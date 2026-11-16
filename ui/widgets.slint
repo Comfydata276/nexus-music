@@ -1,0 +1,800 @@
+// Small building blocks shared by every screen.
+
+import { Theme } from "theme.slint";
+import { Icons } from "icons.slint";
+import { Covers, Card, CardKind, Track, Player, View } from "types.slint";
+
+export component Icon inherits Image {
+    in property <length> size: 18px;
+    in property <brush> tint: Theme.muted;
+    width: self.size;
+    height: self.size;
+    colorize: self.tint;
+    accessible-role: none;
+}
+
+export component IconButton inherits Rectangle {
+    in property <image> icon;
+    in property <length> icon-size: 18px;
+    in property <brush> tint: Theme.muted;
+    in property <brush> hover-tint: Theme.text;
+    // Toggled on, e.g. shuffle enabled.
+    in property <bool> active;
+    in property <bool> enabled: true;
+    in property <string> label;
+    out property <bool> has-hover: touch.has-hover;
+    callback clicked;
+
+    width: 32px;
+    height: 32px;
+    border-radius: self.height / 2;
+    background: touch.pressed ? Theme.press : touch.has-hover ? Theme.hover : transparent;
+    opacity: self.enabled ? 1 : 0.35;
+    animate background { duration: 120ms; }
+
+    accessible-role: button;
+    accessible-label: self.label;
+    accessible-action-default => { touch.clicked(); }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+
+    Icon {
+        source: root.icon;
+        size: root.icon-size;
+        tint: root.active ? Theme.accent-bright : touch.has-hover ? root.hover-tint : root.tint;
+    }
+
+    if root.label != "": Tooltip {
+        Rectangle {
+            background: Theme.overlay;
+            border-radius: 6px;
+            border-width: 1px;
+            border-color: Theme.line;
+            HorizontalLayout {
+                padding-left: 10px;
+                padding-right: 10px;
+                padding-top: 6px;
+                padding-bottom: 6px;
+                Text {
+                    text: root.label;
+                    color: Theme.text;
+                    font-size: 12px;
+                }
+            }
+        }
+    }
+}
+
+// The round violet button that starts playback.
+export component PlayButton inherits Rectangle {
+    in property <bool> playing;
+    in property <length> size: 52px;
+    in property <string> label: self.playing ? "Pause" : "Play";
+    callback clicked;
+
+    width: self.size;
+    height: self.size;
+    border-radius: self.size / 2;
+    background: touch.pressed ? Theme.accent : touch.has-hover ? Theme.accent-bright.brighter(0.12) : Theme.accent-bright;
+    animate background { duration: 120ms; }
+
+    accessible-role: button;
+    accessible-label: self.label;
+    accessible-action-default => { touch.clicked(); }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+
+    Icon {
+        source: root.playing ? Icons.pause-fill : Icons.play-fill;
+        size: root.size * 0.42;
+        tint: Theme.on-accent;
+    }
+}
+
+export component TextButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> primary;
+    in property <bool> danger;
+    in property <bool> enabled: true;
+    callback clicked;
+
+    height: 40px;
+    min-width: label.preferred-width + 40px;
+    border-radius: self.height / 2;
+    border-width: self.primary || self.danger ? 0px : 1px;
+    border-color: touch.has-hover ? Theme.text : Theme.faint;
+    background: self.danger ? (touch.has-hover ? Theme.danger.brighter(0.1) : Theme.danger)
+        : self.primary ? (touch.has-hover ? Theme.accent-bright.brighter(0.12) : Theme.accent-bright)
+        : transparent;
+    opacity: self.enabled ? 1 : 0.5;
+    animate background, border-color { duration: 120ms; }
+
+    accessible-role: button;
+    accessible-label: self.text;
+    accessible-action-default => { touch.clicked(); }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+
+    label := Text {
+        text: root.text;
+        color: root.primary || root.danger ? Theme.on-accent : Theme.text;
+        font-size: 14px;
+        font-weight: 600;
+    }
+}
+
+// Text that behaves like a link: underlined on hover.
+export component LinkText inherits Rectangle {
+    in property <string> text;
+    in property <brush> ink: Theme.muted;
+    in property <length> font-size: 13px;
+    in property <int> font-weight: 400;
+    in property <bool> enabled: true;
+    callback clicked;
+
+    height: label.preferred-height;
+    preferred-width: label.preferred-width;
+    min-width: 0px;
+    horizontal-stretch: 0;
+
+    label := Text {
+        x: 0;
+        width: min(parent.width, self.preferred-width);
+        text: root.text;
+        color: touch.has-hover && root.enabled ? Theme.text : root.ink;
+        font-size: root.font-size;
+        font-weight: root.font-weight;
+        overflow: elide;
+    }
+
+    if touch.has-hover && root.enabled: Rectangle {
+        x: 0;
+        y: parent.height - 1px;
+        width: label.width;
+        height: 1px;
+        background: Theme.text;
+    }
+
+    touch := TouchArea {
+        width: label.width;
+        x: 0;
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => { root.clicked(); }
+    }
+}
+
+// The scrollbar for every list and page: a slim thumb in a lane of its own at the right edge.
+// Used in place of the stock one so it matches the theme and rows can stop just short of it.
+export component ScrollThumb inherits Rectangle {
+    in-out property <length> content-y;
+    in property <length> content-height;
+    in property <length> visible-height;
+
+    property <length> maximum: max(0px, self.content-height - self.visible-height);
+    property <length> inset: 4px;
+    property <length> track: self.height - 2 * self.inset;
+    property <length> thumb-height: clamp(self.track * self.visible-height / max(self.content-height, 1px), min(36px, self.track), self.track);
+    property <length> travel: max(1px, self.track - self.thumb-height);
+
+    width: 14px;
+    visible: self.maximum > 0;
+
+    touch := TouchArea {
+        property <length> grab-y;
+        property <length> grab-offset;
+
+        pointer-event(event) => {
+            if event.button == PointerEventButton.left && event.kind == PointerEventKind.down {
+                // Pressing the lane away from the thumb brings the thumb to the pointer first.
+                if self.mouse-y < thumb.y || self.mouse-y > thumb.y + thumb.height {
+                    root.content-y = -clamp((self.mouse-y - root.inset - root.thumb-height / 2) / root.travel, 0, 1) * root.maximum;
+                }
+                self.grab-y = self.mouse-y;
+                self.grab-offset = -root.content-y;
+            }
+        }
+        moved => {
+            if self.pressed {
+                root.content-y = -clamp(self.grab-offset + (self.mouse-y - self.grab-y) * (root.maximum / root.travel), 0px, root.maximum);
+            }
+        }
+        scroll-event(event) => {
+            root.content-y = clamp(root.content-y + event.delta-y, -root.maximum, 0px);
+            accept
+        }
+    }
+
+    thumb := Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: root.inset + root.travel * clamp(-root.content-y / max(root.maximum, 1px), 0, 1);
+        width: touch.has-hover || touch.pressed ? 6px : 4px;
+        height: root.thumb-height;
+        border-radius: self.width / 2;
+        background: touch.pressed ? Theme.muted : touch.has-hover ? Theme.faint : #ffffff2e;
+        animate width, background { duration: 120ms; }
+    }
+}
+
+// Album, artist or playlist artwork. Art arrives asynchronously; a glyph stands in until then.
+export component Cover inherits Rectangle {
+    in property <string> art;
+    in property <bool> round;
+    in property <image> placeholder: Icons.music;
+    // Edge length used to pick an image resolution; defaults to the rendered width.
+    in property <length> detail: self.width;
+
+    border-radius: self.round ? self.width / 2 : clamp(self.width * 0.06, 3px, 8px);
+    background: Theme.raised;
+    clip: true;
+
+    if picture.source.width == 0: Icon {
+        source: root.placeholder;
+        size: clamp(root.width * 0.36, 14px, 72px);
+        tint: Theme.faint;
+    }
+
+    picture := Image {
+        width: 100%;
+        height: 100%;
+        image-fit: cover;
+        source: Covers.get(root.art, root.detail / 1px, Covers.rev);
+        accessible-role: none;
+    }
+}
+
+export component Slider inherits Rectangle {
+    // 0 to 1.
+    in property <float> value;
+    in property <bool> enabled: true;
+    in property <string> label;
+    out property <bool> dragging: touch.pressed;
+    out property <float> drag-value;
+    out property <bool> has-hover: touch.has-hover;
+    callback moved(value: float);
+    callback released(value: float);
+    callback scrolled(delta: float);
+
+    property <float> shown: self.dragging ? self.drag-value : clamp(self.value, 0, 1);
+    height: 16px;
+    min-width: 40px;
+
+    accessible-role: slider;
+    accessible-label: self.label;
+    accessible-value: Math.round(self.shown * 100);
+    accessible-value-minimum: 0;
+    accessible-value-maximum: 100;
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        pointer-event(event) => {
+            if event.button == PointerEventButton.left && event.kind == PointerEventKind.down {
+                root.drag-value = clamp(self.mouse-x / self.width, 0, 1);
+                root.moved(root.drag-value);
+            }
+            if event.button == PointerEventButton.left && event.kind == PointerEventKind.up {
+                root.released(root.drag-value);
+            }
+        }
+        moved => {
+            if self.pressed {
+                root.drag-value = clamp(self.mouse-x / self.width, 0, 1);
+                root.moved(root.drag-value);
+            }
+        }
+        scroll-event(event) => {
+            root.scrolled(event.delta-y / 1px);
+            return accept;
+        }
+    }
+
+    Rectangle {
+        y: (parent.height - self.height) / 2;
+        height: 4px;
+        border-radius: 2px;
+        background: #ffffff2b;
+
+        Rectangle {
+            x: 0;
+            width: parent.width * root.shown;
+            border-radius: 2px;
+            background: touch.has-hover || root.dragging ? Theme.accent-bright : Theme.text;
+        }
+    }
+
+    if touch.has-hover || root.dragging: Rectangle {
+        x: clamp(root.width * root.shown - 6px, 0px, root.width - 12px);
+        y: (parent.height - self.height) / 2;
+        width: 12px;
+        height: 12px;
+        border-radius: 6px;
+        background: white;
+    }
+}
+
+export component Field inherits Rectangle {
+    in-out property <string> text <=> input.text;
+    in property <string> placeholder;
+    in property <InputType> input-type: InputType.text;
+    in property <string> label;
+    callback accepted;
+    callback edited;
+
+    height: 44px;
+    border-radius: 8px;
+    background: Theme.raised;
+    border-width: 1px;
+    border-color: input.has-focus ? Theme.accent-bright : Theme.line;
+    forward-focus: input;
+    animate border-color { duration: 120ms; }
+
+    HorizontalLayout {
+        padding-left: 14px;
+        padding-right: 14px;
+
+        Rectangle {
+            if input.text == "": Text {
+                x: 0;
+                width: parent.width;
+                text: root.placeholder;
+                color: Theme.faint;
+                font-size: 14px;
+                vertical-alignment: center;
+                overflow: elide;
+                accessible-role: none;
+            }
+
+            input := TextInput {
+                width: parent.width;
+                height: parent.height;
+                color: Theme.text;
+                font-size: 14px;
+                vertical-alignment: center;
+                single-line: true;
+                input-type: root.input-type;
+                selection-background-color: Theme.accent;
+                selection-foreground-color: white;
+                accessible-label: root.label;
+                accepted => { root.accepted(); }
+                edited => { root.edited(); }
+            }
+        }
+    }
+}
+
+// A switch for a setting that takes effect immediately.
+export component Toggle inherits Rectangle {
+    in property <bool> on;
+    in property <string> label;
+    callback toggled(on: bool);
+
+    width: 40px;
+    height: 24px;
+    border-radius: 12px;
+    background: self.on ? Theme.accent-bright : #ffffff2b;
+    animate background { duration: 140ms; }
+
+    accessible-role: switch;
+    accessible-label: self.label;
+    accessible-checkable: true;
+    accessible-checked: self.on;
+    accessible-action-default => { root.toggled(!root.on); }
+
+    Rectangle {
+        x: root.on ? 19px : 3px;
+        width: 18px;
+        height: 18px;
+        border-radius: 9px;
+        background: root.on ? Theme.on-accent : Theme.text;
+        animate x { duration: 140ms; easing: ease-out; }
+    }
+
+    TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.toggled(!root.on); }
+    }
+}
+
+// One selectable option in a row of choices, e.g. sort order.
+export component Chip inherits Rectangle {
+    in property <string> text;
+    in property <bool> selected;
+    callback clicked;
+
+    height: 32px;
+    width: label.preferred-width + 28px;
+    border-radius: 16px;
+    background: self.selected ? Theme.text : touch.has-hover ? Theme.press : Theme.hover;
+    animate background { duration: 120ms; }
+
+    accessible-role: button;
+    accessible-label: self.text;
+    accessible-action-default => { touch.clicked(); }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+
+    label := Text {
+        text: root.text;
+        color: root.selected ? Theme.base : Theme.text;
+        font-size: 13px;
+        font-weight: 500;
+    }
+}
+
+// Album, artist, playlist or genre in a grid or shelf.
+// Calls `rested` once the pointer has stayed put briefly, so sweeping across a grid of cards
+// doesn't count as interest in every one of them.
+export component HoverIntent inherits Rectangle {
+    in property <bool> hovered;
+    callback rested;
+    property <bool> fired;
+    width: 0px;
+    height: 0px;
+    changed hovered => {
+        if !self.hovered {
+            self.fired = false;
+        }
+    }
+
+    Timer {
+        interval: 90ms;
+        running: root.hovered && !root.fired;
+        triggered => {
+            root.fired = true;
+            root.rested();
+        }
+    }
+}
+
+// Faint bars standing in for rows that are still loading.
+export component SkeletonRows inherits Rectangle {
+    in property <int> rows: 6;
+    height: self.rows * 56px;
+
+    for index in root.rows: Rectangle {
+        x: 32px;
+        y: index * 56px + 14px;
+        width: parent.width - 64px;
+        height: 28px;
+        border-radius: 6px;
+        background: #ffffff0d;
+        opacity: 1 - index * 0.13;
+    }
+}
+
+export component MediaCard inherits Rectangle {
+    in property <Card> card;
+    callback activated;
+    callback play;
+    callback menu(x: length, y: length);
+
+    property <bool> is-genre: self.card.kind == CardKind.genre;
+    property <length> art-size: self.width - 24px;
+    height: self.is-genre ? 96px : self.art-size + 78px;
+    border-radius: 8px;
+    background: self.is-genre ? transparent : touch.has-hover ? Theme.hover : transparent;
+    animate background { duration: 140ms; }
+
+    accessible-role: button;
+    accessible-label: self.card.title;
+    accessible-action-default => { root.activated(); }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.activated(); }
+        pointer-event(event) => {
+            if event.button == PointerEventButton.right && event.kind == PointerEventKind.down {
+                root.menu(self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
+            }
+        }
+
+        HoverIntent {
+            hovered: touch.has-hover;
+            rested => { View.card-hovered(root.card); }
+        }
+
+        if !root.is-genre: Rectangle {
+            x: 12px;
+            y: 12px;
+            width: root.art-size;
+            height: root.art-size;
+
+            Cover {
+                art: root.card.cover;
+                round: root.card.kind == CardKind.artist;
+                placeholder: root.card.kind == CardKind.artist ? Icons.user-round
+                    : root.card.kind == CardKind.playlist ? Icons.list-music : Icons.disc-3;
+                // Cards are all drawn at one resolution so a resize doesn't refetch art.
+                detail: 200px;
+            }
+
+            if root.card.kind != CardKind.artist: PlayButton {
+                x: parent.width - self.width - 8px;
+                y: touch.has-hover ? parent.height - self.height - 8px : parent.height - self.height;
+                size: 44px;
+                opacity: touch.has-hover ? 1 : 0;
+                label: "Play " + root.card.title;
+                animate y, opacity { duration: 160ms; easing: ease-out; }
+                clicked => { root.play(); }
+            }
+        }
+
+        if !root.is-genre: Text {
+            x: 12px;
+            y: root.art-size + 22px;
+            width: root.art-size;
+            text: root.card.title;
+            color: Theme.text;
+            font-size: 14px;
+            font-weight: 600;
+            overflow: elide;
+        }
+
+        if !root.is-genre: Text {
+            x: 12px;
+            y: root.art-size + 44px;
+            width: root.art-size;
+            text: root.card.subtitle;
+            color: Theme.muted;
+            font-size: 13px;
+            overflow: elide;
+        }
+
+        if root.is-genre: Rectangle {
+            x: 6px;
+            y: 6px;
+            width: parent.width - 12px;
+            height: parent.height - 12px;
+            border-radius: 8px;
+            background: touch.has-hover ? Theme.overlay : Theme.raised;
+            border-width: 1px;
+            border-color: Theme.line;
+            clip: true;
+            animate background { duration: 140ms; }
+
+            Text {
+                x: 16px;
+                y: 14px;
+                width: parent.width - 32px;
+                text: root.card.title;
+                color: Theme.text;
+                font-family: Theme.display;
+                font-size: 19px;
+                font-weight: 700;
+                overflow: elide;
+            }
+
+            Text {
+                x: 16px;
+                y: parent.height - self.height - 12px;
+                text: root.card.subtitle;
+                color: Theme.muted;
+                font-size: 12px;
+            }
+        }
+    }
+}
+
+// One song in a list.
+export component TrackRow inherits Rectangle {
+    in property <Track> track;
+    in property <bool> show-cover: true;
+    in property <bool> show-album: true;
+    in property <bool> show-number: true;
+    callback activated;
+    callback star;
+    callback menu(x: length, y: length);
+
+    property <bool> current: self.track.id != "" && self.track.id == Player.track-id;
+    height: 56px;
+    border-radius: 6px;
+    background: touch.has-hover ? Theme.hover : transparent;
+
+    accessible-role: list-item;
+    accessible-label: self.track.title + ", " + self.track.artist;
+    accessible-action-default => { root.activated(); }
+
+    touch := TouchArea {
+        double-clicked => { root.activated(); }
+        pointer-event(event) => {
+            if event.button == PointerEventButton.right && event.kind == PointerEventKind.down {
+                root.menu(self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
+            }
+        }
+
+        HorizontalLayout {
+            padding-left: 16px;
+            padding-right: 12px;
+            spacing: 16px;
+
+            if root.show-number: Rectangle {
+                width: 24px;
+
+                if !touch.has-hover && !root.current: Text {
+                    width: parent.width;
+                    text: root.track.number;
+                    color: Theme.muted;
+                    font-size: 14px;
+                    horizontal-alignment: right;
+                }
+
+                if !touch.has-hover && root.current: Icon {
+                    x: parent.width - self.width;
+                    source: Icons.bars;
+                    size: 14px;
+                    tint: Theme.accent-bright;
+                    opacity: Player.playing ? 1 : 0.55;
+                }
+
+                if touch.has-hover: IconButton {
+                    x: parent.width - self.width + 6px;
+                    width: 28px;
+                    height: 28px;
+                    icon: root.current && Player.playing ? Icons.pause-fill : Icons.play-fill;
+                    icon-size: 14px;
+                    tint: Theme.text;
+                    label: root.current && Player.playing ? "Pause" : "Play " + root.track.title;
+                    clicked => {
+                        if root.current {
+                            Player.toggle();
+                        } else {
+                            root.activated();
+                        }
+                    }
+                }
+            }
+
+            if root.show-cover: VerticalLayout {
+                alignment: center;
+                Cover {
+                    width: 40px;
+                    height: 40px;
+                    art: root.track.cover;
+                    detail: 48px;
+                }
+            }
+
+            // Both text columns start from zero width so every row splits the space alike.
+            VerticalLayout {
+                alignment: center;
+                spacing: 3px;
+                horizontal-stretch: 5;
+                min-width: 80px;
+                preferred-width: 0px;
+
+                Text {
+                    text: root.track.title;
+                    color: root.current ? Theme.accent-bright : Theme.text;
+                    font-size: 14px;
+                    font-weight: 500;
+                    overflow: elide;
+                }
+
+                LinkText {
+                    text: root.track.artist;
+                    enabled: root.track.artist-id != "";
+                    clicked => {
+                        View.card-activated({ kind: CardKind.artist, id: root.track.artist-id, title: root.track.artist });
+                    }
+                }
+            }
+
+            if root.show-album: VerticalLayout {
+                alignment: center;
+                horizontal-stretch: 3;
+                min-width: 0px;
+                preferred-width: 0px;
+                LinkText {
+                    text: root.track.album;
+                    enabled: root.track.album-id != "";
+                    clicked => {
+                        View.card-activated({
+                            kind: CardKind.album,
+                            id: root.track.album-id,
+                            title: root.track.album,
+                            subtitle: root.track.artist,
+                            cover: root.track.cover,
+                        });
+                    }
+                }
+            }
+
+            VerticalLayout {
+                alignment: center;
+                IconButton {
+                    width: 30px;
+                    height: 30px;
+                    icon: root.track.starred ? Icons.heart-fill : Icons.heart;
+                    icon-size: 16px;
+                    tint: root.track.starred ? Theme.warm : Theme.muted;
+                    hover-tint: root.track.starred ? Theme.warm : Theme.text;
+                    opacity: root.track.starred || touch.has-hover ? 1 : 0;
+                    label: root.track.starred ? "Remove from Liked songs" : "Add to Liked songs";
+                    clicked => { root.star(); }
+                }
+            }
+
+            Text {
+                width: 40px;
+                text: root.track.duration;
+                color: Theme.muted;
+                font-size: 13px;
+                horizontal-alignment: right;
+                vertical-alignment: center;
+            }
+
+            VerticalLayout {
+                alignment: center;
+                more := IconButton {
+                    width: 30px;
+                    height: 30px;
+                    icon: Icons.ellipsis;
+                    opacity: touch.has-hover ? 1 : 0;
+                    label: "More options for " + root.track.title;
+                    clicked => {
+                        root.menu(more.absolute-position.x, more.absolute-position.y + more.height);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Shown in place of a page while it loads, or when it failed.
+export component PageStatus inherits Rectangle {
+    in property <bool> loading;
+    in property <string> error;
+    callback retry;
+
+    VerticalLayout {
+        alignment: center;
+        spacing: 16px;
+
+        if root.error != "": Text {
+            text: "Couldn't load this page";
+            color: Theme.text;
+            font-family: Theme.display;
+            font-size: 24px;
+            font-weight: 700;
+            horizontal-alignment: center;
+        }
+
+        if root.error != "": Text {
+            text: root.error;
+            color: Theme.muted;
+            font-size: 14px;
+            horizontal-alignment: center;
+            wrap: word-wrap;
+        }
+
+        if root.error != "": HorizontalLayout {
+            alignment: center;
+            TextButton {
+                text: "Try again";
+                clicked => { root.retry(); }
+            }
+        }
+
+        if root.error == "" && root.loading: Text {
+            text: "Loading…";
+            color: Theme.faint;
+            font-size: 14px;
+            horizontal-alignment: center;
+        }
+    }
+}

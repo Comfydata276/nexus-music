@@ -1,0 +1,3 @@
+[target.x86_64-pc-windows-msvc]
+# Match Linux's default main-thread stack size; MSVC's 1 MB default is tight for UI code.
+rustflags = ["-C", "link-arg=/STACK:8000000"]

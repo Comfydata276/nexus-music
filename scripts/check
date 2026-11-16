@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Compile for Linux inside the dev container and print only the diagnostics.
+cd "$(dirname "$0")/.."
+scripts/dx cargo build "$@" 2>&1 | grep -vE "^\s*(Compiling|Downloading|Downloaded|Locking|Adding|Updating|Blocking|Fresh)" | grep -v "^warning: unused manifest\|consider removing the dependency\|^help: consider removing" | head -${LINES_MAX:-120}

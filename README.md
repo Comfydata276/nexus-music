@@ -1,5 +1,118 @@
-<img src="assets/icon.svg" width="64" height="64" alt="">
+<img src="assets/app-icon.png" width="64" height="64" alt="">
 
 # Nexus Music
 
-Created in [T3 Code](https://t3.codes).
+A native Windows music player for [Navidrome](https://www.navidrome.org/). It streams from
+your own server and is laid out the way Spotify is: library on the left, what you're
+browsing in the middle, the player along the bottom.
+
+It is written in Rust with the [Slint](https://slint.dev) UI toolkit. There is no browser
+engine inside it: the interface is drawn directly on the GPU, and audio is decoded and played
+by the app itself.
+
+## What it does
+
+- Signs in to a Navidrome server; the password is kept in Windows Credential Manager.
+- Home, search, albums (sortable), artists, genres, playlists and Liked songs.
+- Gapless playback or crossfade, seeking, shuffle, repeat and a queue you can edit.
+- A queue panel beside the page, with a play button on every row to skip straight to it.
+- Recently played: the last hundred songs, each playable again by itself.
+- Autoplay: when the queue ends it carries on with similar songs, falling back to the same
+  genre when Navidrome has no similar-song source set up.
+- A six-band equaliser with presets, mono audio, and volume levelling from ReplayGain tags
+  at a quiet, normal or loud target.
+- Streaming quality from 96 kbps to lossless, switchable mid-song.
+- Plays MP3, FLAC, AAC/M4A, ALAC, Ogg Vorbis, WAV and AIFF directly. Anything else (Opus,
+  WMA, APE and so on) is converted to MP3 by Navidrome on the fly.
+- Create, rename and delete playlists; add and remove songs; like songs and albums.
+- Synced lyrics when Navidrome has them (embedded or `.lrc` files).
+- Media keys and the Windows now-playing overlay.
+- Reports plays to Navidrome, which keeps play counts current and feeds Last.fm or
+  ListenBrainz if you linked them there.
+- Remembers the queue and position between runs.
+
+Keyboard: Space plays or pauses, Ctrl+Left/Right changes track, Ctrl+Up/Down changes
+volume, Ctrl+K jumps to search, Alt+Left/Right goes back and forward, F5 reloads the page.
+
+## Installing
+
+Run `NexusMusic-Setup-<version>.exe`. It installs for the current user without an
+administrator prompt. The build isn't code-signed, so Windows SmartScreen will ask before
+running it the first time: choose **More info**, then **Run anyway**.
+
+The app needs the Microsoft Visual C++ runtime, which most PCs already have. If Windows
+reports that `VCRUNTIME140.dll` or `MSVCP140.dll` is missing, install it from
+<https://aka.ms/vs/17/release/vc_redist.x64.exe>.
+
+## Building
+
+Everything builds inside one Docker image, including the Windows cross-compile, so the host
+needs only Docker.
+
+```sh
+docker build -f docker/dev.Dockerfile -t nexus-music-dev docker   # once
+scripts/package-windows     # Windows .exe and installer, into dist/
+scripts/check               # compile for Linux and print diagnostics
+scripts/dx cargo test       # unit tests
+```
+
+`scripts/dx <command>` runs any command inside the image as your user.
+
+### Running it on Linux for development
+
+The Linux build is for development and testing only. Slint's embedded
+[MCP server](https://docs.slint.dev/latest/docs/slint/guide/tooling/ai-coding-assistants/)
+lets a script or coding agent inspect the window, click and take screenshots, with no display:
+
+```sh
+scripts/dx bash -c 'SLINT_EMIT_DEBUG_INFO=1 cargo build --features slint/mcp'
+DX_DOCKER_ARGS="-e SLINT_MCP_PORT=9315 -e SLINT_BACKEND=headless-skia -e NEXUS_MUSIC_HOME=/work/target/test-home" \
+  scripts/dx target/debug/nexus-music
+```
+
+- `NEXUS_MUSIC_HOME` puts settings and caches in a folder of your choosing.
+- `NEXUS_TRACE=1` prints how long each track took to open and to produce its first audio.
+- `NEXUS_AUDIO_DUMP=<file>` (only when no sound card is present) records what would have
+  been played as raw 32-bit float stereo at 48 kHz, so output can be checked numerically.
+
+## What keeps it quick
+
+Most waiting in a streaming client is connection setup and round trips, so the app is built
+to avoid both:
+
+- One HTTP agent serves API calls, artwork and audio, with connections kept open for minutes
+  and warmed up at sign-in. Name lookups are cached, and when a name resolves to several
+  addresses the one that answers first is used.
+- A page is drawn from a single request; extras such as an artist's biography follow.
+  Independent requests run in parallel.
+- Clicking something draws its header at once from what the clicked item already shows.
+- Every page is cached in memory and on disk. A cached page appears immediately and is
+  checked against the server in the background. Resting the pointer on an album, artist or
+  playlist fetches its page before the click.
+- Each cover is requested from the server at one size; thumbnails are cut from it locally.
+- FLAC and MP3 tracks start from a single request.
+
+Settings shows how long connecting to your server takes compared with a request on an open
+connection.
+
+## How the code is organised
+
+| Path | What's there |
+| --- | --- |
+| `ui/` | The interface, in Slint. `types.slint` is the contract with the Rust side. |
+| `src/subsonic.rs` | Client for the Subsonic API that Navidrome serves at `/rest`. |
+| `src/audio/` | Playback engine: download buffer, decoding, resampling, output device. |
+| `src/controller.rs` | Sign-in, navigation and the page on screen. |
+| `src/pages.rs` | Turns server responses into page content (runs on worker threads). |
+| `src/playback.rs` | Queue, transport, play reporting, lyrics. |
+| `src/actions.rs` | Context menus, likes, playlist edits. |
+| `src/covers.rs` | Cover art cache, on disk and in memory. |
+| `src/media.rs` | Windows media keys and now-playing overlay. |
+| `installer/` | NSIS script for the Windows installer. |
+
+## Licences of bundled work
+
+- Slint is used under its royalty-free desktop licence, which asks for the attribution shown
+  in Settings.
+- Fonts: Bricolage Grotesque and Hanken Grotesk, SIL Open Font License (`ui/fonts/`).
+- Icons: Lucide, ISC License (`ui/icons/`).

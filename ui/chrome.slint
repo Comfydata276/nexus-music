@@ -1,0 +1,1013 @@
+// The parts of the window that stay put: library sidebar, top bar, queue and the player bar.
+
+import { ListView } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+import { Icons } from "icons.slint";
+import { App, Player, View, CardKind, PlaylistRef, Page, Track } from "types.slint";
+import { Icon, IconButton, Cover, Slider, LinkText, PlayButton, HoverIntent, ScrollThumb } from "widgets.slint";
+
+// Rows stop `gutter` short of a list's right edge, leaving the scrollbar a lane of its own.
+// The lists run `reach` into the panel's padding so that lane sits at the panel's edge.
+global Lane {
+    out property <length> gutter: 14px;
+    out property <length> reach: 8px;
+}
+
+component NavItem inherits Rectangle {
+    in property <image> icon;
+    in property <string> text;
+    in property <bool> selected;
+    callback clicked;
+
+    height: 40px;
+    border-radius: 6px;
+    background: self.selected ? Theme.hover : touch.has-hover ? Theme.hover : transparent;
+    animate background { duration: 120ms; }
+
+    accessible-role: button;
+    accessible-label: self.text;
+    accessible-action-default => { touch.clicked(); }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+        spacing: 14px;
+
+        VerticalLayout {
+            alignment: center;
+            Icon {
+                source: root.icon;
+                size: 20px;
+                tint: root.selected || touch.has-hover ? Theme.text : Theme.muted;
+            }
+        }
+
+        Text {
+            text: root.text;
+            color: root.selected || touch.has-hover ? Theme.text : Theme.muted;
+            font-size: 14px;
+            font-weight: 600;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+}
+
+component PlaylistItem inherits Rectangle {
+    in property <PlaylistRef> playlist;
+    in property <bool> selected;
+    callback clicked;
+    callback rested;
+    callback menu(x: length, y: length);
+
+    height: 56px;
+    border-radius: 6px;
+    background: self.selected ? Theme.hover : touch.has-hover ? Theme.hover : transparent;
+
+    HoverIntent {
+        hovered: touch.has-hover;
+        rested => { root.rested(); }
+    }
+
+    accessible-role: button;
+    accessible-label: self.playlist.name;
+    accessible-action-default => { touch.clicked(); }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+        pointer-event(event) => {
+            if event.button == PointerEventButton.right && event.kind == PointerEventKind.down {
+                root.menu(self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
+            }
+        }
+    }
+
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 8px;
+        spacing: 12px;
+
+        VerticalLayout {
+            alignment: center;
+            Cover {
+                width: 40px;
+                height: 40px;
+                art: root.playlist.cover;
+                placeholder: Icons.list-music;
+                detail: 48px;
+            }
+        }
+
+        VerticalLayout {
+            alignment: center;
+            spacing: 3px;
+
+            Text {
+                text: root.playlist.name;
+                color: root.selected ? Theme.accent-bright : Theme.text;
+                font-size: 14px;
+                font-weight: 500;
+                overflow: elide;
+            }
+
+            Text {
+                text: root.playlist.subtitle;
+                color: Theme.muted;
+                font-size: 12px;
+                overflow: elide;
+            }
+        }
+    }
+}
+
+export component Sidebar inherits Rectangle {
+    background: Theme.panel;
+    border-radius: Theme.radius;
+
+    VerticalLayout {
+        padding: 8px;
+        spacing: 2px;
+
+        HorizontalLayout {
+            padding-left: 12px;
+            padding-top: 12px;
+            padding-bottom: 16px;
+            spacing: 12px;
+            alignment: start;
+
+            Rectangle {
+                width: 28px;
+                height: 28px;
+                border-radius: 8px;
+                background: Theme.accent;
+                Icon {
+                    source: Icons.bars;
+                    size: 15px;
+                    tint: white;
+                }
+            }
+
+            Text {
+                text: "Nexus Music";
+                color: Theme.text;
+                font-family: Theme.display;
+                font-size: 19px;
+                font-weight: 700;
+                vertical-alignment: center;
+            }
+        }
+
+        NavItem {
+            icon: Icons.house;
+            text: "Home";
+            selected: App.route == "home";
+            clicked => { App.navigate("home"); }
+        }
+
+        NavItem {
+            icon: Icons.disc-album;
+            text: "Albums";
+            selected: App.route == "albums";
+            clicked => { App.navigate("albums"); }
+        }
+
+        NavItem {
+            icon: Icons.users-round;
+            text: "Artists";
+            selected: App.route == "artists";
+            clicked => { App.navigate("artists"); }
+        }
+
+        NavItem {
+            icon: Icons.tags;
+            text: "Genres";
+            selected: App.route == "genres";
+            clicked => { App.navigate("genres"); }
+        }
+
+        NavItem {
+            icon: Icons.heart;
+            text: "Liked songs";
+            selected: App.route == "liked";
+            clicked => { App.navigate("liked"); }
+        }
+
+        Rectangle {
+            height: 17px;
+            Rectangle {
+                x: 12px;
+                width: parent.width - 24px;
+                height: 1px;
+                background: Theme.line;
+            }
+        }
+
+        HorizontalLayout {
+            padding-left: 12px;
+            padding-right: 4px;
+            height: 36px;
+
+            Text {
+                text: "Playlists";
+                color: Theme.muted;
+                font-size: 13px;
+                font-weight: 600;
+                vertical-alignment: center;
+            }
+
+            VerticalLayout {
+                alignment: center;
+                IconButton {
+                    icon: Icons.plus;
+                    label: "Create playlist";
+                    clicked => { App.new-playlist(); }
+                }
+            }
+        }
+
+        if App.playlists.length == 0: HorizontalLayout {
+            padding-left: 12px;
+            padding-right: 12px;
+            Text {
+                text: "Playlists you create show up here.";
+                color: Theme.faint;
+                font-size: 13px;
+                wrap: word-wrap;
+            }
+        }
+
+        Rectangle {
+            vertical-stretch: 1;
+            playlists := ListView {
+                x: 0;
+                width: parent.width + Lane.reach;
+                height: parent.height;
+                vertical-scrollbar-policy: always-off;
+                horizontal-scrollbar-policy: always-off;
+                for playlist in App.playlists: Rectangle {
+                    height: 56px;
+                    PlaylistItem {
+                        x: 0;
+                        // Full width until the list is long enough to need its scrollbar.
+                        width: parent.width - (playlists.content-height > playlists.visible-height ? Lane.gutter : Lane.reach);
+                        playlist: playlist;
+                        selected: App.route == "playlist:" + playlist.id;
+                        clicked => {
+                            View.card-activated({ kind: CardKind.playlist, id: playlist.id, title: playlist.name, cover: playlist.cover });
+                        }
+                        rested => {
+                            View.card-hovered({ kind: CardKind.playlist, id: playlist.id });
+                        }
+                        menu(x, y) => {
+                            View.card-menu({ kind: CardKind.playlist, id: playlist.id, title: playlist.name }, x, y);
+                        }
+                    }
+                }
+            }
+
+            ScrollThumb {
+                x: playlists.width - self.width;
+                content-y <=> playlists.content-y;
+                content-height: playlists.content-height;
+                visible-height: playlists.visible-height;
+            }
+        }
+    }
+}
+
+export component TopBar inherits Rectangle {
+    property <int> focus-request: App.search-focus;
+    changed focus-request => { search.focus(); }
+    height: 64px;
+
+    HorizontalLayout {
+        padding-left: 16px;
+        padding-right: 16px;
+        spacing: 8px;
+
+        VerticalLayout {
+            alignment: center;
+            IconButton {
+                icon: Icons.chevron-left;
+                icon-size: 20px;
+                enabled: App.can-go-back;
+                label: "Go back";
+                clicked => { App.go-back(); }
+            }
+        }
+
+        VerticalLayout {
+            alignment: center;
+            IconButton {
+                icon: Icons.chevron-right;
+                icon-size: 20px;
+                enabled: App.can-go-forward;
+                label: "Go forward";
+                clicked => { App.go-forward(); }
+            }
+        }
+
+        VerticalLayout {
+            alignment: center;
+            padding-left: 8px;
+            horizontal-stretch: 1;
+            max-width: 408px;
+
+            Rectangle {
+                min-width: 160px;
+                preferred-width: 400px;
+                max-width: 400px;
+                height: 40px;
+                border-radius: 20px;
+                background: search.has-focus ? Theme.overlay : Theme.raised;
+                border-width: 1px;
+                border-color: search.has-focus ? Theme.accent-bright : transparent;
+                animate border-color, background { duration: 120ms; }
+
+                HorizontalLayout {
+                    padding-left: 14px;
+                    padding-right: 6px;
+                    spacing: 10px;
+
+                    VerticalLayout {
+                        alignment: center;
+                        Icon {
+                            source: Icons.search;
+                            size: 17px;
+                            tint: search.has-focus ? Theme.text : Theme.muted;
+                        }
+                    }
+
+                    Rectangle {
+                        if search.text == "": Text {
+                            x: 0;
+                            width: parent.width;
+                            text: "Search songs, albums, artists";
+                            color: Theme.faint;
+                            font-size: 14px;
+                            vertical-alignment: center;
+                            overflow: elide;
+                            accessible-role: none;
+                        }
+
+                        search := TextInput {
+                            width: parent.width;
+                            height: parent.height;
+                            text <=> App.search-text;
+                            color: Theme.text;
+                            font-size: 14px;
+                            vertical-alignment: center;
+                            single-line: true;
+                            selection-background-color: Theme.accent;
+                            selection-foreground-color: white;
+                            accessible-label: "Search";
+                            edited => {
+                                // Wait for a pause in typing before asking the server.
+                                debounce.stop();
+                                debounce.start();
+                            }
+                            accepted => {
+                                debounce.stop();
+                                App.search(self.text);
+                            }
+                        }
+                    }
+
+                    VerticalLayout {
+                        alignment: center;
+                        IconButton {
+                            width: 28px;
+                            height: 28px;
+                            icon: Icons.x;
+                            icon-size: 15px;
+                            opacity: search.text == "" ? 0 : 1;
+                            enabled: search.text != "";
+                            label: "Clear search";
+                            clicked => {
+                                App.search-text = "";
+                                App.search("");
+                                search.focus();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Rectangle {
+            horizontal-stretch: 1;
+        }
+
+        VerticalLayout {
+            alignment: center;
+            IconButton {
+                icon: Icons.settings;
+                active: App.route == "settings";
+                label: App.route == "settings" ? "Close settings" : "Settings";
+                clicked => {
+                    if App.route == "settings" {
+                        App.go-back();
+                    } else {
+                        App.navigate("settings");
+                    }
+                }
+            }
+        }
+    }
+
+    debounce := Timer {
+        interval: 280ms;
+        running: false;
+        triggered => {
+            self.stop();
+            App.search(search.text);
+        }
+    }
+}
+
+// A song in the queue panel. Hovering turns its cover into a play button.
+component QueueRow inherits Rectangle {
+    in property <Track> track;
+    // The row for the song that's playing: the button pauses and resumes instead.
+    in property <bool> current;
+    callback play;
+    callback menu(x: length, y: length);
+
+    height: 64px;
+    border-radius: 6px;
+    background: touch.has-hover ? Theme.hover : transparent;
+
+    accessible-role: list-item;
+    accessible-label: self.track.title + ", " + self.track.artist;
+    accessible-action-default => { root.play(); }
+
+    touch := TouchArea {
+        double-clicked => { root.play(); }
+        pointer-event(event) => {
+            if event.button == PointerEventButton.right && event.kind == PointerEventKind.down {
+                root.menu(self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
+            }
+        }
+
+        HorizontalLayout {
+            padding-left: 8px;
+            padding-right: 8px;
+            spacing: 12px;
+
+            VerticalLayout {
+                alignment: center;
+                Rectangle {
+                    width: 48px;
+                    height: 48px;
+
+                    art := Cover {
+                        art: root.track.cover;
+                        detail: 48px;
+                    }
+
+                    if touch.has-hover: Rectangle {
+                        border-radius: art.border-radius;
+                        background: play-touch.pressed ? #000000c8 : #000000a0;
+                        accessible-role: button;
+                        accessible-label: (root.current && Player.playing ? "Pause " : "Play ") + root.track.title;
+                        accessible-action-default => { root.play(); }
+
+                        play-touch := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.play(); }
+                        }
+
+                        Icon {
+                            source: root.current && Player.playing ? Icons.pause-fill : Icons.play-fill;
+                            size: 18px;
+                            tint: white;
+                        }
+                    }
+                }
+            }
+
+            VerticalLayout {
+                alignment: center;
+                spacing: 4px;
+                horizontal-stretch: 1;
+                min-width: 60px;
+                preferred-width: 0px;
+
+                Text {
+                    text: root.track.title;
+                    color: root.current ? Theme.accent-bright : Theme.text;
+                    font-size: 15px;
+                    font-weight: 500;
+                    overflow: elide;
+                }
+
+                LinkText {
+                    text: root.track.artist;
+                    font-size: 13px;
+                    enabled: root.track.artist-id != "";
+                    clicked => {
+                        View.card-activated({ kind: CardKind.artist, id: root.track.artist-id, title: root.track.artist });
+                    }
+                }
+            }
+
+            // The length gives way to the menu button while the pointer is on the row.
+            Rectangle {
+                width: 36px;
+
+                if !touch.has-hover: Text {
+                    width: parent.width;
+                    text: root.track.duration;
+                    color: Theme.muted;
+                    font-size: 13px;
+                    horizontal-alignment: right;
+                    vertical-alignment: center;
+                }
+
+                if touch.has-hover: more := IconButton {
+                    x: parent.width - self.width;
+                    icon: Icons.ellipsis;
+                    label: "More options for " + root.track.title;
+                    clicked => {
+                        root.menu(more.absolute-position.x, more.absolute-position.y + more.height);
+                    }
+                }
+            }
+        }
+    }
+}
+
+component PanelTab inherits Rectangle {
+    in property <string> text;
+    in property <bool> selected;
+    callback clicked;
+
+    width: label.preferred-width;
+    accessible-role: tab;
+    accessible-label: self.text;
+    accessible-action-default => { root.clicked(); }
+
+    label := Text {
+        text: root.text;
+        color: root.selected || touch.has-hover ? Theme.text : Theme.muted;
+        font-family: Theme.display;
+        font-size: 15px;
+        font-weight: 700;
+        vertical-alignment: center;
+        animate color { duration: 120ms; }
+    }
+
+    if root.selected: Rectangle {
+        y: parent.height - 9px;
+        height: 2px;
+        border-radius: 1px;
+        background: Theme.accent-bright;
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+export component QueuePanel inherits Rectangle {
+    background: Theme.panel;
+    border-radius: Theme.radius;
+
+    VerticalLayout {
+        padding: 8px;
+        spacing: 4px;
+
+        HorizontalLayout {
+            padding-left: 12px;
+            padding-right: Lane.gutter - Lane.reach;
+            spacing: 20px;
+            height: 48px;
+
+            PanelTab {
+                text: "Queue";
+                selected: App.queue-tab == 0;
+                clicked => { App.queue-tab = 0; }
+            }
+
+            PanelTab {
+                text: "Recently played";
+                selected: App.queue-tab == 1;
+                clicked => { App.queue-tab = 1; }
+            }
+
+            Rectangle {
+                horizontal-stretch: 1;
+            }
+
+            VerticalLayout {
+                alignment: center;
+                IconButton {
+                    icon: Icons.x;
+                    label: "Close";
+                    clicked => { App.set-queue-open(false); }
+                }
+            }
+        }
+
+        if App.queue-tab == 0 && !Player.has-track: HorizontalLayout {
+            padding-left: 12px;
+            padding-right: 12px;
+            Text {
+                text: "Nothing is playing. Pick an album or playlist to start a queue.";
+                color: Theme.faint;
+                font-size: 13px;
+                wrap: word-wrap;
+            }
+        }
+
+        if App.queue-tab == 0 && Player.has-track: HorizontalLayout {
+            padding-left: 12px;
+            height: 28px;
+            Text {
+                text: "Now playing";
+                color: Theme.muted;
+                font-size: 13px;
+                font-weight: 600;
+                vertical-alignment: center;
+            }
+        }
+
+        if App.queue-tab == 0 && Player.has-track: Rectangle {
+            height: 64px;
+            QueueRow {
+                x: 0;
+                width: parent.width - Lane.gutter + Lane.reach;
+                track: Player.track;
+                current: true;
+                play => { Player.toggle(); }
+                menu(x, y) => { Player.queue-menu(-1, x, y); }
+            }
+        }
+
+        if App.queue-tab == 0 && Player.has-track: HorizontalLayout {
+            padding-left: 12px;
+            padding-right: Lane.gutter - Lane.reach + 8px;
+            height: 36px;
+
+            Text {
+                horizontal-stretch: 1;
+                text: Player.queue.length == 0 ? "Nothing queued after this"
+                    : Player.context == "" ? "Next up" : "Next from " + Player.context;
+                color: Theme.muted;
+                font-size: 13px;
+                font-weight: 600;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+
+            if Player.queue.length > 0: VerticalLayout {
+                alignment: center;
+                LinkText {
+                    text: "Clear";
+                    clicked => { Player.clear-queue(); }
+                }
+            }
+        }
+
+        if App.queue-tab == 0: Rectangle {
+            vertical-stretch: 1;
+            upcoming := ListView {
+                x: 0;
+                width: parent.width + Lane.reach;
+                height: parent.height;
+                vertical-scrollbar-policy: always-off;
+                horizontal-scrollbar-policy: always-off;
+                for track[index] in Player.queue: Rectangle {
+                    height: 64px;
+                    QueueRow {
+                        x: 0;
+                        width: parent.width - Lane.gutter;
+                        track: track;
+                        play => { Player.queue-activated(index); }
+                        menu(x, y) => { Player.queue-menu(index, x, y); }
+                    }
+                }
+            }
+
+            ScrollThumb {
+                x: upcoming.width - self.width;
+                content-y <=> upcoming.content-y;
+                content-height: upcoming.content-height;
+                visible-height: upcoming.visible-height;
+            }
+        }
+
+        if App.queue-tab == 1 && Player.history.length == 0: HorizontalLayout {
+            padding-left: 12px;
+            padding-right: 12px;
+            Text {
+                text: "Songs you play show up here, newest first.";
+                color: Theme.faint;
+                font-size: 13px;
+                wrap: word-wrap;
+            }
+        }
+
+        if App.queue-tab == 1: Rectangle {
+            vertical-stretch: 1;
+            played := ListView {
+                x: 0;
+                width: parent.width + Lane.reach;
+                height: parent.height;
+                vertical-scrollbar-policy: always-off;
+                horizontal-scrollbar-policy: always-off;
+                for track[index] in Player.history: Rectangle {
+                    height: 64px;
+                    QueueRow {
+                        x: 0;
+                        width: parent.width - Lane.gutter;
+                        track: track;
+                        play => { Player.history-activated(index); }
+                        menu(x, y) => { Player.history-menu(index, x, y); }
+                    }
+                }
+            }
+
+            ScrollThumb {
+                x: played.width - self.width;
+                content-y <=> played.content-y;
+                content-height: played.content-height;
+                visible-height: played.visible-height;
+            }
+        }
+    }
+}
+
+export component PlayerBar inherits Rectangle {
+    height: 84px;
+
+    property <length> side: max(220px, self.width * 0.28);
+    property <float> progress: Player.duration > 0 ? Player.position / Player.duration : 0;
+
+    // What's playing.
+    Rectangle {
+        x: 8px;
+        width: root.side;
+
+        HorizontalLayout {
+            spacing: 14px;
+            alignment: start;
+
+            if Player.has-track: VerticalLayout {
+                alignment: center;
+                Rectangle {
+                    width: 56px;
+                    height: 56px;
+                    Cover {
+                        art: Player.track.cover;
+                        detail: 64px;
+                    }
+
+                    TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            View.card-activated({
+                                kind: CardKind.album,
+                                id: Player.track.album-id,
+                                title: Player.track.album,
+                                subtitle: Player.track.artist,
+                                cover: Player.track.cover,
+                            });
+                        }
+                    }
+                }
+            }
+
+            if Player.has-track: VerticalLayout {
+                alignment: center;
+                spacing: 4px;
+                width: min(max(now-title.preferred-width, now-artist.preferred-width), max(60px, root.side - 56px - 14px - 14px - 32px - 8px));
+
+                now-title := LinkText {
+                    text: Player.track.title;
+                    ink: Theme.text;
+                    font-size: 14px;
+                    font-weight: 600;
+                    enabled: Player.track.album-id != "";
+                    clicked => {
+                        View.card-activated({
+                            kind: CardKind.album,
+                            id: Player.track.album-id,
+                            title: Player.track.album,
+                            subtitle: Player.track.artist,
+                            cover: Player.track.cover,
+                        });
+                    }
+                }
+
+                now-artist := LinkText {
+                    text: Player.track.artist;
+                    font-size: 12px;
+                    enabled: Player.track.artist-id != "";
+                    clicked => {
+                        View.card-activated({ kind: CardKind.artist, id: Player.track.artist-id, title: Player.track.artist });
+                    }
+                }
+            }
+
+            if Player.has-track: VerticalLayout {
+                alignment: center;
+                IconButton {
+                    icon: Player.track.starred ? Icons.heart-fill : Icons.heart;
+                    icon-size: 17px;
+                    tint: Player.track.starred ? Theme.warm : Theme.muted;
+                    hover-tint: Player.track.starred ? Theme.warm : Theme.text;
+                    label: Player.track.starred ? "Remove from Liked songs" : "Add to Liked songs";
+                    clicked => { Player.toggle-star(); }
+                }
+            }
+        }
+
+    }
+
+    // Transport.
+    Rectangle {
+        x: 8px + root.side;
+        width: root.width - 2 * root.side - 20px;
+
+        VerticalLayout {
+            alignment: center;
+            spacing: 2px;
+
+            HorizontalLayout {
+                alignment: center;
+                spacing: 10px;
+
+                VerticalLayout {
+                    alignment: center;
+                    IconButton {
+                        icon: Icons.shuffle;
+                        icon-size: 17px;
+                        active: Player.shuffle;
+                        label: Player.shuffle ? "Turn off shuffle" : "Shuffle";
+                        clicked => { Player.toggle-shuffle(); }
+                    }
+                }
+
+                VerticalLayout {
+                    alignment: center;
+                    IconButton {
+                        icon: Icons.prev-fill;
+                        icon-size: 17px;
+                        tint: Theme.text;
+                        enabled: Player.has-track;
+                        label: "Previous";
+                        clicked => { Player.previous(); }
+                    }
+                }
+
+                Rectangle {
+                    width: 38px;
+                    height: 38px;
+                    border-radius: 19px;
+                    background: toggle.pressed ? Theme.muted : Theme.text;
+                    opacity: Player.has-track ? 1 : 0.4;
+                    accessible-role: button;
+                    accessible-label: Player.playing ? "Pause" : "Play";
+                    accessible-action-default => { Player.toggle(); }
+
+                    toggle := TouchArea {
+                        enabled: Player.has-track;
+                        mouse-cursor: pointer;
+                        clicked => { Player.toggle(); }
+                    }
+
+                    Icon {
+                        source: Player.playing ? Icons.pause-fill : Icons.play-fill;
+                        size: 16px;
+                        tint: Theme.base;
+                    }
+                }
+
+                VerticalLayout {
+                    alignment: center;
+                    IconButton {
+                        icon: Icons.next-fill;
+                        icon-size: 17px;
+                        tint: Theme.text;
+                        enabled: Player.has-track;
+                        label: "Next";
+                        clicked => { Player.next(); }
+                    }
+                }
+
+                VerticalLayout {
+                    alignment: center;
+                    IconButton {
+                        icon: Player.repeat == 2 ? Icons.repeat-1 : Icons.repeat;
+                        icon-size: 17px;
+                        active: Player.repeat != 0;
+                        label: Player.repeat == 0 ? "Repeat" : Player.repeat == 1 ? "Repeat one" : "Turn off repeat";
+                        clicked => { Player.cycle-repeat(); }
+                    }
+                }
+            }
+
+            HorizontalLayout {
+                spacing: 8px;
+                alignment: center;
+
+                Text {
+                    width: 44px;
+                    text: Player.has-track ? Player.clock(seek.dragging ? seek.drag-value * Player.duration : Player.position) : "";
+                    color: Theme.muted;
+                    font-size: 12px;
+                    horizontal-alignment: right;
+                    vertical-alignment: center;
+                }
+
+                seek := Slider {
+                    width: clamp(root.width - 2 * root.side - 140px, 120px, 640px);
+                    value: root.progress;
+                    enabled: Player.has-track && Player.duration > 0;
+                    label: "Seek";
+                    released(value) => { Player.seek(value * Player.duration); }
+                }
+
+                Text {
+                    width: 44px;
+                    text: Player.has-track ? Player.clock(Player.duration) : "";
+                    color: Theme.muted;
+                    font-size: 12px;
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+    }
+
+    // Lyrics, queue and volume.
+    Rectangle {
+        x: root.width - root.side - 12px;
+        width: root.side;
+
+        HorizontalLayout {
+            alignment: end;
+            spacing: 2px;
+
+            VerticalLayout {
+                alignment: center;
+                IconButton {
+                    icon: Icons.mic-vocal;
+                    icon-size: 17px;
+                    active: App.page == Page.lyrics;
+                    enabled: Player.has-track;
+                    label: "Lyrics";
+                    clicked => {
+                        if App.page == Page.lyrics {
+                            App.go-back();
+                        } else {
+                            App.navigate("lyrics");
+                        }
+                    }
+                }
+            }
+
+            VerticalLayout {
+                alignment: center;
+                IconButton {
+                    icon: Icons.list-music;
+                    icon-size: 17px;
+                    active: App.queue-open;
+                    label: "Queue";
+                    clicked => { App.set-queue-open(!App.queue-open); }
+                }
+            }
+
+            VerticalLayout {
+                alignment: center;
+                IconButton {
+                    icon: Player.muted || Player.volume == 0 ? Icons.volume-x : Player.volume < 0.5 ? Icons.volume-1 : Icons.volume-2;
+                    icon-size: 17px;
+                    label: Player.muted ? "Unmute" : "Mute";
+                    clicked => { Player.toggle-mute(); }
+                }
+            }
+
+            VerticalLayout {
+                alignment: center;
+                Slider {
+                    width: clamp(root.side - 150px, 60px, 110px);
+                    value: Player.muted ? 0 : Player.volume;
+                    label: "Volume";
+                    moved(value) => { Player.set-volume(value); }
+                    scrolled(delta) => {
+                        Player.set-volume(clamp(Player.volume + (delta > 0 ? 0.05 : -0.05), 0, 1));
+                    }
+                }
+            }
+        }
+    }
+}

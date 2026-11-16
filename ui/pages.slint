@@ -1,0 +1,1343 @@
+// The screens shown in the main panel.
+
+import { ScrollView, ListView, AboutSlint } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+import { Icons } from "icons.slint";
+import { App, View, Player, Lyrics, Settings, Covers, Card, CardKind, Shelf, Page, QualityOption } from "types.slint";
+import { Icon, IconButton, PlayButton, TextButton, LinkText, Cover, Field, Toggle, Chip, Slider, MediaCard, TrackRow, PageStatus, HoverIntent, SkeletonRows, ScrollThumb } from "widgets.slint";
+
+// Cover, title and summary at the top of an album, playlist or artist.
+component Hero inherits Rectangle {
+    property <length> art: clamp(self.width * 0.24, 140px, 232px);
+    height: self.art + 48px;
+
+    HorizontalLayout {
+        padding-left: Theme.page-pad;
+        padding-right: Theme.page-pad;
+        padding-top: 16px;
+        padding-bottom: 24px;
+        spacing: 24px;
+
+        Rectangle {
+            width: root.art;
+            height: root.art;
+            border-radius: View.cover-round ? root.art / 2 : 8px;
+            background: Theme.raised;
+            drop-shadow-blur: 32px;
+            drop-shadow-offset-y: 8px;
+            drop-shadow-color: #00000080;
+
+            if View.liked-songs: Rectangle {
+                border-radius: 8px;
+                background: @linear-gradient(135deg, #5b3fd6 0%, #f5b85c 100%);
+                Icon {
+                    source: Icons.heart-fill;
+                    size: root.art * 0.34;
+                    tint: white;
+                }
+            }
+
+            if !View.liked-songs: Cover {
+                art: View.cover;
+                round: View.cover-round;
+                placeholder: View.cover-round ? Icons.user-round : Icons.disc-3;
+                detail: root.art;
+            }
+        }
+
+        VerticalLayout {
+            alignment: end;
+            spacing: 8px;
+
+            Text {
+                text: View.label;
+                color: Theme.text;
+                font-size: 13px;
+                font-weight: 600;
+            }
+
+            Text {
+                text: View.title;
+                color: Theme.text;
+                font-family: Theme.display;
+                font-size: View.title.character-count > 34 ? 30px : View.title.character-count > 18 ? 42px : 60px;
+                font-weight: 800;
+                wrap: word-wrap;
+                max-lines: 2;
+                overflow: elide;
+            }
+
+            HorizontalLayout {
+                alignment: start;
+                spacing: 8px;
+
+                if View.subtitle != "": LinkText {
+                    text: View.subtitle;
+                    ink: Theme.text;
+                    font-size: 14px;
+                    font-weight: 600;
+                    enabled: View.subtitle-route != "";
+                    clicked => { App.navigate(View.subtitle-route); }
+                }
+
+                Text {
+                    text: View.meta;
+                    color: Theme.muted;
+                    font-size: 14px;
+                    overflow: elide;
+                }
+            }
+        }
+    }
+}
+
+component ActionBar inherits Rectangle {
+    height: 72px;
+
+    HorizontalLayout {
+        padding-left: Theme.page-pad;
+        padding-right: Theme.page-pad;
+        spacing: 16px;
+        alignment: start;
+
+        if View.can-play: VerticalLayout {
+            alignment: center;
+            PlayButton {
+                size: 54px;
+                label: "Play " + View.title;
+                clicked => { View.play(false); }
+            }
+        }
+
+        if View.can-play: VerticalLayout {
+            alignment: center;
+            IconButton {
+                width: 40px;
+                height: 40px;
+                icon: Icons.shuffle;
+                icon-size: 22px;
+                label: "Shuffle " + View.title;
+                clicked => { View.play(true); }
+            }
+        }
+
+        if View.can-star: VerticalLayout {
+            alignment: center;
+            IconButton {
+                width: 40px;
+                height: 40px;
+                icon: View.starred ? Icons.heart-fill : Icons.heart;
+                icon-size: 22px;
+                tint: View.starred ? Theme.warm : Theme.muted;
+                hover-tint: View.starred ? Theme.warm : Theme.text;
+                label: View.starred ? "Remove from liked albums" : "Add to liked albums";
+                clicked => { View.toggle-star(); }
+            }
+        }
+
+        if View.has-menu: VerticalLayout {
+            alignment: center;
+            more := IconButton {
+                width: 40px;
+                height: 40px;
+                icon: Icons.ellipsis;
+                icon-size: 22px;
+                label: "More options";
+                clicked => { View.header-menu(more.absolute-position.x, more.absolute-position.y + more.height); }
+            }
+        }
+    }
+}
+
+component ColumnHeader inherits Rectangle {
+    height: 36px;
+
+    HorizontalLayout {
+        padding-left: 32px;
+        padding-right: 28px;
+        spacing: 16px;
+
+        if View.show-number: Text {
+            width: 24px;
+            text: "#";
+            color: Theme.muted;
+            font-size: 13px;
+            horizontal-alignment: right;
+            vertical-alignment: center;
+        }
+
+        if View.show-cover: Rectangle {
+            width: 40px;
+        }
+
+        Text {
+            horizontal-stretch: 5;
+            min-width: 80px;
+            preferred-width: 0px;
+            text: "Title";
+            color: Theme.muted;
+            font-size: 13px;
+            vertical-alignment: center;
+        }
+
+        if View.show-album: Text {
+            horizontal-stretch: 3;
+            min-width: 0px;
+            preferred-width: 0px;
+            text: "Album";
+            color: Theme.muted;
+            font-size: 13px;
+            vertical-alignment: center;
+        }
+
+        // Same width as a row's heart, duration and menu button, so the columns line up.
+        HorizontalLayout {
+            width: 132px;
+            alignment: end;
+            padding-right: 46px;
+            VerticalLayout {
+                alignment: center;
+                Icon {
+                    source: Icons.clock-3;
+                    size: 15px;
+                }
+            }
+        }
+    }
+
+    Rectangle {
+        x: 16px;
+        y: parent.height - 1px;
+        width: parent.width - 32px;
+        height: 1px;
+        background: Theme.line;
+    }
+}
+
+component SectionTitle inherits Rectangle {
+    in property <string> text;
+    in property <string> route;
+    height: 44px;
+
+    HorizontalLayout {
+        padding-left: Theme.page-pad;
+        padding-right: Theme.page-pad;
+
+        Text {
+            horizontal-stretch: 1;
+            text: root.text;
+            color: Theme.text;
+            font-family: Theme.display;
+            font-size: 22px;
+            font-weight: 700;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+
+        if root.route != "": VerticalLayout {
+            alignment: center;
+            LinkText {
+                text: "Show all";
+                font-weight: 600;
+                clicked => { App.navigate(root.route); }
+            }
+        }
+    }
+}
+
+component ShelfView inherits Rectangle {
+    in property <Shelf> shelf;
+    property <bool> genres: self.shelf.cards.length > 0 && self.shelf.cards[0].kind == CardKind.genre;
+    property <length> avail: self.width - 24px;
+    property <int> cols: max(2, floor(self.avail / (self.genres ? 220px : 188px)));
+    property <length> card-width: floor(self.avail / self.cols / 1px) * 1px;
+    property <int> rows: self.shelf.wrap ? ceil(self.shelf.cards.length / self.cols) : 1;
+    property <length> row-height: self.genres ? 96px : self.card-width - 24px + 78px;
+
+    height: 44px + self.rows * self.row-height + 4px;
+
+    SectionTitle {
+        y: 0;
+        text: root.shelf.title;
+        route: root.shelf.route;
+    }
+
+    for card[index] in root.shelf.cards: Rectangle {
+        property <bool> shown: index < root.rows * root.cols;
+        x: 12px + Math.mod(index, root.cols) * root.card-width;
+        y: 44px + floor(index / root.cols) * root.row-height;
+        width: root.card-width;
+        height: root.row-height;
+
+        if self.shown: MediaCard {
+            width: parent.width;
+            card: card;
+            activated => { View.card-activated(card); }
+            play => { View.card-play(card); }
+            menu(x, y) => { View.card-menu(card, x, y); }
+        }
+    }
+}
+
+// A compact album tile for the top of Home.
+component QuickTile inherits Rectangle {
+    in property <Card> card;
+    height: 56px;
+    border-radius: 6px;
+    background: touch.has-hover ? #ffffff26 : #ffffff14;
+    clip: true;
+    animate background { duration: 140ms; }
+
+    accessible-role: button;
+    accessible-label: self.card.title;
+    accessible-action-default => { View.card-activated(root.card); }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { View.card-activated(root.card); }
+        pointer-event(event) => {
+            if event.button == PointerEventButton.right && event.kind == PointerEventKind.down {
+                View.card-menu(root.card, self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
+            }
+        }
+
+        HoverIntent {
+            hovered: touch.has-hover;
+            rested => { View.card-hovered(root.card); }
+        }
+
+        Rectangle {
+            x: 0;
+            width: 56px;
+            height: 56px;
+            Cover {
+                art: root.card.cover;
+                border-radius: 0;
+                placeholder: Icons.disc-3;
+                detail: 64px;
+            }
+        }
+
+        Text {
+            x: 68px;
+            width: parent.width - 68px - (touch.has-hover ? 52px : 12px);
+            text: root.card.title;
+            color: Theme.text;
+            font-size: 14px;
+            font-weight: 600;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+
+        if touch.has-hover: PlayButton {
+            x: parent.width - self.width - 8px;
+            size: 36px;
+            label: "Play " + root.card.title;
+            clicked => { View.card-play(root.card); }
+        }
+    }
+}
+
+component TileGrid inherits Rectangle {
+    property <length> avail: self.width - 2 * Theme.page-pad;
+    property <int> cols: self.avail > 880px ? 4 : self.avail > 560px ? 3 : 2;
+    property <length> tile-width: (self.avail - (self.cols - 1) * 10px) / self.cols;
+    property <int> shown: min(View.tiles.length, self.cols * 2);
+    height: ceil(self.shown / self.cols) * 66px;
+
+    for card[index] in View.tiles: Rectangle {
+        x: Theme.page-pad + Math.mod(index, root.cols) * (root.tile-width + 10px);
+        y: floor(index / root.cols) * 66px;
+        width: root.tile-width;
+        height: 56px;
+        if index < root.shown: QuickTile {
+            card: card;
+        }
+    }
+}
+
+// Home, search results and artist pages: a title or hero, then songs, then shelves.
+export component StackPage inherits Rectangle {
+    in property <bool> hero;
+
+    scroll := ScrollView {
+        vertical-scrollbar-policy: always-off;
+        horizontal-scrollbar-policy: always-off;
+        content-y <=> View.scroll-y;
+
+        VerticalLayout {
+            width: scroll.visible-width;
+            alignment: start;
+            spacing: 8px;
+            padding-bottom: 32px;
+
+            if root.hero: Hero { }
+            if root.hero: ActionBar { }
+
+            if !root.hero && View.title != "": HorizontalLayout {
+                padding-left: Theme.page-pad;
+                padding-right: Theme.page-pad;
+                padding-top: 8px;
+                padding-bottom: 12px;
+                Text {
+                    text: View.title;
+                    color: Theme.text;
+                    font-family: Theme.display;
+                    font-size: 34px;
+                    font-weight: 800;
+                    overflow: elide;
+                }
+            }
+
+            if View.tiles.length > 0: TileGrid { }
+            if View.tiles.length > 0: Rectangle {
+                height: 12px;
+            }
+
+            if View.pending: SkeletonRows {
+                rows: 4;
+            }
+
+            if View.empty != "": VerticalLayout {
+                padding: Theme.page-pad;
+                padding-top: 48px;
+                Text {
+                    text: View.empty;
+                    color: Theme.muted;
+                    font-size: 15px;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+            }
+
+            if View.tracks.length > 0 && View.tracks-title != "": SectionTitle {
+                text: View.tracks-title;
+            }
+
+            for track[index] in View.tracks: HorizontalLayout {
+                padding-left: 12px;
+                padding-right: 12px;
+                TrackRow {
+                    track: track;
+                    show-album: View.show-album;
+                    show-cover: View.show-cover;
+                    show-number: View.show-number;
+                    activated => { View.track-activated(index); }
+                    star => { View.track-star(index); }
+                    menu(x, y) => { View.track-menu(index, x, y); }
+                }
+            }
+
+            for shelf in View.shelves: ShelfView {
+                shelf: shelf;
+            }
+
+            if View.about != "": VerticalLayout {
+                padding-left: Theme.page-pad;
+                padding-right: Theme.page-pad;
+                padding-top: 16px;
+                spacing: 12px;
+
+                Text {
+                    text: "About";
+                    color: Theme.text;
+                    font-family: Theme.display;
+                    font-size: 22px;
+                    font-weight: 700;
+                }
+
+                Text {
+                    max-width: 720px;
+                    text: View.about;
+                    color: Theme.muted;
+                    font-size: 14px;
+                    wrap: word-wrap;
+                }
+            }
+        }
+    }
+
+    ScrollThumb {
+        x: parent.width - self.width;
+        content-y <=> scroll.content-y;
+        content-height: scroll.content-height;
+        visible-height: scroll.visible-height;
+    }
+}
+
+// Albums, playlists and Liked songs. The list is virtualised, so the hero is part of row 0.
+export component TrackListPage inherits Rectangle {
+    if View.tracks.length == 0: VerticalLayout {
+        alignment: start;
+        Hero { }
+
+        ActionBar { }
+
+        if View.pending: SkeletonRows { }
+
+        if !View.pending: Text {
+            text: View.empty;
+            color: Theme.muted;
+            font-size: 15px;
+            horizontal-alignment: center;
+            wrap: word-wrap;
+        }
+    }
+
+    if View.tracks.length > 0: Rectangle {
+        tracks := ListView {
+            vertical-scrollbar-policy: always-off;
+            horizontal-scrollbar-policy: always-off;
+            content-y <=> View.scroll-y;
+
+            for track[index] in View.tracks: VerticalLayout {
+                if index == 0: Hero { }
+                if index == 0: ActionBar { }
+                if index == 0: ColumnHeader { }
+                if index == 0: Rectangle {
+                    height: 8px;
+                }
+
+                if track.section != "": HorizontalLayout {
+                    height: 44px;
+                    padding-left: 32px;
+                    spacing: 12px;
+                    VerticalLayout {
+                        alignment: center;
+                        Icon {
+                            source: Icons.disc-3;
+                            size: 16px;
+                        }
+                    }
+
+                    Text {
+                        text: track.section;
+                        color: Theme.muted;
+                        font-size: 13px;
+                        font-weight: 600;
+                        vertical-alignment: center;
+                    }
+                }
+
+                HorizontalLayout {
+                    padding-left: 16px;
+                    padding-right: 16px;
+                    TrackRow {
+                        track: track;
+                        show-album: View.show-album;
+                        show-cover: View.show-cover;
+                        show-number: View.show-number;
+                        activated => { View.track-activated(index); }
+                        star => { View.track-star(index); }
+                        menu(x, y) => { View.track-menu(index, x, y); }
+                    }
+                }
+
+                if index == View.tracks.length - 1: VerticalLayout {
+                    padding-top: 24px;
+                    padding-bottom: 32px;
+                    for shelf in View.shelves: ShelfView {
+                        shelf: shelf;
+                    }
+                }
+            }
+        }
+
+        ScrollThumb {
+            x: parent.width - self.width;
+            content-y <=> tracks.content-y;
+            content-height: tracks.content-height;
+            visible-height: tracks.visible-height;
+        }
+    }
+}
+
+// Every album or artist in the library, loaded a page at a time as you scroll.
+export component GridPage inherits Rectangle {
+    property <bool> genres: View.grid.length > 0 && View.grid[0].cards.length > 0 && View.grid[0].cards[0].kind == CardKind.genre;
+    property <length> avail: self.width - 24px - 14px;
+    property <int> cols: max(2, floor(self.avail / (self.genres ? 220px : 188px)));
+    property <length> card-width: floor(self.avail / self.cols / 1px) * 1px;
+    changed cols => { View.columns-changed(self.cols); }
+    init => { View.columns-changed(self.cols); }
+
+    VerticalLayout {
+        HorizontalLayout {
+            padding-left: Theme.page-pad;
+            padding-right: Theme.page-pad;
+            padding-top: 8px;
+            padding-bottom: 12px;
+            Text {
+                text: View.title;
+                color: Theme.text;
+                font-family: Theme.display;
+                font-size: 34px;
+                font-weight: 800;
+                overflow: elide;
+            }
+        }
+
+        if View.sorts.length > 0: HorizontalLayout {
+            padding-left: Theme.page-pad;
+            padding-bottom: 12px;
+            spacing: 8px;
+            alignment: start;
+            for name[index] in View.sorts: Chip {
+                text: name;
+                selected: index == View.sort;
+                clicked => { View.set-sort(index); }
+            }
+        }
+
+        if View.empty != "": Text {
+            text: View.empty;
+            color: Theme.muted;
+            font-size: 15px;
+            horizontal-alignment: center;
+            wrap: word-wrap;
+        }
+
+        Rectangle {
+            vertical-stretch: 1;
+            list := ListView {
+                vertical-scrollbar-policy: always-off;
+                horizontal-scrollbar-policy: always-off;
+                content-y <=> View.scroll-y;
+                scrolled => {
+                    if -self.content-y + self.visible-height > self.content-height - 900px {
+                        View.near-end();
+                    }
+                }
+
+                for row in View.grid: HorizontalLayout {
+                    padding-left: 12px;
+                    alignment: start;
+                    for card in row.cards: MediaCard {
+                        width: root.card-width;
+                        card: card;
+                        activated => { View.card-activated(card); }
+                        play => { View.card-play(card); }
+                        menu(x, y) => { View.card-menu(card, x, y); }
+                    }
+                }
+            }
+
+            ScrollThumb {
+                x: parent.width - self.width;
+                content-y <=> list.content-y;
+                content-height: list.content-height;
+                visible-height: list.visible-height;
+            }
+        }
+    }
+}
+
+export component LyricsPage inherits Rectangle {
+    if Lyrics.lines.length == 0: VerticalLayout {
+        alignment: center;
+        spacing: 12px;
+        Text {
+            text: Lyrics.status;
+            color: Theme.muted;
+            font-family: Theme.display;
+            font-size: 24px;
+            font-weight: 700;
+            horizontal-alignment: center;
+            wrap: word-wrap;
+        }
+    }
+
+    if Lyrics.lines.length > 0: Rectangle {
+        scroll := ScrollView {
+            vertical-scrollbar-policy: always-off;
+            horizontal-scrollbar-policy: always-off;
+
+            VerticalLayout {
+                width: scroll.visible-width;
+                alignment: start;
+                padding-left: 48px;
+                padding-right: 48px;
+                padding-top: 32px;
+                padding-bottom: 160px;
+                spacing: 14px;
+
+                for line[index] in Lyrics.lines: Rectangle {
+                    property <bool> active: Lyrics.timed && index == Lyrics.active;
+                    property <bool> past: Lyrics.timed && index < Lyrics.active;
+                    height: label.preferred-height;
+                    changed active => {
+                        if self.active {
+                            anchor.ensure-visible(ScrollBehavior.smooth);
+                        }
+                    }
+
+                    // Taller than the line, so scrolling it into view leaves room around the lyric.
+                    anchor := Rectangle {
+                        y: -120px;
+                        height: parent.height + 360px;
+                    }
+
+                    label := Text {
+                        x: 0;
+                        width: parent.width;
+                        text: line.text == "" ? "♪" : line.text;
+                        color: parent.active || !Lyrics.timed ? Theme.text : touch.has-hover ? Theme.text : parent.past ? Theme.faint : Theme.muted;
+                        font-family: Theme.display;
+                        font-size: 28px;
+                        font-weight: 700;
+                        wrap: word-wrap;
+                        animate color { duration: 200ms; }
+                    }
+
+                    touch := TouchArea {
+                        enabled: Lyrics.timed && line.time >= 0;
+                        mouse-cursor: self.enabled ? pointer : default;
+                        clicked => { Player.seek(line.time); }
+                    }
+                }
+            }
+        }
+
+        ScrollThumb {
+            x: parent.width - self.width;
+            content-y <=> scroll.content-y;
+            content-height: scroll.content-height;
+            visible-height: scroll.visible-height;
+        }
+    }
+}
+
+component SettingRow inherits Rectangle {
+    in property <string> title;
+    in property <string> detail;
+    min-height: 56px;
+
+    HorizontalLayout {
+        spacing: 24px;
+
+        VerticalLayout {
+            alignment: center;
+            spacing: 4px;
+            horizontal-stretch: 1;
+
+            Text {
+                text: root.title;
+                color: Theme.text;
+                font-size: 15px;
+                font-weight: 500;
+                wrap: word-wrap;
+            }
+
+            if root.detail != "": Text {
+                text: root.detail;
+                color: Theme.muted;
+                font-size: 13px;
+                wrap: word-wrap;
+            }
+        }
+
+        VerticalLayout {
+            alignment: center;
+            @children
+        }
+    }
+}
+
+component SettingGroup inherits VerticalLayout {
+    in property <string> title;
+    spacing: 12px;
+
+    Text {
+        text: root.title;
+        color: Theme.text;
+        font-family: Theme.display;
+        font-size: 20px;
+        font-weight: 700;
+        height: 36px;
+        vertical-alignment: center;
+    }
+
+    @children
+}
+
+// One choice in the streaming quality list.
+component QualityRow inherits Rectangle {
+    in property <QualityOption> option;
+    in property <bool> selected;
+    callback clicked;
+
+    border-radius: 8px;
+    background: touch.has-hover ? Theme.hover : transparent;
+    animate background { duration: 120ms; }
+
+    accessible-role: button;
+    accessible-label: self.option.title;
+    accessible-checkable: true;
+    accessible-checked: self.selected;
+    accessible-action-default => { root.clicked(); }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+        padding-top: 10px;
+        padding-bottom: 10px;
+        spacing: 16px;
+
+        VerticalLayout {
+            spacing: 3px;
+            horizontal-stretch: 1;
+
+            Text {
+                text: root.option.title;
+                color: root.selected ? Theme.accent-bright : Theme.text;
+                font-size: 15px;
+                font-weight: 600;
+            }
+
+            Text {
+                text: root.option.detail;
+                color: Theme.muted;
+                font-size: 13px;
+                wrap: word-wrap;
+            }
+        }
+
+        VerticalLayout {
+            alignment: center;
+            Icon {
+                source: Icons.check;
+                size: 18px;
+                tint: Theme.accent-bright;
+                opacity: root.selected ? 1 : 0;
+            }
+        }
+    }
+}
+
+// The equaliser: six draggable points on a plus-or-minus 12 dB plot.
+component EqPanel inherits Rectangle {
+    property <length> side: 76px;
+    property <length> plot-top: 76px;
+    property <length> plot-height: 168px;
+    property <length> step: (self.width - 2 * self.side) / 5;
+    property <length> zero: self.plot-top + self.plot-height / 2;
+
+    pure function px(band: int) -> float {
+        return (root.side + band * root.step) / 1px;
+    }
+    pure function py(band: int) -> float {
+        return (root.zero - Settings.eq-gains[band] / 12 * root.plot-height / 2) / 1px;
+    }
+    function gain-at(y: length) -> float {
+        return clamp((root.zero - y) / (root.plot-height / 2) * 12, -12, 12);
+    }
+
+    property <string> curve: "M " + px(0) + " " + py(0) + " L " + px(1) + " " + py(1) + " L " + px(2) + " " + py(2)
+        + " L " + px(3) + " " + py(3) + " L " + px(4) + " " + py(4) + " L " + px(5) + " " + py(5);
+    property <float> floor: (self.plot-top + self.plot-height) / 1px;
+
+    height: 308px;
+    border-radius: 10px;
+    background: Theme.raised;
+
+    // Presets.
+    Text {
+        x: 24px;
+        y: 24px;
+        height: 32px;
+        text: "Preset";
+        color: Theme.muted;
+        font-size: 14px;
+        vertical-alignment: center;
+    }
+
+    preset := Rectangle {
+        x: 84px;
+        y: 24px;
+        width: preset-row.preferred-width;
+        height: 32px;
+        border-radius: 16px;
+        background: preset-touch.has-hover ? Theme.press : Theme.hover;
+        accessible-role: button;
+        accessible-label: "Equaliser preset: " + Settings.eq-preset;
+        accessible-action-default => { preset-touch.clicked(); }
+
+        preset-touch := TouchArea {
+            mouse-cursor: pointer;
+            clicked => { Settings.choose-preset(preset.absolute-position.x, preset.absolute-position.y + preset.height + 4px); }
+        }
+
+        preset-row := HorizontalLayout {
+            padding-left: 14px;
+            padding-right: 10px;
+            spacing: 6px;
+            Text {
+                text: Settings.eq-preset;
+                color: Theme.text;
+                font-size: 13px;
+                font-weight: 500;
+                vertical-alignment: center;
+            }
+
+            VerticalLayout {
+                alignment: center;
+                Icon {
+                    source: Icons.chevron-down;
+                    size: 16px;
+                }
+            }
+        }
+    }
+
+    // Scale.
+    Text {
+        x: 16px;
+        y: root.plot-top - 8px;
+        text: "+12 dB";
+        color: Theme.faint;
+        font-size: 12px;
+    }
+
+    Text {
+        x: 16px;
+        y: root.plot-top + root.plot-height - 8px;
+        text: "−12 dB";
+        color: Theme.faint;
+        font-size: 12px;
+    }
+
+    Rectangle {
+        x: root.side - 24px;
+        y: root.zero;
+        width: root.width - 2 * root.side + 48px;
+        height: 1px;
+        background: Theme.line;
+    }
+
+    // The curve and the area beneath it.
+    Path {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        viewbox-width: root.width / 1px;
+        viewbox-height: root.height / 1px;
+        commands: root.curve + " L " + px(5) + " " + root.floor + " L " + px(0) + " " + root.floor + " Z";
+        fill: @linear-gradient(180deg, Theme.accent.with-alpha(0.55) 0%, Theme.accent.with-alpha(0.04) 100%);
+        stroke-width: 0px;
+    }
+
+    Path {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        viewbox-width: root.width / 1px;
+        viewbox-height: root.height / 1px;
+        commands: root.curve;
+        stroke: Theme.accent-bright;
+        stroke-width: 2px;
+    }
+
+    for label[band] in Settings.eq-labels: Rectangle {
+        x: root.side + band * root.step - root.step / 2;
+        y: root.plot-top - 10px;
+        width: root.step;
+        height: root.plot-height + 52px;
+
+        Rectangle {
+            y: 10px;
+            width: 1px;
+            height: root.plot-height;
+            background: Theme.line;
+        }
+
+        Rectangle {
+            y: root.py(band) * 1px - parent.y - self.height / 2;
+            width: drag.has-hover || drag.pressed ? 16px : 12px;
+            height: self.width;
+            border-radius: self.width / 2;
+            background: white;
+            animate width { duration: 100ms; }
+        }
+
+        Text {
+            y: root.plot-height + 24px;
+            width: parent.width;
+            text: label;
+            color: Theme.muted;
+            font-size: 12px;
+            font-weight: 600;
+            horizontal-alignment: center;
+        }
+
+        drag := TouchArea {
+            height: root.plot-height + 20px;
+            y: 0;
+            mouse-cursor: pointer;
+            pointer-event(event) => {
+                if event.button == PointerEventButton.left && event.kind == PointerEventKind.down {
+                    Settings.set-eq-band(band, root.gain-at(parent.y + self.mouse-y), false);
+                }
+                if event.button == PointerEventButton.left && event.kind == PointerEventKind.up {
+                    Settings.set-eq-band(band, root.gain-at(parent.y + self.mouse-y), true);
+                }
+            }
+            moved => {
+                if self.pressed {
+                    Settings.set-eq-band(band, root.gain-at(parent.y + self.mouse-y), false);
+                }
+            }
+        }
+    }
+
+    TextButton {
+        x: root.width - self.width - 20px;
+        y: 23px;
+        width: 88px;
+        height: 34px;
+        text: "Reset";
+        clicked => { Settings.reset-eq(); }
+    }
+}
+
+export component SettingsPage inherits Rectangle {
+    scroll := ScrollView {
+        vertical-scrollbar-policy: always-off;
+        horizontal-scrollbar-policy: always-off;
+
+        VerticalLayout {
+            width: scroll.visible-width;
+            alignment: start;
+
+            HorizontalLayout {
+                alignment: center;
+
+                VerticalLayout {
+                    width: min(scroll.visible-width - 2 * Theme.page-pad, 760px);
+                    alignment: start;
+                    padding-top: 8px;
+                    padding-bottom: 56px;
+                    spacing: 28px;
+
+                    Text {
+                        text: "Settings";
+                        color: Theme.text;
+                        font-family: Theme.display;
+                        font-size: 34px;
+                        font-weight: 800;
+                    }
+
+                    SettingGroup {
+                        title: "Audio quality";
+
+                        Text {
+                            text: "Lossless plays your files untouched. The other settings have your server convert to MP3 as you listen, which uses less data away from home.";
+                            color: Theme.muted;
+                            font-size: 13px;
+                            wrap: word-wrap;
+                        }
+
+                        VerticalLayout {
+                            spacing: 2px;
+                            for option[index] in Settings.qualities: QualityRow {
+                                option: option;
+                                selected: index == Settings.quality;
+                                clicked => { Settings.set-quality(index); }
+                            }
+                        }
+
+                        if Settings.now-format != "": Text {
+                            text: Settings.now-format;
+                            color: Theme.muted;
+                            font-size: 13px;
+                            wrap: word-wrap;
+                        }
+                    }
+
+                    SettingGroup {
+                        title: "Playback";
+
+                        SettingRow {
+                            title: "Crossfade songs";
+                            detail: "Blends the end of each song into the start of the next.";
+                            HorizontalLayout {
+                                spacing: 12px;
+                                fade := Slider {
+                                    width: 200px;
+                                    value: Settings.crossfade / 12;
+                                    label: "Crossfade length";
+                                    moved(value) => { Settings.set-crossfade(value * 12, false); }
+                                    released(value) => { Settings.set-crossfade(value * 12, true); }
+                                }
+
+                                Text {
+                                    width: 36px;
+                                    text: Settings.crossfade < 0.5 ? "Off" : Math.round(Settings.crossfade) + " s";
+                                    color: Theme.text;
+                                    font-size: 13px;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+
+                        SettingRow {
+                            title: "Gapless playback";
+                            detail: "Runs one track straight into the next, the way live albums and mixes are meant to be heard.";
+                            Toggle {
+                                on: Settings.gapless;
+                                label: "Gapless playback";
+                                toggled(on) => { Settings.set-gapless(on); }
+                            }
+                        }
+
+                        SettingRow {
+                            title: "Autoplay";
+                            detail: "When your queue ends, keeps going with similar music from your library.";
+                            Toggle {
+                                on: Settings.autoplay;
+                                label: "Autoplay";
+                                toggled(on) => { Settings.set-autoplay(on); }
+                            }
+                        }
+
+                        SettingRow {
+                            title: "Even out volume";
+                            detail: "Uses the ReplayGain tags in your files so quiet and loud tracks play at a similar level.";
+                            Toggle {
+                                on: Settings.normalize;
+                                label: "Even out volume";
+                                toggled(on) => { Settings.set-normalize(on); }
+                            }
+                        }
+
+                        if Settings.normalize: SettingRow {
+                            title: "Volume level";
+                            detail: "How loud that level is. Loud can round off the peaks of dynamic music; Normal and Quiet never do.";
+                            HorizontalLayout {
+                                spacing: 6px;
+                                for name[index] in Settings.volume-levels: Chip {
+                                    text: name;
+                                    selected: index == Settings.volume-level;
+                                    clicked => { Settings.set-volume-level(index); }
+                                }
+                            }
+                        }
+
+                        SettingRow {
+                            title: "Mono audio";
+                            detail: "Plays the same sound from the left and right speakers.";
+                            Toggle {
+                                on: Settings.mono;
+                                label: "Mono audio";
+                                toggled(on) => { Settings.set-mono(on); }
+                            }
+                        }
+
+                        SettingRow {
+                            title: "Equaliser";
+                            detail: "Shapes the bass, mids and treble. Drag the points, or pick a preset.";
+                            Toggle {
+                                on: Settings.equalizer;
+                                label: "Equaliser";
+                                toggled(on) => { Settings.set-equalizer(on); }
+                            }
+                        }
+
+                        if Settings.equalizer: EqPanel { }
+
+                        SettingRow {
+                            title: "Report plays to Navidrome";
+                            detail: "Keeps play counts and Recently played up to date, and feeds Last.fm or ListenBrainz if you linked them in Navidrome.";
+                            Toggle {
+                                on: Settings.scrobble;
+                                label: "Report plays to Navidrome";
+                                toggled(on) => { Settings.set-scrobble(on); }
+                            }
+                        }
+                    }
+
+                    SettingGroup {
+                        title: "Server";
+
+                        SettingRow {
+                            title: App.server;
+                            detail: "Signed in as " + App.username + (App.server-version != "" ? ", Navidrome " + App.server-version : "") + (Settings.connection != "" ? ". " + Settings.connection : "");
+                            TextButton {
+                                text: "Sign out";
+                                clicked => { App.sign-out(); }
+                            }
+                        }
+                    }
+
+                    SettingGroup {
+                        title: "Storage";
+
+                        SettingRow {
+                            title: "Cache";
+                            detail: Settings.cache-size + " of cover art and page data saved on this PC, so things you've seen before open instantly.";
+                            TextButton {
+                                text: "Clear cache";
+                                clicked => { Settings.clear-cache(); }
+                            }
+                        }
+                    }
+
+                    SettingGroup {
+                        title: "About";
+
+                        SettingRow {
+                            title: "Nexus Music " + App.app-version;
+                            detail: "A native player for Navidrome. Fonts: Bricolage Grotesque and Hanken Grotesk (SIL Open Font License). Icons: Lucide (ISC License).";
+                        }
+
+                        HorizontalLayout {
+                            alignment: start;
+                            AboutSlint {
+                                width: 180px;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    ScrollThumb {
+        x: parent.width - self.width;
+        content-y <=> scroll.content-y;
+        content-height: scroll.content-height;
+        visible-height: scroll.visible-height;
+    }
+}
+
+export component LoginPage inherits Rectangle {
+    background: Theme.base;
+
+    // A wash of the brand colour behind the form.
+    Rectangle {
+        background: @radial-gradient(circle, #8b5cf640 0%, #8b5cf600 70%);
+        width: 900px;
+        height: 900px;
+        y: -420px;
+    }
+
+    VerticalLayout {
+        alignment: center;
+
+        HorizontalLayout {
+            alignment: center;
+
+            VerticalLayout {
+                width: 380px;
+                spacing: 12px;
+
+                HorizontalLayout {
+                    alignment: start;
+                    Rectangle {
+                        width: 48px;
+                        height: 48px;
+                        border-radius: 14px;
+                        background: Theme.accent;
+                        Icon {
+                            source: Icons.bars;
+                            size: 26px;
+                            tint: white;
+                        }
+                    }
+                }
+
+                Text {
+                    text: "Connect to your Navidrome server";
+                    color: Theme.text;
+                    font-family: Theme.display;
+                    font-size: 34px;
+                    font-weight: 800;
+                    wrap: word-wrap;
+                }
+
+                Text {
+                    text: "Nexus Music streams straight from the music library you host.";
+                    color: Theme.muted;
+                    font-size: 14px;
+                    wrap: word-wrap;
+                }
+
+                Rectangle {
+                    height: 8px;
+                }
+
+                Text {
+                    text: "Server address";
+                    color: Theme.text;
+                    font-size: 13px;
+                    font-weight: 600;
+                }
+
+                server := Field {
+                    text: App.server;
+                    placeholder: "http://192.168.1.10:4533";
+                    label: "Server address";
+                    accepted => { user.focus(); }
+                }
+
+                Text {
+                    text: "Username";
+                    color: Theme.text;
+                    font-size: 13px;
+                    font-weight: 600;
+                }
+
+                user := Field {
+                    text: App.username;
+                    label: "Username";
+                    accepted => { password.focus(); }
+                }
+
+                Text {
+                    text: "Password";
+                    color: Theme.text;
+                    font-size: 13px;
+                    font-weight: 600;
+                }
+
+                password := Field {
+                    input-type: InputType.password;
+                    label: "Password";
+                    accepted => { App.sign-in(server.text, user.text, password.text); }
+                }
+
+                if App.login-error != "": Text {
+                    text: App.login-error;
+                    color: Theme.danger;
+                    font-size: 13px;
+                    wrap: word-wrap;
+                }
+
+                Rectangle {
+                    height: 4px;
+                }
+
+                TextButton {
+                    text: App.login-busy ? "Connecting…" : "Connect";
+                    primary: true;
+                    enabled: !App.login-busy && server.text != "" && user.text != "" && password.text != "";
+                    height: 46px;
+                    clicked => { App.sign-in(server.text, user.text, password.text); }
+                }
+
+                Text {
+                    text: "Your password is kept in Windows Credential Manager on this PC.";
+                    color: Theme.faint;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+            }
+        }
+    }
+}

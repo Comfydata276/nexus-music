@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Cross-compiles the Windows release and builds the installer into dist/.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+version="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+target=target/x86_64-pc-windows-msvc/release/nexus-music.exe
+
+scripts/dx cargo xwin build --release --target x86_64-pc-windows-msvc
+mkdir -p dist
+cp "$target" "dist/NexusMusic-$version-portable.exe"
+scripts/dx makensis -V2 -DVERSION="$version" installer/nexus-music.nsi
+ls -lh dist/

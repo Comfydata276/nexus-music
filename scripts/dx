@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Run a command inside the nexus-music-dev container as the current user.
+# Build the image first:  docker build -f docker/dev.Dockerfile -t nexus-music-dev docker
+set -euo pipefail
+root="$(cd "$(dirname "$0")/.." && pwd)"
+cache="${NEXUS_DEV_CACHE:-$HOME/.cache/nexus-music-dev}"
+mkdir -p "$cache/registry" "$cache/git" "$cache/home"
+# shellcheck disable=SC2086
+exec docker run --rm ${DX_DOCKER_ARGS:-} \
+  -u "$(id -u):$(id -g)" --network host \
+  -e HOME=/home/dev -e CARGO_TARGET_DIR=/work/target \
+  -v "$root":/work -v "$cache/home":/home/dev \
+  -v "$cache/registry":/opt/cargo/registry -v "$cache/git":/opt/cargo/git \
+  -w /work nexus-music-dev "$@"

@@ -1,0 +1,222 @@
+// Things that float above the window: the context menu, prompts and toasts.
+
+import { Theme } from "theme.slint";
+import { Icons } from "icons.slint";
+import { Menu, Prompt, Toast, MenuEntry } from "types.slint";
+import { Icon, TextButton, Field } from "widgets.slint";
+
+component MenuRow inherits Rectangle {
+    in property <MenuEntry> entry;
+    callback activated;
+
+    height: 38px;
+    border-radius: 4px;
+    background: touch.has-hover ? Theme.press : transparent;
+
+    accessible-role: button;
+    accessible-label: self.entry.label;
+    accessible-action-default => { root.activated(); }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.activated(); }
+    }
+
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 10px;
+        spacing: 12px;
+
+        VerticalLayout {
+            alignment: center;
+            Icon {
+                source: root.entry.icon;
+                size: 16px;
+                tint: root.entry.danger ? Theme.danger : touch.has-hover ? Theme.text : Theme.muted;
+            }
+        }
+
+        Text {
+            horizontal-stretch: 1;
+            text: root.entry.label;
+            color: root.entry.danger ? Theme.danger : Theme.text;
+            font-size: 14px;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+
+        if root.entry.submenu: VerticalLayout {
+            alignment: center;
+            Icon {
+                source: Icons.chevron-right;
+                size: 16px;
+            }
+        }
+    }
+}
+
+export component MenuOverlay inherits Rectangle {
+    property <int> separators: 0;
+    property <length> panel-height: min(panel-content.preferred-height, self.height - 16px);
+
+    // Anything outside the menu closes it.
+    TouchArea {
+        clicked => { Menu.dismissed(); }
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.down && event.button != PointerEventButton.left {
+                Menu.dismissed();
+            }
+        }
+        scroll-event => {
+            Menu.dismissed();
+            return accept;
+        }
+    }
+
+    Rectangle {
+        x: clamp(Menu.x, 8px, max(8px, root.width - self.width - 8px));
+        y: clamp(Menu.y, 8px, max(8px, root.height - self.height - 8px));
+        width: 264px;
+        height: root.panel-height;
+        border-radius: 8px;
+        background: Theme.overlay;
+        border-width: 1px;
+        border-color: Theme.line;
+        drop-shadow-blur: 24px;
+        drop-shadow-offset-y: 8px;
+        drop-shadow-color: #000000a0;
+        clip: true;
+
+        // Swallow clicks on the menu's own padding.
+        TouchArea { }
+
+        panel-content := VerticalLayout {
+            padding: 4px;
+            alignment: start;
+
+            if Menu.title != "": Text {
+                height: 34px;
+                text: "   " + Menu.title;
+                color: Theme.muted;
+                font-size: 12px;
+                font-weight: 600;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+
+            for entry in Menu.entries: VerticalLayout {
+                if entry.separator: Rectangle {
+                    height: 9px;
+                    Rectangle {
+                        height: 1px;
+                        background: Theme.line;
+                    }
+                }
+
+                if !entry.separator: MenuRow {
+                    entry: entry;
+                    activated => { Menu.activated(entry.id); }
+                }
+            }
+        }
+    }
+}
+
+export component PromptOverlay inherits Rectangle {
+    background: #000000a6;
+    callback focus-input();
+    focus-input => { input.focus(); }
+
+    // Block clicks from reaching the window behind.
+    TouchArea {
+        clicked => { Prompt.cancelled(); }
+    }
+
+    Rectangle {
+        width: min(440px, root.width - 48px);
+        height: content.preferred-height;
+        border-radius: 12px;
+        background: Theme.overlay;
+        border-width: 1px;
+        border-color: Theme.line;
+        drop-shadow-blur: 48px;
+        drop-shadow-offset-y: 16px;
+        drop-shadow-color: #000000a0;
+
+        TouchArea { }
+
+        content := VerticalLayout {
+            padding: 24px;
+            spacing: 16px;
+
+            Text {
+                text: Prompt.title;
+                color: Theme.text;
+                font-family: Theme.display;
+                font-size: 22px;
+                font-weight: 700;
+                wrap: word-wrap;
+            }
+
+            if Prompt.message != "": Text {
+                text: Prompt.message;
+                color: Theme.muted;
+                font-size: 14px;
+                wrap: word-wrap;
+            }
+
+            input := Field {
+                visible: Prompt.wants-text;
+                height: Prompt.wants-text ? 44px : 0px;
+                text <=> Prompt.text;
+                label: Prompt.title;
+                accepted => {
+                    if Prompt.text != "" {
+                        Prompt.confirmed(Prompt.text);
+                    }
+                }
+            }
+
+            HorizontalLayout {
+                alignment: end;
+                spacing: 8px;
+
+                TextButton {
+                    text: "Cancel";
+                    clicked => { Prompt.cancelled(); }
+                }
+
+                TextButton {
+                    text: Prompt.confirm-label;
+                    primary: !Prompt.danger;
+                    danger: Prompt.danger;
+                    enabled: !Prompt.wants-text || Prompt.text != "";
+                    clicked => { Prompt.confirmed(Prompt.text); }
+                }
+            }
+        }
+    }
+}
+
+export component ToastOverlay inherits Rectangle {
+    height: 44px;
+    width: min(label.preferred-width + 40px, 560px);
+    border-radius: 22px;
+    background: Theme.text;
+    opacity: Toast.visible ? 1 : 0;
+    drop-shadow-blur: 24px;
+    drop-shadow-offset-y: 6px;
+    drop-shadow-color: #00000090;
+    animate opacity { duration: 180ms; }
+    accessible-role: none;
+
+    label := Text {
+        width: parent.width - 40px;
+        text: Toast.text;
+        color: Theme.base;
+        font-size: 14px;
+        font-weight: 600;
+        horizontal-alignment: center;
+        overflow: elide;
+    }
+}

@@ -1,0 +1,279 @@
+// Data passed between the Rust side and the interface.
+
+export enum Page { home, search, tracklist, artist, grid, settings, lyrics }
+
+export enum CardKind { album, artist, playlist, genre }
+
+export struct Track {
+    id: string,
+    title: string,
+    artist: string,
+    artist-id: string,
+    album: string,
+    album-id: string,
+    cover: string,
+    duration: string,
+    number: string,
+    starred: bool,
+    // Non-empty on the first track of a disc: shown as a divider above the row.
+    section: string,
+}
+
+export struct Card {
+    kind: CardKind,
+    id: string,
+    title: string,
+    subtitle: string,
+    cover: string,
+}
+
+export struct Shelf {
+    title: string,
+    // Route opened by "Show all"; empty hides the link.
+    route: string,
+    // Show every card on as many rows as it takes, instead of one row.
+    wrap: bool,
+    cards: [Card],
+}
+
+export struct CardRow {
+    cards: [Card],
+}
+
+export struct PlaylistRef {
+    id: string,
+    name: string,
+    subtitle: string,
+    cover: string,
+}
+
+export struct MenuEntry {
+    id: string,
+    label: string,
+    icon: image,
+    separator: bool,
+    danger: bool,
+    submenu: bool,
+}
+
+export struct LyricLine {
+    text: string,
+    // Seconds from the start of the track; negative when the lyrics aren't timed.
+    time: float,
+}
+
+// Cover art, loaded lazily by the Rust side. Bindings pass `rev` so they re-run when art arrives.
+export global Covers {
+    in property <int> rev;
+    pure callback get(id: string, size: int, rev: int) -> image;
+    pure callback tint(id: string, rev: int) -> color;
+}
+
+export global App {
+    in property <bool> signed-in;
+    in property <string> server;
+    in property <string> username;
+    in property <string> server-version;
+    in property <string> app-version;
+    in property <string> login-error;
+    in property <bool> login-busy;
+    callback sign-in(server: string, username: string, password: string);
+    callback sign-out();
+
+    in property <Page> page: Page.home;
+    // The current route, e.g. "home" or "playlist:abc"; the sidebar highlights from it.
+    in property <string> route;
+    in property <bool> can-go-back;
+    in property <bool> can-go-forward;
+    callback navigate(route: string);
+    callback go-back();
+    callback go-forward();
+    callback refresh();
+
+    in-out property <string> search-text;
+    callback search(text: string);
+
+    in property <[PlaylistRef]> playlists;
+    callback new-playlist();
+
+    in property <bool> queue-open;
+    callback set-queue-open(open: bool);
+    // Which tab the queue panel shows: 0 the queue, 1 recently played.
+    in-out property <int> queue-tab;
+    // Bumped to move keyboard focus into the search box.
+    in-out property <int> search-focus;
+    // Bumped to move keyboard focus out of the search box, back to the window's shortcuts.
+    in property <int> main-focus;
+}
+
+// The page currently shown in the main panel.
+export global View {
+    in property <bool> loading;
+    in property <string> error;
+    // The header is drawn from what was clicked; the rest of the page is still loading.
+    in property <bool> pending;
+
+    in property <string> label;
+    in property <string> title;
+    in property <string> subtitle;
+    // Where the subtitle links to, e.g. the album's artist; empty for plain text.
+    in property <string> subtitle-route;
+    in property <string> meta;
+    in property <string> about;
+    in property <string> cover;
+    in property <bool> cover-round;
+    in property <bool> can-star;
+    in property <bool> starred;
+    in property <bool> can-play;
+    in property <bool> has-menu;
+    in property <bool> liked-songs;
+
+    in property <[Track]> tracks;
+    in property <string> tracks-title;
+    in property <bool> show-album;
+    in property <bool> show-cover;
+    in property <bool> show-number;
+
+    in property <[Shelf]> shelves;
+    in property <[Card]> tiles;
+    // Shown when the page has nothing to list.
+    in property <string> empty;
+    in property <[CardRow]> grid;
+    in property <[string]> sorts;
+    in property <int> sort;
+
+    in-out property <length> scroll-y;
+
+    callback play(shuffle: bool);
+    callback toggle-star();
+    callback header-menu(x: length, y: length);
+    callback track-activated(index: int);
+    callback track-star(index: int);
+    callback track-menu(index: int, x: length, y: length);
+    callback card-activated(card: Card);
+    // The pointer has rested on something that opens a page: a cue to fetch it early.
+    callback card-hovered(card: Card);
+    callback card-play(card: Card);
+    callback card-menu(card: Card, x: length, y: length);
+    callback set-sort(index: int);
+    callback columns-changed(columns: int);
+    callback near-end();
+}
+
+export global Player {
+    in property <bool> has-track;
+    in property <Track> track;
+    in property <string> track-id;
+    in property <bool> playing;
+    in property <bool> buffering;
+    in property <float> position;
+    in property <float> duration;
+    in property <float> volume: 1;
+    in property <bool> muted;
+    in property <bool> shuffle;
+    // 0 off, 1 repeat the queue, 2 repeat the track.
+    in property <int> repeat;
+    in property <[Track]> queue;
+    in property <string> context;
+    // Songs played before the current one, newest first.
+    in property <[Track]> history;
+
+    callback toggle();
+    callback next();
+    callback previous();
+    callback seek(seconds: float);
+    callback set-volume(volume: float);
+    callback toggle-mute();
+    callback toggle-shuffle();
+    callback cycle-repeat();
+    callback toggle-star();
+    callback queue-activated(index: int);
+    callback queue-menu(index: int, x: length, y: length);
+    callback clear-queue();
+    callback history-activated(index: int);
+    callback history-menu(index: int, x: length, y: length);
+
+    pure public function clock(seconds: float) -> string {
+        return floor(seconds / 60) + ":" + (Math.mod(floor(seconds), 60) < 10 ? "0" : "") + Math.mod(floor(seconds), 60);
+    }
+}
+
+export global Menu {
+    in property <bool> open;
+    in property <length> x;
+    in property <length> y;
+    in property <string> title;
+    in property <[MenuEntry]> entries;
+    callback activated(id: string);
+    callback dismissed();
+}
+
+export global Prompt {
+    in property <bool> open;
+    in property <string> title;
+    in property <string> message;
+    in property <string> confirm-label;
+    in property <bool> wants-text;
+    in property <bool> danger;
+    in-out property <string> text;
+    callback confirmed(text: string);
+    callback cancelled();
+}
+
+export global Toast {
+    in property <bool> visible;
+    in property <string> text;
+}
+
+export global Lyrics {
+    in property <[LyricLine]> lines;
+    in property <bool> timed;
+    in property <int> active: -1;
+    in property <string> status;
+}
+
+export struct QualityOption {
+    title: string,
+    detail: string,
+}
+
+export global Settings {
+    in property <[QualityOption]> qualities;
+    in property <int> quality;
+    // What the current song is and how it's being streamed.
+    in property <string> now-format;
+
+    // Seconds of overlap between tracks; 0 is off.
+    in property <float> crossfade;
+    in property <bool> gapless;
+    in property <bool> autoplay;
+    in property <bool> normalize;
+    in property <[string]> volume-levels;
+    in property <int> volume-level;
+    in property <bool> mono;
+    in property <bool> scrobble;
+
+    in property <bool> equalizer;
+    // Gain in dB for each band, -12 to 12.
+    in property <[float]> eq-gains;
+    in property <[string]> eq-labels;
+    in property <string> eq-preset;
+
+    in property <string> cache-size;
+    in property <string> connection;
+
+    callback set-quality(index: int);
+    // `save` is false while a slider is being dragged and true when it's let go.
+    callback set-crossfade(seconds: float, save: bool);
+    callback set-gapless(on: bool);
+    callback set-autoplay(on: bool);
+    callback set-normalize(on: bool);
+    callback set-volume-level(level: int);
+    callback set-mono(on: bool);
+    callback set-scrobble(on: bool);
+    callback set-equalizer(on: bool);
+    callback set-eq-band(band: int, gain: float, save: bool);
+    callback reset-eq();
+    callback choose-preset(x: length, y: length);
+    callback clear-cache();
+}
