@@ -17,8 +17,7 @@ use crate::ui;
 const PRELOAD_SECONDS: f64 = 25.0;
 /// Rows shown in the queue panel.
 const QUEUE_ROWS: usize = 400;
-/// Songs remembered for "Recently played".
-const HISTORY_LENGTH: usize = 100;
+use crate::sync::HISTORY_LENGTH;
 /// File types that are always lossless. (M4A and CAF can be either; those are judged by
 /// whether the server reports a bit depth, which lossy formats don't have.)
 const LOSSLESS_SUFFIXES: [&str; 4] = ["flac", "wav", "aiff", "aif"];
@@ -139,6 +138,20 @@ impl Playback {
         self.order = std::iter::once(current).chain(rest).collect();
         self.cursor = 0;
     }
+}
+
+/// A fingerprint of the queue and the place in it, to tell a change from a save of the
+/// same thing.
+pub fn queue_fingerprint(pb: &Playback) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    pb.cursor.hash(&mut hasher);
+    (pb.position as i64).hash(&mut hasher);
+    pb.order.hash(&mut hasher);
+    for song in &pb.queue {
+        song.id.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 #[derive(Default)]
@@ -356,6 +369,8 @@ impl Controller {
             }
         }
         self.sync_queue();
+        // Keeps an edited queue across a restart, and tells other devices about it.
+        self.save_queue();
     }
 
     // ---- transport -----------------------------------------------------------------------------
@@ -1228,14 +1243,15 @@ impl Controller {
         {
             let mut history = self.history.borrow_mut();
             // Reloads of the same track (a seek, a quality change) aren't new plays.
-            if history.first().is_some_and(|last| last.id == song.id) {
+            if history.first().is_some_and(|last| last.song.id == song.id) {
                 return;
             }
-            history.insert(0, song);
+            history.insert(0, crate::config::Played { song, at: chrono::Utc::now().timestamp() });
             history.truncate(HISTORY_LENGTH);
             crate::config::save_history(&self.paths.history, &history);
         }
         self.sync_history();
+        self.share_soon();
     }
 
     /// How many entries at the top of the history the panel leaves out: the song playing now
@@ -1244,7 +1260,7 @@ impl Controller {
         let pb = self.playback.borrow();
         let history = self.history.borrow();
         match (pb.current(), history.first()) {
-            (Some(current), Some(last)) if current.id == last.id => 1,
+            (Some(current), Some(last)) if current.id == last.song.id => 1,
             _ => 0,
         }
     }
@@ -1255,13 +1271,13 @@ impl Controller {
             .borrow()
             .iter()
             .skip(self.history_hidden())
-            .map(|song| self.track_row(song))
+            .map(|played| self.track_row(&played.song))
             .collect();
         self.history_model.set_vec(rows);
     }
 
     fn history_song(&self, row: usize) -> Option<Song> {
-        self.history.borrow().get(row + self.history_hidden()).cloned()
+        self.history.borrow().get(row + self.history_hidden()).map(|played| played.song.clone())
     }
 
     /// Plays one song from the history by itself, as if it had been picked on its own: what
@@ -1276,6 +1292,12 @@ impl Controller {
 
     pub fn save_queue(&self) {
         let pb = self.playback.borrow();
+        // Note when the queue last really changed, and pass the change on to other devices.
+        let fingerprint = queue_fingerprint(&pb);
+        if self.queue_sig.replace(fingerprint) != fingerprint && !self.queue_quiet.get() {
+            self.queue_stamp.set(chrono::Utc::now().timestamp());
+            self.queue_changed_here();
+        }
         if pb.queue.is_empty() {
             let _ = std::fs::remove_file(&self.paths.queue);
             return;
@@ -1288,6 +1310,7 @@ impl Controller {
             context: pb.context.clone(),
             source: pb.source.clone(),
             origins: pb.origins.clone(),
+            stamp: self.queue_stamp.get(),
         }
         .save(&self.paths.queue);
     }
@@ -1312,7 +1335,47 @@ impl Controller {
             pb.playing = false;
             pb.current_token = 0;
         }
+        // A queue saved before changes were timed: the file's own date says when it was.
+        let stamp = if saved.stamp > 0 {
+            saved.stamp
+        } else {
+            std::fs::metadata(&self.paths.queue)
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|since| since.as_secs() as i64)
+                .unwrap_or(0)
+        };
+        self.queue_stamp.set(stamp);
+        // Putting it back isn't a change to pass on.
+        self.queue_quiet.set(true);
         self.track_changed();
+        self.queue_quiet.set(false);
+    }
+
+    /// Puts a queue from another device in place of this one, paused at `position` seconds
+    /// into the song at `cursor`.
+    pub fn replace_queue(self: &Rc<Self>, songs: Vec<Song>, cursor: usize, position: f64) {
+        if songs.is_empty() {
+            return;
+        }
+        {
+            let mut pb = self.playback.borrow_mut();
+            pb.origins = vec![None; songs.len()];
+            pb.source.clear();
+            pb.order = (0..songs.len()).collect();
+            pb.cursor = cursor.min(songs.len() - 1);
+            pb.queue = songs;
+            pb.context.clear();
+            pb.position = position;
+            pb.resume_at = position;
+            pb.playing = false;
+            pb.current_token = 0;
+            pb.next_token = 0;
+        }
+        self.queue_quiet.set(true);
+        self.track_changed();
+        self.queue_quiet.set(false);
     }
 
     // ---- lyrics --------------------------------------------------------------------------------

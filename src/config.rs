@@ -75,6 +75,9 @@ pub struct ListPrefs {
     /// The order was chosen by the user. Until it is, the list opens in its usual order:
     /// for a playlist, the most recently added songs first.
     pub sort_chosen: bool,
+    /// When these choices last changed, in seconds since 1970: between devices, the newer
+    /// set wins.
+    pub at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,6 +121,13 @@ pub struct Settings {
     pub pinned_playlists: Vec<String>,
     /// Choices remembered for individual playlists, albums and so on, by route key.
     pub lists: std::collections::HashMap<String, ListPrefs>,
+    /// Share the queue, pins and so on with the app on other devices.
+    pub sync: bool,
+    /// A made-up name for this device, so it can tell its own saved queue from others'.
+    pub device_id: String,
+    /// When the pins and the theme were last changed, to settle which device's are newer.
+    pub pins_at: i64,
+    pub theme_at: i64,
     /// Offline mode: don't contact the server; play downloads only.
     pub offline: bool,
     /// Keep the title bar Windows draws, instead of the app's own.
@@ -160,6 +170,10 @@ impl Default for Settings {
             download_quality: 0,
             pinned_playlists: Vec::new(),
             lists: std::collections::HashMap::new(),
+            sync: true,
+            device_id: String::new(),
+            pins_at: 0,
+            theme_at: 0,
             offline: false,
             standard_title_bar: false,
             theme: THEMES[0].name.to_string(),
@@ -308,6 +322,8 @@ pub struct SavedQueue {
     /// The page the queue was started from, and each song's place in that page's list.
     pub source: String,
     pub origins: Vec<Option<usize>>,
+    /// When the queue last changed, in seconds since 1970 (see `sync`).
+    pub stamp: i64,
 }
 
 impl SavedQueue {
@@ -327,13 +343,32 @@ impl SavedQueue {
     }
 }
 
-/// Songs that have been played, newest first.
-pub fn load_history(path: &Path) -> Vec<Song> {
-    fs::read(path).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default()
+/// A song in "Recently played", and when it was played (seconds since 1970).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Played {
+    pub song: Song,
+    pub at: i64,
 }
 
-pub fn save_history(path: &Path, songs: &[Song]) {
-    if let Ok(json) = serde_json::to_vec(songs) {
+/// Songs that have been played, newest first.
+pub fn load_history(path: &Path) -> Vec<Played> {
+    let bytes = fs::read(path).unwrap_or_default();
+    if let Ok(history) = serde_json::from_slice::<Vec<Played>>(&bytes) {
+        return history;
+    }
+    // The file as it was before plays carried a time: give them made-up ones, in order.
+    let songs: Vec<Song> = serde_json::from_slice(&bytes).unwrap_or_default();
+    let newest = fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|since| since.as_secs() as i64)
+        .unwrap_or(0);
+    songs.into_iter().enumerate().map(|(index, song)| Played { song, at: newest - 200 * index as i64 }).collect()
+}
+
+pub fn save_history(path: &Path, history: &[Played]) {
+    if let Ok(json) = serde_json::to_vec(history) {
         write_atomically(path, &json);
     }
 }

@@ -181,5 +181,6 @@ impl Controller {
     fn came_online(self: &Rc<Self>) {
         self.flush_pending();
         self.sync_collections();
+        self.look_elsewhere();
     }
 }

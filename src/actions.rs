@@ -568,9 +568,11 @@ impl Controller {
                     if !was_pinned {
                         settings.pinned_playlists.push(id.clone());
                     }
+                    settings.pins_at = chrono::Utc::now().timestamp();
                 }
                 self.save_settings();
                 self.show_playlists();
+                self.share_soon();
             }
             ("cancel-download", Target::Song { song, .. }) => {
                 self.cancel_downloads(std::slice::from_ref(&song.id));
@@ -639,6 +641,7 @@ impl Controller {
                     move |ctl, result| match result {
                         Ok((playlist, ids)) => {
                             ctl.added.borrow_mut().create(&playlist.id, &ids, chrono::Utc::now().timestamp());
+                            ctl.share_soon();
                             ctl.toast(format!("Created “{label}”"));
                             ctl.reload_playlists();
                         }
@@ -703,7 +706,9 @@ impl Controller {
                 // report whatever is wrong.
                 let Ok(playlist) = result else { return ctl.add_songs_to_playlist(playlist_id, songs) };
                 // Note what's in it now, so the songs about to be added can be told apart.
-                ctl.added.borrow_mut().observe(&playlist_id, &playlist.songs, chrono::Utc::now().timestamp());
+                if ctl.added.borrow_mut().observe(&playlist_id, &playlist.songs, chrono::Utc::now().timestamp()) {
+                    ctl.share_soon();
+                }
                 let present: std::collections::HashSet<&str> = playlist.songs.iter().map(|s| s.id.as_str()).collect();
                 let fresh: Vec<Song> = songs.iter().filter(|s| !present.contains(s.id.as_str())).cloned().collect();
                 let repeats = songs.len() - fresh.len();
@@ -745,6 +750,7 @@ impl Controller {
             move |ctl, result| match result {
                 Ok((playlist_id, ids)) => {
                     ctl.added.borrow_mut().record(&playlist_id, &ids, chrono::Utc::now().timestamp());
+                    ctl.share_soon();
                     ctl.invalidate(&key);
                     ctl.toast(format!("Added to “{name}”"));
                     if ctl.current_route() == Some(page) {

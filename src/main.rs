@@ -19,6 +19,7 @@ mod pages;
 mod playback;
 mod pool;
 mod subsonic;
+mod sync;
 #[cfg(windows)]
 mod taskbar;
 mod update;

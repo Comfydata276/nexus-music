@@ -386,6 +386,8 @@ export global Settings {
 
     in property <bool> close-to-tray;
     in property <bool> check-updates;
+    // Share the queue, pins and so on with the app on other devices.
+    in property <bool> sync;
     // What the last check for a new version found, in words.
     in property <string> update-status;
     // The newer version on offer; empty when there is none.
@@ -419,6 +421,7 @@ export global Settings {
     callback set-ui-scale(index: int);
     callback set-close-to-tray(on: bool);
     callback set-check-updates(on: bool);
+    callback set-sync(on: bool);
     callback check-updates-now();
     callback install-update();
 }

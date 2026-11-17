@@ -153,6 +153,30 @@ pub struct Playlist {
     pub songs: Vec<Song>,
 }
 
+/// A play queue saved on the server.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PlayQueue {
+    #[serde(rename = "entry")]
+    pub songs: Vec<Song>,
+    /// The id of the song that was playing. (Some servers send a number.)
+    #[serde(deserialize_with = "text_or_number")]
+    pub current: String,
+    /// How far into that song, in milliseconds.
+    pub position: u64,
+    /// When it was saved, and by which app.
+    pub changed: String,
+    pub changed_by: String,
+}
+
+fn text_or_number<'de, D: serde::Deserializer<'de>>(from: D) -> Result<String, D::Error> {
+    Ok(match serde_json::Value::deserialize(from)? {
+        serde_json::Value::String(text) => text,
+        serde_json::Value::Number(number) => number.to_string(),
+        _ => String::new(),
+    })
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct Genre {
@@ -430,13 +454,19 @@ impl Client {
     }
 
     fn url(&self, endpoint: &str, params: &[(&str, &str)]) -> String {
+        self.url_as(CLIENT_NAME, endpoint, params)
+    }
+
+    /// `app` is the name the request gives for this app.
+    fn url_as(&self, app: &str, endpoint: &str, params: &[(&str, &str)]) -> String {
         let i = &self.inner;
         let mut url = format!(
-            "{}/rest/{endpoint}?u={}&t={}&s={}&v={API_VERSION}&c={CLIENT_NAME}&f=json",
+            "{}/rest/{endpoint}?u={}&t={}&s={}&v={API_VERSION}&c={}&f=json",
             i.base,
             encode(&i.username),
             i.token,
-            i.salt
+            i.salt,
+            encode(app)
         );
         for (k, v) in params {
             url.push('&');
@@ -475,7 +505,17 @@ impl Client {
         params: &[(&str, &str)],
         field: Option<&str>,
     ) -> ApiResult<T> {
-        let url = self.url(endpoint, params);
+        self.call_as(CLIENT_NAME, endpoint, params, field)
+    }
+
+    fn call_as<T: DeserializeOwned + Default>(
+        &self,
+        app: &str,
+        endpoint: &str,
+        params: &[(&str, &str)],
+        field: Option<&str>,
+    ) -> ApiResult<T> {
+        let url = self.url_as(app, endpoint, params);
         // A long list of song ids can outgrow what servers and proxies accept in an address,
         // so those go in the body of a POST instead (the OpenSubsonic "formPost" extension).
         let response = match url.split_once('?') {
@@ -705,6 +745,31 @@ impl Client {
         let mut params = vec![("name", name)];
         params.extend(song_ids.iter().map(|id| ("songId", id.as_str())));
         self.call("createPlaylist", &params, Some("playlist"))
+    }
+
+    /// Replaces a playlist's comment, and keeps the playlist private.
+    pub fn set_playlist_comment(&self, id: &str, comment: &str) -> ApiResult<()> {
+        let params = [("playlistId", id), ("comment", comment), ("public", "false")];
+        self.call::<serde_json::Value>("updatePlaylist", &params, None).map(drop)
+    }
+
+    pub fn song(&self, id: &str) -> ApiResult<Song> {
+        self.call("getSong", &[("id", id)], Some("song"))
+    }
+
+    /// Saves the play queue on the server, where other devices can pick it up. `device`
+    /// is recorded as who saved it. `position` is in milliseconds.
+    pub fn save_play_queue(&self, device: &str, ids: &[String], current: &str, position: u64) -> ApiResult<()> {
+        let position = position.to_string();
+        let mut params: Vec<(&str, &str)> = ids.iter().map(|id| ("id", id.as_str())).collect();
+        params.push(("current", current));
+        params.push(("position", &position));
+        self.call_as::<serde_json::Value>(device, "savePlayQueue", &params, None).map(drop)
+    }
+
+    /// The play queue last saved on the server; empty if there isn't one.
+    pub fn play_queue(&self) -> ApiResult<PlayQueue> {
+        self.call("getPlayQueue", &[], Some("playQueue"))
     }
 
     pub fn rename_playlist(&self, id: &str, name: &str) -> ApiResult<()> {

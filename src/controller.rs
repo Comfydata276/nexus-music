@@ -247,7 +247,7 @@ pub struct Controller {
     selection_anchor: Cell<Option<usize>>,
     pub queue_model: Rc<VecModel<ui::Track>>,
     /// Songs that have been played, newest first, including the one playing now.
-    pub history: RefCell<Vec<Song>>,
+    pub history: RefCell<Vec<config::Played>>,
     pub history_model: Rc<VecModel<ui::Track>>,
     pub grid_model: Rc<VecModel<ui::CardRow>>,
     pub grid_columns: Cell<usize>,
@@ -278,6 +278,21 @@ pub struct Controller {
     /// The server isn't answering.
     pub unreachable: Cell<bool>,
     pub reconnect_timer: slint::Timer,
+    /// Sharing with other devices (see `sync`): the timers that pass changes on and look
+    /// for others', whether an exchange is under way (and another is wanted after it), and
+    /// the playlist that holds the shared data.
+    pub sync_timer: slint::Timer,
+    pub sync_look_timer: slint::Timer,
+    pub queue_timer: slint::Timer,
+    pub sync_busy: Cell<bool>,
+    pub sync_again: Cell<bool>,
+    pub sync_playlist: RefCell<Option<String>>,
+    /// When the queue last changed here (or, for one taken from another device, there), and
+    /// a fingerprint of it as last saved, to tell a real change from a save of the same thing.
+    pub queue_stamp: Cell<i64>,
+    pub queue_sig: Cell<u64>,
+    /// Set while the queue is being put in place from a saved copy, which isn't a change.
+    pub queue_quiet: Cell<bool>,
     /// Whether the sound device is currently held in exclusive mode.
     pub output_exclusive: Cell<bool>,
     /// The output devices last listed in the device menu: (id, name).
@@ -340,6 +355,15 @@ impl Controller {
             pending: RefCell::new(crate::offline::load_pending(&paths.pending)),
             unreachable: Cell::new(false),
             reconnect_timer: slint::Timer::default(),
+            sync_timer: slint::Timer::default(),
+            sync_look_timer: slint::Timer::default(),
+            queue_timer: slint::Timer::default(),
+            sync_busy: Cell::new(false),
+            sync_again: Cell::new(false),
+            sync_playlist: RefCell::new(None),
+            queue_stamp: Cell::new(0),
+            queue_sig: Cell::new(crate::playback::queue_fingerprint(&Playback::new(&Settings::default()))),
+            queue_quiet: Cell::new(false),
             output_exclusive: Cell::new(false),
             devices: RefCell::default(),
             update: RefCell::new(None),
@@ -573,6 +597,8 @@ impl Controller {
         self.ui.window().set_minimized(false);
         #[cfg(windows)]
         crate::instance::focus(&self.ui);
+        // Coming back to the app: see what's happened on other devices meanwhile.
+        self.look_elsewhere();
     }
 
     pub fn quit(&self) {
@@ -734,10 +760,12 @@ impl Controller {
         self.restore_queue();
         self.reload_playlists();
         self.navigate(Route::Home);
+        self.start_sync();
     }
 
     pub fn leave(self: &Rc<Self>, message: &str) {
         self.stop_playback();
+        self.stop_sync();
         *self.client.borrow_mut() = None;
         self.cache.borrow_mut().clear();
         self.playlists.borrow_mut().clear();
@@ -758,6 +786,8 @@ impl Controller {
         let _ = std::fs::remove_file(&self.paths.history);
         self.history.borrow_mut().clear();
         self.leave("");
+        // Signing in again starts from whatever the server has.
+        self.queue_stamp.set(0);
     }
 
     // ---- navigation ---------------------------------------------------------------------------
@@ -1008,6 +1038,7 @@ impl Controller {
                 let key = key.clone();
                 post(move |ctl| {
                     ctl.remember(&key, Instant::now(), page.clone());
+                    ctl.observe_playlist(&page);
                     if ctl.nav.borrow().generation == generation {
                         ctl.apply_page(page, scroll);
                     }
@@ -1017,6 +1048,7 @@ impl Controller {
             store_page(&file, &whole);
             post(move |ctl| {
                 ctl.remember(&key, Instant::now(), whole.clone());
+                ctl.observe_playlist(&whole);
                 if ctl.nav.borrow().generation == generation {
                     ctl.apply_if_changed(whole);
                 }
@@ -1079,9 +1111,6 @@ impl Controller {
             let (sort, descending) = self.list_sort(&key);
             *self.track_view.borrow_mut() = TrackView { key, sort, descending, ..Default::default() };
             view.set_filter("".into());
-        }
-        if let (Some(playlist), false) = (&data.playlist, data.pending) {
-            self.added.borrow_mut().observe(&playlist.id, &data.songs, chrono::Utc::now().timestamp());
         }
 
         // Leave lists alone when their content didn't change, so a background refresh or the
@@ -1295,6 +1324,16 @@ impl Controller {
             .collect()
     }
 
+    /// Notes which songs a playlist has, as just read from the server, so ones that turn
+    /// up later can be dated.
+    fn observe_playlist(&self, page: &PageData) {
+        if let Some(playlist) = &page.playlist {
+            if self.added.borrow_mut().observe(&playlist.id, &page.songs, chrono::Utc::now().timestamp()) {
+                self.share_soon();
+            }
+        }
+    }
+
     /// The order a list opens in (an index into `TRACK_SORTS`, and whether it's reversed):
     /// the one it was last left in. A playlist nobody has sorted yet opens with the songs
     /// added most recently at the top.
@@ -1310,7 +1349,9 @@ impl Controller {
     /// The order a playlist's page shows these songs in, as positions in `songs`. Playing
     /// the playlist from elsewhere (the sidebar, a menu) follows the same order.
     pub fn playlist_order(&self, id: &str, songs: &[Song]) -> Vec<usize> {
-        self.added.borrow_mut().observe(id, songs, chrono::Utc::now().timestamp());
+        if self.added.borrow_mut().observe(id, songs, chrono::Utc::now().timestamp()) {
+            self.share_soon();
+        }
         let (sort, descending) = self.list_sort(&format!("playlist:{id}"));
         let mut view = TrackView { sort, descending, ..Default::default() };
         view.arrange(songs, &self.playlist_dates(id, songs));
@@ -1331,13 +1372,12 @@ impl Controller {
             let mut settings = self.settings.borrow_mut();
             let mut prefs = settings.lists.get(key).copied().unwrap_or_default();
             change(&mut prefs);
-            if prefs == Default::default() {
-                settings.lists.remove(key);
-            } else {
-                settings.lists.insert(key.to_string(), prefs);
-            }
+            // Kept even when back to the usual choices, so other devices hear of the change.
+            prefs.at = chrono::Utc::now().timestamp();
+            settings.lists.insert(key.to_string(), prefs);
         }
         self.save_settings();
+        self.share_soon();
     }
 
     /// Remembers the order the list on screen is shown in, for the next visit.
@@ -1581,11 +1621,30 @@ impl Controller {
         self.request(
             |client| client.playlists(),
             |ctl, result| {
-                let Ok(playlists) = result else { return };
+                let Ok(mut playlists) = result else { return };
+                // The playlist the app keeps its shared data in isn't one to listen to.
+                playlists.retain(|p| p.name != crate::sync::PLAYLIST_NAME);
                 *ctl.playlists.borrow_mut() = playlists;
                 ctl.show_playlists();
+                ctl.reload_changed_playlist();
             },
         );
+    }
+
+    /// If the playlist on screen no longer has as many songs as the server says (they were
+    /// added or removed on another device), fetches it again.
+    fn reload_changed_playlist(self: &Rc<Self>) {
+        let Some(Route::Playlist(id)) = self.current_route() else { return };
+        let stale = {
+            let page = self.page.borrow();
+            let shown = page.playlist.as_ref().is_some_and(|p| p.id == id) && !page.pending;
+            let listed = self.playlists.borrow().iter().find(|p| p.id == id).map(|p| p.song_count as usize);
+            shown && listed.is_some_and(|count| count != page.songs.len())
+        };
+        if stale {
+            let scroll = self.ui.global::<ui::View>().get_scroll_y();
+            self.show(Route::Playlist(id), scroll, true, None);
+        }
     }
 
     /// Lists the playlists in the sidebar: pinned ones first, in the order they were pinned,
@@ -1605,13 +1664,17 @@ impl Controller {
                 pinned: place(&p.id).is_some(),
             })
             .collect();
-        self.ui.global::<ui::App>().set_playlists(ModelRc::new(VecModel::from(rows)));
+        // Left alone when nothing differs, so a routine check doesn't disturb the sidebar.
+        let app = self.ui.global::<ui::App>();
+        if app.get_playlists().iter().ne(rows.iter().cloned()) {
+            app.set_playlists(ModelRc::new(VecModel::from(rows)));
+        }
     }
 
     // ---- settings ------------------------------------------------------------------------------
 
     /// Copies the saved settings into the Settings page.
-    fn push_settings(&self) {
+    pub fn push_settings(&self) {
         let settings = self.settings.borrow();
         let page = self.ui.global::<ui::Settings>();
         let strings = |items: Vec<&str>| {
@@ -1676,6 +1739,7 @@ impl Controller {
         );
         page.set_close_to_tray(settings.close_to_tray);
         page.set_check_updates(settings.check_updates);
+        page.set_sync(settings.sync);
     }
 
     /// Changes a setting, shows it, applies it to the audio and, when `save` is set, writes
@@ -1979,7 +2043,11 @@ impl Controller {
         settings.on_set_theme(|index| {
             with(|ctl| {
                 let Some(theme) = config::THEMES.get(index as usize) else { return };
-                ctl.change_setting(true, |s| s.theme = theme.name.to_string());
+                ctl.change_setting(true, |s| {
+                    s.theme = theme.name.to_string();
+                    s.theme_at = chrono::Utc::now().timestamp();
+                });
+                ctl.share_soon();
                 ctl.apply_theme();
             });
         });
@@ -1996,6 +2064,14 @@ impl Controller {
             with(|ctl| {
                 ctl.change_setting(true, |s| s.close_to_tray = on);
                 ctl.sync_tray();
+            });
+        });
+        settings.on_set_sync(|on| {
+            with(|ctl| {
+                ctl.change_setting(true, |s| s.sync = on);
+                if on {
+                    ctl.look_elsewhere();
+                }
             });
         });
         settings.on_set_check_updates(|on| {

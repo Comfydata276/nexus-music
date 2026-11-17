@@ -1825,6 +1825,16 @@ export component SettingsPage inherits Rectangle {
                                 clicked => { App.sign-out(); }
                             }
                         }
+
+                        SettingRow {
+                            title: "Keep my devices in step";
+                            detail: "Your queue, Recently played, pinned playlists, each list's shuffle and sort, the dates songs were added, and the theme follow you to Nexus Music on other devices signed in to this account. Kept on your server, in a playlist named “Nexus Music sync” that other apps will show; leave it be.";
+                            Toggle {
+                                on: Settings.sync;
+                                label: "Keep my devices in step";
+                                toggled(on) => { Settings.set-sync(on); }
+                            }
+                        }
                     }
 
                     SettingGroup {

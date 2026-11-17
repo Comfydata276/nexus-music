@@ -19,6 +19,7 @@ by the app itself.
   Drag rows to reorder the queue, or the songs in a playlist.
 - Find and sort within a playlist or Liked songs: click a column heading to sort by it, including the date each song was added.
 - Shuffle is set per playlist or album and remembered.
+- Keeps your devices in step: the queue and your place in it, Recently played, pinned playlists, each list's shuffle and sort, the dates songs were added and the theme follow you to the app on another PC. The queue uses the server's saved-queue feature; the rest is kept in the comment of a playlist named "Nexus Music sync".
 - Select several songs with Ctrl or Shift, then drag them onto a playlist or the queue, or
   right-click to act on them all.
 - Recently played: the last hundred songs, each playable again by itself.
