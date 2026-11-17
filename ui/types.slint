@@ -17,6 +17,12 @@ export struct Track {
     starred: bool,
     // Non-empty on the first track of a disc: shown as a divider above the row.
     section: string,
+    // How many disc headings come at or before this row.
+    sections-before: int,
+    // This row is the one playing (the same song elsewhere in the list isn't).
+    playing: bool,
+    // 0 to 1 while the song is being downloaded; -1 otherwise.
+    progress: float,
     // A copy is saved on this PC.
     downloaded: bool,
     // Part of the current selection.
@@ -51,6 +57,8 @@ export struct PlaylistRef {
     name: string,
     subtitle: string,
     cover: string,
+    // Kept at the top of the list.
+    pinned: bool,
 }
 
 export struct MenuEntry {
@@ -158,6 +166,8 @@ export global View {
     in property <bool> liked-songs;
 
     in property <[Track]> tracks;
+    // How many disc headings the song list has in all.
+    in property <int> track-sections;
     in property <string> tracks-title;
     in property <bool> show-album;
     in property <bool> show-cover;
@@ -180,6 +190,11 @@ export global View {
     // The page's songs can be saved on this PC. State: 0 none saved, 1 in progress, 2 all saved.
     in property <bool> can-download;
     in property <int> download-state;
+    // While downloading: how many of the page's songs are saved, out of how many, and how
+    // far along that is from 0 to 1 (counting the song in progress).
+    in property <int> download-done;
+    in property <int> download-total;
+    in property <float> download-progress;
     // How many song rows are selected.
     in property <int> selection-count;
     // Rows can be dragged into a new order: a playlist shown in its own order, unfiltered.
@@ -285,11 +300,15 @@ export global Prompt {
     in property <string> title;
     in property <string> message;
     in property <string> confirm-label;
+    // The other button: usually "Cancel", sometimes a second answer.
+    in property <string> cancel-label: "Cancel";
     in property <bool> wants-text;
     in property <bool> danger;
     in-out property <string> text;
     callback confirmed(text: string);
     callback cancelled();
+    // Closed without pressing either button.
+    callback dismissed();
 }
 
 export global Toast {
@@ -334,6 +353,8 @@ export global Settings {
     in property <string> eq-preset;
 
     in property <string> downloads-summary;
+    // Which of `qualities` downloads are saved in.
+    in property <int> download-quality;
     // Offline mode is switched on.
     in property <bool> offline;
     in property <string> cache-size;
@@ -377,6 +398,7 @@ export global Settings {
     callback choose-preset(x: length, y: length);
     callback clear-cache();
     callback remove-downloads();
+    callback set-download-quality(index: int);
     callback set-offline(on: bool);
     callback choose-device(x: length, y: length);
     callback set-exclusive(on: bool);

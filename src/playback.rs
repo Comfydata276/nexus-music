@@ -33,6 +33,11 @@ pub struct Playback {
     /// Position of the current track within `order`.
     pub cursor: usize,
     pub context: String,
+    /// The page the queue was started from (its route key), and for each entry of `queue`
+    /// its position in that page's song list. Used to mark the row that's playing: the
+    /// same song in another list, or a second copy in this one, is a different row.
+    pub source: String,
+    pub origins: Vec<Option<usize>>,
     pub shuffle: bool,
     pub repeat: u8,
     pub playing: bool,
@@ -71,6 +76,8 @@ impl Playback {
             order: Vec::new(),
             cursor: 0,
             context: String::new(),
+            source: String::new(),
+            origins: Vec::new(),
             shuffle: settings.shuffle,
             repeat: settings.repeat.min(2),
             playing: false,
@@ -97,6 +104,11 @@ impl Playback {
 
     pub fn current(&self) -> Option<&Song> {
         self.order.get(self.cursor).and_then(|&i| self.queue.get(i))
+    }
+
+    /// Where the current track sits in the list of the page it was played from.
+    pub fn current_origin(&self) -> Option<usize> {
+        self.order.get(self.cursor).and_then(|&i| self.origins.get(i).copied().flatten())
     }
 
     /// The track that follows when the current one ends by itself.
@@ -142,15 +154,31 @@ impl Controller {
 
     /// Replaces the queue and starts playing from `start`.
     pub fn play_songs(self: &Rc<Self>, songs: Vec<Song>, start: usize, context: &str, shuffle: bool) {
+        // Where these songs came from, if the caller said (see `play_from`).
+        let (source, origins) = match self.play_from.take() {
+            Some((source, origins)) if origins.len() == songs.len() => {
+                (source, origins.into_iter().map(Some).collect::<Vec<_>>())
+            }
+            _ => (String::new(), vec![None; songs.len()]),
+        };
         // Offline, only what's downloaded can play: skip the rest.
-        let (songs, start) = if self.is_offline() {
-            let wanted = songs.get(start).map(|s| s.id.clone());
+        let (songs, origins, start) = if self.is_offline() {
             let downloads = self.downloads.borrow();
-            let kept: Vec<Song> = songs.into_iter().filter(|s| downloads.has(&s.id)).collect();
-            let start = wanted.and_then(|id| kept.iter().position(|s| s.id == id)).unwrap_or(0);
-            (kept, start)
+            let mut kept = Vec::new();
+            let mut kept_origins = Vec::new();
+            let mut kept_start = 0;
+            for (index, (song, origin)) in songs.into_iter().zip(origins).enumerate() {
+                if downloads.has(&song.id) {
+                    if index == start {
+                        kept_start = kept.len();
+                    }
+                    kept.push(song);
+                    kept_origins.push(origin);
+                }
+            }
+            (kept, kept_origins, kept_start)
         } else {
-            (songs, start)
+            (songs, origins, start)
         };
         if songs.is_empty() {
             if self.is_offline() {
@@ -168,6 +196,8 @@ impl Controller {
             // The Shuffle button means "surprise me", so it picks the opening track too.
             pb.cursor = if shuffle { fastrand::usize(..songs.len()) } else { start.min(songs.len() - 1) };
             pb.queue = songs;
+            pb.origins = origins;
+            pb.source = source;
             pb.context = context.to_string();
             if pb.shuffle {
                 pb.shuffle_order();
@@ -350,6 +380,15 @@ impl Controller {
         }
     }
 
+    /// Likes or unlikes the song that's playing. Used by the taskbar's like button.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn toggle_current_star(self: &Rc<Self>) {
+        let song = self.playback.borrow().current().cloned();
+        if let Some(song) = song {
+            self.toggle_song_star(&song);
+        }
+    }
+
     /// Used by the media keys and the sleep timer.
     pub fn set_playing(self: &Rc<Self>, playing: bool) {
         if self.playback.borrow().playing != playing {
@@ -422,6 +461,8 @@ impl Controller {
         {
             let mut pb = self.playback.borrow_mut();
             pb.queue.clear();
+            pb.origins.clear();
+            pb.source.clear();
             pb.order.clear();
             pb.cursor = 0;
             pb.playing = false;
@@ -487,6 +528,8 @@ impl Controller {
             {
                 let mut pb = self.playback.borrow_mut();
                 pb.order = (0..songs.len()).collect();
+                pb.origins = vec![None; songs.len()];
+                pb.source.clear();
                 pb.queue = songs;
                 pb.cursor = 0;
                 pb.context.clear();
@@ -507,6 +550,8 @@ impl Controller {
                 pb.order.insert(at, index);
                 at += 1;
             }
+            let entries = pb.queue.len();
+            pb.origins.resize(entries, None);
         }
         self.next_changed();
     }
@@ -521,6 +566,9 @@ impl Controller {
             }
             let removed = pb.order.remove(at);
             pb.queue.remove(removed);
+            if removed < pb.origins.len() {
+                pb.origins.remove(removed);
+            }
             for index in pb.order.iter_mut() {
                 if *index > removed {
                     *index -= 1;
@@ -549,6 +597,7 @@ impl Controller {
         {
             let mut pb = self.playback.borrow_mut();
             let Some(song) = pb.current().cloned() else { return };
+            pb.origins = vec![pb.current_origin()];
             pb.queue = vec![song];
             pb.order = vec![0];
             pb.cursor = 0;
@@ -718,6 +767,7 @@ impl Controller {
     /// next track and follows the lyrics.
     pub fn tick(self: &Rc<Self>) {
         self.check_sleep();
+        self.tick_downloads();
         // Keep the maximise button, and the title bar's sense of scale, in step with the window.
         let app = self.ui.global::<ui::App>();
         let maximized = self.ui.window().is_maximized();
@@ -860,6 +910,8 @@ impl Controller {
                     let index = pb.queue.len() - 1;
                     pb.order.push(index);
                 }
+                let entries = pb.queue.len();
+                pb.origins.resize(entries, None);
                 // What follows no longer comes from the album or playlist that was chosen.
                 pb.context.clear();
                 (resume, true)
@@ -1059,6 +1111,7 @@ impl Controller {
         self.sync_transport();
         self.sync_queue();
         self.sync_history();
+        self.sync_playing();
         self.save_queue();
         if matches!(self.current_route(), Some(Route::Lyrics | Route::NowPlaying)) {
             self.load_lyrics();
@@ -1108,6 +1161,8 @@ impl Controller {
             let mut track = player.get_track();
             track.starred = starred;
             player.set_track(track);
+            // The like button on the taskbar thumbnail follows too.
+            self.sync_tray();
         }
         for model in [&self.queue_model, &self.history_model, &self.tracks_model] {
             for row in 0..model.row_count() {
@@ -1187,6 +1242,8 @@ impl Controller {
             cursor: pb.cursor,
             position: pb.position,
             context: pb.context.clone(),
+            source: pb.source.clone(),
+            origins: pb.origins.clone(),
         }
         .save(&self.paths.queue);
     }
@@ -1199,6 +1256,9 @@ impl Controller {
             if !pb.queue.is_empty() {
                 return;
             }
+            pb.origins = saved.origins;
+            pb.origins.resize(saved.songs.len(), None);
+            pb.source = saved.source;
             pb.queue = saved.songs;
             pb.order = saved.order;
             pb.cursor = saved.cursor;
@@ -1361,9 +1421,46 @@ impl Controller {
     pub fn play_page_track(self: &Rc<Self>, index: usize) {
         let songs = self.visible_songs();
         let context = self.page.borrow().context.clone();
+        self.playing_from_page();
         if index < songs.len() {
             // Starting from a chosen song plays the list in order, even with shuffle on.
             self.play_songs_from(songs, index, &context);
+        }
+    }
+
+    /// Notes that the next thing played is the page on screen, as it's shown, so its rows
+    /// can be matched to the queue.
+    fn playing_from_page(&self) {
+        let key = self.current_route().map(|route| route.cache_key()).unwrap_or_default();
+        let rows = (0..self.tracks_model.row_count()).filter_map(|row| self.song_index(row)).collect();
+        self.play_from.replace(Some((key, rows)));
+    }
+
+    /// Marks the row that's playing, if the page on screen is where it was played from.
+    pub fn sync_playing(&self) {
+        let playing = {
+            let pb = self.playback.borrow();
+            let key = self.current_route().map(|route| route.cache_key()).unwrap_or_default();
+            if !pb.source.is_empty() && pb.source == key { pb.current_origin() } else { None }
+        };
+        for row in 0..self.tracks_model.row_count() {
+            let Some(mut track) = self.tracks_model.row_data(row) else { continue };
+            let is_playing = playing.is_some() && self.song_index(row) == playing;
+            if track.playing != is_playing {
+                track.playing = is_playing;
+                self.tracks_model.set_row_data(row, track);
+            }
+        }
+    }
+
+    /// Keeps the queue's record of where its songs sit in a page in step with a change to
+    /// that page's list. `moved` says where each old position went (`None` if removed).
+    pub fn page_list_changed(&self, key: &str, moved: impl Fn(usize) -> Option<usize>) {
+        let mut pb = self.playback.borrow_mut();
+        if pb.source == key {
+            for origin in pb.origins.iter_mut() {
+                *origin = origin.and_then(&moved);
+            }
         }
     }
 
@@ -1380,7 +1477,10 @@ impl Controller {
         // A sorted or filtered list plays as it's shown.
         let songs = self.visible_songs();
         match source {
-            crate::pages::PlaySource::Songs => self.play_songs(songs, 0, &context, shuffle),
+            crate::pages::PlaySource::Songs => {
+                self.playing_from_page();
+                self.play_songs(songs, 0, &context, shuffle)
+            }
             crate::pages::PlaySource::Albums(ids) => {
                 self.request(
                     move |client| {

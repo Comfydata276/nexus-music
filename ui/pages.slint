@@ -3,7 +3,7 @@
 import { ScrollView, ListView, AboutSlint } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { Icons } from "icons.slint";
-import { App, View, Player, Lyrics, Settings, Covers, Card, CardKind, Shelf, Page, QualityOption, ThemeOption } from "types.slint";
+import { App, View, Player, Lyrics, Settings, Covers, Card, CardKind, Shelf, Page, QualityOption, ThemeOption, Track } from "types.slint";
 import { Icon, IconButton, PlayButton, TextButton, LinkText, Cover, Field, Toggle, Chip, Slider, MediaCard, TrackRow, PageStatus, HoverIntent, SkeletonRows, ScrollThumb } from "widgets.slint";
 
 // Cover, title and summary at the top of an album, playlist or artist.
@@ -245,7 +245,7 @@ component ActionBar inherits Rectangle {
             }
         }
 
-        if View.can-download: VerticalLayout {
+        if View.can-download && View.download-state != 1: VerticalLayout {
             alignment: center;
             IconButton {
                 width: 40px;
@@ -253,10 +253,71 @@ component ActionBar inherits Rectangle {
                 icon: View.download-state == 2 ? Icons.circle-arrow-down : Icons.download;
                 icon-size: 22px;
                 active: View.download-state == 2;
-                opacity: View.download-state == 1 ? 0.5 : 1;
-                enabled: View.download-state != 1;
-                label: View.download-state == 2 ? "Remove from downloads" : View.download-state == 1 ? "Downloading" : "Download";
+                label: View.download-state == 2 ? "Remove from downloads" : "Download";
                 clicked => { View.download(); }
+            }
+        }
+
+        // While downloading: a ring that fills as songs arrive, with a stop button in it, and
+        // the count beside it.
+        if View.can-download && View.download-state == 1: HorizontalLayout {
+            spacing: 10px;
+
+            VerticalLayout {
+                alignment: center;
+                Rectangle {
+                    property <float> turn: clamp(View.download-progress, 0.02, 0.995);
+                    width: 40px;
+                    height: 40px;
+                    border-radius: 20px;
+                    background: stop.has-hover ? Theme.hover : transparent;
+                    accessible-role: button;
+                    accessible-label: "Cancel downloading";
+                    accessible-action-default => { View.download(); }
+
+                    stop := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { View.download(); }
+                    }
+
+                    Path {
+                        width: 28px;
+                        height: 28px;
+                        viewbox-width: 28;
+                        viewbox-height: 28;
+                        commands: "M 14 2 A 12 12 0 1 1 13.99 2";
+                        stroke: Theme.press;
+                        stroke-width: 3px;
+                        fill: transparent;
+                    }
+
+                    Path {
+                        width: 28px;
+                        height: 28px;
+                        viewbox-width: 28;
+                        viewbox-height: 28;
+                        commands: "M 14 2 A 12 12 0 " + (parent.turn > 0.5 ? "1" : "0") + " 1 "
+                            + (14 + 12 * sin(parent.turn * 360deg)) + " " + (14 - 12 * cos(parent.turn * 360deg));
+                        stroke: Theme.accent-bright;
+                        stroke-width: 3px;
+                        fill: transparent;
+                    }
+
+                    Rectangle {
+                        width: 9px;
+                        height: 9px;
+                        border-radius: 2px;
+                        background: stop.has-hover ? Theme.text : Theme.muted;
+                    }
+                }
+            }
+
+            Text {
+                text: View.download-done + " / " + View.download-total;
+                color: Theme.muted;
+                font-size: 14px;
+                font-weight: 600;
+                vertical-alignment: center;
             }
         }
 
@@ -567,7 +628,7 @@ export component StackPage inherits Rectangle {
                     star => { View.track-star(index); }
                     menu(x, y) => { View.track-menu(index, x, y); }
                     picked(ctrl, shift) => { View.track-clicked(index, ctrl, shift); }
-                    dropped(target) => { View.rows-dropped(index, target); }
+                    dropped(from, target) => { View.rows-dropped(from, target); }
                 }
             }
 
@@ -610,119 +671,134 @@ export component StackPage inherits Rectangle {
 
 // Albums, playlists and Liked songs. The list is virtualised, so the hero is part of row 0.
 export component TrackListPage inherits Rectangle {
-    // The play and filter controls sit over the list, not in it: they stay put while the list
-    // is rebuilt as you type, and stick to the top once the cover has scrolled away.
+    // The page is one scrolling sheet: the cover and title, room for the action bar, the column
+    // header, the songs, then any shelves. Songs all have the same height, so the page works out
+    // for itself which ones are in view and only those exist at any moment. (A long playlist
+    // would otherwise mean thousands of rows.)
     property <length> hero-height: clamp(self.width * 0.24, 140px, 232px) + 48px;
-    // Set by the first row while it exists. Once the list has scrolled far enough to drop that
-    // row, its scroll offset is only an estimate and can't say where the header would be.
-    property <bool> header-gone;
-    property <length> bar-y: View.tracks.length == 0 ? self.hero-height
-        : self.header-gone ? 0px : max(0px, self.hero-height + View.scroll-y);
-    property <bool> stuck: View.tracks.length > 0 && (self.header-gone || self.hero-height + View.scroll-y < 0px);
+    property <length> row-height: 56px;
+    property <length> section-height: 44px;
+    property <length> header-height: self.hero-height + 72px + 36px + 8px;
+    property <length> rows-height: View.tracks.length * self.row-height + View.track-sections * self.section-height;
+    property <length> scrolled: -View.scroll-y;
+    property <int> first: max(0, floor((self.scrolled - self.header-height) / self.row-height) - View.track-sections - 2);
+    property <int> shown: max(0, min(View.tracks.length - self.first, ceil(self.height / self.row-height) + View.track-sections + 5));
+    // The play and filter controls sit over the sheet and stick to the top once the cover has
+    // scrolled away.
+    property <length> bar-y: max(0px, self.hero-height - self.scrolled);
+    property <bool> stuck: self.scrolled > self.hero-height;
 
-    if View.tracks.length == 0: VerticalLayout {
-        alignment: start;
-        Hero { }
-
-        Rectangle {
-            height: 72px;
+    scroll := ScrollView {
+        vertical-scrollbar-policy: always-off;
+        horizontal-scrollbar-policy: always-off;
+        content-y <=> View.scroll-y;
+        content-width: self.visible-width;
+        content-height: root.header-height + root.rows-height + shelves.preferred-height + (View.tracks.length == 0 ? 160px : 0px);
+        // A list that gets shorter (songs removed, a filter typed) mustn't stay scrolled past its end.
+        changed content-height => {
+            self.content-y = max(self.content-y, min(0px, self.visible-height - self.content-height));
         }
 
-        if View.pending: SkeletonRows { }
+        Hero {
+            x: 0;
+            y: 0;
+            width: scroll.visible-width;
+        }
 
-        if !View.pending: Text {
+        if View.tracks.length > 0: ColumnHeader {
+            x: 0;
+            y: root.hero-height + 72px;
+            width: scroll.visible-width;
+        }
+
+        if View.tracks.length == 0 && View.pending: SkeletonRows {
+            x: 0;
+            y: root.hero-height + 72px;
+            width: scroll.visible-width;
+        }
+
+        if View.tracks.length == 0 && !View.pending: Text {
+            x: 24px;
+            y: root.hero-height + 72px + 24px;
+            width: scroll.visible-width - 48px;
             text: View.empty;
             color: Theme.muted;
             font-size: 15px;
             horizontal-alignment: center;
             wrap: word-wrap;
         }
-    }
 
-    if View.tracks.length > 0: Rectangle {
-        tracks := ListView {
-            vertical-scrollbar-policy: always-off;
-            horizontal-scrollbar-policy: always-off;
-            content-y <=> View.scroll-y;
+        for slot in root.shown: row := Rectangle {
+            property <int> index: root.first + slot;
+            property <Track> track: View.tracks[self.index];
+            x: 0;
+            y: root.header-height + self.index * root.row-height + self.track.sections-before * root.section-height;
+            width: scroll.visible-width;
+            height: root.row-height;
 
-            for track[index] in View.tracks: VerticalLayout {
-                if index == 0: Hero { }
-                if index == 0: Rectangle {
-                    height: 72px;
-                    init => {
-                        root.header-gone = self.absolute-position.y + self.height <= root.absolute-position.y;
-                    }
-                    changed absolute-position => {
-                        root.header-gone = self.absolute-position.y + self.height <= root.absolute-position.y;
-                    }
-                }
-                if index == 0: ColumnHeader { }
-                if index == 0: Rectangle {
-                    height: 8px;
-                }
-
-                if track.section != "": HorizontalLayout {
-                    height: 44px;
-                    padding-left: 32px;
-                    spacing: 12px;
-                    VerticalLayout {
-                        alignment: center;
-                        Icon {
-                            source: Icons.disc-3;
-                            size: 16px;
-                        }
-                    }
-
-                    Text {
-                        text: track.section;
-                        color: Theme.muted;
-                        font-size: 13px;
-                        font-weight: 600;
-                        vertical-alignment: center;
+            if self.track.section != "": HorizontalLayout {
+                y: -root.section-height;
+                height: root.section-height;
+                padding-left: 32px;
+                spacing: 12px;
+                VerticalLayout {
+                    alignment: center;
+                    Icon {
+                        source: Icons.disc-3;
+                        size: 16px;
                     }
                 }
 
-                HorizontalLayout {
-                    padding-left: 16px;
-                    padding-right: 16px;
-                    TrackRow {
-                        track: track;
-                        show-album: View.show-album;
-                        show-cover: View.show-cover;
-                        show-number: View.show-number;
-                        can-reorder: View.can-reorder;
-                        index: index;
-                        count: View.tracks.length;
-                        list-top: tracks.absolute-position.y + (root.stuck ? 72px : 0px);
-                        list-bottom: tracks.absolute-position.y + tracks.height;
-                        activated => { View.track-activated(index); }
-                        star => { View.track-star(index); }
-                        menu(x, y) => { View.track-menu(index, x, y); }
-                        picked(ctrl, shift) => { View.track-clicked(index, ctrl, shift); }
-                        dropped(target) => { View.rows-dropped(index, target); }
-                        reordered(delta) => { View.track-moved(index, delta); }
-                        nudge(by) => {
-                            tracks.content-y = clamp(tracks.content-y + by, min(0px, tracks.visible-height - tracks.content-height), 0px);
-                        }
-                    }
+                Text {
+                    text: row.track.section;
+                    color: Theme.muted;
+                    font-size: 13px;
+                    font-weight: 600;
+                    vertical-alignment: center;
                 }
+            }
 
-                if index == View.tracks.length - 1: VerticalLayout {
-                    padding-top: 24px;
-                    padding-bottom: 32px;
-                    for shelf in View.shelves: ShelfView {
-                        shelf: shelf;
-                    }
+            TrackRow {
+                x: 16px;
+                width: row.width - 32px;
+                track: row.track;
+                show-album: View.show-album;
+                show-cover: View.show-cover;
+                show-number: View.show-number;
+                can-reorder: View.can-reorder;
+                index: row.index;
+                count: View.tracks.length;
+                list-top: scroll.absolute-position.y + (root.stuck ? 72px : 0px);
+                list-bottom: scroll.absolute-position.y + scroll.height;
+                activated => { View.track-activated(row.index); }
+                star => { View.track-star(row.index); }
+                menu(x, y) => { View.track-menu(row.index, x, y); }
+                picked(ctrl, shift) => { View.track-clicked(row.index, ctrl, shift); }
+                dropped(from, target) => { View.rows-dropped(from, target); }
+                reordered(from, delta) => { View.track-moved(from, delta); }
+                nudge(by) => {
+                    scroll.content-y = clamp(scroll.content-y + by, min(0px, scroll.visible-height - scroll.content-height), 0px);
                 }
             }
         }
 
-        ScrollThumb {
-            x: parent.width - self.width;
-            content-y <=> tracks.content-y;
-            content-height: tracks.content-height;
-            visible-height: tracks.visible-height;
+        shelves := VerticalLayout {
+            x: 0;
+            y: root.header-height + root.rows-height;
+            width: scroll.visible-width;
+            padding-top: View.shelves.length > 0 ? 24px : 0px;
+            padding-bottom: 32px;
+            for shelf in View.shelves: ShelfView {
+                shelf: shelf;
+            }
         }
+    }
+
+    ScrollThumb {
+        x: parent.width - self.width;
+        content-y <=> scroll.content-y;
+        content-height: scroll.content-height;
+        visible-height: scroll.visible-height;
     }
 
     Rectangle {
@@ -1695,6 +1771,19 @@ export component SettingsPage inherits Rectangle {
                                 on: Settings.offline;
                                 label: "Offline mode";
                                 toggled(on) => { Settings.set-offline(on); }
+                            }
+                        }
+
+                        SettingRow {
+                            title: "Download quality";
+                            detail: "What new downloads are saved as. Lossless keeps each file exactly as it is on your server; the others save smaller MP3 copies.";
+                            HorizontalLayout {
+                                spacing: 6px;
+                                for option[index] in Settings.qualities: Chip {
+                                    text: option.title;
+                                    selected: index == Settings.download-quality;
+                                    clicked => { Settings.set-download-quality(index); }
+                                }
                             }
                         }
 

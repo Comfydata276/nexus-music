@@ -72,6 +72,8 @@ pub struct Song {
     pub cover_art: String,
     pub duration: u32,
     pub suffix: String,
+    /// Size of the file on the server, in bytes.
+    pub size: u64,
     pub bit_rate: u32,
     pub sampling_rate: u32,
     pub bit_depth: u32,
@@ -714,21 +716,19 @@ impl Client {
         self.call::<serde_json::Value>("updatePlaylist", &params, None).map(drop)
     }
 
-    pub fn remove_from_playlist(&self, id: &str, index: usize) -> ApiResult<()> {
-        let index = index.to_string();
-        self.call::<serde_json::Value>(
-            "updatePlaylist",
-            &[("playlistId", id), ("songIndexToRemove", &index)],
-            None,
-        )
-        .map(drop)
-    }
-
     /// Replaces a playlist's songs with `song_ids`, in that order.
     pub fn replace_playlist(&self, id: &str, song_ids: &[String]) -> ApiResult<()> {
         let mut params = vec![("playlistId", id)];
         params.extend(song_ids.iter().map(|s| ("songId", s.as_str())));
         self.call::<serde_json::Value>("createPlaylist", &params, None).map(drop)
+    }
+
+    /// Removes the songs at these positions from a playlist, in one request.
+    pub fn remove_many_from_playlist(&self, id: &str, positions: &[usize]) -> ApiResult<()> {
+        let positions: Vec<String> = positions.iter().map(|p| p.to_string()).collect();
+        let mut params = vec![("playlistId", id)];
+        params.extend(positions.iter().map(|p| ("songIndexToRemove", p.as_str())));
+        self.call::<serde_json::Value>("updatePlaylist", &params, None).map(drop)
     }
 
     pub fn delete_playlist(&self, id: &str) -> ApiResult<()> {

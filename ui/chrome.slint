@@ -62,6 +62,7 @@ component PlaylistItem inherits Rectangle {
     in property <PlaylistRef> playlist;
     in property <bool> selected;
     callback clicked;
+    callback play;
     callback rested;
     callback menu(x: length, y: length);
 
@@ -107,12 +108,39 @@ component PlaylistItem inherits Rectangle {
 
         VerticalLayout {
             alignment: center;
-            Cover {
+            Rectangle {
                 width: 40px;
                 height: 40px;
-                art: root.playlist.cover;
-                placeholder: Icons.list-music;
-                detail: 48px;
+
+                art := Cover {
+                    art: root.playlist.cover;
+                    placeholder: Icons.list-music;
+                    detail: 48px;
+                }
+
+                // Over the cover, a click plays the playlist; anywhere else opens it.
+                if play-touch.has-hover: Rectangle {
+                    border-radius: art.border-radius;
+                    background: play-touch.pressed ? #000000c8 : #000000a0;
+                    Icon {
+                        source: Icons.play-fill;
+                        size: 16px;
+                        tint: white;
+                    }
+                }
+
+                play-touch := TouchArea {
+                    mouse-cursor: pointer;
+                    accessible-role: button;
+                    accessible-label: "Play " + root.playlist.name;
+                    accessible-action-default => { root.play(); }
+                    clicked => { root.play(); }
+                    pointer-event(event) => {
+                        if event.button == PointerEventButton.right && event.kind == PointerEventKind.down {
+                            root.menu(self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
+                        }
+                    }
+                }
             }
         }
 
@@ -128,11 +156,25 @@ component PlaylistItem inherits Rectangle {
                 overflow: elide;
             }
 
-            Text {
-                text: root.playlist.subtitle;
-                color: Theme.muted;
-                font-size: 12px;
-                overflow: elide;
+            HorizontalLayout {
+                spacing: 5px;
+                alignment: start;
+
+                if root.playlist.pinned: VerticalLayout {
+                    alignment: center;
+                    Icon {
+                        source: Icons.pin;
+                        size: 12px;
+                        tint: Theme.accent-bright;
+                    }
+                }
+
+                Text {
+                    text: root.playlist.subtitle;
+                    color: Theme.muted;
+                    font-size: 12px;
+                    overflow: elide;
+                }
             }
         }
     }
@@ -286,6 +328,9 @@ export component Sidebar inherits Rectangle {
                         selected: App.route == "playlist:" + playlist.id;
                         clicked => {
                             View.card-activated({ kind: CardKind.playlist, id: playlist.id, title: playlist.name, cover: playlist.cover });
+                        }
+                        play => {
+                            View.card-play({ kind: CardKind.playlist, id: playlist.id, title: playlist.name });
                         }
                         rested => {
                             View.card-hovered({ kind: CardKind.playlist, id: playlist.id });
@@ -562,7 +607,7 @@ component QueueRow inherits Rectangle {
     in property <length> list-bottom;
     callback play;
     callback menu(x: length, y: length);
-    callback reordered(delta: int);
+    callback reordered(from: int, delta: int);
     callback nudge(by: length);
 
     height: 64px;
@@ -576,7 +621,7 @@ component QueueRow inherits Rectangle {
         count: root.count;
         list-top: root.list-top;
         list-bottom: root.list-bottom;
-        moved(delta) => { root.reordered(delta); }
+        moved(from, delta) => { root.reordered(from, delta); }
         nudge(by) => { root.nudge(by); }
     }
 
@@ -877,7 +922,7 @@ export component QueuePanel inherits Rectangle {
                         list-bottom: upcoming.absolute-position.y + upcoming.height;
                         play => { Player.queue-activated(index); }
                         menu(x, y) => { Player.queue-menu(index, x, y); }
-                        reordered(delta) => { Player.queue-moved(index, delta); }
+                        reordered(from, delta) => { Player.queue-moved(from, delta); }
                         nudge(by) => {
                             upcoming.content-y = clamp(upcoming.content-y + by, min(0px, upcoming.visible-height - upcoming.content-height), 0px);
                         }

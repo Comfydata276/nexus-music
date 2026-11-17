@@ -31,6 +31,17 @@ pub enum Target {
     Playlist { id: String, name: String },
 }
 
+impl Target {
+    /// The route key of the page that lists exactly this target's songs, if there is one.
+    fn route_key(&self) -> Option<String> {
+        match self {
+            Target::Album { id, .. } => Some(format!("album:{id}")),
+            Target::Playlist { id, .. } => Some(format!("playlist:{id}")),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct MenuState {
     target: Target,
@@ -40,6 +51,8 @@ pub struct MenuState {
 }
 
 pub enum PromptAction {
+    /// Some of these songs are already in the playlist: add them all, or only the new ones.
+    AddDuplicates { playlist_id: String, all: Vec<Song>, fresh: Vec<Song> },
     CreatePlaylist(Vec<Song>),
     RenamePlaylist(String),
     DeletePlaylist(String),
@@ -108,8 +121,11 @@ impl Controller {
         let mut rate = self.entry("rate", &label, icons.get_star());
         rate.submenu = true;
         entries.push(rate);
+        let downloading = self.downloads.borrow().progress_of(&song.id) >= 0.0;
         entries.push(if self.downloads.borrow().has(&song.id) {
             self.entry("remove-download", "Remove download", icons.get_circle_arrow_down())
+        } else if downloading {
+            self.entry("cancel-download", "Cancel download", icons.get_x())
         } else {
             self.entry("download", "Download", icons.get_download())
         });
@@ -150,7 +166,18 @@ impl Controller {
         add.submenu = true;
         entries.push(add);
         entries.push(self.entry("star-all", "Add to Liked songs", icons.get_heart()));
-        entries.push(self.entry("download", "Download", icons.get_download()));
+        // Offer whichever of these applies to at least one of the songs.
+        let (saved, unsaved) = {
+            let downloads = self.downloads.borrow();
+            let saved = songs.iter().filter(|s| downloads.has(&s.id) || downloads.progress_of(&s.id) >= 0.0).count();
+            (saved, songs.len() - saved)
+        };
+        if unsaved > 0 {
+            entries.push(self.entry("download", "Download", icons.get_download()));
+        }
+        if saved > 0 {
+            entries.push(self.entry("remove-download", "Remove downloads", icons.get_circle_arrow_down()));
+        }
         if playlist.is_some() {
             entries.push(self.separator());
             entries.push(self.entry("remove-playlist", "Remove from this playlist", icons.get_trash_2()));
@@ -210,8 +237,13 @@ impl Controller {
                 entries.push(add);
                 entries.push(self.entry("download", "Download", icons.get_download()));
             }
-            Target::Playlist { .. } => {
+            Target::Playlist { id, .. } => {
                 entries.push(self.separator());
+                entries.push(if self.settings.borrow().pinned_playlists.contains(id) {
+                    self.entry("unpin", "Unpin", icons.get_pin())
+                } else {
+                    self.entry("pin", "Pin to top", icons.get_pin())
+                });
                 entries.push(self.entry("download", "Download", icons.get_download()));
                 entries.push(self.entry("rename", "Rename", icons.get_pencil()));
                 let mut delete = self.entry("delete", "Delete playlist", icons.get_trash_2());
@@ -472,7 +504,13 @@ impl Controller {
             Target::None => return,
         };
         match (id, &target) {
-            ("play", _) => self.with_songs(target, move |ctl, songs| ctl.play_songs(songs, 0, &name, false)),
+            ("play", _) => {
+                let source = target.route_key();
+                self.with_songs(target, move |ctl, songs| {
+                    ctl.play_from.replace(source.map(|key| (key, (0..songs.len()).collect())));
+                    ctl.play_songs(songs, 0, &name, false)
+                })
+            }
             ("play-next", _) => self.with_songs(target, |ctl, songs| {
                 ctl.enqueue(songs, true);
                 ctl.toast("Playing next");
@@ -513,6 +551,27 @@ impl Controller {
                 self.remove_downloads(std::slice::from_ref(&song.id));
                 self.toast("Download removed");
             }
+            ("pin", Target::Playlist { id, .. }) | ("unpin", Target::Playlist { id, .. }) => {
+                {
+                    let mut settings = self.settings.borrow_mut();
+                    let was_pinned = settings.pinned_playlists.contains(id);
+                    settings.pinned_playlists.retain(|p| p != id);
+                    if !was_pinned {
+                        settings.pinned_playlists.push(id.clone());
+                    }
+                }
+                self.save_settings();
+                self.show_playlists();
+            }
+            ("cancel-download", Target::Song { song, .. }) => {
+                self.cancel_downloads(std::slice::from_ref(&song.id));
+                self.toast("Download cancelled");
+            }
+            ("remove-download", Target::Songs { songs, .. }) => {
+                let ids: Vec<String> = songs.iter().map(|song| song.id.clone()).collect();
+                self.remove_downloads(&ids);
+                self.toast("Downloads removed");
+            }
             ("rename", Target::Playlist { id, name }) => {
                 *self.prompt.borrow_mut() = Some(PromptAction::RenamePlaylist(id.clone()));
                 self.open_prompt("Rename playlist", "", "Save", Some(name), false);
@@ -535,6 +594,7 @@ impl Controller {
 
     fn open_prompt(&self, title: &str, message: &str, confirm: &str, text: Option<&str>, danger: bool) {
         let prompt = self.ui.global::<ui::Prompt>();
+        prompt.set_cancel_label("Cancel".into());
         prompt.set_title(title.into());
         prompt.set_message(message.into());
         prompt.set_confirm_label(confirm.into());
@@ -554,6 +614,11 @@ impl Controller {
         let Some(action) = self.prompt.borrow_mut().take() else { return };
         let name = text.trim().to_string();
         match action {
+            PromptAction::AddDuplicates { playlist_id, fresh, .. } => {
+                if !fresh.is_empty() {
+                    self.add_songs_to_playlist(playlist_id, fresh);
+                }
+            }
             PromptAction::CreatePlaylist(songs) => {
                 if name.is_empty() {
                     return;
@@ -614,7 +679,41 @@ impl Controller {
 
     // ---- playlists -----------------------------------------------------------------------------
 
+    /// Adds songs to a playlist, first asking what to do about any that are already in it.
     pub fn add_to_playlist(self: &Rc<Self>, playlist_id: String, songs: Vec<Song>) {
+        let id = playlist_id.clone();
+        self.request(
+            move |client| client.playlist(&id),
+            move |ctl, result| {
+                // If the playlist can't be read, add without the check: the add itself will
+                // report whatever is wrong.
+                let Ok(playlist) = result else { return ctl.add_songs_to_playlist(playlist_id, songs) };
+                let present: std::collections::HashSet<&str> = playlist.songs.iter().map(|s| s.id.as_str()).collect();
+                let fresh: Vec<Song> = songs.iter().filter(|s| !present.contains(s.id.as_str())).cloned().collect();
+                let repeats = songs.len() - fresh.len();
+                if repeats == 0 {
+                    return ctl.add_songs_to_playlist(playlist_id, songs);
+                }
+                let name = &playlist.name;
+                // The cautious answer is the highlighted one, as it is in Spotify.
+                let (title, message, add, skip) = match (songs.len(), fresh.len()) {
+                    (1, _) => ("Already added", format!("This is already in your “{name}” playlist."), "Add anyway", "Don't add"),
+                    (_, 0) => ("Already added", format!("These are already in your “{name}” playlist."), "Add anyway", "Don't add"),
+                    _ => (
+                        "Some already added",
+                        format!("{repeats} of these {} songs are already in your “{name}” playlist.", songs.len()),
+                        "Add all",
+                        "Add new ones",
+                    ),
+                };
+                *ctl.prompt.borrow_mut() = Some(PromptAction::AddDuplicates { playlist_id, all: songs, fresh });
+                ctl.open_prompt(title, &message, skip, None, false);
+                ctl.ui.global::<ui::Prompt>().set_cancel_label(add.into());
+            },
+        );
+    }
+
+    fn add_songs_to_playlist(self: &Rc<Self>, playlist_id: String, songs: Vec<Song>) {
         let name = self
             .playlists
             .borrow()
@@ -637,53 +736,60 @@ impl Controller {
         );
     }
 
-    /// Takes several songs out of the playlist on screen in one go, by saving what remains.
+    /// Takes songs out of the playlist on screen. They disappear at once; the server is told
+    /// in the background, and the page is reloaded from it if that fails.
     fn remove_rows_from_playlist(self: &Rc<Self>, playlist_id: String, rows: &[usize]) {
-        let (remaining, removed) = {
+        let mut rows: Vec<usize> = rows.to_vec();
+        rows.sort_unstable();
+        rows.dedup();
+        {
             let mut page = self.page.borrow_mut();
             if page.playlist.as_ref().is_none_or(|p| p.id != playlist_id) {
                 return;
             }
-            let before = page.songs.len();
+            rows.retain(|&row| row < page.songs.len());
             let mut index = 0;
             page.songs.retain(|_| {
                 index += 1;
-                !rows.contains(&(index - 1))
+                rows.binary_search(&(index - 1)).is_err()
             });
-            (page.songs.iter().map(|s| s.id.clone()).collect::<Vec<_>>(), before - page.songs.len())
-        };
+            page.can_play = !page.songs.is_empty();
+        }
+        if rows.is_empty() {
+            return;
+        }
         let key = format!("playlist:{playlist_id}");
+        // Anything in the queue that came from this playlist has moved up.
+        self.page_list_changed(&key, |at| match rows.binary_search(&at) {
+            Ok(_) => None,
+            Err(before) => Some(at - before),
+        });
+        self.rebuild_tracks();
+        if let Some(route) = self.current_route() {
+            let data = self.page.borrow().clone();
+            self.remember(&route.cache_key(), std::time::Instant::now(), data);
+        }
+        self.toast(if rows.len() == 1 {
+            "Removed from the playlist".to_string()
+        } else {
+            format!("{} songs removed from the playlist", rows.len())
+        });
         self.request(
-            move |client| client.replace_playlist(&playlist_id, &remaining),
+            move |client| client.remove_many_from_playlist(&playlist_id, &rows),
             move |ctl, result| {
-                ctl.invalidate(&key);
-                match result {
-                    Ok(()) => ctl.toast(format!("{removed} songs removed from the playlist")),
-                    Err(e) => ctl.toast(e.to_string()),
+                if let Err(e) = result {
+                    ctl.invalidate(&key);
+                    ctl.toast(format!("That didn't save. {e}"));
                 }
-                ctl.reload_playlists();
+                // Picks up the playlist's new length and running time (or, if the change
+                // didn't save, puts the songs back).
                 ctl.refresh();
             },
         );
     }
 
     fn remove_from_playlist(self: &Rc<Self>, playlist_id: String, index: usize) {
-        let key = format!("playlist:{playlist_id}");
-        let page = Route::Playlist(playlist_id.clone());
-        self.request(
-            move |client| client.remove_from_playlist(&playlist_id, index),
-            move |ctl, result| match result {
-                Ok(()) => {
-                    ctl.invalidate(&key);
-                    ctl.toast("Removed from playlist");
-                    ctl.reload_playlists();
-                    if ctl.current_route() == Some(page) {
-                        ctl.refresh();
-                    }
-                }
-                Err(e) => ctl.toast(e.to_string()),
-            },
-        );
+        self.remove_rows_from_playlist(playlist_id, &[index]);
     }
 
     fn start_radio(self: &Rc<Self>, seed: Song) {
@@ -712,7 +818,11 @@ impl Controller {
             ui::CardKind::Artist => Target::Artist { id, name: title.clone() },
             ui::CardKind::Genre => return,
         };
-        self.with_songs(target, move |ctl, songs| ctl.play_songs(songs, 0, &title, false));
+        let source = target.route_key();
+        self.with_songs(target, move |ctl, songs| {
+            ctl.play_from.replace(source.map(|key| (key, (0..songs.len()).collect())));
+            ctl.play_songs(songs, 0, &title, false)
+        });
     }
 
     // ---- likes ---------------------------------------------------------------------------------
@@ -769,6 +879,17 @@ impl Controller {
             with(|ctl| ctl.prompt_confirmed(&text));
         });
         prompt.on_cancelled(|| {
+            with(|ctl| {
+                let action = ctl.prompt.borrow_mut().take();
+                ctl.ui.global::<ui::Prompt>().set_open(false);
+                // For this question the second button is an answer, not a way out: add them
+                // all, repeats included.
+                if let Some(PromptAction::AddDuplicates { playlist_id, all, .. }) = action {
+                    ctl.add_songs_to_playlist(playlist_id, all);
+                }
+            });
+        });
+        prompt.on_dismissed(|| {
             with(|ctl| {
                 ctl.prompt.borrow_mut().take();
                 ctl.ui.global::<ui::Prompt>().set_open(false);

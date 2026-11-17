@@ -29,14 +29,16 @@ by the app itself.
 - A choice of output device, and exclusive mode: the device runs at each song's own sample
   rate and receives the file's samples unchanged (bit-perfect at full volume with the
   equaliser and levelling off).
-- Downloads: save songs, albums and playlists on the PC to play without the server.
+- Downloads: save songs, albums and playlists on the PC to play without the server, at a
+  quality you choose, with progress shown per song and on the taskbar, and a cancel button.
 - Offline mode, and automatic detection when the server can't be reached: downloads keep
   playing, and likes, ratings and plays are sent once the server is back.
 - A Now Playing screen with large artwork, the song's format and lyrics or what's next.
 - Internet radio stations set up in Navidrome, star ratings, and a sleep timer.
 - Plays MP3, FLAC, AAC/M4A, ALAC, Ogg Vorbis, WAV and AIFF directly. Anything else (Opus,
   WMA, APE and so on) is converted to MP3 by Navidrome on the fly.
-- Create, rename and delete playlists; add and remove songs; like songs and albums.
+- Create, rename, pin and delete playlists; add and remove songs, with a warning before
+  adding one that's already there; like songs and albums.
 - Synced lyrics when Navidrome has them (embedded or `.lrc` files).
 - Media keys and the Windows now-playing overlay.
 - Reports plays to Navidrome, which keeps play counts current and feeds Last.fm or

@@ -6,6 +6,8 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use serde::{Deserialize, Serialize};
 use slint::{ComponentHandle, Model};
@@ -24,6 +26,15 @@ pub struct Entry {
     pub bytes: u64,
 }
 
+/// A song waiting to be fetched, or being fetched now.
+struct Job {
+    song: Song,
+    /// How much has arrived, in thousandths.
+    progress: Arc<AtomicU32>,
+    /// Set to abandon the fetch.
+    cancel: Arc<AtomicBool>,
+}
+
 pub struct Downloads {
     dir: PathBuf,
     /// Oldest first.
@@ -32,9 +43,10 @@ pub struct Downloads {
     /// Playlists downloaded as a whole (their ids, or "liked" for Liked songs), so songs
     /// added to them later are downloaded too.
     collections: Vec<String>,
-    /// Songs waiting to be fetched or being fetched now.
-    queued: HashSet<String>,
-    /// For the progress message: how many of the current batch are done, and how many failed.
+    /// In the order they'll be fetched.
+    jobs: Vec<Job>,
+    /// For the progress messages: how many songs the current batch has, and how many of
+    /// them are done or failed.
     batch_total: usize,
     batch_done: usize,
     batch_failed: usize,
@@ -60,7 +72,7 @@ impl Downloads {
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or_default();
-        Downloads { dir, entries, files, collections, queued: HashSet::new(), batch_total: 0, batch_done: 0, batch_failed: 0 }
+        Downloads { dir, entries, files, collections, jobs: Vec::new(), batch_total: 0, batch_done: 0, batch_failed: 0 }
     }
 
     fn save(&self) {
@@ -91,14 +103,24 @@ impl Downloads {
         self.entries.is_empty()
     }
 
+    fn job(&self, id: &str) -> Option<&Job> {
+        self.jobs.iter().find(|job| job.song.id == id)
+    }
+
+    /// How far a song's download has got, from 0 to 1; -1 if it isn't being downloaded.
+    pub fn progress_of(&self, id: &str) -> f32 {
+        self.job(id).map(|job| job.progress.load(Ordering::Relaxed) as f32 / 1000.0).unwrap_or(-1.0)
+    }
+
     /// Where a downloaded song's audio is, if it has been downloaded.
     pub fn path_of(&self, id: &str) -> Option<PathBuf> {
         self.files.get(id).map(|file| self.dir.join(file))
     }
 
-    /// The downloaded songs, most recently added first.
+    /// The songs on their way (in the order they'll arrive), then the downloaded ones, most
+    /// recently added first.
     pub fn songs(&self) -> Vec<Song> {
-        self.entries.iter().rev().map(|e| e.song.clone()).collect()
+        self.jobs.iter().map(|job| job.song.clone()).chain(self.entries.iter().rev().map(|e| e.song.clone())).collect()
     }
 
     fn total_bytes(&self) -> u64 {
@@ -120,6 +142,12 @@ impl Downloads {
         }
     }
 
+    /// How far the whole batch has got, from 0 to 1, counting songs part-way through.
+    fn batch_progress(&self) -> f32 {
+        let partial: f32 = self.jobs.iter().map(|job| job.progress.load(Ordering::Relaxed) as f32 / 1000.0).sum();
+        ((self.batch_done + self.batch_failed) as f32 + partial) / self.batch_total.max(1) as f32
+    }
+
     fn add(&mut self, entry: Entry) {
         self.files.insert(entry.song.id.clone(), entry.file.clone());
         self.entries.retain(|e| e.song.id != entry.song.id);
@@ -136,14 +164,27 @@ impl Downloads {
     }
 }
 
-/// Fetches one song's audio into the downloads folder. Runs on a worker thread.
-fn fetch(client: &Client, dir: &Path, song: &Song) -> Result<Entry, String> {
+/// Fetches one song's audio into the downloads folder. Runs on a worker thread. `quality`
+/// is a bitrate cap in kbps, or 0 to keep the file as it is on the server.
+fn fetch(
+    client: &Client,
+    dir: &Path,
+    song: &Song,
+    quality: u32,
+    progress: &AtomicU32,
+    cancel: &AtomicBool,
+) -> Result<Entry, String> {
     let suffix = song.suffix.to_lowercase();
-    // Formats the app can't decode itself are saved the way they're streamed: as MP3.
-    let (url, extension) = if NATIVE_SUFFIXES.contains(&suffix.as_str()) {
-        (client.stream_url(&song.id, 0, 0), suffix)
+    let playable = NATIVE_SUFFIXES.contains(&suffix.as_str());
+    // The original is kept when lossless is asked for, or when it's already an MP3 within the
+    // limit. Otherwise the server converts it, as it would for streaming. (Formats the app
+    // can't decode itself are always converted.)
+    let original = playable && (quality == 0 || (suffix == "mp3" && song.bit_rate > 0 && song.bit_rate <= quality));
+    let rate = if quality == 0 { 320 } else { quality };
+    let (url, extension, expected) = if original {
+        (client.stream_url(&song.id, 0, 0), suffix, song.size)
     } else {
-        (client.stream_url(&song.id, 320, 0), "mp3".to_string())
+        (client.stream_url(&song.id, rate, 0), "mp3".to_string(), song.duration as u64 * rate as u64 * 125)
     };
     let stem: String = song.id.chars().filter(|c| c.is_ascii_alphanumeric() || "-_".contains(*c)).collect();
     if stem.is_empty() {
@@ -151,11 +192,15 @@ fn fetch(client: &Client, dir: &Path, song: &Song) -> Result<Entry, String> {
     }
     let file = format!("{stem}.{extension}");
     let temp = dir.join(format!("{file}.part"));
-    let (mut body, _) = client.open_stream(&url, None).map_err(|e| e.to_string())?;
+    let (mut body, length) = client.open_stream(&url, None).map_err(|e| e.to_string())?;
+    let expected = length.filter(|n| *n > 0).unwrap_or(expected).max(1);
     let mut out = fs::File::create(&temp).map_err(|e| e.to_string())?;
     let mut buf = vec![0u8; 128 * 1024];
     let mut bytes = 0u64;
     let copied = loop {
+        if cancel.load(Ordering::Relaxed) {
+            break Err("cancelled".to_string());
+        }
         match body.read(&mut buf) {
             Ok(0) => break Ok(()),
             Ok(n) => {
@@ -163,6 +208,8 @@ fn fetch(client: &Client, dir: &Path, song: &Song) -> Result<Entry, String> {
                     break Err(e.to_string());
                 }
                 bytes += n as u64;
+                // Held just short of full until the file is in place.
+                progress.store((bytes * 1000 / expected).min(990) as u32, Ordering::Relaxed);
             }
             Err(e) => break Err(e.to_string()),
         }
@@ -220,39 +267,59 @@ impl Controller {
     /// `quiet` skips the messages: used when topping up in the background.
     fn download_songs_with(self: &Rc<Self>, songs: Vec<Song>, quiet: bool) {
         let Some(client) = self.client() else { return };
-        let wanted: Vec<Song> = {
+        let quality = self.settings.borrow().download_quality;
+        let started: Vec<(Song, Arc<AtomicU32>, Arc<AtomicBool>)> = {
             let mut downloads = self.downloads.borrow_mut();
             let mut seen = HashSet::new();
             let wanted: Vec<Song> = songs
                 .into_iter()
-                .filter(|s| !downloads.has(&s.id) && !downloads.queued.contains(&s.id) && seen.insert(s.id.clone()))
+                .filter(|s| {
+                    s.radio_url.is_empty() && !downloads.has(&s.id) && downloads.job(&s.id).is_none() && seen.insert(s.id.clone())
+                })
                 .collect();
-            if downloads.queued.is_empty() {
+            if downloads.jobs.is_empty() {
                 downloads.batch_total = 0;
                 downloads.batch_done = 0;
                 downloads.batch_failed = 0;
             }
             downloads.batch_total += wanted.len();
-            downloads.queued.extend(wanted.iter().map(|s| s.id.clone()));
             wanted
+                .into_iter()
+                .map(|song| {
+                    let job = Job {
+                        song: song.clone(),
+                        progress: Arc::new(AtomicU32::new(0)),
+                        cancel: Arc::new(AtomicBool::new(false)),
+                    };
+                    let handles = (song, job.progress.clone(), job.cancel.clone());
+                    downloads.jobs.push(job);
+                    handles
+                })
+                .collect()
         };
-        if wanted.is_empty() {
+        if started.is_empty() {
             if !quiet {
                 self.toast("Already downloaded");
             }
             return;
         }
         if !quiet {
-            self.toast(match wanted.len() {
-                1 => format!("Downloading “{}”", wanted[0].title),
+            self.toast(match started.len() {
+                1 => format!("Downloading “{}”", started[0].0.title),
                 n => format!("Downloading {n} songs"),
             });
         }
         let (dir, covers) = (self.downloads.borrow().dir.clone(), self.paths.covers.clone());
-        for song in wanted {
+        for (song, progress, cancel) in started {
+            // Show it as on its way straight off.
+            self.mark_download(&song.id);
             let (client, dir, covers) = (client.clone(), dir.clone(), covers.clone());
             self.download_pool.spawn(move || {
-                let result = fetch(&client, &dir, &song);
+                let result = if cancel.load(Ordering::Relaxed) {
+                    Err("cancelled".to_string())
+                } else {
+                    fetch(&client, &dir, &song, quality, &progress, &cancel)
+                };
                 if result.is_ok() && !song.cover_art.is_empty() {
                     // Have the artwork on disk too, for when the server can't be reached.
                     let _ = crate::covers::ensure_file(&client, &covers, &song.cover_art);
@@ -267,61 +334,97 @@ impl Controller {
     fn download_finished(self: &Rc<Self>, id: &str, result: Result<Entry, String>) {
         let finished = {
             let mut downloads = self.downloads.borrow_mut();
-            // Removed or cancelled while it was being fetched.
-            let wanted = downloads.queued.remove(id);
-            match result {
-                Ok(entry) if wanted => {
+            // No longer listed means it was cancelled while being fetched.
+            let wanted = downloads.jobs.iter().position(|job| job.song.id == id).map(|at| downloads.jobs.remove(at));
+            match (result, wanted) {
+                (Ok(entry), Some(_)) => {
                     downloads.batch_done += 1;
                     downloads.add(entry);
                 }
-                Ok(entry) => {
+                (Ok(entry), None) => {
                     let _ = fs::remove_file(downloads.dir.join(entry.file));
                 }
-                Err(_) => downloads.batch_failed += 1,
+                (Err(_), Some(_)) => downloads.batch_failed += 1,
+                (Err(_), None) => {}
             }
-            downloads.queued.is_empty().then_some((downloads.batch_done, downloads.batch_failed))
+            (downloads.jobs.is_empty() && downloads.batch_total > 0)
+                .then_some((downloads.batch_done, downloads.batch_failed))
         };
-        self.mark_downloaded(id, self.downloads.borrow().has(id));
+        self.mark_download(id);
         if let Some((done, failed)) = finished {
-            self.toast(match (done, failed) {
-                (_, 0) if done == 1 => "Download finished".to_string(),
-                (_, 0) => format!("{done} songs downloaded"),
-                (0, _) => "Couldn't download. Check the connection to your server.".to_string(),
-                _ => format!("{done} songs downloaded; {failed} couldn't be fetched"),
-            });
+            self.downloads.borrow_mut().batch_total = 0;
+            match (done, failed) {
+                (0, 0) => {}
+                (1, 0) => self.toast("Download finished"),
+                (_, 0) => self.toast(format!("{done} songs downloaded")),
+                (0, _) => self.toast("Couldn't download. Check the connection to your server."),
+                _ => self.toast(format!("{done} songs downloaded; {failed} couldn't be fetched")),
+            }
         }
         self.sync_downloads();
     }
 
-    /// Deletes these songs' saved copies and forgets any that are still on their way.
+    /// Stops these songs' downloads, whether waiting or part-way through.
+    pub fn cancel_downloads(self: &Rc<Self>, ids: &[String]) {
+        {
+            let mut downloads = self.downloads.borrow_mut();
+            let before = downloads.jobs.len();
+            downloads.jobs.retain(|job| {
+                let cancelled = ids.contains(&job.song.id);
+                if cancelled {
+                    job.cancel.store(true, Ordering::Relaxed);
+                }
+                !cancelled
+            });
+            let cancelled = before - downloads.jobs.len();
+            downloads.batch_total = downloads.batch_total.saturating_sub(cancelled);
+            if downloads.jobs.is_empty() {
+                downloads.batch_total = 0;
+            }
+        }
+        for id in ids {
+            self.mark_download(id);
+        }
+        self.sync_downloads();
+    }
+
+    /// Deletes these songs' saved copies, and stops any that are still on their way.
     pub fn remove_downloads(self: &Rc<Self>, ids: &[String]) {
         {
             let mut downloads = self.downloads.borrow_mut();
             for id in ids {
-                downloads.queued.remove(id);
                 downloads.remove(id);
             }
         }
-        for id in ids {
-            self.mark_downloaded(id, false);
-        }
-        self.sync_downloads();
+        self.cancel_downloads(ids);
     }
 
     pub fn remove_all_downloads(self: &Rc<Self>) {
-        let ids: Vec<String> = self.downloads.borrow().entries.iter().map(|e| e.song.id.clone()).collect();
-        let queued: Vec<String> = self.downloads.borrow().queued.iter().cloned().collect();
-        self.remove_downloads(&[ids, queued].concat());
+        let ids: Vec<String> = self.downloads.borrow().songs().into_iter().map(|song| song.id).collect();
+        let collections = self.downloads.borrow().collections.clone();
+        for id in collections {
+            self.keep_downloaded(&id, false);
+        }
+        self.remove_downloads(&ids);
         self.toast("Downloads removed");
     }
 
-    /// Shows or hides the "downloaded" mark on every row for this song.
-    fn mark_downloaded(&self, id: &str, downloaded: bool) {
+    /// Brings every row for this song up to date with whether it's downloaded or on its way.
+    fn mark_download(&self, id: &str) {
+        let (downloaded, progress) = {
+            let downloads = self.downloads.borrow();
+            (downloads.has(id), downloads.progress_of(id))
+        };
+        let unavailable = self.is_offline() && !downloaded;
         for model in [&self.queue_model, &self.history_model, &self.tracks_model] {
             for row in 0..model.row_count() {
                 if let Some(mut track) = model.row_data(row) {
-                    if track.id == id && track.downloaded != downloaded {
+                    if track.id == id
+                        && (track.downloaded != downloaded || track.progress != progress || track.unavailable != unavailable)
+                    {
                         track.downloaded = downloaded;
+                        track.progress = progress;
+                        track.unavailable = unavailable;
                         model.set_row_data(row, track);
                     }
                 }
@@ -329,22 +432,51 @@ impl Controller {
         }
     }
 
+    /// Runs a few times a second while songs are downloading: moves the progress bars along.
+    pub fn tick_downloads(self: &Rc<Self>) {
+        let ids: Vec<String> = {
+            let downloads = self.downloads.borrow();
+            if downloads.jobs.is_empty() {
+                return;
+            }
+            // Only the ones under way can have moved.
+            downloads.jobs.iter().filter(|job| job.progress.load(Ordering::Relaxed) > 0).map(|job| job.song.id.clone()).collect()
+        };
+        for id in ids {
+            self.mark_download(&id);
+        }
+        self.sync_download_button();
+        self.sync_download_progress();
+    }
+
+    /// Shows the overall progress on the taskbar button.
+    fn sync_download_progress(&self) {
+        #[cfg(windows)]
+        {
+            let downloads = self.downloads.borrow();
+            crate::taskbar::set_progress((!downloads.jobs.is_empty()).then(|| downloads.batch_progress()));
+        }
+    }
+
     /// Refreshes everything that summarises the downloads: the sidebar line, Settings, the
     /// page's download button, and the Downloads page itself when it's showing.
     pub fn sync_downloads(self: &Rc<Self>) {
         let downloads = self.downloads.borrow();
-        let status = if downloads.queued.is_empty() {
+        let status = if downloads.jobs.is_empty() {
             String::new()
         } else {
-            format!("Downloading {} of {}", (downloads.batch_done + downloads.batch_failed + 1).min(downloads.batch_total), downloads.batch_total)
+            let at = (downloads.batch_done + downloads.batch_failed + 1).min(downloads.batch_total);
+            format!("Downloading {at} of {}", downloads.batch_total)
         };
         self.ui.global::<ui::App>().set_download_status(status.into());
         self.ui.global::<ui::Settings>().set_downloads_summary(downloads.summary().into());
         drop(downloads);
-        self.sync_download_button();
-        if matches!(self.current_route(), Some(Route::Downloads)) && self.downloads.borrow().queued.is_empty() {
+        self.sync_download_progress();
+        if matches!(self.current_route(), Some(Route::Downloads)) {
             let scroll = self.ui.global::<ui::View>().get_scroll_y();
             self.show_downloads(scroll);
+        } else {
+            self.sync_download_button();
         }
     }
 
@@ -353,23 +485,51 @@ impl Controller {
         let page = self.page.borrow();
         let downloads = self.downloads.borrow();
         let view = self.ui.global::<ui::View>();
+        if matches!(self.current_route(), Some(Route::Downloads)) {
+            // On the Downloads page the button shows the whole batch, and cancels it.
+            let busy = !downloads.jobs.is_empty();
+            view.set_can_download(busy);
+            view.set_download_state(if busy { 1 } else { 0 });
+            view.set_download_done((downloads.batch_done + downloads.batch_failed) as i32);
+            view.set_download_total(downloads.batch_total as i32);
+            view.set_download_progress(downloads.batch_progress());
+            return;
+        }
         let offered = !page.songs.is_empty()
             && (page.playlist.is_some() || matches!(self.current_route(), Some(Route::Album(_)) | Some(Route::Liked)));
         view.set_can_download(offered);
         let saved = page.songs.iter().filter(|s| downloads.has(&s.id)).count();
-        let busy = page.songs.iter().any(|s| downloads.queued.contains(&s.id));
+        let partial: f32 = page.songs.iter().map(|s| downloads.progress_of(&s.id).max(0.0)).sum();
+        let busy = page.songs.iter().any(|s| downloads.job(&s.id).is_some());
         view.set_download_state(if busy { 1 } else if saved == page.songs.len() && saved > 0 { 2 } else { 0 });
+        view.set_download_done(saved as i32);
+        view.set_download_total(page.songs.len() as i32);
+        view.set_download_progress((saved as f32 + partial) / page.songs.len().max(1) as f32);
     }
 
-    /// The button was pressed: download what's missing, or remove it all if nothing is.
+    /// The button was pressed: cancel what's under way, download what's missing, or remove it
+    /// all if nothing is.
     pub fn toggle_page_download(self: &Rc<Self>) {
+        if matches!(self.current_route(), Some(Route::Downloads)) {
+            let ids: Vec<String> = self.downloads.borrow().jobs.iter().map(|job| job.song.id.clone()).collect();
+            self.cancel_downloads(&ids);
+            return self.toast("Downloads cancelled");
+        }
         let songs = self.page.borrow().songs.clone();
-        let all_saved = {
-            let downloads = self.downloads.borrow();
-            songs.iter().all(|s| downloads.has(&s.id))
-        };
         let collection = self.page_collection();
-        if all_saved {
+        let (all_saved, waiting) = {
+            let downloads = self.downloads.borrow();
+            let waiting: Vec<String> =
+                songs.iter().filter(|s| downloads.job(&s.id).is_some()).map(|s| s.id.clone()).collect();
+            (songs.iter().all(|s| downloads.has(&s.id)), waiting)
+        };
+        if !waiting.is_empty() {
+            if let Some(id) = &collection {
+                self.keep_downloaded(id, false);
+            }
+            self.cancel_downloads(&waiting);
+            self.toast("Download cancelled");
+        } else if all_saved {
             let ids: Vec<String> = songs.iter().map(|s| s.id.clone()).collect();
             if let Some(id) = &collection {
                 self.keep_downloaded(id, false);
@@ -396,16 +556,22 @@ impl Controller {
         self.download_songs_with(songs, true);
     }
 
-    /// Builds the Downloads page from what's on disk; no server involved.
+    /// Builds the Downloads page from what's on disk and what's on its way; no server involved.
     pub fn show_downloads(self: &Rc<Self>, scroll: f32) {
-        let (songs, summary) = {
+        let (songs, summary, waiting) = {
             let downloads = self.downloads.borrow();
-            (downloads.songs(), downloads.summary())
+            (downloads.songs(), downloads.summary(), downloads.jobs.len())
+        };
+        let meta = match (songs.is_empty(), waiting) {
+            (true, _) => String::new(),
+            (false, 0) => summary,
+            (false, 1) => format!("{summary}, and 1 more on its way"),
+            (false, n) => format!("{summary}, and {n} more on their way"),
         };
         let page = PageData {
             label: "On this PC".into(),
             title: "Downloads".into(),
-            meta: if songs.is_empty() { String::new() } else { summary },
+            meta,
             cover: songs.first().map(|s| s.cover_art.clone()).unwrap_or_default(),
             can_play: !songs.is_empty(),
             show_album: true,

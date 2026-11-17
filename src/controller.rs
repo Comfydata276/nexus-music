@@ -104,7 +104,7 @@ impl Route {
     }
 
     /// Identifies cached page data; distinct for anything that loads different content.
-    fn cache_key(&self) -> String {
+    pub fn cache_key(&self) -> String {
         match self {
             Route::Search(query) => format!("search:{query}"),
             Route::Albums(sort) => format!("albums:{sort}"),
@@ -225,6 +225,9 @@ pub struct Controller {
     pub page: RefCell<PageData>,
     pub tracks_model: Rc<VecModel<ui::Track>>,
     pub track_view: RefCell<TrackView>,
+    /// Set just before `play_songs` by callers that know where the songs came from: the
+    /// page's route key, and each song's position in that page's list.
+    pub play_from: RefCell<Option<(String, Vec<usize>)>>,
     /// Rows of the song list that are selected, and the row a Shift-click extends from.
     pub selection: RefCell<std::collections::BTreeSet<usize>>,
     selection_anchor: Cell<Option<usize>>,
@@ -293,6 +296,7 @@ impl Controller {
             page: RefCell::default(),
             tracks_model: Rc::new(VecModel::default()),
             track_view: RefCell::default(),
+            play_from: RefCell::new(None),
             selection: RefCell::default(),
             selection_anchor: Cell::new(None),
             queue_model: Rc::new(VecModel::default()),
@@ -528,7 +532,8 @@ impl Controller {
         #[cfg(windows)]
         {
             let pb = self.playback.borrow();
-            crate::taskbar::update(pb.playing, pb.current().is_some());
+            let liked = pb.current().is_some_and(|song| self.is_starred(song));
+            crate::taskbar::update(pb.playing, pb.current().is_some(), liked);
         }
         #[cfg(windows)]
         if let Some(tray) = self.tray.borrow().as_ref() {
@@ -845,7 +850,7 @@ impl Controller {
         Some((age, data))
     }
 
-    fn remember(&self, key: &str, at: Instant, data: PageData) {
+    pub fn remember(&self, key: &str, at: Instant, data: PageData) {
         let mut cache = self.cache.borrow_mut();
         if cache.len() >= MEMORY_PAGES {
             let mut ages: Vec<Instant> = cache.values().map(|(at, _)| *at).collect();
@@ -1112,6 +1117,8 @@ impl Controller {
             self.track_view.borrow_mut().arrange(&page.songs);
             self.track_rows(&page)
         };
+        let sections = rows.last().map(|row| row.sections_before).unwrap_or(0);
+        self.ui.global::<ui::View>().set_track_sections(sections);
         self.tracks_model.set_vec(rows);
         // The rows are new, so nothing is selected any more.
         self.selection.borrow_mut().clear();
@@ -1227,6 +1234,7 @@ impl Controller {
         }
         drop((page, state));
         self.sync_download_button();
+        self.sync_playing();
     }
 
     /// The page's songs in the order they're shown.
@@ -1275,6 +1283,18 @@ impl Controller {
             page.songs.insert(to, song);
             (id, page.songs.iter().map(|s| s.id.clone()).collect::<Vec<_>>())
         };
+        // If the queue is playing from this playlist, its rows have moved too.
+        self.page_list_changed(&format!("playlist:{id}"), |at| {
+            Some(if at == from {
+                to
+            } else if from < to && at > from && at <= to {
+                at - 1
+            } else if to < from && at >= to && at < from {
+                at + 1
+            } else {
+                at
+            })
+        });
         self.rebuild_tracks();
         if let Some(route) = self.current_route() {
             let data = self.page.borrow().clone();
@@ -1296,6 +1316,7 @@ impl Controller {
         let multi_disc = data.disc_sections
             && data.songs.iter().any(|s| s.disc_number > 1);
         let mut last_disc = 0;
+        let mut sections = 0;
         let state = self.track_view.borrow();
         state
             .map
@@ -1312,7 +1333,9 @@ impl Controller {
                 if multi_disc && song.disc_number != last_disc {
                     last_disc = song.disc_number;
                     row.section = format!("Disc {}", song.disc_number.max(1)).into();
+                    sections += 1;
                 }
+                row.sections_before = sections;
                 row
             })
             .collect()
@@ -1332,6 +1355,9 @@ impl Controller {
             number: SharedString::default(),
             starred: self.is_starred(song),
             section: SharedString::default(),
+            sections_before: 0,
+            playing: false,
+            progress: self.downloads.borrow().progress_of(&song.id),
             selected: false,
             unavailable: self.is_offline() && !self.downloads.borrow().has(&song.id),
             downloaded: self.downloads.borrow().has(&song.id),
@@ -1404,21 +1430,31 @@ impl Controller {
         self.request(
             |client| client.playlists(),
             |ctl, result| {
-                let Ok(mut playlists) = result else { return };
-                playlists.sort_by_key(|p| p.name.to_lowercase());
-                let rows: Vec<ui::PlaylistRef> = playlists
-                    .iter()
-                    .map(|p| ui::PlaylistRef {
-                        id: p.id.as_str().into(),
-                        name: p.name.as_str().into(),
-                        subtitle: count(p.song_count, "song").into(),
-                        cover: p.cover_art.as_str().into(),
-                    })
-                    .collect();
-                ctl.ui.global::<ui::App>().set_playlists(ModelRc::new(VecModel::from(rows)));
+                let Ok(playlists) = result else { return };
                 *ctl.playlists.borrow_mut() = playlists;
+                ctl.show_playlists();
             },
         );
+    }
+
+    /// Lists the playlists in the sidebar: pinned ones first, in the order they were pinned,
+    /// then the rest by name.
+    pub fn show_playlists(&self) {
+        let pinned = self.settings.borrow().pinned_playlists.clone();
+        let place = |id: &str| pinned.iter().position(|p| p == id);
+        let mut playlists = self.playlists.borrow_mut();
+        playlists.sort_by_key(|p| (place(&p.id).unwrap_or(usize::MAX), p.name.to_lowercase()));
+        let rows: Vec<ui::PlaylistRef> = playlists
+            .iter()
+            .map(|p| ui::PlaylistRef {
+                id: p.id.as_str().into(),
+                name: p.name.as_str().into(),
+                subtitle: count(p.song_count, "song").into(),
+                cover: p.cover_art.as_str().into(),
+                pinned: place(&p.id).is_some(),
+            })
+            .collect();
+        self.ui.global::<ui::App>().set_playlists(ModelRc::new(VecModel::from(rows)));
     }
 
     // ---- settings ------------------------------------------------------------------------------
@@ -1483,6 +1519,9 @@ impl Controller {
         page.set_ui_scales(strings(config::UI_SCALES.iter().map(|s| s.0).collect()));
         page.set_ui_scale(
             config::UI_SCALES.iter().position(|s| (s.1 - settings.ui_scale).abs() < 0.01).unwrap_or(1) as i32,
+        );
+        page.set_download_quality(
+            QUALITIES.iter().position(|q| q.2 == settings.download_quality).unwrap_or(QUALITIES.len() - 1) as i32,
         );
         page.set_close_to_tray(settings.close_to_tray);
         page.set_check_updates(settings.check_updates);
@@ -1815,6 +1854,12 @@ impl Controller {
         });
         settings.on_install_update(|| {
             with(|ctl| ctl.install_update());
+        });
+        settings.on_set_download_quality(|index| {
+            with(|ctl| {
+                let bitrate = QUALITIES.get(index as usize).map(|q| q.2).unwrap_or(0);
+                ctl.change_setting(true, |s| s.download_quality = bitrate);
+            });
         });
         settings.on_set_offline(|on| {
             with(|ctl| ctl.set_offline_mode(on));

@@ -95,6 +95,10 @@ pub struct Settings {
     pub output_device_name: String,
     /// Take the device for this app alone and play each song at its own sample rate.
     pub exclusive: bool,
+    /// Bitrate cap in kbps for new downloads; 0 saves the original files.
+    pub download_quality: u32,
+    /// Playlists kept at the top of the sidebar, in the order they were pinned.
+    pub pinned_playlists: Vec<String>,
     /// Offline mode: don't contact the server; play downloads only.
     pub offline: bool,
     /// Keep the title bar Windows draws, instead of the app's own.
@@ -134,6 +138,8 @@ impl Default for Settings {
             output_device: String::new(),
             output_device_name: String::new(),
             exclusive: false,
+            download_quality: 0,
+            pinned_playlists: Vec::new(),
             offline: false,
             standard_title_bar: false,
             theme: THEMES[0].name.to_string(),
@@ -279,6 +285,9 @@ pub struct SavedQueue {
     pub cursor: usize,
     pub position: f64,
     pub context: String,
+    /// The page the queue was started from, and each song's place in that page's list.
+    pub source: String,
+    pub origins: Vec<Option<usize>>,
 }
 
 impl SavedQueue {

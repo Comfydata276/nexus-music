@@ -76,7 +76,8 @@ export component MenuOverlay inherits Rectangle {
     Rectangle {
         x: clamp(Menu.x, 8px, max(8px, root.width - self.width - 8px));
         y: clamp(Menu.y, 8px, max(8px, root.height - self.height - 8px));
-        width: 264px;
+        // As wide as its longest entry needs, within reason.
+        width: clamp(panel-content.preferred-width, 168px, 320px);
         height: root.panel-height;
         border-radius: 8px;
         background: Theme.overlay;
@@ -127,9 +128,10 @@ export component PromptOverlay inherits Rectangle {
     callback focus-input();
     focus-input => { input.focus(); }
 
-    // Block clicks from reaching the window behind.
+    // Block clicks from reaching the window behind. Clicking outside the box closes it
+    // without choosing either answer.
     TouchArea {
-        clicked => { Prompt.cancelled(); }
+        clicked => { Prompt.dismissed(); }
     }
 
     Rectangle {
@@ -182,7 +184,7 @@ export component PromptOverlay inherits Rectangle {
                 spacing: 8px;
 
                 TextButton {
-                    text: "Cancel";
+                    text: Prompt.cancel-label;
                     clicked => { Prompt.cancelled(); }
                 }
 

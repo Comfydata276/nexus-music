@@ -9,8 +9,8 @@ use windows::Win32::Graphics::Gdi::{CreateBitmap, DeleteObject};
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
 use windows::Win32::UI::Shell::{
-    DefSubclassProc, ITaskbarList3, SetWindowSubclass, THB_FLAGS, THB_ICON, THB_TOOLTIP, THBF_DISABLED,
-    THBF_ENABLED, THBN_CLICKED, THUMBBUTTON, TaskbarList,
+    DefSubclassProc, ITaskbarList3, SetWindowSubclass, TBPF_NOPROGRESS, TBPF_NORMAL, THB_FLAGS, THB_ICON,
+    THB_TOOLTIP, THBF_DISABLED, THBF_ENABLED, THBN_CLICKED, THUMBBUTTON, TaskbarList,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateIconIndirect, HICON, ICONINFO, RegisterWindowMessageW, WM_COMMAND,
@@ -22,6 +22,7 @@ use crate::controller::post;
 const PREVIOUS: u32 = 0;
 const TOGGLE: u32 = 1;
 const NEXT: u32 = 2;
+const LIKE: u32 = 3;
 
 struct Bar {
     list: ITaskbarList3,
@@ -30,10 +31,15 @@ struct Bar {
     play: HICON,
     pause: HICON,
     next: HICON,
+    like: HICON,
+    liked_icon: HICON,
     /// The buttons exist on the current taskbar button.
     added: bool,
     playing: bool,
     has_track: bool,
+    liked: bool,
+    /// Download progress shown on the taskbar button, in thousandths; `None` when idle.
+    progress: Option<u32>,
     /// Windows broadcasts this message when it (re)creates the app's taskbar button.
     button_created: u32,
 }
@@ -49,12 +55,23 @@ enum Glyph {
     Play,
     Pause,
     Next,
+    /// A heart: an outline when the song isn't liked, solid when it is.
+    Like,
+    Liked,
 }
 
 fn in_triangle(p: (f32, f32), a: (f32, f32), b: (f32, f32), c: (f32, f32)) -> bool {
     let side = |p: (f32, f32), q: (f32, f32), r: (f32, f32)| (p.0 - r.0) * (q.1 - r.1) - (q.0 - r.0) * (p.1 - r.1);
     let (d1, d2, d3) = (side(p, a, b), side(p, b, c), side(p, c, a));
     !((d1 < 0.0 || d2 < 0.0 || d3 < 0.0) && (d1 > 0.0 || d2 > 0.0 || d3 > 0.0))
+}
+
+/// Whether a point on the 32 by 32 grid is inside a heart, `scale` times full size.
+fn in_heart(x: f32, y: f32, scale: f32) -> bool {
+    // The classic heart curve: (x² + y² - 1)³ - x²y³ <= 0, with y pointing up.
+    let (hx, hy) = ((x - 16.0) / (11.0 * scale), (15.0 - y) / (11.0 * scale) + 0.15 * (1.0 - scale));
+    let round = hx * hx + hy * hy - 1.0;
+    round * round * round - hx * hx * hy * hy * hy <= 0.0
 }
 
 fn covers(glyph: Glyph, x: f32, y: f32) -> bool {
@@ -64,6 +81,8 @@ fn covers(glyph: Glyph, x: f32, y: f32) -> bool {
         Glyph::Pause => bar(8.5, 13.5) || bar(18.5, 23.5),
         Glyph::Next => in_triangle((x, y), (7.0, 7.0), (7.0, 25.0), (21.0, 16.0)) || bar(21.5, 25.5),
         Glyph::Previous => in_triangle((x, y), (25.0, 7.0), (25.0, 25.0), (11.0, 16.0)) || bar(6.5, 10.5),
+        Glyph::Liked => in_heart(x, y, 1.0),
+        Glyph::Like => in_heart(x, y, 1.0) && !in_heart(x, y, 0.72),
     }
 }
 
@@ -126,7 +145,7 @@ fn tip(text: &str) -> [u16; 260] {
 }
 
 impl Bar {
-    fn buttons(&self) -> [THUMBBUTTON; 3] {
+    fn buttons(&self) -> [THUMBBUTTON; 4] {
         let flags = if self.has_track { THBF_ENABLED } else { THBF_DISABLED };
         let button = |id: u32, icon: HICON, text: &str| THUMBBUTTON {
             dwMask: THB_ICON | THB_TOOLTIP | THB_FLAGS,
@@ -140,6 +159,11 @@ impl Bar {
             button(PREVIOUS, self.previous, "Previous"),
             if self.playing { button(TOGGLE, self.pause, "Pause") } else { button(TOGGLE, self.play, "Play") },
             button(NEXT, self.next, "Next"),
+            if self.liked {
+                button(LIKE, self.liked_icon, "Remove from Liked songs")
+            } else {
+                button(LIKE, self.like, "Add to Liked songs")
+            },
         ]
     }
 
@@ -169,6 +193,7 @@ unsafe extern "system" fn on_message(
             PREVIOUS => post(|ctl| ctl.previous_track()),
             TOGGLE => post(|ctl| ctl.toggle_play()),
             NEXT => post(|ctl| ctl.next_track()),
+            LIKE => post(|ctl| ctl.toggle_current_star()),
             _ => {}
         }
         return LRESULT(0);
@@ -199,32 +224,72 @@ pub fn install(ui: &crate::ui::MainWindow) {
             return;
         }
         let light = light_taskbar();
-        let (Some(previous), Some(play), Some(pause), Some(next)) = (
+        let (Some(previous), Some(play), Some(pause), Some(next), Some(like), Some(liked_icon)) = (
             make_icon(Glyph::Previous, light),
             make_icon(Glyph::Play, light),
             make_icon(Glyph::Pause, light),
             make_icon(Glyph::Next, light),
+            make_icon(Glyph::Like, light),
+            make_icon(Glyph::Liked, light),
         ) else {
             return;
         };
         let button_created = RegisterWindowMessageW(w!("TaskbarButtonCreated"));
-        let mut bar =
-            Bar { list, hwnd, previous, play, pause, next, added: false, playing: false, has_track: false, button_created };
+        let mut bar = Bar {
+            list,
+            hwnd,
+            previous,
+            play,
+            pause,
+            next,
+            like,
+            liked_icon,
+            added: false,
+            playing: false,
+            has_track: false,
+            liked: false,
+            progress: None,
+            button_created,
+        };
         bar.show();
         BAR.with(|slot| *slot.borrow_mut() = Some(bar));
         let _ = SetWindowSubclass(hwnd, Some(on_message), 0x4e4d, 0);
     }
 }
 
-/// Updates the play/pause button and whether the buttons can be pressed.
-pub fn update(playing: bool, has_track: bool) {
+/// Updates the play/pause and like buttons, and whether the buttons can be pressed.
+pub fn update(playing: bool, has_track: bool, liked: bool) {
     BAR.with(|bar| {
         if let Ok(mut bar) = bar.try_borrow_mut() {
             if let Some(bar) = bar.as_mut() {
-                if bar.playing != playing || bar.has_track != has_track || !bar.added {
+                if bar.playing != playing || bar.has_track != has_track || bar.liked != liked || !bar.added {
                     bar.playing = playing;
                     bar.has_track = has_track;
+                    bar.liked = liked;
                     bar.show();
+                }
+            }
+        }
+    });
+}
+
+/// Shows download progress on the taskbar button: a fraction from 0 to 1, or `None` to clear it.
+pub fn set_progress(fraction: Option<f32>) {
+    let progress = fraction.map(|f| (f.clamp(0.0, 1.0) * 1000.0) as u32);
+    BAR.with(|bar| {
+        if let Ok(mut bar) = bar.try_borrow_mut() {
+            if let Some(bar) = bar.as_mut().filter(|bar| bar.progress != progress) {
+                bar.progress = progress;
+                unsafe {
+                    match progress {
+                        Some(done) => {
+                            let _ = bar.list.SetProgressState(bar.hwnd, TBPF_NORMAL);
+                            let _ = bar.list.SetProgressValue(bar.hwnd, done.max(10) as u64, 1000);
+                        }
+                        None => {
+                            let _ = bar.list.SetProgressState(bar.hwnd, TBPF_NOPROGRESS);
+                        }
+                    }
                 }
             }
         }
