@@ -165,7 +165,12 @@ impl Controller {
         let mut add = self.entry("add-to", "Add to playlist", icons.get_list_plus());
         add.submenu = true;
         entries.push(add);
-        entries.push(self.entry("star-all", "Add to Liked songs", icons.get_heart()));
+        // Adding skips the ones already liked; once they all are, the offer is to remove them.
+        entries.push(if songs.iter().all(|song| self.is_starred(song)) {
+            self.entry("unstar-all", "Remove from Liked songs", icons.get_heart_fill())
+        } else {
+            self.entry("star-all", "Add to Liked songs", icons.get_heart())
+        });
         // Offer whichever of these applies to at least one of the songs.
         let (saved, unsaved) = {
             let downloads = self.downloads.borrow();
@@ -504,13 +509,7 @@ impl Controller {
             Target::None => return,
         };
         match (id, &target) {
-            ("play", _) => {
-                let source = target.route_key();
-                self.with_songs(target, move |ctl, songs| {
-                    ctl.play_from.replace(source.map(|key| (key, (0..songs.len()).collect())));
-                    ctl.play_songs(songs, 0, &name, true)
-                })
-            }
+            ("play", _) => self.play_target(target, name),
             ("play-next", _) => self.with_songs(target, |ctl, songs| {
                 ctl.enqueue(songs, true);
                 ctl.toast("Playing next");
@@ -532,11 +531,21 @@ impl Controller {
                 self.remove_from_playlist(playlist.clone(), *index)
             }
             ("remove-queue", Target::Song { upcoming: Some(offset), .. }) => self.remove_upcoming(*offset),
-            ("star-all", Target::Songs { songs, .. }) => {
-                for song in songs.iter().filter(|song| !self.is_starred(song)) {
-                    self.set_star("id", song.id.clone(), true);
-                }
-                self.toast(format!("{} songs added to Liked songs", songs.len()));
+            ("star-all", Target::Songs { songs, .. }) | ("unstar-all", Target::Songs { songs, .. }) => {
+                let like = id == "star-all";
+                // Only the songs this changes anything for, each once.
+                let mut ids: Vec<String> =
+                    songs.iter().filter(|song| self.is_starred(song) != like).map(|song| song.id.clone()).collect();
+                ids.sort_unstable();
+                ids.dedup();
+                let changed = ids.len();
+                self.set_song_stars(ids, like);
+                self.toast(match (changed, like) {
+                    (1, true) => "1 song added to Liked songs".to_string(),
+                    (n, true) => format!("{n} songs added to Liked songs"),
+                    (1, false) => "1 song removed from Liked songs".to_string(),
+                    (n, false) => format!("{n} songs removed from Liked songs"),
+                });
             }
             ("remove-playlist", Target::Songs { playlist: Some((playlist, rows)), .. }) => {
                 self.remove_rows_from_playlist(playlist.clone(), rows)
@@ -832,10 +841,25 @@ impl Controller {
             ui::CardKind::Artist => Target::Artist { id, name: title.clone() },
             ui::CardKind::Genre => return,
         };
+        self.play_target(target, title);
+    }
+
+    /// Plays an album, playlist or the like from the top (or shuffled, if it's set to be).
+    fn play_target(self: &Rc<Self>, target: Target, name: String) {
         let source = target.route_key();
+        let playlist = match &target {
+            Target::Playlist { id, .. } => Some(id.clone()),
+            _ => None,
+        };
         self.with_songs(target, move |ctl, songs| {
-            ctl.play_from.replace(source.map(|key| (key, (0..songs.len()).collect())));
-            ctl.play_songs(songs, 0, &title, true)
+            // A playlist plays in the order its page shows it in.
+            let rows: Vec<usize> = match &playlist {
+                Some(id) => ctl.playlist_order(id, &songs),
+                None => (0..songs.len()).collect(),
+            };
+            let songs: Vec<Song> = rows.iter().filter_map(|&row| songs.get(row).cloned()).collect();
+            ctl.play_from.replace(source.map(|key| (key, rows)));
+            ctl.play_songs(songs, 0, &name, true)
         });
     }
 
@@ -846,8 +870,39 @@ impl Controller {
             return self.toast("Radio stations can't be added to Liked songs");
         }
         let starred = !self.is_starred(song);
-        self.set_star("id", song.id.clone(), starred);
+        self.set_song_stars(vec![song.id.clone()], starred);
         self.toast(if starred { "Added to Liked songs" } else { "Removed from Liked songs" });
+    }
+
+    /// Likes or unlikes these songs. Unliked songs leave the Liked songs page if it's showing.
+    fn set_song_stars(self: &Rc<Self>, ids: Vec<String>, starred: bool) {
+        for id in &ids {
+            self.set_star("id", id.clone(), starred);
+        }
+        if starred || ids.is_empty() || !self.page.borrow().liked_songs {
+            return;
+        }
+        let gone: std::collections::HashSet<&str> = ids.iter().map(|id| id.as_str()).collect();
+        let (kept, meta): (Vec<bool>, String) = {
+            let mut page = self.page.borrow_mut();
+            let kept: Vec<bool> = page.songs.iter().map(|song| !gone.contains(song.id.as_str())).collect();
+            let mut at = 0;
+            page.songs.retain(|_| {
+                at += 1;
+                kept[at - 1]
+            });
+            page.can_play = !page.songs.is_empty();
+            page.meta = crate::controller::count(page.songs.len() as u32, "song");
+            (kept, page.meta.clone())
+        };
+        // Anything in the queue that came from this page has moved up.
+        self.page_list_changed("liked", |at| {
+            kept.get(at).copied().unwrap_or(false).then(|| kept[..at].iter().filter(|keep| **keep).count())
+        });
+        let view = self.ui.global::<ui::View>();
+        view.set_meta(meta.into());
+        view.set_can_play(self.page.borrow().can_play);
+        self.rebuild_tracks();
     }
 
     pub fn toggle_page_star(self: &Rc<Self>) {
@@ -875,6 +930,10 @@ impl Controller {
         self.submit(change, move |ctl, reason| {
             ctl.apply_star(kind, &id, !starred);
             ctl.toast(format!("That didn't save. {reason}"));
+            // A song taken off the Liked songs page is still liked after all: show it again.
+            if ctl.page.borrow().liked_songs {
+                ctl.refresh();
+            }
         });
     }
 

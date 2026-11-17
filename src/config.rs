@@ -72,6 +72,9 @@ pub struct ListPrefs {
     /// The order it's shown in (an index into `TRACK_SORTS`), and whether that's reversed.
     pub sort: usize,
     pub descending: bool,
+    /// The order was chosen by the user. Until it is, the list opens in its usual order:
+    /// for a playlist, the most recently added songs first.
+    pub sort_chosen: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

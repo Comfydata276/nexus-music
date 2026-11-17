@@ -1074,11 +1074,10 @@ impl Controller {
         let key = self.current_route().map(|route| route.cache_key()).unwrap_or_default();
         let same_view = self.track_view.borrow().key == key;
         if !same_view {
-            // It opens in the order it was last left in.
-            let prefs = self.list_prefs(&key);
-            let sort = prefs.sort.min(TRACK_SORTS.len() - 1);
-            *self.track_view.borrow_mut() =
-                TrackView { key, sort, descending: sort != 0 && prefs.descending, ..Default::default() };
+            // It opens in the order it was last left in. A playlist nobody has sorted yet
+            // opens with the songs added most recently at the top.
+            let (sort, descending) = self.list_sort(&key);
+            *self.track_view.borrow_mut() = TrackView { key, sort, descending, ..Default::default() };
             view.set_filter("".into());
         }
         if let (Some(playlist), false) = (&data.playlist, data.pending) {
@@ -1271,16 +1270,9 @@ impl Controller {
 
     /// When each of the page's songs was added to it; empty if the page has no such date.
     fn added_dates(&self, page: &PageData) -> Vec<i64> {
-        use crate::added::{day_start, parse_time};
+        use crate::added::parse_time;
         if let Some(playlist) = &page.playlist {
-            // The app's own note where it has one; otherwise the day the song joined the
-            // library, which is the nearest thing the server knows.
-            let noted = self.added.borrow().dates(&playlist.id, &page.songs);
-            page.songs
-                .iter()
-                .zip(noted)
-                .map(|(song, at)| if at > 0 { at } else { day_start(parse_time(&song.created)) })
-                .collect()
+            self.playlist_dates(&playlist.id, &page.songs)
         } else if page.liked_songs {
             page.songs.iter().map(|song| song.starred.as_deref().map(parse_time).unwrap_or(0)).collect()
         } else if matches!(self.current_route(), Some(Route::Downloads)) {
@@ -1289,6 +1281,40 @@ impl Controller {
         } else {
             Vec::new()
         }
+    }
+
+    /// When each song of a playlist was added to it: the app's own note where it has one,
+    /// otherwise the day the song joined the library, the nearest thing the server knows.
+    fn playlist_dates(&self, id: &str, songs: &[Song]) -> Vec<i64> {
+        use crate::added::{day_start, parse_time};
+        let noted = self.added.borrow().dates(id, songs);
+        songs
+            .iter()
+            .zip(noted)
+            .map(|(song, at)| if at > 0 { at } else { day_start(parse_time(&song.created)) })
+            .collect()
+    }
+
+    /// The order a list opens in (an index into `TRACK_SORTS`, and whether it's reversed):
+    /// the one it was last left in. A playlist nobody has sorted yet opens with the songs
+    /// added most recently at the top.
+    fn list_sort(&self, key: &str) -> (usize, bool) {
+        let prefs = self.list_prefs(key);
+        if !prefs.sort_chosen && prefs.sort == 0 && key.starts_with("playlist:") {
+            return (SORT_ADDED, true);
+        }
+        let sort = prefs.sort.min(TRACK_SORTS.len() - 1);
+        (sort, sort != 0 && prefs.descending)
+    }
+
+    /// The order a playlist's page shows these songs in, as positions in `songs`. Playing
+    /// the playlist from elsewhere (the sidebar, a menu) follows the same order.
+    pub fn playlist_order(&self, id: &str, songs: &[Song]) -> Vec<usize> {
+        self.added.borrow_mut().observe(id, songs, chrono::Utc::now().timestamp());
+        let (sort, descending) = self.list_sort(&format!("playlist:{id}"));
+        let mut view = TrackView { sort, descending, ..Default::default() };
+        view.arrange(songs, &self.playlist_dates(id, songs));
+        view.map
     }
 
     // ---- what's remembered about each list -----------------------------------------------------
@@ -1326,6 +1352,7 @@ impl Controller {
         self.update_list_prefs(&key, |prefs| {
             prefs.sort = sort;
             prefs.descending = descending;
+            prefs.sort_chosen = true;
         });
     }
 
