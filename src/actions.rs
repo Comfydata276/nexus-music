@@ -54,6 +54,8 @@ pub enum PromptAction {
     /// Some of these songs are already in the playlist: add them all, or only the new ones.
     AddDuplicates { playlist_id: String, all: Vec<Song>, fresh: Vec<Song> },
     CreatePlaylist(Vec<Song>),
+    /// The file or folder to import playlists from was typed in.
+    ImportPath,
     RenamePlaylist(String),
     DeletePlaylist(String),
 }
@@ -95,7 +97,8 @@ impl Controller {
 
     fn song_menu(&self, song: Song, playlist: Option<(String, usize)>, upcoming: Option<usize>, x: f32, y: f32) {
         // A radio station isn't a song in the library: none of these actions apply to it.
-        if !song.radio_url.is_empty() {
+        // Nor is a row that only names a song an import couldn't find.
+        if !song.radio_url.is_empty() || song.id.is_empty() {
             return;
         }
         let icons = self.ui.global::<ui::Icons>();
@@ -200,8 +203,11 @@ impl Controller {
             let playlist = self.page.borrow().playlist.as_ref().map(|p| {
                 (p.id.clone(), chosen.iter().map(|(index, _)| *index).collect::<Vec<_>>())
             });
-            let songs: Vec<Song> =
-                chosen.into_iter().map(|(_, song)| song).filter(|s| s.radio_url.is_empty()).collect();
+            let songs: Vec<Song> = chosen
+                .into_iter()
+                .map(|(_, song)| song)
+                .filter(|s| s.radio_url.is_empty() && !s.id.is_empty())
+                .collect();
             if songs.len() > 1 {
                 return self.songs_menu(songs, playlist, x, y);
             }
@@ -270,7 +276,7 @@ impl Controller {
             ui::CardKind::Artist => {
                 self.collection_menu(Target::Artist { id, name: title.clone() }, &title, x, y)
             }
-            ui::CardKind::Genre => {}
+            ui::CardKind::Genre | ui::CardKind::Mix => {}
         }
     }
 
@@ -488,6 +494,14 @@ impl Controller {
             return self.set_track_sort(index);
         }
         match id {
+            "new-playlist" => {
+                self.close_menu();
+                return self.prompt_new_playlist(Vec::new());
+            }
+            "import-spotify" => {
+                self.close_menu();
+                return self.start_import();
+            }
             "add-to" => return self.show_playlist_picker(),
             "rate" => return self.show_rating_picker(),
             "back" => {
@@ -615,6 +629,27 @@ impl Controller {
         prompt.set_open(true);
     }
 
+    /// The menu on the + beside "Playlists".
+    pub fn open_playlist_menu(&self, x: f32, y: f32) {
+        let icons = self.ui.global::<ui::Icons>();
+        let entries = vec![
+            self.entry("new-playlist", "New playlist", icons.get_list_plus()),
+            self.entry("import-spotify", "Import from Spotify", icons.get_download()),
+        ];
+        self.open_menu(Target::None, "", entries, x, y);
+    }
+
+    pub fn prompt_import_path(&self) {
+        *self.prompt.borrow_mut() = Some(PromptAction::ImportPath);
+        self.open_prompt(
+            "Import from Spotify",
+            "Type the folder your playlists were exported to, or the path of one file.",
+            "Import",
+            Some(""),
+            false,
+        );
+    }
+
     pub fn prompt_new_playlist(self: &Rc<Self>, songs: Vec<Song>) {
         *self.prompt.borrow_mut() = Some(PromptAction::CreatePlaylist(songs));
         self.open_prompt("Name your playlist", "", "Create playlist", Some(""), false);
@@ -628,6 +663,11 @@ impl Controller {
             PromptAction::AddDuplicates { playlist_id, fresh, .. } => {
                 if !fresh.is_empty() {
                     self.add_songs_to_playlist(playlist_id, fresh);
+                }
+            }
+            PromptAction::ImportPath => {
+                if !name.is_empty() {
+                    self.run_import(vec![std::path::PathBuf::from(name.trim_matches('"'))]);
                 }
             }
             PromptAction::CreatePlaylist(songs) => {
@@ -788,11 +828,9 @@ impl Controller {
             return;
         }
         let key = format!("playlist:{playlist_id}");
-        // Anything in the queue that came from this playlist has moved up.
-        self.page_list_changed(&key, |at| match rows.binary_search(&at) {
-            Ok(_) => None,
-            Err(before) => Some(at - before),
-        });
+        // If the queue is playing from this playlist, the songs leave it too.
+        let songs = self.page.borrow().songs.clone();
+        self.source_list_now(&key, &songs);
         self.rebuild_tracks();
         if let Some(route) = self.current_route() {
             let data = self.page.borrow().clone();
@@ -846,6 +884,14 @@ impl Controller {
             ui::CardKind::Playlist => Target::Playlist { id, name: title.clone() },
             ui::CardKind::Artist => Target::Artist { id, name: title.clone() },
             ui::CardKind::Genre => return,
+            ui::CardKind::Mix => {
+                // Made on the spot from the app's copy of the library.
+                let Some(mix) = crate::search::current().and_then(|index| crate::mixes::one(&index, &id)) else { return };
+                let list: Vec<String> = mix.songs.iter().map(|song| song.id.clone()).collect();
+                let rows = (0..mix.songs.len()).collect();
+                self.play_from.replace(Some(crate::playback::PlayFrom { key: format!("mix:{id}"), rows, list }));
+                return self.play_songs(mix.songs, 0, &mix.title, true);
+            }
         };
         self.play_target(target, title);
     }
@@ -857,14 +903,15 @@ impl Controller {
             Target::Playlist { id, .. } => Some(id.clone()),
             _ => None,
         };
-        self.with_songs(target, move |ctl, songs| {
+        self.with_songs(target, move |ctl, all| {
             // A playlist plays in the order its page shows it in.
             let rows: Vec<usize> = match &playlist {
-                Some(id) => ctl.playlist_order(id, &songs),
-                None => (0..songs.len()).collect(),
+                Some(id) => ctl.playlist_order(id, &all),
+                None => (0..all.len()).collect(),
             };
-            let songs: Vec<Song> = rows.iter().filter_map(|&row| songs.get(row).cloned()).collect();
-            ctl.play_from.replace(source.map(|key| (key, rows)));
+            let songs: Vec<Song> = rows.iter().filter_map(|&row| all.get(row).cloned()).collect();
+            let list = all.iter().map(|song| song.id.clone()).collect();
+            ctl.play_from.replace(source.map(|key| crate::playback::PlayFrom { key, rows, list }));
             ctl.play_songs(songs, 0, &name, true)
         });
     }
@@ -872,6 +919,10 @@ impl Controller {
     // ---- likes ---------------------------------------------------------------------------------
 
     pub fn toggle_song_star(self: &Rc<Self>, song: &Song) {
+        if song.id.is_empty() {
+            // A row that only names a song (one an import couldn't find), not one in the library.
+            return;
+        }
         if !song.radio_url.is_empty() {
             return self.toast("Radio stations can't be added to Liked songs");
         }
@@ -889,22 +940,15 @@ impl Controller {
             return;
         }
         let gone: std::collections::HashSet<&str> = ids.iter().map(|id| id.as_str()).collect();
-        let (kept, meta): (Vec<bool>, String) = {
+        let (songs, meta) = {
             let mut page = self.page.borrow_mut();
-            let kept: Vec<bool> = page.songs.iter().map(|song| !gone.contains(song.id.as_str())).collect();
-            let mut at = 0;
-            page.songs.retain(|_| {
-                at += 1;
-                kept[at - 1]
-            });
+            page.songs.retain(|song| !gone.contains(song.id.as_str()));
             page.can_play = !page.songs.is_empty();
             page.meta = crate::controller::count(page.songs.len() as u32, "song");
-            (kept, page.meta.clone())
+            (page.songs.clone(), page.meta.clone())
         };
-        // Anything in the queue that came from this page has moved up.
-        self.page_list_changed("liked", |at| {
-            kept.get(at).copied().unwrap_or(false).then(|| kept[..at].iter().filter(|keep| **keep).count())
-        });
+        // If the queue is playing Liked songs, they leave it too.
+        self.source_list_now("liked", &songs);
         let view = self.ui.global::<ui::View>();
         view.set_meta(meta.into());
         view.set_can_play(self.page.borrow().can_play);

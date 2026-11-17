@@ -291,10 +291,10 @@ export component Sidebar inherits Rectangle {
 
             VerticalLayout {
                 alignment: center;
-                IconButton {
+                add := IconButton {
                     icon: Icons.plus;
-                    label: "Create playlist";
-                    clicked => { App.new-playlist(); }
+                    label: "Add a playlist";
+                    clicked => { App.playlist-menu(add.absolute-position.x, add.absolute-position.y + add.height + 4px); }
                 }
             }
         }

@@ -327,6 +327,8 @@ pub struct SavedQueue {
     pub origins: Vec<Option<usize>>,
     /// When the queue last changed, in seconds since 1970 (see `sync`).
     pub stamp: i64,
+    /// The ids of every song in the list the queue was started from, as last seen.
+    pub source_list: Vec<String>,
 }
 
 impl SavedQueue {

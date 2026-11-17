@@ -153,6 +153,24 @@ impl Added {
         self.save();
     }
 
+    /// Notes songs added to a playlist at known times, as when a playlist is brought over
+    /// from somewhere that kept them. `fresh` says the app has just made the playlist, with
+    /// nothing else in it.
+    pub fn record_at(&mut self, playlist: &str, songs: &[(String, i64)], fresh: bool, now: i64) {
+        if fresh {
+            self.lists.remove(playlist);
+            self.seen.insert(playlist.to_string());
+        }
+        let notes = self.lists.entry(playlist.to_string()).or_default();
+        for (id, at) in songs {
+            let note = notes.entry(id.clone()).or_default();
+            note.times.push(if *at > 0 { *at } else { now });
+            note.times.sort_unstable();
+            note.at = now;
+        }
+        self.save();
+    }
+
     /// Notes a playlist the app has just created with these songs in it.
     pub fn create(&mut self, playlist: &str, ids: &[String], now: i64) {
         self.lists.remove(playlist);

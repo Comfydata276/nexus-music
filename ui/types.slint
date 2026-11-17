@@ -2,7 +2,7 @@
 
 export enum Page { home, search, tracklist, artist, grid, settings, lyrics, now-playing }
 
-export enum CardKind { album, artist, playlist, genre }
+export enum CardKind { album, artist, playlist, genre, mix }
 
 export struct Track {
     id: string,
@@ -128,6 +128,8 @@ export global App {
 
     in property <[PlaylistRef]> playlists;
     callback new-playlist();
+    // The + beside "Playlists" was clicked: offer to make one or import some.
+    callback playlist-menu(x: length, y: length);
 
     in property <bool> queue-open;
     // Progress of downloads under way, e.g. "Downloading 3 of 12"; empty when idle.
@@ -444,6 +446,7 @@ export global Settings {
     callback set-close-to-tray(on: bool);
     callback set-check-updates(on: bool);
     callback set-sync(on: bool);
+    callback import-spotify();
     callback check-updates-now();
     callback install-update();
 }

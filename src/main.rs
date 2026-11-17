@@ -8,14 +8,18 @@ mod config;
 mod controller;
 mod covers;
 mod downloads;
+mod import;
 #[cfg(windows)]
 mod frame;
 #[cfg(windows)]
 mod instance;
 #[cfg(windows)]
 mod media;
+mod mixes;
 mod offline;
 mod pages;
+#[cfg(windows)]
+mod picker;
 mod playback;
 mod pool;
 mod search;

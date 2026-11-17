@@ -37,6 +37,8 @@ pub struct Playback {
     /// same song in another list, or a second copy in this one, is a different row.
     pub source: String,
     pub origins: Vec<Option<usize>>,
+    /// The ids of every song in that page's list, as last seen: how changes to it are noticed.
+    pub source_list: Vec<String>,
     pub shuffle: bool,
     pub repeat: u8,
     pub playing: bool,
@@ -77,6 +79,7 @@ impl Playback {
             context: String::new(),
             source: String::new(),
             origins: Vec::new(),
+            source_list: Vec::new(),
             shuffle: settings.shuffle,
             repeat: settings.repeat.min(2),
             playing: false,
@@ -140,6 +143,130 @@ impl Playback {
     }
 }
 
+/// Where songs about to be played came from: the page's route key, each song's position in
+/// that page's list, and the ids of the whole list.
+pub struct PlayFrom {
+    pub key: String,
+    pub rows: Vec<usize>,
+    pub list: Vec<String>,
+}
+
+/// Compares a list of song ids as it was with how it is now. Returns where each old entry
+/// has gone (`None` if it's no longer there), and which of the new entries are arrivals.
+/// A song that's in the list more than once is matched copy for copy.
+fn compare_lists(old: &[String], new: &[String]) -> (Vec<Option<usize>>, Vec<usize>) {
+    let mut places: std::collections::HashMap<&str, std::collections::VecDeque<usize>> = Default::default();
+    for (index, id) in new.iter().enumerate() {
+        places.entry(id.as_str()).or_default().push_back(index);
+    }
+    let moved: Vec<Option<usize>> =
+        old.iter().map(|id| places.get_mut(id.as_str()).and_then(|at| at.pop_front())).collect();
+    let mut arrivals: Vec<usize> = places.into_values().flatten().collect();
+    arrivals.sort_unstable();
+    (moved, arrivals)
+}
+
+/// The queue: its songs, where each sits in the list it came from, the order they play in
+/// (as positions in `songs`), and which of those is playing.
+#[derive(Debug, Clone, PartialEq)]
+struct Lineup {
+    songs: Vec<Song>,
+    origins: Vec<Option<usize>>,
+    order: Vec<usize>,
+    cursor: usize,
+}
+
+/// Works out the queue after the list it came from has changed.
+///
+/// Songs that left the list leave the queue, except the one playing. Songs that joined it
+/// are added: in their place if the queue plays in the list's order, somewhere among what's
+/// still to come if it's shuffled. Songs the list was reordered around take up the new
+/// order. Songs that were never part of the list (added to the queue by hand) keep their
+/// place after whatever they followed.
+///
+/// `moved` and `arrivals` are from `compare_lists`; `view` is the new list in the order its
+/// page shows it; `song_at` gives the song at a position in the new list; `pick(n)` chooses
+/// a number below `n`.
+fn follow_list(
+    lineup: Lineup,
+    shuffled: bool,
+    moved: &[Option<usize>],
+    arrivals: &[usize],
+    view: &[usize],
+    song_at: &dyn Fn(usize) -> Option<Song>,
+    pick: &mut dyn FnMut(usize) -> usize,
+) -> Lineup {
+    let Lineup { songs, origins, order, cursor } = lineup;
+    let Some(&current) = order.get(cursor) else {
+        return Lineup { songs, origins, order, cursor };
+    };
+    // Where each entry now sits in the list, and which entries go.
+    let now: Vec<Option<usize>> =
+        origins.iter().map(|origin| origin.and_then(|at| moved.get(at).copied().flatten())).collect();
+    let gone = |entry: usize| origins[entry].is_some() && now[entry].is_none() && entry != current;
+    // The arrangement to keep for entries that aren't in the list: the playing order, or
+    // when shuffled the order underneath the shuffle.
+    let base: Vec<usize> = if shuffled { (0..songs.len()).collect() } else { order.clone() };
+    let mut followers: std::collections::HashMap<Option<usize>, Vec<usize>> = Default::default();
+    let mut holder: std::collections::HashMap<usize, usize> = Default::default();
+    let mut last = None;
+    for &entry in base.iter().filter(|&&entry| !gone(entry)) {
+        match now[entry] {
+            Some(place) => {
+                holder.insert(place, entry);
+                last = Some(entry);
+            }
+            None => followers.entry(last).or_default().push(entry),
+        }
+    }
+    enum Item {
+        Kept(usize),
+        Arrival(usize),
+    }
+    let mut items: Vec<Item> = followers.remove(&None).unwrap_or_default().into_iter().map(Item::Kept).collect();
+    for &place in view {
+        if let Some(&entry) = holder.get(&place) {
+            items.push(Item::Kept(entry));
+            items.extend(followers.remove(&Some(entry)).unwrap_or_default().into_iter().map(Item::Kept));
+        } else if arrivals.binary_search(&place).is_ok() && song_at(place).is_some() {
+            items.push(Item::Arrival(place));
+        }
+    }
+    // The new set of songs, and where each old entry went in it.
+    let mut new_songs = Vec::with_capacity(items.len());
+    let mut new_origins = Vec::with_capacity(items.len());
+    let mut went: Vec<Option<usize>> = vec![None; songs.len()];
+    let mut added = Vec::new();
+    for item in &items {
+        match *item {
+            Item::Kept(entry) => {
+                went[entry] = Some(new_songs.len());
+                new_songs.push(songs[entry].clone());
+                new_origins.push(now[entry]);
+            }
+            Item::Arrival(place) => {
+                added.push(new_songs.len());
+                new_songs.extend(song_at(place));
+                new_origins.push(Some(place));
+            }
+        }
+    }
+    let playing = went[current].unwrap_or(0);
+    let (new_order, new_cursor) = if shuffled {
+        let mut new_order: Vec<usize> = order.iter().filter_map(|&entry| went[entry]).collect();
+        let at = new_order.iter().position(|&entry| entry == playing).unwrap_or(0);
+        for entry in added {
+            // Somewhere after the song that's playing.
+            let slot = at + 1 + pick(new_order.len() - at);
+            new_order.insert(slot.min(new_order.len()), entry);
+        }
+        (new_order, at)
+    } else {
+        ((0..new_songs.len()).collect(), playing)
+    };
+    Lineup { songs: new_songs, origins: new_origins, order: new_order, cursor: new_cursor }
+}
+
 /// A fingerprint of the queue and the place in it, to tell a change from a save of the
 /// same thing.
 pub fn queue_fingerprint(pb: &Playback) -> u64 {
@@ -169,13 +296,13 @@ impl Controller {
     /// song was asked for, so a shuffled list may open with any of them.
     pub fn play_songs(self: &Rc<Self>, songs: Vec<Song>, start: usize, context: &str, any_start: bool) {
         // Where these songs came from, if the caller said (see `play_from`).
-        let (source, origins) = match self.play_from.take() {
-            Some((source, origins)) if origins.len() == songs.len() => {
-                (source, origins.into_iter().map(Some).collect::<Vec<_>>())
+        let (source, origins, source_list) = match self.play_from.take() {
+            Some(from) if from.rows.len() == songs.len() => {
+                (from.key, from.rows.into_iter().map(Some).collect::<Vec<_>>(), from.list)
             }
             // The list is known, but not which of its rows each song is.
-            Some((source, _)) => (source, vec![None; songs.len()]),
-            None => (String::new(), vec![None; songs.len()]),
+            Some(from) => (from.key, vec![None; songs.len()], Vec::new()),
+            None => (String::new(), vec![None; songs.len()], Vec::new()),
         };
         // Offline, only what's downloaded can play: skip the rest.
         let (songs, origins, start) = if self.is_offline() {
@@ -216,6 +343,7 @@ impl Controller {
             pb.queue = songs;
             pb.origins = origins;
             pb.source = source;
+            pb.source_list = source_list;
             pb.context = context.to_string();
             if pb.shuffle {
                 pb.shuffle_order();
@@ -485,6 +613,7 @@ impl Controller {
             pb.queue.clear();
             pb.origins.clear();
             pb.source.clear();
+            pb.source_list.clear();
             pb.order.clear();
             pb.cursor = 0;
             pb.playing = false;
@@ -589,6 +718,8 @@ impl Controller {
                 pb.order = (0..songs.len()).collect();
                 pb.origins = vec![None; songs.len()];
                 pb.source.clear();
+                pb.source_list.clear();
+            pb.source_list.clear();
                 pb.queue = songs;
                 pb.cursor = 0;
                 pb.context.clear();
@@ -1266,6 +1397,8 @@ impl Controller {
     }
 
     pub fn sync_history(self: &Rc<Self>) {
+        // The mixes on Home are built from this too.
+        crate::mixes::set_plays(self.history.borrow().iter().map(|played| (played.song.id.clone(), played.at)).collect());
         let rows: Vec<ui::Track> = self
             .history
             .borrow()
@@ -1311,6 +1444,7 @@ impl Controller {
             source: pb.source.clone(),
             origins: pb.origins.clone(),
             stamp: self.queue_stamp.get(),
+            source_list: pb.source_list.clone(),
         }
         .save(&self.paths.queue);
     }
@@ -1326,6 +1460,7 @@ impl Controller {
             pb.origins = saved.origins;
             pb.origins.resize(saved.songs.len(), None);
             pb.source = saved.source;
+            pb.source_list = saved.source_list;
             pb.queue = saved.songs;
             pb.order = saved.order;
             pb.cursor = saved.cursor;
@@ -1363,6 +1498,7 @@ impl Controller {
             let mut pb = self.playback.borrow_mut();
             pb.origins = vec![None; songs.len()];
             pb.source.clear();
+            pb.source_list.clear();
             pb.order = (0..songs.len()).collect();
             pb.cursor = cursor.min(songs.len() - 1);
             pb.queue = songs;
@@ -1527,6 +1663,10 @@ impl Controller {
     /// `index` is the row that was chosen, in the order the page is showing.
     pub fn play_page_track(self: &Rc<Self>, index: usize) {
         let songs = self.visible_songs();
+        // A row that only names a song (one an import couldn't find) has nothing to play.
+        if songs.get(index).is_some_and(|song| song.id.is_empty() && song.radio_url.is_empty()) {
+            return;
+        }
         let context = self.page.borrow().context.clone();
         self.playing_from_page();
         if index < songs.len() {
@@ -1540,7 +1680,8 @@ impl Controller {
     fn playing_from_page(&self) {
         let key = self.current_route().map(|route| route.cache_key()).unwrap_or_default();
         let rows = (0..self.tracks_model.row_count()).filter_map(|row| self.song_index(row)).collect();
-        self.play_from.replace(Some((key, rows)));
+        let list = self.page.borrow().songs.iter().map(|song| song.id.clone()).collect();
+        self.play_from.replace(Some(PlayFrom { key, rows, list }));
     }
 
     /// Marks the row that's playing, if the page on screen is where it was played from.
@@ -1560,15 +1701,42 @@ impl Controller {
         }
     }
 
-    /// Keeps the queue's record of where its songs sit in a page in step with a change to
-    /// that page's list. `moved` says where each old position went (`None` if removed).
-    pub fn page_list_changed(&self, key: &str, moved: impl Fn(usize) -> Option<usize>) {
-        let mut pb = self.playback.borrow_mut();
-        if pb.source == key {
-            for origin in pb.origins.iter_mut() {
-                *origin = origin.and_then(&moved);
+    /// Tells the queue how the list `key` stands now. If that's the list the queue was
+    /// started from and it has changed (songs added, removed or moved, here or on another
+    /// device), the queue follows: see `follow_list`.
+    pub fn source_list_now(self: &Rc<Self>, key: &str, songs: &[Song]) {
+        let ids: Vec<String> = songs.iter().map(|song| song.id.clone()).collect();
+        {
+            let pb = self.playback.borrow();
+            // (A queue from before lists were kept has nothing to compare with.)
+            if key.is_empty() || pb.source != key || pb.queue.is_empty() || pb.source_list.is_empty() || pb.source_list == ids {
+                return;
             }
         }
+        let view = self.order_for(key, songs);
+        {
+            let mut pb = self.playback.borrow_mut();
+            let (moved, arrivals) = compare_lists(&pb.source_list, &ids);
+            let lineup = Lineup {
+                songs: std::mem::take(&mut pb.queue),
+                origins: std::mem::take(&mut pb.origins),
+                order: std::mem::take(&mut pb.order),
+                cursor: pb.cursor,
+            };
+            let offline = self.is_offline();
+            let downloads = self.downloads.borrow();
+            // Offline, a song that isn't downloaded can't join the queue.
+            let song_at = |place: usize| songs.get(place).filter(|song| !offline || downloads.has(&song.id)).cloned();
+            let lineup = follow_list(lineup, pb.shuffle, &moved, &arrivals, &view, &song_at, &mut |n| fastrand::usize(..n.max(1)));
+            pb.queue = lineup.songs;
+            pb.origins = lineup.origins;
+            pb.order = lineup.order;
+            pb.cursor = lineup.cursor;
+            pb.source_list = ids;
+        }
+        // What plays next may have changed; this also redraws and saves the queue.
+        self.next_changed();
+        self.sync_playing();
     }
 
     /// Plays `songs` beginning with the one at `index`; with shuffle on, that song goes first.
@@ -1603,7 +1771,7 @@ impl Controller {
                     move |ctl, result| match result {
                         Ok(all) => {
                             // Played from this page, though its rows aren't these songs.
-                            ctl.play_from.replace(Some((key, Vec::new())));
+                            ctl.play_from.replace(Some(PlayFrom { key, rows: Vec::new(), list: Vec::new() }));
                             ctl.play_songs(all, 0, &context, true)
                         }
                         Err(e) => ctl.toast(e.to_string()),
@@ -1659,6 +1827,102 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    fn named(id: &str) -> Song {
+        Song { id: id.to_string(), ..Default::default() }
+    }
+
+    /// A queue of these songs, each from the same place in its list, playing the one at `cursor`.
+    fn lineup(ids: &[&str], cursor: usize) -> Lineup {
+        Lineup {
+            songs: ids.iter().map(|id| named(id)).collect(),
+            origins: (0..ids.len()).map(Some).collect(),
+            order: (0..ids.len()).collect(),
+            cursor,
+        }
+    }
+
+    fn ids(list: &[&str]) -> Vec<String> {
+        list.iter().map(|id| id.to_string()).collect()
+    }
+
+    /// The queue in playing order, with the song that's playing in brackets.
+    fn playing_order(lineup: &Lineup) -> String {
+        lineup
+            .order
+            .iter()
+            .enumerate()
+            .map(|(at, &entry)| {
+                let id = &lineup.songs[entry].id;
+                if at == lineup.cursor { format!("[{id}]") } else { id.clone() }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn follow(lineup: Lineup, shuffled: bool, old: &[&str], new: &[&str], view: Option<&[usize]>) -> Lineup {
+        let (moved, arrivals) = compare_lists(&ids(old), &ids(new));
+        let in_order: Vec<usize> = (0..new.len()).collect();
+        let song_at = |place: usize| new.get(place).map(|id| named(id));
+        // "Random" here means as late as possible, to keep the tests the same every run.
+        follow_list(lineup, shuffled, &moved, &arrivals, view.unwrap_or(&in_order), &song_at, &mut |n| n - 1)
+    }
+
+    #[test]
+    fn compares_lists_copy_for_copy() {
+        let (moved, arrivals) = compare_lists(&ids(&["a", "b", "a", "c"]), &ids(&["b", "a", "d", "a", "a"]));
+        assert_eq!(moved, [Some(1), Some(0), Some(3), None]);
+        assert_eq!(arrivals, [2, 4]);
+    }
+
+    #[test]
+    fn the_queue_follows_its_list() {
+        let list = ["a", "b", "c", "d"];
+        // Songs added to the list join the queue in their place; removed ones leave it.
+        let after = follow(lineup(&list, 1), false, &list, &["a", "b", "x", "c", "y"], None);
+        assert_eq!(playing_order(&after), "a [b] x c y");
+        assert_eq!(after.origins, [Some(0), Some(1), Some(2), Some(3), Some(4)]);
+        // The song that's playing stays even if it was removed, and what followed it still does.
+        let after = follow(lineup(&list, 1), false, &list, &["a", "c", "d"], None);
+        assert_eq!(playing_order(&after), "a [b] c d");
+        assert_eq!(after.origins, [Some(0), None, Some(1), Some(2)]);
+        // A reordered list is played in its new order from the current song on.
+        let after = follow(lineup(&list, 1), false, &list, &["d", "b", "a", "c"], None);
+        assert_eq!(playing_order(&after), "d [b] a c");
+        // The page may show the list in another order (newest first, say): that's the order.
+        // (The queue was started from that view, so its entries came from places 2, 1, 0.)
+        let mut queue = lineup(&["c", "b", "a"], 0);
+        queue.origins = vec![Some(2), Some(1), Some(0)];
+        let after = follow(queue, false, &["a", "b", "c"], &["a", "b", "c", "x"], Some(&[3, 2, 1, 0]));
+        assert_eq!(playing_order(&after), "x [c] b a");
+    }
+
+    #[test]
+    fn songs_queued_by_hand_keep_their_place() {
+        // "q" was added to play after "b"; it isn't part of the list.
+        let mut queue = lineup(&["a", "b", "q", "c"], 1);
+        queue.origins = vec![Some(0), Some(1), None, Some(2)];
+        let after = follow(queue, false, &["a", "b", "c"], &["a", "b", "x", "c"], None);
+        assert_eq!(playing_order(&after), "a [b] q x c");
+        // A queue played from part of a list (a filtered view) doesn't gain the rest of it.
+        let mut queue = lineup(&["b", "d"], 0);
+        queue.origins = vec![Some(1), Some(3)];
+        let after = follow(queue, false, &["a", "b", "c", "d"], &["a", "b", "c", "d", "e"], None);
+        assert_eq!(playing_order(&after), "[b] d e");
+    }
+
+    #[test]
+    fn a_shuffled_queue_takes_arrivals_among_what_is_to_come() {
+        let list = ["a", "b", "c", "d"];
+        let mut queue = lineup(&list, 1);
+        queue.order = vec![2, 0, 3, 1];
+        // Playing "a"; "c" has been played, "d" and "b" are to come. "b" is removed, "x" added.
+        let after = follow(queue, true, &list, &["a", "x", "c", "d"], None);
+        assert_eq!(playing_order(&after), "c [a] d x");
+        // Underneath the shuffle the songs are in the list's order, for when shuffle is turned off.
+        let titles: Vec<&str> = after.songs.iter().map(|song| song.id.as_str()).collect();
+        assert_eq!(titles, ["a", "x", "c", "d"]);
     }
 
     #[test]

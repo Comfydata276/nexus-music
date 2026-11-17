@@ -81,6 +81,9 @@ pub struct Song {
     pub starred: Option<String>,
     /// When the song was added to the library.
     pub created: String,
+    /// How many times it's been played, and when last.
+    pub play_count: u32,
+    pub played: String,
     /// The user's star rating, 1 to 5; 0 when unrated.
     pub user_rating: u8,
     pub replay_gain: Option<ReplayGain>,
@@ -108,6 +111,8 @@ pub struct Album {
     pub year: u32,
     pub genre: String,
     pub starred: Option<String>,
+    /// When it was last played.
+    pub played: String,
     pub release_types: Vec<String>,
     #[serde(rename = "song")]
     pub songs: Vec<Song>,

@@ -1831,6 +1831,15 @@ export component SettingsPage inherits Rectangle {
                         }
 
                         SettingRow {
+                            title: "Import playlists from Spotify";
+                            detail: "Export your playlists from Spotify first: one CSV file each from a tool such as Exportify, or Playlist1.json from the data Spotify sends when you ask for it. Songs are matched to your library by title and artist, and the ones that aren't found are listed. Importing again later adds songs you've since added to your library.";
+                            TextButton {
+                                text: "Choose files";
+                                clicked => { Settings.import-spotify(); }
+                            }
+                        }
+
+                        SettingRow {
                             title: "Keep my devices in step";
                             detail: "Your queue, Recently played, pinned playlists, each list's shuffle and sort, the dates songs were added, and the theme follow you to Nexus Music on other devices signed in to this account. Kept on your server, in a playlist named “Nexus Music sync” that other apps will show; leave it be.";
                             Toggle {

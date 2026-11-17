@@ -19,6 +19,8 @@ const PAGE: u32 = 500;
 /// A scan that didn't change the number of songs may still have changed tags, but isn't
 /// worth fetching everything again for more often than this (seconds).
 const RESCAN_AFTER: i64 = 15 * 60;
+/// The copy is fetched afresh this often regardless (seconds), to keep play counts current.
+const REFRESH_AFTER: i64 = 24 * 3600;
 
 /// The library as fetched from the server.
 #[derive(Default, Serialize, Deserialize)]
@@ -40,7 +42,10 @@ impl Library {
             // Wait for it to finish; half a library is no use.
             return false;
         }
-        status.count != self.count || (status.last_scan != self.last_scan && now - self.fetched > RESCAN_AFTER)
+        status.count != self.count
+            || (status.last_scan != self.last_scan && now - self.fetched > RESCAN_AFTER)
+            // How often songs have been played moves on without any scan.
+            || now - self.fetched > REFRESH_AFTER
     }
 
     pub fn fetch(client: &Client) -> ApiResult<Library> {
@@ -147,7 +152,7 @@ pub fn fold(text: &str) -> String {
 
 /// How many single-letter slips (a letter wrong, missing, extra, or two swapped) separate
 /// two words; anything over `limit` comes back as `limit + 1`.
-fn slips(a: &[char], b: &[char], limit: usize) -> usize {
+pub fn slips(a: &[char], b: &[char], limit: usize) -> usize {
     if a.len().abs_diff(b.len()) > limit {
         return limit + 1;
     }

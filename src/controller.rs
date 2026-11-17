@@ -57,6 +57,10 @@ pub enum Route {
     Lyrics,
     /// The screen about the song that's playing.
     NowPlaying,
+    /// How the last import of playlists went.
+    Import,
+    /// One of the "Made for you" mixes, by its id.
+    Mix(String),
 }
 
 impl Route {
@@ -78,6 +82,8 @@ impl Route {
             "settings" => Route::Settings,
             "lyrics" => Route::Lyrics,
             "now-playing" => Route::NowPlaying,
+            "import" => Route::Import,
+            "mix" => Route::Mix(rest.to_string()),
             _ => return None,
         })
     }
@@ -100,6 +106,8 @@ impl Route {
             Route::Settings => "settings".into(),
             Route::Lyrics => "lyrics".into(),
             Route::NowPlaying => "now-playing".into(),
+            Route::Import => "import".into(),
+            Route::Mix(id) => format!("mix:{id}"),
         }
     }
 
@@ -115,8 +123,8 @@ impl Route {
     fn page(&self) -> ui::Page {
         match self {
             Route::Home => ui::Page::Home,
-            Route::Search(_) => ui::Page::Search,
-            Route::Album(_) | Route::Playlist(_) | Route::Liked | Route::Downloads | Route::Radio => {
+            Route::Search(_) | Route::Import => ui::Page::Search,
+            Route::Album(_) | Route::Playlist(_) | Route::Liked | Route::Downloads | Route::Radio | Route::Mix(_) => {
                 ui::Page::Tracklist
             }
             Route::Artist(_) => ui::Page::Artist,
@@ -249,7 +257,7 @@ pub struct Controller {
     pub added: RefCell<crate::added::Added>,
     /// Set just before `play_songs` by callers that know where the songs came from: the
     /// page's route key, and each song's position in that page's list.
-    pub play_from: RefCell<Option<(String, Vec<usize>)>>,
+    pub play_from: RefCell<Option<crate::playback::PlayFrom>>,
     /// Rows of the song list that are selected, and the row a Shift-click extends from.
     pub selection: RefCell<std::collections::BTreeSet<usize>>,
     selection_anchor: Cell<Option<usize>>,
@@ -291,6 +299,8 @@ pub struct Controller {
     /// the playlist that holds the shared data.
     /// Search: what's on offer under the search box, a count that tells a late answer from
     /// the current one, and the timer and flag for keeping the library copy up to date.
+    /// How the last import of playlists went, as a page to show.
+    import_report: RefCell<Option<PageData>>,
     suggestions: RefCell<Vec<Suggestion>>,
     preview_count: Cell<u64>,
     library_timer: slint::Timer,
@@ -369,6 +379,7 @@ impl Controller {
             pending: RefCell::new(crate::offline::load_pending(&paths.pending)),
             unreachable: Cell::new(false),
             reconnect_timer: slint::Timer::default(),
+            import_report: RefCell::new(None),
             suggestions: RefCell::default(),
             preview_count: Cell::new(0),
             library_timer: slint::Timer::default(),
@@ -788,6 +799,119 @@ impl Controller {
         });
     }
 
+    // ---- bringing playlists over from Spotify ---------------------------------------------------
+
+    /// Asks which exported playlists to bring in, then brings them in.
+    pub fn start_import(self: &Rc<Self>) {
+        if self.is_offline() {
+            return self.toast("Importing needs your server, which can't be reached right now.");
+        }
+        if crate::search::current().is_none() {
+            return self.toast("Still fetching your library. Try again in a moment.");
+        }
+        #[cfg(windows)]
+        if let Some(paths) = crate::picker::pick_exports(&self.ui) {
+            if !paths.is_empty() {
+                self.run_import(paths);
+            }
+            return;
+        }
+        // Without the system's file window: ask for the place by name.
+        self.prompt_import_path();
+    }
+
+    pub fn run_import(self: &Rc<Self>, paths: Vec<std::path::PathBuf>) {
+        let (Some(client), Some(index)) = (self.client(), crate::search::current()) else { return };
+        self.toast("Importing your playlists…");
+        self.api_pool.spawn(move || {
+            let result = crate::import::run(&client, &index, &paths);
+            // The songs that weren't found, as a file beside the ones that were chosen.
+            let mut saved = None;
+            if let Ok(reports) = &result {
+                if reports.iter().any(|report| !report.missing.is_empty()) {
+                    let folder = paths.first().map(|p| if p.is_dir() { p.clone() } else { p.parent().map(|d| d.to_path_buf()).unwrap_or_default() });
+                    if let Some(file) = folder.map(|folder| folder.join("Nexus Music - not found.txt")) {
+                        if std::fs::write(&file, crate::import::missing_text(reports)).is_ok() {
+                            saved = Some(file);
+                        }
+                    }
+                }
+            }
+            post(move |ctl| ctl.import_finished(result, saved));
+        });
+    }
+
+    fn import_finished(self: &Rc<Self>, result: Result<Vec<crate::import::ListReport>, String>, saved: Option<std::path::PathBuf>) {
+        let reports = match result {
+            Ok(reports) => reports,
+            Err(reason) => return self.toast(reason),
+        };
+        // When each song was added on Spotify becomes its "Date added" here.
+        let now = chrono::Utc::now().timestamp();
+        for report in reports.iter().filter(|report| !report.dated.is_empty()) {
+            self.added.borrow_mut().record_at(&report.playlist, &report.dated, !report.existed, now);
+        }
+        self.share_soon();
+        self.invalidate("playlist:");
+        self.reload_playlists();
+
+        let (total, found): (usize, usize) =
+            reports.iter().fold((0, 0), |(total, found), report| (total + report.total, found + report.found));
+        let cards: Vec<CardData> = reports
+            .iter()
+            .map(|report| CardData {
+                kind: Kind::Playlist,
+                id: report.playlist.clone(),
+                title: report.name.clone(),
+                subtitle: match (report.found, report.existed) {
+                    (0, _) => format!("None of its {} found", count(report.total as u32, "song")),
+                    (_, true) => format!("{} of {} found, {} added", report.found, report.total, report.added),
+                    (_, false) => format!("{} of {} found", report.found, count(report.total as u32, "song")),
+                },
+                cover: String::new(),
+            })
+            .collect();
+        // The songs that weren't found, shown as rows (they can't be played: there's no file).
+        let missing: Vec<Song> = reports
+            .iter()
+            .flat_map(|report| report.missing.iter())
+            .map(|wanted| Song {
+                title: wanted.title.clone(),
+                artist: wanted.artists.join(", "),
+                album: wanted.album.clone(),
+                duration: wanted.seconds,
+                ..Default::default()
+            })
+            .collect();
+        let page = PageData {
+            title: "Imported from Spotify".into(),
+            lead: vec![pages::ShelfData {
+                title: format!("{} of {} found in your library", found, count(total as u32, "song")),
+                route: String::new(),
+                wrap: true,
+                cards,
+            }],
+            tracks_title: match &saved {
+                Some(file) => format!(
+                    "Not in your library ({}). Also saved as “{}” beside your export.",
+                    missing.len(),
+                    file.file_name().map(|name| name.to_string_lossy().to_string()).unwrap_or_default()
+                ),
+                None => format!("Not in your library ({})", missing.len()),
+            },
+            empty: if missing.is_empty() { "Every song was found.".into() } else { String::new() },
+            songs: missing,
+            show_album: true,
+            ..Default::default()
+        };
+        *self.import_report.borrow_mut() = Some(page);
+        if self.current_route() == Some(Route::Import) {
+            self.show(Route::Import, 0.0, true, None);
+        } else {
+            self.navigate(Route::Import);
+        }
+    }
+
     // ---- search --------------------------------------------------------------------------------
 
     /// Readies the app's own copy of the library, which search runs on: from disk at first,
@@ -1143,6 +1267,15 @@ impl Controller {
                 self.show_downloads(scroll);
                 return;
             }
+            Route::Import => {
+                let page = self.import_report.borrow().clone().unwrap_or_else(|| PageData {
+                    title: "Import from Spotify".into(),
+                    empty: "Nothing has been imported yet. Use the + beside Playlists in the sidebar.".into(),
+                    ..Default::default()
+                });
+                self.apply_page(page, scroll);
+                return;
+            }
             _ => {}
         }
 
@@ -1205,6 +1338,7 @@ impl Controller {
                 post(move |ctl| {
                     ctl.remember(&key, Instant::now(), page.clone());
                     ctl.observe_playlist(&page);
+                    ctl.source_list_now(&key, &page.songs);
                     if ctl.nav.borrow().generation == generation {
                         ctl.apply_page(page, scroll);
                     }
@@ -1215,6 +1349,7 @@ impl Controller {
             post(move |ctl| {
                 ctl.remember(&key, Instant::now(), whole.clone());
                 ctl.observe_playlist(&whole);
+                ctl.source_list_now(&key, &whole.songs);
                 if ctl.nav.borrow().generation == generation {
                     ctl.apply_if_changed(whole);
                 }
@@ -1420,7 +1555,7 @@ impl Controller {
     /// Rows were dragged onto a playlist in the sidebar or onto the queue panel.
     fn rows_dropped(self: &Rc<Self>, row: usize, target: &str) {
         let songs: Vec<Song> = self.songs_on(&self.rows_for(row)).into_iter().map(|(_, song)| song).collect();
-        let songs: Vec<Song> = songs.into_iter().filter(|s| s.radio_url.is_empty()).collect();
+        let songs: Vec<Song> = songs.into_iter().filter(|s| s.radio_url.is_empty() && !s.id.is_empty()).collect();
         if songs.is_empty() {
             return;
         }
@@ -1516,6 +1651,22 @@ impl Controller {
         }
         let sort = prefs.sort.min(TRACK_SORTS.len() - 1);
         (sort, sort != 0 && prefs.descending)
+    }
+
+    /// The order the page for the list `key` shows these songs in, as positions in `songs`.
+    pub fn order_for(&self, key: &str, songs: &[Song]) -> Vec<usize> {
+        if let Some(id) = key.strip_prefix("playlist:") {
+            return self.playlist_order(id, songs);
+        }
+        let (sort, descending) = self.list_sort(key);
+        let added: Vec<i64> = if key == "liked" {
+            songs.iter().map(|song| song.starred.as_deref().map(crate::added::parse_time).unwrap_or(0)).collect()
+        } else {
+            Vec::new()
+        };
+        let mut view = TrackView { sort, descending, ..Default::default() };
+        view.arrange(songs, &added);
+        view.map
     }
 
     /// The order a playlist's page shows these songs in, as positions in `songs`. Playing
@@ -1643,18 +1794,9 @@ impl Controller {
             page.songs.insert(to, song);
             (id, page.songs.iter().map(|s| s.id.clone()).collect::<Vec<_>>())
         };
-        // If the queue is playing from this playlist, its rows have moved too.
-        self.page_list_changed(&format!("playlist:{id}"), |at| {
-            Some(if at == from {
-                to
-            } else if from < to && at > from && at <= to {
-                at - 1
-            } else if to < from && at >= to && at < from {
-                at + 1
-            } else {
-                at
-            })
-        });
+        // If the queue is playing from this playlist, it follows the new order.
+        let songs = self.page.borrow().songs.clone();
+        self.source_list_now(&format!("playlist:{id}"), &songs);
         self.rebuild_tracks();
         if let Some(route) = self.current_route() {
             let data = self.page.borrow().clone();
@@ -1799,8 +1941,34 @@ impl Controller {
                 *ctl.playlists.borrow_mut() = playlists;
                 ctl.show_playlists();
                 ctl.reload_changed_playlist();
+                ctl.follow_playing_playlist();
             },
         );
+    }
+
+    /// If the playlist the queue is playing from has gained or lost songs (added from another
+    /// page, or on another device), fetches it so the queue can follow.
+    fn follow_playing_playlist(self: &Rc<Self>) {
+        let (key, known) = {
+            let pb = self.playback.borrow();
+            (pb.source.clone(), pb.source_list.len())
+        };
+        let Some(id) = key.strip_prefix("playlist:").map(str::to_string) else { return };
+        // The page on screen looks after itself (see `reload_changed_playlist`).
+        if known == 0 || self.current_route() == Some(Route::Playlist(id.clone())) {
+            return;
+        }
+        let listed = self.playlists.borrow().iter().find(|p| p.id == id).map(|p| p.song_count as usize);
+        if listed.is_some_and(|count| count != known) {
+            self.request(
+                move |client| client.playlist(&id),
+                move |ctl, result| {
+                    if let Ok(playlist) = result {
+                        ctl.source_list_now(&key, &playlist.songs);
+                    }
+                },
+            );
+        }
     }
 
     /// If the playlist on screen no longer has as many songs as the server says (they were
@@ -2038,6 +2206,9 @@ impl Controller {
         app.on_new_playlist(|| {
             with(|ctl| ctl.prompt_new_playlist(Vec::new()));
         });
+        app.on_playlist_menu(|x, y| {
+            with(|ctl| ctl.open_playlist_menu(x, y));
+        });
 
         let view = self.ui.global::<ui::View>();
         view.on_play(|| {
@@ -2246,6 +2417,9 @@ impl Controller {
                 ctl.sync_tray();
             });
         });
+        settings.on_import_spotify(|| {
+            with(|ctl| ctl.start_import());
+        });
         settings.on_set_sync(|on| {
             with(|ctl| {
                 ctl.change_setting(true, |s| s.sync = on);
@@ -2319,6 +2493,7 @@ fn card_route(card: &ui::Card) -> Option<Route> {
         ui::CardKind::Artist => Route::Artist(id),
         ui::CardKind::Playlist => Route::Playlist(id),
         ui::CardKind::Genre => Route::Genre(id),
+        ui::CardKind::Mix => Route::Mix(id),
     })
 }
 

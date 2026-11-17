@@ -20,6 +20,8 @@ by the app itself.
   Drag rows to reorder the queue, or the songs in a playlist.
 - Find and sort within a playlist or Liked songs: click a column heading to sort by it, including the date each song was added.
 - Shuffle is set per playlist or album and remembered.
+- Brings playlists over from Spotify: choose the files you exported (CSV from a tool such as Exportify, or Spotify's own data download) and it matches each song to your library, builds the playlists, and lists what it couldn't find.
+- A "Made for you" row on Home, built from your listening: On repeat, Your top songs, Rediscover and mixes of the genres you play most.
 - Keeps your devices in step: the queue and your place in it, Recently played, pinned playlists, each list's shuffle and sort, the dates songs were added and the theme follow you to the app on another PC. The queue uses the server's saved-queue feature; the rest is kept in the comment of a playlist named "Nexus Music sync".
 - Select several songs with Ctrl or Shift, then drag them onto a playlist or the queue, or
   right-click to act on them all.

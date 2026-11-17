@@ -31,6 +31,8 @@ pub enum Kind {
     Artist,
     Playlist,
     Genre,
+    /// A list of songs the app puts together from what's been played.
+    Mix,
 }
 
 impl Kind {
@@ -40,6 +42,7 @@ impl Kind {
             ui::CardKind::Artist => Kind::Artist,
             ui::CardKind::Playlist => Kind::Playlist,
             ui::CardKind::Genre => Kind::Genre,
+            ui::CardKind::Mix => Kind::Mix,
         }
     }
 
@@ -49,6 +52,7 @@ impl Kind {
             Kind::Artist => ui::CardKind::Artist,
             Kind::Playlist => ui::CardKind::Playlist,
             Kind::Genre => ui::CardKind::Genre,
+            Kind::Mix => ui::CardKind::Mix,
         }
     }
 }
@@ -176,7 +180,7 @@ pub fn hint(kind: Kind, title: &str, subtitle: &str, cover: &str) -> Option<Page
         Kind::Album => ("Album", false),
         Kind::Artist => ("Artist", true),
         Kind::Playlist => ("Playlist", false),
-        Kind::Genre => return None,
+        Kind::Genre | Kind::Mix => return None,
     };
     Some(PageData {
         label: label.into(),
@@ -201,11 +205,14 @@ pub fn load(client: &Client, route: &Route) -> ApiResult<PageData> {
         Route::Playlist(id) => playlist(client, id),
         Route::Liked => liked(client),
         Route::Radio => radio(client),
+        Route::Mix(id) => Ok(mix(id)),
         Route::Albums(sort) => albums(client, *sort),
         Route::Artists => artists(client),
         Route::Genres => genres(client),
         Route::Genre(name) => genre(client, name),
-        Route::Settings | Route::Lyrics | Route::NowPlaying | Route::Downloads => Ok(PageData::default()),
+        Route::Settings | Route::Lyrics | Route::NowPlaying | Route::Downloads | Route::Import => {
+            Ok(PageData::default())
+        }
     }
 }
 
@@ -236,15 +243,52 @@ fn shelf(title: &str, route: &str, albums: &[Album]) -> Option<ShelfData> {
     })
 }
 
+/// The page for one of the "Made for you" mixes.
+fn mix(id: &str) -> PageData {
+    let made = crate::search::current().and_then(|index| crate::mixes::one(&index, id));
+    let Some(mut made) = made else {
+        return PageData {
+            label: "Made for you".into(),
+            title: "Mix".into(),
+            show_number: true,
+            empty: "There isn't enough listening to make this mix from yet.".into(),
+            ..Default::default()
+        };
+    };
+    for song in &mut made.songs {
+        // Whether it's liked may have changed since the copy of the library was made.
+        song.starred = crate::search::is_liked(song).then(|| song.starred.clone().unwrap_or_default());
+    }
+    PageData {
+        label: "Made for you".into(),
+        title: made.title.clone(),
+        subtitle: made.about,
+        meta: format!(
+            "{}, {}",
+            count(made.songs.len() as u32, "song"),
+            length(made.songs.iter().map(|s| s.duration).sum())
+        ),
+        cover: made.songs.first().map(|song| song.cover_art.clone()).unwrap_or_default(),
+        can_play: true,
+        show_album: true,
+        show_cover: true,
+        show_number: true,
+        context: made.title,
+        songs: made.songs,
+        ..Default::default()
+    }
+}
+
 fn home(client: &Client) -> ApiResult<PageData> {
     // Four independent lists: ask for them all at once.
     let (recent, newest, frequent, random) = std::thread::scope(|scope| {
-        let list = |kind: AlbumList| scope.spawn(move || client.album_list(&kind, 12, 0));
+        let list = |kind: AlbumList, size: u32| scope.spawn(move || client.album_list(&kind, size, 0));
         let (a, b, c, d) = (
-            list(AlbumList::Recent),
-            list(AlbumList::Newest),
-            list(AlbumList::Frequent),
-            list(AlbumList::Random),
+            list(AlbumList::Recent, 12),
+            list(AlbumList::Newest, 12),
+            // More of these than are shown, to find old favourites among.
+            list(AlbumList::Frequent, 60),
+            list(AlbumList::Random, 12),
         );
         let join = |h: std::thread::ScopedJoinHandle<ApiResult<Vec<Album>>>| {
             h.join().unwrap_or_else(|_| Ok(Vec::new()))
@@ -263,10 +307,38 @@ fn home(client: &Client) -> ApiResult<PageData> {
             tiles.push(CardData::album(album));
         }
     }
+    // Lists put together from what's been played.
+    let mixes: Vec<CardData> = crate::search::current()
+        .map(|index| crate::mixes::all(&index))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|mix| CardData {
+            kind: Kind::Mix,
+            id: mix.id,
+            title: mix.title,
+            subtitle: mix.about,
+            cover: mix.songs.iter().map(|song| song.cover_art.clone()).find(|cover| !cover.is_empty()).unwrap_or_default(),
+        })
+        .collect();
+    let made = (!mixes.is_empty()).then(|| ShelfData { title: "Made for you".into(), route: String::new(), wrap: false, cards: mixes });
+    // Albums played a lot, but not for a while.
+    let now = chrono::Utc::now().timestamp();
+    let neglected: Vec<Album> = frequent
+        .iter()
+        .filter(|album| {
+            let last = crate::added::parse_time(&album.played);
+            last > 0 && now - last > 45 * 24 * 3600
+        })
+        .take(12)
+        .cloned()
+        .collect();
+    let frequent = &frequent[..frequent.len().min(12)];
     let shelves: Vec<ShelfData> = [
+        made,
         shelf("Recently added", "albums:0", &newest),
         shelf("Recently played", "albums:3", &recent),
-        shelf("Most played", "albums:4", &frequent),
+        shelf("Most played", "albums:4", frequent),
+        (neglected.len() >= 4).then(|| shelf("It's been a while", "", &neglected)).flatten(),
         shelf("Something different", "", &random),
     ]
     .into_iter()
