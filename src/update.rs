@@ -127,29 +127,79 @@ pub fn download(installer: &Installer, mut progress: impl FnMut(f32)) -> Result<
     if !trusted(&installer.url) {
         return Err("The download address isn't on the project's release page.".into());
     }
-    let agent = crate::subsonic::make_agent();
-    let response = agent
-        .get(&installer.url)
-        .header("User-Agent", user_agent())
-        .call()
-        .map_err(|e| e.to_string())?;
-    if !response.status().is_success() {
-        return Err(format!("The download failed with status {}.", response.status().as_u16()));
-    }
     let name: String =
         installer.name.chars().filter(|c| c.is_ascii_alphanumeric() || "-_.".contains(*c)).collect();
     let path = std::env::temp_dir().join(if name.is_empty() { "NexusMusic-Setup.exe".into() } else { name });
-    let mut file = File::create(&path).map_err(|e| e.to_string())?;
+    let fetched = fetch(installer, &path, &mut progress);
+    // If the app's own connection to GitHub fails, let Windows fetch the file instead. Either
+    // way the result is only trusted once it matches the published checksum.
+    #[cfg(windows)]
+    let fetched = fetched.or_else(|reason| {
+        if std::env::var_os("NEXUS_TRACE").is_some() {
+            eprintln!("[trace] update download: trying Windows' downloader after: {reason}");
+        }
+        fetch_with_windows(&installer.url, &path).map_err(|second| format!("{reason} {second}"))
+    });
+    let verified = fetched.and_then(|()| verify(installer, &path));
+    if verified.is_err() {
+        let _ = std::fs::remove_file(&path);
+    }
+    verified.map(|()| path)
+}
+
+/// Fetches the file over the app's own HTTP client.
+fn fetch(installer: &Installer, path: &std::path::Path, progress: &mut impl FnMut(f32)) -> Result<(), String> {
+    let trace = std::env::var_os("NEXUS_TRACE").is_some();
+    // GitHub answers with a redirect to its file store. Each hop is requested separately, so a
+    // slow or failed one can be told apart.
+    let mut address = installer.url.clone();
+    let mut hops = 0;
+    let response = loop {
+        let started = std::time::Instant::now();
+        let agent = crate::subsonic::make_agent();
+        let response = agent
+            .get(&address)
+            .header("User-Agent", user_agent())
+            .config()
+            .max_redirects(0)
+            .max_redirects_will_error(false)
+            .timeout_recv_response(Some(Duration::from_secs(12)))
+            .build()
+            .call()
+            .map_err(|e| {
+                if trace {
+                    eprintln!("[trace] update download: hop {hops} failed after {:?}: {e:?}", started.elapsed());
+                }
+                format!("The download didn't start ({e}).")
+            })?;
+        if trace {
+            eprintln!("[trace] update download: hop {hops} answered {} in {:?}", response.status(), started.elapsed());
+        }
+        let next = response
+            .status()
+            .is_redirection()
+            .then(|| response.headers().get("location").and_then(|v| v.to_str().ok()).map(str::to_string))
+            .flatten();
+        match next {
+            Some(next) if hops < 5 && next.starts_with("https://") => {
+                address = next;
+                hops += 1;
+            }
+            _ => break response,
+        }
+    };
+    if !response.status().is_success() {
+        return Err(format!("The download failed with status {}.", response.status().as_u16()));
+    }
+    let mut file = File::create(path).map_err(|e| e.to_string())?;
     let mut body = response.into_body().into_reader();
-    let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 64 * 1024];
     let mut done: u64 = 0;
     loop {
         let n = body.read(&mut buf).map_err(|e| e.to_string())?;
         if n == 0 {
-            break;
+            return Ok(());
         }
-        hasher.update(&buf[..n]);
         file.write_all(&buf[..n]).map_err(|e| e.to_string())?;
         done += n as u64;
         if done > installer.size.max(1) * 2 + (1 << 20) {
@@ -157,14 +207,34 @@ pub fn download(installer: &Installer, mut progress: impl FnMut(f32)) -> Result<
         }
         progress((done as f32 / installer.size.max(1) as f32).min(1.0));
     }
-    drop(file);
-    let digest: String = hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect();
-    let intact = done == installer.size && installer.sha256.as_ref().is_none_or(|expected| *expected == digest);
-    if !intact {
-        let _ = std::fs::remove_file(&path);
-        return Err("The download didn't match the published file, so it wasn't installed.".into());
+}
+
+/// Has Windows download the file with its own networking, the way a browser would.
+#[cfg(windows)]
+fn fetch_with_windows(url: &str, path: &std::path::Path) -> Result<(), String> {
+    use windows::Win32::System::Com::Urlmon::URLDownloadToFileW;
+    use windows::core::HSTRING;
+    unsafe { URLDownloadToFileW(None, &HSTRING::from(url), &HSTRING::from(path.as_os_str()), 0, None) }
+        .map_err(|e| format!("Windows' own downloader failed too (error {:#010X}).", e.code().0))
+}
+
+/// Checks a downloaded file against the size and checksum the release published.
+fn verify(installer: &Installer, path: &std::path::Path) -> Result<(), String> {
+    let mut file = File::open(path).map_err(|e| e.to_string())?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut size: u64 = 0;
+    loop {
+        let n = file.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        size += n as u64;
     }
-    Ok(path)
+    let digest: String = hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect();
+    let intact = size == installer.size && installer.sha256.as_ref().is_none_or(|expected| *expected == digest);
+    if intact { Ok(()) } else { Err("The download didn't match the published file, so it wasn't installed.".into()) }
 }
 
 /// Whether this copy was put in place by the installer (and so can be replaced by one).
@@ -216,5 +286,26 @@ mod tests {
         assert_eq!(installer.name, "NexusMusic-Setup-0.4.0.exe");
         assert_eq!(installer.size, 9);
         assert_eq!(installer.sha256.as_deref(), Some("abcdef"));
+    }
+}
+
+#[cfg(test)]
+mod network_tests {
+    use super::*;
+
+    /// Downloads a real release from GitHub. Run with `cargo test -- --ignored`.
+    #[test]
+    #[ignore = "needs the network"]
+    fn downloads_a_published_installer() {
+        let installer = Installer {
+            url: format!("https://github.com/{REPO}/releases/download/v0.4.0/NexusMusic-Setup-0.4.0.exe"),
+            name: "NexusMusic-Setup-0.4.0.exe".into(),
+            size: 10_071_802,
+            sha256: Some("6369d91186f1bb57b8d77b6b05d6b9da2403511f2e285851cc5bc9671425fbc0".into()),
+        };
+        let started = std::time::Instant::now();
+        let path = download(&installer, |_| {}).expect("download failed");
+        eprintln!("downloaded in {:?} to {}", started.elapsed(), path.display());
+        let _ = std::fs::remove_file(path);
     }
 }

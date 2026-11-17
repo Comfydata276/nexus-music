@@ -587,7 +587,11 @@ impl Controller {
                     Err(reason) => {
                         ctl.update_busy.set(false);
                         page.set_update_busy(false);
-                        page.set_update_status(reason.into());
+                        // Don't leave the user stuck: the same file is one click away in a browser.
+                        page.set_update_status(format!("{reason} The download page has been opened instead.").into());
+                        if let Some(release) = ctl.update.borrow().as_ref() {
+                            crate::update::open_in_browser(&release.page);
+                        }
                     }
                 }
             });
