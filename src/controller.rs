@@ -422,10 +422,24 @@ impl Controller {
 
         self.sync_downloads();
         self.apply_theme();
+        // For looking at the window buttons on a development build, where there's no frame
+        // to replace.
+        #[cfg(not(windows))]
+        app.set_custom_frame(std::env::var_os("NEXUS_SHOW_WINDOW_BUTTONS").is_some());
         // The title bar can only be coloured once the window exists.
         #[cfg(windows)]
         slint::Timer::single_shot(Duration::from_millis(50), || {
             with(|ctl| ctl.apply_theme());
+        });
+        // Take over the title bar, once there is a window to take it over from.
+        #[cfg(windows)]
+        slint::Timer::single_shot(Duration::from_millis(60), || {
+            with(|ctl| {
+                let own = !ctl.settings.borrow().standard_title_bar;
+                let installed = crate::frame::install(&ctl.ui, own);
+                crate::frame::set_scale(ctl.ui.window().scale_factor());
+                ctl.ui.global::<ui::App>().set_custom_frame(installed && own);
+            });
         });
         // Likewise the buttons on the taskbar thumbnail.
         #[cfg(windows)]
@@ -1454,6 +1468,7 @@ impl Controller {
                 .into(),
         );
         page.set_exclusive(settings.exclusive);
+        page.set_standard_title_bar(settings.standard_title_bar);
         page.set_themes(ModelRc::new(VecModel::from(
             config::THEMES
                 .iter()
@@ -1534,6 +1549,28 @@ impl Controller {
                 ctl.settings.borrow_mut().queue_panel = open;
                 ctl.save_settings();
             });
+        });
+        app.on_window_minimize(|| {
+            with(|ctl| ctl.ui.window().set_minimized(true));
+        });
+        app.on_window_maximize(|| {
+            with(|ctl| {
+                let window = ctl.ui.window();
+                window.set_maximized(!window.is_maximized());
+            });
+        });
+        app.on_window_close(|| {
+            // The same as closing it any other way: to the tray, or quit, as set.
+            with(|ctl| ctl.ui.window().dispatch_event(slint::platform::WindowEvent::CloseRequested));
+        });
+        app.on_titlebar_layout(|height, nav_right, search_left, search_right, controls_left| {
+            #[cfg(windows)]
+            with(|ctl| {
+                let scale = ctl.ui.window().scale_factor();
+                crate::frame::set_layout(height, nav_right, search_left, search_right, controls_left, scale);
+            });
+            #[cfg(not(windows))]
+            let _ = (height, nav_right, search_left, search_right, controls_left);
         });
         app.on_sign_out(|| {
             with(|ctl| ctl.sign_out());
@@ -1732,6 +1769,16 @@ impl Controller {
         });
         settings.on_set_exclusive(|on| {
             with(|ctl| ctl.change_setting(true, |s| s.exclusive = on));
+        });
+        settings.on_set_standard_title_bar(|on| {
+            with(|ctl| {
+                ctl.change_setting(true, |s| s.standard_title_bar = on);
+                #[cfg(windows)]
+                {
+                    crate::frame::set_enabled(!on);
+                    ctl.ui.global::<ui::App>().set_custom_frame(!on);
+                }
+            });
         });
         settings.on_set_theme(|index| {
             with(|ctl| {

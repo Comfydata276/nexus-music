@@ -112,6 +112,15 @@ export global App {
     in property <bool> queue-open;
     // Progress of downloads under way, e.g. "Downloading 3 of 12"; empty when idle.
     in property <string> download-status;
+    // The app draws its own title bar, so it needs its own minimise, maximise and close buttons.
+    in property <bool> custom-frame;
+    in property <bool> maximized;
+    callback window-minimize();
+    callback window-maximize();
+    callback window-close();
+    // Reports where the controls in the top bar are (everything else in it drags the window).
+    callback titlebar-layout(height: length, nav-right: length, search-left: length, search-right: length, controls-left: length);
+
     // The server can't be reached, or offline mode is on: only downloads will play.
     in property <bool> offline;
     in property <string> offline-label;
@@ -335,6 +344,8 @@ export global Settings {
     in property <string> output-status;
     in property <bool> exclusive;
 
+    // Use Windows' own title bar instead of the built-in one.
+    in property <bool> standard-title-bar;
     in property <[ThemeOption]> themes;
     in property <int> theme;
     in property <[string]> ui-scales;
@@ -369,6 +380,7 @@ export global Settings {
     callback set-offline(on: bool);
     callback choose-device(x: length, y: length);
     callback set-exclusive(on: bool);
+    callback set-standard-title-bar(on: bool);
     callback set-theme(index: int);
     callback set-ui-scale(index: int);
     callback set-close-to-tray(on: bool);

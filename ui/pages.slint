@@ -1469,6 +1469,16 @@ export component SettingsPage inherits Rectangle {
                         }
 
                         SettingRow {
+                            title: "Use the standard Windows title bar";
+                            detail: "Puts back the title bar Windows draws, above the app's own top bar. Try this if the window is hard to move, resize or snap.";
+                            Toggle {
+                                on: Settings.standard-title-bar;
+                                label: "Use the standard Windows title bar";
+                                toggled(on) => { Settings.set-standard-title-bar(on); }
+                            }
+                        }
+
+                        SettingRow {
                             title: "Interface size";
                             detail: "Makes text and controls larger or smaller. Applies the next time the app starts.";
                             HorizontalLayout {

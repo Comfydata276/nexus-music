@@ -97,6 +97,8 @@ pub struct Settings {
     pub exclusive: bool,
     /// Offline mode: don't contact the server; play downloads only.
     pub offline: bool,
+    /// Keep the title bar Windows draws, instead of the app's own.
+    pub standard_title_bar: bool,
     /// Name of the colour theme (see `THEMES`).
     pub theme: String,
     /// Size of the interface relative to the system's scaling; 1.0 leaves it alone.
@@ -133,6 +135,7 @@ impl Default for Settings {
             output_device_name: String::new(),
             exclusive: false,
             offline: false,
+            standard_title_bar: false,
             theme: THEMES[0].name.to_string(),
             ui_scale: 1.0,
             close_to_tray: true,

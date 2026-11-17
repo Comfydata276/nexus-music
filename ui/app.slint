@@ -128,6 +128,14 @@ export component MainWindow inherits Window {
                 App.search-focus += 1;
                 return accept;
             }
+            if event.modifiers.control && event.text == "," {
+                if App.route == "settings" {
+                    App.go-back();
+                } else {
+                    App.navigate("settings");
+                }
+                return accept;
+            }
             if (event.modifiers.control && event.text == "r") || event.text == Key.F5 {
                 App.refresh();
                 return accept;
@@ -153,22 +161,24 @@ export component MainWindow inherits Window {
         if App.signed-in: Rectangle {
             property <length> gap: Theme.gap;
             property <length> bar: 84px;
+            // The top bar's height: panels start below it.
+            property <length> top: 60px;
             property <length> side: clamp(root.width * 0.22, 220px, 300px);
             // The queue steps aside when the window is too narrow to leave the page room.
             property <bool> queue-shown: App.queue-open && root.width >= 1000px;
             property <length> queue: self.queue-shown ? clamp(root.width * 0.26, 280px, 360px) : 0px;
-            property <length> body: root.height - self.bar - self.gap;
+            property <length> body: root.height - self.bar - self.top;
 
             Sidebar {
                 x: parent.gap;
-                y: parent.gap;
+                y: parent.top;
                 width: parent.side;
                 height: parent.body;
             }
 
             Rectangle {
                 x: parent.gap * 2 + parent.side;
-                y: parent.gap;
+                y: parent.top;
                 width: root.width - parent.side - parent.gap * 3 - (parent.queue-shown ? parent.queue + parent.gap : 0px);
                 height: parent.body;
                 background: Theme.panel;
@@ -194,13 +204,9 @@ export component MainWindow inherits Window {
                     opacity: App.page == Page.now-playing ? 1 : clamp(1 + View.scroll-y / 190px, 0, 1);
                 }
 
-                TopBar {
-                    y: 0;
-                }
-
                 Rectangle {
-                    y: 76px;
-                    height: parent.height - 76px;
+                    y: 12px;
+                    height: parent.height - 12px;
 
                     if View.loading || View.error != "": PageStatus {
                         loading: View.loading;
@@ -222,7 +228,7 @@ export component MainWindow inherits Window {
 
             if self.queue-shown: QueuePanel {
                 x: root.width - parent.queue - parent.gap;
-                y: parent.gap;
+                y: parent.top;
                 width: parent.queue;
                 height: parent.body;
             }
@@ -236,6 +242,14 @@ export component MainWindow inherits Window {
         }
 
         if !App.signed-in: LoginPage { }
+
+        // Above everything else, including the sign-in screen: it's how the window is moved
+        // and closed.
+        TopBar {
+            x: 0;
+            y: 0;
+            width: root.width;
+        }
 
         ToastOverlay {
             y: root.height - self.height - (App.signed-in ? 100px : 32px);

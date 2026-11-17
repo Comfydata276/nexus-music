@@ -307,18 +307,61 @@ export component Sidebar inherits Rectangle {
     }
 }
 
+// A button for the window itself: minimise, maximise or close.
+component WindowButton inherits Rectangle {
+    in property <image> icon;
+    in property <string> label;
+    in property <bool> closes;
+    callback clicked;
+
+    width: 48px;
+    background: touch.pressed ? (self.closes ? #c42b1c.darker(0.2) : Theme.press)
+        : touch.has-hover ? (self.closes ? #c42b1c : Theme.hover) : transparent;
+    animate background { duration: 100ms; }
+
+    accessible-role: button;
+    accessible-label: self.label;
+    accessible-action-default => { touch.clicked(); }
+
+    touch := TouchArea {
+        clicked => { root.clicked(); }
+    }
+
+    Icon {
+        source: root.icon;
+        size: 17px;
+        tint: touch.has-hover ? (root.closes ? white : Theme.text) : Theme.muted;
+    }
+}
+
+// The strip along the top of the window. It stands in for Windows' own title bar: empty parts
+// of it drag the window, and it carries navigation, search and the window's buttons.
 export component TopBar inherits Rectangle {
     property <int> focus-request: App.search-focus;
     changed focus-request => { search.focus(); }
-    height: 76px;
+    height: 60px;
 
-    // The search box sits in the middle of the bar, as wide as the room allows.
-    property <length> search-width: clamp(self.width - 2 * (App.offline ? 216px : 124px), 180px, 520px);
+    // Where the controls are, so the rest of the bar can be treated as the title bar.
+    property <length> nav-right: App.signed-in ? 112px : 0px;
+    property <length> buttons-width: App.custom-frame ? 3 * 48px : 0px;
+    property <length> pill-width: App.signed-in && App.offline ? offline-label.preferred-width + 24px + 8px : 0px;
+    property <length> controls-left: self.width - self.buttons-width - (App.signed-in ? 56px : 0px) - self.pill-width;
+    property <length> search-width: !App.signed-in ? 0px
+        : clamp(self.width - 2 * max(self.nav-right, self.width - self.controls-left) - 48px, 160px, 520px);
+    property <length> search-x: (self.width - self.search-width) / 2;
+    function report() {
+        App.titlebar-layout(self.height, self.nav-right, self.search-x, self.search-x + self.search-width, self.controls-left);
+    }
+    init => { self.report(); }
+    changed width => { self.report(); }
+    changed nav-right => { self.report(); }
+    changed controls-left => { self.report(); }
+    changed search-width => { self.report(); }
 
-    HorizontalLayout {
+    if App.signed-in: HorizontalLayout {
         x: 16px;
-        width: 100px;
-        spacing: 6px;
+        width: 92px;
+        spacing: 8px;
         alignment: start;
 
         VerticalLayout {
@@ -349,11 +392,12 @@ export component TopBar inherits Rectangle {
     }
 
     Rectangle {
-        x: (parent.width - self.width) / 2;
+        visible: App.signed-in;
+        x: root.search-x;
         y: (parent.height - self.height) / 2;
         width: root.search-width;
-        height: 48px;
-        border-radius: 24px;
+        height: 44px;
+        border-radius: 22px;
         background: search.has-focus ? Theme.overlay : Theme.raised;
         border-width: 1px;
         border-color: search.has-focus ? Theme.accent-bright : transparent;
@@ -428,54 +472,70 @@ export component TopBar inherits Rectangle {
         }
     }
 
-    HorizontalLayout {
-        x: parent.width - self.width - 16px;
-        width: 200px;
-        spacing: 6px;
-        alignment: end;
+    Rectangle {
+        visible: App.signed-in && App.offline;
+        x: root.controls-left;
+        y: (parent.height - self.height) / 2;
+        height: 28px;
+        width: offline-label.preferred-width + 24px;
+        border-radius: 14px;
+        background: Theme.warm.with-alpha(0.16);
+        offline-label := Text {
+            text: App.offline-label;
+            color: Theme.warm;
+            font-size: 13px;
+            font-weight: 600;
+        }
+    }
 
-        if App.offline: VerticalLayout {
-            alignment: center;
-            Rectangle {
-                height: 28px;
-                width: offline-label.preferred-width + 24px;
-                border-radius: 14px;
-                background: Theme.warm.with-alpha(0.16);
-                offline-label := Text {
-                    text: App.offline-label;
-                    color: Theme.warm;
-                    font-size: 13px;
-                    font-weight: 600;
-                }
+    if App.signed-in: cog := IconButton {
+        x: root.width - root.buttons-width - 48px;
+        y: (parent.height - self.height) / 2;
+        width: 40px;
+        height: 40px;
+        icon: Icons.settings;
+        icon-size: 22px;
+        active: App.route == "settings";
+        label: App.route == "settings" ? "Close settings" : App.update-available ? "Settings (update available)" : "Settings";
+        clicked => {
+            if App.route == "settings" {
+                App.go-back();
+            } else {
+                App.navigate("settings");
             }
         }
 
-        VerticalLayout {
-            alignment: center;
-            cog := IconButton {
-                width: 40px;
-                height: 40px;
-                icon: Icons.settings;
-                icon-size: 22px;
-                active: App.route == "settings";
-                label: App.route == "settings" ? "Close settings" : App.update-available ? "Settings (update available)" : "Settings";
-                clicked => {
-                    if App.route == "settings" {
-                        App.go-back();
-                    } else {
-                        App.navigate("settings");
-                    }
-                }
+        if App.update-available: Rectangle {
+            x: parent.width - 13px;
+            y: 5px;
+            width: 8px;
+            height: 8px;
+            border-radius: 4px;
+            background: Theme.warm;
+        }
+    }
 
-                if App.update-available: Rectangle {
-                    x: parent.width - 13px;
-                    y: 5px;
-                    width: 8px;
-                    height: 8px;
-                    border-radius: 4px;
-                    background: Theme.warm;
-                }
-            }
+    if App.custom-frame: HorizontalLayout {
+        x: root.width - root.buttons-width;
+        width: root.buttons-width;
+
+        WindowButton {
+            icon: Icons.minus;
+            label: "Minimise";
+            clicked => { App.window-minimize(); }
+        }
+
+        WindowButton {
+            icon: App.maximized ? Icons.copy : Icons.square;
+            label: App.maximized ? "Restore" : "Maximise";
+            clicked => { App.window-maximize(); }
+        }
+
+        WindowButton {
+            icon: Icons.x;
+            label: "Close";
+            closes: true;
+            clicked => { App.window-close(); }
         }
     }
 

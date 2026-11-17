@@ -8,6 +8,8 @@ mod controller;
 mod covers;
 mod downloads;
 #[cfg(windows)]
+mod frame;
+#[cfg(windows)]
 mod instance;
 #[cfg(windows)]
 mod media;

@@ -45,11 +45,13 @@ by the app itself.
 - Keeps playing from the notification area when the window is closed (optional), and
   opening it a second time brings back the copy that's already running.
 - Checks GitHub for new versions and installs them on request.
-- Colour themes that carry through to the window's title bar, and an interface size setting.
+- Its own title bar: navigation, search and the window's buttons in one strip, in the theme's
+  colours. Six colour themes and an interface size setting.
 - Previous, play and next buttons on the taskbar thumbnail.
 
 Keyboard: Space plays or pauses, Ctrl+Left/Right changes track, Ctrl+Up/Down changes
-volume, Ctrl+K jumps to search, Alt+Left/Right goes back and forward, F5 reloads the page.
+volume, Ctrl+K jumps to search, Ctrl+, opens Settings, Alt+Left/Right goes back and forward,
+F5 reloads the page.
 
 ## Installing
 
@@ -136,6 +138,7 @@ connection.
 | `src/audio/exclusive.rs` | Exclusive-mode (WASAPI) output on Windows. |
 | `src/instance.rs` | One running copy at a time, title bar colour, display scaling (Windows). |
 | `src/taskbar.rs` | Buttons on the taskbar thumbnail (Windows). |
+| `src/frame.rs` | Replaces Windows' title bar with the app's own top bar. |
 | `installer/` | NSIS script for the Windows installer. |
 
 ## Licences of bundled work

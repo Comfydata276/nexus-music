@@ -718,6 +718,14 @@ impl Controller {
     /// next track and follows the lyrics.
     pub fn tick(self: &Rc<Self>) {
         self.check_sleep();
+        // Keep the maximise button, and the title bar's sense of scale, in step with the window.
+        let app = self.ui.global::<ui::App>();
+        let maximized = self.ui.window().is_maximized();
+        if app.get_maximized() != maximized {
+            app.set_maximized(maximized);
+        }
+        #[cfg(windows)]
+        crate::frame::set_scale(self.ui.window().scale_factor());
         let Some((token, seconds)) = self.engine.position() else { return };
         let lookahead;
         let (arm, submit, checkpoint) = {
