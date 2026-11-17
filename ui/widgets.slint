@@ -632,7 +632,7 @@ export component MediaCard inherits Rectangle {
                 detail: 200px;
             }
 
-            if root.card.kind != CardKind.artist: PlayButton {
+            if root.card.kind != CardKind.artist && root.card.kind != CardKind.request: PlayButton {
                 x: parent.width - self.width - 8px;
                 y: touch.has-hover ? parent.height - self.height - 8px : parent.height - self.height;
                 size: 44px;

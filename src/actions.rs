@@ -29,6 +29,8 @@ pub enum Target {
     Album { id: String, title: String },
     Artist { id: String, name: String },
     Playlist { id: String, name: String },
+    /// An album on the Requests page: Lidarr's number for it, and its title.
+    Request { id: i64, title: String },
 }
 
 impl Target {
@@ -56,6 +58,9 @@ pub enum PromptAction {
     CreatePlaylist(Vec<Song>),
     /// The file or folder to import playlists from was typed in.
     ImportPath,
+    /// Ask Lidarr for an album (by its name for it), or for several by (artist, album).
+    RequestAlbum { album: String, title: String },
+    RequestMissing(Vec<(String, String)>),
     RenamePlaylist(String),
     DeletePlaylist(String),
 }
@@ -196,6 +201,15 @@ impl Controller {
 
     /// `row` is the row as shown, which a filter or sort can put anywhere in the list.
     pub fn open_track_menu(self: &Rc<Self>, row: usize, x: f32, y: f32) {
+        // On the Requests page a row is an album that's been asked for.
+        let request = {
+            let page = self.page.borrow();
+            self.song_index(row).and_then(|index| Some((*page.request_ids.get(index)?, page.songs.get(index)?.title.clone())))
+        };
+        if let Some((id, title)) = request {
+            let entries = vec![self.entry("cancel-request", "Take off the list", self.ui.global::<ui::Icons>().get_x())];
+            return self.open_menu(Target::Request { id, title: title.clone() }, &title, entries, x, y);
+        }
         // Right-clicking inside a selection acts on all of it.
         let rows = self.rows_for(row);
         if rows.len() > 1 {
@@ -276,7 +290,7 @@ impl Controller {
             ui::CardKind::Artist => {
                 self.collection_menu(Target::Artist { id, name: title.clone() }, &title, x, y)
             }
-            ui::CardKind::Genre | ui::CardKind::Mix => {}
+            ui::CardKind::Genre | ui::CardKind::Mix | ui::CardKind::Request => {}
         }
     }
 
@@ -388,7 +402,7 @@ impl Controller {
         };
         let then: Box<dyn FnOnce(&Rc<Controller>, Vec<Song>) + Send> = Box::new(then);
         match target {
-            Target::None => {}
+            Target::None | Target::Request { .. } => {}
             Target::Song { song, .. } => then(self, vec![song]),
             Target::Songs { songs, .. } => then(self, songs),
             Target::Album { id, .. } => self.request(
@@ -520,6 +534,12 @@ impl Controller {
             Target::Songs { songs, .. } => format!("{} songs", songs.len()),
             Target::Album { title, .. } => title.clone(),
             Target::Artist { name, .. } | Target::Playlist { name, .. } => name.clone(),
+            Target::Request { id: album, title } => {
+                if id == "cancel-request" {
+                    self.cancel_request(*album, title.clone());
+                }
+                return;
+            }
             Target::None => return,
         };
         match (id, &target) {
@@ -617,7 +637,7 @@ impl Controller {
 
     // ---- prompts -------------------------------------------------------------------------------
 
-    fn open_prompt(&self, title: &str, message: &str, confirm: &str, text: Option<&str>, danger: bool) {
+    pub fn open_prompt(&self, title: &str, message: &str, confirm: &str, text: Option<&str>, danger: bool) {
         let prompt = self.ui.global::<ui::Prompt>();
         prompt.set_cancel_label("Cancel".into());
         prompt.set_title(title.into());
@@ -655,8 +675,15 @@ impl Controller {
         self.open_prompt("Name your playlist", "", "Create playlist", Some(""), false);
     }
 
-    fn prompt_confirmed(self: &Rc<Self>, text: &str) {
+    /// Puts the question away and gives the keyboard back to the app's shortcuts.
+    fn close_prompt(&self) {
         self.ui.global::<ui::Prompt>().set_open(false);
+        let app = self.ui.global::<ui::App>();
+        app.set_main_focus(app.get_main_focus().wrapping_add(1));
+    }
+
+    fn prompt_confirmed(self: &Rc<Self>, text: &str) {
+        self.close_prompt();
         let Some(action) = self.prompt.borrow_mut().take() else { return };
         let name = text.trim().to_string();
         match action {
@@ -665,6 +692,8 @@ impl Controller {
                     self.add_songs_to_playlist(playlist_id, fresh);
                 }
             }
+            PromptAction::RequestAlbum { album, title } => self.request_album(album, title),
+            PromptAction::RequestMissing(albums) => self.request_missing(albums),
             PromptAction::ImportPath => {
                 if !name.is_empty() {
                     self.run_import(vec![std::path::PathBuf::from(name.trim_matches('"'))]);
@@ -893,7 +922,7 @@ impl Controller {
             ui::CardKind::Album => Target::Album { id, title: title.clone() },
             ui::CardKind::Playlist => Target::Playlist { id, name: title.clone() },
             ui::CardKind::Artist => Target::Artist { id, name: title.clone() },
-            ui::CardKind::Genre => return,
+            ui::CardKind::Genre | ui::CardKind::Request => return,
             ui::CardKind::Mix => {
                 // Made on the spot from the app's copy of the library.
                 let Some(mix) = crate::search::current().and_then(|index| crate::mixes::one(&index, &id)) else { return };
@@ -1015,7 +1044,7 @@ impl Controller {
         prompt.on_cancelled(|| {
             with(|ctl| {
                 let action = ctl.prompt.borrow_mut().take();
-                ctl.ui.global::<ui::Prompt>().set_open(false);
+                ctl.close_prompt();
                 // For this question the second button is an answer, not a way out: add them
                 // all, repeats included.
                 if let Some(PromptAction::AddDuplicates { playlist_id, all, .. }) = action {
@@ -1026,7 +1055,7 @@ impl Controller {
         prompt.on_dismissed(|| {
             with(|ctl| {
                 ctl.prompt.borrow_mut().take();
-                ctl.ui.global::<ui::Prompt>().set_open(false);
+                ctl.close_prompt();
             });
         });
     }

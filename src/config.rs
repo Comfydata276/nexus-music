@@ -121,6 +121,12 @@ pub struct Settings {
     pub pinned_playlists: Vec<String>,
     /// Choices remembered for individual playlists, albums and so on, by route key.
     pub lists: std::collections::HashMap<String, ListPrefs>,
+    /// Offer to ask a Lidarr server for albums that aren't in the library; where it is, and
+    /// the name for a sign-in in front of it, if any. (Its key and that sign-in's password
+    /// are kept with the account password, not here.)
+    pub requests: bool,
+    pub lidarr_address: String,
+    pub lidarr_sign_in: String,
     /// Share the queue, pins and so on with the app on other devices.
     pub sync: bool,
     /// A made-up name for this device, so it can tell its own saved queue from others'.
@@ -172,6 +178,9 @@ impl Default for Settings {
             download_quality: 0,
             pinned_playlists: Vec::new(),
             lists: std::collections::HashMap::new(),
+            requests: false,
+            lidarr_address: String::new(),
+            lidarr_sign_in: String::new(),
             sync: true,
             device_id: String::new(),
             sync_playlist: String::new(),
@@ -435,6 +444,37 @@ pub fn load_password(paths: &Paths, server: &str, username: &str) -> Option<Stri
 #[cfg(not(windows))]
 pub fn delete_password(paths: &Paths, _server: &str, _username: &str) {
     let _ = fs::remove_file(&paths.secret);
+}
+
+/// Keeps a secret other than the account password, by name, where that one is kept: the
+/// Windows credential store, or elsewhere a file only this user can read. An empty value
+/// forgets it.
+#[cfg(windows)]
+pub fn save_secret(_paths: &Paths, name: &str, value: &str) {
+    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &format!("secret:{name}")) {
+        let _ = if value.is_empty() { entry.delete_credential() } else { entry.set_password(value) };
+    }
+}
+
+#[cfg(windows)]
+pub fn load_secret(_paths: &Paths, name: &str) -> Option<String> {
+    keyring::Entry::new(KEYRING_SERVICE, &format!("secret:{name}")).ok()?.get_password().ok()
+}
+
+#[cfg(not(windows))]
+pub fn save_secret(paths: &Paths, name: &str, value: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let file = paths.secret.with_file_name(format!("secret-{name}"));
+    if value.is_empty() {
+        let _ = fs::remove_file(file);
+    } else if fs::write(&file, value).is_ok() {
+        let _ = fs::set_permissions(&file, fs::Permissions::from_mode(0o600));
+    }
+}
+
+#[cfg(not(windows))]
+pub fn load_secret(paths: &Paths, name: &str) -> Option<String> {
+    fs::read_to_string(paths.secret.with_file_name(format!("secret-{name}"))).ok().filter(|value| !value.is_empty())
 }
 
 /// Total size of the files directly inside `dir`, in bytes.

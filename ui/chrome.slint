@@ -269,6 +269,13 @@ export component Sidebar inherits Rectangle {
             clicked => { App.navigate("downloads"); }
         }
 
+        if App.requests: NavItem {
+            icon: Icons.circle-arrow-down;
+            text: "Requests";
+            selected: App.route == "requests";
+            clicked => { App.navigate("requests"); }
+        }
+
         Rectangle {
             height: 17px;
             Rectangle {

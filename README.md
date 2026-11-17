@@ -21,6 +21,7 @@ by the app itself.
 - Find and sort within a playlist or Liked songs: click a column heading to sort by it, including the date each song was added.
 - Shuffle is set per playlist or album and remembered.
 - Brings playlists over from Spotify: choose the files you exported (CSV from a tool such as Exportify, or Spotify's own data download) and it matches each song to your library, builds the playlists, and lists what it couldn't find.
+- Optional, off by default: if you run Lidarr beside your music server, search results gain a "Not in your library" row. Choosing an album there puts it on Lidarr's list, and a Requests page shows what is on its way. Whole albums only; where Lidarr gets them from is set up in Lidarr.
 - A "Made for you" row on Home, built from your listening: On repeat, Your top songs, Rediscover and mixes of the genres you play most.
 - Keeps your devices in step: the queue and your place in it, Recently played, pinned playlists, each list's shuffle and sort, the dates songs were added and the theme follow you to the app on another PC. The queue uses the server's saved-queue feature; the rest is kept in the comment of a playlist named "Nexus Music sync".
 - Select several songs with Ctrl or Shift, then drag them onto a playlist or the queue, or

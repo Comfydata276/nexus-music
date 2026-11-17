@@ -958,6 +958,7 @@ impl Controller {
     pub fn tick(self: &Rc<Self>) {
         self.check_sleep();
         self.tick_downloads();
+        self.tick_requests();
         // Keep the maximise button, and the title bar's sense of scale, in step with the window.
         let app = self.ui.global::<ui::App>();
         let maximized = self.ui.window().is_maximized();

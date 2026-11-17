@@ -15,6 +15,7 @@ mod frame;
 mod instance;
 #[cfg(windows)]
 mod media;
+mod lidarr;
 mod mixes;
 mod offline;
 mod pages;

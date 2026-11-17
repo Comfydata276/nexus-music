@@ -657,13 +657,24 @@ export component StackPage inherits Rectangle {
                 padding-right: Theme.page-pad;
                 padding-top: 8px;
                 padding-bottom: 12px;
+                spacing: 16px;
                 Text {
+                    horizontal-stretch: 1;
                     text: View.title;
                     color: Theme.text;
                     font-family: Theme.display;
                     font-size: 34px;
                     font-weight: 800;
                     overflow: elide;
+                }
+
+                if View.action != "": VerticalLayout {
+                    alignment: center;
+                    TextButton {
+                        primary: true;
+                        text: View.action;
+                        clicked => { View.action-clicked(); }
+                    }
                 }
             }
 
@@ -1848,6 +1859,97 @@ export component SettingsPage inherits Rectangle {
                                 on: Settings.sync;
                                 label: "Keep my devices in step";
                                 toggled(on) => { Settings.set-sync(on); }
+                            }
+                        }
+                    }
+
+                    SettingGroup {
+                        title: "Requests";
+
+                        SettingRow {
+                            title: "Ask for albums that aren't in your library";
+                            detail: "For people who run Lidarr beside their music server. Search results gain a “Not in your library” row; choosing an album there puts it on Lidarr's list, and a Requests page shows what's on its way. Whole albums only.";
+                            Toggle {
+                                on: Settings.requests;
+                                label: "Ask for albums that aren't in your library";
+                                toggled(on) => { Settings.set-requests(on); }
+                            }
+                        }
+
+                        if Settings.requests: VerticalLayout {
+                            spacing: 8px;
+                            padding-top: 4px;
+
+                            Text {
+                                text: "Lidarr's address";
+                                color: Theme.text;
+                                font-size: 13px;
+                                font-weight: 600;
+                            }
+
+                            lidarr-address := Field {
+                                text: Settings.lidarr-address;
+                                placeholder: "https://lidarr.example.org";
+                                label: "Lidarr's address";
+                            }
+
+                            Text {
+                                text: "API key";
+                                color: Theme.text;
+                                font-size: 13px;
+                                font-weight: 600;
+                            }
+
+                            lidarr-key := Field {
+                                input-type: InputType.password;
+                                placeholder: Settings.lidarr-has-key ? "On file. Type a new one to replace it." : "In Lidarr: Settings, General, API Key";
+                                label: "Lidarr API key";
+                            }
+
+                            Text {
+                                text: "Sign-in in front of Lidarr, if it has one";
+                                color: Theme.text;
+                                font-size: 13px;
+                                font-weight: 600;
+                            }
+
+                            HorizontalLayout {
+                                spacing: 8px;
+
+                                lidarr-name := Field {
+                                    text: Settings.lidarr-sign-in;
+                                    placeholder: "Name";
+                                    label: "Sign-in name";
+                                }
+
+                                lidarr-password := Field {
+                                    input-type: InputType.password;
+                                    placeholder: Settings.lidarr-has-password ? "On file" : "Password";
+                                    label: "Sign-in password";
+                                }
+                            }
+
+                            HorizontalLayout {
+                                spacing: 12px;
+                                padding-top: 4px;
+                                alignment: start;
+
+                                TextButton {
+                                    text: "Save and check";
+                                    clicked => {
+                                        Settings.save-requests(lidarr-address.text, lidarr-key.text, lidarr-name.text, lidarr-password.text);
+                                        lidarr-key.text = "";
+                                        lidarr-password.text = "";
+                                    }
+                                }
+
+                                Text {
+                                    text: Settings.requests-status;
+                                    color: Theme.muted;
+                                    font-size: 13px;
+                                    vertical-alignment: center;
+                                    wrap: word-wrap;
+                                }
                             }
                         }
                     }

@@ -61,6 +61,8 @@ pub enum Route {
     Import,
     /// One of the "Made for you" mixes, by its id.
     Mix(String),
+    /// Albums that have been asked for and haven't arrived.
+    Requests,
 }
 
 impl Route {
@@ -84,6 +86,7 @@ impl Route {
             "now-playing" => Route::NowPlaying,
             "import" => Route::Import,
             "mix" => Route::Mix(rest.to_string()),
+            "requests" => Route::Requests,
             _ => return None,
         })
     }
@@ -108,6 +111,7 @@ impl Route {
             Route::NowPlaying => "now-playing".into(),
             Route::Import => "import".into(),
             Route::Mix(id) => format!("mix:{id}"),
+            Route::Requests => "requests".into(),
         }
     }
 
@@ -123,7 +127,7 @@ impl Route {
     fn page(&self) -> ui::Page {
         match self {
             Route::Home => ui::Page::Home,
-            Route::Search(_) | Route::Import => ui::Page::Search,
+            Route::Search(_) | Route::Import | Route::Requests => ui::Page::Search,
             Route::Album(_) | Route::Playlist(_) | Route::Liked | Route::Downloads | Route::Radio | Route::Mix(_) => {
                 ui::Page::Tracklist
             }
@@ -299,8 +303,11 @@ pub struct Controller {
     /// the playlist that holds the shared data.
     /// Search: what's on offer under the search box, a count that tells a late answer from
     /// the current one, and the timer and flag for keeping the library copy up to date.
-    /// How the last import of playlists went, as a page to show.
+    /// How the last import of playlists went, as a page to show, and the songs it couldn't find.
     import_report: RefCell<Option<PageData>>,
+    import_missing: RefCell<Vec<crate::import::Wanted>>,
+    /// Counts ticks, to refresh the Requests page now and then while it's open.
+    requests_ticks: Cell<u32>,
     suggestions: RefCell<Vec<Suggestion>>,
     preview_count: Cell<u64>,
     library_timer: slint::Timer,
@@ -380,6 +387,8 @@ impl Controller {
             unreachable: Cell::new(false),
             reconnect_timer: slint::Timer::default(),
             import_report: RefCell::new(None),
+            import_missing: RefCell::default(),
+            requests_ticks: Cell::new(0),
             suggestions: RefCell::default(),
             preview_count: Cell::new(0),
             library_timer: slint::Timer::default(),
@@ -494,6 +503,7 @@ impl Controller {
         });
 
         self.sync_downloads();
+        self.connect_requests();
         self.apply_theme();
         // For looking at the window buttons on a development build, where there's no frame
         // to replace.
@@ -799,6 +809,201 @@ impl Controller {
         });
     }
 
+    // ---- asking for albums that aren't in the library -------------------------------------------
+
+    /// Sets up (or drops) the connection to Lidarr from what's in Settings.
+    pub fn connect_requests(&self) {
+        let lidarr = {
+            let settings = self.settings.borrow();
+            let key = config::load_secret(&self.paths, "lidarr-key");
+            match (settings.requests && !settings.lidarr_address.trim().is_empty(), key) {
+                (true, Some(key)) => {
+                    let password = config::load_secret(&self.paths, "lidarr-password").unwrap_or_default();
+                    let sign_in = (!settings.lidarr_sign_in.is_empty()).then_some((settings.lidarr_sign_in.as_str(), password.as_str()));
+                    Some(crate::lidarr::Lidarr::new(&settings.lidarr_address, &key, sign_in))
+                }
+                _ => None,
+            }
+        };
+        self.ui.global::<ui::App>().set_requests(lidarr.is_some());
+        crate::lidarr::set_current(lidarr);
+    }
+
+    /// Saves where Lidarr is and how to get in, then checks that it answers.
+    fn save_requests(self: &Rc<Self>, address: &str, key: &str, sign_in: &str, password: &str) {
+        {
+            let mut settings = self.settings.borrow_mut();
+            settings.lidarr_address = address.trim().to_string();
+            settings.lidarr_sign_in = sign_in.trim().to_string();
+        }
+        self.save_settings();
+        // Blank leaves what's on file; the sign-in's password goes when its name does.
+        if !key.trim().is_empty() {
+            config::save_secret(&self.paths, "lidarr-key", key.trim());
+        }
+        if sign_in.trim().is_empty() {
+            config::save_secret(&self.paths, "lidarr-password", "");
+        } else if !password.is_empty() {
+            config::save_secret(&self.paths, "lidarr-password", password);
+        }
+        self.connect_requests();
+        self.push_settings();
+        let page = self.ui.global::<ui::Settings>();
+        let Some(lidarr) = crate::lidarr::current() else {
+            return page.set_requests_status("Fill in the address and the API key.".into());
+        };
+        page.set_requests_status("Checking…".into());
+        self.api_pool.spawn(move || {
+            let answer = lidarr.version();
+            post(move |ctl| {
+                ctl.ui.global::<ui::Settings>().set_requests_status(
+                    match answer {
+                        Ok(version) => format!("Connected to Lidarr {version}."),
+                        Err(reason) => reason,
+                    }
+                    .into(),
+                );
+            });
+        });
+    }
+
+    /// A card for an album that isn't in the library was clicked: ask whether to request it.
+    fn prompt_request(self: &Rc<Self>, card: &ui::Card) {
+        if card.subtitle.ends_with("Requested") {
+            return self.toast("That one has already been asked for. See Requests in the sidebar.");
+        }
+        let (title, by) = (card.title.to_string(), card.subtitle.split(" • ").next().unwrap_or_default().to_string());
+        *self.prompt.borrow_mut() = Some(crate::actions::PromptAction::RequestAlbum { album: card.id.to_string(), title: title.clone() });
+        self.open_prompt(
+            "Ask for this album?",
+            &format!("“{title}” by {by} will go on Lidarr's list, and Lidarr will start looking for it. The whole album is fetched."),
+            "Request",
+            None,
+            false,
+        );
+    }
+
+    pub fn request_album(self: &Rc<Self>, album: String, title: String) {
+        let Some(lidarr) = crate::lidarr::current() else { return };
+        self.toast(format!("Asking for “{title}”…"));
+        self.api_pool.spawn(move || {
+            // Offered in this session, or (from a page drawn in an earlier one) looked up afresh.
+            let offer = crate::lidarr::offered(&album)
+                .map(Ok)
+                .unwrap_or_else(|| {
+                    lidarr.find_albums(&format!("lidarr:{album}"))?.into_iter().find(|o| o.album == album).ok_or_else(|| "Lidarr no longer lists that album.".to_string())
+                });
+            let result = offer.and_then(|offer| lidarr.request(&offer));
+            post(move |ctl| match result {
+                Ok(()) => {
+                    crate::lidarr::mark(&album, true);
+                    ctl.invalidate("search:");
+                    ctl.invalidate("requests");
+                    ctl.toast(format!("Asked for “{title}”. It'll be in your library once it arrives."));
+                }
+                Err(reason) => ctl.toast(reason),
+            });
+        });
+    }
+
+    /// The albums the songs an import couldn't find are on, as (artist, album), each once.
+    fn missing_albums(&self) -> Vec<(String, String)> {
+        let name = |text: &str| crate::search::fold(text).split_whitespace().collect::<Vec<_>>().join(" ");
+        let mut seen = HashSet::new();
+        self.import_missing
+            .borrow()
+            .iter()
+            .filter(|song| !song.album.trim().is_empty() && !song.artists.is_empty())
+            .filter(|song| seen.insert((name(&song.artists[0]), name(&song.album))))
+            .map(|song| (song.artists[0].clone(), song.album.clone()))
+            .collect()
+    }
+
+    /// Offers to ask for the albums that the songs an import couldn't find are on.
+    fn prompt_request_missing(self: &Rc<Self>) {
+        let albums = self.missing_albums();
+        if albums.is_empty() || crate::lidarr::current().is_none() {
+            return;
+        }
+        let songs = self.import_missing.borrow().len();
+        let many = count(albums.len() as u32, "album");
+        *self.prompt.borrow_mut() = Some(crate::actions::PromptAction::RequestMissing(albums));
+        self.open_prompt(
+            &format!("Ask for {many}?"),
+            &format!("The {} that weren't found are on {many}. Each goes on Lidarr's list as a whole album, not as single songs.", count(songs as u32, "song")),
+            &format!("Request {many}"),
+            None,
+            false,
+        );
+    }
+
+    pub fn request_missing(self: &Rc<Self>, albums: Vec<(String, String)>) {
+        let Some(lidarr) = crate::lidarr::current() else { return };
+        self.toast(format!("Asking Lidarr for {}. This can take a few minutes.", count(albums.len() as u32, "album")));
+        self.api_pool.spawn(move || {
+            let name = |text: &str| crate::search::fold(text).split_whitespace().collect::<Vec<_>>().join(" ");
+            let (mut asked, mut unmatched, mut failed) = (0, 0, None);
+            for (artist, album) in &albums {
+                // The album Lidarr knows by that name and artist, if it knows one.
+                let found = lidarr.find_albums(&format!("{album} {artist}")).unwrap_or_default().into_iter().find(|offer| {
+                    name(&offer.title) == name(album) && (name(&offer.artist) == name(artist) || name(&offer.artist).contains(&name(artist)))
+                });
+                match found {
+                    None => unmatched += 1,
+                    Some(offer) if offer.requested => asked += 1,
+                    Some(offer) => match lidarr.request(&offer) {
+                        Ok(()) => asked += 1,
+                        Err(reason) => failed = Some(reason),
+                    },
+                }
+            }
+            post(move |ctl| {
+                ctl.invalidate("requests");
+                ctl.toast(match (unmatched, failed) {
+                    (_, Some(reason)) => format!("Asked for {}. Then: {reason}", count(asked, "album")),
+                    (0, None) => format!("Asked for {}.", count(asked, "album")),
+                    (n, None) => format!("Asked for {}. Lidarr doesn't know {} by those names.", count(asked, "album"), n),
+                });
+                ctl.navigate(Route::Requests);
+            });
+        });
+    }
+
+    /// Takes an album off Lidarr's list.
+    pub fn cancel_request(self: &Rc<Self>, id: i64, title: String) {
+        let Some(lidarr) = crate::lidarr::current() else { return };
+        self.api_pool.spawn(move || {
+            let result = lidarr.cancel(id);
+            post(move |ctl| {
+                match result {
+                    Ok(()) => ctl.toast(format!("“{title}” is off the list")),
+                    Err(reason) => ctl.toast(reason),
+                }
+                ctl.invalidate("requests");
+                ctl.invalidate("search:");
+                if ctl.current_route() == Some(Route::Requests) {
+                    ctl.show(Route::Requests, 0.0, true, None);
+                }
+            });
+        });
+    }
+
+    /// Keeps the Requests page current while it's open. Called four times a second.
+    pub fn tick_requests(self: &Rc<Self>) {
+        if self.current_route() != Some(Route::Requests) {
+            return self.requests_ticks.set(0);
+        }
+        let ticks = self.requests_ticks.get() + 1;
+        // Every half minute.
+        if ticks >= 120 {
+            self.requests_ticks.set(0);
+            let scroll = self.ui.global::<ui::View>().get_scroll_y();
+            self.show(Route::Requests, scroll, true, None);
+        } else {
+            self.requests_ticks.set(ticks);
+        }
+    }
+
     // ---- bringing playlists over from Spotify ---------------------------------------------------
 
     /// Asks which exported playlists to bring in, then brings them in.
@@ -883,7 +1088,11 @@ impl Controller {
                 ..Default::default()
             })
             .collect();
+        // With requests switched on, the albums those songs are on can be asked for.
+        *self.import_missing.borrow_mut() = reports.iter().flat_map(|report| report.missing.iter().cloned()).collect();
+        let askable = crate::lidarr::current().is_some() && !self.missing_albums().is_empty();
         let page = PageData {
+            action: if askable { "Request the missing albums".into() } else { String::new() },
             title: "Imported from Spotify".into(),
             lead: vec![pages::ShelfData {
                 title: format!("{} of {} found in your library", found, count(total as u32, "song")),
@@ -1448,6 +1657,7 @@ impl Controller {
         if !same_shelves {
             view.set_shelves(shelves_model(&data.shelves));
         }
+        view.set_action(data.action.as_str().into());
         if self.page.borrow().lead != data.lead || data.lead.is_empty() {
             view.set_lead(shelves_model(&data.lead));
         }
@@ -2080,6 +2290,11 @@ impl Controller {
         page.set_close_to_tray(settings.close_to_tray);
         page.set_check_updates(settings.check_updates);
         page.set_sync(settings.sync);
+        page.set_requests(settings.requests);
+        page.set_lidarr_address(settings.lidarr_address.as_str().into());
+        page.set_lidarr_sign_in(settings.lidarr_sign_in.as_str().into());
+        page.set_lidarr_has_key(config::load_secret(&self.paths, "lidarr-key").is_some());
+        page.set_lidarr_has_password(config::load_secret(&self.paths, "lidarr-password").is_some());
     }
 
     /// Changes a setting, shows it, applies it to the audio and, when `save` is set, writes
@@ -2417,6 +2632,22 @@ impl Controller {
                 ctl.sync_tray();
             });
         });
+        settings.on_set_requests(|on| {
+            with(|ctl| {
+                ctl.change_setting(true, |s| s.requests = on);
+                ctl.connect_requests();
+            });
+        });
+        settings.on_save_requests(|address, key, sign_in, password| {
+            with(|ctl| ctl.save_requests(&address, &key, &sign_in, &password));
+        });
+        view.on_action_clicked(|| {
+            with(|ctl| {
+                if ctl.current_route() == Some(Route::Import) {
+                    ctl.prompt_request_missing();
+                }
+            });
+        });
         settings.on_import_spotify(|| {
             with(|ctl| ctl.start_import());
         });
@@ -2470,6 +2701,9 @@ impl Controller {
     }
 
     fn open_card(self: &Rc<Self>, card: &ui::Card) {
+        if card.kind == ui::CardKind::Request {
+            return self.prompt_request(card);
+        }
         let Some(route) = card_route(card) else { return };
         // The card already says enough to draw the page's header before the server answers.
         let subtitle = match self.page.borrow().label.as_str() {
@@ -2494,6 +2728,8 @@ fn card_route(card: &ui::Card) -> Option<Route> {
         ui::CardKind::Playlist => Route::Playlist(id),
         ui::CardKind::Genre => Route::Genre(id),
         ui::CardKind::Mix => Route::Mix(id),
+        // Not a page: clicking one asks whether to request the album.
+        ui::CardKind::Request => return None,
     })
 }
 

@@ -2,7 +2,7 @@
 
 export enum Page { home, search, tracklist, artist, grid, settings, lyrics, now-playing }
 
-export enum CardKind { album, artist, playlist, genre, mix }
+export enum CardKind { album, artist, playlist, genre, mix, request }
 
 export struct Track {
     id: string,
@@ -134,6 +134,8 @@ export global App {
     // The route key of the list the queue is playing from, e.g. "playlist:abc"; empty if it
     // isn't from a list. Play buttons for that list pause and resume it.
     in property <string> playing-source;
+    // Requests are switched on, so there's a page for them.
+    in property <bool> requests;
     in property <bool> queue-open;
     // Progress of downloads under way, e.g. "Downloading 3 of 12"; empty when idle.
     in property <string> download-status;
@@ -203,6 +205,9 @@ export global View {
     in property <[Shelf]> shelves;
     // Shelves shown above the songs instead of below them.
     in property <[Shelf]> lead;
+    // A button beside the page's title, if it has something to offer; and it being clicked.
+    in property <string> action;
+    callback action-clicked();
     in property <[Card]> tiles;
     // Shown when the page has nothing to list.
     in property <string> empty;
@@ -452,6 +457,17 @@ export global Settings {
     callback set-check-updates(on: bool);
     callback set-sync(on: bool);
     callback import-spotify();
+    // Asking a Lidarr server for albums that aren't in the library.
+    in property <bool> requests;
+    in property <string> lidarr-address;
+    in property <string> lidarr-sign-in;
+    // A key (and a password for the sign-in) are on file.
+    in property <bool> lidarr-has-key;
+    in property <bool> lidarr-has-password;
+    // How the last check of the connection went, in words.
+    in property <string> requests-status;
+    callback set-requests(on: bool);
+    callback save-requests(address: string, key: string, sign-in: string, password: string);
     callback check-updates-now();
     callback install-update();
 }

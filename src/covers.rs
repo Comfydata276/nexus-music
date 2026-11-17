@@ -201,9 +201,18 @@ fn file_name(id: &str, bucket: u32) -> String {
     format!("{safe}.{bucket}")
 }
 
-/// Reads a cover file from the disk cache, downloading it first if needed.
+/// The cache file for a picture that's named by its web address, not by the server.
+fn remote_file_name(address: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(address.as_bytes());
+    format!("web-{}", digest.iter().take(12).map(|byte| format!("{byte:02x}")).collect::<String>())
+}
+
+/// Reads a cover file from the disk cache, downloading it first if needed. An `id` that's a
+/// web address (the cover of an album that isn't in the library) is fetched from there.
 fn cover_file(client: &Client, dir: &Path, id: &str, size: u32) -> Option<(Vec<u8>, PathBuf)> {
-    let path = dir.join(file_name(id, size));
+    let remote = id.starts_with("https://") || id.starts_with("http://");
+    let path = dir.join(if remote { remote_file_name(id) } else { file_name(id, size) });
     let (lock, done) = &IN_FLIGHT;
     {
         let mut busy = lock.lock().unwrap();
@@ -219,7 +228,8 @@ fn cover_file(client: &Client, dir: &Path, id: &str, size: u32) -> Option<(Vec<u
             busy = done.wait(busy).unwrap();
         }
     }
-    let fetched = client.fetch_bytes(&client.cover_url(id, size), 16 * 1024 * 1024).ok();
+    let address = if remote { id.to_string() } else { client.cover_url(id, size) };
+    let fetched = client.fetch_bytes(&address, 16 * 1024 * 1024).ok();
     if let Some(bytes) = &fetched {
         // Write beside it and rename, so nobody reads a half-written file.
         let partial = path.with_extension("part");

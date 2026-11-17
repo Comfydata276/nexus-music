@@ -33,6 +33,8 @@ pub enum Kind {
     Genre,
     /// A list of songs the app puts together from what's been played.
     Mix,
+    /// An album that isn't in the library, which could be asked for.
+    Request,
 }
 
 impl Kind {
@@ -43,6 +45,7 @@ impl Kind {
             ui::CardKind::Playlist => Kind::Playlist,
             ui::CardKind::Genre => Kind::Genre,
             ui::CardKind::Mix => Kind::Mix,
+            ui::CardKind::Request => Kind::Request,
         }
     }
 
@@ -53,6 +56,7 @@ impl Kind {
             Kind::Playlist => ui::CardKind::Playlist,
             Kind::Genre => ui::CardKind::Genre,
             Kind::Mix => ui::CardKind::Mix,
+            Kind::Request => ui::CardKind::Request,
         }
     }
 }
@@ -152,6 +156,10 @@ pub struct PageData {
     pub shelves: Vec<ShelfData>,
     /// Shelves that go above the songs instead of below them.
     pub lead: Vec<ShelfData>,
+    /// The label of a button beside the title, if the page has something to offer.
+    pub action: String,
+    /// On the Requests page: Lidarr's number for the album on each row.
+    pub request_ids: Vec<i64>,
     pub tiles: Vec<CardData>,
     pub grid: Vec<CardData>,
     /// The list to keep fetching from as the grid scrolls; `None` once it's all loaded.
@@ -180,7 +188,7 @@ pub fn hint(kind: Kind, title: &str, subtitle: &str, cover: &str) -> Option<Page
         Kind::Album => ("Album", false),
         Kind::Artist => ("Artist", true),
         Kind::Playlist => ("Playlist", false),
-        Kind::Genre | Kind::Mix => return None,
+        Kind::Genre | Kind::Mix | Kind::Request => return None,
     };
     Some(PageData {
         label: label.into(),
@@ -206,6 +214,7 @@ pub fn load(client: &Client, route: &Route) -> ApiResult<PageData> {
         Route::Liked => liked(client),
         Route::Radio => radio(client),
         Route::Mix(id) => Ok(mix(id)),
+        Route::Requests => Ok(requests()),
         Route::Albums(sort) => albums(client, *sort),
         Route::Artists => artists(client),
         Route::Genres => genres(client),
@@ -219,6 +228,7 @@ pub fn load(client: &Client, route: &Route) -> ApiResult<PageData> {
 /// Fetches a page's extras. Returns `None` when the route has none.
 pub fn enrich(client: &Client, route: &Route, page: &PageData) -> Option<PageData> {
     match route {
+        Route::Search(query) if !query.is_empty() => search_extras(query, page),
         Route::Album(id) => album_extras(client, id, page),
         Route::Artist(id) => artist_extras(client, id, page),
         _ => None,
@@ -241,6 +251,85 @@ fn shelf(title: &str, route: &str, albums: &[Album]) -> Option<ShelfData> {
         wrap: false,
         cards: albums.iter().map(CardData::album).collect(),
     })
+}
+
+/// Albums matching a search that aren't in the library, if requests are switched on.
+fn search_extras(query: &str, page: &PageData) -> Option<PageData> {
+    use crate::search::fold;
+    let lidarr = crate::lidarr::current()?;
+    let name = |text: &str| fold(text).split_whitespace().collect::<Vec<_>>().join(" ");
+    // Leave out what the library already has.
+    let have: std::collections::HashSet<(String, String)> = crate::search::current()
+        .map(|index| index.library.albums.iter().map(|album| (name(&album.title), name(&album.subtitle))).collect())
+        .unwrap_or_default();
+    let offers: Vec<crate::lidarr::Offer> = lidarr
+        .find_albums(query)
+        .ok()?
+        .into_iter()
+        .filter(|offer| !have.contains(&(name(&offer.title), name(&offer.artist))))
+        .take(12)
+        .collect();
+    if offers.is_empty() {
+        return None;
+    }
+    crate::lidarr::remember(&offers);
+    let mut page = page.clone();
+    page.empty.clear();
+    page.shelves.push(ShelfData {
+        title: "Not in your library".into(),
+        route: String::new(),
+        wrap: false,
+        cards: offers.iter().map(request_card).collect(),
+    });
+    Some(page)
+}
+
+pub fn request_card(offer: &crate::lidarr::Offer) -> CardData {
+    CardData {
+        kind: Kind::Request,
+        id: offer.album.clone(),
+        title: offer.title.clone(),
+        subtitle: match (offer.requested, offer.year.is_empty()) {
+            (true, _) => format!("{} • Requested", offer.artist),
+            (false, true) => offer.artist.clone(),
+            (false, false) => format!("{} • {}", offer.artist, offer.year),
+        },
+        cover: offer.cover.clone(),
+    }
+}
+
+/// The albums that have been asked for and haven't arrived yet.
+fn requests() -> PageData {
+    let title = "Requests".to_string();
+    let Some(lidarr) = crate::lidarr::current() else {
+        return PageData { title, empty: "Requests are switched off. Turn them on in Settings.".into(), ..Default::default() };
+    };
+    match lidarr.pending() {
+        Err(reason) => PageData { title, empty: reason, ..Default::default() },
+        Ok(pending) if pending.is_empty() => PageData {
+            title,
+            empty: "Nothing is on its way. Search for an album and pick it under “Not in your library”.".into(),
+            ..Default::default()
+        },
+        Ok(pending) => PageData {
+            title,
+            tracks_title: format!("On their way ({})", pending.len()),
+            request_ids: pending.iter().map(|album| album.id).collect(),
+            // Rows that name an album, not songs that can be played.
+            songs: pending
+                .into_iter()
+                .map(|album| Song {
+                    title: album.title,
+                    artist: match album.progress {
+                        Some(done) => format!("{} • Downloading, {done}%", album.artist),
+                        None => format!("{} • Being looked for", album.artist),
+                    },
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        },
+    }
 }
 
 /// The page for one of the "Made for you" mixes.
