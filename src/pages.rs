@@ -198,11 +198,12 @@ pub fn load(client: &Client, route: &Route) -> ApiResult<PageData> {
         Route::Artist(id) => artist(client, id),
         Route::Playlist(id) => playlist(client, id),
         Route::Liked => liked(client),
+        Route::Radio => radio(client),
         Route::Albums(sort) => albums(client, *sort),
         Route::Artists => artists(client),
         Route::Genres => genres(client),
         Route::Genre(name) => genre(client, name),
-        Route::Settings | Route::Lyrics => Ok(PageData::default()),
+        Route::Settings | Route::Lyrics | Route::Downloads => Ok(PageData::default()),
     }
 }
 
@@ -428,6 +429,21 @@ fn liked(client: &Client) -> ApiResult<PageData> {
         show_number: true,
         empty: "Songs you like show up here. Click the heart next to any song to save it.".into(),
         context: "Liked songs".into(),
+        songs,
+        ..Default::default()
+    })
+}
+
+fn radio(client: &Client) -> ApiResult<PageData> {
+    let songs = client.radio_stations()?;
+    Ok(PageData {
+        label: "Live streams".into(),
+        title: "Radio".into(),
+        meta: count(songs.len() as u32, "station"),
+        can_play: !songs.is_empty(),
+        show_number: true,
+        empty: "No stations yet. Add them in Navidrome's web interface, under Radios, and they'll appear here.".into(),
+        context: "Radio".into(),
         songs,
         ..Default::default()
     })

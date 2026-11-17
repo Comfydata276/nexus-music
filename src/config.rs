@@ -14,20 +14,30 @@ pub struct Paths {
     pub covers: PathBuf,
     pub pages: PathBuf,
     pub buffers: PathBuf,
+    /// Songs saved for listening without the server.
+    pub downloads: PathBuf,
     #[cfg(not(windows))]
     secret: PathBuf,
 }
 
 impl Paths {
     pub fn new() -> Paths {
-        let (config, cache) = match directories::ProjectDirs::from("", "", "Nexus Music") {
-            Some(dirs) => (dirs.config_dir().to_path_buf(), dirs.cache_dir().to_path_buf()),
-            None => (PathBuf::from("."), std::env::temp_dir().join("nexus-music")),
+        let (config, cache, data) = match directories::ProjectDirs::from("", "", "Nexus Music") {
+            Some(dirs) => (
+                dirs.config_dir().to_path_buf(),
+                dirs.cache_dir().to_path_buf(),
+                dirs.data_local_dir().to_path_buf(),
+            ),
+            None => (PathBuf::from("."), std::env::temp_dir().join("nexus-music"), PathBuf::from(".")),
         };
         // An override so tests and second profiles don't touch the real one.
-        let (config, cache) = match std::env::var_os("NEXUS_MUSIC_HOME") {
-            Some(home) => (PathBuf::from(&home).join("config"), PathBuf::from(&home).join("cache")),
-            None => (config, cache),
+        let (config, cache, data) = match std::env::var_os("NEXUS_MUSIC_HOME") {
+            Some(home) => (
+                PathBuf::from(&home).join("config"),
+                PathBuf::from(&home).join("cache"),
+                PathBuf::from(&home).join("data"),
+            ),
+            None => (config, cache, data),
         };
         let paths = Paths {
             settings: config.join("settings.json"),
@@ -36,6 +46,7 @@ impl Paths {
             covers: cache.join("covers"),
             pages: cache.join("pages"),
             buffers: cache.join("buffers"),
+            downloads: data.join("downloads"),
             #[cfg(not(windows))]
             secret: config.join("credential"),
         };
@@ -73,6 +84,11 @@ pub struct Settings {
     pub equalizer: bool,
     /// Gain in dB for each equaliser band.
     pub eq_gains: [f32; 6],
+    /// The device to play through (a cpal device id); empty follows the system default.
+    pub output_device: String,
+    pub output_device_name: String,
+    /// Take the device for this app alone and play each song at its own sample rate.
+    pub exclusive: bool,
     /// Closing the window leaves the app running in the notification area.
     pub close_to_tray: bool,
     pub check_updates: bool,
@@ -100,6 +116,9 @@ impl Default for Settings {
             mono: false,
             equalizer: false,
             eq_gains: [0.0; 6],
+            output_device: String::new(),
+            output_device_name: String::new(),
+            exclusive: false,
             close_to_tray: true,
             check_updates: true,
             update_notified: String::new(),

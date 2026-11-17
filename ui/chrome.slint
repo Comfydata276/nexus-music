@@ -198,6 +198,20 @@ export component Sidebar inherits Rectangle {
             clicked => { App.navigate("liked"); }
         }
 
+        NavItem {
+            icon: Icons.radio;
+            text: "Radio";
+            selected: App.route == "radio";
+            clicked => { App.navigate("radio"); }
+        }
+
+        NavItem {
+            icon: Icons.download;
+            text: App.download-status == "" ? "Downloads" : App.download-status;
+            selected: App.route == "downloads";
+            clicked => { App.navigate("downloads"); }
+        }
+
         Rectangle {
             height: 17px;
             Rectangle {
@@ -550,12 +564,26 @@ component QueueRow inherits Rectangle {
                     overflow: elide;
                 }
 
-                LinkText {
-                    text: root.track.artist;
-                    font-size: 13px;
-                    enabled: root.track.artist-id != "";
-                    clicked => {
-                        View.card-activated({ kind: CardKind.artist, id: root.track.artist-id, title: root.track.artist });
+                HorizontalLayout {
+                    spacing: 6px;
+                    alignment: start;
+
+                    if root.track.downloaded: VerticalLayout {
+                        alignment: center;
+                        Icon {
+                            source: Icons.circle-arrow-down;
+                            size: 13px;
+                            tint: Theme.accent-bright;
+                        }
+                    }
+
+                    LinkText {
+                        text: root.track.artist;
+                        font-size: 13px;
+                        enabled: root.track.artist-id != "";
+                        clicked => {
+                            View.card-activated({ kind: CardKind.artist, id: root.track.artist-id, title: root.track.artist });
+                        }
                     }
                 }
             }
@@ -1001,7 +1029,8 @@ export component PlayerBar inherits Rectangle {
 
                 Text {
                     width: 44px;
-                    text: Player.has-track ? Player.clock(Player.duration) : "";
+                    // A radio station has no length.
+                    text: !Player.has-track ? "" : Player.duration > 0 ? Player.clock(Player.duration) : "Live";
                     color: Theme.muted;
                     font-size: 12px;
                     vertical-alignment: center;
@@ -1019,6 +1048,17 @@ export component PlayerBar inherits Rectangle {
         HorizontalLayout {
             alignment: end;
             spacing: 2px;
+
+            VerticalLayout {
+                alignment: center;
+                sleep := IconButton {
+                    icon: Icons.moon;
+                    icon-size: 17px;
+                    active: Player.sleep != "";
+                    label: Player.sleep != "" ? Player.sleep : "Sleep timer";
+                    clicked => { Player.choose-sleep(sleep.absolute-position.x - 60px, sleep.absolute-position.y - 8px); }
+                }
+            }
 
             VerticalLayout {
                 alignment: center;
@@ -1063,7 +1103,7 @@ export component PlayerBar inherits Rectangle {
             VerticalLayout {
                 alignment: center;
                 Slider {
-                    width: clamp(root.side - 150px, 60px, 110px);
+                    width: clamp(root.side - 184px, 60px, 110px);
                     value: Player.muted ? 0 : Player.volume;
                     label: "Volume";
                     moved(value) => { Player.set-volume(value); }

@@ -3,6 +3,7 @@
 
 use std::collections::HashSet;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use slint::{ComponentHandle, Model, ModelRc, VecModel};
 
@@ -22,7 +23,7 @@ const HISTORY_LENGTH: usize = 100;
 /// whether the server reports a bit depth, which lossy formats don't have.)
 const LOSSLESS_SUFFIXES: [&str; 4] = ["flac", "wav", "aiff", "aif"];
 /// File types the built-in decoders handle; anything else is converted by the server.
-const NATIVE_SUFFIXES: [&str; 12] =
+pub const NATIVE_SUFFIXES: [&str; 12] =
     ["mp3", "flac", "m4a", "aac", "ogg", "oga", "wav", "aiff", "aif", "mka", "caf", "mp4"];
 
 pub struct Playback {
@@ -198,9 +199,41 @@ impl Controller {
         let cap = settings.max_bitrate();
         let gain = level_gain(&settings, song);
         let duration_secs = song.duration as f64;
+        if !song.radio_url.is_empty() {
+            // A live stream: no length, no seeking, and nothing to normalise against.
+            let address = song.radio_url.to_lowercase();
+            let suffix = ["aac", "ogg", "flac"].into_iter().find(|ext| address.contains(ext)).unwrap_or("mp3");
+            return TrackRequest {
+                token,
+                local: None,
+                url: song.radio_url.clone(),
+                ranged: false,
+                suffix: suffix.into(),
+                gain: 1.0,
+                start_secs: 0.0,
+                base_secs: 0.0,
+                duration_secs: 0.0,
+            };
+        }
+        if let Some(path) = self.downloads.borrow().path_of(&song.id) {
+            // A downloaded copy plays from disk, whatever the streaming quality is set to.
+            let suffix = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+            return TrackRequest {
+                token,
+                local: Some(path),
+                url: String::new(),
+                ranged: true,
+                suffix,
+                gain,
+                start_secs: at,
+                base_secs: 0.0,
+                duration_secs,
+            };
+        }
         if native && cap == 0 {
             TrackRequest {
                 token,
+                local: None,
                 url: client.stream_url(&song.id, 0, 0),
                 ranged: true,
                 suffix,
@@ -214,6 +247,7 @@ impl Controller {
             let offset = at.floor().max(0.0);
             TrackRequest {
                 token,
+                local: None,
                 url: client.stream_url(&song.id, if cap == 0 { 320 } else { cap }, offset as u32),
                 ranged: false,
                 suffix: "mp3".into(),
@@ -282,8 +316,7 @@ impl Controller {
         }
     }
 
-    /// Used by the media keys, which only exist on Windows.
-    #[cfg_attr(not(windows), allow(dead_code))]
+    /// Used by the media keys and the sleep timer.
     pub fn set_playing(self: &Rc<Self>, playing: bool) {
         if self.playback.borrow().playing != playing {
             self.toggle_play();
@@ -329,6 +362,10 @@ impl Controller {
         let (loaded, transcoded, token, duration) = {
             let mut pb = self.playback.borrow_mut();
             let Some(duration) = pb.current().map(|s| s.duration as f64) else { return };
+            if pb.current().is_some_and(|s| !s.radio_url.is_empty()) {
+                // A live stream has no earlier or later to go to.
+                return;
+            }
             let seconds = seconds.clamp(0.0, (duration - 1.0).max(0.0));
             pb.position = seconds;
             pb.last_tick = seconds;
@@ -516,11 +553,13 @@ impl Controller {
                         pb.last_tick = 0.0;
                         pb.scrobbled = false;
                         let cap = self.settings.borrow().max_bitrate();
-                        pb.transcoded = cap != 0
-                            || pb.current().is_some_and(|s| {
-                                !NATIVE_SUFFIXES.contains(&s.suffix.to_lowercase().as_str())
-                                    || pb.needs_transcode.contains(&s.id)
-                            });
+                        let downloads = self.downloads.borrow();
+                        pb.transcoded = pb.current().is_some_and(|s| {
+                            !downloads.has(&s.id)
+                                && (cap != 0
+                                    || !NATIVE_SUFFIXES.contains(&s.suffix.to_lowercase().as_str())
+                                    || pb.needs_transcode.contains(&s.id))
+                        });
                         true
                     } else if token == pb.current_token {
                         false
@@ -541,12 +580,22 @@ impl Controller {
                     if pb.current_token == 0 {
                         return;
                     }
+                    // The sleep timer asked to stop here: line up what's next, paused.
+                    if self.sleep_after_song.replace(false) {
+                        pb.cursor = pb.following().unwrap_or(pb.cursor);
+                        pb.playing = false;
+                        drop(pb);
+                        self.sync_sleep();
+                        self.toast("Sleep timer: paused");
+                        return self.start_current(0.0);
+                    }
+                    let radio = pb.current().is_some_and(|s| !s.radio_url.is_empty());
                     match pb.following() {
                         Some(cursor) => {
                             pb.cursor = cursor;
                             true
                         }
-                        None if self.settings.borrow().autoplay => {
+                        None if self.settings.borrow().autoplay && !radio => {
                             // Similar songs are on their way (or about to be asked for);
                             // carry on with them when they land.
                             pb.autoplay_resume = true;
@@ -572,6 +621,11 @@ impl Controller {
                     self.track_changed();
                 }
             }
+            Event::Output { status, exclusive } => {
+                self.ui.global::<ui::Settings>().set_output_status(status.into());
+                self.output_exclusive.set(exclusive);
+                self.show_format();
+            }
             Event::Failed { token, message, unsupported } => {
                 let (retry, title, position, give_up) = {
                     let mut pb = self.playback.borrow_mut();
@@ -579,6 +633,13 @@ impl Controller {
                         return;
                     }
                     let Some(song) = pb.current().cloned() else { return };
+                    // A downloaded copy that won't play is discarded, and the song streamed.
+                    if self.downloads.borrow().has(&song.id) {
+                        let position = pb.position;
+                        drop(pb);
+                        self.remove_downloads(std::slice::from_ref(&song.id));
+                        return self.start_current(position);
+                    }
                     // First try having the server convert a file we can't decode.
                     let retry = unsupported && pb.needs_transcode.insert(song.id.clone());
                     if !retry {
@@ -609,6 +670,7 @@ impl Controller {
     /// Runs four times a second: moves the progress bar, counts listening time, queues up the
     /// next track and follows the lyrics.
     pub fn tick(self: &Rc<Self>) {
+        self.check_sleep();
         let Some((token, seconds)) = self.engine.position() else { return };
         let lookahead;
         let (arm, submit, checkpoint) = {
@@ -626,7 +688,7 @@ impl Controller {
             pb.last_tick = seconds;
             // A play counts after half the track or four minutes, whichever comes first.
             let threshold = if duration > 0.0 { (duration / 2.0).min(240.0) } else { 240.0 };
-            let submit = (!pb.scrobbled && pb.listened >= threshold).then(|| {
+            let submit = (!pb.scrobbled && pb.listened >= threshold && song.radio_url.is_empty()).then(|| {
                 pb.scrobbled = true;
                 song.id.clone()
             });
@@ -637,7 +699,12 @@ impl Controller {
             };
             // With gapless and crossfade both off, the next track simply loads when this one
             // has finished, which leaves a short natural pause.
-            let arm = pb.next_token == 0 && near_end && seamless && pb.following().is_some();
+            // (Nor does it run on when the sleep timer is waiting for this song to end.)
+            let arm = pb.next_token == 0
+                && near_end
+                && seamless
+                && pb.following().is_some()
+                && !self.sleep_after_song.get();
             lookahead = near_end
                 && autoplay
                 && pb.following().is_none()
@@ -678,7 +745,8 @@ impl Controller {
         if !self.settings.borrow().scrobble {
             return;
         }
-        if let Some(id) = self.playback.borrow().current().map(|s| s.id.clone()) {
+        let id = self.playback.borrow().current().filter(|s| s.radio_url.is_empty()).map(|s| s.id.clone());
+        if let Some(id) = id {
             self.request(move |client| client.scrobble(&id, false), |_, _| {});
         }
     }
@@ -766,11 +834,58 @@ impl Controller {
         }
     }
 
+    // ---- sleep timer ---------------------------------------------------------------------------
+
+    /// Sets the sleep timer: a number of minutes, 0 for off, or `None` for "when this song ends".
+    pub fn set_sleep(self: &Rc<Self>, minutes: Option<u32>) {
+        self.sleep_after_song.set(minutes.is_none());
+        self.sleep_at.set(
+            minutes.filter(|m| *m > 0).map(|m| Instant::now() + Duration::from_secs(m as u64 * 60)),
+        );
+        if minutes.is_none() {
+            // Don't let the engine run on into the next song.
+            self.next_changed();
+        }
+        self.sync_sleep();
+        self.toast(match minutes {
+            None => "Music will pause when this song ends".to_string(),
+            Some(0) => "Sleep timer off".to_string(),
+            Some(m) => format!("Music will pause in {m} minutes"),
+        });
+    }
+
+    fn check_sleep(self: &Rc<Self>) {
+        let Some(at) = self.sleep_at.get() else { return };
+        if Instant::now() >= at {
+            self.sleep_at.set(None);
+            self.set_playing(false);
+            self.toast("Sleep timer: paused");
+        }
+        self.sync_sleep();
+    }
+
+    /// Shows how long the sleep timer has left.
+    pub fn sync_sleep(&self) {
+        let label = match (self.sleep_at.get(), self.sleep_after_song.get()) {
+            (Some(at), _) => {
+                let left = at.saturating_duration_since(Instant::now()).as_secs();
+                format!("Sleep timer: {} min left", left.div_ceil(60).max(1))
+            }
+            (None, true) => "Sleep timer: pausing after this song".to_string(),
+            (None, false) => String::new(),
+        };
+        let player = self.ui.global::<ui::Player>();
+        if player.get_sleep() != label.as_str() {
+            player.set_sleep(label.into());
+        }
+    }
+
     // ---- audio settings ------------------------------------------------------------------------
 
     /// Pushes the sound settings to the engine. They take effect on what's playing.
     pub fn apply_audio_settings(&self) {
         let settings = self.settings.borrow();
+        self.engine.set_output(&settings.output_device, settings.exclusive);
         self.engine.set_crossfade(settings.crossfade);
         self.engine.set_mono(settings.mono);
         self.engine.set_equalizer(settings.equalizer, settings.eq_gains);
@@ -793,6 +908,12 @@ impl Controller {
     /// server is converting it, what it's converted to.
     pub fn show_format(&self) {
         let text = match self.playback.borrow().current() {
+            Some(song) if !song.radio_url.is_empty() => {
+                let player = self.ui.global::<ui::Player>();
+                player.set_format("Live stream".into());
+                player.set_lossless(false);
+                format!("“{}” is a live stream, played as the station sends it.", song.title)
+            }
             Some(song) => {
                 let mut parts = vec![song.suffix.to_uppercase()];
                 if song.sampling_rate > 0 {
@@ -806,10 +927,13 @@ impl Controller {
                     parts.push(format!("{} kbps", song.bit_rate));
                 }
                 let source = parts.join(", ");
-                let cap = self.settings.borrow().max_bitrate();
+                // A downloaded copy plays as saved: the original, or MP3 for formats the app
+                // can't decode.
+                let saved = self.downloads.borrow().path_of(&song.id);
+                let cap = if saved.is_some() { 0 } else { self.settings.borrow().max_bitrate() };
                 let suffix = song.suffix.to_lowercase();
                 let native = NATIVE_SUFFIXES.contains(&suffix.as_str())
-                    && !self.playback.borrow().needs_transcode.contains(&song.id);
+                    && (saved.is_some() || !self.playback.borrow().needs_transcode.contains(&song.id));
                 let title = &song.title;
                 // The short form shown under the song in the player bar.
                 let as_stored = native && (cap == 0 || (suffix == "mp3" && song.bit_rate <= cap));
@@ -826,6 +950,8 @@ impl Controller {
                 } else {
                     format!("MP3 · {} kbps", if cap == 0 { 320 } else { cap })
                 };
+                // Exclusive output of an untouched lossless file is what reaches the DAC.
+                let label = if self.output_exclusive.get() { format!("{label} · Exclusive") } else { label };
                 let player = self.ui.global::<ui::Player>();
                 player.set_format(label.into());
                 player.set_lossless(lossless);
@@ -1156,6 +1282,9 @@ impl Controller {
                 let to = (index + delta).max(0) as usize;
                 ctl.move_upcoming(index.max(0) as usize, to);
             });
+        });
+        player.on_choose_sleep(|x, y| {
+            with(|ctl| ctl.open_sleep_menu(x, y));
         });
         player.on_history_activated(|index| {
             with(|ctl| ctl.play_history(index as usize));

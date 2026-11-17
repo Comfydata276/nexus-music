@@ -245,6 +245,21 @@ component ActionBar inherits Rectangle {
             }
         }
 
+        if View.can-download: VerticalLayout {
+            alignment: center;
+            IconButton {
+                width: 40px;
+                height: 40px;
+                icon: View.download-state == 2 ? Icons.circle-arrow-down : Icons.download;
+                icon-size: 22px;
+                active: View.download-state == 2;
+                opacity: View.download-state == 1 ? 0.5 : 1;
+                enabled: View.download-state != 1;
+                label: View.download-state == 2 ? "Remove from downloads" : View.download-state == 1 ? "Downloading" : "Download";
+                clicked => { View.download(); }
+            }
+        }
+
         if View.has-menu: VerticalLayout {
             alignment: center;
             more := IconButton {
@@ -1230,6 +1245,30 @@ export component SettingsPage inherits Rectangle {
                     }
 
                     SettingGroup {
+                        title: "Output";
+
+                        SettingRow {
+                            title: "Play through";
+                            detail: Settings.output-status;
+                            device := TextButton {
+                                text: Settings.output-device;
+                                max-width: 280px;
+                                clicked => { Settings.choose-device(device.absolute-position.x, device.absolute-position.y + device.height + 4px); }
+                            }
+                        }
+
+                        SettingRow {
+                            title: "Exclusive mode";
+                            detail: "Gives Nexus Music the device to itself and plays each song at its own sample rate, so nothing is resampled or mixed on the way out. Other apps are silent while music plays. For bit-perfect output, also keep the volume at full and leave the equaliser and volume levelling off.";
+                            Toggle {
+                                on: Settings.exclusive;
+                                label: "Exclusive mode";
+                                toggled(on) => { Settings.set-exclusive(on); }
+                            }
+                        }
+                    }
+
+                    SettingGroup {
                         title: "Playback";
 
                         SettingRow {
@@ -1360,6 +1399,15 @@ export component SettingsPage inherits Rectangle {
 
                     SettingGroup {
                         title: "Storage";
+
+                        SettingRow {
+                            title: "Downloads";
+                            detail: Settings.downloads-summary + ". Songs saved on this PC play without the server, and from disk even when it's reachable.";
+                            TextButton {
+                                text: "Remove all";
+                                clicked => { Settings.remove-downloads(); }
+                            }
+                        }
 
                         SettingRow {
                             title: "Cache";

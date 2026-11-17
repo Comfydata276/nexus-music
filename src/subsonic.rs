@@ -76,7 +76,11 @@ pub struct Song {
     pub bit_depth: u32,
     pub genre: String,
     pub starred: Option<String>,
+    /// The user's star rating, 1 to 5; 0 when unrated.
+    pub user_rating: u8,
     pub replay_gain: Option<ReplayGain>,
+    /// Set (by this app, not the server) on entries that stand for an internet radio station.
+    pub radio_url: String,
 }
 
 impl Song {
@@ -722,6 +726,54 @@ impl Client {
         self.call::<serde_json::Value>(endpoint, &[(kind, id)], None).map(drop)
     }
 
+    /// Rates a song from 1 to 5 stars; 0 removes the rating.
+    pub fn set_rating(&self, id: &str, rating: u8) -> ApiResult<()> {
+        let rating = rating.min(5).to_string();
+        self.call::<serde_json::Value>("setRating", &[("id", id), ("rating", &rating)], None).map(drop)
+    }
+
+    /// The internet radio stations set up on the server, as playable entries.
+    pub fn radio_stations(&self) -> ApiResult<Vec<Song>> {
+        #[derive(Deserialize, Default)]
+        #[serde(rename_all = "camelCase", default)]
+        struct Station {
+            id: String,
+            name: String,
+            stream_url: String,
+            home_page_url: String,
+        }
+        #[derive(Deserialize, Default)]
+        #[serde(rename_all = "camelCase", default)]
+        struct Stations {
+            internet_radio_station: Vec<Station>,
+        }
+        let stations: Stations = self.call("getInternetRadioStations", &[], Some("internetRadioStations"))?;
+        Ok(stations
+            .internet_radio_station
+            .into_iter()
+            .filter(|station| !station.stream_url.is_empty())
+            .map(|station| {
+                // Shown where a song's artist would be: the station's site, without the clutter.
+                let site = station
+                    .home_page_url
+                    .trim_start_matches("https://")
+                    .trim_start_matches("http://")
+                    .trim_start_matches("www.")
+                    .trim_end_matches('/')
+                    .to_string();
+                Song {
+                    id: format!("radio:{}", station.id),
+                    title: station.name,
+                    artist: if site.is_empty() { "Internet radio".into() } else { site },
+                    album: "Internet radio".into(),
+                    radio_url: station.stream_url,
+                    suffix: "mp3".into(),
+                    ..Default::default()
+                }
+            })
+            .collect())
+    }
+
     pub fn search(&self, query: &str, artists: u32, albums: u32, songs: u32) -> ApiResult<Found> {
         let (a, b, c) = (artists.to_string(), albums.to_string(), songs.to_string());
         self.call(
@@ -772,6 +824,17 @@ impl Client {
         url: &str,
         range: Option<(u64, Option<u64>)>,
     ) -> ApiResult<(Box<dyn Read + Send>, Option<u64>)> {
+        self.open_stream_following(url, range, 3)
+    }
+
+    /// `hops` is how many playlist files may be followed before giving up: radio stations
+    /// often publish a small playlist that points at the real stream.
+    fn open_stream_following(
+        &self,
+        url: &str,
+        range: Option<(u64, Option<u64>)>,
+        hops: u8,
+    ) -> ApiResult<(Box<dyn Read + Send>, Option<u64>)> {
         let mut request = self.inner.agent.get(url);
         if let Some((start, end)) = range {
             let value = match end {
@@ -797,9 +860,45 @@ impl Client {
             // Subsonic reports stream errors as a JSON body with HTTP 200.
             return Err(ApiError::Server { code: 70, message: "stream unavailable".into() });
         }
+        let kind = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_lowercase();
+        if range.is_none() && (kind.contains("mpegurl") || kind.contains("scpls") || kind.contains("pls+xml")) {
+            let mut response = response;
+            let text = response
+                .body_mut()
+                .with_config()
+                .limit(256 * 1024)
+                .read_to_string()
+                .map_err(|e| ApiError::Network(e.to_string()))?;
+            return match (stream_in_playlist(&text), hops) {
+                (Some(target), 1..) => self.open_stream_following(&target, None, hops - 1),
+                _ => Err(ApiError::Network("That station's playlist has no stream this app can play.".into())),
+            };
+        }
         let length = response.body().content_length();
         Ok((Box::new(response.into_body().into_reader()), length))
     }
+}
+
+/// The first stream address in an M3U or PLS playlist. (HLS playlists, which list short
+/// segments instead of one continuous stream, aren't supported.)
+fn stream_in_playlist(text: &str) -> Option<String> {
+    if text.contains("#EXT-X-TARGETDURATION") {
+        return None;
+    }
+    text.lines()
+        .map(str::trim)
+        .filter_map(|line| match line.split_once('=') {
+            // PLS: "File1=http://..."
+            Some((key, value)) if key.to_lowercase().starts_with("file") => Some(value.trim()),
+            _ => Some(line),
+        })
+        .find(|line| line.starts_with("http://") || line.starts_with("https://"))
+        .map(str::to_string)
 }
 
 fn network_hint(err: &ureq::Error) -> String {
@@ -831,6 +930,16 @@ mod tests {
             "http://tower:4533"
         );
         assert_eq!(normalize_server_url("http://tower/music/"), "http://tower/music");
+    }
+
+    #[test]
+    fn finds_the_stream_in_station_playlists() {
+        let m3u = "#EXTM3U\n#EXTINF:-1,Some Station\nhttp://example.org/live.mp3\n";
+        assert_eq!(stream_in_playlist(m3u).as_deref(), Some("http://example.org/live.mp3"));
+        let pls = "[playlist]\nNumberOfEntries=1\nFile1=https://example.org/stream\nTitle1=Some Station\n";
+        assert_eq!(stream_in_playlist(pls).as_deref(), Some("https://example.org/stream"));
+        assert_eq!(stream_in_playlist("#EXTM3U\n#EXT-X-TARGETDURATION:6\nhttp://x/seg1.ts\n"), None);
+        assert_eq!(stream_in_playlist("nothing here"), None);
     }
 
     #[test]

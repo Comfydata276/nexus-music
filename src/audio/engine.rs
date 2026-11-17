@@ -27,6 +27,9 @@ use super::dsp::{Controls, EQ_BANDS, Effects, soft_clip};
 use super::source::Download;
 use crate::subsonic::Client;
 
+/// How long after pausing an exclusive device is handed back for other apps to use.
+#[cfg(windows)]
+const EXCLUSIVE_RELEASE_AFTER: Duration = Duration::from_secs(3);
 /// How much decoded audio is kept ahead of the device, in seconds.
 const RING_SECONDS: f64 = 1.0;
 /// Seconds of pause after which the device stream is suspended so Windows can sleep.
@@ -36,6 +39,8 @@ const SUSPEND_AFTER: Duration = Duration::from_secs(20);
 pub struct TrackRequest {
     /// Identifies this load in events and position reports. Never 0.
     pub token: u64,
+    /// A downloaded copy to play instead of streaming.
+    pub local: Option<PathBuf>,
     pub url: String,
     /// True when the server sends the original file, which supports byte ranges.
     pub ranged: bool,
@@ -58,6 +63,8 @@ pub enum Event {
     /// Everything queued in the engine has finished playing.
     Finished,
     Failed { token: u64, message: String, unsupported: bool },
+    /// The output device was (re)opened: how it's being driven, in words.
+    Output { status: String, exclusive: bool },
 }
 
 struct Segment {
@@ -98,7 +105,17 @@ impl Ring {
     }
 }
 
-struct Shared {
+/// Which device to play through, and how.
+#[derive(Clone, Default, PartialEq)]
+struct OutputChoice {
+    /// A cpal device id; empty for the system's default device.
+    device: String,
+    /// Take the device for this app alone and feed it each song at its own sample rate.
+    exclusive: bool,
+}
+
+pub(super) struct Shared {
+    choice: Mutex<OutputChoice>,
     ring: Mutex<Ring>,
     playing: AtomicBool,
     volume: AtomicU32,
@@ -106,7 +123,7 @@ struct Shared {
     /// Token of the track the decoder is currently reading; 0 when idle.
     decoding: AtomicU64,
     /// Set by the device error callback when the stream must be rebuilt.
-    rebuild: AtomicBool,
+    pub(super) rebuild: AtomicBool,
     /// Seconds of overlap between one track and the next; 0 for none.
     crossfade: AtomicU32,
     effects: Controls,
@@ -145,8 +162,12 @@ struct Deck {
     duration: f64,
     /// Track time decoded so far.
     time: f64,
+    /// The file's own sample rate and bit depth; 0 when it doesn't say.
+    rate: u32,
+    bits: u32,
     // Declared last so the reader inside `format` is dropped before the file is deleted.
-    _download: Download,
+    // `None` for a downloaded copy, which is read straight from disk.
+    _download: Option<Download>,
 }
 
 pub struct Engine {
@@ -157,6 +178,7 @@ pub struct Engine {
 impl Engine {
     pub fn new(buffer_dir: PathBuf, on_event: impl Fn(Event) + Send + 'static) -> Engine {
         let shared = Arc::new(Shared {
+            choice: Mutex::new(OutputChoice::default()),
             ring: Mutex::new(Ring {
                 buf: VecDeque::new(),
                 capacity_frames: 48_000,
@@ -198,6 +220,8 @@ impl Engine {
             capturing_tail: false,
             fade: None,
             out: Vec::new(),
+            opened_for: 0,
+            rate_switch: false,
         };
         std::thread::Builder::new()
             .name("audio-engine".into())
@@ -227,6 +251,19 @@ impl Engine {
     pub fn set_playing(&self, playing: bool) {
         self.shared.playing.store(playing, Ordering::Relaxed);
         let _ = self.tx.send(Cmd::Wake);
+    }
+
+    /// Chooses the output device (a cpal device id, or empty for the system default) and
+    /// whether to take it for exclusive use.
+    pub fn set_output(&self, device: &str, exclusive: bool) {
+        let choice = OutputChoice { device: device.to_string(), exclusive };
+        let mut current = self.shared.choice.lock().unwrap();
+        if *current != choice {
+            *current = choice;
+            drop(current);
+            self.shared.rebuild.store(true, Ordering::Relaxed);
+            let _ = self.tx.send(Cmd::Wake);
+        }
     }
 
     /// Linear output gain, 0.0 to 1.0.
@@ -263,8 +300,24 @@ impl Engine {
     }
 }
 
+/// The output devices on this PC: (id, name).
+pub fn output_devices() -> Vec<(String, String)> {
+    let host = cpal::default_host();
+    let Ok(devices) = host.output_devices() else { return Vec::new() };
+    devices
+        .filter_map(|device| {
+            let id = device.id().ok()?.to_string();
+            let name = device.description().ok()?.name().to_string();
+            Some((id, name))
+        })
+        .collect()
+}
+
 enum Output {
     Device(cpal::Stream),
+    /// The device is ours alone, running at the song's sample rate.
+    #[cfg(windows)]
+    Exclusive(#[allow(dead_code)] super::exclusive::ExclusiveStream),
     /// No usable device: a thread consumes audio at real-time speed so playback still advances.
     Null(Arc<AtomicBool>),
 }
@@ -317,6 +370,11 @@ struct Worker {
     fade: Option<Fade>,
     /// Scratch space for audio on its way out of the decoder.
     out: Vec<f32>,
+    /// The song sample rate the output was last opened for (exclusive mode follows the song).
+    opened_for: u32,
+    /// The next track needs the device at a different rate: wait for the current one to
+    /// play out, then reopen.
+    rate_switch: bool,
 }
 
 struct Fade {
@@ -334,7 +392,8 @@ fn trace(what: &str, since: Instant) {
 
 impl Worker {
     fn run(mut self) {
-        self.open_output();
+        // The device is opened when the first track loads, by which time the settings have
+        // said which device to use and how.
         loop {
             let busy = self.current.is_some() && (!self.ended || !self.pending.is_empty());
             let can_decode = busy && self.flush_pending();
@@ -383,9 +442,10 @@ impl Worker {
                 self.reset();
                 self.load_token = request.token;
                 self.load_started = Some(Instant::now());
-                if matches!(self.output, Some(Output::Null(_)))
-                    && self.last_device_retry.elapsed() > Duration::from_secs(3)
-                {
+                let retry = matches!(self.output, Some(Output::Null(_)))
+                    && self.last_device_retry.elapsed() > Duration::from_secs(3);
+                // In exclusive mode the device is opened once the track's format is known.
+                if (self.output.is_none() || retry) && !self.exclusive_wanted() {
                     self.open_output();
                 }
                 self.spawn_open(client, request, Slot::Current);
@@ -406,6 +466,9 @@ impl Worker {
                     Ok(deck) => {
                         if let Some(since) = self.load_started {
                             trace("track opened", since);
+                        }
+                        if self.exclusive_wanted() && (self.output.is_none() || self.wrong_rate_for(&deck)) {
+                            self.open_output_for(Some((deck.rate, deck.bits)));
                         }
                         let mut ring = self.shared.ring.lock().unwrap();
                         ring.clear();
@@ -432,9 +495,18 @@ impl Worker {
                 }
                 match result {
                     Ok(deck) => {
+                        let switch = self.exclusive_wanted() && self.wrong_rate_for(&deck);
                         self.next = Some(deck);
                         if self.ended && self.current.is_some() {
-                            self.promote_next();
+                            if switch {
+                                // Can't run straight on at a different rate: let the ending
+                                // play out first (see `housekeeping`).
+                                self.drain_resampler();
+                                self.release_tail();
+                                self.rate_switch = true;
+                            } else {
+                                self.promote_next();
+                            }
                         }
                     }
                     Err(_) => {
@@ -463,6 +535,7 @@ impl Worker {
         self.announced = 0;
         self.pending.clear();
         self.resampler = None;
+        self.rate_switch = false;
         self.clear_fade();
         self.shared.decoding.store(0, Ordering::Relaxed);
         self.shared.ring.lock().unwrap().clear();
@@ -519,7 +592,17 @@ impl Worker {
     fn housekeeping(&mut self) {
         if self.shared.rebuild.swap(false, Ordering::Relaxed) {
             let position = self.audible_position();
-            self.open_output();
+            let format = self.current.as_ref().map(|deck| (deck.rate, deck.bits));
+            if self.current.is_none() && self.exclusive_wanted() {
+                // Nothing to play: leave the device free for other apps until there is.
+                self.output = None;
+                self.emit(Event::Output {
+                    status: "Exclusive mode is on. The device is taken while a song plays.".into(),
+                    exclusive: false,
+                });
+            } else {
+                self.open_output_for(format);
+            }
             // Buffered audio was produced for the old device's sample rate.
             if let Some((token, secs)) = position {
                 if self.current.as_ref().is_some_and(|d| d.token == token) {
@@ -538,8 +621,19 @@ impl Worker {
                 }
                 self.suspended = false;
             }
+            if self.output.is_none() {
+                // The device was handed back while paused: take it again, at the same rate so
+                // the audio already buffered still fits.
+                let format = self.current.as_ref().map(|deck| (deck.rate, deck.bits));
+                self.open_output_for(format);
+            }
         } else {
             let since = *self.paused_since.get_or_insert_with(Instant::now);
+            #[cfg(windows)]
+            if matches!(self.output, Some(Output::Exclusive(_))) && since.elapsed() > EXCLUSIVE_RELEASE_AFTER {
+                // Don't keep other apps silent while nothing is playing.
+                self.output = None;
+            }
             if !self.suspended && since.elapsed() > SUSPEND_AFTER {
                 if let Some(Output::Device(stream)) = &self.output {
                     let _ = stream.pause();
@@ -560,6 +654,17 @@ impl Worker {
             }
         }
         if self.ended && self.pending.is_empty() && drained && self.current.is_some() {
+            if self.rate_switch && self.next.is_some() {
+                // The old track has played out; reopen the device at the new track's rate.
+                self.rate_switch = false;
+                let format = self.next.as_ref().map(|deck| (deck.rate, deck.bits));
+                self.open_output_for(format);
+                self.resampler = None;
+                self.clear_fade();
+                self.shared.ring.lock().unwrap().clear();
+                self.promote_next();
+                return;
+            }
             if self.next_token != 0 {
                 // The next track is still opening; it starts as soon as it arrives.
                 return;
@@ -666,13 +771,17 @@ impl Worker {
         let mut stereo = std::mem::take(&mut self.stereo);
         stereo.clear();
         match channels {
+            // Audio is only rounded off at the limiter when it has been turned up; untouched
+            // or turned down, samples pass through exactly as decoded.
             1 => {
                 for &s in samples {
-                    let v = soft_clip(s * gain);
+                    let v = if gain > 1.0 { soft_clip(s * gain) } else { s * gain };
                     stereo.extend_from_slice(&[v, v]);
                 }
             }
-            2 => stereo.extend(samples.iter().map(|&s| soft_clip(s * gain))),
+            2 if gain > 1.0 => stereo.extend(samples.iter().map(|&s| soft_clip(s * gain))),
+            2 if gain == 1.0 => stereo.extend_from_slice(samples),
+            2 => stereo.extend(samples.iter().map(|&s| s * gain)),
             _ => {
                 // Fold surround down: fronts plus a share of everything else.
                 for frame in samples.chunks_exact(channels) {
@@ -769,7 +878,13 @@ impl Worker {
     }
 
     fn end_of_deck(&mut self) {
-        if self.next.is_some() {
+        let switch = self.exclusive_wanted() && self.next.as_ref().is_some_and(|deck| self.wrong_rate_for(deck));
+        if switch {
+            self.drain_resampler();
+            self.release_tail();
+            self.ended = true;
+            self.rate_switch = true;
+        } else if self.next.is_some() {
             self.promote_next();
         } else {
             if self.next_token == 0 {
@@ -826,20 +941,64 @@ impl Worker {
     // ---- output device ----------------------------------------------------------------------
 
     fn open_output(&mut self) {
+        self.open_output_for(None);
+    }
+
+    fn exclusive_wanted(&self) -> bool {
+        cfg!(windows) && self.shared.choice.lock().unwrap().exclusive
+    }
+
+    /// Whether the output, as opened, isn't at this track's own sample rate.
+    fn wrong_rate_for(&self, deck: &Deck) -> bool {
+        deck.rate != 0 && deck.rate != self.opened_for
+    }
+
+    /// Opens the chosen device. `format` is the (sample rate, bit depth) of the song about to
+    /// play, which exclusive mode matches.
+    fn open_output_for(&mut self, format: Option<(u32, u32)>) {
         self.output = None;
         self.suspended = false;
         self.last_device_retry = Instant::now();
-        let output = match open_device(&self.shared) {
+        let choice = self.shared.choice.lock().unwrap().clone();
+        let (rate, bits) = format.filter(|f| f.0 != 0).unwrap_or((44_100, 16));
+        self.opened_for = rate;
+        #[cfg_attr(not(windows), allow(unused_mut))]
+        let mut note = String::new();
+        #[cfg(windows)]
+        if choice.exclusive {
+            let device = choice.device.strip_prefix("wasapi:").unwrap_or("").to_string();
+            match super::exclusive::open(self.shared.clone(), device, rate, bits) {
+                Ok(stream) => {
+                    self.set_rate(stream.rate);
+                    let status = format!("Exclusive, {} at {}-bit", khz(stream.rate), stream.bits);
+                    if std::env::var_os("NEXUS_TRACE").is_some() {
+                        eprintln!("[trace] output: {status} (asked for {rate} Hz, {bits}-bit)");
+                    }
+                    self.output = Some(Output::Exclusive(stream));
+                    self.emit(Event::Output { status, exclusive: true });
+                    return;
+                }
+                Err(reason) => {
+                    if std::env::var_os("NEXUS_TRACE").is_some() {
+                        eprintln!("[trace] exclusive output at {rate} Hz, {bits}-bit: {reason}");
+                    }
+                    note = format!(" Exclusive mode wasn't available ({reason}).");
+                }
+            }
+        }
+        let _ = bits;
+        let (output, status) = match open_device(&self.shared, &choice.device) {
             Ok((stream, rate)) => {
                 self.set_rate(rate);
-                Output::Device(stream)
+                (Output::Device(stream), format!("Shared with other apps, {}.{note}", khz(rate)))
             }
             Err(_) => {
                 self.set_rate(48_000);
-                Output::Null(spawn_null_output(self.shared.clone()))
+                (Output::Null(spawn_null_output(self.shared.clone())), "No sound device found.".to_string())
             }
         };
         self.output = Some(output);
+        self.emit(Event::Output { status, exclusive: false });
     }
 
     fn set_rate(&self, rate: u32) {
@@ -847,6 +1006,11 @@ impl Worker {
         let mut ring = self.shared.ring.lock().unwrap();
         ring.capacity_frames = (rate as f64 * RING_SECONDS) as usize;
     }
+}
+
+fn khz(rate: u32) -> String {
+    let khz = rate as f32 / 1000.0;
+    if khz.fract() == 0.0 { format!("{khz:.0} kHz") } else { format!("{khz:.1} kHz") }
 }
 
 fn make_resampler(from_rate: u32, to_rate: u32) -> Option<ResamplerState> {
@@ -890,14 +1054,25 @@ fn run_resampler(rs: &mut ResamplerState, out: &mut Vec<f32>) {
 
 fn open_deck(client: Client, request: TrackRequest, dir: &std::path::Path) -> Result<Deck, OpenError> {
     let fail = |message: String, unsupported: bool| OpenError { message, unsupported };
-    let download = Download::start(client, request.url.clone(), request.ranged, dir);
-    // These two formats decide whether they can seek only when asked to, so it's safe to skip
-    // the tag check at the end of the file. Others (MP4, Ogg) need the end while opening.
-    if matches!(request.suffix.as_str(), "flac" | "mp3") {
-        download.hold_seeking();
-    }
-    let reader = download.reader().map_err(|e| fail(e.to_string(), false))?;
-    let stream = MediaSourceStream::new(Box::new(reader), Default::default());
+    let (source, download): (Box<dyn symphonia::core::io::MediaSource>, Option<Download>) = match &request.local {
+        Some(path) => {
+            let file = std::fs::File::open(path)
+                .map_err(|e| fail(format!("The downloaded copy couldn't be opened: {e}"), false))?;
+            (Box::new(file), None)
+        }
+        None => {
+            let download = Download::start(client, request.url.clone(), request.ranged, dir);
+            // These two formats decide whether they can seek only when asked to, so it's safe
+            // to skip the tag check at the end of the file. Others (MP4, Ogg) need the end
+            // while opening.
+            if matches!(request.suffix.as_str(), "flac" | "mp3") {
+                download.hold_seeking();
+            }
+            let reader = download.reader().map_err(|e| fail(e.to_string(), false))?;
+            (Box::new(reader), Some(download))
+        }
+    };
+    let stream = MediaSourceStream::new(source, Default::default());
     let mut hint = Hint::new();
     if !request.suffix.is_empty() {
         hint.with_extension(&request.suffix);
@@ -908,7 +1083,9 @@ fn open_deck(client: Client, request: TrackRequest, dir: &std::path::Path) -> Re
             let unsupported = matches!(e, SymError::Unsupported(_));
             fail(format!("This file couldn't be read: {e}"), unsupported)
         })?;
-    download.allow_seeking();
+    if let Some(download) = &download {
+        download.allow_seeking();
+    }
     let track = format
         .default_track(TrackType::Audio)
         .ok_or_else(|| fail("This file has no audio track.".into(), true))?;
@@ -919,6 +1096,8 @@ fn open_deck(client: Client, request: TrackRequest, dir: &std::path::Path) -> Re
         .as_ref()
         .and_then(|p| p.audio())
         .ok_or_else(|| fail("This file's audio format isn't recognised.".into(), true))?;
+    let rate = params.sample_rate.unwrap_or(0);
+    let bits = params.bits_per_sample.unwrap_or(0);
     let decoder = symphonia::default::get_codecs()
         .make_audio_decoder(params, &AudioDecoderOptions::default())
         .map_err(|e| fail(format!("This audio format isn't supported: {e}"), true))?;
@@ -946,23 +1125,27 @@ fn open_deck(client: Client, request: TrackRequest, dir: &std::path::Path) -> Re
         base: request.base_secs,
         duration: request.duration_secs,
         time: request.base_secs + start,
+        rate,
+        bits,
         _download: download,
     })
 }
 
 // ---- device callback ----------------------------------------------------------------------------
 
-struct CallbackState {
-    effects: Effects,
-    scratch: Vec<f32>,
+pub(super) struct CallbackState {
+    pub(super) effects: Effects,
+    pub(super) scratch: Vec<f32>,
     /// Play/pause envelope, 0.0 to 1.0, so transport changes don't click.
-    fade: f32,
-    volume: f32,
+    pub(super) fade: f32,
+    pub(super) volume: f32,
 }
 
-fn open_device(shared: &Arc<Shared>) -> Result<(cpal::Stream, u32), String> {
+fn open_device(shared: &Arc<Shared>, device_id: &str) -> Result<(cpal::Stream, u32), String> {
     let host = cpal::default_host();
-    let device = host.default_output_device().ok_or("no output device")?;
+    // A chosen device that has since been unplugged falls back to the system default.
+    let chosen = device_id.parse::<cpal::DeviceId>().ok().and_then(|id| host.device_by_id(&id));
+    let device = chosen.or_else(|| host.default_output_device()).ok_or("no output device")?;
     let supported = device.default_output_config().map_err(|e| e.to_string())?;
     let format = supported.sample_format();
     let config: cpal::StreamConfig = supported.into();
@@ -1017,7 +1200,7 @@ where
         .map_err(|e| e.to_string())
 }
 
-fn fill<T>(out: &mut [T], channels: usize, fade_step: f32, shared: &Shared, st: &mut CallbackState)
+pub(super) fn fill<T>(out: &mut [T], channels: usize, fade_step: f32, shared: &Shared, st: &mut CallbackState)
 where
     T: SizedSample + FromSample<f32>,
 {

@@ -6,6 +6,7 @@ mod audio;
 mod config;
 mod controller;
 mod covers;
+mod downloads;
 #[cfg(windows)]
 mod instance;
 #[cfg(windows)]

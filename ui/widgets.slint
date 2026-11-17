@@ -127,10 +127,12 @@ export component TextButton inherits Rectangle {
     }
 
     label := Text {
+        width: min(self.preferred-width, root.width - 32px);
         text: root.text;
         color: root.primary || root.danger ? Theme.on-accent : Theme.text;
         font-size: 14px;
         font-weight: 600;
+        overflow: elide;
     }
 }
 
@@ -781,11 +783,25 @@ export component TrackRow inherits Rectangle {
                     overflow: elide;
                 }
 
-                LinkText {
-                    text: root.track.artist;
-                    enabled: root.track.artist-id != "";
-                    clicked => {
-                        View.card-activated({ kind: CardKind.artist, id: root.track.artist-id, title: root.track.artist });
+                HorizontalLayout {
+                    spacing: 6px;
+                    alignment: start;
+
+                    if root.track.downloaded: VerticalLayout {
+                        alignment: center;
+                        Icon {
+                            source: Icons.circle-arrow-down;
+                            size: 13px;
+                            tint: Theme.accent-bright;
+                        }
+                    }
+
+                    LinkText {
+                        text: root.track.artist;
+                        enabled: root.track.artist-id != "";
+                        clicked => {
+                            View.card-activated({ kind: CardKind.artist, id: root.track.artist-id, title: root.track.artist });
+                        }
                     }
                 }
             }

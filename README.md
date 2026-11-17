@@ -24,6 +24,11 @@ by the app itself.
 - A six-band equaliser with presets, mono audio, and volume levelling from ReplayGain tags
   at a quiet, normal or loud target.
 - Streaming quality from 96 kbps to lossless, switchable mid-song.
+- A choice of output device, and exclusive mode: the device runs at each song's own sample
+  rate and receives the file's samples unchanged (bit-perfect at full volume with the
+  equaliser and levelling off).
+- Downloads: save songs, albums and playlists on the PC to play without the server.
+- Internet radio stations set up in Navidrome, star ratings, and a sleep timer.
 - Plays MP3, FLAC, AAC/M4A, ALAC, Ogg Vorbis, WAV and AIFF directly. Anything else (Opus,
   WMA, APE and so on) is converted to MP3 by Navidrome on the fly.
 - Create, rename and delete playlists; add and remove songs; like songs and albums.
@@ -119,6 +124,8 @@ connection.
 | `src/covers.rs` | Cover art cache, on disk and in memory. |
 | `src/media.rs` | Windows media keys and now-playing overlay. |
 | `src/update.rs` | Finds, downloads and verifies new releases. |
+| `src/downloads.rs` | Songs saved for offline listening. |
+| `src/audio/exclusive.rs` | Exclusive-mode (WASAPI) output on Windows. |
 | `src/instance.rs` | One running copy at a time (Windows). |
 | `installer/` | NSIS script for the Windows installer. |
 

@@ -17,6 +17,8 @@ export struct Track {
     starred: bool,
     // Non-empty on the first track of a disc: shown as a divider above the row.
     section: string,
+    // A copy is saved on this PC.
+    downloaded: bool,
 }
 
 export struct Card {
@@ -97,6 +99,8 @@ export global App {
     callback new-playlist();
 
     in property <bool> queue-open;
+    // Progress of downloads under way, e.g. "Downloading 3 of 12"; empty when idle.
+    in property <string> download-status;
     // A newer version has been published.
     in property <bool> update-available;
     callback set-queue-open(open: bool);
@@ -150,6 +154,9 @@ export global View {
     in property <string> track-sort;
     in property <bool> track-sort-custom;
     in property <bool> track-sort-descending;
+    // The page's songs can be saved on this PC. State: 0 none saved, 1 in progress, 2 all saved.
+    in property <bool> can-download;
+    in property <int> download-state;
     // Rows can be dragged into a new order: a playlist shown in its own order, unfiltered.
     in property <bool> can-reorder;
 
@@ -162,6 +169,7 @@ export global View {
     callback track-star(index: int);
     callback track-menu(index: int, x: length, y: length);
     callback track-moved(index: int, delta: int);
+    callback download();
     callback set-filter(text: string);
     callback choose-track-sort(x: length, y: length);
     callback card-activated(card: Card);
@@ -194,6 +202,8 @@ export global Player {
     in property <bool> lossless;
     // Songs played before the current one, newest first.
     in property <[Track]> history;
+    // What the sleep timer is set to, in words; empty when it's off.
+    in property <string> sleep;
 
     callback toggle();
     callback next();
@@ -207,6 +217,7 @@ export global Player {
     callback queue-activated(index: int);
     callback queue-menu(index: int, x: length, y: length);
     callback clear-queue();
+    callback choose-sleep(x: length, y: length);
     // The queue row at `index` was dragged `delta` places down (or up, when negative).
     callback queue-moved(index: int, delta: int);
     callback history-activated(index: int);
@@ -278,8 +289,14 @@ export global Settings {
     in property <[string]> eq-labels;
     in property <string> eq-preset;
 
+    in property <string> downloads-summary;
     in property <string> cache-size;
     in property <string> connection;
+
+    // The chosen output device's name, and how it's being driven right now.
+    in property <string> output-device;
+    in property <string> output-status;
+    in property <bool> exclusive;
 
     in property <bool> close-to-tray;
     in property <bool> check-updates;
@@ -305,6 +322,9 @@ export global Settings {
     callback reset-eq();
     callback choose-preset(x: length, y: length);
     callback clear-cache();
+    callback remove-downloads();
+    callback choose-device(x: length, y: length);
+    callback set-exclusive(on: bool);
     callback set-close-to-tray(on: bool);
     callback set-check-updates(on: bool);
     callback check-updates-now();

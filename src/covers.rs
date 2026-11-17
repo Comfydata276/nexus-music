@@ -254,8 +254,8 @@ fn load(client: &Client, dir: &Path, id: &str, bucket: u32) -> Option<Loaded> {
     Some(Loaded { pixels, tint })
 }
 
-/// Makes sure a cover is in the disk cache and returns where. Used for the Windows media overlay.
-#[cfg(windows)]
+/// Makes sure a cover is in the disk cache and returns where. Used for the Windows media
+/// overlay, and to keep artwork for downloaded songs.
 pub fn ensure_file(client: &Client, dir: &Path, id: &str) -> Option<PathBuf> {
     cover_file(client, dir, id, MEDIUM).map(|(_, path)| path)
 }

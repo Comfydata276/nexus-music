@@ -44,6 +44,10 @@ pub enum Route {
     Artist(String),
     Playlist(String),
     Liked,
+    /// Songs saved on this PC.
+    Downloads,
+    /// Internet radio stations set up on the server.
+    Radio,
     /// Carries the index of the chosen sort order.
     Albums(usize),
     Artists,
@@ -63,6 +67,8 @@ impl Route {
             "artist" => Route::Artist(rest.to_string()),
             "playlist" => Route::Playlist(rest.to_string()),
             "liked" => Route::Liked,
+            "downloads" => Route::Downloads,
+            "radio" => Route::Radio,
             "albums" => Route::Albums(rest.parse().unwrap_or(0)),
             "artists" => Route::Artists,
             "genres" => Route::Genres,
@@ -82,6 +88,8 @@ impl Route {
             Route::Artist(id) => format!("artist:{id}"),
             Route::Playlist(id) => format!("playlist:{id}"),
             Route::Liked => "liked".into(),
+            Route::Downloads => "downloads".into(),
+            Route::Radio => "radio".into(),
             Route::Albums(_) => "albums".into(),
             Route::Artists => "artists".into(),
             Route::Genres => "genres".into(),
@@ -104,7 +112,9 @@ impl Route {
         match self {
             Route::Home => ui::Page::Home,
             Route::Search(_) => ui::Page::Search,
-            Route::Album(_) | Route::Playlist(_) | Route::Liked => ui::Page::Tracklist,
+            Route::Album(_) | Route::Playlist(_) | Route::Liked | Route::Downloads | Route::Radio => {
+                ui::Page::Tracklist
+            }
             Route::Artist(_) => ui::Page::Artist,
             Route::Albums(_) | Route::Artists | Route::Genres | Route::Genre(_) => ui::Page::Grid,
             Route::Settings => ui::Page::Settings,
@@ -199,6 +209,8 @@ pub struct Controller {
     pub paths: Paths,
     pub api_pool: Pool,
     pub art_pool: Pool,
+    pub download_pool: Pool,
+    pub downloads: RefCell<crate::downloads::Downloads>,
     pub covers: Covers,
     pub engine: Engine,
     pub settings: RefCell<Settings>,
@@ -217,6 +229,12 @@ pub struct Controller {
     pub grid_loading: Cell<bool>,
     /// Likes changed in this session, ahead of whatever cached responses still say.
     pub stars: RefCell<HashMap<String, bool>>,
+    /// Star ratings changed in this session, likewise.
+    pub ratings: RefCell<HashMap<String, u8>>,
+    /// When the sleep timer will pause playback.
+    pub sleep_at: Cell<Option<Instant>>,
+    /// The sleep timer is set to pause when the current song ends.
+    pub sleep_after_song: Cell<bool>,
     pub menu: RefCell<crate::actions::MenuState>,
     pub prompt: RefCell<Option<crate::actions::PromptAction>>,
     pub lyrics: RefCell<crate::playback::LyricsState>,
@@ -230,6 +248,10 @@ pub struct Controller {
     toast_timer: slint::Timer,
     pub tick_timer: slint::Timer,
     update_timer: slint::Timer,
+    /// Whether the sound device is currently held in exclusive mode.
+    pub output_exclusive: Cell<bool>,
+    /// The output devices last listed in the device menu: (id, name).
+    pub devices: RefCell<Vec<(String, String)>>,
     /// The newer release found by the last check, if any.
     update: RefCell<Option<crate::update::Release>>,
     update_busy: Cell<bool>,
@@ -248,6 +270,8 @@ impl Controller {
         let ctl = Rc::new(Controller {
             covers: Covers::new(paths.covers.clone()),
             api_pool: Pool::new("api", 4, false),
+            download_pool: Pool::new("download", 2, false),
+            downloads: RefCell::new(crate::downloads::Downloads::load(paths.downloads.clone())),
             art_pool: Pool::new("art", 6, true),
             engine,
             playback: RefCell::new(Playback::new(&settings)),
@@ -263,6 +287,9 @@ impl Controller {
             grid_columns: Cell::new(5),
             grid_loading: Cell::new(false),
             stars: RefCell::default(),
+            ratings: RefCell::default(),
+            sleep_at: Cell::new(None),
+            sleep_after_song: Cell::new(false),
             menu: RefCell::default(),
             prompt: RefCell::new(None),
             lyrics: RefCell::default(),
@@ -275,6 +302,8 @@ impl Controller {
             toast_timer: slint::Timer::default(),
             tick_timer: slint::Timer::default(),
             update_timer: slint::Timer::default(),
+            output_exclusive: Cell::new(false),
+            devices: RefCell::default(),
             update: RefCell::new(None),
             update_busy: Cell::new(false),
             #[cfg(windows)]
@@ -382,6 +411,7 @@ impl Controller {
             }
         });
 
+        self.sync_downloads();
         self.start_shell();
         // Look for a new version shortly after opening, then a few times a day.
         self.ui.global::<ui::Settings>().set_can_self_update(crate::update::installed_copy());
@@ -825,6 +855,10 @@ impl Controller {
                 self.load_lyrics();
                 return;
             }
+            Route::Downloads => {
+                self.show_downloads(scroll);
+                return;
+            }
             _ => {}
         }
 
@@ -860,12 +894,19 @@ impl Controller {
             let page = match first {
                 Ok(page) => page,
                 Err(e) => {
+                    let offline_home = matches!(route, Route::Home)
+                        && matches!(e, crate::subsonic::ApiError::Network(_));
                     return post(move |ctl| {
                         // A failed background check leaves the stored copy on screen.
                         if ctl.nav.borrow().generation == generation && !shown {
                             let view = ctl.ui.global::<ui::View>();
                             view.set_loading(false);
                             view.set_error(e.to_string().into());
+                            // With the server out of reach, open on what can still be played.
+                            if offline_home && !ctl.downloads.borrow().is_empty() {
+                                ctl.navigate(Route::Downloads);
+                                ctl.toast("Can't reach your server. Here are your downloads.");
+                            }
                         }
                     });
                 }
@@ -909,7 +950,7 @@ impl Controller {
         self.apply_page(data, scroll);
     }
 
-    fn apply_page(self: &Rc<Self>, data: PageData, scroll: f32) {
+    pub fn apply_page(self: &Rc<Self>, data: PageData, scroll: f32) {
         let view = self.ui.global::<ui::View>();
         view.set_label(data.label.as_str().into());
         view.set_title(data.title.as_str().into());
@@ -1009,7 +1050,9 @@ impl Controller {
         let page = self.page.borrow();
         let state = self.track_view.borrow();
         let view = self.ui.global::<ui::View>();
-        let can_filter = page.playlist.is_some() || page.liked_songs;
+        let can_filter = page.playlist.is_some()
+            || page.liked_songs
+            || matches!(self.current_route(), Some(Route::Downloads));
         view.set_can_filter(can_filter && !page.songs.is_empty());
         view.set_track_sort(
             match (state.sort, page.playlist.is_some()) {
@@ -1026,6 +1069,8 @@ impl Controller {
         } else {
             view.set_empty(page.empty.as_str().into());
         }
+        drop((page, state));
+        self.sync_download_button();
     }
 
     /// The page's songs in the order they're shown.
@@ -1126,10 +1171,12 @@ impl Controller {
             album: song.album.as_str().into(),
             album_id: song.album_id.as_str().into(),
             cover: song.cover_art.as_str().into(),
-            duration: clock(song.duration).into(),
+            // A radio station has no length.
+            duration: if song.duration == 0 { SharedString::default() } else { clock(song.duration).into() },
             number: SharedString::default(),
             starred: self.is_starred(song),
             section: SharedString::default(),
+            downloaded: self.downloads.borrow().has(&song.id),
         }
     }
 
@@ -1256,6 +1303,11 @@ impl Controller {
                 .collect::<Vec<_>>(),
         )));
         page.set_eq_preset(settings.eq_preset().into());
+        page.set_output_device(
+            if settings.output_device.is_empty() { "System default" } else { settings.output_device_name.as_str() }
+                .into(),
+        );
+        page.set_exclusive(settings.exclusive);
         page.set_close_to_tray(settings.close_to_tray);
         page.set_check_updates(settings.check_updates);
     }
@@ -1269,6 +1321,15 @@ impl Controller {
         if save {
             self.save_settings();
         }
+    }
+
+    /// Plays through the device at `index` in the last device menu; `None` is the system default.
+    pub fn choose_device(&self, index: Option<usize>) {
+        let chosen = index.and_then(|i| self.devices.borrow().get(i).cloned()).unwrap_or_default();
+        self.change_setting(true, |s| {
+            s.output_device = chosen.0;
+            s.output_device_name = chosen.1;
+        });
     }
 
     fn refresh_cache_size(&self) {
@@ -1361,6 +1422,9 @@ impl Controller {
         });
         view.on_track_moved(|index, delta| {
             with(|ctl| ctl.move_playlist_track(index.max(0) as usize, (index + delta).max(0) as usize));
+        });
+        view.on_download(|| {
+            with(|ctl| ctl.toggle_page_download());
         });
         view.on_set_filter(|text| {
             with(|ctl| ctl.set_track_filter(&text));
@@ -1481,6 +1545,12 @@ impl Controller {
         settings.on_choose_preset(|x, y| {
             with(|ctl| ctl.open_preset_menu(x, y));
         });
+        settings.on_choose_device(|x, y| {
+            with(|ctl| ctl.open_device_menu(x, y));
+        });
+        settings.on_set_exclusive(|on| {
+            with(|ctl| ctl.change_setting(true, |s| s.exclusive = on));
+        });
         settings.on_set_close_to_tray(|on| {
             with(|ctl| {
                 ctl.change_setting(true, |s| s.close_to_tray = on);
@@ -1500,6 +1570,9 @@ impl Controller {
         });
         settings.on_install_update(|| {
             with(|ctl| ctl.install_update());
+        });
+        settings.on_remove_downloads(|| {
+            with(|ctl| ctl.remove_all_downloads());
         });
         settings.on_clear_cache(|| {
             with(|ctl| {

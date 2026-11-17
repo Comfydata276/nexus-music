@@ -69,7 +69,16 @@ impl Controller {
         self.ui.global::<ui::Menu>().set_open(false);
     }
 
+    /// The user's rating for a song, 0 to 5, counting changes made in this session.
+    pub fn rating_of(&self, song: &Song) -> u8 {
+        self.ratings.borrow().get(&song.id).copied().unwrap_or(song.user_rating)
+    }
+
     fn song_menu(&self, song: Song, playlist: Option<(String, usize)>, upcoming: Option<usize>, x: f32, y: f32) {
+        // A radio station isn't a song in the library: none of these actions apply to it.
+        if !song.radio_url.is_empty() {
+            return;
+        }
         let icons = self.ui.global::<ui::Icons>();
         let mut entries = vec![
             self.entry("play-next", "Play next", icons.get_list_start()),
@@ -83,6 +92,20 @@ impl Controller {
             self.entry("unstar", "Remove from Liked songs", icons.get_heart_fill())
         } else {
             self.entry("star", "Add to Liked songs", icons.get_heart())
+        });
+        let rating = self.rating_of(&song);
+        let label = match rating {
+            0 => "Rate".to_string(),
+            1 => "Rated 1 star".to_string(),
+            n => format!("Rated {n} stars"),
+        };
+        let mut rate = self.entry("rate", &label, icons.get_star());
+        rate.submenu = true;
+        entries.push(rate);
+        entries.push(if self.downloads.borrow().has(&song.id) {
+            self.entry("remove-download", "Remove download", icons.get_circle_arrow_down())
+        } else {
+            self.entry("download", "Download", icons.get_download())
         });
         entries.push(self.separator());
         if !song.album_id.is_empty() {
@@ -145,9 +168,11 @@ impl Controller {
                 let mut add = self.entry("add-to", "Add to playlist", icons.get_list_plus());
                 add.submenu = true;
                 entries.push(add);
+                entries.push(self.entry("download", "Download", icons.get_download()));
             }
             Target::Playlist { .. } => {
                 entries.push(self.separator());
+                entries.push(self.entry("download", "Download", icons.get_download()));
                 entries.push(self.entry("rename", "Rename", icons.get_pencil()));
                 let mut delete = self.entry("delete", "Delete playlist", icons.get_trash_2());
                 delete.danger = true;
@@ -187,6 +212,65 @@ impl Controller {
             _ => String::new(),
         };
         self.collection_menu(target, &title, x, y);
+    }
+
+    fn show_rating_picker(&self) {
+        let icons = self.ui.global::<ui::Icons>();
+        let current = match &self.menu.borrow().target {
+            Target::Song { song, .. } => self.rating_of(song),
+            _ => 0,
+        };
+        let tick = |on: bool| if on { icons.get_check() } else { slint::Image::default() };
+        let mut entries = vec![self.entry("back", "Back", icons.get_chevron_left()), self.separator()];
+        for stars in (1..=5u8).rev() {
+            let label = if stars == 1 { "1 star".to_string() } else { format!("{stars} stars") };
+            entries.push(self.entry(&format!("rate:{stars}"), &label, tick(stars == current)));
+        }
+        entries.push(self.separator());
+        entries.push(self.entry("rate:0", "No rating", tick(current == 0)));
+        let menu = self.ui.global::<ui::Menu>();
+        menu.set_title("Rate".into());
+        menu.set_entries(ModelRc::new(VecModel::from(entries)));
+    }
+
+    /// Saves a song's rating on the server; 0 clears it.
+    fn rate_song(self: &Rc<Self>, song: &Song, rating: u8) {
+        let previous = self.rating_of(song);
+        self.ratings.borrow_mut().insert(song.id.clone(), rating);
+        let id = song.id.clone();
+        let undo = id.clone();
+        self.request(
+            move |client| client.set_rating(&id, rating),
+            move |ctl, result| match result {
+                Ok(()) => ctl.toast(match rating {
+                    0 => "Rating removed".to_string(),
+                    1 => "Rated 1 star".to_string(),
+                    n => format!("Rated {n} stars"),
+                }),
+                Err(e) => {
+                    ctl.ratings.borrow_mut().insert(undo, previous);
+                    ctl.toast(format!("Couldn't save the rating. {e}"));
+                }
+            },
+        );
+    }
+
+    pub fn open_sleep_menu(&self, x: f32, y: f32) {
+        let icons = self.ui.global::<ui::Icons>();
+        let timed = self.sleep_at.get().is_some();
+        let after_song = self.sleep_after_song.get();
+        let tick = |on: bool| if on { icons.get_check() } else { slint::Image::default() };
+        let mut entries = Vec::new();
+        for minutes in [5u32, 10, 15, 30, 45, 60] {
+            let label = if minutes == 60 { "1 hour".to_string() } else { format!("{minutes} minutes") };
+            entries.push(self.entry(&format!("sleep:{minutes}"), &label, slint::Image::default()));
+        }
+        entries.push(self.entry("sleep:end", "End of this song", tick(after_song)));
+        entries.push(self.separator());
+        entries.push(self.entry("sleep:0", "Off", tick(!timed && !after_song)));
+        // The menu opens above the button it belongs to.
+        let height = entries.len() as f32 * 36.0 + 40.0;
+        self.open_menu(Target::None, "Pause music after", entries, x, y - height);
     }
 
     fn show_playlist_picker(&self) {
@@ -259,6 +343,19 @@ impl Controller {
         self.open_menu(Target::None, "Presets", entries, x, y);
     }
 
+    pub fn open_device_menu(&self, x: f32, y: f32) {
+        let icons = self.ui.global::<ui::Icons>();
+        let devices = crate::audio::engine::output_devices();
+        let current = self.settings.borrow().output_device.clone();
+        let tick = |on: bool| if on { icons.get_check() } else { slint::Image::default() };
+        let mut entries = vec![self.entry("device:default", "System default", tick(current.is_empty()))];
+        for (index, (id, name)) in devices.iter().enumerate() {
+            entries.push(self.entry(&format!("device:{index}"), name, tick(*id == current)));
+        }
+        *self.devices.borrow_mut() = devices;
+        self.open_menu(Target::None, "Play through", entries, x, y);
+    }
+
     pub fn open_track_sort_menu(&self, x: f32, y: f32) {
         let icons = self.ui.global::<ui::Icons>();
         let (current, descending) = {
@@ -287,12 +384,29 @@ impl Controller {
             self.close_menu();
             return self.choose_preset(index);
         }
+        if let Some(choice) = id.strip_prefix("sleep:") {
+            self.close_menu();
+            return self.set_sleep(if choice == "end" { None } else { Some(choice.parse().unwrap_or(0)) });
+        }
+        if let Some(rating) = id.strip_prefix("rate:").and_then(|r| r.parse::<u8>().ok()) {
+            self.close_menu();
+            let target = std::mem::take(&mut self.menu.borrow_mut().target);
+            if let Target::Song { song, .. } = target {
+                self.rate_song(&song, rating);
+            }
+            return;
+        }
+        if let Some(device) = id.strip_prefix("device:") {
+            self.close_menu();
+            return self.choose_device(device.parse().ok());
+        }
         if let Some(index) = id.strip_prefix("sort:").and_then(|i| i.parse().ok()) {
             self.close_menu();
             return self.set_track_sort(index);
         }
         match id {
             "add-to" => return self.show_playlist_picker(),
+            "rate" => return self.show_rating_picker(),
             "back" => {
                 let state = self.menu.borrow();
                 let menu = self.ui.global::<ui::Menu>();
@@ -333,6 +447,11 @@ impl Controller {
                 self.remove_from_playlist(playlist.clone(), *index)
             }
             ("remove-queue", Target::Song { upcoming: Some(offset), .. }) => self.remove_upcoming(*offset),
+            ("download", _) => self.with_songs(target, |ctl, songs| ctl.download_songs(songs)),
+            ("remove-download", Target::Song { song, .. }) => {
+                self.remove_downloads(std::slice::from_ref(&song.id));
+                self.toast("Download removed");
+            }
             ("rename", Target::Playlist { id, name }) => {
                 *self.prompt.borrow_mut() = Some(PromptAction::RenamePlaylist(id.clone()));
                 self.open_prompt("Rename playlist", "", "Save", Some(name), false);
@@ -508,6 +627,9 @@ impl Controller {
     // ---- likes ---------------------------------------------------------------------------------
 
     pub fn toggle_song_star(self: &Rc<Self>, song: &Song) {
+        if !song.radio_url.is_empty() {
+            return self.toast("Radio stations can't be added to Liked songs");
+        }
         let starred = !self.is_starred(song);
         self.set_star("id", song.id.clone(), starred);
         self.toast(if starred { "Added to Liked songs" } else { "Removed from Liked songs" });
