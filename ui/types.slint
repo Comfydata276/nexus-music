@@ -131,6 +131,9 @@ export global App {
     // The + beside "Playlists" was clicked: offer to make one or import some.
     callback playlist-menu(x: length, y: length);
 
+    // The route key of the list the queue is playing from, e.g. "playlist:abc"; empty if it
+    // isn't from a list. Play buttons for that list pause and resume it.
+    in property <string> playing-source;
     in property <bool> queue-open;
     // Progress of downloads under way, e.g. "Downloading 3 of 12"; empty when idle.
     in property <string> download-status;
@@ -220,6 +223,8 @@ export global View {
     in property <bool> show-added;
     // This list plays shuffled.
     in property <bool> shuffle;
+    // The queue is playing from this page's list, so its play button pauses and resumes.
+    in property <bool> playing-here;
     // The page's songs can be saved on this PC. State: 0 none saved, 1 in progress, 2 all saved.
     in property <bool> can-download;
     in property <int> download-state;

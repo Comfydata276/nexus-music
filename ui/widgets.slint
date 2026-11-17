@@ -2,7 +2,7 @@
 
 import { Theme } from "theme.slint";
 import { Icons } from "icons.slint";
-import { Covers, Card, CardKind, Track, Player, View, Drag } from "types.slint";
+import { App, Covers, Card, CardKind, Track, Player, View, Drag } from "types.slint";
 
 export component Icon inherits Image {
     in property <length> size: 18px;
@@ -637,7 +637,11 @@ export component MediaCard inherits Rectangle {
                 y: touch.has-hover ? parent.height - self.height - 8px : parent.height - self.height;
                 size: 44px;
                 opacity: touch.has-hover ? 1 : 0;
-                label: "Play " + root.card.title;
+                // The list that's playing gets a pause button.
+                playing: Player.playing && root.card.id != "" && App.playing-source == (root.card.kind == CardKind.album ? "album:"
+                    : root.card.kind == CardKind.playlist ? "playlist:"
+                    : root.card.kind == CardKind.mix ? "mix:" : "none:") + root.card.id;
+                label: (self.playing ? "Pause " : "Play ") + root.card.title;
                 animate y, opacity { duration: 160ms; easing: ease-out; }
                 clicked => { root.play(); }
             }

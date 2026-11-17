@@ -1689,6 +1689,10 @@ impl Controller {
         let playing = {
             let pb = self.playback.borrow();
             let key = self.current_route().map(|route| route.cache_key()).unwrap_or_default();
+            // Play buttons for the list the queue came from pause and resume it.
+            let source = if pb.current().is_some() { pb.source.as_str() } else { "" };
+            self.ui.global::<ui::App>().set_playing_source(source.into());
+            self.ui.global::<ui::View>().set_playing_here(!source.is_empty() && source == key);
             if !pb.source.is_empty() && pb.source == key { pb.current_origin() } else { None }
         };
         for row in 0..self.tracks_model.row_count() {
@@ -1744,9 +1748,20 @@ impl Controller {
         self.play_songs(songs, index, context, false);
     }
 
+    /// Whether the queue was started from the list with this route key.
+    pub fn is_playing_from(&self, key: &str) -> bool {
+        let pb = self.playback.borrow();
+        !key.is_empty() && pb.source == key && pb.current().is_some()
+    }
+
     /// The page's play button: plays its list from the top, or shuffled if the list is set
-    /// to shuffle.
+    /// to shuffle. If the list is already what's playing, it pauses or resumes instead.
     pub fn play_page(self: &Rc<Self>) {
+        // If this page's list is what's playing, the button pauses and resumes it.
+        let key = self.current_route().map(|route| route.cache_key()).unwrap_or_default();
+        if self.is_playing_from(&key) {
+            return self.toggle_play();
+        }
         let (source, context) = {
             let page = self.page.borrow();
             (page.play.clone(), page.context.clone())

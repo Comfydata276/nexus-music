@@ -60,6 +60,8 @@ component NavItem inherits Rectangle {
 
 component PlaylistItem inherits Rectangle {
     in property <PlaylistRef> playlist;
+    // This playlist is what's playing right now.
+    property <bool> playing: Player.playing && App.playing-source == "playlist:" + self.playlist.id;
     in property <bool> selected;
     callback clicked;
     callback play;
@@ -118,12 +120,13 @@ component PlaylistItem inherits Rectangle {
                     detail: 48px;
                 }
 
-                // Over the cover, a click plays the playlist; anywhere else opens it.
+                // Over the cover, a click plays the playlist (or pauses it, if it's the one
+                // playing); anywhere else opens it.
                 if play-touch.has-hover: Rectangle {
                     border-radius: art.border-radius;
                     background: play-touch.pressed ? #000000c8 : #000000a0;
                     Icon {
-                        source: Icons.play-fill;
+                        source: root.playing ? Icons.pause-fill : Icons.play-fill;
                         size: 16px;
                         tint: white;
                     }
@@ -132,7 +135,7 @@ component PlaylistItem inherits Rectangle {
                 play-touch := TouchArea {
                     mouse-cursor: pointer;
                     accessible-role: button;
-                    accessible-label: "Play " + root.playlist.name;
+                    accessible-label: (root.playing ? "Pause " : "Play ") + root.playlist.name;
                     accessible-action-default => { root.play(); }
                     clicked => { root.play(); }
                     pointer-event(event) => {

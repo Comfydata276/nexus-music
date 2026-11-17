@@ -879,6 +879,16 @@ impl Controller {
 
     pub fn play_card(self: &Rc<Self>, card: &ui::Card) {
         let (id, title) = (card.id.to_string(), card.title.to_string());
+        // The play button on what's already playing pauses and resumes it.
+        let key = match card.kind {
+            ui::CardKind::Album => format!("album:{id}"),
+            ui::CardKind::Playlist => format!("playlist:{id}"),
+            ui::CardKind::Mix => format!("mix:{id}"),
+            _ => String::new(),
+        };
+        if self.is_playing_from(&key) {
+            return self.toggle_play();
+        }
         let target = match card.kind {
             ui::CardKind::Album => Target::Album { id, title: title.clone() },
             ui::CardKind::Playlist => Target::Playlist { id, name: title.clone() },

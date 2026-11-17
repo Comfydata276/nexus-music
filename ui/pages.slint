@@ -214,7 +214,8 @@ component ActionBar inherits Rectangle {
             alignment: center;
             PlayButton {
                 size: 54px;
-                label: "Play " + View.title;
+                playing: View.playing-here && Player.playing;
+                label: (self.playing ? "Pause " : "Play ") + View.title;
                 clicked => { View.play(); }
             }
         }
@@ -608,7 +609,8 @@ component QuickTile inherits Rectangle {
         if touch.has-hover: PlayButton {
             x: parent.width - self.width - 8px;
             size: 36px;
-            label: "Play " + root.card.title;
+            playing: Player.playing && App.playing-source == "album:" + root.card.id;
+            label: (self.playing ? "Pause " : "Play ") + root.card.title;
             clicked => { View.card-play(root.card); }
         }
     }
