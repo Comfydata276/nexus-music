@@ -261,6 +261,13 @@ impl Controller {
         let after_song = self.sleep_after_song.get();
         let tick = |on: bool| if on { icons.get_check() } else { slint::Image::default() };
         let mut entries = Vec::new();
+        // With a timer running, the menu opens on how long it has left.
+        if let Some(at) = self.sleep_at.get() {
+            let minutes = at.saturating_duration_since(std::time::Instant::now()).as_secs().div_ceil(60).max(1);
+            let label = if minutes == 1 { "1 minute left".to_string() } else { format!("{minutes} minutes left") };
+            entries.push(self.entry("sleep:keep", &label, icons.get_moon()));
+            entries.push(self.separator());
+        }
         for minutes in [5u32, 10, 15, 30, 45, 60] {
             let label = if minutes == 60 { "1 hour".to_string() } else { format!("{minutes} minutes") };
             entries.push(self.entry(&format!("sleep:{minutes}"), &label, slint::Image::default()));
@@ -386,6 +393,10 @@ impl Controller {
         }
         if let Some(choice) = id.strip_prefix("sleep:") {
             self.close_menu();
+            if choice == "keep" {
+                // The time-left line is there to be read, not to change anything.
+                return;
+            }
             return self.set_sleep(if choice == "end" { None } else { Some(choice.parse().unwrap_or(0)) });
         }
         if let Some(rating) = id.strip_prefix("rate:").and_then(|r| r.parse::<u8>().ok()) {
