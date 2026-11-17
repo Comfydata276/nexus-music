@@ -149,7 +149,54 @@ fn exchange(client: &Client, known: Option<String>, local: Shared, mut songs: Ha
     Ok(Outcome { playlist: playlist.id, shared: merged, songs })
 }
 
+/// Reads what's shared without changing anything, for a first look before the window opens.
+fn peek(client: &Client, known: &str) -> Option<(String, Shared)> {
+    let playlist = if known.is_empty() {
+        let id = client.playlists().ok()?.into_iter().filter(|p| p.name == PLAYLIST_NAME).map(|p| p.id).min()?;
+        client.playlist(&id).ok()?
+    } else {
+        client.playlist(known).ok()?
+    };
+    (playlist.name == PLAYLIST_NAME).then(|| (playlist.id, serde_json::from_str(&playlist.comment).unwrap_or_default()))
+}
+
+/// How long opening the window may wait on the server for the theme.
+const THEME_WAIT: Duration = Duration::from_millis(1000);
+
 impl Controller {
+    /// Finds out, before the window is shown, whether the theme was changed on another
+    /// device, so the app opens in the right colours instead of changing once it's up.
+    /// Gives up after a moment if the server is slow to answer.
+    pub fn preload_theme(&self) {
+        let Some(client) = self.client() else { return };
+        if !self.settings.borrow().sync || self.is_offline() {
+            return;
+        }
+        let known = self.settings.borrow().sync_playlist.clone();
+        let (answer, wait) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = answer.send(peek(&client, &known));
+        });
+        let Ok(Some((playlist, theirs))) = wait.recv_timeout(THEME_WAIT) else { return };
+        let changed = {
+            let mut settings = self.settings.borrow_mut();
+            settings.sync_playlist = playlist.clone();
+            let known = crate::config::THEMES.iter().any(|t| t.name == theirs.theme);
+            let newer = known && (theirs.theme_at, &theirs.theme) > (settings.theme_at, &settings.theme);
+            if newer {
+                settings.theme = theirs.theme.clone();
+                settings.theme_at = theirs.theme_at;
+            }
+            newer
+        };
+        *self.sync_playlist.borrow_mut() = Some(playlist);
+        if changed {
+            self.save_settings();
+            self.apply_theme();
+            self.push_settings();
+        }
+    }
+
     fn sync_on(&self) -> bool {
         self.settings.borrow().sync && self.client().is_some() && !self.is_offline()
     }
@@ -166,6 +213,10 @@ impl Controller {
     /// Starts keeping in step: now, and every so often from here on.
     pub fn start_sync(self: &Rc<Self>) {
         self.sync_busy.set(false);
+        if self.sync_playlist.borrow().is_none() {
+            let known = self.settings.borrow().sync_playlist.clone();
+            *self.sync_playlist.borrow_mut() = (!known.is_empty()).then_some(known);
+        }
         self.look_elsewhere();
         self.sync_look_timer.start(slint::TimerMode::Repeated, LOOK, || {
             with(|ctl| ctl.look_elsewhere());
@@ -260,11 +311,14 @@ impl Controller {
 
     /// Takes in what came back from the server, where it's newer than what's here.
     fn take_shared(self: &Rc<Self>, outcome: Outcome) {
-        *self.sync_playlist.borrow_mut() = Some(outcome.playlist);
+        let moved = self.settings.borrow().sync_playlist != outcome.playlist;
+        *self.sync_playlist.borrow_mut() = Some(outcome.playlist.clone());
         let theirs = outcome.shared;
-        let (mut pins, mut theme, mut lists) = (false, false, false);
+        let (mut pins, mut theme, mut lists) = (false, false, moved);
         {
             let mut settings = self.settings.borrow_mut();
+            // Remembered, so the next start can look at it before the window opens.
+            settings.sync_playlist = outcome.playlist;
             if (theirs.pins_at, &theirs.pins) > (settings.pins_at, &settings.pinned_playlists) {
                 pins = settings.pinned_playlists != theirs.pins;
                 settings.pinned_playlists = theirs.pins.clone();

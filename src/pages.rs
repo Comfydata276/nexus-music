@@ -81,7 +81,7 @@ impl CardData {
         CardData { subtitle, ..CardData::album(album) }
     }
 
-    fn artist(artist: &Artist) -> CardData {
+    pub fn artist(artist: &Artist) -> CardData {
         CardData {
             kind: Kind::Artist,
             id: artist.id.clone(),
@@ -146,6 +146,8 @@ pub struct PageData {
     pub album_numbers: bool,
     pub disc_sections: bool,
     pub shelves: Vec<ShelfData>,
+    /// Shelves that go above the songs instead of below them.
+    pub lead: Vec<ShelfData>,
     pub tiles: Vec<CardData>,
     pub grid: Vec<CardData>,
     /// The list to keep fetching from as the grid scrolls; `None` once it's all loaded.
@@ -291,18 +293,39 @@ fn search(client: &Client, query: &str) -> ApiResult<PageData> {
         };
         return Ok(PageData { title: "Search".into(), shelves, ..Default::default() });
     }
-    let found = client.search(query, 8, 12, 20)?;
-    let mut shelves = Vec::new();
-    if !found.artists.is_empty() {
-        shelves.push(ShelfData {
-            title: "Artists".into(),
-            route: String::new(),
-            wrap: false,
-            cards: found.artists.iter().map(CardData::artist).collect(),
-        });
-    }
-    shelves.extend(shelf("Albums", "", &found.albums));
-    let empty = if found.songs.is_empty() && shelves.is_empty() {
+    // The app's own copy of the library forgives typing mistakes; the server doesn't, and
+    // is only asked while that copy hasn't arrived yet.
+    let found = match crate::search::current() {
+        Some(index) => {
+            let mut found = index.search(query, &crate::search::is_liked, 8, 12, 30);
+            for song in &mut found.songs {
+                // Whether it's liked may have changed since the copy was made.
+                song.starred = crate::search::is_liked(song).then(|| song.starred.clone().unwrap_or_default());
+            }
+            found
+        }
+        None => {
+            let found = client.search(query, 8, 12, 20)?;
+            crate::search::Results {
+                artists: found.artists.iter().map(CardData::artist).collect(),
+                albums: found.albums.iter().map(CardData::album).collect(),
+                songs: found.songs,
+                artist_first: false,
+            }
+        }
+    };
+    let row = |title: &str, cards: Vec<CardData>| {
+        (!cards.is_empty()).then(|| ShelfData { title: title.into(), route: String::new(), wrap: false, cards })
+    };
+    let artists = row("Artists", found.artists);
+    let albums = row("Albums", found.albums);
+    // An artist who matches what was typed goes above the songs.
+    let (lead, shelves): (Vec<ShelfData>, Vec<ShelfData>) = if found.artist_first {
+        (artists.into_iter().collect(), albums.into_iter().collect())
+    } else {
+        (Vec::new(), artists.into_iter().chain(albums).collect())
+    };
+    let empty = if found.songs.is_empty() && shelves.is_empty() && lead.is_empty() {
         format!("Nothing in your library matches “{query}”. Check the spelling or try fewer words.")
     } else {
         String::new()
@@ -314,6 +337,7 @@ fn search(client: &Client, query: &str) -> ApiResult<PageData> {
         show_cover: true,
         show_number: false,
         shelves,
+        lead,
         empty,
         context: format!("“{query}”"),
         ..Default::default()

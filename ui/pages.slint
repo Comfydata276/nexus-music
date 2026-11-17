@@ -686,6 +686,10 @@ export component StackPage inherits Rectangle {
                 }
             }
 
+            for shelf in View.lead: ShelfView {
+                shelf: shelf;
+            }
+
             if View.tracks.length > 0 && View.tracks-title != "": SectionTitle {
                 text: View.tracks-title;
             }

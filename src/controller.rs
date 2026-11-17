@@ -197,6 +197,14 @@ impl TrackView {
     }
 }
 
+/// Something offered under the search box.
+#[derive(Clone)]
+enum Suggestion {
+    /// An artist or an album.
+    Card(CardData),
+    Song(Song),
+}
+
 struct HistoryEntry {
     route: Route,
     scroll: f32,
@@ -281,6 +289,12 @@ pub struct Controller {
     /// Sharing with other devices (see `sync`): the timers that pass changes on and look
     /// for others', whether an exchange is under way (and another is wanted after it), and
     /// the playlist that holds the shared data.
+    /// Search: what's on offer under the search box, a count that tells a late answer from
+    /// the current one, and the timer and flag for keeping the library copy up to date.
+    suggestions: RefCell<Vec<Suggestion>>,
+    preview_count: Cell<u64>,
+    library_timer: slint::Timer,
+    library_busy: Cell<bool>,
     pub sync_timer: slint::Timer,
     pub sync_look_timer: slint::Timer,
     pub queue_timer: slint::Timer,
@@ -355,6 +369,10 @@ impl Controller {
             pending: RefCell::new(crate::offline::load_pending(&paths.pending)),
             unreachable: Cell::new(false),
             reconnect_timer: slint::Timer::default(),
+            suggestions: RefCell::default(),
+            preview_count: Cell::new(0),
+            library_timer: slint::Timer::default(),
+            library_busy: Cell::new(false),
             sync_timer: slint::Timer::default(),
             sync_look_timer: slint::Timer::default(),
             queue_timer: slint::Timer::default(),
@@ -754,6 +772,9 @@ impl Controller {
         let warm = client.clone();
         self.art_pool.spawn(move || warm.warm_up(6));
         *self.client.borrow_mut() = Some(client);
+        // Before any of the app is on screen: pick up the theme last chosen on any device,
+        // so it opens in the right colours instead of changing a moment later.
+        self.preload_theme();
         app.set_signed_in(true);
         *self.nav.borrow_mut() = Nav::default();
         self.cache.borrow_mut().clear();
@@ -761,11 +782,151 @@ impl Controller {
         self.reload_playlists();
         self.navigate(Route::Home);
         self.start_sync();
+        self.load_library();
+        self.library_timer.start(slint::TimerMode::Repeated, Duration::from_secs(5 * 60), || {
+            with(|ctl| ctl.load_library());
+        });
+    }
+
+    // ---- search --------------------------------------------------------------------------------
+
+    /// Readies the app's own copy of the library, which search runs on: from disk at first,
+    /// then from the server whenever that says the library has changed.
+    fn load_library(self: &Rc<Self>) {
+        let (Some(client), Some(dir)) = (self.client(), self.pages_dir()) else { return };
+        if self.library_busy.replace(true) {
+            return;
+        }
+        // Offline, the copy on disk still serves; there's just no asking for a newer one.
+        let online = !self.is_offline();
+        self.api_pool.spawn(move || {
+            let _ = std::fs::create_dir_all(&dir);
+            let file = dir.join("library.json");
+            let mut renewed = false;
+            if crate::search::current().is_none() {
+                if let Some(library) = crate::search::Library::load(&file) {
+                    crate::search::set_current(Some(crate::search::Index::new(library)));
+                    renewed = true;
+                }
+            }
+            if let Some(status) = online.then(|| client.scan_status().ok()).flatten() {
+                let now = chrono::Utc::now().timestamp();
+                let stale = match crate::search::current() {
+                    Some(index) => index.library.is_stale(&status, now),
+                    None => !status.scanning,
+                };
+                if stale {
+                    if let Ok(library) = crate::search::Library::fetch(&client) {
+                        library.save(&file);
+                        crate::search::set_current(Some(crate::search::Index::new(library)));
+                        renewed = true;
+                    }
+                }
+            }
+            if renewed && online {
+                // Which songs are liked, as of now.
+                if let Ok(found) = client.starred() {
+                    crate::search::set_liked(found.songs.into_iter().map(|song| song.id).collect());
+                }
+            }
+            post(|ctl| ctl.library_busy.set(false));
+        });
+    }
+
+    /// Looks up what's being typed in the search box and offers the best few matches.
+    fn search_preview(self: &Rc<Self>, text: &str) {
+        let query = text.trim().to_string();
+        let count = self.preview_count.get() + 1;
+        self.preview_count.set(count);
+        if query.is_empty() {
+            return self.close_preview();
+        }
+        let Some(client) = self.client() else { return };
+        self.api_pool.spawn(move || {
+            let found = match crate::search::current() {
+                Some(index) => Some(index.search(&query, &crate::search::is_liked, 2, 2, 5)),
+                // No copy of the library yet: the server's exact search will have to do.
+                None => client.search(&query, 1, 2, 5).ok().map(|found| crate::search::Results {
+                    artists: found.artists.iter().map(CardData::artist).collect(),
+                    albums: found.albums.iter().map(CardData::album).collect(),
+                    songs: found.songs,
+                    artist_first: false,
+                }),
+            };
+            post(move |ctl| {
+                if let (Some(found), true) = (found, ctl.preview_count.get() == count) {
+                    ctl.show_preview(found);
+                }
+            });
+        });
+    }
+
+    fn show_preview(&self, found: crate::search::Results) {
+        let artists = found.artists.into_iter().map(Suggestion::Card);
+        let albums = found.albums.into_iter().map(Suggestion::Card);
+        let songs = found.songs.into_iter().map(Suggestion::Song);
+        // An artist who matches what was typed leads; otherwise the songs do.
+        let list: Vec<Suggestion> = if found.artist_first {
+            artists.chain(songs).chain(albums).collect()
+        } else {
+            songs.chain(artists.take(1)).chain(albums).collect()
+        };
+        let rows: Vec<ui::Suggestion> = list
+            .iter()
+            .map(|suggestion| match suggestion {
+                Suggestion::Card(card) => ui::Suggestion {
+                    kind: if card.kind == Kind::Artist { 0 } else { 1 },
+                    title: card.title.as_str().into(),
+                    subtitle: match (card.kind, card.subtitle.is_empty()) {
+                        (Kind::Artist, _) => "Artist".into(),
+                        (_, true) => "Album".into(),
+                        (_, false) => format!("Album • {}", card.subtitle).into(),
+                    },
+                    cover: card.cover.as_str().into(),
+                    liked: false,
+                },
+                Suggestion::Song(song) => ui::Suggestion {
+                    kind: 2,
+                    title: song.title.as_str().into(),
+                    subtitle: format!("Song • {}", song.artist_label()).into(),
+                    cover: song.cover_art.as_str().into(),
+                    liked: self.stars.borrow().get(&song.id).copied().unwrap_or_else(|| crate::search::is_liked(song)),
+                },
+            })
+            .collect();
+        let search = self.ui.global::<ui::Search>();
+        search.set_highlight(-1);
+        search.set_open(!rows.is_empty());
+        search.set_items(ModelRc::new(VecModel::from(rows)));
+        *self.suggestions.borrow_mut() = list;
+    }
+
+    fn close_preview(&self) {
+        let search = self.ui.global::<ui::Search>();
+        search.set_open(false);
+        search.set_highlight(-1);
+    }
+
+    /// A row of the preview was chosen: go to the artist or album, or play the song.
+    fn open_suggestion(self: &Rc<Self>, index: usize) {
+        let Some(suggestion) = self.suggestions.borrow().get(index).cloned() else { return };
+        self.close_preview();
+        // The keyboard goes back to the player's shortcuts.
+        let app = self.ui.global::<ui::App>();
+        app.set_main_focus(app.get_main_focus().wrapping_add(1));
+        match suggestion {
+            Suggestion::Card(card) => self.open_card(&card.to_ui()),
+            // By itself, as from Recently played: what follows is up to autoplay.
+            Suggestion::Song(song) => self.play_songs(vec![song], 0, "", false),
+        }
     }
 
     pub fn leave(self: &Rc<Self>, message: &str) {
         self.stop_playback();
         self.stop_sync();
+        self.library_timer.stop();
+        self.close_preview();
+        crate::search::set_current(None);
         *self.client.borrow_mut() = None;
         self.cache.borrow_mut().clear();
         self.playlists.borrow_mut().clear();
@@ -788,6 +949,8 @@ impl Controller {
         self.leave("");
         // Signing in again starts from whatever the server has.
         self.queue_stamp.set(0);
+        self.settings.borrow_mut().sync_playlist.clear();
+        self.save_settings();
     }
 
     // ---- navigation ---------------------------------------------------------------------------
@@ -955,8 +1118,11 @@ impl Controller {
             if !app.get_search_text().is_empty() {
                 app.set_search_text("".into());
             }
-            // Leaving search: give the keyboard back to the player shortcuts.
-            app.set_main_focus(app.get_main_focus().wrapping_add(1));
+            // Leaving search: give the keyboard back to the player shortcuts. (A refresh of
+            // the page on screen isn't leaving anything, and mustn't interrupt typing.)
+            if !force {
+                app.set_main_focus(app.get_main_focus().wrapping_add(1));
+            }
         }
 
         let view = self.ui.global::<ui::View>();
@@ -1131,9 +1297,9 @@ impl Controller {
         if !same_tiles {
             view.set_tiles(cards_model(&data.tiles));
         }
-        if !same_shelves {
-            view.set_shelves(ModelRc::new(VecModel::from(
-                data.shelves
+        let shelves_model = |shelves: &[pages::ShelfData]| {
+            ModelRc::new(VecModel::from(
+                shelves
                     .iter()
                     .map(|shelf| ui::Shelf {
                         title: shelf.title.as_str().into(),
@@ -1142,7 +1308,13 @@ impl Controller {
                         cards: cards_model(&shelf.cards),
                     })
                     .collect::<Vec<_>>(),
-            )));
+            ))
+        };
+        if !same_shelves {
+            view.set_shelves(shelves_model(&data.shelves));
+        }
+        if self.page.borrow().lead != data.lead || data.lead.is_empty() {
+            view.set_lead(shelves_model(&data.lead));
         }
         if !same_grid {
             self.grid_model.set_vec(grid_rows(&data.grid, self.grid_columns.get()));
@@ -1845,8 +2017,16 @@ impl Controller {
         app.on_refresh(|| {
             with(|ctl| ctl.refresh());
         });
+        let search = self.ui.global::<ui::Search>();
+        search.on_preview(|text| {
+            with(|ctl| ctl.search_preview(&text));
+        });
+        search.on_activate(|index| {
+            with(|ctl| ctl.open_suggestion(index.max(0) as usize));
+        });
         app.on_search(|text| {
             with(|ctl| {
+                ctl.close_preview();
                 let query = text.trim().to_string();
                 // Clearing the box while browsing elsewhere shouldn't yank you to Search.
                 let on_search = matches!(ctl.current_route(), Some(Route::Search(_)));

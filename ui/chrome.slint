@@ -3,7 +3,7 @@
 import { ListView } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { Icons } from "icons.slint";
-import { App, Player, View, CardKind, PlaylistRef, Page, Track, Drag } from "types.slint";
+import { App, Player, View, CardKind, PlaylistRef, Page, Track, Drag, Search, Suggestion } from "types.slint";
 import { Icon, IconButton, Cover, Slider, LinkText, PlayButton, HoverIntent, ScrollThumb, Reorder } from "widgets.slint";
 
 // Rows stop `gutter` short of a list's right edge, leaving the scrollbar a lane of its own.
@@ -391,9 +391,9 @@ export component TopBar inherits Rectangle {
     property <length> buttons-width: App.custom-frame ? 3 * 48px : 0px;
     property <length> pill-width: App.signed-in && App.offline ? offline-label.preferred-width + 24px + 8px : 0px;
     property <length> controls-left: self.width - self.buttons-width - (App.signed-in ? 56px : 0px) - self.pill-width;
-    property <length> search-width: !App.signed-in ? 0px
+    out property <length> search-width: !App.signed-in ? 0px
         : clamp(self.width - 2 * max(self.nav-right, self.width - self.controls-left) - 48px, 160px, 520px);
-    property <length> search-x: (self.width - self.search-width) / 2;
+    out property <length> search-x: (self.width - self.search-width) / 2;
     function report() {
         App.titlebar-layout(self.height, self.nav-right, self.search-x, self.search-x + self.search-width, self.controls-left);
     }
@@ -486,13 +486,34 @@ export component TopBar inherits Rectangle {
                     selection-foreground-color: white;
                     accessible-label: "Search";
                     edited => {
-                        // Wait for a pause in typing before asking the server.
+                        // Wait for a pause in typing before looking.
                         debounce.stop();
                         debounce.start();
                     }
+                    // Enter opens the row picked out with the arrow keys, or else the full results.
                     accepted => {
                         debounce.stop();
-                        App.search(self.text);
+                        if Search.open && Search.highlight >= 0 {
+                            Search.activate(Search.highlight);
+                        } else {
+                            Search.open = false;
+                            App.search(self.text);
+                        }
+                    }
+                    key-pressed(event) => {
+                        if Search.open && event.text == Key.DownArrow {
+                            Search.highlight = min(Search.highlight + 1, Search.items.length - 1);
+                            return accept;
+                        }
+                        if Search.open && event.text == Key.UpArrow {
+                            Search.highlight = max(Search.highlight - 1, -1);
+                            return accept;
+                        }
+                        if Search.open && event.text == Key.Escape {
+                            Search.open = false;
+                            return accept;
+                        }
+                        return reject;
                     }
                 }
             }
@@ -509,6 +530,7 @@ export component TopBar inherits Rectangle {
                     label: "Clear search";
                     clicked => {
                         App.search-text = "";
+                        Search.preview("");
                         App.search("");
                         search.focus();
                     }
@@ -585,11 +607,135 @@ export component TopBar inherits Rectangle {
     }
 
     debounce := Timer {
-        interval: 280ms;
+        interval: 120ms;
         running: false;
         triggered => {
             self.stop();
-            App.search(search.text);
+            Search.preview(search.text);
+        }
+    }
+}
+
+// One result in the preview under the search box.
+component SuggestionRow inherits Rectangle {
+    in property <Suggestion> item;
+    in property <bool> highlighted;
+    callback clicked;
+
+    height: 56px;
+    border-radius: 8px;
+    background: self.highlighted || touch.has-hover ? Theme.hover : transparent;
+    accessible-role: button;
+    accessible-label: self.item.title + ", " + self.item.subtitle;
+    accessible-action-default => { root.clicked(); }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 14px;
+        spacing: 12px;
+
+        VerticalLayout {
+            alignment: center;
+            Cover {
+                width: 40px;
+                height: 40px;
+                art: root.item.cover;
+                round: root.item.kind == 0;
+                placeholder: root.item.kind == 0 ? Icons.user-round : Icons.music;
+                detail: 48px;
+            }
+        }
+
+        VerticalLayout {
+            alignment: center;
+            spacing: 3px;
+            horizontal-stretch: 1;
+            min-width: 0px;
+            preferred-width: 0px;
+
+            Text {
+                text: root.item.title;
+                color: Theme.text;
+                font-size: 14px;
+                font-weight: 500;
+                overflow: elide;
+            }
+
+            Text {
+                text: root.item.subtitle;
+                color: Theme.muted;
+                font-size: 13px;
+                overflow: elide;
+            }
+        }
+
+        if root.item.liked: VerticalLayout {
+            alignment: center;
+            Icon {
+                source: Icons.heart-fill;
+                size: 15px;
+                tint: Theme.warm;
+            }
+        }
+    }
+}
+
+// The preview of results under the search box. Fills the window so that a click anywhere
+// else puts it away.
+export component SearchOverlay inherits Rectangle {
+    // Where the search box is.
+    in property <length> anchor-x;
+    in property <length> anchor-width;
+
+    TouchArea {
+        y: 60px;
+        height: parent.height - 60px;
+        clicked => { Search.open = false; }
+    }
+
+    Rectangle {
+        property <length> wide: min(max(root.anchor-width, 460px), root.width - 16px);
+        x: clamp(root.anchor-x + (root.anchor-width - self.wide) / 2, 8px, max(8px, root.width - self.wide - 8px));
+        y: 56px;
+        width: self.wide;
+        height: rows.preferred-height;
+        border-radius: 12px;
+        background: Theme.overlay;
+        border-width: 1px;
+        border-color: Theme.line;
+        drop-shadow-blur: 24px;
+        drop-shadow-offset-y: 8px;
+        drop-shadow-color: #00000090;
+
+        // Clicks between the rows don't fall through to the page.
+        TouchArea { }
+
+        rows := VerticalLayout {
+            padding: 6px;
+
+            for item[index] in Search.items: SuggestionRow {
+                item: item;
+                highlighted: index == Search.highlight;
+                clicked => { Search.activate(index); }
+            }
+
+            HorizontalLayout {
+                padding-left: 10px;
+                padding-right: 10px;
+                padding-top: 8px;
+                padding-bottom: 6px;
+                Text {
+                    text: "Enter for all results";
+                    color: Theme.faint;
+                    font-size: 12px;
+                    horizontal-alignment: right;
+                }
+            }
         }
     }
 }

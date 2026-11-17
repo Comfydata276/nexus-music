@@ -153,6 +153,14 @@ pub struct Playlist {
     pub songs: Vec<Song>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ScanStatus {
+    pub scanning: bool,
+    pub count: u64,
+    pub last_scan: String,
+}
+
 /// A play queue saved on the server.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -875,6 +883,30 @@ impl Client {
             &[("query", query), ("artistCount", &a), ("albumCount", &b), ("songCount", &c)],
             Some("searchResult3"),
         )
+    }
+
+    /// One page of everything in the library: up to this many artists, albums and songs,
+    /// starting `offset` in to each.
+    pub fn library_page(&self, artists: u32, albums: u32, songs: u32, offset: u32) -> ApiResult<Found> {
+        let (a, b, c, o) = (artists.to_string(), albums.to_string(), songs.to_string(), offset.to_string());
+        self.call(
+            "search3",
+            &[
+                ("query", ""),
+                ("artistCount", &a),
+                ("albumCount", &b),
+                ("songCount", &c),
+                ("artistOffset", &o),
+                ("albumOffset", &o),
+                ("songOffset", &o),
+            ],
+            Some("searchResult3"),
+        )
+    }
+
+    /// How many songs the server has, and when it last looked through its folders.
+    pub fn scan_status(&self) -> ApiResult<ScanStatus> {
+        self.call("getScanStatus", &[], Some("scanStatus"))
     }
 
     pub fn scrobble(&self, id: &str, submission: bool) -> ApiResult<()> {

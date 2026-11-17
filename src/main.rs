@@ -18,6 +18,7 @@ mod offline;
 mod pages;
 mod playback;
 mod pool;
+mod search;
 mod subsonic;
 mod sync;
 #[cfg(windows)]

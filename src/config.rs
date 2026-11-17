@@ -125,6 +125,8 @@ pub struct Settings {
     pub sync: bool,
     /// A made-up name for this device, so it can tell its own saved queue from others'.
     pub device_id: String,
+    /// The id of the playlist that holds what's shared between devices, once known.
+    pub sync_playlist: String,
     /// When the pins and the theme were last changed, to settle which device's are newer.
     pub pins_at: i64,
     pub theme_at: i64,
@@ -172,6 +174,7 @@ impl Default for Settings {
             lists: std::collections::HashMap::new(),
             sync: true,
             device_id: String::new(),
+            sync_playlist: String::new(),
             pins_at: 0,
             theme_at: 0,
             offline: false,

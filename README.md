@@ -14,6 +14,7 @@ by the app itself.
 
 - Signs in to a Navidrome server; the password is kept in Windows Credential Manager.
 - Home, search, albums (sortable), artists, genres, playlists and Liked songs.
+- Search that forgives typing mistakes, with a preview of the best matches as you type. It runs on a copy of the library kept on your PC, so it's instant; a matching artist comes first, and songs you've liked rank above others.
 - Gapless playback or crossfade, seeking, shuffle, repeat and a queue you can edit.
 - A queue panel beside the page, with a play button on every row to skip straight to it.
   Drag rows to reorder the queue, or the songs in a playlist.

@@ -79,6 +79,16 @@ export struct ThemeOption {
     surface: color,
 }
 
+// Something offered under the search box while typing.
+export struct Suggestion {
+    // 0 an artist, 1 an album, 2 a song.
+    kind: int,
+    title: string,
+    subtitle: string,
+    cover: string,
+    liked: bool,
+}
+
 export struct LyricLine {
     text: string,
     // Seconds from the start of the track; negative when the lyrics aren't timed.
@@ -145,6 +155,16 @@ export global App {
     in property <int> main-focus;
 }
 
+// The preview of results shown under the search box as you type.
+export global Search {
+    in property <[Suggestion]> items;
+    in-out property <bool> open;
+    // The row picked out with the arrow keys; -1 for none.
+    in-out property <int> highlight: -1;
+    callback preview(text: string);
+    callback activate(index: int);
+}
+
 // The page currently shown in the main panel.
 export global View {
     in property <bool> loading;
@@ -176,6 +196,8 @@ export global View {
     in property <bool> show-number;
 
     in property <[Shelf]> shelves;
+    // Shelves shown above the songs instead of below them.
+    in property <[Shelf]> lead;
     in property <[Card]> tiles;
     // Shown when the page has nothing to list.
     in property <string> empty;

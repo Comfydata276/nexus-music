@@ -8,13 +8,13 @@ import "fonts/BricolageGrotesque-ExtraBold.ttf";
 
 import { Theme } from "theme.slint";
 import { Icons } from "icons.slint";
-import { Drag, App, View, Player, Menu, Prompt, Toast, Lyrics, Settings, Covers, Page, Track, Card, CardKind, Shelf, CardRow, PlaylistRef, MenuEntry, LyricLine, QualityOption, ThemeOption } from "types.slint";
+import { Drag, App, View, Player, Menu, Prompt, Toast, Lyrics, Settings, Covers, Page, Track, Card, CardKind, Shelf, CardRow, PlaylistRef, MenuEntry, LyricLine, QualityOption, ThemeOption, Search, Suggestion } from "types.slint";
 import { PageStatus } from "widgets.slint";
-import { Sidebar, TopBar, QueuePanel, PlayerBar } from "chrome.slint";
+import { Sidebar, TopBar, QueuePanel, PlayerBar, SearchOverlay } from "chrome.slint";
 import { StackPage, TrackListPage, GridPage, LyricsPage, NowPlayingPage, SettingsPage, LoginPage } from "pages.slint";
 import { MenuOverlay, PromptOverlay, ToastOverlay } from "overlays.slint";
 
-export { Theme, App, View, Player, Menu, Prompt, Toast, Lyrics, Settings, Covers, Icons, Page, Track, Card, CardKind, Shelf, CardRow, PlaylistRef, MenuEntry, LyricLine, QualityOption, ThemeOption }
+export { Theme, App, View, Player, Menu, Prompt, Toast, Lyrics, Settings, Covers, Icons, Page, Track, Card, CardKind, Shelf, CardRow, PlaylistRef, MenuEntry, LyricLine, QualityOption, ThemeOption, Search, Suggestion }
 
 // The icon in the notification area, shown while closing the window keeps the app running.
 export component Tray inherits SystemTrayIcon {
@@ -245,10 +245,15 @@ export component MainWindow inherits Window {
 
         // Above everything else, including the sign-in screen: it's how the window is moved
         // and closed.
-        TopBar {
+        top := TopBar {
             x: 0;
             y: 0;
             width: root.width;
+        }
+
+        if App.signed-in && Search.open && Search.items.length > 0: SearchOverlay {
+            anchor-x: top.search-x;
+            anchor-width: top.search-width;
         }
 
         ToastOverlay {

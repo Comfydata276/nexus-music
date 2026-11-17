@@ -921,6 +921,7 @@ impl Controller {
     fn apply_star(self: &Rc<Self>, kind: &str, id: &str, starred: bool) {
         self.stars.borrow_mut().insert(id.to_string(), starred);
         if kind == "id" {
+            crate::search::note_liked(id, starred);
             self.song_star_changed(id, starred);
         } else if self.page.borrow().star.as_ref().is_some_and(|(_, page_id)| page_id == id) {
             self.ui.global::<ui::View>().set_starred(starred);
