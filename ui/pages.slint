@@ -897,6 +897,188 @@ export component LyricsPage inherits Rectangle {
     }
 }
 
+// A screen built around the song that's playing: its artwork large, what it is and how it's
+// being played, and beside that the lyrics, or what's coming next when there are none.
+export component NowPlayingPage inherits Rectangle {
+    property <bool> wide: self.width >= 760px;
+    property <length> art: clamp(min(self.height - 250px, (self.wide ? self.width * 0.42 : self.width) - 96px), 140px, 520px);
+
+    if !Player.has-track: Text {
+        text: "Nothing is playing";
+        color: Theme.muted;
+        font-family: Theme.display;
+        font-size: 24px;
+        font-weight: 700;
+    }
+
+    if Player.has-track: HorizontalLayout {
+        padding-left: 48px;
+        padding-right: root.wide ? 0px : 48px;
+        padding-top: 8px;
+        padding-bottom: 24px;
+        spacing: 24px;
+
+        VerticalLayout {
+            width: root.wide ? root.art : parent.width - 96px;
+            alignment: center;
+            spacing: 6px;
+
+            HorizontalLayout {
+                alignment: root.wide ? start : center;
+                Rectangle {
+                    width: root.art;
+                    height: root.art;
+                    border-radius: 10px;
+                    background: Theme.raised;
+                    drop-shadow-blur: 40px;
+                    drop-shadow-offset-y: 10px;
+                    drop-shadow-color: #00000090;
+                    Cover {
+                        art: Player.track.cover;
+                        detail: 640px;
+                    }
+                }
+            }
+
+            Rectangle {
+                height: 18px;
+            }
+
+            Text {
+                text: Player.track.title;
+                color: Theme.text;
+                font-family: Theme.display;
+                font-size: 30px;
+                font-weight: 800;
+                overflow: elide;
+            }
+
+            LinkText {
+                text: Player.track.artist;
+                font-size: 17px;
+                enabled: Player.track.artist-id != "";
+                clicked => {
+                    View.card-activated({ kind: CardKind.artist, id: Player.track.artist-id, title: Player.track.artist });
+                }
+            }
+
+            LinkText {
+                text: Player.track.album;
+                font-size: 15px;
+                ink: Theme.faint;
+                enabled: Player.track.album-id != "";
+                clicked => {
+                    View.card-activated({
+                        kind: CardKind.album,
+                        id: Player.track.album-id,
+                        title: Player.track.album,
+                        subtitle: Player.track.artist,
+                        cover: Player.track.cover,
+                    });
+                }
+            }
+
+            Rectangle {
+                height: 6px;
+            }
+
+            if Player.format != "": Text {
+                text: Player.format;
+                color: Player.lossless ? Theme.accent-bright : Theme.muted;
+                font-size: 13px;
+                font-weight: 600;
+                overflow: elide;
+            }
+
+            if Settings.output-status != "": Text {
+                text: "Output: " + Settings.output-status;
+                color: Theme.faint;
+                font-size: 13px;
+                wrap: word-wrap;
+            }
+        }
+
+        if root.wide: Rectangle {
+            horizontal-stretch: 1;
+
+            if Lyrics.lines.length > 0: LyricsPage { }
+
+            if Lyrics.lines.length == 0: VerticalLayout {
+                padding-left: 24px;
+                padding-right: 32px;
+                alignment: center;
+                spacing: 4px;
+
+                Text {
+                    text: Player.queue.length == 0 ? "Nothing queued after this" : "Up next";
+                    color: Theme.muted;
+                    font-size: 13px;
+                    font-weight: 600;
+                    height: 32px;
+                    vertical-alignment: center;
+                }
+
+                for track[index] in Player.queue: Rectangle {
+                    // A glance at what's coming; the queue panel has the rest.
+                    visible: index < 6;
+                    height: index < 6 ? 60px : 0px;
+                    border-radius: 6px;
+                    background: next-touch.has-hover ? Theme.hover : transparent;
+
+                    next-touch := TouchArea {
+                        mouse-cursor: pointer;
+                        double-clicked => { Player.queue-activated(index); }
+                    }
+
+                    HorizontalLayout {
+                        padding-left: 8px;
+                        padding-right: 12px;
+                        spacing: 12px;
+
+                        VerticalLayout {
+                            alignment: center;
+                            Cover {
+                                width: 44px;
+                                height: 44px;
+                                art: track.cover;
+                                detail: 48px;
+                            }
+                        }
+
+                        VerticalLayout {
+                            alignment: center;
+                            spacing: 3px;
+                            horizontal-stretch: 1;
+                            preferred-width: 0px;
+                            Text {
+                                text: track.title;
+                                color: Theme.text;
+                                font-size: 15px;
+                                font-weight: 500;
+                                overflow: elide;
+                            }
+
+                            Text {
+                                text: track.artist;
+                                color: Theme.muted;
+                                font-size: 13px;
+                                overflow: elide;
+                            }
+                        }
+
+                        Text {
+                            text: track.duration;
+                            color: Theme.muted;
+                            font-size: 13px;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 component SettingRow inherits Rectangle {
     in property <string> title;
     in property <string> detail;
@@ -1495,6 +1677,16 @@ export component SettingsPage inherits Rectangle {
 
                     SettingGroup {
                         title: "Storage";
+
+                        SettingRow {
+                            title: "Offline mode";
+                            detail: "Plays only what's downloaded and doesn't contact your server. Likes, ratings and plays are kept and sent when you turn it off.";
+                            Toggle {
+                                on: Settings.offline;
+                                label: "Offline mode";
+                                toggled(on) => { Settings.set-offline(on); }
+                            }
+                        }
 
                         SettingRow {
                             title: "Downloads";

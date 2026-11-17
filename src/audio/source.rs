@@ -5,6 +5,7 @@
 //! or a user seek) are answered with small HTTP range requests instead of waiting for
 //! everything in between.
 
+use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
@@ -21,6 +22,10 @@ const SIDE_THRESHOLD: u64 = 768 * 1024;
 const SIDE_CHUNK_MIN: u64 = 64 * 1024;
 const SIDE_CHUNK_MAX: u64 = 4 * 1024 * 1024;
 const STALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// How much of a live stream is held ahead of the decoder before the download waits, and how
+/// much already-played audio is kept behind it.
+const LIVE_AHEAD: usize = 2 * 1024 * 1024;
+const LIVE_BEHIND: u64 = 256 * 1024;
 
 static NEXT_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -32,6 +37,10 @@ struct State {
     total: Option<u64>,
     done: bool,
     error: Option<String>,
+    /// For a live stream: the stretch of it currently held in memory, and where in the
+    /// stream that stretch begins. (A live stream never ends, so it can't go in a file.)
+    held: VecDeque<u8>,
+    held_from: u64,
 }
 
 struct Shared {
@@ -39,6 +48,9 @@ struct Shared {
     url: String,
     /// Raw files can be range-requested; transcoded streams can't.
     ranged: bool,
+    /// An internet radio stream: endless, kept in memory, and it may announce song titles.
+    live: bool,
+    title: Arc<Mutex<String>>,
     path: PathBuf,
     state: Mutex<State>,
     progress: Condvar,
@@ -62,13 +74,15 @@ pub struct Download {
 }
 
 impl Download {
-    pub fn start(client: Client, url: String, ranged: bool, dir: &std::path::Path) -> Download {
+    pub fn start(client: Client, url: String, ranged: bool, live: bool, dir: &std::path::Path) -> Download {
         let id = NEXT_FILE_ID.fetch_add(1, Ordering::Relaxed);
         let path = dir.join(format!("stream-{}-{id}.part", std::process::id()));
         let shared = Arc::new(Shared {
             client,
             url,
             ranged,
+            live,
+            title: Arc::new(Mutex::new(String::new())),
             path,
             state: Mutex::new(State::default()),
             progress: Condvar::new(),
@@ -78,7 +92,7 @@ impl Download {
         let worker = shared.clone();
         std::thread::Builder::new()
             .name("download".into())
-            .spawn(move || download_loop(&worker))
+            .spawn(move || if worker.live { live_loop(&worker) } else { download_loop(&worker) })
             .expect("failed to start a download thread");
         Download { shared }
     }
@@ -96,6 +110,11 @@ impl Download {
         self.shared.seek_held.store(false, Ordering::Relaxed);
     }
 
+    /// What a radio station says it's playing; empty if it hasn't said.
+    pub fn title(&self) -> String {
+        self.shared.title.lock().unwrap().clone()
+    }
+
     pub fn reader(&self) -> io::Result<SourceReader> {
         // The file is created by the download thread; wait for that before opening it.
         let mut state = self.shared.state.lock().unwrap();
@@ -107,7 +126,7 @@ impl Download {
         }
         drop(state);
         Ok(SourceReader {
-            file: File::open(&self.shared.path)?,
+            file: if self.shared.live { None } else { Some(File::open(&self.shared.path)?) },
             shared: self.shared.clone(),
             pos: 0,
             file_pos: 0,
@@ -185,6 +204,39 @@ fn download_loop(shared: &Shared) {
     }
 }
 
+/// Feeds a live stream into memory, pausing whenever the decoder falls far enough behind.
+fn live_loop(shared: &Shared) {
+    let (mut body, _) = match shared.client.open_live(&shared.url, &shared.title) {
+        Ok(v) => v,
+        Err(e) => return finish(shared, Some(e.to_string())),
+    };
+    {
+        let mut state = shared.state.lock().unwrap();
+        state.opened = true;
+        shared.progress.notify_all();
+    }
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        match body.read(&mut buf) {
+            Ok(0) => return finish(shared, None),
+            Ok(n) => {
+                let mut state = shared.state.lock().unwrap();
+                while state.held.len() > LIVE_AHEAD && !shared.cancel.load(Ordering::Relaxed) {
+                    let (next, _) = shared.progress.wait_timeout(state, Duration::from_millis(250)).unwrap();
+                    state = next;
+                }
+                if shared.cancel.load(Ordering::Relaxed) {
+                    return;
+                }
+                state.held.extend(&buf[..n]);
+                state.downloaded += n as u64;
+                shared.progress.notify_all();
+            }
+            Err(e) => return finish(shared, Some(format!("The station's stream dropped: {e}"))),
+        }
+    }
+}
+
 fn finish(shared: &Shared, error: Option<String>) {
     let mut state = shared.state.lock().unwrap();
     state.opened = true;
@@ -201,7 +253,8 @@ fn finish(shared: &Shared, error: Option<String>) {
 
 pub struct SourceReader {
     shared: Arc<Shared>,
-    file: File,
+    /// `None` for a live stream, which is read from memory.
+    file: Option<File>,
     pos: u64,
     /// Where the file handle's cursor currently is, to skip redundant seeks.
     file_pos: u64,
@@ -247,14 +300,36 @@ impl Read for SourceReader {
         let mut waited_since: Option<Instant> = None;
         let mut state = self.shared.state.lock().unwrap();
         loop {
+            if self.shared.live && self.pos < state.downloaded {
+                if self.pos < state.held_from {
+                    return Err(io::Error::other("that part of the live stream is gone"));
+                }
+                let skip = (self.pos - state.held_from) as usize;
+                let n = buf.len().min(state.held.len() - skip);
+                for (slot, byte) in buf[..n].iter_mut().zip(state.held.iter().skip(skip)) {
+                    *slot = *byte;
+                }
+                self.pos += n as u64;
+                // Let go of what has been played, and wake the download if it was waiting.
+                let stale = (self.pos - state.held_from).saturating_sub(LIVE_BEHIND) as usize;
+                if stale > 0 {
+                    state.held.drain(..stale);
+                    state.held_from += stale as u64;
+                    self.shared.progress.notify_all();
+                }
+                return Ok(n);
+            }
             if self.pos < state.downloaded {
+                let Some(file) = self.file.as_mut() else {
+                    return Err(io::Error::other("no buffer file"));
+                };
                 let available = (state.downloaded - self.pos) as usize;
                 drop(state);
                 if self.file_pos != self.pos {
-                    self.file.seek(SeekFrom::Start(self.pos))?;
+                    file.seek(SeekFrom::Start(self.pos))?;
                 }
                 let want = buf.len().min(available);
-                let n = self.file.read(&mut buf[..want])?;
+                let n = file.read(&mut buf[..want])?;
                 self.pos += n as u64;
                 self.file_pos = self.pos;
                 return Ok(n);

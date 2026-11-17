@@ -11,6 +11,8 @@ pub struct Paths {
     pub settings: PathBuf,
     pub queue: PathBuf,
     pub history: PathBuf,
+    /// Likes, ratings and plays waiting to be sent to the server.
+    pub pending: PathBuf,
     pub covers: PathBuf,
     pub pages: PathBuf,
     pub buffers: PathBuf,
@@ -43,6 +45,7 @@ impl Paths {
             settings: config.join("settings.json"),
             queue: config.join("queue.json"),
             history: config.join("history.json"),
+            pending: config.join("pending.json"),
             covers: cache.join("covers"),
             pages: cache.join("pages"),
             buffers: cache.join("buffers"),
@@ -92,6 +95,8 @@ pub struct Settings {
     pub output_device_name: String,
     /// Take the device for this app alone and play each song at its own sample rate.
     pub exclusive: bool,
+    /// Offline mode: don't contact the server; play downloads only.
+    pub offline: bool,
     /// Name of the colour theme (see `THEMES`).
     pub theme: String,
     /// Size of the interface relative to the system's scaling; 1.0 leaves it alone.
@@ -127,6 +132,7 @@ impl Default for Settings {
             output_device: String::new(),
             output_device_name: String::new(),
             exclusive: false,
+            offline: false,
             theme: THEMES[0].name.to_string(),
             ui_scale: 1.0,
             close_to_tray: true,

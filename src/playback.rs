@@ -142,7 +142,20 @@ impl Controller {
 
     /// Replaces the queue and starts playing from `start`.
     pub fn play_songs(self: &Rc<Self>, songs: Vec<Song>, start: usize, context: &str, shuffle: bool) {
+        // Offline, only what's downloaded can play: skip the rest.
+        let (songs, start) = if self.is_offline() {
+            let wanted = songs.get(start).map(|s| s.id.clone());
+            let downloads = self.downloads.borrow();
+            let kept: Vec<Song> = songs.into_iter().filter(|s| downloads.has(&s.id)).collect();
+            let start = wanted.and_then(|id| kept.iter().position(|s| s.id == id)).unwrap_or(0);
+            (kept, start)
+        } else {
+            (songs, start)
+        };
         if songs.is_empty() {
+            if self.is_offline() {
+                self.toast("That isn't downloaded, so it can't play while you're offline");
+            }
             return;
         }
         {
@@ -216,6 +229,7 @@ impl Controller {
             return TrackRequest {
                 token,
                 local: None,
+                live: true,
                 url: song.radio_url.clone(),
                 ranged: false,
                 suffix: suffix.into(),
@@ -231,6 +245,7 @@ impl Controller {
             return TrackRequest {
                 token,
                 local: Some(path),
+                live: false,
                 url: String::new(),
                 ranged: true,
                 suffix,
@@ -244,6 +259,7 @@ impl Controller {
             TrackRequest {
                 token,
                 local: None,
+                live: false,
                 url: client.stream_url(&song.id, 0, 0),
                 ranged: true,
                 suffix,
@@ -258,6 +274,7 @@ impl Controller {
             TrackRequest {
                 token,
                 local: None,
+                live: false,
                 url: client.stream_url(&song.id, if cap == 0 { 320 } else { cap }, offset as u32),
                 ranged: false,
                 suffix: "mp3".into(),
@@ -315,7 +332,14 @@ impl Controller {
             pb.playing = !pb.playing;
             (pb.current_token != 0, pb.resume_at)
         };
-        if loaded {
+        let rejoin = {
+            let pb = self.playback.borrow();
+            pb.playing && pb.current().is_some_and(|s| !s.radio_url.is_empty())
+        };
+        if rejoin {
+            // A radio station carries on while paused: resuming joins it as it is now.
+            self.start_current(0.0);
+        } else if loaded {
             self.engine.set_playing(self.playback.borrow().playing);
             self.sync_transport();
         } else {
@@ -631,6 +655,19 @@ impl Controller {
                     self.track_changed();
                 }
             }
+            Event::StreamTitle { token, title } => {
+                let station = {
+                    let pb = self.playback.borrow();
+                    pb.current().filter(|s| token == pb.current_token && !s.radio_url.is_empty()).cloned()
+                };
+                if let Some(station) = station {
+                    // The station's name stays as the title; the song goes where the artist would.
+                    let player = self.ui.global::<ui::Player>();
+                    let mut track = player.get_track();
+                    track.artist = if title.is_empty() { station.artist_label().into() } else { title.into() };
+                    player.set_track(track);
+                }
+            }
             Event::Output { status, exclusive } => {
                 self.ui.global::<ui::Settings>().set_output_status(status.into());
                 self.output_exclusive.set(exclusive);
@@ -743,7 +780,9 @@ impl Controller {
         }
         if let Some(id) = submit {
             if self.settings.borrow().scrobble {
-                self.request(move |client| client.scrobble(&id, true), |_, _| {});
+                // Sent now, or kept with its time and sent when the server is next reachable.
+                let at = chrono::Utc::now().timestamp_millis();
+                self.submit(crate::offline::Pending::Played { id, at }, |_, _| {});
             }
         }
         self.follow_lyrics(position);
@@ -1013,7 +1052,7 @@ impl Controller {
         self.sync_queue();
         self.sync_history();
         self.save_queue();
-        if matches!(self.current_route(), Some(Route::Lyrics)) {
+        if matches!(self.current_route(), Some(Route::Lyrics | Route::NowPlaying)) {
             self.load_lyrics();
         }
         self.show_format();
@@ -1040,7 +1079,7 @@ impl Controller {
         let _ = (playing, position);
     }
 
-    fn sync_queue(self: &Rc<Self>) {
+    pub fn sync_queue(self: &Rc<Self>) {
         let pb = self.playback.borrow();
         let rows: Vec<ui::Track> = pb
             .order

@@ -11,6 +11,7 @@ mod downloads;
 mod instance;
 #[cfg(windows)]
 mod media;
+mod offline;
 mod pages;
 mod playback;
 mod pool;

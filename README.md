@@ -30,6 +30,9 @@ by the app itself.
   rate and receives the file's samples unchanged (bit-perfect at full volume with the
   equaliser and levelling off).
 - Downloads: save songs, albums and playlists on the PC to play without the server.
+- Offline mode, and automatic detection when the server can't be reached: downloads keep
+  playing, and likes, ratings and plays are sent once the server is back.
+- A Now Playing screen with large artwork, the song's format and lyrics or what's next.
 - Internet radio stations set up in Navidrome, star ratings, and a sleep timer.
 - Plays MP3, FLAC, AAC/M4A, ALAC, Ogg Vorbis, WAV and AIFF directly. Anything else (Opus,
   WMA, APE and so on) is converted to MP3 by Navidrome on the fly.
@@ -129,6 +132,7 @@ connection.
 | `src/media.rs` | Windows media keys and now-playing overlay. |
 | `src/update.rs` | Finds, downloads and verifies new releases. |
 | `src/downloads.rs` | Songs saved for offline listening. |
+| `src/offline.rs` | Offline mode and changes held until the server is reachable. |
 | `src/audio/exclusive.rs` | Exclusive-mode (WASAPI) output on Windows. |
 | `src/instance.rs` | One running copy at a time, title bar colour, display scaling (Windows). |
 | `src/taskbar.rs` | Buttons on the taskbar thumbnail (Windows). |

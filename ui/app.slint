@@ -11,7 +11,7 @@ import { Icons } from "icons.slint";
 import { Drag, App, View, Player, Menu, Prompt, Toast, Lyrics, Settings, Covers, Page, Track, Card, CardKind, Shelf, CardRow, PlaylistRef, MenuEntry, LyricLine, QualityOption, ThemeOption } from "types.slint";
 import { PageStatus } from "widgets.slint";
 import { Sidebar, TopBar, QueuePanel, PlayerBar } from "chrome.slint";
-import { StackPage, TrackListPage, GridPage, LyricsPage, SettingsPage, LoginPage } from "pages.slint";
+import { StackPage, TrackListPage, GridPage, LyricsPage, NowPlayingPage, SettingsPage, LoginPage } from "pages.slint";
 import { MenuOverlay, PromptOverlay, ToastOverlay } from "overlays.slint";
 
 export { Theme, App, View, Player, Menu, Prompt, Toast, Lyrics, Settings, Covers, Icons, Page, Track, Card, CardKind, Shelf, CardRow, PlaylistRef, MenuEntry, LyricLine, QualityOption, ThemeOption }
@@ -81,9 +81,10 @@ export component MainWindow inherits Window {
     forward-focus: keys;
 
     // Whether the page has a cover whose colour should wash the top of the panel.
-    property <bool> tinted: App.page == Page.tracklist || App.page == Page.artist;
+    property <bool> tinted: App.page == Page.tracklist || App.page == Page.artist || App.page == Page.now-playing;
     property <bool> liked: App.page == Page.tracklist && View.liked-songs;
     property <color> wash: self.liked ? Theme.accent.darker(0.25)
+        : App.page == Page.now-playing ? Covers.tint(Player.track.cover, Covers.rev)
         : self.tinted ? Covers.tint(View.cover, Covers.rev)
         : App.page == Page.home ? Theme.accent : Theme.panel;
     // The Rust side bumps this after navigating, to take the keyboard back from the search box.
@@ -190,7 +191,7 @@ export component MainWindow inherits Window {
                     y: 0;
                     height: 360px;
                     background: @linear-gradient(180deg, root.wash.with-alpha(root.tinted ? 0.62 : App.page == Page.home ? 0.24 : 0) 0%, Theme.panel.with-alpha(0) 100%);
-                    opacity: clamp(1 + View.scroll-y / 190px, 0, 1);
+                    opacity: App.page == Page.now-playing ? 1 : clamp(1 + View.scroll-y / 190px, 0, 1);
                 }
 
                 TopBar {
@@ -214,6 +215,7 @@ export component MainWindow inherits Window {
                     if !View.loading && View.error == "" && App.page == Page.tracklist: TrackListPage { }
                     if !View.loading && View.error == "" && App.page == Page.grid: GridPage { }
                     if App.page == Page.lyrics: LyricsPage { }
+                    if App.page == Page.now-playing: NowPlayingPage { }
                     if App.page == Page.settings: SettingsPage { }
                 }
             }

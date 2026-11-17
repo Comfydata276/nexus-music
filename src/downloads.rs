@@ -29,6 +29,9 @@ pub struct Downloads {
     /// Oldest first.
     entries: Vec<Entry>,
     files: HashMap<String, String>,
+    /// Playlists downloaded as a whole (their ids, or "liked" for Liked songs), so songs
+    /// added to them later are downloaded too.
+    collections: Vec<String>,
     /// Songs waiting to be fetched or being fetched now.
     queued: HashSet<String>,
     /// For the progress message: how many of the current batch are done, and how many failed.
@@ -53,7 +56,11 @@ impl Downloads {
             }
         }
         let files = entries.iter().map(|e| (e.song.id.clone(), e.file.clone())).collect();
-        Downloads { dir, entries, files, queued: HashSet::new(), batch_total: 0, batch_done: 0, batch_failed: 0 }
+        let collections = fs::read(dir.join("collections.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
+        Downloads { dir, entries, files, collections, queued: HashSet::new(), batch_total: 0, batch_done: 0, batch_failed: 0 }
     }
 
     fn save(&self) {
@@ -62,6 +69,17 @@ impl Downloads {
             if fs::write(&temp, json).is_ok() {
                 let _ = fs::rename(&temp, self.dir.join("index.json"));
             }
+        }
+    }
+
+    /// Remembers (or forgets) that a playlist is kept downloaded.
+    fn keep_collection(&mut self, id: &str, keep: bool) {
+        self.collections.retain(|c| c != id);
+        if keep {
+            self.collections.push(id.to_string());
+        }
+        if let Ok(json) = serde_json::to_vec(&self.collections) {
+            let _ = fs::write(self.dir.join("collections.json"), json);
         }
     }
 
@@ -161,6 +179,46 @@ fn fetch(client: &Client, dir: &Path, song: &Song) -> Result<Entry, String> {
 impl Controller {
     /// Saves these songs on this PC. Ones already saved or on their way are skipped.
     pub fn download_songs(self: &Rc<Self>, songs: Vec<Song>) {
+        self.download_songs_with(songs, false);
+    }
+
+    /// The id under which the page on screen is kept downloaded, if it's a playlist.
+    fn page_collection(&self) -> Option<String> {
+        let page = self.page.borrow();
+        match &page.playlist {
+            Some(playlist) => Some(playlist.id.clone()),
+            None if page.liked_songs => Some("liked".into()),
+            None => None,
+        }
+    }
+
+    /// Marks a playlist as kept downloaded (or no longer).
+    pub fn keep_downloaded(&self, id: &str, keep: bool) {
+        self.downloads.borrow_mut().keep_collection(id, keep);
+    }
+
+    /// Downloads whatever has been added to the playlists that are kept downloaded.
+    pub fn sync_collections(self: &Rc<Self>) {
+        if self.is_offline() {
+            return;
+        }
+        let collections = self.downloads.borrow().collections.clone();
+        for id in collections {
+            self.request(
+                move |client| {
+                    if id == "liked" { client.starred().map(|found| found.songs) } else { client.playlist(&id).map(|p| p.songs) }
+                },
+                |ctl, result| {
+                    if let Ok(songs) = result {
+                        ctl.download_songs_with(songs, true);
+                    }
+                },
+            );
+        }
+    }
+
+    /// `quiet` skips the messages: used when topping up in the background.
+    fn download_songs_with(self: &Rc<Self>, songs: Vec<Song>, quiet: bool) {
         let Some(client) = self.client() else { return };
         let wanted: Vec<Song> = {
             let mut downloads = self.downloads.borrow_mut();
@@ -179,12 +237,17 @@ impl Controller {
             wanted
         };
         if wanted.is_empty() {
-            return self.toast("Already downloaded");
+            if !quiet {
+                self.toast("Already downloaded");
+            }
+            return;
         }
-        self.toast(match wanted.len() {
-            1 => format!("Downloading “{}”", wanted[0].title),
-            n => format!("Downloading {n} songs"),
-        });
+        if !quiet {
+            self.toast(match wanted.len() {
+                1 => format!("Downloading “{}”", wanted[0].title),
+                n => format!("Downloading {n} songs"),
+            });
+        }
         let (dir, covers) = (self.downloads.borrow().dir.clone(), self.paths.covers.clone());
         for song in wanted {
             let (client, dir, covers) = (client.clone(), dir.clone(), covers.clone());
@@ -305,13 +368,32 @@ impl Controller {
             let downloads = self.downloads.borrow();
             songs.iter().all(|s| downloads.has(&s.id))
         };
+        let collection = self.page_collection();
         if all_saved {
             let ids: Vec<String> = songs.iter().map(|s| s.id.clone()).collect();
+            if let Some(id) = &collection {
+                self.keep_downloaded(id, false);
+            }
             self.remove_downloads(&ids);
             self.toast("Removed from downloads");
         } else {
+            // A playlist downloaded as a whole stays that way as songs are added to it.
+            if let Some(id) = &collection {
+                self.keep_downloaded(id, true);
+            }
             self.download_songs(songs);
         }
+    }
+
+    /// Called when a page has loaded: if it's a playlist that's kept downloaded, fetch any of
+    /// its songs that aren't saved yet.
+    pub fn top_up_page(self: &Rc<Self>) {
+        let Some(id) = self.page_collection() else { return };
+        if self.is_offline() || !self.downloads.borrow().collections.contains(&id) {
+            return;
+        }
+        let songs = self.page.borrow().songs.clone();
+        self.download_songs_with(songs, true);
     }
 
     /// Builds the Downloads page from what's on disk; no server involved.

@@ -1,6 +1,6 @@
 // Data passed between the Rust side and the interface.
 
-export enum Page { home, search, tracklist, artist, grid, settings, lyrics }
+export enum Page { home, search, tracklist, artist, grid, settings, lyrics, now-playing }
 
 export enum CardKind { album, artist, playlist, genre }
 
@@ -21,6 +21,8 @@ export struct Track {
     downloaded: bool,
     // Part of the current selection.
     selected: bool,
+    // Can't be played right now: the app is offline and the song isn't downloaded.
+    unavailable: bool,
 }
 
 export struct Card {
@@ -112,6 +114,7 @@ export global App {
     in property <string> download-status;
     // The server can't be reached, or offline mode is on: only downloads will play.
     in property <bool> offline;
+    in property <string> offline-label;
     // A newer version has been published.
     in property <bool> update-available;
     callback set-queue-open(open: bool);
@@ -322,6 +325,8 @@ export global Settings {
     in property <string> eq-preset;
 
     in property <string> downloads-summary;
+    // Offline mode is switched on.
+    in property <bool> offline;
     in property <string> cache-size;
     in property <string> connection;
 
@@ -361,6 +366,7 @@ export global Settings {
     callback choose-preset(x: length, y: length);
     callback clear-cache();
     callback remove-downloads();
+    callback set-offline(on: bool);
     callback choose-device(x: length, y: length);
     callback set-exclusive(on: bool);
     callback set-theme(index: int);

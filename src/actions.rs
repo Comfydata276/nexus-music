@@ -277,22 +277,16 @@ impl Controller {
     fn rate_song(self: &Rc<Self>, song: &Song, rating: u8) {
         let previous = self.rating_of(song);
         self.ratings.borrow_mut().insert(song.id.clone(), rating);
-        let id = song.id.clone();
-        let undo = id.clone();
-        self.request(
-            move |client| client.set_rating(&id, rating),
-            move |ctl, result| match result {
-                Ok(()) => ctl.toast(match rating {
-                    0 => "Rating removed".to_string(),
-                    1 => "Rated 1 star".to_string(),
-                    n => format!("Rated {n} stars"),
-                }),
-                Err(e) => {
-                    ctl.ratings.borrow_mut().insert(undo, previous);
-                    ctl.toast(format!("Couldn't save the rating. {e}"));
-                }
-            },
-        );
+        let undo = song.id.clone();
+        self.toast(match rating {
+            0 => "Rating removed".to_string(),
+            1 => "Rated 1 star".to_string(),
+            n => format!("Rated {n} stars"),
+        });
+        self.submit(crate::offline::Pending::Rating { id: song.id.clone(), rating }, move |ctl, reason| {
+            ctl.ratings.borrow_mut().insert(undo, previous);
+            ctl.toast(format!("Couldn't save the rating. {reason}"));
+        });
     }
 
     pub fn open_sleep_menu(&self, x: f32, y: f32) {
@@ -509,7 +503,12 @@ impl Controller {
             ("remove-playlist", Target::Songs { playlist: Some((playlist, rows)), .. }) => {
                 self.remove_rows_from_playlist(playlist.clone(), rows)
             }
-            ("download", _) => self.with_songs(target, |ctl, songs| ctl.download_songs(songs)),
+            ("download", _) => {
+                if let Target::Playlist { id, .. } = &target {
+                    self.keep_downloaded(id, true);
+                }
+                self.with_songs(target, |ctl, songs| ctl.download_songs(songs))
+            }
             ("remove-download", Target::Song { song, .. }) => {
                 self.remove_downloads(std::slice::from_ref(&song.id));
                 self.toast("Download removed");
@@ -748,18 +747,11 @@ impl Controller {
         // Lists of liked things are now out of date.
         self.invalidate("liked");
         self.invalidate("albums:");
-        self.request(
-            {
-                let id = id.clone();
-                move |client| client.set_starred(kind, &id, starred)
-            },
-            move |ctl, result| {
-                if let Err(e) = result {
-                    ctl.apply_star(kind, &id, !starred);
-                    ctl.toast(format!("That didn't save. {e}"));
-                }
-            },
-        );
+        let change = crate::offline::Pending::Star { kind: kind.to_string(), id: id.clone(), starred };
+        self.submit(change, move |ctl, reason| {
+            ctl.apply_star(kind, &id, !starred);
+            ctl.toast(format!("That didn't save. {reason}"));
+        });
     }
 
     // ---- callbacks from the interface ----------------------------------------------------------

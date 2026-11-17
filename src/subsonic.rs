@@ -216,6 +216,8 @@ struct Inner {
     token: String,
     /// One agent for everything, so API calls, artwork and audio share warm connections.
     agent: ureq::Agent,
+    /// Offline mode: every request fails at once instead of going out.
+    offline: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Clone)]
@@ -397,7 +399,21 @@ impl Client {
                 salt,
                 token,
                 agent: make_agent(),
+                offline: std::sync::atomic::AtomicBool::new(false),
             }),
+        }
+    }
+
+    /// In offline mode nothing is sent: requests fail straight away.
+    pub fn set_offline(&self, offline: bool) {
+        self.inner.offline.store(offline, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn check_online(&self) -> ApiResult<()> {
+        if self.inner.offline.load(std::sync::atomic::Ordering::Relaxed) {
+            Err(ApiError::Network("Offline mode is on.".into()))
+        } else {
+            Ok(())
         }
     }
 
@@ -498,6 +514,7 @@ impl Client {
         url: &str,
         overall: Option<Duration>,
     ) -> ApiResult<ureq::http::Response<ureq::Body>> {
+        self.check_online()?;
         self.inner.agent.get(url).config().timeout_global(overall).build().call().map_err(|e| {
             // The server may have moved; look its address up afresh next time.
             dns::forget();
@@ -506,6 +523,7 @@ impl Client {
     }
 
     fn post_form(&self, address: &str, form: &str) -> ApiResult<ureq::http::Response<ureq::Body>> {
+        self.check_online()?;
         self.inner
             .agent
             .post(address)
@@ -538,6 +556,7 @@ impl Client {
                 salt: self.inner.salt.clone(),
                 token: self.inner.token.clone(),
                 agent: make_agent(),
+                offline: std::sync::atomic::AtomicBool::new(false),
             }),
         };
         dns::forget();
@@ -727,6 +746,13 @@ impl Client {
         self.call::<serde_json::Value>(endpoint, &[(kind, id)], None).map(drop)
     }
 
+    /// Records that a song was played at an earlier time (milliseconds since 1970).
+    pub fn scrobble_at(&self, id: &str, at: i64) -> ApiResult<()> {
+        let at = at.to_string();
+        self.call::<serde_json::Value>("scrobble", &[("id", id), ("submission", "true"), ("time", &at)], None)
+            .map(drop)
+    }
+
     /// Rates a song from 1 to 5 stars; 0 removes the rating.
     pub fn set_rating(&self, id: &str, rating: u8) -> ApiResult<()> {
         let rating = rating.min(5).to_string();
@@ -825,7 +851,17 @@ impl Client {
         url: &str,
         range: Option<(u64, Option<u64>)>,
     ) -> ApiResult<(Box<dyn Read + Send>, Option<u64>)> {
-        self.open_stream_following(url, range, 3)
+        self.open_stream_following(url, range, 3, None)
+    }
+
+    /// Opens an internet radio stream. Stations that announce what they're playing have
+    /// those announcements taken out of the audio and the latest written to `title`.
+    pub fn open_live(
+        &self,
+        url: &str,
+        title: &std::sync::Arc<std::sync::Mutex<String>>,
+    ) -> ApiResult<(Box<dyn Read + Send>, Option<u64>)> {
+        self.open_stream_following(url, None, 3, Some(title))
     }
 
     /// `hops` is how many playlist files may be followed before giving up: radio stations
@@ -835,8 +871,14 @@ impl Client {
         url: &str,
         range: Option<(u64, Option<u64>)>,
         hops: u8,
+        live: Option<&std::sync::Arc<std::sync::Mutex<String>>>,
     ) -> ApiResult<(Box<dyn Read + Send>, Option<u64>)> {
+        self.check_online()?;
         let mut request = self.inner.agent.get(url);
+        if live.is_some() {
+            // Asks the station to include "now playing" announcements in the stream.
+            request = request.header("Icy-MetaData", "1");
+        }
         if let Some((start, end)) = range {
             let value = match end {
                 Some(end) => format!("bytes={start}-{end}"),
@@ -876,13 +918,62 @@ impl Client {
                 .read_to_string()
                 .map_err(|e| ApiError::Network(e.to_string()))?;
             return match (stream_in_playlist(&text), hops) {
-                (Some(target), 1..) => self.open_stream_following(&target, None, hops - 1),
+                (Some(target), 1..) => self.open_stream_following(&target, None, hops - 1, live),
                 _ => Err(ApiError::Network("That station's playlist has no stream this app can play.".into())),
             };
         }
         let length = response.body().content_length();
-        Ok((Box::new(response.into_body().into_reader()), length))
+        let interval = response
+            .headers()
+            .get("icy-metaint")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| *n > 0);
+        let body = response.into_body().into_reader();
+        Ok(match (live, interval) {
+            (Some(title), Some(interval)) => {
+                (Box::new(IcyReader { inner: body, interval, until_note: interval, title: title.clone() }), None)
+            }
+            _ => (Box::new(body), length),
+        })
     }
+}
+
+/// Reads a radio stream that has "now playing" announcements mixed in every `interval`
+/// bytes, passing on only the audio and keeping the latest announcement.
+struct IcyReader<R> {
+    inner: R,
+    interval: usize,
+    /// Audio bytes left before the next announcement.
+    until_note: usize,
+    title: std::sync::Arc<std::sync::Mutex<String>>,
+}
+
+impl<R: Read> Read for IcyReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.until_note == 0 {
+            // One byte gives the announcement's length in units of 16 bytes; usually zero.
+            let mut length = [0u8; 1];
+            self.inner.read_exact(&mut length)?;
+            let mut note = vec![0u8; length[0] as usize * 16];
+            self.inner.read_exact(&mut note)?;
+            if let Some(title) = stream_title(&String::from_utf8_lossy(&note)) {
+                *self.title.lock().unwrap() = title;
+            }
+            self.until_note = self.interval;
+        }
+        let want = buf.len().min(self.until_note);
+        let n = self.inner.read(&mut buf[..want])?;
+        self.until_note -= n;
+        Ok(n)
+    }
+}
+
+/// Picks the song title out of an announcement like `StreamTitle='Artist - Song';StreamUrl='';`.
+fn stream_title(note: &str) -> Option<String> {
+    let rest = note.split_once("StreamTitle='")?.1;
+    let title = rest.split_once("';").map(|(title, _)| title).unwrap_or(rest.trim_end_matches(['\0', '\'', ';']));
+    Some(title.trim().to_string())
 }
 
 /// The first stream address in an M3U or PLS playlist. (HLS playlists, which list short
@@ -941,6 +1032,25 @@ mod tests {
         assert_eq!(stream_in_playlist(pls).as_deref(), Some("https://example.org/stream"));
         assert_eq!(stream_in_playlist("#EXTM3U\n#EXT-X-TARGETDURATION:6\nhttp://x/seg1.ts\n"), None);
         assert_eq!(stream_in_playlist("nothing here"), None);
+    }
+
+    #[test]
+    fn strips_announcements_from_a_radio_stream() {
+        // Four bytes of audio, then a 16-byte announcement, then four more bytes of audio.
+        let mut stream = b"AAAA".to_vec();
+        stream.push(2);
+        let mut note = b"StreamTitle='Band - Song';".to_vec();
+        note.resize(32, 0);
+        stream.extend_from_slice(&note);
+        stream.extend_from_slice(b"BBBB");
+        stream.push(0);
+        stream.extend_from_slice(b"CC");
+        let title = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let mut reader = IcyReader { inner: &stream[..], interval: 4, until_note: 4, title: title.clone() };
+        let mut audio = Vec::new();
+        reader.read_to_end(&mut audio).unwrap();
+        assert_eq!(audio, b"AAAABBBBCC");
+        assert_eq!(*title.lock().unwrap(), "Band - Song");
     }
 
     #[test]

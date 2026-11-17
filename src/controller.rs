@@ -55,6 +55,8 @@ pub enum Route {
     Genre(String),
     Settings,
     Lyrics,
+    /// The screen about the song that's playing.
+    NowPlaying,
 }
 
 impl Route {
@@ -75,6 +77,7 @@ impl Route {
             "genre" => Route::Genre(rest.to_string()),
             "settings" => Route::Settings,
             "lyrics" => Route::Lyrics,
+            "now-playing" => Route::NowPlaying,
             _ => return None,
         })
     }
@@ -96,6 +99,7 @@ impl Route {
             Route::Genre(name) => format!("genre:{name}"),
             Route::Settings => "settings".into(),
             Route::Lyrics => "lyrics".into(),
+            Route::NowPlaying => "now-playing".into(),
         }
     }
 
@@ -119,6 +123,7 @@ impl Route {
             Route::Albums(_) | Route::Artists | Route::Genres | Route::Genre(_) => ui::Page::Grid,
             Route::Settings => ui::Page::Settings,
             Route::Lyrics => ui::Page::Lyrics,
+            Route::NowPlaying => ui::Page::NowPlaying,
         }
     }
 }
@@ -251,6 +256,11 @@ pub struct Controller {
     toast_timer: slint::Timer,
     pub tick_timer: slint::Timer,
     update_timer: slint::Timer,
+    /// Changes waiting to be sent to the server.
+    pub pending: RefCell<Vec<crate::offline::Pending>>,
+    /// The server isn't answering.
+    pub unreachable: Cell<bool>,
+    pub reconnect_timer: slint::Timer,
     /// Whether the sound device is currently held in exclusive mode.
     pub output_exclusive: Cell<bool>,
     /// The output devices last listed in the device menu: (id, name).
@@ -307,6 +317,9 @@ impl Controller {
             toast_timer: slint::Timer::default(),
             tick_timer: slint::Timer::default(),
             update_timer: slint::Timer::default(),
+            pending: RefCell::new(crate::offline::load_pending(&paths.pending)),
+            unreachable: Cell::new(false),
+            reconnect_timer: slint::Timer::default(),
             output_exclusive: Cell::new(false),
             devices: RefCell::default(),
             update: RefCell::new(None),
@@ -392,20 +405,11 @@ impl Controller {
                 config::load_password(&self.paths, &settings.server, &settings.username)
             {
                 let client = Client::new(&settings.server, &settings.username, &password);
+                client.set_offline(settings.offline);
                 self.enter(client, None);
-                // Confirm the saved login still works; if not, go back to the sign-in screen.
-                self.request(
-                    |client| client.ping(),
-                    |ctl, result| match result {
-                        Ok(info) => {
-                            ctl.ui.global::<ui::App>().set_server_version(info.version.into());
-                        }
-                        Err(crate::subsonic::ApiError::Server { .. }) => {
-                            ctl.leave("Your saved sign-in no longer works. Sign in again.");
-                        }
-                        Err(_) => {}
-                    },
-                );
+                // Confirm the saved login still works (if not, go back to the sign-in
+                // screen), and find out whether the server can be reached at all.
+                self.check_connection();
             }
         }
 
@@ -547,7 +551,8 @@ impl Controller {
     /// Asks GitHub whether a newer version exists. `manual` is a check the user asked for:
     /// it always runs, and reports problems instead of staying quiet.
     pub fn check_for_updates(self: &Rc<Self>, manual: bool) {
-        if !manual && !self.settings.borrow().check_updates {
+        // Offline mode means not going online for anything, unless asked to directly.
+        if !manual && (!self.settings.borrow().check_updates || self.settings.borrow().offline) {
             return;
         }
         if self.update_busy.get() {
@@ -696,7 +701,7 @@ impl Controller {
         self.navigate(Route::Home);
     }
 
-    fn leave(self: &Rc<Self>, message: &str) {
+    pub fn leave(self: &Rc<Self>, message: &str) {
         self.stop_playback();
         *self.client.borrow_mut() = None;
         self.cache.borrow_mut().clear();
@@ -897,7 +902,7 @@ impl Controller {
                 self.refresh_cache_size();
                 return;
             }
-            Route::Lyrics => {
+            Route::Lyrics | Route::NowPlaying => {
                 view.set_loading(false);
                 view.set_error("".into());
                 self.load_lyrics();
@@ -942,9 +947,12 @@ impl Controller {
             let page = match first {
                 Ok(page) => page,
                 Err(e) => {
-                    let offline_home = matches!(route, Route::Home)
-                        && matches!(e, crate::subsonic::ApiError::Network(_));
+                    let network = matches!(e, crate::subsonic::ApiError::Network(_));
+                    let offline_home = matches!(route, Route::Home) && network;
                     return post(move |ctl| {
+                        if network && !ctl.settings.borrow().offline {
+                            ctl.set_unreachable(true);
+                        }
                         // A failed background check leaves the stored copy on screen.
                         if ctl.nav.borrow().generation == generation && !shown {
                             let view = ctl.ui.global::<ui::View>();
@@ -1073,6 +1081,7 @@ impl Controller {
         *self.page.borrow_mut() = data;
         if !same_tracks {
             self.rebuild_tracks();
+            self.top_up_page();
         } else {
             self.sync_track_view();
         }
@@ -1083,7 +1092,7 @@ impl Controller {
     }
 
     /// Rebuilds the song rows from the page's songs, as filtered and sorted.
-    fn rebuild_tracks(&self) {
+    pub fn rebuild_tracks(&self) {
         let rows = {
             let page = self.page.borrow();
             self.track_view.borrow_mut().arrange(&page.songs);
@@ -1310,6 +1319,7 @@ impl Controller {
             starred: self.is_starred(song),
             section: SharedString::default(),
             selected: false,
+            unavailable: self.is_offline() && !self.downloads.borrow().has(&song.id),
             downloaded: self.downloads.borrow().has(&song.id),
         }
     }
@@ -1758,6 +1768,9 @@ impl Controller {
         });
         settings.on_install_update(|| {
             with(|ctl| ctl.install_update());
+        });
+        settings.on_set_offline(|on| {
+            with(|ctl| ctl.set_offline_mode(on));
         });
         settings.on_remove_downloads(|| {
             with(|ctl| ctl.remove_all_downloads());

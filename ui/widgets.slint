@@ -717,7 +717,7 @@ export component TrackRow inherits Rectangle {
     height: 56px;
     border-radius: 6px;
     background: self.track.selected ? Theme.press : touch.has-hover || reorder.dragging ? Theme.hover : transparent;
-    opacity: reorder.dragging ? 0.55 : 1;
+    opacity: reorder.dragging ? 0.55 : self.track.unavailable ? 0.4 : 1;
 
     reorder := Reorder {
         enabled: true;

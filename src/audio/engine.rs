@@ -41,6 +41,8 @@ pub struct TrackRequest {
     pub token: u64,
     /// A downloaded copy to play instead of streaming.
     pub local: Option<PathBuf>,
+    /// An internet radio stream: endless, with no seeking.
+    pub live: bool,
     pub url: String,
     /// True when the server sends the original file, which supports byte ranges.
     pub ranged: bool,
@@ -63,6 +65,8 @@ pub enum Event {
     /// Everything queued in the engine has finished playing.
     Finished,
     Failed { token: u64, message: String, unsupported: bool },
+    /// A radio station announced what it's playing.
+    StreamTitle { token: u64, title: String },
     /// The output device was (re)opened: how it's being driven, in words.
     Output { status: String, exclusive: bool },
 }
@@ -167,7 +171,7 @@ struct Deck {
     bits: u32,
     // Declared last so the reader inside `format` is dropped before the file is deleted.
     // `None` for a downloaded copy, which is read straight from disk.
-    _download: Option<Download>,
+    download: Option<Download>,
 }
 
 pub struct Engine {
@@ -222,6 +226,7 @@ impl Engine {
             out: Vec::new(),
             opened_for: 0,
             rate_switch: false,
+            stream_title: String::new(),
         };
         std::thread::Builder::new()
             .name("audio-engine".into())
@@ -375,6 +380,8 @@ struct Worker {
     /// The next track needs the device at a different rate: wait for the current one to
     /// play out, then reopen.
     rate_switch: bool,
+    /// What the radio station last said it was playing.
+    stream_title: String,
 }
 
 struct Fade {
@@ -639,6 +646,14 @@ impl Worker {
                     let _ = stream.pause();
                 }
                 self.suspended = true;
+            }
+        }
+
+        // Pass on what a radio station says it's playing.
+        if let Some(deck) = self.current.as_ref() {
+            if let Some(title) = deck.download.as_ref().map(|d| d.title()).filter(|t| *t != self.stream_title) {
+                self.stream_title = title.clone();
+                self.emit(Event::StreamTitle { token: deck.token, title });
             }
         }
 
@@ -1061,7 +1076,7 @@ fn open_deck(client: Client, request: TrackRequest, dir: &std::path::Path) -> Re
             (Box::new(file), None)
         }
         None => {
-            let download = Download::start(client, request.url.clone(), request.ranged, dir);
+            let download = Download::start(client, request.url.clone(), request.ranged, request.live, dir);
             // These two formats decide whether they can seek only when asked to, so it's safe
             // to skip the tag check at the end of the file. Others (MP4, Ogg) need the end
             // while opening.
@@ -1127,7 +1142,7 @@ fn open_deck(client: Client, request: TrackRequest, dir: &std::path::Path) -> Re
         time: request.base_secs + start,
         rate,
         bits,
-        _download: download,
+        download,
     })
 }
 
