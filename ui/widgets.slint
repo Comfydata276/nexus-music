@@ -2,7 +2,7 @@
 
 import { Theme } from "theme.slint";
 import { Icons } from "icons.slint";
-import { Covers, Card, CardKind, Track, Player, View } from "types.slint";
+import { Covers, Card, CardKind, Track, Player, View, Drag } from "types.slint";
 
 export component Icon inherits Image {
     in property <length> size: 18px;
@@ -233,7 +233,14 @@ export component ScrollThumb inherits Rectangle {
 // pointer; it works out where the row would land, draws the insertion line, and scrolls the
 // list when the pointer nears its top or bottom.
 export component Reorder inherits Rectangle {
+    // The row can be dragged at all.
     in property <bool> enabled;
+    // Dragging within the list moves the row to a new place.
+    in property <bool> reorder: true;
+    // Dragging can also carry the row to a playlist or the queue (see `Drag`).
+    in property <bool> droppable;
+    in property <string> label;
+    callback dropped(target: string);
     in property <int> index;
     in property <int> count;
     // Top and bottom of the list's visible part, in window coordinates.
@@ -256,26 +263,56 @@ export component Reorder inherits Rectangle {
         self.armed = self.enabled;
         self.press-y = y;
     }
-    // `y` is the pointer's position within the row.
-    public function drag(y: length) {
+    // `x` and `y` are the pointer's position within the row.
+    public function drag(x: length, y: length) {
         if self.armed && !self.dragging && (y - self.press-y > 6px || self.press-y - y > 6px) {
             self.dragging = true;
+            if self.droppable {
+                Drag.label = self.label;
+                Drag.target = "";
+                Drag.active = true;
+            }
         }
         self.pointer-y = self.absolute-position.y + y;
+        if self.dragging && self.droppable {
+            Drag.x = self.absolute-position.x + x;
+            Drag.y = self.pointer-y;
+        }
     }
     public function release() {
-        if self.dragging && self.delta != 0 {
+        if self.dragging && self.droppable {
+            // Places that accept a drop notice the pointer a moment after it moves, so give
+            // them that moment before deciding where the songs landed.
+            self.finishing = true;
+        } else {
+            self.finish();
+        }
+    }
+    function finish() {
+        self.finishing = false;
+        if self.dragging && self.droppable && Drag.target != "" {
+            root.dropped(Drag.target);
+        } else if self.dragging && self.reorder && self.delta != 0 {
             root.moved(self.delta);
         }
-        self.dragging = false;
-        self.armed = false;
+        self.cancel();
+    }
+    property <bool> finishing;
+    Timer {
+        interval: 20ms;
+        running: root.finishing;
+        triggered => { root.finish(); }
     }
     public function cancel() {
+        if self.dragging && self.droppable {
+            Drag.active = false;
+            Drag.target = "";
+        }
         self.dragging = false;
         self.armed = false;
     }
 
-    if root.dragging && root.delta != 0: Rectangle {
+    if root.dragging && root.reorder && root.delta != 0 && !(root.droppable && Drag.target != ""): Rectangle {
         y: (root.delta < 0 ? root.delta : root.delta + 1) * root.height - 1px;
         height: 2px;
         border-radius: 1px;
@@ -671,15 +708,23 @@ export component TrackRow inherits Rectangle {
     callback menu(x: length, y: length);
     callback reordered(delta: int);
     callback nudge(by: length);
+    // Clicked, with these modifier keys held: builds up a selection.
+    callback picked(ctrl: bool, shift: bool);
+    // Dragged onto a playlist or the queue.
+    callback dropped(target: string);
 
     property <bool> current: self.track.id != "" && self.track.id == Player.track-id;
     height: 56px;
     border-radius: 6px;
-    background: touch.has-hover || reorder.dragging ? Theme.hover : transparent;
+    background: self.track.selected ? Theme.press : touch.has-hover || reorder.dragging ? Theme.hover : transparent;
     opacity: reorder.dragging ? 0.55 : 1;
 
     reorder := Reorder {
-        enabled: root.can-reorder;
+        enabled: true;
+        reorder: root.can-reorder;
+        droppable: true;
+        label: root.track.selected && View.selection-count > 1 ? View.selection-count + " songs" : root.track.title;
+        dropped(target) => { root.dropped(target); }
         index: root.index;
         count: root.count;
         list-top: root.list-top;
@@ -703,6 +748,9 @@ export component TrackRow inherits Rectangle {
                 reorder.press(self.mouse-y);
             }
             if event.button == PointerEventButton.left && event.kind == PointerEventKind.up {
+                if !reorder.dragging {
+                    root.picked(event.modifiers.control, event.modifiers.shift);
+                }
                 reorder.release();
             }
             if event.kind == PointerEventKind.cancel {
@@ -711,7 +759,7 @@ export component TrackRow inherits Rectangle {
         }
         moved => {
             if self.pressed {
-                reorder.drag(self.mouse-y);
+                reorder.drag(self.mouse-x, self.mouse-y);
             }
         }
 

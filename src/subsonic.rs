@@ -53,6 +53,7 @@ pub struct ReplayGain {
     pub track_gain: Option<f32>,
     pub album_gain: Option<f32>,
     pub track_peak: Option<f32>,
+    pub album_peak: Option<f32>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]

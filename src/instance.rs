@@ -43,6 +43,42 @@ pub fn claim() -> bool {
     true
 }
 
+/// How much Windows is set to enlarge things on the main display (1.0 is 100%).
+pub fn system_scale() -> f32 {
+    use windows_sys::Win32::UI::HiDpi::{
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForSystem, SetProcessDpiAwarenessContext,
+    };
+    unsafe {
+        // Without declaring this first, Windows reports 100% whatever the real setting is.
+        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        (GetDpiForSystem() as f32 / 96.0).clamp(1.0, 4.0)
+    }
+}
+
+/// Colours the window's title bar and border to match the theme (Windows 11; on Windows 10
+/// the title bar goes dark instead). Colours are 0xRRGGBB.
+pub fn tint_title_bar(ui: &crate::ui::MainWindow, background: u32, text: u32) {
+    use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
+    // Not all of these are in every version of the bindings, so they're spelled out.
+    const USE_IMMERSIVE_DARK_MODE: u32 = 20;
+    const BORDER_COLOR: u32 = 34;
+    const CAPTION_COLOR: u32 = 35;
+    const TEXT_COLOR: u32 = 36;
+    let window = ui.window().window_handle();
+    let Ok(handle) = window.window_handle() else { return };
+    let RawWindowHandle::Win32(win32) = handle.as_raw() else { return };
+    let hwnd = win32.hwnd.get() as *mut std::ffi::c_void;
+    // Windows wants blue, green, red.
+    let colorref = |rgb: u32| ((rgb & 0xff) << 16) | (rgb & 0xff00) | ((rgb >> 16) & 0xff);
+    let set = |attribute: u32, value: u32| unsafe {
+        DwmSetWindowAttribute(hwnd, attribute, (&raw const value).cast(), 4);
+    };
+    set(USE_IMMERSIVE_DARK_MODE, 1);
+    set(CAPTION_COLOR, colorref(background));
+    set(BORDER_COLOR, colorref(background));
+    set(TEXT_COLOR, colorref(text));
+}
+
 /// Brings the window in front of other apps.
 pub fn focus(ui: &crate::ui::MainWindow) {
     let window = ui.window().window_handle();

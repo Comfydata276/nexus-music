@@ -197,7 +197,17 @@ impl Controller {
         let suffix = song.suffix.to_lowercase();
         let native = NATIVE_SUFFIXES.contains(&suffix.as_str()) && !pb.needs_transcode.contains(&song.id);
         let cap = settings.max_bitrate();
-        let gain = level_gain(&settings, song);
+        // Whether this song sits beside another from the same album in the play order.
+        let album_run = !song.album_id.is_empty()
+            && pb.order.iter().position(|&i| pb.queue.get(i).is_some_and(|s| s.id == song.id)).is_some_and(|at| {
+                let beside = |at: Option<usize>| {
+                    at.and_then(|at| pb.order.get(at))
+                        .and_then(|&i| pb.queue.get(i))
+                        .is_some_and(|other| other.album_id == song.album_id)
+                };
+                beside(at.checked_sub(1)) || beside(Some(at + 1))
+            });
+        let gain = level_gain(&settings, song, album_run);
         let duration_secs = song.duration as f64;
         if !song.radio_url.is_empty() {
             // A live stream: no length, no seeking, and nothing to normalise against.
@@ -1344,16 +1354,31 @@ impl Controller {
 }
 
 /// The gain to apply to a song so it lands at the chosen loudness, from its ReplayGain tags.
-fn level_gain(settings: &Settings, song: &Song) -> f32 {
-    let Some(gain_db) = song.replay_gain.as_ref().and_then(|g| g.track_gain) else { return 1.0 };
+/// `album_run` says the song is playing alongside others from its album.
+fn level_gain(settings: &Settings, song: &Song, album_run: bool) -> f32 {
     if !settings.normalize {
         return 1.0;
     }
+    let Some(tags) = song.replay_gain.as_ref() else { return 1.0 };
+    // Album gain turns a whole album up or down by one amount, keeping its songs in
+    // proportion; it falls back to the song's own value when the album one is missing.
+    let by_album = match settings.level_mode {
+        1 => false,
+        2 => true,
+        _ => album_run,
+    };
+    let (gain_db, peak) = match (by_album, tags.album_gain) {
+        (true, Some(album_gain)) => (album_gain, tags.album_peak.or(tags.track_peak)),
+        _ => match tags.track_gain {
+            Some(track_gain) => (track_gain, tags.track_peak),
+            None => return 1.0,
+        },
+    };
     let (_, offset) = VOLUME_LEVELS[(settings.volume_level as usize).min(VOLUME_LEVELS.len() - 1)];
     let gain = 10f32.powf((gain_db + offset) / 20.0);
     // Quiet and Normal never push a track's peaks past full scale. Loud may, by up to 3 dB,
     // and the limiter rounds those peaks off: that's the quality cost of the Loud setting.
-    let peak = song.replay_gain.as_ref().and_then(|g| g.track_peak).filter(|p| *p > 0.0).unwrap_or(1.0);
+    let peak = peak.filter(|p| *p > 0.0).unwrap_or(1.0);
     let headroom = if settings.volume_level >= 2 { 1.41 } else { 1.0 };
     gain.min(headroom / peak)
 }
@@ -1365,7 +1390,12 @@ mod tests {
 
     fn song(gain: f32, peak: f32) -> Song {
         Song {
-            replay_gain: Some(ReplayGain { track_gain: Some(gain), album_gain: None, track_peak: Some(peak) }),
+            replay_gain: Some(ReplayGain {
+                track_gain: Some(gain),
+                album_gain: Some(gain - 5.0),
+                track_peak: Some(peak),
+                album_peak: Some(peak),
+            }),
             ..Default::default()
         }
     }
@@ -1374,16 +1404,25 @@ mod tests {
     fn loudness_levels_respect_peaks() {
         let mut settings = Settings { normalize: true, volume_level: 1, ..Default::default() };
         // A loud modern master is turned down: -8 dB of ReplayGain plus Normal's +4 dB.
-        assert!((level_gain(&settings, &song(-8.0, 1.0)) - 10f32.powf(-4.0 / 20.0)).abs() < 0.001);
+        assert!((level_gain(&settings, &song(-8.0, 1.0), false) - 10f32.powf(-4.0 / 20.0)).abs() < 0.001);
         // A quiet track with full-scale peaks can't be raised without clipping.
-        assert_eq!(level_gain(&settings, &song(3.0, 1.0)), 1.0);
+        assert_eq!(level_gain(&settings, &song(3.0, 1.0), false), 1.0);
         // Unless Loud is chosen, which allows a little and leans on the limiter.
         settings.volume_level = 2;
-        assert!((level_gain(&settings, &song(3.0, 1.0)) - 1.41).abs() < 0.001);
+        assert!((level_gain(&settings, &song(3.0, 1.0), false) - 1.41).abs() < 0.001);
         // Off means untouched, as does a file with no ReplayGain tag.
         settings.normalize = false;
-        assert_eq!(level_gain(&settings, &song(-8.0, 1.0)), 1.0);
+        assert_eq!(level_gain(&settings, &song(-8.0, 1.0), false), 1.0);
         settings.normalize = true;
-        assert_eq!(level_gain(&settings, &Song::default()), 1.0);
+        assert_eq!(level_gain(&settings, &Song::default(), false), 1.0);
+        // Playing through an album, Auto uses the album's value (5 dB lower in this fixture);
+        // "Song" never does, and "Album" always does.
+        settings.volume_level = 1;
+        let album = 10f32.powf((-8.0 - 5.0 + 4.0) / 20.0);
+        assert!((level_gain(&settings, &song(-8.0, 1.0), true) - album).abs() < 0.001);
+        settings.level_mode = 1;
+        assert!((level_gain(&settings, &song(-8.0, 1.0), true) - 10f32.powf(-4.0 / 20.0)).abs() < 0.001);
+        settings.level_mode = 2;
+        assert!((level_gain(&settings, &song(-8.0, 1.0), false) - album).abs() < 0.001);
     }
 }

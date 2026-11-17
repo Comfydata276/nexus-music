@@ -71,6 +71,9 @@ pub struct Settings {
     pub normalize: bool,
     /// Loudness target when evening out volume: 0 quiet, 1 normal, 2 loud.
     pub volume_level: u8,
+    /// Which ReplayGain value evens out volume: 0 decides by what's playing, 1 each song's
+    /// own, 2 its album's.
+    pub level_mode: u8,
     pub scrobble: bool,
     /// Whether the queue panel is showing. (Named apart from the old `queue_open`, which was
     /// never saved, so the panel starts open for everyone.)
@@ -89,6 +92,10 @@ pub struct Settings {
     pub output_device_name: String,
     /// Take the device for this app alone and play each song at its own sample rate.
     pub exclusive: bool,
+    /// Name of the colour theme (see `THEMES`).
+    pub theme: String,
+    /// Size of the interface relative to the system's scaling; 1.0 leaves it alone.
+    pub ui_scale: f32,
     /// Closing the window leaves the app running in the notification area.
     pub close_to_tray: bool,
     pub check_updates: bool,
@@ -108,6 +115,7 @@ impl Default for Settings {
             bitrate: 0,
             normalize: false,
             volume_level: 1,
+            level_mode: 0,
             scrobble: true,
             queue_panel: true,
             crossfade: 0.0,
@@ -119,12 +127,75 @@ impl Default for Settings {
             output_device: String::new(),
             output_device_name: String::new(),
             exclusive: false,
+            theme: THEMES[0].name.to_string(),
+            ui_scale: 1.0,
             close_to_tray: true,
             check_updates: true,
             update_notified: String::new(),
         }
     }
 }
+
+/// A colour theme: surfaces from darkest to lightest, text from strongest to faintest, and
+/// the accent. Colours are 0xRRGGBB.
+pub struct ThemeColors {
+    pub name: &'static str,
+    pub base: u32,
+    pub panel: u32,
+    pub raised: u32,
+    pub overlay: u32,
+    pub text: u32,
+    pub muted: u32,
+    pub faint: u32,
+    pub accent: u32,
+    pub accent_bright: u32,
+    /// Text and icons drawn on top of the accent.
+    pub on_accent: u32,
+    /// Marks things you've liked.
+    pub warm: u32,
+}
+
+pub const THEMES: [ThemeColors; 6] = [
+    ThemeColors {
+        name: "Violet",
+        base: 0x0b0811, panel: 0x14101d, raised: 0x1e182b, overlay: 0x251e35,
+        text: 0xf3effa, muted: 0xa89fbb, faint: 0x6f6783,
+        accent: 0x8b5cf6, accent_bright: 0xa98bfb, on_accent: 0x150c2b, warm: 0xf5b85c,
+    },
+    ThemeColors {
+        name: "Green",
+        base: 0x000000, panel: 0x121212, raised: 0x1f1f1f, overlay: 0x2a2a2a,
+        text: 0xffffff, muted: 0xb3b3b3, faint: 0x6a6a6a,
+        accent: 0x1db954, accent_bright: 0x1ed760, on_accent: 0x04130a, warm: 0x1ed760,
+    },
+    ThemeColors {
+        name: "Ember",
+        base: 0x0e0907, panel: 0x17100c, raised: 0x241811, overlay: 0x2f2017,
+        text: 0xfbf3ec, muted: 0xc2ab98, faint: 0x7f6b5c,
+        accent: 0xf97316, accent_bright: 0xfb923c, on_accent: 0x2a1203, warm: 0xfbbf24,
+    },
+    ThemeColors {
+        name: "Ocean",
+        base: 0x070b12, panel: 0x0e1420, raised: 0x172033, overlay: 0x1e2a42,
+        text: 0xeef3fb, muted: 0x9fb0c9, faint: 0x647692,
+        accent: 0x3b82f6, accent_bright: 0x60a5fa, on_accent: 0x06142e, warm: 0xf5b85c,
+    },
+    ThemeColors {
+        name: "Rose",
+        base: 0x110810, panel: 0x1b0f18, raised: 0x291724, overlay: 0x341d2e,
+        text: 0xfbeff6, muted: 0xc4a4b7, faint: 0x866b7b,
+        accent: 0xec4899, accent_bright: 0xf472b6, on_accent: 0x2d0a1c, warm: 0xf5b85c,
+    },
+    ThemeColors {
+        name: "Graphite",
+        base: 0x0a0a0b, panel: 0x131315, raised: 0x1e1e21, overlay: 0x28282c,
+        text: 0xf4f4f5, muted: 0xa1a1aa, faint: 0x6b6b74,
+        accent: 0xd4d4d8, accent_bright: 0xf4f4f5, on_accent: 0x18181b, warm: 0xf5b85c,
+    },
+];
+
+/// Interface sizes offered in Settings: label and scale.
+pub const UI_SCALES: [(&str, f32); 4] = [("Small", 0.9), ("Normal", 1.0), ("Large", 1.12), ("Larger", 1.25)];
 
 /// Streaming quality choices: name, what it costs, and the bitrate cap sent to the server
 /// (0 = the original file).
@@ -143,6 +214,9 @@ pub const QUALITIES: [(&str, &str, u32); 4] = [
 /// Loudness targets for evening out volume: name and the offset in dB from the ReplayGain
 /// reference level (which sits between Quiet and Normal).
 pub const VOLUME_LEVELS: [(&str, f32); 3] = [("Quiet", -1.0), ("Normal", 4.0), ("Loud", 7.0)];
+
+/// How volume is evened out: by song, by album, or whichever suits what's playing.
+pub const LEVEL_MODES: [&str; 3] = ["Auto", "Song", "Album"];
 
 /// Equaliser presets: name and the gain in dB for each of the six bands.
 pub const EQ_PRESETS: [(&str, [f32; 6]); 10] = [
@@ -167,6 +241,10 @@ impl Settings {
         if let Ok(json) = serde_json::to_vec_pretty(self) {
             write_atomically(path, &json);
         }
+    }
+
+    pub fn theme(&self) -> &'static ThemeColors {
+        THEMES.iter().find(|t| t.name == self.theme).unwrap_or(&THEMES[0])
     }
 
     pub fn max_bitrate(&self) -> u32 {

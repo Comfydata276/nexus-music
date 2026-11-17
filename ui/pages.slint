@@ -3,7 +3,7 @@
 import { ScrollView, ListView, AboutSlint } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { Icons } from "icons.slint";
-import { App, View, Player, Lyrics, Settings, Covers, Card, CardKind, Shelf, Page, QualityOption } from "types.slint";
+import { App, View, Player, Lyrics, Settings, Covers, Card, CardKind, Shelf, Page, QualityOption, ThemeOption } from "types.slint";
 import { Icon, IconButton, PlayButton, TextButton, LinkText, Cover, Field, Toggle, Chip, Slider, MediaCard, TrackRow, PageStatus, HoverIntent, SkeletonRows, ScrollThumb } from "widgets.slint";
 
 // Cover, title and summary at the top of an album, playlist or artist.
@@ -29,7 +29,7 @@ component Hero inherits Rectangle {
 
             if View.liked-songs: Rectangle {
                 border-radius: 8px;
-                background: @linear-gradient(135deg, #5b3fd6 0%, #f5b85c 100%);
+                background: @linear-gradient(135deg, Theme.accent.darker(0.25) 0%, Theme.warm 100%);
                 Icon {
                     source: Icons.heart-fill;
                     size: root.art * 0.34;
@@ -561,9 +561,13 @@ export component StackPage inherits Rectangle {
                     show-album: View.show-album;
                     show-cover: View.show-cover;
                     show-number: View.show-number;
+                    index: index;
+                    count: View.tracks.length;
                     activated => { View.track-activated(index); }
                     star => { View.track-star(index); }
                     menu(x, y) => { View.track-menu(index, x, y); }
+                    picked(ctrl, shift) => { View.track-clicked(index, ctrl, shift); }
+                    dropped(target) => { View.rows-dropped(index, target); }
                 }
             }
 
@@ -694,6 +698,8 @@ export component TrackListPage inherits Rectangle {
                         activated => { View.track-activated(index); }
                         star => { View.track-star(index); }
                         menu(x, y) => { View.track-menu(index, x, y); }
+                        picked(ctrl, shift) => { View.track-clicked(index, ctrl, shift); }
+                        dropped(target) => { View.rows-dropped(index, target); }
                         reordered(delta) => { View.track-moved(index, delta); }
                         nudge(by) => {
                             tracks.content-y = clamp(tracks.content-y + by, min(0px, tracks.visible-height - tracks.content-height), 0px);
@@ -942,6 +948,52 @@ component SettingGroup inherits VerticalLayout {
     }
 
     @children
+}
+
+// A colour theme to pick: its surface colour with a dot of its accent, and its name.
+component ThemeSwatch inherits Rectangle {
+    in property <ThemeOption> option;
+    in property <bool> selected;
+    callback clicked;
+
+    min-width: 76px;
+    max-width: 124px;
+    horizontal-stretch: 1;
+    height: 84px;
+    border-radius: 10px;
+    background: self.option.surface;
+    border-width: self.selected ? 2px : 1px;
+    border-color: self.selected ? Theme.accent-bright : touch.has-hover ? Theme.muted : Theme.line;
+    animate border-color { duration: 120ms; }
+
+    accessible-role: button;
+    accessible-label: self.option.name + " theme";
+    accessible-checkable: true;
+    accessible-checked: self.selected;
+    accessible-action-default => { root.clicked(); }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+
+    Rectangle {
+        x: 14px;
+        y: 14px;
+        width: 22px;
+        height: 22px;
+        border-radius: 11px;
+        background: root.option.accent;
+    }
+
+    Text {
+        x: 14px;
+        y: parent.height - self.height - 12px;
+        text: root.option.name;
+        color: white;
+        font-size: 13px;
+        font-weight: 600;
+    }
 }
 
 // One choice in the streaming quality list.
@@ -1218,6 +1270,37 @@ export component SettingsPage inherits Rectangle {
                     }
 
                     SettingGroup {
+                        title: "Appearance";
+
+                        SettingRow {
+                            title: "Theme";
+                            detail: "Colours for the whole app, including the window's title bar.";
+                        }
+
+                        HorizontalLayout {
+                            spacing: 10px;
+                            for option[index] in Settings.themes: ThemeSwatch {
+                                option: option;
+                                selected: index == Settings.theme;
+                                clicked => { Settings.set-theme(index); }
+                            }
+                        }
+
+                        SettingRow {
+                            title: "Interface size";
+                            detail: "Makes text and controls larger or smaller. Applies the next time the app starts.";
+                            HorizontalLayout {
+                                spacing: 6px;
+                                for name[index] in Settings.ui-scales: Chip {
+                                    text: name;
+                                    selected: index == Settings.ui-scale;
+                                    clicked => { Settings.set-ui-scale(index); }
+                                }
+                            }
+                        }
+                    }
+
+                    SettingGroup {
                         title: "Audio quality";
 
                         Text {
@@ -1333,6 +1416,19 @@ export component SettingsPage inherits Rectangle {
                                     text: name;
                                     selected: index == Settings.volume-level;
                                     clicked => { Settings.set-volume-level(index); }
+                                }
+                            }
+                        }
+
+                        if Settings.normalize: SettingRow {
+                            title: "Level by";
+                            detail: "Song makes every song equally loud. Album keeps an album's quiet and loud songs in proportion. Auto uses Album while you play an album through, and Song otherwise.";
+                            HorizontalLayout {
+                                spacing: 6px;
+                                for name[index] in Settings.level-modes: Chip {
+                                    text: name;
+                                    selected: index == Settings.level-mode;
+                                    clicked => { Settings.set-level-mode(index); }
                                 }
                             }
                         }
@@ -1479,7 +1575,7 @@ export component LoginPage inherits Rectangle {
 
     // A wash of the brand colour behind the form.
     Rectangle {
-        background: @radial-gradient(circle, #8b5cf640 0%, #8b5cf600 70%);
+        background: @radial-gradient(circle, Theme.accent.with-alpha(0.25) 0%, Theme.accent.with-alpha(0) 70%);
         width: 900px;
         height: 900px;
         y: -420px;

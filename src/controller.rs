@@ -220,6 +220,9 @@ pub struct Controller {
     pub page: RefCell<PageData>,
     pub tracks_model: Rc<VecModel<ui::Track>>,
     pub track_view: RefCell<TrackView>,
+    /// Rows of the song list that are selected, and the row a Shift-click extends from.
+    pub selection: RefCell<std::collections::BTreeSet<usize>>,
+    selection_anchor: Cell<Option<usize>>,
     pub queue_model: Rc<VecModel<ui::Track>>,
     /// Songs that have been played, newest first, including the one playing now.
     pub history: RefCell<Vec<Song>>,
@@ -280,6 +283,8 @@ impl Controller {
             page: RefCell::default(),
             tracks_model: Rc::new(VecModel::default()),
             track_view: RefCell::default(),
+            selection: RefCell::default(),
+            selection_anchor: Cell::new(None),
             queue_model: Rc::new(VecModel::default()),
             history: RefCell::new(config::load_history(&paths.history)),
             history_model: Rc::new(VecModel::default()),
@@ -412,6 +417,20 @@ impl Controller {
         });
 
         self.sync_downloads();
+        self.apply_theme();
+        // The title bar can only be coloured once the window exists.
+        #[cfg(windows)]
+        slint::Timer::single_shot(Duration::from_millis(50), || {
+            with(|ctl| ctl.apply_theme());
+        });
+        // Likewise the buttons on the taskbar thumbnail.
+        #[cfg(windows)]
+        slint::Timer::single_shot(Duration::from_millis(400), || {
+            with(|ctl| {
+                crate::taskbar::install(&ctl.ui);
+                ctl.sync_tray();
+            });
+        });
         self.start_shell();
         // Look for a new version shortly after opening, then a few times a day.
         self.ui.global::<ui::Settings>().set_can_self_update(crate::update::installed_copy());
@@ -457,6 +476,26 @@ impl Controller {
         }
     }
 
+    /// Paints the interface, and the window's title bar, in the chosen theme's colours.
+    pub fn apply_theme(&self) {
+        let colors = self.settings.borrow().theme();
+        let color = |rgb: u32| slint::Color::from_argb_encoded(0xff00_0000 | rgb);
+        let theme = self.ui.global::<ui::Theme>();
+        theme.set_base(color(colors.base));
+        theme.set_panel(color(colors.panel));
+        theme.set_raised(color(colors.raised));
+        theme.set_overlay(color(colors.overlay));
+        theme.set_text(color(colors.text));
+        theme.set_muted(color(colors.muted));
+        theme.set_faint(color(colors.faint));
+        theme.set_accent(color(colors.accent));
+        theme.set_accent_bright(color(colors.accent_bright));
+        theme.set_on_accent(color(colors.on_accent));
+        theme.set_warm(color(colors.warm));
+        #[cfg(windows)]
+        crate::instance::tint_title_bar(&self.ui, colors.base, colors.muted);
+    }
+
     /// Whether closing the window should leave the app running in the notification area.
     fn stays_in_tray(&self) -> bool {
         #[cfg(windows)]
@@ -468,6 +507,11 @@ impl Controller {
 
     /// Shows the tray icon only while it has a job: when closing hides the window to it.
     pub fn sync_tray(&self) {
+        #[cfg(windows)]
+        {
+            let pb = self.playback.borrow();
+            crate::taskbar::update(pb.playing, pb.current().is_some());
+        }
         #[cfg(windows)]
         if let Some(tray) = self.tray.borrow().as_ref() {
             let pb = self.playback.borrow();
@@ -1046,7 +1090,92 @@ impl Controller {
             self.track_rows(&page)
         };
         self.tracks_model.set_vec(rows);
+        // The rows are new, so nothing is selected any more.
+        self.selection.borrow_mut().clear();
+        self.selection_anchor.set(None);
+        self.ui.global::<ui::View>().set_selection_count(0);
         self.sync_track_view();
+    }
+
+    // ---- selecting songs -----------------------------------------------------------------------
+
+    /// Replaces the selection, updating only the rows whose state changed.
+    fn set_selection(&self, rows: std::collections::BTreeSet<usize>) {
+        let old = self.selection.replace(rows.clone());
+        for &row in old.symmetric_difference(&rows) {
+            if let Some(mut track) = self.tracks_model.row_data(row) {
+                track.selected = rows.contains(&row);
+                self.tracks_model.set_row_data(row, track);
+            }
+        }
+        self.ui.global::<ui::View>().set_selection_count(rows.len() as i32);
+    }
+
+    /// A row was clicked: plain selects it alone, Ctrl adds or removes it, Shift selects
+    /// everything from the last row clicked to this one.
+    fn track_clicked(&self, row: usize, ctrl: bool, shift: bool) {
+        let mut rows = self.selection.borrow().clone();
+        match (shift, self.selection_anchor.get()) {
+            (true, Some(anchor)) => {
+                if !ctrl {
+                    rows.clear();
+                }
+                rows.extend(row.min(anchor)..=row.max(anchor));
+            }
+            _ => {
+                if ctrl {
+                    if !rows.remove(&row) {
+                        rows.insert(row);
+                    }
+                } else {
+                    rows = [row].into();
+                }
+                self.selection_anchor.set(Some(row));
+            }
+        }
+        self.set_selection(rows);
+    }
+
+    pub fn clear_selection(&self) {
+        self.selection_anchor.set(None);
+        self.set_selection(Default::default());
+    }
+
+    /// The rows an action on `row` applies to: the whole selection if `row` is part of one,
+    /// otherwise that row alone (which becomes the selection).
+    pub fn rows_for(&self, row: usize) -> Vec<usize> {
+        let selected = self.selection.borrow().clone();
+        if selected.len() > 1 && selected.contains(&row) {
+            return selected.into_iter().collect();
+        }
+        self.selection_anchor.set(Some(row));
+        self.set_selection([row].into());
+        vec![row]
+    }
+
+    /// The songs on these rows, with each one's position in the page's own list.
+    pub fn songs_on(&self, rows: &[usize]) -> Vec<(usize, Song)> {
+        let page = self.page.borrow();
+        rows.iter()
+            .filter_map(|&row| self.song_index(row))
+            .filter_map(|index| page.songs.get(index).map(|song| (index, song.clone())))
+            .collect()
+    }
+
+    /// Rows were dragged onto a playlist in the sidebar or onto the queue panel.
+    fn rows_dropped(self: &Rc<Self>, row: usize, target: &str) {
+        let songs: Vec<Song> = self.songs_on(&self.rows_for(row)).into_iter().map(|(_, song)| song).collect();
+        let songs: Vec<Song> = songs.into_iter().filter(|s| s.radio_url.is_empty()).collect();
+        if songs.is_empty() {
+            return;
+        }
+        if target == "queue" {
+            let count = songs.len();
+            self.enqueue(songs, false);
+            self.toast(if count == 1 { "Added to queue".to_string() } else { format!("{count} songs added to queue") });
+        } else if let Some(id) = target.strip_prefix("playlist:") {
+            self.add_to_playlist(id.to_string(), songs);
+        }
     }
 
     /// Shows the state of the filter and sort controls.
@@ -1180,6 +1309,7 @@ impl Controller {
             number: SharedString::default(),
             starred: self.is_starred(song),
             section: SharedString::default(),
+            selected: false,
             downloaded: self.downloads.borrow().has(&song.id),
         }
     }
@@ -1290,6 +1420,8 @@ impl Controller {
         page.set_normalize(settings.normalize);
         page.set_volume_levels(strings(VOLUME_LEVELS.iter().map(|l| l.0).collect()));
         page.set_volume_level(settings.volume_level as i32);
+        page.set_level_modes(strings(config::LEVEL_MODES.to_vec()));
+        page.set_level_mode(settings.level_mode.min(2) as i32);
         page.set_mono(settings.mono);
         page.set_scrobble(settings.scrobble);
         page.set_equalizer(settings.equalizer);
@@ -1312,6 +1444,21 @@ impl Controller {
                 .into(),
         );
         page.set_exclusive(settings.exclusive);
+        page.set_themes(ModelRc::new(VecModel::from(
+            config::THEMES
+                .iter()
+                .map(|t| ui::ThemeOption {
+                    name: t.name.into(),
+                    accent: slint::Color::from_argb_encoded(0xff00_0000 | t.accent_bright),
+                    surface: slint::Color::from_argb_encoded(0xff00_0000 | t.panel),
+                })
+                .collect::<Vec<_>>(),
+        )));
+        page.set_theme(config::THEMES.iter().position(|t| t.name == settings.theme).unwrap_or(0) as i32);
+        page.set_ui_scales(strings(config::UI_SCALES.iter().map(|s| s.0).collect()));
+        page.set_ui_scale(
+            config::UI_SCALES.iter().position(|s| (s.1 - settings.ui_scale).abs() < 0.01).unwrap_or(1) as i32,
+        );
         page.set_close_to_tray(settings.close_to_tray);
         page.set_check_updates(settings.check_updates);
     }
@@ -1427,6 +1574,21 @@ impl Controller {
         view.on_track_moved(|index, delta| {
             with(|ctl| ctl.move_playlist_track(index.max(0) as usize, (index + delta).max(0) as usize));
         });
+        view.on_track_clicked(|index, ctrl, shift| {
+            with(|ctl| ctl.track_clicked(index.max(0) as usize, ctrl, shift));
+        });
+        view.on_rows_dropped(|index, target| {
+            with(|ctl| ctl.rows_dropped(index.max(0) as usize, &target));
+        });
+        view.on_select_all(|| {
+            with(|ctl| {
+                let all = (0..ctl.tracks_model.row_count()).collect();
+                ctl.set_selection(all);
+            });
+        });
+        view.on_clear_selection(|| {
+            with(|ctl| ctl.clear_selection());
+        });
         view.on_download(|| {
             with(|ctl| ctl.toggle_page_download());
         });
@@ -1524,6 +1686,12 @@ impl Controller {
                 ctl.reload_current();
             });
         });
+        settings.on_set_level_mode(|mode| {
+            with(|ctl| {
+                ctl.change_setting(true, |s| s.level_mode = mode.clamp(0, 2) as u8);
+                ctl.reload_current();
+            });
+        });
         settings.on_set_mono(|on| {
             with(|ctl| ctl.change_setting(true, |s| s.mono = on));
         });
@@ -1554,6 +1722,22 @@ impl Controller {
         });
         settings.on_set_exclusive(|on| {
             with(|ctl| ctl.change_setting(true, |s| s.exclusive = on));
+        });
+        settings.on_set_theme(|index| {
+            with(|ctl| {
+                let Some(theme) = config::THEMES.get(index as usize) else { return };
+                ctl.change_setting(true, |s| s.theme = theme.name.to_string());
+                ctl.apply_theme();
+            });
+        });
+        settings.on_set_ui_scale(|index| {
+            with(|ctl| {
+                let Some((_, scale)) = config::UI_SCALES.get(index as usize) else { return };
+                if (ctl.settings.borrow().ui_scale - scale).abs() > 0.01 {
+                    ctl.change_setting(true, |s| s.ui_scale = *scale);
+                    ctl.toast("The new size takes effect the next time Nexus Music starts");
+                }
+            });
         });
         settings.on_set_close_to_tray(|on| {
             with(|ctl| {

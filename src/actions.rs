@@ -20,6 +20,12 @@ pub enum Target {
         /// Set when the row is in the queue: how far after the current track.
         upcoming: Option<usize>,
     },
+    /// Several songs chosen together.
+    Songs {
+        songs: Vec<Song>,
+        /// Set when they're rows of a playlist: its id and the rows' positions.
+        playlist: Option<(String, Vec<usize>)>,
+    },
     Album { id: String, title: String },
     Artist { id: String, name: String },
     Playlist { id: String, name: String },
@@ -132,8 +138,42 @@ impl Controller {
         self.song_menu(song, None, None, x, y);
     }
 
+    /// The menu for several selected songs.
+    fn songs_menu(&self, songs: Vec<Song>, playlist: Option<(String, Vec<usize>)>, x: f32, y: f32) {
+        let icons = self.ui.global::<ui::Icons>();
+        let mut entries = vec![
+            self.entry("play-next", "Play next", icons.get_list_start()),
+            self.entry("add-queue", "Add to queue", icons.get_list_end()),
+            self.separator(),
+        ];
+        let mut add = self.entry("add-to", "Add to playlist", icons.get_list_plus());
+        add.submenu = true;
+        entries.push(add);
+        entries.push(self.entry("star-all", "Add to Liked songs", icons.get_heart()));
+        entries.push(self.entry("download", "Download", icons.get_download()));
+        if playlist.is_some() {
+            entries.push(self.separator());
+            entries.push(self.entry("remove-playlist", "Remove from this playlist", icons.get_trash_2()));
+        }
+        let title = format!("{} songs", songs.len());
+        self.open_menu(Target::Songs { songs, playlist }, &title, entries, x, y);
+    }
+
     /// `row` is the row as shown, which a filter or sort can put anywhere in the list.
     pub fn open_track_menu(self: &Rc<Self>, row: usize, x: f32, y: f32) {
+        // Right-clicking inside a selection acts on all of it.
+        let rows = self.rows_for(row);
+        if rows.len() > 1 {
+            let chosen = self.songs_on(&rows);
+            let playlist = self.page.borrow().playlist.as_ref().map(|p| {
+                (p.id.clone(), chosen.iter().map(|(index, _)| *index).collect::<Vec<_>>())
+            });
+            let songs: Vec<Song> =
+                chosen.into_iter().map(|(_, song)| song).filter(|s| s.radio_url.is_empty()).collect();
+            if songs.len() > 1 {
+                return self.songs_menu(songs, playlist, x, y);
+            }
+        }
         let Some(index) = self.song_index(row) else { return };
         let (song, playlist) = {
             let page = self.page.borrow();
@@ -313,6 +353,7 @@ impl Controller {
         match target {
             Target::None => {}
             Target::Song { song, .. } => then(self, vec![song]),
+            Target::Songs { songs, .. } => then(self, songs),
             Target::Album { id, .. } => self.request(
                 move |client| client.album(&id).map(|a| a.songs),
                 move |ctl, result| finish(ctl, result, then),
@@ -431,6 +472,7 @@ impl Controller {
         let target = std::mem::take(&mut self.menu.borrow_mut().target);
         let name = match &target {
             Target::Song { song, .. } => song.title.clone(),
+            Target::Songs { songs, .. } => format!("{} songs", songs.len()),
             Target::Album { title, .. } => title.clone(),
             Target::Artist { name, .. } | Target::Playlist { name, .. } => name.clone(),
             Target::None => return,
@@ -458,6 +500,15 @@ impl Controller {
                 self.remove_from_playlist(playlist.clone(), *index)
             }
             ("remove-queue", Target::Song { upcoming: Some(offset), .. }) => self.remove_upcoming(*offset),
+            ("star-all", Target::Songs { songs, .. }) => {
+                for song in songs.iter().filter(|song| !self.is_starred(song)) {
+                    self.set_star("id", song.id.clone(), true);
+                }
+                self.toast(format!("{} songs added to Liked songs", songs.len()));
+            }
+            ("remove-playlist", Target::Songs { playlist: Some((playlist, rows)), .. }) => {
+                self.remove_rows_from_playlist(playlist.clone(), rows)
+            }
             ("download", _) => self.with_songs(target, |ctl, songs| ctl.download_songs(songs)),
             ("remove-download", Target::Song { song, .. }) => {
                 self.remove_downloads(std::slice::from_ref(&song.id));
@@ -564,7 +615,7 @@ impl Controller {
 
     // ---- playlists -----------------------------------------------------------------------------
 
-    fn add_to_playlist(self: &Rc<Self>, playlist_id: String, songs: Vec<Song>) {
+    pub fn add_to_playlist(self: &Rc<Self>, playlist_id: String, songs: Vec<Song>) {
         let name = self
             .playlists
             .borrow()
@@ -583,6 +634,36 @@ impl Controller {
                     ctl.reload_playlists();
                 }
                 Err(e) => ctl.toast(e.to_string()),
+            },
+        );
+    }
+
+    /// Takes several songs out of the playlist on screen in one go, by saving what remains.
+    fn remove_rows_from_playlist(self: &Rc<Self>, playlist_id: String, rows: &[usize]) {
+        let (remaining, removed) = {
+            let mut page = self.page.borrow_mut();
+            if page.playlist.as_ref().is_none_or(|p| p.id != playlist_id) {
+                return;
+            }
+            let before = page.songs.len();
+            let mut index = 0;
+            page.songs.retain(|_| {
+                index += 1;
+                !rows.contains(&(index - 1))
+            });
+            (page.songs.iter().map(|s| s.id.clone()).collect::<Vec<_>>(), before - page.songs.len())
+        };
+        let key = format!("playlist:{playlist_id}");
+        self.request(
+            move |client| client.replace_playlist(&playlist_id, &remaining),
+            move |ctl, result| {
+                ctl.invalidate(&key);
+                match result {
+                    Ok(()) => ctl.toast(format!("{removed} songs removed from the playlist")),
+                    Err(e) => ctl.toast(e.to_string()),
+                }
+                ctl.reload_playlists();
+                ctl.refresh();
             },
         );
     }

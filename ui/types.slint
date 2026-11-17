@@ -19,6 +19,8 @@ export struct Track {
     section: string,
     // A copy is saved on this PC.
     downloaded: bool,
+    // Part of the current selection.
+    selected: bool,
 }
 
 export struct Card {
@@ -56,6 +58,13 @@ export struct MenuEntry {
     separator: bool,
     danger: bool,
     submenu: bool,
+}
+
+// A colour theme offered in Settings, shown as a swatch.
+export struct ThemeOption {
+    name: string,
+    accent: color,
+    surface: color,
 }
 
 export struct LyricLine {
@@ -101,6 +110,8 @@ export global App {
     in property <bool> queue-open;
     // Progress of downloads under way, e.g. "Downloading 3 of 12"; empty when idle.
     in property <string> download-status;
+    // The server can't be reached, or offline mode is on: only downloads will play.
+    in property <bool> offline;
     // A newer version has been published.
     in property <bool> update-available;
     callback set-queue-open(open: bool);
@@ -157,6 +168,8 @@ export global View {
     // The page's songs can be saved on this PC. State: 0 none saved, 1 in progress, 2 all saved.
     in property <bool> can-download;
     in property <int> download-state;
+    // How many song rows are selected.
+    in property <int> selection-count;
     // Rows can be dragged into a new order: a playlist shown in its own order, unfiltered.
     in property <bool> can-reorder;
 
@@ -169,6 +182,13 @@ export global View {
     callback track-star(index: int);
     callback track-menu(index: int, x: length, y: length);
     callback track-moved(index: int, delta: int);
+    // A row was clicked, with Ctrl or Shift held to build up a selection.
+    callback track-clicked(index: int, ctrl: bool, shift: bool);
+    // The row at `index` (with the rest of the selection, if it's part of one) was dragged
+    // onto `target`: "queue" or "playlist:<id>".
+    callback rows-dropped(index: int, target: string);
+    callback select-all();
+    callback clear-selection();
     callback download();
     callback set-filter(text: string);
     callback choose-track-sort(x: length, y: length);
@@ -180,6 +200,16 @@ export global View {
     callback set-sort(index: int);
     callback columns-changed(columns: int);
     callback near-end();
+}
+
+// Songs being dragged towards a playlist or the queue. Rows publish the pointer's position
+// here; places that accept a drop watch it and name themselves as the target.
+export global Drag {
+    in-out property <bool> active;
+    in-out property <length> x;
+    in-out property <length> y;
+    in-out property <string> label;
+    in-out property <string> target;
 }
 
 export global Player {
@@ -280,6 +310,8 @@ export global Settings {
     in property <bool> normalize;
     in property <[string]> volume-levels;
     in property <int> volume-level;
+    in property <[string]> level-modes;
+    in property <int> level-mode;
     in property <bool> mono;
     in property <bool> scrobble;
 
@@ -298,6 +330,11 @@ export global Settings {
     in property <string> output-status;
     in property <bool> exclusive;
 
+    in property <[ThemeOption]> themes;
+    in property <int> theme;
+    in property <[string]> ui-scales;
+    in property <int> ui-scale;
+
     in property <bool> close-to-tray;
     in property <bool> check-updates;
     // What the last check for a new version found, in words.
@@ -315,6 +352,7 @@ export global Settings {
     callback set-autoplay(on: bool);
     callback set-normalize(on: bool);
     callback set-volume-level(level: int);
+    callback set-level-mode(mode: int);
     callback set-mono(on: bool);
     callback set-scrobble(on: bool);
     callback set-equalizer(on: bool);
@@ -325,6 +363,8 @@ export global Settings {
     callback remove-downloads();
     callback choose-device(x: length, y: length);
     callback set-exclusive(on: bool);
+    callback set-theme(index: int);
+    callback set-ui-scale(index: int);
     callback set-close-to-tray(on: bool);
     callback set-check-updates(on: bool);
     callback check-updates-now();

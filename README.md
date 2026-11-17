@@ -18,6 +18,8 @@ by the app itself.
 - A queue panel beside the page, with a play button on every row to skip straight to it.
   Drag rows to reorder the queue, or the songs in a playlist.
 - Find and sort within a playlist or Liked songs.
+- Select several songs with Ctrl or Shift, then drag them onto a playlist or the queue, or
+  right-click to act on them all.
 - Recently played: the last hundred songs, each playable again by itself.
 - Autoplay: when the queue ends it carries on with similar songs, falling back to the same
   genre when Navidrome has no similar-song source set up.
@@ -40,6 +42,8 @@ by the app itself.
 - Keeps playing from the notification area when the window is closed (optional), and
   opening it a second time brings back the copy that's already running.
 - Checks GitHub for new versions and installs them on request.
+- Colour themes that carry through to the window's title bar, and an interface size setting.
+- Previous, play and next buttons on the taskbar thumbnail.
 
 Keyboard: Space plays or pauses, Ctrl+Left/Right changes track, Ctrl+Up/Down changes
 volume, Ctrl+K jumps to search, Alt+Left/Right goes back and forward, F5 reloads the page.
@@ -126,7 +130,8 @@ connection.
 | `src/update.rs` | Finds, downloads and verifies new releases. |
 | `src/downloads.rs` | Songs saved for offline listening. |
 | `src/audio/exclusive.rs` | Exclusive-mode (WASAPI) output on Windows. |
-| `src/instance.rs` | One running copy at a time (Windows). |
+| `src/instance.rs` | One running copy at a time, title bar colour, display scaling (Windows). |
+| `src/taskbar.rs` | Buttons on the taskbar thumbnail (Windows). |
 | `installer/` | NSIS script for the Windows installer. |
 
 ## Licences of bundled work

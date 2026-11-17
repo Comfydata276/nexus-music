@@ -8,13 +8,13 @@ import "fonts/BricolageGrotesque-ExtraBold.ttf";
 
 import { Theme } from "theme.slint";
 import { Icons } from "icons.slint";
-import { App, View, Player, Menu, Prompt, Toast, Lyrics, Settings, Covers, Page, Track, Card, CardKind, Shelf, CardRow, PlaylistRef, MenuEntry, LyricLine, QualityOption } from "types.slint";
+import { Drag, App, View, Player, Menu, Prompt, Toast, Lyrics, Settings, Covers, Page, Track, Card, CardKind, Shelf, CardRow, PlaylistRef, MenuEntry, LyricLine, QualityOption, ThemeOption } from "types.slint";
 import { PageStatus } from "widgets.slint";
 import { Sidebar, TopBar, QueuePanel, PlayerBar } from "chrome.slint";
 import { StackPage, TrackListPage, GridPage, LyricsPage, SettingsPage, LoginPage } from "pages.slint";
 import { MenuOverlay, PromptOverlay, ToastOverlay } from "overlays.slint";
 
-export { App, View, Player, Menu, Prompt, Toast, Lyrics, Settings, Covers, Icons, Page, Track, Card, CardKind, Shelf, CardRow, PlaylistRef, MenuEntry, LyricLine, QualityOption }
+export { Theme, App, View, Player, Menu, Prompt, Toast, Lyrics, Settings, Covers, Icons, Page, Track, Card, CardKind, Shelf, CardRow, PlaylistRef, MenuEntry, LyricLine, QualityOption, ThemeOption }
 
 // The icon in the notification area, shown while closing the window keeps the app running.
 export component Tray inherits SystemTrayIcon {
@@ -83,7 +83,7 @@ export component MainWindow inherits Window {
     // Whether the page has a cover whose colour should wash the top of the panel.
     property <bool> tinted: App.page == Page.tracklist || App.page == Page.artist;
     property <bool> liked: App.page == Page.tracklist && View.liked-songs;
-    property <color> wash: self.liked ? #5b3fd6
+    property <color> wash: self.liked ? Theme.accent.darker(0.25)
         : self.tinted ? Covers.tint(View.cover, Covers.rev)
         : App.page == Page.home ? Theme.accent : Theme.panel;
     // The Rust side bumps this after navigating, to take the keyboard back from the search box.
@@ -134,9 +134,15 @@ export component MainWindow inherits Window {
             if event.text == Key.Escape {
                 if Menu.open {
                     Menu.dismissed();
+                } else if View.selection-count > 0 {
+                    View.clear-selection();
                 } else {
                     self.focus();
                 }
+                return accept;
+            }
+            if event.modifiers.control && event.text == "a" && (App.page == Page.tracklist || App.page == Page.search || App.page == Page.artist) {
+                View.select-all();
                 return accept;
             }
             return reject;
@@ -192,8 +198,8 @@ export component MainWindow inherits Window {
                 }
 
                 Rectangle {
-                    y: 64px;
-                    height: parent.height - 64px;
+                    y: 76px;
+                    height: parent.height - 76px;
 
                     if View.loading || View.error != "": PageStatus {
                         loading: View.loading;
@@ -231,6 +237,30 @@ export component MainWindow inherits Window {
 
         ToastOverlay {
             y: root.height - self.height - (App.signed-in ? 100px : 32px);
+        }
+
+        // What's being dragged, following the pointer.
+        if Drag.active: Rectangle {
+            x: min(Drag.x + 14px, root.width - self.width - 8px);
+            y: min(Drag.y + 12px, root.height - self.height - 8px);
+            width: min(drag-label.preferred-width + 28px, 280px);
+            height: 34px;
+            border-radius: 17px;
+            background: Drag.target != "" ? Theme.accent : Theme.overlay;
+            border-width: 1px;
+            border-color: Theme.line;
+            drop-shadow-blur: 16px;
+            drop-shadow-color: #00000080;
+
+            drag-label := Text {
+                width: parent.width - 28px;
+                text: Drag.label;
+                color: Drag.target != "" ? white : Theme.text;
+                font-size: 13px;
+                font-weight: 600;
+                horizontal-alignment: center;
+                overflow: elide;
+            }
         }
 
         if Menu.open: MenuOverlay { }
