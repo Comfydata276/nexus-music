@@ -16,6 +16,8 @@ by the app itself.
 - Home, search, albums (sortable), artists, genres, playlists and Liked songs.
 - Gapless playback or crossfade, seeking, shuffle, repeat and a queue you can edit.
 - A queue panel beside the page, with a play button on every row to skip straight to it.
+  Drag rows to reorder the queue, or the songs in a playlist.
+- Find and sort within a playlist or Liked songs.
 - Recently played: the last hundred songs, each playable again by itself.
 - Autoplay: when the queue ends it carries on with similar songs, falling back to the same
   genre when Navidrome has no similar-song source set up.
@@ -30,15 +32,22 @@ by the app itself.
 - Reports plays to Navidrome, which keeps play counts current and feeds Last.fm or
   ListenBrainz if you linked them there.
 - Remembers the queue and position between runs.
+- Keeps playing from the notification area when the window is closed (optional), and
+  opening it a second time brings back the copy that's already running.
+- Checks GitHub for new versions and installs them on request.
 
 Keyboard: Space plays or pauses, Ctrl+Left/Right changes track, Ctrl+Up/Down changes
 volume, Ctrl+K jumps to search, Alt+Left/Right goes back and forward, F5 reloads the page.
 
 ## Installing
 
-Run `NexusMusic-Setup-<version>.exe`. It installs for the current user without an
+Download `NexusMusic-Setup-<version>.exe` from the
+[latest release](https://github.com/Comfydata276/nexus-music/releases/latest) and run it. It installs for the current user without an
 administrator prompt. The build isn't code-signed, so Windows SmartScreen will ask before
 running it the first time: choose **More info**, then **Run anyway**.
+
+Installed copies update themselves from Settings, About. The portable `.exe` on the same
+page needs no installation; it tells you when a new version is out and opens the download page.
 
 The app needs the Microsoft Visual C++ runtime, which most PCs already have. If Windows
 reports that `VCRUNTIME140.dll` or `MSVCP140.dll` is missing, install it from
@@ -54,6 +63,7 @@ docker build -f docker/dev.Dockerfile -t nexus-music-dev docker   # once
 scripts/package-windows     # Windows .exe and installer, into dist/
 scripts/check               # compile for Linux and print diagnostics
 scripts/dx cargo test       # unit tests
+scripts/release notes.md    # build and publish a GitHub release (bump Cargo.toml and push first)
 ```
 
 `scripts/dx <command>` runs any command inside the image as your user.
@@ -108,6 +118,8 @@ connection.
 | `src/actions.rs` | Context menus, likes, playlist edits. |
 | `src/covers.rs` | Cover art cache, on disk and in memory. |
 | `src/media.rs` | Windows media keys and now-playing overlay. |
+| `src/update.rs` | Finds, downloads and verifies new releases. |
+| `src/instance.rs` | One running copy at a time (Windows). |
 | `installer/` | NSIS script for the Windows installer. |
 
 ## Licences of bundled work

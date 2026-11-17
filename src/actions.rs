@@ -109,7 +109,9 @@ impl Controller {
         self.song_menu(song, None, None, x, y);
     }
 
-    pub fn open_track_menu(self: &Rc<Self>, index: usize, x: f32, y: f32) {
+    /// `row` is the row as shown, which a filter or sort can put anywhere in the list.
+    pub fn open_track_menu(self: &Rc<Self>, row: usize, x: f32, y: f32) {
+        let Some(index) = self.song_index(row) else { return };
         let (song, playlist) = {
             let page = self.page.borrow();
             let Some(song) = page.songs.get(index).cloned() else { return };
@@ -257,10 +259,37 @@ impl Controller {
         self.open_menu(Target::None, "Presets", entries, x, y);
     }
 
+    pub fn open_track_sort_menu(&self, x: f32, y: f32) {
+        let icons = self.ui.global::<ui::Icons>();
+        let (current, descending) = {
+            let state = self.track_view.borrow();
+            (state.sort(), state.descending())
+        };
+        let own_order = if self.page.borrow().playlist.is_some() { "Custom order" } else { "Default order" };
+        let entries = crate::controller::TRACK_SORTS
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let icon = match (index == current, index, descending) {
+                    (false, ..) => slint::Image::default(),
+                    (true, 0, _) => icons.get_check(),
+                    (true, _, false) => icons.get_arrow_up(),
+                    (true, _, true) => icons.get_arrow_down(),
+                };
+                self.entry(&format!("sort:{index}"), if index == 0 { own_order } else { name }, icon)
+            })
+            .collect();
+        self.open_menu(Target::None, "Sort by", entries, x, y);
+    }
+
     fn menu_activated(self: &Rc<Self>, id: &str) {
         if let Some(index) = id.strip_prefix("eq:").and_then(|i| i.parse().ok()) {
             self.close_menu();
             return self.choose_preset(index);
+        }
+        if let Some(index) = id.strip_prefix("sort:").and_then(|i| i.parse().ok()) {
+            self.close_menu();
+            return self.set_track_sort(index);
         }
         match id {
             "add-to" => return self.show_playlist_picker(),

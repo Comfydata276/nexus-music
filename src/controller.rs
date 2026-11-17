@@ -113,6 +113,66 @@ impl Route {
     }
 }
 
+/// Orders a song list can be shown in. The first is the list's own order.
+pub const TRACK_SORTS: [&str; 5] = ["Custom order", "Title", "Artist", "Album", "Duration"];
+
+/// How the song list on screen is narrowed and ordered.
+#[derive(Default)]
+pub struct TrackView {
+    /// The page this applies to; moving to another page starts afresh.
+    key: String,
+    filter: String,
+    sort: usize,
+    descending: bool,
+    /// For each row shown, the index of its song in the page's list.
+    map: Vec<usize>,
+}
+
+impl TrackView {
+    pub fn sort(&self) -> usize {
+        self.sort
+    }
+
+    pub fn descending(&self) -> bool {
+        self.descending
+    }
+
+    fn is_default(&self) -> bool {
+        self.sort == 0 && self.filter.trim().is_empty()
+    }
+
+    /// Works out which songs to show, and in what order.
+    fn arrange(&mut self, songs: &[Song]) {
+        let needle = self.filter.trim().to_lowercase();
+        let mut map: Vec<usize> = (0..songs.len())
+            .filter(|&i| {
+                let song = &songs[i];
+                needle.is_empty()
+                    || song.title.to_lowercase().contains(&needle)
+                    || song.artist_label().to_lowercase().contains(&needle)
+                    || song.album.to_lowercase().contains(&needle)
+            })
+            .collect();
+        if self.sort != 0 {
+            let key = |i: &usize| -> (String, u32) {
+                let song = &songs[*i];
+                match self.sort {
+                    1 => (song.title.to_lowercase(), 0),
+                    2 => (song.artist_label().to_lowercase(), 0),
+                    3 => (song.album.to_lowercase(), song.disc_number * 1000 + song.track),
+                    _ => (String::new(), song.duration),
+                }
+            };
+            // A stable sort, so songs that tie keep the list's own order.
+            map.sort_by_cached_key(key);
+            if self.descending {
+                map.reverse();
+            }
+        }
+        self.map = map;
+    }
+}
+
 struct HistoryEntry {
     route: Route,
     scroll: f32,
@@ -147,6 +207,7 @@ pub struct Controller {
     /// What the page on screen was built from; the source for play and menu actions.
     pub page: RefCell<PageData>,
     pub tracks_model: Rc<VecModel<ui::Track>>,
+    pub track_view: RefCell<TrackView>,
     pub queue_model: Rc<VecModel<ui::Track>>,
     /// Songs that have been played, newest first, including the one playing now.
     pub history: RefCell<Vec<Song>>,
@@ -168,6 +229,12 @@ pub struct Controller {
     prefetching: RefCell<HashSet<String>>,
     toast_timer: slint::Timer,
     pub tick_timer: slint::Timer,
+    update_timer: slint::Timer,
+    /// The newer release found by the last check, if any.
+    update: RefCell<Option<crate::update::Release>>,
+    update_busy: Cell<bool>,
+    #[cfg(windows)]
+    tray: RefCell<Option<ui::Tray>>,
 }
 
 impl Controller {
@@ -188,6 +255,7 @@ impl Controller {
             playlists: RefCell::default(),
             page: RefCell::default(),
             tracks_model: Rc::new(VecModel::default()),
+            track_view: RefCell::default(),
             queue_model: Rc::new(VecModel::default()),
             history: RefCell::new(config::load_history(&paths.history)),
             history_model: Rc::new(VecModel::default()),
@@ -206,6 +274,11 @@ impl Controller {
             prefetching: RefCell::default(),
             toast_timer: slint::Timer::default(),
             tick_timer: slint::Timer::default(),
+            update_timer: slint::Timer::default(),
+            update: RefCell::new(None),
+            update_busy: Cell::new(false),
+            #[cfg(windows)]
+            tray: RefCell::new(None),
             paths,
             ui,
         });
@@ -307,6 +380,187 @@ impl Controller {
             if let Some(ctl) = weak.upgrade() {
                 ctl.tick();
             }
+        });
+
+        self.start_shell();
+        // Look for a new version shortly after opening, then a few times a day.
+        self.ui.global::<ui::Settings>().set_can_self_update(crate::update::installed_copy());
+        slint::Timer::single_shot(Duration::from_secs(5), || {
+            with(|ctl| ctl.check_for_updates(false));
+        });
+        self.update_timer.start(slint::TimerMode::Repeated, Duration::from_secs(6 * 3600), || {
+            with(|ctl| ctl.check_for_updates(false));
+        });
+    }
+
+    // ---- window, tray and quitting ------------------------------------------------------------
+
+    /// Sets up what happens when the window is closed, and the tray icon.
+    fn start_shell(self: &Rc<Self>) {
+        self.ui.window().on_close_requested(|| {
+            with(|ctl| {
+                if !ctl.stays_in_tray() {
+                    ctl.quit();
+                }
+            });
+            slint::CloseRequestResponse::HideWindow
+        });
+        #[cfg(windows)]
+        if let Ok(tray) = ui::Tray::new() {
+            tray.on_open(|| {
+                with(|ctl| ctl.show_window());
+            });
+            tray.on_toggle_play(|| {
+                with(|ctl| ctl.toggle_play());
+            });
+            tray.on_next(|| {
+                with(|ctl| ctl.next_track());
+            });
+            tray.on_previous(|| {
+                with(|ctl| ctl.previous_track());
+            });
+            tray.on_quit(|| {
+                with(|ctl| ctl.quit());
+            });
+            *self.tray.borrow_mut() = Some(tray);
+            self.sync_tray();
+        }
+    }
+
+    /// Whether closing the window should leave the app running in the notification area.
+    fn stays_in_tray(&self) -> bool {
+        #[cfg(windows)]
+        let has_tray = self.tray.borrow().is_some();
+        #[cfg(not(windows))]
+        let has_tray = false;
+        has_tray && self.settings.borrow().close_to_tray
+    }
+
+    /// Shows the tray icon only while it has a job: when closing hides the window to it.
+    pub fn sync_tray(&self) {
+        #[cfg(windows)]
+        if let Some(tray) = self.tray.borrow().as_ref() {
+            let pb = self.playback.borrow();
+            tray.set_shown(self.settings.borrow().close_to_tray);
+            tray.set_playing(pb.playing);
+            tray.set_has_track(pb.current().is_some());
+            tray.set_now(
+                pb.current()
+                    .map(|song| format!("{} - {}", song.title, song.artist_label()))
+                    .unwrap_or_default()
+                    .into(),
+            );
+        }
+    }
+
+    /// Brings the window back from the tray or from behind other apps.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn show_window(self: &Rc<Self>) {
+        let _ = self.ui.show();
+        self.ui.window().set_minimized(false);
+        #[cfg(windows)]
+        crate::instance::focus(&self.ui);
+    }
+
+    pub fn quit(&self) {
+        self.save_queue();
+        self.save_settings();
+        let _ = slint::quit_event_loop();
+    }
+
+    // ---- updates -------------------------------------------------------------------------------
+
+    /// Asks GitHub whether a newer version exists. `manual` is a check the user asked for:
+    /// it always runs, and reports problems instead of staying quiet.
+    pub fn check_for_updates(self: &Rc<Self>, manual: bool) {
+        if !manual && !self.settings.borrow().check_updates {
+            return;
+        }
+        if self.update_busy.get() {
+            return;
+        }
+        let page = self.ui.global::<ui::Settings>();
+        if manual {
+            page.set_update_status("Checking…".into());
+        }
+        self.api_pool.spawn(move || {
+            let result = crate::update::check();
+            post(move |ctl| {
+                let page = ctl.ui.global::<ui::Settings>();
+                match result {
+                    Ok(Some(release)) => {
+                        page.set_update_version(release.version.as_str().into());
+                        page.set_update_status(
+                            format!("Version {} is available.", release.version).into(),
+                        );
+                        ctl.ui.global::<ui::App>().set_update_available(true);
+                        // Mention each new version once; after that the dot on the cog is enough.
+                        if ctl.settings.borrow().update_notified != release.version {
+                            ctl.settings.borrow_mut().update_notified = release.version.clone();
+                            ctl.save_settings();
+                            ctl.toast(format!(
+                                "Nexus Music {} is available. Open Settings to update.",
+                                release.version
+                            ));
+                        }
+                        *ctl.update.borrow_mut() = Some(release);
+                    }
+                    Ok(None) => {
+                        *ctl.update.borrow_mut() = None;
+                        page.set_update_version("".into());
+                        page.set_update_status("You have the latest version.".into());
+                        ctl.ui.global::<ui::App>().set_update_available(false);
+                    }
+                    Err(reason) if manual => {
+                        page.set_update_status(format!("Couldn't check for updates. {reason}").into());
+                    }
+                    Err(_) => {}
+                }
+            });
+        });
+    }
+
+    /// Downloads the new version's installer and hands over to it.
+    fn install_update(self: &Rc<Self>) {
+        let Some(release) = self.update.borrow().clone() else { return };
+        let installer = match (&release.installer, crate::update::installed_copy()) {
+            (Some(installer), true) => installer.clone(),
+            // A portable copy, or a release without an installer: show where to get it.
+            _ => return crate::update::open_in_browser(&release.page),
+        };
+        if self.update_busy.replace(true) {
+            return;
+        }
+        let page = self.ui.global::<ui::Settings>();
+        page.set_update_busy(true);
+        page.set_update_status("Downloading the update…".into());
+        std::thread::spawn(move || {
+            let mut last = -1;
+            let result = crate::update::download(&installer, |fraction| {
+                let percent = (fraction * 100.0) as i32;
+                if percent != last {
+                    last = percent;
+                    post(move |ctl| {
+                        let text = format!("Downloading the update… {percent}%");
+                        ctl.ui.global::<ui::Settings>().set_update_status(text.into());
+                    });
+                }
+            });
+            post(move |ctl| {
+                let page = ctl.ui.global::<ui::Settings>();
+                let launched = result.and_then(|path| {
+                    crate::update::run_installer(&path).map_err(|e| format!("Couldn't start the installer: {e}"))
+                });
+                match launched {
+                    // The installer replaces the program and opens the new version.
+                    Ok(()) => ctl.quit(),
+                    Err(reason) => {
+                        ctl.update_busy.set(false);
+                        page.set_update_busy(false);
+                        page.set_update_status(reason.into());
+                    }
+                }
+            });
         });
     }
 
@@ -684,23 +938,29 @@ impl Controller {
         )));
         view.set_sort(data.sort as i32);
 
+        // A different page starts with its list unfiltered and in its own order.
+        let key = self.current_route().map(|route| route.cache_key()).unwrap_or_default();
+        let same_view = self.track_view.borrow().key == key;
+        if !same_view {
+            *self.track_view.borrow_mut() = TrackView { key, ..Default::default() };
+            view.set_filter("".into());
+        }
+
         // Leave lists alone when their content didn't change, so a background refresh or the
         // arrival of a page's extras doesn't disturb what's being looked at.
         let (same_tracks, same_tiles, same_shelves, same_grid) = {
             let old = self.page.borrow();
             (
-                old.songs == data.songs
+                same_view
+                    && old.songs == data.songs
                     && old.album_numbers == data.album_numbers
                     && old.disc_sections == data.disc_sections
-                    && self.tracks_model.row_count() == data.songs.len(),
+                    && self.tracks_model.row_count() == self.track_view.borrow().map.len(),
                 old.tiles == data.tiles && !old.tiles.is_empty(),
                 old.shelves == data.shelves && !old.shelves.is_empty(),
                 old.grid == data.grid && !old.grid.is_empty(),
             )
         };
-        if !same_tracks {
-            self.tracks_model.set_vec(self.track_rows(&data));
-        }
         if !same_tiles {
             view.set_tiles(cards_model(&data.tiles));
         }
@@ -722,19 +982,124 @@ impl Controller {
         }
         self.grid_loading.set(false);
         *self.page.borrow_mut() = data;
+        if !same_tracks {
+            self.rebuild_tracks();
+        } else {
+            self.sync_track_view();
+        }
 
         view.set_error("".into());
         view.set_loading(false);
         view.set_scroll_y(scroll);
     }
 
-    /// Builds the interface rows for the page's songs.
+    /// Rebuilds the song rows from the page's songs, as filtered and sorted.
+    fn rebuild_tracks(&self) {
+        let rows = {
+            let page = self.page.borrow();
+            self.track_view.borrow_mut().arrange(&page.songs);
+            self.track_rows(&page)
+        };
+        self.tracks_model.set_vec(rows);
+        self.sync_track_view();
+    }
+
+    /// Shows the state of the filter and sort controls.
+    fn sync_track_view(&self) {
+        let page = self.page.borrow();
+        let state = self.track_view.borrow();
+        let view = self.ui.global::<ui::View>();
+        let can_filter = page.playlist.is_some() || page.liked_songs;
+        view.set_can_filter(can_filter && !page.songs.is_empty());
+        view.set_track_sort(
+            match (state.sort, page.playlist.is_some()) {
+                (0, false) => "Default order",
+                (sort, _) => TRACK_SORTS[sort.min(TRACK_SORTS.len() - 1)],
+            }
+            .into(),
+        );
+        view.set_track_sort_custom(state.sort == 0);
+        view.set_track_sort_descending(state.descending);
+        view.set_can_reorder(page.playlist.is_some() && state.is_default() && !page.pending);
+        if !state.filter.trim().is_empty() && state.map.is_empty() {
+            view.set_empty(format!("No songs here match “{}”.", state.filter.trim()).into());
+        } else {
+            view.set_empty(page.empty.as_str().into());
+        }
+    }
+
+    /// The page's songs in the order they're shown.
+    pub fn visible_songs(&self) -> Vec<Song> {
+        let page = self.page.borrow();
+        let state = self.track_view.borrow();
+        state.map.iter().filter_map(|&i| page.songs.get(i).cloned()).collect()
+    }
+
+    /// The position in the page's own list of the song shown on `row`.
+    pub fn song_index(&self, row: usize) -> Option<usize> {
+        self.track_view.borrow().map.get(row).copied()
+    }
+
+    fn set_track_filter(&self, text: &str) {
+        if self.track_view.borrow().filter == text {
+            return;
+        }
+        self.track_view.borrow_mut().filter = text.to_string();
+        self.rebuild_tracks();
+        self.ui.global::<ui::View>().set_scroll_y(0.0);
+    }
+
+    /// Picking the order already in use flips its direction.
+    pub fn set_track_sort(&self, sort: usize) {
+        {
+            let mut state = self.track_view.borrow_mut();
+            state.descending = sort != 0 && state.sort == sort && !state.descending;
+            state.sort = sort.min(TRACK_SORTS.len() - 1);
+        }
+        self.rebuild_tracks();
+    }
+
+    /// Moves a playlist's song from one row to another and saves the new order.
+    fn move_playlist_track(self: &Rc<Self>, from: usize, to: usize) {
+        if !self.track_view.borrow().is_default() {
+            return;
+        }
+        let (id, ids) = {
+            let mut page = self.page.borrow_mut();
+            let Some(id) = page.playlist.as_ref().map(|p| p.id.clone()) else { return };
+            if from == to || from >= page.songs.len() || to >= page.songs.len() {
+                return;
+            }
+            let song = page.songs.remove(from);
+            page.songs.insert(to, song);
+            (id, page.songs.iter().map(|s| s.id.clone()).collect::<Vec<_>>())
+        };
+        self.rebuild_tracks();
+        if let Some(route) = self.current_route() {
+            let data = self.page.borrow().clone();
+            self.remember(&route.cache_key(), Instant::now(), data);
+        }
+        self.request(
+            move |client| client.replace_playlist(&id, &ids),
+            |ctl, result| {
+                if let Err(e) = result {
+                    ctl.toast(format!("Couldn't save the new order. {e}"));
+                    ctl.refresh();
+                }
+            },
+        );
+    }
+
+    /// Builds the interface rows for the page's songs, in the order the view has arranged.
     fn track_rows(&self, data: &PageData) -> Vec<ui::Track> {
         let multi_disc = data.disc_sections
             && data.songs.iter().any(|s| s.disc_number > 1);
         let mut last_disc = 0;
-        data.songs
+        let state = self.track_view.borrow();
+        state
+            .map
             .iter()
+            .filter_map(|&i| data.songs.get(i))
             .enumerate()
             .map(|(index, song)| {
                 let mut row = self.track_row(song);
@@ -891,6 +1256,8 @@ impl Controller {
                 .collect::<Vec<_>>(),
         )));
         page.set_eq_preset(settings.eq_preset().into());
+        page.set_close_to_tray(settings.close_to_tray);
+        page.set_check_updates(settings.check_updates);
     }
 
     /// Changes a setting, shows it, applies it to the audio and, when `save` is set, writes
@@ -992,9 +1359,20 @@ impl Controller {
         view.on_track_activated(|index| {
             with(|ctl| ctl.play_page_track(index as usize));
         });
+        view.on_track_moved(|index, delta| {
+            with(|ctl| ctl.move_playlist_track(index.max(0) as usize, (index + delta).max(0) as usize));
+        });
+        view.on_set_filter(|text| {
+            with(|ctl| ctl.set_track_filter(&text));
+        });
+        view.on_choose_track_sort(|x, y| {
+            with(|ctl| ctl.open_track_sort_menu(x, y));
+        });
         view.on_track_star(|index| {
             with(|ctl| {
-                let song = ctl.page.borrow().songs.get(index as usize).cloned();
+                let song = ctl
+                    .song_index(index as usize)
+                    .and_then(|i| ctl.page.borrow().songs.get(i).cloned());
                 if let Some(song) = song {
                     ctl.toggle_song_star(&song);
                 }
@@ -1102,6 +1480,26 @@ impl Controller {
         });
         settings.on_choose_preset(|x, y| {
             with(|ctl| ctl.open_preset_menu(x, y));
+        });
+        settings.on_set_close_to_tray(|on| {
+            with(|ctl| {
+                ctl.change_setting(true, |s| s.close_to_tray = on);
+                ctl.sync_tray();
+            });
+        });
+        settings.on_set_check_updates(|on| {
+            with(|ctl| {
+                ctl.change_setting(true, |s| s.check_updates = on);
+                if on {
+                    ctl.check_for_updates(false);
+                }
+            });
+        });
+        settings.on_check_updates_now(|| {
+            with(|ctl| ctl.check_for_updates(true));
+        });
+        settings.on_install_update(|| {
+            with(|ctl| ctl.install_update());
         });
         settings.on_clear_cache(|| {
             with(|ctl| {

@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Builds the Windows release and publishes it on GitHub, which is where installed copies
+# look for updates. Bump `version` in Cargo.toml, commit and push first.
+# Usage: scripts/release [file with release notes]
+set -euo pipefail
+cd "$(dirname "$0")/.."
+version="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+notes="${1:-}"
+
+if [ -n "$(git status --porcelain)" ]; then
+  echo "There are uncommitted changes. Commit them before releasing." >&2
+  exit 1
+fi
+git fetch -q origin
+if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]; then
+  echo "This commit isn't what's on GitHub's main branch. Push it before releasing." >&2
+  exit 1
+fi
+if gh release view "v$version" >/dev/null 2>&1; then
+  echo "Version $version is already released. Bump the version in Cargo.toml." >&2
+  exit 1
+fi
+
+scripts/package-windows
+files=("dist/NexusMusic-Setup-$version.exe" "dist/NexusMusic-$version-portable.exe")
+if [ -n "$notes" ]; then
+  gh release create "v$version" "${files[@]}" --title "Nexus Music $version" --notes-file "$notes"
+else
+  gh release create "v$version" "${files[@]}" --title "Nexus Music $version" --generate-notes
+fi

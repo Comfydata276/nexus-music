@@ -91,6 +91,117 @@ component Hero inherits Rectangle {
     }
 }
 
+// The box that narrows a playlist to songs matching what's typed. Closed, it's just the icon.
+component FilterBox inherits Rectangle {
+    property <bool> expanded: input.has-focus || View.filter != "";
+    width: self.expanded ? 220px : 40px;
+    height: 40px;
+    border-radius: 20px;
+    background: self.expanded ? Theme.raised : open.has-hover ? Theme.hover : transparent;
+    border-width: 1px;
+    border-color: input.has-focus ? Theme.accent-bright : transparent;
+    animate width { duration: 140ms; easing: ease-out; }
+
+    open := TouchArea {
+        mouse-cursor: root.expanded ? text : pointer;
+        clicked => { input.focus(); }
+    }
+
+    Icon {
+        x: 11px;
+        source: Icons.search;
+        size: 18px;
+        tint: root.expanded || open.has-hover ? Theme.text : Theme.muted;
+    }
+
+    if root.expanded && View.filter == "": Text {
+        x: 38px;
+        width: parent.width - 48px;
+        text: "Find in this list";
+        color: Theme.faint;
+        font-size: 14px;
+        vertical-alignment: center;
+        overflow: elide;
+        accessible-role: none;
+    }
+
+    input := TextInput {
+        x: 38px;
+        width: max(0px, parent.width - 38px - 34px);
+        text <=> View.filter;
+        visible: root.expanded;
+        color: Theme.text;
+        font-size: 14px;
+        vertical-alignment: center;
+        single-line: true;
+        selection-background-color: Theme.accent;
+        selection-foreground-color: white;
+        accessible-label: "Find in this list";
+        edited => { View.set-filter(self.text); }
+        key-pressed(event) => {
+            if event.text == Key.Escape {
+                View.filter = "";
+                View.set-filter("");
+                self.clear-focus();
+                return accept;
+            }
+            return reject;
+        }
+    }
+
+    if View.filter != "": IconButton {
+        x: parent.width - self.width - 6px;
+        width: 28px;
+        height: 28px;
+        icon: Icons.x;
+        icon-size: 15px;
+        label: "Clear";
+        clicked => {
+            View.filter = "";
+            View.set-filter("");
+            input.focus();
+        }
+    }
+}
+
+component SortButton inherits Rectangle {
+    height: 40px;
+    width: row.preferred-width;
+    border-radius: 20px;
+    background: touch.has-hover ? Theme.hover : transparent;
+    accessible-role: button;
+    accessible-label: "Sort: " + View.track-sort;
+    accessible-action-default => { touch.clicked(); }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { View.choose-track-sort(root.absolute-position.x, root.absolute-position.y + root.height + 4px); }
+    }
+
+    row := HorizontalLayout {
+        padding-left: 14px;
+        padding-right: 12px;
+        spacing: 8px;
+
+        Text {
+            text: View.track-sort;
+            color: touch.has-hover || !View.track-sort-custom ? Theme.text : Theme.muted;
+            font-size: 14px;
+            font-weight: 500;
+            vertical-alignment: center;
+        }
+
+        VerticalLayout {
+            alignment: center;
+            Icon {
+                source: View.track-sort-custom ? Icons.chevron-down : View.track-sort-descending ? Icons.arrow-down : Icons.arrow-up;
+                size: 15px;
+                tint: touch.has-hover || !View.track-sort-custom ? Theme.text : Theme.muted;
+            }
+        }
+    }
+}
+
 component ActionBar inherits Rectangle {
     height: 72px;
 
@@ -98,7 +209,6 @@ component ActionBar inherits Rectangle {
         padding-left: Theme.page-pad;
         padding-right: Theme.page-pad;
         spacing: 16px;
-        alignment: start;
 
         if View.can-play: VerticalLayout {
             alignment: center;
@@ -145,6 +255,20 @@ component ActionBar inherits Rectangle {
                 label: "More options";
                 clicked => { View.header-menu(more.absolute-position.x, more.absolute-position.y + more.height); }
             }
+        }
+
+        Rectangle {
+            horizontal-stretch: 1;
+        }
+
+        if View.can-filter: VerticalLayout {
+            alignment: center;
+            FilterBox { }
+        }
+
+        if View.can-filter: VerticalLayout {
+            alignment: center;
+            SortButton { }
         }
     }
 }
@@ -467,11 +591,23 @@ export component StackPage inherits Rectangle {
 
 // Albums, playlists and Liked songs. The list is virtualised, so the hero is part of row 0.
 export component TrackListPage inherits Rectangle {
+    // The play and filter controls sit over the list, not in it: they stay put while the list
+    // is rebuilt as you type, and stick to the top once the cover has scrolled away.
+    property <length> hero-height: clamp(self.width * 0.24, 140px, 232px) + 48px;
+    // Set by the first row while it exists. Once the list has scrolled far enough to drop that
+    // row, its scroll offset is only an estimate and can't say where the header would be.
+    property <bool> header-gone;
+    property <length> bar-y: View.tracks.length == 0 ? self.hero-height
+        : self.header-gone ? 0px : max(0px, self.hero-height + View.scroll-y);
+    property <bool> stuck: View.tracks.length > 0 && (self.header-gone || self.hero-height + View.scroll-y < 0px);
+
     if View.tracks.length == 0: VerticalLayout {
         alignment: start;
         Hero { }
 
-        ActionBar { }
+        Rectangle {
+            height: 72px;
+        }
 
         if View.pending: SkeletonRows { }
 
@@ -492,7 +628,15 @@ export component TrackListPage inherits Rectangle {
 
             for track[index] in View.tracks: VerticalLayout {
                 if index == 0: Hero { }
-                if index == 0: ActionBar { }
+                if index == 0: Rectangle {
+                    height: 72px;
+                    init => {
+                        root.header-gone = self.absolute-position.y + self.height <= root.absolute-position.y;
+                    }
+                    changed absolute-position => {
+                        root.header-gone = self.absolute-position.y + self.height <= root.absolute-position.y;
+                    }
+                }
                 if index == 0: ColumnHeader { }
                 if index == 0: Rectangle {
                     height: 8px;
@@ -527,9 +671,18 @@ export component TrackListPage inherits Rectangle {
                         show-album: View.show-album;
                         show-cover: View.show-cover;
                         show-number: View.show-number;
+                        can-reorder: View.can-reorder;
+                        index: index;
+                        count: View.tracks.length;
+                        list-top: tracks.absolute-position.y + (root.stuck ? 72px : 0px);
+                        list-bottom: tracks.absolute-position.y + tracks.height;
                         activated => { View.track-activated(index); }
                         star => { View.track-star(index); }
                         menu(x, y) => { View.track-menu(index, x, y); }
+                        reordered(delta) => { View.track-moved(index, delta); }
+                        nudge(by) => {
+                            tracks.content-y = clamp(tracks.content-y + by, min(0px, tracks.visible-height - tracks.content-height), 0px);
+                        }
                     }
                 }
 
@@ -548,6 +701,22 @@ export component TrackListPage inherits Rectangle {
             content-y <=> tracks.content-y;
             content-height: tracks.content-height;
             visible-height: tracks.visible-height;
+        }
+    }
+
+    Rectangle {
+        x: 0;
+        y: root.bar-y;
+        width: parent.width - 14px;
+        height: 72px;
+        background: root.stuck ? Theme.panel : transparent;
+
+        ActionBar { }
+
+        if root.stuck: Rectangle {
+            y: parent.height - 1px;
+            height: 1px;
+            background: Theme.line;
         }
     }
 }
@@ -1176,6 +1345,20 @@ export component SettingsPage inherits Rectangle {
                     }
 
                     SettingGroup {
+                        title: "Window";
+
+                        SettingRow {
+                            title: "Keep playing when the window is closed";
+                            detail: "Closing the window tucks Nexus Music into the notification area by the clock, where its icon brings it back or quits it.";
+                            Toggle {
+                                on: Settings.close-to-tray;
+                                label: "Keep playing when the window is closed";
+                                toggled(on) => { Settings.set-close-to-tray(on); }
+                            }
+                        }
+                    }
+
+                    SettingGroup {
                         title: "Storage";
 
                         SettingRow {
@@ -1193,7 +1376,34 @@ export component SettingsPage inherits Rectangle {
 
                         SettingRow {
                             title: "Nexus Music " + App.app-version;
-                            detail: "A native player for Navidrome. Fonts: Bricolage Grotesque and Hanken Grotesk (SIL Open Font License). Icons: Lucide (ISC License).";
+                            detail: Settings.update-status;
+                            if Settings.update-version == "": TextButton {
+                                text: "Check for updates";
+                                clicked => { Settings.check-updates-now(); }
+                            }
+                            if Settings.update-version != "": TextButton {
+                                primary: true;
+                                enabled: !Settings.update-busy;
+                                text: Settings.can-self-update ? "Update to " + Settings.update-version : "Get " + Settings.update-version;
+                                clicked => { Settings.install-update(); }
+                            }
+                        }
+
+                        SettingRow {
+                            title: "Check for updates automatically";
+                            detail: "Looks for a new version when the app opens and tells you when there is one. Nothing is installed until you choose to.";
+                            Toggle {
+                                on: Settings.check-updates;
+                                label: "Check for updates automatically";
+                                toggled(on) => { Settings.set-check-updates(on); }
+                            }
+                        }
+
+                        Text {
+                            text: "A native player for Navidrome. Fonts: Bricolage Grotesque and Hanken Grotesk (SIL Open Font License). Icons: Lucide (ISC License).";
+                            color: Theme.muted;
+                            font-size: 13px;
+                            wrap: word-wrap;
                         }
 
                         HorizontalLayout {

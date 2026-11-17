@@ -3,6 +3,7 @@
 
 Unicode true
 !include "MUI2.nsh"
+!include "FileFunc.nsh"
 
 !define APP_NAME "Nexus Music"
 !define APP_EXE "NexusMusic.exe"
@@ -65,6 +66,17 @@ Section "Install"
     ExecShell "open" "https://aka.ms/vs/17/release/vc_redist.x64.exe"
   runtime_ok:
 SectionEnd
+
+; The app updates itself by running this installer with /S /RELAUNCH: install quietly, then
+; open the new version.
+Function .onInstSuccess
+  ${GetParameters} $R0
+  ClearErrors
+  ${GetOptions} $R0 "/RELAUNCH" $R1
+  IfErrors no_relaunch
+  Exec '"$INSTDIR\${APP_EXE}"'
+  no_relaunch:
+FunctionEnd
 
 Section "Uninstall"
   nsExec::Exec 'taskkill /IM "${APP_EXE}" /F'

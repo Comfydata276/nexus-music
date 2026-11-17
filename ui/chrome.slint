@@ -4,7 +4,7 @@ import { ListView } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { Icons } from "icons.slint";
 import { App, Player, View, CardKind, PlaylistRef, Page, Track } from "types.slint";
-import { Icon, IconButton, Cover, Slider, LinkText, PlayButton, HoverIntent, ScrollThumb } from "widgets.slint";
+import { Icon, IconButton, Cover, Slider, LinkText, PlayButton, HoverIntent, ScrollThumb, Reorder } from "widgets.slint";
 
 // Rows stop `gutter` short of a list's right edge, leaving the scrollbar a lane of its own.
 // The lists run `reach` into the panel's padding so that lane sits at the panel's edge.
@@ -406,16 +406,25 @@ export component TopBar inherits Rectangle {
 
         VerticalLayout {
             alignment: center;
-            IconButton {
+            cog := IconButton {
                 icon: Icons.settings;
                 active: App.route == "settings";
-                label: App.route == "settings" ? "Close settings" : "Settings";
+                label: App.route == "settings" ? "Close settings" : App.update-available ? "Settings (update available)" : "Settings";
                 clicked => {
                     if App.route == "settings" {
                         App.go-back();
                     } else {
                         App.navigate("settings");
                     }
+                }
+
+                if App.update-available: Rectangle {
+                    x: parent.width - 11px;
+                    y: 3px;
+                    width: 8px;
+                    height: 8px;
+                    border-radius: 4px;
+                    background: Theme.warm;
                 }
             }
         }
@@ -436,22 +445,56 @@ component QueueRow inherits Rectangle {
     in property <Track> track;
     // The row for the song that's playing: the button pauses and resumes instead.
     in property <bool> current;
+    // Reordering by dragging: the row's place in its list, and the list's visible extent.
+    in property <bool> can-reorder;
+    in property <int> index;
+    in property <int> count;
+    in property <length> list-top;
+    in property <length> list-bottom;
     callback play;
     callback menu(x: length, y: length);
+    callback reordered(delta: int);
+    callback nudge(by: length);
 
     height: 64px;
     border-radius: 6px;
-    background: touch.has-hover ? Theme.hover : transparent;
+    background: touch.has-hover || reorder.dragging ? Theme.hover : transparent;
+    opacity: reorder.dragging ? 0.55 : 1;
+
+    reorder := Reorder {
+        enabled: root.can-reorder;
+        index: root.index;
+        count: root.count;
+        list-top: root.list-top;
+        list-bottom: root.list-bottom;
+        moved(delta) => { root.reordered(delta); }
+        nudge(by) => { root.nudge(by); }
+    }
 
     accessible-role: list-item;
     accessible-label: self.track.title + ", " + self.track.artist;
     accessible-action-default => { root.play(); }
 
     touch := TouchArea {
+        mouse-cursor: reorder.dragging ? grabbing : default;
         double-clicked => { root.play(); }
         pointer-event(event) => {
             if event.button == PointerEventButton.right && event.kind == PointerEventKind.down {
                 root.menu(self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
+            }
+            if event.button == PointerEventButton.left && event.kind == PointerEventKind.down {
+                reorder.press(self.mouse-y);
+            }
+            if event.button == PointerEventButton.left && event.kind == PointerEventKind.up {
+                reorder.release();
+            }
+            if event.kind == PointerEventKind.cancel {
+                reorder.cancel();
+            }
+        }
+        moved => {
+            if self.pressed {
+                reorder.drag(self.mouse-y);
             }
         }
 
@@ -690,8 +733,17 @@ export component QueuePanel inherits Rectangle {
                         x: 0;
                         width: parent.width - Lane.gutter;
                         track: track;
+                        can-reorder: true;
+                        index: index;
+                        count: Player.queue.length;
+                        list-top: upcoming.absolute-position.y;
+                        list-bottom: upcoming.absolute-position.y + upcoming.height;
                         play => { Player.queue-activated(index); }
                         menu(x, y) => { Player.queue-menu(index, x, y); }
+                        reordered(delta) => { Player.queue-moved(index, delta); }
+                        nudge(by) => {
+                            upcoming.content-y = clamp(upcoming.content-y + by, min(0px, upcoming.visible-height - upcoming.content-height), 0px);
+                        }
                     }
                 }
             }
@@ -746,6 +798,8 @@ export component QueuePanel inherits Rectangle {
 }
 
 export component PlayerBar inherits Rectangle {
+    // False when the window is too narrow to show the queue beside the page.
+    in property <bool> queue-fits: true;
     height: 84px;
 
     property <length> side: max(220px, self.width * 0.28);
@@ -787,8 +841,8 @@ export component PlayerBar inherits Rectangle {
 
             if Player.has-track: VerticalLayout {
                 alignment: center;
-                spacing: 4px;
-                width: min(max(now-title.preferred-width, now-artist.preferred-width), max(60px, root.side - 56px - 14px - 14px - 32px - 8px));
+                spacing: 3px;
+                width: min(max(now-title.preferred-width, now-artist.preferred-width, now-format.preferred-width), max(60px, root.side - 56px - 14px - 14px - 32px - 8px));
 
                 now-title := LinkText {
                     text: Player.track.title;
@@ -814,6 +868,15 @@ export component PlayerBar inherits Rectangle {
                     clicked => {
                         View.card-activated({ kind: CardKind.artist, id: Player.track.artist-id, title: Player.track.artist });
                     }
+                }
+
+                now-format := Text {
+                    text: Player.format;
+                    color: Player.lossless ? Theme.accent-bright : Theme.faint;
+                    font-size: 11px;
+                    font-weight: 600;
+                    overflow: elide;
+                    accessible-label: "Audio format: " + Player.format;
                 }
             }
 
@@ -980,8 +1043,9 @@ export component PlayerBar inherits Rectangle {
                 IconButton {
                     icon: Icons.list-music;
                     icon-size: 17px;
-                    active: App.queue-open;
-                    label: "Queue";
+                    active: App.queue-open && root.queue-fits;
+                    enabled: root.queue-fits;
+                    label: root.queue-fits ? "Queue" : "Widen the window to show the queue";
                     clicked => { App.set-queue-open(!App.queue-open); }
                 }
             }

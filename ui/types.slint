@@ -97,6 +97,8 @@ export global App {
     callback new-playlist();
 
     in property <bool> queue-open;
+    // A newer version has been published.
+    in property <bool> update-available;
     callback set-queue-open(open: bool);
     // Which tab the queue panel shows: 0 the queue, 1 recently played.
     in-out property <int> queue-tab;
@@ -142,6 +144,15 @@ export global View {
     in property <[string]> sorts;
     in property <int> sort;
 
+    // Playlists and Liked songs can be filtered and sorted in place.
+    in property <bool> can-filter;
+    in-out property <string> filter;
+    in property <string> track-sort;
+    in property <bool> track-sort-custom;
+    in property <bool> track-sort-descending;
+    // Rows can be dragged into a new order: a playlist shown in its own order, unfiltered.
+    in property <bool> can-reorder;
+
     in-out property <length> scroll-y;
 
     callback play(shuffle: bool);
@@ -150,6 +161,9 @@ export global View {
     callback track-activated(index: int);
     callback track-star(index: int);
     callback track-menu(index: int, x: length, y: length);
+    callback track-moved(index: int, delta: int);
+    callback set-filter(text: string);
+    callback choose-track-sort(x: length, y: length);
     callback card-activated(card: Card);
     // The pointer has rested on something that opens a page: a cue to fetch it early.
     callback card-hovered(card: Card);
@@ -175,6 +189,9 @@ export global Player {
     in property <int> repeat;
     in property <[Track]> queue;
     in property <string> context;
+    // The current song's audio format in a few words, e.g. "FLAC · 44.1 kHz · 16-bit".
+    in property <string> format;
+    in property <bool> lossless;
     // Songs played before the current one, newest first.
     in property <[Track]> history;
 
@@ -190,6 +207,8 @@ export global Player {
     callback queue-activated(index: int);
     callback queue-menu(index: int, x: length, y: length);
     callback clear-queue();
+    // The queue row at `index` was dragged `delta` places down (or up, when negative).
+    callback queue-moved(index: int, delta: int);
     callback history-activated(index: int);
     callback history-menu(index: int, x: length, y: length);
 
@@ -262,6 +281,16 @@ export global Settings {
     in property <string> cache-size;
     in property <string> connection;
 
+    in property <bool> close-to-tray;
+    in property <bool> check-updates;
+    // What the last check for a new version found, in words.
+    in property <string> update-status;
+    // The newer version on offer; empty when there is none.
+    in property <string> update-version;
+    in property <bool> update-busy;
+    // This copy was installed, so it can replace itself. A portable copy opens the download page.
+    in property <bool> can-self-update;
+
     callback set-quality(index: int);
     // `save` is false while a slider is being dragged and true when it's let go.
     callback set-crossfade(seconds: float, save: bool);
@@ -276,4 +305,8 @@ export global Settings {
     callback reset-eq();
     callback choose-preset(x: length, y: length);
     callback clear-cache();
+    callback set-close-to-tray(on: bool);
+    callback set-check-updates(on: bool);
+    callback check-updates-now();
+    callback install-update();
 }

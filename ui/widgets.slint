@@ -227,6 +227,68 @@ export component ScrollThumb inherits Rectangle {
     }
 }
 
+// Drag-to-reorder for a row in a list of equal-height rows. The row's TouchArea feeds it the
+// pointer; it works out where the row would land, draws the insertion line, and scrolls the
+// list when the pointer nears its top or bottom.
+export component Reorder inherits Rectangle {
+    in property <bool> enabled;
+    in property <int> index;
+    in property <int> count;
+    // Top and bottom of the list's visible part, in window coordinates.
+    in property <length> list-top;
+    in property <length> list-bottom;
+    out property <bool> dragging;
+    // How many places the row would move if let go now.
+    out property <int> delta: !self.dragging ? 0 : clamp(self.slot, -self.index, self.count - 1 - self.index);
+    callback moved(delta: int);
+    callback nudge(by: length);
+
+    property <bool> armed;
+    property <length> press-y;
+    // Where the pointer is, in window coordinates, as of its last movement.
+    property <length> pointer-y;
+    property <int> slot: floor((self.pointer-y - self.absolute-position.y) / self.height);
+    property <length> edge: 40px;
+
+    public function press(y: length) {
+        self.armed = self.enabled;
+        self.press-y = y;
+    }
+    // `y` is the pointer's position within the row.
+    public function drag(y: length) {
+        if self.armed && !self.dragging && (y - self.press-y > 6px || self.press-y - y > 6px) {
+            self.dragging = true;
+        }
+        self.pointer-y = self.absolute-position.y + y;
+    }
+    public function release() {
+        if self.dragging && self.delta != 0 {
+            root.moved(self.delta);
+        }
+        self.dragging = false;
+        self.armed = false;
+    }
+    public function cancel() {
+        self.dragging = false;
+        self.armed = false;
+    }
+
+    if root.dragging && root.delta != 0: Rectangle {
+        y: (root.delta < 0 ? root.delta : root.delta + 1) * root.height - 1px;
+        height: 2px;
+        border-radius: 1px;
+        background: Theme.accent-bright;
+    }
+
+    Timer {
+        interval: 16ms;
+        running: root.dragging && (root.pointer-y < root.list-top + root.edge || root.pointer-y > root.list-bottom - root.edge);
+        triggered => {
+            root.nudge(root.pointer-y < root.list-top + root.edge ? 9px : -9px);
+        }
+    }
+}
+
 // Album, artist or playlist artwork. Art arrives asynchronously; a glyph stands in until then.
 export component Cover inherits Rectangle {
     in property <string> art;
@@ -596,24 +658,58 @@ export component TrackRow inherits Rectangle {
     in property <bool> show-cover: true;
     in property <bool> show-album: true;
     in property <bool> show-number: true;
+    // Reordering by dragging: the row's place in its list, and the list's visible extent.
+    in property <bool> can-reorder;
+    in property <int> index;
+    in property <int> count;
+    in property <length> list-top;
+    in property <length> list-bottom;
     callback activated;
     callback star;
     callback menu(x: length, y: length);
+    callback reordered(delta: int);
+    callback nudge(by: length);
 
     property <bool> current: self.track.id != "" && self.track.id == Player.track-id;
     height: 56px;
     border-radius: 6px;
-    background: touch.has-hover ? Theme.hover : transparent;
+    background: touch.has-hover || reorder.dragging ? Theme.hover : transparent;
+    opacity: reorder.dragging ? 0.55 : 1;
+
+    reorder := Reorder {
+        enabled: root.can-reorder;
+        index: root.index;
+        count: root.count;
+        list-top: root.list-top;
+        list-bottom: root.list-bottom;
+        moved(delta) => { root.reordered(delta); }
+        nudge(by) => { root.nudge(by); }
+    }
 
     accessible-role: list-item;
     accessible-label: self.track.title + ", " + self.track.artist;
     accessible-action-default => { root.activated(); }
 
     touch := TouchArea {
+        mouse-cursor: reorder.dragging ? grabbing : default;
         double-clicked => { root.activated(); }
         pointer-event(event) => {
             if event.button == PointerEventButton.right && event.kind == PointerEventKind.down {
                 root.menu(self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
+            }
+            if event.button == PointerEventButton.left && event.kind == PointerEventKind.down {
+                reorder.press(self.mouse-y);
+            }
+            if event.button == PointerEventButton.left && event.kind == PointerEventKind.up {
+                reorder.release();
+            }
+            if event.kind == PointerEventKind.cancel {
+                reorder.cancel();
+            }
+        }
+        moved => {
+            if self.pressed {
+                reorder.drag(self.mouse-y);
             }
         }
 

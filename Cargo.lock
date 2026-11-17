@@ -3158,7 +3158,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-music"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "cpal",
@@ -3172,11 +3172,13 @@ dependencies = [
  "rubato",
  "serde",
  "serde_json",
+ "sha2",
  "slint",
  "slint-build",
  "souvlaki",
  "symphonia",
  "ureq",
+ "windows-sys 0.61.2",
  "winresource",
 ]
 

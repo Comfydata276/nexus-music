@@ -18,6 +18,9 @@ const PRELOAD_SECONDS: f64 = 25.0;
 const QUEUE_ROWS: usize = 400;
 /// Songs remembered for "Recently played".
 const HISTORY_LENGTH: usize = 100;
+/// File types that are always lossless. (M4A and CAF can be either; those are judged by
+/// whether the server reports a bit depth, which lossy formats don't have.)
+const LOSSLESS_SUFFIXES: [&str; 4] = ["flac", "wav", "aiff", "aif"];
 /// File types the built-in decoders handle; anything else is converted by the server.
 const NATIVE_SUFFIXES: [&str; 12] =
     ["mp3", "flac", "m4a", "aac", "ogg", "oga", "wav", "aiff", "aif", "mka", "caf", "mp4"];
@@ -456,6 +459,21 @@ impl Controller {
         self.next_changed();
     }
 
+    /// Moves the entry `from` places after the current track to `to` places after it.
+    fn move_upcoming(self: &Rc<Self>, from: usize, to: usize) {
+        {
+            let mut pb = self.playback.borrow_mut();
+            let base = pb.cursor + 1;
+            let (from, to) = (base + from, base + to);
+            if from == to || from >= pb.order.len() || to >= pb.order.len() {
+                return;
+            }
+            let entry = pb.order.remove(from);
+            pb.order.insert(to, entry);
+        }
+        self.next_changed();
+    }
+
     fn clear_upcoming(self: &Rc<Self>) {
         {
             let mut pb = self.playback.borrow_mut();
@@ -790,8 +808,27 @@ impl Controller {
                 let source = parts.join(", ");
                 let cap = self.settings.borrow().max_bitrate();
                 let suffix = song.suffix.to_lowercase();
-                let native = NATIVE_SUFFIXES.contains(&suffix.as_str());
+                let native = NATIVE_SUFFIXES.contains(&suffix.as_str())
+                    && !self.playback.borrow().needs_transcode.contains(&song.id);
                 let title = &song.title;
+                // The short form shown under the song in the player bar.
+                let as_stored = native && (cap == 0 || (suffix == "mp3" && song.bit_rate <= cap));
+                let lossless = as_stored
+                    && (LOSSLESS_SUFFIXES.contains(&suffix.as_str()) || song.bit_depth > 0);
+                let label = if as_stored {
+                    let mut short = vec![song.suffix.to_uppercase()];
+                    if lossless {
+                        short.extend(parts.iter().skip(1).filter(|p| !p.ends_with("kbps")).cloned());
+                    } else if song.bit_rate > 0 {
+                        short.push(format!("{} kbps", song.bit_rate));
+                    }
+                    short.join(" · ")
+                } else {
+                    format!("MP3 · {} kbps", if cap == 0 { 320 } else { cap })
+                };
+                let player = self.ui.global::<ui::Player>();
+                player.set_format(label.into());
+                player.set_lossless(lossless);
                 if cap > 0 && suffix == "mp3" && song.bit_rate <= cap {
                     // Already an MP3 within the limit: the server sends it untouched.
                     format!("“{title}” is playing as stored: {source}.")
@@ -805,7 +842,10 @@ impl Controller {
                     format!("“{title}” is playing as stored: {source}.")
                 }
             }
-            None => String::new(),
+            None => {
+                self.ui.global::<ui::Player>().set_format("".into());
+                String::new()
+            }
         };
         self.ui.global::<ui::Settings>().set_now_format(text.into());
     }
@@ -855,13 +895,13 @@ impl Controller {
         player.set_repeat(pb.repeat as i32);
         // Slider travel is squared so the quiet end of the range has usable resolution.
         self.engine.set_volume(if pb.muted { 0.0 } else { pb.volume * pb.volume });
+        let (playing, position) = (pb.playing, pb.position);
+        drop(pb);
+        self.sync_tray();
         #[cfg(windows)]
-        {
-            let playing = pb.playing;
-            let position = pb.position;
-            drop(pb);
-            self.media_playing(playing, position);
-        }
+        self.media_playing(playing, position);
+        #[cfg(not(windows))]
+        let _ = (playing, position);
     }
 
     fn sync_queue(self: &Rc<Self>) {
@@ -1111,6 +1151,12 @@ impl Controller {
         player.on_clear_queue(|| {
             with(|ctl| ctl.clear_upcoming());
         });
+        player.on_queue_moved(|index, delta| {
+            with(|ctl| {
+                let to = (index + delta).max(0) as usize;
+                ctl.move_upcoming(index.max(0) as usize, to);
+            });
+        });
         player.on_history_activated(|index| {
             with(|ctl| ctl.play_history(index as usize));
         });
@@ -1125,11 +1171,10 @@ impl Controller {
 
     // ---- playing from the page on screen -------------------------------------------------------
 
+    /// `index` is the row that was chosen, in the order the page is showing.
     pub fn play_page_track(self: &Rc<Self>, index: usize) {
-        let (songs, context) = {
-            let page = self.page.borrow();
-            (page.songs.clone(), page.context.clone())
-        };
+        let songs = self.visible_songs();
+        let context = self.page.borrow().context.clone();
         if index < songs.len() {
             // Starting from a chosen song plays the list in order, even with shuffle on.
             self.play_songs_from(songs, index, &context);
@@ -1142,10 +1187,12 @@ impl Controller {
     }
 
     pub fn play_page(self: &Rc<Self>, shuffle: bool) {
-        let (source, songs, context) = {
+        let (source, context) = {
             let page = self.page.borrow();
-            (page.play.clone(), page.songs.clone(), page.context.clone())
+            (page.play.clone(), page.context.clone())
         };
+        // A sorted or filtered list plays as it's shown.
+        let songs = self.visible_songs();
         match source {
             crate::pages::PlaySource::Songs => self.play_songs(songs, 0, &context, shuffle),
             crate::pages::PlaySource::Albums(ids) => {

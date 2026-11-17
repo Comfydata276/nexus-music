@@ -16,6 +16,58 @@ import { MenuOverlay, PromptOverlay, ToastOverlay } from "overlays.slint";
 
 export { App, View, Player, Menu, Prompt, Toast, Lyrics, Settings, Covers, Icons, Page, Track, Card, CardKind, Shelf, CardRow, PlaylistRef, MenuEntry, LyricLine, QualityOption }
 
+// The icon in the notification area, shown while closing the window keeps the app running.
+export component Tray inherits SystemTrayIcon {
+    in property <string> now;
+    in property <bool> playing;
+    in property <bool> has-track;
+    in property <bool> shown <=> root.visible;
+    callback open;
+    callback toggle-play;
+    callback next;
+    callback previous;
+    callback quit;
+
+    icon: @image-url("../assets/app-icon.png");
+    title: "Nexus Music";
+    tooltip: root.now == "" ? "Nexus Music" : root.now;
+    clicked => { root.open(); }
+
+    Menu {
+        MenuItem {
+            title: "Open Nexus Music";
+            activated => { root.open(); }
+        }
+
+        MenuSeparator { }
+
+        MenuItem {
+            title: root.playing ? "Pause" : "Play";
+            enabled: root.has-track;
+            activated => { root.toggle-play(); }
+        }
+
+        MenuItem {
+            title: "Next";
+            enabled: root.has-track;
+            activated => { root.next(); }
+        }
+
+        MenuItem {
+            title: "Previous";
+            enabled: root.has-track;
+            activated => { root.previous(); }
+        }
+
+        MenuSeparator { }
+
+        MenuItem {
+            title: "Quit";
+            activated => { root.quit(); }
+        }
+    }
+}
+
 export component MainWindow inherits Window {
     title: Player.has-track ? Player.track.title + " - " + Player.track.artist : "Nexus Music";
     icon: @image-url("../assets/app-icon.png");
@@ -95,7 +147,9 @@ export component MainWindow inherits Window {
             property <length> gap: Theme.gap;
             property <length> bar: 84px;
             property <length> side: clamp(root.width * 0.22, 220px, 300px);
-            property <length> queue: App.queue-open ? clamp(root.width * 0.26, 280px, 360px) : 0px;
+            // The queue steps aside when the window is too narrow to leave the page room.
+            property <bool> queue-shown: App.queue-open && root.width >= 1000px;
+            property <length> queue: self.queue-shown ? clamp(root.width * 0.26, 280px, 360px) : 0px;
             property <length> body: root.height - self.bar - self.gap;
 
             Sidebar {
@@ -108,7 +162,7 @@ export component MainWindow inherits Window {
             Rectangle {
                 x: parent.gap * 2 + parent.side;
                 y: parent.gap;
-                width: root.width - parent.side - parent.gap * 3 - (App.queue-open ? parent.queue + parent.gap : 0px);
+                width: root.width - parent.side - parent.gap * 3 - (parent.queue-shown ? parent.queue + parent.gap : 0px);
                 height: parent.body;
                 background: Theme.panel;
                 border-radius: Theme.radius;
@@ -130,7 +184,7 @@ export component MainWindow inherits Window {
                     y: 0;
                     height: 360px;
                     background: @linear-gradient(180deg, root.wash.with-alpha(root.tinted ? 0.62 : App.page == Page.home ? 0.24 : 0) 0%, Theme.panel.with-alpha(0) 100%);
-                    opacity: clamp(1 + View.scroll-y / 420px, 0, 1);
+                    opacity: clamp(1 + View.scroll-y / 190px, 0, 1);
                 }
 
                 TopBar {
@@ -158,7 +212,7 @@ export component MainWindow inherits Window {
                 }
             }
 
-            if App.queue-open: QueuePanel {
+            if self.queue-shown: QueuePanel {
                 x: root.width - parent.queue - parent.gap;
                 y: parent.gap;
                 width: parent.queue;
@@ -166,6 +220,7 @@ export component MainWindow inherits Window {
             }
 
             PlayerBar {
+                queue-fits: root.width >= 1000px;
                 x: 0;
                 y: root.height - parent.bar;
                 width: root.width;

@@ -245,7 +245,7 @@ pub fn normalize_server_url(input: &str) -> String {
 /// Longest an API call may take from start to finish. Audio downloads have no such limit.
 const API_TIMEOUT: Duration = Duration::from_secs(45);
 
-fn make_agent() -> ureq::Agent {
+pub(crate) fn make_agent() -> ureq::Agent {
     use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
     use ureq::unversioned::transport::DefaultConnector;
     let tls = TlsConfig::builder()
@@ -451,7 +451,12 @@ impl Client {
         field: Option<&str>,
     ) -> ApiResult<T> {
         let url = self.url(endpoint, params);
-        let response = self.get(&url, Some(API_TIMEOUT))?;
+        // A long list of song ids can outgrow what servers and proxies accept in an address,
+        // so those go in the body of a POST instead (the OpenSubsonic "formPost" extension).
+        let response = match url.split_once('?') {
+            Some((address, form)) if url.len() > 1800 => self.post_form(address, form)?,
+            _ => self.get(&url, Some(API_TIMEOUT))?,
+        };
         let status = response.status().as_u16();
         let reader = response.into_body().into_reader();
         let mut root: serde_json::Value = serde_json::from_reader(reader).map_err(|_| {
@@ -493,6 +498,18 @@ impl Client {
             dns::forget();
             ApiError::Network(network_hint(&e))
         })
+    }
+
+    fn post_form(&self, address: &str, form: &str) -> ApiResult<ureq::http::Response<ureq::Body>> {
+        self.inner
+            .agent
+            .post(address)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .config()
+            .timeout_global(Some(API_TIMEOUT))
+            .build()
+            .send(form)
+            .map_err(|e| ApiError::Network(network_hint(&e)))
     }
 
     /// Opens connections ahead of need, so the first clicks don't pay for setting them up.
@@ -681,6 +698,13 @@ impl Client {
             None,
         )
         .map(drop)
+    }
+
+    /// Replaces a playlist's songs with `song_ids`, in that order.
+    pub fn replace_playlist(&self, id: &str, song_ids: &[String]) -> ApiResult<()> {
+        let mut params = vec![("playlistId", id)];
+        params.extend(song_ids.iter().map(|s| ("songId", s.as_str())));
+        self.call::<serde_json::Value>("createPlaylist", &params, None).map(drop)
     }
 
     pub fn delete_playlist(&self, id: &str) -> ApiResult<()> {

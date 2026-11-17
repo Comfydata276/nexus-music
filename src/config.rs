@@ -73,6 +73,11 @@ pub struct Settings {
     pub equalizer: bool,
     /// Gain in dB for each equaliser band.
     pub eq_gains: [f32; 6],
+    /// Closing the window leaves the app running in the notification area.
+    pub close_to_tray: bool,
+    pub check_updates: bool,
+    /// The newest version the user has already been told about.
+    pub update_notified: String,
 }
 
 impl Default for Settings {
@@ -95,6 +100,9 @@ impl Default for Settings {
             mono: false,
             equalizer: false,
             eq_gains: [0.0; 6],
+            close_to_tray: true,
+            check_updates: true,
+            update_notified: String::new(),
         }
     }
 }
