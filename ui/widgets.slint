@@ -705,6 +705,8 @@ export component TrackRow inherits Rectangle {
     in property <bool> show-cover: true;
     in property <bool> show-album: true;
     in property <bool> show-number: true;
+    // Show when the song was added to the list.
+    in property <bool> show-added;
     // Reordering by dragging: the row's place in its list, and the list's visible extent.
     in property <bool> can-reorder;
     in property <int> index;
@@ -882,6 +884,15 @@ export component TrackRow inherits Rectangle {
                         });
                     }
                 }
+            }
+
+            if root.show-added: Text {
+                width: 110px;
+                text: root.track.added;
+                color: Theme.muted;
+                font-size: 13px;
+                vertical-alignment: center;
+                overflow: elide;
             }
 
             VerticalLayout {

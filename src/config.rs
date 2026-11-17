@@ -18,6 +18,8 @@ pub struct Paths {
     pub buffers: PathBuf,
     /// Songs saved for listening without the server.
     pub downloads: PathBuf,
+    /// When songs were added to playlists, as far as this app has seen.
+    pub added: PathBuf,
     #[cfg(not(windows))]
     secret: PathBuf,
 }
@@ -46,6 +48,7 @@ impl Paths {
             queue: config.join("queue.json"),
             history: config.join("history.json"),
             pending: config.join("pending.json"),
+            added: config.join("playlist-added.json"),
             covers: cache.join("covers"),
             pages: cache.join("pages"),
             buffers: cache.join("buffers"),
@@ -58,6 +61,17 @@ impl Paths {
         }
         paths
     }
+}
+
+/// What's remembered about one list of songs (a playlist, an album, Liked songs).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ListPrefs {
+    /// Play it shuffled.
+    pub shuffle: bool,
+    /// The order it's shown in (an index into `TRACK_SORTS`), and whether that's reversed.
+    pub sort: usize,
+    pub descending: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,6 +113,8 @@ pub struct Settings {
     pub download_quality: u32,
     /// Playlists kept at the top of the sidebar, in the order they were pinned.
     pub pinned_playlists: Vec<String>,
+    /// Choices remembered for individual playlists, albums and so on, by route key.
+    pub lists: std::collections::HashMap<String, ListPrefs>,
     /// Offline mode: don't contact the server; play downloads only.
     pub offline: bool,
     /// Keep the title bar Windows draws, instead of the app's own.
@@ -140,6 +156,7 @@ impl Default for Settings {
             exclusive: false,
             download_quality: 0,
             pinned_playlists: Vec::new(),
+            lists: std::collections::HashMap::new(),
             offline: false,
             standard_title_bar: false,
             theme: THEMES[0].name.to_string(),

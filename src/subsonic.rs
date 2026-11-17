@@ -79,6 +79,8 @@ pub struct Song {
     pub bit_depth: u32,
     pub genre: String,
     pub starred: Option<String>,
+    /// When the song was added to the library.
+    pub created: String,
     /// The user's star rating, 1 to 5; 0 when unrated.
     pub user_rating: u8,
     pub replay_gain: Option<ReplayGain>,

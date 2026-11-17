@@ -152,14 +152,17 @@ pub struct LyricsState {
 impl Controller {
     // ---- starting playback ---------------------------------------------------------------------
 
-    /// Replaces the queue and starts playing from `start`.
-    pub fn play_songs(self: &Rc<Self>, songs: Vec<Song>, start: usize, context: &str, shuffle: bool) {
+    /// Replaces the queue and starts playing from `start`. `any_start` says no particular
+    /// song was asked for, so a shuffled list may open with any of them.
+    pub fn play_songs(self: &Rc<Self>, songs: Vec<Song>, start: usize, context: &str, any_start: bool) {
         // Where these songs came from, if the caller said (see `play_from`).
         let (source, origins) = match self.play_from.take() {
             Some((source, origins)) if origins.len() == songs.len() => {
                 (source, origins.into_iter().map(Some).collect::<Vec<_>>())
             }
-            _ => (String::new(), vec![None; songs.len()]),
+            // The list is known, but not which of its rows each song is.
+            Some((source, _)) => (source, vec![None; songs.len()]),
+            None => (String::new(), vec![None; songs.len()]),
         };
         // Offline, only what's downloaded can play: skip the rest.
         let (songs, origins, start) = if self.is_offline() {
@@ -186,15 +189,17 @@ impl Controller {
             }
             return;
         }
+        // Each list remembers whether it plays shuffled. Songs that aren't from a list (a
+        // search result, say) leave shuffle as it is.
+        let listed = (!source.is_empty()).then(|| self.list_prefs(&source).shuffle);
         {
             let mut pb = self.playback.borrow_mut();
-            if shuffle && !pb.shuffle {
-                pb.shuffle = true;
-                self.settings.borrow_mut().shuffle = true;
-            }
+            let shuffle = listed.unwrap_or(pb.shuffle);
+            pb.shuffle = shuffle;
+            self.settings.borrow_mut().shuffle = shuffle;
             pb.order = (0..songs.len()).collect();
-            // The Shuffle button means "surprise me", so it picks the opening track too.
-            pb.cursor = if shuffle { fastrand::usize(..songs.len()) } else { start.min(songs.len() - 1) };
+            pb.cursor =
+                if shuffle && any_start { fastrand::usize(..songs.len()) } else { start.min(songs.len() - 1) };
             pb.queue = songs;
             pb.origins = origins;
             pb.source = source;
@@ -208,6 +213,8 @@ impl Controller {
         }
         self.save_settings();
         self.start_current(0.0);
+        self.sync_transport();
+        self.sync_page_shuffle();
     }
 
     /// Loads the track at the cursor into the engine.
@@ -488,20 +495,57 @@ impl Controller {
     }
 
     fn toggle_shuffle(self: &Rc<Self>) {
-        {
+        let on = !self.playback.borrow().shuffle;
+        self.set_shuffle(on);
+    }
+
+    /// Turns shuffle on or off for what's playing. The current song carries on: turning it
+    /// on shuffles what follows; turning it off continues from this song in the list's order.
+    fn set_shuffle(self: &Rc<Self>, on: bool) {
+        let source = {
             let mut pb = self.playback.borrow_mut();
-            pb.shuffle = !pb.shuffle;
-            self.settings.borrow_mut().shuffle = pb.shuffle;
-            if pb.shuffle {
-                pb.shuffle_order();
-            } else if let Some(&current) = pb.order.get(pb.cursor) {
-                pb.order = (0..pb.queue.len()).collect();
-                pb.cursor = current;
+            if pb.shuffle != on {
+                pb.shuffle = on;
+                if on {
+                    pb.shuffle_order();
+                } else if let Some(&current) = pb.order.get(pb.cursor) {
+                    pb.order = (0..pb.queue.len()).collect();
+                    pb.cursor = current;
+                }
             }
-        }
+            pb.source.clone()
+        };
+        self.settings.borrow_mut().shuffle = on;
         self.save_settings();
+        // The list being played remembers the choice for next time.
+        self.update_list_prefs(&source, |prefs| prefs.shuffle = on);
         self.sync_transport();
         self.next_changed();
+        self.sync_page_shuffle();
+    }
+
+    /// The shuffle button on a page: sets whether that list plays shuffled, without starting
+    /// it. If it's the list playing now, the queue changes to match.
+    pub fn toggle_page_shuffle(self: &Rc<Self>) {
+        let Some(key) = self.current_route().map(|route| route.cache_key()) else { return };
+        let playing_this = self.playback.borrow().source == key;
+        if playing_this {
+            self.toggle_shuffle();
+        } else {
+            let on = !self.list_prefs(&key).shuffle;
+            self.update_list_prefs(&key, |prefs| prefs.shuffle = on);
+            self.sync_page_shuffle();
+        }
+    }
+
+    /// Shows whether the list on screen plays shuffled.
+    pub fn sync_page_shuffle(&self) {
+        let key = self.current_route().map(|route| route.cache_key()).unwrap_or_default();
+        let on = {
+            let pb = self.playback.borrow();
+            if !key.is_empty() && pb.source == key { pb.shuffle } else { self.list_prefs(&key).shuffle }
+        };
+        self.ui.global::<ui::View>().set_shuffle(on);
     }
 
     fn cycle_repeat(self: &Rc<Self>) {
@@ -1469,7 +1513,9 @@ impl Controller {
         self.play_songs(songs, index, context, false);
     }
 
-    pub fn play_page(self: &Rc<Self>, shuffle: bool) {
+    /// The page's play button: plays its list from the top, or shuffled if the list is set
+    /// to shuffle.
+    pub fn play_page(self: &Rc<Self>) {
         let (source, context) = {
             let page = self.page.borrow();
             (page.play.clone(), page.context.clone())
@@ -1479,9 +1525,10 @@ impl Controller {
         match source {
             crate::pages::PlaySource::Songs => {
                 self.playing_from_page();
-                self.play_songs(songs, 0, &context, shuffle)
+                self.play_songs(songs, 0, &context, true)
             }
             crate::pages::PlaySource::Albums(ids) => {
+                let key = self.current_route().map(|route| route.cache_key()).unwrap_or_default();
                 self.request(
                     move |client| {
                         let mut all = Vec::new();
@@ -1491,7 +1538,11 @@ impl Controller {
                         Ok(all)
                     },
                     move |ctl, result| match result {
-                        Ok(all) => ctl.play_songs(all, 0, &context, shuffle),
+                        Ok(all) => {
+                            // Played from this page, though its rows aren't these songs.
+                            ctl.play_from.replace(Some((key, Vec::new())));
+                            ctl.play_songs(all, 0, &context, true)
+                        }
                         Err(e) => ctl.toast(e.to_string()),
                     },
                 );

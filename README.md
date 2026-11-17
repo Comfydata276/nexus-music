@@ -17,7 +17,8 @@ by the app itself.
 - Gapless playback or crossfade, seeking, shuffle, repeat and a queue you can edit.
 - A queue panel beside the page, with a play button on every row to skip straight to it.
   Drag rows to reorder the queue, or the songs in a playlist.
-- Find and sort within a playlist or Liked songs.
+- Find and sort within a playlist or Liked songs: click a column heading to sort by it, including the date each song was added.
+- Shuffle is set per playlist or album and remembered.
 - Select several songs with Ctrl or Shift, then drag them onto a playlist or the queue, or
   right-click to act on them all.
 - Recently played: the last hundred songs, each playable again by itself.

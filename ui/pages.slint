@@ -215,19 +215,34 @@ component ActionBar inherits Rectangle {
             PlayButton {
                 size: 54px;
                 label: "Play " + View.title;
-                clicked => { View.play(false); }
+                clicked => { View.play(); }
             }
         }
 
+        // Sets whether this list plays shuffled; it doesn't start anything playing.
         if View.can-play: VerticalLayout {
             alignment: center;
-            IconButton {
+            Rectangle {
                 width: 40px;
                 height: 40px;
-                icon: Icons.shuffle;
-                icon-size: 22px;
-                label: "Shuffle " + View.title;
-                clicked => { View.play(true); }
+
+                IconButton {
+                    width: 40px;
+                    height: 40px;
+                    icon: Icons.shuffle;
+                    icon-size: 22px;
+                    active: View.shuffle;
+                    label: View.shuffle ? "Turn off shuffle for " + View.title : "Turn on shuffle for " + View.title;
+                    clicked => { View.toggle-shuffle(); }
+                }
+
+                if View.shuffle: Rectangle {
+                    y: 34px;
+                    width: 4px;
+                    height: 4px;
+                    border-radius: 2px;
+                    background: Theme.accent-bright;
+                }
             }
         }
 
@@ -349,7 +364,69 @@ component ActionBar inherits Rectangle {
     }
 }
 
+// A column's heading. Clicking it sorts the list by that column: one way, then the other,
+// then back to the list's own order.
+component HeaderCell inherits Rectangle {
+    in property <string> text;
+    // Shown in place of the text when there is none.
+    in property <image> icon;
+    in property <int> column;
+    // Sits at the right of its space instead of the left.
+    in property <bool> trailing;
+    property <bool> active: View.track-sort-index == self.column;
+    property <brush> ink: self.active || touch.has-hover ? Theme.text : Theme.muted;
+
+    accessible-role: button;
+    accessible-label: "Sort by " + (self.text != "" ? self.text : "length");
+    accessible-action-default => { touch.clicked(); }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { View.sort-column(root.column); }
+    }
+
+    HorizontalLayout {
+        alignment: root.trailing ? end : start;
+        spacing: 6px;
+
+        if root.active && root.trailing: VerticalLayout {
+            alignment: center;
+            Icon {
+                source: View.track-sort-descending ? Icons.arrow-down : Icons.arrow-up;
+                size: 14px;
+                tint: Theme.accent-bright;
+            }
+        }
+
+        if root.text != "": Text {
+            text: root.text;
+            color: root.ink;
+            font-size: 13px;
+            vertical-alignment: center;
+        }
+
+        if root.text == "": VerticalLayout {
+            alignment: center;
+            Icon {
+                source: root.icon;
+                size: 15px;
+                tint: root.ink;
+            }
+        }
+
+        if root.active && !root.trailing: VerticalLayout {
+            alignment: center;
+            Icon {
+                source: View.track-sort-descending ? Icons.arrow-down : Icons.arrow-up;
+                size: 14px;
+                tint: Theme.accent-bright;
+            }
+        }
+    }
+}
+
 component ColumnHeader inherits Rectangle {
+    in property <bool> show-added;
     height: 36px;
 
     HorizontalLayout {
@@ -370,37 +447,36 @@ component ColumnHeader inherits Rectangle {
             width: 40px;
         }
 
-        Text {
+        HeaderCell {
             horizontal-stretch: 5;
             min-width: 80px;
             preferred-width: 0px;
             text: "Title";
-            color: Theme.muted;
-            font-size: 13px;
-            vertical-alignment: center;
+            column: 1;
         }
 
-        if View.show-album: Text {
+        if View.show-album: HeaderCell {
             horizontal-stretch: 3;
             min-width: 0px;
             preferred-width: 0px;
             text: "Album";
-            color: Theme.muted;
-            font-size: 13px;
-            vertical-alignment: center;
+            column: 3;
+        }
+
+        if root.show-added: HeaderCell {
+            width: 110px;
+            text: "Date added";
+            column: 5;
         }
 
         // Same width as a row's heart, duration and menu button, so the columns line up.
         HorizontalLayout {
             width: 132px;
-            alignment: end;
             padding-right: 46px;
-            VerticalLayout {
-                alignment: center;
-                Icon {
-                    source: Icons.clock-3;
-                    size: 15px;
-                }
+            HeaderCell {
+                icon: Icons.clock-3;
+                column: 4;
+                trailing: true;
             }
         }
     }
@@ -687,6 +763,8 @@ export component TrackListPage inherits Rectangle {
     // scrolled away.
     property <length> bar-y: max(0px, self.hero-height - self.scrolled);
     property <bool> stuck: self.scrolled > self.hero-height;
+    // The date column gives way first when the window is narrow.
+    property <bool> show-added: View.show-added && self.width >= 860px;
 
     scroll := ScrollView {
         vertical-scrollbar-policy: always-off;
@@ -709,6 +787,7 @@ export component TrackListPage inherits Rectangle {
             x: 0;
             y: root.hero-height + 72px;
             width: scroll.visible-width;
+            show-added: root.show-added;
         }
 
         if View.tracks.length == 0 && View.pending: SkeletonRows {
@@ -765,6 +844,7 @@ export component TrackListPage inherits Rectangle {
                 show-album: View.show-album;
                 show-cover: View.show-cover;
                 show-number: View.show-number;
+                show-added: root.show-added;
                 can-reorder: View.can-reorder;
                 index: row.index;
                 count: View.tracks.length;

@@ -508,7 +508,7 @@ impl Controller {
                 let source = target.route_key();
                 self.with_songs(target, move |ctl, songs| {
                     ctl.play_from.replace(source.map(|key| (key, (0..songs.len()).collect())));
-                    ctl.play_songs(songs, 0, &name, false)
+                    ctl.play_songs(songs, 0, &name, true)
                 })
             }
             ("play-next", _) => self.with_songs(target, |ctl, songs| {
@@ -626,9 +626,10 @@ impl Controller {
                 let ids: Vec<String> = songs.iter().map(|s| s.id.clone()).collect();
                 let label = name.clone();
                 self.request(
-                    move |client| client.create_playlist(&name, &ids),
+                    move |client| client.create_playlist(&name, &ids).map(|playlist| (playlist, ids)),
                     move |ctl, result| match result {
-                        Ok(_) => {
+                        Ok((playlist, ids)) => {
+                            ctl.added.borrow_mut().create(&playlist.id, &ids, chrono::Utc::now().timestamp());
                             ctl.toast(format!("Created “{label}”"));
                             ctl.reload_playlists();
                         }
@@ -664,6 +665,10 @@ impl Controller {
                     move |ctl, result| match result {
                         Ok(()) => {
                             ctl.invalidate(&key);
+                            ctl.update_list_prefs(&key, |prefs| *prefs = Default::default());
+                            if let Route::Playlist(id) = &page {
+                                ctl.added.borrow_mut().forget(id);
+                            }
                             ctl.toast("Playlist deleted");
                             ctl.reload_playlists();
                             if ctl.current_route() == Some(page) {
@@ -688,6 +693,8 @@ impl Controller {
                 // If the playlist can't be read, add without the check: the add itself will
                 // report whatever is wrong.
                 let Ok(playlist) = result else { return ctl.add_songs_to_playlist(playlist_id, songs) };
+                // Note what's in it now, so the songs about to be added can be told apart.
+                ctl.added.borrow_mut().observe(&playlist_id, &playlist.songs, chrono::Utc::now().timestamp());
                 let present: std::collections::HashSet<&str> = playlist.songs.iter().map(|s| s.id.as_str()).collect();
                 let fresh: Vec<Song> = songs.iter().filter(|s| !present.contains(s.id.as_str())).cloned().collect();
                 let repeats = songs.len() - fresh.len();
@@ -723,13 +730,20 @@ impl Controller {
             .unwrap_or_else(|| "playlist".into());
         let ids: Vec<String> = songs.iter().map(|s| s.id.clone()).collect();
         let key = format!("playlist:{playlist_id}");
+        let page = Route::Playlist(playlist_id.clone());
         self.request(
-            move |client| client.add_to_playlist(&playlist_id, &ids),
+            move |client| client.add_to_playlist(&playlist_id, &ids).map(|()| (playlist_id, ids)),
             move |ctl, result| match result {
-                Ok(()) => {
+                Ok((playlist_id, ids)) => {
+                    ctl.added.borrow_mut().record(&playlist_id, &ids, chrono::Utc::now().timestamp());
                     ctl.invalidate(&key);
                     ctl.toast(format!("Added to “{name}”"));
-                    ctl.reload_playlists();
+                    if ctl.current_route() == Some(page) {
+                        // The playlist is on screen: show the new songs in it.
+                        ctl.refresh();
+                    } else {
+                        ctl.reload_playlists();
+                    }
                 }
                 Err(e) => ctl.toast(e.to_string()),
             },
@@ -821,7 +835,7 @@ impl Controller {
         let source = target.route_key();
         self.with_songs(target, move |ctl, songs| {
             ctl.play_from.replace(source.map(|key| (key, (0..songs.len()).collect())));
-            ctl.play_songs(songs, 0, &title, false)
+            ctl.play_songs(songs, 0, &title, true)
         });
     }
 

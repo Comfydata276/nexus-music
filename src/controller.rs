@@ -129,7 +129,9 @@ impl Route {
 }
 
 /// Orders a song list can be shown in. The first is the list's own order.
-pub const TRACK_SORTS: [&str; 5] = ["Custom order", "Title", "Artist", "Album", "Duration"];
+pub const TRACK_SORTS: [&str; 6] = ["Custom order", "Title", "Artist", "Album", "Duration", "Date added"];
+/// The position of "Date added" in `TRACK_SORTS`.
+const SORT_ADDED: usize = 5;
 
 /// How the song list on screen is narrowed and ordered.
 #[derive(Default)]
@@ -156,8 +158,14 @@ impl TrackView {
         self.sort == 0 && self.filter.trim().is_empty()
     }
 
-    /// Works out which songs to show, and in what order.
-    fn arrange(&mut self, songs: &[Song]) {
+    /// Whether an order starts out reversed when first chosen: dates do, newest first.
+    fn starts_descending(sort: usize) -> bool {
+        sort == SORT_ADDED
+    }
+
+    /// Works out which songs to show, and in what order. `added` holds when each song was
+    /// added to the list, where that's known.
+    fn arrange(&mut self, songs: &[Song], added: &[i64]) {
         let needle = self.filter.trim().to_lowercase();
         let mut map: Vec<usize> = (0..songs.len())
             .filter(|&i| {
@@ -169,13 +177,14 @@ impl TrackView {
             })
             .collect();
         if self.sort != 0 {
-            let key = |i: &usize| -> (String, u32) {
+            let key = |i: &usize| -> (String, i64) {
                 let song = &songs[*i];
                 match self.sort {
                     1 => (song.title.to_lowercase(), 0),
                     2 => (song.artist_label().to_lowercase(), 0),
-                    3 => (song.album.to_lowercase(), song.disc_number * 1000 + song.track),
-                    _ => (String::new(), song.duration),
+                    3 => (song.album.to_lowercase(), (song.disc_number * 1000 + song.track) as i64),
+                    4 => (String::new(), song.duration as i64),
+                    _ => (String::new(), added.get(*i).copied().unwrap_or(0)),
                 }
             };
             // A stable sort, so songs that tie keep the list's own order.
@@ -225,6 +234,11 @@ pub struct Controller {
     pub page: RefCell<PageData>,
     pub tracks_model: Rc<VecModel<ui::Track>>,
     pub track_view: RefCell<TrackView>,
+    /// When each of the page's songs was added to its list (0 where unknown); empty on
+    /// pages that have no such date.
+    page_added: RefCell<Vec<i64>>,
+    /// The app's own note of when songs were added to playlists.
+    pub added: RefCell<crate::added::Added>,
     /// Set just before `play_songs` by callers that know where the songs came from: the
     /// page's route key, and each song's position in that page's list.
     pub play_from: RefCell<Option<(String, Vec<usize>)>>,
@@ -296,6 +310,8 @@ impl Controller {
             page: RefCell::default(),
             tracks_model: Rc::new(VecModel::default()),
             track_view: RefCell::default(),
+            page_added: RefCell::default(),
+            added: RefCell::new(crate::added::Added::load(paths.added.clone())),
             play_from: RefCell::new(None),
             selection: RefCell::default(),
             selection_anchor: Cell::new(None),
@@ -1058,8 +1074,15 @@ impl Controller {
         let key = self.current_route().map(|route| route.cache_key()).unwrap_or_default();
         let same_view = self.track_view.borrow().key == key;
         if !same_view {
-            *self.track_view.borrow_mut() = TrackView { key, ..Default::default() };
+            // It opens in the order it was last left in.
+            let prefs = self.list_prefs(&key);
+            let sort = prefs.sort.min(TRACK_SORTS.len() - 1);
+            *self.track_view.borrow_mut() =
+                TrackView { key, sort, descending: sort != 0 && prefs.descending, ..Default::default() };
             view.set_filter("".into());
+        }
+        if let (Some(playlist), false) = (&data.playlist, data.pending) {
+            self.added.borrow_mut().observe(&playlist.id, &data.songs, chrono::Utc::now().timestamp());
         }
 
         // Leave lists alone when their content didn't change, so a background refresh or the
@@ -1114,7 +1137,9 @@ impl Controller {
     pub fn rebuild_tracks(&self) {
         let rows = {
             let page = self.page.borrow();
-            self.track_view.borrow_mut().arrange(&page.songs);
+            let added = self.added_dates(&page);
+            self.track_view.borrow_mut().arrange(&page.songs, &added);
+            *self.page_added.borrow_mut() = added;
             self.track_rows(&page)
         };
         let sections = rows.last().map(|row| row.sections_before).unwrap_or(0);
@@ -1213,10 +1238,10 @@ impl Controller {
         let page = self.page.borrow();
         let state = self.track_view.borrow();
         let view = self.ui.global::<ui::View>();
-        let can_filter = page.playlist.is_some()
-            || page.liked_songs
-            || matches!(self.current_route(), Some(Route::Downloads));
+        let can_filter = self.is_own_list(&page);
         view.set_can_filter(can_filter && !page.songs.is_empty());
+        view.set_show_added(can_filter);
+        view.set_track_sort_index(state.sort as i32);
         view.set_track_sort(
             match (state.sort, page.playlist.is_some()) {
                 (0, false) => "Default order",
@@ -1235,6 +1260,73 @@ impl Controller {
         drop((page, state));
         self.sync_download_button();
         self.sync_playing();
+        self.sync_page_shuffle();
+    }
+
+    /// Playlists, Liked songs and Downloads: lists of the user's own making, which can be
+    /// filtered, show when each song was added, and remember how they were sorted.
+    fn is_own_list(&self, page: &PageData) -> bool {
+        page.playlist.is_some() || page.liked_songs || matches!(self.current_route(), Some(Route::Downloads))
+    }
+
+    /// When each of the page's songs was added to it; empty if the page has no such date.
+    fn added_dates(&self, page: &PageData) -> Vec<i64> {
+        use crate::added::{day_start, parse_time};
+        if let Some(playlist) = &page.playlist {
+            // The app's own note where it has one; otherwise the day the song joined the
+            // library, which is the nearest thing the server knows.
+            let noted = self.added.borrow().dates(&playlist.id, &page.songs);
+            page.songs
+                .iter()
+                .zip(noted)
+                .map(|(song, at)| if at > 0 { at } else { day_start(parse_time(&song.created)) })
+                .collect()
+        } else if page.liked_songs {
+            page.songs.iter().map(|song| song.starred.as_deref().map(parse_time).unwrap_or(0)).collect()
+        } else if matches!(self.current_route(), Some(Route::Downloads)) {
+            let downloads = self.downloads.borrow();
+            page.songs.iter().map(|song| downloads.added_at(&song.id)).collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    // ---- what's remembered about each list -----------------------------------------------------
+
+    pub fn list_prefs(&self, key: &str) -> crate::config::ListPrefs {
+        self.settings.borrow().lists.get(key).copied().unwrap_or_default()
+    }
+
+    pub fn update_list_prefs(&self, key: &str, change: impl FnOnce(&mut crate::config::ListPrefs)) {
+        if key.is_empty() {
+            return;
+        }
+        {
+            let mut settings = self.settings.borrow_mut();
+            let mut prefs = settings.lists.get(key).copied().unwrap_or_default();
+            change(&mut prefs);
+            if prefs == Default::default() {
+                settings.lists.remove(key);
+            } else {
+                settings.lists.insert(key.to_string(), prefs);
+            }
+        }
+        self.save_settings();
+    }
+
+    /// Remembers the order the list on screen is shown in, for the next visit.
+    fn remember_track_sort(&self) {
+        if !self.is_own_list(&self.page.borrow()) {
+            return;
+        }
+        let (key, sort, descending) = {
+            let state = self.track_view.borrow();
+            (state.key.clone(), state.sort, state.descending)
+        };
+        self.update_list_prefs(&key, |prefs| {
+            prefs.sort = sort;
+            prefs.descending = descending;
+        });
     }
 
     /// The page's songs in the order they're shown.
@@ -1262,9 +1354,38 @@ impl Controller {
     pub fn set_track_sort(&self, sort: usize) {
         {
             let mut state = self.track_view.borrow_mut();
-            state.descending = sort != 0 && state.sort == sort && !state.descending;
-            state.sort = sort.min(TRACK_SORTS.len() - 1);
+            let sort = sort.min(TRACK_SORTS.len() - 1);
+            state.descending = match (sort, state.sort == sort) {
+                (0, _) => false,
+                (_, true) => !state.descending,
+                (_, false) => TrackView::starts_descending(sort),
+            };
+            state.sort = sort;
         }
+        self.remember_track_sort();
+        self.rebuild_tracks();
+    }
+
+    /// A column heading was clicked: sort by it, then the other way, then back to the
+    /// list's own order.
+    fn cycle_track_sort(&self, column: usize) {
+        if column == 0 || column >= TRACK_SORTS.len() {
+            return;
+        }
+        {
+            let mut state = self.track_view.borrow_mut();
+            let first = TrackView::starts_descending(column);
+            if state.sort != column {
+                state.sort = column;
+                state.descending = first;
+            } else if state.descending == first {
+                state.descending = !first;
+            } else {
+                state.sort = 0;
+                state.descending = false;
+            }
+        }
+        self.remember_track_sort();
         self.rebuild_tracks();
     }
 
@@ -1313,18 +1434,20 @@ impl Controller {
 
     /// Builds the interface rows for the page's songs, in the order the view has arranged.
     fn track_rows(&self, data: &PageData) -> Vec<ui::Track> {
-        let multi_disc = data.disc_sections
-            && data.songs.iter().any(|s| s.disc_number > 1);
+        let state = self.track_view.borrow();
+        // Disc headings only make sense while the album is in its own order.
+        let multi_disc = data.disc_sections && state.sort == 0 && data.songs.iter().any(|s| s.disc_number > 1);
         let mut last_disc = 0;
         let mut sections = 0;
-        let state = self.track_view.borrow();
+        let added = self.page_added.borrow();
         state
             .map
             .iter()
-            .filter_map(|&i| data.songs.get(i))
+            .filter_map(|&i| data.songs.get(i).map(|song| (i, song)))
             .enumerate()
-            .map(|(index, song)| {
+            .map(|(index, (i, song))| {
                 let mut row = self.track_row(song);
+                row.added = crate::added::date_label(added.get(i).copied().unwrap_or(0)).into();
                 row.number = if data.album_numbers && song.track > 0 {
                     song.track.to_string().into()
                 } else {
@@ -1352,6 +1475,7 @@ impl Controller {
             cover: song.cover_art.as_str().into(),
             // A radio station has no length.
             duration: if song.duration == 0 { SharedString::default() } else { clock(song.duration).into() },
+            added: SharedString::default(),
             number: SharedString::default(),
             starred: self.is_starred(song),
             section: SharedString::default(),
@@ -1645,8 +1769,14 @@ impl Controller {
         });
 
         let view = self.ui.global::<ui::View>();
-        view.on_play(|shuffle| {
-            with(|ctl| ctl.play_page(shuffle));
+        view.on_play(|| {
+            with(|ctl| ctl.play_page());
+        });
+        view.on_toggle_shuffle(|| {
+            with(|ctl| ctl.toggle_page_shuffle());
+        });
+        view.on_sort_column(|column| {
+            with(|ctl| ctl.cycle_track_sort(column.max(0) as usize));
         });
         view.on_toggle_star(|| {
             with(|ctl| ctl.toggle_page_star());

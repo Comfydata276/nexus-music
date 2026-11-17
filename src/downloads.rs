@@ -24,6 +24,9 @@ pub struct Entry {
     /// File name within the downloads folder.
     pub file: String,
     pub bytes: u64,
+    /// When it was downloaded, in seconds since 1970; 0 for downloads from before this was kept.
+    #[serde(default)]
+    pub at: i64,
 }
 
 /// A song waiting to be fetched, or being fetched now.
@@ -110,6 +113,21 @@ impl Downloads {
     /// How far a song's download has got, from 0 to 1; -1 if it isn't being downloaded.
     pub fn progress_of(&self, id: &str) -> f32 {
         self.job(id).map(|job| job.progress.load(Ordering::Relaxed) as f32 / 1000.0).unwrap_or(-1.0)
+    }
+
+    /// When a song was downloaded, in seconds since 1970; 0 if it isn't (or isn't yet).
+    pub fn added_at(&self, id: &str) -> i64 {
+        let Some(entry) = self.entries.iter().find(|entry| entry.song.id == id) else { return 0 };
+        if entry.at > 0 {
+            return entry.at;
+        }
+        // Older downloads: the file's own date says when it arrived.
+        fs::metadata(self.dir.join(&entry.file))
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|since| since.as_secs() as i64)
+            .unwrap_or(0)
     }
 
     /// Where a downloaded song's audio is, if it has been downloaded.
@@ -220,7 +238,7 @@ fn fetch(
         return Err(reason);
     }
     fs::rename(&temp, dir.join(&file)).map_err(|e| e.to_string())?;
-    Ok(Entry { song: song.clone(), file, bytes })
+    Ok(Entry { song: song.clone(), file, bytes, at: chrono::Utc::now().timestamp() })
 }
 
 impl Controller {

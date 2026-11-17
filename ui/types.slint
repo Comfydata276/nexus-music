@@ -13,6 +13,8 @@ export struct Track {
     album-id: string,
     cover: string,
     duration: string,
+    // When the song was added to the list it's shown in, e.g. "3 Mar 2025"; empty if unknown.
+    added: string,
     number: string,
     starred: bool,
     // Non-empty on the first track of a disc: shown as a divider above the row.
@@ -187,6 +189,13 @@ export global View {
     in property <string> track-sort;
     in property <bool> track-sort-custom;
     in property <bool> track-sort-descending;
+    // Which column the songs are sorted by: 0 none (the list's own order), 1 title, 2 artist,
+    // 3 album, 4 length, 5 date added.
+    in property <int> track-sort-index;
+    // The list has a "Date added" column.
+    in property <bool> show-added;
+    // This list plays shuffled.
+    in property <bool> shuffle;
     // The page's songs can be saved on this PC. State: 0 none saved, 1 in progress, 2 all saved.
     in property <bool> can-download;
     in property <int> download-state;
@@ -202,7 +211,10 @@ export global View {
 
     in-out property <length> scroll-y;
 
-    callback play(shuffle: bool);
+    callback play();
+    callback toggle-shuffle();
+    // A column heading was clicked.
+    callback sort-column(column: int);
     callback toggle-star();
     callback header-menu(x: length, y: length);
     callback track-activated(index: int);
