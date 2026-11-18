@@ -317,6 +317,11 @@ pub struct Controller {
     import_missing: RefCell<Vec<crate::import::Wanted>>,
     /// Counts ticks, to refresh the Requests page now and then while it's open.
     requests_ticks: Cell<u32>,
+    /// The search on screen: everything it found, which kind of result it's narrowed to
+    /// (see `pages::SEARCH_FILTERS`), and the words that choice belongs to.
+    search_whole: RefCell<Option<PageData>>,
+    search_filter: Cell<usize>,
+    search_filter_query: RefCell<String>,
     /// Songs kept on this PC as they're played, what fetches the next few ahead of time,
     /// and counters that pace the two.
     pub song_cache: crate::songcache::SongCache,
@@ -409,6 +414,9 @@ impl Controller {
             import_report: RefCell::new(None),
             import_missing: RefCell::default(),
             requests_ticks: Cell::new(0),
+            search_whole: RefCell::new(None),
+            search_filter: Cell::new(0),
+            search_filter_query: RefCell::default(),
             song_cache: crate::songcache::SongCache::new(paths.songs.clone()),
             fetch_ahead: crate::songcache::Ahead::new(),
             keep_ticks: Cell::new(0),
@@ -1826,8 +1834,24 @@ impl Controller {
         });
     }
 
+    /// Narrows the search on screen to one kind of result (or back to all of them).
+    fn set_search_filter(self: &Rc<Self>, filter: usize) {
+        if self.search_filter.get() == filter {
+            return;
+        }
+        self.search_filter.set(filter);
+        let whole = self.search_whole.borrow().clone();
+        if let Some(whole) = whole {
+            self.apply_page(whole, 0.0);
+        }
+    }
+
     /// Replaces the page on screen with a newer copy, unless nothing differs.
     fn apply_if_changed(self: &Rc<Self>, data: PageData) {
+        // A search on screen is a view of what was found: compare with that, not the view.
+        if self.search_whole.borrow().as_ref() == Some(&data) {
+            return;
+        }
         {
             let current = self.page.borrow();
             if *current == data {
@@ -1845,6 +1869,34 @@ impl Controller {
 
     pub fn apply_page(self: &Rc<Self>, data: PageData, scroll: f32) {
         let view = self.ui.global::<ui::View>();
+        // A search is shown through whichever of its chips is chosen; everything it found is
+        // kept, so choosing another needs no new search.
+        let data = match self.current_route() {
+            Some(Route::Search(query)) if !query.is_empty() => {
+                if *self.search_filter_query.borrow() != query {
+                    self.search_filter.set(0);
+                    self.search_filter_query.replace(query);
+                }
+                let shown = pages::search_view(&data, self.search_filter.get());
+                self.search_whole.replace(Some(data));
+                if view.get_kinds().row_count() == 0 {
+                    view.set_kinds(ModelRc::new(VecModel::from(
+                        pages::SEARCH_FILTERS.iter().map(|name| SharedString::from(*name)).collect::<Vec<_>>(),
+                    )));
+                }
+                view.set_kind(self.search_filter.get() as i32);
+                shown
+            }
+            _ => {
+                self.search_whole.replace(None);
+                if view.get_kinds().row_count() > 0 {
+                    view.set_kinds(ModelRc::default());
+                }
+                data
+            }
+        };
+        view.set_tracks_route(data.tracks_route.as_str().into());
+        view.set_offers_route(data.offers_route.as_str().into());
         view.set_label(data.label.as_str().into());
         view.set_title(data.title.as_str().into());
         view.set_subtitle(data.subtitle.as_str().into());
@@ -2682,6 +2734,10 @@ impl Controller {
         });
         app.on_navigate(|route| {
             with(|ctl| {
+                // "Show all" on a search's list chooses that kind's chip.
+                if let Some(filter) = route.strip_prefix("filter:").and_then(|filter| filter.parse::<usize>().ok()) {
+                    return ctl.set_search_filter(filter);
+                }
                 if let Some(route) = Route::parse(&route) {
                     ctl.navigate(route);
                 }
@@ -2965,6 +3021,9 @@ impl Controller {
                 Some(Route::OutsideArtist(artist)) => ctl.prompt_add_artist(artist),
                 _ => {}
             });
+        });
+        view.on_set_kind(|index| {
+            with(|ctl| ctl.set_search_filter(index.max(0) as usize));
         });
         view.on_offer_activated(|index| {
             with(|ctl| {

@@ -187,6 +187,10 @@ pub struct PageData {
     /// for, and the shelves beneath them.
     pub offers_title: String,
     pub offers_note: String,
+    /// Where "Show all" beside the songs leads, for a list that's been cut short; and the
+    /// same for the songs that aren't in the library.
+    pub tracks_route: String,
+    pub offers_route: String,
     pub offers: Vec<OfferData>,
     pub tail: Vec<ShelfData>,
     pub tiles: Vec<CardData>,
@@ -290,6 +294,67 @@ fn plain(text: &str) -> String {
     crate::search::fold(text).split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// The kinds of thing a search can be narrowed to, as its chips name them.
+pub const SEARCH_FILTERS: [&str; 4] = ["All", "Songs", "Artists", "Albums"];
+/// How many songs each list shows before "Show all", and how many cards make a shelf worth
+/// a "Show all" of its own.
+const TOP_SONGS: usize = 4;
+const SHELF_ROW: usize = 5;
+
+/// A search page as it's shown with one of its chips chosen. `whole` holds everything that
+/// was found; "All" shows the top few of each kind, the others one kind in full.
+pub fn search_view(whole: &PageData, filter: usize) -> PageData {
+    let mut page = whole.clone();
+    let looking = whole.offers_note.starts_with("Looking");
+    if filter == 0 || filter >= SEARCH_FILTERS.len() {
+        if page.songs.len() > TOP_SONGS {
+            page.songs.truncate(TOP_SONGS);
+            page.tracks_route = "filter:1".into();
+        }
+        if page.offers.len() > TOP_SONGS {
+            page.offers.truncate(TOP_SONGS);
+            page.offers_route = "filter:1".into();
+        }
+        for shelf in page.lead.iter_mut().chain(&mut page.shelves).chain(&mut page.tail) {
+            if shelf.cards.len() > SHELF_ROW {
+                shelf.route = match shelf.title.as_str() {
+                    "Artists" => "filter:2".into(),
+                    "Albums" => "filter:3".into(),
+                    _ => String::new(),
+                };
+            }
+        }
+        return page;
+    }
+    // Every card of the kind chosen, on as many rows as they need.
+    let of = |shelves: &[ShelfData], title: &str| -> Vec<ShelfData> {
+        shelves.iter().filter(|shelf| shelf.title == title).cloned().map(|shelf| ShelfData { wrap: true, route: String::new(), ..shelf }).collect()
+    };
+    page.lead.clear();
+    if filter == 1 {
+        page.shelves.clear();
+        page.tail.clear();
+    } else {
+        let title = SEARCH_FILTERS[filter];
+        page.shelves = of(&whole.lead, title).into_iter().chain(of(&whole.shelves, title)).collect();
+        page.tail = of(&whole.tail, title);
+        page.songs.clear();
+        page.offers.clear();
+    }
+    let outside = !page.offers.is_empty() || !page.tail.is_empty();
+    if !outside && !looking {
+        page.offers_title.clear();
+        page.offers_note.clear();
+    }
+    let nothing = page.songs.is_empty() && page.shelves.is_empty() && !outside;
+    page.empty = if nothing && !looking {
+        format!("No {} found for {}.", SEARCH_FILTERS[filter].to_lowercase(), whole.context)
+    } else {
+        String::new()
+    };
+    page
+}
+
 /// What's been found beyond the library so far, put onto a copy of the search page.
 fn with_outside(
     page: &PageData,
@@ -363,13 +428,13 @@ fn search_extras(query: &str, page: &PageData, publish: &mut dyn FnMut(PageData)
                 let within = format!(" {typed} ").contains(&format!(" {name} ")) && name.split(' ').count() * 2 >= words;
                 !name.is_empty() && (name.contains(&typed) || within)
             })
-            .take(5)
+            .take(10)
             .partition(|artist| plain(&artist.name) == typed);
 
         // Lidarr's part is in: show it while more is being looked for.
         let (albums, singles) = releases.join().unwrap_or_default();
         let mut albums: Vec<crate::lidarr::Offer> =
-            albums.into_iter().filter(|offer| !have_albums.contains(&(plain(&offer.title), plain(&offer.artist)))).take(12).collect();
+            albums.into_iter().filter(|offer| !have_albums.contains(&(plain(&offer.title), plain(&offer.artist)))).take(24).collect();
         // What's been offered before is remembered as it was: asked for, and with its cover.
         for album in &mut albums {
             if let Some(known) = crate::lidarr::offered(&album.album) {
@@ -377,7 +442,10 @@ fn search_extras(query: &str, page: &PageData, publish: &mut dyn FnMut(PageData)
             }
         }
         crate::lidarr::remember(&albums);
-        let mut artists: Vec<crate::lidarr::ArtistOffer> = exact.iter().chain(&named).cloned().collect();
+        // Of those named outright, the ones of some note (Lidarr has their picture) go first.
+        let (noted, obscure): (Vec<_>, Vec<_>) = exact.iter().cloned().partition(|artist| !artist.cover.is_empty());
+        let noted_count = noted.len();
+        let mut artists: Vec<crate::lidarr::ArtistOffer> = noted.into_iter().chain(obscure).chain(named.iter().cloned()).collect();
         crate::lidarr::remember_artists(&artists);
 
         // A well-known song typed by its title alone. Lidarr's list of singles says whose it
@@ -401,7 +469,7 @@ fn search_extras(query: &str, page: &PageData, publish: &mut dyn FnMut(PageData)
                 crate::lidarr::remember(&theirs);
                 albums.retain(|album| !theirs.iter().any(|their| their.album == album.album));
                 albums.splice(0..0, theirs);
-                albums.truncate(12);
+                albums.truncate(24);
             }
             return Some(with_outside(page, "Ask Lidarr for any of these albums, or open the artist for everything they've made.", &[], &artists, &albums));
         }
@@ -424,12 +492,13 @@ fn search_extras(query: &str, page: &PageData, publish: &mut dyn FnMut(PageData)
             let listed = songs.iter().any(|have| {
                 crate::musicbrainz::same_words(&have.title, &song.title) && crate::musicbrainz::same_words(&have.artist, &song.artist)
             });
-            if !listed && songs.len() < 8 {
+            if !listed && songs.len() < 20 {
                 songs.push(song);
             }
         }
         // Whoever the songs found are by joins the artists: typing a song's name should lead
-        // to its artist too. They go after an artist who was named outright, before the rest.
+        // to its artist too. They go after a noted artist who was named outright, before the
+        // rest (an obscure band that shares the song's name, say).
         let mut by: Vec<crate::lidarr::ArtistOffer> = Vec::new();
         for song in songs.iter().take(3) {
             let listed = artists.iter().chain(&by).any(|artist| artist.id == song.artist_id);
@@ -440,9 +509,8 @@ fn search_extras(query: &str, page: &PageData, publish: &mut dyn FnMut(PageData)
                 );
             }
         }
-        let after_exact = exact.len();
-        artists.splice(after_exact..after_exact, by);
-        artists.truncate(6);
+        artists.splice(noted_count..noted_count, by);
+        artists.truncate(12);
         // The albums those songs are on go first among the albums. They're made up from what's
         // known of the song, which is less than Lidarr would say, so they aren't kept to act
         // on later: Lidarr is asked when one is opened or requested.
@@ -464,6 +532,7 @@ fn search_extras(query: &str, page: &PageData, publish: &mut dyn FnMut(PageData)
         }
         albums.truncate(12);
         let nothing = songs.is_empty() && artists.is_empty() && albums.is_empty();
+        albums.truncate(24);
         let note = if nothing { "Nothing else was found beyond your library." } else { ASK };
         let found = with_outside(page, note, &songs, &artists, &albums);
 
@@ -810,7 +879,7 @@ fn search(client: &Client, query: &str) -> ApiResult<PageData> {
     // is only asked while that copy hasn't arrived yet.
     let found = match crate::search::current() {
         Some(index) => {
-            let mut found = index.search(query, &crate::search::is_liked, 8, 12, 30);
+            let mut found = index.search(query, &crate::search::is_liked, 24, 36, 60);
             for song in &mut found.songs {
                 // Whether it's liked may have changed since the copy was made.
                 song.starred = crate::search::is_liked(song).then(|| song.starred.clone().unwrap_or_default());
@@ -818,7 +887,7 @@ fn search(client: &Client, query: &str) -> ApiResult<PageData> {
             found
         }
         None => {
-            let found = client.search(query, 8, 12, 20)?;
+            let found = client.search(query, 24, 36, 60)?;
             crate::search::Results {
                 artists: found.artists.iter().map(CardData::artist).collect(),
                 albums: found.albums.iter().map(CardData::album).collect(),
@@ -1154,6 +1223,49 @@ mod tests {
     fn strips_markup_from_biographies() {
         let bio = "A trio from Leeds &amp; beyond. <a target='_blank' href=\"https://last.fm/x\">Read more on Last.fm</a>";
         assert_eq!(plain_text(bio), "A trio from Leeds & beyond.");
+    }
+
+    #[test]
+    fn narrows_a_search_to_one_kind() {
+        let cards = |count: usize, kind: Kind| -> Vec<CardData> {
+            (0..count).map(|n| CardData { kind, id: n.to_string(), title: format!("Card {n}"), ..Default::default() }).collect()
+        };
+        let shelf = |title: &str, count: usize, kind: Kind| ShelfData { title: title.into(), route: String::new(), wrap: false, cards: cards(count, kind) };
+        let whole = PageData {
+            songs: (0..9).map(|n| Song { id: n.to_string(), title: format!("Song {n}"), ..Default::default() }).collect(),
+            lead: vec![shelf("Artists", 2, Kind::Artist)],
+            shelves: vec![shelf("Albums", 8, Kind::Album)],
+            offers_title: "Not in your library".into(),
+            offers_note: "Ask Lidarr for any of these.".into(),
+            offers: (0..6).map(|n| OfferData { title: format!("Offer {n}"), ..Default::default() }).collect(),
+            tail: vec![shelf("Artists", 7, Kind::OutsideArtist)],
+            context: "“words”".into(),
+            ..Default::default()
+        };
+        // All: the top few songs of each list, with a way to the rest.
+        let all = search_view(&whole, 0);
+        assert_eq!((all.songs.len(), all.offers.len()), (4, 4));
+        assert_eq!((all.tracks_route.as_str(), all.offers_route.as_str()), ("filter:1", "filter:1"));
+        assert_eq!(all.lead[0].route, "");
+        assert_eq!((all.shelves[0].route.as_str(), all.tail[0].route.as_str()), ("filter:3", "filter:2"));
+        // Songs: every song, in the library and out of it, and nothing else.
+        let songs = search_view(&whole, 1);
+        assert_eq!((songs.songs.len(), songs.offers.len()), (9, 6));
+        assert!(songs.lead.is_empty() && songs.shelves.is_empty() && songs.tail.is_empty() && songs.tracks_route.is_empty());
+        // Artists: the library's and the others', on as many rows as they need.
+        let artists = search_view(&whole, 2);
+        assert!(artists.songs.is_empty() && artists.offers.is_empty() && artists.lead.is_empty());
+        assert_eq!((artists.shelves.len(), artists.shelves[0].cards.len(), artists.shelves[0].wrap), (1, 2, true));
+        assert_eq!((artists.tail[0].cards.len(), artists.tail[0].wrap, artists.offers_title.as_str()), (7, true, "Not in your library"));
+        // Albums: there are none beyond the library, so that heading goes.
+        let albums = search_view(&whole, 3);
+        assert_eq!((albums.shelves[0].cards.len(), albums.tail.len(), albums.offers_title.as_str()), (8, 0, ""));
+        // A kind with nothing says so, unless more is still being looked for.
+        let bare = PageData { songs: whole.songs.clone(), context: "“words”".into(), ..Default::default() };
+        assert_eq!(search_view(&bare, 3).empty, "No albums found for “words”.");
+        let looking = PageData { offers_title: "Not in your library".into(), offers_note: "Looking for songs…".into(), ..bare.clone() };
+        assert_eq!(search_view(&looking, 3).empty, "");
+        assert_eq!(search_view(&looking, 3).offers_note, "Looking for songs…");
     }
 
     #[test]

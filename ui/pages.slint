@@ -745,8 +745,29 @@ component TileGrid inherits Rectangle {
 // Home, search results and artist pages: a title or hero, then songs, then shelves.
 export component StackPage inherits Rectangle {
     in property <bool> hero;
+    // Room at the top for a search's chips, which stay put while the results scroll.
+    property <length> bar: View.kinds.length > 0 ? 56px : 0px;
+
+    if View.kinds.length > 0: HorizontalLayout {
+        y: 0;
+        height: root.bar;
+        padding-left: Theme.page-pad;
+        spacing: 8px;
+        alignment: start;
+
+        for name[index] in View.kinds: VerticalLayout {
+            alignment: center;
+            Chip {
+                text: name;
+                selected: index == View.kind;
+                clicked => { View.set-kind(index); }
+            }
+        }
+    }
 
     scroll := ScrollView {
+        y: root.bar;
+        height: parent.height - root.bar;
         vertical-scrollbar-policy: always-off;
         horizontal-scrollbar-policy: always-off;
         content-y <=> View.scroll-y;
@@ -813,6 +834,7 @@ export component StackPage inherits Rectangle {
 
             if View.tracks.length > 0 && View.tracks-title != "": SectionTitle {
                 text: View.tracks-title;
+                route: View.tracks-route;
             }
 
             for track[index] in View.tracks: HorizontalLayout {
@@ -869,6 +891,7 @@ export component StackPage inherits Rectangle {
 
             if View.offers.length > 0: SectionTitle {
                 text: "Songs";
+                route: View.offers-route;
             }
 
             for offer[index] in View.offers: HorizontalLayout {
@@ -911,6 +934,8 @@ export component StackPage inherits Rectangle {
     }
 
     ScrollThumb {
+        y: root.bar;
+        height: parent.height - root.bar;
         x: parent.width - self.width;
         content-y <=> scroll.content-y;
         content-height: scroll.content-height;

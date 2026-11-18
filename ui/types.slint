@@ -230,6 +230,14 @@ export global View {
     // for, and shelves that go beneath them.
     in property <string> offers-title;
     in property <string> offers-note;
+    // Where "Show all" leads for the songs, and for the songs that aren't in the library;
+    // empty when the whole list is already shown.
+    in property <string> tracks-route;
+    in property <string> offers-route;
+    // On a search: the kinds it can be narrowed to, and which is chosen.
+    in property <[string]> kinds;
+    in property <int> kind;
+    callback set-kind(index: int);
     in property <[Offer]> offers;
     in property <[Shelf]> tail;
     callback offer-activated(index: int);
