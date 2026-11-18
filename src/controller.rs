@@ -419,7 +419,10 @@ impl Controller {
             import_report: RefCell::new(None),
             import_missing: RefCell::default(),
             import_fills: RefCell::default(),
-            asked: RefCell::new(crate::asked::AskedList::load(&paths.asked)),
+            asked: RefCell::new({
+                crate::discover::set_place(paths.discover.clone());
+                crate::asked::AskedList::load(&paths.asked)
+            }),
             asked_ticks: Cell::new(0),
             requests_ticks: Cell::new(0),
             search_whole: RefCell::new(None),
@@ -1159,6 +1162,7 @@ impl Controller {
             let open = page
                 .shelves
                 .iter()
+                .chain(&page.tail)
                 .filter(|shelf| shelf.title == "Albums")
                 .flat_map(|shelf| &shelf.cards)
                 .filter(|card| card.kind == Kind::Request && !card.subtitle.ends_with("Requested") && !card.subtitle.ends_with("Arrived"))
@@ -1189,6 +1193,7 @@ impl Controller {
             post(move |ctl| match result {
                 Ok(_) => {
                     ctl.refresh_outside();
+                    crate::discover::forget(&artist);
                     ctl.toast(format!("Added {name}. Their albums are on Lidarr's list; see Requests in the sidebar."));
                 }
                 Err(reason) => ctl.toast(reason),
@@ -2151,6 +2156,7 @@ impl Controller {
         }
         view.set_action(data.action.as_str().into());
         view.set_offers_title(data.offers_title.as_str().into());
+        view.set_offers_heading(data.offers_heading.as_str().into());
         view.set_offers_note(data.offers_note.as_str().into());
         if self.page.borrow().offers != data.offers || data.offers.is_empty() {
             view.set_offers(ModelRc::new(VecModel::from(

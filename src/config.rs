@@ -25,6 +25,8 @@ pub struct Paths {
     pub added: PathBuf,
     /// What's been asked for through this app and is being watched for.
     pub asked: PathBuf,
+    /// Artists worth a look, as last worked out (see `discover`).
+    pub discover: PathBuf,
     #[cfg(not(windows))]
     secret: PathBuf,
 }
@@ -55,6 +57,7 @@ impl Paths {
             pending: config.join("pending.json"),
             added: config.join("playlist-added.json"),
             asked: config.join("asked.json"),
+            discover: cache.join("discover.json"),
             covers: cache.join("covers"),
             pages: cache.join("pages"),
             buffers: cache.join("buffers"),

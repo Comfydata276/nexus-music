@@ -890,7 +890,7 @@ export component StackPage inherits Rectangle {
             }
 
             if View.offers.length > 0: SectionTitle {
-                text: "Songs";
+                text: View.offers-heading != "" ? View.offers-heading : "Songs";
                 route: View.offers-route;
             }
 
@@ -2124,7 +2124,7 @@ export component SettingsPage inherits Rectangle {
                     if Settings.tab == 4: VerticalLayout {
                         SettingRow {
                             title: "Ask for music that isn't in your library";
-                            detail: "For people who run Lidarr beside their music server. Search gains a “Not in your library” section; asking for something there puts it on Lidarr's list, and the Requests page shows what's on its way. Songs and track lists are looked up at MusicBrainz, which is sent what you search for.";
+                            detail: "For people who run Lidarr beside their music server. Search gains a “Not in your library” section; asking for something there puts it on Lidarr's list, and the Requests page shows what's on its way. Songs and track lists are looked up at MusicBrainz, which is sent what you search for. How much each is played comes from ListenBrainz, which is told which artists and songs came up.";
                             Toggle {
                                 on: Settings.requests;
                                 label: "Ask for music that isn't in your library";

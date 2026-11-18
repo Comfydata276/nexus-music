@@ -393,6 +393,12 @@ impl Lidarr {
             .collect())
     }
 
+    /// Every artist Lidarr keeps track of, by their MusicBrainz ids.
+    pub fn tracked(&self) -> Result<std::collections::HashSet<String>, String> {
+        let artists: Vec<ArtistRes> = self.get("artist")?;
+        Ok(artists.into_iter().map(|known| known.foreign_artist_id).collect())
+    }
+
     /// Lidarr's own number and name for an artist, if it keeps track of them.
     pub fn known_artist(&self, artist: &str) -> Result<Option<(i64, String)>, String> {
         let artists: Vec<ArtistRes> = self.get("artist")?;

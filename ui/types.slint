@@ -231,6 +231,8 @@ export global View {
     // Music that isn't in the library: a heading for the section, songs that could be asked
     // for, and shelves that go beneath them.
     in property <string> offers-title;
+    // What the songs that could be asked for are headed; "Songs" if it's empty.
+    in property <string> offers-heading;
     in property <string> offers-note;
     // Where "Show all" leads for the songs, and for the songs that aren't in the library;
     // empty when the whole list is already shown.

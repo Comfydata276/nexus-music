@@ -708,6 +708,15 @@ impl Client {
         self.call("getArtistInfo2", &[("id", id), ("count", "12")], Some("artistInfo2"))
     }
 
+    /// The names of artists like this one that the library doesn't have. The server asks
+    /// whatever it's been set up with (Last.fm, Deezer), so this can take seconds, and
+    /// comes back empty if it has nowhere to ask.
+    pub fn similar_outside(&self, id: &str) -> ApiResult<Vec<String>> {
+        let info: ArtistInfo = self.call("getArtistInfo2", &[("id", id), ("count", "20"), ("includeNotPresent", "true")], Some("artistInfo2"))?;
+        // One that isn't in the library has no id of its own: none, or "-1".
+        Ok(info.similar.into_iter().filter(|artist| artist.id.is_empty() || artist.id.starts_with('-')).map(|artist| artist.name).filter(|name| !name.is_empty()).collect())
+    }
+
     pub fn top_songs(&self, artist_name: &str, count: u32) -> ApiResult<Vec<Song>> {
         #[derive(Deserialize, Default)]
         #[serde(default)]

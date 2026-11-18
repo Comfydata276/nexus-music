@@ -41,6 +41,12 @@ pub struct SongOffer {
     pub seconds: u32,
     /// "EP" or "Single" when that's what it's on; empty for an album.
     pub kind: String,
+    /// MusicBrainz's names for the recordings of it that were found.
+    pub recordings: Vec<String>,
+    /// How well it answers what was typed, 0 being best (see `closeness`).
+    pub close: u8,
+    /// How many times it's been played, where ListenBrainz has been asked.
+    pub listens: u64,
 }
 
 /// A song on an album, by name only.
@@ -168,13 +174,33 @@ pub fn find_songs(term: &str) -> Result<Vec<SongOffer>, String> {
 /// versions of a well-known song and not the original.
 pub fn song_by(artist: &str, title: &str) -> Result<Vec<SongOffer>, String> {
     let phrase: String = title.chars().filter(|c| !matches!(c, '"' | '\\')).collect();
-    // Asked for among studio albums only: a famous song has hundreds of live and compilation
-    // recordings, and the album cut needn't be among the first handed back.
-    let query = format!("arid:{artist} AND recording:\"{phrase}\" AND primarytype:album AND status:official AND NOT secondarytype:*");
-    let found = get(&format!("recording?query={}&limit=50&fmt=json", crate::subsonic::encode(&query)))?;
-    let mut songs: Vec<SongOffer> = songs_from(&found, title, false).into_iter().filter(|song| same_words(base(&song.title), base(title))).collect();
-    // Theirs alone goes before one they share the credit for (a mash-up, a duet).
-    songs.sort_by_key(|song| !(song.artist_id == artist && song.artist == song.artist_name));
+    let ask = |only: &str, limit: u32| -> Result<Vec<SongOffer>, String> {
+        let query = format!("arid:{artist} AND recording:\"{phrase}\" AND primarytype:album AND status:official AND {only}");
+        let found = get(&format!("recording?query={}&limit={limit}&fmt=json", crate::subsonic::encode(&query)))?;
+        Ok(songs_from(&found, title, false).into_iter().filter(|song| same_words(base(&song.title), base(title))).collect())
+    };
+    // Theirs goes before one where they're a guest (a remix by someone else, "ft." them),
+    // and theirs alone before one they share the credit for (a mash-up, a duet).
+    let order = |songs: &mut Vec<SongOffer>| songs.sort_by_key(|song| (song.artist_id != artist, std::cmp::Reverse(song.listens), song.artist != song.artist_name));
+    // Asked for among recordings that are only on studio albums: a famous song has hundreds
+    // of live and compilation recordings, and the album cut needn't be among the first
+    // handed back.
+    let mut songs = ask("NOT secondarytype:*", 50)?;
+    order(&mut songs);
+    if songs.first().is_none_or(|song| song.artist_id != artist) {
+        // But the album cut of a hit is on compilations as well, which rules it out above.
+        // So it's asked for again with only the live recordings left out, and the one
+        // that's played most is taken to be it.
+        let mut wider = ask("NOT secondarytype:live", 100)?;
+        let recordings: Vec<String> = wider.iter().flat_map(|song| song.recordings.iter().cloned()).collect();
+        if let Ok(counts) = crate::listenbrainz::listens(&recordings) {
+            by_listens(&mut wider, &counts);
+        }
+        order(&mut wider);
+        if wider.first().is_some_and(|song| song.artist_id == artist) {
+            songs = wider;
+        }
+    }
     Ok(songs)
 }
 
@@ -214,7 +240,7 @@ fn closeness(typed: &[String], song: &SongOffer) -> u8 {
 
 /// A title without what's in brackets after it: "Lonely No More (Acoustic)" is, for finding
 /// the song, "Lonely No More".
-fn base(title: &str) -> &str {
+pub fn base(title: &str) -> &str {
     let cut = title.find(" (").or_else(|| title.find(" [")).unwrap_or(title.len());
     if cut == 0 { title } else { &title[..cut] }
 }
@@ -261,6 +287,9 @@ fn songs_from(found: &Value, typed: &str, singles: bool) -> Vec<SongOffer> {
             groups.len() - 1
         });
         let group = &mut groups[place];
+        if !text(recording, "id").is_empty() {
+            group.offer.recordings.push(text(recording, "id").to_string());
+        }
         if title.len() < group.offer.title.len() {
             group.offer.title = title.to_string();
         }
@@ -305,17 +334,151 @@ fn songs_from(found: &Value, typed: &str, singles: bool) -> Vec<SongOffer> {
     ranked.sort_by(|(close_a, a), (close_b, b)| {
         close_a.cmp(close_b).then(if *close_a == 3 { b.score.cmp(&a.score) } else { std::cmp::Ordering::Equal }).then(b.releases.cmp(&a.releases))
     });
-    ranked.into_iter().map(|(_, group)| group.offer).collect()
+    ranked.into_iter().map(|(close, group)| SongOffer { close, ..group.offer }).collect()
+}
+
+/// Puts songs that answer what was typed equally well in order of how much they're played:
+/// of forty songs called "Home", the one most people mean goes first. `counts` is what
+/// ListenBrainz says of their recordings. Loose matches keep the order they were found in.
+pub fn by_listens(songs: &mut [SongOffer], counts: &HashMap<String, u64>) {
+    for song in songs.iter_mut() {
+        song.listens = song.recordings.iter().filter_map(|recording| counts.get(recording)).copied().max().unwrap_or(0);
+    }
+    songs.sort_by(|a, b| a.close.cmp(&b.close).then(if a.close < 3 { b.listens.cmp(&a.listens) } else { std::cmp::Ordering::Equal }));
+}
+
+/// An artist's most played songs, each on the release of theirs it can be asked for with.
+/// `top` is ListenBrainz's list, most played first; `releases` is what the artist has put
+/// out. A song is placed on the album ListenBrainz knows it from, or failing that on the
+/// single of its own name; one that fits neither is left out.
+pub fn popular(top: &[crate::listenbrainz::TopSong], releases: &[Offer], artist: &str, artist_name: &str) -> Vec<SongOffer> {
+    let mut songs: Vec<SongOffer> = Vec::new();
+    for song in top {
+        let title = base(&song.title);
+        if songs.iter().any(|have| same_words(base(&have.title), title)) {
+            continue;
+        }
+        let on = |name: &str, kind: &str| releases.iter().find(|release| release.kind() == kind && (same_words(&release.title, name) || same_words(base(&release.title), base(name))));
+        let Some(release) = on(&song.album_title, "Album").or_else(|| on(title, "Single")).or_else(|| on(&song.album_title, "EP")).or_else(|| on(&song.album_title, "Single")) else {
+            continue;
+        };
+        songs.push(SongOffer {
+            title: song.title.clone(),
+            artist: artist_name.to_string(),
+            artist_id: artist.to_string(),
+            artist_name: artist_name.to_string(),
+            album: release.album.clone(),
+            album_title: release.title.clone(),
+            year: release.year.clone(),
+            seconds: song.seconds,
+            kind: release.kind.clone(),
+            listens: song.listens,
+            ..Default::default()
+        });
+    }
+    songs
 }
 
 /// An artist's studio albums, newest first, and what the artist is called.
 pub fn artist_albums(artist: &str) -> Result<(String, Vec<Offer>), String> {
-    artist_releases(artist, false).map(|(name, releases)| (name, releases.into_iter().filter(|release| release.kind() == "Album").collect()))
+    // Asked for as their page asks, so the one answer serves both.
+    artist_releases(artist, crate::lidarr::singles()).map(|(name, releases)| (name, releases.into_iter().filter(|release| release.kind() == "Album").collect()))
 }
 
 /// An artist's studio albums and, if `singles` says so, their EPs and singles too, newest
 /// first; and what the artist is called.
 pub fn artist_releases(artist: &str, singles: bool) -> Result<(String, Vec<Offer>), String> {
+    // Asked for more than once in a row: by a search that names the artist, then by their
+    // page, then for what's on the page. Kept a while so only the first has to wait.
+    let key = (artist.to_string(), singles);
+    {
+        let kept = RELEASES.lock().unwrap_or_else(|stuck| stuck.into_inner());
+        if let Some((_, _, found)) = kept.iter().find(|(known, at, _)| *known == key && at.elapsed() < RELEASES_KEPT) {
+            return Ok(found.clone());
+        }
+    }
+    let found = fetch_artist_releases(artist, singles)?;
+    let mut kept = RELEASES.lock().unwrap_or_else(|stuck| stuck.into_inner());
+    kept.retain(|(known, at, _)| *known != key && at.elapsed() < RELEASES_KEPT);
+    if kept.len() >= 40 {
+        kept.remove(0);
+    }
+    kept.push((key, Instant::now(), found.clone()));
+    Ok(found)
+}
+
+/// How long an artist's list of releases is kept.
+const RELEASES_KEPT: Duration = Duration::from_secs(600);
+type Releases = (String, Vec<Offer>);
+static RELEASES: Mutex<Vec<((String, bool), Instant, Releases)>> = Mutex::new(Vec::new());
+
+/// An artist's songs, most played first, worked out from what ListenBrainz will say of
+/// anyone: which of their releases are played most, and then which songs on those.
+/// `releases` is what they've put out.
+pub fn played_most(artist: &str, releases: &[Offer]) -> Result<Vec<crate::listenbrainz::TopSong>, String> {
+    /// How many of their releases are looked into.
+    const DEEP: usize = 4;
+    let ids: Vec<String> = releases.iter().take(300).map(|release| release.album.clone()).collect();
+    let plays = crate::listenbrainz::release_listens(&ids)?;
+    let mut most: Vec<&Offer> = releases.iter().filter(|release| plays.contains_key(&release.album)).collect();
+    most.sort_by_key(|release| std::cmp::Reverse(plays[&release.album]));
+    most.truncate(DEEP);
+    if most.is_empty() {
+        return Ok(Vec::new());
+    }
+    let groups: Vec<&str> = most.iter().map(|release| release.album.as_str()).collect();
+    let query = format!("rgid:({}) AND arid:{artist}", groups.join(" OR "));
+    // Two hundred at most: deluxe editions can double what an album holds.
+    let mut recordings: Vec<Value> = Vec::new();
+    for page in 0..2 {
+        let found = get(&format!("recording?query={}&limit=100&offset={}&fmt=json", crate::subsonic::encode(&query), page * 100))?;
+        let got = list(&found, "recordings");
+        recordings.extend(got.iter().cloned());
+        if got.len() < 100 || found.get("count").and_then(Value::as_u64).unwrap_or(0) <= 100 {
+            break;
+        }
+    }
+    let counts = crate::listenbrainz::listens(&recordings.iter().map(|recording| text(recording, "id").to_string()).collect::<Vec<_>>())?;
+    Ok(most_played(&recordings, &counts, &most))
+}
+
+/// One entry per song among `recordings`, most played first, each on the best of `most`
+/// (the artist's most played releases, in that order) that it's on.
+fn most_played(recordings: &[Value], counts: &HashMap<String, u64>, most: &[&Offer]) -> Vec<crate::listenbrainz::TopSong> {
+    let mut songs: Vec<crate::listenbrainz::TopSong> = Vec::new();
+    let mut places: HashMap<String, usize> = HashMap::new();
+    for recording in recordings {
+        let title = text(recording, "title");
+        let listens = counts.get(text(recording, "id")).copied().unwrap_or(0);
+        if title.is_empty() || listens == 0 {
+            continue;
+        }
+        let on: Vec<&str> = list(recording, "releases").iter().filter_map(|release| release.get("release-group")).map(|group| text(group, "id")).collect();
+        // An album before a single or EP; of a kind, the more played.
+        let Some(home) = most.iter().filter(|release| on.contains(&release.album.as_str())).min_by_key(|release| release.kind() != "Album") else { continue };
+        let place = *places.entry(fold(base(title))).or_insert_with(|| {
+            songs.push(crate::listenbrainz::TopSong { title: title.to_string(), album_title: home.title.clone(), ..Default::default() });
+            songs.len() - 1
+        });
+        let song = &mut songs[place];
+        if title.len() < song.title.len() {
+            song.title = title.to_string();
+        }
+        // The same song recorded twice (the album cut and its video, say) counts once, as
+        // whichever is played more.
+        if listens > song.listens {
+            song.listens = listens;
+            song.seconds = (recording.get("length").and_then(Value::as_u64).unwrap_or(0) / 1000) as u32;
+            if home.kind() == "Album" || song.album_title.is_empty() {
+                song.album_title = home.title.clone();
+            }
+        }
+    }
+    songs.sort_by_key(|song| std::cmp::Reverse(song.listens));
+    songs
+}
+
+fn fetch_artist_releases(artist: &str, singles: bool) -> Result<(String, Vec<Offer>), String> {
     let mut name = String::new();
     let mut albums = Vec::new();
     let kinds = if singles { "album%7Cep%7Csingle" } else { "album" };
@@ -434,7 +597,7 @@ mod tests {
         let songs = songs_from(&found, "lonely no more", false);
         assert_eq!(songs.len(), 2);
         assert_eq!(
-            songs[0],
+            SongOffer { recordings: Vec::new(), ..songs[0].clone() },
             SongOffer {
                 title: "Lonely No More".into(),
                 artist: "Rob Thomas".into(),
@@ -445,9 +608,72 @@ mod tests {
                 year: "2005".into(),
                 seconds: 227,
                 kind: String::new(),
+                // The title is what was typed; the artist wasn't.
+                close: 1,
+                ..Default::default()
             }
         );
         assert_eq!((songs[1].artist.as_str(), songs[1].album.as_str(), songs[1].seconds), ("W.C. Clark", "lp", 0));
+    }
+
+    #[test]
+    fn puts_the_most_played_first() {
+        let song = |title: &str, artist: &str, close: u8, recordings: &[&str]| SongOffer {
+            title: title.into(),
+            artist: artist.into(),
+            close,
+            recordings: recordings.iter().map(|id| id.to_string()).collect(),
+            ..Default::default()
+        };
+        let mut songs = vec![song("Home", "Nobody", 1, &["a"]), song("Home", "Somebody", 1, &["b", "c"]), song("Homeward", "Loose", 3, &["d"]), song("Home", "Typed", 0, &[])];
+        let counts = HashMap::from([("a".to_string(), 10), ("b".to_string(), 3), ("c".to_string(), 900), ("d".to_string(), 5000)]);
+        by_listens(&mut songs, &counts);
+        // What was typed outright stays first whatever it's played; a loose match stays last.
+        assert_eq!(songs.iter().map(|song| song.artist.as_str()).collect::<Vec<_>>(), ["Typed", "Somebody", "Nobody", "Loose"]);
+        assert_eq!(songs[1].listens, 900);
+    }
+
+    #[test]
+    fn places_popular_songs_on_releases() {
+        let release = |id: &str, title: &str, kind: &str| Offer { album: id.into(), title: title.into(), kind: kind.into(), year: "2005".into(), ..Default::default() };
+        let releases = [release("stb", "…Something to Be", ""), release("lnm", "Lonely No More", "Single"), release("pie", "Pieces", "Single"), release("ep", "Sessions", "EP")];
+        let top = |title: &str, album: &str, listens: u64| crate::listenbrainz::TopSong { title: title.into(), album_title: album.into(), seconds: 200, listens };
+        let songs = popular(
+            &[
+                top("Lonely No More", "...Something to Be", 90),
+                top("Lonely No More (Acoustic)", "Sessions", 80),
+                top("Pieces", "Greatest Hits", 70),
+                top("Nowhere", "A Film Soundtrack", 60),
+                top("Live Cut", "Sessions", 50),
+            ],
+            &releases,
+            "rt",
+            "Rob Thomas",
+        );
+        let placed: Vec<(&str, &str, &str)> = songs.iter().map(|song| (song.title.as_str(), song.album.as_str(), song.kind.as_str())).collect();
+        // On its album where it has one; on its own single failing that; left out otherwise.
+        assert_eq!(placed, [("Lonely No More", "stb", ""), ("Pieces", "pie", "Single"), ("Live Cut", "ep", "EP")]);
+        assert_eq!((songs[0].artist_id.as_str(), songs[0].listens, songs[0].year.as_str()), ("rt", 90, "2005"));
+    }
+
+    #[test]
+    fn works_out_the_most_played() {
+        let recordings: Value = serde_json::from_str(
+            r#"[
+            {"id":"r1","title":"Yellow","length":269000,"releases":[{"release-group":{"id":"para"}},{"release-group":{"id":"best"}}]},
+            {"id":"r2","title":"Yellow (video)","length":270000,"releases":[{"release-group":{"id":"yel"}}]},
+            {"id":"r3","title":"Trouble","length":270000,"releases":[{"release-group":{"id":"para"}}]},
+            {"id":"r4","title":"Unplayed","releases":[{"release-group":{"id":"para"}}]},
+            {"id":"r5","title":"Elsewhere","releases":[{"release-group":{"id":"other"}}]}
+            ]"#,
+        )
+        .unwrap();
+        let (single, album) = (Offer { album: "yel".into(), title: "Yellow".into(), kind: "Single".into(), ..Default::default() }, Offer { album: "para".into(), title: "Parachutes".into(), ..Default::default() });
+        let counts = HashMap::from([("r1".to_string(), 50), ("r2".to_string(), 700), ("r3".to_string(), 90), ("r5".to_string(), 999)]);
+        let songs = most_played(recordings.as_array().unwrap(), &counts, &[&single, &album]);
+        let listed: Vec<(&str, &str, u64, u32)> = songs.iter().map(|song| (song.title.as_str(), song.album_title.as_str(), song.listens, song.seconds)).collect();
+        // The two recordings of Yellow count once, at the more played, and it's on the album.
+        assert_eq!(listed, [("Yellow", "Parachutes", 700, 270), ("Trouble", "Parachutes", 90, 270)]);
     }
 
     #[test]
@@ -513,5 +739,50 @@ mod tests {
         // Otherwise it's offered on its single: not the remix single, and not the later EP.
         let songs = songs_from(&found, "only a single", true);
         assert_eq!((songs[0].album.as_str(), songs[0].kind.as_str(), songs[0].year.as_str()), ("single", "Single", "2024"));
+    }
+}
+
+#[cfg(test)]
+mod live {
+    /// Not run as a rule: it asks the real services. `cargo test live -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn song_search() {
+        let term = std::env::var("TERM_TYPED").unwrap_or_else(|_| "somebody that i used to know".into());
+        let mut found = super::find_songs(&term).unwrap();
+        let recordings: Vec<String> = found.iter().flat_map(|song| song.recordings.iter().cloned()).collect();
+        let counts = crate::listenbrainz::listens(&recordings);
+        println!("{} songs, {} recordings, listens {:?}", found.len(), recordings.len(), counts.as_ref().map(|c| c.len()));
+        if let Ok(counts) = counts {
+            super::by_listens(&mut found, &counts);
+        }
+        for song in found.iter().take(12) {
+            println!("{} {} | {} | {} | {} {} {}", song.close, song.listens, song.title, song.artist, song.album_title, song.year, song.kind);
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn most_played_by_artist() {
+        let artist = std::env::var("ARTIST_ID").unwrap_or_else(|_| "e42680f7-e439-4666-9c2c-536c2b3c6db3".into());
+        let (name, releases) = super::artist_releases(&artist, true).unwrap();
+        let top = super::played_most(&artist, &releases).unwrap();
+        println!("{name}: {} releases, {} songs", releases.len(), top.len());
+        for song in top.iter().take(12) {
+            println!("{} | {} | {}", song.listens, song.title, song.album_title);
+        }
+        for song in super::popular(&top, &releases, &artist, &name).iter().take(12) {
+            println!("  -> {} | {} {} {}", song.title, song.album_title, song.year, song.kind);
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn song_by_artist() {
+        let artist = std::env::var("ARTIST_ID").unwrap_or_else(|_| "6f6fd596-76e0-4b82-aa37-f558ac2d337b".into());
+        let title = std::env::var("TITLE_TYPED").unwrap_or_else(|_| "Somebody That I Used to Know".into());
+        for song in super::song_by(&artist, &title).unwrap().iter().take(5) {
+            println!("{} | {} | {} | {} {} {}", song.listens, song.title, song.artist, song.album_title, song.year, song.kind);
+        }
     }
 }

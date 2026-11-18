@@ -8,6 +8,7 @@ mod audio;
 mod config;
 mod controller;
 mod covers;
+mod discover;
 mod downloads;
 mod import;
 #[cfg(windows)]
@@ -18,6 +19,7 @@ mod instance;
 #[cfg(windows)]
 mod media;
 mod lidarr;
+mod listenbrainz;
 mod mixes;
 mod musicbrainz;
 mod offline;

@@ -189,6 +189,8 @@ pub struct PageData {
     /// for, and the shelves beneath them.
     pub offers_title: String,
     pub offers_note: String,
+    /// What the songs among them are headed, if not "Songs".
+    pub offers_heading: String,
     /// Where "Show all" beside the songs leads, for a list that's been cut short; and the
     /// same for the songs that aren't in the library.
     pub tracks_route: String,
@@ -268,7 +270,9 @@ pub fn enrich(client: &Client, route: &Route, page: &PageData, publish: &mut dyn
     match route {
         Route::Search(query) if !query.is_empty() => search_extras(query, page, publish),
         Route::Album(id) => album_extras(client, id, page),
+        Route::Home => home_extras(client, page),
         Route::Artist(id) => artist_extras(client, id, page, publish),
+        Route::OutsideArtist(id) => outside_artist_extras(id, page),
         _ => None,
     }
 }
@@ -355,6 +359,80 @@ pub fn search_view(whole: &PageData, filter: usize) -> PageData {
     page
 }
 
+/// A song that could be asked for, as a row on a page.
+fn offer_data(song: &crate::musicbrainz::SongOffer, requested: bool) -> OfferData {
+    // An album or EP by its name; a single is named after the song, so it's just called
+    // what it is.
+    let on = match song.kind.as_str() {
+        "Single" => "Single".to_string(),
+        "EP" => format!("{} (EP)", song.album_title),
+        _ => song.album_title.clone(),
+    };
+    OfferData {
+        album: song.album.clone(),
+        album_title: song.album_title.clone(),
+        title: song.title.clone(),
+        artist: song.artist.clone(),
+        artist_id: song.artist_id.clone(),
+        artist_name: song.artist_name.clone(),
+        about: if song.year.is_empty() { on } else { format!("{on} • {}", song.year) },
+        kind: song.kind.clone(),
+        cover: crate::musicbrainz::cover(&song.album),
+        seconds: song.seconds,
+        requested,
+    }
+}
+
+/// How many plays make an artist one of some note, and how many put it beyond doubt that
+/// their name, typed, means them and not a song called the same.
+const NOTED: u64 = 10_000;
+const UNMISTAKABLE: u64 = 5_000_000;
+/// How many of an artist's most played songs are listed.
+const POPULAR: usize = 8;
+
+/// What an artist is most played for. ListenBrainz says outright for the best known; for
+/// the rest it's worked out from their releases, which takes a couple of seconds longer.
+fn top_of(artist: &str, releases: &[crate::lidarr::Offer]) -> Vec<crate::listenbrainz::TopSong> {
+    match crate::listenbrainz::top_songs(artist) {
+        Ok(top) if !top.is_empty() => top,
+        _ => crate::musicbrainz::played_most(artist, releases).unwrap_or_default(),
+    }
+}
+
+/// An artist's most played songs that the library doesn't have, each on the release of
+/// theirs it can be asked for with. `top` is ListenBrainz's list of what they're played
+/// for and `releases` everything they've put out. Also says
+/// whether any were left out for being in the library already.
+fn popular_songs(top: &[crate::listenbrainz::TopSong], artist: &str, name: &str, releases: &[crate::lidarr::Offer]) -> (Vec<crate::musicbrainz::SongOffer>, bool) {
+    let have: std::collections::HashSet<String> = crate::search::current()
+        .map(|index| {
+            index
+                .library
+                .songs
+                .iter()
+                .filter(|song| crate::musicbrainz::words(song.artist_label()).join(" ").contains(&crate::musicbrainz::words(name).join(" ")))
+                .map(|song| plain(crate::musicbrainz::base(&song.title)))
+                .collect()
+        })
+        .unwrap_or_default();
+    // A song on an album that's here is here too, whatever the file calls it.
+    let have_albums: std::collections::HashSet<String> = crate::search::current()
+        .map(|index| index.library.albums.iter().filter(|album| plain(&album.subtitle) == plain(name)).map(|album| plain(&album.title)).collect())
+        .unwrap_or_default();
+    let all = crate::musicbrainz::popular(top, releases, artist, name);
+    let mut left_out = false;
+    let mut songs: Vec<crate::musicbrainz::SongOffer> = Vec::new();
+    for (place, song) in all.into_iter().enumerate() {
+        if have.contains(&plain(crate::musicbrainz::base(&song.title))) || have_albums.contains(&plain(&song.album_title)) {
+            // Only what would have been listed counts as left out.
+            left_out |= place < POPULAR;
+        } else if songs.len() < POPULAR {
+            songs.push(song);
+        }
+    }
+    (songs, left_out)
+}
+
 /// What's been found beyond the library so far, put onto a copy of the search page.
 fn with_outside(
     page: &PageData,
@@ -374,29 +452,11 @@ fn with_outside(
         crate::asked::shared().into_iter().filter(|asked| asked.arrived == 0 && !asked.album.is_empty()).map(|asked| asked.album).collect();
     page.offers = songs
         .iter()
-        .map(|song| OfferData {
-            album: song.album.clone(),
-            album_title: song.album_title.clone(),
-            title: song.title.clone(),
-            artist: song.artist.clone(),
-            artist_id: song.artist_id.clone(),
-            artist_name: song.artist_name.clone(),
-            about: {
-                // An album or EP by its name; a single is named after the song, so it's
-                // just called what it is.
-                let on = match song.kind.as_str() {
-                    "Single" => "Single".to_string(),
-                    "EP" => format!("{} (EP)", song.album_title),
-                    _ => song.album_title.clone(),
-                };
-                if song.year.is_empty() { on } else { format!("{on} • {}", song.year) }
-            },
-            kind: song.kind.clone(),
-            cover: crate::musicbrainz::cover(&song.album),
-            seconds: song.seconds,
-            requested: awaited.contains(&song.album)
+        .map(|song| {
+            let requested = awaited.contains(&song.album)
                 || albums.iter().any(|album| album.album == song.album && album.requested)
-                || crate::lidarr::offered(&song.album).is_some_and(|offer| offer.requested),
+                || crate::lidarr::offered(&song.album).is_some_and(|offer| offer.requested);
+            offer_data(song, requested)
         })
         .collect();
     page.tail.clear();
@@ -468,30 +528,80 @@ fn search_extras(query: &str, page: &PageData, publish: &mut dyn FnMut(PageData)
             .iter()
             .filter(|single| single.votes > 0 && !single.artist_id.is_empty() && crate::musicbrainz::same_words(&single.title, query))
             .max_by_key(|single| single.votes);
+        let own = |songs: Vec<crate::musicbrainz::SongOffer>| -> Vec<crate::musicbrainz::SongOffer> {
+            songs.into_iter().filter(|song| !have_songs.contains(&(plain(&song.title), plain(&song.artist)))).collect()
+        };
+        // The songs matching what was typed. Of those that answer it equally well, the most
+        // played go first.
+        let look = || -> Vec<crate::musicbrainz::SongOffer> {
+            let mut found = own(crate::musicbrainz::find_songs(query).unwrap_or_default());
+            let recordings: Vec<String> = found.iter().flat_map(|song| song.recordings.iter().cloned()).collect();
+            if let Ok(counts) = crate::listenbrainz::listens(&recordings) {
+                crate::musicbrainz::by_listens(&mut found, &counts);
+            }
+            found
+        };
         // An artist's name was typed: what's wanted is what they've made, not songs that
-        // happen to have the name in their title. Only an artist of some note counts, one
-        // Lidarr has a picture of: there's an obscure band named after most famous songs.
-        let meant = if famous.is_some() { None } else { exact.iter().find(|artist| !artist.cover.is_empty()) };
+        // happen to have the name in their title. But there's an obscure band named after
+        // most famous songs, so of those by that name it's the one played most, and one of
+        // some note: Lidarr has their picture, or they've been played a fair bit.
+        let plays = if famous.is_some() || exact.is_empty() {
+            Default::default()
+        } else {
+            crate::listenbrainz::artist_listens(&exact.iter().map(|artist| artist.id.clone()).collect::<Vec<_>>()).unwrap_or_default()
+        };
+        let played = |artist: &crate::lidarr::ArtistOffer| plays.get(&artist.id).copied().unwrap_or(0);
+        let mut meant = if famous.is_some() {
+            None
+        } else {
+            // The first of the most played; with nothing known of plays, the first pictured.
+            exact.iter().rev().filter(|artist| !artist.cover.is_empty() || played(artist) >= NOTED).max_by_key(|artist| played(artist))
+        };
+        // A name that's as likely a song's ("Believer", "Home"): unless the artist is one of
+        // the most played there are, the songs of that name are looked up too, and if one is
+        // played more than everything the artist has made, the song is what's meant.
+        let mut looked: Option<Vec<crate::musicbrainz::SongOffer>> = None;
+        if let Some(artist) = meant.filter(|artist| played(artist) < UNMISTAKABLE) {
+            publish(with_outside(page, "Looking for songs and albums…", &[], &artists, &albums));
+            let found = look();
+            let best = found.iter().filter(|song| song.close <= 1).map(|song| song.listens).max().unwrap_or(0);
+            if best > played(artist) {
+                meant = None;
+            }
+            looked = Some(found);
+        }
         if let Some(artist) = meant {
-            publish(with_outside(page, "Looking for their albums…", &[], &artists, &albums));
-            if let Ok((_, theirs)) = crate::musicbrainz::artist_albums(&artist.id) {
-                let theirs: Vec<crate::lidarr::Offer> = theirs
-                    .into_iter()
-                    .filter(|offer| !have_albums.contains(&(plain(&offer.title), plain(&artist.name))))
-                    .map(|offer| crate::lidarr::offered(&offer.album).unwrap_or(offer))
+            // They go first among the artists.
+            if let Some(place) = artists.iter().position(|other| other.id == artist.id) {
+                let first = artists.remove(place);
+                artists.insert(0, first);
+            }
+        }
+        if let Some(artist) = meant {
+            publish(with_outside(page, "Looking for their songs and albums…", &[], &artists, &albums));
+            let mut songs = Vec::new();
+            if let Ok((_, releases)) = crate::musicbrainz::artist_releases(&artist.id, crate::lidarr::singles()) {
+                let theirs: Vec<crate::lidarr::Offer> = releases
+                    .iter()
+                    .filter(|offer| offer.kind() == "Album" && !have_albums.contains(&(plain(&offer.title), plain(&artist.name))))
+                    .map(|offer| crate::lidarr::offered(&offer.album).unwrap_or_else(|| offer.clone()))
                     .collect();
                 crate::lidarr::remember(&theirs);
                 albums.retain(|album| !theirs.iter().any(|their| their.album == album.album));
                 albums.splice(0..0, theirs);
                 albums.truncate(24);
+                publish(with_outside(page, "Looking for their most played songs…", &[], &artists, &albums));
+                songs = popular_songs(&top_of(&artist.id, &releases), &artist.id, &artist.name, &releases).0;
             }
-            return Some(with_outside(page, "Ask Lidarr for any of these albums, or open the artist for everything they've made.", &[], &artists, &albums));
+            let note = if songs.is_empty() {
+                "Ask Lidarr for any of these albums, or open the artist for everything they've made."
+            } else {
+                "Their most played songs come first. Ask Lidarr for any of these, or open the artist for everything they've made."
+            };
+            return Some(with_outside(page, note, &songs, &artists, &albums));
         }
         publish(with_outside(page, "Looking for songs beyond your library…", &[], &artists, &albums));
 
-        let own = |songs: Vec<crate::musicbrainz::SongOffer>| -> Vec<crate::musicbrainz::SongOffer> {
-            songs.into_iter().filter(|song| !have_songs.contains(&(plain(&song.title), plain(&song.artist)))).collect()
-        };
         // For a well-known song, MusicBrainz would hand back a hundred versions in no order,
         // so the one that's meant is asked for by name and goes first.
         let mut songs: Vec<crate::musicbrainz::SongOffer> = Vec::new();
@@ -502,7 +612,11 @@ fn search_extras(query: &str, page: &PageData, publish: &mut dyn FnMut(PageData)
                 publish(with_outside(page, "Looking for more songs…", &songs, &artists, &albums));
             }
         }
-        for song in own(crate::musicbrainz::find_songs(query).unwrap_or_default()) {
+        let found = match looked {
+            Some(found) => found,
+            None => look(),
+        };
+        for song in found {
             let listed = songs.iter().any(|have| {
                 crate::musicbrainz::same_words(&have.title, &song.title) && crate::musicbrainz::same_words(&have.artist, &song.artist)
             });
@@ -664,7 +778,9 @@ fn outside_artist(id: &str) -> PageData {
         cover_round: true,
         action: if open > 0 { "Add artist".into() } else { String::new() },
         empty: if cards.is_empty() && smaller.is_empty() { "Nothing is listed for this artist.".into() } else { String::new() },
-        shelves: [("Albums", cards), ("Singles and EPs", smaller)]
+        // Beneath the songs they're most played for, which arrive after (see
+        // `outside_artist_extras`); that's where the page puts `tail`.
+        tail: [("Albums", cards), ("Singles and EPs", smaller)]
             .into_iter()
             .filter(|(_, cards)| !cards.is_empty())
             .map(|(title, cards)| ShelfData { title: title.into(), route: String::new(), wrap: true, cards })
@@ -672,6 +788,29 @@ fn outside_artist(id: &str) -> PageData {
         artist_id: id.to_string(),
         ..Default::default()
     }
+}
+
+/// The songs an artist is most played for, for the top of their page. Found after the page
+/// itself, since it takes a few more questions.
+fn outside_artist_extras(id: &str, page: &PageData) -> Option<PageData> {
+    crate::lidarr::current()?;
+    if page.title.is_empty() || !page.offers.is_empty() {
+        return None;
+    }
+    let (_, releases) = crate::musicbrainz::artist_releases(id, crate::lidarr::singles()).ok()?;
+    let (popular, left_out) = popular_songs(&top_of(id, &releases), id, &page.title, &releases);
+    if popular.is_empty() {
+        return None;
+    }
+    let awaited: std::collections::HashSet<String> =
+        crate::asked::shared().into_iter().filter(|asked| asked.arrived == 0 && !asked.album.is_empty()).map(|asked| asked.album).collect();
+    let mut page = page.clone();
+    page.offers_heading = if left_out { "Popular, and not in your library".into() } else { "Popular".into() };
+    page.offers = popular
+        .iter()
+        .map(|song| offer_data(song, awaited.contains(&song.album) || crate::lidarr::offered(&song.album).is_some_and(|offer| offer.requested)))
+        .collect();
+    Some(page)
 }
 
 /// An album that isn't in the library: what's on it, and a button to ask for it.
@@ -883,6 +1022,8 @@ fn home(client: &Client) -> ApiResult<PageData> {
         })
         .collect();
     let made = (!mixes.is_empty()).then(|| ShelfData { title: "Made for you".into(), route: String::new(), wrap: false, cards: mixes });
+    // Artists that aren't here but might be wanted, if there's a way to ask for them.
+    let discover = crate::lidarr::current().and(crate::search::current()).and_then(|index| discover_shelf(&crate::discover::shown(&index)));
     // Albums played a lot, but not for a while.
     let now = chrono::Utc::now().timestamp();
     let neglected: Vec<Album> = frequent
@@ -899,6 +1040,7 @@ fn home(client: &Client) -> ApiResult<PageData> {
         made,
         shelf("Recently added", "albums:0", &newest),
         shelf("Recently played", "albums:3", &recent),
+        discover,
         shelf("Most played", "albums:4", frequent),
         (neglected.len() >= 4).then(|| shelf("It's been a while", "", &neglected)).flatten(),
         shelf("Something different", "", &random),
@@ -912,6 +1054,49 @@ fn home(client: &Client) -> ApiResult<PageData> {
         String::new()
     };
     Ok(PageData { title: greeting().into(), tiles, shelves, empty, ..Default::default() })
+}
+
+const DISCOVER: &str = "Artists you might like";
+
+/// The row of artists that aren't in the library but are like the ones played most.
+fn discover_shelf(artists: &[crate::discover::Suggestion]) -> Option<ShelfData> {
+    if artists.is_empty() {
+        return None;
+    }
+    // Their pages are opened by Lidarr's name for them, and want their name and picture.
+    let offers: Vec<crate::lidarr::ArtistOffer> = artists
+        .iter()
+        .map(|artist| crate::lidarr::ArtistOffer { id: artist.id.clone(), name: artist.name.clone(), cover: artist.cover.clone(), ..Default::default() })
+        .collect();
+    crate::lidarr::remember_artists(&offers);
+    Some(ShelfData {
+        title: DISCOVER.into(),
+        route: String::new(),
+        wrap: false,
+        cards: artists
+            .iter()
+            .map(|artist| CardData { kind: Kind::OutsideArtist, id: artist.id.clone(), title: artist.name.clone(), subtitle: format!("Like {}", artist.like), cover: artist.cover.clone() })
+            .collect(),
+    })
+}
+
+/// Looks for artists worth suggesting, when that's due. It takes a while, so Home is
+/// on screen long before; the row joins it when it's ready.
+fn home_extras(client: &Client, page: &PageData) -> Option<PageData> {
+    let lidarr = crate::lidarr::current()?;
+    let index = crate::search::current()?;
+    let now = chrono::Utc::now().timestamp();
+    if crate::discover::fresh(now) || index.library.songs.is_empty() {
+        return None;
+    }
+    crate::discover::find(client, &index, &lidarr, now);
+    let shelf = discover_shelf(&crate::discover::shown(&index))?;
+    let mut page = page.clone();
+    page.shelves.retain(|shelf| shelf.title != DISCOVER);
+    // After what's been played lately, as on the page when it's loaded with them known.
+    let place = page.shelves.iter().position(|shelf| shelf.title == "Recently played").map_or(page.shelves.len().min(1), |at| at + 1);
+    page.shelves.insert(place, shelf);
+    Some(page)
 }
 
 fn search(client: &Client, query: &str) -> ApiResult<PageData> {
@@ -1219,6 +1404,28 @@ fn missing_albums(name: &str, mbid: &str, page: &PageData) -> Option<ShelfData> 
     })
 }
 
+/// The songs by an artist that the library has, most played in the world first.
+fn library_top(name: &str, mbid: &str) -> Vec<Song> {
+    let Some(index) = crate::search::current() else { return Vec::new() };
+    let Ok((_, releases)) = crate::musicbrainz::artist_releases(mbid, crate::lidarr::singles()) else { return Vec::new() };
+    let top = top_of(mbid, &releases);
+    let theirs: Vec<&Song> = index.library.songs.iter().filter(|song| plain(song.artist_label()) == plain(name)).collect();
+    let mut songs: Vec<Song> = Vec::new();
+    for wanted in &top {
+        let title = plain(crate::musicbrainz::base(&wanted.title));
+        if songs.iter().any(|song| plain(crate::musicbrainz::base(&song.title)) == title) {
+            continue;
+        }
+        if let Some(song) = theirs.iter().find(|song| plain(crate::musicbrainz::base(&song.title)) == title) {
+            songs.push((*song).clone());
+            if songs.len() == 5 {
+                break;
+            }
+        }
+    }
+    songs
+}
+
 fn artist_extras(client: &Client, id: &str, page: &PageData, publish: &mut dyn FnMut(PageData)) -> Option<PageData> {
     let name = page.title.clone();
     let (info, top) = std::thread::scope(|scope| {
@@ -1230,6 +1437,9 @@ fn artist_extras(client: &Client, id: &str, page: &PageData, publish: &mut dyn F
         info.similar.iter().filter(|a| !a.id.is_empty()).map(CardData::artist).collect();
     let about = plain_text(&info.biography);
     let asking = crate::lidarr::current().is_some();
+    // The server can only say what's popular if it has somewhere to ask. With requests
+    // switched on there's ListenBrainz, whose list is matched to the songs that are here.
+    let top = if top.is_empty() && asking && !info.music_brainz_id.is_empty() { library_top(&name, &info.music_brainz_id) } else { top };
     if top.is_empty() && similar.is_empty() && about.is_empty() && !asking {
         return None;
     }
