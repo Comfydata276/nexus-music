@@ -649,6 +649,7 @@ component SuggestionRow inherits Rectangle {
     in property <Suggestion> item;
     in property <bool> highlighted;
     callback clicked;
+    callback menu(x: length, y: length);
 
     height: 56px;
     border-radius: 8px;
@@ -660,6 +661,11 @@ component SuggestionRow inherits Rectangle {
     touch := TouchArea {
         mouse-cursor: pointer;
         clicked => { root.clicked(); }
+        pointer-event(event) => {
+            if event.button == PointerEventButton.right && event.kind == PointerEventKind.down {
+                root.menu(self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
+            }
+        }
     }
 
     HorizontalLayout {
@@ -750,6 +756,7 @@ export component SearchOverlay inherits Rectangle {
                 item: item;
                 highlighted: index == Search.highlight;
                 clicked => { Search.activate(index); }
+                menu(x, y) => { Search.menu(index, x, y); }
             }
 
             HorizontalLayout {

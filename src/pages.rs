@@ -266,7 +266,7 @@ pub fn enrich(client: &Client, route: &Route, page: &PageData, publish: &mut dyn
     match route {
         Route::Search(query) if !query.is_empty() => search_extras(query, page, publish),
         Route::Album(id) => album_extras(client, id, page),
-        Route::Artist(id) => artist_extras(client, id, page),
+        Route::Artist(id) => artist_extras(client, id, page, publish),
         _ => None,
     }
 }
@@ -295,7 +295,7 @@ fn plain(text: &str) -> String {
 }
 
 /// The kinds of thing a search can be narrowed to, as its chips name them.
-pub const SEARCH_FILTERS: [&str; 4] = ["All", "Songs", "Artists", "Albums"];
+pub const SEARCH_FILTERS: [&str; 5] = ["All", "Songs", "Artists", "Albums", "Playlists"];
 /// How many songs each list shows before "Show all", and how many cards make a shelf worth
 /// a "Show all" of its own.
 const TOP_SONGS: usize = 4;
@@ -317,11 +317,9 @@ pub fn search_view(whole: &PageData, filter: usize) -> PageData {
         }
         for shelf in page.lead.iter_mut().chain(&mut page.shelves).chain(&mut page.tail) {
             if shelf.cards.len() > SHELF_ROW {
-                shelf.route = match shelf.title.as_str() {
-                    "Artists" => "filter:2".into(),
-                    "Albums" => "filter:3".into(),
-                    _ => String::new(),
-                };
+                if let Some(kind) = SEARCH_FILTERS.iter().position(|name| *name == shelf.title) {
+                    shelf.route = format!("filter:{kind}");
+                }
             }
         }
         return page;
@@ -719,21 +717,50 @@ pub fn request_card(offer: &crate::lidarr::Offer) -> CardData {
     }
 }
 
-/// The albums that have been asked for and haven't arrived yet.
+/// The albums that have been asked for: those that have arrived lately, then those still on
+/// their way.
 fn requests() -> PageData {
     let title = "Requests".to_string();
     let Some(lidarr) = crate::lidarr::current() else {
         return PageData { title, empty: "Requests are switched off. Turn them on in Settings.".into(), ..Default::default() };
     };
+    // What this app asked for that has since turned up, newest first.
+    let mut arrived: Vec<crate::asked::Asked> = crate::asked::shared().into_iter().filter(|asked| asked.arrived != 0 && !asked.library_album.is_empty()).collect();
+    arrived.sort_by_key(|asked| std::cmp::Reverse(asked.arrived));
+    let lead: Vec<ShelfData> = if arrived.is_empty() {
+        Vec::new()
+    } else {
+        vec![ShelfData {
+            title: "Arrived".into(),
+            route: String::new(),
+            wrap: true,
+            cards: arrived
+                .iter()
+                .map(|asked| CardData {
+                    kind: Kind::Album,
+                    id: asked.library_album.clone(),
+                    title: asked.title.clone(),
+                    subtitle: if asked.song.is_empty() { asked.artist.clone() } else { format!("{} • for “{}”", asked.artist, asked.song) },
+                    cover: asked.cover.clone(),
+                })
+                .collect(),
+        }]
+    };
     match lidarr.pending() {
-        Err(reason) => PageData { title, empty: reason, ..Default::default() },
+        Err(reason) => PageData { title, lead, empty: reason, ..Default::default() },
         Ok(pending) if pending.is_empty() => PageData {
             title,
-            empty: "Nothing is on its way. Search for an album and pick it under “Not in your library”.".into(),
+            empty: if lead.is_empty() {
+                "Nothing is on its way. Search for a song, artist or album and pick it under “Not in your library”.".into()
+            } else {
+                "Nothing else is on its way.".into()
+            },
+            lead,
             ..Default::default()
         },
         Ok(pending) => PageData {
             title,
+            lead,
             tracks_title: format!("On their way ({})", pending.len()),
             request_ids: pending.iter().map(|album| album.id).collect(),
             // Rows that name an album, not songs that can be played.
@@ -901,11 +928,12 @@ fn search(client: &Client, query: &str) -> ApiResult<PageData> {
     };
     let artists = row("Artists", found.artists);
     let albums = row("Albums", found.albums);
+    let playlists = row("Playlists", crate::search::playlists_matching(query));
     // An artist who matches what was typed goes above the songs.
     let (lead, shelves): (Vec<ShelfData>, Vec<ShelfData>) = if found.artist_first {
-        (artists.into_iter().collect(), albums.into_iter().collect())
+        (artists.into_iter().collect(), albums.into_iter().chain(playlists).collect())
     } else {
-        (Vec::new(), artists.into_iter().chain(albums).collect())
+        (Vec::new(), artists.into_iter().chain(albums).chain(playlists).collect())
     };
     let empty = if found.songs.is_empty() && shelves.is_empty() && lead.is_empty() {
         format!("Nothing in your library matches “{query}”. Check the spelling or try fewer words.")
@@ -1117,7 +1145,56 @@ fn artist(client: &Client, id: &str) -> ApiResult<PageData> {
 
 /// Popular songs, biography and similar artists. The server gets these from Last.fm, which
 /// can take seconds, so the artist's own albums are on screen long before.
-fn artist_extras(client: &Client, id: &str, page: &PageData) -> Option<PageData> {
+/// The studio albums by an artist that the library doesn't have, as a shelf to ask for them
+/// from. `mbid` is MusicBrainz's name for the artist if the server knows it; otherwise Lidarr
+/// is asked who goes by `name`.
+fn missing_albums(name: &str, mbid: &str, page: &PageData) -> Option<ShelfData> {
+    let lidarr = crate::lidarr::current()?;
+    let artist = if mbid.is_empty() {
+        let found = lidarr.find_artists(name).ok()?;
+        let mut same = found.into_iter().filter(|artist| crate::musicbrainz::same_words(&artist.name, name));
+        // Of several by that name, the one of some note.
+        let first = same.next()?;
+        if first.cover.is_empty() { same.find(|artist| !artist.cover.is_empty()).unwrap_or(first) } else { first }
+    } else {
+        crate::lidarr::ArtistOffer { id: mbid.to_string(), name: name.to_string(), ..Default::default() }
+    };
+    crate::lidarr::remember_artists(std::slice::from_ref(&artist));
+    let albums: Vec<(crate::lidarr::Offer, bool)> = match lidarr.known_artist(&artist.id).ok().flatten() {
+        Some((number, known)) => lidarr.albums_of(number, &known).ok()?,
+        None => crate::musicbrainz::artist_albums(&artist.id).ok()?.1.into_iter().map(|album| (album, false)).collect(),
+    };
+    // What the page already lists is what the library has.
+    let have: Vec<&str> = page.shelves.iter().flat_map(|shelf| &shelf.cards).filter(|card| card.kind == Kind::Album).map(|card| card.title.as_str()).collect();
+    let missing: Vec<crate::lidarr::Offer> = albums
+        .into_iter()
+        .filter(|(offer, arrived)| !arrived && !have.iter().any(|title| crate::musicbrainz::same_words(title, &offer.title)))
+        .map(|(offer, _)| offer)
+        .collect();
+    if missing.is_empty() {
+        return None;
+    }
+    crate::lidarr::remember(&missing);
+    Some(ShelfData {
+        title: "Not in your library".into(),
+        route: format!("outside-artist:{}", artist.id),
+        wrap: false,
+        cards: missing
+            .iter()
+            .map(|offer| CardData {
+                subtitle: match (offer.year.is_empty(), offer.requested) {
+                    (true, true) => "Requested".into(),
+                    (true, false) => "Album".into(),
+                    (false, true) => format!("{} • Requested", offer.year),
+                    (false, false) => offer.year.clone(),
+                },
+                ..request_card(offer)
+            })
+            .collect(),
+    })
+}
+
+fn artist_extras(client: &Client, id: &str, page: &PageData, publish: &mut dyn FnMut(PageData)) -> Option<PageData> {
     let name = page.title.clone();
     let (info, top) = std::thread::scope(|scope| {
         let info = scope.spawn(|| client.artist_info(id).unwrap_or_default());
@@ -1127,21 +1204,26 @@ fn artist_extras(client: &Client, id: &str, page: &PageData) -> Option<PageData>
     let similar: Vec<CardData> =
         info.similar.iter().filter(|a| !a.id.is_empty()).map(CardData::artist).collect();
     let about = plain_text(&info.biography);
-    if top.is_empty() && similar.is_empty() && about.is_empty() {
+    let asking = crate::lidarr::current().is_some();
+    if top.is_empty() && similar.is_empty() && about.is_empty() && !asking {
         return None;
     }
     let mut page = page.clone();
     page.songs = top;
     page.about = about;
-    page.shelves.retain(|s| s.title != "Fans also like");
-    if !similar.is_empty() {
-        page.shelves.push(ShelfData {
-            title: "Fans also like".into(),
-            route: String::new(),
-            wrap: false,
-            cards: similar,
-        });
+    page.shelves.retain(|s| s.title != "Fans also like" && s.title != "Not in your library");
+    let fans = (!similar.is_empty()).then(|| ShelfData { title: "Fans also like".into(), route: String::new(), wrap: false, cards: similar });
+    if !asking {
+        page.shelves.extend(fans);
+        return Some(page);
     }
+    // With requests switched on: what they've made that isn't here, which takes a moment
+    // longer to find, so the rest is shown meanwhile.
+    let mut shown = page.clone();
+    shown.shelves.extend(fans.clone());
+    publish(shown);
+    page.shelves.extend(missing_albums(&name, &info.music_brainz_id, &page));
+    page.shelves.extend(fans);
     Some(page)
 }
 

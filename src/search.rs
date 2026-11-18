@@ -497,3 +497,31 @@ mod tests {
         assert_eq!(titles(&found.songs), ["Psycho / Maisie Peters"]);
     }
 }
+
+// ---- playlists ------------------------------------------------------------------------------------
+
+/// The playlists, as cards, for a search to look through. Kept up to date by whatever lists
+/// them in the sidebar.
+static PLAYLISTS: std::sync::RwLock<Vec<CardData>> = std::sync::RwLock::new(Vec::new());
+
+pub fn set_playlists(playlists: Vec<CardData>) {
+    if let Ok(mut all) = PLAYLISTS.write() {
+        *all = playlists;
+    }
+}
+
+/// The playlists whose name has every word that was typed, or the start of it.
+pub fn playlists_matching(query: &str) -> Vec<CardData> {
+    let typed = crate::musicbrainz::words(query);
+    if typed.is_empty() {
+        return Vec::new();
+    }
+    let Ok(all) = PLAYLISTS.read() else { return Vec::new() };
+    all.iter()
+        .filter(|playlist| {
+            let name = crate::musicbrainz::words(&playlist.title);
+            typed.iter().all(|word| name.iter().any(|part| part.starts_with(word.as_str())))
+        })
+        .cloned()
+        .collect()
+}

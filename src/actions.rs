@@ -59,7 +59,7 @@ pub enum PromptAction {
     /// The file or folder to import playlists from was typed in.
     ImportPath,
     /// Ask Lidarr for an album (by its name for it), or for several by (artist, album).
-    RequestAlbum { album: String, title: String },
+    RequestAlbum { album: String, title: String, song: String },
     AddArtist { artist: String, name: String },
     RequestMissing(Vec<(String, String)>),
     RenamePlaylist(String),
@@ -693,7 +693,7 @@ impl Controller {
                     self.add_songs_to_playlist(playlist_id, fresh);
                 }
             }
-            PromptAction::RequestAlbum { album, title } => self.request_album(album, title),
+            PromptAction::RequestAlbum { album, title, song } => self.request_album(album, title, song),
             PromptAction::AddArtist { artist, name } => self.add_artist(artist, name),
             PromptAction::RequestMissing(albums) => self.request_missing(albums),
             PromptAction::ImportPath => {

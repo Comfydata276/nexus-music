@@ -188,6 +188,8 @@ export global Search {
     in-out property <int> highlight: -1;
     callback preview(text: string);
     callback activate(index: int);
+    // Right-clicked: the same menu the item has anywhere else.
+    callback menu(index: int, x: length, y: length);
 }
 
 // The page currently shown in the main panel.

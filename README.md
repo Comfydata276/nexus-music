@@ -23,6 +23,7 @@ by the app itself.
 - Brings playlists over from Spotify: choose the files you exported (CSV from a tool such as Exportify, or Spotify's own data download) and it matches each song to your library, builds the playlists, and lists what it couldn't find.
 - Optional, off by default: if you run Lidarr beside your music server, search results gain a "Not in your library" section. It lists songs (each with the album it's on), artists and albums; an artist opens to all their albums and an album to its track list. Asking for a song or album puts that album on Lidarr's list, "Add artist" has Lidarr fetch everything by them, and a Requests page shows what is on its way. Whole albums only; where Lidarr gets them from is set up in Lidarr. Songs, discographies and track lists are looked up at [MusicBrainz](https://musicbrainz.org), which is sent what you search for; covers come from the Cover Art Archive. If Lidarr sits behind an Authentik sign-in, you sign in with your browser and the app keeps only a token (see below).
 - A "Made for you" row on Home, built from your listening: On repeat, Your top songs, Rediscover and mixes of the genres you play most.
+- Follows up what you ask for: when a requested album arrives it says so, lists it under Requests, and puts the songs an imported playlist was missing into that playlist.
 - Keeps songs ready: each song is kept on this PC once it has played, and the next few in the queue are fetched ahead of time, so the music carries on through a dropped connection and replays start at once. You choose how much space that may take (2 GB unless changed) and how far ahead to fetch; the songs played longest ago make way when it fills.
 - Playing a song from a search starts its radio: that song, then others like it.
 - Keeps your devices in step: the queue and your place in it, Recently played, pinned playlists, each list's shuffle and sort, the dates songs were added and the theme follow you to the app on another PC. The queue uses the server's saved-queue feature; the rest is kept in the comment of a playlist named "Nexus Music sync".
@@ -165,6 +166,7 @@ connection.
 | `src/covers.rs` | Cover art cache, on disk and in memory. |
 | `src/media.rs` | Windows media keys and now-playing overlay. |
 | `src/lidarr.rs` | Asking a Lidarr server for albums (optional). |
+| `src/asked.rs` | Remembers what was requested and spots when it arrives. |
 | `src/musicbrainz.rs` | Finds songs, discographies and track lists for music that isn't in the library. |
 | `src/gate.rs` | Browser sign-in for a Lidarr that sits behind Authentik. |
 | `src/update.rs` | Finds, downloads and verifies new releases. |

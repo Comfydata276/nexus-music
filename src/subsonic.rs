@@ -140,6 +140,8 @@ pub struct Artist {
 #[serde(rename_all = "camelCase", default)]
 pub struct ArtistInfo {
     pub biography: String,
+    /// MusicBrainz's name for the artist, where the server knows it.
+    pub music_brainz_id: String,
     #[serde(rename = "similarArtist")]
     pub similar: Vec<Artist>,
 }

@@ -23,6 +23,8 @@ pub struct Paths {
     pub downloads: PathBuf,
     /// When songs were added to playlists, as far as this app has seen.
     pub added: PathBuf,
+    /// What's been asked for through this app and is being watched for.
+    pub asked: PathBuf,
     #[cfg(not(windows))]
     secret: PathBuf,
 }
@@ -52,6 +54,7 @@ impl Paths {
             history: config.join("history.json"),
             pending: config.join("pending.json"),
             added: config.join("playlist-added.json"),
+            asked: config.join("asked.json"),
             covers: cache.join("covers"),
             pages: cache.join("pages"),
             buffers: cache.join("buffers"),

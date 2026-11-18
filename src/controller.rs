@@ -315,6 +315,11 @@ pub struct Controller {
     /// How the last import of playlists went, as a page to show, and the songs it couldn't find.
     import_report: RefCell<Option<PageData>>,
     import_missing: RefCell<Vec<crate::import::Wanted>>,
+    /// The same songs with the playlist each belongs in: (album, the song for that playlist).
+    import_fills: RefCell<Vec<(String, crate::asked::Fill)>>,
+    /// What's been asked for and is being watched for, and a count that paces the watching.
+    pub asked: RefCell<crate::asked::AskedList>,
+    asked_ticks: Cell<u32>,
     /// Counts ticks, to refresh the Requests page now and then while it's open.
     requests_ticks: Cell<u32>,
     /// The search on screen: everything it found, which kind of result it's narrowed to
@@ -413,6 +418,9 @@ impl Controller {
             reconnect_timer: slint::Timer::default(),
             import_report: RefCell::new(None),
             import_missing: RefCell::default(),
+            import_fills: RefCell::default(),
+            asked: RefCell::new(crate::asked::AskedList::load(&paths.asked)),
+            asked_ticks: Cell::new(0),
             requests_ticks: Cell::new(0),
             search_whole: RefCell::new(None),
             search_filter: Cell::new(0),
@@ -837,6 +845,7 @@ impl Controller {
         self.reload_playlists();
         self.navigate(Route::Home);
         self.start_sync();
+        self.asked.borrow_mut().tidy(chrono::Utc::now().timestamp());
         self.load_library();
         self.library_timer.start(slint::TimerMode::Repeated, Duration::from_secs(5 * 60), || {
             with(|ctl| ctl.load_library());
@@ -1074,7 +1083,8 @@ impl Controller {
         } else {
             format!("“{song}” is on “{title}”{by}. That album will go on Lidarr's list, and Lidarr will start looking for it. The whole album is fetched.")
         };
-        *self.prompt.borrow_mut() = Some(crate::actions::PromptAction::RequestAlbum { album: album.to_string(), title: title.to_string() });
+        *self.prompt.borrow_mut() =
+            Some(crate::actions::PromptAction::RequestAlbum { album: album.to_string(), title: title.to_string(), song: song.to_string() });
         self.open_prompt("Ask for this album?", &text, "Request", None, false);
     }
 
@@ -1090,7 +1100,7 @@ impl Controller {
         }
     }
 
-    pub fn request_album(self: &Rc<Self>, album: String, title: String) {
+    pub fn request_album(self: &Rc<Self>, album: String, title: String, song: String) {
         let Some(lidarr) = crate::lidarr::current() else { return };
         self.toast(format!("Asking for “{title}”…"));
         self.api_pool.spawn(move || {
@@ -1102,10 +1112,19 @@ impl Controller {
                 });
             let result = offer.and_then(|offer| {
                 crate::lidarr::remember(std::slice::from_ref(&offer));
-                lidarr.request(&offer)
+                lidarr.request(&offer).map(|()| offer.artist)
             });
             post(move |ctl| match result {
-                Ok(()) => {
+                Ok(artist) => {
+                    // Noted, so it can be followed up when it arrives.
+                    ctl.asked.borrow_mut().add(crate::asked::Asked {
+                        album: album.clone(),
+                        title: title.clone(),
+                        artist,
+                        at: chrono::Utc::now().timestamp(),
+                        song,
+                        ..Default::default()
+                    });
                     crate::lidarr::mark(&album, true);
                     ctl.refresh_outside();
                     ctl.toast(format!("Asked for “{title}”. It'll be in your library once it arrives."));
@@ -1195,6 +1214,8 @@ impl Controller {
         self.api_pool.spawn(move || {
             let name = |text: &str| crate::search::fold(text).split_whitespace().collect::<Vec<_>>().join(" ");
             let (mut asked, mut unmatched, mut failed) = (0, 0, None);
+            // What was asked for, as (the names it was asked by, what Lidarr calls it).
+            let mut noted: Vec<((String, String), crate::lidarr::Offer)> = Vec::new();
             for (artist, album) in &albums {
                 // The album Lidarr knows by that name and artist, if it knows one.
                 let found = lidarr.find_albums(&format!("{album} {artist}")).unwrap_or_default().into_iter().find(|offer| {
@@ -1202,14 +1223,39 @@ impl Controller {
                 });
                 match found {
                     None => unmatched += 1,
-                    Some(offer) if offer.requested => asked += 1,
+                    Some(offer) if offer.requested => {
+                        asked += 1;
+                        noted.push(((artist.clone(), album.clone()), offer));
+                    }
                     Some(offer) => match lidarr.request(&offer) {
-                        Ok(()) => asked += 1,
+                        Ok(()) => {
+                            asked += 1;
+                            noted.push(((artist.clone(), album.clone()), offer));
+                        }
                         Err(reason) => failed = Some(reason),
                     },
                 }
             }
             post(move |ctl| {
+                // Noted with the songs each playlist is missing, to be put in on arrival.
+                let now = chrono::Utc::now().timestamp();
+                for ((artist, album), offer) in noted {
+                    let fills = ctl
+                        .import_fills
+                        .borrow()
+                        .iter()
+                        .filter(|(of, fill)| name(of) == name(&album) && fill.artists.first().is_some_and(|first| name(first) == name(&artist)))
+                        .map(|(_, fill)| fill.clone())
+                        .collect();
+                    ctl.asked.borrow_mut().add(crate::asked::Asked {
+                        album: offer.album,
+                        title: offer.title,
+                        artist: offer.artist,
+                        at: now,
+                        fills,
+                        ..Default::default()
+                    });
+                }
                 ctl.invalidate("requests");
                 ctl.toast(match (unmatched, failed) {
                     (_, Some(reason)) => format!("Asked for {}. Then: {reason}", count(asked, "album")),
@@ -1221,6 +1267,88 @@ impl Controller {
         });
     }
 
+    /// Albums that were asked for have turned up in the library: says so, and puts the songs
+    /// their playlists were missing into those playlists.
+    fn requests_arrived(self: &Rc<Self>, arrivals: Vec<crate::asked::Arrival>) {
+        let now = chrono::Utc::now().timestamp();
+        let told: Vec<crate::asked::Asked> = {
+            let mut asked = self.asked.borrow_mut();
+            let fresh: Vec<crate::asked::Asked> =
+                arrivals.iter().filter_map(|arrival| asked.items.get(arrival.place).filter(|asked| asked.arrived == 0).cloned()).collect();
+            asked.mark(&arrivals, now);
+            fresh
+        };
+        if told.is_empty() {
+            return;
+        }
+        let news = match told.as_slice() {
+            [one] if !one.song.is_empty() => format!("“{}” has arrived, on “{}”.", one.song, one.title),
+            [one] => format!("“{}” by {} has arrived.", one.title, one.artist),
+            many => format!("{} albums you asked for have arrived.", many.len()),
+        };
+        self.toast(format!("{news} See Requests."));
+        self.refresh_outside();
+        if self.current_route() == Some(Route::Requests) {
+            self.show(Route::Requests, 0.0, true, None);
+        }
+        // The songs playlists were waiting for, gathered by playlist. A playlist that was
+        // never made (none of its songs were found at the time) is made now.
+        let mut by_list: Vec<(String, String, Vec<(String, i64)>)> = Vec::new();
+        for (playlist, name, song, added) in arrivals.into_iter().flat_map(|arrival| arrival.fills) {
+            let id = if playlist.is_empty() {
+                self.playlists.borrow().iter().find(|known| known.name == name).map(|known| known.id.clone()).unwrap_or_default()
+            } else {
+                playlist
+            };
+            match by_list.iter_mut().find(|(known, known_name, _)| *known == id && *known_name == name) {
+                Some((_, _, songs)) => songs.push((song, added)),
+                None => by_list.push((id, name, vec![(song, added)])),
+            }
+        }
+        if by_list.is_empty() {
+            return;
+        }
+        self.request(
+            move |client| {
+                let mut done: Vec<(String, String, Vec<(String, i64)>)> = Vec::new();
+                for (id, name, songs) in by_list {
+                    let ids: Vec<String> = songs.iter().map(|(song, _)| song.clone()).collect();
+                    let id = if id.is_empty() {
+                        client.create_playlist(&name, &ids)?.id
+                    } else {
+                        // Not ones the playlist has gained some other way in the meantime.
+                        let have: HashSet<String> = client.playlist(&id).map(|list| list.songs.into_iter().map(|song| song.id).collect()).unwrap_or_default();
+                        let new: Vec<String> = ids.iter().filter(|song| !have.contains(*song)).cloned().collect();
+                        if !new.is_empty() {
+                            client.add_to_playlist(&id, &new)?;
+                        }
+                        id
+                    };
+                    done.push((id, name, songs));
+                }
+                Ok(done)
+            },
+            move |ctl, result| {
+                let Ok(done) = result else { return };
+                let (mut songs, mut names) = (0, Vec::new());
+                for (id, name, added) in &done {
+                    // Dated as they were on the playlist they came from, where that's known.
+                    let dated: Vec<(String, i64)> = added.iter().map(|(song, at)| (song.clone(), if *at > 0 { *at } else { now })).collect();
+                    ctl.added.borrow_mut().record_at(id, &dated, false, now);
+                    songs += added.len();
+                    names.push(name.clone());
+                }
+                ctl.share_soon();
+                ctl.invalidate("playlist:");
+                ctl.reload_playlists();
+                ctl.toast(match names.as_slice() {
+                    [one] => format!("{news} Added {} to “{one}”.", count(songs as u32, "song")),
+                    _ => format!("{news} Added {} to {} playlists.", count(songs as u32, "song"), names.len()),
+                });
+            },
+        );
+    }
+
     /// Takes an album off Lidarr's list.
     pub fn cancel_request(self: &Rc<Self>, id: i64, title: String) {
         let Some(lidarr) = crate::lidarr::current() else { return };
@@ -1228,7 +1356,10 @@ impl Controller {
             let result = lidarr.cancel(id);
             post(move |ctl| {
                 match result {
-                    Ok(()) => ctl.toast(format!("“{title}” is off the list")),
+                    Ok(()) => {
+                        ctl.asked.borrow_mut().forget(&title);
+                        ctl.toast(format!("“{title}” is off the list"));
+                    }
                     Err(reason) => ctl.toast(reason),
                 }
                 ctl.invalidate("requests");
@@ -1242,6 +1373,13 @@ impl Controller {
 
     /// Keeps the Requests page current while it's open. Called four times a second.
     pub fn tick_requests(self: &Rc<Self>) {
+        // While something asked for is on its way, look for it in the library every minute
+        // (a quick question to the server; the library is only read again if it has grown).
+        let waited = self.asked_ticks.get() + 1;
+        self.asked_ticks.set(waited);
+        if waited % 240 == 0 && self.asked.borrow().waiting() && crate::lidarr::current().is_some() {
+            self.load_library();
+        }
         if self.current_route() != Some(Route::Requests) {
             return self.requests_ticks.set(0);
         }
@@ -1342,6 +1480,22 @@ impl Controller {
             .collect();
         // With requests switched on, the albums those songs are on can be asked for.
         *self.import_missing.borrow_mut() = reports.iter().flat_map(|report| report.missing.iter().cloned()).collect();
+        *self.import_fills.borrow_mut() = reports
+            .iter()
+            .flat_map(|report| {
+                report.missing.iter().map(|wanted| {
+                    let fill = crate::asked::Fill {
+                        playlist: report.playlist.clone(),
+                        playlist_name: report.name.clone(),
+                        title: wanted.title.clone(),
+                        artists: wanted.artists.clone(),
+                        seconds: wanted.seconds,
+                        added: wanted.added,
+                    };
+                    (wanted.album.clone(), fill)
+                })
+            })
+            .collect();
         let askable = crate::lidarr::current().is_some() && !self.missing_albums().is_empty();
         let page = PageData {
             action: if askable { "Request the missing albums".into() } else { String::new() },
@@ -1414,7 +1568,14 @@ impl Controller {
                     crate::search::set_liked(found.songs.into_iter().map(|song| song.id).collect());
                 }
             }
-            post(|ctl| ctl.library_busy.set(false));
+            // Has anything that was asked for turned up?
+            let arrived = crate::search::current().map(|index| crate::asked::arrivals(&index, &crate::asked::shared())).unwrap_or_default();
+            post(move |ctl| {
+                ctl.library_busy.set(false);
+                if !arrived.is_empty() {
+                    ctl.requests_arrived(arrived);
+                }
+            });
         });
     }
 
@@ -2192,7 +2353,7 @@ impl Controller {
     /// added most recently at the top.
     fn list_sort(&self, key: &str) -> (usize, bool) {
         let prefs = self.list_prefs(key);
-        if !prefs.sort_chosen && prefs.sort == 0 && key.starts_with("playlist:") {
+        if !prefs.sort_chosen && prefs.sort == 0 && (key.starts_with("playlist:") || key == "liked") {
             return (SORT_ADDED, true);
         }
         let sort = prefs.sort.min(TRACK_SORTS.len() - 1);
@@ -2550,6 +2711,19 @@ impl Controller {
                 pinned: place(&p.id).is_some(),
             })
             .collect();
+        // A search looks through them too.
+        crate::search::set_playlists(
+            playlists
+                .iter()
+                .map(|p| CardData {
+                    kind: Kind::Playlist,
+                    id: p.id.clone(),
+                    title: p.name.clone(),
+                    subtitle: count(p.song_count, "song"),
+                    cover: p.cover_art.clone(),
+                })
+                .collect(),
+        );
         // Left alone when nothing differs, so a routine check doesn't disturb the sidebar.
         let app = self.ui.global::<ui::App>();
         if app.get_playlists().iter().ne(rows.iter().cloned()) {
@@ -2755,6 +2929,15 @@ impl Controller {
         let search = self.ui.global::<ui::Search>();
         search.on_preview(|text| {
             with(|ctl| ctl.search_preview(&text));
+        });
+        search.on_menu(|index, x, y| {
+            with(|ctl| {
+                let Some(suggestion) = ctl.suggestions.borrow().get(index.max(0) as usize).cloned() else { return };
+                match suggestion {
+                    Suggestion::Card(card) => ctl.open_card_menu(&card.to_ui(), x, y),
+                    Suggestion::Song(song) => ctl.open_song_menu(song, x, y),
+                }
+            });
         });
         search.on_activate(|index| {
             with(|ctl| ctl.open_suggestion(index.max(0) as usize));
