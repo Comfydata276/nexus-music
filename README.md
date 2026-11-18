@@ -64,7 +64,7 @@ F5 reloads the page.
 ### Requests when Lidarr is behind Authentik
 
 If Lidarr's address answers with an [Authentik](https://goauthentik.io) sign-in instead of
-Lidarr, "Save and check" notices and offers **Sign in with browser**. You sign in on
+Lidarr, pressing **Connect** notices and opens that sign-in in your browser. You sign in on
 Authentik's own page, with whatever second step it asks for, and the browser hands the app a
 token. No name or password is typed into the app or kept by it. The token is kept in the
 Windows credential store, is replaced each time it's used, and is handed back when you sign

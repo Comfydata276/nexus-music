@@ -436,6 +436,8 @@ export component Slider inherits Rectangle {
 export component Field inherits Rectangle {
     in-out property <string> text <=> input.text;
     in property <string> placeholder;
+    // The placeholder's colour; stronger when it stands for something already on file.
+    in property <brush> placeholder-ink: Theme.faint;
     in property <InputType> input-type: InputType.text;
     in property <string> label;
     callback accepted;
@@ -458,7 +460,7 @@ export component Field inherits Rectangle {
                 x: 0;
                 width: parent.width;
                 text: root.placeholder;
-                color: Theme.faint;
+                color: root.placeholder-ink;
                 font-size: 14px;
                 vertical-alignment: center;
                 overflow: elide;

@@ -308,6 +308,8 @@ pub struct Controller {
     import_missing: RefCell<Vec<crate::import::Wanted>>,
     /// Counts ticks, to refresh the Requests page now and then while it's open.
     requests_ticks: Cell<u32>,
+    /// Counts checks of the connection to Lidarr, to tell a late answer from the current one.
+    requests_check: Cell<u64>,
     /// The sign-in in front of Lidarr, once signed in to. The one copy is kept for as long
     /// as it's good, so its token is only ever renewed in one place.
     gate: RefCell<Option<std::sync::Arc<crate::gate::Session>>>,
@@ -392,6 +394,7 @@ impl Controller {
             import_report: RefCell::new(None),
             import_missing: RefCell::default(),
             requests_ticks: Cell::new(0),
+            requests_check: Cell::new(0),
             gate: RefCell::new(None),
             suggestions: RefCell::default(),
             preview_count: Cell::new(0),
@@ -854,12 +857,24 @@ impl Controller {
         crate::gate::Session::new(found, token, move |token| config::save_secret(&paths, "lidarr-token", token))
     }
 
-    fn requests_status(&self, text: &str) {
-        self.ui.global::<ui::Settings>().set_requests_status(text.into());
+    /// Shows where the connection to Lidarr stands: `state` picks the marker and the one
+    /// action on offer ("none", "checking", "connected", "sign-in", "waiting" or "error"),
+    /// `text` says it in words.
+    fn requests_state(&self, state: &str, text: &str) {
+        let page = self.ui.global::<ui::Settings>();
+        page.set_requests_state(state.into());
+        page.set_requests_status(text.into());
     }
 
-    /// Saves where Lidarr is and its key, then checks that it answers.
-    fn save_requests(self: &Rc<Self>, address: &str, key: &str) {
+    /// "Lidarr is behind the sign-in at auth.example.org."
+    fn behind_sign_in(&self) -> String {
+        let gate = crate::gate::Found { service: self.settings.borrow().lidarr_gate.clone(), client: String::new() };
+        format!("Lidarr is behind the sign-in at {}.", gate.host())
+    }
+
+    /// Saves where Lidarr is and its key, then connects: checks that it answers and, if a
+    /// sign-in answers instead, goes on to that.
+    fn save_requests(&self, address: &str, key: &str) {
         let moved = {
             let mut settings = self.settings.borrow_mut();
             let moved = crate::lidarr::tidy(&settings.lidarr_address) != crate::lidarr::tidy(address);
@@ -880,15 +895,19 @@ impl Controller {
         }
         self.connect_requests();
         self.push_settings();
-        self.check_requests();
+        self.check_requests(true);
     }
 
     /// Asks Lidarr whether it's there and, if a sign-in answers instead, which one.
-    fn check_requests(self: &Rc<Self>) {
+    /// `by_hand` when someone pressed Connect: then a sign-in that's needed is started
+    /// straight away, not just offered.
+    pub fn check_requests(&self, by_hand: bool) {
         let Some(lidarr) = crate::lidarr::current() else {
-            return self.requests_status("Fill in the address and the API key.");
+            return self.requests_state("none", "Not connected yet.");
         };
-        self.requests_status("Checking…");
+        let check = self.requests_check.get() + 1;
+        self.requests_check.set(check);
+        self.requests_state("checking", "Checking…");
         let address = crate::lidarr::tidy(&self.settings.borrow().lidarr_address);
         self.api_pool.spawn(move || {
             let answer = lidarr.version();
@@ -898,39 +917,45 @@ impl Controller {
                 }
                 _ => None,
             };
-            post(move |ctl| ctl.requests_checked(answer, gate));
+            post(move |ctl| {
+                // Only the newest check counts.
+                if ctl.requests_check.get() == check {
+                    ctl.requests_checked(by_hand, answer, gate);
+                }
+            });
         });
     }
 
-    fn requests_checked(&self, answer: Result<String, String>, gate: Option<Result<Option<crate::gate::Found>, String>>) {
-        let status = match (answer, gate) {
-            (Ok(version), _) => format!("Connected to Lidarr {version}."),
-            (Err(_), Some(Ok(Some(found)))) => {
-                let known = {
-                    let settings = self.settings.borrow();
-                    settings.lidarr_gate == found.service && settings.lidarr_gate_client == found.client
-                };
-                if !known {
-                    self.drop_sign_in();
-                    {
-                        let mut settings = self.settings.borrow_mut();
-                        settings.lidarr_gate = found.service;
-                        settings.lidarr_gate_client = found.client;
-                    }
-                    self.save_settings();
-                    self.connect_requests();
+    fn requests_checked(&self, by_hand: bool, answer: Result<String, String>, gate: Option<Result<Option<crate::gate::Found>, String>>) {
+        if let Some(Ok(Some(found))) = &gate {
+            let known = {
+                let settings = self.settings.borrow();
+                settings.lidarr_gate == found.service && settings.lidarr_gate_client == found.client
+            };
+            if !known {
+                self.drop_sign_in();
+                {
+                    let mut settings = self.settings.borrow_mut();
+                    settings.lidarr_gate = found.service.clone();
+                    settings.lidarr_gate_client = found.client.clone();
                 }
-                "Lidarr is behind a sign-in. Sign in below to connect.".to_string()
+                self.save_settings();
+                self.connect_requests();
             }
-            (Err(_), Some(Err(why))) => why,
-            (Err(reason), _) => reason,
-        };
+        }
         self.push_settings();
-        self.requests_status(&status);
+        let signed_out = !self.settings.borrow().lidarr_gate.is_empty() && config::load_secret(&self.paths, "lidarr-token").is_none();
+        match (answer, gate) {
+            (Ok(version), _) => self.requests_state("connected", &format!("Connected to Lidarr {version}.")),
+            (Err(_), Some(Ok(Some(_)))) if by_hand => self.sign_in_requests(),
+            (Err(_), Some(Ok(Some(_)))) => self.requests_state("sign-in", &self.behind_sign_in()),
+            (Err(_), Some(Err(why))) => self.requests_state("error", &why),
+            (Err(reason), _) => self.requests_state(if signed_out { "sign-in" } else { "error" }, &reason),
+        }
     }
 
     /// Starts a sign-in to what's in front of Lidarr: opens it in the browser and waits.
-    fn sign_in_requests(self: &Rc<Self>) {
+    fn sign_in_requests(&self) {
         let found = {
             let settings = self.settings.borrow();
             crate::gate::Found { service: settings.lidarr_gate.clone(), client: settings.lidarr_gate_client.clone() }
@@ -939,8 +964,8 @@ impl Controller {
             return;
         }
         let round = crate::gate::new_round();
-        self.ui.global::<ui::Settings>().set_lidarr_signing_in(true);
-        self.requests_status("Waiting for you to sign in in your browser…");
+        self.requests_check.set(self.requests_check.get() + 1);
+        self.requests_state("waiting", &format!("Finish signing in at {} in your browser.", found.host()));
         std::thread::spawn(move || {
             let agent = crate::subsonic::make_agent_without_redirects();
             let result = crate::gate::begin(&found).and_then(|attempt| {
@@ -952,11 +977,10 @@ impl Controller {
         });
     }
 
-    fn signed_in(self: &Rc<Self>, round: u64, found: crate::gate::Found, result: Result<crate::gate::SignedIn, String>) {
+    fn signed_in(&self, round: u64, found: crate::gate::Found, result: Result<crate::gate::SignedIn, String>) {
         if !crate::gate::is_current(round) {
             return;
         }
-        self.ui.global::<ui::Settings>().set_lidarr_signing_in(false);
         match result {
             Ok(done) => {
                 config::save_secret(&self.paths, "lidarr-token", &done.token);
@@ -965,11 +989,11 @@ impl Controller {
                 self.gate.replace(Some(std::sync::Arc::new(self.new_gate(found, done.token))));
                 self.connect_requests();
                 self.push_settings();
-                self.check_requests();
+                self.check_requests(false);
             }
             Err(why) => {
                 self.push_settings();
-                self.requests_status(&why);
+                self.requests_state("sign-in", &why);
             }
         }
     }
@@ -977,14 +1001,12 @@ impl Controller {
     /// Stops waiting for a sign-in that was started.
     fn cancel_sign_in(&self) {
         crate::gate::new_round();
-        self.ui.global::<ui::Settings>().set_lidarr_signing_in(false);
-        self.requests_status("");
+        self.requests_state("sign-in", &self.behind_sign_in());
     }
 
     /// Forgets the sign-in in front of Lidarr and hands its token back to the service.
     fn drop_sign_in(&self) {
         crate::gate::new_round();
-        self.ui.global::<ui::Settings>().set_lidarr_signing_in(false);
         let session = self.gate.replace(None);
         let on_file = config::load_secret(&self.paths, "lidarr-token");
         let service = self.settings.borrow().lidarr_gate.clone();
@@ -1005,12 +1027,12 @@ impl Controller {
         });
     }
 
-    fn sign_out_requests(self: &Rc<Self>) {
+    fn sign_out_requests(&self) {
         self.drop_sign_in();
         self.save_settings();
         self.connect_requests();
         self.push_settings();
-        self.requests_status("Signed out.");
+        self.requests_state("sign-in", &format!("Signed out. {}", self.behind_sign_in()));
     }
 
     /// A card for an album that isn't in the library was clicked: ask whether to request it.
@@ -1610,6 +1632,10 @@ impl Controller {
                 view.set_loading(false);
                 view.set_error("".into());
                 self.refresh_cache_size();
+                // Show how the connection to Lidarr stands now, unless a sign-in is under way.
+                if self.ui.global::<ui::Settings>().get_requests_state() != "waiting" {
+                    self.check_requests(false);
+                }
                 return;
             }
             Route::Lyrics | Route::NowPlaying => {
@@ -2438,7 +2464,7 @@ impl Controller {
         page.set_sync(settings.sync);
         page.set_requests(settings.requests);
         page.set_lidarr_address(settings.lidarr_address.as_str().into());
-        page.set_lidarr_has_key(config::load_secret(&self.paths, "lidarr-key").is_some());
+        page.set_lidarr_key_hint(config::load_secret(&self.paths, "lidarr-key").map(|key| crate::lidarr::mask(&key)).unwrap_or_default().into());
         let gate = crate::gate::Found { service: settings.lidarr_gate.clone(), client: String::new() };
         page.set_lidarr_gate(gate.host().into());
         page.set_lidarr_signed_in(settings.lidarr_signed_in.as_str().into());
@@ -2784,10 +2810,16 @@ impl Controller {
             with(|ctl| {
                 ctl.change_setting(true, |s| s.requests = on);
                 ctl.connect_requests();
+                if on {
+                    ctl.check_requests(false);
+                }
             });
         });
         settings.on_save_requests(|address, key| {
             with(|ctl| ctl.save_requests(&address, &key));
+        });
+        settings.on_check_requests(|| {
+            with(|ctl| ctl.check_requests(false));
         });
         settings.on_sign_in_requests(|| {
             with(|ctl| ctl.sign_in_requests());

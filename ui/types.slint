@@ -460,18 +460,21 @@ export global Settings {
     // Asking a Lidarr server for albums that aren't in the library.
     in property <bool> requests;
     in property <string> lidarr-address;
-    // An API key is on file.
-    in property <bool> lidarr-has-key;
+    // The API key on file, as dots and its last few characters; empty if there's none.
+    in property <string> lidarr-key-hint;
     // The sign-in service in front of Lidarr, if one was found ("auth.example.org"); whether
-    // this PC is signed in to it, as whom, and whether a sign-in is waiting on the browser.
+    // this PC is signed in to it, and as whom.
     in property <string> lidarr-gate;
     in property <bool> lidarr-has-token;
     in property <string> lidarr-signed-in;
-    in property <bool> lidarr-signing-in;
-    // How the last check of the connection went, in words.
+    // Where the connection stands: "none", "checking", "connected", "sign-in" (a sign-in is
+    // needed), "waiting" (on the browser) or "error"; and the same in words.
+    in property <string> requests-state: "none";
     in property <string> requests-status;
     callback set-requests(on: bool);
+    // Saves the address and key and connects, going on to the sign-in if one is needed.
     callback save-requests(address: string, key: string);
+    callback check-requests();
     callback sign-in-requests();
     callback cancel-sign-in();
     callback sign-out-requests();

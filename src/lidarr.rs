@@ -102,6 +102,14 @@ pub fn tidy(address: &str) -> String {
     if address.is_empty() || address.contains("://") { address.to_string() } else { format!("http://{address}") }
 }
 
+/// A key for showing: dots, then its last six characters, enough to tell which key it is.
+/// A key too short for that to be safe is all dots.
+pub fn mask(key: &str) -> String {
+    let letters: Vec<char> = key.trim().chars().collect();
+    let shown = if letters.len() >= 16 { letters[letters.len() - 6..].iter().collect() } else { String::new() };
+    format!("{}{shown}", "•".repeat(if shown.is_empty() { 16 } else { 10 }))
+}
+
 /// Whether this is a plain studio album: the kind this feature deals in.
 fn is_album(album: &AlbumRes) -> bool {
     album.album_type.eq_ignore_ascii_case("album") && album.secondary_types.is_empty()
@@ -363,6 +371,13 @@ mod tests {
         assert_eq!(tidy(" https://lidarr.example.org/ "), "https://lidarr.example.org");
         assert_eq!(tidy("192.168.1.5:8686"), "http://192.168.1.5:8686");
         assert_eq!(tidy(""), "");
+    }
+
+    #[test]
+    fn masks_keys() {
+        assert_eq!(mask("1565b829294744838c094584fd123456"), "••••••••••123456");
+        assert_eq!(mask(" 1565b829294744838c094584fd123456\n"), "••••••••••123456");
+        assert_eq!(mask("short-key"), "••••••••••••••••");
     }
 
     #[test]

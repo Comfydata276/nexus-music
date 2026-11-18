@@ -1876,96 +1876,154 @@ export component SettingsPage inherits Rectangle {
                             }
                         }
 
-                        if Settings.requests: VerticalLayout {
-                            spacing: 8px;
+                        if Settings.requests: lidarr-box := VerticalLayout {
+                            // Something typed that hasn't been saved.
+                            property <bool> edited: lidarr-address.text != Settings.lidarr-address || lidarr-key.text != "";
+                            property <bool> can-connect: lidarr-address.text != "" && (lidarr-key.text != "" || Settings.lidarr-key-hint != "");
+                            function connect() {
+                                if self.can-connect {
+                                    Settings.save-requests(lidarr-address.text, lidarr-key.text);
+                                    lidarr-key.text = "";
+                                    lidarr-address.text = Settings.lidarr-address;
+                                }
+                            }
+                            spacing: 12px;
                             padding-top: 4px;
-
-                            Text {
-                                text: "Lidarr's address";
-                                color: Theme.text;
-                                font-size: 13px;
-                                font-weight: 600;
-                            }
-
-                            lidarr-address := Field {
-                                text: Settings.lidarr-address;
-                                placeholder: "https://lidarr.example.org";
-                                label: "Lidarr's address";
-                            }
-
-                            Text {
-                                text: "API key";
-                                color: Theme.text;
-                                font-size: 13px;
-                                font-weight: 600;
-                            }
-
-                            lidarr-key := Field {
-                                input-type: InputType.password;
-                                placeholder: Settings.lidarr-has-key ? "On file. Type a new one to replace it." : "In Lidarr: Settings, General, API Key";
-                                label: "Lidarr API key";
-                            }
 
                             HorizontalLayout {
                                 spacing: 12px;
-                                padding-top: 4px;
-                                alignment: start;
 
-                                TextButton {
-                                    text: "Save and check";
-                                    clicked => {
-                                        Settings.save-requests(lidarr-address.text, lidarr-key.text);
-                                        lidarr-key.text = "";
+                                VerticalLayout {
+                                    spacing: 6px;
+                                    horizontal-stretch: 3;
+
+                                    Text {
+                                        text: "Lidarr's address";
+                                        color: Theme.text;
+                                        font-size: 13px;
+                                        font-weight: 600;
+                                    }
+
+                                    lidarr-address := Field {
+                                        text: Settings.lidarr-address;
+                                        placeholder: "https://lidarr.example.org";
+                                        label: "Lidarr's address";
+                                        accepted => { lidarr-box.connect(); }
                                     }
                                 }
 
-                                Text {
-                                    text: Settings.requests-status;
-                                    color: Theme.muted;
-                                    font-size: 13px;
-                                    vertical-alignment: center;
-                                    wrap: word-wrap;
+                                VerticalLayout {
+                                    spacing: 6px;
+                                    horizontal-stretch: 2;
+
+                                    Text {
+                                        text: "API key";
+                                        color: Theme.text;
+                                        font-size: 13px;
+                                        font-weight: 600;
+                                    }
+
+                                    lidarr-key := Field {
+                                        input-type: InputType.password;
+                                        placeholder: Settings.lidarr-key-hint != "" ? Settings.lidarr-key-hint : "In Lidarr: Settings, General";
+                                        placeholder-ink: Settings.lidarr-key-hint != "" ? Theme.muted : Theme.faint;
+                                        label: "Lidarr API key";
+                                        accepted => { lidarr-box.connect(); }
+                                    }
                                 }
                             }
 
-                            // Only once a sign-in has been found in front of Lidarr.
-                            if Settings.lidarr-gate != "": VerticalLayout {
-                                spacing: 8px;
-                                padding-top: 8px;
-
-                                Text {
-                                    text: "Sign-in in front of Lidarr";
-                                    color: Theme.text;
-                                    font-size: 13px;
-                                    font-weight: 600;
-                                }
-
-                                Text {
-                                    text: Settings.lidarr-has-token
-                                        ? (Settings.lidarr-signed-in != "" ? "Signed in as " + Settings.lidarr-signed-in : "Signed in") + " at " + Settings.lidarr-gate + ". Your password isn't kept: this PC holds a token from that sign-in, and signing out hands it back."
-                                        : "Lidarr is behind the sign-in at " + Settings.lidarr-gate + ". Sign in there in your browser. Your password isn't typed into this app or kept by it.";
-                                    color: Theme.muted;
-                                    font-size: 13px;
-                                    wrap: word-wrap;
-                                }
+                            // Where things stand, and the one thing to do next.
+                            Rectangle {
+                                background: Theme.raised;
+                                border-radius: 10px;
+                                border-width: 1px;
+                                border-color: Theme.line;
 
                                 HorizontalLayout {
+                                    padding: 14px;
+                                    padding-left: 16px;
                                     spacing: 12px;
-                                    alignment: start;
 
-                                    if !Settings.lidarr-has-token && !Settings.lidarr-signing-in: TextButton {
-                                        text: "Sign in with browser";
-                                        clicked => { Settings.sign-in-requests(); }
+                                    VerticalLayout {
+                                        alignment: start;
+                                        padding-top: 5px;
+
+                                        Rectangle {
+                                            width: 10px;
+                                            height: 10px;
+                                            border-radius: 5px;
+                                            background: Settings.requests-state == "connected" ? #4cc38a
+                                                : Settings.requests-state == "error" ? Theme.danger
+                                                : Settings.requests-state == "none" ? Theme.faint
+                                                : Theme.warm;
+                                            animate background { duration: 150ms; }
+                                        }
                                     }
 
-                                    if Settings.lidarr-signing-in: TextButton {
-                                        text: "Cancel";
-                                        clicked => { Settings.cancel-sign-in(); }
+                                    VerticalLayout {
+                                        alignment: center;
+                                        spacing: 4px;
+                                        horizontal-stretch: 1;
+
+                                        Text {
+                                            text: Settings.requests-status;
+                                            color: Theme.text;
+                                            font-size: 14px;
+                                            font-weight: 500;
+                                            wrap: word-wrap;
+                                        }
+
+                                        if Settings.lidarr-has-token: Text {
+                                            text: (Settings.lidarr-signed-in != "" ? "Signed in as " + Settings.lidarr-signed-in : "Signed in") + " at " + Settings.lidarr-gate + ". This PC keeps a token from that sign-in, not your password.";
+                                            color: Theme.muted;
+                                            font-size: 13px;
+                                            wrap: word-wrap;
+                                        }
+
+                                        if !Settings.lidarr-has-token && (Settings.requests-state == "sign-in" || Settings.requests-state == "waiting"): Text {
+                                            text: "You sign in on its own page, in your browser. Your password isn't typed into this app or kept by it.";
+                                            color: Theme.muted;
+                                            font-size: 13px;
+                                            wrap: word-wrap;
+                                        }
+
+                                        if Settings.lidarr-has-token && Settings.requests-state != "waiting": HorizontalLayout {
+                                            alignment: start;
+
+                                            LinkText {
+                                                text: "Sign out";
+                                                ink: Theme.accent-bright;
+                                                clicked => { Settings.sign-out-requests(); }
+                                            }
+                                        }
                                     }
 
-                                    if Settings.lidarr-has-token && !Settings.lidarr-signing-in: TextButton {
-                                        text: "Sign out";
-                                        clicked => { Settings.sign-out-requests(); }
+                                    VerticalLayout {
+                                        alignment: center;
+
+                                        if Settings.requests-state == "waiting": TextButton {
+                                            text: "Cancel";
+                                            clicked => { Settings.cancel-sign-in(); }
+                                        }
+
+                                        if Settings.requests-state != "waiting" && (lidarr-box.edited || Settings.requests-state == "none"): TextButton {
+                                            text: "Connect";
+                                            primary: true;
+                                            enabled: lidarr-box.can-connect;
+                                            clicked => { lidarr-box.connect(); }
+                                        }
+
+                                        if !lidarr-box.edited && Settings.requests-state == "sign-in": TextButton {
+                                            text: "Sign in with browser";
+                                            primary: true;
+                                            clicked => { Settings.sign-in-requests(); }
+                                        }
+
+                                        if !lidarr-box.edited && Settings.requests-state == "error": TextButton {
+                                            text: "Try again";
+                                            clicked => { Settings.check-requests(); }
+                                        }
                                     }
                                 }
                             }
