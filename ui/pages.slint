@@ -1906,29 +1906,6 @@ export component SettingsPage inherits Rectangle {
                                 label: "Lidarr API key";
                             }
 
-                            Text {
-                                text: "Sign-in in front of Lidarr, if it has one";
-                                color: Theme.text;
-                                font-size: 13px;
-                                font-weight: 600;
-                            }
-
-                            HorizontalLayout {
-                                spacing: 8px;
-
-                                lidarr-name := Field {
-                                    text: Settings.lidarr-sign-in;
-                                    placeholder: "Name";
-                                    label: "Sign-in name";
-                                }
-
-                                lidarr-password := Field {
-                                    input-type: InputType.password;
-                                    placeholder: Settings.lidarr-has-password ? "On file" : "Password";
-                                    label: "Sign-in password";
-                                }
-                            }
-
                             HorizontalLayout {
                                 spacing: 12px;
                                 padding-top: 4px;
@@ -1937,9 +1914,8 @@ export component SettingsPage inherits Rectangle {
                                 TextButton {
                                     text: "Save and check";
                                     clicked => {
-                                        Settings.save-requests(lidarr-address.text, lidarr-key.text, lidarr-name.text, lidarr-password.text);
+                                        Settings.save-requests(lidarr-address.text, lidarr-key.text);
                                         lidarr-key.text = "";
-                                        lidarr-password.text = "";
                                     }
                                 }
 
@@ -1949,6 +1925,48 @@ export component SettingsPage inherits Rectangle {
                                     font-size: 13px;
                                     vertical-alignment: center;
                                     wrap: word-wrap;
+                                }
+                            }
+
+                            // Only once a sign-in has been found in front of Lidarr.
+                            if Settings.lidarr-gate != "": VerticalLayout {
+                                spacing: 8px;
+                                padding-top: 8px;
+
+                                Text {
+                                    text: "Sign-in in front of Lidarr";
+                                    color: Theme.text;
+                                    font-size: 13px;
+                                    font-weight: 600;
+                                }
+
+                                Text {
+                                    text: Settings.lidarr-has-token
+                                        ? (Settings.lidarr-signed-in != "" ? "Signed in as " + Settings.lidarr-signed-in : "Signed in") + " at " + Settings.lidarr-gate + ". Your password isn't kept: this PC holds a token from that sign-in, and signing out hands it back."
+                                        : "Lidarr is behind the sign-in at " + Settings.lidarr-gate + ". Sign in there in your browser. Your password isn't typed into this app or kept by it.";
+                                    color: Theme.muted;
+                                    font-size: 13px;
+                                    wrap: word-wrap;
+                                }
+
+                                HorizontalLayout {
+                                    spacing: 12px;
+                                    alignment: start;
+
+                                    if !Settings.lidarr-has-token && !Settings.lidarr-signing-in: TextButton {
+                                        text: "Sign in with browser";
+                                        clicked => { Settings.sign-in-requests(); }
+                                    }
+
+                                    if Settings.lidarr-signing-in: TextButton {
+                                        text: "Cancel";
+                                        clicked => { Settings.cancel-sign-in(); }
+                                    }
+
+                                    if Settings.lidarr-has-token && !Settings.lidarr-signing-in: TextButton {
+                                        text: "Sign out";
+                                        clicked => { Settings.sign-out-requests(); }
+                                    }
                                 }
                             }
                         }

@@ -294,6 +294,15 @@ pub fn normalize_server_url(input: &str) -> String {
 const API_TIMEOUT: Duration = Duration::from_secs(45);
 
 pub(crate) fn make_agent() -> ureq::Agent {
+    agent_following(10)
+}
+
+/// For callers that need to see where a redirect points instead of being taken there.
+pub(crate) fn make_agent_without_redirects() -> ureq::Agent {
+    agent_following(0)
+}
+
+fn agent_following(redirects: u32) -> ureq::Agent {
     use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
     use ureq::unversioned::transport::DefaultConnector;
     let tls = TlsConfig::builder()
@@ -303,6 +312,8 @@ pub(crate) fn make_agent() -> ureq::Agent {
     let config = ureq::Agent::config_builder()
         .tls_config(tls)
         .http_status_as_error(false)
+        .max_redirects(redirects)
+        .max_redirects_will_error(false)
         .no_delay(true)
         .timeout_connect(Some(Duration::from_secs(8)))
         .timeout_recv_response(Some(Duration::from_secs(30)))

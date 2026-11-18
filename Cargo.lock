@@ -3158,12 +3158,13 @@ dependencies = [
 
 [[package]]
 name = "nexus-music"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "chrono",
  "cpal",
  "directories",
  "fastrand",
+ "getrandom 0.3.4",
  "image",
  "keyring",
  "md-5",

@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::subsonic::Song;
 
+#[derive(Clone)]
 pub struct Paths {
     pub settings: PathBuf,
     pub queue: PathBuf,
@@ -126,7 +127,12 @@ pub struct Settings {
     /// are kept with the account password, not here.)
     pub requests: bool,
     pub lidarr_address: String,
-    pub lidarr_sign_in: String,
+    /// The sign-in service in front of Lidarr, if there is one: where it is and the name it
+    /// knows Lidarr's sign-in by. Found by asking, not typed in.
+    pub lidarr_gate: String,
+    pub lidarr_gate_client: String,
+    /// Who is signed in there, for showing. The token itself is kept with the passwords.
+    pub lidarr_signed_in: String,
     /// Share the queue, pins and so on with the app on other devices.
     pub sync: bool,
     /// A made-up name for this device, so it can tell its own saved queue from others'.
@@ -180,7 +186,9 @@ impl Default for Settings {
             lists: std::collections::HashMap::new(),
             requests: false,
             lidarr_address: String::new(),
-            lidarr_sign_in: String::new(),
+            lidarr_gate: String::new(),
+            lidarr_gate_client: String::new(),
+            lidarr_signed_in: String::new(),
             sync: true,
             device_id: String::new(),
             sync_playlist: String::new(),

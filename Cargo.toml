@@ -1,6 +1,6 @@
 [package]
 name = "nexus-music"
-version = "0.13.0"
+version = "0.14.0"
 edition = "2024"
 description = "A fast native music player for Navidrome"
 publish = false
@@ -25,6 +25,7 @@ md-5 = "0.11"
 sha2 = "0.11"
 directories = "6"
 fastrand = "2"
+getrandom = "0.3"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [target.'cfg(windows)'.dependencies]

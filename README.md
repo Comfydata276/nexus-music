@@ -21,7 +21,7 @@ by the app itself.
 - Find and sort within a playlist or Liked songs: click a column heading to sort by it, including the date each song was added.
 - Shuffle is set per playlist or album and remembered.
 - Brings playlists over from Spotify: choose the files you exported (CSV from a tool such as Exportify, or Spotify's own data download) and it matches each song to your library, builds the playlists, and lists what it couldn't find.
-- Optional, off by default: if you run Lidarr beside your music server, search results gain a "Not in your library" row. Choosing an album there puts it on Lidarr's list, and a Requests page shows what is on its way. Whole albums only; where Lidarr gets them from is set up in Lidarr.
+- Optional, off by default: if you run Lidarr beside your music server, search results gain a "Not in your library" row. Choosing an album there puts it on Lidarr's list, and a Requests page shows what is on its way. Whole albums only; where Lidarr gets them from is set up in Lidarr. If Lidarr sits behind an Authentik sign-in, you sign in with your browser and the app keeps only a token (see below).
 - A "Made for you" row on Home, built from your listening: On repeat, Your top songs, Rediscover and mixes of the genres you play most.
 - Keeps your devices in step: the queue and your place in it, Recently played, pinned playlists, each list's shuffle and sort, the dates songs were added and the theme follow you to the app on another PC. The queue uses the server's saved-queue feature; the rest is kept in the comment of a playlist named "Nexus Music sync".
 - Select several songs with Ctrl or Shift, then drag them onto a playlist or the queue, or
@@ -60,6 +60,28 @@ by the app itself.
 Keyboard: Space plays or pauses, Ctrl+Left/Right changes track, Ctrl+Up/Down changes
 volume, Ctrl+K jumps to search, Ctrl+, opens Settings, Alt+Left/Right goes back and forward,
 F5 reloads the page.
+
+### Requests when Lidarr is behind Authentik
+
+If Lidarr's address answers with an [Authentik](https://goauthentik.io) sign-in instead of
+Lidarr, "Save and check" notices and offers **Sign in with browser**. You sign in on
+Authentik's own page, with whatever second step it asks for, and the browser hands the app a
+token. No name or password is typed into the app or kept by it. The token is kept in the
+Windows credential store, is replaced each time it's used, and is handed back when you sign
+out. It lasts for as long as the app is opened now and then within the lifetime Authentik
+gives refresh tokens.
+
+Authentik needs three things set up once:
+
+1. An OAuth2/OpenID provider for the app: public client, client ID `nexus-music`, redirect
+   URI `http://127\.0\.0\.1:\d+/callback` (regular expression), grant types Authorization
+   Code and Refresh Token, scopes `openid`, `profile` and `offline_access`. Give it an
+   application, limited to the people who may use Lidarr.
+2. On the proxy provider in front of Lidarr, add that provider under Federated OIDC
+   Providers. Who may use Lidarr is still decided by the Lidarr application's own bindings.
+3. The reverse proxy has to pass the `Authorization` header on to Authentik's outpost for
+   Lidarr's host. With that header passed, Authentik also accepts tokens made from a user's
+   app password for that host, so only do this where that is acceptable.
 
 ## Installing
 
@@ -140,6 +162,8 @@ connection.
 | `src/actions.rs` | Context menus, likes, playlist edits. |
 | `src/covers.rs` | Cover art cache, on disk and in memory. |
 | `src/media.rs` | Windows media keys and now-playing overlay. |
+| `src/lidarr.rs` | Asking a Lidarr server for albums (optional). |
+| `src/gate.rs` | Browser sign-in for a Lidarr that sits behind Authentik. |
 | `src/update.rs` | Finds, downloads and verifies new releases. |
 | `src/downloads.rs` | Songs saved for offline listening. |
 | `src/offline.rs` | Offline mode and changes held until the server is reachable. |

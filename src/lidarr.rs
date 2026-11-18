@@ -6,7 +6,7 @@
 //! getting on. Where Lidarr gets albums from is its own business and set up there.
 
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -19,8 +19,8 @@ const LEARN_ARTIST: Duration = Duration::from_secs(90);
 pub struct Lidarr {
     base: String,
     key: String,
-    /// For a sign-in that sits in front of Lidarr: the value of an `Authorization` header.
-    proxy: Option<String>,
+    /// The sign-in that sits in front of Lidarr, if there is one and it's been signed in to.
+    gate: Option<Arc<crate::gate::Session>>,
     agent: ureq::Agent,
 }
 
@@ -96,18 +96,10 @@ struct QueueItem {
     sizeleft: f64,
 }
 
-/// Standard base64, for the sign-in header.
-fn base64(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let n = (chunk[0] as u32) << 16 | (*chunk.get(1).unwrap_or(&0) as u32) << 8 | *chunk.get(2).unwrap_or(&0) as u32;
-        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
-        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 { ALPHABET[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if chunk.len() > 2 { ALPHABET[n as usize & 63] as char } else { '=' });
-    }
-    out
+/// An address as typed, made into one that can be called.
+pub fn tidy(address: &str) -> String {
+    let address = address.trim().trim_end_matches('/');
+    if address.is_empty() || address.contains("://") { address.to_string() } else { format!("http://{address}") }
 }
 
 /// Whether this is a plain studio album: the kind this feature deals in.
@@ -128,47 +120,64 @@ fn offer(album: AlbumRes) -> Offer {
 }
 
 impl Lidarr {
-    /// `address` is where Lidarr is, e.g. "https://lidarr.example.org". `sign_in` is a name
-    /// and password for a login that sits in front of it, if there is one.
-    pub fn new(address: &str, key: &str, sign_in: Option<(&str, &str)>) -> Lidarr {
-        let address = address.trim().trim_end_matches('/');
-        let base = if address.contains("://") { address.to_string() } else { format!("http://{address}") };
-        Lidarr {
-            base,
-            key: key.trim().to_string(),
-            proxy: sign_in.map(|(name, password)| format!("Basic {}", base64(format!("{name}:{password}").as_bytes()))),
-            agent: crate::subsonic::make_agent(),
-        }
+    /// `address` is where Lidarr is, e.g. "https://lidarr.example.org". `gate` is the
+    /// sign-in in front of it, if there is one.
+    pub fn new(address: &str, key: &str, gate: Option<Arc<crate::gate::Session>>) -> Lidarr {
+        // Redirects aren't followed: Lidarr's own answers never are one, and a sign-in in
+        // front of it shows itself by sending one.
+        Lidarr { base: tidy(address), key: key.trim().to_string(), gate, agent: crate::subsonic::make_agent_without_redirects() }
+    }
+
+    /// One request, as it went: the status and what came back.
+    fn once(&self, method: &str, url: &str, body: Option<&str>, pass: Option<&str>) -> Result<(u16, String), String> {
+        let unreachable = |e: ureq::Error| format!("Couldn't reach Lidarr. {e}");
+        let response = match body {
+            None => {
+                let mut request = self.agent.get(url).header("X-Api-Key", &self.key);
+                if let Some(pass) = pass {
+                    request = request.header("Authorization", &format!("Bearer {pass}"));
+                }
+                request.call().map_err(unreachable)?
+            }
+            Some(body) => {
+                let request = if method == "PUT" { self.agent.put(url) } else { self.agent.post(url) };
+                let mut request = request.header("X-Api-Key", &self.key).header("Content-Type", "application/json");
+                if let Some(pass) = pass {
+                    request = request.header("Authorization", &format!("Bearer {pass}"));
+                }
+                request.send(body).map_err(unreachable)?
+            }
+        };
+        let status = response.status().as_u16();
+        Ok((status, response.into_body().read_to_string().unwrap_or_default()))
     }
 
     fn send<T: DeserializeOwned>(&self, method: &str, path: &str, body: Option<serde_json::Value>) -> Result<T, String> {
         let url = format!("{}/api/v1/{path}", self.base);
-        let unreachable = |e: ureq::Error| format!("Couldn't reach Lidarr. {e}");
-        let response = match (method, body) {
-            ("GET", _) => {
-                let mut request = self.agent.get(&url).header("X-Api-Key", &self.key);
-                if let Some(proxy) = &self.proxy {
-                    request = request.header("Authorization", proxy);
-                }
-                request.call().map_err(unreachable)?
-            }
-            (method, body) => {
-                let request = if method == "PUT" { self.agent.put(&url) } else { self.agent.post(&url) };
-                let mut request = request.header("X-Api-Key", &self.key).header("Content-Type", "application/json");
-                if let Some(proxy) = &self.proxy {
-                    request = request.header("Authorization", proxy);
-                }
-                request.send(body.unwrap_or(serde_json::Value::Null).to_string()).map_err(unreachable)?
-            }
+        let body = match (method, body) {
+            ("GET", _) => None,
+            (_, body) => Some(body.unwrap_or(serde_json::Value::Null).to_string()),
         };
-        let status = response.status().as_u16();
-        let text = response.into_body().read_to_string().unwrap_or_default();
+        let pass = self.gate.as_ref().map(|gate| gate.pass()).transpose()?;
+        let (mut status, mut text) = self.once(method, &url, body.as_deref(), pass.as_deref())?;
+        if (300..400).contains(&status) {
+            // The sign-in in front turned the pass away; it may only have run out early.
+            if let Some(gate) = &self.gate {
+                gate.forget_pass();
+                let pass = gate.pass()?;
+                (status, text) = self.once(method, &url, body.as_deref(), Some(&pass))?;
+                if (300..400).contains(&status) {
+                    return Err("You're signed in, but the sign-in in front of Lidarr still turned the app away. \
+                                The proxy in front of Lidarr may not be passing the sign-in on."
+                        .into());
+                }
+            }
+        }
         match status {
-            200..=299 => serde_json::from_str(if text.trim().is_empty() { "null" } else { &text }).map_err(|_| {
-                // A sign-in page, most likely: something in front of Lidarr wants a login.
-                "That address answered, but not as Lidarr. If Lidarr sits behind a sign-in, fill in the name and password for it.".to_string()
-            }),
-            401 | 403 => Err("Lidarr turned the request away. Check the API key (and the sign-in, if there's one in front of it).".into()),
+            200..=299 => serde_json::from_str(if text.trim().is_empty() { "null" } else { &text })
+                .map_err(|_| "That address answered, but not as Lidarr. Check the address.".to_string()),
+            300..=399 => Err(crate::gate::NEEDED.into()),
+            401 | 403 => Err("Lidarr turned the request away. Check the API key.".into()),
             _ => Err(format!("Lidarr answered with an error ({status}).")),
         }
     }
@@ -350,12 +359,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn encodes_the_sign_in() {
-        assert_eq!(base64(b""), "");
-        assert_eq!(base64(b"f"), "Zg==");
-        assert_eq!(base64(b"fo"), "Zm8=");
-        assert_eq!(base64(b"foo"), "Zm9v");
-        assert_eq!(base64(b"name:pass word"), "bmFtZTpwYXNzIHdvcmQ=");
+    fn tidies_addresses() {
+        assert_eq!(tidy(" https://lidarr.example.org/ "), "https://lidarr.example.org");
+        assert_eq!(tidy("192.168.1.5:8686"), "http://192.168.1.5:8686");
+        assert_eq!(tidy(""), "");
     }
 
     #[test]

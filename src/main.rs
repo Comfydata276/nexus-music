@@ -11,6 +11,7 @@ mod downloads;
 mod import;
 #[cfg(windows)]
 mod frame;
+mod gate;
 #[cfg(windows)]
 mod instance;
 #[cfg(windows)]
