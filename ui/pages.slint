@@ -1273,15 +1273,42 @@ export component GridPage inherits Rectangle {
 }
 
 export component LyricsPage inherits Rectangle {
+    // Nothing to show: say so in the middle of the page, as the page's whole content.
     if Lyrics.lines.length == 0: VerticalLayout {
         alignment: center;
-        spacing: 12px;
+        padding: 48px;
+        spacing: 10px;
+
+        HorizontalLayout {
+            alignment: center;
+            padding-bottom: 8px;
+            Rectangle {
+                width: 72px;
+                height: 72px;
+                border-radius: 36px;
+                background: Theme.raised;
+                Icon {
+                    source: Icons.mic-vocal;
+                    size: 30px;
+                    tint: Theme.faint;
+                }
+            }
+        }
+
         Text {
             text: Lyrics.status;
-            color: Theme.muted;
+            color: Theme.text;
             font-family: Theme.display;
-            font-size: 24px;
+            font-size: 26px;
             font-weight: 700;
+            horizontal-alignment: center;
+            wrap: word-wrap;
+        }
+
+        if Lyrics.note != "": Text {
+            text: Lyrics.note;
+            color: Theme.muted;
+            font-size: 15px;
             horizontal-alignment: center;
             wrap: word-wrap;
         }

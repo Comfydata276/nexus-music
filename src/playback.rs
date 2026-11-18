@@ -1658,6 +1658,7 @@ impl Controller {
             *self.lyrics.borrow_mut() = LyricsState::default();
             lyrics.set_lines(ModelRc::default());
             lyrics.set_status("Play a song to see its lyrics".into());
+            lyrics.set_note("".into());
             return;
         };
         if self.lyrics.borrow().song_id == song.id {
@@ -1672,6 +1673,7 @@ impl Controller {
             None => {
                 lyrics.set_lines(ModelRc::default());
                 lyrics.set_status("Looking for lyrics…".into());
+                lyrics.set_note("".into());
             }
         }
         // The server is asked all the same: for a first look, or in case they've changed.
@@ -1749,7 +1751,17 @@ impl Controller {
     fn show_lyrics(self: &Rc<Self>, found: Option<Lyrics>) {
         let lyrics = self.ui.global::<ui::Lyrics>();
         let Some(found) = found else {
+            // Whatever was on screen belonged to another song: take it away.
+            {
+                let mut state = self.lyrics.borrow_mut();
+                state.times.clear();
+                state.active = -1;
+            }
+            lyrics.set_lines(ModelRc::default());
+            lyrics.set_timed(false);
+            lyrics.set_active(-1);
             lyrics.set_status("No lyrics for this song".into());
+            lyrics.set_note("Your music server doesn't have any for it.".into());
             return;
         };
         let timed = found.synced && found.line.iter().all(|l| l.start.is_some());

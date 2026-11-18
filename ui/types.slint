@@ -419,7 +419,9 @@ export global Lyrics {
     in property <[LyricLine]> lines;
     in property <bool> timed;
     in property <int> active: -1;
+    // What to say when there are no lines to show, and a line of explanation beneath it.
     in property <string> status;
+    in property <string> note;
 }
 
 export struct QualityOption {
