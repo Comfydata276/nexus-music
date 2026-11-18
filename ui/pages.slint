@@ -588,7 +588,7 @@ component OfferRow inherits Rectangle {
                 text: root.offer.artist;
                 enabled: root.offer.artist-id != "";
                 clicked => {
-                    View.card-activated({ kind: CardKind.outside-artist, id: root.offer.artist-id, title: root.offer.artist-name });
+                    View.card-activated({ kind: root.offer.song != "" ? CardKind.artist : CardKind.outside-artist, id: root.offer.artist-id, title: root.offer.artist-name });
                 }
             }
         }
@@ -601,7 +601,13 @@ component OfferRow inherits Rectangle {
 
             LinkText {
                 text: root.offer.about;
-                clicked => { root.activated(); }
+                clicked => {
+                    if root.offer.song != "" {
+                        View.card-activated({ kind: CardKind.album, id: root.offer.album, title: root.offer.album-title, subtitle: root.offer.artist-name, cover: root.offer.cover });
+                    } else {
+                        root.activated();
+                    }
+                }
             }
         }
 
@@ -623,7 +629,8 @@ component OfferRow inherits Rectangle {
                 icon: root.offer.requested ? Icons.check : Icons.plus;
                 icon-size: 20px;
                 tint: root.offer.requested ? Theme.accent-bright : Theme.muted;
-                label: root.offer.requested ? "“" + root.offer.album-title + "” has been asked for" : "Request “" + root.offer.album-title + "”";
+                label: root.offer.song != "" ? (root.offer.requested ? "Added to this playlist" : "Add to this playlist")
+                    : root.offer.requested ? "“" + root.offer.album-title + "” has been asked for" : "Request “" + root.offer.album-title + "”";
                 clicked => { root.request(); }
             }
         }
@@ -803,6 +810,40 @@ export component StackPage inherits Rectangle {
                         primary: true;
                         text: View.action;
                         clicked => { View.action-clicked(); }
+                    }
+                }
+            }
+
+            // A page of figures: each a large number over what it counts.
+            if View.stats.length > 0: HorizontalLayout {
+                padding-left: Theme.page-pad;
+                padding-right: Theme.page-pad;
+                padding-bottom: 12px;
+                spacing: 12px;
+                for stat in View.stats: Rectangle {
+                    horizontal-stretch: 1;
+                    height: 92px;
+                    border-radius: 10px;
+                    background: Theme.raised;
+                    VerticalLayout {
+                        padding-left: 18px;
+                        padding-right: 12px;
+                        alignment: center;
+                        spacing: 2px;
+                        Text {
+                            text: stat.value;
+                            color: Theme.text;
+                            font-family: Theme.display;
+                            font-size: 30px;
+                            font-weight: 800;
+                            overflow: elide;
+                        }
+                        Text {
+                            text: stat.label;
+                            color: Theme.muted;
+                            font-size: 13px;
+                            overflow: elide;
+                        }
                     }
                 }
             }
@@ -1064,10 +1105,65 @@ export component TrackListPage inherits Rectangle {
             x: 0;
             y: root.header-height + root.rows-height;
             width: scroll.visible-width;
+            // It's as tall as the sheet, so what's in it is kept together at the top.
+            alignment: start;
             padding-top: View.shelves.length > 0 ? 24px : 0px;
             padding-bottom: 32px;
             for shelf in View.shelves: ShelfView {
                 shelf: shelf;
+            }
+
+            // Songs that would suit the playlist, each with a button to add it.
+            if View.offers.length > 0: VerticalLayout {
+                padding-top: 28px;
+
+                Rectangle {
+                    height: 1px;
+                    HorizontalLayout {
+                        padding-left: Theme.page-pad;
+                        padding-right: Theme.page-pad;
+                        Rectangle { background: Theme.line; }
+                    }
+                }
+
+                HorizontalLayout {
+                    padding-top: 12px;
+                    padding-right: Theme.page-pad;
+                    SectionTitle {
+                        horizontal-stretch: 1;
+                        text: View.offers-heading;
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        LinkText {
+                            text: "Refresh";
+                            font-weight: 600;
+                            clicked => { View.offers-refresh(); }
+                        }
+                    }
+                }
+
+                HorizontalLayout {
+                    padding-left: Theme.page-pad;
+                    padding-right: Theme.page-pad;
+                    padding-bottom: 8px;
+                    Text {
+                        text: View.offers-note;
+                        color: Theme.muted;
+                        font-size: 13px;
+                        wrap: word-wrap;
+                    }
+                }
+            }
+
+            for offer[index] in View.offers: HorizontalLayout {
+                padding-left: 12px;
+                padding-right: 12px;
+                OfferRow {
+                    offer: offer;
+                    activated => { View.offer-activated(index); }
+                    request => { View.offer-request(index); }
+                }
             }
         }
     }
@@ -1943,6 +2039,16 @@ export component SettingsPage inherits Rectangle {
                                 on: Settings.scrobble;
                                 label: "Report plays to Navidrome";
                                 toggled(on) => { Settings.set-scrobble(on); }
+                            }
+                        }
+
+                        SettingRow {
+                            title: "Find lyrics online";
+                            detail: "When your server has no lyrics for a song, gets them from LRCLIB, a free lyrics collection, and keeps them on this PC. Your whole library is looked up in the background, which takes a few hours the first time, so LRCLIB is sent each song's title, artist, album and length." + (Settings.lyrics-status != "" ? "\n" + Settings.lyrics-status : "");
+                            Toggle {
+                                on: Settings.online-lyrics;
+                                label: "Find lyrics online";
+                                toggled(on) => { Settings.set-online-lyrics(on); }
                             }
                         }
                     }

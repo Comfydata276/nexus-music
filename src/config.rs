@@ -27,6 +27,10 @@ pub struct Paths {
     pub asked: PathBuf,
     /// Artists worth a look, as last worked out (see `discover`).
     pub discover: PathBuf,
+    /// Lyrics fetched for songs the server has none for (see `lyrics`).
+    pub lyrics: PathBuf,
+    /// Every play and when it happened (see `plays`).
+    pub plays: PathBuf,
     #[cfg(not(windows))]
     secret: PathBuf,
 }
@@ -63,6 +67,8 @@ impl Paths {
             buffers: cache.join("buffers"),
             songs: cache.join("songs"),
             downloads: data.join("downloads"),
+            lyrics: data.join("lyrics"),
+            plays: config.join("plays.json"),
             #[cfg(not(windows))]
             secret: config.join("credential"),
         };
@@ -138,6 +144,8 @@ pub struct Settings {
     /// many songs past the one playing are fetched ahead of time.
     pub cache_limit_mb: u32,
     pub cache_ahead: u32,
+    /// Lyrics the server doesn't have are looked up at LRCLIB and kept (see `lyrics`).
+    pub online_lyrics: bool,
     pub requests: bool,
     /// Songs that never came out on an album are offered too, on their EP or single.
     pub request_singles: bool,
@@ -201,6 +209,7 @@ impl Default for Settings {
             lists: std::collections::HashMap::new(),
             cache_limit_mb: 2048,
             cache_ahead: 3,
+            online_lyrics: false,
             requests: false,
             request_singles: true,
             lidarr_address: String::new(),

@@ -63,6 +63,8 @@ pub enum Route {
     Mix(String),
     /// Albums that have been asked for and haven't arrived.
     Requests,
+    /// What's been played most, over one of `pages::STATS_PERIODS`.
+    Stats(usize),
     /// An artist as the wider world knows them, by MusicBrainz's name for them: all their
     /// albums, in the library or not.
     OutsideArtist(String),
@@ -92,6 +94,7 @@ impl Route {
             "import" => Route::Import,
             "mix" => Route::Mix(rest.to_string()),
             "requests" => Route::Requests,
+            "stats" => Route::Stats(rest.parse().unwrap_or(0)),
             "outside-artist" => Route::OutsideArtist(rest.to_string()),
             "outside-album" => Route::OutsideAlbum(rest.to_string()),
             _ => return None,
@@ -119,6 +122,7 @@ impl Route {
             Route::Import => "import".into(),
             Route::Mix(id) => format!("mix:{id}"),
             Route::Requests => "requests".into(),
+            Route::Stats(_) => "stats".into(),
             Route::OutsideArtist(id) => format!("outside-artist:{id}"),
             Route::OutsideAlbum(id) => format!("outside-album:{id}"),
         }
@@ -129,6 +133,7 @@ impl Route {
         match self {
             Route::Search(query) => format!("search:{query}"),
             Route::Albums(sort) => format!("albums:{sort}"),
+            Route::Stats(period) => format!("stats:{period}"),
             other => other.key(),
         }
     }
@@ -136,7 +141,7 @@ impl Route {
     fn page(&self) -> ui::Page {
         match self {
             Route::Home => ui::Page::Home,
-            Route::Search(_) | Route::Import | Route::Requests => ui::Page::Search,
+            Route::Search(_) | Route::Import | Route::Requests | Route::Stats(_) => ui::Page::Search,
             Route::Album(_) | Route::Playlist(_) | Route::Liked | Route::Downloads | Route::Radio | Route::Mix(_) => {
                 ui::Page::Tracklist
             }
@@ -277,6 +282,8 @@ pub struct Controller {
     pub queue_model: Rc<VecModel<ui::Track>>,
     /// Songs that have been played, newest first, including the one playing now.
     pub history: RefCell<Vec<config::Played>>,
+    /// Every play and when, for "Your stats".
+    pub play_log: RefCell<crate::plays::PlayLog>,
     pub history_model: Rc<VecModel<ui::Track>>,
     pub grid_model: Rc<VecModel<ui::CardRow>>,
     pub grid_columns: Cell<usize>,
@@ -363,6 +370,9 @@ pub struct Controller {
     update_busy: Cell<bool>,
     #[cfg(windows)]
     tray: RefCell<Option<ui::Tray>>,
+    /// The small player's window, once it's been opened, and whether it's showing.
+    mini: RefCell<Option<ui::MiniPlayer>>,
+    pub mini_open: Cell<bool>,
 }
 
 impl Controller {
@@ -392,6 +402,10 @@ impl Controller {
             selection: RefCell::default(),
             selection_anchor: Cell::new(None),
             queue_model: Rc::new(VecModel::default()),
+            play_log: RefCell::new({
+                let recent: Vec<(String, i64)> = config::load_history(&paths.history).into_iter().map(|played| (played.song.id, played.at)).collect();
+                crate::plays::PlayLog::load(&paths.plays, &recent)
+            }),
             history: RefCell::new(config::load_history(&paths.history)),
             history_model: Rc::new(VecModel::default()),
             grid_model: Rc::new(VecModel::default()),
@@ -421,6 +435,8 @@ impl Controller {
             import_fills: RefCell::default(),
             asked: RefCell::new({
                 crate::discover::set_place(paths.discover.clone());
+                crate::lyrics::set_place(paths.lyrics.clone());
+                crate::lyrics::start();
                 crate::asked::AskedList::load(&paths.asked)
             }),
             asked_ticks: Cell::new(0),
@@ -453,6 +469,8 @@ impl Controller {
             update_busy: Cell::new(false),
             #[cfg(windows)]
             tray: RefCell::new(None),
+            mini: RefCell::new(None),
+            mini_open: Cell::new(false),
             paths,
             ui,
         });
@@ -626,20 +644,100 @@ impl Controller {
     pub fn apply_theme(&self) {
         let colors = self.settings.borrow().theme();
         let color = |rgb: u32| slint::Color::from_argb_encoded(0xff00_0000 | rgb);
-        let theme = self.ui.global::<ui::Theme>();
-        theme.set_base(color(colors.base));
-        theme.set_panel(color(colors.panel));
-        theme.set_raised(color(colors.raised));
-        theme.set_overlay(color(colors.overlay));
-        theme.set_text(color(colors.text));
-        theme.set_muted(color(colors.muted));
-        theme.set_faint(color(colors.faint));
-        theme.set_accent(color(colors.accent));
-        theme.set_accent_bright(color(colors.accent_bright));
-        theme.set_on_accent(color(colors.on_accent));
-        theme.set_warm(color(colors.warm));
+        let paint = |theme: ui::Theme| {
+            theme.set_base(color(colors.base));
+            theme.set_panel(color(colors.panel));
+            theme.set_raised(color(colors.raised));
+            theme.set_overlay(color(colors.overlay));
+            theme.set_text(color(colors.text));
+            theme.set_muted(color(colors.muted));
+            theme.set_faint(color(colors.faint));
+            theme.set_accent(color(colors.accent));
+            theme.set_accent_bright(color(colors.accent_bright));
+            theme.set_on_accent(color(colors.on_accent));
+            theme.set_warm(color(colors.warm));
+        };
+        paint(self.ui.global::<ui::Theme>());
         #[cfg(windows)]
-        crate::instance::tint_title_bar(&self.ui, colors.base, colors.muted);
+        crate::instance::tint_title_bar(self.ui.window(), colors.base, colors.muted);
+        // The small player is a window of its own, with its own copy of the colours.
+        if let Some(mini) = self.mini.borrow().as_ref() {
+            paint(mini.global::<ui::Theme>());
+            #[cfg(windows)]
+            crate::instance::tint_title_bar(mini.window(), colors.base, colors.muted);
+        }
+    }
+
+    // ---- the small player ----------------------------------------------------------------------
+
+    /// Swaps the window for the small player, which stays on top of other apps.
+    pub fn open_mini(self: &Rc<Self>) {
+        if self.mini.borrow().is_none() {
+            let Ok(mini) = ui::MiniPlayer::new() else { return self.toast("The mini player couldn't be opened.") };
+            mini.on_toggle(|| {
+                with(|ctl| ctl.toggle_play());
+            });
+            mini.on_next(|| {
+                with(|ctl| ctl.next_track());
+            });
+            mini.on_previous(|| {
+                with(|ctl| ctl.previous_track());
+            });
+            mini.on_toggle_star(|| {
+                with(|ctl| ctl.toggle_current_star());
+            });
+            mini.on_expand(|| {
+                with(|ctl| ctl.close_mini());
+            });
+            // Closing it brings the full window back: the app isn't being quit.
+            mini.window().on_close_requested(|| {
+                with(|ctl| ctl.close_mini());
+                slint::CloseRequestResponse::HideWindow
+            });
+            *self.mini.borrow_mut() = Some(mini);
+            self.apply_theme();
+        }
+        self.sync_mini();
+        let shown = self.mini.borrow().as_ref().is_some_and(|mini| mini.show().is_ok());
+        if !shown {
+            return self.toast("The mini player couldn't be opened.");
+        }
+        self.mini_open.set(true);
+        // The colours of its title bar can only be set once it's on screen.
+        self.apply_theme();
+        self.ui.window().set_minimized(true);
+    }
+
+    /// Puts the small player away and brings the full window back.
+    pub fn close_mini(self: &Rc<Self>) {
+        if !self.mini_open.replace(false) {
+            return;
+        }
+        if let Some(mini) = self.mini.borrow().as_ref() {
+            let _ = mini.hide();
+        }
+        self.show_window();
+    }
+
+    /// Tells the small player what's playing and how far through it is. Called four times
+    /// a second while it's open.
+    pub fn sync_mini(&self) {
+        let mini = self.mini.borrow();
+        let Some(mini) = mini.as_ref() else { return };
+        let pb = self.playback.borrow();
+        let song = pb.current();
+        mini.set_has_track(song.is_some());
+        mini.set_playing(pb.playing);
+        mini.set_song(song.map(|song| song.title.as_str()).unwrap_or_default().into());
+        mini.set_artist(song.map(|song| song.artist_label()).unwrap_or_default().into());
+        mini.set_starred(song.is_some_and(|song| self.is_starred(song)));
+        let length = song.map(|song| song.duration as f64).unwrap_or(0.0);
+        mini.set_progress(if length > 0.0 { (pb.position / length) as f32 } else { 0.0 });
+        mini.set_elapsed(if song.is_some() { clock(pb.position as u32).into() } else { "".into() });
+        mini.set_total(if length > 0.0 { clock(length as u32).into() } else { "".into() });
+        // The picture arrives a moment after it's first asked for; asking again finds it.
+        let cover = song.map(|song| song.cover_art.clone()).unwrap_or_default();
+        mini.set_picture(if cover.is_empty() { slint::Image::default() } else { self.covers.get(self, &cover, 200) });
     }
 
     /// Whether closing the window should leave the app running in the notification area.
@@ -1155,6 +1253,33 @@ impl Controller {
         });
     }
 
+    /// Plays a song that's suggested for the playlist on screen, by itself.
+    fn play_suggestion(self: &Rc<Self>, song: &str) {
+        let Some(found) = crate::search::current().and_then(|index| index.library.songs.iter().find(|known| known.id == song).cloned()) else { return };
+        let title = found.title.clone();
+        self.play_songs(vec![found], 0, &title, false);
+    }
+
+    /// Adds a suggested song to the playlist on screen. The row is ticked at once; the
+    /// page then reloads with the song in the list and a fresh suggestion in its place.
+    fn add_suggestion(self: &Rc<Self>, index: usize) {
+        let (playlist, song) = {
+            let mut page = self.page.borrow_mut();
+            let Some(playlist) = page.playlist.as_ref().map(|playlist| playlist.id.clone()) else { return };
+            let Some(offer) = page.offers.get_mut(index).filter(|offer| !offer.requested) else { return };
+            offer.requested = true;
+            (playlist, offer.song.clone())
+        };
+        let Some(found) = crate::search::current().and_then(|index| index.library.songs.iter().find(|known| known.id == song).cloned()) else { return };
+        let view = self.ui.global::<ui::View>();
+        let offers = view.get_offers();
+        if let Some(mut row) = offers.row_data(index) {
+            row.requested = true;
+            offers.set_row_data(index, row);
+        }
+        self.add_to_playlist(playlist, vec![found]);
+    }
+
     /// Asks whether to have Lidarr keep track of the artist whose page this is.
     fn prompt_add_artist(self: &Rc<Self>, artist: String) {
         let (name, albums) = {
@@ -1585,6 +1710,10 @@ impl Controller {
                         renewed = true;
                     }
                 }
+            }
+            if renewed {
+                // There may be songs whose lyrics haven't been looked for.
+                crate::lyrics::wake();
             }
             if renewed && online {
                 // Which songs are liked, as of now.
@@ -2072,6 +2201,15 @@ impl Controller {
                 view.set_kind(self.search_filter.get() as i32);
                 shown
             }
+            Some(Route::Stats(period)) => {
+                // The chips choose how far back the figures go.
+                self.search_whole.replace(None);
+                if view.get_kinds().row_count() != pages::STATS_PERIODS.len() {
+                    view.set_kinds(ModelRc::new(VecModel::from(pages::STATS_PERIODS.iter().map(|name| SharedString::from(*name)).collect::<Vec<_>>())));
+                }
+                view.set_kind(period as i32);
+                data
+            }
             _ => {
                 self.search_whole.replace(None);
                 if view.get_kinds().row_count() > 0 {
@@ -2080,6 +2218,9 @@ impl Controller {
                 data
             }
         };
+        view.set_stats(ModelRc::new(VecModel::from(
+            data.stats.iter().map(|(value, label)| ui::Stat { value: value.as_str().into(), label: label.as_str().into() }).collect::<Vec<_>>(),
+        )));
         view.set_tracks_route(data.tracks_route.as_str().into());
         view.set_offers_route(data.offers_route.as_str().into());
         view.set_label(data.label.as_str().into());
@@ -2173,6 +2314,7 @@ impl Controller {
                         cover: offer.cover.as_str().into(),
                         duration: if offer.seconds > 0 { clock(offer.seconds).into() } else { "".into() },
                         requested: offer.requested,
+                        song: offer.song.as_str().into(),
                     })
                     .collect::<Vec<_>>(),
             )));
@@ -2834,6 +2976,7 @@ impl Controller {
         page.set_cache_ahead(config::CACHE_AHEAD.iter().position(|songs| *songs == settings.cache_ahead).unwrap_or(0) as i32);
         page.set_requests(settings.requests);
         page.set_request_singles(settings.request_singles);
+        page.set_online_lyrics(settings.online_lyrics);
         page.set_lidarr_address(settings.lidarr_address.as_str().into());
         page.set_lidarr_key_hint(config::load_secret(&self.paths, "lidarr-key").map(|key| crate::lidarr::mask(&key)).unwrap_or_default().into());
         let gate = crate::gate::Found { service: settings.lidarr_gate.clone(), client: String::new() };
@@ -3203,6 +3346,14 @@ impl Controller {
                 }
             });
         });
+        settings.on_set_online_lyrics(|on| {
+            with(|ctl| {
+                ctl.change_setting(true, |s| s.online_lyrics = on);
+                ctl.follow_lyrics_setting();
+                // The song that's playing may have some now.
+                ctl.reload_lyrics();
+            });
+        });
         settings.on_set_request_singles(|on| {
             with(|ctl| {
                 ctl.change_setting(true, |s| s.request_singles = on);
@@ -3241,18 +3392,35 @@ impl Controller {
             });
         });
         view.on_set_kind(|index| {
-            with(|ctl| ctl.set_search_filter(index.max(0) as usize));
+            with(|ctl| match ctl.current_route() {
+                Some(Route::Stats(period)) => {
+                    if period != index.max(0) as usize {
+                        ctl.navigate(Route::Stats(index.max(0) as usize));
+                    }
+                }
+                _ => ctl.set_search_filter(index.max(0) as usize),
+            });
         });
         view.on_offer_activated(|index| {
             with(|ctl| {
                 let Some(offer) = ctl.page.borrow().offers.get(index as usize).cloned() else { return };
+                if !offer.song.is_empty() {
+                    // A song suggested for a playlist: hear it.
+                    return ctl.play_suggestion(&offer.song);
+                }
                 let hint = pages::hint(Kind::Request, &offer.album_title, &offer.artist, &offer.cover);
                 ctl.navigate_with(Route::OutsideAlbum(offer.album), hint);
             });
         });
+        view.on_offers_refresh(|| {
+            with(|ctl| ctl.refresh());
+        });
         view.on_offer_request(|index| {
             with(|ctl| {
                 let Some(offer) = ctl.page.borrow().offers.get(index as usize).cloned() else { return };
+                if !offer.song.is_empty() {
+                    return ctl.add_suggestion(index as usize);
+                }
                 ctl.prompt_request(&offer.album, &offer.album_title, &offer.artist, &offer.title, if offer.kind.is_empty() { "Album" } else { &offer.kind });
             });
         });

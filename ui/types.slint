@@ -57,6 +57,15 @@ export struct Offer {
     duration: string,
     // The album has already been asked for.
     requested: bool,
+    // Set when it's a song the library has, offered for a playlist: the song's id. The album
+    // and artist ids are then the library's, and `requested` means it's been added.
+    song: string,
+}
+
+// A figure at the top of a page, e.g. "312" over "hours listened".
+export struct Stat {
+    value: string,
+    label: string,
 }
 
 export struct Shelf {
@@ -205,6 +214,8 @@ export global View {
     // Where the subtitle links to, e.g. the album's artist; empty for plain text.
     in property <string> subtitle-route;
     in property <string> meta;
+    // Figures shown across the top of the page.
+    in property <[Stat]> stats;
     in property <string> about;
     in property <string> cover;
     in property <bool> cover-round;
@@ -246,6 +257,8 @@ export global View {
     in property <[Shelf]> tail;
     callback offer-activated(index: int);
     callback offer-request(index: int);
+    // Asks for a different set of suggestions.
+    callback offers-refresh();
     in property <[Card]> tiles;
     // Shown when the page has nothing to list.
     in property <string> empty;
@@ -355,6 +368,8 @@ export global Player {
     callback toggle-shuffle();
     callback cycle-repeat();
     callback toggle-star();
+    // Swaps the window for the small one that stays on top of other apps.
+    callback open-mini();
     callback queue-activated(index: int);
     callback queue-menu(index: int, x: length, y: length);
     callback clear-queue();
@@ -510,6 +525,10 @@ export global Settings {
     callback import-spotify();
     // Asking a Lidarr server for albums that aren't in the library.
     in property <bool> requests;
+    // Lyrics the server doesn't have are looked up online; and how far that's got.
+    in property <bool> online-lyrics;
+    in property <string> lyrics-status;
+    callback set-online-lyrics(on: bool);
     // Singles and EPs are offered as well as albums.
     in property <bool> request-singles;
     callback set-request-singles(on: bool);

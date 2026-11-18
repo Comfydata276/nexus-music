@@ -9,7 +9,7 @@ import "fonts/BricolageGrotesque-ExtraBold.ttf";
 import { Theme } from "theme.slint";
 import { Icons } from "icons.slint";
 import { Drag, App, View, Player, Menu, Prompt, Toast, Lyrics, Settings, Covers, Page, Track, Card, CardKind, Shelf, Offer, CardRow, PlaylistRef, MenuEntry, LyricLine, QualityOption, ThemeOption, Search, Suggestion } from "types.slint";
-import { PageStatus } from "widgets.slint";
+import { PageStatus, IconButton } from "widgets.slint";
 import { Sidebar, TopBar, QueuePanel, PlayerBar, SearchOverlay } from "chrome.slint";
 import { StackPage, TrackListPage, GridPage, LyricsPage, NowPlayingPage, SettingsPage, LoginPage } from "pages.slint";
 import { MenuOverlay, PromptOverlay, ToastOverlay } from "overlays.slint";
@@ -64,6 +64,198 @@ export component Tray inherits SystemTrayIcon {
         MenuItem {
             title: "Quit";
             activated => { root.quit(); }
+        }
+    }
+}
+
+// The small player: what's playing and the buttons to steer it, in a window that stays on
+// top of other apps. It's a window of its own, told what to show by the app (it doesn't share
+// the main window's `Player`).
+export component MiniPlayer inherits Window {
+    in property <string> song;
+    in property <string> artist;
+    in property <image> picture;
+    in property <bool> has-track;
+    in property <bool> playing;
+    in property <bool> starred;
+    // How far through the song, 0 to 1; and the same as times, e.g. "1:02" and "3:47".
+    in property <float> progress;
+    in property <string> elapsed;
+    in property <string> total;
+    callback toggle;
+    callback next;
+    callback previous;
+    callback toggle-star;
+    // Back to the full window.
+    callback expand;
+
+    title: root.has-track ? root.song + " - " + root.artist : "Nexus Music";
+    icon: @image-url("../assets/app-icon.png");
+    background: Theme.base;
+    always-on-top: true;
+    preferred-width: 380px;
+    min-width: 320px;
+    max-width: 640px;
+    min-height: 124px;
+    max-height: 124px;
+    default-font-family: "Hanken Grotesk";
+    default-font-size: 14px;
+
+    keys := FocusScope {
+        key-pressed(event) => {
+            if event.text == " " {
+                root.toggle();
+                return accept;
+            }
+            if event.modifiers.control && event.text == Key.RightArrow {
+                root.next();
+                return accept;
+            }
+            if event.modifiers.control && event.text == Key.LeftArrow {
+                root.previous();
+                return accept;
+            }
+            return reject;
+        }
+    }
+
+    HorizontalLayout {
+        padding: 12px;
+        spacing: 14px;
+
+        Rectangle {
+            width: 100px;
+            height: 100px;
+            border-radius: 8px;
+            background: Theme.raised;
+            clip: true;
+
+            if art.source.width == 0: Image {
+                width: 36px;
+                height: 36px;
+                source: Icons.music;
+                colorize: Theme.faint;
+            }
+
+            art := Image {
+                width: 100%;
+                height: 100%;
+                image-fit: cover;
+                source: root.picture;
+                accessible-role: none;
+            }
+        }
+
+        VerticalLayout {
+            horizontal-stretch: 1;
+            min-width: 0px;
+            alignment: space-between;
+
+            VerticalLayout {
+                spacing: 2px;
+                Text {
+                    text: root.has-track ? root.song : "Nothing playing";
+                    color: Theme.text;
+                    font-size: 15px;
+                    font-weight: 700;
+                    overflow: elide;
+                }
+
+                Text {
+                    text: root.artist;
+                    color: Theme.muted;
+                    font-size: 13px;
+                    overflow: elide;
+                }
+            }
+
+            HorizontalLayout {
+                spacing: 8px;
+                Text {
+                    text: root.elapsed;
+                    color: Theme.faint;
+                    font-size: 11px;
+                    vertical-alignment: center;
+                    accessible-role: none;
+                }
+
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    alignment: center;
+                    Rectangle {
+                        height: 4px;
+                        border-radius: 2px;
+                        background: Theme.raised;
+                        Rectangle {
+                            x: 0;
+                            width: parent.width * clamp(root.progress, 0, 1);
+                            height: 100%;
+                            border-radius: 2px;
+                            background: Theme.accent-bright;
+                        }
+                    }
+                }
+
+                Text {
+                    text: root.total;
+                    color: Theme.faint;
+                    font-size: 11px;
+                    vertical-alignment: center;
+                    accessible-role: none;
+                }
+            }
+
+            HorizontalLayout {
+                spacing: 4px;
+                IconButton {
+                    icon: root.starred ? Icons.heart-fill : Icons.heart;
+                    icon-size: 17px;
+                    tint: root.starred ? Theme.warm : Theme.muted;
+                    enabled: root.has-track;
+                    label: root.starred ? "Remove from Liked songs" : "Add to Liked songs";
+                    clicked => { root.toggle-star(); }
+                }
+
+                Rectangle {
+                    horizontal-stretch: 1;
+                }
+
+                IconButton {
+                    icon: Icons.prev-fill;
+                    icon-size: 16px;
+                    enabled: root.has-track;
+                    label: "Previous";
+                    clicked => { root.previous(); }
+                }
+
+                IconButton {
+                    icon: root.playing ? Icons.pause-fill : Icons.play-fill;
+                    icon-size: 20px;
+                    tint: Theme.text;
+                    enabled: root.has-track;
+                    label: root.playing ? "Pause" : "Play";
+                    clicked => { root.toggle(); }
+                }
+
+                IconButton {
+                    icon: Icons.next-fill;
+                    icon-size: 16px;
+                    enabled: root.has-track;
+                    label: "Next";
+                    clicked => { root.next(); }
+                }
+
+                Rectangle {
+                    horizontal-stretch: 1;
+                }
+
+                IconButton {
+                    icon: Icons.maximize-2;
+                    icon-size: 16px;
+                    label: "Back to the full window";
+                    clicked => { root.expand(); }
+                }
+            }
         }
     }
 }

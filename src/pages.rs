@@ -133,6 +133,9 @@ pub struct OfferData {
     pub requested: bool,
     /// "EP" or "Single" when that's what it's on; empty for an album.
     pub kind: String,
+    /// Set when it's a song the library has, suggested for a playlist: the song's id. The
+    /// album and artist ids are then the library's, and `requested` means it's been added.
+    pub song: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -161,6 +164,8 @@ pub struct PageData {
     pub subtitle: String,
     pub subtitle_route: String,
     pub meta: String,
+    /// Figures across the top of the page: each a number and what it counts.
+    pub stats: Vec<(String, String)>,
     pub about: String,
     pub cover: String,
     pub cover_round: bool,
@@ -252,6 +257,7 @@ pub fn load(client: &Client, route: &Route) -> ApiResult<PageData> {
         Route::Radio => radio(client),
         Route::Mix(id) => Ok(mix(id)),
         Route::Requests => Ok(requests()),
+        Route::Stats(period) => Ok(stats(*period)),
         Route::OutsideArtist(id) => Ok(outside_artist(id)),
         Route::OutsideAlbum(id) => Ok(outside_album(id)),
         Route::Albums(sort) => albums(client, *sort),
@@ -273,6 +279,7 @@ pub fn enrich(client: &Client, route: &Route, page: &PageData, publish: &mut dyn
         Route::Home => home_extras(client, page),
         Route::Artist(id) => artist_extras(client, id, page, publish),
         Route::OutsideArtist(id) => outside_artist_extras(id, page),
+        Route::Playlist(_) => playlist_extras(client, page),
         _ => None,
     }
 }
@@ -380,6 +387,7 @@ fn offer_data(song: &crate::musicbrainz::SongOffer, requested: bool) -> OfferDat
         cover: crate::musicbrainz::cover(&song.album),
         seconds: song.seconds,
         requested,
+        song: String::new(),
     }
 }
 
@@ -945,6 +953,123 @@ fn requests() -> PageData {
 }
 
 /// The page for one of the "Made for you" mixes.
+/// How far back "Your stats" can look.
+pub const STATS_PERIODS: [&str; 3] = ["All time", "Last 6 months", "Last 4 weeks"];
+
+/// A number with its thousands marked off: 5210 is "5,210".
+fn grouped(number: u64) -> String {
+    let digits = number.to_string();
+    let mut out = String::new();
+    for (place, digit) in digits.chars().enumerate() {
+        if place > 0 && (digits.len() - place) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
+}
+
+fn plays(times: u64) -> String {
+    format!("{} {}", grouped(times), if times == 1 { "play" } else { "plays" })
+}
+
+/// What's been played most: songs, artists, albums and kinds of music, with how much
+/// listening it comes to. "All time" goes by the server's count of each song's plays, which
+/// takes in every app and device. The shorter periods go by this app's own log of plays,
+/// since the server doesn't say when anything was played.
+fn stats(period: usize) -> PageData {
+    let title = "Your stats".to_string();
+    let period = period.min(STATS_PERIODS.len() - 1);
+    let Some(index) = crate::search::current() else {
+        return PageData { title, empty: "Your library is still being read. Try again in a moment.".into(), ..Default::default() };
+    };
+    let now = chrono::Utc::now().timestamp();
+    let log = crate::plays::shared();
+    // How many times each song was played in the period.
+    let mut times: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
+    if period == 0 {
+        for song in index.library.songs.iter().filter(|song| song.play_count > 0) {
+            times.insert(song.id.as_str(), song.play_count as u64);
+        }
+    } else {
+        let since = now - if period == 1 { 183 } else { 28 } * 24 * 3600;
+        for (song, _) in log.iter().filter(|(_, at)| *at >= since) {
+            *times.entry(song.as_str()).or_default() += 1;
+        }
+    }
+    let mut songs: Vec<(&Song, u64)> = index.library.songs.iter().filter_map(|song| times.get(song.id.as_str()).map(|times| (song, *times))).collect();
+    songs.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.title.cmp(&b.0.title)));
+    // The log only knows what's happened since it was started.
+    let started = log.first().map(|(_, at)| *at).unwrap_or(now);
+    let note = if period == 0 {
+        String::new()
+    } else {
+        let day = chrono::DateTime::from_timestamp(started, 0).map(|at| at.with_timezone(&chrono::Local).format("%-d %B %Y").to_string()).unwrap_or_default();
+        format!("Plays in this period are the ones this app has counted on this PC, starting {day}. “All time” uses your server's own count, which takes in every app.")
+    };
+    if songs.is_empty() {
+        let empty = if period == 0 { "Nothing has been played yet." } else { "Nothing has been played in this period." };
+        return PageData { title, empty: empty.into(), about: note, ..Default::default() };
+    }
+
+    // The same plays, added up by artist, by album and by kind of music.
+    let tally = |key: &dyn Fn(&Song) -> &str| -> Vec<(String, u64)> {
+        let mut sums: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
+        for (song, times) in &songs {
+            let key = key(song);
+            if !key.is_empty() {
+                *sums.entry(key).or_default() += times;
+            }
+        }
+        let mut sums: Vec<(String, u64)> = sums.into_iter().map(|(key, times)| (key.to_string(), times)).collect();
+        sums.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        sums
+    };
+    let artists = tally(&|song| song.artist_id.as_str());
+    let albums = tally(&|song| song.album_id.as_str());
+    let genres = tally(&|song| song.genre.as_str());
+    let seconds: u64 = songs.iter().map(|(song, times)| song.duration as u64 * times).sum();
+    let total: u64 = songs.iter().map(|(_, times)| times).sum();
+
+    let listened = if seconds >= 3600 { (grouped(seconds / 3600), "hours listened") } else { (grouped(seconds / 60), "minutes listened") };
+    let figures = vec![
+        (listened.0, listened.1.to_string()),
+        (grouped(total), if total == 1 { "play" } else { "plays" }.to_string()),
+        (grouped(songs.len() as u64), if songs.len() == 1 { "song" } else { "songs" }.to_string()),
+        (grouped(artists.len() as u64), if artists.len() == 1 { "artist" } else { "artists" }.to_string()),
+    ];
+    let cards = |sums: &[(String, u64)], known: &[CardData], limit: usize| -> Vec<CardData> {
+        sums.iter()
+            .filter_map(|(id, times)| known.iter().find(|card| &card.id == id).map(|card| (card, times)))
+            .take(limit)
+            .map(|(card, times)| CardData {
+                // An album keeps its artist beside the count; an artist has only the count.
+                subtitle: if card.kind == Kind::Album && !card.subtitle.is_empty() { format!("{} • {}", plays(*times), card.subtitle) } else { plays(*times) },
+                ..card.clone()
+            })
+            .collect()
+    };
+    let top_artists = cards(&artists, &index.library.artists, 10);
+    let top_albums = cards(&albums, &index.library.albums, 10);
+    let kinds: Vec<CardData> =
+        genres.iter().take(10).map(|(name, times)| CardData { kind: Kind::Genre, id: name.clone(), title: name.clone(), subtitle: plays(*times), cover: String::new() }).collect();
+    let shelf = |title: &str, cards: Vec<CardData>| (!cards.is_empty()).then(|| ShelfData { title: title.into(), route: String::new(), wrap: false, cards });
+    PageData {
+        title,
+        stats: figures,
+        about: note,
+        lead: shelf("Top artists", top_artists).into_iter().collect(),
+        songs: songs.iter().take(25).map(|(song, _)| (*song).clone()).collect(),
+        tracks_title: "Top songs".into(),
+        show_album: true,
+        show_cover: true,
+        show_number: true,
+        shelves: [shelf("Top albums", top_albums), shelf("Most played kinds of music", kinds)].into_iter().flatten().collect(),
+        context: "Your top songs".into(),
+        ..Default::default()
+    }
+}
+
 fn mix(id: &str) -> PageData {
     let made = crate::search::current().and_then(|index| crate::mixes::one(&index, id));
     let Some(mut made) = made else {
@@ -1264,6 +1389,86 @@ fn playlist(client: &Client, id: &str) -> ApiResult<PageData> {
         playlist: Some(playlist),
         ..Default::default()
     })
+}
+
+/// How many songs are suggested for a playlist.
+const SUGGESTED: usize = 10;
+
+/// Songs from the library that would suit a playlist: ones the server reckons similar to a
+/// few of the songs in it, picked afresh each time, so asking again gives different ones.
+/// If the server has nothing to go on, songs of the kind the playlist is mostly made of.
+fn playlist_extras(client: &Client, page: &PageData) -> Option<PageData> {
+    page.playlist.as_ref()?;
+    if page.songs.is_empty() {
+        return None;
+    }
+    let listed: std::collections::HashSet<&str> = page.songs.iter().map(|song| song.id.as_str()).collect();
+    // The same song from another album is no suggestion either.
+    let named: std::collections::HashSet<(String, String)> = page.songs.iter().map(|song| (plain(&song.title), plain(&song.artist))).collect();
+    let mut seeds: Vec<&Song> = page.songs.iter().filter(|song| song.radio_url.is_empty()).collect();
+    fastrand::shuffle(&mut seeds);
+    seeds.truncate(3);
+    let similar: Vec<Vec<Song>> = std::thread::scope(|scope| {
+        let asked: Vec<_> = seeds.iter().map(|seed| scope.spawn(|| client.similar_songs(&seed.id, 30).unwrap_or_default())).collect();
+        asked.into_iter().map(|asked| asked.join().unwrap_or_default()).collect()
+    });
+    let mut picks: Vec<Song> = Vec::new();
+    let take = |song: &Song, picks: &mut Vec<Song>| {
+        let known = listed.contains(song.id.as_str()) || named.contains(&(plain(&song.title), plain(&song.artist))) || picks.iter().any(|pick| pick.id == song.id);
+        // No more than two by one artist, so one seed's artist doesn't fill the list.
+        let by = picks.iter().filter(|pick| pick.artist_id == song.artist_id).count();
+        if !known && by < 2 && picks.len() < SUGGESTED {
+            picks.push(song.clone());
+        }
+    };
+    // A song from each seed's list in turn, the most alike first.
+    for place in 0..30 {
+        for list in &similar {
+            if let Some(song) = list.get(place) {
+                take(song, &mut picks);
+            }
+        }
+    }
+    let mut note = "Based on what's in this playlist.";
+    if picks.len() < SUGGESTED {
+        // The kind of music most of it is.
+        let mut kinds: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for song in page.songs.iter().filter(|song| !song.genre.is_empty()) {
+            *kinds.entry(song.genre.as_str()).or_default() += 1;
+        }
+        if let Some((genre, _)) = kinds.into_iter().max_by_key(|(genre, count)| (*count, std::cmp::Reverse(*genre))) {
+            if picks.is_empty() {
+                note = "More of the kind of music this playlist is mostly made of.";
+            }
+            for song in client.random_songs(40, Some(genre)).unwrap_or_default() {
+                take(&song, &mut picks);
+            }
+        }
+    }
+    if picks.is_empty() {
+        return None;
+    }
+    let mut page = page.clone();
+    page.offers_heading = "Recommended".into();
+    page.offers_note = note.into();
+    page.offers = picks
+        .iter()
+        .map(|song| OfferData {
+            album: song.album_id.clone(),
+            album_title: song.album.clone(),
+            title: song.title.clone(),
+            artist: song.artist_label().to_string(),
+            artist_id: song.artist_id.clone(),
+            artist_name: song.artist.clone(),
+            about: song.album.clone(),
+            cover: song.cover_art.clone(),
+            seconds: song.duration,
+            requested: false,
+            kind: String::new(),
+            song: song.id.clone(),
+        })
+        .collect();
+    Some(page)
 }
 
 fn liked(client: &Client) -> ApiResult<PageData> {

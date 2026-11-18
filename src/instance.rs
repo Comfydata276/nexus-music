@@ -57,14 +57,14 @@ pub fn system_scale() -> f32 {
 
 /// Colours the window's title bar and border to match the theme (Windows 11; on Windows 10
 /// the title bar goes dark instead). Colours are 0xRRGGBB.
-pub fn tint_title_bar(ui: &crate::ui::MainWindow, background: u32, text: u32) {
+pub fn tint_title_bar(window: &slint::Window, background: u32, text: u32) {
     use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
     // Not all of these are in every version of the bindings, so they're spelled out.
     const USE_IMMERSIVE_DARK_MODE: u32 = 20;
     const BORDER_COLOR: u32 = 34;
     const CAPTION_COLOR: u32 = 35;
     const TEXT_COLOR: u32 = 36;
-    let window = ui.window().window_handle();
+    let window = window.window_handle();
     let Ok(handle) = window.window_handle() else { return };
     let RawWindowHandle::Win32(win32) = handle.as_raw() else { return };
     let hwnd = win32.hwnd.get() as *mut std::ffi::c_void;

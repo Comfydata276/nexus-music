@@ -49,7 +49,10 @@ by the app itself.
   WMA, APE and so on) is converted to MP3 by Navidrome on the fly.
 - Create, rename, pin and delete playlists; add and remove songs, with a warning before
   adding one that's already there; like songs and albums.
-- Synced lyrics when Navidrome has them (embedded or `.lrc` files).
+- Synced lyrics when Navidrome has them (embedded or `.lrc` files). Optional, off by default: for songs it has none for, lyrics are fetched from [LRCLIB](https://lrclib.net) and kept on your PC. That looks up your whole library in the background, so LRCLIB is sent each song's title, artist, album and length.
+- A mini player: a small window that stays on top of other apps, with the artwork, the song, and buttons to pause, skip and like.
+- "Your stats": what you've played most (songs, artists, albums and kinds of music) and how many hours it comes to, for all time, the last six months or the last four weeks. All time uses your server's play counts; the shorter periods use a log of plays this app keeps on your PC from the day you install this version.
+- Recommended songs under each playlist: songs from your library like the ones in it, each with a button to add it.
 - Media keys and the Windows now-playing overlay.
 - Reports plays to Navidrome, which keeps play counts current and feeds Last.fm or
   ListenBrainz if you linked them there.
@@ -171,6 +174,8 @@ connection.
 | `src/musicbrainz.rs` | Finds songs, discographies and track lists for music that isn't in the library. |
 | `src/gate.rs` | Browser sign-in for a Lidarr that sits behind Authentik. |
 | `src/update.rs` | Finds, downloads and verifies new releases. |
+| `src/lyrics.rs` | Lyrics from LRCLIB for songs the server has none for. |
+| `src/plays.rs` | The log of plays behind "Your stats". |
 | `src/listenbrainz.rs` | How much songs, releases and artists are played. |
 | `src/discover.rs` | Artists worth a look that the library doesn't have. |
 | `src/songcache.rs` | Songs kept as they're played and fetched ahead of the queue. |

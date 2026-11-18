@@ -19,6 +19,7 @@ mod instance;
 #[cfg(windows)]
 mod media;
 mod lidarr;
+mod lyrics;
 mod listenbrainz;
 mod mixes;
 mod musicbrainz;
@@ -27,6 +28,7 @@ mod pages;
 #[cfg(windows)]
 mod picker;
 mod playback;
+mod plays;
 mod pool;
 mod search;
 mod songcache;

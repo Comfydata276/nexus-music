@@ -281,6 +281,13 @@ export component Sidebar inherits Rectangle {
         }
 
         NavItem {
+            icon: Icons.chart-no-axes-column;
+            text: "Your stats";
+            selected: App.route == "stats";
+            clicked => { App.navigate("stats"); }
+        }
+
+        NavItem {
             icon: Icons.download;
             text: App.download-status == "" ? "Downloads" : App.download-status;
             selected: App.route == "downloads";
@@ -1422,6 +1429,17 @@ export component PlayerBar inherits Rectangle {
                             App.navigate("lyrics");
                         }
                     }
+                }
+            }
+
+            VerticalLayout {
+                alignment: center;
+                IconButton {
+                    icon: Icons.picture-in-picture-2;
+                    icon-size: 17px;
+                    enabled: Player.has-track;
+                    label: "Mini player";
+                    clicked => { Player.open-mini(); }
                 }
             }
 
