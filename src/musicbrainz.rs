@@ -55,9 +55,40 @@ pub fn cover(album: &str) -> String {
     format!("https://coverartarchive.org/release-group/{album}/front-250")
 }
 
+/// MusicBrainz closes a connection that's been idle for 15 seconds. Setting one up takes
+/// about a second from far away, most of what a search would otherwise take.
+const THEIR_IDLE: Duration = Duration::from_secs(12);
+/// When MusicBrainz was last talked to.
+static TOUCHED: Mutex<Option<Instant>> = Mutex::new(None);
+
+fn agent() -> &'static ureq::Agent {
+    AGENT.get_or_init(|| crate::subsonic::make_agent_idle(THEIR_IDLE))
+}
+
+/// Notes that MusicBrainz is being talked to now; says whether it had been lately.
+fn touch() -> bool {
+    let mut touched = TOUCHED.lock().unwrap_or_else(|stuck| stuck.into_inner());
+    let lately = touched.is_some_and(|at| at.elapsed() < THEIR_IDLE - Duration::from_secs(2));
+    *touched = Some(Instant::now());
+    lately
+}
+
+/// Opens a connection ahead of a search, so the search doesn't wait for one. Called while
+/// something is being typed into the search box; does nothing if a connection is likely open.
+pub fn warm() {
+    if touch() {
+        return;
+    }
+    std::thread::spawn(|| {
+        // The smallest thing there is to ask for, and not one of the lookups they ration.
+        if let Ok(response) = agent().get("https://musicbrainz.org/robots.txt").call() {
+            let _ = response.into_body().read_to_string();
+        }
+    });
+}
+
 fn get(path: &str) -> Result<Value, String> {
-    let agent = AGENT.get_or_init(crate::subsonic::make_agent);
-    for attempt in 0..3 {
+    for attempt in 0..4u64 {
         // One caller at a time, each waiting out the gap since the one before.
         {
             let mut next = NEXT.lock().unwrap_or_else(|stuck| stuck.into_inner());
@@ -66,15 +97,19 @@ fn get(path: &str) -> Result<Value, String> {
             }
             *next = Some(Instant::now() + GAP);
         }
-        let response = agent
+        touch();
+        let response = agent()
             .get(&format!("{BASE}/{path}"))
             .header("Accept", "application/json")
             .call()
             .map_err(|e| format!("Couldn't reach MusicBrainz. {e}"))?;
         let status = response.status().as_u16();
-        // Busy, or asked too fast: it says to come back shortly.
-        if status == 503 && attempt < 2 {
-            std::thread::sleep(Duration::from_millis(1500));
+        // Its search is shared by everyone and turns callers away when it's busy, saying how
+        // soon to come back (a second, as a rule). That's waited out by the gap above.
+        if status == 503 && attempt < 3 {
+            let wait = response.headers().get("retry-after").and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok()).unwrap_or(1).clamp(1, 3);
+            let _ = response.into_body().read_to_string();
+            *NEXT.lock().unwrap_or_else(|stuck| stuck.into_inner()) = Some(Instant::now() + Duration::from_secs(wait));
             continue;
         }
         if status != 200 {
@@ -114,14 +149,56 @@ fn year(date: &str) -> String {
 /// Looks for songs matching what was typed, each with the studio album it's on.
 pub fn find_songs(term: &str) -> Result<Vec<SongOffer>, String> {
     let found = get(&format!("recording?query={}&dismax=true&limit=100&fmt=json", crate::subsonic::encode(term)))?;
-    Ok(songs_from(&found))
+    Ok(songs_from(&found, term))
 }
 
-/// An artist's songs, the best known first as far as can be told, each with the studio
-/// album it's on.
-pub fn songs_by(artist: &str) -> Result<Vec<SongOffer>, String> {
-    let found = get(&format!("recording?query=arid:{artist}&limit=100&fmt=json"))?;
-    Ok(songs_from(&found))
+/// One artist's song of a given name, with the studio album it's on. For when it's known
+/// whose song is meant: a search by title alone can bring back a hundred other people's
+/// versions of a well-known song and not the original.
+pub fn song_by(artist: &str, title: &str) -> Result<Vec<SongOffer>, String> {
+    let phrase: String = title.chars().filter(|c| !matches!(c, '"' | '\\')).collect();
+    // Asked for among studio albums only: a famous song has hundreds of live and compilation
+    // recordings, and the album cut needn't be among the first handed back.
+    let query = format!("arid:{artist} AND recording:\"{phrase}\" AND primarytype:album AND status:official AND NOT secondarytype:*");
+    let found = get(&format!("recording?query={}&limit=50&fmt=json", crate::subsonic::encode(&query)))?;
+    let mut songs: Vec<SongOffer> = songs_from(&found, title).into_iter().filter(|song| same_words(base(&song.title), base(title))).collect();
+    // Theirs alone goes before one they share the credit for (a mash-up, a duet).
+    songs.sort_by_key(|song| !(song.artist_id == artist && song.artist == song.artist_name));
+    Ok(songs)
+}
+
+/// The words of a piece of text, for comparing: folded, without punctuation.
+pub fn words(text: &str) -> Vec<String> {
+    let folded: String = fold(text).chars().filter(|c| !matches!(c, '\'' | '’')).collect();
+    folded.split(|c: char| !c.is_alphanumeric()).filter(|word| !word.is_empty()).map(str::to_string).collect()
+}
+
+/// Whether two pieces of text are made of the same words, in any order.
+pub fn same_words(a: &str, b: &str) -> bool {
+    let (a, b) = (words(a), words(b));
+    !a.is_empty() && a.iter().all(|word| b.contains(word)) && b.iter().all(|word| a.contains(word))
+}
+
+/// How well a song answers what was typed, 0 being best:
+/// 0, its title and artist are exactly what was typed ("yellow coldplay");
+/// 1, its title is ("yellow");
+/// 2, everything typed is in its title and artist, among other words;
+/// 3, anything else.
+fn closeness(typed: &[String], song: &SongOffer) -> u8 {
+    let title = words(base(&song.title));
+    let artist = words(&song.artist);
+    let all_typed = typed.iter().all(|word| title.contains(word) || artist.contains(word));
+    let title_typed = !title.is_empty() && title.iter().all(|word| typed.contains(word));
+    let artist_typed = artist.iter().all(|word| typed.contains(word));
+    if all_typed && title_typed && artist_typed {
+        0
+    } else if title_typed && typed.iter().all(|word| title.contains(word)) {
+        1
+    } else if all_typed {
+        2
+    } else {
+        3
+    }
 }
 
 /// A title without what's in brackets after it: "Lonely No More (Acoustic)" is, for finding
@@ -134,9 +211,10 @@ fn base(title: &str) -> &str {
 /// MusicBrainz lists every recording of a song separately: the single, the album cut, each
 /// compilation it was licensed to, each remix and live take. This folds them into one entry
 /// per song and artist, named as plainly as any of them is, and keeps the earliest studio
-/// album among them. A song found on more releases goes first: that's the nearest thing
-/// here to how well known it is.
-fn songs_from(found: &Value) -> Vec<SongOffer> {
+/// album among them. They're put in order of how well they answer what was typed; among
+/// equals, a song found on more releases goes first, which is the nearest thing here to how
+/// well known it is.
+fn songs_from(found: &Value, typed: &str) -> Vec<SongOffer> {
     struct Group {
         offer: SongOffer,
         /// The date of the album chosen so far; empty if it has none.
@@ -191,11 +269,15 @@ fn songs_from(found: &Value) -> Vec<SongOffer> {
         }
     }
     groups.retain(|group| !group.offer.album.is_empty());
-    // Well below the best match is noise.
-    let best = groups.iter().map(|group| group.score).max().unwrap_or(0);
-    groups.retain(|group| group.score + 30 >= best);
-    groups.sort_by(|a, b| b.score.cmp(&a.score).then(b.releases.cmp(&a.releases)));
-    groups.into_iter().map(|group| group.offer).collect()
+    let typed = words(typed);
+    let mut ranked: Vec<(u8, Group)> = groups.into_iter().map(|group| (closeness(&typed, &group.offer), group)).collect();
+    // Of the loose matches, those MusicBrainz itself scored well below its best are noise.
+    let best = ranked.iter().map(|(_, group)| group.score).max().unwrap_or(0);
+    ranked.retain(|(close, group)| *close < 3 || group.score + 30 >= best);
+    ranked.sort_by(|(close_a, a), (close_b, b)| {
+        close_a.cmp(close_b).then(if *close_a == 3 { b.score.cmp(&a.score) } else { std::cmp::Ordering::Equal }).then(b.releases.cmp(&a.releases))
+    });
+    ranked.into_iter().map(|(_, group)| group.offer).collect()
 }
 
 /// An artist's studio albums, newest first, and what the artist is called.
@@ -311,7 +393,7 @@ mod tests {
             ]}"#,
         )
         .unwrap();
-        let songs = songs_from(&found);
+        let songs = songs_from(&found, "lonely no more");
         assert_eq!(songs.len(), 2);
         assert_eq!(
             songs[0],
@@ -347,5 +429,31 @@ mod tests {
         assert_eq!(base("Lonely No More (Acoustic)"), "Lonely No More");
         assert_eq!(base("(What's the Story) Morning Glory?"), "(What's the Story) Morning Glory?");
         assert_eq!(base("Plain"), "Plain");
+    }
+
+    #[test]
+    fn puts_what_was_meant_first() {
+        let song = |title: &str, artist: &str| SongOffer { title: title.into(), artist: artist.into(), ..Default::default() };
+        let typed = words("Yellow coldplay");
+        assert_eq!(closeness(&typed, &song("Yellow", "Coldplay")), 0);
+        assert_eq!(closeness(&typed, &song("Yellow (Coldplay)", "Calum Graham")), 3);
+        assert_eq!(closeness(&typed, &song("Yellow Submarine", "Coldplay")), 2);
+        assert_eq!(closeness(&words("mr brightside"), &song("Mr. Brightside", "The Killers")), 1);
+        assert_eq!(closeness(&words("mr brightside"), &song("Mr. Brightside (Jacques Lu Cont remix)", "The Killers")), 1);
+        assert_eq!(closeness(&words("don't stop"), &song("Dont Stop", "Someone")), 1);
+        assert!(same_words("Mr. Brightside", "mr brightside"));
+        assert!(!same_words("Mr. Brightside", "brightside"));
+        // A cover scored higher by MusicBrainz still goes after the song that was asked for.
+        let found: Value = serde_json::from_str(
+            r#"{"recordings":[
+            {"score":100,"title":"Yellow (Coldplay)","artist-credit":[{"name":"Calum Graham","artist":{"id":"cg","name":"Calum Graham"}}],
+             "releases":[{"status":"Official","date":"2015","release-group":{"id":"t","title":"Thread","primary-type":"Album"}}]},
+            {"score":41,"title":"Yellow","artist-credit":[{"name":"Coldplay","artist":{"id":"cp","name":"Coldplay"}}],
+             "releases":[{"status":"Official","date":"2000-07-10","release-group":{"id":"p","title":"Parachutes","primary-type":"Album"}}]}
+            ]}"#,
+        )
+        .unwrap();
+        let songs = songs_from(&found, "yellow coldplay");
+        assert_eq!(songs.iter().map(|song| song.artist.as_str()).collect::<Vec<_>>(), ["Coldplay", "Calum Graham"]);
     }
 }

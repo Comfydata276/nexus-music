@@ -294,15 +294,21 @@ pub fn normalize_server_url(input: &str) -> String {
 const API_TIMEOUT: Duration = Duration::from_secs(45);
 
 pub(crate) fn make_agent() -> ureq::Agent {
-    agent_following(10)
+    agent_following(10, Duration::from_secs(300))
+}
+
+/// For a server that closes idle connections sooner than most: one kept longer than `idle`
+/// isn't used again.
+pub(crate) fn make_agent_idle(idle: Duration) -> ureq::Agent {
+    agent_following(10, idle)
 }
 
 /// For callers that need to see where a redirect points instead of being taken there.
 pub(crate) fn make_agent_without_redirects() -> ureq::Agent {
-    agent_following(0)
+    agent_following(0, Duration::from_secs(300))
 }
 
-fn agent_following(redirects: u32) -> ureq::Agent {
+fn agent_following(redirects: u32, idle: Duration) -> ureq::Agent {
     use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
     use ureq::unversioned::transport::DefaultConnector;
     let tls = TlsConfig::builder()
@@ -321,7 +327,7 @@ fn agent_following(redirects: u32) -> ureq::Agent {
         // open, and for minutes, not seconds: enough for artwork to load many at a time.
         .max_idle_connections(24)
         .max_idle_connections_per_host(24)
-        .max_idle_age(Duration::from_secs(300))
+        .max_idle_age(idle)
         .user_agent(concat!("NexusMusic/", env!("CARGO_PKG_VERSION")))
         .build();
     ureq::Agent::with_parts(config, DefaultConnector::new(), dns::CachingResolver::default())

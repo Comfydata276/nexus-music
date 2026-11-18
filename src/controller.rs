@@ -1408,6 +1408,10 @@ impl Controller {
         if query.is_empty() {
             return self.close_preview();
         }
+        // A search beyond the library is likely to follow: have the connection ready for it.
+        if crate::lidarr::current().is_some() {
+            crate::musicbrainz::warm();
+        }
         let Some(client) = self.client() else { return };
         self.api_pool.spawn(move || {
             let found = match crate::search::current() {
@@ -1791,7 +1795,15 @@ impl Controller {
                     }
                 });
             }
-            let whole = pages::enrich(&client, &route, &page).unwrap_or(page);
+            // Extras that take a while are shown part by part as they come in.
+            let mut publish = |part: PageData| {
+                post(move |ctl| {
+                    if ctl.nav.borrow().generation == generation {
+                        ctl.apply_if_changed(part);
+                    }
+                });
+            };
+            let whole = pages::enrich(&client, &route, &page, &mut publish).unwrap_or(page);
             store_page(&file, &whole);
             post(move |ctl| {
                 ctl.remember(&key, Instant::now(), whole.clone());
@@ -3033,7 +3045,7 @@ fn card_route(card: &ui::Card) -> Option<Route> {
 /// Loads a page with its extras and writes it to the disk cache.
 fn fetch_whole(client: &Client, route: &Route, file: &std::path::Path) -> ApiResult<PageData> {
     let page = pages::load(client, route)?;
-    let whole = pages::enrich(client, route, &page).unwrap_or(page);
+    let whole = pages::enrich(client, route, &page, &mut |_| {}).unwrap_or(page);
     store_page(file, &whole);
     Ok(whole)
 }

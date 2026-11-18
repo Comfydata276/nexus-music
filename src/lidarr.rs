@@ -51,6 +51,16 @@ pub struct ArtistOffer {
     pub cover: String,
 }
 
+/// A song that was put out on its own, as Lidarr knows it. Not something that can be asked
+/// for, but it says whose a well-known song is.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Single {
+    pub title: String,
+    pub artist_id: String,
+    /// How many people have rated it at MusicBrainz: few for most, some for the famous.
+    pub votes: i64,
+}
+
 /// An album on Lidarr's list that hasn't fully arrived.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Pending {
@@ -101,6 +111,13 @@ struct AlbumRes {
     artist: ArtistRes,
     images: Vec<ImageRes>,
     statistics: StatsRes,
+    ratings: RatingsRes,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+struct RatingsRes {
+    votes: i64,
 }
 
 #[derive(Deserialize, Default)]
@@ -243,8 +260,18 @@ impl Lidarr {
 
     /// Looks for albums matching what was typed.
     pub fn find_albums(&self, term: &str) -> Result<Vec<Offer>, String> {
+        self.find_releases(term).map(|(albums, _)| albums)
+    }
+
+    /// Looks for albums matching what was typed, and the singles of that name too.
+    pub fn find_releases(&self, term: &str) -> Result<(Vec<Offer>, Vec<Single>), String> {
         let found: Vec<AlbumRes> = self.get(&format!("album/lookup?term={}", crate::subsonic::encode(term)))?;
-        Ok(found.into_iter().filter(is_album).map(offer).collect())
+        let singles = found
+            .iter()
+            .filter(|album| album.album_type.eq_ignore_ascii_case("single") && album.secondary_types.is_empty())
+            .map(|album| Single { title: album.title.clone(), artist_id: album.artist.foreign_artist_id.clone(), votes: album.ratings.votes })
+            .collect();
+        Ok((found.into_iter().filter(is_album).map(offer).collect(), singles))
     }
 
     /// Looks for artists matching what was typed.
