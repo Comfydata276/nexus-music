@@ -60,6 +60,7 @@ pub enum PromptAction {
     ImportPath,
     /// Ask Lidarr for an album (by its name for it), or for several by (artist, album).
     RequestAlbum { album: String, title: String },
+    AddArtist { artist: String, name: String },
     RequestMissing(Vec<(String, String)>),
     RenamePlaylist(String),
     DeletePlaylist(String),
@@ -290,7 +291,7 @@ impl Controller {
             ui::CardKind::Artist => {
                 self.collection_menu(Target::Artist { id, name: title.clone() }, &title, x, y)
             }
-            ui::CardKind::Genre | ui::CardKind::Mix | ui::CardKind::Request => {}
+            ui::CardKind::Genre | ui::CardKind::Mix | ui::CardKind::Request | ui::CardKind::OutsideArtist => {}
         }
     }
 
@@ -693,6 +694,7 @@ impl Controller {
                 }
             }
             PromptAction::RequestAlbum { album, title } => self.request_album(album, title),
+            PromptAction::AddArtist { artist, name } => self.add_artist(artist, name),
             PromptAction::RequestMissing(albums) => self.request_missing(albums),
             PromptAction::ImportPath => {
                 if !name.is_empty() {
@@ -922,7 +924,12 @@ impl Controller {
             ui::CardKind::Album => Target::Album { id, title: title.clone() },
             ui::CardKind::Playlist => Target::Playlist { id, name: title.clone() },
             ui::CardKind::Artist => Target::Artist { id, name: title.clone() },
-            ui::CardKind::Genre | ui::CardKind::Request => return,
+            ui::CardKind::Genre | ui::CardKind::OutsideArtist => return,
+            // The button on an album that isn't in the library asks for it.
+            ui::CardKind::Request => {
+                let by = crate::lidarr::offered(&id).map(|offer| offer.artist).unwrap_or_default();
+                return self.prompt_request(&id, &title, &by, "");
+            }
             ui::CardKind::Mix => {
                 // Made on the spot from the app's copy of the library.
                 let Some(mix) = crate::search::current().and_then(|index| crate::mixes::one(&index, &id)) else { return };

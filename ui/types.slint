@@ -2,7 +2,7 @@
 
 export enum Page { home, search, tracklist, artist, grid, settings, lyrics, now-playing }
 
-export enum CardKind { album, artist, playlist, genre, mix, request }
+export enum CardKind { album, artist, playlist, genre, mix, request, outside-artist }
 
 export struct Track {
     id: string,
@@ -39,6 +39,21 @@ export struct Card {
     title: string,
     subtitle: string,
     cover: string,
+}
+
+// A song that isn't in the library, which could be had by asking for the album it's on.
+export struct Offer {
+    // The album it's on, by Lidarr's name for it, and that album's title.
+    album: string,
+    album-title: string,
+    title: string,
+    artist: string,
+    // What to say about where it's from, e.g. "…Something to Be • 2005".
+    about: string,
+    cover: string,
+    duration: string,
+    // The album has already been asked for.
+    requested: bool,
 }
 
 export struct Shelf {
@@ -208,6 +223,14 @@ export global View {
     // A button beside the page's title, if it has something to offer; and it being clicked.
     in property <string> action;
     callback action-clicked();
+    // Music that isn't in the library: a heading for the section, songs that could be asked
+    // for, and shelves that go beneath them.
+    in property <string> offers-title;
+    in property <string> offers-note;
+    in property <[Offer]> offers;
+    in property <[Shelf]> tail;
+    callback offer-activated(index: int);
+    callback offer-request(index: int);
     in property <[Card]> tiles;
     // Shown when the page has nothing to list.
     in property <string> empty;

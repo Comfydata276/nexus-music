@@ -3,7 +3,7 @@
 import { ScrollView, ListView, AboutSlint } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { Icons } from "icons.slint";
-import { App, View, Player, Lyrics, Settings, Covers, Card, CardKind, Shelf, Page, QualityOption, ThemeOption, Track } from "types.slint";
+import { App, View, Player, Lyrics, Settings, Covers, Card, CardKind, Shelf, Offer, Page, QualityOption, ThemeOption, Track } from "types.slint";
 import { Icon, IconButton, PlayButton, TextButton, LinkText, Cover, Field, Toggle, Chip, Slider, MediaCard, TrackRow, PageStatus, HoverIntent, SkeletonRows, ScrollThumb } from "widgets.slint";
 
 // Cover, title and summary at the top of an album, playlist or artist.
@@ -209,6 +209,15 @@ component ActionBar inherits Rectangle {
         padding-left: Theme.page-pad;
         padding-right: Theme.page-pad;
         spacing: 16px;
+
+        if View.action != "": VerticalLayout {
+            alignment: center;
+            TextButton {
+                primary: true;
+                text: View.action;
+                clicked => { View.action-clicked(); }
+            }
+        }
 
         if View.can-play: VerticalLayout {
             alignment: center;
@@ -522,6 +531,105 @@ component SectionTitle inherits Rectangle {
     }
 }
 
+// A song that isn't in the library: where it's from, and a button to ask for the album.
+component OfferRow inherits Rectangle {
+    in property <Offer> offer;
+    callback activated;
+    callback request;
+
+    height: 56px;
+    border-radius: 6px;
+    background: touch.has-hover || add.has-hover ? Theme.hover : transparent;
+    animate background { duration: 120ms; }
+
+    accessible-role: list-item;
+    accessible-label: root.offer.title + ", " + root.offer.artist + ", " + root.offer.about;
+    accessible-action-default => { root.activated(); }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.activated(); }
+    }
+
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 8px;
+        spacing: 12px;
+
+        VerticalLayout {
+            alignment: center;
+            Cover {
+                width: 40px;
+                height: 40px;
+                art: root.offer.cover;
+                placeholder: Icons.disc-3;
+                detail: 48px;
+            }
+        }
+
+        VerticalLayout {
+            alignment: center;
+            spacing: 2px;
+            horizontal-stretch: 5;
+            min-width: 0px;
+            // Both text columns start from nothing, so every row splits the space alike.
+            preferred-width: 0px;
+
+            Text {
+                text: root.offer.title;
+                color: Theme.text;
+                font-size: 14px;
+                font-weight: 500;
+                overflow: elide;
+                accessible-role: none;
+            }
+
+            Text {
+                text: root.offer.artist;
+                color: Theme.muted;
+                font-size: 13px;
+                overflow: elide;
+                accessible-role: none;
+            }
+        }
+
+        Text {
+            horizontal-stretch: 4;
+            min-width: 0px;
+            preferred-width: 0px;
+            text: root.offer.about;
+            color: Theme.muted;
+            font-size: 13px;
+            vertical-alignment: center;
+            overflow: elide;
+            accessible-role: none;
+        }
+
+        Text {
+            width: 48px;
+            text: root.offer.duration;
+            color: Theme.muted;
+            font-size: 13px;
+            horizontal-alignment: right;
+            vertical-alignment: center;
+            accessible-role: none;
+        }
+
+        VerticalLayout {
+            alignment: center;
+            add := IconButton {
+                width: 36px;
+                height: 36px;
+                icon: root.offer.requested ? Icons.check : Icons.plus;
+                icon-size: 20px;
+                tint: root.offer.requested ? Theme.accent-bright : Theme.muted;
+                label: root.offer.requested ? root.offer.album-title + " has been asked for" : "Request the album " + root.offer.album-title;
+                clicked => { root.request(); }
+            }
+        }
+    }
+}
+
 component ShelfView inherits Rectangle {
     in property <Shelf> shelf;
     property <bool> genres: self.shelf.cards.length > 0 && self.shelf.cards[0].kind == CardKind.genre;
@@ -726,6 +834,54 @@ export component StackPage inherits Rectangle {
             }
 
             for shelf in View.shelves: ShelfView {
+                shelf: shelf;
+            }
+
+            // Music that isn't in the library and could be asked for.
+            if View.offers-title != "": VerticalLayout {
+                padding-left: Theme.page-pad;
+                padding-right: Theme.page-pad;
+                padding-top: 20px;
+                spacing: 4px;
+
+                Rectangle {
+                    height: 1px;
+                    background: Theme.line;
+                }
+
+                Text {
+                    text: View.offers-title;
+                    color: Theme.text;
+                    font-family: Theme.display;
+                    font-size: 26px;
+                    font-weight: 800;
+                    height: 48px;
+                    vertical-alignment: bottom;
+                }
+
+                Text {
+                    text: View.offers-note;
+                    color: Theme.muted;
+                    font-size: 13px;
+                    wrap: word-wrap;
+                }
+            }
+
+            if View.offers.length > 0: SectionTitle {
+                text: "Songs";
+            }
+
+            for offer[index] in View.offers: HorizontalLayout {
+                padding-left: 12px;
+                padding-right: 12px;
+                OfferRow {
+                    offer: offer;
+                    activated => { View.offer-activated(index); }
+                    request => { View.offer-request(index); }
+                }
+            }
+
+            for shelf in View.tail: ShelfView {
                 shelf: shelf;
             }
 
@@ -1868,7 +2024,7 @@ export component SettingsPage inherits Rectangle {
 
                         SettingRow {
                             title: "Ask for albums that aren't in your library";
-                            detail: "For people who run Lidarr beside their music server. Search results gain a “Not in your library” row; choosing an album there puts it on Lidarr's list, and a Requests page shows what's on its way. Whole albums only.";
+                            detail: "For people who run Lidarr beside their music server. Search results gain a “Not in your library” section of songs, artists and albums; asking for one puts its album on Lidarr's list, and a Requests page shows what's on its way. Whole albums only. Songs and track lists are looked up at MusicBrainz, which is sent what you search for.";
                             Toggle {
                                 on: Settings.requests;
                                 label: "Ask for albums that aren't in your library";

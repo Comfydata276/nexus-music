@@ -63,6 +63,11 @@ pub enum Route {
     Mix(String),
     /// Albums that have been asked for and haven't arrived.
     Requests,
+    /// An artist as the wider world knows them, by MusicBrainz's name for them: all their
+    /// albums, in the library or not.
+    OutsideArtist(String),
+    /// An album that isn't in the library, by MusicBrainz's name for it.
+    OutsideAlbum(String),
 }
 
 impl Route {
@@ -87,6 +92,8 @@ impl Route {
             "import" => Route::Import,
             "mix" => Route::Mix(rest.to_string()),
             "requests" => Route::Requests,
+            "outside-artist" => Route::OutsideArtist(rest.to_string()),
+            "outside-album" => Route::OutsideAlbum(rest.to_string()),
             _ => return None,
         })
     }
@@ -112,6 +119,8 @@ impl Route {
             Route::Import => "import".into(),
             Route::Mix(id) => format!("mix:{id}"),
             Route::Requests => "requests".into(),
+            Route::OutsideArtist(id) => format!("outside-artist:{id}"),
+            Route::OutsideAlbum(id) => format!("outside-album:{id}"),
         }
     }
 
@@ -131,7 +140,7 @@ impl Route {
             Route::Album(_) | Route::Playlist(_) | Route::Liked | Route::Downloads | Route::Radio | Route::Mix(_) => {
                 ui::Page::Tracklist
             }
-            Route::Artist(_) => ui::Page::Artist,
+            Route::Artist(_) | Route::OutsideArtist(_) | Route::OutsideAlbum(_) => ui::Page::Artist,
             Route::Albums(_) | Route::Artists | Route::Genres | Route::Genre(_) => ui::Page::Grid,
             Route::Settings => ui::Page::Settings,
             Route::Lyrics => ui::Page::Lyrics,
@@ -1035,20 +1044,32 @@ impl Controller {
         self.requests_state("sign-in", &format!("Signed out. {}", self.behind_sign_in()));
     }
 
-    /// A card for an album that isn't in the library was clicked: ask whether to request it.
-    fn prompt_request(self: &Rc<Self>, card: &ui::Card) {
-        if card.subtitle.ends_with("Requested") {
+    /// Asks whether to request an album that isn't in the library. `song` is the song that
+    /// led here, if it was one: the album is what gets fetched, and that's said.
+    pub fn prompt_request(self: &Rc<Self>, album: &str, title: &str, by: &str, song: &str) {
+        if crate::lidarr::offered(album).is_some_and(|offer| offer.requested) {
             return self.toast("That one has already been asked for. See Requests in the sidebar.");
         }
-        let (title, by) = (card.title.to_string(), card.subtitle.split(" • ").next().unwrap_or_default().to_string());
-        *self.prompt.borrow_mut() = Some(crate::actions::PromptAction::RequestAlbum { album: card.id.to_string(), title: title.clone() });
-        self.open_prompt(
-            "Ask for this album?",
-            &format!("“{title}” by {by} will go on Lidarr's list, and Lidarr will start looking for it. The whole album is fetched."),
-            "Request",
-            None,
-            false,
-        );
+        let by = if by.is_empty() { String::new() } else { format!(" by {by}") };
+        let text = if song.is_empty() {
+            format!("“{title}”{by} will go on Lidarr's list, and Lidarr will start looking for it. The whole album is fetched.")
+        } else {
+            format!("“{song}” is on “{title}”{by}. That album will go on Lidarr's list, and Lidarr will start looking for it. The whole album is fetched.")
+        };
+        *self.prompt.borrow_mut() = Some(crate::actions::PromptAction::RequestAlbum { album: album.to_string(), title: title.to_string() });
+        self.open_prompt("Ask for this album?", &text, "Request", None, false);
+    }
+
+    /// Reloads the page on screen if it shows music that isn't in the library, after what's
+    /// been asked for has changed.
+    fn refresh_outside(self: &Rc<Self>) {
+        self.invalidate("search:");
+        self.invalidate("requests");
+        self.invalidate("outside-");
+        if let Some(route @ (Route::OutsideAlbum(_) | Route::OutsideArtist(_) | Route::Search(_))) = self.current_route() {
+            let scroll = self.ui.global::<ui::View>().get_scroll_y();
+            self.show(route, scroll, true, None);
+        }
     }
 
     pub fn request_album(self: &Rc<Self>, album: String, title: String) {
@@ -1061,13 +1082,58 @@ impl Controller {
                 .unwrap_or_else(|| {
                     lidarr.find_albums(&format!("lidarr:{album}"))?.into_iter().find(|o| o.album == album).ok_or_else(|| "Lidarr no longer lists that album.".to_string())
                 });
-            let result = offer.and_then(|offer| lidarr.request(&offer));
+            let result = offer.and_then(|offer| {
+                crate::lidarr::remember(std::slice::from_ref(&offer));
+                lidarr.request(&offer)
+            });
             post(move |ctl| match result {
                 Ok(()) => {
                     crate::lidarr::mark(&album, true);
-                    ctl.invalidate("search:");
-                    ctl.invalidate("requests");
+                    ctl.refresh_outside();
                     ctl.toast(format!("Asked for “{title}”. It'll be in your library once it arrives."));
+                }
+                Err(reason) => ctl.toast(reason),
+            });
+        });
+    }
+
+    /// Asks whether to have Lidarr keep track of the artist whose page this is.
+    fn prompt_add_artist(self: &Rc<Self>, artist: String) {
+        let (name, albums) = {
+            let page = self.page.borrow();
+            let open = page
+                .shelves
+                .iter()
+                .flat_map(|shelf| &shelf.cards)
+                .filter(|card| card.kind == Kind::Request && !card.subtitle.ends_with("Requested") && !card.subtitle.ends_with("Arrived"))
+                .count();
+            (page.title.clone(), open)
+        };
+        if name.is_empty() || albums == 0 {
+            return;
+        }
+        *self.prompt.borrow_mut() = Some(crate::actions::PromptAction::AddArtist { artist, name: name.clone() });
+        self.open_prompt(
+            &format!("Add {name}?"),
+            &format!(
+                "Lidarr will look for {} by {name} that you don't have, and for new ones as they come out. That can be a lot to fetch.",
+                if albums == 1 { "the 1 album".to_string() } else { format!("all {albums} albums") }
+            ),
+            "Add artist",
+            None,
+            false,
+        );
+    }
+
+    pub fn add_artist(self: &Rc<Self>, artist: String, name: String) {
+        let Some(lidarr) = crate::lidarr::current() else { return };
+        self.toast(format!("Adding {name}…"));
+        self.api_pool.spawn(move || {
+            let result = lidarr.add_artist(&artist, &name);
+            post(move |ctl| match result {
+                Ok(_) => {
+                    ctl.refresh_outside();
+                    ctl.toast(format!("Added {name}. Their albums are on Lidarr's list; see Requests in the sidebar."));
                 }
                 Err(reason) => ctl.toast(reason),
             });
@@ -1830,6 +1896,28 @@ impl Controller {
             view.set_shelves(shelves_model(&data.shelves));
         }
         view.set_action(data.action.as_str().into());
+        view.set_offers_title(data.offers_title.as_str().into());
+        view.set_offers_note(data.offers_note.as_str().into());
+        if self.page.borrow().offers != data.offers || data.offers.is_empty() {
+            view.set_offers(ModelRc::new(VecModel::from(
+                data.offers
+                    .iter()
+                    .map(|offer| ui::Offer {
+                        album: offer.album.as_str().into(),
+                        album_title: offer.album_title.as_str().into(),
+                        title: offer.title.as_str().into(),
+                        artist: offer.artist.as_str().into(),
+                        about: offer.about.as_str().into(),
+                        cover: offer.cover.as_str().into(),
+                        duration: if offer.seconds > 0 { clock(offer.seconds).into() } else { "".into() },
+                        requested: offer.requested,
+                    })
+                    .collect::<Vec<_>>(),
+            )));
+        }
+        if self.page.borrow().tail != data.tail || data.tail.is_empty() {
+            view.set_tail(shelves_model(&data.tail));
+        }
         if self.page.borrow().lead != data.lead || data.lead.is_empty() {
             view.set_lead(shelves_model(&data.lead));
         }
@@ -2831,10 +2919,30 @@ impl Controller {
             with(|ctl| ctl.sign_out_requests());
         });
         view.on_action_clicked(|| {
-            with(|ctl| {
-                if ctl.current_route() == Some(Route::Import) {
-                    ctl.prompt_request_missing();
+            with(|ctl| match ctl.current_route() {
+                Some(Route::Import) => ctl.prompt_request_missing(),
+                Some(Route::OutsideAlbum(album)) => {
+                    let (title, by) = {
+                        let page = ctl.page.borrow();
+                        (page.title.clone(), page.subtitle.clone())
+                    };
+                    ctl.prompt_request(&album, &title, &by, "");
                 }
+                Some(Route::OutsideArtist(artist)) => ctl.prompt_add_artist(artist),
+                _ => {}
+            });
+        });
+        view.on_offer_activated(|index| {
+            with(|ctl| {
+                let Some(offer) = ctl.page.borrow().offers.get(index as usize).cloned() else { return };
+                let hint = pages::hint(Kind::Request, &offer.album_title, &offer.artist, &offer.cover);
+                ctl.navigate_with(Route::OutsideAlbum(offer.album), hint);
+            });
+        });
+        view.on_offer_request(|index| {
+            with(|ctl| {
+                let Some(offer) = ctl.page.borrow().offers.get(index as usize).cloned() else { return };
+                ctl.prompt_request(&offer.album, &offer.album_title, &offer.artist, &offer.title);
             });
         });
         settings.on_import_spotify(|| {
@@ -2890,15 +2998,15 @@ impl Controller {
     }
 
     fn open_card(self: &Rc<Self>, card: &ui::Card) {
-        if card.kind == ui::CardKind::Request {
-            return self.prompt_request(card);
-        }
         let Some(route) = card_route(card) else { return };
         // The card already says enough to draw the page's header before the server answers.
         let subtitle = match self.page.borrow().label.as_str() {
             // On an artist's page the cards are captioned with years, not the artist.
             "Artist" => self.page.borrow().title.clone(),
             _ if card.kind == ui::CardKind::Album => card.subtitle.to_string(),
+            _ if card.kind == ui::CardKind::Request => {
+                crate::lidarr::offered(&card.id).map(|offer| offer.artist).unwrap_or_default()
+            }
             _ => String::new(),
         };
         let hint = pages::hint(Kind::from_ui(card.kind), &card.title, &subtitle, &card.cover);
@@ -2917,8 +3025,8 @@ fn card_route(card: &ui::Card) -> Option<Route> {
         ui::CardKind::Playlist => Route::Playlist(id),
         ui::CardKind::Genre => Route::Genre(id),
         ui::CardKind::Mix => Route::Mix(id),
-        // Not a page: clicking one asks whether to request the album.
-        ui::CardKind::Request => return None,
+        ui::CardKind::Request => Route::OutsideAlbum(id),
+        ui::CardKind::OutsideArtist => Route::OutsideArtist(id),
     })
 }
 

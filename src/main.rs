@@ -18,6 +18,7 @@ mod instance;
 mod media;
 mod lidarr;
 mod mixes;
+mod musicbrainz;
 mod offline;
 mod pages;
 #[cfg(windows)]

@@ -35,6 +35,8 @@ pub enum Kind {
     Mix,
     /// An album that isn't in the library, which could be asked for.
     Request,
+    /// An artist as the wider world knows them, whether or not the library has their music.
+    OutsideArtist,
 }
 
 impl Kind {
@@ -46,6 +48,7 @@ impl Kind {
             ui::CardKind::Genre => Kind::Genre,
             ui::CardKind::Mix => Kind::Mix,
             ui::CardKind::Request => Kind::Request,
+            ui::CardKind::OutsideArtist => Kind::OutsideArtist,
         }
     }
 
@@ -57,6 +60,7 @@ impl Kind {
             Kind::Genre => ui::CardKind::Genre,
             Kind::Mix => ui::CardKind::Mix,
             Kind::Request => ui::CardKind::Request,
+            Kind::OutsideArtist => ui::CardKind::OutsideArtist,
         }
     }
 }
@@ -110,6 +114,22 @@ impl CardData {
     }
 }
 
+/// A song that isn't in the library, which could be had by asking for the album it's on.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OfferData {
+    /// The album it's on: Lidarr's name for it, and its title.
+    pub album: String,
+    pub album_title: String,
+    pub title: String,
+    pub artist: String,
+    /// E.g. "…Something to Be • 2005".
+    pub about: String,
+    pub cover: String,
+    pub seconds: u32,
+    pub requested: bool,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ShelfData {
     pub title: String,
@@ -160,6 +180,12 @@ pub struct PageData {
     pub action: String,
     /// On the Requests page: Lidarr's number for the album on each row.
     pub request_ids: Vec<i64>,
+    /// Music that isn't in the library: the section's heading, songs that could be asked
+    /// for, and the shelves beneath them.
+    pub offers_title: String,
+    pub offers_note: String,
+    pub offers: Vec<OfferData>,
+    pub tail: Vec<ShelfData>,
     pub tiles: Vec<CardData>,
     pub grid: Vec<CardData>,
     /// The list to keep fetching from as the grid scrolls; `None` once it's all loaded.
@@ -185,10 +211,10 @@ pub fn hint(kind: Kind, title: &str, subtitle: &str, cover: &str) -> Option<Page
         return None;
     }
     let (label, round) = match kind {
-        Kind::Album => ("Album", false),
-        Kind::Artist => ("Artist", true),
+        Kind::Album | Kind::Request => ("Album", false),
+        Kind::Artist | Kind::OutsideArtist => ("Artist", true),
         Kind::Playlist => ("Playlist", false),
-        Kind::Genre | Kind::Mix | Kind::Request => return None,
+        Kind::Genre | Kind::Mix => return None,
     };
     Some(PageData {
         label: label.into(),
@@ -196,8 +222,8 @@ pub fn hint(kind: Kind, title: &str, subtitle: &str, cover: &str) -> Option<Page
         subtitle: subtitle.into(),
         cover: cover.into(),
         cover_round: round,
-        show_album: kind != Kind::Album,
-        show_cover: kind != Kind::Album,
+        show_album: !matches!(kind, Kind::Album | Kind::Request),
+        show_cover: !matches!(kind, Kind::Album | Kind::Request),
         show_number: true,
         pending: true,
         ..Default::default()
@@ -215,6 +241,8 @@ pub fn load(client: &Client, route: &Route) -> ApiResult<PageData> {
         Route::Radio => radio(client),
         Route::Mix(id) => Ok(mix(id)),
         Route::Requests => Ok(requests()),
+        Route::OutsideArtist(id) => Ok(outside_artist(id)),
+        Route::OutsideAlbum(id) => Ok(outside_album(id)),
         Route::Albums(sort) => albums(client, *sort),
         Route::Artists => artists(client),
         Route::Genres => genres(client),
@@ -253,35 +281,289 @@ fn shelf(title: &str, route: &str, albums: &[Album]) -> Option<ShelfData> {
     })
 }
 
-/// Albums matching a search that aren't in the library, if requests are switched on.
+/// Text as it's compared: folded, with runs of spaces closed up.
+fn plain(text: &str) -> String {
+    crate::search::fold(text).split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Songs, artists and albums matching a search that aren't in the library, if requests are
+/// switched on. Songs come from MusicBrainz; artists and albums from Lidarr.
 fn search_extras(query: &str, page: &PageData) -> Option<PageData> {
-    use crate::search::fold;
     let lidarr = crate::lidarr::current()?;
-    let name = |text: &str| fold(text).split_whitespace().collect::<Vec<_>>().join(" ");
+    let (songs, artists, albums) = std::thread::scope(|scope| {
+        let songs = scope.spawn(|| crate::musicbrainz::find_songs(query).unwrap_or_default());
+        let artists = scope.spawn(|| lidarr.find_artists(query).unwrap_or_default());
+        let albums = lidarr.find_albums(query).unwrap_or_default();
+        (songs.join().unwrap_or_default(), artists.join().unwrap_or_default(), albums)
+    });
     // Leave out what the library already has.
-    let have: std::collections::HashSet<(String, String)> = crate::search::current()
-        .map(|index| index.library.albums.iter().map(|album| (name(&album.title), name(&album.subtitle))).collect())
+    let index = crate::search::current();
+    let have_albums: std::collections::HashSet<(String, String)> = index
+        .as_ref()
+        .map(|index| index.library.albums.iter().map(|album| (plain(&album.title), plain(&album.subtitle))).collect())
         .unwrap_or_default();
-    let offers: Vec<crate::lidarr::Offer> = lidarr
-        .find_albums(query)
-        .ok()?
+    let have_songs: std::collections::HashSet<(String, String)> = index
+        .as_ref()
+        .map(|index| index.library.songs.iter().map(|song| (plain(&song.title), plain(song.artist_label()))).collect())
+        .unwrap_or_default();
+    let albums: Vec<crate::lidarr::Offer> =
+        albums.into_iter().filter(|offer| !have_albums.contains(&(plain(&offer.title), plain(&offer.artist)))).take(12).collect();
+    let songs: Vec<crate::musicbrainz::SongOffer> =
+        songs.into_iter().filter(|song| !have_songs.contains(&(plain(&song.title), plain(&song.artist)))).take(8).collect();
+    // Artists named in what was typed. A name that's only a small part of it ("Lonely", when
+    // a song's whole title was typed) is a coincidence and is left out.
+    let typed = plain(query);
+    let words = typed.split(' ').count();
+    let (exact, named): (Vec<crate::lidarr::ArtistOffer>, Vec<crate::lidarr::ArtistOffer>) = artists
         .into_iter()
-        .filter(|offer| !have.contains(&(name(&offer.title), name(&offer.artist))))
-        .take(12)
-        .collect();
-    if offers.is_empty() {
-        return None;
+        .filter(|artist| {
+            let name = plain(&artist.name);
+            let within = format!(" {typed} ").contains(&format!(" {name} ")) && name.split(' ').count() * 2 >= words;
+            !name.is_empty() && (name.contains(&typed) || within)
+        })
+        .take(5)
+        .partition(|artist| plain(&artist.name) == typed);
+    // An artist's name was typed: the songs to show are theirs, not ones that happen to have
+    // the name in their title.
+    let songs = match exact.first().map(|artist| crate::musicbrainz::songs_by(&artist.id)) {
+        Some(Ok(theirs)) if !theirs.is_empty() => {
+            theirs.into_iter().filter(|song| !have_songs.contains(&(plain(&song.title), plain(&song.artist)))).take(8).collect()
+        }
+        _ => songs,
+    };
+    // Then whoever the songs found are by: typing a song's name should lead to its artist
+    // too. Lidarr is asked for each, for their picture.
+    let mut by: Vec<(&str, &str)> = Vec::new();
+    for song in songs.iter().take(3) {
+        let listed = exact.iter().chain(&named).any(|artist| artist.id == song.artist_id) || by.iter().any(|(id, _)| *id == song.artist_id);
+        if !song.artist_id.is_empty() && !listed {
+            by.push((&song.artist_id, &song.artist_name));
+        }
     }
-    crate::lidarr::remember(&offers);
+    let by: Vec<crate::lidarr::ArtistOffer> = std::thread::scope(|scope| {
+        let asked: Vec<_> = by
+            .iter()
+            .map(|(id, name)| {
+                let lidarr = &lidarr;
+                scope.spawn(move || {
+                    let found = lidarr.find_artists(&format!("lidarr:{id}")).ok().and_then(|found| found.into_iter().find(|artist| artist.id == *id));
+                    found.unwrap_or_else(|| crate::lidarr::ArtistOffer { id: id.to_string(), name: name.to_string(), ..Default::default() })
+                })
+            })
+            .collect();
+        asked.into_iter().filter_map(|asked| asked.join().ok()).collect()
+    });
+    let artists: Vec<crate::lidarr::ArtistOffer> = exact.into_iter().chain(by).chain(named).take(6).collect();
+    // The albums those songs are on go first among the albums.
+    let mut albums = albums;
+    let mut front = 0;
+    // These are made up from what's known of the song, which is less than Lidarr would say.
+    let mut sketched: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for song in songs.iter().take(3) {
+        if !albums.iter().any(|album| album.album == song.album) {
+            albums.insert(
+                front,
+                crate::lidarr::Offer {
+                    album: song.album.clone(),
+                    artist_id: song.artist_id.clone(),
+                    title: song.album_title.clone(),
+                    artist: song.artist_name.clone(),
+                    year: song.year.clone(),
+                    cover: crate::musicbrainz::cover(&song.album),
+                    requested: false,
+                },
+            );
+            front += 1;
+            sketched.insert(song.album.clone());
+        }
+    }
+    albums.truncate(12);
+    if songs.is_empty() && artists.is_empty() && albums.is_empty() {
+        let mut page = page.clone();
+        page.offers_note = "Nothing else was found beyond your library.".into();
+        return Some(page);
+    }
+    // What's been offered before is remembered as it was: asked for, and with its own cover.
+    for album in &mut albums {
+        if let Some(known) = crate::lidarr::offered(&album.album) {
+            *album = known;
+        }
+    }
+    // Only what Lidarr itself described is kept to act on later; the rest is looked up when
+    // it's opened or asked for.
+    let described: Vec<crate::lidarr::Offer> = albums.iter().filter(|album| !sketched.contains(&album.album)).cloned().collect();
+    crate::lidarr::remember(&described);
+    crate::lidarr::remember_artists(&artists);
+    let requested: std::collections::HashSet<&str> = albums.iter().filter(|album| album.requested).map(|album| album.album.as_str()).collect();
     let mut page = page.clone();
     page.empty.clear();
-    page.shelves.push(ShelfData {
-        title: "Not in your library".into(),
-        route: String::new(),
-        wrap: false,
-        cards: offers.iter().map(request_card).collect(),
-    });
+    page.offers_title = "Not in your library".into();
+    page.offers_note = "Ask Lidarr for any of these. A song comes with the album it's on.".into();
+    page.offers = songs
+        .iter()
+        .map(|song| OfferData {
+            album: song.album.clone(),
+            album_title: song.album_title.clone(),
+            title: song.title.clone(),
+            artist: song.artist.clone(),
+            about: if song.year.is_empty() { song.album_title.clone() } else { format!("{} • {}", song.album_title, song.year) },
+            cover: crate::musicbrainz::cover(&song.album),
+            seconds: song.seconds,
+            requested: requested.contains(song.album.as_str()) || crate::lidarr::offered(&song.album).is_some_and(|offer| offer.requested),
+        })
+        .collect();
+    page.tail.clear();
+    if !artists.is_empty() {
+        page.tail.push(ShelfData { title: "Artists".into(), route: String::new(), wrap: false, cards: artists.iter().map(outside_artist_card).collect() });
+    }
+    if !albums.is_empty() {
+        page.tail.push(ShelfData { title: "Albums".into(), route: String::new(), wrap: false, cards: albums.iter().map(request_card).collect() });
+    }
     Some(page)
+}
+
+fn outside_artist_card(artist: &crate::lidarr::ArtistOffer) -> CardData {
+    CardData {
+        kind: Kind::OutsideArtist,
+        id: artist.id.clone(),
+        title: artist.name.clone(),
+        subtitle: if artist.about.is_empty() { "Artist".into() } else { artist.about.clone() },
+        cover: artist.cover.clone(),
+    }
+}
+
+fn requests_off(title: &str) -> PageData {
+    PageData { title: title.into(), empty: "Requests are switched off. Turn them on in Settings.".into(), ..Default::default() }
+}
+
+/// An artist as the wider world knows them: every studio album they've made, with the ones
+/// in the library opening as usual and the rest there to be asked for.
+fn outside_artist(id: &str) -> PageData {
+    let Some(lidarr) = crate::lidarr::current() else { return requests_off("Artist") };
+    let remembered = crate::lidarr::offered_artist(id);
+    // If Lidarr keeps track of the artist, its list says what's wanted and what's arrived.
+    let known = lidarr.known_artist(id).ok().flatten();
+    let found = match &known {
+        Some((number, name)) => lidarr.albums_of(*number, name).map(|albums| (name.clone(), albums)),
+        None => crate::musicbrainz::artist_albums(id).map(|(name, albums)| (name, albums.into_iter().map(|album| (album, false)).collect())),
+    };
+    let (name, albums) = match found {
+        Ok(found) => found,
+        Err(reason) => return PageData { label: "Artist".into(), title: remembered.map(|a| a.name).unwrap_or_default(), cover_round: true, empty: reason, ..Default::default() },
+    };
+    let name = if name.is_empty() { remembered.as_ref().map(|artist| artist.name.clone()).unwrap_or_default() } else { name };
+    let offers: Vec<crate::lidarr::Offer> = albums.iter().map(|(offer, _)| offer.clone()).collect();
+    crate::lidarr::remember(&offers);
+    // Albums the library has are shown as its own, so they open and play.
+    let library: std::collections::HashMap<String, CardData> = crate::search::current()
+        .map(|index| {
+            index
+                .library
+                .albums
+                .iter()
+                .filter(|album| plain(&album.subtitle) == plain(&name))
+                .map(|album| (plain(&album.title), album.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut owned = 0;
+    let mut open = 0;
+    let cards: Vec<CardData> = albums
+        .iter()
+        .map(|(offer, have)| {
+            let year = |rest: &str| match (offer.year.is_empty(), rest.is_empty()) {
+                (true, _) => rest.to_string(),
+                (false, true) => offer.year.clone(),
+                (false, false) => format!("{} • {rest}", offer.year),
+            };
+            if let Some(mine) = library.get(&plain(&offer.title)) {
+                owned += 1;
+                return CardData { subtitle: year("In your library"), ..mine.clone() };
+            }
+            if !*have && !offer.requested {
+                open += 1;
+            }
+            CardData {
+                subtitle: year(if *have { "Arrived" } else if offer.requested { "Requested" } else { "" }),
+                ..request_card(offer)
+            }
+        })
+        .collect();
+    let meta = match (cards.len(), owned) {
+        (0, _) => String::new(),
+        (all, 0) => count(all as u32, "album"),
+        (all, owned) => format!("{} • {owned} in your library", count(all as u32, "album")),
+    };
+    PageData {
+        label: "Artist".into(),
+        title: name,
+        meta,
+        cover: remembered.map(|artist| artist.cover).unwrap_or_default(),
+        cover_round: true,
+        action: if open > 0 { "Add artist".into() } else { String::new() },
+        empty: if cards.is_empty() { "No studio albums are listed for this artist.".into() } else { String::new() },
+        shelves: if cards.is_empty() {
+            Vec::new()
+        } else {
+            vec![ShelfData { title: "Albums".into(), route: String::new(), wrap: true, cards }]
+        },
+        artist_id: id.to_string(),
+        ..Default::default()
+    }
+}
+
+/// An album that isn't in the library: what's on it, and a button to ask for it.
+fn outside_album(id: &str) -> PageData {
+    let Some(lidarr) = crate::lidarr::current() else { return requests_off("Album") };
+    let offer = crate::lidarr::offered(id)
+        .map(|offer| Ok(Some(offer)))
+        .unwrap_or_else(|| lidarr.find_albums(&format!("lidarr:{id}")).map(|found| found.into_iter().find(|offer| offer.album == id)));
+    let offer = match offer {
+        Ok(Some(offer)) => offer,
+        Ok(None) => return PageData { label: "Album".into(), empty: "Lidarr doesn't list that album, so it can't be asked for.".into(), ..Default::default() },
+        Err(reason) => return PageData { label: "Album".into(), empty: reason, ..Default::default() },
+    };
+    crate::lidarr::remember(std::slice::from_ref(&offer));
+    let tracks = crate::musicbrainz::album_tracks(id);
+    let (songs, empty) = match tracks {
+        Ok(tracks) => (tracks, String::new()),
+        Err(reason) => (Vec::new(), format!("The list of songs couldn't be fetched. {reason}")),
+    };
+    let discs = songs.iter().map(|track| track.disc).max().unwrap_or(1);
+    let mut meta: Vec<String> = Vec::new();
+    if !offer.year.is_empty() {
+        meta.push(offer.year.clone());
+    }
+    if !songs.is_empty() {
+        meta.push(count(songs.len() as u32, "song"));
+    }
+    meta.push(if offer.requested { "Requested".into() } else { "Not in your library".into() });
+    PageData {
+        label: "Album".into(),
+        title: offer.title.clone(),
+        subtitle: offer.artist.clone(),
+        subtitle_route: if offer.artist_id.is_empty() { String::new() } else { format!("outside-artist:{}", offer.artist_id) },
+        meta: meta.join(" • "),
+        cover: if offer.cover.is_empty() { crate::musicbrainz::cover(id) } else { offer.cover.clone() },
+        action: if offer.requested { "Requested".into() } else { "Request album".into() },
+        songs: songs
+            .into_iter()
+            .map(|track| Song {
+                title: track.title,
+                artist: offer.artist.clone(),
+                track: track.number,
+                disc_number: track.disc,
+                duration: track.seconds,
+                ..Default::default()
+            })
+            .collect(),
+        show_number: true,
+        album_numbers: true,
+        disc_sections: discs > 1,
+        empty,
+        artist_id: offer.artist_id,
+        ..Default::default()
+    }
 }
 
 pub fn request_card(offer: &crate::lidarr::Offer) -> CardData {
@@ -491,6 +773,11 @@ fn search(client: &Client, query: &str) -> ApiResult<PageData> {
     } else {
         String::new()
     };
+    // With requests switched on, more is on its way from beyond the library.
+    let (offers_title, offers_note) = match crate::lidarr::current() {
+        Some(_) => ("Not in your library".to_string(), "Looking for songs, artists and albums beyond your library…".to_string()),
+        None => Default::default(),
+    };
     Ok(PageData {
         tracks_title: "Songs".into(),
         songs: found.songs,
@@ -499,6 +786,8 @@ fn search(client: &Client, query: &str) -> ApiResult<PageData> {
         show_number: false,
         shelves,
         lead,
+        offers_title,
+        offers_note,
         empty,
         context: format!("“{query}”"),
         ..Default::default()

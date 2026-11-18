@@ -39,6 +39,18 @@ pub struct Offer {
     pub requested: bool,
 }
 
+/// An artist Lidarr knows of.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ArtistOffer {
+    /// Lidarr's name for the artist (a MusicBrainz id).
+    pub id: String,
+    pub name: String,
+    /// A few words that tell artists of the same name apart; may be empty.
+    pub about: String,
+    /// Where a picture of them is, as a web address; may be empty.
+    pub cover: String,
+}
+
 /// An album on Lidarr's list that hasn't fully arrived.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Pending {
@@ -57,6 +69,21 @@ struct ArtistRes {
     id: i64,
     artist_name: String,
     foreign_artist_id: String,
+    disambiguation: String,
+    images: Vec<ImageRes>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+struct ImageRes {
+    cover_type: String,
+    remote_url: String,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+struct StatsRes {
+    track_file_count: i64,
 }
 
 #[derive(Deserialize, Default)]
@@ -72,6 +99,8 @@ struct AlbumRes {
     monitored: bool,
     artist_id: i64,
     artist: ArtistRes,
+    images: Vec<ImageRes>,
+    statistics: StatsRes,
 }
 
 #[derive(Deserialize, Default)]
@@ -108,6 +137,15 @@ pub fn mask(key: &str) -> String {
     let letters: Vec<char> = key.trim().chars().collect();
     let shown = if letters.len() >= 16 { letters[letters.len() - 6..].iter().collect() } else { String::new() };
     format!("{}{shown}", "•".repeat(if shown.is_empty() { 16 } else { 10 }))
+}
+
+/// The first picture of one of the kinds wanted, as a web address; empty if there's none.
+fn picture(images: &[ImageRes], kinds: &[&str]) -> String {
+    kinds
+        .iter()
+        .find_map(|kind| images.iter().find(|image| image.cover_type.eq_ignore_ascii_case(kind) && !image.remote_url.is_empty()))
+        .map(|image| image.remote_url.clone())
+        .unwrap_or_default()
 }
 
 /// Whether this is a plain studio album: the kind this feature deals in.
@@ -207,6 +245,86 @@ impl Lidarr {
     pub fn find_albums(&self, term: &str) -> Result<Vec<Offer>, String> {
         let found: Vec<AlbumRes> = self.get(&format!("album/lookup?term={}", crate::subsonic::encode(term)))?;
         Ok(found.into_iter().filter(is_album).map(offer).collect())
+    }
+
+    /// Looks for artists matching what was typed.
+    pub fn find_artists(&self, term: &str) -> Result<Vec<ArtistOffer>, String> {
+        let found: Vec<ArtistRes> = self.get(&format!("artist/lookup?term={}", crate::subsonic::encode(term)))?;
+        Ok(found
+            .into_iter()
+            .filter(|artist| !artist.foreign_artist_id.is_empty())
+            .map(|artist| ArtistOffer {
+                cover: picture(&artist.images, &["poster", "fanart"]),
+                id: artist.foreign_artist_id,
+                name: artist.artist_name,
+                about: artist.disambiguation,
+            })
+            .collect())
+    }
+
+    /// Lidarr's own number and name for an artist, if it keeps track of them.
+    pub fn known_artist(&self, artist: &str) -> Result<Option<(i64, String)>, String> {
+        let artists: Vec<ArtistRes> = self.get("artist")?;
+        Ok(artists.into_iter().find(|known| known.foreign_artist_id == artist).map(|known| (known.id, known.artist_name)))
+    }
+
+    /// The studio albums of an artist Lidarr keeps track of, newest first, and whether each
+    /// has arrived.
+    pub fn albums_of(&self, artist: i64, name: &str) -> Result<Vec<(Offer, bool)>, String> {
+        let albums: Vec<AlbumRes> = self.get(&format!("album?artistId={artist}"))?;
+        let mut albums: Vec<(Offer, bool)> = albums
+            .into_iter()
+            .filter(is_album)
+            .map(|album| {
+                let have = album.statistics.track_file_count > 0;
+                let cover = picture(&album.images, &["cover", "disc"]);
+                let mut offer = offer(album);
+                offer.requested &= !have;
+                offer.artist = name.to_string();
+                offer.cover = if cover.is_empty() { crate::musicbrainz::cover(&offer.album) } else { cover };
+                (offer, have)
+            })
+            .collect();
+        albums.sort_by(|a, b| b.0.year.cmp(&a.0.year).then(a.0.title.cmp(&b.0.title)));
+        Ok(albums)
+    }
+
+    /// Has Lidarr keep track of an artist: every album of theirs goes on its list, and new
+    /// ones will as they come out. Returns how many albums that put on the list.
+    pub fn add_artist(&self, artist: &str, name: &str) -> Result<usize, String> {
+        let Some((known, _)) = self.known_artist(artist)? else {
+            let folders: Vec<RootFolder> = self.get("rootfolder")?;
+            let folder = folders.first().ok_or("Lidarr has no music folder set up yet.")?;
+            let _: ArtistRes = self.send(
+                "POST",
+                "artist",
+                Some(serde_json::json!({
+                    "foreignArtistId": artist,
+                    "artistName": name,
+                    "qualityProfileId": folder.default_quality_profile_id,
+                    "metadataProfileId": folder.default_metadata_profile_id,
+                    "rootFolderPath": folder.path,
+                    "monitored": true,
+                    "monitorNewItems": "all",
+                    "addOptions": { "monitor": "all", "searchForMissingAlbums": true },
+                })),
+            )?;
+            // Lidarr learns their albums in its own time; how many isn't known yet.
+            return Ok(0);
+        };
+        let mut record: serde_json::Value = self.get(&format!("artist/{known}"))?;
+        record["monitored"] = true.into();
+        record["monitorNewItems"] = "all".into();
+        let _: serde_json::Value = self.send("PUT", &format!("artist/{known}"), Some(record))?;
+        let albums: Vec<AlbumRes> = self.get(&format!("album?artistId={known}"))?;
+        let wanted: Vec<i64> =
+            albums.iter().filter(|album| !album.monitored && album.statistics.track_file_count == 0).map(|album| album.id).collect();
+        if !wanted.is_empty() {
+            let _: serde_json::Value =
+                self.send("PUT", "album/monitor", Some(serde_json::json!({ "albumIds": wanted, "monitored": true })))?;
+        }
+        let _: serde_json::Value = self.send("POST", "command", Some(serde_json::json!({ "name": "ArtistSearch", "artistId": known })))?;
+        Ok(wanted.len())
     }
 
     /// Puts an album on Lidarr's list and has Lidarr start looking for it. Nothing else by
@@ -338,6 +456,25 @@ pub fn set_current(lidarr: Option<Lidarr>) {
     if let Ok(mut current) = CURRENT.write() {
         *current = lidarr;
     }
+}
+
+/// Artists that have been offered, by Lidarr's name for them.
+static ARTISTS: RwLock<Option<HashMap<String, ArtistOffer>>> = RwLock::new(None);
+
+pub fn remember_artists(artists: &[ArtistOffer]) {
+    if let Ok(mut all) = ARTISTS.write() {
+        let all = all.get_or_insert_with(HashMap::new);
+        for artist in artists {
+            // A later mention without a picture doesn't replace one with.
+            if !artist.cover.is_empty() || !all.contains_key(&artist.id) {
+                all.insert(artist.id.clone(), artist.clone());
+            }
+        }
+    }
+}
+
+pub fn offered_artist(artist: &str) -> Option<ArtistOffer> {
+    ARTISTS.read().ok()?.as_ref()?.get(artist).cloned()
 }
 
 pub fn remember(offers: &[Offer]) {
