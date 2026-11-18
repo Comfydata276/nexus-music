@@ -2765,6 +2765,7 @@ impl Controller {
                 .map(|(title, detail, _)| ui::QualityOption { title: (*title).into(), detail: (*detail).into() })
                 .collect::<Vec<_>>(),
         )));
+        page.set_quality_names(strings(QUALITIES.iter().map(|q| q.0).collect()));
         let quality = QUALITIES.iter().position(|q| q.2 == settings.bitrate).unwrap_or(QUALITIES.len() - 1);
         page.set_quality(quality as i32);
         page.set_crossfade(settings.crossfade);

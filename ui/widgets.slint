@@ -520,6 +520,99 @@ export component Toggle inherits Rectangle {
     }
 }
 
+// A choice of one from a few, as a single control: the options side by side in one track,
+// the chosen one filled in. For settings; `Chip` is for narrowing a list.
+export component Segmented inherits Rectangle {
+    in property <[string]> options;
+    in property <int> selected;
+    // What's being chosen, for screen readers.
+    in property <string> label;
+    callback chosen(index: int);
+
+    height: 36px;
+    width: track.preferred-width;
+    border-radius: 18px;
+    background: Theme.raised;
+    border-width: 1px;
+    border-color: Theme.line;
+
+    track := HorizontalLayout {
+        padding: 3px;
+        spacing: 2px;
+
+        for name[index] in root.options: Rectangle {
+            property <bool> on: index == root.selected;
+            width: caption.preferred-width + 26px;
+            border-radius: 15px;
+            background: self.on ? Theme.text : touch.has-hover ? Theme.press : transparent;
+            animate background { duration: 120ms; }
+
+            accessible-role: button;
+            accessible-label: root.label != "" ? root.label + ": " + name : name;
+            accessible-checkable: true;
+            accessible-checked: self.on;
+            accessible-action-default => { root.chosen(index); }
+
+            touch := TouchArea {
+                mouse-cursor: pointer;
+                clicked => { root.chosen(index); }
+            }
+
+            caption := Text {
+                text: name;
+                color: parent.on ? Theme.base : touch.has-hover ? Theme.text : Theme.muted;
+                font-size: 13px;
+                font-weight: parent.on ? 600 : 500;
+                accessible-role: none;
+            }
+        }
+    }
+}
+
+// A choice from a list too long or too changeable to lay out: shows what's chosen, and opens
+// the list when clicked.
+export component Select inherits Rectangle {
+    in property <string> text;
+    in property <string> label;
+    callback clicked;
+
+    height: 36px;
+    width: clamp(caption.preferred-width + 54px, 120px, 300px);
+    border-radius: 8px;
+    background: touch.has-hover ? Theme.overlay : Theme.raised;
+    border-width: 1px;
+    border-color: touch.has-hover ? Theme.faint : Theme.line;
+    animate background, border-color { duration: 120ms; }
+
+    accessible-role: button;
+    accessible-label: root.label != "" ? root.label + ": " + root.text : root.text;
+    accessible-action-default => { root.clicked(); }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+
+    caption := Text {
+        x: 14px;
+        width: min(self.preferred-width, parent.width - 54px);
+        text: root.text;
+        color: Theme.text;
+        font-size: 13px;
+        font-weight: 500;
+        overflow: elide;
+        vertical-alignment: center;
+        accessible-role: none;
+    }
+
+    Icon {
+        x: parent.width - self.width - 12px;
+        source: Icons.chevron-down;
+        size: 16px;
+        tint: Theme.muted;
+    }
+}
+
 // One selectable option in a row of choices, e.g. sort order.
 export component Chip inherits Rectangle {
     in property <string> text;

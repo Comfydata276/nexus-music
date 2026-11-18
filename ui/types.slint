@@ -412,6 +412,10 @@ export struct QualityOption {
 
 export global Settings {
     in property <[QualityOption]> qualities;
+    // Their names alone, for the control that chooses between them.
+    in property <[string]> quality-names;
+    // Which section of the settings is showing.
+    in-out property <int> tab;
     in property <int> quality;
     // What the current song is and how it's being streamed.
     in property <string> now-format;

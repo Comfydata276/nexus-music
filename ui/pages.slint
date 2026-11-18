@@ -4,7 +4,7 @@ import { ScrollView, ListView, AboutSlint } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { Icons } from "icons.slint";
 import { App, View, Player, Lyrics, Settings, Covers, Card, CardKind, Shelf, Offer, Page, QualityOption, ThemeOption, Track } from "types.slint";
-import { Icon, IconButton, PlayButton, TextButton, LinkText, Cover, Field, Toggle, Chip, Slider, MediaCard, TrackRow, PageStatus, HoverIntent, SkeletonRows, ScrollThumb } from "widgets.slint";
+import { Icon, IconButton, PlayButton, TextButton, LinkText, Cover, Field, Toggle, Chip, Segmented, Select, Slider, MediaCard, TrackRow, PageStatus, HoverIntent, SkeletonRows, ScrollThumb } from "widgets.slint";
 
 // Cover, title and summary at the top of an album, playlist or artist.
 component Hero inherits Rectangle {
@@ -1433,61 +1433,109 @@ export component NowPlayingPage inherits Rectangle {
     }
 }
 
+// One setting: what it is and what it does on the left, the control that changes it on the
+// right. Where the two can't sit side by side and leave the words room, the control goes
+// underneath them.
 component SettingRow inherits Rectangle {
     in property <string> title;
     in property <string> detail;
-    // Tall enough for the words at the width they actually get. Left to itself the row is
-    // sized as if they didn't wrap, and a long description runs into the row below.
-    min-height: max(56px, heading.preferred-height + (root.detail != "" ? about.preferred-height + 4px : 0px) + 8px);
+    // Belongs to the setting above it: set in from the edge, beside a rule.
+    in property <bool> nested;
+    property <length> inset: self.nested ? 22px : 0px;
+    property <length> room: self.width - self.inset;
+    property <length> control: slot.preferred-width;
+    property <bool> stacked: self.control > 0 && self.room - self.control - 24px < 340px;
+    property <length> words: self.stacked || self.control == 0 ? self.room : self.room - self.control - 24px;
+    property <length> words-height: heading.preferred-height + (self.detail != "" ? 4px + about.preferred-height : 0px);
+    height: 29px + (self.stacked ? self.words-height + 12px + slot.preferred-height : max(self.words-height, slot.preferred-height, 32px));
 
-    HorizontalLayout {
-        spacing: 24px;
+    if root.nested: Rectangle {
+        x: 5px;
+        y: 0;
+        width: 2px;
+        height: parent.height;
+        background: Theme.line;
+    }
 
-        VerticalLayout {
-            alignment: center;
-            spacing: 4px;
-            horizontal-stretch: 1;
+    heading := Text {
+        x: root.inset;
+        y: root.stacked ? 14px : (root.height - 1px - root.words-height) / 2;
+        width: root.words;
+        text: root.title;
+        color: Theme.text;
+        font-size: 15px;
+        font-weight: 500;
+        wrap: word-wrap;
+    }
 
-            heading := Text {
-                text: root.title;
-                color: Theme.text;
-                font-size: 15px;
-                font-weight: 500;
-                wrap: word-wrap;
-            }
+    about := Text {
+        x: root.inset;
+        y: heading.y + heading.preferred-height + 4px;
+        width: root.words;
+        visible: root.detail != "";
+        text: root.detail;
+        color: Theme.muted;
+        font-size: 13px;
+        wrap: word-wrap;
+    }
 
-            about := Text {
-                visible: root.detail != "";
-                height: root.detail != "" ? self.preferred-height : 0px;
-                text: root.detail;
-                color: Theme.muted;
-                font-size: 13px;
-                wrap: word-wrap;
-            }
-        }
+    slot := HorizontalLayout {
+        x: root.stacked ? root.inset : root.width - self.width;
+        y: root.stacked ? 14px + root.words-height + 12px : (root.height - 1px - self.height) / 2;
+        width: self.preferred-width;
+        height: self.preferred-height;
+        @children
+    }
 
-        VerticalLayout {
-            alignment: center;
-            @children
-        }
+    Rectangle {
+        x: root.inset;
+        y: parent.height - 1px;
+        width: root.room;
+        height: 1px;
+        background: Theme.line;
     }
 }
 
-component SettingGroup inherits VerticalLayout {
-    in property <string> title;
-    spacing: 12px;
-
-    Text {
-        text: root.title;
-        color: Theme.text;
-        font-family: Theme.display;
-        font-size: 20px;
-        font-weight: 700;
-        height: 36px;
-        vertical-alignment: center;
+// Something wider that belongs to the setting above it (a plot, a form): set in from the
+// edge beside the same rule.
+component SettingNest inherits Rectangle {
+    HorizontalLayout {
+        padding-left: 22px;
+        padding-top: 14px;
+        padding-bottom: 14px;
+        @children
     }
 
-    @children
+    Rectangle {
+        x: 5px;
+        width: 2px;
+        height: parent.height;
+        background: Theme.line;
+    }
+
+    Rectangle {
+        x: 22px;
+        y: parent.height - 1px;
+        width: parent.width - 22px;
+        height: 1px;
+        background: Theme.line;
+    }
+}
+
+// Names a run of related settings within a section.
+component SettingHeading inherits Rectangle {
+    in property <string> text;
+    height: 52px;
+
+    Text {
+        x: 0;
+        y: parent.height - self.height - 6px;
+        text: root.text;
+        color: Theme.text;
+        font-family: Theme.display;
+        font-size: 18px;
+        font-weight: 700;
+    }
 }
 
 // A colour theme to pick: its surface colour with a dot of its accent, and its name.
@@ -1533,65 +1581,6 @@ component ThemeSwatch inherits Rectangle {
         color: white;
         font-size: 13px;
         font-weight: 600;
-    }
-}
-
-// One choice in the streaming quality list.
-component QualityRow inherits Rectangle {
-    in property <QualityOption> option;
-    in property <bool> selected;
-    callback clicked;
-
-    border-radius: 8px;
-    background: touch.has-hover ? Theme.hover : transparent;
-    animate background { duration: 120ms; }
-
-    accessible-role: button;
-    accessible-label: self.option.title;
-    accessible-checkable: true;
-    accessible-checked: self.selected;
-    accessible-action-default => { root.clicked(); }
-
-    touch := TouchArea {
-        mouse-cursor: pointer;
-        clicked => { root.clicked(); }
-    }
-
-    HorizontalLayout {
-        padding-left: 12px;
-        padding-right: 12px;
-        padding-top: 10px;
-        padding-bottom: 10px;
-        spacing: 16px;
-
-        VerticalLayout {
-            spacing: 3px;
-            horizontal-stretch: 1;
-
-            Text {
-                text: root.option.title;
-                color: root.selected ? Theme.accent-bright : Theme.text;
-                font-size: 15px;
-                font-weight: 600;
-            }
-
-            Text {
-                text: root.option.detail;
-                color: Theme.muted;
-                font-size: 13px;
-                wrap: word-wrap;
-            }
-        }
-
-        VerticalLayout {
-            alignment: center;
-            Icon {
-                source: Icons.check;
-                size: 18px;
-                tint: Theme.accent-bright;
-                opacity: root.selected ? 1 : 0;
-            }
-        }
     }
 }
 
@@ -1782,8 +1771,63 @@ component EqPanel inherits Rectangle {
     }
 }
 
+// Settings, a section at a time. Every setting is a row of the same shape, and each kind of
+// choice has one control: a switch for on or off, a segmented choice for one of a few, a
+// dropdown for one of many, a slider for an amount, a button for something to do.
 export component SettingsPage inherits Rectangle {
+    property <length> column: min(self.width - 2 * Theme.page-pad, 760px);
+    property <length> edge: (self.width - self.column) / 2;
+    // The title and the section chips stay put above the settings.
+    property <length> head: 116px;
+
+    Text {
+        x: root.edge;
+        y: 8px;
+        text: "Settings";
+        color: Theme.text;
+        font-family: Theme.display;
+        font-size: 34px;
+        font-weight: 800;
+    }
+
+    // Sideways-scrollable, for a window too narrow to show every section's chip.
+    Flickable {
+        x: root.edge;
+        y: 64px;
+        width: root.column;
+        height: 36px;
+        content-width: max(self.width, sections.preferred-width);
+        content-height: 36px;
+
+        sections := HorizontalLayout {
+            spacing: 6px;
+            alignment: start;
+
+            for name[index] in ["Appearance", "Playback", "Sound", "Storage", "Requests", "Account", "About"]: VerticalLayout {
+                alignment: center;
+                Chip {
+                    text: name;
+                    selected: index == Settings.tab;
+                    clicked => {
+                        Settings.tab = index;
+                        scroll.content-y = 0px;
+                    }
+                }
+            }
+        }
+    }
+
+    Rectangle {
+        x: root.edge;
+        y: root.head - 1px;
+        width: root.column;
+        height: 1px;
+        background: Theme.line;
+    }
+
     scroll := ScrollView {
+        y: root.head;
+        height: parent.height - root.head;
         vertical-scrollbar-policy: always-off;
         horizontal-scrollbar-policy: always-off;
 
@@ -1795,121 +1839,55 @@ export component SettingsPage inherits Rectangle {
                 alignment: center;
 
                 VerticalLayout {
-                    width: min(scroll.visible-width - 2 * Theme.page-pad, 760px);
+                    width: root.column;
                     alignment: start;
-                    padding-top: 8px;
                     padding-bottom: 56px;
-                    spacing: 28px;
 
-                    Text {
-                        text: "Settings";
-                        color: Theme.text;
-                        font-family: Theme.display;
-                        font-size: 34px;
-                        font-weight: 800;
-                    }
-
-                    SettingGroup {
-                        title: "Appearance";
-
+                    // ---- Appearance ----
+                    if Settings.tab == 0: VerticalLayout {
                         SettingRow {
                             title: "Theme";
                             detail: "Colours for the whole app, including the window's title bar.";
-                        }
-
-                        HorizontalLayout {
-                            spacing: 10px;
-                            for option[index] in Settings.themes: ThemeSwatch {
-                                option: option;
-                                selected: index == Settings.theme;
-                                clicked => { Settings.set-theme(index); }
-                            }
-                        }
-
-                        SettingRow {
-                            title: "Use the standard Windows title bar";
-                            detail: "Puts back the title bar Windows draws, above the app's own top bar. Try this if the window is hard to move, resize or snap.";
-                            Toggle {
-                                on: Settings.standard-title-bar;
-                                label: "Use the standard Windows title bar";
-                                toggled(on) => { Settings.set-standard-title-bar(on); }
+                            HorizontalLayout {
+                                spacing: 10px;
+                                for option[index] in Settings.themes: ThemeSwatch {
+                                    option: option;
+                                    selected: index == Settings.theme;
+                                    clicked => { Settings.set-theme(index); }
+                                }
                             }
                         }
 
                         SettingRow {
                             title: "Interface size";
                             detail: "Makes text and controls larger or smaller. Applies the next time the app starts.";
-                            HorizontalLayout {
-                                spacing: 6px;
-                                for name[index] in Settings.ui-scales: Chip {
-                                    text: name;
-                                    selected: index == Settings.ui-scale;
-                                    clicked => { Settings.set-ui-scale(index); }
-                                }
-                            }
-                        }
-                    }
-
-                    SettingGroup {
-                        title: "Audio quality";
-
-                        Text {
-                            text: "Lossless plays your files untouched. The other settings have your server convert to MP3 as you listen, which uses less data away from home.";
-                            color: Theme.muted;
-                            font-size: 13px;
-                            wrap: word-wrap;
-                        }
-
-                        VerticalLayout {
-                            spacing: 2px;
-                            for option[index] in Settings.qualities: QualityRow {
-                                option: option;
-                                selected: index == Settings.quality;
-                                clicked => { Settings.set-quality(index); }
-                            }
-                        }
-
-                        if Settings.now-format != "": Text {
-                            text: Settings.now-format;
-                            color: Theme.muted;
-                            font-size: 13px;
-                            wrap: word-wrap;
-                        }
-                    }
-
-                    SettingGroup {
-                        title: "Output";
-
-                        SettingRow {
-                            title: "Play through";
-                            detail: Settings.output-status;
-                            device := TextButton {
-                                text: Settings.output-device;
-                                max-width: 280px;
-                                clicked => { Settings.choose-device(device.absolute-position.x, device.absolute-position.y + device.height + 4px); }
+                            Segmented {
+                                label: "Interface size";
+                                options: Settings.ui-scales;
+                                selected: Settings.ui-scale;
+                                chosen(index) => { Settings.set-ui-scale(index); }
                             }
                         }
 
                         SettingRow {
-                            title: "Exclusive mode";
-                            detail: "Gives Nexus Music the device to itself and plays each song at its own sample rate, so nothing is resampled or mixed on the way out. Other apps are silent while music plays. For bit-perfect output, also keep the volume at full and leave the equaliser and volume levelling off.";
+                            title: "Standard Windows title bar";
+                            detail: "Puts back the title bar Windows draws, above the app's own. Try it if the window is hard to move, resize or snap.";
                             Toggle {
-                                on: Settings.exclusive;
-                                label: "Exclusive mode";
-                                toggled(on) => { Settings.set-exclusive(on); }
+                                on: Settings.standard-title-bar;
+                                label: "Standard Windows title bar";
+                                toggled(on) => { Settings.set-standard-title-bar(on); }
                             }
                         }
                     }
 
-                    SettingGroup {
-                        title: "Playback";
-
+                    // ---- Playback ----
+                    if Settings.tab == 1: VerticalLayout {
                         SettingRow {
-                            title: "Crossfade songs";
+                            title: "Crossfade";
                             detail: "Blends the end of each song into the start of the next.";
                             HorizontalLayout {
                                 spacing: 12px;
-                                fade := Slider {
+                                Slider {
                                     width: 200px;
                                     value: Settings.crossfade / 12;
                                     label: "Crossfade length";
@@ -1922,6 +1900,7 @@ export component SettingsPage inherits Rectangle {
                                     text: Settings.crossfade < 0.5 ? "Off" : Math.round(Settings.crossfade) + " s";
                                     color: Theme.text;
                                     font-size: 13px;
+                                    horizontal-alignment: right;
                                     vertical-alignment: center;
                                 }
                             }
@@ -1929,7 +1908,7 @@ export component SettingsPage inherits Rectangle {
 
                         SettingRow {
                             title: "Gapless playback";
-                            detail: "Runs one track straight into the next, the way live albums and mixes are meant to be heard.";
+                            detail: "Runs one track straight into the next, as live albums and mixes are meant to be heard.";
                             Toggle {
                                 on: Settings.gapless;
                                 label: "Gapless playback";
@@ -1948,6 +1927,64 @@ export component SettingsPage inherits Rectangle {
                         }
 
                         SettingRow {
+                            title: "Keep playing when the window is closed";
+                            detail: "Closing the window tucks Nexus Music into the notification area by the clock, where its icon brings it back or quits it.";
+                            Toggle {
+                                on: Settings.close-to-tray;
+                                label: "Keep playing when the window is closed";
+                                toggled(on) => { Settings.set-close-to-tray(on); }
+                            }
+                        }
+
+                        SettingRow {
+                            title: "Report plays to Navidrome";
+                            detail: "Keeps play counts and Recently played up to date, and feeds Last.fm or ListenBrainz if you linked them in Navidrome.";
+                            Toggle {
+                                on: Settings.scrobble;
+                                label: "Report plays to Navidrome";
+                                toggled(on) => { Settings.set-scrobble(on); }
+                            }
+                        }
+                    }
+
+                    // ---- Sound ----
+                    if Settings.tab == 2: VerticalLayout {
+                        SettingRow {
+                            title: "Streaming quality";
+                            detail: Settings.qualities[Settings.quality].detail + (Settings.now-format != "" ? "\n" + Settings.now-format : "");
+                            Segmented {
+                                label: "Streaming quality";
+                                options: Settings.quality-names;
+                                selected: Settings.quality;
+                                chosen(index) => { Settings.set-quality(index); }
+                            }
+                        }
+
+                        SettingRow {
+                            title: "Play through";
+                            detail: Settings.output-status;
+                            device := Select {
+                                label: "Play through";
+                                text: Settings.output-device;
+                                clicked => { Settings.choose-device(device.absolute-position.x, device.absolute-position.y + device.height + 4px); }
+                            }
+                        }
+
+                        SettingRow {
+                            title: "Exclusive mode";
+                            detail: "Gives Nexus Music the device to itself and plays each song at its own sample rate, with nothing resampled or mixed in. Other apps are silent meanwhile. For bit-perfect output, also keep the volume at full and the equaliser and volume levelling off.";
+                            Toggle {
+                                on: Settings.exclusive;
+                                label: "Exclusive mode";
+                                toggled(on) => { Settings.set-exclusive(on); }
+                            }
+                        }
+
+                        SettingHeading {
+                            text: "Volume and tone";
+                        }
+
+                        SettingRow {
                             title: "Even out volume";
                             detail: "Uses the ReplayGain tags in your files so quiet and loud tracks play at a similar level.";
                             Toggle {
@@ -1958,28 +1995,26 @@ export component SettingsPage inherits Rectangle {
                         }
 
                         if Settings.normalize: SettingRow {
-                            title: "Volume level";
+                            nested: true;
+                            title: "Level";
                             detail: "How loud that level is. Loud can round off the peaks of dynamic music; Normal and Quiet never do.";
-                            HorizontalLayout {
-                                spacing: 6px;
-                                for name[index] in Settings.volume-levels: Chip {
-                                    text: name;
-                                    selected: index == Settings.volume-level;
-                                    clicked => { Settings.set-volume-level(index); }
-                                }
+                            Segmented {
+                                label: "Volume level";
+                                options: Settings.volume-levels;
+                                selected: Settings.volume-level;
+                                chosen(index) => { Settings.set-volume-level(index); }
                             }
                         }
 
                         if Settings.normalize: SettingRow {
+                            nested: true;
                             title: "Level by";
                             detail: "Song makes every song equally loud. Album keeps an album's quiet and loud songs in proportion. Auto uses Album while you play an album through, and Song otherwise.";
-                            HorizontalLayout {
-                                spacing: 6px;
-                                for name[index] in Settings.level-modes: Chip {
-                                    text: name;
-                                    selected: index == Settings.level-mode;
-                                    clicked => { Settings.set-level-mode(index); }
-                                }
+                            Segmented {
+                                label: "Level by";
+                                options: Settings.level-modes;
+                                selected: Settings.level-mode;
+                                chosen(index) => { Settings.set-level-mode(index); }
                             }
                         }
 
@@ -2003,22 +2038,267 @@ export component SettingsPage inherits Rectangle {
                             }
                         }
 
-                        if Settings.equalizer: EqPanel { }
+                        if Settings.equalizer: SettingNest {
+                            EqPanel { }
+                        }
+                    }
+
+                    // ---- Storage ----
+                    if Settings.tab == 3: VerticalLayout {
+                        SettingRow {
+                            title: "Offline mode";
+                            detail: "Plays only what's on this PC and doesn't contact your server. Likes, ratings and plays are kept and sent when you turn it off.";
+                            Toggle {
+                                on: Settings.offline;
+                                label: "Offline mode";
+                                toggled(on) => { Settings.set-offline(on); }
+                            }
+                        }
+
+                        SettingHeading {
+                            text: "Downloads";
+                        }
 
                         SettingRow {
-                            title: "Report plays to Navidrome";
-                            detail: "Keeps play counts and Recently played up to date, and feeds Last.fm or ListenBrainz if you linked them in Navidrome.";
-                            Toggle {
-                                on: Settings.scrobble;
-                                label: "Report plays to Navidrome";
-                                toggled(on) => { Settings.set-scrobble(on); }
+                            title: "Download quality";
+                            detail: "What new downloads are saved as. Lossless keeps each file exactly as it is on your server; the others save smaller MP3 copies.";
+                            Segmented {
+                                label: "Download quality";
+                                options: Settings.quality-names;
+                                selected: Settings.download-quality;
+                                chosen(index) => { Settings.set-download-quality(index); }
+                            }
+                        }
+
+                        SettingRow {
+                            title: "Downloaded songs";
+                            detail: Settings.downloads-summary + ". They play without the server, and from disk even when it's reachable.";
+                            TextButton {
+                                text: "Remove all";
+                                clicked => { Settings.remove-downloads(); }
+                            }
+                        }
+
+                        SettingHeading {
+                            text: "Kept songs";
+                        }
+
+                        SettingRow {
+                            title: "Keep songs as they play";
+                            detail: "Replays then start at once and need no connection. This is the space they may take; when it's used, the ones played longest ago make way. " + Settings.kept-songs + " kept now.";
+                            Segmented {
+                                label: "Space for kept songs";
+                                options: Settings.cache-limits;
+                                selected: Settings.cache-limit;
+                                chosen(index) => { Settings.set-cache-limit(index); }
+                            }
+                        }
+
+                        if Settings.cache-limit > 0: SettingRow {
+                            nested: true;
+                            title: "Fetch ahead";
+                            detail: "How many songs after the one playing are fetched in advance. If your connection drops, the music carries on through those.";
+                            Segmented {
+                                label: "Songs fetched ahead";
+                                options: Settings.cache-aheads;
+                                selected: Settings.cache-ahead;
+                                chosen(index) => { Settings.set-cache-ahead(index); }
+                            }
+                        }
+
+                        SettingHeading {
+                            text: "Cache";
+                        }
+
+                        SettingRow {
+                            title: "Cover art and pages";
+                            detail: Settings.cache-size + " saved on this PC, so things you've seen before open instantly. Clearing it clears the kept songs too.";
+                            TextButton {
+                                text: "Clear cache";
+                                clicked => { Settings.clear-cache(); }
                             }
                         }
                     }
 
-                    SettingGroup {
-                        title: "Server";
+                    // ---- Requests ----
+                    if Settings.tab == 4: VerticalLayout {
+                        SettingRow {
+                            title: "Ask for music that isn't in your library";
+                            detail: "For people who run Lidarr beside their music server. Search gains a “Not in your library” section; asking for something there puts it on Lidarr's list, and the Requests page shows what's on its way. Songs and track lists are looked up at MusicBrainz, which is sent what you search for.";
+                            Toggle {
+                                on: Settings.requests;
+                                label: "Ask for music that isn't in your library";
+                                toggled(on) => { Settings.set-requests(on); }
+                            }
+                        }
 
+                        if Settings.requests: SettingRow {
+                            nested: true;
+                            title: "Singles and EPs too";
+                            detail: "A song that never came out on an album is offered on its single or EP, and artists' pages list those as well. Asking for one has Lidarr list that artist's singles and EPs alongside their albums; only what you ask for is fetched.";
+                            Toggle {
+                                on: Settings.request-singles;
+                                label: "Singles and EPs too";
+                                toggled(on) => { Settings.set-request-singles(on); }
+                            }
+                        }
+
+                        if Settings.requests: SettingNest {
+                            lidarr-box := VerticalLayout {
+                                // Something typed that hasn't been saved.
+                                property <bool> edited: lidarr-address.text != Settings.lidarr-address || lidarr-key.text != "";
+                                property <bool> can-connect: lidarr-address.text != "" && (lidarr-key.text != "" || Settings.lidarr-key-hint != "");
+                                function connect() {
+                                    if self.can-connect {
+                                        Settings.save-requests(lidarr-address.text, lidarr-key.text);
+                                        lidarr-key.text = "";
+                                        lidarr-address.text = Settings.lidarr-address;
+                                    }
+                                }
+                                spacing: 12px;
+
+                                HorizontalLayout {
+                                    spacing: 12px;
+
+                                    VerticalLayout {
+                                        spacing: 6px;
+                                        horizontal-stretch: 3;
+
+                                        Text {
+                                            text: "Lidarr's address";
+                                            color: Theme.text;
+                                            font-size: 13px;
+                                            font-weight: 600;
+                                        }
+
+                                        lidarr-address := Field {
+                                            text: Settings.lidarr-address;
+                                            placeholder: "https://lidarr.example.org";
+                                            label: "Lidarr's address";
+                                            accepted => { lidarr-box.connect(); }
+                                        }
+                                    }
+
+                                    VerticalLayout {
+                                        spacing: 6px;
+                                        horizontal-stretch: 2;
+
+                                        Text {
+                                            text: "API key";
+                                            color: Theme.text;
+                                            font-size: 13px;
+                                            font-weight: 600;
+                                        }
+
+                                        lidarr-key := Field {
+                                            input-type: InputType.password;
+                                            placeholder: Settings.lidarr-key-hint != "" ? Settings.lidarr-key-hint : "In Lidarr: Settings, General";
+                                            placeholder-ink: Settings.lidarr-key-hint != "" ? Theme.muted : Theme.faint;
+                                            label: "Lidarr API key";
+                                            accepted => { lidarr-box.connect(); }
+                                        }
+                                    }
+                                }
+
+                                // Where things stand, and the one thing to do next.
+                                Rectangle {
+                                    background: Theme.raised;
+                                    border-radius: 10px;
+                                    border-width: 1px;
+                                    border-color: Theme.line;
+
+                                    HorizontalLayout {
+                                        padding: 14px;
+                                        padding-left: 16px;
+                                        spacing: 12px;
+
+                                        VerticalLayout {
+                                            alignment: center;
+
+                                            Rectangle {
+                                                width: 10px;
+                                                height: 10px;
+                                                border-radius: 5px;
+                                                background: Settings.requests-state == "connected" ? #4cc38a
+                                                    : Settings.requests-state == "error" ? Theme.danger
+                                                    : Settings.requests-state == "none" ? Theme.faint
+                                                    : Theme.warm;
+                                                animate background { duration: 150ms; }
+                                            }
+                                        }
+
+                                        VerticalLayout {
+                                            alignment: center;
+                                            spacing: 4px;
+                                            horizontal-stretch: 1;
+
+                                            Text {
+                                                text: Settings.requests-status;
+                                                color: Theme.text;
+                                                font-size: 14px;
+                                                font-weight: 500;
+                                                wrap: word-wrap;
+                                            }
+
+                                            if Settings.lidarr-has-token: Text {
+                                                text: (Settings.lidarr-signed-in != "" ? "Signed in as " + Settings.lidarr-signed-in : "Signed in") + " at " + Settings.lidarr-gate + ". This PC keeps a token from that sign-in, not your password.";
+                                                color: Theme.muted;
+                                                font-size: 13px;
+                                                wrap: word-wrap;
+                                            }
+
+                                            if !Settings.lidarr-has-token && (Settings.requests-state == "sign-in" || Settings.requests-state == "waiting"): Text {
+                                                text: "You sign in on its own page, in your browser. Your password isn't typed into this app or kept by it.";
+                                                color: Theme.muted;
+                                                font-size: 13px;
+                                                wrap: word-wrap;
+                                            }
+
+                                            if Settings.lidarr-has-token && Settings.requests-state != "waiting": HorizontalLayout {
+                                                alignment: start;
+
+                                                LinkText {
+                                                    text: "Sign out";
+                                                    ink: Theme.accent-bright;
+                                                    clicked => { Settings.sign-out-requests(); }
+                                                }
+                                            }
+                                        }
+
+                                        VerticalLayout {
+                                            alignment: center;
+
+                                            if Settings.requests-state == "waiting": TextButton {
+                                                text: "Cancel";
+                                                clicked => { Settings.cancel-sign-in(); }
+                                            }
+
+                                            if Settings.requests-state != "waiting" && (lidarr-box.edited || Settings.requests-state == "none"): TextButton {
+                                                text: "Connect";
+                                                primary: true;
+                                                enabled: lidarr-box.can-connect;
+                                                clicked => { lidarr-box.connect(); }
+                                            }
+
+                                            if !lidarr-box.edited && Settings.requests-state == "sign-in": TextButton {
+                                                text: "Sign in with browser";
+                                                primary: true;
+                                                clicked => { Settings.sign-in-requests(); }
+                                            }
+
+                                            if !lidarr-box.edited && Settings.requests-state == "error": TextButton {
+                                                text: "Try again";
+                                                clicked => { Settings.check-requests(); }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // ---- Account ----
+                    if Settings.tab == 5: VerticalLayout {
                         SettingRow {
                             title: App.server;
                             detail: "Signed in as " + App.username + (App.server-version != "" ? ", Navidrome " + App.server-version : "") + (Settings.connection != "" ? ". " + Settings.connection : "");
@@ -2029,290 +2309,27 @@ export component SettingsPage inherits Rectangle {
                         }
 
                         SettingRow {
-                            title: "Import playlists from Spotify";
-                            detail: "Export your playlists from Spotify first: one CSV file each from a tool such as Exportify, or Playlist1.json from the data Spotify sends when you ask for it. Songs are matched to your library by title and artist, and the ones that aren't found are listed. Importing again later adds songs you've since added to your library.";
-                            TextButton {
-                                text: "Choose files";
-                                clicked => { Settings.import-spotify(); }
-                            }
-                        }
-
-                        SettingRow {
                             title: "Keep my devices in step";
-                            detail: "Your queue, Recently played, pinned playlists, each list's shuffle and sort, the dates songs were added, and the theme follow you to Nexus Music on other devices signed in to this account. Kept on your server, in a playlist named “Nexus Music sync” that other apps will show; leave it be.";
+                            detail: "Your queue, Recently played, pinned playlists, each list's shuffle and sort, the dates songs were added and the theme follow you to Nexus Music on other devices. Kept on your server in a playlist named “Nexus Music sync”, which other apps will show; leave it be.";
                             Toggle {
                                 on: Settings.sync;
                                 label: "Keep my devices in step";
                                 toggled(on) => { Settings.set-sync(on); }
                             }
                         }
-                    }
-
-                    SettingGroup {
-                        title: "Requests";
 
                         SettingRow {
-                            title: "Ask for albums that aren't in your library";
-                            detail: "For people who run Lidarr beside their music server. Search results gain a “Not in your library” section of songs, artists and albums; asking for one puts its album on Lidarr's list, and a Requests page shows what's on its way. Songs and track lists are looked up at MusicBrainz, which is sent what you search for.";
-                            Toggle {
-                                on: Settings.requests;
-                                label: "Ask for albums that aren't in your library";
-                                toggled(on) => { Settings.set-requests(on); }
-                            }
-                        }
-
-                        if Settings.requests: SettingRow {
-                            title: "Singles and EPs too";
-                            detail: "A song that never came out on an album is offered on the single or EP it did come out on, and an artist's page lists those as well. Asking for one has Lidarr list that artist's singles and EPs alongside their albums; only what you ask for is fetched.";
-                            Toggle {
-                                on: Settings.request-singles;
-                                label: "Singles and EPs too";
-                                toggled(on) => { Settings.set-request-singles(on); }
-                            }
-                        }
-
-                        if Settings.requests: lidarr-box := VerticalLayout {
-                            // Something typed that hasn't been saved.
-                            property <bool> edited: lidarr-address.text != Settings.lidarr-address || lidarr-key.text != "";
-                            property <bool> can-connect: lidarr-address.text != "" && (lidarr-key.text != "" || Settings.lidarr-key-hint != "");
-                            function connect() {
-                                if self.can-connect {
-                                    Settings.save-requests(lidarr-address.text, lidarr-key.text);
-                                    lidarr-key.text = "";
-                                    lidarr-address.text = Settings.lidarr-address;
-                                }
-                            }
-                            spacing: 12px;
-                            padding-top: 4px;
-
-                            HorizontalLayout {
-                                spacing: 12px;
-
-                                VerticalLayout {
-                                    spacing: 6px;
-                                    horizontal-stretch: 3;
-
-                                    Text {
-                                        text: "Lidarr's address";
-                                        color: Theme.text;
-                                        font-size: 13px;
-                                        font-weight: 600;
-                                    }
-
-                                    lidarr-address := Field {
-                                        text: Settings.lidarr-address;
-                                        placeholder: "https://lidarr.example.org";
-                                        label: "Lidarr's address";
-                                        accepted => { lidarr-box.connect(); }
-                                    }
-                                }
-
-                                VerticalLayout {
-                                    spacing: 6px;
-                                    horizontal-stretch: 2;
-
-                                    Text {
-                                        text: "API key";
-                                        color: Theme.text;
-                                        font-size: 13px;
-                                        font-weight: 600;
-                                    }
-
-                                    lidarr-key := Field {
-                                        input-type: InputType.password;
-                                        placeholder: Settings.lidarr-key-hint != "" ? Settings.lidarr-key-hint : "In Lidarr: Settings, General";
-                                        placeholder-ink: Settings.lidarr-key-hint != "" ? Theme.muted : Theme.faint;
-                                        label: "Lidarr API key";
-                                        accepted => { lidarr-box.connect(); }
-                                    }
-                                }
-                            }
-
-                            // Where things stand, and the one thing to do next.
-                            Rectangle {
-                                background: Theme.raised;
-                                border-radius: 10px;
-                                border-width: 1px;
-                                border-color: Theme.line;
-
-                                HorizontalLayout {
-                                    padding: 14px;
-                                    padding-left: 16px;
-                                    spacing: 12px;
-
-                                    VerticalLayout {
-                                        alignment: start;
-                                        padding-top: 5px;
-
-                                        Rectangle {
-                                            width: 10px;
-                                            height: 10px;
-                                            border-radius: 5px;
-                                            background: Settings.requests-state == "connected" ? #4cc38a
-                                                : Settings.requests-state == "error" ? Theme.danger
-                                                : Settings.requests-state == "none" ? Theme.faint
-                                                : Theme.warm;
-                                            animate background { duration: 150ms; }
-                                        }
-                                    }
-
-                                    VerticalLayout {
-                                        alignment: center;
-                                        spacing: 4px;
-                                        horizontal-stretch: 1;
-
-                                        Text {
-                                            text: Settings.requests-status;
-                                            color: Theme.text;
-                                            font-size: 14px;
-                                            font-weight: 500;
-                                            wrap: word-wrap;
-                                        }
-
-                                        if Settings.lidarr-has-token: Text {
-                                            text: (Settings.lidarr-signed-in != "" ? "Signed in as " + Settings.lidarr-signed-in : "Signed in") + " at " + Settings.lidarr-gate + ". This PC keeps a token from that sign-in, not your password.";
-                                            color: Theme.muted;
-                                            font-size: 13px;
-                                            wrap: word-wrap;
-                                        }
-
-                                        if !Settings.lidarr-has-token && (Settings.requests-state == "sign-in" || Settings.requests-state == "waiting"): Text {
-                                            text: "You sign in on its own page, in your browser. Your password isn't typed into this app or kept by it.";
-                                            color: Theme.muted;
-                                            font-size: 13px;
-                                            wrap: word-wrap;
-                                        }
-
-                                        if Settings.lidarr-has-token && Settings.requests-state != "waiting": HorizontalLayout {
-                                            alignment: start;
-
-                                            LinkText {
-                                                text: "Sign out";
-                                                ink: Theme.accent-bright;
-                                                clicked => { Settings.sign-out-requests(); }
-                                            }
-                                        }
-                                    }
-
-                                    VerticalLayout {
-                                        alignment: center;
-
-                                        if Settings.requests-state == "waiting": TextButton {
-                                            text: "Cancel";
-                                            clicked => { Settings.cancel-sign-in(); }
-                                        }
-
-                                        if Settings.requests-state != "waiting" && (lidarr-box.edited || Settings.requests-state == "none"): TextButton {
-                                            text: "Connect";
-                                            primary: true;
-                                            enabled: lidarr-box.can-connect;
-                                            clicked => { lidarr-box.connect(); }
-                                        }
-
-                                        if !lidarr-box.edited && Settings.requests-state == "sign-in": TextButton {
-                                            text: "Sign in with browser";
-                                            primary: true;
-                                            clicked => { Settings.sign-in-requests(); }
-                                        }
-
-                                        if !lidarr-box.edited && Settings.requests-state == "error": TextButton {
-                                            text: "Try again";
-                                            clicked => { Settings.check-requests(); }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    SettingGroup {
-                        title: "Window";
-
-                        SettingRow {
-                            title: "Keep playing when the window is closed";
-                            detail: "Closing the window tucks Nexus Music into the notification area by the clock, where its icon brings it back or quits it.";
-                            Toggle {
-                                on: Settings.close-to-tray;
-                                label: "Keep playing when the window is closed";
-                                toggled(on) => { Settings.set-close-to-tray(on); }
-                            }
-                        }
-                    }
-
-                    SettingGroup {
-                        title: "Storage";
-
-                        SettingRow {
-                            title: "Offline mode";
-                            detail: "Plays only what's downloaded and doesn't contact your server. Likes, ratings and plays are kept and sent when you turn it off.";
-                            Toggle {
-                                on: Settings.offline;
-                                label: "Offline mode";
-                                toggled(on) => { Settings.set-offline(on); }
-                            }
-                        }
-
-                        SettingRow {
-                            title: "Download quality";
-                            detail: "What new downloads are saved as. Lossless keeps each file exactly as it is on your server; the others save smaller MP3 copies.";
-                            HorizontalLayout {
-                                spacing: 6px;
-                                for option[index] in Settings.qualities: Chip {
-                                    text: option.title;
-                                    selected: index == Settings.download-quality;
-                                    clicked => { Settings.set-download-quality(index); }
-                                }
-                            }
-                        }
-
-                        SettingRow {
-                            title: "Downloads";
-                            detail: Settings.downloads-summary + ". Songs saved on this PC play without the server, and from disk even when it's reachable.";
+                            title: "Import playlists from Spotify";
+                            detail: "Export them first: a CSV file each from a tool such as Exportify, or Playlist1.json from Spotify's data download. Songs are matched to your library by title and artist, and the ones that aren't found are listed. Importing again later adds what your library has gained.";
                             TextButton {
-                                text: "Remove all";
-                                clicked => { Settings.remove-downloads(); }
-                            }
-                        }
-
-                        SettingRow {
-                            title: "Keep songs ready";
-                            detail: "Songs are kept on this PC as they play, so replays start at once and need no connection. When this much space is used, the ones played longest ago make way. " + Settings.kept-songs + " kept now.";
-                            HorizontalLayout {
-                                spacing: 6px;
-                                for name[index] in Settings.cache-limits: Chip {
-                                    text: name;
-                                    selected: index == Settings.cache-limit;
-                                    clicked => { Settings.set-cache-limit(index); }
-                                }
-                            }
-                        }
-
-                        if Settings.cache-limit > 0: SettingRow {
-                            title: "Fetch songs ahead";
-                            detail: "How many songs after the one playing are fetched in advance. If your connection drops, the music carries on through those.";
-                            HorizontalLayout {
-                                spacing: 6px;
-                                for name[index] in Settings.cache-aheads: Chip {
-                                    text: name;
-                                    selected: index == Settings.cache-ahead;
-                                    clicked => { Settings.set-cache-ahead(index); }
-                                }
-                            }
-                        }
-
-                        SettingRow {
-                            title: "Cache";
-                            detail: Settings.cache-size + " of cover art and page data saved on this PC, so things you've seen before open instantly. Clearing it clears the kept songs too.";
-                            TextButton {
-                                text: "Clear cache";
-                                clicked => { Settings.clear-cache(); }
+                                text: "Choose files";
+                                clicked => { Settings.import-spotify(); }
                             }
                         }
                     }
 
-                    SettingGroup {
-                        title: "About";
-
+                    // ---- About ----
+                    if Settings.tab == 6: VerticalLayout {
                         SettingRow {
                             title: "Nexus Music " + App.app-version;
                             detail: Settings.update-status;
@@ -2338,17 +2355,22 @@ export component SettingsPage inherits Rectangle {
                             }
                         }
 
-                        Text {
-                            text: "A native player for Navidrome. Fonts: Bricolage Grotesque and Hanken Grotesk (SIL Open Font License). Icons: Lucide (ISC License).";
-                            color: Theme.muted;
-                            font-size: 13px;
-                            wrap: word-wrap;
-                        }
+                        VerticalLayout {
+                            padding-top: 20px;
+                            spacing: 16px;
 
-                        HorizontalLayout {
-                            alignment: start;
-                            AboutSlint {
-                                width: 180px;
+                            Text {
+                                text: "A native player for Navidrome. Fonts: Bricolage Grotesque and Hanken Grotesk (SIL Open Font License). Icons: Lucide (ISC License).";
+                                color: Theme.muted;
+                                font-size: 13px;
+                                wrap: word-wrap;
+                            }
+
+                            HorizontalLayout {
+                                alignment: start;
+                                AboutSlint {
+                                    width: 180px;
+                                }
                             }
                         }
                     }
@@ -2359,6 +2381,8 @@ export component SettingsPage inherits Rectangle {
 
     ScrollThumb {
         x: parent.width - self.width;
+        y: root.head;
+        height: parent.height - root.head;
         content-y <=> scroll.content-y;
         content-height: scroll.content-height;
         visible-height: scroll.visible-height;
