@@ -49,7 +49,7 @@ by the app itself.
   WMA, APE and so on) is converted to MP3 by Navidrome on the fly.
 - Create, rename, pin and delete playlists; add and remove songs, with a warning before
   adding one that's already there; like songs and albums.
-- Synced lyrics, from Navidrome: it serves the ones embedded in a song or in a `.lrc` file beside it. The app doesn't fetch lyrics itself, so every app that uses your server shows the same ones. To fill in a library that has none, put `.lrc` files beside the songs with a tool such as [LRCGET](https://github.com/tranxuanthang/lrcget).
+- Synced lyrics, from Navidrome: it serves the ones embedded in a song or in a `.lrc` file beside it. The app doesn't look lyrics up anywhere else, so every app that uses your server shows the same ones. It keeps a copy of what the server says, and fetches the lyrics of the next few songs in the queue ahead of time, so they show the instant you open them and are there when you're offline. To fill in a library that has none, put `.lrc` files beside the songs with a tool such as [LRCGET](https://github.com/tranxuanthang/lrcget).
 - A mini player: a small window that stays on top of other apps, with the artwork, the song, and buttons to pause, skip and like.
 - "Your stats": what you've played most (songs, artists, albums and kinds of music) and how many hours it comes to, for all time, the last six months or the last four weeks. All time uses your server's play counts; the shorter periods use a log of plays this app keeps on your PC from the day you install this version.
 - Recommended songs under each playlist: songs from your library like the ones in it, each with a button to add it.
@@ -174,6 +174,7 @@ connection.
 | `src/musicbrainz.rs` | Finds songs, discographies and track lists for music that isn't in the library. |
 | `src/gate.rs` | Browser sign-in for a Lidarr that sits behind Authentik. |
 | `src/update.rs` | Finds, downloads and verifies new releases. |
+| `src/lyrics.rs` | The server's lyrics, kept so they show at once. |
 | `src/plays.rs` | The log of plays behind "Your stats". |
 | `src/listenbrainz.rs` | How much songs, releases and artists are played. |
 | `src/discover.rs` | Artists worth a look that the library doesn't have. |

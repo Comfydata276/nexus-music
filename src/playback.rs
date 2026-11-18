@@ -525,6 +525,7 @@ impl Controller {
     /// connection drops, and makes room among the kept songs when they outgrow their limit.
     /// Called every few seconds while something is playing.
     pub fn keep_ahead(self: &Rc<Self>) {
+        self.fetch_lyrics_ahead();
         let (ahead, limit) = {
             let settings = self.settings.borrow();
             (settings.cache_ahead as usize, settings.cache_limit_mb as u64 * 1024 * 1024)
@@ -1517,6 +1518,7 @@ impl Controller {
         }
         self.sync_history();
         self.share_soon();
+        self.fetch_lyrics_ahead();
     }
 
     /// How many entries at the top of the history the panel leaves out: the song playing now
@@ -1662,18 +1664,86 @@ impl Controller {
             return;
         }
         *self.lyrics.borrow_mut() = LyricsState { song_id: song.id.clone(), ..Default::default() };
-        lyrics.set_lines(ModelRc::default());
-        lyrics.set_status("Looking for lyrics…".into());
+        // What's kept from the last time the server was asked shows at once.
+        let dir = self.lyrics_dir();
+        let had = dir.as_ref().and_then(|dir| crate::lyrics::kept(dir, &song.id)).map(|kept| kept.lyrics);
+        match &had {
+            Some(kept) => self.show_lyrics(kept.clone()),
+            None => {
+                lyrics.set_lines(ModelRc::default());
+                lyrics.set_status("Looking for lyrics…".into());
+            }
+        }
+        // The server is asked all the same: for a first look, or in case they've changed.
         let id = song.id.clone();
         self.request(
-            move |client| client.lyrics(&id),
+            move |client| {
+                let found = client.lyrics(&id)?;
+                if let Some(dir) = &dir {
+                    crate::lyrics::keep(dir, &id, &found);
+                }
+                Ok(found)
+            },
             move |ctl, result| {
                 if ctl.lyrics.borrow().song_id != song.id {
                     return;
                 }
-                ctl.show_lyrics(result.ok().flatten());
+                match result {
+                    // Only redrawn if they differ, so the page isn't disturbed for nothing.
+                    Ok(found) => {
+                        if had.as_ref() != Some(&found) {
+                            ctl.show_lyrics(found);
+                        }
+                    }
+                    // The server couldn't be asked: what's kept stays; with nothing kept, say so.
+                    Err(_) => {
+                        if had.is_none() {
+                            ctl.show_lyrics(None);
+                        }
+                    }
+                }
             },
         );
+    }
+
+    /// Fetches the lyrics of the song playing and the next few in the queue, so they're
+    /// on hand before anyone opens them. Each song is asked about once a session; opening
+    /// its lyrics asks again.
+    pub fn fetch_lyrics_ahead(self: &Rc<Self>) {
+        const AHEAD: usize = 5;
+        const FRESH: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+        if self.is_offline() {
+            return;
+        }
+        let (Some(client), Some(dir)) = (self.client(), self.lyrics_dir()) else { return };
+        let wanted: Vec<String> = {
+            let pb = self.playback.borrow();
+            let mut asked = self.lyrics_asked.borrow_mut();
+            pb.order
+                .iter()
+                .skip(pb.cursor)
+                .take(AHEAD + 1)
+                .filter_map(|&i| pb.queue.get(i))
+                .filter(|song| !song.id.is_empty() && song.radio_url.is_empty())
+                .filter(|song| asked.insert(song.id.clone()))
+                .map(|song| song.id.clone())
+                .collect()
+        };
+        if wanted.is_empty() {
+            return;
+        }
+        self.api_pool.spawn(move || {
+            for id in wanted {
+                // Asked lately and it had some: no need. One that had none is asked about
+                // again, since lyrics get added to a library after the songs do.
+                if crate::lyrics::kept(&dir, &id).is_some_and(|kept| kept.lyrics.is_some() && kept.age < FRESH) {
+                    continue;
+                }
+                if let Ok(found) = client.lyrics(&id) {
+                    crate::lyrics::keep(&dir, &id, &found);
+                }
+            }
+        });
     }
 
     fn show_lyrics(self: &Rc<Self>, found: Option<Lyrics>) {

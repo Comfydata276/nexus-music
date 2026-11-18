@@ -299,6 +299,8 @@ pub struct Controller {
     pub menu: RefCell<crate::actions::MenuState>,
     pub prompt: RefCell<Option<crate::actions::PromptAction>>,
     pub lyrics: RefCell<crate::playback::LyricsState>,
+    /// Songs whose lyrics have been fetched ahead in this session.
+    pub lyrics_asked: RefCell<std::collections::HashSet<String>>,
     #[cfg(windows)]
     pub media: RefCell<Option<crate::media::MediaKeys>>,
     client: RefCell<Option<Client>>,
@@ -418,6 +420,7 @@ impl Controller {
             menu: RefCell::default(),
             prompt: RefCell::new(None),
             lyrics: RefCell::default(),
+            lyrics_asked: RefCell::default(),
             #[cfg(windows)]
             media: RefCell::new(None),
             client: RefCell::new(None),
@@ -1937,6 +1940,11 @@ impl Controller {
         let client = self.client()?;
         let who = format!("{}|{}", client.server(), client.username());
         Some(self.paths.pages.join(file_stem(&who)))
+    }
+
+    /// Where lyrics are kept for the server that's signed in to (see `lyrics`).
+    pub fn lyrics_dir(&self) -> Option<PathBuf> {
+        Some(self.pages_dir()?.join("lyrics"))
     }
 
     /// A stored copy of a page and its age: from memory, or from disk on the first visit of

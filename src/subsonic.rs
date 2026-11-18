@@ -214,7 +214,7 @@ pub struct Found {
     pub songs: Vec<Song>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct LyricLine {
     /// Milliseconds from the start of the track; absent for unsynced lyrics.
@@ -222,7 +222,7 @@ pub struct LyricLine {
     pub value: String,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Lyrics {
     pub synced: bool,
