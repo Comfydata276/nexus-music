@@ -525,10 +525,6 @@ export global Settings {
     callback import-spotify();
     // Asking a Lidarr server for albums that aren't in the library.
     in property <bool> requests;
-    // Lyrics the server doesn't have are looked up online; and how far that's got.
-    in property <bool> online-lyrics;
-    in property <string> lyrics-status;
-    callback set-online-lyrics(on: bool);
     // Singles and EPs are offered as well as albums.
     in property <bool> request-singles;
     callback set-request-singles(on: bool);

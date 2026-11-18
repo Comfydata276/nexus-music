@@ -435,8 +435,8 @@ impl Controller {
             import_fills: RefCell::default(),
             asked: RefCell::new({
                 crate::discover::set_place(paths.discover.clone());
-                crate::lyrics::set_place(paths.lyrics.clone());
-                crate::lyrics::start();
+                // Lyrics the app once fetched for itself; the server provides them now.
+                let _ = std::fs::remove_dir_all(&paths.old_lyrics);
                 crate::asked::AskedList::load(&paths.asked)
             }),
             asked_ticks: Cell::new(0),
@@ -1711,10 +1711,6 @@ impl Controller {
                     }
                 }
             }
-            if renewed {
-                // There may be songs whose lyrics haven't been looked for.
-                crate::lyrics::wake();
-            }
             if renewed && online {
                 // Which songs are liked, as of now.
                 if let Ok(found) = client.starred() {
@@ -2976,7 +2972,6 @@ impl Controller {
         page.set_cache_ahead(config::CACHE_AHEAD.iter().position(|songs| *songs == settings.cache_ahead).unwrap_or(0) as i32);
         page.set_requests(settings.requests);
         page.set_request_singles(settings.request_singles);
-        page.set_online_lyrics(settings.online_lyrics);
         page.set_lidarr_address(settings.lidarr_address.as_str().into());
         page.set_lidarr_key_hint(config::load_secret(&self.paths, "lidarr-key").map(|key| crate::lidarr::mask(&key)).unwrap_or_default().into());
         let gate = crate::gate::Found { service: settings.lidarr_gate.clone(), client: String::new() };
@@ -3344,14 +3339,6 @@ impl Controller {
                 if on {
                     ctl.check_requests(false);
                 }
-            });
-        });
-        settings.on_set_online_lyrics(|on| {
-            with(|ctl| {
-                ctl.change_setting(true, |s| s.online_lyrics = on);
-                ctl.follow_lyrics_setting();
-                // The song that's playing may have some now.
-                ctl.reload_lyrics();
             });
         });
         settings.on_set_request_singles(|on| {

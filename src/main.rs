@@ -19,7 +19,6 @@ mod instance;
 #[cfg(windows)]
 mod media;
 mod lidarr;
-mod lyrics;
 mod listenbrainz;
 mod mixes;
 mod musicbrainz;

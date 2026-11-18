@@ -2041,16 +2041,6 @@ export component SettingsPage inherits Rectangle {
                                 toggled(on) => { Settings.set-scrobble(on); }
                             }
                         }
-
-                        SettingRow {
-                            title: "Find lyrics online";
-                            detail: "When your server has no lyrics for a song, gets them from LRCLIB, a free lyrics collection, and keeps them on this PC. Your whole library is looked up in the background, which takes a few hours the first time, so LRCLIB is sent each song's title, artist, album and length." + (Settings.lyrics-status != "" ? "\n" + Settings.lyrics-status : "");
-                            Toggle {
-                                on: Settings.online-lyrics;
-                                label: "Find lyrics online";
-                                toggled(on) => { Settings.set-online-lyrics(on); }
-                            }
-                        }
                     }
 
                     // ---- Sound ----

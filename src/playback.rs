@@ -1073,9 +1073,6 @@ impl Controller {
         if self.mini_open.get() {
             self.sync_mini();
         }
-        if keep_ticks % 8 == 0 {
-            self.follow_lyrics_setting();
-        }
         // Keep the maximise button, and the title bar's sense of scale, in step with the window.
         let app = self.ui.global::<ui::App>();
         let maximized = self.ui.window().is_maximized();
@@ -1653,35 +1650,6 @@ impl Controller {
 
     // ---- lyrics --------------------------------------------------------------------------------
 
-    /// Has the lyrics worker ask or not, as the setting and the connection allow, and says
-    /// in Settings how far through the library it's got.
-    pub fn follow_lyrics_setting(&self) {
-        let on = self.settings.borrow().online_lyrics;
-        crate::lyrics::set_online(on && !self.is_offline());
-        let (found, without, total) = crate::lyrics::progress();
-        let status = if !on {
-            String::new()
-        } else if total == 0 {
-            "Waiting for your library before looking any up.".to_string()
-        } else if found + without >= total {
-            format!("Lyrics are kept for {found} of your {total} songs. LRCLIB has none for the rest.")
-        } else {
-            format!("Lyrics are kept for {found} of your {total} songs so far, with {} still to look up.", total - found - without)
-        };
-        let page = self.ui.global::<ui::Settings>();
-        if page.get_lyrics_status() != status.as_str() {
-            page.set_lyrics_status(status.into());
-        }
-    }
-
-    /// Looks for the current song's lyrics afresh, if they're on screen.
-    pub fn reload_lyrics(self: &Rc<Self>) {
-        self.lyrics.borrow_mut().song_id.clear();
-        if matches!(self.current_route(), Some(Route::Lyrics | Route::NowPlaying)) {
-            self.load_lyrics();
-        }
-    }
-
     pub fn load_lyrics(self: &Rc<Self>) {
         let lyrics = self.ui.global::<ui::Lyrics>();
         let Some(song) = self.playback.borrow().current().cloned() else {
@@ -1696,19 +1664,10 @@ impl Controller {
         *self.lyrics.borrow_mut() = LyricsState { song_id: song.id.clone(), ..Default::default() };
         lyrics.set_lines(ModelRc::default());
         lyrics.set_status("Looking for lyrics…".into());
-        let wanted = song.clone();
+        let id = song.id.clone();
         self.request(
-            move |client| {
-                // The server's own first, if they're timed. Otherwise what's kept from
-                // LRCLIB or can be had from it, and failing that whatever the server has.
-                let server = client.lyrics(&wanted.id).ok().flatten();
-                if server.as_ref().is_some_and(|lyrics| lyrics.synced) {
-                    return Ok(server);
-                }
-                let timed = crate::lyrics::kept(&wanted.id).filter(|lyrics| lyrics.synced);
-                Ok(timed.or(server).or_else(|| crate::lyrics::for_song(&wanted)))
-            },
-            move |ctl, result: crate::subsonic::ApiResult<Option<Lyrics>>| {
+            move |client| client.lyrics(&id),
+            move |ctl, result| {
                 if ctl.lyrics.borrow().song_id != song.id {
                     return;
                 }
