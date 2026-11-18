@@ -317,6 +317,12 @@ pub struct Controller {
     import_missing: RefCell<Vec<crate::import::Wanted>>,
     /// Counts ticks, to refresh the Requests page now and then while it's open.
     requests_ticks: Cell<u32>,
+    /// Songs kept on this PC as they're played, what fetches the next few ahead of time,
+    /// and counters that pace the two.
+    pub song_cache: crate::songcache::SongCache,
+    pub fetch_ahead: crate::songcache::Ahead,
+    pub keep_ticks: Cell<u32>,
+    pub keep_rounds: Cell<u32>,
     /// Counts checks of the connection to Lidarr, to tell a late answer from the current one.
     requests_check: Cell<u64>,
     /// The sign-in in front of Lidarr, once signed in to. The one copy is kept for as long
@@ -403,6 +409,10 @@ impl Controller {
             import_report: RefCell::new(None),
             import_missing: RefCell::default(),
             requests_ticks: Cell::new(0),
+            song_cache: crate::songcache::SongCache::new(paths.songs.clone()),
+            fetch_ahead: crate::songcache::Ahead::new(),
+            keep_ticks: Cell::new(0),
+            keep_rounds: Cell::new(0),
             requests_check: Cell::new(0),
             gate: RefCell::new(None),
             suggestions: RefCell::default(),
@@ -1487,8 +1497,8 @@ impl Controller {
         app.set_main_focus(app.get_main_focus().wrapping_add(1));
         match suggestion {
             Suggestion::Card(card) => self.open_card(&card.to_ui()),
-            // By itself, as from Recently played: what follows is up to autoplay.
-            Suggestion::Song(song) => self.play_songs(vec![song], 0, "", false),
+            // A song picked from a search starts its radio: the song, then ones like it.
+            Suggestion::Song(song) => self.play_radio(song),
         }
     }
 
@@ -1919,6 +1929,8 @@ impl Controller {
                         album_title: offer.album_title.as_str().into(),
                         title: offer.title.as_str().into(),
                         artist: offer.artist.as_str().into(),
+                        artist_id: offer.artist_id.as_str().into(),
+                        artist_name: offer.artist_name.as_str().into(),
                         about: offer.about.as_str().into(),
                         cover: offer.cover.as_str().into(),
                         duration: if offer.seconds > 0 { clock(offer.seconds).into() } else { "".into() },
@@ -2346,7 +2358,7 @@ impl Controller {
             playing: false,
             progress: self.downloads.borrow().progress_of(&song.id),
             selected: false,
-            unavailable: self.is_offline() && !self.downloads.borrow().has(&song.id),
+            unavailable: self.is_offline() && !self.plays_offline(song),
             downloaded: self.downloads.borrow().has(&song.id),
         }
     }
@@ -2553,6 +2565,10 @@ impl Controller {
         )));
         page.set_theme(config::THEMES.iter().position(|t| t.name == settings.theme).unwrap_or(0) as i32);
         page.set_ui_scales(strings(config::UI_SCALES.iter().map(|s| s.0).collect()));
+        page.set_cache_limits(strings(config::CACHE_LIMITS.iter().map(|limit| limit.0).collect()));
+        page.set_cache_aheads(strings(config::CACHE_AHEAD_NAMES.to_vec()));
+        page.set_cache_limits(strings(config::CACHE_LIMITS.iter().map(|limit| limit.0).collect()));
+        page.set_cache_aheads(strings(config::CACHE_AHEAD.iter().map(|songs| if *songs == 0 { "Off" } else { ["", "1", "", "3", "", "5", "", "", "", "", "10"][*songs as usize] }).collect()));
         page.set_ui_scale(
             config::UI_SCALES.iter().position(|s| (s.1 - settings.ui_scale).abs() < 0.01).unwrap_or(1) as i32,
         );
@@ -2562,6 +2578,8 @@ impl Controller {
         page.set_close_to_tray(settings.close_to_tray);
         page.set_check_updates(settings.check_updates);
         page.set_sync(settings.sync);
+        page.set_cache_limit(config::CACHE_LIMITS.iter().position(|limit| limit.1 == settings.cache_limit_mb).unwrap_or(0) as i32);
+        page.set_cache_ahead(config::CACHE_AHEAD.iter().position(|songs| *songs == settings.cache_ahead).unwrap_or(0) as i32);
         page.set_requests(settings.requests);
         page.set_lidarr_address(settings.lidarr_address.as_str().into());
         page.set_lidarr_key_hint(config::load_secret(&self.paths, "lidarr-key").map(|key| crate::lidarr::mask(&key)).unwrap_or_default().into());
@@ -2593,7 +2611,11 @@ impl Controller {
 
     fn refresh_cache_size(&self) {
         let (dir, pages) = (self.covers.dir().to_path_buf(), self.paths.pages.clone());
+        let songs = self.song_cache.clone();
         self.api_pool.spawn(move || {
+            let kept = songs.size() as f64 / (1024.0 * 1024.0);
+            let kept = if kept >= 1024.0 { format!("{:.1} GB", kept / 1024.0) } else { format!("{kept:.0} MB") };
+            post(move |ctl| ctl.ui.global::<ui::Settings>().set_kept_songs(kept.into()));
             let page_bytes: u64 = std::fs::read_dir(&pages)
                 .into_iter()
                 .flatten()
@@ -2994,9 +3016,32 @@ impl Controller {
         settings.on_remove_downloads(|| {
             with(|ctl| ctl.remove_all_downloads());
         });
+        settings.on_set_cache_limit(|index| {
+            with(|ctl| {
+                let megabytes = config::CACHE_LIMITS.get(index as usize).map_or(0, |limit| limit.1);
+                ctl.change_setting(true, |s| s.cache_limit_mb = megabytes);
+                if megabytes == 0 {
+                    ctl.fetch_ahead.want(Vec::new());
+                    ctl.song_cache.clear();
+                } else {
+                    let cache = ctl.song_cache.clone();
+                    ctl.api_pool.spawn(move || cache.trim(megabytes as u64 * 1024 * 1024, &HashSet::new()));
+                }
+                ctl.refresh_cache_size();
+            });
+        });
+        settings.on_set_cache_ahead(|index| {
+            with(|ctl| {
+                let songs = config::CACHE_AHEAD.get(index as usize).copied().unwrap_or(0);
+                ctl.change_setting(true, |s| s.cache_ahead = songs);
+                ctl.keep_ahead();
+            });
+        });
         settings.on_clear_cache(|| {
             with(|ctl| {
                 ctl.covers.clear_disk();
+                ctl.fetch_ahead.want(Vec::new());
+                ctl.song_cache.clear();
                 ctl.cache.borrow_mut().clear();
                 let _ = std::fs::remove_dir_all(&ctl.paths.pages);
                 let _ = std::fs::create_dir_all(&ctl.paths.pages);

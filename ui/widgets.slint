@@ -839,11 +839,39 @@ export component TrackRow inherits Rectangle {
 
             if root.show-cover: VerticalLayout {
                 alignment: center;
-                Cover {
+                Rectangle {
                     width: 40px;
                     height: 40px;
-                    art: root.track.cover;
-                    detail: 48px;
+
+                    Cover {
+                        width: 40px;
+                        height: 40px;
+                        art: root.track.cover;
+                        detail: 48px;
+                    }
+
+                    // With no number column to put it in, the play button goes over the cover.
+                    if !root.show-number && touch.has-hover && root.track.id != "": Rectangle {
+                        border-radius: 4px;
+                        background: #000000a0;
+
+                        IconButton {
+                            width: 40px;
+                            height: 40px;
+                            icon: root.current && Player.playing ? Icons.pause-fill : Icons.play-fill;
+                            icon-size: 16px;
+                            tint: white;
+                            hover-tint: white;
+                            label: root.current && Player.playing ? "Pause" : "Play " + root.track.title;
+                            clicked => {
+                                if root.current {
+                                    Player.toggle();
+                                } else {
+                                    root.activated();
+                                }
+                            }
+                        }
+                    }
                 }
             }
 

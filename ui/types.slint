@@ -48,6 +48,9 @@ export struct Offer {
     album-title: string,
     title: string,
     artist: string,
+    // The first artist credited, by Lidarr's name for them, and what they're called.
+    artist-id: string,
+    artist-name: string,
     // What to say about where it's from, e.g. "…Something to Be • 2005".
     about: string,
     cover: string,
@@ -427,6 +430,15 @@ export global Settings {
     // Offline mode is switched on.
     in property <bool> offline;
     in property <string> cache-size;
+    // Songs kept as they're played: how much space they may take (the choices and which is
+    // chosen; the first keeps none), how many are fetched ahead, and how much is kept now.
+    in property <[string]> cache-limits;
+    in property <int> cache-limit;
+    in property <[string]> cache-aheads;
+    in property <int> cache-ahead;
+    in property <string> kept-songs;
+    callback set-cache-limit(index: int);
+    callback set-cache-ahead(index: int);
     in property <string> connection;
 
     // The chosen output device's name, and how it's being driven right now.

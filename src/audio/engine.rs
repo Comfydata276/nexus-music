@@ -41,6 +41,9 @@ pub struct TrackRequest {
     pub token: u64,
     /// A downloaded copy to play instead of streaming.
     pub local: Option<PathBuf>,
+    /// When streaming: where to keep the file once it has all arrived, so it needn't be
+    /// fetched again.
+    pub keep: Option<PathBuf>,
     /// An internet radio stream: endless, with no seeking.
     pub live: bool,
     pub url: String,
@@ -1076,7 +1079,7 @@ fn open_deck(client: Client, request: TrackRequest, dir: &std::path::Path) -> Re
             (Box::new(file), None)
         }
         None => {
-            let download = Download::start(client, request.url.clone(), request.ranged, request.live, dir);
+            let download = Download::start(client, request.url.clone(), request.ranged, request.live, dir, request.keep.clone());
             // These two formats decide whether they can seek only when asked to, so it's safe
             // to skip the tag check at the end of the file. Others (MP4, Ogg) need the end
             // while opening.

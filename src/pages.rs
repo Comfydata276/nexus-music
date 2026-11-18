@@ -123,6 +123,9 @@ pub struct OfferData {
     pub album_title: String,
     pub title: String,
     pub artist: String,
+    /// The first artist credited: Lidarr's name for them, and what they're called.
+    pub artist_id: String,
+    pub artist_name: String,
     /// E.g. "…Something to Be • 2005".
     pub about: String,
     pub cover: String,
@@ -308,6 +311,8 @@ fn with_outside(
             album_title: song.album_title.clone(),
             title: song.title.clone(),
             artist: song.artist.clone(),
+            artist_id: song.artist_id.clone(),
+            artist_name: song.artist_name.clone(),
             about: if song.year.is_empty() { song.album_title.clone() } else { format!("{} • {}", song.album_title, song.year) },
             cover: crate::musicbrainz::cover(&song.album),
             seconds: song.seconds,

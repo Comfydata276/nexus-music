@@ -17,6 +17,8 @@ pub struct Paths {
     pub covers: PathBuf,
     pub pages: PathBuf,
     pub buffers: PathBuf,
+    /// Songs kept as they're played and fetched ahead (see `songcache`).
+    pub songs: PathBuf,
     /// Songs saved for listening without the server.
     pub downloads: PathBuf,
     /// When songs were added to playlists, as far as this app has seen.
@@ -53,11 +55,12 @@ impl Paths {
             covers: cache.join("covers"),
             pages: cache.join("pages"),
             buffers: cache.join("buffers"),
+            songs: cache.join("songs"),
             downloads: data.join("downloads"),
             #[cfg(not(windows))]
             secret: config.join("credential"),
         };
-        for dir in [&config, &paths.covers, &paths.pages, &paths.buffers] {
+        for dir in [&config, &paths.covers, &paths.pages, &paths.buffers, &paths.songs] {
             let _ = fs::create_dir_all(dir);
         }
         paths
@@ -125,6 +128,10 @@ pub struct Settings {
     /// Offer to ask a Lidarr server for albums that aren't in the library; where it is, and
     /// the name for a sign-in in front of it, if any. (Its key and that sign-in's password
     /// are kept with the account password, not here.)
+    /// Space allowed for songs kept as they're played, in megabytes; 0 keeps none. And how
+    /// many songs past the one playing are fetched ahead of time.
+    pub cache_limit_mb: u32,
+    pub cache_ahead: u32,
     pub requests: bool,
     pub lidarr_address: String,
     /// The sign-in service in front of Lidarr, if there is one: where it is and the name it
@@ -184,6 +191,8 @@ impl Default for Settings {
             download_quality: 0,
             pinned_playlists: Vec::new(),
             lists: std::collections::HashMap::new(),
+            cache_limit_mb: 2048,
+            cache_ahead: 3,
             requests: false,
             lidarr_address: String::new(),
             lidarr_gate: String::new(),
@@ -264,6 +273,12 @@ pub const THEMES: [ThemeColors; 6] = [
 ];
 
 /// Interface sizes offered in Settings: label and scale.
+/// Choices for how much space kept songs may take, in megabytes. The first keeps none.
+pub const CACHE_LIMITS: [(&str, u32); 6] = [("Off", 0), ("1 GB", 1024), ("2 GB", 2048), ("5 GB", 5120), ("10 GB", 10240), ("20 GB", 20480)];
+/// Choices for how many songs to fetch ahead of the one playing.
+pub const CACHE_AHEAD: [u32; 5] = [0, 1, 3, 5, 10];
+pub const CACHE_AHEAD_NAMES: [&str; 5] = ["Off", "1", "3", "5", "10"];
+
 pub const UI_SCALES: [(&str, f32); 4] = [("Small", 0.9), ("Normal", 1.0), ("Large", 1.12), ("Larger", 1.25)];
 
 /// Streaming quality choices: name, what it costs, and the bitrate cap sent to the server

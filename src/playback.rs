@@ -2,6 +2,7 @@
 //! and lyrics. All on the UI thread; the audio itself is the engine's business.
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -63,7 +64,11 @@ pub struct Playback {
     needs_transcode: HashSet<String>,
     failures: u32,
     /// Similar songs are being fetched to continue after the queue.
+    /// Songs whose kept copy was thrown away because it wouldn't play.
+    dropped_kept: HashSet<String>,
     autoplay_loading: bool,
+    /// The song they're being found for. An answer for any other is out of date.
+    autoplay_seed: String,
     /// The queue ran out while those songs were still on their way: start them on arrival.
     autoplay_resume: bool,
     /// The track that last triggered an early autoplay lookup, so each track asks only once.
@@ -98,7 +103,9 @@ impl Playback {
             saved_at: 0.0,
             needs_transcode: HashSet::new(),
             failures: 0,
+            dropped_kept: HashSet::new(),
             autoplay_loading: false,
+            autoplay_seed: String::new(),
             autoplay_resume: false,
             autoplay_asked: 0,
         }
@@ -311,7 +318,7 @@ impl Controller {
             let mut kept_origins = Vec::new();
             let mut kept_start = 0;
             for (index, (song, origin)) in songs.into_iter().zip(origins).enumerate() {
-                if downloads.has(&song.id) {
+                if downloads.has(&song.id) || self.plays_offline(&song) {
                     if index == start {
                         kept_start = kept.len();
                     }
@@ -407,6 +414,7 @@ impl Controller {
             return TrackRequest {
                 token,
                 local: None,
+                keep: None,
                 live: true,
                 url: song.radio_url.clone(),
                 ranged: false,
@@ -423,6 +431,7 @@ impl Controller {
             return TrackRequest {
                 token,
                 local: Some(path),
+                keep: None,
                 live: false,
                 url: String::new(),
                 ranged: true,
@@ -433,10 +442,30 @@ impl Controller {
                 duration_secs,
             };
         }
+        // A copy kept from an earlier play, or fetched ahead, plays from disk too.
+        let (bitrate, kept_as) = stream_form(native, cap, &suffix);
+        let kept = (settings.cache_limit_mb > 0).then(|| self.song_cache.file(&song.id, bitrate, kept_as));
+        if let Some(path) = kept.as_ref().filter(|path| crate::songcache::ready(path)) {
+            crate::songcache::touch(path);
+            return TrackRequest {
+                token,
+                local: Some(path.clone()),
+                keep: None,
+                live: false,
+                url: String::new(),
+                ranged: true,
+                suffix: kept_as.to_string(),
+                gain,
+                start_secs: at,
+                base_secs: 0.0,
+                duration_secs,
+            };
+        }
         if native && cap == 0 {
             TrackRequest {
                 token,
                 local: None,
+                keep: kept,
                 live: false,
                 url: client.stream_url(&song.id, 0, 0),
                 ranged: true,
@@ -452,6 +481,8 @@ impl Controller {
             TrackRequest {
                 token,
                 local: None,
+                // Only a conversion that starts at the beginning is the whole song.
+                keep: kept.filter(|_| offset == 0.0),
                 live: false,
                 url: client.stream_url(&song.id, if cap == 0 { 320 } else { cap }, offset as u32),
                 ranged: false,
@@ -461,6 +492,71 @@ impl Controller {
                 base_secs: offset,
                 duration_secs,
             }
+        }
+    }
+
+    /// Where a song would be kept, in the form it would be streamed in right now, and the
+    /// bit rate to ask the server for (0 for the file as it is).
+    fn kept_file(&self, pb: &Playback, song: &Song) -> (PathBuf, u32) {
+        let suffix = song.suffix.to_lowercase();
+        let native = NATIVE_SUFFIXES.contains(&suffix.as_str()) && !pb.needs_transcode.contains(&song.id);
+        let (bitrate, kept_as) = stream_form(native, self.settings.borrow().max_bitrate(), &suffix);
+        (self.song_cache.file(&song.id, bitrate, kept_as), bitrate)
+    }
+
+    /// Whether a song can play without the server: it's downloaded, or a copy has been kept.
+    pub fn plays_offline(&self, song: &Song) -> bool {
+        if self.downloads.borrow().has(&song.id) {
+            return true;
+        }
+        let settings = self.settings.borrow();
+        if settings.cache_limit_mb == 0 || song.id.is_empty() {
+            return false;
+        }
+        let suffix = song.suffix.to_lowercase();
+        let cap = settings.max_bitrate();
+        [true, false].into_iter().any(|native| {
+            let (bitrate, kept_as) = stream_form(native, cap, &suffix);
+            crate::songcache::ready(&self.song_cache.file(&song.id, bitrate, kept_as))
+        })
+    }
+
+    /// Has the next few songs fetched ahead of time, so the music carries on if the
+    /// connection drops, and makes room among the kept songs when they outgrow their limit.
+    /// Called every few seconds while something is playing.
+    pub fn keep_ahead(self: &Rc<Self>) {
+        let (ahead, limit) = {
+            let settings = self.settings.borrow();
+            (settings.cache_ahead as usize, settings.cache_limit_mb as u64 * 1024 * 1024)
+        };
+        let Some(client) = self.client().filter(|_| limit > 0 && !self.is_offline()) else {
+            return self.fetch_ahead.want(Vec::new());
+        };
+        let mut wanted = Vec::new();
+        let mut in_use = HashSet::new();
+        {
+            let pb = self.playback.borrow();
+            let downloads = self.downloads.borrow();
+            let upcoming = pb.order.iter().skip(pb.cursor).take(ahead + 1).filter_map(|&i| pb.queue.get(i));
+            for (place, song) in upcoming.enumerate() {
+                if song.id.is_empty() || !song.radio_url.is_empty() || downloads.has(&song.id) {
+                    continue;
+                }
+                let (path, bitrate) = self.kept_file(&pb, song);
+                in_use.insert(path.clone());
+                // The one playing is already streaming, and is kept when it has all arrived.
+                if place > 0 && !crate::songcache::ready(&path) {
+                    wanted.push(crate::songcache::Wanted { client: client.clone(), url: client.stream_url(&song.id, bitrate, 0), path });
+                }
+            }
+        }
+        self.fetch_ahead.want(wanted);
+        // Now and then, make room. Off the main thread: it reads the whole folder.
+        let rounds = self.keep_rounds.get() + 1;
+        self.keep_rounds.set(rounds);
+        if rounds % 8 == 1 {
+            let cache = self.song_cache.clone();
+            self.api_pool.spawn(move || cache.trim(limit, &in_use));
         }
     }
 
@@ -926,6 +1022,15 @@ impl Controller {
                         self.remove_downloads(std::slice::from_ref(&song.id));
                         return self.start_current(position);
                     }
+                    // So is a copy kept from an earlier play (once: if the song still won't
+                    // play after that, the copy wasn't what was wrong).
+                    let (kept, _) = self.kept_file(&pb, &song);
+                    if crate::songcache::ready(&kept) && pb.dropped_kept.insert(song.id.clone()) {
+                        let position = pb.position;
+                        drop(pb);
+                        let _ = std::fs::remove_file(&kept);
+                        return self.start_current(position);
+                    }
                     // First try having the server convert a file we can't decode.
                     let retry = unsupported && pb.needs_transcode.insert(song.id.clone());
                     if !retry {
@@ -958,6 +1063,12 @@ impl Controller {
     pub fn tick(self: &Rc<Self>) {
         self.check_sleep();
         self.tick_downloads();
+        // Every few seconds while there's a queue, see that the next songs are on hand.
+        let keep_ticks = self.keep_ticks.get() + 1;
+        self.keep_ticks.set(keep_ticks);
+        if keep_ticks % 16 == 0 && self.playback.borrow().current_token != 0 {
+            self.keep_ahead();
+        }
         self.tick_requests();
         // Keep the maximise button, and the title bar's sense of scale, in step with the window.
         let app = self.ui.global::<ui::App>();
@@ -1051,19 +1162,29 @@ impl Controller {
 
     // ---- autoplay -----------------------------------------------------------------------------
 
+    /// Plays a song straight away and lines up songs like it to follow: its radio. The song
+    /// doesn't wait for the others to be found.
+    pub fn play_radio(self: &Rc<Self>, song: Song) {
+        let context = format!("{} radio", song.title);
+        self.play_songs(vec![song], 0, &context, false);
+        self.load_autoplay();
+    }
+
     /// Extends the queue with music like its last song. Safe to call repeatedly.
     fn load_autoplay(self: &Rc<Self>) {
         let seed = {
             let mut pb = self.playback.borrow_mut();
-            if pb.autoplay_loading {
+            let Some(seed) = pb.order.last().and_then(|&i| pb.queue.get(i)).cloned() else { return };
+            if pb.autoplay_loading && pb.autoplay_seed == seed.id {
                 return;
             }
-            let Some(seed) = pb.order.last().and_then(|&i| pb.queue.get(i)).cloned() else { return };
             pb.autoplay_loading = true;
+            pb.autoplay_seed = seed.id.clone();
             seed
         };
         let known: HashSet<String> =
             self.playback.borrow().queue.iter().map(|s| s.id.clone()).collect();
+        let asked_for = seed.id.clone();
         self.request(
             move |client| {
                 // Best match first: songs the server considers similar. That needs Last.fm or
@@ -1084,17 +1205,22 @@ impl Controller {
                 songs.truncate(30);
                 Ok(songs)
             },
-            |ctl, result| ctl.autoplay_loaded(result.unwrap_or_default()),
+            move |ctl, result| ctl.autoplay_loaded(&asked_for, result.unwrap_or_default()),
         );
     }
 
-    fn autoplay_loaded(self: &Rc<Self>, songs: Vec<Song>) {
+    fn autoplay_loaded(self: &Rc<Self>, seed: &str, songs: Vec<Song>) {
         let (resume, found) = {
             let mut pb = self.playback.borrow_mut();
+            // Asked for a queue that has since been replaced, and asked again for the new one.
+            if pb.autoplay_seed != seed {
+                return;
+            }
             pb.autoplay_loading = false;
             let resume = std::mem::take(&mut pb.autoplay_resume);
             // The queue may have been replaced while the request was out.
-            let still_at_end = pb.following().is_none() && !pb.order.is_empty();
+            let still_at_end = pb.following().is_none()
+                && pb.order.last().and_then(|&i| pb.queue.get(i)).is_some_and(|last| last.id == seed);
             if !songs.is_empty() && still_at_end {
                 for song in songs {
                     pb.queue.push(song);
@@ -1103,8 +1229,11 @@ impl Controller {
                 }
                 let entries = pb.queue.len();
                 pb.origins.resize(entries, None);
-                // What follows no longer comes from the album or playlist that was chosen.
-                pb.context.clear();
+                // What follows no longer comes from the album or playlist that was chosen. (A
+                // radio stays a radio: more of the same is what it is.)
+                if !pb.context.ends_with(" radio") {
+                    pb.context.clear();
+                }
                 (resume, true)
             } else {
                 (resume && still_at_end, false)
@@ -1668,6 +1797,13 @@ impl Controller {
         if songs.get(index).is_some_and(|song| song.id.is_empty() && song.radio_url.is_empty()) {
             return;
         }
+        // From a search, what's wanted is that song and then more like it, not whatever else
+        // happened to match the words.
+        if matches!(self.current_route(), Some(Route::Search(_))) {
+            if let Some(song) = songs.get(index).cloned() {
+                return self.play_radio(song);
+            }
+        }
         let context = self.page.borrow().context.clone();
         self.playing_from_page();
         if index < songs.len() {
@@ -1800,6 +1936,13 @@ impl Controller {
 
 /// The gain to apply to a song so it lands at the chosen loudness, from its ReplayGain tags.
 /// `album_run` says the song is playing alongside others from its album.
+/// The form a song is streamed in: the bit rate to ask for (0 for the file as it is) and
+/// the kind of file that comes back. `native` is whether the app can play the file as it is;
+/// `cap` is the bit rate limit in Settings, 0 for none.
+fn stream_form(native: bool, cap: u32, suffix: &str) -> (u32, &str) {
+    if native && cap == 0 { (0, suffix) } else { (if cap == 0 { 320 } else { cap }, "mp3") }
+}
+
 fn level_gain(settings: &Settings, song: &Song, album_run: bool) -> f32 {
     if !settings.normalize {
         return 1.0;

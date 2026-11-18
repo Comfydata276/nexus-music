@@ -26,6 +26,7 @@ mod picker;
 mod playback;
 mod pool;
 mod search;
+mod songcache;
 mod subsonic;
 mod sync;
 #[cfg(windows)]

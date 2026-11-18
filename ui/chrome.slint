@@ -191,32 +191,50 @@ export component Sidebar inherits Rectangle {
         padding: 8px;
         spacing: 2px;
 
-        HorizontalLayout {
-            padding-left: 12px;
-            padding-top: 12px;
-            padding-bottom: 16px;
-            spacing: 12px;
-            alignment: start;
+        // The app's name: clicking it goes Home.
+        Rectangle {
+            height: 56px;
+            accessible-role: button;
+            accessible-label: "Nexus Music, go to Home";
+            accessible-action-default => { App.navigate("home"); }
 
-            Rectangle {
-                width: 28px;
-                height: 28px;
-                border-radius: 8px;
-                background: Theme.accent;
-                Icon {
-                    source: Icons.bars;
-                    size: 15px;
-                    tint: white;
-                }
+            brand := TouchArea {
+                x: 4px;
+                width: brand-row.preferred-width + 8px;
+                mouse-cursor: pointer;
+                clicked => { App.navigate("home"); }
             }
 
-            Text {
-                text: "Nexus Music";
-                color: Theme.text;
-                font-family: Theme.display;
-                font-size: 19px;
-                font-weight: 700;
-                vertical-alignment: center;
+            brand-row := HorizontalLayout {
+                x: 0;
+                width: self.preferred-width;
+                padding-left: 12px;
+                padding-top: 12px;
+                padding-bottom: 16px;
+                spacing: 12px;
+
+                Rectangle {
+                    width: 28px;
+                    height: 28px;
+                    border-radius: 8px;
+                    background: brand.has-hover ? Theme.accent-bright : Theme.accent;
+                    animate background { duration: 120ms; }
+                    Icon {
+                        source: Icons.bars;
+                        size: 15px;
+                        tint: white;
+                    }
+                }
+
+                Text {
+                    text: "Nexus Music";
+                    color: Theme.text;
+                    font-family: Theme.display;
+                    font-size: 19px;
+                    font-weight: 700;
+                    vertical-alignment: center;
+                    accessible-role: none;
+                }
             }
         }
 

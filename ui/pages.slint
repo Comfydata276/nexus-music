@@ -584,25 +584,25 @@ component OfferRow inherits Rectangle {
                 accessible-role: none;
             }
 
-            Text {
+            LinkText {
                 text: root.offer.artist;
-                color: Theme.muted;
-                font-size: 13px;
-                overflow: elide;
-                accessible-role: none;
+                enabled: root.offer.artist-id != "";
+                clicked => {
+                    View.card-activated({ kind: CardKind.outside-artist, id: root.offer.artist-id, title: root.offer.artist-name });
+                }
             }
         }
 
-        Text {
+        VerticalLayout {
+            alignment: center;
             horizontal-stretch: 4;
             min-width: 0px;
             preferred-width: 0px;
-            text: root.offer.about;
-            color: Theme.muted;
-            font-size: 13px;
-            vertical-alignment: center;
-            overflow: elide;
-            accessible-role: none;
+
+            LinkText {
+                text: root.offer.about;
+                clicked => { root.activated(); }
+            }
         }
 
         Text {
@@ -1411,7 +1411,9 @@ export component NowPlayingPage inherits Rectangle {
 component SettingRow inherits Rectangle {
     in property <string> title;
     in property <string> detail;
-    min-height: 56px;
+    // Tall enough for the words at the width they actually get. Left to itself the row is
+    // sized as if they didn't wrap, and a long description runs into the row below.
+    min-height: max(56px, heading.preferred-height + (root.detail != "" ? about.preferred-height + 4px : 0px) + 8px);
 
     HorizontalLayout {
         spacing: 24px;
@@ -1421,7 +1423,7 @@ component SettingRow inherits Rectangle {
             spacing: 4px;
             horizontal-stretch: 1;
 
-            Text {
+            heading := Text {
                 text: root.title;
                 color: Theme.text;
                 font-size: 15px;
@@ -1429,7 +1431,9 @@ component SettingRow inherits Rectangle {
                 wrap: word-wrap;
             }
 
-            if root.detail != "": Text {
+            about := Text {
+                visible: root.detail != "";
+                height: root.detail != "" ? self.preferred-height : 0px;
                 text: root.detail;
                 color: Theme.muted;
                 font-size: 13px;
@@ -2236,8 +2240,34 @@ export component SettingsPage inherits Rectangle {
                         }
 
                         SettingRow {
+                            title: "Keep songs ready";
+                            detail: "Songs are kept on this PC as they play, so replays start at once and need no connection. When this much space is used, the ones played longest ago make way. " + Settings.kept-songs + " kept now.";
+                            HorizontalLayout {
+                                spacing: 6px;
+                                for name[index] in Settings.cache-limits: Chip {
+                                    text: name;
+                                    selected: index == Settings.cache-limit;
+                                    clicked => { Settings.set-cache-limit(index); }
+                                }
+                            }
+                        }
+
+                        if Settings.cache-limit > 0: SettingRow {
+                            title: "Fetch songs ahead";
+                            detail: "How many songs after the one playing are fetched in advance. If your connection drops, the music carries on through those.";
+                            HorizontalLayout {
+                                spacing: 6px;
+                                for name[index] in Settings.cache-aheads: Chip {
+                                    text: name;
+                                    selected: index == Settings.cache-ahead;
+                                    clicked => { Settings.set-cache-ahead(index); }
+                                }
+                            }
+                        }
+
+                        SettingRow {
                             title: "Cache";
-                            detail: Settings.cache-size + " of cover art and page data saved on this PC, so things you've seen before open instantly.";
+                            detail: Settings.cache-size + " of cover art and page data saved on this PC, so things you've seen before open instantly. Clearing it clears the kept songs too.";
                             TextButton {
                                 text: "Clear cache";
                                 clicked => { Settings.clear-cache(); }

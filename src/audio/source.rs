@@ -52,6 +52,8 @@ struct Shared {
     live: bool,
     title: Arc<Mutex<String>>,
     path: PathBuf,
+    /// Where to keep a copy once the whole track has arrived, if it's to be kept.
+    keep: Option<PathBuf>,
     state: Mutex<State>,
     progress: Condvar,
     cancel: AtomicBool,
@@ -74,7 +76,7 @@ pub struct Download {
 }
 
 impl Download {
-    pub fn start(client: Client, url: String, ranged: bool, live: bool, dir: &std::path::Path) -> Download {
+    pub fn start(client: Client, url: String, ranged: bool, live: bool, dir: &std::path::Path, keep: Option<PathBuf>) -> Download {
         let id = NEXT_FILE_ID.fetch_add(1, Ordering::Relaxed);
         let path = dir.join(format!("stream-{}-{id}.part", std::process::id()));
         let shared = Arc::new(Shared {
@@ -84,6 +86,7 @@ impl Download {
             live,
             title: Arc::new(Mutex::new(String::new())),
             path,
+            keep,
             state: Mutex::new(State::default()),
             progress: Condvar::new(),
             cancel: AtomicBool::new(false),
@@ -243,8 +246,13 @@ fn finish(shared: &Shared, error: Option<String>) {
     match error {
         // A short read on a known-length file is an error; treat clean EOF as completion.
         None => {
+            // All of it, and not a file that ended short of the length it was said to have.
+            let whole = state.downloaded > 0 && state.total.is_none_or(|total| total == state.downloaded);
             state.done = true;
             state.total = Some(state.downloaded);
+            if let (true, false, Some(keep)) = (whole, shared.live, &shared.keep) {
+                crate::songcache::adopt(&shared.path, keep);
+            }
         }
         Some(e) => state.error = Some(e),
     }
