@@ -136,6 +136,8 @@ pub struct Settings {
     pub cache_limit_mb: u32,
     pub cache_ahead: u32,
     pub requests: bool,
+    /// Songs that never came out on an album are offered too, on their EP or single.
+    pub request_singles: bool,
     pub lidarr_address: String,
     /// The sign-in service in front of Lidarr, if there is one: where it is and the name it
     /// knows Lidarr's sign-in by. Found by asking, not typed in.
@@ -197,6 +199,7 @@ impl Default for Settings {
             cache_limit_mb: 2048,
             cache_ahead: 3,
             requests: false,
+            request_singles: true,
             lidarr_address: String::new(),
             lidarr_gate: String::new(),
             lidarr_gate_client: String::new(),

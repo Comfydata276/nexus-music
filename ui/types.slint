@@ -504,6 +504,9 @@ export global Settings {
     callback import-spotify();
     // Asking a Lidarr server for albums that aren't in the library.
     in property <bool> requests;
+    // Singles and EPs are offered as well as albums.
+    in property <bool> request-singles;
+    callback set-request-singles(on: bool);
     in property <string> lidarr-address;
     // The API key on file, as dots and its last few characters; empty if there's none.
     in property <string> lidarr-key-hint;

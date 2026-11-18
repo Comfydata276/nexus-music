@@ -39,6 +39,8 @@ pub struct SongOffer {
     pub album_title: String,
     pub year: String,
     pub seconds: u32,
+    /// "EP" or "Single" when that's what it's on; empty for an album.
+    pub kind: String,
 }
 
 /// A song on an album, by name only.
@@ -129,9 +131,18 @@ fn list<'a>(value: &'a Value, key: &str) -> &'a [Value] {
     value.get(key).and_then(Value::as_array).map_or(&[], Vec::as_slice)
 }
 
-/// Whether this is a plain studio album: the kind requests deal in.
-fn is_album(group: &Value) -> bool {
-    text(group, "primary-type") == "Album" && list(group, "secondary-types").is_empty()
+/// The kind of studio release this is, if it's one that can be asked for: an album, an EP
+/// or a single, and not a live one, a compilation, a remix and so on.
+fn kind_of(group: &Value) -> Option<&'static str> {
+    if !list(group, "secondary-types").is_empty() {
+        return None;
+    }
+    match text(group, "primary-type") {
+        "Album" => Some("Album"),
+        "EP" => Some("EP"),
+        "Single" => Some("Single"),
+        _ => None,
+    }
 }
 
 /// The artists credited, as written ("A feat. B"), and the first one's id and name.
@@ -149,7 +160,7 @@ fn year(date: &str) -> String {
 /// Looks for songs matching what was typed, each with the studio album it's on.
 pub fn find_songs(term: &str) -> Result<Vec<SongOffer>, String> {
     let found = get(&format!("recording?query={}&dismax=true&limit=100&fmt=json", crate::subsonic::encode(term)))?;
-    Ok(songs_from(&found, term))
+    Ok(songs_from(&found, term, crate::lidarr::singles()))
 }
 
 /// One artist's song of a given name, with the studio album it's on. For when it's known
@@ -161,7 +172,7 @@ pub fn song_by(artist: &str, title: &str) -> Result<Vec<SongOffer>, String> {
     // recordings, and the album cut needn't be among the first handed back.
     let query = format!("arid:{artist} AND recording:\"{phrase}\" AND primarytype:album AND status:official AND NOT secondarytype:*");
     let found = get(&format!("recording?query={}&limit=50&fmt=json", crate::subsonic::encode(&query)))?;
-    let mut songs: Vec<SongOffer> = songs_from(&found, title).into_iter().filter(|song| same_words(base(&song.title), base(title))).collect();
+    let mut songs: Vec<SongOffer> = songs_from(&found, title, false).into_iter().filter(|song| same_words(base(&song.title), base(title))).collect();
     // Theirs alone goes before one they share the credit for (a mash-up, a duet).
     songs.sort_by_key(|song| !(song.artist_id == artist && song.artist == song.artist_name));
     Ok(songs)
@@ -214,11 +225,16 @@ fn base(title: &str) -> &str {
 /// album among them. They're put in order of how well they answer what was typed; among
 /// equals, a song found on more releases goes first, which is the nearest thing here to how
 /// well known it is.
-fn songs_from(found: &Value, typed: &str) -> Vec<SongOffer> {
+///
+/// A song that isn't on any album is offered on the single or EP it came out on, if
+/// `singles` says those are wanted.
+fn songs_from(found: &Value, typed: &str, singles: bool) -> Vec<SongOffer> {
     struct Group {
         offer: SongOffer,
         /// The date of the album chosen so far; empty if it has none.
         date: String,
+        /// How good a home that is for the song: 0 an album, 1 a single, 2 an EP.
+        rank: u8,
         score: u64,
         releases: usize,
     }
@@ -238,6 +254,7 @@ fn songs_from(found: &Value, typed: &str) -> Vec<SongOffer> {
             groups.push(Group {
                 offer: SongOffer { title: title.into(), artist, artist_id, artist_name, ..Default::default() },
                 date: String::new(),
+                rank: 0,
                 score: 0,
                 releases: 0,
             });
@@ -251,15 +268,26 @@ fn songs_from(found: &Value, typed: &str) -> Vec<SongOffer> {
         group.score = group.score.max(recording.get("score").and_then(Value::as_u64).unwrap_or(0));
         group.releases += releases.len();
         for release in releases {
-            let Some(album) = release.get("release-group").filter(|album| is_album(album)) else { continue };
+            let Some(album) = release.get("release-group") else { continue };
+            let rank = match kind_of(album) {
+                Some("Album") => 0,
+                Some("Single") if singles => 1,
+                Some("EP") if singles => 2,
+                _ => continue,
+            };
             // A release credited to someone else is a compilation, whatever it's filed as.
             let (_, by, _) = credit(release);
             if matches!(text(release, "status"), "Bootleg" | "Pseudo-Release") || by == VARIOUS {
                 continue;
             }
             let date = text(release, "date");
-            let earlier = group.offer.album.is_empty() || (!date.is_empty() && (group.date.is_empty() || date < group.date.as_str()));
-            if earlier {
+            // An album first. Failing that the single, which is the song as it was put out,
+            // before an EP, which is as likely a session or a live set. Of a kind, the earliest.
+            let earlier = !date.is_empty() && (group.date.is_empty() || date < group.date.as_str());
+            let better = group.offer.album.is_empty() || rank < group.rank || (rank == group.rank && earlier);
+            if better {
+                group.rank = rank;
+                group.offer.kind = ["", "Single", "EP"][rank as usize].to_string();
                 group.date = date.to_string();
                 group.offer.album = text(album, "id").to_string();
                 group.offer.album_title = text(album, "title").to_string();
@@ -282,11 +310,18 @@ fn songs_from(found: &Value, typed: &str) -> Vec<SongOffer> {
 
 /// An artist's studio albums, newest first, and what the artist is called.
 pub fn artist_albums(artist: &str) -> Result<(String, Vec<Offer>), String> {
+    artist_releases(artist, false).map(|(name, releases)| (name, releases.into_iter().filter(|release| release.kind() == "Album").collect()))
+}
+
+/// An artist's studio albums and, if `singles` says so, their EPs and singles too, newest
+/// first; and what the artist is called.
+pub fn artist_releases(artist: &str, singles: bool) -> Result<(String, Vec<Offer>), String> {
     let mut name = String::new();
     let mut albums = Vec::new();
+    let kinds = if singles { "album%7Cep%7Csingle" } else { "album" };
     // A hundred at a time; live albums and compilations are among them and are left out.
-    for page in 0..4 {
-        let found = get(&format!("release-group?artist={artist}&type=album&limit=100&offset={}&inc=artist-credits&fmt=json", page * 100))?;
+    for page in 0..6 {
+        let found = get(&format!("release-group?artist={artist}&type={kinds}&limit=100&offset={}&inc=artist-credits&fmt=json", page * 100))?;
         let groups = list(&found, "release-groups");
         for group in groups {
             let credits = list(group, "artist-credit");
@@ -294,9 +329,10 @@ pub fn artist_albums(artist: &str) -> Result<(String, Vec<Offer>), String> {
                 let this = credits.iter().filter_map(|c| c.get("artist")).find(|a| text(a, "id") == artist);
                 name = this.map(|a| text(a, "name").to_string()).unwrap_or_default();
             }
-            if is_album(group) {
+            if let Some(kind) = kind_of(group) {
                 let (by, _, _) = credit(group);
                 albums.push(Offer {
+                    kind: if kind == "Album" { String::new() } else { kind.to_string() },
                     album: text(group, "id").to_string(),
                     artist_id: artist.to_string(),
                     title: text(group, "title").to_string(),
@@ -393,7 +429,9 @@ mod tests {
             ]}"#,
         )
         .unwrap();
-        let songs = songs_from(&found, "lonely no more");
+        // With singles wanted, a song still goes on its album where it has one.
+        assert_eq!(songs_from(&found, "lonely no more", true)[0].album, "stb");
+        let songs = songs_from(&found, "lonely no more", false);
         assert_eq!(songs.len(), 2);
         assert_eq!(
             songs[0],
@@ -406,6 +444,7 @@ mod tests {
                 album_title: "…Something to Be".into(),
                 year: "2005".into(),
                 seconds: 227,
+                kind: String::new(),
             }
         );
         assert_eq!((songs[1].artist.as_str(), songs[1].album.as_str(), songs[1].seconds), ("W.C. Clark", "lp", 0));
@@ -453,7 +492,26 @@ mod tests {
             ]}"#,
         )
         .unwrap();
-        let songs = songs_from(&found, "yellow coldplay");
+        let songs = songs_from(&found, "yellow coldplay", false);
         assert_eq!(songs.iter().map(|song| song.artist.as_str()).collect::<Vec<_>>(), ["Coldplay", "Calum Graham"]);
+    }
+
+    #[test]
+    fn offers_a_song_on_the_single_it_came_out_on() {
+        let found: Value = serde_json::from_str(
+            r#"{"recordings":[
+            {"score":100,"title":"Only A Single","length":180000,"artist-credit":[{"name":"Someone","artist":{"id":"s","name":"Someone"}}],
+             "releases":[
+               {"status":"Official","date":"2024-03-01","release-group":{"id":"single","title":"Only A Single","primary-type":"Single"}},
+               {"status":"Official","date":"2024-01-01","release-group":{"id":"remix","title":"Only A Single (Remixes)","primary-type":"Single","secondary-types":["Remix"]}},
+               {"status":"Official","date":"2024-06-01","release-group":{"id":"ep","title":"Short Player","primary-type":"EP"}}]}
+            ]}"#,
+        )
+        .unwrap();
+        // Albums only: it isn't on one, so it isn't offered.
+        assert!(songs_from(&found, "only a single", false).is_empty());
+        // Otherwise it's offered on its single: not the remix single, and not the later EP.
+        let songs = songs_from(&found, "only a single", true);
+        assert_eq!((songs[0].album.as_str(), songs[0].kind.as_str(), songs[0].year.as_str()), ("single", "Single", "2024"));
     }
 }

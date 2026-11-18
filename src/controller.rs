@@ -869,6 +869,7 @@ impl Controller {
             }
         };
         self.ui.global::<ui::App>().set_requests(lidarr.is_some());
+        crate::lidarr::set_singles(self.settings.borrow().request_singles);
         crate::lidarr::set_current(lidarr);
     }
 
@@ -1073,19 +1074,36 @@ impl Controller {
 
     /// Asks whether to request an album that isn't in the library. `song` is the song that
     /// led here, if it was one: the album is what gets fetched, and that's said.
-    pub fn prompt_request(self: &Rc<Self>, album: &str, title: &str, by: &str, song: &str) {
-        if crate::lidarr::offered(album).is_some_and(|offer| offer.requested) {
+    pub fn prompt_request(self: &Rc<Self>, album: &str, title: &str, by: &str, song: &str, kind: &str) {
+        let offered = crate::lidarr::offered(album);
+        if offered.as_ref().is_some_and(|offer| offer.requested) {
             return self.toast("That one has already been asked for. See Requests in the sidebar.");
         }
+        // What kind of release it is, if the caller didn't say: Lidarr may have.
+        let kind = if kind.is_empty() { offered.as_ref().map(|offer| offer.kind().to_string()).unwrap_or_default() } else { kind.to_string() };
+        let whose = if by.is_empty() { "the artist".to_string() } else { by.to_string() };
         let by = if by.is_empty() { String::new() } else { format!(" by {by}") };
-        let text = if song.is_empty() {
-            format!("“{title}”{by} will go on Lidarr's list, and Lidarr will start looking for it. The whole album is fetched.")
-        } else {
-            format!("“{song}” is on “{title}”{by}. That album will go on Lidarr's list, and Lidarr will start looking for it. The whole album is fetched.")
+        let text = match (kind.as_str(), song.is_empty()) {
+            ("Single", _) => format!(
+                "“{title}”{by} came out as a single. It will go on Lidarr's list, and Lidarr will start looking for it. If Lidarr only lists {whose}'s albums so far, it will be set to list their singles and EPs too. None but this one is fetched, though ones they release from now on are treated as their new albums are."
+            ),
+            ("EP", true) => format!(
+                "“{title}”{by} is an EP. It will go on Lidarr's list, and Lidarr will start looking for it. If Lidarr only lists {whose}'s albums so far, it will be set to list their singles and EPs too. None but this one is fetched, though ones they release from now on are treated as their new albums are."
+            ),
+            ("EP", false) => format!(
+                "“{song}” is on the EP “{title}”{by}. That EP will go on Lidarr's list, and Lidarr will start looking for it. If Lidarr only lists {whose}'s albums so far, it will be set to list their singles and EPs too. None but this one is fetched, though ones they release from now on are treated as their new albums are."
+            ),
+            (_, true) => format!("“{title}”{by} will go on Lidarr's list, and Lidarr will start looking for it. The whole album is fetched."),
+            (_, false) => format!("“{song}” is on “{title}”{by}. That album will go on Lidarr's list, and Lidarr will start looking for it. The whole album is fetched."),
+        };
+        let heading = match kind.as_str() {
+            "Single" => "Ask for this single?",
+            "EP" => "Ask for this EP?",
+            _ => "Ask for this album?",
         };
         *self.prompt.borrow_mut() =
             Some(crate::actions::PromptAction::RequestAlbum { album: album.to_string(), title: title.to_string(), song: song.to_string() });
-        self.open_prompt("Ask for this album?", &text, "Request", None, false);
+        self.open_prompt(heading, &text, "Request", None, false);
     }
 
     /// Reloads the page on screen if it shows music that isn't in the library, after what's
@@ -1108,7 +1126,7 @@ impl Controller {
             let offer = crate::lidarr::offered(&album)
                 .map(Ok)
                 .unwrap_or_else(|| {
-                    lidarr.find_albums(&format!("lidarr:{album}"))?.into_iter().find(|o| o.album == album).ok_or_else(|| "Lidarr no longer lists that album.".to_string())
+                    lidarr.find_any(&format!("lidarr:{album}"))?.into_iter().find(|o| o.album == album).ok_or_else(|| "Lidarr no longer lists that one.".to_string())
                 });
             let result = offer.and_then(|offer| {
                 crate::lidarr::remember(std::slice::from_ref(&offer));
@@ -1141,6 +1159,7 @@ impl Controller {
             let open = page
                 .shelves
                 .iter()
+                .filter(|shelf| shelf.title == "Albums")
                 .flat_map(|shelf| &shelf.cards)
                 .filter(|card| card.kind == Kind::Request && !card.subtitle.ends_with("Requested") && !card.subtitle.ends_with("Arrived"))
                 .count();
@@ -2807,6 +2826,7 @@ impl Controller {
         page.set_cache_limit(config::CACHE_LIMITS.iter().position(|limit| limit.1 == settings.cache_limit_mb).unwrap_or(0) as i32);
         page.set_cache_ahead(config::CACHE_AHEAD.iter().position(|songs| *songs == settings.cache_ahead).unwrap_or(0) as i32);
         page.set_requests(settings.requests);
+        page.set_request_singles(settings.request_singles);
         page.set_lidarr_address(settings.lidarr_address.as_str().into());
         page.set_lidarr_key_hint(config::load_secret(&self.paths, "lidarr-key").map(|key| crate::lidarr::mask(&key)).unwrap_or_default().into());
         let gate = crate::gate::Found { service: settings.lidarr_gate.clone(), client: String::new() };
@@ -3176,6 +3196,14 @@ impl Controller {
                 }
             });
         });
+        settings.on_set_request_singles(|on| {
+            with(|ctl| {
+                ctl.change_setting(true, |s| s.request_singles = on);
+                crate::lidarr::set_singles(on);
+                ctl.invalidate("search:");
+                ctl.invalidate("outside-");
+            });
+        });
         settings.on_save_requests(|address, key| {
             with(|ctl| ctl.save_requests(&address, &key));
         });
@@ -3199,7 +3227,7 @@ impl Controller {
                         let page = ctl.page.borrow();
                         (page.title.clone(), page.subtitle.clone())
                     };
-                    ctl.prompt_request(&album, &title, &by, "");
+                    ctl.prompt_request(&album, &title, &by, "", "");
                 }
                 Some(Route::OutsideArtist(artist)) => ctl.prompt_add_artist(artist),
                 _ => {}
@@ -3218,7 +3246,7 @@ impl Controller {
         view.on_offer_request(|index| {
             with(|ctl| {
                 let Some(offer) = ctl.page.borrow().offers.get(index as usize).cloned() else { return };
-                ctl.prompt_request(&offer.album, &offer.album_title, &offer.artist, &offer.title);
+                ctl.prompt_request(&offer.album, &offer.album_title, &offer.artist, &offer.title, if offer.kind.is_empty() { "Album" } else { &offer.kind });
             });
         });
         settings.on_import_spotify(|| {

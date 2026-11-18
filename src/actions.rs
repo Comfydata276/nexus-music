@@ -928,7 +928,7 @@ impl Controller {
             // The button on an album that isn't in the library asks for it.
             ui::CardKind::Request => {
                 let by = crate::lidarr::offered(&id).map(|offer| offer.artist).unwrap_or_default();
-                return self.prompt_request(&id, &title, &by, "");
+                return self.prompt_request(&id, &title, &by, "", "");
             }
             ui::CardKind::Mix => {
                 // Made on the spot from the app's copy of the library.

@@ -623,7 +623,7 @@ component OfferRow inherits Rectangle {
                 icon: root.offer.requested ? Icons.check : Icons.plus;
                 icon-size: 20px;
                 tint: root.offer.requested ? Theme.accent-bright : Theme.muted;
-                label: root.offer.requested ? root.offer.album-title + " has been asked for" : "Request the album " + root.offer.album-title;
+                label: root.offer.requested ? "“" + root.offer.album-title + "” has been asked for" : "Request “" + root.offer.album-title + "”";
                 clicked => { root.request(); }
             }
         }
@@ -2053,11 +2053,21 @@ export component SettingsPage inherits Rectangle {
 
                         SettingRow {
                             title: "Ask for albums that aren't in your library";
-                            detail: "For people who run Lidarr beside their music server. Search results gain a “Not in your library” section of songs, artists and albums; asking for one puts its album on Lidarr's list, and a Requests page shows what's on its way. Whole albums only. Songs and track lists are looked up at MusicBrainz, which is sent what you search for.";
+                            detail: "For people who run Lidarr beside their music server. Search results gain a “Not in your library” section of songs, artists and albums; asking for one puts its album on Lidarr's list, and a Requests page shows what's on its way. Songs and track lists are looked up at MusicBrainz, which is sent what you search for.";
                             Toggle {
                                 on: Settings.requests;
                                 label: "Ask for albums that aren't in your library";
                                 toggled(on) => { Settings.set-requests(on); }
+                            }
+                        }
+
+                        if Settings.requests: SettingRow {
+                            title: "Singles and EPs too";
+                            detail: "A song that never came out on an album is offered on the single or EP it did come out on, and an artist's page lists those as well. Asking for one has Lidarr list that artist's singles and EPs alongside their albums; only what you ask for is fetched.";
+                            Toggle {
+                                on: Settings.request-singles;
+                                label: "Singles and EPs too";
+                                toggled(on) => { Settings.set-request-singles(on); }
                             }
                         }
 
