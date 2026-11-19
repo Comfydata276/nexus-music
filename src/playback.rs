@@ -2078,6 +2078,18 @@ impl Controller {
         player.on_clear_queue(|| {
             with(|ctl| ctl.clear_upcoming());
         });
+        player.on_save_queue(|| {
+            with(|ctl| {
+                // What's playing and everything after it, in the order it will play.
+                let songs: Vec<Song> = {
+                    let pb = ctl.playback.borrow();
+                    pb.order.iter().skip(pb.cursor).filter_map(|&i| pb.queue.get(i)).filter(|s| s.radio_url.is_empty() && !s.id.is_empty()).cloned().collect()
+                };
+                if !songs.is_empty() {
+                    ctl.prompt_new_playlist(songs);
+                }
+            });
+        });
         player.on_queue_moved(|index, delta| {
             with(|ctl| {
                 let to = (index + delta).max(0) as usize;

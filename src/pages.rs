@@ -1096,6 +1096,7 @@ fn mix(id: &str) -> PageData {
         ),
         cover: made.songs.first().map(|song| song.cover_art.clone()).unwrap_or_default(),
         can_play: true,
+        has_menu: true,
         show_album: true,
         show_cover: true,
         show_number: true,

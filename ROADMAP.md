@@ -88,15 +88,16 @@ Things that lose data or interrupt the music.
 - [x] Links and the "Up next" rows can be named and used by a screen reader.
 - [ ] On search results and artist pages the list doesn't yet scroll to follow the keyboard.
 
-## 5. Playlists you can trust
+## 5. Playlists you can trust (0.28.0)
 
-- [ ] Removing or moving a song checks the playlist against the server first, so a change
-      made on another device isn't undone and the wrong song is never removed.
-- [ ] Undo for the last removal or move.
-- [ ] Songs from a requested album reach the imported playlist that was waiting for them even
-      if the first attempt fails.
-- [ ] Save the queue, or a "Made for you" mix, as a playlist.
-- [ ] Export a playlist as CSV.
+- [x] Removing or moving a song is carried out on the playlist as the server has it at that
+      moment, so a change made on another device isn't undone and the wrong song is never
+      removed. Changes to playlists are sent one at a time, in the order they were made.
+- [x] Undo for the last removal or move, on the toast or with Ctrl+Z.
+- [x] Songs from a requested album reach the imported playlist that was waiting for them even
+      if the first attempt fails, or the album turns up before all its songs do.
+- [x] Save the queue, or a "Made for you" mix, as a playlist.
+- [x] Export a playlist as CSV.
 
 ## 6. Downloads
 

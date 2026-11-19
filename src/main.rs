@@ -28,6 +28,7 @@ mod pages;
 #[cfg(windows)]
 mod picker;
 mod playback;
+mod playlists;
 mod plays;
 mod pool;
 mod saver;

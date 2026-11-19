@@ -343,6 +343,10 @@ export component MainWindow inherits Window {
                 }
                 return accept;
             }
+            if event.modifiers.control && event.text == "z" {
+                App.undo();
+                return accept;
+            }
             if (event.modifiers.control && event.text == "r") || event.text == Key.F5 {
                 App.refresh();
                 return accept;

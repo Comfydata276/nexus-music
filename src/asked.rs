@@ -18,6 +18,10 @@ use crate::search::Index;
 const SHOWN_FOR: i64 = 14 * 24 * 3600;
 /// How long to go on watching for something that never arrives.
 const GIVEN_UP_AFTER: i64 = 180 * 24 * 3600;
+/// How long after an album arrives to go on trying to get its songs into the playlists that
+/// were waiting for them. An album can show up in the library before all its songs have,
+/// and a playlist can fail to save.
+const FILLED_WITHIN: i64 = 3 * 24 * 3600;
 
 /// A song a playlist is missing, to be put in once its album arrives.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -50,6 +54,8 @@ pub struct Asked {
     pub arrived: i64,
     pub library_album: String,
     pub cover: String,
+    /// It has arrived, but not all the songs playlists were waiting for are in them yet.
+    pub unfilled: bool,
 }
 
 /// An album that has turned up, with what's to be done about it.
@@ -62,6 +68,11 @@ pub struct Arrival {
     /// Songs to put into playlists: the playlist (id, name), the song's id, and when it was
     /// added where it came from.
     pub fills: Vec<(String, String, String, i64)>,
+    /// How many songs its playlists are waiting for that aren't in the library yet.
+    pub missing: usize,
+    /// When it was asked for and by what title: what tells it apart once places have moved.
+    pub at: i64,
+    pub title: String,
 }
 
 pub struct AskedList {
@@ -131,9 +142,19 @@ impl AskedList {
         }
     }
 
-    /// Whether anything asked for is still on its way.
+    /// Whether anything asked for is still on its way, or has songs still to go into
+    /// playlists.
     pub fn waiting(&self) -> bool {
-        self.items.iter().any(|asked| asked.arrived == 0)
+        self.items.iter().any(|asked| asked.arrived == 0 || asked.unfilled)
+    }
+
+    /// Notes how getting an arrival's songs into its playlists went: done unless some of them
+    /// still aren't in the library.
+    pub fn filled(&mut self, at: i64, title: &str, missing: usize) {
+        if let Some(asked) = self.items.iter_mut().find(|asked| asked.at == at && asked.title == title && asked.arrived != 0) {
+            asked.unfilled = missing > 0;
+            self.save();
+        }
     }
 
     /// Drops what's been listed long enough, and what's been waited for too long.
@@ -148,11 +169,14 @@ impl AskedList {
     /// Marks arrivals as such.
     pub fn mark(&mut self, arrivals: &[Arrival], now: i64) {
         for arrival in arrivals {
-            if let Some(asked) = self.items.get_mut(arrival.place).filter(|asked| asked.arrived == 0) {
+            let Some(asked) = self.items.get_mut(arrival.place) else { continue };
+            if asked.arrived == 0 {
                 asked.arrived = now;
                 asked.library_album = arrival.library_album.clone();
                 asked.cover = arrival.cover.clone();
             }
+            // Until its songs are known to be in their playlists (see `filled`).
+            asked.unfilled = !arrival.fills.is_empty() || arrival.missing > 0;
         }
         self.save();
     }
@@ -164,10 +188,12 @@ fn same_artist(a: &str, b: &str) -> bool {
     !a.is_empty() && !b.is_empty() && (a.iter().all(|word| b.contains(word)) || b.iter().all(|word| a.contains(word)))
 }
 
-/// Looks through the library for the albums in `asked` that are still awaited. For each
-/// that's there now, finds the songs its playlists were missing.
-pub fn arrivals(index: &Index, asked: &[Asked]) -> Vec<Arrival> {
-    let awaited: Vec<(usize, &Asked)> = asked.iter().enumerate().filter(|(_, asked)| asked.arrived == 0).collect();
+/// Looks through the library for the albums in `asked` that are still awaited, and for the
+/// ones that arrived lately with songs still to go into playlists. For each that's there
+/// now, finds the songs its playlists were missing.
+pub fn arrivals(index: &Index, asked: &[Asked], now: i64) -> Vec<Arrival> {
+    let due = |asked: &Asked| asked.arrived == 0 || (asked.unfilled && now - asked.arrived < FILLED_WITHIN);
+    let awaited: Vec<(usize, &Asked)> = asked.iter().enumerate().filter(|(_, asked)| due(asked)).collect();
     if awaited.is_empty() {
         return Vec::new();
     }
@@ -177,7 +203,7 @@ pub fn arrivals(index: &Index, asked: &[Asked]) -> Vec<Arrival> {
         .filter_map(|(place, asked)| {
             // The library's albums carry their artist as the line beneath the title.
             let album = index.library.albums.iter().find(|album| same_words(&album.title, &asked.title) && same_artist(&album.subtitle, &asked.artist))?;
-            let fills = asked
+            let fills: Vec<(String, String, String, i64)> = asked
                 .fills
                 .iter()
                 .filter_map(|fill| {
@@ -186,7 +212,12 @@ pub fn arrivals(index: &Index, asked: &[Asked]) -> Vec<Arrival> {
                     Some((fill.playlist.clone(), fill.playlist_name.clone(), song.id.clone(), fill.added))
                 })
                 .collect();
-            Some(Arrival { place, library_album: album.id.clone(), cover: album.cover.clone(), fills })
+            let missing = asked.fills.len() - fills.len();
+            // One that arrived before and still has nothing to add is no news.
+            if asked.arrived != 0 && fills.is_empty() {
+                return None;
+            }
+            Some(Arrival { place, library_album: album.id.clone(), cover: album.cover.clone(), fills, missing, at: asked.at, title: asked.title.clone() })
         })
         .collect()
 }
@@ -217,10 +248,38 @@ mod tests {
             Asked { title: "Parachutes".into(), artist: "Coldplay".into(), arrived: 5, ..Default::default() },
             Asked { title: "Parachutes".into(), artist: "Someone Else".into(), ..Default::default() },
         ];
-        let found = arrivals(&index(), &asked);
+        let found = arrivals(&index(), &asked, 1000);
         assert_eq!(found.len(), 1);
         assert_eq!((found[0].place, found[0].library_album.as_str(), found[0].cover.as_str()), (0, "a1", "al-a1"));
         assert_eq!(found[0].fills, vec![("p1".to_string(), "Road Trip".to_string(), "s1".to_string(), 1_700_000_000)]);
+        // One of the two songs its playlist wanted isn't in the library (yet).
+        assert_eq!(found[0].missing, 1);
+    }
+
+    #[test]
+    fn goes_on_filling_playlists_after_an_album_arrives() {
+        let path = std::env::temp_dir().join(format!("nexus-asked-fill-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let fill = Fill { playlist: "p1".into(), playlist_name: "Road Trip".into(), title: "Lonely No More".into(), artists: vec!["Rob Thomas".into()], seconds: 200, added: 0 };
+        let mut list = AskedList::load(&path);
+        list.add(Asked { title: "...Something to Be".into(), artist: "Rob Thomas".into(), at: 50, fills: vec![fill], ..Default::default() });
+        let first = arrivals(&index(), &list.items, 1000);
+        list.mark(&first, 1000);
+        // It has arrived, and its song still has to go into the playlist: if that fails (or
+        // the app closes first) the next look at the library offers it again.
+        assert!(list.items[0].arrived == 1000 && list.items[0].unfilled && list.waiting());
+        let again = arrivals(&index(), &list.items, 2000);
+        assert_eq!((again.len(), again[0].fills.len()), (1, 1));
+        list.mark(&again, 2000);
+        assert_eq!(list.items[0].arrived, 1000);
+        // Once the playlist has it, there's nothing more to do.
+        list.filled(50, "...Something to Be", 0);
+        assert!(!list.items[0].unfilled && !list.waiting());
+        assert!(arrivals(&index(), &list.items, 3000).is_empty());
+        // And it isn't tried for ever.
+        list.items[0].unfilled = true;
+        assert!(arrivals(&index(), &list.items, 1000 + FILLED_WITHIN + 1).is_empty());
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

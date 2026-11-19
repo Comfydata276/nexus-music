@@ -302,6 +302,7 @@ impl Controller {
                     self.entry("pin", "Pin to top", icons.get_pin())
                 });
                 entries.push(self.entry("download", "Download", icons.get_download()));
+                entries.push(self.entry("export", "Export as CSV", icons.get_file_down()));
                 entries.push(self.entry("rename", "Rename", icons.get_pencil()));
                 let mut delete = self.entry("delete", "Delete playlist", icons.get_trash_2());
                 delete.danger = true;
@@ -332,6 +333,14 @@ impl Controller {
             match (&page.playlist, self.current_route()) {
                 (Some(p), _) => Target::Playlist { id: p.id.clone(), name: p.name.clone() },
                 (None, Some(Route::Album(id))) => Target::Album { id, title: page.title.clone() },
+                // A mix is made afresh from your listening and changes over time; the one
+                // thing to do with it as a whole is to keep it.
+                (None, Some(Route::Mix(_))) if !page.songs.is_empty() => {
+                    let entries = vec![self.entry("save-playlist", "Save as playlist", self.ui.global::<ui::Icons>().get_list_plus())];
+                    let (target, title) = (Target::Songs { songs: page.songs.clone(), playlist: None }, page.title.clone());
+                    drop(page);
+                    return self.open_menu(target, &title, entries, x, y);
+                }
                 _ => return,
             }
         };
@@ -585,6 +594,8 @@ impl Controller {
                 ctl.toast("Added to queue");
             }),
             ("pl-new", _) => self.with_songs(target, |ctl, songs| ctl.prompt_new_playlist(songs)),
+            ("save-playlist", Target::Songs { songs, .. }) => self.prompt_new_playlist(songs.clone()),
+            ("export", Target::Playlist { id, name }) => self.export_playlist(id.clone(), name.clone()),
             ("star", Target::Song { song, .. }) | ("unstar", Target::Song { song, .. }) => {
                 self.toggle_song_star(song)
             }
@@ -873,22 +884,32 @@ impl Controller {
         let mut rows: Vec<usize> = rows.to_vec();
         rows.sort_unstable();
         rows.dedup();
-        {
+        let before = {
             let mut page = self.page.borrow_mut();
             if page.playlist.as_ref().is_none_or(|p| p.id != playlist_id) {
                 return;
             }
             rows.retain(|&row| row < page.songs.len());
+            let before = page.songs.clone();
             let mut index = 0;
             page.songs.retain(|_| {
                 index += 1;
                 rows.binary_search(&(index - 1)).is_err()
             });
             page.can_play = !page.songs.is_empty();
-        }
+            before
+        };
         if rows.is_empty() {
             return;
         }
+        // Which songs go, said by the songs themselves and not by where they sit: the
+        // playlist may have changed on the server since this page loaded.
+        let ids: Vec<String> = before.iter().map(|song| song.id.clone()).collect();
+        let edit = crate::playlists::Edit::Remove(rows.iter().map(|&row| crate::playlists::spot(&ids, row)).collect());
+        *self.undo.borrow_mut() = Some((
+            std::time::Instant::now(),
+            crate::controller::Undo::Removed { playlist: playlist_id.clone(), before, places: rows.clone() },
+        ));
         let key = format!("playlist:{playlist_id}");
         // If the queue is playing from this playlist, the songs leave it too.
         let songs = self.page.borrow().songs.clone();
@@ -898,21 +919,44 @@ impl Controller {
             let data = self.page.borrow().clone();
             self.remember(&route.cache_key(), std::time::Instant::now(), data);
         }
-        self.toast(if rows.len() == 1 {
+        self.toast_with_undo(if rows.len() == 1 {
             "Removed from the playlist".to_string()
         } else {
             format!("{} songs removed from the playlist", rows.len())
         });
+        self.edit_playlist(playlist_id, ids, edit);
+    }
+
+    /// Writes a playlist out as a spreadsheet file: where the system's save window says, or
+    /// (without one) into the app's own folder.
+    fn export_playlist(self: &Rc<Self>, id: String, name: String) {
+        let file = format!("{}.csv", crate::playlists::file_name(&name));
+        #[cfg(windows)]
+        let chosen = match crate::picker::pick_save(&self.ui, &file) {
+            Some(None) => return,
+            Some(path) => path,
+            None => None,
+        };
+        #[cfg(not(windows))]
+        let chosen: Option<std::path::PathBuf> = None;
+        let path = chosen.unwrap_or_else(|| self.paths.exports.join(&file));
         self.request(
-            move |client| client.remove_many_from_playlist(&playlist_id, &rows),
+            move |client| client.playlist(&id).map(|playlist| (id, playlist)),
             move |ctl, result| {
-                if let Err(e) = result {
-                    ctl.invalidate(&key);
-                    ctl.toast(format!("That didn't save. {e}"));
+                let (id, playlist) = match result {
+                    Ok(found) => found,
+                    Err(e) => return ctl.toast(format!("Couldn't export “{name}”. {e}")),
+                };
+                let added = ctl.added.borrow().dates(&id, &playlist.songs);
+                let text = crate::playlists::csv(&playlist.songs, &added);
+                if let Some(folder) = path.parent() {
+                    let _ = std::fs::create_dir_all(folder);
                 }
-                // Picks up the playlist's new length and running time (or, if the change
-                // didn't save, puts the songs back).
-                ctl.refresh();
+                // With a mark at the start that tells a spreadsheet the text is UTF-8.
+                match std::fs::write(&path, format!("\u{feff}{text}")) {
+                    Ok(()) => ctl.toast(format!("Exported “{name}” to {}", path.display())),
+                    Err(e) => ctl.toast(format!("Couldn't write {}. {e}", path.display())),
+                }
             },
         );
     }

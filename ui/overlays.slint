@@ -231,8 +231,10 @@ export component PromptOverlay inherits Rectangle {
 }
 
 export component ToastOverlay inherits Rectangle {
+    // Room for the action ("Undo") beside the words, when there is one.
+    property <length> action-width: Toast.action == "" ? 0px : action.preferred-width + 28px;
     height: 44px;
-    width: min(label.preferred-width + 40px, 560px);
+    width: min(label.preferred-width + 40px + self.action-width, 560px);
     border-radius: 22px;
     background: Theme.text;
     opacity: Toast.visible ? 1 : 0;
@@ -243,12 +245,41 @@ export component ToastOverlay inherits Rectangle {
     accessible-role: none;
 
     label := Text {
-        width: parent.width - 40px;
+        x: 20px;
+        width: parent.width - 40px - root.action-width;
         text: Toast.text;
         color: Theme.base;
         font-size: 14px;
         font-weight: 600;
         horizontal-alignment: center;
         overflow: elide;
+    }
+
+    Rectangle {
+        x: parent.width - root.action-width - 8px;
+        y: 6px;
+        width: root.action-width;
+        height: parent.height - 12px;
+        border-radius: 16px;
+        visible: Toast.action != "";
+        background: act.has-hover ? Theme.base.transparentize(0.82) : Theme.base.transparentize(0.9);
+        accessible-role: button;
+        accessible-label: Toast.action;
+        accessible-action-default => { Toast.acted(); }
+
+        action := Text {
+            text: Toast.action;
+            color: Theme.base;
+            font-size: 14px;
+            font-weight: 700;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+
+        act := TouchArea {
+            enabled: Toast.visible && Toast.action != "";
+            mouse-cursor: pointer;
+            clicked => { Toast.acted(); }
+        }
     }
 }

@@ -14,6 +14,8 @@ pub struct Paths {
     /// Where in the queue playback has got to. Kept apart from the queue itself, which is
     /// large and changes far less often.
     pub queue_place: PathBuf,
+    /// Where exported playlists go when there's no system window to ask where.
+    pub exports: PathBuf,
     pub history: PathBuf,
     /// Likes, ratings and plays waiting to be sent to the server.
     pub pending: PathBuf,
@@ -62,6 +64,7 @@ impl Paths {
             settings: config.join("settings.json"),
             queue: config.join("queue.json"),
             queue_place: config.join("queue-place.json"),
+            exports: data.join("exports"),
             history: config.join("history.json"),
             pending: config.join("pending.json"),
             added: config.join("playlist-added.json"),

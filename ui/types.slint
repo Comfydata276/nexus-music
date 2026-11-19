@@ -149,6 +149,8 @@ export global App {
     callback go-back();
     callback go-forward();
     callback refresh();
+    // Ctrl+Z: take back the last change to a playlist.
+    callback undo();
 
     in-out property <string> search-text;
     callback search(text: string);
@@ -394,6 +396,7 @@ export global Player {
     callback queue-activated(index: int);
     callback queue-menu(index: int, x: length, y: length);
     callback clear-queue();
+    callback save-queue();
     callback choose-sleep(x: length, y: length);
     // The queue row at `index` was dragged `delta` places down (or up, when negative).
     callback queue-moved(index: int, delta: int);
@@ -439,6 +442,9 @@ export global Prompt {
 export global Toast {
     in property <bool> visible;
     in property <string> text;
+    // Something that can be done about what the toast says ("Undo"); empty for nothing.
+    in property <string> action;
+    callback acted();
 }
 
 export global Lyrics {

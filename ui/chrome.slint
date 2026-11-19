@@ -1071,6 +1071,7 @@ export component QueuePanel inherits Rectangle {
         if App.queue-tab == 0 && Player.has-track: HorizontalLayout {
             padding-left: 12px;
             padding-right: Lane.gutter - Lane.reach + 8px;
+            spacing: 14px;
             height: 36px;
 
             Text {
@@ -1082,6 +1083,14 @@ export component QueuePanel inherits Rectangle {
                 font-weight: 600;
                 vertical-alignment: center;
                 overflow: elide;
+            }
+
+            if Player.queue.length > 0: VerticalLayout {
+                alignment: center;
+                LinkText {
+                    text: "Save";
+                    clicked => { Player.save-queue(); }
+                }
             }
 
             if Player.queue.length > 0: VerticalLayout {

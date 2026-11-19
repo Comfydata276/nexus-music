@@ -36,6 +36,14 @@ pub fn post(f: impl FnOnce(&Rc<Controller>) + Send + 'static) {
     });
 }
 
+/// A change to a playlist that can be taken back: the playlist, and its songs before.
+pub enum Undo {
+    /// Songs were taken out; `places` is where they were, lowest first.
+    Removed { playlist: String, before: Vec<Song>, places: Vec<usize> },
+    /// The song at `from` was moved to `to`.
+    Moved { playlist: String, before: Vec<Song>, from: usize, to: usize },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Route {
     Home,
@@ -259,6 +267,11 @@ pub struct Controller {
     /// For asking Lidarr to fetch things. One of those can take minutes, and mustn't hold
     /// up loading pages.
     requests_pool: Pool,
+    /// For changes to playlists, one at a time and in the order they were made, so a later
+    /// change is always applied to what an earlier one left.
+    playlist_pool: Pool,
+    /// The last change to a playlist that can still be taken back, and when it was made.
+    pub undo: RefCell<Option<(Instant, Undo)>>,
     /// For looking things up in the copy of the library kept on this PC, which needs no
     /// network and so shouldn't wait behind anything that does.
     quick_pool: Pool,
@@ -416,6 +429,8 @@ impl Controller {
             covers: Covers::new(paths.covers.clone()),
             api_pool: Pool::new("api", 4, false),
             requests_pool: Pool::new("requests", 2, false),
+            playlist_pool: Pool::new("playlists", 1, false),
+            undo: RefCell::default(),
             quick_pool: Pool::new("quick", 1, true),
             download_pool: Pool::new("download", 2, false),
             downloads: RefCell::new(crate::downloads::Downloads::load(paths.downloads.clone())),
@@ -544,15 +559,115 @@ impl Controller {
     }
 
     pub fn toast(&self, text: impl Into<SharedString>) {
+        self.show_toast(text.into(), "", Duration::from_millis(3200));
+    }
+
+    /// A toast with "Undo" on it, shown for longer so there's time to press it.
+    pub fn toast_with_undo(&self, text: impl Into<SharedString>) {
+        self.show_toast(text.into(), "Undo", Duration::from_secs(8));
+    }
+
+    fn show_toast(&self, text: SharedString, action: &str, shown_for: Duration) {
         let toast = self.ui.global::<ui::Toast>();
-        toast.set_text(text.into());
+        toast.set_text(text);
+        toast.set_action(action.into());
         toast.set_visible(true);
         let weak = self.ui.as_weak();
-        self.toast_timer.start(slint::TimerMode::SingleShot, Duration::from_millis(3200), move || {
+        self.toast_timer.start(slint::TimerMode::SingleShot, shown_for, move || {
             if let Some(ui) = weak.upgrade() {
                 ui.global::<ui::Toast>().set_visible(false);
             }
         });
+    }
+
+    /// Carries out a change to a playlist on the server. The playlist is looked at as it is
+    /// there now, and the change applied to that, so songs added or removed somewhere else
+    /// since the page loaded are neither lost nor mistaken for the ones meant. `expected` is
+    /// what the page took the playlist to hold before the change.
+    pub fn edit_playlist(self: &Rc<Self>, id: String, expected: Vec<String>, edit: crate::playlists::Edit) {
+        use crate::playlists::{Edit, apply, positions};
+        let Some(client) = self.client() else { return };
+        self.playlist_pool.spawn(move || {
+            let result = (|| -> crate::subsonic::ApiResult<bool> {
+                let now: Vec<String> = client.playlist(&id)?.songs.into_iter().map(|song| song.id).collect();
+                match &edit {
+                    Edit::Remove(spots) => {
+                        let places = positions(&now, spots);
+                        if !places.is_empty() {
+                            client.remove_many_from_playlist(&id, &places)?;
+                        }
+                    }
+                    _ => {
+                        let next = apply(&now, &edit);
+                        if next != now {
+                            client.replace_playlist(&id, &next)?;
+                        }
+                    }
+                }
+                Ok(now != expected)
+            })();
+            post(move |ctl| {
+                let key = format!("playlist:{id}");
+                let showing = ctl.current_route() == Some(Route::Playlist(id.clone()));
+                match result {
+                    // It had changed elsewhere: show how it stands now. Either way its length
+                    // and running time on the page want bringing up to date.
+                    Ok(_) if showing => ctl.refresh(),
+                    Ok(_) => ctl.invalidate(&key),
+                    Err(e) => {
+                        ctl.invalidate(&key);
+                        ctl.toast(format!("That didn't save. {e}"));
+                        if showing {
+                            ctl.refresh();
+                        }
+                    }
+                }
+            });
+        });
+    }
+
+    /// Takes back the last change to a playlist, if it was made in the last minute.
+    pub fn undo_last(self: &Rc<Self>) {
+        let Some((at, undo)) = self.undo.borrow_mut().take() else { return };
+        if at.elapsed() > Duration::from_secs(60) {
+            return;
+        }
+        self.ui.global::<ui::Toast>().set_visible(false);
+        let (playlist, restored, edit) = match undo {
+            Undo::Removed { playlist, before, places } => {
+                let ids: Vec<String> = before.iter().map(|song| song.id.clone()).collect();
+                let edit = crate::playlists::restoring(&ids, &places);
+                (playlist, before, edit)
+            }
+            Undo::Moved { playlist, before, from, to } => {
+                // The list as it was after the move, and the move back.
+                let mut ids: Vec<String> = before.iter().map(|song| song.id.clone()).collect();
+                let moved = ids.remove(from);
+                ids.insert(to, moved);
+                let edit = crate::playlists::moving(&ids, to, from);
+                (playlist, before, edit)
+            }
+        };
+        // What the page (if it's still on this playlist) holds now is what the server is
+        // expected to hold; then the page goes back to how it was.
+        let showing = self.page.borrow().playlist.as_ref().is_some_and(|p| p.id == playlist);
+        let expected: Vec<String> = if showing { self.page.borrow().songs.iter().map(|s| s.id.clone()).collect() } else { Vec::new() };
+        if showing {
+            {
+                let mut page = self.page.borrow_mut();
+                page.songs = restored;
+                page.can_play = !page.songs.is_empty();
+            }
+            let songs = self.page.borrow().songs.clone();
+            self.source_list_now(&format!("playlist:{playlist}"), &songs);
+            self.rebuild_tracks();
+            if let Some(route) = self.current_route() {
+                let data = self.page.borrow().clone();
+                self.remember(&route.cache_key(), Instant::now(), data);
+            }
+        }
+        self.toast("Put back");
+        self.edit_playlist(playlist, expected, edit);
     }
 
     pub fn save_settings(&self) {
@@ -1480,19 +1595,24 @@ impl Controller {
             asked.mark(&arrivals, now);
             fresh
         };
-        if told.is_empty() {
-            return;
-        }
+        // Arrivals that are news; the rest arrived before and are here to have their
+        // playlists seen to again.
         let news = match told.as_slice() {
+            [] => String::new(),
             [one] if !one.song.is_empty() => format!("“{}” has arrived, on “{}”.", one.song, one.title),
             [one] => format!("“{}” by {} has arrived.", one.title, one.artist),
             many => format!("{} albums you asked for have arrived.", many.len()),
         };
-        self.toast(format!("{news} See Requests."));
-        self.refresh_outside();
-        if self.current_route() == Some(Route::Requests) {
-            self.show(Route::Requests, 0.0, true, None);
+        if !told.is_empty() {
+            self.toast(format!("{news} See Requests."));
+            self.refresh_outside();
+            if self.current_route() == Some(Route::Requests) {
+                self.show(Route::Requests, 0.0, true, None);
+            }
         }
+        // What to note once each one's songs are in their playlists.
+        let settle: Vec<(i64, String, usize)> =
+            arrivals.iter().filter(|arrival| !arrival.fills.is_empty()).map(|arrival| (arrival.at, arrival.title.clone(), arrival.missing)).collect();
         // The songs playlists were waiting for, gathered by playlist. A playlist that was
         // never made (none of its songs were found at the time) is made now.
         let mut by_list: Vec<(String, String, Vec<(String, i64)>)> = Vec::new();
@@ -1515,38 +1635,51 @@ impl Controller {
                 let mut done: Vec<(String, String, Vec<(String, i64)>)> = Vec::new();
                 for (id, name, songs) in by_list {
                     let ids: Vec<String> = songs.iter().map(|(song, _)| song.clone()).collect();
-                    let id = if id.is_empty() {
-                        client.create_playlist(&name, &ids)?.id
+                    let (id, songs) = if id.is_empty() {
+                        (client.create_playlist(&name, &ids)?.id, songs)
                     } else {
-                        // Not ones the playlist has gained some other way in the meantime.
-                        let have: HashSet<String> = client.playlist(&id).map(|list| list.songs.into_iter().map(|song| song.id).collect()).unwrap_or_default();
-                        let new: Vec<String> = ids.iter().filter(|song| !have.contains(*song)).cloned().collect();
+                        // Not ones the playlist has already: gained some other way in the
+                        // meantime, or put there by an earlier go at this that was cut short.
+                        let have: HashSet<String> = client.playlist(&id)?.songs.into_iter().map(|song| song.id).collect();
+                        let new: Vec<(String, i64)> = songs.into_iter().filter(|(song, _)| !have.contains(song)).collect();
                         if !new.is_empty() {
-                            client.add_to_playlist(&id, &new)?;
+                            let ids: Vec<String> = new.iter().map(|(song, _)| song.clone()).collect();
+                            client.add_to_playlist(&id, &ids)?;
                         }
-                        id
+                        (id, new)
                     };
                     done.push((id, name, songs));
                 }
                 Ok(done)
             },
             move |ctl, result| {
+                // If a playlist couldn't be saved, these stay marked as waiting and are tried
+                // again the next time the library is looked at.
                 let Ok(done) = result else { return };
+                for (at, title, missing) in &settle {
+                    ctl.asked.borrow_mut().filled(*at, title, *missing);
+                }
                 let (mut songs, mut names) = (0, Vec::new());
                 for (id, name, added) in &done {
                     // Dated as they were on the playlist they came from, where that's known.
                     let dated: Vec<(String, i64)> = added.iter().map(|(song, at)| (song.clone(), if *at > 0 { *at } else { now })).collect();
                     ctl.added.borrow_mut().record_at(id, &dated, false, now);
                     songs += added.len();
-                    names.push(name.clone());
+                    if !added.is_empty() {
+                        names.push(name.clone());
+                    }
                 }
                 ctl.share_soon();
                 ctl.invalidate("playlist:");
                 ctl.reload_playlists();
-                ctl.toast(match names.as_slice() {
-                    [one] => format!("{news} Added {} to “{one}”.", count(songs as u32, "song")),
-                    _ => format!("{news} Added {} to {} playlists.", count(songs as u32, "song"), names.len()),
-                });
+                if songs == 0 {
+                    return;
+                }
+                let added = match names.as_slice() {
+                    [one] => format!("Added {} to “{one}”.", count(songs as u32, "song")),
+                    _ => format!("Added {} to {} playlists.", count(songs as u32, "song"), names.len()),
+                };
+                ctl.toast(if news.is_empty() { added } else { format!("{news} {added}") });
             },
         );
     }
@@ -1771,7 +1904,8 @@ impl Controller {
                 }
             }
             // Has anything that was asked for turned up?
-            let arrived = crate::search::current().map(|index| crate::asked::arrivals(&index, &crate::asked::shared())).unwrap_or_default();
+            let now = chrono::Utc::now().timestamp();
+            let arrived = crate::search::current().map(|index| crate::asked::arrivals(&index, &crate::asked::shared(), now)).unwrap_or_default();
             post(move |ctl| {
                 ctl.library_busy.set(false);
                 if !arrived.is_empty() {
@@ -2818,16 +2952,20 @@ impl Controller {
         if !self.track_view.borrow().is_default() {
             return;
         }
-        let (id, ids) = {
+        let (id, before) = {
             let mut page = self.page.borrow_mut();
             let Some(id) = page.playlist.as_ref().map(|p| p.id.clone()) else { return };
             if from == to || from >= page.songs.len() || to >= page.songs.len() {
                 return;
             }
+            let before = page.songs.clone();
             let song = page.songs.remove(from);
             page.songs.insert(to, song);
-            (id, page.songs.iter().map(|s| s.id.clone()).collect::<Vec<_>>())
+            (id, before)
         };
+        let ids: Vec<String> = before.iter().map(|song| song.id.clone()).collect();
+        let edit = crate::playlists::moving(&ids, from, to);
+        *self.undo.borrow_mut() = Some((Instant::now(), Undo::Moved { playlist: id.clone(), before, from, to }));
         // If the queue is playing from this playlist, it follows the new order.
         let songs = self.page.borrow().songs.clone();
         self.source_list_now(&format!("playlist:{id}"), &songs);
@@ -2836,15 +2974,8 @@ impl Controller {
             let data = self.page.borrow().clone();
             self.remember(&route.cache_key(), Instant::now(), data);
         }
-        self.request(
-            move |client| client.replace_playlist(&id, &ids),
-            |ctl, result| {
-                if let Err(e) = result {
-                    ctl.toast(format!("Couldn't save the new order. {e}"));
-                    ctl.refresh();
-                }
-            },
-        );
+        self.toast_with_undo("Moved");
+        self.edit_playlist(id, ids, edit);
     }
 
     /// Builds the interface rows for the page's songs, in the order the view has arranged.
@@ -3254,6 +3385,12 @@ impl Controller {
         });
         app.on_refresh(|| {
             with(|ctl| ctl.refresh());
+        });
+        app.on_undo(|| {
+            with(|ctl| ctl.undo_last());
+        });
+        self.ui.global::<ui::Toast>().on_acted(|| {
+            with(|ctl| ctl.undo_last());
         });
         let search = self.ui.global::<ui::Search>();
         search.on_preview(|text| {

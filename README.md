@@ -55,6 +55,12 @@ What's planned next is in the [roadmap](ROADMAP.md).
   WMA, APE and so on) is converted to MP3 by Navidrome on the fly.
 - Create, rename, pin and delete playlists; add and remove songs, with a warning before
   adding one that's already there; like songs and albums.
+- Playlists are safe to edit from more than one place. Removing or moving a song is carried
+  out on the playlist as the server has it at that moment, by the song and not by its
+  position, so a change made on another device in the meantime is kept and the wrong song is
+  never removed. "Undo" (or Ctrl+Z) takes the last removal or move back.
+- Save the queue, or a "Made for you" mix, as a playlist. Export a playlist as a CSV file
+  that this app, and other tools, can import again.
 - Synced lyrics, from Navidrome: it serves the ones embedded in a song or in a `.lrc` file beside it. The app doesn't look lyrics up anywhere else, so every app that uses your server shows the same ones. It keeps a copy of what the server says, and fetches the lyrics of the next few songs in the queue ahead of time, so they show the instant you open them and are there when you're offline. To fill in a library that has none, put `.lrc` files beside the songs with a tool such as [LRCGET](https://github.com/tranxuanthang/lrcget).
 - A mini player: a small window that stays on top of other apps, with the artwork, the song, and buttons to pause, skip and like.
 - "Your stats": what you've played most (songs, artists, albums and kinds of music) and how many hours it comes to, for all time, the last six months or the last four weeks. All time uses your server's play counts; the shorter periods use a log of plays this app keeps on your PC from the day you install this version.
@@ -82,6 +88,7 @@ What's planned next is in the [roadmap](ROADMAP.md).
 | Up, Down, Page Up, Page Down, Home, End | Move through the songs on the page |
 | Shift with any of those | Select from where you started to where you've moved |
 | Ctrl+A | Select every song on the page |
+| Ctrl+Z | Undo the last removal from, or move within, a playlist |
 | Enter | Play the song you're on |
 | Delete | Take the selected songs out of the playlist |
 | Menu key, or Shift+F10 | Open the menu for the selected songs; the arrows and Enter work in it |
@@ -201,6 +208,7 @@ connection.
 | `src/controller.rs` | Sign-in, navigation and the page on screen. |
 | `src/pages.rs` | Turns server responses into page content (runs on worker threads). |
 | `src/playback.rs` | Queue, transport, play reporting, lyrics. |
+| `src/playlists.rs` | Describes a change to a playlist so it can be applied to the server's copy; CSV export. |
 | `src/actions.rs` | Context menus, likes, playlist edits. |
 | `src/covers.rs` | Cover art cache, on disk and in memory. |
 | `src/media.rs` | Windows media keys and now-playing overlay. |
