@@ -22,6 +22,8 @@ const ARRIVING: [&str; 2] = ["fetch", "adopt"];
 #[derive(Clone)]
 pub struct SongCache {
     dir: PathBuf,
+    /// The names of the files kept, and when the folder was last read for them.
+    listed: Arc<Mutex<Option<(Instant, HashSet<std::ffi::OsString>)>>>,
 }
 
 impl SongCache {
@@ -32,7 +34,25 @@ impl SongCache {
                 let _ = fs::remove_file(entry.path());
             }
         }
-        SongCache { dir }
+        SongCache { dir, listed: Arc::default() }
+    }
+
+    /// Whether a song is kept, going by a list of the folder that's at most two seconds old.
+    /// For drawing long lists of songs, where asking the disk about each one adds up.
+    pub fn holds(&self, path: &Path) -> bool {
+        let mut listed = self.listed.lock().unwrap_or_else(|stuck| stuck.into_inner());
+        if !listed.as_ref().is_some_and(|(at, _)| at.elapsed() < Duration::from_secs(2)) {
+            let names = fs::read_dir(&self.dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|entry| !is_arriving(&entry.path()))
+                .map(|entry| entry.file_name())
+                .collect();
+            *listed = Some((Instant::now(), names));
+        }
+        let Some((_, names)) = listed.as_ref() else { return false };
+        path.file_name().is_some_and(|name| names.contains(name))
     }
 
     /// Where a song is (or would be) kept. `bitrate` is 0 for the file as the server has it,
@@ -280,6 +300,8 @@ mod tests {
         }
         assert_eq!(cache.size(), 3000);
         assert!(ready(&a) && !ready(&dir.join("missing")));
+        // The quick check goes by a list of the folder, not by asking about each file.
+        assert!(cache.holds(&a) && cache.holds(&b) && !cache.holds(&dir.join("missing.raw.flac")));
 
         // Room for two: the oldest goes, unless it's being kept for playing.
         cache.trim(2000, &HashSet::from([a.clone()]));

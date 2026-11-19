@@ -256,6 +256,12 @@ pub struct Controller {
     pub ui: ui::MainWindow,
     pub paths: Paths,
     pub api_pool: Pool,
+    /// For asking Lidarr to fetch things. One of those can take minutes, and mustn't hold
+    /// up loading pages.
+    requests_pool: Pool,
+    /// For looking things up in the copy of the library kept on this PC, which needs no
+    /// network and so shouldn't wait behind anything that does.
+    quick_pool: Pool,
     pub art_pool: Pool,
     pub download_pool: Pool,
     pub downloads: RefCell<crate::downloads::Downloads>,
@@ -280,6 +286,12 @@ pub struct Controller {
     pub selection: RefCell<std::collections::BTreeSet<usize>>,
     selection_anchor: Cell<Option<usize>>,
     pub queue_model: Rc<VecModel<ui::Track>>,
+    /// The first few rows of the queue, for Now Playing's glance at what's next.
+    pub up_next_model: Rc<VecModel<ui::Track>>,
+    /// Which rows of the song list on screen show each song, so one song's rows can be
+    /// brought up to date without going through the whole list. Emptied when the list is
+    /// rebuilt and filled in again when next needed.
+    pub track_places: RefCell<HashMap<String, Vec<usize>>>,
     /// Songs that have been played, newest first, including the one playing now.
     pub history: RefCell<Vec<config::Played>>,
     /// Every play and when, for "Your stats".
@@ -353,6 +365,9 @@ pub struct Controller {
     gate: RefCell<Option<std::sync::Arc<crate::gate::Session>>>,
     suggestions: RefCell<Vec<Suggestion>>,
     preview_count: Cell<u64>,
+    /// The same count, where the search thread can see it: a search that is no longer the
+    /// newest when its turn comes isn't run.
+    preview_latest: std::sync::Arc<std::sync::atomic::AtomicU64>,
     library_timer: slint::Timer,
     library_busy: Cell<bool>,
     pub sync_timer: slint::Timer,
@@ -365,6 +380,12 @@ pub struct Controller {
     /// a fingerprint of it as last saved, to tell a real change from a save of the same thing.
     pub queue_stamp: Cell<i64>,
     pub queue_sig: Cell<u64>,
+    /// The shape (see `config::queue_shape`) of the queue as last written to disk.
+    pub queue_saved: Cell<u64>,
+    /// While set, emptying the queue leaves the saved copy alone.
+    pub keep_saved_queue: Cell<bool>,
+    /// Writes files in the background.
+    pub saver: crate::saver::Saver,
     /// Set while the queue is being put in place from a saved copy, which isn't a change.
     pub queue_quiet: Cell<bool>,
     /// Whether the sound device is currently held in exclusive mode.
@@ -392,6 +413,8 @@ impl Controller {
         let ctl = Rc::new(Controller {
             covers: Covers::new(paths.covers.clone()),
             api_pool: Pool::new("api", 4, false),
+            requests_pool: Pool::new("requests", 2, false),
+            quick_pool: Pool::new("quick", 1, true),
             download_pool: Pool::new("download", 2, false),
             downloads: RefCell::new(crate::downloads::Downloads::load(paths.downloads.clone())),
             art_pool: Pool::new("art", 6, true),
@@ -408,6 +431,8 @@ impl Controller {
             selection: RefCell::default(),
             selection_anchor: Cell::new(None),
             queue_model: Rc::new(VecModel::default()),
+            up_next_model: Rc::new(VecModel::default()),
+            track_places: RefCell::default(),
             play_log: RefCell::new({
                 let recent: Vec<(String, i64)> = config::load_history(&paths.history).into_iter().map(|played| (played.song.id, played.at)).collect();
                 crate::plays::PlayLog::load(&paths.plays, &recent)
@@ -461,6 +486,7 @@ impl Controller {
             gate: RefCell::new(None),
             suggestions: RefCell::default(),
             preview_count: Cell::new(0),
+            preview_latest: Default::default(),
             library_timer: slint::Timer::default(),
             library_busy: Cell::new(false),
             sync_timer: slint::Timer::default(),
@@ -472,6 +498,9 @@ impl Controller {
             queue_stamp: Cell::new(0),
             queue_sig: Cell::new(crate::playback::queue_fingerprint(&Playback::new(&Settings::default()))),
             queue_quiet: Cell::new(false),
+            queue_saved: Cell::new(0),
+            keep_saved_queue: Cell::new(false),
+            saver: crate::saver::Saver::new(),
             output_exclusive: Cell::new(false),
             devices: RefCell::default(),
             update: RefCell::new(None),
@@ -541,6 +570,7 @@ impl Controller {
         self.ui.global::<ui::View>().set_tracks(ModelRc::from(self.tracks_model.clone()));
         self.ui.global::<ui::View>().set_grid(ModelRc::from(self.grid_model.clone()));
         self.ui.global::<ui::Player>().set_queue(ModelRc::from(self.queue_model.clone()));
+        self.ui.global::<ui::Player>().set_up_next(ModelRc::from(self.up_next_model.clone()));
         self.ui.global::<ui::Player>().set_history(ModelRc::from(self.history_model.clone()));
         self.sync_history();
         self.sync_transport();
@@ -1242,7 +1272,7 @@ impl Controller {
     pub fn request_album(self: &Rc<Self>, album: String, title: String, song: String) {
         let Some(lidarr) = crate::lidarr::current() else { return };
         self.toast(format!("Asking for “{title}”…"));
-        self.api_pool.spawn(move || {
+        self.requests_pool.spawn(move || {
             // Offered in this session, or (from a page drawn in an earlier one) looked up afresh.
             let offer = crate::lidarr::offered(&album)
                 .map(Ok)
@@ -1333,7 +1363,7 @@ impl Controller {
     pub fn add_artist(self: &Rc<Self>, artist: String, name: String) {
         let Some(lidarr) = crate::lidarr::current() else { return };
         self.toast(format!("Adding {name}…"));
-        self.api_pool.spawn(move || {
+        self.requests_pool.spawn(move || {
             let result = lidarr.add_artist(&artist, &name);
             post(move |ctl| match result {
                 Ok(_) => {
@@ -1380,7 +1410,7 @@ impl Controller {
     pub fn request_missing(self: &Rc<Self>, albums: Vec<(String, String)>) {
         let Some(lidarr) = crate::lidarr::current() else { return };
         self.toast(format!("Asking Lidarr for {}. This can take a few minutes.", count(albums.len() as u32, "album")));
-        self.api_pool.spawn(move || {
+        self.requests_pool.spawn(move || {
             let name = |text: &str| crate::search::fold(text).split_whitespace().collect::<Vec<_>>().join(" ");
             let (mut asked, mut unmatched, mut failed) = (0, 0, None);
             // What was asked for, as (the names it was asked by, what Lidarr calls it).
@@ -1753,6 +1783,7 @@ impl Controller {
         let query = text.trim().to_string();
         let count = self.preview_count.get() + 1;
         self.preview_count.set(count);
+        self.preview_latest.store(count, std::sync::atomic::Ordering::Relaxed);
         if query.is_empty() {
             return self.close_preview();
         }
@@ -1761,23 +1792,34 @@ impl Controller {
             crate::musicbrainz::warm();
         }
         let Some(client) = self.client() else { return };
-        self.api_pool.spawn(move || {
-            let found = match crate::search::current() {
-                Some(index) => Some(index.search(&query, &crate::search::is_liked, 2, 2, 5)),
-                // No copy of the library yet: the server's exact search will have to do.
-                None => client.search(&query, 1, 2, 5).ok().map(|found| crate::search::Results {
-                    artists: found.artists.iter().map(CardData::artist).collect(),
-                    albums: found.albums.iter().map(CardData::album).collect(),
-                    songs: found.songs,
-                    artist_first: false,
-                }),
-            };
+        let show = move |found: Option<crate::search::Results>| {
             post(move |ctl| {
                 if let (Some(found), true) = (found, ctl.preview_count.get() == count) {
                     ctl.show_preview(found);
                 }
             });
-        });
+        };
+        match crate::search::current() {
+            // The library is on this PC: search it on a thread kept for that, newest first,
+            // passing over any search that more typing has already replaced.
+            Some(index) => {
+                let latest = self.preview_latest.clone();
+                self.quick_pool.spawn(move || {
+                    if latest.load(std::sync::atomic::Ordering::Relaxed) == count {
+                        show(Some(index.search(&query, &crate::search::is_liked, 2, 2, 5)));
+                    }
+                });
+            }
+            // No copy of the library yet: the server's exact search will have to do.
+            None => self.api_pool.spawn(move || {
+                show(client.search(&query, 1, 2, 5).ok().map(|found| crate::search::Results {
+                    artists: found.artists.iter().map(CardData::artist).collect(),
+                    albums: found.albums.iter().map(CardData::album).collect(),
+                    songs: found.songs,
+                    artist_first: false,
+                }))
+            }),
+        }
     }
 
     fn show_preview(&self, found: crate::search::Results) {
@@ -1842,13 +1884,12 @@ impl Controller {
 
     pub fn leave(self: &Rc<Self>, message: &str) {
         // Stopping empties the queue, and an empty queue isn't kept. Being turned away by the
-        // server is no reason to lose it, so the saved copy is put back for the next sign-in.
+        // server is no reason to lose it, so the saved copy stays for the next sign-in.
         // (Signing out by choice removes it first.)
-        let queue = std::fs::read(&self.paths.queue).ok();
+        self.keep_saved_queue.set(true);
         self.stop_playback();
-        if let Some(queue) = queue {
-            config::write_atomically(&self.paths.queue, &queue);
-        }
+        self.keep_saved_queue.set(false);
+        self.queue_saved.set(0);
         self.stop_sync();
         self.library_timer.stop();
         self.close_preview();
@@ -1869,7 +1910,8 @@ impl Controller {
             (settings.server.clone(), settings.username.clone())
         };
         config::delete_password(&self.paths, &server, &username);
-        let _ = std::fs::remove_file(&self.paths.queue);
+        self.saver.remove(self.paths.queue.clone());
+        self.saver.remove(self.paths.queue_place.clone());
         let _ = std::fs::remove_file(&self.paths.history);
         self.history.borrow_mut().clear();
         self.leave("");
@@ -1978,16 +2020,43 @@ impl Controller {
             return Some((at.elapsed(), data.clone()));
         }
         let path = self.pages_dir()?.join(file_name(key));
-        let bytes = std::fs::read(&path).ok()?;
-        let data: PageData = serde_json::from_slice(&bytes).ok()?;
-        let age = std::fs::metadata(&path)
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|at| at.elapsed().ok())
-            .unwrap_or(Duration::MAX);
+        let (age, data) = read_page(&path)?;
         let stored = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
         self.remember(key, stored, data.clone());
         Some((age, data))
+    }
+
+    /// A long playlist's stored copy is megabytes of text, and reading it back takes long
+    /// enough to notice. The first time one is wanted it's read away from this thread, and
+    /// the page is shown as soon as it's in memory. Returns whether that's under way.
+    fn read_big_page(self: &Rc<Self>, key: &str, route: &Route, scroll: f32, hint: Option<PageData>, generation: u64) -> bool {
+        const BIG: u64 = 256 * 1024;
+        if self.cache.borrow().contains_key(key) {
+            return false;
+        }
+        let Some(path) = self.pages_dir().map(|dir| dir.join(file_name(key))) else { return false };
+        if !std::fs::metadata(&path).is_ok_and(|meta| meta.len() > BIG) {
+            return false;
+        }
+        let (key, route) = (key.to_string(), route.clone());
+        self.quick_pool.spawn(move || {
+            let read = read_page(&path);
+            post(move |ctl| {
+                match read {
+                    Some((age, data)) => {
+                        ctl.remember(&key, Instant::now().checked_sub(age).unwrap_or_else(Instant::now), data)
+                    }
+                    // Not a page any more: without it the next look goes to the server.
+                    None => {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+                if ctl.nav.borrow().generation == generation {
+                    ctl.show(route, scroll, false, hint);
+                }
+            });
+        });
+        true
     }
 
     pub fn remember(&self, key: &str, at: Instant, data: PageData) {
@@ -2091,6 +2160,17 @@ impl Controller {
         }
 
         let key = route.cache_key();
+        if !force && self.read_big_page(&key, &route, scroll, hint.clone(), generation) {
+            // Until it's read: what's already known of the page, or a blank panel.
+            match hint {
+                Some(hint) => self.apply_page(hint, 0.0),
+                None => {
+                    view.set_loading(true);
+                    view.set_scroll_y(0.0);
+                }
+            }
+            return;
+        }
         let cached = if force { None } else { self.cached_page(&key) };
         // Something to draw immediately: a stored copy, or failing that the hint.
         let shown = match cached {
@@ -2382,6 +2462,7 @@ impl Controller {
         let sections = rows.last().map(|row| row.sections_before).unwrap_or(0);
         self.ui.global::<ui::View>().set_track_sections(sections);
         self.tracks_model.set_vec(rows);
+        self.track_places.borrow_mut().clear();
         // The rows are new, so nothing is selected any more.
         self.selection.borrow_mut().clear();
         self.selection_anchor.set(None);
@@ -3577,6 +3658,13 @@ fn file_stem(key: &str) -> String {
         .take(80)
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
         .collect()
+}
+
+/// Reads a stored page, and how long ago it was stored.
+fn read_page(path: &std::path::Path) -> Option<(Duration, PageData)> {
+    let data: PageData = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    let age = std::fs::metadata(path).and_then(|m| m.modified()).ok().and_then(|at| at.elapsed().ok()).unwrap_or(Duration::MAX);
+    Some((age, data))
 }
 
 fn file_name(key: &str) -> String {

@@ -61,19 +61,20 @@ Things that lose data or interrupt the music.
 - [x] Fetching songs ahead of time gives up on a transfer that has gone quiet, instead of
       waiting on it for the rest of the session.
 
-## 3. Smooth with a big queue and a big library
+## 3. Smooth with a big queue and a big library (0.26.0)
 
-- [ ] The queue is saved as song ids and a position, away from the UI thread, and the
-      position is saved by itself.
-- [ ] The play log is added to, not rewritten, on each play.
-- [ ] The window opens with the saved theme at once; a newer synced theme is applied when it
+- [x] The queue is written to disk only when it changes, by a thread of its own, and where
+      playback has got to is saved by itself.
+- [x] The play log is added to, not rewritten, on each play.
+- [x] The window opens with the saved theme at once; a newer synced theme is applied when it
       arrives.
-- [ ] Download progress updates only the rows that changed.
-- [ ] Search while typing waits for a pause, drops searches that are out of date, and doesn't
-      share threads with network calls. Lidarr requests get a thread of their own.
-- [ ] The queue panel and "Up next" build only the rows on show.
-- [ ] Offline, the app knows which songs it has without asking the disk for every row.
-- [ ] Cached pages are read away from the UI thread.
+- [x] Download progress updates only the rows that changed, and the list of downloads is
+      written every couple of seconds during a batch, not once per song.
+- [x] Search while typing has a thread of its own and skips searches that are out of date.
+      Lidarr requests have their own threads too.
+- [x] "Up next" on Now Playing builds only the rows it shows. (The queue panel already did.)
+- [x] Offline, the app knows which songs it has without asking the disk for every row.
+- [x] Large stored pages are read away from the UI thread.
 
 ## 4. Keyboard
 

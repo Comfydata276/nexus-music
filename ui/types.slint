@@ -354,6 +354,8 @@ export global Player {
     // 0 off, 1 repeat the queue, 2 repeat the track.
     in property <int> repeat;
     in property <[Track]> queue;
+    // The first few of `queue`, for places that only show a glance of it.
+    in property <[Track]> up-next;
     in property <string> context;
     // The current song's audio format in a few words, e.g. "FLAC · 44.1 kHz · 16-bit".
     in property <string> format;

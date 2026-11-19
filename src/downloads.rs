@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use serde::{Deserialize, Serialize};
-use slint::{ComponentHandle, Model};
+use slint::ComponentHandle;
 
 use crate::controller::{Controller, Route, post};
 use crate::pages::{PageData, PlaySource};
@@ -48,6 +48,14 @@ pub struct Downloads {
     collections: Vec<String>,
     /// In the order they'll be fetched.
     jobs: Vec<Job>,
+    /// How far each song in `jobs` has got, by song id, so a row can be asked about without
+    /// going through the list.
+    under_way: HashMap<String, Arc<AtomicU32>>,
+    /// When each downloaded song arrived, by song id.
+    arrived: HashMap<String, i64>,
+    /// The list of downloads has changed since it was last written to disk.
+    unsaved: bool,
+    saved_at: std::time::Instant,
     /// For the progress messages: how many songs the current batch has, and how many of
     /// them are done or failed.
     batch_total: usize,
@@ -71,19 +79,44 @@ impl Downloads {
             }
         }
         let files = entries.iter().map(|e| (e.song.id.clone(), e.file.clone())).collect();
+        let arrived = entries.iter().map(|e| (e.song.id.clone(), arrival(&dir, e))).collect();
         let collections = fs::read(dir.join("collections.json"))
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or_default();
-        Downloads { dir, entries, files, collections, jobs: Vec::new(), batch_total: 0, batch_done: 0, batch_failed: 0 }
+        Downloads {
+            dir,
+            entries,
+            files,
+            collections,
+            jobs: Vec::new(),
+            under_way: HashMap::new(),
+            arrived,
+            unsaved: false,
+            saved_at: std::time::Instant::now(),
+            batch_total: 0,
+            batch_done: 0,
+            batch_failed: 0,
+        }
     }
 
-    fn save(&self) {
+    fn save(&mut self) {
         if let Ok(json) = serde_json::to_vec(&self.entries) {
             let temp = self.dir.join("index.tmp");
             if fs::write(&temp, json).is_ok() {
                 let _ = fs::rename(&temp, self.dir.join("index.json"));
             }
+        }
+        self.unsaved = false;
+        self.saved_at = std::time::Instant::now();
+    }
+
+    /// Writes the list of downloads if it has changed. While a batch is arriving that would
+    /// be the whole list rewritten for every song, so it's done every couple of seconds
+    /// instead, and once more when the batch is over (`now`).
+    pub fn save_if_due(&mut self, now: bool) {
+        if self.unsaved && (now || self.saved_at.elapsed() > std::time::Duration::from_secs(2)) {
+            self.save();
         }
     }
 
@@ -106,28 +139,19 @@ impl Downloads {
         self.entries.is_empty()
     }
 
-    fn job(&self, id: &str) -> Option<&Job> {
-        self.jobs.iter().find(|job| job.song.id == id)
+    /// Whether a song is waiting to be downloaded or on its way.
+    fn queued(&self, id: &str) -> bool {
+        self.under_way.contains_key(id)
     }
 
     /// How far a song's download has got, from 0 to 1; -1 if it isn't being downloaded.
     pub fn progress_of(&self, id: &str) -> f32 {
-        self.job(id).map(|job| job.progress.load(Ordering::Relaxed) as f32 / 1000.0).unwrap_or(-1.0)
+        self.under_way.get(id).map(|progress| progress.load(Ordering::Relaxed) as f32 / 1000.0).unwrap_or(-1.0)
     }
 
     /// When a song was downloaded, in seconds since 1970; 0 if it isn't (or isn't yet).
     pub fn added_at(&self, id: &str) -> i64 {
-        let Some(entry) = self.entries.iter().find(|entry| entry.song.id == id) else { return 0 };
-        if entry.at > 0 {
-            return entry.at;
-        }
-        // Older downloads: the file's own date says when it arrived.
-        fs::metadata(self.dir.join(&entry.file))
-            .and_then(|meta| meta.modified())
-            .ok()
-            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|since| since.as_secs() as i64)
-            .unwrap_or(0)
+        self.arrived.get(id).copied().unwrap_or(0)
     }
 
     /// Where a downloaded song's audio is, if it has been downloaded.
@@ -167,19 +191,37 @@ impl Downloads {
     }
 
     fn add(&mut self, entry: Entry) {
-        self.files.insert(entry.song.id.clone(), entry.file.clone());
-        self.entries.retain(|e| e.song.id != entry.song.id);
+        // Only a song downloaded a second time has an earlier entry to take out.
+        if self.files.insert(entry.song.id.clone(), entry.file.clone()).is_some() {
+            self.entries.retain(|e| e.song.id != entry.song.id);
+        }
+        self.arrived.insert(entry.song.id.clone(), arrival(&self.dir, &entry));
         self.entries.push(entry);
-        self.save();
+        self.unsaved = true;
     }
 
     fn remove(&mut self, id: &str) {
         if let Some(file) = self.files.remove(id) {
             let _ = fs::remove_file(self.dir.join(file));
             self.entries.retain(|e| e.song.id != id);
+            self.arrived.remove(id);
             self.save();
         }
     }
+}
+
+/// When a download arrived, in seconds since 1970; 0 if that can't be told.
+fn arrival(dir: &std::path::Path, entry: &Entry) -> i64 {
+    if entry.at > 0 {
+        return entry.at;
+    }
+    // Older downloads: the file's own date says when it arrived.
+    fs::metadata(dir.join(&entry.file))
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|since| since.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Fetches one song's audio into the downloads folder. Runs on a worker thread. `quality`
@@ -292,7 +334,7 @@ impl Controller {
             let wanted: Vec<Song> = songs
                 .into_iter()
                 .filter(|s| {
-                    s.radio_url.is_empty() && !downloads.has(&s.id) && downloads.job(&s.id).is_none() && seen.insert(s.id.clone())
+                    s.radio_url.is_empty() && !downloads.has(&s.id) && !downloads.queued(&s.id) && seen.insert(s.id.clone())
                 })
                 .collect();
             if downloads.jobs.is_empty() {
@@ -310,6 +352,7 @@ impl Controller {
                         cancel: Arc::new(AtomicBool::new(false)),
                     };
                     let handles = (song, job.progress.clone(), job.cancel.clone());
+                    downloads.under_way.insert(job.song.id.clone(), job.progress.clone());
                     downloads.jobs.push(job);
                     handles
                 })
@@ -354,6 +397,7 @@ impl Controller {
             let mut downloads = self.downloads.borrow_mut();
             // No longer listed means it was cancelled while being fetched.
             let wanted = downloads.jobs.iter().position(|job| job.song.id == id).map(|at| downloads.jobs.remove(at));
+            downloads.under_way.remove(id);
             match (result, wanted) {
                 (Ok(entry), Some(_)) => {
                     downloads.batch_done += 1;
@@ -365,8 +409,10 @@ impl Controller {
                 (Err(_), Some(_)) => downloads.batch_failed += 1,
                 (Err(_), None) => {}
             }
-            (downloads.jobs.is_empty() && downloads.batch_total > 0)
-                .then_some((downloads.batch_done, downloads.batch_failed))
+            // The last of a batch: the list of downloads goes to disk now.
+            let over = downloads.jobs.is_empty();
+            downloads.save_if_due(over);
+            (over && downloads.batch_total > 0).then_some((downloads.batch_done, downloads.batch_failed))
         };
         self.mark_download(id);
         if let Some((done, failed)) = finished {
@@ -394,6 +440,11 @@ impl Controller {
                 }
                 !cancelled
             });
+            for id in ids {
+                downloads.under_way.remove(id);
+            }
+            let over = downloads.jobs.is_empty();
+            downloads.save_if_due(over);
             let cancelled = before - downloads.jobs.len();
             downloads.batch_total = downloads.batch_total.saturating_sub(cancelled);
             if downloads.jobs.is_empty() {
@@ -434,26 +485,20 @@ impl Controller {
             (downloads.has(id), downloads.progress_of(id))
         };
         let unavailable = self.is_offline() && !downloaded;
-        for model in [&self.queue_model, &self.history_model, &self.tracks_model] {
-            for row in 0..model.row_count() {
-                if let Some(mut track) = model.row_data(row) {
-                    if track.id == id
-                        && (track.downloaded != downloaded || track.progress != progress || track.unavailable != unavailable)
-                    {
-                        track.downloaded = downloaded;
-                        track.progress = progress;
-                        track.unavailable = unavailable;
-                        model.set_row_data(row, track);
-                    }
-                }
-            }
-        }
+        self.each_row_of(id, |track| {
+            let changed = track.downloaded != downloaded || track.progress != progress || track.unavailable != unavailable;
+            track.downloaded = downloaded;
+            track.progress = progress;
+            track.unavailable = unavailable;
+            changed
+        });
     }
 
     /// Runs a few times a second while songs are downloading: moves the progress bars along.
     pub fn tick_downloads(self: &Rc<Self>) {
         let ids: Vec<String> = {
-            let downloads = self.downloads.borrow();
+            let mut downloads = self.downloads.borrow_mut();
+            downloads.save_if_due(false);
             if downloads.jobs.is_empty() {
                 return;
             }
@@ -518,7 +563,7 @@ impl Controller {
         view.set_can_download(offered);
         let saved = page.songs.iter().filter(|s| downloads.has(&s.id)).count();
         let partial: f32 = page.songs.iter().map(|s| downloads.progress_of(&s.id).max(0.0)).sum();
-        let busy = page.songs.iter().any(|s| downloads.job(&s.id).is_some());
+        let busy = page.songs.iter().any(|s| downloads.queued(&s.id));
         view.set_download_state(if busy { 1 } else if saved == page.songs.len() && saved > 0 { 2 } else { 0 });
         view.set_download_done(saved as i32);
         view.set_download_total(page.songs.len() as i32);
@@ -538,7 +583,7 @@ impl Controller {
         let (all_saved, waiting) = {
             let downloads = self.downloads.borrow();
             let waiting: Vec<String> =
-                songs.iter().filter(|s| downloads.job(&s.id).is_some()).map(|s| s.id.clone()).collect();
+                songs.iter().filter(|s| downloads.queued(&s.id)).map(|s| s.id.clone()).collect();
             (songs.iter().all(|s| downloads.has(&s.id)), waiting)
         };
         if !waiting.is_empty() {

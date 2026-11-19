@@ -160,24 +160,26 @@ fn peek(client: &Client, known: &str) -> Option<(String, Shared)> {
     (playlist.name == PLAYLIST_NAME).then(|| (playlist.id, serde_json::from_str(&playlist.comment).unwrap_or_default()))
 }
 
-/// How long opening the window may wait on the server for the theme.
-const THEME_WAIT: Duration = Duration::from_millis(1000);
-
 impl Controller {
-    /// Finds out, before the window is shown, whether the theme was changed on another
-    /// device, so the app opens in the right colours instead of changing once it's up.
-    /// Gives up after a moment if the server is slow to answer.
+    /// Finds out whether the theme was changed on another device. The window opens in the
+    /// colours last used here without waiting for the answer; a newer choice is applied
+    /// when it arrives, which with the server close by is before the window has been seen.
     pub fn preload_theme(&self) {
         let Some(client) = self.client() else { return };
         if !self.settings.borrow().sync || self.is_offline() {
             return;
         }
         let known = self.settings.borrow().sync_playlist.clone();
-        let (answer, wait) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = answer.send(peek(&client, &known));
+        self.api_pool.spawn(move || {
+            let Some((playlist, theirs)) = peek(&client, &known) else { return };
+            crate::controller::post(move |ctl| ctl.theme_arrived(playlist, theirs));
         });
-        let Ok(Some((playlist, theirs))) = wait.recv_timeout(THEME_WAIT) else { return };
+    }
+
+    fn theme_arrived(&self, playlist: String, theirs: Shared) {
+        if self.client().is_none() {
+            return;
+        }
         let changed = {
             let mut settings = self.settings.borrow_mut();
             settings.sync_playlist = playlist.clone();

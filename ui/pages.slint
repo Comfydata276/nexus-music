@@ -1495,10 +1495,9 @@ export component NowPlayingPage inherits Rectangle {
                     vertical-alignment: center;
                 }
 
-                for track[index] in Player.queue: Rectangle {
+                for track[index] in Player.up-next: Rectangle {
                     // A glance at what's coming; the queue panel has the rest.
-                    visible: index < 6;
-                    height: index < 6 ? 60px : 0px;
+                    height: 60px;
                     border-radius: 6px;
                     background: next-touch.has-hover ? Theme.hover : transparent;
 

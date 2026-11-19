@@ -159,6 +159,16 @@ to avoid both:
 - Each cover is requested from the server at one size; thumbnails are cut from it locally.
 - FLAC and MP3 tracks start from a single request.
 
+And the thread that draws the window is kept free of anything slow:
+
+- Files are written by a thread of their own. The queue (which can be thousands of songs) is
+  written only when it changes; where playback has got to is a few numbers kept beside it.
+- Each play adds one line to the play log; the log is never rewritten.
+- Searching the library as you type has its own thread and skips any search that more typing
+  has already replaced. Asking Lidarr for something, which can take minutes, has its own too.
+- A long playlist's stored copy is read back away from the window's thread.
+- One song's rows are found by a lookup, not by going through the list on screen.
+
 Settings shows how long connecting to your server takes compared with a request on an open
 connection.
 
@@ -182,6 +192,7 @@ connection.
 | `src/update.rs` | Finds, downloads and verifies new releases. |
 | `src/lyrics.rs` | The server's lyrics, kept so they show at once. |
 | `src/plays.rs` | The log of plays behind "Your stats". |
+| `src/saver.rs` | Writes files in the background, newest version only. |
 | `src/listenbrainz.rs` | How much songs, releases and artists are played. |
 | `src/discover.rs` | Artists worth a look that the library doesn't have. |
 | `src/songcache.rs` | Songs kept as they're played and fetched ahead of the queue. |

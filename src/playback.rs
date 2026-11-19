@@ -18,6 +18,8 @@ use crate::ui;
 const PRELOAD_SECONDS: f64 = 25.0;
 /// Rows shown in the queue panel.
 const QUEUE_ROWS: usize = 400;
+/// How many of those Now Playing shows.
+const UP_NEXT_ROWS: usize = 6;
 use crate::sync::HISTORY_LENGTH;
 /// File types that are always lossless. (M4A and CAF can be either; those are judged by
 /// whether the server reports a bit depth, which lossy formats don't have.)
@@ -548,7 +550,7 @@ impl Controller {
         let cap = settings.max_bitrate();
         [true, false].into_iter().any(|native| {
             let (bitrate, kept_as) = stream_form(native, cap, &suffix);
-            crate::songcache::ready(&self.song_cache.file(&song.id, bitrate, kept_as))
+            self.song_cache.holds(&self.song_cache.file(&song.id, bitrate, kept_as))
         })
     }
 
@@ -1628,7 +1630,37 @@ impl Controller {
             .map(|song| self.track_row(song))
             .collect();
         drop(pb);
+        self.up_next_model.set_vec(rows.iter().take(UP_NEXT_ROWS).cloned().collect::<Vec<_>>());
         self.queue_model.set_vec(rows);
+    }
+
+    /// Does `change` to every row showing this song: in the queue, Recently played and the
+    /// song list on screen. `change` returns whether it altered the row.
+    pub fn each_row_of(&self, id: &str, mut change: impl FnMut(&mut ui::Track) -> bool) {
+        let mut apply = |model: &VecModel<ui::Track>, row: usize| {
+            if let Some(mut track) = model.row_data(row).filter(|track| track.id == id) {
+                if change(&mut track) {
+                    model.set_row_data(row, track);
+                }
+            }
+        };
+        // These three are short.
+        for model in [&self.queue_model, &self.up_next_model, &self.history_model] {
+            for row in 0..model.row_count() {
+                apply(model, row);
+            }
+        }
+        // The list on screen can be thousands of rows, so where each song is in it is noted
+        // the first time it's needed.
+        let mut places = self.track_places.borrow_mut();
+        if places.is_empty() && self.tracks_model.row_count() > 0 {
+            for (row, track) in self.tracks_model.iter().enumerate() {
+                places.entry(track.id.to_string()).or_default().push(row);
+            }
+        }
+        for &row in places.get(id).into_iter().flatten() {
+            apply(&self.tracks_model, row);
+        }
     }
 
     /// Applies a like or unlike to every copy of the song the player is showing.
@@ -1641,16 +1673,7 @@ impl Controller {
             // The like button on the taskbar thumbnail follows too.
             self.sync_tray();
         }
-        for model in [&self.queue_model, &self.history_model, &self.tracks_model] {
-            for row in 0..model.row_count() {
-                if let Some(mut track) = model.row_data(row) {
-                    if track.id == id && track.starred != starred {
-                        track.starred = starred;
-                        model.set_row_data(row, track);
-                    }
-                }
-            }
-        }
+        self.each_row_of(id, |track| std::mem::replace(&mut track.starred, starred) != starred);
     }
 
     // ---- recently played -----------------------------------------------------------------------
@@ -1720,26 +1743,53 @@ impl Controller {
             self.queue_changed_here();
         }
         if pb.queue.is_empty() {
-            let _ = std::fs::remove_file(&self.paths.queue);
+            // Nothing to come back to, unless the saved copy is being held on to (see `leave`).
+            if !self.keep_saved_queue.get() {
+                self.queue_saved.set(0);
+                self.saver.remove(self.paths.queue.clone());
+                self.saver.remove(self.paths.queue_place.clone());
+            }
             return;
         }
-        SavedQueue {
-            songs: pb.queue.clone(),
-            order: pb.order.clone(),
-            cursor: pb.cursor,
-            position: pb.position,
-            context: pb.context.clone(),
-            source: pb.source.clone(),
-            origins: pb.origins.clone(),
-            stamp: self.queue_stamp.get(),
-            source_list: pb.source_list.clone(),
+        // The queue itself is thousands of songs and changes when you change it. Where
+        // playback has got to changes all the time and is a few numbers. So they are kept
+        // apart: the queue is written only when it's different, and both away from this
+        // thread.
+        let shape = crate::config::queue_shape(&pb.queue, &pb.order, &pb.context, &pb.source, &pb.origins, &pb.source_list);
+        let stamp = self.queue_stamp.get();
+        if self.queue_saved.replace(shape) != shape {
+            let saved = SavedQueue {
+                songs: pb.queue.clone(),
+                order: pb.order.clone(),
+                cursor: pb.cursor,
+                position: pb.position,
+                context: pb.context.clone(),
+                source: pb.source.clone(),
+                origins: pb.origins.clone(),
+                stamp,
+                source_list: pb.source_list.clone(),
+            };
+            self.saver.write(self.paths.queue.clone(), move || serde_json::to_vec(&saved).ok());
         }
-        .save(&self.paths.queue);
+        let place = crate::config::QueuePlace { shape, cursor: pb.cursor, position: pb.position, stamp };
+        self.saver.write(self.paths.queue_place.clone(), move || serde_json::to_vec(&place).ok());
     }
 
     /// Brings back the queue from the last run, paused where it stopped.
     pub fn restore_queue(self: &Rc<Self>) {
-        let Some(saved) = SavedQueue::load(&self.paths.queue) else { return };
+        // Anything still on its way to disk gets there first.
+        self.saver.flush();
+        let Some(mut saved) = SavedQueue::load(&self.paths.queue) else { return };
+        let shape =
+            crate::config::queue_shape(&saved.songs, &saved.order, &saved.context, &saved.source, &saved.origins, &saved.source_list);
+        // Where playback had got to, if that was noted for this same queue.
+        let place = crate::config::QueuePlace::load(&self.paths.queue_place);
+        if let Some(place) = place.filter(|place| place.shape == shape && place.cursor < saved.order.len()) {
+            saved.cursor = place.cursor;
+            saved.position = place.position;
+            saved.stamp = saved.stamp.max(place.stamp);
+        }
+        self.queue_saved.set(shape);
         {
             let mut pb = self.playback.borrow_mut();
             if !pb.queue.is_empty() {

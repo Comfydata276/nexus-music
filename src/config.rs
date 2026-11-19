@@ -11,6 +11,9 @@ use crate::subsonic::Song;
 pub struct Paths {
     pub settings: PathBuf,
     pub queue: PathBuf,
+    /// Where in the queue playback has got to. Kept apart from the queue itself, which is
+    /// large and changes far less often.
+    pub queue_place: PathBuf,
     pub history: PathBuf,
     /// Likes, ratings and plays waiting to be sent to the server.
     pub pending: PathBuf,
@@ -58,6 +61,7 @@ impl Paths {
         let paths = Paths {
             settings: config.join("settings.json"),
             queue: config.join("queue.json"),
+            queue_place: config.join("queue-place.json"),
             history: config.join("history.json"),
             pending: config.join("pending.json"),
             added: config.join("playlist-added.json"),
@@ -388,12 +392,58 @@ impl SavedQueue {
             && queue.order.iter().all(|&i| i < queue.songs.len());
         valid.then_some(queue)
     }
+}
 
-    pub fn save(&self, path: &Path) {
-        if let Ok(json) = serde_json::to_vec(self) {
-            write_atomically(path, &json);
-        }
+/// Where playback has got to in the saved queue.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct QueuePlace {
+    /// Which queue this belongs to (see `queue_shape`); a place saved for a different queue
+    /// is ignored.
+    pub shape: u64,
+    pub cursor: usize,
+    pub position: f64,
+    pub stamp: i64,
+}
+
+impl QueuePlace {
+    pub fn load(path: &Path) -> Option<QueuePlace> {
+        serde_json::from_slice(&fs::read(path).ok()?).ok()
     }
+}
+
+/// A number that changes whenever what's in the queue or its order does, and not when
+/// playback only moves along it. The same from one run of the app to the next.
+pub fn queue_shape(
+    songs: &[Song],
+    order: &[usize],
+    context: &str,
+    source: &str,
+    origins: &[Option<usize>],
+    source_list: &[String],
+) -> u64 {
+    // FNV-1a, written out so the result doesn't depend on the standard library's hasher.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut mix = |bytes: &[u8]| {
+        for byte in bytes.iter().chain(&[0xff]) {
+            hash = (hash ^ *byte as u64).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    for song in songs {
+        mix(song.id.as_bytes());
+    }
+    for place in order {
+        mix(&(*place as u64).to_le_bytes());
+    }
+    mix(context.as_bytes());
+    mix(source.as_bytes());
+    for origin in origins {
+        mix(&origin.map_or(u64::MAX, |at| at as u64).to_le_bytes());
+    }
+    for id in source_list {
+        mix(id.as_bytes());
+    }
+    hash
 }
 
 /// A song in "Recently played", and when it was played (seconds since 1970).
@@ -520,4 +570,26 @@ pub fn load_secret(paths: &Paths, name: &str) -> Option<String> {
 pub fn dir_size(dir: &Path) -> u64 {
     let Ok(entries) = fs::read_dir(dir) else { return 0 };
     entries.flatten().filter_map(|e| e.metadata().ok()).filter(|m| m.is_file()).map(|m| m.len()).sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_shape_of_a_queue_follows_what_is_in_it() {
+        let song = |id: &str| Song { id: id.into(), ..Default::default() };
+        let songs = [song("a"), song("b"), song("c")];
+        let shape = |songs: &[Song], order: &[usize], context: &str| queue_shape(songs, order, context, "album:1", &[], &[]);
+        let base = shape(&songs, &[0, 1, 2], "An album");
+        // The same queue has the same shape, every time and on every run.
+        assert_eq!(base, shape(&songs, &[0, 1, 2], "An album"));
+        assert_eq!(queue_shape(&[], &[], "", "", &[], &[]), 0x0a99_c907_b6f6_4763);
+        // A different order, a different song or a different name is a different queue.
+        assert_ne!(base, shape(&songs, &[0, 2, 1], "An album"));
+        assert_ne!(base, shape(&[song("a"), song("b"), song("x")], &[0, 1, 2], "An album"));
+        assert_ne!(base, shape(&songs, &[0, 1, 2], "Another"));
+        // Ids that run together differently are told apart.
+        assert_ne!(shape(&[song("ab"), song("c")], &[0, 1], ""), shape(&[song("a"), song("bc")], &[0, 1], ""));
+    }
 }

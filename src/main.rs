@@ -30,6 +30,7 @@ mod picker;
 mod playback;
 mod plays;
 mod pool;
+mod saver;
 mod search;
 mod songcache;
 mod subsonic;
@@ -78,5 +79,8 @@ fn main() -> Result<(), slint::PlatformError> {
     // Remember where playback was for next time.
     controller.save_queue();
     controller.save_settings();
+    controller.downloads.borrow_mut().save_if_due(true);
+    // The queue is written by a thread of its own: wait for it to finish.
+    controller.saver.flush();
     Ok(())
 }
