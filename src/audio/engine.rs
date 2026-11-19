@@ -289,6 +289,15 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(buffer_dir: PathBuf, on_event: impl Fn(Event) + Send + 'static) -> Engine {
+        // With no sound card, NEXUS_AUDIO_DUMP=<file> records what would have been played.
+        let record_to = std::env::var_os("NEXUS_AUDIO_DUMP").map(PathBuf::from);
+        Engine::recording_to(buffer_dir, record_to, on_event)
+    }
+
+    /// An engine that, if there is no sound device to be had, plays into the file named:
+    /// raw 32-bit float stereo, at the rate the engine works at. That is how its output is
+    /// checked without listening to it.
+    pub fn recording_to(buffer_dir: PathBuf, record_to: Option<PathBuf>, on_event: impl Fn(Event) + Send + 'static) -> Engine {
         let shared = Arc::new(Shared::new());
         let (tx, rx) = mpsc::channel();
         let worker = Worker {
@@ -296,6 +305,7 @@ impl Engine {
             tx: tx.clone(),
             shared: shared.clone(),
             buffer_dir,
+            record_to,
             on_event: Box::new(on_event),
             output: None,
             current: None,
@@ -457,6 +467,8 @@ struct Worker {
     tx: Sender<Cmd>,
     shared: Arc<Shared>,
     buffer_dir: PathBuf,
+    /// Where to play to when there's no sound device (see `Engine::recording_to`).
+    record_to: Option<PathBuf>,
     on_event: Box<dyn Fn(Event) + Send>,
     output: Option<Output>,
     current: Option<Box<Deck>>,
@@ -1161,7 +1173,7 @@ impl Worker {
             }
             Err(_) => {
                 self.set_rate(48_000);
-                if std::env::var_os("NEXUS_AUDIO_DUMP").is_none() {
+                let Some(record_to) = self.record_to.clone() else {
                     // Nothing to play through. Playing on in silence would move through the
                     // queue and count songs nobody heard, so say so and let the player pause;
                     // the device is looked for again when play is pressed.
@@ -1169,9 +1181,9 @@ impl Worker {
                     self.emit(Event::Output { status: "No sound device found.".into(), exclusive: false });
                     self.emit(Event::NoDevice);
                     return;
-                }
+                };
                 // For checking output without a sound card: play to the file named instead.
-                (Output::Null(spawn_null_output(self.shared.clone())), "No sound device found.".to_string())
+                (Output::Null(spawn_null_output(self.shared.clone(), record_to)), "No sound device found.".to_string())
             }
         };
         self.output = Some(output);
@@ -1444,13 +1456,12 @@ where
     st.volume = target_volume;
 }
 
-fn spawn_null_output(shared: Arc<Shared>) -> Arc<AtomicBool> {
+fn spawn_null_output(shared: Arc<Shared>, record_to: PathBuf) -> Arc<AtomicBool> {
     let stop = Arc::new(AtomicBool::new(false));
     let flag = stop.clone();
-    // Diagnostic: with no sound card, NEXUS_AUDIO_DUMP=<file> records what would have been
-    // played, as raw 32-bit float stereo, so output can be checked without listening to it.
-    let mut dump = std::env::var_os("NEXUS_AUDIO_DUMP")
-        .and_then(|path| std::fs::OpenOptions::new().create(true).append(true).open(path).ok());
+    // What would have been played goes to the file, as raw 32-bit float stereo, so output
+    // can be checked without listening to it.
+    let mut dump = std::fs::OpenOptions::new().create(true).append(true).open(record_to).ok();
     let _ = std::thread::Builder::new().name("null-output".into()).spawn(move || {
         use std::io::Write;
         let tick = Duration::from_millis(20);
@@ -1639,5 +1650,118 @@ mod tests {
     #[test]
     fn plays_every_frame_of_an_ogg_vorbis_file_and_no_more() {
         assert_eq!(played_frames(include_bytes!("../../tests/fixtures/half-second.ogg"), "ogg"), 22_050);
+    }
+
+    // ---- the engine as a whole ------------------------------------------------------------
+
+    /// Plays tracks through a whole engine that has a file to play into instead of a sound
+    /// device, and returns what came out (stereo frames at 48 kHz) once the queue has
+    /// finished. `first` is loaded; `set_up` can name what follows, seek, and so on.
+    fn played(name: &str, first: TrackRequest, set_up: impl FnOnce(&Engine)) -> Vec<[f32; 2]> {
+        let dir = std::env::temp_dir().join(format!("nexus-engine-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let recording = dir.join("out.raw");
+        let (events, heard) = mpsc::channel();
+        let engine = Engine::recording_to(dir.clone(), Some(recording.clone()), move |event| {
+            let _ = events.send(event);
+        });
+        let client = Client::new("http://127.0.0.1:9", "someone", "secret");
+        engine.load(client, first);
+        set_up(&engine);
+        engine.set_playing(true);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            match heard.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(Event::Finished) => break,
+                Ok(Event::Failed { message, .. }) => panic!("the engine gave up: {message}"),
+                Ok(_) => {}
+                Err(_) => panic!("the engine never finished"),
+            }
+        }
+        // The last of it is still on its way to the file.
+        std::thread::sleep(Duration::from_millis(80));
+        drop(engine);
+        let bytes = std::fs::read(&recording).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        bytes.chunks_exact(8).map(|frame| [0, 4].map(|at| f32::from_le_bytes(frame[at..at + 4].try_into().unwrap()))).collect()
+    }
+
+    /// One of the half-second test files, written out to be played from disk.
+    fn track(token: u64, name: &str, bytes: &[u8]) -> TrackRequest {
+        let path = std::env::temp_dir().join(format!("nexus-engine-fixture-{}-{name}", std::process::id()));
+        std::fs::write(&path, bytes).unwrap();
+        TrackRequest {
+            token,
+            local: Some(path),
+            keep: None,
+            live: false,
+            url: String::new(),
+            ranged: true,
+            suffix: name.rsplit('.').next().unwrap().to_string(),
+            gain: 1.0,
+            start_secs: 0.0,
+            base_secs: 0.0,
+            duration_secs: 0.5,
+            continues: false,
+        }
+    }
+
+    const MP3: &[u8] = include_bytes!("../../tests/fixtures/half-second.mp3");
+    const OGG: &[u8] = include_bytes!("../../tests/fixtures/half-second.ogg");
+
+    /// The quietest stretch of ten milliseconds in what was played, leaving out the very
+    /// start and end: a gap between two tracks shows up as one that's near silent.
+    fn quietest(frames: &[[f32; 2]]) -> f32 {
+        frames[2400..frames.len() - 2400]
+            .chunks(480)
+            .map(|window| window.iter().map(|frame| frame[0].abs()).fold(0.0, f32::max))
+            .fold(f32::MAX, f32::min)
+    }
+
+    #[test]
+    fn one_track_runs_into_the_next_without_a_gap() {
+        // Half a second of a tone as MP3, then the same as Ogg Vorbis: 22,050 frames each at
+        // 44.1 kHz, which is 24,000 each at the 48 kHz they're played at.
+        let client = Client::new("http://127.0.0.1:9", "someone", "secret");
+        let frames = played("gapless", track(1, "a.mp3", MP3), |engine| engine.set_next(Some((client, track(2, "b.ogg", OGG)))));
+        assert!(frames.len().abs_diff(48_000) <= 2, "{} frames came out", frames.len());
+        assert!(quietest(&frames) > 0.03, "a quiet patch of {}", quietest(&frames));
+    }
+
+    #[test]
+    fn a_crossfade_overlaps_two_tracks_unless_they_are_one_album() {
+        let next = |continues: bool| {
+            let client = Client::new("http://127.0.0.1:9", "someone", "secret");
+            move |engine: &Engine| {
+                // A fade longer than a third of the track is cut to a third: 8,000 frames here,
+                // and up to a couple of packets more, since the blend starts on a packet.
+                engine.set_crossfade(0.4);
+                engine.set_next(Some((client, TrackRequest { continues, ..track(2, "d.ogg", OGG) })));
+            }
+        };
+        // Blended: the second starts under the end of the first, so less comes out in all.
+        let blended = played("crossfade", track(1, "c.mp3", MP3), next(false));
+        // (Both files are the same tone, which can cancel itself out where they overlap, so
+        // how loud the blend is says nothing here.)
+        assert!((37_500..=40_000).contains(&blended.len()), "{} frames came out", blended.len());
+        // The next track of the same album: every frame of both, end to end.
+        let album = played("album", track(1, "e.mp3", MP3), next(true));
+        assert!(album.len().abs_diff(48_000) <= 2, "{} frames came out", album.len());
+    }
+
+    #[test]
+    fn seeking_plays_on_from_where_it_was_asked() {
+        // Once the track is open, jump half-way: a quarter of a second is left. A seek in an
+        // MP3 lands on a packet, and a packet or two early at that (each needs the one before
+        // it to decode), so up to 50 ms more than that comes out.
+        let frames = played("seek", track(1, "f.mp3", MP3), |engine| {
+            let opened = Instant::now();
+            while engine.position().is_none() && opened.elapsed() < Duration::from_secs(5) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            engine.seek(0.25);
+        });
+        assert!((12_000..=14_400).contains(&frames.len()), "{} frames came out", frames.len());
     }
 }

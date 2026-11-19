@@ -134,9 +134,9 @@ Things that lose data or interrupt the music.
 - [x] Every push is compiled and tested automatically (GitHub Actions). (0.33.0)
 - [x] Tests for the offline queue and for the streaming source, against a test server that
       stalls, cuts and refuses connections. (0.24.0, 0.25.0)
-- [ ] Tests for the audio engine using its recorded output (gapless, seeking, crossfade).
-      The pieces are tested (trimming, resampling to the exact frame, the buffer, the fade);
-      the engine running end to end is still only checked by hand in the test app.
+- [x] Tests for the audio engine using its recorded output: two tracks played through the
+      whole engine come out gapless to the frame, a crossfade overlaps them (and leaves an
+      album alone), and a seek plays on from the right place.
 - [x] A crash log, and "Save diagnostics" in Settings. (0.33.0)
 - [x] A damaged settings file is recovered from a backup, never reset without saying. (0.33.0)
 - [x] Releases are tagged at the commit that was built, with a pinned Rust version. (0.33.0)
