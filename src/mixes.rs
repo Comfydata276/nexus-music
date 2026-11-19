@@ -19,6 +19,117 @@ pub struct Mix {
     pub songs: Vec<Song>,
 }
 
+/// A mix made to rules of your own. Every rule left at its starting value lets any song in.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Rules {
+    /// Tells it apart from the others for good, whatever it's renamed to.
+    pub id: u64,
+    pub name: String,
+    /// Part of a genre's name; empty for any.
+    pub genre: String,
+    /// At least this many stars; 0 for any.
+    pub rating: u8,
+    /// Only songs you've liked.
+    pub liked: bool,
+    /// Released in these years; 0 for no limit at that end.
+    pub from_year: u32,
+    pub to_year: u32,
+    /// An entry of `PLAYED`.
+    pub played: u8,
+    /// An entry of `ADDED`.
+    pub added: u8,
+    /// An entry of `ORDERS`.
+    pub order: u8,
+    /// An entry of `SIZES`.
+    pub size: u8,
+}
+
+/// When a song was last played: the name of each choice, and the fewest days ago (-1 for
+/// "never played", 0 for any).
+pub const PLAYED: [(&str, i64); 5] =
+    [("Any time", 0), ("Never played", -1), ("Not in the last month", 30), ("Not in the last six months", 182), ("Not in the last year", 365)];
+/// When a song came into the library: the name of each choice, and the most days ago (0 for any).
+pub const ADDED: [(&str, i64); 4] = [("Any time", 0), ("In the last month", 30), ("In the last six months", 182), ("In the last year", 365)];
+pub const ORDERS: [&str; 4] = ["Shuffled", "Most played first", "Newest first", "Longest since played first"];
+pub const SIZES: [usize; 4] = [25, 50, 100, 200];
+
+impl Rules {
+    /// The rules in words, for under the mix's name.
+    pub fn summary(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if !self.genre.trim().is_empty() {
+            parts.push(self.genre.trim().to_string());
+        }
+        match self.rating {
+            0 => {}
+            5 => parts.push("5 stars".into()),
+            n => parts.push(format!("{n} stars or more")),
+        }
+        if self.liked {
+            parts.push("liked".into());
+        }
+        match (self.from_year, self.to_year) {
+            (0, 0) => {}
+            (from, 0) => parts.push(format!("from {from} on")),
+            (0, to) => parts.push(format!("up to {to}")),
+            (from, to) if from == to => parts.push(from.to_string()),
+            (from, to) => parts.push(format!("{from} to {to}")),
+        }
+        if self.played > 0 {
+            parts.push(PLAYED[(self.played as usize).min(PLAYED.len() - 1)].0.to_lowercase());
+        }
+        if self.added > 0 {
+            parts.push(format!("added {}", ADDED[(self.added as usize).min(ADDED.len() - 1)].0.to_lowercase()));
+        }
+        parts.push(ORDERS[(self.order as usize).min(ORDERS.len() - 1)].to_lowercase());
+        if parts.len() == 1 { format!("Any song, {}", parts[0]) } else { parts.join(", ") }
+    }
+
+    fn lets_in(&self, song: &Song, now: i64) -> bool {
+        let genre = crate::search::fold(self.genre.trim());
+        let (_, played) = PLAYED[(self.played as usize).min(PLAYED.len() - 1)];
+        let (_, added) = ADDED[(self.added as usize).min(ADDED.len() - 1)];
+        let last = crate::added::parse_time(&song.played);
+        (genre.is_empty() || crate::search::fold(&song.genre).contains(&genre))
+            && song.user_rating >= self.rating
+            && (!self.liked || crate::search::is_liked(song))
+            && (self.from_year == 0 || song.year >= self.from_year)
+            && (self.to_year == 0 || (song.year > 0 && song.year <= self.to_year))
+            && match played {
+                0 => true,
+                -1 => song.play_count == 0,
+                days => last == 0 || now - last > days * DAY,
+            }
+            && (added == 0 || now - crate::added::parse_time(&song.created) <= added * DAY)
+    }
+
+    /// The songs these rules pick out, in the order asked for.
+    pub fn songs(&self, index: &Index, now: i64) -> Vec<Song> {
+        let mut songs: Vec<&Song> = index.library.songs.iter().filter(|song| self.lets_in(song, now)).collect();
+        match self.order {
+            1 => songs.sort_by(|a, b| b.play_count.cmp(&a.play_count).then_with(|| a.title.cmp(&b.title))),
+            2 => songs.sort_by(|a, b| b.created.cmp(&a.created).then_with(|| a.title.cmp(&b.title))),
+            3 => songs.sort_by_key(|song| crate::added::parse_time(&song.played)),
+            _ => shuffle_for_today(&mut songs, &format!("rule:{}", self.id), now),
+        }
+        songs.into_iter().take(SIZES[(self.size as usize).min(SIZES.len() - 1)]).cloned().collect()
+    }
+}
+
+/// The mixes made to rules, kept here so they can be built off the UI thread.
+static RULES: RwLock<Vec<Rules>> = RwLock::new(Vec::new());
+
+pub fn set_rules(rules: Vec<Rules>) {
+    if let Ok(mut all) = RULES.write() {
+        *all = rules;
+    }
+}
+
+fn rules() -> Vec<Rules> {
+    RULES.read().map(|rules| rules.clone()).unwrap_or_default()
+}
+
 /// Recently played, as song ids and when: kept here so mixes can be built off the UI thread.
 static PLAYS: RwLock<Vec<(String, i64)>> = RwLock::new(Vec::new());
 
@@ -97,6 +208,11 @@ fn genre_mix(index: &Index, genre: &str, now: i64) -> Vec<Song> {
 pub fn one(index: &Index, id: &str) -> Option<Mix> {
     let now = chrono::Utc::now().timestamp();
     let plays = PLAYS.read().map(|plays| plays.clone()).unwrap_or_default();
+    // One made to rules is there as soon as it has been made, even while nothing fits it.
+    if let Some(rule) = id.strip_prefix("rule:").and_then(|id| id.parse::<u64>().ok()) {
+        let rules = rules().into_iter().find(|rules| rules.id == rule)?;
+        return Some(Mix { id: id.to_string(), title: rules.name.clone(), about: rules.summary(), songs: rules.songs(index, now) });
+    }
     let (title, about, songs, least) = match id {
         "on-repeat" => ("On repeat".to_string(), "What you've played most lately", on_repeat(index, &plays, now), 5),
         "top" => ("Your top songs".to_string(), "Your most played of all time", top_songs(index), 10),
@@ -112,7 +228,14 @@ pub fn one(index: &Index, id: &str) -> Option<Mix> {
 /// Every mix there's enough listening to make.
 pub fn all(index: &Index) -> Vec<Mix> {
     let genres: Vec<String> = top_genres(index).into_iter().map(|genre| format!("genre:{genre}")).collect();
-    ["on-repeat", "top", "rediscover"].into_iter().chain(genres.iter().map(String::as_str)).filter_map(|id| one(index, id)).collect()
+    // Yours first, then the ones the app makes from your listening.
+    let own: Vec<String> = rules().into_iter().map(|rules| format!("rule:{}", rules.id)).collect();
+    own.iter()
+        .map(String::as_str)
+        .chain(["on-repeat", "top", "rediscover"])
+        .chain(genres.iter().map(String::as_str))
+        .filter_map(|id| one(index, id))
+        .collect()
 }
 
 #[cfg(test)]
@@ -177,5 +300,25 @@ mod tests {
         let offered: Vec<String> = all(&index).into_iter().map(|mix| mix.id).collect();
         assert_eq!(offered, ["on-repeat", "top", "rediscover", "genre:Rock", "genre:Jazz"]);
         set_plays(vec![]);
+
+        // A mix made to rules: rock not played in the last month, most played first.
+        let rule = Rules { id: 7, name: "Old rock".into(), genre: "rock".into(), played: 2, order: 1, size: 0, ..Default::default() };
+        let picked = rule.songs(&index, now);
+        assert_eq!(picked.len(), 25);
+        assert!(picked.iter().all(|song| song.genre == "Rock") && picked[0].id == "0");
+        assert_eq!(rule.summary(), "rock, not in the last month, most played first");
+        // Never played, any genre: the ten folk songs.
+        let fresh = Rules { played: 1, ..Default::default() };
+        assert_eq!(fresh.songs(&index, now).len(), 10);
+        assert_eq!(fresh.summary(), "never played, shuffled");
+        assert_eq!(Rules::default().summary(), "Any song, shuffled");
+        // Played in the last month counts as played lately; the jazz was two days ago.
+        assert!(Rules { genre: "jazz".into(), played: 2, ..Default::default() }.songs(&index, now).is_empty());
+        // Once made it's among the mixes, ahead of the app's own, and has a page.
+        set_rules(vec![rule.clone()]);
+        assert_eq!(all(&index).first().map(|mix| (mix.id.clone(), mix.title.clone())), Some(("rule:7".to_string(), "Old rock".to_string())));
+        assert_eq!(one(&index, "rule:7").unwrap().about, rule.summary());
+        assert!(one(&index, "rule:8").is_none());
+        set_rules(vec![]);
     }
 }

@@ -79,6 +79,24 @@ impl PlayLog {
         self.lines = shared.len();
     }
 
+    /// Takes in plays made on other devices (see `sync`), leaving out the ones already here.
+    /// Returns how many were new.
+    pub fn absorb(&mut self, plays: &[(String, i64)]) -> usize {
+        let known: std::collections::HashSet<(String, i64)> = match SHARED.read() {
+            // Anything another device has to tell is recent, so the newest part is enough to
+            // compare with.
+            Ok(shared) => shared.iter().rev().take(5000).cloned().collect(),
+            Err(_) => return 0,
+        };
+        let mut new: Vec<&(String, i64)> = plays.iter().filter(|play| !known.contains(*play)).collect();
+        new.sort_by_key(|(_, at)| *at);
+        new.dedup();
+        for (song, at) in &new {
+            self.add(song, *at);
+        }
+        new.len()
+    }
+
     /// Notes a play.
     pub fn add(&mut self, song: &str, at: i64) {
         if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&self.path) {
@@ -112,6 +130,14 @@ mod tests {
         std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(b"[\"d\",4").unwrap();
         PlayLog::load(&old, &[]);
         assert_eq!(shared(), [("a".to_string(), 100), ("b".to_string(), 200), ("c".to_string(), 300)]);
+        let _ = std::fs::remove_file(&path);
+
+        // Plays from another device are taken in once each, oldest first.
+        let mut log = PlayLog::load(&old, &[("c".to_string(), 300)]);
+        let elsewhere = [("z".to_string(), 350), ("c".to_string(), 300), ("y".to_string(), 320), ("z".to_string(), 350)];
+        assert_eq!(log.absorb(&elsewhere), 2);
+        assert_eq!(log.absorb(&elsewhere), 0);
+        assert_eq!(shared(), [("c".to_string(), 300), ("y".to_string(), 320), ("z".to_string(), 350)]);
         let _ = std::fs::remove_file(&path);
 
         // No log at all: it starts from what Recently played has, which is newest first.

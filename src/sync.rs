@@ -14,6 +14,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use slint::ComponentHandle as _;
 
 use crate::added::{Notes, merge_notes, parse_time};
 use crate::config::{ListPrefs, Played};
@@ -30,6 +31,9 @@ const SETTLE: Duration = Duration::from_secs(3);
 const LOOK: Duration = Duration::from_secs(60);
 /// Songs remembered for "Recently played".
 pub const HISTORY_LENGTH: usize = 100;
+/// How many of the latest plays are passed between devices for "Your stats". Each device
+/// keeps every play it hears of; this is only how far back one that's been away can catch up.
+const PLAYS_SHARED: usize = 500;
 /// How much of a long queue is passed on: this many songs before the current one...
 const QUEUE_BEHIND: usize = 50;
 /// ...and this many from it onwards.
@@ -52,6 +56,10 @@ pub struct Shared {
     pub added: Notes,
     /// Song id and when it was played, newest first.
     pub history: Vec<(String, i64)>,
+    /// The latest plays that counted, from every device, newest first: what "Your stats"
+    /// for the last weeks and months is worked out from. (Unlike `history`, a song played
+    /// twice running is here twice.)
+    pub plays: Vec<(String, i64)>,
 }
 
 fn list_rank(prefs: &ListPrefs) -> (i64, bool, usize, bool, bool) {
@@ -66,6 +74,15 @@ pub fn merge_history(a: &[(String, i64)], b: &[(String, i64)]) -> Vec<(String, i
     // The same song twice running is one stretch of listening.
     all.dedup_by(|later, earlier| later.0 == earlier.0);
     all.truncate(HISTORY_LENGTH);
+    all
+}
+
+/// Puts the plays two devices know of into one list, newest first, each play once.
+pub fn merge_plays(a: &[(String, i64)], b: &[(String, i64)]) -> Vec<(String, i64)> {
+    let mut all: Vec<(String, i64)> = a.iter().chain(b).cloned().collect();
+    all.sort_by(|x, y| y.1.cmp(&x.1).then_with(|| x.0.cmp(&y.0)));
+    all.dedup();
+    all.truncate(PLAYS_SHARED);
     all
 }
 
@@ -89,6 +106,7 @@ pub fn merge(a: &Shared, b: &Shared, now: i64) -> Shared {
         lists,
         added: merge_notes(&a.added, &b.added, now),
         history: merge_history(&a.history, &b.history),
+        plays: merge_plays(&a.plays, &b.plays),
     }
 }
 
@@ -281,6 +299,7 @@ impl Controller {
             // Before the playlists have loaded there's no telling which still exist.
             added: self.added.borrow().shared((!known.is_empty()).then_some(&known)),
             history: self.history.borrow().iter().map(|played| (played.song.id.clone(), played.at)).collect(),
+            plays: merge_plays(&crate::plays::shared().into_iter().rev().take(PLAYS_SHARED).collect::<Vec<_>>(), &[]),
         }
     }
 
@@ -356,6 +375,10 @@ impl Controller {
             // The dates on screen may have changed.
             self.rebuild_tracks();
         }
+        // Plays counted on other devices go into this one's log, so the stats cover them all.
+        if self.play_log.borrow_mut().absorb(&theirs.plays) > 0 {
+            self.invalidate("stats");
+        }
         // Recently played: both devices' plays, in order.
         let mine: Vec<(String, i64)> =
             self.history.borrow().iter().map(|played| (played.song.id.clone(), played.at)).collect();
@@ -416,17 +439,49 @@ impl Controller {
     /// Asks the server for the saved queue, and takes it up if another device changed it
     /// after anything was last done here. A device that's playing keeps its own queue.
     pub fn check_server_queue(self: &Rc<Self>) {
-        if !self.sync_on() || self.playback.borrow().playing {
+        if !self.sync_on() {
             return;
         }
         self.request(
             |client| client.play_queue(),
             |ctl, result| {
                 if let Ok(theirs) = result {
+                    ctl.note_elsewhere(&theirs);
                     ctl.adopt_queue(theirs);
                 }
             },
         );
+    }
+
+    /// Remembers what another device has been playing in the last half hour, so it can be
+    /// offered as "Continue here". (A device that's paused takes up a newer queue without
+    /// being asked; this is for one that's playing something of its own.)
+    fn note_elsewhere(&self, theirs: &PlayQueue) {
+        let age = chrono::Utc::now().timestamp() - parse_time(&theirs.changed);
+        let same = self.playback.borrow().current().is_some_and(|song| song.id == theirs.current);
+        let newer = !theirs.songs.is_empty() && theirs.changed_by != self.device_name() && (0..30 * 60).contains(&age) && !same;
+        let label = newer
+            .then(|| theirs.songs.iter().find(|song| song.id == theirs.current).or(theirs.songs.first()))
+            .flatten()
+            .map(|song| format!("{} — {}", song.title, song.artist_label()))
+            .unwrap_or_default();
+        *self.elsewhere.borrow_mut() = newer.then(|| theirs.clone());
+        self.ui.global::<crate::ui::Player>().set_elsewhere(label.into());
+    }
+
+    /// Takes up what another device was playing, from where it had got to, and plays it.
+    pub fn continue_here(self: &Rc<Self>) {
+        let Some(theirs) = self.elsewhere.borrow_mut().take() else { return };
+        self.ui.global::<crate::ui::Player>().set_elsewhere("".into());
+        let cursor = theirs.songs.iter().position(|song| song.id == theirs.current).unwrap_or(0);
+        let duration = theirs.songs[cursor].duration as f64;
+        let position = theirs.position as f64 / 1000.0;
+        let position = if duration > 0.0 && position >= duration - 1.0 { 0.0 } else { position.max(0.0) };
+        self.engine.set_playing(false);
+        self.engine.stop();
+        self.queue_stamp.set(parse_time(&theirs.changed));
+        self.replace_queue(theirs.songs, cursor, position);
+        self.toggle_play();
     }
 
     fn adopt_queue(self: &Rc<Self>, theirs: PlayQueue) {
@@ -437,6 +492,9 @@ impl Controller {
         if self.playback.borrow().playing {
             return;
         }
+        // Taken up: there's nothing left to offer.
+        self.elsewhere.borrow_mut().take();
+        self.ui.global::<crate::ui::Player>().set_elsewhere("".into());
         let cursor = theirs.songs.iter().position(|song| song.id == theirs.current).unwrap_or(0);
         let duration = theirs.songs[cursor].duration as f64;
         let position = theirs.position as f64 / 1000.0;
@@ -455,6 +513,21 @@ mod tests {
 
     fn history(entries: &[(&str, i64)]) -> Vec<(String, i64)> {
         entries.iter().map(|(id, at)| (id.to_string(), *at)).collect()
+    }
+
+    #[test]
+    fn every_device_s_plays_are_counted_once() {
+        let here = history(&[("a", 30), ("a", 20), ("b", 10)]);
+        let there = history(&[("c", 40), ("a", 20)]);
+        // Unlike Recently played, a song played twice is two plays; the same play known to
+        // both devices is one.
+        let merged = merge_plays(&here, &there);
+        assert_eq!(merged, history(&[("c", 40), ("a", 30), ("a", 20), ("b", 10)]));
+        assert_eq!(merge_plays(&there, &here), merged);
+        // Only so many are passed around.
+        let many: Vec<(String, i64)> = (0..PLAYS_SHARED as i64 + 50).map(|at| ("s".to_string(), at)).collect();
+        let kept = merge_plays(&many, &[]);
+        assert_eq!((kept.len(), kept[0].1), (PLAYS_SHARED, PLAYS_SHARED as i64 + 49));
     }
 
     #[test]

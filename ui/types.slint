@@ -402,6 +402,10 @@ export global Player {
     callback queue-menu(index: int, x: length, y: length);
     callback clear-queue();
     callback save-queue();
+    // What another device is playing ("Song — Artist"), when that's more recent than
+    // anything done here; empty otherwise.
+    in property <string> elsewhere;
+    callback continue-here();
     callback choose-sleep(x: length, y: length);
     // The queue row at `index` was dragged `delta` places down (or up, when negative).
     callback queue-moved(index: int, delta: int);

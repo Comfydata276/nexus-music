@@ -2108,6 +2108,9 @@ impl Controller {
         player.on_clear_queue(|| {
             with(|ctl| ctl.clear_upcoming());
         });
+        player.on_continue_here(|| {
+            with(|ctl| ctl.continue_here());
+        });
         player.on_save_queue(|| {
             with(|ctl| {
                 // What's playing and everything after it, in the order it will play.

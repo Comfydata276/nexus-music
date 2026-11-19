@@ -60,6 +60,10 @@ pub enum PromptAction {
     ImportPath,
     /// A name for the equaliser as it's set now.
     SavePreset,
+    /// A name for a new mix made to rules.
+    NewMix,
+    /// Something typed for one of a mix's rules: the mix, and which rule.
+    RuleText { rule: u64, field: &'static str },
     /// The folder to keep downloads in was typed in.
     DownloadsFolder,
     /// Ask Lidarr for an album (by its name for it), or for several by (artist, album).
@@ -345,13 +349,13 @@ impl Controller {
             match (&page.playlist, self.current_route()) {
                 (Some(p), _) => Target::Playlist { id: p.id.clone(), name: p.name.clone() },
                 (None, Some(Route::Album(id))) => Target::Album { id, title: page.title.clone() },
-                // A mix is made afresh from your listening and changes over time; the one
-                // thing to do with it as a whole is to keep it.
-                (None, Some(Route::Mix(_))) if !page.songs.is_empty() => {
-                    let entries = vec![self.entry("save-playlist", "Save as playlist", self.ui.global::<ui::Icons>().get_list_plus())];
-                    let (target, title) = (Target::Songs { songs: page.songs.clone(), playlist: None }, page.title.clone());
+                // A mix is made afresh each day and changes over time: it can be kept as a
+                // playlist, and one made to rules of your own can have those rules changed.
+                (None, Some(Route::Mix(id))) => {
+                    let rule = id.strip_prefix("rule:").and_then(|id| id.parse::<u64>().ok());
+                    let (songs, title) = (page.songs.clone(), page.title.clone());
                     drop(page);
-                    return self.open_menu(target, &title, entries, x, y);
+                    return self.mix_menu(rule, songs, &title, x, y);
                 }
                 _ => return,
             }
@@ -598,6 +602,18 @@ impl Controller {
                 self.close_menu();
                 return self.start_import();
             }
+            "new-mix" => {
+                self.close_menu();
+                *self.prompt.borrow_mut() = Some(PromptAction::NewMix);
+                return self.open_prompt(
+                    "Name your mix",
+                    "A mix picks songs from your library by rules you set: a genre, a rating, how long since you played them. You choose the rules next, from the mix's menu.",
+                    "Create mix",
+                    Some(""),
+                    false,
+                );
+            }
+            rule if rule.starts_with("rule") => return self.rule_chosen(rule),
             "add-to" => return self.show_playlist_picker(),
             "rate" => return self.show_rating_picker(),
             "back" => {
@@ -739,9 +755,184 @@ impl Controller {
         let icons = self.ui.global::<ui::Icons>();
         let entries = vec![
             self.entry("new-playlist", "New playlist", icons.get_list_plus()),
+            self.entry("new-mix", "New mix from rules", icons.get_list_music()),
             self.entry("import-spotify", "Import from Spotify", icons.get_download()),
         ];
         self.open_menu(Target::None, "", entries, x, y);
+    }
+
+    // ---- mixes made to rules -------------------------------------------------------------------
+
+    /// The menu on a mix's page.
+    fn mix_menu(&self, rule: Option<u64>, songs: Vec<Song>, title: &str, x: f32, y: f32) {
+        let icons = self.ui.global::<ui::Icons>();
+        let mut entries = Vec::new();
+        if !songs.is_empty() {
+            entries.push(self.entry("save-playlist", "Save as playlist", icons.get_list_plus()));
+        }
+        let rules = rule.and_then(|id| self.settings.borrow().rule_mixes.iter().find(|rules| rules.id == id).cloned());
+        self.menu_rule.set(rules.as_ref().map(|rules| rules.id));
+        if let Some(rules) = rules {
+            use crate::mixes::{ADDED, ORDERS, PLAYED, SIZES};
+            if !entries.is_empty() {
+                entries.push(self.separator());
+            }
+            let pick = |index: u8, count: usize| (index as usize).min(count - 1);
+            let years = match (rules.from_year, rules.to_year) {
+                (0, 0) => "any".to_string(),
+                (from, 0) => format!("from {from}"),
+                (0, to) => format!("up to {to}"),
+                (from, to) => format!("{from} to {to}"),
+            };
+            let stars = match rules.rating {
+                0 => "any".to_string(),
+                5 => "5 stars".to_string(),
+                n => format!("{n} or more"),
+            };
+            let mut choice = |id: &str, label: String, submenu: bool| {
+                let mut entry = self.entry(id, &label, slint::Image::default());
+                entry.submenu = submenu;
+                entries.push(entry);
+            };
+            choice("rule:genre", format!("Genre: {}", if rules.genre.trim().is_empty() { "any" } else { rules.genre.trim() }), false);
+            choice("rule:rating", format!("Rating: {stars}"), true);
+            choice("rule:liked", format!("Liked songs only: {}", if rules.liked { "yes" } else { "no" }), false);
+            choice("rule:years", format!("Years: {years}"), false);
+            choice("rule:played", format!("Last played: {}", PLAYED[pick(rules.played, PLAYED.len())].0.to_lowercase()), true);
+            choice("rule:added", format!("Added: {}", ADDED[pick(rules.added, ADDED.len())].0.to_lowercase()), true);
+            choice("rule:order", format!("Order: {}", ORDERS[pick(rules.order, ORDERS.len())].to_lowercase()), true);
+            choice("rule:size", format!("Length: {} songs", SIZES[pick(rules.size, SIZES.len())]), true);
+            entries.push(self.separator());
+            entries.push(self.entry("rule:rename", "Rename", icons.get_pencil()));
+            let mut delete = self.entry("rule:delete", "Delete mix", icons.get_trash_2());
+            delete.danger = true;
+            entries.push(delete);
+        }
+        if !entries.is_empty() {
+            self.open_menu(Target::Songs { songs, playlist: None }, title, entries, x, y);
+        }
+    }
+
+    /// Something was chosen from a rule mix's menu.
+    fn rule_chosen(self: &Rc<Self>, id: &str) {
+        use crate::mixes::{ADDED, ORDERS, PLAYED, SIZES};
+        let Some(rule) = self.menu_rule.get() else { return self.close_menu() };
+        let Some(rules) = self.settings.borrow().rule_mixes.iter().find(|rules| rules.id == rule).cloned() else {
+            return self.close_menu();
+        };
+        // A choice from one of the lists below: "rule-set:<which>:<number>".
+        if let Some((field, value)) = id.strip_prefix("rule-set:").and_then(|rest| rest.split_once(':')) {
+            let value: u8 = value.parse().unwrap_or(0);
+            self.close_menu();
+            return self.change_rule(rule, |rules| match field {
+                "rating" => rules.rating = value,
+                "played" => rules.played = value,
+                "added" => rules.added = value,
+                "order" => rules.order = value,
+                _ => rules.size = value,
+            });
+        }
+        // A list of choices takes the menu's place, with the one in force ticked.
+        let list = |title: &str, field: &str, current: u8, names: Vec<String>| {
+            let icons = self.ui.global::<ui::Icons>();
+            let mut entries = vec![self.entry("back", "Back", icons.get_chevron_left()), self.separator()];
+            for (index, name) in names.iter().enumerate() {
+                let icon = if index == current as usize { icons.get_check() } else { slint::Image::default() };
+                entries.push(self.entry(&format!("rule-set:{field}:{index}"), name, icon));
+            }
+            let menu = self.ui.global::<ui::Menu>();
+            menu.set_title(title.into());
+            menu.set_entries(ModelRc::new(VecModel::from(entries)));
+        };
+        let ask = |field: &'static str, title: &str, message: &str, now: String| {
+            self.close_menu();
+            *self.prompt.borrow_mut() = Some(PromptAction::RuleText { rule, field });
+            self.open_prompt(title, message, "Set", Some(&now), false);
+        };
+        match id {
+            "rule:rating" => list("Rating", "rating", rules.rating, ["Any", "1 star or more", "2 or more", "3 or more", "4 or more", "5 stars"].map(String::from).to_vec()),
+            "rule:played" => list("Last played", "played", rules.played, PLAYED.iter().map(|choice| choice.0.to_string()).collect()),
+            "rule:added" => list("Added to the library", "added", rules.added, ADDED.iter().map(|choice| choice.0.to_string()).collect()),
+            "rule:order" => list("Order", "order", rules.order, ORDERS.iter().map(|order| order.to_string()).collect()),
+            "rule:size" => list("Length", "size", rules.size, SIZES.iter().map(|size| format!("{size} songs")).collect()),
+            "rule:liked" => {
+                self.close_menu();
+                self.change_rule(rule, |rules| rules.liked = !rules.liked);
+            }
+            "rule:genre" => ask("genre", "Genre", "Part of a genre's name, such as “rock”. Leave it empty for any genre.", rules.genre.clone()),
+            "rule:years" => {
+                let now = match (rules.from_year, rules.to_year) {
+                    (0, 0) => String::new(),
+                    (from, 0) => format!("{from}-"),
+                    (0, to) => format!("-{to}"),
+                    (from, to) => format!("{from}-{to}"),
+                };
+                ask("years", "Years", "A year, or a range such as “1990-1999”, “2010-” or “-1985”. Leave it empty for any year.", now)
+            }
+            "rule:rename" => ask("name", "Rename the mix", "", rules.name.clone()),
+            "rule:delete" => {
+                self.close_menu();
+                {
+                    self.settings.borrow_mut().rule_mixes.retain(|rules| rules.id != rule);
+                }
+                self.rule_mixes_changed(rule);
+                self.toast(format!("Deleted “{}”", rules.name));
+                self.navigate(Route::Home);
+            }
+            _ => self.close_menu(),
+        }
+    }
+
+    /// Something typed for a rule. An empty answer clears the rule (but not the name).
+    fn set_rule_text(self: &Rc<Self>, rule: u64, field: &str, text: &str) {
+        let text = text.trim().to_string();
+        self.change_rule(rule, |rules| match field {
+            "genre" => rules.genre = text.clone(),
+            "name" => {
+                if !text.is_empty() {
+                    rules.name = text.clone();
+                }
+            }
+            _ => {
+                // "1990-1999", "2010-", "-1985" or one year.
+                let year = |part: &str| part.trim().parse::<u32>().ok().filter(|year| (1000..=9999).contains(year)).unwrap_or(0);
+                (rules.from_year, rules.to_year) = match text.split_once(['-', '–']) {
+                    Some((from, to)) => (year(from), year(to)),
+                    None => (year(&text), year(&text)),
+                };
+            }
+        });
+    }
+
+    fn new_rule_mix(self: &Rc<Self>, name: &str) {
+        let name = name.trim();
+        if name.is_empty() {
+            return;
+        }
+        let id = chrono::Utc::now().timestamp_millis() as u64;
+        self.settings.borrow_mut().rule_mixes.push(crate::mixes::Rules { id, name: name.to_string(), size: 1, ..Default::default() });
+        self.rule_mixes_changed(id);
+        self.navigate(Route::Mix(format!("rule:{id}")));
+        self.toast("Set its rules from the “…” menu");
+    }
+
+    fn change_rule(self: &Rc<Self>, rule: u64, change: impl FnOnce(&mut crate::mixes::Rules)) {
+        if let Some(rules) = self.settings.borrow_mut().rule_mixes.iter_mut().find(|rules| rules.id == rule) {
+            change(rules);
+        }
+        self.rule_mixes_changed(rule);
+    }
+
+    /// The rules of a mix changed (or it was made or deleted): keeps them, and has the mix
+    /// and the row on Home that lists it made again.
+    fn rule_mixes_changed(self: &Rc<Self>, rule: u64) {
+        self.save_settings();
+        crate::mixes::set_rules(self.settings.borrow().rule_mixes.clone());
+        self.invalidate(&format!("mix:rule:{rule}"));
+        self.invalidate("home");
+        if self.current_route() == Some(Route::Mix(format!("rule:{rule}"))) {
+            self.refresh();
+        }
     }
 
     /// Everything the server says about a song, laid out to be read.
@@ -863,6 +1054,8 @@ impl Controller {
                 }
             }
             PromptAction::SavePreset => self.save_preset(&name),
+            PromptAction::NewMix => self.new_rule_mix(&name),
+            PromptAction::RuleText { rule, field } => self.set_rule_text(rule, field, &name),
             PromptAction::DownloadsFolder => {
                 if !name.is_empty() {
                     self.move_downloads(std::path::PathBuf::from(name.trim_matches('"')));

@@ -4,7 +4,7 @@ import { ListView } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { Icons } from "icons.slint";
 import { App, Player, View, CardKind, PlaylistRef, Page, Track, Drag, Search, Suggestion } from "types.slint";
-import { Icon, IconButton, Cover, Slider, LinkText, PlayButton, HoverIntent, ScrollThumb, Reorder } from "widgets.slint";
+import { Icon, IconButton, Cover, Slider, LinkText, PlayButton, HoverIntent, ScrollThumb, Reorder, TextButton } from "widgets.slint";
 
 // Rows stop `gutter` short of a list's right edge, leaving the scrollbar a lane of its own.
 // The lists run `reach` into the panel's padding so that lane sits at the panel's edge.
@@ -1048,6 +1048,50 @@ export component QueuePanel inherits Rectangle {
                 color: Theme.faint;
                 font-size: 13px;
                 wrap: word-wrap;
+            }
+        }
+
+        // Another device has been playing since this one did anything: offer to pick it up.
+        if App.queue-tab == 0 && Player.elsewhere != "": Rectangle {
+            height: 58px;
+            Rectangle {
+                x: 4px;
+                width: parent.width - Lane.gutter + Lane.reach - 8px;
+                height: 50px;
+                border-radius: 8px;
+                background: Theme.raised;
+
+                HorizontalLayout {
+                    padding-left: 12px;
+                    padding-right: 10px;
+                    spacing: 10px;
+
+                    VerticalLayout {
+                        horizontal-stretch: 1;
+                        alignment: center;
+                        Text {
+                            text: "Playing on another device";
+                            color: Theme.muted;
+                            font-size: 11px;
+                            font-weight: 600;
+                        }
+
+                        Text {
+                            text: Player.elsewhere;
+                            color: Theme.text;
+                            font-size: 13px;
+                            overflow: elide;
+                        }
+                    }
+
+                    VerticalLayout {
+                        alignment: center;
+                        TextButton {
+                            text: "Continue here";
+                            clicked => { Player.continue-here(); }
+                        }
+                    }
+                }
             }
         }
 

@@ -140,6 +140,8 @@ pub struct Settings {
     /// Turns everything down before the equaliser, in dB (0 or negative), to leave room for
     /// bands that are turned up. Anything above 0 stands for Auto (see `eq_preamp_now`).
     pub eq_preamp: f32,
+    /// Mixes made to rules of your own (see `mixes::Rules`).
+    pub rule_mixes: Vec<crate::mixes::Rules>,
     /// Equaliser curves saved under names of your own.
     pub eq_saved: Vec<(String, [f32; 6])>,
     /// The device to play through (a cpal device id); empty follows the system default.
@@ -220,6 +222,7 @@ impl Default for Settings {
             eq_gains: [0.0; 6],
             eq_preamp: 0.0,
             eq_saved: Vec::new(),
+            rule_mixes: Vec::new(),
             output_device: String::new(),
             output_device_name: String::new(),
             exclusive: false,

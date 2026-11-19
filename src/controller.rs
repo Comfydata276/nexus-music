@@ -313,6 +313,10 @@ pub struct Controller {
     pub track_places: RefCell<HashMap<String, Vec<usize>>>,
     /// The downloads are on their way to another folder; nothing new is started meanwhile.
     pub moving_downloads: Cell<bool>,
+    /// The mix made to rules whose menu is open.
+    pub menu_rule: Cell<Option<u64>>,
+    /// What another device was playing more recently than anything was done here.
+    pub elsewhere: RefCell<Option<crate::subsonic::PlayQueue>>,
     /// Songs that have been played, newest first, including the one playing now.
     pub history: RefCell<Vec<config::Played>>,
     /// Every play and when, for "Your stats".
@@ -427,6 +431,7 @@ impl Controller {
     pub fn install(ui: ui::MainWindow) -> Rc<Controller> {
         let paths = Paths::new();
         let settings = Settings::load(&paths.settings);
+        crate::mixes::set_rules(settings.rule_mixes.clone());
         crate::audio::source::clean_stale(&paths.buffers);
         let engine = Engine::new(paths.buffers.clone(), |event| {
             post(move |ctl| ctl.on_engine_event(event));
@@ -462,6 +467,8 @@ impl Controller {
             up_next_model: Rc::new(VecModel::default()),
             track_places: RefCell::default(),
             moving_downloads: Cell::new(false),
+            menu_rule: Cell::new(None),
+            elsewhere: RefCell::default(),
             play_log: RefCell::new({
                 let recent: Vec<(String, i64)> = config::load_history(&paths.history).into_iter().map(|played| (played.song.id, played.at)).collect();
                 crate::plays::PlayLog::load(&paths.plays, &recent)
