@@ -90,6 +90,8 @@ Authentik needs three things set up once:
    Lidarr's host. With that header passed, Authentik also accepts tokens made from a user's
    app password for that host, so only do this where that is acceptable.
 
+What's planned next is in the [roadmap](ROADMAP.md).
+
 ## Installing
 
 Download `NexusMusic-Setup-<version>.exe` from the
