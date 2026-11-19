@@ -256,6 +256,17 @@ pub enum AlbumList {
     ByGenre(String),
 }
 
+/// Lyric lines with the file's own offset taken off their times, so everything after this
+/// can take the times as they are.
+fn shifted(mut lines: Vec<LyricLine>, offset: i64) -> Vec<LyricLine> {
+    if offset != 0 {
+        for line in &mut lines {
+            line.start = line.start.map(|at| (at - offset).max(0));
+        }
+    }
+    lines
+}
+
 // ---------------------------------------------------------------------------------------------
 // Client
 // ---------------------------------------------------------------------------------------------
@@ -960,10 +971,19 @@ impl Client {
         #[derive(Deserialize, Default)]
         #[serde(default, rename_all = "camelCase")]
         struct Wrap {
-            structured_lyrics: Vec<Lyrics>,
+            structured_lyrics: Vec<Offset>,
+        }
+        /// A set of lyrics as the server sends it, with the shift a lyrics file can ask for.
+        #[derive(Deserialize, Default)]
+        #[serde(default)]
+        struct Offset {
+            synced: bool,
+            line: Vec<LyricLine>,
+            /// In milliseconds: positive shows every line that much sooner.
+            offset: i64,
         }
         let wrap: Wrap = self.call("getLyricsBySongId", &[("id", song_id)], Some("lyricsList"))?;
-        let mut all = wrap.structured_lyrics;
+        let mut all: Vec<Lyrics> = wrap.structured_lyrics.into_iter().map(|set| Lyrics { synced: set.synced, line: shifted(set.line, set.offset) }).collect();
         // Prefer a synced set when the file carries both.
         all.sort_by_key(|l| !l.synced);
         Ok(all.into_iter().find(|l| !l.line.is_empty()))
@@ -1159,6 +1179,16 @@ fn network_hint(err: &ureq::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn takes_a_lyrics_file_s_offset_off_its_times() {
+        let line = |start: Option<i64>| LyricLine { start, value: "la".into() };
+        // 500 ms sooner; a line can't start before the song does.
+        let sooner = shifted(vec![line(Some(200)), line(Some(1500)), line(None)], 500);
+        assert_eq!(sooner.iter().map(|line| line.start).collect::<Vec<_>>(), [Some(0), Some(1000), None]);
+        let later = shifted(vec![line(Some(200))], -300);
+        assert_eq!(later[0].start, Some(500));
+    }
 
     #[test]
     fn normalizes_typed_addresses() {

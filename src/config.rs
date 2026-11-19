@@ -121,6 +121,9 @@ pub struct Settings {
     /// Which ReplayGain value evens out volume: 0 decides by what's playing, 1 each song's
     /// own, 2 its album's.
     pub level_mode: u8,
+    /// How much songs with no levelling tags are turned down while levelling is on, in dB
+    /// (0 or negative). Tagged songs are usually turned down by about this much.
+    pub untagged_db: f32,
     pub scrobble: bool,
     /// Whether the queue panel is showing. (Named apart from the old `queue_open`, which was
     /// never saved, so the panel starts open for everyone.)
@@ -134,6 +137,11 @@ pub struct Settings {
     pub equalizer: bool,
     /// Gain in dB for each equaliser band.
     pub eq_gains: [f32; 6],
+    /// Turns everything down before the equaliser, in dB (0 or negative), to leave room for
+    /// bands that are turned up. Anything above 0 stands for Auto (see `eq_preamp_now`).
+    pub eq_preamp: f32,
+    /// Equaliser curves saved under names of your own.
+    pub eq_saved: Vec<(String, [f32; 6])>,
     /// The device to play through (a cpal device id); empty follows the system default.
     pub output_device: String,
     pub output_device_name: String,
@@ -201,6 +209,7 @@ impl Default for Settings {
             normalize: false,
             volume_level: 1,
             level_mode: 0,
+            untagged_db: -6.0,
             scrobble: true,
             queue_panel: true,
             crossfade: 0.0,
@@ -209,6 +218,8 @@ impl Default for Settings {
             mono: false,
             equalizer: false,
             eq_gains: [0.0; 6],
+            eq_preamp: 0.0,
+            eq_saved: Vec::new(),
             output_device: String::new(),
             output_device_name: String::new(),
             exclusive: false,
@@ -307,6 +318,12 @@ pub const CACHE_AHEAD_NAMES: [&str; 5] = ["Off", "1", "3", "5", "10"];
 
 pub const UI_SCALES: [(&str, f32); 4] = [("Small", 0.9), ("Normal", 1.0), ("Large", 1.12), ("Larger", 1.25)];
 
+/// The equaliser preamp choices: the name, and the amount in dB (1 for Auto).
+pub const PREAMPS: [(&str, f32); 6] = [("Auto", 1.0), ("Off", 0.0), ("3 dB", -3.0), ("6 dB", -6.0), ("9 dB", -9.0), ("12 dB", -12.0)];
+
+/// How much to turn down songs that have no levelling tags: the name, and the amount in dB.
+pub const UNTAGGED_LEVELS: [(&str, f32); 4] = [("Leave", 0.0), ("3 dB", -3.0), ("6 dB", -6.0), ("9 dB", -9.0)];
+
 /// Streaming quality choices: name, what it costs, and the bitrate cap sent to the server
 /// (0 = the original file).
 pub const QUALITIES: [(&str, &str, u32); 4] = [
@@ -361,13 +378,18 @@ impl Settings {
         self.bitrate
     }
 
-    /// The name of the preset matching the current equaliser curve, if any.
-    pub fn eq_preset(&self) -> &'static str {
-        EQ_PRESETS
-            .iter()
-            .find(|(_, gains)| gains.iter().zip(self.eq_gains).all(|(a, b)| (a - b).abs() < 0.05))
-            .map(|(name, _)| *name)
-            .unwrap_or("Custom")
+    /// The name of the preset matching the current equaliser curve: one of the app's, one
+    /// of your own, or "Custom" for neither.
+    pub fn eq_preset(&self) -> String {
+        let same = |gains: &[f32; 6]| gains.iter().zip(self.eq_gains).all(|(a, b)| (a - b).abs() < 0.05);
+        let built_in = EQ_PRESETS.iter().find(|(_, gains)| same(gains)).map(|(name, _)| name.to_string());
+        built_in.or_else(|| self.eq_saved.iter().find(|(_, gains)| same(gains)).map(|(name, _)| name.clone())).unwrap_or_else(|| "Custom".into())
+    }
+
+    /// The preamp in use, in dB: the amount set, or for Auto exactly enough room for the
+    /// band turned up the most.
+    pub fn eq_preamp_now(&self) -> f32 {
+        if self.eq_preamp > 0.0 { -self.eq_gains.iter().fold(0.0f32, |most, gain| most.max(*gain)) } else { self.eq_preamp }
     }
 }
 
@@ -581,6 +603,24 @@ pub fn dir_size(dir: &Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_the_equaliser_curve_and_works_out_the_preamp() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.eq_preset(), EQ_PRESETS[0].0);
+        settings.eq_gains = [1.5, 0.0, -2.0, 0.0, 4.5, 3.0];
+        assert_eq!(settings.eq_preset(), "Custom");
+        settings.eq_saved.push(("Headphones".into(), settings.eq_gains));
+        assert_eq!(settings.eq_preset(), "Headphones");
+        // Off, a set amount, and Auto: as much as the band raised the most.
+        assert_eq!(settings.eq_preamp_now(), 0.0);
+        settings.eq_preamp = -3.0;
+        assert_eq!(settings.eq_preamp_now(), -3.0);
+        settings.eq_preamp = 1.0;
+        assert_eq!(settings.eq_preamp_now(), -4.5);
+        settings.eq_gains = [-3.0; 6];
+        assert_eq!(settings.eq_preamp_now(), 0.0);
+    }
 
     #[test]
     fn the_shape_of_a_queue_follows_what_is_in_it() {

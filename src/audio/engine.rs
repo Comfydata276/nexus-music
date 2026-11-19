@@ -59,6 +59,10 @@ pub struct TrackRequest {
     pub base_secs: f64,
     /// The track's length, to know when a crossfade into the next one should begin.
     pub duration_secs: f64,
+    /// It is the next track of the same album as the one before it. Such tracks run on as
+    /// the album has them, without a crossfade: a live album or a continuous mix mustn't be
+    /// blended at every track mark.
+    pub continues: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -271,6 +275,8 @@ struct Deck {
     /// The file's own sample rate and bit depth; 0 when it doesn't say.
     rate: u32,
     bits: u32,
+    /// See `TrackRequest::continues`.
+    continues: bool,
     // Declared last so the reader inside `format` is dropped before the file is deleted.
     // `None` for a downloaded copy, which is read straight from disk.
     download: Option<Download>,
@@ -298,6 +304,7 @@ impl Engine {
             failed: false,
             load_token: 0,
             next_token: 0,
+            next_continues: false,
             announced: 0,
             pending: VecDeque::new(),
             resampler: None,
@@ -313,6 +320,8 @@ impl Engine {
             fade: None,
             out: Vec::new(),
             opened_for: 0,
+            bits_asked: 0,
+            bits_given: 0,
             rate_switch: false,
             stream_title: String::new(),
             watched: Instant::now(),
@@ -384,8 +393,8 @@ impl Engine {
     }
 
     /// Gains in dB for the bands in `EQ_BANDS`.
-    pub fn set_equalizer(&self, on: bool, gains: [f32; EQ_BANDS.len()]) {
-        self.shared.effects.set_equalizer(on, gains);
+    pub fn set_equalizer(&self, on: bool, gains: [f32; EQ_BANDS.len()], preamp: f32) {
+        self.shared.effects.set_equalizer(on, gains, preamp);
     }
 
     /// The audible track and the position within it, in seconds.
@@ -433,10 +442,14 @@ impl Drop for Output {
 struct ResamplerState {
     inner: Fft<f32>,
     from_rate: u32,
+    to_rate: u32,
     input: Vec<f32>,
     output: Vec<f32>,
     /// Output frames still to drop to hide the filter's start-up delay.
     skip: usize,
+    /// Frames taken in and frames handed on so far, to end on exactly the right one.
+    fed: u64,
+    given: u64,
 }
 
 struct Worker {
@@ -455,6 +468,8 @@ struct Worker {
     failed: bool,
     load_token: u64,
     next_token: u64,
+    /// The track named to come next carries on the album that's playing (no crossfade).
+    next_continues: bool,
     announced: u64,
     /// Stereo samples at the device rate that didn't fit in the ring yet.
     pending: VecDeque<f32>,
@@ -475,8 +490,11 @@ struct Worker {
     fade: Option<Fade>,
     /// Scratch space for audio on its way out of the decoder.
     out: Vec<f32>,
-    /// The song sample rate the output was last opened for (exclusive mode follows the song).
+    /// The song sample rate the output was last opened for (exclusive mode follows the song),
+    /// the bit depth that was asked for then, and the one the device gave.
     opened_for: u32,
+    bits_asked: u32,
+    bits_given: u32,
     /// The next track needs the device at a different rate: wait for the current one to
     /// play out, then reopen.
     rate_switch: bool,
@@ -566,8 +584,10 @@ impl Worker {
             Cmd::SetNext(next) => {
                 self.next = None;
                 self.next_token = 0;
+                self.next_continues = false;
                 if let Some((client, request)) = next {
                     self.next_token = request.token;
+                    self.next_continues = request.continues;
                     self.spawn_open(client, request, Slot::Next);
                 }
             }
@@ -640,6 +660,7 @@ impl Worker {
         self.failed = false;
         self.load_token = 0;
         self.next_token = 0;
+        self.next_continues = false;
         self.announced = 0;
         self.pending.clear();
         self.resampler = None;
@@ -894,7 +915,7 @@ impl Worker {
             // Within a crossfade's length of the end, audio is set aside for blending
             // instead of being queued.
             let overlap = crossfade_for(&self.shared, deck.duration);
-            if overlap > 0.0 && deck.time >= deck.duration - overlap {
+            if overlap > 0.0 && deck.time >= deck.duration - overlap && !self.next_continues {
                 self.capturing_tail = true;
             }
             self.feed(body, rate, channels, gain);
@@ -956,6 +977,7 @@ impl Worker {
             match self.resampler.as_mut() {
                 Some(rs) => {
                     rs.input.extend_from_slice(&stereo);
+                    rs.fed += stereo.len() as u64 / 2;
                     run_resampler(rs, &mut out);
                 }
                 // Couldn't build one (absurd rates): play at the wrong speed rather than not at all.
@@ -1003,13 +1025,8 @@ impl Worker {
 
     /// Pushes the resampler's remaining audio out and retires it.
     fn drain_resampler(&mut self) {
-        let Some(mut rs) = self.resampler.take() else { return };
-        let chunk = rs.inner.input_frames_next() * 2;
-        // Enough silence to flush both the partial chunk and the filter's delay line.
-        let padded = (rs.input.len() / chunk + 2) * chunk;
-        rs.input.resize(padded, 0.0);
-        let mut out = Vec::new();
-        run_resampler(&mut rs, &mut out);
+        let Some(rs) = self.resampler.take() else { return };
+        let mut out = finish_resampler(rs);
         self.route(&mut out);
     }
 
@@ -1044,6 +1061,13 @@ impl Worker {
     fn promote_next(&mut self) {
         let Some(deck) = self.next.take() else { return };
         self.next_token = 0;
+        self.next_continues = false;
+        if deck.continues {
+            // The album carries on: whatever was held back plays as recorded, and this
+            // track follows it without a blend.
+            self.drain_resampler();
+            self.release_tail();
+        }
         if !self.tail.is_empty() {
             // The tail must be complete, resampler remainder included, before blending.
             self.drain_resampler();
@@ -1083,9 +1107,13 @@ impl Worker {
         cfg!(windows) && self.shared.choice.lock().unwrap().exclusive
     }
 
-    /// Whether the output, as opened, isn't at this track's own sample rate.
+    /// Whether the output, as opened, doesn't suit this track: it's at another sample rate,
+    /// or it's carrying fewer bits than the track has and more haven't been asked for yet.
+    /// (A track with fewer bits than the output loses nothing, so that isn't a reason.)
     fn wrong_rate_for(&self, deck: &Deck) -> bool {
-        deck.rate != 0 && deck.rate != self.opened_for
+        let rate = deck.rate != 0 && deck.rate != self.opened_for;
+        let bits = deck.bits > self.bits_given && deck.bits > self.bits_asked && self.bits_given != 0;
+        rate || bits
     }
 
     /// Opens the chosen device. `format` is the (sample rate, bit depth) of the song about to
@@ -1098,6 +1126,8 @@ impl Worker {
         let choice = self.shared.choice.lock().unwrap().clone();
         let (rate, bits) = format.filter(|f| f.0 != 0).unwrap_or((44_100, 16));
         self.opened_for = rate;
+        self.bits_asked = bits;
+        self.bits_given = 0;
         #[cfg_attr(not(windows), allow(unused_mut))]
         let mut note = String::new();
         #[cfg(windows)]
@@ -1105,6 +1135,7 @@ impl Worker {
             let device = choice.device.strip_prefix("wasapi:").unwrap_or("").to_string();
             match super::exclusive::open(self.shared.clone(), device, rate, bits) {
                 Ok(stream) => {
+                    self.bits_given = stream.bits;
                     self.set_rate(stream.rate);
                     let status = format!("Exclusive, {} at {}-bit", khz(stream.rate), stream.bits);
                     if std::env::var_os("NEXUS_TRACE").is_some() {
@@ -1163,7 +1194,23 @@ fn make_resampler(from_rate: u32, to_rate: u32) -> Option<ResamplerState> {
         Fft::<f32>::new(from_rate as usize, to_rate as usize, 1024, 2, FixedSync::Input).ok()?;
     let skip = inner.output_delay();
     let output = vec![0.0; inner.output_frames_max() * 2];
-    Some(ResamplerState { inner, from_rate, input: Vec::new(), output, skip })
+    Some(ResamplerState { inner, from_rate, to_rate, input: Vec::new(), output, skip, fed: 0, given: 0 })
+}
+
+/// The last of a resampler's audio. Getting it out means pushing silence through behind it;
+/// what comes back is cut off at the frame the track really ends on, so none of that silence
+/// is played and one track still runs straight into the next.
+fn finish_resampler(mut rs: ResamplerState) -> Vec<f32> {
+    let chunk = rs.inner.input_frames_next() * 2;
+    // Enough silence to flush both the partial chunk and the filter's delay line.
+    let padded = (rs.input.len() / chunk + 2) * chunk;
+    rs.input.resize(padded, 0.0);
+    let mut out = Vec::new();
+    run_resampler(&mut rs, &mut out);
+    let due = (rs.fed as u128 * rs.to_rate as u128).div_ceil(rs.from_rate.max(1) as u128) as u64;
+    let surplus = rs.given.saturating_sub(due) as usize * 2;
+    out.truncate(out.len().saturating_sub(surplus));
+    out
 }
 
 /// The crossfade length to use for a track, in seconds: the setting, but never more than a
@@ -1192,6 +1239,7 @@ fn run_resampler(rs: &mut ResamplerState, out: &mut Vec<f32>) {
         consumed += used.max(1) * 2;
         let skip = rs.skip.min(produced);
         rs.skip -= skip;
+        rs.given += (produced - skip) as u64;
         out.extend_from_slice(&rs.output[skip * 2..produced * 2]);
     }
     rs.input.drain(..consumed.min(rs.input.len()));
@@ -1277,6 +1325,7 @@ fn open_deck(client: Client, request: TrackRequest, dir: &std::path::Path, inter
         time: request.base_secs + start,
         rate,
         bits,
+        continues: request.continues,
         download,
     })
 }
@@ -1528,6 +1577,28 @@ mod tests {
         let back: Vec<f32> = out.iter().step_by(2).copied().collect();
         assert!(back[0] <= step && back[2000] == 0.5, "{} then {}", back[0], back[2000]);
         assert!(back.windows(2).all(|pair| pair[1] >= pair[0] && pair[1] - pair[0] <= step));
+    }
+
+    #[test]
+    fn a_resampled_track_ends_on_its_last_frame() {
+        // Just over a second of a steady tone at 44.1 kHz, played on a 48 kHz device.
+        for frames in [44_100usize, 50_000, 44_101, 1_000] {
+            let mut rs = make_resampler(44_100, 48_000).unwrap();
+            let mut out = Vec::new();
+            // Fed in the uneven pieces a decoder hands over.
+            let tone: Vec<f32> = (0..frames * 2).map(|i| 0.5 * ((i / 2) as f32 * 0.05).sin()).collect();
+            for piece in tone.chunks(2 * 1152) {
+                rs.input.extend_from_slice(piece);
+                rs.fed += piece.len() as u64 / 2;
+                run_resampler(&mut rs, &mut out);
+            }
+            out.extend(finish_resampler(rs));
+            let due = (frames * 48_000).div_ceil(44_100);
+            assert_eq!(out.len() / 2, due, "{frames} frames in");
+            // And what's at the very end is still the tone, not silence tacked on.
+            let last: f32 = out[out.len() - 200..].iter().map(|sample| sample.abs()).fold(0.0, f32::max);
+            assert!(last > 0.2, "the last frames are {last}");
+        }
     }
 
     /// Decodes a whole file the way the engine does and counts the frames it would play.

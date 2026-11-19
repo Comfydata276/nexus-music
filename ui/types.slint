@@ -484,6 +484,14 @@ export global Settings {
     in property <[string]> volume-levels;
     in property <int> volume-level;
     in property <[string]> level-modes;
+    // How much songs with no levelling tags are turned down.
+    in property <[string]> untagged-levels;
+    in property <int> untagged-level;
+    callback set-untagged-level(index: int);
+    // The equaliser's preamp: Auto, Off, or a set amount.
+    in property <[string]> preamps;
+    in property <int> preamp;
+    callback set-preamp(index: int);
     in property <int> level-mode;
     in property <bool> mono;
     in property <bool> scrobble;

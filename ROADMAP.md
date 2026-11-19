@@ -110,15 +110,16 @@ Things that lose data or interrupt the music.
 - [x] Downloads and held changes are kept per account.
 - [ ] A choice of folder for the songs kept as they play.
 
-## 7. Audio
+## 7. Audio (0.30.0)
 
-- [ ] A volume setting for songs that have no ReplayGain tags, so they don't jump out when
-      levelling is on.
-- [ ] No crossfade between consecutive tracks of the same album.
-- [ ] Exclusive mode reopens the output when the bit depth changes, not only the sample rate.
-- [ ] An equaliser preamp, and presets you can save.
-- [ ] No extra silence when a resampled song ends.
-- [ ] Lyrics honour the offset a `.lrc` file can carry, and lyrics that aren't timed say so.
+- [x] Songs that have no ReplayGain tags are turned down by a typical amount while levelling
+      is on, so they don't jump out. How much is a setting.
+- [x] No crossfade between consecutive tracks of the same album.
+- [x] Exclusive mode reopens the output when a song has more bits than the output is
+      carrying, not only when the sample rate changes.
+- [x] An equaliser preamp, with an automatic setting, and presets you can save.
+- [x] No extra silence when a resampled song ends.
+- [x] Lyrics honour the offset a `.lrc` file can carry, and lyrics that aren't timed say so.
 
 ## 8. Finding music
 

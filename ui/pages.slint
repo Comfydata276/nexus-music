@@ -1360,6 +1360,13 @@ export component LyricsPage inherits Rectangle {
                 padding-bottom: 160px;
                 spacing: 14px;
 
+                if !Lyrics.timed: Text {
+                    text: "These lyrics aren't timed, so they don't follow the song.";
+                    color: Theme.faint;
+                    font-size: 13px;
+                    font-weight: 600;
+                }
+
                 for line[index] in Lyrics.lines: Rectangle {
                     property <bool> active: Lyrics.timed && index == Lyrics.active;
                     property <bool> past: Lyrics.timed && index < Lyrics.active;
@@ -2175,6 +2182,18 @@ export component SettingsPage inherits Rectangle {
                             }
                         }
 
+                        if Settings.normalize: SettingRow {
+                            nested: true;
+                            title: "Songs with nothing to go by";
+                            detail: "Levelling goes by a tag in each file that says how much to turn the song down. A song without one is treated as if its tag said this much, which is about what most do, so it doesn't stand out louder than the rest.";
+                            Segmented {
+                                label: "Turn down songs without levelling tags by";
+                                options: Settings.untagged-levels;
+                                selected: Settings.untagged-level;
+                                chosen(index) => { Settings.set-untagged-level(index); }
+                            }
+                        }
+
                         SettingRow {
                             title: "Mono audio";
                             detail: "Plays the same sound from the left and right speakers.";
@@ -2197,6 +2216,18 @@ export component SettingsPage inherits Rectangle {
 
                         if Settings.equalizer: SettingNest {
                             EqPanel { }
+                        }
+
+                        if Settings.equalizer: SettingRow {
+                            nested: true;
+                            title: "Preamp";
+                            detail: "Turns everything down before the equaliser, so bands you've raised have room and don't distort. Auto turns it down by as much as the highest band is raised.";
+                            Segmented {
+                                label: "Equaliser preamp";
+                                options: Settings.preamps;
+                                selected: Settings.preamp;
+                                chosen(index) => { Settings.set-preamp(index); }
+                            }
                         }
                     }
 

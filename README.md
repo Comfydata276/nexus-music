@@ -17,7 +17,7 @@ What's planned next is in the [roadmap](ROADMAP.md).
 - Signs in to a Navidrome server; the password is kept in Windows Credential Manager.
 - Home, search, albums (sortable), artists, genres, playlists and Liked songs.
 - Search that forgives typing mistakes, with a preview of the best matches as you type. It runs on a copy of the library kept on your PC, so it's instant; a matching artist comes first, and songs you've liked rank above others.
-- Gapless playback or crossfade, seeking, shuffle, repeat and a queue you can edit.
+- Gapless playback or crossfade, seeking, shuffle, repeat and a queue you can edit. Crossfade leaves an album alone: its tracks run into each other as recorded.
 - A queue panel beside the page, with a play button on every row to skip straight to it.
   Drag rows to reorder the queue, or the songs in a playlist.
 - Find and sort within a playlist or Liked songs: click a column heading to sort by it, including the date each song was added.
@@ -36,8 +36,10 @@ What's planned next is in the [roadmap](ROADMAP.md).
 - Recently played: the last hundred songs, each playable again by itself.
 - Autoplay: when the queue ends it carries on with similar songs, falling back to the same
   genre when Navidrome has no similar-song source set up.
-- A six-band equaliser with presets, mono audio, and volume levelling from ReplayGain tags
-  at a quiet, normal or loud target.
+- A six-band equaliser with presets, presets of your own, and a preamp that leaves room for
+  bands you've raised (automatically, if you like). Mono audio. Volume levelling from
+  ReplayGain tags at a quiet, normal or loud target; songs with no tags are turned down by a
+  typical amount so they don't stand out.
 - Streaming quality from 96 kbps to lossless, switchable mid-song.
 - A choice of output device, and exclusive mode: the device runs at each song's own sample
   rate and receives the file's samples unchanged (bit-perfect at full volume with the

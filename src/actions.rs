@@ -58,6 +58,8 @@ pub enum PromptAction {
     CreatePlaylist(Vec<Song>),
     /// The file or folder to import playlists from was typed in.
     ImportPath,
+    /// A name for the equaliser as it's set now.
+    SavePreset,
     /// The folder to keep downloads in was typed in.
     DownloadsFolder,
     /// Ask Lidarr for an album (by its name for it), or for several by (artist, album).
@@ -473,15 +475,27 @@ impl Controller {
     /// The equaliser's preset list, shown with the same menu as everything else.
     pub fn open_preset_menu(&self, x: f32, y: f32) {
         let icons = self.ui.global::<ui::Icons>();
-        let current = self.settings.borrow().eq_preset();
-        let entries = crate::config::EQ_PRESETS
+        let settings = self.settings.borrow();
+        let current = settings.eq_preset();
+        let tick = |name: &str| if name == current { icons.get_check() } else { slint::Image::default() };
+        let mut entries: Vec<ui::MenuEntry> = crate::config::EQ_PRESETS
             .iter()
             .enumerate()
-            .map(|(index, (name, _))| {
-                let icon = if *name == current { icons.get_check() } else { slint::Image::default() };
-                self.entry(&format!("eq:{index}"), name, icon)
-            })
+            .map(|(index, (name, _))| self.entry(&format!("eq:{index}"), name, tick(name)))
             .collect();
+        // Your own, then keeping the curve as it is now, then removing the one in use.
+        if !settings.eq_saved.is_empty() {
+            entries.push(self.separator());
+            entries.extend(settings.eq_saved.iter().enumerate().map(|(index, (name, _))| self.entry(&format!("eq-mine:{index}"), name, tick(name))));
+        }
+        entries.push(self.separator());
+        entries.push(self.entry("eq-save", "Save as a preset", icons.get_list_plus()));
+        if let Some((index, (name, _))) = settings.eq_saved.iter().enumerate().find(|(_, (name, _))| *name == current) {
+            let mut delete = self.entry(&format!("eq-delete:{index}"), &format!("Delete “{name}”"), icons.get_trash_2());
+            delete.danger = true;
+            entries.push(delete);
+        }
+        drop(settings);
         self.open_menu(Target::None, "Presets", entries, x, y);
     }
 
@@ -525,6 +539,19 @@ impl Controller {
         if let Some(index) = id.strip_prefix("eq:").and_then(|i| i.parse().ok()) {
             self.close_menu();
             return self.choose_preset(index);
+        }
+        if let Some(index) = id.strip_prefix("eq-mine:").and_then(|i| i.parse().ok()) {
+            self.close_menu();
+            return self.choose_saved_preset(index);
+        }
+        if let Some(index) = id.strip_prefix("eq-delete:").and_then(|i| i.parse().ok()) {
+            self.close_menu();
+            return self.delete_saved_preset(index);
+        }
+        if id == "eq-save" {
+            self.close_menu();
+            *self.prompt.borrow_mut() = Some(PromptAction::SavePreset);
+            return self.open_prompt("Name this preset", "Keeps the equaliser as it's set now.", "Save preset", Some(""), false);
         }
         if let Some(choice) = id.strip_prefix("sleep:") {
             self.close_menu();
@@ -758,6 +785,7 @@ impl Controller {
                     self.run_import(vec![std::path::PathBuf::from(name.trim_matches('"'))]);
                 }
             }
+            PromptAction::SavePreset => self.save_preset(&name),
             PromptAction::DownloadsFolder => {
                 if !name.is_empty() {
                     self.move_downloads(std::path::PathBuf::from(name.trim_matches('"')));

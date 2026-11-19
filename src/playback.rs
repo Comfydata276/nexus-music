@@ -458,6 +458,7 @@ impl Controller {
                 start_secs: 0.0,
                 base_secs: 0.0,
                 duration_secs: 0.0,
+                continues: false,
             };
         }
         if let Some(path) = self.downloads.borrow().path_of(&song.id).filter(|_| !pb.bad_downloads.contains(&song.id)) {
@@ -475,6 +476,7 @@ impl Controller {
                 start_secs: at,
                 base_secs: 0.0,
                 duration_secs,
+                continues: false,
             };
         }
         // A copy kept from an earlier play, or fetched ahead, plays from disk too.
@@ -494,6 +496,7 @@ impl Controller {
                 start_secs: at,
                 base_secs: 0.0,
                 duration_secs,
+                continues: false,
             };
         }
         if native && cap == 0 {
@@ -510,6 +513,7 @@ impl Controller {
                 start_secs: at,
                 base_secs: 0.0,
                 duration_secs,
+                continues: false,
             }
         } else {
             // The server skips ahead for us; the stream then starts at `offset`.
@@ -527,6 +531,7 @@ impl Controller {
                 start_secs: 0.0,
                 base_secs: offset,
                 duration_secs,
+                continues: false,
             }
         }
     }
@@ -610,7 +615,17 @@ impl Controller {
             let token = pb.new_token();
             pb.next_token = token;
             pb.next_cursor = cursor;
-            self.request_for(&mut pb, &song, token, 0.0)
+            // The next track of the album that's playing runs on as the album has it.
+            let continues = pb.current().is_some_and(|now| {
+                !now.album_id.is_empty()
+                    && now.album_id == song.album_id
+                    && now.disc_number == song.disc_number
+                    && now.track > 0
+                    && song.track == now.track + 1
+            });
+            let mut request = self.request_for(&mut pb, &song, token, 0.0);
+            request.continues = continues;
+            request
         };
         self.engine.set_next(Some((client, request)));
     }
@@ -1483,7 +1498,7 @@ impl Controller {
         self.engine.set_output(&settings.output_device, settings.exclusive);
         self.engine.set_crossfade(settings.crossfade);
         self.engine.set_mono(settings.mono);
-        self.engine.set_equalizer(settings.equalizer, settings.eq_gains);
+        self.engine.set_equalizer(settings.equalizer, settings.eq_gains, settings.eq_preamp_now());
     }
 
     /// Restarts the current track where it is, to pick up a setting that's fixed when a
@@ -2298,7 +2313,12 @@ fn level_gain(settings: &Settings, song: &Song, album_run: bool) -> f32 {
     if !settings.normalize {
         return 1.0;
     }
-    let Some(tags) = song.replay_gain.as_ref() else { return 1.0 };
+    let (_, offset) = VOLUME_LEVELS[(settings.volume_level as usize).min(VOLUME_LEVELS.len() - 1)];
+    // A song with no tags to go by is treated as if its tag said a set amount, about what a
+    // typical song's does, so it doesn't jump out among tagged ones. Never turned up: nothing
+    // says how much room its peaks leave. (0 leaves such songs exactly as they are.)
+    let untagged = if settings.untagged_db < 0.0 { 10f32.powf((settings.untagged_db + offset) / 20.0).min(1.0) } else { 1.0 };
+    let Some(tags) = song.replay_gain.as_ref() else { return untagged };
     // Album gain turns a whole album up or down by one amount, keeping its songs in
     // proportion; it falls back to the song's own value when the album one is missing.
     let by_album = match settings.level_mode {
@@ -2310,10 +2330,9 @@ fn level_gain(settings: &Settings, song: &Song, album_run: bool) -> f32 {
         (true, Some(album_gain)) => (album_gain, tags.album_peak.or(tags.track_peak)),
         _ => match tags.track_gain {
             Some(track_gain) => (track_gain, tags.track_peak),
-            None => return 1.0,
+            None => return untagged,
         },
     };
-    let (_, offset) = VOLUME_LEVELS[(settings.volume_level as usize).min(VOLUME_LEVELS.len() - 1)];
     let gain = 10f32.powf((gain_db + offset) / 20.0);
     // Quiet and Normal never push a track's peaks past full scale. Loud may, by up to 3 dB,
     // and the limiter rounds those peaks off: that's the quality cost of the Loud setting.
@@ -2341,6 +2360,34 @@ mod tests {
 
     fn named(id: &str) -> Song {
         Song { id: id.to_string(), ..Default::default() }
+    }
+
+    #[test]
+    fn turns_down_songs_that_have_no_levelling_tags() {
+        let level = |settings: &Settings| level_gain(settings, &named("untagged"), false);
+        let decibels = |gain: f32| 20.0 * gain.log10();
+        // Treated as tagged "6 dB down" unless told otherwise: at the Quiet level (1 dB under
+        // the tags' own reference) that's 7 dB down, at Normal (4 dB over it) 2 dB down.
+        let mut settings = Settings { normalize: true, volume_level: 0, ..Default::default() };
+        assert!((decibels(level(&settings)) + 7.0).abs() < 0.01);
+        settings.volume_level = 1;
+        assert!((decibels(level(&settings)) + 2.0).abs() < 0.01);
+        settings.untagged_db = -9.0;
+        assert!((decibels(level(&settings)) + 5.0).abs() < 0.01);
+        // Never up: nothing says how much room the song's peaks leave.
+        settings.untagged_db = -3.0;
+        assert_eq!(level(&settings), 1.0);
+        // "Leave" leaves them exactly as they are, at every level.
+        settings.untagged_db = 0.0;
+        settings.volume_level = 0;
+        assert_eq!(level(&settings), 1.0);
+        // With levelling off, nothing is touched.
+        settings = Settings { normalize: false, untagged_db: -9.0, ..Default::default() };
+        assert_eq!(level(&settings), 1.0);
+        // A song with tags that say nothing about the track goes the same way as one without.
+        let empty = Song { replay_gain: Some(ReplayGain { track_gain: None, album_gain: None, track_peak: None, album_peak: None }), ..Default::default() };
+        let settings = Settings { normalize: true, volume_level: 1, ..Default::default() };
+        assert!((decibels(level_gain(&settings, &empty, false)) + 2.0).abs() < 0.01);
     }
 
     /// A queue of these songs, each from the same place in its list, playing the one at `cursor`.

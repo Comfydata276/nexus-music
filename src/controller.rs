@@ -3263,6 +3263,10 @@ impl Controller {
         page.set_volume_level(settings.volume_level as i32);
         page.set_level_modes(strings(config::LEVEL_MODES.to_vec()));
         page.set_level_mode(settings.level_mode.min(2) as i32);
+        page.set_untagged_levels(strings(config::UNTAGGED_LEVELS.iter().map(|level| level.0).collect()));
+        page.set_untagged_level(config::UNTAGGED_LEVELS.iter().position(|level| (level.1 - settings.untagged_db).abs() < 0.1).unwrap_or(0) as i32);
+        page.set_preamps(strings(config::PREAMPS.iter().map(|preamp| preamp.0).collect()));
+        page.set_preamp(config::PREAMPS.iter().position(|preamp| (preamp.1 - settings.eq_preamp).abs() < 0.1).unwrap_or(1) as i32);
         page.set_mono(settings.mono);
         page.set_scrobble(settings.scrobble);
         page.set_equalizer(settings.equalizer);
@@ -3635,6 +3639,20 @@ impl Controller {
                 ctl.reload_current();
             });
         });
+        settings.on_set_untagged_level(|index| {
+            with(|ctl| {
+                let (_, db) = config::UNTAGGED_LEVELS[(index.max(0) as usize).min(config::UNTAGGED_LEVELS.len() - 1)];
+                ctl.change_setting(true, |s| s.untagged_db = db);
+                // How loud a song plays is fixed when it loads.
+                ctl.reload_current();
+            });
+        });
+        settings.on_set_preamp(|index| {
+            with(|ctl| {
+                let (_, db) = config::PREAMPS[(index.max(0) as usize).min(config::PREAMPS.len() - 1)];
+                ctl.change_setting(true, |s| s.eq_preamp = db);
+            });
+        });
         settings.on_set_mono(|on| {
             with(|ctl| ctl.change_setting(true, |s| s.mono = on));
         });
@@ -3978,5 +3996,38 @@ impl Controller {
                 s.equalizer = true;
             });
         }
+    }
+
+    /// Applies one of your own saved equaliser curves.
+    pub fn choose_saved_preset(&self, index: usize) {
+        let saved = self.settings.borrow().eq_saved.get(index).map(|(_, gains)| *gains);
+        if let Some(gains) = saved {
+            self.change_setting(true, |s| {
+                s.eq_gains = gains;
+                s.equalizer = true;
+            });
+        }
+    }
+
+    /// Keeps the equaliser as it's set now under a name; the same name again replaces it.
+    pub fn save_preset(&self, name: &str) {
+        let name = name.trim().to_string();
+        if name.is_empty() || EQ_PRESETS.iter().any(|(built_in, _)| *built_in == name) {
+            return self.toast("That name is taken by one of the presets that come with the app.");
+        }
+        self.change_setting(true, |s| {
+            let gains = s.eq_gains;
+            s.eq_saved.retain(|(other, _)| *other != name);
+            s.eq_saved.push((name.clone(), gains));
+        });
+        self.toast(format!("Saved “{name}”"));
+    }
+
+    pub fn delete_saved_preset(&self, index: usize) {
+        self.change_setting(true, |s| {
+            if index < s.eq_saved.len() {
+                s.eq_saved.remove(index);
+            }
+        });
     }
 }

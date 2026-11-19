@@ -15,6 +15,8 @@ pub struct Controls {
     pub mono: AtomicBool,
     eq_on: AtomicBool,
     eq_gains: [AtomicU32; 6],
+    /// Linear gain applied before the bands, to leave room for the ones turned up.
+    eq_preamp: AtomicU32,
     /// Bumped on every equaliser change so the audio thread knows to recompute its filters.
     eq_version: AtomicU64,
 }
@@ -25,14 +27,17 @@ impl Controls {
             mono: AtomicBool::new(false),
             eq_on: AtomicBool::new(false),
             eq_gains: std::array::from_fn(|_| AtomicU32::new(0f32.to_bits())),
+            eq_preamp: AtomicU32::new(1f32.to_bits()),
             eq_version: AtomicU64::new(1),
         }
     }
 
-    pub fn set_equalizer(&self, on: bool, gains: [f32; 6]) {
+    /// `preamp` is in dB, 0 or below.
+    pub fn set_equalizer(&self, on: bool, gains: [f32; 6], preamp: f32) {
         for (slot, gain) in self.eq_gains.iter().zip(gains) {
             slot.store(gain.clamp(-EQ_RANGE, EQ_RANGE).to_bits(), Ordering::Relaxed);
         }
+        self.eq_preamp.store(10f32.powf(preamp.clamp(-EQ_RANGE, 0.0) / 20.0).to_bits(), Ordering::Relaxed);
         self.eq_on.store(on, Ordering::Relaxed);
         self.eq_version.fetch_add(1, Ordering::Relaxed);
     }
@@ -124,12 +129,13 @@ pub struct Effects {
     rate: f32,
     version: u64,
     active: bool,
+    preamp: f32,
     bands: [Biquad; 6],
 }
 
 impl Effects {
     pub fn new(rate: u32) -> Effects {
-        Effects { rate: rate.max(8000) as f32, version: 0, active: false, bands: [Biquad::default(); 6] }
+        Effects { rate: rate.max(8000) as f32, version: 0, active: false, preamp: 1.0, bands: [Biquad::default(); 6] }
     }
 
     /// Processes interleaved stereo in place.
@@ -149,12 +155,13 @@ impl Effects {
                 };
                 band.set(shape, EQ_BANDS[index], gain, self.rate);
             }
-            self.active = on && any;
+            self.preamp = f32::from_bits(controls.eq_preamp.load(Ordering::Relaxed));
+            self.active = on && (any || self.preamp < 0.999);
         }
         if self.active {
             for frame in samples.chunks_exact_mut(2) {
                 for (channel, sample) in frame.iter_mut().enumerate() {
-                    let mut value = *sample;
+                    let mut value = *sample * self.preamp;
                     for band in self.bands.iter_mut() {
                         value = band.run(channel, value);
                     }
@@ -179,9 +186,13 @@ mod tests {
 
     /// Level of a sine at `frequency` after the equaliser, in dB relative to the input.
     fn response(gains: [f32; 6], frequency: f32) -> f32 {
+        response_with(gains, 0.0, frequency)
+    }
+
+    fn response_with(gains: [f32; 6], preamp: f32, frequency: f32) -> f32 {
         let rate = 48_000;
         let controls = Controls::new();
-        controls.set_equalizer(true, gains);
+        controls.set_equalizer(true, gains, preamp);
         let mut effects = Effects::new(rate);
         let mut samples: Vec<f32> = (0..rate * 2)
             .flat_map(|n| {
@@ -219,5 +230,17 @@ mod tests {
         assert_eq!(soft_clip(0.5), 0.5);
         assert!(soft_clip(3.0) <= 1.0 && soft_clip(3.0) > 0.95);
         assert!(soft_clip(-3.0) >= -1.0);
+    }
+
+    #[test]
+    fn the_preamp_turns_everything_down_before_the_bands() {
+        // Flat bands with 6 dB of preamp: 6 dB quieter everywhere.
+        assert!((response_with([0.0; 6], -6.0, 1000.0) + 6.0).abs() < 0.2);
+        // A 6 dB boost at 1 kHz with 6 dB of preamp comes out level there, and quieter elsewhere.
+        let boosted = [0.0, 0.0, 0.0, 6.0, 0.0, 0.0];
+        assert!(response_with(boosted, -6.0, 1000.0).abs() < 0.3);
+        assert!((response_with(boosted, -6.0, 60.0) + 6.0).abs() < 0.5);
+        // It only ever turns down.
+        assert!(response_with([0.0; 6], 6.0, 1000.0).abs() < 0.2);
     }
 }
