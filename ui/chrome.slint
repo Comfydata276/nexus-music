@@ -793,6 +793,8 @@ component QueueRow inherits Rectangle {
     in property <int> count;
     in property <length> list-top;
     in property <length> list-bottom;
+    // The keyboard is on this row.
+    in property <bool> focused;
     callback play;
     callback menu(x: length, y: length);
     callback reordered(from: int, delta: int);
@@ -800,7 +802,9 @@ component QueueRow inherits Rectangle {
 
     height: 64px;
     border-radius: 6px;
-    background: touch.has-hover || reorder.dragging ? Theme.hover : transparent;
+    background: touch.has-hover || reorder.dragging || self.focused ? Theme.hover : transparent;
+    border-width: self.focused ? 1px : 0px;
+    border-color: Theme.accent;
     opacity: reorder.dragging ? 0.55 : root.track.unavailable ? 0.4 : 1;
 
     reorder := Reorder {
@@ -1092,6 +1096,17 @@ export component QueuePanel inherits Rectangle {
         if App.queue-tab == 0: Rectangle {
             vertical-stretch: 1;
             upcoming := ListView {
+                // Keep the row the keyboard is on in view.
+                property <int> cursor: App.keys-in-queue ? Player.queue-cursor : -1;
+                changed cursor => {
+                    if self.cursor >= 0 {
+                        if -self.content-y > self.cursor * 64px {
+                            self.content-y = -self.cursor * 64px;
+                        } else if -self.content-y + self.visible-height < (self.cursor + 1) * 64px {
+                            self.content-y = self.visible-height - (self.cursor + 1) * 64px;
+                        }
+                    }
+                }
                 x: 0;
                 width: parent.width + Lane.reach;
                 height: parent.height;
@@ -1106,6 +1121,7 @@ export component QueuePanel inherits Rectangle {
                         can-reorder: true;
                         index: index;
                         count: Player.queue.length;
+                        focused: App.keys-in-queue && index == Player.queue-cursor;
                         list-top: upcoming.absolute-position.y;
                         list-bottom: upcoming.absolute-position.y + upcoming.height;
                         play => { Player.queue-activated(index); }

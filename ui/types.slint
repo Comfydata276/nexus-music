@@ -183,6 +183,8 @@ export global App {
     callback set-queue-open(open: bool);
     // Which tab the queue panel shows: 0 the queue, 1 recently played.
     in-out property <int> queue-tab;
+    // The arrow keys act on the queue panel instead of the page.
+    in-out property <bool> keys-in-queue;
     // Bumped to move keyboard focus into the search box.
     in-out property <int> search-focus;
     // Bumped to move keyboard focus out of the search box, back to the window's shortcuts.
@@ -313,6 +315,14 @@ export global View {
     callback rows-dropped(index: int, target: string);
     callback select-all();
     callback clear-selection();
+    // Keyboard: move the selection by this many rows (extending it with Shift held), play
+    // what's selected, take it out of the playlist. `cursor-row` is the row the keyboard is
+    // on (-1 for none) and `reveal-tick` changes when that row should be scrolled into view.
+    in property <int> cursor-row: -1;
+    in property <int> reveal-tick;
+    callback move-selection(delta: int, extend: bool);
+    callback activate-selection();
+    callback remove-selection();
     callback download();
     callback set-filter(text: string);
     callback choose-track-sort(x: length, y: length);
@@ -371,6 +381,11 @@ export global Player {
     callback seek(seconds: float);
     callback set-volume(volume: float);
     callback toggle-mute();
+    // Jump forwards or back by this many seconds.
+    callback seek-by(seconds: float);
+    // The row of the queue panel the keyboard is on, -1 for none.
+    in-out property <int> queue-cursor: -1;
+    callback queue-remove(index: int);
     callback toggle-shuffle();
     callback cycle-repeat();
     callback toggle-star();
@@ -396,6 +411,11 @@ export global Menu {
     in property <length> y;
     in property <string> title;
     in property <[MenuEntry]> entries;
+    // The entry the keyboard is on (-1 for none) and how far down the menu it is.
+    in-out property <int> cursor: -1;
+    in property <length> cursor-y;
+    callback move(delta: int);
+    callback accept();
     callback activated(id: string);
     callback dismissed();
 }

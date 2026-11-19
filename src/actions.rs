@@ -2,7 +2,7 @@
 
 use std::rc::Rc;
 
-use slint::{ComponentHandle, ModelRc, VecModel};
+use slint::{ComponentHandle, ModelRc, VecModel, Model as _};
 
 use crate::controller::{Controller, Route, with};
 use crate::subsonic::Song;
@@ -94,6 +94,37 @@ impl Controller {
 
     fn close_menu(&self) {
         self.ui.global::<ui::Menu>().set_open(false);
+    }
+
+    /// Does what choosing `id` from the open menu would, if the menu offers it; either way
+    /// the menu is closed. For keys that are shortcuts for a menu entry.
+    pub fn act_on_menu(self: &Rc<Self>, id: &str) {
+        let offered = self.ui.global::<ui::Menu>().get_entries().iter().any(|entry| entry.id == id);
+        if offered {
+            self.menu_activated(id);
+        }
+        self.close_menu();
+    }
+
+    /// An arrow key in a menu: moves to the next entry that way, round the ends.
+    fn move_menu_cursor(&self, delta: i32) {
+        let menu = self.ui.global::<ui::Menu>();
+        let entries: Vec<ui::MenuEntry> = menu.get_entries().iter().collect();
+        let count = entries.len() as i32;
+        if !entries.iter().any(|entry| !entry.separator) {
+            return;
+        }
+        // From no entry, down lands on the first and up on the last.
+        let mut at = if menu.get_cursor() < 0 && delta < 0 { count } else { menu.get_cursor() };
+        loop {
+            at = (at + delta.signum()).rem_euclid(count);
+            if !entries[at as usize].separator {
+                break;
+            }
+        }
+        let above: f32 = entries[..at as usize].iter().map(|entry| if entry.separator { 9.0 } else { 38.0 }).sum();
+        menu.set_cursor(at);
+        menu.set_cursor_y(4.0 + if menu.get_title().is_empty() { 0.0 } else { 34.0 } + above);
     }
 
     /// The user's rating for a song, 0 to 5, counting changes made in this session.
@@ -1043,6 +1074,18 @@ impl Controller {
         });
         menu.on_dismissed(|| {
             with(|ctl| ctl.close_menu());
+        });
+        menu.on_move(|delta| {
+            with(|ctl| ctl.move_menu_cursor(delta));
+        });
+        menu.on_accept(|| {
+            with(|ctl| {
+                let menu = ctl.ui.global::<ui::Menu>();
+                let chosen = usize::try_from(menu.get_cursor()).ok().and_then(|at| menu.get_entries().row_data(at));
+                if let Some(entry) = chosen.filter(|entry| !entry.separator) {
+                    ctl.menu_activated(&entry.id);
+                }
+            });
         });
         let prompt = self.ui.global::<ui::Prompt>();
         prompt.on_confirmed(|text| {

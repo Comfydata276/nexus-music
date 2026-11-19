@@ -1631,6 +1631,11 @@ impl Controller {
             .collect();
         drop(pb);
         self.up_next_model.set_vec(rows.iter().take(UP_NEXT_ROWS).cloned().collect::<Vec<_>>());
+        // The keyboard's row in the queue panel can't be past the end of it.
+        let player = self.ui.global::<ui::Player>();
+        if player.get_queue_cursor() >= rows.len() as i32 {
+            player.set_queue_cursor(rows.len() as i32 - 1);
+        }
         self.queue_model.set_vec(rows);
     }
 
@@ -2021,6 +2026,21 @@ impl Controller {
         });
         player.on_set_volume(|volume| {
             with(|ctl| ctl.set_volume(volume));
+        });
+        player.on_seek_by(|seconds| {
+            with(|ctl| {
+                let (position, duration) = {
+                    let pb = ctl.playback.borrow();
+                    (pb.position, pb.current().map_or(0.0, |song| song.duration as f64))
+                };
+                // A radio station has no length to move about in.
+                if duration > 0.0 {
+                    ctl.seek((position + seconds as f64).clamp(0.0, (duration - 1.0).max(0.0)));
+                }
+            });
+        });
+        player.on_queue_remove(|index| {
+            with(|ctl| ctl.remove_upcoming(index.max(0) as usize));
         });
         player.on_toggle_mute(|| {
             with(|ctl| {

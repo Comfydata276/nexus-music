@@ -1004,6 +1004,19 @@ export component TrackListPage inherits Rectangle {
     property <bool> stuck: self.scrolled > self.hero-height;
     // The date column gives way first when the window is narrow.
     property <bool> show-added: View.show-added && self.width >= 860px;
+    // The keyboard moved to a row: bring it into view, clear of the bar stuck to the top.
+    property <length> cursor-top: self.header-height + View.cursor-row * self.row-height
+        + View.tracks[View.cursor-row].sections-before * self.section-height;
+    property <int> reveal: View.reveal-tick;
+    changed reveal => {
+        if View.cursor-row >= 0 {
+            if self.scrolled > self.cursor-top - 88px {
+                scroll.content-y = min(0px, -(self.cursor-top - 88px));
+            } else if self.scrolled + scroll.visible-height < self.cursor-top + self.row-height + 8px {
+                scroll.content-y = scroll.visible-height - self.cursor-top - self.row-height - 8px;
+            }
+        }
+    }
 
     scroll := ScrollView {
         vertical-scrollbar-policy: always-off;
@@ -1499,6 +1512,9 @@ export component NowPlayingPage inherits Rectangle {
                     // A glance at what's coming; the queue panel has the rest.
                     height: 60px;
                     border-radius: 6px;
+                    accessible-role: list-item;
+                    accessible-label: track.title + ", " + track.artist;
+                    accessible-action-default => { Player.queue-activated(index); }
                     background: next-touch.has-hover ? Theme.hover : transparent;
 
                     next-touch := TouchArea {

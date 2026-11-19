@@ -279,6 +279,8 @@ export component MainWindow inherits Window {
         : App.page == Page.now-playing ? Covers.tint(Player.track.cover, Covers.rev)
         : self.tinted ? Covers.tint(View.cover, Covers.rev)
         : App.page == Page.home ? Theme.accent : Theme.panel;
+    // The queue panel is on screen and showing what's coming up, so the keyboard can go to it.
+    property <bool> queue-usable: App.queue-open && self.width >= 1000px && App.queue-tab == 0 && Player.queue.length > 0;
     // The Rust side bumps this after navigating, to take the keyboard back from the search box.
     property <int> focus-request: App.main-focus;
     changed focus-request => { keys.focus(); }
@@ -287,6 +289,19 @@ export component MainWindow inherits Window {
         key-pressed(event) => {
             if Prompt.open || !App.signed-in {
                 return reject;
+            }
+            // A menu that's open takes the arrow keys and Enter.
+            if Menu.open && event.text == Key.DownArrow {
+                Menu.move(1);
+                return accept;
+            }
+            if Menu.open && event.text == Key.UpArrow {
+                Menu.move(-1);
+                return accept;
+            }
+            if Menu.open && event.text == Key.Return {
+                Menu.accept();
+                return accept;
             }
             if event.text == " " {
                 Player.toggle();
@@ -345,6 +360,99 @@ export component MainWindow inherits Window {
             if event.modifiers.control && event.text == "a" && (App.page == Page.tracklist || App.page == Page.search || App.page == Page.artist) {
                 View.select-all();
                 return accept;
+            }
+            if event.modifiers.control || event.modifiers.meta {
+                return reject;
+            }
+            // Tab or F6 moves the arrow keys between the page and the queue panel.
+            if (event.text == Key.Tab || event.text == Key.F6) && !event.modifiers.alt && root.queue-usable {
+                App.keys-in-queue = !App.keys-in-queue;
+                if App.keys-in-queue && Player.queue-cursor < 0 {
+                    Player.queue-cursor = 0;
+                }
+                return accept;
+            }
+            if App.keys-in-queue && root.queue-usable {
+                if event.text == Key.DownArrow && event.modifiers.alt && Player.queue-cursor >= 0 && Player.queue-cursor < Player.queue.length - 1 {
+                    Player.queue-moved(Player.queue-cursor, 1);
+                    Player.queue-cursor += 1;
+                    return accept;
+                }
+                if event.text == Key.UpArrow && event.modifiers.alt && Player.queue-cursor > 0 {
+                    Player.queue-moved(Player.queue-cursor, -1);
+                    Player.queue-cursor -= 1;
+                    return accept;
+                }
+                if event.text == Key.DownArrow {
+                    Player.queue-cursor = min(Player.queue.length - 1, Player.queue-cursor + 1);
+                    return accept;
+                }
+                if event.text == Key.UpArrow {
+                    Player.queue-cursor = max(0, Player.queue-cursor - 1);
+                    return accept;
+                }
+                if event.text == Key.Return && Player.queue-cursor >= 0 {
+                    Player.queue-activated(Player.queue-cursor);
+                    return accept;
+                }
+                if (event.text == Key.Delete || event.text == Key.Backspace) && Player.queue-cursor >= 0 {
+                    Player.queue-remove(Player.queue-cursor);
+                    return accept;
+                }
+            }
+            if event.modifiers.alt {
+                return reject;
+            }
+            if event.text == Key.LeftArrow {
+                Player.seek-by(-5);
+                return accept;
+            }
+            if event.text == Key.RightArrow {
+                Player.seek-by(5);
+                return accept;
+            }
+            if event.text == "m" {
+                Player.toggle-mute();
+                return accept;
+            }
+            if !App.keys-in-queue && (App.page == Page.tracklist || App.page == Page.search || App.page == Page.artist) {
+                if event.text == Key.DownArrow {
+                    View.move-selection(1, event.modifiers.shift);
+                    return accept;
+                }
+                if event.text == Key.UpArrow {
+                    View.move-selection(-1, event.modifiers.shift);
+                    return accept;
+                }
+                if event.text == Key.PageDown {
+                    View.move-selection(10, event.modifiers.shift);
+                    return accept;
+                }
+                if event.text == Key.PageUp {
+                    View.move-selection(-10, event.modifiers.shift);
+                    return accept;
+                }
+                if event.text == Key.Home {
+                    View.move-selection(-1000000, event.modifiers.shift);
+                    return accept;
+                }
+                if event.text == Key.End {
+                    View.move-selection(1000000, event.modifiers.shift);
+                    return accept;
+                }
+                if event.text == Key.Return && View.cursor-row >= 0 {
+                    View.activate-selection();
+                    return accept;
+                }
+                if event.text == Key.Delete && View.cursor-row >= 0 {
+                    View.remove-selection();
+                    return accept;
+                }
+                // The menu key, or Shift+F10: what right-clicking the row would offer.
+                if (event.text == Key.Menu || (event.text == Key.F10 && event.modifiers.shift)) && View.cursor-row >= 0 {
+                    View.track-menu(View.cursor-row, root.width * 0.45, root.height * 0.4);
+                    return accept;
+                }
             }
             return reject;
         }

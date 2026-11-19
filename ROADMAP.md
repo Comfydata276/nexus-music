@@ -76,13 +76,17 @@ Things that lose data or interrupt the music.
 - [x] Offline, the app knows which songs it has without asking the disk for every row.
 - [x] Large stored pages are read away from the UI thread.
 
-## 4. Keyboard
+## 4. Keyboard (0.27.0)
 
-- [ ] Arrow keys, Enter to play, Delete to remove and Shift with the arrows to select, in
-      song lists and the queue.
-- [ ] Left and Right to seek, M to mute.
-- [ ] Menus work from the keyboard, and a long "Add to playlist" menu scrolls.
-- [ ] Accessibility labels on the controls that lack them.
+- [x] Arrow keys, Page Up and Down, Home and End move through the songs on a page, Enter
+      plays, Delete removes from a playlist, and Shift with the arrows selects.
+- [x] The same in the queue panel, reached with Tab or F6: Enter plays, Delete removes,
+      Alt with the arrows moves a song up or down.
+- [x] Left and Right to seek, M to mute.
+- [x] The menu key opens the menu for what's selected; menus work with the arrows and Enter,
+      and a long "Add to playlist" menu scrolls.
+- [x] Links and the "Up next" rows can be named and used by a screen reader.
+- [ ] On search results and artist pages the list doesn't yet scroll to follow the keyboard.
 
 ## 5. Playlists you can trust
 

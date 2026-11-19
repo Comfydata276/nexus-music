@@ -70,9 +70,28 @@ What's planned next is in the [roadmap](ROADMAP.md).
   colours. Six colour themes and an interface size setting.
 - Previous, play and next buttons on the taskbar thumbnail.
 
-Keyboard: Space plays or pauses, Ctrl+Left/Right changes track, Ctrl+Up/Down changes
-volume, Ctrl+K jumps to search, Ctrl+, opens Settings, Alt+Left/Right goes back and forward,
-F5 reloads the page.
+### Keyboard
+
+| Keys | What they do |
+|---|---|
+| Space | Play or pause |
+| Left, Right | Back or forward five seconds |
+| Ctrl+Left, Ctrl+Right | Previous or next track |
+| Ctrl+Up, Ctrl+Down | Volume |
+| M | Mute |
+| Up, Down, Page Up, Page Down, Home, End | Move through the songs on the page |
+| Shift with any of those | Select from where you started to where you've moved |
+| Ctrl+A | Select every song on the page |
+| Enter | Play the song you're on |
+| Delete | Take the selected songs out of the playlist |
+| Menu key, or Shift+F10 | Open the menu for the selected songs; the arrows and Enter work in it |
+| Tab, or F6 | Move the arrow keys to the queue panel and back |
+| In the queue: Enter, Delete, Alt+Up, Alt+Down | Play that song, remove it, move it up or down |
+| Ctrl+K | Search |
+| Ctrl+, | Settings |
+| Alt+Left, Alt+Right | Back and forward |
+| F5 | Reload the page |
+| Esc | Close a menu, clear the selection |
 
 ### Requests when Lidarr is behind Authentik
 

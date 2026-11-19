@@ -285,6 +285,8 @@ pub struct Controller {
     /// Rows of the song list that are selected, and the row a Shift-click extends from.
     pub selection: RefCell<std::collections::BTreeSet<usize>>,
     selection_anchor: Cell<Option<usize>>,
+    /// The row the keyboard is on.
+    selection_cursor: Cell<Option<usize>>,
     pub queue_model: Rc<VecModel<ui::Track>>,
     /// The first few rows of the queue, for Now Playing's glance at what's next.
     pub up_next_model: Rc<VecModel<ui::Track>>,
@@ -430,6 +432,7 @@ impl Controller {
             play_from: RefCell::new(None),
             selection: RefCell::default(),
             selection_anchor: Cell::new(None),
+            selection_cursor: Cell::new(None),
             queue_model: Rc::new(VecModel::default()),
             up_next_model: Rc::new(VecModel::default()),
             track_places: RefCell::default(),
@@ -2463,6 +2466,7 @@ impl Controller {
         self.ui.global::<ui::View>().set_track_sections(sections);
         self.tracks_model.set_vec(rows);
         self.track_places.borrow_mut().clear();
+        self.set_cursor_row(None, false);
         // The rows are new, so nothing is selected any more.
         self.selection.borrow_mut().clear();
         self.selection_anchor.set(None);
@@ -2506,12 +2510,59 @@ impl Controller {
                 self.selection_anchor.set(Some(row));
             }
         }
+        self.set_cursor_row(Some(row), false);
         self.set_selection(rows);
     }
 
     pub fn clear_selection(&self) {
         self.selection_anchor.set(None);
+        self.set_cursor_row(None, false);
         self.set_selection(Default::default());
+    }
+
+    /// Notes which row the keyboard is on, and has it scrolled into view if asked.
+    fn set_cursor_row(&self, row: Option<usize>, reveal: bool) {
+        self.selection_cursor.set(row);
+        let view = self.ui.global::<ui::View>();
+        view.set_cursor_row(row.map_or(-1, |row| row as i32));
+        if reveal {
+            view.set_reveal_tick(view.get_reveal_tick().wrapping_add(1));
+        }
+    }
+
+    /// An arrow key: moves the keyboard's row by `delta` and selects it, or with Shift held
+    /// selects everything from where the selection started to it.
+    fn move_selection(&self, delta: i32, extend: bool) {
+        let count = self.tracks_model.row_count();
+        if count == 0 {
+            return;
+        }
+        let row = match self.selection_cursor.get() {
+            Some(at) => (at as i64 + delta as i64).clamp(0, count as i64 - 1) as usize,
+            // Nothing chosen yet: start at the top going down, at the bottom going up.
+            None if delta > 0 => 0,
+            None => count - 1,
+        };
+        let rows = match (extend, self.selection_anchor.get()) {
+            (true, Some(anchor)) => (row.min(anchor)..=row.max(anchor)).collect(),
+            _ => {
+                self.selection_anchor.set(Some(row));
+                [row].into()
+            }
+        };
+        self.set_cursor_row(Some(row), true);
+        self.set_selection(rows);
+    }
+
+    /// Delete: takes the selected songs out of the playlist on screen, the same as the menu's
+    /// "Remove from this playlist".
+    fn remove_selection(self: &Rc<Self>) {
+        let Some(row) = self.selection_cursor.get() else { return };
+        if self.page.borrow().playlist.is_none() {
+            return;
+        }
+        self.open_track_menu(row, 0.0, 0.0);
+        self.act_on_menu("remove-playlist");
     }
 
     /// The rows an action on `row` applies to: the whole selection if `row` is part of one,
@@ -3256,6 +3307,19 @@ impl Controller {
         });
         view.on_track_activated(|index| {
             with(|ctl| ctl.play_page_track(index as usize));
+        });
+        view.on_move_selection(|delta, extend| {
+            with(|ctl| ctl.move_selection(delta, extend));
+        });
+        view.on_activate_selection(|| {
+            with(|ctl| {
+                if let Some(row) = ctl.selection_cursor.get() {
+                    ctl.play_page_track(row);
+                }
+            });
+        });
+        view.on_remove_selection(|| {
+            with(|ctl| ctl.remove_selection());
         });
         view.on_track_moved(|index, delta| {
             with(|ctl| ctl.move_playlist_track(index.max(0) as usize, (index + delta).max(0) as usize));

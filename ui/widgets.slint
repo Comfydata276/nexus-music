@@ -152,10 +152,21 @@ export component LinkText inherits Rectangle {
     min-width: 0px;
     horizontal-stretch: 0;
 
+    // A link: a screen reader can name it and follow it.
+    accessible-role: button;
+    accessible-label: self.text;
+    accessible-enabled: self.enabled;
+    accessible-action-default => {
+        if self.enabled {
+            self.clicked();
+        }
+    }
+
     label := Text {
         x: 0;
         width: min(parent.width, self.preferred-width);
         text: root.text;
+        accessible-role: none;
         color: touch.has-hover && root.enabled ? Theme.text : root.ink;
         font-size: root.font-size;
         font-weight: root.font-weight;
