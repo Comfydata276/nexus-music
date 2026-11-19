@@ -2559,6 +2559,15 @@ export component SettingsPage inherits Rectangle {
                             }
                         }
 
+                        SettingRow {
+                            title: "Diagnostics";
+                            detail: "Writes a text file about the app and how it's set up, with its recent messages and a note of any time it stopped by itself, and opens it. Useful when something isn't working. It names no server address or account (its messages can mention songs by name), and it stays on this PC unless you send it somewhere.";
+                            TextButton {
+                                text: "Save diagnostics";
+                                clicked => { Settings.save-diagnostics(); }
+                            }
+                        }
+
                         VerticalLayout {
                             padding-top: 20px;
                             spacing: 16px;

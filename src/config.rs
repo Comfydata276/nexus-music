@@ -16,6 +16,10 @@ pub struct Paths {
     pub queue_place: PathBuf,
     /// Where exported playlists go when there's no system window to ask where.
     pub exports: PathBuf,
+    /// What went wrong the last time the app stopped by itself, and the file "Save
+    /// diagnostics" writes.
+    pub crash_log: PathBuf,
+    pub diagnostics: PathBuf,
     pub history: PathBuf,
     /// Likes, ratings and plays waiting to be sent to the server.
     pub pending: PathBuf,
@@ -65,6 +69,8 @@ impl Paths {
             queue: config.join("queue.json"),
             queue_place: config.join("queue-place.json"),
             exports: data.join("exports"),
+            crash_log: data.join("crash.log"),
+            diagnostics: data.join("diagnostics.txt"),
             history: config.join("history.json"),
             pending: config.join("pending.json"),
             added: config.join("playlist-added.json"),
@@ -363,8 +369,41 @@ pub const EQ_PRESETS: [(&str, [f32; 6]); 10] = [
 ];
 
 impl Settings {
+    /// Reads the settings, for a look at one of them. See `load_checked`.
     pub fn load(path: &Path) -> Settings {
-        fs::read(path).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default()
+        Settings::read(path).or_else(|| Settings::read(&backup_of(path))).unwrap_or_default()
+    }
+
+    fn read(path: &Path) -> Option<Settings> {
+        serde_json::from_slice(&fs::read(path).ok()?).ok()
+    }
+
+    /// Reads the settings when the app starts. A file that can't be read (cut short by a
+    /// power cut, edited by hand into something else) is never quietly replaced by a fresh
+    /// one: the copy kept from the last good start is used, and failing that the damaged
+    /// file is put aside under another name. The second value says so when either happened.
+    pub fn load_checked(path: &Path) -> (Settings, Option<String>) {
+        let backup = backup_of(path);
+        if !path.exists() {
+            // A first run, or the file was deleted to start afresh.
+            return (Settings::default(), None);
+        }
+        if let Some(settings) = Settings::read(path) {
+            // Good: this is the copy to fall back on next time.
+            let _ = fs::copy(path, &backup);
+            return (settings, None);
+        }
+        if let Some(settings) = Settings::read(&backup) {
+            let _ = fs::copy(&backup, path);
+            return (settings, Some("Your settings file was damaged, so the copy from the last time the app started was used.".into()));
+        }
+        let aside = path.with_extension("damaged.json");
+        let _ = fs::rename(path, &aside);
+        let note = format!(
+            "Your settings file couldn't be read and there was no copy to fall back on. It has been kept as {}, and the app has started with its default settings.",
+            aside.file_name().map(|name| name.to_string_lossy().to_string()).unwrap_or_default()
+        );
+        (Settings::default(), Some(note))
     }
 
     pub fn save(&self, path: &Path) {
@@ -423,6 +462,11 @@ impl SavedQueue {
             && queue.order.iter().all(|&i| i < queue.songs.len());
         valid.then_some(queue)
     }
+}
+
+/// Where the copy of the settings from the last good start is kept.
+fn backup_of(path: &Path) -> PathBuf {
+    path.with_extension("backup.json")
 }
 
 /// Where playback has got to in the saved queue.
@@ -606,6 +650,35 @@ pub fn dir_size(dir: &Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_damaged_settings_file_is_never_quietly_replaced() {
+        let dir = std::env::temp_dir().join(format!("nexus-settings-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        // A first run: defaults, and nothing to say.
+        let (settings, note) = Settings::load_checked(&path);
+        assert!(note.is_none() && settings.server.is_empty());
+        // A good file is read, and a copy of it kept.
+        Settings { server: "https://music.example.org".into(), volume: 0.4, ..Default::default() }.save(&path);
+        let (settings, note) = Settings::load_checked(&path);
+        assert!(note.is_none() && settings.server == "https://music.example.org");
+        // Cut short: the copy stands in, the file is mended, and the app says so.
+        fs::write(&path, br#"{"server": "https://music.ex"#).unwrap();
+        let (settings, note) = Settings::load_checked(&path);
+        assert!(settings.server == "https://music.example.org" && settings.volume == 0.4);
+        assert!(note.unwrap().contains("damaged"));
+        assert_eq!(Settings::load_checked(&path).0.server, "https://music.example.org");
+        // No copy either: the damaged file is kept under another name, not overwritten.
+        fs::write(&path, b"not settings at all").unwrap();
+        fs::remove_file(dir.join("settings.backup.json")).unwrap();
+        let (settings, note) = Settings::load_checked(&path);
+        assert!(settings.server.is_empty() && note.unwrap().contains("settings.damaged.json"));
+        assert_eq!(fs::read(dir.join("settings.damaged.json")).unwrap(), b"not settings at all");
+        assert!(!path.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn names_the_equaliser_curve_and_works_out_the_preamp() {

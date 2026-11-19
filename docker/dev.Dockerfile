@@ -16,7 +16,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:$PATH
-RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable \
+# The Rust version every build and release uses. Raise it here (and in
+# .github/workflows/check.yml) on purpose, not by rebuilding the image on a different day.
+ARG RUST_VERSION=1.100.0
+RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain ${RUST_VERSION} \
       --target x86_64-pc-windows-msvc \
     && cargo install cargo-xwin --locked \
     && chmod -R a+rwX /opt/rustup /opt/cargo

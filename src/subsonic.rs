@@ -322,6 +322,44 @@ pub fn normalize_server_url(input: &str) -> String {
     url
 }
 
+/// The addresses to try for what was typed as the server's. One that says "http://" or
+/// "https://" is taken at its word. One that doesn't is tried over HTTPS first, and over
+/// plain HTTP only if that gets nowhere.
+pub fn addresses_to_try(typed: &str) -> Vec<String> {
+    let typed = typed.trim();
+    if typed.is_empty() {
+        Vec::new()
+    } else if typed.contains("://") {
+        vec![typed.to_string()]
+    } else {
+        vec![format!("https://{typed}"), format!("http://{typed}")]
+    }
+}
+
+/// Whether an address is plain HTTP to somewhere that isn't on the home network (or this
+/// PC): the case where what's sent can be read by others on the way.
+pub fn unencrypted_beyond_home(address: &str) -> bool {
+    let Some(rest) = address.strip_prefix("http://") else { return false };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+    // An IPv6 address is in brackets, with the port after them.
+    let host = match host.strip_prefix('[') {
+        Some(bracketed) => bracketed.split(']').next().unwrap_or_default(),
+        None => host.rsplit_once(':').map_or(host, |(name, _)| name),
+    }
+    .to_lowercase();
+    if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
+        let [a, b, ..] = ip.octets();
+        // Private ranges, this PC, link-local, and the range Tailscale and similar use.
+        return !(ip.is_private() || ip.is_loopback() || ip.is_link_local() || (a == 100 && (64..128).contains(&b)));
+    }
+    if let Ok(ip) = host.parse::<std::net::Ipv6Addr>() {
+        return !(ip.is_loopback() || (ip.segments()[0] & 0xfe00) == 0xfc00 || (ip.segments()[0] & 0xffc0) == 0xfe80);
+    }
+    let local = ["localhost", ".local", ".lan", ".home", ".internal", ".home.arpa", ".localdomain"];
+    !(host.is_empty() || !host.contains('.') || local.iter().any(|ending| host == ending.trim_start_matches('.') || host.ends_with(ending)))
+}
+
 /// Longest an API call may take from start to finish. Audio downloads have no such limit.
 const API_TIMEOUT: Duration = Duration::from_secs(45);
 
@@ -672,6 +710,12 @@ impl Client {
         let started = std::time::Instant::now();
         fresh.ping()?;
         Ok((cold, started.elapsed().as_millis()))
+    }
+
+    /// Whether anything at all answers at this address within `limit`. For trying an address
+    /// that's only a guess without waiting long on it.
+    pub fn answers_within(&self, limit: Duration) -> bool {
+        self.get(&self.url_as(CLIENT_NAME, "ping", &[]), Some(limit)).is_ok()
     }
 
     pub fn ping(&self) -> ApiResult<ServerInfo> {
@@ -1190,6 +1234,22 @@ fn network_hint(err: &ureq::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tries_https_first_and_knows_when_plain_http_matters() {
+        assert_eq!(addresses_to_try(" music.example.org "), ["https://music.example.org", "http://music.example.org"]);
+        assert_eq!(addresses_to_try("http://192.168.1.5:4533"), ["http://192.168.1.5:4533"]);
+        assert_eq!(addresses_to_try("https://music.example.org/"), ["https://music.example.org/"]);
+        assert!(addresses_to_try("  ").is_empty());
+        // Plain HTTP only matters where someone else could be listening.
+        for home in ["http://192.168.1.5:4533", "http://10.0.0.2", "http://localhost:4533", "http://nas:4533", "http://nas.local", "http://music.lan/", "http://100.96.1.2:4533", "http://127.0.0.1:4533", "http://[::1]:4533", "http://[fd00::5]:4533"] {
+            assert!(!unencrypted_beyond_home(home), "{home}");
+        }
+        for away in ["http://music.example.org", "http://music.example.org:4533/x", "http://8.8.8.8:4533", "http://100.200.1.2", "http://[2001:db8::1]:4533"] {
+            assert!(unencrypted_beyond_home(away), "{away}");
+        }
+        assert!(!unencrypted_beyond_home("https://music.example.org"));
+    }
 
     #[test]
     fn takes_a_lyrics_file_s_offset_off_its_times() {

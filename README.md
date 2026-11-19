@@ -14,7 +14,7 @@ What's planned next is in the [roadmap](ROADMAP.md).
 
 ## What it does
 
-- Signs in to a Navidrome server; the password is kept in Windows Credential Manager.
+- Signs in to a Navidrome server; the password is kept in Windows Credential Manager. An address typed without `https://` is tried over HTTPS first; if only plain HTTP works and the server isn't on your home network, the app says so.
 - Home, search, albums (sortable), artists, songs (every song in the library, newest first, sortable and filterable), genres, playlists and Liked songs.
 - Search that forgives typing mistakes, with a preview of the best matches as you type. It runs on a copy of the library kept on your PC, so it's instant; a matching artist comes first, and songs you've liked rank above others. A short word is only taken for a mistyping of one that starts with the same letter, so four letters don't match half the library.
 - Gapless playback or crossfade, seeking, shuffle, repeat and a queue you can edit. Crossfade leaves an album alone: its tracks run into each other as recorded.
@@ -78,6 +78,7 @@ What's planned next is in the [roadmap](ROADMAP.md).
 - Keeps playing from the notification area when the window is closed (optional), and
   opening it a second time brings back the copy that's already running.
 - Checks GitHub for new versions and installs them on request, once the download matches the checksum GitHub publishes for it.
+- If it ever stops by itself it notes why, and "Save diagnostics" under Settings, About writes a text file about the app and its set-up (no server address or account) to help work out what went wrong. A settings file that gets damaged is recovered from a copy, or put aside; it is never silently replaced with defaults.
 - Its own title bar: navigation, search and the window's buttons in one strip, in the theme's
   colours. Six colour themes and an interface size setting.
 - Previous, play and next buttons on the taskbar thumbnail.
@@ -154,6 +155,10 @@ scripts/check               # compile for Linux and print diagnostics
 scripts/dx cargo test       # unit tests
 scripts/release notes.md    # build and publish a GitHub release (bump Cargo.toml and push first)
 ```
+
+Every push to GitHub is compiled and tested there as well (`.github/workflows/check.yml`).
+The Rust version is fixed in `docker/dev.Dockerfile` and in that workflow, so a release is
+built with the same compiler as the one before unless it's raised on purpose.
 
 `scripts/dx <command>` runs any command inside the image as your user.
 

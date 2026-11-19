@@ -16,6 +16,7 @@ if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]; then
   echo "This commit isn't what's on GitHub's main branch. Push it before releasing." >&2
   exit 1
 fi
+commit="$(git rev-parse HEAD)"
 if gh release view "v$version" >/dev/null 2>&1; then
   echo "Version $version is already released. Bump the version in Cargo.toml." >&2
   exit 1
@@ -26,9 +27,14 @@ scripts/check
 scripts/dx cargo test --quiet
 
 scripts/package-windows
+# The tag goes on the commit that was built, whatever has been pushed since.
+if [ -n "$(git status --porcelain)" ] || [ "$(git rev-parse HEAD)" != "$commit" ]; then
+  echo "The source changed while the release was being built. Nothing was published." >&2
+  exit 1
+fi
 files=("dist/NexusMusic-Setup-$version.exe" "dist/NexusMusic-$version-portable.exe")
 if [ -n "$notes" ]; then
-  gh release create "v$version" "${files[@]}" --title "Nexus Music $version" --notes-file "$notes"
+  gh release create "v$version" "${files[@]}" --target "$commit" --title "Nexus Music $version" --notes-file "$notes"
 else
-  gh release create "v$version" "${files[@]}" --title "Nexus Music $version" --generate-notes
+  gh release create "v$version" "${files[@]}" --target "$commit" --title "Nexus Music $version" --generate-notes
 fi

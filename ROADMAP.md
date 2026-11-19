@@ -86,7 +86,6 @@ Things that lose data or interrupt the music.
 - [x] The menu key opens the menu for what's selected; menus work with the arrows and Enter,
       and a long "Add to playlist" menu scrolls.
 - [x] Links and the "Up next" rows can be named and used by a screen reader.
-- [ ] On search results and artist pages the list doesn't yet scroll to follow the keyboard.
 
 ## 5. Playlists you can trust (0.28.0)
 
@@ -108,7 +107,6 @@ Things that lose data or interrupt the music.
 - [x] A choice of folder for downloads, which moves them, with a check for free space before
       moving and before downloading.
 - [x] Downloads and held changes are kept per account.
-- [ ] A choice of folder for the songs kept as they play.
 
 ## 7. Audio (0.30.0)
 
@@ -133,16 +131,28 @@ Things that lose data or interrupt the music.
 
 ## Alongside every release
 
-- [ ] Every push is compiled and tested automatically (GitHub Actions).
-- [ ] Tests for the audio engine using its recorded output (gapless, seeking, crossfade), for
-      the offline queue and for the streaming source.
-- [ ] A crash log, and "Copy diagnostics" in Settings.
-- [ ] A damaged settings file is recovered from a backup, never reset without saying.
-- [ ] Releases are built from the tagged commit with a pinned toolchain and build image.
-- [ ] A server address typed without `https://` tries HTTPS first and warns before using
-      plain HTTP outside the home network.
+- [x] Every push is compiled and tested automatically (GitHub Actions). (0.33.0)
+- [x] Tests for the offline queue and for the streaming source, against a test server that
+      stalls, cuts and refuses connections. (0.24.0, 0.25.0)
+- [ ] Tests for the audio engine using its recorded output (gapless, seeking, crossfade).
+      The pieces are tested (trimming, resampling to the exact frame, the buffer, the fade);
+      the engine running end to end is still only checked by hand in the test app.
+- [x] A crash log, and "Save diagnostics" in Settings. (0.33.0)
+- [x] A damaged settings file is recovered from a backup, never reset without saying. (0.33.0)
+- [x] Releases are tagged at the commit that was built, with a pinned Rust version. (0.33.0)
+- [x] A server address typed without `https://` tries HTTPS first and warns when plain HTTP
+      is used outside the home network. (0.33.0)
 - [ ] Updates are signed with the project's own key, so they don't depend on GitHub alone.
-- [ ] The controller is split up area by area as each is worked on.
+      This one needs a decision: where the key is kept, and what happens if it is lost.
+- [ ] The controller is split up area by area as each is worked on. Started: playlist
+      edits, file saving and download bookkeeping now live in modules of their own.
+
+## Left over from the numbered steps
+
+- [ ] On search results and artist pages the list doesn't yet scroll to follow the keyboard.
+- [ ] A choice of folder for the songs kept as they play.
+- [ ] Dragging a song to reorder a playlist has unit tests but hasn't been driven in the
+      test app.
 
 ## Suggested, not yet decided
 

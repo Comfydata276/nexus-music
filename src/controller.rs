@@ -315,6 +315,10 @@ pub struct Controller {
     pub moving_downloads: Cell<bool>,
     /// The mix made to rules whose menu is open.
     pub menu_rule: Cell<Option<u64>>,
+    /// The last messages shown at the bottom of the window and when, for "Save diagnostics".
+    pub said: RefCell<std::collections::VecDeque<(i64, String)>>,
+    /// Something to say once the window is up (the settings file was damaged, say).
+    startup_note: RefCell<Option<String>>,
     /// What another device was playing more recently than anything was done here.
     pub elsewhere: RefCell<Option<crate::subsonic::PlayQueue>>,
     /// Songs that have been played, newest first, including the one playing now.
@@ -430,7 +434,7 @@ pub struct Controller {
 impl Controller {
     pub fn install(ui: ui::MainWindow) -> Rc<Controller> {
         let paths = Paths::new();
-        let settings = Settings::load(&paths.settings);
+        let (settings, settings_note) = Settings::load_checked(&paths.settings);
         crate::mixes::set_rules(settings.rule_mixes.clone());
         crate::audio::source::clean_stale(&paths.buffers);
         let engine = Engine::new(paths.buffers.clone(), |event| {
@@ -468,6 +472,8 @@ impl Controller {
             track_places: RefCell::default(),
             moving_downloads: Cell::new(false),
             menu_rule: Cell::new(None),
+            said: RefCell::default(),
+            startup_note: RefCell::new(settings_note),
             elsewhere: RefCell::default(),
             play_log: RefCell::new({
                 let recent: Vec<(String, i64)> = config::load_history(&paths.history).into_iter().map(|played| (played.song.id, played.at)).collect();
@@ -551,7 +557,91 @@ impl Controller {
         CONTROLLER.with(|slot| *slot.borrow_mut() = Some(ctl.clone()));
         ctl.wire();
         ctl.start();
+        ctl.say_startup_notes();
         ctl
+    }
+
+    /// Says, once the window has had a moment to appear, anything that needs saying about
+    /// how the app started: the settings file was damaged, or the app stopped by itself
+    /// last time.
+    fn say_startup_notes(self: &Rc<Self>) {
+        // How much of the crash log has been mentioned already is kept beside it.
+        let seen_file = self.paths.crash_log.with_extension("seen");
+        let size = std::fs::metadata(&self.paths.crash_log).map(|meta| meta.len()).unwrap_or(0);
+        let seen: u64 = std::fs::read_to_string(&seen_file).ok().and_then(|text| text.trim().parse().ok()).unwrap_or(0);
+        let crashed = size > seen;
+        if crashed {
+            let _ = std::fs::write(&seen_file, size.to_string());
+        }
+        let note = self.startup_note.borrow_mut().take().or_else(|| {
+            crashed.then(|| "The app stopped unexpectedly last time. “Save diagnostics” under Settings, About has what was noted.".to_string())
+        });
+        if let Some(note) = note {
+            slint::Timer::single_shot(Duration::from_millis(1500), move || {
+                with(|ctl| ctl.show_toast(note.into(), "", Duration::from_secs(10)));
+            });
+        }
+    }
+
+    /// Writes a file describing the app and how it's set up, for working out what's wrong,
+    /// and opens it. It names no server address or account; the messages in it are the ones
+    /// the app showed, which can mention a song or playlist.
+    pub fn save_diagnostics(&self) {
+        let settings = self.settings.borrow();
+        let page = self.ui.global::<ui::Settings>();
+        let app = self.ui.global::<ui::App>();
+        let yes = |on: bool| if on { "on" } else { "off" };
+        let mut lines = vec![
+            format!("Nexus Music {} on {} ({})", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH),
+            format!("Written {}", chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")),
+            String::new(),
+            format!("Signed in: {}", if self.client().is_some() { "yes" } else { "no" }),
+            format!("Server version: {}", app.get_server_version()),
+            format!("Server address uses HTTPS: {}", if settings.server.starts_with("https://") { "yes" } else { "no" }),
+            format!("Offline mode: {}; server out of reach: {}", yes(settings.offline), yes(self.unreachable.get())),
+            format!("Sound output: {}", page.get_output_status()),
+            format!("Exclusive mode: {}; streaming limit: {} kbps (0 is none)", yes(settings.exclusive), settings.max_bitrate()),
+            format!("Gapless: {}; crossfade: {} s; levelling: {}; equaliser: {}", yes(settings.gapless), settings.crossfade, yes(settings.normalize), yes(settings.equalizer)),
+            format!("Library on this PC: {} songs", crate::search::current().map_or(0, |index| index.library.songs.len())),
+            format!("Downloads: {}", self.downloads.borrow().summary()),
+            format!("Kept songs limit: {} MB; cache: {}", settings.cache_limit_mb, page.get_cache_size()),
+            format!("Sharing between devices: {}; requests through Lidarr: {}", yes(settings.sync), yes(settings.requests)),
+            format!("Changes waiting to be sent: {}", self.pending.borrow().len() + self.sending.borrow().len()),
+            String::new(),
+            "Recent messages:".to_string(),
+        ];
+        let said = self.said.borrow();
+        if said.is_empty() {
+            lines.push("  (none this session)".into());
+        }
+        for (at, text) in said.iter() {
+            let when = chrono::DateTime::from_timestamp(*at, 0).map(|at| at.format("%H:%M:%S").to_string()).unwrap_or_default();
+            lines.push(format!("  {when} UTC  {text}"));
+        }
+        lines.push(String::new());
+        lines.push("Times the app stopped by itself:".to_string());
+        match std::fs::read_to_string(&self.paths.crash_log) {
+            Ok(log) if !log.trim().is_empty() => {
+                let all: Vec<&str> = log.lines().collect();
+                lines.extend(all[all.len().saturating_sub(40)..].iter().map(|line| format!("  {line}")));
+            }
+            _ => lines.push("  (none noted)".into()),
+        }
+        drop(said);
+        drop(settings);
+        let path = self.paths.diagnostics.clone();
+        if let Some(folder) = path.parent() {
+            let _ = std::fs::create_dir_all(folder);
+        }
+        match std::fs::write(&path, lines.join("\r\n")) {
+            Ok(()) => {
+                // Opened in whatever shows text files, to be read or copied from.
+                let program = if cfg!(windows) { "notepad" } else { "xdg-open" };
+                let _ = std::process::Command::new(program).arg(&path).spawn();
+                self.toast(format!("Saved to {}", path.display()));
+            }
+            Err(e) => self.toast(format!("Couldn't write {}. {e}", path.display())),
+        }
     }
 
     pub fn client(&self) -> Option<Client> {
@@ -586,6 +676,13 @@ impl Controller {
     }
 
     fn show_toast(&self, text: SharedString, action: &str, shown_for: Duration) {
+        {
+            let mut said = self.said.borrow_mut();
+            said.push_back((chrono::Utc::now().timestamp(), text.to_string()));
+            if said.len() > 40 {
+                said.pop_front();
+            }
+        }
         let toast = self.ui.global::<ui::Toast>();
         toast.set_text(text);
         toast.set_action(action.into());
@@ -1073,14 +1170,28 @@ impl Controller {
         app.set_login_busy(true);
         app.set_login_error("".into());
         let username = username.trim().to_string();
-        let client = Client::new(&server, &username, &password);
         self.api_pool.spawn(move || {
-            let result = client.ping();
+            // An address typed without "http://" or "https://" is tried the safe way first.
+            let mut answer = Err(crate::subsonic::ApiError::Network("No address was given.".into()));
+            let addresses = crate::subsonic::addresses_to_try(&server);
+            for (index, address) in addresses.iter().enumerate() {
+                let client = Client::new(address, &username, &password);
+                // HTTPS was a guess: if nothing answers there soon, go on to plain HTTP
+                // without waiting out the full time a real server is given.
+                if index + 1 < addresses.len() && !client.answers_within(Duration::from_secs(5)) {
+                    continue;
+                }
+                answer = client.ping().map(|info| (client, info));
+                // Signed in, or the server is there and says no: either way that settles it.
+                if answer.as_ref().err().is_none_or(|error| matches!(error, crate::subsonic::ApiError::Server { .. })) {
+                    break;
+                }
+            }
             post(move |ctl| {
                 let app = ctl.ui.global::<ui::App>();
                 app.set_login_busy(false);
-                match result {
-                    Ok(info) => {
+                match answer {
+                    Ok((client, info)) => {
                         {
                             let mut settings = ctl.settings.borrow_mut();
                             settings.server = client.server().to_string();
@@ -1091,10 +1202,18 @@ impl Controller {
                             ctl.toast("Couldn't save your password; you'll need to sign in next time.");
                         }
                         ctl.covers.reset();
+                        let open = crate::subsonic::unencrypted_beyond_home(client.server());
                         ctl.enter(client, Some(info.version));
                         // The server is plainly there: stop treating it as out of reach, and
                         // send whatever was being held for it.
                         ctl.check_connection();
+                        if open {
+                            ctl.show_toast(
+                                "Signed in without encryption: over plain HTTP your sign-in and your music can be read on the way. If your server has an https:// address, sign in with that.".into(),
+                                "",
+                                Duration::from_secs(12),
+                            );
+                        }
                     }
                     Err(e) => app.set_login_error(e.to_string().into()),
                 }
@@ -3855,6 +3974,9 @@ impl Controller {
                 let folder = ctl.paths.downloads.clone();
                 ctl.move_downloads(folder);
             });
+        });
+        settings.on_save_diagnostics(|| {
+            with(|ctl| ctl.save_diagnostics());
         });
         settings.on_remove_downloads(|| {
             with(|ctl| ctl.remove_all_downloads());
