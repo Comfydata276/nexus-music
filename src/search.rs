@@ -195,6 +195,12 @@ fn likeness(typed: &[char], word: &[char]) -> f32 {
         4..=7 => 1,
         _ => 2,
     };
+    // A short word is only taken for a mistyping of one that starts the same way. Without
+    // that, four or five letters are near enough to a good many words that have nothing to
+    // do with them: "home" would find "Someday".
+    if typed.len() <= 5 && typed.first() != word.first() {
+        return 0.0;
+    }
     let whole = slips(typed, word, limit);
     if whole <= limit {
         return if whole == 1 { 0.75 } else { 0.6 };
@@ -443,6 +449,27 @@ mod tests {
     fn folds_accents_and_punctuation() {
         assert_eq!(fold("Beyoncé — Déjà Vu!"), "beyonce   deja vu ");
         assert_eq!(fold("Don’t Stop"), "dont stop");
+    }
+
+    #[test]
+    fn short_words_only_match_words_that_start_the_same_way() {
+        let chars = |text: &str| text.chars().collect::<Vec<char>>();
+        let like = |typed: &str, word: &str| likeness(&chars(typed), &chars(word));
+        // One letter out, and it's the first: a different word altogether.
+        assert_eq!(like("home", "someday"), 0.0);
+        assert_eq!(like("home", "come"), 0.0);
+        assert_eq!(like("lost", "most"), 0.0);
+        // A slip later in the word is still a slip.
+        assert!(like("masi", "maisie") > 0.0);
+        assert!(like("quen", "queen") > 0.0);
+        assert!(like("jaz", "jazz") > 0.8);
+        // Longer words are forgiven a wrong first letter, as before.
+        assert!(like("saisie", "maisie") > 0.0);
+        // And through the whole search: "tazz" isn't taken for "Jazz", "masi" still finds Maisie.
+        let found = library().search("tazz", &|_| false, 5, 5, 5);
+        assert!(found.songs.is_empty() && found.albums.is_empty(), "{:?}", titles(&found.songs));
+        let found = library().search("masi", &|_| false, 5, 5, 5);
+        assert_eq!(found.artists.first().map(|artist| artist.title.as_str()), Some("Maisie Peters"));
     }
 
     #[test]

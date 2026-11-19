@@ -15,8 +15,8 @@ What's planned next is in the [roadmap](ROADMAP.md).
 ## What it does
 
 - Signs in to a Navidrome server; the password is kept in Windows Credential Manager.
-- Home, search, albums (sortable), artists, genres, playlists and Liked songs.
-- Search that forgives typing mistakes, with a preview of the best matches as you type. It runs on a copy of the library kept on your PC, so it's instant; a matching artist comes first, and songs you've liked rank above others.
+- Home, search, albums (sortable), artists, songs (every song in the library, newest first, sortable and filterable), genres, playlists and Liked songs.
+- Search that forgives typing mistakes, with a preview of the best matches as you type. It runs on a copy of the library kept on your PC, so it's instant; a matching artist comes first, and songs you've liked rank above others. A short word is only taken for a mistyping of one that starts with the same letter, so four letters don't match half the library.
 - Gapless playback or crossfade, seeking, shuffle, repeat and a queue you can edit. Crossfade leaves an album alone: its tracks run into each other as recorded.
 - A queue panel beside the page, with a play button on every row to skip straight to it.
   Drag rows to reorder the queue, or the songs in a playlist.

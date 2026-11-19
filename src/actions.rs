@@ -177,9 +177,17 @@ impl Controller {
         if !song.album_id.is_empty() {
             entries.push(self.entry("go-album", "Go to album", icons.get_disc_album()));
         }
-        if !song.artist_id.is_empty() {
+        // Everyone credited, each with a way to their page; or the one artist, if that's
+        // all the server names.
+        let credited: Vec<&crate::subsonic::Credit> = song.artists.iter().filter(|credit| !credit.id.is_empty()).collect();
+        if credited.len() > 1 {
+            for credit in credited {
+                entries.push(self.entry(&format!("go-artist:{}", credit.id), &format!("Go to {}", credit.name), icons.get_user_round()));
+            }
+        } else if !song.artist_id.is_empty() {
             entries.push(self.entry("go-artist", "Go to artist", icons.get_user_round()));
         }
+        entries.push(self.entry("details", "Song details", icons.get_info()));
         entries.push(self.entry("radio", "Start radio from this song", icons.get_radio()));
         if playlist.is_some() {
             entries.push(self.separator());
@@ -536,6 +544,10 @@ impl Controller {
     }
 
     fn menu_activated(self: &Rc<Self>, id: &str) {
+        if let Some(artist) = id.strip_prefix("go-artist:") {
+            self.close_menu();
+            return self.navigate(Route::Artist(artist.to_string()));
+        }
         if let Some(index) = id.strip_prefix("eq:").and_then(|i| i.parse().ok()) {
             self.close_menu();
             return self.choose_preset(index);
@@ -629,6 +641,7 @@ impl Controller {
                 self.toggle_song_star(song)
             }
             ("go-album", Target::Song { song, .. }) => self.navigate(Route::Album(song.album_id.clone())),
+            ("details", Target::Song { song, .. }) => self.show_song_details(song),
             ("go-artist", Target::Song { song, .. }) => {
                 self.navigate(Route::Artist(song.artist_id.clone()))
             }
@@ -729,6 +742,70 @@ impl Controller {
             self.entry("import-spotify", "Import from Spotify", icons.get_download()),
         ];
         self.open_menu(Target::None, "", entries, x, y);
+    }
+
+    /// Everything the server says about a song, laid out to be read.
+    fn show_song_details(&self, song: &Song) {
+        let mut lines: Vec<String> = Vec::new();
+        let mut line = |name: &str, value: String| {
+            if !value.is_empty() {
+                lines.push(format!("{name}: {value}"));
+            }
+        };
+        let number = |n: u32, unit: &str| if n > 0 { format!("{n}{unit}") } else { String::new() };
+        let date = |text: &str| {
+            let at = crate::added::parse_time(text);
+            if at > 0 { chrono::DateTime::from_timestamp(at, 0).map(|at| at.format("%-d %B %Y").to_string()).unwrap_or_default() } else { String::new() }
+        };
+        let artists = if song.artists.len() > 1 {
+            song.artists.iter().map(|credit| credit.name.as_str()).collect::<Vec<_>>().join(", ")
+        } else {
+            song.artist_label().to_string()
+        };
+        line(if song.artists.len() > 1 { "Artists" } else { "Artist" }, artists);
+        line("Album", song.album.clone());
+        line("Track", match (song.disc_number, song.track) {
+            (_, 0) => String::new(),
+            (disc, track) if disc > 1 => format!("{track}, disc {disc}"),
+            (_, track) => track.to_string(),
+        });
+        line("Year", number(song.year, ""));
+        line("Genre", song.genre.clone());
+        line("Length", if song.duration > 0 { crate::controller::clock(song.duration) } else { String::new() });
+        let mut format = vec![song.suffix.to_uppercase()];
+        if song.sampling_rate > 0 {
+            let khz = song.sampling_rate as f32 / 1000.0;
+            format.push(if khz.fract() == 0.0 { format!("{khz:.0} kHz") } else { format!("{khz:.1} kHz") });
+        }
+        format.extend([number(song.bit_depth, "-bit"), number(song.bit_rate, " kbps")].into_iter().filter(|part| !part.is_empty()));
+        line("Format", format.into_iter().filter(|part| !part.is_empty()).collect::<Vec<_>>().join(", "));
+        line("Size", if song.size > 0 { format!("{:.1} MB", song.size as f64 / (1024.0 * 1024.0)) } else { String::new() });
+        if let Some(tags) = &song.replay_gain {
+            let db = |gain: Option<f32>| gain.map(|gain| format!("{gain:+.1} dB"));
+            let parts: Vec<String> = [db(tags.track_gain).map(|g| format!("song {g}")), db(tags.album_gain).map(|g| format!("album {g}"))].into_iter().flatten().collect();
+            line("Levelling tags", parts.join(", "));
+        } else {
+            line("Levelling tags", "none".into());
+        }
+        line("Played", match song.play_count {
+            0 => "never".into(),
+            1 => format!("once, on {}", date(&song.played)),
+            n => format!("{n} times, last on {}", date(&song.played)),
+        });
+        line("Your rating", match self.rating_of(song) {
+            0 => String::new(),
+            1 => "1 star".into(),
+            n => format!("{n} stars"),
+        });
+        line("Added to the library", date(&song.created));
+        if let Some((kind, kbps)) = self.downloads.borrow().saved_as(song) {
+            line("Downloaded as", format!("{}, about {kbps} kbps", kind.to_uppercase()));
+        }
+        self.close_menu();
+        *self.prompt.borrow_mut() = None;
+        let prompt = self.ui.global::<ui::Prompt>();
+        self.open_prompt(&song.title, &lines.join("\n"), "Close", None, false);
+        prompt.set_cancel_label("".into());
     }
 
     /// Asks which folder downloads should be kept in, then moves them there.

@@ -260,6 +260,13 @@ export component Sidebar inherits Rectangle {
         }
 
         NavItem {
+            icon: Icons.music;
+            text: "Songs";
+            selected: App.route == "songs";
+            clicked => { App.navigate("songs"); }
+        }
+
+        NavItem {
             icon: Icons.tags;
             text: "Genres";
             selected: App.route == "genres";

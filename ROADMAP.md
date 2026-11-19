@@ -121,15 +121,15 @@ Things that lose data or interrupt the music.
 - [x] No extra silence when a resampled song ends.
 - [x] Lyrics honour the offset a `.lrc` file can carry, and lyrics that aren't timed say so.
 
-## 8. Finding music
+## 8. Finding music (0.31.0 and after)
 
-- [ ] A Songs page: every song, sortable, with "Recently added".
-- [ ] Every artist credited on a song links to their page.
+- [x] A Songs page: every song, newest first, sortable and filterable. (0.31.0)
+- [x] Every artist credited on a song has a "Go to" entry in the song's menu. (0.31.0)
+- [x] A details view for a song: format, bit depth, sample rate, levelling, play count. (0.31.0)
+- [x] Search that is less forgiving on short words. (0.31.0)
 - [ ] Mixes from your own rules, such as "rated four or more, not played this year".
 - [ ] "Continue here": pick up on this PC what another one was playing.
 - [ ] Stats for the last four weeks and six months that cover every PC.
-- [ ] A details view for a song: format, bit depth, sample rate, levelling, play count.
-- [ ] Search that is less forgiving on short words.
 
 ## Alongside every release
 

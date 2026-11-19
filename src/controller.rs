@@ -52,6 +52,8 @@ pub enum Route {
     Artist(String),
     Playlist(String),
     Liked,
+    /// Every song in the library, newest first.
+    Songs,
     /// Songs saved on this PC.
     Downloads,
     /// Internet radio stations set up on the server.
@@ -90,6 +92,7 @@ impl Route {
             "artist" => Route::Artist(rest.to_string()),
             "playlist" => Route::Playlist(rest.to_string()),
             "liked" => Route::Liked,
+            "songs" => Route::Songs,
             "downloads" => Route::Downloads,
             "radio" => Route::Radio,
             "albums" => Route::Albums(rest.parse().unwrap_or(0)),
@@ -118,6 +121,7 @@ impl Route {
             Route::Artist(id) => format!("artist:{id}"),
             Route::Playlist(id) => format!("playlist:{id}"),
             Route::Liked => "liked".into(),
+            Route::Songs => "songs".into(),
             Route::Downloads => "downloads".into(),
             Route::Radio => "radio".into(),
             Route::Albums(_) => "albums".into(),
@@ -150,7 +154,7 @@ impl Route {
         match self {
             Route::Home => ui::Page::Home,
             Route::Search(_) | Route::Import | Route::Requests | Route::Stats(_) => ui::Page::Search,
-            Route::Album(_) | Route::Playlist(_) | Route::Liked | Route::Downloads | Route::Radio | Route::Mix(_) => {
+            Route::Album(_) | Route::Playlist(_) | Route::Liked | Route::Songs | Route::Downloads | Route::Radio | Route::Mix(_) => {
                 ui::Page::Tracklist
             }
             Route::Artist(_) | Route::OutsideArtist(_) | Route::OutsideAlbum(_) => ui::Page::Artist,
@@ -2817,7 +2821,7 @@ impl Controller {
     /// Playlists, Liked songs and Downloads: lists of the user's own making, which can be
     /// filtered, show when each song was added, and remember how they were sorted.
     fn is_own_list(&self, page: &PageData) -> bool {
-        page.playlist.is_some() || page.liked_songs || matches!(self.current_route(), Some(Route::Downloads))
+        page.playlist.is_some() || page.liked_songs || matches!(self.current_route(), Some(Route::Downloads | Route::Songs))
     }
 
     /// When each of the page's songs was added to it; empty if the page has no such date.
@@ -2830,6 +2834,9 @@ impl Controller {
         } else if matches!(self.current_route(), Some(Route::Downloads)) {
             let downloads = self.downloads.borrow();
             page.songs.iter().map(|song| downloads.added_at(&song.id)).collect()
+        } else if matches!(self.current_route(), Some(Route::Songs)) {
+            // When each came into the library.
+            page.songs.iter().map(|song| crate::added::day_start(parse_time(&song.created))).collect()
         } else {
             Vec::new()
         }
@@ -3925,6 +3932,10 @@ fn fetch_whole(client: &Client, route: &Route, file: &std::path::Path) -> ApiRes
 }
 
 fn store_page(file: &std::path::Path, page: &PageData) {
+    // A page made from what's already on this PC is quicker made again than read back.
+    if page.local {
+        return;
+    }
     let Ok(json) = serde_json::to_vec(page) else { return };
     if json.len() > DISK_PAGE_LIMIT {
         return;

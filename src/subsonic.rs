@@ -74,6 +74,9 @@ pub struct Song {
     pub album_id: String,
     pub artist_id: String,
     pub display_artist: String,
+    /// Everyone credited on the song, when the server says (it may name only the first
+    /// otherwise, in `artist`).
+    pub artists: Vec<Credit>,
     pub track: u32,
     pub disc_number: u32,
     pub year: u32,
@@ -97,6 +100,14 @@ pub struct Song {
     pub replay_gain: Option<ReplayGain>,
     /// Set (by this app, not the server) on entries that stand for an internet radio station.
     pub radio_url: String,
+}
+
+/// An artist named on a song.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Credit {
+    pub id: String,
+    pub name: String,
 }
 
 impl Song {

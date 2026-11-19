@@ -213,7 +213,8 @@ export component PromptOverlay inherits Rectangle {
                 alignment: end;
                 spacing: 8px;
 
-                TextButton {
+                // Something that's only there to be read has one button, to close it.
+                if Prompt.cancel-label != "": TextButton {
                     text: Prompt.cancel-label;
                     clicked => { Prompt.cancelled(); }
                 }

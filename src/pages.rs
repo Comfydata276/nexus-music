@@ -172,6 +172,10 @@ pub struct PageData {
     pub liked_songs: bool,
     pub can_play: bool,
     pub has_menu: bool,
+    /// Made from the copy of the library on this PC, not asked of the server: there's no
+    /// call to keep a copy of it on disk as well.
+    #[serde(skip)]
+    pub local: bool,
     /// Something that went wrong on this page, and the name of what can be done about it.
     #[serde(default)]
     pub notice: String,
@@ -259,6 +263,7 @@ pub fn load(client: &Client, route: &Route) -> ApiResult<PageData> {
         Route::Artist(id) => artist(client, id),
         Route::Playlist(id) => playlist(client, id),
         Route::Liked => liked(client),
+        Route::Songs => Ok(all_songs()),
         Route::Radio => radio(client),
         Route::Mix(id) => Ok(mix(id)),
         Route::Requests => Ok(requests()),
@@ -1475,6 +1480,33 @@ fn playlist_extras(client: &Client, page: &PageData) -> Option<PageData> {
         })
         .collect();
     Some(page)
+}
+
+/// Every song in the library, the newest arrivals first. Made from the copy of the library
+/// kept on this PC, so it's there at once and without the server.
+fn all_songs() -> PageData {
+    let mut songs = crate::search::current().map(|index| index.library.songs.clone()).unwrap_or_default();
+    // The server's dates are text that sorts as time does; the title settles ties (a whole
+    // album arrives at once).
+    songs.sort_by(|a, b| b.created.cmp(&a.created).then_with(|| a.album.cmp(&b.album)).then_with(|| a.track.cmp(&b.track)));
+    for song in &mut songs {
+        // Whether it's liked may have changed since the copy of the library was made.
+        song.starred = crate::search::is_liked(song).then(|| song.starred.clone().unwrap_or_default());
+    }
+    PageData {
+        label: "Library".into(),
+        title: "Songs".into(),
+        meta: format!("{}, newest first", count(songs.len() as u32, "song")),
+        can_play: !songs.is_empty(),
+        show_album: true,
+        show_cover: true,
+        show_number: true,
+        local: true,
+        empty: "Your library is still being fetched. It'll be here in a moment.".into(),
+        context: "Songs".into(),
+        songs,
+        ..Default::default()
+    }
 }
 
 fn liked(client: &Client) -> ApiResult<PageData> {
