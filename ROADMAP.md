@@ -149,8 +149,9 @@ Things that lose data or interrupt the music.
 
 ## Left over from the numbered steps
 
-- [ ] On search results and artist pages the list doesn't yet scroll to follow the keyboard.
-- [ ] A choice of folder for the songs kept as they play.
+- [x] Search results and artist pages scroll to follow the keyboard, and Down in the search
+      box moves to the songs found. (0.34.0)
+- [x] A choice of folder for the songs kept as they play. (0.34.0)
 - [ ] Dragging a song to reorder a playlist has unit tests but hasn't been driven in the
       test app.
 

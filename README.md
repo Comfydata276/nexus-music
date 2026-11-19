@@ -27,7 +27,7 @@ What's planned next is in the [roadmap](ROADMAP.md).
 - With requests on, Home gains "Artists you might like": artists you don't have that are like the ones you play most, each opening to their page. Your server is asked who is similar (it needs Last.fm or Deezer for that, and Navidrome uses Deezer unless told otherwise), and Lidarr says who each one is.
 - A "Made for you" row on Home, built from your listening: On repeat, Your top songs, Rediscover and mixes of the genres you play most. You can add mixes of your own, made to rules you set: a genre, a rating, liked songs only, the years, how long since you played them, how lately they were added. Each has a page that stays up to date and can be saved as a playlist.
 - Follows up what you ask for: when a requested album arrives it says so, lists it under Requests, and puts the songs an imported playlist was missing into that playlist.
-- Keeps songs ready: each song is kept on this PC once it has played, and the next few in the queue are fetched ahead of time, so the music carries on through a dropped connection and replays start at once. You choose how much space that may take (2 GB unless changed) and how far ahead to fetch; the songs played longest ago make way when it fills.
+- Keeps songs ready: each song is kept on this PC once it has played, and the next few in the queue are fetched ahead of time, so the music carries on through a dropped connection and replays start at once. You choose how much space that may take (2 GB unless changed), which folder it's in, and how far ahead to fetch; the songs played longest ago make way when it fills.
 - Rides out a bad connection: a stream that stops arriving is asked for again from where it stopped, usually before the audio in hand runs out. If the server can't be reached at all the song waits where it is, the player says it's reconnecting, and the music carries on from the same place when the server is back. Skipping, stopping and seeking still act at once while a stream is stuck.
 - Playing a song from a search starts its radio: that song, then others like it.
 - Keeps your devices in step: the queue and your place in it, Recently played, pinned playlists, each list's shuffle and sort, the dates songs were added and the theme follow you to the app on another PC. The queue uses the server's saved-queue feature; the rest is kept in the comment of a playlist named "Nexus Music sync". When another PC has been playing in the last half hour, the queue panel offers "Continue here", which picks its queue up where it had got to. The plays behind "Your stats" are shared too, so the last four weeks and six months cover every PC.
@@ -93,6 +93,7 @@ What's planned next is in the [roadmap](ROADMAP.md).
 | Ctrl+Up, Ctrl+Down | Volume |
 | M | Mute |
 | Up, Down, Page Up, Page Down, Home, End | Move through the songs on the page |
+| Down, in the search box | Leave the box for the songs found |
 | Shift with any of those | Select from where you started to where you've moved |
 | Ctrl+A | Select every song on the page |
 | Ctrl+Z | Undo the last removal from, or move within, a playlist |

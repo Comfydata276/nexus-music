@@ -159,6 +159,9 @@ pub struct Settings {
     pub download_quality: u32,
     /// The folder downloads are kept in; empty for the app's own.
     pub downloads_dir: String,
+    /// The folder songs are kept in as they play; empty for the app's own. Read when the app
+    /// starts.
+    pub songs_dir: String,
     /// Playlists kept at the top of the sidebar, in the order they were pinned.
     pub pinned_playlists: Vec<String>,
     /// Choices remembered for individual playlists, albums and so on, by route key.
@@ -234,6 +237,7 @@ impl Default for Settings {
             exclusive: false,
             download_quality: 0,
             downloads_dir: String::new(),
+            songs_dir: String::new(),
             pinned_playlists: Vec::new(),
             lists: std::collections::HashMap::new(),
             cache_limit_mb: 2048,

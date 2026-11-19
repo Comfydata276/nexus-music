@@ -435,6 +435,7 @@ impl Controller {
     pub fn install(ui: ui::MainWindow) -> Rc<Controller> {
         let paths = Paths::new();
         let (settings, settings_note) = Settings::load_checked(&paths.settings);
+        let settings_songs_dir = settings.songs_dir.clone();
         crate::mixes::set_rules(settings.rule_mixes.clone());
         crate::audio::source::clean_stale(&paths.buffers);
         let engine = Engine::new(paths.buffers.clone(), |event| {
@@ -520,7 +521,19 @@ impl Controller {
             search_whole: RefCell::new(None),
             search_filter: Cell::new(0),
             search_filter_query: RefCell::default(),
-            song_cache: crate::songcache::SongCache::new(paths.songs.clone()),
+            song_cache: crate::songcache::SongCache::new({
+                // Somewhere of your choosing, if you've chosen. Then what was kept in the
+                // app's own folder is of no more use, and is cleared.
+                if settings_songs_dir.is_empty() {
+                    paths.songs.clone()
+                } else {
+                    for stale in std::fs::read_dir(&paths.songs).into_iter().flatten().flatten() {
+                        let _ = std::fs::remove_file(stale.path());
+                    }
+                    let _ = std::fs::create_dir_all(&settings_songs_dir);
+                    PathBuf::from(&settings_songs_dir)
+                }
+            }),
             fetch_ahead: crate::songcache::Ahead::new(),
             keep_ticks: Cell::new(0),
             keep_rounds: Cell::new(0),
@@ -2824,6 +2837,10 @@ impl Controller {
         }
         self.set_cursor_row(Some(row), false);
         self.set_selection(rows);
+        // The keyboard follows the click: out of the search box, if it was there, so the
+        // arrow keys carry on from this row.
+        let app = self.ui.global::<ui::App>();
+        app.set_main_focus(app.get_main_focus().wrapping_add(1));
     }
 
     pub fn clear_selection(&self) {
@@ -3396,6 +3413,8 @@ impl Controller {
         page.set_volume_level(settings.volume_level as i32);
         page.set_level_modes(strings(config::LEVEL_MODES.to_vec()));
         page.set_level_mode(settings.level_mode.min(2) as i32);
+        page.set_songs_folder(if settings.songs_dir.is_empty() { self.paths.songs.display().to_string() } else { settings.songs_dir.clone() }.into());
+        page.set_songs_folder_custom(!settings.songs_dir.is_empty());
         page.set_untagged_levels(strings(config::UNTAGGED_LEVELS.iter().map(|level| level.0).collect()));
         page.set_untagged_level(config::UNTAGGED_LEVELS.iter().position(|level| (level.1 - settings.untagged_db).abs() < 0.1).unwrap_or(0) as i32);
         page.set_preamps(strings(config::PREAMPS.iter().map(|preamp| preamp.0).collect()));
@@ -3965,6 +3984,12 @@ impl Controller {
         });
         settings.on_set_offline(|on| {
             with(|ctl| ctl.set_offline_mode(on));
+        });
+        settings.on_change_songs_folder(|| {
+            with(|ctl| ctl.change_songs_folder());
+        });
+        settings.on_reset_songs_folder(|| {
+            with(|ctl| ctl.set_songs_folder(None));
         });
         settings.on_change_downloads_folder(|| {
             with(|ctl| ctl.change_downloads_folder());

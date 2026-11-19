@@ -66,6 +66,8 @@ pub enum PromptAction {
     RuleText { rule: u64, field: &'static str },
     /// The folder to keep downloads in was typed in.
     DownloadsFolder,
+    /// The folder for songs kept as they play was typed in.
+    SongsFolder,
     /// Ask Lidarr for an album (by its name for it), or for several by (artist, album).
     RequestAlbum { album: String, title: String, song: String },
     AddArtist { artist: String, name: String },
@@ -1002,7 +1004,7 @@ impl Controller {
     /// Asks which folder downloads should be kept in, then moves them there.
     pub fn change_downloads_folder(self: &Rc<Self>) {
         #[cfg(windows)]
-        match crate::picker::pick_folder(&self.ui) {
+        match crate::picker::pick_folder(&self.ui, "Choose a folder for downloads") {
             Some(Some(folder)) => return self.move_downloads(folder),
             Some(None) => return,
             None => {}
@@ -1010,6 +1012,41 @@ impl Controller {
         // Without the system's folder window: ask for the place by name.
         *self.prompt.borrow_mut() = Some(PromptAction::DownloadsFolder);
         self.open_prompt("Downloads folder", "Type the folder to keep downloads in.", "Move downloads", Some(""), false);
+    }
+
+    /// Asks which folder songs should be kept in as they play.
+    pub fn change_songs_folder(self: &Rc<Self>) {
+        #[cfg(windows)]
+        match crate::picker::pick_folder(&self.ui, "Choose a folder for kept songs") {
+            Some(Some(folder)) => return self.set_songs_folder(Some(folder)),
+            Some(None) => return,
+            None => {}
+        }
+        *self.prompt.borrow_mut() = Some(PromptAction::SongsFolder);
+        self.open_prompt("Kept songs folder", "Type the folder to keep songs in as they play.", "Use this folder", Some(""), false);
+    }
+
+    /// Notes where songs are to be kept as they play (`None` for the app's own folder). The
+    /// app goes on using the folder it started with until it's next opened; nothing is
+    /// moved, since what's kept is only ever a copy of what's on the server.
+    pub fn set_songs_folder(self: &Rc<Self>, folder: Option<std::path::PathBuf>) {
+        if let Some(folder) = &folder {
+            if std::fs::create_dir_all(folder).is_err() || !folder.is_dir() {
+                return self.toast(format!("{} can't be used as a folder.", folder.display()));
+            }
+        }
+        let text = folder.filter(|folder| *folder != self.paths.songs).map(|folder| folder.display().to_string()).unwrap_or_default();
+        if self.settings.borrow().songs_dir == text {
+            return;
+        }
+        self.settings.borrow_mut().songs_dir = text.clone();
+        self.save_settings();
+        self.push_settings();
+        self.toast(if text.is_empty() {
+            "Kept songs go back to the app's own folder the next time it starts.".to_string()
+        } else {
+            format!("Kept songs will go in {text} from the next time the app starts.")
+        });
     }
 
     pub fn prompt_import_path(&self) {
@@ -1056,6 +1093,11 @@ impl Controller {
             PromptAction::SavePreset => self.save_preset(&name),
             PromptAction::NewMix => self.new_rule_mix(&name),
             PromptAction::RuleText { rule, field } => self.set_rule_text(rule, field, &name),
+            PromptAction::SongsFolder => {
+                if !name.is_empty() {
+                    self.set_songs_folder(Some(std::path::PathBuf::from(name.trim_matches('"'))));
+                }
+            }
             PromptAction::DownloadsFolder => {
                 if !name.is_empty() {
                     self.move_downloads(std::path::PathBuf::from(name.trim_matches('"')));

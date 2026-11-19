@@ -555,6 +555,13 @@ export component TopBar inherits Rectangle {
                             Search.open = false;
                             return accept;
                         }
+                        // With the suggestions closed, Down leaves the box for the results:
+                        // the arrow keys then move through the songs found.
+                        if !Search.open && event.text == Key.DownArrow && App.page == Page.search {
+                            App.main-focus += 1;
+                            View.move-selection(1, false);
+                            return accept;
+                        }
                         return reject;
                     }
                 }

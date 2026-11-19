@@ -25,13 +25,13 @@ fn owner(ui: &crate::ui::MainWindow) -> Option<HWND> {
 
 /// Asks for a folder. `None` if the window couldn't be shown at all; `Some(None)` if it was
 /// closed without choosing.
-pub fn pick_folder(ui: &crate::ui::MainWindow) -> Option<Option<PathBuf>> {
+pub fn pick_folder(ui: &crate::ui::MainWindow, title: &str) -> Option<Option<PathBuf>> {
     let owner = owner(ui);
     unsafe {
         let dialog: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
         let options = dialog.GetOptions().ok()?;
         dialog.SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM).ok()?;
-        let _ = dialog.SetTitle(w!("Choose a folder for downloads"));
+        let _ = dialog.SetTitle(&HSTRING::from(title));
         if dialog.Show(owner).is_err() {
             return Some(None);
         }

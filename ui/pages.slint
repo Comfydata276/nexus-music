@@ -900,6 +900,17 @@ export component StackPage inherits Rectangle {
             for track[index] in View.tracks: HorizontalLayout {
                 padding-left: 12px;
                 padding-right: 12px;
+                // The keyboard moved to this row: bring it into view.
+                property <int> reveal: View.reveal-tick;
+                changed reveal => {
+                    if index == View.cursor-row {
+                        if -scroll.content-y > self.y - 8px {
+                            scroll.content-y = min(0px, -(self.y - 8px));
+                        } else if -scroll.content-y + scroll.visible-height < self.y + self.height + 8px {
+                            scroll.content-y = scroll.visible-height - self.y - self.height - 8px;
+                        }
+                    }
+                }
                 TrackRow {
                     track: track;
                     show-album: View.show-album;
@@ -2295,6 +2306,23 @@ export component SettingsPage inherits Rectangle {
                                 options: Settings.cache-limits;
                                 selected: Settings.cache-limit;
                                 chosen(index) => { Settings.set-cache-limit(index); }
+                            }
+                        }
+
+                        if Settings.cache-limit > 0: SettingRow {
+                            nested: true;
+                            title: "Kept songs folder";
+                            detail: Settings.songs-folder + ". A change takes effect the next time the app starts; nothing is moved, since kept songs are only copies of what's on your server.";
+                            HorizontalLayout {
+                                spacing: 8px;
+                                if Settings.songs-folder-custom: TextButton {
+                                    text: "Use default";
+                                    clicked => { Settings.reset-songs-folder(); }
+                                }
+                                TextButton {
+                                    text: "Change";
+                                    clicked => { Settings.change-songs-folder(); }
+                                }
                             }
                         }
 

@@ -512,6 +512,11 @@ export global Settings {
     in property <bool> downloads-folder-custom;
     callback change-downloads-folder();
     callback reset-downloads-folder();
+    // The same for the songs kept as they play.
+    in property <string> songs-folder;
+    in property <bool> songs-folder-custom;
+    callback change-songs-folder();
+    callback reset-songs-folder();
     // Which of `qualities` downloads are saved in.
     in property <int> download-quality;
     // Offline mode is switched on.
