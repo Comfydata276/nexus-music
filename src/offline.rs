@@ -229,10 +229,27 @@ impl Controller {
         );
     }
 
+    /// A quick look at whether the server is still there, while music plays. Finding it gone
+    /// starts the usual checks for its return; finding it there changes nothing.
+    pub fn check_server(self: &Rc<Self>) {
+        if self.is_offline() {
+            return;
+        }
+        self.request(
+            |client| client.ping().map(|_| ()),
+            |ctl, answer| match answer {
+                Ok(()) => {}
+                Err(error) if error.sign_in_refused() => ctl.leave("Your saved sign-in no longer works. Sign in again."),
+                Err(_) => ctl.set_unreachable(true),
+            },
+        );
+    }
+
     /// The server is reachable: send what was held back, and top up downloaded playlists.
     fn came_online(self: &Rc<Self>) {
         self.flush_pending();
         self.covers.retry_failed(self);
+        self.resume_waiting();
         self.sync_collections();
         self.look_elsewhere();
     }

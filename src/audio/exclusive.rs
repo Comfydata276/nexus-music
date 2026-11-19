@@ -266,6 +266,7 @@ pub fn open(shared: Arc<Shared>, device_id: String, rate: u32, bits: u32) -> Res
                 scratch: Vec::with_capacity(frames as usize * 2),
                 fade: 0.0,
                 volume: 1.0,
+                level: 0.0,
             };
             let fade_step = 1.0 / (rate as f32 * 0.012);
             let mut mix = vec![0f32; frames as usize * 2];

@@ -6,7 +6,7 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -24,7 +24,7 @@ use symphonia::core::meta::MetadataOptions;
 use symphonia::core::units::{Time, TimeBase};
 
 use super::dsp::{Controls, EQ_BANDS, Effects, soft_clip};
-use super::source::Download;
+use super::source::{Download, Interrupt};
 use crate::subsonic::Client;
 
 /// How long after pausing an exclusive device is handed back for other apps to use.
@@ -42,8 +42,8 @@ pub struct TrackRequest {
     /// A downloaded copy to play instead of streaming.
     pub local: Option<PathBuf>,
     /// When streaming: where to keep the file once it has all arrived, so it needn't be
-    /// fetched again.
-    pub keep: Option<PathBuf>,
+    /// fetched again, and the fewest bytes the whole song can come to.
+    pub keep: Option<(PathBuf, u64)>,
     /// An internet radio stream: endless, with no seeking.
     pub live: bool,
     pub url: String,
@@ -67,48 +67,107 @@ pub enum Event {
     Started(u64),
     /// Everything queued in the engine has finished playing.
     Finished,
-    Failed { token: u64, message: String, unsupported: bool },
+    /// `network` is whether fetching the track is what went wrong, as against playing it.
+    Failed { token: u64, message: String, unsupported: bool, network: bool },
     /// A radio station announced what it's playing.
     StreamTitle { token: u64, title: String },
     /// The output device was (re)opened: how it's being driven, in words.
     Output { status: String, exclusive: bool },
+    /// There is nothing to play through.
+    NoDevice,
 }
 
 struct Segment {
     token: u64,
-    /// Device frame, counted from the last flush, at which this track begins.
+    /// Device frame, counted from when the app started, at which this track begins.
     start_frame: u64,
     /// Track time at `start_frame`.
     offset: f64,
 }
 
+/// The segment audible once `played` frames have gone out, discarding the ones left behind.
+fn audible(segments: &mut VecDeque<Segment>, played: u64) -> Option<&Segment> {
+    while segments.len() > 1 && segments[1].start_frame <= played {
+        segments.pop_front();
+    }
+    segments.front().filter(|s| s.start_frame <= played)
+}
+
+/// Room for a second of stereo at any sample rate a device will take (a power of two).
+const RING_SLOTS: usize = 1 << 20;
+
+/// Decoded audio on its way to the device: interleaved stereo at the device's sample rate.
+/// The decoder's thread writes and the device's callback reads, and neither ever waits for
+/// the other: there is no lock, only counts of how much has been written and read.
 struct Ring {
-    /// Interleaved stereo at the device sample rate.
-    buf: VecDeque<f32>,
-    capacity_frames: usize,
-    written: u64,
-    played: u64,
-    segments: VecDeque<Segment>,
+    slots: Box<[AtomicU32]>,
+    /// Samples written and read since the app started.
+    written: AtomicU64,
+    read: AtomicU64,
+    /// Everything written before this was thrown away by a seek or a new track; the reader
+    /// skips to here.
+    void_before: AtomicU64,
+    /// How many frames may wait at once: a second of audio at the device's rate.
+    capacity_frames: AtomicUsize,
 }
 
 impl Ring {
-    fn clear(&mut self) {
-        self.buf.clear();
-        self.written = 0;
-        self.played = 0;
-        self.segments.clear();
+    fn new() -> Ring {
+        Ring {
+            slots: (0..RING_SLOTS).map(|_| AtomicU32::new(0)).collect(),
+            written: AtomicU64::new(0),
+            read: AtomicU64::new(0),
+            void_before: AtomicU64::new(0),
+            capacity_frames: AtomicUsize::new(48_000),
+        }
+    }
+
+    fn set_capacity(&self, frames: usize) {
+        self.capacity_frames.store(frames.clamp(1, RING_SLOTS / 2), Ordering::Relaxed);
+    }
+
+    /// Frames written since the app started.
+    fn written_frames(&self) -> u64 {
+        self.written.load(Ordering::Acquire) / 2
+    }
+
+    /// Frames that have gone to the device, or been thrown away, since the app started.
+    fn played_frames(&self) -> u64 {
+        self.read.load(Ordering::Acquire).max(self.void_before.load(Ordering::Acquire)) / 2
+    }
+
+    fn waiting_frames(&self) -> usize {
+        (self.written_frames() - self.played_frames()) as usize
     }
 
     fn free_frames(&self) -> usize {
-        self.capacity_frames.saturating_sub(self.buf.len() / 2)
+        self.capacity_frames.load(Ordering::Relaxed).saturating_sub(self.waiting_frames())
     }
 
-    /// The segment currently audible, discarding the ones already left behind.
-    fn audible(&mut self) -> Option<&Segment> {
-        while self.segments.len() > 1 && self.segments[1].start_frame <= self.played {
-            self.segments.pop_front();
+    /// Throws away what hasn't been played. For the writer's side.
+    fn clear(&self) {
+        self.void_before.store(self.written.load(Ordering::Relaxed), Ordering::Release);
+    }
+
+    /// Adds samples. For the writer's side, which checks `free_frames` first.
+    fn push(&self, samples: impl Iterator<Item = f32>) {
+        let mut at = self.written.load(Ordering::Relaxed);
+        for sample in samples {
+            self.slots[at as usize & (RING_SLOTS - 1)].store(sample.to_bits(), Ordering::Relaxed);
+            at += 1;
         }
-        self.segments.front().filter(|s| s.start_frame <= self.played)
+        self.written.store(at, Ordering::Release);
+    }
+
+    /// Moves up to `frames` frames into `out`. For the reader's side. Returns how many frames
+    /// are still waiting afterwards.
+    fn pop(&self, out: &mut Vec<f32>, frames: usize) -> usize {
+        let read = self.read.load(Ordering::Relaxed).max(self.void_before.load(Ordering::Acquire));
+        let waiting = ((self.written.load(Ordering::Acquire) - read) / 2) as usize;
+        let take = frames.min(waiting);
+        out.extend((0..take as u64 * 2).map(|i| f32::from_bits(self.slots[(read + i) as usize & (RING_SLOTS - 1)].load(Ordering::Relaxed))));
+        self.read.store(read + take as u64 * 2, Ordering::Release);
+        waiting - take
     }
 }
 
@@ -123,7 +182,12 @@ struct OutputChoice {
 
 pub(super) struct Shared {
     choice: Mutex<OutputChoice>,
-    ring: Mutex<Ring>,
+    ring: Ring,
+    /// Where each track begins in what has been written to the ring. Never touched by the
+    /// device's callback.
+    segments: Mutex<VecDeque<Segment>>,
+    /// Raised while a command is waiting, so the engine's thread stops waiting on a download.
+    interrupt: Arc<Interrupt>,
     playing: AtomicBool,
     volume: AtomicU32,
     out_rate: AtomicU32,
@@ -134,6 +198,40 @@ pub(super) struct Shared {
     /// Seconds of overlap between one track and the next; 0 for none.
     crossfade: AtomicU32,
     effects: Controls,
+}
+
+impl Shared {
+    fn new() -> Shared {
+        Shared {
+            choice: Mutex::new(OutputChoice::default()),
+            ring: Ring::new(),
+            segments: Mutex::default(),
+            interrupt: Arc::default(),
+            playing: AtomicBool::new(false),
+            volume: AtomicU32::new(1.0f32.to_bits()),
+            out_rate: AtomicU32::new(48_000),
+            decoding: AtomicU64::new(0),
+            rebuild: AtomicBool::new(false),
+            crossfade: AtomicU32::new(0f32.to_bits()),
+            effects: Controls::new(),
+        }
+    }
+
+    /// The audible track and the position within it, in seconds.
+    fn position(&self) -> Option<(u64, f64)> {
+        let rate = self.out_rate.load(Ordering::Relaxed).max(1) as f64;
+        let played = self.ring.played_frames();
+        let mut segments = self.segments.lock().unwrap();
+        audible(&mut segments, played).map(|s| (s.token, s.offset + (played - s.start_frame) as f64 / rate))
+    }
+
+    /// Throws away what's waiting to be played and starts counting a track from here.
+    fn restart_at(&self, token: u64, offset: f64) {
+        self.ring.clear();
+        let mut segments = self.segments.lock().unwrap();
+        segments.clear();
+        segments.push_back(Segment { token, start_frame: self.ring.written_frames(), offset });
+    }
 }
 
 enum Slot {
@@ -153,6 +251,7 @@ enum Cmd {
 struct OpenError {
     message: String,
     unsupported: bool,
+    network: bool,
 }
 
 /// An opened track: its download, demuxer and decoder.
@@ -184,23 +283,7 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(buffer_dir: PathBuf, on_event: impl Fn(Event) + Send + 'static) -> Engine {
-        let shared = Arc::new(Shared {
-            choice: Mutex::new(OutputChoice::default()),
-            ring: Mutex::new(Ring {
-                buf: VecDeque::new(),
-                capacity_frames: 48_000,
-                written: 0,
-                played: 0,
-                segments: VecDeque::new(),
-            }),
-            playing: AtomicBool::new(false),
-            volume: AtomicU32::new(1.0f32.to_bits()),
-            out_rate: AtomicU32::new(48_000),
-            decoding: AtomicU64::new(0),
-            rebuild: AtomicBool::new(false),
-            crossfade: AtomicU32::new(0f32.to_bits()),
-            effects: Controls::new(),
-        });
+        let shared = Arc::new(Shared::new());
         let (tx, rx) = mpsc::channel();
         let worker = Worker {
             rx,
@@ -212,6 +295,7 @@ impl Engine {
             current: None,
             next: None,
             ended: false,
+            failed: false,
             load_token: 0,
             next_token: 0,
             announced: 0,
@@ -222,6 +306,7 @@ impl Engine {
             paused_since: None,
             suspended: false,
             last_device_retry: Instant::now(),
+            no_device: false,
             load_started: None,
             tail: Vec::new(),
             capturing_tail: false,
@@ -230,6 +315,7 @@ impl Engine {
             opened_for: 0,
             rate_switch: false,
             stream_title: String::new(),
+            watched: Instant::now(),
         };
         std::thread::Builder::new()
             .name("audio-engine".into())
@@ -240,7 +326,16 @@ impl Engine {
 
     /// Replaces whatever is playing with this track.
     pub fn load(&self, client: Client, request: TrackRequest) {
-        let _ = self.tx.send(Cmd::Load(client, request));
+        self.urgent(Cmd::Load(client, request));
+    }
+
+    /// Sends a command that replaces what the engine is doing. If its thread is waiting on a
+    /// download that isn't arriving, it stops waiting and takes the command at once.
+    fn urgent(&self, cmd: Cmd) {
+        self.shared.interrupt.raise();
+        if self.tx.send(cmd).is_err() {
+            self.shared.interrupt.lower();
+        }
     }
 
     /// Names the track to continue with, gaplessly, when the current one ends.
@@ -249,11 +344,11 @@ impl Engine {
     }
 
     pub fn seek(&self, secs: f64) {
-        let _ = self.tx.send(Cmd::Seek(secs));
+        self.urgent(Cmd::Seek(secs));
     }
 
     pub fn stop(&self) {
-        let _ = self.tx.send(Cmd::Stop);
+        self.urgent(Cmd::Stop);
     }
 
     pub fn set_playing(&self, playing: bool) {
@@ -295,10 +390,7 @@ impl Engine {
 
     /// The audible track and the position within it, in seconds.
     pub fn position(&self) -> Option<(u64, f64)> {
-        let rate = self.shared.out_rate.load(Ordering::Relaxed).max(1) as f64;
-        let mut ring = self.shared.ring.lock().unwrap();
-        let played = ring.played;
-        ring.audible().map(|s| (s.token, s.offset + (played - s.start_frame) as f64 / rate))
+        self.shared.position()
     }
 
     /// Token of the track the decoder has reached, which runs ahead of the audible one near
@@ -358,6 +450,9 @@ struct Worker {
     next: Option<Box<Deck>>,
     /// The current deck has been decoded to its end.
     ended: bool,
+    /// The current deck stopped because it failed. The player has been told and decides what
+    /// happens next, so its running out isn't also reported as the queue finishing.
+    failed: bool,
     load_token: u64,
     next_token: u64,
     announced: u64,
@@ -369,6 +464,8 @@ struct Worker {
     paused_since: Option<Instant>,
     suspended: bool,
     last_device_retry: Instant,
+    /// The last attempt to open a device found none.
+    no_device: bool,
     /// When the current load was requested, until its first audio is queued. For timing.
     load_started: Option<Instant>,
     /// The closing seconds of the current track, held back to blend into the next one.
@@ -385,6 +482,8 @@ struct Worker {
     rate_switch: bool,
     /// What the radio station last said it was playing.
     stream_title: String,
+    /// When the downloads were last checked for having gone quiet.
+    watched: Instant,
 }
 
 struct Fade {
@@ -402,6 +501,7 @@ fn trace(what: &str, since: Instant) {
 
 impl Worker {
     fn run(mut self) {
+        self.shared.interrupt.claim();
         // The device is opened when the first track loads, by which time the settings have
         // said which device to use and how.
         loop {
@@ -447,6 +547,9 @@ impl Worker {
     // ---- commands ---------------------------------------------------------------------------
 
     fn handle(&mut self, cmd: Cmd) {
+        if matches!(cmd, Cmd::Load(..) | Cmd::Seek(_) | Cmd::Stop) {
+            self.shared.interrupt.lower();
+        }
         match cmd {
             Cmd::Load(client, request) => {
                 self.reset();
@@ -480,14 +583,7 @@ impl Worker {
                         if self.exclusive_wanted() && (self.output.is_none() || self.wrong_rate_for(&deck)) {
                             self.open_output_for(Some((deck.rate, deck.bits)));
                         }
-                        let mut ring = self.shared.ring.lock().unwrap();
-                        ring.clear();
-                        ring.segments.push_back(Segment {
-                            token,
-                            start_frame: 0,
-                            offset: deck.base + deck.start,
-                        });
-                        drop(ring);
+                        self.shared.restart_at(token, deck.base + deck.start);
                         self.shared.decoding.store(token, Ordering::Relaxed);
                         self.current = Some(deck);
                         self.ended = false;
@@ -496,6 +592,7 @@ impl Worker {
                         token,
                         message: e.message,
                         unsupported: e.unsupported,
+                        network: e.network,
                     }),
                 }
             }
@@ -540,6 +637,7 @@ impl Worker {
         self.current = None;
         self.next = None;
         self.ended = false;
+        self.failed = false;
         self.load_token = 0;
         self.next_token = 0;
         self.announced = 0;
@@ -548,15 +646,17 @@ impl Worker {
         self.rate_switch = false;
         self.clear_fade();
         self.shared.decoding.store(0, Ordering::Relaxed);
-        self.shared.ring.lock().unwrap().clear();
+        self.shared.ring.clear();
+        self.shared.segments.lock().unwrap().clear();
     }
 
     fn spawn_open(&self, client: Client, request: TrackRequest, slot: Slot) {
         let tx = self.tx.clone();
         let dir = self.buffer_dir.clone();
         let token = request.token;
+        let interrupt = self.shared.interrupt.clone();
         let spawned = std::thread::Builder::new().name("track-open".into()).spawn(move || {
-            let result = open_deck(client, request, &dir).map(Box::new);
+            let result = open_deck(client, request, &dir, interrupt).map(Box::new);
             let _ = tx.send(Cmd::Opened { token, slot, result });
         });
         if spawned.is_err() {
@@ -564,6 +664,7 @@ impl Worker {
                 token,
                 message: "Couldn't start a thread to open the track.".into(),
                 unsupported: false,
+                network: false,
             });
         }
     }
@@ -592,9 +693,7 @@ impl Worker {
         self.pending.clear();
         self.resampler = None;
         self.clear_fade();
-        let mut ring = self.shared.ring.lock().unwrap();
-        ring.clear();
-        ring.segments.push_back(Segment { token, start_frame: 0, offset });
+        self.shared.restart_at(token, offset);
     }
 
     // ---- periodic work ----------------------------------------------------------------------
@@ -631,9 +730,9 @@ impl Worker {
                 }
                 self.suspended = false;
             }
-            if self.output.is_none() {
-                // The device was handed back while paused: take it again, at the same rate so
-                // the audio already buffered still fits.
+            if self.output.is_none() && (!self.no_device || self.last_device_retry.elapsed() > Duration::from_secs(1)) {
+                // The device was handed back while paused, or there was none to be had: take
+                // it now, at the same rate so the audio already buffered still fits.
                 let format = self.current.as_ref().map(|deck| (deck.rate, deck.bits));
                 self.open_output_for(format);
             }
@@ -652,6 +751,16 @@ impl Worker {
             }
         }
 
+        // See that what's being fetched is still arriving, while there's audio in hand.
+        if self.watched.elapsed() > Duration::from_millis(500) {
+            self.watched = Instant::now();
+            for deck in self.current.iter().chain(self.next.iter()) {
+                if let Some(download) = &deck.download {
+                    download.watch();
+                }
+            }
+        }
+
         // Pass on what a radio station says it's playing.
         if let Some(deck) = self.current.as_ref() {
             if let Some(title) = deck.download.as_ref().map(|d| d.title()).filter(|t| *t != self.stream_title) {
@@ -661,10 +770,8 @@ impl Worker {
         }
 
         // Announce track changes as playback crosses them, and the end of the queue.
-        let mut ring = self.shared.ring.lock().unwrap();
-        let drained = ring.played >= ring.written;
-        let audible = ring.audible().map(|s| s.token);
-        drop(ring);
+        let drained = self.shared.ring.waiting_frames() == 0;
+        let audible = self.shared.position().map(|(token, _)| token);
         if let Some(token) = audible {
             if token != self.announced {
                 self.announced = token;
@@ -679,7 +786,7 @@ impl Worker {
                 self.open_output_for(format);
                 self.resampler = None;
                 self.clear_fade();
-                self.shared.ring.lock().unwrap().clear();
+                self.shared.ring.clear();
                 self.promote_next();
                 return;
             }
@@ -690,15 +797,14 @@ impl Worker {
             self.current = None;
             self.ended = false;
             self.shared.decoding.store(0, Ordering::Relaxed);
-            self.emit(Event::Finished);
+            if !std::mem::take(&mut self.failed) {
+                self.emit(Event::Finished);
+            }
         }
     }
 
     fn audible_position(&self) -> Option<(u64, f64)> {
-        let rate = self.shared.out_rate.load(Ordering::Relaxed).max(1) as f64;
-        let mut ring = self.shared.ring.lock().unwrap();
-        let played = ring.played;
-        ring.audible().map(|s| (s.token, s.offset + (played - s.start_frame) as f64 / rate))
+        self.shared.position()
     }
 
     /// Moves pending samples into the ring. Returns true when everything fit.
@@ -706,11 +812,8 @@ impl Worker {
         if self.pending.is_empty() {
             return true;
         }
-        let mut ring = self.shared.ring.lock().unwrap();
-        let frames = ring.free_frames().min(self.pending.len() / 2);
-        ring.buf.extend(self.pending.drain(..frames * 2));
-        ring.written += frames as u64;
-        drop(ring);
+        let frames = self.shared.ring.free_frames().min(self.pending.len() / 2);
+        self.shared.ring.push(self.pending.drain(..frames * 2));
         if frames > 0 {
             if let Some(since) = self.load_started.take() {
                 trace("first audio queued", since);
@@ -729,14 +832,28 @@ impl Worker {
             Err(SymError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 return self.end_of_deck();
             }
+            // The wait for more of the file was cut short because a command is waiting. Whatever
+            // it is (another track, a seek, stop) replaces this read.
+            Err(_) if self.shared.interrupt.raised() => return,
             Err(e) => {
                 let token = deck.token;
+                let network = deck.download.as_ref().is_some_and(|download| download.troubled());
                 // Whatever was decoded so far plays out; the player decides what follows.
                 self.emit(Event::Failed {
                     token,
-                    message: format!("Playback stopped: {e}"),
+                    message: if network { format!("{e}") } else { format!("Playback stopped: {e}") },
                     unsupported: false,
+                    network,
                 });
+                self.failed = true;
+                if network {
+                    // The song isn't over, its stream is: don't run on into the next one.
+                    // What was decoded plays out while the player sees about getting it back.
+                    self.drain_resampler();
+                    self.release_tail();
+                    self.ended = true;
+                    return;
+                }
                 return self.end_of_deck();
             }
         };
@@ -761,7 +878,9 @@ impl Worker {
                     token,
                     message: format!("Playback stopped: {e}"),
                     unsupported: false,
+                    network: false,
                 });
+                self.failed = true;
                 return self.end_of_deck();
             }
         };
@@ -942,17 +1061,16 @@ impl Worker {
                 self.fade = Some(Fade { tail, done: 0 });
             }
         }
-        let mut ring = self.shared.ring.lock().unwrap();
-        let start_frame = ring.written + (self.pending.len() / 2) as u64;
-        ring.segments.push_back(Segment {
+        let start_frame = self.shared.ring.written_frames() + (self.pending.len() / 2) as u64;
+        self.shared.segments.lock().unwrap().push_back(Segment {
             token: deck.token,
             start_frame,
             offset: deck.base + deck.start,
         });
-        drop(ring);
         self.shared.decoding.store(deck.token, Ordering::Relaxed);
         self.current = Some(deck);
         self.ended = false;
+        self.failed = false;
     }
 
     // ---- output device ----------------------------------------------------------------------
@@ -974,6 +1092,7 @@ impl Worker {
     /// play, which exclusive mode matches.
     fn open_output_for(&mut self, format: Option<(u32, u32)>) {
         self.output = None;
+        self.no_device = false;
         self.suspended = false;
         self.last_device_retry = Instant::now();
         let choice = self.shared.choice.lock().unwrap().clone();
@@ -1011,6 +1130,16 @@ impl Worker {
             }
             Err(_) => {
                 self.set_rate(48_000);
+                if std::env::var_os("NEXUS_AUDIO_DUMP").is_none() {
+                    // Nothing to play through. Playing on in silence would move through the
+                    // queue and count songs nobody heard, so say so and let the player pause;
+                    // the device is looked for again when play is pressed.
+                    self.no_device = true;
+                    self.emit(Event::Output { status: "No sound device found.".into(), exclusive: false });
+                    self.emit(Event::NoDevice);
+                    return;
+                }
+                // For checking output without a sound card: play to the file named instead.
                 (Output::Null(spawn_null_output(self.shared.clone())), "No sound device found.".to_string())
             }
         };
@@ -1020,8 +1149,7 @@ impl Worker {
 
     fn set_rate(&self, rate: u32) {
         self.shared.out_rate.store(rate, Ordering::Relaxed);
-        let mut ring = self.shared.ring.lock().unwrap();
-        ring.capacity_frames = (rate as f64 * RING_SECONDS) as usize;
+        self.shared.ring.set_capacity((rate as f64 * RING_SECONDS) as usize);
     }
 }
 
@@ -1069,8 +1197,8 @@ fn run_resampler(rs: &mut ResamplerState, out: &mut Vec<f32>) {
     rs.input.drain(..consumed.min(rs.input.len()));
 }
 
-fn open_deck(client: Client, request: TrackRequest, dir: &std::path::Path) -> Result<Deck, OpenError> {
-    let fail = |message: String, unsupported: bool| OpenError { message, unsupported };
+fn open_deck(client: Client, request: TrackRequest, dir: &std::path::Path, interrupt: Arc<Interrupt>) -> Result<Deck, OpenError> {
+    let fail = |message: String, unsupported: bool| OpenError { message, unsupported, network: false };
     let (source, download): (Box<dyn symphonia::core::io::MediaSource>, Option<Download>) = match &request.local {
         Some(path) => {
             let file = std::fs::File::open(path)
@@ -1078,14 +1206,16 @@ fn open_deck(client: Client, request: TrackRequest, dir: &std::path::Path) -> Re
             (Box::new(file), None)
         }
         None => {
-            let download = Download::start(client, request.url.clone(), request.ranged, request.live, dir, request.keep.clone());
+            let download =
+                Download::start(client, request.url.clone(), request.ranged, request.live, dir, request.keep.clone(), interrupt);
             // These two formats decide whether they can seek only when asked to, so it's safe
             // to skip the tag check at the end of the file. Others (MP4, Ogg) need the end
             // while opening.
             if matches!(request.suffix.as_str(), "flac" | "mp3") {
                 download.hold_seeking();
             }
-            let reader = download.reader().map_err(|e| fail(e.to_string(), false))?;
+            // The download never got going: the server couldn't be reached, or said no.
+            let reader = download.reader().map_err(|e| OpenError { message: e.to_string(), unsupported: false, network: true })?;
             (Box::new(reader), Some(download))
         }
     };
@@ -1097,8 +1227,11 @@ fn open_deck(client: Client, request: TrackRequest, dir: &std::path::Path) -> Re
     let mut format = symphonia::default::get_probe()
         .probe(&hint, stream, FormatOptions::default(), MetadataOptions::default())
         .map_err(|e| {
-            let unsupported = matches!(e, SymError::Unsupported(_));
-            fail(format!("This file couldn't be read: {e}"), unsupported)
+            // A file that stopped arriving while it was being opened is the connection's
+            // doing, and it isn't a format to ask the server to convert.
+            let network = download.as_ref().is_some_and(|download| download.troubled());
+            let unsupported = matches!(e, SymError::Unsupported(_)) && !network;
+            OpenError { message: format!("This file couldn't be read: {e}"), unsupported, network }
         })?;
     if let Some(download) = &download {
         download.allow_seeking();
@@ -1156,6 +1289,9 @@ pub(super) struct CallbackState {
     /// Play/pause envelope, 0.0 to 1.0, so transport changes don't click.
     pub(super) fade: f32,
     pub(super) volume: f32,
+    /// Running-dry envelope, 0.0 to 1.0: eases down as the last of the buffered audio goes
+    /// out, and back up when there is more.
+    pub(super) level: f32,
 }
 
 fn open_device(shared: &Arc<Shared>, device_id: &str) -> Result<(cpal::Stream, u32), String> {
@@ -1198,6 +1334,7 @@ where
         scratch: Vec::with_capacity(16_384),
         fade: 0.0,
         volume: 1.0,
+        level: 0.0,
     };
     device
         .build_output_stream(
@@ -1226,13 +1363,10 @@ where
     let target_volume = f32::from_bits(shared.volume.load(Ordering::Relaxed));
 
     st.scratch.clear();
+    // How many frames are still waiting behind the ones taken now.
+    let mut behind = 0;
     if playing || st.fade > 0.0 {
-        // Never block the audio thread: on the rare contended lock, output a moment of silence.
-        if let Ok(mut ring) = shared.ring.try_lock() {
-            let take = frames.min(ring.buf.len() / 2);
-            st.scratch.extend(ring.buf.drain(..take * 2));
-            ring.played += take as u64;
-        }
+        behind = shared.ring.pop(&mut st.scratch, frames);
     }
     let got = st.scratch.len() / 2;
     st.effects.process(&shared.effects, &mut st.scratch);
@@ -1241,7 +1375,11 @@ where
     for (i, frame) in out.chunks_mut(channels.max(1)).enumerate() {
         st.fade = if playing { (st.fade + fade_step).min(1.0) } else { (st.fade - fade_step).max(0.0) };
         st.volume += volume_step;
-        let gain = st.fade * st.volume;
+        // When the audio in hand is about to run out (the download fell behind), the last few
+        // milliseconds are eased down to nothing instead of stopping dead with a click.
+        let ahead = if i < got { (got - i + behind) as f32 * fade_step } else { 0.0 };
+        st.level = if ahead < st.level { ahead } else { (st.level + fade_step).min(ahead).min(1.0) };
+        let gain = st.fade * st.volume * st.level;
         let (l, r) = if i < got { (st.scratch[i * 2] * gain, st.scratch[i * 2 + 1] * gain) } else { (0.0, 0.0) };
         match frame.len() {
             1 => frame[0] = T::from_sample((l + r) * 0.5),
@@ -1275,12 +1413,8 @@ fn spawn_null_output(shared: Arc<Shared>) -> Arc<AtomicBool> {
                 continue;
             }
             let rate = shared.out_rate.load(Ordering::Relaxed) as usize;
-            let mut ring = shared.ring.lock().unwrap();
-            let take = (rate / 50).min(ring.buf.len() / 2);
             taken.clear();
-            taken.extend(ring.buf.drain(..take * 2));
-            ring.played += take as u64;
-            drop(ring);
+            shared.ring.pop(&mut taken, rate / 50);
             effects.process(&shared.effects, &mut taken);
             if let Some(file) = dump.as_mut() {
                 let bytes: Vec<u8> = taken.iter().flat_map(|s| s.to_le_bytes()).collect();
@@ -1315,6 +1449,85 @@ mod tests {
         assert_eq!(trims(1024, 500, 0, 524), (0, 524));
         // A packet that doesn't say how long it is: trim as asked, within what there is.
         assert_eq!(trims(100, 0, 30, 200), (30, 70));
+    }
+
+    #[test]
+    fn the_ring_hands_over_what_was_written_in_order() {
+        let ring = Ring::new();
+        ring.set_capacity(1000);
+        ring.push((0..200).map(|n| n as f32));
+        assert_eq!((ring.waiting_frames(), ring.free_frames()), (100, 900));
+        let mut out = Vec::new();
+        assert_eq!(ring.pop(&mut out, 30), 70);
+        assert_eq!(out, (0..60).map(|n| n as f32).collect::<Vec<_>>());
+        assert_eq!((ring.played_frames(), ring.written_frames()), (30, 100));
+        // Asking for more than there is hands over what there is.
+        out.clear();
+        assert_eq!(ring.pop(&mut out, 500), 0);
+        assert_eq!(out.len(), 140);
+
+        // Round the end of its storage many times over, nothing is lost or repeated.
+        ring.set_capacity(RING_SLOTS / 2);
+        let mut next = 0u32;
+        for _ in 0..7 {
+            ring.push((0..400_000).map(|i| (next + i) as f32));
+            out.clear();
+            assert_eq!(ring.pop(&mut out, 200_000), 0);
+            assert!(out.iter().enumerate().all(|(i, sample)| *sample == (next + i as u32) as f32));
+            next += 400_000;
+        }
+    }
+
+    #[test]
+    fn clearing_the_ring_skips_what_was_waiting() {
+        let ring = Ring::new();
+        ring.push((0..200).map(|n| n as f32));
+        let mut out = Vec::new();
+        ring.pop(&mut out, 10);
+        ring.clear();
+        assert_eq!((ring.waiting_frames(), ring.played_frames()), (0, 100));
+        ring.push([7.0, 8.0].into_iter());
+        out.clear();
+        assert_eq!(ring.pop(&mut out, 10), 0);
+        assert_eq!(out, [7.0, 8.0]);
+
+        // A track starts counting from where the ring had got to.
+        let shared = Shared::new();
+        shared.ring.push((0..2000).map(|_| 0.0));
+        shared.restart_at(5, 42.0);
+        assert_eq!(shared.position(), Some((5, 42.0)));
+        shared.ring.push((0..96_000).map(|_| 0.0));
+        shared.ring.pop(&mut out, 24_000);
+        assert_eq!(shared.position(), Some((5, 42.5)));
+    }
+
+    #[test]
+    fn running_dry_fades_out_and_coming_back_fades_in() {
+        let shared = Shared::new();
+        shared.playing.store(true, Ordering::Relaxed);
+        let step = 1.0 / (48_000.0 * 0.012);
+        let mut state =
+            CallbackState { effects: Effects::new(48_000), scratch: Vec::new(), fade: 1.0, volume: 1.0, level: 1.0 };
+        // A steady signal, with 600 frames left of it: less than two callbacks' worth.
+        shared.ring.push((0..1200).map(|_| 0.5));
+        let mut heard = Vec::new();
+        for _ in 0..2 {
+            let mut out = [0f32; 1024];
+            fill(&mut out, 2, step, &shared, &mut state);
+            heard.extend(out.iter().step_by(2).copied());
+        }
+        assert_eq!(heard[0], 0.5);
+        assert_eq!(*heard.last().unwrap(), 0.0);
+        let biggest_drop = heard.windows(2).map(|pair| (pair[0] - pair[1]).abs()).fold(0.0, f32::max);
+        assert!(biggest_drop <= step, "a click of {biggest_drop} where the audio ran out");
+
+        // More arrives: it comes up from nothing instead of starting at full level.
+        shared.ring.push((0..8000).map(|_| 0.5));
+        let mut out = [0f32; 4096];
+        fill(&mut out, 2, step, &shared, &mut state);
+        let back: Vec<f32> = out.iter().step_by(2).copied().collect();
+        assert!(back[0] <= step && back[2000] == 0.5, "{} then {}", back[0], back[2000]);
+        assert!(back.windows(2).all(|pair| pair[1] >= pair[0] && pair[1] - pair[0] <= step));
     }
 
     /// Decodes a whole file the way the engine does and counts the frames it would play.

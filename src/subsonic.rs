@@ -1026,7 +1026,14 @@ impl Client {
             };
             request = request.header("Range", value);
         }
-        let response = request.call().map_err(|e| ApiError::Network(network_hint(&e)))?;
+        // A server that takes the connection and then says nothing is given up on sooner for
+        // audio than for other calls: something is waiting to be heard.
+        let response = request
+            .config()
+            .timeout_recv_response(Some(Duration::from_secs(15)))
+            .build()
+            .call()
+            .map_err(|e| ApiError::Network(network_hint(&e)))?;
         let status = response.status().as_u16();
         if !response.status().is_success() {
             return Err(ApiError::Network(format!("HTTP status {status}.")));

@@ -318,6 +318,8 @@ pub struct Controller {
     /// The server isn't answering.
     pub unreachable: Cell<bool>,
     pub reconnect_timer: slint::Timer,
+    /// Waits before asking again for a song whose stream stopped arriving.
+    pub retry_timer: slint::Timer,
     /// Sharing with other devices (see `sync`): the timers that pass changes on and look
     /// for others', whether an exchange is under way (and another is wanted after it), and
     /// the playlist that holds the shared data.
@@ -436,6 +438,7 @@ impl Controller {
             sending: RefCell::default(),
             unreachable: Cell::new(false),
             reconnect_timer: slint::Timer::default(),
+            retry_timer: slint::Timer::default(),
             import_report: RefCell::new(None),
             import_missing: RefCell::default(),
             import_fills: RefCell::default(),

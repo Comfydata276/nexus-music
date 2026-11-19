@@ -1253,12 +1253,13 @@ export component PlayerBar inherits Rectangle {
                 }
 
                 now-format := Text {
-                    text: Player.format;
-                    color: Player.lossless ? Theme.accent-bright : Theme.faint;
+                    property <string> waiting: Player.reconnecting ? "Reconnecting…" : Player.stalled ? "Buffering…" : "";
+                    text: self.waiting != "" ? self.waiting : Player.format;
+                    color: self.waiting != "" ? Theme.muted : Player.lossless ? Theme.accent-bright : Theme.faint;
                     font-size: 11px;
                     font-weight: 600;
                     overflow: elide;
-                    accessible-label: "Audio format: " + Player.format;
+                    accessible-label: self.waiting != "" ? self.waiting : "Audio format: " + Player.format;
                 }
             }
 

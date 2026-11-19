@@ -10,8 +10,9 @@ use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::subsonic::Client;
 
@@ -119,6 +120,9 @@ pub struct Wanted {
     pub client: Client,
     pub url: String,
     pub path: PathBuf,
+    /// The fewest bytes the whole song can come to, for a conversion (whose length the
+    /// server doesn't announce); 0 for a file as it is.
+    pub least: u64,
 }
 
 struct Plan {
@@ -176,33 +180,77 @@ impl Ahead {
     }
 }
 
-/// Downloads one song to where it's kept. Left unfinished if told to stop or the connection
-/// fails; it'll be asked for again if it's still wanted.
+/// How a fetch is getting on, shared between the thread doing it and the one watching it.
+#[derive(Default)]
+struct Transfer {
+    arrived: AtomicU64,
+    over: AtomicBool,
+    /// The watcher has walked away: the file is no longer this transfer's to touch.
+    dropped: AtomicBool,
+}
+
+/// How long a fetch may bring nothing before it's walked away from.
+const QUIET: Duration = Duration::from_secs(30);
+
+/// Downloads one song to where it's kept. Left unfinished if told to stop, the connection
+/// fails or it goes quiet; it'll be asked for again if it's still wanted.
+///
+/// The transfer runs on a thread of its own, because a read from a connection that has died
+/// without closing never returns. This thread only watches, and so can always move on.
 fn fetch(want: &Wanted, stop: &AtomicBool) {
+    let transfer = Arc::new(Transfer::default());
+    let (job, theirs) = (want.clone(), transfer.clone());
+    let spawned = std::thread::Builder::new().name("fetch-ahead-transfer".into()).spawn(move || {
+        bring(&job, &theirs);
+        theirs.over.store(true, Ordering::Relaxed);
+    });
+    if spawned.is_err() {
+        return;
+    }
+    let (mut had, mut since) = (0, Instant::now());
+    while !transfer.over.load(Ordering::Relaxed) {
+        std::thread::sleep(Duration::from_millis(100));
+        let now = transfer.arrived.load(Ordering::Relaxed);
+        if now != had {
+            (had, since) = (now, Instant::now());
+        }
+        if stop.load(Ordering::Relaxed) || since.elapsed() > QUIET {
+            transfer.dropped.store(true, Ordering::Relaxed);
+            let _ = fs::remove_file(want.path.with_extension("fetch"));
+            return;
+        }
+    }
+}
+
+fn bring(want: &Wanted, transfer: &Transfer) {
     let arriving = want.path.with_extension("fetch");
+    let dropped = || transfer.dropped.load(Ordering::Relaxed);
     let done = (|| -> Result<(), String> {
         let (mut body, length) = want.client.open_stream(&want.url, None).map_err(|e| e.to_string())?;
         let mut file = fs::File::create(&arriving).map_err(|e| e.to_string())?;
         let mut buffer = vec![0u8; 64 * 1024];
         let mut got: u64 = 0;
         loop {
-            if stop.load(Ordering::Relaxed) {
-                return Err("stopped".into());
-            }
             match body.read(&mut buffer).map_err(|e| e.to_string())? {
+                _ if dropped() => return Err("stopped".into()),
                 0 => break,
                 count => {
                     file.write_all(&buffer[..count]).map_err(|e| e.to_string())?;
                     got += count as u64;
+                    transfer.arrived.store(got, Ordering::Relaxed);
                 }
             }
         }
-        // Short of what was promised: the connection closed early.
-        if got == 0 || length.is_some_and(|length| got < length) {
+        // Short of what was promised, or of what the whole song must come to: the
+        // connection closed early.
+        if got == 0 || got < want.least || length.is_some_and(|length| got < length) {
             return Err("incomplete".into());
         }
         file.flush().map_err(|e| e.to_string())
     })();
+    if dropped() {
+        return;
+    }
     if done.is_err() || fs::rename(&arriving, &want.path).is_err() {
         let _ = fs::remove_file(&arriving);
     }

@@ -342,6 +342,10 @@ export global Player {
     in property <string> track-id;
     in property <bool> playing;
     in property <bool> buffering;
+    // The song's stream stopped arriving and is being asked for again.
+    in property <bool> reconnecting;
+    // The song is meant to be playing but is waiting for more of its stream.
+    in property <bool> stalled;
     in property <float> position;
     in property <float> duration;
     in property <float> volume: 1;

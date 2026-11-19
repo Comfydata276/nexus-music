@@ -28,6 +28,7 @@ What's planned next is in the [roadmap](ROADMAP.md).
 - A "Made for you" row on Home, built from your listening: On repeat, Your top songs, Rediscover and mixes of the genres you play most.
 - Follows up what you ask for: when a requested album arrives it says so, lists it under Requests, and puts the songs an imported playlist was missing into that playlist.
 - Keeps songs ready: each song is kept on this PC once it has played, and the next few in the queue are fetched ahead of time, so the music carries on through a dropped connection and replays start at once. You choose how much space that may take (2 GB unless changed) and how far ahead to fetch; the songs played longest ago make way when it fills.
+- Rides out a bad connection: a stream that stops arriving is asked for again from where it stopped, usually before the audio in hand runs out. If the server can't be reached at all the song waits where it is, the player says it's reconnecting, and the music carries on from the same place when the server is back. Skipping, stopping and seeking still act at once while a stream is stuck.
 - Playing a song from a search starts its radio: that song, then others like it.
 - Keeps your devices in step: the queue and your place in it, Recently played, pinned playlists, each list's shuffle and sort, the dates songs were added and the theme follow you to the app on another PC. The queue uses the server's saved-queue feature; the rest is kept in the comment of a playlist named "Nexus Music sync".
 - Select several songs with Ctrl or Shift, then drag them onto a playlist or the queue, or
@@ -49,7 +50,7 @@ What's planned next is in the [roadmap](ROADMAP.md).
   sign-in the server refuses takes you back to the sign-in screen, and the queue is still
   there after signing in again.
 - A Now Playing screen with large artwork, the song's format and lyrics or what's next.
-- Internet radio stations set up in Navidrome, star ratings, and a sleep timer.
+- Internet radio stations set up in Navidrome (a station whose stream drops is rejoined), star ratings, and a sleep timer.
 - Plays MP3, FLAC, AAC/M4A, ALAC, Ogg Vorbis, WAV and AIFF directly. Anything else (Opus,
   WMA, APE and so on) is converted to MP3 by Navidrome on the fly.
 - Create, rename, pin and delete playlists; add and remove songs, with a warning before

@@ -44,19 +44,22 @@ Things that lose data or interrupt the music.
 - [x] `scripts/check` fails when the build fails, and `scripts/release` runs the tests
       before it publishes.
 
-## 2. Streaming that survives a bad connection
+## 2. Streaming that survives a bad connection (0.25.0)
 
-- [ ] A stalled stream doesn't freeze the player: Next, Stop and seeking act at once.
-- [ ] A stream that has gone quiet is reconnected and carries on from the same place, instead
+- [x] A stalled stream doesn't freeze the player: Next, Stop and seeking act at once.
+- [x] A stream that has gone quiet is reconnected and carries on from the same place, instead
       of skipping to the next song.
-- [ ] A lost connection is noticed while music plays, not only when a page is opened, and
-      the player says it is reconnecting.
-- [ ] The audio buffer is shared without a lock, and running dry fades out instead of
+- [x] A lost connection is noticed while music plays, not only when a page is opened, and
+      the player says it is buffering or reconnecting.
+- [x] The audio buffer is shared without a lock, and running dry fades out instead of
       clicking.
-- [ ] If the sound device can't be opened the player pauses and says why, instead of moving
-      through the queue in silence and counting plays. A device plugged in mid-song is used.
-- [ ] Internet radio rejoins a station that dropped.
-- [ ] A converted song that was cut short isn't kept in the cache.
+- [x] If there is no sound device the player pauses and says why, instead of moving through
+      the queue in silence and counting plays. One plugged in later is used when play is
+      pressed.
+- [x] Internet radio rejoins a station that dropped.
+- [x] A converted song that was cut short isn't kept in the cache.
+- [x] Fetching songs ahead of time gives up on a transfer that has gone quiet, instead of
+      waiting on it for the rest of the session.
 
 ## 3. Smooth with a big queue and a big library
 

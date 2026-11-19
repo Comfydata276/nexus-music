@@ -11,7 +11,7 @@ use slint::{ComponentHandle, Model, ModelRc, VecModel};
 use crate::audio::engine::{Event, TrackRequest};
 use crate::config::{SavedQueue, Settings, VOLUME_LEVELS};
 use crate::controller::{Controller, Route, with};
-use crate::subsonic::{Lyrics, Song};
+use crate::subsonic::{ApiError, Lyrics, Song};
 use crate::ui;
 
 /// Start fetching the following track once this much of the current one remains.
@@ -63,6 +63,14 @@ pub struct Playback {
     /// Songs whose original files the decoders rejected.
     needs_transcode: HashSet<String>,
     failures: u32,
+    /// How many times in a row the current song's stream has been asked for again after the
+    /// connection failed, and whether it's now waiting for the server to come back.
+    reconnects: u32,
+    waiting_for_server: bool,
+    /// Where the song had got to when last looked at, and for how many looks in a row (four
+    /// a second) it hasn't moved although it's meant to be playing.
+    seen_at: Option<f64>,
+    stuck_ticks: u32,
     /// Similar songs are being fetched to continue after the queue.
     /// Songs whose kept copy was thrown away because it wouldn't play.
     dropped_kept: HashSet<String>,
@@ -103,6 +111,10 @@ impl Playback {
             saved_at: 0.0,
             needs_transcode: HashSet::new(),
             failures: 0,
+            reconnects: 0,
+            waiting_for_server: false,
+            seen_at: None,
+            stuck_ticks: 0,
             dropped_kept: HashSet::new(),
             autoplay_loading: false,
             autoplay_seed: String::new(),
@@ -379,13 +391,17 @@ impl Controller {
             pb.listened = 0.0;
             pb.last_tick = at;
             pb.scrobbled = false;
+            pb.waiting_for_server = false;
             let request = self.request_for(&mut pb, &song, token, at);
             pb.transcoded = !request.ranged;
             (request, pb.playing)
         };
+        self.retry_timer.stop();
         self.engine.load(client, request);
         self.engine.set_playing(playing);
-        self.ui.global::<ui::Player>().set_buffering(true);
+        let player = self.ui.global::<ui::Player>();
+        player.set_buffering(true);
+        player.set_reconnecting(false);
         self.track_changed();
     }
 
@@ -479,7 +495,8 @@ impl Controller {
             TrackRequest {
                 token,
                 local: None,
-                keep: kept,
+                // The server says how long the file is, so nothing shorter is kept.
+                keep: kept.map(|path| (path, 0)),
                 live: false,
                 url: client.stream_url(&song.id, 0, 0),
                 ranged: true,
@@ -496,7 +513,7 @@ impl Controller {
                 token,
                 local: None,
                 // Only a conversion that starts at the beginning is the whole song.
-                keep: kept.filter(|_| offset == 0.0),
+                keep: kept.filter(|_| offset == 0.0).map(|path| (path, least_bytes(song, bitrate))),
                 live: false,
                 url: client.stream_url(&song.id, if cap == 0 { 320 } else { cap }, offset as u32),
                 ranged: false,
@@ -561,7 +578,8 @@ impl Controller {
                 in_use.insert(path.clone());
                 // The one playing is already streaming, and is kept when it has all arrived.
                 if place > 0 && !crate::songcache::ready(&path) {
-                    wanted.push(crate::songcache::Wanted { client: client.clone(), url: client.stream_url(&song.id, bitrate, 0), path });
+                    let least = if bitrate == 0 { 0 } else { least_bytes(song, bitrate) };
+                    wanted.push(crate::songcache::Wanted { client: client.clone(), url: client.stream_url(&song.id, bitrate, 0), path, least });
                 }
             }
         }
@@ -927,6 +945,7 @@ impl Controller {
                 let advanced = {
                     let mut pb = self.playback.borrow_mut();
                     pb.failures = 0;
+                    pb.reconnects = 0;
                     if token != 0 && token == pb.next_token {
                         // The engine rolled into the next track by itself.
                         pb.cursor = pb.next_cursor;
@@ -951,7 +970,9 @@ impl Controller {
                         return;
                     }
                 };
-                self.ui.global::<ui::Player>().set_buffering(false);
+                let player = self.ui.global::<ui::Player>();
+                player.set_buffering(false);
+                player.set_reconnecting(false);
                 if advanced {
                     self.track_changed();
                 }
@@ -1023,13 +1044,29 @@ impl Controller {
                 self.output_exclusive.set(exclusive);
                 self.show_format();
             }
-            Event::Failed { token, message, unsupported } => {
-                let (retry, title, position, give_up) = {
+            Event::NoDevice => {
+                // Playing on with nothing to play through would count songs nobody heard.
+                let was_playing = std::mem::replace(&mut self.playback.borrow_mut().playing, false);
+                if was_playing {
+                    self.engine.set_playing(false);
+                    self.sync_transport();
+                    self.toast("No sound device found, so playback is paused.");
+                }
+            }
+            Event::Failed { token, message, unsupported, network } => {
+                let (retry, title, position) = {
                     let mut pb = self.playback.borrow_mut();
                     if token != pb.current_token {
                         return;
                     }
                     let Some(song) = pb.current().cloned() else { return };
+                    if network {
+                        // The stream stopped arriving. That's the connection, not the song.
+                        let attempt = pb.reconnects;
+                        pb.reconnects += 1;
+                        drop(pb);
+                        return self.reconnect(token, attempt, &song, message);
+                    }
                     // A downloaded copy that won't play is discarded, and the song streamed.
                     if self.downloads.borrow().has(&song.id) {
                         let position = pb.position;
@@ -1048,28 +1085,122 @@ impl Controller {
                     }
                     // First try having the server convert a file we can't decode.
                     let retry = unsupported && pb.needs_transcode.insert(song.id.clone());
-                    if !retry {
-                        pb.failures += 1;
-                    }
-                    (retry, song.title, pb.position, pb.failures >= 3 || pb.following().is_none())
+                    (retry, song.title, pb.position)
                 };
                 if retry {
                     self.restart_current(position);
                     return;
                 }
-                self.toast(format!("Couldn't play “{title}”. {message}"));
-                if give_up {
-                    let mut pb = self.playback.borrow_mut();
-                    pb.playing = false;
-                    pb.current_token = 0;
-                    drop(pb);
-                    self.engine.set_playing(false);
-                    self.engine.stop();
-                    self.sync_transport();
-                } else {
-                    self.next_track();
-                }
+                self.pass_over(&title, &message);
             }
+        }
+    }
+
+    /// Says so when a song that's meant to be playing hasn't moved for a second and a half:
+    /// it's waiting for more of its stream to arrive.
+    fn notice_stall(&self, position: Option<(u64, f64)>) {
+        let stalled = {
+            let mut pb = self.playback.borrow_mut();
+            let at = position.filter(|(token, _)| *token == pb.current_token).map(|(_, seconds)| seconds);
+            if !pb.playing || pb.current_token == 0 || (at.is_some() && at != pb.seen_at) {
+                pb.stuck_ticks = 0;
+            } else {
+                pb.stuck_ticks += 1;
+            }
+            pb.seen_at = at;
+            pb.stuck_ticks >= 6
+        };
+        let player = self.ui.global::<ui::Player>();
+        if player.get_stalled() != stalled {
+            player.set_stalled(stalled);
+        }
+    }
+
+    /// The current song's stream stopped arriving. It's asked for again from where it had
+    /// got to, a few times and a little further apart each time. If that doesn't bring it
+    /// back and the server can't be reached, the song waits where it is and carries on when
+    /// the server returns; if the server is there, the song is what's wrong and is passed over.
+    fn reconnect(self: &Rc<Self>, token: u64, attempt: u32, song: &Song, message: String) {
+        const WAITS: [u64; 4] = [1, 2, 4, 8];
+        let player = self.ui.global::<ui::Player>();
+        player.set_reconnecting(true);
+        if let Some(&wait) = WAITS.get(attempt as usize) {
+            self.retry_timer.start(slint::TimerMode::SingleShot, Duration::from_secs(wait), move || {
+                with(|ctl| ctl.retry_current(token));
+            });
+            return;
+        }
+        let title = song.title.clone();
+        if !song.radio_url.is_empty() {
+            // A radio station is somewhere else on the internet, not the music server.
+            return self.pass_over(&title, &message);
+        }
+        self.request(
+            |client| client.ping().map(|_| ()),
+            move |ctl, answer| {
+                if ctl.playback.borrow().current_token != token {
+                    return;
+                }
+                match answer {
+                    Ok(()) | Err(ApiError::Server { .. }) => ctl.pass_over(&title, &message),
+                    Err(_) => {
+                        ctl.playback.borrow_mut().waiting_for_server = true;
+                        ctl.set_unreachable(true);
+                        ctl.toast("Lost the connection to the server. The music will carry on when it's back.");
+                    }
+                }
+            },
+        );
+    }
+
+    /// Asks for the current song's stream again, from where it had got to.
+    fn retry_current(self: &Rc<Self>, token: u64) {
+        let position = {
+            let pb = self.playback.borrow();
+            if pb.current_token != token {
+                return;
+            }
+            pb.position
+        };
+        let radio = self.playback.borrow().current().is_some_and(|song| !song.radio_url.is_empty());
+        self.restart_current(if radio { 0.0 } else { position });
+        self.ui.global::<ui::Player>().set_reconnecting(true);
+    }
+
+    /// The server is back: carry on with a song that was waiting for it.
+    pub fn resume_waiting(self: &Rc<Self>) {
+        let position = {
+            let mut pb = self.playback.borrow_mut();
+            if !std::mem::take(&mut pb.waiting_for_server) || pb.current_token == 0 {
+                return;
+            }
+            pb.reconnects = 0;
+            pb.position
+        };
+        self.restart_current(position);
+    }
+
+    /// Gives up on the current song: says so, and moves to the next unless too many in a row
+    /// have failed or there is no next.
+    fn pass_over(self: &Rc<Self>, title: &str, message: &str) {
+        self.ui.global::<ui::Player>().set_reconnecting(false);
+        let give_up = {
+            let mut pb = self.playback.borrow_mut();
+            pb.failures += 1;
+            pb.reconnects = 0;
+            pb.failures >= 3 || pb.following().is_none()
+        };
+        self.toast(format!("Couldn't play “{title}”. {message}"));
+        if give_up {
+            let mut pb = self.playback.borrow_mut();
+            pb.playing = false;
+            pb.current_token = 0;
+            drop(pb);
+            self.engine.set_playing(false);
+            self.engine.stop();
+            self.sync_transport();
+        } else {
+            self.next_track();
         }
     }
 
@@ -1084,6 +1215,11 @@ impl Controller {
         if keep_ticks % 16 == 0 && self.playback.borrow().current_token != 0 {
             self.keep_ahead();
         }
+        // Once a minute while music plays, see that the server is still there, so a lost
+        // connection shows before the songs kept on this PC run out.
+        if keep_ticks % 240 == 0 && self.playback.borrow().playing {
+            self.check_server();
+        }
         self.tick_requests();
         if self.mini_open.get() {
             self.sync_mini();
@@ -1096,7 +1232,9 @@ impl Controller {
         }
         #[cfg(windows)]
         crate::frame::set_scale(self.ui.window().scale_factor());
-        let Some((token, seconds)) = self.engine.position() else { return };
+        let position = self.engine.position();
+        self.notice_stall(position);
+        let Some((token, seconds)) = position else { return };
         let lookahead;
         let (arm, submit, checkpoint) = {
             let mut pb = self.playback.borrow_mut();
@@ -2042,6 +2180,14 @@ impl Controller {
 /// The form a song is streamed in: the bit rate to ask for (0 for the file as it is) and
 /// the kind of file that comes back. `native` is whether the app can play the file as it is;
 /// `cap` is the bit rate limit in Settings, 0 for none.
+/// The fewest bytes a whole converted song can come to: most of what its length works out at,
+/// at the bit rate asked for or the file's own if that's lower. A conversion doesn't say how
+/// long it will be, so one that ends well short of this was cut off, and isn't kept.
+fn least_bytes(song: &Song, bitrate: u32) -> u64 {
+    let rate = if song.bit_rate > 0 { bitrate.min(song.bit_rate) } else { bitrate };
+    song.duration as u64 * rate as u64 * 125 * 4 / 5
+}
+
 fn stream_form(native: bool, cap: u32, suffix: &str) -> (u32, &str) {
     if native && cap == 0 { (0, suffix) } else { (if cap == 0 { 320 } else { cap }, "mp3") }
 }
