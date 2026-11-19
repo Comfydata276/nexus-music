@@ -181,6 +181,14 @@ pub fn tidy(address: &str) -> String {
     if address.is_empty() || address.contains("://") { address.to_string() } else { format!("http://{address}") }
 }
 
+/// The host (and port) an address points at, which is what a saved key belongs to.
+pub fn host(address: &str) -> String {
+    let address = tidy(address);
+    let rest = address.split_once("://").map_or(address.as_str(), |(_, rest)| rest);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    authority.rsplit_once('@').map_or(authority, |(_, host)| host).to_lowercase()
+}
+
 /// A key for showing: dots, then its last six characters, enough to tell which key it is.
 /// A key too short for that to be safe is all dots.
 pub fn mask(key: &str) -> String {
@@ -734,6 +742,16 @@ mod tests {
         assert_eq!(tidy(" https://lidarr.example.org/ "), "https://lidarr.example.org");
         assert_eq!(tidy("192.168.1.5:8686"), "http://192.168.1.5:8686");
         assert_eq!(tidy(""), "");
+    }
+
+    #[test]
+    fn finds_the_host_a_key_belongs_to() {
+        assert_eq!(host("https://Lidarr.example.org/lidarr/"), "lidarr.example.org");
+        assert_eq!(host("http://lidarr.example.org"), "lidarr.example.org");
+        assert_eq!(host("192.168.1.5:8686"), "192.168.1.5:8686");
+        assert_ne!(host("192.168.1.5:8686"), host("192.168.1.5:8687"));
+        assert_ne!(host("https://lidarr.example.org"), host("https://lidarr.example.com"));
+        assert_eq!(host(""), "");
     }
 
     #[test]

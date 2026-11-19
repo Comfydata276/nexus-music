@@ -30,18 +30,18 @@ follows from that.
 
 Things that lose data or interrupt the music.
 
-- [ ] A server that answers with an error no longer signs you out and stops the music; only
+- [x] A server that answers with an error no longer signs you out and stops the music; only
       a refused sign-in does. Signing in again keeps the queue.
-- [ ] Likes, ratings and plays made offline are kept until the server has accepted them. A
+- [x] Likes, ratings and plays made offline are kept until the server has accepted them. A
       proxy's error page counts as "try again", not as sent.
-- [ ] Changing Lidarr's address to a different host forgets the saved key, so it is never
+- [x] Changing Lidarr's address to a different host forgets the saved key, so it is never
       sent somewhere it wasn't meant for.
-- [ ] An update is installed only if it matches the checksum GitHub publishes; with no
+- [x] An update is installed only if it matches the checksum GitHub publishes; with no
       checksum it isn't installed.
-- [ ] MP3 and Ogg Vorbis songs are no longer trimmed twice where one song joins the next.
-- [ ] Seeking in a song that is being converted no longer counts the play twice.
-- [ ] Artwork that failed to load is tried again once the connection is back.
-- [ ] `scripts/check` fails when the build fails, and `scripts/release` runs the tests
+- [x] MP3 and Ogg Vorbis songs are no longer trimmed twice where one song joins the next.
+- [x] Seeking in a song that is being converted no longer counts the play twice.
+- [x] Artwork that failed to load is tried again once the connection is back.
+- [x] `scripts/check` fails when the build fails, and `scripts/release` runs the tests
       before it publishes.
 
 ## 2. Streaming that survives a bad connection

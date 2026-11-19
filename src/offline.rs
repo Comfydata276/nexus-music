@@ -30,8 +30,61 @@ impl Pending {
     }
 }
 
+impl Pending {
+    /// What the change is about. Changes to the same thing have to reach the server in order.
+    fn id(&self) -> &str {
+        match self {
+            Pending::Star { id, .. } | Pending::Rating { id, .. } | Pending::Played { id, .. } => id,
+        }
+    }
+}
+
 pub fn load_pending(path: &std::path::Path) -> Vec<Pending> {
     std::fs::read(path).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default()
+}
+
+/// How a round of sending held changes went.
+#[derive(Debug)]
+struct Sent {
+    /// How many the server dealt with.
+    done: usize,
+    /// The ones still to send, in the order they were made.
+    kept: Vec<Pending>,
+    /// The server stopped answering part-way.
+    lost_touch: bool,
+}
+
+/// Sends held changes in order, keeping every one the server hasn't dealt with.
+fn send_all(waiting: &[Pending], mut send: impl FnMut(&Pending) -> ApiResult<()>) -> Sent {
+    let mut sent = Sent { done: 0, kept: Vec::new(), lost_touch: false };
+    // Things with a change that was kept: later changes to them wait behind it.
+    let mut held: Vec<&str> = Vec::new();
+    let mut strange = 0;
+    for (index, change) in waiting.iter().enumerate() {
+        if held.contains(&change.id()) {
+            sent.kept.push(change.clone());
+            continue;
+        }
+        match send(change) {
+            Ok(()) => (sent.done, strange) = (sent.done + 1, 0),
+            // The server is there and said no (the song has gone, say): asking again won't help.
+            Err(error @ ApiError::Server { .. }) if !error.sign_in_refused() => (sent.done, strange) = (sent.done + 1, 0),
+            // Something in front of the server answered in its place (a proxy's error page):
+            // keep the change and carry on, unless that's all that comes back.
+            Err(ApiError::NotSubsonic(_)) if strange < 2 => {
+                strange += 1;
+                held.push(change.id());
+                sent.kept.push(change.clone());
+            }
+            // No server to speak of: this one and the rest wait.
+            Err(_) => {
+                sent.kept.extend_from_slice(&waiting[index..]);
+                sent.lost_touch = true;
+                break;
+            }
+        }
+    }
+    sent
 }
 
 impl Controller {
@@ -41,9 +94,13 @@ impl Controller {
         self.settings.borrow().offline || self.unreachable.get()
     }
 
+    /// Writes down what's still to be sent. Changes on their way to the server stay on file
+    /// until it has answered, so closing the app part-way can't lose them.
     fn save_pending(&self) {
-        if let Ok(json) = serde_json::to_vec(&*self.pending.borrow()) {
-            let _ = std::fs::write(&self.paths.pending, json);
+        let (sending, pending) = (self.sending.borrow(), self.pending.borrow());
+        let held: Vec<&Pending> = sending.iter().chain(pending.iter()).collect();
+        if let Ok(json) = serde_json::to_vec(&held) {
+            crate::config::write_atomically(&self.paths.pending, &json);
         }
     }
 
@@ -59,49 +116,42 @@ impl Controller {
             move |client| sent.send(client),
             move |ctl, result| match result {
                 Ok(()) => {}
-                Err(ApiError::Network(_)) => {
+                // The server said no.
+                Err(error @ ApiError::Server { .. }) if !error.sign_in_refused() => refused(ctl, error.to_string()),
+                // It couldn't be asked: no connection, or a proxy answering in its place.
+                Err(_) => {
                     ctl.pending.borrow_mut().push(change);
                     ctl.save_pending();
                     ctl.set_unreachable(true);
                 }
-                Err(e) => refused(ctl, e.to_string()),
             },
         );
     }
 
     /// Sends everything that was held back while offline.
     fn flush_pending(self: &Rc<Self>) {
-        let waiting = std::mem::take(&mut *self.pending.borrow_mut());
-        if waiting.is_empty() {
+        let Some(client) = self.client() else { return };
+        // One round at a time: what a round is sending is in `sending` until it's over.
+        if !self.sending.borrow().is_empty() || self.pending.borrow().is_empty() {
             return;
         }
-        self.save_pending();
-        self.request(
-            move |client| {
-                let mut unsent = Vec::new();
-                for (index, change) in waiting.iter().enumerate() {
-                    match change.send(client) {
-                        // The server said no to this one; there's nothing to gain by retrying.
-                        Ok(()) | Err(ApiError::Server { .. }) | Err(ApiError::NotSubsonic(_)) => {}
-                        Err(ApiError::Network(_)) => {
-                            unsent.extend_from_slice(&waiting[index..]);
-                            break;
-                        }
-                    }
-                }
-                Ok((waiting.len() - unsent.len(), unsent))
-            },
-            |ctl, result| {
-                let Ok((sent, unsent)) = result else { return };
-                if !unsent.is_empty() {
-                    ctl.pending.borrow_mut().splice(0..0, unsent);
-                    ctl.save_pending();
-                }
-                if sent > 0 {
+        let waiting = std::mem::take(&mut *self.pending.borrow_mut());
+        *self.sending.borrow_mut() = waiting.clone();
+        self.api_pool.spawn(move || {
+            let sent = send_all(&waiting, |change| change.send(&client));
+            crate::controller::post(move |ctl| {
+                ctl.sending.borrow_mut().clear();
+                // Anything changed while this was going on comes after what was kept.
+                ctl.pending.borrow_mut().splice(0..0, sent.kept);
+                ctl.save_pending();
+                if sent.done > 0 {
                     ctl.invalidate("liked");
                 }
-            },
-        );
+                if sent.lost_touch && ctl.client().is_some() {
+                    ctl.set_unreachable(true);
+                }
+            });
+        });
     }
 
     /// Shows whether the app is offline, and why.
@@ -170,9 +220,11 @@ impl Controller {
                     ctl.set_unreachable(false);
                     ctl.came_online();
                 }
-                Err(ApiError::Network(_)) => ctl.set_unreachable(true),
-                Err(ApiError::Server { .. }) => ctl.leave("Your saved sign-in no longer works. Sign in again."),
-                Err(_) => {}
+                Err(error) if error.sign_in_refused() => ctl.leave("Your saved sign-in no longer works. Sign in again."),
+                // No answer, an error from the server, or a proxy answering in its place: none
+                // of those is a reason to sign out. Carry on with what's on this PC and keep
+                // trying.
+                Err(_) => ctl.set_unreachable(true),
             },
         );
     }
@@ -180,7 +232,61 @@ impl Controller {
     /// The server is reachable: send what was held back, and top up downloaded playlists.
     fn came_online(self: &Rc<Self>) {
         self.flush_pending();
+        self.covers.retry_failed(self);
         self.sync_collections();
         self.look_elsewhere();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn star(id: &str, starred: bool) -> Pending {
+        Pending::Star { kind: "song".into(), id: id.into(), starred }
+    }
+
+    fn ids(changes: &[Pending]) -> Vec<&str> {
+        changes.iter().map(Pending::id).collect()
+    }
+
+    #[test]
+    fn keeps_what_the_server_has_not_dealt_with() {
+        let waiting = [star("a", true), star("b", true), star("c", true), star("d", true)];
+        // Everything goes through.
+        let sent = send_all(&waiting, |_| Ok(()));
+        assert_eq!((sent.done, sent.kept.len(), sent.lost_touch), (4, 0, false));
+        // The connection drops at the third: it and the rest wait, in order.
+        let mut calls = 0;
+        let sent = send_all(&waiting, |_| {
+            calls += 1;
+            if calls >= 3 { Err(ApiError::Network("gone".into())) } else { Ok(()) }
+        });
+        assert_eq!((sent.done, ids(&sent.kept), sent.lost_touch), (2, vec!["c", "d"], true));
+        // The server refuses one for good: it isn't asked again, and the rest go.
+        let sent = send_all(&waiting, |change| {
+            if change.id() == "b" { Err(ApiError::Server { code: 70, message: "not found".into() }) } else { Ok(()) }
+        });
+        assert_eq!((sent.done, sent.kept.len()), (4, 0));
+        // A sign-in the server no longer accepts refuses nothing in particular: all of it waits.
+        let sent = send_all(&waiting, |_| Err(ApiError::Server { code: 40, message: "wrong password".into() }));
+        assert_eq!((sent.done, sent.kept.len(), sent.lost_touch), (0, 4, true));
+    }
+
+    #[test]
+    fn keeps_a_change_that_a_proxy_answered_for() {
+        let page = || Err(ApiError::NotSubsonic("502".into()));
+        // One odd answer: that change waits, and so does a later change to the same song.
+        let waiting = [star("a", true), star("b", true), star("a", false), star("c", true)];
+        let sent = send_all(&waiting, |change| if change.id() == "a" { page() } else { Ok(()) });
+        assert_eq!((sent.done, ids(&sent.kept), sent.lost_touch), (2, vec!["a", "a"], false));
+        // Nothing but error pages: stop asking and keep the lot.
+        let waiting = [star("a", true), star("b", true), star("c", true), star("d", true)];
+        let mut calls = 0;
+        let sent = send_all(&waiting, |_| {
+            calls += 1;
+            page()
+        });
+        assert_eq!((sent.done, ids(&sent.kept), sent.lost_touch, calls), (0, vec!["a", "b", "c", "d"], true, 3));
     }
 }

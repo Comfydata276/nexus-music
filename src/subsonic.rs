@@ -24,6 +24,14 @@ pub enum ApiError {
     Server { code: i64, message: String },
 }
 
+impl ApiError {
+    /// Whether the server turned the sign-in itself away (a wrong or unusable password or
+    /// key), as against refusing one request or failing in some other way.
+    pub fn sign_in_refused(&self) -> bool {
+        matches!(self, ApiError::Server { code: 40..=44, .. })
+    }
+}
+
 impl fmt::Display for ApiError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

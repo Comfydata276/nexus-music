@@ -389,6 +389,20 @@ impl Controller {
         self.track_changed();
     }
 
+    /// Loads the track at the cursor again, at `at`: after a seek the engine can't do in
+    /// place, a changed setting, or a retry. It's the same listen carrying on, so what has
+    /// been heard still counts and the song isn't reported as played a second time.
+    fn restart_current(self: &Rc<Self>, at: f64) {
+        let (listened, scrobbled) = {
+            let pb = self.playback.borrow();
+            (pb.listened, pb.scrobbled)
+        };
+        self.start_current(at);
+        let mut pb = self.playback.borrow_mut();
+        pb.listened = listened;
+        pb.scrobbled = scrobbled;
+    }
+
     fn request_for(&self, pb: &mut Playback, song: &Song, token: u64, at: f64) -> TrackRequest {
         let client = self.client().expect("signed in");
         let settings = self.settings.borrow();
@@ -587,7 +601,7 @@ impl Controller {
         if armed {
             if self.engine.decoding_token() == next_token {
                 // The engine already ran on into the old next track; start this one over.
-                self.start_current(position);
+                self.restart_current(position);
             } else {
                 self.playback.borrow_mut().next_token = 0;
                 self.engine.set_next(None);
@@ -698,7 +712,7 @@ impl Controller {
             return;
         }
         if transcoded || self.engine.decoding_token() != token {
-            self.start_current(seconds);
+            self.restart_current(seconds);
         } else {
             self.engine.seek(seconds);
         }
@@ -1021,7 +1035,7 @@ impl Controller {
                         let position = pb.position;
                         drop(pb);
                         self.remove_downloads(std::slice::from_ref(&song.id));
-                        return self.start_current(position);
+                        return self.restart_current(position);
                     }
                     // So is a copy kept from an earlier play (once: if the song still won't
                     // play after that, the copy wasn't what was wrong).
@@ -1030,7 +1044,7 @@ impl Controller {
                         let position = pb.position;
                         drop(pb);
                         let _ = std::fs::remove_file(&kept);
-                        return self.start_current(position);
+                        return self.restart_current(position);
                     }
                     // First try having the server convert a file we can't decode.
                     let retry = unsupported && pb.needs_transcode.insert(song.id.clone());
@@ -1040,7 +1054,7 @@ impl Controller {
                     (retry, song.title, pb.position, pb.failures >= 3 || pb.following().is_none())
                 };
                 if retry {
-                    self.start_current(position);
+                    self.restart_current(position);
                     return;
                 }
                 self.toast(format!("Couldn't play “{title}”. {message}"));
@@ -1333,7 +1347,7 @@ impl Controller {
             (pb.current_token != 0, pb.position)
         };
         if loaded {
-            self.start_current(position);
+            self.restart_current(position);
         }
         self.show_format();
     }

@@ -21,6 +21,10 @@ if gh release view "v$version" >/dev/null 2>&1; then
   exit 1
 fi
 
+# Nothing is published that doesn't build cleanly and pass its tests.
+scripts/check
+scripts/dx cargo test --quiet
+
 scripts/package-windows
 files=("dist/NexusMusic-Setup-$version.exe" "dist/NexusMusic-$version-portable.exe")
 if [ -n "$notes" ]; then

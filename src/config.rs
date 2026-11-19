@@ -426,7 +426,7 @@ pub fn save_history(path: &Path, history: &[Played]) {
     }
 }
 
-fn write_atomically(path: &Path, bytes: &[u8]) {
+pub fn write_atomically(path: &Path, bytes: &[u8]) {
     let temp = path.with_extension("tmp");
     if fs::write(&temp, bytes).is_ok() {
         let _ = fs::rename(&temp, path);

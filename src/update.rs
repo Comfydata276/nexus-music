@@ -121,11 +121,17 @@ fn trusted(url: &str) -> bool {
     url.starts_with(&format!("https://github.com/{REPO}/releases/download/"))
 }
 
+const NO_CHECKSUM: &str =
+    "GitHub didn't publish a checksum for this update, so it can't be checked and wasn't installed. Download it from the release page instead.";
+
 /// Downloads the installer to the temporary folder, checking it against the size and
 /// checksum GitHub published. `progress` is called with the fraction done.
 pub fn download(installer: &Installer, mut progress: impl FnMut(f32)) -> Result<PathBuf, String> {
     if !trusted(&installer.url) {
         return Err("The download address isn't on the project's release page.".into());
+    }
+    if installer.sha256.is_none() {
+        return Err(NO_CHECKSUM.into());
     }
     let name: String =
         installer.name.chars().filter(|c| c.is_ascii_alphanumeric() || "-_.".contains(*c)).collect();
@@ -233,7 +239,8 @@ fn verify(installer: &Installer, path: &std::path::Path) -> Result<(), String> {
         size += n as u64;
     }
     let digest: String = hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect();
-    let intact = size == installer.size && installer.sha256.as_ref().is_none_or(|expected| *expected == digest);
+    // No published checksum means nothing to check against, and that isn't a pass.
+    let intact = size == installer.size && installer.sha256.as_ref().is_some_and(|expected| *expected == digest);
     if intact { Ok(()) } else { Err("The download didn't match the published file, so it wasn't installed.".into()) }
 }
 
@@ -286,6 +293,40 @@ mod tests {
         assert_eq!(installer.name, "NexusMusic-Setup-0.4.0.exe");
         assert_eq!(installer.size, 9);
         assert_eq!(installer.sha256.as_deref(), Some("abcdef"));
+    }
+}
+
+#[cfg(test)]
+mod checksum_tests {
+    use super::*;
+
+    fn installer(bytes: &[u8], sha256: Option<String>) -> Installer {
+        Installer {
+            url: format!("https://github.com/{REPO}/releases/download/v9.9.9/NexusMusic-Setup-9.9.9.exe"),
+            name: "NexusMusic-Setup-9.9.9.exe".into(),
+            size: bytes.len() as u64,
+            sha256,
+        }
+    }
+
+    #[test]
+    fn installs_only_what_matches_a_published_checksum() {
+        let bytes = b"not really an installer";
+        let path = std::env::temp_dir().join(format!("nexus-update-test-{}", std::process::id()));
+        std::fs::write(&path, bytes).unwrap();
+        let digest: String = Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect();
+        assert!(verify(&installer(bytes, Some(digest.clone())), &path).is_ok());
+        // The right size isn't enough.
+        assert!(verify(&installer(bytes, Some("0".repeat(64))), &path).is_err());
+        assert!(verify(&installer(bytes, None), &path).is_err());
+        // The right checksum for a different length isn't either.
+        assert!(verify(&Installer { size: 5, ..installer(bytes, Some(digest)) }, &path).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn will_not_fetch_an_update_with_no_checksum() {
+        assert_eq!(download(&installer(b"", None), |_| {}).unwrap_err(), NO_CHECKSUM);
     }
 }
 

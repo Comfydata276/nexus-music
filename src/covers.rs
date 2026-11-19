@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use slint::{Color, ComponentHandle, Image, Rgba8Pixel, SharedPixelBuffer};
 
@@ -35,11 +35,16 @@ pub struct Covers {
     bytes: Cell<usize>,
     clock: Cell<u64>,
     pending: RefCell<HashSet<Key>>,
-    failed: RefCell<HashSet<Key>>,
+    /// Pictures that couldn't be fetched, and when: each is left alone for `RETRY_AFTER`.
+    failed: RefCell<HashMap<Key, Instant>>,
     tints: RefCell<HashMap<String, Color>>,
     bump: slint::Timer,
     bump_queued: Cell<bool>,
 }
+
+/// How long a picture that couldn't be fetched is left before it's asked for again. The
+/// reason is usually the connection, and that comes back.
+const RETRY_AFTER: Duration = Duration::from_secs(60);
 
 /// The sizes pictures are kept at. Thumbnails are cut down locally from `MEDIUM`, so a cover
 /// seen as a card needs nothing more from the server to appear in a track row or the player.
@@ -92,7 +97,8 @@ impl Covers {
             entry.used = now;
             return entry.image.clone();
         }
-        if !self.failed.borrow().contains(&key) && self.pending.borrow_mut().insert(key.clone()) {
+        let resting = self.failed.borrow().get(&key).is_some_and(|at| at.elapsed() < RETRY_AFTER);
+        if !resting && self.pending.borrow_mut().insert(key.clone()) {
             if let Some(client) = ctl.client() {
                 let dir = self.dir.clone();
                 ctl.art_pool.spawn(move || {
@@ -129,14 +135,29 @@ impl Covers {
                     bytes,
                     used: self.clock.get(),
                 };
+                self.failed.borrow_mut().remove(&key);
                 self.cache.borrow_mut().insert(key, entry);
                 self.bytes.set(self.bytes.get() + bytes);
                 self.evict();
             }
             None => {
-                self.failed.borrow_mut().insert(key);
+                self.failed.borrow_mut().insert(key, Instant::now());
             }
         }
+        self.redraw(ctl);
+    }
+
+    /// The server is back: pictures that couldn't be fetched are asked for again, starting
+    /// with the ones on screen.
+    pub fn retry_failed(&self, ctl: &Controller) {
+        if !self.failed.borrow().is_empty() {
+            self.failed.borrow_mut().clear();
+            self.redraw(ctl);
+        }
+    }
+
+    /// Has everything showing a picture look it up again, shortly.
+    fn redraw(&self, ctl: &Controller) {
         // Art tends to arrive in bursts; one refresh covers the lot.
         if !self.bump_queued.replace(true) {
             let weak = ctl.ui.as_weak();

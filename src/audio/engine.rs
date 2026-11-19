@@ -769,8 +769,7 @@ impl Worker {
         if channels > 0 && rate > 0 {
             // Encoder delay and padding, so albums play through without gaps.
             let frames = samples.len() / channels;
-            let head = (packet.trim_start.get() as usize).min(frames);
-            let tail = (packet.trim_end.get() as usize).min(frames - head);
+            let (head, tail) = trims(frames, packet.dur.get(), packet.trim_start.get(), packet.trim_end.get());
             let body = &samples[head * channels..(frames - tail) * channels];
             deck.time += (frames - head - tail) as f64 / rate as f64;
             // Within a crossfade's length of the end, audio is set aside for blending
@@ -1290,4 +1289,71 @@ fn spawn_null_output(shared: Arc<Shared>) -> Arc<AtomicBool> {
         }
     });
     stop
+}
+
+/// How many frames to drop from the start and end of a decoded packet so that only real audio
+/// is left. `valid` is how many of the packet's frames are real audio; `head` and `tail` are
+/// the encoder's delay and padding in it. The MP3 and Vorbis decoders have already dropped
+/// those, and then `frames` is no more than `valid` and nothing more may go.
+fn trims(frames: usize, valid: u64, head: u64, tail: u64) -> (usize, usize) {
+    let spare = frames.saturating_sub(usize::try_from(valid).unwrap_or(usize::MAX));
+    let head = usize::try_from(head).unwrap_or(usize::MAX).min(spare);
+    let tail = usize::try_from(tail).unwrap_or(usize::MAX).min(spare - head);
+    (head, tail)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn leaves_alone_what_the_decoder_already_trimmed() {
+        // A decoder that trims for itself hands back only the real audio.
+        assert_eq!(trims(47, 47, 1105, 0), (0, 0));
+        // One that doesn't hands back the lot, and the delay and padding go here.
+        assert_eq!(trims(1152, 47, 1105, 0), (1105, 0));
+        assert_eq!(trims(1024, 500, 0, 524), (0, 524));
+        // A packet that doesn't say how long it is: trim as asked, within what there is.
+        assert_eq!(trims(100, 0, 30, 200), (30, 70));
+    }
+
+    /// Decodes a whole file the way the engine does and counts the frames it would play.
+    fn played_frames(bytes: &'static [u8], suffix: &str) -> usize {
+        let stream = MediaSourceStream::new(Box::new(std::io::Cursor::new(bytes)), Default::default());
+        let mut hint = Hint::new();
+        hint.with_extension(suffix);
+        let mut format = symphonia::default::get_probe()
+            .probe(&hint, stream, FormatOptions::default(), MetadataOptions::default())
+            .unwrap();
+        let track = format.default_track(TrackType::Audio).unwrap();
+        let track_id = track.id;
+        let params = track.codec_params.as_ref().and_then(|p| p.audio()).unwrap();
+        let mut decoder =
+            symphonia::default::get_codecs().make_audio_decoder(params, &AudioDecoderOptions::default()).unwrap();
+        let mut samples: Vec<f32> = Vec::new();
+        let mut total = 0;
+        while let Ok(Some(packet)) = format.next_packet() {
+            if packet.track_id != track_id {
+                continue;
+            }
+            let decoded = decoder.decode(&packet).unwrap();
+            decoded.copy_to_vec_interleaved(&mut samples);
+            let frames = samples.len() / decoded.spec().channels().count();
+            let (head, tail) = trims(frames, packet.dur.get(), packet.trim_start.get(), packet.trim_end.get());
+            total += frames - head - tail;
+        }
+        total
+    }
+
+    // Both files are half a second of a tone at 44.1 kHz: 22,050 frames went into the encoder,
+    // which added its own delay at the start and padding at the end.
+    #[test]
+    fn plays_every_frame_of_an_mp3_and_no_more() {
+        assert_eq!(played_frames(include_bytes!("../../tests/fixtures/half-second.mp3"), "mp3"), 22_050);
+    }
+
+    #[test]
+    fn plays_every_frame_of_an_ogg_vorbis_file_and_no_more() {
+        assert_eq!(played_frames(include_bytes!("../../tests/fixtures/half-second.ogg"), "ogg"), 22_050);
+    }
 }

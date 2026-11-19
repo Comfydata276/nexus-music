@@ -10,6 +10,8 @@ It is written in Rust with the [Slint](https://slint.dev) UI toolkit. There is n
 engine inside it: the interface is drawn directly on the GPU, and audio is decoded and played
 by the app itself.
 
+What's planned next is in the [roadmap](ROADMAP.md).
+
 ## What it does
 
 - Signs in to a Navidrome server; the password is kept in Windows Credential Manager.
@@ -42,7 +44,10 @@ by the app itself.
 - Downloads: save songs, albums and playlists on the PC to play without the server, at a
   quality you choose, with progress shown per song and on the taskbar, and a cancel button.
 - Offline mode, and automatic detection when the server can't be reached: downloads keep
-  playing, and likes, ratings and plays are sent once the server is back.
+  playing, and likes, ratings and plays are kept on the PC until the server is back and has
+  accepted them. A server that answers with an error is treated the same way; only a
+  sign-in the server refuses takes you back to the sign-in screen, and the queue is still
+  there after signing in again.
 - A Now Playing screen with large artwork, the song's format and lyrics or what's next.
 - Internet radio stations set up in Navidrome, star ratings, and a sleep timer.
 - Plays MP3, FLAC, AAC/M4A, ALAC, Ogg Vorbis, WAV and AIFF directly. Anything else (Opus,
@@ -59,7 +64,7 @@ by the app itself.
 - Remembers the queue and position between runs.
 - Keeps playing from the notification area when the window is closed (optional), and
   opening it a second time brings back the copy that's already running.
-- Checks GitHub for new versions and installs them on request.
+- Checks GitHub for new versions and installs them on request, once the download matches the checksum GitHub publishes for it.
 - Its own title bar: navigation, search and the window's buttons in one strip, in the theme's
   colours. Six colour themes and an interface size setting.
 - Previous, play and next buttons on the taskbar thumbnail.
@@ -89,8 +94,6 @@ Authentik needs three things set up once:
 3. The reverse proxy has to pass the `Authorization` header on to Authentik's outpost for
    Lidarr's host. With that header passed, Authentik also accepts tokens made from a user's
    app password for that host, so only do this where that is acceptable.
-
-What's planned next is in the [roadmap](ROADMAP.md).
 
 ## Installing
 

@@ -313,6 +313,8 @@ pub struct Controller {
     update_timer: slint::Timer,
     /// Changes waiting to be sent to the server.
     pub pending: RefCell<Vec<crate::offline::Pending>>,
+    /// The held changes being sent to the server right now.
+    pub sending: RefCell<Vec<crate::offline::Pending>>,
     /// The server isn't answering.
     pub unreachable: Cell<bool>,
     pub reconnect_timer: slint::Timer,
@@ -431,6 +433,7 @@ impl Controller {
             tick_timer: slint::Timer::default(),
             update_timer: slint::Timer::default(),
             pending: RefCell::new(crate::offline::load_pending(&paths.pending)),
+            sending: RefCell::default(),
             unreachable: Cell::new(false),
             reconnect_timer: slint::Timer::default(),
             import_report: RefCell::new(None),
@@ -920,6 +923,9 @@ impl Controller {
                         }
                         ctl.covers.reset();
                         ctl.enter(client, Some(info.version));
+                        // The server is plainly there: stop treating it as out of reach, and
+                        // send whatever was being held for it.
+                        ctl.check_connection();
                     }
                     Err(e) => app.set_login_error(e.to_string().into()),
                 }
@@ -1016,11 +1022,12 @@ impl Controller {
     /// Saves where Lidarr is and its key, then connects: checks that it answers and, if a
     /// sign-in answers instead, goes on to that.
     fn save_requests(&self, address: &str, key: &str) {
-        let moved = {
+        let (moved, elsewhere) = {
             let mut settings = self.settings.borrow_mut();
             let moved = crate::lidarr::tidy(&settings.lidarr_address) != crate::lidarr::tidy(address);
+            let elsewhere = crate::lidarr::host(&settings.lidarr_address) != crate::lidarr::host(address);
             settings.lidarr_address = address.trim().to_string();
-            moved
+            (moved, elsewhere)
         };
         if moved {
             // A sign-in belongs to the address it was found in front of.
@@ -1030,12 +1037,19 @@ impl Controller {
             settings.lidarr_gate_client.clear();
         }
         self.save_settings();
-        // Blank leaves the key that's on file.
+        // Blank leaves the key that's on file, unless the address now points at a different
+        // host: a key is only ever sent to the host it was typed in for.
+        let forgotten = key.trim().is_empty() && elsewhere && config::load_secret(&self.paths, "lidarr-key").is_some();
         if !key.trim().is_empty() {
             config::save_secret(&self.paths, "lidarr-key", key.trim());
+        } else if elsewhere {
+            config::save_secret(&self.paths, "lidarr-key", "");
         }
         self.connect_requests();
         self.push_settings();
+        if forgotten {
+            return self.requests_state("none", "That's a different address, so the saved key was forgotten. Enter the key for it.");
+        }
         self.check_requests(true);
     }
 
@@ -1824,7 +1838,14 @@ impl Controller {
     }
 
     pub fn leave(self: &Rc<Self>, message: &str) {
+        // Stopping empties the queue, and an empty queue isn't kept. Being turned away by the
+        // server is no reason to lose it, so the saved copy is put back for the next sign-in.
+        // (Signing out by choice removes it first.)
+        let queue = std::fs::read(&self.paths.queue).ok();
         self.stop_playback();
+        if let Some(queue) = queue {
+            config::write_atomically(&self.paths.queue, &queue);
+        }
         self.stop_sync();
         self.library_timer.stop();
         self.close_preview();
