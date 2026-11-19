@@ -32,6 +32,9 @@ pub struct Entry {
 /// A song waiting to be fetched, or being fetched now.
 struct Job {
     song: Song,
+    /// Which go at this song this is. A song can be cancelled and asked for again while
+    /// the first go is still winding down; what that one reports mustn't be taken for this.
+    attempt: u64,
     /// How much has arrived, in thousandths.
     progress: Arc<AtomicU32>,
     /// Set to abandon the fetch.
@@ -55,6 +58,12 @@ pub struct Downloads {
     arrived: HashMap<String, i64>,
     /// The list of downloads has changed since it was last written to disk.
     unsaved: bool,
+    /// Whose downloads these are (see `account`): each account has its own list, in the same
+    /// folder, so signing in as someone else doesn't show the last person's.
+    account: String,
+    next_attempt: u64,
+    /// Songs that couldn't be downloaded this session, and why, newest last.
+    pub failed: Vec<(Song, String)>,
     saved_at: std::time::Instant,
     /// For the progress messages: how many songs the current batch has, and how many of
     /// them are done or failed.
@@ -64,10 +73,22 @@ pub struct Downloads {
 }
 
 impl Downloads {
-    pub fn load(dir: PathBuf) -> Downloads {
+    /// Reads the downloads that belong to `account` (empty for nobody: signed out).
+    pub fn load(dir: PathBuf, account: &str) -> Downloads {
         let _ = fs::create_dir_all(&dir);
-        let mut entries: Vec<Entry> = fs::read(dir.join("index.json"))
+        if !account.is_empty() {
+            // Before 0.29 there was one list for whoever was signed in. It becomes the list
+            // of the first account to sign in after updating.
+            for name in ["index", "collections"] {
+                let (old, new) = (dir.join(format!("{name}.json")), dir.join(format!("{name}-{account}.json")));
+                if old.exists() && !new.exists() {
+                    let _ = fs::rename(&old, &new);
+                }
+            }
+        }
+        let mut entries: Vec<Entry> = fs::read(dir.join(format!("index-{account}.json")))
             .ok()
+            .filter(|_| !account.is_empty())
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or_default();
         // Trust the folder over the index: a file deleted by hand is simply not downloaded.
@@ -80,8 +101,9 @@ impl Downloads {
         }
         let files = entries.iter().map(|e| (e.song.id.clone(), e.file.clone())).collect();
         let arrived = entries.iter().map(|e| (e.song.id.clone(), arrival(&dir, e))).collect();
-        let collections = fs::read(dir.join("collections.json"))
+        let collections = fs::read(dir.join(format!("collections-{account}.json")))
             .ok()
+            .filter(|_| !account.is_empty())
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or_default();
         Downloads {
@@ -93,6 +115,9 @@ impl Downloads {
             under_way: HashMap::new(),
             arrived,
             unsaved: false,
+            account: account.to_string(),
+            next_attempt: 0,
+            failed: Vec::new(),
             saved_at: std::time::Instant::now(),
             batch_total: 0,
             batch_done: 0,
@@ -101,11 +126,11 @@ impl Downloads {
     }
 
     fn save(&mut self) {
+        if self.account.is_empty() {
+            return;
+        }
         if let Ok(json) = serde_json::to_vec(&self.entries) {
-            let temp = self.dir.join("index.tmp");
-            if fs::write(&temp, json).is_ok() {
-                let _ = fs::rename(&temp, self.dir.join("index.json"));
-            }
+            crate::config::write_atomically(&self.dir.join(format!("index-{}.json", self.account)), &json);
         }
         self.unsaved = false;
         self.saved_at = std::time::Instant::now();
@@ -126,9 +151,14 @@ impl Downloads {
         if keep {
             self.collections.push(id.to_string());
         }
-        if let Ok(json) = serde_json::to_vec(&self.collections) {
-            let _ = fs::write(self.dir.join("collections.json"), json);
+        if let (Ok(json), false) = (serde_json::to_vec(&self.collections), self.account.is_empty()) {
+            crate::config::write_atomically(&self.dir.join(format!("collections-{}.json", self.account)), &json);
         }
+    }
+
+    /// The folder the downloads are in.
+    pub fn folder(&self) -> &Path {
+        &self.dir
     }
 
     pub fn has(&self, id: &str) -> bool {
@@ -150,6 +180,27 @@ impl Downloads {
     }
 
     /// When a song was downloaded, in seconds since 1970; 0 if it isn't (or isn't yet).
+    /// The form a downloaded song was saved in: its file's extension, and its bit rate in
+    /// kbps as near as the file's size and the song's length say.
+    pub fn saved_as(&self, song: &Song) -> Option<(String, u32)> {
+        let file = self.files.get(&song.id)?;
+        let suffix = file.rsplit('.').next().unwrap_or_default().to_lowercase();
+        let bytes = self.entries.iter().rev().find(|entry| entry.song.id == song.id).map_or(0, |entry| entry.bytes);
+        let kbps = if song.duration > 0 { (bytes * 8 / song.duration as u64 / 1000) as u32 } else { 0 };
+        Some((suffix, kbps))
+    }
+
+    /// One line about the songs that couldn't be downloaded, or nothing if they all could.
+    pub fn trouble(&self) -> String {
+        let Some((song, reason)) = self.failed.last() else { return String::new() };
+        let which = match self.failed.len() {
+            1 => format!("“{}”", song.title),
+            2 => format!("“{}” and 1 other song", song.title),
+            n => format!("“{}” and {} other songs", song.title, n - 1),
+        };
+        format!("{which} couldn't be downloaded. {reason}")
+    }
+
     pub fn added_at(&self, id: &str) -> i64 {
         self.arrived.get(id).copied().unwrap_or(0)
     }
@@ -224,6 +275,55 @@ fn arrival(dir: &std::path::Path, entry: &Entry) -> i64 {
         .unwrap_or(0)
 }
 
+/// Room left on the drive after a batch of downloads, so they never fill it to the brim.
+const SPARE: u64 = 500 * 1024 * 1024;
+
+/// How much room is free on the drive a folder is on, if that can be told.
+fn free_space(folder: &Path) -> Option<u64> {
+    fs4::available_space(folder).ok()
+}
+
+/// "340 MB", "12.4 GB".
+fn size_label(bytes: u64) -> String {
+    let megabytes = bytes as f64 / (1024.0 * 1024.0);
+    if megabytes >= 1024.0 { format!("{:.1} GB", megabytes / 1024.0) } else { format!("{megabytes:.0} MB") }
+}
+
+/// Whether a download keeps the file as the server has it, and how big it's expected to be.
+fn expected_bytes(song: &Song, quality: u32) -> u64 {
+    let suffix = song.suffix.to_lowercase();
+    let playable = NATIVE_SUFFIXES.contains(&suffix.as_str());
+    let original = playable && (quality == 0 || (suffix == "mp3" && song.bit_rate > 0 && song.bit_rate <= quality));
+    if original { song.size } else { song.duration as u64 * if quality == 0 { 320 } else { quality } as u64 * 125 }
+}
+
+/// Moves everything in one folder into another: by renaming where that works (the same
+/// drive), otherwise by copying and then removing. Returns how many files moved and how
+/// many couldn't be. Files still arriving are left out.
+pub fn move_folder(from: &Path, to: &Path) -> (usize, usize) {
+    let (mut moved, mut stuck) = (0, 0);
+    for entry in fs::read_dir(from).into_iter().flatten().flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        if !path.is_file() || name.to_string_lossy().ends_with(".part") {
+            continue;
+        }
+        let target = to.join(&name);
+        let done = fs::rename(&path, &target).is_ok()
+            || (fs::copy(&path, &target).is_ok_and(|copied| fs::metadata(&path).is_ok_and(|meta| meta.len() == copied)) && fs::remove_file(&path).is_ok());
+        if done {
+            moved += 1;
+        } else {
+            // Don't leave half a copy behind where the whole file would be looked for.
+            if target.exists() && path.exists() {
+                let _ = fs::remove_file(&target);
+            }
+            stuck += 1;
+        }
+    }
+    (moved, stuck)
+}
+
 /// Fetches one song's audio into the downloads folder. Runs on a worker thread. `quality`
 /// is a bitrate cap in kbps, or 0 to keep the file as it is on the server.
 fn fetch(
@@ -231,6 +331,7 @@ fn fetch(
     dir: &Path,
     song: &Song,
     quality: u32,
+    attempt: u64,
     progress: &AtomicU32,
     cancel: &AtomicBool,
 ) -> Result<Entry, String> {
@@ -251,7 +352,9 @@ fn fetch(
         return Err("unexpected song id".into());
     }
     let file = format!("{stem}.{extension}");
-    let temp = dir.join(format!("{file}.part"));
+    // Each go has a file of its own to arrive in, so two goes at one song can't trip over
+    // each other.
+    let temp = dir.join(format!("{file}.{attempt}.part"));
     let (mut body, length) = client.open_stream(&url, None).map_err(|e| e.to_string())?;
     let expected = length.filter(|n| *n > 0).unwrap_or(expected).max(1);
     let mut out = fs::File::create(&temp).map_err(|e| e.to_string())?;
@@ -275,7 +378,13 @@ fn fetch(
         }
     };
     drop(out);
-    if let Err(reason) = copied.and_then(|()| if bytes == 0 { Err("the server sent nothing".into()) } else { Ok(()) }) {
+    let copied = copied.and_then(|()| match bytes {
+        0 => Err("The server sent nothing.".to_string()),
+        // Cancelled as the last of it arrived: it isn't wanted, whole or not.
+        _ if cancel.load(Ordering::Relaxed) => Err("cancelled".to_string()),
+        _ => Ok(()),
+    });
+    if let Err(reason) = copied {
         let _ = fs::remove_file(&temp);
         return Err(reason);
     }
@@ -327,8 +436,14 @@ impl Controller {
     /// `quiet` skips the messages: used when topping up in the background.
     fn download_songs_with(self: &Rc<Self>, songs: Vec<Song>, quiet: bool) {
         let Some(client) = self.client() else { return };
+        if self.moving_downloads.get() {
+            if !quiet {
+                self.toast("The downloads are being moved to another folder. Try again when that's done.");
+            }
+            return;
+        }
         let quality = self.settings.borrow().download_quality;
-        let started: Vec<(Song, Arc<AtomicU32>, Arc<AtomicBool>)> = {
+        let started: Vec<(Song, u64, Arc<AtomicU32>, Arc<AtomicBool>)> = {
             let mut downloads = self.downloads.borrow_mut();
             let mut seen = HashSet::new();
             let wanted: Vec<Song> = songs
@@ -337,6 +452,20 @@ impl Controller {
                     s.radio_url.is_empty() && !downloads.has(&s.id) && !downloads.queued(&s.id) && seen.insert(s.id.clone())
                 })
                 .collect();
+            // Is there room? Going by what the server says each file is, or for a smaller
+            // copy what its length works out at, with something left over for the drive.
+            let needed: u64 = wanted.iter().map(|song| expected_bytes(song, quality)).sum();
+            if let Some(free) = free_space(&downloads.dir).filter(|free| needed + SPARE > *free) {
+                drop(downloads);
+                if !quiet {
+                    self.toast(format!(
+                        "Not enough room: that needs about {}, and the drive your downloads are on has {} free. (Half a gigabyte is always left spare.)",
+                        size_label(needed),
+                        size_label(free)
+                    ));
+                }
+                return;
+            }
             if downloads.jobs.is_empty() {
                 downloads.batch_total = 0;
                 downloads.batch_done = 0;
@@ -346,12 +475,16 @@ impl Controller {
             wanted
                 .into_iter()
                 .map(|song| {
+                    downloads.next_attempt += 1;
                     let job = Job {
                         song: song.clone(),
+                        attempt: downloads.next_attempt,
                         progress: Arc::new(AtomicU32::new(0)),
                         cancel: Arc::new(AtomicBool::new(false)),
                     };
-                    let handles = (song, job.progress.clone(), job.cancel.clone());
+                    // Asked for again: it's no longer among the ones that failed.
+                    downloads.failed.retain(|(failed, _)| failed.id != song.id);
+                    let handles = (song, job.attempt, job.progress.clone(), job.cancel.clone());
                     downloads.under_way.insert(job.song.id.clone(), job.progress.clone());
                     downloads.jobs.push(job);
                     handles
@@ -371,7 +504,7 @@ impl Controller {
             });
         }
         let (dir, covers) = (self.downloads.borrow().dir.clone(), self.paths.covers.clone());
-        for (song, progress, cancel) in started {
+        for (song, attempt, progress, cancel) in started {
             // Show it as on its way straight off.
             self.mark_download(&song.id);
             let (client, dir, covers) = (client.clone(), dir.clone(), covers.clone());
@@ -379,34 +512,45 @@ impl Controller {
                 let result = if cancel.load(Ordering::Relaxed) {
                     Err("cancelled".to_string())
                 } else {
-                    fetch(&client, &dir, &song, quality, &progress, &cancel)
+                    fetch(&client, &dir, &song, quality, attempt, &progress, &cancel)
                 };
                 if result.is_ok() && !song.cover_art.is_empty() {
                     // Have the artwork on disk too, for when the server can't be reached.
                     let _ = crate::covers::ensure_file(&client, &covers, &song.cover_art);
                 }
                 let id = song.id.clone();
-                post(move |ctl| ctl.download_finished(&id, result));
+                post(move |ctl| ctl.download_finished(&id, attempt, result));
             });
         }
         self.sync_downloads();
     }
 
-    fn download_finished(self: &Rc<Self>, id: &str, result: Result<Entry, String>) {
+    fn download_finished(self: &Rc<Self>, id: &str, attempt: u64, result: Result<Entry, String>) {
         let finished = {
             let mut downloads = self.downloads.borrow_mut();
-            // No longer listed means it was cancelled while being fetched.
-            let wanted = downloads.jobs.iter().position(|job| job.song.id == id).map(|at| downloads.jobs.remove(at));
-            downloads.under_way.remove(id);
+            // No longer listed means this go was cancelled while it was fetching. (The song
+            // may have been asked for again since: that go is listed, and left alone.)
+            let wanted = downloads.jobs.iter().position(|job| job.song.id == id && job.attempt == attempt).map(|at| downloads.jobs.remove(at));
+            if wanted.is_some() {
+                downloads.under_way.remove(id);
+            }
             match (result, wanted) {
                 (Ok(entry), Some(_)) => {
                     downloads.batch_done += 1;
                     downloads.add(entry);
                 }
+                // A go that was cancelled finished anyway. Its file goes, unless the song has
+                // been asked for again or downloaded since, when the file is that one's.
                 (Ok(entry), None) => {
-                    let _ = fs::remove_file(downloads.dir.join(entry.file));
+                    if !downloads.has(id) && !downloads.queued(id) {
+                        let _ = fs::remove_file(downloads.dir.join(entry.file));
+                    }
                 }
-                (Err(_), Some(_)) => downloads.batch_failed += 1,
+                (Err(reason), Some(job)) => {
+                    downloads.batch_failed += 1;
+                    downloads.failed.retain(|(failed, _)| failed.id != job.song.id);
+                    downloads.failed.push((job.song, reason));
+                }
                 (Err(_), None) => {}
             }
             // The last of a batch: the list of downloads goes to disk now.
@@ -421,8 +565,8 @@ impl Controller {
                 (0, 0) => {}
                 (1, 0) => self.toast("Download finished"),
                 (_, 0) => self.toast(format!("{done} songs downloaded")),
-                (0, _) => self.toast("Couldn't download. Check the connection to your server."),
-                _ => self.toast(format!("{done} songs downloaded; {failed} couldn't be fetched")),
+                (0, _) => self.toast(self.downloads.borrow().trouble()),
+                _ => self.toast(format!("{done} songs downloaded; {failed} couldn't be. See Downloads.")),
             }
         }
         self.sync_downloads();
@@ -466,6 +610,69 @@ impl Controller {
             }
         }
         self.cancel_downloads(ids);
+    }
+
+    /// Moves the downloads into another folder and keeps them there from now on.
+    pub fn move_downloads(self: &Rc<Self>, folder: PathBuf) {
+        let from = self.downloads.borrow().dir.clone();
+        if folder == from {
+            return;
+        }
+        if !self.downloads.borrow().jobs.is_empty() || self.moving_downloads.get() {
+            return self.toast("Wait for the downloads under way to finish, then choose the folder again.");
+        }
+        if fs::create_dir_all(&folder).is_err() || !folder.is_dir() {
+            return self.toast(format!("{} can't be used as a folder.", folder.display()));
+        }
+        // Room for them all, unless it's the same drive (when nothing is copied). Renaming a
+        // scrap of a file across tells which.
+        let probe = from.join("move-test.part");
+        let same_drive = fs::write(&probe, b"").is_ok() && fs::rename(&probe, folder.join("move-test.part")).is_ok();
+        let _ = fs::remove_file(&probe);
+        let _ = fs::remove_file(folder.join("move-test.part"));
+        let needed = crate::config::dir_size(&from);
+        if let Some(free) = free_space(&folder).filter(|free| !same_drive && needed + SPARE > *free) {
+            return self.toast(format!(
+                "Not enough room there: the downloads come to {}, and that drive has {} free. (Half a gigabyte is always left spare.)",
+                size_label(needed),
+                size_label(free)
+            ));
+        }
+        self.downloads.borrow_mut().save_if_due(true);
+        self.moving_downloads.set(true);
+        self.toast(format!("Moving your downloads to {}…", folder.display()));
+        std::thread::spawn(move || {
+            let (moved, stuck) = move_folder(&from, &folder);
+            post(move |ctl| {
+                ctl.moving_downloads.set(false);
+                // What couldn't be moved is still where it was: stay there with everything
+                // else left behind, so nothing is lost sight of.
+                if stuck > 0 {
+                    let (back, _) = move_folder(&folder, &from);
+                    let account = ctl.account();
+                    *ctl.downloads.borrow_mut() = Downloads::load(from, &account);
+                    ctl.toast(format!("{stuck} of {} files couldn't be moved, so the downloads are staying where they were.", moved + stuck));
+                    let _ = back;
+                } else {
+                    ctl.settings.borrow_mut().downloads_dir =
+                        if folder == ctl.paths.downloads { String::new() } else { folder.display().to_string() };
+                    ctl.save_settings();
+                    let account = ctl.account();
+                    *ctl.downloads.borrow_mut() = Downloads::load(folder.clone(), &account);
+                    ctl.toast(format!("Your downloads are now in {}", folder.display()));
+                }
+                ctl.sync_downloads();
+                ctl.rebuild_tracks();
+            });
+        });
+    }
+
+    /// Has another go at the songs that couldn't be downloaded.
+    pub fn retry_downloads(self: &Rc<Self>) {
+        let songs: Vec<Song> = self.downloads.borrow().failed.iter().map(|(song, _)| song.clone()).collect();
+        if !songs.is_empty() {
+            self.download_songs(songs);
+        }
     }
 
     pub fn remove_all_downloads(self: &Rc<Self>) {
@@ -532,7 +739,10 @@ impl Controller {
             format!("Downloading {at} of {}", downloads.batch_total)
         };
         self.ui.global::<ui::App>().set_download_status(status.into());
-        self.ui.global::<ui::Settings>().set_downloads_summary(downloads.summary().into());
+        let settings = self.ui.global::<ui::Settings>();
+        settings.set_downloads_summary(downloads.summary().into());
+        settings.set_downloads_folder(downloads.dir.display().to_string().into());
+        settings.set_downloads_folder_custom(downloads.dir != self.paths.downloads);
         drop(downloads);
         self.sync_download_progress();
         if matches!(self.current_route(), Some(Route::Downloads)) {
@@ -631,10 +841,13 @@ impl Controller {
             (false, 1) => format!("{summary}, and 1 more on its way"),
             (false, n) => format!("{summary}, and {n} more on their way"),
         };
+        let trouble = self.downloads.borrow().trouble();
         let page = PageData {
             label: "On this PC".into(),
             title: "Downloads".into(),
             meta,
+            notice_action: if trouble.is_empty() { String::new() } else { "Retry failed".into() },
+            notice: trouble,
             cover: songs.first().map(|s| s.cover_art.clone()).unwrap_or_default(),
             can_play: !songs.is_empty(),
             show_album: true,
@@ -647,5 +860,87 @@ impl Controller {
             ..Default::default()
         };
         self.apply_page(page, scroll);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn folder(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("nexus-downloads-test-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn entry(id: &str, file: &str, bytes: u64) -> Entry {
+        Entry { song: Song { id: id.into(), title: id.to_uppercase(), suffix: "flac".into(), duration: 100, ..Default::default() }, file: file.into(), bytes, at: 5 }
+    }
+
+    #[test]
+    fn each_account_has_its_own_list() {
+        let dir = folder("accounts");
+        // A list from before accounts had their own, with one song whose file is there.
+        fs::write(dir.join("a.flac"), b"audio").unwrap();
+        fs::write(dir.join("index.json"), serde_json::to_vec(&vec![entry("a", "a.flac", 5)]).unwrap()).unwrap();
+        fs::write(dir.join("collections.json"), br#"["liked"]"#).unwrap();
+        // Nobody signed in: nothing shown, and the old list is left for whoever signs in.
+        assert!(Downloads::load(dir.clone(), "").is_empty());
+        assert!(dir.join("index.json").exists());
+        // The first to sign in gets it.
+        let mut first = Downloads::load(dir.clone(), "server_ann");
+        assert!(first.has("a") && first.collections == ["liked"]);
+        assert!(!dir.join("index.json").exists() && dir.join("index-server_ann.json").exists());
+        // Someone else starts with none, and what they download is theirs alone.
+        let mut second = Downloads::load(dir.clone(), "server_bob");
+        assert!(second.is_empty() && second.collections.is_empty());
+        fs::write(dir.join("b.mp3"), b"audio").unwrap();
+        second.add(entry("b", "b.mp3", 5));
+        second.save_if_due(true);
+        first.save_if_due(true);
+        assert!(Downloads::load(dir.clone(), "server_bob").has("b"));
+        assert!(!Downloads::load(dir.clone(), "server_ann").has("b"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn says_what_a_download_was_saved_as_and_what_went_wrong() {
+        let dir = folder("saved");
+        fs::write(dir.join("a.flac"), b"x").unwrap();
+        fs::write(dir.join("b.mp3"), b"x").unwrap();
+        let mut downloads = Downloads::load(dir.clone(), "someone");
+        // A hundred seconds of audio in 1,600,000 bytes is 128 kbps.
+        downloads.add(entry("a", "a.flac", 12_000_000));
+        downloads.add(entry("b", "b.mp3", 1_600_000));
+        let song = |id: &str| entry(id, "", 0).song;
+        assert_eq!(downloads.saved_as(&song("a")), Some(("flac".to_string(), 960)));
+        assert_eq!(downloads.saved_as(&song("b")), Some(("mp3".to_string(), 128)));
+        assert_eq!(downloads.saved_as(&song("c")), None);
+
+        assert_eq!(downloads.trouble(), "");
+        downloads.failed.push((song("x"), "Can't reach the server.".into()));
+        assert_eq!(downloads.trouble(), "“X” couldn't be downloaded. Can't reach the server.");
+        downloads.failed.push((song("y"), "The disk is full.".into()));
+        downloads.failed.push((song("z"), "The disk is full.".into()));
+        assert_eq!(downloads.trouble(), "“Z” and 2 other songs couldn't be downloaded. The disk is full.");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn moves_a_folder_of_downloads() {
+        let (from, to) = (folder("from"), folder("to"));
+        fs::write(from.join("a.flac"), b"one").unwrap();
+        fs::write(from.join("index-someone.json"), b"[]").unwrap();
+        fs::write(from.join("c.flac.7.part"), b"half").unwrap();
+        fs::create_dir_all(from.join("a folder")).unwrap();
+        assert_eq!(move_folder(&from, &to), (2, 0));
+        assert_eq!(fs::read(to.join("a.flac")).unwrap(), b"one");
+        assert!(to.join("index-someone.json").exists() && !from.join("a.flac").exists());
+        // A file still arriving stays behind, and folders aren't touched.
+        assert!(from.join("c.flac.7.part").exists() && from.join("a folder").exists() && !to.join("c.flac.7.part").exists());
+        assert_eq!((size_label(340 * 1024 * 1024), size_label(12_400 * 1024 * 1024)), ("340 MB".to_string(), "12.1 GB".to_string()));
+        let _ = fs::remove_dir_all(from);
+        let _ = fs::remove_dir_all(to);
     }
 }

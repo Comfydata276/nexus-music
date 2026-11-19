@@ -99,14 +99,16 @@ Things that lose data or interrupt the music.
 - [x] Save the queue, or a "Made for you" mix, as a playlist.
 - [x] Export a playlist as CSV.
 
-## 6. Downloads
+## 6. Downloads (0.29.0)
 
-- [ ] Cancelling a download and starting it again works.
-- [ ] Downloads that failed are listed with the reason and a "Retry failed" button.
-- [ ] The format shown for a downloaded song is the format of the downloaded copy.
-- [ ] A playback error doesn't delete the downloaded copy.
-- [ ] A choice of folder for downloads and the song cache, with a check for free space.
-- [ ] Downloads and held changes are kept per account.
+- [x] Cancelling a download and starting it again works.
+- [x] Downloads that failed are listed with the reason and a "Retry failed" button.
+- [x] The format shown for a downloaded song is the format of the downloaded copy.
+- [x] A playback error doesn't delete the downloaded copy.
+- [x] A choice of folder for downloads, which moves them, with a check for free space before
+      moving and before downloading.
+- [x] Downloads and held changes are kept per account.
+- [ ] A choice of folder for the songs kept as they play.
 
 ## 7. Audio
 

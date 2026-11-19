@@ -76,6 +76,8 @@ pub struct Playback {
     /// Similar songs are being fetched to continue after the queue.
     /// Songs whose kept copy was thrown away because it wouldn't play.
     dropped_kept: HashSet<String>,
+    /// Songs whose downloaded copy wouldn't play this session: they're streamed instead.
+    bad_downloads: HashSet<String>,
     autoplay_loading: bool,
     /// The song they're being found for. An answer for any other is out of date.
     autoplay_seed: String,
@@ -118,6 +120,7 @@ impl Playback {
             seen_at: None,
             stuck_ticks: 0,
             dropped_kept: HashSet::new(),
+            bad_downloads: HashSet::new(),
             autoplay_loading: false,
             autoplay_seed: String::new(),
             autoplay_resume: false,
@@ -457,7 +460,7 @@ impl Controller {
                 duration_secs: 0.0,
             };
         }
-        if let Some(path) = self.downloads.borrow().path_of(&song.id) {
+        if let Some(path) = self.downloads.borrow().path_of(&song.id).filter(|_| !pb.bad_downloads.contains(&song.id)) {
             // A downloaded copy plays from disk, whatever the streaming quality is set to.
             let suffix = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
             return TrackRequest {
@@ -1069,11 +1072,15 @@ impl Controller {
                         drop(pb);
                         return self.reconnect(token, attempt, &song, message);
                     }
-                    // A downloaded copy that won't play is discarded, and the song streamed.
-                    if self.downloads.borrow().has(&song.id) {
+                    // A downloaded copy that won't play is left where it is (one failure may be
+                    // nothing to do with the file), and the song is streamed for now.
+                    if self.downloads.borrow().has(&song.id) && pb.bad_downloads.insert(song.id.clone()) {
                         let position = pb.position;
                         drop(pb);
-                        self.remove_downloads(std::slice::from_ref(&song.id));
+                        self.toast(format!(
+                            "The downloaded copy of “{}” wouldn't play, so it's being streamed. If that keeps happening, remove the download and fetch it again.",
+                            song.title
+                        ));
                         return self.restart_current(position);
                     }
                     // So is a copy kept from an earlier play (once: if the song still won't
@@ -1515,11 +1522,17 @@ impl Controller {
                     parts.push(format!("{} kbps", song.bit_rate));
                 }
                 let source = parts.join(", ");
-                // A downloaded copy plays as saved: the original, or MP3 for formats the app
-                // can't decode.
-                let saved = self.downloads.borrow().path_of(&song.id);
-                let cap = if saved.is_some() { 0 } else { self.settings.borrow().max_bitrate() };
+                // A downloaded copy plays as it was saved, which is the original only if it
+                // was downloaded at full quality: one saved at a lower quality is an MP3.
                 let suffix = song.suffix.to_lowercase();
+                let bad = self.playback.borrow().bad_downloads.contains(&song.id);
+                let saved = self.downloads.borrow().saved_as(song).filter(|_| !bad);
+                let converted = saved.as_ref().filter(|(kind, _)| *kind != suffix).map(|(_, kbps)| nearest_rate(*kbps));
+                let cap = match (&saved, converted) {
+                    (_, Some(rate)) => rate,
+                    (Some(_), None) => 0,
+                    (None, None) => self.settings.borrow().max_bitrate(),
+                };
                 let native = NATIVE_SUFFIXES.contains(&suffix.as_str())
                     && (saved.is_some() || !self.playback.borrow().needs_transcode.contains(&song.id));
                 let title = &song.title;
@@ -1546,6 +1559,8 @@ impl Controller {
                 if cap > 0 && suffix == "mp3" && song.bit_rate <= cap {
                     // Already an MP3 within the limit: the server sends it untouched.
                     format!("“{title}” is playing as stored: {source}.")
+                } else if converted.is_some() {
+                    format!("“{title}” is {source}. The copy downloaded to this PC is a {cap} kbps MP3, and that is what's playing.")
                 } else if cap > 0 {
                     format!("“{title}” is {source}, converted to {cap} kbps MP3 for streaming.")
                 } else if !native {
@@ -2268,6 +2283,11 @@ impl Controller {
 fn least_bytes(song: &Song, bitrate: u32) -> u64 {
     let rate = if song.bit_rate > 0 { bitrate.min(song.bit_rate) } else { bitrate };
     song.duration as u64 * rate as u64 * 125 * 4 / 5
+}
+
+/// The usual MP3 bit rate nearest to one worked out from a file's size.
+fn nearest_rate(kbps: u32) -> u32 {
+    [96u32, 128, 160, 192, 256, 320].into_iter().min_by_key(|rate| rate.abs_diff(kbps)).unwrap_or(320)
 }
 
 fn stream_form(native: bool, cap: u32, suffix: &str) -> (u32, &str) {

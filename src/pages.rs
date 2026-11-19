@@ -172,6 +172,11 @@ pub struct PageData {
     pub liked_songs: bool,
     pub can_play: bool,
     pub has_menu: bool,
+    /// Something that went wrong on this page, and the name of what can be done about it.
+    #[serde(default)]
+    pub notice: String,
+    #[serde(default)]
+    pub notice_action: String,
     /// The API parameter and id used to like this page's subject, e.g. `("albumId", id)`.
     pub star: Option<(String, String)>,
     pub starred: bool,

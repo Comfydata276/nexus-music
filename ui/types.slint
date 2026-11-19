@@ -218,6 +218,11 @@ export global View {
     // Where the subtitle links to, e.g. the album's artist; empty for plain text.
     in property <string> subtitle-route;
     in property <string> meta;
+    // Something that went wrong on this page and what can be done about it, such as
+    // downloads that failed and "Retry failed". Empty for nothing.
+    in property <string> notice;
+    in property <string> notice-action;
+    callback notice-acted();
     // Figures shown across the top of the page.
     in property <[Stat]> stats;
     in property <string> about;
@@ -490,6 +495,11 @@ export global Settings {
     in property <string> eq-preset;
 
     in property <string> downloads-summary;
+    // Where downloads are kept, and whether that's somewhere other than the app's own folder.
+    in property <string> downloads-folder;
+    in property <bool> downloads-folder-custom;
+    callback change-downloads-folder();
+    callback reset-downloads-folder();
     // Which of `qualities` downloads are saved in.
     in property <int> download-quality;
     // Offline mode is switched on.

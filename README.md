@@ -44,6 +44,10 @@ What's planned next is in the [roadmap](ROADMAP.md).
   equaliser and levelling off).
 - Downloads: save songs, albums and playlists on the PC to play without the server, at a
   quality you choose, with progress shown per song and on the taskbar, and a cancel button.
+  Songs that couldn't be fetched are listed on the Downloads page with the reason and a
+  "Retry failed" button. You choose the folder they're kept in (Settings, Storage); changing
+  it moves them. A download that wouldn't fit on the drive isn't started. Each account has
+  its own list of downloads.
 - Offline mode, and automatic detection when the server can't be reached: downloads keep
   playing, and likes, ratings and plays are kept on the PC until the server is back and has
   accepted them. A server that answers with an error is treated the same way; only a

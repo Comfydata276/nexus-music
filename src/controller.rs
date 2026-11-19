@@ -307,6 +307,8 @@ pub struct Controller {
     /// brought up to date without going through the whole list. Emptied when the list is
     /// rebuilt and filled in again when next needed.
     pub track_places: RefCell<HashMap<String, Vec<usize>>>,
+    /// The downloads are on their way to another folder; nothing new is started meanwhile.
+    pub moving_downloads: Cell<bool>,
     /// Songs that have been played, newest first, including the one playing now.
     pub history: RefCell<Vec<config::Played>>,
     /// Every play and when, for "Your stats".
@@ -433,7 +435,11 @@ impl Controller {
             undo: RefCell::default(),
             quick_pool: Pool::new("quick", 1, true),
             download_pool: Pool::new("download", 2, false),
-            downloads: RefCell::new(crate::downloads::Downloads::load(paths.downloads.clone())),
+            // Nobody is signed in yet: whose downloads to show is known in `enter`.
+            downloads: RefCell::new(crate::downloads::Downloads::load(
+                if settings.downloads_dir.is_empty() { paths.downloads.clone() } else { PathBuf::from(&settings.downloads_dir) },
+                "",
+            )),
             art_pool: Pool::new("art", 6, true),
             engine,
             playback: RefCell::new(Playback::new(&settings)),
@@ -451,6 +457,7 @@ impl Controller {
             queue_model: Rc::new(VecModel::default()),
             up_next_model: Rc::new(VecModel::default()),
             track_places: RefCell::default(),
+            moving_downloads: Cell::new(false),
             play_log: RefCell::new({
                 let recent: Vec<(String, i64)> = config::load_history(&paths.history).into_iter().map(|played| (played.song.id, played.at)).collect();
                 crate::plays::PlayLog::load(&paths.plays, &recent)
@@ -477,7 +484,7 @@ impl Controller {
             toast_timer: slint::Timer::default(),
             tick_timer: slint::Timer::default(),
             update_timer: slint::Timer::default(),
-            pending: RefCell::new(crate::offline::load_pending(&paths.pending)),
+            pending: RefCell::default(),
             sending: RefCell::default(),
             unreachable: Cell::new(false),
             reconnect_timer: slint::Timer::default(),
@@ -1096,6 +1103,7 @@ impl Controller {
         let warm = client.clone();
         self.art_pool.spawn(move || warm.warm_up(6));
         *self.client.borrow_mut() = Some(client);
+        self.load_account();
         // Before any of the app is on screen: pick up the theme last chosen on any device,
         // so it opens in the right colours instead of changing a moment later.
         self.preload_theme();
@@ -1111,6 +1119,35 @@ impl Controller {
         self.library_timer.start(slint::TimerMode::Repeated, Duration::from_secs(5 * 60), || {
             with(|ctl| ctl.load_library());
         });
+    }
+
+    /// Who is signed in, as a name that can be part of a file's name; empty when nobody is.
+    pub fn account(&self) -> String {
+        self.client().map(|client| file_stem(&format!("{}|{}", client.server(), client.username()))).unwrap_or_default()
+    }
+
+    /// Where the changes held for the server are kept for whoever is signed in.
+    pub fn pending_path(&self) -> Option<PathBuf> {
+        let account = self.account();
+        (!account.is_empty()).then(|| self.paths.pending.with_file_name(format!("pending-{account}.json")))
+    }
+
+    /// Brings in what belongs to the account that has just signed in: its downloads, and
+    /// the likes, ratings and plays still waiting to be sent for it. Each account has its
+    /// own, so one person's never show up for, or get sent as, another.
+    fn load_account(&self) {
+        let account = self.account();
+        let folder = self.downloads.borrow().folder().to_path_buf();
+        *self.downloads.borrow_mut() = crate::downloads::Downloads::load(folder, &account);
+        self.sending.borrow_mut().clear();
+        let held = self.pending_path().map(|path| {
+            // Before 0.29 there was one list for whoever was signed in.
+            if !path.exists() && self.paths.pending.exists() {
+                let _ = std::fs::rename(&self.paths.pending, &path);
+            }
+            crate::offline::load_pending(&path)
+        });
+        *self.pending.borrow_mut() = held.unwrap_or_default();
     }
 
     // ---- asking for albums that aren't in the library -------------------------------------------
@@ -2027,6 +2064,15 @@ impl Controller {
         self.stop_playback();
         self.keep_saved_queue.set(false);
         self.queue_saved.set(0);
+        // What belongs to this account is on disk; none of it stays on screen or in hand.
+        {
+            let mut downloads = self.downloads.borrow_mut();
+            downloads.save_if_due(true);
+            let folder = downloads.folder().to_path_buf();
+            *downloads = crate::downloads::Downloads::load(folder, "");
+        }
+        self.pending.borrow_mut().clear();
+        self.sending.borrow_mut().clear();
         self.stop_sync();
         self.library_timer.stop();
         self.close_preview();
@@ -2479,6 +2525,8 @@ impl Controller {
         view.set_liked_songs(data.liked_songs);
         view.set_can_play(data.can_play);
         view.set_has_menu(data.has_menu);
+        view.set_notice(data.notice.as_str().into());
+        view.set_notice_action(data.notice_action.as_str().into());
         view.set_pending(data.pending);
         view.set_can_star(data.star.is_some());
         view.set_starred(match &data.star {
@@ -3445,6 +3493,14 @@ impl Controller {
         view.on_track_activated(|index| {
             with(|ctl| ctl.play_page_track(index as usize));
         });
+        view.on_notice_acted(|| {
+            with(|ctl| {
+                // The one notice with something to do about it: downloads that failed.
+                if ctl.current_route() == Some(Route::Downloads) {
+                    ctl.retry_downloads();
+                }
+            });
+        });
         view.on_move_selection(|delta, extend| {
             with(|ctl| ctl.move_selection(delta, extend));
         });
@@ -3758,6 +3814,15 @@ impl Controller {
         });
         settings.on_set_offline(|on| {
             with(|ctl| ctl.set_offline_mode(on));
+        });
+        settings.on_change_downloads_folder(|| {
+            with(|ctl| ctl.change_downloads_folder());
+        });
+        settings.on_reset_downloads_folder(|| {
+            with(|ctl| {
+                let folder = ctl.paths.downloads.clone();
+                ctl.move_downloads(folder);
+            });
         });
         settings.on_remove_downloads(|| {
             with(|ctl| ctl.remove_all_downloads());

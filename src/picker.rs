@@ -8,7 +8,8 @@ use windows::Win32::Foundation::HWND;
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
 use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
 use windows::Win32::UI::Shell::{
-    FOS_ALLOWMULTISELECT, FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM, FOS_OVERWRITEPROMPT, FileOpenDialog, FileSaveDialog,
+    FOS_ALLOWMULTISELECT, FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM, FOS_OVERWRITEPROMPT, FOS_PICKFOLDERS, FileOpenDialog,
+    FileSaveDialog,
     IFileOpenDialog, IFileSaveDialog, SIGDN_FILESYSPATH,
 };
 use windows::core::{HSTRING, w};
@@ -19,6 +20,26 @@ fn owner(ui: &crate::ui::MainWindow) -> Option<HWND> {
     match window.window_handle().ok().map(|handle| handle.as_raw()) {
         Some(RawWindowHandle::Win32(win32)) => Some(HWND(win32.hwnd.get() as *mut _)),
         _ => None,
+    }
+}
+
+/// Asks for a folder. `None` if the window couldn't be shown at all; `Some(None)` if it was
+/// closed without choosing.
+pub fn pick_folder(ui: &crate::ui::MainWindow) -> Option<Option<PathBuf>> {
+    let owner = owner(ui);
+    unsafe {
+        let dialog: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+        let options = dialog.GetOptions().ok()?;
+        dialog.SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM).ok()?;
+        let _ = dialog.SetTitle(w!("Choose a folder for downloads"));
+        if dialog.Show(owner).is_err() {
+            return Some(None);
+        }
+        let item = dialog.GetResult().ok()?;
+        let shown = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+        let path = shown.to_string().ok().map(PathBuf::from);
+        CoTaskMemFree(Some(shown.0 as *const _));
+        Some(path)
     }
 }
 

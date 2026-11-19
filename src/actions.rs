@@ -58,6 +58,8 @@ pub enum PromptAction {
     CreatePlaylist(Vec<Song>),
     /// The file or folder to import playlists from was typed in.
     ImportPath,
+    /// The folder to keep downloads in was typed in.
+    DownloadsFolder,
     /// Ask Lidarr for an album (by its name for it), or for several by (artist, album).
     RequestAlbum { album: String, title: String, song: String },
     AddArtist { artist: String, name: String },
@@ -702,6 +704,19 @@ impl Controller {
         self.open_menu(Target::None, "", entries, x, y);
     }
 
+    /// Asks which folder downloads should be kept in, then moves them there.
+    pub fn change_downloads_folder(self: &Rc<Self>) {
+        #[cfg(windows)]
+        match crate::picker::pick_folder(&self.ui) {
+            Some(Some(folder)) => return self.move_downloads(folder),
+            Some(None) => return,
+            None => {}
+        }
+        // Without the system's folder window: ask for the place by name.
+        *self.prompt.borrow_mut() = Some(PromptAction::DownloadsFolder);
+        self.open_prompt("Downloads folder", "Type the folder to keep downloads in.", "Move downloads", Some(""), false);
+    }
+
     pub fn prompt_import_path(&self) {
         *self.prompt.borrow_mut() = Some(PromptAction::ImportPath);
         self.open_prompt(
@@ -741,6 +756,11 @@ impl Controller {
             PromptAction::ImportPath => {
                 if !name.is_empty() {
                     self.run_import(vec![std::path::PathBuf::from(name.trim_matches('"'))]);
+                }
+            }
+            PromptAction::DownloadsFolder => {
+                if !name.is_empty() {
+                    self.move_downloads(std::path::PathBuf::from(name.trim_matches('"')));
                 }
             }
             PromptAction::CreatePlaylist(songs) => {

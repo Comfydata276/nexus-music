@@ -97,10 +97,11 @@ impl Controller {
     /// Writes down what's still to be sent. Changes on their way to the server stay on file
     /// until it has answered, so closing the app part-way can't lose them.
     fn save_pending(&self) {
+        let Some(path) = self.pending_path() else { return };
         let (sending, pending) = (self.sending.borrow(), self.pending.borrow());
         let held: Vec<&Pending> = sending.iter().chain(pending.iter()).collect();
         if let Ok(json) = serde_json::to_vec(&held) {
-            crate::config::write_atomically(&self.paths.pending, &json);
+            crate::config::write_atomically(&path, &json);
         }
     }
 
@@ -137,9 +138,22 @@ impl Controller {
         }
         let waiting = std::mem::take(&mut *self.pending.borrow_mut());
         *self.sending.borrow_mut() = waiting.clone();
+        let (account, path) = (self.account(), self.pending_path());
         self.api_pool.spawn(move || {
             let sent = send_all(&waiting, |change| change.send(&client));
             crate::controller::post(move |ctl| {
+                if ctl.account() != account {
+                    // Someone else has signed in meanwhile. What wasn't sent stays in the
+                    // file of the account it was made under, ahead of anything there already.
+                    if let Some(path) = path {
+                        let mut held = sent.kept;
+                        held.extend(load_pending(&path).into_iter().skip(waiting.len()));
+                        if let Ok(json) = serde_json::to_vec(&held) {
+                            crate::config::write_atomically(&path, &json);
+                        }
+                    }
+                    return;
+                }
                 ctl.sending.borrow_mut().clear();
                 // Anything changed while this was going on comes after what was kept.
                 ctl.pending.borrow_mut().splice(0..0, sent.kept);

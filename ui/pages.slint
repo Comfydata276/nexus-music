@@ -87,6 +87,25 @@ component Hero inherits Rectangle {
                     overflow: elide;
                 }
             }
+
+            if View.notice != "": HorizontalLayout {
+                spacing: 12px;
+
+                Text {
+                    horizontal-stretch: 1;
+                    text: View.notice;
+                    color: Theme.danger;
+                    font-size: 13px;
+                    overflow: elide;
+                    vertical-alignment: center;
+                }
+
+                if View.notice-action != "": TextButton {
+                    horizontal-stretch: 0;
+                    text: View.notice-action;
+                    clicked => { View.notice-acted(); }
+                }
+            }
         }
     }
 }
@@ -2214,6 +2233,22 @@ export component SettingsPage inherits Rectangle {
                             TextButton {
                                 text: "Remove all";
                                 clicked => { Settings.remove-downloads(); }
+                            }
+                        }
+
+                        SettingRow {
+                            title: "Downloads folder";
+                            detail: Settings.downloads-folder + ". Choosing another folder (on a bigger drive, say) moves what's downloaded there.";
+                            HorizontalLayout {
+                                spacing: 8px;
+                                if Settings.downloads-folder-custom: TextButton {
+                                    text: "Use default";
+                                    clicked => { Settings.reset-downloads-folder(); }
+                                }
+                                TextButton {
+                                    text: "Change";
+                                    clicked => { Settings.change-downloads-folder(); }
+                                }
                             }
                         }
 
