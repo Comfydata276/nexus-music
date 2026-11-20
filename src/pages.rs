@@ -677,6 +677,7 @@ fn search_extras(query: &str, page: &PageData, publish: &mut dyn FnMut(PageData)
                     year: song.year.clone(),
                     cover: crate::musicbrainz::cover(&song.album),
                     requested: false,
+                    soundtrack: false,
                 };
                 albums.insert(front, crate::lidarr::offered(&song.album).unwrap_or(sketch));
                 front += 1;

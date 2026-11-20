@@ -161,6 +161,10 @@ Things that lose data or interrupt the music.
       singles, EPs and any album whose name carried an extra such as "(Remastered)", wait
       for Lidarr after each one, and keep no record until the end. (0.35.0)
 
+- [x] Soundtracks can be asked for, including a film's soundtrack album credited to
+      various artists; and an album is still found when Lidarr's own search fails on its
+      name. (0.36.0)
+
 ## Suggested, not yet decided
 
 - A contact address in the requests to MusicBrainz and ListenBrainz, which ask for one.

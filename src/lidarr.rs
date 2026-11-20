@@ -40,6 +40,8 @@ pub struct Offer {
     pub requested: bool,
     /// "EP" or "Single" for one of those; empty (or "Album") for an album.
     pub kind: String,
+    /// It's filed as a soundtrack: music made for a film, a show or a game.
+    pub soundtrack: bool,
 }
 
 impl Offer {
@@ -61,6 +63,10 @@ impl Offer {
 /// The name of the profile this app makes in Lidarr for artists a single or an EP is asked
 /// of. Lidarr only knows the kinds of release an artist's profile lists.
 const SINGLES_PROFILE: &str = "Albums, EPs and singles";
+/// And the one for artists a soundtrack is asked of, which lists those as well.
+const SOUNDTRACKS_PROFILE: &str = "Albums, EPs, singles and soundtracks";
+/// MusicBrainz's name for "Various Artists", which most film soundtracks are credited to.
+pub const VARIOUS: &str = "89ad4ac3-39f7-470e-963a-56509c546377";
 
 /// Whether singles and EPs are offered as well as albums. Set from Settings.
 static SINGLES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
@@ -194,6 +200,8 @@ pub struct Setup {
     /// and EPs too, once that's been looked up (or made).
     albums: i64,
     singles: Option<i64>,
+    /// And the one that lists soundtracks as well.
+    soundtracks: Option<i64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -240,10 +248,16 @@ fn is_album(album: &AlbumRes) -> bool {
     kind_of(album) == Some("Album")
 }
 
-/// The kind of studio release this is, if it's one that can be asked for: no live albums,
-/// compilations, remixes and the like.
+/// Whether a release is filed as a soundtrack and nothing else besides (not a live one, or a
+/// compilation of them).
+fn is_soundtrack(album: &AlbumRes) -> bool {
+    matches!(album.secondary_types.as_slice(), [only] if only.eq_ignore_ascii_case("soundtrack"))
+}
+
+/// The kind of release this is, if it's one that can be asked for: a studio release or a
+/// soundtrack. No live albums, compilations, remixes and the like.
 fn kind_of(album: &AlbumRes) -> Option<&'static str> {
-    if !album.secondary_types.is_empty() {
+    if !album.secondary_types.is_empty() && !is_soundtrack(album) {
         return None;
     }
     match album.album_type.to_lowercase().as_str() {
@@ -257,6 +271,11 @@ fn kind_of(album: &AlbumRes) -> Option<&'static str> {
 /// Whether a Lidarr profile lists releases of a kind ("Album", "EP", "Single").
 fn allows(profile: &serde_json::Value, kind: &str) -> bool {
     listed(profile, "primaryAlbumTypes", "albumType").iter().any(|name| name == kind)
+}
+
+/// Whether a Lidarr profile lists releases like this one: its kind, and soundtracks if it's one.
+fn suits(profile: &serde_json::Value, wanted: &Offer) -> bool {
+    allows(profile, wanted.kind()) && (!wanted.soundtrack || listed(profile, "secondaryAlbumTypes", "albumType").iter().any(|name| name == "Soundtrack"))
 }
 
 /// The names switched on in one of a profile's three lists.
@@ -285,15 +304,15 @@ fn covers(big: &serde_json::Value, small: &serde_json::Value) -> bool {
     })
 }
 
-/// A profile like `template` that lists studio albums, EPs and singles, official releases
-/// only, ready to be handed to Lidarr.
-fn singles_profile(template: &serde_json::Value) -> serde_json::Value {
+/// A profile like `template` that lists studio albums, EPs and singles (and soundtracks, if
+/// asked), official releases only, ready to be handed to Lidarr.
+fn made_profile(template: &serde_json::Value, soundtracks: bool) -> serde_json::Value {
     let mut profile = template.clone();
     if let Some(fields) = profile.as_object_mut() {
         fields.remove("id");
-        fields.insert("name".into(), SINGLES_PROFILE.into());
+        fields.insert("name".into(), if soundtracks { SOUNDTRACKS_PROFILE } else { SINGLES_PROFILE }.into());
     }
-    let wanted: [&[&str]; 3] = [&["Album", "EP", "Single"], &["Studio"], &["Official"]];
+    let wanted: [&[&str]; 3] = [&["Album", "EP", "Single"], if soundtracks { &["Studio", "Soundtrack"] } else { &["Studio"] }, &["Official"]];
     for ((list, item), names) in PROFILE_LISTS.iter().zip(wanted) {
         for entry in profile.get_mut(*list).and_then(|entries| entries.as_array_mut()).into_iter().flatten() {
             let name = entry.get(*item).and_then(|kind| kind.get("name")).and_then(|name| name.as_str()).unwrap_or_default().to_string();
@@ -341,6 +360,7 @@ fn jobs_stamp(commands: &[serde_json::Value]) -> u64 {
 
 fn offer(album: AlbumRes) -> Offer {
     Offer {
+        soundtrack: is_soundtrack(&album),
         kind: kind_of(&album).filter(|kind| *kind != "Album").unwrap_or_default().to_string(),
         requested: album.id > 0 && album.monitored,
         year: album.release_date.get(..4).filter(|year| *year != "0001").unwrap_or_default().to_string(),
@@ -540,14 +560,19 @@ impl Lidarr {
     /// Puts an album (or an EP, or a single) on Lidarr's list and has Lidarr start looking
     /// for it. Nothing else by the artist is asked for.
     pub fn request(&self, wanted: &Offer) -> Result<(), String> {
+        if wanted.artist_id == VARIOUS {
+            return self.request_from_various(wanted);
+        }
         let kind = wanted.kind();
+        // An album by an artist Lidarr lists the albums of needs nothing special.
+        let plain = kind == "Album" && !wanted.soundtrack;
         let artists: Vec<ArtistRes> = self.get("artist")?;
         let known = artists.into_iter().find(|artist| artist.foreign_artist_id == wanted.artist_id).map(|artist| artist.id);
         // What the artist's "new releases" setting was, if it had to be turned off meanwhile.
         let mut put_back: Option<String> = None;
         let artist = match known {
             Some(artist) => {
-                if kind != "Album" {
+                if !plain {
                     put_back = self.list_singles(artist, wanted)?;
                 }
                 artist
@@ -557,11 +582,11 @@ impl Lidarr {
                 // set about fetching everything they've made.
                 let folders: Vec<RootFolder> = self.get("rootfolder")?;
                 let folder = folders.first().ok_or("Lidarr has no music folder set up yet.")?;
-                let profile = if kind == "Album" {
+                let profile = if plain {
                     folder.default_metadata_profile_id
                 } else {
                     let profiles: Vec<serde_json::Value> = self.get("metadataprofile")?;
-                    self.profile_with_singles(&profiles)?.get("id").and_then(|id| id.as_i64()).ok_or("Lidarr's profile for singles has no number.")?
+                    self.profile_for(&profiles, wanted.soundtrack)?.get("id").and_then(|id| id.as_i64()).ok_or("Lidarr's profile for singles has no number.")?
                 };
                 let added: ArtistRes = self.send(
                     "POST",
@@ -592,13 +617,63 @@ impl Lidarr {
         }
     }
 
-    /// The profile that lists EPs and singles as well as albums, made if Lidarr hasn't one.
-    fn profile_with_singles(&self, profiles: &[serde_json::Value]) -> Result<serde_json::Value, String> {
-        if let Some(ours) = profiles.iter().find(|profile| profile.get("name").and_then(|name| name.as_str()) == Some(SINGLES_PROFILE)) {
+    /// The profile that lists EPs and singles as well as albums (and soundtracks, if asked),
+    /// made if Lidarr hasn't one.
+    fn profile_for(&self, profiles: &[serde_json::Value], soundtracks: bool) -> Result<serde_json::Value, String> {
+        let name = if soundtracks { SOUNDTRACKS_PROFILE } else { SINGLES_PROFILE };
+        if let Some(ours) = profiles.iter().find(|profile| profile.get("name").and_then(|known| known.as_str()) == Some(name)) {
             return Ok(ours.clone());
         }
         let template = profiles.first().ok_or("Lidarr has no profiles to copy from.")?;
-        self.send("POST", "metadataprofile", Some(singles_profile(template)))
+        self.send("POST", "metadataprofile", Some(made_profile(template, soundtracks)))
+    }
+
+    /// Asks for an album credited to "Various Artists", as most film soundtracks are. That
+    /// isn't an artist whose releases Lidarr can read in: it holds only the albums put
+    /// there one at a time, so this one is put there, wanted.
+    fn request_from_various(&self, wanted: &Offer) -> Result<(), String> {
+        let known = self.artist_numbers()?.get(VARIOUS).copied();
+        if let Some(artist) = known {
+            if let Some(there) = self.listed(artist)?.into_iter().find(|there| there.album == wanted.album) {
+                return if there.wanted || there.have { Ok(()) } else { self.want(artist, &[there.id]) };
+            }
+        }
+        // Lidarr's own description of the album, which is what it takes back to add one.
+        let found: Vec<serde_json::Value> = self.get(&format!("album/lookup?term={}", crate::subsonic::encode(&format!("lidarr:{}", wanted.album))))?;
+        let mut album = found
+            .into_iter()
+            .find(|album| album.get("foreignAlbumId").and_then(|id| id.as_str()) == Some(wanted.album.as_str()))
+            .ok_or("Lidarr no longer lists that one.")?;
+        let folders: Vec<RootFolder> = self.get("rootfolder")?;
+        let folder = folders.first().ok_or("Lidarr has no music folder set up yet.")?;
+        let profile = if wanted.kind() == "Album" && !wanted.soundtrack {
+            folder.default_metadata_profile_id
+        } else {
+            let profiles: Vec<serde_json::Value> = self.get("metadataprofile")?;
+            self.profile_for(&profiles, wanted.soundtrack)?.get("id").and_then(|id| id.as_i64()).ok_or("Lidarr's profile for soundtracks has no number.")?
+        };
+        album["monitored"] = true.into();
+        album["addOptions"] = serde_json::json!({ "addType": "manual", "searchForNewAlbum": true });
+        if !album.get("artist").is_some_and(|artist| artist.is_object()) {
+            album["artist"] = serde_json::json!({ "foreignArtistId": VARIOUS, "artistName": wanted.artist });
+        }
+        let artist = &mut album["artist"];
+        artist["qualityProfileId"] = folder.default_quality_profile_id.into();
+        artist["metadataProfileId"] = profile.into();
+        artist["rootFolderPath"] = folder.path.as_str().into();
+        artist["monitored"] = true.into();
+        artist["monitorNewItems"] = "none".into();
+        artist["addOptions"] = serde_json::json!({ "monitor": "unknown", "albumsToMonitor": [wanted.album], "searchForMissingAlbums": false });
+        let _: serde_json::Value = self.send("POST", "album", Some(album))?;
+        // If "Various Artists" was there already, Lidarr must be watching it to look for this.
+        if let Some(artist) = known {
+            let mut record: serde_json::Value = self.get(&format!("artist/{artist}"))?;
+            if record.get("monitored").and_then(|m| m.as_bool()) != Some(true) {
+                record["monitored"] = true.into();
+                let _: serde_json::Value = self.send("PUT", &format!("artist/{artist}"), Some(record))?;
+            }
+        }
+        Ok(())
     }
 
     /// Has Lidarr list an artist's EPs and singles, if it doesn't already, so one of them can
@@ -623,16 +698,16 @@ impl Lidarr {
         let profiles: Vec<serde_json::Value> = self.get("metadataprofile")?;
         let mut record: serde_json::Value = self.get(&format!("artist/{artist}"))?;
         let current = profiles.iter().find(|profile| profile.get("id") == record.get("metadataProfileId"));
-        if current.is_some_and(|profile| allows(profile, wanted.kind())) {
+        if current.is_some_and(|profile| suits(profile, wanted)) {
             return Ok(None);
         }
-        let ours = self.profile_with_singles(&profiles)?;
+        let ours = self.profile_for(&profiles, wanted.soundtrack)?;
         if let Some(current) = current.filter(|current| !covers(&ours, current)) {
             let name = current.get("name").and_then(|name| name.as_str()).unwrap_or("its own");
             return Err(format!(
                 "{} is on Lidarr's “{name}” profile, which doesn't list {}s. Add them to that profile in Lidarr, then ask again.",
                 wanted.artist,
-                wanted.kind_word()
+                if wanted.soundtrack && allows(current, wanted.kind()) { "soundtrack" } else { wanted.kind_word() }
             ));
         }
         let before = record.get("monitorNewItems").and_then(|setting| setting.as_str()).unwrap_or("all").to_string();
@@ -669,7 +744,7 @@ impl Lidarr {
     pub fn setup(&self) -> Result<Setup, String> {
         let folders: Vec<RootFolder> = self.get("rootfolder")?;
         let folder = folders.first().ok_or("Lidarr has no music folder set up yet.")?;
-        Ok(Setup { folder: folder.path.clone(), quality: folder.default_quality_profile_id, albums: folder.default_metadata_profile_id, singles: None })
+        Ok(Setup { folder: folder.path.clone(), quality: folder.default_quality_profile_id, albums: folder.default_metadata_profile_id, singles: None, soundtracks: None })
     }
 
     /// Adds an artist Lidarr doesn't have with these releases of theirs wanted and none of
@@ -678,15 +753,20 @@ impl Lidarr {
     /// nothing is lost if this app closes meanwhile. Returns Lidarr's number for the artist.
     pub fn add_wanting(&self, setup: &mut Setup, wanted: &[Offer]) -> Result<i64, String> {
         let first = wanted.first().ok_or("Nothing was asked for.")?;
-        let profile = if wanted.iter().all(|offer| offer.kind() == "Album") {
+        let soundtracks = wanted.iter().any(|offer| offer.soundtrack);
+        let profile = if wanted.iter().all(|offer| offer.kind() == "Album" && !offer.soundtrack) {
             setup.albums
         } else {
-            match setup.singles {
+            match if soundtracks { setup.soundtracks } else { setup.singles } {
                 Some(id) => id,
                 None => {
                     let profiles: Vec<serde_json::Value> = self.get("metadataprofile")?;
-                    let id = self.profile_with_singles(&profiles)?.get("id").and_then(|id| id.as_i64()).ok_or("Lidarr's profile for singles has no number.")?;
-                    setup.singles = Some(id);
+                    let id = self.profile_for(&profiles, soundtracks)?.get("id").and_then(|id| id.as_i64()).ok_or("Lidarr's profile for singles has no number.")?;
+                    if soundtracks {
+                        setup.soundtracks = Some(id);
+                    } else {
+                        setup.singles = Some(id);
+                    }
                     id
                 }
             }
@@ -968,7 +1048,7 @@ mod tests {
             "releaseStatuses": [entry("releaseStatus", "Official", true), entry("releaseStatus", "Bootleg", false)],
         });
         assert!(allows(&standard, "Album") && !allows(&standard, "Single"));
-        let ours = singles_profile(&standard);
+        let ours = made_profile(&standard, false);
         assert_eq!(ours.get("id"), None);
         assert_eq!(ours["name"], SINGLES_PROFILE);
         assert!(allows(&ours, "Album") && allows(&ours, "EP") && allows(&ours, "Single") && !allows(&ours, "Other"));
@@ -979,6 +1059,44 @@ mod tests {
         let mut live = standard.clone();
         live["secondaryAlbumTypes"][1]["allowed"] = true.into();
         assert!(!covers(&ours, &live));
+    }
+
+    #[test]
+    fn makes_a_profile_that_lists_soundtracks_too() {
+        let entry = |item: &str, name: &str, allowed: bool| serde_json::json!({ item: { "id": 1, "name": name }, "allowed": allowed });
+        let standard = serde_json::json!({
+            "id": 1, "name": "Standard",
+            "primaryAlbumTypes": [entry("albumType", "Single", false), entry("albumType", "EP", false), entry("albumType", "Album", true)],
+            "secondaryAlbumTypes": [entry("albumType", "Studio", true), entry("albumType", "Soundtrack", false), entry("albumType", "Live", false)],
+            "releaseStatuses": [entry("releaseStatus", "Official", true)],
+        });
+        let singles = made_profile(&standard, false);
+        let ours = made_profile(&standard, true);
+        assert_eq!(ours["name"], SOUNDTRACKS_PROFILE);
+        assert_eq!(listed(&ours, "secondaryAlbumTypes", "albumType"), ["Studio", "Soundtrack"]);
+        // It lists everything the other two do, so an artist can be moved to it from either.
+        assert!(covers(&ours, &standard) && covers(&ours, &singles) && !covers(&singles, &ours));
+        let single = Offer { kind: "Single".into(), ..Default::default() };
+        let from_a_film = Offer { kind: "Single".into(), soundtrack: true, ..Default::default() };
+        let score = Offer { soundtrack: true, ..Default::default() };
+        assert!(suits(&standard, &Offer::default()) && !suits(&standard, &single) && !suits(&standard, &score));
+        assert!(suits(&singles, &single) && !suits(&singles, &from_a_film));
+        assert!(suits(&ours, &single) && suits(&ours, &from_a_film) && suits(&ours, &score));
+    }
+
+    #[test]
+    fn offers_soundtracks_but_not_live_ones() {
+        let found: Vec<AlbumRes> = serde_json::from_str(
+            r#"[
+            {"title":"Still Falling for You","foreignAlbumId":"s1","albumType":"Single","secondaryTypes":["Soundtrack"],"artist":{"artistName":"Ellie Goulding","foreignArtistId":"e1"}},
+            {"title":"Still Falling for You (live)","foreignAlbumId":"s2","albumType":"Single","secondaryTypes":["Live","Soundtrack"],"artist":{"artistName":"Ellie Goulding","foreignArtistId":"e1"}},
+            {"title":"Hits from Films","foreignAlbumId":"s3","albumType":"Album","secondaryTypes":["Compilation","Soundtrack"],"artist":{"artistName":"Various Artists","foreignArtistId":"v"}},
+            {"title":"Sing","foreignAlbumId":"s4","albumType":"Album","secondaryTypes":["Soundtrack"],"artist":{"artistName":"Various Artists","foreignArtistId":"v"}}
+            ]"#,
+        )
+        .unwrap();
+        let offers: Vec<Offer> = found.into_iter().filter(|album| kind_of(album).is_some()).map(offer).collect();
+        assert_eq!(offers.iter().map(|offer| (offer.album.as_str(), offer.kind(), offer.soundtrack)).collect::<Vec<_>>(), [("s1", "Single", true), ("s4", "Album", true)]);
     }
 
     #[test]
@@ -1034,6 +1152,7 @@ mod tests {
                 cover: "https://example.org/c.jpg".into(),
                 requested: false,
                 kind: String::new(),
+                soundtrack: false,
             }
         );
         assert!(offers[1].requested);

@@ -372,7 +372,8 @@ pub fn choose(found: &[Offer], artist: &str, album: &str, singles: bool) -> Opti
         .iter()
         .filter(|offer| singles || offer.kind() == "Album")
         .filter(|offer| !wanted.is_empty() && key(&offer.title) == wanted && same_artist(&offer.artist, artist))
-        .min_by_key(|offer| (words(&offer.title) != exact, rank(offer)))
+        // A studio release before a soundtrack of the same name.
+        .min_by_key(|offer| (words(&offer.title) != exact, offer.soundtrack, rank(offer)))
         .cloned()
 }
 
@@ -425,20 +426,33 @@ fn release_of(want: &Want, song: &str, singles: bool) -> Result<Option<String>, 
     }
 }
 
+/// Finds an album by the name a playlist gives it, as Lidarr's search answers.
+fn by_name(lidarr: &Lidarr, want: &Want, singles: bool) -> Result<Option<Offer>, String> {
+    let found = search(lidarr, &format!("{} {}", want.album, want.artist))?;
+    if let Some(offer) = choose(&found, &want.artist, &want.album, singles) {
+        return Ok(Some(offer));
+    }
+    // Lidarr's search can be thrown by the trimmings; ask without them.
+    let bare = crate::import::undecorated(&want.album);
+    if bare != want.album.trim() {
+        let found = search(lidarr, &format!("{bare} {}", want.artist))?;
+        return Ok(choose(&found, &want.artist, &want.album, singles));
+    }
+    Ok(None)
+}
+
 /// Finds what Lidarr calls an album. An error only if Lidarr couldn't be asked.
 fn find(lidarr: &Lidarr, want: &Want, singles: bool) -> Result<Lookup, String> {
+    // Lidarr's search fails outright for some words ("Thriller" is one), whatever else is
+    // asked with them. That isn't the end of it: the album can still be found by its songs,
+    // and looked up by the name that gives, which is a different question to Lidarr.
+    let mut failed = None;
     if !want.album.is_empty() {
-        let found = search(lidarr, &format!("{} {}", want.album, want.artist))?;
-        if let Some(offer) = choose(&found, &want.artist, &want.album, singles) {
-            return Ok(Lookup::Is(offer));
-        }
-        // Lidarr's search can be thrown by the trimmings; ask without them.
-        let bare = crate::import::undecorated(&want.album);
-        if bare != want.album.trim() {
-            let found = search(lidarr, &format!("{bare} {}", want.artist))?;
-            if let Some(offer) = choose(&found, &want.artist, &want.album, singles) {
-                return Ok(Lookup::Is(offer));
-            }
+        match by_name(lidarr, want, singles) {
+            Ok(Some(offer)) => return Ok(Lookup::Is(offer)),
+            Ok(None) => {}
+            Err(reason) if reason.starts_with("Lidarr answered") => failed = Some(reason),
+            Err(reason) => return Err(reason),
         }
     }
     // By one of its songs: MusicBrainz says what the song came out on, by the name Lidarr
@@ -458,7 +472,10 @@ fn find(lidarr: &Lidarr, want: &Want, singles: bool) -> Result<Lookup, String> {
             return Ok(Lookup::Is(offer));
         }
     }
-    Ok(if unsure { Lookup::Unsure } else { Lookup::Not })
+    match failed {
+        Some(reason) => Err(reason),
+        None => Ok(if unsure { Lookup::Unsure } else { Lookup::Not }),
+    }
 }
 
 // ---- the work ----------------------------------------------------------------------------------------
@@ -640,6 +657,18 @@ fn ask_all(lidarr: &Lidarr, tell: &Tell) -> Result<(), String> {
         // Whether this is an artist to watch Lidarr with (see `Batch::proof`).
         let mut unproven = false;
         let went = match known.get(&artist) {
+            // "Various Artists", which soundtracks are credited to, isn't an artist whose
+            // releases Lidarr can read in: its albums are put there one at a time.
+            _ if artist == crate::lidarr::VARIOUS => Ok((
+                0,
+                offers
+                    .iter()
+                    .map(|offer| match lidarr.request(offer) {
+                        Ok(()) => Went::Listed,
+                        Err(reason) => Went::Failed(reason.trim_end_matches('.').to_string()),
+                    })
+                    .collect(),
+            )),
             Some(&number) => ask_known(lidarr, number, &offers).map(|went| (number, went)),
             None => ask_new(lidarr, &mut setup, &offers).map(|(number, went, watch)| {
                 known.insert(artist.clone(), number);
@@ -744,9 +773,9 @@ fn ask_known(lidarr: &Lidarr, artist: i64, offers: &[Offer]) -> Result<Vec<Went>
                 Went::Listed
             }
             None if reading => Went::Sent(false),
-            // Lidarr only lists the kinds of release an artist's profile names. A single or
-            // an EP may just need the artist moved to a profile that names those.
-            None if offer.kind() != "Album" => match lidarr.start_listing_singles(artist, offer) {
+            // Lidarr only lists the kinds of release an artist's profile names. A single, an
+            // EP or a soundtrack may just need the artist moved to a profile that names those.
+            None if offer.kind() != "Album" || offer.soundtrack => match lidarr.start_listing_singles(artist, offer) {
                 Ok(Some(before)) => {
                     with(|batch| batch.restore.push((artist, before)));
                     save();
@@ -943,6 +972,15 @@ fn finish(lidarr: &Lidarr, artist: i64, given_up: bool, tell: &Tell) -> Result<b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn takes_a_studio_release_before_a_soundtrack_of_the_same_name() {
+        let found = [Offer { soundtrack: true, ..offer("Purple Rain", "Prince", "") }, offer("Purple Rain", "Prince", "Single"), Offer { soundtrack: true, ..offer("Still Falling for You", "Ellie Goulding", "Single") }];
+        assert_eq!(choose(&found, "Prince", "Purple Rain", true).map(|offer| (offer.kind, offer.soundtrack)), Some(("Single".into(), false)));
+        // A soundtrack when that's all there is.
+        assert_eq!(choose(&found, "Prince", "Purple Rain", false).map(|offer| offer.soundtrack), Some(true));
+        assert_eq!(choose(&found, "Ellie Goulding", "Still Falling For You (From \"Bridget Jones's Baby\" Original Motion Picture Soundtrack)", true).map(|offer| offer.soundtrack), Some(true));
+    }
 
     fn offer(title: &str, artist: &str, kind: &str) -> Offer {
         Offer { album: format!("{title}/{artist}/{kind}"), title: title.into(), artist: artist.into(), kind: kind.into(), ..Default::default() }

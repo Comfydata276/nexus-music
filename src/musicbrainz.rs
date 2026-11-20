@@ -20,7 +20,7 @@ const BASE: &str = "https://musicbrainz.org/ws/2";
 /// The gap kept between requests.
 const GAP: Duration = Duration::from_millis(1100);
 /// MusicBrainz's own name for "Various Artists".
-const VARIOUS: &str = "89ad4ac3-39f7-470e-963a-56509c546377";
+const VARIOUS: &str = crate::lidarr::VARIOUS;
 
 /// When the next request may be made.
 static NEXT: Mutex<Option<Instant>> = Mutex::new(None);
@@ -137,10 +137,16 @@ fn list<'a>(value: &'a Value, key: &str) -> &'a [Value] {
     value.get(key).and_then(Value::as_array).map_or(&[], Vec::as_slice)
 }
 
-/// The kind of studio release this is, if it's one that can be asked for: an album, an EP
-/// or a single, and not a live one, a compilation, a remix and so on.
+/// Whether a release is filed as a soundtrack and nothing else besides.
+fn is_soundtrack(group: &Value) -> bool {
+    matches!(list(group, "secondary-types"), [only] if only.as_str() == Some("Soundtrack"))
+}
+
+/// The kind of release this is, if it's one that can be asked for: an album, an EP or a
+/// single, made in a studio or for a soundtrack, and not a live one, a compilation, a remix
+/// and so on.
 fn kind_of(group: &Value) -> Option<&'static str> {
-    if !list(group, "secondary-types").is_empty() {
+    if !list(group, "secondary-types").is_empty() && !is_soundtrack(group) {
         return None;
     }
     match text(group, "primary-type") {
@@ -204,25 +210,43 @@ pub fn song_by(artist: &str, title: &str) -> Result<Vec<SongOffer>, String> {
     Ok(songs)
 }
 
-/// The studio release a song came out on, for when only names are known: an artist's, a
-/// song's and (perhaps) the album a playlist says it's on. The answer is MusicBrainz's name
-/// for the release, which is Lidarr's too. Singles and EPs only count if `singles` says so.
+/// The release a song came out on, for when only names are known: an artist's, a song's and
+/// (perhaps) the album a playlist says it's on. The answer is MusicBrainz's name for the
+/// release, which is Lidarr's too. Singles and EPs only count if `singles` says so.
 pub fn release_with(artist: &str, title: &str, album: &str, singles: bool) -> Result<Option<String>, String> {
     let quoted = |text: &str| text.chars().filter(|c| !matches!(c, '"' | '\\')).collect::<String>();
     let song = crate::import::undecorated(title);
-    let query = format!("artist:\"{}\" AND recording:\"{}\"", quoted(artist), quoted(&song));
-    let found = get(&format!("recording?query={}&limit=50&fmt=json", crate::subsonic::encode(&query)))?;
-    Ok(release_among(&found, artist, title, album, singles))
+    let mut query = format!("artist:\"{}\" AND recording:\"{}\"", quoted(artist), quoted(&song));
+    let ask = |query: &str, limit: u32| get(&format!("recording?query={}&limit={limit}&fmt=json", crate::subsonic::encode(query)));
+    // A well-known song has hundreds of recordings (every live take, every compilation),
+    // and the one wanted needn't be among the first handed back. So the release the
+    // playlist names is asked for first, by name.
+    let named = crate::import::undecorated(album);
+    if !named.is_empty() {
+        let found = ask(&format!("{query} AND release:\"{}\"", quoted(&named)), 50)?;
+        if let Some(release) = release_among(&found, artist, title, album, singles) {
+            return Ok(Some(release));
+        }
+    }
+    query.push_str(" AND NOT secondarytype:live");
+    Ok(release_among(&ask(&query, 100)?, artist, title, album, singles))
 }
 
 /// Of the releases these recordings are on, the one to ask for: the one the playlist named
-/// if it's among them, then an album before a single before an EP, then the earliest.
+/// if it's among them; then a studio release before a soundtrack, the artist's own before
+/// one credited to various artists, an album before a single before an EP, and the earliest.
 fn release_among(found: &Value, artist: &str, title: &str, album: &str, singles: bool) -> Option<String> {
     let song = crate::import::undecorated(title);
     // A live take or a remix isn't the song, unless that's what was asked for.
     let kind = crate::import::version(title);
-    let named = |title: &str| !album.is_empty() && same_words(&crate::import::undecorated(title), &crate::import::undecorated(album));
-    let mut best: Option<((bool, u8, String), String)> = None;
+    // Playlists name soundtracks loosely ("Sing (Original Motion Picture Soundtrack Deluxe)"
+    // for "Sing: Original Motion Picture Soundtrack"): one's words within the other's will do.
+    let (bare, full) = (words(&crate::import::undecorated(album)), words(album));
+    let named = |title: &str| {
+        let theirs = words(title);
+        !bare.is_empty() && (same_words(&crate::import::undecorated(title), &crate::import::undecorated(album)) || (theirs.len() > 1 && theirs.iter().all(|word| full.contains(word))))
+    };
+    let mut best: Option<((bool, bool, bool, u8, String), String)> = None;
     for recording in list(found, "recordings") {
         let theirs = text(recording, "title");
         if recording.get("video").and_then(Value::as_bool) == Some(true) || !same_words(&crate::import::undecorated(theirs), &song) || crate::import::version(theirs) != kind {
@@ -241,12 +265,16 @@ fn release_among(found: &Value, artist: &str, title: &str, album: &str, singles:
                 _ => continue,
             };
             let (_, by, _) = credit(release);
-            if matches!(text(release, "status"), "Bootleg" | "Pseudo-Release") || by == VARIOUS || text(group, "id").is_empty() {
+            let soundtrack = is_soundtrack(group);
+            // A release credited to various artists is a compilation, whatever it's filed
+            // as, unless it's a film's soundtrack.
+            let various = by == VARIOUS;
+            if matches!(text(release, "status"), "Bootleg" | "Pseudo-Release") || (various && !soundtrack) || text(group, "id").is_empty() {
                 continue;
             }
             // One with no date goes after those with.
             let date = if text(release, "date").is_empty() { "9999" } else { text(release, "date") };
-            let key = (!named(text(group, "title")), rank, date.to_string());
+            let key = (!named(text(group, "title")), soundtrack, various, rank, date.to_string());
             if best.as_ref().is_none_or(|(top, _)| key < *top) {
                 best = Some((key, text(group, "id").to_string()));
             }
@@ -349,17 +377,22 @@ fn songs_from(found: &Value, typed: &str, singles: bool) -> Vec<SongOffer> {
         group.releases += releases.len();
         for release in releases {
             let Some(album) = release.get("release-group") else { continue };
-            let rank = match kind_of(album) {
+            let kind = match kind_of(album) {
                 Some("Album") => 0,
                 Some("Single") if singles => 1,
                 Some("EP") if singles => 2,
                 _ => continue,
             };
-            // A release credited to someone else is a compilation, whatever it's filed as.
+            // A release credited to various artists is a compilation, whatever it's filed
+            // as, unless it's a film's soundtrack.
             let (_, by, _) = credit(release);
-            if matches!(text(release, "status"), "Bootleg" | "Pseudo-Release") || by == VARIOUS {
+            let soundtrack = is_soundtrack(album);
+            if matches!(text(release, "status"), "Bootleg" | "Pseudo-Release") || (by == VARIOUS && !soundtrack) {
                 continue;
             }
+            // A soundtrack is the song's home only if it has no other: after every studio
+            // release, and a film's own soundtrack album after the artist's.
+            let rank = kind + if !soundtrack { 0 } else if by == VARIOUS { 6 } else { 3 };
             let date = text(release, "date");
             // An album first. Failing that the single, which is the song as it was put out,
             // before an EP, which is as likely a session or a live set. Of a kind, the earliest.
@@ -367,7 +400,7 @@ fn songs_from(found: &Value, typed: &str, singles: bool) -> Vec<SongOffer> {
             let better = group.offer.album.is_empty() || rank < group.rank || (rank == group.rank && earlier);
             if better {
                 group.rank = rank;
-                group.offer.kind = ["", "Single", "EP"][rank as usize].to_string();
+                group.offer.kind = ["", "Single", "EP"][kind as usize].to_string();
                 group.date = date.to_string();
                 group.offer.album = text(album, "id").to_string();
                 group.offer.album_title = text(album, "title").to_string();
@@ -546,6 +579,7 @@ fn fetch_artist_releases(artist: &str, singles: bool) -> Result<(String, Vec<Off
             if let Some(kind) = kind_of(group) {
                 let (by, _, _) = credit(group);
                 albums.push(Offer {
+                    soundtrack: is_soundtrack(group),
                     kind: if kind == "Album" { String::new() } else { kind.to_string() },
                     album: text(group, "id").to_string(),
                     artist_id: artist.to_string(),
@@ -643,6 +677,25 @@ mod tests {
         assert_eq!(release_among(&found, "Lifehouse", "Another Song", "", true), None);
         // A live take is what's found only when a live take is what's wanted.
         assert_eq!(release_among(&found, "Lifehouse", "All In - Live", "", true).as_deref(), Some("live"));
+
+        // A song made for a film: its own single is filed as a soundtrack, and so is the
+        // film's album, which is credited to various artists.
+        let by_various = |id: &str, title: &str, secondary: &str| {
+            format!(
+                r#"{{"status":"Official","date":"2016","artist-credit":[{{"name":"Various Artists","artist":{{"id":"{VARIOUS}","name":"Various Artists"}}}}],"release-group":{{"id":"{id}","title":"{title}","primary-type":"Album","secondary-types":[{secondary}]}}}}"#
+            )
+        };
+        let found: Value = serde_json::from_str(&format!(
+            r#"{{"recordings":[{}]}}"#,
+            recording("Still Falling for You", "Ellie Goulding", &[by_various("hits", "Hits 2016", r#""Compilation""#), by_various("film", "Bridget Jones’s Baby: Original Motion Picture Soundtrack", r#""Soundtrack""#), release("single", "Still Falling for You", "Single", r#""Soundtrack""#, "2016-08-19")]),
+        ))
+        .unwrap();
+        let wanted = "Still Falling For You - From \"Bridget Jones's Baby\"";
+        assert_eq!(release_among(&found, "Ellie Goulding", wanted, "Still Falling For You (From \"Bridget Jones's Baby\" Original Motion Picture Soundtrack)", true).as_deref(), Some("single"));
+        // Her own release before the film's, when the playlist doesn't say; the film's when it does, or when singles are off.
+        assert_eq!(release_among(&found, "Ellie Goulding", wanted, "", true).as_deref(), Some("single"));
+        assert_eq!(release_among(&found, "Ellie Goulding", wanted, "Bridget Jones's Baby (Original Motion Picture Soundtrack Deluxe)", true).as_deref(), Some("film"));
+        assert_eq!(release_among(&found, "Ellie Goulding", wanted, "", false).as_deref(), Some("film"));
     }
 
     #[test]

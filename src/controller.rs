@@ -1548,6 +1548,17 @@ impl Controller {
             (_, true) => format!("“{title}”{by} will go on Lidarr's list, and Lidarr will start looking for it. The whole album is fetched."),
             (_, false) => format!("“{song}” is on “{title}”{by}. That album will go on Lidarr's list, and Lidarr will start looking for it. The whole album is fetched."),
         };
+        // A soundtrack is another kind of release Lidarr has to be set to list.
+        let soundtrack = offered.as_ref().is_some_and(|offer| offer.soundtrack);
+        let text = if !soundtrack {
+            text
+        } else if offered.as_ref().is_some_and(|offer| offer.artist_id == crate::lidarr::VARIOUS) {
+            format!("{text} It's a soundtrack credited to various artists, so it goes on Lidarr's list under “Various Artists”.")
+        } else if kind == "Album" || kind.is_empty() {
+            format!("{text} It's a soundtrack. If Lidarr doesn't list {whose}'s soundtracks so far, it will be set to. None but this one is fetched.")
+        } else {
+            text.replace("their singles and EPs too", "their singles, EPs and soundtracks too")
+        };
         let heading = match kind.as_str() {
             "Single" => "Ask for this single?",
             "EP" => "Ask for this EP?",
