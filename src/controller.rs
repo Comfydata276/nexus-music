@@ -514,6 +514,7 @@ impl Controller {
                 crate::discover::set_place(paths.discover.clone());
                 // Lyrics the app once fetched for itself; the server provides them now.
                 let _ = std::fs::remove_dir_all(&paths.old_lyrics);
+                crate::bulk::load(&paths.asking);
                 crate::asked::AskedList::load(&paths.asked)
             }),
             asked_ticks: Cell::new(0),
@@ -852,6 +853,8 @@ impl Controller {
 
         self.sync_downloads();
         self.connect_requests();
+        // Albums that were being asked for when the app last closed.
+        self.run_bulk();
         self.apply_theme();
         // For looking at the window buttons on a development build, where there's no frame
         // to replace.
@@ -1674,94 +1677,180 @@ impl Controller {
         });
     }
 
-    /// The albums the songs an import couldn't find are on, as (artist, album), each once.
-    fn missing_albums(&self) -> Vec<(String, String)> {
+    /// What to ask for to get the songs an import couldn't find: the album each is on, once,
+    /// with the songs wanted from it and the playlists they go into.
+    fn missing_wants(&self) -> Vec<crate::bulk::Want> {
         let name = |text: &str| crate::search::fold(text).split_whitespace().collect::<Vec<_>>().join(" ");
-        let mut seen = HashSet::new();
-        self.import_missing
-            .borrow()
-            .iter()
-            .filter(|song| !song.album.trim().is_empty() && !song.artists.is_empty())
-            .filter(|song| seen.insert((name(&song.artists[0]), name(&song.album))))
-            .map(|song| (song.artists[0].clone(), song.album.clone()))
-            .collect()
+        let mut wants: Vec<crate::bulk::Want> = Vec::new();
+        let mut places: HashMap<(String, String), usize> = HashMap::new();
+        // The two lists run side by side: a song, and where it goes when it arrives.
+        for (song, (_, fill)) in self.import_missing.borrow().iter().zip(self.import_fills.borrow().iter()) {
+            let Some(artist) = song.artists.first().filter(|artist| !artist.trim().is_empty()) else { continue };
+            let album = song.album.trim();
+            // A song whose album the file doesn't name is found by the song itself.
+            let key = (name(artist), if album.is_empty() { format!("\u{1}{}", name(&song.title)) } else { name(album) });
+            let at = *places.entry(key).or_insert_with(|| {
+                wants.push(crate::bulk::Want { artist: artist.clone(), album: album.to_string(), ..Default::default() });
+                wants.len() - 1
+            });
+            if !wants[at].songs.contains(&song.title) {
+                wants[at].songs.push(song.title.clone());
+            }
+            if !wants[at].fills.contains(fill) {
+                wants[at].fills.push(fill.clone());
+            }
+        }
+        wants
     }
 
     /// Offers to ask for the albums that the songs an import couldn't find are on.
     fn prompt_request_missing(self: &Rc<Self>) {
-        let albums = self.missing_albums();
-        if albums.is_empty() || crate::lidarr::current().is_none() {
+        let albums = self.missing_wants().len();
+        if albums == 0 || crate::lidarr::current().is_none() {
             return;
         }
-        let songs = self.import_missing.borrow().len();
-        let many = count(albums.len() as u32, "album");
-        *self.prompt.borrow_mut() = Some(crate::actions::PromptAction::RequestMissing(albums));
-        self.open_prompt(
-            &format!("Ask for {many}?"),
-            &format!("The {} that weren't found are on {many}. Each goes on Lidarr's list as a whole album, not as single songs.", count(songs as u32, "song")),
-            &format!("Request {many}"),
-            None,
-            false,
-        );
+        if crate::bulk::running() {
+            self.toast("Lidarr is still being asked for the last lot. See Requests.");
+            return self.navigate(Route::Requests);
+        }
+        let songs = count(self.import_missing.borrow().len() as u32, "song");
+        let many = count(albums as u32, "album");
+        let (heading, text) = if crate::lidarr::singles() {
+            (
+                format!("Ask for {many} and singles?"),
+                format!(
+                    "The {songs} that weren't found came out on {albums} albums, EPs and singles. Each goes on Lidarr's list whole, as the playlist names it: a song listed by its single is asked for as that single. For that, an artist Lidarr only lists albums of is set to list their singles and EPs too. Nothing but what's asked for is fetched."
+                ),
+            )
+        } else {
+            (
+                format!("Ask for {many}?"),
+                format!(
+                    "The {songs} that weren't found are on {many}. Each goes on Lidarr's list as a whole album. A song that only came out on a single or an EP is left out, because those are switched off in Settings."
+                ),
+            )
+        };
+        *self.prompt.borrow_mut() = Some(crate::actions::PromptAction::RequestMissing);
+        self.open_prompt(&heading, &text, "Request them", None, false);
     }
 
-    pub fn request_missing(self: &Rc<Self>, albums: Vec<(String, String)>) {
+    /// Asks for everything the last import didn't find. It's handed over as one batch, which
+    /// is worked through in the background and shown on the Requests page (see `bulk`).
+    pub fn request_missing(self: &Rc<Self>) {
+        let wants = self.missing_wants();
+        if wants.is_empty() || crate::lidarr::current().is_none() {
+            return;
+        }
+        self.toast(format!("Asking Lidarr for {}. How it's going is shown here.", count(wants.len() as u32, "album")));
+        crate::bulk::start(wants);
+        self.run_bulk();
+        self.invalidate("requests");
+        self.navigate(Route::Requests);
+    }
+
+    /// Carries on with a batch of albums being asked for, if there is one and Lidarr is set up.
+    pub fn run_bulk(self: &Rc<Self>) {
         let Some(lidarr) = crate::lidarr::current() else { return };
-        self.toast(format!("Asking Lidarr for {}. This can take a few minutes.", count(albums.len() as u32, "album")));
-        self.requests_pool.spawn(move || {
-            let name = |text: &str| crate::search::fold(text).split_whitespace().collect::<Vec<_>>().join(" ");
-            let (mut asked, mut unmatched, mut failed) = (0, 0, None);
-            // What was asked for, as (the names it was asked by, what Lidarr calls it).
-            let mut noted: Vec<((String, String), crate::lidarr::Offer)> = Vec::new();
-            for (artist, album) in &albums {
-                // The album Lidarr knows by that name and artist, if it knows one.
-                let found = lidarr.find_albums(&format!("{album} {artist}")).unwrap_or_default().into_iter().find(|offer| {
-                    name(&offer.title) == name(album) && (name(&offer.artist) == name(artist) || name(&offer.artist).contains(&name(artist)))
-                });
-                match found {
-                    None => unmatched += 1,
-                    Some(offer) if offer.requested => {
-                        asked += 1;
-                        noted.push(((artist.clone(), album.clone()), offer));
-                    }
-                    Some(offer) => match lidarr.request(&offer) {
-                        Ok(()) => {
-                            asked += 1;
-                            noted.push(((artist.clone(), album.clone()), offer));
-                        }
-                        Err(reason) => failed = Some(reason),
-                    },
+        if !crate::bulk::unfinished() {
+            return;
+        }
+        crate::bulk::run(lidarr, |event| post(move |ctl| ctl.bulk_event(event)));
+    }
+
+    fn bulk_event(self: &Rc<Self>, event: crate::bulk::Event) {
+        use crate::bulk::Event;
+        match event {
+            Event::Changed => self.show_bulk_notice(),
+            Event::Noted(notes) => {
+                for note in &notes {
+                    crate::lidarr::mark(&note.album, true);
+                }
+                self.asked.borrow_mut().add_all(notes);
+                self.invalidate("requests");
+            }
+            Event::Forgot(titles) => {
+                let mut asked = self.asked.borrow_mut();
+                for title in titles {
+                    asked.forget(&title);
                 }
             }
-            post(move |ctl| {
-                // Noted with the songs each playlist is missing, to be put in on arrival.
-                let now = chrono::Utc::now().timestamp();
-                for ((artist, album), offer) in noted {
-                    let fills = ctl
-                        .import_fills
-                        .borrow()
-                        .iter()
-                        .filter(|(of, fill)| name(of) == name(&album) && fill.artists.first().is_some_and(|first| name(first) == name(&artist)))
-                        .map(|(_, fill)| fill.clone())
-                        .collect();
-                    ctl.asked.borrow_mut().add(crate::asked::Asked {
-                        album: offer.album,
-                        title: offer.title,
-                        artist: offer.artist,
-                        at: now,
-                        fills,
-                        ..Default::default()
-                    });
+            Event::Asked => {
+                let summary = crate::bulk::summary();
+                if summary.listed > 0 {
+                    let missed = summary.unknown + summary.failed;
+                    let rest = if missed == 0 { String::new() } else { format!(" {missed} couldn't be asked for; see Requests.") };
+                    self.toast(format!("{} on Lidarr's list.{rest}", if summary.listed == 1 { "1 album is".to_string() } else { format!("{} albums are", summary.listed) }));
                 }
-                ctl.invalidate("requests");
-                ctl.toast(match (unmatched, failed) {
-                    (_, Some(reason)) => format!("Asked for {}. Then: {reason}", count(asked, "album")),
-                    (0, None) => format!("Asked for {}.", count(asked, "album")),
-                    (n, None) => format!("Asked for {}. Lidarr doesn't know {} by those names.", count(asked, "album"), n),
-                });
-                ctl.navigate(Route::Requests);
-            });
-        });
+                self.reload_requests();
+            }
+            Event::Ended => {
+                let summary = crate::bulk::summary();
+                if !summary.stopped.is_empty() {
+                    self.toast(format!("Stopped asking Lidarr. {}", summary.stopped));
+                } else if summary.unknown + summary.failed == 0 {
+                    // Nothing left to say about it.
+                    crate::bulk::clear();
+                }
+                self.refresh_outside();
+                self.reload_requests();
+            }
+        }
+    }
+
+    /// Shows how the batch stands, if the Requests page is the one on screen.
+    fn show_bulk_notice(&self) {
+        if self.current_route() != Some(Route::Requests) {
+            return;
+        }
+        let (notice, action, other) = crate::bulk::summary().notice();
+        let view = self.ui.global::<ui::View>();
+        view.set_notice(notice.as_str().into());
+        view.set_notice_action(action.into());
+        view.set_notice_other(other.into());
+        let mut page = self.page.borrow_mut();
+        page.notice = notice;
+        page.notice_action = action.to_string();
+        page.notice_other = other.to_string();
+    }
+
+    /// Draws the Requests page afresh if it's the one on screen.
+    fn reload_requests(self: &Rc<Self>) {
+        self.invalidate("requests");
+        if self.current_route() == Some(Route::Requests) {
+            let scroll = self.ui.global::<ui::View>().get_scroll_y();
+            self.show(Route::Requests, scroll, true, None);
+        }
+    }
+
+    /// A button beside what the Requests page says of a batch: stop it, carry on with it,
+    /// have another go at what it couldn't ask for, or clear away what's left of it.
+    fn bulk_action(self: &Rc<Self>, other: bool) {
+        let action = {
+            let page = self.page.borrow();
+            if other { page.notice_other.clone() } else { page.notice_action.clone() }
+        };
+        match action.as_str() {
+            "Stop" => {
+                crate::bulk::stop();
+                return self.toast("Stopping. What's already been asked for stays on Lidarr's list.");
+            }
+            "Carry on" => {
+                if crate::lidarr::current().is_none() {
+                    return self.toast("Requests are switched off. Turn them on in Settings.");
+                }
+                self.run_bulk();
+            }
+            "Try again" => {
+                if crate::lidarr::current().is_none() {
+                    return self.toast("Requests are switched off. Turn them on in Settings.");
+                }
+                if crate::bulk::again() {
+                    self.run_bulk();
+                }
+            }
+            _ => crate::bulk::clear(),
+        }
+        self.reload_requests();
     }
 
     /// Albums that were asked for have turned up in the library: says so, and puts the songs
@@ -2011,7 +2100,7 @@ impl Controller {
                 })
             })
             .collect();
-        let askable = crate::lidarr::current().is_some() && !self.missing_albums().is_empty();
+        let askable = crate::lidarr::current().is_some() && !self.missing_wants().is_empty();
         let page = PageData {
             action: if askable { "Request the missing albums".into() } else { String::new() },
             title: "Imported from Spotify".into(),
@@ -2670,6 +2759,7 @@ impl Controller {
         view.set_has_menu(data.has_menu);
         view.set_notice(data.notice.as_str().into());
         view.set_notice_action(data.notice_action.as_str().into());
+        view.set_notice_other(data.notice_other.as_str().into());
         view.set_pending(data.pending);
         view.set_can_star(data.star.is_some());
         view.set_starred(match &data.star {
@@ -2732,6 +2822,7 @@ impl Controller {
             view.set_shelves(shelves_model(&data.shelves));
         }
         view.set_action(data.action.as_str().into());
+        view.set_offers_first(data.offers_first);
         view.set_offers_title(data.offers_title.as_str().into());
         view.set_offers_heading(data.offers_heading.as_str().into());
         view.set_offers_note(data.offers_note.as_str().into());
@@ -3651,9 +3742,19 @@ impl Controller {
         });
         view.on_notice_acted(|| {
             with(|ctl| {
-                // The one notice with something to do about it: downloads that failed.
-                if ctl.current_route() == Some(Route::Downloads) {
-                    ctl.retry_downloads();
+                match ctl.current_route() {
+                    // Downloads that failed.
+                    Some(Route::Downloads) => ctl.retry_downloads(),
+                    // A batch of albums being asked for.
+                    Some(Route::Requests) => ctl.bulk_action(false),
+                    _ => {}
+                }
+            });
+        });
+        view.on_notice_other_acted(|| {
+            with(|ctl| {
+                if ctl.current_route() == Some(Route::Requests) {
+                    ctl.bulk_action(true);
                 }
             });
         });
@@ -3935,6 +4036,10 @@ impl Controller {
                     // A song suggested for a playlist: hear it.
                     return ctl.play_suggestion(&offer.song);
                 }
+                if offer.album.is_empty() {
+                    // One that couldn't be asked for by name: look for it by hand.
+                    return ctl.navigate(Route::Search(format!("{} {}", offer.title, offer.artist)));
+                }
                 let hint = pages::hint(Kind::Request, &offer.album_title, &offer.artist, &offer.cover);
                 ctl.navigate_with(Route::OutsideAlbum(offer.album), hint);
             });
@@ -3947,6 +4052,9 @@ impl Controller {
                 let Some(offer) = ctl.page.borrow().offers.get(index as usize).cloned() else { return };
                 if !offer.song.is_empty() {
                     return ctl.add_suggestion(index as usize);
+                }
+                if offer.album.is_empty() {
+                    return;
                 }
                 ctl.prompt_request(&offer.album, &offer.album_title, &offer.artist, &offer.title, if offer.kind.is_empty() { "Album" } else { &offer.kind });
             });

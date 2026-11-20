@@ -155,6 +155,12 @@ Things that lose data or interrupt the music.
 - [ ] Dragging a song to reorder a playlist has unit tests but hasn't been driven in the
       test app.
 
+## Since the roadmap
+
+- [x] Asking for everything an import didn't find works at any size. It used to skip
+      singles, EPs and any album whose name carried an extra such as "(Remastered)", wait
+      for Lidarr after each one, and keep no record until the end. (0.35.0)
+
 ## Suggested, not yet decided
 
 - A contact address in the requests to MusicBrainz and ListenBrainz, which ask for one.

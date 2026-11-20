@@ -25,7 +25,8 @@ pub struct Lidarr {
 }
 
 /// An album Lidarr knows of that could be asked for.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, Deserialize)]
+#[serde(default)]
 pub struct Offer {
     /// Lidarr's name for the album (a MusicBrainz release-group id) and for its artist.
     pub album: String,
@@ -165,6 +166,34 @@ struct RootFolder {
 #[serde(rename_all = "camelCase", default)]
 struct Page<T> {
     records: Vec<T>,
+    total_records: usize,
+}
+
+/// How many albums (or downloads) Lidarr is asked for at a time when a list is read.
+const PAGE: usize = 500;
+/// The most pages of a list that are read: a stop for a server that never says it's done.
+const PAGES: usize = 100;
+
+/// A release Lidarr lists for an artist it keeps track of.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Listed {
+    /// Its MusicBrainz id, and Lidarr's own number for it.
+    pub album: String,
+    pub id: i64,
+    /// It's on Lidarr's list of things to get.
+    pub wanted: bool,
+    /// Lidarr has files for it.
+    pub have: bool,
+}
+
+/// What a new artist is added with: where Lidarr keeps music, and the profiles it uses there.
+pub struct Setup {
+    folder: String,
+    quality: i64,
+    /// The profile for an artist only albums are wanted of, and the one that lists singles
+    /// and EPs too, once that's been looked up (or made).
+    albums: i64,
+    singles: Option<i64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -274,6 +303,42 @@ fn singles_profile(template: &serde_json::Value) -> serde_json::Value {
     profile
 }
 
+/// Which of these artists Lidarr's list of jobs has something queued or under way for. A
+/// job that reads every artist in keeps them all busy.
+fn busy_among(commands: &[serde_json::Value], artists: &std::collections::HashSet<i64>) -> std::collections::HashSet<i64> {
+    let mut busy = std::collections::HashSet::new();
+    for command in commands {
+        let status = command.get("status").and_then(|status| status.as_str()).unwrap_or_default().to_lowercase();
+        if status != "queued" && status != "started" {
+            continue;
+        }
+        let name = command.get("name").and_then(|name| name.as_str()).unwrap_or_default();
+        let body = command.get("body");
+        let mut named: Vec<i64> =
+            body.and_then(|body| body.get("artistIds")).and_then(|ids| ids.as_array()).into_iter().flatten().filter_map(|id| id.as_i64()).collect();
+        named.extend(body.and_then(|body| body.get("artistId")).and_then(|id| id.as_i64()));
+        if named.is_empty() && name == "RefreshArtist" {
+            return artists.clone();
+        }
+        busy.extend(named.into_iter().filter(|id| artists.contains(id)));
+    }
+    busy
+}
+
+/// A number that stands for the jobs Lidarr has queued or under way, and how far each has got.
+fn jobs_stamp(commands: &[serde_json::Value]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut jobs: Vec<(i64, String)> = commands
+        .iter()
+        .map(|command| (command.get("id").and_then(|id| id.as_i64()).unwrap_or_default(), command.get("status").and_then(|status| status.as_str()).unwrap_or_default().to_lowercase()))
+        .filter(|(_, status)| status == "queued" || status == "started")
+        .collect();
+    jobs.sort();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    jobs.hash(&mut hasher);
+    hasher.finish()
+}
+
 fn offer(album: AlbumRes) -> Offer {
     Offer {
         kind: kind_of(&album).filter(|kind| *kind != "Album").unwrap_or_default().to_string(),
@@ -361,11 +426,6 @@ impl Lidarr {
             version: String,
         }
         self.get::<Status>("system/status").map(|status| status.version)
-    }
-
-    /// Looks for albums matching what was typed.
-    pub fn find_albums(&self, term: &str) -> Result<Vec<Offer>, String> {
-        self.find_releases(term).map(|(albums, _)| albums)
     }
 
     /// Looks for albums matching what was typed, and the singles of that name too.
@@ -549,6 +609,17 @@ impl Lidarr {
     /// release and fetch the lot. With the setting off while it reads them in, they're
     /// listed and nothing more; turning it back on afterwards doesn't change that.
     fn list_singles(&self, artist: i64, wanted: &Offer) -> Result<Option<String>, String> {
+        let before = self.start_listing_singles(artist, wanted)?;
+        if before.is_some() {
+            // Lidarr starts reading the artist's releases in again; give it a moment to begin.
+            std::thread::sleep(Duration::from_secs(3));
+        }
+        Ok(before)
+    }
+
+    /// The same, without waiting for Lidarr to begin: for a caller that watches for it to
+    /// finish (see `busy_with`) and puts the setting back itself (see `set_new_releases`).
+    pub fn start_listing_singles(&self, artist: i64, wanted: &Offer) -> Result<Option<String>, String> {
         let profiles: Vec<serde_json::Value> = self.get("metadataprofile")?;
         let mut record: serde_json::Value = self.get(&format!("artist/{artist}"))?;
         let current = profiles.iter().find(|profile| profile.get("id") == record.get("metadataProfileId"));
@@ -568,9 +639,121 @@ impl Lidarr {
         record["metadataProfileId"] = ours.get("id").cloned().unwrap_or_default();
         record["monitorNewItems"] = "none".into();
         let _: serde_json::Value = self.send("PUT", &format!("artist/{artist}"), Some(record))?;
-        // Lidarr starts reading the artist's releases in again; give it a moment to begin.
-        std::thread::sleep(Duration::from_secs(3));
         Ok(Some(before))
+    }
+
+    /// Sets what Lidarr does about an artist's new releases ("all", "new" or "none").
+    pub fn set_new_releases(&self, artist: i64, setting: &str) -> Result<(), String> {
+        let mut record: serde_json::Value = self.get(&format!("artist/{artist}"))?;
+        if record.get("monitorNewItems").and_then(|now| now.as_str()) == Some(setting) {
+            return Ok(());
+        }
+        record["monitorNewItems"] = setting.into();
+        self.send::<serde_json::Value>("PUT", &format!("artist/{artist}"), Some(record)).map(drop)
+    }
+
+    // ---- many at once (see `bulk`) -------------------------------------------------------------
+
+    /// Where this Lidarr is: what tells one from another.
+    pub fn address(&self) -> &str {
+        &self.base
+    }
+
+    /// Lidarr's own numbers for the artists it keeps track of, by their MusicBrainz ids.
+    pub fn artist_numbers(&self) -> Result<HashMap<String, i64>, String> {
+        let artists: Vec<ArtistRes> = self.get("artist")?;
+        Ok(artists.into_iter().map(|artist| (artist.foreign_artist_id, artist.id)).collect())
+    }
+
+    /// What's needed to add an artist.
+    pub fn setup(&self) -> Result<Setup, String> {
+        let folders: Vec<RootFolder> = self.get("rootfolder")?;
+        let folder = folders.first().ok_or("Lidarr has no music folder set up yet.")?;
+        Ok(Setup { folder: folder.path.clone(), quality: folder.default_quality_profile_id, albums: folder.default_metadata_profile_id, singles: None })
+    }
+
+    /// Adds an artist Lidarr doesn't have with these releases of theirs wanted and none of
+    /// the rest, in one call. Lidarr reads the artist in, marks the releases named and
+    /// starts looking for them by itself, in its own time: nothing has to wait for it, and
+    /// nothing is lost if this app closes meanwhile. Returns Lidarr's number for the artist.
+    pub fn add_wanting(&self, setup: &mut Setup, wanted: &[Offer]) -> Result<i64, String> {
+        let first = wanted.first().ok_or("Nothing was asked for.")?;
+        let profile = if wanted.iter().all(|offer| offer.kind() == "Album") {
+            setup.albums
+        } else {
+            match setup.singles {
+                Some(id) => id,
+                None => {
+                    let profiles: Vec<serde_json::Value> = self.get("metadataprofile")?;
+                    let id = self.profile_with_singles(&profiles)?.get("id").and_then(|id| id.as_i64()).ok_or("Lidarr's profile for singles has no number.")?;
+                    setup.singles = Some(id);
+                    id
+                }
+            }
+        };
+        let albums: Vec<&str> = wanted.iter().map(|offer| offer.album.as_str()).collect();
+        let added: ArtistRes = self.send(
+            "POST",
+            "artist",
+            Some(serde_json::json!({
+                "foreignArtistId": first.artist_id,
+                "artistName": first.artist,
+                "qualityProfileId": setup.quality,
+                "metadataProfileId": profile,
+                "rootFolderPath": setup.folder,
+                "monitored": true,
+                "monitorNewItems": "none",
+                // With releases named, Lidarr marks those and no others whatever "monitor"
+                // says. "none" isn't said, because that also stops Lidarr watching the artist.
+                "addOptions": { "monitor": "unknown", "albumsToMonitor": albums, "searchForMissingAlbums": true },
+            })),
+        )?;
+        Ok(added.id)
+    }
+
+    /// What Lidarr lists for an artist it keeps track of.
+    pub fn listed(&self, artist: i64) -> Result<Vec<Listed>, String> {
+        let albums: Vec<AlbumRes> = self.get(&format!("album?artistId={artist}"))?;
+        Ok(albums
+            .into_iter()
+            .map(|album| Listed { wanted: album.monitored, have: album.statistics.track_file_count > 0, id: album.id, album: album.foreign_album_id })
+            .collect())
+    }
+
+    /// Marks releases of an artist Lidarr has as wanted, and starts the search for them.
+    pub fn want(&self, artist: i64, albums: &[i64]) -> Result<(), String> {
+        if albums.is_empty() {
+            return Ok(());
+        }
+        // Lidarr only looks for albums of artists it's watching.
+        let mut record: serde_json::Value = self.get(&format!("artist/{artist}"))?;
+        if record.get("monitored").and_then(|m| m.as_bool()) != Some(true) {
+            record["monitored"] = true.into();
+            let _: serde_json::Value = self.send("PUT", &format!("artist/{artist}"), Some(record))?;
+        }
+        let _: serde_json::Value = self.send("PUT", "album/monitor", Some(serde_json::json!({ "albumIds": albums, "monitored": true })))?;
+        self.send::<serde_json::Value>("POST", "command", Some(serde_json::json!({ "name": "AlbumSearch", "albumIds": albums }))).map(drop)
+    }
+
+    /// Takes releases off Lidarr's list.
+    pub fn unwant(&self, albums: &[i64]) -> Result<(), String> {
+        if albums.is_empty() {
+            return Ok(());
+        }
+        self.send::<serde_json::Value>("PUT", "album/monitor", Some(serde_json::json!({ "albumIds": albums, "monitored": false }))).map(drop)
+    }
+
+    /// Which of these artists Lidarr is in the middle of something for: reading them in,
+    /// looking through their folder, or waiting its turn to.
+    pub fn busy_with(&self, artists: &std::collections::HashSet<i64>) -> Result<std::collections::HashSet<i64>, String> {
+        self.busy(artists).map(|(busy, _)| busy)
+    }
+
+    /// The same, with a number that changes whenever Lidarr's list of jobs does: a way to
+    /// tell a Lidarr that's working through a long list from one that's stuck.
+    pub fn busy(&self, artists: &std::collections::HashSet<i64>) -> Result<(std::collections::HashSet<i64>, u64), String> {
+        let commands: Vec<serde_json::Value> = self.get("command")?;
+        Ok((busy_among(&commands, artists), jobs_stamp(&commands)))
     }
 
     /// Puts an artist's "new releases" setting back, once Lidarr has finished with them.
@@ -645,18 +828,32 @@ impl Lidarr {
         }))
     }
 
+    /// Every record of one of Lidarr's lists that come a page at a time.
+    fn every<T: DeserializeOwned + Default>(&self, path: &str) -> Result<Vec<T>, String> {
+        let mut all: Vec<T> = Vec::new();
+        for page in 1..=PAGES {
+            let join = if path.contains('?') { '&' } else { '?' };
+            let got: Page<T> = self.get(&format!("{path}{join}page={page}&pageSize={PAGE}"))?;
+            let count = got.records.len();
+            all.extend(got.records);
+            if count < PAGE || (got.total_records > 0 && all.len() >= got.total_records) {
+                break;
+            }
+        }
+        Ok(all)
+    }
+
     /// The albums on Lidarr's list that haven't fully arrived, those being downloaded first.
     pub fn pending(&self) -> Result<Vec<Pending>, String> {
-        let wanted: Page<AlbumRes> = self.get("wanted/missing?pageSize=200&includeArtist=true")?;
-        let queue: Page<QueueItem> = self.get("queue?pageSize=200")?;
+        let wanted: Vec<AlbumRes> = self.every("wanted/missing?includeArtist=true")?;
+        let queue: Vec<QueueItem> = self.every("queue")?;
         let mut progress: HashMap<i64, u8> = HashMap::new();
-        for item in queue.records.iter().filter(|item| item.size > 0.0) {
+        for item in queue.iter().filter(|item| item.size > 0.0) {
             let done = (((item.size - item.sizeleft) / item.size) * 100.0).clamp(0.0, 100.0) as u8;
             let best = progress.entry(item.album_id).or_default();
             *best = (*best).max(done);
         }
         let mut pending: Vec<Pending> = wanted
-            .records
             .into_iter()
             .map(|album| Pending {
                 progress: progress.get(&album.id).copied(),
@@ -782,6 +979,33 @@ mod tests {
         let mut live = standard.clone();
         live["secondaryAlbumTypes"][1]["allowed"] = true.into();
         assert!(!covers(&ours, &live));
+    }
+
+    #[test]
+    fn tells_which_artists_lidarr_is_busy_with() {
+        let commands: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[
+            {"name":"RefreshArtist","status":"started","body":{"artistIds":[10],"isNewArtist":true}},
+            {"name":"RefreshArtist","status":"queued","body":{"artistIds":[11,12]}},
+            {"name":"RescanFolders","status":"queued","body":{"folders":["/music/x"],"artistIds":[13]}},
+            {"name":"MissingAlbumSearch","status":"started","body":{"artistId":14}},
+            {"name":"RefreshArtist","status":"completed","body":{"artistIds":[15]}},
+            {"name":"RssSync","status":"started","body":{}}
+            ]"#,
+        )
+        .unwrap();
+        let asked: std::collections::HashSet<i64> = [10, 12, 13, 14, 15, 16].into();
+        let mut busy: Vec<i64> = busy_among(&commands, &asked).into_iter().collect();
+        busy.sort_unstable();
+        assert_eq!(busy, [10, 12, 13, 14]);
+        // Lidarr's own round of every artist keeps them all busy.
+        let all: Vec<serde_json::Value> = serde_json::from_str(r#"[{"name":"RefreshArtist","status":"started","body":{"artistIds":[]}}]"#).unwrap();
+        assert_eq!(busy_among(&all, &asked), asked);
+        // A job finishing, or starting, shows.
+        let step = |text: &str| jobs_stamp(&serde_json::from_str::<Vec<serde_json::Value>>(text).unwrap());
+        let before = step(r#"[{"id":1,"status":"started"},{"id":2,"status":"queued"},{"id":3,"status":"queued"}]"#);
+        assert_eq!(before, step(r#"[{"id":3,"status":"queued"},{"id":0,"status":"completed"},{"id":2,"status":"queued"},{"id":1,"status":"started"}]"#));
+        assert_ne!(before, step(r#"[{"id":1,"status":"completed"},{"id":2,"status":"started"},{"id":3,"status":"queued"}]"#));
     }
 
     #[test]

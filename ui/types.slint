@@ -223,6 +223,9 @@ export global View {
     in property <string> notice;
     in property <string> notice-action;
     callback notice-acted();
+    // A second thing that can be done about it.
+    in property <string> notice-other;
+    callback notice-other-acted();
     // Figures shown across the top of the page.
     in property <[Stat]> stats;
     in property <string> about;
@@ -251,6 +254,8 @@ export global View {
     // Music that isn't in the library: a heading for the section, songs that could be asked
     // for, and shelves that go beneath them.
     in property <string> offers-title;
+    // That section goes at the top of the page (what couldn't be asked for), not the foot.
+    in property <bool> offers-first;
     // What the songs that could be asked for are headed; "Songs" if it's empty.
     in property <string> offers-heading;
     in property <string> offers-note;

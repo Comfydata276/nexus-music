@@ -68,10 +68,10 @@ pub enum PromptAction {
     DownloadsFolder,
     /// The folder for songs kept as they play was typed in.
     SongsFolder,
-    /// Ask Lidarr for an album (by its name for it), or for several by (artist, album).
+    /// Ask Lidarr for an album (by its name for it), or for everything an import didn't find.
     RequestAlbum { album: String, title: String, song: String },
     AddArtist { artist: String, name: String },
-    RequestMissing(Vec<(String, String)>),
+    RequestMissing,
     RenamePlaylist(String),
     DeletePlaylist(String),
 }
@@ -1084,7 +1084,7 @@ impl Controller {
             }
             PromptAction::RequestAlbum { album, title, song } => self.request_album(album, title, song),
             PromptAction::AddArtist { artist, name } => self.add_artist(artist, name),
-            PromptAction::RequestMissing(albums) => self.request_missing(albums),
+            PromptAction::RequestMissing => self.request_missing(),
             PromptAction::ImportPath => {
                 if !name.is_empty() {
                     self.run_import(vec![std::path::PathBuf::from(name.trim_matches('"'))]);

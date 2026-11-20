@@ -34,6 +34,8 @@ pub struct Paths {
     pub added: PathBuf,
     /// What's been asked for through this app and is being watched for.
     pub asked: PathBuf,
+    /// A batch of albums being asked for, so it can be carried on after a restart (see `bulk`).
+    pub asking: PathBuf,
     /// Artists worth a look, as last worked out (see `discover`).
     pub discover: PathBuf,
     /// Where version 0.22 kept lyrics it fetched itself. Lyrics now come from the server
@@ -75,6 +77,7 @@ impl Paths {
             pending: config.join("pending.json"),
             added: config.join("playlist-added.json"),
             asked: config.join("asked.json"),
+            asking: config.join("asking.json"),
             discover: cache.join("discover.json"),
             covers: cache.join("covers"),
             pages: cache.join("pages"),

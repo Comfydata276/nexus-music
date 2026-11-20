@@ -303,8 +303,8 @@ pub fn missing_text(reports: &[ListReport]) -> String {
 // ---- finding the songs ---------------------------------------------------------------------------
 
 /// A title without what's often tacked on to it ("(feat. X)", "- 2011 Remaster", "[Live]"),
-/// lower-cased and without accents or punctuation.
-fn plain(title: &str) -> String {
+/// otherwise as written. A title that's nothing but a bracket ("(Intro)") is left alone.
+pub(crate) fn undecorated(title: &str) -> String {
     let mut kept = String::new();
     let mut depth = 0usize;
     for c in title.chars() {
@@ -315,15 +315,18 @@ fn plain(title: &str) -> String {
             _ => {}
         }
     }
-    let kept = kept.split(" - ").next().unwrap_or_default();
-    let folded = fold(kept).split_whitespace().collect::<Vec<_>>().join(" ");
-    // A title that's nothing but a bracket ("(Intro)") keeps it.
-    if folded.is_empty() { fold(title).split_whitespace().collect::<Vec<_>>().join(" ") } else { folded }
+    let kept = kept.split(" - ").next().unwrap_or_default().trim();
+    if kept.chars().any(char::is_alphanumeric) { kept.to_string() } else { title.trim().to_string() }
+}
+
+/// The same, lower-cased and without accents or punctuation.
+fn plain(title: &str) -> String {
+    fold(&undecorated(title)).split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Which kind of recording a title says it is, if it says. A live version isn't the song
 /// the playlist asked for, unless that's what it asked for.
-fn version(title: &str) -> Vec<&'static str> {
+pub(crate) fn version(title: &str) -> Vec<&'static str> {
     let folded = fold(title);
     let words: Vec<&str> = folded.split_whitespace().collect();
     ["live", "remix", "acoustic", "instrumental", "demo", "karaoke"].into_iter().filter(|kind| words.contains(kind)).collect()

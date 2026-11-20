@@ -5,6 +5,7 @@ mod actions;
 mod asked;
 mod added;
 mod audio;
+mod bulk;
 mod config;
 mod controller;
 mod covers;

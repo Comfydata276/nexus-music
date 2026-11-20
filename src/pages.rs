@@ -181,6 +181,9 @@ pub struct PageData {
     pub notice: String,
     #[serde(default)]
     pub notice_action: String,
+    /// A second thing that can be done about it.
+    #[serde(default)]
+    pub notice_other: String,
     /// The API parameter and id used to like this page's subject, e.g. `("albumId", id)`.
     pub star: Option<(String, String)>,
     pub starred: bool,
@@ -205,6 +208,8 @@ pub struct PageData {
     pub offers_note: String,
     /// What the songs among them are headed, if not "Songs".
     pub offers_heading: String,
+    /// That section goes at the top of the page, not the foot.
+    pub offers_first: bool,
     /// Where "Show all" beside the songs leads, for a list that's been cut short; and the
     /// same for the songs that aren't in the library.
     pub tracks_route: String,
@@ -928,7 +933,7 @@ fn requests() -> PageData {
                 .collect(),
         }]
     };
-    match lidarr.pending() {
+    let mut page = match lidarr.pending() {
         Err(reason) => PageData { title, lead, empty: reason, ..Default::default() },
         Ok(pending) if pending.is_empty() => PageData {
             title,
@@ -959,7 +964,36 @@ fn requests() -> PageData {
                 .collect(),
             ..Default::default()
         },
+    };
+    // A batch of albums being asked for (see `bulk`): how it stands, and what it couldn't ask for.
+    let (notice, action, other) = crate::bulk::summary().notice();
+    page.notice = notice;
+    page.notice_action = action.to_string();
+    page.notice_other = other.to_string();
+    let missed = crate::bulk::missed();
+    if !missed.is_empty() {
+        if !crate::bulk::running() && page.tracks_title.is_empty() {
+            page.empty = String::new();
+        }
+        page.offers_first = true;
+        page.offers_title = "Couldn't be asked for".into();
+        page.offers_note = "Lidarr was asked for these by the names your playlists give them, and by their songs. Pick one to search for it yourself.".into();
+        page.offers_heading = if missed.len() == 1 { "1 album".into() } else { format!("{} albums", missed.len()) };
+        page.offers = missed
+            .into_iter()
+            .map(|want| {
+                let song = want.songs.first().cloned().unwrap_or_default();
+                OfferData {
+                    title: if want.album.is_empty() { song.clone() } else { want.album.clone() },
+                    artist: want.artist.clone(),
+                    artist_name: want.artist,
+                    about: if want.album.is_empty() || song.is_empty() { want.reason } else { format!("{}, for “{song}”", want.reason) },
+                    ..Default::default()
+                }
+            })
+            .collect();
     }
+    page
 }
 
 /// The page for one of the "Made for you" mixes.

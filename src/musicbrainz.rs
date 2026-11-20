@@ -204,6 +204,57 @@ pub fn song_by(artist: &str, title: &str) -> Result<Vec<SongOffer>, String> {
     Ok(songs)
 }
 
+/// The studio release a song came out on, for when only names are known: an artist's, a
+/// song's and (perhaps) the album a playlist says it's on. The answer is MusicBrainz's name
+/// for the release, which is Lidarr's too. Singles and EPs only count if `singles` says so.
+pub fn release_with(artist: &str, title: &str, album: &str, singles: bool) -> Result<Option<String>, String> {
+    let quoted = |text: &str| text.chars().filter(|c| !matches!(c, '"' | '\\')).collect::<String>();
+    let song = crate::import::undecorated(title);
+    let query = format!("artist:\"{}\" AND recording:\"{}\"", quoted(artist), quoted(&song));
+    let found = get(&format!("recording?query={}&limit=50&fmt=json", crate::subsonic::encode(&query)))?;
+    Ok(release_among(&found, artist, title, album, singles))
+}
+
+/// Of the releases these recordings are on, the one to ask for: the one the playlist named
+/// if it's among them, then an album before a single before an EP, then the earliest.
+fn release_among(found: &Value, artist: &str, title: &str, album: &str, singles: bool) -> Option<String> {
+    let song = crate::import::undecorated(title);
+    // A live take or a remix isn't the song, unless that's what was asked for.
+    let kind = crate::import::version(title);
+    let named = |title: &str| !album.is_empty() && same_words(&crate::import::undecorated(title), &crate::import::undecorated(album));
+    let mut best: Option<((bool, u8, String), String)> = None;
+    for recording in list(found, "recordings") {
+        let theirs = text(recording, "title");
+        if recording.get("video").and_then(Value::as_bool) == Some(true) || !same_words(&crate::import::undecorated(theirs), &song) || crate::import::version(theirs) != kind {
+            continue;
+        }
+        let (written, _, first) = credit(recording);
+        if !crate::asked::same_artist(&first, artist) && !crate::asked::same_artist(&written, artist) {
+            continue;
+        }
+        for release in list(recording, "releases") {
+            let Some(group) = release.get("release-group") else { continue };
+            let rank = match kind_of(group) {
+                Some("Album") => 0,
+                Some("Single") if singles => 1,
+                Some("EP") if singles => 2,
+                _ => continue,
+            };
+            let (_, by, _) = credit(release);
+            if matches!(text(release, "status"), "Bootleg" | "Pseudo-Release") || by == VARIOUS || text(group, "id").is_empty() {
+                continue;
+            }
+            // One with no date goes after those with.
+            let date = if text(release, "date").is_empty() { "9999" } else { text(release, "date") };
+            let key = (!named(text(group, "title")), rank, date.to_string());
+            if best.as_ref().is_none_or(|(top, _)| key < *top) {
+                best = Some((key, text(group, "id").to_string()));
+            }
+        }
+    }
+    best.map(|(_, id)| id)
+}
+
 /// The words of a piece of text, for comparing: folded, without punctuation.
 pub fn words(text: &str) -> Vec<String> {
     let folded: String = fold(text).chars().filter(|c| !matches!(c, '\'' | '’')).collect();
@@ -565,6 +616,34 @@ fn tracks_from(found: &Value) -> Vec<TrackName> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finds_the_release_a_named_song_came_out_on() {
+        let release = |id: &str, title: &str, kind: &str, secondary: &str, date: &str| {
+            format!(r#"{{"status":"Official","date":"{date}","release-group":{{"id":"{id}","title":"{title}","primary-type":"{kind}","secondary-types":[{secondary}]}}}}"#)
+        };
+        let recording = |title: &str, artist: &str, releases: &[String]| {
+            format!(r#"{{"title":"{title}","artist-credit":[{{"name":"{artist}","artist":{{"id":"a1","name":"{artist}"}}}}],"releases":[{}]}}"#, releases.join(","))
+        };
+        let found: Value = serde_json::from_str(&format!(
+            r#"{{"recordings":[{},{},{}]}}"#,
+            recording("All In", "Lifehouse", &[release("ep", "All In", "EP", "", ""), release("best", "Greatest Hits", "Album", r#""Compilation""#, "2015"), release("album", "Smoke & Mirrors", "Album", "", "2010")]),
+            recording("All In (live)", "Lifehouse", &[release("live", "Live Somewhere", "Album", "", "2001")]),
+            recording("All In", "Someone Else", &[release("other", "Theirs", "Album", "", "1999")]),
+        ))
+        .unwrap();
+        // The studio album, whatever else the song is on.
+        assert_eq!(release_among(&found, "Lifehouse", "All In", "", true).as_deref(), Some("album"));
+        // Unless the playlist names something else it's on.
+        assert_eq!(release_among(&found, "Lifehouse", "All In", "All In - EP", true).as_deref(), Some("ep"));
+        assert_eq!(release_among(&found, "Lifehouse", "All In", "Smoke & Mirrors (International Version)", true).as_deref(), Some("album"));
+        // With singles and EPs switched off, only an album will do.
+        assert_eq!(release_among(&found, "Lifehouse", "All In", "All In", false).as_deref(), Some("album"));
+        assert_eq!(release_among(&found, "Nobody", "All In", "", true), None);
+        assert_eq!(release_among(&found, "Lifehouse", "Another Song", "", true), None);
+        // A live take is what's found only when a live take is what's wanted.
+        assert_eq!(release_among(&found, "Lifehouse", "All In - Live", "", true).as_deref(), Some("live"));
+    }
 
     #[test]
     fn folds_recordings_into_songs() {

@@ -111,6 +111,22 @@ impl AskedList {
     /// Notes something asked for. Asking again for the same album adds to the note that's
     /// there: more songs for playlists, or the song that's wanted from it.
     pub fn add(&mut self, asked: Asked) {
+        self.put(asked);
+        self.save();
+    }
+
+    /// Notes several things asked for at once.
+    pub fn add_all(&mut self, asked: Vec<Asked>) {
+        if asked.is_empty() {
+            return;
+        }
+        for one in asked {
+            self.put(one);
+        }
+        self.save();
+    }
+
+    fn put(&mut self, asked: Asked) {
         let same = |other: &Asked| {
             other.arrived == 0 && ((!asked.album.is_empty() && other.album == asked.album) || (same_words(&other.title, &asked.title) && same_artist(&other.artist, &asked.artist)))
         };
@@ -130,7 +146,6 @@ impl AskedList {
             }
             None => self.items.push(asked),
         }
-        self.save();
     }
 
     /// Stops watching for an album that's been taken off Lidarr's list.
@@ -183,7 +198,7 @@ impl AskedList {
 }
 
 /// Whether two artist credits name the same artist, or one is among the other's.
-fn same_artist(a: &str, b: &str) -> bool {
+pub(crate) fn same_artist(a: &str, b: &str) -> bool {
     let (a, b) = (words(a), words(b));
     !a.is_empty() && !b.is_empty() && (a.iter().all(|word| b.contains(word)) || b.iter().all(|word| a.contains(word)))
 }
