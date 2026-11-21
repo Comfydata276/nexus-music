@@ -430,16 +430,10 @@ impl Controller {
         let suffix = song.suffix.to_lowercase();
         let native = NATIVE_SUFFIXES.contains(&suffix.as_str()) && !pb.needs_transcode.contains(&song.id);
         let cap = settings.max_bitrate();
-        // Whether this song sits beside another from the same album in the play order.
-        let album_run = !song.album_id.is_empty()
-            && pb.order.iter().position(|&i| pb.queue.get(i).is_some_and(|s| s.id == song.id)).is_some_and(|at| {
-                let beside = |at: Option<usize>| {
-                    at.and_then(|at| pb.order.get(at))
-                        .and_then(|&i| pb.queue.get(i))
-                        .is_some_and(|other| other.album_id == song.album_id)
-                };
-                beside(at.checked_sub(1)) || beside(Some(at + 1))
-            });
+        let album_run = pb.order.iter().position(|&i| pb.queue.get(i).is_some_and(|s| s.id == song.id)).is_some_and(|at| {
+            let neighbour = |at: Option<usize>| at.and_then(|at| pb.order.get(at)).and_then(|&i| pb.queue.get(i));
+            in_album_order(song, neighbour(at.checked_sub(1)), neighbour(Some(at + 1)), pb.shuffle)
+        });
         let gain = level_gain(&settings, song, album_run);
         let duration_secs = song.duration as f64;
         if !song.radio_url.is_empty() {
@@ -2290,11 +2284,6 @@ impl Controller {
     }
 }
 
-/// The gain to apply to a song so it lands at the chosen loudness, from its ReplayGain tags.
-/// `album_run` says the song is playing alongside others from its album.
-/// The form a song is streamed in: the bit rate to ask for (0 for the file as it is) and
-/// the kind of file that comes back. `native` is whether the app can play the file as it is;
-/// `cap` is the bit rate limit in Settings, 0 for none.
 /// The fewest bytes a whole converted song can come to: most of what its length works out at,
 /// at the bit rate asked for or the file's own if that's lower. A conversion doesn't say how
 /// long it will be, so one that ends well short of this was cut off, and isn't kept.
@@ -2308,10 +2297,45 @@ fn nearest_rate(kbps: u32) -> u32 {
     [96u32, 128, 160, 192, 256, 320].into_iter().min_by_key(|rate| rate.abs_diff(kbps)).unwrap_or(320)
 }
 
+/// The form a song is streamed in: the bit rate to ask for (0 for the file as it is) and
+/// the kind of file that comes back. `native` is whether the app can play the file as it is;
+/// `cap` is the bit rate limit in Settings, 0 for none.
 fn stream_form(native: bool, cap: u32, suffix: &str) -> (u32, &str) {
     if native && cap == 0 { (0, suffix) } else { (if cap == 0 { 320 } else { cap }, "mp3") }
 }
 
+/// Whether a song is playing as part of its album, which is when Auto levels by album: shuffle
+/// is off and the song before or after it is the album's previous or next track. A playlist
+/// or a shuffle uses each song's own value instead, except for a run of consecutive tracks
+/// from one album, which keeps their levels relative to each other.
+/// Without track numbers to go by, any neighbour from the same album counts.
+fn in_album_order(song: &Song, before: Option<&Song>, after: Option<&Song>, shuffled: bool) -> bool {
+    if shuffled || song.album_id.is_empty() {
+        return false;
+    }
+    let key = |s: &Song| (s.disc_number.max(1), s.track);
+    // Whether `second` follows `first` directly in the album: the next track on the same
+    // disc, or the first track of the next disc.
+    let follows = |first: &Song, second: &Song| {
+        let ((d1, t1), (d2, t2)) = (key(first), key(second));
+        (d1 == d2 && t1 + 1 == t2) || (d1 + 1 == d2 && t2 == 1)
+    };
+    [(before, true), (after, false)].into_iter().any(|(other, is_before)| {
+        other.is_some_and(|other| {
+            other.album_id == song.album_id
+                && if song.track == 0 || other.track == 0 {
+                    true
+                } else if is_before {
+                    follows(other, song)
+                } else {
+                    follows(song, other)
+                }
+        })
+    })
+}
+
+/// The gain to apply to a song so it lands at the chosen loudness, from its ReplayGain tags.
+/// `album_run` says the song is playing as part of its album (see `in_album_order`).
 fn level_gain(settings: &Settings, song: &Song, album_run: bool) -> f32 {
     if !settings.normalize {
         return 1.0;
@@ -2359,6 +2383,32 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn album_order_decides_auto_levelling() {
+        let track = |album: &str, disc: u32, track: u32| Song { album_id: album.into(), disc_number: disc, track, ..Default::default() };
+        let (one, two, three) = (track("a", 1, 1), track("a", 1, 2), track("a", 1, 3));
+        // Playing an album through, in order.
+        assert!(in_album_order(&two, Some(&one), Some(&three), false));
+        assert!(in_album_order(&one, None, Some(&two), false));
+        assert!(in_album_order(&three, Some(&two), None, false));
+        // Across a disc change, with or without disc numbers on the first disc.
+        assert!(in_album_order(&track("a", 2, 1), Some(&track("a", 1, 12)), None, false));
+        assert!(in_album_order(&track("a", 2, 1), Some(&track("a", 0, 12)), None, false));
+        // Shuffled, even if two happen to land in order.
+        assert!(!in_album_order(&two, Some(&one), Some(&three), true));
+        // A playlist: neighbours from other albums, or from the same album out of order.
+        assert!(!in_album_order(&two, Some(&track("b", 1, 1)), Some(&track("c", 1, 3)), false));
+        assert!(!in_album_order(&two, Some(&track("a", 1, 7)), Some(&track("a", 1, 9)), false));
+        assert!(!in_album_order(&two, Some(&three), Some(&one), false));
+        // Two consecutive tracks of an album within a playlist keep their balance.
+        assert!(in_album_order(&two, Some(&track("b", 1, 1)), Some(&three), false));
+        // No track numbers: any neighbour from the album counts; no album never does.
+        assert!(in_album_order(&track("a", 0, 0), Some(&track("a", 0, 0)), None, false));
+        assert!(!in_album_order(&track("", 1, 2), Some(&track("", 1, 1)), None, false));
+        // A lone song.
+        assert!(!in_album_order(&one, None, None, false));
     }
 
     fn named(id: &str) -> Song {
