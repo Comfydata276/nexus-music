@@ -106,7 +106,9 @@ fn address(text: &str) -> Result<String, String> {
 /// A host link is the relay's address with the host key after a `#`:
 /// `https://jam.example.org/#key`. Returns the address and the key.
 pub fn parse_host_link(text: &str) -> Result<(String, String), String> {
-    let Some((before, key)) = text.trim().split_once('#') else {
+    // The relay's whole log line may have been pasted: the link is the part with the # in it.
+    let text = text.split_whitespace().find(|word| word.contains('#')).unwrap_or(text.trim());
+    let Some((before, key)) = text.split_once('#') else {
         return Err("A host link ends with # and a key. Copy the whole link from your relay's log.".into());
     };
     let key = key.trim();
@@ -1246,6 +1248,8 @@ mod tests {
     #[test]
     fn reads_host_links() {
         assert_eq!(parse_host_link(" https://jam.example.org/#abcdefghijklmnop "), Ok(("https://jam.example.org".into(), "abcdefghijklmnop".into())));
+        // The whole line from the relay's log, pasted as it stands.
+        assert_eq!(parse_host_link("Host link, for Nexus Music's settings (keep it private): https://jam.example.org/#abcdefghijklmnop\n"), Ok(("https://jam.example.org".into(), "abcdefghijklmnop".into())));
         // Under a path on a shared address, and with no scheme typed.
         assert_eq!(parse_host_link("example.org/jam/#abcdefghijklmnop"), Ok(("https://example.org/jam".into(), "abcdefghijklmnop".into())));
         assert_eq!(parse_host_link("http://192.168.1.5:8080/#abcdefghijklmnop"), Ok(("http://192.168.1.5:8080".into(), "abcdefghijklmnop".into())));

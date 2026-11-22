@@ -468,7 +468,14 @@ export component Field inherits Rectangle {
         padding-left: 14px;
         padding-right: 14px;
 
+        // A field is as wide as its place in the layout, whatever is typed in it: long
+        // text scrolls inside the field and never pushes the layout wider.
         Rectangle {
+            min-width: 0px;
+            preferred-width: 0px;
+            horizontal-stretch: 1;
+            clip: true;
+
             if input.text == "": Text {
                 x: 0;
                 width: parent.width;
