@@ -12,6 +12,7 @@
   const ICONS = {
     play: '<svg viewBox="0 0 24 24" aria-hidden="true"><path class="solid" d="M7 4.6v14.8a1 1 0 0 0 1.52.85l12-7.4a1 1 0 0 0 0-1.7l-12-7.4A1 1 0 0 0 7 4.6Z"/></svg>',
     pause: '<svg viewBox="0 0 24 24" aria-hidden="true"><path class="solid" d="M7.5 4h2A1.5 1.5 0 0 1 11 5.5v13A1.5 1.5 0 0 1 9.5 20h-2A1.5 1.5 0 0 1 6 18.5v-13A1.5 1.5 0 0 1 7.5 4Zm7 0h2A1.5 1.5 0 0 1 18 5.5v13a1.5 1.5 0 0 1-1.5 1.5h-2a1.5 1.5 0 0 1-1.5-1.5v-13A1.5 1.5 0 0 1 14.5 4Z"/></svg>',
+    grip: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 9h14M5 15h14"/></svg>',
     plus: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>',
     check: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg>',
     cross: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>',
@@ -39,7 +40,6 @@
   let searching = 0;      // counts searches, so a late answer isn't shown
   let drawn = '';         // what the list was last drawn from
   const adding = new Set();
-  const added = new Set();
   let toastTimer = 0;
 
   const clock = (seconds) => {
@@ -240,7 +240,7 @@
     list();
   }
 
-  function row(song, about, button) {
+  function row(song, about, buttons) {
     const item = document.createElement('li');
     const picture = cover(song.cover, 's');
     let art;
@@ -271,8 +271,7 @@
     const length = document.createElement('span');
     length.className = 'song-length';
     length.textContent = clock(song.duration || 0);
-    item.append(art, words, length);
-    if (button) item.append(button);
+    item.append(art, words, length, ...buttons);
     return item;
   }
 
@@ -286,15 +285,25 @@
     return button;
   }
 
+  // The heading between the songs queued by hand and the rest of the list.
+  function heading(text) {
+    const item = document.createElement('li');
+    item.className = 'heading';
+    item.textContent = text;
+    return item;
+  }
+
   // The list under the search box: what was found, or else what's up next.
   function list() {
-    if (!seen) return;
+    if (!seen || drag) return;
     const state = seen.state || {};
     const queue = state.queue || [];
     const me = seen.you ? seen.you.id : '';
-    const queued = new Set(queue.map((song) => song.id));
-    if (state.now) queued.add(state.now.id);
-    const basis = JSON.stringify([results, queue, state.more, me, [...adding], [...added].filter((id) => queued.has(id))]);
+    const control = !!state.control;
+    // Songs waiting in "Next in queue", and the one playing: adding those again does nothing.
+    const waiting = new Set(queue.filter((song) => song.queued).map((song) => song.id));
+    if (state.now) waiting.add(state.now.id);
+    const basis = JSON.stringify([results, queue, state.more, state.context, control, me, [...adding]]);
     if (basis === drawn) return;
     drawn = basis;
     const box = $('list');
@@ -309,12 +318,12 @@
         let button;
         if (adding.has(song.id)) {
           button = action('add busy', 'Adding ' + song.title, 'plus', null);
-        } else if (queued.has(song.id)) {
+        } else if (waiting.has(song.id)) {
           button = action('done', song.title + ' is in the queue', 'check', null);
         } else {
           button = action('add', 'Add ' + song.title + ' to the queue', 'plus', () => add(song));
         }
-        box.append(row(song, about, button));
+        box.append(row(song, about, [button]));
       }
       if (!results.length) {
         note.hidden = false;
@@ -322,8 +331,12 @@
       }
       return;
     }
-    title.textContent = 'Up next';
-    for (const song of queue) {
+    const ahead = queue.findIndex((song) => !song.queued);
+    const queued = ahead < 0 ? queue.length : ahead;
+    const rest = state.context ? 'Next from ' + state.context : 'Next up';
+    title.textContent = queued ? 'Next in queue' : rest;
+    queue.forEach((song, at) => {
+      if (queued && at === queued) box.append(heading(rest));
       const about = [song.artist];
       if (song.by) {
         const by = document.createElement('span');
@@ -331,9 +344,19 @@
         by.textContent = 'added by ' + (song.by_id === me ? 'you' : song.by);
         about.push(by);
       }
-      const mine = song.by_id && song.by_id === me;
-      box.append(row(song, about, mine ? action('remove', 'Take ' + song.title + ' out of the queue', 'cross', () => remove(song)) : null));
-    }
+      const buttons = [];
+      const mine = song.queued && song.by_id && song.by_id === me;
+      if (control || mine) buttons.push(action('remove', 'Take ' + song.title + ' out of the queue', 'cross', () => remove(song, at)));
+      if (control) {
+        const grip = action('grip', 'Move ' + song.title, 'grip', null);
+        grip.disabled = false;
+        grip.addEventListener('pointerdown', (event) => grab(event, at));
+        buttons.push(grip);
+      }
+      const item = row(song, about, buttons);
+      item.dataset.at = at;
+      box.append(item);
+    });
     if (state.more) {
       note.hidden = false;
       note.textContent = 'And ' + state.more + ' more after these.';
@@ -348,16 +371,95 @@
     list();
     const done = await ask('add', { id: song.id });
     adding.delete(song.id);
-    if (done) {
-      added.add(song.id);
-      toast('Added “' + song.title + '”');
-    }
+    if (done) toast('Added “' + song.title + '”');
     drawn = '';
     list();
   }
 
-  async function remove(song) {
-    if (await ask('remove', { id: song.id })) toast('Taken out of the queue');
+  async function remove(song, at) {
+    // Shown as done straight away; the host's word on it follows.
+    seen.state.queue.splice(at, 1);
+    list();
+    if (!(await ask('remove', { at, id: song.id }))) refresh();
+  }
+
+  // Asks for the jam as it stands, after something shown as done turned out not to be.
+  async function refresh() {
+    try {
+      const { status, body } = await call('/state?v=0');
+      if (status === 200) {
+        seen = body;
+        version = body.v;
+        heardAt = performance.now();
+        draw();
+      }
+    } catch { /* the next change will put it right */ }
+  }
+
+  // ---- dragging a song to a new place in the queue ----
+
+  let drag = null;   // { at, item, line, target, queued }
+
+  function grab(event, at) {
+    const item = event.currentTarget.closest('li');
+    if (!item || drag) return;
+    event.preventDefault();
+    const line = document.createElement('li');
+    line.className = 'drop';
+    drag = { at, item, line, target: at, queued: !!seen.state.queue[at].queued, pointer: event.pointerId };
+    item.classList.add('dragging');
+    event.currentTarget.setPointerCapture(event.pointerId);
+    event.currentTarget.addEventListener('pointermove', carry);
+    event.currentTarget.addEventListener('pointerup', drop);
+    event.currentTarget.addEventListener('pointercancel', drop);
+  }
+
+  // Works out where the song would land: before which song, and in which part of the queue.
+  function carry(event) {
+    if (!drag) return;
+    const box = $('list');
+    const rows = [...box.children].filter((child) => child !== drag.line);
+    // Near the top or bottom of the screen, the page scrolls to follow.
+    if (event.clientY < 80) scrollBy(0, -12); else if (event.clientY > innerHeight - 80) scrollBy(0, 12);
+    let before = null;
+    for (const child of rows) {
+      const area = child.getBoundingClientRect();
+      if (event.clientY < area.top + area.height / 2) { before = child; break; }
+    }
+    box.insertBefore(drag.line, before);
+    // Count the songs above the line, and see which side of the heading it's on.
+    let target = 0;
+    let queued = true;
+    for (const child of box.children) {
+      if (child === drag.line) break;
+      if (child.classList.contains('heading')) queued = false; else target += 1;
+    }
+    const queue = seen.state.queue;
+    const split = queue.findIndex((song) => !song.queued);
+    drag.target = target;
+    drag.queued = queued && (split < 0 ? queue.length : split) > 0;
+  }
+
+  function drop(event) {
+    if (!drag) return;
+    const { at, item, line, queued } = drag;
+    let { target } = drag;
+    event.currentTarget.removeEventListener('pointermove', carry);
+    event.currentTarget.removeEventListener('pointerup', drop);
+    event.currentTarget.removeEventListener('pointercancel', drop);
+    item.classList.remove('dragging');
+    line.remove();
+    drag = null;
+    const queue = seen.state.queue;
+    // `target` counted the song itself if it was above the line.
+    const to = target > at ? target - 1 : target;
+    if (event.type !== 'pointerup' || (to === at && !!queue[at].queued === queued)) return list();
+    const song = queue.splice(at, 1)[0];
+    if (queued) song.queued = true; else delete song.queued;
+    queue.splice(to, 0, song);
+    drawn = '';
+    list();
+    ask('move', { from: at, to, queued, id: song.id }).then((done) => { if (!done) refresh(); });
   }
 
   let typing = 0;
@@ -424,6 +526,12 @@
     $('skip').disabled = true;
     await ask('skip');
     $('skip').disabled = false;
+  });
+
+  $('previous').addEventListener('click', async () => {
+    $('previous').disabled = true;
+    await ask('previous');
+    $('previous').disabled = false;
   });
 
   $('query').addEventListener('input', typed);

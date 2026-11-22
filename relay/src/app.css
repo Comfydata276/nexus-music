@@ -253,6 +253,15 @@ svg .solid { fill: currentColor; stroke: none; }
 .act.busy { opacity: 0.5; }
 .act.remove { background: none; border-color: transparent; color: var(--muted); }
 
+.act.grip { background: none; border-color: transparent; color: var(--faint); cursor: grab; touch-action: none; }
+.flip { transform: scaleX(-1); }
+
+/* The heading between the songs queued by hand and the rest of the list. */
+.songs li.heading { min-height: 0; margin: 20px 0 8px; padding: 0 4px; font-size: 13px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+.songs li.dragging { opacity: 0.45; }
+/* Where a song being dragged would land. */
+.songs li.drop { min-height: 0; height: 2px; padding: 0; margin: -1px 4px; border-radius: 1px; background: var(--accent-bright); }
+
 .side > .hint { padding: 12px 4px; }
 
 .toast {

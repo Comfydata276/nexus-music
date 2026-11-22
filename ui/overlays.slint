@@ -561,11 +561,11 @@ export component JamOverlay inherits Rectangle {
                             horizontal-stretch: 1;
 
                             JamLabel {
-                                text: "Guests can pause and skip";
+                                text: "Guests can steer";
                             }
 
                             Text {
-                                text: "Off, they can still add songs and take out the ones they added.";
+                                text: "They can pause, skip, reorder the queue and take songs out. Off, they can still add songs and take out the ones they added.";
                                 color: Theme.muted;
                                 font-size: 13px;
                                 wrap: word-wrap;
@@ -576,7 +576,7 @@ export component JamOverlay inherits Rectangle {
                             alignment: center;
                             Toggle {
                                 on: Jam.guests-control;
-                                label: "Guests can pause and skip";
+                                label: "Guests can steer";
                                 toggled(on) => { Jam.set-guests-control(on); }
                             }
                         }

@@ -25,7 +25,7 @@ const STATE_BODY: usize = 512 * 1024;
 /// The most one cover may weigh.
 const COVER_BODY: usize = 1536 * 1024;
 /// What a guest may ask the host app to do.
-const ACTIONS: [&str; 6] = ["search", "add", "remove", "skip", "pause", "play"];
+const ACTIONS: [&str; 13] = ["search", "add", "remove", "skip", "previous", "pause", "play", "seek", "jump", "move", "clear", "shuffle", "repeat"];
 /// Things waiting for the host app, per jam, before more are turned away.
 const MOST_WAITING: usize = 120;
 /// What the host app hasn't collected yet, per jam, before the oldest is dropped.
@@ -570,6 +570,7 @@ fn handle(relay: &Relay, request: Request) {
         (Method::Post, ["api", "jam", jam, "join"]) => guest_join(relay, request, jam, &mut out),
         (Method::Get, ["api", "jam", jam, "state"]) => guest_state(relay, request, jam, query, &mut out),
         (Method::Post, ["api", "jam", jam, "ask"]) => guest_ask(relay, request, jam, &mut out),
+        (Method::Post, ["api", "jam", jam, "leave"]) => guest_leave(relay, request, jam, &mut out),
         (Method::Get, ["api", "jam", jam, "cover", size, cover]) => guest_cover(relay, request, jam, size, cover, &mut out),
         _ => out.push(request, error(404, "There's nothing at that address.")),
     }
@@ -866,6 +867,29 @@ fn guest_ask(relay: &Relay, mut request: Request, id: &str, out: &mut Outbox) {
     jam.tell_host(json!({"kind": "ask", "id": ask, "guest": about, "action": action, "data": body["data"]}), out);
 }
 
+/// A guest says they're going: they come off the list at once, not when they've gone quiet.
+fn guest_leave(relay: &Relay, request: Request, id: &str, out: &mut Outbox) {
+    let mut jams = relay.jams.lock().unwrap();
+    let Some(jam) = jams.get_mut(id) else { return out.push(request, error(404, "This jam has ended.")) };
+    let token = match guest_of(jam, &request) {
+        Ok(guest) => guest.token.clone(),
+        Err(refusal) => return out.push(request, refusal),
+    };
+    jam.guests.retain(|guest| guest.token != token);
+    let mut waiting = Vec::new();
+    for (other, parked) in std::mem::take(&mut jam.watchers) {
+        if other == token {
+            out.push(parked.request, error(401, "Join the jam first."));
+        } else {
+            waiting.push((other, parked));
+        }
+    }
+    jam.watchers = waiting;
+    jam.tell_host(json!({"kind": "guests"}), out);
+    jam.changed(out);
+    out.push(request, json_reply(200, &json!({"ok": true})));
+}
+
 /// A cover, from what the host app has already sent or by asking it. Anyone with the
 /// jam's link may ask: the link is what lets people in.
 fn guest_cover(relay: &Relay, request: Request, id: &str, size: &str, cover: &str, out: &mut Outbox) {
@@ -1140,6 +1164,11 @@ mod tests {
         let (_, told) = ask(to, "GET", &format!("/api/host/{id}/poll?after=0"), &secret, Value::Null);
         assert!(told["events"].as_array().unwrap().iter().any(|event| event["kind"] == "guests"), "{told}");
         assert!(told["guests"].as_array().unwrap().is_empty());
+        // Saying goodbye takes a guest off the list straight away, and their pass with them.
+        let (leaver, _) = join(to, &id, "Alex");
+        assert_eq!(ask(to, "POST", &format!("/api/jam/{id}/leave"), &leaver, json!({})).0, 200);
+        assert_eq!(ask(to, "GET", &format!("/api/jam/{id}/state?v=0"), &leaver, Value::Null).0, 401);
+        assert_eq!(ask(to, "GET", &format!("/api/jam/{id}"), "", Value::Null).1["guests"], 0);
         // Their phone wakes up: the same token still works, and they're listed again.
         let (status, seen) = ask(to, "GET", &format!("/api/jam/{id}/state?v=0"), &token, Value::Null);
         assert_eq!(status, 200);

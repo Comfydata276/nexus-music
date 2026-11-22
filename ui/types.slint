@@ -377,7 +377,12 @@ export global Player {
     in property <bool> shuffle;
     // 0 off, 1 repeat the queue, 2 repeat the track.
     in property <int> repeat;
+    // What's to come. The first `queued` rows were queued by hand ("Next in queue"); the
+    // rest are what's left of the list being played. Where both are present, the row at
+    // `queue-gap` holds no song: it's the heading between them. -1 when there's no heading.
     in property <[Track]> queue;
+    in property <int> queued;
+    in property <int> queue-gap: -1;
     // The first few of `queue`, for places that only show a glance of it.
     in property <[Track]> up-next;
     in property <string> context;
@@ -407,7 +412,8 @@ export global Player {
     callback open-mini();
     callback queue-activated(index: int);
     callback queue-menu(index: int, x: length, y: length);
-    callback clear-queue();
+    // Empties "Next in queue" (`queued`) or the rest of what's to come.
+    callback clear-queue(queued: bool);
     callback save-queue();
     // What another device is playing ("Song — Artist"), when that's more recent than
     // anything done here; empty otherwise.
@@ -461,23 +467,22 @@ export struct JamGuest {
     name: string,
 }
 
-// A song in a jam this PC has joined: one that's queued, or one found in the host's library.
+// A song found in the library of the host of a jam this PC has joined.
 export struct JamSong {
     id: string,
     title: string,
-    // Who it's by and, for one that was searched for, the album it's on.
+    // Who it's by and the album it's on.
     about: string,
     cover: string,
     duration: string,
-    // Who added it, in words ("added by Sam"); empty if nobody in the jam did.
-    by: string,
-    // What can be done with it: 0 nothing, 1 add it, 2 it's being added, 3 it's already
-    // queued, 4 take it out again (this guest added it).
+    // What can be done with it: 1 add it to the jam's queue, 2 it's being added, 3 it's
+    // already waiting in the queue.
     action: int,
 }
 
 // A jam: several people adding to one queue. `hosting` is one started here, where the music
-// plays; `joined` is someone else's, steered from here.
+// plays; `joined` is someone else's, which the player and the queue panel then show and
+// steer in place of this PC's own queue.
 export global Jam {
     // The window for starting or joining a jam, and for looking after one hosted here.
     in-out property <bool> open;
@@ -496,7 +501,7 @@ export global Jam {
     in property <string> link;
     in property <image> qr;
     in property <[JamGuest]> guests;
-    // Guests may pause and skip.
+    // Guests may steer: pause, skip, reorder and take songs out. (They can always add.)
     in property <bool> guests-control;
     // Trouble reaching the relay, in words; empty when there's none.
     in property <string> status;
@@ -512,19 +517,9 @@ export global Jam {
     in property <string> with;
     // Something the guest should know (the host's app has gone quiet); empty for nothing.
     in property <string> notice;
-    in property <bool> has-track;
-    in property <string> title;
-    in property <string> artist;
-    in property <string> cover;
-    in property <float> position;
-    in property <float> duration;
-    in property <bool> playing;
-    // The host lets guests pause and skip.
+    // The host lets guests steer.
     in property <bool> control;
-    in property <[JamSong]> queue;
-    // How many more songs are queued after the ones listed.
-    in property <int> more;
-    // What's typed in the search box, and what the host's library has for it.
+    // What's typed in the jam page's search box, and what the host's library has for it.
     in-out property <string> query;
     in property <bool> searched;
     in property <[JamSong]> results;
@@ -532,9 +527,6 @@ export global Jam {
     callback leave();
     callback search(text: string);
     callback add(id: string);
-    callback remove(id: string);
-    callback toggle();
-    callback skip();
 }
 
 export global Toast {

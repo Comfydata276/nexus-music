@@ -100,6 +100,10 @@ pub struct Song {
     pub replay_gain: Option<ReplayGain>,
     /// Set (by this app, not the server) on entries that stand for an internet radio station.
     pub radio_url: String,
+    /// Set (by this app) on a queue entry that was put there by hand and hasn't played yet:
+    /// it's in "Next in queue", ahead of the rest of whatever list is playing.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub queued: bool,
 }
 
 /// An artist named on a song.

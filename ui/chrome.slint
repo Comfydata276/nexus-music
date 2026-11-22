@@ -1161,9 +1161,12 @@ export component QueuePanel inherits Rectangle {
             spacing: 14px;
             height: 36px;
 
+            // With songs queued by hand, they come first, under their own heading; the
+            // heading for the rest of the list is then a row further down.
             Text {
                 horizontal-stretch: 1;
                 text: Player.queue.length == 0 ? "Nothing queued after this"
+                    : Player.queued > 0 ? "Next in queue"
                     : Player.context == "" ? "Next up" : "Next from " + Player.context;
                 color: Theme.muted;
                 font-size: 13px;
@@ -1172,7 +1175,7 @@ export component QueuePanel inherits Rectangle {
                 overflow: elide;
             }
 
-            if Player.queue.length > 0: VerticalLayout {
+            if Player.queue.length > 0 && Player.queued == 0 && !Jam.joined: VerticalLayout {
                 alignment: center;
                 LinkText {
                     text: "Save";
@@ -1183,8 +1186,8 @@ export component QueuePanel inherits Rectangle {
             if Player.queue.length > 0: VerticalLayout {
                 alignment: center;
                 LinkText {
-                    text: "Clear";
-                    clicked => { Player.clear-queue(); }
+                    text: Player.queued > 0 ? "Clear queue" : "Clear";
+                    clicked => { Player.clear-queue(Player.queued > 0); }
                 }
             }
         }
@@ -1210,7 +1213,43 @@ export component QueuePanel inherits Rectangle {
                 horizontal-scrollbar-policy: always-off;
                 for track[index] in Player.queue: Rectangle {
                     height: 64px;
-                    QueueRow {
+
+                    // The heading between the songs queued by hand and the rest of the list.
+                    if index == Player.queue-gap: HorizontalLayout {
+                        x: 12px;
+                        y: parent.height - self.height;
+                        width: parent.width - Lane.gutter - 12px - 8px;
+                        height: 36px;
+                        spacing: 14px;
+
+                        Text {
+                            horizontal-stretch: 1;
+                            text: Player.context == "" ? "Next up" : "Next from " + Player.context;
+                            color: Theme.muted;
+                            font-size: 13px;
+                            font-weight: 600;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+
+                        if !Jam.joined: VerticalLayout {
+                            alignment: center;
+                            LinkText {
+                                text: "Save";
+                                clicked => { Player.save-queue(); }
+                            }
+                        }
+
+                        VerticalLayout {
+                            alignment: center;
+                            LinkText {
+                                text: "Clear";
+                                clicked => { Player.clear-queue(false); }
+                            }
+                        }
+                    }
+
+                    if index != Player.queue-gap: QueueRow {
                         x: 0;
                         width: parent.width - Lane.gutter;
                         track: track;
@@ -1274,6 +1313,93 @@ export component QueuePanel inherits Rectangle {
                 content-y <=> played.content-y;
                 content-height: played.content-height;
                 visible-height: played.visible-height;
+            }
+        }
+    }
+}
+
+// Something to press on the jam strip.
+component StripLink inherits Rectangle {
+    in property <string> text;
+    callback clicked;
+
+    width: label.preferred-width + 24px;
+    height: 24px;
+    border-radius: 12px;
+    background: touch.pressed ? #00000050 : touch.has-hover ? #00000038 : #00000024;
+    accessible-role: button;
+    accessible-label: self.text;
+    accessible-action-default => { root.clicked(); }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+
+    label := Text {
+        text: root.text;
+        color: white;
+        font-size: 12px;
+        font-weight: 600;
+    }
+}
+
+// The strip along the bottom of the window while this PC is in a jam: it says whose, where
+// the music is playing, and how to get out.
+export component JamStrip inherits Rectangle {
+    background: Theme.accent;
+
+    HorizontalLayout {
+        padding-left: 16px;
+        padding-right: 12px;
+        spacing: 10px;
+
+        VerticalLayout {
+            alignment: center;
+            Icon {
+                source: Icons.party-popper;
+                size: 16px;
+                tint: white;
+            }
+        }
+
+        Text {
+            horizontal-stretch: 1;
+            text: Jam.joined ? "In " + Jam.host + "'s jam. The music plays where " + Jam.host + " is; this player and queue control it."
+                : Jam.guests.length == 0 ? "Hosting a jam. The music plays here; waiting for guests to join."
+                : Jam.guests.length == 1 ? "Hosting a jam with " + Jam.guests[0].name + ". The music plays here."
+                : "Hosting a jam with " + Jam.guests.length + " guests. The music plays here.";
+            color: white;
+            font-size: 13px;
+            font-weight: 600;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+
+        if Jam.joined: VerticalLayout {
+            alignment: center;
+            StripLink {
+                text: "Find songs";
+                clicked => { App.navigate("jam"); }
+            }
+        }
+
+        if Jam.joined: VerticalLayout {
+            alignment: center;
+            StripLink {
+                text: "Leave jam";
+                clicked => { Jam.leave(); }
+            }
+        }
+
+        if Jam.hosting: VerticalLayout {
+            alignment: center;
+            StripLink {
+                text: "Invite and manage";
+                clicked => {
+                    Jam.opened();
+                    Jam.open = true;
+                }
             }
         }
     }

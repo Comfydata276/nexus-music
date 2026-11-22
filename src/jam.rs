@@ -32,6 +32,8 @@ use crate::ui;
 const SHOWN: usize = 100;
 /// How many songs a guest's search brings back.
 const FOUND: usize = 40;
+/// The most songs one request may add to a jam's queue.
+const MOST_ADDED: usize = 50;
 /// The relay is told what's playing at least this often, changed or not.
 const RETELL: Duration = Duration::from_secs(30);
 
@@ -219,6 +221,27 @@ fn qr_image(text: &str) -> slint::Image {
 
 // ---- state -------------------------------------------------------------------------------
 
+/// Something done to playback. When this PC has joined a jam it isn't done here: it's
+/// asked of the jam's host, whose queue and player this PC is then showing.
+pub enum Remote {
+    Toggle,
+    Play(bool),
+    Next,
+    Previous,
+    Seek(f64),
+    /// Take out the entry this many places after the current track.
+    Remove(usize),
+    /// Move an entry from one place after the current track to another, into "Next in
+    /// queue" or out of it.
+    Move(usize, usize, bool),
+    /// Empty "Next in queue", or else the rest of what's to come.
+    Clear(bool),
+    /// Play the entry this many places after the current track.
+    Jump(usize),
+    Shuffle,
+    Repeat,
+}
+
 /// Something for the thread that talks to the relay on the host's behalf.
 enum Out {
     /// What's playing and queued. Only the newest waiting to go is sent.
@@ -271,6 +294,9 @@ pub struct Joined {
     searches: u64,
     /// Songs being added right now.
     adding: HashSet<String>,
+    /// The jam's songs as this PC's own library knows them, by id; `None` for one it
+    /// doesn't have. Kept so each is looked up once.
+    known: HashMap<String, Option<Song>>,
     trouble: String,
 }
 
@@ -382,18 +408,19 @@ fn answer_guest(line: &Line, id: &str, secret: &str, serial: u64, client: Option
     let ask = event["id"].as_u64().unwrap_or(0);
     let guest = (event["guest"]["id"].as_str().unwrap_or("").to_string(), event["guest"]["name"].as_str().unwrap_or("Someone").to_string());
     let action = event["action"].as_str().unwrap_or("").to_string();
-    match action.as_str() {
-        "search" => {
-            let songs = find_songs(event["data"]["q"].as_str().unwrap_or(""), client);
-            let _ = line.post(&format!("api/host/{id}/reply"), secret, &json!({"id": ask, "ok": true, "data": {"songs": songs}}));
-        }
-        "add" | "remove" => {
-            let wanted = event["data"]["id"].as_str().unwrap_or("").to_string();
-            let song = if action == "add" { find_song(&wanted, client) } else { None };
-            post(move |ctl| ctl.jam_asked(serial, ask, guest, &action, &wanted, song));
-        }
-        _ => post(move |ctl| ctl.jam_asked(serial, ask, guest, &action, "", None)),
+    let data = event["data"].clone();
+    if action == "search" {
+        let songs = find_songs(data["q"].as_str().unwrap_or(""), client);
+        let _ = line.post(&format!("api/host/{id}/reply"), secret, &json!({"id": ask, "ok": true, "data": {"songs": songs}}));
+        return;
     }
+    // Songs to add are named by id: one, or a list of them.
+    let wanted: Vec<&str> = match data["ids"].as_array() {
+        Some(ids) => ids.iter().filter_map(Value::as_str).take(MOST_ADDED).collect(),
+        None => data["id"].as_str().into_iter().collect(),
+    };
+    let songs: Vec<Song> = if action == "add" { wanted.iter().filter_map(|id| find_song(id, client)).collect() } else { Vec::new() };
+    post(move |ctl| ctl.jam_asked(serial, ask, guest, &action, &data, songs));
 }
 
 fn send_cover(line: &Line, id: &str, secret: &str, client: Option<&Client>, covers: &std::path::Path, event: &Value) {
@@ -703,33 +730,26 @@ impl Controller {
         self.show_hosting();
     }
 
-    /// A guest asked for something that changes what plays. `song` is the one to add, when
-    /// that's what was asked and the library has it.
-    fn jam_asked(self: &Rc<Self>, serial: u64, ask: u64, guest: (String, String), action: &str, wanted: &str, song: Option<Song>) {
+    /// A guest asked for something that changes what plays. `songs` are the ones to add,
+    /// when that's what was asked, as far as the library has them.
+    fn jam_asked(self: &Rc<Self>, serial: u64, ask: u64, guest: (String, String), action: &str, data: &Value, songs: Vec<Song>) {
         if self.jam.borrow().hosting.as_ref().is_none_or(|hosting| hosting.serial != serial) {
             return;
         }
+        // Adding songs, and taking your own back out, is what a jam is for. The rest is
+        // the host's to allow.
+        let control = self.settings.borrow().jam_guests_control;
         let done = match action {
-            "add" => self.jam_add_for(&guest, song),
-            "remove" => self.jam_remove_for(&guest, wanted),
-            "skip" | "pause" | "play" => {
-                if !self.settings.borrow().jam_guests_control {
-                    Err("The host is choosing what plays.".to_string())
-                } else if self.playback.borrow().current().is_none() {
-                    Err("Nothing is playing.".to_string())
-                } else {
-                    match action {
-                        "skip" => self.next_track(),
-                        "pause" => self.set_playing(false),
-                        _ => self.set_playing(true),
-                    }
-                    Ok(())
-                }
+            "add" => self.jam_add_for(&guest, songs, control && data["next"].as_bool() == Some(true)),
+            "remove" => self.jam_remove_for(&guest, data, control),
+            "skip" | "previous" | "pause" | "play" | "seek" | "jump" | "move" | "clear" | "shuffle" | "repeat" if !control => {
+                Err("The host is choosing what plays. You can still add songs.".to_string())
             }
+            "skip" | "previous" | "pause" | "play" | "seek" | "jump" | "move" | "clear" | "shuffle" | "repeat" => self.jam_control(action, data).map(|()| json!({})),
             _ => Err("That isn't something a guest can do.".to_string()),
         };
         let reply = match done {
-            Ok(()) => json!({"id": ask, "ok": true, "data": {}}),
+            Ok(data) => json!({"id": ask, "ok": true, "data": data}),
             Err(why) => json!({"id": ask, "ok": false, "error": why}),
         };
         if let Some(hosting) = self.jam.borrow().hosting.as_ref() {
@@ -738,51 +758,93 @@ impl Controller {
         self.jam_sync(false);
     }
 
-    /// Puts a guest's song in the queue: after the song that's playing and after anything
-    /// guests have already lined up there, so what they add plays in the order they added it.
-    fn jam_add_for(self: &Rc<Self>, guest: &(String, String), song: Option<Song>) -> Result<(), String> {
-        let Some(song) = song.filter(|song| song.radio_url.is_empty()) else {
-            return Err("That song isn't in the library.".to_string());
-        };
-        let (empty, after) = {
-            let pb = self.playback.borrow();
-            let jam = self.jam.borrow();
-            let added = jam.hosting.as_ref().map(|hosting| &hosting.added);
-            let ahead = || pb.order.iter().skip(pb.cursor + 1).filter_map(|&index| pb.queue.get(index));
-            if pb.current().is_some_and(|current| current.id == song.id) || ahead().any(|queued| queued.id == song.id) {
-                return Err("That song is already in the queue.".to_string());
-            }
-            (pb.order.is_empty(), ahead().take_while(|queued| added.is_some_and(|added| added.contains_key(&queued.id))).count())
-        };
-        if let Some(hosting) = self.jam.borrow_mut().hosting.as_mut() {
-            hosting.added.insert(song.id.clone(), guest.clone());
+    /// Which entry after the current track a guest means: the one at `at`, if it's still
+    /// the song they saw there, or else the nearest copy of that song. The queue may have
+    /// moved on between their seeing it and their asking.
+    fn jam_entry(&self, at: &Value, id: &Value) -> Result<usize, String> {
+        let (at, id) = (at.as_u64().unwrap_or(u64::MAX) as usize, id.as_str().unwrap_or(""));
+        let pb = self.playback.borrow();
+        let ahead = || pb.order.iter().skip(pb.cursor + 1).filter_map(|&index| pb.queue.get(index));
+        if ahead().nth(at).is_some_and(|song| song.id == id) {
+            return Ok(at);
         }
-        let title = song.title.clone();
-        self.enqueue_after(song, after);
+        ahead().enumerate().filter(|(_, song)| song.id == id).map(|(place, _)| place).min_by_key(|place| place.abs_diff(at)).ok_or_else(|| "That song is no longer in the queue.".to_string())
+    }
+
+    /// Does to playback what a guest who's allowed to asked for.
+    fn jam_control(self: &Rc<Self>, action: &str, data: &Value) -> Result<(), String> {
+        if self.playback.borrow().current().is_none() {
+            return Err("Nothing is playing.".to_string());
+        }
+        match action {
+            "skip" => self.next_track(),
+            "previous" => self.previous_track(),
+            "pause" => self.set_playing(false),
+            "play" => self.set_playing(true),
+            "seek" => self.seek(data["to"].as_f64().unwrap_or(0.0).max(0.0)),
+            "jump" => self.jump_to_upcoming(self.jam_entry(&data["at"], &data["id"])?),
+            "move" => {
+                let from = self.jam_entry(&data["from"], &data["id"])?;
+                let last = {
+                    let pb = self.playback.borrow();
+                    pb.order.len().saturating_sub(pb.cursor + 2)
+                };
+                self.move_upcoming(from, (data["to"].as_u64().unwrap_or(0) as usize).min(last), data["queued"].as_bool() == Some(true));
+            }
+            "clear" => self.clear_upcoming(data["queued"].as_bool() == Some(true)),
+            "shuffle" => self.set_shuffle(data["on"].as_bool() == Some(true)),
+            _ => self.set_repeat(data["mode"].as_u64().unwrap_or(0).min(2) as u8),
+        }
+        Ok(())
+    }
+
+    /// Queues a guest's songs: in "Next in queue", at the bottom of it (or the top, with
+    /// `next`), so what guests add plays in the order they added it and ahead of the rest
+    /// of whatever list the host was playing.
+    fn jam_add_for(self: &Rc<Self>, guest: &(String, String), songs: Vec<Song>, next: bool) -> Result<Value, String> {
+        let asked = songs.len();
+        let (empty, mut waiting) = {
+            let pb = self.playback.borrow();
+            let waiting: HashSet<String> = pb.current().into_iter().chain(pb.order.iter().skip(pb.cursor + 1).take(pb.queued_ahead()).filter_map(|&index| pb.queue.get(index))).map(|song| song.id.clone()).collect();
+            (pb.order.is_empty(), waiting)
+        };
+        // A song that's already waiting in the queue, or playing, isn't queued a second time.
+        let fresh: Vec<Song> = songs.into_iter().filter(|song| song.radio_url.is_empty() && waiting.insert(song.id.clone())).collect();
+        if fresh.is_empty() {
+            return Err(if asked == 0 { "That song isn't in the host's library." } else { "That's already in the queue." }.to_string());
+        }
+        if let Some(hosting) = self.jam.borrow_mut().hosting.as_mut() {
+            for song in &fresh {
+                hosting.added.insert(song.id.clone(), guest.clone());
+            }
+        }
+        let said = match fresh.as_slice() {
+            [one] => format!("{} added {}", guest.1, one.title),
+            many => format!("{} added {} songs", guest.1, many.len()),
+        };
+        let count = fresh.len();
+        self.enqueue(fresh, next);
         if empty && !self.playback.borrow().playing {
             // Nothing was queued at all: the first song anyone adds starts the music.
             self.toggle_play();
         }
-        self.toast(format!("{} added {title}", guest.1));
-        Ok(())
+        self.toast(said);
+        Ok(json!({"added": count}))
     }
 
-    /// Takes a song back out of the queue for the guest who added it.
-    fn jam_remove_for(self: &Rc<Self>, guest: &(String, String), wanted: &str) -> Result<(), String> {
-        let theirs = self.jam.borrow().hosting.as_ref().is_some_and(|hosting| hosting.added.get(wanted).is_some_and(|(id, _)| *id == guest.0));
-        if !theirs {
-            return Err("You can take out the songs you added.".to_string());
-        }
-        let place = {
-            let pb = self.playback.borrow();
-            pb.order.iter().skip(pb.cursor + 1).position(|&index| pb.queue.get(index).is_some_and(|song| song.id == wanted))
-        };
-        let Some(place) = place else { return Err("That song has already played.".to_string()) };
-        if let Some(hosting) = self.jam.borrow_mut().hosting.as_mut() {
-            hosting.added.remove(wanted);
+    /// Takes a song out of the queue for a guest: any song if the host lets guests steer,
+    /// otherwise only one they queued themselves.
+    fn jam_remove_for(self: &Rc<Self>, guest: &(String, String), data: &Value, control: bool) -> Result<Value, String> {
+        let place = self.jam_entry(&data["at"], &data["id"])?;
+        if !control {
+            let queued = place < self.playback.borrow().queued_ahead();
+            let theirs = self.jam.borrow().hosting.as_ref().is_some_and(|hosting| hosting.added.get(data["id"].as_str().unwrap_or("")).is_some_and(|(id, _)| *id == guest.0));
+            if !(queued && theirs) {
+                return Err("You can take out the songs you added.".to_string());
+            }
         }
         self.remove_upcoming(place);
-        Ok(())
+        Ok(json!({}))
     }
 
     /// Tells the relay what's playing and queued, if that's changed since it was last told
@@ -802,9 +864,9 @@ impl Controller {
         }
         let playing = pb.playing && now.is_some();
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        (now.map(|song| song.id.as_str()), playing, control, ahead.len()).hash(&mut hasher);
+        (now.map(|song| song.id.as_str()), playing, control, ahead.len(), pb.shuffle, pb.repeat, pb.context.as_str()).hash(&mut hasher);
         for song in ahead.iter().take(SHOWN) {
-            (song.id.as_str(), hosting.added.get(&song.id).map(|(id, _)| id.as_str())).hash(&mut hasher);
+            (song.id.as_str(), song.queued, hosting.added.get(&song.id).map(|(id, _)| id.as_str())).hash(&mut hasher);
         }
         let print = hasher.finish();
         // Guests work out where the song has got to from where it was when they were told;
@@ -819,9 +881,13 @@ impl Controller {
             .take(SHOWN)
             .map(|song| {
                 let mut entry = song_json(song);
-                if let Some((id, name)) = hosting.added.get(&song.id) {
-                    entry["by"] = json!(name);
-                    entry["by_id"] = json!(id);
+                if song.queued {
+                    // Queued by hand: part of "Next in queue". If a guest queued it, by whom.
+                    entry["queued"] = json!(true);
+                    if let Some((id, name)) = hosting.added.get(&song.id) {
+                        entry["by"] = json!(name);
+                        entry["by_id"] = json!(id);
+                    }
                 }
                 entry
             })
@@ -833,6 +899,9 @@ impl Controller {
             "now": now.map(song_json),
             "queue": queue,
             "more": ahead.len().saturating_sub(SHOWN),
+            "context": pb.context,
+            "shuffle": pb.shuffle,
+            "repeat": pb.repeat,
         });
         hosting.told = print;
         hosting.told_at = Instant::now();
@@ -898,6 +967,9 @@ impl Controller {
             let (line, id, token, stop) = (line.clone(), id.clone(), token.clone(), stop.clone());
             let _ = std::thread::Builder::new().name("jam-guest".into()).spawn(move || guest_loop(line, id, token, serial, stop));
         }
+        // From here the player and the queue panel are the jam's. What was playing on this
+        // PC stops, and is still there, where it was, when the jam is left.
+        self.set_playing(false);
         self.jam.borrow_mut().joined = Some(Joined {
             serial,
             line,
@@ -911,16 +983,18 @@ impl Controller {
             results: None,
             searches: 0,
             adding: HashSet::new(),
+            known: HashMap::new(),
             trouble: String::new(),
         });
         let ui = self.ui.global::<ui::Jam>();
         ui.set_query("".into());
         ui.set_open(false);
         self.show_joined();
+        self.show_remote();
         self.navigate(Route::Jam);
     }
 
-    /// Leaves the jam this PC joined, if any.
+    /// Leaves the jam this PC joined, if any. The player goes back to this PC's own queue.
     pub fn leave_jam(self: &Rc<Self>) {
         let joined = {
             let mut jam = self.jam.borrow_mut();
@@ -932,8 +1006,14 @@ impl Controller {
         };
         let Some(joined) = joined else { return };
         joined.stop.store(true, Ordering::Relaxed);
+        // The host's list of who's there is put right at once, not when this PC has gone quiet.
+        let (line, id, token) = (joined.line.clone(), joined.id.clone(), joined.token.clone());
+        self.jam_pool.spawn(move || {
+            let _ = line.send(&format!("api/jam/{id}/leave"), &token, "application/json", b"{}", Duration::from_secs(5));
+        });
         self.jam_timer.stop();
         self.show_joined();
+        self.track_changed();
         if self.current_route() == Some(Route::Jam) {
             self.navigate(Route::Home);
         }
@@ -968,6 +1048,20 @@ impl Controller {
             joined.trouble.clear();
         }
         self.show_joined();
+        self.show_remote();
+    }
+
+    /// Asks the relay for the jam as it stands, after something this PC assumed turned out
+    /// not to be so.
+    fn jam_refresh(&self) {
+        let jam = self.jam.borrow();
+        let Some(joined) = &jam.joined else { return };
+        let (line, id, token, serial) = (joined.line.clone(), joined.id.clone(), joined.token.clone(), joined.serial);
+        self.jam_pool.spawn(move || {
+            if let Ok((200, body)) = line.get(&format!("api/jam/{id}/state?v=0"), &token, Duration::from_secs(20)) {
+                post(move |ctl| ctl.jam_heard(serial, body));
+            }
+        });
     }
 
     /// Where the host's song has got to: where it was when last heard, plus the time since.
@@ -979,25 +1073,19 @@ impl Controller {
         (state["position"].as_f64().unwrap_or(0.0) + since).clamp(0.0, duration.max(0.0))
     }
 
-    /// Brings the jam page up to date with the jam this PC is in (or none).
+    /// Brings the jam page up to date with the jam this PC is in (or none): who's there,
+    /// and what the host's library has for what's typed.
     fn show_joined(&self) {
         let ui = self.ui.global::<ui::Jam>();
         let jam = self.jam.borrow();
         let Some(joined) = &jam.joined else {
             ui.set_joined(false);
             ui.set_host("".into());
-            ui.set_queue(ModelRc::default());
             ui.set_results(ModelRc::default());
-            ui.set_has_track(false);
             return;
         };
         let state = &joined.heard["state"];
-        let now = &state["now"];
         let text = |value: &Value| SharedString::from(value.as_str().unwrap_or(""));
-        let cover = |song: &Value, size: &str| match song["cover"].as_str().filter(|cover| !cover.is_empty()) {
-            Some(cover) => SharedString::from(format!("{}/api/jam/{}/cover/{size}/{}", joined.line.base, joined.id, crate::subsonic::encode(cover))),
-            None => SharedString::default(),
-        };
         ui.set_joined(true);
         ui.set_host(joined.host.as_str().into());
         let others: Vec<&str> = joined.heard["guests"].as_array().map(|list| list.iter().filter(|guest| guest["id"].as_str() != Some(joined.me.as_str())).filter_map(|guest| guest["name"].as_str()).collect()).unwrap_or_default();
@@ -1015,39 +1103,8 @@ impl Controller {
         } else {
             SharedString::default()
         });
-        ui.set_has_track(now.is_object());
-        ui.set_title(text(&now["title"]));
-        ui.set_artist(text(&now["artist"]));
-        ui.set_cover(cover(now, "l"));
-        ui.set_duration(now["duration"].as_f64().unwrap_or(0.0) as f32);
-        ui.set_position(Controller::jam_position(joined) as f32);
-        ui.set_playing(state["playing"].as_bool() == Some(true));
         ui.set_control(state["control"].as_bool() == Some(true));
-        ui.set_more(state["more"].as_i64().unwrap_or(0) as i32);
-        let queue = state["queue"].as_array().map(Vec::as_slice).unwrap_or_default();
-        let coming: HashSet<&str> = queue.iter().chain(now.is_object().then_some(now)).filter_map(|song| song["id"].as_str()).collect();
-        let row = |song: &Value, about: String, by: String, action: i32| ui::JamSong {
-            id: text(&song["id"]),
-            title: text(&song["title"]),
-            about: about.into(),
-            cover: cover(song, "s"),
-            duration: clock(song["duration"].as_u64().unwrap_or(0) as u32).into(),
-            by: by.into(),
-            action,
-        };
-        let rows: Vec<ui::JamSong> = queue
-            .iter()
-            .map(|song| {
-                let mine = song["by_id"].as_str() == Some(joined.me.as_str());
-                let by = match song["by"].as_str() {
-                    Some(_) if mine => "added by you".to_string(),
-                    Some(name) => format!("added by {name}"),
-                    None => String::new(),
-                };
-                row(song, song["artist"].as_str().unwrap_or("").to_string(), by, if mine { 4 } else { 0 })
-            })
-            .collect();
-        ui.set_queue(ModelRc::new(VecModel::from(rows)));
+        let coming: HashSet<&str> = state["queue"].as_array().into_iter().flatten().filter(|song| song["queued"].as_bool() == Some(true)).chain(state["now"].is_object().then_some(&state["now"])).filter_map(|song| song["id"].as_str()).collect();
         ui.set_searched(joined.results.is_some());
         let found: Vec<ui::JamSong> = joined
             .results
@@ -1055,18 +1112,213 @@ impl Controller {
             .flatten()
             .map(|song| {
                 let id = song["id"].as_str().unwrap_or("");
-                let action = if joined.adding.contains(id) {
-                    2
-                } else if coming.contains(id) {
-                    3
-                } else {
-                    1
-                };
                 let (artist, album) = (song["artist"].as_str().unwrap_or(""), song["album"].as_str().unwrap_or(""));
-                row(song, if album.is_empty() { artist.to_string() } else { format!("{artist} • {album}") }, String::new(), action)
+                ui::JamSong {
+                    id: text(&song["id"]),
+                    title: text(&song["title"]),
+                    about: if album.is_empty() { artist.to_string() } else { format!("{artist} • {album}") }.into(),
+                    cover: joined.cover(song, "s"),
+                    duration: clock(song["duration"].as_u64().unwrap_or(0) as u32).into(),
+                    // 1 it can be added, 2 it's being added, 3 it's already waiting in the queue.
+                    action: if joined.adding.contains(id) {
+                        2
+                    } else if coming.contains(id) {
+                        3
+                    } else {
+                        1
+                    },
+                }
             })
             .collect();
         ui.set_results(ModelRc::new(VecModel::from(found)));
+    }
+
+    /// When this PC is in someone's jam, shows the jam in the player and the queue panel,
+    /// in place of this PC's own queue, and returns true. Otherwise does nothing.
+    pub fn show_remote(&self) -> bool {
+        let (now, rows, ahead, playing, position, duration, context, shuffle, repeat) = {
+            let mut jam = self.jam.borrow_mut();
+            let Some(joined) = jam.joined.as_mut() else { return false };
+            let state = joined.heard["state"].clone();
+            let now = state["now"].is_object().then(|| self.jam_row(joined, &state["now"]));
+            let queue = state["queue"].as_array().map(Vec::as_slice).unwrap_or_default();
+            let rows: Vec<ui::Track> = queue.iter().map(|song| self.jam_row(joined, song)).collect();
+            let ahead = queue.iter().take_while(|song| song["queued"].as_bool() == Some(true)).count();
+            (
+                now,
+                rows,
+                ahead,
+                state["playing"].as_bool() == Some(true),
+                Controller::jam_position(joined),
+                state["now"]["duration"].as_f64().unwrap_or(0.0),
+                state["context"].as_str().unwrap_or("").to_string(),
+                state["shuffle"].as_bool() == Some(true),
+                state["repeat"].as_i64().unwrap_or(0) as i32,
+            )
+        };
+        let player = self.ui.global::<ui::Player>();
+        player.set_has_track(now.is_some());
+        let now = now.unwrap_or_default();
+        player.set_track_id(now.id.clone());
+        player.set_track(now);
+        player.set_duration(duration as f32);
+        player.set_position(position as f32);
+        player.set_context(context.into());
+        player.set_playing(playing);
+        player.set_shuffle(shuffle);
+        player.set_repeat(repeat);
+        player.set_buffering(false);
+        player.set_reconnecting(false);
+        player.set_stalled(false);
+        player.set_format("".into());
+        self.show_queue(rows, ahead);
+        true
+    }
+
+    /// A song of the jam as a row for the player or the queue panel. A song this PC's own
+    /// library has is shown as it is anywhere else in the app (its artist can be opened,
+    /// it can be liked); one it doesn't have is shown from what the host said of it.
+    fn jam_row(&self, joined: &mut Joined, song: &Value) -> ui::Track {
+        let id = song["id"].as_str().unwrap_or("");
+        let known = joined.known.entry(id.to_string()).or_insert_with(|| crate::search::current().and_then(|index| index.library.songs.iter().find(|known| known.id == id).cloned())).clone();
+        let mut row = match &known {
+            Some(known) => self.track_row(known),
+            None => ui::Track {
+                id: id.into(),
+                title: song["title"].as_str().unwrap_or("").into(),
+                artist: song["artist"].as_str().unwrap_or("").into(),
+                album: song["album"].as_str().unwrap_or("").into(),
+                cover: joined.cover(song, "l"),
+                duration: clock(song["duration"].as_u64().unwrap_or(0) as u32).into(),
+                progress: -1.0,
+                ..Default::default()
+            },
+        };
+        // Whether it can play offline is this PC's business, not the jam's.
+        row.unavailable = false;
+        row.by = match song["by"].as_str() {
+            Some(_) if song["by_id"].as_str() == Some(joined.me.as_str()) => "you".into(),
+            Some(name) => name.into(),
+            None => SharedString::default(),
+        };
+        row
+    }
+
+    /// In a jam: the song a row of its queue stands for (-1 for the one playing), as this
+    /// PC's library knows it. `None` when this PC isn't in a jam.
+    pub fn remote_song(&self, index: i32) -> Option<Option<Song>> {
+        let jam = self.jam.borrow();
+        let joined = jam.joined.as_ref()?;
+        let state = &joined.heard["state"];
+        let song = if index < 0 { &state["now"] } else { &state["queue"][index as usize] };
+        Some(song["id"].as_str().and_then(|id| joined.known.get(id).cloned().flatten()))
+    }
+
+    /// In a jam, asks the host to do `what` and returns true. Otherwise returns false, and
+    /// the caller does it to this PC's own playback.
+    pub fn remote(self: &Rc<Self>, what: Remote) -> bool {
+        let (action, data) = {
+            let mut jam = self.jam.borrow_mut();
+            let Some(joined) = jam.joined.as_mut() else { return false };
+            let me = joined.me.clone();
+            let position = Controller::jam_position(joined);
+            let state = &mut joined.heard["state"];
+            let entry = |state: &Value, at: usize| state["queue"][at]["id"].as_str().unwrap_or("").to_string();
+            // Guests may always take out what they queued themselves. Anything else that
+            // steers the jam is the host's to allow, and there's no point asking if not.
+            let mine = matches!(what, Remote::Remove(at) if state["queue"][at]["by_id"].as_str() == Some(me.as_str()));
+            if state["control"].as_bool() != Some(true) && !mine {
+                let host = joined.host.clone();
+                drop(jam);
+                self.toast(format!("{host} is choosing what plays. You can still add songs."));
+                return true;
+            }
+            // The player shows what was asked for straight away; the host's word on it
+            // follows a moment later.
+            let settle = |state: &mut Value, playing: bool, at: f64| {
+                state["playing"] = json!(playing);
+                state["position"] = json!(at);
+            };
+            let sent = match what {
+                Remote::Toggle | Remote::Play(_) => {
+                    let playing = state["playing"].as_bool() == Some(true);
+                    let wanted = match what {
+                        Remote::Play(on) => on,
+                        _ => !playing,
+                    };
+                    if wanted == playing {
+                        return true;
+                    }
+                    settle(state, wanted, position);
+                    (if wanted { "play" } else { "pause" }, json!({}))
+                }
+                Remote::Next => ("skip", json!({})),
+                Remote::Previous => ("previous", json!({})),
+                Remote::Seek(to) => {
+                    let playing = state["playing"].as_bool() == Some(true);
+                    settle(state, playing, to);
+                    ("seek", json!({"to": to}))
+                }
+                Remote::Remove(at) => {
+                    let id = entry(state, at);
+                    if let Some(queue) = state["queue"].as_array_mut().filter(|queue| at < queue.len()) {
+                        queue.remove(at);
+                    }
+                    ("remove", json!({"at": at, "id": id}))
+                }
+                Remote::Move(from, to, queued) => {
+                    let id = entry(state, from);
+                    if let Some(queue) = state["queue"].as_array_mut().filter(|queue| from < queue.len() && to < queue.len()) {
+                        let mut moved = queue.remove(from);
+                        moved["queued"] = json!(queued);
+                        queue.insert(to, moved);
+                    }
+                    ("move", json!({"from": from, "to": to, "queued": queued, "id": id}))
+                }
+                Remote::Clear(queued) => ("clear", json!({"queued": queued})),
+                Remote::Jump(at) => ("jump", json!({"at": at, "id": entry(state, at)})),
+                Remote::Shuffle => ("shuffle", json!({"on": state["shuffle"].as_bool() != Some(true)})),
+                Remote::Repeat => ("repeat", json!({"mode": (state["repeat"].as_u64().unwrap_or(0) + 1) % 3})),
+            };
+            joined.heard["age"] = json!(0.0);
+            joined.heard_at = Instant::now();
+            sent
+        };
+        self.show_remote();
+        self.jam_simply(action, data);
+        true
+    }
+
+    /// In a jam, queues songs in the jam's queue and returns true. Otherwise returns false.
+    pub fn remote_add(&self, songs: &[Song], play_next: bool) -> bool {
+        if self.jam.borrow().joined.is_none() {
+            return false;
+        }
+        let ids: Vec<&str> = songs.iter().filter(|song| song.radio_url.is_empty()).map(|song| song.id.as_str()).take(MOST_ADDED).collect();
+        if ids.is_empty() {
+            self.toast("Radio stations can't be added to a jam");
+            return true;
+        }
+        let cut = songs.len() > ids.len();
+        self.jam_request("add", json!({"ids": ids, "next": play_next}), move |ctl, answer| match answer {
+            Ok(done) => match done["added"].as_u64().unwrap_or(1) {
+                1 => ctl.toast("Added to the jam's queue"),
+                count if cut => ctl.toast(format!("Added the first {count} songs to the jam's queue")),
+                count => ctl.toast(format!("Added {count} songs to the jam's queue")),
+            },
+            Err(why) => ctl.toast(why),
+        });
+        true
+    }
+
+    /// In a jam, playing something means queueing it: the song that was picked, or the
+    /// whole list when the list itself was played. Returns false when not in a jam.
+    pub fn remote_play(&self, songs: &[Song], start: usize, whole: bool) -> bool {
+        if self.jam.borrow().joined.is_none() {
+            return false;
+        }
+        let picked = if whole { songs } else { songs.get(start..start + 1).unwrap_or_default() };
+        self.remote_add(picked, false)
     }
 
     /// Asks the host's app for something and hands back its answer on the UI thread.
@@ -1127,6 +1379,7 @@ impl Controller {
         });
     }
 
+    /// The + beside a song found in the host's library.
     fn jam_add(self: &Rc<Self>, song: &str) {
         let song = song.to_string();
         let fresh = self.jam.borrow_mut().joined.as_mut().is_some_and(|joined| joined.adding.insert(song.clone()));
@@ -1140,23 +1393,25 @@ impl Controller {
             }
             ctl.show_joined();
             match answer {
-                Ok(_) => ctl.toast("Added to the jam"),
+                Ok(_) => ctl.toast("Added to the jam's queue"),
                 Err(why) => ctl.toast(why),
             }
         });
     }
 
-    /// Asks for something with nothing to show for it but a complaint if it fails.
+    /// Asks for something with nothing to show for it but a complaint if it fails, and a
+    /// fresh look at the jam, since the player showed it as done.
     fn jam_simply(&self, action: &str, data: Value) {
         self.jam_request(action, data, |ctl, answer| {
             if let Err(why) = answer {
                 ctl.toast(why);
+                ctl.jam_refresh();
             }
         });
     }
 
     /// Called a few times a second: keeps a hosted jam's guests up to date, and moves the
-    /// progress bar of a joined one.
+    /// progress bar while in someone else's.
     pub fn jam_tick(self: &Rc<Self>) {
         let (hosting, position) = {
             let jam = self.jam.borrow();
@@ -1166,7 +1421,7 @@ impl Controller {
             self.jam_sync(false);
         }
         if let Some(position) = position {
-            self.ui.global::<ui::Jam>().set_position(position as f32);
+            self.ui.global::<ui::Player>().set_position(position as f32);
         }
     }
 
@@ -1204,18 +1459,6 @@ impl Controller {
         jam.on_add(|song| {
             with(|ctl| ctl.jam_add(&song));
         });
-        jam.on_remove(|song| {
-            with(|ctl| ctl.jam_simply("remove", json!({"id": song.as_str()})));
-        });
-        jam.on_toggle(|| {
-            with(|ctl| {
-                let playing = ctl.ui.global::<ui::Jam>().get_playing();
-                ctl.jam_simply(if playing { "pause" } else { "play" }, json!({}));
-            });
-        });
-        jam.on_skip(|| {
-            with(|ctl| ctl.jam_simply("skip", json!({})));
-        });
         jam.on_opened(|| {
             with(|ctl| ctl.jam_problem(""));
         });
@@ -1238,6 +1481,16 @@ impl Controller {
         settings.on_check_jam(|| {
             with(|ctl| ctl.check_jam());
         });
+    }
+}
+
+impl Joined {
+    /// Where one of the jam's covers can be had: from the relay, which asks the host's app.
+    fn cover(&self, song: &Value, size: &str) -> SharedString {
+        match song["cover"].as_str().filter(|cover| !cover.is_empty()) {
+            Some(cover) => format!("{}/api/jam/{}/cover/{size}/{}", self.line.base, self.id, crate::subsonic::encode(cover)).into(),
+            None => SharedString::default(),
+        }
     }
 }
 

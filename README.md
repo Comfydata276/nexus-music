@@ -20,6 +20,11 @@ What's planned next is in the [roadmap](ROADMAP.md).
 - Gapless playback or crossfade, seeking, shuffle, repeat and a queue you can edit. Crossfade leaves an album alone: its tracks run into each other as recorded.
 - A queue panel beside the page, with a play button on every row to skip straight to it.
   Drag rows to reorder the queue, or the songs in a playlist.
+- "Add to queue" and "Play next" put songs in "Next in queue", which plays straight after the
+  current song and ahead of the rest of the album or playlist you were playing; the list
+  carries on afterwards. A song that's already further down the list can be queued too, and
+  still plays when its turn in the list comes. Drag a song across the heading to move it into
+  the queue or back out; "Clear queue" empties just what you queued.
 - Find and sort within a playlist or Liked songs: click a column heading to sort by it, including the date each song was added.
 - Shuffle is set per playlist or album and remembered.
 - Brings playlists over from Spotify: choose the files you exported (CSV from a tool such as Exportify, or Spotify's own data download) and it matches each song to your library, builds the playlists, and lists what it couldn't find.
@@ -31,7 +36,7 @@ What's planned next is in the [roadmap](ROADMAP.md).
 - Keeps songs ready: each song is kept on this PC once it has played, and the next few in the queue are fetched ahead of time, so the music carries on through a dropped connection and replays start at once. You choose how much space that may take (2 GB unless changed), which folder it's in, and how far ahead to fetch; the songs played longest ago make way when it fills.
 - Rides out a bad connection: a stream that stops arriving is asked for again from where it stopped, usually before the audio in hand runs out. If the server can't be reached at all the song waits where it is, the player says it's reconnecting, and the music carries on from the same place when the server is back. Skipping, stopping and seeking still act at once while a stream is stuck.
 - Playing a song from a search starts its radio: that song, then others like it.
-- Jams: one queue that friends add to while the music plays on your PC. They join from a link, in a browser (a phone works) or in Nexus Music on their own PC under Jam, and from there see what's playing, search your library, add songs and take their own back out. You choose whether they may pause and skip, see who's there, and can remove anyone. The queue shows who added what. Joining a jam needs nothing set up; hosting one is off until you switch it on, and needs a small relay service (see below).
+- Jams: one queue that friends add to while the music plays on your PC. They join from a link, in a browser (a phone works) or in Nexus Music on their own PC under Jam. In the app, a joined jam takes over the player and the queue panel: they show the host's song and queue, and pausing, skipping, dragging songs into a new order or taking them out happens for everyone. “Add to queue” anywhere adds to the jam, and so does playing a song. A strip along the bottom of the window says you're in a jam for as long as you are. The browser page does the same from a phone. You choose whether guests may steer or only add songs, see who's there, and can remove anyone. The queue shows who added what. Joining a jam needs nothing set up; hosting one is off until you switch it on, and needs a small relay service (see below).
 - Keeps your devices in step: the queue and your place in it, Recently played, pinned playlists, each list's shuffle and sort, the dates songs were added and the theme follow you to the app on another PC. The queue uses the server's saved-queue feature; the rest is kept in the comment of a playlist named "Nexus Music sync". When another PC has been playing in the last half hour, the queue panel offers "Continue here", which picks its queue up where it had got to. The plays behind "Your stats" are shared too, so the last four weeks and six months cover every PC.
 - Select several songs with Ctrl or Shift, then drag them onto a playlist or the queue, or
   right-click to act on them all.
@@ -134,18 +139,24 @@ Authentik needs three things set up once:
 
 ### Jams
 
-A jam's music plays on the host's PC. Everyone else steers: what a guest adds goes after the
-song that's playing, behind anything guests have already lined up, so songs play in the order
-they were added. A song that's already in the queue isn't added twice, and the first song
-added to an empty queue starts the music.
+A jam's music plays on the host's PC. Everyone else steers. What a guest adds goes into
+"Next in queue", behind anything already waiting there, so songs play in the order they were
+added and ahead of whatever album or playlist the host had on. A song that's already waiting
+isn't queued twice, and the first song added to an empty queue starts the music. With "Guests
+can steer" on (it is unless the host turns it off), guests can also pause, skip, go back,
+reorder the queue and take songs out; with it off they can add songs and take their own back
+out.
 
 Guests don't sign in to your music server and are never given its address or your sign-in.
 What they search for is looked up by your copy of the app, in its own copy of the library,
 and covers are passed on by it. No audio is sent to them.
 
-**Joining.** Click Jam in the sidebar, paste the link the host sent, and press Join. The jam
-gets a page of its own, where the search box looks in the host's library. Someone without the
-app opens the same link in a browser.
+**Joining.** Click Jam in the sidebar, paste the link the host sent, and press Join. From
+then until you leave, the player at the bottom and the queue panel are the jam's: what was
+playing on your PC pauses and is still there afterwards. Songs your own library also has are
+shown as they are anywhere else in the app; the jam's page has a search box that looks in
+the host's library, for when it isn't the same one. Someone without the app opens the same
+link in a browser.
 
 **Hosting.** A PC at home can't be reached from a phone on mobile data, so the app and the
 guests meet at a relay: a small service you run somewhere that can be reached, such as beside

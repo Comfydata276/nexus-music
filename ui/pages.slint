@@ -2787,7 +2787,7 @@ export component SettingsPage inherits Rectangle {
     }
 }
 
-// One song on the jam page: queued, or found in the host's library.
+// A song found in the jam host's library, with a button to add it to the jam's queue.
 component JamRow inherits Rectangle {
     in property <JamSong> song;
     callback acted;
@@ -2797,10 +2797,10 @@ component JamRow inherits Rectangle {
     background: touch.has-hover ? Theme.hover : transparent;
 
     accessible-role: list-item;
-    accessible-label: self.song.title + ", " + self.song.about + (self.song.by != "" ? ", " + self.song.by : "");
+    accessible-label: self.song.title + ", " + self.song.about;
 
     touch := TouchArea {
-        // Double-clicking a song that was searched for adds it, as it would play one elsewhere.
+        // Double-clicking adds it, as it would play a song elsewhere.
         double-clicked => {
             if root.song.action == 1 {
                 root.acted();
@@ -2838,23 +2838,11 @@ component JamRow inherits Rectangle {
                 overflow: elide;
             }
 
-            HorizontalLayout {
-                spacing: 6px;
-                alignment: start;
-
-                Text {
-                    text: root.song.about;
-                    color: Theme.muted;
-                    font-size: 13px;
-                    overflow: elide;
-                }
-
-                if root.song.by != "": Text {
-                    text: "• " + root.song.by;
-                    color: Theme.accent-bright;
-                    font-size: 13px;
-                    overflow: elide;
-                }
+            Text {
+                text: root.song.about;
+                color: Theme.muted;
+                font-size: 13px;
+                overflow: elide;
             }
         }
 
@@ -2869,11 +2857,11 @@ component JamRow inherits Rectangle {
             alignment: center;
             width: 32px;
 
-            if root.song.action == 1 || root.song.action == 2: IconButton {
+            if root.song.action != 3: IconButton {
                 icon: Icons.plus;
                 tint: Theme.text;
                 enabled: root.song.action == 1;
-                label: root.song.action == 1 ? "Add to the jam" : "Adding…";
+                label: root.song.action == 1 ? "Add to the jam's queue" : "Adding…";
                 clicked => { root.acted(); }
             }
 
@@ -2884,22 +2872,15 @@ component JamRow inherits Rectangle {
                 accessible-role: text;
                 accessible-label: "In the queue";
             }
-
-            if root.song.action == 4: IconButton {
-                icon: Icons.x;
-                label: "Take it out of the queue";
-                clicked => { root.acted(); }
-            }
         }
     }
 }
 
-// The jam this PC has joined: what the host is playing, what's queued, and the host's
-// library to add from.
+// The jam this PC has joined: who's in it, and the host's library to add from. What's
+// playing and what's queued are in the player and the queue panel, which are the jam's
+// for as long as this PC is in it.
 export component JamPage inherits Rectangle {
     property <length> column: min(self.width - 2 * Theme.page-pad, 760px);
-    property <length> edge: (self.width - self.column) / 2;
-    property <float> progress: Jam.duration > 0 ? clamp(Jam.position / Jam.duration, 0, 1) : 0;
 
     if !Jam.joined: VerticalLayout {
         alignment: center;
@@ -3029,113 +3010,12 @@ export component JamPage inherits Rectangle {
                             }
                         }
 
-                        // What the host is playing.
-                        Rectangle {
-                            height: 132px;
-                            border-radius: 12px;
-                            background: Theme.raised;
-
-                            HorizontalLayout {
-                                padding: 16px;
-                                spacing: 16px;
-
-                                Cover {
-                                    width: 100px;
-                                    height: 100px;
-                                    art: Jam.cover;
-                                    detail: 320px;
-                                }
-
-                                VerticalLayout {
-                                    alignment: center;
-                                    spacing: 6px;
-                                    horizontal-stretch: 1;
-                                    min-width: 80px;
-                                    preferred-width: 0px;
-
-                                    Text {
-                                        text: Jam.has-track ? Jam.title : "Nothing is playing yet";
-                                        color: Theme.text;
-                                        font-family: Theme.display;
-                                        font-size: 22px;
-                                        font-weight: 700;
-                                        overflow: elide;
-                                    }
-
-                                    Text {
-                                        text: Jam.has-track ? Jam.artist : "Add a song to get it started.";
-                                        color: Theme.muted;
-                                        font-size: 14px;
-                                        overflow: elide;
-                                    }
-
-                                    if Jam.has-track: HorizontalLayout {
-                                        padding-top: 6px;
-                                        spacing: 10px;
-
-                                        Text {
-                                            text: Player.clock(Jam.position);
-                                            color: Theme.muted;
-                                            font-size: 12px;
-                                            vertical-alignment: center;
-                                        }
-
-                                        VerticalLayout {
-                                            alignment: center;
-                                            horizontal-stretch: 1;
-                                            Rectangle {
-                                                height: 4px;
-                                                border-radius: 2px;
-                                                background: #ffffff24;
-                                                Rectangle {
-                                                    x: 0;
-                                                    width: parent.width * root.progress;
-                                                    height: 4px;
-                                                    border-radius: 2px;
-                                                    background: Theme.accent-bright;
-                                                }
-                                            }
-                                        }
-
-                                        Text {
-                                            text: Player.clock(Jam.duration);
-                                            color: Theme.muted;
-                                            font-size: 12px;
-                                            vertical-alignment: center;
-                                        }
-                                    }
-                                }
-
-                                if Jam.has-track && Jam.control: HorizontalLayout {
-                                    spacing: 4px;
-
-                                    VerticalLayout {
-                                        alignment: center;
-                                        PlayButton {
-                                            size: 48px;
-                                            playing: Jam.playing;
-                                            label: Jam.playing ? "Pause the jam" : "Play the jam";
-                                            clicked => { Jam.toggle(); }
-                                        }
-                                    }
-
-                                    VerticalLayout {
-                                        alignment: center;
-                                        IconButton {
-                                            icon: Icons.next-fill;
-                                            tint: Theme.text;
-                                            label: "Skip this song";
-                                            clicked => { Jam.skip(); }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        if Jam.has-track && !Jam.control: Text {
-                            text: Jam.host + " is choosing what plays. You can still add songs.";
-                            color: Theme.faint;
-                            font-size: 13px;
+                        Text {
+                            text: "The music is playing where " + Jam.host + " is. The player at the bottom and the queue panel are the jam's while you're in it"
+                                + (Jam.control ? ": pause, skip, drag songs into a new order or take them out, and everyone sees it." : ". " + Jam.host + " is choosing what plays, so you can add songs and take your own back out.")
+                                + " “Add to queue” anywhere in the app adds to the jam, and so does playing a song.";
+                            color: Theme.muted;
+                            font-size: 14px;
                             wrap: word-wrap;
                         }
 
@@ -3164,50 +3044,27 @@ export component JamPage inherits Rectangle {
                             }
                         }
 
-                        VerticalLayout {
+                        if Jam.query != "": VerticalLayout {
                             spacing: 2px;
 
                             Text {
                                 height: 28px;
-                                text: Jam.query != "" ? "Songs" : "Up next";
+                                text: "Songs";
                                 color: Theme.muted;
                                 font-size: 13px;
                                 font-weight: 600;
                                 vertical-alignment: center;
                             }
 
-                            if Jam.query != "": VerticalLayout {
-                                for song in Jam.results: JamRow {
-                                    song: song;
-                                    acted => { Jam.add(song.id); }
-                                }
-
-                                if Jam.searched && Jam.results.length == 0: Text {
-                                    text: "Nothing in " + Jam.host + "'s library matches that.";
-                                    color: Theme.faint;
-                                    font-size: 14px;
-                                }
+                            for song in Jam.results: JamRow {
+                                song: song;
+                                acted => { Jam.add(song.id); }
                             }
 
-                            if Jam.query == "": VerticalLayout {
-                                for song in Jam.queue: JamRow {
-                                    song: song;
-                                    acted => { Jam.remove(song.id); }
-                                }
-
-                                if Jam.queue.length == 0: Text {
-                                    text: "Nothing is queued. Find a song above to add one.";
-                                    color: Theme.faint;
-                                    font-size: 14px;
-                                }
-
-                                if Jam.more > 0: Text {
-                                    height: 36px;
-                                    text: "And " + Jam.more + " more after these.";
-                                    color: Theme.faint;
-                                    font-size: 14px;
-                                    vertical-alignment: center;
-                                }
+                            if Jam.searched && Jam.results.length == 0: Text {
+                                text: "Nothing in " + Jam.host + "'s library matches that.";
+                                color: Theme.faint;
+                                font-size: 14px;
                             }
                         }
                     }

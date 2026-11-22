@@ -10,7 +10,7 @@ import { Theme } from "theme.slint";
 import { Icons } from "icons.slint";
 import { Drag, App, View, Player, Menu, Prompt, Toast, Lyrics, Settings, Covers, Page, Track, Card, CardKind, Shelf, Offer, CardRow, PlaylistRef, MenuEntry, LyricLine, QualityOption, ThemeOption, Search, Suggestion, Jam, JamGuest, JamSong } from "types.slint";
 import { PageStatus, IconButton } from "widgets.slint";
-import { Sidebar, TopBar, QueuePanel, PlayerBar, SearchOverlay } from "chrome.slint";
+import { Sidebar, TopBar, QueuePanel, PlayerBar, SearchOverlay, JamStrip } from "chrome.slint";
 import { StackPage, TrackListPage, GridPage, LyricsPage, NowPlayingPage, SettingsPage, LoginPage, JamPage } from "pages.slint";
 import { MenuOverlay, PromptOverlay, ToastOverlay, JamOverlay } from "overlays.slint";
 
@@ -394,12 +394,19 @@ export component MainWindow inherits Window {
                     Player.queue-cursor -= 1;
                     return accept;
                 }
+                // The heading between the queue's two parts is a row, but not one to stop on.
                 if event.text == Key.DownArrow {
                     Player.queue-cursor = min(Player.queue.length - 1, Player.queue-cursor + 1);
+                    if Player.queue-cursor == Player.queue-gap {
+                        Player.queue-cursor += 1;
+                    }
                     return accept;
                 }
                 if event.text == Key.UpArrow {
                     Player.queue-cursor = max(0, Player.queue-cursor - 1);
+                    if Player.queue-cursor == Player.queue-gap {
+                        Player.queue-cursor -= 1;
+                    }
                     return accept;
                 }
                 if event.text == Key.Return && Player.queue-cursor >= 0 {
@@ -471,7 +478,9 @@ export component MainWindow inherits Window {
         // Panels are placed by hand, not by a layout, so their sizes can follow the window.
         if App.signed-in: Rectangle {
             property <length> gap: Theme.gap;
-            property <length> bar: 84px;
+            // In a jam, a strip along the very bottom says so; the player bar sits on it.
+            property <length> strip: Jam.hosting || Jam.joined ? 32px : 0px;
+            property <length> bar: 84px + self.strip;
             // The top bar's height: panels start below it.
             property <length> top: 60px;
             property <length> side: clamp(root.width * 0.22, 220px, 300px);
@@ -551,6 +560,13 @@ export component MainWindow inherits Window {
                 y: root.height - parent.bar;
                 width: root.width;
             }
+
+            if self.strip > 0: JamStrip {
+                x: 0;
+                y: root.height - parent.strip;
+                width: root.width;
+                height: parent.strip;
+            }
         }
 
         if !App.signed-in: LoginPage { }
@@ -569,7 +585,7 @@ export component MainWindow inherits Window {
         }
 
         ToastOverlay {
-            y: root.height - self.height - (App.signed-in ? 100px : 32px);
+            y: root.height - self.height - (App.signed-in ? 100px + (Jam.hosting || Jam.joined ? 32px : 0px) : 32px);
         }
 
         // What's being dragged, following the pointer.

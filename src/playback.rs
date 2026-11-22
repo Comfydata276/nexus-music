@@ -11,6 +11,7 @@ use slint::{ComponentHandle, Model, ModelRc, VecModel};
 use crate::audio::engine::{Event, TrackRequest};
 use crate::config::{SavedQueue, Settings, VOLUME_LEVELS};
 use crate::controller::{Controller, Route, with};
+use crate::jam::Remote;
 use crate::subsonic::{ApiError, Lyrics, Song};
 use crate::ui;
 
@@ -164,6 +165,115 @@ impl Playback {
         fastrand::shuffle(&mut rest);
         self.order = std::iter::once(current).chain(rest).collect();
         self.cursor = 0;
+    }
+
+    /// How many of the entries straight after the current one were queued by hand: the
+    /// length of "Next in queue".
+    pub fn queued_ahead(&self) -> usize {
+        self.order.iter().skip(self.cursor + 1).take_while(|&&entry| self.queue.get(entry).is_some_and(|song| song.queued)).count()
+    }
+
+    /// Rearranges the order with `rearrange`, then puts what was queued by hand back where
+    /// it was: straight after the current track, in the order it was queued.
+    fn rearrange_keeping_queued(&mut self, rearrange: impl FnOnce(&mut Self)) {
+        let ahead: Vec<usize> = self.order.iter().skip(self.cursor + 1).take(self.queued_ahead()).copied().collect();
+        rearrange(self);
+        let Some(&current) = self.order.get(self.cursor) else { return };
+        if ahead.is_empty() {
+            return;
+        }
+        self.order.retain(|entry| !ahead.contains(entry));
+        self.cursor = self.order.iter().position(|&entry| entry == current).unwrap_or(0);
+        for (place, entry) in ahead.into_iter().enumerate() {
+            self.order.insert(self.cursor + 1 + place, entry);
+        }
+    }
+
+    /// Takes the entry at this place in the playing order out of the queue.
+    fn drop_at(&mut self, at: usize) {
+        if at >= self.order.len() {
+            return;
+        }
+        let removed = self.order.remove(at);
+        self.queue.remove(removed);
+        if removed < self.origins.len() {
+            self.origins.remove(removed);
+        }
+        for index in self.order.iter_mut() {
+            if *index > removed {
+                *index -= 1;
+            }
+        }
+        if at < self.cursor {
+            self.cursor -= 1;
+        }
+    }
+
+    /// Queues songs by hand: at the top of "Next in queue" with `play_next`, otherwise at
+    /// the bottom of it.
+    fn queue_up(&mut self, songs: Vec<Song>, play_next: bool) {
+        let mut at = self.cursor + 1 + if play_next { 0 } else { self.queued_ahead() };
+        for mut song in songs {
+            song.queued = true;
+            self.queue.push(song);
+            self.order.insert(at, self.queue.len() - 1);
+            at += 1;
+        }
+        self.origins.resize(self.queue.len(), None);
+    }
+
+    /// Moves the entry `from` places after the current track to `to` places after it, into
+    /// "Next in queue" or out of it as `queued` says.
+    fn move_ahead(&mut self, from: usize, to: usize, queued: bool) {
+        let base = self.cursor + 1;
+        let (from, to) = (base + from, base + to);
+        if from >= self.order.len() || to >= self.order.len() {
+            return;
+        }
+        let entry = self.order.remove(from);
+        self.order.insert(to, entry);
+        if let Some(song) = self.queue.get_mut(entry) {
+            song.queued = queued;
+        }
+    }
+
+    /// Empties part of what's to come: with `queued`, the songs queued by hand; otherwise
+    /// the rest of the list behind them.
+    fn clear_ahead(&mut self, queued: bool) {
+        let ahead = self.queued_ahead();
+        if queued {
+            for _ in 0..ahead {
+                self.drop_at(self.cursor + 1);
+            }
+        } else {
+            while self.order.len() > self.cursor + 1 + ahead {
+                self.drop_at(self.order.len() - 1);
+            }
+        }
+    }
+
+    /// Makes the entry `offset` places after the current track the current one. Songs
+    /// queued by hand that it jumps over aren't lost: they stay next, after it. Returns
+    /// whether there was such an entry.
+    fn jump_ahead(&mut self, offset: usize) -> bool {
+        let at = self.cursor + 1 + offset;
+        if at >= self.order.len() {
+            return false;
+        }
+        let ahead = self.queued_ahead();
+        if offset < ahead {
+            // One of the queued songs: it comes to the front of them.
+            let entry = self.order.remove(at);
+            self.cursor += 1;
+            self.order.insert(self.cursor, entry);
+        } else {
+            let waiting: Vec<usize> = self.order.drain(self.cursor + 1..self.cursor + 1 + ahead).collect();
+            self.cursor = at - ahead;
+            for (place, entry) in waiting.into_iter().enumerate() {
+                self.order.insert(self.cursor + 1 + place, entry);
+            }
+        }
+        true
     }
 }
 
@@ -319,6 +429,10 @@ impl Controller {
     /// Replaces the queue and starts playing from `start`. `any_start` says no particular
     /// song was asked for, so a shuffled list may open with any of them.
     pub fn play_songs(self: &Rc<Self>, songs: Vec<Song>, start: usize, context: &str, any_start: bool) {
+        if self.remote_play(&songs, start, any_start) {
+            self.play_from.take();
+            return;
+        }
         // Where these songs came from, if the caller said (see `play_from`).
         let (source, origins, source_list) = match self.play_from.take() {
             Some(from) if from.rows.len() == songs.len() => {
@@ -369,6 +483,10 @@ impl Controller {
             pb.source = source;
             pb.source_list = source_list;
             pb.context = context.to_string();
+            // A new queue: nothing in it was queued by hand.
+            for song in pb.queue.iter_mut() {
+                song.queued = false;
+            }
             if pb.shuffle {
                 pb.shuffle_order();
             }
@@ -647,6 +765,9 @@ impl Controller {
     // ---- transport -----------------------------------------------------------------------------
 
     pub fn toggle_play(self: &Rc<Self>) {
+        if self.remote(Remote::Toggle) {
+            return;
+        }
         let (loaded, resume_at) = {
             let mut pb = self.playback.borrow_mut();
             if pb.current().is_none() {
@@ -684,12 +805,18 @@ impl Controller {
 
     /// Used by the media keys and the sleep timer.
     pub fn set_playing(self: &Rc<Self>, playing: bool) {
+        if self.remote(Remote::Play(playing)) {
+            return;
+        }
         if self.playback.borrow().playing != playing {
             self.toggle_play();
         }
     }
 
     pub fn next_track(self: &Rc<Self>) {
+        if self.remote(Remote::Next) {
+            return;
+        }
         {
             let mut pb = self.playback.borrow_mut();
             if pb.order.is_empty() {
@@ -709,6 +836,9 @@ impl Controller {
     }
 
     pub fn previous_track(self: &Rc<Self>) {
+        if self.remote(Remote::Previous) {
+            return;
+        }
         {
             let mut pb = self.playback.borrow_mut();
             if pb.order.is_empty() {
@@ -725,6 +855,9 @@ impl Controller {
     }
 
     pub fn seek(self: &Rc<Self>, seconds: f64) {
+        if self.remote(Remote::Seek(seconds)) {
+            return;
+        }
         let (loaded, transcoded, token, duration) = {
             let mut pb = self.playback.borrow_mut();
             let Some(duration) = pb.current().map(|s| s.duration as f64) else { return };
@@ -781,23 +914,28 @@ impl Controller {
         self.sync_transport();
     }
 
-    fn toggle_shuffle(self: &Rc<Self>) {
+    pub fn toggle_shuffle(self: &Rc<Self>) {
+        if self.remote(Remote::Shuffle) {
+            return;
+        }
         let on = !self.playback.borrow().shuffle;
         self.set_shuffle(on);
     }
 
     /// Turns shuffle on or off for what's playing. The current song carries on: turning it
     /// on shuffles what follows; turning it off continues from this song in the list's order.
-    fn set_shuffle(self: &Rc<Self>, on: bool) {
+    pub fn set_shuffle(self: &Rc<Self>, on: bool) {
         let source = {
             let mut pb = self.playback.borrow_mut();
             if pb.shuffle != on {
                 pb.shuffle = on;
                 if on {
-                    pb.shuffle_order();
+                    pb.rearrange_keeping_queued(|pb| pb.shuffle_order());
                 } else if let Some(&current) = pb.order.get(pb.cursor) {
-                    pb.order = (0..pb.queue.len()).collect();
-                    pb.cursor = current;
+                    pb.rearrange_keeping_queued(|pb| {
+                        pb.order = (0..pb.queue.len()).collect();
+                        pb.cursor = current;
+                    });
                 }
             }
             pb.source.clone()
@@ -836,9 +974,18 @@ impl Controller {
     }
 
     fn cycle_repeat(self: &Rc<Self>) {
+        if self.remote(Remote::Repeat) {
+            return;
+        }
+        let mode = (self.playback.borrow().repeat + 1) % 3;
+        self.set_repeat(mode);
+    }
+
+    /// Sets repeat: 0 off, 1 the whole queue, 2 the current track.
+    pub fn set_repeat(self: &Rc<Self>, mode: u8) {
         {
             let mut pb = self.playback.borrow_mut();
-            pb.repeat = (pb.repeat + 1) % 3;
+            pb.repeat = mode.min(2);
             self.settings.borrow_mut().repeat = pb.repeat;
         }
         self.save_settings();
@@ -848,9 +995,15 @@ impl Controller {
 
     // ---- queue editing -------------------------------------------------------------------------
 
-    /// Adds songs right after the current track, or at the end of the queue.
+    /// Queues songs by hand. They go into "Next in queue", which plays straight after the
+    /// current track and ahead of the rest of whatever list is playing: at the top of it
+    /// with `play_next`, otherwise at the bottom. A song that's already further down the
+    /// list is queued all the same, and plays again when its turn in the list comes.
     pub fn enqueue(self: &Rc<Self>, songs: Vec<Song>, play_next: bool) {
         if songs.is_empty() {
+            return;
+        }
+        if self.remote_add(&songs, play_next) {
             return;
         }
         let was_empty = self.playback.borrow().order.is_empty();
@@ -862,8 +1015,10 @@ impl Controller {
                 pb.origins = vec![None; songs.len()];
                 pb.source.clear();
                 pb.source_list.clear();
-            pb.source_list.clear();
                 pb.queue = songs;
+                for song in pb.queue.iter_mut() {
+                    song.queued = false;
+                }
                 pb.cursor = 0;
                 pb.context.clear();
                 pb.playing = false;
@@ -874,95 +1029,59 @@ impl Controller {
             self.track_changed();
             return;
         }
-        {
-            let mut pb = self.playback.borrow_mut();
-            let mut at = if play_next { pb.cursor + 1 } else { pb.order.len() };
-            for song in songs {
-                pb.queue.push(song);
-                let index = pb.queue.len() - 1;
-                pb.order.insert(at, index);
-                at += 1;
-            }
-            let entries = pb.queue.len();
-            pb.origins.resize(entries, None);
-        }
-        self.next_changed();
-    }
-
-    /// Adds a song `offset` places after the current track (or last, if that's past the end).
-    pub fn enqueue_after(self: &Rc<Self>, song: Song, offset: usize) {
-        if self.playback.borrow().order.is_empty() {
-            return self.enqueue(vec![song], false);
-        }
-        {
-            let mut pb = self.playback.borrow_mut();
-            let at = (pb.cursor + 1 + offset).min(pb.order.len());
-            pb.queue.push(song);
-            let index = pb.queue.len() - 1;
-            pb.order.insert(at, index);
-            let entries = pb.queue.len();
-            pb.origins.resize(entries, None);
-        }
+        self.playback.borrow_mut().queue_up(songs, play_next);
         self.next_changed();
     }
 
     /// Removes the entry `offset` places after the current track.
     pub fn remove_upcoming(self: &Rc<Self>, offset: usize) {
+        if self.remote(Remote::Remove(offset)) {
+            return;
+        }
         {
             let mut pb = self.playback.borrow_mut();
             let at = pb.cursor + 1 + offset;
             if at >= pb.order.len() {
                 return;
             }
-            let removed = pb.order.remove(at);
-            pb.queue.remove(removed);
-            if removed < pb.origins.len() {
-                pb.origins.remove(removed);
-            }
-            for index in pb.order.iter_mut() {
-                if *index > removed {
-                    *index -= 1;
-                }
-            }
+            pb.drop_at(at);
         }
         self.next_changed();
     }
 
     /// Moves the entry `from` places after the current track to `to` places after it.
-    fn move_upcoming(self: &Rc<Self>, from: usize, to: usize) {
-        {
-            let mut pb = self.playback.borrow_mut();
-            let base = pb.cursor + 1;
-            let (from, to) = (base + from, base + to);
-            if from == to || from >= pb.order.len() || to >= pb.order.len() {
-                return;
-            }
-            let entry = pb.order.remove(from);
-            pb.order.insert(to, entry);
+    /// `queued` says which part of the queue it lands in: "Next in queue" or the list.
+    pub fn move_upcoming(self: &Rc<Self>, from: usize, to: usize, queued: bool) {
+        if self.remote(Remote::Move(from, to, queued)) {
+            return;
         }
+        self.playback.borrow_mut().move_ahead(from, to, queued);
         self.next_changed();
     }
 
-    fn clear_upcoming(self: &Rc<Self>) {
-        {
-            let mut pb = self.playback.borrow_mut();
-            let Some(song) = pb.current().cloned() else { return };
-            pb.origins = vec![pb.current_origin()];
-            pb.queue = vec![song];
-            pb.order = vec![0];
-            pb.cursor = 0;
+    /// Empties part of what's to come: with `queued`, the songs queued by hand; otherwise
+    /// the rest of the list behind them.
+    pub fn clear_upcoming(self: &Rc<Self>, queued: bool) {
+        if self.remote(Remote::Clear(queued)) {
+            return;
         }
+        if self.playback.borrow().current().is_none() {
+            return;
+        }
+        self.playback.borrow_mut().clear_ahead(queued);
         self.next_changed();
     }
 
-    fn jump_to_upcoming(self: &Rc<Self>, offset: usize) {
+    /// Plays the entry `offset` places after the current track now.
+    pub fn jump_to_upcoming(self: &Rc<Self>, offset: usize) {
+        if self.remote(Remote::Jump(offset)) {
+            return;
+        }
         {
             let mut pb = self.playback.borrow_mut();
-            let at = pb.cursor + 1 + offset;
-            if at >= pb.order.len() {
+            if !pb.jump_ahead(offset) {
                 return;
             }
-            pb.cursor = at;
             pb.playing = true;
         }
         self.start_current(0.0);
@@ -1610,6 +1729,18 @@ impl Controller {
 
     /// The current track changed (or there no longer is one).
     pub fn track_changed(self: &Rc<Self>) {
+        {
+            // The song that's playing has had its turn: it's no longer waiting in the queue.
+            let mut pb = self.playback.borrow_mut();
+            if let Some(&entry) = pb.order.get(pb.cursor) {
+                if let Some(song) = pb.queue.get_mut(entry) {
+                    song.queued = false;
+                }
+            }
+        }
+        if self.show_remote() {
+            return;
+        }
         let player = self.ui.global::<ui::Player>();
         let current = self.playback.borrow().current().cloned();
         match &current {
@@ -1643,6 +1774,9 @@ impl Controller {
     }
 
     pub fn sync_transport(self: &Rc<Self>) {
+        if self.show_remote() {
+            return;
+        }
         let pb = self.playback.borrow();
         let player = self.ui.global::<ui::Player>();
         player.set_playing(pb.playing);
@@ -1662,9 +1796,13 @@ impl Controller {
     }
 
     pub fn sync_queue(self: &Rc<Self>) {
-        // In a jam hosted here, songs guests added say who added them.
+        if self.show_remote() {
+            return;
+        }
+        // In a jam hosted here, songs guests queued say who queued them.
         let added_by = self.jam.borrow().added_by();
         let pb = self.playback.borrow();
+        let ahead = pb.queued_ahead();
         let rows: Vec<ui::Track> = pb
             .order
             .iter()
@@ -1673,20 +1811,66 @@ impl Controller {
             .filter_map(|&i| pb.queue.get(i))
             .map(|song| {
                 let mut row = self.track_row(song);
-                if let Some(name) = added_by.get(&song.id) {
+                if let Some(name) = added_by.get(&song.id).filter(|_| song.queued) {
                     row.by = name.as_str().into();
                 }
                 row
             })
             .collect();
         drop(pb);
+        self.show_queue(rows, ahead);
+    }
+
+    /// Shows what's to come in the queue panel. The first `ahead` rows were queued by hand
+    /// and are listed as "Next in queue"; the rest are what's left of the list being played.
+    pub fn show_queue(&self, mut rows: Vec<ui::Track>, ahead: usize) {
         self.up_next_model.set_vec(rows.iter().take(UP_NEXT_ROWS).cloned().collect::<Vec<_>>());
-        // The keyboard's row in the queue panel can't be past the end of it.
-        let player = self.ui.global::<ui::Player>();
-        if player.get_queue_cursor() >= rows.len() as i32 {
-            player.set_queue_cursor(rows.len() as i32 - 1);
+        // Where one part ends and the other begins there's a heading, which takes a row of
+        // its own in the list (a row with no song in it).
+        let gap = if ahead > 0 && ahead < rows.len() { ahead as i32 } else { -1 };
+        if gap >= 0 {
+            rows.insert(ahead, ui::Track::default());
         }
+        let player = self.ui.global::<ui::Player>();
+        player.set_queued(ahead.min(rows.len()) as i32);
+        player.set_queue_gap(gap);
+        // The keyboard's row in the queue panel can't be past the end of it, or on the heading.
+        let cursor = player.get_queue_cursor().min(rows.len() as i32 - 1);
+        player.set_queue_cursor(if cursor == gap && gap >= 0 { cursor - 1 } else { cursor });
         self.queue_model.set_vec(rows);
+    }
+
+    /// Which entry after the current track a row of the queue panel shows; `None` for the
+    /// heading between its two parts.
+    fn queue_place(&self, row: i32) -> Option<usize> {
+        let gap = self.ui.global::<ui::Player>().get_queue_gap();
+        if row < 0 || row == gap {
+            return None;
+        }
+        Some(if gap >= 0 && row > gap { row - 1 } else { row } as usize)
+    }
+
+    /// A row of the queue panel was moved `delta` rows (by dragging, or with the keyboard).
+    /// The heading counts as a row: a song moved above it joins "Next in queue", and one
+    /// moved below it goes back among the rest.
+    fn queue_row_moved(self: &Rc<Self>, row: i32, delta: i32) {
+        let player = self.ui.global::<ui::Player>();
+        let (gap, queued) = (player.get_queue_gap(), player.get_queued());
+        let target = row + delta;
+        if row < 0 || target < 0 || row == gap {
+            return;
+        }
+        let (from, to, joins) = if gap < 0 {
+            // No heading: everything shown is of one kind.
+            (row, target, queued > 0)
+        } else if row < gap {
+            if target < gap { (row, target, true) } else { (row, target - 1, false) }
+        } else if target <= gap {
+            (row - 1, target, true)
+        } else {
+            (row - 1, target - 1, false)
+        };
+        self.move_upcoming(from as usize, to as usize, joins);
     }
 
     /// Does `change` to every row showing this song: in the queue, Recently played and the
@@ -2090,7 +2274,11 @@ impl Controller {
             });
         });
         player.on_queue_remove(|index| {
-            with(|ctl| ctl.remove_upcoming(index.max(0) as usize));
+            with(|ctl| {
+                if let Some(place) = ctl.queue_place(index) {
+                    ctl.remove_upcoming(place);
+                }
+            });
         });
         player.on_toggle_mute(|| {
             with(|ctl| {
@@ -2120,13 +2308,24 @@ impl Controller {
             });
         });
         player.on_queue_activated(|index| {
-            with(|ctl| ctl.jump_to_upcoming(index as usize));
+            with(|ctl| {
+                if let Some(place) = ctl.queue_place(index) {
+                    ctl.jump_to_upcoming(place);
+                }
+            });
         });
         player.on_queue_menu(|index, x, y| {
-            with(|ctl| ctl.open_queue_menu(index, x, y));
+            with(|ctl| {
+                // -1 is the song that's playing.
+                if index < 0 {
+                    ctl.open_queue_menu(-1, x, y);
+                } else if let Some(place) = ctl.queue_place(index) {
+                    ctl.open_queue_menu(place as i32, x, y);
+                }
+            });
         });
-        player.on_clear_queue(|| {
-            with(|ctl| ctl.clear_upcoming());
+        player.on_clear_queue(|queued| {
+            with(|ctl| ctl.clear_upcoming(queued));
         });
         player.on_continue_here(|| {
             with(|ctl| ctl.continue_here());
@@ -2144,10 +2343,7 @@ impl Controller {
             });
         });
         player.on_queue_moved(|index, delta| {
-            with(|ctl| {
-                let to = (index + delta).max(0) as usize;
-                ctl.move_upcoming(index.max(0) as usize, to);
-            });
+            with(|ctl| ctl.queue_row_moved(index, delta));
         });
         player.on_choose_sleep(|x, y| {
             with(|ctl| ctl.open_sleep_menu(x, y));
@@ -2503,6 +2699,110 @@ mod tests {
         let song_at = |place: usize| new.get(place).map(|id| named(id));
         // "Random" here means as late as possible, to keep the tests the same every run.
         follow_list(lineup, shuffled, &moved, &arrivals, view.unwrap_or(&in_order), &song_at, &mut |n| n - 1)
+    }
+
+    /// A queue of these songs in this order, with the first one playing.
+    fn queue_of(ids: &[&str]) -> Playback {
+        let mut pb = Playback::new(&Settings::default());
+        pb.queue = ids.iter().map(|id| named(id)).collect();
+        pb.order = (0..ids.len()).collect();
+        pb.origins = vec![None; ids.len()];
+        pb
+    }
+
+    /// What's playing, then what's to come, with a star on the songs queued by hand.
+    fn coming(pb: &Playback) -> String {
+        let name = |&entry: &usize| format!("{}{}", pb.queue[entry].id, if pb.queue[entry].queued { "*" } else { "" });
+        format!("{} | {}", pb.queue[pb.order[pb.cursor]].id, pb.order.iter().skip(pb.cursor + 1).map(name).collect::<Vec<_>>().join(" "))
+    }
+
+    #[test]
+    fn songs_queued_by_hand_play_before_the_rest_of_the_list() {
+        let mut pb = queue_of(&["a", "b", "c"]);
+        pb.queue_up(vec![named("x")], false);
+        assert_eq!(coming(&pb), "a | x* b c");
+        // The next one queued goes behind the first, not in front of it...
+        pb.queue_up(vec![named("y")], false);
+        assert_eq!(coming(&pb), "a | x* y* b c");
+        // ...unless it's to play next. A song that's already in the list is queued all the
+        // same, and stays in the list too.
+        pb.queue_up(vec![named("c")], true);
+        assert_eq!(coming(&pb), "a | c* x* y* b c");
+        assert_eq!(pb.queued_ahead(), 3);
+        // Once the first of them is playing, two are left waiting.
+        pb.cursor += 1;
+        assert_eq!(pb.queued_ahead(), 2);
+    }
+
+    #[test]
+    fn jumping_ahead_keeps_what_was_queued_by_hand() {
+        let mut pb = queue_of(&["a", "b", "c", "d"]);
+        pb.queue_up(vec![named("x"), named("y")], false);
+        // To a song of the list: the queued songs wait behind it.
+        assert!(pb.jump_ahead(3));
+        assert_eq!(coming(&pb), "c | x* y* d");
+        // To one of the queued songs: the others stay where they were.
+        assert!(pb.jump_ahead(1));
+        assert_eq!(coming(&pb), "y | x* d");
+        assert!(!pb.jump_ahead(9));
+    }
+
+    #[test]
+    fn moving_a_song_takes_it_into_the_queued_part_or_out_of_it() {
+        let mut pb = queue_of(&["a", "b", "c"]);
+        pb.queue_up(vec![named("x"), named("y")], false);
+        pb.move_ahead(2, 0, true);
+        assert_eq!(coming(&pb), "a | b* x* y* c");
+        pb.move_ahead(1, 3, false);
+        assert_eq!(coming(&pb), "a | b* y* c x");
+        // Out of range: nothing happens.
+        pb.move_ahead(1, 9, true);
+        assert_eq!(coming(&pb), "a | b* y* c x");
+    }
+
+    #[test]
+    fn clears_one_part_of_the_queue_and_leaves_the_other() {
+        let mut pb = queue_of(&["a", "b", "c"]);
+        pb.cursor = 1;
+        pb.queue_up(vec![named("x"), named("y")], false);
+        assert_eq!(coming(&pb), "b | x* y* c");
+        let mut list = queue_of(&["a", "b", "c"]);
+        list.cursor = 1;
+        list.queue_up(vec![named("x"), named("y")], false);
+        list.clear_ahead(false);
+        assert_eq!(coming(&list), "b | x* y*");
+        pb.clear_ahead(true);
+        assert_eq!(coming(&pb), "b | c");
+        // What was played before is still there to go back to.
+        assert_eq!(pb.queue[pb.order[0]].id, "a");
+    }
+
+    #[test]
+    fn shuffling_leaves_what_was_queued_by_hand_next() {
+        let mut pb = queue_of(&["a", "b", "c", "d", "e", "f"]);
+        pb.cursor = 2;
+        pb.queue_up(vec![named("x"), named("y")], false);
+        pb.rearrange_keeping_queued(|pb| pb.shuffle_order());
+        assert!(coming(&pb).starts_with("c | x* y* "), "{}", coming(&pb));
+        assert_eq!(pb.order.len(), 8);
+        // And turning shuffle off again puts the list back in order around them.
+        let current = pb.order[pb.cursor];
+        pb.rearrange_keeping_queued(|pb| {
+            pb.order = (0..pb.queue.len()).collect();
+            pb.cursor = current;
+        });
+        assert_eq!(coming(&pb), "c | x* y* d e f");
+    }
+
+    #[test]
+    fn dropping_an_entry_keeps_the_place_in_the_queue() {
+        let mut pb = queue_of(&["a", "b", "c", "d"]);
+        pb.cursor = 2;
+        pb.drop_at(0);
+        assert_eq!(coming(&pb), "c | d");
+        pb.drop_at(2);
+        assert_eq!(coming(&pb), "c | ");
+        assert_eq!(pb.queue.len(), 2);
     }
 
     #[test]
