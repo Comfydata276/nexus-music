@@ -1087,6 +1087,7 @@ impl Controller {
 
     pub fn quit(self: &Rc<Self>) {
         // A jam hosted here ends with the app; its guests are told so, not left waiting.
+        self.stop_linking();
         self.end_jam(true);
         self.save_queue();
         self.save_settings();
@@ -2332,8 +2333,9 @@ impl Controller {
         }
         self.pending.borrow_mut().clear();
         self.sending.borrow_mut().clear();
-        self.end_jam(false);
         self.leave_jam();
+        self.end_jam(false);
+        self.stop_linking();
         self.ui.global::<ui::Jam>().set_open(false);
         self.stop_sync();
         self.library_timer.stop();

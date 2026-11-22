@@ -3,7 +3,7 @@
 import { ListView } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { Icons } from "icons.slint";
-import { App, Player, View, CardKind, PlaylistRef, Page, Track, Drag, Search, Suggestion, Jam } from "types.slint";
+import { App, Player, View, CardKind, PlaylistRef, Page, Track, Drag, Search, Suggestion, Jam, Devices } from "types.slint";
 import { Icon, IconButton, Cover, Slider, LinkText, PlayButton, HoverIntent, ScrollThumb, Reorder, TextButton } from "widgets.slint";
 
 // Rows stop `gutter` short of a list's right edge, leaving the scrollbar a lane of its own.
@@ -1365,7 +1365,8 @@ export component JamStrip inherits Rectangle {
 
         Text {
             horizontal-stretch: 1;
-            text: Jam.joined ? "In " + Jam.host + "'s jam. The music plays where " + Jam.host + " is; this player and queue control it."
+            text: Jam.linked ? "Playing on " + Jam.device + ". This player and queue control it."
+                : Jam.joined ? "In " + Jam.host + "'s jam. The music plays where " + Jam.host + " is; this player and queue control it."
                 : Jam.guests.length == 0 ? "Hosting a jam. The music plays here; waiting for guests to join."
                 : Jam.guests.length == 1 ? "Hosting a jam with " + Jam.guests[0].name + ". The music plays here."
                 : "Hosting a jam with " + Jam.guests.length + " guests. The music plays here.";
@@ -1374,6 +1375,22 @@ export component JamStrip inherits Rectangle {
             font-weight: 600;
             vertical-alignment: center;
             overflow: elide;
+        }
+
+        if Jam.linked: VerticalLayout {
+            alignment: center;
+            StripLink {
+                text: "Play here";
+                clicked => { Devices.choose(""); }
+            }
+        }
+
+        if Jam.linked: VerticalLayout {
+            alignment: center;
+            StripLink {
+                text: "Stop steering";
+                clicked => { Jam.leave(); }
+            }
         }
 
         if Jam.joined: VerticalLayout {
@@ -1392,7 +1409,7 @@ export component JamStrip inherits Rectangle {
             }
         }
 
-        if Jam.hosting: VerticalLayout {
+        if Jam.hosting && !Jam.linked: VerticalLayout {
             alignment: center;
             StripLink {
                 text: "Invite and manage";
@@ -1671,7 +1688,7 @@ export component PlayerBar inherits Rectangle {
                 }
             }
 
-            VerticalLayout {
+            if !(Devices.linked && root.side < 264px): VerticalLayout {
                 alignment: center;
                 IconButton {
                     icon: Icons.picture-in-picture-2;
@@ -1679,6 +1696,18 @@ export component PlayerBar inherits Rectangle {
                     enabled: Player.has-track;
                     label: "Mini player";
                     clicked => { Player.open-mini(); }
+                }
+            }
+
+            // Shown once this PC is linked up with the person's other devices.
+            if Devices.linked: VerticalLayout {
+                alignment: center;
+                IconButton {
+                    icon: Icons.monitor-speaker;
+                    icon-size: 17px;
+                    active: Jam.linked || Devices.open;
+                    label: Jam.linked ? "Playing on " + Jam.device : "Play on another device";
+                    clicked => { Devices.open = !Devices.open; }
                 }
             }
 
@@ -1707,7 +1736,7 @@ export component PlayerBar inherits Rectangle {
             VerticalLayout {
                 alignment: center;
                 Slider {
-                    width: clamp(root.side - 184px, 60px, 110px);
+                    width: clamp(root.side - (Devices.linked ? 218px : 184px), 60px, 110px);
                     value: Player.muted ? 0 : Player.volume;
                     label: "Volume";
                     moved(value) => { Player.set-volume(value); }

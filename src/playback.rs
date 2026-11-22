@@ -429,7 +429,7 @@ impl Controller {
     /// Replaces the queue and starts playing from `start`. `any_start` says no particular
     /// song was asked for, so a shuffled list may open with any of them.
     pub fn play_songs(self: &Rc<Self>, songs: Vec<Song>, start: usize, context: &str, any_start: bool) {
-        if self.remote_play(&songs, start, any_start) {
+        if self.remote_play(&songs, start, context, any_start) {
             self.play_from.take();
             return;
         }
@@ -902,7 +902,10 @@ impl Controller {
         self.track_changed();
     }
 
-    fn set_volume(self: &Rc<Self>, volume: f32) {
+    pub fn set_volume(self: &Rc<Self>, volume: f32) {
+        if self.remote(Remote::Volume(volume)) {
+            return;
+        }
         {
             let mut pb = self.playback.borrow_mut();
             pb.volume = volume.clamp(0.0, 1.0);
@@ -1085,6 +1088,28 @@ impl Controller {
             pb.playing = true;
         }
         self.start_current(0.0);
+    }
+
+    /// Takes over a queue handed across from another device: these songs in this order,
+    /// starting with the one at `index`, from `position` seconds into it. Songs marked as
+    /// queued by hand stay so.
+    pub fn load_queue(self: &Rc<Self>, songs: Vec<Song>, index: usize, position: f64, playing: bool, context: &str) {
+        if songs.is_empty() {
+            return;
+        }
+        self.engine.set_playing(false);
+        self.engine.stop();
+        let duration = songs.get(index).map_or(0.0, |song| song.duration as f64);
+        // Handed over in a song's last moments, it starts from the top instead.
+        let position = if duration > 0.0 && position >= duration - 1.0 { 0.0 } else { position.max(0.0) };
+        self.replace_queue(songs, index, position);
+        self.playback.borrow_mut().context = context.to_string();
+        self.track_changed();
+        if playing {
+            self.toggle_play();
+        } else {
+            self.save_queue();
+        }
     }
 
     // ---- engine events and the clock -----------------------------------------------------------

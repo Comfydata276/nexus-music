@@ -34,6 +34,10 @@ const SHOWN: usize = 100;
 const FOUND: usize = 40;
 /// The most songs one request may add to a jam's queue.
 const MOST_ADDED: usize = 50;
+/// The most songs handed from one device to another with a queue.
+const MOST_HANDED: usize = 3000;
+/// How long to leave it before trying again to open this device's session at the relay.
+const TRY_AGAIN: Duration = Duration::from_secs(30);
 /// The relay is told what's playing at least this often, changed or not.
 const RETELL: Duration = Duration::from_secs(30);
 
@@ -240,6 +244,8 @@ pub enum Remote {
     Jump(usize),
     Shuffle,
     Repeat,
+    /// Only between a person's own devices: a guest in a jam turns their own volume.
+    Volume(f32),
 }
 
 /// Something for the thread that talks to the relay on the host's behalf.
@@ -257,6 +263,13 @@ enum Out {
 /// A jam this PC is hosting.
 pub struct Hosting {
     serial: u64,
+    /// The session's name at the relay.
+    id: String,
+    /// It's a jam: friends have been given its link. Otherwise it's only there for this
+    /// person's other devices to steer this one through, and nothing on screen says "jam".
+    public: bool,
+    /// Guests that proved to be this person's own devices, by their guest id.
+    owners: HashSet<String>,
     /// What friends open to join.
     link: String,
     /// Who's here: each guest's id and name.
@@ -278,6 +291,11 @@ pub struct Hosting {
 /// A jam this PC has joined.
 pub struct Joined {
     serial: u64,
+    /// Set when what's joined is one of this person's own devices, not a friend's jam: the
+    /// word that proves this copy is theirs, which gives it the run of the other device.
+    owner: Option<String>,
+    /// That device's id and name.
+    device: (String, String),
     line: Arc<Line>,
     id: String,
     token: String,
@@ -310,6 +328,40 @@ pub struct Jam {
     joined: Option<Joined>,
     /// Counts checks of the relay in Settings, likewise.
     checks: u64,
+    /// This device's session is being opened at the relay, and when that was last tried.
+    opening: bool,
+    tried: Option<Instant>,
+    /// "Start a jam" was pressed while it was opening: make it a jam when it's open.
+    go_public: bool,
+    /// This device's place among the person's other devices, once it has one.
+    presence: Option<Presence>,
+    /// The other devices in the room: id, name, and what each says of itself.
+    devices: Vec<(String, String, Value)>,
+    /// What this device last said of itself (a fingerprint of it), and when.
+    said: u64,
+    said_at: Option<Instant>,
+    /// There's no saved password to work the room's name out from: don't keep trying.
+    no_words: bool,
+}
+
+/// This device's membership of the room where the person's devices find each other.
+struct Presence {
+    serial: u64,
+    stop: Arc<AtomicBool>,
+    line: Arc<Line>,
+    key: String,
+    /// The room's name, and the word that proves a device is one of this person's. Both
+    /// are worked out from the account, so only copies signed in to it can know them.
+    room: String,
+    word: String,
+}
+
+/// What comes with joining one of this person's own devices instead of a friend's jam.
+struct Own {
+    word: String,
+    device: (String, String),
+    /// The queue this device was playing, to carry on with over there.
+    handover: Option<Value>,
 }
 
 impl Jam {
@@ -415,12 +467,70 @@ fn answer_guest(line: &Line, id: &str, secret: &str, serial: u64, client: Option
         return;
     }
     // Songs to add are named by id: one, or a list of them.
-    let wanted: Vec<&str> = match data["ids"].as_array() {
-        Some(ids) => ids.iter().filter_map(Value::as_str).take(MOST_ADDED).collect(),
-        None => data["id"].as_str().into_iter().collect(),
+    let wanted: Vec<String> = match data["ids"].as_array() {
+        Some(ids) => ids.iter().filter_map(Value::as_str).take(MOST_ADDED).map(str::to_string).collect(),
+        None => data["id"].as_str().map(str::to_string).into_iter().collect(),
     };
-    let songs: Vec<Song> = if action == "add" { wanted.iter().filter_map(|id| find_song(id, client)).collect() } else { Vec::new() };
+    let mut data = data;
+    let songs: Vec<Song> = match action.as_str() {
+        "add" => wanted.iter().filter_map(|id| find_song(id, client)).collect(),
+        "load" => {
+            let (songs, index) = handed_songs(&data);
+            data["index"] = json!(index);
+            songs
+        }
+        _ => Vec::new(),
+    };
     post(move |ctl| ctl.jam_asked(serial, ask, guest, &action, &data, songs));
+}
+
+/// The songs of a queue handed over from another device, as this library knows them, and
+/// where in them the one to start with is. Songs this library doesn't have are left out.
+fn handed_songs(data: &Value) -> (Vec<Song>, usize) {
+    let Some(index) = crate::search::current() else { return (Vec::new(), 0) };
+    let known: HashMap<&str, &Song> = index.library.songs.iter().map(|song| (song.id.as_str(), song)).collect();
+    let start = data["index"].as_u64().unwrap_or(0) as usize;
+    let (mut songs, mut begin) = (Vec::new(), 0);
+    for (place, entry) in data["songs"].as_array().into_iter().flatten().take(MOST_HANDED).enumerate() {
+        if place == start {
+            begin = songs.len();
+        }
+        if let Some(song) = entry["id"].as_str().and_then(|id| known.get(id)) {
+            songs.push(Song { queued: entry["queued"].as_bool() == Some(true), ..(*song).clone() });
+        }
+    }
+    let begin = begin.min(songs.len().saturating_sub(1));
+    (songs, begin)
+}
+
+/// Waits on the relay for news of this person's other devices.
+fn room_loop(line: Arc<Line>, key: String, room: String, device: String, serial: u64, stop: Arc<AtomicBool>) {
+    let mut version = 0u64;
+    while !stop.load(Ordering::Relaxed) {
+        let answer = line.get(&format!("api/room/{room}/poll?device={device}&v={version}"), &key, Duration::from_secs(40));
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        match answer {
+            Ok((200, body)) => {
+                version = body["v"].as_u64().unwrap_or(0);
+                let seen: Vec<(String, String, Value)> = body["devices"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|device| (device["id"].as_str().unwrap_or("").to_string(), device["name"].as_str().unwrap_or("").to_string(), device["status"].clone()))
+                    .collect();
+                post(move |ctl| ctl.devices_seen(serial, seen));
+            }
+            // The relay has forgotten this device (it restarted, say): say hello again.
+            Ok((404, _)) => {
+                post(move |ctl| ctl.devices_forgot(serial));
+                std::thread::sleep(Duration::from_secs(3));
+            }
+            Ok((401 | 429, _)) => std::thread::sleep(Duration::from_secs(30)),
+            _ => std::thread::sleep(Duration::from_secs(5)),
+        }
+    }
 }
 
 fn send_cover(line: &Line, id: &str, secret: &str, client: Option<&Client>, covers: &std::path::Path, event: &Value) {
@@ -499,7 +609,9 @@ impl Controller {
             let settings = self.settings.borrow();
             page.set_jam_host(settings.jam_host);
             page.set_jam_relay(host_of(&settings.jam_relay).into());
+            page.set_link_devices(settings.link_devices);
         }
+        page.set_device_name(self.this_device().1.into());
         let jam = self.ui.global::<ui::Jam>();
         jam.set_can_host(self.can_host_jam());
         jam.set_name(self.jam_name().into());
@@ -566,12 +678,13 @@ impl Controller {
         let ui = self.ui.global::<ui::Jam>();
         let jam = self.jam.borrow();
         ui.set_busy(jam.busy);
-        match &jam.hosting {
+        match jam.hosting.as_ref().filter(|hosting| hosting.public) {
             Some(hosting) => {
                 ui.set_hosting(true);
                 ui.set_link(hosting.link.as_str().into());
                 ui.set_status(hosting.trouble.as_str().into());
-                let guests: Vec<ui::JamGuest> = hosting.guests.iter().map(|(id, name)| ui::JamGuest { id: id.into(), name: name.into() }).collect();
+                // This person's own devices aren't guests.
+                let guests: Vec<ui::JamGuest> = hosting.guests.iter().filter(|(id, _)| !hosting.owners.contains(id)).map(|(id, name)| ui::JamGuest { id: id.into(), name: name.into() }).collect();
                 ui.set_guests(ModelRc::new(VecModel::from(guests)));
             }
             None => {
@@ -588,27 +701,62 @@ impl Controller {
         self.ui.global::<ui::Jam>().set_problem(text.into());
     }
 
-    /// Starts a jam at the relay on file.
+    /// Starts a jam. If this device already has a session open at the relay for the
+    /// person's other devices, that session becomes the jam; otherwise one is opened.
     pub fn start_jam(self: &Rc<Self>) {
         self.jam_problem("");
-        if self.jam.borrow().busy || self.jam.borrow().hosting.is_some() {
+        if self.jam.borrow().busy {
             return;
         }
         if self.jam.borrow().joined.is_some() {
             return self.jam_problem("Leave the jam you're in before starting one.");
         }
-        let (address, key) = (self.settings.borrow().jam_relay.clone(), config::load_secret(&self.paths, "jam-key"));
-        let Some(key) = key.filter(|_| self.can_host_jam()) else {
+        if !self.can_host_jam() {
             return self.jam_problem("Hosting isn't set up yet. Turn it on in Settings, under Jam.");
+        }
+        let link = {
+            let mut jam = self.jam.borrow_mut();
+            match jam.hosting.as_mut() {
+                Some(hosting) => {
+                    hosting.public = true;
+                    Some(hosting.link.clone())
+                }
+                None => {
+                    jam.busy = true;
+                    jam.go_public = true;
+                    None
+                }
+            }
         };
+        match link {
+            Some(link) => {
+                self.ui.global::<ui::Jam>().set_qr(qr_image(&link));
+                self.show_hosting();
+                self.sync_queue();
+            }
+            None => {
+                self.show_hosting();
+                self.open_session();
+            }
+        }
+    }
+
+    /// Opens this device's session at the relay, through which it can be steered: by
+    /// guests if it's made a jam, and by the person's other devices either way.
+    fn open_session(self: &Rc<Self>) {
+        if self.jam.borrow().opening || self.jam.borrow().hosting.is_some() {
+            return;
+        }
+        let (address, key) = (self.settings.borrow().jam_relay.clone(), config::load_secret(&self.paths, "jam-key"));
+        let Some(key) = key.filter(|_| self.can_host_jam()) else { return };
         let name = self.jam_name();
         let serial = {
             let mut jam = self.jam.borrow_mut();
-            jam.busy = true;
+            jam.opening = true;
+            jam.tried = Some(Instant::now());
             jam.serial += 1;
             jam.serial
         };
-        self.show_hosting();
         self.jam_pool.spawn(move || {
             let line = Line::new(&address);
             let made = match line.post("api/host/start", &key, &json!({"name": name})) {
@@ -628,12 +776,21 @@ impl Controller {
         if self.jam.borrow().serial != serial {
             return;
         }
-        self.jam.borrow_mut().busy = false;
+        let public = {
+            let mut jam = self.jam.borrow_mut();
+            jam.opening = false;
+            jam.busy = false;
+            std::mem::take(&mut jam.go_public)
+        };
         let (id, secret) = match made {
             Ok(made) => made,
             Err(why) => {
                 self.show_hosting();
-                return self.jam_problem(&why);
+                // Only someone who pressed "Start a jam" is waiting to hear why not.
+                if public {
+                    self.jam_problem(&why);
+                }
+                return;
             }
         };
         let line = Arc::new(line);
@@ -645,12 +802,17 @@ impl Controller {
             let _ = std::thread::Builder::new().name("jam-send".into()).spawn(move || send_loop(line, id, secret, waiting));
         }
         {
-            let (stop, pool, client, covers) = (stop.clone(), self.jam_pool.clone(), self.client(), self.covers.dir().to_path_buf());
+            let (id, stop, pool, client, covers) = (id.clone(), stop.clone(), self.jam_pool.clone(), self.client(), self.covers.dir().to_path_buf());
             let _ = std::thread::Builder::new().name("jam-host".into()).spawn(move || host_loop(line, id, secret, serial, stop, pool, client, covers));
         }
-        self.ui.global::<ui::Jam>().set_qr(qr_image(&link));
+        if public {
+            self.ui.global::<ui::Jam>().set_qr(qr_image(&link));
+        }
         self.jam.borrow_mut().hosting = Some(Hosting {
             serial,
+            id,
+            public,
+            owners: HashSet::new(),
             link,
             guests: Vec::new(),
             added: HashMap::new(),
@@ -672,6 +834,8 @@ impl Controller {
         let hosting = {
             let mut jam = self.jam.borrow_mut();
             jam.busy = false;
+            jam.opening = false;
+            jam.go_public = false;
             // Anything still on its way for this jam is for nobody now.
             jam.serial += 1;
             jam.hosting.take()
@@ -690,19 +854,23 @@ impl Controller {
 
     /// Guests have come or gone.
     fn jam_news(self: &Rc<Self>, serial: u64, guests: Vec<(String, String)>, arrivals: Vec<String>) {
-        {
+        let public = {
             let mut jam = self.jam.borrow_mut();
             let Some(hosting) = jam.hosting.as_mut().filter(|hosting| hosting.serial == serial) else { return };
             if hosting.guests == guests && arrivals.is_empty() {
                 return;
             }
             hosting.guests = guests;
-        }
+            hosting.public
+        };
         self.show_hosting();
-        match arrivals.as_slice() {
-            [] => {}
-            [one] => self.toast(format!("{one} joined the jam")),
-            several => self.toast(format!("{} people joined the jam", several.len())),
+        // Outside a jam, the only ones who come and go are this person's own devices.
+        if public {
+            match arrivals.as_slice() {
+                [] => {}
+                [one] => self.toast(format!("{one} joined the jam")),
+                several => self.toast(format!("{} people joined the jam", several.len())),
+            }
         }
     }
 
@@ -715,11 +883,15 @@ impl Controller {
 
     /// The relay no longer knows the jam (it restarted, or the jam ran out).
     fn jam_lost(self: &Rc<Self>, serial: u64, why: &str) {
-        if self.jam.borrow().hosting.as_ref().is_none_or(|hosting| hosting.serial != serial) {
-            return;
-        }
+        let public = match self.jam.borrow().hosting.as_ref() {
+            Some(hosting) if hosting.serial == serial => hosting.public,
+            _ => return,
+        };
         self.end_jam(false);
-        self.toast(why);
+        // A session that was only there for the person's own devices is quietly opened again.
+        if public {
+            self.toast(why);
+        }
     }
 
     fn remove_jam_guest(&self, guest: &str) {
@@ -736,12 +908,41 @@ impl Controller {
         if self.jam.borrow().hosting.as_ref().is_none_or(|hosting| hosting.serial != serial) {
             return;
         }
+        // One of this person's own devices says so with a word only copies signed in to
+        // their account can work out. It has the run of this one.
+        let own = {
+            let mut jam = self.jam.borrow_mut();
+            let word = jam.presence.as_ref().map(|presence| presence.word.clone());
+            let own = word.is_some_and(|word| data["owner"].as_str() == Some(word.as_str()));
+            let fresh = own && jam.hosting.as_mut().is_some_and(|hosting| hosting.owners.insert(guest.0.clone()));
+            drop(jam);
+            if fresh {
+                self.show_hosting();
+            }
+            own
+        };
         // Adding songs, and taking your own back out, is what a jam is for. The rest is
         // the host's to allow.
-        let control = self.settings.borrow().jam_guests_control;
+        let control = own || self.settings.borrow().jam_guests_control;
         let done = match action {
-            "add" => self.jam_add_for(&guest, songs, control && data["next"].as_bool() == Some(true)),
+            "add" => self.jam_add_for(&guest, songs, control && data["next"].as_bool() == Some(true), own),
             "remove" => self.jam_remove_for(&guest, data, control),
+            "hello" | "queue" | "load" | "volume" if !own => Err("That's for your own devices.".to_string()),
+            "hello" => Ok(json!({})),
+            "queue" => Ok(self.queue_to_hand_over()),
+            "load" => {
+                if songs.is_empty() {
+                    Err("This device's library has none of those songs.".to_string())
+                } else {
+                    let index = data["index"].as_u64().unwrap_or(0) as usize;
+                    self.load_queue(songs, index, data["position"].as_f64().unwrap_or(0.0), data["playing"].as_bool() != Some(false), data["context"].as_str().unwrap_or(""));
+                    Ok(json!({}))
+                }
+            }
+            "volume" => {
+                self.set_volume(data["to"].as_f64().unwrap_or(1.0) as f32);
+                Ok(json!({}))
+            }
             "skip" | "previous" | "pause" | "play" | "seek" | "jump" | "move" | "clear" | "shuffle" | "repeat" if !control => {
                 Err("The host is choosing what plays. You can still add songs.".to_string())
             }
@@ -756,6 +957,14 @@ impl Controller {
             let _ = hosting.out.send(Out::Reply(reply));
         }
         self.jam_sync(false);
+    }
+
+    /// What this device is playing and has queued, for another device to carry on with:
+    /// the current song first, then the rest in the order they'd play.
+    fn queue_to_hand_over(&self) -> Value {
+        let pb = self.playback.borrow();
+        let songs: Vec<Value> = pb.order.iter().skip(pb.cursor).filter_map(|&index| pb.queue.get(index)).filter(|song| song.radio_url.is_empty()).take(MOST_HANDED).map(|song| json!({"id": song.id, "queued": song.queued})).collect();
+        json!({"songs": songs, "index": 0, "position": pb.position, "playing": pb.playing && pb.current().is_some(), "context": pb.context})
     }
 
     /// Which entry after the current track a guest means: the one at `at`, if it's still
@@ -801,7 +1010,7 @@ impl Controller {
     /// Queues a guest's songs: in "Next in queue", at the bottom of it (or the top, with
     /// `next`), so what guests add plays in the order they added it and ahead of the rest
     /// of whatever list the host was playing.
-    fn jam_add_for(self: &Rc<Self>, guest: &(String, String), songs: Vec<Song>, next: bool) -> Result<Value, String> {
+    fn jam_add_for(self: &Rc<Self>, guest: &(String, String), songs: Vec<Song>, next: bool, own: bool) -> Result<Value, String> {
         let asked = songs.len();
         let (empty, mut waiting) = {
             let pb = self.playback.borrow();
@@ -813,7 +1022,8 @@ impl Controller {
         if fresh.is_empty() {
             return Err(if asked == 0 { "That song isn't in the host's library." } else { "That's already in the queue." }.to_string());
         }
-        if let Some(hosting) = self.jam.borrow_mut().hosting.as_mut() {
+        // What the person queued from another of their devices is theirs, not a guest's.
+        if let Some(hosting) = self.jam.borrow_mut().hosting.as_mut().filter(|_| !own) {
             for song in &fresh {
                 hosting.added.insert(song.id.clone(), guest.clone());
             }
@@ -828,7 +1038,9 @@ impl Controller {
             // Nothing was queued at all: the first song anyone adds starts the music.
             self.toggle_play();
         }
-        self.toast(said);
+        if !own {
+            self.toast(said);
+        }
         Ok(json!({"added": count}))
     }
 
@@ -864,7 +1076,7 @@ impl Controller {
         }
         let playing = pb.playing && now.is_some();
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        (now.map(|song| song.id.as_str()), playing, control, ahead.len(), pb.shuffle, pb.repeat, pb.context.as_str()).hash(&mut hasher);
+        (now.map(|song| song.id.as_str()), playing, control, ahead.len(), pb.shuffle, pb.repeat, pb.context.as_str(), (pb.volume * 100.0) as i32).hash(&mut hasher);
         for song in ahead.iter().take(SHOWN) {
             (song.id.as_str(), song.queued, hosting.added.get(&song.id).map(|(id, _)| id.as_str())).hash(&mut hasher);
         }
@@ -902,6 +1114,7 @@ impl Controller {
             "context": pb.context,
             "shuffle": pb.shuffle,
             "repeat": pb.repeat,
+            "volume": pb.volume,
         });
         hosting.told = print;
         hosting.told_at = Instant::now();
@@ -918,7 +1131,7 @@ impl Controller {
         if self.jam.borrow().busy {
             return;
         }
-        if self.jam.borrow().hosting.is_some() {
+        if self.jam.borrow().hosting.as_ref().is_some_and(|hosting| hosting.public) {
             return self.jam_problem("End the jam you're hosting before joining another.");
         }
         let (address, id) = match parse_jam_link(link) {
@@ -927,10 +1140,16 @@ impl Controller {
         };
         self.set_jam_name(name);
         let name = self.jam_name();
+        self.join_session(address, id, name, None);
+    }
+
+    /// Joins a session at a relay: a friend's jam, or (with `own`) one of this person's
+    /// other devices, to steer it.
+    fn join_session(self: &Rc<Self>, address: String, id: String, name: String, own: Option<Own>) {
         self.leave_jam();
         let serial = {
             let mut jam = self.jam.borrow_mut();
-            jam.busy = true;
+            jam.busy = own.is_none();
             jam.serial += 1;
             jam.serial
         };
@@ -947,11 +1166,11 @@ impl Controller {
                 Ok(_) => Err("That link didn't lead to a jam.".to_string()),
                 Err(why) => Err(why),
             };
-            post(move |ctl| ctl.jam_joined(serial, line, id, joined));
+            post(move |ctl| ctl.jam_joined(serial, line, id, joined, own));
         });
     }
 
-    fn jam_joined(self: &Rc<Self>, serial: u64, line: Line, id: String, joined: Result<(String, String, String), String>) {
+    fn jam_joined(self: &Rc<Self>, serial: u64, line: Line, id: String, joined: Result<(String, String, String), String>, own: Option<Own>) {
         if self.jam.borrow().serial != serial {
             return;
         }
@@ -959,7 +1178,12 @@ impl Controller {
         self.show_hosting();
         let (token, me, host) = match joined {
             Ok(joined) => joined,
-            Err(why) => return self.jam_problem(&why),
+            Err(why) => {
+                return match own {
+                    Some(own) => self.toast(format!("Couldn't reach {}. {why}", own.device.1)),
+                    None => self.jam_problem(&why),
+                };
+            }
         };
         let line = Arc::new(line);
         let stop = Arc::new(AtomicBool::new(false));
@@ -967,11 +1191,18 @@ impl Controller {
             let (line, id, token, stop) = (line.clone(), id.clone(), token.clone(), stop.clone());
             let _ = std::thread::Builder::new().name("jam-guest".into()).spawn(move || guest_loop(line, id, token, serial, stop));
         }
-        // From here the player and the queue panel are the jam's. What was playing on this
-        // PC stops, and is still there, where it was, when the jam is left.
+        // From here the player and the queue panel are the other device's. What was playing
+        // on this PC stops, and is still there, where it was, afterwards.
         self.set_playing(false);
+        let (owner, device, handover) = match own {
+            Some(own) => (Some(own.word), own.device, own.handover),
+            None => (None, Default::default(), None),
+        };
+        let friend = owner.is_none();
         self.jam.borrow_mut().joined = Some(Joined {
             serial,
+            owner,
+            device,
             line,
             id,
             token,
@@ -991,11 +1222,27 @@ impl Controller {
         ui.set_open(false);
         self.show_joined();
         self.show_remote();
-        self.navigate(Route::Jam);
+        self.show_devices();
+        if friend {
+            self.navigate(Route::Jam);
+        } else {
+            // Say who's asking, so the other device gives this one the run of it; and if
+            // this one was playing, hand it what was playing here to carry on with.
+            match handover {
+                Some(queue) => self.jam_simply("load", queue),
+                None => self.jam_simply("hello", json!({})),
+            }
+        }
     }
 
     /// Leaves the jam this PC joined, if any. The player goes back to this PC's own queue.
     pub fn leave_jam(self: &Rc<Self>) {
+        self.leave_jam_saying(None);
+    }
+
+    /// Leaves, first asking one last thing of the other side (`last` is an action and what
+    /// goes with it). The two go one after the other, so the goodbye can't overtake it.
+    fn leave_jam_saying(self: &Rc<Self>, last: Option<(&str, Value)>) {
         let joined = {
             let mut jam = self.jam.borrow_mut();
             let joined = jam.joined.take();
@@ -1008,12 +1255,22 @@ impl Controller {
         joined.stop.store(true, Ordering::Relaxed);
         // The host's list of who's there is put right at once, not when this PC has gone quiet.
         let (line, id, token) = (joined.line.clone(), joined.id.clone(), joined.token.clone());
+        let last = last.map(|(action, mut data)| {
+            if let Some(word) = &joined.owner {
+                data["owner"] = json!(word);
+            }
+            json!({"action": action, "data": data})
+        });
         self.jam_pool.spawn(move || {
+            if let Some(last) = last {
+                let _ = line.post(&format!("api/jam/{id}/ask"), &token, &last);
+            }
             let _ = line.send(&format!("api/jam/{id}/leave"), &token, "application/json", b"{}", Duration::from_secs(5));
         });
         self.jam_timer.stop();
         self.show_joined();
         self.track_changed();
+        self.show_devices();
         if self.current_route() == Some(Route::Jam) {
             self.navigate(Route::Home);
         }
@@ -1021,11 +1278,15 @@ impl Controller {
 
     /// The jam is over, or this guest is out of it.
     fn jam_gone(self: &Rc<Self>, serial: u64, why: &str) {
-        if self.jam.borrow().joined.as_ref().is_none_or(|joined| joined.serial != serial) {
-            return;
-        }
+        let device = match self.jam.borrow().joined.as_ref() {
+            Some(joined) if joined.serial == serial => joined.owner.as_ref().map(|_| joined.device.1.clone()),
+            _ => return,
+        };
         self.leave_jam();
-        self.toast(why);
+        match device {
+            Some(name) => self.toast(format!("{name} can't be reached any more, so the player is back on this PC.")),
+            None => self.toast(why),
+        }
     }
 
     fn jam_guest_trouble(&self, serial: u64, text: &str) {
@@ -1080,13 +1341,17 @@ impl Controller {
         let jam = self.jam.borrow();
         let Some(joined) = &jam.joined else {
             ui.set_joined(false);
+            ui.set_linked(false);
             ui.set_host("".into());
             ui.set_results(ModelRc::default());
             return;
         };
         let state = &joined.heard["state"];
         let text = |value: &Value| SharedString::from(value.as_str().unwrap_or(""));
-        ui.set_joined(true);
+        // A friend's jam, or one of this person's own devices being steered from here.
+        ui.set_joined(joined.owner.is_none());
+        ui.set_linked(joined.owner.is_some());
+        ui.set_device(joined.device.1.as_str().into());
         ui.set_host(joined.host.as_str().into());
         let others: Vec<&str> = joined.heard["guests"].as_array().map(|list| list.iter().filter(|guest| guest["id"].as_str() != Some(joined.me.as_str())).filter_map(|guest| guest["name"].as_str()).collect()).unwrap_or_default();
         ui.set_with(match others.as_slice() {
@@ -1136,7 +1401,7 @@ impl Controller {
     /// When this PC is in someone's jam, shows the jam in the player and the queue panel,
     /// in place of this PC's own queue, and returns true. Otherwise does nothing.
     pub fn show_remote(&self) -> bool {
-        let (now, rows, ahead, playing, position, duration, context, shuffle, repeat) = {
+        let (now, rows, ahead, playing, position, duration, context, shuffle, repeat, volume) = {
             let mut jam = self.jam.borrow_mut();
             let Some(joined) = jam.joined.as_mut() else { return false };
             let state = joined.heard["state"].clone();
@@ -1154,6 +1419,8 @@ impl Controller {
                 state["context"].as_str().unwrap_or("").to_string(),
                 state["shuffle"].as_bool() == Some(true),
                 state["repeat"].as_i64().unwrap_or(0) as i32,
+                // Between a person's own devices the volume slider is the other device's.
+                joined.owner.as_ref().and_then(|_| state["volume"].as_f64()),
             )
         };
         let player = self.ui.global::<ui::Player>();
@@ -1167,6 +1434,10 @@ impl Controller {
         player.set_playing(playing);
         player.set_shuffle(shuffle);
         player.set_repeat(repeat);
+        if let Some(volume) = volume {
+            player.set_volume(volume as f32);
+            player.set_muted(false);
+        }
         player.set_buffering(false);
         player.set_reconnecting(false);
         player.set_stalled(false);
@@ -1227,7 +1498,12 @@ impl Controller {
             // Guests may always take out what they queued themselves. Anything else that
             // steers the jam is the host's to allow, and there's no point asking if not.
             let mine = matches!(what, Remote::Remove(at) if state["queue"][at]["by_id"].as_str() == Some(me.as_str()));
-            if state["control"].as_bool() != Some(true) && !mine {
+            let own = joined.owner.is_some();
+            if let (Remote::Volume(_), false) = (&what, own) {
+                // In a friend's jam the volume slider is still this PC's own.
+                return false;
+            }
+            if state["control"].as_bool() != Some(true) && !mine && !own {
                 let host = joined.host.clone();
                 drop(jam);
                 self.toast(format!("{host} is choosing what plays. You can still add songs."));
@@ -1279,6 +1555,10 @@ impl Controller {
                 Remote::Jump(at) => ("jump", json!({"at": at, "id": entry(state, at)})),
                 Remote::Shuffle => ("shuffle", json!({"on": state["shuffle"].as_bool() != Some(true)})),
                 Remote::Repeat => ("repeat", json!({"mode": (state["repeat"].as_u64().unwrap_or(0) + 1) % 3})),
+                Remote::Volume(to) => {
+                    state["volume"] = json!(to);
+                    ("volume", json!({"to": to}))
+                }
             };
             joined.heard["age"] = json!(0.0);
             joined.heard_at = Instant::now();
@@ -1289,36 +1569,41 @@ impl Controller {
         true
     }
 
-    /// In a jam, queues songs in the jam's queue and returns true. Otherwise returns false.
+    /// Steering playback elsewhere, queues songs there and returns true. Otherwise returns false.
     pub fn remote_add(&self, songs: &[Song], play_next: bool) -> bool {
-        if self.jam.borrow().joined.is_none() {
-            return false;
-        }
+        let Some(place) = self.jam.borrow().joined.as_ref().map(|joined| if joined.owner.is_some() { format!("the queue on {}", joined.device.1) } else { "the jam's queue".to_string() }) else { return false };
         let ids: Vec<&str> = songs.iter().filter(|song| song.radio_url.is_empty()).map(|song| song.id.as_str()).take(MOST_ADDED).collect();
         if ids.is_empty() {
-            self.toast("Radio stations can't be added to a jam");
+            self.toast("Radio stations can't be added from here");
             return true;
         }
         let cut = songs.len() > ids.len();
         self.jam_request("add", json!({"ids": ids, "next": play_next}), move |ctl, answer| match answer {
             Ok(done) => match done["added"].as_u64().unwrap_or(1) {
-                1 => ctl.toast("Added to the jam's queue"),
-                count if cut => ctl.toast(format!("Added the first {count} songs to the jam's queue")),
-                count => ctl.toast(format!("Added {count} songs to the jam's queue")),
+                1 => ctl.toast(format!("Added to {place}")),
+                count if cut => ctl.toast(format!("Added the first {count} songs to {place}")),
+                count => ctl.toast(format!("Added {count} songs to {place}")),
             },
             Err(why) => ctl.toast(why),
         });
         true
     }
 
-    /// In a jam, playing something means queueing it: the song that was picked, or the
-    /// whole list when the list itself was played. Returns false when not in a jam.
-    pub fn remote_play(&self, songs: &[Song], start: usize, whole: bool) -> bool {
-        if self.jam.borrow().joined.is_none() {
-            return false;
+    /// Steering playback elsewhere, playing something here plays it there, and this
+    /// returns true. On one of the person's own devices it plays as it would here, taking
+    /// the queue's place. In a friend's jam it's queued instead: the song that was picked,
+    /// or the whole list when the list itself was played. Returns false otherwise.
+    pub fn remote_play(&self, songs: &[Song], start: usize, context: &str, whole: bool) -> bool {
+        let Some(own) = self.jam.borrow().joined.as_ref().map(|joined| joined.owner.is_some()) else { return false };
+        if !own {
+            let picked = if whole { songs } else { songs.get(start..start + 1).unwrap_or_default() };
+            return self.remote_add(picked, false);
         }
-        let picked = if whole { songs } else { songs.get(start..start + 1).unwrap_or_default() };
-        self.remote_add(picked, false)
+        // A very long list is handed over from the song that was picked onwards.
+        let from = if songs.len() > MOST_HANDED { start } else { 0 };
+        let handed: Vec<Value> = songs.iter().skip(from).take(MOST_HANDED).map(|song| json!({"id": song.id})).collect();
+        self.jam_simply("load", json!({"songs": handed, "index": start - from, "position": 0.0, "playing": true, "context": context}));
+        true
     }
 
     /// Asks the host's app for something and hands back its answer on the UI thread.
@@ -1326,6 +1611,11 @@ impl Controller {
         let jam = self.jam.borrow();
         let Some(joined) = &jam.joined else { return };
         let (line, id, token, serial) = (joined.line.clone(), joined.id.clone(), joined.token.clone(), joined.serial);
+        let mut data = data;
+        if let Some(word) = &joined.owner {
+            // What shows the other device that this is one of its owner's own.
+            data["owner"] = json!(word);
+        }
         let body = json!({"action": action, "data": data});
         self.jam_pool.spawn(move || {
             let answer = match line.post(&format!("api/jam/{id}/ask"), &token, &body) {
@@ -1410,8 +1700,8 @@ impl Controller {
         });
     }
 
-    /// Called a few times a second: keeps a hosted jam's guests up to date, and moves the
-    /// progress bar while in someone else's.
+    /// Called a few times a second: keeps guests and other devices up to date with what's
+    /// playing here, and moves the progress bar while steering playback elsewhere.
     pub fn jam_tick(self: &Rc<Self>) {
         let (hosting, position) = {
             let jam = self.jam.borrow();
@@ -1423,6 +1713,240 @@ impl Controller {
         if let Some(position) = position {
             self.ui.global::<ui::Player>().set_position(position as f32);
         }
+        self.link_devices();
+    }
+
+    // ---- this person's other devices ---------------------------------------------------------
+
+    /// This device, to the others: an id that stays the same, and a name to show.
+    fn this_device(&self) -> (String, String) {
+        if self.settings.borrow().device_id.is_empty() {
+            self.settings.borrow_mut().device_id = format!("{:08x}", fastrand::u32(..));
+            self.save_settings();
+        }
+        let settings = self.settings.borrow();
+        let chosen = settings.device_name.trim();
+        let name = if chosen.is_empty() { std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).ok().filter(|name| !name.trim().is_empty()).unwrap_or_else(|| "This PC".to_string()) } else { chosen.to_string() };
+        (settings.device_id.clone(), name.chars().take(24).collect())
+    }
+
+    /// What only copies of the app signed in to this account can work out: the name of the
+    /// room they meet in, and the word that shows one of them is asking. Both come from the
+    /// account's name and password, and neither gives the password away.
+    fn account_words(&self) -> Option<(String, String)> {
+        use sha2::{Digest, Sha256};
+        let (server, username) = {
+            let settings = self.settings.borrow();
+            (settings.server.clone(), settings.username.clone())
+        };
+        let password = config::load_password(&self.paths, &server, &username)?;
+        let word = |purpose: &str| Sha256::digest(format!("nexus-music {purpose}\n{username}\n{password}").as_bytes()).iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        Some((word("room"), word("owner")[..32].to_string()))
+    }
+
+    /// Whether this device should be finding the person's other devices: signed in, a relay
+    /// set up, and linking not switched off.
+    fn linking_wanted(&self) -> bool {
+        self.client().is_some() && self.can_host_jam() && self.settings.borrow().link_devices
+    }
+
+    /// Keeps this device's place among the person's others: in the room, with a session
+    /// open that they can steer it through, and saying what it's playing. Called a few
+    /// times a second; does something only when something needs doing.
+    fn link_devices(self: &Rc<Self>) {
+        if !self.linking_wanted() {
+            if self.jam.borrow().presence.is_some() {
+                self.stop_linking();
+            }
+            return;
+        }
+        if self.jam.borrow().presence.is_none() {
+            if self.jam.borrow().no_words {
+                return;
+            }
+            let Some((room, word)) = self.account_words() else {
+                self.jam.borrow_mut().no_words = true;
+                return;
+            };
+            let (address, Some(key)) = (self.settings.borrow().jam_relay.clone(), config::load_secret(&self.paths, "jam-key")) else { return };
+            let (line, stop) = (Arc::new(Line::new(&address)), Arc::new(AtomicBool::new(false)));
+            let serial = {
+                let mut jam = self.jam.borrow_mut();
+                jam.serial += 1;
+                jam.said = 0;
+                jam.said_at = None;
+                jam.presence = Some(Presence { serial: jam.serial, stop: stop.clone(), line: line.clone(), key: key.clone(), room: room.clone(), word });
+                jam.serial
+            };
+            self.say_status(true);
+            let device = self.this_device().0;
+            let _ = std::thread::Builder::new().name("jam-room".into()).spawn(move || {
+                // Give the first hello a moment to land before asking who else is there.
+                std::thread::sleep(Duration::from_millis(700));
+                room_loop(line, key, room, device, serial, stop)
+            });
+            self.show_devices();
+        }
+        // A session for the others to steer this device through, opened again if it's lost.
+        let open = {
+            let jam = self.jam.borrow();
+            jam.hosting.is_none() && !jam.opening && jam.tried.is_none_or(|at| at.elapsed() >= TRY_AGAIN)
+        };
+        if open {
+            self.open_session();
+        }
+        self.say_status(false);
+    }
+
+    /// Tells the room what this device is doing, if that's changed (or with `again`).
+    fn say_status(&self, again: bool) {
+        use std::hash::{Hash, Hasher};
+        let (id, name) = self.this_device();
+        let mut jam = self.jam.borrow_mut();
+        let status = {
+            let pb = self.playback.borrow();
+            let now = pb.current();
+            // While this device is steering another, or in a friend's jam, it isn't itself
+            // there to be steered.
+            let steering = jam.joined.as_ref().map(|joined| if joined.owner.is_some() { joined.device.1.clone() } else { format!("{}'s jam", joined.host) });
+            json!({
+                "session": jam.hosting.as_ref().filter(|_| steering.is_none()).map(|hosting| hosting.id.clone()),
+                "title": now.map(|song| song.title.clone()),
+                "artist": now.map(|song| song.artist_label().to_string()),
+                "playing": pb.playing && now.is_some(),
+                "steering": steering,
+            })
+        };
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        (status.to_string(), &name).hash(&mut hasher);
+        let print = hasher.finish();
+        let stale = jam.said_at.is_none_or(|at| at.elapsed() >= RETELL);
+        let Some(presence) = jam.presence.as_ref() else { return };
+        if !(again || stale || print != jam.said) {
+            return;
+        }
+        let (line, key, room) = (presence.line.clone(), presence.key.clone(), presence.room.clone());
+        jam.said = print;
+        jam.said_at = Some(Instant::now());
+        self.jam_pool.spawn(move || {
+            let _ = line.post(&format!("api/room/{room}/enter"), &key, &json!({"id": id, "name": name, "status": status}));
+        });
+    }
+
+    /// Leaves the room: at sign-out, when linking is switched off, and when the app closes.
+    pub fn stop_linking(&self) {
+        let presence = {
+            let mut jam = self.jam.borrow_mut();
+            jam.devices.clear();
+            jam.no_words = false;
+            jam.tried = None;
+            jam.presence.take()
+        };
+        if let Some(presence) = presence {
+            presence.stop.store(true, Ordering::Relaxed);
+            let id = self.this_device().0;
+            self.jam_pool.spawn(move || {
+                let _ = presence.line.send(&format!("api/room/{}/leave", presence.room), &presence.key, "application/json", json!({"id": id}).to_string().as_bytes(), Duration::from_secs(5));
+            });
+        }
+        self.show_devices();
+    }
+
+    /// News of who's in the room.
+    fn devices_seen(&self, serial: u64, seen: Vec<(String, String, Value)>) {
+        let mine = self.this_device().0;
+        {
+            let mut jam = self.jam.borrow_mut();
+            if jam.presence.as_ref().is_none_or(|presence| presence.serial != serial) {
+                return;
+            }
+            jam.devices = seen.into_iter().filter(|(id, _, _)| *id != mine).collect();
+        }
+        self.show_devices();
+    }
+
+    /// The relay no longer has this device in the room: say hello again.
+    fn devices_forgot(&self, serial: u64) {
+        if self.jam.borrow().presence.as_ref().is_some_and(|presence| presence.serial == serial) {
+            self.say_status(true);
+        }
+    }
+
+    /// Brings the list of devices up to date.
+    fn show_devices(&self) {
+        let ui = self.ui.global::<ui::Devices>();
+        let name = self.this_device().1;
+        let jam = self.jam.borrow();
+        ui.set_linked(jam.presence.is_some());
+        let steering = jam.joined.as_ref().filter(|joined| joined.owner.is_some()).map(|joined| joined.device.0.clone());
+        let mut list = vec![ui::Device { id: "".into(), name: name.into(), about: "This PC".into(), active: steering.is_none(), ready: true }];
+        for (id, name, status) in &jam.devices {
+            let title = status["title"].as_str().unwrap_or("");
+            let about = match (status["steering"].as_str(), status["session"].is_string()) {
+                (Some(other), _) => format!("Steering {other}"),
+                (None, false) => "Getting ready…".to_string(),
+                (None, true) if title.is_empty() => "Nothing playing".to_string(),
+                (None, true) if status["playing"].as_bool() == Some(true) => format!("Playing {title}"),
+                (None, true) => format!("Paused on {title}"),
+            };
+            list.push(ui::Device { id: id.into(), name: name.into(), about: about.into(), active: steering.as_deref() == Some(id.as_str()), ready: status["session"].is_string() });
+        }
+        ui.set_list(ModelRc::new(VecModel::from(list)));
+    }
+
+    /// A device was picked from the list. Another device: this one starts steering it, and
+    /// if music is playing here it carries on over there. This PC: what the other device
+    /// was playing carries on here.
+    fn pick_device(self: &Rc<Self>, id: &str) {
+        self.ui.global::<ui::Devices>().set_open(false);
+        if id.is_empty() {
+            return self.play_here();
+        }
+        let (target, address, word, already, in_jam) = {
+            let jam = self.jam.borrow();
+            let target = jam.devices.iter().find(|(other, _, _)| other == id).map(|(_, name, status)| (name.clone(), status["session"].as_str().map(str::to_string)));
+            (
+                target,
+                jam.presence.as_ref().map(|presence| presence.line.base.clone()),
+                jam.presence.as_ref().map(|presence| presence.word.clone()),
+                jam.joined.as_ref().is_some_and(|joined| joined.owner.is_some() && joined.device.0 == id),
+                jam.joined.as_ref().is_some_and(|joined| joined.owner.is_none()) || jam.hosting.as_ref().is_some_and(|hosting| hosting.public),
+            )
+        };
+        if already {
+            return;
+        }
+        if in_jam {
+            return self.toast("Leave the jam before moving to another device");
+        }
+        let (Some((name, Some(session))), Some(address), Some(word)) = (target, address, word) else {
+            return self.toast("That device isn't ready to be steered yet. Try again in a moment.");
+        };
+        // Music playing here moves over there; otherwise that device is steered as it is.
+        let handover = {
+            let playing = self.jam.borrow().joined.is_none() && self.playback.borrow().playing;
+            playing.then(|| self.queue_to_hand_over())
+        };
+        let me = self.this_device().1;
+        self.join_session(address, session, me, Some(Own { word, device: (id.to_string(), name), handover }));
+    }
+
+    /// Brings what another device is playing over to this one, and stops steering it.
+    fn play_here(self: &Rc<Self>) {
+        if self.jam.borrow().joined.as_ref().is_none_or(|joined| joined.owner.is_none()) {
+            return;
+        }
+        self.jam_request("queue", json!({}), |ctl, answer| {
+            let Ok(queue) = answer else { return ctl.leave_jam() };
+            if queue["playing"].as_bool() != Some(true) {
+                // Nothing was playing there to bring over: just let go of it.
+                return ctl.leave_jam();
+            }
+            let (songs, index) = handed_songs(&queue);
+            // The other device stops as this one starts.
+            ctl.leave_jam_saying(Some(("pause", json!({}))));
+            ctl.load_queue(songs, index, queue["position"].as_f64().unwrap_or(0.0), true, queue["context"].as_str().unwrap_or(""));
+        });
     }
 
     pub fn wire_jam(self: &Rc<Self>) {
@@ -1462,6 +1986,9 @@ impl Controller {
         jam.on_opened(|| {
             with(|ctl| ctl.jam_problem(""));
         });
+        self.ui.global::<ui::Devices>().on_choose(|id| {
+            with(|ctl| ctl.pick_device(&id));
+        });
         let settings = self.ui.global::<ui::Settings>();
         settings.on_set_jam_host(|on| {
             with(|ctl| {
@@ -1473,6 +2000,21 @@ impl Controller {
                 } else {
                     ctl.end_jam(false);
                 }
+            });
+        });
+        settings.on_set_link_devices(|on| {
+            with(|ctl| {
+                ctl.settings.borrow_mut().link_devices = on;
+                ctl.save_settings();
+                ctl.push_jam();
+            });
+        });
+        settings.on_set_device_name(|name| {
+            with(|ctl| {
+                ctl.settings.borrow_mut().device_name = name.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(24).collect();
+                ctl.save_settings();
+                ctl.push_jam();
+                ctl.show_devices();
             });
         });
         settings.on_save_jam_link(|link| {

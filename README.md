@@ -36,6 +36,7 @@ What's planned next is in the [roadmap](ROADMAP.md).
 - Keeps songs ready: each song is kept on this PC once it has played, and the next few in the queue are fetched ahead of time, so the music carries on through a dropped connection and replays start at once. You choose how much space that may take (2 GB unless changed), which folder it's in, and how far ahead to fetch; the songs played longest ago make way when it fills.
 - Rides out a bad connection: a stream that stops arriving is asked for again from where it stopped, usually before the audio in hand runs out. If the server can't be reached at all the song waits where it is, the player says it's reconnecting, and the music carries on from the same place when the server is back. Skipping, stopping and seeking still act at once while a stream is stuck.
 - Playing a song from a search starts its radio: that song, then others like it.
+- Play on another of your devices: with a relay set up (see Jams, below), every PC running Nexus Music on your account shows up under the devices button in the player bar, with what it's playing. Pick one while music is playing and the music moves there, carrying on from the same place in the same queue; pick one while nothing is playing and you steer whatever it has on. Either way the player and queue panel on the PC in front of you then control the other one, volume included, and “Play here” brings the music back.
 - Jams: one queue that friends add to while the music plays on your PC. They join from a link, in a browser (a phone works) or in Nexus Music on their own PC under Jam. In the app, a joined jam takes over the player and the queue panel: they show the host's song and queue, and pausing, skipping, dragging songs into a new order or taking them out happens for everyone. “Add to queue” anywhere adds to the jam, and so does playing a song. A strip along the bottom of the window says you're in a jam for as long as you are. The browser page does the same from a phone. You choose whether guests may steer or only add songs, see who's there, and can remove anyone. The queue shows who added what. Joining a jam needs nothing set up; hosting one is off until you switch it on, and needs a small relay service (see below).
 - Keeps your devices in step: the queue and your place in it, Recently played, pinned playlists, each list's shuffle and sort, the dates songs were added and the theme follow you to the app on another PC. The queue uses the server's saved-queue feature; the rest is kept in the comment of a playlist named "Nexus Music sync". When another PC has been playing in the last half hour, the queue panel offers "Continue here", which picks its queue up where it had got to. The plays behind "Your stats" are shared too, so the last four weeks and six months cover every PC.
 - Select several songs with Ctrl or Shift, then drag them onto a playlist or the queue, or
@@ -172,6 +173,16 @@ router for the app itself. Once the relay is running:
 A jam ends when you end it, when the app closes, or half an hour after the app loses touch
 with the relay.
 
+**Your own devices.** The same relay links your PCs to each other. On each one, switch on
+"Host jams" under Settings, Jam, and paste the host link; "Link my devices" is then on unless
+you turn it off. Each PC keeps a private session open at the relay and says what it's
+playing, and the others list it under the devices button in the player bar. Only copies of
+the app signed in to the same account can find each other: the room they meet in, and the
+word one shows another to be given the run of it, are both worked out from the account's
+name and password (neither gives the password away, and it is never sent). Starting a jam
+turns the PC's private session into the jam; ending it opens a fresh private one, so an old
+jam link is of no further use.
+
 **Running the relay.** It is one small program in a container, keeps nothing on disk, and
 holds jams in memory only: restarting it ends any jam in progress.
 
@@ -188,7 +199,7 @@ docker logs nexus-music-jam    # prints the host link
 | `JAM_HOST_KEY` | What a copy of the app must show to start a jam: at least 16 characters, and worth making long and random. Without it the relay makes one up each time it starts, so the host link changes on every restart. |
 | `JAM_PUBLIC_URL` | The address people reach the relay at. Only used to print the whole host link in the log. |
 | `JAM_LISTEN` | Where it listens inside the container; `0.0.0.0:8080` unless set. |
-| `JAM_MAX_JAMS` | How many jams may run at once; 5 unless set. |
+| `JAM_MAX_JAMS` | How many sessions may be open at once; 20 unless set. Each linked device holds one, whether or not it's a jam. |
 
 Put it behind the reverse proxy you already use, on an address of its own (or under a path),
 with HTTPS. Three things matter there:
@@ -307,7 +318,7 @@ connection.
 | `src/bulk.rs` | Asks Lidarr for many albums at once: finds each, hands them over an artist at a time, and checks what Lidarr made of them. |
 | `src/musicbrainz.rs` | Finds songs, discographies and track lists for music that isn't in the library. |
 | `src/gate.rs` | Browser sign-in for a Lidarr that sits behind Authentik. |
-| `src/jam.rs` | Jams: hosting one through a relay, and joining someone else's. |
+| `src/jam.rs` | Jams and linked devices: being steered through a relay, steering someone else's playback, and handing a queue from one device to another. |
 | `relay/` | The jam relay: a separate small program (its own `Cargo.toml`) with the page guests without the app use. |
 | `src/update.rs` | Finds, downloads and verifies new releases. |
 | `src/lyrics.rs` | The server's lyrics, kept so they show at once. |

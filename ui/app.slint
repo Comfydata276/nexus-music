@@ -8,13 +8,13 @@ import "fonts/BricolageGrotesque-ExtraBold.ttf";
 
 import { Theme } from "theme.slint";
 import { Icons } from "icons.slint";
-import { Drag, App, View, Player, Menu, Prompt, Toast, Lyrics, Settings, Covers, Page, Track, Card, CardKind, Shelf, Offer, CardRow, PlaylistRef, MenuEntry, LyricLine, QualityOption, ThemeOption, Search, Suggestion, Jam, JamGuest, JamSong } from "types.slint";
+import { Drag, App, View, Player, Menu, Prompt, Toast, Lyrics, Settings, Covers, Page, Track, Card, CardKind, Shelf, Offer, CardRow, PlaylistRef, MenuEntry, LyricLine, QualityOption, ThemeOption, Search, Suggestion, Jam, JamGuest, JamSong, Devices, Device } from "types.slint";
 import { PageStatus, IconButton } from "widgets.slint";
 import { Sidebar, TopBar, QueuePanel, PlayerBar, SearchOverlay, JamStrip } from "chrome.slint";
 import { StackPage, TrackListPage, GridPage, LyricsPage, NowPlayingPage, SettingsPage, LoginPage, JamPage } from "pages.slint";
-import { MenuOverlay, PromptOverlay, ToastOverlay, JamOverlay } from "overlays.slint";
+import { MenuOverlay, PromptOverlay, ToastOverlay, JamOverlay, DevicesOverlay } from "overlays.slint";
 
-export { Theme, App, View, Player, Menu, Prompt, Toast, Lyrics, Settings, Covers, Icons, Page, Track, Card, CardKind, Shelf, Offer, CardRow, PlaylistRef, MenuEntry, LyricLine, QualityOption, ThemeOption, Search, Suggestion, Jam, JamGuest, JamSong }
+export { Theme, App, View, Player, Menu, Prompt, Toast, Lyrics, Settings, Covers, Icons, Page, Track, Card, CardKind, Shelf, Offer, CardRow, PlaylistRef, MenuEntry, LyricLine, QualityOption, ThemeOption, Search, Suggestion, Jam, JamGuest, JamSong, Devices, Device }
 
 // The icon in the notification area, shown while closing the window keeps the app running.
 export component Tray inherits SystemTrayIcon {
@@ -479,7 +479,7 @@ export component MainWindow inherits Window {
         if App.signed-in: Rectangle {
             property <length> gap: Theme.gap;
             // In a jam, a strip along the very bottom says so; the player bar sits on it.
-            property <length> strip: Jam.hosting || Jam.joined ? 32px : 0px;
+            property <length> strip: Jam.hosting || Jam.joined || Jam.linked ? 32px : 0px;
             property <length> bar: 84px + self.strip;
             // The top bar's height: panels start below it.
             property <length> top: 60px;
@@ -585,7 +585,7 @@ export component MainWindow inherits Window {
         }
 
         ToastOverlay {
-            y: root.height - self.height - (App.signed-in ? 100px + (Jam.hosting || Jam.joined ? 32px : 0px) : 32px);
+            y: root.height - self.height - (App.signed-in ? 100px + (Jam.hosting || Jam.joined || Jam.linked ? 32px : 0px) : 32px);
         }
 
         // What's being dragged, following the pointer.
@@ -613,6 +613,10 @@ export component MainWindow inherits Window {
         }
 
         if Jam.open && App.signed-in: JamOverlay { }
+
+        if Devices.open && App.signed-in: DevicesOverlay {
+            lift: 96px + (Jam.hosting || Jam.joined || Jam.linked ? 32px : 0px);
+        }
 
         if Menu.open: MenuOverlay { }
 

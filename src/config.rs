@@ -194,6 +194,11 @@ pub struct Settings {
     pub jam_name: String,
     /// Guests in a jam hosted here may pause and skip.
     pub jam_guests_control: bool,
+    /// Other copies of the app signed in to the same account can see this one, steer it,
+    /// and take over what it's playing (and it them). Needs the relay.
+    pub link_devices: bool,
+    /// What this device is called in other devices' lists; empty for the computer's name.
+    pub device_name: String,
     /// Share the queue, pins and so on with the app on other devices.
     pub sync: bool,
     /// A made-up name for this device, so it can tell its own saved queue from others'.
@@ -263,6 +268,8 @@ impl Default for Settings {
             jam_relay: String::new(),
             jam_name: String::new(),
             jam_guests_control: true,
+            link_devices: true,
+            device_name: String::new(),
             sync: true,
             device_id: String::new(),
             sync_playlist: String::new(),

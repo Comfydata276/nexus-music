@@ -2684,6 +2684,28 @@ export component SettingsPage inherits Rectangle {
                                 }
                             }
                         }
+
+                        if Settings.jam-host: SettingRow {
+                            title: "Link my devices";
+                            detail: "Other PCs running Nexus Music, signed in to the same account and set up with the same relay, appear under the devices button in the player bar. Pick one to move what you're playing over to it, or to steer what it's playing from here.";
+                            Toggle {
+                                on: Settings.link-devices;
+                                label: "Link my devices";
+                                toggled(on) => { Settings.set-link-devices(on); }
+                            }
+                        }
+
+                        if Settings.jam-host && Settings.link-devices: SettingRow {
+                            nested: true;
+                            title: "This device's name";
+                            detail: "What it's called in the list on your other devices.";
+                            Field {
+                                width: 220px;
+                                text: Settings.device-name;
+                                label: "This device's name";
+                                accepted => { Settings.set-device-name(self.text); }
+                            }
+                        }
                     }
 
                     // ---- Account ----

@@ -25,7 +25,13 @@ const STATE_BODY: usize = 512 * 1024;
 /// The most one cover may weigh.
 const COVER_BODY: usize = 1536 * 1024;
 /// What a guest may ask the host app to do.
-const ACTIONS: [&str; 13] = ["search", "add", "remove", "skip", "previous", "pause", "play", "seek", "jump", "move", "clear", "shuffle", "repeat"];
+const ACTIONS: [&str; 17] = ["search", "add", "remove", "skip", "previous", "pause", "play", "seek", "jump", "move", "clear", "shuffle", "repeat", "hello", "load", "queue", "volume"];
+/// The most a guest may send when asking the host app for something. Handing a whole queue
+/// from one of a person's devices to another is the big one.
+const ASK_BODY: usize = 256 * 1024;
+/// Rooms, and devices in one, before more are turned away.
+const MOST_ROOMS: usize = 50;
+const MOST_DEVICES: usize = 12;
 /// Things waiting for the host app, per jam, before more are turned away.
 const MOST_WAITING: usize = 120;
 /// What the host app hasn't collected yet, per jam, before the oldest is dropped.
@@ -57,7 +63,7 @@ impl Config {
     pub fn new(host_key: String) -> Config {
         Config {
             host_key,
-            max_jams: 5,
+            max_jams: 20,
             max_guests: 50,
             hold: Duration::from_secs(20),
             ask_wait: Duration::from_secs(12),
@@ -342,6 +348,63 @@ impl Jam {
     }
 }
 
+/// One of a person's copies of the app, as the others see it.
+struct Device {
+    id: String,
+    name: String,
+    /// What it says of itself: what it's playing, and the session others can steer it through.
+    status: Value,
+    seen: Instant,
+    /// Its wait for the room to change.
+    poll: Option<Parked>,
+}
+
+/// Where one person's copies of the app find each other. A room's name is worked out by
+/// the app from the account it's signed in to, so only copies signed in to that account
+/// can name it; nothing is kept but who is in it now.
+#[derive(Default)]
+struct Room {
+    devices: Vec<Device>,
+    version: u64,
+}
+
+impl Room {
+    fn snapshot(&self) -> Value {
+        json!({"v": self.version, "devices": self.devices.iter().map(|device| json!({"id": device.id, "name": device.name, "status": device.status})).collect::<Vec<_>>()})
+    }
+
+    /// Who's in the room, or what they say of themselves, has changed: tell everyone waiting.
+    fn changed(&mut self, out: &mut Outbox) {
+        self.version += 1;
+        let now = Instant::now();
+        let snapshot = self.snapshot();
+        for device in &mut self.devices {
+            if let Some(parked) = device.poll.take() {
+                device.seen = now;
+                out.push(parked.request, json_reply(200, &snapshot));
+            }
+        }
+    }
+
+    /// Answers waits that have run their course and forgets devices that have gone quiet.
+    /// Returns whether the room is empty.
+    fn sweep(&mut self, config: &Config, now: Instant, out: &mut Outbox) -> bool {
+        let snapshot = self.snapshot();
+        for device in &mut self.devices {
+            if let Some(parked) = device.poll.take_if(|parked| parked.until <= now) {
+                device.seen = now;
+                out.push(parked.request, json_reply(200, &snapshot));
+            }
+        }
+        let before = self.devices.len();
+        self.devices.retain(|device| device.poll.is_some() || now.saturating_duration_since(device.seen) <= config.idle_after);
+        if self.devices.len() != before {
+            self.changed(out);
+        }
+        self.devices.is_empty()
+    }
+}
+
 /// Who may do how much, how often: each key has an allowance that refills over time.
 #[derive(Default)]
 struct Limits {
@@ -367,12 +430,13 @@ impl Limits {
 pub struct Relay {
     config: Config,
     jams: Mutex<HashMap<String, Jam>>,
+    rooms: Mutex<HashMap<String, Room>>,
     limits: Mutex<Limits>,
 }
 
 impl Relay {
     pub fn new(config: Config) -> Relay {
-        Relay { config, jams: Mutex::new(HashMap::new()), limits: Mutex::new(Limits::default()) }
+        Relay { config, jams: Mutex::new(HashMap::new()), rooms: Mutex::new(HashMap::new()), limits: Mutex::new(Limits::default()) }
     }
 
     fn allow(&self, key: &str, capacity: f64, per_second: f64) -> bool {
@@ -421,6 +485,10 @@ pub fn start(relay: Arc<Relay>, server: Arc<Server>, workers: usize) {
                         println!("A jam ended: its host went quiet. {} running.", jams.len());
                     }
                 }
+            }
+            {
+                let mut rooms = relay.rooms.lock().unwrap();
+                rooms.retain(|_, room| !room.sweep(&relay.config, now, &mut out));
             }
             out.send();
             rounds += 1;
@@ -566,6 +634,9 @@ fn handle(relay: &Relay, request: Request) {
         (Method::Post, ["api", "host", jam, "cover"]) => host_cover(relay, request, jam, query, &mut out),
         (Method::Post, ["api", "host", jam, "remove"]) => host_remove(relay, request, jam, &mut out),
         (Method::Post, ["api", "host", jam, "end"]) => host_end(relay, request, jam, &mut out),
+        (Method::Post, ["api", "room", room, "enter"]) => room_enter(relay, request, room, &mut out),
+        (Method::Get, ["api", "room", room, "poll"]) => room_poll(relay, request, room, query, &mut out),
+        (Method::Post, ["api", "room", room, "leave"]) => room_leave(relay, request, room, &mut out),
         (Method::Get, ["api", "jam", jam]) => guest_peek(relay, request, jam, &mut out),
         (Method::Post, ["api", "jam", jam, "join"]) => guest_join(relay, request, jam, &mut out),
         (Method::Get, ["api", "jam", jam, "state"]) => guest_state(relay, request, jam, query, &mut out),
@@ -750,6 +821,105 @@ fn host_end(relay: &Relay, request: Request, id: &str, out: &mut Outbox) {
     out.push(request, json_reply(200, &json!({"ok": true})));
 }
 
+/// A room's name as the app makes it: a long run of letters and digits.
+fn room_name(text: &str) -> bool {
+    (32..=64).contains(&text.len()) && text.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
+/// A copy of the app says it's here, or that what it's doing has changed. Needs the host
+/// key: rooms are for the people this relay is run for.
+fn room_enter(relay: &Relay, mut request: Request, name: &str, out: &mut Outbox) {
+    if let Err(refusal) = relay.host_key_ok(&request) {
+        return out.push(request, refusal);
+    }
+    let body = match read_json(&mut request, GUEST_BODY) {
+        Ok(body) => body,
+        Err(refusal) => return out.push(request, refusal),
+    };
+    let id = body["id"].as_str().unwrap_or("");
+    if !room_name(name) || !plain_id(id) || id.len() > 64 {
+        return out.push(request, error(400, "That isn't a room."));
+    }
+    let mut rooms = relay.rooms.lock().unwrap();
+    if !rooms.contains_key(name) && rooms.len() >= MOST_ROOMS {
+        return out.push(request, error(503, "This relay has as many rooms as it allows."));
+    }
+    let room = rooms.entry(name.to_string()).or_default();
+    let called = clean_name(body["name"].as_str().unwrap_or(""), "A device");
+    let status = if body["status"].is_object() { body["status"].clone() } else { json!({}) };
+    let now = Instant::now();
+    match room.devices.iter().position(|device| device.id == id) {
+        Some(at) => {
+            let device = &mut room.devices[at];
+            device.seen = now;
+            if device.name != called || device.status != status {
+                device.name = called;
+                device.status = status;
+                room.changed(out);
+            }
+        }
+        None if room.devices.len() >= MOST_DEVICES => return out.push(request, error(503, "That's as many devices as a room holds.")),
+        None => {
+            room.devices.push(Device { id: id.to_string(), name: called, status, seen: now, poll: None });
+            room.changed(out);
+        }
+    }
+    out.push(request, json_reply(200, &room.snapshot()));
+}
+
+/// A copy of the app waits to hear of a change to its room.
+fn room_poll(relay: &Relay, request: Request, name: &str, query: &str, out: &mut Outbox) {
+    if let Err(refusal) = relay.host_key_ok(&request) {
+        return out.push(request, refusal);
+    }
+    let (id, seen) = (query_value(query, "device").unwrap_or(""), query_value(query, "v").and_then(|text| text.parse::<u64>().ok()).unwrap_or(0));
+    let mut rooms = relay.rooms.lock().unwrap();
+    let Some(room) = rooms.get_mut(name) else { return out.push(request, error(404, "Enter the room first.")) };
+    let (version, snapshot) = (room.version, room.snapshot());
+    let Some(device) = room.devices.iter_mut().find(|device| device.id == id) else { return out.push(request, error(404, "Enter the room first.")) };
+    device.seen = Instant::now();
+    if let Some(earlier) = device.poll.take() {
+        out.push(earlier.request, json_reply(200, &snapshot));
+    }
+    if seen != version {
+        return out.push(request, json_reply(200, &snapshot));
+    }
+    device.poll = Some(Parked { request, until: Instant::now() + relay.config.hold });
+}
+
+fn room_leave(relay: &Relay, mut request: Request, name: &str, out: &mut Outbox) {
+    if let Err(refusal) = relay.host_key_ok(&request) {
+        return out.push(request, refusal);
+    }
+    let body = match read_json(&mut request, GUEST_BODY) {
+        Ok(body) => body,
+        Err(refusal) => return out.push(request, refusal),
+    };
+    let mut rooms = relay.rooms.lock().unwrap();
+    if let Some(room) = rooms.get_mut(name) {
+        let before = room.devices.len();
+        let id = body["id"].as_str().unwrap_or("");
+        let mut gone = Vec::new();
+        room.devices.retain_mut(|device| {
+            if device.id != id {
+                return true;
+            }
+            gone.extend(device.poll.take());
+            false
+        });
+        for parked in gone {
+            out.push(parked.request, error(404, "Enter the room first."));
+        }
+        if room.devices.len() != before {
+            room.changed(out);
+        }
+        if room.devices.is_empty() {
+            rooms.remove(name);
+        }
+    }
+    out.push(request, json_reply(200, &json!({"ok": true})));
+}
+
 /// Whose jam this is, for the page to say before anyone has joined it.
 fn guest_peek(relay: &Relay, request: Request, id: &str, out: &mut Outbox) {
     if !relay.allow(&format!("peek:{}", caller(&request)), 120.0, 2.0) {
@@ -829,7 +999,7 @@ fn guest_state(relay: &Relay, request: Request, id: &str, query: &str, out: &mut
 }
 
 fn guest_ask(relay: &Relay, mut request: Request, id: &str, out: &mut Outbox) {
-    let body = match read_json(&mut request, GUEST_BODY) {
+    let body = match read_json(&mut request, ASK_BODY) {
         Ok(body) => body,
         Err(refusal) => return out.push(request, refusal),
     };
@@ -1194,6 +1364,39 @@ mod tests {
         join(to, &id, "Third");
         assert_eq!(ask(to, "GET", &format!("/api/jam/{id}/state?v=0"), &first, Value::Null).0, 200);
         assert_eq!(ask(to, "GET", &format!("/api/jam/{id}/state?v=0"), &second, Value::Null).0, 401);
+    }
+
+    #[test]
+    fn a_person_s_devices_find_each_other_in_a_room() {
+        let to = relay(|config| config.idle_after = Duration::from_millis(900));
+        let room = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let enter = |id: &str, name: &str, status: Value| ask(to, "POST", &format!("/api/room/{room}/enter"), KEY, json!({"id": id, "name": name, "status": status}));
+        // Rooms are for holders of the host key, and have long names.
+        assert_eq!(ask(to, "POST", &format!("/api/room/{room}/enter"), "", json!({"id": "pc"})).0, 401);
+        assert_eq!(ask(to, "POST", "/api/room/short/enter", KEY, json!({"id": "pc"})).0, 400);
+        assert_eq!(ask(to, "GET", &format!("/api/room/{room}/poll?device=pc&v=0"), KEY, Value::Null).0, 404);
+        let (status, seen) = enter("pc", "Desktop", json!({"session": "abc", "playing": true}));
+        assert_eq!((status, seen["devices"].as_array().unwrap().len()), (200, 1));
+        let (_, seen) = enter("laptop", "Laptop", json!({}));
+        assert_eq!(seen["devices"].as_array().unwrap().len(), 2);
+        assert_eq!(seen["devices"][0]["status"]["session"], "abc");
+        // A device waiting on the room hears when another says something new of itself...
+        let version = seen["v"].as_u64().unwrap();
+        let path = format!("/api/room/{room}/poll?device=laptop&v={version}");
+        let waiting = std::thread::spawn(move || ask(to, "GET", &path, KEY, Value::Null));
+        std::thread::sleep(Duration::from_millis(100));
+        enter("pc", "Desktop", json!({"session": "abc", "playing": false}));
+        let (_, heard) = waiting.join().unwrap();
+        assert_eq!(heard["devices"][0]["status"]["playing"], false);
+        // ...and saying the same thing again changes nothing.
+        let version = heard["v"].as_u64().unwrap();
+        assert_eq!(enter("pc", "Desktop", json!({"session": "abc", "playing": false})).1["v"].as_u64().unwrap(), version);
+        // One that says it's going is gone at once; one that just goes quiet, after a while.
+        assert_eq!(ask(to, "POST", &format!("/api/room/{room}/leave"), KEY, json!({"id": "pc"})).0, 200);
+        let (_, left) = ask(to, "GET", &format!("/api/room/{room}/poll?device=laptop&v={version}"), KEY, Value::Null);
+        assert_eq!(left["devices"].as_array().unwrap().len(), 1);
+        std::thread::sleep(Duration::from_millis(1500));
+        assert_eq!(ask(to, "GET", &format!("/api/room/{room}/poll?device=laptop&v=0"), KEY, Value::Null).0, 404);
     }
 
     #[test]

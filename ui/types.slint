@@ -512,6 +512,10 @@ export global Jam {
     callback set-guests-control(on: bool);
 
     in property <bool> joined;
+    // Not a jam, but the same arrangement: the player and queue are steering another of
+    // this person's own devices, the one named.
+    in property <bool> linked;
+    in property <string> device;
     in property <string> host;
     // Who else is there, as a sentence.
     in property <string> with;
@@ -527,6 +531,29 @@ export global Jam {
     callback leave();
     callback search(text: string);
     callback add(id: string);
+}
+
+// One of the person's devices: this PC (first in the list, with an empty id) or another
+// copy of the app signed in to the same account.
+export struct Device {
+    id: string,
+    name: string,
+    // What it's doing, in a few words.
+    about: string,
+    // It's where the player on this PC is playing: this PC itself, or the device being steered.
+    active: bool,
+    // It can be picked.
+    ready: bool,
+}
+
+// The person's other devices, for moving playback between them and steering one from another.
+export global Devices {
+    // This PC is linked up: there's a relay, and it's looking for the others.
+    in property <bool> linked;
+    in property <[Device]> list;
+    // The list is showing.
+    in-out property <bool> open;
+    callback choose(id: string);
 }
 
 export global Toast {
@@ -697,6 +724,11 @@ export global Settings {
     in property <string> jam-state: "none";
     in property <string> jam-status;
     callback set-jam-host(on: bool);
+    // Linking this person's devices through the relay, and what this one is called.
+    in property <bool> link-devices;
+    in property <string> device-name;
+    callback set-link-devices(on: bool);
+    callback set-device-name(name: string);
     // Keeps a host link (the relay's address and its key) and checks it.
     callback save-jam-link(link: string);
     callback check-jam();
