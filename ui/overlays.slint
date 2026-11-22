@@ -600,7 +600,7 @@ export component JamOverlay inherits Rectangle {
 }
 
 // One device in the list.
-component DeviceRow inherits Rectangle {
+export component DeviceRow inherits Rectangle {
     in property <Device> device;
     callback chosen;
 
@@ -706,7 +706,7 @@ export component DevicesOverlay inherits Rectangle {
 
                 Text {
                     height: 32px;
-                    text: "  Play on";
+                    text: "  Connect";
                     color: Theme.text;
                     font-family: Theme.display;
                     font-size: 18px;
@@ -716,7 +716,10 @@ export component DevicesOverlay inherits Rectangle {
 
                 for device in Devices.list: DeviceRow {
                     device: device;
-                    chosen => { Devices.choose(device.id); }
+                    chosen => {
+                        Devices.open = false;
+                        Devices.choose(device.id);
+                    }
                 }
 
                 if Devices.list.length < 2: Text {

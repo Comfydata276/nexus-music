@@ -5,6 +5,7 @@ import { Theme } from "theme.slint";
 import { Icons } from "icons.slint";
 import { App, Player, View, CardKind, PlaylistRef, Page, Track, Drag, Search, Suggestion, Jam, Devices } from "types.slint";
 import { Icon, IconButton, Cover, Slider, LinkText, PlayButton, HoverIntent, ScrollThumb, Reorder, TextButton } from "widgets.slint";
+import { DeviceRow } from "overlays.slint";
 
 // Rows stop `gutter` short of a list's right edge, leaving the scrollbar a lane of its own.
 // The lists run `reach` into the panel's padding so that lane sits at the panel's edge.
@@ -1318,6 +1319,165 @@ export component QueuePanel inherits Rectangle {
     }
 }
 
+// The devices, in the side panel where the queue otherwise is: where the music is playing,
+// a way into a jam, and the person's other devices to move it to.
+export component ConnectPanel inherits Rectangle {
+    background: Theme.panel;
+    border-radius: Theme.radius;
+
+    VerticalLayout {
+        padding: 8px;
+        spacing: 8px;
+        alignment: start;
+
+        HorizontalLayout {
+            padding-left: 12px;
+            padding-right: Lane.gutter - Lane.reach;
+            height: 48px;
+
+            Text {
+                text: "Connect";
+                color: Theme.text;
+                font-family: Theme.display;
+                font-size: 15px;
+                font-weight: 700;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+
+            VerticalLayout {
+                alignment: center;
+                IconButton {
+                    icon: Icons.x;
+                    label: "Close";
+                    clicked => { Devices.open = false; }
+                }
+            }
+        }
+
+        // Where the music is, and listening with friends.
+        Rectangle {
+            border-radius: 8px;
+            background: Theme.raised;
+
+            VerticalLayout {
+                padding: 12px;
+                spacing: 12px;
+
+                HorizontalLayout {
+                    spacing: 12px;
+
+                    VerticalLayout {
+                        alignment: center;
+                        Icon {
+                            source: Icons.monitor-speaker;
+                            size: 22px;
+                            tint: Theme.accent-bright;
+                        }
+                    }
+
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 3px;
+                        horizontal-stretch: 1;
+                        min-width: 0px;
+                        preferred-width: 0px;
+
+                        Text {
+                            text: Jam.linked ? Jam.device : Devices.list.length > 0 ? Devices.list[0].name : "This PC";
+                            color: Theme.accent-bright;
+                            font-size: 15px;
+                            font-weight: 600;
+                            overflow: elide;
+                        }
+
+                        Text {
+                            text: Jam.linked ? "Playing there" : "This PC";
+                            color: Theme.muted;
+                            font-size: 12px;
+                            overflow: elide;
+                        }
+                    }
+
+                    if Jam.linked: VerticalLayout {
+                        alignment: center;
+                        TextButton {
+                            height: 32px;
+                            text: "Play here";
+                            clicked => { Devices.choose(""); }
+                        }
+                    }
+                }
+
+                Rectangle {
+                    height: 1px;
+                    background: Theme.line;
+                }
+
+                HorizontalLayout {
+                    spacing: 12px;
+
+                    Text {
+                        text: Jam.hosting ? (Jam.guests.length == 0 ? "Hosting a jam. Waiting for guests." : Jam.guests.length == 1 ? "Hosting a jam with 1 guest" : "Hosting a jam with " + Jam.guests.length + " guests")
+                            : Jam.joined ? "In " + Jam.host + "'s jam"
+                            : "Listen with friends anywhere";
+                        color: Theme.muted;
+                        font-size: 13px;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                        wrap: word-wrap;
+                    }
+
+                    VerticalLayout {
+                        alignment: center;
+                        TextButton {
+                            height: 32px;
+                            text: Jam.hosting ? "Manage" : Jam.joined ? "Leave" : Jam.can-host ? "Start a jam" : "Join a jam";
+                            clicked => {
+                                if Jam.joined {
+                                    Jam.leave();
+                                } else {
+                                    Jam.opened();
+                                    Jam.open = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if Devices.list.length > 1: Text {
+            height: 28px;
+            text: "   Your devices";
+            color: Theme.muted;
+            font-size: 13px;
+            font-weight: 600;
+            vertical-alignment: center;
+        }
+
+        // Every device but the one named above.
+        for device in Devices.list: Rectangle {
+            height: device.active || Devices.list.length < 2 ? 0px : 56px;
+            clip: true;
+            if !device.active: DeviceRow {
+                device: device;
+                chosen => { Devices.choose(device.id); }
+            }
+        }
+
+        if Devices.list.length < 2: Text {
+            text: Devices.linked ? "Your other devices show up here when Nexus Music is open on them, signed in to the same account, with the same relay set up under Settings, Jam."
+                : "To play on your other devices from here, set up a relay on each of them under Settings, Jam, and leave “Link my devices” on.";
+            color: Theme.muted;
+            font-size: 13px;
+            wrap: word-wrap;
+            x: 12px;
+            width: parent.width - 40px;
+        }
+    }
+}
+
 // Something to press on the jam strip.
 component StripLink inherits Rectangle {
     in property <string> text;
@@ -1688,7 +1848,7 @@ export component PlayerBar inherits Rectangle {
                 }
             }
 
-            if !(Devices.linked && root.side < 264px): VerticalLayout {
+            if root.side >= 264px: VerticalLayout {
                 alignment: center;
                 IconButton {
                     icon: Icons.picture-in-picture-2;
@@ -1699,14 +1859,14 @@ export component PlayerBar inherits Rectangle {
                 }
             }
 
-            // Shown once this PC is linked up with the person's other devices.
-            if Devices.linked: VerticalLayout {
+            // Shows the devices in the side panel, in the queue's place.
+            VerticalLayout {
                 alignment: center;
                 IconButton {
                     icon: Icons.monitor-speaker;
                     icon-size: 17px;
                     active: Jam.linked || Devices.open;
-                    label: Jam.linked ? "Playing on " + Jam.device : "Play on another device";
+                    label: Jam.linked ? "Playing on " + Jam.device : "Connect to a device";
                     clicked => { Devices.open = !Devices.open; }
                 }
             }
@@ -1716,10 +1876,20 @@ export component PlayerBar inherits Rectangle {
                 IconButton {
                     icon: Icons.list-music;
                     icon-size: 17px;
-                    active: App.queue-open && root.queue-fits;
+                    active: App.queue-open && root.queue-fits && !Devices.open;
                     enabled: root.queue-fits;
                     label: root.queue-fits ? "Queue" : "Widen the window to show the queue";
-                    clicked => { App.set-queue-open(!App.queue-open); }
+                    clicked => {
+                        // With the devices in the panel, this brings the queue back to it.
+                        if Devices.open {
+                            Devices.open = false;
+                            if !App.queue-open {
+                                App.set-queue-open(true);
+                            }
+                        } else {
+                            App.set-queue-open(!App.queue-open);
+                        }
+                    }
                 }
             }
 
@@ -1736,7 +1906,7 @@ export component PlayerBar inherits Rectangle {
             VerticalLayout {
                 alignment: center;
                 Slider {
-                    width: clamp(root.side - (Devices.linked ? 218px : 184px), 60px, 110px);
+                    width: clamp(root.side - 218px, 60px, 110px);
                     value: Player.muted ? 0 : Player.volume;
                     label: "Volume";
                     moved(value) => { Player.set-volume(value); }

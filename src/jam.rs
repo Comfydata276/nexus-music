@@ -1898,7 +1898,6 @@ impl Controller {
     /// if music is playing here it carries on over there. This PC: what the other device
     /// was playing carries on here.
     fn pick_device(self: &Rc<Self>, id: &str) {
-        self.ui.global::<ui::Devices>().set_open(false);
         if id.is_empty() {
             return self.play_here();
         }

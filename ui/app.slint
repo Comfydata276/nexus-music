@@ -10,7 +10,7 @@ import { Theme } from "theme.slint";
 import { Icons } from "icons.slint";
 import { Drag, App, View, Player, Menu, Prompt, Toast, Lyrics, Settings, Covers, Page, Track, Card, CardKind, Shelf, Offer, CardRow, PlaylistRef, MenuEntry, LyricLine, QualityOption, ThemeOption, Search, Suggestion, Jam, JamGuest, JamSong, Devices, Device } from "types.slint";
 import { PageStatus, IconButton } from "widgets.slint";
-import { Sidebar, TopBar, QueuePanel, PlayerBar, SearchOverlay, JamStrip } from "chrome.slint";
+import { Sidebar, TopBar, QueuePanel, ConnectPanel, PlayerBar, SearchOverlay, JamStrip } from "chrome.slint";
 import { StackPage, TrackListPage, GridPage, LyricsPage, NowPlayingPage, SettingsPage, LoginPage, JamPage } from "pages.slint";
 import { MenuOverlay, PromptOverlay, ToastOverlay, JamOverlay, DevicesOverlay } from "overlays.slint";
 
@@ -280,7 +280,7 @@ export component MainWindow inherits Window {
         : self.tinted ? Covers.tint(View.cover, Covers.rev)
         : App.page == Page.home ? Theme.accent : Theme.panel;
     // The queue panel is on screen and showing what's coming up, so the keyboard can go to it.
-    property <bool> queue-usable: App.queue-open && self.width >= 1000px && App.queue-tab == 0 && Player.queue.length > 0;
+    property <bool> queue-usable: App.queue-open && !Devices.open && self.width >= 1000px && App.queue-tab == 0 && Player.queue.length > 0;
     // The Rust side bumps this after navigating, to take the keyboard back from the search box.
     property <int> focus-request: App.main-focus;
     changed focus-request => { keys.focus(); }
@@ -485,7 +485,8 @@ export component MainWindow inherits Window {
             property <length> top: 60px;
             property <length> side: clamp(root.width * 0.22, 220px, 300px);
             // The queue steps aside when the window is too narrow to leave the page room.
-            property <bool> queue-shown: App.queue-open && root.width >= 1000px;
+            // The panel at the side holds the queue, or the list of devices in its place.
+            property <bool> queue-shown: (App.queue-open || Devices.open) && root.width >= 1000px;
             property <length> queue: self.queue-shown ? clamp(root.width * 0.26, 280px, 360px) : 0px;
             property <length> body: root.height - self.bar - self.top;
 
@@ -547,7 +548,14 @@ export component MainWindow inherits Window {
                 }
             }
 
-            if self.queue-shown: QueuePanel {
+            if self.queue-shown && Devices.open: ConnectPanel {
+                x: root.width - parent.queue - parent.gap;
+                y: parent.top;
+                width: parent.queue;
+                height: parent.body;
+            }
+
+            if self.queue-shown && !Devices.open: QueuePanel {
                 x: root.width - parent.queue - parent.gap;
                 y: parent.top;
                 width: parent.queue;
@@ -614,7 +622,8 @@ export component MainWindow inherits Window {
 
         if Jam.open && App.signed-in: JamOverlay { }
 
-        if Devices.open && App.signed-in: DevicesOverlay {
+        // In a window too narrow for the side panel, the devices are listed over the corner.
+        if Devices.open && App.signed-in && root.width < 1000px: DevicesOverlay {
             lift: 96px + (Jam.hosting || Jam.joined || Jam.linked ? 32px : 0px);
         }
 
