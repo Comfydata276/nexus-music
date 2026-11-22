@@ -1,0 +1,6 @@
+# Only what the relay is built from is sent to Docker: not the app's build output.
+*
+!assets/app-icon.png
+!relay
+relay/target
+relay/Dockerfile*

@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0811">
+<meta name="robots" content="noindex">
+<title>Jam · Nexus Music</title>
+<link rel="icon" href="{root}icon.png">
+<link rel="apple-touch-icon" href="{root}icon.png">
+<link rel="stylesheet" href="{root}app.css">
+<script src="{root}app.js" defer></script>
+</head>
+<body data-root="{root}">
+
+<!-- Shown before joining, and when there's no jam to show. -->
+<section id="gate" class="gate" hidden>
+  <img class="mark" src="{root}icon.png" alt="" width="56" height="56">
+  <h1 id="gate-title"></h1>
+  <p id="gate-text"></p>
+  <form id="join" hidden>
+    <label for="name">Your name</label>
+    <input id="name" name="name" type="text" maxlength="24" autocomplete="nickname" enterkeyhint="go" required>
+    <button id="join-button" class="primary" type="submit">Join the jam</button>
+    <p class="tip">Have Nexus Music on this PC? You can join from there too: copy this page's address and paste it under Jam.</p>
+  </form>
+</section>
+
+<div id="jam" class="jam" hidden>
+  <header class="top">
+    <div class="top-words">
+      <p class="eyebrow">Jam</p>
+      <h1 id="host"></h1>
+    </div>
+    <button id="people" class="chip" type="button" aria-expanded="false" aria-controls="people-list">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 21a8 8 0 0 0-16 0"/><circle cx="10" cy="8" r="5"/><path d="M22 20c0-3.37-2-6.5-4-8a5 5 0 0 0-.45-8.3"/></svg>
+      <span id="people-count"></span>
+    </button>
+  </header>
+  <ul id="people-list" class="people" hidden></ul>
+  <p id="notice" class="notice" role="status" hidden></p>
+
+  <div class="columns">
+    <section class="now" aria-label="Now playing">
+      <div class="art"><img id="now-art" alt="" hidden></div>
+      <div class="now-words">
+        <p id="now-title" class="now-title"></p>
+        <p id="now-artist" class="now-artist"></p>
+      </div>
+      <div id="progress" class="progress" hidden>
+        <div class="bar"><div id="bar-fill" class="bar-fill"></div></div>
+        <div class="times"><span id="time-at"></span><span id="time-all"></span></div>
+      </div>
+      <div id="controls" class="controls" hidden>
+        <button id="toggle" class="round primary" type="button" aria-label="Pause"></button>
+        <button id="skip" class="round" type="button" aria-label="Skip this song">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path class="solid" d="M5 4.5v15a1 1 0 0 0 1.55.83L17 13.2V19a1.25 1.25 0 0 0 2.5 0V5A1.25 1.25 0 0 0 17 5v5.8L6.55 3.67A1 1 0 0 0 5 4.5Z"/></svg>
+        </button>
+      </div>
+      <p id="controls-note" class="hint" hidden></p>
+    </section>
+
+    <section class="side">
+      <div class="search">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.6-3.6"/></svg>
+        <input id="query" type="search" placeholder="Find a song to add" autocomplete="off" autocapitalize="none" spellcheck="false" enterkeyhint="search" aria-label="Find a song to add">
+        <button id="clear" class="plain" type="button" aria-label="Clear the search" hidden>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+        </button>
+      </div>
+      <h2 id="list-title" class="list-title"></h2>
+      <ul id="list" class="songs"></ul>
+      <p id="list-note" class="hint" hidden></p>
+    </section>
+  </div>
+</div>
+
+<p id="toast" class="toast" role="status" hidden></p>
+<noscript><p class="gate">This page needs JavaScript to show the jam.</p></noscript>
+</body>
+</html>

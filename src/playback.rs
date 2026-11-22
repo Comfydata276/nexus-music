@@ -889,6 +889,23 @@ impl Controller {
         self.next_changed();
     }
 
+    /// Adds a song `offset` places after the current track (or last, if that's past the end).
+    pub fn enqueue_after(self: &Rc<Self>, song: Song, offset: usize) {
+        if self.playback.borrow().order.is_empty() {
+            return self.enqueue(vec![song], false);
+        }
+        {
+            let mut pb = self.playback.borrow_mut();
+            let at = (pb.cursor + 1 + offset).min(pb.order.len());
+            pb.queue.push(song);
+            let index = pb.queue.len() - 1;
+            pb.order.insert(at, index);
+            let entries = pb.queue.len();
+            pb.origins.resize(entries, None);
+        }
+        self.next_changed();
+    }
+
     /// Removes the entry `offset` places after the current track.
     pub fn remove_upcoming(self: &Rc<Self>, offset: usize) {
         {
@@ -1226,6 +1243,7 @@ impl Controller {
     /// next track and follows the lyrics.
     pub fn tick(self: &Rc<Self>) {
         self.check_sleep();
+        self.jam_tick();
         self.tick_downloads();
         // Every few seconds while there's a queue, see that the next songs are on hand.
         let keep_ticks = self.keep_ticks.get() + 1;
@@ -1644,6 +1662,8 @@ impl Controller {
     }
 
     pub fn sync_queue(self: &Rc<Self>) {
+        // In a jam hosted here, songs guests added say who added them.
+        let added_by = self.jam.borrow().added_by();
         let pb = self.playback.borrow();
         let rows: Vec<ui::Track> = pb
             .order
@@ -1651,7 +1671,13 @@ impl Controller {
             .skip(pb.cursor + 1)
             .take(QUEUE_ROWS)
             .filter_map(|&i| pb.queue.get(i))
-            .map(|song| self.track_row(song))
+            .map(|song| {
+                let mut row = self.track_row(song);
+                if let Some(name) = added_by.get(&song.id) {
+                    row.by = name.as_str().into();
+                }
+                row
+            })
             .collect();
         drop(pb);
         self.up_next_model.set_vec(rows.iter().take(UP_NEXT_ROWS).cloned().collect::<Vec<_>>());

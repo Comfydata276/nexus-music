@@ -1,6 +1,6 @@
 [package]
 name = "nexus-music"
-version = "0.36.1"
+version = "0.37.0"
 edition = "2024"
 description = "A fast native music player for Navidrome"
 publish = false
@@ -28,6 +28,7 @@ fastrand = "2"
 fs4 = { version = "0.13", default-features = false, features = ["sync"] }
 getrandom = "0.3"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+qrcode = { version = "0.14", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 souvlaki = { version = "0.9", default-features = false }

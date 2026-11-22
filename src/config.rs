@@ -186,6 +186,14 @@ pub struct Settings {
     pub lidarr_gate_client: String,
     /// Who is signed in there, for showing. The token itself is kept with the passwords.
     pub lidarr_signed_in: String,
+    /// Hosting jams is switched on, and the relay they're hosted at. (The host key for it is
+    /// kept with the account password, not here.)
+    pub jam_host: bool,
+    pub jam_relay: String,
+    /// The name to go by in jams; empty for the account's name.
+    pub jam_name: String,
+    /// Guests in a jam hosted here may pause and skip.
+    pub jam_guests_control: bool,
     /// Share the queue, pins and so on with the app on other devices.
     pub sync: bool,
     /// A made-up name for this device, so it can tell its own saved queue from others'.
@@ -251,6 +259,10 @@ impl Default for Settings {
             lidarr_gate: String::new(),
             lidarr_gate_client: String::new(),
             lidarr_signed_in: String::new(),
+            jam_host: false,
+            jam_relay: String::new(),
+            jam_name: String::new(),
+            jam_guests_control: true,
             sync: true,
             device_id: String::new(),
             sync_playlist: String::new(),

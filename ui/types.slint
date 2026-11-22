@@ -1,6 +1,6 @@
 // Data passed between the Rust side and the interface.
 
-export enum Page { home, search, tracklist, artist, grid, settings, lyrics, now-playing }
+export enum Page { home, search, tracklist, artist, grid, settings, lyrics, now-playing, jam }
 
 export enum CardKind { album, artist, playlist, genre, mix, request, outside-artist }
 
@@ -31,6 +31,8 @@ export struct Track {
     selected: bool,
     // Can't be played right now: the app is offline and the song isn't downloaded.
     unavailable: bool,
+    // In the queue of a jam hosted here: the guest who added the song. Empty otherwise.
+    by: string,
 }
 
 export struct Card {
@@ -453,6 +455,88 @@ export global Prompt {
     callback dismissed();
 }
 
+// Someone who has joined a jam hosted here.
+export struct JamGuest {
+    id: string,
+    name: string,
+}
+
+// A song in a jam this PC has joined: one that's queued, or one found in the host's library.
+export struct JamSong {
+    id: string,
+    title: string,
+    // Who it's by and, for one that was searched for, the album it's on.
+    about: string,
+    cover: string,
+    duration: string,
+    // Who added it, in words ("added by Sam"); empty if nobody in the jam did.
+    by: string,
+    // What can be done with it: 0 nothing, 1 add it, 2 it's being added, 3 it's already
+    // queued, 4 take it out again (this guest added it).
+    action: int,
+}
+
+// A jam: several people adding to one queue. `hosting` is one started here, where the music
+// plays; `joined` is someone else's, steered from here.
+export global Jam {
+    // The window for starting or joining a jam, and for looking after one hosted here.
+    in-out property <bool> open;
+    callback opened();
+    // The name this person goes by in jams.
+    in property <string> name;
+    // A jam is being started or joined.
+    in property <bool> busy;
+    // Why the last start or join didn't work; empty if it did.
+    in property <string> problem;
+
+    // Hosting is switched on in Settings and a relay is on file.
+    in property <bool> can-host;
+    in property <bool> hosting;
+    // What friends open to join, and the same as a QR code.
+    in property <string> link;
+    in property <image> qr;
+    in property <[JamGuest]> guests;
+    // Guests may pause and skip.
+    in property <bool> guests-control;
+    // Trouble reaching the relay, in words; empty when there's none.
+    in property <string> status;
+    // `name` is what's in the name box, which may have been changed.
+    callback start(name: string);
+    callback end();
+    callback remove-guest(id: string);
+    callback set-guests-control(on: bool);
+
+    in property <bool> joined;
+    in property <string> host;
+    // Who else is there, as a sentence.
+    in property <string> with;
+    // Something the guest should know (the host's app has gone quiet); empty for nothing.
+    in property <string> notice;
+    in property <bool> has-track;
+    in property <string> title;
+    in property <string> artist;
+    in property <string> cover;
+    in property <float> position;
+    in property <float> duration;
+    in property <bool> playing;
+    // The host lets guests pause and skip.
+    in property <bool> control;
+    in property <[JamSong]> queue;
+    // How many more songs are queued after the ones listed.
+    in property <int> more;
+    // What's typed in the search box, and what the host's library has for it.
+    in-out property <string> query;
+    in property <bool> searched;
+    in property <[JamSong]> results;
+    callback join(link: string, name: string);
+    callback leave();
+    callback search(text: string);
+    callback add(id: string);
+    callback remove(id: string);
+    callback toggle();
+    callback skip();
+}
+
 export global Toast {
     in property <bool> visible;
     in property <string> text;
@@ -613,6 +697,17 @@ export global Settings {
     callback sign-in-requests();
     callback cancel-sign-in();
     callback sign-out-requests();
+    // Hosting jams: switched on, the relay on file ("jam.example.org", empty for none), and
+    // where the connection to it stands: "none", "checking", "connected" or "error", with
+    // the same in words.
+    in property <bool> jam-host;
+    in property <string> jam-relay;
+    in property <string> jam-state: "none";
+    in property <string> jam-status;
+    callback set-jam-host(on: bool);
+    // Keeps a host link (the relay's address and its key) and checks it.
+    callback save-jam-link(link: string);
+    callback check-jam();
     callback check-updates-now();
     callback save-diagnostics();
     callback install-update();

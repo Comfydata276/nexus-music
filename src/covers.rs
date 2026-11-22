@@ -291,6 +291,12 @@ pub fn ensure_file(client: &Client, dir: &Path, id: &str) -> Option<PathBuf> {
     cover_file(client, dir, id, MEDIUM).map(|(_, path)| path)
 }
 
+/// A cover's file as the server sent it, for passing on to someone else: at the size the
+/// big artwork uses when `large`, otherwise at the size rows are cut from.
+pub fn file_bytes(client: &Client, dir: &Path, id: &str, large: bool) -> Option<Vec<u8>> {
+    cover_file(client, dir, id, if large { LARGE } else { MEDIUM }).map(|(bytes, _)| bytes)
+}
+
 /// A representative colour for the artwork, weighted towards its vivid pixels and adjusted so
 /// white text stays readable on top of it.
 fn dominant_colour(image: &image::RgbaImage) -> [u8; 3] {

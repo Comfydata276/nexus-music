@@ -31,6 +31,7 @@ What's planned next is in the [roadmap](ROADMAP.md).
 - Keeps songs ready: each song is kept on this PC once it has played, and the next few in the queue are fetched ahead of time, so the music carries on through a dropped connection and replays start at once. You choose how much space that may take (2 GB unless changed), which folder it's in, and how far ahead to fetch; the songs played longest ago make way when it fills.
 - Rides out a bad connection: a stream that stops arriving is asked for again from where it stopped, usually before the audio in hand runs out. If the server can't be reached at all the song waits where it is, the player says it's reconnecting, and the music carries on from the same place when the server is back. Skipping, stopping and seeking still act at once while a stream is stuck.
 - Playing a song from a search starts its radio: that song, then others like it.
+- Jams: one queue that friends add to while the music plays on your PC. They join from a link, in a browser (a phone works) or in Nexus Music on their own PC under Jam, and from there see what's playing, search your library, add songs and take their own back out. You choose whether they may pause and skip, see who's there, and can remove anyone. The queue shows who added what. Joining a jam needs nothing set up; hosting one is off until you switch it on, and needs a small relay service (see below).
 - Keeps your devices in step: the queue and your place in it, Recently played, pinned playlists, each list's shuffle and sort, the dates songs were added and the theme follow you to the app on another PC. The queue uses the server's saved-queue feature; the rest is kept in the comment of a playlist named "Nexus Music sync". When another PC has been playing in the last half hour, the queue panel offers "Continue here", which picks its queue up where it had got to. The plays behind "Your stats" are shared too, so the last four weeks and six months cover every PC.
 - Select several songs with Ctrl or Shift, then drag them onto a playlist or the queue, or
   right-click to act on them all.
@@ -131,6 +132,70 @@ Authentik needs three things set up once:
    Lidarr's host. With that header passed, Authentik also accepts tokens made from a user's
    app password for that host, so only do this where that is acceptable.
 
+### Jams
+
+A jam's music plays on the host's PC. Everyone else steers: what a guest adds goes after the
+song that's playing, behind anything guests have already lined up, so songs play in the order
+they were added. A song that's already in the queue isn't added twice, and the first song
+added to an empty queue starts the music.
+
+Guests don't sign in to your music server and are never given its address or your sign-in.
+What they search for is looked up by your copy of the app, in its own copy of the library,
+and covers are passed on by it. No audio is sent to them.
+
+**Joining.** Click Jam in the sidebar, paste the link the host sent, and press Join. The jam
+gets a page of its own, where the search box looks in the host's library. Someone without the
+app opens the same link in a browser.
+
+**Hosting.** A PC at home can't be reached from a phone on mobile data, so the app and the
+guests meet at a relay: a small service you run somewhere that can be reached, such as beside
+your music server. The app connects out to it; nothing has to be opened on your PC or your
+router for the app itself. Once the relay is running:
+
+1. In Settings, under Jam, switch on "Host jams".
+2. Paste the relay's host link and press Connect. The link is the relay's address with a key
+   after a `#`; the relay prints it when it starts. The key is kept with your password
+   (Windows Credential Manager), not in the settings file, and is only ever sent to that relay.
+3. Click Jam in the sidebar and "Start a jam". Send friends the link, or have them scan the code.
+
+A jam ends when you end it, when the app closes, or half an hour after the app loses touch
+with the relay.
+
+**Running the relay.** It is one small program in a container, keeps nothing on disk, and
+holds jams in memory only: restarting it ends any jam in progress.
+
+```sh
+docker run -d --name nexus-music-jam --restart unless-stopped -p 8080:8080 \
+  -e JAM_HOST_KEY="$(openssl rand -hex 24)" \
+  -e JAM_PUBLIC_URL=https://jam.example.org \
+  ghcr.io/comfydata276/nexus-music-jam:latest
+docker logs nexus-music-jam    # prints the host link
+```
+
+| Setting | What it's for |
+|---|---|
+| `JAM_HOST_KEY` | What a copy of the app must show to start a jam: at least 16 characters, and worth making long and random. Without it the relay makes one up each time it starts, so the host link changes on every restart. |
+| `JAM_PUBLIC_URL` | The address people reach the relay at. Only used to print the whole host link in the log. |
+| `JAM_LISTEN` | Where it listens inside the container; `0.0.0.0:8080` unless set. |
+| `JAM_MAX_JAMS` | How many jams may run at once; 5 unless set. |
+
+Put it behind the reverse proxy you already use, on an address of its own (or under a path),
+with HTTPS. Three things matter there:
+
+- Nothing may ask for a sign-in in front of it. Guests have no account anywhere; the jam's
+  link, which is long and random, is what lets them in. The host key is what stops anyone
+  else starting jams.
+- It holds requests open for up to 20 seconds on purpose, waiting for something to say. A
+  proxy that gives up on a quiet request sooner than that needs its read timeout raised.
+- The `Authorization` header must be passed through to it.
+
+The app refuses a host link or jam link that starts with `http://` unless it points at your
+own network, since the key travels with every request.
+
+The image is built and published by `.github/workflows/relay.yml` when the relay changes. To
+build it yourself: `docker build -f relay/Dockerfile -t nexus-music-jam .` from the top of
+this repository.
+
 ## Installing
 
 Download `NexusMusic-Setup-<version>.exe` from the
@@ -156,6 +221,7 @@ scripts/package-windows     # Windows .exe and installer, into dist/
 scripts/check               # compile for Linux and print diagnostics
 scripts/dx cargo test       # unit tests
 scripts/release notes.md    # build and publish a GitHub release (bump Cargo.toml and push first)
+scripts/dx cargo test --manifest-path relay/Cargo.toml    # the jam relay's tests
 ```
 
 Every push to GitHub is compiled and tested there as well (`.github/workflows/check.yml`).
@@ -230,6 +296,8 @@ connection.
 | `src/bulk.rs` | Asks Lidarr for many albums at once: finds each, hands them over an artist at a time, and checks what Lidarr made of them. |
 | `src/musicbrainz.rs` | Finds songs, discographies and track lists for music that isn't in the library. |
 | `src/gate.rs` | Browser sign-in for a Lidarr that sits behind Authentik. |
+| `src/jam.rs` | Jams: hosting one through a relay, and joining someone else's. |
+| `relay/` | The jam relay: a separate small program (its own `Cargo.toml`) with the page guests without the app use. |
 | `src/update.rs` | Finds, downloads and verifies new releases. |
 | `src/lyrics.rs` | The server's lyrics, kept so they show at once. |
 | `src/plays.rs` | The log of plays behind "Your stats". |

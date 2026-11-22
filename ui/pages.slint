@@ -3,7 +3,7 @@
 import { ScrollView, ListView, AboutSlint } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { Icons } from "icons.slint";
-import { App, View, Player, Lyrics, Settings, Covers, Card, CardKind, Shelf, Offer, Page, QualityOption, ThemeOption, Track } from "types.slint";
+import { App, View, Player, Lyrics, Settings, Covers, Card, CardKind, Shelf, Offer, Page, QualityOption, ThemeOption, Track, Jam, JamSong } from "types.slint";
 import { Icon, IconButton, PlayButton, TextButton, LinkText, Cover, Field, Toggle, Chip, Segmented, Select, Slider, MediaCard, TrackRow, PageStatus, HoverIntent, SkeletonRows, ScrollThumb } from "widgets.slint";
 
 // Cover, title and summary at the top of an album, playlist or artist.
@@ -2029,7 +2029,7 @@ export component SettingsPage inherits Rectangle {
             spacing: 6px;
             alignment: start;
 
-            for name[index] in ["Appearance", "Playback", "Sound", "Storage", "Requests", "Account", "About"]: VerticalLayout {
+            for name[index] in ["Appearance", "Playback", "Sound", "Storage", "Requests", "Jam", "Account", "About"]: VerticalLayout {
                 alignment: center;
                 Chip {
                     text: name;
@@ -2580,8 +2580,114 @@ export component SettingsPage inherits Rectangle {
                         }
                     }
 
-                    // ---- Account ----
+                    // ---- Jam ----
                     if Settings.tab == 5: VerticalLayout {
+                        SettingRow {
+                            title: "Host jams";
+                            detail: "A jam is one queue that friends add to while the music plays on this PC. They join from a link, in a browser or in Nexus Music. Hosting needs a jam relay: a small service you run beside your music server, which is what lets friends reach the jam from wherever they are. Joining someone else's jam needs none of this.";
+                            Toggle {
+                                on: Settings.jam-host;
+                                label: "Host jams";
+                                toggled(on) => { Settings.set-jam-host(on); }
+                            }
+                        }
+
+                        if Settings.jam-host: SettingNest {
+                            jam-box := VerticalLayout {
+                                function connect() {
+                                    if jam-link.text != "" {
+                                        Settings.save-jam-link(jam-link.text);
+                                        jam-link.text = "";
+                                    }
+                                }
+                                spacing: 12px;
+
+                                VerticalLayout {
+                                    spacing: 6px;
+
+                                    Text {
+                                        text: "Host link";
+                                        color: Theme.text;
+                                        font-size: 13px;
+                                        font-weight: 600;
+                                    }
+
+                                    jam-link := Field {
+                                        input-type: InputType.password;
+                                        placeholder: Settings.jam-relay != "" ? "The link for " + Settings.jam-relay + " is on file" : "https://jam.example.org/#key";
+                                        placeholder-ink: Settings.jam-relay != "" ? Theme.muted : Theme.faint;
+                                        label: "Host link";
+                                        accepted => { jam-box.connect(); }
+                                    }
+
+                                    Text {
+                                        text: "The relay prints this link when it starts. It ends with a key, so treat it like a password: this PC keeps the key where it keeps your password, not in its settings file.";
+                                        color: Theme.muted;
+                                        font-size: 13px;
+                                        wrap: word-wrap;
+                                    }
+                                }
+
+                                // Where things stand, and the one thing to do next.
+                                Rectangle {
+                                    background: Theme.raised;
+                                    border-radius: 10px;
+                                    border-width: 1px;
+                                    border-color: Theme.line;
+
+                                    HorizontalLayout {
+                                        padding: 14px;
+                                        padding-left: 16px;
+                                        spacing: 12px;
+
+                                        VerticalLayout {
+                                            alignment: center;
+
+                                            Rectangle {
+                                                width: 10px;
+                                                height: 10px;
+                                                border-radius: 5px;
+                                                background: Settings.jam-state == "connected" ? #4cc38a
+                                                    : Settings.jam-state == "error" ? Theme.danger
+                                                    : Settings.jam-state == "none" ? Theme.faint
+                                                    : Theme.warm;
+                                                animate background { duration: 150ms; }
+                                            }
+                                        }
+
+                                        Text {
+                                            text: Settings.jam-status;
+                                            color: Theme.text;
+                                            font-size: 14px;
+                                            font-weight: 500;
+                                            wrap: word-wrap;
+                                            vertical-alignment: center;
+                                            horizontal-stretch: 1;
+                                        }
+
+                                        VerticalLayout {
+                                            alignment: center;
+
+                                            if jam-link.text != "" || Settings.jam-state == "none": TextButton {
+                                                text: "Connect";
+                                                primary: true;
+                                                enabled: jam-link.text != "";
+                                                clicked => { jam-box.connect(); }
+                                            }
+
+                                            if jam-link.text == "" && Settings.jam-state == "error": TextButton {
+                                                text: "Try again";
+                                                clicked => { Settings.check-jam(); }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // ---- Account ----
+                    if Settings.tab == 6: VerticalLayout {
                         SettingRow {
                             title: App.server;
                             detail: "Signed in as " + App.username + (App.server-version != "" ? ", Navidrome " + App.server-version : "") + (Settings.connection != "" ? ". " + Settings.connection : "");
@@ -2612,7 +2718,7 @@ export component SettingsPage inherits Rectangle {
                     }
 
                     // ---- About ----
-                    if Settings.tab == 6: VerticalLayout {
+                    if Settings.tab == 7: VerticalLayout {
                         SettingRow {
                             title: "Nexus Music " + App.app-version;
                             detail: Settings.update-status;
@@ -2678,6 +2784,445 @@ export component SettingsPage inherits Rectangle {
         content-y <=> scroll.content-y;
         content-height: scroll.content-height;
         visible-height: scroll.visible-height;
+    }
+}
+
+// One song on the jam page: queued, or found in the host's library.
+component JamRow inherits Rectangle {
+    in property <JamSong> song;
+    callback acted;
+
+    height: 60px;
+    border-radius: 6px;
+    background: touch.has-hover ? Theme.hover : transparent;
+
+    accessible-role: list-item;
+    accessible-label: self.song.title + ", " + self.song.about + (self.song.by != "" ? ", " + self.song.by : "");
+
+    touch := TouchArea {
+        // Double-clicking a song that was searched for adds it, as it would play one elsewhere.
+        double-clicked => {
+            if root.song.action == 1 {
+                root.acted();
+            }
+        }
+    }
+
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 8px;
+        spacing: 12px;
+
+        VerticalLayout {
+            alignment: center;
+            Cover {
+                width: 44px;
+                height: 44px;
+                art: root.song.cover;
+                detail: 44px;
+            }
+        }
+
+        VerticalLayout {
+            alignment: center;
+            spacing: 3px;
+            horizontal-stretch: 1;
+            min-width: 60px;
+            preferred-width: 0px;
+
+            Text {
+                text: root.song.title;
+                color: Theme.text;
+                font-size: 15px;
+                font-weight: 500;
+                overflow: elide;
+            }
+
+            HorizontalLayout {
+                spacing: 6px;
+                alignment: start;
+
+                Text {
+                    text: root.song.about;
+                    color: Theme.muted;
+                    font-size: 13px;
+                    overflow: elide;
+                }
+
+                if root.song.by != "": Text {
+                    text: "• " + root.song.by;
+                    color: Theme.accent-bright;
+                    font-size: 13px;
+                    overflow: elide;
+                }
+            }
+        }
+
+        Text {
+            text: root.song.duration;
+            color: Theme.muted;
+            font-size: 13px;
+            vertical-alignment: center;
+        }
+
+        VerticalLayout {
+            alignment: center;
+            width: 32px;
+
+            if root.song.action == 1 || root.song.action == 2: IconButton {
+                icon: Icons.plus;
+                tint: Theme.text;
+                enabled: root.song.action == 1;
+                label: root.song.action == 1 ? "Add to the jam" : "Adding…";
+                clicked => { root.acted(); }
+            }
+
+            if root.song.action == 3: Icon {
+                x: (parent.width - self.width) / 2;
+                source: Icons.check;
+                tint: Theme.accent-bright;
+                accessible-role: text;
+                accessible-label: "In the queue";
+            }
+
+            if root.song.action == 4: IconButton {
+                icon: Icons.x;
+                label: "Take it out of the queue";
+                clicked => { root.acted(); }
+            }
+        }
+    }
+}
+
+// The jam this PC has joined: what the host is playing, what's queued, and the host's
+// library to add from.
+export component JamPage inherits Rectangle {
+    property <length> column: min(self.width - 2 * Theme.page-pad, 760px);
+    property <length> edge: (self.width - self.column) / 2;
+    property <float> progress: Jam.duration > 0 ? clamp(Jam.position / Jam.duration, 0, 1) : 0;
+
+    if !Jam.joined: VerticalLayout {
+        alignment: center;
+        padding: 48px;
+        spacing: 10px;
+
+        HorizontalLayout {
+            alignment: center;
+            padding-bottom: 8px;
+            Rectangle {
+                width: 72px;
+                height: 72px;
+                border-radius: 36px;
+                background: Theme.raised;
+                Icon {
+                    source: Icons.party-popper;
+                    size: 30px;
+                    tint: Theme.faint;
+                }
+            }
+        }
+
+        Text {
+            text: "You're not in a jam";
+            color: Theme.text;
+            font-family: Theme.display;
+            font-size: 26px;
+            font-weight: 700;
+            horizontal-alignment: center;
+        }
+
+        Text {
+            text: "Join one with the link its host sent you.";
+            color: Theme.muted;
+            font-size: 14px;
+            horizontal-alignment: center;
+        }
+
+        HorizontalLayout {
+            alignment: center;
+            padding-top: 10px;
+            TextButton {
+                text: "Join a jam";
+                primary: true;
+                clicked => {
+                    Jam.opened();
+                    Jam.open = true;
+                }
+            }
+        }
+    }
+
+    if Jam.joined: Rectangle {
+        scroll := ScrollView {
+            vertical-scrollbar-policy: always-off;
+            horizontal-scrollbar-policy: always-off;
+
+            VerticalLayout {
+                width: scroll.visible-width;
+                alignment: start;
+
+                HorizontalLayout {
+                    alignment: center;
+
+                    VerticalLayout {
+                        width: root.column;
+                        alignment: start;
+                        padding-top: 8px;
+                        padding-bottom: 56px;
+                        spacing: 16px;
+
+                        // Whose jam, who's in it, and the way out.
+                        HorizontalLayout {
+                            spacing: 16px;
+
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                spacing: 4px;
+
+                                Text {
+                                    text: "JAM";
+                                    color: Theme.accent-bright;
+                                    font-size: 12px;
+                                    font-weight: 700;
+                                }
+
+                                Text {
+                                    text: Jam.host + "'s jam";
+                                    color: Theme.text;
+                                    font-family: Theme.display;
+                                    font-size: 34px;
+                                    font-weight: 800;
+                                    overflow: elide;
+                                }
+
+                                Text {
+                                    text: Jam.with;
+                                    color: Theme.muted;
+                                    font-size: 14px;
+                                    wrap: word-wrap;
+                                }
+                            }
+
+                            VerticalLayout {
+                                alignment: center;
+                                TextButton {
+                                    text: "Leave jam";
+                                    clicked => { Jam.leave(); }
+                                }
+                            }
+                        }
+
+                        if Jam.notice != "": Rectangle {
+                            height: notice.preferred-height + 24px;
+                            border-radius: 10px;
+                            background: Theme.warm.with-alpha(0.12);
+                            border-width: 1px;
+                            border-color: Theme.warm.with-alpha(0.3);
+
+                            notice := Text {
+                                x: 14px;
+                                width: parent.width - 28px;
+                                text: Jam.notice;
+                                color: Theme.warm;
+                                font-size: 14px;
+                                wrap: word-wrap;
+                            }
+                        }
+
+                        // What the host is playing.
+                        Rectangle {
+                            height: 132px;
+                            border-radius: 12px;
+                            background: Theme.raised;
+
+                            HorizontalLayout {
+                                padding: 16px;
+                                spacing: 16px;
+
+                                Cover {
+                                    width: 100px;
+                                    height: 100px;
+                                    art: Jam.cover;
+                                    detail: 320px;
+                                }
+
+                                VerticalLayout {
+                                    alignment: center;
+                                    spacing: 6px;
+                                    horizontal-stretch: 1;
+                                    min-width: 80px;
+                                    preferred-width: 0px;
+
+                                    Text {
+                                        text: Jam.has-track ? Jam.title : "Nothing is playing yet";
+                                        color: Theme.text;
+                                        font-family: Theme.display;
+                                        font-size: 22px;
+                                        font-weight: 700;
+                                        overflow: elide;
+                                    }
+
+                                    Text {
+                                        text: Jam.has-track ? Jam.artist : "Add a song to get it started.";
+                                        color: Theme.muted;
+                                        font-size: 14px;
+                                        overflow: elide;
+                                    }
+
+                                    if Jam.has-track: HorizontalLayout {
+                                        padding-top: 6px;
+                                        spacing: 10px;
+
+                                        Text {
+                                            text: Player.clock(Jam.position);
+                                            color: Theme.muted;
+                                            font-size: 12px;
+                                            vertical-alignment: center;
+                                        }
+
+                                        VerticalLayout {
+                                            alignment: center;
+                                            horizontal-stretch: 1;
+                                            Rectangle {
+                                                height: 4px;
+                                                border-radius: 2px;
+                                                background: #ffffff24;
+                                                Rectangle {
+                                                    x: 0;
+                                                    width: parent.width * root.progress;
+                                                    height: 4px;
+                                                    border-radius: 2px;
+                                                    background: Theme.accent-bright;
+                                                }
+                                            }
+                                        }
+
+                                        Text {
+                                            text: Player.clock(Jam.duration);
+                                            color: Theme.muted;
+                                            font-size: 12px;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                }
+
+                                if Jam.has-track && Jam.control: HorizontalLayout {
+                                    spacing: 4px;
+
+                                    VerticalLayout {
+                                        alignment: center;
+                                        PlayButton {
+                                            size: 48px;
+                                            playing: Jam.playing;
+                                            label: Jam.playing ? "Pause the jam" : "Play the jam";
+                                            clicked => { Jam.toggle(); }
+                                        }
+                                    }
+
+                                    VerticalLayout {
+                                        alignment: center;
+                                        IconButton {
+                                            icon: Icons.next-fill;
+                                            tint: Theme.text;
+                                            label: "Skip this song";
+                                            clicked => { Jam.skip(); }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if Jam.has-track && !Jam.control: Text {
+                            text: Jam.host + " is choosing what plays. You can still add songs.";
+                            color: Theme.faint;
+                            font-size: 13px;
+                            wrap: word-wrap;
+                        }
+
+                        // Looks in the host's library, not this PC's.
+                        HorizontalLayout {
+                            spacing: 8px;
+
+                            Field {
+                                text <=> Jam.query;
+                                placeholder: "Find a song in " + Jam.host + "'s library to add";
+                                label: "Find a song to add";
+                                horizontal-stretch: 1;
+                                edited => { Jam.search(self.text); }
+                            }
+
+                            if Jam.query != "": VerticalLayout {
+                                alignment: center;
+                                IconButton {
+                                    icon: Icons.x;
+                                    label: "Clear the search";
+                                    clicked => {
+                                        Jam.query = "";
+                                        Jam.search("");
+                                    }
+                                }
+                            }
+                        }
+
+                        VerticalLayout {
+                            spacing: 2px;
+
+                            Text {
+                                height: 28px;
+                                text: Jam.query != "" ? "Songs" : "Up next";
+                                color: Theme.muted;
+                                font-size: 13px;
+                                font-weight: 600;
+                                vertical-alignment: center;
+                            }
+
+                            if Jam.query != "": VerticalLayout {
+                                for song in Jam.results: JamRow {
+                                    song: song;
+                                    acted => { Jam.add(song.id); }
+                                }
+
+                                if Jam.searched && Jam.results.length == 0: Text {
+                                    text: "Nothing in " + Jam.host + "'s library matches that.";
+                                    color: Theme.faint;
+                                    font-size: 14px;
+                                }
+                            }
+
+                            if Jam.query == "": VerticalLayout {
+                                for song in Jam.queue: JamRow {
+                                    song: song;
+                                    acted => { Jam.remove(song.id); }
+                                }
+
+                                if Jam.queue.length == 0: Text {
+                                    text: "Nothing is queued. Find a song above to add one.";
+                                    color: Theme.faint;
+                                    font-size: 14px;
+                                }
+
+                                if Jam.more > 0: Text {
+                                    height: 36px;
+                                    text: "And " + Jam.more + " more after these.";
+                                    color: Theme.faint;
+                                    font-size: 14px;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        ScrollThumb {
+            x: parent.width - self.width;
+            y: 0;
+            height: parent.height;
+            content-y <=> scroll.content-y;
+            content-height: scroll.content-height;
+            visible-height: scroll.visible-height;
+        }
     }
 }
 

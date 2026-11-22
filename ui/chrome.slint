@@ -3,7 +3,7 @@
 import { ListView } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { Icons } from "icons.slint";
-import { App, Player, View, CardKind, PlaylistRef, Page, Track, Drag, Search, Suggestion } from "types.slint";
+import { App, Player, View, CardKind, PlaylistRef, Page, Track, Drag, Search, Suggestion, Jam } from "types.slint";
 import { Icon, IconButton, Cover, Slider, LinkText, PlayButton, HoverIntent, ScrollThumb, Reorder, TextButton } from "widgets.slint";
 
 // Rows stop `gutter` short of a list's right edge, leaving the scrollbar a lane of its own.
@@ -17,6 +17,8 @@ component NavItem inherits Rectangle {
     in property <image> icon;
     in property <string> text;
     in property <bool> selected;
+    // Something is going on behind it (a jam is running): drawn in the accent colour.
+    in property <bool> lit;
     callback clicked;
 
     height: 40px;
@@ -43,13 +45,13 @@ component NavItem inherits Rectangle {
             Icon {
                 source: root.icon;
                 size: 20px;
-                tint: root.selected || touch.has-hover ? Theme.text : Theme.muted;
+                tint: root.lit ? Theme.accent-bright : root.selected || touch.has-hover ? Theme.text : Theme.muted;
             }
         }
 
         Text {
             text: root.text;
-            color: root.selected || touch.has-hover ? Theme.text : Theme.muted;
+            color: root.lit ? Theme.accent-bright : root.selected || touch.has-hover ? Theme.text : Theme.muted;
             font-size: 14px;
             font-weight: 600;
             vertical-alignment: center;
@@ -306,6 +308,24 @@ export component Sidebar inherits Rectangle {
             text: "Requests";
             selected: App.route == "requests";
             clicked => { App.navigate("requests"); }
+        }
+
+        // A jam joined from here has a page; otherwise this opens the window for starting
+        // or joining one, or for looking after the one hosted here.
+        NavItem {
+            icon: Icons.party-popper;
+            text: Jam.hosting ? (Jam.guests.length == 0 ? "Jam: waiting for guests" : Jam.guests.length == 1 ? "Jam: 1 guest" : "Jam: " + Jam.guests.length + " guests")
+                : Jam.joined ? Jam.host + "'s jam" : "Jam";
+            selected: App.route == "jam";
+            lit: Jam.hosting || Jam.joined;
+            clicked => {
+                if Jam.joined {
+                    App.navigate("jam");
+                } else {
+                    Jam.opened();
+                    Jam.open = true;
+                }
+            }
         }
 
         Rectangle {
@@ -930,6 +950,15 @@ component QueueRow inherits Rectangle {
                         clicked => {
                             View.card-activated({ kind: CardKind.artist, id: root.track.artist-id, title: root.track.artist });
                         }
+                    }
+
+                    // In a jam: which guest added it.
+                    if root.track.by != "": Text {
+                        text: "• " + root.track.by;
+                        color: Theme.accent-bright;
+                        font-size: 13px;
+                        overflow: elide;
+                        accessible-label: "Added by " + root.track.by;
                     }
                 }
             }

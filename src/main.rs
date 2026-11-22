@@ -17,6 +17,7 @@ mod frame;
 mod gate;
 #[cfg(windows)]
 mod instance;
+mod jam;
 #[cfg(windows)]
 mod media;
 mod lidarr;

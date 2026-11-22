@@ -8,13 +8,13 @@ import "fonts/BricolageGrotesque-ExtraBold.ttf";
 
 import { Theme } from "theme.slint";
 import { Icons } from "icons.slint";
-import { Drag, App, View, Player, Menu, Prompt, Toast, Lyrics, Settings, Covers, Page, Track, Card, CardKind, Shelf, Offer, CardRow, PlaylistRef, MenuEntry, LyricLine, QualityOption, ThemeOption, Search, Suggestion } from "types.slint";
+import { Drag, App, View, Player, Menu, Prompt, Toast, Lyrics, Settings, Covers, Page, Track, Card, CardKind, Shelf, Offer, CardRow, PlaylistRef, MenuEntry, LyricLine, QualityOption, ThemeOption, Search, Suggestion, Jam, JamGuest, JamSong } from "types.slint";
 import { PageStatus, IconButton } from "widgets.slint";
 import { Sidebar, TopBar, QueuePanel, PlayerBar, SearchOverlay } from "chrome.slint";
-import { StackPage, TrackListPage, GridPage, LyricsPage, NowPlayingPage, SettingsPage, LoginPage } from "pages.slint";
-import { MenuOverlay, PromptOverlay, ToastOverlay } from "overlays.slint";
+import { StackPage, TrackListPage, GridPage, LyricsPage, NowPlayingPage, SettingsPage, LoginPage, JamPage } from "pages.slint";
+import { MenuOverlay, PromptOverlay, ToastOverlay, JamOverlay } from "overlays.slint";
 
-export { Theme, App, View, Player, Menu, Prompt, Toast, Lyrics, Settings, Covers, Icons, Page, Track, Card, CardKind, Shelf, Offer, CardRow, PlaylistRef, MenuEntry, LyricLine, QualityOption, ThemeOption, Search, Suggestion }
+export { Theme, App, View, Player, Menu, Prompt, Toast, Lyrics, Settings, Covers, Icons, Page, Track, Card, CardKind, Shelf, Offer, CardRow, PlaylistRef, MenuEntry, LyricLine, QualityOption, ThemeOption, Search, Suggestion, Jam, JamGuest, JamSong }
 
 // The icon in the notification area, shown while closing the window keeps the app running.
 export component Tray inherits SystemTrayIcon {
@@ -284,10 +284,17 @@ export component MainWindow inherits Window {
     // The Rust side bumps this after navigating, to take the keyboard back from the search box.
     property <int> focus-request: App.main-focus;
     changed focus-request => { keys.focus(); }
+    // Closing the jam window gives the keyboard back to the player's shortcuts.
+    property <bool> jam-open: Jam.open;
+    changed jam-open => {
+        if !self.jam-open {
+            keys.focus();
+        }
+    }
 
     keys := FocusScope {
         key-pressed(event) => {
-            if Prompt.open || !App.signed-in {
+            if Prompt.open || Jam.open || !App.signed-in {
                 return reject;
             }
             // A menu that's open takes the arrow keys and Enter.
@@ -527,6 +534,7 @@ export component MainWindow inherits Window {
                     if App.page == Page.lyrics: LyricsPage { }
                     if App.page == Page.now-playing: NowPlayingPage { }
                     if App.page == Page.settings: SettingsPage { }
+                    if App.page == Page.jam: JamPage { }
                 }
             }
 
@@ -587,6 +595,8 @@ export component MainWindow inherits Window {
                 overflow: elide;
             }
         }
+
+        if Jam.open && App.signed-in: JamOverlay { }
 
         if Menu.open: MenuOverlay { }
 

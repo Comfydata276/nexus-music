@@ -1,0 +1,48 @@
+# Builds the jam relay's image and publishes it to GitHub's container registry whenever
+# the relay changes on main, so a server can pull it instead of building it.
+name: Jam relay image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "relay/**"
+      - "assets/app-icon.png"
+      - ".github/workflows/relay.yml"
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: relay-image
+  cancel-in-progress: true
+
+jobs:
+  image:
+    name: Build and publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Work out the image's name and version
+        id: name
+        run: |
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}-jam" >> "$GITHUB_OUTPUT"
+          echo "version=$(grep -m1 '^version' relay/Cargo.toml | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: relay/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.name.outputs.image }}:latest
+            ${{ steps.name.outputs.image }}:${{ steps.name.outputs.version }}

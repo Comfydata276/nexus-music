@@ -279,7 +279,7 @@ pub fn load(client: &Client, route: &Route) -> ApiResult<PageData> {
         Route::Artists => artists(client),
         Route::Genres => genres(client),
         Route::Genre(name) => genre(client, name),
-        Route::Settings | Route::Lyrics | Route::NowPlaying | Route::Downloads | Route::Import => {
+        Route::Settings | Route::Lyrics | Route::NowPlaying | Route::Downloads | Route::Import | Route::Jam => {
             Ok(PageData::default())
         }
     }
