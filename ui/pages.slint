@@ -4,11 +4,17 @@ import { ScrollView, ListView, AboutSlint } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { Icons } from "icons.slint";
 import { App, View, Player, Lyrics, Settings, Covers, Card, CardKind, Shelf, Offer, Page, QualityOption, ThemeOption, Track, Jam, JamSong } from "types.slint";
-import { Icon, IconButton, PlayButton, TextButton, LinkText, Cover, Field, Toggle, Chip, Segmented, Select, Slider, MediaCard, TrackRow, PageStatus, HoverIntent, SkeletonRows, ScrollThumb } from "widgets.slint";
+import { Icon, IconButton, PlayButton, TextButton, LinkText, Cover, Field, Toggle, ChipRow, Segmented, Select, Slider, MediaCard, TrackRow, PageStatus, HoverIntent, SkeletonRows, ScrollThumb } from "widgets.slint";
 
 // Cover, title and summary at the top of an album, playlist or artist.
 component Hero inherits Rectangle {
     property <length> art: clamp(self.width * 0.24, 140px, 232px);
+    // The room the title has beside the cover. A short title is sized to fit it on one line
+    // (so a single word is never broken in two); a long one may take two lines.
+    property <length> room: self.width - 2 * Theme.page-pad - self.art - 24px;
+    property <length> title-size: min(
+        View.title.character-count > 34 ? 30px : View.title.character-count > 18 ? 42px : 60px,
+        max(26px, self.room / (0.64 * clamp(View.title.character-count, 4, 14))));
     height: self.art + 48px;
 
     HorizontalLayout {
@@ -60,7 +66,7 @@ component Hero inherits Rectangle {
                 text: View.title;
                 color: Theme.text;
                 font-family: Theme.display;
-                font-size: View.title.character-count > 34 ? 30px : View.title.character-count > 18 ? 42px : 60px;
+                font-size: root.title-size;
                 font-weight: 800;
                 wrap: word-wrap;
                 max-lines: 2;
@@ -456,6 +462,7 @@ component HeaderCell inherits Rectangle {
 
 component ColumnHeader inherits Rectangle {
     in property <bool> show-added;
+    in property <bool> show-album: View.show-album;
     height: 36px;
 
     HorizontalLayout {
@@ -484,7 +491,7 @@ component ColumnHeader inherits Rectangle {
             column: 1;
         }
 
-        if View.show-album: HeaderCell {
+        if root.show-album: HeaderCell {
             horizontal-stretch: 3;
             min-width: 0px;
             preferred-width: 0px;
@@ -662,7 +669,9 @@ component ShelfView inherits Rectangle {
     in property <Shelf> shelf;
     property <bool> genres: self.shelf.cards.length > 0 && self.shelf.cards[0].kind == CardKind.genre;
     property <length> avail: self.width - 24px;
-    property <int> cols: max(2, floor(self.avail / (self.genres ? 220px : 188px)));
+    // In a narrow page, three smaller cards to a line sit better than two very large ones.
+    property <int> cols: self.genres ? max(2, floor(self.avail / 220px))
+        : self.avail < 564px ? max(2, floor(self.avail / 160px)) : floor(self.avail / 188px);
     property <length> card-width: floor(self.avail / self.cols / 1px) * 1px;
     property <int> rows: self.shelf.wrap ? ceil(self.shelf.cards.length / self.cols) : 1;
     property <length> row-height: self.genres ? 96px : self.card-width - 24px + 78px;
@@ -824,24 +833,31 @@ component OffersBlock inherits VerticalLayout {
 // Home, search results and artist pages: a title or hero, then songs, then shelves.
 export component StackPage inherits Rectangle {
     in property <bool> hero;
-    // Room at the top for a search's chips, which stay put while the results scroll.
-    property <length> bar: View.kinds.length > 0 ? 56px : 0px;
+    // Room at the top for a search's chips, which stay put while the results scroll: one
+    // line of them or more, and a second set beneath when the chosen one has finer choices.
+    property <length> bar: View.kinds.length == 0 ? 0px
+        : 12px + kinds.height + (View.sub-kinds.length > 0 ? 8px + sub-kinds.height : 0px) + 12px;
 
-    if View.kinds.length > 0: HorizontalLayout {
-        y: 0;
-        height: root.bar;
-        padding-left: Theme.page-pad;
-        spacing: 8px;
-        alignment: start;
+    kinds := ChipRow {
+        x: Theme.page-pad;
+        y: 12px;
+        width: root.width - 2 * Theme.page-pad;
+        height: self.preferred-height;
+        visible: View.kinds.length > 0;
+        names: View.kinds;
+        selected: View.kind;
+        chosen(index) => { View.set-kind(index); }
+    }
 
-        for name[index] in View.kinds: VerticalLayout {
-            alignment: center;
-            Chip {
-                text: name;
-                selected: index == View.kind;
-                clicked => { View.set-kind(index); }
-            }
-        }
+    sub-kinds := ChipRow {
+        x: Theme.page-pad;
+        y: kinds.y + kinds.height + 8px;
+        width: root.width - 2 * Theme.page-pad;
+        height: self.preferred-height;
+        visible: View.kinds.length > 0 && View.sub-kinds.length > 0;
+        names: View.sub-kinds;
+        selected: View.sub-kind;
+        chosen(index) => { View.set-sub-kind(index); }
     }
 
     scroll := ScrollView {
@@ -921,13 +937,16 @@ export component StackPage inherits Rectangle {
             }
 
             // A page of figures: each a large number over what it counts.
-            if View.stats.length > 0: HorizontalLayout {
-                padding-left: Theme.page-pad;
-                padding-right: Theme.page-pad;
-                padding-bottom: 12px;
-                spacing: 12px;
-                for stat in View.stats: Rectangle {
-                    horizontal-stretch: 1;
+            if View.stats.length > 0: Rectangle {
+                // All on one line where there's room; otherwise two to a line.
+                property <length> room: root.width - 2 * Theme.page-pad;
+                property <int> across: self.room >= View.stats.length * 128px ? View.stats.length : 2;
+                property <length> tile: (self.room - (self.across - 1) * 12px) / self.across;
+                height: ceil(View.stats.length / self.across) * 104px;
+                for stat[index] in View.stats: Rectangle {
+                    x: Theme.page-pad + mod(index, parent.across) * (parent.tile + 12px);
+                    y: floor(index / parent.across) * 104px;
+                    width: parent.tile;
                     height: 92px;
                     border-radius: 10px;
                     background: Theme.raised;
@@ -1005,9 +1024,11 @@ export component StackPage inherits Rectangle {
                 }
                 TrackRow {
                     track: track;
-                    show-album: View.show-album;
+                    show-album: View.show-album && root.width >= 600px;
                     show-cover: View.show-cover;
                     show-number: View.show-number;
+                    // On "Your stats": how often each song was played.
+                    show-added: View.show-added;
                     index: index;
                     count: View.tracks.length;
                     activated => { View.track-activated(index); }
@@ -1083,8 +1104,9 @@ export component TrackListPage inherits Rectangle {
     // scrolled away.
     property <length> bar-y: max(0px, self.hero-height - self.scrolled);
     property <bool> stuck: self.scrolled > self.hero-height;
-    // The date column gives way first when the window is narrow.
+    // The date column gives way first when the window is narrow, then the album.
     property <bool> show-added: View.show-added && self.width >= 860px;
+    property <bool> show-album: View.show-album && self.width >= 600px;
     // The keyboard moved to a row: bring it into view, clear of the bar stuck to the top.
     property <length> cursor-top: self.header-height + View.cursor-row * self.row-height
         + View.tracks[View.cursor-row].sections-before * self.section-height;
@@ -1121,6 +1143,7 @@ export component TrackListPage inherits Rectangle {
             y: root.hero-height + 72px;
             width: scroll.visible-width;
             show-added: root.show-added;
+            show-album: root.show-album;
         }
 
         if View.tracks.length == 0 && View.pending: SkeletonRows {
@@ -1174,7 +1197,7 @@ export component TrackListPage inherits Rectangle {
                 x: 16px;
                 width: row.width - 32px;
                 track: row.track;
-                show-album: View.show-album;
+                show-album: root.show-album;
                 show-cover: View.show-cover;
                 show-number: View.show-number;
                 show-added: root.show-added;
@@ -1290,7 +1313,9 @@ export component TrackListPage inherits Rectangle {
 export component GridPage inherits Rectangle {
     property <bool> genres: View.grid.length > 0 && View.grid[0].cards.length > 0 && View.grid[0].cards[0].kind == CardKind.genre;
     property <length> avail: self.width - 24px - 14px;
-    property <int> cols: max(2, floor(self.avail / (self.genres ? 220px : 188px)));
+    // In a narrow page, three smaller cards to a line sit better than two very large ones.
+    property <int> cols: self.genres ? max(2, floor(self.avail / 220px))
+        : self.avail < 564px ? max(2, floor(self.avail / 160px)) : floor(self.avail / 188px);
     property <length> card-width: floor(self.avail / self.cols / 1px) * 1px;
     changed cols => { View.columns-changed(self.cols); }
     init => { View.columns-changed(self.cols); }
@@ -1313,13 +1338,12 @@ export component GridPage inherits Rectangle {
 
         if View.sorts.length > 0: HorizontalLayout {
             padding-left: Theme.page-pad;
+            padding-right: Theme.page-pad;
             padding-bottom: 12px;
-            spacing: 8px;
-            alignment: start;
-            for name[index] in View.sorts: Chip {
-                text: name;
-                selected: index == View.sort;
-                clicked => { View.set-sort(index); }
+            ChipRow {
+                names: View.sorts;
+                selected: View.sort;
+                chosen(index) => { View.set-sort(index); }
             }
         }
 
@@ -2003,12 +2027,16 @@ component EqPanel inherits Rectangle {
 export component SettingsPage inherits Rectangle {
     property <length> column: min(self.width - 2 * Theme.page-pad, 760px);
     property <length> edge: (self.width - self.column) / 2;
-    // The title and the section chips stay put above the settings.
-    property <length> head: 116px;
+    // The title and the section chips stay put above the settings. In a narrow window the
+    // chips take two lines, and the settings start that much lower. In a short one the
+    // title makes way, so the settings keep most of the height.
+    property <bool> short: self.height < 480px;
+    property <length> head: sections.y + sections.height + 18px;
 
     Text {
         x: root.edge;
         y: 8px;
+        visible: !root.short;
         text: "Settings";
         color: Theme.text;
         font-family: Theme.display;
@@ -2016,30 +2044,17 @@ export component SettingsPage inherits Rectangle {
         font-weight: 800;
     }
 
-    // Sideways-scrollable, for a window too narrow to show every section's chip.
-    Flickable {
+    sections := ChipRow {
         x: root.edge;
-        y: 64px;
+        y: root.short ? 10px : 66px;
         width: root.column;
-        height: 36px;
-        content-width: max(self.width, sections.preferred-width);
-        content-height: 36px;
-
-        sections := HorizontalLayout {
-            spacing: 6px;
-            alignment: start;
-
-            for name[index] in ["Appearance", "Playback", "Sound", "Storage", "Requests", "Jam", "Account", "About"]: VerticalLayout {
-                alignment: center;
-                Chip {
-                    text: name;
-                    selected: index == Settings.tab;
-                    clicked => {
-                        Settings.tab = index;
-                        scroll.content-y = 0px;
-                    }
-                }
-            }
+        height: self.preferred-height;
+        spacing: 6px;
+        names: ["Appearance", "Playback", "Sound", "Storage", "Requests", "Jam", "Account", "About"];
+        selected: Settings.tab;
+        chosen(index) => {
+            Settings.tab = index;
+            scroll.content-y = 0px;
         }
     }
 
@@ -2074,9 +2089,18 @@ export component SettingsPage inherits Rectangle {
                         SettingRow {
                             title: "Theme";
                             detail: "Colours for the whole app, including the window's title bar.";
-                            HorizontalLayout {
-                                spacing: 10px;
+                            // As many to a line as there's room for.
+                            Rectangle {
+                                property <int> fit: max(2, floor((root.column + 10px) / 96px));
+                                property <int> lines: ceil(Settings.themes.length / self.fit);
+                                // Shared out evenly between the lines, not one left over.
+                                property <int> across: max(1, ceil(Settings.themes.length / self.lines));
+                                width: self.across * 96px - 10px;
+                                height: self.lines * 94px - 10px;
                                 for option[index] in Settings.themes: ThemeSwatch {
+                                    x: mod(index, parent.across) * 96px;
+                                    y: floor(index / parent.across) * 94px;
+                                    width: 86px;
                                     option: option;
                                     selected: index == Settings.theme;
                                     clicked => { Settings.set-theme(index); }

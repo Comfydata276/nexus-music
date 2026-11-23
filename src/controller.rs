@@ -73,7 +73,8 @@ pub enum Route {
     Mix(String),
     /// Albums that have been asked for and haven't arrived.
     Requests,
-    /// What's been played most, over one of `pages::STATS_PERIODS`.
+    /// What's been played most, over a stretch of time: `pages::stats` says which number
+    /// stands for which.
     Stats(usize),
     /// An artist as the wider world knows them, by MusicBrainz's name for them: all their
     /// albums, in the library or not.
@@ -149,7 +150,8 @@ impl Route {
         match self {
             Route::Search(query) => format!("search:{query}"),
             Route::Albums(sort) => format!("albums:{sort}"),
-            Route::Stats(period) => format!("stats:{period}"),
+            // (Not "stats:0": before 0.40 that was a different stretch of time.)
+            Route::Stats(period) => format!("stats-{period}"),
             other => other.key(),
         }
     }
@@ -874,6 +876,13 @@ impl Controller {
         // to replace.
         #[cfg(not(windows))]
         app.set_custom_frame(std::env::var_os("NEXUS_SHOW_WINDOW_BUTTONS").is_some());
+        // For looking at the layout in a window of a given size, e.g. `1000x650`.
+        if let Some((width, height)) = std::env::var("NEXUS_WINDOW_SIZE").ok().and_then(|size| {
+            let (width, height) = size.split_once('x')?;
+            Some((width.parse::<f32>().ok()?, height.parse::<f32>().ok()?))
+        }) {
+            self.ui.window().set_size(slint::LogicalSize::new(width, height));
+        }
         // The title bar can only be coloured once the window exists.
         #[cfg(windows)]
         slint::Timer::single_shot(Duration::from_millis(50), || {
@@ -2542,7 +2551,7 @@ impl Controller {
         });
     }
 
-    fn show(self: &Rc<Self>, route: Route, scroll: f32, force: bool, hint: Option<PageData>) {
+    pub(crate) fn show(self: &Rc<Self>, route: Route, scroll: f32, force: bool, hint: Option<PageData>) {
         let generation = {
             let mut nav = self.nav.borrow_mut();
             nav.generation += 1;
@@ -2768,7 +2777,7 @@ impl Controller {
                 if view.get_kinds().row_count() != pages::STATS_PERIODS.len() {
                     view.set_kinds(ModelRc::new(VecModel::from(pages::STATS_PERIODS.iter().map(|name| SharedString::from(*name)).collect::<Vec<_>>())));
                 }
-                view.set_kind(period as i32);
+                view.set_kind(period.min(pages::STATS_PERIODS.len() - 1) as i32);
                 data
             }
             _ => {
@@ -2779,6 +2788,12 @@ impl Controller {
                 data
             }
         };
+        // The finer choices under the chosen chip, where the page has any.
+        let filters: Vec<SharedString> = data.filters.iter().map(|(name, _)| name.as_str().into()).collect();
+        if filters.len() != view.get_sub_kinds().row_count() || filters.iter().zip(view.get_sub_kinds().iter()).any(|(a, b)| *a != b) {
+            view.set_sub_kinds(ModelRc::new(VecModel::from(filters)));
+        }
+        view.set_sub_kind(data.filter as i32);
         view.set_stats(ModelRc::new(VecModel::from(
             data.stats.iter().map(|(value, label)| ui::Stat { value: value.as_str().into(), label: label.as_str().into() }).collect::<Vec<_>>(),
         )));
@@ -3067,7 +3082,8 @@ impl Controller {
         let view = self.ui.global::<ui::View>();
         let can_filter = self.is_own_list(&page);
         view.set_can_filter(can_filter && !page.songs.is_empty());
-        view.set_show_added(can_filter);
+        // The same column says how often each song was played, on a page that counts plays.
+        view.set_show_added(can_filter || !page.song_notes.is_empty());
         view.set_track_sort_index(state.sort as i32);
         view.set_track_sort(
             match (state.sort, page.playlist.is_some()) {
@@ -3320,7 +3336,10 @@ impl Controller {
             .enumerate()
             .map(|(index, (i, song))| {
                 let mut row = self.track_row(song);
-                row.added = crate::added::date_label(added.get(i).copied().unwrap_or(0)).into();
+                row.added = match data.song_notes.get(i) {
+                    Some(note) => note.as_str().into(),
+                    None => crate::added::date_label(added.get(i).copied().unwrap_or(0)).into(),
+                };
                 row.number = if data.album_numbers && song.track > 0 {
                     song.track.to_string().into()
                 } else {
@@ -4068,6 +4087,16 @@ impl Controller {
                     }
                 }
                 _ => ctl.set_search_filter(index.max(0) as usize),
+            });
+        });
+        view.on_set_sub_kind(|index| {
+            with(|ctl| {
+                let chosen = ctl.page.borrow().filters.get(index.max(0) as usize).map(|(_, period)| *period);
+                if let (Some(period), Some(Route::Stats(now))) = (chosen, ctl.current_route()) {
+                    if period != now {
+                        ctl.navigate(Route::Stats(period));
+                    }
+                }
             });
         });
         view.on_offer_activated(|index| {

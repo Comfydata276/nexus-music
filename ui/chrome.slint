@@ -1,6 +1,6 @@
 // The parts of the window that stay put: library sidebar, top bar, queue and the player bar.
 
-import { ListView } from "std-widgets.slint";
+import { ListView, ScrollView } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { Icons } from "icons.slint";
 import { App, Player, View, CardKind, PlaylistRef, Page, Track, Drag, Search, Suggestion, Jam, Devices } from "types.slint";
@@ -187,6 +187,9 @@ component PlaylistItem inherits Rectangle {
 }
 
 export component Sidebar inherits Rectangle {
+    // How tall the list below the name is, worked out from what's in it: the places to go,
+    // the rule, the heading, then the playlists (or the line that stands in for them).
+    property <length> tall: (10 + (App.requests ? 1 : 0)) * 42px + 19px + 38px + max(1, App.playlists.length) * 58px;
     background: Theme.panel;
     border-radius: Theme.radius;
 
@@ -241,152 +244,158 @@ export component Sidebar inherits Rectangle {
             }
         }
 
-        NavItem {
-            icon: Icons.house;
-            text: "Home";
-            selected: App.route == "home";
-            clicked => { App.navigate("home"); }
-        }
-
-        NavItem {
-            icon: Icons.disc-album;
-            text: "Albums";
-            selected: App.route == "albums";
-            clicked => { App.navigate("albums"); }
-        }
-
-        NavItem {
-            icon: Icons.users-round;
-            text: "Artists";
-            selected: App.route == "artists";
-            clicked => { App.navigate("artists"); }
-        }
-
-        NavItem {
-            icon: Icons.music;
-            text: "Songs";
-            selected: App.route == "songs";
-            clicked => { App.navigate("songs"); }
-        }
-
-        NavItem {
-            icon: Icons.tags;
-            text: "Genres";
-            selected: App.route == "genres";
-            clicked => { App.navigate("genres"); }
-        }
-
-        NavItem {
-            icon: Icons.heart;
-            text: "Liked songs";
-            selected: App.route == "liked";
-            clicked => { App.navigate("liked"); }
-        }
-
-        NavItem {
-            icon: Icons.radio;
-            text: "Radio";
-            selected: App.route == "radio";
-            clicked => { App.navigate("radio"); }
-        }
-
-        NavItem {
-            icon: Icons.chart-no-axes-column;
-            text: "Your stats";
-            selected: App.route == "stats";
-            clicked => { App.navigate("stats"); }
-        }
-
-        NavItem {
-            icon: Icons.download;
-            text: App.download-status == "" ? "Downloads" : App.download-status;
-            selected: App.route == "downloads";
-            clicked => { App.navigate("downloads"); }
-        }
-
-        if App.requests: NavItem {
-            icon: Icons.circle-arrow-down;
-            text: "Requests";
-            selected: App.route == "requests";
-            clicked => { App.navigate("requests"); }
-        }
-
-        // A jam joined from here has a page; otherwise this opens the window for starting
-        // or joining one, or for looking after the one hosted here.
-        NavItem {
-            icon: Icons.party-popper;
-            text: Jam.hosting ? (Jam.guests.length == 0 ? "Jam: waiting for guests" : Jam.guests.length == 1 ? "Jam: 1 guest" : "Jam: " + Jam.guests.length + " guests")
-                : Jam.joined ? Jam.host + "'s jam" : "Jam";
-            selected: App.route == "jam";
-            lit: Jam.hosting || Jam.joined;
-            clicked => {
-                if Jam.joined {
-                    App.navigate("jam");
-                } else {
-                    Jam.opened();
-                    Jam.open = true;
-                }
-            }
-        }
-
-        Rectangle {
-            height: 17px;
-            Rectangle {
-                x: 12px;
-                width: parent.width - 24px;
-                height: 1px;
-                background: Theme.line;
-            }
-        }
-
-        HorizontalLayout {
-            padding-left: 12px;
-            padding-right: 4px;
-            height: 36px;
-
-            Text {
-                text: "Playlists";
-                color: Theme.muted;
-                font-size: 13px;
-                font-weight: 600;
-                vertical-alignment: center;
-            }
-
-            VerticalLayout {
-                alignment: center;
-                add := IconButton {
-                    icon: Icons.plus;
-                    label: "Add a playlist";
-                    clicked => { App.playlist-menu(add.absolute-position.x, add.absolute-position.y + add.height + 4px); }
-                }
-            }
-        }
-
-        if App.playlists.length == 0: HorizontalLayout {
-            padding-left: 12px;
-            padding-right: 12px;
-            Text {
-                text: "Playlists you create show up here.";
-                color: Theme.faint;
-                font-size: 13px;
-                wrap: word-wrap;
-            }
-        }
-
+        // Everything below the name scrolls as one, so a short window still reaches all of
+        // it: the places to go, then the playlists.
         Rectangle {
             vertical-stretch: 1;
-            playlists := ListView {
+
+            scroll := ScrollView {
                 x: 0;
                 width: parent.width + Lane.reach;
                 height: parent.height;
                 vertical-scrollbar-policy: always-off;
                 horizontal-scrollbar-policy: always-off;
-                for playlist in App.playlists: Rectangle {
-                    height: 56px;
-                    PlaylistItem {
-                        x: 0;
-                        // Full width until the list is long enough to need its scrollbar.
-                        width: parent.width - (playlists.content-height > playlists.visible-height ? Lane.gutter : Lane.reach);
+
+                VerticalLayout {
+                    width: scroll.visible-width;
+                    alignment: start;
+                    spacing: 2px;
+                    // Full width until there's enough to need the scrollbar.
+                    padding-right: root.tall > scroll.height ? Lane.gutter : Lane.reach;
+
+                    NavItem {
+                        icon: Icons.house;
+                        text: "Home";
+                        selected: App.route == "home";
+                        clicked => { App.navigate("home"); }
+                    }
+
+                    NavItem {
+                        icon: Icons.disc-album;
+                        text: "Albums";
+                        selected: App.route == "albums";
+                        clicked => { App.navigate("albums"); }
+                    }
+
+                    NavItem {
+                        icon: Icons.users-round;
+                        text: "Artists";
+                        selected: App.route == "artists";
+                        clicked => { App.navigate("artists"); }
+                    }
+
+                    NavItem {
+                        icon: Icons.music;
+                        text: "Songs";
+                        selected: App.route == "songs";
+                        clicked => { App.navigate("songs"); }
+                    }
+
+                    NavItem {
+                        icon: Icons.tags;
+                        text: "Genres";
+                        selected: App.route == "genres";
+                        clicked => { App.navigate("genres"); }
+                    }
+
+                    NavItem {
+                        icon: Icons.heart;
+                        text: "Liked songs";
+                        selected: App.route == "liked";
+                        clicked => { App.navigate("liked"); }
+                    }
+
+                    NavItem {
+                        icon: Icons.radio;
+                        text: "Radio";
+                        selected: App.route == "radio";
+                        clicked => { App.navigate("radio"); }
+                    }
+
+                    NavItem {
+                        icon: Icons.chart-no-axes-column;
+                        text: "Your stats";
+                        selected: App.route == "stats";
+                        clicked => { App.navigate("stats"); }
+                    }
+
+                    NavItem {
+                        icon: Icons.download;
+                        text: App.download-status == "" ? "Downloads" : App.download-status;
+                        selected: App.route == "downloads";
+                        clicked => { App.navigate("downloads"); }
+                    }
+
+                    if App.requests: NavItem {
+                        icon: Icons.circle-arrow-down;
+                        text: "Requests";
+                        selected: App.route == "requests";
+                        clicked => { App.navigate("requests"); }
+                    }
+
+                    // A jam joined from here has a page; otherwise this opens the window for starting
+                    // or joining one, or for looking after the one hosted here.
+                    NavItem {
+                        icon: Icons.party-popper;
+                        text: Jam.hosting ? (Jam.guests.length == 0 ? "Jam: waiting for guests" : Jam.guests.length == 1 ? "Jam: 1 guest" : "Jam: " + Jam.guests.length + " guests")
+                            : Jam.joined ? Jam.host + "'s jam" : "Jam";
+                        selected: App.route == "jam";
+                        lit: Jam.hosting || Jam.joined;
+                        clicked => {
+                            if Jam.joined {
+                                App.navigate("jam");
+                            } else {
+                                Jam.opened();
+                                Jam.open = true;
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        height: 17px;
+                        Rectangle {
+                            x: 12px;
+                            width: parent.width - 24px;
+                            height: 1px;
+                            background: Theme.line;
+                        }
+                    }
+
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        padding-right: 4px;
+                        height: 36px;
+
+                        Text {
+                            text: "Playlists";
+                            color: Theme.muted;
+                            font-size: 13px;
+                            font-weight: 600;
+                            vertical-alignment: center;
+                        }
+
+                        VerticalLayout {
+                            alignment: center;
+                            add := IconButton {
+                                icon: Icons.plus;
+                                label: "Add a playlist";
+                                clicked => { App.playlist-menu(add.absolute-position.x, add.absolute-position.y + add.height + 4px); }
+                            }
+                        }
+                    }
+
+                    if App.playlists.length == 0: HorizontalLayout {
+                        padding-left: 12px;
+                        padding-right: 12px;
+                        Text {
+                            text: "Playlists you create show up here.";
+                            color: Theme.faint;
+                            font-size: 13px;
+                            wrap: word-wrap;
+                        }
+                    }
+
+                    for playlist in App.playlists: PlaylistItem {
                         playlist: playlist;
                         selected: App.route == "playlist:" + playlist.id;
                         clicked => {
@@ -406,10 +415,10 @@ export component Sidebar inherits Rectangle {
             }
 
             ScrollThumb {
-                x: playlists.width - self.width;
-                content-y <=> playlists.content-y;
-                content-height: playlists.content-height;
-                visible-height: playlists.visible-height;
+                x: scroll.width - self.width;
+                content-y <=> scroll.content-y;
+                content-height: scroll.content-height;
+                visible-height: scroll.visible-height;
             }
         }
     }
@@ -1036,10 +1045,17 @@ export component QueuePanel inherits Rectangle {
         }
     }
 
+    // The window is too narrow for the panel to sit beside the page: it lies over it.
+    in property <bool> over;
     background: Theme.panel;
     border-radius: Theme.radius;
-    border-width: self.drop-here ? 2px : 0px;
-    border-color: Theme.accent-bright;
+    border-width: self.drop-here ? 2px : self.over ? 1px : 0px;
+    border-color: self.drop-here ? Theme.accent-bright : Theme.line;
+    drop-shadow-blur: self.over ? 28px : 0px;
+    drop-shadow-color: self.over ? #000000a0 : transparent;
+
+    // Nothing clicked here reaches the page underneath.
+    TouchArea { }
 
     VerticalLayout {
         padding: 8px;
@@ -1072,7 +1088,13 @@ export component QueuePanel inherits Rectangle {
                 IconButton {
                     icon: Icons.x;
                     label: "Close";
-                    clicked => { App.set-queue-open(false); }
+                    clicked => {
+                        if root.over {
+                            App.queue-over = false;
+                        } else {
+                            App.set-queue-open(false);
+                        }
+                    }
                 }
             }
         }
@@ -1322,8 +1344,17 @@ export component QueuePanel inherits Rectangle {
 // The devices, in the side panel where the queue otherwise is: where the music is playing,
 // a way into a jam, and the person's other devices to move it to.
 export component ConnectPanel inherits Rectangle {
+    // The window is too narrow for the panel to sit beside the page: it lies over it.
+    in property <bool> over;
     background: Theme.panel;
     border-radius: Theme.radius;
+    border-width: self.over ? 1px : 0px;
+    border-color: Theme.line;
+    drop-shadow-blur: self.over ? 28px : 0px;
+    drop-shadow-color: self.over ? #000000a0 : transparent;
+
+    // Nothing clicked here reaches the page underneath.
+    TouchArea { }
 
     VerticalLayout {
         padding: 8px;
@@ -1583,8 +1614,9 @@ export component JamStrip inherits Rectangle {
 }
 
 export component PlayerBar inherits Rectangle {
-    // False when the window is too narrow to show the queue beside the page.
-    in property <bool> queue-fits: true;
+    // The window has room for the queue beside the page; otherwise it opens over the page.
+    in property <bool> wide: true;
+    property <bool> queue-open: self.wide ? App.queue-open : App.queue-over;
     height: 84px;
 
     property <length> side: max(220px, self.width * 0.28);
@@ -1876,16 +1908,19 @@ export component PlayerBar inherits Rectangle {
                 IconButton {
                     icon: Icons.list-music;
                     icon-size: 17px;
-                    active: App.queue-open && root.queue-fits && !Devices.open;
-                    enabled: root.queue-fits;
-                    label: root.queue-fits ? "Queue" : "Widen the window to show the queue";
+                    active: root.queue-open && !Devices.open;
+                    label: "Queue";
                     clicked => {
                         // With the devices in the panel, this brings the queue back to it.
                         if Devices.open {
                             Devices.open = false;
-                            if !App.queue-open {
+                            if !root.wide {
+                                App.queue-over = true;
+                            } else if !App.queue-open {
                                 App.set-queue-open(true);
                             }
+                        } else if !root.wide {
+                            App.queue-over = !App.queue-over;
                         } else {
                             App.set-queue-open(!App.queue-open);
                         }

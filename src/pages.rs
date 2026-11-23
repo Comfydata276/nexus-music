@@ -188,6 +188,12 @@ pub struct PageData {
     pub star: Option<(String, String)>,
     pub starred: bool,
     pub songs: Vec<Song>,
+    /// Something to say beside each of `songs` (how often it was played), where there is.
+    pub song_notes: Vec<String>,
+    /// Finer choices under the page's chosen chip, as (name, what choosing it leads to), and
+    /// which of them this page is.
+    pub filters: Vec<(String, usize)>,
+    pub filter: usize,
     pub tracks_title: String,
     pub show_album: bool,
     pub show_cover: bool,
@@ -272,7 +278,7 @@ pub fn load(client: &Client, route: &Route) -> ApiResult<PageData> {
         Route::Radio => radio(client),
         Route::Mix(id) => Ok(mix(id)),
         Route::Requests => Ok(requests()),
-        Route::Stats(period) => Ok(stats(*period)),
+        Route::Stats(period) => Ok(stats(client, *period)),
         Route::OutsideArtist(id) => Ok(outside_artist(id)),
         Route::OutsideAlbum(id) => Ok(outside_album(id)),
         Route::Albums(sort) => albums(client, *sort),
@@ -997,9 +1003,20 @@ fn requests() -> PageData {
     page
 }
 
-/// The page for one of the "Made for you" mixes.
-/// How far back "Your stats" can look.
-pub const STATS_PERIODS: [&str; 3] = ["All time", "Last 6 months", "Last 4 weeks"];
+/// How far back "Your stats" can look: the chips across its top. `Route::Stats` carries
+/// the place of one of these; or, for a finer choice under "All time", one of the numbers
+/// below.
+pub const STATS_PERIODS: [&str; 4] = ["Today", "This week", "This month", "All time"];
+const STATS_TODAY: usize = 0;
+const STATS_WEEK: usize = 1;
+const STATS_MONTH: usize = 2;
+/// Everything there's a count of.
+const STATS_ALL: usize = 3;
+const STATS_3_MONTHS: usize = 4;
+const STATS_6_MONTHS: usize = 5;
+const STATS_12_MONTHS: usize = 6;
+/// From here up the number is a calendar year.
+const STATS_YEAR: usize = 1000;
 
 /// A number with its thousands marked off: 5210 is "5,210".
 fn grouped(number: u64) -> String {
@@ -1018,43 +1035,131 @@ fn plays(times: u64) -> String {
     format!("{} {}", grouped(times), if times == 1 { "play" } else { "plays" })
 }
 
-/// What's been played most: songs, artists, albums and kinds of music, with how much
-/// listening it comes to. "All time" goes by the server's count of each song's plays, which
-/// takes in every app and device. The shorter periods go by this app's own log of plays,
-/// since the server doesn't say when anything was played.
-fn stats(period: usize) -> PageData {
-    let title = "Your stats".to_string();
-    let period = period.min(STATS_PERIODS.len() - 1);
-    let Some(index) = crate::search::current() else {
-        return PageData { title, empty: "Your library is still being read. Try again in a moment.".into(), ..Default::default() };
-    };
-    let now = chrono::Utc::now().timestamp();
-    let log = crate::plays::shared();
-    // How many times each song was played in the period.
-    let mut times: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
-    if period == 0 {
-        for song in index.library.songs.iter().filter(|song| song.play_count > 0) {
-            times.insert(song.id.as_str(), song.play_count as u64);
+/// When a day began, by the clock on this PC (seconds since 1970).
+fn day_began(day: chrono::NaiveDate) -> i64 {
+    use chrono::TimeZone;
+    day.and_hms_opt(0, 0, 0).and_then(|time| chrono::Local.from_local_datetime(&time).earliest()).map(|time| time.timestamp()).unwrap_or(0)
+}
+
+/// The stretch of time a stats period covers, as seconds since 1970: from, and up to but not
+/// including. `None` for all time. Days, weeks (which start on Monday) and months go by the
+/// clock on this PC.
+fn stats_span(period: usize, now: chrono::DateTime<chrono::Local>) -> Option<(i64, i64)> {
+    use chrono::Datelike;
+    let today = now.date_naive();
+    let ever = i64::MAX;
+    let months_back = |months: u32| today.checked_sub_months(chrono::Months::new(months)).map(day_began).unwrap_or(0);
+    Some(match period {
+        STATS_TODAY => (day_began(today), ever),
+        STATS_WEEK => (day_began(today - chrono::Days::new(today.weekday().num_days_from_monday() as u64)), ever),
+        STATS_MONTH => (day_began(today.with_day(1).unwrap_or(today)), ever),
+        STATS_3_MONTHS => (months_back(3), ever),
+        STATS_6_MONTHS => (months_back(6), ever),
+        STATS_12_MONTHS => (months_back(12), ever),
+        year if year >= STATS_YEAR => {
+            let began = |year: i32| chrono::NaiveDate::from_ymd_opt(year, 1, 1).map(day_began).unwrap_or(0);
+            (began(year as i32), began(year as i32 + 1))
         }
-    } else {
-        let since = now - if period == 1 { 183 } else { 28 } * 24 * 3600;
-        for (song, _) in log.iter().filter(|(_, at)| *at >= since) {
+        _ => return None,
+    })
+}
+
+/// How many times each song was played over a stats period, and how many of those plays
+/// were made from each playlist (by its route key).
+///
+/// A stretch of time goes by this app's own log of plays, since the server doesn't say when
+/// anything was played. "All time" goes by the server's count of each song's plays, which
+/// takes in every app and device; to that are added the plays logged since this PC's copy
+/// of the library was fetched, which that copy can't know of yet.
+fn stats_counts<'a>(
+    period: usize,
+    library: &'a crate::search::Library,
+    log: &'a [(String, i64)],
+    sources: &'a [(String, i64, String)],
+    now: chrono::DateTime<chrono::Local>,
+) -> (std::collections::HashMap<&'a str, u64>, std::collections::HashMap<&'a str, u64>) {
+    let mut times: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
+    let (from, until) = match stats_span(period, now) {
+        Some(span) => span,
+        None => {
+            for song in library.songs.iter().filter(|song| song.play_count > 0) {
+                times.insert(song.id.as_str(), song.play_count as u64);
+            }
+            for (song, _) in log.iter().filter(|(_, at)| *at > library.fetched) {
+                *times.entry(song.as_str()).or_default() += 1;
+            }
+            (i64::MIN, i64::MAX)
+        }
+    };
+    if from != i64::MIN {
+        for (song, _) in log.iter().filter(|(_, at)| *at >= from && *at < until) {
             *times.entry(song.as_str()).or_default() += 1;
         }
     }
+    let mut lists: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
+    for (_, _, list) in sources.iter().filter(|(_, at, _)| *at >= from && *at < until) {
+        *lists.entry(list.as_str()).or_default() += 1;
+    }
+    (times, lists)
+}
+
+/// The finer choices under "All time": everything, the last few months, and each calendar
+/// year the log of plays reaches into (when it reaches into more than one).
+fn stats_filters(log: &[(String, i64)], now: chrono::DateTime<chrono::Local>) -> Vec<(String, usize)> {
+    use chrono::Datelike;
+    let mut filters: Vec<(String, usize)> = vec![
+        ("Everything".into(), STATS_ALL),
+        ("Last 3 months".into(), STATS_3_MONTHS),
+        ("Last 6 months".into(), STATS_6_MONTHS),
+        ("Last 12 months".into(), STATS_12_MONTHS),
+    ];
+    let first = log.iter().map(|(_, at)| *at).min().and_then(|at| chrono::DateTime::from_timestamp(at, 0)).map(|at| at.with_timezone(&chrono::Local).year());
+    if let Some(first) = first.filter(|first| *first < now.year() && *first >= STATS_YEAR as i32) {
+        filters.extend((first..=now.year()).rev().map(|year| (year.to_string(), year as usize)));
+    }
+    filters
+}
+
+/// What's been played over a stretch of time: how much listening it comes to, and the
+/// songs, artists, albums, kinds of music and playlists played most.
+fn stats(client: &Client, period: usize) -> PageData {
+    let title = "Your stats".to_string();
+    let now = chrono::Local::now();
+    let log = crate::plays::shared();
+    let all_time = period >= STATS_ALL;
+    let filters = if all_time { stats_filters(&log, now) } else { Vec::new() };
+    // A year that's no longer offered (or a number that never was) is all time.
+    let period = if period < STATS_ALL || filters.iter().any(|(_, code)| *code == period) { period } else { STATS_ALL };
+    let filter = filters.iter().position(|(_, code)| *code == period).unwrap_or(0);
+    let blank = PageData { title: title.clone(), filters: filters.clone(), filter, local: true, ..Default::default() };
+    let Some(index) = crate::search::current() else {
+        return PageData { empty: "Your library is still being read. Try again in a moment.".into(), ..blank };
+    };
+    let sources = crate::plays::sources();
+    let (times, lists) = stats_counts(period, &index.library, &log, &sources, now);
     let mut songs: Vec<(&Song, u64)> = index.library.songs.iter().filter_map(|song| times.get(song.id.as_str()).map(|times| (song, *times))).collect();
     songs.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.title.cmp(&b.0.title)));
+
     // The log only knows what's happened since it was started.
-    let started = log.first().map(|(_, at)| *at).unwrap_or(now);
-    let note = if period == 0 {
-        String::new()
-    } else {
-        let day = chrono::DateTime::from_timestamp(started, 0).map(|at| at.with_timezone(&chrono::Local).format("%-d %B %Y").to_string()).unwrap_or_default();
-        format!("Plays in this period are the ones this app has counted on this PC, starting {day}. “All time” uses your server's own count, which takes in every app.")
+    let started = log.iter().map(|(_, at)| *at).min().unwrap_or(now.timestamp());
+    let since = chrono::DateTime::from_timestamp(started, 0).map(|at| at.with_timezone(&chrono::Local).format("%-d %B %Y").to_string()).unwrap_or_default();
+    let note = match stats_span(period, now) {
+        None => format!(
+            "“Everything” goes by your server's count of each song's plays, which takes in every app you've listened with. The shorter stretches of time, and the playlists, go by the plays Nexus Music itself has counted, which start on {since}."
+        ),
+        // Only worth saying when the stretch of time reaches back before the log does.
+        Some((from, _)) if from < started => format!("Plays here are the ones Nexus Music has counted, which start on {since}. “All time” uses your server's own count, which takes in every app."),
+        Some(_) => String::new(),
     };
     if songs.is_empty() {
-        let empty = if period == 0 { "Nothing has been played yet." } else { "Nothing has been played in this period." };
-        return PageData { title, empty: empty.into(), about: note, ..Default::default() };
+        let empty = match period {
+            STATS_TODAY => "Nothing played yet today. Songs show up here once you're half way through them.",
+            STATS_WEEK => "Nothing played yet this week.",
+            STATS_MONTH => "Nothing played yet this month.",
+            STATS_ALL => "Nothing has been played yet.",
+            _ => "Nothing was played in this time.",
+        };
+        return PageData { empty: empty.into(), about: if all_time { note } else { String::new() }, ..blank };
     }
 
     // The same plays, added up by artist, by album and by kind of music.
@@ -1076,11 +1181,13 @@ fn stats(period: usize) -> PageData {
     let seconds: u64 = songs.iter().map(|(song, times)| song.duration as u64 * times).sum();
     let total: u64 = songs.iter().map(|(_, times)| times).sum();
 
-    let listened = if seconds >= 3600 { (grouped(seconds / 3600), "hours listened") } else { (grouped(seconds / 60), "minutes listened") };
+    // Minutes, until there are so many that hours say it better.
+    let minutes = seconds / 60;
+    let listened = if minutes >= 6000 { (grouped(seconds / 3600), "hours listened") } else { (grouped(minutes), if minutes == 1 { "minute listened" } else { "minutes listened" }) };
     let figures = vec![
         (listened.0, listened.1.to_string()),
-        (grouped(total), if total == 1 { "play" } else { "plays" }.to_string()),
-        (grouped(songs.len() as u64), if songs.len() == 1 { "song" } else { "songs" }.to_string()),
+        (grouped(total), if total == 1 { "song played" } else { "songs played" }.to_string()),
+        (grouped(songs.len() as u64), if songs.len() == 1 { "different song" } else { "different songs" }.to_string()),
         (grouped(artists.len() as u64), if artists.len() == 1 { "artist" } else { "artists" }.to_string()),
     ];
     let cards = |sums: &[(String, u64)], known: &[CardData], limit: usize| -> Vec<CardData> {
@@ -1098,23 +1205,40 @@ fn stats(period: usize) -> PageData {
     let top_albums = cards(&albums, &index.library.albums, 10);
     let kinds: Vec<CardData> =
         genres.iter().take(10).map(|(name, times)| CardData { kind: Kind::Genre, id: name.clone(), title: name.clone(), subtitle: plays(*times), cover: String::new() }).collect();
+    // The playlists most played from. Their names are the server's to say; without it
+    // (offline, say) the page does without them.
+    let mut lists: Vec<(&str, u64)> = lists.into_iter().filter_map(|(key, times)| key.strip_prefix("playlist:").map(|id| (id, times))).collect();
+    lists.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    let top_playlists: Vec<CardData> = if lists.is_empty() {
+        Vec::new()
+    } else {
+        let known = client.playlists().unwrap_or_default();
+        lists
+            .iter()
+            .filter_map(|(id, times)| known.iter().find(|playlist| playlist.id == *id).map(|playlist| (playlist, times)))
+            .take(10)
+            .map(|(playlist, times)| CardData { kind: Kind::Playlist, id: playlist.id.clone(), title: playlist.name.clone(), subtitle: plays(*times), cover: playlist.cover_art.clone() })
+            .collect()
+    };
     let shelf = |title: &str, cards: Vec<CardData>| (!cards.is_empty()).then(|| ShelfData { title: title.into(), route: String::new(), wrap: false, cards });
+    let top: Vec<&(&Song, u64)> = songs.iter().take(25).collect();
     PageData {
-        title,
         stats: figures,
         about: note,
         lead: shelf("Top artists", top_artists).into_iter().collect(),
-        songs: songs.iter().take(25).map(|(song, _)| (*song).clone()).collect(),
+        songs: top.iter().map(|(song, _)| (*song).clone()).collect(),
+        song_notes: top.iter().map(|(_, times)| plays(*times)).collect(),
         tracks_title: "Top songs".into(),
         show_album: true,
         show_cover: true,
         show_number: true,
-        shelves: [shelf("Top albums", top_albums), shelf("Most played kinds of music", kinds)].into_iter().flatten().collect(),
+        shelves: [shelf("Top albums", top_albums), shelf("Top genres", kinds), shelf("Top playlists", top_playlists)].into_iter().flatten().collect(),
         context: "Your top songs".into(),
-        ..Default::default()
+        ..blank
     }
 }
 
+/// The page for one of the "Made for you" mixes.
 fn mix(id: &str) -> PageData {
     let made = crate::search::current().and_then(|index| crate::mixes::one(&index, id));
     let Some(mut made) = made else {
@@ -1861,6 +1985,60 @@ mod tests {
         let looking = PageData { offers_title: "Not in your library".into(), offers_note: "Looking for songs…".into(), ..bare.clone() };
         assert_eq!(search_view(&looking, 3).empty, "");
         assert_eq!(search_view(&looking, 3).offers_note, "Looking for songs…");
+    }
+
+    #[test]
+    fn stats_cover_the_right_stretch_of_time() {
+        use chrono::TimeZone;
+        let at = |year, month, day, hour| chrono::Local.with_ymd_and_hms(year, month, day, hour, 0, 0).earliest().unwrap();
+        // A Wednesday afternoon.
+        let now = at(2026, 11, 18, 15);
+        let stamp = |year, month, day, hour| at(year, month, day, hour).timestamp();
+        assert_eq!(stats_span(STATS_TODAY, now).unwrap().0, stamp(2026, 11, 18, 0));
+        // The week began on Monday; the month on the 1st.
+        assert_eq!(stats_span(STATS_WEEK, now).unwrap().0, stamp(2026, 11, 16, 0));
+        assert_eq!(stats_span(STATS_MONTH, now).unwrap().0, stamp(2026, 11, 1, 0));
+        assert_eq!(stats_span(STATS_3_MONTHS, now).unwrap().0, stamp(2026, 8, 18, 0));
+        assert_eq!(stats_span(2025, now).unwrap(), (stamp(2025, 1, 1, 0), stamp(2026, 1, 1, 0)));
+        assert_eq!(stats_span(STATS_ALL, now), None);
+
+        let song = |id: &str, plays: u32| Song { id: id.into(), play_count: plays, ..Default::default() };
+        // The copy of the library was fetched on Tuesday, when "a" had been played 5 times.
+        let library = crate::search::Library { fetched: stamp(2026, 11, 17, 9), songs: vec![song("a", 5), song("b", 0)], ..Default::default() };
+        let log = vec![
+            ("a".to_string(), stamp(2025, 12, 30, 10)),
+            ("a".to_string(), stamp(2026, 11, 2, 10)),
+            ("b".to_string(), stamp(2026, 11, 16, 8)),
+            ("a".to_string(), stamp(2026, 11, 17, 20)),
+            ("b".to_string(), stamp(2026, 11, 18, 9)),
+            ("b".to_string(), stamp(2026, 11, 18, 10)),
+        ];
+        let sources = vec![
+            ("b".to_string(), stamp(2026, 11, 16, 8), "playlist:p".to_string()),
+            ("b".to_string(), stamp(2026, 11, 18, 9), "playlist:p".to_string()),
+            ("b".to_string(), stamp(2026, 11, 18, 10), "playlist:q".to_string()),
+        ];
+        let counts = |period: usize| {
+            let (times, lists) = stats_counts(period, &library, &log, &sources, now);
+            let mut times: Vec<(String, u64)> = times.into_iter().map(|(id, times)| (id.to_string(), times)).collect();
+            let mut lists: Vec<(String, u64)> = lists.into_iter().map(|(id, times)| (id.to_string(), times)).collect();
+            times.sort();
+            lists.sort();
+            (times, lists)
+        };
+        let named = |pairs: &[(&str, u64)]| -> Vec<(String, u64)> { pairs.iter().map(|(id, times)| (id.to_string(), *times)).collect() };
+        assert_eq!(counts(STATS_TODAY), (named(&[("b", 2)]), named(&[("playlist:p", 1), ("playlist:q", 1)])));
+        assert_eq!(counts(STATS_WEEK), (named(&[("a", 1), ("b", 3)]), named(&[("playlist:p", 2), ("playlist:q", 1)])));
+        assert_eq!(counts(STATS_MONTH).0, named(&[("a", 2), ("b", 3)]));
+        assert_eq!(counts(2025).0, named(&[("a", 1)]));
+        // All time: the server's counts, and the plays made since they were fetched (which
+        // a song nobody had played by then gets too).
+        assert_eq!(counts(STATS_ALL), (named(&[("a", 6), ("b", 2)]), named(&[("playlist:p", 2), ("playlist:q", 1)])));
+
+        // The years are offered once the log reaches into more than one.
+        let names = |log: &[(String, i64)]| stats_filters(log, now).into_iter().map(|(name, _)| name).collect::<Vec<_>>();
+        assert_eq!(names(&log), ["Everything", "Last 3 months", "Last 6 months", "Last 12 months", "2026", "2025"]);
+        assert_eq!(names(&log[1..]), ["Everything", "Last 3 months", "Last 6 months", "Last 12 months"]);
     }
 
     #[test]

@@ -12,7 +12,7 @@ import { Drag, App, View, Player, Menu, Prompt, Toast, Lyrics, Settings, Covers,
 import { PageStatus, IconButton } from "widgets.slint";
 import { Sidebar, TopBar, QueuePanel, ConnectPanel, PlayerBar, SearchOverlay, JamStrip } from "chrome.slint";
 import { StackPage, TrackListPage, GridPage, LyricsPage, NowPlayingPage, SettingsPage, LoginPage, JamPage } from "pages.slint";
-import { MenuOverlay, PromptOverlay, ToastOverlay, JamOverlay, DevicesOverlay } from "overlays.slint";
+import { MenuOverlay, PromptOverlay, ToastOverlay, JamOverlay } from "overlays.slint";
 
 export { Theme, App, View, Player, Menu, Prompt, Toast, Lyrics, Settings, Covers, Icons, Page, Track, Card, CardKind, Shelf, Offer, CardRow, PlaylistRef, MenuEntry, LyricLine, QualityOption, ThemeOption, Search, Suggestion, Jam, JamGuest, JamSong, Devices, Device }
 
@@ -280,7 +280,14 @@ export component MainWindow inherits Window {
         : self.tinted ? Covers.tint(View.cover, Covers.rev)
         : App.page == Page.home ? Theme.accent : Theme.panel;
     // The queue panel is on screen and showing what's coming up, so the keyboard can go to it.
-    property <bool> queue-usable: App.queue-open && !Devices.open && self.width >= 1000px && App.queue-tab == 0 && Player.queue.length > 0;
+    // Wide enough for the queue to sit beside the page and leave the page room.
+    property <bool> wide: self.width >= 1100px;
+    changed wide => {
+        if self.wide {
+            App.queue-over = false;
+        }
+    }
+    property <bool> queue-usable: (self.wide ? App.queue-open : App.queue-over) && !Devices.open && App.queue-tab == 0 && Player.queue.length > 0;
     // The Rust side bumps this after navigating, to take the keyboard back from the search box.
     property <int> focus-request: App.main-focus;
     changed focus-request => { keys.focus(); }
@@ -484,10 +491,12 @@ export component MainWindow inherits Window {
             // The top bar's height: panels start below it.
             property <length> top: 60px;
             property <length> side: clamp(root.width * 0.22, 220px, 300px);
-            // The queue steps aside when the window is too narrow to leave the page room.
             // The panel at the side holds the queue, or the list of devices in its place.
-            property <bool> queue-shown: (App.queue-open || Devices.open) && root.width >= 1000px;
+            // In a window too narrow to leave the page room beside it, the panel lies over
+            // the page's right-hand side instead of squeezing it, and only when asked for.
+            property <bool> queue-shown: (root.wide ? App.queue-open : App.queue-over) || Devices.open;
             property <length> queue: self.queue-shown ? clamp(root.width * 0.26, 280px, 360px) : 0px;
+            property <bool> queue-beside: self.queue-shown && root.wide;
             property <length> body: root.height - self.bar - self.top;
 
             Sidebar {
@@ -500,7 +509,7 @@ export component MainWindow inherits Window {
             Rectangle {
                 x: parent.gap * 2 + parent.side;
                 y: parent.top;
-                width: root.width - parent.side - parent.gap * 3 - (parent.queue-shown ? parent.queue + parent.gap : 0px);
+                width: root.width - parent.side - parent.gap * 3 - (parent.queue-beside ? parent.queue + parent.gap : 0px);
                 height: parent.body;
                 background: Theme.panel;
                 border-radius: Theme.radius;
@@ -553,6 +562,7 @@ export component MainWindow inherits Window {
                 y: parent.top;
                 width: parent.queue;
                 height: parent.body;
+                over: !parent.queue-beside;
             }
 
             if self.queue-shown && !Devices.open: QueuePanel {
@@ -560,10 +570,11 @@ export component MainWindow inherits Window {
                 y: parent.top;
                 width: parent.queue;
                 height: parent.body;
+                over: !parent.queue-beside;
             }
 
             PlayerBar {
-                queue-fits: root.width >= 1000px;
+                wide: root.wide;
                 x: 0;
                 y: root.height - parent.bar;
                 width: root.width;
@@ -621,11 +632,6 @@ export component MainWindow inherits Window {
         }
 
         if Jam.open && App.signed-in: JamOverlay { }
-
-        // In a window too narrow for the side panel, the devices are listed over the corner.
-        if Devices.open && App.signed-in && root.width < 1000px: DevicesOverlay {
-            lift: 96px + (Jam.hosting || Jam.joined || Jam.linked ? 32px : 0px);
-        }
 
         if Menu.open: MenuOverlay { }
 

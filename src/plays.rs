@@ -7,6 +7,11 @@
 //!
 //! It is a file that is only ever added to, a line at a time, so noting a play costs the
 //! same however long the log has grown.
+//!
+//! A play made from a playlist says which (from version 0.40), so the playlists played most
+//! can be told too.
+
+use std::collections::HashMap;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -19,20 +24,51 @@ const SLACK: usize = 5_000;
 
 pub struct PlayLog {
     /// The log: a song id and when it was played (seconds since 1970) on each line, oldest
-    /// first.
+    /// first; and after those, for a play made from a playlist, that page's route key.
     path: PathBuf,
     lines: usize,
 }
 
 /// The plays, for the threads that build pages.
 static SHARED: RwLock<Vec<(String, i64)>> = RwLock::new(Vec::new());
+/// Where the plays that were made from a playlist were made from: its route key
+/// ("playlist:abc"), by the play.
+static SOURCES: RwLock<Option<HashMap<(String, i64), String>>> = RwLock::new(None);
 
 pub fn shared() -> Vec<(String, i64)> {
     SHARED.read().map(|plays| plays.clone()).unwrap_or_default()
 }
 
-fn line(song: &str, at: i64) -> String {
-    format!("{}\n", serde_json::to_string(&(song, at)).unwrap_or_default())
+/// The plays that were made from a playlist, each with that playlist's route key.
+pub fn sources() -> Vec<(String, i64, String)> {
+    let Ok(sources) = SOURCES.read() else { return Vec::new() };
+    sources.iter().flatten().map(|((song, at), from)| (song.clone(), *at, from.clone())).collect()
+}
+
+fn source_of(song: &str, at: i64) -> String {
+    let Ok(sources) = SOURCES.read() else { return String::new() };
+    sources.as_ref().and_then(|sources| sources.get(&(song.to_string(), at)).cloned()).unwrap_or_default()
+}
+
+fn note_source(song: &str, at: i64, from: &str) {
+    if from.is_empty() {
+        return;
+    }
+    if let Ok(mut sources) = SOURCES.write() {
+        sources.get_or_insert_with(HashMap::new).insert((song.to_string(), at), from.to_string());
+    }
+}
+
+fn line(song: &str, at: i64, from: &str) -> String {
+    let text = if from.is_empty() { serde_json::to_string(&(song, at)) } else { serde_json::to_string(&(song, at, from)) };
+    format!("{}\n", text.unwrap_or_default())
+}
+
+/// A line of the log: the song, when, and where it was played from if that was noted.
+fn parse(line: &str) -> Option<(String, i64, String)> {
+    serde_json::from_str::<(String, i64, String)>(line)
+        .ok()
+        .or_else(|| serde_json::from_str::<(String, i64)>(line).ok().map(|(song, at)| (song, at, String::new())))
 }
 
 impl PlayLog {
@@ -42,9 +78,19 @@ impl PlayLog {
     pub fn load(old: &Path, recent: &[(String, i64)]) -> PlayLog {
         let path = old.with_extension("log");
         let mut log = PlayLog { path, lines: 0 };
+        if let Ok(mut sources) = SOURCES.write() {
+            *sources = None;
+        }
         let plays: Vec<(String, i64)> = match std::fs::read_to_string(&log.path) {
             // A line cut short by the app being killed is passed over.
-            Ok(text) => text.lines().filter_map(|line| serde_json::from_str(line).ok()).collect(),
+            Ok(text) => text
+                .lines()
+                .filter_map(parse)
+                .map(|(song, at, from)| {
+                    note_source(&song, at, &from);
+                    (song, at)
+                })
+                .collect(),
             Err(_) => {
                 let carried = std::fs::read(old).ok().and_then(|bytes| serde_json::from_slice::<Vec<(String, i64)>>(&bytes).ok());
                 let mut plays = carried.unwrap_or_else(|| recent.to_vec());
@@ -63,7 +109,7 @@ impl PlayLog {
     }
 
     fn rewrite(&self, plays: &[(String, i64)]) {
-        let text: String = plays.iter().map(|(song, at)| line(song, *at)).collect();
+        let text: String = plays.iter().map(|(song, at)| line(song, *at, &source_of(song, *at))).collect();
         crate::config::write_atomically(&self.path, text.as_bytes());
     }
 
@@ -74,14 +120,21 @@ impl PlayLog {
         }
         let Ok(mut shared) = SHARED.write() else { return };
         let extra = shared.len().saturating_sub(LIMIT);
-        shared.drain(..extra);
+        let gone: Vec<(String, i64)> = shared.drain(..extra).collect();
+        if let Ok(mut sources) = SOURCES.write() {
+            if let Some(sources) = sources.as_mut() {
+                for play in &gone {
+                    sources.remove(play);
+                }
+            }
+        }
         self.rewrite(&shared);
         self.lines = shared.len();
     }
 
     /// Takes in plays made on other devices (see `sync`), leaving out the ones already here.
-    /// Returns how many were new.
-    pub fn absorb(&mut self, plays: &[(String, i64)]) -> usize {
+    /// `sources` says which playlists some of them were made from. Returns how many were new.
+    pub fn absorb(&mut self, plays: &[(String, i64)], sources: &[(String, i64, String)]) -> usize {
         let known: std::collections::HashSet<(String, i64)> = match SHARED.read() {
             // Anything another device has to tell is recent, so the newest part is enough to
             // compare with.
@@ -92,16 +145,18 @@ impl PlayLog {
         new.sort_by_key(|(_, at)| *at);
         new.dedup();
         for (song, at) in &new {
-            self.add(song, *at);
+            let from = sources.iter().find(|(other, when, _)| other == song && when == at).map(|(_, _, from)| from.as_str()).unwrap_or("");
+            self.add(song, *at, from);
         }
         new.len()
     }
 
-    /// Notes a play.
-    pub fn add(&mut self, song: &str, at: i64) {
+    /// Notes a play, and the playlist it was made from (its route key) if it was from one.
+    pub fn add(&mut self, song: &str, at: i64, from: &str) {
         if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&self.path) {
-            let _ = file.write_all(line(song, at).as_bytes());
+            let _ = file.write_all(line(song, at, from).as_bytes());
         }
+        note_source(song, at, from);
         if let Ok(mut shared) = SHARED.write() {
             shared.push((song.to_string(), at));
         }
@@ -123,7 +178,7 @@ mod tests {
         std::fs::write(&old, r#"[["a",100],["b",200]]"#).unwrap();
         let mut log = PlayLog::load(&old, &[]);
         assert!(!old.exists());
-        log.add("c", 300);
+        log.add("c", 300, "");
         // Adding a play adds a line and leaves the rest of the file as it was.
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "[\"a\",100]\n[\"b\",200]\n[\"c\",300]\n");
         // A line cut short (the app was killed part-way through writing it) is passed over.
@@ -135,9 +190,19 @@ mod tests {
         // Plays from another device are taken in once each, oldest first.
         let mut log = PlayLog::load(&old, &[("c".to_string(), 300)]);
         let elsewhere = [("z".to_string(), 350), ("c".to_string(), 300), ("y".to_string(), 320), ("z".to_string(), 350)];
-        assert_eq!(log.absorb(&elsewhere), 2);
-        assert_eq!(log.absorb(&elsewhere), 0);
+        let from = [("y".to_string(), 320, "playlist:p".to_string())];
+        assert_eq!(log.absorb(&elsewhere, &from), 2);
+        assert_eq!(log.absorb(&elsewhere, &from), 0);
         assert_eq!(shared(), [("c".to_string(), 300), ("y".to_string(), 320), ("z".to_string(), 350)]);
+        // A play made from a playlist says so, here and after the log is read again.
+        log.add("w", 400, "playlist:q");
+        let mut noted = sources();
+        noted.sort();
+        assert_eq!(noted, [("w".to_string(), 400, "playlist:q".to_string()), ("y".to_string(), 320, "playlist:p".to_string())]);
+        assert!(std::fs::read_to_string(&path).unwrap().ends_with("[\"y\",320,\"playlist:p\"]\n[\"z\",350]\n[\"w\",400,\"playlist:q\"]\n"));
+        PlayLog::load(&old, &[]);
+        assert_eq!(sources().len(), 2);
+        assert_eq!(shared().len(), 4);
         let _ = std::fs::remove_file(&path);
 
         // No log at all: it starts from what Recently played has, which is newest first.

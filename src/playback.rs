@@ -1433,7 +1433,11 @@ impl Controller {
             let threshold = if duration > 0.0 { (duration / 2.0).min(240.0) } else { 240.0 };
             let submit = (!pb.scrobbled && pb.listened >= threshold && song.radio_url.is_empty()).then(|| {
                 pb.scrobbled = true;
-                song.id.clone()
+                // A song playing as part of a playlist counts towards that playlist too; one
+                // put in the queue by hand, or played from anywhere else, doesn't.
+                let listed = pb.order.get(pb.cursor).and_then(|&at| pb.origins.get(at).copied().flatten()).is_some();
+                let from = if listed && pb.source.starts_with("playlist:") { pb.source.clone() } else { String::new() };
+                (song.id.clone(), from)
             });
             let near_end = duration > 0.0 && duration - seconds <= PRELOAD_SECONDS;
             let (seamless, autoplay) = {
@@ -1474,8 +1478,14 @@ impl Controller {
         if checkpoint {
             self.save_queue();
         }
-        if let Some(id) = submit {
-            self.play_log.borrow_mut().add(&id, chrono::Utc::now().timestamp());
+        if let Some((id, from)) = submit {
+            self.play_log.borrow_mut().add(&id, chrono::Utc::now().timestamp(), &from);
+            // The figures on "Your stats" have moved on.
+            self.invalidate("stats");
+            if let Some(route @ Route::Stats(_)) = self.current_route() {
+                let scroll = self.ui.global::<ui::View>().get_scroll_y();
+                self.show(route, scroll, true, None);
+            }
             if self.settings.borrow().scrobble {
                 // Sent now, or kept with its time and sent when the server is next reachable.
                 let at = chrono::Utc::now().timestamp_millis();

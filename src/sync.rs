@@ -60,6 +60,9 @@ pub struct Shared {
     /// for the last weeks and months is worked out from. (Unlike `history`, a song played
     /// twice running is here twice.)
     pub plays: Vec<(String, i64)>,
+    /// For those of `plays` that were made from a playlist: the play, and that playlist's
+    /// route key. (Apart from `plays` so that versions before 0.40 can still read that.)
+    pub play_sources: Vec<(String, i64, String)>,
 }
 
 fn list_rank(prefs: &ListPrefs) -> (i64, bool, usize, bool, bool) {
@@ -86,6 +89,16 @@ pub fn merge_plays(a: &[(String, i64)], b: &[(String, i64)]) -> Vec<(String, i64
     all
 }
 
+/// Where the plays being passed on were made from, as far as either device knows.
+fn merge_sources(a: &Shared, b: &Shared, plays: &[(String, i64)]) -> Vec<(String, i64, String)> {
+    let kept: std::collections::HashSet<(&str, i64)> = plays.iter().map(|(song, at)| (song.as_str(), *at)).collect();
+    let mut all: Vec<(String, i64, String)> =
+        a.play_sources.iter().chain(&b.play_sources).filter(|(song, at, _)| kept.contains(&(song.as_str(), *at))).cloned().collect();
+    all.sort_by(|x, y| y.1.cmp(&x.1).then_with(|| x.0.cmp(&y.0)).then_with(|| x.2.cmp(&y.2)));
+    all.dedup_by(|later, earlier| later.0 == earlier.0 && later.1 == earlier.1);
+    all
+}
+
 /// Combines what two devices know. For each item the newer wins; equally new, the choice is
 /// arbitrary but the same whichever way round they're given, so devices end up agreeing.
 pub fn merge(a: &Shared, b: &Shared, now: i64) -> Shared {
@@ -97,6 +110,7 @@ pub fn merge(a: &Shared, b: &Shared, now: i64) -> Shared {
             lists.insert(key.clone(), *theirs);
         }
     }
+    let plays = merge_plays(&a.plays, &b.plays);
     Shared {
         nexus_music_sync: VERSION,
         pins: if pins_from_a { a.pins.clone() } else { b.pins.clone() },
@@ -106,7 +120,8 @@ pub fn merge(a: &Shared, b: &Shared, now: i64) -> Shared {
         lists,
         added: merge_notes(&a.added, &b.added, now),
         history: merge_history(&a.history, &b.history),
-        plays: merge_plays(&a.plays, &b.plays),
+        play_sources: merge_sources(a, b, &plays),
+        plays,
     }
 }
 
@@ -289,6 +304,11 @@ impl Controller {
         let settings = self.settings.borrow();
         let playlists = self.playlists.borrow();
         let known: HashSet<&str> = playlists.iter().map(|p| p.id.as_str()).collect();
+        let plays = merge_plays(&crate::plays::shared().into_iter().rev().take(PLAYS_SHARED).collect::<Vec<_>>(), &[]);
+        let play_sources = {
+            let kept: HashSet<(&str, i64)> = plays.iter().map(|(song, at)| (song.as_str(), *at)).collect();
+            crate::plays::sources().into_iter().filter(|(song, at, _)| kept.contains(&(song.as_str(), *at))).collect()
+        };
         Shared {
             nexus_music_sync: VERSION,
             pins: settings.pinned_playlists.clone(),
@@ -299,7 +319,8 @@ impl Controller {
             // Before the playlists have loaded there's no telling which still exist.
             added: self.added.borrow().shared((!known.is_empty()).then_some(&known)),
             history: self.history.borrow().iter().map(|played| (played.song.id.clone(), played.at)).collect(),
-            plays: merge_plays(&crate::plays::shared().into_iter().rev().take(PLAYS_SHARED).collect::<Vec<_>>(), &[]),
+            play_sources,
+            plays,
         }
     }
 
@@ -376,7 +397,7 @@ impl Controller {
             self.rebuild_tracks();
         }
         // Plays counted on other devices go into this one's log, so the stats cover them all.
-        if self.play_log.borrow_mut().absorb(&theirs.plays) > 0 {
+        if self.play_log.borrow_mut().absorb(&theirs.plays, &theirs.play_sources) > 0 {
             self.invalidate("stats");
         }
         // Recently played: both devices' plays, in order.

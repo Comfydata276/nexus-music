@@ -660,6 +660,21 @@ export component Chip inherits Rectangle {
     }
 }
 
+// Chips to choose one of a few things by. In a window too narrow for them all on one line
+// they run on to the next, so none is ever out of reach.
+export component ChipRow inherits FlexboxLayout {
+    in property <[string]> names;
+    in property <int> selected;
+    callback chosen(index: int);
+    spacing: 8px;
+
+    for name[index] in root.names: Chip {
+        text: name;
+        selected: index == root.selected;
+        clicked => { root.chosen(index); }
+    }
+}
+
 // Album, artist, playlist or genre in a grid or shelf.
 // Calls `rested` once the pointer has stayed put briefly, so sweeping across a grid of cards
 // doesn't count as interest in every one of them.

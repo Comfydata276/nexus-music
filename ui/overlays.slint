@@ -523,7 +523,8 @@ export component JamOverlay inherits Rectangle {
                         }
 
                         if Jam.guests.length > 0: Flickable {
-                            height: min(guest-rows.preferred-height, 132px);
+                            // Fewer at a time in a short window, so the buttons beneath stay on screen.
+                            height: min(guest-rows.preferred-height, clamp(root.height - 500px, 64px, 132px));
                             content-height: guest-rows.preferred-height;
 
                             guest-rows := VerticalLayout {
@@ -659,75 +660,6 @@ export component DeviceRow inherits Rectangle {
                 font-size: 12px;
                 overflow: elide;
                 accessible-role: none;
-            }
-        }
-    }
-}
-
-// The list of the person's devices, over the bottom right corner where its button is.
-export component DevicesOverlay inherits Rectangle {
-    // How far above the bottom of the window the list sits: clear of the player bar.
-    in property <length> lift: 96px;
-
-    // Anything outside the list closes it.
-    TouchArea {
-        clicked => { Devices.open = false; }
-    }
-
-    Rectangle {
-        x: root.width - self.width - 16px;
-        y: root.height - self.height - root.lift;
-        width: min(340px, root.width - 32px);
-        height: min(content.preferred-height, root.height - root.lift - 16px);
-        border-radius: 12px;
-        background: Theme.overlay;
-        border-width: 1px;
-        border-color: Theme.line;
-        drop-shadow-blur: 32px;
-        drop-shadow-offset-y: 10px;
-        drop-shadow-color: #000000a0;
-        clip: true;
-
-        TouchArea { }
-
-        FocusScope {
-            init => { self.focus(); }
-            key-pressed(event) => {
-                if event.text == Key.Escape {
-                    Devices.open = false;
-                    return accept;
-                }
-                return reject;
-            }
-
-            content := VerticalLayout {
-                padding: 12px;
-                spacing: 4px;
-
-                Text {
-                    height: 32px;
-                    text: "  Connect";
-                    color: Theme.text;
-                    font-family: Theme.display;
-                    font-size: 18px;
-                    font-weight: 700;
-                    vertical-alignment: center;
-                }
-
-                for device in Devices.list: DeviceRow {
-                    device: device;
-                    chosen => {
-                        Devices.open = false;
-                        Devices.choose(device.id);
-                    }
-                }
-
-                if Devices.list.length < 2: Text {
-                    text: "  Your other devices show up here when Nexus Music is open on them, signed in to the same account, with the same relay set up under Settings, Jam.";
-                    color: Theme.muted;
-                    font-size: 12px;
-                    wrap: word-wrap;
-                }
             }
         }
     }

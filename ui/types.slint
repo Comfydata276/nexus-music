@@ -168,6 +168,10 @@ export global App {
     // Requests are switched on, so there's a page for them.
     in property <bool> requests;
     in property <bool> queue-open;
+    // The queue is open over the page, in a window too narrow to have it beside the page.
+    // (Kept apart from `queue-open`, which is remembered: a queue left open in a wide
+    // window mustn't cover the page when the window is made narrow.)
+    in-out property <bool> queue-over;
     // Progress of downloads under way, e.g. "Downloading 3 of 12"; empty when idle.
     in property <string> download-status;
     // The app draws its own title bar, so it needs its own minimise, maximise and close buttons.
@@ -269,6 +273,10 @@ export global View {
     in property <[string]> kinds;
     in property <int> kind;
     callback set-kind(index: int);
+    // Finer choices under the chosen kind ("Your stats" has them under "All time").
+    in property <[string]> sub-kinds;
+    in property <int> sub-kind;
+    callback set-sub-kind(index: int);
     in property <[Offer]> offers;
     in property <[Shelf]> tail;
     callback offer-activated(index: int);
