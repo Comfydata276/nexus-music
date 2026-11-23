@@ -833,8 +833,8 @@ component OffersBlock inherits VerticalLayout {
 // Home, search results and artist pages: a title or hero, then songs, then shelves.
 export component StackPage inherits Rectangle {
     in property <bool> hero;
-    // Room at the top for a search's chips, which stay put while the results scroll: one
-    // line of them or more, and a second set beneath when the chosen one has finer choices.
+    // Room at the top for a search's chips, which stay put while the results scroll, and
+    // for a second line of them beneath when the chosen one has finer choices.
     property <length> bar: View.kinds.length == 0 ? 0px
         : 12px + kinds.height + (View.sub-kinds.length > 0 ? 8px + sub-kinds.height : 0px) + 12px;
 
@@ -842,7 +842,6 @@ export component StackPage inherits Rectangle {
         x: Theme.page-pad;
         y: 12px;
         width: root.width - 2 * Theme.page-pad;
-        height: self.preferred-height;
         visible: View.kinds.length > 0;
         names: View.kinds;
         selected: View.kind;
@@ -853,7 +852,6 @@ export component StackPage inherits Rectangle {
         x: Theme.page-pad;
         y: kinds.y + kinds.height + 8px;
         width: root.width - 2 * Theme.page-pad;
-        height: self.preferred-height;
         visible: View.kinds.length > 0 && View.sub-kinds.length > 0;
         names: View.sub-kinds;
         selected: View.sub-kind;
@@ -2027,8 +2025,7 @@ component EqPanel inherits Rectangle {
 export component SettingsPage inherits Rectangle {
     property <length> column: min(self.width - 2 * Theme.page-pad, 760px);
     property <length> edge: (self.width - self.column) / 2;
-    // The title and the section chips stay put above the settings. In a narrow window the
-    // chips take two lines, and the settings start that much lower. In a short one the
+    // The title and the section chips stay put above the settings. In a short window the
     // title makes way, so the settings keep most of the height.
     property <bool> short: self.height < 480px;
     property <length> head: sections.y + sections.height + 18px;
@@ -2048,7 +2045,6 @@ export component SettingsPage inherits Rectangle {
         x: root.edge;
         y: root.short ? 10px : 66px;
         width: root.column;
-        height: self.preferred-height;
         spacing: 6px;
         names: ["Appearance", "Playback", "Sound", "Storage", "Requests", "Jam", "Account", "About"];
         selected: Settings.tab;
@@ -2089,18 +2085,19 @@ export component SettingsPage inherits Rectangle {
                         SettingRow {
                             title: "Theme";
                             detail: "Colours for the whole app, including the window's title bar.";
-                            // As many to a line as there's room for.
+                            // All on one line while there's room, narrowing to fit; in a very
+                            // narrow window, shared out evenly between two lines.
                             Rectangle {
-                                property <int> fit: max(2, floor((root.column + 10px) / 96px));
+                                property <int> fit: max(2, floor((root.column + 10px) / 86px));
                                 property <int> lines: ceil(Settings.themes.length / self.fit);
-                                // Shared out evenly between the lines, not one left over.
                                 property <int> across: max(1, ceil(Settings.themes.length / self.lines));
-                                width: self.across * 96px - 10px;
+                                property <length> swatch: clamp((root.column - (self.across - 1) * 10px) / self.across, 76px, 124px);
+                                width: self.across * (self.swatch + 10px) - 10px;
                                 height: self.lines * 94px - 10px;
                                 for option[index] in Settings.themes: ThemeSwatch {
-                                    x: mod(index, parent.across) * 96px;
+                                    x: mod(index, parent.across) * (parent.swatch + 10px);
                                     y: floor(index / parent.across) * 94px;
-                                    width: 86px;
+                                    width: parent.swatch;
                                     option: option;
                                     selected: index == Settings.theme;
                                     clicked => { Settings.set-theme(index); }

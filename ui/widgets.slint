@@ -660,18 +660,126 @@ export component Chip inherits Rectangle {
     }
 }
 
-// Chips to choose one of a few things by. In a window too narrow for them all on one line
-// they run on to the next, so none is ever out of reach.
-export component ChipRow inherits FlexboxLayout {
+// An arrow at the end of a row of chips that has more than fits: it brings the rest into view.
+component ChipArrow inherits Rectangle {
+    in property <bool> forward;
+    in property <color> backdrop;
+    callback clicked;
+
+    width: 64px;
+    // The chips fade out under it, so it's plain that the row carries on.
+    background: self.forward
+        ? @linear-gradient(90deg, root.backdrop.with-alpha(0) 0%, root.backdrop 55%, root.backdrop 100%)
+        : @linear-gradient(90deg, root.backdrop 0%, root.backdrop 45%, root.backdrop.with-alpha(0) 100%);
+
+    // A click on the faded part doesn't land on the chip half-hidden beneath it.
+    TouchArea {
+        clicked => { root.clicked(); }
+    }
+
+    Rectangle {
+        x: root.forward ? parent.width - self.width : 0px;
+        width: 30px;
+        height: 30px;
+        border-radius: 15px;
+        background: touch.pressed ? Theme.press : touch.has-hover ? Theme.press : Theme.raised;
+        border-width: 1px;
+        border-color: Theme.line;
+        animate background { duration: 120ms; }
+
+        accessible-role: button;
+        accessible-label: root.forward ? "Show more" : "Show earlier";
+        accessible-action-default => { root.clicked(); }
+
+        touch := TouchArea {
+            mouse-cursor: pointer;
+            clicked => { root.clicked(); }
+        }
+
+        Icon {
+            source: root.forward ? Icons.chevron-right : Icons.chevron-left;
+            size: 16px;
+            tint: Theme.text;
+        }
+    }
+}
+
+// Chips to choose one of a few things by, on one line. In a window too narrow for them all
+// the line scrolls sideways: the chips fade out at the end that has more, under an arrow
+// that brings the rest into view. The mouse wheel moves it too.
+export component ChipRow inherits Rectangle {
     in property <[string]> names;
     in property <int> selected;
+    in property <length> spacing: 8px;
+    // What the row sits on, for the chips to fade into.
+    in property <color> backdrop: Theme.panel;
     callback chosen(index: int);
-    spacing: 8px;
 
-    for name[index] in root.names: Chip {
-        text: name;
-        selected: index == root.selected;
-        clicked => { root.chosen(index); }
+    // How far the line can move, and how far it has.
+    property <length> reach: max(0px, chips.preferred-width - self.width);
+    property <length> offset;
+    // A wider window leaves less to scroll.
+    changed reach => {
+        self.offset = min(self.offset, self.reach);
+    }
+    function move(by: length) {
+        self.offset = clamp(self.offset + by, 0px, self.reach);
+    }
+    // Brings a chip that's part-hidden wholly into view, clear of the arrows.
+    function reveal(x: length, width: length) {
+        if x - 44px < self.offset {
+            self.offset = max(0px, x - 44px);
+        } else if x + width + 44px > self.offset + self.width {
+            self.offset = min(self.reach, x + width + 44px - self.width);
+        }
+    }
+
+    height: 32px;
+
+    TouchArea {
+        scroll-event(event) => {
+            if root.reach <= 0px {
+                return reject;
+            }
+            root.move(event.delta-x != 0px ? -event.delta-x : -event.delta-y);
+            accept
+        }
+
+        Rectangle {
+            clip: true;
+
+            chips := HorizontalLayout {
+                x: -root.offset;
+                width: self.preferred-width;
+                spacing: root.spacing;
+                animate x {
+                    duration: 180ms;
+                    easing: ease-out;
+                }
+
+                for name[index] in root.names: Chip {
+                    text: name;
+                    selected: index == root.selected;
+                    clicked => {
+                        root.reveal(self.x, self.width);
+                        root.chosen(index);
+                    }
+                }
+            }
+        }
+    }
+
+    if root.offset > 0px: ChipArrow {
+        x: 0;
+        backdrop: root.backdrop;
+        clicked => { root.move(-root.width * 0.6); }
+    }
+
+    if root.offset < root.reach: ChipArrow {
+        x: root.width - self.width;
+        forward: true;
+        backdrop: root.backdrop;
+        clicked => { root.move(root.width * 0.6); }
     }
 }
 
