@@ -374,35 +374,21 @@ pub fn scheme_of(address: &str) -> Option<String> {
     split_scheme(address.trim()).map(|(scheme, _)| scheme)
 }
 
-/// The host an address names, in small letters, without a port, a user name or brackets.
-fn host_of(address: &str) -> String {
-    let rest = split_scheme(address).map_or(address, |(_, rest)| rest);
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    let host = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
-    // An IPv6 address is in brackets, with the port after them.
-    match host.strip_prefix('[') {
-        Some(bracketed) => bracketed.split(']').next().unwrap_or_default(),
-        None => host.rsplit_once(':').map_or(host, |(name, _)| name),
-    }
-    .to_lowercase()
-}
-
 /// The addresses to try for what was typed as the server's. One that names its scheme
 /// ("http://", "https://", in any case) is taken at its word. One that doesn't is tried over
-/// HTTPS, and over plain HTTP as well only when it is on the home network, going by where its
-/// name actually leads (see `resolves_home`): the sign-in never goes unencrypted beyond it
-/// unless the person typed "http://" themselves. This looks the name up, so it's for a worker
-/// thread.
+/// HTTPS, and over plain HTTP as well only when it looks like a home-network address, by the
+/// same reading of the address as `unencrypted_beyond_home`: beyond that, the sign-in goes
+/// unencrypted only if the person typed "http://" themselves.
 pub fn addresses_to_try(typed: &str) -> Vec<String> {
     let typed = typed.trim();
     if typed.is_empty() {
         Vec::new()
     } else if split_scheme(typed).is_some() {
         vec![typed.to_string()]
-    } else if resolves_home(&format!("http://{typed}")) {
-        vec![format!("https://{typed}"), format!("http://{typed}")]
-    } else {
+    } else if unencrypted_beyond_home(&format!("http://{typed}")) {
         vec![format!("https://{typed}")]
+    } else {
+        vec![format!("https://{typed}"), format!("http://{typed}")]
     }
 }
 
@@ -411,66 +397,45 @@ pub const TRY_PLAIN_HTTP: &str = "If your server really has no HTTPS, type http:
 
 /// Whether to add `TRY_PLAIN_HTTP` to a failed sign-in to what was `typed`, having tried
 /// `tried` addresses: only HTTPS was tried, because no scheme was typed, and nothing could be
-/// connected to there. Not after a certificate problem (plain HTTP is no cure for that), and
-/// not after the app turned down a redirect to plain HTTP (it's there, and has HTTPS).
+/// connected to there. Not after a certificate problem or any other answer: plain HTTP is no
+/// cure for those.
 pub fn suggests_plain_http(typed: &str, tried: usize, error: &ApiError) -> bool {
     tried == 1 && scheme_of(typed).is_none() && matches!(error, ApiError::Unconnected(_))
 }
 
 /// Whether to warn, at start-up, about signing in to `server` over plain HTTP beyond the home
-/// network, when `warned` is the address last warned about. Looks the name up.
+/// network, when `warned` is the address last warned about.
 pub fn warn_of_plain_http(server: &str, warned: &str) -> bool {
-    server != warned && plain_http_beyond_home(server)
+    server != warned && unencrypted_beyond_home(server)
 }
 
 /// Said when signed in over plain HTTP to a server beyond the home network.
 pub const PLAIN_HTTP_WARNING: &str = "Signed in without encryption: over plain HTTP your sign-in and your music can be read on the way. If your server has an https:// address, sign in with that.";
 
-/// Whether an address is on the home network or this PC, going by every address its name
-/// leads to now (an address typed as numbers leads only to itself). One public address among
-/// them is enough to say no, and so is a name that can't be looked up. This looks the name up,
-/// so it's for a worker thread; the answer is remembered with the lookup, and the connection
-/// made afterwards goes to the same addresses.
-pub fn resolves_home(address: &str) -> bool {
-    let found = dns::lookup(address);
-    !found.is_empty() && found.iter().all(|ip| home_ip(*ip))
-}
-
-/// Whether an address is plain HTTP to somewhere beyond the home network, going by where its
-/// name actually leads: the case where the sign-in can be read on the way. Looks the name up.
-pub fn plain_http_beyond_home(address: &str) -> bool {
-    scheme_of(address).as_deref() == Some("http") && !resolves_home(address.trim())
-}
-
-/// Whether an IP address is on the home network or this PC: private ranges, this PC,
-/// link-local, and the range Tailscale and similar use.
-fn home_ip(ip: std::net::IpAddr) -> bool {
-    use std::net::IpAddr;
-    let v4 = |ip: std::net::Ipv4Addr| {
-        let [a, b, ..] = ip.octets();
-        ip.is_private() || ip.is_loopback() || ip.is_link_local() || (a == 100 && (64..128).contains(&b))
-    };
-    match ip {
-        IpAddr::V4(ip) => v4(ip),
-        IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
-            Some(mapped) => v4(mapped),
-            None => ip.is_loopback() || (ip.segments()[0] & 0xfe00) == 0xfc00 || (ip.segments()[0] & 0xffc0) == 0xfe80,
-        },
-    }
-}
-
 /// Whether an address is plain HTTP to somewhere that isn't on the home network (or this
-/// PC), going by how it's written, without looking the name up: a bare name such as `nas` is
-/// taken to be at home. For a jam relay's link, which is read as it's pasted. The music
-/// server's address is judged by `plain_http_beyond_home`, which looks.
+/// PC): the case where what's sent can be read by others on the way. This goes by how the
+/// address is written, without looking the name up: a bare name such as `nas` is taken to be
+/// at home.
 pub fn unencrypted_beyond_home(address: &str) -> bool {
-    let address = address.trim();
-    if split_scheme(address).is_none_or(|(scheme, _)| scheme != "http") {
+    let Some((scheme, rest)) = split_scheme(address.trim()) else { return false };
+    if scheme != "http" {
         return false;
     }
-    let host = host_of(address);
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        return !home_ip(ip);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+    // An IPv6 address is in brackets, with the port after them.
+    let host = match host.strip_prefix('[') {
+        Some(bracketed) => bracketed.split(']').next().unwrap_or_default(),
+        None => host.rsplit_once(':').map_or(host, |(name, _)| name),
+    }
+    .to_lowercase();
+    if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
+        let [a, b, ..] = ip.octets();
+        // Private ranges, this PC, link-local, and the range Tailscale and similar use.
+        return !(ip.is_private() || ip.is_loopback() || ip.is_link_local() || (a == 100 && (64..128).contains(&b)));
+    }
+    if let Ok(ip) = host.parse::<std::net::Ipv6Addr>() {
+        return !(ip.is_loopback() || (ip.segments()[0] & 0xfe00) == 0xfc00 || (ip.segments()[0] & 0xffc0) == 0xfe80);
     }
     let local = ["localhost", ".local", ".lan", ".home", ".internal", ".home.arpa", ".localdomain"];
     !(host.is_empty() || !host.contains('.') || local.iter().any(|ending| host == ending.trim_start_matches('.') || host.ends_with(ending)))
@@ -478,112 +443,6 @@ pub fn unencrypted_beyond_home(address: &str) -> bool {
 
 /// Longest an API call may take from start to finish. Audio downloads have no such limit.
 const API_TIMEOUT: Duration = Duration::from_secs(45);
-/// Most redirects one request is taken through.
-const MAX_REDIRECTS: usize = 10;
-/// How long a stream has, from the first request to the answer at the end of any redirects.
-/// (Its audio may then take as long as it takes.)
-const STREAM_ANSWER: Duration = Duration::from_secs(30);
-/// The answers that send a request on to another address. (300, 304 and 305 don't.)
-const REDIRECTS: [u16; 5] = [301, 302, 303, 307, 308];
-
-/// What a request carries, which decides which redirects it follows.
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Carries {
-    /// It was built by this client from the server's address, and has the sign-in in its
-    /// address or its form: it goes on only to the same server.
-    SignIn,
-    /// Somewhere else's address, with nothing of the account's in it: a radio station's
-    /// stream, or a cover from another site. It goes wherever it's sent.
-    Nothing,
-}
-
-const REDIRECT_DOWNGRADE: &str = "It sent the app from its HTTPS address on to a plain-HTTP one, where your sign-in could be read on the way, so the app didn't go.";
-const REDIRECT_ELSEWHERE: &str = "It sent the app on to a different server, so the app didn't go, and your sign-in wasn't passed on.";
-const REDIRECT_NAMED: &str = "It sent the app on to an address with a name or password in it, so the app didn't go.";
-const REDIRECT_UNREADABLE: &str = "It sent the app on to an address the app couldn't make sense of.";
-const REDIRECT_LOOP: &str = "It kept sending the app on from one address to another.";
-const OUT_OF_TIME: &str = "The connection timed out. Check the address and your network.";
-
-/// Where a redirect from `from` to `location` goes, if it's one to follow. `location` is read
-/// as a URI reference against `from` (RFC 3986, by the `url` crate): a path, `../`, a query
-/// or fragment alone, or `//` and another host. A request with the sign-in goes on only to the
-/// same server; why not, if not.
-fn redirect_to(carries: Carries, from: &url::Url, location: &str) -> Result<url::Url, &'static str> {
-    let mut to = from.join(location.trim()).map_err(|_| REDIRECT_UNREADABLE)?;
-    // A fragment is for a browser; it isn't sent.
-    to.set_fragment(None);
-    if !matches!(to.scheme(), "http" | "https") {
-        return Err(REDIRECT_UNREADABLE);
-    }
-    if carries == Carries::SignIn {
-        same_server(from, &to)?;
-    }
-    Ok(to)
-}
-
-/// Whether `to` is the same server as `from`, for a request that carries the sign-in: the same
-/// host, and either the same scheme and port or plain HTTP on its usual port going up to HTTPS
-/// on its usual port. Never down from HTTPS to plain HTTP, and never to an address with a
-/// name or password in it.
-fn same_server(from: &url::Url, to: &url::Url) -> Result<(), &'static str> {
-    if from.scheme() == "https" && to.scheme() != "https" {
-        return Err(REDIRECT_DOWNGRADE);
-    }
-    if !to.username().is_empty() || to.password().is_some() {
-        return Err(REDIRECT_NAMED);
-    }
-    // The url crate has already put a name in small letters and an IPv6 address in one form;
-    // a name with a dot on the end is the same name.
-    let host = |url: &url::Url| match url.host() {
-        Some(url::Host::Domain(name)) => Some(name.strip_suffix('.').unwrap_or(name).to_ascii_lowercase()),
-        Some(other) => Some(other.to_string()),
-        None => None,
-    };
-    if host(from).is_none() || host(from) != host(to) {
-        return Err(REDIRECT_ELSEWHERE);
-    }
-    let ports = (from.port_or_known_default(), to.port_or_known_default());
-    let same = match (from.scheme(), to.scheme()) {
-        (a, b) if a == b => ports.0 == ports.1,
-        ("http", "https") => ports == (Some(80), Some(443)),
-        _ => false,
-    };
-    if same { Ok(()) } else { Err(REDIRECT_ELSEWHERE) }
-}
-
-/// Sends a request with `send`, and again wherever the answer redirects it to, by the rules of
-/// `redirect_to`. `send` is given the address and the time left: everything, every redirect
-/// included, is over by `deadline`. A redirect that isn't followed is an error: something
-/// answered in the server's place. A request that had a form sends the same form again, since
-/// it's to the same server's API; one that had none still has none.
-fn follow(
-    carries: Carries,
-    url: &str,
-    deadline: std::time::Instant,
-    mut send: impl FnMut(&str, Duration) -> ApiResult<ureq::http::Response<ureq::Body>>,
-) -> ApiResult<ureq::http::Response<ureq::Body>> {
-    let mut at = url.to_string();
-    let mut been: Vec<String> = Vec::new();
-    loop {
-        let left = deadline.saturating_duration_since(std::time::Instant::now());
-        if left.is_zero() {
-            return Err(ApiError::Network(OUT_OF_TIME.into()));
-        }
-        let response = send(&at, left)?;
-        let location = response.headers().get("location").and_then(|v| v.to_str().ok());
-        let (true, Some(location)) = (REDIRECTS.contains(&response.status().as_u16()), location) else {
-            return Ok(response);
-        };
-        let refused = |why: &str| ApiError::NotSubsonic(why.to_string());
-        let from = url::Url::parse(&at).map_err(|_| refused(REDIRECT_UNREADABLE))?;
-        let next = redirect_to(carries, &from, location).map_err(refused)?.to_string();
-        been.push(from.to_string());
-        if been.contains(&next) || been.len() > MAX_REDIRECTS {
-            return Err(refused(REDIRECT_LOOP));
-        }
-        at = next;
-    }
-}
 
 pub(crate) fn make_agent() -> ureq::Agent {
     agent_following(10, Duration::from_secs(300))
@@ -595,9 +454,7 @@ pub(crate) fn make_agent_idle(idle: Duration) -> ureq::Agent {
     agent_following(10, idle)
 }
 
-/// For callers that need to see where a redirect points instead of being taken there. The
-/// music server's client is one: it follows redirects itself, and only safe ones (see
-/// `follow`), since its requests carry the sign-in.
+/// For callers that need to see where a redirect points instead of being taken there.
 pub(crate) fn make_agent_without_redirects() -> ureq::Agent {
     agent_following(0, Duration::from_secs(300))
 }
@@ -654,20 +511,6 @@ mod dns {
         *CACHE.lock().unwrap() = None;
     }
 
-    /// The IP addresses the host in `address` (a whole URL) leads to, looked up as a request
-    /// to it would look them up, and remembered for that request. Empty if it can't be.
-    pub fn lookup(address: &str) -> Vec<std::net::IpAddr> {
-        let Ok(uri) = address.trim().parse::<Uri>() else { return Vec::new() };
-        CachingResolver::default()
-            .resolve(&uri, &Config::default(), NextTimeout::default())
-            .map(|found| found.iter().map(|addr| addr.ip()).collect())
-            .unwrap_or_default()
-    }
-
-    /// Names that lead where a test says, as `host:port`, whatever the PC's own lookups say.
-    #[cfg(test)]
-    pub static FIXED: Mutex<Option<HashMap<String, Vec<SocketAddr>>>> = Mutex::new(None);
-
     #[derive(Debug, Default)]
     pub struct CachingResolver {
         inner: DefaultResolver,
@@ -684,12 +527,6 @@ mod dns {
                 (Some(scheme), Some(authority)) => DefaultResolver::host_and_port(scheme, authority),
                 _ => None,
             };
-            #[cfg(test)]
-            if let Some(fixed) = key.as_ref().and_then(|key| FIXED.lock().unwrap().as_ref()?.get(key).cloned()) {
-                let mut out = self.empty();
-                fixed.into_iter().for_each(|addr| out.push(addr));
-                return Ok(out);
-            }
             if let Some(key) = &key {
                 let cache = CACHE.lock().unwrap();
                 let hit = cache.as_ref().and_then(|map| map.get(key)).filter(|(at, _)| at.elapsed() < TTL);
@@ -770,7 +607,7 @@ impl Client {
                 username: username.to_string(),
                 salt,
                 token,
-                agent: make_agent_without_redirects(),
+                agent: make_agent(),
                 offline: std::sync::atomic::AtomicBool::new(false),
             }),
         }
@@ -864,7 +701,7 @@ impl Client {
         // so those go in the body of a POST instead (the OpenSubsonic "formPost" extension).
         let response = match url.split_once('?') {
             Some((address, form)) if url.len() > 1800 => self.post_form(address, form)?,
-            _ => self.get(&url, Carries::SignIn, API_TIMEOUT)?,
+            _ => self.get(&url, Some(API_TIMEOUT))?,
         };
         let status = response.status().as_u16();
         let reader = response.into_body().into_reader();
@@ -897,33 +734,30 @@ impl Client {
             .map_err(|e| ApiError::NotSubsonic(format!("Unexpected response from {endpoint}: {e}")))
     }
 
-    /// A GET of `url` that's all over within `overall`, redirects and the body included.
-    fn get(&self, url: &str, carries: Carries, overall: Duration) -> ApiResult<ureq::http::Response<ureq::Body>> {
+    fn get(
+        &self,
+        url: &str,
+        overall: Option<Duration>,
+    ) -> ApiResult<ureq::http::Response<ureq::Body>> {
         self.check_online()?;
-        follow(carries, url, std::time::Instant::now() + overall, |url, left| {
-            self.inner.agent.get(url).config().timeout_global(Some(left)).build().call().map_err(|e| {
-                // The server may have moved; look its address up afresh next time.
-                dns::forget();
-                network_error(&e)
-            })
+        self.inner.agent.get(url).config().timeout_global(overall).build().call().map_err(|e| {
+            // The server may have moved; look its address up afresh next time.
+            dns::forget();
+            network_error(&e)
         })
     }
 
-    /// A form sent to the server's API. Redirected (within the same server), it goes again as
-    /// the same form: without its contents the request would mean nothing.
     fn post_form(&self, address: &str, form: &str) -> ApiResult<ureq::http::Response<ureq::Body>> {
         self.check_online()?;
-        follow(Carries::SignIn, address, std::time::Instant::now() + API_TIMEOUT, |address, left| {
-            self.inner
-                .agent
-                .post(address)
-                .header("Content-Type", "application/x-www-form-urlencoded")
-                .config()
-                .timeout_global(Some(left))
-                .build()
-                .send(form)
-                .map_err(|e| network_error(&e))
-        })
+        self.inner
+            .agent
+            .post(address)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .config()
+            .timeout_global(Some(API_TIMEOUT))
+            .build()
+            .send(form)
+            .map_err(|e| network_error(&e))
     }
 
     /// Opens connections ahead of need, so the first clicks don't pay for setting them up.
@@ -946,7 +780,7 @@ impl Client {
                 username: self.inner.username.clone(),
                 salt: self.inner.salt.clone(),
                 token: self.inner.token.clone(),
-                agent: make_agent_without_redirects(),
+                agent: make_agent(),
                 offline: std::sync::atomic::AtomicBool::new(false),
             }),
         };
@@ -962,7 +796,7 @@ impl Client {
     /// Whether anything at all answers at this address within `limit`. For trying an address
     /// that's only a guess without waiting long on it.
     pub fn answers_within(&self, limit: Duration) -> bool {
-        self.get(&self.url_as(CLIENT_NAME, "ping", &[]), Carries::SignIn, limit).is_ok()
+        self.get(&self.url_as(CLIENT_NAME, "ping", &[]), Some(limit)).is_ok()
     }
 
     pub fn ping(&self) -> ApiResult<ServerInfo> {
@@ -1291,20 +1125,9 @@ impl Client {
         Ok(all.into_iter().find(|l| !l.line.is_empty()))
     }
 
-    /// Fetches a small binary resource such as cover art, from the music server: `url` is one
-    /// this client made.
+    /// Fetches a small binary resource such as cover art.
     pub fn fetch_bytes(&self, url: &str, limit: u64) -> ApiResult<Vec<u8>> {
-        self.fetch_bytes_carrying(url, Carries::SignIn, limit)
-    }
-
-    /// Fetches a small binary resource from another site, such as a cover from a catalogue
-    /// of them. Nothing of the account's goes with it, so it follows redirects anywhere.
-    pub fn fetch_elsewhere(&self, url: &str, limit: u64) -> ApiResult<Vec<u8>> {
-        self.fetch_bytes_carrying(url, Carries::Nothing, limit)
-    }
-
-    fn fetch_bytes_carrying(&self, url: &str, carries: Carries, limit: u64) -> ApiResult<Vec<u8>> {
-        let mut response = self.get(url, carries, API_TIMEOUT)?;
+        let mut response = self.get(url, Some(API_TIMEOUT))?;
         if !response.status().is_success() {
             return Err(ApiError::Network(format!("HTTP status {}.", response.status().as_u16())));
         }
@@ -1316,15 +1139,15 @@ impl Client {
             .map_err(|e| ApiError::Network(e.to_string()))
     }
 
-    /// Opens a song's audio from the music server (`url` is one this client made), optionally
-    /// starting at a byte offset (and ending at an inclusive end offset). Returns the body
-    /// reader and the number of bytes the response will carry, when the server knows it.
+    /// Opens an audio stream, optionally starting at a byte offset (and ending at an inclusive
+    /// end offset). Returns the body reader and the number of bytes the response will carry,
+    /// when the server knows it.
     pub fn open_stream(
         &self,
         url: &str,
         range: Option<(u64, Option<u64>)>,
     ) -> ApiResult<(Box<dyn Read + Send>, Option<u64>)> {
-        self.open_stream_following(url, range, 0, None)
+        self.open_stream_following(url, range, 3, None)
     }
 
     /// Opens an internet radio stream. Stations that announce what they're playing have
@@ -1337,10 +1160,8 @@ impl Client {
         self.open_stream_following(url, None, 3, Some(title))
     }
 
-    /// `live` is given for a radio station, and only then: its address is the station's, not
-    /// the music server's, and carries nothing of the account's. `hops` is how many playlist
-    /// files may be followed before giving up, as stations often publish a small playlist
-    /// that points at the real stream; a song never does that.
+    /// `hops` is how many playlist files may be followed before giving up: radio stations
+    /// often publish a small playlist that points at the real stream.
     fn open_stream_following(
         &self,
         url: &str,
@@ -1349,31 +1170,26 @@ impl Client {
         live: Option<&std::sync::Arc<std::sync::Mutex<String>>>,
     ) -> ApiResult<(Box<dyn Read + Send>, Option<u64>)> {
         self.check_online()?;
-        let carries = if live.is_some() { Carries::Nothing } else { Carries::SignIn };
-        let response = follow(carries, url, std::time::Instant::now() + STREAM_ANSWER, |url, left| {
-            let mut request = self.inner.agent.get(url);
-            if live.is_some() {
-                // Asks the station to include "now playing" announcements in the stream.
-                request = request.header("Icy-MetaData", "1");
-            }
-            if let Some((start, end)) = range {
-                let value = match end {
-                    Some(end) => format!("bytes={start}-{end}"),
-                    None => format!("bytes={start}-"),
-                };
-                request = request.header("Range", value);
-            }
-            // A server that takes the connection and then says nothing is given up on sooner
-            // for audio than for other calls: something is waiting to be heard. Neither wait
-            // goes past the time left for the answer.
-            request
-                .config()
-                .timeout_connect(Some(left.min(Duration::from_secs(8))))
-                .timeout_recv_response(Some(left.min(Duration::from_secs(15))))
-                .build()
-                .call()
-                .map_err(|e| network_error(&e))
-        })?;
+        let mut request = self.inner.agent.get(url);
+        if live.is_some() {
+            // Asks the station to include "now playing" announcements in the stream.
+            request = request.header("Icy-MetaData", "1");
+        }
+        if let Some((start, end)) = range {
+            let value = match end {
+                Some(end) => format!("bytes={start}-{end}"),
+                None => format!("bytes={start}-"),
+            };
+            request = request.header("Range", value);
+        }
+        // A server that takes the connection and then says nothing is given up on sooner for
+        // audio than for other calls: something is waiting to be heard.
+        let response = request
+            .config()
+            .timeout_recv_response(Some(Duration::from_secs(15)))
+            .build()
+            .call()
+            .map_err(|e| ApiError::Network(network_hint(&e)))?;
         let status = response.status().as_u16();
         if !response.status().is_success() {
             return Err(ApiError::Network(format!("HTTP status {status}.")));
@@ -1396,7 +1212,7 @@ impl Client {
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default()
             .to_lowercase();
-        if live.is_some() && range.is_none() && (kind.contains("mpegurl") || kind.contains("scpls") || kind.contains("pls+xml")) {
+        if range.is_none() && (kind.contains("mpegurl") || kind.contains("scpls") || kind.contains("pls+xml")) {
             let mut response = response;
             let text = response
                 .body_mut()
@@ -1480,7 +1296,7 @@ fn stream_in_playlist(text: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// What a request that failed to get an answer comes to.
+/// What an API request that failed to get an answer comes to.
 fn network_error(err: &ureq::Error) -> ApiError {
     use std::io::ErrorKind;
     let unconnected = match err {
@@ -1517,23 +1333,9 @@ pub(crate) mod fake {
     use std::net::{TcpListener, TcpStream};
     use std::sync::Arc;
 
-    /// A request as it reached a test server.
-    #[derive(Debug, Clone, Default)]
-    pub struct Arrived {
-        pub method: String,
-        /// The path and query, as in "/rest/ping?u=...".
-        pub target: String,
-        pub body: String,
-    }
-
     /// Starts a web server for one test and gives its address. `answer` is given each request
     /// in turn: its path and query (as in "/rest/ping?u=..."), and the connection to answer on.
     pub fn server(answer: impl Fn(&str, &mut TcpStream) + Send + Sync + 'static) -> String {
-        recording(move |arrived, stream| answer(&arrived.target, stream))
-    }
-
-    /// The same, with the whole request: its method and body as well.
-    pub fn recording(answer: impl Fn(&Arrived, &mut TcpStream) + Send + Sync + 'static) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = format!("http://{}", listener.local_addr().unwrap());
         let answer = Arc::new(answer);
@@ -1550,27 +1352,14 @@ pub(crate) mod fake {
                     if first.trim().is_empty() {
                         return;
                     }
-                    let mut length = 0;
                     loop {
                         let mut line = String::new();
                         if lines.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
                             break;
                         }
-                        if let Some((name, value)) = line.split_once(':') {
-                            if name.eq_ignore_ascii_case("content-length") {
-                                length = value.trim().parse().unwrap_or(0);
-                            }
-                        }
                     }
-                    let mut body = vec![0u8; length];
-                    let _ = std::io::Read::read_exact(&mut lines, &mut body);
-                    let mut words = first.split_whitespace();
-                    let arrived = Arrived {
-                        method: words.next().unwrap_or_default().to_string(),
-                        target: words.next().unwrap_or_default().to_string(),
-                        body: String::from_utf8_lossy(&body).into_owned(),
-                    };
-                    answer(&arrived, &mut stream);
+                    let target = first.split_whitespace().nth(1).unwrap_or_default().to_string();
+                    answer(&target, &mut stream);
                 });
             }
         });
@@ -1589,65 +1378,11 @@ pub(crate) mod fake {
             body.len()
         );
     }
-
-    /// Answers that what was asked for is at `location` instead.
-    pub fn moved(stream: &mut TcpStream, location: &str) {
-        redirect(stream, 302, location);
-    }
-
-    /// Answers with `status`, pointing at `location`.
-    pub fn redirect(stream: &mut TcpStream, status: u16, location: &str) {
-        let _ = write!(stream, "HTTP/1.1 {status} Moved\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    /// Has `name` lead to `ips` for the rest of the test run, on any port the tests use.
-    fn pretend_name(name: &str, ips: &[&str]) {
-        let mut fixed = dns::FIXED.lock().unwrap();
-        let fixed = fixed.get_or_insert_with(Default::default);
-        for port in [80, 443, 4533] {
-            let addrs = ips.iter().map(|ip| std::net::SocketAddr::new(ip.parse().unwrap(), port)).collect();
-            fixed.insert(format!("{name}:{port}"), addrs);
-        }
-    }
-
-    #[test]
-    fn plain_http_is_tried_only_where_the_name_really_leads_home() {
-        // A bare name isn't taken to be at home: it's looked up.
-        pretend_name("faraway-nas", &["203.0.113.7"]);
-        pretend_name("nearby-nas", &["192.168.1.5"]);
-        pretend_name("split-nas", &["192.168.1.6", "2001:db8::6"]);
-        pretend_name("mapped-nas", &["::ffff:10.0.0.9"]);
-        assert_eq!(addresses_to_try("faraway-nas:4533"), ["https://faraway-nas:4533"]);
-        assert_eq!(addresses_to_try("nearby-nas:4533"), ["https://nearby-nas:4533", "http://nearby-nas:4533"]);
-        assert_eq!(addresses_to_try("mapped-nas"), ["https://mapped-nas", "http://mapped-nas"]);
-        // One public address among them is enough to say no.
-        assert_eq!(addresses_to_try("split-nas"), ["https://split-nas"]);
-        // A name under a home-sounding ending is looked up too.
-        pretend_name("music.lan", &["198.51.100.20"]);
-        assert_eq!(addresses_to_try("music.lan"), ["https://music.lan"]);
-        // A name that can't be looked up gets no fallback either.
-        assert_eq!(addresses_to_try("no-such-host.invalid"), ["https://no-such-host.invalid"]);
-        assert_eq!(addresses_to_try("localhost:4533"), ["https://localhost:4533", "http://localhost:4533"]);
-        // The warning goes by the same judgement.
-        assert!(plain_http_beyond_home("http://faraway-nas:4533"));
-        assert!(plain_http_beyond_home("HTTP://split-nas"));
-        assert!(!plain_http_beyond_home("http://nearby-nas:4533"));
-        assert!(!plain_http_beyond_home("https://faraway-nas"));
-        assert!(!plain_http_beyond_home("http://127.0.0.1:4533"));
-        assert!(plain_http_beyond_home("http://203.0.113.7"));
-        // At start-up, once for each address.
-        assert!(warn_of_plain_http("http://faraway-nas:4533", ""));
-        assert!(!warn_of_plain_http("http://faraway-nas:4533", "http://faraway-nas:4533"));
-        assert!(warn_of_plain_http("http://faraway-nas:4533", "http://203.0.113.7"));
-        assert!(!warn_of_plain_http("http://nearby-nas:4533", ""));
-        assert!(!warn_of_plain_http("https://faraway-nas", ""));
-    }
 
     #[test]
     fn suggests_plain_http_only_when_nothing_could_be_connected_to() {
@@ -1656,10 +1391,10 @@ mod tests {
         // Typed with a scheme, or plain HTTP already tried: nothing to suggest.
         assert!(!suggests_plain_http("https://music.example.org", 1, &refused));
         assert!(!suggests_plain_http("nas", 2, &refused));
-        // A certificate problem, a name not found, a redirect turned down, a server's "no".
+        // A certificate problem, something that isn't a Navidrome server, a server's "no".
         for other in [
             ApiError::Network("The secure connection failed (certificate).".into()),
-            ApiError::NotSubsonic(REDIRECT_DOWNGRADE.into()),
+            ApiError::NotSubsonic("HTTP status 404.".into()),
             ApiError::Server { code: 40, message: "wrong".into() },
         ] {
             assert!(!suggests_plain_http("music.example.org", 1, &other), "{other:?}");
@@ -1685,20 +1420,31 @@ mod tests {
         });
         let error = Client::new(&address, "someone", "secret").ping().unwrap_err();
         assert!(matches!(error, ApiError::Network(_)), "{error:?}");
-        // Turned away from a redirect down to plain HTTP: something answered.
-        let error = follow(Carries::SignIn, "https://music.example.org/rest/ping", far_off(), |url, _| {
-            Ok(answer(if url.starts_with("https") { 301 } else { 200 }, "http://music.example.org/rest/ping"))
-        })
-        .unwrap_err();
-        assert!(matches!(error, ApiError::NotSubsonic(_)), "{error:?}");
+        assert!(error.is_network());
+    }
+
+    #[test]
+    fn knows_when_the_scan_count_is_the_song_count() {
+        let info = |kind: &str, version: &str| ServerInfo { kind: kind.into(), version: version.into() };
+        assert!(info("navidrome", "0.55.0 (1a2b3c)").counts_songs());
+        assert!(info("navidrome", "0.58.5").counts_songs());
+        assert!(info("Navidrome", "v1.0.0").counts_songs());
+        assert!(!info("navidrome", "0.54.5 (1a2b3c)").counts_songs());
+        assert!(!info("", "1.16.1").counts_songs());
+        assert!(!info("gonic", "0.60.0").counts_songs());
     }
 
     #[test]
     fn tries_https_first_and_knows_when_plain_http_matters() {
-        // With no scheme typed, plain HTTP is tried as well only on the home network.
-        pretend_name("music.example.org", &["203.0.113.8"]);
+        // With no scheme typed, plain HTTP is tried as well only for an address that looks
+        // like a home one.
         assert_eq!(addresses_to_try(" music.example.org "), ["https://music.example.org"]);
+        assert_eq!(addresses_to_try("music.example.org:4533"), ["https://music.example.org:4533"]);
+        assert_eq!(addresses_to_try("8.8.8.8:4533"), ["https://8.8.8.8:4533"]);
         assert_eq!(addresses_to_try("192.168.1.5:4533"), ["https://192.168.1.5:4533", "http://192.168.1.5:4533"]);
+        assert_eq!(addresses_to_try("nas:4533"), ["https://nas:4533", "http://nas:4533"]);
+        assert_eq!(addresses_to_try("music.lan"), ["https://music.lan", "http://music.lan"]);
+        assert_eq!(addresses_to_try("localhost:4533"), ["https://localhost:4533", "http://localhost:4533"]);
         assert_eq!(addresses_to_try("http://192.168.1.5:4533"), ["http://192.168.1.5:4533"]);
         // Typed with "http://" it's taken at its word, in whatever case.
         assert_eq!(addresses_to_try("http://music.example.org"), ["http://music.example.org"]);
@@ -1714,6 +1460,12 @@ mod tests {
         assert_eq!(scheme_of(" HTTPS://music.example.org").as_deref(), Some("https"));
         assert_eq!(scheme_of("music.example.org:4533"), None);
         assert_eq!(scheme_of("://x"), None);
+        // At start-up, once for each address, and only beyond home.
+        assert!(warn_of_plain_http("http://music.example.org:4533", ""));
+        assert!(!warn_of_plain_http("http://music.example.org:4533", "http://music.example.org:4533"));
+        assert!(warn_of_plain_http("http://music.example.org:4533", "http://8.8.8.8"));
+        assert!(!warn_of_plain_http("http://192.168.1.5:4533", ""));
+        assert!(!warn_of_plain_http("https://music.example.org", ""));
         // Plain HTTP only matters where someone else could be listening.
         for home in ["http://192.168.1.5:4533", "http://10.0.0.2", "http://localhost:4533", "http://nas:4533", "http://nas.local", "http://music.lan/", "http://100.96.1.2:4533", "http://127.0.0.1:4533", "http://[::1]:4533", "http://[fd00::5]:4533"] {
             assert!(!unencrypted_beyond_home(home), "{home}");
@@ -1751,270 +1503,6 @@ mod tests {
         assert_eq!(normalize_server_url("http://tower:4533/app#/"), "http://tower:4533");
         // The scheme in small letters, so it's the same account however it was typed.
         assert_eq!(normalize_server_url("HTTP://tower:4533"), "http://tower:4533");
-    }
-
-    fn far_off() -> std::time::Instant {
-        std::time::Instant::now() + Duration::from_secs(30)
-    }
-
-    /// An answer with `status`, and `location` if it's a redirect.
-    fn answer(status: u16, location: &str) -> ureq::http::Response<ureq::Body> {
-        let mut response = ureq::http::Response::builder().status(status);
-        if (300..400).contains(&status) {
-            response = response.header("location", location);
-        }
-        response.body(ureq::Body::builder().data("")).unwrap()
-    }
-
-    /// Where a redirect from `from` to `location` is followed to, for a request with the
-    /// sign-in, or why not.
-    fn signed_to(from: &str, location: &str) -> Result<String, &'static str> {
-        redirect_to(Carries::SignIn, &url::Url::parse(from).unwrap(), location).map(|to| to.to_string())
-    }
-
-    #[test]
-    fn reads_where_a_redirect_points_as_a_uri_reference() {
-        let from = "http://tower:4533/music/rest/ping?u=a";
-        assert_eq!(signed_to(from, "/rest/ping?u=a"), Ok("http://tower:4533/rest/ping?u=a".into()));
-        assert_eq!(signed_to(from, "stream?id=1"), Ok("http://tower:4533/music/rest/stream?id=1".into()));
-        assert_eq!(signed_to(from, "./stream"), Ok("http://tower:4533/music/rest/stream".into()));
-        assert_eq!(signed_to(from, "../rest/ping"), Ok("http://tower:4533/music/rest/ping".into()));
-        assert_eq!(signed_to(from, "../../../../rest/ping"), Ok("http://tower:4533/rest/ping".into()));
-        assert_eq!(signed_to(from, "?u=b"), Ok("http://tower:4533/music/rest/ping?u=b".into()));
-        // A fragment alone is the same address; it isn't sent.
-        assert_eq!(signed_to(from, "#top"), Ok("http://tower:4533/music/rest/ping?u=a".into()));
-        assert_eq!(signed_to(from, "ping/"), Ok("http://tower:4533/music/rest/ping/".into()));
-        // Protocol-relative: the same scheme, and whatever host it names.
-        assert_eq!(signed_to(from, "//tower:4533/rest/ping"), Ok("http://tower:4533/rest/ping".into()));
-        assert_eq!(signed_to(from, "//elsewhere/rest/ping"), Err(REDIRECT_ELSEWHERE));
-        assert_eq!(signed_to(from, " HTTP://TOWER:4533/x "), Ok("http://tower:4533/x".into()));
-        assert_eq!(signed_to(from, "ftp://tower/x"), Err(REDIRECT_UNREADABLE));
-        assert_eq!(signed_to(from, "http://[::1"), Err(REDIRECT_UNREADABLE));
-    }
-
-    #[test]
-    fn follows_a_redirect_with_the_sign_in_only_to_the_same_server() {
-        // The same host however it's written: case, a dot on the end, IPv6 in another form.
-        assert!(signed_to("http://tower:4533/x", "http://TOWER:4533/y").is_ok());
-        assert!(signed_to("https://music.example.org/x", "https://music.example.org./y").is_ok());
-        assert!(signed_to("http://[::1]:4533/x", "http://[0:0:0:0:0:0:0:1]:4533/y").is_ok());
-        assert!(signed_to("https://music.example.org/x", "https://music.example.org:443/y").is_ok());
-        // Up from plain HTTP to HTTPS on the same host, each on its usual port.
-        assert!(signed_to("http://music.example.org/x", "https://music.example.org/x").is_ok());
-        assert!(signed_to("http://music.example.org:80/x", "https://music.example.org:443/x").is_ok());
-        assert_eq!(signed_to("http://tower:4533/x", "https://tower:4533/x"), Err(REDIRECT_ELSEWHERE));
-        assert_eq!(signed_to("http://tower:4533/x", "https://tower/x"), Err(REDIRECT_ELSEWHERE));
-        // Another port on the same host is another server.
-        assert_eq!(signed_to("http://tower:4533/x", "http://tower:8080/x"), Err(REDIRECT_ELSEWHERE));
-        assert_eq!(signed_to("https://music.example.org/x", "https://music.example.org:8443/x"), Err(REDIRECT_ELSEWHERE));
-        // Another host, including one under the same name, or the same machine by number.
-        assert_eq!(signed_to("https://music.example.org/x", "https://auth.example.org/x"), Err(REDIRECT_ELSEWHERE));
-        assert_eq!(signed_to("https://music.example.org/x", "https://music.example.org.evil.test/x"), Err(REDIRECT_ELSEWHERE));
-        assert_eq!(signed_to("http://localhost:4533/x", "http://127.0.0.1:4533/x"), Err(REDIRECT_ELSEWHERE));
-        // Never down to plain HTTP, even on the same host.
-        assert_eq!(signed_to("https://music.example.org/x", "http://music.example.org/x"), Err(REDIRECT_DOWNGRADE));
-        assert_eq!(signed_to("https://music.example.org/x", "HTTP://music.example.org/x"), Err(REDIRECT_DOWNGRADE));
-        // Never to an address with a name or password in it.
-        assert_eq!(signed_to("http://tower:4533/x", "http://someone@tower:4533/x"), Err(REDIRECT_NAMED));
-        assert_eq!(signed_to("http://tower:4533/x", "http://:secret@tower:4533/x"), Err(REDIRECT_NAMED));
-        // What carries nothing goes anywhere.
-        let station = url::Url::parse("https://radio.example.org/live").unwrap();
-        assert!(redirect_to(Carries::Nothing, &station, "http://cdn.example.net/live.mp3").is_ok());
-    }
-
-    #[test]
-    fn follows_http_up_to_https_on_the_usual_ports() {
-        // (A test can't listen on the usual ports, so this one answers in place of a network.)
-        let mut asked = Vec::new();
-        let response = follow(Carries::SignIn, "http://music.example.org/rest/ping?u=a", far_off(), |url, _| {
-            asked.push(url.to_string());
-            Ok(if url.starts_with("http:") { answer(301, "https://music.example.org/rest/ping?u=a") } else { answer(200, "") })
-        })
-        .unwrap();
-        assert_eq!(response.status(), 200);
-        assert_eq!(asked, ["http://music.example.org/rest/ping?u=a", "https://music.example.org/rest/ping?u=a"]);
-        // Only the five redirects are followed: 300 and 304 come back as they are.
-        for status in [300, 304] {
-            let mut asked = 0;
-            let response = follow(Carries::SignIn, "http://tower/x", far_off(), |_, _| {
-                asked += 1;
-                Ok(answer(status, "/y"))
-            })
-            .unwrap();
-            assert_eq!((response.status().as_u16(), asked), (status, 1));
-        }
-    }
-
-    /// A long playlist: its request goes as a form in the body of a POST.
-    fn long_list() -> Vec<String> {
-        (0..300).map(|n| format!("song-{n:05}")).collect()
-    }
-
-    #[test]
-    fn a_long_form_is_sent_again_within_the_server_and_never_to_another() {
-        for status in [302, 303, 307, 308] {
-            // Somewhere else, which counts what reaches it: by another name, and on another port.
-            let reached = Arc::new(std::sync::Mutex::new(Vec::<fake::Arrived>::new()));
-            let log = reached.clone();
-            let elsewhere = fake::recording(move |arrived, stream| {
-                log.lock().unwrap().push(arrived.clone());
-                fake::ok(stream, "");
-            });
-            let by_name = elsewhere.replace("127.0.0.1", "localhost");
-            let arrived = Arc::new(std::sync::Mutex::new(Vec::<fake::Arrived>::new()));
-            let log = arrived.clone();
-            let server = fake::recording(move |request, stream| {
-                log.lock().unwrap().push(request.clone());
-                let path = request.target.split('?').next().unwrap();
-                match path {
-                    "/rest/createPlaylist" => fake::redirect(stream, status, "/moved/rest/createPlaylist"),
-                    "/moved/rest/createPlaylist" => fake::ok(stream, ""),
-                    "/rest/getPlaylist" => fake::redirect(stream, status, &format!("{by_name}/rest/getPlaylist")),
-                    // A removal goes to the same machine by another name; an addition to the
-                    // same name on another port.
-                    _ if request.body.contains("songIndexToRemove") => fake::redirect(stream, status, &format!("{by_name}{path}")),
-                    _ => fake::redirect(stream, status, &format!("{elsewhere}{path}")),
-                }
-            });
-            let client = Client::new(&server, "someone", "secret");
-            let songs = long_list();
-            client.replace_playlist("p1", &songs).unwrap_or_else(|e| panic!("{status}: {e}"));
-            let seen = arrived.lock().unwrap().clone();
-            assert_eq!(seen.len(), 2, "{status}");
-            // The same POST, with the same form, sign-in and all.
-            assert!(seen.iter().all(|request| request.method == "POST"), "{status}: {seen:?}");
-            assert_eq!(seen[0].body, seen[1].body, "{status}");
-            assert!(seen[1].body.contains("u=someone") && seen[1].body.contains("t=") && seen[1].body.contains("song-00299"), "{status}");
-            // Sent on to another server, it doesn't go, and it's no success.
-            let positions: Vec<usize> = (0..400).collect();
-            for refused in [client.add_to_playlist("p1", &songs), client.remove_many_from_playlist("p1", &positions), client.playlist("x").map(drop)] {
-                let error = refused.unwrap_err();
-                assert!(matches!(error, ApiError::NotSubsonic(_)), "{status}: {error:?}");
-                assert!(error.to_string().contains("didn't go"), "{error}");
-            }
-            assert!(reached.lock().unwrap().is_empty(), "{status}: {:?}", reached.lock().unwrap());
-        }
-    }
-
-    #[test]
-    fn a_redirect_to_another_server_or_port_is_not_followed() {
-        let reached = Arc::new(AtomicUsize::new(0));
-        let counter = reached.clone();
-        let elsewhere = fake::server(move |_, stream| {
-            counter.fetch_add(1, Ordering::Relaxed);
-            fake::ok(stream, "");
-        });
-        // The same machine by another name, and the same name on another port.
-        let by_name = elsewhere.replace("127.0.0.1", "localhost");
-        let secure = elsewhere.replace("http://", "https://");
-        let named = elsewhere.replace("http://", "http://someone@");
-        let server = fake::server(move |target, stream| {
-            let path = target.split('?').next().unwrap();
-            match path {
-                "/rest/ping" => fake::moved(stream, &format!("{by_name}{target}")),
-                "/rest/getScanStatus" => fake::moved(stream, &format!("{elsewhere}{target}")),
-                "/rest/getGenres" => fake::moved(stream, &format!("{secure}{target}")),
-                "/rest/getStarred2" => fake::moved(stream, &format!("{named}{target}")),
-                "/rest/getPlaylists" => fake::redirect(stream, 300, &format!("{elsewhere}{target}")),
-                _ => fake::ok(stream, ""),
-            }
-        });
-        let client = Client::new(&server, "someone", "secret");
-        for refused in [client.ping().map(drop), client.scan_status().map(drop), client.genres().map(drop), client.starred().map(drop), client.playlists().map(drop)] {
-            let error = refused.unwrap_err();
-            assert!(matches!(error, ApiError::NotSubsonic(_)), "{error:?}");
-        }
-        assert_eq!(reached.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn the_usual_proxy_redirects_still_sign_in() {
-        // A slash added on the end, a server moved to a path of its own, and `..` in the way.
-        let server = fake::server(move |target, stream| {
-            let (path, query) = target.split_once('?').unwrap_or((target, ""));
-            match path {
-                "/rest/ping" => fake::redirect(stream, 301, &format!("/rest/ping/?{query}")),
-                "/rest/ping/" => fake::redirect(stream, 308, &format!("/music/rest/ping?{query}")),
-                "/music/rest/ping" => fake::ok(stream, ""),
-                "/rest/getScanStatus" => fake::redirect(stream, 307, &format!("../music/./rest/getScanStatus?{query}")),
-                "/music/rest/getScanStatus" => fake::ok(stream, r#""scanStatus":{"scanning":false,"count":7}"#),
-                _ => fake::ok(stream, ""),
-            }
-        });
-        let client = Client::new(&server, "someone", "secret");
-        client.ping().unwrap();
-        assert_eq!(client.scan_status().unwrap().count, Some(7));
-    }
-
-    #[test]
-    fn one_deadline_covers_every_redirect() {
-        // Each answer takes a while and sends the app on to another address on the same server.
-        let server = fake::server(move |target, stream| {
-            std::thread::sleep(Duration::from_millis(400));
-            let hop: u32 = target.trim_start_matches("/hop").split(['/', '?']).next().unwrap().parse().unwrap_or(0);
-            fake::moved(stream, &format!("/hop{}/rest/ping", hop + 1));
-        });
-        let client = Client::new(&server, "someone", "secret");
-        let started = std::time::Instant::now();
-        assert!(!client.answers_within(Duration::from_secs(1)));
-        assert!(started.elapsed() < Duration::from_millis(1800), "{:?}", started.elapsed());
-    }
-
-    #[test]
-    fn stops_when_redirects_go_round_in_a_circle() {
-        let asked = Arc::new(AtomicUsize::new(0));
-        let counter = asked.clone();
-        let server = fake::server(move |target, stream| {
-            counter.fetch_add(1, Ordering::Relaxed);
-            let other = if target.starts_with("/a") { "/b" } else { "/a" };
-            fake::moved(stream, other);
-        });
-        let error = Client::new(&server, "someone", "secret").ping().unwrap_err();
-        assert_eq!(error.to_string(), format!("That address didn't answer like a Navidrome server. {REDIRECT_LOOP}"));
-        assert_eq!(asked.load(Ordering::Relaxed), 3);
-    }
-
-    #[test]
-    fn radio_is_told_apart_by_how_it_was_asked_for_not_by_its_address() {
-        use std::io::Write;
-        // A station, and the stream its playlist and its redirect lead to, on other servers.
-        let reached = Arc::new(AtomicUsize::new(0));
-        let counter = reached.clone();
-        let stream_host = fake::server(move |_, stream| {
-            counter.fetch_add(1, Ordering::Relaxed);
-            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg\r\nContent-Length: 4\r\nConnection: close\r\n\r\nabcd");
-        });
-        let target = stream_host.replace("127.0.0.1", "localhost");
-        let playlist = format!("#EXTM3U\n{target}/live.mp3\n");
-        let station = fake::server(move |path, stream| {
-            if path.starts_with("/moved") {
-                fake::moved(stream, &format!("{target}/live.mp3"));
-            } else {
-                let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: audio/x-mpegurl\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{playlist}", playlist.len());
-            }
-        });
-        // The music server is elsewhere again: the station's address isn't under it.
-        let client = Client::new("http://127.0.0.1:9", "someone", "secret");
-        let title = Arc::new(std::sync::Mutex::new(String::new()));
-        // As a radio station: its playlist and its redirect are followed wherever they lead.
-        assert!(client.open_live(&format!("{station}/listen.m3u"), &title).is_ok());
-        assert!(client.open_live(&format!("{station}/moved"), &title).is_ok());
-        assert_eq!(reached.load(Ordering::Relaxed), 2);
-        // As a song, the same addresses lead nowhere else.
-        assert!(client.open_stream(&format!("{station}/moved"), None).is_err());
-        let _ = client.open_stream(&format!("{station}/listen.m3u"), None);
-        assert_eq!(reached.load(Ordering::Relaxed), 2);
-    }
-
-    #[test]
-    fn knows_when_the_scan_count_is_the_song_count() {
-        let info = |kind: &str, version: &str| ServerInfo { kind: kind.into(), version: version.into() };
-        assert!(info("navidrome", "0.55.0 (1a2b3c)").counts_songs());
-        assert!(info("navidrome", "0.58.5").counts_songs());
-        assert!(info("Navidrome", "v1.0.0").counts_songs());
-        assert!(!info("navidrome", "0.54.5 (1a2b3c)").counts_songs());
-        assert!(!info("", "1.16.1").counts_songs());
-        assert!(!info("gonic", "0.60.0").counts_songs());
     }
 
     #[test]

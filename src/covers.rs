@@ -250,8 +250,7 @@ fn cover_file(client: &Client, dir: &Path, id: &str, size: u32) -> Option<(Vec<u
         }
     }
     let address = if remote { id.to_string() } else { client.cover_url(id, size) };
-    // A cover from another site carries nothing of the account's; one from the server does.
-    let fetched = if remote { client.fetch_elsewhere(&address, 16 * 1024 * 1024) } else { client.fetch_bytes(&address, 16 * 1024 * 1024) }.ok();
+    let fetched = client.fetch_bytes(&address, 16 * 1024 * 1024).ok();
     if let Some(bytes) = &fetched {
         // Write beside it and rename, so nobody reads a half-written file.
         let partial = path.with_extension("part");

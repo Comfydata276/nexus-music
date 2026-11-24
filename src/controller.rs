@@ -923,27 +923,16 @@ impl Controller {
     /// was typed so or saved by an older version's fallback), but the person is told, once
     /// for that address, and how to put it right.
     fn warn_of_plain_http(self: &Rc<Self>) {
-        let (server, warned) = {
+        let server = {
             let settings = self.settings.borrow();
-            (settings.server.clone(), settings.plain_http_warned.clone())
-        };
-        if crate::subsonic::scheme_of(&server).as_deref() != Some("http") || server == warned {
-            return;
-        }
-        // Where the name leads is looked up away from the window's thread.
-        self.api_pool.spawn(move || {
-            if !crate::subsonic::warn_of_plain_http(&server, &warned) {
+            if !crate::subsonic::warn_of_plain_http(&settings.server, &settings.plain_http_warned) {
                 return;
             }
-            post(move |ctl| {
-                if ctl.settings.borrow().server != server {
-                    return;
-                }
-                ctl.settings.borrow_mut().plain_http_warned = server;
-                ctl.save_settings();
-                ctl.show_toast(crate::subsonic::PLAIN_HTTP_WARNING.into(), "", Duration::from_secs(20));
-            });
-        });
+            settings.server.clone()
+        };
+        self.settings.borrow_mut().plain_http_warned = server;
+        self.save_settings();
+        self.show_toast(crate::subsonic::PLAIN_HTTP_WARNING.into(), "", Duration::from_secs(20));
     }
 
     // ---- window, tray and quitting ------------------------------------------------------------
@@ -1243,7 +1232,7 @@ impl Controller {
         let username = username.trim().to_string();
         self.api_pool.spawn(move || {
             // An address typed without "http://" or "https://" is tried the safe way first,
-            // and the unsafe way only on the home network.
+            // and the unsafe way only when it looks like a home-network one.
             let mut answer = Err(crate::subsonic::ApiError::Network("No address was given.".into()));
             let addresses = crate::subsonic::addresses_to_try(&server);
             for (index, address) in addresses.iter().enumerate() {
@@ -1259,8 +1248,7 @@ impl Controller {
                     break;
                 }
             }
-            // Over plain HTTP beyond the home network, going by where the name leads.
-            let open = answer.as_ref().is_ok_and(|(client, _)| crate::subsonic::plain_http_beyond_home(client.server()));
+            let open = answer.as_ref().is_ok_and(|(client, _)| crate::subsonic::unencrypted_beyond_home(client.server()));
             let suggest_http = answer.as_ref().err().is_some_and(|e| crate::subsonic::suggests_plain_http(&server, addresses.len(), e));
             post(move |ctl| {
                 let app = ctl.ui.global::<ui::App>();

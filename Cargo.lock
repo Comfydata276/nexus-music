@@ -3191,7 +3191,6 @@ dependencies = [
  "souvlaki",
  "symphonia",
  "ureq",
- "url",
  "windows",
  "windows-sys 0.61.2",
  "winresource",
