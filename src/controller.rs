@@ -44,6 +44,15 @@ pub enum Undo {
     Moved { playlist: String, before: Vec<Song>, from: usize, to: usize },
 }
 
+impl Undo {
+    /// The playlist the change was made to.
+    pub fn playlist(&self) -> &str {
+        match self {
+            Undo::Removed { playlist, .. } | Undo::Moved { playlist, .. } => playlist,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Route {
     Home,
@@ -730,35 +739,32 @@ impl Controller {
     /// since the page loaded are neither lost nor mistaken for the ones meant. `expected` is
     /// what the page took the playlist to hold before the change.
     pub fn edit_playlist(self: &Rc<Self>, id: String, expected: Vec<String>, edit: crate::playlists::Edit) {
-        use crate::playlists::{Edit, apply, positions};
+        use crate::playlists::{Outcome, carry_out};
         let Some(client) = self.client() else { return };
         self.playlist_pool.spawn(move || {
-            let result = (|| -> crate::subsonic::ApiResult<bool> {
-                let now: Vec<String> = client.playlist(&id)?.songs.into_iter().map(|song| song.id).collect();
-                match &edit {
-                    Edit::Remove(spots) => {
-                        let places = positions(&now, spots);
-                        if !places.is_empty() {
-                            client.remove_many_from_playlist(&id, &places)?;
-                        }
-                    }
-                    _ => {
-                        let next = apply(&now, &edit);
-                        if next != now {
-                            client.replace_playlist(&id, &next)?;
-                        }
-                    }
-                }
-                Ok(now != expected)
-            })();
+            let result = carry_out(&client, &id, &expected, &edit);
             post(move |ctl| {
                 let key = format!("playlist:{id}");
                 let showing = ctl.current_route() == Some(Route::Playlist(id.clone()));
                 match result {
                     // It had changed elsewhere: show how it stands now. Either way its length
                     // and running time on the page want bringing up to date.
-                    Ok(_) if showing => ctl.refresh(),
-                    Ok(_) => ctl.invalidate(&key),
+                    Ok(Outcome::Done { .. }) if showing => ctl.refresh(),
+                    Ok(Outcome::Done { .. }) => ctl.invalidate(&key),
+                    // Nothing was sent. The page already shows the change, so it goes back to
+                    // what the server has, and there's nothing to undo.
+                    Ok(Outcome::HidesSongs) => {
+                        let mut undo = ctl.undo.borrow_mut();
+                        if undo.as_ref().is_some_and(|(_, undo)| undo.playlist() == id) {
+                            *undo = None;
+                        }
+                        drop(undo);
+                        ctl.invalidate(&key);
+                        ctl.toast(crate::playlists::HIDES_SONGS);
+                        if showing {
+                            ctl.refresh();
+                        }
+                    }
                     Err(e) => {
                         ctl.invalidate(&key);
                         ctl.toast(format!("That didn't save. {e}"));

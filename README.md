@@ -73,7 +73,11 @@ What's planned next is in the [roadmap](ROADMAP.md).
 - Playlists are safe to edit from more than one place. Removing or moving a song is carried
   out on the playlist as the server has it at that moment, by the song and not by its
   position, so a change made on another device in the meantime is kept and the wrong song is
-  never removed. "Undo" (or Ctrl+Z) takes the last removal or move back.
+  never removed. "Undo" (or Ctrl+Z) takes the last removal or move back. A playlist that
+  holds songs missing from your library (their files gone, or a disk offline when the server
+  last looked) is the exception: the server hides those songs from the app but still counts
+  them, so nothing is removed, moved or undone in it, and the app says why. Songs can still
+  be added to it.
 - Save the queue, or a "Made for you" mix, as a playlist. Export a playlist as a CSV file
   that this app, and other tools, can import again.
 - Synced lyrics, from Navidrome: it serves the ones embedded in a song or in a `.lrc` file beside it. The app doesn't look lyrics up anywhere else, so every app that uses your server shows the same ones. It keeps a copy of what the server says, and fetches the lyrics of the next few songs in the queue ahead of time, so they show the instant you open them and are there when you're offline. To fill in a library that has none, put `.lrc` files beside the songs with a tool such as [LRCGET](https://github.com/tranxuanthang/lrcget).

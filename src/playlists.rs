@@ -5,6 +5,59 @@
 //! sent as "song number 7" or as the page's whole list: it's described by the songs
 //! themselves, and carried out on the playlist as the server has it at that moment.
 
+use crate::subsonic::{ApiResult, Client, Playlist};
+
+/// What the person is told when a change to a playlist can't be made by position.
+pub const HIDES_SONGS: &str = "Some songs in this playlist are missing from your library, so it can't be changed from here.";
+
+/// Whether the server holds songs in this playlist that its answer leaves out. Navidrome keeps
+/// an entry whose song has gone missing from the library (its file gone, or a disk offline
+/// during a scan) and still counts it when told to remove the song at a position, but leaves
+/// it out of the playlist's own answer, and out of that answer's count. The list of playlists
+/// still counts it. So a playlist whose count in that list is more than the songs its own
+/// answer lists is hiding some; so is one the list doesn't hold at all.
+pub fn hides_songs(playlist: &Playlist, all: &[Playlist]) -> bool {
+    all.iter().find(|other| other.id == playlist.id).is_none_or(|listed| listed.song_count as usize > playlist.songs.len())
+}
+
+/// How a change to a playlist went on the server.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Outcome {
+    /// Carried out (or there was nothing to do). `elsewhere` is whether the playlist had
+    /// changed since the page took its copy.
+    Done { elsewhere: bool },
+    /// Nothing was sent: the playlist holds songs the server doesn't show, so a position or
+    /// a whole new list would be taken to mean something other than what the page meant.
+    HidesSongs,
+}
+
+/// Carries out an edit on the playlist as the server has it now. `expected` is what the page
+/// took it to hold before the change. Removing goes by positions and moving or putting back
+/// replaces the whole list, so neither is sent for a playlist that hides songs; that is
+/// decided on the same read the change is worked out from.
+pub fn carry_out(client: &Client, id: &str, expected: &[String], edit: &Edit) -> ApiResult<Outcome> {
+    let playlist = client.playlist(id)?;
+    if hides_songs(&playlist, &client.playlists()?) {
+        return Ok(Outcome::HidesSongs);
+    }
+    let now: Vec<String> = playlist.songs.into_iter().map(|song| song.id).collect();
+    match edit {
+        Edit::Remove(spots) => {
+            let places = positions(&now, spots);
+            if !places.is_empty() {
+                client.remove_many_from_playlist(id, &places)?;
+            }
+        }
+        _ => {
+            let next = apply(&now, edit);
+            if next != now {
+                client.replace_playlist(id, &next)?;
+            }
+        }
+    }
+    Ok(Outcome::Done { elsewhere: now != expected })
+}
+
 /// One song's place in a list where the same song can appear more than once: the song, and
 /// which of its appearances this is (0 for the first).
 #[derive(Debug, Clone, PartialEq)]
@@ -190,6 +243,106 @@ mod tests {
         assert_eq!(apply(&list("a x d"), &undo), list("a b c x d e"));
         // The first song of the list, put back first.
         assert_eq!(apply(&list("b"), &restoring(&list("a b"), &[0])), list("a b"));
+    }
+
+    #[test]
+    fn a_playlist_hides_songs_when_the_list_of_playlists_counts_more_than_it_shows() {
+        // As Navidrome 0.64.2 answered for the stored [X, A, B, C] with X's file gone: the
+        // playlist's own answer lists three and counts three, the list of playlists counts four.
+        let shown: Playlist = serde_json::from_str(
+            r#"{"id":"p1","name":"exp1 read","songCount":3,"duration":155,"owner":"tester","readonly":false,
+                "entry":[{"id":"a","title":"Side B"},{"id":"b","title":"Rust Thunder"},{"id":"c","title":"Under Engine"}]}"#,
+        )
+        .unwrap();
+        let listed: Vec<Playlist> = serde_json::from_str(
+            r#"[{"id":"p0","name":"Other","songCount":1},{"id":"p1","name":"exp1 read","songCount":4,"duration":215,"owner":"tester"}]"#,
+        )
+        .unwrap();
+        assert!(hides_songs(&shown, &listed));
+        // Once X is back, or an administrator has removed it, the two agree.
+        let mut agreed = listed.clone();
+        agreed[1].song_count = 3;
+        assert!(!hides_songs(&shown, &agreed));
+        // A song taken out elsewhere between the two reads makes the list count fewer: that's
+        // not hiding, and the change goes ahead as any other would.
+        agreed[1].song_count = 2;
+        assert!(!hides_songs(&shown, &agreed));
+        // Not in the list at all: nothing to go by, so it's taken to hide songs.
+        assert!(hides_songs(&shown, &listed[..1]));
+        assert!(hides_songs(&shown, &[]));
+    }
+
+    /// A pretend Navidrome holding one playlist, "p1": its songs as stored, each with whether
+    /// it's missing from the library, and the changes it was sent.
+    struct Stored {
+        songs: Vec<(String, bool)>,
+        writes: Vec<String>,
+    }
+
+    fn navidrome(songs: &[(&str, bool)]) -> (Client, std::sync::Arc<std::sync::Mutex<Stored>>) {
+        use crate::subsonic::fake;
+        let stored = std::sync::Arc::new(std::sync::Mutex::new(Stored {
+            songs: songs.iter().map(|(id, missing)| (id.to_string(), *missing)).collect(),
+            writes: Vec::new(),
+        }));
+        let held = stored.clone();
+        let address = fake::server(move |target, _, stream| {
+            let (path, query) = target.split_once('?').unwrap_or((target, ""));
+            let pairs: Vec<(&str, &str)> = query.split('&').filter_map(|pair| pair.split_once('=')).collect();
+            let all = |name: &str| pairs.iter().filter(|(key, _)| *key == name).map(|(_, value)| value.to_string()).collect::<Vec<_>>();
+            let mut stored = held.lock().unwrap();
+            let entries = |stored: &Stored| {
+                let shown: Vec<String> =
+                    stored.songs.iter().filter(|(_, missing)| !missing).map(|(id, _)| format!(r#"{{"id":"{id}","title":"Song {id}"}}"#)).collect();
+                format!(r#""songCount":{},"entry":[{}]"#, shown.len(), shown.join(","))
+            };
+            match path {
+                "/rest/getPlaylist" => fake::ok(stream, &format!(r#""playlist":{{"id":"p1","name":"Mine",{}}}"#, entries(&stored))),
+                "/rest/getPlaylists" => {
+                    fake::ok(stream, &format!(r#""playlists":{{"playlist":[{{"id":"p1","name":"Mine","songCount":{}}}]}}"#, stored.songs.len()))
+                }
+                "/rest/updatePlaylist" | "/rest/createPlaylist" => {
+                    stored.writes.push(path.trim_start_matches("/rest/").to_string());
+                    // Positions count every stored song, the missing ones too.
+                    let mut gone: Vec<usize> = all("songIndexToRemove").iter().map(|at| at.parse().unwrap()).collect();
+                    gone.sort_unstable();
+                    for at in gone.into_iter().rev() {
+                        stored.songs.remove(at);
+                    }
+                    stored.songs.extend(all("songIdToAdd").into_iter().map(|id| (id, false)));
+                    if path == "/rest/createPlaylist" {
+                        stored.songs = all("songId").into_iter().map(|id| (id, false)).collect();
+                    }
+                    fake::ok(stream, "");
+                }
+                _ => fake::ok(stream, ""),
+            }
+        });
+        (Client::new(&address, "someone", "secret"), stored)
+    }
+
+    #[test]
+    fn a_playlist_hiding_a_missing_song_is_not_changed_by_position() {
+        let (client, stored) = navidrome(&[("x", true), ("a", false), ("b", false), ("c", false)]);
+        let held = |stored: &std::sync::Mutex<Stored>| stored.lock().unwrap().songs.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>();
+        let shown = list("a b c");
+        // Taking out "b" as shown would have taken out "a"; moving "c" to the top, or putting
+        // back a removed song, would have thrown "x" away. None of them is sent.
+        for edit in [Edit::Remove(vec![spot(&shown, 1)]), moving(&shown, 2, 0), restoring(&list("a b c d"), &[3])] {
+            assert_eq!(carry_out(&client, "p1", &shown, &edit).unwrap(), Outcome::HidesSongs, "{edit:?}");
+        }
+        assert!(stored.lock().unwrap().writes.is_empty());
+        assert_eq!(held(&stored), list("x a b c"));
+        // Adding is by the song and goes at the end, so it still goes.
+        client.add_to_playlist("p1", &["d".to_string()]).unwrap();
+        assert_eq!(held(&stored), list("x a b c d"));
+
+        // With the song back in the library, the same removal takes out "b".
+        stored.lock().unwrap().songs[0].1 = false;
+        let shown = list("x a b c d");
+        let outcome = carry_out(&client, "p1", &shown, &Edit::Remove(vec![spot(&shown, 2)])).unwrap();
+        assert_eq!(outcome, Outcome::Done { elsewhere: false });
+        assert_eq!(held(&stored), list("x a c d"));
     }
 
     #[test]

@@ -1368,6 +1368,102 @@ mod tests {
         assert!(!unencrypted_beyond_home("https://music.example.org"));
     }
 
+    /// Against a Navidrome of its own, never one whose playlists matter: makes a song go
+    /// missing from the library while a playlist holds it, and shows that the app's way of
+    /// changing a playlist sends no removal, move or Undo then, but still adds. Run by hand:
+    ///
+    /// ```sh
+    /// NEXUS_TEST_SERVER=http://127.0.0.1:<port> NEXUS_TEST_USER=<name> NEXUS_TEST_PASSWORD=<password> \
+    /// NEXUS_TEST_MISSING_FILE=<one song's file in that server's music folder> \
+    ///   cargo test missing_song -- --ignored --nocapture
+    /// ```
+    ///
+    /// The file is renamed for a while (and the library scanned) to make its song missing, and
+    /// put back afterwards, even if the test fails.
+    #[test]
+    #[ignore = "needs a Navidrome of its own; see the comment"]
+    fn a_playlist_holding_a_missing_song_is_refused_on_navidrome() {
+        use crate::playlists::{Edit, Outcome, carry_out, moving, restoring, spot};
+        let env = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} is not set"));
+        let client = Client::new(&env("NEXUS_TEST_SERVER"), &env("NEXUS_TEST_USER"), &env("NEXUS_TEST_PASSWORD"));
+        let file = std::path::PathBuf::from(env("NEXUS_TEST_MISSING_FILE"));
+        let aside = file.with_extension("away");
+
+        let scan = || {
+            client.call::<serde_json::Value>("startScan", &[("fullScan", "true")], None).unwrap();
+            std::thread::sleep(Duration::from_secs(1));
+            while client.scan_status().unwrap().scanning {
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        };
+        let library = || -> std::collections::HashSet<String> { client.library_page(0, 0, 5000, 0).unwrap().songs.into_iter().map(|song| song.id).collect() };
+        struct PutBack<'a>(&'a std::path::Path, &'a std::path::Path);
+        impl Drop for PutBack<'_> {
+            fn drop(&mut self) {
+                if self.1.exists() {
+                    let _ = std::fs::rename(self.1, self.0);
+                }
+            }
+        }
+        let _put_back = PutBack(&file, &aside);
+        let away = || std::fs::rename(&file, &aside).unwrap();
+        let back = || std::fs::rename(&aside, &file).unwrap();
+
+        // Which song the file is: the one that goes when it does.
+        let all = library();
+        away();
+        scan();
+        let gone: Vec<String> = all.difference(&library()).cloned().collect();
+        assert_eq!(gone.len(), 1, "one song goes with the file: {gone:?}");
+        let x = gone[0].clone();
+        back();
+        scan();
+
+        // The playlist [X, A, B, C], and D to add: songs of the same album.
+        let album = client.album(&client.song(&x).unwrap().album_id).unwrap();
+        let others: Vec<String> = album.songs.iter().map(|song| song.id.clone()).filter(|id| *id != x).collect();
+        assert!(others.len() >= 4, "an album of at least five songs");
+        let (a, b, c, d) = (others[0].clone(), others[1].clone(), others[2].clone(), others[3].clone());
+        let id = client.create_playlist("Missing song test", &[x.clone(), a.clone(), b.clone(), c.clone()]).unwrap().id;
+        let counted = || client.playlists().unwrap().into_iter().find(|p| p.id == id).map(|p| p.song_count);
+        let shown = || -> Vec<String> { client.playlist(&id).unwrap().songs.into_iter().map(|song| song.id).collect() };
+
+        away();
+        scan();
+        let page = shown();
+        println!("X missing: the playlist shows {} songs, the list of playlists counts {:?}", page.len(), counted());
+        assert_eq!(page, [a.clone(), b.clone(), c.clone()]);
+        assert_eq!(counted(), Some(4));
+        // Remove B as shown, move C to the top, and the Undo of a removal of D.
+        let edits = [
+            ("remove", Edit::Remove(vec![spot(&page, 1)])),
+            ("move", moving(&page, 2, 0)),
+            ("undo", restoring(&[a.clone(), b.clone(), c.clone(), d.clone()], &[3])),
+        ];
+        for (what, edit) in &edits {
+            let outcome = carry_out(&client, &id, &page, edit).unwrap();
+            println!("{what}: {outcome:?}; shown after {}, counted {:?}", shown().len(), counted());
+            assert_eq!(outcome, Outcome::HidesSongs, "{what}");
+            assert_eq!(shown(), page, "{what}");
+            assert_eq!(counted(), Some(4), "{what}");
+        }
+        client.add_to_playlist(&id, std::slice::from_ref(&d)).unwrap();
+        println!("add: shown after {}, counted {:?}", shown().len(), counted());
+        assert_eq!(shown(), [a.clone(), b.clone(), c.clone(), d.clone()]);
+        assert_eq!(counted(), Some(5));
+
+        // X back: everything kept, and the same removal now takes out B.
+        back();
+        scan();
+        let page = shown();
+        println!("X back: the playlist shows {} songs, the list of playlists counts {:?}", page.len(), counted());
+        assert_eq!(page, [x.clone(), a.clone(), b.clone(), c.clone(), d.clone()]);
+        assert_eq!(carry_out(&client, &id, &page, &Edit::Remove(vec![spot(&page, 2)])).unwrap(), Outcome::Done { elsewhere: false });
+        assert_eq!(shown(), [x, a, c, d]);
+        client.delete_playlist(&id).unwrap();
+    }
+
     #[test]
     fn takes_a_lyrics_file_s_offset_off_its_times() {
         let line = |start: Option<i64>| LyricLine { start, value: "la".into() };
