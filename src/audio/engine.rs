@@ -49,6 +49,9 @@ pub struct TrackRequest {
     pub url: String,
     /// True when the server sends the original file, which supports byte ranges.
     pub ranged: bool,
+    /// When asking for a conversion: the size of the song's file on the server (0 if not
+    /// known). An answer of exactly that many bytes, with byte ranges, is the file itself.
+    pub size: u64,
     /// File extension, to help format detection.
     pub suffix: String,
     /// Linear gain applied while decoding (volume normalisation).
@@ -197,6 +200,9 @@ pub(super) struct Shared {
     out_rate: AtomicU32,
     /// Token of the track the decoder is currently reading; 0 when idle.
     decoding: AtomicU64,
+    /// The same, when that track can be sought in without asking for it again: it's a file
+    /// on disk, or the server sent it as it is and takes byte ranges.
+    in_place: AtomicU64,
     /// Set by the device error callback when the stream must be rebuilt.
     pub(super) rebuild: AtomicBool,
     /// Seconds of overlap between one track and the next; 0 for none.
@@ -215,6 +221,7 @@ impl Shared {
             volume: AtomicU32::new(1.0f32.to_bits()),
             out_rate: AtomicU32::new(48_000),
             decoding: AtomicU64::new(0),
+            in_place: AtomicU64::new(0),
             rebuild: AtomicBool::new(false),
             crossfade: AtomicU32::new(0f32.to_bits()),
             effects: Controls::new(),
@@ -280,6 +287,13 @@ struct Deck {
     // Declared last so the reader inside `format` is dropped before the file is deleted.
     // `None` for a downloaded copy, which is read straight from disk.
     download: Option<Download>,
+}
+
+impl Deck {
+    /// See `Shared::in_place`.
+    fn in_place(&self) -> bool {
+        self.download.as_ref().is_none_or(Download::ranged)
+    }
 }
 
 pub struct Engine {
@@ -416,6 +430,13 @@ impl Engine {
     /// the end of a track.
     pub fn decoding_token(&self) -> u64 {
         self.shared.decoding.load(Ordering::Relaxed)
+    }
+
+    /// Whether the track with this token is the one being decoded and can be sought in
+    /// without being asked for again. (A conversion can't, unless the server sent the file
+    /// as it is after all.)
+    pub fn seeks_in_place(&self, token: u64) -> bool {
+        self.shared.decoding.load(Ordering::Relaxed) == token && self.shared.in_place.load(Ordering::Relaxed) == token
     }
 }
 
@@ -616,6 +637,7 @@ impl Worker {
                             self.open_output_for(Some((deck.rate, deck.bits)));
                         }
                         self.shared.restart_at(token, deck.base + deck.start);
+                        self.shared.in_place.store(if deck.in_place() { token } else { 0 }, Ordering::Relaxed);
                         self.shared.decoding.store(token, Ordering::Relaxed);
                         self.current = Some(deck);
                         self.ended = false;
@@ -1103,6 +1125,7 @@ impl Worker {
             start_frame,
             offset: deck.base + deck.start,
         });
+        self.shared.in_place.store(if deck.in_place() { deck.token } else { 0 }, Ordering::Relaxed);
         self.shared.decoding.store(deck.token, Ordering::Relaxed);
         self.current = Some(deck);
         self.ended = false;
@@ -1257,7 +1280,7 @@ fn run_resampler(rs: &mut ResamplerState, out: &mut Vec<f32>) {
     rs.input.drain(..consumed.min(rs.input.len()));
 }
 
-fn open_deck(client: Client, request: TrackRequest, dir: &std::path::Path, interrupt: Arc<Interrupt>) -> Result<Deck, OpenError> {
+fn open_deck(client: Client, mut request: TrackRequest, dir: &std::path::Path, interrupt: Arc<Interrupt>) -> Result<Deck, OpenError> {
     let fail = |message: String, unsupported: bool| OpenError { message, unsupported, network: false };
     let (source, download): (Box<dyn symphonia::core::io::MediaSource>, Option<Download>) = match &request.local {
         Some(path) => {
@@ -1267,7 +1290,7 @@ fn open_deck(client: Client, request: TrackRequest, dir: &std::path::Path, inter
         }
         None => {
             let download =
-                Download::start(client, request.url.clone(), request.ranged, request.live, dir, request.keep.clone(), interrupt);
+                Download::start(client, request.url.clone(), request.ranged, request.size, request.live, dir, request.keep.clone(), interrupt);
             // These two formats decide whether they can seek only when asked to, so it's safe
             // to skip the tag check at the end of the file. Others (MP4, Ogg) need the end
             // while opening.
@@ -1279,6 +1302,12 @@ fn open_deck(client: Client, request: TrackRequest, dir: &std::path::Path, inter
             (Box::new(reader), Some(download))
         }
     };
+    if !request.ranged && download.as_ref().is_some_and(Download::ranged) {
+        // A conversion was asked for, starting `base_secs` in, and the server sent the whole
+        // file as it is, from its start: so the seek to there is made in the file.
+        request.start_secs += request.base_secs;
+        request.base_secs = 0.0;
+    }
     let stream = MediaSourceStream::new(source, Default::default());
     let mut hint = Hint::new();
     if !request.suffix.is_empty() {
@@ -1658,6 +1687,11 @@ mod tests {
     /// device, and returns what came out (stereo frames at 48 kHz) once the queue has
     /// finished. `first` is loaded; `set_up` can name what follows, seek, and so on.
     fn played(name: &str, first: TrackRequest, set_up: impl FnOnce(&Engine)) -> Vec<[f32; 2]> {
+        played_from(name, Client::new("http://127.0.0.1:9", "someone", "secret"), first, set_up)
+    }
+
+    /// The same, with `first` streamed from `client`'s server.
+    fn played_from(name: &str, client: Client, first: TrackRequest, set_up: impl FnOnce(&Engine)) -> Vec<[f32; 2]> {
         let dir = std::env::temp_dir().join(format!("nexus-engine-test-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1666,7 +1700,6 @@ mod tests {
         let engine = Engine::recording_to(dir.clone(), Some(recording.clone()), move |event| {
             let _ = events.send(event);
         });
-        let client = Client::new("http://127.0.0.1:9", "someone", "secret");
         engine.load(client, first);
         set_up(&engine);
         engine.set_playing(true);
@@ -1698,6 +1731,7 @@ mod tests {
             live: false,
             url: String::new(),
             ranged: true,
+            size: 0,
             suffix: name.rsplit('.').next().unwrap().to_string(),
             gain: 1.0,
             start_secs: 0.0,
@@ -1765,26 +1799,102 @@ mod tests {
         assert!((12_000..=14_400).contains(&frames.len()), "{} frames came out", frames.len());
     }
 
+    /// About two seconds of MP3: the half-second one's audio four times over, without its
+    /// first frame (182 bytes), which is the encoder's note of how long the file is.
+    fn longer_mp3() -> &'static [u8] {
+        Box::leak(MP3[182..].repeat(4).into_boxed_slice())
+    }
+
+    /// A server that answers every request for a song with `song`: as the file itself (its
+    /// length, byte ranges taken), or as a conversion (neither).
+    fn mp3_server(as_itself: bool, song: &'static [u8]) -> Client {
+        let address = crate::subsonic::fake::server(move |_, from, stream| {
+            use std::io::Write;
+            let _ = match (as_itself, from) {
+                (true, Some(from)) => {
+                    let (from, last) = (from as usize, song.len() - 1);
+                    write!(stream, "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {from}-{last}/{}\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n", song.len(), song.len() - from)
+                        .and_then(|_| stream.write_all(&song[from..]))
+                }
+                (true, None) => write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n", song.len())
+                    .and_then(|_| stream.write_all(song)),
+                (false, _) => write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg\r\nAccept-Ranges: none\r\nConnection: close\r\n\r\n").and_then(|_| stream.write_all(song)),
+            };
+        });
+        Client::new(&address, "someone", "secret")
+    }
+
+    /// A conversion asked for, as a streaming quality below lossless does, starting `from`
+    /// seconds in, of a song whose file on the server is `song`.
+    fn conversion(client: &Client, from: f64, song: &[u8]) -> TrackRequest {
+        let url = client.stream_url("song-1", 320, from as u32);
+        TrackRequest { local: None, url, ranged: false, size: song.len() as u64, suffix: "mp3".into(), base_secs: from, duration_secs: 2.0, ..track(1, "g.mp3", MP3) }
+    }
+
+    /// Waits for the track to be heard, and gives where it was then.
+    fn heard_from(engine: &Engine) -> f64 {
+        let opened = Instant::now();
+        while engine.position().is_none() && opened.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        engine.position().expect("the track was heard").1
+    }
+
+    #[test]
+    fn a_conversion_the_server_sent_as_the_file_itself_is_sought_in_where_it_is() {
+        // Seeking: in the file, by the engine, as for a file asked for as itself.
+        let client = mp3_server(true, MP3);
+        let frames = played_from("as-itself", client.clone(), conversion(&client, 0.0, MP3), |engine| {
+            heard_from(engine);
+            assert!(engine.seeks_in_place(1));
+            engine.seek(0.25);
+        });
+        assert!((12_000..=14_400).contains(&frames.len()), "{} frames came out", frames.len());
+        // Asked to start a second in, the server sent it from the start, taking no notice:
+        // the app goes there in the file itself (a packet or two early, as a seek in an MP3
+        // does), and plays the rest of the song's 2.19 seconds.
+        let song = longer_mp3();
+        let client = mp3_server(true, song);
+        let frames = played_from("as-itself-later", client.clone(), conversion(&client, 1.0, song), |engine| {
+            let at = heard_from(engine);
+            assert!((0.9..1.1).contains(&at), "heard from {at}");
+        });
+        assert!((55_000..=62_000).contains(&frames.len()), "{} frames came out", frames.len());
+    }
+
+    #[test]
+    fn a_real_conversion_is_asked_for_again_to_seek() {
+        let client = mp3_server(false, MP3);
+        played_from("converted", client.clone(), conversion(&client, 0.0, MP3), |engine| {
+            heard_from(engine);
+            assert!(!engine.seeks_in_place(1), "a conversion has to be asked for again from where a seek lands");
+        });
+        // Asked for from a second in, what comes is taken to start there, and all of it plays.
+        let song = longer_mp3();
+        let client = mp3_server(false, song);
+        let frames = played_from("converted-later", client.clone(), conversion(&client, 1.0, song), |engine| {
+            let at = heard_from(engine);
+            assert!((1.0..1.1).contains(&at), "heard from {at}");
+        });
+        assert!(frames.len() > 100_000, "{} frames came out", frames.len());
+    }
+
     #[test]
     fn a_song_kept_by_0_40_1_plays_and_seeks_with_the_server_out_of_reach() {
-        // The song cache as 0.40.1 left it: an MP3 within the limit, asked for as a conversion
-        // at that limit and kept under it.
+        // The song cache as 0.40.1 left it: an MP3 within a limit of 320 kbps, asked for as a
+        // conversion at that limit and kept under that name, which is the name still used.
         let dir = std::env::temp_dir().join(format!("nexus-engine-kept-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("song-7.320.mp3"), MP3).unwrap();
         let cache = crate::songcache::SongCache::new(dir.clone());
-        let song = crate::subsonic::Song { id: "song-7".into(), suffix: "mp3".into(), bit_rate: 128, duration: 1, ..Default::default() };
-        // The lookup playback goes by finds it; the engine plays it from disk (its client's
-        // server has nothing listening) and seeks in it.
-        let found = crate::playback::kept(&cache, &song, true, 320);
-        let path = found.ready().expect("the copy kept by 0.40.1").clone();
-        let request = crate::playback::from_kept(1, path, &found.kept_as, 1.0, 0.0, 0.5);
+        let kept = cache.file("song-7", 320, "mp3");
+        assert!(crate::songcache::ready(&kept), "{kept:?}");
+        // Played from disk as a kept copy is (the client's server has nothing listening).
+        let request = TrackRequest { local: Some(kept), ..track(1, "h.mp3", MP3) };
         let frames = played("kept-0401", request, |engine| {
-            let opened = Instant::now();
-            while engine.position().is_none() && opened.elapsed() < Duration::from_secs(5) {
-                std::thread::sleep(Duration::from_millis(10));
-            }
+            heard_from(engine);
+            assert!(engine.seeks_in_place(1));
             engine.seek(0.25);
         });
         assert!((12_000..=14_400).contains(&frames.len()), "{} frames came out", frames.len());

@@ -627,7 +627,7 @@ impl Controller {
             String::new(),
             format!("Signed in: {}", if self.client().is_some() { "yes" } else { "no" }),
             format!("Server version: {}", app.get_server_version()),
-            format!("Server address uses HTTPS: {}", if crate::subsonic::scheme_of(&settings.server).as_deref() == Some("https") { "yes" } else { "no" }),
+            format!("Server address uses HTTPS: {}", if settings.server.starts_with("https://") { "yes" } else { "no" }),
             format!("Offline mode: {}; server out of reach: {}", yes(settings.offline), yes(self.unreachable.get())),
             format!("Sound output: {}", page.get_output_status()),
             format!("Exclusive mode: {}; streaming limit: {} kbps (0 is none)", yes(settings.exclusive), settings.max_bitrate()),
@@ -857,7 +857,6 @@ impl Controller {
                 // Confirm the saved login still works (if not, go back to the sign-in
                 // screen), and find out whether the server can be reached at all.
                 self.check_connection();
-                self.warn_of_plain_http();
             }
         }
 
@@ -916,23 +915,6 @@ impl Controller {
         self.update_timer.start(slint::TimerMode::Repeated, Duration::from_secs(6 * 3600), || {
             with(|ctl| ctl.check_for_updates(false));
         });
-    }
-
-    /// A saved address that's plain HTTP to a server beyond the home network still signs in
-    /// (that sign-in has gone that way many times already, and the app can't tell whether it
-    /// was typed so or saved by an older version's fallback), but the person is told, once
-    /// for that address, and how to put it right.
-    fn warn_of_plain_http(self: &Rc<Self>) {
-        let server = {
-            let settings = self.settings.borrow();
-            if !crate::subsonic::warn_of_plain_http(&settings.server, &settings.plain_http_warned) {
-                return;
-            }
-            settings.server.clone()
-        };
-        self.settings.borrow_mut().plain_http_warned = server;
-        self.save_settings();
-        self.show_toast(crate::subsonic::PLAIN_HTTP_WARNING.into(), "", Duration::from_secs(20));
     }
 
     // ---- window, tray and quitting ------------------------------------------------------------
@@ -1248,8 +1230,6 @@ impl Controller {
                     break;
                 }
             }
-            let open = answer.as_ref().is_ok_and(|(client, _)| crate::subsonic::unencrypted_beyond_home(client.server()));
-            let suggest_http = answer.as_ref().err().is_some_and(|e| crate::subsonic::suggests_plain_http(&server, addresses.len(), e));
             post(move |ctl| {
                 let app = ctl.ui.global::<ui::App>();
                 app.set_login_busy(false);
@@ -1259,31 +1239,31 @@ impl Controller {
                             let mut settings = ctl.settings.borrow_mut();
                             settings.server = client.server().to_string();
                             settings.username = username.clone();
-                            if open {
-                                // Said now, so not again at the next start.
-                                settings.plain_http_warned = client.server().to_string();
-                            }
                         }
                         ctl.save_settings();
                         if !config::save_password(&ctl.paths, client.server(), &username, &password) {
                             ctl.toast("Couldn't save your password; you'll need to sign in next time.");
                         }
                         ctl.covers.reset();
+                        let open = crate::subsonic::unencrypted_beyond_home(client.server());
                         ctl.enter(client, Some(info.version));
                         // The server is plainly there: stop treating it as out of reach, and
                         // send whatever was being held for it.
                         ctl.check_connection();
                         if open {
-                            ctl.show_toast(crate::subsonic::PLAIN_HTTP_WARNING.into(), "", Duration::from_secs(12));
+                            ctl.show_toast(
+                                "Signed in without encryption: over plain HTTP your sign-in and your music can be read on the way. If your server has an https:// address, sign in with that.".into(),
+                                "",
+                                Duration::from_secs(12),
+                            );
                         }
                     }
-                    Err(e) => {
-                        let mut shown = e.to_string();
-                        if suggest_http {
-                            shown = format!("{shown} {}", crate::subsonic::TRY_PLAIN_HTTP);
-                        }
-                        app.set_login_error(shown.into());
-                    }
+                    // Only HTTPS was tried, because no scheme was typed: say so, and how to
+                    // choose otherwise, whatever went wrong.
+                    Err(e) if crate::subsonic::https_only(&server) => app.set_login_error(
+                        format!("{e}\nNexus Music tried HTTPS. If your server has no HTTPS, type http:// in front of the address.").into(),
+                    ),
+                    Err(e) => app.set_login_error(e.to_string().into()),
                 }
             });
         });
@@ -2215,17 +2195,11 @@ impl Controller {
                     renewed = true;
                 }
             }
-            if online {
-                let current = crate::search::current();
-                // Taken out while the fetch goes on, which can be minutes: signing out resets it.
-                let mut retry = std::mem::take(&mut *crate::search::RETRY.lock().unwrap_or_else(|stuck| stuck.into_inner()));
-                // A copy that couldn't be trusted leaves the one in use where it is.
-                if let Ok(Some(library)) = crate::search::renew(&client, current.as_ref().map(|index| &index.library), &mut retry, &|| chrono::Utc::now().timestamp()) {
-                    library.save(&file);
-                    crate::search::set_current(Some(crate::search::Index::new(library)));
-                    renewed = true;
-                }
-                *crate::search::RETRY.lock().unwrap_or_else(|stuck| stuck.into_inner()) = retry;
+            let renew = || crate::search::renew(&client, crate::search::current().as_ref().map(|index| &index.library));
+            if let Some(library) = online.then(renew).flatten() {
+                library.save(&file);
+                crate::search::set_current(Some(crate::search::Index::new(library)));
+                renewed = true;
             }
             if renewed && online {
                 // Which songs are liked, as of now.
@@ -2374,7 +2348,6 @@ impl Controller {
         self.library_timer.stop();
         self.close_preview();
         crate::search::set_current(None);
-        *crate::search::RETRY.lock().unwrap_or_else(|stuck| stuck.into_inner()) = crate::search::Retry::new();
         *self.client.borrow_mut() = None;
         self.cache.borrow_mut().clear();
         self.playlists.borrow_mut().clear();
@@ -2689,7 +2662,7 @@ impl Controller {
             let page = match first {
                 Ok(page) => page,
                 Err(e) => {
-                    let network = e.is_network();
+                    let network = matches!(e, crate::subsonic::ApiError::Network(_));
                     let offline_home = matches!(route, Route::Home) && network;
                     return post(move |ctl| {
                         if network && !ctl.settings.borrow().offline {

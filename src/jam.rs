@@ -98,10 +98,7 @@ fn address(text: &str) -> Result<String, String> {
     if text.is_empty() || text.contains(char::is_whitespace) {
         return Err("That doesn't look like a link.".into());
     }
-    let whole = match crate::subsonic::scheme_of(text).as_deref() {
-        Some("https" | "http") => text.to_string(),
-        _ => format!("https://{text}"),
-    };
+    let whole = if text.starts_with("https://") || text.starts_with("http://") { text.to_string() } else { format!("https://{text}") };
     if crate::subsonic::unencrypted_beyond_home(&whole) {
         return Err("That link starts with http://, which others on the way could read. Use the https:// one.".into());
     }

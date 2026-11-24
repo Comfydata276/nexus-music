@@ -105,8 +105,12 @@ struct State {
 struct Shared {
     client: Client,
     url: String,
-    /// Raw files can be range-requested; transcoded streams can't.
-    ranged: bool,
+    /// Raw files can be range-requested; transcoded streams can't. Set as well when a
+    /// conversion was asked for and the server sent the file itself (see `size`).
+    ranged: AtomicBool,
+    /// When a conversion is asked for: the size of the song's file on the server, if known.
+    /// An answer exactly that long that takes byte ranges is the file itself, not converted.
+    size: u64,
     /// An internet radio stream: endless, kept in memory, and it may announce song titles.
     live: bool,
     title: Arc<Mutex<String>>,
@@ -125,6 +129,10 @@ struct Shared {
 }
 
 impl Shared {
+    fn ranged(&self) -> bool {
+        self.ranged.load(Ordering::Relaxed)
+    }
+
     /// Looks at whether the download has gone quiet, and does something about it: a file
     /// that can be asked for from the middle is asked for again from where it stopped, and
     /// anything else is given up on so that whoever plays it can start it over.
@@ -133,7 +141,7 @@ impl Shared {
         if !state.opened || state.done || state.error.is_some() || self.live || quiet < STALL_RESTART {
             return;
         }
-        if self.ranged && state.restarts < STALL_RESTARTS {
+        if self.ranged() && state.restarts < STALL_RESTARTS {
             state.attempt += 1;
             state.restarts += 1;
             state.progressed = Instant::now();
@@ -143,7 +151,7 @@ impl Shared {
                 return;
             }
         }
-        if self.ranged || quiet >= STALL_GIVE_UP {
+        if self.ranged() || quiet >= STALL_GIVE_UP {
             state.error = Some("The connection to the server went quiet.".into());
             self.trouble.store(true, Ordering::Relaxed);
             self.progress.notify_all();
@@ -161,6 +169,7 @@ impl Download {
         client: Client,
         url: String,
         ranged: bool,
+        size: u64,
         live: bool,
         dir: &std::path::Path,
         keep: Option<(PathBuf, u64)>,
@@ -171,7 +180,8 @@ impl Download {
         let shared = Arc::new(Shared {
             client,
             url,
-            ranged,
+            ranged: AtomicBool::new(ranged),
+            size,
             live,
             title: Arc::new(Mutex::new(String::new())),
             path,
@@ -208,6 +218,12 @@ impl Download {
     pub fn watch(&self) {
         let mut state = self.shared.state.lock().unwrap();
         self.shared.watch(&mut state);
+    }
+
+    /// Whether the file can be asked for by byte range, which is what seeking in it needs.
+    /// Known once `reader` has given a reader.
+    pub fn ranged(&self) -> bool {
+        self.shared.ranged()
     }
 
     /// Whether what went wrong with this track was fetching it.
@@ -302,13 +318,13 @@ fn download_loop(shared: &Arc<Shared>, attempt: u64) {
             return finish(shared, attempt, Some(format!("Couldn't buffer the track: {e}")));
         }
         let range = (offset > 0).then_some((offset, None));
-        let (mut body, length) = match shared.client.open_stream(&shared.url, range) {
+        let (mut body, length, ranges) = match shared.client.open_stream_ranges(&shared.url, range) {
             Ok(v) => v,
             Err(e) => {
                 failures += 1;
                 // Before anything has come at all there's no point lingering: whoever asked
                 // for the track decides whether to ask again, and tells the listener.
-                if failures > 4 || offset == 0 || !shared.ranged {
+                if failures > 4 || offset == 0 || !shared.ranged() {
                     return finish(shared, attempt, Some(e.to_string()));
                 }
                 pause_before_retry(shared, failures);
@@ -322,7 +338,13 @@ fn download_loop(shared: &Arc<Shared>, attempt: u64) {
             }
             if !state.opened {
                 state.opened = true;
-                state.total = if shared.ranged { length } else { None };
+                // Asked for a conversion, the server sent the file as it is, as Navidrome does
+                // when it's already within the limit: then it's played like a file asked for
+                // as itself, sought in by byte range. Anything less clear, and it isn't.
+                if shared.size > 0 && length == Some(shared.size) && ranges {
+                    shared.ranged.store(true, Ordering::Relaxed);
+                }
+                state.total = if shared.ranged() { length } else { None };
             }
             state.progressed = Instant::now();
             shared.progress.notify_all();
@@ -354,7 +376,7 @@ fn download_loop(shared: &Arc<Shared>, attempt: u64) {
                 }
                 Err(e) => {
                     failures += 1;
-                    if failures > 4 || !shared.ranged {
+                    if failures > 4 || !shared.ranged() {
                         return finish(shared, attempt, Some(format!("The connection dropped: {e}")));
                     }
                     pause_before_retry(shared, failures);
@@ -415,7 +437,7 @@ fn finish(shared: &Shared, attempt: u64, error: Option<String>) {
             let least = shared.keep.as_ref().map_or(0, |(_, least)| *least);
             let whole = state.downloaded > 0
                 && state.total.is_none_or(|total| total == state.downloaded)
-                && (shared.ranged || state.downloaded >= least);
+                && (shared.ranged() || state.downloaded >= least);
             state.done = true;
             state.total = Some(state.downloaded);
             if let (true, false, Some((keep, _))) = (whole, shared.live, &shared.keep) {
@@ -606,7 +628,7 @@ impl Read for SourceReader {
                 if self.pos >= total {
                     return Ok(0);
                 }
-                if self.shared.ranged && self.pos - state.downloaded > SIDE_THRESHOLD {
+                if self.shared.ranged() && self.pos - state.downloaded > SIDE_THRESHOLD {
                     drop(state);
                     return self.read_side(buf, total);
                 }
@@ -650,12 +672,12 @@ impl Seek for SourceReader {
 
 impl MediaSource for SourceReader {
     fn is_seekable(&self) -> bool {
-        self.shared.ranged && !self.shared.seek_held.load(Ordering::Relaxed)
+        self.shared.ranged() && !self.shared.seek_held.load(Ordering::Relaxed)
     }
 
     fn byte_len(&self) -> Option<u64> {
         let state = self.shared.state.lock().unwrap();
-        if self.shared.ranged || state.done { state.total } else { None }
+        if self.shared.ranged() || state.done { state.total } else { None }
     }
 }
 
@@ -726,7 +748,44 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("nexus-source-test-{}-{}", std::process::id(), NEXT_FILE_ID.fetch_add(1, Ordering::Relaxed)));
         fs::create_dir_all(&dir).unwrap();
         let client = Client::new("http://127.0.0.1:9", "someone", "secret");
-        (Download::start(client, url, ranged, false, &dir, keep, interrupt), dir)
+        (Download::start(client, url, ranged, 0, false, &dir, keep, interrupt), dir)
+    }
+
+    #[test]
+    fn a_conversion_is_taken_for_the_file_itself_only_when_the_answer_says_so() {
+        // What a server sends when asked for a conversion of a file of 1,000 bytes: how long
+        // it says the answer is, whether it takes byte ranges, and the size the app was told.
+        let cases = [
+            // The file as it is: its own length, and ranges taken.
+            (Some(1000), true, 1000, true),
+            // A conversion with a length estimated, or one kept by the server: no ranges, or
+            // another length.
+            (Some(1000), false, 1000, false),
+            (Some(900), true, 1000, false),
+            // No length said, or no size known: as before, a conversion.
+            (None, true, 1000, false),
+            (None, false, 1000, false),
+            (Some(1000), true, 0, false),
+        ];
+        for (length, ranges, size, whole) in cases {
+            let url = server(move |_, _, stream| {
+                let said = length.map(|n| format!("Content-Length: {n}\r\n")).unwrap_or_default();
+                let ranges = if ranges { "bytes" } else { "none" };
+                let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg\r\n{said}Accept-Ranges: {ranges}\r\nConnection: close\r\n\r\n");
+                let _ = stream.write_all(&song(length.unwrap_or(1000)));
+            });
+            let dir = std::env::temp_dir().join(format!("nexus-source-test-{}-{}", std::process::id(), NEXT_FILE_ID.fetch_add(1, Ordering::Relaxed)));
+            fs::create_dir_all(&dir).unwrap();
+            let client = Client::new("http://127.0.0.1:9", "someone", "secret");
+            let download = Download::start(client, url, false, size, false, &dir, None, Arc::default());
+            let mut reader = download.reader().unwrap();
+            assert_eq!(download.ranged(), whole, "{length:?}, ranges {ranges}, size {size}");
+            let mut all = Vec::new();
+            reader.read_to_end(&mut all).unwrap();
+            assert_eq!(all.len(), length.unwrap_or(1000));
+            drop(download);
+            let _ = fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]
@@ -851,7 +910,7 @@ mod tests {
             let keep = dir.join("kept.320.mp3");
             let client = Client::new("http://127.0.0.1:9", "someone", "secret");
             // The whole song would come to at least 50,000 bytes.
-            let download = Download::start(client, url, false, false, &dir, Some((keep.clone(), 50_000)), Arc::default());
+            let download = Download::start(client, url, false, 0, false, &dir, Some((keep.clone(), 50_000)), Arc::default());
             let mut got = Vec::new();
             download.reader().unwrap().read_to_end(&mut got).unwrap();
             assert!(got == content);
