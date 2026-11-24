@@ -595,25 +595,13 @@ impl Controller {
             };
         }
         // A copy kept from an earlier play, or fetched ahead, plays from disk too.
-        let (bitrate, kept_as) = stream_form(native, cap, &suffix, song.bit_rate);
-        let kept = (settings.cache_limit_mb > 0).then(|| self.song_cache.file(&song.id, bitrate, kept_as));
-        if let Some(path) = kept.as_ref().filter(|path| crate::songcache::ready(path)) {
+        let found = kept(&self.song_cache, song, native, cap);
+        let bitrate = found.bitrate;
+        if let Some(path) = found.ready().filter(|_| settings.cache_limit_mb > 0) {
             crate::songcache::touch(path);
-            return TrackRequest {
-                token,
-                local: Some(path.clone()),
-                keep: None,
-                live: false,
-                url: String::new(),
-                ranged: true,
-                suffix: kept_as.to_string(),
-                gain,
-                start_secs: at,
-                base_secs: 0.0,
-                duration_secs,
-                continues: false,
-            };
+            return from_kept(token, path.clone(), &found.kept_as, gain, at, duration_secs);
         }
+        let kept = (settings.cache_limit_mb > 0).then(|| found.new_name().clone());
         if bitrate == 0 {
             TrackRequest {
                 token,
@@ -651,13 +639,10 @@ impl Controller {
         }
     }
 
-    /// Where a song would be kept, in the form it would be streamed in right now, and the
-    /// bit rate to ask the server for (0 for the file as it is).
-    fn kept_file(&self, pb: &Playback, song: &Song) -> (PathBuf, u32) {
-        let suffix = song.suffix.to_lowercase();
-        let native = NATIVE_SUFFIXES.contains(&suffix.as_str()) && !pb.needs_transcode.contains(&song.id);
-        let (bitrate, kept_as) = stream_form(native, self.settings.borrow().max_bitrate(), &suffix, song.bit_rate);
-        (self.song_cache.file(&song.id, bitrate, kept_as), bitrate)
+    /// Where a song is or would be kept, in the form it would be streamed in right now.
+    fn kept_file(&self, pb: &Playback, song: &Song) -> Kept {
+        let native = NATIVE_SUFFIXES.contains(&song.suffix.to_lowercase().as_str()) && !pb.needs_transcode.contains(&song.id);
+        kept(&self.song_cache, song, native, self.settings.borrow().max_bitrate())
     }
 
     /// Whether a song can play without the server: it's downloaded, or a copy has been kept.
@@ -669,12 +654,8 @@ impl Controller {
         if settings.cache_limit_mb == 0 || song.id.is_empty() {
             return false;
         }
-        let suffix = song.suffix.to_lowercase();
         let cap = settings.max_bitrate();
-        [true, false].into_iter().any(|native| {
-            let (bitrate, kept_as) = stream_form(native, cap, &suffix, song.bit_rate);
-            self.song_cache.holds(&self.song_cache.file(&song.id, bitrate, kept_as))
-        })
+        [true, false].into_iter().any(|native| kept(&self.song_cache, song, native, cap).names.iter().any(|path| self.song_cache.holds(path)))
     }
 
     /// Has the next few songs fetched ahead of time, so the music carries on if the
@@ -699,11 +680,14 @@ impl Controller {
                 if song.id.is_empty() || !song.radio_url.is_empty() || downloads.has(&song.id) {
                     continue;
                 }
-                let (path, bitrate) = self.kept_file(&pb, song);
-                in_use.insert(path.clone());
+                let found = self.kept_file(&pb, song);
+                // Whichever name it's kept under, it isn't made room for.
+                in_use.extend(found.names.iter().cloned());
                 // The one playing is already streaming, and is kept when it has all arrived.
-                if place > 0 && !crate::songcache::ready(&path) {
+                if place > 0 && found.ready().is_none() {
+                    let bitrate = found.bitrate;
                     let least = if bitrate == 0 { 0 } else { least_bytes(song, bitrate) };
+                    let path = found.new_name().clone();
                     wanted.push(crate::songcache::Wanted { client: client.clone(), url: client.stream_url(&song.id, bitrate, 0), path, least });
                 }
             }
@@ -1252,8 +1236,8 @@ impl Controller {
                     }
                     // So is a copy kept from an earlier play (once: if the song still won't
                     // play after that, the copy wasn't what was wrong).
-                    let (kept, _) = self.kept_file(&pb, &song);
-                    if crate::songcache::ready(&kept) && pb.dropped_kept.insert(song.id.clone()) {
+                    let kept = self.kept_file(&pb, &song).ready().cloned();
+                    if let Some(kept) = kept.filter(|_| pb.dropped_kept.insert(song.id.clone())) {
                         let position = pb.position;
                         drop(pb);
                         let _ = std::fs::remove_file(&kept);
@@ -2572,6 +2556,71 @@ fn stream_form(native: bool, cap: u32, suffix: &str, bit_rate: u32) -> (u32, &st
     }
 }
 
+/// The forms a song may be kept in, in the form it streams in now (see `stream_form`): the one
+/// a new copy is kept as first, then any an earlier version kept the same file as. Version
+/// 0.40.1 asked for an MP3 already within the limit as a conversion at that limit, which the
+/// server answers with the file itself, and kept it under that bit rate.
+fn kept_forms(native: bool, cap: u32, suffix: &str, bit_rate: u32) -> Vec<(u32, &str)> {
+    let now = stream_form(native, cap, suffix, bit_rate);
+    let mut forms = vec![now];
+    if now.0 == 0 && within_limit(suffix, bit_rate, cap) {
+        forms.push((cap, "mp3"));
+    }
+    forms
+}
+
+/// A song's kept copy, in the form it would be streamed in now.
+pub(crate) struct Kept {
+    /// Every name it may be kept under; a new copy goes under the first.
+    pub names: Vec<PathBuf>,
+    /// The bit rate to ask the server for (0 for the file as it is), and the kind of file.
+    pub bitrate: u32,
+    pub kept_as: String,
+}
+
+impl Kept {
+    /// The copy that's there to play, under whichever name.
+    pub fn ready(&self) -> Option<&PathBuf> {
+        self.names.iter().find(|path| crate::songcache::ready(path))
+    }
+
+    pub fn new_name(&self) -> &PathBuf {
+        &self.names[0]
+    }
+}
+
+/// Where `song` is or would be kept, with `native` saying whether the app plays the file as
+/// it is and `cap` the bit rate limit. The one lookup that playing, fetching ahead, saying
+/// what plays offline and making room all go by.
+pub(crate) fn kept(cache: &crate::songcache::SongCache, song: &Song, native: bool, cap: u32) -> Kept {
+    let suffix = song.suffix.to_lowercase();
+    let forms = kept_forms(native, cap, &suffix, song.bit_rate);
+    let (bitrate, kept_as) = forms[0];
+    Kept {
+        names: forms.iter().map(|&(bitrate, kept_as)| cache.file(&song.id, bitrate, kept_as)).collect(),
+        bitrate,
+        kept_as: kept_as.to_string(),
+    }
+}
+
+/// What to play a kept copy from, starting `at` seconds in.
+pub(crate) fn from_kept(token: u64, path: PathBuf, kept_as: &str, gain: f32, at: f64, duration_secs: f64) -> TrackRequest {
+    TrackRequest {
+        token,
+        local: Some(path),
+        keep: None,
+        live: false,
+        url: String::new(),
+        ranged: true,
+        suffix: kept_as.to_string(),
+        gain,
+        start_secs: at,
+        base_secs: 0.0,
+        duration_secs,
+        continues: false,
+    }
+}
+
 /// Whether a song is playing as part of its album, which is when Auto levels by album: shuffle
 /// is off and the song before or after it is the album's previous or next track. A playlist
 /// or a shuffle uses each song's own value instead, except for a run of consecutive tracks
@@ -2674,6 +2723,35 @@ mod tests {
         assert_eq!(stream_form(false, 320, "mp3", 128), (320, "mp3"));
         assert!(within_limit("MP3", 192, 192));
         assert!(!within_limit("mp3", 192, 0));
+    }
+
+    #[test]
+    fn a_copy_kept_by_0_40_1_is_found_under_its_old_name() {
+        // An MP3 within the limit: kept now as the file itself, and by 0.40.1 under the limit.
+        assert_eq!(kept_forms(true, 320, "mp3", 128), [(0, "mp3"), (320, "mp3")]);
+        assert_eq!(kept_forms(true, 128, "mp3", 0), [(0, "mp3"), (128, "mp3")]);
+        // Anything else has the one name it always had.
+        assert_eq!(kept_forms(true, 0, "mp3", 128), [(0, "mp3")]);
+        assert_eq!(kept_forms(true, 128, "mp3", 320), [(128, "mp3")]);
+        assert_eq!(kept_forms(true, 320, "flac", 900), [(320, "mp3")]);
+        assert_eq!(kept_forms(false, 320, "mp3", 128), [(320, "mp3")]);
+        // Through the lookup: the old copy is the one to play and to leave alone; a new one
+        // would go under the new name.
+        let dir = std::env::temp_dir().join(format!("nexus-kept-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = crate::songcache::SongCache::new(dir.clone());
+        let song = Song { id: "song-1".into(), suffix: "MP3".into(), bit_rate: 192, ..Default::default() };
+        assert!(kept(&cache, &song, true, 320).ready().is_none());
+        std::fs::write(dir.join("song-1.320.mp3"), b"audio").unwrap();
+        let found = kept(&cache, &song, true, 320);
+        assert_eq!(found.ready(), Some(&dir.join("song-1.320.mp3")));
+        assert_eq!(found.new_name(), &dir.join("song-1.raw.mp3"));
+        assert_eq!((found.bitrate, found.kept_as.as_str()), (0, "mp3"));
+        assert!(found.names.iter().any(|path| cache.holds(path)));
+        // At another limit it's another file.
+        assert!(kept(&cache, &song, true, 256).ready().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

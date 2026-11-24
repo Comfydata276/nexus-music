@@ -1764,4 +1764,30 @@ mod tests {
         });
         assert!((12_000..=14_400).contains(&frames.len()), "{} frames came out", frames.len());
     }
+
+    #[test]
+    fn a_song_kept_by_0_40_1_plays_and_seeks_with_the_server_out_of_reach() {
+        // The song cache as 0.40.1 left it: an MP3 within the limit, asked for as a conversion
+        // at that limit and kept under it.
+        let dir = std::env::temp_dir().join(format!("nexus-engine-kept-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("song-7.320.mp3"), MP3).unwrap();
+        let cache = crate::songcache::SongCache::new(dir.clone());
+        let song = crate::subsonic::Song { id: "song-7".into(), suffix: "mp3".into(), bit_rate: 128, duration: 1, ..Default::default() };
+        // The lookup playback goes by finds it; the engine plays it from disk (its client's
+        // server has nothing listening) and seeks in it.
+        let found = crate::playback::kept(&cache, &song, true, 320);
+        let path = found.ready().expect("the copy kept by 0.40.1").clone();
+        let request = crate::playback::from_kept(1, path, &found.kept_as, 1.0, 0.0, 0.5);
+        let frames = played("kept-0401", request, |engine| {
+            let opened = Instant::now();
+            while engine.position().is_none() && opened.elapsed() < Duration::from_secs(5) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            engine.seek(0.25);
+        });
+        assert!((12_000..=14_400).contains(&frames.len()), "{} frames came out", frames.len());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
