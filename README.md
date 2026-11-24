@@ -14,7 +14,7 @@ What's planned next is in the [roadmap](ROADMAP.md).
 
 ## What it does
 
-- Signs in to a Navidrome server; the password is kept in Windows Credential Manager. An address typed without `https://` is tried over HTTPS first; if only plain HTTP works and the server isn't on your home network, the app says so.
+- Signs in to a Navidrome server; the password is kept in Windows Credential Manager. An address typed without `https://` is tried over HTTPS; only an address on your home network is tried over plain HTTP as well. To sign in over plain HTTP anywhere else, type `http://` in front of the address, and the app warns you that it isn't encrypted. The app doesn't follow a redirect that would take your sign-in from HTTPS to plain HTTP, or over plain HTTP to another server.
 - Home, search, albums (sortable), artists, songs (every song in the library, newest first, sortable and filterable), genres, playlists and Liked songs.
 - Search that forgives typing mistakes, with a preview of the best matches as you type. It runs on a copy of the library kept on your PC, so it's instant; a matching artist comes first, and songs you've liked rank above others. A short word is only taken for a mistyping of one that starts with the same letter, so four letters don't match half the library.
 - Gapless playback or crossfade, seeking, shuffle, repeat and a queue you can edit. Crossfade leaves an album alone: its tracks run into each other as recorded.

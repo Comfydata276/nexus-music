@@ -58,6 +58,8 @@ pub struct Playback {
     resume_at: f64,
     /// The current track is being converted by the server, so seeking means reloading.
     transcoded: bool,
+    /// The same for the track armed to play next.
+    next_transcoded: bool,
     listened: f64,
     last_tick: f64,
     scrobbled: bool,
@@ -110,6 +112,7 @@ impl Playback {
             next_cursor: 0,
             resume_at: 0.0,
             transcoded: false,
+            next_transcoded: false,
             listened: 0.0,
             last_tick: 0.0,
             scrobbled: false,
@@ -592,7 +595,7 @@ impl Controller {
             };
         }
         // A copy kept from an earlier play, or fetched ahead, plays from disk too.
-        let (bitrate, kept_as) = stream_form(native, cap, &suffix);
+        let (bitrate, kept_as) = stream_form(native, cap, &suffix, song.bit_rate);
         let kept = (settings.cache_limit_mb > 0).then(|| self.song_cache.file(&song.id, bitrate, kept_as));
         if let Some(path) = kept.as_ref().filter(|path| crate::songcache::ready(path)) {
             crate::songcache::touch(path);
@@ -611,7 +614,7 @@ impl Controller {
                 continues: false,
             };
         }
-        if native && cap == 0 {
+        if bitrate == 0 {
             TrackRequest {
                 token,
                 local: None,
@@ -636,7 +639,7 @@ impl Controller {
                 // Only a conversion that starts at the beginning is the whole song.
                 keep: kept.filter(|_| offset == 0.0).map(|path| (path, least_bytes(song, bitrate))),
                 live: false,
-                url: client.stream_url(&song.id, if cap == 0 { 320 } else { cap }, offset as u32),
+                url: client.stream_url(&song.id, bitrate, offset as u32),
                 ranged: false,
                 suffix: "mp3".into(),
                 gain,
@@ -653,7 +656,7 @@ impl Controller {
     fn kept_file(&self, pb: &Playback, song: &Song) -> (PathBuf, u32) {
         let suffix = song.suffix.to_lowercase();
         let native = NATIVE_SUFFIXES.contains(&suffix.as_str()) && !pb.needs_transcode.contains(&song.id);
-        let (bitrate, kept_as) = stream_form(native, self.settings.borrow().max_bitrate(), &suffix);
+        let (bitrate, kept_as) = stream_form(native, self.settings.borrow().max_bitrate(), &suffix, song.bit_rate);
         (self.song_cache.file(&song.id, bitrate, kept_as), bitrate)
     }
 
@@ -669,7 +672,7 @@ impl Controller {
         let suffix = song.suffix.to_lowercase();
         let cap = settings.max_bitrate();
         [true, false].into_iter().any(|native| {
-            let (bitrate, kept_as) = stream_form(native, cap, &suffix);
+            let (bitrate, kept_as) = stream_form(native, cap, &suffix, song.bit_rate);
             self.song_cache.holds(&self.song_cache.file(&song.id, bitrate, kept_as))
         })
     }
@@ -737,6 +740,7 @@ impl Controller {
             });
             let mut request = self.request_for(&mut pb, &song, token, 0.0);
             request.continues = continues;
+            pb.next_transcoded = !request.ranged;
             request
         };
         self.engine.set_next(Some((client, request)));
@@ -1130,14 +1134,7 @@ impl Controller {
                         pb.listened = 0.0;
                         pb.last_tick = 0.0;
                         pb.scrobbled = false;
-                        let cap = self.settings.borrow().max_bitrate();
-                        let downloads = self.downloads.borrow();
-                        pb.transcoded = pb.current().is_some_and(|s| {
-                            !downloads.has(&s.id)
-                                && (cap != 0
-                                    || !NATIVE_SUFFIXES.contains(&s.suffix.to_lowercase().as_str())
-                                    || pb.needs_transcode.contains(&s.id))
-                        });
+                        pb.transcoded = pb.next_transcoded;
                         true
                     } else if token == pb.current_token {
                         false
@@ -1718,7 +1715,7 @@ impl Controller {
                     && (saved.is_some() || !self.playback.borrow().needs_transcode.contains(&song.id));
                 let title = &song.title;
                 // The short form shown under the song in the player bar.
-                let as_stored = native && (cap == 0 || (suffix == "mp3" && song.bit_rate <= cap));
+                let as_stored = native && (cap == 0 || within_limit(&suffix, song.bit_rate, cap));
                 let lossless = as_stored
                     && (LOSSLESS_SUFFIXES.contains(&suffix.as_str()) || song.bit_depth > 0);
                 let label = if as_stored {
@@ -2554,11 +2551,25 @@ fn nearest_rate(kbps: u32) -> u32 {
     [96u32, 128, 160, 192, 256, 320].into_iter().min_by_key(|rate| rate.abs_diff(kbps)).unwrap_or(320)
 }
 
+/// Whether a song is already what the server would make of it at a limit of `cap` kbps: an
+/// MP3 at or under that bit rate. Asked for MP3 at that limit, Navidrome sends such a file
+/// as it is, and then takes no notice of a `timeOffset` saying where to start, so it's asked
+/// for as the file itself instead. A bit rate of 0 is one the server doesn't know, and it sends
+/// that file as it is too.
+pub fn within_limit(suffix: &str, bit_rate: u32, cap: u32) -> bool {
+    cap > 0 && suffix.eq_ignore_ascii_case("mp3") && bit_rate <= cap
+}
+
 /// The form a song is streamed in: the bit rate to ask for (0 for the file as it is) and
 /// the kind of file that comes back. `native` is whether the app can play the file as it is;
-/// `cap` is the bit rate limit in Settings, 0 for none.
-fn stream_form(native: bool, cap: u32, suffix: &str) -> (u32, &str) {
-    if native && cap == 0 { (0, suffix) } else { (if cap == 0 { 320 } else { cap }, "mp3") }
+/// `cap` is the bit rate limit in Settings, 0 for none; `bit_rate` is the file's, as the
+/// server reports it.
+fn stream_form(native: bool, cap: u32, suffix: &str, bit_rate: u32) -> (u32, &str) {
+    if native && (cap == 0 || within_limit(suffix, bit_rate, cap)) {
+        (0, suffix)
+    } else {
+        (if cap == 0 { 320 } else { cap }, "mp3")
+    }
 }
 
 /// Whether a song is playing as part of its album, which is when Auto levels by album: shuffle
@@ -2640,6 +2651,29 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn an_mp3_within_the_limit_is_streamed_as_the_file_itself() {
+        // Lossless chosen: the file as it is, if the app can play it.
+        assert_eq!(stream_form(true, 0, "flac", 900), (0, "flac"));
+        assert_eq!(stream_form(false, 0, "opus", 128), (320, "mp3"));
+        // An MP3 already at or under the limit is what the server would send anyway, and
+        // asking for it as the file means seeking in it works the ordinary way.
+        assert_eq!(stream_form(true, 320, "mp3", 128), (0, "mp3"));
+        assert_eq!(stream_form(true, 128, "mp3", 128), (0, "mp3"));
+        // One whose bit rate the server doesn't know is sent as it is too.
+        assert_eq!(stream_form(true, 128, "mp3", 0), (0, "mp3"));
+        // Above the limit, or another kind of file, the server really converts it, and is
+        // asked to start where a seek lands.
+        assert_eq!(stream_form(true, 128, "mp3", 320), (128, "mp3"));
+        assert_eq!(stream_form(true, 320, "flac", 900), (320, "mp3"));
+        assert_eq!(stream_form(true, 320, "m4a", 256), (320, "mp3"));
+        assert_eq!(stream_form(false, 128, "opus", 96), (128, "mp3"));
+        // An MP3 the app's decoder turned away goes to the server to convert.
+        assert_eq!(stream_form(false, 320, "mp3", 128), (320, "mp3"));
+        assert!(within_limit("MP3", 192, 192));
+        assert!(!within_limit("mp3", 192, 0));
     }
 
     #[test]

@@ -293,7 +293,7 @@ fn size_label(bytes: u64) -> String {
 fn expected_bytes(song: &Song, quality: u32) -> u64 {
     let suffix = song.suffix.to_lowercase();
     let playable = NATIVE_SUFFIXES.contains(&suffix.as_str());
-    let original = playable && (quality == 0 || (suffix == "mp3" && song.bit_rate > 0 && song.bit_rate <= quality));
+    let original = playable && (quality == 0 || crate::playback::within_limit(&suffix, song.bit_rate, quality));
     if original { song.size } else { song.duration as u64 * if quality == 0 { 320 } else { quality } as u64 * 125 }
 }
 
@@ -340,7 +340,7 @@ fn fetch(
     // The original is kept when lossless is asked for, or when it's already an MP3 within the
     // limit. Otherwise the server converts it, as it would for streaming. (Formats the app
     // can't decode itself are always converted.)
-    let original = playable && (quality == 0 || (suffix == "mp3" && song.bit_rate > 0 && song.bit_rate <= quality));
+    let original = playable && (quality == 0 || crate::playback::within_limit(&suffix, song.bit_rate, quality));
     let rate = if quality == 0 { 320 } else { quality };
     let (url, extension, expected) = if original {
         (client.stream_url(&song.id, 0, 0), suffix, song.size)

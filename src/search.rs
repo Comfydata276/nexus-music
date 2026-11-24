@@ -21,6 +21,8 @@ const PAGE: u32 = 500;
 const RESCAN_AFTER: i64 = 15 * 60;
 /// The copy is fetched afresh this often regardless (seconds), to keep play counts current.
 const REFRESH_AFTER: i64 = 24 * 3600;
+/// How many times one look at the library fetches it, while the library keeps changing.
+const FETCH_TRIES: usize = 3;
 
 /// The library as fetched from the server.
 #[derive(Default, Serialize, Deserialize)]
@@ -48,11 +50,37 @@ impl Library {
             || now - self.fetched > REFRESH_AFTER
     }
 
-    pub fn fetch(client: &Client) -> ApiResult<Library> {
-        let status = client.scan_status()?;
+    /// Fetches the whole library afresh. The server hands it over a page at a time, by
+    /// position, so a song added or removed while that's under way shifts the rest along: one
+    /// can then fall between two pages, or come twice. What the server says about its library
+    /// is asked again at the end, and a copy taken while it changed isn't trusted; it's
+    /// fetched again, a few times at most. After that this gives up with nothing, the copy
+    /// already in use stays, and the next look at the library tries again. (So does a scan
+    /// under way: half a library is no use.)
+    pub fn fetch(client: &Client) -> ApiResult<Option<Library>> {
+        // Whether the server's song count is the number of songs, to check the copy against.
+        let counts_songs = client.ping().is_ok_and(|info| info.counts_songs());
+        let mut status = client.scan_status()?;
+        for _ in 0..FETCH_TRIES {
+            if status.scanning {
+                break;
+            }
+            let library = Self::fetch_pages(client, &status)?;
+            let after = client.scan_status()?;
+            let unchanged = !after.scanning && after.count == status.count && after.last_scan == status.last_scan;
+            if unchanged && library.is_whole(counts_songs.then_some(after.count)) {
+                return Ok(Some(library));
+            }
+            status = after;
+        }
+        Ok(None)
+    }
+
+    /// Every page of the library, stamped with `status`, read before the first.
+    fn fetch_pages(client: &Client, status: &ScanStatus) -> ApiResult<Library> {
         let mut library = Library {
             count: status.count,
-            last_scan: status.last_scan,
+            last_scan: status.last_scan.clone(),
             fetched: chrono::Utc::now().timestamp(),
             ..Default::default()
         };
@@ -75,6 +103,16 @@ impl Library {
             page += 1;
         }
         Ok(library)
+    }
+
+    /// Whether a copy holds together: no song in it twice, which is what a song added while
+    /// the pages were fetched looks like, and no more songs than `count`, the server's song
+    /// count where it is one. Fewer is no sign of a fault: the count takes in every library
+    /// on the server, and an account may be let into only some of them.
+    fn is_whole(&self, count: Option<u64>) -> bool {
+        let mut seen = HashSet::with_capacity(self.songs.len());
+        self.songs.iter().all(|song| seen.insert(song.id.as_str()))
+            && count.is_none_or(|count| self.songs.len() as u64 <= count)
     }
 
     pub fn load(path: &Path) -> Option<Library> {
@@ -522,6 +560,141 @@ mod tests {
         // Words can come from the title and the artist together.
         let found = index.search("psycho maisie", &|_: &Song| false, 5, 5, 10);
         assert_eq!(titles(&found.songs), ["Psycho / Maisie Peters"]);
+    }
+
+    /// A library on a pretend server, as `Library::fetch` sees it.
+    struct Shelf {
+        songs: Vec<String>,
+        last_scan: String,
+        scanning: bool,
+        /// Pages of songs asked for, by where each started.
+        pages: Vec<u32>,
+    }
+
+    /// A pretend server holding `shelf`. `meanwhile` is called after each page of songs is
+    /// sent, with where that page started, to change the library as a scan would.
+    fn library_server(
+        shelf: Arc<std::sync::Mutex<Shelf>>,
+        meanwhile: impl Fn(&mut Shelf, u32) + Send + Sync + 'static,
+    ) -> Client {
+        use crate::subsonic::fake;
+        let address = fake::server(move |target, stream| {
+            let number = |name: &str| {
+                let at = target.find(&format!("&{name}=")).map(|at| at + name.len() + 2);
+                at.map_or(0, |at| target[at..].split('&').next().unwrap().parse::<u32>().unwrap())
+            };
+            let mut shelf = shelf.lock().unwrap();
+            if target.starts_with("/rest/getScanStatus") {
+                let fields = format!(
+                    r#""scanStatus":{{"scanning":{},"count":{},"lastScan":"{}"}}"#,
+                    shelf.scanning,
+                    shelf.songs.len(),
+                    shelf.last_scan
+                );
+                fake::ok(stream, &fields);
+            } else if target.starts_with("/rest/search3") {
+                let (offset, count) = (number("songOffset"), number("songCount"));
+                let page: Vec<String> = shelf
+                    .songs
+                    .iter()
+                    .skip(offset as usize)
+                    .take(count as usize)
+                    .map(|id| format!(r#"{{"id":"{id}","title":"Song {id}"}}"#))
+                    .collect();
+                fake::ok(stream, &format!(r#""searchResult3":{{"song":[{}]}}"#, page.join(",")));
+                if count > 0 {
+                    shelf.pages.push(offset);
+                    meanwhile(&mut shelf, offset);
+                }
+            } else {
+                fake::ok(stream, "");
+            }
+        });
+        Client::new(&address, "someone", "secret")
+    }
+
+    fn shelf(songs: usize) -> Arc<std::sync::Mutex<Shelf>> {
+        let songs = (0..songs).map(|n| format!("s{n}")).collect();
+        Arc::new(std::sync::Mutex::new(Shelf { songs, last_scan: "1".into(), scanning: false, pages: Vec::new() }))
+    }
+
+    fn ids(library: &Library) -> Vec<String> {
+        library.songs.iter().map(|song| song.id.clone()).collect()
+    }
+
+    #[test]
+    fn a_song_removed_while_the_pages_arrive_is_not_lost_from_the_copy() {
+        let shelf = shelf(1200);
+        // After the first page, a scan finds an early song gone: everything after it moves
+        // up one, and the song that was first on the second page would be skipped.
+        let client = library_server(shelf.clone(), |shelf, offset| {
+            if offset == 0 && shelf.last_scan == "1" {
+                shelf.songs.remove(3);
+                shelf.last_scan = "2".into();
+            }
+        });
+        let library = Library::fetch(&client).unwrap().expect("fetched again, and trusted");
+        let shelf = shelf.lock().unwrap();
+        assert_eq!(ids(&library), shelf.songs);
+        assert!(library.songs.iter().any(|song| song.id == "s500"));
+        assert_eq!((library.count, library.last_scan.as_str()), (1199, "2"));
+        // The first go, and a whole second one.
+        assert_eq!(shelf.pages, [0, 500, 1000, 0, 500, 1000]);
+    }
+
+    #[test]
+    fn a_song_that_comes_twice_is_caught_even_if_the_server_says_nothing_changed() {
+        let shelf = shelf(1200);
+        // One added at the start and one taken from the end: the same count, and no scan
+        // to say so, but the last song of the first page comes again on the second.
+        let client = library_server(shelf.clone(), |shelf, offset| {
+            if offset == 0 && shelf.pages.len() == 1 {
+                shelf.songs.insert(0, "new".into());
+                shelf.songs.pop();
+            }
+        });
+        let library = Library::fetch(&client).unwrap().expect("fetched again, and trusted");
+        assert_eq!(ids(&library), shelf.lock().unwrap().songs);
+        assert_eq!(shelf.lock().unwrap().pages.len(), 6);
+    }
+
+    #[test]
+    fn a_library_that_keeps_changing_leaves_the_copy_in_use_alone() {
+        let shelf = shelf(700);
+        let client = library_server(shelf.clone(), |shelf, offset| {
+            if offset == 0 {
+                shelf.songs.push(format!("added{}", shelf.pages.len()));
+                shelf.last_scan = format!("{}", shelf.pages.len());
+            }
+        });
+        assert!(Library::fetch(&client).unwrap().is_none());
+        // A few goes, then it waits for the next look at the library.
+        assert_eq!(shelf.lock().unwrap().pages.iter().filter(|&&offset| offset == 0).count(), FETCH_TRIES);
+    }
+
+    #[test]
+    fn waits_for_a_scan_to_finish() {
+        let shelf = shelf(10);
+        shelf.lock().unwrap().scanning = true;
+        let client = library_server(shelf.clone(), |_, _| {});
+        assert!(Library::fetch(&client).unwrap().is_none());
+        assert!(shelf.lock().unwrap().pages.is_empty());
+        // Once it has, the copy comes.
+        shelf.lock().unwrap().scanning = false;
+        let library = Library::fetch(&client).unwrap().unwrap();
+        assert_eq!(library.songs.len(), 10);
+    }
+
+    #[test]
+    fn a_copy_holds_no_song_twice_and_no_more_than_the_server_counts() {
+        let copy = |ids: &[&str]| Library { songs: ids.iter().map(|id| song(id, "", "", "")).collect(), ..Default::default() };
+        assert!(copy(&["a", "b", "c"]).is_whole(Some(3)));
+        // Fewer can be an account let into only some of the server's libraries.
+        assert!(copy(&["a", "b"]).is_whole(Some(3)));
+        assert!(!copy(&["a", "b", "c", "d"]).is_whole(Some(3)));
+        assert!(!copy(&["a", "b", "a"]).is_whole(None));
+        // A count that isn't the song count isn't gone by.
+        assert!(copy(&["a", "b", "c", "d"]).is_whole(None));
     }
 }
 

@@ -627,7 +627,7 @@ impl Controller {
             String::new(),
             format!("Signed in: {}", if self.client().is_some() { "yes" } else { "no" }),
             format!("Server version: {}", app.get_server_version()),
-            format!("Server address uses HTTPS: {}", if settings.server.starts_with("https://") { "yes" } else { "no" }),
+            format!("Server address uses HTTPS: {}", if crate::subsonic::scheme_of(&settings.server).as_deref() == Some("https") { "yes" } else { "no" }),
             format!("Offline mode: {}; server out of reach: {}", yes(settings.offline), yes(self.unreachable.get())),
             format!("Sound output: {}", page.get_output_status()),
             format!("Exclusive mode: {}; streaming limit: {} kbps (0 is none)", yes(settings.exclusive), settings.max_bitrate()),
@@ -1213,9 +1213,12 @@ impl Controller {
         app.set_login_error("".into());
         let username = username.trim().to_string();
         self.api_pool.spawn(move || {
-            // An address typed without "http://" or "https://" is tried the safe way first.
+            // An address typed without "http://" or "https://" is tried the safe way first,
+            // and the unsafe way only on the home network.
             let mut answer = Err(crate::subsonic::ApiError::Network("No address was given.".into()));
             let addresses = crate::subsonic::addresses_to_try(&server);
+            // HTTPS was the only thing tried, and not because the person said so.
+            let only_guessed_https = addresses.len() == 1 && crate::subsonic::scheme_of(&server).is_none();
             for (index, address) in addresses.iter().enumerate() {
                 let client = Client::new(address, &username, &password);
                 // HTTPS was a guess: if nothing answers there soon, go on to plain HTTP
@@ -1257,7 +1260,13 @@ impl Controller {
                             );
                         }
                     }
-                    Err(e) => app.set_login_error(e.to_string().into()),
+                    Err(e) => {
+                        let mut shown = e.to_string();
+                        if only_guessed_https && !matches!(e, crate::subsonic::ApiError::Server { .. }) {
+                            shown = format!("{shown} {}", crate::subsonic::TRY_PLAIN_HTTP);
+                        }
+                        app.set_login_error(shown.into());
+                    }
                 }
             });
         });
@@ -2196,7 +2205,8 @@ impl Controller {
                     None => !status.scanning,
                 };
                 if stale {
-                    if let Ok(library) = crate::search::Library::fetch(&client) {
+                    // A copy that couldn't be trusted leaves the one in use where it is.
+                    if let Ok(Some(library)) = crate::search::Library::fetch(&client) {
                         library.save(&file);
                         crate::search::set_current(Some(crate::search::Index::new(library)));
                         renewed = true;

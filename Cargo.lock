@@ -3168,7 +3168,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-music"
-version = "0.40.1"
+version = "0.40.2"
 dependencies = [
  "chrono",
  "cpal",
