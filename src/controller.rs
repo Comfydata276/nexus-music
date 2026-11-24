@@ -857,6 +857,7 @@ impl Controller {
                 // Confirm the saved login still works (if not, go back to the sign-in
                 // screen), and find out whether the server can be reached at all.
                 self.check_connection();
+                self.warn_of_plain_http();
             }
         }
 
@@ -914,6 +915,34 @@ impl Controller {
         });
         self.update_timer.start(slint::TimerMode::Repeated, Duration::from_secs(6 * 3600), || {
             with(|ctl| ctl.check_for_updates(false));
+        });
+    }
+
+    /// A saved address that's plain HTTP to a server beyond the home network still signs in
+    /// (that sign-in has gone that way many times already, and the app can't tell whether it
+    /// was typed so or saved by an older version's fallback), but the person is told, once
+    /// for that address, and how to put it right.
+    fn warn_of_plain_http(self: &Rc<Self>) {
+        let (server, warned) = {
+            let settings = self.settings.borrow();
+            (settings.server.clone(), settings.plain_http_warned.clone())
+        };
+        if crate::subsonic::scheme_of(&server).as_deref() != Some("http") || server == warned {
+            return;
+        }
+        // Where the name leads is looked up away from the window's thread.
+        self.api_pool.spawn(move || {
+            if !crate::subsonic::warn_of_plain_http(&server, &warned) {
+                return;
+            }
+            post(move |ctl| {
+                if ctl.settings.borrow().server != server {
+                    return;
+                }
+                ctl.settings.borrow_mut().plain_http_warned = server;
+                ctl.save_settings();
+                ctl.show_toast(crate::subsonic::PLAIN_HTTP_WARNING.into(), "", Duration::from_secs(20));
+            });
         });
     }
 
@@ -1217,8 +1246,6 @@ impl Controller {
             // and the unsafe way only on the home network.
             let mut answer = Err(crate::subsonic::ApiError::Network("No address was given.".into()));
             let addresses = crate::subsonic::addresses_to_try(&server);
-            // HTTPS was the only thing tried, and not because the person said so.
-            let only_guessed_https = addresses.len() == 1 && crate::subsonic::scheme_of(&server).is_none();
             for (index, address) in addresses.iter().enumerate() {
                 let client = Client::new(address, &username, &password);
                 // HTTPS was a guess: if nothing answers there soon, go on to plain HTTP
@@ -1232,6 +1259,9 @@ impl Controller {
                     break;
                 }
             }
+            // Over plain HTTP beyond the home network, going by where the name leads.
+            let open = answer.as_ref().is_ok_and(|(client, _)| crate::subsonic::plain_http_beyond_home(client.server()));
+            let suggest_http = answer.as_ref().err().is_some_and(|e| crate::subsonic::suggests_plain_http(&server, addresses.len(), e));
             post(move |ctl| {
                 let app = ctl.ui.global::<ui::App>();
                 app.set_login_busy(false);
@@ -1241,28 +1271,27 @@ impl Controller {
                             let mut settings = ctl.settings.borrow_mut();
                             settings.server = client.server().to_string();
                             settings.username = username.clone();
+                            if open {
+                                // Said now, so not again at the next start.
+                                settings.plain_http_warned = client.server().to_string();
+                            }
                         }
                         ctl.save_settings();
                         if !config::save_password(&ctl.paths, client.server(), &username, &password) {
                             ctl.toast("Couldn't save your password; you'll need to sign in next time.");
                         }
                         ctl.covers.reset();
-                        let open = crate::subsonic::unencrypted_beyond_home(client.server());
                         ctl.enter(client, Some(info.version));
                         // The server is plainly there: stop treating it as out of reach, and
                         // send whatever was being held for it.
                         ctl.check_connection();
                         if open {
-                            ctl.show_toast(
-                                "Signed in without encryption: over plain HTTP your sign-in and your music can be read on the way. If your server has an https:// address, sign in with that.".into(),
-                                "",
-                                Duration::from_secs(12),
-                            );
+                            ctl.show_toast(crate::subsonic::PLAIN_HTTP_WARNING.into(), "", Duration::from_secs(12));
                         }
                     }
                     Err(e) => {
                         let mut shown = e.to_string();
-                        if only_guessed_https && !matches!(e, crate::subsonic::ApiError::Server { .. }) {
+                        if suggest_http {
                             shown = format!("{shown} {}", crate::subsonic::TRY_PLAIN_HTTP);
                         }
                         app.set_login_error(shown.into());
@@ -2673,7 +2702,7 @@ impl Controller {
             let page = match first {
                 Ok(page) => page,
                 Err(e) => {
-                    let network = matches!(e, crate::subsonic::ApiError::Network(_));
+                    let network = e.is_network();
                     let offline_home = matches!(route, Route::Home) && network;
                     return post(move |ctl| {
                         if network && !ctl.settings.borrow().offline {

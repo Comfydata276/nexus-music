@@ -29,6 +29,8 @@ fs4 = { version = "0.13", default-features = false, features = ["sync"] }
 getrandom = "0.3"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 qrcode = { version = "0.14", default-features = false }
+# Already in the build through other crates; used to resolve where a redirect points.
+url = "2.5"
 
 [target.'cfg(windows)'.dependencies]
 souvlaki = { version = "0.9", default-features = false }

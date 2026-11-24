@@ -221,6 +221,9 @@ pub struct Settings {
     pub check_updates: bool,
     /// The newest version the user has already been told about.
     pub update_notified: String,
+    /// The server address last warned about for going over plain HTTP beyond the home
+    /// network, so the warning is given once and not at every start.
+    pub plain_http_warned: String,
 }
 
 impl Default for Settings {
@@ -282,6 +285,7 @@ impl Default for Settings {
             close_to_tray: true,
             check_updates: true,
             update_notified: String::new(),
+            plain_http_warned: String::new(),
         }
     }
 }
