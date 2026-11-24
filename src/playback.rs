@@ -2755,6 +2755,34 @@ mod tests {
     }
 
     #[test]
+    fn a_full_cache_keeps_a_queued_song_s_copy_from_0_40_1() {
+        // A cache over its limit: the 0.40.1 copy of a song about to play is the oldest file
+        // in it, and two songs not in the queue were played since.
+        let dir = std::env::temp_dir().join(format!("nexus-kept-trim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = crate::songcache::SongCache::new(dir.clone());
+        let aged = |name: &str, secs: u64| {
+            let path = dir.join(name);
+            std::fs::write(&path, vec![1u8; 1000]).unwrap();
+            let file = std::fs::File::options().write(true).open(&path).unwrap();
+            file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)).unwrap();
+            path
+        };
+        let old_copy = aged("song-1.320.mp3", 1_000);
+        let other = aged("song-2.raw.flac", 2_000);
+        let newer = aged("song-3.raw.flac", 3_000);
+        // What's kept from making room, as fetching ahead gathers it for the queue.
+        let queued = Song { id: "song-1".into(), suffix: "mp3".into(), bit_rate: 192, ..Default::default() };
+        let mut in_use = HashSet::new();
+        in_use.extend(kept(&cache, &queued, true, 320).names);
+        cache.trim(1000, &in_use);
+        assert!(old_copy.exists(), "the queued song's copy was made room for");
+        assert!(!other.exists() && !newer.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn album_order_decides_auto_levelling() {
         let track = |album: &str, disc: u32, track: u32| Song { album_id: album.into(), disc_number: disc, track, ..Default::default() };
         let (one, two, three) = (track("a", 1, 1), track("a", 1, 2), track("a", 1, 3));

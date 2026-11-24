@@ -27,7 +27,8 @@ const FETCH_TRIES: usize = 3;
 /// with each one after, up to the most.
 const RETRY_AFTER: i64 = 5 * 60;
 const RETRY_AFTER_MOST: i64 = 3600;
-/// More pages than this of one kind (two million songs) is a server that never says it's done.
+/// More full pages than this of one kind (two million songs) is a server that never says it's
+/// done. The page after the last full one is still read, as that's how the end is seen.
 const MOST_PAGES: u32 = 4000;
 
 fn trusted() -> bool {
@@ -91,16 +92,23 @@ impl Library {
             if status.scanning && !any {
                 break;
             }
-            let mut library = Self::fetch_pages(client, &status)?;
-            let after = client.scan_status()?;
+            let mut library = Self::fetch_pages(client, &status, MOST_PAGES)?;
+            // Without the server's word on its library now, the copy can't be checked: it's
+            // one that couldn't be trusted, which beats none.
+            let Ok(after) = client.scan_status() else {
+                untrusted = Some(library);
+                break;
+            };
+            // A count missing from either reading means no check by count.
+            let counts = status.count.zip(after.count);
             let unchanged = !status.scanning
                 && !after.scanning
-                && after.count == status.count
+                && counts.is_none_or(|(before, now)| before == now)
                 && after.last_scan == status.last_scan;
-            // No count means no check by count.
-            let count = after.count.filter(|_| counts_songs);
+            let count = counts.map(|(_, now)| now).filter(|_| counts_songs);
             if unchanged && library.is_whole(count) {
                 library.verified = true;
+                library.count = after.count.or(status.count).unwrap_or(0);
                 return Ok(Fetched { library: Some(library), last_scan: after.last_scan });
             }
             let scanning = after.scanning;
@@ -119,8 +127,9 @@ impl Library {
         Ok(Fetched { library, last_scan: status.last_scan })
     }
 
-    /// Every page of the library, stamped with `status`, read before the first.
-    fn fetch_pages(client: &Client, status: &ScanStatus) -> ApiResult<Library> {
+    /// Every page of the library, stamped with `status`, read before the first; `most` full
+    /// pages of a kind at most.
+    fn fetch_pages(client: &Client, status: &ScanStatus, most: u32) -> ApiResult<Library> {
         let mut library = Library {
             count: status.count.unwrap_or(0),
             last_scan: status.last_scan.clone(),
@@ -133,7 +142,7 @@ impl Library {
         let mut before: [Option<String>; 3] = Default::default();
         let mut page = 0;
         while artists || albums || songs {
-            if page == MOST_PAGES {
+            if page > most {
                 library.cut_short = true;
                 break;
             }
@@ -241,8 +250,10 @@ pub static RETRY: std::sync::Mutex<Retry> = std::sync::Mutex::new(Retry::new());
 
 /// Looks at the server's library and fetches a new copy if `current`, the one in use, is out
 /// of date (or there is none), as far as `retry` allows. Gives back the copy to use instead,
-/// if there is one.
-pub fn renew(client: &Client, current: Option<&Library>, retry: &mut Retry, now: i64) -> ApiResult<Option<Library>> {
+/// if there is one. `clock` tells the time in seconds: a fetch can take minutes, and the wait
+/// after a copy that couldn't be trusted starts when it's turned down.
+pub fn renew(client: &Client, current: Option<&Library>, retry: &mut Retry, clock: &dyn Fn() -> i64) -> ApiResult<Option<Library>> {
+    let now = clock();
     let status = client.scan_status()?;
     let stale = current.is_none_or(|library| library.is_stale(&status, now));
     if !stale || !retry.allows(&status, now) {
@@ -251,7 +262,7 @@ pub fn renew(client: &Client, current: Option<&Library>, retry: &mut Retry, now:
     let fetched = Library::fetch(client, current.is_none())?;
     match &fetched.library {
         Some(library) if library.verified => *retry = Retry::new(),
-        _ => retry.refused(&fetched.last_scan, now),
+        _ => retry.refused(&fetched.last_scan, clock()),
     }
     Ok(fetched.library)
 }
@@ -700,6 +711,8 @@ mod tests {
         ignores_offset: bool,
         /// Pages of songs asked for, by where each started.
         pages: Vec<u32>,
+        /// The server fails when asked about its library.
+        status_broken: bool,
     }
 
     /// A pretend server holding `shelf`. `meanwhile` is called after each page of songs is
@@ -715,7 +728,9 @@ mod tests {
                 at.map_or(0, |at| target[at..].split('&').next().unwrap().parse::<u32>().unwrap())
             };
             let mut shelf = shelf.lock().unwrap();
-            if target.starts_with("/rest/getScanStatus") {
+            if target.starts_with("/rest/getScanStatus") && shelf.status_broken {
+                let _ = std::io::Write::write_all(stream, b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            } else if target.starts_with("/rest/getScanStatus") {
                 let count = if shelf.counts { format!(r#","count":{}"#, shelf.songs.len()) } else { String::new() };
                 let fields = format!(r#""scanStatus":{{"scanning":{}{count},"lastScan":"{}"}}"#, shelf.scanning, shelf.last_scan);
                 fake::ok(stream, &fields);
@@ -749,7 +764,12 @@ mod tests {
 
     fn shelf(songs: usize) -> Arc<std::sync::Mutex<Shelf>> {
         let songs = (0..songs).map(|n| format!("s{n}")).collect();
-        Arc::new(std::sync::Mutex::new(Shelf { songs, last_scan: "1".into(), scanning: false, counts: true, ignores_offset: false, pages: Vec::new() }))
+        Arc::new(std::sync::Mutex::new(Shelf { songs, last_scan: "1".into(), scanning: false, counts: true, ignores_offset: false, pages: Vec::new(), status_broken: false }))
+    }
+
+    /// A clock that always says `now`.
+    fn at(now: i64) -> impl Fn() -> i64 {
+        move || now
     }
 
     fn ids(library: &Library) -> Vec<String> {
@@ -830,11 +850,11 @@ mod tests {
         let shelf = shelf(10);
         shelf.lock().unwrap().counts = false;
         let client = library_server(shelf.clone(), |_, _| {});
-        let library = renew(&client, None, &mut Retry::new(), 0).unwrap().expect("a copy");
+        let library = renew(&client, None, &mut Retry::new(), &at(0)).unwrap().expect("a copy");
         assert!(library.verified);
         assert_eq!(library.songs.len(), 10);
         // And no count isn't taken for a change in it.
-        assert!(renew(&client, Some(&library), &mut Retry::new(), 60).unwrap().is_none());
+        assert!(renew(&client, Some(&library), &mut Retry::new(), &at(60)).unwrap().is_none());
     }
 
     #[test]
@@ -848,7 +868,7 @@ mod tests {
         });
         let fetches = || shelf.lock().unwrap().pages.len();
         let (mut retry, current) = (Retry::new(), old_copy());
-        assert!(renew(&client, Some(&current), &mut retry, 0).unwrap().is_none());
+        assert!(renew(&client, Some(&current), &mut retry, &at(0)).unwrap().is_none());
         assert_eq!(fetches(), FETCH_TRIES);
         // Each look at the library in the meantime fetches nothing: five minutes, then ten,
         // twenty, forty, and an hour at most from then on.
@@ -856,11 +876,11 @@ mod tests {
         for wait in [300, 600, 1200, 2400, 3600, 3600] {
             let before = fetches();
             for _ in 0..4 {
-                assert!(renew(&client, Some(&current), &mut retry, now + wait - 60).unwrap().is_none());
+                assert!(renew(&client, Some(&current), &mut retry, &at(now + wait - 60)).unwrap().is_none());
             }
             assert_eq!(fetches(), before, "within {wait} seconds");
             now += wait;
-            assert!(renew(&client, Some(&current), &mut retry, now).unwrap().is_none());
+            assert!(renew(&client, Some(&current), &mut retry, &at(now)).unwrap().is_none());
             assert_eq!(fetches(), before + FETCH_TRIES, "after {wait} seconds");
         }
         // A new scan of the library is worth a try straight away; once it's trusted, the
@@ -869,7 +889,7 @@ mod tests {
         calm.last_scan = "9".into();
         drop(calm);
         let client = library_server(shelf.clone(), |_, _| {});
-        let library = renew(&client, Some(&current), &mut retry, now + 1).unwrap().expect("a trusted copy");
+        let library = renew(&client, Some(&current), &mut retry, &at(now + 1)).unwrap().expect("a trusted copy");
         assert!(library.verified);
         assert_eq!(retry.wait, 0);
     }
@@ -881,16 +901,16 @@ mod tests {
         shelf.lock().unwrap().scanning = true;
         let client = library_server(shelf.clone(), |_, _| {});
         let mut retry = Retry::new();
-        let first = renew(&client, None, &mut retry, 0).unwrap().expect("better than none");
+        let first = renew(&client, None, &mut retry, &at(0)).unwrap().expect("better than none");
         assert!(!first.verified);
         assert_eq!(first.songs.len(), 12);
         // Fetched once, not again and again while the scan goes on.
         assert_eq!(shelf.lock().unwrap().pages, [0]);
         // While there is a copy, one that can't be trusted doesn't replace it.
-        assert!(renew(&client, Some(&first), &mut retry, 400).unwrap().is_none());
+        assert!(renew(&client, Some(&first), &mut retry, &at(400)).unwrap().is_none());
         shelf.lock().unwrap().scanning = false;
-        assert!(renew(&client, Some(&first), &mut retry, 100).unwrap().is_none(), "still waiting after the first");
-        let second = renew(&client, Some(&first), &mut retry, 400).unwrap().expect("a trusted copy, later");
+        assert!(renew(&client, Some(&first), &mut retry, &at(100)).unwrap().is_none(), "still waiting after the first");
+        let second = renew(&client, Some(&first), &mut retry, &at(400)).unwrap().expect("a trusted copy, later");
         assert!(second.verified);
         // A library that changes all the time: with nothing in use, a copy without repeats.
         let shelf = shelf_of(&["a", "b", "c"]);
@@ -899,7 +919,7 @@ mod tests {
             shelf.songs.insert(0, format!("n{n}"));
             shelf.last_scan = n.to_string();
         });
-        let copy = renew(&client, None, &mut Retry::new(), 0).unwrap().expect("better than none");
+        let copy = renew(&client, None, &mut Retry::new(), &at(0)).unwrap().expect("better than none");
         assert!(!copy.verified);
         let ids = ids(&copy);
         assert_eq!(ids.iter().collect::<HashSet<_>>().len(), ids.len());
@@ -922,6 +942,90 @@ mod tests {
         assert_eq!(library.songs.len(), 500);
         // Two pages a go: the first, and the same one again.
         assert_eq!(shelf.lock().unwrap().pages.len(), 2 * FETCH_TRIES);
+    }
+
+    #[test]
+    fn the_wait_after_a_refused_copy_starts_when_it_is_refused() {
+        let shelf = shelf(1200);
+        // Each page takes two minutes, so one go at the library takes six, and every go finds
+        // a song come in at the front.
+        let clock = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let ticking = clock.clone();
+        let client = library_server(shelf.clone(), move |shelf, offset| {
+            ticking.fetch_add(120, std::sync::atomic::Ordering::Relaxed);
+            if offset == 0 {
+                shelf.songs.insert(0, format!("new{}", shelf.pages.len()));
+            }
+        });
+        let now = || clock.load(std::sync::atomic::Ordering::Relaxed);
+        let (mut retry, current) = (Retry::new(), old_copy());
+        assert!(renew(&client, Some(&current), &mut retry, &now).unwrap().is_none());
+        let fetches = || shelf.lock().unwrap().pages.len();
+        let (refused_at, after_refusal) = (now(), fetches());
+        assert!(refused_at >= 6 * 60, "{refused_at}");
+        // Four minutes after the refusal (well past five after the fetch began), still waiting.
+        assert!(renew(&client, Some(&current), &mut retry, &at(refused_at + 240)).unwrap().is_none());
+        assert_eq!(fetches(), after_refusal);
+        // Five minutes after it, the next go.
+        assert!(renew(&client, Some(&current), &mut retry, &at(refused_at + 300)).unwrap().is_none());
+        assert!(fetches() > after_refusal);
+    }
+
+    #[test]
+    fn a_scan_status_that_cant_be_read_after_the_pages_counts_as_a_refusal() {
+        // The pages arrive, then the server can't say how its library stands.
+        let broken_after_the_pages = |shelf: &mut Shelf, _: u32| shelf.status_broken = true;
+        // With a copy in use, it stays, and the wait begins.
+        let shelf = shelf(10);
+        let client = library_server(shelf.clone(), broken_after_the_pages);
+        let (mut retry, current) = (Retry::new(), old_copy());
+        assert!(renew(&client, Some(&current), &mut retry, &at(0)).unwrap().is_none());
+        assert_eq!(retry.wait, RETRY_AFTER);
+        // Once the server answers again, nothing is fetched until the wait is over.
+        shelf.lock().unwrap().status_broken = false;
+        let before = shelf.lock().unwrap().pages.len();
+        assert!(renew(&client, Some(&current), &mut retry, &at(60)).unwrap().is_none());
+        assert_eq!(shelf.lock().unwrap().pages.len(), before);
+        // With no copy at all, the one that arrived is kept, as one that wasn't checked.
+        let shelf = shelf_of(&["a", "b", "c"]);
+        let client = library_server(shelf.clone(), broken_after_the_pages);
+        let mut retry = Retry::new();
+        let copy = renew(&client, None, &mut retry, &at(0)).unwrap().expect("better than none");
+        assert!(!copy.verified);
+        assert_eq!(ids(&copy), ["a", "b", "c"]);
+        assert_eq!(retry.wait, RETRY_AFTER);
+    }
+
+    #[test]
+    fn a_count_missing_from_either_reading_is_not_compared() {
+        for given_first in [true, false] {
+            // The server gives a count at one reading and not at the other.
+            let shelf = shelf(10);
+            shelf.lock().unwrap().counts = given_first;
+            let client = library_server(shelf.clone(), |shelf, _| shelf.counts = !shelf.counts);
+            let library = Library::fetch(&client, false).unwrap().library.unwrap_or_else(|| panic!("given first: {given_first}"));
+            assert!(library.verified);
+            assert_eq!(library.songs.len(), 10);
+            // Stamped with the count that was given.
+            assert_eq!(library.count, 10);
+            // Fetched once.
+            assert_eq!(shelf.lock().unwrap().pages, [0]);
+        }
+    }
+
+    #[test]
+    fn a_library_of_exactly_the_most_pages_is_whole() {
+        // The most is two pages here: a library of exactly two pages is all there, seen by the
+        // empty page after them.
+        let client = library_server(shelf(2 * PAGE as usize), |_, _| {});
+        let status = client.scan_status().unwrap();
+        let library = Library::fetch_pages(&client, &status, 2).unwrap();
+        assert!(!library.cut_short);
+        assert!(library.is_whole(Some(1000)));
+        assert_eq!(library.songs.len(), 1000);
+        // One more full page than the most is a server that may never stop.
+        let client = library_server(shelf(3 * PAGE as usize), |_, _| {});
+        assert!(Library::fetch_pages(&client, &status, 2).unwrap().cut_short);
     }
 
     #[test]

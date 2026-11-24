@@ -2216,12 +2216,11 @@ impl Controller {
                 }
             }
             if online {
-                let now = chrono::Utc::now().timestamp();
                 let current = crate::search::current();
                 // Taken out while the fetch goes on, which can be minutes: signing out resets it.
                 let mut retry = std::mem::take(&mut *crate::search::RETRY.lock().unwrap_or_else(|stuck| stuck.into_inner()));
                 // A copy that couldn't be trusted leaves the one in use where it is.
-                if let Ok(Some(library)) = crate::search::renew(&client, current.as_ref().map(|index| &index.library), &mut retry, now) {
+                if let Ok(Some(library)) = crate::search::renew(&client, current.as_ref().map(|index| &index.library), &mut retry, &|| chrono::Utc::now().timestamp()) {
                     library.save(&file);
                     crate::search::set_current(Some(crate::search::Index::new(library)));
                     renewed = true;
