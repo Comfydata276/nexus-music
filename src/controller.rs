@@ -1259,8 +1259,9 @@ impl Controller {
                         }
                     }
                     // Only HTTPS was tried, because no scheme was typed: say so, and how to
-                    // choose otherwise, whatever went wrong.
-                    Err(e) if crate::subsonic::https_only(&server) => app.set_login_error(
+                    // choose otherwise. Not when the server itself answered (a wrong
+                    // password, say): then HTTPS worked, and the sentence would mislead.
+                    Err(e) if crate::subsonic::https_only(&server) && !matches!(e, crate::subsonic::ApiError::Server { .. }) => app.set_login_error(
                         format!("{e}\nNexus Music tried HTTPS. If your server has no HTTPS, type http:// in front of the address.").into(),
                     ),
                     Err(e) => app.set_login_error(e.to_string().into()),
