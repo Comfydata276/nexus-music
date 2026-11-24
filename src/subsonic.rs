@@ -304,35 +304,38 @@ pub struct Client {
 
 /// Tidies what the user typed into a base URL: adds a scheme (in small letters), drops
 /// trailing slashes and any `/app/...` path copied from the browser's address bar, and the
-/// `/rest` the API lives under.
+/// `/rest` the API lives under. Only the path after the server's name and port is tidied, so
+/// a server named `rest` or `app` keeps its name.
 pub fn normalize_server_url(input: &str) -> String {
-    let mut url = input.trim().to_string();
-    if url.is_empty() {
-        return url;
+    let typed = input.trim();
+    if typed.is_empty() {
+        return String::new();
     }
-    url = match url.split_once("://") {
+    let (scheme, rest) = match typed.split_once("://") {
         // "HTTP://" and "http://" are the same server, and the same account.
-        Some((scheme, rest)) => format!("{}://{rest}", scheme.to_ascii_lowercase()),
-        None => format!("http://{url}"),
+        Some((scheme, rest)) => (scheme.to_ascii_lowercase(), rest),
+        None => ("http".to_string(), typed),
     };
-    if let Some(pos) = url.find("/app/") {
-        url.truncate(pos);
+    let (host, path) = rest.split_at(rest.find(['/', '?', '#']).unwrap_or(rest.len()));
+    let mut path = path.to_string();
+    if let Some(pos) = path.find("/app/") {
+        path.truncate(pos);
     }
     // Trailing slashes first, so ".../rest/" loses its "/rest" as well, and the first
     // request doesn't go to ".../rest/rest/ping".
-    let trim = |url: &mut String| {
-        while url.ends_with('/') || url.ends_with('#') {
-            url.pop();
+    let trim = |path: &mut String| {
+        while path.ends_with('/') || path.ends_with('#') {
+            path.pop();
         }
     };
-    trim(&mut url);
+    trim(&mut path);
     for suffix in ["/app", "/rest"] {
-        if url.ends_with(suffix) {
-            url.truncate(url.len() - suffix.len());
+        if path.ends_with(suffix) {
+            path.truncate(path.len() - suffix.len());
         }
     }
-    trim(&mut url);
-    url
+    trim(&mut path);
+    format!("{scheme}://{host}{path}")
 }
 
 /// The addresses to try for what was typed as the server's. One that says "http://" or
@@ -1387,6 +1390,14 @@ mod tests {
         // the checks on it see it for what it is.
         assert_eq!(normalize_server_url("HTTP://tower:4533"), "http://tower:4533");
         assert_eq!(normalize_server_url("HTTPS://music.example.org/rest/"), "https://music.example.org");
+        // Only the path is tidied: a server named "rest" or "app" keeps its name.
+        assert_eq!(normalize_server_url("http://rest/"), "http://rest");
+        assert_eq!(normalize_server_url("http://rest"), "http://rest");
+        assert_eq!(normalize_server_url("http://rest/rest/"), "http://rest");
+        assert_eq!(normalize_server_url("http://app/app/#/"), "http://app");
+        assert_eq!(normalize_server_url("rest"), "http://rest");
+        assert_eq!(normalize_server_url("app:4533/app/"), "http://app:4533");
+        assert_eq!(normalize_server_url("  "), "");
     }
 
     #[test]
