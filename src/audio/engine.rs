@@ -254,7 +254,8 @@ enum Cmd {
     Load(Client, TrackRequest),
     SetNext(Option<(Client, TrackRequest)>),
     Opened { token: u64, slot: Slot, result: Result<Box<Deck>, OpenError> },
-    Seek(f64),
+    /// Where to go in the track with this token; ignored if another is playing by then.
+    Seek(u64, f64),
     Stop,
     Wake,
 }
@@ -376,8 +377,10 @@ impl Engine {
         let _ = self.tx.send(Cmd::SetNext(next));
     }
 
-    pub fn seek(&self, secs: f64) {
-        self.urgent(Cmd::Seek(secs));
+    /// Goes to `secs` into the track with this token, if it's still the one playing when the
+    /// engine gets to it, not the one after it.
+    pub fn seek(&self, token: u64, secs: f64) {
+        self.urgent(Cmd::Seek(token, secs));
     }
 
     pub fn stop(&self) {
@@ -598,7 +601,7 @@ impl Worker {
     // ---- commands ---------------------------------------------------------------------------
 
     fn handle(&mut self, cmd: Cmd) {
-        if matches!(cmd, Cmd::Load(..) | Cmd::Seek(_) | Cmd::Stop) {
+        if matches!(cmd, Cmd::Load(..) | Cmd::Seek(..) | Cmd::Stop) {
             self.shared.interrupt.lower();
         }
         match cmd {
@@ -681,7 +684,7 @@ impl Worker {
                     }
                 }
             }
-            Cmd::Seek(secs) => self.seek(secs),
+            Cmd::Seek(token, secs) => self.seek(token, secs),
             Cmd::Stop => self.reset(),
             Cmd::Wake => {}
         }
@@ -724,8 +727,8 @@ impl Worker {
         }
     }
 
-    fn seek(&mut self, secs: f64) {
-        let Some(deck) = self.current.as_mut() else { return };
+    fn seek(&mut self, token: u64, secs: f64) {
+        let Some(deck) = self.current.as_mut().filter(|deck| deck.token == token) else { return };
         let target = (secs - deck.base).max(0.0);
         let time = Time::try_from_secs_f64(target).unwrap_or(Time::ZERO);
         let landed = match deck
@@ -769,9 +772,7 @@ impl Worker {
             }
             // Buffered audio was produced for the old device's sample rate.
             if let Some((token, secs)) = position {
-                if self.current.as_ref().is_some_and(|d| d.token == token) {
-                    self.seek(secs);
-                }
+                self.seek(token, secs);
             }
         }
 
@@ -1794,9 +1795,20 @@ mod tests {
             while engine.position().is_none() && opened.elapsed() < Duration::from_secs(5) {
                 std::thread::sleep(Duration::from_millis(10));
             }
-            engine.seek(0.25);
+            engine.seek(1, 0.25);
         });
         assert!((12_000..=14_400).contains(&frames.len()), "{} frames came out", frames.len());
+    }
+
+    #[test]
+    fn a_seek_meant_for_another_track_is_ignored() {
+        // Sent for the track before, as one can be at the moment one hands over to the next:
+        // this one plays on from where it is, all of it.
+        let frames = played("seek-other", track(2, "i.mp3", MP3), |engine| {
+            heard_from(engine);
+            engine.seek(1, 0.25);
+        });
+        assert!(frames.len().abs_diff(24_000) <= 2, "{} frames came out", frames.len());
     }
 
     /// About two seconds of MP3: the half-second one's audio four times over, without its
@@ -1847,7 +1859,7 @@ mod tests {
         let frames = played_from("as-itself", client.clone(), conversion(&client, 0.0, MP3), |engine| {
             heard_from(engine);
             assert!(engine.seeks_in_place(1));
-            engine.seek(0.25);
+            engine.seek(1, 0.25);
         });
         assert!((12_000..=14_400).contains(&frames.len()), "{} frames came out", frames.len());
         // Asked to start a second in, the server sent it from the start, taking no notice:
@@ -1895,7 +1907,7 @@ mod tests {
         let frames = played("kept-0401", request, |engine| {
             heard_from(engine);
             assert!(engine.seeks_in_place(1));
-            engine.seek(0.25);
+            engine.seek(1, 0.25);
         });
         assert!((12_000..=14_400).contains(&frames.len()), "{} frames came out", frames.len());
         let _ = std::fs::remove_dir_all(&dir);

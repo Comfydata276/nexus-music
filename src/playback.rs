@@ -883,7 +883,7 @@ impl Controller {
         if !self.engine.seeks_in_place(token) {
             self.restart_current(seconds);
         } else {
-            self.engine.seek(seconds);
+            self.engine.seek(token, seconds);
         }
     }
 
