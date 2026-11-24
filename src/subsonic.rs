@@ -187,7 +187,8 @@ pub struct Playlist {
 #[serde(rename_all = "camelCase", default)]
 pub struct ScanStatus {
     pub scanning: bool,
-    pub count: u64,
+    /// The number of songs, where the server says.
+    pub count: Option<u64>,
     pub last_scan: String,
 }
 
@@ -1521,7 +1522,7 @@ mod tests {
         assert!(refused.to_string().contains("didn't go"), "{refused}");
         assert_eq!(reached.load(Ordering::Relaxed), 0);
         // On the same server it is.
-        assert_eq!(client.scan_status().unwrap().count, 7);
+        assert_eq!(client.scan_status().unwrap().count, Some(7));
     }
 
     #[test]

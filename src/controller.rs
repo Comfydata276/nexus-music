@@ -2198,20 +2198,18 @@ impl Controller {
                     renewed = true;
                 }
             }
-            if let Some(status) = online.then(|| client.scan_status().ok()).flatten() {
+            if online {
                 let now = chrono::Utc::now().timestamp();
-                let stale = match crate::search::current() {
-                    Some(index) => index.library.is_stale(&status, now),
-                    None => !status.scanning,
-                };
-                if stale {
-                    // A copy that couldn't be trusted leaves the one in use where it is.
-                    if let Ok(Some(library)) = crate::search::Library::fetch(&client) {
-                        library.save(&file);
-                        crate::search::set_current(Some(crate::search::Index::new(library)));
-                        renewed = true;
-                    }
+                let current = crate::search::current();
+                // Taken out while the fetch goes on, which can be minutes: signing out resets it.
+                let mut retry = std::mem::take(&mut *crate::search::RETRY.lock().unwrap_or_else(|stuck| stuck.into_inner()));
+                // A copy that couldn't be trusted leaves the one in use where it is.
+                if let Ok(Some(library)) = crate::search::renew(&client, current.as_ref().map(|index| &index.library), &mut retry, now) {
+                    library.save(&file);
+                    crate::search::set_current(Some(crate::search::Index::new(library)));
+                    renewed = true;
                 }
+                *crate::search::RETRY.lock().unwrap_or_else(|stuck| stuck.into_inner()) = retry;
             }
             if renewed && online {
                 // Which songs are liked, as of now.
@@ -2360,6 +2358,7 @@ impl Controller {
         self.library_timer.stop();
         self.close_preview();
         crate::search::set_current(None);
+        *crate::search::RETRY.lock().unwrap_or_else(|stuck| stuck.into_inner()) = crate::search::Retry::new();
         *self.client.borrow_mut() = None;
         self.cache.borrow_mut().clear();
         self.playlists.borrow_mut().clear();
