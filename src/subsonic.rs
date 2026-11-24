@@ -632,22 +632,24 @@ impl Client {
         params: &[(&str, &str)],
         field: Option<&str>,
     ) -> ApiResult<T> {
-        self.call_as(CLIENT_NAME, endpoint, params, field)
+        self.call_as(CLIENT_NAME, endpoint, params, field, API_TIMEOUT)
     }
 
+    /// `limit` is how long to wait for the whole answer.
     fn call_as<T: DeserializeOwned + Default>(
         &self,
         app: &str,
         endpoint: &str,
         params: &[(&str, &str)],
         field: Option<&str>,
+        limit: Duration,
     ) -> ApiResult<T> {
         let url = self.url_as(app, endpoint, params);
         // A long list of song ids can outgrow what servers and proxies accept in an address,
         // so those go in the body of a POST instead (the OpenSubsonic "formPost" extension).
         let response = match url.split_once('?') {
             Some((address, form)) if url.len() > 1800 => self.post_form(address, form)?,
-            _ => self.get(&url, Some(API_TIMEOUT))?,
+            _ => self.get(&url, Some(limit))?,
         };
         let status = response.status().as_u16();
         let reader = response.into_body().into_reader();
@@ -906,7 +908,7 @@ impl Client {
         let mut params: Vec<(&str, &str)> = ids.iter().map(|id| ("id", id.as_str())).collect();
         params.push(("current", current));
         params.push(("position", &position));
-        self.call_as::<serde_json::Value>(device, "savePlayQueue", &params, None).map(drop)
+        self.call_as::<serde_json::Value>(device, "savePlayQueue", &params, None, API_TIMEOUT).map(drop)
     }
 
     /// The play queue last saved on the server; empty if there isn't one.
@@ -1041,6 +1043,11 @@ impl Client {
     /// How many songs the server has, and when it last looked through its folders.
     pub fn scan_status(&self) -> ApiResult<ScanStatus> {
         self.call("getScanStatus", &[], Some("scanStatus"))
+    }
+
+    /// The same, waiting no longer than `limit` for the answer.
+    pub fn scan_status_within(&self, limit: Duration) -> ApiResult<ScanStatus> {
+        self.call_as(CLIENT_NAME, "getScanStatus", &[], Some("scanStatus"), limit)
     }
 
     pub fn scrobble(&self, id: &str, submission: bool) -> ApiResult<()> {

@@ -51,9 +51,10 @@ impl Library {
     /// Fetches the whole library, a page at a time. The pages go by position, so a song added
     /// or removed while they arrive shifts the rest along: one can fall between two pages, or
     /// come twice. So the server is asked about its library again at the end. The copy is
-    /// used either way, but if the library changed meanwhile (or the server couldn't say, or
-    /// a song came twice) it's stamped with a song count no server has, so `is_stale` sees it
-    /// as out of date and it's fetched again at the next look.
+    /// used either way, but if the server says its library changed meanwhile, or it's
+    /// scanning, the copy is stamped with a song count no server has, so `is_stale` sees it
+    /// as out of date and it's fetched again at the next look. If the server can't say, the
+    /// copy is stamped as it was found at the start.
     pub fn fetch(client: &Client) -> ApiResult<Library> {
         let status = client.scan_status()?;
         let mut library = Library {
@@ -80,11 +81,11 @@ impl Library {
             library.songs.extend(found.songs);
             page += 1;
         }
-        let mut seen = HashSet::with_capacity(library.songs.len());
-        let held = !status.scanning
-            && client.scan_status().is_ok_and(|after| after == status)
-            && library.songs.iter().all(|song| seen.insert(song.id.as_str()));
-        if !held {
+        // A slow answer doesn't hold up a copy that's ready.
+        let changed = client
+            .scan_status_within(std::time::Duration::from_secs(5))
+            .is_ok_and(|after| after.scanning || after != status);
+        if changed {
             library.count = u64::MAX;
         }
         Ok(library)
@@ -431,12 +432,13 @@ mod tests {
     use super::*;
     use crate::pages::Kind;
 
-    /// A pretend server's library: its songs, scan stamp and whether it's scanning; and where
-    /// each page of songs asked for started.
+    /// A pretend server's library: its songs, scan stamp and whether it's scanning; whether
+    /// it fails to say how its library is; and where each page of songs asked for started.
     struct Shelf {
         songs: Vec<String>,
         last_scan: String,
         scanning: bool,
+        silent: bool,
         pages: Vec<u32>,
     }
 
@@ -445,7 +447,7 @@ mod tests {
     fn library_server(songs: usize, meanwhile: impl Fn(&mut Shelf, u32) + Send + Sync + 'static) -> (Client, Arc<std::sync::Mutex<Shelf>>) {
         use crate::subsonic::fake;
         let songs = (0..songs).map(|n| format!("s{n}")).collect();
-        let shelf = Arc::new(std::sync::Mutex::new(Shelf { songs, last_scan: "1".into(), scanning: false, pages: Vec::new() }));
+        let shelf = Arc::new(std::sync::Mutex::new(Shelf { songs, last_scan: "1".into(), scanning: false, silent: false, pages: Vec::new() }));
         let served = shelf.clone();
         let address = fake::server(move |target, _, stream| {
             let number = |name: &str| {
@@ -453,7 +455,9 @@ mod tests {
                 at.map_or(0, |at| target[at..].split('&').next().unwrap().parse::<usize>().unwrap())
             };
             let mut shelf = served.lock().unwrap();
-            if target.starts_with("/rest/getScanStatus") {
+            if target.starts_with("/rest/getScanStatus") && shelf.silent {
+                let _ = std::io::Write::write_all(stream, b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            } else if target.starts_with("/rest/getScanStatus") {
                 let status = format!(r#""scanStatus":{{"scanning":{},"count":{},"lastScan":"{}"}}"#, shelf.scanning, shelf.songs.len(), shelf.last_scan);
                 fake::ok(stream, &status);
             } else if target.starts_with("/rest/search3") {
@@ -497,6 +501,19 @@ mod tests {
         assert_eq!((second.count, second.last_scan.as_str()), (700, "2"));
         assert!(renew(&client, Some(&second)).is_none());
         assert_eq!(shelf.lock().unwrap().pages, [0, 500, 0, 500]);
+    }
+
+    #[test]
+    fn a_copy_the_server_cant_say_about_afterwards_is_stamped_as_usual() {
+        // Once the songs are sent, the server stops answering how its library is.
+        let (client, shelf) = library_server(700, |shelf, offset| shelf.silent = offset == 500);
+        let library = renew(&client, None).expect("the copy is used");
+        assert_eq!(ids(&library), shelf.lock().unwrap().songs);
+        assert_eq!((library.count, library.last_scan.as_str()), (700, "1"));
+        // It answers again, and the copy isn't fetched again.
+        shelf.lock().unwrap().silent = false;
+        assert!(renew(&client, Some(&library)).is_none());
+        assert_eq!(shelf.lock().unwrap().pages, [0, 500]);
     }
 
     #[test]
