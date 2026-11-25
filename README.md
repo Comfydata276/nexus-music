@@ -246,7 +246,7 @@ needs only Docker.
 docker build -f docker/dev.Dockerfile -t nexus-music-dev docker   # once
 scripts/package-windows     # Windows .exe and installer, into dist/
 scripts/check               # compile for Linux and print diagnostics
-scripts/dx cargo test       # unit tests
+scripts/dx cargo test --workspace    # unit tests: the app's and the library's (core/)
 scripts/release notes.md    # build and publish a GitHub release (bump Cargo.toml and push first)
 scripts/dx cargo test --manifest-path relay/Cargo.toml    # the jam relay's tests
 ```
@@ -256,6 +256,13 @@ The Rust version is fixed in `docker/dev.Dockerfile` and in that workflow, so a 
 built with the same compiler as the one before unless it's raised on purpose.
 
 `scripts/dx <command>` runs any command inside the image as your user.
+
+The repository is a Cargo workspace of two packages: the app, at the top, and the library
+it is built on, in `core/` (see "How the code is organised"). The library is compiled into
+the app's one `.exe`; it isn't a separate file. `cargo build` and `cargo test` at the top
+cover both, and `scripts/dx cargo test -p nexus-core` runs the library's tests alone. The
+jam relay in `relay/` is not part of the workspace: it has its own lock file and is built
+into its own image.
 
 ### Running it on Linux for development
 
@@ -308,6 +315,7 @@ connection.
 
 | Path | What's there |
 | --- | --- |
+| `core/` | The library (`nexus-core`): what every app on an account has to do identically, kept apart so the Android app can be built on the same code. No window, files, threads or connections of its own. See below. |
 | `ui/` | The interface, in Slint. `types.slint` is the contract with the Rust side. |
 | `src/subsonic.rs` | Client for the Subsonic API that Navidrome serves at `/rest`. |
 | `src/audio/` | Playback engine: download buffer, decoding, resampling, output device. |
@@ -339,6 +347,29 @@ connection.
 | `src/taskbar.rs` | Buttons on the taskbar thumbnail (Windows). |
 | `src/frame.rs` | Replaces Windows' title bar with the app's own top bar. |
 | `installer/` | NSIS script for the Windows installer. |
+
+### The library, `core/`
+
+A rule that lives in `core/` is written once and gives the Windows app and the Android app
+the same answer. Each module in `src/` that had such a rule passes it on under its old name
+(`search::fold` is `nexus_core::text::fold`), and keeps what is the Windows app's own: the
+window, the files, the connections.
+
+| Path | What's there |
+| --- | --- |
+| `core/src/text.rs` | Comparing names: folding, words, what titles have tacked on. |
+| `core/src/search.rs` | How well what was typed matches a name. |
+| `core/src/model.rs` | What a server's answers are read into: a song, an album, a playlist. |
+| `core/src/sync.rs`, `notes.rs` | The record devices share, and how two copies of it are combined. |
+| `core/src/playlists.rs` | A change to a playlist, described so it means the same if the playlist has changed. |
+| `core/src/address.rs` | What a typed server address means, and when plain HTTP matters. |
+| `core/src/jam.rs` | Reading a jam's link; what a jam says of a song. |
+| `core/src/levelling.rs` | When a song counts as playing with its album. |
+| `core/src/musicbrainz.rs`, `listenbrainz.rs`, `offer.rs` | The questions put to MusicBrainz and ListenBrainz and what is made of the answers. |
+| `core/src/http.rs` | How the library asks for a request: it asks the app. `src/corehttp.rs` is the Windows app's answer, on its own connections. |
+
+Something moves into `core/` when it is free of the window, files and threads, and is moved
+as it is written, tests with it.
 
 ## Licences of bundled work
 

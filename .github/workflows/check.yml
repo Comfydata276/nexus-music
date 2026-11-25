@@ -1,4 +1,5 @@
-# Compiles the app and runs its tests on every push and pull request.
+# Compiles the app and the library it is built on (core/), and runs the tests of both, on
+# every push and pull request.
 # The Windows release itself is built and published by scripts/release.
 name: Check
 
@@ -53,10 +54,10 @@ jobs:
             check-${{ runner.os }}-${{ env.RUST_VERSION }}-
 
       - name: Build
-        run: cargo build --locked
+        run: cargo build --locked --workspace
 
       - name: Test
-        run: cargo test --locked
+        run: cargo test --locked --workspace
 
       - name: Test the jam relay
         run: cargo test --locked --manifest-path relay/Cargo.toml
