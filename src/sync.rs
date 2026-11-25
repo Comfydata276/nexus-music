@@ -274,6 +274,26 @@ pub fn merged_history(live: &[Played], take: &Take, songs: &HashMap<String, Song
     Some(merged.into_iter().filter_map(|(id, at)| known(&id).map(|song| Played { song: song.clone(), at })).collect())
 }
 
+/// What asking the server for a song played on another device came to.
+pub enum Looked {
+    Found(Box<Song>),
+    /// The server says there is no such song. Only this is remembered for the rest of the
+    /// run, so that it isn't asked for at every exchange.
+    Gone,
+    /// It couldn't be had this time (the request timed out, the server failed in some
+    /// other way): it is asked for again at the next exchange.
+    NotNow,
+}
+
+pub fn looked(id: &str, answer: ApiResult<Song>) -> Looked {
+    match answer {
+        Ok(song) if song.id == id => Looked::Found(Box::new(song)),
+        // (Subsonic's "the requested data was not found".)
+        Err(ApiError::Server { code: 70, .. }) => Looked::Gone,
+        _ => Looked::NotNow,
+    }
+}
+
 impl Controller {
     /// Finds out whether the theme was changed on another device. The window opens in the
     /// colours last used here without waiting for the answer; a newer choice is applied
@@ -534,7 +554,8 @@ impl Controller {
             self.rebuild_tracks();
         }
         // Recently played: songs played elsewhere that this PC hasn't met are asked for
-        // (once in a run each), and the list is put together when they are back.
+        // (one the server says it doesn't have, once in a run), and the list is put
+        // together when they are back.
         let wanted: Vec<String> = {
             let (history, missing) = (self.history.borrow(), self.history_missing.borrow());
             let known: HashSet<&str> = history.iter().map(|played| played.song.id.as_str()).collect();
@@ -572,34 +593,43 @@ impl Controller {
         let take = plan.take;
         self.api_pool.spawn(move || {
             // 7.3: still the same sign-in, with sharing on, immediately before each request
-            // that changes the server.
-            let sent = write.map(|write| {
+            // that changes the server. And the server's answer to the write is taken note
+            // of as soon as it has come, not after the songs below have been asked for.
+            if let Some(write) = write {
                 let went = send(&client, &write, &|| live.load(Ordering::SeqCst) == session).ok().flatten();
-                (write, went)
-            });
-            let songs: HashMap<String, Option<Song>> = wanted.into_iter().map(|id| (id.clone(), client.song(&id).ok().filter(|song| song.id == id))).collect();
-            post(move |ctl| ctl.finished(session, take, songs, sent));
+                post(move |ctl| ctl.wrote(session, &write, went));
+            }
+            let songs: Vec<(String, Looked)> = wanted.into_iter().map(|id| (id.clone(), looked(&id, client.song(&id)))).collect();
+            post(move |ctl| ctl.finished(session, take, songs));
         });
     }
 
+    /// Step 7.4: the server has answered that it took the write. Only now is what the write
+    /// carried agreed, and its changes done with.
+    fn wrote(self: &Rc<Self>, session: u64, write: &Write, went: Option<String>) {
+        if session != self.session.load(Ordering::SeqCst) {
+            return;
+        }
+        if let Some(playlist) = went {
+            let told = written(&mut self.settings.borrow_mut(), write, &playlist);
+            self.tell(&told);
+        }
+    }
+
     /// The end of an exchange that had something to send or to ask for.
-    fn finished(self: &Rc<Self>, session: u64, take: Take, songs: HashMap<String, Option<Song>>, sent: Option<(Write, Option<String>)>) {
+    fn finished(self: &Rc<Self>, session: u64, take: Take, songs: Vec<(String, Looked)>) {
         if session != self.session.load(Ordering::SeqCst) {
             return self.exchange_over();
         }
         let mut found = HashMap::new();
         for (id, song) in songs {
             match song {
-                Some(song) => drop(found.insert(id, song)),
-                None => drop(self.history_missing.borrow_mut().insert(id)),
+                Looked::Found(song) => drop(found.insert(id, *song)),
+                Looked::Gone => drop(self.history_missing.borrow_mut().insert(id)),
+                Looked::NotNow => {}
             }
         }
         self.take_history(&take, &found);
-        // Step 7.4: only now is what the write carried agreed, and its changes done with.
-        if let Some((write, Some(playlist))) = sent {
-            let told = written(&mut self.settings.borrow_mut(), &write, &playlist);
-            self.tell(&told);
-        }
         self.exchange_over();
     }
 
@@ -891,6 +921,26 @@ mod tests {
         let save = owner.prepared();
         owner.restored(Some("NexusMusic-0badc0de@1700000000".into()));
         assert!(save.still() && owner.taken().is_some());
+    }
+
+    #[test]
+    fn only_the_servers_no_such_song_is_remembered() {
+        let song = Song { id: "s1".into(), ..Default::default() };
+        assert!(matches!(looked("s1", Ok(song.clone())), Looked::Found(found) if found.id == "s1"));
+        // The server's own "not found" is a definite no.
+        assert!(matches!(looked("s1", Err(ApiError::Server { code: 70, message: "Song not found".into() })), Looked::Gone));
+        // A request that timed out, an answer that wasn't the server's, a refusal for some
+        // other reason, a different song altogether: none says the song is gone, and it is
+        // asked for again at the next exchange, as 0.40.4 asked.
+        for answer in [
+            Err(ApiError::Network("timed out".into())),
+            Err(ApiError::NotSubsonic("a proxy's page".into())),
+            Err(ApiError::Server { code: 0, message: "a generic error".into() }),
+            Err(ApiError::Server { code: 50, message: "not authorised".into() }),
+            Ok(Song { id: "another".into(), ..Default::default() }),
+        ] {
+            assert!(matches!(looked("s1", answer), Looked::NotNow));
+        }
     }
 
     #[test]
