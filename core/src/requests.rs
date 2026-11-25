@@ -137,6 +137,12 @@ pub trait Library: Send + Sync {
         Some((album.id.to_string(), album.cover.to_string()))
     }
 
+    /// Which of these songs it has, by their ids on the music server: one answer for each,
+    /// in order. (What another of the person's devices names a song by: see `link`.)
+    fn has_songs(&self, ids: &[String]) -> Vec<bool> {
+        vec![false; ids.len()]
+    }
+
     /// The names of the artists it has, each folded: who isn't news.
     fn artist_names(&self) -> HashSet<String> {
         self.artists().map(fold).collect()
@@ -155,6 +161,9 @@ pub struct Snapshot {
     /// Each song's title and who it's credited to.
     pub songs: Vec<(String, String)>,
     pub artists: Vec<String>,
+    /// The id of every song, on the music server: what another of the person's devices
+    /// names a song by (see `link`). An app that does not link its devices leaves it empty.
+    pub ids: Vec<String>,
 }
 
 impl Library for Snapshot {
@@ -168,6 +177,11 @@ impl Library for Snapshot {
 
     fn artists(&self) -> Box<dyn Iterator<Item = &str> + '_> {
         Box::new(self.artists.iter().map(String::as_str))
+    }
+
+    fn has_songs(&self, ids: &[String]) -> Vec<bool> {
+        let has: HashSet<&str> = self.ids.iter().map(String::as_str).collect();
+        ids.iter().map(|id| has.contains(id.as_str())).collect()
     }
 }
 
@@ -901,6 +915,7 @@ mod tests {
             albums: vec![album("a1", "…Something to Be", "Rob Thomas"), album("a2", "Parachutes", "Coldplay"), album("a3", "Parachutes ", "coldplay"), album("a4", "X&Y", "Coldplay")],
             songs: vec![("Yellow (Live)".into(), "Coldplay".into()), ("Lonely No More".into(), "Rob Thomas".into()), ("Fix You".into(), "Coldplay & Friends".into())],
             artists: vec!["Coldplay".into(), "Rob Thomas".into(), "Beyoncé".into()],
+            ..Default::default()
         }
     }
 

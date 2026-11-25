@@ -247,6 +247,11 @@ impl nexus_core::requests::Library for Index {
     fn artists(&self) -> Box<dyn Iterator<Item = &str> + '_> {
         Box::new(self.library.artists.iter().map(|artist| artist.title.as_str()))
     }
+
+    fn has_songs(&self, ids: &[String]) -> Vec<bool> {
+        let has: HashSet<&str> = self.library.songs.iter().map(|song| song.id.as_str()).collect();
+        ids.iter().map(|id| has.contains(id.as_str())).collect()
+    }
 }
 
 pub fn current() -> Option<Arc<Index>> {
@@ -558,7 +563,12 @@ mod library {
             albums: albums.iter().map(|(id, title, artist)| LibraryAlbum { id: (*id).into(), title: (*title).into(), artist: (*artist).into(), cover: format!("al-{id}") }).collect(),
             songs: songs.iter().map(|(_, title, artist, shown)| ((*title).into(), if shown.is_empty() { (*artist).into() } else { (*shown).into() })).collect(),
             artists: artists.iter().map(|name| (*name).into()).collect(),
+            ids: songs.iter().map(|(id, ..)| (*id).into()).collect(),
         };
+        // Which songs each has, by id: asked the same of both.
+        let asked: Vec<String> = songs.iter().map(|(id, ..)| (*id).to_string()).chain(["not-a-song".to_string()]).collect();
+        assert_eq!(nexus_core::requests::Library::has_songs(&index, &asked), snapshot.has_songs(&asked));
+        assert_eq!(snapshot.has_songs(&asked).iter().filter(|has| **has).count(), songs.len());
         assert_eq!(index.album_names(), snapshot.album_names());
         assert_eq!(index.song_names(), snapshot.song_names());
         assert_eq!(index.artist_names(), snapshot.artist_names());
