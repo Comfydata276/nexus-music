@@ -27,6 +27,51 @@ pub struct PlayLog {
     /// first; and after those, for a play made from a playlist, that page's route key.
     path: PathBuf,
     lines: usize,
+    /// Plays made here that could not be written to the file when they were made (the disk
+    /// was full): they are counted for this run, and written with the next thing that is.
+    /// Until they are, nothing is said to be kept (see `keep`).
+    unwritten: Vec<(String, i64, String)>,
+}
+
+/// Adds lines to the end of a log, and says whether they are there. The file is first cut
+/// back to the end of its last whole line: a write that failed part-way (the disk filled)
+/// leaves the beginning of a line, and a line written straight after it would be joined to
+/// it and read as neither. If these lines can't all be written, the file is put back as it
+/// was before them, so that writing them again later doesn't make some of them twice.
+fn append(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::OpenOptions::new().create(true).read(true).write(true).truncate(false).open(path)?;
+    let length = file.metadata()?.len();
+    let from = length.saturating_sub(64 * 1024);
+    file.seek(SeekFrom::Start(from))?;
+    let mut tail = Vec::new();
+    file.read_to_end(&mut tail)?;
+    let whole = match tail.iter().rposition(|byte| *byte == b'\n') {
+        Some(end) => from + end as u64 + 1,
+        // Not one line end in it: the start of a first line, or nothing.
+        None if from == 0 => 0,
+        None => length,
+    };
+    if whole < length {
+        file.set_len(whole)?;
+    }
+    file.seek(SeekFrom::Start(whole))?;
+    let written = file.write_all(text.as_bytes()).and_then(|()| file.sync_data());
+    if written.is_err() {
+        let _ = file.set_len(whole);
+    }
+    written
+}
+
+/// The newest plays, for sharing with other devices (see `sync`), and where those made from
+/// a playlist were made from. The log itself is not copied.
+pub fn newest() -> (Vec<(String, i64)>, Vec<(String, i64, String)>) {
+    let plays = SHARED.read().map(|plays| nexus_core::sync::newest_plays(plays.iter())).unwrap_or_default();
+    let from = match SOURCES.read() {
+        Ok(sources) => plays.iter().filter_map(|play| sources.as_ref()?.get(play).map(|from| (play.0.clone(), play.1, from.clone()))).collect(),
+        Err(_) => Vec::new(),
+    };
+    (plays, from)
 }
 
 /// The plays, for the threads that build pages.
@@ -77,7 +122,7 @@ impl PlayLog {
     /// what Recently played remembers, so the log isn't empty on day one.
     pub fn load(old: &Path, recent: &[(String, i64)]) -> PlayLog {
         let path = old.with_extension("log");
-        let mut log = PlayLog { path, lines: 0 };
+        let mut log = PlayLog { path, lines: 0, unwritten: Vec::new() };
         if let Ok(mut sources) = SOURCES.write() {
             *sources = None;
         }
@@ -132,56 +177,82 @@ impl PlayLog {
         self.lines = shared.len();
     }
 
+    /// Writes what is still waiting to be written (see `unwritten`).
+    fn flush(&mut self) -> std::io::Result<()> {
+        if self.unwritten.is_empty() {
+            return Ok(());
+        }
+        let text: String = self.unwritten.iter().map(|(song, at, from)| line(song, *at, from)).collect();
+        append(&self.path, &text)?;
+        self.unwritten.clear();
+        Ok(())
+    }
+
     /// Takes in plays made on other devices (see `sync`), leaving out the ones already here,
-    /// and **makes sure they are in the file before saying so**. `sources` says which
-    /// playlists some of them were made from. Returns how many were new; or, if they could
-    /// not be written (the disk is full, the file can't be opened), why, and then none of
-    /// them is counted here either.
+    /// and **makes sure they are in the file before saying so**: and with them every play
+    /// this PC has counted. `sources` says which playlists some of them were made from; a
+    /// play already here whose source is only told now is given it. Returns how many were
+    /// new; or, if the log could not be written (the disk is full, the file can't be
+    /// opened), why, and then none of them is counted here.
     ///
     /// The record devices share holds only the latest plays. One that is about to fall out
     /// of it, and that this PC has not yet got, has to be safe here before this PC writes
     /// the record back without it: so nothing is written back on the strength of plays this
-    /// PC could not keep.
+    /// PC could not keep, or of a log that could not be read back.
     pub fn keep(&mut self, plays: &[(String, i64)], sources: &[(String, i64, String)]) -> std::io::Result<usize> {
+        // A play made here that never reached the file is in memory all the same: it must
+        // not pass for kept.
+        self.flush()?;
         let known: std::collections::HashSet<(String, i64)> = match SHARED.read() {
             // Anything another device has to tell is recent, so the newest part is enough to
             // compare with.
             Ok(shared) => shared.iter().rev().take(5000).cloned().collect(),
             Err(_) => return Err(std::io::Error::other("the log of plays is in use")),
         };
+        let from = |song: &str, at: i64| sources.iter().find(|(other, when, _)| other == song && *when == at).map(|(_, _, from)| from.as_str()).unwrap_or("");
         let mut new: Vec<&(String, i64)> = plays.iter().filter(|play| !known.contains(*play)).collect();
         new.sort_by_key(|(_, at)| *at);
         new.dedup();
-        if new.is_empty() {
-            return Ok(0);
+        if !new.is_empty() {
+            let text: String = new.iter().map(|(song, at)| line(song, *at, from(song, *at))).collect();
+            append(&self.path, &text)?;
+            for (song, at) in &new {
+                note_source(song, *at, from(song, *at));
+            }
+            if let Ok(mut shared) = SHARED.write() {
+                shared.extend(new.iter().map(|play| (*play).clone()));
+            }
+            self.lines += new.len();
         }
-        let from = |song: &str, at: i64| sources.iter().find(|(other, when, _)| other == song && *when == at).map(|(_, _, from)| from.as_str()).unwrap_or("");
-        let text: String = new.iter().map(|(song, at)| line(song, *at, from(song, *at))).collect();
-        let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&self.path)?;
-        file.write_all(text.as_bytes())?;
-        file.sync_data()?;
-        for (song, at) in &new {
-            note_source(song, *at, from(song, *at));
+        // A play this PC already had, whose source another device knew: its line in the
+        // file has none, so the file is written again, whole.
+        let late: Vec<&(String, i64, String)> =
+            sources.iter().filter(|(song, at, from)| !from.is_empty() && known.contains(&(song.clone(), *at)) && source_of(song, *at).is_empty()).collect();
+        if !late.is_empty() {
+            for (song, at, from) in &late {
+                note_source(song, *at, from);
+            }
+            let all = SHARED.read().map(|shared| shared.clone()).unwrap_or_default();
+            let text: String = all.iter().map(|(song, at)| line(song, *at, &source_of(song, *at))).collect();
+            crate::config::write_surely(&self.path, text.as_bytes())?;
         }
-        if let Ok(mut shared) = SHARED.write() {
-            shared.extend(new.iter().map(|play| (*play).clone()));
-        }
-        self.lines += new.len();
         self.trim();
         Ok(new.len())
     }
 
     /// Notes a play, and the playlist it was made from (its route key) if it was from one.
+    /// It is counted at once; if it can't be written to the file now it is written with
+    /// the next play that can be.
     pub fn add(&mut self, song: &str, at: i64, from: &str) {
-        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&self.path) {
-            let _ = file.write_all(line(song, at, from).as_bytes());
-        }
         note_source(song, at, from);
         if let Ok(mut shared) = SHARED.write() {
             shared.push((song.to_string(), at));
         }
+        self.unwritten.push((song.to_string(), at, from.to_string()));
         self.lines += 1;
-        self.trim();
+        if self.flush().is_ok() {
+            self.trim();
+        }
     }
 }
 
@@ -228,12 +299,42 @@ mod tests {
         // Plays that can't be written to the file are not counted as kept: the log is as it
         // was, here and on the disk. (A folder stands where the file should be.)
         let before = shared();
-        let blocked = PlayLog { path: std::env::temp_dir(), lines: before.len() };
-        let mut blocked = blocked;
+        let mut blocked = PlayLog { path: std::env::temp_dir(), lines: before.len(), unwritten: Vec::new() };
         assert!(blocked.keep(&[("never".to_string(), 500)], &[]).is_err());
         assert_eq!(shared(), before);
         // With nothing new there is nothing to write, and nothing to fail.
         assert_eq!(blocked.keep(&before, &[]).unwrap(), 0);
+
+        // A write that failed part-way left the beginning of a line (the disk filled). The
+        // next write does not go straight after it: joined to it, the play would be counted
+        // as kept and be in a line nothing can read.
+        let _ = std::fs::remove_file(&path);
+        let mut log = PlayLog::load(&old, &[("a".to_string(), 100)]);
+        std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(b"[\"cut-sh").unwrap();
+        assert_eq!(log.keep(&[("b".to_string(), 200)], &[]).unwrap(), 1);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[\"a\",100]\n[\"b\",200]\n");
+        PlayLog::load(&old, &[]);
+        assert_eq!(shared(), [("a".to_string(), 100), ("b".to_string(), 200)]);
+        // A play made here while the file can't be written is counted, but nothing is said
+        // to be kept until it has been: then it is in the file, once, with the others.
+        let mut log = PlayLog::load(&old, &[]);
+        let file = std::mem::replace(&mut log.path, std::env::temp_dir());
+        log.add("c", 300, "playlist:q");
+        assert_eq!(shared().len(), 3);
+        assert!(log.keep(&[], &[]).is_err() && log.keep(&[("d".to_string(), 400)], &[]).is_err());
+        log.path = file;
+        assert_eq!(log.keep(&[("d".to_string(), 400)], &[]).unwrap(), 1);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[\"a\",100]\n[\"b\",200]\n[\"c\",300,\"playlist:q\"]\n[\"d\",400]\n");
+        // A play already in the log is given a source that another device tells of later,
+        // in the file too; it is not counted again.
+        assert_eq!(log.keep(&[("b".to_string(), 200)], &[("b".to_string(), 200, "playlist:p".to_string())]).unwrap(), 0);
+        assert!(std::fs::read_to_string(&path).unwrap().contains("[\"b\",200,\"playlist:p\"]\n"));
+        PlayLog::load(&old, &[]);
+        assert_eq!((shared().len(), sources().len()), (4, 2));
+        // The newest are offered by when they were played, with their sources.
+        let (offered, from) = newest();
+        assert_eq!((offered[0].clone(), offered.len(), from.len()), (("d".to_string(), 400), 4, 2));
+        let _ = std::fs::remove_file(&path);
 
         // No log at all: it starts from what Recently played has, which is newest first.
         PlayLog::load(&old, &[("y".to_string(), 20), ("x".to_string(), 10)]);

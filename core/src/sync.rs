@@ -95,6 +95,17 @@ pub fn merge_plays(a: &[(String, i64)], b: &[(String, i64)]) -> Vec<(String, i64
     all
 }
 
+/// The plays a device offers from its log: the newest [`PLAYS_SHARED`] **by when they were
+/// played**, newest first, each once. (Not the last so many lines of the log: plays taken in
+/// from another device are written after ones made here that are newer, and a log read by
+/// its end would offer old plays of theirs in place of newer ones of its own.)
+pub fn newest_plays<'a>(log: impl Iterator<Item = &'a (String, i64)>) -> Vec<(String, i64)> {
+    let mut all: Vec<&(String, i64)> = log.collect();
+    all.sort_unstable_by(|x, y| y.1.cmp(&x.1).then_with(|| x.0.cmp(&y.0)));
+    all.dedup();
+    all.into_iter().take(PLAYS_SHARED).cloned().collect()
+}
+
 /// Where the plays being passed on were made from, as far as either device knows.
 fn merge_sources(a: &Shared, b: &Shared, plays: &[(String, i64)]) -> Vec<(String, i64, String)> {
     let kept: std::collections::HashSet<(&str, i64)> = plays.iter().map(|(song, at)| (song.as_str(), *at)).collect();
@@ -153,6 +164,20 @@ mod tests {
         let many: Vec<(String, i64)> = (0..PLAYS_SHARED as i64 + 50).map(|at| ("s".to_string(), at)).collect();
         let kept = merge_plays(&many, &[]);
         assert_eq!((kept.len(), kept[0].1), (PLAYS_SHARED, PLAYS_SHARED as i64 + 49));
+    }
+
+    #[test]
+    fn the_plays_offered_are_the_newest_by_time_wherever_they_are_in_the_log() {
+        // A long log of this device's own plays, and after them, as they were taken in, some
+        // older ones from another device.
+        let mut log: Vec<(String, i64)> = (0..PLAYS_SHARED as i64 + 100).map(|n| ("mine".to_string(), 10_000 + n)).collect();
+        log.extend((0..50).map(|n| ("theirs".to_string(), 500 + n)));
+        log.push(("mine".to_string(), 10_000 + PLAYS_SHARED as i64 + 99));
+        let offered = newest_plays(log.iter());
+        assert_eq!(offered.len(), PLAYS_SHARED);
+        assert_eq!((offered[0].1, offered[PLAYS_SHARED - 1].1), (10_000 + PLAYS_SHARED as i64 + 99, 10_100));
+        assert!(offered.iter().all(|(song, _)| song == "mine"));
+        assert_eq!(newest_plays([].iter()), []);
     }
 
     #[test]

@@ -17,7 +17,6 @@ use slint::ComponentHandle as _;
 
 use nexus_core::record::{self, Read};
 use nexus_core::step::{Answers, Change, Choices, Device, Found, Outcome, Plan, Stated, Write, find, settle};
-use nexus_core::sync::{PLAYS_SHARED, merge_plays};
 pub use nexus_core::sync::{HISTORY_LENGTH, PLAYLIST_NAME};
 
 use crate::added::Notes;
@@ -261,11 +260,8 @@ impl Controller {
         let settings = self.settings.borrow();
         let playlists = self.playlists.borrow();
         let known: HashSet<&str> = playlists.iter().map(|p| p.id.as_str()).collect();
-        let plays = merge_plays(&crate::plays::shared().into_iter().rev().take(PLAYS_SHARED).collect::<Vec<_>>(), &[]);
-        let play_sources = {
-            let kept: HashSet<(&str, i64)> = plays.iter().map(|(song, at)| (song.as_str(), *at)).collect();
-            crate::plays::sources().into_iter().filter(|(song, at, _)| kept.contains(&(song.as_str(), *at))).collect()
-        };
+        // The newest plays by when they were played, wherever in the log they lie.
+        let (plays, play_sources) = crate::plays::newest();
         Holds {
             username: settings.username.clone(),
             choices: settings.choices.clone(),
