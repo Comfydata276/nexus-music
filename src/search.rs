@@ -546,6 +546,22 @@ mod library {
     use crate::pages::Kind;
 
     #[test]
+    fn a_copy_of_the_library_cut_short_is_none_and_is_fetched_again() {
+        let path = std::env::temp_dir().join(format!("nexus-library-{}.json", std::process::id()));
+        let library = Library { songs: vec![Song { id: "s1".into(), title: "Yellow".into(), ..Default::default() }], ..Default::default() };
+        library.save(&path);
+        let whole = std::fs::read(&path).unwrap();
+        assert!(Library::load(&path).is_some_and(|read| read.songs.len() == 1));
+        // Renamed into place without being flushed: after a power cut it can hold nothing,
+        // or part of the copy. Either is no copy, and a new one is fetched from the server.
+        for cut in [&whole[..0], &whole[..whole.len() / 2], &whole[..whole.len() - 1]] {
+            std::fs::write(&path, cut).unwrap();
+            assert!(Library::load(&path).is_none(), "{}", String::from_utf8_lossy(cut));
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn the_windows_library_answers_as_the_plain_lists_do() {
         // The window's index and the plain lists the phone hands across, made from the same
         // library, give the same answer to every question.

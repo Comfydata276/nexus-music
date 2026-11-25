@@ -205,11 +205,12 @@ impl Job {
     }
 
     /// Takes up the batch that was under way when the app last closed, as it was written down
-    /// (see `Desk::keep`). What can't be read is left alone.
-    pub fn load(&self, written: &[u8]) {
-        if let Ok(batch) = serde_json::from_slice::<Batch>(written) {
-            self.with(|now| *now = batch);
-        }
+    /// (see `Desk::keep`), and says whether it could be read. What can't be read is left
+    /// alone: what to do with it, and what to tell the person, is the app's.
+    pub fn load(&self, written: &[u8]) -> bool {
+        let Ok(batch) = serde_json::from_slice::<Batch>(written) else { return false };
+        self.with(|now| *now = batch);
+        true
     }
 
     fn save(&self) {
@@ -1302,5 +1303,10 @@ mod tests {
         assert_eq!(written["restore"], serde_json::json!([[5, "all"]]));
         assert_eq!(written["stopped"], STOPPED);
         assert!(job.unfinished());
+        // Read back, it is taken up; cut short, or empty, it is not, and the app is told so.
+        let again = Job::new(Nowhere);
+        let written = kept.lock().unwrap().clone().unwrap();
+        assert!(!again.load(b"") && !again.load(&written[..written.len() / 2]) && !again.unfinished());
+        assert!(again.load(&written) && again.unfinished());
     }
 }

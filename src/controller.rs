@@ -649,7 +649,8 @@ impl Controller {
         let seen: u64 = std::fs::read_to_string(&seen_file).ok().and_then(|text| text.trim().parse().ok()).unwrap_or(0);
         let crashed = size > seen;
         if crashed {
-            let _ = std::fs::write(&seen_file, size.to_string());
+            // Whole or not at all: a number cut short would be taken for one that was seen.
+            config::write_atomically(&seen_file, size.to_string().as_bytes());
         }
         let note = self.startup_note.borrow_mut().take().or_else(|| {
             crashed.then(|| "The app stopped unexpectedly last time. “Save diagnostics” under Settings, About has what was noted.".to_string())
@@ -4395,5 +4396,24 @@ impl Controller {
                 s.eq_saved.remove(index);
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_page_cut_short_is_not_there_and_is_fetched_again() {
+        let path = std::env::temp_dir().join(format!("nexus-page-{}.json", std::process::id()));
+        let page = crate::pages::PageData { title: "Road Trip".into(), ..Default::default() };
+        let whole = serde_json::to_vec(&page).unwrap();
+        std::fs::write(&path, &whole).unwrap();
+        assert_eq!(super::read_page(&path).map(|(_, read)| read), Some(page));
+        // Written in place (it can be fetched again): cut short, or emptied, it is no page,
+        // and the page is fetched as if none was kept.
+        for cut in [&whole[..0], &whole[..whole.len() / 2], &whole[..whole.len() - 1]] {
+            std::fs::write(&path, cut).unwrap();
+            assert!(super::read_page(&path).is_none(), "{}", String::from_utf8_lossy(cut));
+        }
+        let _ = std::fs::remove_file(&path);
     }
 }

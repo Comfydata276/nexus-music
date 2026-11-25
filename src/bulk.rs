@@ -44,11 +44,10 @@ impl Desk for Windows {
             None => {
                 let _ = std::fs::remove_file(path);
             }
+            // Whole, or the batch as it was: a kill or a power cut part-way can't leave
+            // half of it, and with it the settings it has to put back on Lidarr.
             Some(json) => {
-                let partial = path.with_extension("json.part");
-                if std::fs::write(&partial, json).is_ok() {
-                    let _ = std::fs::rename(&partial, path);
-                }
+                let _ = crate::config::write_surely(path, &json);
             }
         }
     }
@@ -76,8 +75,67 @@ static JOB: LazyLock<Job> = LazyLock::new(|| Job::new(Windows));
 /// Reads the batch that was under way when the app last closed, if there was one.
 pub fn load(path: &std::path::Path) {
     let _ = PLACE.set(path.to_path_buf());
-    if let Ok(written) = std::fs::read(path) {
-        JOB.load(&written);
+    let trouble = take_up(path, |written| JOB.load(written));
+    if let Ok(mut said) = TROUBLE.write() {
+        *said = trouble;
+    }
+}
+
+/// What the Requests page says about the file the batch is kept in, if anything.
+static TROUBLE: std::sync::RwLock<&'static str> = std::sync::RwLock::new("");
+
+pub fn trouble() -> &'static str {
+    TROUBLE.read().map(|said| *said).unwrap_or("")
+}
+
+const FOUND_EMPTY: &str = "A batch of albums being asked for was found empty when the app started (it was stopped while saving it), so it hasn't been carried on. If it had turned off “new releases” for an artist while their singles were read in, that hasn't been put back: look at those artists in Lidarr.";
+const FOUND_DAMAGED: &str = "A batch of albums being asked for couldn't be read back when the app started, so it hasn't been carried on. If it had turned off “new releases” for an artist while their singles were read in, that hasn't been put back: look at those artists in Lidarr. The file has been kept as asking.damaged.json.";
+
+/// Takes up the batch written down in `path` with `load`, and says what the person is to be
+/// told about it. **A file that can't be read is never taken for no batch, silently:** one
+/// that reads and isn't a batch (cut short by an earlier version, or by a power cut) is kept
+/// aside as `asking.damaged.json` before anything is written over it, and the person is told
+/// what may not have been put back on Lidarr.
+fn take_up(path: &std::path::Path, load: impl FnOnce(&[u8]) -> bool) -> &'static str {
+    let Ok(written) = std::fs::read(path) else { return "" };
+    if load(&written) {
+        return "";
+    }
+    if written.iter().all(u8::is_ascii_whitespace) {
+        let _ = std::fs::remove_file(path);
+        return FOUND_EMPTY;
+    }
+    let _ = std::fs::rename(path, path.with_extension("damaged.json"));
+    FOUND_DAMAGED
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_batch_found_empty_or_damaged_is_said_and_kept_aside() {
+        let dir = std::env::temp_dir().join(format!("nexus-asking-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("asking.json");
+        let job = Job::new(Windows);
+        let read = |written: &[u8]| job.load(written);
+        // Nothing written down: nothing to say.
+        assert_eq!(take_up(&path, read), "");
+        // A batch, written down whole, is taken up.
+        let batch = br#"{"wants":[],"restore":[[5,"all"]],"stopped":"","proof":null}"#;
+        std::fs::write(&path, batch).unwrap();
+        assert_eq!(take_up(&path, read), "");
+        assert!(job.unfinished());
+        // What 0.40.10 could leave after a power cut: an empty file, or the batch cut short.
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(take_up(&path, read), FOUND_EMPTY);
+        std::fs::write(&path, &batch[..30]).unwrap();
+        assert_eq!(take_up(&path, read), FOUND_DAMAGED);
+        assert_eq!(std::fs::read(dir.join("asking.damaged.json")).unwrap(), &batch[..30]);
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

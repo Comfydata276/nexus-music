@@ -629,7 +629,8 @@ fn requests() -> PageData {
     };
     // A batch of albums being asked for (see `bulk`): how it stands, and what it couldn't ask for.
     let (notice, action, other) = crate::bulk::summary().notice();
-    page.notice = notice;
+    // And what was found wrong with the files they are kept in, when the app started.
+    page.notice = [crate::asked::trouble(), crate::bulk::trouble(), notice.as_str()].into_iter().filter(|said| !said.is_empty()).collect::<Vec<_>>().join(" ");
     page.notice_action = action.to_string();
     page.notice_other = other.to_string();
     let missed = crate::bulk::missed();

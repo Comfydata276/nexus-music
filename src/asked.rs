@@ -20,19 +20,55 @@ pub use nexus_core::asked::{Arrival, Asked, Fill};
 pub struct AskedList {
     path: PathBuf,
     pub items: Vec<Asked>,
+    /// The file is there and could not be read: it is not written over (see `read_back`).
+    held: bool,
+    /// What the person is told on the Requests page about the file, if anything.
+    trouble: &'static str,
 }
 
 /// A copy for the threads that look for arrivals and draw the Requests page.
 static SHARED: RwLock<Vec<Asked>> = RwLock::new(Vec::new());
+/// What the Requests page says about the file the list is kept in, if anything.
+static TROUBLE: RwLock<&'static str> = RwLock::new("");
 
 pub fn shared() -> Vec<Asked> {
     SHARED.read().map(|items| items.clone()).unwrap_or_default()
 }
 
+/// For the Requests page: the list's file was found damaged or could not be read.
+pub fn trouble() -> &'static str {
+    TROUBLE.read().map(|trouble| *trouble).unwrap_or("")
+}
+
+const FOUND_EMPTY: &str = "The list of albums asked for through this app was found empty: the app was stopped while it was saving it. Albums asked for before then won't be announced when they arrive, or put into their playlists. Lidarr still fetches them, and what it's fetching is shown here.";
+const FOUND_DAMAGED: &str = "The list of albums asked for through this app couldn't be read, so albums asked for before now won't be announced when they arrive, or put into their playlists. Lidarr still fetches them, and what it's fetching is shown here. The file has been kept as asked.damaged.json.";
+const NOT_READ: &str = "The list of albums asked for through this app couldn't be read just now, so it has been left as it is. It is read again when something is next asked for, and when the app next starts.";
+
+/// What the file holds, read back. **A file that could not be read is never taken for an
+/// empty list**: one that is there and can't be read just now is left as it is, and not
+/// written over (`held`); one that reads and isn't a list (cut short by 0.40.10 or earlier,
+/// which wrote it in place) is kept aside as `asked.damaged.json`, and only then written
+/// afresh. An empty file is what such a cut left: there is nothing to keep of it.
+fn read_back(path: &Path) -> (Vec<Asked>, bool, &'static str) {
+    match std::fs::read(path) {
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(items) => (items, false, ""),
+            Err(_) if bytes.iter().all(u8::is_ascii_whitespace) => (Vec::new(), false, FOUND_EMPTY),
+            Err(_) => {
+                let aside = path.with_extension("damaged.json");
+                let kept = std::fs::rename(path, &aside).is_ok();
+                (Vec::new(), !kept, if kept { FOUND_DAMAGED } else { NOT_READ })
+            }
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (Vec::new(), false, ""),
+        Err(_) => (Vec::new(), true, NOT_READ),
+    }
+}
+
 impl AskedList {
     pub fn load(path: &Path) -> AskedList {
-        let items: Vec<Asked> = std::fs::read(path).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default();
-        let list = AskedList { path: path.to_path_buf(), items };
+        let (items, held, trouble) = read_back(path);
+        let list = AskedList { path: path.to_path_buf(), items, held, trouble };
         list.share();
         list
     }
@@ -41,11 +77,31 @@ impl AskedList {
         if let Ok(mut shared) = SHARED.write() {
             *shared = self.items.clone();
         }
+        if let Ok(mut shared) = TROUBLE.write() {
+            *shared = self.trouble;
+        }
     }
 
-    pub fn save(&self) {
-        if let Ok(json) = serde_json::to_vec_pretty(&self.items) {
-            let _ = std::fs::write(&self.path, json);
+    /// Written whole, or not at all: a kill or a power cut part-way leaves the list as it
+    /// was (`config::write_surely`). A file that could not be read when the app started is
+    /// tried again first, and what it holds is joined to what has been asked since.
+    pub fn save(&mut self) {
+        if self.held {
+            let (items, held, trouble) = read_back(&self.path);
+            if !held {
+                let mut joined = items;
+                for asked in self.items.drain(..) {
+                    nexus_core::asked::put(&mut joined, asked);
+                }
+                self.items = joined;
+                self.held = false;
+                self.trouble = trouble;
+            }
+        }
+        if !self.held {
+            if let Ok(json) = serde_json::to_vec_pretty(&self.items) {
+                let _ = crate::config::write_surely(&self.path, &json);
+            }
         }
         self.share();
     }
@@ -203,5 +259,62 @@ mod tests {
         list.tidy(1000 + SHOWN_FOR + 1);
         assert!(list.items.is_empty());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_list_found_empty_or_damaged_is_said_and_kept_and_never_taken_for_nothing() {
+        let dir = std::env::temp_dir().join(format!("nexus-asked-found-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("asked.json");
+        let aside = dir.join("asked.damaged.json");
+        let cradlesong = || Asked { title: "Cradlesong".into(), artist: "Rob Thomas".into(), at: 100, ..Default::default() };
+        // What 0.40.10 left, killed while it saved the list in place: an empty file. Nothing
+        // can be had back from it, and the person is told why arrivals of what they asked
+        // for before won't be announced.
+        std::fs::write(&path, "").unwrap();
+        let mut list = AskedList::load(&path);
+        assert!(list.items.is_empty());
+        assert_eq!(list.trouble, FOUND_EMPTY);
+        list.add(cradlesong());
+        assert_eq!(AskedList::load(&path).items.len(), 1);
+        // Cut short part-way: it is kept aside, as it was, before anything is written.
+        let whole = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &whole[..whole.len() / 2]).unwrap();
+        let mut list = AskedList::load(&path);
+        assert_eq!((list.items.len(), list.trouble), (0, FOUND_DAMAGED));
+        assert_eq!(std::fs::read(&aside).unwrap(), &whole[..whole.len() / 2]);
+        list.add(Asked { title: "Parachutes".into(), artist: "Coldplay".into(), ..Default::default() });
+        assert_eq!(std::fs::read(&aside).unwrap(), &whole[..whole.len() / 2]);
+        assert_eq!(AskedList::load(&path).items[0].title, "Parachutes");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_list_that_could_not_be_read_is_not_written_over_and_is_joined_once_it_can_be() {
+        let dir = std::env::temp_dir().join(format!("nexus-asked-held-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("asked.json");
+        let mut list = AskedList::load(&path);
+        list.add(Asked { title: "Cradlesong".into(), artist: "Rob Thomas".into(), at: 100, ..Default::default() });
+        let before = std::fs::read(&path).unwrap();
+        // (A folder where the file is read is a file that can't be read, on every system.)
+        let away = dir.join("away.json");
+        std::fs::rename(&path, &away).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let mut list = AskedList::load(&path);
+        assert_eq!((list.items.len(), list.trouble), (0, NOT_READ));
+        list.add(Asked { title: "Parachutes".into(), artist: "Coldplay".into(), at: 200, ..Default::default() });
+        assert!(path.is_dir(), "written over");
+        // It can be read again: what it holds and what was asked meanwhile, both.
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(&away, &path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        list.add(Asked { title: "Yellow".into(), artist: "Coldplay".into(), at: 300, ..Default::default() });
+        let titles: Vec<String> = AskedList::load(&path).items.into_iter().map(|asked| asked.title).collect();
+        assert_eq!(titles, ["Cradlesong", "Parachutes", "Yellow"]);
+        assert_eq!(list.trouble, "");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

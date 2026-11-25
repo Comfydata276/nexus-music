@@ -61,6 +61,13 @@ mod tests {
         // That a song has none is kept too, which is different from never having asked.
         assert_eq!(kept(&dir, "b").map(|kept| kept.lyrics), Some(None));
         assert!(dir.join("a_1.json").exists());
+        // A file a power cut emptied or cut short (it is renamed in place without being
+        // flushed) is nothing kept, not "the song has none": the server is asked again.
+        let whole = std::fs::read(dir.join("a_1.json")).unwrap();
+        for cut in [&whole[..0], &whole[..whole.len() / 2], &b"nul"[..]] {
+            std::fs::write(dir.join("a_1.json"), cut).unwrap();
+            assert!(kept(&dir, "a/1").is_none(), "{}", String::from_utf8_lossy(cut));
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

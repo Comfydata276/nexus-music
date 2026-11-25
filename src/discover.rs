@@ -36,11 +36,18 @@ fn kept() -> Kept {
     if let Some(kept) = KEPT.read().ok().and_then(|kept| kept.clone()) {
         return kept;
     }
-    let kept: Kept = PLACE.get().and_then(|path| std::fs::read(path).ok()).and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default();
+    let kept = PLACE.get().map(|path| read_kept(path)).unwrap_or_default();
     if let Ok(mut shared) = KEPT.write() {
         *shared = Some(kept.clone());
     }
     kept
+}
+
+/// What's kept, read back. They can be looked for again, so they are written in place: a
+/// file that a kill or a power cut cut short, or emptied, is read as none kept, looked for
+/// as soon as Home is opened, and written over. Never as suggestions, or as an error.
+fn read_kept(path: &std::path::Path) -> Kept {
+    std::fs::read(path).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default()
 }
 
 fn keep(kept: Kept) {
@@ -104,4 +111,24 @@ fn look(client: &Client, index: &Index, lidarr: &Lidarr, now: i64) -> Vec<Sugges
     let Ok(found) = nexus_core::discover::look(lidarr, &similar, index, now) else { return Vec::new() };
     keep(found.clone());
     found.artists
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn suggestions_cut_short_are_none_kept_and_are_looked_for_again() {
+        let path = std::env::temp_dir().join(format!("nexus-discover-{}.json", std::process::id()));
+        let kept = Kept { at: 1_700_000_000, artists: vec![Suggestion { id: "1".into(), name: "Hanson".into(), ..Default::default() }] };
+        let whole = serde_json::to_vec_pretty(&kept).unwrap();
+        std::fs::write(&path, &whole).unwrap();
+        assert!(read_kept(&path).fresh(1_700_000_001) && read_kept(&path).artists.len() == 1);
+        for cut in [&whole[..0], &whole[..whole.len() / 2], &whole[..whole.len() - 1]] {
+            std::fs::write(&path, cut).unwrap();
+            let read = read_kept(&path);
+            assert!(read.artists.is_empty() && !read.fresh(1_700_000_001), "{}", String::from_utf8_lossy(cut));
+        }
+        let _ = std::fs::remove_file(&path);
+    }
 }
