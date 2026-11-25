@@ -96,22 +96,7 @@ impl Paths {
     }
 }
 
-/// What's remembered about one list of songs (a playlist, an album, Liked songs).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ListPrefs {
-    /// Play it shuffled.
-    pub shuffle: bool,
-    /// The order it's shown in (an index into `TRACK_SORTS`), and whether that's reversed.
-    pub sort: usize,
-    pub descending: bool,
-    /// The order was chosen by the user. Until it is, the list opens in its usual order:
-    /// for a playlist, the most recently added songs first.
-    pub sort_chosen: bool,
-    /// When these choices last changed, in seconds since 1970: between devices, the newer
-    /// set wins.
-    pub at: i64,
-}
+pub use nexus_core::sync::ListPrefs;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]

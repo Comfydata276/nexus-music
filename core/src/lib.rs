@@ -5,4 +5,6 @@
 //! file, starts a thread or opens a connection; whatever it needs from the world, the app
 //! hands it.
 
+pub mod notes;
+pub mod sync;
 pub mod text;
