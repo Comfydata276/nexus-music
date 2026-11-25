@@ -569,7 +569,7 @@ impl Controller {
     }
 
     /// Whether a jam could be hosted from here: hosting is on and a host link is on file.
-    fn can_host_jam(&self) -> bool {
+    pub(crate) fn can_host_jam(&self) -> bool {
         let settings = self.settings.borrow();
         settings.jam_host && !settings.jam_relay.is_empty() && config::load_secret(&self.paths, "jam-key").is_some()
     }
@@ -1720,12 +1720,13 @@ impl Controller {
             self.ui.global::<ui::Player>().set_position(position as f32);
         }
         self.link_devices();
+        self.link_tick();
     }
 
     // ---- this person's other devices ---------------------------------------------------------
 
     /// This device, to the others: an id that stays the same, and a name to show.
-    fn this_device(&self) -> (String, String) {
+    pub(crate) fn this_device(&self) -> (String, String) {
         if self.settings.borrow().device_id.is_empty() {
             self.settings.borrow_mut().device_id = format!("{:08x}", fastrand::u32(..));
             self.save_settings();
@@ -2012,6 +2013,8 @@ impl Controller {
                 ctl.settings.borrow_mut().link_devices = on;
                 ctl.save_settings();
                 ctl.push_jam();
+                // (Where the new linking is switched on, off is off for it at once: see `link`.)
+                ctl.link_setting(on);
             });
         });
         settings.on_set_device_name(|name| {

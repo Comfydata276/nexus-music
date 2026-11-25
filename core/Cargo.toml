@@ -16,6 +16,12 @@ serde_json = { version = "1", features = ["raw_value"] }
 # `Date` on an answer. The app carries chrono already; none of its clock is used here, so
 # the library still has no clock of its own.
 chrono = { version = "0.4", default-features = false, features = ["std"] }
-# The check sent ahead of the secret in a browser sign-in (see src/gate.rs). The app carries
-# the same version already.
+# Linking a person's devices (src/link.rs). The seal on what they say to each other, the
+# key it is sealed with, and wiping both. No source of randomness comes with any of these:
+# an app hands the random bytes in.
+chacha20poly1305 = { version = "=0.10.1", default-features = false, features = ["alloc"] }
+hkdf = "=0.13.0"
+zeroize = "1.8"
+# The check sent ahead of the secret in a browser sign-in (see src/gate.rs), and the key
+# for linking devices. The app carries the same version already.
 sha2 = "0.11"

@@ -301,6 +301,13 @@ pub struct Controller {
     pub jam_pool: std::sync::Arc<Pool>,
     /// The jam being hosted or joined, if any (see `jam`).
     pub jam: RefCell<crate::jam::Jam>,
+    /// The order of choices on this PC: what a command from another of the person's
+    /// devices is judged against (see `link`).
+    pub link_rule: RefCell<nexus_core::link::rule::Rule>,
+    /// The player is being changed: what it does on the way is part of that one change.
+    pub link_changing: Cell<bool>,
+    /// The new linking of a person's devices, where it is switched on (see `link`).
+    pub link: RefCell<crate::link::Link>,
     /// Waits for typing in a jam's search box to pause.
     pub jam_timer: slint::Timer,
     pub downloads: RefCell<crate::downloads::Downloads>,
@@ -499,6 +506,9 @@ impl Controller {
             quick_pool: Pool::new("quick", 1, true),
             jam_pool: std::sync::Arc::new(Pool::new("jam", 4, false)),
             jam: RefCell::default(),
+            link_rule: RefCell::default(),
+            link_changing: Cell::new(false),
+            link: RefCell::default(),
             jam_timer: slint::Timer::default(),
             download_pool: Pool::new("download", 2, false),
             // Nobody is signed in yet: whose downloads to show is known in `enter`.
@@ -1142,6 +1152,8 @@ impl Controller {
         self.let_go();
         // A jam hosted here ends with the app; its guests are told so, not left waiting.
         self.stop_linking();
+        // (The new linking ends with the sign-in, and a look still on its way with it.)
+        self.link_stop();
         self.end_jam(true);
         self.save_queue();
         self.save_settings();
@@ -2386,6 +2398,8 @@ impl Controller {
         self.leave_jam();
         self.end_jam(false);
         self.stop_linking();
+        // (The new linking ends with the sign-in, and a look still on its way with it.)
+        self.link_stop();
         self.ui.global::<ui::Jam>().set_open(false);
         self.stop_sync();
         self.library_timer.stop();
@@ -3498,7 +3512,7 @@ impl Controller {
             |ctl, result| {
                 let Ok(mut playlists) = result else { return };
                 // The playlist the app keeps its shared data in isn't one to listen to.
-                playlists.retain(|p| p.name != crate::sync::PLAYLIST_NAME);
+                playlists.retain(|p| !crate::link::unlisted(&p.name));
                 *ctl.playlists.borrow_mut() = playlists;
                 ctl.show_playlists();
                 ctl.reload_changed_playlist();
@@ -4266,6 +4280,7 @@ impl Controller {
 
         self.wire_playback();
         self.wire_jam();
+        self.wire_link();
         self.wire_actions();
     }
 
@@ -4310,9 +4325,14 @@ fn fetch_whole(client: &Client, route: &Route, file: &std::path::Path) -> ApiRes
     Ok(whole)
 }
 
-fn store_page(file: &std::path::Path, page: &PageData) {
+pub(crate) fn store_page(file: &std::path::Path, page: &PageData) {
     // A page made from what's already on this PC is quicker made again than read back.
     if page.local {
+        return;
+    }
+    // The page of a playlist the app keeps for itself holds, as its comment, what the app
+    // keeps there: for one of them that is a secret. It is never written to disk.
+    if page.playlist.as_ref().is_some_and(|playlist| !crate::link::page_may_be_kept(&playlist.name)) {
         return;
     }
     let Ok(json) = serde_json::to_vec(page) else { return };

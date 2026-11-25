@@ -194,19 +194,26 @@ further use.
 holds jams in memory only: restarting it ends any jam in progress.
 
 ```sh
+KEY="$(openssl rand -hex 24)"
 docker run -d --name nexus-music-jam --restart unless-stopped -p 8080:8080 \
-  -e JAM_HOST_KEY="$(openssl rand -hex 24)" \
+  -e JAM_HOST_KEY="$KEY" \
   -e JAM_PUBLIC_URL=https://jam.example.org \
   ghcr.io/comfydata276/nexus-music-jam:latest
-docker logs nexus-music-jam    # prints the host link
+echo "https://jam.example.org/#$KEY"    # the host link, for Nexus Music's settings
 ```
+
+The relay never prints the host key, so keep the link from the line above: anyone who has
+it can start jams.
 
 | Setting | What it's for |
 |---|---|
-| `JAM_HOST_KEY` | What a copy of the app must show to start a jam: at least 16 characters, and worth making long and random. Without it the relay makes one up each time it starts, so the host link changes on every restart. |
-| `JAM_PUBLIC_URL` | The address people reach the relay at. Only used to print the whole host link in the log. |
+| `JAM_HOST_KEY` | What a copy of the app must show to start a jam: at least 16 characters, and worth making long and random. The relay does not start without it. |
+| `JAM_PUBLIC_URL` | The address people reach the relay at. Only used to say in the log where the host link begins. |
 | `JAM_LISTEN` | Where it listens inside the container; `0.0.0.0:8080` unless set. |
 | `JAM_MAX_JAMS` | How many sessions may be open at once; 20 unless set. Each linked device holds one, whether or not it's a jam. |
+| `JAM_TRUSTED_PROXY` | The one address your reverse proxy connects from. Set it and callers are counted by the address the proxy saw; leave it unset and they are counted by the connection's own, which behind a proxy is the proxy's for everybody. |
+| `JAM_OLD_LINK` | `off` turns away devices that find each other the way versions up to 0.40.6 do. On unless set. |
+| `JAM_LINK_LISTEN` | Where the relay serves the route a person's own devices will link through (not used by any released version yet), e.g. `0.0.0.0:8081`. Off unless set. It is a second port on purpose, with its own threads, so that nothing done to it can slow a jam: publish it too, and have the proxy send `/api/link/` there and everything else to the first. |
 
 Put it behind the reverse proxy you already use, on an address of its own (or under a path),
 with HTTPS. Three things matter there:
@@ -217,6 +224,38 @@ with HTTPS. Three things matter there:
 - It holds requests open for up to 20 seconds on purpose, waiting for something to say. A
   proxy that gives up on a quiet request sooner than that needs its read timeout raised.
 - The `Authorization` header must be passed through to it.
+
+**The route for a person's own devices** (`JAM_LINK_LISTEN`; no released version uses it
+yet). It is served on a second port so that nothing done to it can slow a jam, and the proxy
+has to send it there:
+
+- **The rule.** Everything under `/api/link/` goes to the relay's second port; everything
+  else goes to the first, as now. In Nginx Proxy Manager: the proxy host, *Custom locations*,
+  *Add location*; location `/api/link/`, scheme `http`, the relay's address, the second port;
+  nothing in the location's own settings box.
+- **`JAM_TRUSTED_PROXY`** is the address the proxy connects to the relay from (its
+  container's address on the network they share). From that address, and no other, the relay
+  takes the caller to be the last address in `X-Forwarded-For`.
+- **Which address that is.** Nginx Proxy Manager writes one address there for a custom
+  location, the one it takes the caller to be; and it takes a caller's own word for that
+  (an `X-Real-IP` header) whenever the connection comes from a private range or from
+  Cloudflare or CloudFront:
+
+  | The device | Reaches the proxy from | The relay counts it as |
+  |---|---|---|
+  | On the home network, straight to the proxy | Its own private address | That address, or whatever `X-Real-IP` it chose to send |
+  | On mobile data, or anywhere else, through Cloudflare | A Cloudflare address | That Cloudflare address, which it shares with everyone else coming through Cloudflare; or whatever `X-Real-IP` it chose to send, which Cloudflare passes on and the proxy believes |
+  | From outside, not through Cloudflare | Its own public address | That address; an `X-Real-IP` it sends is ignored |
+
+  So behind Cloudflare the relay's limits for each address count Cloudflare, or a claim.
+  To have them count the real address, put `real_ip_header CF-Connecting-IP;` in the proxy
+  host's *Advanced* box: Cloudflare writes that header itself, over anything a caller sent.
+  The limits that do not go by address (for each place, for each room, and for the relay as
+  a whole) hold either way.
+
+  This is from Nginx Proxy Manager's own templates (`backend/templates/_location.conf` and
+  `docker/rootfs/etc/nginx/nginx.conf`, as they stood on 25 November 2026), not from any
+  running server.
 
 The app refuses a host link or jam link that starts with `http://` unless it points at your
 own network, since the key travels with every request.
@@ -275,6 +314,11 @@ writes its own pins, sorts and theme straight back. To go back to the record as 
 A PC that step 3 was not done on puts back whatever it holds that is newer than the copy.
 Recently played and the plays are not gone back on either way: what has been played since
 the copy was kept stays, on the PCs and in the record.
+
+Look at the file's text before you paste it: a copy made by 0.40.5 to 0.40.7 can be empty or
+cut short if the app was stopped or the PC lost power at the moment it was made, and nothing
+can tell that from a whole copy afterwards (later versions give the file its name only once
+it is whole).
 
 **Known, and accepted.**
 

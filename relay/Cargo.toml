@@ -12,10 +12,15 @@ publish = false
 tiny_http = "0.12"
 serde_json = "1"
 getrandom = "0.3"
+# One socket option the standard library has no name for on a listening socket: how long
+# a write may make no progress.
+socket2 = "0.6"
 
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
-panic = "abort"
+# (Not `panic = "abort"`: a fault in the route devices link through is caught and outlived,
+# which needs the program to be able to unwind. A fault anywhere else still ends the
+# program at once, as it always has: see the hook in src/main.rs.)

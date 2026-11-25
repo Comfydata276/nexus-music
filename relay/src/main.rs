@@ -13,22 +13,48 @@ use std::sync::Arc;
 use relay::{Config, Relay};
 
 fn main() {
+    // A fault anywhere but in the route devices link through ends the program at once, as
+    // it always has: the container is started again, and that is the plain thing to do
+    // when a jam's own code has gone wrong. A fault on one of the route's threads is caught
+    // there and outlived (see `relay::link`), so that nothing sent to the route can end a jam.
+    let ordinary = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |fault| {
+        ordinary(fault);
+        if !relay::link::outlives_a_fault(std::thread::current().name()) {
+            std::process::abort();
+        }
+    }));
     let setting = |name: &str| std::env::var(name).ok().map(|value| value.trim().to_string()).filter(|value| !value.is_empty());
     let listen = setting("JAM_LISTEN").unwrap_or_else(|| "0.0.0.0:8080".to_string());
     let public = setting("JAM_PUBLIC_URL").map(|address| address.trim_end_matches('/').to_string());
-    let (key, temporary) = match setting("JAM_HOST_KEY") {
-        Some(key) if key.len() >= 16 => (key, false),
+    // The host key is never printed, here or anywhere: whoever reads this program's output
+    // could then start jams and take places in rooms. So it has to be given.
+    let key = match setting("JAM_HOST_KEY") {
+        Some(key) if key.len() >= 16 => key,
         Some(_) => {
             eprintln!("JAM_HOST_KEY is too short: use at least 16 characters, e.g. the output of `openssl rand -hex 24`.");
             std::process::exit(2);
         }
-        None => (relay::random_text(40), true),
+        None => {
+            eprintln!("Set JAM_HOST_KEY: at least 16 characters, e.g. the output of `openssl rand -hex 24`. The host link is this relay's public address, then /# and that key.");
+            std::process::exit(2);
+        }
     };
-    let mut config = Config::new(key.clone());
+    let mut config = Config::new(key);
     if let Some(most) = setting("JAM_MAX_JAMS").and_then(|text| text.parse().ok()) {
         config.max_jams = most;
     }
-    let server = match tiny_http::Server::http(&listen) {
+    if let Some(proxy) = setting("JAM_TRUSTED_PROXY") {
+        match proxy.parse() {
+            Ok(address) => config.trusted_proxy = Some(address),
+            Err(_) => {
+                eprintln!("JAM_TRUSTED_PROXY isn't an address: give the one address the proxy in front of this relay connects from.");
+                std::process::exit(2);
+            }
+        }
+    }
+    config.old_link = !setting("JAM_OLD_LINK").is_some_and(|value| matches!(value.to_lowercase().as_str(), "off" | "no" | "false" | "0"));
+    let server = match relay::listen(&listen, relay::WRITE_DEADLINE) {
         Ok(server) => Arc::new(server),
         Err(why) => {
             eprintln!("Couldn't listen on {listen}: {why}");
@@ -36,13 +62,24 @@ fn main() {
         }
     };
     println!("Nexus Music jam relay {} listening on {listen}.", env!("CARGO_PKG_VERSION"));
-    if temporary {
-        println!("No JAM_HOST_KEY is set, so a key was made up for this run and will change on the next. Set JAM_HOST_KEY to keep one.");
-    }
     match &public {
-        Some(address) => println!("Host link, for Nexus Music's settings (keep it private): {address}/#{key}"),
-        None if temporary => println!("Host link, for Nexus Music's settings: this relay's public address, then /#{key}"),
+        Some(address) => println!("Host link, for Nexus Music's settings (keep it private): {address}/# and the host key."),
         None => println!("Host link, for Nexus Music's settings: this relay's public address, then /# and the host key."),
     }
-    relay::serve(Arc::new(Relay::new(config)), server, 8);
+    if !config.old_link {
+        println!("Devices that link the old way are turned away.");
+    }
+    let relay = Arc::new(Relay::new(config));
+    // The route a person's devices link through is served apart from everything else, at
+    // an address of its own, so that nothing done to it can slow a jam. The proxy in front
+    // sends `/api/link/` there.
+    if let Some(address) = setting("JAM_LINK_LISTEN") {
+        match relay::link::listen(relay.clone(), &address) {
+            Ok(at) => println!("Devices link through {at}: have the proxy in front send /api/link/ there."),
+            // Jams are what this relay is for: they are served all the same. The route is
+            // simply not there, and `/api/hello` does not say it is.
+            Err(why) => eprintln!("Devices can't link through this relay: the route for them couldn't be started at {address} ({why}). Jams are served as usual."),
+        }
+    }
+    relay::serve(relay, server, 8);
 }

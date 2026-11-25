@@ -188,6 +188,10 @@ pub struct Settings {
     pub sync: bool,
     /// A made-up name for this device, so it can tell its own saved queue from others'.
     pub device_id: String,
+    /// What this installation calls itself to the person's other devices under the new
+    /// linking (see `link`): sixteen random bytes. Made the first time it is needed.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub link_device: String,
     /// The id of the playlist that holds what's shared between devices, once known.
     pub sync_playlist: String,
     /// When the pins and the theme that were last agreed with the server were chosen (see
@@ -267,6 +271,7 @@ impl Default for Settings {
             device_name: String::new(),
             sync: true,
             device_id: String::new(),
+            link_device: String::new(),
             sync_playlist: String::new(),
             pins_at: 0,
             theme_at: 0,
@@ -658,12 +663,111 @@ pub fn write_atomically(path: &Path, bytes: &[u8]) {
 /// the disk, and put in place, or an error and the file as it was.
 pub fn write_surely(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
-    let temp = path.with_extension("tmp");
+    let temp = beside(path);
     let mut file = fs::File::create(&temp)?;
     file.write_all(bytes)?;
     file.sync_all()?;
     drop(file);
     fs::rename(&temp, path)
+}
+
+/// The name beside a file's that it is written under before it is put in place.
+pub fn beside(path: &Path) -> PathBuf {
+    path.with_extension("tmp")
+}
+
+/// As `write_surely`, for a file that is made once and never replaced: written beside its
+/// place, flushed to the disk, and only then given its name, if nothing has that name; then
+/// its folder is synced. So whatever is at the name is the whole file, or nothing is. If
+/// something has the name already it is left as it is, and the error is `AlreadyExists`.
+/// What a stopped attempt left beside the name is never read: it is cleared first.
+pub fn write_once(path: &Path, bytes: &[u8], steps: &Steps) -> std::io::Result<()> {
+    use std::io::Write;
+    let temp = beside(path);
+    // Removed, not written over: the next file there is a new one, so nothing else that
+    // names the old one (on Linux, the copy itself, if an attempt was stopped between the
+    // two steps of its move) is written through it.
+    match fs::remove_file(&temp) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
+        _ => {}
+    }
+    let placed = (|| {
+        let mut file = (steps.create)(&temp)?;
+        file.write_all(bytes)?;
+        (steps.flush)(&file)?;
+        drop(file);
+        (steps.place)(&temp, path)
+    })();
+    if placed.is_err() {
+        // This attempt's own file, which never had the name.
+        let _ = fs::remove_file(&temp);
+    }
+    placed?;
+    (steps.sync_folder)(path)
+}
+
+/// The steps by which `write_once` puts a file on the disk, given so that a test can have
+/// the app stopped at one of them, or have one fail. `ON_DISK` are the real ones.
+#[derive(Clone, Copy)]
+pub struct Steps {
+    /// Makes a new, empty file to write, only if nothing has its name.
+    pub create: fn(&Path) -> std::io::Result<fs::File>,
+    /// Makes sure what was written to it is on the disk.
+    pub flush: fn(&fs::File) -> std::io::Result<()>,
+    /// Gives the file written beside its place its own name, if nothing has that name.
+    pub place: fn(&Path, &Path) -> std::io::Result<()>,
+    /// Makes the names in a file's folder outlast a power cut.
+    pub sync_folder: fn(&Path) -> std::io::Result<()>,
+}
+
+pub const ON_DISK: Steps = Steps {
+    create: |path| fs::OpenOptions::new().write(true).create_new(true).open(path),
+    flush: fs::File::sync_all,
+    place: place_new,
+    sync_folder,
+};
+
+/// Moves `from` to `to` only if nothing has the name `to`, and never over what has it:
+/// `AlreadyExists` then, and both left as they are. (`fs::rename` replaces.) Windows:
+/// `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING`, which fails if the name is had; with
+/// `MOVEFILE_WRITE_THROUGH`, which Microsoft documents as not returning until the file is
+/// actually moved on the disk.
+#[cfg(windows)]
+fn place_new(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
+    let wide = |path: &Path| path.as_os_str().encode_wide().chain(Some(0)).collect::<Vec<u16>>();
+    let (from, to) = (wide(from), wide(to));
+    if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_WRITE_THROUGH) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Elsewhere (the Linux build): a second name is made for the file with `link`, which fails
+/// if the name is had and never replaces, and then its first name is removed. The new name
+/// comes with the whole file. (If the removal doesn't happen, the file under its first name
+/// is cleared by the next attempt, and never read.)
+#[cfg(not(windows))]
+fn place_new(from: &Path, to: &Path) -> std::io::Result<()> {
+    fs::hard_link(from, to)?;
+    let _ = fs::remove_file(from);
+    Ok(())
+}
+
+/// Makes the names in a file's folder, made or removed, outlast a power cut: the folder is
+/// synced (Linux).
+#[cfg(not(windows))]
+fn sync_folder(path: &Path) -> std::io::Result<()> {
+    let folder = path.parent().filter(|folder| !folder.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    fs::File::open(folder)?.sync_all()
+}
+
+/// Windows lets no ordinary program sync a folder. What stands for it is the move's
+/// `MOVEFILE_WRITE_THROUGH` (`place_new`).
+#[cfg(windows)]
+fn sync_folder(_: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 const KEYRING_SERVICE: &str = "Nexus Music";

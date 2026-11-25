@@ -221,7 +221,7 @@ pub fn run(client: &crate::subsonic::Client, index: &Index, paths: &[PathBuf]) -
         .playlists()
         .map_err(|e| e.to_string())?
         .into_iter()
-        .filter(|p| p.name != crate::sync::PLAYLIST_NAME && (p.owner.is_empty() || p.owner.to_lowercase() == mine))
+        .filter(|p| !crate::link::unlisted(&p.name) && (p.owner.is_empty() || p.owner.to_lowercase() == mine))
         .map(|p| (name_of(&p.name), p.id))
         .collect();
     let mut reports = Vec::new();
@@ -266,8 +266,8 @@ pub fn run(client: &crate::subsonic::Client, index: &Index, paths: &[PathBuf]) -
                 }
                 None => {
                     let ids: Vec<String> = found.iter().map(|(id, _)| id.clone()).collect();
-                    if nexus_core::step::reserved(&list.name) {
-                        return Err(nexus_core::step::RESERVED.to_string());
+                    if let Some(kept) = crate::link::kept_name(&list.name) {
+                        return Err(kept.to_string());
                     }
                     report.playlist = client.create_playlist(&list.name, &ids).map_err(|e| e.to_string())?.id;
                     report.added = found.len();
