@@ -72,7 +72,8 @@ fn work(waiting: Receiver<Job>) {
                 _ if superseded => {}
                 Job::Write(path, make) => {
                     if let Some(bytes) = make() {
-                        match crate::config::write_surely(&path, &bytes) {
+                        // In passing, as 0.40.10 wrote them (`config::Durable::InPassing`).
+                        match crate::config::write_in_passing(&path, &bytes) {
                             Ok(()) => failed.remove(&path),
                             Err(_) => failed.insert(path),
                         };

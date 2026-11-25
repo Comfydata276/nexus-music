@@ -895,8 +895,14 @@ impl Controller {
         self.edit_playlist(playlist, expected, edit);
     }
 
+    /// Saves the settings after a change the person made: flushed to the disk.
     pub fn save_settings(&self) {
         self.settings.borrow().save(&self.paths.settings);
+    }
+
+    /// Saves the settings in passing, as an exchange or a new queue starting does.
+    pub fn save_settings_in_passing(&self) {
+        self.settings.borrow().save_in_passing(&self.paths.settings);
     }
 
     // ---- start-up and sign-in ----------------------------------------------------------------

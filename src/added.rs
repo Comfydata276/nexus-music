@@ -52,9 +52,17 @@ impl Added {
         Added { path, kept }
     }
 
+    /// After an edit, an import, a playlist made or deleted here: flushed. What is noted on
+    /// a look at a playlist, or taken in from other devices, is saved in passing.
     fn save(&self) {
         if let Ok(json) = serde_json::to_vec(&self.kept) {
             let _ = crate::config::write_surely(&self.path, &json);
+        }
+    }
+
+    fn save_in_passing(&self) {
+        if let Ok(json) = serde_json::to_vec(&self.kept) {
+            let _ = crate::config::write_in_passing(&self.path, &json);
         }
     }
 
@@ -62,7 +70,7 @@ impl Added {
     /// added". Nothing it notes is shared.
     pub fn notice(&mut self, playlist: &str, songs: &[Song], now: i64) {
         if self.kept.notice(playlist, &ids(songs), now) {
-            self.save();
+            self.save_in_passing();
         }
     }
 
@@ -118,7 +126,7 @@ impl Added {
     pub fn merge(&mut self, theirs: &Notes) -> bool {
         let changed = self.kept.take(theirs);
         if changed {
-            self.save();
+            self.save_in_passing();
         }
         changed
     }

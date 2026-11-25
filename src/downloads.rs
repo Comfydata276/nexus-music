@@ -143,14 +143,17 @@ impl Downloads {
         }
     }
 
-    fn save(&mut self) {
+    /// Writes the list: flushed when a batch is over, or after a removal (`Durable`); in
+    /// passing while a batch is arriving.
+    fn save(&mut self, durable: crate::config::Durable) {
         if self.account.is_empty() {
             return;
         }
         // Only a list that is on the disk is no longer due (and one that isn't is tried
         // again a couple of seconds later, or at the end of the batch).
         if let Ok(json) = serde_json::to_vec(&self.entries) {
-            if crate::config::write_surely(&index_file(&self.dir, &self.account), &json).is_ok() {
+            let written = crate::config::write_whole(&index_file(&self.dir, &self.account), &json, durable, &crate::config::REPLACING);
+            if written.is_ok() {
                 self.unsaved = false;
             }
         }
@@ -162,7 +165,7 @@ impl Downloads {
     /// instead, and once more when the batch is over (`now`).
     pub fn save_if_due(&mut self, now: bool) {
         if self.unsaved && (now || self.saved_at.elapsed() > std::time::Duration::from_secs(2)) {
-            self.save();
+            self.save(if now { crate::config::Durable::Flushed } else { crate::config::Durable::InPassing });
         }
     }
 
@@ -277,7 +280,7 @@ impl Downloads {
             let _ = fs::remove_file(self.dir.join(file));
             self.entries.retain(|e| e.song.id != id);
             self.arrived.remove(id);
-            self.save();
+            self.save(crate::config::Durable::Flushed);
         }
     }
 }

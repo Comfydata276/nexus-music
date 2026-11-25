@@ -318,7 +318,7 @@ fn keep_first_by(settings: &Path, account: &str, version: &str, found: &str, ste
     let made = if path.is_file() {
         Err(std::io::ErrorKind::AlreadyExists.into())
     } else {
-        crate::config::write_whole(&path, found.as_bytes(), steps).and_then(|placed| match placed {
+        crate::config::write_whole(&path, found.as_bytes(), crate::config::Durable::Flushed, steps).and_then(|placed| match placed {
             crate::config::Placed::Synced => Ok(()),
             crate::config::Placed::Unsynced => (steps.sync_folder)(&path),
         })
@@ -651,7 +651,7 @@ impl Controller {
     /// changed them.
     fn tell(&self, told: &Told) {
         if told.save {
-            self.save_settings();
+            self.save_settings_in_passing();
         }
         if told.pins {
             self.show_playlists();

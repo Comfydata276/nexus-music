@@ -321,7 +321,7 @@ impl PlayLog {
         let lines: String = plays.iter().map(|(song, at)| line(song, *at, "")).collect();
         // In place, the log is the log; the list goes only once its name will outlast a
         // power cut (its folder synced), and is otherwise left, never to be read.
-        let placed = crate::config::write_whole(&self.path, lines.as_bytes(), steps)?;
+        let placed = crate::config::write_whole(&self.path, lines.as_bytes(), crate::config::Durable::Flushed, steps)?;
         if from_old && placed == crate::config::Placed::Synced {
             let _ = std::fs::remove_file(old);
         }

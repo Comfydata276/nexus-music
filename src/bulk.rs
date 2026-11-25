@@ -47,14 +47,14 @@ impl Place {
         Place { path: path.to_path_buf(), held: AtomicBool::new(false) }
     }
 
-    /// In passing: whole, or the batch as it was.
+    /// Its progress, in passing: whole, or the batch as it was, without waiting for the disk.
     fn keep(&self, json: Option<Vec<u8>>) {
         if self.held.load(Ordering::SeqCst) {
             return;
         }
         match json {
             None => drop(std::fs::remove_file(&self.path)),
-            Some(json) => drop(crate::config::write_surely(&self.path, &json)),
+            Some(json) => drop(crate::config::write_in_passing(&self.path, &json)),
         }
     }
 

@@ -515,9 +515,18 @@ impl Settings {
         (fresh(), Some(note))
     }
 
+    /// Saves the settings after a change the person made: flushed to the disk.
     pub fn save(&self, path: &Path) {
         if let Ok(json) = serde_json::to_vec_pretty(self) {
             let _ = write_surely(path, &json);
+        }
+    }
+
+    /// Saves the settings in passing, as an exchange or a new queue starting does: not
+    /// waiting for the disk (`Durable::InPassing`).
+    pub fn save_in_passing(&self, path: &Path) {
+        if let Ok(json) = serde_json::to_vec_pretty(self) {
+            let _ = write_in_passing(path, &json);
         }
     }
 
@@ -664,9 +673,11 @@ pub fn load_history(path: &Path) -> Vec<Played> {
     songs.into_iter().enumerate().map(|(index, song)| Played { song, at: newest - 200 * index as i64 }).collect()
 }
 
+/// Saves Recently played as a song starts, or as an exchange brings plays from elsewhere: in
+/// passing (`Durable::InPassing`).
 pub fn save_history(path: &Path, history: &[Played]) {
     if let Ok(json) = serde_json::to_vec(history) {
-        let _ = write_surely(path, &json);
+        let _ = write_in_passing(path, &json);
     }
 }
 
@@ -691,7 +702,19 @@ pub enum Placed {
     Unsynced,
 }
 
-pub fn write_whole(path: &Path, bytes: &[u8], steps: &Steps) -> std::io::Result<Placed> {
+/// Whether a write waits for the disk: the rule at the top of `docs/FILES.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Durable {
+    /// Made because the person just did something, or wanted on the disk before the app
+    /// acts on it: flushed before it is given its name, and its folder synced (Linux).
+    Flushed,
+    /// Made by a timer, or by playback moving on: renamed into place without a flush, as
+    /// 0.40.10 wrote everything. A kill leaves the old file or the new one; a power cut within
+    /// a few seconds of it can leave the name empty.
+    InPassing,
+}
+
+pub fn write_whole(path: &Path, bytes: &[u8], durable: Durable, steps: &Steps) -> std::io::Result<Placed> {
     use std::io::Write;
     // A new file, never one that is there: a name of a killed run's that came round again
     // (the same process number, and its count) is passed over for the next.
@@ -708,7 +731,9 @@ pub fn write_whole(path: &Path, bytes: &[u8], steps: &Steps) -> std::io::Result<
     };
     let placed = (|| {
         file.write_all(bytes)?;
-        (steps.flush)(&file)?;
+        if durable == Durable::Flushed {
+            (steps.flush)(&file)?;
+        }
         drop(file);
         (steps.place)(&temp, path)
     })();
@@ -717,6 +742,9 @@ pub fn write_whole(path: &Path, bytes: &[u8], steps: &Steps) -> std::io::Result<
         let _ = fs::remove_file(&temp);
     }
     placed?;
+    if durable == Durable::InPassing {
+        return Ok(Placed::Unsynced);
+    }
     Ok(if (steps.sync_folder)(path).is_ok() { Placed::Synced } else { Placed::Unsynced })
 }
 
@@ -724,7 +752,12 @@ pub fn write_whole(path: &Path, bytes: &[u8], steps: &Steps) -> std::io::Result<
 /// settings, the queue, what waits to be sent, ...). A caller that has nothing to do about a
 /// failure leaves the error be: the file is then as it was.
 pub fn write_surely(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    write_whole(path, bytes, &REPLACING).map(drop)
+    write_whole(path, bytes, Durable::Flushed, &REPLACING).map(drop)
+}
+
+/// `write_whole`, over whatever has the name, not waiting for the disk (`Durable::InPassing`).
+pub fn write_in_passing(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_whole(path, bytes, Durable::InPassing, &REPLACING).map(drop)
 }
 
 /// The name a write puts its file under, beside `path`, before it gives it the name: the
@@ -1059,7 +1092,7 @@ mod tests {
     /// Writes `bytes` over `path` and has the app "killed" where `steps` panic: what was done
     /// up to there stays on the disk, and nothing after it is done.
     fn killed(path: &Path, bytes: &str, steps: Steps) -> bool {
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| write_whole(path, bytes.as_bytes(), &steps))).is_err()
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| write_whole(path, bytes.as_bytes(), Durable::Flushed, &steps))).is_err()
     }
 
     #[test]
@@ -1114,7 +1147,7 @@ mod tests {
         }
         fs::write(&path, "as it was").unwrap();
         for steps in [Steps { flush: |_| fails(), ..REPLACING }, Steps { place: |_, _| fails(), ..REPLACING }] {
-            assert!(write_whole(&path, b"new", &steps).is_err());
+            assert!(write_whole(&path, b"new", Durable::Flushed, &steps).is_err());
             assert_eq!(fs::read_to_string(&path).unwrap(), "as it was");
             assert_eq!(names_in(&dir), ["pending.json"]);
         }
@@ -1122,7 +1155,7 @@ mod tests {
         // not "as it was": a caller that takes a change back on an error would otherwise
         // take back what is on the disk. (A caller that must know the name will outlast a
         // power cut is told that it may not.)
-        assert!(write_whole(&path, b"new", &Steps { sync_folder: |_| fails(), ..REPLACING }).is_ok());
+        assert!(write_whole(&path, b"new", Durable::Flushed, &Steps { sync_folder: |_| fails(), ..REPLACING }).is_ok());
         assert_eq!(fs::read_to_string(&path).unwrap(), "new");
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1152,7 +1185,7 @@ mod tests {
         }
 
         pub fn second(steps: &Steps) -> std::io::Result<()> {
-            write_whole(&dest(), SECOND, steps).map(drop)
+            write_whole(&dest(), SECOND, Durable::Flushed, steps).map(drop)
         }
 
         pub const AT_CREATE: Steps = Steps {
@@ -1216,14 +1249,14 @@ mod tests {
         // there whole, and nothing is left beside it.
         for (at, steps, last) in [("create", AT_CREATE, FIRST), ("flush", AT_FLUSH, FIRST), ("place", AT_PLACE, FIRST), ("inside", INSIDE, SECOND)] {
             fs::write(&path, "as it was").unwrap();
-            assert!(write_whole(&path, FIRST, &steps).is_ok(), "at {at}");
+            assert!(write_whole(&path, FIRST, Durable::Flushed, &steps).is_ok(), "at {at}");
             assert_eq!(fs::read(&path).unwrap(), last, "at {at}");
             assert_eq!(names_in(&dir), ["asking.json"], "at {at}");
         }
         // Made once (the kept copy, the start of the log): the second gives it the name
         // first, and the first finds it there, and leaves it.
         fs::remove_file(&path).unwrap();
-        let first = write_whole(&path, FIRST, &ONCE_RACED);
+        let first = write_whole(&path, FIRST, Durable::Flushed, &ONCE_RACED);
         assert_eq!(first.map_err(|error| error.kind()), Err(std::io::ErrorKind::AlreadyExists));
         assert_eq!(fs::read(&path).unwrap(), SECOND);
         assert_eq!(names_in(&dir), ["asking.json"]);
@@ -1231,8 +1264,26 @@ mod tests {
         // plays and the list from before it), written at once.
         let (log, list) = (dir.join("plays.log"), dir.join("plays.json"));
         DEST.with(|dest| *dest.borrow_mut() = list.clone());
-        assert!(write_whole(&log, FIRST, &AT_FLUSH).is_ok());
+        assert!(write_whole(&log, FIRST, Durable::Flushed, &AT_FLUSH).is_ok());
         assert_eq!((fs::read(&log).unwrap(), fs::read(&list).unwrap()), (FIRST.to_vec(), SECOND.to_vec()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_write_in_passing_is_renamed_into_place_without_waiting_for_the_disk() {
+        let dir = std::env::temp_dir().join(format!("nexus-in-passing-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.json");
+        fs::write(&path, "as it was").unwrap();
+        // Neither flushed nor its folder synced: whole at its name all the same, and said not
+        // to be synced.
+        let waits = Steps { flush: |_| panic!("flushed"), sync_folder: |_| panic!("synced"), ..REPLACING };
+        assert_eq!(write_whole(&path, b"new", Durable::InPassing, &waits).unwrap(), Placed::Unsynced);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new");
+        // Flushed, it is both.
+        let flushed = std::panic::catch_unwind(|| write_whole(&path, b"newer", Durable::Flushed, &waits));
+        assert!(flushed.is_err(), "a flushed write that didn't flush");
         let _ = fs::remove_dir_all(&dir);
     }
 
