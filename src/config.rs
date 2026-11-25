@@ -668,9 +668,12 @@ pub fn save_history(path: &Path, history: &[Played]) {
 
 /// **The one way the app writes a file it must not lose**, so that a kill or a power cut
 /// leaves either the file as it was or the file as it is now, never one cut short, and never
-/// an empty one: written beside its place (`beside`), flushed to the disk, given its name by
-/// `steps.place`, and its folder synced (Linux). What a stopped attempt left beside it is
-/// cleared first and never read. If any step fails, an error, and the file as it was.
+/// an empty one: written beside its place under a name of this write's own (`temp_for`),
+/// flushed to the disk, given its name by `steps.place`, and its folder synced (Linux). It
+/// renames only its own file, and removes only its own if a step fails; then it is an
+/// error, and the file as it was. What killed runs left beside it is never read, and is
+/// cleared when the app starts (`clear_leftovers`), never by a write in passing: it could
+/// be another write's, under way.
 ///
 /// Whether it may replace a file that has the name is the steps': `REPLACING` (`fs::rename`,
 /// for a file written again and again: `write_surely`) does, `ONCE` (for a file made once and
@@ -678,16 +681,20 @@ pub fn save_history(path: &Path, history: &[Played]) {
 /// does, and gives `AlreadyExists` instead.
 pub fn write_whole(path: &Path, bytes: &[u8], steps: &Steps) -> std::io::Result<()> {
     use std::io::Write;
-    let temp = beside(path);
-    // Removed, not written over: the next file there is a new one, so nothing else that
-    // names the old one (on Linux, the copy itself, if an attempt was stopped between the
-    // two steps of a move that doesn't replace) is written through it.
-    match fs::remove_file(&temp) {
-        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
-        _ => {}
-    }
+    // A new file, never one that is there: a name of a killed run's that came round again
+    // (the same process number, and its count) is passed over for the next.
+    let (temp, mut file) = {
+        let mut tries = 0;
+        loop {
+            let temp = temp_for(path);
+            match (steps.create)(&temp) {
+                Ok(file) => break (temp, file),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && tries < 8 => tries += 1,
+                Err(error) => return Err(error),
+            }
+        }
+    };
     let placed = (|| {
-        let mut file = (steps.create)(&temp)?;
         file.write_all(bytes)?;
         (steps.flush)(&file)?;
         drop(file);
@@ -708,10 +715,35 @@ pub fn write_surely(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     write_whole(path, bytes, &REPLACING)
 }
 
-/// The name beside a file's that it is written under before it is put in place.
-pub fn beside(path: &Path) -> PathBuf {
-    path.with_extension("tmp")
+/// The name a write puts its file under, beside `path`, before it gives it the name: the
+/// whole of `path`'s name, this process's number, and a count of this process's writes. No
+/// other write, here or in another copy of the app, makes the same one.
+pub fn temp_for(path: &Path) -> PathBuf {
+    static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let count = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+    path.with_file_name(format!("{name}.{}.{count}.tmp", std::process::id()))
 }
+
+/// Clears from `dir` what writes killed part-way left: files whose names end `.tmp` and
+/// start with one of `ours` (the names of the app's own files there). These are this
+/// version's names (`temp_for`) and the one name versions up to 0.40.10 used for each file
+/// (its stem, then `.tmp`). **Only when the app starts, before anything is written**: done
+/// later it could take a write's file from under it.
+pub fn clear_leftovers(dir: &Path, ours: &[&str]) {
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.ends_with(".tmp") && ours.iter().any(|own| name.starts_with(own)) && entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// The app's own files in the settings folder and the data folder, by how their names
+/// start (`clear_leftovers`).
+pub const SETTINGS_FILES: &[&str] = &["settings", "queue", "history", "pending", "playlist-added", "asked", "asking", "plays", "shared-record-kept-"];
+pub const DATA_FILES: &[&str] = &["crash"];
 
 /// The steps by which `write_whole` puts a file on the disk, given so that a test can have
 /// the app stopped at one of them, or have one fail. `ONCE` and `REPLACING` are the real
@@ -954,7 +986,6 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("queue.json");
-        let temp = beside(&path);
         fs::write(&path, "the old queue").unwrap();
         // Killed once the file beside it was made, and once it was written and not yet
         // renamed: the file is as it was.
@@ -969,12 +1000,18 @@ mod tests {
         assert_eq!(fs::read_to_string(&path).unwrap(), "the old queue");
         assert!(killed(&path, "the new queue", Steps { place: |_, _| panic!("killed"), ..REPLACING }));
         assert_eq!(fs::read_to_string(&path).unwrap(), "the old queue");
-        // What a kill left beside it, half written, is never read, and the next write
-        // clears it.
-        fs::write(&temp, "the new q").unwrap();
+        // What a killed run left beside it, half written, is never read; nor is it cleared
+        // by a write in passing (it could be another write's, under way), only when the app
+        // starts, before anything is written.
+        let left = [dir.join("queue.json.999999.0.tmp"), dir.join("queue.tmp")];
+        for left in &left {
+            fs::write(left, "the new q").unwrap();
+        }
         write_surely(&path, b"the new queue").unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "the new queue");
-        assert!(!temp.exists());
+        assert!(left.iter().all(|left| fs::read_to_string(left).unwrap() == "the new q"));
+        clear_leftovers(&dir, &["queue"]);
+        assert_eq!(names_in(&dir), ["queue.json"]);
         // The power goes the moment the new file has its name: it is the whole new file,
         // because it was flushed before it was given the name. (Not flushed, as
         // `write_atomically` did before, the name would be left with nothing in it.)
@@ -997,12 +1034,136 @@ mod tests {
         for steps in [Steps { flush: |_| fails(), ..REPLACING }, Steps { place: |_, _| fails(), ..REPLACING }] {
             assert!(write_whole(&path, b"new", &steps).is_err());
             assert_eq!(fs::read_to_string(&path).unwrap(), "as it was");
-            assert!(!beside(&path).exists());
+            assert_eq!(names_in(&dir), ["pending.json"]);
         }
         // Renamed, and its folder not synced (Linux): in place, and an error all the same,
         // for a caller that must know it will outlast a power cut.
         assert!(write_whole(&path, b"new", &Steps { sync_folder: |_| fails(), ..REPLACING }).is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), "new");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir).unwrap().map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        names
+    }
+
+    /// A second write of the same file, run whole while the first is at one of its steps.
+    mod two_writers {
+        use super::*;
+        use std::cell::RefCell;
+
+        thread_local! {
+            /// The file both write.
+            pub static DEST: RefCell<PathBuf> = RefCell::new(PathBuf::new());
+            static FIRST_PLACE: RefCell<Option<(PathBuf, PathBuf)>> = const { RefCell::new(None) };
+        }
+
+        pub const FIRST: &[u8] = b"the first write, whole";
+        pub const SECOND: &[u8] = b"the second write, whole";
+
+        fn dest() -> PathBuf {
+            DEST.with(|dest| dest.borrow().clone())
+        }
+
+        pub fn second(steps: &Steps) -> std::io::Result<()> {
+            write_whole(&dest(), SECOND, steps)
+        }
+
+        pub const AT_CREATE: Steps = Steps {
+            create: |path| {
+                let file = (REPLACING.create)(path)?;
+                second(&REPLACING)?;
+                Ok(file)
+            },
+            ..REPLACING
+        };
+        pub const AT_FLUSH: Steps = Steps {
+            flush: |file| {
+                (REPLACING.flush)(file)?;
+                second(&REPLACING)
+            },
+            ..REPLACING
+        };
+        pub const AT_PLACE: Steps = Steps {
+            place: |from, to| {
+                second(&REPLACING)?;
+                (REPLACING.place)(from, to)
+            },
+            ..REPLACING
+        };
+        /// The first gives its file its name in the middle of the second's write: once the
+        /// second has flushed its own, and before the second gives it the name.
+        pub const INSIDE: Steps = Steps {
+            place: |from, to| {
+                FIRST_PLACE.with(|first| *first.borrow_mut() = Some((from.to_path_buf(), to.to_path_buf())));
+                second(&Steps {
+                    flush: |file| {
+                        (REPLACING.flush)(file)?;
+                        let (from, to) = FIRST_PLACE.with(|first| first.borrow_mut().take()).unwrap();
+                        (REPLACING.place)(&from, &to)
+                    },
+                    ..REPLACING
+                })
+            },
+            ..REPLACING
+        };
+        /// Made once: the second is given the name while the first is flushing its own.
+        pub const ONCE_RACED: Steps = Steps {
+            flush: |file| {
+                (ONCE.flush)(file)?;
+                second(&ONCE)
+            },
+            ..ONCE
+        };
+    }
+
+    #[test]
+    fn two_writes_of_one_file_never_publish_each_others_bytes() {
+        use two_writers::*;
+        let dir = std::env::temp_dir().join(format!("nexus-two-writers-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("asking.json");
+        DEST.with(|dest| *dest.borrow_mut() = path.clone());
+        // Whichever step the first is at when the second runs, each writes only its own file
+        // and gives the name only its own: both are done, the one that gave the name last is
+        // there whole, and nothing is left beside it.
+        for (at, steps, last) in [("create", AT_CREATE, FIRST), ("flush", AT_FLUSH, FIRST), ("place", AT_PLACE, FIRST), ("inside", INSIDE, SECOND)] {
+            fs::write(&path, "as it was").unwrap();
+            assert!(write_whole(&path, FIRST, &steps).is_ok(), "at {at}");
+            assert_eq!(fs::read(&path).unwrap(), last, "at {at}");
+            assert_eq!(names_in(&dir), ["asking.json"], "at {at}");
+        }
+        // Made once (the kept copy, the start of the log): the second gives it the name
+        // first, and the first finds it there, and leaves it.
+        fs::remove_file(&path).unwrap();
+        let first = write_whole(&path, FIRST, &ONCE_RACED);
+        assert_eq!(first.map_err(|error| error.kind()), Err(std::io::ErrorKind::AlreadyExists));
+        assert_eq!(fs::read(&path).unwrap(), SECOND);
+        assert_eq!(names_in(&dir), ["asking.json"]);
+        // Two files of one name but for what follows the last dot, in one folder (the log of
+        // plays and the list from before it), written at once.
+        let (log, list) = (dir.join("plays.log"), dir.join("plays.json"));
+        DEST.with(|dest| *dest.borrow_mut() = list.clone());
+        assert!(write_whole(&log, FIRST, &AT_FLUSH).is_ok());
+        assert_eq!((fs::read(&log).unwrap(), fs::read(&list).unwrap()), (FIRST.to_vec(), SECOND.to_vec()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn what_killed_runs_left_is_cleared_at_the_start_and_nothing_else() {
+        let dir = std::env::temp_dir().join(format!("nexus-leftovers-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // What a run killed part-way through writing left: under this version's names, and
+        // the one name versions up to 0.40.10 used. And what isn't the app's to clear.
+        for name in ["asking.json", "asking.json.4242.17.tmp", "asking.tmp", "settings.json.1.0.tmp", "someone's notes.tmp", "asking.json.4242.17.tmp.txt"] {
+            fs::write(dir.join(name), "x").unwrap();
+        }
+        clear_leftovers(&dir, &["asking", "settings"]);
+        assert_eq!(names_in(&dir), ["asking.json", "asking.json.4242.17.tmp.txt", "someone's notes.tmp"]);
         let _ = fs::remove_dir_all(&dir);
     }
 

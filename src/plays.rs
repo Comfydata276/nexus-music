@@ -599,13 +599,15 @@ mod tests {
         std::fs::write(&path, "[\"a\",100]\n[\"b\",200]\n").unwrap();
         let mut log = PlayLog::load(&old, &[]);
         let told = [("b".to_string(), 200, "playlist:p".to_string())];
-        // The file can't be written again (a folder stands where its new text is put first).
-        let way = path.with_extension("tmp");
-        std::fs::create_dir_all(&way).unwrap();
+        // The file can't be written again (a folder stands where it is to be renamed to).
+        let away = path.with_extension("away");
+        std::fs::rename(&path, &away).unwrap();
+        std::fs::create_dir_all(&path).unwrap();
         assert!(log.keep(&[play("b", 200)], &told).is_err());
         assert!(sources().is_empty(), "the source is not known here while the file does not have it");
         // It can now: the source is asked about again, and this time it is in the file.
-        std::fs::remove_dir_all(&way).unwrap();
+        std::fs::remove_dir_all(&path).unwrap();
+        std::fs::rename(&away, &path).unwrap();
         assert_eq!(log.keep(&[play("b", 200)], &told).unwrap(), 0);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "[\"a\",100]\n[\"b\",200,\"playlist:p\"]\n");
         assert_eq!(sources(), told);
@@ -709,7 +711,8 @@ mod tests {
         use crate::config::{ONCE, Steps};
         let _turn = turn();
         let (old, path) = fresh("kill");
-        let beside = crate::config::beside(&path);
+        // What a killed run left beside it (as this version names it, and as 0.40.10 did).
+        let left = [path.with_file_name("plays.log.4242.0.tmp"), path.with_file_name("plays.tmp")];
         std::fs::write(&old, LIST).unwrap();
         // Killed the moment the file was made, empty, and again when it was written and
         // made sure of and not yet named: there is no log, and the list it is started from
@@ -728,12 +731,16 @@ mod tests {
         assert!(!path.exists(), "a log at its name before it was given it");
         assert_eq!(std::fs::read_to_string(&old).unwrap(), LIST);
         // What a kill left beside it, half written, is not the log: the next start makes
-        // the log whole, from the list, and clears it.
-        std::fs::write(&beside, "[\"a\",100]\n[\"b\",2").unwrap();
+        // the log whole, from the list, and never reads it. (The app clears it as it starts.)
+        for left in &left {
+            std::fs::write(left, "[\"a\",100]\n[\"b\",2").unwrap();
+        }
         let log = PlayLog::load(&old, &[play("z", 50)]);
         assert_eq!(shared(), [play("a", 100), play("b", 200), play("c", 300)]);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), LOGGED);
-        assert!(!old.exists() && !beside.exists() && log.note().is_none());
+        assert!(!old.exists() && log.note().is_none());
+        crate::config::clear_leftovers(path.parent().unwrap(), crate::config::SETTINGS_FILES);
+        assert!(left.iter().all(|left| !left.exists()) && path.exists());
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
@@ -748,7 +755,9 @@ mod tests {
         std::fs::write(&old, LIST).unwrap();
         for steps in [Steps { flush: |_| fails(), ..ONCE }, Steps { place: |_, _| fails(), ..ONCE }] {
             let mut log = PlayLog::load_by(&old, &[play("z", 50)], &steps);
-            assert!(!path.exists() && !crate::config::beside(&path).exists());
+            // Nothing at its name, and nothing of this start's beside it.
+            let names: Vec<String> = std::fs::read_dir(path.parent().unwrap()).unwrap().map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned()).filter(|name| name != "plays.log.new").collect();
+            assert_eq!(names, ["plays.json"]);
             // And says so, once, when the app has started.
             assert!(log.note().is_some_and(|note| note.contains("couldn't be started")));
             // What is played meanwhile is kept beside it, as for a log that can't be read.

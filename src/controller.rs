@@ -482,6 +482,13 @@ pub struct Controller {
 impl Controller {
     pub fn install(ui: ui::MainWindow) -> Rc<Controller> {
         let paths = Paths::new();
+        // What writes killed part-way left beside the app's files: cleared now, before
+        // anything is written (`config::clear_leftovers`).
+        for (dir, ours) in [(paths.settings.parent(), config::SETTINGS_FILES), (paths.crash_log.parent(), config::DATA_FILES)] {
+            if let Some(dir) = dir {
+                config::clear_leftovers(dir, ours);
+            }
+        }
         let (settings, settings_note) = Settings::load_checked(&paths.settings);
         let play_log = {
             let recent: Vec<(String, i64)> = config::load_history(&paths.history).into_iter().map(|played| (played.song.id, played.at)).collect();

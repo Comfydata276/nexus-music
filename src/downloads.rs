@@ -76,6 +76,15 @@ impl Downloads {
     /// Reads the downloads that belong to `account` (empty for nobody: signed out).
     pub fn load(dir: PathBuf, account: &str) -> Downloads {
         let _ = fs::create_dir_all(&dir);
+        // What writes of the lists killed part-way left: cleared the first time the folder
+        // is read in a run, before either list is written there (`config::clear_leftovers`).
+        static CLEARED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+        if let Ok(mut cleared) = CLEARED.lock() {
+            if !cleared.contains(&dir) {
+                crate::config::clear_leftovers(&dir, &["index-", "collections-"]);
+                cleared.push(dir.clone());
+            }
+        }
         if !account.is_empty() {
             // Before 0.29 there was one list for whoever was signed in. It becomes the list
             // of the first account to sign in after updating.

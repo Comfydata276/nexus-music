@@ -10,10 +10,12 @@ files whose reader still takes one that can't be read for none.
 
 How each is written:
 
-- **Whole** is `config::write_whole`: written beside its place (the same name ending `.tmp`),
-  flushed to the disk, renamed into place, and on Linux its folder synced. A kill or a power
-  cut leaves the old file or the new one. Whatever a stopped write left beside it is cleared
-  by the next and never read.
+- **Whole** is `config::write_whole`: written beside its place under a name of that write's
+  own (the file's whole name, the process's number, a count, then `.tmp`), flushed to the
+  disk, renamed into place, and on Linux its folder synced. A kill or a power cut leaves the
+  old file or the new one. Each write renames and removes only its own file. What a killed
+  run left beside a file is never read, and is cleared when the app next starts, before
+  anything is written.
 - **Whole, once** is the same with a move that never replaces a file of that name (on
   Windows `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING`, with `MOVEFILE_WRITE_THROUGH`;
   on Linux `link(2)`, then removing the first name). The file is there whole, or not at all.

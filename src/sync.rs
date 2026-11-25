@@ -318,9 +318,9 @@ fn keep_first_by(settings: &Path, account: &str, version: &str, found: &str, ste
     match made {
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && path.is_file() => {
             // There already (made by an earlier exchange, or by another attempt a moment
-            // ago). What a stopped attempt left beside it is not the copy, and goes. And the
-            // run that gave it its name may have stopped before its folder was synced.
-            let _ = std::fs::remove_file(crate::config::beside(&path));
+            // ago). What a stopped attempt left beside it is not the copy, and is cleared when
+            // the app next starts. And the run that gave it its name may have stopped before
+            // its folder was synced.
             (steps.sync_folder)(&path)
         }
         made => made,
@@ -1580,7 +1580,9 @@ mod tests {
     }
 
     const COPY: &str = "shared-record-kept-tester-0.40.8.json";
-    const BESIDE: &str = "shared-record-kept-tester-0.40.8.tmp";
+    /// What a killed run left beside the copy: under this version's name for it, and the
+    /// one 0.40.8 to 0.40.10 used.
+    const LEFT: [&str; 2] = ["shared-record-kept-tester-0.40.8.json.4242.0.tmp", "shared-record-kept-tester-0.40.8.tmp"];
     const FOUND: &str = r#"{"the record":"as it was found"}"#;
 
     #[test]
@@ -1588,7 +1590,8 @@ mod tests {
         use crate::config::{ONCE, Steps};
         let (dir, settings) = kept_scratch("kill");
         let read = |name: &str| std::fs::read_to_string(dir.join(name)).ok();
-        // Before anything is sent, the copy is at its name, whole, and nothing else is.
+        // Before anything is sent, the copy is at its name, whole. What killed runs left
+        // beside it is never read; it is cleared when the app starts.
         let next_exchange = || {
             let steps = Steps {
                 sync_folder: |path| {
@@ -1599,7 +1602,9 @@ mod tests {
                 ..ONCE
             };
             keep_first_by(&settings, "tester", "0.40.8", FOUND, &steps).unwrap();
-            assert_eq!((read(COPY).as_deref(), names_in(&dir)), (Some(FOUND), vec![COPY.to_string()]));
+            assert_eq!(read(COPY).as_deref(), Some(FOUND));
+            crate::config::clear_leftovers(&dir, crate::config::SETTINGS_FILES);
+            assert_eq!(names_in(&dir), vec![COPY.to_string()]);
             std::fs::remove_file(dir.join(COPY)).unwrap();
         };
 
@@ -1624,14 +1629,18 @@ mod tests {
         // What a kill leaves beside the copy's place is not the copy, read or kept: half
         // of it, or nothing at all.
         for left in [r#"{"the record":"as"#, ""] {
-            std::fs::write(dir.join(BESIDE), left).unwrap();
+            for name in LEFT {
+                std::fs::write(dir.join(name), left).unwrap();
+            }
             next_exchange();
         }
-        // Nor is it read when the copy is there already; it is cleared.
+        // Nor is it read when the copy is there already.
         keep_first(&settings, "tester", "0.40.8", FOUND).unwrap();
-        std::fs::write(dir.join(BESIDE), "half").unwrap();
+        for name in LEFT {
+            std::fs::write(dir.join(name), "half").unwrap();
+        }
         keep_first(&settings, "tester", "0.40.8", "what this version wrote").unwrap();
-        assert_eq!((read(COPY).as_deref(), names_in(&dir)), (Some(FOUND), vec![COPY.to_string()]));
+        assert_eq!(read(COPY).as_deref(), Some(FOUND));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
