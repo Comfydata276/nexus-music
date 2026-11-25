@@ -7,6 +7,7 @@
 
 pub mod http;
 pub mod listenbrainz;
+pub mod model;
 pub mod musicbrainz;
 pub mod notes;
 pub mod offer;
