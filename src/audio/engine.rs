@@ -1787,17 +1787,14 @@ mod tests {
 
     #[test]
     fn seeking_plays_on_from_where_it_was_asked() {
-        // Once the track is open, jump half-way: a quarter of a second is left. A seek in an
-        // MP3 lands on a packet, and a packet or two early at that (each needs the one before
-        // it to decode), so up to 50 ms more than that comes out.
+        // Once the track is open, jump half-way: a quarter of a second is left, and a little
+        // more (see `assert_plays_on_from`).
+        let mut landed = 0.0;
         let frames = played("seek", track(1, "f.mp3", MP3), |engine| {
-            let opened = Instant::now();
-            while engine.position().is_none() && opened.elapsed() < Duration::from_secs(5) {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            engine.seek(1, 0.25);
+            heard_from(engine);
+            landed = sought(engine, 0.25);
         });
-        assert!((12_000..=14_400).contains(&frames.len()), "{} frames came out", frames.len());
+        assert_plays_on_from(landed, frames.len());
     }
 
     #[test]
@@ -1852,16 +1849,48 @@ mod tests {
         engine.position().expect("the track was heard").1
     }
 
+    /// Seeks in track 1, which is open and not yet playing, and waits until the engine has
+    /// done it: gives where the seek landed.
+    ///
+    /// Playing must not start before that. A seek is carried out by the engine's own thread
+    /// a moment after it is asked for, and until then the beginning of the track is what is
+    /// waiting to be played: if playing starts first, the stand-in output takes a tick of it
+    /// (960 frames every 20 ms) for each tick that passes before the seek is done. These
+    /// cases used to seek and start playing in one breath, and count everything that came
+    /// out: 13,918 frames where the engine's thread was quick, and one tick more (14,878,
+    /// outside what they allowed) on a machine where the output's tick came first.
+    fn sought(engine: &Engine, secs: f64) -> f64 {
+        let before = engine.position().expect("the track is open").1;
+        engine.seek(1, secs);
+        let asked = Instant::now();
+        while engine.position().is_some_and(|(_, at)| at == before) && asked.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        engine.position().expect("the track is open").1
+    }
+
+    /// A seek to half-way through the half-second MP3 landed at `landed`, and `frames` were
+    /// heard from then on. A seek in an MP3 lands on a packet, and a packet or two early at
+    /// that (each needs the one before it to decode): so up to 50 ms before the quarter
+    /// second. What is heard is the rest of the file from where it landed, and nothing
+    /// else: nothing from before the seek, and no part of it twice.
+    fn assert_plays_on_from(landed: f64, frames: usize) {
+        assert!((0.2..=0.25).contains(&landed), "the seek landed at {landed}");
+        let rest = ((0.5 - landed) * 48_000.0).round() as usize;
+        assert!(frames.abs_diff(rest) <= 240, "{frames} frames came out after a seek that landed at {landed}: {rest} are left from there");
+    }
+
     #[test]
     fn a_conversion_the_server_sent_as_the_file_itself_is_sought_in_where_it_is() {
         // Seeking: in the file, by the engine, as for a file asked for as itself.
         let client = mp3_server(true, MP3);
+        let mut landed = 0.0;
         let frames = played_from("as-itself", client.clone(), conversion(&client, 0.0, MP3), |engine| {
             heard_from(engine);
             assert!(engine.seeks_in_place(1));
-            engine.seek(1, 0.25);
+            landed = sought(engine, 0.25);
         });
-        assert!((12_000..=14_400).contains(&frames.len()), "{} frames came out", frames.len());
+        assert_plays_on_from(landed, frames.len());
         // Asked to start a second in, the server sent it from the start, taking no notice:
         // the app goes there in the file itself (a packet or two early, as a seek in an MP3
         // does), and plays the rest of the song's 2.19 seconds.
@@ -1904,12 +1933,13 @@ mod tests {
         assert!(crate::songcache::ready(&kept), "{kept:?}");
         // Played from disk as a kept copy is (the client's server has nothing listening).
         let request = TrackRequest { local: Some(kept), ..track(1, "h.mp3", MP3) };
+        let mut landed = 0.0;
         let frames = played("kept-0401", request, |engine| {
             heard_from(engine);
             assert!(engine.seeks_in_place(1));
-            engine.seek(1, 0.25);
+            landed = sought(engine, 0.25);
         });
-        assert!((12_000..=14_400).contains(&frames.len()), "{} frames came out", frames.len());
+        assert_plays_on_from(landed, frames.len());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
