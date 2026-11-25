@@ -48,6 +48,13 @@ fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Whether a fault on the thread of this name is one the program outlives: only on the
+/// route's own threads, which are all named for it. Everywhere else a fault ends the
+/// program, as it did before the route existed.
+pub fn outlives_a_fault(thread: Option<&str>) -> bool {
+    thread.is_some_and(|name| name.starts_with("link-"))
+}
+
 /// For the tests: a token that makes the route fault while serving the request that shows
 /// it, and one that makes it fault with its rooms locked.
 #[cfg(test)]
@@ -653,26 +660,30 @@ pub fn listen(relay: Arc<Relay>, address: &str) -> std::io::Result<SocketAddr> {
                 std::thread::sleep(Duration::from_millis(50));
                 continue;
             };
-            // One connection too many is closed as it arrives. Nothing of it is read, and
-            // nothing is written to it.
-            if link.open.try_update(Ordering::SeqCst, Ordering::SeqCst, |open| (open < limits.connections).then_some(open + 1)).is_err() {
-                continue;
-            }
-            let conn = Conn { peer: stream.peer_addr().ok().map(|peer| peer.ip()), stream, open: link.open.clone() };
-            // With every thread busy and the queue full it is told so, in a few bytes that a
-            // new connection always has room for, and closed. Nothing of it is read.
-            if link.waiting.try_update(Ordering::SeqCst, Ordering::SeqCst, |waiting| (waiting < limits.queue).then_some(waiting + 1)).is_err() {
-                let body = json!({"error": "This relay is busy. Try again in a moment."}).to_string();
-                let mut conn = conn;
-                if conn.stream.set_nonblocking(true).is_ok() {
-                    let _ = conn.stream.write_all(format!("{}{body}", reply_head(503, body.len())).as_bytes());
-                }
-                continue;
-            }
-            link.queue(Job::Call(conn));
+            let _ = catch_unwind(AssertUnwindSafe(|| take(link, limits, stream)));
         }
     });
     Ok(at)
+}
+
+/// A connection arrives: it is counted and queued for a thread, or turned away.
+fn take(link: &Link, limits: &Limits, stream: TcpStream) {
+    // One connection too many is closed as it arrives. Nothing of it is read, and nothing
+    // is written to it.
+    if link.open.try_update(Ordering::SeqCst, Ordering::SeqCst, |open| (open < limits.connections).then_some(open + 1)).is_err() {
+        return;
+    }
+    let mut conn = Conn { peer: stream.peer_addr().ok().map(|peer| peer.ip()), stream, open: link.open.clone() };
+    // With every thread busy and the queue full it is told so, in a few bytes that a new
+    // connection always has room for, and closed. Nothing of it is read.
+    if link.waiting.try_update(Ordering::SeqCst, Ordering::SeqCst, |waiting| (waiting < limits.queue).then_some(waiting + 1)).is_err() {
+        let body = json!({"error": "This relay is busy. Try again in a moment."}).to_string();
+        if conn.stream.set_nonblocking(true).is_ok() {
+            let _ = conn.stream.write_all(format!("{}{body}", reply_head(503, body.len())).as_bytes());
+        }
+        return;
+    }
+    link.queue(Job::Call(conn));
 }
 
 /// One request, from its head to whatever is to be written for it.

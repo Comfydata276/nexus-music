@@ -13,6 +13,17 @@ use std::sync::Arc;
 use relay::{Config, Relay};
 
 fn main() {
+    // A fault anywhere but in the route devices link through ends the program at once, as
+    // it always has: the container is started again, and that is the plain thing to do
+    // when a jam's own code has gone wrong. A fault on one of the route's threads is caught
+    // there and outlived (see `relay::link`), so that nothing sent to the route can end a jam.
+    let ordinary = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |fault| {
+        ordinary(fault);
+        if !relay::link::outlives_a_fault(std::thread::current().name()) {
+            std::process::abort();
+        }
+    }));
     let setting = |name: &str| std::env::var(name).ok().map(|value| value.trim().to_string()).filter(|value| !value.is_empty());
     let listen = setting("JAM_LISTEN").unwrap_or_else(|| "0.0.0.0:8080".to_string());
     let public = setting("JAM_PUBLIC_URL").map(|address| address.trim_end_matches('/').to_string());

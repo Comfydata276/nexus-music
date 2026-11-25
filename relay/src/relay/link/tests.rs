@@ -507,6 +507,19 @@ fn a_body_of_the_wrong_shape_is_refused_and_ends_nothing() {
     assert_eq!(call(jams, "POST", "/api/host/start", "", json!({"name": "Jez"})).0, 200);
 }
 
+/// A fault is outlived only on the route's own threads. On any other it ends the program,
+/// as it did before the route existed.
+#[test]
+fn only_the_route_s_own_threads_outlive_a_fault() {
+    for name in ["link-0", "link-5", "link-sweeper", "link-listener"] {
+        assert!(outlives_a_fault(Some(name)), "{name}");
+    }
+    for name in ["worker-0", "worker-7", "sweeper", "main", "", "relink-0", "LINK-0"] {
+        assert!(!outlives_a_fault(Some(name)), "{name}");
+    }
+    assert!(!outlives_a_fault(None));
+}
+
 /// Whatever goes wrong in a request, the route goes on: the thread that was serving it
 /// answers 500 and takes the next, and a jam on the other port never knows. (The faults
 /// here are made by the test: nothing a sender can send is known to cause one.)
