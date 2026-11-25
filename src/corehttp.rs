@@ -9,6 +9,103 @@ use nexus_core::http::{BODY_LIMIT, Failure, Http, Method, Request, Response, Str
 
 pub struct Agent(pub ureq::Agent);
 
+/// What the app asks the public services through (MusicBrainz, ListenBrainz): an agent that
+/// lets go of a connection idle for longer than `idle`, and follows a redirect only by
+/// `Public`'s rule.
+pub fn public(idle: std::time::Duration) -> std::sync::Arc<dyn Http> {
+    std::sync::Arc::new(Public { inner: Box::new(Agent(crate::subsonic::make_agent_idle_without_redirects(idle))), resolve: resolve_name })
+}
+
+/// How many redirects in a row a public service's answer is followed through.
+const HOPS: usize = 5;
+
+/// A public service's requests, with its redirects followed by hand: only for a GET (a POST's
+/// answer is the answer, its redirect included), only from HTTPS to HTTPS, at most `HOPS` in a
+/// row, and never to an address on this machine or its network (loopback, link-local,
+/// private), whether written so or found so by looking the name up. A redirect that isn't
+/// followed is handed over as the answer.
+pub struct Public {
+    inner: Box<dyn Http>,
+    /// Looks a name up: the addresses a host and port lead to.
+    resolve: fn(&str, u16) -> Vec<std::net::IpAddr>,
+}
+
+fn resolve_name(host: &str, port: u16) -> Vec<std::net::IpAddr> {
+    use std::net::ToSocketAddrs;
+    (host, port).to_socket_addrs().map(|found| found.map(|address| address.ip()).collect()).unwrap_or_default()
+}
+
+/// An address on the open internet: not this machine, not its network, not one that isn't
+/// anywhere.
+fn far_away(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            !(v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified() || v4.is_broadcast() || (a == 100 && (64..128).contains(&b)))
+        }
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return far_away(IpAddr::V4(v4));
+            }
+            let first = v6.segments()[0];
+            !(v6.is_loopback() || v6.is_unspecified() || (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80)
+        }
+    }
+}
+
+impl Public {
+    /// Where a redirect from `from` to `location` leads, if it's to be followed.
+    fn next(&self, from: &str, location: &str) -> Option<String> {
+        let from: ureq::http::Uri = from.parse().ok()?;
+        if from.scheme_str()? != "https" {
+            return None;
+        }
+        let to = if location.starts_with('/') && !location.starts_with("//") {
+            format!("https://{}{location}", from.authority()?)
+        } else {
+            location.to_string()
+        };
+        let uri: ureq::http::Uri = to.parse().ok()?;
+        if !uri.scheme_str()?.eq_ignore_ascii_case("https") || uri.authority()?.as_str().contains('@') {
+            return None;
+        }
+        let host = uri.host()?.trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
+        if host == "localhost" || host.ends_with(".localhost") {
+            return None;
+        }
+        let addresses = match host.parse::<std::net::IpAddr>() {
+            Ok(ip) => vec![ip],
+            Err(_) => (self.resolve)(&host, uri.port_u16().unwrap_or(443)),
+        };
+        (!addresses.is_empty() && addresses.into_iter().all(far_away)).then_some(to)
+    }
+}
+
+impl Http for Public {
+    fn send(&self, request: &Request) -> Result<Response, Failure> {
+        let mut answer = self.inner.send(request)?;
+        if !matches!(request.method, Method::Get) {
+            return Ok(answer);
+        }
+        let mut url = request.url.to_string();
+        for _ in 0..HOPS {
+            if !matches!(answer.status, 301 | 302 | 303 | 307 | 308) {
+                break;
+            }
+            let Some(next) = answer.header("location").and_then(|to| self.next(&url, to)) else { break };
+            // The redirect's own body is let go of unread.
+            answer = self.inner.send(&Request { url: &next, ..request.clone() })?;
+            url = next;
+        }
+        Ok(answer)
+    }
+
+    fn pause(&self, wait: std::time::Duration) -> Result<(), Failure> {
+        self.inner.pause(wait)
+    }
+}
+
 impl Http for Agent {
     fn send(&self, request: &Request) -> Result<Response, Failure> {
         let unreachable = |e: ureq::Error| Failure::Reach(e.to_string());
@@ -229,6 +326,87 @@ mod tests {
             let theirs: Option<Person> = agent.get(&address).call().unwrap().into_body().read_json().ok();
             let ours: Option<Person> = Agent(agent).send(&Request::get(&address)).unwrap().json().ok();
             assert_eq!(ours, theirs, "for {:?}", String::from_utf8_lossy(&answer));
+        }
+    }
+
+    #[test]
+    fn the_public_services_redirects_are_followed_only_from_https_to_https() {
+        // A plain-HTTP answer that sends the caller elsewhere, here on this machine: not
+        // followed, for a GET or a POST; the redirect is the answer.
+        let asked = Arc::new(AtomicUsize::new(0));
+        let count = asked.clone();
+        let address = fake::server(move |path, _, stream| {
+            count.fetch_add(1, Ordering::SeqCst);
+            if path.starts_with("/moved") {
+                let _ = write!(stream, "HTTP/1.1 302 Found\r\nLocation: /here\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            } else if path.starts_with("/kept") {
+                let _ = write!(stream, "HTTP/1.1 307 Temporary Redirect\r\nLocation: /here\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            } else {
+                let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+            }
+        });
+        let public = super::public(Duration::from_secs(5));
+        let got = public.send(&Request::get(&format!("{address}/moved"))).unwrap();
+        assert_eq!((got.status, got.header("location")), (302, Some("/here")));
+        let body = "{\"recording_mbids\":[\"a\"]}";
+        let got = public.send(&Request { method: Method::Post(body), ..Request::get(&format!("{address}/moved")) }).unwrap();
+        assert_eq!(got.status, 302);
+        let got = public.send(&Request { method: Method::Post(body), ..Request::get(&format!("{address}/kept")) }).unwrap();
+        assert_eq!(got.status, 307);
+        assert_eq!(asked.load(Ordering::SeqCst), 3, "only the requests asked for were made");
+    }
+
+    /// A public service that answers each address with a redirect to the next one listed,
+    /// and the last with what was asked for; every request written down.
+    struct Hops {
+        to: Vec<(&'static str, &'static str)>,
+        asked: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl Http for Hops {
+        fn send(&self, request: &Request) -> Result<Response, Failure> {
+            self.asked.lock().unwrap().push(request.url.to_string());
+            Ok(match self.to.iter().find(|(from, _)| *from == request.url) {
+                Some((_, to)) => Response::new(302, vec![("Location".into(), Some(to.to_string()))], || Ok(String::new())),
+                None => Response::new(200, Vec::new(), || Ok("ok".into())),
+            })
+        }
+    }
+
+    /// Names resolve to addresses on the open internet, but for "inside.example", which
+    /// leads to one on the home network.
+    fn names(host: &str, _: u16) -> Vec<std::net::IpAddr> {
+        if host == "inside.example" { vec!["192.168.1.20".parse().unwrap()] } else { vec!["93.184.216.34".parse().unwrap()] }
+    }
+
+    fn hops(to: Vec<(&'static str, &'static str)>) -> (u16, Vec<String>) {
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let public = super::Public { inner: Box::new(Hops { to, asked: asked.clone() }), resolve: names };
+        let status = public.send(&Request::get("https://a.example/start")).unwrap().status;
+        let asked = asked.lock().unwrap().clone();
+        (status, asked)
+    }
+
+    #[test]
+    fn a_public_services_redirects_follow_the_rule() {
+        // Five redirects from HTTPS to HTTPS on the open internet are followed; a sixth isn't.
+        let five = vec![
+            ("https://a.example/start", "https://b.example/1"),
+            ("https://b.example/1", "/2"),
+            ("https://b.example/2", "https://c.example/3"),
+            ("https://c.example/3", "https://d.example/4"),
+            ("https://d.example/4", "https://e.example/5"),
+        ];
+        let (status, asked) = hops(five.clone());
+        assert_eq!((status, asked.last().map(String::as_str)), (200, Some("https://e.example/5")));
+        let mut six = five;
+        six.push(("https://e.example/5", "https://f.example/6"));
+        let (status, asked) = hops(six);
+        assert_eq!((status, asked.len()), (302, 6));
+        // Not to plain HTTP, nor anywhere on this machine or its network, written or looked up.
+        for to in ["http://b.example/", "https://127.0.0.1/", "https://[::1]/", "https://10.0.0.5/", "https://169.254.1.1/", "https://[fe80::1]/", "https://[fd00::1]/", "https://localhost/", "https://inside.example/", "https://user@b.example/"] {
+            let (status, asked) = hops(vec![("https://a.example/start", to)]);
+            assert_eq!((status, asked.len()), (302, 1), "a redirect to {to}");
         }
     }
 }

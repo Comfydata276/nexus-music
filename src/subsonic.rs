@@ -104,9 +104,10 @@ pub(crate) fn make_agent() -> ureq::Agent {
 }
 
 /// For a server that closes idle connections sooner than most: one kept longer than `idle`
-/// isn't used again.
-pub(crate) fn make_agent_idle(idle: Duration) -> ureq::Agent {
-    agent_following(10, idle)
+/// isn't used again. It follows no redirects: its caller does that by its own rules (see
+/// `corehttp::public`).
+pub(crate) fn make_agent_idle_without_redirects(idle: Duration) -> ureq::Agent {
+    agent_following(0, idle)
 }
 
 /// For callers that need to see where a redirect points instead of being taken there.
