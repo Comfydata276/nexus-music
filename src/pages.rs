@@ -542,41 +542,28 @@ fn outside_artist_extras(id: &str, page: &PageData) -> Option<PageData> {
     Some(page)
 }
 
-/// An album that isn't in the library: what's on it, and a button to ask for it.
+/// An album that isn't in the library: what's on it, and a button to ask for it (see
+/// `nexus_core::requests::album`).
 fn outside_album(id: &str) -> PageData {
     let Some(lidarr) = crate::lidarr::current() else { return requests_off("Album") };
-    let offer = crate::lidarr::offered(id)
-        .map(|offer| Ok(Some(offer)))
-        .unwrap_or_else(|| lidarr.find_any(&format!("lidarr:{id}")).map(|found| found.into_iter().find(|offer| offer.album == id)));
-    let offer = match offer {
-        Ok(Some(offer)) => offer,
-        Ok(None) => return PageData { label: "Album".into(), empty: "Lidarr doesn't list that one, so it can't be asked for.".into(), ..Default::default() },
-        Err(reason) => return PageData { label: "Album".into(), empty: reason, ..Default::default() },
+    // (Nothing on Windows stops a request, so "stopped" can't come of it.)
+    let found = match nexus_core::requests::album(services(&lidarr), crate::lidarr::offers(), id) {
+        Ok(nexus_core::requests::AlbumPage::Found(found)) => found,
+        Ok(nexus_core::requests::AlbumPage::Unavailable(reason)) => return PageData { label: "Album".into(), empty: reason, ..Default::default() },
+        Err(_) => return PageData { label: "Album".into(), ..Default::default() },
     };
-    crate::lidarr::remember(std::slice::from_ref(&offer));
-    let tracks = crate::musicbrainz::album_tracks(id);
-    let (songs, empty) = match tracks {
-        Ok(tracks) => (tracks, String::new()),
-        Err(reason) => (Vec::new(), format!("The list of songs couldn't be fetched. {reason}")),
-    };
-    let discs = songs.iter().map(|track| track.disc).max().unwrap_or(1);
-    let mut meta: Vec<String> = Vec::new();
-    if !offer.year.is_empty() {
-        meta.push(offer.year.clone());
-    }
-    if !songs.is_empty() {
-        meta.push(count(songs.len() as u32, "song"));
-    }
-    meta.push(if offer.requested { "Requested".into() } else { "Not in your library".into() });
+    let offer = found.offer;
+    let discs = found.tracks.iter().map(|track| track.disc).max().unwrap_or(1);
     PageData {
         label: offer.kind().into(),
         title: offer.title.clone(),
         subtitle: offer.artist.clone(),
         subtitle_route: if offer.artist_id.is_empty() { String::new() } else { format!("outside-artist:{}", offer.artist_id) },
-        meta: meta.join(" • "),
-        cover: if offer.cover.is_empty() { crate::musicbrainz::cover(id) } else { offer.cover.clone() },
-        action: if offer.requested { "Requested".into() } else { format!("Request {}", offer.kind_word()) },
-        songs: songs
+        meta: found.about,
+        cover: found.cover,
+        action: found.action,
+        songs: found
+            .tracks
             .into_iter()
             .map(|track| Song {
                 title: track.title,
@@ -590,7 +577,7 @@ fn outside_album(id: &str) -> PageData {
         show_number: true,
         album_numbers: true,
         disc_sections: discs > 1,
-        empty,
+        empty: found.tracks_failed,
         artist_id: offer.artist_id,
         ..Default::default()
     }

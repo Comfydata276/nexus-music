@@ -8,7 +8,7 @@
 use std::sync::{Arc, OnceLock};
 
 use nexus_core::musicbrainz::{MusicBrainz, THEIR_IDLE};
-pub use nexus_core::musicbrainz::{SongOffer, TrackName, base, cover, same_words, words};
+pub use nexus_core::musicbrainz::{SongOffer, base, cover, same_words, words};
 
 use crate::lidarr::Offer;
 
@@ -43,10 +43,6 @@ pub fn artist_releases(artist: &str, singles: bool) -> Result<(String, Vec<Offer
     service().artist_releases(artist, singles)
 }
 
-/// The songs on an album.
-pub fn album_tracks(album: &str) -> Result<Vec<TrackName>, String> {
-    service().album_tracks(album)
-}
 
 #[cfg(test)]
 mod live {

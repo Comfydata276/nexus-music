@@ -20,7 +20,7 @@ use crate::asked::Asked;
 use crate::http::STOPPED;
 use crate::lidarr::{ArtistOffer, Lidarr, Offers};
 use crate::listenbrainz::{ListenBrainz, TopSong};
-use crate::musicbrainz::{MusicBrainz, SongOffer};
+use crate::musicbrainz::{MusicBrainz, SongOffer, TrackName};
 use crate::offer::Offer;
 use crate::text::{base, fold, same_artist, same_words, words};
 
@@ -604,6 +604,70 @@ pub fn artist_popular(
     }))
 }
 
+// ---- an album beyond the library -------------------------------------------------------------------
+
+/// Said of an album Lidarr has no record of.
+pub const NOT_LISTED: &str = "Lidarr doesn't list that one, so it can't be asked for.";
+
+/// An album that isn't in the library, as its page shows it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OutsideAlbum {
+    pub offer: Offer,
+    pub cover: String,
+    pub tracks: Vec<TrackName>,
+    /// Why the songs couldn't be listed, if they couldn't.
+    pub tracks_failed: String,
+    /// What's said of it under its name ("2019 • 12 songs • Not in your library").
+    pub about: String,
+    /// "Request album" (or EP, single), or "Requested".
+    pub action: String,
+}
+
+/// What an album's page comes to.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum AlbumPage {
+    Found(OutsideAlbum),
+    /// It can't be shown, and this says why (`NOT_LISTED`, or why Lidarr couldn't be asked).
+    Unavailable(String),
+}
+
+/// An album that isn't in the library: what's on it, and whether it can be asked for. `id`
+/// is Lidarr's (and MusicBrainz's) name for it.
+pub fn album(services: Services, offers: &Offers, id: &str) -> Result<AlbumPage, Stopped> {
+    let offer = match offers.offered(id) {
+        Some(offer) => Ok(Some(offer)),
+        None => unless_stopped(services.lidarr.find_any(&format!("lidarr:{id}")))?.map(|found| found.into_iter().find(|offer| offer.album == id)),
+    };
+    let offer = match offer {
+        Ok(Some(offer)) => offer,
+        Ok(None) => return Ok(AlbumPage::Unavailable(NOT_LISTED.into())),
+        Err(reason) => return Ok(AlbumPage::Unavailable(reason)),
+    };
+    offers.remember(std::slice::from_ref(&offer));
+    let tracks = unless_stopped(services.musicbrainz.album_tracks(id))?;
+    let (songs, empty) = match tracks {
+        Ok(tracks) => (tracks, String::new()),
+        Err(reason) => (Vec::new(), format!("The list of songs couldn't be fetched. {reason}")),
+    };
+    let mut meta: Vec<String> = Vec::new();
+    if !offer.year.is_empty() {
+        meta.push(offer.year.clone());
+    }
+    if !songs.is_empty() {
+        meta.push(count(songs.len(), "song"));
+    }
+    meta.push(if offer.requested { "Requested".into() } else { "Not in your library".into() });
+    Ok(AlbumPage::Found(OutsideAlbum {
+        about: meta.join(" • "),
+        cover: if offer.cover.is_empty() { crate::musicbrainz::cover(id) } else { offer.cover.clone() },
+        action: if offer.requested { "Requested".into() } else { format!("Request {}", offer.kind_word()) },
+        tracks: songs,
+        tracks_failed: empty,
+        offer,
+    }))
+}
+
 /// "1 album", "3 albums": a number of things.
 pub fn count(n: usize, noun: &str) -> String {
     if n == 1 { format!("1 {noun}") } else { format!("{n} {noun}s") }
@@ -757,5 +821,24 @@ mod tests {
         for stop_after in 0..all {
             assert_eq!(asking(MARROW_LAKE, stop_after, popular).0, Err(Stopped), "popular, stopped after {stop_after} of {all}");
         }
+    }
+
+    #[test]
+    fn an_albums_page_and_when_it_is_stopped() {
+        fn page(services: Services) -> Result<AlbumPage, Stopped> {
+            album(services, &Offers::new(), "rg-9")
+        }
+        const ROUTES: &[(&str, &str)] = &[
+            ("album/lookup?term=lidarr%3Arg-9", r#"[{"title":"Nine","foreignAlbumId":"rg-9","albumType":"EP","releaseDate":"2019-01-01","artist":{"artistName":"Someone","foreignArtistId":"so"}}]"#),
+            ("release?release-group=rg-9", r#"{"releases":[{"media":[{"position":1,"tracks":[{"title":"One","length":100000,"position":1}]}]}]}"#),
+        ];
+        let (found, all) = asking(ROUTES, usize::MAX, page);
+        let Ok(AlbumPage::Found(found)) = found else { panic!("{found:?}") };
+        assert_eq!((found.about.as_str(), found.action.as_str(), found.tracks.len()), ("2019 • 1 song • Not in your library", "Request EP", 1));
+        assert_eq!(all, 2);
+        for stop_after in 0..all {
+            assert_eq!(asking(ROUTES, stop_after, page).0, Err(Stopped), "stopped after {stop_after}");
+        }
+        assert_eq!(asking(&[], usize::MAX, page).0, Ok(AlbumPage::Unavailable(NOT_LISTED.into())));
     }
 }
