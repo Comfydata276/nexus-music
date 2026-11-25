@@ -646,6 +646,7 @@ impl Client {
     /// The playlists as the server states them, for keeping devices in step (see `sync`):
     /// an owner or a comment the answer leaves out is `None`, not empty. With the server's
     /// clock.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn playlists_stated(&self) -> ApiResult<Timed<Vec<Stated>>> {
         #[derive(Deserialize, Default)]
         #[serde(default)]
@@ -654,6 +655,25 @@ impl Client {
         }
         let answer = self.call_timed::<Wrap>(CLIENT_NAME, "getPlaylists", &[], Some("playlists"), API_TIMEOUT)?;
         Ok(Timed { value: answer.value.playlist, date: answer.date, received: answer.received })
+    }
+
+    /// The list of playlists, **asked for once and read both ways**: as the server states
+    /// them ([`Client::playlists_stated`]) and as the app lists them
+    /// ([`Client::playlists`]). A look at what other devices have changed wants both, and
+    /// they are the same request. The second reading takes nothing from the first: if the
+    /// answer can't be read as the app lists playlists, that half is `None` and the stated
+    /// half stands, exactly as it would have asked by itself.
+    pub fn playlists_both(&self) -> ApiResult<(Option<Vec<Playlist>>, Timed<Vec<Stated>>)> {
+        #[derive(Deserialize, Default)]
+        #[serde(default)]
+        struct Wrap {
+            playlist: Vec<serde_json::Value>,
+        }
+        let answer = self.call_timed::<Wrap>(CLIENT_NAME, "getPlaylists", &[], Some("playlists"), API_TIMEOUT)?;
+        let all = serde_json::Value::Array(answer.value.playlist);
+        let stated: Vec<Stated> =
+            serde_json::from_value(all.clone()).map_err(|e| ApiError::NotSubsonic(format!("Unexpected response from getPlaylists: {e}")))?;
+        Ok((serde_json::from_value(all).ok(), Timed { value: stated, date: answer.date, received: answer.received }))
     }
 
     /// One playlist as the server states it, without its songs.
