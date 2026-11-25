@@ -428,6 +428,40 @@ impl Short<'_> {
     }
 }
 
+/// Who may do how much, how often, on the route: each key has an allowance that refills
+/// over time. The route's own, and locked by nothing but the route: counting what is done
+/// here, wrong host keys among it, cannot slow a jam or lock a jam's host out.
+#[derive(Default)]
+struct Allowances {
+    buckets: HashMap<String, (f64, Instant)>,
+}
+
+/// The most keys counted at once. The keys are places and callers' addresses, which a
+/// sender can make up any number of.
+const MOST_COUNTED: usize = 4096;
+
+impl Allowances {
+    fn allow(&mut self, key: &str, capacity: f64, per_second: f64, now: Instant) -> bool {
+        if !self.buckets.contains_key(key) && self.buckets.len() >= MOST_COUNTED {
+            self.forget_idle(now);
+            // Still as many as are counted: this one is not let through uncounted.
+            if self.buckets.len() >= MOST_COUNTED {
+                return false;
+            }
+        }
+        let (left, at) = self.buckets.get(key).copied().unwrap_or((capacity, now));
+        let left = (left + now.saturating_duration_since(at).as_secs_f64() * per_second).min(capacity);
+        let allowed = left >= 1.0;
+        self.buckets.insert(key.to_string(), (if allowed { left - 1.0 } else { left }, now));
+        allowed
+    }
+
+    /// Forgets the keys that have their whole allowance back: ten minutes unused.
+    fn forget_idle(&mut self, now: Instant) {
+        self.buckets.retain(|_, (_, at)| now.saturating_duration_since(*at) < Duration::from_secs(600));
+    }
+}
+
 // ---- rooms -------------------------------------------------------------------------------
 
 struct Frame {
@@ -562,6 +596,7 @@ enum Job {
 #[derive(Default)]
 pub struct Link {
     rooms: Mutex<HashMap<String, Room>>,
+    allowances: Mutex<Allowances>,
     jobs: Mutex<VecDeque<Job>>,
     wake: Condvar,
     waiting: AtomicUsize,
@@ -579,6 +614,11 @@ impl Link {
     /// Whether the route is being served: what `/api/hello` goes by.
     pub fn listening(&self) -> bool {
         locked(&self.at).is_some()
+    }
+
+    /// Whether one more of what `key` names may be done now.
+    fn allow(&self, key: &str, capacity: f64, per_second: f64) -> bool {
+        locked(&self.allowances).allow(key, capacity, per_second, Instant::now())
     }
 
     /// Sets `bytes` aside from what may be being written at once, if there is that much.
@@ -734,8 +774,13 @@ pub fn listen(relay: Arc<Relay>, address: &str) -> std::io::Result<SocketAddr> {
     {
         let relay = relay.clone();
         start("link-sweeper".into(), Box::new(move || {
+            let mut rounds = 0u32;
             loop {
                 std::thread::sleep(Duration::from_millis(250));
+                rounds = rounds.wrapping_add(1);
+                if rounds % 240 == 0 {
+                    locked(&relay.link.allowances).forget_idle(Instant::now());
+                }
                 // It writes nothing itself: what it finds to answer goes to the route's threads.
                 // And whatever goes wrong in one round, there is a next.
                 let _ = catch_unwind(AssertUnwindSafe(|| {
@@ -825,12 +870,14 @@ fn call(relay: &Relay, mut conn: Conn, out: &mut Vec<Answer>) {
     }
 }
 
-/// Whether the host key shown is the right one. Wrong guesses are counted with the jams'.
+/// Whether the host key shown is the right one. Wrong guesses are counted, across everyone
+/// who guesses here, so the key can't be found by trying; and counted apart from wrong
+/// guesses where jams are served, so that guessing here locks nobody out there.
 fn host_key_ok(relay: &Relay, shown: &str) -> Result<(), (u16, &'static str)> {
     if same(shown.as_bytes(), relay.config.host_key.as_bytes()) {
         return Ok(());
     }
-    if !relay.allow("wrong-host-key", 10.0, 10.0 / 60.0) {
+    if !relay.link.allow("wrong-host-key", 10.0, 10.0 / 60.0) {
         return Err((429, "Too many wrong host keys. Wait a minute."));
     }
     Err((401, "That host link isn't right for this relay."))
@@ -971,7 +1018,7 @@ fn number(query: &str, field: &str) -> u64 {
 fn enter(relay: &Relay, mut conn: Conn, mut asked: Asked, out: &mut Vec<Answer>) {
     let (link, limits) = (&relay.link, &relay.config.link);
     let address = caller(relay, &conn, &asked);
-    if !relay.allow(&format!("link-enter:{address}"), limits.enters, limits.enters / 60.0) {
+    if !link.allow(&format!("enter:{address}"), limits.enters, limits.enters / 60.0) {
         return link.say(conn, 429, "Too many arrivals from this address. Wait a moment.", limits, out);
     }
     let body = match read_body(&mut conn, &mut asked, limits.body_wait) {
@@ -1039,7 +1086,7 @@ fn send(relay: &Relay, mut conn: Conn, mut asked: Asked, out: &mut Vec<Answer>) 
     };
     let Some(from) = from else { return link.say(conn, 404, "Enter the room first.", limits, out) };
     let address = caller(relay, &conn, &asked);
-    if !relay.allow(&format!("link-send:{name}:{from}"), limits.sends.0, limits.sends.1) || !relay.allow(&format!("link-sends:{address}"), limits.sends_per_address, limits.sends_per_address) {
+    if !link.allow(&format!("send:{name}:{from}"), limits.sends.0, limits.sends.1) || !link.allow(&format!("sends:{address}"), limits.sends_per_address, limits.sends_per_address) {
         return link.say(conn, 429, "Too much is being sent. Wait a moment.", limits, out);
     }
     // The body is read only now: its sender holds the host key and a place.

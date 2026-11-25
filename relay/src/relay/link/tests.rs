@@ -666,6 +666,46 @@ fn a_route_that_did_not_start_is_not_offered() {
     assert_eq!(call(started.unwrap(), "POST", &format!("/api/link/{ROOM}/enter"), "", json!({"place": PC})).0, 200);
 }
 
+/// What is counted on the route is counted there and nowhere else.
+#[test]
+fn hammering_the_route_with_wrong_keys_locks_no_jam_s_host_out() {
+    let (to, jams, _) = relay_with_jams(|_| {});
+    let wrong = |at: SocketAddr, path: &str| raw(at, "POST", path, &[("Authorization", "Bearer not-the-host-key-at-all")], b"{}", Some(2)).0;
+    let route = format!("/api/link/{ROOM}/enter");
+    // Ten wrong guesses at the route are told so; after that they are told to wait.
+    let guesses: Vec<u16> = (0..40).map(|_| wrong(to, &route)).collect();
+    assert_eq!((guesses[..10].iter().all(|status| *status == 401), guesses[10..].iter().all(|status| *status == 429)), (true, true), "{guesses:?}");
+    // Where jams are served, nothing has been counted: a wrong key is still simply wrong,
+    // and the right one starts a jam.
+    assert_eq!(wrong(jams, "/api/host/start"), 401);
+    assert_eq!(call(jams, "POST", "/api/host/start", "", json!({"name": "Jez"})).0, 200);
+    assert_eq!(call(jams, "GET", "/api/hello", "", Value::Null).1["host"], true);
+    // And the other way about: guesses where jams are served are not counted on the route.
+    let (to, jams, _) = relay_with_jams(|_| {});
+    let guesses: Vec<u16> = (0..40).map(|_| wrong(jams, "/api/host/start")).collect();
+    assert_eq!(guesses.iter().filter(|status| **status == 429).count(), 30, "{guesses:?}");
+    assert_eq!(wrong(to, &route), 401);
+    enter(to, ROOM, PC);
+}
+
+/// A sender can make up any number of places and addresses to be counted under. Only so
+/// many are, and one more is not let through uncounted.
+#[test]
+fn only_so_many_callers_are_counted_at_once() {
+    let mut allowances = Allowances::default();
+    let now = Instant::now();
+    for n in 0..MOST_COUNTED {
+        assert!(allowances.allow(&format!("enter:{n}"), 2.0, 0.0, now));
+    }
+    assert!(!allowances.allow("enter:one more", 2.0, 0.0, now));
+    // One that is counted already still has its own allowance, and no more.
+    assert!(allowances.allow("enter:7", 2.0, 0.0, now) && !allowances.allow("enter:7", 2.0, 0.0, now));
+    // Ten minutes on, the idle ones are forgotten and there is room again.
+    let later = now + Duration::from_secs(601);
+    assert!(allowances.allow("enter:one more", 2.0, 0.0, later));
+    assert_eq!(allowances.buckets.len(), 1);
+}
+
 /// A request is refused before any of its body is read if the body is not one the route
 /// will take, and the connection is closed, not read to its end.
 #[test]
