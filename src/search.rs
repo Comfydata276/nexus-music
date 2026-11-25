@@ -144,134 +144,11 @@ pub struct Results {
     pub artist_first: bool,
 }
 
+// How names are folded and how a match is scored are the library's; going through this
+// PC's copy of the library with them is below.
+pub use nexus_core::search::slips;
+use nexus_core::search::{likeness, rate};
 pub use nexus_core::text::fold;
-
-/// How many single-letter slips (a letter wrong, missing, extra, or two swapped) separate
-/// two words; anything over `limit` comes back as `limit + 1`.
-pub fn slips(a: &[char], b: &[char], limit: usize) -> usize {
-    if a.len().abs_diff(b.len()) > limit {
-        return limit + 1;
-    }
-    let mut before: Vec<usize> = vec![0; b.len() + 1];
-    let mut previous: Vec<usize> = (0..=b.len()).collect();
-    let mut current: Vec<usize> = vec![0; b.len() + 1];
-    for i in 1..=a.len() {
-        current[0] = i;
-        let mut least = current[0];
-        for j in 1..=b.len() {
-            let cost = usize::from(a[i - 1] != b[j - 1]);
-            let mut best = (previous[j] + 1).min(current[j - 1] + 1).min(previous[j - 1] + cost);
-            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
-                best = best.min(before[j - 2] + 1);
-            }
-            current[j] = best;
-            least = least.min(best);
-        }
-        if least > limit {
-            return limit + 1;
-        }
-        std::mem::swap(&mut before, &mut previous);
-        std::mem::swap(&mut previous, &mut current);
-    }
-    previous[b.len()].min(limit + 1)
-}
-
-/// How well a typed word matches a word from the library, from 0 (not at all) to 1 (the
-/// same word). The start of a word counts nearly as much, since the rest may yet be typed;
-/// a slip or two is forgiven in words long enough for that not to match everything.
-fn likeness(typed: &[char], word: &[char]) -> f32 {
-    if typed == word {
-        return 1.0;
-    }
-    if word.starts_with(typed) {
-        return 0.85 + 0.1 * typed.len() as f32 / word.len() as f32;
-    }
-    let limit = match typed.len() {
-        0..=3 => return 0.0,
-        4..=7 => 1,
-        _ => 2,
-    };
-    // A short word is only taken for a mistyping of one that starts the same way. Without
-    // that, four or five letters are near enough to a good many words that have nothing to
-    // do with them: "home" would find "Someday".
-    if typed.len() <= 5 && typed.first() != word.first() {
-        return 0.0;
-    }
-    let whole = slips(typed, word, limit);
-    if whole <= limit {
-        return if whole == 1 { 0.75 } else { 0.6 };
-    }
-    // A mistyped start of a longer word: "masi" for "maisie".
-    let mut best = limit + 1;
-    for length in typed.len().saturating_sub(1)..=(typed.len() + 1).min(word.len().saturating_sub(1)) {
-        best = best.min(slips(typed, &word[..length], limit));
-    }
-    // Worth much less than a whole word that's nearly right: it's a guess on a guess.
-    match best {
-        1 => 0.4,
-        2 if limit == 2 => 0.3,
-        _ => 0.0,
-    }
-}
-
-/// One thing's match against what was typed.
-#[derive(Default, Clone, Copy)]
-struct Match {
-    /// Overall, counting every field.
-    score: f32,
-    /// Counting the name (or title) alone; 0 if some typed word isn't in it.
-    name: f32,
-}
-
-/// Scores something whose name is `name` and which also answers to `others` (an artist's or
-/// album's words, each with how much they count), against the typed words. `scores[i][w]`
-/// is how well typed word `i` matches library word `w`.
-fn rate(scores: &[Vec<f32>], name: &[u32], others: &[(&[u32], f32)]) -> Option<Match> {
-    let mut total = 0.0;
-    let mut name_total = 0.0;
-    let mut in_name = true;
-    // Which of the name's words were what a typed word matched best.
-    let mut used = 0u64;
-    for typed in scores {
-        let (mut best_name, mut at) = (0.0f32, usize::MAX);
-        for (position, &word) in name.iter().enumerate() {
-            if typed[word as usize] > best_name {
-                best_name = typed[word as usize];
-                at = position;
-            }
-        }
-        let mut best = best_name;
-        for (words, weight) in others {
-            for &word in *words {
-                best = best.max(typed[word as usize] * weight);
-            }
-        }
-        if best <= 0.0 {
-            return None;
-        }
-        total += best;
-        if best_name > 0.0 {
-            name_total += best_name;
-            if best_name >= best && at < 64 {
-                used |= 1 << at;
-            }
-        } else {
-            in_name = false;
-        }
-    }
-    let typed = scores.len() as f32;
-    // Bonuses for the typed words making up more of the name: all of it, or its start.
-    let covered = if name.is_empty() { 0.0 } else { used.count_ones() as f32 / name.len() as f32 };
-    let in_order = name.len() >= scores.len() && scores.iter().zip(name).all(|(typed, &word)| typed[word as usize] >= 0.85);
-    let exact = in_order && name.len() == scores.len() && scores.iter().zip(name).all(|(typed, &word)| typed[word as usize] >= 1.0);
-    let bonus = 0.3 * covered + if exact { 0.5 } else { 0.0 } + if in_order { 0.2 } else { 0.0 };
-    // ...which counts for less the shakier the match with the name is.
-    let bonus = bonus * name_total / typed;
-    Some(Match {
-        score: total / typed + bonus,
-        name: if in_name { name_total / typed + bonus } else { 0.0 },
-    })
-}
 
 impl Index {
     pub fn new(library: Library) -> Index {
@@ -567,15 +444,6 @@ mod tests {
         assert!(found.songs.is_empty() && found.albums.is_empty(), "{:?}", titles(&found.songs));
         let found = library().search("masi", &|_| false, 5, 5, 5);
         assert_eq!(found.artists.first().map(|artist| artist.title.as_str()), Some("Maisie Peters"));
-    }
-
-    #[test]
-    fn counts_slips() {
-        let chars = |text: &str| text.chars().collect::<Vec<char>>();
-        assert_eq!(slips(&chars("masie"), &chars("maisie"), 2), 1);
-        assert_eq!(slips(&chars("pyscho"), &chars("psycho"), 2), 1);
-        assert_eq!(slips(&chars("queen"), &chars("queen"), 1), 0);
-        assert_eq!(slips(&chars("abc"), &chars("xyz"), 1), 2);
     }
 
     #[test]
