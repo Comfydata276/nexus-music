@@ -185,10 +185,27 @@ impl Prepared {
 }
 
 impl QueueOwner {
-    /// The queue changed here, or was played on: whatever it was, it is this PC's own now.
-    pub fn changed_here(&self) {
+    /// **The person did something to the queue, or to playing it, here**: whatever it was
+    /// before, it is this PC's own from this moment. Said at the press itself
+    /// (`Controller::pressing`), not found out afterwards from the queue looking different:
+    /// a seek while paused, or Play and then Pause inside a second, changes nothing a look
+    /// at the queue would notice. And it is another queue for anything waiting to be saved.
+    pub fn claimed(&self) {
         *self.taken.borrow_mut() = None;
         self.revision.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// The queue looks different from when it was last noted, and no press made it so: a
+    /// song played on, the next one began, similar songs were added at the end. **That
+    /// claims nothing.** Says whether the queue is this PC's own, and so whether this is a
+    /// change to save; one taken up from another device and left alone is still that
+    /// device's, whatever the app does to it by itself.
+    pub fn moved_on(&self) -> bool {
+        if self.taken.borrow().is_some() {
+            return false;
+        }
+        self.revision.fetch_add(1, Ordering::SeqCst);
+        true
     }
 
     /// Another device's queue was put in this one's place. It is that device's, and not
@@ -691,17 +708,61 @@ impl Controller {
     // numbered steps are named below. This is the timers, the requests, and putting a queue
     // in the player.
 
-    /// The queue changed here, or was played on: save it on the server once things have
-    /// settled. (Whatever it was before, it is this PC's own now.)
-    pub fn queue_changed_here(&self) {
-        self.queue_owner.changed_here();
-        // What another device was playing is offered to a PC that isn't playing only while
-        // that is newer than the queue here, which it has just stopped being. (While a song
-        // plays this comes round with every note of its place, and the offer is the look's
-        // to keep or withdraw.)
-        if !self.playback.try_borrow().map(|pb| pb.playing).unwrap_or(true) && self.elsewhere.borrow_mut().take().is_some() {
+    /// A press: the person is about to change what is in the player or how it is playing
+    /// (a row played, a song queued, moved or removed, the queue cleared or jumped in,
+    /// Play, Pause, Next, Previous, shuffle; from the window, the tray, the taskbar, the
+    /// mini player, the media keys, or a guest in a jam). Everything `changing` is, and
+    /// besides: **the queue is this PC's own from this moment** (`claim_queue`).
+    ///
+    /// **This and `pressed` are the one list of the person's ways in.** What the app does
+    /// by itself goes through `changing` and `changed` alone, and claims nothing: the next
+    /// song beginning, a song that failed being passed over, similar songs arriving, the
+    /// sleep timer, the sound device going, a queue another device saved being put in the
+    /// player, the last run's queue being put back. A press carried out inside one of
+    /// those (the sleep timer pausing by "pressing" Pause) is part of it, and is no press.
+    pub fn pressing(&self) -> crate::link::Changing<'_> {
+        let own = !self.link_changing.get();
+        let changing = self.changing();
+        if own {
+            self.claim_queue();
+        }
+        changing
+    }
+
+    /// The same, for a press that is over as soon as it is made (a seek, a song queued).
+    pub fn pressed(&self) {
+        if !self.link_changing.get() {
+            self.claim_queue();
+        }
+        self.changed();
+    }
+
+    /// The queue is this PC's own from this moment, by the person's own doing: no longer
+    /// another device's that was taken up, changed now by this PC's clock, and to be saved
+    /// on the server once things have settled. (It borrows nothing of the player: a press
+    /// can be half-way through changing it.)
+    pub fn claim_queue(&self) {
+        self.queue_stamp.set(chrono::Utc::now().timestamp());
+        self.queue_owner.claimed();
+        // What another device was playing was offered as the newer of the two, which it
+        // has just stopped being.
+        if self.elsewhere.borrow_mut().take().is_some() {
             self.ui.global::<crate::ui::Player>().set_elsewhere("".into());
         }
+        self.save_queue_soon();
+    }
+
+    /// The queue came to look different with no press (see `QueueOwner::moved_on`): if it
+    /// is this PC's own, that is a change to save, timed now.
+    pub fn queue_moved_on(&self) {
+        if self.queue_owner.moved_on() {
+            self.queue_stamp.set(chrono::Utc::now().timestamp());
+            self.save_queue_soon();
+        }
+    }
+
+    /// Saves the queue on the server once things have settled.
+    fn save_queue_soon(&self) {
         if self.settings.borrow().sync {
             self.queue_timer.start(slint::TimerMode::SingleShot, SETTLE, || {
                 with(|ctl| ctl.upload_queue());
@@ -831,6 +892,8 @@ impl Controller {
         self.queue_owner.taken_up(place.taken);
         self.replace_queue(theirs.songs, place.cursor, place.position);
         if play {
+            // (Inside this change, which is the app's own: it claims nothing. Whoever asked
+            // for it to be played says whose it is: see `continue_here`.)
             self.toggle_play();
         }
     }
@@ -841,6 +904,10 @@ impl Controller {
         self.ui.global::<crate::ui::Player>().set_elsewhere("".into());
         let place = handover::place(&theirs, clock);
         self.take_up(theirs, place, true);
+        // Taken by the person's own choice, it is this PC's own queue from the first
+        // moment: not one "taken up and left alone", which the other device's next save
+        // would replace.
+        self.claim_queue();
     }
 }
 
@@ -994,6 +1061,50 @@ mod tests {
     }
 
     #[test]
+    fn only_the_persons_own_action_makes_a_queue_taken_up_this_pcs_own() {
+        // B has taken A's queue up (A saved it at 00:10:00), and it sits there paused.
+        let theirs = |at: &str, position: u64| PlayQueue {
+            songs: ["a", "b", "c"].iter().map(|id| Song { id: id.to_string(), duration: 200, ..Default::default() }).collect(),
+            current: "b".into(),
+            position,
+            changed: at.into(),
+            changed_by: "NexusMusic-0badc0de".into(),
+        };
+        let here = |owner: &QueueOwner, stamp: i64| Here {
+            device: "NexusMusic-feedf00d".into(),
+            current: Some("b".into()),
+            playing: false,
+            stamp,
+            taken: owner.taken(),
+            ids: vec!["a".into(), "b".into(), "c".into()],
+        };
+        let (day, clock) = (86_400, Clock::Offset(0));
+        let owner = QueueOwner::default();
+        owner.taken_up("1970-01-02T00:10:00Z".into());
+        // The queue coming to look different with nobody having pressed anything claims
+        // nothing: it is still A's, and A's next save is taken up as the last was.
+        assert!(!owner.moved_on());
+        assert_eq!(owner.taken().as_deref(), Some("1970-01-02T00:10:00Z"));
+        assert!(matches!(handover::look(&theirs("1970-01-02T00:10:20Z", 50_000), &here(&owner, day + 600), clock, day + 625).then, Then::TakeUp(_)));
+
+        // B's person seeks, with the song paused. Nothing a save would notice has changed
+        // (the same songs, the same one current), and for a moment not even the second it
+        // is at. The press itself makes the queue B's own, there and then; and a save that
+        // was being prepared is for the queue as it was before the press.
+        let prepared = owner.prepared();
+        owner.claimed();
+        assert_eq!(owner.taken(), None);
+        assert!(!prepared.still());
+        // So when A, playing on, saves again, B keeps its queue and its place, and is
+        // offered A's. (A's has moved on to another song.)
+        let later = PlayQueue { current: "c".into(), ..theirs("1970-01-02T00:11:20Z", 0) };
+        let looked = handover::look(&later, &here(&owner, day + 660), clock, day + 700);
+        assert_eq!((looked.then, looked.offer), (Then::Nothing, Some(2)));
+        // From then on what plays here is B's own to save as it goes.
+        assert!(owner.moved_on());
+    }
+
+    #[test]
     fn a_save_prepared_before_another_devices_queue_was_taken_up_is_not_sent() {
         let owner = QueueOwner::default();
         // A save is prepared: the songs and the place as they are, the server about to be
@@ -1009,7 +1120,7 @@ mod tests {
         // Anything done to the queue here is the same to a save prepared before it; and
         // the queue is then this PC's own.
         let save = owner.prepared();
-        owner.changed_here();
+        owner.claimed();
         assert!(!save.still() && owner.taken().is_none());
         // Putting back, at start-up, what was in the player is no change to anything.
         let save = owner.prepared();

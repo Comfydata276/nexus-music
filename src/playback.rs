@@ -351,7 +351,7 @@ impl Controller {
             }
             return;
         }
-        let _changing = self.changing();
+        let _changing = self.pressing();
         // Each list remembers whether it plays shuffled. Songs that aren't from a list (a
         // search result, say) leave shuffle as it is.
         let listed = (!source.is_empty()).then(|| self.list_prefs(&source).shuffle);
@@ -662,7 +662,7 @@ impl Controller {
         if self.playback.borrow().current().is_none() {
             return;
         }
-        let _changing = self.changing();
+        let _changing = self.pressing();
         let (loaded, resume_at) = {
             let mut pb = self.playback.borrow_mut();
             if pb.current().is_none() {
@@ -734,7 +734,7 @@ impl Controller {
         if self.playback.borrow().order.is_empty() {
             return;
         }
-        let _changing = self.changing();
+        let _changing = self.pressing();
         {
             let mut pb = self.playback.borrow_mut();
             if pb.order.is_empty() {
@@ -760,7 +760,7 @@ impl Controller {
         if self.playback.borrow().order.is_empty() {
             return;
         }
-        let _changing = self.changing();
+        let _changing = self.pressing();
         {
             let mut pb = self.playback.borrow_mut();
             if pb.order.is_empty() {
@@ -788,7 +788,7 @@ impl Controller {
                 return;
             }
             let seconds = seconds.clamp(0.0, (duration - 1.0).max(0.0));
-            self.changed();
+            self.pressed();
             pb.position = seconds;
             pb.last_tick = seconds;
             pb.resume_at = seconds;
@@ -855,7 +855,7 @@ impl Controller {
     /// Turns shuffle on or off for what's playing. The current song carries on: turning it
     /// on shuffles what follows; turning it off continues from this song in the list's order.
     pub fn set_shuffle(self: &Rc<Self>, on: bool) {
-        self.changed();
+        self.pressed();
         let source = {
             let mut pb = self.playback.borrow_mut();
             if pb.shuffle != on {
@@ -938,7 +938,7 @@ impl Controller {
         if self.remote_add(&songs, play_next) {
             return;
         }
-        self.changed();
+        self.pressed();
         let was_empty = self.playback.borrow().order.is_empty();
         if was_empty {
             // Nothing queued yet: this becomes the queue, ready to play.
@@ -977,7 +977,7 @@ impl Controller {
             if at >= pb.order.len() {
                 return;
             }
-            self.changed();
+            self.pressed();
             pb.drop_at(at);
         }
         self.next_changed();
@@ -989,7 +989,7 @@ impl Controller {
         if self.remote(Remote::Move(from, to, queued)) {
             return;
         }
-        self.changed();
+        self.pressed();
         self.playback.borrow_mut().move_ahead(from, to, queued);
         self.next_changed();
     }
@@ -1003,7 +1003,7 @@ impl Controller {
         if self.playback.borrow().current().is_none() {
             return;
         }
-        self.changed();
+        self.pressed();
         self.playback.borrow_mut().clear_ahead(queued);
         self.next_changed();
     }
@@ -1020,7 +1020,7 @@ impl Controller {
             }
             pb.playing = true;
         }
-        let _changing = self.changing();
+        let _changing = self.pressing();
         self.start_current(0.0);
     }
 
@@ -1031,7 +1031,7 @@ impl Controller {
         if songs.is_empty() {
             return;
         }
-        let _changing = self.changing();
+        let _changing = self.pressing();
         self.engine.set_playing(false);
         self.engine.stop();
         let duration = songs.get(index).map_or(0.0, |song| song.duration as f64);
@@ -1949,10 +1949,12 @@ impl Controller {
         // Note when the queue last really changed, and pass the change on to other devices.
         let fingerprint = queue_fingerprint(&pb);
         if self.queue_sig.replace(fingerprint) != fingerprint && !self.queue_quiet.get() {
-            // (By this PC's own clock. It is set beside the server's when it is compared
-            // with the time of another device's save: see `nexus_core::handover`.)
-            self.queue_stamp.set(chrono::Utc::now().timestamp());
-            self.queue_changed_here();
+            // The queue looks different from when it was last noted. Whose it is was said
+            // at the press that made it so, if a press did (`pressing`): here it is only a
+            // change to save, if the queue is this PC's own. (Timed by this PC's own clock,
+            // which is set beside the server's when it is compared with the time of another
+            // device's save: see `nexus_core::handover`.)
+            self.queue_moved_on();
         }
         if pb.queue.is_empty() {
             // Nothing to come back to, unless the saved copy is being held on to (see `leave`).
