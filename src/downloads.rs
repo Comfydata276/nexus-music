@@ -72,6 +72,15 @@ pub struct Downloads {
     batch_failed: usize,
 }
 
+/// Which songs an account has downloaded here, and which lists it keeps downloaded.
+pub fn index_file(dir: &Path, account: &str) -> PathBuf {
+    dir.join(format!("index-{account}.json"))
+}
+
+pub fn collections_file(dir: &Path, account: &str) -> PathBuf {
+    dir.join(format!("collections-{account}.json"))
+}
+
 impl Downloads {
     /// Reads the downloads that belong to `account` (empty for nobody: signed out).
     pub fn load(dir: PathBuf, account: &str) -> Downloads {
@@ -95,7 +104,7 @@ impl Downloads {
                 }
             }
         }
-        let mut entries: Vec<Entry> = fs::read(dir.join(format!("index-{account}.json")))
+        let mut entries: Vec<Entry> = fs::read(index_file(&dir, account))
             .ok()
             .filter(|_| !account.is_empty())
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
@@ -110,7 +119,7 @@ impl Downloads {
         }
         let files = entries.iter().map(|e| (e.song.id.clone(), e.file.clone())).collect();
         let arrived = entries.iter().map(|e| (e.song.id.clone(), arrival(&dir, e))).collect();
-        let collections = fs::read(dir.join(format!("collections-{account}.json")))
+        let collections = fs::read(collections_file(&dir, account))
             .ok()
             .filter(|_| !account.is_empty())
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
@@ -141,7 +150,7 @@ impl Downloads {
         // Handed to the saver, which writes it on its own thread and, if it can't, keeps it
         // due and tries again: from here it is the saver's to get onto the disk.
         if let Ok(json) = serde_json::to_vec(&self.entries) {
-            crate::saver::saver().write(self.dir.join(format!("index-{}.json", self.account)), move || Some(json));
+            crate::saver::saver().write(index_file(&self.dir, &self.account), move || Some(json));
             self.unsaved = false;
         }
         self.saved_at = std::time::Instant::now();
@@ -163,7 +172,7 @@ impl Downloads {
             self.collections.push(id.to_string());
         }
         if let (Ok(json), false) = (serde_json::to_vec(&self.collections), self.account.is_empty()) {
-            crate::saver::saver().write(self.dir.join(format!("collections-{}.json", self.account)), move || Some(json));
+            crate::saver::saver().write(collections_file(&self.dir, &self.account), move || Some(json));
         }
     }
 

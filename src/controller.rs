@@ -657,7 +657,7 @@ impl Controller {
     /// last time.
     fn say_startup_notes(self: &Rc<Self>) {
         // How much of the crash log has been mentioned already is kept beside it.
-        let seen_file = self.paths.crash_log.with_extension("seen");
+        let seen_file = config::crash_seen(&self.paths);
         let size = std::fs::metadata(&self.paths.crash_log).map(|meta| meta.len()).unwrap_or(0);
         let seen: u64 = std::fs::read_to_string(&seen_file).ok().and_then(|text| text.trim().parse().ok()).unwrap_or(0);
         let crashed = size > seen;
@@ -1397,7 +1397,7 @@ impl Controller {
     /// Where the changes held for the server are kept for whoever is signed in.
     pub fn pending_path(&self) -> Option<PathBuf> {
         let account = self.account();
-        (!account.is_empty()).then(|| self.paths.pending.with_file_name(format!("pending-{account}.json")))
+        (!account.is_empty()).then(|| config::pending_file(&self.paths, &account))
     }
 
     /// Brings in what belongs to the account that has just signed in: its downloads, and
@@ -2222,7 +2222,7 @@ impl Controller {
         let online = !self.is_offline();
         self.api_pool.spawn(move || {
             let _ = std::fs::create_dir_all(&dir);
-            let file = dir.join("library.json");
+            let file = config::library_file(&dir);
             let mut renewed = false;
             if crate::search::current().is_none() {
                 if let Some(library) = crate::search::Library::load(&file) {
@@ -2502,7 +2502,7 @@ impl Controller {
 
     /// Where lyrics are kept for the server that's signed in to (see `lyrics`).
     pub fn lyrics_dir(&self) -> Option<PathBuf> {
-        Some(self.pages_dir()?.join("lyrics"))
+        Some(config::lyrics_dir(&self.pages_dir()?))
     }
 
     /// A stored copy of a page and its age: from memory, or from disk on the first visit of

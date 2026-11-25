@@ -836,6 +836,26 @@ pub fn set_aside(path: &Path) -> Option<PathBuf> {
     None
 }
 
+/// How much of the crash log has been mentioned already, kept beside it.
+pub fn crash_seen(paths: &Paths) -> PathBuf {
+    paths.crash_log.with_extension("seen")
+}
+
+/// What waits to be sent to the server for an account (`Settings::account_file`).
+pub fn pending_file(paths: &Paths, account: &str) -> PathBuf {
+    paths.pending.with_file_name(format!("pending-{account}.json"))
+}
+
+/// The copy of the library search goes by, and the lyrics kept, in a sign-in's folder of
+/// the page cache.
+pub fn library_file(pages: &Path) -> PathBuf {
+    pages.join("library.json")
+}
+
+pub fn lyrics_dir(pages: &Path) -> PathBuf {
+    pages.join("lyrics")
+}
+
 /// The app's own files in the settings folder and the data folder, by how their names
 /// start (`clear_leftovers`).
 pub const SETTINGS_FILES: &[&str] = &["settings", "queue", "history", "pending", "playlist-added", "asked", "asking", "plays", "shared-record-kept-"];
@@ -1290,7 +1310,36 @@ mod tests {
 
     #[test]
     fn every_file_the_app_keeps_is_in_the_table_of_them() {
-        // Named one by one, so that a file added to `Paths` can't be left out of this.
+        let paths = Paths::at(Path::new("config"), Path::new("cache"), Path::new("data"));
+        let table = include_str!("../docs/FILES.md");
+        let name = |path: &Path| path.file_name().unwrap().to_string_lossy().into_owned();
+        let folder = |path: &Path| format!("{}\\", name(path));
+        // Each named by what the app names it with, for an account and a version.
+        let (account, version) = ("<account>", "<version>");
+        let pages = paths.pages.join("<sign-in>");
+        let mut named = vec![
+            name(&crash_seen(&paths)),
+            name(&pending_file(&paths, account)),
+            name(&library_file(&pages)),
+            folder(&lyrics_dir(&pages)),
+            name(&crate::sync::kept_file(&paths.settings, account, version)),
+            name(&crate::downloads::index_file(&paths.downloads, account)),
+            name(&crate::downloads::collections_file(&paths.downloads, account)),
+            name(&crate::plays::log_file(&paths.plays)),
+            name(&crate::plays::side_file(&crate::plays::log_file(&paths.plays))),
+            name(&backup_of(&paths.settings)),
+            name(&paths.settings.with_extension("damaged.json")),
+            // Moved aside under a name of its own (`set_aside`), and a write's own file
+            // beside its place (`temp_for`).
+            "asked.damaged-<date and time>.json".into(),
+            "asking.damaged-<date and time>.json".into(),
+            "<file>.<process>.<count>.tmp".into(),
+        ];
+        let temp = name(&temp_for(Path::new("<file>")));
+        let parts: Vec<&str> = temp.split('.').collect();
+        assert!(parts.len() == 4 && parts[0] == "<file>" && parts[3] == "tmp" && parts[1..3].iter().all(|part| part.parse::<u64>().is_ok()), "{temp}");
+        // And every one of `Paths`, named one by one, so that a file added there can't be
+        // left out of this.
         let Paths {
             settings,
             queue,
@@ -1299,9 +1348,9 @@ mod tests {
             crash_log,
             diagnostics,
             history,
-            pending,
+            pending: _,
             covers,
-            pages,
+            pages: _,
             buffers,
             songs,
             downloads,
@@ -1309,35 +1358,23 @@ mod tests {
             asked,
             asking,
             discover,
-            old_lyrics: _,
+            old_lyrics,
             plays,
             #[cfg(not(windows))]
             secret,
-        } = Paths::at(Path::new("config"), Path::new("cache"), Path::new("data"));
-        let table = include_str!("../docs/FILES.md");
-        let name = |path: &Path| path.file_name().unwrap().to_string_lossy().into_owned();
-        let mut named = vec![
-            name(&settings),
-            name(&backup_of(&settings)),
-            name(&queue),
-            name(&queue_place),
-            name(&crash_log),
-            name(&diagnostics),
-            name(&history),
-            name(&pending).replace(".json", "-<account>.json"),
-            name(&added),
-            name(&asked),
-            name(&asking),
-            name(&discover),
-            name(&plays),
-            name(&plays.with_extension("log")),
-            name(&plays.with_extension("log.new")),
-        ];
-        named.extend([&exports, &covers, &pages, &buffers, &songs, &downloads].map(|folder| format!("{}\\", name(folder))));
+        } = paths;
+        named.extend([&settings, &queue, &queue_place, &crash_log, &diagnostics, &history, &added, &asked, &asking, &discover, &plays].map(|path| name(path)));
+        named.extend([&exports, &covers, &buffers, &songs, &downloads, &old_lyrics].map(|path| folder(path)));
+        named.push("pages\\".into());
         #[cfg(not(windows))]
-        named.push(name(&secret));
+        named.extend([name(&secret), "secret-<name>".into()]);
         for named in named {
-            assert!(table.contains(&format!("`{named}")), "docs/FILES.md doesn't say how {named} is kept");
+            assert!(table.contains(&named), "docs/FILES.md doesn't say how {named} is kept");
+        }
+        // Every row says all of it: what it holds, how it is written, what a kill leaves, what
+        // a power cut leaves, and how one that can't be read is taken.
+        for row in table.lines().filter(|line| line.starts_with("| ")) {
+            assert_eq!(row.matches(" | ").count() + 2, 7, "a row without all six: {row}");
         }
     }
 

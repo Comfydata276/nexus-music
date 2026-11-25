@@ -180,6 +180,16 @@ fn parse(line: &str) -> Option<(String, i64, String)> {
         .or_else(|| serde_json::from_str::<(String, i64)>(line).ok().map(|(song, at)| (song, at, String::new())))
 }
 
+/// The log, beside where versions before 0.26 kept the plays (`old`); and the file beside
+/// the log that plays go to while it can't be written (`PlayLog::aside`).
+pub fn log_file(old: &Path) -> PathBuf {
+    old.with_extension("log")
+}
+
+pub fn side_file(log: &Path) -> PathBuf {
+    log.with_extension("log.new")
+}
+
 impl PlayLog {
     /// Reads the log.
     ///
@@ -198,7 +208,7 @@ impl PlayLog {
     /// `load`, starting a log by the steps given (a test's, to stop the app at one or have
     /// one fail).
     fn load_by(old: &Path, recent: &[(String, i64)], steps: &crate::config::Steps) -> PlayLog {
-        let path = old.with_extension("log");
+        let path = log_file(old);
         let mut log = PlayLog { path, lines: 0, aside: false, whole: true, unread: false, unstarted: false, no_links: false };
         if let Ok(mut sources) = SOURCES.write() {
             *sources = None;
@@ -280,7 +290,7 @@ impl PlayLog {
 
     /// Where plays are kept while the log itself is not to be written to (see `aside`).
     fn side(&self) -> PathBuf {
-        self.path.with_extension("log.new")
+        side_file(&self.path)
     }
 
     /// The file plays are added to in this run.
