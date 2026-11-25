@@ -813,6 +813,11 @@ impl Device {
         let number = self.session.as_ref()?.number;
         let session = self.live(number, env.now_ms)?;
         let (place, token) = session.place.clone()?;
+        // And only to a place that is in the room: a device that has gone is sent nothing.
+        if !session.others.contains(&to) {
+            out.push(Do::Log(format!("send: {} is not in the room, nothing is sent to it", text::place(&to))));
+            return None;
+        }
         let sealed = frame::seal(&session.keys, kind, &nonce, &place, &to, message.as_bytes())?;
         out.push(Do::Send { session: number, token, to, frame: sealed });
         Some(nonce)
@@ -1173,6 +1178,14 @@ impl Device {
                 // However it ends, this device is no longer in the middle of it.
                 env.player.done(waiting);
                 match took {
+                    // The device the music came from has left the room while this one
+                    // was starting: there is nobody to tell, and the person is told that.
+                    // (This device is in the room itself: where it is not, or there is
+                    // no session, it is linking that has stopped, said below.)
+                    Took::Pause(_) if self.session.as_ref().is_some_and(|session| session.place.is_some() && !session.others.contains(&place)) => {
+                        out.push(Do::Log(format!("take: {} sounds; {name} has left the room and cannot be told to stop", env.me.here.this_lower())));
+                        self.say(words::took_and_it_has_left(&name), out);
+                    }
                     Took::Pause(at) => {
                         // The other stops now that this one sounds: against the state its
                         // queue was taken from, so that if it has been given anything else

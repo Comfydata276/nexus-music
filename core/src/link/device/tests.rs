@@ -1637,6 +1637,36 @@ fn what_became_of_the_stop_that_ends_play_here_is_said_even_when_its_answer_cann
     assert_eq!(world.copies[A].said.len(), before);
 }
 
+/// The device the music is being taken from leaves the room while the taker is starting.
+/// When the taker sounds there is nobody to tell: nothing is sent to the place the device
+/// had, and the person is told that it may still be playing.
+#[test]
+fn a_source_that_leaves_while_the_taker_is_starting_is_sent_nothing_and_the_person_is_told() {
+    let mut world = taking(|world| world.copies[A].player.stream = false);
+    world.pass(1_000);
+    let (session, mine) = (world.copies[A].session, text::place(&world.copies[A].place.unwrap()));
+    let did = world.with(A, |device, env| device.heard(session, &[mine], &[], env));
+    world.act(A, did);
+    let sent = world.path.last_command.clone().map(|frame| frame.text);
+    world.copies[A].player.stream = true;
+    world.copies[A].player.play(true);
+    world.pass(1_000);
+    assert_eq!((said(&world), world.copies[A].player.playing, world.copies[B].player.playing), ("Playing here. Copy B is no longer there to be told, so it may still be playing.", true, true));
+    assert!(world.log(A, "asked Copy B to pause").is_empty() && world.log(A, "has left the room and cannot be told to stop").len() == 1, "{:?}", world.copies[A].log);
+    assert_eq!(world.path.last_command.clone().map(|frame| frame.text), sent, "a command was sent to a place whose device had gone");
+    // Said once, and the take is over: the device is not left busy.
+    let told = world.copies[A].said.len();
+    world.pass(40_000);
+    assert_eq!((world.copies[A].said.len(), world.copies[A].player.rule.busy(world.now)), (told, false));
+    // Nothing at all is sent to a place that is not in the room, whatever asks for it.
+    let mut world = steering("pause");
+    let (session, mine, b) = (world.copies[A].session, text::place(&world.copies[A].place.unwrap()), world.b_place());
+    let did = world.with(A, |device, env| device.heard(session, &[mine], &[], env));
+    world.act(A, did);
+    let did = world.with(A, |device, env| device.pause(&b, env));
+    assert!(!did.iter().any(|ask| matches!(ask, Do::Send { .. })), "{did:?}");
+}
+
 /// The queue that "Play here" asked for comes after its time is up, and before any tick
 /// has run to say so: it is not taken.
 #[test]

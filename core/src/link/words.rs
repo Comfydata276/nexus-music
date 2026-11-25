@@ -181,6 +181,11 @@ pub fn could_not_load_here(name: &str, here: Here) -> String {
     format!("{} couldn't load that. {name} is still playing.", here.this())
 }
 
+/// "Play here", when the device the music came from left before it could be told to stop.
+pub fn took_and_it_has_left(name: &str) -> String {
+    format!("Playing here. {name} is no longer there to be told, so it may still be playing.")
+}
+
 pub fn queue_never_came(name: &str) -> String {
     format!("{name} didn't answer, so nothing was moved. It may still be playing.")
 }
