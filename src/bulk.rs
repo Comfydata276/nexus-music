@@ -47,21 +47,20 @@ impl Place {
         Place { path: path.to_path_buf(), held: AtomicBool::new(false) }
     }
 
-    /// In passing: on the saver's thread, whole, in the order asked. The window and the
-    /// threads that look albums up both come here, and neither waits for the disk.
+    /// In passing: whole, or the batch as it was.
     fn keep(&self, json: Option<Vec<u8>>) {
         if self.held.load(Ordering::SeqCst) {
             return;
         }
         match json {
-            None => crate::saver::saver().remove(self.path.clone()),
-            Some(json) => crate::saver::saver().write(self.path.clone(), move || Some(json)),
+            None => drop(std::fs::remove_file(&self.path)),
+            Some(json) => drop(crate::config::write_surely(&self.path, &json)),
         }
     }
 
-    /// Written in its turn and waited for: what must be on the disk before Lidarr is changed.
+    /// What must be on the disk before Lidarr is changed: written, and said whether it is.
     fn keep_checked(&self, json: Vec<u8>) -> bool {
-        !self.held.load(Ordering::SeqCst) && crate::saver::saver().write_checked(self.path.clone(), json).is_ok()
+        !self.held.load(Ordering::SeqCst) && crate::config::write_surely(&self.path, &json).is_ok()
     }
 
     /// Takes up the batch written down here with `load`, and says what the person is to be
@@ -220,7 +219,6 @@ mod tests {
         // Lidarr isn't changed.
         place.keep(Some(BATCH.to_vec()));
         assert!(!place.keep_checked(BATCH.to_vec()));
-        crate::saver::saver().flush();
         assert!(place.path.is_dir());
         // A batch that reads, as before: written, and surely.
         std::fs::remove_dir(&place.path).unwrap();
@@ -244,7 +242,6 @@ mod tests {
         assert_eq!(place.take_up(|written| job.load(written)), NOT_MOVED);
         place.keep(Some(BATCH.to_vec()));
         assert!(!place.keep_checked(BATCH.to_vec()));
-        crate::saver::saver().flush();
         drop(pinned);
         assert_eq!(std::fs::read(&place.path).unwrap(), &BATCH[..30]);
         let _ = std::fs::remove_dir_all(&dir);

@@ -515,19 +515,16 @@ impl Settings {
         (fresh(), Some(note))
     }
 
-    /// Saves the settings in passing: on the saver's thread, which tries again if it can't
-    /// (`saver`).
     pub fn save(&self, path: &Path) {
         if let Ok(json) = serde_json::to_vec_pretty(self) {
-            crate::saver::saver().write(path.to_path_buf(), move || Some(json));
+            let _ = write_surely(path, &json);
         }
     }
 
     /// Saves the settings and says whether they are on the disk: for a change that must be
-    /// kept before it is shown as made (see `Controller::choose`). Written by the saver, in
-    /// its turn after the settings saved in passing before, and waited for.
+    /// kept before it is shown as made (see `Controller::choose`).
     pub fn save_surely(&self, path: &Path) -> bool {
-        serde_json::to_vec_pretty(self).is_ok_and(|json| crate::saver::saver().write_checked(path.to_path_buf(), json).is_ok())
+        serde_json::to_vec_pretty(self).is_ok_and(|json| write_surely(path, &json).is_ok())
     }
 
     pub fn theme(&self) -> &'static ThemeColors {
@@ -667,10 +664,9 @@ pub fn load_history(path: &Path) -> Vec<Played> {
     songs.into_iter().enumerate().map(|(index, song)| Played { song, at: newest - 200 * index as i64 }).collect()
 }
 
-/// Saves Recently played, on the saver's thread.
 pub fn save_history(path: &Path, history: &[Played]) {
     if let Ok(json) = serde_json::to_vec(history) {
-        crate::saver::saver().write(path.to_path_buf(), move || Some(json));
+        let _ = write_surely(path, &json);
     }
 }
 
@@ -687,44 +683,6 @@ pub fn save_history(path: &Path, history: &[Played]) {
 /// for a file written again and again: `write_surely`) does, `ONCE` (for a file made once and
 /// never replaced: the kept copy of the shared record, the start of the log of plays) never
 /// does, and gives `AlreadyExists` instead.
-pub fn write_whole(path: &Path, bytes: &[u8], steps: &Steps) -> std::io::Result<Placed> {
-    let started = std::time::Instant::now();
-    let written = write_whole_now(path, bytes, steps);
-    flushed(path, started);
-    written
-}
-
-thread_local! {
-    /// This is the window's thread (`mark_window_thread`), and how many times a file has
-    /// been flushed on it.
-    static WINDOW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    static WINDOW_FLUSHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
-/// Marks the calling thread as the window's, so that every file flushed on it is counted
-/// and, with `NEXUS_TRACE` set, printed with how long it took.
-pub fn mark_window_thread() {
-    WINDOW.set(true);
-}
-
-/// How many times a file has been flushed on the window's thread, if this is it.
-#[cfg(test)]
-pub fn window_flushes() -> u64 {
-    WINDOW_FLUSHES.get()
-}
-
-/// Notes that a file was written and flushed: counted, and traced, if this is the window's
-/// thread. Only what the person waits for the answer of is to be (see `saver`).
-pub fn flushed(path: &Path, started: std::time::Instant) {
-    if !WINDOW.get() {
-        return;
-    }
-    WINDOW_FLUSHES.set(WINDOW_FLUSHES.get() + 1);
-    if std::env::var_os("NEXUS_TRACE").is_some() {
-        eprintln!("[trace] flushed on the window's thread in {:.1} ms: {}", started.elapsed().as_secs_f64() * 1000.0, path.display());
-    }
-}
-
 /// A file written whole is in place: and its folder synced, or (Linux) not, so that its
 /// name may not outlast a power cut. Either way it is written: the file has changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -733,7 +691,7 @@ pub enum Placed {
     Unsynced,
 }
 
-fn write_whole_now(path: &Path, bytes: &[u8], steps: &Steps) -> std::io::Result<Placed> {
+pub fn write_whole(path: &Path, bytes: &[u8], steps: &Steps) -> std::io::Result<Placed> {
     use std::io::Write;
     // A new file, never one that is there: a name of a killed run's that came round again
     // (the same process number, and its count) is passed over for the next.
@@ -1045,7 +1003,6 @@ mod tests {
         assert!(note.is_none() && settings.server.is_empty());
         // A good file is read, and a copy of it kept.
         Settings { server: "https://music.example.org".into(), volume: 0.4, ..Default::default() }.save(&path);
-        crate::saver::saver().flush();
         let (settings, note) = Settings::load_checked(&path);
         assert!(note.is_none() && settings.server == "https://music.example.org");
         // Cut short: the copy stands in, the file is mended, and the app says so.
@@ -1276,6 +1233,26 @@ mod tests {
         DEST.with(|dest| *dest.borrow_mut() = list.clone());
         assert!(write_whole(&log, FIRST, &AT_FLUSH).is_ok());
         assert_eq!((fs::read(&log).unwrap(), fs::read(&list).unwrap()), (FIRST.to_vec(), SECOND.to_vec()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_change_is_on_the_disk_when_its_save_returns_whatever_else_is_being_written() {
+        let dir = std::env::temp_dir().join(format!("nexus-save-now-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        // The queue's write, slow on its own thread (a stalled disk, a network drive).
+        let saver = crate::saver::Saver::new();
+        saver.write(dir.join("queue.json"), || {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            Some(b"[]".to_vec())
+        });
+        let started = std::time::Instant::now();
+        Settings { theme: "Violet".into(), ..Default::default() }.save(&path);
+        assert!(path.exists(), "the settings weren't on the disk when their save returned");
+        assert!(Settings { theme: "Ocean".into(), ..Default::default() }.save_surely(&path));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1), "a save waited for another file's write");
         let _ = fs::remove_dir_all(&dir);
     }
 

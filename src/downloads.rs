@@ -147,11 +147,12 @@ impl Downloads {
         if self.account.is_empty() {
             return;
         }
-        // Handed to the saver, which writes it on its own thread and, if it can't, keeps it
-        // due and tries again: from here it is the saver's to get onto the disk.
+        // Only a list that is on the disk is no longer due (and one that isn't is tried
+        // again a couple of seconds later, or at the end of the batch).
         if let Ok(json) = serde_json::to_vec(&self.entries) {
-            crate::saver::saver().write(index_file(&self.dir, &self.account), move || Some(json));
-            self.unsaved = false;
+            if crate::config::write_surely(&index_file(&self.dir, &self.account), &json).is_ok() {
+                self.unsaved = false;
+            }
         }
         self.saved_at = std::time::Instant::now();
     }
@@ -172,7 +173,7 @@ impl Downloads {
             self.collections.push(id.to_string());
         }
         if let (Ok(json), false) = (serde_json::to_vec(&self.collections), self.account.is_empty()) {
-            crate::saver::saver().write(collections_file(&self.dir, &self.account), move || Some(json));
+            let _ = crate::config::write_surely(&collections_file(&self.dir, &self.account), &json);
         }
     }
 
@@ -919,7 +920,6 @@ mod tests {
         second.add(entry("b", "b.mp3", 5));
         second.save_if_due(true);
         first.save_if_due(true);
-        crate::saver::saver().flush();
         assert!(Downloads::load(dir.clone(), "server_bob").has("b"));
         assert!(!Downloads::load(dir.clone(), "server_ann").has("b"));
         let _ = fs::remove_dir_all(dir);

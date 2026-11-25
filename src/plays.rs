@@ -27,6 +27,10 @@ pub struct PlayLog {
     /// first; and after those, for a play made from a playlist, that page's route key.
     path: PathBuf,
     lines: usize,
+    /// Plays made here that could not be written to the file when they were made (the disk
+    /// was full): they are counted for this run, and written with the next thing that is.
+    /// Until they are, nothing is said to be kept (see `keep`).
+    unwritten: Vec<(String, i64, String)>,
     /// The log is not to be written to in this run: it could not be read when the app
     /// started (see `load`). What would be added to it is added to a file beside it
     /// instead (`side`), and joined to it the next time it reads.
@@ -91,14 +95,7 @@ fn ending(bytes: &[u8]) -> (usize, bool) {
 /// that would be joined to it and read as neither). If these lines can't all be written,
 /// the file is put back as it was before them, so that writing them again later doesn't
 /// make some of them twice.
-pub fn append(path: &Path, text: &str) -> std::io::Result<()> {
-    let started = std::time::Instant::now();
-    let added = append_now(path, text);
-    crate::config::flushed(path, started);
-    added
-}
-
-fn append_now(path: &Path, text: &str) -> std::io::Result<()> {
+fn append(path: &Path, text: &str) -> std::io::Result<()> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = std::fs::OpenOptions::new().create(true).read(true).write(true).truncate(false).open(path)?;
     let length = file.metadata()?.len();
@@ -209,7 +206,7 @@ impl PlayLog {
     /// one fail).
     fn load_by(old: &Path, recent: &[(String, i64)], steps: &crate::config::Steps) -> PlayLog {
         let path = log_file(old);
-        let mut log = PlayLog { path, lines: 0, aside: false, whole: true, unread: false, unstarted: false, no_links: false };
+        let mut log = PlayLog { path, lines: 0, unwritten: Vec::new(), aside: false, whole: true, unread: false, unstarted: false, no_links: false };
         if let Ok(mut sources) = SOURCES.write() {
             *sources = None;
         }
@@ -331,11 +328,9 @@ impl PlayLog {
         Ok(plays)
     }
 
-    /// Writes the log again, whole, from `plays`: on the saver's thread, after every line
-    /// added before it (which `plays` has too).
     fn rewrite(&self, plays: &[(String, i64)]) {
         let text: String = plays.iter().map(|(song, at)| line(song, *at, &source_of(song, *at))).collect();
-        crate::saver::saver().write(self.path.clone(), move || Some(text.into_bytes()));
+        let _ = crate::config::write_surely(&self.path, text.as_bytes());
     }
 
     /// Takes the oldest plays out once the log is well past its limit.
@@ -357,6 +352,16 @@ impl PlayLog {
         self.lines = shared.len();
     }
 
+    /// Writes what is still waiting to be written (see `unwritten`).
+    fn flush(&mut self) -> std::io::Result<()> {
+        if self.unwritten.is_empty() {
+            return Ok(());
+        }
+        append(&self.target(), &text(&self.unwritten))?;
+        self.unwritten.clear();
+        Ok(())
+    }
+
     /// Takes in plays made on other devices (see `sync`), leaving out the ones already here,
     /// and **makes sure they are in the file before saying so**: and with them every play
     /// this PC has counted. `sources` says which playlists some of them were made from; a
@@ -369,6 +374,9 @@ impl PlayLog {
     /// the record back without it: so nothing is written back on the strength of plays this
     /// PC could not keep, or of a log that could not be read back.
     pub fn keep(&mut self, plays: &[(String, i64)], sources: &[(String, i64, String)]) -> std::io::Result<usize> {
+        // A play made here that never reached the file is in memory all the same: it must
+        // not pass for kept.
+        self.flush()?;
         let known: std::collections::HashSet<(String, i64)> = match SHARED.read() {
             // Anything another device has to tell is recent, so the newest part is enough to
             // compare with.
@@ -379,12 +387,9 @@ impl PlayLog {
         let mut new: Vec<&(String, i64)> = plays.iter().filter(|play| !known.contains(*play)).collect();
         new.sort_by_key(|(_, at)| *at);
         new.dedup();
-        // These lines, after every play made here that is still on its way to the file: a
-        // play made here that never reached the file is in memory all the same, and must
-        // not pass for kept. So the saver says whether all of them are there.
-        let text: String = new.iter().map(|(song, at)| line(song, *at, from(song, *at))).collect();
-        crate::saver::saver().append_checked(self.target(), text, append)?;
         if !new.is_empty() {
+            let text: String = new.iter().map(|(song, at)| line(song, *at, from(song, *at))).collect();
+            append(&self.target(), &text)?;
             for (song, at) in &new {
                 note_source(song, *at, from(song, *at));
             }
@@ -405,7 +410,7 @@ impl PlayLog {
         if !late.is_empty() && self.whole && !self.aside {
             let all = SHARED.read().map(|shared| shared.clone()).unwrap_or_default();
             let text: String = all.iter().map(|play| line(&play.0, play.1, late.get(play).map(|from| from.to_string()).unwrap_or_else(|| source_of(&play.0, play.1)).as_str())).collect();
-            crate::saver::saver().write_checked(self.path.clone(), text.into_bytes())?;
+            crate::config::write_surely(&self.path, text.as_bytes())?;
             for ((song, at), from) in &late {
                 note_source(song, *at, from);
             }
@@ -415,18 +420,18 @@ impl PlayLog {
     }
 
     /// Notes a play, and the playlist it was made from (its route key) if it was from one.
-    /// It is counted at once, and its line is added to the file on the saver's thread, so
-    /// that the window never waits for the disk while a song plays. If it can't be added
-    /// then, it stays due there and is tried again; until it is in the file nothing is said
-    /// to be kept (`keep` asks).
+    /// It is counted at once; if it can't be written to the file now it is written with
+    /// the next play that can be.
     pub fn add(&mut self, song: &str, at: i64, from: &str) {
         note_source(song, at, from);
         if let Ok(mut shared) = SHARED.write() {
             shared.push((song.to_string(), at));
         }
-        crate::saver::saver().append(self.target(), line(song, at, from), append);
+        self.unwritten.push((song.to_string(), at, from.to_string()));
         self.lines += 1;
-        self.trim();
+        if self.flush().is_ok() {
+            self.trim();
+        }
     }
 }
 
@@ -503,7 +508,6 @@ mod tests {
             // A play made meanwhile, and plays other devices tell of (one of them a play the
             // log has, for all this run knows), are kept: beside the log, not in it.
             log.add("c", 300, "playlist:q");
-            crate::saver::saver().flush();
             assert_eq!(log.keep(&[play("a", 100), play("d", 400)], &[]).unwrap(), 2);
             assert_eq!(shared(), [play("c", 300), play("a", 100), play("d", 400)]);
             drop(held);
@@ -533,7 +537,6 @@ mod tests {
         assert_eq!(shared(), [play("a", 100), play("c", 300)]);
         // A play is added after it; the rest of the file is as it was.
         log.add("d", 400, "");
-        crate::saver::saver().flush();
         let after = [damaged.as_slice(), b"[\"d\",400]\n"].concat();
         assert_eq!(std::fs::read(&path).unwrap(), after);
         // A source told later would have the file written again, whole, from the plays that
@@ -552,7 +555,7 @@ mod tests {
         // between a check and a read for it to change in. And if one has appeared by the
         // time the new one is made, it is not written over.
         std::fs::write(&path, "[\"a\",100]\n").unwrap();
-        let log = PlayLog { path: path.clone(), lines: 0, aside: false, whole: true, unread: false, unstarted: false, no_links: false };
+        let log = PlayLog { path: path.clone(), lines: 0, unwritten: Vec::new(), aside: false, whole: true, unread: false, unstarted: false, no_links: false };
         assert!(log.begin(&old, &[play("z", 50)], &crate::config::ONCE).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "[\"a\",100]\n");
         std::fs::remove_file(&path).unwrap();
@@ -570,7 +573,6 @@ mod tests {
             if std::fs::read(&old).is_err() {
                 let mut log = PlayLog::load(&old, &[play("z", 50)]);
                 log.add("c", 300, "");
-                crate::saver::saver().flush();
                 assert!(!path.exists());
                 assert!(log.note().is_some_and(|note| note.contains("couldn't be started")));
             }
@@ -602,7 +604,6 @@ mod tests {
         let mut log = PlayLog::load(&old, &[]);
         assert_eq!(shared(), [play("a", 100)]);
         log.add("c", 300, "");
-        crate::saver::saver().flush();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "[\"a\",100]\n[\"c\",300]\n");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
@@ -640,7 +641,6 @@ mod tests {
         let mut log = PlayLog::load(&old, &[]);
         assert!(!old.exists());
         log.add("c", 300, "");
-        crate::saver::saver().flush();
         // Adding a play adds a line and leaves the rest of the file as it was.
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "[\"a\",100]\n[\"b\",200]\n[\"c\",300]\n");
         // A line cut short (the app was killed part-way through writing it) is passed over.
@@ -658,7 +658,6 @@ mod tests {
         assert_eq!(shared(), [("c".to_string(), 300), ("y".to_string(), 320), ("z".to_string(), 350)]);
         // A play made from a playlist says so, here and after the log is read again.
         log.add("w", 400, "playlist:q");
-        crate::saver::saver().flush();
         let mut noted = sources();
         noted.sort();
         assert_eq!(noted, [("w".to_string(), 400, "playlist:q".to_string()), ("y".to_string(), 320, "playlist:p".to_string())]);
@@ -671,7 +670,7 @@ mod tests {
         // Plays that can't be written to the file are not counted as kept: the log is as it
         // was, here and on the disk. (A folder stands where the file should be.)
         let before = shared();
-        let mut blocked = PlayLog { path: std::env::temp_dir(), lines: before.len(), aside: false, whole: true, unread: false, unstarted: false, no_links: false };
+        let mut blocked = PlayLog { path: std::env::temp_dir(), lines: before.len(), unwritten: Vec::new(), aside: false, whole: true, unread: false, unstarted: false, no_links: false };
         assert!(blocked.keep(&[("never".to_string(), 500)], &[]).is_err());
         assert_eq!(shared(), before);
         // With nothing new there is nothing to write, and nothing to fail.
@@ -689,8 +688,7 @@ mod tests {
         assert_eq!(shared(), [("a".to_string(), 100), ("b".to_string(), 200)]);
         // A play made here while the file can't be written is counted, but nothing is said
         // to be kept until it has been: then it is in the file, once, with the others.
-        // (The file is made read-only, and then writable again: with nothing in between
-        // for the saver, which tries again in its own time, to write to.)
+        // (The file is made read-only, and then writable again.)
         let mut log = PlayLog::load(&old, &[]);
         let writable = |yes: bool| {
             let mut permissions = std::fs::metadata(&path).unwrap().permissions();
@@ -787,7 +785,6 @@ mod tests {
             assert!(log.note().is_some_and(|note| note.contains("couldn't be started")));
             // What is played meanwhile is kept beside it, as for a log that can't be read.
             log.add("d", 400, "");
-            crate::saver::saver().flush();
             assert_eq!(std::fs::read_to_string(&old).unwrap(), LIST);
         }
         // The next start that can make it starts it from the list, and joins what was
@@ -796,22 +793,6 @@ mod tests {
         assert_eq!(shared(), [play("a", 100), play("b", 200), play("c", 300), play("d", 400)]);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), format!("{LOGGED}[\"d\",400]\n"));
         assert!(!old.exists());
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
-    }
-
-    #[test]
-    fn a_play_counted_while_a_song_plays_never_waits_for_the_disk_on_the_window_thread() {
-        let _turn = turn();
-        let (old, path) = fresh("window");
-        std::fs::write(&path, "[\"a\",100]\n").unwrap();
-        crate::config::mark_window_thread();
-        let mut log = PlayLog::load(&old, &[]);
-        let before = crate::config::window_flushes();
-        log.add("b", 200, "playlist:p");
-        assert_eq!(crate::config::window_flushes(), before, "a play's line was flushed on the window's thread");
-        // It is added on the saver's thread; and asked, the saver says it is there.
-        assert_eq!(log.keep(&[], &[]).unwrap(), 0);
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[\"a\",100]\n[\"b\",200,\"playlist:p\"]\n");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
@@ -829,7 +810,6 @@ mod tests {
         assert_eq!(shared(), [play("a", 100), play("b", 200), play("c", 300)]);
         assert!(log.note().is_none());
         log.add("d", 400, "");
-        crate::saver::saver().flush();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), format!("{LOGGED}[\"d\",400]\n"));
         assert_eq!(std::fs::read_to_string(&old).unwrap(), LIST);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
@@ -897,7 +877,6 @@ mod tests {
         assert_eq!(shared(), [play("x", 1)]);
         assert!(log.note().is_none());
         log.add("d", 400, "");
-        crate::saver::saver().flush();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "[\"x\",1]\n[\"d\",400]\n");
         assert_eq!(std::fs::read_to_string(&old).unwrap(), LIST);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());

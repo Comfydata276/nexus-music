@@ -101,7 +101,7 @@ impl Controller {
         let (sending, pending) = (self.sending.borrow(), self.pending.borrow());
         let held: Vec<&Pending> = sending.iter().chain(pending.iter()).collect();
         if let Ok(json) = serde_json::to_vec(&held) {
-            crate::saver::saver().write(path, move || Some(json));
+            let _ = crate::config::write_surely(&path, &json);
         }
     }
 
@@ -145,16 +145,12 @@ impl Controller {
                 if ctl.account() != account {
                     // Someone else has signed in meanwhile. What wasn't sent stays in the
                     // file of the account it was made under, ahead of anything there already.
-                    // (Read and written on the saver's thread, after what was asked for the file
-                    // before.)
                     if let Some(path) = path {
-                        let skip = waiting.len();
-                        let file = path.clone();
-                        crate::saver::saver().write(path, move || {
-                            let mut held = sent.kept;
-                            held.extend(load_pending(&file).into_iter().skip(skip));
-                            serde_json::to_vec(&held).ok()
-                        });
+                        let mut held = sent.kept;
+                        held.extend(load_pending(&path).into_iter().skip(waiting.len()));
+                        if let Ok(json) = serde_json::to_vec(&held) {
+                            let _ = crate::config::write_surely(&path, &json);
+                        }
                     }
                     return;
                 }
