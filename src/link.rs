@@ -453,6 +453,13 @@ impl Link {
     }
 }
 
+/// Whether this copy should be linked with the person's other devices the new way: signed
+/// in, a relay set up, random numbers to be had, and "Link my devices" on. That setting
+/// means what it says for the old linking and the new alike: off is off for both.
+fn wanted(signed_in: bool, relay: bool, link_my_devices: bool, no_random: bool) -> bool {
+    signed_in && relay && link_my_devices && !no_random
+}
+
 fn name_of(seen: &Seen) -> String {
     seen.peer.shown().map_or_else(|| "A device".to_string(), |shown| shown.tell.name.clone())
 }
@@ -476,7 +483,7 @@ impl Controller {
             link.looking = false;
             link.looks += 1;
         }
-        let wanted = self.client().is_some() && self.can_host_jam() && !self.link.borrow().off;
+        let wanted = wanted(self.client().is_some(), self.can_host_jam(), self.settings.borrow().link_devices, self.link.borrow().off);
         if !wanted {
             self.link_end("");
             return self.link_show();
@@ -928,6 +935,13 @@ mod tests {
             assert_eq!(file.exists(), kept, "{name}");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn link_my_devices_off_is_off_for_the_new_linking_too() {
+        assert!(wanted(true, true, true, false));
+        assert!(!wanted(true, true, false, false), "the setting is off");
+        assert!(!wanted(false, true, true, false) && !wanted(true, false, true, false) && !wanted(true, true, true, true));
     }
 
     #[test]
