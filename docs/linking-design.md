@@ -112,7 +112,10 @@ A **look** is: list the playlists; choose by the rule of `core/src/step.rs` (`fi
 the lowest id among those of that name whose owner the server states to be this
 account); fetch that playlist; check what was fetched. The fetched playlist counts
 only if its id is the one asked for, its name is the name, its **owner is stated** and
-is this account, and it is **stated private** (`public` present and `false`). An
+is this account, and it is **stated private** (`public` present and `false`).
+Navidrome's JSON leaves `public` out when it is false, so that answer cannot state it;
+its XML answer always writes the attribute, and the app asks for the playlist again in
+XML and reads it there, from an "ok" answer about that id. An
 answer that fails any of these, or leaves one out, is not used, is not written over,
 and does not renew the ten minutes. A server that does not state these cannot be used
 for linking, and the app says so. The name is added to the reserved names.
@@ -187,8 +190,8 @@ this route, and it shares no code with jams. Answers carry `Cache-Control: no-st
   no longer prints the host key at start-up, whether set or made up; with none set it
   does not start.
 - Statuses: 400 a room, place or body that is not well formed; 401 the host key; 404
-  no such room, place or token; 409 the place is taken; 410 old linking is off; 413;
-  429 with `Retry-After`; 503 full.
+  no such room, place or token; 409 the place is taken; 410 old linking is off; 411 a
+  body that does not state its length; 413; 429 with `Retry-After`; 503 full.
 
 | Limit | Value | When passed |
 |---|---|---|
