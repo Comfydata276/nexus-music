@@ -130,7 +130,7 @@ impl Downloads {
             return;
         }
         if let Ok(json) = serde_json::to_vec(&self.entries) {
-            crate::config::write_atomically(&self.dir.join(format!("index-{}.json", self.account)), &json);
+            let _ = crate::config::write_surely(&self.dir.join(format!("index-{}.json", self.account)), &json);
         }
         self.unsaved = false;
         self.saved_at = std::time::Instant::now();
@@ -152,7 +152,7 @@ impl Downloads {
             self.collections.push(id.to_string());
         }
         if let (Ok(json), false) = (serde_json::to_vec(&self.collections), self.account.is_empty()) {
-            crate::config::write_atomically(&self.dir.join(format!("collections-{}.json", self.account)), &json);
+            let _ = crate::config::write_surely(&self.dir.join(format!("collections-{}.json", self.account)), &json);
         }
     }
 

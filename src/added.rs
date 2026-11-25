@@ -54,7 +54,7 @@ impl Added {
 
     fn save(&self) {
         if let Ok(json) = serde_json::to_vec(&self.kept) {
-            crate::config::write_atomically(&self.path, &json);
+            let _ = crate::config::write_surely(&self.path, &json);
         }
     }
 

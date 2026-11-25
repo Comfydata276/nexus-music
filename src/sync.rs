@@ -304,17 +304,17 @@ pub fn kept_file(settings: &Path, account: &str, version: &str) -> std::path::Pa
 /// can be undone by hand. **The copy is its own proof.** If the file is there, the record
 /// has been kept, and the file is never opened for writing again; if it is not, it is
 /// written beside its place and comes to its name whole, only if the name is still not had
-/// (`config::write_once`). Either way its folder is synced before this returns. An error
-/// means it isn't there, or may not outlast a power cut: then nothing may be sent. Nothing
-/// else is asked or noted.
+/// (`config::write_whole`, with `config::ONCE`). Either way its folder is synced before this
+/// returns. An error means it isn't there, or may not outlast a power cut: then nothing may
+/// be sent. Nothing else is asked or noted.
 pub fn keep_first(settings: &Path, account: &str, version: &str, found: &str) -> std::io::Result<()> {
-    keep_first_by(settings, account, version, found, &crate::config::ON_DISK)
+    keep_first_by(settings, account, version, found, &crate::config::ONCE)
 }
 
 /// `keep_first`, by the steps given (a test's, to stop the app at one or have one fail).
 fn keep_first_by(settings: &Path, account: &str, version: &str, found: &str, steps: &crate::config::Steps) -> std::io::Result<()> {
     let path = kept_file(settings, account, version);
-    let made = if path.is_file() { Err(std::io::ErrorKind::AlreadyExists.into()) } else { crate::config::write_once(&path, found.as_bytes(), steps) };
+    let made = if path.is_file() { Err(std::io::ErrorKind::AlreadyExists.into()) } else { crate::config::write_whole(&path, found.as_bytes(), steps) };
     match made {
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && path.is_file() => {
             // There already (made by an earlier exchange, or by another attempt a moment
@@ -1585,7 +1585,7 @@ mod tests {
 
     #[test]
     fn a_copy_cut_short_by_a_kill_is_never_at_its_name_and_the_next_exchange_makes_it_whole_before_sending() {
-        use crate::config::{ON_DISK, Steps};
+        use crate::config::{ONCE, Steps};
         let (dir, settings) = kept_scratch("kill");
         let read = |name: &str| std::fs::read_to_string(dir.join(name)).ok();
         // Before anything is sent, the copy is at its name, whole, and nothing else is.
@@ -1594,9 +1594,9 @@ mod tests {
                 sync_folder: |path| {
                     // What is sent is sent after this: by now the name is the whole copy.
                     assert_eq!(std::fs::read_to_string(path.with_file_name(COPY)).unwrap(), FOUND);
-                    (ON_DISK.sync_folder)(path)
+                    (ONCE.sync_folder)(path)
                 },
-                ..ON_DISK
+                ..ONCE
             };
             keep_first_by(&settings, "tester", "0.40.8", FOUND, &steps).unwrap();
             assert_eq!((read(COPY).as_deref(), names_in(&dir)), (Some(FOUND), vec![COPY.to_string()]));
@@ -1607,16 +1607,16 @@ mod tests {
         // copy's own name, and the next exchange took it for the copy.
         let made_then_killed = Steps {
             create: |path| {
-                let _empty = (ON_DISK.create)(path)?;
+                let _empty = (ONCE.create)(path)?;
                 panic!("killed")
             },
-            ..ON_DISK
+            ..ONCE
         };
         assert!(killed(&settings, FOUND, made_then_killed));
         assert_eq!(read(COPY), None);
         next_exchange();
         // Killed when it was written and made sure of, before it had its name.
-        let written_then_killed = Steps { place: |_, _| panic!("killed"), ..ON_DISK };
+        let written_then_killed = Steps { place: |_, _| panic!("killed"), ..ONCE };
         assert!(killed(&settings, FOUND, written_then_killed));
         assert_eq!(read(COPY), None);
         next_exchange();
@@ -1637,13 +1637,13 @@ mod tests {
 
     #[test]
     fn a_copy_already_there_is_never_replaced_even_by_a_second_attempt_racing_the_first() {
-        use crate::config::{ON_DISK, Steps};
+        use crate::config::{ONCE, Steps};
         let (dir, settings) = kept_scratch("race");
         let read = |name: &str| std::fs::read_to_string(dir.join(name)).ok();
         // The move itself: onto a name that is had, it fails and changes neither file.
         std::fs::write(dir.join("from"), "new").unwrap();
         std::fs::write(dir.join("to"), "kept").unwrap();
-        let moved = (ON_DISK.place)(&dir.join("from"), &dir.join("to"));
+        let moved = (ONCE.place)(&dir.join("from"), &dir.join("to"));
         assert_eq!(moved.map_err(|error| error.kind()), Err(std::io::ErrorKind::AlreadyExists));
         assert_eq!((read("from").as_deref(), read("to").as_deref()), (Some("new"), Some("kept")));
         std::fs::remove_file(dir.join("from")).unwrap();
@@ -1653,9 +1653,9 @@ mod tests {
         let raced = Steps {
             place: |from, to| {
                 std::fs::write(to, "the other attempt's copy").unwrap();
-                (ON_DISK.place)(from, to)
+                (ONCE.place)(from, to)
             },
-            ..ON_DISK
+            ..ONCE
         };
         keep_first_by(&settings, "tester", "0.40.8", FOUND, &raced).unwrap();
         assert_eq!((read(COPY).as_deref(), names_in(&dir)), (Some("the other attempt's copy"), vec![COPY.to_string()]));
@@ -1664,7 +1664,7 @@ mod tests {
 
     #[test]
     fn a_flush_move_or_folder_sync_that_fails_means_nothing_is_sent() {
-        use crate::config::{ON_DISK, Steps};
+        use crate::config::{ONCE, Steps};
         let (dir, settings) = kept_scratch("fail");
         let read = |name: &str| std::fs::read_to_string(dir.join(name)).ok();
         fn fails() -> std::io::Result<()> {
@@ -1673,18 +1673,18 @@ mod tests {
         let keep = |steps: Steps| keep_first_by(&settings, "tester", "0.40.8", FOUND, &steps);
         // Not made sure of, or not moved: an error, and nothing at the copy's name or
         // beside it.
-        assert!(keep(Steps { flush: |_| fails(), ..ON_DISK }).is_err());
+        assert!(keep(Steps { flush: |_| fails(), ..ONCE }).is_err());
         assert_eq!(names_in(&dir), Vec::<String>::new());
-        assert!(keep(Steps { place: |_, _| fails(), ..ON_DISK }).is_err());
+        assert!(keep(Steps { place: |_, _| fails(), ..ONCE }).is_err());
         assert_eq!(names_in(&dir), Vec::<String>::new());
         // Moved, and its folder not synced: an error (on Windows there is no folder to
         // sync, and the move itself is written through). The copy is whole at its name, and
         // the next exchange syncs the folder before it counts it as kept.
-        assert!(keep(Steps { sync_folder: |_| fails(), ..ON_DISK }).is_err());
+        assert!(keep(Steps { sync_folder: |_| fails(), ..ONCE }).is_err());
         assert_eq!(read(COPY).as_deref(), Some(FOUND));
         // Found there already, and its folder can't be synced: an error.
-        assert!(keep(Steps { sync_folder: |_| fails(), ..ON_DISK }).is_err());
-        keep(ON_DISK).unwrap();
+        assert!(keep(Steps { sync_folder: |_| fails(), ..ONCE }).is_err());
+        keep(ONCE).unwrap();
         assert_eq!((read(COPY).as_deref(), names_in(&dir)), (Some(FOUND), vec![COPY.to_string()]));
         let _ = std::fs::remove_dir_all(&dir);
     }

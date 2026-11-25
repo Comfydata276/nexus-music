@@ -101,7 +101,7 @@ impl Controller {
         let (sending, pending) = (self.sending.borrow(), self.pending.borrow());
         let held: Vec<&Pending> = sending.iter().chain(pending.iter()).collect();
         if let Ok(json) = serde_json::to_vec(&held) {
-            crate::config::write_atomically(&path, &json);
+            let _ = crate::config::write_surely(&path, &json);
         }
     }
 
@@ -149,7 +149,7 @@ impl Controller {
                         let mut held = sent.kept;
                         held.extend(load_pending(&path).into_iter().skip(waiting.len()));
                         if let Ok(json) = serde_json::to_vec(&held) {
-                            crate::config::write_atomically(&path, &json);
+                            let _ = crate::config::write_surely(&path, &json);
                         }
                     }
                     return;

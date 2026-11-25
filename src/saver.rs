@@ -67,7 +67,7 @@ fn work(waiting: Receiver<Job>) {
                 _ if superseded => {}
                 Job::Write(path, make) => {
                     if let Some(bytes) = make() {
-                        crate::config::write_atomically(&path, &bytes);
+                        let _ = crate::config::write_surely(&path, &bytes);
                     }
                 }
                 Job::Remove(path) => {

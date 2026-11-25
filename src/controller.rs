@@ -650,7 +650,7 @@ impl Controller {
         let crashed = size > seen;
         if crashed {
             // Whole or not at all: a number cut short would be taken for one that was seen.
-            config::write_atomically(&seen_file, size.to_string().as_bytes());
+            let _ = config::write_surely(&seen_file, size.to_string().as_bytes());
         }
         let note = self.startup_note.borrow_mut().take().or_else(|| {
             crashed.then(|| "The app stopped unexpectedly last time. “Save diagnostics” under Settings, About has what was noted.".to_string())

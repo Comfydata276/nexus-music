@@ -508,7 +508,7 @@ impl Settings {
 
     pub fn save(&self, path: &Path) {
         if let Ok(json) = serde_json::to_vec_pretty(self) {
-            write_atomically(path, &json);
+            let _ = write_surely(path, &json);
         }
     }
 
@@ -657,45 +657,26 @@ pub fn load_history(path: &Path) -> Vec<Played> {
 
 pub fn save_history(path: &Path, history: &[Played]) {
     if let Ok(json) = serde_json::to_vec(history) {
-        write_atomically(path, &json);
+        let _ = write_surely(path, &json);
     }
 }
 
-pub fn write_atomically(path: &Path, bytes: &[u8]) {
-    let temp = path.with_extension("tmp");
-    if fs::write(&temp, bytes).is_ok() {
-        let _ = fs::rename(&temp, path);
-    }
-}
-
-/// As `write_atomically`, for what has to be known to be on the disk: written, flushed to
-/// the disk, and put in place, or an error and the file as it was.
-pub fn write_surely(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    let temp = beside(path);
-    let mut file = fs::File::create(&temp)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    drop(file);
-    fs::rename(&temp, path)
-}
-
-/// The name beside a file's that it is written under before it is put in place.
-pub fn beside(path: &Path) -> PathBuf {
-    path.with_extension("tmp")
-}
-
-/// As `write_surely`, for a file that is made once and never replaced: written beside its
-/// place, flushed to the disk, and only then given its name, if nothing has that name; then
-/// its folder is synced. So whatever is at the name is the whole file, or nothing is. If
-/// something has the name already it is left as it is, and the error is `AlreadyExists`.
-/// What a stopped attempt left beside the name is never read: it is cleared first.
-pub fn write_once(path: &Path, bytes: &[u8], steps: &Steps) -> std::io::Result<()> {
+/// **The one way the app writes a file it must not lose**, so that a kill or a power cut
+/// leaves either the file as it was or the file as it is now, never one cut short, and never
+/// an empty one: written beside its place (`beside`), flushed to the disk, given its name by
+/// `steps.place`, and its folder synced (Linux). What a stopped attempt left beside it is
+/// cleared first and never read. If any step fails, an error, and the file as it was.
+///
+/// Whether it may replace a file that has the name is the steps': `REPLACING` (`fs::rename`,
+/// for a file written again and again: `write_surely`) does, `ONCE` (for a file made once and
+/// never replaced: the kept copy of the shared record, the start of the log of plays) never
+/// does, and gives `AlreadyExists` instead.
+pub fn write_whole(path: &Path, bytes: &[u8], steps: &Steps) -> std::io::Result<()> {
     use std::io::Write;
     let temp = beside(path);
     // Removed, not written over: the next file there is a new one, so nothing else that
     // names the old one (on Linux, the copy itself, if an attempt was stopped between the
-    // two steps of its move) is written through it.
+    // two steps of a move that doesn't replace) is written through it.
     match fs::remove_file(&temp) {
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
         _ => {}
@@ -715,26 +696,46 @@ pub fn write_once(path: &Path, bytes: &[u8], steps: &Steps) -> std::io::Result<(
     (steps.sync_folder)(path)
 }
 
-/// The steps by which `write_once` puts a file on the disk, given so that a test can have
-/// the app stopped at one of them, or have one fail. `ON_DISK` are the real ones.
+/// `write_whole`, over whatever has the name: for what is written again and again (the
+/// settings, the queue, what waits to be sent, ...). A caller that has nothing to do about a
+/// failure leaves the error be: the file is then as it was.
+pub fn write_surely(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_whole(path, bytes, &REPLACING)
+}
+
+/// The name beside a file's that it is written under before it is put in place.
+pub fn beside(path: &Path) -> PathBuf {
+    path.with_extension("tmp")
+}
+
+/// The steps by which `write_whole` puts a file on the disk, given so that a test can have
+/// the app stopped at one of them, or have one fail. `ONCE` and `REPLACING` are the real
+/// ones.
 #[derive(Clone, Copy)]
 pub struct Steps {
     /// Makes a new, empty file to write, only if nothing has its name.
     pub create: fn(&Path) -> std::io::Result<fs::File>,
     /// Makes sure what was written to it is on the disk.
     pub flush: fn(&fs::File) -> std::io::Result<()>,
-    /// Gives the file written beside its place its own name, if nothing has that name.
+    /// Gives the file written beside its place its own name: over what has it
+    /// (`REPLACING`), or only if nothing has it (`ONCE`).
     pub place: fn(&Path, &Path) -> std::io::Result<()>,
     /// Makes the names in a file's folder outlast a power cut.
     pub sync_folder: fn(&Path) -> std::io::Result<()>,
 }
 
-pub const ON_DISK: Steps = Steps {
+/// For a file made once and never replaced.
+pub const ONCE: Steps = Steps {
     create: |path| fs::OpenOptions::new().write(true).create_new(true).open(path),
     flush: fs::File::sync_all,
     place: place_new,
     sync_folder,
 };
+
+/// For a file written again and again: it replaces what has the name. (Without
+/// write-through on Windows: the file was flushed before the rename, so a power cut leaves
+/// the old file or the new one, whichever the rename had got to.)
+pub const REPLACING: Steps = Steps { place: |from, to| fs::rename(from, to), ..ONCE };
 
 /// Moves `from` to `to` only if nothing has the name `to`, and never over what has it:
 /// `AlreadyExists` then, and both left as they are. (`fs::rename` replaces.) Windows:
@@ -891,6 +892,11 @@ mod tests {
         assert!(settings.server == "https://music.example.org" && settings.volume == 0.4);
         assert!(note.unwrap().contains("damaged"));
         assert_eq!(Settings::load_checked(&path).0.server, "https://music.example.org");
+        // Empty, as a power cut could leave it when it was renamed into place unflushed: the
+        // same.
+        fs::write(&path, b"").unwrap();
+        let (settings, note) = Settings::load_checked(&path);
+        assert!(settings.server == "https://music.example.org" && note.unwrap().contains("damaged"));
         // No copy either: the damaged file is kept under another name, not overwritten.
         fs::write(&path, b"not settings at all").unwrap();
         fs::remove_file(dir.join("settings.backup.json")).unwrap();
@@ -898,6 +904,100 @@ mod tests {
         assert!(settings.server.is_empty() && note.unwrap().contains("settings.damaged.json"));
         assert_eq!(fs::read(dir.join("settings.damaged.json")).unwrap(), b"not settings at all");
         assert!(!path.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+
+    /// A disk on which what was never flushed is lost at a power cut: `flush` notes that
+    /// what was written is on it, and `place`, given the file its name, then cuts the power,
+    /// and the name keeps only what was flushed.
+    mod power_cut {
+        use super::*;
+        use std::cell::Cell;
+
+        thread_local!(static FLUSHED: Cell<bool> = const { Cell::new(false) });
+
+        pub const STEPS: Steps = Steps {
+            flush: |file| {
+                FLUSHED.set(true);
+                file.sync_all()
+            },
+            place: |from, to| {
+                fs::rename(from, to)?;
+                if !FLUSHED.get() {
+                    fs::File::create(to)?;
+                }
+                panic!("the power went")
+            },
+            ..REPLACING
+        };
+
+        pub fn reset() {
+            FLUSHED.set(false);
+        }
+    }
+
+    /// Writes `bytes` over `path` and has the app "killed" where `steps` panic: what was done
+    /// up to there stays on the disk, and nothing after it is done.
+    fn killed(path: &Path, bytes: &str, steps: Steps) -> bool {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| write_whole(path, bytes.as_bytes(), &steps))).is_err()
+    }
+
+    #[test]
+    fn a_file_written_over_is_the_old_one_or_the_new_one_after_a_kill_or_a_power_cut() {
+        let dir = std::env::temp_dir().join(format!("nexus-whole-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("queue.json");
+        let temp = beside(&path);
+        fs::write(&path, "the old queue").unwrap();
+        // Killed once the file beside it was made, and once it was written and not yet
+        // renamed: the file is as it was.
+        let made_then_killed = Steps {
+            create: |path| {
+                let _empty = (REPLACING.create)(path)?;
+                panic!("killed")
+            },
+            ..REPLACING
+        };
+        assert!(killed(&path, "the new queue", made_then_killed));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "the old queue");
+        assert!(killed(&path, "the new queue", Steps { place: |_, _| panic!("killed"), ..REPLACING }));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "the old queue");
+        // What a kill left beside it, half written, is never read, and the next write
+        // clears it.
+        fs::write(&temp, "the new q").unwrap();
+        write_surely(&path, b"the new queue").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "the new queue");
+        assert!(!temp.exists());
+        // The power goes the moment the new file has its name: it is the whole new file,
+        // because it was flushed before it was given the name. (Not flushed, as
+        // `write_atomically` did before, the name would be left with nothing in it.)
+        power_cut::reset();
+        assert!(killed(&path, "the newest queue", power_cut::STEPS));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "the newest queue");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_flush_or_rename_that_fails_leaves_the_file_as_it_was() {
+        let dir = std::env::temp_dir().join(format!("nexus-whole-fail-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pending.json");
+        fn fails() -> std::io::Result<()> {
+            Err(std::io::Error::other("the disk said no"))
+        }
+        fs::write(&path, "as it was").unwrap();
+        for steps in [Steps { flush: |_| fails(), ..REPLACING }, Steps { place: |_, _| fails(), ..REPLACING }] {
+            assert!(write_whole(&path, b"new", &steps).is_err());
+            assert_eq!(fs::read_to_string(&path).unwrap(), "as it was");
+            assert!(!beside(&path).exists());
+        }
+        // Renamed, and its folder not synced (Linux): in place, and an error all the same,
+        // for a caller that must know it will outlast a power cut.
+        assert!(write_whole(&path, b"new", &Steps { sync_folder: |_| fails(), ..REPLACING }).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new");
         let _ = fs::remove_dir_all(&dir);
     }
 

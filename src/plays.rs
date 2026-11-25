@@ -187,7 +187,7 @@ impl PlayLog {
     /// is read for the lines that read, and added to as usual; it is not written again
     /// whole (see `whole`).
     pub fn load(old: &Path, recent: &[(String, i64)]) -> PlayLog {
-        PlayLog::load_by(old, recent, &crate::config::ON_DISK)
+        PlayLog::load_by(old, recent, &crate::config::ONCE)
     }
 
     /// `load`, starting a log by the steps given (a test's, to stop the app at one or have
@@ -279,7 +279,7 @@ impl PlayLog {
             // A log read whole is written again whole, in order; one with lines that did not
             // read is only added to (`whole`).
             let written = if self.whole { crate::config::write_surely(&self.path, text(&all).as_bytes()) } else { append(&self.path, &text(&missing)) };
-            if written.and_then(|()| (crate::config::ON_DISK.sync_folder)(&self.path)).is_err() {
+            if written.and_then(|()| (crate::config::ONCE.sync_folder)(&self.path)).is_err() {
                 return;
             }
             self.restored = missing.len();
@@ -303,10 +303,10 @@ impl PlayLog {
     /// log has it. If it is there and can't be read just now, no log is made without it
     /// (an error); if it reads and isn't such a list, it is left where it is. Failing a
     /// list, the log starts with `recent`: what Recently played remembers, so that it
-    /// isn't empty on day one. The file comes to its name whole or not at all
-    /// (`config::write_once`), only if nothing has the name: a log is never written over by
-    /// this, and what a stopped start left beside it is never the log. The list goes only
-    /// once the log is on the disk.
+    /// isn't empty on day one. The file comes to its name whole or not at all, and only if
+    /// nothing has the name (`config::write_whole`, with `config::ONCE`): a log is never
+    /// written over by this, and what a stopped start left beside it is never the log. The
+    /// list goes only once the log is on the disk.
     fn begin(&self, old: &Path, recent: &[(String, i64)], steps: &crate::config::Steps) -> std::io::Result<Vec<(String, i64)>> {
         let carried = match std::fs::read(old) {
             Ok(bytes) => serde_json::from_slice::<Vec<(String, i64)>>(&bytes).ok(),
@@ -317,7 +317,7 @@ impl PlayLog {
         let mut plays = carried.unwrap_or_else(|| recent.to_vec());
         plays.sort_by_key(|(_, at)| *at);
         let lines: String = plays.iter().map(|(song, at)| line(song, *at, "")).collect();
-        crate::config::write_once(&self.path, lines.as_bytes(), steps)?;
+        crate::config::write_whole(&self.path, lines.as_bytes(), steps)?;
         if from_old {
             let _ = std::fs::remove_file(old);
         }
@@ -326,7 +326,7 @@ impl PlayLog {
 
     fn rewrite(&self, plays: &[(String, i64)]) {
         let text: String = plays.iter().map(|(song, at)| line(song, *at, &source_of(song, *at))).collect();
-        crate::config::write_atomically(&self.path, text.as_bytes());
+        let _ = crate::config::write_surely(&self.path, text.as_bytes());
     }
 
     /// Takes the oldest plays out once the log is well past its limit.
@@ -552,7 +552,7 @@ mod tests {
         // time the new one is made, it is not written over.
         std::fs::write(&path, "[\"a\",100]\n").unwrap();
         let log = PlayLog { path: path.clone(), lines: 0, unwritten: Vec::new(), aside: false, whole: true, unread: false, restored: 0 };
-        assert!(log.begin(&old, &[play("z", 50)], &crate::config::ON_DISK).is_err());
+        assert!(log.begin(&old, &[play("z", 50)], &crate::config::ONCE).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "[\"a\",100]\n");
         std::fs::remove_file(&path).unwrap();
         // The list from before 0.26 is there and is damaged: the log starts from Recently
@@ -717,7 +717,7 @@ mod tests {
 
     #[test]
     fn a_log_cut_short_by_a_kill_while_it_is_started_is_never_at_its_name() {
-        use crate::config::{ON_DISK, Steps};
+        use crate::config::{ONCE, Steps};
         let _turn = turn();
         let (old, path) = fresh("kill");
         let beside = crate::config::beside(&path);
@@ -727,14 +727,14 @@ mod tests {
         // is still there.
         let made_then_killed = Steps {
             create: |path| {
-                let _empty = (ON_DISK.create)(path)?;
+                let _empty = (ONCE.create)(path)?;
                 panic!("killed")
             },
-            ..ON_DISK
+            ..ONCE
         };
         assert!(killed(&old, made_then_killed));
         assert!(!path.exists(), "an empty log at its name");
-        let written_then_killed = Steps { place: |_, _| panic!("killed"), ..ON_DISK };
+        let written_then_killed = Steps { place: |_, _| panic!("killed"), ..ONCE };
         assert!(killed(&old, written_then_killed));
         assert!(!path.exists(), "a log at its name before it was given it");
         assert_eq!(std::fs::read_to_string(&old).unwrap(), LIST);
@@ -750,14 +750,14 @@ mod tests {
 
     #[test]
     fn a_log_that_cannot_be_made_sure_of_or_named_is_not_started_and_nothing_is_lost() {
-        use crate::config::{ON_DISK, Steps};
+        use crate::config::{ONCE, Steps};
         let _turn = turn();
         let (old, path) = fresh("fail");
         fn fails() -> std::io::Result<()> {
             Err(std::io::Error::other("the disk said no"))
         }
         std::fs::write(&old, LIST).unwrap();
-        for steps in [Steps { flush: |_| fails(), ..ON_DISK }, Steps { place: |_, _| fails(), ..ON_DISK }] {
+        for steps in [Steps { flush: |_| fails(), ..ONCE }, Steps { place: |_, _| fails(), ..ONCE }] {
             let mut log = PlayLog::load_by(&old, &[play("z", 50)], &steps);
             assert!(!path.exists() && !crate::config::beside(&path).exists());
             // What is played meanwhile is kept beside it, as for a log that can't be read.
