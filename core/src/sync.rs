@@ -6,6 +6,12 @@
 //! This is the layout of that text and the merge. Every app on the account has to do both
 //! identically, or they undo each other's changes. Talking to the server, and applying what
 //! comes back, is each app's own.
+//!
+//! `merge` combines whatever two records it is given and stamps the result with this
+//! layout. It does not look at the layout number of either: before merging what it read
+//! from the server, and before writing anything back, an app has to check that the server's
+//! copy isn't in a later layout (`nexus_music_sync` greater than `VERSION`), and leave such
+//! a copy alone (the Windows app's `exchange` does).
 
 use std::collections::HashMap;
 

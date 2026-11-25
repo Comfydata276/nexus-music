@@ -33,6 +33,11 @@ pub const THEIR_IDLE: Duration = Duration::from_secs(12);
 type Releases = (String, Vec<Offer>);
 
 /// MusicBrainz, asked through the app's own way of making requests.
+///
+/// An app makes one of these and uses it for everything. The gap MusicBrainz asks for
+/// between requests, and the wait when it says it's busy, are kept by the one that made
+/// the last request: two of them would each keep their own, and together ask twice as
+/// often as allowed. Nothing here stops an app making two.
 pub struct MusicBrainz {
     http: Arc<dyn Http>,
     listenbrainz: ListenBrainz,

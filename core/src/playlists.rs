@@ -6,6 +6,11 @@
 //! themselves, and worked out on the playlist as the server has it at that moment. This is
 //! the describing and the working out; reading the playlist and sending the change is each
 //! app's own.
+//!
+//! `apply` and `positions` work on whatever list they are given. They do not check that the
+//! list is all the server holds: before sending a removal by position, or a whole new list,
+//! an app has to ask `hides_songs` of the same read of the playlist, and send nothing if it
+//! says yes (the Windows app's `playlists::carry_out` is that).
 
 use crate::model::Playlist;
 
