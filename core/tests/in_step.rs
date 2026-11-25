@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use nexus_core::notes::{Kept, Note, Notes};
 use nexus_core::playlists::{Edit, spot};
 use nexus_core::record::{self, Read};
-use nexus_core::step::{Agreed, Answers, Change, Choices, Device, Found, Held, Outcome, Plan, Stated, Stop, Write, clock, find, history, limits, reserved, settle};
+use nexus_core::step::{Agreed, Answers, Change, Choices, Device, Found, Held, Outcome, Plan, Stated, Stop, UNANSWERED, Write, clock, find, history, limits, reserved, settle};
 use nexus_core::time::Clock;
 use nexus_core::sync::{LONG_AGO, ListPrefs, PLAYLIST_NAME, PLAYS_SHARED, Shared};
 
@@ -418,6 +418,57 @@ fn the_last_word_on_one_thing_is_the_one_that_waits_and_one_taken_back_unsent_is
     assert!(device.choices.sending(&write));
     device.does(Change::Unpin("c".into()));
     assert_eq!(device.choices.waiting.len(), 2);
+    assert_eq!(device.pins(), ["p1", "p2"]);
+}
+
+#[test]
+fn an_undoing_is_kept_while_the_write_it_undoes_could_still_arrive() {
+    // As seen in the running app. The device pins C; the write is sent and held up on its
+    // way (not yet at the server); the person undoes the pin. The device gives up waiting
+    // for the answer, and exchanges again: the record has no C, and the pin and its
+    // undoing come to nothing.
+    let held_up = |server: &mut Server| {
+        let mut device = in_step(server);
+        device.does(Change::Pin("c".into()));
+        let reads = device.read(server);
+        let first = plan(device.decide(&reads));
+        assert!(device.take(&first));
+        let write = first.write.unwrap();
+        assert!(device.choices.sending(&write));
+        device.does(Change::Unpin("c".into()));
+        (device.clock, server.date) = (NOW + 50, Some(NOW + 50));
+        assert_eq!(device.exchange(server), None);
+        assert!(server.writes.is_empty());
+        assert_eq!(device.pins(), ["p1", "p2"]);
+        (device, write)
+    };
+    let mut server = Server::with(&text(&pc()));
+    let mut other = in_step(&mut server);
+    let (mut device, write) = held_up(&mut server);
+    // Nothing is let go yet: the write may still arrive.
+    assert_eq!(device.choices.waiting.len(), 2);
+    // It does arrive, after all that: C is pinned in the record.
+    server.take(&write);
+    assert_eq!(server.record("r").pins, ["p1", "p2", "c"]);
+    // At the device's next look the undoing is made on top of it. C is pinned nowhere, the
+    // changes are done with, and the other device never keeps it.
+    (device.clock, server.date) = (NOW + 110, Some(NOW + 110));
+    assert_eq!(device.exchange(&mut server), None);
+    assert_eq!((server.record("r").pins, device.pins()), (pins(&["p1", "p2"]), pins(&["p1", "p2"])));
+    assert!(device.choices.waiting.is_empty());
+    assert_eq!(other.exchange(&mut server), None);
+    assert_eq!(other.pins(), ["p1", "p2"]);
+
+    // If the write never arrives, the two are let go once it no longer could: nothing was
+    // ever written, and nothing is.
+    let mut server = Server::with(&text(&pc()));
+    let (mut device, _) = held_up(&mut server);
+    (device.clock, server.date) = (NOW + UNANSWERED - 1, Some(NOW + UNANSWERED - 1));
+    assert_eq!(device.exchange(&mut server), None);
+    assert_eq!(device.choices.waiting.len(), 2);
+    (device.clock, server.date) = (NOW + UNANSWERED, Some(NOW + UNANSWERED));
+    assert_eq!(device.exchange(&mut server), None);
+    assert!(device.choices.waiting.is_empty() && server.writes.is_empty());
     assert_eq!(device.pins(), ["p1", "p2"]);
 }
 

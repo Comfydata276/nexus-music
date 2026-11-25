@@ -293,6 +293,8 @@ A PC that step 3 was not done on puts back whatever it holds that is newer than 
   before either had seen the other's) holds data nobody reads: every device uses the one with
   the lowest id. To see it, look for two playlists of that name in Navidrome's own pages; to
   be rid of it, check its comment holds nothing wanted and delete it there.
+- A change that is sent, held up on its way for more than ten minutes, and undone here in
+  the meantime, is not undone again when it finally arrives. (Up to ten minutes, it is.)
 - An edit made in the fraction of a second between the app deciding what to send and sending
   it goes as it was decided, and is put right by the next exchange.
 - What arrives from other devices (pins, sorts, the theme, dates, Recently played) is written

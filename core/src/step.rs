@@ -61,7 +61,9 @@
 //!       sign-in's own connection.
 //!    4. Only once the server has answered that it took the write: [`Choices::written`],
 //!       saved. If no answer comes, do nothing: the changes stay as tried, and the next
-//!       exchange makes them again.
+//!       exchange makes them again. (A change the person makes on top of them meanwhile is
+//!       kept for [`UNANSWERED`] after the write was sent, even if the two come to nothing:
+//!       the write may yet arrive.)
 //!
 //! A change the person makes ([`Choices::change`]) is saved, surely, **before** it is shown
 //! as made, and is made under the account signed in: it is only ever sent for that account.
@@ -177,6 +179,11 @@ impl Change {
     }
 }
 
+/// How long after a write was sent and never answered it is taken that it may still arrive.
+/// The app waits 45 seconds for any answer; something between it and the server could hold
+/// a request longer and deliver it all the same. Ten minutes is far past either.
+pub const UNANSWERED: i64 = 10 * 60;
+
 /// A change that is waiting to be shared.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Waiting {
@@ -193,6 +200,16 @@ pub struct Waiting {
     /// it. Until it is, the change stays: it will be made again at the next exchange.
     #[serde(default)]
     pub tried: bool,
+    /// When that write was made ([`Write::at`]); 0 when none has been.
+    #[serde(default)]
+    pub tried_at: i64,
+}
+
+impl Waiting {
+    /// A write that carried this was sent, has not been answered, and may still arrive.
+    fn on_its_way(&self, now: i64) -> bool {
+        self.tried && now.saturating_sub(self.tried_at) < UNANSWERED
+    }
 }
 
 /// What a device shows: what was agreed, with the waiting changes on top.
@@ -238,7 +255,7 @@ impl Choices {
         let about = change.about();
         self.waiting.retain(|waits| waits.account != account || waits.tried || !waits.change.about().iter().all(|thing| about.contains(thing)));
         let without = self.shown(account);
-        self.waiting.push(Waiting { id: self.next, account: account.to_string(), change: change.clone(), tried: false });
+        self.waiting.push(Waiting { id: self.next, account: account.to_string(), change: change.clone(), tried: false, tried_at: 0 });
         let tried = self.waiting_for(account).any(|waits| waits.tried && waits.change.about().iter().any(|thing| about.contains(thing)));
         if !tried && self.shown(account) == without {
             self.waiting.pop();
@@ -276,6 +293,7 @@ impl Choices {
         }
         for waits in self.waiting.iter_mut().filter(|waits| write.carried.contains(&waits.id)) {
             waits.tried = true;
+            waits.tried_at = write.at;
         }
         true
     }
@@ -537,6 +555,9 @@ pub struct Write {
     pub found: String,
     /// The changes this write carries ([`Choices::sending`], [`Choices::written`]).
     pub carried: Vec<u64>,
+    /// When it was decided, by the server's clock where that is known.
+    #[serde(default)]
+    pub at: i64,
     /// What is agreed once the server has taken it.
     pub agreed: Agreed,
 }
@@ -731,6 +752,13 @@ pub fn settle(device: &Device, answers: &Answers) -> Outcome {
     // another account are not this exchange's: they wait for theirs.
     let waiting: Vec<&Waiting> = device.choices.waiting_for(&device.account).collect();
     let record = onto(&merged, &waiting, now);
+    // A write that was sent and never answered may still arrive (it was held up on its way;
+    // the app stopped waiting). While it could, a change the person has made on top of what
+    // it carried is kept even when the two come to nothing against what the server has
+    // now: if the write does arrive, the later change is still there to be made on top of
+    // it. (Pinned, the write held up, unpinned: let go as "nothing to do", the pin would
+    // arrive afterwards and stay.) A change with nothing made on top of it is not kept so.
+    let unsettled = waiting.iter().any(|waits| waits.on_its_way(now)) && waiting.iter().any(|waits| !waits.tried);
     let waiting: Vec<u64> = waiting.iter().map(|waits| waits.id).collect();
     let adds = record != theirs && (!comment.is_empty() || says(&record));
     // What would be written is checked as what is read is checked: a record this device
@@ -750,6 +778,7 @@ pub fn settle(device: &Device, answers: &Answers) -> Outcome {
         text,
         found: comment.to_string(),
         carried: waiting.clone(),
+        at: now,
         agreed: Agreed::of(&record),
     });
     Outcome::Go(Box::new(Plan {
@@ -762,7 +791,7 @@ pub fn settle(device: &Device, answers: &Answers) -> Outcome {
             agreed: Agreed::of(&merged),
             // With nothing to write, a change that waited has been found to alter nothing.
             // (Held back, it still waits.)
-            done: if write.is_none() && held.is_none() && record == merged { waiting } else { Vec::new() },
+            done: if write.is_none() && held.is_none() && record == merged && !unsettled { waiting } else { Vec::new() },
             notes: theirs.added.clone(),
             history: theirs.history.clone(),
         },
