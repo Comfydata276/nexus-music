@@ -431,7 +431,7 @@ impl Controller {
         let mut write = plan.write;
         if let Some(carries) = &write {
             // 7.1: the record as this version first found it is kept, or nothing is sent.
-            let account = self.settings.borrow().account();
+            let account = self.settings.borrow().account_file();
             if keep_first(&self.paths.settings, &account, env!("CARGO_PKG_VERSION"), &carries.found).is_err() {
                 self.sync_says("A copy of the shared record couldn't be kept on this PC first, so nothing was written.");
                 write = None;

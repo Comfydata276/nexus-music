@@ -182,8 +182,10 @@ impl Change {
 pub struct Waiting {
     /// Which change this is, among all this device has ever made.
     pub id: u64,
-    /// The account it was made under (a device's own name for a sign-in: the server and the
-    /// user). It is only ever sent for that account; under any other it waits, untouched.
+    /// The account it was made under: **the server's address and the username, each exactly
+    /// as signed in with**, in one text (the caller's to put together, never shortened or
+    /// made "safe": two accounts must never come out the same). It is compared as text. The
+    /// change is only ever sent for that account; under any other it waits, untouched.
     #[serde(default)]
     pub account: String,
     pub change: Change,
@@ -409,8 +411,8 @@ pub const RESERVED: &str = "Nexus Music keeps that name for itself, for keeping 
 pub struct Device {
     /// The account's name, as the device signs in with it.
     pub username: String,
-    /// The device's own name for this sign-in (the server and the user): the waiting
-    /// changes made under it are the ones this exchange may carry.
+    /// This sign-in, exactly (see [`Waiting::account`]): the waiting changes made under it
+    /// are the ones this exchange may carry.
     pub account: String,
     pub choices: Choices,
     /// The dated notes of when songs were added: the person's own changes on this device,

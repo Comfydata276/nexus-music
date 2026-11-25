@@ -417,11 +417,32 @@ impl Settings {
         self.show();
     }
 
-    /// The app's name for the sign-in these settings hold (the server and the user), as it
-    /// can be part of a file's name. A change the person makes is made under it, and is
-    /// only ever shared for it (see `nexus_core::step`).
+    /// The sign-in these settings hold: the server's address as the app keeps it, and the
+    /// username, each exactly as it is. Two sign-ins are the same account only when this is
+    /// the same text. A change the person makes is made under it and is only ever shared
+    /// for it (see `nexus_core::step`). (An address can't hold a line end, so the two parts
+    /// can't run into each other.)
     pub fn account(&self) -> String {
-        format!("{}|{}", self.server, self.username).chars().take(80).map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).collect()
+        format!("{}\n{}", self.server, self.username)
+    }
+
+    /// That account as part of a file's name: as much of it as reads easily, and then a
+    /// short hash of exactly what it is, so that no two accounts share a file, on a disk
+    /// that ignores case either.
+    pub fn account_file(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let host = self.server.trim_start_matches("https://").trim_start_matches("http://");
+        let mut readable = String::new();
+        for c in format!("{host} {}", self.username).chars() {
+            match c.to_ascii_lowercase() {
+                c if c.is_ascii_lowercase() || c.is_ascii_digit() => readable.push(c),
+                _ if readable.ends_with('-') || readable.is_empty() => {}
+                _ => readable.push('-'),
+            }
+        }
+        let readable: String = readable.chars().take(40).collect();
+        let hash: String = Sha256::digest(self.account().as_bytes()).iter().take(8).map(|byte| format!("{byte:02x}")).collect();
+        format!("{}-{hash}", readable.trim_end_matches('-'))
     }
 
     /// Brings what is shown up to date with `choices`: what was agreed with the server,
@@ -815,7 +836,7 @@ mod tests {
         // A change made now is kept as the change, puts no time on anything, and is on the
         // disk before it is shown.
         assert!(settings.choices.change(&settings.account(), Change::Pin("p3".into())));
-        assert_eq!(settings.account(), "https___music_example_org_");
+        assert_eq!(settings.account(), "https://music.example.org\n");
         settings.show();
         assert!(settings.save_surely(&path));
         let (again, _) = Settings::load_checked(&path);
@@ -829,6 +850,34 @@ mod tests {
         let agreed = &fresh.choices.agreed;
         assert_eq!((fresh.in_step, agreed.theme.as_str(), agreed.theme_at, agreed.pins_at, agreed.lists.len()), (1, "Violet", 0, 0, 0));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_account_is_told_from_another_by_exactly_what_it_is() {
+        use nexus_core::step::{Change, Choices};
+        let of = |server: &str, username: &str| Settings { server: server.into(), username: username.into(), ..Default::default() };
+        let home = "https://music.example.org";
+        // Two usernames that differ only in punctuation are two accounts: a change made
+        // under one is not the other's, to show or to send.
+        let (dot, under) = (of(home, "alice.smith"), of(home, "alice_smith"));
+        assert_ne!(dot.account(), under.account());
+        let mut choices = Choices::default();
+        choices.change(&dot.account(), Change::Pin("p".into()));
+        assert_eq!((choices.shown(&dot.account()).pins.len(), choices.shown(&under.account()).pins.len()), (1, 0));
+        // However long the server's address, the username is part of who it is.
+        let long = format!("https://{}.example.org", "a".repeat(120));
+        assert_ne!(of(&long, "one").account(), of(&long, "two").account());
+        // The same server and name are the same account, every time.
+        assert_eq!(dot.account(), of(home, "alice.smith").account());
+        // In a file's name: no two accounts share one, on a disk that ignores case either;
+        // and it is made of nothing a file's name can't hold, and isn't long.
+        let all = [dot, under, of(home, "Alice"), of(home, "alice"), of(&long, "one"), of(&long, "two"), of("http://music.example.org", "alice"), of(home, "")];
+        let names: Vec<String> = all.iter().map(|settings| settings.account_file()).collect();
+        let folded: std::collections::HashSet<String> = names.iter().map(|name| name.to_lowercase()).collect();
+        assert_eq!(folded.len(), names.len(), "{names:?}");
+        assert!(names.iter().all(|name| name.len() <= 64 && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')), "{names:?}");
+        // Readable, as far as it goes.
+        assert!(names[0].starts_with("music-example-org-alice-smith-"), "{names:?}");
     }
 
     #[test]
