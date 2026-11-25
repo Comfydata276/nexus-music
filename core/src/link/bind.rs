@@ -224,14 +224,15 @@ impl Player for Held {
     fn carry_out(&mut self, command: &Command, ready: &Ready) -> bool {
         match command {
             Command::Play => self.playing.brief.playing = self.playing.has_song,
-            Command::Pause => self.playing.brief.playing = false,
+            Command::Pause | Command::Moved => self.playing.brief.playing = false,
             _ => {}
         }
         // (Whatever was sounding was sounding before this: what sounds after it is for
         // the player to say.)
         self.playing.sounding_at = None;
-        // The person chose it at another of their devices; the rule has counted it.
-        self.ways.begin(Who::Elsewhere, true);
+        // The person chose it at another of their devices (but for the stop that ends a
+        // move, which is nobody's); the rule counts it.
+        self.ways.begin(command.chosen_by(), true);
         let owed = self.ways.touch(Who::Here, command.touches());
         self.ways.end();
         if owed.claim {
@@ -783,7 +784,7 @@ mod tests {
                 let done = match &act {
                     Act::Carry { number, command, ready } => {
                         match (command, ready) {
-                            (Command::Pause, _) => self.sounds[who] = None,
+                            (Command::Pause | Command::Moved, _) => self.sounds[who] = None,
                             (Command::Play, _) => self.sounds[who] = Some(0.0),
                             (Command::Next, _) if self.songs[who].len() > 1 => drop(self.songs[who].remove(0)),
                             (Command::Adopt(adopt), Ready::Queue(songs, begin)) => {
@@ -872,13 +873,17 @@ mod tests {
         assert!(pair.event(0, r#"{"event":"play_here"}"#).ends_with(r#"{"act":"handled","by_another":true}]"#));
         pair.pass(1_500);
         assert!(pair.acts[0].iter().any(|act| matches!(act, Act::Take { songs, begin: 0, .. } if songs.len() == 3 && songs[0].0 == "s1")), "{:?}", pair.acts[0]);
-        assert_eq!((pair.said(0).last().copied(), pair.carried(1), pair.sounds[1]), (Some("Playing here. Phone B is paused."), vec!["next", "pause"], None));
+        assert_eq!((pair.said(0).last().copied(), pair.carried(1), pair.sounds[1]), (Some("Playing here. Phone B is paused."), vec!["next", "moved"], None));
+        // B's going quiet was nobody's choice there: its queue is not claimed by it (as it
+        // was by the Next), so that A, which is playing, is the one whose queue is newest.
+        let before_each: Vec<bool> = pair.acts[1].iter().enumerate().filter(|(_, act)| matches!(act, Act::Carry { .. })).map(|(at, _)| at > 0 && pair.acts[1][at - 1] == Act::Claim).collect();
+        assert_eq!(before_each, [true, false]);
         assert!(pair.acts[0].contains(&Act::Do { ask: Do::Steering(None) }));
         // And given back: A, playing, picks B, which takes the queue and plays; A is stopped
         // when B's sound has started.
         pair.event(0, &serde_json::json!({"event": "choose", "place": place, "in_a_jam": false}).to_string());
         pair.pass(1_500);
-        assert_eq!((pair.said(0).last().copied(), pair.carried(1), pair.sounds[0]), (Some("Playing on Phone B."), vec!["next", "pause", "adopt"], None));
+        assert_eq!((pair.said(0).last().copied(), pair.carried(1), pair.sounds[0]), (Some("Playing on Phone B."), vec!["next", "moved", "adopt"], None));
         assert!(matches!(pair.acts[0].iter().rev().find(|act| matches!(act, Act::Pause { .. } | Act::Take { .. })), Some(Act::Pause { .. })));
     }
 }

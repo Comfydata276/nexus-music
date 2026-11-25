@@ -27,7 +27,7 @@
 //! within its bounds, before anything is done for it. A field a version does not know is
 //! ignored; a field it knows and finds wrong is not guessed at.
 
-use crate::ways::What;
+use crate::ways::{What, Who};
 use serde_json::{Map, Value, json};
 
 use super::text;
@@ -123,6 +123,13 @@ pub enum Command {
     Repeat { mode: u8 },
     Add { ids: Vec<String>, next: bool },
     Adopt(Adopt),
+    /// Stop: the music that was playing here has been taken up by the device that asks,
+    /// and is sounding there ("Play here", pressed on it). Carried out as a pause is; but
+    /// **it is nobody's choice at this device**, as the pause that ends a move the other
+    /// way is. The person chose that the music be over there, and the queue is that
+    /// device's from when it took it: this one going quiet claims nothing, so that the
+    /// device now playing is the one whose queue is the newest.
+    Moved,
 }
 
 fn number(with: &Map<String, Value>, name: &str, most: f64) -> Option<f64> {
@@ -167,6 +174,17 @@ impl Command {
             Command::Repeat { .. } => "repeat",
             Command::Add { .. } => "add",
             Command::Adopt(_) => "adopt",
+            Command::Moved => "moved",
+        }
+    }
+
+    /// Who chose it, at the device that carries it out (`crate::ways`): the person, at
+    /// another of their devices; but for the stop that ends a move of music, which is
+    /// nobody's.
+    pub fn chosen_by(&self) -> Who {
+        match self {
+            Command::Moved => Who::Nobody,
+            _ => Who::Elsewhere,
         }
     }
 
@@ -179,14 +197,14 @@ impl Command {
             Command::Volume { .. } | Command::Repeat { .. } => What::Manner,
             Command::Play | Command::Pause | Command::Next | Command::Previous | Command::Seek { .. } => What::Playing,
             Command::Jump { .. } | Command::Move { .. } | Command::Remove { .. } | Command::Clear { .. } | Command::Shuffle { .. } => What::Playing,
-            Command::Add { .. } | Command::Adopt(_) => What::Playing,
+            Command::Add { .. } | Command::Adopt(_) | Command::Moved => What::Playing,
         }
     }
 
     /// What goes with it, if anything does.
     pub fn with(&self) -> Option<Value> {
         Some(match self {
-            Command::Play | Command::Pause | Command::Next | Command::Previous => return None,
+            Command::Play | Command::Pause | Command::Next | Command::Previous | Command::Moved => return None,
             Command::Seek { to } | Command::Volume { to } => json!({"to": to}),
             Command::Jump { at, id } | Command::Remove { at, id } => json!({"at": at, "id": id}),
             Command::Move { from, to, queued, id } => json!({"from": from, "to": to, "queued": queued, "id": id}),
@@ -219,7 +237,8 @@ impl Command {
         };
         Some(match name {
             // A command that takes nothing with it, and says it does, was made for something else.
-            "play" | "pause" | "next" | "previous" if !with.is_empty() => return None,
+            "play" | "pause" | "next" | "previous" | "moved" if !with.is_empty() => return None,
+            "moved" => Command::Moved,
             "play" => Command::Play,
             "pause" => Command::Pause,
             "next" => Command::Next,
@@ -288,6 +307,7 @@ mod tests {
         vec![
             Command::Play,
             Command::Pause,
+            Command::Moved,
             Command::Next,
             Command::Previous,
             Command::Seek { to: 61.5 },
@@ -306,7 +326,7 @@ mod tests {
     #[test]
     fn every_command_is_written_and_read_back() {
         let all = every();
-        assert_eq!(all.len(), 14);
+        assert_eq!(all.len(), 15);
         for command in all {
             let with = command.with();
             assert_eq!(Command::read(command.name(), with.as_ref()), Some(command.clone()), "{}", command.name());

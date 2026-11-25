@@ -85,7 +85,7 @@ impl Player for Fake {
         // (As a real player: a press that would change nothing changes nothing.)
         let nothing = match command {
             Command::Play => self.playing,
-            Command::Pause => !self.playing,
+            Command::Pause | Command::Moved => !self.playing,
             Command::Next => self.cursor + 1 >= self.queue.len(),
             Command::Seek { .. } => self.radio,
             Command::Volume { to } => self.volume == *to,
@@ -100,7 +100,7 @@ impl Player for Fake {
         self.did.push(command.name().to_string());
         match (command, ready) {
             (Command::Play, _) => self.play(true),
-            (Command::Pause, _) => self.play(false),
+            (Command::Pause | Command::Moved, _) => self.play(false),
             (Command::Next, _) => self.cursor += 1,
             (Command::Previous, _) => self.position = 0.0,
             (Command::Seek { to }, _) => self.position = *to,
@@ -1330,6 +1330,72 @@ fn the_pause_that_completes_a_taking_is_judged_like_any_other() {
     let mut world = taking(|world| world.path.hold_commands = true);
     world.pass(14_000);
     assert_eq!((said(&world), world.copies[A].player.playing, world.copies[B].player.playing), ("Playing here. Copy B didn't answer, so it may still be playing.", true, true));
+}
+
+/// "Play here": while the queue it took has not sounded, the device that took it is in
+/// the middle of something to the others; if it never sounds it is stopped, not left to
+/// start later with the other still playing; and the other is told the music has moved,
+/// which is nobody's choice there.
+#[test]
+fn a_device_taking_music_is_busy_until_it_sounds_and_stopped_if_it_never_does() {
+    let mut world = taking(|world| world.copies[A].player.stream = false);
+    world.pass(1_000);
+    let a = &world.copies[A].player;
+    assert!(a.rule.busy(world.now) && a.queue.len() == 8 && a.playing, "{:?}", world.copies[A].log);
+    // At its deadline it is stopped, says so, and is free; the other was never asked anything.
+    world.pass(30_000);
+    let a = &world.copies[A].player;
+    assert_eq!((said(&world), a.playing, a.rule.busy(world.now), world.copies[B].player.playing), ("This PC didn't start in time, so Copy B was left playing.", false, false, true));
+    assert!(world.copies[B].player.did.is_empty());
+    // When it does sound, it is free at once, and the other is stopped by "moved", not by
+    // a pause as a press would make.
+    let mut world = taking(|_| {});
+    world.pass(1_000);
+    assert!(!world.copies[A].player.rule.busy(world.now));
+    assert_eq!((world.copies[B].player.did.clone(), world.copies[B].player.playing), (vec!["moved".to_string()], false));
+    // Something chosen here meanwhile: free at once as well, and nothing more is done.
+    let mut world = taking(|world| world.copies[A].player.stream = false);
+    world.pass(1_000);
+    world.copies[A].player.own_next();
+    world.pass(500);
+    assert!(!world.copies[A].player.rule.busy(world.now) && world.copies[A].player.playing);
+}
+
+/// The other device cannot be told to stop, because linking has ended: the person is told
+/// so on the device that took the music, which goes on playing it.
+#[test]
+fn a_taking_that_cannot_be_completed_because_linking_ended_says_so() {
+    // The session ends (the secret was reset elsewhere) after the queue was taken and
+    // before it sounds here.
+    let mut world = taking(|world| world.copies[A].player.stream = false);
+    world.pass(1_000);
+    world.looked(A, Looked::Secret { secret: secret(8), id: "k".into(), wrote: None }, false);
+    let a = &world.copies[A].player;
+    assert_eq!((said(&world), a.playing, a.queue.len(), a.rule.busy(world.now)), ("Playing here. Linking stopped before Copy B could be told, so it may still be playing.", true, 8, false));
+    // (Said once: the take is over.)
+    let told = world.copies[A].said.len();
+    world.pass(40_000);
+    assert_eq!((world.copies[A].said.len(), world.copies[B].player.playing), (told, true));
+    // "Link my devices" switched off there, and the sign-in ending: the same.
+    for off in [true, false] {
+        let mut world = taking(|world| world.copies[A].player.stream = false);
+        world.pass(1_000);
+        let did = world.with(A, |device, env| if off { device.setting(false, env) } else { device.stop(env) });
+        world.act(A, did);
+        assert_eq!(said(&world), "Playing here. Linking stopped before Copy B could be told, so it may still be playing.");
+        assert!(!world.copies[A].player.rule.busy(world.now));
+    }
+    // It sounds, and at that moment this device has no place in the room to send from
+    // (the relay forgot it): told, not left unsaid.
+    let mut world = taking(|world| world.copies[A].player.stream = false);
+    world.pass(1_000);
+    let session = world.copies[A].session;
+    world.copies[A].device.left(session);
+    world.copies[A].player.stream = true;
+    world.copies[A].player.play(true);
+    world.pass(1_000);
+    assert_eq!((said(&world), world.copies[A].player.playing), ("Playing here. Linking stopped before Copy B could be told, so it may still be playing.", true));
+    assert_eq!(world.log(A, "could not be asked to stop").len(), 1);
 }
 
 // ---- reset, and the secret changing under a command ------------------------------------------------

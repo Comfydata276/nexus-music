@@ -344,10 +344,11 @@ impl Player for Here<'_> {
         // The person chose this at another of their devices. The rule counts it, once, if
         // the player changes anything for it, so the player's own counting is not added;
         // and the queue is theirs by it as it would be by the same press here.
-        let _carrying = ctl.for_another(Who::Elsewhere, true);
+        // (The stop that ends a move of music to the device that asks is nobody's.)
+        let _carrying = ctl.for_another(command.chosen_by(), true);
         match (command, ready) {
             (Command::Play, _) => ctl.set_playing_here(true),
-            (Command::Pause, _) => ctl.set_playing_here(false),
+            (Command::Pause | Command::Moved, _) => ctl.set_playing_here(false),
             (Command::Next, _) => ctl.next_track_here(),
             (Command::Previous, _) => ctl.previous_track_here(),
             (Command::Seek { to }, _) => ctl.seek_here(*to),

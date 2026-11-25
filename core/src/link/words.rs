@@ -159,6 +159,12 @@ pub fn took(outcome: Outcome, name: &str) -> String {
     }
 }
 
+/// "Play here", when linking ended (the secret was reset, the sign-in changed, the relay
+/// could not be reached any more) before the other device could be told to stop.
+pub fn took_and_linking_ended(name: &str) -> String {
+    format!("Playing here. Linking stopped before {name} could be told, so it may still be playing.")
+}
+
 pub fn queue_never_came(name: &str) -> String {
     format!("{name} didn't answer, so nothing was moved. It may still be playing.")
 }
