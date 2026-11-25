@@ -51,6 +51,15 @@ impl fmt::Display for ApiError {
 
 pub type ApiResult<T> = Result<T, ApiError>;
 
+/// An answer, with the server's clock as the answer gave it (its `Date`, in seconds since
+/// 1970; `None` if it gave none that can be read) and this PC's clock as it arrived.
+#[derive(Debug, Clone)]
+pub struct Timed<T> {
+    pub value: T,
+    pub date: Option<i64>,
+    pub received: i64,
+}
+
 // ---------------------------------------------------------------------------------------------
 // Models
 // ---------------------------------------------------------------------------------------------
@@ -61,6 +70,7 @@ pub type ApiResult<T> = Result<T, ApiError>;
 pub use nexus_core::model::ReplayGain;
 pub use nexus_core::model::{Album, AlbumList, Artist, ArtistInfo, Credit, Found, Genre, LyricLine, Lyrics, PlayQueue, Playlist, ScanStatus, ServerInfo, Song};
 use nexus_core::model::shifted;
+pub use nexus_core::step::Stated;
 
 // ---------------------------------------------------------------------------------------------
 // Client
@@ -332,6 +342,18 @@ impl Client {
         field: Option<&str>,
         limit: Duration,
     ) -> ApiResult<T> {
+        self.call_timed(app, endpoint, params, field, limit).map(|answer| answer.value)
+    }
+
+    /// As `call_as`, with the server's clock as the answer gave it.
+    fn call_timed<T: DeserializeOwned + Default>(
+        &self,
+        app: &str,
+        endpoint: &str,
+        params: &[(&str, &str)],
+        field: Option<&str>,
+        limit: Duration,
+    ) -> ApiResult<Timed<T>> {
         let url = self.url_as(app, endpoint, params);
         // A long list of song ids can outgrow what servers and proxies accept in an address,
         // so those go in the body of a POST instead (the OpenSubsonic "formPost" extension).
@@ -340,6 +362,10 @@ impl Client {
             _ => self.get(&url, Some(limit))?,
         };
         let status = response.status().as_u16();
+        // The server's clock, and this PC's as the answer's headers arrived.
+        let date = response.headers().get("date").and_then(|date| date.to_str().ok()).and_then(nexus_core::time::http_date);
+        let received = chrono::Utc::now().timestamp();
+        let timed = |value: T| Timed { value, date, received };
         let reader = response.into_body().into_reader();
         let mut root: serde_json::Value = serde_json::from_reader(reader).map_err(|_| {
             ApiError::NotSubsonic(format!("Check the address (HTTP status {status})."))
@@ -362,11 +388,12 @@ impl Client {
             Some(field) => match body.get_mut(field) {
                 Some(v) => v.take(),
                 // An empty library section is simply omitted from the response.
-                None => return Ok(T::default()),
+                None => return Ok(timed(T::default())),
             },
             None => body.take(),
         };
         serde_json::from_value(value)
+            .map(timed)
             .map_err(|e| ApiError::NotSubsonic(format!("Unexpected response from {endpoint}: {e}")))
     }
 
@@ -571,6 +598,24 @@ impl Client {
 
     pub fn playlist(&self, id: &str) -> ApiResult<Playlist> {
         self.call("getPlaylist", &[("id", id)], Some("playlist"))
+    }
+
+    /// The playlists as the server states them, for keeping devices in step (see `sync`):
+    /// an owner or a comment the answer leaves out is `None`, not empty. With the server's
+    /// clock.
+    pub fn playlists_stated(&self) -> ApiResult<Timed<Vec<Stated>>> {
+        #[derive(Deserialize, Default)]
+        #[serde(default)]
+        struct Wrap {
+            playlist: Vec<Stated>,
+        }
+        let answer = self.call_timed::<Wrap>(CLIENT_NAME, "getPlaylists", &[], Some("playlists"), API_TIMEOUT)?;
+        Ok(Timed { value: answer.value.playlist, date: answer.date, received: answer.received })
+    }
+
+    /// One playlist as the server states it, without its songs.
+    pub fn playlist_stated(&self, id: &str) -> ApiResult<Timed<Stated>> {
+        self.call_timed(CLIENT_NAME, "getPlaylist", &[("id", id)], Some("playlist"), API_TIMEOUT)
     }
 
     pub fn create_playlist(&self, name: &str, song_ids: &[String]) -> ApiResult<Playlist> {
