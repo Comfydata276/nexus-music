@@ -184,9 +184,11 @@ you turn it off. Each PC keeps a private session open at the relay and says what
 playing, and the others list it under “Connect to a device” in the player bar. Only copies of
 the app signed in to the same account can find each other: the room they meet in, and the
 word one shows another to be given the run of it, are both worked out from the account's
-name and password (neither gives the password away, and it is never sent). Starting a jam
-turns the PC's private session into the jam; ending it opens a fresh private one, so an old
-jam link is of no further use.
+name and password (neither gives the password away, and it is never sent). A private
+session does nothing for anyone else who reaches it, and the relay is told what the PC is
+playing only while one of your devices is steering it. Starting a jam turns the PC's private
+session into the jam; ending it opens a fresh private one, so an old jam link is of no
+further use.
 
 **Running the relay.** It is one small program in a container, keeps nothing on disk, and
 holds jams in memory only: restarting it ends any jam in progress.
@@ -457,7 +459,7 @@ window, the files, the connections.
 | `core/src/time.rs` | The times a server sends, and a device's clock set beside the server's. |
 | `core/src/playlists.rs` | A change to a playlist, described so it means the same if the playlist has changed. |
 | `core/src/address.rs` | What a typed server address means, and when plain HTTP matters. |
-| `core/src/jam.rs` | Reading a jam's link; what a jam says of a song. |
+| `core/src/jam.rs` | Reading a jam's link; what a jam says of a song; what a device does for whoever asks it something. |
 | `core/src/levelling.rs` | When a song counts as playing with its album. |
 | `core/src/queue.rs` | What becomes of the queue when the list it was started from changes. |
 | `core/src/musicbrainz.rs`, `listenbrainz.rs`, `offer.rs` | The questions put to MusicBrainz and ListenBrainz and what is made of the answers. |

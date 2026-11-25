@@ -1,7 +1,8 @@
 //! Jams and linked devices: what the apps have to read and say alike.
 //!
-//! A link pasted from the relay's log or from a friend, and how a song is described to the
-//! others in a jam. Talking to the relay, and steering a player, are each app's own.
+//! A link pasted from the relay's log or from a friend, how a song is described to the
+//! others in a jam, and what a device being steered does for whoever asks. Talking to the
+//! relay, and steering a player, are each app's own.
 
 use serde_json::{Value, json};
 
@@ -70,6 +71,64 @@ pub fn song_json(song: &Song) -> Value {
     })
 }
 
+/// What a device's session at the relay is, to the app answering what's asked through it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Session {
+    /// Open only so the person's other devices can steer this one. Anyone else who reaches
+    /// it (its name can turn up wherever the relay's traffic is logged) has no business there.
+    Private,
+    /// A jam: friends have been given its link.
+    Jam,
+}
+
+/// What to do about something asked through a session.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Answer {
+    /// Do it. `steer` is whether the one asking may steer: it lets what they add go to the
+    /// top of "Next in queue", and lets them take out any song, not only their own.
+    Do { steer: bool },
+    /// Refuse, saying this. Nothing is looked up, fetched or read for it.
+    No(&'static str),
+}
+
+/// The refusal that says nothing about why: the one given for what nobody may ask.
+pub const NOT_FOR_GUESTS: &str = "That isn't something a guest can do.";
+
+/// What changes what plays, beyond adding and taking out.
+const STEERING: [&str; 10] = ["skip", "previous", "pause", "play", "seek", "jump", "move", "clear", "shuffle", "repeat"];
+/// What only the person's own devices ask: say hello, hand a queue over or take it, turn the volume.
+const OWN_DEVICES: [&str; 4] = ["hello", "queue", "load", "volume"];
+
+/// What may be done about `action` (as the relay names it; `cover` for a cover), asked
+/// through a session of the kind `session`. `owner` is whether the asker showed the word
+/// that only the person's own devices can work out; `guests_steer` is the host's "Guests
+/// can steer". In a private session nobody without the word is given anything.
+pub fn answer(session: Session, owner: bool, guests_steer: bool, action: &str) -> Answer {
+    let known = matches!(action, "search" | "cover" | "add" | "remove") || STEERING.contains(&action) || OWN_DEVICES.contains(&action);
+    if !known {
+        return Answer::No(NOT_FOR_GUESTS);
+    }
+    if owner {
+        return Answer::Do { steer: true };
+    }
+    if session == Session::Private {
+        return Answer::No(NOT_FOR_GUESTS);
+    }
+    match action {
+        "search" | "cover" | "add" | "remove" => Answer::Do { steer: guests_steer },
+        _ if OWN_DEVICES.contains(&action) => Answer::No("That's for your own devices."),
+        _ if guests_steer => Answer::Do { steer: true },
+        _ => Answer::No("The host is choosing what plays. You can still add songs."),
+    }
+}
+
+/// Whether what came with an ask shows the owner word `word` (`None` when this device has
+/// none to compare with). Compared in full whatever differs, so the time taken says nothing.
+pub fn shows_owner(word: Option<&str>, data: &Value) -> bool {
+    let (Some(word), Some(shown)) = (word.filter(|word| !word.is_empty()), data["owner"].as_str()) else { return false };
+    word.len() == shown.len() && word.bytes().zip(shown.bytes()).fold(0u8, |differ, (a, b)| differ | (a ^ b)) == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,5 +167,61 @@ mod tests {
     fn describes_a_song_for_guests() {
         let song = Song { id: "s1".into(), title: "Blue".into(), artist: "A".into(), display_artist: "A & B".into(), album: "Sky".into(), cover_art: "al-1".into(), duration: 185, ..Default::default() };
         assert_eq!(song_json(&song), json!({"id": "s1", "title": "Blue", "artist": "A & B", "album": "Sky", "cover": "al-1", "duration": 185}));
+    }
+
+    /// Every kind of ask, in a private session and a jam, with the owner word and without,
+    /// with "Guests can steer" on and off.
+    #[test]
+    fn who_may_ask_what() {
+        use Answer::{Do, No};
+        let steering = Do { steer: true };
+        let held = No("The host is choosing what plays. You can still add songs.");
+        let own = No("That's for your own devices.");
+        let none = No(NOT_FOR_GUESTS);
+        let mut asks: Vec<&str> = vec!["search", "cover", "add", "remove"];
+        asks.extend(STEERING);
+        asks.extend(OWN_DEVICES);
+        asks.push("anything else");
+        for action in asks {
+            let steers = STEERING.contains(&action);
+            let owns = OWN_DEVICES.contains(&action);
+            let known = action != "anything else";
+            for guests_steer in [false, true] {
+                let at = |session, owner| (answer(session, owner, guests_steer, action), (action, session, owner, guests_steer));
+                // The person's own devices have the run of a device, private or in a jam.
+                for session in [Session::Private, Session::Jam] {
+                    let (got, case) = at(session, true);
+                    assert_eq!(got, if known { steering } else { none }, "{case:?}");
+                }
+                // Anyone else gets nothing at all from a private session...
+                let (got, case) = at(Session::Private, false);
+                assert_eq!(got, none, "{case:?}");
+                // ...and in a jam, what a guest gets.
+                let (got, case) = at(Session::Jam, false);
+                let wanted = match () {
+                    _ if !known => none,
+                    _ if owns => own,
+                    _ if steers && guests_steer => steering,
+                    _ if steers => held,
+                    _ => Do { steer: guests_steer },
+                };
+                assert_eq!(got, wanted, "{case:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_owner_word_is_shown_or_not() {
+        let word = "0123456789abcdef0123456789abcdef";
+        assert!(shows_owner(Some(word), &json!({"owner": word})));
+        assert!(!shows_owner(Some(word), &json!({"owner": "0123456789abcdef0123456789abcdee"})));
+        assert!(!shows_owner(Some(word), &json!({"owner": "0123456789abcdef"})));
+        assert!(!shows_owner(Some(word), &json!({"owner": ""})));
+        assert!(!shows_owner(Some(word), &json!({"owner": 7})));
+        assert!(!shows_owner(Some(word), &json!({})));
+        assert!(!shows_owner(Some(word), &Value::Null));
+        // A device with no word of its own recognises nobody, not even someone showing none.
+        assert!(!shows_owner(None, &json!({"owner": word})));
+        assert!(!shows_owner(Some(""), &json!({"owner": ""})));
     }
 }

@@ -6,9 +6,14 @@
 //! so does the host, because the host's PC can't be reached from outside its own network.
 //!
 //! Hosting: the app starts a jam at the relay with its host key, then keeps one request
-//! open that the relay answers whenever a guest wants something. Searches and covers are
-//! answered from worker threads; anything that changes what plays is done on the UI thread.
-//! The relay is told what's playing whenever that changes.
+//! open that the relay answers whenever a guest wants something. Whether it's to be done
+//! at all is decided on the UI thread first; searches and covers are then answered from
+//! worker threads, and anything that changes what plays is done on the UI thread. The
+//! relay is told what's playing whenever that changes.
+//!
+//! A session opened only for the person's own devices answers nobody else: whoever has its
+//! name but not the owner word is refused everything, at no cost, and is told nothing of
+//! what plays unless one of the person's devices is there steering it.
 //!
 //! Joining: the app joins with the jam's link, keeps one request open that the relay
 //! answers whenever the jam changes, and sends what the guest asks for.
@@ -93,7 +98,7 @@ fn reason(body: &Value, otherwise: &str) -> String {
 
 // Reading a pasted link, and what a song is described as to a jam, are the library's.
 pub use nexus_core::jam::{parse_host_link, parse_jam_link};
-use nexus_core::jam::{host_of, song_json};
+use nexus_core::jam::{Answer, NOT_FOR_GUESTS, Session, answer, host_of, shows_owner, song_json};
 
 // ---- what's passed about -----------------------------------------------------------------
 
@@ -197,6 +202,8 @@ enum Out {
     Reply(Value),
     /// Take this guest out of the jam.
     Remove(String),
+    /// Say there's no such cover (its id and size), without looking.
+    NoCover(String, String),
     /// End the jam, and say on this channel when the relay has been told.
     End(mpsc::Sender<()>),
 }
@@ -305,6 +312,18 @@ struct Own {
     handover: Option<Value>,
 }
 
+impl Hosting {
+    fn session(&self) -> Session {
+        if self.public { Session::Jam } else { Session::Private }
+    }
+
+    /// Whether the relay may be told what's playing: always in a jam, and in a private
+    /// session only while one of the person's own devices is there to see it.
+    fn tells(&self) -> bool {
+        self.public || self.guests.iter().any(|(id, _)| self.owners.contains(id))
+    }
+}
+
 impl Jam {
     /// Who added each song still to come in the jam being hosted, for the queue panel.
     pub fn added_by(&self) -> HashMap<String, String> {
@@ -334,6 +353,9 @@ fn send_loop(line: Arc<Line>, id: String, secret: String, waiting: mpsc::Receive
                 }
                 Out::Remove(guest) => {
                     let _ = line.post(&format!("api/host/{id}/remove"), &secret, &json!({"guest": guest}));
+                }
+                Out::NoCover(cover, size) => {
+                    let _ = line.send(&format!("api/host/{id}/cover?cover={cover}&size={size}&missing=1"), &secret, "application/octet-stream", b"", Duration::from_secs(20));
                 }
                 Out::End(done) => {
                     let _ = line.send(&format!("api/host/{id}/end"), &secret, "application/json", b"{}", Duration::from_secs(3));
@@ -376,13 +398,22 @@ fn host_loop(line: Arc<Line>, id: String, secret: String, serial: u64, stop: Arc
             after = after.max(event["seq"].as_u64().unwrap_or(0));
             match event["kind"].as_str().unwrap_or("") {
                 "joined" => arrivals.push(event["guest"]["name"].as_str().unwrap_or("Someone").to_string()),
+                // Nothing is looked up for an ask until the UI thread has said it's allowed.
                 "ask" => {
-                    let (line, id, secret, client) = (line.clone(), id.clone(), secret.clone(), client.clone());
-                    pool.spawn(move || answer_guest(&line, &id, &secret, serial, client.as_ref(), event));
+                    let (line, id, secret, client, pool) = (line.clone(), id.clone(), secret.clone(), client.clone(), pool.clone());
+                    post(move |ctl| {
+                        if ctl.jam_admits(serial, &event) {
+                            pool.spawn(move || answer_guest(&line, &id, &secret, serial, client.as_ref(), event));
+                        }
+                    });
                 }
                 "cover" => {
-                    let (line, id, secret, client, covers) = (line.clone(), id.clone(), secret.clone(), client.clone(), covers.clone());
-                    pool.spawn(move || send_cover(&line, &id, &secret, client.as_ref(), &covers, &event));
+                    let (line, id, secret, client, covers, pool) = (line.clone(), id.clone(), secret.clone(), client.clone(), covers.clone(), pool.clone());
+                    post(move |ctl| {
+                        if ctl.jam_admits(serial, &event) {
+                            pool.spawn(move || send_cover(&line, &id, &secret, client.as_ref(), &covers, &event));
+                        }
+                    });
                 }
                 _ => {}
             }
@@ -805,6 +836,8 @@ impl Controller {
             hosting.public
         };
         self.show_hosting();
+        // One of the person's devices may have come or gone, which decides what the relay is told.
+        self.jam_sync(false);
         // Outside a jam, the only ones who come and go are this person's own devices.
         if public {
             match arrivals.as_slice() {
@@ -843,18 +876,43 @@ impl Controller {
         self.show_hosting();
     }
 
+    /// Whether something asked through the session being hosted (an ask, or a cover) is to
+    /// be looked into. If not, it is answered at once as refused, and costs nothing: no
+    /// search, no request to the music server, no cover read.
+    fn jam_admits(&self, serial: u64, event: &Value) -> bool {
+        let jam = self.jam.borrow();
+        let Some(hosting) = jam.hosting.as_ref().filter(|hosting| hosting.serial == serial) else { return false };
+        let cover = event["kind"].as_str() == Some("cover");
+        let action = if cover { "cover" } else { event["action"].as_str().unwrap_or("") };
+        // Covers are asked for by address and carry no word: only a jam's guests get them.
+        let owner = !cover && shows_owner(jam.presence.as_ref().map(|presence| presence.word.as_str()), &event["data"]);
+        let why = match answer(hosting.session(), owner, self.settings.borrow().jam_guests_control, action) {
+            Answer::Do { .. } => return true,
+            Answer::No(why) => why,
+        };
+        let refusal = if cover {
+            let (id, size) = (event["cover"].as_str().unwrap_or(""), event["size"].as_str().unwrap_or(""));
+            let plain = !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~'));
+            if !plain || !matches!(size, "s" | "l") {
+                return false;
+            }
+            Out::NoCover(id.to_string(), size.to_string())
+        } else {
+            Out::Reply(json!({"id": event["id"].as_u64().unwrap_or(0), "ok": false, "error": why}))
+        };
+        let _ = hosting.out.send(refusal);
+        false
+    }
+
     /// A guest asked for something that changes what plays. `songs` are the ones to add,
     /// when that's what was asked, as far as the library has them.
     fn jam_asked(self: &Rc<Self>, serial: u64, ask: u64, guest: (String, String), action: &str, data: &Value, songs: Vec<Song>) {
-        if self.jam.borrow().hosting.as_ref().is_none_or(|hosting| hosting.serial != serial) {
-            return;
-        }
+        let Some(session) = self.jam.borrow().hosting.as_ref().filter(|hosting| hosting.serial == serial).map(Hosting::session) else { return };
         // One of this person's own devices says so with a word only copies signed in to
         // their account can work out. It has the run of this one.
         let own = {
             let mut jam = self.jam.borrow_mut();
-            let word = jam.presence.as_ref().map(|presence| presence.word.clone());
-            let own = word.is_some_and(|word| data["owner"].as_str() == Some(word.as_str()));
+            let own = shows_owner(jam.presence.as_ref().map(|presence| presence.word.as_str()), data);
             let fresh = own && jam.hosting.as_mut().is_some_and(|hosting| hosting.owners.insert(guest.0.clone()));
             drop(jam);
             if fresh {
@@ -863,32 +921,30 @@ impl Controller {
             own
         };
         // Adding songs, and taking your own back out, is what a jam is for. The rest is
-        // the host's to allow.
-        let control = own || self.settings.borrow().jam_guests_control;
-        let done = match action {
-            "add" => self.jam_add_for(&guest, songs, control && data["next"].as_bool() == Some(true), own),
-            "remove" => self.jam_remove_for(&guest, data, control),
-            "hello" | "queue" | "load" | "volume" if !own => Err("That's for your own devices.".to_string()),
-            "hello" => Ok(json!({})),
-            "queue" => Ok(self.queue_to_hand_over()),
-            "load" => {
-                if songs.is_empty() {
-                    Err("This device's library has none of those songs.".to_string())
-                } else {
-                    let index = data["index"].as_u64().unwrap_or(0) as usize;
-                    self.load_queue(songs, index, data["position"].as_f64().unwrap_or(0.0), data["playing"].as_bool() != Some(false), data["context"].as_str().unwrap_or(""));
+        // the host's to allow; and a session that isn't a jam is for the person's own devices.
+        let done = match answer(session, own, self.settings.borrow().jam_guests_control, action) {
+            Answer::No(why) => Err(why.to_string()),
+            Answer::Do { steer } => match action {
+                "add" => self.jam_add_for(&guest, songs, steer && data["next"].as_bool() == Some(true), own),
+                "remove" => self.jam_remove_for(&guest, data, steer),
+                "hello" => Ok(json!({})),
+                "queue" => Ok(self.queue_to_hand_over()),
+                "load" => {
+                    if songs.is_empty() {
+                        Err("This device's library has none of those songs.".to_string())
+                    } else {
+                        let index = data["index"].as_u64().unwrap_or(0) as usize;
+                        self.load_queue(songs, index, data["position"].as_f64().unwrap_or(0.0), data["playing"].as_bool() != Some(false), data["context"].as_str().unwrap_or(""));
+                        Ok(json!({}))
+                    }
+                }
+                "volume" => {
+                    self.set_volume(data["to"].as_f64().unwrap_or(1.0) as f32);
                     Ok(json!({}))
                 }
-            }
-            "volume" => {
-                self.set_volume(data["to"].as_f64().unwrap_or(1.0) as f32);
-                Ok(json!({}))
-            }
-            "skip" | "previous" | "pause" | "play" | "seek" | "jump" | "move" | "clear" | "shuffle" | "repeat" if !control => {
-                Err("The host is choosing what plays. You can still add songs.".to_string())
-            }
-            "skip" | "previous" | "pause" | "play" | "seek" | "jump" | "move" | "clear" | "shuffle" | "repeat" => self.jam_control(action, data).map(|()| json!({})),
-            _ => Err("That isn't something a guest can do.".to_string()),
+                "skip" | "previous" | "pause" | "play" | "seek" | "jump" | "move" | "clear" | "shuffle" | "repeat" => self.jam_control(action, data).map(|()| json!({})),
+                _ => Err(NOT_FOR_GUESTS.to_string()),
+            },
         };
         let reply = match done {
             Ok(data) => json!({"id": ask, "ok": true, "data": data}),
@@ -1016,8 +1072,10 @@ impl Controller {
             hosting.added.retain(|song, _| around.contains(song.as_str()));
         }
         let playing = pb.playing && now.is_some();
+        // Anyone who has the session's name can read what the relay is told of it.
+        let tells = hosting.tells();
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        (now.map(|song| song.id.as_str()), playing, control, ahead.len(), pb.shuffle, pb.repeat, pb.context.as_str(), (pb.volume * 100.0) as i32).hash(&mut hasher);
+        (tells, now.map(|song| song.id.as_str()), playing, control, ahead.len(), pb.shuffle, pb.repeat, pb.context.as_str(), (pb.volume * 100.0) as i32).hash(&mut hasher);
         for song in ahead.iter().take(SHOWN) {
             (song.id.as_str(), song.queued, hosting.added.get(&song.id).map(|(id, _)| id.as_str())).hash(&mut hasher);
         }
@@ -1025,8 +1083,15 @@ impl Controller {
         // Guests work out where the song has got to from where it was when they were told;
         // a seek, or a stall, makes that wrong.
         let expected = hosting.told_position + if hosting.told_playing { hosting.told_at.elapsed().as_secs_f64() } else { 0.0 };
-        let moved = now.is_some() && (pb.position - expected).abs() > 2.0;
+        let moved = tells && now.is_some() && (pb.position - expected).abs() > 2.0;
         if !(force || print != hosting.told || moved || hosting.told_at.elapsed() >= RETELL) {
+            return;
+        }
+        if !tells {
+            // What it was told before is put out of reach as well.
+            hosting.told = print;
+            hosting.told_at = Instant::now();
+            let _ = hosting.out.send(Out::State(json!({})));
             return;
         }
         let queue: Vec<Value> = ahead
