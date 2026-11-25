@@ -16,6 +16,7 @@
 //! Nothing here panics, whatever it is given.
 
 pub mod command;
+pub mod device;
 pub mod frame;
 pub mod look;
 pub mod message;

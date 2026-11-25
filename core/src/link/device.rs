@@ -1,0 +1,1422 @@
+//! One device among a person's devices: everything it decides, as plain state.
+//!
+//! [`Device`] is the session (one sign-in with one secret), what is known of each other
+//! device in the room, what has been asked of each and what is waiting to be, the device
+//! being steered, a move of music in either direction, the news, and the list. It owns no
+//! thread, clock, file or socket. The app tells it what has happened and when (the tick,
+//! a look's answer, what the relay handed over, what was pressed) and it says what to do
+//! ([`Do`]): look at the secret, keep a place in this room, send this frame, say this to
+//! the person. What it needs of the app while it decides it asks through two small traits:
+//!
+//! - [`Player`]: what is playing and sounding on this device, its order of choices
+//!   ([`super::rule::Rule`]), and "carry out this command", which the app does by the very
+//!   code the same press runs.
+//! - [`crate::requests::Library`]: which of these songs this device has.
+//!
+//! and it is handed the time (milliseconds, on a clock that goes on counting while the
+//! device sleeps), the day, and random bytes from the system.
+//!
+//! **The rule of rules** (`docs/linking-design.md`, 7): a command is validated
+//! ([`super::message::read_ask`]), authorised (the frame opened; [`Rule::admit`]), given
+//! its place (the reservation), worked for (its entry found, its songs looked up), and at
+//! the moment it is carried out authorised again ([`Rule::finish`], under the session it
+//! arrived in). Each of those is a line of [`Device::commanded`] and [`Device::finish`].
+
+use std::collections::HashMap;
+
+use super::command::{Adopt, Command, MOST_ADDED, id_ok};
+use super::frame::{self, ASK, Keys, TELL};
+use super::look::{Looked, ends_session};
+use super::message::{Ask, At, Full, Handed, Tell, Want, Why, read_ask, read_tell};
+use super::moving::{Adopted, Adopting, Gave, Giving, START_MS, Taking, Took};
+use super::news::News;
+use super::rule::{Reservation, Waiting};
+use super::secret::{self, Secret};
+use super::seen::{self, Seen as Remembered};
+use super::steer::{Outcome, Peer, Press as Pressed, Tick, Told, Wait};
+use super::view::{Press, View};
+use super::words::{self, Here};
+use super::{Asks, DeviceId, LOOK_AGAIN_MS, LOOK_EVERY_MS, LOOK_IDLE_MS, Nonce, Place, WAIT_MS, minute, secret_holds, text};
+use crate::requests::Library;
+
+/// How long a device that was being steered may be gone from the room before the player
+/// goes back to this device.
+pub const LOST_MS: u64 = 45_000;
+/// How far the sound has to have moved on, in seconds, to count as having started: a song
+/// that has been opened is not yet sound.
+pub const SOUNDS_AFTER: f64 = 0.2;
+
+/// What a device says it is playing, in brief.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Brief {
+    pub playing: bool,
+    pub title: String,
+    pub artist: String,
+}
+
+/// What a command needs found before it can be carried out, as the app is handed it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Ready {
+    Nothing,
+    /// The entry of the queue it means, as the queue stands now: its place after the
+    /// current song.
+    Entry(usize),
+    /// The songs to queue, by id: the ones this device has.
+    Songs(Vec<String>),
+    /// The queue to take: each song this device has, and whether it was queued by hand;
+    /// and where in them to start.
+    Queue(Vec<(String, bool)>, usize),
+}
+
+/// This device's own player, as the deciding needs it.
+pub trait Player {
+    fn brief(&self) -> Brief;
+    /// What a device steering this one shows.
+    fn full(&self) -> Full;
+    /// What is playing and to come, by id, the song that is playing first; nothing, if
+    /// what is playing is not something another device could carry on with (a radio).
+    fn handed(&self) -> Handed;
+    /// Where the sound has got to in the song the player holds, in seconds, if it is
+    /// playing and the sound has reached that song.
+    fn sounding_at(&self) -> Option<f64>;
+    /// If the sound has rolled into the next song and the window has not yet been told,
+    /// brings the window up to it now (the cursor moves, and the order of choices with
+    /// it). Says whether it had to.
+    fn catch_up(&mut self) -> bool;
+    /// Whether there is a song in the player at all.
+    fn has_song(&self) -> bool;
+    /// The ids of the songs to come, in the order they would play.
+    fn ahead(&self) -> Vec<String>;
+    /// Carries a command out, exactly as the same press on this device would be, on this
+    /// device only. The command has taken its place in the order of choices already: what
+    /// the player does for it is not counted again.
+    fn carry_out(&mut self, command: &Command, ready: &Ready);
+    /// Stops this device's own sound, and counts it as a change.
+    fn pause(&mut self);
+    /// Takes a queue brought from another device and plays it, counted as a change: each
+    /// song and whether it was queued by hand, where to start, and how far in.
+    fn take(&mut self, songs: &[(String, bool)], begin: usize, position: f64, context: &str);
+
+    // The order of choices (see `super::rule`), which the app keeps beside its player
+    // because every way into the player counts there.
+    fn generation(&self) -> u64;
+    fn busy(&self, now_ms: u64) -> bool;
+    fn by(&self) -> Option<Nonce>;
+    fn admit(&mut self, at: At, minute: u64, now_ms: u64) -> Result<Reservation, Why>;
+    fn finish(&mut self, reservation: Reservation, at: At, minute: u64, same_session: bool, nonce: Nonce) -> Result<(), Why>;
+    fn refuse(&mut self, reservation: Reservation);
+    fn wait(&mut self, now_ms: u64, for_ms: u64) -> Waiting;
+    fn done(&mut self, waiting: Waiting);
+}
+
+/// Who this device is to the others.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Me {
+    /// Made once for the installation. Not secret, and only ever sent sealed.
+    pub device: DeviceId,
+    /// What the person calls it.
+    pub name: String,
+    pub here: Here,
+}
+
+/// What the app hands over with each thing that happens.
+pub struct Env<'a> {
+    /// Milliseconds on a clock that goes on counting while the device sleeps.
+    pub now_ms: u64,
+    /// Today, in days since 1970: for forgetting devices not seen in a month.
+    pub today: u64,
+    pub me: &'a Me,
+    pub player: &'a mut dyn Player,
+    pub library: &'a dyn Library,
+    /// Fills these bytes from the system's source of randomness, or says it could not.
+    /// Nothing is ever made up another way.
+    pub random: &'a mut dyn FnMut(&mut [u8]) -> bool,
+}
+
+impl Env<'_> {
+    fn nonce(&mut self) -> Option<Nonce> {
+        let mut bytes = [0u8; 24];
+        (self.random)(&mut bytes).then_some(bytes)
+    }
+}
+
+/// What the device asks of the app.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Do {
+    /// Write this down, if anything is being written down (for watching copies from
+    /// outside). Never a secret, a key or a token.
+    Log(String),
+    /// Say this to the person where they are looking (a toast).
+    Say(String),
+    /// Look at the secret on the music server (`super::look::look`), away from this
+    /// thread, and answer with [`Device::looked`] under this number.
+    Look { number: u64, used: Option<String>, reset: bool },
+    /// The sign-in has ended: the look that is under way makes no further request.
+    StopLook,
+    /// A session has begun: keep a place in this room (`super::relay::keep_place`) for as
+    /// long as it lasts, and answer under its number.
+    Begin { session: u64, room: String, since_ms: u64 },
+    /// The session's secret was read again: it is good for ten minutes from here.
+    Renew { session: u64, since_ms: u64 },
+    /// The session is over: give up its place, and send nothing more that was queued under it.
+    End { session: u64 },
+    /// Send this frame (`super::relay::send`), unless the session has ended or run out of
+    /// time when its turn comes ([`may_go`]).
+    Send { session: u64, token: String, to: Place, frame: String },
+    /// Some of the songs a command brings are not in this device's copy of the library:
+    /// ask the music server for them, and answer with [`Device::found`] the ones it has.
+    Find { ticket: u64, ids: Vec<String> },
+    /// For a test only: carry on with what this ticket holds after this long
+    /// ([`Device::resume`]).
+    Later { ticket: u64, after_ms: u64 },
+    /// The devices seen have changed: keep this list.
+    Remember(Vec<Remembered>),
+    /// A page of this playlist that was written to disk before now holds the secret: it goes.
+    Forget { playlist: String },
+    /// The player in the window is now another device's (its name), or this one's again.
+    Steering(Option<String>),
+    /// What the device being steered is doing has changed: draw it again.
+    Draw,
+}
+
+/// Whether something queued to be sent under a session may go when its turn comes: only if
+/// the session has not ended and its secret is still inside its time. Both, because a
+/// session that has run out is no session, whether or not anything has ended it yet.
+pub fn may_go(session_ended: bool, since_ms: u64, now_ms: u64) -> bool {
+    !session_ended && secret_holds(since_ms, now_ms)
+}
+
+/// Whether this device should be linked with the person's others at all: signed in, a
+/// relay set up, random numbers to be had, and "Link my devices" on.
+pub fn wanted(signed_in: bool, relay: bool, link_my_devices: bool) -> bool {
+    signed_in && relay && link_my_devices
+}
+
+/// One line of the list.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Row {
+    /// Its place at the relay, as text: what picking it names. Empty for one that is not here.
+    pub place: String,
+    pub name: String,
+    /// What it's doing, in a few words.
+    pub about: String,
+    pub playing: bool,
+    /// It's the device the player here is steering.
+    pub active: bool,
+    /// It's here to be picked. Otherwise it is one seen before that isn't here just now.
+    pub ready: bool,
+}
+
+/// What the panel shows.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Shown {
+    /// This device has its place in the room.
+    pub entered: bool,
+    pub rows: Vec<Row>,
+    /// What there is to say: what became of the last thing asked, or why nothing is linked.
+    pub note: String,
+    /// The device being steered, by name; empty for none.
+    pub steering: String,
+}
+
+/// What was last asked of a device, so that what became of it can be said.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Out {
+    /// Pause, from the list of devices.
+    Pause,
+    /// Something pressed while steering it: the screen shows what became of it.
+    Steer,
+    /// Songs to queue there, and how many.
+    Add(usize),
+    /// A queue to play there now, while steering it; and how many of its songs were left behind.
+    PlayThere(usize),
+    /// This device's music, to carry on there; how many songs were sent, and how many left behind.
+    Give(Giving, usize, usize),
+    /// The pause that completes bringing its music here.
+    TakePause,
+}
+
+#[derive(Default)]
+struct Seen {
+    peer: Peer,
+    /// When it was last looked at.
+    looked_ms: Option<u64>,
+    /// What the command that is out was for. Kept until it is known to have been carried
+    /// out: a refusal, or "not known", can still be put right by a success that arrives later.
+    out: Option<Out>,
+}
+
+/// One sign-in with one secret. When either changes the session ends, and everything in
+/// flight under it is dropped: its number no longer matches.
+struct Session {
+    number: u64,
+    secret: Secret,
+    keys: Keys,
+    /// When the look that read the secret began. Ten minutes on, the secret is not used.
+    since_ms: u64,
+    /// This device's place in the room and the token for it, once it has entered.
+    place: Option<(Place, String)>,
+    /// The other places in the room, in the relay's order, and what is known of each.
+    others: Vec<Place>,
+    peers: HashMap<Place, Seen>,
+}
+
+impl Session {
+    /// Where a device is in the room now: the place that last answered as it. A copy that
+    /// was started again is at two places for a while, and its latest answer is the one
+    /// that counts.
+    fn place_of(&self, device: &DeviceId) -> Option<Place> {
+        let answered = |place: &Place| self.peers.get(place)?.peer.shown().filter(|shown| shown.tell.device == *device).map(|shown| shown.sent_ms);
+        self.others.iter().filter_map(|place| answered(place).map(|at| (at, *place))).max_by_key(|(at, _)| *at).map(|(_, place)| place)
+    }
+}
+
+/// One of the person's other devices is being steered from here.
+struct Steering {
+    device: DeviceId,
+    name: String,
+    view: Option<View>,
+    /// Since when it has had no place in the room.
+    lost_ms: Option<u64>,
+}
+
+/// Music is being brought here from another device.
+enum Take {
+    /// Its queue has been asked for.
+    Asked { place: Place, nonce: Nonce, name: String, pressed_ms: u64 },
+    /// Its queue is loaded here, and this device's sound is awaited: `heard_from` is where
+    /// in the song the sound was when it was first heard on it.
+    Loaded { place: Place, name: String, taking: Taking, heard_from: Option<f64> },
+}
+
+/// A queue another device sent has been loaded here. It is answered when it sounds.
+struct Adoption {
+    session: u64,
+    from: Place,
+    nonce: Nonce,
+    adopting: Adopting,
+    /// This device is busy to the others until then.
+    waiting: Waiting,
+    heard_from: Option<f64>,
+}
+
+/// A command that has been accepted and whose work is still under way away from here.
+struct Pending {
+    session: u64,
+    from: Place,
+    nonce: Nonce,
+    command: Command,
+    at: At,
+    reservation: Reservation,
+    /// What it needs, if that is already found (a command held for a test).
+    ready: Option<Ready>,
+}
+
+#[derive(Default)]
+pub struct Device {
+    /// The sign-in all of this belongs to.
+    account: String,
+    /// The playlist the secret was last read from under this sign-in.
+    used: Option<String>,
+    /// A look is on its way: there is never more than one for a sign-in.
+    looking: bool,
+    /// Goes up when the sign-in changes, so the answer to an earlier look is dropped.
+    looks: u64,
+    /// When the last look finished.
+    looked_ms: Option<u64>,
+    /// "Reset linking" was pressed: the next look writes a new secret.
+    reset: bool,
+    session: Option<Session>,
+    sessions: u64,
+    asks: Asks,
+    note: String,
+    /// The system could not give random numbers: linking is off for this run.
+    off: bool,
+    steering: Option<Steering>,
+    take: Option<Take>,
+    adoption: Option<Adoption>,
+    pending: HashMap<u64, Pending>,
+    tickets: u64,
+    news: News,
+    remembered: Vec<Remembered>,
+    /// What the list last showed, to say when it changes.
+    listed: Vec<Row>,
+    /// For a test only: how long a Pause from another device is held between being
+    /// accepted and being carried out.
+    pub slow_pause_ms: Option<u64>,
+}
+
+fn name_of(seen: &Seen) -> String {
+    seen.peer.shown().map_or_else(|| "A device".to_string(), |shown| shown.tell.name.clone())
+}
+
+/// One row for each device. A copy that has been started again is in the room twice for
+/// a while: at its new place, and at its old one until the relay gives that up. It is
+/// shown once, as its latest answer has it, where it was first in the list.
+fn latest_of_each<T>(rows: Vec<(DeviceId, u64, T)>) -> Vec<T> {
+    let mut kept: Vec<(DeviceId, u64, T)> = Vec::new();
+    for (device, heard_ms, row) in rows {
+        match kept.iter_mut().find(|(other, _, _)| *other == device) {
+            Some(earlier) if heard_ms >= earlier.1 => *earlier = (device, heard_ms, row),
+            Some(_) => {}
+            None => kept.push((device, heard_ms, row)),
+        }
+    }
+    kept.into_iter().map(|(_, _, row)| row).collect()
+}
+
+/// Which entry after the current song a command means: the one at `at`, if it is still
+/// the song its sender saw there, or else the nearest copy of that song.
+pub fn entry(ahead: &[String], at: u64, id: &str) -> Option<usize> {
+    let at = at as usize;
+    if ahead.get(at).is_some_and(|there| there == id) {
+        return Some(at);
+    }
+    ahead.iter().enumerate().filter(|(_, there)| there.as_str() == id).map(|(place, _)| place).min_by_key(|place| place.abs_diff(at))
+}
+
+/// The songs of a queue sent by another device that this device has, each with whether it
+/// was queued by hand (the `queued` straight after the one to start with), and where in
+/// them to start. Songs this library doesn't have are left out.
+pub fn known(library: &dyn Library, ids: &[String], start: usize, queued: usize) -> (Vec<(String, bool)>, usize) {
+    let has = library.has_songs(ids);
+    let (mut songs, mut begin) = (Vec::new(), 0);
+    for (place, id) in ids.iter().enumerate() {
+        if place == start {
+            begin = songs.len();
+        }
+        if has.get(place) == Some(&true) {
+            songs.push((id.clone(), place > start && place <= start + queued));
+        }
+    }
+    let begin = begin.min(songs.len().saturating_sub(1));
+    (songs, begin)
+}
+
+impl Device {
+    /// A device that remembers these others from before.
+    pub fn new(remembered: Vec<Remembered>) -> Device {
+        Device { remembered, ..Device::default() }
+    }
+
+    /// The session, if `number` is the one that is live **and its secret is inside its
+    /// time**. Asked at every use of a session: when a look's answer would renew it, when
+    /// something is sent, when a frame is opened, and at the moment the player is changed.
+    fn live(&self, number: u64, now_ms: u64) -> Option<&Session> {
+        self.session.as_ref().filter(|session| session.number == number && secret_holds(session.since_ms, now_ms))
+    }
+
+    fn live_mut(&mut self, number: u64, now_ms: u64) -> Option<&mut Session> {
+        self.session.as_mut().filter(|session| session.number == number && secret_holds(session.since_ms, now_ms))
+    }
+
+    /// Whether a session with this number is live now.
+    pub fn is_live(&self, session: u64, now_ms: u64) -> bool {
+        self.live(session, now_ms).is_some()
+    }
+
+    fn peer_mut(&mut self, place: &Place) -> Option<&mut Seen> {
+        self.session.as_mut()?.peers.get_mut(place)
+    }
+
+    fn name(&self, place: &Place) -> Option<String> {
+        self.session.as_ref()?.peers.get(place).map(name_of)
+    }
+
+    /// The place of the device being steered, if it has one in the room now.
+    fn steered_place(&self) -> Option<Place> {
+        self.session.as_ref()?.place_of(&self.steering.as_ref()?.device)
+    }
+
+    /// The name of the device the player here is steering, if it is steering one.
+    pub fn steered(&self) -> Option<&str> {
+        self.steering.as_ref().map(|steering| steering.name.as_str())
+    }
+
+    /// What the device being steered is doing, as the player shows it.
+    pub fn view(&self) -> Option<&View> {
+        self.steering.as_ref()?.view.as_ref()
+    }
+
+    /// Ends the session, if there is one. Says whether there was one.
+    fn end_session(&mut self, out: &mut Vec<Do>) -> bool {
+        let Some(session) = self.session.take() else { return false };
+        self.sessions += 1;
+        // A queue that was asked for under it will not be answered under another.
+        if matches!(self.take, Some(Take::Asked { .. })) {
+            self.take = None;
+        }
+        self.news.forget();
+        out.push(Do::End { session: session.number });
+        true
+    }
+
+    /// Everything of this sign-in's is over: the session, and any look at the secret that
+    /// is still on its way, whose answer must start nothing.
+    fn stop_all(&mut self, out: &mut Vec<Do>) {
+        self.end_session(out);
+        if self.looking {
+            out.push(Do::StopLook);
+        }
+        self.looks += 1;
+        self.looking = false;
+        self.looked_ms = None;
+        self.reset = false;
+        self.take = None;
+        if self.steering.take().is_some() {
+            out.push(Do::Steering(None));
+        }
+    }
+
+    /// Ends everything of this sign-in's: at sign-out, when linking is no longer wanted,
+    /// and when the account changes.
+    pub fn stop(&mut self) -> Vec<Do> {
+        let mut out = Vec::new();
+        if self.session.is_some() {
+            out.push(Do::Log("session: ended, with the sign-in it belonged to".into()));
+        }
+        self.stop_all(&mut out);
+        out
+    }
+
+    /// "Link my devices" was set. Off is off at once: everything of this sign-in's ends
+    /// here, in the same step as the setting is saved, so that a frame already on its way
+    /// to this thread finds no session to act under.
+    pub fn setting(&mut self, link_my_devices: bool) -> Vec<Do> {
+        let mut out = Vec::new();
+        if !link_my_devices {
+            if self.session.is_some() {
+                out.push(Do::Log("session: ended, \"Link my devices\" was switched off".into()));
+            }
+            self.stop_all(&mut out);
+        }
+        out
+    }
+
+    /// Called a few times a second. `account` names the sign-in (it changes when the
+    /// person signs in as someone else); `wanted` is [`wanted`].
+    pub fn tick(&mut self, account: &str, wanted: bool, env: &mut Env) -> Vec<Do> {
+        let mut out = Vec::new();
+        let now = env.now_ms;
+        if self.account != account {
+            // Another sign-in: nothing of the last one's carries over.
+            out.extend(self.stop());
+            self.account = account.to_string();
+            self.used = None;
+        }
+        if !wanted || self.off {
+            out.extend(self.stop());
+            return out;
+        }
+        if self.session.as_ref().is_some_and(|session| !secret_holds(session.since_ms, now)) {
+            out.push(Do::Log("session: the secret has not been read for ten minutes".into()));
+            if self.end_session(&mut out) {
+                out.push(Do::Log("session: ended".into()));
+            }
+            self.note = words::SERVER_SILENT.into();
+        }
+        if !self.looking && (self.reset || self.looked_ms.is_none_or(|at| now.saturating_sub(at) >= LOOK_AGAIN_MS)) {
+            self.looking = true;
+            out.push(Do::Look { number: self.looks, used: self.used.clone(), reset: std::mem::take(&mut self.reset) });
+        }
+        self.peers(env, &mut out);
+        self.moves(env, &mut out);
+        self.tell_news(env, &mut out);
+        out
+    }
+
+    /// "Reset linking" was pressed: a new secret is written at the next look, which starts
+    /// as soon as the one on its way (if any) is over.
+    pub fn reset(&mut self) -> Vec<Do> {
+        self.reset = true;
+        self.note = words::RESETTING.into();
+        vec![Do::Log("reset: asked for".into())]
+    }
+
+    /// A look has finished. `since_ms` is when it began; `reset` is whether it was one
+    /// that writes a new secret.
+    pub fn looked(&mut self, number: u64, since_ms: u64, looked: Looked, reset: bool, env: &mut Env) -> Vec<Do> {
+        let mut out = Vec::new();
+        // (Signed out since, or no longer wanted: the answer is nobody's.)
+        if self.looks != number {
+            return out;
+        }
+        self.looking = false;
+        self.looked_ms = Some(env.now_ms);
+        // A look that found the record is not one to use ends the session that used it
+        // now, not when its ten minutes are up.
+        if ends_session(&looked) && self.end_session(&mut out) {
+            out.push(Do::Log("session: ended, the record is no longer one to use".into()));
+        }
+        let reset_done = reset && matches!(&looked, Looked::Secret { wrote: Some(secret::Why::Reset), .. });
+        // A reset that got as far as writing and no further has still ended the old secret.
+        let reset_half_done = reset && matches!(&looked, Looked::Invalid);
+        let begin = match looked {
+            Looked::Secret { secret, id, wrote } => {
+                out.push(Do::Forget { playlist: id.clone() });
+                self.used = Some(id);
+                if wrote == Some(secret::Why::Public) {
+                    self.note = words::WAS_PUBLIC.into();
+                }
+                match self.session.as_mut().filter(|session| session.secret == secret && secret_holds(session.since_ms, env.now_ms)) {
+                    Some(session) => {
+                        session.since_ms = since_ms;
+                        out.push(Do::Renew { session: session.number, since_ms });
+                        out.push(Do::Log("look: the secret is as it was".into()));
+                        None
+                    }
+                    None => Some(secret),
+                }
+            }
+            Looked::Stopped(stop) => {
+                self.note = words::stopped(stop, env.me.here);
+                out.push(Do::Log(format!("look: stopped ({stop:?})")));
+                None
+            }
+            Looked::Failed => {
+                out.push(Do::Log("look: the music server could not be asked".into()));
+                None
+            }
+            Looked::Invalid => {
+                self.note = words::NEEDS_RESETTING.into();
+                None
+            }
+            Looked::NoRandom => {
+                self.no_random(env.me.here, &mut out);
+                None
+            }
+        };
+        if reset_half_done {
+            self.note = words::RESET_HALF_DONE.into();
+        } else if reset && !reset_done {
+            self.note = words::RESET_NOT_DONE.into();
+        }
+        if let Some(secret) = begin {
+            // A secret that is not the one in use: a new session, and the end of the old one.
+            if self.end_session(&mut out) {
+                out.push(Do::Log("session: ended".into()));
+            }
+            let keys = Keys::of(&secret);
+            self.sessions += 1;
+            self.note.clear();
+            out.push(Do::Begin { session: self.sessions, room: keys.room().to_string(), since_ms });
+            self.session = Some(Session { number: self.sessions, secret, keys, since_ms, place: None, others: Vec::new(), peers: HashMap::new() });
+            out.push(Do::Log("session: begun with a secret a look read".into()));
+            if reset_done {
+                out.push(Do::Log("reset: a new secret was written and read back".into()));
+                self.note = words::RESET_DONE.into();
+            }
+        }
+        out
+    }
+
+    fn no_random(&mut self, here: Here, out: &mut Vec<Do>) {
+        if self.end_session(out) {
+            out.push(Do::Log("session: ended".into()));
+        }
+        self.note = words::no_random(here);
+        self.off = true;
+    }
+
+    /// The system gave no random bytes where some were needed: linking is off for this run.
+    pub fn out_of_random(&mut self, here: Here) -> Vec<Do> {
+        let mut out = Vec::new();
+        self.no_random(here, &mut out);
+        out
+    }
+
+    /// The relay had something for the person (why no place can be had).
+    pub fn said(&mut self, session: u64, note: &str) {
+        if self.session.as_ref().is_some_and(|live| live.number == session) {
+            self.note = note.to_string();
+        }
+    }
+
+    /// This device has a place in the room.
+    pub fn entered(&mut self, session: u64, place: Place, token: String) {
+        self.news.forget();
+        if let Some(live) = self.session.as_mut().filter(|live| live.number == session) {
+            // A new place: whatever was asked from the old one cannot be answered to it.
+            live.place = Some((place, token));
+            live.others.clear();
+            live.peers.clear();
+        }
+    }
+
+    /// The relay has forgotten this device's place.
+    pub fn left(&mut self, session: u64) {
+        if let Some(live) = self.session.as_mut().filter(|live| live.number == session) {
+            live.place = None;
+            live.others.clear();
+            live.peers.clear();
+        }
+    }
+
+    /// Seals a message for another place, to be sent. Its nonce.
+    fn send(&mut self, to: Place, kind: u8, message: String, env: &mut Env, out: &mut Vec<Do>) -> Option<Nonce> {
+        let Some(nonce) = env.nonce() else {
+            self.no_random(env.me.here, out);
+            return None;
+        };
+        // Under the session that is live now, and only inside its time.
+        let number = self.session.as_ref()?.number;
+        let session = self.live(number, env.now_ms)?;
+        let (place, token) = session.place.clone()?;
+        let sealed = frame::seal(&session.keys, kind, &nonce, &place, &to, message.as_bytes())?;
+        out.push(Do::Send { session: number, token, to, frame: sealed });
+        Some(nonce)
+    }
+
+    /// What this device says of itself.
+    fn state(&self, re: Option<Nonce>, ok: Option<bool>, why: Option<Why>, env: &Env) -> Tell {
+        let brief = env.player.brief();
+        Tell {
+            re,
+            ok,
+            why,
+            device: env.me.device,
+            name: env.me.name.clone(),
+            at: At { generation: env.player.generation(), minute: minute(env.now_ms) },
+            busy: env.player.busy(env.now_ms),
+            by: env.player.by(),
+            playing: brief.playing,
+            title: brief.title,
+            artist: brief.artist,
+            steering: self.steering.as_ref().map(|steering| steering.name.clone()).unwrap_or_default(),
+            full: None,
+            queue: None,
+        }
+    }
+
+    /// What the relay handed over: who is in the room, and what was in this device's mailbox.
+    pub fn heard(&mut self, session: u64, places: &[String], frames: &[(String, String)], env: &mut Env) -> Vec<Do> {
+        let mut out = Vec::new();
+        let mine = {
+            let Some(live) = self.live_mut(session, env.now_ms) else { return out };
+            let Some((mine, _)) = live.place.clone() else { return out };
+            live.others = places.iter().filter_map(|place| text::read_place(place)).filter(|place| *place != mine).take(15).collect();
+            let others = live.others.clone();
+            live.peers.retain(|place, _| others.contains(place));
+            mine
+        };
+        for (from, sealed) in frames {
+            let Some(from) = text::read_place(from) else { continue };
+            // (Checked for each frame: the one before may have ended the session.)
+            let Some(live) = self.live(session, env.now_ms) else { return out };
+            let Some(opened) = frame::open(&live.keys, sealed, &from, &mine) else {
+                out.push(Do::Log(format!("frame from {}: does not open, dropped", text::place(&from))));
+                continue;
+            };
+            match opened.kind {
+                ASK => self.asked(session, from, opened.nonce, &opened.message, env, &mut out),
+                TELL => self.told(session, from, &opened.message, env, &mut out),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    // ---- what another device asks of this one ----------------------------------------------
+
+    /// What is sounding is what a command would act on: before anything from another
+    /// device is judged, answered or carried out, the window is brought up to the sound.
+    fn catch_up(env: &mut Env, out: &mut Vec<Do>) {
+        if env.player.catch_up() {
+            out.push(Do::Log("the sound has rolled into the next song: the window is brought up to it".into()));
+        }
+    }
+
+    fn asked(&mut self, session: u64, from: Place, nonce: Nonce, message: &[u8], env: &mut Env, out: &mut Vec<Do>) {
+        if !self.asks.allow(env.now_ms) {
+            return out.push(Do::Log("ask: more than this device answers in a second, dropped".into()));
+        }
+        Device::catch_up(env, out);
+        match read_ask(message) {
+            None => {
+                out.push(Do::Log(format!("ask from {}: not one this version carries out", text::place(&from))));
+                let answer = self.state(Some(nonce), Some(false), Some(Why::Invalid), env);
+                self.answer(session, from, answer, env, out);
+            }
+            Some(Ask::Look(want)) => {
+                let mut state = self.state(Some(nonce), None, None, env);
+                match want {
+                    Want::Brief => {}
+                    Want::Full => state.full = Some(env.player.full()),
+                    Want::Queue => state.queue = Some(env.player.handed()),
+                }
+                self.answer(session, from, state, env, out);
+            }
+            Some(Ask::Do { command, at }) => self.commanded(session, from, nonce, command, at, env, out),
+        }
+    }
+
+    /// A command from another device, as it arrives: checked against the rule before any
+    /// work is done for it, then whatever it needs is found, and then it is carried out.
+    fn commanded(&mut self, session: u64, from: Place, nonce: Nonce, command: Command, at: At, env: &mut Env, out: &mut Vec<Do>) {
+        let now = env.now_ms;
+        let reservation = match env.player.admit(at, minute(now), now) {
+            Ok(reservation) => reservation,
+            Err(why) => return self.refused(session, from, nonce, &command, at, why, env, out),
+        };
+        let cannot = |device: &mut Device, env: &mut Env, out: &mut Vec<Do>| {
+            env.player.refuse(reservation);
+            device.refused(session, from, nonce, &command, at, Why::Cannot, env, out);
+        };
+        let entry_of = |env: &Env, at: u64, id: &str| entry(&env.player.ahead(), at, id).map(Ready::Entry);
+        // What it needs found, or that it cannot be done. Nothing is changed here.
+        let ready = match &command {
+            Command::Play | Command::Pause | Command::Next | Command::Previous | Command::Seek { .. } | Command::Clear { .. } if !env.player.has_song() => None,
+            Command::Jump { at, id } | Command::Remove { at, id } => entry_of(env, *at, id),
+            Command::Move { from, id, .. } => entry_of(env, *from, id),
+            Command::Add { ids, .. } => {
+                let has = env.library.has_songs(ids);
+                if has.iter().all(|has| *has) && has.len() == ids.len() {
+                    Some(Ready::Songs(ids.clone()))
+                } else {
+                    // The songs are looked up away from this thread; the command stays the
+                    // one that is open, and this device is busy to the others, until they
+                    // are back.
+                    self.tickets += 1;
+                    self.pending.insert(self.tickets, Pending { session, from, nonce, command: command.clone(), at, reservation, ready: None });
+                    return out.push(Do::Find { ticket: self.tickets, ids: ids.clone() });
+                }
+            }
+            // It checks it can play before anything is changed: a queue none of whose songs
+            // this library has is not taken.
+            Command::Adopt(adopt) => match known(env.library, &adopt.songs, adopt.index, adopt.queued) {
+                (songs, _) if songs.is_empty() => None,
+                (songs, begin) => Some(Ready::Queue(songs, begin)),
+            },
+            _ => Some(Ready::Nothing),
+        };
+        let Some(ready) = ready else { return cannot(self, env, out) };
+        // (For a test only: a Pause is carried out a while after it is accepted, so that
+        // something can be made to happen in between.)
+        if let (Command::Pause, Some(wait)) = (&command, self.slow_pause_ms) {
+            out.push(Do::Log(format!("pause from {}: accepted, and held {wait} ms before it is carried out (a test)", text::place(&from))));
+            self.tickets += 1;
+            self.pending.insert(self.tickets, Pending { session, from, nonce, command, at, reservation, ready: Some(ready) });
+            return out.push(Do::Later { ticket: self.tickets, after_ms: wait });
+        }
+        self.finish(session, from, nonce, command, at, reservation, ready, env, out);
+    }
+
+    /// The songs a command brought that the music server has, of those this device's copy
+    /// of the library lacked ([`Do::Find`]): every song the command names that can be
+    /// played here, by id, the ones the library had and the ones that were found.
+    pub fn found(&mut self, ticket: u64, songs: Vec<String>, env: &mut Env) -> Vec<Do> {
+        let mut out = Vec::new();
+        let Some(pending) = self.pending.remove(&ticket) else { return out };
+        let Pending { session, from, nonce, command, at, reservation, .. } = pending;
+        if songs.is_empty() {
+            env.player.refuse(reservation);
+            self.refused(session, from, nonce, &command, at, Why::Cannot, env, &mut out);
+        } else {
+            self.finish(session, from, nonce, command, at, reservation, Ready::Songs(songs), env, &mut out);
+        }
+        out
+    }
+
+    /// Carries on with what a ticket holds ([`Do::Later`]).
+    pub fn resume(&mut self, ticket: u64, env: &mut Env) -> Vec<Do> {
+        let mut out = Vec::new();
+        if let Some(Pending { session, from, nonce, command, at, reservation, ready: Some(ready) }) = self.pending.remove(&ticket) {
+            self.finish(session, from, nonce, command, at, reservation, ready, env, &mut out);
+        }
+        out
+    }
+
+    /// The moment the player is changed for a command from another device: everything is
+    /// checked again, under the session the command arrived in, and then it is carried out
+    /// the way the same press on this device would be.
+    #[allow(clippy::too_many_arguments)]
+    fn finish(&mut self, session: u64, from: Place, nonce: Nonce, command: Command, at: At, reservation: Reservation, ready: Ready, env: &mut Env, out: &mut Vec<Do>) {
+        // (The sound may have rolled on while the work was done.)
+        Device::catch_up(env, out);
+        let now = env.now_ms;
+        let same_session = self.is_live(session, now);
+        if let Err(why) = env.player.finish(reservation, at, minute(now), same_session, nonce) {
+            return self.refused(session, from, nonce, &command, at, why, env, out);
+        }
+        env.player.carry_out(&command, &ready);
+        out.push(Do::Log(format!("{} from {} against generation {}: carried out", command.name(), text::place(&from), at.generation)));
+        if matches!(command, Command::Adopt(_)) {
+            // It answers "carried out" when its sound has started, and is busy until then.
+            let waiting = env.player.wait(now, START_MS + 5_000);
+            let adoption = Adoption { session, from, nonce, adopting: Adopting::begin(env.player.generation(), now), waiting, heard_from: None };
+            if let Some(earlier) = self.adoption.replace(adoption) {
+                env.player.done(earlier.waiting);
+            }
+            return;
+        }
+        let answer = self.state(Some(nonce), Some(true), None, env);
+        self.answer(session, from, answer, env, out);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn refused(&mut self, session: u64, from: Place, nonce: Nonce, command: &Command, at: At, why: Why, env: &mut Env, out: &mut Vec<Do>) {
+        out.push(Do::Log(format!(
+            "{} from {} against generation {}: refused, {why:?} (this device is at {}{})",
+            command.name(),
+            text::place(&from),
+            at.generation,
+            env.player.generation(),
+            if env.player.busy(env.now_ms) { ", busy" } else { "" }
+        )));
+        let answer = self.state(Some(nonce), Some(false), Some(why), env);
+        self.answer(session, from, answer, env, out);
+    }
+
+    /// Answers an ask, if the session it arrived under is still the live one: an answer is
+    /// not sent under another session, to a place that session has never heard of.
+    fn answer(&mut self, session: u64, to: Place, answer: Tell, env: &mut Env, out: &mut Vec<Do>) {
+        if !self.is_live(session, env.now_ms) {
+            return out.push(Do::Log("answer: the session it belonged to has ended, not sent".into()));
+        }
+        self.send(to, TELL, answer.text(), env, out);
+    }
+
+    /// The moves that wait on this device's own sound: a queue another device sent, which
+    /// is answered when it sounds; and music being brought here, whose other end is paused
+    /// when this one sounds. And the device being steered, if it has gone.
+    fn moves(&mut self, env: &mut Env, out: &mut Vec<Do>) {
+        let now = env.now_ms;
+        // This device's own sound has started on the queue a move is waiting on once it
+        // has moved on from where it was first heard: the song being open is not yet sound.
+        let sounding = {
+            let at = env.player.sounding_at();
+            let heard = match (&mut self.adoption, &mut self.take) {
+                (Some(adoption), _) => Some(&mut adoption.heard_from),
+                (None, Some(Take::Loaded { heard_from, .. })) => Some(heard_from),
+                _ => None,
+            };
+            match (heard, at) {
+                (Some(heard), Some(at)) => at - *heard.get_or_insert(at) >= SOUNDS_AFTER,
+                (Some(heard), None) => {
+                    *heard = None;
+                    false
+                }
+                (None, _) => false,
+            }
+        };
+        let generation = env.player.generation();
+        // A queue that was sent here.
+        let live = self.session.as_ref().map(|session| session.number);
+        let step = match &self.adoption {
+            // (The session it came under has ended: there is nobody to answer.)
+            Some(adoption) if live != Some(adoption.session) => Some(None),
+            Some(adoption) => adoption.adopting.poll(sounding, generation, now).map(Some),
+            None => None,
+        };
+        if let Some((adoption, adopted)) = step.and_then(|adopted| self.adoption.take().map(|adoption| (adoption, adopted))) {
+            let (ok, why) = match adopted {
+                Some(Adopted::Started) => (true, None),
+                Some(Adopted::Changed) => (false, Some(Why::Changed)),
+                Some(Adopted::Failed) => {
+                    // No sound came: it stops trying, and says so.
+                    env.player.pause();
+                    (false, Some(Why::Cannot))
+                }
+                None => (false, None),
+            };
+            env.player.done(adoption.waiting);
+            if adopted.is_some() {
+                out.push(Do::Log(format!("adopt from {}: {}", text::place(&adoption.from), if ok { "its sound has started" } else { "it did not start" })));
+                let answer = self.state(Some(adoption.nonce), Some(ok), why, env);
+                self.answer(adoption.session, adoption.from, answer, env, out);
+            }
+        }
+        // Music being brought here.
+        let step = match &self.take {
+            Some(Take::Loaded { taking, .. }) => taking.poll(sounding, generation, now).map(Some),
+            // Its queue never came.
+            Some(Take::Asked { pressed_ms, .. }) if now.saturating_sub(*pressed_ms) >= WAIT_MS => Some(None),
+            _ => None,
+        };
+        match step.and_then(|took| self.take.take().map(|take| (take, took))) {
+            Some((Take::Asked { name, .. }, _)) => {
+                self.let_go_into(out);
+                self.say(words::queue_never_came(&name), out);
+            }
+            Some((Take::Loaded { place, name, .. }, Some(took))) => match took {
+                Took::Pause(at) => {
+                    // The other stops now that this one sounds: against the state its queue
+                    // was taken from, so that if it has been given anything else to do
+                    // since, it is left to it.
+                    if let Some(nonce) = self.send(place, ASK, Ask::Do { command: Command::Pause, at }.text(), env, out) {
+                        out.push(Do::Log(format!("take: {} sounds; asked {name} to pause, against generation {}", env.me.here.this_lower(), at.generation)));
+                        if let Some(seen) = self.peer_mut(&place) {
+                            seen.peer.sent(nonce, at, now);
+                            seen.out = Some(Out::TakePause);
+                        }
+                    }
+                }
+                Took::ThisChanged => self.say(words::chosen_here_meanwhile(&name), out),
+                Took::NotStarted => self.say(words::did_not_start_here(&name, env.me.here), out),
+            },
+            _ => {}
+        }
+        // The device being steered.
+        let here = self.steered_place().is_some();
+        let lost = match self.steering.as_mut() {
+            Some(steering) if here => {
+                steering.lost_ms = None;
+                None
+            }
+            Some(steering) => {
+                let since = *steering.lost_ms.get_or_insert(now);
+                (now.saturating_sub(since) >= LOST_MS).then(|| steering.name.clone())
+            }
+            None => None,
+        };
+        if let Some(name) = lost {
+            self.let_go_into(out);
+            self.say(words::gone(&name, env.me.here), out);
+        }
+    }
+
+    /// Tells the other devices, unasked, that what this one is doing has changed: so that
+    /// they look now, not at their next turn. Bounded by `super::news`.
+    fn tell_news(&mut self, env: &mut Env, out: &mut Vec<Do>) {
+        use std::hash::{Hash, Hasher};
+        let Some(others) = self.session.as_ref().filter(|session| session.place.is_some()).map(|session| session.others.clone()) else { return };
+        let state = self.state(None, None, None, env);
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        (state.at.generation, state.busy, state.playing, &state.title, &state.artist, &state.name, &state.steering).hash(&mut hasher);
+        if !self.news.due(hasher.finish(), others.len(), env.now_ms) {
+            return;
+        }
+        let text = state.text();
+        for place in others {
+            self.send(place, TELL, text.clone(), env, out);
+        }
+    }
+
+    // ---- what this device asks of another --------------------------------------------------
+
+    /// Says something to the person: where they are looking, and under the list.
+    fn say(&mut self, note: String, out: &mut Vec<Do>) {
+        out.push(Do::Log(format!("said: {note}")));
+        self.note = note.clone();
+        out.push(Do::Say(note));
+    }
+
+    /// Another device says something of itself.
+    fn told(&mut self, session: u64, from: Place, message: &[u8], env: &mut Env, out: &mut Vec<Do>) {
+        let Some(mut tell) = read_tell(message) else {
+            return out.push(Do::Log(format!("tell from {}: breaks its shape, dropped", text::place(&from))));
+        };
+        let now = env.now_ms;
+        if tell.news() {
+            // News is a reason to look, and nothing more.
+            let look = self.live_mut(session, now).and_then(|live| live.peers.get_mut(&from)).is_some_and(|seen| seen.peer.news(now));
+            if look {
+                self.look_at(from, false, env, out);
+            }
+            return;
+        }
+        // (The queue, if it carries one, is for the move that asked for it and is not kept.)
+        let (handed, re, at, playing, device) = (tell.queue.take(), tell.re, tell.at, tell.playing, tell.device);
+        let (told, name, sent_for) = {
+            let Some(seen) = self.live_mut(session, now).and_then(|live| live.peers.get_mut(&from)) else { return };
+            let told = seen.peer.told(tell);
+            let sent_for = seen.out;
+            if matches!(told, Told::Settled(Outcome::Done) | Told::ShownAndSettled(Outcome::Done)) {
+                seen.out = None;
+            }
+            (told, name_of(seen), sent_for)
+        };
+        if matches!(told, Told::Shown | Told::ShownAndSettled(_)) {
+            // It answered under this name: it is remembered, so that the list can show it
+            // at once another time.
+            let id = text::base64(&device);
+            if seen::is_news(&self.remembered, &id, &name, env.today) {
+                self.remembered = seen::remembered(std::mem::take(&mut self.remembered), Some((&id, &name)), env.today);
+                out.push(Do::Remember(self.remembered.clone()));
+            }
+            self.show_view(from, now, out);
+            // The queue that was asked for, to bring its music here.
+            if matches!(&self.take, Some(Take::Asked { place, nonce, .. }) if *place == from && Some(*nonce) == re) {
+                self.took(from, handed, at, playing, env, out);
+            }
+        }
+        match told {
+            Told::Dropped => out.push(Do::Log(format!("tell from {name}: answers nothing waited on, dropped"))),
+            Told::Shown => {}
+            Told::Settled(outcome) | Told::ShownAndSettled(outcome) => {
+                self.outcome(from, &name, sent_for, outcome, env, out);
+                // What was pressed while it was unanswered goes next, if it was carried out.
+                if outcome == Outcome::Done {
+                    self.next(from, env, out);
+                }
+                // The answer to a command does not change what is shown: look again.
+                self.look_at(from, false, env, out);
+            }
+        }
+    }
+
+    /// Says what became of something asked of another device.
+    fn outcome(&mut self, place: Place, name: &str, sent_for: Option<Out>, outcome: Outcome, env: &mut Env, out: &mut Vec<Do>) {
+        let sent_for = sent_for.unwrap_or(Out::Steer);
+        out.push(Do::Log(format!("outcome of {sent_for:?} to {name}: {outcome:?}")));
+        let note = match (sent_for, outcome) {
+            (Out::Pause, Outcome::Done) => words::paused(name),
+            (Out::Steer | Out::PlayThere(0), Outcome::Done) => String::new(),
+            (Out::PlayThere(left), Outcome::Done) => words::sent_as_many_as_fit(name, left),
+            (Out::Add(count), Outcome::Done) => words::added(count, name),
+            (Out::Give(giving, sent, left), outcome) => {
+                let gave = giving.ends(outcome, env.player.generation(), env.now_ms);
+                if gave == Gave::Moved {
+                    // The other has started: this one stops, and the player is the other's.
+                    env.player.pause();
+                    self.steer(place, env, out);
+                }
+                words::gave(gave, name, left, sent, env.me.here)
+            }
+            (Out::TakePause, outcome) => words::took(outcome, name),
+            (_, outcome) => words::outcome(outcome, name),
+        };
+        if note.is_empty() {
+            return;
+        }
+        out.push(Do::Log(format!("said: {note}")));
+        self.note = note.clone();
+        // Under the list for a Pause pressed there; anything else is said where the person is looking.
+        if sent_for != Out::Pause {
+            out.push(Do::Say(note));
+        }
+    }
+
+    /// Sends a look to a place. `checking` says it is the one look that asks what became of
+    /// a command that has gone unanswered.
+    fn look_at(&mut self, to: Place, checking: bool, env: &mut Env, out: &mut Vec<Do>) {
+        // The device being steered is asked for everything the player shows.
+        let want = if self.steered_place() == Some(to) { Want::Full } else { Want::Brief };
+        let Some(nonce) = self.send(to, ASK, Ask::Look(want).text(), env, out) else { return };
+        let now = env.now_ms;
+        if let Some(seen) = self.peer_mut(&to) {
+            seen.looked_ms = Some(now);
+            if checking { seen.peer.checking(nonce, now) } else { seen.peer.looked(nonce, now) }
+        }
+    }
+
+    /// Looks at each of the other devices from time to time (the one being steered every
+    /// few seconds), and gives up waiting for the answer to a command when it has waited
+    /// long enough.
+    fn peers(&mut self, env: &mut Env, out: &mut Vec<Do>) {
+        let now = env.now_ms;
+        let steered = self.steered_place();
+        let (mut to_look, mut settled) = (Vec::new(), Vec::new());
+        {
+            let Some(session) = self.session.as_mut().filter(|session| session.place.is_some()) else { return };
+            for place in session.others.clone() {
+                let seen = session.peers.entry(place).or_default();
+                let every = if steered == Some(place) { LOOK_EVERY_MS } else { LOOK_IDLE_MS };
+                match seen.peer.tick(now) {
+                    Tick::Check => to_look.push((place, true)),
+                    Tick::Settled(outcome) => settled.push((place, name_of(seen), seen.out, outcome)),
+                    Tick::Nothing if seen.looked_ms.is_none_or(|at| now.saturating_sub(at) >= every) => to_look.push((place, false)),
+                    Tick::Nothing => {}
+                }
+            }
+        }
+        for (place, name, sent_for, outcome) in settled {
+            self.outcome(place, &name, sent_for, outcome, env, out);
+        }
+        for (place, checking) in to_look {
+            self.look_at(place, checking, env, out);
+        }
+    }
+
+    /// Asks a device to do something: now, if nothing asked of it is unanswered and there
+    /// is a fresh state to make it against; after the command that is out, if one is; or
+    /// not at all.
+    fn ask(&mut self, to: Place, command: Command, sent_for: Out, env: &mut Env, out: &mut Vec<Do>) -> Pressed {
+        let now = env.now_ms;
+        let Some(press) = self.peer_mut(&to).map(|seen| seen.peer.press(&command, now)) else { return Pressed::No(Wait::Look) };
+        let Pressed::Send(at) = press else { return press };
+        let name = command.name();
+        let Some(nonce) = self.send(to, ASK, Ask::Do { command, at }.text(), env, out) else { return Pressed::No(Wait::Look) };
+        if let Some(seen) = self.peer_mut(&to) {
+            out.push(Do::Log(format!("{name}: asked {}, against generation {} in minute {}", name_of(seen), at.generation, at.minute)));
+            seen.peer.sent(nonce, at, now);
+            seen.out = Some(sent_for);
+        }
+        press
+    }
+
+    /// Sends the next press that was waiting for a device, now that the one before it has
+    /// been carried out: against the state in that answer.
+    fn next(&mut self, to: Place, env: &mut Env, out: &mut Vec<Do>) {
+        let now = env.now_ms;
+        let Some((command, at)) = self.peer_mut(&to).and_then(|seen| seen.peer.next(now)) else { return };
+        let sent_for = match &command {
+            Command::Add { ids, .. } => Out::Add(ids.len()),
+            _ => Out::Steer,
+        };
+        let name = command.name();
+        let Some(nonce) = self.send(to, ASK, Ask::Do { command, at }.text(), env, out) else { return };
+        if let Some(seen) = self.peer_mut(&to) {
+            out.push(Do::Log(format!("{name}: asked {} next, against generation {} in minute {}", name_of(seen), at.generation, at.minute)));
+            seen.peer.sent(nonce, at, now);
+            seen.out = Some(sent_for);
+        }
+    }
+
+    /// Says why something could not be asked of a device just now, and looks at it.
+    fn not_sent(&mut self, to: Place, name: &str, wait: Wait, aloud: bool, env: &mut Env, out: &mut Vec<Do>) {
+        let note = words::not_sent(wait, name);
+        if wait != Wait::Unanswered && self.name(&to).is_some() {
+            self.look_at(to, false, env, out);
+        }
+        self.note = note.clone();
+        if aloud {
+            out.push(Do::Say(note));
+        }
+    }
+
+    fn unanswered(&self, place: &Place) -> bool {
+        self.session.as_ref().and_then(|session| session.peers.get(place)).is_some_and(|seen| seen.peer.waiting())
+    }
+
+    /// Pause was pressed for another device, in the list.
+    pub fn pause(&mut self, place: &str, env: &mut Env) -> Vec<Do> {
+        let mut out = Vec::new();
+        let Some(to) = text::read_place(place) else { return out };
+        let Some(name) = self.name(&to) else { return out };
+        if self.unanswered(&to) {
+            self.not_sent(to, &name, Wait::Unanswered, false, env, &mut out);
+            return out;
+        }
+        match self.ask(to, Command::Pause, Out::Pause, env, &mut out) {
+            Pressed::Send(_) | Pressed::Waits => self.note = words::asked_to_pause(&name),
+            Pressed::No(wait) => self.not_sent(to, &name, wait, false, env, &mut out),
+        }
+        out
+    }
+
+    // ---- steering another device from here ---------------------------------------------------
+
+    /// From here the player and the queue panel are that device's.
+    fn steer(&mut self, place: Place, env: &mut Env, out: &mut Vec<Do>) {
+        let found = self.session.as_ref().and_then(|session| session.peers.get(&place)).and_then(|seen| seen.peer.shown()).map(|shown| (shown.tell.device, shown.tell.name.clone()));
+        let Some((device, name)) = found else { return };
+        out.push(Do::Log(format!("steering {name}")));
+        out.push(Do::Steering(Some(name.clone())));
+        self.steering = Some(Steering { device, name, view: None, lost_ms: None });
+        self.look_at(place, false, env, out);
+    }
+
+    fn let_go_into(&mut self, out: &mut Vec<Do>) -> bool {
+        if matches!(self.take, Some(Take::Asked { .. })) {
+            self.take = None;
+        }
+        let was = self.steering.take().is_some();
+        if was {
+            out.push(Do::Log("steering: stopped".into()));
+            out.push(Do::Steering(None));
+        }
+        was
+    }
+
+    /// Stops steering, leaving the other device as it is. The player is this device's own
+    /// again. Nothing, if none was being steered.
+    pub fn let_go(&mut self) -> Vec<Do> {
+        let mut out = Vec::new();
+        self.let_go_into(&mut out);
+        out
+    }
+
+    /// A fresh state arrived from a place: if that is the device being steered, the
+    /// player shows it.
+    fn show_view(&mut self, from: Place, now: u64, out: &mut Vec<Do>) {
+        if self.steered_place() != Some(from) {
+            return;
+        }
+        let fresh = self.session.as_ref().and_then(|session| session.peers.get(&from)).and_then(|seen| seen.peer.shown()).and_then(|shown| shown.tell.full.clone().map(|full| (full, shown.tell.playing, shown.tell.name.clone())));
+        if let (Some((full, playing, name)), Some(steering)) = (fresh, self.steering.as_mut()) {
+            steering.view = Some(View { full, playing, heard_ms: now });
+            if steering.name != name {
+                out.push(Do::Steering(Some(name.clone())));
+                steering.name = name;
+            }
+            out.push(Do::Draw);
+        }
+    }
+
+    /// Something was pressed in the player or the queue panel. While another device is
+    /// being steered it is asked of that device, and this says so (`Some`); otherwise
+    /// `None`, and the press is this device's own.
+    pub fn press(&mut self, press: Press, env: &mut Env) -> Option<Vec<Do>> {
+        let steering = self.steering.as_ref()?;
+        let mut out = Vec::new();
+        // (Steering a device that has no place in the room just now: what is pressed has
+        // nowhere to go, and is still not this device's own.)
+        let (place, name) = (self.steered_place().unwrap_or_default(), steering.name.clone());
+        let Some(command) = steering.view.as_ref().and_then(|view| press.command(view)) else { return Some(out) };
+        match self.ask(place, command.clone(), Out::Steer, env, &mut out) {
+            Pressed::Send(_) | Pressed::Waits => {
+                // The player shows what was asked for straight away; the other device's
+                // word on it follows a moment later.
+                if let Some(view) = self.steering.as_mut().and_then(|steering| steering.view.as_mut()) {
+                    view.at_once(&command, env.now_ms);
+                }
+                out.push(Do::Draw);
+            }
+            Pressed::No(wait) => self.not_sent(place, &name, wait, true, env, &mut out),
+        }
+        Some(out)
+    }
+
+    /// Songs were queued (Add to queue, Play next). While another device is being steered
+    /// they are queued there; otherwise `None`.
+    pub fn add(&mut self, ids: &[String], next: bool, env: &mut Env) -> Option<Vec<Do>> {
+        let name = self.steering.as_ref()?.name.clone();
+        let mut out = Vec::new();
+        let place = self.steered_place().unwrap_or_default();
+        // (An id that cannot be carried is a radio station's, or none.)
+        let ids: Vec<String> = ids.iter().filter(|id| id_ok(id)).take(MOST_ADDED).cloned().collect();
+        if ids.is_empty() {
+            out.push(Do::Say(words::NOT_RADIO.into()));
+            return Some(out);
+        }
+        let count = ids.len();
+        if let Pressed::No(wait) = self.ask(place, Command::Add { ids, next }, Out::Add(count), env, &mut out) {
+            self.not_sent(place, &name, wait, true, env, &mut out);
+        }
+        Some(out)
+    }
+
+    /// Something was played (an album, a song in a list). While another device is being
+    /// steered it plays there, as it would here, taking the queue's place; otherwise `None`.
+    /// A song that cannot be carried (a radio station) is given as an empty id.
+    pub fn play(&mut self, ids: &[String], start: usize, context: &str, env: &mut Env) -> Option<Vec<Do>> {
+        let name = self.steering.as_ref()?.name.clone();
+        let mut out = Vec::new();
+        let place = self.steered_place().unwrap_or_default();
+        let Some((adopt, left)) = Adopt::fitted(ids, start, 0, 0.0, context) else {
+            out.push(Do::Say(words::cannot_play_there(&name)));
+            return Some(out);
+        };
+        if let Pressed::No(wait) = self.ask(place, Command::Adopt(adopt), Out::PlayThere(left), env, &mut out) {
+            self.not_sent(place, &name, wait, true, env, &mut out);
+        }
+        Some(out)
+    }
+
+    /// A device was picked in the list: this one starts steering it, and if music is
+    /// playing here it carries on over there, this one stopping once that one has started.
+    /// `in_a_jam` is whether this device is in a jam with other people, when it steers nothing.
+    pub fn choose(&mut self, place: &str, in_a_jam: bool, env: &mut Env) -> Vec<Do> {
+        let mut out = Vec::new();
+        let Some(to) = text::read_place(place) else { return out };
+        let Some(name) = self.name(&to) else { return out };
+        if self.steered_place() == Some(to) {
+            return out;
+        }
+        if in_a_jam {
+            out.push(Do::Say(words::IN_A_JAM.into()));
+            return out;
+        }
+        // Music playing here moves over there; otherwise that device is steered as it is.
+        let playing = self.steering.is_none() && env.player.brief().playing;
+        let handed = playing.then(|| env.player.handed()).filter(|handed| !handed.songs.is_empty());
+        let Some(handed) = handed else {
+            self.let_go_into(&mut out);
+            self.steer(to, env, &mut out);
+            return out;
+        };
+        let Some((adopt, _)) = Adopt::fitted(&handed.songs, 0, handed.queued, handed.position, &handed.context) else { return out };
+        if self.unanswered(&to) {
+            self.not_sent(to, &name, Wait::Unanswered, true, env, &mut out);
+            return out;
+        }
+        let giving = Giving::begin(env.player.generation(), env.now_ms);
+        let sent = adopt.songs.len();
+        match self.ask(to, Command::Adopt(adopt), Out::Give(giving, sent, handed.more as usize), env, &mut out) {
+            Pressed::Send(_) => {
+                self.note = words::moving(&name);
+                out.push(Do::Say(words::moving(&name)));
+            }
+            Pressed::Waits => {}
+            Pressed::No(wait) => self.not_sent(to, &name, wait, true, env, &mut out),
+        }
+        out
+    }
+
+    /// "Play here": brings what the device being steered is playing over to this one, and
+    /// stops steering it. `None` if no device was being steered.
+    pub fn play_here(&mut self, env: &mut Env) -> Option<Vec<Do>> {
+        let name = self.steering.as_ref()?.name.clone();
+        let mut out = Vec::new();
+        let place = self.steered_place().unwrap_or_default();
+        // Its queue is asked for; what is done with it is in `took`.
+        match self.send(place, ASK, Ask::Look(Want::Queue).text(), env, &mut out) {
+            Some(nonce) => {
+                let now = env.now_ms;
+                if let Some(seen) = self.peer_mut(&place) {
+                    seen.peer.looked(nonce, now);
+                }
+                self.take = Some(Take::Asked { place, nonce, name: name.clone(), pressed_ms: now });
+                out.push(Do::Log(format!("take: asked {name} for its queue")));
+            }
+            None => {
+                self.let_go_into(&mut out);
+                self.say(words::cannot_be_reached_to_move(&name), &mut out);
+            }
+        }
+        Some(out)
+    }
+
+    /// The queue that was asked for has arrived: it is taken and started here. The other
+    /// device is paused once this one sounds (`moves`).
+    fn took(&mut self, from: Place, handed: Option<Handed>, at: At, playing: bool, env: &mut Env, out: &mut Vec<Do>) {
+        let Some(Take::Asked { name, pressed_ms, .. }) = self.take.take() else { return };
+        // The player is this device's own from here, whatever comes of it.
+        self.let_go_into(out);
+        let Some(handed) = handed.filter(|handed| playing && !handed.songs.is_empty()) else {
+            // Nothing was playing there to bring over: it is just let go of.
+            return out.push(Do::Log(format!("take: {name} was not playing anything")));
+        };
+        let (songs, begin) = known(env.library, &handed.songs, 0, handed.queued);
+        if songs.is_empty() {
+            return self.say(words::none_of_those_songs(&name, env.me.here), out);
+        }
+        env.player.take(&songs, begin, handed.position, &handed.context);
+        let taking = Taking::begin(at, env.player.generation(), pressed_ms);
+        out.push(Do::Log(format!("take: loaded {name}'s queue here; it is paused when {} sounds", env.me.here.this_lower())));
+        self.take = Some(Take::Loaded { place: from, name, taking, heard_from: None });
+    }
+
+    /// The list: the other devices and what each is doing, and after them the ones seen
+    /// before that are not here now. Says, the first time and whenever it changes, what
+    /// it shows ([`Do::Log`]).
+    pub fn shown(&mut self, now_ms: u64) -> (Shown, Vec<Do>) {
+        let steered = self.steering.as_ref().map(|steering| steering.device);
+        let (mut rows, mut here) = (Vec::new(), Vec::new());
+        if let Some(session) = &self.session {
+            for place in &session.others {
+                let Some(shown) = session.peers.get(place).and_then(|seen| seen.peer.shown()) else { continue };
+                let tell = &shown.tell;
+                here.push(text::base64(&tell.device));
+                let row = Row { place: text::place(place), name: tell.name.clone(), about: words::about(tell, now_ms.saturating_sub(shown.sent_ms) / 1000), playing: tell.playing, active: steered == Some(tell.device), ready: true };
+                rows.push((tell.device, shown.sent_ms, row));
+            }
+        }
+        let entered = self.session.as_ref().is_some_and(|session| session.place.is_some());
+        let mut rows = latest_of_each(rows);
+        // The devices seen before and not here now: listed at once, and not to be picked.
+        for known in self.remembered.iter().filter(|known| !here.contains(&known.id)) {
+            rows.push(Row { place: String::new(), name: known.name.clone(), about: if entered { words::NOT_HERE } else { words::LOOKING_FOR_IT }.into(), playing: false, active: false, ready: false });
+        }
+        let mut out = Vec::new();
+        if rows != self.listed {
+            out.push(Do::Log(format!("shown: {}", if rows.is_empty() { "no other devices".to_string() } else { rows.iter().map(|row| format!("{}: {}", row.name, row.about)).collect::<Vec<_>>().join("; ") })));
+            self.listed = rows.clone();
+        }
+        (Shown { entered, rows, note: self.note.clone(), steering: self.steered().unwrap_or_default().to_string() }, out)
+    }
+}
+
+#[cfg(test)]
+mod tests;
