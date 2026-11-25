@@ -125,21 +125,48 @@ for linking, and the app says so. The name is added to the reserved names.
 
 | The look finds | The device |
 |---|---|
-| No playlist of ours | Makes one, writes a new secret into it, and looks again from the start. It uses only what a look reads back, never what it wrote. |
-| Ours, comment empty or not a record (a device stopped between making and writing) | **Repairs it:** writes a new secret into it and looks again. |
+| No playlist of ours | Makes one (below), and looks again from the start. It uses only what a look reads back, never what it wrote. |
+| Ours by name, and holding no record: empty, or with a description of the person's own, with songs or without | **Leaves it exactly as it is.** It is the person's own playlist. Linking does not start, and the person is told to rename or delete it. |
 | Ours, with a later layout number | Leaves it alone. Linking is off until the app is updated. |
 | Ours, readable | Uses the secret, and remembers the playlist's id for this sign-in. |
 | A lower id of ours than the one remembered, the remembered one still there | Moves to the lower (two devices each made one; this is how they agree). |
-| The remembered one gone | **Does not take up another playlist's old secret.** Writes a new secret into what `find` now gives, or makes one. |
+| The remembered one gone | **Does not take up another playlist's old secret.** Writes a new secret into what `find` now gives if that holds a record, or makes one. |
 | Ours, stated public | Makes it private, writes a new secret, and tells the person. |
 
 Two devices that write at the same moment may use different secrets until the next
 look.
 
+**Nothing is ever written into a playlist that holds no record**, and so that this
+cannot strand the app's own first-time making, **the name is only ever given together
+with the record.** The playlist is made as "Nexus Music link (being set up)" and given
+its name, the record and its privacy in one request. There is no moment at which a
+playlist of the name, with no record in it, is the app's leaving: one that is found so
+is the person's. A playlist left being set up by a look that could not finish (the
+app was closed, the server went away) is carried on with by the next look, if it is
+still as the app left it: this account's, by that name, with no songs and nothing
+written in it. Otherwise another is made. The setting-up name is reserved and left out
+of listings as the name is. Nothing is made unless there are random bytes to put in it.
+
+**A comment is a record only if it reads as one:** the mark with a layout this version
+knows and a well-formed secret, or the mark with a later layout. A description that
+only has the mark's name in it is a description.
+
 - **Writing** is by form POST with the sign-in in the form too, so neither the secret
   nor a new address carrying it reaches a log. (Navidrome takes form POST for every
   call; checked in its source.) Every write sets the playlist private. Redirects are
   not followed.
+- **Only a 200 that parses is an answer.** A proxy's error page, or any other status
+  with a body that happens to read as a good answer, is no answer.
+- **A write that gets no answer is followed by a read**, because the server may have
+  written it all the same. The look goes round again and goes by what it reads: the new
+  secret (the write landed and its answer was lost); the secret that stood (it never
+  landed: for a reset, nothing is said to have been reset); or, if the read gets no
+  answer either, nothing: the record is not known to be good, and what is held is not
+  used.
+- **Before the first request that changes anything on the server**, the look says it is
+  to be seen through (`keep_going`): a sign-out after that does not leave it half done.
+  That first request is the making of the playlist, where one is made. A request
+  already on its way when the sign-in ends still finishes; no other is made.
 - **When.** A look starts when linking is switched on or the app starts, two minutes
   after the last one finished, and on "Reset linking". **One look at a time for a
   sign-in.** The secret is held in memory only and is used for at most ten minutes,
@@ -149,23 +176,29 @@ look.
   writes a new one in its place and reads that back. It is no other path to the
   playlist: the same answer is checked the same way before anything is written, so
   a reset cannot write into a playlist a look would not use. Other devices move at
-  their next look. If the new secret cannot be written, the old one stands and the
-  person is told the reset did not happen.
+  their next look. **The session on the device where it was pressed ends at the
+  press**, not when that look comes back: from that moment the device sends, opens and
+  carries out nothing under the old secret, and a look that was on its way (it reads
+  the old secret) begins nothing. If the new secret cannot be written, the old one
+  stands on the server, the person is told the reset did not happen, and the device
+  has a session again when a look next reads it.
 - **A session** is one sign-in with one secret. When the secret changes or runs out,
   the person signs out, "Link my devices" is switched off, or the account changes, the
   session ends: looks, answers, what is queued to send and commands in flight under it
   are dropped. **Every use asks whether the session is the live one and inside its
   ten minutes:** a look's answer, anything sent, each frame opened, and the moment the
   player is changed (5.6). A look that finds the record is not one to use (public and
-  not repaired, not ours, a later layout, no longer stated) ends the session there and
-  then; a look that could not ask concludes nothing.
+  not replaced, not ours, holding no record, a later layout, no longer stated) ends the
+  session there and then; a look that could not ask concludes nothing. **The end of a
+  session ends everything that was waiting under it, there and then** (5.6).
 - **Never listed, never on disk.** With linking on, the playlist is left out of every
-  ordinary listing of playlists, as the sync record's is, and the page of a playlist
-  of either name is never written to the app's cache of pages. **Nor by what it
-  holds:** a playlist renamed somewhere else (on the music server's own page) is an
-  ordinary playlist to every listing, and its comment is still the record; so a page
-  whose playlist's comment is marked as a linking record is not written either,
-  whatever the playlist is called, and one found on disk is thrown away unread.
+  ordinary listing of playlists, as the sync record's is. And the page of a playlist
+  whose comment **is a linking record** is never written to the app's cache of pages,
+  **whatever the playlist is called**, and one found on disk is thrown away unread: a
+  playlist renamed somewhere else (on the music server's own page) is an ordinary
+  playlist to every listing, and its comment is still the record. It is by what the
+  comment holds and nothing else: an ordinary playlist that only has the name, or
+  whose description only looks like a record, is cached as any other.
   **Versions up to 0.40.6
   do list it,** and opening it there writes the secret into that PC's page cache: one
   more reason an old PC is updated before linking is switched on anywhere.
@@ -319,6 +352,7 @@ itself.
 | `repeat` | `mode` | 0 off, 1 the queue, 2 the song. |
 | `add` | `ids` (1 to 50), `next` | Queue these songs: at the bottom of "Next in queue", or with `next` at its top. |
 | `adopt` | `songs`, `index`, `queued`, `position`, `context` | Take this queue and play it from `songs[index]`, `position` seconds in. `queued` is how many straight after it were queued by hand. |
+| `moved` | absent, or `{}` | Stop: the music that was playing here is sounding on the device that asks (5.7). Carried out as a pause, and judged like any other; but it is nobody's choice at the device that goes quiet (5.6.1). |
 
 - A place in the queue is a whole number up to 100,000. **An entry is named twice,** by
   its place and by the id of the song that was seen there: the device being asked
@@ -347,7 +381,7 @@ itself.
 | Field | |
 |---|---|
 | `re` | The nonce of the ask this answers. Absent in news. |
-| `ok`, `why` | In an answer to a command. `why` is `changed`, `busy`, `late`, `invalid` or `cannot`. |
+| `ok`, `why` | In an answer to a command. Refused: `ok` false, and `why` is `changed`, `busy`, `late`, `invalid` or `cannot`. Carried out: `ok` true. **Nothing to do** (the device was already as the command asked: playing, for a `play`): `ok` true with `why` `nothing`. |
 | `device`, `name` | Who is speaking: its device id and the name the person gave it. |
 | `at` | Its generation and minute now. |
 | `busy` | A choice has been accepted and not yet carried out, or its work is still under way (5.6, 5.7). |
@@ -412,8 +446,16 @@ whenever what a command would act on changes:
 marks the device **busy** from the press until the work is done or has come to
 nothing. Its state says so, and a command from another device is refused `busy`: the
 state it was made against is about to change. Several choices can be waiting at once,
-each as it would be without this; none displaces another. A wait ends by itself after
-a minute, so a look-up that never answers cannot leave a device busy for ever.
+each as it would be without this; none displaces another.
+
+**Every wait has an end, and the end of a session ends its waits.** A choice's wait
+ends by itself after a minute. A command that has been accepted is given half a
+minute for its work (its songs looked up, a player on another thread saying what it
+did): after that the device gives it up, is busy with it no longer, tells its sender
+it took too long, and takes nothing from what the work then brings back. A queue
+taken from another device keeps the device busy only until its sound starts or its
+time is up. And when the session ends, whatever ends it, everything that was waiting
+under it is let go there and then. Nothing can leave a device busy for ever.
 
 What marks a device busy: Play, Play Next and Add to Queue on anything whose songs
 have to be looked up; a radio being started; a guest's request in a jam, and one from
@@ -441,12 +483,24 @@ turns out to be one this device cannot carry out (the entry is gone, it has none
 the songs, nothing is in the player to act on) it is let go and answered `cannot`:
 nothing was changed, so nothing moves.
 **At the moment the player is changed** the device checks that it is still the open
-command, that the generation has not moved since it was accepted, the minute, and
-that the session it arrived under is still the live session and inside its time
-(5.1). Then it carries the command out, the generation moves, `by` becomes the
-command's nonce, and the answer says `ok`. A command is finished once. It carries
-out its action on this device only: a Pause never goes on to a jam the device has
-joined.
+command and inside its half minute, that the generation has not moved since it was
+accepted, the minute, and that the session it arrived under is still the live session
+and inside its time (5.1). That is leave to change the player, and the player is
+asked. **Only what changed the player counts:**
+
+- it changed something: the generation moves, once, `by` becomes the command's
+  nonce, and the answer says `ok`;
+- it was already as the command asked (a `play` when it was playing, a `pause` when
+  paused, the volume, shuffle or repeat set to what they are, a queue cleared of
+  nothing): nothing moves, `by` is as it was, and the answer says `ok` with `why`
+  `nothing`. Its sender takes it as settled and says nothing;
+- it could not (a seek on a radio, `next` with nothing to go to): nothing moves, and
+  the answer is `cannot`.
+
+A command is finished once. It carries out its action on this device only: a Pause
+never goes on to a jam the device has joined. A player that cannot be asked directly
+(the phone's: section 8) is asked and says what came of it; nobody is answered, and
+the device stays busy with the command, until it has, for two seconds at the most.
 
 So a repeat fails (its first delivery moved the generation), a command held back
 fails once anything changes there or two minutes pass, and a
@@ -460,7 +514,10 @@ Nothing is remembered about past commands but `by`.
   45 seconds old; otherwise it looks first;
 - sends one command to a device at a time. A press made while one is unanswered waits
   (up to eight; a volume slider keeps only its latest), and is sent only after an `ok`,
-  against the state in that answer. A refusal or an unknown outcome discards them;
+  against the state in that answer. A refusal or an unknown outcome discards them.
+  **A refusal as `busy` that names the command itself in `by`** is no refusal: the
+  command was taken and its work is under way (a queue that has not sounded yet), and
+  what was refused was a repeat of it made on the way. The sender goes on waiting;
 - with nothing unanswered, sends a press at once or not at all: it never waits for a
   look and then goes by itself, against a state the person had not seen. After an
   `ok`, the state in that answer serves for the next press too, until a look's answer
@@ -546,7 +603,7 @@ the same press here would**, by the old linking and the new alike.
 | Playing something: an album, playlist, artist or mix; a page's Play; a song in a list; a suggestion; Recently played; a radio station; a song's radio | `play_songs` | The person here | As the queue is replaced. If nothing in it can play (offline): no. | From the press until the songs arrive, where they are looked up | Yes, as the queue is replaced: where the songs are looked up, when they arrive | The walk: an album (looked up), a song in a list, a look-up the music server never answers |
 | Play Next, Add to Queue: a song, songs dragged onto the queue, an album, a playlist | `enqueue_here` | The person here | Yes | From the choice until the songs arrive, where they are looked up | Yes, as the songs are queued: where they are looked up, when they arrive | The walk: a song; an album, looked up |
 | A guest in a jam, and a device linked the old way | `jam_asked`, then the same functions as the presses above | A guest; or the person at another of their devices (the old linking) | As each is carried out | From being let in until carried out or refused | Yes, for what touches what plays; a guest's volume or repeat, no | The walk: a guest's add, skip and play, and a search (which changes nothing). The second slice's walk: a device steered the old way while the new runs |
-| A command from another device | `core::link::device` (judged, and counted once), then the `_here` function of the same press under `for_another` | The person at another of their devices | Once, as the rule lets it through; what the player does for it is not counted again | From being accepted until carried out; a queue taken over, until its sound starts | As the same press would: yes, but for volume and repeat | The second slice's walk: every command, and its repeat refused `changed` |
+| A command from another device | `core::link::device` (judged), then the `_here` function of the same press under `for_another` | The person at another of their devices; nobody, for `moved` | Once, by the rule, if the player changed anything for it; what the player does for it is not counted again | From being accepted until carried out; a queue taken over, until its sound starts | As the same press would: yes, but for volume and repeat; and not for `moved`, which is nobody's | The second slice's walk: every command, and its repeat refused `changed` |
 | The sound rolling into the next song | The engine's word, or the app reading what is sounding before it judges another device's command | Nobody | At the sound's boundary |  | No | The walk |
 | A song ending; the queue running out | The engine's word | Nobody | Yes |  | No | The walk: the queue running out, autoplay off |
 | Autoplay | `autoplay_loaded` | Nobody | As the songs are added: ahead of time, while the last song plays | Only if they have not arrived when the queue runs out: from then until they land | No | The walk: both |
@@ -555,7 +612,8 @@ the same press here would**, by the old linking and the new alike.
 | The sound output being lost | The engine's word | Nobody | If it was playing |  | No | By reading: it cannot be made to happen in a headless window |
 | A followed playlist changing the queue | `source_list_now` | Nobody | Yes |  | No | By reading |
 | Sync's "Continue here" | `sync.rs`, then `replace_queue` | The person here | Yes |  | Yes, once the queue is in (said by `continue_here` itself: putting it in claims nothing) | By reading |
-| The queue restored as the app starts; sign-out emptying the player | `replace_queue`, `stop_playback` | Nobody | Yes |  | No | By reading |
+| The queue restored as the app starts | `restore_queue` | Nobody | No: it is put back before the app has told anyone a state, so there is no command it could be made against | | No: a queue taken up from another device is still that device's after a restart | By reading |
+| Sign-out emptying the player | `stop_playback` | Nobody | Yes | | No | By reading |
 | "Play here": another device's music brought to this PC | `core::link::device`, then `load_queue_here` | The person here | As the queue is taken | Until its sound starts | Yes, as "Continue here" does | The second slice's walk |
 | The pause that ends a move of this PC's music to another device | `core::link::device`, then `pause_here` | Nobody | Yes |  | No: the person chose that the queue go there, and that device claimed it as it took it | The second slice's walk |
 
@@ -581,8 +639,16 @@ person told where.
 - **From the other device** ("Play here", while steering it). This device looks with
   `want: queue`, takes the queue and starts. Once its own sound has started, if
   nothing else has been chosen here since and the press was no more than 30 seconds
-  ago, it sends the other `pause`, **quoting the `at` of the state it took the queue
-  from.**
+  ago, it tells the other the music has `moved`, **quoting the `at` of the state it
+  took the queue from.** From loading the queue until then it is busy to the other
+  devices, as a device that was sent a queue is. If its sound has not started when the
+  30 seconds are up, **it is stopped**, not left to start later with the other still
+  playing.
+- **Whose the queue is afterwards** (5.6.1). The device that takes the music claims
+  its queue as it takes it, by `adopt` or by "Play here". The device that goes quiet
+  claims nothing by it: its stop is the app's own doing (the pause that ends a move
+  to another device) or `moved` (the stop that ends "Play here"). So the device that
+  is playing is the one whose saved queue is the newest.
 - **Sound has started** when the song is playing and has moved on a fifth of a second
   from where it was first heard: a song that has been opened is not yet sound.
 - **A device that took a queue** gives its sound 20 seconds. If something else is
@@ -603,11 +669,12 @@ person told where.
 | No answer, and the other changed or could not be looked at | "Study PC didn't answer. Still playing here; check whether Study PC started too." | Here; there not known |
 | "Play here": the other's queue never came | "Study PC didn't answer, so nothing was moved. It may still be playing." | There, as it was |
 | "Play here": this device has none of the songs | "This PC's library has none of those songs. Study PC is still playing." | There |
-| "Play here": this device's sound did not start in 30 seconds | "This PC didn't start in time, so Study PC was left playing." | There |
+| "Play here": this device's sound did not start in 30 seconds | "This PC didn't start in time, so Study PC was left playing." | There; this device is stopped |
 | "Play here": something else was chosen here before the sound started | "Something else was chosen here, so Study PC was left as it is: it is still playing." | There, and whatever was chosen here |
 | "Play here": started here, and the other paused | "Playing here. Study PC is paused." | Here |
 | "Play here": started here; the other refused the pause | "Playing here. Study PC was given something else to do before it could be paused, so it may still be playing." | Both, possibly |
 | "Play here": started here; the pause was not answered | "Playing here. Study PC didn't answer, so it may still be playing." | Here; there not known |
+| "Play here": linking ended before the other could be told (the secret reset, the sign-in changed, "Link my devices" off, no place at the relay) | "Playing here. Linking stopped before Study PC could be told, so it may still be playing." | Here; there not known |
 
 **Still not promised.** That a device which cannot play is left as it was. It checks
 that its library has the songs before it changes anything; but if the music server
@@ -733,13 +800,30 @@ both in Kotlin, and the deciding must not call into Kotlin while it decides. So:
   apps' controls added. What is to be done to the player comes back as data
   (`Act::Carry`, `Act::Pause`, `Act::Take`), each numbered; and when the queue is the
   phone's own by something, `Act::Claim`, worked out by the same `core::ways`.
-- **Nothing is decided against a player that has not caught up.** A command is
-  carried out a moment after it is decided, on another thread. Until Kotlin has said
-  what its player holds after doing what it was last asked (the state, with that
-  act's number), what the relay brings is kept in order and decided then: the second
-  of two commands finds the queue as the first left it, as on Windows, where the
-  player is asked directly. A state read before the act was done is not taken. A
-  player that never says so holds nothing up for more than two seconds.
+- **A command is answered when the phone's player has said what came of it, not
+  before.** The rule gives leave, Kotlin is asked (`Act::Carry`), and until Kotlin
+  reports (`Event::Did`: whether the player changed anything, and what it holds now)
+  nobody is answered, nothing is counted, the queue is not claimed, and the phone is
+  busy with the command. The answer is built from the report. The command is given
+  up, and Kotlin told not to carry it out now (`Act::Cancel`), if no report comes in
+  two seconds (its sender is told it took too long), if something is chosen on the
+  phone first (`Event::Changed` before the report: its sender is told the phone
+  changed), or if the session ends. So Kotlin reports an act as it does it, before it
+  tells of anything else.
+- **Nothing is decided against a player that has not caught up, or on a state that has
+  gone stale.** Until Kotlin has said what its player holds after doing what it was
+  last asked, what the relay brings is kept in order and decided then: the second of
+  two commands finds the queue as the first left it, as on Windows, where the player
+  is asked directly. A state read before the act was done is not taken. If the player
+  still has not said what it holds when its two seconds are up, the phone is busy to
+  the others until it does: a command is refused `busy`, and a look is answered busy,
+  which no device acts on.
+- **A sign-out or another account is applied before anything that was kept is looked
+  at**: what was kept under the session that ended is nobody's.
+- **Every list has a bound:** frames kept (256), look-ups counted as under way (16,
+  none past its minute), devices remembered (16, held to that as they are read from a
+  settings file, and forgotten by the calendar after thirty days). The relay's token
+  for a place is never shown by whatever holds it.
 - **The library is a snapshot:** the ids of its songs, handed over when the phone's
   copy changes.
 - **What the person does is an event; what to show is data:** the list after each
@@ -893,9 +977,11 @@ After that: the phone, on `bind::Phone`.
 4. **The generation is only as good as the app's count of changes.** A way into the
    player that does not count is a hole. Every one has to be found and tested, on both
    apps. Windows' are listed in 5.6.1. On the phone the count is told across a
-   boundary (`Event::Changed`), so a way in that is not told is the same hole, and
-   between a change in Media3 and its being told there is a moment in which a command
-   made before it can still be let through.
+   boundary (`Event::Changed`), so a way in that is not told is the same hole. A
+   command the rule has let through is given up if a change is told before the
+   phone's player reports having done it; what is left is the moment between a change
+   in Media3 and its being told, and on Windows the moment between reading what is
+   sounding and changing the player, in which the sound can roll into the next song.
 5. **After a lost answer, if anyone chose since, the outcome is not known.**
 6. **A busy device starves steering from elsewhere.**
 7. **The minute and the ten minutes need a clock that counts sleep.**
