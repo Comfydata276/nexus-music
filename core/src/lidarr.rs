@@ -659,7 +659,8 @@ impl Lidarr {
         let before = self.start_listing_singles(artist, wanted)?;
         if before.is_some() {
             // Lidarr starts reading the artist's releases in again; give it a moment to begin.
-            self.pause(Duration::from_secs(3))?;
+            // A wait cut short ends here, but the setting is still handed back to be put back.
+            let _ = self.pause(Duration::from_secs(3));
         }
         Ok(before)
     }
@@ -815,7 +816,10 @@ impl Lidarr {
         }
         let started = std::time::Instant::now();
         while self.busy_with_artists()? && started.elapsed() < LEARN_ARTIST {
-            self.pause(Duration::from_secs(2))?;
+            // A wait cut short ends the waiting, not the putting back.
+            if self.pause(Duration::from_secs(2)).is_err() {
+                break;
+            }
         }
         let mut record: serde_json::Value = self.get(&format!("artist/{artist}"))?;
         record["monitorNewItems"] = before.into();
@@ -1072,5 +1076,60 @@ mod tests {
         );
         assert!(offers[1].requested);
         assert_eq!(offers[1].year, "");
+    }
+
+    /// A Lidarr that keeps one artist, on the Standard profile with new releases wanted, and
+    /// is forever busy reading artists in; asked over an app that has been told to stop, so
+    /// that every wait is cut short. Every request is written down.
+    struct Stopping {
+        asked: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl crate::http::Http for Stopping {
+        fn send(&self, request: &crate::http::Request) -> Result<crate::http::Response, crate::http::Failure> {
+            use crate::http::Method;
+            let (method, body) = match request.method {
+                Method::Get => ("GET", ""),
+                Method::Post(body) => ("POST", body),
+                Method::Put(body) => ("PUT", body),
+            };
+            let path = request.url.trim_start_matches("http://lidarr.test/api/v1/");
+            self.asked.lock().unwrap().push(format!("{method} {path} {body}"));
+            let entry = |item: &str, name: &str, allowed: bool| serde_json::json!({ item: { "id": 1, "name": name }, "allowed": allowed });
+            let profile = |id: i64, name: &str, singles: bool| {
+                serde_json::json!({ "id": id, "name": name,
+                    "primaryAlbumTypes": [entry("albumType", "Album", true), entry("albumType", "Single", singles), entry("albumType", "EP", singles)],
+                    "secondaryAlbumTypes": [entry("albumType", "Studio", true)],
+                    "releaseStatuses": [entry("releaseStatus", "Official", true)] })
+            };
+            let answer = match (method, path) {
+                ("GET", "artist") => r#"[{"id":5,"artistName":"Someone","foreignArtistId":"ar1"}]"#.to_string(),
+                ("GET", "metadataprofile") => serde_json::json!([profile(1, "Standard", false), profile(2, SINGLES_PROFILE, true)]).to_string(),
+                ("GET", "artist/5") => r#"{"id":5,"metadataProfileId":1,"monitorNewItems":"all","monitored":true}"#.to_string(),
+                ("GET", "album?artistId=5") => r#"[{"id":9,"title":"A Single","foreignAlbumId":"al1","albumType":"Single"}]"#.to_string(),
+                ("GET", "command") => r#"[{"name":"RefreshArtist","status":"started"}]"#.to_string(),
+                _ => "{}".to_string(),
+            };
+            Ok(crate::http::Response::new(200, Vec::new(), move || Ok(answer)))
+        }
+
+        fn pause(&self, _: Duration) -> Result<(), crate::http::Failure> {
+            Err(crate::http::Failure::Stopped)
+        }
+    }
+
+    #[test]
+    fn a_setting_changed_for_a_while_is_put_back_however_the_wait_ends() {
+        // Asking for a single of an artist whose profile lists albums only: their "new
+        // releases" setting is turned off while Lidarr reads their singles in, and is put back
+        // afterwards, even though every wait for Lidarr is cut short.
+        let http = Arc::new(Stopping { asked: Default::default() });
+        let lidarr = Lidarr::new("lidarr.test", "key", None, http.clone());
+        let single = Offer { album: "al1".into(), artist_id: "ar1".into(), title: "A Single".into(), artist: "Someone".into(), kind: "Single".into(), ..Default::default() };
+        assert_eq!(lidarr.request(&single), Err(STOPPED.to_string()));
+        let puts: Vec<String> = http.asked.lock().unwrap().iter().filter(|asked| asked.starts_with("PUT artist/5")).cloned().collect();
+        assert_eq!(puts.len(), 2, "{puts:?}");
+        assert!(puts[0].contains(r#""monitorNewItems":"none""#) && puts[0].contains(r#""metadataProfileId":2"#), "{}", puts[0]);
+        assert!(puts[1].contains(r#""monitorNewItems":"all""#), "{}", puts[1]);
     }
 }

@@ -1014,6 +1014,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::http::STOPPED;
 
     #[test]
     fn takes_a_studio_release_before_a_soundtrack_of_the_same_name() {
@@ -1217,5 +1218,79 @@ mod tests {
             ]
         );
         assert_eq!(noted, ["Glass Orchard 0", "Paper Tides 0"]);
+    }
+
+    /// A Lidarr that keeps one artist on a profile of albums only, and once their profile is
+    /// changed is forever reading them in; asked over an app that has been told to stop, so
+    /// every wait is cut short.
+    struct Stopped(AtomicBool);
+
+    impl crate::http::Http for Stopped {
+        fn send(&self, request: &crate::http::Request) -> Result<crate::http::Response, crate::http::Failure> {
+            let path = request.url.trim_start_matches("http://lidarr.test/api/v1/").to_string();
+            if matches!(request.method, crate::http::Method::Put(_)) && path == "artist/5" {
+                self.0.store(true, Ordering::SeqCst);
+            }
+            let entry = |item: &str, name: &str, allowed: bool| serde_json::json!({ item: { "id": 1, "name": name }, "allowed": allowed });
+            let profile = |id: i64, name: &str, singles: bool| {
+                serde_json::json!({ "id": id, "name": name,
+                    "primaryAlbumTypes": [entry("albumType", "Album", true), entry("albumType", "Single", singles), entry("albumType", "EP", singles)],
+                    "secondaryAlbumTypes": [entry("albumType", "Studio", true)],
+                    "releaseStatuses": [entry("releaseStatus", "Official", true)] })
+            };
+            let answer = match path.as_str() {
+                path if path.starts_with("album/lookup") => {
+                    r#"[{"title":"A Single","foreignAlbumId":"al1","albumType":"Single","artist":{"artistName":"Someone","foreignArtistId":"ar1"}}]"#.to_string()
+                }
+                "artist" => r#"[{"id":5,"artistName":"Someone","foreignArtistId":"ar1"}]"#.to_string(),
+                "album?artistId=5" => r#"[{"id":8,"title":"An Album","foreignAlbumId":"al0","albumType":"Album","monitored":true}]"#.to_string(),
+                "metadataprofile" => serde_json::json!([profile(1, "Standard", false), profile(2, "Albums, EPs and singles", true)]).to_string(),
+                "artist/5" => r#"{"id":5,"metadataProfileId":1,"monitorNewItems":"all","monitored":true}"#.to_string(),
+                "command" if self.0.load(Ordering::SeqCst) => r#"[{"id":1,"name":"RefreshArtist","status":"started","body":{"artistIds":[5]}}]"#.to_string(),
+                "command" => "[]".to_string(),
+                _ => "{}".to_string(),
+            };
+            Ok(crate::http::Response::new(200, Vec::new(), move || Ok(answer)))
+        }
+
+        fn pause(&self, _: Duration) -> Result<(), crate::http::Failure> {
+            Err(crate::http::Failure::Stopped)
+        }
+    }
+
+    /// Keeps what's written down, and asks for singles too.
+    struct Kept(Arc<Mutex<Option<Vec<u8>>>>);
+
+    impl Desk for Kept {
+        fn keep(&self, batch: Option<Vec<u8>>) {
+            *self.0.lock().unwrap() = batch;
+        }
+
+        fn now(&self) -> i64 {
+            0
+        }
+
+        fn singles(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn a_setting_to_put_back_is_kept_however_the_wait_ends() {
+        // A single of an artist whose profile lists albums only: their "new releases" setting
+        // is turned off while Lidarr reads their singles in. Every wait for Lidarr is cut
+        // short; what's to be put back is written down, to be put back once Lidarr is done.
+        let kept = Arc::new(Mutex::new(None));
+        let job = Job::new(Kept(kept.clone()));
+        let http: Arc<dyn crate::http::Http> = Arc::new(Stopped(AtomicBool::new(false)));
+        let lidarr = Lidarr::new("lidarr.test", "key", None, http.clone());
+        let musicbrainz = MusicBrainz::new(http.clone(), crate::listenbrainz::ListenBrainz::new(http));
+        job.start(vec![Want { artist: "Someone".into(), album: "A Single".into(), ..Default::default() }]);
+        assert!(job.begin());
+        job.work_through(&lidarr, &musicbrainz, &|_| {});
+        let written: serde_json::Value = serde_json::from_slice(kept.lock().unwrap().as_ref().unwrap()).unwrap();
+        assert_eq!(written["restore"], serde_json::json!([[5, "all"]]));
+        assert_eq!(written["stopped"], STOPPED);
+        assert!(job.unfinished());
     }
 }
