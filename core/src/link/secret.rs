@@ -106,24 +106,29 @@ pub fn unlisted(name: &str, linking: bool) -> bool {
     name == crate::sync::PLAYLIST_NAME || (linking && name == PLAYLIST_NAME)
 }
 
-/// Whether a playlist's page may be written to an app's cache of pages on disk: never one
-/// of a name the app keeps for itself, whose comment is not a description. Linking's is
-/// never written whether or not linking is on in this copy: it may be on in another, and
-/// what that one keeps there is a secret.
+/// Whether a playlist's page may be written to an app's cache of pages on disk: never the
+/// one devices are kept in step through, whose comment is not a description; and never one
+/// whose comment is a linking record, **whatever the playlist is called**, and whether or
+/// not linking is on in this copy (it may be on in another, and what that one keeps there
+/// is a secret). A playlist renamed somewhere else (on the music server's own page, in
+/// another app) is an ordinary playlist to every listing, and its comment is still the
+/// record: a page that holds one is not written, and one found on disk is thrown away
+/// unread.
 ///
-/// **And by what it holds, not only by its name.** A playlist renamed somewhere else (on
-/// the music server's own page, in another app) is an ordinary playlist to every listing,
-/// and its comment is still the record: so a page whose playlist's comment is a linking
-/// record is not written either, and one found on disk is thrown away unread.
+/// **By what it holds, and by nothing else.** A playlist that only has linking's name,
+/// with songs of the person's own or a description of their own, is theirs: its page is
+/// kept as any other is. So is one whose description merely looks like a record.
 pub fn page_may_be_kept(playlist: &str, comment: &str) -> bool {
-    playlist != crate::sync::PLAYLIST_NAME && playlist != PLAYLIST_NAME && !is_record(comment)
+    playlist != crate::sync::PLAYLIST_NAME && !is_record(comment)
 }
 
-/// Whether a comment is a linking record at all, of any layout, readable or not: whether
-/// it is marked as one. What is marked so is never written to a device's disk, whatever
-/// the playlist it is on has come to be called.
+/// Whether a comment is a linking record: whether it **reads as one**. That is the mark
+/// with a layout this version knows and a well-formed secret; or the mark with a later
+/// layout, whose secret this version cannot know the form of and will not put on a disk.
+/// A description that only has the mark's name in it (with nothing behind it, with no
+/// secret, with a secret that is not one) is a description.
 pub fn is_record(comment: &str) -> bool {
-    matches!(serde_json::from_str(comment), Ok(serde_json::Value::Object(fields)) if fields.contains_key(MARK))
+    matches!(read(comment), Record::Is(_) | Record::Later(_))
 }
 
 /// Reads the comment. The layout number is read first, by itself: a later layout is
@@ -376,21 +381,49 @@ mod tests {
         assert_eq!(kept_name("Nexus Music sync", false), Some(crate::step::RESERVED));
         assert_eq!(kept_name("Nexus Music sync", true), Some(crate::step::RESERVED));
         assert_eq!(kept_name("Morning mix", true), None);
-        // Never on disk, by name or by what it holds, whether linking is on here or not.
+        // Never on disk, by what it holds, whether linking is on here or not.
         assert!(page_may_be_kept("Morning mix", "For the walk to work"));
-        for (name, comment) in [("Nexus Music link", ""), ("Nexus Music sync", ""), ("Renamed elsewhere", COMMENT), ("A later layout", r#"{"nexus_music_link":2,"key":"…"}"#)] {
+        for (name, comment) in [("Nexus Music link", COMMENT), ("Nexus Music sync", ""), ("Renamed elsewhere", COMMENT), ("A later layout", r#"{"nexus_music_link":2,"key":"…"}"#)] {
             assert!(!page_may_be_kept(name, comment), "{name}");
         }
     }
 
     #[test]
-    fn a_comment_marked_as_a_record_is_one_whatever_else_is_in_it() {
-        for record in [COMMENT, r#"{"nexus_music_link":2,"key":"later"}"#, r#"{"nexus_music_link":1}"#, r#"{"nexus_music_link":null,"secret":7}"#, r#" {"secret":"x","nexus_music_link":1} "#] {
+    fn a_comment_is_a_record_only_if_it_reads_as_one() {
+        // The mark and a well-formed secret; or a later layout, whose secret this version
+        // cannot know the form of and so will not put on a disk.
+        let spaced = format!(" {COMMENT} ");
+        for record in [COMMENT, spaced.as_str(), r#"{"nexus_music_link":2,"key":"later"}"#, r#"{"nexus_music_link":9}"#] {
             assert!(is_record(record), "{record}");
         }
-        for other in ["", "For the walk to work", r#"{"nexus_music_sync":1}"#, r#"["nexus_music_link"]"#, r#""nexus_music_link""#, "{nexus_music_link"] {
+        // A description that only looks like one is somebody's description: a key of that
+        // name with nothing behind it, a layout that is no layout, a secret that is not one.
+        let others = [
+            "",
+            "For the walk to work",
+            r#"{"nexus_music_sync":1}"#,
+            r#"["nexus_music_link"]"#,
+            r#""nexus_music_link""#,
+            "{nexus_music_link",
+            r#"{"nexus_music_link":null,"secret":7}"#,
+            r#"{"nexus_music_link":null}"#,
+            r#"{"nexus_music_link":0,"secret":"ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8"}"#,
+            r#"{"nexus_music_link":"1","secret":"ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8"}"#,
+            r#"{"nexus_music_link":1}"#,
+            r#"{"nexus_music_link":1,"secret":"x"}"#,
+            r#"{"nexus_music_link":1,"secret":"ICEiIyQl"}"#,
+            r#"{"nexus_music_link":1,"secret":7}"#,
+        ];
+        for other in others {
             assert!(!is_record(other), "{other}");
         }
+        // And a page is kept or not by that alone, for every playlist but the one devices
+        // are kept in step through: an ordinary playlist that has the name, and one whose
+        // description looks like a record and is not, are the person's own, cached as any.
+        assert!(!page_may_be_kept("Road trip", COMMENT) && !page_may_be_kept(PLAYLIST_NAME, COMMENT));
+        assert!(page_may_be_kept(PLAYLIST_NAME, "") && page_may_be_kept(PLAYLIST_NAME, "Songs for linking arms to"));
+        assert!(page_may_be_kept("Road trip", r#"{"nexus_music_link":null}"#) && page_may_be_kept("Road trip", ""));
+        assert!(!page_may_be_kept(crate::sync::PLAYLIST_NAME, ""));
     }
 
     const COMMENT: &str = r#"{"nexus_music_link":1,"secret":"ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8"}"#;

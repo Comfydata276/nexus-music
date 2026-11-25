@@ -851,8 +851,13 @@ mod tests {
         for (name, comment, kept) in [
             ("Morning mix", "For the walk to work", true),
             ("Nexus Music link", RECORD, false),
-            ("Nexus Music link", "", false),
             ("Nexus Music sync", "", false),
+            // A playlist of the person's own that only has the name, or whose description
+            // only looks like a record: theirs, and kept as any other.
+            ("Nexus Music link", "", true),
+            ("Nexus Music link", "Songs for linking arms to", true),
+            ("Road trip", r#"{"nexus_music_link":null}"#, true),
+            ("Road trip", r#"{"nexus_music_link":1,"secret":"not one"}"#, true),
             // Renamed on the music server's own page: an ordinary playlist to every listing,
             // and its comment is still the record.
             ("Renamed elsewhere", RECORD, false),
