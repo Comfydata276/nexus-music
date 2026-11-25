@@ -196,7 +196,10 @@ impl Rule {
     /// (If the command was given up while the player was at it, because its time ran out,
     /// what the player changed has still changed: the generation moves, and no command is
     /// named as having made the state.)
-    pub fn carried(&mut self, carrying: Carrying, changed: bool, nonce: Nonce) {
+    ///
+    /// `by` is that command's nonce; or nothing, where the player could not say what it
+    /// did: then it is a change that no command is named for.
+    pub fn carried(&mut self, carrying: Carrying, changed: bool, by: Option<Nonce>) {
         let open = self.command.is_some_and(|(id, _)| id == carrying.0);
         if open {
             self.command = None;
@@ -204,7 +207,7 @@ impl Rule {
         if changed {
             self.moved();
             if open {
-                self.by = Some(nonce);
+                self.by = by;
             }
         }
     }
@@ -241,7 +244,7 @@ mod tests {
 
     /// The moment a command is carried out, with a player that does what it says.
     fn finish(rule: &mut Rule, reservation: Reservation, at: At, minute: u64, now_ms: u64, same_session: bool, nonce: Nonce) -> Result<(), Why> {
-        rule.finish(reservation, at, minute, now_ms, same_session).map(|carrying| rule.carried(carrying, true, nonce))
+        rule.finish(reservation, at, minute, now_ms, same_session).map(|carrying| rule.carried(carrying, true, Some(nonce)))
     }
 
     /// Leave to change the player is not a change: a command that was let through and
@@ -255,7 +258,7 @@ mod tests {
         // While the player is asked, the device is busy with it, and nothing else is let in.
         assert!(rule.busy(0));
         assert_eq!(rule.admit(seen, 0, 0), Err(Why::Busy));
-        rule.carried(carrying, false, X);
+        rule.carried(carrying, false, Some(X));
         assert_eq!((rule.generation(), rule.by(), rule.busy(0)), (1, None, false));
         // The state it was made against still stands: the next command made against it is
         // carried out, and one that does change the player is the one that made the state.
@@ -263,7 +266,7 @@ mod tests {
         assert_eq!((rule.generation(), rule.by()), (2, Some(Y)));
         // It is said once. Said again, and as having changed something: what is said to
         // have changed has changed, and no command is named as having made the state.
-        rule.carried(carrying, true, X);
+        rule.carried(carrying, true, Some(X));
         assert_eq!((rule.generation(), rule.by()), (3, None));
         // A player that takes longer than the command was given: the command is given up,
         // another is let in; what the player then says it changed has changed all the same.
@@ -273,7 +276,7 @@ mod tests {
         let carrying = rule.finish(reservation, seen, 0, 0, true).unwrap();
         assert!(!rule.busy(OPEN_MS));
         let next = rule.admit(seen, 0, OPEN_MS).unwrap();
-        rule.carried(carrying, true, X);
+        rule.carried(carrying, true, Some(X));
         assert_eq!((rule.generation(), rule.by()), (2, None));
         // And the one let in meanwhile was made against a state that is no longer there.
         assert_eq!(finish(&mut rule, next, seen, 0, OPEN_MS, true, Y), Err(Why::Changed));

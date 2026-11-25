@@ -33,7 +33,7 @@ use std::time::Duration;
 
 use nexus_core::http::{Failure, Http, Request, Response};
 use nexus_core::link::command::Command;
-use nexus_core::link::device::{Brief, Device, Do, Env, Me, Player, Ready, may_go, wanted};
+use nexus_core::link::device::{Brief, Carried, Device, Do, Env, Me, Player, Ready, Sounding, may_go, wanted};
 use nexus_core::link::message::{At, Entry, Full, Handed, Why};
 use nexus_core::link::relay::{self, FromRelay, Relay};
 use nexus_core::link::rule::{Carrying, Reservation, Waiting};
@@ -115,6 +115,14 @@ fn random<const N: usize>() -> Option<[u8; N]> {
 fn slow_pause() -> Option<u64> {
     static WAIT: OnceLock<Option<u64>> = OnceLock::new();
     *WAIT.get_or_init(|| std::env::var("NEXUS_MUSIC_LINK_TEST_SLOW_PAUSE").ok()?.parse().ok())
+}
+
+/// For a test only: with `NEXUS_MUSIC_LINK_TEST_FAIL_TAKE` set, a queue brought from another
+/// device ("Play here") is not put in this PC's player, as if the player had refused it.
+/// Never set otherwise.
+fn fail_take() -> bool {
+    static FAIL: OnceLock<bool> = OnceLock::new();
+    *FAIL.get_or_init(|| std::env::var_os("NEXUS_MUSIC_LINK_TEST_FAIL_TAKE").is_some())
 }
 
 /// Writes a line of what happened to the file named by `NEXUS_MUSIC_LINK_LOG`, if any: for
@@ -260,6 +268,9 @@ pub struct Link {
     /// The song the sound was found to have rolled into before the window had been told:
     /// the engine's own word of it, when it comes, is not acted on twice.
     caught: Cell<u64>,
+    /// Whose the queue was before it was marked as handed to another device, while the
+    /// stop that goes with the hand-over has not yet been seen to work.
+    before_handed: RefCell<Option<Option<String>>>,
 }
 
 /// This PC's own player, as the deciding asks it. Each command is carried out by the
@@ -304,8 +315,14 @@ impl Player for Here<'_> {
         Handed::fitted(&ids, pb.queued_ahead(), pb.position, &pb.context)
     }
 
-    fn sounding_at(&self) -> Option<f64> {
-        self.ctl.sounding_at()
+    fn sounding(&self) -> Option<Sounding> {
+        // (The engine's own place in the song the player holds: sound that has come out,
+        // of the queue that is in the player now.)
+        self.ctl.sounding_at().map(|at| Sounding { queue: self.ctl.queue_number.get(), at })
+    }
+
+    fn queue(&self) -> u64 {
+        self.ctl.queue_number.get()
     }
 
     fn catch_up(&mut self) -> bool {
@@ -324,7 +341,7 @@ impl Player for Here<'_> {
         pb.order.iter().skip(pb.cursor + 1).filter_map(|&index| pb.queue.get(index)).map(|song| song.id.clone()).collect()
     }
 
-    fn carry_out(&mut self, command: &Command, ready: &Ready) -> bool {
+    fn carry_out(&mut self, command: &Command, ready: &Ready) -> Carried {
         let ctl = self.ctl;
         // What is so already is not done again: the functions below would count a volume
         // set to what it is, or a queue cleared of nothing, as a change.
@@ -340,7 +357,7 @@ impl Player for Here<'_> {
             }
         };
         if already {
-            return false;
+            return Carried::Unchanged;
         }
         // The person chose this at another of their devices. The rule counts it, once, if
         // the player changes anything for it, so the player's own counting is not added;
@@ -372,16 +389,27 @@ impl Player for Here<'_> {
         }
         // Each of those takes its way into the player only once it knows something will
         // change (`ways`): whether one was taken is whether anything did.
-        ctl.ways.taken()
+        if ctl.ways.taken() { Carried::Changed } else { Carried::Unchanged }
     }
 
     /// This PC's queue is another device's now. In `nexus_core::handover`'s terms it is
     /// one taken up from that device and not touched: not saved, and it follows what that
     /// device saves, until the person uses it here (`claim_queue`). It is another queue
     /// for a save that was already prepared, which is then not sent.
-    fn handed_on(&mut self) {
+    fn handed_on(&mut self) -> bool {
         log("queue: handed to another of the person's devices: not saved from here, and it follows, until it is used here");
+        *self.ctl.link.borrow().before_handed.borrow_mut() = Some(self.ctl.queue_owner.taken());
         self.ctl.queue_owner.taken_up(nexus_core::handover::HANDED.into());
+        true
+    }
+
+    /// This PC did not stop: its queue is whose it was.
+    fn handed_back(&mut self) {
+        let was = self.ctl.link.borrow().before_handed.borrow_mut().take();
+        if let Some(was) = was {
+            log("queue: this PC did not stop, so its queue is not handed on after all");
+            self.ctl.queue_owner.handed_back(was);
+        }
     }
 
     /// (The end of a move of this PC's music to another device: the app's own doing. The
@@ -392,8 +420,14 @@ impl Player for Here<'_> {
         self.ctl.pause_here();
     }
 
-    fn take(&mut self, songs: &[(String, bool)], begin: usize, position: f64, context: &str) {
+    /// (Whether it went in is the player's own word: its queue has a new number.)
+    fn take(&mut self, songs: &[(String, bool)], begin: usize, position: f64, context: &str) -> bool {
+        if fail_take() {
+            return false;
+        }
+        let before = self.ctl.queue_number.get();
         self.ctl.load_queue_here(self.songs(songs.iter().map(|(id, queued)| (id, *queued))), begin, position, context);
+        self.ctl.queue_number.get() != before
     }
 
     fn generation(&self) -> u64 {
@@ -416,8 +450,8 @@ impl Player for Here<'_> {
         self.ctl.link_rule.borrow_mut().finish(reservation, at, minute, now_ms, same_session)
     }
 
-    fn carried(&mut self, carrying: Carrying, changed: bool, nonce: Nonce) {
-        self.ctl.link_rule.borrow_mut().carried(carrying, changed, nonce);
+    fn carried(&mut self, carrying: Carrying, changed: bool, by: Option<Nonce>) {
+        self.ctl.link_rule.borrow_mut().carried(carrying, changed, by);
     }
 
     fn refuse(&mut self, reservation: Reservation) {

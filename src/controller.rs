@@ -456,6 +456,10 @@ pub struct Controller {
     /// When the queue last changed here (or, for one taken from another device, there), and
     /// a fingerprint of it as last saved, to tell a real change from a save of the same thing.
     pub queue_stamp: Cell<i64>,
+    /// How many times a queue has been put in the player whole (`replace_queue`): the
+    /// number of the queue that is in it now, for a move of music that waits for the
+    /// sound of the queue it put in and of no other (`link`).
+    pub queue_number: Cell<u64>,
     pub queue_sig: Cell<u64>,
     /// The shape (see `config::queue_shape`) of the queue as last written to disk.
     pub queue_saved: Cell<u64>,
@@ -616,6 +620,7 @@ impl Controller {
             history_missing: RefCell::default(),
             queue_owner: Default::default(),
             queue_stamp: Cell::new(0),
+            queue_number: Cell::new(0),
             queue_sig: Cell::new(crate::playback::queue_fingerprint(&Playback::new(&Settings::default()))),
             queue_quiet: Cell::new(false),
             queue_saved: Cell::new(0),

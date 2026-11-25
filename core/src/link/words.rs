@@ -123,10 +123,12 @@ pub fn outcome(outcome: Outcome, name: &str) -> String {
         Outcome::Refused(Why::Busy) => format!("{name} was in the middle of something. Nothing was done."),
         Outcome::Refused(Why::Late) => format!("That took too long to reach {name}. Nothing was done."),
         Outcome::Refused(Why::Invalid | Why::Cannot) => format!("{name} couldn't do that."),
+
         // (Never said as a refusal; and if it were, there would be nothing to tell.)
         Outcome::Refused(Why::Nothing) => String::new(),
         Outcome::NotReached => format!("That hadn't reached {name} when checked."),
-        Outcome::Unknown => format!("{name} changed, or didn't answer. Check what is playing before you press again."),
+        // (An answer of "not known" is `Outcome::Unknown`, and is never said as a refusal.)
+        Outcome::Unknown | Outcome::Refused(Why::Unknown) => format!("{name} changed, or didn't answer. Check what is playing before you press again."),
     }
 }
 
@@ -144,7 +146,7 @@ pub fn gave(gave: Gave, name: &str, left: usize, sent: usize, here: Here) -> Str
         Gave::Stayed(Why::Changed) => format!("{name} was given something else to do before it started. Still playing here."),
         Gave::Stayed(Why::Late) => format!("That took too long to reach {name}, so nothing was moved. Still playing here."),
         // (A queue to take over is never "nothing to do": if that is ever said of one, it was not taken.)
-        Gave::Stayed(Why::Cannot | Why::Invalid | Why::Nothing) => format!("{name} couldn't play that. Still playing here."),
+        Gave::Stayed(Why::Cannot | Why::Invalid | Why::Nothing | Why::Unknown) => format!("{name} couldn't play that. Still playing here."),
         Gave::NotReached => format!("That hadn't reached {name} when checked. Still playing here; {name} may yet start."),
         Gave::Unknown => format!("{name} didn't answer. Still playing here; check whether {name} started too."),
     }
@@ -156,6 +158,8 @@ pub fn took(outcome: Outcome, name: &str) -> String {
         Outcome::Done => format!("Playing here. {name} is paused."),
         // (It did not know what it was told: an older version of the app.)
         Outcome::Refused(Why::Invalid) => format!("Playing here. {name} couldn't be told to stop, so it may still be playing."),
+        // (It was told, and its player did not stop.)
+        Outcome::Refused(Why::Cannot) => format!("Playing here. {name} couldn't be stopped, so it is still playing too."),
         Outcome::Refused(_) => format!("Playing here. {name} was given something else to do before it could be paused, so it may still be playing."),
         Outcome::NotReached | Outcome::Unknown => format!("Playing here. {name} didn't answer, so it may still be playing."),
     }
@@ -165,6 +169,16 @@ pub fn took(outcome: Outcome, name: &str) -> String {
 /// could not be reached any more) before the other device could be told to stop.
 pub fn took_and_linking_ended(name: &str) -> String {
     format!("Playing here. Linking stopped before {name} could be told, so it may still be playing.")
+}
+
+/// This device's music has started on the other, and this one did not stop when asked.
+pub fn gave_and_did_not_stop(name: &str, here: Here) -> String {
+    format!("{name} has started, and {} couldn't be stopped. Both are playing.", here.this_lower())
+}
+
+/// "Play here", when the other device's queue could not be put in this device's player.
+pub fn could_not_load_here(name: &str, here: Here) -> String {
+    format!("{} couldn't load that. {name} is still playing.", here.this())
 }
 
 pub fn queue_never_came(name: &str) -> String {

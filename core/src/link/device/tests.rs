@@ -31,6 +31,16 @@ struct Fake {
     /// Each time its queue was said to have been handed to another device: whether it was
     /// still sounding then.
     handed_on: Vec<bool>,
+    /// How many times a hand-over was taken back (the device did not stop).
+    handed_back: usize,
+    /// The number of the queue in the player: a new one each time a queue is put in whole.
+    queue_number: u64,
+    /// A queue to take does not go into the player.
+    takes_nothing: bool,
+    /// Told to stop, it goes on sounding.
+    does_not_stop: bool,
+    /// It carries a command out and cannot say what it did.
+    cannot_say: bool,
 }
 
 impl Fake {
@@ -67,8 +77,11 @@ impl Player for Fake {
     fn handed(&self) -> Handed {
         Handed::fitted(&self.queue[self.cursor.min(self.queue.len())..], 0, self.position, "the queue")
     }
-    fn sounding_at(&self) -> Option<f64> {
-        self.started_ms.filter(|_| self.playing).map(|started| self.position + (self.now_ms - started) as f64 / 1000.0)
+    fn sounding(&self) -> Option<Sounding> {
+        self.started_ms.filter(|_| self.playing).map(|started| Sounding { queue: self.queue_number, at: self.position + (self.now_ms - started) as f64 / 1000.0 })
+    }
+    fn queue(&self) -> u64 {
+        self.queue_number
     }
     fn catch_up(&mut self) -> bool {
         if std::mem::take(&mut self.rolled) {
@@ -84,22 +97,40 @@ impl Player for Fake {
     fn ahead(&self) -> Vec<String> {
         self.queue.iter().skip(self.cursor + 1).cloned().collect()
     }
-    fn carry_out(&mut self, command: &Command, ready: &Ready) -> bool {
-        self.carry(command, ready)
+    fn carry_out(&mut self, command: &Command, ready: &Ready) -> Carried {
+        if self.does_not_stop && matches!(command, Command::Pause | Command::Moved) {
+            return Carried::Unchanged;
+        }
+        match (self.carry(command, ready), self.cannot_say) {
+            (_, true) => Carried::Unknown,
+            (true, _) => Carried::Changed,
+            (false, _) => Carried::Unchanged,
+        }
     }
-    fn handed_on(&mut self) {
+    fn handed_on(&mut self) -> bool {
         self.handed_on.push(self.playing);
+        true
+    }
+    fn handed_back(&mut self) {
+        self.handed_back += 1;
     }
     fn pause(&mut self) {
         self.rule.moved();
-        self.play(false);
+        if !self.does_not_stop {
+            self.play(false);
+        }
     }
-    fn take(&mut self, songs: &[(String, bool)], begin: usize, position: f64, _context: &str) {
+    fn take(&mut self, songs: &[(String, bool)], begin: usize, position: f64, _context: &str) -> bool {
+        if self.takes_nothing {
+            return false;
+        }
         self.rule.moved();
         self.queue = songs.iter().map(|(id, _)| id.clone()).collect();
+        self.queue_number += 1;
         self.cursor = begin;
         self.position = position;
         self.play(true);
+        true
     }
     fn generation(&self) -> u64 {
         self.rule.generation()
@@ -116,8 +147,8 @@ impl Player for Fake {
     fn finish(&mut self, reservation: Reservation, at: At, minute: u64, now_ms: u64, same_session: bool) -> Result<Carrying, Why> {
         self.rule.finish(reservation, at, minute, now_ms, same_session)
     }
-    fn carried(&mut self, carrying: Carrying, changed: bool, nonce: Nonce) {
-        self.rule.carried(carrying, changed, nonce)
+    fn carried(&mut self, carrying: Carrying, changed: bool, by: Option<Nonce>) {
+        self.rule.carried(carrying, changed, by)
     }
     fn refuse(&mut self, reservation: Reservation) {
         self.rule.refuse(reservation)
@@ -174,6 +205,7 @@ impl Fake {
             (Command::Add { .. }, Ready::Songs(songs)) => self.queue.extend(songs.iter().cloned()),
             (Command::Adopt(adopt), Ready::Queue(songs, begin)) => {
                 self.queue = songs.iter().map(|(id, _)| id.clone()).collect();
+                self.queue_number += 1;
                 self.cursor = *begin;
                 self.position = adopt.position;
                 self.play(true);
@@ -1347,6 +1379,75 @@ fn a_device_whose_sound_never_starts_pauses_and_says_it_could_not() {
     world.pass(1_000);
     assert_eq!(said(&world), "Copy B couldn't play that. Still playing here.");
     assert_eq!(world.copies[B].player.queue.len(), 8);
+}
+
+/// "Play here" on a device whose player does not take the queue (the app could not build
+/// it, the player refused it). What was in its player before goes on sounding. That is not
+/// the sound of the queue that was taken: nothing is claimed, and the other device is not
+/// told to stop.
+#[test]
+fn a_queue_that_did_not_go_into_the_player_stops_nobody() {
+    let mut world = taking(|world| {
+        // (A is sounding its own three songs, as it would be if something had started
+        // them while it steered B.)
+        world.copies[A].player.play(true);
+        world.copies[A].player.takes_nothing = true;
+    });
+    world.pass(3_000);
+    let a = &world.copies[A].player;
+    assert_eq!((said(&world), a.queue.len(), a.playing, world.copies[B].player.playing), ("This PC couldn't load that. Copy B is still playing.", 3, true, true));
+    assert!(world.log(A, "asked Copy B to pause").is_empty() && world.copies[B].player.handed_on.is_empty() && !a.rule.busy(world.now), "{:?}", world.copies[A].log);
+    assert_eq!(world.last(A, "take:"), "take: Copy B's queue could not be put in the player here");
+    // The same queue, going in: only then is its sound waited for, and B told.
+    let mut world = taking(|world| world.copies[A].player.play(true));
+    world.pass(1_000);
+    assert_eq!((said(&world), world.copies[A].player.queue.len(), world.copies[B].player.playing), ("Playing here. Copy B is paused.", 8, false));
+}
+
+/// A device that is told its music has moved, and does not stop: it is not acknowledged
+/// as stopped, its queue is its own still, and the person is told both are playing. In
+/// both directions.
+#[test]
+fn a_device_that_did_not_stop_is_not_said_to_have_and_keeps_its_queue() {
+    // "Play here" on A: B is told, and goes on sounding.
+    let mut world = taking(|world| world.copies[B].player.does_not_stop = true);
+    world.pass(1_000);
+    let b = &world.copies[B].player;
+    assert_eq!((said(&world), b.playing, b.handed_on.len(), b.handed_back), ("Playing here. Copy B couldn't be stopped, so it is still playing too.", true, 1, 1));
+    assert!(world.last(B, "moved from").contains("refused, Cannot") && world.log(B, "could not be stopped").len() == 1, "{:?}", world.copies[B].log);
+    // A's music given to B: B starts, and A does not stop. A's player is A's own still.
+    let mut world = giving(|world| world.copies[A].player.does_not_stop = true);
+    world.pass(1_000);
+    let a = &world.copies[A].player;
+    assert_eq!((said(&world), a.playing, a.handed_on.len(), a.handed_back, world.copies[A].window.clone()), ("Copy B has started, and this PC couldn't be stopped. Both are playing.", true, 1, 1, None));
+    // One that was already quiet when told is stopped, and says there was nothing to do:
+    // its queue is handed on all the same.
+    let mut world = taking(|world| world.path.hold_commands = true);
+    world.pass(1_000);
+    world.copies[B].player.play(false);
+    world.release();
+    let b = &world.copies[B].player;
+    assert_eq!((said(&world), b.handed_on.clone(), b.handed_back), ("Playing here. Copy B is paused.", vec![false], 0));
+    assert!(world.last(B, "moved from").ends_with("nothing to do, it was so already"));
+}
+
+/// A player that carries a command out and cannot say what came of it (asking it went
+/// wrong part-way). The device does not say "done" and does not say "not done": it counts
+/// a change that no command is named for, and answers with its state, asked afresh.
+#[test]
+fn a_player_that_cannot_say_what_it_did_is_answered_as_not_known() {
+    let mut world = steering("next");
+    world.copies[B].player.cannot_say = true;
+    let before = world.copies[B].player.rule.generation();
+    world.ask("next");
+    let b = &world.copies[B].player;
+    assert!(world.last(B, "next from").ends_with("the player could not say what came of it; answered as not known"), "{:?}", world.copies[B].log);
+    assert_eq!((b.rule.generation(), b.rule.by(), b.rule.busy(world.now)), (before + 1, None, false));
+    assert_eq!((world.last(A, "outcome of"), world.copies[A].said.last().map(String::as_str)), ("outcome of Steer to Copy B: Unknown".to_string(), Some("Copy B changed, or didn't answer. Check what is playing before you press again.")));
+    // A queue to take over: what is gone by is whether it is in the player.
+    let mut world = giving(|world| world.copies[B].player.cannot_say = true);
+    world.pass(1_000);
+    assert_eq!((said(&world), world.copies[B].player.queue.len(), world.copies[A].player.playing), ("Playing on Copy B.", 3, false));
 }
 
 /// A device whose music has moved to another is told that its queue is that device's now,

@@ -2187,6 +2187,7 @@ impl Controller {
         if songs.is_empty() {
             return;
         }
+        self.queue_number.set(self.queue_number.get() + 1);
         let _way = self.way_in(Who::Nobody, What::Playing);
         {
             let mut pb = self.playback.borrow_mut();

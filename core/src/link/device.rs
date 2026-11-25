@@ -70,6 +70,29 @@ pub enum Ready {
     Queue(Vec<(String, bool)>, usize),
 }
 
+/// What came of asking the player to carry a command out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Carried {
+    /// It changed the player.
+    Changed,
+    /// The player is as it was: it was so already, or could not do it.
+    Unchanged,
+    /// The player could not say what it did (asking it went wrong part-way, in an app
+    /// whose player is not in this language). It may have changed. The deciding then goes
+    /// by what the player says of itself when asked afresh, counts a change that no
+    /// command is named for, and tells the command's sender that it is not known.
+    Unknown,
+}
+
+/// Where the sound has got to, and in which queue.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Sounding {
+    /// The number of the queue the sounding song belongs to ([`Player::queue`]).
+    pub queue: u64,
+    /// How far into the song, in seconds.
+    pub at: f64,
+}
+
 /// This device's own player, as the deciding needs it. **It is asked, and has answered
 /// when the call returns**: the deciding and the player live on one thread. (For a player
 /// that tells its listeners of a change before the call that made it returns, see
@@ -81,9 +104,16 @@ pub trait Player {
     /// What is playing and to come, by id, the song that is playing first; nothing, if
     /// what is playing is not something another device could carry on with (a radio).
     fn handed(&self) -> Handed;
-    /// Where the sound has got to in the song the player holds, in seconds, if it is
-    /// playing and the sound has reached that song.
-    fn sounding_at(&self) -> Option<f64>;
+    /// Where the sound has got to in the song the player holds, if it is playing and the
+    /// sound has reached that song: sound that is advancing, not a place the player has
+    /// been told to go to. And which queue that song belongs to.
+    fn sounding(&self) -> Option<Sounding>;
+    /// The number of the queue in the player. **It changes each time a queue is put in
+    /// the player whole** (a queue taken from another device, by `take` or by an `adopt`
+    /// carried out) and is never used twice in a run. It is how a move knows the sound it
+    /// waits for is the sound of the queue it installed, and not of the one that was
+    /// there before and went on playing because the new one never went in.
+    fn queue(&self) -> u64;
     /// If the sound has rolled into the next song and the window has not yet been told,
     /// brings the window up to it now (the cursor moves, and the order of choices with
     /// it). Says whether it had to.
@@ -96,19 +126,25 @@ pub trait Player {
     /// device only, **and says whether it changed anything**: a Play when it was playing, a
     /// seek on a radio, a Next with nothing to go to, change nothing. What the player does
     /// for it is not counted by the player: the rule counts it, once, if it changed anything.
-    fn carry_out(&mut self, command: &Command, ready: &Ready) -> bool;
+    fn carry_out(&mut self, command: &Command, ready: &Ready) -> Carried;
     /// **This device's queue has been handed to another of the person's devices**, which
     /// is playing it by the person's own choice: from this moment it is here as a queue
     /// taken up from that device and not touched (`crate::handover::HANDED`). It is not
     /// saved, and it follows what that device saves, until the person uses it here.
     /// Said before this device's sound is stopped for it, so that the stop is not saved
-    /// as a change of this device's own. Counts nothing and claims nothing.
-    fn handed_on(&mut self);
+    /// as a change of this device's own. Counts nothing and claims nothing. Says whether
+    /// it could be marked so: if not, the stop goes ahead all the same, and it is told.
+    fn handed_on(&mut self) -> bool;
+    /// The hand-over did not happen after all (this device could not be stopped): the
+    /// queue is as it was before [`Player::handed_on`].
+    fn handed_back(&mut self);
     /// Stops this device's own sound, and counts it as a change.
     fn pause(&mut self);
-    /// Takes a queue brought from another device and plays it, counted as a change: each
-    /// song and whether it was queued by hand, where to start, and how far in.
-    fn take(&mut self, songs: &[(String, bool)], begin: usize, position: f64, context: &str);
+    /// Takes a queue brought from another device and plays it: each song and whether it
+    /// was queued by hand, where to start, and how far in. **Says whether the queue is in
+    /// the player**; if it is, [`Player::queue`] has a new number and it is counted as a
+    /// change, and if not, nothing is counted and nothing is claimed.
+    fn take(&mut self, songs: &[(String, bool)], begin: usize, position: f64, context: &str) -> bool;
 
     // The order of choices (see `super::rule`), which the app keeps beside its player
     // because every way into the player counts there.
@@ -117,7 +153,9 @@ pub trait Player {
     fn by(&self) -> Option<Nonce>;
     fn admit(&mut self, at: At, minute: u64, now_ms: u64) -> Result<Reservation, Why>;
     fn finish(&mut self, reservation: Reservation, at: At, minute: u64, now_ms: u64, same_session: bool) -> Result<Carrying, Why>;
-    fn carried(&mut self, carrying: Carrying, changed: bool, nonce: Nonce);
+    /// (`by` is the command to name as having made the state, if it changed anything:
+    /// none, where what it did is not known.)
+    fn carried(&mut self, carrying: Carrying, changed: bool, by: Option<Nonce>);
     fn refuse(&mut self, reservation: Reservation);
     fn wait(&mut self, now_ms: u64, for_ms: u64) -> Waiting;
     fn done(&mut self, waiting: Waiting);
@@ -304,7 +342,9 @@ enum Take {
     /// Its queue is loaded here, and this device's sound is awaited: `heard_from` is where
     /// in the song the sound was when it was first heard on it. This device is busy to the
     /// others until then (`waiting`): what it holds is about to become what is sounding.
-    Loaded { place: Place, name: String, taking: Taking, heard_from: Option<f64>, waiting: Waiting },
+    /// (`queue`: the number the player gave the queue as it went in. Only that queue's
+    /// sound counts.)
+    Loaded { place: Place, name: String, taking: Taking, queue: u64, heard_from: Option<f64>, waiting: Waiting },
 }
 
 /// A queue another device sent has been loaded here. It is answered when it sounds.
@@ -315,6 +355,8 @@ struct Adoption {
     adopting: Adopting,
     /// This device is busy to the others until then.
     waiting: Waiting,
+    /// The number the player gave the queue as it went in: only that queue's sound counts.
+    queue: u64,
     heard_from: Option<f64>,
 }
 
@@ -964,15 +1006,41 @@ impl Device {
             Ok(carrying) => carrying,
             Err(why) => return self.refused(session, from, nonce, &command, at, why, env, out),
         };
-        // The music has moved to the device that asks: the queue is that device's now,
-        // whether or not there is any sound here left to stop.
-        if command == Command::Moved {
-            env.player.handed_on();
+        // The music has moved to the device that asks. Its queue is marked as that device's
+        // before the sound is stopped, so that the stop is not saved as a change of this
+        // device's own; and the mark stands only if the sound did stop.
+        let handing = command == Command::Moved;
+        let marked = handing && env.player.handed_on();
+        if handing && !marked {
+            out.push(Do::Log("queue: it could not be marked as handed on".into()));
         }
         // What came of it is known as the player returns: the rule is told, and the
         // command's sender answered, from the player as it now is.
-        let changed = env.player.carry_out(&command, &ready);
-        env.player.carried(carrying, changed, nonce);
+        let before = env.player.queue();
+        let carried = env.player.carry_out(&command, &ready);
+        let changed = match (&command, carried) {
+            // A queue to take over is in the player if the player's queue has a new
+            // number, whatever was said: that is asked afresh, and gone by.
+            (Command::Adopt(_), _) => env.player.queue() != before,
+            (_, carried) => carried != Carried::Unchanged,
+        };
+        // (What it did is not known: a change, and no command is named for it.)
+        let unknown = carried == Carried::Unknown && !matches!(command, Command::Adopt(_));
+        env.player.carried(carrying, changed, (!unknown).then_some(nonce));
+        if handing && env.player.brief().playing {
+            // It was told to stop and is still sounding: it is not acknowledged as
+            // stopped, and its queue is its own still.
+            if marked {
+                env.player.handed_back();
+            }
+            out.push(Do::Log(format!("moved from {}: this device could not be stopped, and is still playing", text::place(&from))));
+            return self.refused(session, from, nonce, &command, at, Why::Cannot, env, out);
+        }
+        if unknown && !handing {
+            out.push(Do::Log(format!("{} from {} against generation {}: the player could not say what came of it; answered as not known", command.name(), text::place(&from), at.generation)));
+            let answer = self.state(Some(nonce), Some(false), Some(Why::Unknown), env);
+            return self.answer(session, from, answer, env, out);
+        }
         if !changed {
             // The player did nothing. Either it was already as the command asked, which is
             // no fault and is said as such; or it could not do it. Nothing has moved.
@@ -989,7 +1057,7 @@ impl Device {
         if matches!(command, Command::Adopt(_)) {
             // It answers "carried out" when its sound has started, and is busy until then.
             let waiting = env.player.wait(now, START_MS + 5_000);
-            let adoption = Adoption { session, from, nonce, adopting: Adopting::begin(env.player.generation(), now), waiting, heard_from: None };
+            let adoption = Adoption { session, from, nonce, adopting: Adopting::begin(env.player.generation(), now), waiting, queue: env.player.queue(), heard_from: None };
             if let Some(earlier) = self.adoption.replace(adoption) {
                 env.player.done(earlier.waiting);
             }
@@ -1030,13 +1098,16 @@ impl Device {
         // This device's own sound has started on the queue a move is waiting on once it
         // has moved on from where it was first heard: the song being open is not yet sound.
         let sounding = {
-            let at = env.player.sounding_at();
+            let sound = env.player.sounding();
             let heard = match (&mut self.adoption, &mut self.take) {
-                (Some(adoption), _) => Some(&mut adoption.heard_from),
-                (None, Some(Take::Loaded { heard_from, .. })) => Some(heard_from),
+                (Some(adoption), _) => Some((&mut adoption.heard_from, adoption.queue)),
+                (None, Some(Take::Loaded { heard_from, queue, .. })) => Some((heard_from, *queue)),
                 _ => None,
             };
-            match (heard, at) {
+            // (Only the sound of the queue that was installed for the move: the queue
+            // that was there before, still playing, is not it.)
+            let at = heard.as_ref().and_then(|(_, queue)| sound.filter(|sound| sound.queue == *queue)).map(|sound| sound.at);
+            match (heard.map(|(heard, _)| heard), at) {
                 (Some(heard), Some(at)) => at - *heard.get_or_insert(at) >= SOUNDS_AFTER,
                 (Some(heard), None) => {
                     *heard = None;
@@ -1242,12 +1313,26 @@ impl Device {
                 let gave = giving.ends(outcome, env.player.generation(), env.now_ms);
                 if gave == Gave::Moved {
                     // The other has started: the queue is that device's now, this one
-                    // stops, and the player is the other's.
-                    env.player.handed_on();
+                    // stops, and the player is the other's. (Marked before the stop, and
+                    // only kept if this device did stop.)
+                    let marked = env.player.handed_on();
+                    if !marked {
+                        out.push(Do::Log("queue: it could not be marked as handed on".into()));
+                    }
                     env.player.pause();
-                    self.steer(place, env, out);
+                    if env.player.brief().playing {
+                        if marked {
+                            env.player.handed_back();
+                        }
+                        out.push(Do::Log(format!("give: {name} has started and this device could not be stopped")));
+                        words::gave_and_did_not_stop(name, env.me.here)
+                    } else {
+                        self.steer(place, env, out);
+                        words::gave(gave, name, left, sent, env.me.here)
+                    }
+                } else {
+                    words::gave(gave, name, left, sent, env.me.here)
                 }
-                words::gave(gave, name, left, sent, env.me.here)
             }
             (Out::TakePause, outcome) => words::took(outcome, name),
             (_, outcome) => words::outcome(outcome, name),
@@ -1558,13 +1643,23 @@ impl Device {
         if songs.is_empty() {
             return self.say(words::none_of_those_songs(&name, env.me.here), out);
         }
-        env.player.take(&songs, begin, handed.position, &handed.context);
+        // Whether it went in is asked of the player afresh, and gone by: its queue has a
+        // new number, or it has not.
+        let before = env.player.queue();
+        let said = env.player.take(&songs, begin, handed.position, &handed.context);
+        let queue = env.player.queue();
+        if queue == before {
+            // Nothing was installed: nothing is waited for, and the other device is not
+            // told to stop on the strength of what was playing here before.
+            out.push(Do::Log(format!("take: {name}'s queue could not be put in the player here{}", if said { " (though the player said it was)" } else { "" })));
+            return self.say(words::could_not_load_here(&name, env.me.here), out);
+        }
         let taking = Taking::begin(at, env.player.generation(), pressed_ms);
         // Busy to the other devices until it sounds or is given up (a little longer than
         // the take itself is given, so that the wait is never what ends first).
         let waiting = env.player.wait(env.now_ms, MOVE_MS + 5_000);
         out.push(Do::Log(format!("take: loaded {name}'s queue here; it is paused when {} sounds", env.me.here.this_lower())));
-        self.take = Some(Take::Loaded { place: from, name, taking, heard_from: None, waiting });
+        self.take = Some(Take::Loaded { place: from, name, taking, queue, heard_from: None, waiting });
     }
 
     /// The list: the other devices and what each is doing, and after them the ones seen
