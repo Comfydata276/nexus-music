@@ -2013,6 +2013,8 @@ impl Controller {
                 ctl.settings.borrow_mut().link_devices = on;
                 ctl.save_settings();
                 ctl.push_jam();
+                // (Where the new linking is switched on, off is off for it at once: see `link`.)
+                ctl.link_setting(on);
             });
         });
         settings.on_set_device_name(|name| {

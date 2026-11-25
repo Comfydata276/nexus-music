@@ -601,6 +601,17 @@ impl Link {
         self.looked_ms = None;
     }
 
+    /// "Link my devices" was set. Off is off at once: everything of this sign-in's ends
+    /// here, in the same step as the setting is saved, so that a frame already on its way
+    /// to this thread finds no session to act under. Says whether anything was ended.
+    fn setting(&mut self, link_my_devices: bool) -> bool {
+        if link_my_devices {
+            return false;
+        }
+        self.stop();
+        true
+    }
+
     /// A look starts: the number its answer must show to be taken, and what it watches to
     /// see whether the sign-in it is for has ended.
     fn look_begins(&mut self) -> (u64, Arc<AtomicBool>) {
@@ -685,6 +696,15 @@ impl Controller {
         }
         if !note.is_empty() {
             link.note = note.to_string();
+        }
+    }
+
+    /// "Link my devices" was changed in Settings. Where the new linking is switched on,
+    /// off takes effect at once, not at the next tick.
+    pub fn link_setting(&self, link_my_devices: bool) {
+        if on() && self.link.borrow_mut().setting(link_my_devices) {
+            log("session: ended, \"Link my devices\" was switched off");
+            self.link_show();
         }
     }
 
@@ -1380,6 +1400,22 @@ mod tests {
         // The older answer does not replace the newer whichever order the places come in.
         assert_eq!(latest_of_each(vec![(study, 30_000, "new"), (study, 1_000, "old")]), vec!["new"]);
         assert_eq!(latest_of_each(Vec::<([u8; 16], u64, &str)>::new()), Vec::<&str>::new());
+    }
+
+    /// Switching the setting off ends the session in the same step, so a frame that was
+    /// already queued for this thread cannot act before the next tick notices.
+    #[test]
+    fn link_my_devices_off_takes_effect_at_once() {
+        let mut link = linked(1_000);
+        let (looks, over) = link.look_begins();
+        let queued = link.session.as_ref().map(|session| session.stop.clone()).unwrap();
+        // Switched on (as it was): nothing ends.
+        assert!(!link.setting(true) && link.live(1, 1_000).is_some() && link.expects(looks));
+        // Switched off: there is no session for the frame that arrives next to be opened
+        // under, nothing queued is sent, and a look on its way starts nothing.
+        assert!(link.setting(false));
+        assert!(link.live(1, 1_000).is_none(), "a frame already on its way would still be opened");
+        assert!(queued.load(Ordering::Relaxed) && over.load(Ordering::Relaxed) && !link.expects(looks));
     }
 
     #[test]
