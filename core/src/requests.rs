@@ -791,9 +791,10 @@ pub fn asked_sentence(title: &str) -> String {
 }
 
 /// What's said instead when Lidarr has it, but the note of it couldn't be kept on this
-/// `device` ("computer", "phone"): it will still arrive, but nothing will say so.
+/// `device` ("computer", "phone"): it will still arrive, but nothing will say so. Short, as
+/// a toast is one line: what matters comes before the end, which a narrow one cuts off.
 pub fn asked_unnoted(title: &str, device: &str) -> String {
-    format!("Asked for “{title}”. It'll be in your library once it arrives, but this {device} couldn't keep a note of it, so the app won't say when it does.")
+    format!("Asked for “{title}”, but this {device} couldn't note it to say when it arrives.")
 }
 
 /// Said on the Requests page when the list of what was asked for on this `device` couldn't be
@@ -1121,7 +1122,7 @@ mod tests {
         assert_eq!(ask("ost-ep", "Them", "", ""), "Ask for this EP? | “Title” by Them is an EP. It will go on Lidarr's list, and Lidarr will start looking for it. If Lidarr only lists Them's albums so far, it will be set to list their singles, EPs and soundtracks too. None but this one is fetched, though ones they release from now on are treated as their new albums are.");
         assert_eq!(asking_for("Title"), "Asking for “Title”…");
         assert_eq!(asked_sentence("Title"), "Asked for “Title”. It'll be in your library once it arrives.");
-        assert_eq!(asked_unnoted("Title", "computer"), "Asked for “Title”. It'll be in your library once it arrives, but this computer couldn't keep a note of it, so the app won't say when it does.");
+        assert_eq!(asked_unnoted("Title", "computer"), "Asked for “Title”, but this computer couldn't note it to say when it arrives.");
         assert_eq!(
             asked_unreadable("phone"),
             "The list of what was asked for on this phone couldn't be read, so albums asked for before won't be said to have arrived, or put into the playlists waiting for them. What's on its way is still shown."
