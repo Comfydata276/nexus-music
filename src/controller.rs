@@ -3451,15 +3451,22 @@ impl Controller {
         self.request(
             |client| client.playlists(),
             |ctl, result| {
-                let Ok(mut playlists) = result else { return };
-                // The playlist the app keeps its shared data in isn't one to listen to.
-                playlists.retain(|p| !crate::link::unlisted(&p.name));
-                *ctl.playlists.borrow_mut() = playlists;
-                ctl.show_playlists();
-                ctl.reload_changed_playlist();
-                ctl.follow_playing_playlist();
+                if let Ok(playlists) = result {
+                    ctl.playlists_arrived(playlists);
+                }
             },
         );
+    }
+
+    /// The list of playlists has been read from the server, by [`Self::reload_playlists`]
+    /// or by a look at what other devices have changed (which reads it anyway).
+    pub fn playlists_arrived(self: &Rc<Self>, mut playlists: Vec<Playlist>) {
+        // The playlist the app keeps its shared data in isn't one to listen to.
+        playlists.retain(|p| !crate::link::unlisted(&p.name));
+        *self.playlists.borrow_mut() = playlists;
+        self.show_playlists();
+        self.reload_changed_playlist();
+        self.follow_playing_playlist();
     }
 
     /// If the playlist the queue is playing from has gained or lost songs (added from another

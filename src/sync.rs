@@ -18,7 +18,7 @@ use std::time::Duration;
 use slint::ComponentHandle as _;
 
 use nexus_core::handover::{self, Clock, First, Here, Save, Then};
-use nexus_core::step::{Answers, Change, Device, Found, Outcome, Plan, Take, Write, find, settle};
+use nexus_core::step::{Answers, Change, Device, Found, Outcome, Plan, Stop, Take, Write, find, settle};
 pub use nexus_core::sync::{HISTORY_LENGTH, PLAYLIST_NAME};
 
 use crate::config::{Played, Settings};
@@ -27,8 +27,30 @@ use crate::subsonic::{ApiError, ApiResult, Client, PlayQueue, Song, Timed};
 
 /// How long after a change before it's passed on, so a burst of changes goes as one.
 const SETTLE: Duration = Duration::from_secs(3);
-/// How often to look for changes made elsewhere.
-const LOOK: Duration = Duration::from_secs(60);
+/// How often to look for changes made elsewhere, while the window is open: what another
+/// device changed shows here within a quarter of a minute.
+const LOOK: Duration = Duration::from_secs(15);
+/// And while the window is hidden in the notification area, where nobody is looking at it:
+/// every so many of those, which is once a minute, as it always was.
+const LOOKS_WHEN_HIDDEN: u32 = 4;
+
+/// The looks the timer has come round for while the window was hidden, since the last one
+/// made. (The timer is the window's own thread's.)
+static HIDDEN_LOOKS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Whether a look is made at this turn of the timer. `hidden` counts the turns let go by
+/// while the window was hidden.
+fn due(window_open: bool, hidden: &std::sync::atomic::AtomicU32) -> bool {
+    if window_open {
+        hidden.store(0, Ordering::SeqCst);
+        return true;
+    }
+    if hidden.fetch_add(1, Ordering::SeqCst) + 1 < LOOKS_WHEN_HIDDEN {
+        return false;
+    }
+    hidden.store(0, Ordering::SeqCst);
+    true
+}
 
 // What an exchange decides is the library's (`nexus_core::step`), the same for every app:
 // which playlist holds the record, what the server's answers mean, what to keep, take in and
@@ -38,8 +60,24 @@ const LOOK: Duration = Duration::from_secs(60);
 
 /// Step 1: asks the server for the list of playlists and for the one that holds the record.
 /// Nothing of what this PC holds is needed for it, and nothing is written.
+/// (The app asks through [`read_both`], and through this for a second asking. It is also
+/// what the Android repository's stand-in PC, which is built from this file, asks through.)
 pub fn read(client: &Client) -> ApiResult<Answers> {
-    let listed = client.playlists_stated()?;
+    read_both(client, |_| {})
+}
+
+/// The same asking, with the list of playlists also handed to `listed` as the app lists
+/// them: it is the same answer as the exchange's first, read the other way, so a look at
+/// what other devices changed asks for it once. **It is handed over the moment it
+/// arrives**, before the record's own playlist is asked for and whatever becomes of that
+/// request: one answer, two readers, neither waiting for the other. (Not handed over at
+/// all if the answer can't be read that way.)
+pub fn read_both(client: &Client, listed: impl FnOnce(Vec<crate::subsonic::Playlist>)) -> ApiResult<Answers> {
+    let (playlists, stated) = client.playlists_both()?;
+    if let Some(playlists) = playlists {
+        listed(playlists);
+    }
+    let listed = stated;
     let (playlist, date, received) = match find(&listed.value, client.username()) {
         Found::Ours(id) => {
             let answer = client.playlist_stated(&id)?;
@@ -131,6 +169,14 @@ pub struct QueueOwner {
     /// that device's name and the time of its save (`nexus_core::handover::Here::taken`).
     taken: std::cell::RefCell<Option<String>>,
     revision: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// The offer that was last taken, or acted past: the time of that save and who made it.
+    used: std::cell::RefCell<Option<(String, String)>>,
+    /// How many looks at the server's saved queue have begun, and the newest whose answer
+    /// has been taken.
+    looks: std::cell::Cell<u64>,
+    answered: std::cell::Cell<u64>,
+    /// How many of the requests looks have made are still out.
+    out: std::cell::Cell<u32>,
 }
 
 /// A save's note of the queue it was prepared for.
@@ -147,10 +193,27 @@ impl Prepared {
 }
 
 impl QueueOwner {
-    /// The queue changed here, or was played on: whatever it was, it is this PC's own now.
-    pub fn changed_here(&self) {
+    /// **The person did something to the queue, or to playing it, here**: whatever it was
+    /// before, it is this PC's own from this moment. Said at the press itself
+    /// (`Controller::pressing`), not found out afterwards from the queue looking different:
+    /// a seek while paused, or Play and then Pause inside a second, changes nothing a look
+    /// at the queue would notice. And it is another queue for anything waiting to be saved.
+    pub fn claimed(&self) {
         *self.taken.borrow_mut() = None;
         self.revision.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// The queue looks different from when it was last noted, and no press made it so: a
+    /// song played on, the next one began, similar songs were added at the end. **That
+    /// claims nothing.** Says whether the queue is this PC's own, and so whether this is a
+    /// change to save; one taken up from another device and left alone is still that
+    /// device's, whatever the app does to it by itself.
+    pub fn moved_on(&self) -> bool {
+        if self.taken.borrow().is_some() {
+            return false;
+        }
+        self.revision.fetch_add(1, Ordering::SeqCst);
+        true
     }
 
     /// Another device's queue was put in this one's place. It is that device's, and not
@@ -160,6 +223,57 @@ impl QueueOwner {
     pub fn taken_up(&self, from: String) {
         *self.taken.borrow_mut() = Some(from);
         self.revision.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// An offer of this saved queue was taken ("Continue here"), or the person did something
+    /// here while it stood: it is done with, and the same one is not made again. What that
+    /// device saves next is another.
+    pub fn offer_used(&self, theirs: &PlayQueue) {
+        *self.used.borrow_mut() = Some((theirs.changed.clone(), theirs.changed_by.clone()));
+    }
+
+    /// Whether this saved queue is the one whose offer is done with.
+    pub fn used(&self, theirs: &PlayQueue) -> bool {
+        self.used.borrow().as_ref().is_some_and(|(at, by)| *at == theirs.changed && *by == theirs.changed_by)
+    }
+
+    /// A look at the server's saved queue begins: its number.
+    pub fn look_began(&self) -> u64 {
+        self.looks.set(self.looks.get() + 1);
+        self.looks.get()
+    }
+
+    /// The answer to look `number` has come. Whether it counts: not if a later look's
+    /// answer came first (what that one decided is the newer, and stands).
+    pub fn look_counts(&self, number: u64) -> bool {
+        if number <= self.answered.get() {
+            return false;
+        }
+        self.answered.set(number);
+        true
+    }
+
+    /// A look has sent a request (the record's, the saved queue's, the list of playlists).
+    pub fn look_sent(&self) {
+        self.out.set(self.out.get() + 1);
+    }
+
+    /// One of a look's requests has come back, with an answer or without.
+    pub fn look_back(&self) {
+        self.out.set(self.out.get().saturating_sub(1));
+    }
+
+    /// A new sign-in: whatever the last one's looks had out is not this one's to wait for.
+    pub fn looks_forgotten(&self) {
+        self.out.set(0);
+    }
+
+    /// Whether any request a look made is still out. **While one is, the timer's next look
+    /// is not made**: a request may take 45 seconds to give up and there are four workers,
+    /// so looks every 15 seconds at a server that is slow would queue behind each other,
+    /// and a write behind them.
+    pub fn look_out(&self) -> bool {
+        self.out.get() > 0
     }
 
     /// As it was left when the app last closed.
@@ -314,12 +428,24 @@ impl Controller {
     /// Starts keeping in step: now, and every so often from here on.
     pub fn start_sync(self: &Rc<Self>) {
         self.let_go();
+        self.queue_owner.looks_forgotten();
         // (What is shown is the choices as this sign-in has them.)
         self.settings.borrow_mut().show();
         self.look_elsewhere();
         self.sync_look_timer.start(slint::TimerMode::Repeated, LOOK, || {
-            with(|ctl| ctl.look_elsewhere());
+            with(|ctl| ctl.look_is_due());
         });
+    }
+
+    /// The timer has come round. With the window open, a look; hidden in the notification
+    /// area, one in every [`LOOKS_WHEN_HIDDEN`].
+    fn look_is_due(self: &Rc<Self>) {
+        // (A look whose requests have not all come back is still being made: this turn of
+        // the timer is passed over, not queued behind it.)
+        if self.queue_owner.look_out() || !due(self.ui.window().is_visible(), &HIDDEN_LOOKS) {
+            return;
+        }
+        self.look_elsewhere();
     }
 
     pub fn stop_sync(&self) {
@@ -346,7 +472,16 @@ impl Controller {
             self.sync_timer.stop();
             self.queue_timer.stop();
             self.sync_says("");
+            // Nothing of another device's is offered while this is off: what was on offer
+            // would otherwise stay there to be pressed.
+            self.withdraw_offer();
         }
+    }
+
+    /// Whatever another device's queue was on offer no longer is.
+    fn withdraw_offer(&self) {
+        *self.elsewhere.borrow_mut() = None;
+        self.ui.global::<crate::ui::Player>().set_elsewhere("".into());
     }
 
     /// Picks up whatever other devices have changed.
@@ -354,17 +489,40 @@ impl Controller {
         if !self.sync_on() {
             return;
         }
-        self.share_now();
+        // Playlists made or changed elsewhere are drawn from the exchange's own read of
+        // the list of playlists: it is the same request, and is made once. Only if no
+        // exchange could begin now (one is still out) is the list asked for by itself.
+        //
+        // And a change made here that is still settling is not sent early by a look: its
+        // own exchange is three seconds away at most, and reads the server as this would.
+        if self.sync_timer.running() || !self.share_now(true) {
+            self.list_playlists();
+        }
         self.check_server_queue();
-        // Playlists made or changed elsewhere.
-        self.reload_playlists();
+    }
+
+    /// The list of playlists by itself, for a look that makes no exchange.
+    fn list_playlists(self: &Rc<Self>) {
+        let Some(client) = self.client() else { return };
+        self.queue_owner.look_sent();
+        self.api_pool.spawn(move || {
+            let playlists = client.playlists();
+            post(move |ctl| {
+                ctl.queue_owner.look_back();
+                if let (Ok(playlists), true) = (playlists, ctl.client().is_some()) {
+                    ctl.playlists_arrived(playlists);
+                }
+            });
+        });
     }
 
     /// Something that's shared changed here: pass it on once things have settled.
     pub fn share_soon(&self) {
         if self.settings.borrow().sync {
             self.sync_timer.start(slint::TimerMode::SingleShot, SETTLE, || {
-                with(|ctl| ctl.share_now());
+                with(|ctl| {
+                    ctl.share_now(false);
+                });
             });
         }
     }
@@ -434,20 +592,42 @@ impl Controller {
     /// Step 1 of an exchange: the server is asked. Nothing this PC holds is looked at until
     /// the answers are back (`answered`), so whatever the person does meanwhile is in what
     /// is then decided.
-    fn share_now(self: &Rc<Self>) {
+    ///
+    /// `look`: this is part of a look at what other devices have changed, which also draws
+    /// the list of playlists afresh from what is read. Says whether the server was asked.
+    fn share_now(self: &Rc<Self>, look: bool) -> bool {
         if !self.sync_on() {
-            return;
+            return false;
         }
-        let Some(client) = self.client() else { return };
+        let Some(client) = self.client() else { return false };
         if !self.exchange.begin() {
             // One exchange at a time, one let go included: again when it is back.
-            return;
+            return false;
         }
         let session = self.session.load(Ordering::SeqCst);
+        if look {
+            self.queue_owner.look_sent();
+        }
         self.api_pool.spawn(move || {
-            let answers = read(&client);
-            post(move |ctl| ctl.answered(session, client, answers));
+            let answers = read_both(&client, |playlists| {
+                // The list of playlists, as the sidebar and the pages show it: what a look
+                // used to ask for a second time. Drawn now, not when the exchange is done.
+                if look {
+                    post(move |ctl| {
+                        if ctl.client().is_some() {
+                            ctl.playlists_arrived(playlists);
+                        }
+                    });
+                }
+            });
+            post(move |ctl| {
+                if look {
+                    ctl.queue_owner.look_back();
+                }
+                ctl.answered(session, client, answers, false)
+            });
         });
+        true
     }
 
     /// An exchange has finished, one way or another (applied, stopped, or let go and now
@@ -482,7 +662,13 @@ impl Controller {
     /// connection of the sign-in that asked, and `session` says which that was: if it is
     /// no longer the one signed in, or sharing has been switched off, everything here is
     /// dropped.
-    fn answered(self: &Rc<Self>, session: u64, client: Client, answers: ApiResult<Answers>) {
+    ///
+    /// `again`: these are the answers of a second asking, made at once because the first
+    /// two disagreed about what is in the playlist. That is what another device writing
+    /// between the two reads looks like, and it is no fault: the server is asked once more
+    /// straight away, and only answers that disagree a second time running stop the
+    /// exchange and are said.
+    fn answered(self: &Rc<Self>, session: u64, client: Client, answers: ApiResult<Answers>, again: bool) {
         // Step 2. (Let go: dropped. But it has come back, so the next may begin.)
         if session != self.session.load(Ordering::SeqCst) {
             return self.exchange_over();
@@ -495,6 +681,16 @@ impl Controller {
         // Step 3: decided from what this PC holds now.
         let plan = match settle(&self.device(), &answers) {
             // Step 4.
+            Outcome::Stop(Stop::Disagree) if !again => {
+                // (Still this exchange: nothing else begins until it is back.)
+                self.api_pool.spawn(move || {
+                    // (The sidebar was drawn from the first asking; this one is the
+                    // exchange's alone.)
+                    let answers = read(&client);
+                    post(move |ctl| ctl.answered(session, client, answers, true));
+                });
+                return;
+            }
             Outcome::Stop(stop) => {
                 self.sync_says(stop.words());
                 return self.exchange_over();
@@ -616,10 +812,63 @@ impl Controller {
     // numbered steps are named below. This is the timers, the requests, and putting a queue
     // in the player.
 
-    /// The queue changed here, or was played on: save it on the server once things have
-    /// settled. (Whatever it was before, it is this PC's own now.)
-    pub fn queue_changed_here(&self) {
-        self.queue_owner.changed_here();
+    /// A press: the person is about to change what is in the player or how it is playing
+    /// (a row played, a song queued, moved or removed, the queue cleared or jumped in,
+    /// Play, Pause, Next, Previous, shuffle; from the window, the tray, the taskbar, the
+    /// mini player, the media keys, or a guest in a jam). Everything `changing` is, and
+    /// besides: **the queue is this PC's own from this moment** (`claim_queue`).
+    ///
+    /// **This and `pressed` are the one list of the person's ways in.** What the app does
+    /// by itself goes through `changing` and `changed` alone, and claims nothing: the next
+    /// song beginning, a song that failed being passed over, similar songs arriving, the
+    /// sleep timer, the sound device going, a queue another device saved being put in the
+    /// player, the last run's queue being put back. A press carried out inside one of
+    /// those (the sleep timer pausing by "pressing" Pause) is part of it, and is no press.
+    pub fn pressing(&self) -> crate::link::Changing<'_> {
+        let own = !self.link_changing.get();
+        let changing = self.changing();
+        if own {
+            self.claim_queue();
+        }
+        changing
+    }
+
+    /// The same, for a press that is over as soon as it is made (a seek, a song queued).
+    pub fn pressed(&self) {
+        if !self.link_changing.get() {
+            self.claim_queue();
+        }
+        self.changed();
+    }
+
+    /// The queue is this PC's own from this moment, by the person's own doing: no longer
+    /// another device's that was taken up, changed now by this PC's clock, and to be saved
+    /// on the server once things have settled. (It borrows nothing of the player: a press
+    /// can be half-way through changing it.)
+    pub fn claim_queue(&self) {
+        self.queue_stamp.set(chrono::Utc::now().timestamp());
+        self.queue_owner.claimed();
+        // What another device was playing was offered as the newer of the two, which it
+        // has just stopped being: the person has acted past that offer, and it is not made
+        // again.
+        if let Some((theirs, _)) = self.elsewhere.borrow_mut().take() {
+            self.queue_owner.offer_used(&theirs);
+            self.ui.global::<crate::ui::Player>().set_elsewhere("".into());
+        }
+        self.save_queue_soon();
+    }
+
+    /// The queue came to look different with no press (see `QueueOwner::moved_on`): if it
+    /// is this PC's own, that is a change to save, timed now.
+    pub fn queue_moved_on(&self) {
+        if self.queue_owner.moved_on() {
+            self.queue_stamp.set(chrono::Utc::now().timestamp());
+            self.save_queue_soon();
+        }
+    }
+
+    /// Saves the queue on the server once things have settled.
+    fn save_queue_soon(&self) {
         if self.settings.borrow().sync {
             self.queue_timer.start(slint::TimerMode::SingleShot, SETTLE, || {
                 with(|ctl| ctl.upload_queue());
@@ -630,12 +879,17 @@ impl Controller {
     /// This PC's side of a comparison of queues.
     fn here(&self) -> Here {
         let pb = self.playback.borrow();
+        let in_order: Vec<&Song> = pb.order.iter().filter_map(|&i| pb.queue.get(i)).collect();
         Here {
             device: self.device_name(),
             current: pb.current().map(|song| song.id.clone()),
             playing: pb.playing,
             stamp: self.queue_stamp.get(),
             taken: self.queue_owner.taken(),
+            // What this PC would save of its queue: what tells another device's queue with
+            // the same song current from this one. (Where it would save nothing though
+            // something is there, a radio station, that one thing: see the library's contract.)
+            ids: handover::window(&in_order, pb.cursor, pb.position).map(|saved| saved.ids).unwrap_or_else(|| pb.current().map(|song| song.id.clone()).into_iter().collect()),
         }
     }
 
@@ -701,11 +955,22 @@ impl Controller {
         }
         let Some(client) = self.client() else { return };
         let session = self.session.load(Ordering::SeqCst);
+        let number = self.queue_owner.look_began();
+        self.queue_owner.look_sent();
         self.api_pool.spawn(move || {
-            let Ok(theirs) = client.play_queue_timed() else { return };
+            let theirs = client.play_queue_timed();
             post(move |ctl| {
-                if session == ctl.session.load(Ordering::SeqCst) && ctl.sync_on() {
-                    ctl.looked_at_queue(theirs);
+                ctl.queue_owner.look_back();
+                // (An answer that comes after a later look's has nothing to say: that one
+                // has decided already, from what the server held more lately.)
+                if session != ctl.session.load(Ordering::SeqCst) || !ctl.sync_on() || !ctl.queue_owner.look_counts(number) {
+                    return;
+                }
+                match theirs {
+                    Ok(theirs) => ctl.looked_at_queue(theirs),
+                    // The server couldn't be asked: an offer made from an earlier answer
+                    // is no longer known to stand, and is not left there to be pressed.
+                    Err(_) => ctl.withdraw_offer(),
                 }
             });
         });
@@ -720,9 +985,11 @@ impl Controller {
         self.clock.set(clock);
         let theirs = theirs.value;
         let looked = handover::look(&theirs, &self.here(), clock, chrono::Utc::now().timestamp());
-        let label = looked.offer.and_then(|index| theirs.songs.get(index)).map(|song| format!("{} — {}", song.title, song.artist_label())).unwrap_or_default();
+        // (An offer that was taken, or that the person acted past, is not made again.)
+        let offer = looked.offer.filter(|_| !self.queue_owner.used(&theirs));
+        let label = offer.and_then(|index| theirs.songs.get(index)).map(|song| format!("{} — {}", song.title, song.artist_label())).unwrap_or_default();
         // (Kept with the clock it was read by, for "Continue here".)
-        *self.elsewhere.borrow_mut() = looked.offer.is_some().then(|| (theirs.clone(), clock));
+        *self.elsewhere.borrow_mut() = offer.is_some().then(|| (theirs.clone(), clock));
         self.ui.global::<crate::ui::Player>().set_elsewhere(label.into());
         match looked.then {
             Then::TakeUp(place) => self.take_up(theirs, place, false),
@@ -745,6 +1012,8 @@ impl Controller {
         self.queue_owner.taken_up(place.taken);
         self.replace_queue(theirs.songs, place.cursor, place.position);
         if play {
+            // (Inside this change, which is the app's own: it claims nothing. Whoever asked
+            // for it to be played says whose it is: see `continue_here`.)
             self.toggle_play();
         }
     }
@@ -753,8 +1022,14 @@ impl Controller {
     pub fn continue_here(self: &Rc<Self>) {
         let Some((theirs, clock)) = self.elsewhere.borrow_mut().take() else { return };
         self.ui.global::<crate::ui::Player>().set_elsewhere("".into());
+        // (Taken: that offer is done with.)
+        self.queue_owner.offer_used(&theirs);
         let place = handover::place(&theirs, clock);
         self.take_up(theirs, place, true);
+        // Taken by the person's own choice, it is this PC's own queue from the first
+        // moment: not one "taken up and left alone", which the other device's next save
+        // would replace.
+        self.claim_queue();
     }
 }
 
@@ -763,7 +1038,7 @@ mod tests {
     use std::io::Write as _;
     use std::sync::{Arc, Mutex};
 
-    use nexus_core::step::{Held, Stop};
+    use nexus_core::step::Held;
 
     use super::*;
     use crate::subsonic::fake;
@@ -775,6 +1050,8 @@ mod tests {
         playlists: Vec<(String, String, Option<String>, String)>,
         date: Option<String>,
         asked: Vec<String>,
+        /// The server is in trouble with single playlists: asked for one, it fails.
+        no_playlist: bool,
     }
 
     fn decoded(text: &str) -> String {
@@ -807,6 +1084,10 @@ mod tests {
                 let comment = if comment.is_empty() { String::new() } else { format!(r#","comment":{}"#, serde_json::to_string(comment).unwrap()) };
                 format!(r#"{{"id":"{id}","name":"{name}"{owner}{comment}}}"#)
             };
+            if stored.no_playlist && path == "/rest/getPlaylist" {
+                let _ = write!(stream, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                return;
+            }
             let fields = match path {
                 "/rest/getPlaylists" => format!(r#""playlists":{{"playlist":[{}]}}"#, stored.playlists.iter().map(said).collect::<Vec<_>>().join(",")),
                 "/rest/getPlaylist" => {
@@ -867,6 +1148,159 @@ mod tests {
     }
 
     #[test]
+    fn the_list_of_playlists_read_once_is_what_two_readings_gave() {
+        // A look used to ask for the list of playlists twice in the same moment: once as
+        // the server states it, for the exchange, and once as the app lists it, for the
+        // sidebar. Asked once and read both ways, each half is what it was.
+        let (client, stored) = navidrome();
+        {
+            let mut stored = stored.lock().unwrap();
+            stored.date = Some("Wed, 25 Nov 2026 10:00:00 GMT".into());
+            stored.playlists = vec![
+                ("p1".into(), "Morning mix".into(), Some("tester".into()), "for the mornings".into()),
+                ("a".into(), PLAYLIST_NAME.into(), Some("tester".into()), r#"{"nexus_music_sync":1,"pins":["p1"],"pins_at":1700000000}"#.into()),
+                // One whose owner and comment the server leaves out.
+                ("q".into(), "Quiet".into(), None, String::new()),
+            ];
+        }
+        let (listed, stated) = client.playlists_both().unwrap();
+        assert_eq!(listed, Some(client.playlists().unwrap()));
+        assert_eq!(stated.value, client.playlists_stated().unwrap().value);
+        assert!(stated.value.len() == 3 && stated.date.is_some());
+        assert_eq!((stated.value[2].owner.clone(), stated.value[2].comment.clone()), (None, None));
+        // And the exchange decides from the same answers either way.
+        let mut handed = None;
+        let both = read_both(&client, |playlists| handed = Some(playlists)).unwrap();
+        let alone = read(&client).unwrap();
+        assert_eq!((both.listed, both.playlist), (alone.listed, alone.playlist));
+        assert_eq!(handed, Some(client.playlists().unwrap()));
+    }
+
+    #[test]
+    fn the_list_for_the_sidebar_does_not_wait_on_the_records_own_playlist() {
+        // The list of playlists arrives; the request after it, for the record's playlist,
+        // fails. The exchange has nothing to decide from. The sidebar has its list all the
+        // same: it was handed over the moment it came.
+        let (client, stored) = navidrome();
+        {
+            let mut stored = stored.lock().unwrap();
+            stored.playlists = vec![
+                ("p1".into(), "Morning mix".into(), Some("tester".into()), String::new()),
+                ("a".into(), PLAYLIST_NAME.into(), Some("tester".into()), r#"{"nexus_music_sync":1}"#.into()),
+            ];
+            stored.no_playlist = true;
+        }
+        let mut handed = None;
+        let answers = read_both(&client, |playlists| handed = Some(playlists));
+        assert!(answers.is_err());
+        assert_eq!(handed.map(|all| all.iter().map(|one| one.name.clone()).collect::<Vec<_>>()), Some(vec!["Morning mix".to_string(), PLAYLIST_NAME.to_string()]));
+        assert_eq!(stored.lock().unwrap().asked, ["getPlaylists", "getPlaylist"]);
+    }
+
+    #[test]
+    fn a_look_is_made_each_time_round_with_the_window_open_and_one_time_in_four_hidden() {
+        let hidden = std::sync::atomic::AtomicU32::new(0);
+        // Open: every time the timer comes round (every quarter of a minute).
+        assert!((0..5).all(|_| due(true, &hidden)));
+        // Hidden in the notification area: once a minute, as before.
+        let looks: Vec<bool> = (0..9).map(|_| due(false, &hidden)).collect();
+        assert_eq!(looks, [false, false, false, true, false, false, false, true, false]);
+        // Opened again, and hidden again: the count starts from the last look made.
+        assert!(due(true, &hidden));
+        assert_eq!((0..4).map(|_| due(false, &hidden)).collect::<Vec<_>>(), [false, false, false, true]);
+        assert_eq!(LOOK * LOOKS_WHEN_HIDDEN, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn only_the_persons_own_action_makes_a_queue_taken_up_this_pcs_own() {
+        // B has taken A's queue up (A saved it at 00:10:00), and it sits there paused.
+        let theirs = |at: &str, position: u64| PlayQueue {
+            songs: ["a", "b", "c"].iter().map(|id| Song { id: id.to_string(), duration: 200, ..Default::default() }).collect(),
+            current: "b".into(),
+            position,
+            changed: at.into(),
+            changed_by: "NexusMusic-0badc0de".into(),
+        };
+        let here = |owner: &QueueOwner, stamp: i64| Here {
+            device: "NexusMusic-feedf00d".into(),
+            current: Some("b".into()),
+            playing: false,
+            stamp,
+            taken: owner.taken(),
+            ids: vec!["a".into(), "b".into(), "c".into()],
+        };
+        let (day, clock) = (86_400, Clock::Offset(0));
+        let owner = QueueOwner::default();
+        owner.taken_up("1970-01-02T00:10:00Z".into());
+        // The queue coming to look different with nobody having pressed anything claims
+        // nothing: it is still A's, and A's next save is taken up as the last was.
+        assert!(!owner.moved_on());
+        assert_eq!(owner.taken().as_deref(), Some("1970-01-02T00:10:00Z"));
+        assert!(matches!(handover::look(&theirs("1970-01-02T00:10:20Z", 50_000), &here(&owner, day + 600), clock, day + 625).then, Then::TakeUp(_)));
+
+        // B's person seeks, with the song paused. Nothing a save would notice has changed
+        // (the same songs, the same one current), and for a moment not even the second it
+        // is at. The press itself makes the queue B's own, there and then; and a save that
+        // was being prepared is for the queue as it was before the press.
+        let prepared = owner.prepared();
+        owner.claimed();
+        assert_eq!(owner.taken(), None);
+        assert!(!prepared.still());
+        // So when A, playing on, saves again, B keeps its queue and its place, and is
+        // offered A's. (A's has moved on to another song.)
+        let later = PlayQueue { current: "c".into(), ..theirs("1970-01-02T00:11:20Z", 0) };
+        let looked = handover::look(&later, &here(&owner, day + 660), clock, day + 700);
+        assert_eq!((looked.then, looked.offer), (Then::Nothing, Some(2)));
+        // From then on what plays here is B's own to save as it goes.
+        assert!(owner.moved_on());
+    }
+
+    #[test]
+    fn an_offer_that_was_used_or_acted_past_is_not_made_again() {
+        let saved = |at: &str, by: &str| PlayQueue { changed: at.into(), changed_by: by.into(), ..Default::default() };
+        let owner = QueueOwner::default();
+        let first = saved("1970-01-02T00:10:00Z", "NexusMusic-0badc0de");
+        // Offered, and then taken (or the person did something else instead): that offer is
+        // done with. The same saved queue is never offered a second time...
+        assert!(!owner.used(&first));
+        owner.offer_used(&first);
+        assert!(owner.used(&first));
+        // ...but what that device saves next is another offer, and so is another device's.
+        assert!(!owner.used(&saved("1970-01-02T00:10:20Z", "NexusMusic-0badc0de")));
+        assert!(!owner.used(&saved("1970-01-02T00:10:00Z", "NexusMusic-feedf00d")));
+    }
+
+    #[test]
+    fn a_look_is_not_made_while_an_earlier_looks_requests_are_still_out() {
+        let owner = QueueOwner::default();
+        assert!(!owner.look_out());
+        // A look asks for the record and for the saved queue.
+        owner.look_sent();
+        owner.look_sent();
+        assert!(owner.look_out());
+        // One has answered; the other is slow. The timer comes round: no look.
+        owner.look_back();
+        assert!(owner.look_out());
+        // Back, with an answer or without: the next turn of the timer looks again.
+        owner.look_back();
+        assert!(!owner.look_out());
+        owner.look_back();
+        assert!(!owner.look_out());
+    }
+
+    #[test]
+    fn the_answer_to_an_older_look_that_comes_after_a_newer_ones_changes_nothing() {
+        let owner = QueueOwner::default();
+        let (first, second) = (owner.look_began(), owner.look_began());
+        // The second look's answer arrives first, and counts; the first's, after it, doesn't.
+        assert!(owner.look_counts(second));
+        assert!(!owner.look_counts(first));
+        // In the usual order each counts.
+        let (third, fourth) = (owner.look_began(), owner.look_began());
+        assert!(owner.look_counts(third) && owner.look_counts(fourth));
+    }
+
+    #[test]
     fn a_save_prepared_before_another_devices_queue_was_taken_up_is_not_sent() {
         let owner = QueueOwner::default();
         // A save is prepared: the songs and the place as they are, the server about to be
@@ -882,7 +1316,7 @@ mod tests {
         // Anything done to the queue here is the same to a save prepared before it; and
         // the queue is then this PC's own.
         let save = owner.prepared();
-        owner.changed_here();
+        owner.claimed();
         assert!(!save.still() && owner.taken().is_none());
         // Putting back, at start-up, what was in the player is no change to anything.
         let save = owner.prepared();

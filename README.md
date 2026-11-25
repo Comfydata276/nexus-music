@@ -39,7 +39,7 @@ What's planned next is in the [roadmap](ROADMAP.md).
 - Playing a song from a search starts its radio: that song, then others like it.
 - Play on another of your devices: with a relay set up (see Jams, below), every PC running Nexus Music on your account shows up under “Connect to a device” in the player bar, which lists them in the side panel in the queue's place, with what each is playing. Pick one while music is playing and the music moves there, carrying on from the same place in the same queue; pick one while nothing is playing and you steer whatever it has on. Either way the player and queue panel on the PC in front of you then control the other one, volume included, and “Play here” brings the music back.
 - Jams: one queue that friends add to while the music plays on your PC. They join from a link, in a browser (a phone works) or in Nexus Music on their own PC under Jam. In the app, a joined jam takes over the player and the queue panel: they show the host's song and queue, and pausing, skipping, dragging songs into a new order or taking them out happens for everyone. “Add to queue” anywhere adds to the jam, and so does playing a song. A strip along the bottom of the window says you're in a jam for as long as you are. The browser page does the same from a phone. You choose whether guests may steer or only add songs, see who's there, and can remove anyone. The queue shows who added what. Joining a jam needs nothing set up; hosting one is off until you switch it on, and needs a small relay service (see below).
-- Keeps your devices in step: the queue and your place in it, Recently played, pinned playlists, each list's shuffle and sort, the dates songs were added and the theme follow you to the app on another PC. The queue uses the server's saved-queue feature; the rest is kept in the comment of a playlist named "Nexus Music sync". When another PC has been playing in the last half hour, the queue panel offers "Continue here", which picks its queue up where it had got to. The plays behind "Your stats" are shared too, so today, this week and this month cover every PC. See "Keeping devices in step", below, for where a copy of it is kept and what is known not to be perfect.
+- Keeps your devices in step: the queue and your place in it, Recently played, pinned playlists, each list's shuffle and sort, the dates songs were added and the theme follow you to the app on another PC. The queue uses the server's saved-queue feature; the rest is kept in the comment of a playlist named "Nexus Music sync". A queue you have used on a device is never replaced by itself: what another device was playing is offered in the queue panel as "Continue here", which picks its queue up where it had got to. A device with nothing in its queue, or still showing a queue it picked up and you haven't touched, takes the newer one up by itself, paused. The plays behind "Your stats" are shared too, so today, this week and this month cover every PC. See "Keeping devices in step", below, for where a copy of it is kept and what is known not to be perfect.
 - Select several songs with Ctrl or Shift, then drag them onto a playlist or the queue, or
   right-click to act on them all.
 - Recently played: the last hundred songs, each playable again by itself.
@@ -323,8 +323,23 @@ it is whole).
 **Known, and accepted.**
 
 - Two devices that read the record in the same moment both write, and the second write wins.
-  The first still holds what it wrote and puts it back at its next look (a minute at most).
-  The server has no write that is conditional on what was read.
+  The first still holds what it wrote and puts it back at its next look (a quarter of a
+  minute at most with the window open, a minute hidden in the notification area). The
+  server has no write that is conditional on what was read.
+- A device that isn't playing saves a queue you have just changed there, though another
+  device is playing; for the seconds until that device's next save (it saves as it plays,
+  without looking) the server holds the queue that isn't being played. A third device that
+  looks in those seconds with nothing of its own in its queue picks that one up, and puts it
+  right at its next look. The server's saved queue doesn't say whether its device is playing.
+- A device that is following another's queue (it picked it up, and you haven't touched it)
+  knows the save it picked up by its time, which the server gives to the second. A second
+  save by that device within the same second is not picked up; the one after it is.
+- A queue put back at start-up whose note of where it had got to is missing or is for
+  another queue is treated as your own, whether or not it was one picked up from another
+  device: it is then offered the other device's queue, never replaced by it.
+- Hidden in the notification area the app looks once a minute, counted in quarters of a
+  minute from the last look. Opening the window and hiding it again between two of those
+  can bring the next look round sooner than a minute.
 - If the answer to a write is lost (the app is closed, the connection drops) and, before this
   device next looks, another device deliberately sets the opposite, this device makes its
   change again on top of that.
