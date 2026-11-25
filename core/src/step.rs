@@ -478,6 +478,10 @@ pub enum Held {
     LaterLayout,
     /// The record holds something this version couldn't write back as it found it.
     MoreThanKnown,
+    /// What this device would write is larger than a record that is read (see [`limits`]).
+    TooLarge,
+    /// What this device would write has a time in it outside any that is read.
+    TimeOutOfRange,
 }
 
 impl Held {
@@ -487,6 +491,8 @@ impl Held {
             Held::ClockWrong => "This device's clock is wrong, so its changes aren't being shared.",
             Held::LaterLayout => "The shared record was written by a newer version of the app, so this one reads it and doesn't change it.",
             Held::MoreThanKnown => "The shared record holds more than this version knows, so this one reads it and doesn't change it.",
+            Held::TooLarge => "What this device has to add would make the shared record larger than Nexus Music reads, so it hasn't been written.",
+            Held::TimeOutOfRange => "What this device has to add would put a time in the shared record that is out of range, so it hasn't been written.",
         }
     }
 }
@@ -713,9 +719,21 @@ pub fn settle(device: &Device, answers: &Answers) -> Outcome {
     let record = onto(&merged, &waiting, now);
     let waiting: Vec<u64> = waiting.iter().map(|waits| waits.id).collect();
     let adds = record != theirs && (!comment.is_empty() || says(&record));
-    let write = (adds && held.is_none()).then(|| Write {
+    // What would be written is checked as what is read is checked: a record this device
+    // would refuse at its next read (a time one second past the last allowed, one pin more
+    // than is taken in) is not written, here to be stopped at by every device after.
+    let text = (adds && held.is_none()).then(|| record::write(&record, &unknown));
+    if let Some(text) = &text {
+        held = match unfit(&record) {
+            Some(Stop::TimeOutOfRange) => Some(Held::TimeOutOfRange),
+            Some(_) => Some(Held::TooLarge),
+            None if text.len() > limits::TEXT => Some(Held::TooLarge),
+            None => None,
+        };
+    }
+    let write = text.filter(|_| held.is_none()).map(|text| Write {
         into: playlist.clone(),
-        text: record::write(&record, &unknown),
+        text,
         found: comment.to_string(),
         carried: waiting.clone(),
         agreed: Agreed::of(&record),

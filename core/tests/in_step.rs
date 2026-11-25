@@ -694,6 +694,33 @@ fn a_comment_one_answer_states_as_empty_and_the_other_as_something_is_a_disagree
 }
 
 #[test]
+fn a_record_that_would_not_be_read_back_is_not_written() {
+    let plan = |device: &Dev, server: &Server| match device.decide(&device.read(server)) {
+        Outcome::Go(plan) => *plan,
+        Outcome::Stop(stop) => panic!("stopped: {stop:?}"),
+    };
+    let mut device = Dev::new();
+    device.does(Change::Pin("mine".into()));
+    // The record's pins carry the latest time anything may carry. A pin made here would be
+    // given the second after it: a time the next read, here or anywhere, refuses.
+    let server = Server::with(&text(&Shared { pins_at: limits::TIME, ..pc() }));
+    let held = plan(&device, &server);
+    assert_eq!((held.write, held.held), (None, Some(Held::TimeOutOfRange)));
+    // It is taken in as it is, and the change still waits.
+    assert_eq!(held.take.agreed.pins_at, limits::TIME);
+    assert!(held.take.done.is_empty());
+    // As many pins as are read at all: one more would make a record that is not.
+    let full: Vec<String> = (0..limits::PINS).map(|n| format!("p{n}")).collect();
+    let server = Server::with(&text(&Shared { pins: full, ..pc() }));
+    let held = plan(&device, &server);
+    assert_eq!((held.write, held.held), (None, Some(Held::TooLarge)));
+    // With room for it, it is written, and what is written is read.
+    let server = Server::with(&text(&pc()));
+    let write = plan(&device, &server).write.unwrap();
+    assert!(matches!(record::read(&write.text), Read::Record(_)));
+}
+
+#[test]
 fn the_clock_is_measured_whatever_the_playlist_holds() {
     // An exchange that stops for another reason has still read the server's clock: the
     // queue needs it too.
@@ -762,12 +789,14 @@ fn nothing_the_library_is_given_makes_it_fail() {
     }
     let mut server = Server::with(&format!(r#"{{"nexus_music_sync":1,"junk":"{}"}}"#, "x".repeat(limits::TEXT)));
     assert_eq!(device.clone().exchange(&mut server), Some(Stop::TooLarge));
-    // And a change's time is one more than the latest there can be, at the most.
+    // And a change whose time would be one more than the latest there can be is not written
+    // (see `a_record_that_would_not_be_read_back_is_not_written`).
     let mut server = with(&|r| r.pins_at = limits::TIME);
     let mut last = device.clone();
     last.does(Change::Pin("c".into()));
     assert_eq!(last.exchange(&mut server), None);
-    assert_eq!(server.record("r").pins_at, limits::TIME + 1);
+    assert!(server.writes.is_empty());
+    assert_eq!(server.record("r").pins_at, limits::TIME);
 }
 
 #[test]
