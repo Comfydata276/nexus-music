@@ -274,6 +274,14 @@ impl Peer {
             // a repeat the relay's path made, say) does not stand against it. A refusal is
             // believed once, and never over a success.
             let done = tell.ok == Some(true) || (tell.by == Some(command.nonce) && !tell.busy);
+            // The device says this command made its state and that its work is still under
+            // way there (a queue it took has not sounded yet). Whatever this is the answer
+            // to (a repeat of the command made on the way, refused as busy), it settles
+            // nothing: the command was taken, and its own answer is still to come. What
+            // waits behind it goes on waiting.
+            if !done && tell.busy && tell.by == Some(command.nonce) {
+                return Told::Dropped;
+            }
             let known = command.outcome == Some(Outcome::Done);
             if known || (command.answered && !done) {
                 return Told::Dropped;
@@ -532,9 +540,11 @@ mod tests {
             }
         };
         assert_eq!((outcome, now), (Outcome::Unknown, 1_000 + 4 * WAIT_MS));
-        // And an answer that says "busy" beside the name of the command is no success yet.
+        // And an answer that says "busy" beside the name of the command is no success yet,
+        // and no refusal either: the command is the one under way, and is waited on.
         let mut peer = paused();
-        assert_eq!(peer.told(Tell { ok: Some(false), why: Some(Why::Busy), by: Some(PAUSE), busy: true, ..state(6, PAUSE) }), Told::Settled(Outcome::Refused(Why::Busy)));
+        assert_eq!(peer.told(Tell { ok: Some(false), why: Some(Why::Busy), by: Some(PAUSE), busy: true, ..state(6, PAUSE) }), Told::Dropped);
+        assert!(peer.waiting());
         assert_eq!(peer.told(Tell { ok: Some(true), by: Some(PAUSE), ..state(6, PAUSE) }), Told::Settled(Outcome::Done));
     }
 
@@ -576,6 +586,25 @@ mod tests {
         assert_eq!(peer.told(Tell { ok: Some(false), why: Some(Why::Changed), ..state(7, PAUSE) }), Told::Dropped);
         assert_eq!(peer.told(Tell { ok: Some(true), by: Some(PAUSE), ..state(6, PAUSE) }), Told::Dropped);
         assert_eq!(peer.outcome(), Some(Outcome::Done));
+    }
+
+    /// A queue is sent, taken, and has not sounded yet; the path delivers the same frame
+    /// again, and the device refuses the repeat as busy. That refusal carries the command's
+    /// own name, and says the command is the one under way.
+    #[test]
+    fn a_repeat_refused_while_the_command_itself_is_under_way_settles_nothing() {
+        let mut peer = paused();
+        assert_eq!(peer.told(Tell { ok: Some(false), why: Some(Why::Busy), by: Some(PAUSE), busy: true, ..state(6, PAUSE) }), Told::Dropped);
+        assert_eq!(peer.outcome(), None);
+        // Its own answer then settles it, either way.
+        assert_eq!(peer.told(Tell { ok: Some(true), by: Some(PAUSE), ..state(6, PAUSE) }), Told::Settled(Outcome::Done));
+        let mut peer = paused();
+        assert_eq!(peer.told(Tell { ok: Some(false), why: Some(Why::Busy), by: Some(PAUSE), busy: true, ..state(6, PAUSE) }), Told::Dropped);
+        assert_eq!(peer.told(Tell { ok: Some(false), why: Some(Why::Cannot), ..state(7, PAUSE) }), Told::Settled(Outcome::Refused(Why::Cannot)));
+        // A refusal as busy that does not name the command is the device being busy with
+        // something else: the command was not taken, and that is that.
+        let mut peer = paused();
+        assert_eq!(peer.told(Tell { ok: Some(false), why: Some(Why::Busy), busy: true, ..state(5, PAUSE) }), Told::Settled(Outcome::Refused(Why::Busy)));
     }
 
     /// The double skip, from the sender's side: the only answer to arrive is the refusal of

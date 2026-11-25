@@ -1239,6 +1239,28 @@ fn an_answer_that_is_lost_or_late_is_made_up_for_by_looking() {
     assert_eq!((said(&world), world.copies[A].player.playing, world.copies[B].player.playing), ("Copy B has started, too late for this PC to stop by itself. Both are playing.", true, true));
 }
 
+/// The queue is taken and has not sounded yet, and the path delivers the same frame again.
+/// The other device refuses the repeat (it is busy: with this very command), and that
+/// refusal must not end the move: the first is still under way, and is answered when it
+/// sounds.
+#[test]
+fn a_queue_delivered_twice_while_the_first_is_starting_keeps_its_sender_waiting() {
+    let mut world = giving(|world| world.copies[B].player.stream = false);
+    let again = world.path.last_command.clone().expect("the queue was carried");
+    let told = world.copies[A].said.len();
+    world.deliver(again);
+    assert!(world.last(B, "adopt from").contains("refused, Busy"), "{:?}", world.copies[B].log);
+    world.pass(2_000);
+    // Nothing is said, nothing is given up: A plays on, and waits.
+    assert_eq!((world.copies[A].said.len(), world.copies[A].player.playing, world.copies[B].player.did.clone()), (told, true, vec!["adopt".to_string()]));
+    assert!(world.log(A, "outcome of Give").is_empty(), "{:?}", world.copies[A].log);
+    // B's sound starts: the move completes as if the repeat had never been.
+    world.copies[B].player.stream = true;
+    world.copies[B].player.play(true);
+    world.pass(1_500);
+    assert_eq!((said(&world), world.copies[A].player.playing, world.copies[B].player.playing), ("Playing on Copy B.", false, true));
+}
+
 #[test]
 fn a_device_that_was_touched_meanwhile_is_left_as_it_is() {
     // This one: Next is pressed here while the other's answer is on its way.
