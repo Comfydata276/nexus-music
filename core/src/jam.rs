@@ -122,6 +122,25 @@ pub fn answer(session: Session, owner: bool, guests_steer: bool, action: &str) -
     }
 }
 
+/// What a guest keeps of what the relay passed on about the jam it has joined. **It is
+/// somebody else's JSON**, and the guest's own presses are written into it (the player
+/// shows what was asked for straight away), so its shape is made sure of here, once:
+/// what is not an object is nothing at all; a state that is not an object is no state; and
+/// a queue that is not a list of entries, each an object, is no queue. Whatever it is
+/// handed, what comes back can be read from and written into without stopping the app.
+pub fn heard(mut body: Value) -> Value {
+    let Some(fields) = body.as_object_mut() else { return Value::Null };
+    if fields.get("state").is_some_and(|state| !state.is_object()) {
+        fields.remove("state");
+    }
+    if let Some(state) = fields.get_mut("state").and_then(Value::as_object_mut)
+        && state.get("queue").is_some_and(|queue| !queue.as_array().is_some_and(|entries| entries.iter().all(Value::is_object)))
+    {
+        state.remove("queue");
+    }
+    body
+}
+
 /// The guests a host has removed from the session it is hosting, by the id the relay gave
 /// each. **A guest who has been removed is no longer answered or obeyed**, whatever of
 /// theirs was under way: a song they asked for that was still being looked up when they
@@ -160,6 +179,43 @@ pub fn shows_owner(word: Option<&str>, data: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A guest writes its own presses into the state it was sent. Whatever was sent, that
+    /// must not stop the app: a number where the state should be did, in 0.40.10 and before.
+    #[test]
+    fn whatever_a_guest_is_sent_can_be_read_from_and_written_into() {
+        use serde_json::json;
+        // As a host sends it: kept as it is.
+        let good = json!({"host": "Den PC", "age": 1.5, "state": {"playing": true, "position": 12.0, "queue": [{"id": "s1", "queued": false}]}, "guests": []});
+        assert_eq!(heard(good.clone()), good);
+        // What is not an object is nothing; a state or a queue of the wrong kind is none.
+        for nothing in [json!(7), json!("state"), json!([1, 2]), json!(true), Value::Null] {
+            assert_eq!(heard(nothing), Value::Null);
+        }
+        for state in [json!(7), json!("playing"), json!([{"playing": true}]), json!(false), Value::Null] {
+            assert!(heard(json!({"host": "Den PC", "state": state.clone()}))["state"].is_null(), "{state}");
+        }
+        for queue in [json!(7), json!("s1"), json!({"0": {}}), json!([7, 8]), json!([{"id": "s1"}, "s2"]), Value::Null] {
+            let kept = heard(json!({"state": {"playing": true, "queue": queue.clone()}}));
+            assert_eq!(kept["state"], json!({"playing": true}), "{queue}");
+        }
+        // And every write a guest's press makes goes through, whatever was sent.
+        let sent = [json!(7), json!({"state": 7}), json!({"state": "x"}), json!({"state": {"queue": [7, 8]}}), json!({"state": {"queue": 7}}), json!({"state": {"queue": [{"id": "a"}, {"id": "b"}]}}), json!({}), Value::Null];
+        for sent in sent {
+            let mut kept = heard(sent.clone());
+            let state = &mut kept["state"];
+            state["playing"] = json!(true);
+            state["position"] = json!(3.0);
+            state["volume"] = json!(0.5);
+            if let Some(queue) = state["queue"].as_array_mut().filter(|queue| queue.len() > 1) {
+                let mut moved = queue.remove(1);
+                moved["queued"] = json!(true);
+                queue.insert(0, moved);
+            }
+            kept["age"] = json!(0.0);
+            assert_eq!(kept["state"]["playing"], json!(true), "{sent}");
+        }
+    }
 
     #[test]
     fn a_guest_who_has_been_removed_is_known_as_removed_and_the_list_has_a_bound() {

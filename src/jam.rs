@@ -1355,7 +1355,9 @@ impl Controller {
             if let Some(host) = body["host"].as_str() {
                 joined.host = host.to_string();
             }
-            joined.heard = body;
+            // (Somebody else's JSON, which this PC's own presses are written into: its
+            // shape is made sure of as it is kept.)
+            joined.heard = nexus_core::jam::heard(body);
             joined.heard_at = Instant::now();
             joined.trouble.clear();
         }
