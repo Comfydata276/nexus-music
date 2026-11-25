@@ -24,14 +24,39 @@ pub struct AskedList {
 
 /// A copy for the threads that look for arrivals and draw the Requests page.
 static SHARED: RwLock<Vec<Asked>> = RwLock::new(Vec::new());
+/// The list kept on this computer was there when the app started, but couldn't be read.
+static UNREADABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the list kept on this computer couldn't be read when the app started (see
+/// `AskedList::load`): what was asked for before is not being watched for.
+pub fn unreadable() -> bool {
+    UNREADABLE.load(std::sync::atomic::Ordering::SeqCst)
+}
 
 pub fn shared() -> Vec<Asked> {
     SHARED.read().map(|items| items.clone()).unwrap_or_default()
 }
 
 impl AskedList {
+    /// Reads the list kept at `path`. One that's there but can't be read is moved aside, as
+    /// it was, to a file of its own beside it ("asked.unreadable-<when>.json"), so that
+    /// what's asked for from now on doesn't write over it; and `unreadable` says so.
     pub fn load(path: &Path) -> AskedList {
-        let items: Vec<Asked> = std::fs::read(path).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default();
+        let mut unreadable = false;
+        let items: Vec<Asked> = match std::fs::read(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            read => match read.ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()) {
+                Some(items) => items,
+                None => {
+                    unreadable = true;
+                    let stem = path.file_stem().map(|stem| stem.to_string_lossy().into_owned()).unwrap_or_else(|| "asked".into());
+                    let aside = path.with_file_name(format!("{stem}.unreadable-{}.json", chrono::Utc::now().timestamp()));
+                    let _ = std::fs::rename(path, aside);
+                    Vec::new()
+                }
+            },
+        };
+        UNREADABLE.store(unreadable, std::sync::atomic::Ordering::SeqCst);
         let list = AskedList { path: path.to_path_buf(), items };
         list.share();
         list
@@ -43,18 +68,19 @@ impl AskedList {
         }
     }
 
-    pub fn save(&self) {
-        if let Ok(json) = serde_json::to_vec_pretty(&self.items) {
-            let _ = std::fs::write(&self.path, json);
-        }
+    /// Writes the list down, and shares it. Says whether it was written.
+    pub fn save(&self) -> bool {
+        let written = serde_json::to_vec_pretty(&self.items).is_ok_and(|json| std::fs::write(&self.path, json).is_ok());
         self.share();
+        written
     }
 
     /// Notes something asked for. Asking again for the same album adds to the note that's
-    /// there: more songs for playlists, or the song that's wanted from it.
-    pub fn add(&mut self, asked: Asked) {
+    /// there: more songs for playlists, or the song that's wanted from it. Says whether the
+    /// note was written down: if not, it's kept only until the app closes.
+    pub fn add(&mut self, asked: Asked) -> bool {
         nexus_core::asked::put(&mut self.items, asked);
-        self.save();
+        self.save()
     }
 
     /// Notes several things asked for at once.
@@ -204,4 +230,36 @@ mod tests {
         assert!(list.items.is_empty());
         let _ = std::fs::remove_file(&path);
     }
+
+    #[test]
+    fn a_list_that_cant_be_read_is_said_so_and_kept_as_it_was() {
+        // (Apart from the pins, which read what's shared.)
+        let _apart = crate::pins::apart();
+        // A list on disk that isn't one (cut short, say, by a power cut while it was written).
+        let dir = std::env::temp_dir().join(format!("nexus-asked-unreadable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("asked.json");
+        std::fs::write(&path, b"[{\"album\":\"rg1\",\"title\":\"Cradle").unwrap();
+        let mut list = AskedList::load(&path);
+        assert!(list.items.is_empty() && unreadable());
+        // What was there isn't written over by what's asked for next: it's kept beside it.
+        assert!(list.add(Asked { album: "rg2".into(), title: "Parachutes".into(), artist: "Coldplay".into(), ..Default::default() }));
+        let kept: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|entry| entry.path()).filter(|other| *other != path).collect();
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(std::fs::read(&kept[0]).unwrap(), b"[{\"album\":\"rg1\",\"title\":\"Cradle");
+        assert_eq!(AskedList::load(&path).items.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_note_that_cant_be_written_down_is_said_so() {
+        let _apart = crate::pins::apart();
+        let path = std::env::temp_dir().join(format!("nexus-asked-nowhere-{}", std::process::id())).join("no such folder").join("asked.json");
+        let mut list = AskedList::load(&path);
+        assert!(!list.add(Asked { album: "rg1".into(), title: "Cradlesong".into(), artist: "Rob Thomas".into(), ..Default::default() }));
+        // Still followed up while the app is open.
+        assert_eq!(shared().iter().filter(|asked| asked.album == "rg1" && asked.title == "Cradlesong").count(), 1);
+    }
 }
+

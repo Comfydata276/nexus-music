@@ -790,6 +790,19 @@ pub fn asked_sentence(title: &str) -> String {
     format!("Asked for “{title}”. It'll be in your library once it arrives.")
 }
 
+/// What's said instead when Lidarr has it, but the note of it couldn't be kept on this
+/// `device` ("computer", "phone"): it will still arrive, but nothing will say so.
+pub fn asked_unnoted(title: &str, device: &str) -> String {
+    format!("Asked for “{title}”. It'll be in your library once it arrives, but this {device} couldn't keep a note of it, so the app won't say when it does.")
+}
+
+/// Said on the Requests page when the list of what was asked for on this `device` couldn't be
+/// read: what's on its way still is, as Lidarr says, but what arrives of what was asked for
+/// before won't be said, or put into the playlists waiting for it.
+pub fn asked_unreadable(device: &str) -> String {
+    format!("The list of what was asked for on this {device} couldn't be read, so albums asked for before won't be said to have arrived, or put into the playlists waiting for them. What's on its way is still shown.")
+}
+
 // ---- "Add artist" ------------------------------------------------------------------------------
 
 /// The question before Lidarr is set to keep track of an artist: its heading and text.
@@ -1108,6 +1121,11 @@ mod tests {
         assert_eq!(ask("ost-ep", "Them", "", ""), "Ask for this EP? | “Title” by Them is an EP. It will go on Lidarr's list, and Lidarr will start looking for it. If Lidarr only lists Them's albums so far, it will be set to list their singles, EPs and soundtracks too. None but this one is fetched, though ones they release from now on are treated as their new albums are.");
         assert_eq!(asking_for("Title"), "Asking for “Title”…");
         assert_eq!(asked_sentence("Title"), "Asked for “Title”. It'll be in your library once it arrives.");
+        assert_eq!(asked_unnoted("Title", "computer"), "Asked for “Title”. It'll be in your library once it arrives, but this computer couldn't keep a note of it, so the app won't say when it does.");
+        assert_eq!(
+            asked_unreadable("phone"),
+            "The list of what was asked for on this phone couldn't be read, so albums asked for before won't be said to have arrived, or put into the playlists waiting for them. What's on its way is still shown."
+        );
         let note = asked_for("lidarr-ep", "Title", "Them", "A Song", 50);
         assert_eq!((note.album.as_str(), note.title.as_str(), note.artist.as_str(), note.song.as_str(), note.at, note.arrived), ("lidarr-ep", "Title", "Them", "A Song", 50, 0));
     }

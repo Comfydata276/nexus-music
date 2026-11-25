@@ -635,7 +635,12 @@ fn requests() -> PageData {
     };
     // A batch of albums being asked for (see `bulk`): how it stands, and what it couldn't ask for.
     let (notice, action, other) = crate::bulk::summary().notice();
-    page.notice = notice;
+    // The list of what was asked for couldn't be read when the app started: said first.
+    page.notice = match (crate::asked::unreadable(), notice.is_empty()) {
+        (true, true) => nexus_core::requests::asked_unreadable("computer"),
+        (true, false) => format!("{} {notice}", nexus_core::requests::asked_unreadable("computer")),
+        (false, _) => notice,
+    };
     page.notice_action = action.to_string();
     page.notice_other = other.to_string();
     let missed = crate::bulk::missed();
