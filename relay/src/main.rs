@@ -58,5 +58,18 @@ fn main() {
     if !config.old_link {
         println!("Devices that link the old way are turned away.");
     }
-    relay::serve(Arc::new(Relay::new(config)), server, 8);
+    let relay = Arc::new(Relay::new(config));
+    // The route a person's devices link through is served apart from everything else, at
+    // an address of its own, so that nothing done to it can slow a jam. The proxy in front
+    // sends `/api/link/` there.
+    if let Some(address) = setting("JAM_LINK_LISTEN") {
+        match relay::link::listen(relay.clone(), &address) {
+            Ok(at) => println!("Devices link through {at}: have the proxy in front send /api/link/ there."),
+            Err(why) => {
+                eprintln!("Couldn't listen on {address} for devices to link through: {why}");
+                std::process::exit(1);
+            }
+        }
+    }
+    relay::serve(relay, server, 8);
 }

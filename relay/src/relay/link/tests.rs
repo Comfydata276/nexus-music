@@ -14,16 +14,24 @@ const ROOM: &str = "gmpsssbzsbysp73rfdjtchkolqpwl2uvsjde7s2hiioejtponbaq";
 const PC: &str = "caireeyuculbogazdinryhi6d4";
 const PHONE: &str = "6dy7f47u6x3pp6hz7l57z7p674";
 
-/// A relay on a port of its own, with short waits; and the relay itself, to count what it holds.
+/// A relay with short waits: where its route for devices listens, and the relay itself,
+/// to count what it holds.
 fn relay(change: impl FnOnce(&mut Config)) -> (SocketAddr, Arc<Relay>) {
+    let (to, _, relay) = relay_with_jams(change);
+    (to, relay)
+}
+
+/// The same, and where its jams are served: a different port, and different threads.
+fn relay_with_jams(change: impl FnOnce(&mut Config)) -> (SocketAddr, SocketAddr, Arc<Relay>) {
     let mut config = Config::new(KEY.to_string());
     config.hold = Duration::from_millis(400);
     change(&mut config);
     let server = Arc::new(Server::http("127.0.0.1:0").unwrap());
-    let address = server.server_addr().to_ip().unwrap();
+    let jams = server.server_addr().to_ip().unwrap();
     let relay = Arc::new(Relay::new(config));
     start(relay.clone(), server, 4);
-    (address, relay)
+    let to = listen(relay.clone(), "127.0.0.1:0").unwrap();
+    (to, jams, relay)
 }
 
 /// One request, as HTTP/1.0 so the answer ends when the connection does. `headers` are
@@ -41,8 +49,10 @@ fn raw(to: SocketAddr, method: &str, path: &str, headers: &[(&str, &str)], body:
     stream.write_all(head.as_bytes()).unwrap();
     stream.write_all(body).unwrap();
     let mut answer = Vec::new();
-    stream.read_to_end(&mut answer).unwrap();
-    let split = answer.windows(4).position(|window| window == b"\r\n\r\n").unwrap();
+    // (A relay with no room for one more connection closes it as it arrives, and its few
+    // words may or may not get through first: that is read as the 503 it is.)
+    let whole = stream.read_to_end(&mut answer).is_ok();
+    let Some(split) = answer.windows(4).position(|window| window == b"\r\n\r\n").filter(|_| whole) else { return (503, String::new(), Vec::new()) };
     let status = std::str::from_utf8(&answer[9..12]).unwrap().parse().unwrap();
     (status, String::from_utf8_lossy(&answer[..split]).to_string(), answer[split + 4..].to_vec())
 }
@@ -144,7 +154,8 @@ fn a_place_coming_or_going_wakes_the_others() {
     // One that just stops asking is given up after a while, and the room with it.
     std::thread::sleep(Duration::from_millis(1300));
     assert_eq!(poll(to, ROOM, &pc, 0, 0).0, 404);
-    assert_eq!(relay.link.totals(), Totals::default());
+    // (The connection just answered may still be being let go of.)
+    assert_eq!(Totals { open: 0, ..relay.link.totals() }, Totals::default());
 }
 
 #[test]
@@ -366,16 +377,20 @@ fn only_the_named_proxy_says_who_is_calling() {
 
 #[test]
 fn nothing_of_a_jam_reaches_a_mailbox() {
-    let (to, relay) = relay(|_| {});
+    let (to, jams, relay) = relay_with_jams(|_| {});
     let (pc, phone) = (enter(to, ROOM, PC), enter(to, ROOM, PHONE));
     assert_eq!(send(to, ROOM, &pc, PHONE, "c2VhbGVk"), 200);
-    let before = relay.link.totals();
-    // A jam, its host's secret, and a guest in it.
+    let held = |relay: &Relay| {
+        let totals = relay.link.totals();
+        (totals.rooms, totals.places, totals.frames, totals.bytes)
+    };
+    let before = held(&relay);
+    // A jam, its host's secret, and a guest in it: on the jams' own port.
     let jam_call = |method: &str, path: &str, bearer: &str, body: Value| {
         let sent = if body.is_null() { Vec::new() } else { body.to_string().into_bytes() };
         let bearer = format!("Bearer {bearer}");
         let headers: &[(&str, &str)] = if bearer.len() > 7 { &[("Authorization", bearer.as_str())] } else { &[] };
-        let (status, _, bytes) = raw(to, method, path, headers, &sent, Some(sent.len()));
+        let (status, _, bytes) = raw(jams, method, path, headers, &sent, Some(sent.len()));
         (status, serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null))
     };
     let (_, made) = jam_call("POST", "/api/host/start", KEY, json!({"name": "Jez"}));
@@ -399,6 +414,18 @@ fn nothing_of_a_jam_reaches_a_mailbox() {
         let headers: Vec<(&str, &str)> = headers.iter().map(|(name, value)| (*name, value.as_str())).collect();
         assert_eq!(raw(to, "GET", &format!("/api/link/{ROOM}/poll?v=0&after=0"), &headers, b"", Some(0)).0, 401, "{bearer}");
     }
+    // The route is not there at all where jams are served, with any key or token; and where
+    // the route is served there is no jam, no page, and nothing else.
+    for (method, verb) in [("POST", "enter"), ("GET", "poll"), ("POST", "send"), ("POST", "leave")] {
+        let key = format!("Bearer {KEY}");
+        assert_eq!(raw(jams, method, &format!("/api/link/{ROOM}/{verb}"), &[("Authorization", &key), ("X-Nexus-Link", &pc)], b"{}", Some(2)).0, 404, "{verb}");
+    }
+    for path in ["/".to_string(), "/api/hello".to_string(), "/healthz".to_string(), format!("/api/jam/{jam}"), format!("/j/{jam}"), format!("/api/jam/{jam}/state?v=0"), format!("/api/host/{jam}/poll"), format!("/api/link/{ROOM}"), format!("/api/link/{ROOM}/poll/extra")] {
+        for bearer in [KEY, guest.as_str(), secret.as_str()] {
+            assert_eq!(raw(to, "GET", &path, &[("Authorization", &format!("Bearer {bearer}"))], b"", Some(0)).0, 404, "{path}");
+        }
+    }
+    assert_eq!(raw(to, "POST", "/api/host/start", &[("Authorization", &format!("Bearer {KEY}"))], b"{}", Some(2)).0, 404);
     // A room's name and a place's token get nothing from the paths a guest or a host uses.
     for path in [format!("/api/jam/{ROOM}"), format!("/api/jam/{ROOM}/state"), format!("/api/jam/{ROOM}/cover/300/al-1"), format!("/api/jam/{PC}")] {
         assert_eq!(jam_call("GET", &path, &pc, Value::Null).0, 404, "{path}");
@@ -412,59 +439,249 @@ fn nothing_of_a_jam_reaches_a_mailbox() {
     let (_, state) = jam_call("GET", &format!("/api/jam/{jam}/state?v=0"), &guest, Value::Null);
     assert!(!state.to_string().contains(PC) && !state.to_string().contains("c2VhbGVk"));
     // After all of it the mailbox is as it was, and its owner collects the frame.
-    assert_eq!(relay.link.totals(), before);
+    assert_eq!(held(&relay), before);
     assert_eq!(poll(to, ROOM, &phone, 0, 0).1["frames"], json!([{"seq": 1, "from": PC, "frame": "c2VhbGVk"}]));
 }
 
 #[test]
-fn hello_says_the_route_is_here_and_old_linking_can_be_refused() {
+fn hello_offers_the_route_only_when_it_is_served_and_old_linking_can_be_refused() {
     let old = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    let (to, _) = relay(|_| {});
-    assert_eq!(call(to, "GET", "/api/hello", "", Value::Null).1["link"], 4);
-    assert_eq!(call(to, "POST", &format!("/api/room/{old}/enter"), "", json!({"id": "pc"})).0, 200);
-    let (to, _) = relay(|config| config.old_link = false);
-    assert_eq!(call(to, "GET", "/api/hello", "", Value::Null).1["host"], true);
+    let jam_call = |jams: SocketAddr, method: &str, path: &str, body: Value| call(jams, method, path, "", body);
+    // A relay that serves only jams says nothing of the route.
+    let server = Arc::new(Server::http("127.0.0.1:0").unwrap());
+    let alone = server.server_addr().to_ip().unwrap();
+    start(Arc::new(Relay::new(Config::new(KEY.to_string()))), server, 2);
+    let (_, hello) = jam_call(alone, "GET", "/api/hello", Value::Null);
+    assert_eq!((&hello["nexus_jam"], &hello["host"], &hello["link"]), (&json!(1), &json!(true), &Value::Null));
+    // One that serves it says so, and old linking still works beside it.
+    let (to, jams, _) = relay_with_jams(|_| {});
+    assert_eq!(jam_call(jams, "GET", "/api/hello", Value::Null).1["link"], 4);
+    assert_eq!(jam_call(jams, "POST", &format!("/api/room/{old}/enter"), json!({"id": "pc"})).0, 200);
+    enter(to, ROOM, PC);
+    let (to, jams, _) = relay_with_jams(|config| config.old_link = false);
+    assert_eq!(jam_call(jams, "GET", "/api/hello", Value::Null).1["host"], true);
     for (method, verb) in [("POST", "enter"), ("GET", "poll"), ("POST", "leave")] {
-        assert_eq!(call(to, method, &format!("/api/room/{old}/{verb}"), "", json!({"id": "pc"})).0, 410, "{verb}");
+        assert_eq!(jam_call(jams, method, &format!("/api/room/{old}/{verb}"), json!({"id": "pc"})).0, 410, "{verb}");
     }
     // Jams and the new route are as they were.
-    assert_eq!(call(to, "POST", "/api/host/start", "", json!({"name": "Jez"})).0, 200);
+    assert_eq!(jam_call(jams, "POST", "/api/host/start", json!({"name": "Jez"})).0, 200);
     enter(to, ROOM, PC);
 }
 
+/// A request is refused before any of its body is read if the body is not one the route
+/// will take, and the connection is closed, not read to its end.
 #[test]
-fn a_stalled_body_holds_one_of_the_route_s_own_threads_and_no_jam() {
+fn a_body_the_route_will_not_take_is_never_read() {
+    let (to, relay) = relay(|config| config.link.body_wait = Duration::from_secs(30));
+    let pc = enter(to, ROOM, PC);
+    let key = format!("Bearer {KEY}");
+    // A sender that says far more is coming than a `send` may be, and sends none of it,
+    // is answered at once and let go of: nobody waits for what it promised.
+    for (verb, promised) in [("send", 288 * 1024 + 1), ("send", usize::MAX), ("enter", 8 * 1024 + 1), ("leave", 1 << 30)] {
+        let began = Instant::now();
+        let mut stream = TcpStream::connect(to).unwrap();
+        stream.write_all(format!("POST /api/link/{ROOM}/{verb} HTTP/1.1\r\nHost: relay\r\nContent-Length: {promised}\r\nAuthorization: {key}\r\nX-Nexus-Link: {pc}\r\n\r\n").as_bytes()).unwrap();
+        let mut answer = Vec::new();
+        stream.read_to_end(&mut answer).unwrap();
+        assert!(answer.starts_with(b"HTTP/1.1 413 "), "{verb}: {}", String::from_utf8_lossy(&answer));
+        assert!(began.elapsed() < Duration::from_secs(2), "{verb}");
+    }
+    // The same for one that doesn't say how long it is, in either of the ways there are.
+    let unsaid = format!("POST /api/link/{ROOM}/send HTTP/1.1\r\nHost: relay\r\nAuthorization: {key}\r\nX-Nexus-Link: {pc}\r\n");
+    for head in [format!("{unsaid}\r\n"), format!("{unsaid}Transfer-Encoding: chunked\r\n\r\n5\r\nhello")] {
+        let mut stream = TcpStream::connect(to).unwrap();
+        stream.write_all(head.as_bytes()).unwrap();
+        let mut answer = Vec::new();
+        stream.read_to_end(&mut answer).unwrap();
+        assert!(answer.starts_with(b"HTTP/1.1 411 "), "{}", String::from_utf8_lossy(&answer));
+    }
+    // And for one without the host key, or without a place: nothing it sends is waited for.
+    for (bearer, token) in [("Bearer not-the-host-key-at-all", pc.as_str()), (key.as_str(), "no-such-token")] {
+        let began = Instant::now();
+        let mut stream = TcpStream::connect(to).unwrap();
+        stream.write_all(format!("POST /api/link/{ROOM}/send HTTP/1.1\r\nHost: relay\r\nContent-Length: 4000\r\nAuthorization: {bearer}\r\nX-Nexus-Link: {token}\r\n\r\n").as_bytes()).unwrap();
+        let mut answer = Vec::new();
+        stream.read_to_end(&mut answer).unwrap();
+        assert!(answer.starts_with(b"HTTP/1.1 401 ") || answer.starts_with(b"HTTP/1.1 404 "));
+        assert!(began.elapsed() < Duration::from_secs(2));
+    }
+    // A head that never ends is cut off at its size, and one that isn't a request at all
+    // is simply closed.
+    let mut stream = TcpStream::connect(to).unwrap();
+    let _ = stream.write_all(format!("GET /api/link/{ROOM}/poll HTTP/1.1\r\nX-Pad: {}\r\n", "a".repeat(9000)).as_bytes());
+    let mut answer = Vec::new();
+    let _ = stream.read_to_end(&mut answer);
+    assert!(answer.starts_with(b"HTTP/1.1 431 "), "{}", String::from_utf8_lossy(&answer));
+    let mut stream = TcpStream::connect(to).unwrap();
+    stream.write_all(&[0xff, 0xfe, b'\r', b'\n', b'\r', b'\n']).unwrap();
+    let mut answer = Vec::new();
+    let _ = stream.read_to_end(&mut answer);
+    assert!(answer.is_empty());
+    // Each was let go of within a moment of being answered.
+    let began = Instant::now();
+    while relay.link.totals().open > 0 && began.elapsed() < Duration::from_secs(2) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(relay.link.totals().open, 0);
+}
+
+/// Reading has a deadline, a head's and a body's, and the route is closed to more than it
+/// can hold: so however it is leant on, it comes back, and it never grows.
+#[test]
+fn a_stalled_head_or_body_is_given_up_and_too_many_connections_are_closed_unread() {
+    let (to, relay) = relay(|config| {
+        config.link.threads = 2;
+        config.link.queue = 4;
+        config.link.connections = 12;
+        config.link.head_wait = Duration::from_millis(500);
+        config.link.body_wait = Duration::from_millis(500);
+        config.hold = Duration::from_secs(4);
+    });
+    // Six devices, each waiting for something to be put in its mailbox.
+    let tokens: Vec<String> = (0..6).map(|n| enter(to, ROOM, &place_named(n))).collect();
+    let pc = enter(to, ROOM, PC);
+    let version = poll(to, ROOM, &pc, 0, 0).1["v"].as_u64().unwrap();
+    let waiting: Vec<_> = tokens.into_iter().map(|token| std::thread::spawn(move || poll(to, ROOM, &token, version, 0))).collect();
+    std::thread::sleep(Duration::from_millis(150));
+    assert_eq!((relay.link.totals().held, relay.link.totals().open), (6, 6));
+    // Two senders that promise a body and stall: both of the route's threads are waiting.
+    // Four more that say nothing at all wait for a thread.
+    let stalled = format!("POST /api/link/{ROOM}/send HTTP/1.1\r\nHost: relay\r\nContent-Length: 4000\r\nAuthorization: Bearer {KEY}\r\nX-Nexus-Link: {pc}\r\n\r\n{{\"to\":");
+    let mut held: Vec<TcpStream> = (0..2).map(|_| {
+        let mut stream = TcpStream::connect(to).unwrap();
+        stream.write_all(stalled.as_bytes()).unwrap();
+        stream
+    }).collect();
+    std::thread::sleep(Duration::from_millis(100));
+    held.extend((0..4).map(|_| TcpStream::connect(to).unwrap()));
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!((relay.link.totals().open, relay.link.totals().waiting), (12, 4));
+    // That is as many connections as the route takes: one more is closed as it arrives,
+    // with nothing read from it and nothing said to it.
+    let began = Instant::now();
+    let mut closed = TcpStream::connect(to).unwrap();
+    let _ = closed.write_all(stalled.as_bytes());
+    let mut answer = Vec::new();
+    let _ = closed.read_to_end(&mut answer);
+    assert!(answer.is_empty() && began.elapsed() < Duration::from_millis(300), "{}", String::from_utf8_lossy(&answer));
+    assert_eq!(relay.link.totals().open, 12);
+    // Every one of the twelve is given up at its deadline or answered, whether or not its
+    // sender ever lets go, and the route is back: only the waiting devices are left, nothing
+    // waits for a thread, and a device is served.
+    let began = Instant::now();
+    while relay.link.totals().open > 6 && began.elapsed() < Duration::from_secs(8) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let after = relay.link.totals();
+    assert_eq!((after.open, after.waiting, after.held, after.frames), (6, 0, 6, 0));
+    assert!(began.elapsed() < Duration::from_secs(4), "{:?}", began.elapsed());
+    for stream in &mut held {
+        let mut answer = Vec::new();
+        let _ = stream.read_to_end(&mut answer);
+        assert!(answer.is_empty(), "{}", String::from_utf8_lossy(&answer));
+    }
+    assert_eq!(send(to, ROOM, &pc, &place_named(0), "eA"), 200);
+    for device in waiting {
+        assert_eq!(device.join().unwrap().0, 200);
+    }
+}
+
+/// With the queue for a thread full, a connection is told the relay is busy as it arrives,
+/// and nothing of it is read.
+#[test]
+fn with_every_thread_busy_and_the_queue_full_the_next_is_turned_away_unread() {
     let (to, relay) = relay(|config| {
         config.link.threads = 1;
-        config.link.queue = 1;
-        config.hold = Duration::from_secs(5);
+        config.link.queue = 2;
+        config.link.head_wait = Duration::from_millis(800);
     });
-    let pc = enter(to, ROOM, PC);
-    // A sender that says 4,000 bytes are coming and sends none: the route's one thread waits.
-    // (A body under a kilobyte is read by the HTTP library before the request is handed
-    // over, on the connection's own thread.)
-    let mut stalled = TcpStream::connect(to).unwrap();
-    stalled.write_all(format!("POST /api/link/{ROOM}/send HTTP/1.0\r\nHost: relay\r\nContent-Length: 4000\r\nAuthorization: Bearer {KEY}\r\nX-Nexus-Link: {pc}\r\n\r\n").as_bytes()).unwrap();
-    std::thread::sleep(Duration::from_millis(200));
-    // One more request waits for the thread; the next is turned away at once.
-    let (room, token) = (ROOM.to_string(), pc.clone());
-    let queued = std::thread::spawn(move || poll(to, &room, &token, 0, 0));
-    std::thread::sleep(Duration::from_millis(200));
-    assert_eq!(relay.link.totals().waiting, 1);
+    let mut held: Vec<TcpStream> = vec![TcpStream::connect(to).unwrap()];
+    std::thread::sleep(Duration::from_millis(100));
+    held.extend((0..2).map(|_| TcpStream::connect(to).unwrap()));
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!((relay.link.totals().open, relay.link.totals().waiting), (3, 2));
     let began = Instant::now();
-    assert_eq!(poll(to, ROOM, &pc, 0, 0).0, 503);
-    // Jams are answered meanwhile as if nothing were happening.
-    assert_eq!(call(to, "POST", "/api/host/start", "", json!({"name": "Jez"})).0, 200);
-    assert_eq!(call(to, "GET", "/api/hello", "", Value::Null).0, 200);
-    assert!(began.elapsed() < Duration::from_millis(500));
-    // When the sender gives up, the thread is free again and the waiting request is answered.
-    drop(stalled);
-    assert_eq!(queued.join().unwrap().0, 200);
-    assert_eq!(relay.link.totals().waiting, 0);
+    let mut over = TcpStream::connect(to).unwrap();
+    let mut answer = Vec::new();
+    let _ = over.read_to_end(&mut answer);
+    assert!(answer.starts_with(b"HTTP/1.1 503 "), "{}", String::from_utf8_lossy(&answer));
+    assert!(began.elapsed() < Duration::from_millis(300));
+    assert_eq!(relay.link.totals().open, 3);
+}
+
+/// The reviewer's case, and its neighbours: the route leant on every way there is, while a
+/// jam is hosted, joined, steered and polled through the same relay. No answer to the jam
+/// is slowed, because nothing of the route runs where jams are served.
+#[test]
+fn the_route_saturated_costs_a_jam_nothing() {
+    let (to, jams, relay) = relay_with_jams(|config| {
+        config.link.head_wait = Duration::from_secs(20);
+        config.link.body_wait = Duration::from_secs(20);
+        config.link.write_wait = Duration::from_secs(20);
+        config.link.sends = (1000.0, 1000.0);
+        config.link.sends_per_address = 10000.0;
+    });
+    let (pc, phone) = (enter(to, ROOM, PC), enter(to, ROOM, PHONE));
+    let key = format!("Bearer {KEY}");
+    // Every thread of the route waiting on a body that is not coming; its queue full of
+    // more of the same; connections past that turned away; and a device that asked for a
+    // great deal and reads none of it.
+    let stalled = format!("POST /api/link/{ROOM}/send HTTP/1.1\r\nHost: relay\r\nContent-Length: 290000\r\nAuthorization: {key}\r\nX-Nexus-Link: {pc}\r\n\r\n{{\"to\":");
+    let leaning: Vec<TcpStream> = (0..200).filter_map(|_| {
+        let mut stream = TcpStream::connect(to).ok()?;
+        let _ = stream.write_all(stalled.as_bytes());
+        Some(stream)
+    }).collect();
+    std::thread::sleep(Duration::from_millis(300));
+    let totals = relay.link.totals();
+    assert_eq!((totals.waiting, totals.open), (64, 70), "six being read, sixty-four waiting, the rest told the relay is busy");
+    // A jam, meanwhile: started, joined, shown, asked of, answered, and watched.
+    let timed = |method: &str, path: &str, bearer: &str, body: Value| {
+        let began = Instant::now();
+        let sent = if body.is_null() { Vec::new() } else { body.to_string().into_bytes() };
+        let bearer = format!("Bearer {bearer}");
+        let headers: &[(&str, &str)] = if bearer.len() > 7 { &[("Authorization", bearer.as_str())] } else { &[] };
+        let (status, _, bytes) = raw(jams, method, path, headers, &sent, Some(sent.len()));
+        assert_eq!(status, 200, "{method} {path}: {}", String::from_utf8_lossy(&bytes));
+        assert!(began.elapsed() < Duration::from_millis(250), "{method} {path} took {:?}", began.elapsed());
+        serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null)
+    };
+    for _ in 0..3 {
+        let made = timed("POST", "/api/host/start", KEY, json!({"name": "Jez", "public": true}));
+        let (jam, secret) = (made["jam"].as_str().unwrap().to_string(), made["secret"].as_str().unwrap().to_string());
+        timed("POST", &format!("/api/host/{jam}/state"), &secret, json!({"state": {"playing": true, "queue": []}}));
+        timed("GET", &format!("/api/jam/{jam}"), "", Value::Null);
+        let guest = timed("POST", &format!("/api/jam/{jam}/join"), "", json!({"name": "Guest"}))["token"].as_str().unwrap().to_string();
+        timed("GET", &format!("/api/jam/{jam}/state?v=0"), &guest, Value::Null);
+        // The guest steers; the host collects the question and answers it.
+        let asking = {
+            let (jam, guest) = (jam.clone(), guest.clone());
+            std::thread::spawn(move || call_as(jams, "POST", &format!("/api/jam/{jam}/ask"), &guest, json!({"action": "pause", "data": {}})))
+        };
+        std::thread::sleep(Duration::from_millis(150));
+        let asked = timed("GET", &format!("/api/host/{jam}/poll?after=0"), &secret, Value::Null);
+        let ask = asked["events"].as_array().unwrap().iter().find(|event| event["kind"] == "ask").unwrap()["id"].as_u64().unwrap();
+        timed("POST", &format!("/api/host/{jam}/reply"), &secret, json!({"id": ask, "ok": true, "data": {}}));
+        assert_eq!(asking.join().unwrap().0, 200);
+        timed("GET", "/api/hello", KEY, Value::Null);
+        timed("POST", &format!("/api/host/{jam}/end"), &secret, json!({}));
+    }
+    // The devices themselves are another matter: the route is full, and says so.
+    assert_eq!(poll(to, ROOM, &phone, 0, 0).0, 503);
+    drop(leaning);
+}
+
+/// A call as a jam's guest or host makes it: the bearer is theirs, not the host key.
+fn call_as(to: SocketAddr, method: &str, path: &str, bearer: &str, body: Value) -> (u16, Value) {
+    let sent = if body.is_null() { Vec::new() } else { body.to_string().into_bytes() };
+    let bearer = format!("Bearer {bearer}");
+    let (status, _, bytes) = raw(to, method, path, &[("Authorization", &bearer)], &sent, Some(sent.len()));
+    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
 }
 
 /// The whole of what the route can hold, at its shipped limits: every room, every place,
-/// every room full, every place polling.
+/// every room full, every place polling. And what it is writing at once, counted as what
+/// is written: every byte of every reply.
 #[test]
 fn the_totals_under_load() {
     let (to, relay) = relay(|config| {
@@ -502,7 +719,8 @@ fn the_totals_under_load() {
     let stored = relay.link.totals();
     assert_eq!((stored.rooms, stored.places, stored.frames, stored.bytes), (20, 320, 160, 40 * 1024 * 1024));
     // Every place asks at once. What is being written is never more than its allowance,
-    // and every frame still arrives.
+    // every frame still arrives, and what was counted is what was sent: the bytes the
+    // route says it wrote are the bytes the callers received, heads and all.
     let watching = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let most = {
         let (relay, watching) = (relay.clone(), watching.clone());
@@ -510,20 +728,39 @@ fn the_totals_under_load() {
             let mut most = 0;
             while watching.load(Ordering::SeqCst) {
                 most = most.max(relay.link.totals().writing);
-                std::thread::sleep(Duration::from_millis(2));
+                std::thread::sleep(Duration::from_millis(1));
             }
             most
         })
     };
-    let got: usize = std::thread::scope(|scope| {
-        let asking: Vec<_> = rooms.iter().zip(&filled).flat_map(|(room, tokens)| tokens.iter().map(move |token| (room, token))).map(|(room, token)| scope.spawn(move || patient_poll(to, room, token, 0, 0)["frames"].as_array().map_or(0, |frames| frames.len()))).collect();
-        asking.into_iter().map(|thread| thread.join().unwrap()).sum()
+    let wrote_before = relay.link.written.load(Ordering::SeqCst);
+    let key = format!("Bearer {KEY}");
+    let (got, received): (usize, usize) = std::thread::scope(|scope| {
+        let asking: Vec<_> = rooms.iter().zip(&filled).flat_map(|(room, tokens)| tokens.iter().map(move |token| (room, token))).map(|(room, token)| {
+            let key = &key;
+            scope.spawn(move || loop {
+                // (Told the relay is busy, a device asks again, as the app does. Those few
+                // bytes are written as the connection arrives and are not part of the count.)
+                let (status, head, body) = raw(to, "GET", &format!("/api/link/{room}/poll?v=0&after=0"), &[("Authorization", key), ("X-Nexus-Link", token)], b"", Some(0));
+                if status == 503 {
+                    std::thread::sleep(Duration::from_millis(40));
+                    continue;
+                }
+                assert_eq!(status, 200);
+                let frames = serde_json::from_slice::<Value>(&body).unwrap()["frames"].as_array().map_or(0, |frames| frames.len());
+                break (frames, head.len() + 4 + body.len());
+            })
+        }).collect();
+        asking.into_iter().map(|thread| thread.join().unwrap()).fold((0, 0), |sum, one| (sum.0 + one.0, sum.1 + one.1))
     });
     watching.store(false, Ordering::SeqCst);
     let most = most.join().unwrap();
     assert_eq!(got, 160);
-    assert!(most <= limits.writing, "{most}");
-    assert!(most > 0);
+    assert_eq!(relay.link.written.load(Ordering::SeqCst) - wrote_before, received);
+    assert!(received > 160 * 256 * 1024 + 320 * 150, "{received}");
+    // (On one machine an answer is written as fast as it is made, so the allowance is
+    // seldom near full here. That it refuses what does not fit is tested by itself, below.)
+    assert!(most > 0 && most <= limits.writing, "{most}");
     assert_eq!(relay.link.totals().writing, 0);
     // Dealt with, they are gone; and then every place waits, and that is as many as wait.
     std::thread::scope(|scope| {
@@ -542,6 +779,27 @@ fn the_totals_under_load() {
         let held = relay.link.totals();
         assert_eq!((held.held, held.frames, held.bytes, held.writing), (320, 0, 0, 0));
     });
+}
+
+/// What an answer to a poll is charged is its length, to the byte: measured before a
+/// single frame is copied.
+#[test]
+fn a_poll_s_answer_is_measured_before_it_is_built() {
+    let link = Link::default();
+    let limits = Limits::default();
+    let frames = [Frame { seq: 7, from: PC.to_string(), frame: "A".repeat(1000) }, Frame { seq: 12345, from: PHONE.to_string(), frame: "eA".to_string() }];
+    let chosen: Vec<&Frame> = frames.iter().collect();
+    for (places, frames, more, replaced) in [(vec![], vec![], false, false), (vec![PC, PHONE], chosen.clone(), true, false), (vec![PC], chosen[..1].to_vec(), false, true)] {
+        let before = link.writing.load(Ordering::SeqCst);
+        let bytes = link.admit_poll(41, &places, &frames, more, replaced, &limits).unwrap();
+        assert_eq!(link.writing.load(Ordering::SeqCst) - before, bytes.len());
+        let split = bytes.windows(4).position(|window| window == b"\r\n\r\n").unwrap();
+        let (head, body) = (String::from_utf8_lossy(&bytes[..split]).to_string(), &bytes[split + 4..]);
+        assert!(head.contains(&format!("Content-Length: {}", body.len())) && head.contains("Connection: close") && head.contains("Cache-Control: no-store"));
+        let read: Value = serde_json::from_slice(body).unwrap();
+        assert_eq!((read["v"].as_u64(), read["places"].as_array().map(Vec::len), read["frames"].as_array().map(Vec::len), read["more"].as_bool(), read.get("replaced").is_some()), (Some(41), Some(places.len()), Some(frames.len()), Some(more), replaced));
+    }
+    assert_eq!(link.admit_poll(1, &[PC], &chosen, false, false, &Limits { writing: 1000, ..Limits::default() }).map(|bytes| bytes.len()), None);
 }
 
 /// A connection that stops reading is given up on, not waited for. (The deadline is the

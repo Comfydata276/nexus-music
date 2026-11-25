@@ -213,6 +213,7 @@ it can start jams.
 | `JAM_MAX_JAMS` | How many sessions may be open at once; 20 unless set. Each linked device holds one, whether or not it's a jam. |
 | `JAM_TRUSTED_PROXY` | The one address your reverse proxy connects from. Set it and callers are counted by the address the proxy saw; leave it unset and they are counted by the connection's own, which behind a proxy is the proxy's for everybody. |
 | `JAM_OLD_LINK` | `off` turns away devices that find each other the way versions up to 0.40.6 do. On unless set. |
+| `JAM_LINK_LISTEN` | Where the relay serves the route a person's own devices will link through (not used by any released version yet), e.g. `0.0.0.0:8081`. Off unless set. It is a second port on purpose, with its own threads, so that nothing done to it can slow a jam: publish it too, and have the proxy send `/api/link/` there and everything else to the first. |
 
 Put it behind the reverse proxy you already use, on an address of its own (or under a path),
 with HTTPS. Three things matter there:

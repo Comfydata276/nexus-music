@@ -445,7 +445,8 @@ pub struct Relay {
     jams: Mutex<HashMap<String, Jam>>,
     rooms: Mutex<HashMap<String, Room>>,
     limits: Mutex<Limits>,
-    /// Where a person's devices pass each other sealed frames. Nothing above reaches it.
+    /// Where a person's devices pass each other sealed frames. Nothing above reaches it,
+    /// and it is served by a listener and threads of its own.
     link: link::Link,
 }
 
@@ -487,7 +488,6 @@ pub fn listen(address: &str, deadline: Duration) -> Result<Server, Box<dyn std::
 
 /// Starts answering requests and comes back; the work goes on in other threads.
 pub fn start(relay: Arc<Relay>, server: Arc<Server>, workers: usize) {
-    link::start(relay.clone());
     for index in 0..workers.max(1) {
         let (relay, server) = (relay.clone(), server.clone());
         let _ = std::thread::Builder::new().name(format!("worker-{index}")).spawn(move || {
@@ -663,10 +663,6 @@ fn handle(relay: &Relay, request: Request) {
         (Method::Post, ["api", "host", jam, "cover"]) => host_cover(relay, request, jam, query, &mut out),
         (Method::Post, ["api", "host", jam, "remove"]) => host_remove(relay, request, jam, &mut out),
         (Method::Post, ["api", "host", jam, "end"]) => host_end(relay, request, jam, &mut out),
-        (Method::Post, ["api", "link", room, "enter"]) => link::take(relay, request, link::Call::Enter, room, query),
-        (Method::Get, ["api", "link", room, "poll"]) => link::take(relay, request, link::Call::Poll, room, query),
-        (Method::Post, ["api", "link", room, "send"]) => link::take(relay, request, link::Call::Send, room, query),
-        (Method::Post, ["api", "link", room, "leave"]) => link::take(relay, request, link::Call::Leave, room, query),
         (_, ["api", "room", ..]) if !relay.config.old_link => out.push(request, error(410, "This relay no longer links devices the old way. Update Nexus Music on this device.")),
         (Method::Post, ["api", "room", room, "enter"]) => room_enter(relay, request, room, &mut out),
         (Method::Get, ["api", "room", room, "poll"]) => room_poll(relay, request, room, query, &mut out),
@@ -684,7 +680,12 @@ fn handle(relay: &Relay, request: Request) {
 
 /// Says this is a jam relay and, if a host key came with the question, whether it's right.
 fn hello(relay: &Relay, request: Request, out: &mut Outbox) {
-    let mut answer = json!({"nexus_jam": 1, "version": env!("CARGO_PKG_VERSION"), "link": link::VERSION});
+    let mut answer = json!({"nexus_jam": 1, "version": env!("CARGO_PKG_VERSION")});
+    // The route a person's devices link through has a listener of its own (see `link`).
+    // It is offered only when that is up.
+    if relay.link.listening() {
+        answer["link"] = json!(link::VERSION);
+    }
     if bearer(&request).is_some() {
         if let Err(refusal) = relay.host_key_ok(&request) {
             return out.push(request, refusal);
