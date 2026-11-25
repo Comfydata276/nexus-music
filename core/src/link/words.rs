@@ -56,6 +56,7 @@ pub fn stopped(stop: Stop, here: Here) -> String {
         Stop::Later => format!("Update Nexus Music on {} to link it with your other devices.", here.this_lower()),
         Stop::Mismatch => "The music server's answer about your devices' link didn't add up. It will be asked again.".to_string(),
         Stop::HasSongs => "You have a playlist named “Nexus Music link” with songs in it. Rename or delete it, and your devices can be linked.".to_string(),
+        Stop::Taken => "You have a playlist named “Nexus Music link”. Rename or delete it, and your devices can be linked.".to_string(),
     }
 }
 

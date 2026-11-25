@@ -35,8 +35,14 @@ pub const PLAYLIST_NAME: &str = "Nexus Music link";
 /// Whether a playlist of the person's own may have this name: not this one, **where
 /// linking is in use**. An app in which it is not has no business with the name.
 pub fn reserved(name: &str) -> bool {
-    name.trim() == PLAYLIST_NAME
+    name.trim() == PLAYLIST_NAME || name.trim() == SETTING_UP
 }
+
+/// What a playlist is called for the moment between being made and being given the record
+/// (see [`judge`]). **The name itself is only ever given together with the record**, in
+/// one request: so a playlist that has the name and no record was not left by the app,
+/// whatever happened to the app in between, and is the person's own.
+pub const SETTING_UP: &str = "Nexus Music link (being set up)";
 
 /// What the app says when a playlist of the person's own is given the name.
 pub const RESERVED: &str = "Nexus Music keeps that name for itself, for linking your devices. Choose another.";
@@ -103,7 +109,7 @@ pub fn kept_name(name: &str, linking: bool) -> Option<&'static str> {
 /// that holds the secret. What is not listed is not opened, and a page that is not opened
 /// is not written to an app's cache of pages.
 pub fn unlisted(name: &str, linking: bool) -> bool {
-    name == crate::sync::PLAYLIST_NAME || (linking && name == PLAYLIST_NAME)
+    name == crate::sync::PLAYLIST_NAME || (linking && (name == PLAYLIST_NAME || name == SETTING_UP))
 }
 
 /// Whether a playlist's page may be written to an app's cache of pages on disk: never the
@@ -277,6 +283,11 @@ pub enum Stop {
     /// made before linking kept the name, and is left exactly as it is. Linking does not
     /// start until it has been renamed or deleted, and the person is told so.
     HasSongs,
+    /// The playlist of that name holds no record: empty, or with a description of the
+    /// person's own. It is theirs as much as one with songs in it, and is left exactly as
+    /// it is: nothing is written into it and it is not made private. Linking does not
+    /// start until it has been renamed or deleted, and the person is told so.
+    Taken,
 }
 
 /// What to do after listing the playlists.
@@ -307,13 +318,11 @@ pub fn choose(listed: &[Stated], username: &str, used: Option<&str>) -> Next {
     }
 }
 
-/// Why a new secret is to be written.
+/// Why a new secret was written.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Why {
-    /// Made and never written into.
-    Empty,
-    /// Not a record that can be read.
-    Broken,
+    /// There was no record: a playlist was made for it.
+    Made,
     /// The playlist used before has gone.
     Gone,
     /// Other accounts could see it. The person is told.
@@ -326,7 +335,8 @@ pub enum Why {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Verdict {
     Use(Secret),
-    /// Write a new secret into it (and keep it private), then look again.
+    /// Write a new secret into it (and keep it private), then look again. Only ever said
+    /// of a playlist that holds a record.
     Write(Why),
     Stop(Stop),
 }
@@ -334,6 +344,11 @@ pub enum Verdict {
 /// What to make of the playlist that was fetched. It counts only if it is the one asked
 /// for, by id and by name, and the server **states** that it is this account's and that it
 /// is private.
+///
+/// **Nothing is ever written into a playlist that does not hold a record.** One of the
+/// name with songs in it, with a description of the person's own, or with nothing in it at
+/// all, is theirs: the app never leaves such a one behind (the name is given with the
+/// record, in one request: [`SETTING_UP`]), so it did not make it.
 pub fn judge(asked: &str, replace: bool, fetched: &Fetched, username: &str) -> Verdict {
     if fetched.id != asked || fetched.name != PLAYLIST_NAME {
         return Verdict::Stop(Stop::Mismatch);
@@ -356,12 +371,33 @@ pub fn judge(asked: &str, replace: bool, fetched: &Fetched, username: &str) -> V
     match record {
         // Whatever else is true of it, a later layout is left exactly as it is.
         Record::Later(_) => Verdict::Stop(Stop::Later),
-        _ if public => Verdict::Write(Why::Public),
-        _ if replace => Verdict::Write(Why::Gone),
-        Record::Empty => Verdict::Write(Why::Empty),
-        Record::Broken => Verdict::Write(Why::Broken),
+        // No record: not the app's to touch, public or private, whatever has gone.
+        Record::Empty | Record::Broken => Verdict::Stop(Stop::Taken),
+        Record::Is(_) if public => Verdict::Write(Why::Public),
+        Record::Is(_) if replace => Verdict::Write(Why::Gone),
         Record::Is(secret) => Verdict::Use(secret),
     }
+}
+
+/// The playlist a look that could not finish left being set up, if there is one: the
+/// lowest id among those of that name that the server says are this account's.
+pub fn left_being_set_up(listed: &[Stated], username: &str) -> Option<String> {
+    match find_named(listed, username, SETTING_UP) {
+        Found::Ours(id) => Some(id),
+        _ => None,
+    }
+}
+
+/// Whether that playlist, as fetched, is one to carry on with: the one asked for, by id
+/// and by its name, stated to be this account's, with no songs in it and nothing written
+/// in it. Anything else (somebody has put songs or a description in it) is left alone, and
+/// another is made.
+pub fn may_be_set_up(asked: &str, fetched: &Fetched, username: &str) -> bool {
+    fetched.id == asked
+        && fetched.name == SETTING_UP
+        && fetched.owner.as_ref().is_some_and(|owner| owner.to_lowercase() == username.to_lowercase())
+        && fetched.songs == Some(0)
+        && read(fetched.comment.as_deref().unwrap_or("")) == Record::Empty
 }
 
 #[cfg(test)]
@@ -537,7 +573,7 @@ mod tests {
         }
         // An empty comment is left out, as Navidrome leaves it; so is an owner it won't state.
         let bare = fetched(r#"<subsonic-response status="ok"><playlist id="k" name="Nexus Music link" songCount="0" public="false" owner="tester"/></subsonic-response>"#).unwrap();
-        assert_eq!((bare.comment.clone(), judge("k", false, &bare, "tester")), (None, Verdict::Write(Why::Empty)));
+        assert_eq!((bare.comment.clone(), judge("k", false, &bare, "tester")), (None, Verdict::Stop(Stop::Taken)));
         assert_eq!(fetched(r#"<subsonic-response status="ok"><playlist id='k' public='true'/></subsonic-response>"#).map(|read| (read.owner, read.public)), Some((None, Some(true))));
     }
 
@@ -594,11 +630,40 @@ mod tests {
         assert_eq!(fetched(&answer("false").replace(r#"songCount="0""#, r#"songCount="many""#)).unwrap().songs, None);
     }
 
+    /// A playlist of the name that holds no record is the person's own, with songs in it
+    /// or without: nothing is written into it, whatever else is true.
     #[test]
-    fn an_empty_or_broken_record_of_ours_is_repaired_and_a_later_one_left_alone() {
-        assert_eq!(judge("k", false, &got("k", None), "tester"), Verdict::Write(Why::Empty));
-        assert_eq!(judge("k", false, &got("k", Some("")), "tester"), Verdict::Write(Why::Empty));
-        assert_eq!(judge("k", false, &got("k", Some("someone's note")), "tester"), Verdict::Write(Why::Broken));
+    fn a_playlist_that_holds_no_record_is_never_written_into_and_a_later_layout_is_left_alone() {
+        let not_records = [None, Some(""), Some("someone's note"), Some(r#"{"nexus_music_link":null}"#), Some(r#"{"nexus_music_link":1}"#), Some(r#"{"nexus_music_link":1,"secret":"short"}"#)];
+        for comment in not_records {
+            for public in [false, true] {
+                for replace in [false, true] {
+                    assert_eq!(judge("k", replace, &Fetched { public: Some(public), ..got("k", comment) }, "tester"), Verdict::Stop(Stop::Taken), "{comment:?}, public {public}, replace {replace}");
+                }
+            }
+        }
+        // The name is kept from a playlist of the person's own where linking is in use, and
+        // so is the one a playlist has for the moment it is being set up.
+        assert_eq!((kept_name(SETTING_UP, true), kept_name(SETTING_UP, false), unlisted(SETTING_UP, true), unlisted(SETTING_UP, false)), (Some(RESERVED), None, true, false));
+        // One left being set up is carried on with only as the app left it: its own, by
+        // that name, with nothing in it.
+        let left = |name: &str, owner: Option<&str>| Stated { id: "s".into(), name: name.into(), owner: owner.map(str::to_string), comment: None };
+        assert_eq!(left_being_set_up(&[left(SETTING_UP, Some("tester")), listed("k", Some("tester"))], "tester"), Some("s".into()));
+        assert_eq!(left_being_set_up(&[left(SETTING_UP, Some("other")), left(SETTING_UP, None), left("Morning mix", Some("tester"))], "tester"), None);
+        let as_left = Fetched { id: "s".into(), name: SETTING_UP.into(), owner: Some("Tester".into()), public: Some(true), comment: None, songs: Some(0) };
+        assert!(may_be_set_up("s", &as_left, "tester"));
+        for touched in [
+            Fetched { songs: Some(1), ..as_left.clone() },
+            Fetched { songs: None, ..as_left.clone() },
+            Fetched { comment: Some("mine now".into()), ..as_left.clone() },
+            Fetched { comment: Some(COMMENT.into()), ..as_left.clone() },
+            Fetched { owner: Some("other".into()), ..as_left.clone() },
+            Fetched { owner: None, ..as_left.clone() },
+            Fetched { name: PLAYLIST_NAME.into(), ..as_left.clone() },
+            Fetched { id: "t".into(), ..as_left.clone() },
+        ] {
+            assert!(!may_be_set_up("s", &touched, "tester"), "{touched:?}");
+        }
         let later = r#"{"nexus_music_link":2,"secret":"x"}"#;
         assert_eq!(judge("k", false, &got("k", Some(later)), "tester"), Verdict::Stop(Stop::Later));
         // Not even to make it private, or because another has gone.

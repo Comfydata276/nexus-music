@@ -99,6 +99,9 @@ fn call(http: &dyn Http, account: &Account, endpoint: &str, with: &[(&str, &str)
     let url = format!("{}/{endpoint}", account.rest);
     let request = Request { method: Method::Post(&form), url: &url, headers: &[("Content-Type", "application/x-www-form-urlencoded")], patience: None };
     match http.send(&request) {
+        // (Only an answer the server gives when all is well is read: a proxy's error page,
+        // or a 500 with a body that happens to parse, is no answer.)
+        Ok(response) if response.status != 200 => Err(Not::Asked),
         Ok(response) => response.body().map_err(|_| Not::Asked),
         Err(Failure::Stopped) => Err(Not::Wanted),
         Err(Failure::Reach(_)) => Err(Not::Asked),
@@ -118,12 +121,26 @@ fn answer(http: &dyn Http, account: &Account, endpoint: &str, with: &[(&str, &st
 /// `reset` asks for a new secret. `random` gives thirty-two bytes from the system's source
 /// of randomness, or `None` if it has none to give. `log` is told what was written, in
 /// words that name no secret.
+///
+/// **A write that gets no answer is followed by a read.** The server may have written it
+/// all the same, so nothing is concluded from the silence: the look goes round again, and
+/// what it then reads is what is true. If that read shows the secret that stood before a
+/// reset's write, the write never landed and the look says nothing was reset; if it cannot
+/// read either, the record is not known to be good and what is held is not to be used.
+///
+/// **Making the record's playlist.** It is made under another name ([`secret::SETTING_UP`])
+/// and given its own name, the record and its privacy together, in one request: so a
+/// playlist that has the name and no record is never the app's leaving, and is never
+/// written into. One left being set up by a look that could not finish is carried on
+/// with, if it is still as the app left it.
 pub fn look(http: &dyn Http, account: &Account, mut used: Option<String>, mut reset: bool, random: &mut dyn FnMut() -> Option<[u8; 32]>, log: &mut dyn FnMut(String)) -> Looked {
     let mut wrote = None;
     // The record has been seen to be no good in this look.
     let mut no_good = false;
-    // It has written nothing yet.
-    let mut written = false;
+    // It has changed nothing on the server yet.
+    let mut changed = false;
+    // The secret that stood when a reset's write was sent.
+    let mut stood: Option<Secret> = None;
     let unasked = |no_good: bool| if no_good { Looked::Invalid } else { Looked::Failed };
     macro_rules! ask {
         ($asked:expr, $otherwise:expr) => {
@@ -134,12 +151,30 @@ pub fn look(http: &dyn Http, account: &Account, mut used: Option<String>, mut re
             }
         };
     }
-    let write = |id: &str, fresh: &Secret, written: &mut bool| {
-        if !std::mem::replace(written, true) {
+    // Before the first request that changes anything on the server: what is begun is to
+    // be seen through.
+    let changing = |changed: &mut bool| {
+        if !std::mem::replace(changed, true) {
             http.keep_going();
         }
-        answer(http, account, "updatePlaylist", &[("playlistId", id), ("comment", &fresh.comment()), ("public", "false")]).map(drop)
     };
+    // A new secret into a playlist, kept private; and, for one being set up, its name
+    // with it. Whether it was answered: no answer is not "not written".
+    macro_rules! put {
+        ($id:expr, $fresh:expr, $named:expr, $what:expr) => {{
+            let comment = $fresh.comment();
+            let mut with = vec![("playlistId", $id.as_str())];
+            if $named {
+                with.push(("name", secret::PLAYLIST_NAME));
+            }
+            with.extend([("comment", comment.as_str()), ("public", "false")]);
+            match answer(http, account, "updatePlaylist", &with) {
+                Ok(_) => log(format!("look: {}", $what)),
+                Err(Not::Wanted) => return Looked::Failed,
+                Err(Not::Asked) => log(format!("look: no answer to writing a secret into {}: reading what is there", $id)),
+            }
+        }};
+    }
     for _ in 0..secret::ROUNDS {
         let listed = ask!(answer(http, account, "getPlaylists", &[]), unasked(no_good));
         let listed: Vec<Stated> = serde_json::from_value(listed["playlists"]["playlist"].clone()).unwrap_or_default();
@@ -149,12 +184,29 @@ pub fn look(http: &dyn Http, account: &Account, mut used: Option<String>, mut re
             Next::Make => {
                 // There is none. If one was in use, that one has gone.
                 no_good |= used.is_some();
-                let made = ask!(answer(http, account, "createPlaylist", &[("name", secret::PLAYLIST_NAME)]), unasked(no_good));
-                let Some(id) = made["playlist"]["id"].as_str().filter(|id| !id.is_empty()).map(str::to_string) else { return unasked(no_good) };
+                // (Nothing is made without a secret to put in it.)
                 let Some(fresh) = random().map(Secret::new) else { return Looked::NoRandom };
-                ask!(write(&id, &fresh, &mut written), unasked(no_good));
-                log(format!("look: made the playlist {id} and wrote a secret into it"));
-                used = Some(id);
+                let mut id = None;
+                if let Some(left) = secret::left_being_set_up(&listed, &account.username) {
+                    let fetched = ask!(call(http, account, "getPlaylist", &[("id", &left)], true), unasked(no_good));
+                    if secret::fetched(&fetched).is_some_and(|fetched| secret::may_be_set_up(&left, &fetched, &account.username)) {
+                        id = Some(left);
+                    }
+                }
+                changing(&mut changed);
+                let id = match id {
+                    Some(id) => id,
+                    None => {
+                        let made = ask!(answer(http, account, "createPlaylist", &[("name", secret::SETTING_UP)]), unasked(no_good));
+                        let Some(id) = made["playlist"]["id"].as_str().filter(|id| !id.is_empty()).map(str::to_string) else { return unasked(no_good) };
+                        id
+                    }
+                };
+                put!(id, fresh, true, format!("made the playlist {id} and wrote a secret into it"));
+                wrote = Some(Why::Made);
+                // (That the one used before has gone is known now, and has been noted: the
+                // playlist just made is not "another one, found in its place".)
+                used = None;
                 continue;
             }
         };
@@ -163,34 +215,40 @@ pub fn look(http: &dyn Http, account: &Account, mut used: Option<String>, mut re
         let fetched = ask!(call(http, account, "getPlaylist", &[("id", &id)], true), unasked(no_good));
         let Some(fetched) = secret::fetched(&fetched) else { return unasked(no_good) };
         match secret::judge(&id, replace, &fetched, &account.username) {
-            Verdict::Use(_) if reset => {
+            Verdict::Use(secret) if reset => {
                 reset = false;
                 let Some(fresh) = random().map(Secret::new) else { return Looked::NoRandom };
-                // (If it cannot be written, the secret that is there stands, and the look
-                // says only that the server could not be asked.)
-                ask!(write(&id, &fresh, &mut written), unasked(no_good));
-                log(format!("look: wrote a new secret into {id} (Reset)"));
+                changing(&mut changed);
+                put!(id, fresh, false, format!("wrote a new secret into {id} (Reset)"));
                 wrote = Some(Why::Reset);
                 used = Some(id);
-                // The secret that was read is the record no longer: if the new one cannot
-                // be read back, the look says so, and the old one is not used meanwhile.
+                // The secret that was read may be the record no longer: it is used again
+                // only if a read shows it is.
+                stood = Some(secret);
                 no_good = true;
             }
-            Verdict::Use(secret) => return Looked::Secret { secret, id, wrote },
+            Verdict::Use(secret) => {
+                // The read after a reset's write shows the secret that stood before it:
+                // the write never landed, and nothing was reset.
+                if stood.as_ref() == Some(&secret) {
+                    wrote = None;
+                }
+                return Looked::Secret { secret, id, wrote };
+            }
             Verdict::Stop(stop) => return Looked::Stopped(stop),
             Verdict::Write(why) => {
                 no_good = true;
                 // A new secret into it, and it is kept private. The secret used afterwards
                 // is the one the next round reads back, not this one.
                 let Some(fresh) = random().map(Secret::new) else { return Looked::NoRandom };
-                ask!(write(&id, &fresh, &mut written), Looked::Invalid);
-                log(format!("look: wrote a new secret into {id} ({why:?})"));
+                changing(&mut changed);
+                put!(id, fresh, false, format!("wrote a new secret into {id} ({why:?})"));
                 wrote = Some(why);
                 used = Some(id);
             }
         }
     }
-    // It kept being undone.
+    // It kept being undone, or kept not being answered.
     unasked(no_good)
 }
 
@@ -200,14 +258,19 @@ mod tests {
 
     use super::*;
     use crate::http::Response;
+    use crate::link::secret::Stop;
 
-    /// A music server that answers from a script: what each fetch of the playlist gives
-    /// (`None`: no answer), and whether listing and writing work.
+    /// A music server that answers from a script: what each fetch of the record's playlist
+    /// gives (`None`: no answer), whether listing and writing work, and one playlist it
+    /// can be asked to make, which it then lists and gives as it was last written.
     struct Scripted {
         fetches: Mutex<Vec<Option<String>>>,
         listed: Vec<Value>,
         list_works: bool,
         write_works: bool,
+        /// The playlist it was asked to make, or holds from before: its id, name, comment
+        /// and how many songs are in it.
+        made: Mutex<Option<(String, String, String, u32)>>,
         asked: Mutex<Vec<&'static str>>,
         /// The forms that were sent, to see what was in them and what was not.
         sent: Mutex<Vec<(String, String)>>,
@@ -221,10 +284,15 @@ mod tests {
     /// A way one request can go wrong.
     #[derive(Debug, Clone, Copy, PartialEq)]
     enum Fail {
-        /// The server cannot be reached, or the request times out.
+        /// The server cannot be reached, or the request times out: it never arrives.
         NoAnswer,
+        /// It arrives, the server does what was asked, and the answer is lost on the way back.
+        Lost,
         /// Something answers that is not the music server: a proxy's error page.
         NotTheServer,
+        /// The server's own answer, word for word as when all is well, under a status that
+        /// says it is not.
+        NotOkStatus,
         /// The server answers that all is not well.
         NotOk,
         /// The person signs out while it is under way.
@@ -234,12 +302,44 @@ mod tests {
     impl Scripted {
         fn with(fetches: Vec<Option<String>>) -> Scripted {
             let listed = vec![serde_json::json!({"id": "k", "name": secret::PLAYLIST_NAME, "owner": "tester"})];
-            Scripted { fetches: Mutex::new(fetches), listed, list_works: true, write_works: true, asked: Mutex::default(), sent: Mutex::default(), signed_out_after: None, kept_going: Mutex::default(), fails: None }
+            Scripted {
+                fetches: Mutex::new(fetches),
+                listed,
+                list_works: true,
+                write_works: true,
+                made: Mutex::default(),
+                asked: Mutex::default(),
+                sent: Mutex::default(),
+                signed_out_after: None,
+                kept_going: Mutex::default(),
+                fails: None,
+            }
+        }
+
+        /// A server with no playlist of the name on it.
+        fn bare() -> Scripted {
+            let mut server = Scripted::with(vec![]);
+            server.listed.clear();
+            server
         }
 
         fn asked(&self) -> Vec<&'static str> {
             self.asked.lock().unwrap().clone()
         }
+    }
+
+    /// A field of a form, as it was meant.
+    fn field(form: &str, name: &str) -> Option<String> {
+        let value = form.split('&').find_map(|pair| pair.strip_prefix(&format!("{name}=")))?;
+        let (mut out, mut bytes) = (Vec::new(), value.bytes());
+        while let Some(byte) = bytes.next() {
+            match byte {
+                b'%' => out.push(u8::from_str_radix(&String::from_utf8(vec![bytes.next()?, bytes.next()?]).ok()?, 16).ok()?),
+                b'+' => out.push(b' '),
+                other => out.push(other),
+            }
+        }
+        String::from_utf8(out).ok()
     }
 
     impl Http for Scripted {
@@ -250,48 +350,71 @@ mod tests {
             }
             let Method::Post(form) = request.method else { panic!("a look asks by POST and no other way") };
             self.sent.lock().unwrap().push((request.url.to_string(), form.to_string()));
-            let ok = |inside: Value| Ok(Response::new(200, Vec::new(), move || Ok(serde_json::json!({"subsonic-response": inside}).to_string())));
-            let unreachable = || Err(Failure::Reach("could not be reached".into()));
             let call = request.url.rsplit('/').next().unwrap_or_default();
-            if let Some((_, how)) = self.fails.filter(|(at, _)| *at == asked.len()) {
-                asked.push(match call {
-                    "getPlaylists" => "list",
-                    "getPlaylist" => "fetch",
-                    "createPlaylist" => "make",
-                    _ => "write",
-                });
-                let says = |text: &'static str, status: u16| Ok(Response::new(status, Vec::new(), move || Ok(text.to_string())));
-                return match (how, call) {
-                    (Fail::NoAnswer, _) => unreachable(),
-                    (Fail::SignedOut, _) => Err(Failure::Stopped),
-                    (Fail::NotTheServer, _) => says("<html><body>502 Bad Gateway</body></html>", 502),
-                    (Fail::NotOk, "getPlaylist") => says(r#"<subsonic-response status="failed"><error code="0" message="not now"/></subsonic-response>"#, 200),
-                    (Fail::NotOk, _) => says(r#"{"subsonic-response":{"status":"failed","error":{"code":0,"message":"not now"}}}"#, 200),
-                };
+            let how = self.fails.filter(|(at, _)| *at == asked.len()).map(|(_, how)| how);
+            asked.push(match call {
+                "getPlaylists" => "list",
+                "getPlaylist" => "fetch",
+                "createPlaylist" => "make",
+                "updatePlaylist" => "write",
+                other => panic!("a look asked for {other}"),
+            });
+            let says = |status: u16, text: String| Ok(Response::new(status, Vec::new(), move || Ok(text)));
+            let unreachable = || Err(Failure::Reach("could not be reached".into()));
+            match (how, call) {
+                (Some(Fail::NoAnswer), _) => return unreachable(),
+                (Some(Fail::SignedOut), _) => return Err(Failure::Stopped),
+                (Some(Fail::NotTheServer), _) => return says(502, "<html><body>502 Bad Gateway</body></html>".into()),
+                (Some(Fail::NotOk), "getPlaylist") => return says(200, r#"<subsonic-response status="failed"><error code="0" message="not now"/></subsonic-response>"#.into()),
+                (Some(Fail::NotOk), _) => return says(200, r#"{"subsonic-response":{"status":"failed","error":{"code":0,"message":"not now"}}}"#.into()),
+                _ => {}
             }
-            match call {
+            // What the server does, and what it would say of it.
+            let ok = |inside: Value| Some(serde_json::json!({"subsonic-response": inside}).to_string());
+            let mut made = self.made.lock().unwrap();
+            let answer = match call {
+                "getPlaylists" if !self.list_works => None,
                 "getPlaylists" => {
-                    asked.push("list");
-                    if self.list_works { ok(serde_json::json!({"status": "ok", "playlists": {"playlist": self.listed}})) } else { unreachable() }
-                }
-                "getPlaylist" => {
-                    asked.push("fetch");
-                    let mut fetches = self.fetches.lock().unwrap();
-                    match if fetches.is_empty() { None } else { fetches.remove(0) } {
-                        Some(text) => Ok(Response::new(200, Vec::new(), move || Ok(text))),
-                        None => unreachable(),
+                    let mut listed = self.listed.clone();
+                    if let Some((id, name, ..)) = made.as_ref() {
+                        listed.push(serde_json::json!({"id": id, "name": name, "owner": "tester"}));
                     }
+                    ok(serde_json::json!({"status": "ok", "playlists": {"playlist": listed}}))
                 }
+                "getPlaylist" => match made.as_ref().filter(|(id, ..)| field(form, "id").as_deref() == Some(id.as_str())) {
+                    Some((id, name, comment, songs)) => Some(format!(
+                        r#"<subsonic-response status="ok"><playlist id="{id}" name="{name}" comment="{}" songCount="{songs}" public="false" owner="tester"></playlist></subsonic-response>"#,
+                        comment.replace('"', "&#34;")
+                    )),
+                    None => {
+                        let mut fetches = self.fetches.lock().unwrap();
+                        if fetches.is_empty() { None } else { fetches.remove(0) }
+                    }
+                },
                 "createPlaylist" => {
-                    asked.push("make");
+                    *made = Some(("made".into(), field(form, "name").unwrap_or_default(), String::new(), 0));
                     ok(serde_json::json!({"status": "ok", "playlist": {"id": "made"}}))
                 }
-                "updatePlaylist" => {
-                    asked.push("write");
-                    if self.write_works { ok(serde_json::json!({"status": "ok"})) } else { unreachable() }
+                _ if !self.write_works => None,
+                _ => {
+                    if let Some((_, name, comment, _)) = made.as_mut().filter(|(id, ..)| field(form, "playlistId").as_deref() == Some(id.as_str())) {
+                        *comment = field(form, "comment").unwrap_or_default();
+                        if let Some(new) = field(form, "name") {
+                            *name = new;
+                        }
+                    }
+                    ok(serde_json::json!({"status": "ok"}))
                 }
-                other => panic!("a look asked for {other}"),
+            };
+            match (how, answer) {
+                (Some(Fail::Lost), _) | (_, None) => unreachable(),
+                (Some(Fail::NotOkStatus), Some(text)) => says(500, text),
+                (_, Some(text)) => says(200, text),
             }
+        }
+
+        fn pause(&self, _: std::time::Duration) -> Result<(), Failure> {
+            Ok(())
         }
 
         fn keep_going(&self) {
@@ -315,6 +438,13 @@ mod tests {
 
     const RECORD: &str = r#"{"nexus_music_link":1,"secret":"ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8"}"#;
 
+    /// The secret a look in these tests writes, and the record it makes of it.
+    fn fresh() -> (Secret, String) {
+        let fresh = Secret::new([9; 32]);
+        let written = fresh.comment();
+        (fresh, written)
+    }
+
     #[test]
     fn a_look_reads_the_record_by_form_post_and_puts_nothing_in_an_address() {
         let server = Scripted::with(vec![playlist(RECORD, false)]);
@@ -327,7 +457,7 @@ mod tests {
         // A look that reads and writes nothing asks nobody to keep going.
         assert_eq!(*server.kept_going.lock().unwrap(), None);
         // What is written goes in the form too, encoded, and the playlist is kept private.
-        let server = Scripted::with(vec![playlist("", false), playlist(RECORD, false)]);
+        let server = Scripted::with(vec![playlist(RECORD, true), playlist(RECORD, false)]);
         looks(&server, Some("k"), false);
         let sent = server.sent.lock().unwrap().clone();
         assert_eq!(sent[2].0, "http://music.example/rest/updatePlaylist");
@@ -350,12 +480,9 @@ mod tests {
         let (ends, _, asked) = found(vec![playlist(RECORD, true), None]);
         assert!(ends, "the old secret would live on until its time ran out");
         assert_eq!(asked, ["list", "fetch", "write", "list", "fetch"]);
-        // The same when the playlist that was used has gone, when the answer is not one
-        // about a playlist, and when what was written keeps not being there.
-        let mut server = Scripted::with(vec![playlist(RECORD, true)]);
-        server.listed.clear();
-        assert!(ends_session(&looks(&server, Some("gone"), false)) || server.asked().contains(&"make"));
-        assert!(found(vec![playlist("somebody's note", false), Some("not an answer".into())]).0);
+        // The same when the answer is not one about a playlist, and when what was written
+        // keeps not being there.
+        assert!(found(vec![playlist(RECORD, true), Some("not an answer".into())]).0);
         assert!(found(vec![playlist(RECORD, true), playlist(RECORD, true), playlist(RECORD, true)]).0);
         // Unless a later read shows it good: then that is the secret to use.
         let (ends, good, _) = found(vec![playlist(RECORD, true), playlist(RECORD, false)]);
@@ -366,10 +493,11 @@ mod tests {
         let mut server = Scripted::with(vec![]);
         server.list_works = false;
         assert!(!ends_session(&looks(&server, Some("k"), false)));
-        // A record found no good that cannot be written over is no good either.
-        let mut server = Scripted::with(vec![playlist(RECORD, true)]);
+        // A record found no good that cannot be written over is no good either, however
+        // many times it is tried.
+        let mut server = Scripted::with(vec![playlist(RECORD, true); 3]);
         server.write_works = false;
-        assert!(ends_session(&looks(&server, Some("k"), false)));
+        assert_eq!((looks(&server, Some("k"), false), server.asked().len()), (Looked::Invalid, 9));
         // An answer the server gives when all is not well is no answer.
         let server = Scripted::with(vec![Some(r#"<subsonic-response status="failed"><error code="70"/></subsonic-response>"#.into())]);
         assert_eq!(looks(&server, Some("k"), false), Looked::Failed);
@@ -399,19 +527,16 @@ mod tests {
         server.signed_out_after = Some(0);
         looks(&server, None, false);
         assert!(server.asked().is_empty());
-        let mut server = Scripted::with(vec![]);
-        server.listed.clear();
+        let mut server = Scripted::bare();
         server.signed_out_after = Some(2);
-        looks(&server, None, false);
-        assert_eq!(server.asked(), ["list", "make"]);
+        assert_eq!((looks(&server, None, false), server.asked()), (Looked::Failed, vec!["list", "make"]));
     }
 
     /// "Reset linking": a look that writes a new secret where it would have used the one it
     /// read, and uses only what it then reads back.
     #[test]
     fn a_look_that_resets_writes_a_new_secret_and_reads_it_back() {
-        let fresh = Secret::new([9; 32]);
-        let written = fresh.comment();
+        let (fresh, written) = fresh();
         let server = Scripted::with(vec![playlist(RECORD, false), playlist(&written, false)]);
         let looked = looks(&server, Some("k"), true);
         assert_eq!(server.asked(), ["list", "fetch", "write", "list", "fetch"]);
@@ -425,60 +550,124 @@ mod tests {
         looks(&server, Some("k"), true);
         assert_eq!(server.asked().iter().filter(|asked| **asked == "write").count(), 1);
         // Nothing a look would not use is written into: a playlist that is somebody's, one
-        // with a later layout.
+        // with a later layout, one that holds no record.
         let somebody = r#"<subsonic-response status="ok"><playlist id="k" name="Nexus Music link" comment="" songCount="3" public="false" owner="tester"></playlist></subsonic-response>"#;
-        for stops in [Some(somebody.to_string()), playlist(r#"{"nexus_music_link":2}"#, false)] {
+        for stops in [Some(somebody.to_string()), playlist(r#"{"nexus_music_link":2}"#, false), playlist("", false), playlist("a list of links", false)] {
             let server = Scripted::with(vec![stops]);
             assert!(matches!(looks(&server, Some("k"), true), Looked::Stopped(_)));
             assert!(!server.asked().contains(&"write"), "{:?}", server.asked());
         }
     }
 
+    /// A write that gets no answer may have been written all the same: the look reads, and
+    /// goes by what it reads.
     #[test]
-    fn a_reset_that_cannot_be_written_leaves_the_secret_and_one_that_cannot_be_read_back_ends_it() {
-        // The write gets no answer: nothing has changed, and nothing is concluded.
-        let mut server = Scripted::with(vec![playlist(RECORD, false)]);
-        server.write_works = false;
-        let looked = looks(&server, Some("k"), true);
-        assert!(looked == Looked::Failed && !ends_session(&looked));
-        assert_eq!(server.asked(), ["list", "fetch", "write"]);
-        // Written, and the read-back gets no answer: the secret that was in use is the
-        // record no longer, and is not used on the strength of a request that failed.
-        let server = Scripted::with(vec![playlist(RECORD, false), None]);
-        assert!(ends_session(&looks(&server, Some("k"), true)), "the old secret would live on after a reset");
-        // Signed out as it began: nothing is written.
+    fn a_write_that_is_not_answered_is_followed_by_a_read() {
+        let (fresh, written) = fresh();
+        let old = match secret::read(RECORD) {
+            secret::Record::Is(secret) => secret,
+            _ => unreachable!(),
+        };
+        let unanswered = |fetches: Vec<Option<String>>, how: Fail, reset: bool| {
+            let mut server = Scripted::with(fetches);
+            server.fails = Some((2, how));
+            let looked = looks(&server, Some("k"), reset);
+            (looked, server.asked())
+        };
+        // A reset whose write never arrived, or was refused: the read shows the secret that
+        // stood, which is used, and nothing is said to have been reset.
+        for how in [Fail::NoAnswer, Fail::NotTheServer, Fail::NotOkStatus, Fail::NotOk] {
+            let (looked, asked) = unanswered(vec![playlist(RECORD, false), playlist(RECORD, false)], how, true);
+            assert_eq!((looked, asked), (Looked::Secret { secret: old.clone(), id: "k".into(), wrote: None }, vec!["list", "fetch", "write", "list", "fetch"]), "{how:?}");
+        }
+        // One that was written, with its answer lost: the read shows the new secret, and
+        // the reset was done.
+        let (looked, _) = unanswered(vec![playlist(RECORD, false), playlist(&written, false)], Fail::Lost, true);
+        assert_eq!(looked, Looked::Secret { secret: fresh.clone(), id: "k".into(), wrote: Some(Why::Reset) });
+        // Neither the write nor the read is answered: the record is not known to be good,
+        // and what is held is not to be used.
+        let (looked, asked) = unanswered(vec![playlist(RECORD, false), None], Fail::NoAnswer, true);
+        assert_eq!((looked, asked), (Looked::Invalid, vec!["list", "fetch", "write", "list", "fetch"]));
+        // A public record whose replacement was not answered: read again, found public
+        // still, written again, read back.
+        let (looked, asked) = unanswered(vec![playlist(RECORD, true), playlist(RECORD, true), playlist(&written, false)], Fail::NoAnswer, false);
+        assert_eq!(asked, ["list", "fetch", "write", "list", "fetch", "write", "list", "fetch"]);
+        assert_eq!(looked, Looked::Secret { secret: fresh.clone(), id: "k".into(), wrote: Some(Why::Public) });
+        // And one that was written with its answer lost is not written twice.
+        let (looked, asked) = unanswered(vec![playlist(RECORD, true), playlist(&written, false)], Fail::Lost, false);
+        assert_eq!((looked, asked), (Looked::Secret { secret: fresh.clone(), id: "k".into(), wrote: Some(Why::Public) }, vec!["list", "fetch", "write", "list", "fetch"]));
+        // Signed out as a reset began: nothing is written.
         let mut server = Scripted::with(vec![playlist(RECORD, false)]);
         server.signed_out_after = Some(2);
-        looks(&server, Some("k"), true);
-        assert_eq!(server.asked(), ["list", "fetch"]);
+        assert_eq!((looks(&server, Some("k"), true), server.asked()), (Looked::Failed, vec!["list", "fetch"]));
     }
 
+    /// The record's playlist is made under another name, and given its own name with the
+    /// record, in one request: at no moment is there a playlist of the name with no record
+    /// in it that the app made.
     #[test]
-    fn with_no_random_bytes_to_be_had_nothing_is_written() {
-        let server = Scripted::with(vec![playlist("", false)]);
-        let looked = look(&server, &account(), Some("k".into()), false, &mut || None, &mut |_| {});
-        assert_eq!(looked, Looked::NoRandom);
-        assert_eq!(server.asked(), ["list", "fetch"]);
-        // Nor is a playlist that was just made written into; and what was written is said
-        // without the secret.
-        let mut server = Scripted::with(vec![playlist(RECORD, false)]);
-        server.listed.clear();
+    fn the_playlist_is_given_its_name_and_the_record_together() {
+        let (fresh, written) = fresh();
+        let server = Scripted::bare();
         let mut said = Vec::new();
-        look(&server, &account(), None, false, &mut || Some([9; 32]), &mut |line| said.push(line));
-        // (This server never lists what was made, so it is made again each round.)
-        assert!(!said.is_empty() && said.iter().all(|line| line == "look: made the playlist made and wrote a secret into it"), "{said:?}");
+        let looked = look(&server, &account(), None, false, &mut || Some([9; 32]), &mut |line| said.push(line));
+        assert_eq!(server.asked(), ["list", "make", "write", "list", "fetch"]);
+        assert_eq!(looked, Looked::Secret { secret: fresh.clone(), id: "made".into(), wrote: Some(Why::Made) });
+        let sent = server.sent.lock().unwrap().clone();
+        assert_eq!(field(&sent[1].1, "name").as_deref(), Some(secret::SETTING_UP));
+        assert_eq!((field(&sent[2].1, "name").as_deref(), field(&sent[2].1, "comment"), field(&sent[2].1, "public").as_deref()), (Some(secret::PLAYLIST_NAME), Some(written.clone()), Some("false")));
+        // It says the look is to be seen through before it makes the playlist, not after;
+        // and what it says it wrote names no secret.
+        assert_eq!(*server.kept_going.lock().unwrap(), Some(1));
+        assert_eq!(said, ["look: made the playlist made and wrote a secret into it"]);
+        // The write is not answered and did not arrive: the playlist is still being set up,
+        // has not the name, and is carried on with. No second one is made.
+        let mut server = Scripted::bare();
+        server.fails = Some((2, Fail::NoAnswer));
+        let looked = looks(&server, None, false);
+        assert_eq!(server.asked(), ["list", "make", "write", "list", "fetch", "write", "list", "fetch"]);
+        assert_eq!(looked, Looked::Secret { secret: fresh.clone(), id: "made".into(), wrote: Some(Why::Made) });
+        // The write arrived and its answer was lost: the read finds the record.
+        let mut server = Scripted::bare();
+        server.fails = Some((2, Fail::Lost));
+        assert_eq!((looks(&server, None, false), server.asked()), (Looked::Secret { secret: fresh.clone(), id: "made".into(), wrote: Some(Why::Made) }, vec!["list", "make", "write", "list", "fetch"]));
+        // One left being set up by a look that never got to write (the app was closed):
+        // carried on with, as long as it is as the app left it.
+        let left = |comment: &str, songs: u32| {
+            let server = Scripted::bare();
+            *server.made.lock().unwrap() = Some(("left".into(), secret::SETTING_UP.into(), comment.into(), songs));
+            server
+        };
+        let server = left("", 0);
+        assert_eq!((looks(&server, None, false), server.asked()), (Looked::Secret { secret: fresh.clone(), id: "left".into(), wrote: Some(Why::Made) }, vec!["list", "fetch", "write", "list", "fetch"]));
+        // Somebody has put songs in it, or written in it: it is theirs now, and another is made.
+        for (comment, songs) in [("", 2), ("mine", 0)] {
+            let server = left(comment, songs);
+            looks(&server, None, false);
+            assert_eq!(server.asked()[..3], ["list", "fetch", "make"], "{comment:?}, {songs} songs");
+        }
+        // Nothing is made if no writing of it could ever be seen through: without a secret
+        // to put in it, the server is not touched.
+        let server = Scripted::bare();
+        assert_eq!((look(&server, &account(), None, false, &mut || None, &mut |_| {}), server.asked()), (Looked::NoRandom, vec!["list"]));
+        // With no random bytes a record is not replaced either.
+        let server = Scripted::with(vec![playlist(RECORD, true)]);
+        assert_eq!((look(&server, &account(), Some("k".into()), false, &mut || None, &mut |_| {}), server.asked()), (Looked::NoRandom, vec!["list", "fetch"]));
     }
 
-    /// Every request of every kind of look, going wrong in every way a request can: the
-    /// look makes no other request, and concludes only what it has seen. Before the record
-    /// has been seen to be no good, a failure concludes nothing (what is held runs out in
-    /// its own time); after, what is held is not to be used.
+    /// Every request of every kind of look that is not a write, going wrong in every way a
+    /// request can; and each write with the sign-in ending under it. The look makes no
+    /// other request, and concludes only what it has seen: before the record has been
+    /// seen to be no good, a failure concludes nothing (what is held runs out in its own
+    /// time); after, what is held is not to be used. (A write that is not answered is
+    /// another matter, and has a test of its own.)
     #[test]
     fn every_request_of_a_look_failing_in_every_way() {
-        let fresh = Secret::new([9; 32]).comment();
+        let (_, written) = fresh();
         // Each kind of look: the playlist used before, whether a reset was asked for, what
-        // each fetch finds, whether the playlist is listed, the requests it makes when all
-        // goes well, and the first of them by which the record has been seen to be no good.
+        // each fetch finds, whether a playlist of the name is listed, the requests it makes
+        // when all goes well, and the first of them by which the record has been seen to be
+        // no good.
         struct Kind {
             what: &'static str,
             used: Option<&'static str>,
@@ -490,30 +679,26 @@ mod tests {
         }
         let kinds = [
             Kind { what: "the record is read", used: Some("k"), reset: false, fetches: vec![playlist(RECORD, false)], listed: true, asks: &["list", "fetch"], no_good_from: usize::MAX },
-            Kind { what: "an empty record is written into", used: None, reset: false, fetches: vec![playlist("", false), playlist(RECORD, false)], listed: true, asks: &["list", "fetch", "write", "list", "fetch"], no_good_from: 2 },
             Kind { what: "a public record is replaced", used: Some("k"), reset: false, fetches: vec![playlist(RECORD, true), playlist(RECORD, false)], listed: true, asks: &["list", "fetch", "write", "list", "fetch"], no_good_from: 2 },
-            Kind { what: "a broken record is replaced", used: Some("k"), reset: false, fetches: vec![playlist("{not a record", false), playlist(RECORD, false)], listed: true, asks: &["list", "fetch", "write", "list", "fetch"], no_good_from: 2 },
-            // (This server never lists what was made. The one made in the first round has
-            // gone by the second, and that is a record seen to be no good.)
-            Kind { what: "there is no playlist yet", used: None, reset: false, fetches: vec![], listed: false, asks: &["list", "make", "write", "list", "make", "write", "list", "make", "write"], no_good_from: 4 },
-            Kind { what: "the playlist that was used has gone", used: Some("gone"), reset: false, fetches: vec![], listed: false, asks: &["list", "make", "write", "list", "make", "write", "list", "make", "write"], no_good_from: 1 },
-            Kind { what: "the secret is reset", used: Some("k"), reset: true, fetches: vec![playlist(RECORD, false), playlist(&fresh, false)], listed: true, asks: &["list", "fetch", "write", "list", "fetch"], no_good_from: 3 },
+            Kind { what: "there is no playlist yet", used: None, reset: false, fetches: vec![], listed: false, asks: &["list", "make", "write", "list", "fetch"], no_good_from: usize::MAX },
+            Kind { what: "the playlist that was used has gone", used: Some("gone"), reset: false, fetches: vec![], listed: false, asks: &["list", "make", "write", "list", "fetch"], no_good_from: 1 },
+            Kind { what: "the secret is reset", used: Some("k"), reset: true, fetches: vec![playlist(RECORD, false), playlist(&written, false)], listed: true, asks: &["list", "fetch", "write", "list", "fetch"], no_good_from: 3 },
         ];
         for kind in &kinds {
             let server = |fails| {
-                let mut server = Scripted::with(kind.fetches.clone());
-                if !kind.listed {
-                    server.listed.clear();
-                }
+                let mut server = if kind.listed { Scripted::with(kind.fetches.clone()) } else { Scripted::bare() };
                 server.fails = fails;
                 server
             };
             // With nothing going wrong it asks what it should.
             let well = server(None);
-            looks(&well, kind.used, kind.reset);
+            assert!(matches!(looks(&well, kind.used, kind.reset), Looked::Secret { .. }), "{}", kind.what);
             assert_eq!(well.asked(), kind.asks, "{}", kind.what);
             for at in 0..kind.asks.len() {
-                for how in [Fail::NoAnswer, Fail::NotTheServer, Fail::NotOk, Fail::SignedOut] {
+                for how in [Fail::NoAnswer, Fail::Lost, Fail::NotTheServer, Fail::NotOkStatus, Fail::NotOk, Fail::SignedOut] {
+                    if kind.asks[at] == "write" && how != Fail::SignedOut {
+                        continue;
+                    }
                     let server = server(Some((at, how)));
                     let looked = looks(&server, kind.used, kind.reset);
                     let case = format!("{}: its {} (request {at}) {how:?}", kind.what, kind.asks[at]);
@@ -525,12 +710,6 @@ mod tests {
                     assert_eq!(looked, expected, "{case}");
                     assert_eq!(ends_session(&looked), expected == Looked::Invalid, "{case}");
                 }
-            }
-            // And with no random bytes to be had, it stops where it would have written.
-            if let Some(write) = kind.asks.iter().position(|ask| *ask == "write") {
-                let server = server(None);
-                let looked = look(&server, &account(), kind.used.map(str::to_string), kind.reset, &mut || None, &mut |_| {});
-                assert_eq!((looked, server.asked()), (Looked::NoRandom, kind.asks[..write].to_vec()), "{}", kind.what);
             }
         }
     }
@@ -547,13 +726,17 @@ mod tests {
             ("it has been renamed", of(r#"id="k" name="Road trip" comment="" songCount="0" public="false" owner="tester""#), Stop::Mismatch),
             ("it is somebody else's", of(r#"id="k" name="Nexus Music link" comment="" songCount="0" public="false" owner="other""#), Stop::Mismatch),
             ("it has songs in it", of(r#"id="k" name="Nexus Music link" comment="" songCount="2" public="false" owner="tester""#), Stop::HasSongs),
+            ("it is empty, and holds no record", playlist("", false), Stop::Taken),
+            ("it is empty, holds no record, and others can see it", playlist("", true), Stop::Taken),
+            ("its description is the person's own", playlist("Links to things", false), Stop::Taken),
+            ("its description only looks like a record", playlist(r#"{"nexus_music_link":1,"secret":"x"}"#, false), Stop::Taken),
             ("its record is in a later layout", playlist(r#"{"nexus_music_link":2,"secret":"x"}"#, false), Stop::Later),
         ];
         for (what, fetched, stop) in cases {
-            for reset in [false, true] {
+            for (reset, used) in [(false, Some("k")), (true, Some("k")), (false, Some("gone")), (false, None)] {
                 let server = Scripted::with(vec![fetched.clone()]);
-                let looked = looks(&server, Some("k"), reset);
-                assert_eq!((&looked, server.asked()), (&Looked::Stopped(stop), vec!["list", "fetch"]), "{what}, reset {reset}");
+                let looked = looks(&server, used, reset);
+                assert_eq!((&looked, server.asked()), (&Looked::Stopped(stop), vec!["list", "fetch"]), "{what}, reset {reset}, used {used:?}");
                 assert!(ends_session(&looked), "{what}");
             }
         }
