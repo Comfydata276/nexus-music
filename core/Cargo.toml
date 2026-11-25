@@ -9,6 +9,4 @@ publish = false
 # serve the Windows app and the Android app. Anything added here has to keep that true.
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-
-[dev-dependencies]
 serde_json = "1"

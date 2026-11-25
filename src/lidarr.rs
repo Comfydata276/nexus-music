@@ -24,49 +24,13 @@ pub struct Lidarr {
     agent: ureq::Agent,
 }
 
-/// An album Lidarr knows of that could be asked for.
-#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, Deserialize)]
-#[serde(default)]
-pub struct Offer {
-    /// Lidarr's name for the album (a MusicBrainz release-group id) and for its artist.
-    pub album: String,
-    pub artist_id: String,
-    pub title: String,
-    pub artist: String,
-    pub year: String,
-    /// Where its cover picture is, as a web address; may be empty.
-    pub cover: String,
-    /// It's already on Lidarr's list of albums to get.
-    pub requested: bool,
-    /// "EP" or "Single" for one of those; empty (or "Album") for an album.
-    pub kind: String,
-    /// It's filed as a soundtrack: music made for a film, a show or a game.
-    pub soundtrack: bool,
-}
-
-impl Offer {
-    /// What kind of release it is: "Album", "EP" or "Single".
-    pub fn kind(&self) -> &str {
-        if self.kind.is_empty() { "Album" } else { &self.kind }
-    }
-
-    /// The kind as it's said in a sentence: "album", "EP" or "single".
-    pub fn kind_word(&self) -> &'static str {
-        match self.kind() {
-            "EP" => "EP",
-            "Single" => "single",
-            _ => "album",
-        }
-    }
-}
+pub use nexus_core::offer::{Offer, VARIOUS};
 
 /// The name of the profile this app makes in Lidarr for artists a single or an EP is asked
 /// of. Lidarr only knows the kinds of release an artist's profile lists.
 const SINGLES_PROFILE: &str = "Albums, EPs and singles";
 /// And the one for artists a soundtrack is asked of, which lists those as well.
 const SOUNDTRACKS_PROFILE: &str = "Albums, EPs, singles and soundtracks";
-/// MusicBrainz's name for "Various Artists", which most film soundtracks are credited to.
-pub const VARIOUS: &str = "89ad4ac3-39f7-470e-963a-56509c546377";
 
 /// Whether singles and EPs are offered as well as albums. Set from Settings.
 static SINGLES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);

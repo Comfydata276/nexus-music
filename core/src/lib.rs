@@ -5,6 +5,10 @@
 //! file, starts a thread or opens a connection; whatever it needs from the world, the app
 //! hands it.
 
+pub mod http;
+pub mod listenbrainz;
+pub mod musicbrainz;
 pub mod notes;
+pub mod offer;
 pub mod sync;
 pub mod text;

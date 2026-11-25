@@ -8,6 +8,7 @@ mod audio;
 mod bulk;
 mod config;
 mod controller;
+mod corehttp;
 mod covers;
 mod discover;
 mod downloads;
