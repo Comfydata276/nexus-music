@@ -1049,11 +1049,64 @@ fn a_poll_s_answer_is_measured_before_it_is_built() {
     assert_eq!(link.admit_poll(1, &[PC], &chosen, false, false, &Limits { writing: 1000, ..Limits::default() }).map(|bytes| bytes.len()), None);
 }
 
-/// A connection that stops reading is given up on, not waited for. (The deadline is the
+/// On the route itself: a device that asks for a great deal and reads none of it. The
+/// write that stops making progress is given up at its deadline, and the route's thread
+/// takes the next request; what the reply held of the budget is given back.
+#[test]
+fn a_write_to_a_device_that_stops_reading_is_given_up_on_the_route() {
+    assert!(the_route_serves_another_after_a_stuck_write(Duration::from_millis(300), Duration::from_secs(20)), "nobody else was answered");
+    // And it is the deadline that does it: with none to speak of, the thread stays stuck.
+    assert!(!the_route_serves_another_after_a_stuck_write(Duration::from_secs(3600), Duration::from_secs(3)), "the thread was never stuck");
+}
+
+/// Whether, with one thread on the route and that thread writing an answer far larger
+/// than the system will hold on the way to a device that reads none of it, another device
+/// is served within `patience`.
+fn the_route_serves_another_after_a_stuck_write(deadline: Duration, patience: Duration) -> bool {
+    let (to, relay) = relay(|config| {
+        config.link.threads = 1;
+        config.link.write_wait = deadline;
+        // (An answer is never this big as shipped: at most half a megabyte, which the
+        // system takes whole however slow the reader. To see a write stop, the limits on
+        // how much may wait and be answered at once are lifted for this test.)
+        config.link.mailbox_frames = 1000;
+        config.link.mailbox_bytes = 256 * 1024 * 1024;
+        config.link.room_bytes = 256 * 1024 * 1024;
+        config.link.poll_answer = 256 * 1024 * 1024;
+        config.link.writing = 256 * 1024 * 1024;
+        config.link.sends = (1000.0, 1000.0);
+        config.link.sends_per_address = 10000.0;
+    });
+    let (pc, phone) = (enter(to, ROOM, PC), enter(to, ROOM, PHONE));
+    let frame = "A".repeat(256 * 1024);
+    for _ in 0..160 {
+        assert_eq!(send(to, ROOM, &pc, PHONE, &frame), 200);
+    }
+    // The phone asks for all forty megabytes of it and reads nothing.
+    let mut stuck = TcpStream::connect(to).unwrap();
+    stuck.write_all(format!("GET /api/link/{ROOM}/poll?v=0&after=0 HTTP/1.1\r\nHost: relay\r\nAuthorization: Bearer {KEY}\r\nX-Nexus-Link: {phone}\r\n\r\n").as_bytes()).unwrap();
+    until(|| relay.link.totals().writing > 30 * 1024 * 1024);
+    assert!(relay.link.totals().writing > 30 * 1024 * 1024, "the answer was never being written");
+    // Another device asks meanwhile.
+    let mut other = TcpStream::connect(to).unwrap();
+    other.set_read_timeout(Some(patience)).unwrap();
+    other.write_all(format!("GET /api/link/{ROOM}/poll?v=0&after=0 HTTP/1.1\r\nHost: relay\r\nAuthorization: Bearer {KEY}\r\nX-Nexus-Link: {pc}\r\n\r\n").as_bytes()).unwrap();
+    let mut answer = Vec::new();
+    let served = other.read_to_end(&mut answer).is_ok() && answer.starts_with(b"HTTP/1.1 200 ");
+    if served {
+        // Given up, the stuck answer holds nothing of the budget any more.
+        until(|| relay.link.totals().writing == 0);
+        assert_eq!(relay.link.totals().writing, 0);
+    }
+    drop(stuck);
+    served
+}
+
+/// Where jams are served: a connection that stops reading is given up on, not waited for. (The deadline is the
 /// listening socket's, which a connection taken from it starts with: so on Linux.)
 #[cfg(target_os = "linux")]
 #[test]
-fn a_write_that_makes_no_progress_is_given_up() {
+fn a_write_that_makes_no_progress_is_given_up_where_jams_are_served() {
     assert!(stuck_writes_are_given_up(Duration::from_millis(10), Duration::from_secs(90)), "nobody else was answered");
     // And it is the deadline that does it: with none to speak of, the thread stays stuck.
     assert!(!stuck_writes_are_given_up(Duration::from_secs(3600), Duration::from_secs(6)), "the thread was never stuck");
