@@ -822,6 +822,12 @@ impl Controller {
             pb.current_token = 0;
             pb.next_token = 0;
             pb.position = 0.0;
+            // Similar songs asked for to follow the queue that has just gone are for no
+            // queue now: an answer still on its way must not add them to whatever is in
+            // the player by then (the next sign-in's queue, put back).
+            pb.autoplay_seed.clear();
+            pb.autoplay_loading = false;
+            pb.autoplay_resume = false;
         }
         self.engine.set_playing(false);
         self.engine.stop();

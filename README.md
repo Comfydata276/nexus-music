@@ -331,6 +331,15 @@ it is whole).
   without looking) the server holds the queue that isn't being played. A third device that
   looks in those seconds with nothing of its own in its queue picks that one up, and puts it
   right at its next look. The server's saved queue doesn't say whether its device is playing.
+- A device that is following another's queue (it picked it up, and you haven't touched it)
+  knows the save it picked up by its time, which the server gives to the second. A second
+  save by that device within the same second is not picked up; the one after it is.
+- A queue put back at start-up whose note of where it had got to is missing or is for
+  another queue is treated as your own, whether or not it was one picked up from another
+  device: it is then offered the other device's queue, never replaced by it.
+- Hidden in the notification area the app looks once a minute, counted in quarters of a
+  minute from the last look. Opening the window and hiding it again between two of those
+  can bring the next look round sooner than a minute.
 - If the answer to a write is lost (the app is closed, the connection drops) and, before this
   device next looks, another device deliberately sets the opposite, this device makes its
   change again on top of that.
