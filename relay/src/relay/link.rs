@@ -214,7 +214,8 @@ enum Job {
     Write(Answer),
 }
 
-/// How much the route holds at this moment.
+/// How much the route holds at this moment: for the tests, which count it.
+#[cfg(test)]
 #[derive(Debug, Default, PartialEq)]
 pub struct Totals {
     pub rooms: usize,
@@ -249,6 +250,7 @@ impl Link {
         self.writing.fetch_sub(bytes, Ordering::SeqCst);
     }
 
+    #[cfg(test)]
     pub fn totals(&self) -> Totals {
         let rooms = self.rooms.lock().unwrap();
         let places = || rooms.values().flat_map(|room| room.places.iter());
