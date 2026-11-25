@@ -60,24 +60,24 @@ fn due(window_open: bool, hidden: &std::sync::atomic::AtomicU32) -> bool {
 
 /// Step 1: asks the server for the list of playlists and for the one that holds the record.
 /// Nothing of what this PC holds is needed for it, and nothing is written.
-/// (The app itself asks through [`read_both`]. This is for the tests, and for the Android
-/// repository's stand-in PC, which is built from this file.)
-#[cfg_attr(not(test), allow(dead_code))]
+/// (The app asks through [`read_both`], and through this for a second asking. It is also
+/// what the Android repository's stand-in PC, which is built from this file, asks through.)
 pub fn read(client: &Client) -> ApiResult<Answers> {
-    read_both(client).map(|read| read.answers)
+    read_both(client, |_| {})
 }
 
-/// What asking the server for an exchange brought: the answers it decides from, and the
-/// list of playlists as the app lists them. That is the same answer as the first of those,
-/// read the other way, so a look at what other devices changed asks for it once.
-pub struct Read {
-    pub answers: Answers,
-    /// `None` if the answer couldn't be read that way.
-    pub playlists: Option<Vec<crate::subsonic::Playlist>>,
-}
-
-pub fn read_both(client: &Client) -> ApiResult<Read> {
-    let (playlists, listed) = client.playlists_both()?;
+/// The same asking, with the list of playlists also handed to `listed` as the app lists
+/// them: it is the same answer as the exchange's first, read the other way, so a look at
+/// what other devices changed asks for it once. **It is handed over the moment it
+/// arrives**, before the record's own playlist is asked for and whatever becomes of that
+/// request: one answer, two readers, neither waiting for the other. (Not handed over at
+/// all if the answer can't be read that way.)
+pub fn read_both(client: &Client, listed: impl FnOnce(Vec<crate::subsonic::Playlist>)) -> ApiResult<Answers> {
+    let (playlists, stated) = client.playlists_both()?;
+    if let Some(playlists) = playlists {
+        listed(playlists);
+    }
+    let listed = stated;
     let (playlist, date, received) = match find(&listed.value, client.username()) {
         Found::Ours(id) => {
             let answer = client.playlist_stated(&id)?;
@@ -85,7 +85,7 @@ pub fn read_both(client: &Client) -> ApiResult<Read> {
         }
         _ => (None, listed.date, listed.received),
     };
-    Ok(Read { answers: Answers { listed: listed.value, playlist, date, received }, playlists })
+    Ok(Answers { listed: listed.value, playlist, date, received })
 }
 
 /// Step 7.3: makes a write the library asked for: the playlist first, if there is none
@@ -560,8 +560,18 @@ impl Controller {
         }
         let session = self.session.load(Ordering::SeqCst);
         self.api_pool.spawn(move || {
-            let answers = read_both(&client);
-            post(move |ctl| ctl.answered(session, client, answers, false, look));
+            let answers = read_both(&client, |playlists| {
+                // The list of playlists, as the sidebar and the pages show it: what a look
+                // used to ask for a second time. Drawn now, not when the exchange is done.
+                if look {
+                    post(move |ctl| {
+                        if ctl.client().is_some() {
+                            ctl.playlists_arrived(playlists);
+                        }
+                    });
+                }
+            });
+            post(move |ctl| ctl.answered(session, client, answers, false));
         });
         true
     }
@@ -604,7 +614,7 @@ impl Controller {
     /// between the two reads looks like, and it is no fault: the server is asked once more
     /// straight away, and only answers that disagree a second time running stop the
     /// exchange and are said.
-    fn answered(self: &Rc<Self>, session: u64, client: Client, answers: ApiResult<Read>, again: bool, look: bool) {
+    fn answered(self: &Rc<Self>, session: u64, client: Client, answers: ApiResult<Answers>, again: bool) {
         // Step 2. (Let go: dropped. But it has come back, so the next may begin.)
         if session != self.session.load(Ordering::SeqCst) {
             return self.exchange_over();
@@ -612,12 +622,7 @@ impl Controller {
         if !self.sync_on() {
             return self.exchange_over();
         }
-        let Ok(Read { answers, playlists }) = answers else { return self.exchange_over() };
-        // The list of playlists, as the sidebar and the pages show it: what a look used to
-        // ask for a second time.
-        if let Some(playlists) = playlists.filter(|_| look) {
-            self.playlists_arrived(playlists);
-        }
+        let Ok(answers) = answers else { return self.exchange_over() };
         self.clock.set(nexus_core::step::clock(&answers));
         // Step 3: decided from what this PC holds now.
         let plan = match settle(&self.device(), &answers) {
@@ -625,8 +630,10 @@ impl Controller {
             Outcome::Stop(Stop::Disagree) if !again => {
                 // (Still this exchange: nothing else begins until it is back.)
                 self.api_pool.spawn(move || {
-                    let answers = read_both(&client);
-                    post(move |ctl| ctl.answered(session, client, answers, true, look));
+                    // (The sidebar was drawn from the first asking; this one is the
+                    // exchange's alone.)
+                    let answers = read(&client);
+                    post(move |ctl| ctl.answered(session, client, answers, true));
                 });
                 return;
             }
@@ -986,6 +993,8 @@ mod tests {
         playlists: Vec<(String, String, Option<String>, String)>,
         date: Option<String>,
         asked: Vec<String>,
+        /// The server is in trouble with single playlists: asked for one, it fails.
+        no_playlist: bool,
     }
 
     fn decoded(text: &str) -> String {
@@ -1018,6 +1027,10 @@ mod tests {
                 let comment = if comment.is_empty() { String::new() } else { format!(r#","comment":{}"#, serde_json::to_string(comment).unwrap()) };
                 format!(r#"{{"id":"{id}","name":"{name}"{owner}{comment}}}"#)
             };
+            if stored.no_playlist && path == "/rest/getPlaylist" {
+                let _ = write!(stream, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                return;
+            }
             let fields = match path {
                 "/rest/getPlaylists" => format!(r#""playlists":{{"playlist":[{}]}}"#, stored.playlists.iter().map(said).collect::<Vec<_>>().join(",")),
                 "/rest/getPlaylist" => {
@@ -1099,9 +1112,32 @@ mod tests {
         assert!(stated.value.len() == 3 && stated.date.is_some());
         assert_eq!((stated.value[2].owner.clone(), stated.value[2].comment.clone()), (None, None));
         // And the exchange decides from the same answers either way.
-        let both = read_both(&client).unwrap();
+        let mut handed = None;
+        let both = read_both(&client, |playlists| handed = Some(playlists)).unwrap();
         let alone = read(&client).unwrap();
-        assert_eq!((both.answers.listed, both.answers.playlist), (alone.listed, alone.playlist));
+        assert_eq!((both.listed, both.playlist), (alone.listed, alone.playlist));
+        assert_eq!(handed, Some(client.playlists().unwrap()));
+    }
+
+    #[test]
+    fn the_list_for_the_sidebar_does_not_wait_on_the_records_own_playlist() {
+        // The list of playlists arrives; the request after it, for the record's playlist,
+        // fails. The exchange has nothing to decide from. The sidebar has its list all the
+        // same: it was handed over the moment it came.
+        let (client, stored) = navidrome();
+        {
+            let mut stored = stored.lock().unwrap();
+            stored.playlists = vec![
+                ("p1".into(), "Morning mix".into(), Some("tester".into()), String::new()),
+                ("a".into(), PLAYLIST_NAME.into(), Some("tester".into()), r#"{"nexus_music_sync":1}"#.into()),
+            ];
+            stored.no_playlist = true;
+        }
+        let mut handed = None;
+        let answers = read_both(&client, |playlists| handed = Some(playlists));
+        assert!(answers.is_err());
+        assert_eq!(handed.map(|all| all.iter().map(|one| one.name.clone()).collect::<Vec<_>>()), Some(vec!["Morning mix".to_string(), PLAYLIST_NAME.to_string()]));
+        assert_eq!(stored.lock().unwrap().asked, ["getPlaylists", "getPlaylist"]);
     }
 
     #[test]
