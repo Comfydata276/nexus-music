@@ -85,6 +85,8 @@ pub struct Playback {
     autoplay_seed: String,
     /// The queue ran out while those songs were still on their way: start them on arrival.
     autoplay_resume: bool,
+    /// And for as long as that is so, this PC counts as busy to the person's other devices.
+    autoplay_wait: Option<nexus_core::link::rule::Waiting>,
     /// The track that last triggered an early autoplay lookup, so each track asks only once.
     autoplay_asked: u64,
 }
@@ -125,6 +127,7 @@ impl Playback {
             autoplay_loading: false,
             autoplay_seed: String::new(),
             autoplay_resume: false,
+            autoplay_wait: None,
             autoplay_asked: 0,
         }
     }
@@ -378,6 +381,10 @@ impl Controller {
             pb.playing = true;
             pb.failures = 0;
             pb.autoplay_resume = false;
+            // (If the last queue had run out and was waiting for more: it waits no longer.)
+            if let Some(waiting) = pb.autoplay_wait.take() {
+                self.looked_up(waiting);
+            }
         }
         self.save_settings();
         self.start_current(0.0);
@@ -1207,6 +1214,12 @@ impl Controller {
                             // Similar songs are on their way (or about to be asked for);
                             // carry on with them when they land.
                             pb.autoplay_resume = true;
+                            // The queue has run out and what plays next is being looked
+                            // up: until it lands, this PC is busy to other devices (see
+                            // `link`). What they would act on is about to change by itself.
+                            if let Some(earlier) = pb.autoplay_wait.replace(self.looking_up()) {
+                                self.looked_up(earlier);
+                            }
                             drop(pb);
                             return self.load_autoplay();
                         }
@@ -1594,6 +1607,9 @@ impl Controller {
                 return;
             }
             pb.autoplay_loading = false;
+            if let Some(waiting) = pb.autoplay_wait.take() {
+                self.looked_up(waiting);
+            }
             self.changed();
             let resume = std::mem::take(&mut pb.autoplay_resume);
             // The queue may have been replaced while the request was out.

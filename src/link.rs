@@ -172,7 +172,7 @@ impl Controller {
     pub fn changing(&self) -> Changing<'_> {
         let outer = self.link_changing.replace(true);
         if !outer {
-            self.link_rule.borrow_mut().moved();
+            self.link_moved();
         }
         Changing { flag: &self.link_changing, outer }
     }
@@ -187,20 +187,29 @@ impl Controller {
     /// The same, for a change that is over as soon as it is made (the volume, a seek).
     pub fn changed(&self) {
         if !self.link_changing.get() {
-            self.link_rule.borrow_mut().moved();
+            self.link_moved();
         }
+    }
+
+    fn link_moved(&self) {
+        let mut rule = self.link_rule.borrow_mut();
+        rule.moved();
+        log(format!("order: moved on to {}", rule.generation()));
     }
 
     /// Something to play has been chosen and its songs are still to be looked up: until
     /// `looked_up`, or the look-up's time is up, this PC is busy to other devices. To the
     /// person at it, nothing is different.
     pub fn looking_up(&self) -> Waiting {
+        log("order: busy, something chosen here is being looked up");
         self.link_rule.borrow_mut().wait(now_ms(), LOOK_UP_MS)
     }
 
     /// The look-up is over, whatever it found.
     pub fn looked_up(&self, waiting: Waiting) {
-        self.link_rule.borrow_mut().done(waiting);
+        let mut rule = self.link_rule.borrow_mut();
+        rule.done(waiting);
+        log(format!("order: a look-up is over{}", if rule.busy(now_ms()) { ", another is still under way" } else { "" }));
     }
 }
 

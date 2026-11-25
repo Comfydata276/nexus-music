@@ -667,14 +667,31 @@ impl Controller {
         };
         match (id, &target) {
             ("play", _) => self.play_target(target, name),
-            ("play-next", _) => self.with_songs(target, |ctl, songs| {
-                ctl.enqueue(songs, true);
-                ctl.toast("Playing next");
-            }),
-            ("add-queue", _) => self.with_songs(target, |ctl, songs| {
-                ctl.enqueue(songs, false);
-                ctl.toast("Added to queue");
-            }),
+            // (Until the songs have been looked up, this PC is busy to other devices: see `link`.)
+            ("play-next", _) => {
+                let waiting = self.looking_up();
+                self.with_songs_or(
+                    target,
+                    move |ctl, songs| {
+                        ctl.looked_up(waiting);
+                        ctl.enqueue(songs, true);
+                        ctl.toast("Playing next");
+                    },
+                    move |ctl| ctl.looked_up(waiting),
+                )
+            }
+            ("add-queue", _) => {
+                let waiting = self.looking_up();
+                self.with_songs_or(
+                    target,
+                    move |ctl, songs| {
+                        ctl.looked_up(waiting);
+                        ctl.enqueue(songs, false);
+                        ctl.toast("Added to queue");
+                    },
+                    move |ctl| ctl.looked_up(waiting),
+                )
+            }
             ("pl-new", _) => self.with_songs(target, |ctl, songs| ctl.prompt_new_playlist(songs)),
             ("save-playlist", Target::Songs { songs, .. }) => self.prompt_new_playlist(songs.clone()),
             ("export", Target::Playlist { id, name }) => self.export_playlist(id.clone(), name.clone()),

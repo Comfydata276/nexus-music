@@ -28,6 +28,8 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 
+use nexus_core::link::rule::Waiting;
+
 use crate::config;
 use crate::controller::{Controller, Route, clock, post, with};
 use crate::subsonic::{Client, Song};
@@ -403,7 +405,11 @@ fn host_loop(line: Arc<Line>, id: String, secret: String, serial: u64, stop: Arc
                     let (line, id, secret, client, pool) = (line.clone(), id.clone(), secret.clone(), client.clone(), pool.clone());
                     post(move |ctl| {
                         if ctl.jam_admits(serial, &event) {
-                            pool.spawn(move || answer_guest(&line, &id, &secret, serial, client.as_ref(), event));
+                            // What changes what plays is a choice whose work is still to
+                            // do: until it is carried out, or comes to nothing, this PC is
+                            // busy to the person's other devices (see `link`).
+                            let waiting = changes_what_plays(event["action"].as_str().unwrap_or("")).then(|| ctl.looking_up());
+                            pool.spawn(move || answer_guest(&line, &id, &secret, serial, client.as_ref(), event, waiting));
                         }
                     });
                 }
@@ -428,7 +434,7 @@ fn host_loop(line: Arc<Line>, id: String, secret: String, serial: u64, stop: Arc
 
 /// Deals with one thing a guest asked for. Looking things up happens here, on a worker
 /// thread; changing what plays is passed to the UI thread.
-fn answer_guest(line: &Line, id: &str, secret: &str, serial: u64, client: Option<&Client>, event: Value) {
+fn answer_guest(line: &Line, id: &str, secret: &str, serial: u64, client: Option<&Client>, event: Value, waiting: Option<Waiting>) {
     let ask = event["id"].as_u64().unwrap_or(0);
     let guest = (event["guest"]["id"].as_str().unwrap_or("").to_string(), event["guest"]["name"].as_str().unwrap_or("Someone").to_string());
     let action = event["action"].as_str().unwrap_or("").to_string();
@@ -453,7 +459,19 @@ fn answer_guest(line: &Line, id: &str, secret: &str, serial: u64, client: Option
         }
         _ => Vec::new(),
     };
-    post(move |ctl| ctl.jam_asked(serial, ask, guest, &action, &data, songs));
+    post(move |ctl| {
+        // The look-up is over: carrying it out is what moves this PC on.
+        if let Some(waiting) = waiting {
+            ctl.looked_up(waiting);
+        }
+        ctl.jam_asked(serial, ask, guest, &action, &data, songs)
+    });
+}
+
+/// Whether a guest's request, if it is carried out, changes what this PC plays or has
+/// queued. A search, a hello and a look at the queue do not.
+fn changes_what_plays(action: &str) -> bool {
+    matches!(action, "add" | "remove" | "load" | "volume" | "skip" | "previous" | "pause" | "play" | "seek" | "jump" | "move" | "clear" | "shuffle" | "repeat")
 }
 
 /// The songs of a queue handed over from another device, as this library knows them, and
