@@ -430,7 +430,7 @@ connection.
 | `src/plays.rs` | The log of plays behind "Your stats". |
 | `src/saver.rs` | Writes files in the background, newest version only. |
 | `src/listenbrainz.rs` | How much songs, releases and artists are played. |
-| `src/discover.rs` | Artists worth a look that the library doesn't have. |
+| `src/discover.rs` | Artists worth a look that the library doesn't have: asking the server and Lidarr, and keeping the answer. The ranking is `core/src/discover.rs`. |
 | `src/songcache.rs` | Songs kept as they're played and fetched ahead of the queue. |
 | `src/downloads.rs` | Songs saved for offline listening. |
 | `src/offline.rs` | Offline mode and changes held until the server is reachable. |
@@ -465,6 +465,7 @@ window, the files, the connections.
 | `core/src/musicbrainz.rs`, `listenbrainz.rs`, `offer.rs` | The questions put to MusicBrainz and ListenBrainz and what is made of the answers. |
 | `core/src/lidarr.rs` | The questions put to Lidarr and what is made of the answers: looking up, asking for an album or an artist, the profiles for singles and soundtracks, what is on its way. `src/lidarr.rs` keeps the Lidarr in use and what has been offered. |
 | `core/src/asked.rs` | What has been asked for: one note per album, when to stop watching, and which arrivals have songs for playlists. The app keeps the list in its file and finds albums and songs in its own copy of the library, handing `arrivals` the two look-ups. |
+| `core/src/discover.rs` | "Artists you might like": who the favourites are, how who they're like is ranked, which of Lidarr's answers is meant, how long the answer is kept. |
 | `core/src/gate.rs` | The sign-in in front of Lidarr: finding it, the link the browser is sent to, trading the code and renewing the token. `src/gate.rs` keeps the browser's part: somewhere on this PC for it to come back to, and opening it. |
 | `core/src/http.rs` | How the library asks for a request: it asks the app. `src/corehttp.rs` is the Windows app's answer, on its own connections. |
 
