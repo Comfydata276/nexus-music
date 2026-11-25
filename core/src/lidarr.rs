@@ -106,6 +106,18 @@ impl Offers {
     }
 }
 
+/// Said once Lidarr has answered, with its version.
+pub fn connected(version: &str) -> String {
+    format!("Connected to Lidarr {version}.")
+}
+
+/// Said while there's no Lidarr to ask.
+pub const NOT_CONNECTED: &str = "Not connected yet.";
+/// Said while Lidarr is being asked whether it's there.
+pub const CHECKING: &str = "Checking…";
+/// Said when the address has moved to another host, so the key kept for the last is gone.
+pub const KEY_FORGOTTEN: &str = "That's a different address, so the saved key was forgotten. Enter the key for it.";
+
 /// Said when Lidarr can't be reached without signing in.
 pub const NEEDED: &str = "Lidarr is behind a sign-in. In Settings, under Requests, sign in with your browser.";
 

@@ -1437,7 +1437,7 @@ impl Controller {
     /// "Lidarr is behind the sign-in at auth.example.org."
     fn behind_sign_in(&self) -> String {
         let gate = crate::gate::Found { service: self.settings.borrow().lidarr_gate.clone(), client: String::new() };
-        format!("Lidarr is behind the sign-in at {}.", gate.host())
+        nexus_core::gate::behind_sign_in(gate.host())
     }
 
     /// Saves where Lidarr is and its key, then connects: checks that it answers and, if a
@@ -1469,7 +1469,7 @@ impl Controller {
         self.connect_requests();
         self.push_settings();
         if forgotten {
-            return self.requests_state("none", "That's a different address, so the saved key was forgotten. Enter the key for it.");
+            return self.requests_state("none", nexus_core::lidarr::KEY_FORGOTTEN);
         }
         self.check_requests(true);
     }
@@ -1479,11 +1479,11 @@ impl Controller {
     /// straight away, not just offered.
     pub fn check_requests(&self, by_hand: bool) {
         let Some(lidarr) = crate::lidarr::current() else {
-            return self.requests_state("none", "Not connected yet.");
+            return self.requests_state("none", nexus_core::lidarr::NOT_CONNECTED);
         };
         let check = self.requests_check.get() + 1;
         self.requests_check.set(check);
-        self.requests_state("checking", "Checking…");
+        self.requests_state("checking", nexus_core::lidarr::CHECKING);
         let address = crate::lidarr::tidy(&self.settings.borrow().lidarr_address);
         self.api_pool.spawn(move || {
             let answer = lidarr.version();
@@ -1522,7 +1522,7 @@ impl Controller {
         self.push_settings();
         let signed_out = !self.settings.borrow().lidarr_gate.is_empty() && config::load_secret(&self.paths, "lidarr-token").is_none();
         match (answer, gate) {
-            (Ok(version), _) => self.requests_state("connected", &format!("Connected to Lidarr {version}.")),
+            (Ok(version), _) => self.requests_state("connected", &nexus_core::lidarr::connected(&version)),
             (Err(_), Some(Ok(Some(_)))) if by_hand => self.sign_in_requests(),
             (Err(_), Some(Ok(Some(_)))) => self.requests_state("sign-in", &self.behind_sign_in()),
             (Err(_), Some(Err(why))) => self.requests_state("error", &why),
@@ -1541,7 +1541,7 @@ impl Controller {
         }
         let round = crate::gate::new_round();
         self.requests_check.set(self.requests_check.get() + 1);
-        self.requests_state("waiting", &format!("Finish signing in at {} in your browser.", found.host()));
+        self.requests_state("waiting", &nexus_core::gate::finish_in_browser(found.host()));
         std::thread::spawn(move || {
             let agent = crate::subsonic::make_agent_without_redirects();
             let result = crate::gate::begin(&found).and_then(|attempt| {
@@ -1608,7 +1608,7 @@ impl Controller {
         self.save_settings();
         self.connect_requests();
         self.push_settings();
-        self.requests_state("sign-in", &format!("Signed out. {}", self.behind_sign_in()));
+        self.requests_state("sign-in", &nexus_core::gate::signed_out(&self.behind_sign_in()));
     }
 
     /// Asks whether to request an album that isn't in the library. `song` is the song that

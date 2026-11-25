@@ -21,8 +21,7 @@ use nexus_core::gate::{base64url, param};
 pub use nexus_core::gate::{Found, Session, SignedIn};
 pub use nexus_core::lidarr::NEEDED;
 
-/// How long to wait for someone to finish signing in in the browser.
-const WAIT: Duration = Duration::from_secs(5 * 60);
+use nexus_core::gate::{Page, WAIT};
 
 /// The connection the sign-in service is asked over: one of the app's agents, which must be
 /// one that doesn't follow redirects.
@@ -51,7 +50,7 @@ pub fn session(found: Found, token: String, keep: impl Fn(&str) + Send + Sync + 
 /// Letters nobody could guess, from the system's own source of randomness.
 fn unguessable(bytes: usize) -> Result<String, String> {
     let mut buffer = vec![0u8; bytes];
-    getrandom::fill(&mut buffer).map_err(|_| "This PC couldn't supply random numbers for the sign-in.".to_string())?;
+    getrandom::fill(&mut buffer).map_err(|_| nexus_core::gate::no_random_numbers("PC"))?;
     Ok(base64url(&buffer))
 }
 
@@ -82,21 +81,13 @@ pub struct Attempt {
 
 /// Gets ready for a sign-in: opens a door on this PC for the browser to come back through.
 pub fn begin(found: &Found) -> Result<Attempt, String> {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(|e| format!("Couldn't get ready for the browser to come back. {e}"))?;
+    let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(|e| nexus_core::gate::not_ready(&e))?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
     let back = format!("http://127.0.0.1:{port}/callback");
     let secret = unguessable(48)?;
     let state = unguessable(18)?;
     let link = nexus_core::gate::sign_in_link(found, &back, &state, &secret);
     Ok(Attempt { listener, found: found.clone(), secret, state, back, link })
-}
-
-fn page(heading: &str, body: &str) -> String {
-    format!(
-        "<!doctype html><meta charset=\"utf-8\"><title>Nexus Music</title>\
-         <body style=\"margin:0;height:100vh;display:grid;place-items:center;background:#0d1117;color:#e6edf3;font:16px system-ui,sans-serif\">\
-         <div style=\"text-align:center;max-width:28em;padding:24px\"><h1 style=\"font-size:22px\">{heading}</h1><p style=\"color:#9da7b3\">{body}</p></div>"
-    )
 }
 
 fn reply(stream: &mut TcpStream, status: &str, body: &str) {
@@ -139,7 +130,7 @@ impl Attempt {
                 return Err(String::new());
             }
             if Instant::now() > deadline {
-                return Err("Nobody signed in within five minutes. Try again when you're ready.".into());
+                return Err(nexus_core::gate::NOBODY_SIGNED_IN.into());
             }
             let mut stream = match self.listener.accept() {
                 Ok((stream, _)) => stream,
@@ -147,25 +138,25 @@ impl Attempt {
                     std::thread::sleep(Duration::from_millis(100));
                     continue;
                 }
-                Err(e) => return Err(format!("Couldn't hear back from the browser. {e}")),
+                Err(e) => return Err(nexus_core::gate::not_heard(&e)),
             };
             let line = first_line(&mut stream);
             let target = line.split_whitespace().nth(1).unwrap_or_default();
             let (path, query) = target.split_once('?').unwrap_or((target, ""));
             if path != "/callback" || param(query, "state").as_deref() != Some(self.state.as_str()) {
-                reply(&mut stream, "404 Not Found", &page("Nothing here", "This page only finishes a sign-in to Nexus Music."));
+                reply(&mut stream, "404 Not Found", &nexus_core::gate::page(Page::NothingHere));
                 continue;
             }
             if let Some(error) = param(query, "error") {
                 let why = param(query, "error_description").filter(|why| !why.is_empty()).unwrap_or(error);
-                reply(&mut stream, "200 OK", &page("The sign-in didn't go through", "Go back to Nexus Music to try again."));
-                return Err(format!("The sign-in service turned the sign-in down: {why}"));
+                reply(&mut stream, "200 OK", &nexus_core::gate::page(Page::NotThrough));
+                return Err(nexus_core::gate::turned_down(&why));
             }
             if let Some(code) = param(query, "code").filter(|code| !code.is_empty()) {
-                reply(&mut stream, "200 OK", &page("You're signed in", "You can close this tab and go back to Nexus Music."));
+                reply(&mut stream, "200 OK", &nexus_core::gate::page(Page::SignedIn));
                 return Ok(code);
             }
-            reply(&mut stream, "400 Bad Request", &page("Nothing here", "This page only finishes a sign-in to Nexus Music."));
+            reply(&mut stream, "400 Bad Request", &nexus_core::gate::page(Page::NothingHere));
         }
     }
 }
@@ -196,6 +187,35 @@ pub fn open_link(url: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The page as 0.40.8 made it, kept to hold the library's to.
+    fn page_as_it_was(heading: &str, body: &str) -> String {
+        format!(
+            "<!doctype html><meta charset=\"utf-8\"><title>Nexus Music</title>\
+             <body style=\"margin:0;height:100vh;display:grid;place-items:center;background:#0d1117;color:#e6edf3;font:16px system-ui,sans-serif\">\
+             <div style=\"text-align:center;max-width:28em;padding:24px\"><h1 style=\"font-size:22px\">{heading}</h1><p style=\"color:#9da7b3\">{body}</p></div>"
+        )
+    }
+
+    #[test]
+    fn shows_the_browser_the_pages_and_says_the_words_it_always_has() {
+        assert_eq!(nexus_core::gate::page(Page::SignedIn), page_as_it_was("You're signed in", "You can close this tab and go back to Nexus Music."));
+        assert_eq!(nexus_core::gate::page(Page::NotThrough), page_as_it_was("The sign-in didn't go through", "Go back to Nexus Music to try again."));
+        assert_eq!(nexus_core::gate::page(Page::NothingHere), page_as_it_was("Nothing here", "This page only finishes a sign-in to Nexus Music."));
+        assert_eq!(WAIT, Duration::from_secs(5 * 60));
+        assert_eq!(nexus_core::gate::NOBODY_SIGNED_IN, "Nobody signed in within five minutes. Try again when you're ready.");
+        assert_eq!(nexus_core::gate::turned_down("not allowed"), "The sign-in service turned the sign-in down: not allowed");
+        assert_eq!(nexus_core::gate::not_ready(&"in use"), "Couldn't get ready for the browser to come back. in use");
+        assert_eq!(nexus_core::gate::not_heard(&"broken"), "Couldn't hear back from the browser. broken");
+        assert_eq!(nexus_core::gate::no_random_numbers("PC"), "This PC couldn't supply random numbers for the sign-in.");
+        assert_eq!(nexus_core::gate::behind_sign_in("auth.example.org"), "Lidarr is behind the sign-in at auth.example.org.");
+        assert_eq!(nexus_core::gate::finish_in_browser("auth.example.org"), "Finish signing in at auth.example.org in your browser.");
+        assert_eq!(nexus_core::gate::signed_out("Lidarr is behind the sign-in at x."), "Signed out. Lidarr is behind the sign-in at x.");
+        assert_eq!(nexus_core::lidarr::connected("2.12.4"), "Connected to Lidarr 2.12.4.");
+        assert_eq!(nexus_core::lidarr::NOT_CONNECTED, "Not connected yet.");
+        assert_eq!(nexus_core::lidarr::CHECKING, "Checking…");
+        assert_eq!(nexus_core::lidarr::KEY_FORGOTTEN, "That's a different address, so the saved key was forgotten. Enter the key for it.");
+    }
 
     #[test]
     fn makes_secrets_nobody_could_guess() {
