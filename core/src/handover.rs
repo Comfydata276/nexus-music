@@ -18,7 +18,35 @@
 //! **The contract.** What an app keeps, and saves with the queue so that it is there after a
 //! restart: [`Here::stamp`], when the queue was last changed or played on here, **by this
 //! device's own clock**; and [`Here::taken`], set when the queue is one taken up from
-//! another device and cleared when anything is done to it here. Then:
+//! another device and cleared when anything is done to it here.
+//!
+//! What every app owes, the Windows app and the phone alike:
+//!
+//! * **Whose the queue is, is said at the person's own action**, not found out afterwards
+//!   from the queue looking different. `taken` is cleared and the stamp set at the press: a
+//!   row played, a song queued, moved or removed, the queue cleared, a jump in it, Play,
+//!   Pause, a seek, Next, Previous, however it reaches the player. A seek while paused, or
+//!   Play and then Pause inside a second, changes nothing a look at the queue would notice,
+//!   and is the person's own all the same. What the app does by itself claims nothing: the
+//!   next song beginning, a failed one passed over, similar songs arriving, a sleep timer,
+//!   the sound going, another device's queue put in the player, a restart putting the last
+//!   run's queue back.
+//! * **"Continue here", once taken, is the person's own choice**: the queue put in by it is
+//!   this device's own from that moment, not `taken`.
+//! * **[`Here::ids`] is always given**: the ids of the queue's songs, in order, as the
+//!   device would save them ([`window`]); and where it would save nothing though something
+//!   is at the cursor (a radio station), the id of that one thing. It is empty only for an
+//!   empty queue, and [`Here::current`] is `None` only then too. Both or neither: a device
+//!   that names a current song and no songs is in breach, and [`look`] stops a debug build
+//!   on it. (A release build then goes by the current song alone, which can hide an offer.)
+//! * **An offer that is showing is withdrawn** when it is taken, when the person does
+//!   anything to the queue or to playing it here, when a look could not ask the server, and
+//!   when sharing is switched off; and the offer of one saved queue (its time and who saved
+//!   it), once taken or acted past, is never made again.
+//! * **Looks are numbered**: the answer to an older one that arrives after a newer one's
+//!   changes nothing.
+//!
+//! Then:
 //!
 //! *A save* (a few seconds after a change, and now and then while a song plays). Saves take
 //! turns, one at a time, in the order asked.
@@ -121,9 +149,11 @@ pub struct Here {
     /// played of it here since: when that device saved it, as the server said
     /// ([`Place::taken`]).
     pub taken: Option<String>,
-    /// The songs of this device's queue as it would save them ([`window`]'s `ids`): what
-    /// tells another device's queue with the same song current from the same queue. Left
-    /// empty, only the current song is compared.
+    /// The songs of this device's queue, in order, as it would save them ([`window`]'s
+    /// `ids`): what tells another device's queue with the same song current from the same
+    /// queue. **Always given** (see the contract at the top): empty only for an empty queue,
+    /// where `current` is `None` too; for a queue nothing of which would be saved (a radio
+    /// station at the cursor), the id of what is at the cursor.
     pub ids: Vec<String>,
 }
 
@@ -188,12 +218,18 @@ fn usable(clock: Clock) -> bool {
 /// Whether the server's queue is the one this device has: the same song current and, where
 /// the device says what its queue holds, the same songs around it.
 fn same_queue(theirs: &PlayQueue, here: &Here) -> bool {
+    // (A device that names a current song and no songs is in breach of the contract: a
+    // debug build stops on it in `look`. A release build goes by the current song alone.)
     here.current.as_deref() == Some(theirs.current.as_str()) && (here.ids.is_empty() || here.ids.iter().eq(theirs.songs.iter().map(|song| &song.id)))
 }
 
 /// Decides what a look at the server's saved queue leads to. `clock` is this device's clock
 /// beside the server's as that very read measured it, and `now` this device's clock.
 pub fn look(theirs: &PlayQueue, here: &Here, clock: Clock, now: i64) -> Looked {
+    debug_assert!(
+        here.current.is_none() == here.ids.is_empty(),
+        "a device says what its queue holds, always: a current song and its songs, or neither (see the contract at the top of handover.rs)"
+    );
     if !usable(clock) {
         return Looked { offer: None, then: Then::Nothing };
     }
@@ -289,12 +325,16 @@ mod tests {
     /// This device, its queue last changed `stamp` seconds into that day by its own clock:
     /// a queue of the person's own, with the song "mine" current.
     fn here(stamp: i64) -> Here {
-        Here { device: ME.into(), current: Some("mine".into()), playing: false, stamp: DAY + stamp, taken: None, ids: Vec::new() }
+        Here { device: ME.into(), current: Some("mine".into()), playing: false, stamp: DAY + stamp, taken: None, ids: vec!["mine".into(), "next".into()] }
     }
 
     /// The same device with nothing in its queue.
     fn empty(stamp: i64) -> Here {
-        Here { current: None, ..here(stamp) }
+        Here { current: None, ids: Vec::new(), ..here(stamp) }
+    }
+
+    fn ids(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|id| id.to_string()).collect()
     }
 
     #[test]
@@ -361,7 +401,7 @@ mod tests {
         // The PC's queue, saved at 00:10:00, was taken up here.
         let theirs = saved(PC, 600, &["a", "b", "c"], "b", 30_000);
         let Then::TakeUp(taken_up) = look(&theirs, &empty(100), RIGHT, DAY + 700).then else { panic!("not taken up") };
-        let taken = Here { current: Some("b".into()), stamp: taken_up.stamp, taken: Some(taken_up.taken.clone()), ..here(0) };
+        let taken = Here { current: Some("b".into()), ids: ids(&["a", "b", "c"]), stamp: taken_up.stamp, taken: Some(taken_up.taken.clone()), ..here(0) };
         // A save asked for before it was taken up comes due: what is in the player is the
         // PC's queue, untouched, and it is not passed on as this device's, changed now.
         assert_eq!(first(&taken), First::Read);
@@ -399,9 +439,9 @@ mod tests {
         let busy = Here { playing: true, ..here(100) };
         assert_eq!(look(&theirs, &busy, RIGHT, DAY + 700), Looked { offer: Some(1), then: Then::Nothing });
         assert_eq!(look(&theirs, &busy, RIGHT, DAY + 600 + OFFER_FOR).offer, None);
-        // Nobody is offered the song they are on already, nor their own queue.
+        // Nobody is offered the queue they have already, nor their own.
         for device in [&idle, &busy] {
-            assert_eq!(look(&theirs, &Here { current: Some("b".into()), ..device.clone() }, RIGHT, DAY + 700).offer, None);
+            assert_eq!(look(&theirs, &Here { current: Some("b".into()), ids: ids(&["a", "b", "c"]), ..device.clone() }, RIGHT, DAY + 700).offer, None);
             assert_eq!(look(&saved(ME, 600, &["a", "b"], "b", 0), device, RIGHT, DAY + 700), Looked { offer: None, then: Then::Nothing });
         }
         // Changed here after the PC saved, and paused: the PC's is the older, so it is
@@ -419,7 +459,6 @@ mod tests {
         // Both devices are on the song "b". Where this one says what is in its queue, it is
         // offered the other's only if the songs around "b" are not the same ones.
         let theirs = saved(PC, 600, &["a", "b", "c"], "b", 30_000);
-        let ids = |ids: &[&str]| ids.iter().map(|id| id.to_string()).collect::<Vec<_>>();
         let on_b = Here { current: Some("b".into()), ..here(100) };
         assert_eq!(look(&theirs, &Here { ids: ids(&["a", "b", "c"]), ..on_b.clone() }, RIGHT, DAY + 700).offer, None);
         // The person added a song here: another queue, and the PC's is offered.
@@ -430,8 +469,6 @@ mod tests {
         let playing = Here { playing: true, ids: ids(&["a", "b", "c", "x"]), ..on_b.clone() };
         assert_eq!(look(&theirs, &playing, RIGHT, DAY + 700).offer, Some(1));
         assert_eq!(look(&theirs, &Here { ids: ids(&["a", "b", "c"]), ..playing }, RIGHT, DAY + 700).offer, None);
-        // A device that doesn't say what is in its queue is judged by its current song alone.
-        assert_eq!(look(&theirs, &on_b, RIGHT, DAY + 700).offer, None);
         // What is in the queue here never decides whether another's is taken up: only
         // whether there is anything of the person's to lose.
         assert_eq!(look(&theirs, &Here { ids: ids(&["a", "b", "c"]), ..on_b.clone() }, RIGHT, DAY + 700).then, Then::Nothing);
@@ -443,19 +480,20 @@ mod tests {
         // phone, not playing, took that queue up (00:10:00), and has followed it since.
         let theirs = saved(PC, 600, &["a", "b", "c"], "b", 30_000);
         let Then::TakeUp(taken_up) = look(&theirs, &empty(0), RIGHT, DAY + 610).then else { panic!("not taken up") };
-        let following = Here { current: Some("b".into()), stamp: taken_up.stamp, taken: Some(taken_up.taken.clone()), ..here(0) };
+        let following = Here { current: Some("b".into()), ids: ids(&["a", "b", "c"]), stamp: taken_up.stamp, taken: Some(taken_up.taken.clone()), ..here(0) };
         // Left alone it goes on following: the PC's next save is taken up as the last was.
         assert!(matches!(look(&saved(PC, 620, &["a", "b", "c"], "b", 50_000), &following, RIGHT, DAY + 625).then, Then::TakeUp(_)));
 
         // The person adds a song to it at 00:11:00. From then it is this device's own queue.
-        let own = Here { taken: None, stamp: DAY + 660, ..following.clone() };
+        let own = Here { taken: None, stamp: DAY + 660, ids: ids(&["a", "b", "c", "x"]), ..following.clone() };
         // Its save goes (the PC's last save is the older)...
         assert_eq!(save(&saved(PC, 640, &["a", "b", "c"], "b", 70_000), &own, RIGHT), Save::Save);
         // ...and the PC, playing, saves over it twenty seconds later without a look. The
         // look after that finds the PC's queue the newer. It is not put in this one's
         // place: the song just added is still here.
+        // The PC's is offered instead: the same song, but not the same songs after it.
         let again = saved(PC, 680, &["a", "b", "c"], "b", 110_000);
-        assert_eq!(look(&again, &own, RIGHT, DAY + 700), Looked { offer: None, then: Then::Nothing });
+        assert_eq!(look(&again, &own, RIGHT, DAY + 700), Looked { offer: Some(1), then: Then::Nothing });
         // Nor does this device save over the PC again: the two don't take turns.
         assert_eq!(save(&again, &own, RIGHT), Save::NotNewest);
         // When the PC moves on to another song, that is offered, and still nothing is done
@@ -473,6 +511,16 @@ mod tests {
         assert_eq!(look(&moved, &here(-80_000), RIGHT, DAY + 815).then, Then::Nothing);
         // A device with nothing in its queue has nothing of the person's to lose: taken up.
         assert!(matches!(look(&moved, &empty(-80_000), RIGHT, DAY + 815).then, Then::TakeUp(_)));
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "a device says what its queue holds")]
+    fn a_device_that_names_a_current_song_and_no_songs_is_stopped_in_a_debug_build() {
+        // (Left to pass, it would be judged by its current song alone, and an offer of the
+        // same song in another queue would be hidden.)
+        let silent = Here { ids: Vec::new(), ..here(100) };
+        look(&saved(PC, 600, &["a", "b", "c"], "b", 0), &silent, RIGHT, DAY + 700);
     }
 
     #[test]
@@ -508,7 +556,7 @@ mod tests {
         // Once it is there (saved three seconds after the change), nothing is.
         assert_eq!(look(&saved(ME, 303, &["mine"], "mine", 0), &here(300), RIGHT, DAY + 400).then, Then::Nothing);
         // With nothing in the queue there is nothing to owe.
-        assert_eq!(look(&PlayQueue::default(), &Here { current: None, ..here(300) }, RIGHT, DAY + 400).then, Then::Nothing);
+        assert_eq!(look(&PlayQueue::default(), &empty(300), RIGHT, DAY + 400).then, Then::Nothing);
     }
 
     #[test]

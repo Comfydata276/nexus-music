@@ -887,8 +887,9 @@ impl Controller {
             stamp: self.queue_stamp.get(),
             taken: self.queue_owner.taken(),
             // What this PC would save of its queue: what tells another device's queue with
-            // the same song current from this one.
-            ids: handover::window(&in_order, pb.cursor, pb.position).map(|saved| saved.ids).unwrap_or_default(),
+            // the same song current from this one. (Where it would save nothing though
+            // something is there, a radio station, that one thing: see the library's contract.)
+            ids: handover::window(&in_order, pb.cursor, pb.position).map(|saved| saved.ids).unwrap_or_else(|| pb.current().map(|song| song.id.clone()).into_iter().collect()),
         }
     }
 
