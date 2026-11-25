@@ -36,6 +36,44 @@ const LOOK: Duration = Duration::from_secs(60);
 // follows is this app's part: asking the server, the files, and (in `impl Controller`) the
 // timers and showing what came back.
 
+/// Step 1: asks the server for the list of playlists and for the one that holds the record.
+/// Nothing of what this PC holds is needed for it, and nothing is written.
+pub fn read(client: &Client) -> ApiResult<Answers> {
+    let listed = client.playlists_stated()?;
+    let (playlist, date, received) = match find(&listed.value, client.username()) {
+        Found::Ours(id) => {
+            let answer = client.playlist_stated(&id)?;
+            (Some(answer.value), answer.date, answer.received)
+        }
+        _ => (None, listed.date, listed.received),
+    };
+    Ok(Answers { listed: listed.value, playlist, date, received })
+}
+
+/// Step 7.3: makes a write the library asked for: the playlist first, if there is none
+/// (asked for once: if the text then can't be written, the next exchange finds the playlist
+/// empty and fills it). `still` is asked immediately before **each** request that changes
+/// the server, the second as well as the first: whether it is still the same sign-in, with
+/// sharing on and the app not shutting down. Returns the playlist the record went into;
+/// `None` if `still` said no, and then nothing more was sent.
+pub fn send(client: &Client, write: &Write, still: &dyn Fn() -> bool) -> ApiResult<Option<String>> {
+    let id = match &write.into {
+        Some(id) => id.clone(),
+        None if still() => client.create_playlist(PLAYLIST_NAME, &[])?.id,
+        None => return Ok(None),
+    };
+    if id.is_empty() {
+        return Err(ApiError::NotSubsonic("The new playlist came back without an id.".into()));
+    }
+    if !still() {
+        return Ok(None);
+    }
+    client.set_playlist_comment(&id, &write.text)?;
+    Ok(Some(id))
+}
+
+// ---- what follows is this app's own: its files, taking turns, and the window ----
+
 /// One thing at a time on its way to the server and back: an exchange, or a save of the
 /// queue. **Something asked of the server that has been let go still counts as on its way
 /// until it has answered.** Letting go means its result will not be applied; it does not
@@ -135,54 +173,6 @@ impl QueueOwner {
 
     pub fn prepared(&self) -> Prepared {
         Prepared { was: self.revision.load(Ordering::SeqCst), now: self.revision.clone() }
-    }
-}
-
-/// Step 1: asks the server for the list of playlists and for the one that holds the record.
-/// Nothing of what this PC holds is needed for it, and nothing is written.
-pub fn read(client: &Client) -> ApiResult<Answers> {
-    let listed = client.playlists_stated()?;
-    let (playlist, date, received) = match find(&listed.value, client.username()) {
-        Found::Ours(id) => {
-            let answer = client.playlist_stated(&id)?;
-            (Some(answer.value), answer.date, answer.received)
-        }
-        _ => (None, listed.date, listed.received),
-    };
-    Ok(Answers { listed: listed.value, playlist, date, received })
-}
-
-/// Step 7.3: makes a write the library asked for: the playlist first, if there is none
-/// (asked for once: if the text then can't be written, the next exchange finds the playlist
-/// empty and fills it). `still` is asked immediately before **each** request that changes
-/// the server, the second as well as the first: whether it is still the same sign-in, with
-/// sharing on and the app not shutting down. Returns the playlist the record went into;
-/// `None` if `still` said no, and then nothing more was sent.
-pub fn send(client: &Client, write: &Write, still: &dyn Fn() -> bool) -> ApiResult<Option<String>> {
-    let id = match &write.into {
-        Some(id) => id.clone(),
-        None if still() => client.create_playlist(PLAYLIST_NAME, &[])?.id,
-        None => return Ok(None),
-    };
-    if id.is_empty() {
-        return Err(ApiError::NotSubsonic("The new playlist came back without an id.".into()));
-    }
-    if !still() {
-        return Ok(None);
-    }
-    client.set_playlist_comment(&id, &write.text)?;
-    Ok(Some(id))
-}
-
-/// The theme the record has, for a first look before the window opens, and when it was
-/// chosen. Found exactly as an exchange finds the record (the same reads, the same
-/// decision, for a device with nothing of its own to say); nothing is written.
-fn peek(client: &Client) -> Option<(String, i64)> {
-    let answers = read(client).ok()?;
-    let device = Device { username: client.username().to_string(), ..Default::default() };
-    match settle(&device, &answers) {
-        Outcome::Go(plan) => Some((plan.take.agreed.theme, plan.take.agreed.theme_at)),
-        Outcome::Stop(_) => None,
     }
 }
 
@@ -295,38 +285,6 @@ pub fn looked(id: &str, answer: ApiResult<Song>) -> Looked {
 }
 
 impl Controller {
-    /// Finds out whether the theme was changed on another device. The window opens in the
-    /// colours last used here without waiting for the answer; a newer choice is applied
-    /// when it arrives, which with the server close by is before the window has been seen.
-    pub fn preload_theme(&self) {
-        let Some(client) = self.client() else { return };
-        if !self.settings.borrow().sync || self.is_offline() {
-            return;
-        }
-        let session = self.session.load(Ordering::SeqCst);
-        self.api_pool.spawn(move || {
-            let Some((theme, at)) = peek(&client) else { return };
-            post(move |ctl| ctl.theme_arrived(session, theme, at));
-        });
-    }
-
-    fn theme_arrived(&self, session: u64, theme: String, at: i64) {
-        if session != self.session.load(Ordering::SeqCst) || self.client().is_none() {
-            return;
-        }
-        let told = {
-            let mut settings = self.settings.borrow_mut();
-            let known = crate::config::THEMES.iter().any(|t| t.name == theme);
-            // (Agreed, as the record has it; a theme chosen here since still shows on top.)
-            told(&mut settings, |settings| {
-                if known {
-                    settings.choices.theme_seen(&theme, at);
-                }
-            })
-        };
-        self.tell(&told);
-    }
-
     fn sync_on(&self) -> bool {
         self.settings.borrow().sync && self.client().is_some() && !self.is_offline()
     }
@@ -1005,15 +963,13 @@ mod tests {
         assert_eq!(send(&client, &second.write.unwrap(), &|| true).unwrap().as_ref(), Some(&id));
         assert!(comment(&stored, &id).contains(r#""pins":["p1","p2"]"#));
         assert_eq!(comment(&stored, "a-guests"), "theirs");
-        // The look before the window opens finds the theme there: in the playlist an
-        // exchange would use, and no other. A higher-id playlist of the account's with
+        // A device with nothing of its own to say finds the theme there: in the playlist
+        // every exchange uses, and no other. A higher-id playlist of the account's with
         // another theme in it is not looked at.
         stored.lock().unwrap().playlists.iter_mut().find(|playlist| playlist.0 == id).unwrap().3 = r#"{"nexus_music_sync":1,"theme":"Ocean","theme_at":77}"#.into();
         stored.lock().unwrap().playlists.push(("z-higher".into(), PLAYLIST_NAME.into(), Some("tester".into()), r#"{"nexus_music_sync":1,"theme":"Rose","theme_at":99}"#.into()));
-        assert_eq!(peek(&client), Some(("Ocean".to_string(), 77)));
-        // And not at all where an exchange would stop.
-        stored.lock().unwrap().playlists.iter_mut().find(|playlist| playlist.0 == id).unwrap().3 = "somebody's note".into();
-        assert_eq!(peek(&client), None);
+        let agreed = plan(decided(&client, &pc(&[]))).take.agreed;
+        assert_eq!((agreed.theme.as_str(), agreed.theme_at), ("Ocean", 77));
     }
 
     #[test]
@@ -1042,7 +998,6 @@ mod tests {
         // The owner left out of the answers: the playlist is not taken for the account's.
         stored.lock().unwrap().playlists[0].2 = None;
         assert_eq!(decided(&client, &pinned), Outcome::Stop(Stop::OwnerNotStated));
-        assert_eq!(peek(&client), None);
         assert_eq!(stored.lock().unwrap().playlists[0].3, record);
     }
 

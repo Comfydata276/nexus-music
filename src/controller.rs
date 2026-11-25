@@ -1328,9 +1328,6 @@ impl Controller {
         self.art_pool.spawn(move || warm.warm_up(6));
         *self.client.borrow_mut() = Some(client);
         self.load_account();
-        // Before any of the app is on screen: pick up the theme last chosen on any device,
-        // so it opens in the right colours instead of changing a moment later.
-        self.preload_theme();
         app.set_signed_in(true);
         *self.nav.borrow_mut() = Nav::default();
         self.cache.borrow_mut().clear();

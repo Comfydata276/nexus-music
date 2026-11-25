@@ -286,17 +286,6 @@ impl Choices {
         self.agreed = write.agreed.clone();
         self.waiting.retain(|waits| !write.carried.contains(&waits.id));
     }
-
-    /// A theme another device chose, found by a look before the window opens (nothing is
-    /// written by such a look). Taken as agreed if it is newer than what was.
-    pub fn theme_seen(&mut self, theme: &str, at: i64) -> bool {
-        let newer = in_range(at) && (at, theme) > (self.agreed.theme_at, self.agreed.theme.as_str());
-        if newer {
-            self.agreed.theme = theme.to_string();
-            self.agreed.theme_at = at;
-        }
-        newer
-    }
 }
 
 /// The record with these changes made to it, and no time put on anything.
