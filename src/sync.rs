@@ -175,6 +175,8 @@ pub struct QueueOwner {
     /// has been taken.
     looks: std::cell::Cell<u64>,
     answered: std::cell::Cell<u64>,
+    /// How many of the requests looks have made are still out.
+    out: std::cell::Cell<u32>,
 }
 
 /// A save's note of the queue it was prepared for.
@@ -249,6 +251,29 @@ impl QueueOwner {
         }
         self.answered.set(number);
         true
+    }
+
+    /// A look has sent a request (the record's, the saved queue's, the list of playlists).
+    pub fn look_sent(&self) {
+        self.out.set(self.out.get() + 1);
+    }
+
+    /// One of a look's requests has come back, with an answer or without.
+    pub fn look_back(&self) {
+        self.out.set(self.out.get().saturating_sub(1));
+    }
+
+    /// A new sign-in: whatever the last one's looks had out is not this one's to wait for.
+    pub fn looks_forgotten(&self) {
+        self.out.set(0);
+    }
+
+    /// Whether any request a look made is still out. **While one is, the timer's next look
+    /// is not made**: a request may take 45 seconds to give up and there are four workers,
+    /// so looks every 15 seconds at a server that is slow would queue behind each other,
+    /// and a write behind them.
+    pub fn look_out(&self) -> bool {
+        self.out.get() > 0
     }
 
     /// As it was left when the app last closed.
@@ -403,6 +428,7 @@ impl Controller {
     /// Starts keeping in step: now, and every so often from here on.
     pub fn start_sync(self: &Rc<Self>) {
         self.let_go();
+        self.queue_owner.looks_forgotten();
         // (What is shown is the choices as this sign-in has them.)
         self.settings.borrow_mut().show();
         self.look_elsewhere();
@@ -414,7 +440,9 @@ impl Controller {
     /// The timer has come round. With the window open, a look; hidden in the notification
     /// area, one in every [`LOOKS_WHEN_HIDDEN`].
     fn look_is_due(self: &Rc<Self>) {
-        if !due(self.ui.window().is_visible(), &HIDDEN_LOOKS) {
+        // (A look whose requests have not all come back is still being made: this turn of
+        // the timer is passed over, not queued behind it.)
+        if self.queue_owner.look_out() || !due(self.ui.window().is_visible(), &HIDDEN_LOOKS) {
             return;
         }
         self.look_elsewhere();
@@ -464,10 +492,28 @@ impl Controller {
         // Playlists made or changed elsewhere are drawn from the exchange's own read of
         // the list of playlists: it is the same request, and is made once. Only if no
         // exchange could begin now (one is still out) is the list asked for by itself.
-        if !self.share_now(true) {
-            self.reload_playlists();
+        //
+        // And a change made here that is still settling is not sent early by a look: its
+        // own exchange is three seconds away at most, and reads the server as this would.
+        if self.sync_timer.running() || !self.share_now(true) {
+            self.list_playlists();
         }
         self.check_server_queue();
+    }
+
+    /// The list of playlists by itself, for a look that makes no exchange.
+    fn list_playlists(self: &Rc<Self>) {
+        let Some(client) = self.client() else { return };
+        self.queue_owner.look_sent();
+        self.api_pool.spawn(move || {
+            let playlists = client.playlists();
+            post(move |ctl| {
+                ctl.queue_owner.look_back();
+                if let (Ok(playlists), true) = (playlists, ctl.client().is_some()) {
+                    ctl.playlists_arrived(playlists);
+                }
+            });
+        });
     }
 
     /// Something that's shared changed here: pass it on once things have settled.
@@ -559,6 +605,9 @@ impl Controller {
             return false;
         }
         let session = self.session.load(Ordering::SeqCst);
+        if look {
+            self.queue_owner.look_sent();
+        }
         self.api_pool.spawn(move || {
             let answers = read_both(&client, |playlists| {
                 // The list of playlists, as the sidebar and the pages show it: what a look
@@ -571,7 +620,12 @@ impl Controller {
                     });
                 }
             });
-            post(move |ctl| ctl.answered(session, client, answers, false));
+            post(move |ctl| {
+                if look {
+                    ctl.queue_owner.look_back();
+                }
+                ctl.answered(session, client, answers, false)
+            });
         });
         true
     }
@@ -901,9 +955,11 @@ impl Controller {
         let Some(client) = self.client() else { return };
         let session = self.session.load(Ordering::SeqCst);
         let number = self.queue_owner.look_began();
+        self.queue_owner.look_sent();
         self.api_pool.spawn(move || {
             let theirs = client.play_queue_timed();
             post(move |ctl| {
+                ctl.queue_owner.look_back();
                 // (An answer that comes after a later look's has nothing to say: that one
                 // has decided already, from what the server held more lately.)
                 if session != ctl.session.load(Ordering::SeqCst) || !ctl.sync_on() || !ctl.queue_owner.look_counts(number) {
@@ -1211,6 +1267,24 @@ mod tests {
         // ...but what that device saves next is another offer, and so is another device's.
         assert!(!owner.used(&saved("1970-01-02T00:10:20Z", "NexusMusic-0badc0de")));
         assert!(!owner.used(&saved("1970-01-02T00:10:00Z", "NexusMusic-feedf00d")));
+    }
+
+    #[test]
+    fn a_look_is_not_made_while_an_earlier_looks_requests_are_still_out() {
+        let owner = QueueOwner::default();
+        assert!(!owner.look_out());
+        // A look asks for the record and for the saved queue.
+        owner.look_sent();
+        owner.look_sent();
+        assert!(owner.look_out());
+        // One has answered; the other is slow. The timer comes round: no look.
+        owner.look_back();
+        assert!(owner.look_out());
+        // Back, with an answer or without: the next turn of the timer looks again.
+        owner.look_back();
+        assert!(!owner.look_out());
+        owner.look_back();
+        assert!(!owner.look_out());
     }
 
     #[test]
