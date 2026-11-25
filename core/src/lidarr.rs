@@ -572,7 +572,11 @@ impl Lidarr {
         let pass = self.gate.as_ref().map(|gate| gate.pass()).transpose()?;
         let (mut status, mut text) = self.once(method, &url, body.as_deref(), pass.as_deref())?;
         if (300..400).contains(&status) {
-            // The sign-in in front turned the pass away; it may only have run out early.
+            // The sign-in in front turned the pass away; it may only have run out early. A
+            // write is sent again too, once, with a fresh pass: what was turned away at the
+            // sign-in, or sent elsewhere, wasn't carried out. This is the only time anything is sent twice: the
+            // Windows app's agent sends nothing again of its own accord (see its test
+            // `a_write_to_lidarr_or_the_sign_in_is_sent_once_whatever_comes_back`).
             if let Some(gate) = &self.gate {
                 gate.forget_pass();
                 let pass = gate.pass()?;

@@ -409,4 +409,99 @@ mod tests {
             assert_eq!((status, asked.len()), (302, 1), "a redirect to {to}");
         }
     }
+
+    /// A server for the writes test: every request on every connection written down by its
+    /// first line, and each answered as `answer` says (`None`: the connection is closed
+    /// without a word). A connection is let go of after an answer that says
+    /// "Connection: close", or one ending "\r\n\r\n{}" (an answer that doesn't say so, from
+    /// a server that drops idle connections at once); otherwise kept for the next request.
+    fn counting(answer: impl Fn(&str) -> Option<String> + Send + Sync + 'static) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{BufRead, BufReader, Read};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (answer, written) = (Arc::new(answer), seen.clone());
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let (answer, written) = (answer.clone(), written.clone());
+                std::thread::spawn(move || {
+                    let mut stream = stream;
+                    let mut lines = BufReader::new(stream.try_clone().unwrap());
+                    loop {
+                        let mut first = String::new();
+                        if lines.read_line(&mut first).unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let mut length = 0;
+                        loop {
+                            let mut line = String::new();
+                            if lines.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                                break;
+                            }
+                            if let Some(value) = line.to_lowercase().strip_prefix("content-length:") {
+                                length = value.trim().parse().unwrap_or(0);
+                            }
+                        }
+                        let mut body = vec![0; length];
+                        let _ = lines.read_exact(&mut body);
+                        let first = first.trim_end().to_string();
+                        written.lock().unwrap().push(first.clone());
+                        match answer(&first) {
+                            Some(said) => {
+                                let _ = stream.write_all(said.as_bytes());
+                                if said.contains("Connection: close") || said.ends_with("\r\n\r\n{}") {
+                                    return;
+                                }
+                            }
+                            None => return,
+                        }
+                    }
+                });
+            }
+        });
+        (address, seen)
+    }
+
+    #[test]
+    fn a_write_to_lidarr_or_the_sign_in_is_sent_once_whatever_comes_back() {
+        // Lidarr's requests and the sign-in's go out on this agent (`make_agent_without_redirects`,
+        // through `Agent`). Whatever answers a POST or a PUT, ureq doesn't send it again: not
+        // when busy, not when sent elsewhere, not when told it went to the wrong server, not
+        // when the connection is closed on it. (Lidarr's own client asks again once after a
+        // redirect to the sign-in, with a fresh pass: that's `nexus_core::lidarr`, by design.)
+        let answers = [
+            Some("HTTP/1.1 503 Service Unavailable\r\nRetry-After: 0\r\nContent-Length: 0\r\n\r\n"),
+            Some("HTTP/1.1 307 Temporary Redirect\r\nLocation: /api/v1/album/monitor\r\nContent-Length: 0\r\n\r\n"),
+            Some("HTTP/1.1 308 Permanent Redirect\r\nLocation: /api/v1/album/monitor\r\nContent-Length: 0\r\n\r\n"),
+            Some("HTTP/1.1 421 Misdirected Request\r\nContent-Length: 0\r\n\r\n"),
+            Some("HTTP/1.1 408 Request Timeout\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"),
+            None,
+        ];
+        for answer in answers {
+            for put in [false, true] {
+                let (address, seen) = counting(move |_| answer.map(str::to_string));
+                let agent = Agent(crate::subsonic::make_agent_without_redirects());
+                let url = format!("{address}/api/v1/album/monitor");
+                let body = "{\"albumIds\":[1],\"monitored\":false}";
+                let method = if put { Method::Put(body) } else { Method::Post(body) };
+                let _ = agent.send(&Request { method, ..Request::get(&url) });
+                std::thread::sleep(Duration::from_millis(300));
+                assert_eq!(seen.lock().unwrap().len(), 1, "{} answered {answer:?}", if put { "PUT" } else { "POST" });
+            }
+        }
+        // A connection kept from an earlier request, closed by the other end since: the write
+        // goes out once, on a new one.
+        let (address, seen) = counting(|_| Some("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}".to_string()));
+        let agent = Agent(crate::subsonic::make_agent_without_redirects());
+        let url = format!("{address}/api/v1/album/monitor");
+        let got = agent.send(&Request::get(&url)).unwrap();
+        assert_eq!(got.body().as_deref(), Ok("{}"));
+        // The server has let the kept connection go.
+        std::thread::sleep(Duration::from_millis(100));
+        let _ = agent.send(&Request { method: Method::Put("{}"), ..Request::get(&url) });
+        std::thread::sleep(Duration::from_millis(300));
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.iter().filter(|first| first.starts_with("PUT")).count(), 1, "{seen:?}");
+    }
 }
+
