@@ -33,12 +33,27 @@ use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::sync::Condvar;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
 use super::{Relay, same};
+
+/// Locks, whatever became of the last thread to hold the lock. A fault in one request
+/// must not make every later one fail: what is held is still the best account there is of
+/// the rooms, and every sum over it is made so that it cannot go below nothing.
+fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// For the tests: a token that makes the route fault while serving the request that shows
+/// it, and one that makes it fault with its rooms locked.
+#[cfg(test)]
+pub const FAULT: &str = "fault, for a test";
+#[cfg(test)]
+pub const FAULT_HOLDING_THE_ROOMS: &str = "fault holding the rooms, for a test";
 
 /// What the route's version is called in `/api/hello`.
 pub const VERSION: u64 = 4;
@@ -202,8 +217,10 @@ fn read_head(conn: &mut Conn, wait: Duration) -> Result<Asked, Option<(u16, &'st
     Ok(asked)
 }
 
-/// Reads the body the head promised, within its deadline, as JSON. `Err` is what to say.
-fn read_body(conn: &mut Conn, asked: &mut Asked, wait: Duration) -> Result<Value, Option<(u16, &'static str)>> {
+/// Reads the body the head promised, within its deadline: the fields of a JSON object, and
+/// nothing else. A body that is JSON of another shape (a number, a list, a text) is as
+/// wrong as one that is not JSON at all, and is refused the same way. `Err` is what to say.
+fn read_body(conn: &mut Conn, asked: &mut Asked, wait: Duration) -> Result<serde_json::Map<String, Value>, Option<(u16, &'static str)>> {
     let length = asked.length.unwrap_or(0);
     let mut body = std::mem::take(&mut asked.rest);
     body.truncate(length);
@@ -216,9 +233,12 @@ fn read_body(conn: &mut Conn, asked: &mut Asked, wait: Duration) -> Result<Value
         body.extend_from_slice(&piece[..read]);
     }
     if body.is_empty() {
-        return Ok(json!({}));
+        return Ok(serde_json::Map::new());
     }
-    serde_json::from_slice(&body).map_err(|_| Some((400, "That wasn't understood.")))
+    match serde_json::from_slice(&body) {
+        Ok(Value::Object(fields)) => Ok(fields),
+        _ => Err(Some((400, "That wasn't understood."))),
+    }
 }
 
 /// Lets go of a connection that has been answered. A request refused with some of its body
@@ -250,6 +270,7 @@ fn reason(status: u16) -> &'static str {
         413 => "Payload Too Large",
         429 => "Too Many Requests",
         431 => "Request Header Fields Too Large",
+        500 => "Internal Server Error",
         _ => "Service Unavailable",
     }
 }
@@ -261,9 +282,30 @@ fn reply_head(status: u16, length: usize) -> String {
 }
 
 /// A reply to write: every byte of it, all of which has been counted against the budget.
+/// What it holds of the budget is given back when it is let go of, written or not.
 struct Answer {
     conn: Conn,
+    bytes: Charged,
+}
+
+/// The bytes of a reply, and their share of what may be being written at once.
+struct Charged {
     bytes: Vec<u8>,
+    writing: Arc<AtomicUsize>,
+}
+
+impl Drop for Charged {
+    fn drop(&mut self) {
+        let held = self.bytes.len();
+        let _ = self.writing.try_update(Ordering::SeqCst, Ordering::SeqCst, |now| Some(now.saturating_sub(held)));
+    }
+}
+
+impl std::ops::Deref for Charged {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.bytes
+    }
 }
 
 /// Somewhere a poll's answer is written: for real, or only to be measured.
@@ -372,7 +414,7 @@ impl Room {
 
     fn remove(&mut self, at: usize, link: &Link, limits: &Limits, out: &mut Vec<Answer>) {
         let place = self.places.remove(at);
-        self.bytes -= place.bytes;
+        self.bytes = self.bytes.saturating_sub(place.bytes);
         if let Some(parked) = place.poll {
             link.say(parked.conn, 404, "Enter the room first.", limits, out);
         }
@@ -383,7 +425,7 @@ impl Place {
     /// What is waiting for this place, as the whole reply to its poll: as many frames,
     /// oldest first, as an answer may weigh. `None` if it cannot be written just now. No
     /// frame is copied until the whole reply has been measured and admitted.
-    fn answer(&mut self, version: u64, roster: &[String], replaced: bool, link: &Link, limits: &Limits) -> Option<Vec<u8>> {
+    fn answer(&mut self, version: u64, roster: &[String], replaced: bool, link: &Link, limits: &Limits) -> Option<Charged> {
         let places: Vec<&str> = roster.iter().map(String::as_str).collect();
         // (What wraps a frame in the answer is under a hundred bytes; the places, a few
         // hundred in all.)
@@ -414,7 +456,7 @@ impl Place {
         while self.frames.front().is_some_and(|frame| frame.seq <= after) {
             freed += self.frames.pop_front().map_or(0, |frame| frame.frame.len());
         }
-        self.bytes -= freed;
+        self.bytes = self.bytes.saturating_sub(freed);
         freed
     }
 }
@@ -449,7 +491,7 @@ pub struct Link {
     jobs: Mutex<VecDeque<Job>>,
     wake: Condvar,
     waiting: AtomicUsize,
-    writing: AtomicUsize,
+    writing: Arc<AtomicUsize>,
     open: Arc<AtomicUsize>,
     /// Every byte of every reply the route has written, for the tests to set beside what
     /// the callers received.
@@ -462,7 +504,7 @@ pub struct Link {
 impl Link {
     /// Whether the route is being served: what `/api/hello` goes by.
     pub fn listening(&self) -> bool {
-        self.at.lock().unwrap().is_some()
+        locked(&self.at).is_some()
     }
 
     /// Sets `bytes` aside from what may be being written at once, if there is that much.
@@ -472,7 +514,7 @@ impl Link {
 
     /// The whole reply to a poll, if it may be written now: measured, admitted against the
     /// budget, and only then built.
-    fn admit_poll(&self, version: u64, places: &[impl AsRef<str>], frames: &[&Frame], more: bool, replaced: bool, limits: &Limits) -> Option<Vec<u8>> {
+    fn admit_poll(&self, version: u64, places: &[impl AsRef<str>], frames: &[&Frame], more: bool, replaced: bool, limits: &Limits) -> Option<Charged> {
         let places: Vec<&str> = places.iter().map(AsRef::as_ref).collect();
         let mut measure = Measure(0);
         poll_body(&mut measure, version, &places, frames, more, replaced);
@@ -485,7 +527,7 @@ impl Link {
         bytes.extend_from_slice(head.as_bytes());
         poll_body(&mut bytes, version, &places, frames, more, replaced);
         debug_assert_eq!(bytes.len(), whole);
-        Some(bytes)
+        Some(Charged { bytes, writing: self.writing.clone() })
     }
 
     /// A short reply: a refusal, or the answer to anything but a poll. With no room in the
@@ -496,7 +538,7 @@ impl Link {
         if self.take(head.len() + body.len(), limits.writing) {
             let mut bytes = head.into_bytes();
             bytes.extend_from_slice(body.as_bytes());
-            out.push(Answer { conn, bytes });
+            out.push(Answer { conn, bytes: Charged { bytes, writing: self.writing.clone() } });
         }
     }
 
@@ -505,29 +547,31 @@ impl Link {
     }
 
     /// Writes a reply and closes the connection. A write that makes no progress is given
-    /// up; either way what the reply held of the budget is given back.
-    fn write(&self, mut answer: Answer, limits: &Limits) {
-        let stream = &mut answer.conn.stream;
-        let _ = stream.set_write_timeout(Some(limits.write_wait));
-        let sent = stream.write_all(&answer.bytes).and_then(|()| stream.flush());
+    /// up; either way what the reply held of the budget is given back as it is let go of.
+    fn write(&self, answer: Answer, limits: &Limits) {
+        let Answer { mut conn, bytes } = answer;
+        let _ = conn.stream.set_write_timeout(Some(limits.write_wait));
+        let sent = conn.stream.write_all(&bytes).and_then(|()| conn.stream.flush());
         #[cfg(test)]
         if sent.is_ok() {
-            self.written.fetch_add(answer.bytes.len(), Ordering::SeqCst);
+            self.written.fetch_add(bytes.len(), Ordering::SeqCst);
         }
-        self.writing.fetch_sub(answer.bytes.len(), Ordering::SeqCst);
+        // Written or given up, it is no longer being written: its share is given back now,
+        // before the connection is let go of.
+        drop(bytes);
         if sent.is_ok() {
-            let_go(stream);
+            let_go(&mut conn.stream);
         }
     }
 
     fn queue(&self, job: Job) {
-        self.jobs.lock().unwrap().push_back(job);
+        locked(&self.jobs).push_back(job);
         self.wake.notify_one();
     }
 
     #[cfg(test)]
     pub fn totals(&self) -> Totals {
-        let rooms = self.rooms.lock().unwrap();
+        let rooms = locked(&self.rooms);
         let places = || rooms.values().flat_map(|room| room.places.iter());
         Totals {
             rooms: rooms.len(),
@@ -547,13 +591,13 @@ impl Link {
 pub fn listen(relay: Arc<Relay>, address: &str) -> std::io::Result<SocketAddr> {
     let listener = TcpListener::bind(address)?;
     let at = listener.local_addr()?;
-    *relay.link.at.lock().unwrap() = Some(at);
+    *locked(&relay.link.at) = Some(at);
     for index in 0..relay.config.link.threads.max(1) {
         let relay = relay.clone();
         let _ = std::thread::Builder::new().name(format!("link-{index}")).spawn(move || {
             loop {
                 let job = {
-                    let mut jobs = relay.link.jobs.lock().unwrap();
+                    let mut jobs = locked(&relay.link.jobs);
                     loop {
                         match jobs.pop_front() {
                             Some(job) => break job,
@@ -562,7 +606,13 @@ pub fn listen(relay: Arc<Relay>, address: &str) -> std::io::Result<SocketAddr> {
                     }
                 };
                 let limits = &relay.config.link;
-                match job {
+                // Whatever goes wrong in serving one request, this thread takes the next.
+                // The connection is answered if it still can be, and let go of.
+                let spare = match &job {
+                    Job::Call(conn) => conn.stream.try_clone().ok(),
+                    Job::Write(_) => None,
+                };
+                let served = catch_unwind(AssertUnwindSafe(|| match job {
                     Job::Write(answer) => relay.link.write(answer, limits),
                     Job::Call(conn) => {
                         relay.link.waiting.fetch_sub(1, Ordering::SeqCst);
@@ -572,6 +622,11 @@ pub fn listen(relay: Arc<Relay>, address: &str) -> std::io::Result<SocketAddr> {
                             relay.link.write(answer, limits);
                         }
                     }
+                }));
+                if let (Err(_), Some(mut stream)) = (served, spare) {
+                    let body = "{\"error\":\"Something went wrong in the relay.\"}";
+                    let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+                    let _ = stream.write_all(format!("{}{body}", reply_head(500, body.len())).as_bytes());
                 }
             }
         });
@@ -582,9 +637,12 @@ pub fn listen(relay: Arc<Relay>, address: &str) -> std::io::Result<SocketAddr> {
             loop {
                 std::thread::sleep(Duration::from_millis(250));
                 // It writes nothing itself: what it finds to answer goes to the route's threads.
-                for answer in sweep(&relay, Instant::now()) {
-                    relay.link.queue(Job::Write(answer));
-                }
+                // And whatever goes wrong in one round, there is a next.
+                let _ = catch_unwind(AssertUnwindSafe(|| {
+                    for answer in sweep(&relay, Instant::now()) {
+                        relay.link.queue(Job::Write(answer));
+                    }
+                }));
             }
         });
     }
@@ -628,6 +686,15 @@ fn call(relay: &Relay, mut conn: Conn, out: &mut Vec<Answer>) {
     if let Err((status, message)) = host_key_ok(relay, &asked.key) {
         return link.say(conn, status, message, limits, out);
     }
+    #[cfg(test)]
+    match asked.token.as_str() {
+        FAULT => panic!("asked to, by a test"),
+        FAULT_HOLDING_THE_ROOMS => {
+            let _rooms = locked(&link.rooms);
+            panic!("asked to, by a test, with the rooms locked");
+        }
+        _ => {}
+    }
     // A body is taken only if it says how long it is, and that is within what its call
     // allows. Otherwise the request is refused here, with none of its body read.
     if asked.post {
@@ -662,7 +729,7 @@ fn host_key_ok(relay: &Relay, shown: &str) -> Result<(), (u16, &'static str)> {
 fn sweep(relay: &Relay, now: Instant) -> Vec<Answer> {
     let (link, limits) = (&relay.link, &relay.config.link);
     let mut out = Vec::new();
-    let mut rooms = link.rooms.lock().unwrap();
+    let mut rooms = locked(&link.rooms);
     for room in rooms.values_mut() {
         let (version, roster) = (room.version, room.roster());
         for place in &mut room.places {
@@ -800,12 +867,12 @@ fn enter(relay: &Relay, mut conn: Conn, mut asked: Asked, out: &mut Vec<Answer>)
         Err(Some((status, message))) => return link.say(conn, status, message, limits, out),
         Err(None) => return,
     };
-    let (name, place) = (asked.room.as_str(), body["place"].as_str().unwrap_or(""));
+    let (name, place) = (asked.room.as_str(), body.get("place").and_then(Value::as_str).unwrap_or(""));
     if !is_room(name) || !is_place(place) {
         return link.say(conn, 400, "That isn't a room or a place in one.", limits, out);
     }
     let Some(token) = new_token() else { return link.say(conn, 503, "This relay can't make a token just now.", limits, out) };
-    let mut rooms = link.rooms.lock().unwrap();
+    let mut rooms = locked(&link.rooms);
     if !rooms.contains_key(name) && rooms.len() >= limits.rooms {
         return link.say(conn, 503, "This relay has as many rooms as it allows.", limits, out);
     }
@@ -828,12 +895,12 @@ fn enter(relay: &Relay, mut conn: Conn, mut asked: Asked, out: &mut Vec<Answer>)
 fn poll(relay: &Relay, conn: Conn, asked: Asked, out: &mut Vec<Answer>) {
     let (link, limits) = (&relay.link, &relay.config.link);
     let (seen, after) = (number(&asked.query, "v"), number(&asked.query, "after"));
-    let mut rooms = link.rooms.lock().unwrap();
+    let mut rooms = locked(&link.rooms);
     let Some(room) = rooms.get_mut(&asked.room) else { return link.say(conn, 404, "Enter the room first.", limits, out) };
     let Some(at) = holder(room, &asked.token) else { return link.say(conn, 404, "Enter the room first.", limits, out) };
     let (version, roster) = (room.version, room.roster());
     let freed = room.places[at].dealt_with(after);
-    room.bytes -= freed;
+    room.bytes = room.bytes.saturating_sub(freed);
     let place = &mut room.places[at];
     place.seen = Instant::now();
     if let Some(earlier) = place.poll.take()
@@ -855,7 +922,7 @@ fn send(relay: &Relay, mut conn: Conn, mut asked: Asked, out: &mut Vec<Answer>) 
     let (link, limits) = (&relay.link, &relay.config.link);
     let name = asked.room.clone();
     let from = {
-        let rooms = link.rooms.lock().unwrap();
+        let rooms = locked(&link.rooms);
         rooms.get(&name).and_then(|room| holder(room, &asked.token).map(|at| room.places[at].place.clone()))
     };
     let Some(from) = from else { return link.say(conn, 404, "Enter the room first.", limits, out) };
@@ -869,12 +936,12 @@ fn send(relay: &Relay, mut conn: Conn, mut asked: Asked, out: &mut Vec<Answer>) 
         Err(Some((status, message))) => return link.say(conn, status, message, limits, out),
         Err(None) => return,
     };
-    let to = body["to"].as_str().unwrap_or("").to_string();
-    let frame = match body["frame"].take() {
-        Value::String(frame) if is_place(&to) && is_frame(&frame) => frame,
+    let to = body.get("to").and_then(Value::as_str).unwrap_or("").to_string();
+    let frame = match body.remove("frame") {
+        Some(Value::String(frame)) if is_place(&to) && is_frame(&frame) => frame,
         _ => return link.say(conn, 400, "That isn't a frame for a place.", limits, out),
     };
-    let mut rooms = link.rooms.lock().unwrap();
+    let mut rooms = locked(&link.rooms);
     let Some(room) = rooms.get_mut(&name) else { return link.say(conn, 404, "Enter the room first.", limits, out) };
     // The sender may have gone, or been given up on, while its body was read.
     if holder(room, &asked.token).is_none() {
@@ -904,11 +971,14 @@ fn send(relay: &Relay, mut conn: Conn, mut asked: Asked, out: &mut Vec<Answer>) 
 /// A device gives up its place: what was waiting for it is dropped.
 fn leave(relay: &Relay, mut conn: Conn, mut asked: Asked, out: &mut Vec<Answer>) {
     let (link, limits) = (&relay.link, &relay.config.link);
-    // (Whatever it sends with that is of no interest, and is not waited for long.)
-    if read_body(&mut conn, &mut asked, limits.body_wait).is_err_and(|said| said.is_none()) {
-        return;
+    // (It takes nothing; but what it sends is read as every body is, and one that is not an
+    // object is refused like any other.)
+    match read_body(&mut conn, &mut asked, limits.body_wait) {
+        Ok(_) => {}
+        Err(Some((status, message))) => return link.say(conn, status, message, limits, out),
+        Err(None) => return,
     }
-    let mut rooms = link.rooms.lock().unwrap();
+    let mut rooms = locked(&link.rooms);
     let left = rooms.get_mut(&asked.room).and_then(|room| {
         let at = holder(room, &asked.token)?;
         room.remove(at, link, limits, out);

@@ -92,6 +92,14 @@ fn send(to: SocketAddr, room: &str, token: &str, place: &str, frame: &str) -> u1
     call(to, "POST", &format!("/api/link/{room}/send"), token, json!({"to": place, "frame": frame})).0
 }
 
+/// Waits, up to three seconds, for something that happens on another thread.
+fn until(what: impl Fn() -> bool) {
+    let began = Instant::now();
+    while !what() && began.elapsed() < Duration::from_secs(3) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// The nth room name, and the nth place, spelled as the route wants them.
 fn room_named(n: usize) -> String {
     format!("{}{}{}", BASE32[n % 32] as char, BASE32[n / 32 % 32] as char, "a".repeat(50))
@@ -468,6 +476,67 @@ fn hello_offers_the_route_only_when_it_is_served_and_old_linking_can_be_refused(
     enter(to, ROOM, PC);
 }
 
+/// The reviewer's request, and its neighbours: a body that is JSON and not what its call
+/// takes. The first of these ended the whole program, and every jam in it with it.
+#[test]
+fn a_body_of_the_wrong_shape_is_refused_and_ends_nothing() {
+    let (to, jams, relay) = relay_with_jams(|config| config.link.enters = 1000.0);
+    let (pc, phone) = (enter(to, ROOM, PC), enter(to, ROOM, PHONE));
+    let key = format!("Bearer {KEY}");
+    let headers = [("Authorization", key.as_str()), ("X-Nexus-Link", pc.as_str())];
+    let good = format!(r#"{{"to":"{PHONE}","frame":"eA"}}"#);
+    let wrong = ["7", "-1", "1e9", "true", "null", r#""text""#, "[]", r#"[1,"two"]"#, r#"[{"to":"x"}]"#, "{", "nonsense", r#"{"to":7,"frame":"eA"}"#, r#"{"to":"PHONE"}"#, r#"{"frame":"eA"}"#, r#"{"to":{},"frame":[]}"#, r#"{"to":null,"frame":null}"#];
+    for verb in ["send", "enter", "leave"] {
+        for body in wrong {
+            let body = body.replace("PHONE", PHONE);
+            // (`leave` takes nothing: for it, only what is not an object at all is wrong. And
+            // `enter` asks only for a place.)
+            if verb != "send" && body.starts_with('{') && body.ends_with('}') {
+                continue;
+            }
+            let (status, _, _) = raw(to, "POST", &format!("/api/link/{ROOM}/{verb}"), &headers, body.as_bytes(), Some(body.len()));
+            assert_eq!(status, 400, "{verb} with {body}");
+        }
+    }
+    // Nothing was done by any of them: both places are where they were, nothing waits, and
+    // the route and the jams are served as before.
+    let held = relay.link.totals();
+    assert_eq!((held.places, held.frames), (2, 0));
+    assert_eq!(raw(to, "POST", &format!("/api/link/{ROOM}/send"), &headers, good.as_bytes(), Some(good.len())).0, 200);
+    assert_eq!(poll(to, ROOM, &phone, 0, 0).1["frames"][0]["from"], PC);
+    assert_eq!(call(jams, "POST", "/api/host/start", "", json!({"name": "Jez"})).0, 200);
+}
+
+/// Whatever goes wrong in a request, the route goes on: the thread that was serving it
+/// answers 500 and takes the next, and a jam on the other port never knows. (The faults
+/// here are made by the test: nothing a sender can send is known to cause one.)
+#[test]
+fn a_fault_in_one_request_ends_neither_the_route_nor_a_jam() {
+    let (to, jams, relay) = relay_with_jams(|config| config.link.threads = 2);
+    let pc = enter(to, ROOM, PC);
+    let key = format!("Bearer {KEY}");
+    // More faults than the route has threads, some of them while its rooms are locked.
+    for n in 0..6 {
+        let token = if n % 2 == 0 { FAULT } else { FAULT_HOLDING_THE_ROOMS };
+        let (status, _, body) = raw(to, "GET", &format!("/api/link/{ROOM}/poll?v=0&after=0"), &[("Authorization", &key), ("X-Nexus-Link", token)], b"", Some(0));
+        assert_eq!((status, String::from_utf8_lossy(&body).contains("went wrong")), (500, true));
+    }
+    // The route still serves, with what it held intact; nothing is left open or charged.
+    assert_eq!(send(to, ROOM, &pc, PC, "eA"), 200);
+    assert_eq!(poll(to, ROOM, &pc, 0, 0).1["frames"][0]["frame"], "eA");
+    let began = Instant::now();
+    while relay.link.totals().open > 0 && began.elapsed() < Duration::from_secs(2) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let after = relay.link.totals();
+    assert_eq!((after.open, after.waiting, after.writing, after.places), (0, 0, 0, 1));
+    // And a jam is started, joined and shown as if nothing had happened.
+    let (_, made) = call(jams, "POST", "/api/host/start", "", json!({"name": "Jez"}));
+    let jam = made["jam"].as_str().unwrap();
+    assert_eq!(call(jams, "POST", &format!("/api/jam/{jam}/join"), "", json!({"name": "Guest"})).0, 200);
+    assert_eq!(call(jams, "GET", &format!("/api/jam/{jam}"), "", Value::Null).0, 200);
+}
+
 /// A request is refused before any of its body is read if the body is not one the route
 /// will take, and the connection is closed, not read to its end.
 #[test]
@@ -541,8 +610,12 @@ fn a_stalled_head_or_body_is_given_up_and_too_many_connections_are_closed_unread
     let tokens: Vec<String> = (0..6).map(|n| enter(to, ROOM, &place_named(n))).collect();
     let pc = enter(to, ROOM, PC);
     let version = poll(to, ROOM, &pc, 0, 0).1["v"].as_u64().unwrap();
-    let waiting: Vec<_> = tokens.into_iter().map(|token| std::thread::spawn(move || poll(to, ROOM, &token, version, 0))).collect();
-    std::thread::sleep(Duration::from_millis(150));
+    // (One after another: all at once, six would be more than the queue of four takes.)
+    let waiting: Vec<_> = tokens.into_iter().enumerate().map(|(n, token)| {
+        let device = std::thread::spawn(move || poll(to, ROOM, &token, version, 0));
+        until(|| relay.link.totals().held == n + 1);
+        device
+    }).collect();
     assert_eq!((relay.link.totals().held, relay.link.totals().open), (6, 6));
     // Two senders that promise a body and stall: both of the route's threads are waiting.
     // Four more that say nothing at all wait for a thread.
@@ -552,9 +625,9 @@ fn a_stalled_head_or_body_is_given_up_and_too_many_connections_are_closed_unread
         stream.write_all(stalled.as_bytes()).unwrap();
         stream
     }).collect();
-    std::thread::sleep(Duration::from_millis(100));
+    until(|| relay.link.totals().open == 8 && relay.link.totals().waiting == 0);
     held.extend((0..4).map(|_| TcpStream::connect(to).unwrap()));
-    std::thread::sleep(Duration::from_millis(100));
+    until(|| relay.link.totals().open == 12);
     assert_eq!((relay.link.totals().open, relay.link.totals().waiting), (12, 4));
     // That is as many connections as the route takes: one more is closed as it arrives,
     // with nothing read from it and nothing said to it.
@@ -627,7 +700,7 @@ fn the_route_saturated_costs_a_jam_nothing() {
     // more of the same; connections past that turned away; and a device that asked for a
     // great deal and reads none of it.
     let stalled = format!("POST /api/link/{ROOM}/send HTTP/1.1\r\nHost: relay\r\nContent-Length: 290000\r\nAuthorization: {key}\r\nX-Nexus-Link: {pc}\r\n\r\n{{\"to\":");
-    let leaning: Vec<TcpStream> = (0..200).filter_map(|_| {
+    let leaning: Vec<TcpStream> = (0..120).filter_map(|_| {
         let mut stream = TcpStream::connect(to).ok()?;
         let _ = stream.write_all(stalled.as_bytes());
         Some(stream)
