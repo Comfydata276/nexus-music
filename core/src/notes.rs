@@ -427,23 +427,23 @@ mod tests {
         };
         // The first copy taken out: the one that is left is the one added on the second day.
         let mut kept = two();
-        assert!(kept.edited("p", &list, &Edit::Remove(vec![spot(&list, 0)]), 300));
+        assert!(kept.edited("p", &list, &Edit::Remove(vec![spot(&list, 0).unwrap()]), 300));
         assert_eq!(kept.shared(None)["p"]["x"], Note { times: vec![200], at: 300 });
         assert_eq!(kept.dates("p", &["a", "x", "b"]), [0, 200, 0]);
         // The second taken out: the first day's is left.
         let mut kept = two();
-        assert!(kept.edited("p", &list, &Edit::Remove(vec![spot(&list, 2)]), 300));
+        assert!(kept.edited("p", &list, &Edit::Remove(vec![spot(&list, 2).unwrap()]), 300));
         assert_eq!(kept.shared(None)["p"]["x"], Note { times: vec![100], at: 300 });
         // Both, and one that was only ever noticed: x is told as gone; a says nothing.
         let mut kept = two();
-        assert!(kept.edited("p", &list, &Edit::Remove(vec![spot(&list, 0), spot(&list, 1), spot(&list, 2)]), 300));
+        assert!(kept.edited("p", &list, &Edit::Remove(vec![spot(&list, 0).unwrap(), spot(&list, 1).unwrap(), spot(&list, 2).unwrap()]), 300));
         assert_eq!(kept.shared(None)["p"], HashMap::from([("x".to_string(), Note { times: vec![], at: 300 })]));
         assert_eq!(kept.dates("p", &["b"]), [0]);
         // A copy the note has no time for (it is one of three, and the note knows two):
         // the times that are left are still the later copies'.
         let three = ids(&["x", "x", "x"]);
         let mut kept = two();
-        assert!(kept.edited("p", &three, &Edit::Remove(vec![spot(&three, 0)]), 300));
+        assert!(kept.edited("p", &three, &Edit::Remove(vec![spot(&three, 0).unwrap()]), 300));
         assert_eq!(kept.shared(None)["p"]["x"].times, [100, 200]);
         // Putting songs in and moving them go as before: what is put in is dated.
         let mut kept = two();

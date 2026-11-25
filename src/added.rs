@@ -182,7 +182,7 @@ mod tests {
         // Songs the person adds here are dated at once, and shared; so is one taken out.
         added.record("p", &["d".to_string()], 300);
         let list: Vec<String> = ["a", "b", "c", "d"].iter().map(|id| id.to_string()).collect();
-        assert!(added.edited("p", &list, &crate::playlists::Edit::Remove(vec![crate::playlists::spot(&list, 3)]), 400));
+        assert!(added.edited("p", &list, &crate::playlists::Edit::Remove(vec![crate::playlists::spot(&list, 3).unwrap()]), 400));
         assert_eq!(added.shared(None)["p"]["d"], Note { times: vec![], at: 400 });
         // It survives a restart.
         let mut again = Added::load(path.clone());

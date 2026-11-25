@@ -1269,7 +1269,7 @@ impl Controller {
         // Which songs go, said by the songs themselves and not by where they sit: the
         // playlist may have changed on the server since this page loaded.
         let ids: Vec<String> = before.iter().map(|song| song.id.clone()).collect();
-        let edit = crate::playlists::Edit::Remove(rows.iter().map(|&row| crate::playlists::spot(&ids, row)).collect());
+        let edit = crate::playlists::Edit::Remove(rows.iter().filter_map(|&row| crate::playlists::spot(&ids, row)).collect());
         *self.undo.borrow_mut() = Some((
             std::time::Instant::now(),
             crate::controller::Undo::Removed { playlist: playlist_id.clone(), before, places: rows.clone() },

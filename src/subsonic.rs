@@ -1143,7 +1143,7 @@ mod tests {
         assert_eq!(counted(), Some(4));
         // Remove B as shown, move C to the top, and the Undo of a removal of D.
         let edits = [
-            ("remove", Edit::Remove(vec![spot(&page, 1)])),
+            ("remove", Edit::Remove(vec![spot(&page, 1).unwrap()])),
             ("move", moving(&page, 2, 0)),
             ("undo", restoring(&[a.clone(), b.clone(), c.clone(), d.clone()], &[3])),
         ];
@@ -1165,7 +1165,7 @@ mod tests {
         let page = shown();
         println!("X back: the playlist shows {} songs, the list of playlists counts {:?}", page.len(), counted());
         assert_eq!(page, [x.clone(), a.clone(), b.clone(), c.clone(), d.clone()]);
-        assert!(matches!(carry_out(&client, &id, &page, &Edit::Remove(vec![spot(&page, 2)])).unwrap(), Outcome::Done { elsewhere: false, .. }));
+        assert!(matches!(carry_out(&client, &id, &page, &Edit::Remove(vec![spot(&page, 2).unwrap()])).unwrap(), Outcome::Done { elsewhere: false, .. }));
         assert_eq!(shown(), [x, a, c, d]);
         client.delete_playlist(&id).unwrap();
     }

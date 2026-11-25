@@ -44,11 +44,11 @@ pub enum Edit {
     Insert(Vec<(String, Option<Spot>)>),
 }
 
-/// The spot of the song at `index`.
-pub fn spot(list: &[String], index: usize) -> Spot {
-    let id = list[index].clone();
+/// The spot of the song at `index`; none if the list isn't that long.
+pub fn spot(list: &[String], index: usize) -> Option<Spot> {
+    let id = list.get(index)?.clone();
     let nth = list[..index].iter().filter(|other| **other == id).count();
-    Spot { id, nth }
+    Some(Spot { id, nth })
 }
 
 /// Where a spot is in a list, if that appearance of the song is there.
@@ -101,18 +101,21 @@ pub fn apply(now: &[String], edit: &Edit) -> Vec<String> {
     list
 }
 
-/// The edit that moves the song at `from` to `to` in `list`.
+/// The edit that moves the song at `from` to `to` in `list`. A `from` the list doesn't
+/// reach is a song that isn't there, and the edit moves nothing; a `to` past the end is the
+/// end.
 pub fn moving(list: &[String], from: usize, to: usize) -> Edit {
-    let song = spot(list, from);
+    let Some(song) = spot(list, from) else { return Edit::Remove(Vec::new()) };
     let mut without = list.to_vec();
     without.remove(from);
-    let after = (to > 0).then(|| spot(&without, to - 1));
+    let after = to.min(without.len()).checked_sub(1).and_then(|before| spot(&without, before));
     Edit::Move { song, after }
 }
 
 /// The edit that puts back the songs that were at these places in `before` (lowest first).
+/// A place `before` doesn't reach held nothing, and nothing is put back for it.
 pub fn restoring(before: &[String], places: &[usize]) -> Edit {
-    Edit::Insert(places.iter().map(|&index| (before[index].clone(), (index > 0).then(|| spot(before, index - 1)))).collect())
+    Edit::Insert(places.iter().filter_map(|&index| Some((before.get(index)?.clone(), index.checked_sub(1).and_then(|before_it| spot(before, before_it))))).collect())
 }
 
 #[cfg(test)]
@@ -126,7 +129,7 @@ mod tests {
     #[test]
     fn removes_the_songs_meant_from_a_playlist_that_changed() {
         let page = list("a b c d e");
-        let remove = Edit::Remove(vec![spot(&page, 1), spot(&page, 3)]);
+        let remove = Edit::Remove(vec![spot(&page, 1).unwrap(), spot(&page, 3).unwrap()]);
         // Nothing else has touched it.
         assert_eq!(apply(&page, &remove), list("a c e"));
         // Another device reordered it and added a song: the same two songs go, not whatever
@@ -134,14 +137,26 @@ mod tests {
         assert_eq!(apply(&list("e d c b a x"), &remove), list("e c a x"));
         // One of them was already taken out elsewhere.
         assert_eq!(apply(&list("a c d e"), &remove), list("a c e"));
-        assert_eq!(positions(&list("x a b c d e"), &[spot(&page, 1), spot(&page, 3)]), [2, 4]);
+        assert_eq!(positions(&list("x a b c d e"), &[spot(&page, 1).unwrap(), spot(&page, 3).unwrap()]), [2, 4]);
+    }
+
+    #[test]
+    fn a_position_that_is_out_of_range_is_a_song_that_is_not_there() {
+        let page = list("a b c");
+        assert_eq!((spot(&page, 2).map(|spot| spot.id), spot(&page, 3)), (Some("c".to_string()), None));
+        // Moving what isn't there moves nothing; moving to past the end moves to the end.
+        assert_eq!(apply(&page, &moving(&page, 9, 0)), page);
+        assert_eq!(apply(&page, &moving(&page, 0, 99)), list("b c a"));
+        assert_eq!(apply(&list(""), &moving(&list(""), 0, 0)), list(""));
+        // Putting back what was at places that never were puts nothing back for them.
+        assert_eq!(apply(&list("a c"), &restoring(&page, &[1, 9])), page);
     }
 
     #[test]
     fn tells_copies_of_the_same_song_apart() {
         let page = list("a b a c a");
         // The second "a".
-        let remove = Edit::Remove(vec![spot(&page, 2)]);
+        let remove = Edit::Remove(vec![spot(&page, 2).unwrap()]);
         assert_eq!(apply(&page, &remove), list("a b c a"));
         // If only one copy is left on the server there is no second copy to take out.
         assert_eq!(apply(&list("b a c"), &remove), list("b a c"));
@@ -169,7 +184,7 @@ mod tests {
     fn puts_removed_songs_back_where_they_were() {
         let before = list("a b c d e");
         let removed = [1, 2, 4];
-        let after = apply(&before, &Edit::Remove(removed.iter().map(|&at| spot(&before, at)).collect()));
+        let after = apply(&before, &Edit::Remove(removed.iter().filter_map(|&at| spot(&before, at)).collect()));
         assert_eq!(after, list("a d"));
         let undo = restoring(&before, &removed);
         assert_eq!(apply(&after, &undo), before);

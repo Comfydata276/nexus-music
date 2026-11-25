@@ -149,7 +149,7 @@ mod tests {
         let shown = list("a b c");
         // Taking out "b" as shown would have taken out "a"; moving "c" to the top, or putting
         // back a removed song, would have thrown "x" away. None of them is sent.
-        for edit in [Edit::Remove(vec![spot(&shown, 1)]), moving(&shown, 2, 0), restoring(&list("a b c d"), &[3])] {
+        for edit in [Edit::Remove(vec![spot(&shown, 1).unwrap()]), moving(&shown, 2, 0), restoring(&list("a b c d"), &[3])] {
             assert_eq!(carry_out(&client, "p1", &shown, &edit).unwrap(), Outcome::HidesSongs, "{edit:?}");
         }
         assert!(stored.lock().unwrap().writes.is_empty());
@@ -161,7 +161,7 @@ mod tests {
         // With the song back in the library, the same removal takes out "b".
         stored.lock().unwrap().songs[0].1 = false;
         let shown = list("x a b c d");
-        let outcome = carry_out(&client, "p1", &shown, &Edit::Remove(vec![spot(&shown, 2)])).unwrap();
+        let outcome = carry_out(&client, "p1", &shown, &Edit::Remove(vec![spot(&shown, 2).unwrap()])).unwrap();
         assert_eq!(outcome, Outcome::Done { elsewhere: false, before: list("x a b c d") });
         assert_eq!(held(&stored), list("x a c d"));
     }
