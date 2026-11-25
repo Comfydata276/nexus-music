@@ -81,6 +81,63 @@ impl Turn {
     }
 }
 
+/// Whose the queue in the player is, and which queue a save was prepared for.
+///
+/// A save of the queue is prepared (the songs, the place) and then sent a moment later,
+/// after a look at the server. **It is sent only if the queue is still the one it was
+/// prepared for**: anything done to the queue here since, and the taking up of another
+/// device's queue in its place, both make it another queue.
+#[derive(Default)]
+pub struct QueueOwner {
+    /// Set while the queue is one taken up from another device and not yet touched here:
+    /// that device's name and the time of its save (`nexus_core::handover::Here::taken`).
+    taken: std::cell::RefCell<Option<String>>,
+    revision: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// A save's note of the queue it was prepared for.
+pub struct Prepared {
+    was: u64,
+    now: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl Prepared {
+    /// Whether the queue is still that one. Asked immediately before the save is sent.
+    pub fn still(&self) -> bool {
+        self.now.load(Ordering::SeqCst) == self.was
+    }
+}
+
+impl QueueOwner {
+    /// The queue changed here, or was played on: whatever it was, it is this PC's own now.
+    pub fn changed_here(&self) {
+        *self.taken.borrow_mut() = None;
+        self.revision.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Another device's queue was put in this one's place. It is that device's, and not
+    /// this PC's to save, until something is done to it here.
+    /// **It is a change to the queue for anything waiting to be saved**: a save prepared
+    /// before it is for the queue that was replaced.
+    pub fn taken_up(&self, from: String) {
+        *self.taken.borrow_mut() = Some(from);
+        self.revision.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// As it was left when the app last closed.
+    pub fn restored(&self, taken: Option<String>) {
+        *self.taken.borrow_mut() = taken;
+    }
+
+    pub fn taken(&self) -> Option<String> {
+        self.taken.borrow().clone()
+    }
+
+    pub fn prepared(&self) -> Prepared {
+        Prepared { was: self.revision.load(Ordering::SeqCst), now: self.revision.clone() }
+    }
+}
+
 /// Step 1: asks the server for the list of playlists and for the one that holds the record.
 /// Nothing of what this PC holds is needed for it, and nothing is written.
 pub fn read(client: &Client) -> ApiResult<Answers> {
@@ -566,8 +623,7 @@ impl Controller {
     /// The queue changed here, or was played on: save it on the server once things have
     /// settled. (Whatever it was before, it is this PC's own now.)
     pub fn queue_changed_here(&self) {
-        *self.queue_taken.borrow_mut() = None;
-        self.queue_revision.fetch_add(1, Ordering::SeqCst);
+        self.queue_owner.changed_here();
         if self.settings.borrow().sync {
             self.queue_timer.start(slint::TimerMode::SingleShot, SETTLE, || {
                 with(|ctl| ctl.upload_queue());
@@ -583,7 +639,7 @@ impl Controller {
             current: pb.current().map(|song| song.id.clone()),
             playing: pb.playing,
             stamp: self.queue_stamp.get(),
-            taken: self.queue_taken.borrow().clone(),
+            taken: self.queue_owner.taken(),
         }
     }
 
@@ -609,7 +665,7 @@ impl Controller {
             return;
         }
         let (session, live) = (self.session.load(Ordering::SeqCst), self.session.clone());
-        let (revision, revisions) = (self.queue_revision.load(Ordering::SeqCst), self.queue_revision.clone());
+        let prepared = self.queue_owner.prepared();
         self.api_pool.spawn(move || {
             // Steps 1 and 2.
             let (go, clock) = match handover::first(&here) {
@@ -623,7 +679,7 @@ impl Controller {
                 },
             };
             // Step 3.
-            if go && live.load(Ordering::SeqCst) == session && revisions.load(Ordering::SeqCst) == revision {
+            if go && live.load(Ordering::SeqCst) == session && prepared.still() {
                 let _ = client.save_play_queue(&here.device, &saved.ids, &saved.current, saved.position);
             }
             post(move |ctl| {
@@ -689,7 +745,7 @@ impl Controller {
         self.engine.set_playing(false);
         self.engine.stop();
         self.queue_stamp.set(place.stamp);
-        *self.queue_taken.borrow_mut() = Some(place.taken);
+        self.queue_owner.taken_up(place.taken);
         self.replace_queue(theirs.songs, place.cursor, place.position);
         if play {
             self.toggle_play();
@@ -811,6 +867,30 @@ mod tests {
 
     fn pins(settings: &Settings) -> Vec<&str> {
         settings.pinned_playlists.iter().map(String::as_str).collect()
+    }
+
+    #[test]
+    fn a_save_prepared_before_another_devices_queue_was_taken_up_is_not_sent() {
+        let owner = QueueOwner::default();
+        // A save is prepared: the songs and the place as they are, the server about to be
+        // looked at. Nothing happens meanwhile: it may be sent.
+        let save = owner.prepared();
+        assert!(save.still());
+        // Meanwhile a look at the server finds another device's newer queue, and it is put
+        // in this one's place. The save is for a queue that is no longer in the player:
+        // sent, it would put the old queue over the newer one, as the newest.
+        owner.taken_up("NexusMusic-0badc0de@1700000000".into());
+        assert!(!save.still(), "a save of the queue that was replaced would still be sent");
+        assert_eq!(owner.taken().as_deref(), Some("NexusMusic-0badc0de@1700000000"));
+        // Anything done to the queue here is the same to a save prepared before it; and
+        // the queue is then this PC's own.
+        let save = owner.prepared();
+        owner.changed_here();
+        assert!(!save.still() && owner.taken().is_none());
+        // Putting back, at start-up, what was in the player is no change to anything.
+        let save = owner.prepared();
+        owner.restored(Some("NexusMusic-0badc0de@1700000000".into()));
+        assert!(save.still() && owner.taken().is_some());
     }
 
     #[test]

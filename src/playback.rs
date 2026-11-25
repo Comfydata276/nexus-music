@@ -1930,7 +1930,7 @@ impl Controller {
             };
             self.saver.write(self.paths.queue.clone(), move || serde_json::to_vec(&saved).ok());
         }
-        let place = crate::config::QueuePlace { shape, cursor: pb.cursor, position: pb.position, stamp, taken: self.queue_taken.borrow().clone() };
+        let place = crate::config::QueuePlace { shape, cursor: pb.cursor, position: pb.position, stamp, taken: self.queue_owner.taken() };
         self.saver.write(self.paths.queue_place.clone(), move || serde_json::to_vec(&place).ok());
     }
 
@@ -1948,7 +1948,7 @@ impl Controller {
             saved.position = place.position;
             saved.stamp = saved.stamp.max(place.stamp);
             // A queue taken up from another device is still that device's after a restart.
-            *self.queue_taken.borrow_mut() = place.taken;
+            self.queue_owner.restored(place.taken);
         }
         self.queue_saved.set(shape);
         {

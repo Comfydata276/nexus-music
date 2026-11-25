@@ -441,12 +441,10 @@ pub struct Controller {
     /// Songs in other devices' Recently played that the server said it doesn't have, so
     /// they aren't asked for again this run.
     pub history_missing: RefCell<std::collections::HashSet<String>>,
-    /// Set while the queue is one taken up from another device, with nothing done to it
-    /// here since (when that device saved it; kept with the queue's place between runs); a
-    /// number that moves on at every change made to the queue here; a save of the queue is
-    /// on its way; and another has been asked for meanwhile.
-    pub queue_taken: RefCell<Option<String>>,
-    pub queue_revision: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Whose the queue in the player is (another device's, taken up and not touched here
+    /// since: kept with the queue's place between runs), and which queue a save was
+    /// prepared for.
+    pub queue_owner: crate::sync::QueueOwner,
     /// When the queue last changed here (or, for one taken from another device, there), and
     /// a fingerprint of it as last saved, to tell a real change from a save of the same thing.
     pub queue_stamp: Cell<i64>,
@@ -605,8 +603,7 @@ impl Controller {
             sync_note: RefCell::default(),
             session: Default::default(),
             history_missing: RefCell::default(),
-            queue_taken: RefCell::default(),
-            queue_revision: Default::default(),
+            queue_owner: Default::default(),
             queue_stamp: Cell::new(0),
             queue_sig: Cell::new(crate::playback::queue_fingerprint(&Playback::new(&Settings::default()))),
             queue_quiet: Cell::new(false),
