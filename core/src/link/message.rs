@@ -304,7 +304,8 @@ impl Handed {
         Some(Handed {
             queued: fields.get("queued")?.as_u64().filter(|queued| (*queued as usize) < songs.len().max(1))? as usize,
             songs,
-            position: fields.get("position")?.as_f64().filter(|at| at.is_finite() && *at >= 0.0)?,
+            // (A day is longer than any song: the bound a queue sent as a command has.)
+            position: fields.get("position")?.as_f64().filter(|at| at.is_finite() && (0.0..=86_400.0).contains(at))?,
             context: text::cut(fields.get("context").map_or(Some(""), Value::as_str)?, MOST_CONTEXT),
             more: fields.get("more").map_or(Some(0), Value::as_u64)?,
         })
@@ -440,6 +441,17 @@ pub fn read_tell(message: &[u8]) -> Option<Tell> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Where in the song a queue handed over says it is: a number another device made.
+    #[test]
+    fn a_queue_handed_over_names_a_place_no_later_than_a_day_into_its_song() {
+        let handed = |position: Value| Handed::read(&json!({"songs": ["s1", "s2"], "queued": 0, "position": position, "context": "", "more": 0}));
+        assert_eq!(handed(json!(12.5)).map(|handed| handed.position), Some(12.5));
+        assert!(handed(json!(0)).is_some() && handed(json!(86_400)).is_some());
+        for not_one in [json!(86_400.5), json!(1e18), json!(1.7e308), json!(-0.5), json!("12"), Value::Null] {
+            assert_eq!(handed(not_one.clone()), None, "{not_one}");
+        }
+    }
 
     const MOST_ASK: usize = super::super::command::MOST_SIMPLE;
     const MOST_TELL: usize = MOST_BRIEF;

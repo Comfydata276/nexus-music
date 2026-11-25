@@ -2139,8 +2139,10 @@ impl Controller {
             pb.order = saved.order;
             pb.cursor = saved.cursor;
             pb.context = saved.context;
-            pb.position = saved.position;
-            pb.resume_at = saved.position;
+            // (From a file: made safe as a queue from another device is.)
+            let length = pb.order.get(pb.cursor).and_then(|&entry| pb.queue.get(entry)).map_or(0, |song| song.duration);
+            pb.position = nexus_core::queue::place_in_song(saved.position, length);
+            pb.resume_at = pb.position;
             pb.playing = false;
             pb.current_token = 0;
         }
@@ -2176,6 +2178,9 @@ impl Controller {
             pb.source_list.clear();
             pb.order = (0..songs.len()).collect();
             pb.cursor = cursor.min(songs.len() - 1);
+            // Where in the song: a number that came from another device, or from the
+            // server's saved queue, and is made safe here, where every such queue comes in.
+            let position = nexus_core::queue::place_in_song(position, songs[pb.cursor].duration);
             pb.queue = songs;
             pb.context.clear();
             pb.position = position;

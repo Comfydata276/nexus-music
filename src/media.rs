@@ -109,7 +109,9 @@ impl Controller {
             return;
         }
         if let Some(media) = self.media.borrow_mut().as_mut() {
-            let progress = Some(MediaPosition(Duration::from_secs_f64(position.max(0.0))));
+            // (Whatever number it is handed: turning one that is too large into a length
+            // of time stops the app.)
+            let progress = Some(MediaPosition(nexus_core::queue::span(position)));
             media.reported = position;
             let _ = media.controls.set_playback(if playing {
                 MediaPlayback::Playing { progress }
