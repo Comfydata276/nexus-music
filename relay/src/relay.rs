@@ -7,11 +7,14 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Cursor, Read};
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tiny_http::{Header, Method, Request, Response, Server};
+
+pub mod link;
 
 const PAGE: &str = include_str!("page.html");
 const SCRIPT: &str = include_str!("app.js");
@@ -57,6 +60,13 @@ pub struct Config {
     pub idle_after: Duration,
     /// Covers held per jam, in bytes.
     pub cover_budget: usize,
+    /// The proxy in front of this relay, if it has one and was told of it: the one sender
+    /// whose `X-Forwarded-For` is believed, by the route devices link through.
+    pub trusted_proxy: Option<IpAddr>,
+    /// Whether devices may still find each other the old way, through `/api/room`.
+    pub old_link: bool,
+    /// The bounds on the route devices link through.
+    pub link: link::Limits,
 }
 
 impl Config {
@@ -72,6 +82,9 @@ impl Config {
             end_after: Duration::from_secs(30 * 60),
             idle_after: Duration::from_secs(45),
             cover_budget: 48 * 1024 * 1024,
+            trusted_proxy: None,
+            old_link: true,
+            link: link::Limits::default(),
         }
     }
 }
@@ -432,11 +445,13 @@ pub struct Relay {
     jams: Mutex<HashMap<String, Jam>>,
     rooms: Mutex<HashMap<String, Room>>,
     limits: Mutex<Limits>,
+    /// Where a person's devices pass each other sealed frames. Nothing above reaches it.
+    link: link::Link,
 }
 
 impl Relay {
     pub fn new(config: Config) -> Relay {
-        Relay { config, jams: Mutex::new(HashMap::new()), rooms: Mutex::new(HashMap::new()), limits: Mutex::new(Limits::default()) }
+        Relay { config, jams: Mutex::new(HashMap::new()), rooms: Mutex::new(HashMap::new()), limits: Mutex::new(Limits::default()), link: link::Link::default() }
     }
 
     fn allow(&self, key: &str, capacity: f64, per_second: f64) -> bool {
@@ -457,8 +472,22 @@ impl Relay {
     }
 }
 
+/// How long an answer may make no progress before it is given up: a connection that has
+/// stopped reading must not keep a thread for ever.
+pub const WRITE_DEADLINE: Duration = Duration::from_secs(20);
+
+/// Listens at `address`. Connections taken from it give up a write that makes no progress
+/// for `deadline`: the deadline is set on the listening socket, and a connection accepted
+/// from it starts with the listener's (so on Linux, where the relay runs).
+pub fn listen(address: &str, deadline: Duration) -> Result<Server, Box<dyn std::error::Error + Send + Sync + 'static>> {
+    let listener = std::net::TcpListener::bind(address)?;
+    socket2::SockRef::from(&listener).set_write_timeout(Some(deadline))?;
+    Server::from_listener(listener, None)
+}
+
 /// Starts answering requests and comes back; the work goes on in other threads.
 pub fn start(relay: Arc<Relay>, server: Arc<Server>, workers: usize) {
+    link::start(relay.clone());
     for index in 0..workers.max(1) {
         let (relay, server) = (relay.clone(), server.clone());
         let _ = std::thread::Builder::new().name(format!("worker-{index}")).spawn(move || {
@@ -634,6 +663,11 @@ fn handle(relay: &Relay, request: Request) {
         (Method::Post, ["api", "host", jam, "cover"]) => host_cover(relay, request, jam, query, &mut out),
         (Method::Post, ["api", "host", jam, "remove"]) => host_remove(relay, request, jam, &mut out),
         (Method::Post, ["api", "host", jam, "end"]) => host_end(relay, request, jam, &mut out),
+        (Method::Post, ["api", "link", room, "enter"]) => link::take(relay, request, link::Call::Enter, room, query),
+        (Method::Get, ["api", "link", room, "poll"]) => link::take(relay, request, link::Call::Poll, room, query),
+        (Method::Post, ["api", "link", room, "send"]) => link::take(relay, request, link::Call::Send, room, query),
+        (Method::Post, ["api", "link", room, "leave"]) => link::take(relay, request, link::Call::Leave, room, query),
+        (_, ["api", "room", ..]) if !relay.config.old_link => out.push(request, error(410, "This relay no longer links devices the old way. Update Nexus Music on this device.")),
         (Method::Post, ["api", "room", room, "enter"]) => room_enter(relay, request, room, &mut out),
         (Method::Get, ["api", "room", room, "poll"]) => room_poll(relay, request, room, query, &mut out),
         (Method::Post, ["api", "room", room, "leave"]) => room_leave(relay, request, room, &mut out),
@@ -650,7 +684,7 @@ fn handle(relay: &Relay, request: Request) {
 
 /// Says this is a jam relay and, if a host key came with the question, whether it's right.
 fn hello(relay: &Relay, request: Request, out: &mut Outbox) {
-    let mut answer = json!({"nexus_jam": 1, "version": env!("CARGO_PKG_VERSION")});
+    let mut answer = json!({"nexus_jam": 1, "version": env!("CARGO_PKG_VERSION"), "link": link::VERSION});
     if bearer(&request).is_some() {
         if let Err(refusal) = relay.host_key_ok(&request) {
             return out.push(request, refusal);

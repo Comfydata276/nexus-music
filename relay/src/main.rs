@@ -16,19 +16,34 @@ fn main() {
     let setting = |name: &str| std::env::var(name).ok().map(|value| value.trim().to_string()).filter(|value| !value.is_empty());
     let listen = setting("JAM_LISTEN").unwrap_or_else(|| "0.0.0.0:8080".to_string());
     let public = setting("JAM_PUBLIC_URL").map(|address| address.trim_end_matches('/').to_string());
-    let (key, temporary) = match setting("JAM_HOST_KEY") {
-        Some(key) if key.len() >= 16 => (key, false),
+    // The host key is never printed, here or anywhere: whoever reads this program's output
+    // could then start jams and take places in rooms. So it has to be given.
+    let key = match setting("JAM_HOST_KEY") {
+        Some(key) if key.len() >= 16 => key,
         Some(_) => {
             eprintln!("JAM_HOST_KEY is too short: use at least 16 characters, e.g. the output of `openssl rand -hex 24`.");
             std::process::exit(2);
         }
-        None => (relay::random_text(40), true),
+        None => {
+            eprintln!("Set JAM_HOST_KEY: at least 16 characters, e.g. the output of `openssl rand -hex 24`. The host link is this relay's public address, then /# and that key.");
+            std::process::exit(2);
+        }
     };
-    let mut config = Config::new(key.clone());
+    let mut config = Config::new(key);
     if let Some(most) = setting("JAM_MAX_JAMS").and_then(|text| text.parse().ok()) {
         config.max_jams = most;
     }
-    let server = match tiny_http::Server::http(&listen) {
+    if let Some(proxy) = setting("JAM_TRUSTED_PROXY") {
+        match proxy.parse() {
+            Ok(address) => config.trusted_proxy = Some(address),
+            Err(_) => {
+                eprintln!("JAM_TRUSTED_PROXY isn't an address: give the one address the proxy in front of this relay connects from.");
+                std::process::exit(2);
+            }
+        }
+    }
+    config.old_link = !setting("JAM_OLD_LINK").is_some_and(|value| matches!(value.to_lowercase().as_str(), "off" | "no" | "false" | "0"));
+    let server = match relay::listen(&listen, relay::WRITE_DEADLINE) {
         Ok(server) => Arc::new(server),
         Err(why) => {
             eprintln!("Couldn't listen on {listen}: {why}");
@@ -36,13 +51,12 @@ fn main() {
         }
     };
     println!("Nexus Music jam relay {} listening on {listen}.", env!("CARGO_PKG_VERSION"));
-    if temporary {
-        println!("No JAM_HOST_KEY is set, so a key was made up for this run and will change on the next. Set JAM_HOST_KEY to keep one.");
-    }
     match &public {
-        Some(address) => println!("Host link, for Nexus Music's settings (keep it private): {address}/#{key}"),
-        None if temporary => println!("Host link, for Nexus Music's settings: this relay's public address, then /#{key}"),
+        Some(address) => println!("Host link, for Nexus Music's settings (keep it private): {address}/# and the host key."),
         None => println!("Host link, for Nexus Music's settings: this relay's public address, then /# and the host key."),
+    }
+    if !config.old_link {
+        println!("Devices that link the old way are turned away.");
     }
     relay::serve(Arc::new(Relay::new(config)), server, 8);
 }

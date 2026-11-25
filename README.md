@@ -194,19 +194,25 @@ further use.
 holds jams in memory only: restarting it ends any jam in progress.
 
 ```sh
+KEY="$(openssl rand -hex 24)"
 docker run -d --name nexus-music-jam --restart unless-stopped -p 8080:8080 \
-  -e JAM_HOST_KEY="$(openssl rand -hex 24)" \
+  -e JAM_HOST_KEY="$KEY" \
   -e JAM_PUBLIC_URL=https://jam.example.org \
   ghcr.io/comfydata276/nexus-music-jam:latest
-docker logs nexus-music-jam    # prints the host link
+echo "https://jam.example.org/#$KEY"    # the host link, for Nexus Music's settings
 ```
+
+The relay never prints the host key, so keep the link from the line above: anyone who has
+it can start jams.
 
 | Setting | What it's for |
 |---|---|
-| `JAM_HOST_KEY` | What a copy of the app must show to start a jam: at least 16 characters, and worth making long and random. Without it the relay makes one up each time it starts, so the host link changes on every restart. |
-| `JAM_PUBLIC_URL` | The address people reach the relay at. Only used to print the whole host link in the log. |
+| `JAM_HOST_KEY` | What a copy of the app must show to start a jam: at least 16 characters, and worth making long and random. The relay does not start without it. |
+| `JAM_PUBLIC_URL` | The address people reach the relay at. Only used to say in the log where the host link begins. |
 | `JAM_LISTEN` | Where it listens inside the container; `0.0.0.0:8080` unless set. |
 | `JAM_MAX_JAMS` | How many sessions may be open at once; 20 unless set. Each linked device holds one, whether or not it's a jam. |
+| `JAM_TRUSTED_PROXY` | The one address your reverse proxy connects from. Set it and callers are counted by the address the proxy saw; leave it unset and they are counted by the connection's own, which behind a proxy is the proxy's for everybody. |
+| `JAM_OLD_LINK` | `off` turns away devices that find each other the way versions up to 0.40.6 do. On unless set. |
 
 Put it behind the reverse proxy you already use, on an address of its own (or under a path),
 with HTTPS. Three things matter there:
