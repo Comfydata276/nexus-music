@@ -123,8 +123,8 @@ pub enum Event {
     Changed,
     /// These are on Lidarr's list (or as good as): note them, to be followed up.
     Noted(Vec<Asked>),
-    /// These turned out not to be: forget them, by title.
-    Forgot(Vec<String>),
+    /// These turned out not to be: forget them (by what they are: see `asked::forget`).
+    Forgot(Vec<Asked>),
     /// Everything that could be asked for has been; Lidarr may still be reading artists in.
     Asked,
     /// The batch has ended, or stopped.
@@ -1002,7 +1002,7 @@ impl Job {
                     want.reason = not_listed(offer);
                     if want.noted {
                         want.noted = false;
-                        gone.push(offer.title.clone());
+                        gone.push(Asked { album: offer.album.clone(), title: offer.title.clone(), artist: offer.artist.clone(), ..Default::default() });
                     }
                 }
             }

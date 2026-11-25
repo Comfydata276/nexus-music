@@ -208,6 +208,11 @@ pub struct PageData {
     pub action: String,
     /// On the Requests page: Lidarr's number for the album on each row.
     pub request_ids: Vec<i64>,
+    /// And what the album is: its MusicBrainz id and its artist, to forget the note of it
+    /// once it's taken off the list. (Not among what the pins compare: the old code that
+    /// recorded them had no such thing.)
+    #[serde(skip)]
+    pub request_albums: Vec<(String, String)>,
     /// Music that isn't in the library: the section's heading, songs that could be asked
     /// for, and the shelves beneath them.
     pub offers_title: String,
@@ -622,6 +627,7 @@ fn requests() -> PageData {
         lead,
         tracks_title: waiting.heading,
         request_ids: waiting.pending.iter().map(|(album, _)| album.id).collect(),
+        request_albums: waiting.pending.iter().map(|(album, _)| (album.album.clone(), album.artist.clone())).collect(),
         // Rows that name an album, not songs that can be played.
         songs: waiting.pending.into_iter().map(|(album, line)| Song { title: album.title, artist: line, ..Default::default() }).collect(),
         empty: waiting.empty,

@@ -1835,10 +1835,11 @@ impl Controller {
                 self.asked.borrow_mut().add_all(notes);
                 self.invalidate("requests");
             }
-            Event::Forgot(titles) => {
+            Event::Forgot(gone) => {
                 let mut asked = self.asked.borrow_mut();
-                for title in titles {
-                    asked.forget(&title);
+                for album in gone {
+                    asked.forget(&album.album, &album.title, &album.artist);
+                    crate::lidarr::mark(&album.album, false);
                 }
             }
             Event::Asked => {
@@ -2015,21 +2016,26 @@ impl Controller {
         );
     }
 
-    /// Takes an album off Lidarr's list.
-    pub fn cancel_request(self: &Rc<Self>, id: i64, title: String) {
+    /// Takes an album off Lidarr's list (its number there), and forgets the note of it: the
+    /// one with its MusicBrainz id, or its title and artist both (see `asked::forget`). It's
+    /// no longer shown as asked for where it's offered.
+    pub fn cancel_request(self: &Rc<Self>, id: i64, album: String, title: String, artist: String) {
         let Some(lidarr) = crate::lidarr::current() else { return };
         self.api_pool.spawn(move || {
             let result = lidarr.cancel(id);
             post(move |ctl| {
                 match result {
                     Ok(()) => {
-                        ctl.asked.borrow_mut().forget(&title);
+                        ctl.asked.borrow_mut().forget(&album, &title, &artist);
+                        crate::lidarr::mark(&album, false);
                         ctl.toast(nexus_core::requests::off_the_list(&title));
                     }
                     Err(reason) => ctl.toast(reason),
                 }
                 ctl.invalidate("requests");
                 ctl.invalidate("search:");
+                // Its page and its artist's, kept from before, would still say "Requested".
+                ctl.invalidate("outside-");
                 if ctl.current_route() == Some(Route::Requests) {
                     ctl.show(Route::Requests, 0.0, true, None);
                 }

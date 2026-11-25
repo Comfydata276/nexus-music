@@ -111,11 +111,20 @@ pub fn put(items: &mut Vec<Asked>, asked: Asked) {
     }
 }
 
-/// Stops watching for an album that's been taken off Lidarr's list. Says whether the list
-/// changed.
-pub fn forget(items: &mut Vec<Asked>, title: &str) -> bool {
+/// Stops watching for an album that's been taken off Lidarr's list: the one with its
+/// MusicBrainz id (`album`), or, where either side has none (a note written by an older
+/// version), the one with its title and artist both. Never by its title alone: two albums of
+/// one name are two albums. Says whether the list changed.
+pub fn forget(items: &mut Vec<Asked>, album: &str, title: &str, artist: &str) -> bool {
     let before = items.len();
-    items.retain(|asked| asked.arrived != 0 || !same_words(&asked.title, title));
+    items.retain(|asked| {
+        let same = if !album.is_empty() && !asked.album.is_empty() {
+            asked.album == album
+        } else {
+            !artist.is_empty() && same_words(&asked.title, title) && same_artist(&asked.artist, artist)
+        };
+        asked.arrived != 0 || !same
+    });
     items.len() != before
 }
 
@@ -278,7 +287,7 @@ mod tests {
         assert!(!waiting(&items));
         assert_eq!(items[0].library_album, "a9");
         // Taking it off Lidarr's list doesn't forget one that's already here.
-        assert!(!forget(&mut items, "Cradlesong"));
+        assert!(!forget(&mut items, "", "Cradlesong", "Rob Thomas"));
         assert_eq!(items.len(), 1);
         assert!(!tidy(&mut items, 1000 + SHOWN_FOR - 1));
         assert!(tidy(&mut items, 1000 + SHOWN_FOR + 1));
@@ -286,7 +295,26 @@ mod tests {
         // One still awaited is forgotten by its title, and given up on after half a year.
         put(&mut items, Asked { title: "Cradlesong".into(), artist: "Rob Thomas".into(), at: 100, ..Default::default() });
         put(&mut items, Asked { title: "Something to Be".into(), artist: "Rob Thomas".into(), at: 100, ..Default::default() });
-        assert!(forget(&mut items, "cradlesong") && items.len() == 1);
+        assert!(forget(&mut items, "", "cradlesong", "rob thomas") && items.len() == 1);
         assert!(!tidy(&mut items, 100 + GIVEN_UP_AFTER - 1) && tidy(&mut items, 100 + GIVEN_UP_AFTER));
+    }
+
+    #[test]
+    fn what_was_asked_for_is_forgotten_by_what_it_is() {
+        // Two albums of one name, by two artists, both asked for; and one noted by an older
+        // version, with no id. Taking one off forgets that one alone.
+        let mut items = vec![
+            Asked { album: "rg-a".into(), title: "Greatest Hits".into(), artist: "Queen".into(), ..Default::default() },
+            Asked { album: "rg-b".into(), title: "Greatest Hits".into(), artist: "ABBA".into(), ..Default::default() },
+            Asked { title: "Greatest Hits".into(), artist: "Blondie".into(), ..Default::default() },
+        ];
+        assert!(forget(&mut items, "rg-b", "Greatest Hits", "ABBA"));
+        assert_eq!(items.iter().map(|asked| asked.artist.as_str()).collect::<Vec<_>>(), ["Queen", "Blondie"]);
+        // One with no id is found by its title and artist together, never its title alone.
+        assert!(!forget(&mut items, "rg-z", "Greatest Hits", "Someone Else"));
+        assert!(forget(&mut items, "rg-c", "greatest hits", "blondie"));
+        assert_eq!(items.iter().map(|asked| asked.artist.as_str()).collect::<Vec<_>>(), ["Queen"]);
+        // An id that doesn't match isn't overruled by a title and artist that do.
+        assert!(!forget(&mut items, "rg-other", "Greatest Hits", "Queen"));
     }
 }

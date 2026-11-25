@@ -183,6 +183,9 @@ pub struct Single {
 pub struct Pending {
     /// Lidarr's own number for the album.
     pub id: i64,
+    /// Its MusicBrainz id (Lidarr's `foreignAlbumId`): what tells it apart from another
+    /// album of the same name.
+    pub album: String,
     pub title: String,
     pub artist: String,
     /// How far along, from 0 to 100, if it's being downloaded; `None` while it's still
@@ -1113,6 +1116,7 @@ impl Lidarr {
             .map(|album| Pending {
                 progress: progress.get(&album.id).copied(),
                 id: album.id,
+                album: album.foreign_album_id,
                 title: album.title,
                 artist: album.artist.artist_name,
             })

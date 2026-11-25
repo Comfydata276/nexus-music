@@ -69,8 +69,8 @@ impl AskedList {
     }
 
     /// Stops watching for an album that's been taken off Lidarr's list.
-    pub fn forget(&mut self, title: &str) {
-        if nexus_core::asked::forget(&mut self.items, title) {
+    pub fn forget(&mut self, album: &str, title: &str, artist: &str) {
+        if nexus_core::asked::forget(&mut self.items, album, title, artist) {
             self.save();
         }
     }
@@ -198,7 +198,7 @@ mod tests {
         assert!(!list.waiting());
         assert_eq!(AskedList::load(&path).items[0].library_album, "a9");
         // Taking it off Lidarr's list doesn't forget one that's already here.
-        list.forget("Cradlesong");
+        list.forget("", "Cradlesong", "Rob Thomas");
         assert_eq!(list.items.len(), 1);
         list.tidy(1000 + SHOWN_FOR + 1);
         assert!(list.items.is_empty());
