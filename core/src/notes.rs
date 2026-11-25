@@ -89,6 +89,16 @@ pub struct Kept {
     pub seen: std::collections::HashSet<String>,
 }
 
+/// Word that the person took a song out of a playlist altogether, on a device that had no
+/// date for it. The record may have one all the same (another device added the song, and
+/// this one has not exchanged since): then this, the newer, takes it back everywhere.
+/// Whether the record has one is not this device's to know when the song is removed, so the
+/// word is kept for every such removal; [`crate::step::settle`] passes it on only where
+/// the record has a note of the song, and it is let go like any other word of a removal.
+fn went(now: i64) -> Note {
+    Note { times: Vec::new(), at: now }
+}
+
 fn counts<'a>(ids: impl IntoIterator<Item = &'a str>) -> HashMap<&'a str, usize> {
     let mut counts: HashMap<&str, usize> = HashMap::new();
     for id in ids {
@@ -186,7 +196,6 @@ impl Kept {
                 continue;
             }
             match notes.get_mut(*id) {
-                // Word of it is only worth passing on where there was a date to take back.
                 Some(note) if note.at != 0 => {
                     note.times = fitted(&note.times, had);
                     note.times.truncate(count);
@@ -194,10 +203,12 @@ impl Kept {
                     shared = true;
                 }
                 Some(note) if count > 0 => note.times.truncate(count),
-                Some(_) => {
-                    notes.remove(*id);
+                // Gone altogether, and this device had no date for it: see `went`.
+                _ if count == 0 => {
+                    notes.insert(id.to_string(), went(now));
+                    shared = true;
                 }
-                None => {}
+                _ => {}
             }
         }
         if notes.is_empty() {
@@ -224,20 +235,23 @@ impl Kept {
         let notes = self.lists.entry(playlist.to_string()).or_default();
         let mut shared = false;
         for (id, copies) in gone {
-            let Some(note) = notes.get_mut(id) else { continue };
+            let altogether = copies.len() >= was[id];
+            let Some(note) = notes.get_mut(id).filter(|note| note.at != 0 || !altogether) else {
+                // Gone altogether, and this device had no date for it: see `went`.
+                if altogether {
+                    notes.insert(id.to_string(), went(now));
+                    shared = true;
+                }
+                continue;
+            };
             let mut times = fitted(&note.times, was[id]);
             for copy in copies.into_iter().rev() {
                 times.remove(copy);
             }
+            note.times = times;
             if note.at != 0 {
-                // Word of it is only worth passing on where there was a date to take back.
-                note.times = times;
                 note.at = now;
                 shared = true;
-            } else if times.is_empty() {
-                notes.remove(id);
-            } else {
-                note.times = times;
             }
         }
         if notes.is_empty() {
@@ -402,12 +416,18 @@ mod tests {
         assert_eq!(kept.shared(None)["p"], HashMap::from([("x".to_string(), Note { times: vec![200], at: 200 })]));
         // Moving songs about dates nothing.
         assert!(!kept.changed("p", &ids(&["a", "x", "b"]), &ids(&["b", "a", "x"]), 250));
-        // Taking x out again says so, as of then; taking out one that never had a date says
-        // nothing to anyone.
+        // Taking x out again says so, as of then. Taking out one that never had a date here
+        // is word kept too: the record may have a date for it that this device has not
+        // heard of, and the exchange passes the word on only if it has (`step::settle`).
         assert!(kept.changed("p", &ids(&["b", "a", "x"]), &ids(&["b", "a"]), 300));
         assert_eq!(kept.shared(None)["p"]["x"], Note { times: vec![], at: 300 });
-        assert!(!kept.changed("p", &ids(&["b", "a"]), &ids(&["b"]), 350));
-        assert_eq!(kept.shared(None)["p"].len(), 1);
+        assert!(kept.changed("p", &ids(&["b", "a"]), &ids(&["b"]), 350));
+        assert_eq!(kept.shared(None)["p"]["a"], Note { times: vec![], at: 350 });
+        // One of two copies that never had dates taken out: nothing is known that could be
+        // said.
+        kept.notice("p", &["b", "n", "n"], 360);
+        assert!(!kept.changed("p", &ids(&["b", "n", "n"]), &ids(&["b", "n"]), 370));
+        assert!(!kept.shared(None)["p"].contains_key("n"));
         // One of two dated copies taken out: the note keeps one time, and is newer.
         kept.added("p", &ids(&["d", "d"]), 400);
         assert!(kept.changed("p", &ids(&["b", "d", "d"]), &ids(&["b", "d"]), 450));
@@ -434,10 +454,11 @@ mod tests {
         let mut kept = two();
         assert!(kept.edited("p", &list, &Edit::Remove(vec![spot(&list, 2).unwrap()]), 300));
         assert_eq!(kept.shared(None)["p"]["x"], Note { times: vec![100], at: 300 });
-        // Both, and one that was only ever noticed: x is told as gone; a says nothing.
+        // Both, and one that was only ever noticed: each is word that it went (for the one
+        // with no date here, passed on only if the record has a date for it).
         let mut kept = two();
         assert!(kept.edited("p", &list, &Edit::Remove(vec![spot(&list, 0).unwrap(), spot(&list, 1).unwrap(), spot(&list, 2).unwrap()]), 300));
-        assert_eq!(kept.shared(None)["p"], HashMap::from([("x".to_string(), Note { times: vec![], at: 300 })]));
+        assert_eq!(kept.shared(None)["p"], HashMap::from([("x".to_string(), Note { times: vec![], at: 300 }), ("a".to_string(), Note { times: vec![], at: 300 })]));
         assert_eq!(kept.dates("p", &["b"]), [0]);
         // A copy the note has no time for (it is one of three, and the note knows two):
         // the times that are left are still the later copies'.

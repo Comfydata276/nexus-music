@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 
 use nexus_core::notes::{Kept, Note, Notes};
+use nexus_core::playlists::{Edit, spot};
 use nexus_core::record::{self, Read};
 use nexus_core::step::{Agreed, Answers, Change, Choices, Device, Found, Held, Outcome, Plan, Stated, Stop, Write, clock, find, history, limits, reserved, settle};
 use nexus_core::time::Clock;
@@ -718,6 +719,34 @@ fn a_record_that_would_not_be_read_back_is_not_written() {
     let server = Server::with(&text(&pc()));
     let write = plan(&device, &server).write.unwrap();
     assert!(matches!(record::read(&write.text), Read::Record(_)));
+}
+
+#[test]
+fn removing_a_song_this_device_has_no_date_for_takes_back_the_date_the_record_has() {
+    // The record has the date another device added s1 to p1 on. This device has not
+    // exchanged since (it was offline, or sharing was off), and has no date for it.
+    let mut server = Server::with(&text(&pc()));
+    let mut device = Dev::new();
+    let list = ["s1".to_string(), "s8".to_string()];
+    device.kept.notice("p1", &["s1", "s8"], NOW - 50);
+    // The person takes both songs out of the playlist here.
+    let both = Edit::Remove(vec![spot(&list, 0).unwrap(), spot(&list, 1).unwrap()]);
+    device.kept.edited("p1", &list, &both, NOW - 10);
+    assert_eq!(device.exchange(&mut server), None);
+    // The record no longer says s1 was added on that day: it says it went. (Otherwise the
+    // date would come back to this device with the song gone, and be shown for it if it
+    // were ever added again by something that keeps no dates.)
+    let noted = &server.record("r").added["p1"];
+    assert_eq!(noted["s1"], Note { times: vec![], at: NOW - 10 });
+    // The record had nothing about s8, and so nothing to take back: no word of it is added.
+    assert!(!noted.contains_key("s8"));
+    // And this device shows no date for either.
+    assert_eq!(device.kept.dates("p1", &[]), Vec::<i64>::new());
+    assert!(device.kept.lists["p1"]["s1"].times.is_empty());
+    // A second device hears that s1 went, and drops the date it had.
+    let mut other = Dev::new();
+    assert_eq!(other.exchange(&mut server), None);
+    assert!(other.kept.lists["p1"]["s1"].times.is_empty());
 }
 
 #[test]

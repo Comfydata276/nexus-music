@@ -639,6 +639,20 @@ fn unfit(record: &Shared) -> Option<Stop> {
     times.into_iter().any(|time| !in_range(time)).then_some(Stop::TimeOutOfRange)
 }
 
+/// The device's notes of when songs were added, as far as they are worth putting in the
+/// record. Word that a song went is passed on only where the record has a note of that
+/// song: a date to take back. (A device keeps word of every removal it makes, not knowing
+/// what the record has: [`crate::notes::Kept::edited`].)
+fn worth_saying(mine: &Notes, theirs: &Notes) -> Notes {
+    let mut out = mine.clone();
+    for (playlist, notes) in &mut out {
+        let noted = theirs.get(playlist);
+        notes.retain(|song, note| !note.times.is_empty() || noted.is_some_and(|noted| noted.contains_key(song)));
+    }
+    out.retain(|_, notes| !notes.is_empty());
+    out
+}
+
 /// Decides an exchange (step 3): what to keep, take in and write, given what the device
 /// holds now and what the server answered. It cannot fail and does not panic, whatever it
 /// is given.
@@ -703,7 +717,7 @@ pub fn settle(device: &Device, answers: &Answers) -> Outcome {
         theme: agreed.theme.clone(),
         theme_at: agreed.theme_at,
         lists: agreed.lists.clone(),
-        added: device.notes.clone(),
+        added: worth_saying(&device.notes, &theirs.added),
         history: device.history.clone(),
         plays: device.plays.clone(),
         play_sources: device.play_sources.clone(),
