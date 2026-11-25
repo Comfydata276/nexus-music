@@ -5,6 +5,7 @@
 //! file, starts a thread or opens a connection; whatever it needs from the world, the app
 //! hands it.
 
+pub mod address;
 pub mod http;
 pub mod listenbrainz;
 pub mod model;
