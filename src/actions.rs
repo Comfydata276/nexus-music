@@ -1350,21 +1350,21 @@ impl Controller {
 
     fn start_radio(self: &Rc<Self>, seed: Song) {
         let id = seed.id.clone();
-        // The choice is made now, at the press; the songs are looked up after.
-        let held = self.reserve();
+        // Until the songs have been looked up, this PC is busy to other devices (see `link`).
+        let waiting = self.looking_up();
         self.request(
             move |client| client.similar_songs(&id, 60),
             move |ctl, result| {
                 let similar = result.unwrap_or_default();
+                ctl.looked_up(waiting);
                 if similar.is_empty() {
-                    ctl.given_up(held);
                     ctl.toast("No similar songs found. Radio needs Last.fm set up in Navidrome.");
                     return;
                 }
                 let context = format!("{} radio", seed.title);
                 let mut songs = vec![seed.clone()];
                 songs.extend(similar.into_iter().filter(|s| s.id != seed.id));
-                ctl.carried(held, |ctl| ctl.play_songs(songs, 0, &context, false));
+                ctl.play_songs(songs, 0, &context, false);
             },
         );
     }
@@ -1410,24 +1410,23 @@ impl Controller {
             Target::Playlist { id, .. } => Some(id.clone()),
             _ => None,
         };
-        // The choice is made now, at the press; the songs are looked up after.
-        let held = self.reserve();
+        // Until the songs have been looked up, this PC is busy to other devices (see `link`).
+        let waiting = self.looking_up();
         self.with_songs_or(
             target,
             move |ctl, all| {
-                ctl.carried(held, |ctl| {
-                    // A playlist plays in the order its page shows it in.
-                    let rows: Vec<usize> = match &playlist {
-                        Some(id) => ctl.playlist_order(id, &all),
-                        None => (0..all.len()).collect(),
-                    };
-                    let songs: Vec<Song> = rows.iter().filter_map(|&row| all.get(row).cloned()).collect();
-                    let list = all.iter().map(|song| song.id.clone()).collect();
-                    ctl.play_from.replace(source.map(|key| crate::playback::PlayFrom { key, rows, list }));
-                    ctl.play_songs(songs, 0, &name, true)
-                });
+                ctl.looked_up(waiting);
+                // A playlist plays in the order its page shows it in.
+                let rows: Vec<usize> = match &playlist {
+                    Some(id) => ctl.playlist_order(id, &all),
+                    None => (0..all.len()).collect(),
+                };
+                let songs: Vec<Song> = rows.iter().filter_map(|&row| all.get(row).cloned()).collect();
+                let list = all.iter().map(|song| song.id.clone()).collect();
+                ctl.play_from.replace(source.map(|key| crate::playback::PlayFrom { key, rows, list }));
+                ctl.play_songs(songs, 0, &name, true)
             },
-            move |ctl| ctl.given_up(held),
+            move |ctl| ctl.looked_up(waiting),
         );
     }
 

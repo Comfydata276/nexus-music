@@ -10,10 +10,9 @@
 //! and what the asking side concludes. What is here is this app's own: asking the music
 //! server and the relay, the clock, random numbers, the player, and the window.
 //!
-//! **The order of choices** is here too, and is on whether or not linking is: every way
-//! into the player takes its place through [`Controller::choice`], [`Controller::lesser`]
-//! or [`Controller::reserve`], so that a command from another device can be judged against
-//! what has been chosen on this one.
+//! **The order of choices** is here too: a count of what has changed on this PC, kept so
+//! that a command from another device can be judged against what is true here. It decides
+//! nothing about what the person does on this PC, with linking on or off.
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -23,7 +22,7 @@ use std::time::Duration;
 
 use nexus_core::link::frame::{self, ASK, Keys, TELL};
 use nexus_core::link::message::{Ask, At, Tell, Why, read_ask, read_tell};
-use nexus_core::link::rule::Reservation;
+use nexus_core::link::rule::Waiting;
 use nexus_core::link::secret::{self, Fetched, Next, Secret, Stop, Verdict};
 use nexus_core::link::steer::{Outcome, Peer, Tick, Told, Wait};
 use nexus_core::link::{Asks, LOOK_AGAIN_MS, LOOK_EVERY_MS, Nonce, Place, VERSION, minute, secret_holds, text};
@@ -92,70 +91,58 @@ fn log(line: impl AsRef<str>) {
 }
 
 // ---- the order of choices ----------------------------------------------------------------
+//
+// It exists so that a command from another device is judged against what is true on this
+// one, and for nothing else. Nothing the person does here is ever refused, delayed or
+// dropped because of it: these calls only keep count.
 
-/// A choice is being carried out. While it is, what the player does on its way is part of
-/// that choice and takes no place of its own.
-pub struct Carrying<'a> {
+/// How long a look-up for something to play is given before this PC stops counting as
+/// busy on its account: longer than any one request to the music server is given.
+const LOOK_UP_MS: u64 = 60_000;
+
+/// What the player holds is being changed. What it does on the way is part of that one
+/// change and is not counted again.
+pub struct Changing<'a> {
     flag: &'a std::cell::Cell<bool>,
     outer: bool,
 }
 
-impl Drop for Carrying<'_> {
+impl Drop for Changing<'_> {
     fn drop(&mut self) {
         self.flag.set(self.outer);
     }
 }
 
 impl Controller {
-    /// A choice that says what plays (play, pause, next, a new queue), made and carried out
-    /// here and now: it takes its place in the order of choices. Anything still waiting to
-    /// be carried out (a Play whose songs are being looked up) no longer has the say.
-    pub fn choice(&self) -> Carrying<'_> {
-        let outer = self.link_carrying.replace(true);
+    /// What a command from another device would act on is about to change, by a press or
+    /// by itself: the generation moves on, once for everything done until this is dropped.
+    /// Called only once it is known that something will change: a press that changes
+    /// nothing (Next with nothing to go to) takes no place.
+    pub fn changing(&self) -> Changing<'_> {
+        let outer = self.link_changing.replace(true);
         if !outer {
-            let mut rule = self.link_rule.borrow_mut();
-            let reservation = rule.accept();
-            rule.carry_out(reservation);
+            self.link_rule.borrow_mut().moved();
         }
-        Carrying { flag: &self.link_carrying, outer }
+        Changing { flag: &self.link_changing, outer }
     }
 
-    /// A lesser choice (a seek, the volume, an edit to the queue), or something the player
-    /// does by itself that changes what a command would act on (the next song starting).
-    /// It does not displace a choice that is waiting to be carried out.
-    pub fn lesser(&self) {
-        if !self.link_carrying.get() {
+    /// The same, for a change that is over as soon as it is made (the volume, a seek).
+    pub fn changed(&self) {
+        if !self.link_changing.get() {
             self.link_rule.borrow_mut().moved();
         }
     }
 
-    /// As `lesser`, for something the player does by itself along a path a press also
-    /// takes (passing over a song that won't play, the sleep timer's pause).
-    pub fn by_itself(&self) -> Carrying<'_> {
-        self.lesser();
-        Carrying { flag: &self.link_carrying, outer: self.link_carrying.replace(true) }
+    /// Something to play has been chosen and its songs are still to be looked up: until
+    /// `looked_up`, or the look-up's time is up, this PC is busy to other devices. To the
+    /// person at it, nothing is different.
+    pub fn looking_up(&self) -> Waiting {
+        self.link_rule.borrow_mut().wait(now_ms(), LOOK_UP_MS)
     }
 
-    /// A choice that says what plays is made now, at the press, and its work (looking the
-    /// songs up) is still to do. Until `carried` or `given_up`, this PC is busy.
-    pub fn reserve(&self) -> Reservation {
-        self.link_rule.borrow_mut().accept()
-    }
-
-    /// The work for a reserved choice is done: carries it out with `then`, unless
-    /// something has been chosen since, in which case nothing is done.
-    pub fn carried(self: &Rc<Self>, held: Reservation, then: impl FnOnce(&Rc<Self>)) -> bool {
-        if !self.link_rule.borrow_mut().carry_out(held) {
-            return false;
-        }
-        let _carrying = Carrying { flag: &self.link_carrying, outer: self.link_carrying.replace(true) };
-        then(self);
-        true
-    }
-
-    /// The work for a reserved choice came to nothing.
-    pub fn given_up(&self, held: Reservation) {
-        self.link_rule.borrow_mut().give_up(held);
+    /// The look-up is over, whatever it found.
+    pub fn looked_up(&self, waiting: Waiting) {
+        self.link_rule.borrow_mut().done(waiting);
     }
 }
 
@@ -632,7 +619,7 @@ impl Controller {
             device,
             name,
             at: At { generation: rule.generation(), minute: minute(now_ms()) },
-            busy: rule.busy(),
+            busy: rule.busy(now_ms()),
             by: rule.by(),
             playing: pb.playing && now.is_some(),
             title: now.map(|song| song.title.clone()).unwrap_or_default(),
@@ -698,13 +685,12 @@ impl Controller {
             Some(Ask::Look) => self.link_state(Some(nonce), None, None),
             Some(Ask::Pause { at }) => {
                 // Checked as it arrives, before anything is done for it...
-                let admitted = self.link_rule.borrow_mut().admit(at, minute(now));
+                let admitted = self.link_rule.borrow_mut().admit(at, minute(now), now);
                 let done = admitted.and_then(|reservation| {
                     // ...and again at the moment the player is changed, under the session
                     // it arrived in.
                     let same_session = self.link.borrow().session.as_ref().is_some_and(|session| session.serial == serial);
                     self.link_rule.borrow_mut().finish(reservation, at, minute(now_ms()), same_session, nonce)?;
-                    let _carrying = Carrying { flag: &self.link_carrying, outer: self.link_carrying.replace(true) };
                     self.pause_here();
                     Ok(())
                 });
@@ -714,7 +700,7 @@ impl Controller {
                         self.link_state(Some(nonce), Some(true), None)
                     }
                     Err(why) => {
-                        log(format!("pause from {who} against generation {}: refused, {why:?} (this device is at {}{})", at.generation, self.link_rule.borrow().generation(), if self.link_rule.borrow().busy() { ", busy" } else { "" }));
+                        log(format!("pause from {who} against generation {}: refused, {why:?} (this device is at {}{})", at.generation, self.link_rule.borrow().generation(), if self.link_rule.borrow().busy(now_ms()) { ", busy" } else { "" }));
                         self.link_state(Some(nonce), Some(false), Some(why))
                     }
                 }

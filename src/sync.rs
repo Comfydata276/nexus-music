@@ -735,9 +735,7 @@ impl Controller {
         if theirs.songs.is_empty() {
             return;
         }
-        // "Continue here" is a choice. Taking up a newer queue unasked is not: it does not
-        // displace one that is waiting to be carried out (see `link`).
-        let _order = if play { self.choice() } else { self.by_itself() };
+        let _changing = self.changing();
         self.engine.set_playing(false);
         self.engine.stop();
         self.queue_stamp.set(place.stamp);

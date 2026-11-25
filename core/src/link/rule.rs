@@ -1,48 +1,69 @@
 //! The one rule a device applies to a command from another of the person's devices.
 //!
-//! **A device has a generation,** a number that starts at 1 with the app and moves on:
+//! The rule exists for one purpose: so that a command from another device is judged against
+//! what is true on this one. It never judges what the person does on this device itself:
+//! nothing they press here is refused, delayed or dropped because of it.
 //!
-//! * when a choice is accepted ([`Rule::accept`]): at the press, before any work is done
-//!   for it. A choice that changes nothing counts;
-//! * by itself, when what a command would act on changes ([`Rule::moved`]): the next
-//!   song starting, autoplay adding songs, a timer's pause, the output being lost. The
-//!   lesser choices go the same way: a seek, the volume, an edit to the queue.
+//! **A device has a generation,** a number that starts at 1 with the app and moves on
+//! ([`Rule::moved`]) whenever what a command would act on changes: a choice made here
+//! being carried out (not one that changes nothing: Next with nothing to go to), the next
+//! song starting, autoplay adding songs, a timer's pause, the output being lost, a command
+//! from another device being carried out.
 //!
-//! **Accepting and carrying out.** Accepting a choice *reserves* its generation, once.
-//! Every later step that carries the choice out (a look-up's answer arriving, the player
-//! being changed) first asks [`Rule::carry_out`], and does nothing if told no: something
-//! newer has the say. Between the two the device is **busy**: its state says so, and a
-//! command from another device is refused. While it is busy the generation does not move
-//! by itself: no command can be made against a busy state, and the state that follows is
-//! the one that counts.
+//! **Busy.** A choice made here whose work is still to do (a Play whose songs are being
+//! looked up) marks the device busy from the press ([`Rule::wait`]) until the work is done
+//! or has come to nothing ([`Rule::done`]). Its state says so, and a command from another
+//! device is refused meanwhile: the state it was made against is about to change. Being
+//! busy changes nothing for the person at the device, and several choices can be waiting
+//! at once, each as it would be without this. A wait ends by itself after the time it
+//! was given, so a look-up that never answers cannot leave a device busy for ever.
 //!
 //! **A command** quotes the generation and the minute of the state it was made against.
 //! It is accepted ([`Rule::admit`]) only if the device is not busy, that is its generation
 //! now, and its minute now is that minute or the one after; and it is carried out
-//! ([`Rule::finish`]) only if all of that still holds at the moment the player is changed,
-//! under the same session. So a command delivered twice, one held back, and one overtaken
-//! by something chosen at the device all fail the same way, and nothing is remembered
-//! about past commands but which one was carried out last ([`Rule::by`]).
+//! ([`Rule::finish`]) only if it is still the command that was accepted and all of that
+//! still holds at the moment the player is changed, under the same session. So a command
+//! delivered twice, one held back, and one overtaken by something chosen at the device all
+//! fail the same way, and nothing is remembered about past commands but which one was
+//! carried out last ([`Rule::by`]).
 
 use super::Nonce;
 use super::message::{At, Why};
 
-/// A place in the order of choices, reserved when the choice was accepted.
+/// The most choices that can be waiting at once. More than this and the oldest stops
+/// counting: a device does not stay busy on the strength of a pile of forgotten look-ups.
+const MOST_WAITING: usize = 32;
+
+/// A choice made on this device whose work is still to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Reservation(u64);
+pub struct Waiting(u64);
+
+/// A command from another device that has been accepted and not yet carried out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reservation {
+    id: u64,
+    /// The generation it was accepted at: still the generation when it is carried out, or
+    /// something has been chosen since.
+    generation: u64,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Rule {
     generation: u64,
-    /// The choice that has been accepted and not yet carried out.
-    open: Option<u64>,
-    /// The command that was last carried out, if nothing has been chosen since.
+    /// The choices that are waiting, and when each stops counting (the app's clock, in
+    /// milliseconds).
+    waiting: Vec<(u64, u64)>,
+    /// The command that has been accepted and not yet carried out.
+    command: Option<u64>,
+    /// What the next wait or command is called.
+    next: u64,
+    /// The command that was last carried out, if nothing has changed since.
     by: Option<Nonce>,
 }
 
 impl Default for Rule {
     fn default() -> Rule {
-        Rule { generation: 1, open: None, by: None }
+        Rule { generation: 1, waiting: Vec::new(), command: None, next: 1, by: None }
     }
 }
 
@@ -51,87 +72,82 @@ impl Rule {
         self.generation
     }
 
-    pub fn busy(&self) -> bool {
-        self.open.is_some()
+    /// Whether a choice made here is waiting for its work, or a command is being carried out.
+    pub fn busy(&self, now_ms: u64) -> bool {
+        self.command.is_some() || self.waiting.iter().any(|(_, until)| *until > now_ms)
     }
 
     pub fn by(&self) -> Option<Nonce> {
         self.by
     }
 
-    /// A choice is accepted: its generation is reserved, and the device is busy until the
-    /// choice is carried out or given up. Whatever was waiting to be carried out no longer
-    /// has the say.
-    pub fn accept(&mut self) -> Reservation {
-        self.generation = self.generation.saturating_add(1);
-        self.open = Some(self.generation);
-        self.by = None;
-        Reservation(self.generation)
+    fn name(&mut self) -> u64 {
+        let id = self.next;
+        self.next = self.next.wrapping_add(1);
+        id
     }
 
-    /// Asked by each step that carries a choice out, before it does anything. `true`:
-    /// nothing has been accepted since; go ahead (and for the last step, the device is no
-    /// longer busy). `false`: something newer has the say; do nothing.
-    pub fn carry_out(&mut self, reservation: Reservation) -> bool {
-        if reservation.0 != self.generation {
-            return false;
+    /// A choice is made here whose work is still to do: the device is busy until [`done`]
+    /// is called for it, or `for_ms` has passed, whichever comes first. Nothing else
+    /// changes: whatever else is waiting goes on waiting.
+    ///
+    /// [`done`]: Rule::done
+    pub fn wait(&mut self, now_ms: u64, for_ms: u64) -> Waiting {
+        self.waiting.retain(|(_, until)| *until > now_ms);
+        if self.waiting.len() >= MOST_WAITING {
+            self.waiting.remove(0);
         }
-        self.open = None;
-        true
+        let id = self.name();
+        self.waiting.push((id, now_ms.saturating_add(for_ms)));
+        Waiting(id)
     }
 
-    /// Whether a choice is still the newest, without ending it: for a step that is not the
-    /// last.
-    pub fn stands(&self, reservation: Reservation) -> bool {
-        reservation.0 == self.generation
+    /// The work for a choice is over: it was carried out (which moved the generation by
+    /// itself, if it changed anything), or it came to nothing.
+    pub fn done(&mut self, waiting: Waiting) {
+        self.waiting.retain(|(id, _)| *id != waiting.0);
     }
 
-    /// A choice that was accepted came to nothing (its look-up failed). The generation
-    /// stays where the press put it; the device is no longer busy.
-    pub fn give_up(&mut self, reservation: Reservation) {
-        if self.open == Some(reservation.0) {
-            self.open = None;
-        }
-    }
-
-    /// What a command would act on has changed without a choice that takes a place of its
-    /// own. While a choice is waiting to be carried out this changes nothing (see above).
+    /// What a command would act on has changed.
     pub fn moved(&mut self) {
-        if self.open.is_none() {
-            self.generation = self.generation.saturating_add(1);
-            self.by = None;
-        }
+        self.generation = self.generation.saturating_add(1);
+        self.by = None;
     }
 
-    /// A command arrives, made against `at`; `minute` is this device's minute now. Checked
-    /// before any work is done for it. `Ok`: it is accepted like any other choice.
-    pub fn admit(&mut self, at: At, minute: u64) -> Result<Reservation, Why> {
-        self.check(at, minute)?;
-        Ok(self.accept())
-    }
-
-    fn check(&self, at: At, minute: u64) -> Result<(), Why> {
-        if self.busy() {
+    /// A command arrives, made against `at`; `minute` is this device's minute now and
+    /// `now_ms` its clock. Checked before any work is done for it.
+    pub fn admit(&mut self, at: At, minute: u64, now_ms: u64) -> Result<Reservation, Why> {
+        if self.busy(now_ms) {
             return Err(Why::Busy);
         }
         if at.generation != self.generation {
             return Err(Why::Changed);
         }
-        in_time(at, minute)
+        in_time(at, minute)?;
+        let id = self.name();
+        self.command = Some(id);
+        Ok(Reservation { id, generation: self.generation })
     }
 
     /// The moment the player is changed for a command. `Ok`: change it; the command is the
     /// one that made this state. `Err`: change nothing. `same_session` is whether the
-    /// sign-in and the secret the command arrived under are still the ones in use.
+    /// sign-in and the secret the command arrived under are still the ones in use, and
+    /// inside their time.
+    ///
+    /// Only the command that is open can be finished, and only once.
     pub fn finish(&mut self, reservation: Reservation, at: At, minute: u64, same_session: bool, nonce: Nonce) -> Result<(), Why> {
-        if !self.stands(reservation) {
+        if self.command != Some(reservation.id) {
             return Err(Why::Changed);
         }
-        self.open = None;
+        self.command = None;
+        if reservation.generation != self.generation {
+            return Err(Why::Changed);
+        }
         if !same_session {
             return Err(Why::Cannot);
         }
         in_time(at, minute)?;
+        self.moved();
         self.by = Some(nonce);
         Ok(())
     }
@@ -153,6 +169,8 @@ mod tests {
 
     const X: Nonce = [1; 24];
     const Y: Nonce = [2; 24];
+    /// How long a look-up is given.
+    const LOOK_UP: u64 = 60_000;
 
     fn at(rule: &Rule, minute: u64) -> At {
         At { generation: rule.generation(), minute }
@@ -160,14 +178,8 @@ mod tests {
 
     /// A command that arrives and is carried out at once, as a Pause is.
     fn command(rule: &mut Rule, at: At, minute: u64, nonce: Nonce) -> Result<(), Why> {
-        let reservation = rule.admit(at, minute)?;
+        let reservation = rule.admit(at, minute, minute.saturating_mul(60_000))?;
         rule.finish(reservation, at, minute, true, nonce)
-    }
-
-    /// A choice made and carried out at the device in one step.
-    fn press(rule: &mut Rule) {
-        let reservation = rule.accept();
-        assert!(rule.carry_out(reservation));
     }
 
     #[test]
@@ -175,7 +187,7 @@ mod tests {
         let mut rule = Rule::default();
         let seen = at(&rule, 3);
         assert_eq!(command(&mut rule, seen, 3, X), Ok(()));
-        assert_eq!((rule.generation(), rule.by(), rule.busy()), (2, Some(X), false));
+        assert_eq!((rule.generation(), rule.by(), rule.busy(180_000)), (2, Some(X), false));
     }
 
     #[test]
@@ -191,11 +203,10 @@ mod tests {
     }
 
     #[test]
-    fn held_play_refused_once_anything_is_chosen_at_the_device() {
+    fn held_play_refused_once_anything_changes_at_the_device() {
         let mut rule = Rule::default();
         let seen = at(&rule, 0);
-        // The person pauses at the device, though it was paused already: it counts.
-        press(&mut rule);
+        rule.moved();
         assert_eq!(command(&mut rule, seen, 0, X), Err(Why::Changed));
         assert_eq!(rule.by(), None);
     }
@@ -207,7 +218,7 @@ mod tests {
         assert_eq!(command(&mut on_time, seen, 6, X), Ok(()));
         assert_eq!(command(&mut late, seen, 7, X), Err(Why::Late));
         // Refused for its age, it has taken no place: the device is as it was.
-        assert_eq!((late.generation(), late.busy()), (1, false));
+        assert_eq!((late.generation(), late.busy(0)), (1, false));
         // A minute from before the device's own count began is not one to act on either.
         assert_eq!(command(&mut late, At { generation: 1, minute: 9 }, 7, X), Err(Why::Late));
     }
@@ -216,10 +227,10 @@ mod tests {
     fn a_command_that_arrives_in_time_and_whose_work_outlasts_the_minute() {
         let mut rule = Rule::default();
         let seen = at(&rule, 5);
-        let reservation = rule.admit(seen, 6).unwrap();
-        assert!(rule.busy());
+        let reservation = rule.admit(seen, 6, 0).unwrap();
+        assert!(rule.busy(0));
         assert_eq!(rule.finish(reservation, seen, 7, true, X), Err(Why::Late));
-        assert_eq!((rule.by(), rule.busy()), (None, false));
+        assert_eq!((rule.by(), rule.busy(0), rule.generation()), (None, false, 1));
     }
 
     /// Review 2's sequence 14, as review 3 corrected it: Play is pressed at the device on a
@@ -228,42 +239,72 @@ mod tests {
     fn sequence_14_a_held_pause_against_a_play_still_looking_its_songs_up() {
         let mut rule = Rule::default();
         let before = at(&rule, 0);
-        let play = rule.accept();
-        // The held Pause, and one from a device that looked during the look-up and was
-        // shown the new generation beside the old queue.
+        let play = rule.wait(1_000, LOOK_UP);
+        // The held Pause, and one from a device that looked during the look-up.
         assert_eq!(command(&mut rule, before, 0, X), Err(Why::Busy));
         let during = at(&rule, 0);
         assert_eq!(command(&mut rule, during, 0, Y), Err(Why::Busy));
-        // The look-up answers and the Play goes ahead.
-        assert!(rule.carry_out(play));
+        // The look-up answers and the Play goes ahead: that is what moves the generation.
+        rule.done(play);
+        rule.moved();
         assert_eq!(command(&mut rule, before, 0, X), Err(Why::Changed));
-        assert_eq!((rule.generation(), rule.by(), rule.busy()), (2, None, false));
+        assert_eq!((rule.generation(), rule.by(), rule.busy(2_000)), (2, None, false));
+    }
+
+    /// What the rule must never do: decide between two things the person did here.
+    #[test]
+    fn nothing_chosen_at_the_device_displaces_anything_else_chosen_there() {
+        let mut rule = Rule::default();
+        // Play on an album, then Next with nothing to go to (which changes nothing), then
+        // Play on another album: both look-ups are still waiting, each as it was.
+        let first = rule.wait(0, LOOK_UP);
+        let second = rule.wait(500, LOOK_UP);
+        assert!(rule.busy(600));
+        // The second fails. The first answers and plays.
+        rule.done(second);
+        assert!(rule.busy(700));
+        rule.done(first);
+        rule.moved();
+        assert_eq!((rule.busy(800), rule.generation()), (false, 2));
+        // The volume is nudged and a song ends while a look-up waits: each moves the
+        // generation, and the look-up is still waiting.
+        let third = rule.wait(1_000, LOOK_UP);
+        rule.moved();
+        rule.moved();
+        assert!(rule.busy(1_100));
+        rule.done(third);
+        // Done twice, or for a wait that ran out, it changes nothing.
+        rule.done(third);
+        assert_eq!((rule.busy(1_200), rule.generation()), (false, 4));
     }
 
     #[test]
-    fn a_look_up_that_answers_after_a_newer_choice_does_nothing() {
+    fn a_look_up_that_never_answers_does_not_leave_the_device_busy_for_ever() {
         let mut rule = Rule::default();
-        let play = rule.accept();
-        press(&mut rule);
-        assert!(!rule.carry_out(play));
-        // And one that fails leaves the device free again, where the press put it.
-        let another = rule.accept();
-        rule.give_up(another);
-        assert_eq!((rule.generation(), rule.busy()), (4, false));
-        // Giving up a choice that is no longer the open one does not end a newer one.
-        let (older, newer) = (rule.accept(), rule.accept());
-        rule.give_up(older);
-        assert!(rule.busy() && rule.carry_out(newer));
+        let seen = at(&rule, 0);
+        let _never = rule.wait(1_000, LOOK_UP);
+        assert_eq!(rule.admit(seen, 0, 60_999), Err(Why::Busy));
+        // Its time is up. Nothing changed meanwhile, so the command stands.
+        assert!(!rule.busy(61_000));
+        let reservation = rule.admit(seen, 1, 61_000).unwrap();
+        assert_eq!(rule.finish(reservation, seen, 1, true, X), Ok(()));
+        // However many are left waiting, only so many count, and each for its own time.
+        let mut rule = Rule::default();
+        for n in 0..100 {
+            rule.wait(n, LOOK_UP);
+        }
+        assert_eq!(rule.waiting.len(), MOST_WAITING);
+        assert!(rule.busy(60_050) && !rule.busy(60_100));
     }
 
     #[test]
     fn a_choice_at_the_device_while_a_command_s_work_is_under_way() {
         let mut rule = Rule::default();
         let seen = at(&rule, 0);
-        let reservation = rule.admit(seen, 0).unwrap();
-        press(&mut rule);
+        let reservation = rule.admit(seen, 0, 0).unwrap();
+        rule.moved();
         assert_eq!(rule.finish(reservation, seen, 0, true, X), Err(Why::Changed));
-        assert_eq!((rule.by(), rule.busy()), (None, false));
+        assert_eq!((rule.by(), rule.busy(0)), (None, false));
     }
 
     #[test]
@@ -277,23 +318,16 @@ mod tests {
     }
 
     #[test]
-    fn while_a_choice_waits_the_generation_does_not_move_by_itself() {
-        let mut rule = Rule::default();
-        let play = rule.accept();
-        // The song that was playing ends, and the volume is nudged, while the list is
-        // looked up: the Play still goes ahead.
-        rule.moved();
-        rule.moved();
-        assert!(rule.carry_out(play));
-        assert_eq!(rule.generation(), 2);
-    }
-
-    #[test]
     fn two_devices_at_the_same_instant() {
         let mut rule = Rule::default();
         let seen = at(&rule, 0);
         assert_eq!((command(&mut rule, seen, 0, X), command(&mut rule, seen, 0, Y)), (Ok(()), Err(Why::Changed)));
         assert_eq!(rule.by(), Some(X));
+        // And while one is being carried out, the other is told the device is busy.
+        let mut rule = Rule::default();
+        let first = rule.admit(seen, 0, 0).unwrap();
+        assert_eq!(rule.admit(seen, 0, 0), Err(Why::Busy));
+        assert_eq!(rule.finish(first, seen, 0, true, X), Ok(()));
     }
 
     #[test]
@@ -311,18 +345,36 @@ mod tests {
     fn the_secret_rolling_over_at_the_moment_of_carrying_out() {
         let mut rule = Rule::default();
         let seen = at(&rule, 0);
-        let reservation = rule.admit(seen, 0).unwrap();
+        let reservation = rule.admit(seen, 0, 0).unwrap();
         assert_eq!(rule.finish(reservation, seen, 0, false, X), Err(Why::Cannot));
-        // It is not carried out and not named, and the device is free for the next choice.
-        assert_eq!((rule.by(), rule.busy(), rule.generation()), (None, false, 2));
+        // It is not carried out and not named, and the device is as it was and free.
+        assert_eq!((rule.by(), rule.busy(0), rule.generation()), (None, false, 1));
+    }
+
+    /// Only the command that is open can be finished, and only once.
+    #[test]
+    fn a_command_is_finished_once_and_only_while_it_is_the_open_one() {
+        let mut rule = Rule::default();
+        let seen = at(&rule, 0);
+        let reservation = rule.admit(seen, 0, 0).unwrap();
+        assert_eq!(rule.finish(reservation, seen, 0, true, X), Ok(()));
+        // The same reservation again: the player must not be changed a second time.
+        assert_eq!(rule.finish(reservation, seen, 0, true, X), Err(Why::Changed));
+        assert_eq!((rule.generation(), rule.by()), (2, Some(X)));
+        // One that was refused at the last step is over too.
+        let seen = at(&rule, 0);
+        let reservation = rule.admit(seen, 0, 0).unwrap();
+        assert_eq!(rule.finish(reservation, seen, 5, true, Y), Err(Why::Late));
+        assert_eq!(rule.finish(reservation, seen, 0, true, Y), Err(Why::Changed));
+        assert_eq!((rule.generation(), rule.by()), (2, Some(X)));
     }
 
     #[test]
     fn the_numbers_cannot_run_out_or_wrap() {
-        let mut rule = Rule { generation: u64::MAX, open: None, by: None };
-        let reservation = rule.accept();
-        assert!(rule.carry_out(reservation));
+        let mut rule = Rule { generation: u64::MAX, next: u64::MAX, ..Rule::default() };
         rule.moved();
+        let waiting = rule.wait(u64::MAX, u64::MAX);
+        rule.done(waiting);
         assert_eq!(rule.generation(), u64::MAX);
         assert_eq!(command(&mut Rule::default(), At { generation: 1, minute: u64::MAX }, 0, X), Err(Why::Late));
         assert_eq!(command(&mut Rule::default(), At { generation: 1, minute: u64::MAX - 1 }, u64::MAX, X), Ok(()));
