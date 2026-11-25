@@ -85,6 +85,13 @@ pub enum Record {
     Is(Secret),
 }
 
+/// Whether a comment is a linking record at all, of any layout, readable or not: whether
+/// it is marked as one. What is marked so is never written to a device's disk, whatever
+/// the playlist it is on has come to be called.
+pub fn is_record(comment: &str) -> bool {
+    matches!(serde_json::from_str(comment), Ok(serde_json::Value::Object(fields)) if fields.contains_key(MARK))
+}
+
 /// Reads the comment. The layout number is read first, by itself: a later layout is
 /// [`Record::Later`] whatever else it holds.
 pub fn read(comment: &str) -> Record {
@@ -321,6 +328,16 @@ pub fn judge(asked: &str, replace: bool, fetched: &Fetched, username: &str) -> V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_comment_marked_as_a_record_is_one_whatever_else_is_in_it() {
+        for record in [COMMENT, r#"{"nexus_music_link":2,"key":"later"}"#, r#"{"nexus_music_link":1}"#, r#"{"nexus_music_link":null,"secret":7}"#, r#" {"secret":"x","nexus_music_link":1} "#] {
+            assert!(is_record(record), "{record}");
+        }
+        for other in ["", "For the walk to work", r#"{"nexus_music_sync":1}"#, r#"["nexus_music_link"]"#, r#""nexus_music_link""#, "{nexus_music_link"] {
+            assert!(!is_record(other), "{other}");
+        }
+    }
 
     const COMMENT: &str = r#"{"nexus_music_link":1,"secret":"ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8"}"#;
 

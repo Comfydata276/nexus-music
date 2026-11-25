@@ -81,8 +81,14 @@ fn unlisted_when(name: &str, linking: bool) -> bool {
 /// name the app keeps for itself, whose comment is not a description. Linking's is never
 /// written whether or not linking is on in this copy: it may be on in another, and what
 /// that one keeps there is a secret.
-pub fn page_may_be_kept(playlist: &str) -> bool {
-    playlist != crate::sync::PLAYLIST_NAME && playlist != secret::PLAYLIST_NAME
+///
+/// **And by what it holds, not only by its name.** A playlist renamed somewhere else (on
+/// the music server's own page, in another app) is an ordinary playlist to every listing,
+/// and its comment is still the record: so a page whose playlist's comment is a linking
+/// record is not written either, and one found on disk is thrown away unread
+/// (`controller::read_page`).
+pub fn page_may_be_kept(playlist: &str, comment: &str) -> bool {
+    playlist != crate::sync::PLAYLIST_NAME && playlist != secret::PLAYLIST_NAME && !secret::is_record(comment)
 }
 
 /// Milliseconds since the app started, on a clock that goes on counting while the PC
@@ -2285,13 +2291,49 @@ mod tests {
     fn a_page_for_a_playlist_the_app_keeps_for_itself_is_never_written_to_disk() {
         use crate::pages::PageData;
         use crate::subsonic::Playlist;
+        const RECORD: &str = r#"{"nexus_music_link":1,"secret":"ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8"}"#;
         let dir = std::env::temp_dir().join(format!("nexus-link-page-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let page = |name: &str| PageData { title: name.to_string(), playlist: Some(Playlist { id: "p".into(), name: name.into(), comment: r#"{"nexus_music_link":1,"secret":"ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8"}"#.into(), ..Default::default() }), ..Default::default() };
-        for (name, kept) in [("Morning mix", true), ("Nexus Music link", false), ("Nexus Music sync", false)] {
-            let file = dir.join(name);
-            crate::controller::store_page(&file, &page(name));
+        let page = |name: &str, comment: &str| PageData { title: name.to_string(), playlist: Some(Playlist { id: "p".into(), name: name.into(), comment: comment.into(), ..Default::default() }), ..Default::default() };
+        for (name, comment, kept) in [
+            ("Morning mix", "For the walk to work", true),
+            ("Nexus Music link", RECORD, false),
+            ("Nexus Music link", "", false),
+            ("Nexus Music sync", "", false),
+            // Renamed on the music server's own page: an ordinary playlist to every listing,
+            // and its comment is still the record.
+            ("Renamed elsewhere", RECORD, false),
+            ("A later layout", r#"{"nexus_music_link":2,"key":"…"}"#, false),
+        ] {
+            let file = dir.join(format!("{name}-{}", comment.len()));
+            crate::controller::store_page(&file, &page(name, comment));
             assert_eq!(file.exists(), kept, "{name}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A page written to disk before any of this was known (by a version that listed the
+    /// playlist, or while it had another name) is not read back: it is thrown away.
+    #[test]
+    fn a_page_on_disk_that_holds_the_record_is_thrown_away_unread() {
+        use crate::pages::PageData;
+        use crate::subsonic::Playlist;
+        let dir = std::env::temp_dir().join(format!("nexus-link-page-read-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |file: &str, name: &str, comment: &str| {
+            let page = PageData { title: name.to_string(), playlist: Some(Playlist { id: "p".into(), name: name.into(), comment: comment.into(), ..Default::default() }), ..Default::default() };
+            let path = dir.join(file);
+            // (As an earlier version wrote it: straight to disk.)
+            std::fs::write(&path, serde_json::to_vec(&page).unwrap()).unwrap();
+            path
+        };
+        let ordinary = write("ordinary", "Morning mix", "For the walk to work");
+        assert!(crate::controller::read_page(&ordinary).is_some() && ordinary.exists());
+        for (file, name, comment) in [("named", "Nexus Music link", r#"{"nexus_music_link":1,"secret":"ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8"}"#), ("renamed", "Renamed elsewhere", r#"{"nexus_music_link":1,"secret":"ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8"}"#)] {
+            let path = write(file, name, comment);
+            assert!(crate::controller::read_page(&path).is_none(), "{name} was read back");
+            assert!(!path.exists(), "{name} is still on disk");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

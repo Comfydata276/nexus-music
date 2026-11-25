@@ -4332,7 +4332,7 @@ pub(crate) fn store_page(file: &std::path::Path, page: &PageData) {
     }
     // The page of a playlist the app keeps for itself holds, as its comment, what the app
     // keeps there: for one of them that is a secret. It is never written to disk.
-    if page.playlist.as_ref().is_some_and(|playlist| !crate::link::page_may_be_kept(&playlist.name)) {
+    if page.playlist.as_ref().is_some_and(|playlist| !crate::link::page_may_be_kept(&playlist.name, &playlist.comment)) {
         return;
     }
     let Ok(json) = serde_json::to_vec(page) else { return };
@@ -4355,8 +4355,15 @@ fn file_stem(key: &str) -> String {
 }
 
 /// Reads a stored page, and how long ago it was stored.
-fn read_page(path: &std::path::Path) -> Option<(Duration, PageData)> {
+pub(crate) fn read_page(path: &std::path::Path) -> Option<(Duration, PageData)> {
     let data: PageData = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    // A page that was written before it was known not to be (by an earlier version, or
+    // while its playlist had another name) holds what the app keeps in that playlist's
+    // comment. It is not read: it goes.
+    if data.playlist.as_ref().is_some_and(|playlist| !crate::link::page_may_be_kept(&playlist.name, &playlist.comment)) {
+        let _ = std::fs::remove_file(path);
+        return None;
+    }
     let age = std::fs::metadata(path).and_then(|m| m.modified()).ok().and_then(|at| at.elapsed().ok()).unwrap_or(Duration::MAX);
     Some((age, data))
 }
