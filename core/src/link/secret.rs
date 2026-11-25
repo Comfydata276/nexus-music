@@ -114,6 +114,8 @@ pub struct Fetched {
     /// Navidrome leaves an empty comment out of its answer, so with the owner stated a
     /// missing comment is an empty one.
     pub comment: Option<String>,
+    /// How many songs it holds. The record has none.
+    pub songs: Option<u64>,
 }
 
 /// A playlist as one XML answer to "fetch this playlist" gives it: what it is, whose,
@@ -143,6 +145,7 @@ pub fn fetched(xml: &str) -> Option<Fetched> {
             _ => None,
         },
         comment: said("comment"),
+        songs: said("songCount").and_then(|count| count.parse().ok()),
     })
 }
 
@@ -224,6 +227,10 @@ pub enum Stop {
     /// The answer was not about the playlist that was asked for, or it is not ours after
     /// all. Nothing is concluded from it.
     Mismatch,
+    /// The playlist of that name has songs in it: it is a playlist of the person's own,
+    /// made before linking kept the name, and is left exactly as it is. Linking does not
+    /// start until it has been renamed or deleted, and the person is told so.
+    HasSongs,
 }
 
 /// What to do after listing the playlists.
@@ -289,6 +296,14 @@ pub fn judge(asked: &str, replace: bool, fetched: &Fetched, username: &str) -> V
         Some(_) => {}
     }
     let Some(public) = fetched.public else { return Verdict::Stop(Stop::NotStated) };
+    // The record is a playlist with no songs. One with songs in it is somebody's playlist:
+    // nothing is written into it, its comment is not taken for a secret, and it is not
+    // made private. Whether it has any has to be said, like whose it is.
+    match fetched.songs {
+        None => return Verdict::Stop(Stop::NotStated),
+        Some(songs) if songs > 0 => return Verdict::Stop(Stop::HasSongs),
+        Some(_) => {}
+    }
     let record = read(fetched.comment.as_deref().unwrap_or(""));
     match record {
         // Whatever else is true of it, a later layout is left exactly as it is.
@@ -320,7 +335,7 @@ mod tests {
     }
 
     fn got(id: &str, comment: Option<&str>) -> Fetched {
-        Fetched { id: id.into(), name: PLAYLIST_NAME.into(), owner: Some("tester".into()), public: Some(false), comment: comment.map(str::to_string) }
+        Fetched { id: id.into(), name: PLAYLIST_NAME.into(), owner: Some("tester".into()), public: Some(false), comment: comment.map(str::to_string), songs: Some(0) }
     }
 
     #[test]
@@ -405,7 +420,7 @@ mod tests {
     #[test]
     fn a_playlist_is_read_whole_from_the_one_answer_that_says_whether_it_is_public() {
         let private = fetched(&answer("false")).unwrap();
-        assert_eq!(private, Fetched { id: "7K5dLzMvMcCEj4us2t4RO0".into(), name: PLAYLIST_NAME.into(), owner: Some("tester".into()), public: Some(false), comment: Some(COMMENT.into()) });
+        assert_eq!(private, Fetched { id: "7K5dLzMvMcCEj4us2t4RO0".into(), name: PLAYLIST_NAME.into(), owner: Some("tester".into()), public: Some(false), comment: Some(COMMENT.into()), songs: Some(0) });
         // And so judged: the secret in it is the one to use.
         assert_eq!(judge("7K5dLzMvMcCEj4us2t4RO0", false, &private, "tester"), Verdict::Use(secret()));
         assert_eq!(judge("7K5dLzMvMcCEj4us2t4RO0", false, &fetched(&answer("true")).unwrap(), "tester"), Verdict::Write(Why::Public));
@@ -415,7 +430,7 @@ mod tests {
             assert_eq!((read.public, judge(&read.id, false, &read, "tester")), (None, Verdict::Stop(Stop::NotStated)));
         }
         // An empty comment is left out, as Navidrome leaves it; so is an owner it won't state.
-        let bare = fetched(r#"<subsonic-response status="ok"><playlist id="k" name="Nexus Music link" public="false" owner="tester"/></subsonic-response>"#).unwrap();
+        let bare = fetched(r#"<subsonic-response status="ok"><playlist id="k" name="Nexus Music link" songCount="0" public="false" owner="tester"/></subsonic-response>"#).unwrap();
         assert_eq!((bare.comment.clone(), judge("k", false, &bare, "tester")), (None, Verdict::Write(Why::Empty)));
         assert_eq!(fetched(r#"<subsonic-response status="ok"><playlist id='k' public='true'/></subsonic-response>"#).map(|read| (read.owner, read.public)), Some((None, Some(true))));
     }
@@ -446,6 +461,31 @@ mod tests {
         for (written, meant) in [("a&amp;b", "a&b"), ("&lt;&gt;&quot;&apos;", "<>\"'"), ("&#34;&#x22;&#X22;", "\"\"\""), ("fish &chips; & more", "fish &chips; & more"), ("&#xD83D;", "&#xD83D;"), ("&", "&"), ("caf&#233;", "café")] {
             assert_eq!(unescaped(written), meant, "{written}");
         }
+    }
+
+    /// Switching linking on must not take over a playlist the person made themselves and
+    /// happened to call by the name: overwrite its description and hide it from others.
+    #[test]
+    fn a_playlist_with_songs_in_it_is_never_taken_for_the_record() {
+        let theirs = |comment: Option<&str>, public: bool| Fetched { songs: Some(12), public: Some(public), ..got("k", comment) };
+        // Whatever its description says, and whether or not others can see it, it is left
+        // exactly as it is: nothing is written, and nothing in it is used.
+        for comment in [None, Some(""), Some("songs for the car"), Some(COMMENT)] {
+            for public in [false, true] {
+                for replace in [false, true] {
+                    assert_eq!(judge("k", replace, &theirs(comment, public), "tester"), Verdict::Stop(Stop::HasSongs), "{comment:?}, public {public}, replace {replace}");
+                }
+            }
+        }
+        // How many songs it holds has to be said, as whose it is has to be.
+        assert_eq!(judge("k", false, &Fetched { songs: None, ..got("k", Some(COMMENT)) }, "tester"), Verdict::Stop(Stop::NotStated));
+        // With none, it is the record, as before.
+        assert_eq!(judge("k", false, &got("k", Some(COMMENT)), "tester"), Verdict::Use(secret()));
+        // And the number is read from the answer the rest is read from.
+        assert_eq!(fetched(&answer("false")).unwrap().songs, Some(0));
+        assert_eq!(fetched(&answer("false").replace(r#"songCount="0""#, r#"songCount="12""#)).unwrap().songs, Some(12));
+        assert_eq!(fetched(&answer("false").replace(r#" songCount="0""#, "")).unwrap().songs, None);
+        assert_eq!(fetched(&answer("false").replace(r#"songCount="0""#, r#"songCount="many""#)).unwrap().songs, None);
     }
 
     #[test]

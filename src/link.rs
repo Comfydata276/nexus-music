@@ -646,6 +646,7 @@ impl Controller {
                         Stop::NotStated => "This music server doesn't say whose a playlist is or whether it is private, so devices can't be linked through it.",
                         Stop::Later => "Update Nexus Music on this PC to link it with your other devices.",
                         Stop::Mismatch => "The music server's answer about your devices' link didn't add up. It will be asked again.",
+                        Stop::HasSongs => "You have a playlist named “Nexus Music link” with songs in it. Rename or delete it, and your devices can be linked.",
                     }
                     .into();
                     log(format!("look: stopped ({stop:?})"));
@@ -1104,7 +1105,7 @@ mod tests {
     /// layout, or no longer stated, ends the session at once.
     #[test]
     fn a_look_that_finds_the_record_no_good_ends_the_session_at_once() {
-        for found in [Looked::Invalid, Looked::Stopped(Stop::Mismatch), Looked::Stopped(Stop::NotStated), Looked::Stopped(Stop::Later)] {
+        for found in [Looked::Invalid, Looked::Stopped(Stop::Mismatch), Looked::Stopped(Stop::NotStated), Looked::Stopped(Stop::Later), Looked::Stopped(Stop::HasSongs)] {
             assert!(ends_session(&found));
         }
         // Not being able to ask is no evidence of anything, and the same secret read again
