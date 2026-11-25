@@ -2004,7 +2004,7 @@ impl Controller {
                 match result {
                     Ok(()) => {
                         ctl.asked.borrow_mut().forget(&title);
-                        ctl.toast(format!("“{title}” is off the list"));
+                        ctl.toast(nexus_core::requests::off_the_list(&title));
                     }
                     Err(reason) => ctl.toast(reason),
                 }

@@ -598,65 +598,37 @@ pub fn request_card(offer: &crate::lidarr::Offer) -> CardData {
 }
 
 /// The albums that have been asked for: those that have arrived lately, then those still on
-/// their way.
+/// their way (see `nexus_core::requests::on_their_way`).
 fn requests() -> PageData {
     let title = "Requests".to_string();
     let Some(lidarr) = crate::lidarr::current() else {
         return PageData { title, empty: "Requests are switched off. Turn them on in Settings.".into(), ..Default::default() };
     };
-    // What this app asked for that has since turned up, newest first.
-    let mut arrived: Vec<crate::asked::Asked> = crate::asked::shared().into_iter().filter(|asked| asked.arrived != 0 && !asked.library_album.is_empty()).collect();
-    arrived.sort_by_key(|asked| std::cmp::Reverse(asked.arrived));
-    let lead: Vec<ShelfData> = if arrived.is_empty() {
+    // (Nothing on Windows stops a request, so "stopped" can't come of it.)
+    let waiting = nexus_core::requests::on_their_way(&lidarr, &crate::asked::shared()).unwrap_or_default();
+    let lead: Vec<ShelfData> = if waiting.arrived.is_empty() {
         Vec::new()
     } else {
         vec![ShelfData {
             title: "Arrived".into(),
             route: String::new(),
             wrap: true,
-            cards: arrived
+            cards: waiting
+                .arrived
                 .iter()
-                .map(|asked| CardData {
-                    kind: Kind::Album,
-                    id: asked.library_album.clone(),
-                    title: asked.title.clone(),
-                    subtitle: if asked.song.is_empty() { asked.artist.clone() } else { format!("{} • for “{}”", asked.artist, asked.song) },
-                    cover: asked.cover.clone(),
-                })
+                .map(|(asked, line)| CardData { kind: Kind::Album, id: asked.library_album.clone(), title: asked.title.clone(), subtitle: line.clone(), cover: asked.cover.clone() })
                 .collect(),
         }]
     };
-    let mut page = match lidarr.pending() {
-        Err(reason) => PageData { title, lead, empty: reason, ..Default::default() },
-        Ok(pending) if pending.is_empty() => PageData {
-            title,
-            empty: if lead.is_empty() {
-                "Nothing is on its way. Search for a song, artist or album and pick it under “Not in your library”.".into()
-            } else {
-                "Nothing else is on its way.".into()
-            },
-            lead,
-            ..Default::default()
-        },
-        Ok(pending) => PageData {
-            title,
-            lead,
-            tracks_title: format!("On their way ({})", pending.len()),
-            request_ids: pending.iter().map(|album| album.id).collect(),
-            // Rows that name an album, not songs that can be played.
-            songs: pending
-                .into_iter()
-                .map(|album| Song {
-                    title: album.title,
-                    artist: match album.progress {
-                        Some(done) => format!("{} • Downloading, {done}%", album.artist),
-                        None => format!("{} • Being looked for", album.artist),
-                    },
-                    ..Default::default()
-                })
-                .collect(),
-            ..Default::default()
-        },
+    let mut page = PageData {
+        title,
+        lead,
+        tracks_title: waiting.heading,
+        request_ids: waiting.pending.iter().map(|(album, _)| album.id).collect(),
+        // Rows that name an album, not songs that can be played.
+        songs: waiting.pending.into_iter().map(|(album, line)| Song { title: album.title, artist: line, ..Default::default() }).collect(),
+        empty: waiting.empty,
+        ..Default::default()
     };
     // A batch of albums being asked for (see `bulk`): how it stands, and what it couldn't ask for.
     let (notice, action, other) = crate::bulk::summary().notice();

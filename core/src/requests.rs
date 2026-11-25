@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::asked::Asked;
 use crate::http::STOPPED;
-use crate::lidarr::{ArtistOffer, Lidarr, Offers};
+use crate::lidarr::{ArtistOffer, Lidarr, Offers, Pending};
 use crate::listenbrainz::{ListenBrainz, TopSong};
 use crate::musicbrainz::{MusicBrainz, SongOffer, TrackName};
 use crate::offer::Offer;
@@ -785,6 +785,73 @@ pub fn added(name: &str) -> String {
     format!("Added {name}. Their albums are on Lidarr's list")
 }
 
+// ---- what is on its way --------------------------------------------------------------------------
+
+/// What has been asked for: what has arrived lately, and what Lidarr has still to get.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Waiting {
+    /// What this app asked for that has since turned up, newest first, each with the line
+    /// under it ("Coldplay • for “Yellow”").
+    pub arrived: Vec<(Asked, String)>,
+    /// "On their way (3)"; empty when nothing is.
+    pub heading: String,
+    /// Each album Lidarr has still to get, with the line under it ("Coldplay • Downloading,
+    /// 40%", "Coldplay • Being looked for").
+    pub pending: Vec<(Pending, String)>,
+    /// What to say when nothing is on its way, or why Lidarr couldn't say.
+    pub empty: String,
+    /// Lidarr couldn't say: `empty` is why.
+    pub failed: bool,
+}
+
+/// The albums that have been asked for: those that have arrived lately, then those still on
+/// their way. `asked` is the app's list of what it asked for.
+pub fn on_their_way(lidarr: &Lidarr, asked: &[Asked]) -> Result<Waiting, Stopped> {
+    // What this app asked for that has since turned up, newest first.
+    let mut arrived: Vec<Asked> = asked.iter().filter(|asked| asked.arrived != 0 && !asked.library_album.is_empty()).cloned().collect();
+    arrived.sort_by_key(|asked| std::cmp::Reverse(asked.arrived));
+    let arrived: Vec<(Asked, String)> = arrived
+        .into_iter()
+        .map(|asked| {
+            let line = if asked.song.is_empty() { asked.artist.clone() } else { format!("{} • for “{}”", asked.artist, asked.song) };
+            (asked, line)
+        })
+        .collect();
+    Ok(match unless_stopped(lidarr.pending())? {
+        Err(reason) => Waiting { arrived, empty: reason, failed: true, ..Default::default() },
+        Ok(pending) if pending.is_empty() => Waiting {
+            empty: if arrived.is_empty() {
+                "Nothing is on its way. Search for a song, artist or album and pick it under “Not in your library”.".into()
+            } else {
+                "Nothing else is on its way.".into()
+            },
+            arrived,
+            ..Default::default()
+        },
+        Ok(pending) => Waiting {
+            arrived,
+            heading: format!("On their way ({})", pending.len()),
+            pending: pending
+                .into_iter()
+                .map(|album| {
+                    let line = match album.progress {
+                        Some(done) => format!("{} • Downloading, {done}%", album.artist),
+                        None => format!("{} • Being looked for", album.artist),
+                    };
+                    (album, line)
+                })
+                .collect(),
+            ..Default::default()
+        },
+    })
+}
+
+/// What's said once an album has been taken off Lidarr's list (see `Lidarr::cancel`).
+pub fn off_the_list(title: &str) -> String {
+    format!("“{title}” is off the list")
+}
+
 /// "1 album", "3 albums": a number of things.
 pub fn count(n: usize, noun: &str) -> String {
     if n == 1 { format!("1 {noun}") } else { format!("{n} {noun}s") }
@@ -1014,5 +1081,19 @@ mod tests {
         assert_eq!(adding("Marrow Lake", 3).1, "Lidarr will look for all 3 albums by Marrow Lake that you don't have, and for new ones as they come out. That can be a lot to fetch.");
         assert_eq!(adding_now("Marrow Lake"), "Adding Marrow Lake…");
         assert_eq!(format!("{}; see Requests in the sidebar.", added("Marrow Lake")), "Added Marrow Lake. Their albums are on Lidarr's list; see Requests in the sidebar.");
+    }
+
+    #[test]
+    fn a_stopped_look_at_what_is_on_its_way_says_so() {
+        fn look(services: Services) -> Result<Waiting, Stopped> {
+            on_their_way(services.lidarr, &[])
+        }
+        let none = r#"{"page":1,"pageSize":500,"totalRecords":0,"records":[]}"#;
+        let (found, all) = served(&[("wanted/missing", none), ("queue", none)], usize::MAX, look);
+        assert_eq!(found.unwrap().empty, "Nothing is on its way. Search for a song, artist or album and pick it under “Not in your library”.");
+        for stop_after in 0..all {
+            assert_eq!(served(&[("wanted/missing", none), ("queue", none)], stop_after, look).0, Err(Stopped));
+        }
+        assert_eq!(off_the_list("Title"), "“Title” is off the list");
     }
 }
