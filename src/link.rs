@@ -42,6 +42,23 @@ pub fn on() -> bool {
     *ON.get_or_init(|| std::env::var("NEXUS_MUSIC_LINK").is_ok_and(|value| value == "1"))
 }
 
+/// Why a playlist of the person's own may not have this name, if it may not. Each feature
+/// keeps a name to itself with its own words, and the new linking only where it is on:
+/// with it off, nothing of it exists.
+pub fn kept_name(name: &str) -> Option<&'static str> {
+    kept_name_when(name, on())
+}
+
+fn kept_name_when(name: &str, linking: bool) -> Option<&'static str> {
+    if nexus_core::step::reserved(name) {
+        Some(nexus_core::step::RESERVED)
+    } else if linking && secret::reserved(name) {
+        Some(secret::RESERVED)
+    } else {
+        None
+    }
+}
+
 /// Milliseconds since the app started, on a clock that goes on counting while the PC
 /// sleeps: the rule's minute, and the life of the secret, are read off it.
 pub fn now_ms() -> u64 {
@@ -854,5 +871,20 @@ impl Controller {
         self.ui.global::<ui::Linked>().on_pause(|place| {
             with(|ctl| ctl.link_pause(place.as_str()));
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn with_linking_off_its_playlist_s_name_is_anyone_s_to_use() {
+        assert_eq!(kept_name_when("Nexus Music link", false), None);
+        assert_eq!(kept_name_when("Nexus Music link", true), Some(secret::RESERVED));
+        // The record's name is kept either way, with the record's own words.
+        assert_eq!(kept_name_when("Nexus Music sync", false), Some(nexus_core::step::RESERVED));
+        assert_eq!(kept_name_when("Nexus Music sync", true), Some(nexus_core::step::RESERVED));
+        assert_eq!(kept_name_when("Morning mix", true), None);
     }
 }

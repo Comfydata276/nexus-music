@@ -1123,9 +1123,9 @@ impl Controller {
                 if name.is_empty() {
                     return;
                 }
-                if nexus_core::step::reserved(&name) {
-                    // The name of the playlist the app keeps what devices share in.
-                    return self.toast(nexus_core::step::RESERVED);
+                if let Some(kept) = crate::link::kept_name(&name) {
+                    // A name the app keeps for a playlist of its own.
+                    return self.toast(kept);
                 }
                 let ids: Vec<String> = songs.iter().map(|s| s.id.clone()).collect();
                 let label = name.clone();
@@ -1146,9 +1146,9 @@ impl Controller {
                 if name.is_empty() {
                     return;
                 }
-                if nexus_core::step::reserved(&name) {
-                    // The name of the playlist the app keeps what devices share in.
-                    return self.toast(nexus_core::step::RESERVED);
+                if let Some(kept) = crate::link::kept_name(&name) {
+                    // A name the app keeps for a playlist of its own.
+                    return self.toast(kept);
                 }
                 let key = format!("playlist:{id}");
                 let page = Route::Playlist(id.clone());

@@ -413,10 +413,11 @@ pub fn ours(playlist: &Stated, username: &str) -> bool {
     playlist.ours(username)
 }
 
-/// Whether a playlist of the person's own may have this name: not the record's, nor the
-/// one the secret the account's devices share is kept in.
+/// Whether a playlist of the person's own may have this name: not the record's. (Another
+/// feature that keeps a playlist to itself keeps its own name, with its own words: see
+/// `link::secret::reserved`.)
 pub fn reserved(name: &str) -> bool {
-    name.trim() == PLAYLIST_NAME || name.trim() == crate::link::secret::PLAYLIST_NAME
+    name.trim() == PLAYLIST_NAME
 }
 
 /// What the app says when a playlist of the person's own is given the record's name.

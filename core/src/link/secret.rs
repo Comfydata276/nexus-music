@@ -29,8 +29,17 @@ use zeroize::Zeroizing;
 use super::text;
 use crate::step::{Found, Stated, find_named, ours};
 
-/// The playlist the secret is kept in. A name the app keeps for itself (`step::reserved`).
+/// The playlist the secret is kept in. A name the app keeps for itself, where linking is on.
 pub const PLAYLIST_NAME: &str = "Nexus Music link";
+
+/// Whether a playlist of the person's own may have this name: not this one, **where
+/// linking is in use**. An app in which it is not has no business with the name.
+pub fn reserved(name: &str) -> bool {
+    name.trim() == PLAYLIST_NAME
+}
+
+/// What the app says when a playlist of the person's own is given the name.
+pub const RESERVED: &str = "Nexus Music keeps that name for itself, for linking your devices. Choose another.";
 /// The most times one look goes round.
 pub const ROUNDS: usize = 3;
 
@@ -265,6 +274,15 @@ mod tests {
 
     fn fetched(id: &str, comment: Option<&str>) -> Fetched {
         Fetched { id: id.into(), name: PLAYLIST_NAME.into(), owner: Some("tester".into()), public: Some(false), comment: comment.map(str::to_string) }
+    }
+
+    #[test]
+    fn each_feature_keeps_its_own_name_with_its_own_words() {
+        assert!(reserved("Nexus Music link") && reserved(" Nexus Music link ") && !reserved("Nexus Music sync") && !reserved("Morning mix"));
+        // The record that keeps devices in step has nothing to say about this name, nor this
+        // about that one: an app with linking off refuses only the first.
+        assert!(crate::step::reserved("Nexus Music sync") && !crate::step::reserved("Nexus Music link"));
+        assert!(RESERVED.contains("linking") && crate::step::RESERVED.contains("in step"));
     }
 
     #[test]
