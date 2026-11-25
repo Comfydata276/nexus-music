@@ -60,10 +60,6 @@ pub fn remember_artists(artists: &[ArtistOffer]) {
     OFFERS.remember_artists(artists)
 }
 
-pub fn offered_artist(artist: &str) -> Option<ArtistOffer> {
-    OFFERS.offered_artist(artist)
-}
-
 pub fn remember(offers: &[Offer]) {
     OFFERS.remember(offers)
 }

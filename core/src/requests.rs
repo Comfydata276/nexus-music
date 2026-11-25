@@ -457,6 +457,158 @@ pub fn search(
     })
 }
 
+// ---- an artist beyond the library ------------------------------------------------------------------
+
+/// One of an artist's releases, as their page shows it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Release {
+    pub offer: Offer,
+    /// The line under it: the year, what kind of release it is if it isn't an album, and how
+    /// it stands ("2019 • EP • Requested", "2016 • In your library").
+    pub caption: String,
+    /// The library's own copy, if it has it: then it's shown, and opened, as that.
+    pub library: Option<LibraryAlbum>,
+    /// Lidarr has it.
+    pub arrived: bool,
+}
+
+/// An artist as the wider world knows them.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OutsideArtist {
+    pub name: String,
+    pub cover: String,
+    /// What's said of them under the name ("3 albums • 1 in your library").
+    pub about: String,
+    pub albums: Vec<Release>,
+    /// Singles and EPs, and soundtracks other than albums.
+    pub smaller: Vec<Release>,
+    /// How many albums could be asked for: none means there's nothing for "Add artist" to do.
+    pub open: usize,
+    /// What to say instead, when there's nothing to show, or why it couldn't be had.
+    pub empty: String,
+    /// It couldn't be had: `empty` says why, and `name` is what they were called when offered.
+    pub failed: bool,
+}
+
+/// An artist as the wider world knows them: every studio album they've made, with the ones
+/// in the library opening as usual and the rest there to be asked for. `id` is
+/// MusicBrainz's name for them; `singles` the "singles and EPs" setting.
+pub fn artist(services: Services, library: &dyn Library, offers: &Offers, singles: bool, id: &str) -> Result<OutsideArtist, Stopped> {
+    let lidarr = services.lidarr;
+    let remembered = offers.offered_artist(id);
+    // If Lidarr keeps track of the artist, its list says what's wanted and what's arrived.
+    let known = unless_stopped(lidarr.known_artist(id))?.ok().flatten();
+    let found = match &known {
+        Some((number, name)) => match unless_stopped(lidarr.releases_of(*number, name))? {
+            Ok(mut releases) => {
+                // Lidarr only lists the kinds of release the artist's profile covers, which may
+                // not include singles and EPs: those come from MusicBrainz.
+                if singles {
+                    for release in unless_stopped(services.musicbrainz.artist_releases(id, true))?.map(|(_, releases)| releases).unwrap_or_default() {
+                        if release.kind() != "Album" && !releases.iter().any(|(known, _)| known.album == release.album) {
+                            releases.push((release, false));
+                        }
+                    }
+                }
+                Ok((name.clone(), releases))
+            }
+            Err(reason) => Err(reason),
+        },
+        None => unless_stopped(services.musicbrainz.artist_releases(id, singles))?.map(|(name, releases)| (name, releases.into_iter().map(|release| (release, false)).collect())),
+    };
+    let (name, albums): (String, Vec<(Offer, bool)>) = match found {
+        Ok(found) => found,
+        Err(reason) => return Ok(OutsideArtist { name: remembered.map(|a| a.name).unwrap_or_default(), empty: reason, failed: true, ..Default::default() }),
+    };
+    let name = if name.is_empty() { remembered.as_ref().map(|artist| artist.name.clone()).unwrap_or_default() } else { name };
+    let offered: Vec<Offer> = albums.iter().map(|(offer, _)| offer.clone()).collect();
+    offers.remember(&offered);
+    // Albums the library has are shown as its own, so they open and play.
+    let library: HashMap<String, LibraryAlbum> = library.albums_by(&name);
+    let mut owned = 0;
+    let mut open = 0;
+    let mut card = |offer: &Offer, have: bool, counted: bool| -> Release {
+        // The year, what kind of thing it is if it isn't an album, and how it stands.
+        let caption = |state: &str| {
+            let kind = if offer.kind() == "Album" { "" } else { offer.kind() };
+            [offer.year.as_str(), kind, state].into_iter().filter(|part| !part.is_empty()).collect::<Vec<_>>().join(" • ")
+        };
+        if let Some(mine) = library.get(&plain(&offer.title)) {
+            owned += counted as usize;
+            return Release { offer: offer.clone(), caption: caption("In your library"), library: Some(mine.clone()), arrived: have };
+        }
+        if counted && !have && !offer.requested {
+            open += 1;
+        }
+        Release { offer: offer.clone(), caption: caption(if have { "Arrived" } else if offer.requested { "Requested" } else { "" }), library: None, arrived: have }
+    };
+    let cards: Vec<Release> = albums.iter().filter(|(offer, _)| offer.kind() == "Album").map(|(offer, have)| card(offer, *have, true)).collect();
+    let smaller: Vec<Release> = albums.iter().filter(|(offer, _)| offer.kind() != "Album").map(|(offer, have)| card(offer, *have, false)).collect();
+    let about = match (cards.len(), owned) {
+        (0, _) => String::new(),
+        (all, 0) => count(all, "album"),
+        (all, owned) => format!("{} • {owned} in your library", count(all, "album")),
+    };
+    Ok(OutsideArtist {
+        empty: if cards.is_empty() && smaller.is_empty() { "Nothing is listed for this artist.".into() } else { String::new() },
+        name,
+        cover: remembered.map(|artist| artist.cover).unwrap_or_default(),
+        about,
+        albums: cards,
+        smaller,
+        open,
+        failed: false,
+    })
+}
+
+/// The songs an artist is most played for, for the top of their page.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Popular {
+    /// "Popular", or "Popular, and not in your library" when some were left out for being
+    /// in the library already.
+    pub heading: String,
+    /// Each with whether its album has been asked for.
+    pub songs: Vec<(SongOffer, bool)>,
+}
+
+/// The songs an artist is most played for that the library doesn't have, for the top of
+/// their page; `None` if there are none. Found after the page itself, since it takes a few
+/// more questions. `name` is what the page calls them.
+pub fn artist_popular(
+    services: Services,
+    library: &dyn Library,
+    offers: &Offers,
+    singles: bool,
+    asked: &dyn Fn() -> Vec<Asked>,
+    id: &str,
+    name: &str,
+) -> Result<Option<Popular>, Stopped> {
+    let Ok((_, releases)) = unless_stopped(services.musicbrainz.artist_releases(id, singles))? else { return Ok(None) };
+    let (popular, left_out) = popular_songs(&top_of(services.musicbrainz, services.listenbrainz, id, &releases)?, library, id, name, &releases);
+    if popular.is_empty() {
+        return Ok(None);
+    }
+    let awaited: HashSet<String> = asked().into_iter().filter(|asked| asked.arrived == 0 && !asked.album.is_empty()).map(|asked| asked.album).collect();
+    Ok(Some(Popular {
+        heading: if left_out { "Popular, and not in your library".into() } else { "Popular".into() },
+        songs: popular
+            .into_iter()
+            .map(|song| {
+                let requested = awaited.contains(&song.album) || offers.offered(&song.album).is_some_and(|offer| offer.requested);
+                (song, requested)
+            })
+            .collect(),
+    }))
+}
+
+/// "1 album", "3 albums": a number of things.
+pub fn count(n: usize, noun: &str) -> String {
+    if n == 1 { format!("1 {noun}") } else { format!("{n} {noun}s") }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -554,6 +706,56 @@ mod tests {
         for stop_after in 0..all.len() {
             let (found, _, _) = searching(quiet_band(), stop_after, "quiet band");
             assert_eq!(found, Err(Stopped), "stopped after {stop_after}");
+        }
+    }
+
+    /// Asks `ask` of the stand-in, stopped from its `stop_after`th request on.
+    fn asking<T>(routes: &[(&'static str, &str)], stop_after: usize, ask: impl Fn(Services) -> T) -> (T, usize) {
+        let routes = routes.iter().map(|(part, answer)| (*part, answer.to_string())).collect();
+        let http = std::sync::Arc::new(Scripted { routes, stop_after, asked: Default::default() });
+        let lidarr = Lidarr::new("http://lidarr.test", "key", None, http.clone());
+        let listenbrainz = ListenBrainz::new(http.clone());
+        let musicbrainz = MusicBrainz::new(http.clone(), listenbrainz.clone());
+        let found = ask(Services { lidarr: &lidarr, musicbrainz: &musicbrainz, listenbrainz: &listenbrainz });
+        let asked = http.asked.lock().unwrap().len();
+        (found, asked)
+    }
+
+    const MARROW_LAKE: &[(&str, &str)] = &[
+        ("api/v1/artist", "[]"),
+        ("release-group?artist=ml", r#"{"release-group-count":2,"release-groups":[
+            {"id":"rg-1","title":"Iron Kite","primary-type":"Album","secondary-types":[],"first-release-date":"2018-10-19","artist-credit":[{"name":"Marrow Lake","artist":{"id":"ml","name":"Marrow Lake"}}]},
+            {"id":"rg-2","title":"Small Hours","primary-type":"EP","secondary-types":[],"first-release-date":"2017","artist-credit":[{"name":"Marrow Lake","artist":{"id":"ml","name":"Marrow Lake"}}]}]}"#),
+        ("top-recordings-for-artist/ml", r#"[{"recording_name":"Kite","release_name":"Iron Kite","total_listen_count":9}]"#),
+    ];
+
+    #[test]
+    fn an_artists_page_says_what_they_have_made() {
+        let (found, _) = asking(MARROW_LAKE, usize::MAX, |services| artist(services, &snapshot(), &Offers::new(), true, "ml"));
+        let found = found.unwrap();
+        assert_eq!((found.name.as_str(), found.about.as_str(), found.open), ("Marrow Lake", "1 album", 1));
+        assert_eq!(found.albums.iter().chain(&found.smaller).map(|release| release.caption.as_str()).collect::<Vec<_>>(), ["2018", "2017 • EP"]);
+        let (popular, _) = asking(MARROW_LAKE, usize::MAX, |services| artist_popular(services, &snapshot(), &Offers::new(), true, &Vec::new, "ml", "Marrow Lake"));
+        let popular = popular.unwrap().unwrap();
+        assert_eq!((popular.heading.as_str(), popular.songs.len()), ("Popular", 1));
+    }
+
+    #[test]
+    fn a_stopped_artists_page_says_so() {
+        fn page(services: Services) -> Result<OutsideArtist, Stopped> {
+            artist(services, &snapshot(), &Offers::new(), true, "ml")
+        }
+        fn popular(services: Services) -> Result<Option<Popular>, Stopped> {
+            artist_popular(services, &snapshot(), &Offers::new(), true, &Vec::new, "ml", "Marrow Lake")
+        }
+        let (_, all) = asking(MARROW_LAKE, usize::MAX, page);
+        for stop_after in 0..all {
+            assert_eq!(asking(MARROW_LAKE, stop_after, page).0, Err(Stopped), "stopped after {stop_after} of {all}");
+        }
+        let (_, all) = asking(MARROW_LAKE, usize::MAX, popular);
+        assert!(all >= 2);
+        for stop_after in 0..all {
+            assert_eq!(asking(MARROW_LAKE, stop_after, popular).0, Err(Stopped), "popular, stopped after {stop_after} of {all}");
         }
     }
 }

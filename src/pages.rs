@@ -478,79 +478,34 @@ fn requests_off(title: &str) -> PageData {
 }
 
 /// An artist as the wider world knows them: every studio album they've made, with the ones
-/// in the library opening as usual and the rest there to be asked for.
+/// in the library opening as usual and the rest there to be asked for (see
+/// `nexus_core::requests::artist`).
 fn outside_artist(id: &str) -> PageData {
     let Some(lidarr) = crate::lidarr::current() else { return requests_off("Artist") };
-    let remembered = crate::lidarr::offered_artist(id);
-    // If Lidarr keeps track of the artist, its list says what's wanted and what's arrived.
-    let known = lidarr.known_artist(id).ok().flatten();
-    let singles = crate::lidarr::singles();
-    let found = match &known {
-        Some((number, name)) => lidarr.releases_of(*number, name).map(|mut releases| {
-            // Lidarr only lists the kinds of release the artist's profile covers, which may
-            // not include singles and EPs: those come from MusicBrainz.
-            if singles {
-                for release in crate::musicbrainz::artist_releases(id, true).map(|(_, releases)| releases).unwrap_or_default() {
-                    if release.kind() != "Album" && !releases.iter().any(|(known, _)| known.album == release.album) {
-                        releases.push((release, false));
-                    }
-                }
-            }
-            (name.clone(), releases)
-        }),
-        None => crate::musicbrainz::artist_releases(id, singles).map(|(name, releases)| (name, releases.into_iter().map(|release| (release, false)).collect())),
+    let index = crate::search::current();
+    // (Nothing on Windows stops a request, so "stopped" can't come of it.)
+    let Ok(found) = nexus_core::requests::artist(services(&lidarr), library(&index), crate::lidarr::offers(), crate::lidarr::singles(), id) else {
+        return PageData { label: "Artist".into(), cover_round: true, ..Default::default() };
     };
-    let (name, albums) = match found {
-        Ok(found) => found,
-        Err(reason) => return PageData { label: "Artist".into(), title: remembered.map(|a| a.name).unwrap_or_default(), cover_round: true, empty: reason, ..Default::default() },
-    };
-    let name = if name.is_empty() { remembered.as_ref().map(|artist| artist.name.clone()).unwrap_or_default() } else { name };
-    let offers: Vec<crate::lidarr::Offer> = albums.iter().map(|(offer, _)| offer.clone()).collect();
-    crate::lidarr::remember(&offers);
-    // Albums the library has are shown as its own, so they open and play.
-    let library: std::collections::HashMap<String, CardData> = crate::search::current()
-        .map(|index| {
-            index
-                .library
-                .albums
-                .iter()
-                .filter(|album| plain(&album.subtitle) == plain(&name))
-                .map(|album| (plain(&album.title), album.clone()))
-                .collect()
-        })
-        .unwrap_or_default();
-    let mut owned = 0;
-    let mut open = 0;
-    let mut card = |offer: &crate::lidarr::Offer, have: bool, counted: bool| -> CardData {
-        // The year, what kind of thing it is if it isn't an album, and how it stands.
-        let caption = |state: &str| {
-            let kind = if offer.kind() == "Album" { "" } else { offer.kind() };
-            [offer.year.as_str(), kind, state].into_iter().filter(|part| !part.is_empty()).collect::<Vec<_>>().join(" • ")
-        };
-        if let Some(mine) = library.get(&plain(&offer.title)) {
-            owned += counted as usize;
-            return CardData { subtitle: caption("In your library"), ..mine.clone() };
+    if found.failed {
+        return PageData { label: "Artist".into(), title: found.name, cover_round: true, empty: found.empty, ..Default::default() };
+    }
+    let card = |release: &nexus_core::requests::Release| -> CardData {
+        match &release.library {
+            Some(mine) => CardData { kind: Kind::Album, id: mine.id.clone(), title: mine.title.clone(), subtitle: release.caption.clone(), cover: mine.cover.clone() },
+            None => CardData { subtitle: release.caption.clone(), ..request_card(&release.offer) },
         }
-        if counted && !have && !offer.requested {
-            open += 1;
-        }
-        CardData { subtitle: caption(if have { "Arrived" } else if offer.requested { "Requested" } else { "" }), ..request_card(offer) }
     };
-    let cards: Vec<CardData> = albums.iter().filter(|(offer, _)| offer.kind() == "Album").map(|(offer, have)| card(offer, *have, true)).collect();
-    let smaller: Vec<CardData> = albums.iter().filter(|(offer, _)| offer.kind() != "Album").map(|(offer, have)| card(offer, *have, false)).collect();
-    let meta = match (cards.len(), owned) {
-        (0, _) => String::new(),
-        (all, 0) => count(all as u32, "album"),
-        (all, owned) => format!("{} • {owned} in your library", count(all as u32, "album")),
-    };
+    let cards: Vec<CardData> = found.albums.iter().map(card).collect();
+    let smaller: Vec<CardData> = found.smaller.iter().map(card).collect();
     PageData {
         label: "Artist".into(),
-        title: name,
-        meta,
-        cover: remembered.map(|artist| artist.cover).unwrap_or_default(),
+        title: found.name,
+        meta: found.about,
+        cover: found.cover,
         cover_round: true,
-        action: if open > 0 { "Add artist".into() } else { String::new() },
-        empty: if cards.is_empty() && smaller.is_empty() { "Nothing is listed for this artist.".into() } else { String::new() },
+        action: if found.open > 0 { "Add artist".into() } else { String::new() },
+        empty: found.empty,
         // Beneath the songs they're most played for, which arrive after (see
         // `outside_artist_extras`); that's where the page puts `tail`.
         tail: [("Albums", cards), ("Singles and EPs", smaller)]
@@ -566,25 +521,24 @@ fn outside_artist(id: &str) -> PageData {
 /// The songs an artist is most played for, for the top of their page. Found after the page
 /// itself, since it takes a few more questions.
 fn outside_artist_extras(id: &str, page: &PageData) -> Option<PageData> {
-    crate::lidarr::current()?;
+    let lidarr = crate::lidarr::current()?;
     if page.title.is_empty() || !page.offers.is_empty() {
         return None;
     }
-    let (_, releases) = crate::musicbrainz::artist_releases(id, crate::lidarr::singles()).ok()?;
-    let top = nexus_core::requests::top_of(crate::musicbrainz::service(), crate::listenbrainz::service(), id, &releases).ok()?;
     let index = crate::search::current();
-    let (popular, left_out) = nexus_core::requests::popular_songs(&top, library(&index), id, &page.title, &releases);
-    if popular.is_empty() {
-        return None;
-    }
-    let awaited: std::collections::HashSet<String> =
-        crate::asked::shared().into_iter().filter(|asked| asked.arrived == 0 && !asked.album.is_empty()).map(|asked| asked.album).collect();
+    let popular = nexus_core::requests::artist_popular(
+        services(&lidarr),
+        library(&index),
+        crate::lidarr::offers(),
+        crate::lidarr::singles(),
+        &crate::asked::shared,
+        id,
+        &page.title,
+    )
+    .ok()??;
     let mut page = page.clone();
-    page.offers_heading = if left_out { "Popular, and not in your library".into() } else { "Popular".into() };
-    page.offers = popular
-        .iter()
-        .map(|song| offer_data(song, awaited.contains(&song.album) || crate::lidarr::offered(&song.album).is_some_and(|offer| offer.requested)))
-        .collect();
+    page.offers_heading = popular.heading;
+    page.offers = popular.songs.iter().map(|(song, requested)| offer_data(song, *requested)).collect();
     Some(page)
 }
 
