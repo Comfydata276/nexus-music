@@ -514,30 +514,50 @@ clock is used.
 Each way in, where it counts, and where it was seen to. "The same press" means it goes
 through the same function as the row it names, and is counted there. The walk is
 `ways.py` beside the other walks: one headless copy that writes down each move of its
-generation and each time it is busy, driven through each way in turn. Thirty-seven
-ways, each as the table says.
+generation, each time it is busy and each time its queue is claimed, driven through
+each way in turn. Thirty-seven ways, each as the table says.
 
-| Way in | Enters the player at | Moves the generation | Busy while it waits | Seen |
-|---|---|---|---|---|
-| Play, Pause: the window's button, Space, the tray, the taskbar's buttons, the mini player, the media keys | `toggle_play_here` | As it toggles. With nothing in the player: no. | | The walk: the button, Space |
-| Next, Previous: the buttons, Ctrl+Right and Ctrl+Left, the tray, the taskbar, the mini player, the media keys | `next_track_here`, `previous_track_here` | As it goes. With nothing to go to: no. | | The walk: the buttons, the keys |
-| Seek: the bar, the keys, the media keys | `seek_here` | Yes. Not on a radio, which has nowhere to seek to. | | The walk |
-| Volume; Mute | `set_volume_here`; the mute button's own handler | Yes | | The walk |
-| Shuffle, Repeat | `set_shuffle`, `set_repeat` | Yes | | The walk |
-| The queue's own edits: double-click an entry, Remove from queue, drag, Clear | `jump_to_upcoming_here`, `remove_upcoming_here`, `move_upcoming_here`, `clear_upcoming_here` | Yes. Naming a place that is not there: no. | | The walk |
-| Playing something: an album, playlist, artist or mix; a page's Play; a song in a list; a suggestion; Recently played; a radio station; a song's radio | `play_songs` | As the queue is replaced. If nothing in it can play (offline): no. | From the press until the songs arrive, where they are looked up | The walk: an album (looked up), a song in a list, a look-up the music server never answers |
-| Play Next, Add to Queue: a song, songs dragged onto the queue, an album, a playlist | `enqueue_here` | Yes | From the choice until the songs arrive, where they are looked up | The walk: a song; an album, looked up |
-| A guest in a jam, and a device linked the old way | `jam_asked`, then the same functions as the presses above | As each is carried out | From being let in until carried out or refused | The walk: a guest's add, skip and play, and a search (which changes nothing). The second slice's walk: a device steered the old way while the new runs |
-| A command from another device | `core::link::device` (judged, and counted once), then the `_here` function of the same press under `carrying_out` | Once, as the rule lets it through; what the player does for it is not counted again | From being accepted until carried out; a queue taken over, until its sound starts | The second slice's walk: every command, and its repeat refused `changed` |
-| The sound rolling into the next song | The engine's word, or the app reading what is sounding before it judges another device's command | At the sound's boundary | | The walk |
-| A song ending; the queue running out | The engine's word | Yes | | The walk: the queue running out, autoplay off |
-| Autoplay | `autoplay_loaded` | As the songs are added: ahead of time, while the last song plays | Only if they have not arrived when the queue runs out: from then until they land | The walk: both |
-| A song that will not play being passed over | `pass_over` | Yes | | The walk |
-| The sleep timer: set, cancelled, its pause | `set_sleep`, `check_sleep`, the end of a song | Yes | | By reading |
-| The sound output being lost | The engine's word | If it was playing | | By reading: it cannot be made to happen in a headless window |
-| A followed playlist changing the queue | `source_list_now` | Yes | | By reading |
-| Sync's "Continue here" | `sync.rs`, then `replace_queue` | Yes | | By reading |
-| The queue restored as the app starts; sign-out emptying the player | `replace_queue`, `stop_playback` | Yes | | By reading |
+**Each way in says one thing, once: who chose it and what it touches** (`core::ways`;
+on Windows, `way_in`, `came_in` and `for_another` in `src/ways.rs`). Two rules are
+worked out from that statement, and neither keeps a list of its own: this section's
+order of choices, and whose the queue is when devices share it through the server's
+saved queue (`core::handover`, where a queue the person has made their own is never
+replaced by itself). Who chose it is the person at this PC, unless a function the app
+runs by itself says nobody did, or whoever carries out another's choice says whose it
+is first: a command from another of the person's devices, or what a guest asked for.
+What is under way is one choice, counted once and claimed once, and is whoever's the
+outermost is: the sleep timer pauses by running Pause's function, and that is the
+app's own doing all the same.
+
+The queue is this PC's own by a way in when a person chose it (here, at another of
+their devices, or as a guest) and it touches what a saved queue holds: what is in the
+player and how it is playing. The volume, mute, repeat and setting the sleep timer are
+counted and claim nothing. **A command from another of the person's devices claims as
+the same press here would**, by the old linking and the new alike.
+
+| Way in | Enters the player at | Who chose it | Moves the generation | Busy while it waits | The queue is this PC's own by it | Seen |
+|---|---|---|---|---|---|---|
+| Play, Pause: the window's button, Space, the tray, the taskbar's buttons, the mini player, the media keys | `toggle_play_here` | The person here | As it toggles. With nothing in the player: no. |  | Yes | The walk: the button, Space |
+| Next, Previous: the buttons, Ctrl+Right and Ctrl+Left, the tray, the taskbar, the mini player, the media keys | `next_track_here`, `previous_track_here` | The person here | As it goes. With nothing to go to: no. |  | Yes | The walk: the buttons, the keys |
+| Seek: the bar, the keys, the media keys | `seek_here` | The person here | Yes. Not on a radio, which has nowhere to seek to. |  | Yes | The walk |
+| Volume; Mute | `set_volume_here`; the mute button's own handler | The person here | Yes |  | No: a saved queue holds neither | The walk |
+| Shuffle, Repeat | `set_shuffle`, `set_repeat` | The person here | Yes |  | Shuffle: yes. Repeat: no | The walk |
+| The queue's own edits: double-click an entry, Remove from queue, drag, Clear | `jump_to_upcoming_here`, `remove_upcoming_here`, `move_upcoming_here`, `clear_upcoming_here` | The person here | Yes. Naming a place that is not there: no. |  | Yes | The walk |
+| Playing something: an album, playlist, artist or mix; a page's Play; a song in a list; a suggestion; Recently played; a radio station; a song's radio | `play_songs` | The person here | As the queue is replaced. If nothing in it can play (offline): no. | From the press until the songs arrive, where they are looked up | Yes, as the queue is replaced: where the songs are looked up, when they arrive | The walk: an album (looked up), a song in a list, a look-up the music server never answers |
+| Play Next, Add to Queue: a song, songs dragged onto the queue, an album, a playlist | `enqueue_here` | The person here | Yes | From the choice until the songs arrive, where they are looked up | Yes, as the songs are queued: where they are looked up, when they arrive | The walk: a song; an album, looked up |
+| A guest in a jam, and a device linked the old way | `jam_asked`, then the same functions as the presses above | A guest; or the person at another of their devices (the old linking) | As each is carried out | From being let in until carried out or refused | Yes, for what touches what plays; a guest's volume or repeat, no | The walk: a guest's add, skip and play, and a search (which changes nothing). The second slice's walk: a device steered the old way while the new runs |
+| A command from another device | `core::link::device` (judged, and counted once), then the `_here` function of the same press under `for_another` | The person at another of their devices | Once, as the rule lets it through; what the player does for it is not counted again | From being accepted until carried out; a queue taken over, until its sound starts | As the same press would: yes, but for volume and repeat | The second slice's walk: every command, and its repeat refused `changed` |
+| The sound rolling into the next song | The engine's word, or the app reading what is sounding before it judges another device's command | Nobody | At the sound's boundary |  | No | The walk |
+| A song ending; the queue running out | The engine's word | Nobody | Yes |  | No | The walk: the queue running out, autoplay off |
+| Autoplay | `autoplay_loaded` | Nobody | As the songs are added: ahead of time, while the last song plays | Only if they have not arrived when the queue runs out: from then until they land | No | The walk: both |
+| A song that will not play being passed over | `pass_over` | Nobody | Yes |  | No | The walk |
+| The sleep timer: set, cancelled, its pause | `set_sleep`, `check_sleep`, the end of a song | Set, cancelled: the person here. Its pause: nobody | Yes |  | No: setting it touches nothing a saved queue holds, and its pause is the app's own | By reading |
+| The sound output being lost | The engine's word | Nobody | If it was playing |  | No | By reading: it cannot be made to happen in a headless window |
+| A followed playlist changing the queue | `source_list_now` | Nobody | Yes |  | No | By reading |
+| Sync's "Continue here" | `sync.rs`, then `replace_queue` | The person here | Yes |  | Yes, once the queue is in (said by `continue_here` itself: putting it in claims nothing) | By reading |
+| The queue restored as the app starts; sign-out emptying the player | `replace_queue`, `stop_playback` | Nobody | Yes |  | No | By reading |
+| "Play here": another device's music brought to this PC | `core::link::device`, then `load_queue_here` | The person here | As the queue is taken | Until its sound starts | Yes, as "Continue here" does | The second slice's walk |
+| The pause that ends a move of this PC's music to another device | `core::link::device`, then `pause_here` | Nobody | Yes |  | No: the person chose that the queue go there, and that device claimed it as it took it | The second slice's walk |
 
 Not counted, because no command acts on them: the position ticking, a radio's song title
 arriving, a song being liked, the sound settings and the output device being changed (the
@@ -679,6 +699,7 @@ timers, making the requests, its player, its window.
 | `words` | Every sentence the person is told, for a PC and for a phone. |
 | `seen` | The devices seen before: sixteen, thirty days, by name. |
 | `bind` | The same deciding for an app whose player and library are not in Rust (below). |
+| `core::ways` (beside `link`) | Who chose a way into the player and what it touches, and what is owed for it: a place in the order of choices, and the queue being this device's own (5.6.1). |
 
 It owns no thread, clock, file, socket or source of randomness. An app hands in:
 
@@ -696,8 +717,8 @@ It owns no thread, clock, file, socket or source of randomness. An app hands in:
   it has.
 
 **Windows** (`src/link.rs`) is then: the switch; the seam every way into the player
-calls (`changing`, `changed`, `looking_up`, and `carrying_out` for a command, which
-is not counted twice); two `Http`s over the app's own agents; `Player` over the
+calls (`way_in`, `came_in`, `looking_up`, and `for_another` for a command or a guest's
+ask, which says whose choice it is and is not counted twice); two `Http`s over the app's own agents; `Player` over the
 `_here` functions of the player; the thread that keeps the place and the pool that
 sends; and the window (the list, the other device's player and queue, the toasts).
 
@@ -705,12 +726,13 @@ sends; and the window (the list, the other device's player and queue, the toasts
 both in Kotlin, and the deciding must not call into Kotlin while it decides. So:
 
 - **The player is events in and commands out.** Kotlin says what its player holds
-  whenever that changes (`Event::Player`), and tells each thing that counts in the
-  order of choices as it happens (`Event::Changed`, and `LookingUp` and `LookedUp`
-  around a look-up for something to play): every row of 5.6.1 has its like on a
-  phone, with the notification, a headset, the car and other apps' controls added.
-  What is to be done to the player comes back as data (`Act::Carry`, `Act::Pause`,
-  `Act::Take`), each numbered.
+  whenever that changes (`Event::Player`), and tells each way in as it is taken
+  (`Event::Changed`, with who chose it and what it touches as in 5.6.1; and
+  `LookingUp` and `LookedUp` around a look-up for something to play): every row of
+  5.6.1 has its like on a phone, with the notification, a headset, the car and other
+  apps' controls added. What is to be done to the player comes back as data
+  (`Act::Carry`, `Act::Pause`, `Act::Take`), each numbered; and when the queue is the
+  phone's own by something, `Act::Claim`, worked out by the same `core::ways`.
 - **Nothing is decided against a player that has not caught up.** A command is
   carried out a moment after it is decided, on another thread. Until Kotlin has said
   what its player holds after doing what it was last asked (the state, with that
