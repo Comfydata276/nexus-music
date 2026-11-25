@@ -283,17 +283,7 @@ fn release_among(found: &Value, artist: &str, title: &str, album: &str, singles:
     best.map(|(_, id)| id)
 }
 
-/// The words of a piece of text, for comparing: folded, without punctuation.
-pub fn words(text: &str) -> Vec<String> {
-    let folded: String = fold(text).chars().filter(|c| !matches!(c, '\'' | '’')).collect();
-    folded.split(|c: char| !c.is_alphanumeric()).filter(|word| !word.is_empty()).map(str::to_string).collect()
-}
-
-/// Whether two pieces of text are made of the same words, in any order.
-pub fn same_words(a: &str, b: &str) -> bool {
-    let (a, b) = (words(a), words(b));
-    !a.is_empty() && a.iter().all(|word| b.contains(word)) && b.iter().all(|word| a.contains(word))
-}
+pub use nexus_core::text::{base, same_words, words};
 
 /// How well a song answers what was typed, 0 being best:
 /// 0, its title and artist are exactly what was typed ("yellow coldplay");
@@ -315,13 +305,6 @@ fn closeness(typed: &[String], song: &SongOffer) -> u8 {
     } else {
         3
     }
-}
-
-/// A title without what's in brackets after it: "Lonely No More (Acoustic)" is, for finding
-/// the song, "Lonely No More".
-pub fn base(title: &str) -> &str {
-    let cut = title.find(" (").or_else(|| title.find(" [")).unwrap_or(title.len());
-    if cut == 0 { title } else { &title[..cut] }
 }
 
 /// MusicBrainz lists every recording of a song separately: the single, the album cut, each

@@ -1,0 +1,10 @@
+[package]
+name = "nexus-core"
+version = "0.0.0"
+edition = "2024"
+description = "The parts of Nexus Music that every app on an account must do identically"
+publish = false
+
+# No window, no threads of its own and no network code: this is what lets one copy of it
+# serve the Windows app and the Android app. Anything added here has to keep that true.
+[dependencies]

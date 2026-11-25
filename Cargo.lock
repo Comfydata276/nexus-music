@@ -3167,6 +3167,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "nexus-core"
+version = "0.0.0"
+
+[[package]]
 name = "nexus-music"
 version = "0.40.3"
 dependencies = [
@@ -3180,6 +3184,7 @@ dependencies = [
  "keyring",
  "md-5",
  "native-tls",
+ "nexus-core",
  "qrcode",
  "raw-window-handle",
  "rubato",

@@ -529,18 +529,7 @@ fn random_salt() -> String {
     (0..16).map(|_| fastrand::alphanumeric()).collect()
 }
 
-pub fn encode(input: &str) -> String {
-    let mut out = String::with_capacity(input.len() + 8);
-    for b in input.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
-}
+pub use nexus_core::text::encode;
 
 impl Client {
     pub fn new(server: &str, username: &str, password: &str) -> Client {
@@ -1530,11 +1519,5 @@ mod tests {
         reader.read_to_end(&mut audio).unwrap();
         assert_eq!(audio, b"AAAABBBBCC");
         assert_eq!(*title.lock().unwrap(), "Band - Song");
-    }
-
-    #[test]
-    fn encodes_query_values() {
-        assert_eq!(encode("Marrow & Pine"), "Marrow%20%26%20Pine");
-        assert_eq!(encode("Études"), "%C3%89tudes");
     }
 }

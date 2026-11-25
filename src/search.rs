@@ -144,37 +144,7 @@ pub struct Results {
     pub artist_first: bool,
 }
 
-/// Lower-case, without accents or punctuation, so "Beyoncé" and "beyonce" are the same.
-pub fn fold(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for c in text.chars().flat_map(char::to_lowercase) {
-        match c {
-            'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'ā' | 'ă' | 'ą' => out.push('a'),
-            'ç' | 'ć' | 'č' => out.push('c'),
-            'ď' | 'đ' => out.push('d'),
-            'è' | 'é' | 'ê' | 'ë' | 'ē' | 'ė' | 'ę' | 'ě' => out.push('e'),
-            'ğ' => out.push('g'),
-            'ì' | 'í' | 'î' | 'ï' | 'ī' | 'į' | 'ı' => out.push('i'),
-            'ł' => out.push('l'),
-            'ñ' | 'ń' | 'ň' => out.push('n'),
-            'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ø' | 'ō' | 'ő' => out.push('o'),
-            'ř' => out.push('r'),
-            'ś' | 'š' | 'ş' => out.push('s'),
-            'ť' | 'ţ' => out.push('t'),
-            'ù' | 'ú' | 'û' | 'ü' | 'ū' | 'ů' | 'ű' | 'ų' => out.push('u'),
-            'ý' | 'ÿ' => out.push('y'),
-            'ź' | 'ż' | 'ž' => out.push('z'),
-            'æ' => out.push_str("ae"),
-            'œ' => out.push_str("oe"),
-            'ß' => out.push_str("ss"),
-            // "don't" and "dont" are the same word.
-            '\'' | '’' | '‘' | '`' => {}
-            c if c.is_alphanumeric() => out.push(c),
-            _ => out.push(' '),
-        }
-    }
-    out
-}
+pub use nexus_core::text::fold;
 
 /// How many single-letter slips (a letter wrong, missing, extra, or two swapped) separate
 /// two words; anything over `limit` comes back as `limit + 1`.
@@ -576,12 +546,6 @@ mod tests {
 
     fn titles(songs: &[Song]) -> Vec<String> {
         songs.iter().map(|song| format!("{} / {}", song.title, song.artist)).collect()
-    }
-
-    #[test]
-    fn folds_accents_and_punctuation() {
-        assert_eq!(fold("Beyoncé — Déjà Vu!"), "beyonce   deja vu ");
-        assert_eq!(fold("Don’t Stop"), "dont stop");
     }
 
     #[test]

@@ -5,7 +5,17 @@ edition = "2024"
 description = "A fast native music player for Navidrome"
 publish = false
 
+# The app, and the library both apps are built on (core/). The jam relay (relay/) is a
+# project of its own, with its own lock file and image.
+[workspace]
+members = ["core"]
+default-members = [".", "core"]
+exclude = ["relay"]
+
 [dependencies]
+# What every app on an account must do identically. It has no window, starts no threads and
+# opens no connections; it is compiled into the app like any other dependency.
+nexus-core = { path = "core" }
 slint = { version = "1.19", default-features = false, features = [
     "std", "backend-winit", "renderer-skia", "renderer-software",
     "accessibility", "compat-1-2", "system-tray", "raw-window-handle-06",

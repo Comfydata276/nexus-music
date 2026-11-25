@@ -11,7 +11,7 @@ use std::sync::RwLock;
 use serde::{Deserialize, Serialize};
 
 use crate::import::{Matcher, Wanted};
-use crate::musicbrainz::{same_words, words};
+use crate::musicbrainz::same_words;
 use crate::search::Index;
 
 /// How long an arrival stays listed on the Requests page.
@@ -197,11 +197,7 @@ impl AskedList {
     }
 }
 
-/// Whether two artist credits name the same artist, or one is among the other's.
-pub(crate) fn same_artist(a: &str, b: &str) -> bool {
-    let (a, b) = (words(a), words(b));
-    !a.is_empty() && !b.is_empty() && (a.iter().all(|word| b.contains(word)) || b.iter().all(|word| a.contains(word)))
-}
+pub(crate) use nexus_core::text::same_artist;
 
 /// Looks through the library for the albums in `asked` that are still awaited, and for the
 /// ones that arrived lately with songs still to go into playlists. For each that's there
