@@ -250,7 +250,7 @@ fn name_of(http: &dyn Http, service: &str, access: &str) -> String {
     let Ok(response) = http.send(&Request { headers: &[("Authorization", &bearer)], ..Request::get(&url) }) else {
         return String::new();
     };
-    let person: Person = response.body().ok().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default();
+    let person: Person = response.json().unwrap_or_default();
     if person.preferred_username.is_empty() { person.name } else { person.preferred_username }
 }
 

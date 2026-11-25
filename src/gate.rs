@@ -442,4 +442,75 @@ mod wire {
         let found = session("http://127.0.0.1:9", "kept", Arc::default()).pass().unwrap_err();
         assert!(found.starts_with("Couldn't reach the sign-in service. "), "{found}");
     }
+
+    /// Signs in against a stand-in service whose UserInfo is answered by `userinfo`; the rest
+    /// as Authentik answers. Gives what came of it and how long finishing took.
+    fn sign_in_with_userinfo(userinfo: impl Fn(&mut std::net::TcpStream) + Send + Sync + 'static) -> (Result<SignedIn, String>, Duration) {
+        let (address, _) = recorder(move |_, request, stream| match request.line() {
+            line if line.starts_with("POST /application/o/token/ ") && request.body.contains("authorization_code") => {
+                json(stream, "200 OK", r#"{"access_token":"first-access","refresh_token":"to keep"}"#)
+            }
+            line if line.starts_with("POST /application/o/token/ ") => json(stream, "200 OK", r#"{"access_token":"a-pass","expires_in":600}"#),
+            _ => userinfo(stream),
+        });
+        let attempt = begin(&Found { service: address, client: "lidarr-proxy".into() }).unwrap();
+        let query = attempt.link.split_once('?').unwrap().1.to_string();
+        let (back, state) = (param(&query, "redirect_uri").unwrap(), param(&query, "state").unwrap());
+        std::thread::spawn(move || {
+            let mut stream = std::net::TcpStream::connect(back.trim_start_matches("http://").trim_end_matches("/callback")).unwrap();
+            write!(stream, "GET /callback?code=c&state={state} HTTP/1.1\r\n\r\n").unwrap();
+            let _ = stream.read_to_string(&mut String::new());
+        });
+        let started = Instant::now();
+        let done = attempt.finish(&agent(), || false);
+        (done, started.elapsed())
+    }
+
+    fn answer(stream: &mut std::net::TcpStream, kind: &str, body: &[u8]) {
+        let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+        let _ = stream.write_all(body);
+    }
+
+    #[test]
+    fn a_name_page_that_is_not_json_and_never_ends_is_given_up_at_once() {
+        // A proxy's page in place of the answer, sent as it's made and never finished: what
+        // it begins with is enough to tell it isn't the answer.
+        let (done, took) = sign_in_with_userinfo(|stream| {
+            let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nTransfer-Encoding: chunked\r\n\r\n6\r\n<html>\r\n");
+            let _ = stream.flush();
+            std::thread::sleep(Duration::from_secs(20));
+        });
+        let done = done.unwrap();
+        assert_eq!((done.token.as_str(), done.name.as_str()), ("to keep", ""));
+        assert!(took < Duration::from_secs(5), "took {took:?}");
+    }
+
+    #[test]
+    fn a_name_page_that_says_how_long_it_is_is_read_whole_first() {
+        // One that says how long it is is read whole before it's looked at, and so waited for.
+        const STALL: Duration = Duration::from_secs(3);
+        let (done, took) = sign_in_with_userinfo(|stream| {
+            let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n<html>");
+            let _ = stream.flush();
+            std::thread::sleep(STALL);
+        });
+        assert_eq!(done.unwrap().name, "");
+        assert!(took >= STALL - Duration::from_millis(500), "took {took:?}");
+    }
+
+    #[test]
+    fn bytes_that_are_not_text_in_a_claim_nobody_reads_do_not_lose_the_name() {
+        for kind in ["application/json", "text/plain"] {
+            let (done, _) = sign_in_with_userinfo(move |stream| answer(stream, kind, b"{\"sub\":\"\xff\xfe\",\"preferred_username\":\"someone\",\"name\":\"Some One\"}"));
+            assert_eq!(done.unwrap().name, "someone", "as {kind}");
+        }
+    }
+
+    #[test]
+    fn bytes_that_are_not_text_in_the_name_lose_the_name() {
+        for kind in ["application/json", "text/plain"] {
+            let (done, _) = sign_in_with_userinfo(move |stream| answer(stream, kind, b"{\"preferred_username\":\"some\xffone\",\"name\":\"Some One\"}"));
+            assert_eq!(done.unwrap().name, "", "as {kind}");
+        }
+    }
 }

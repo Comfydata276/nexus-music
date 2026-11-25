@@ -47,14 +47,45 @@ pub struct Response {
     /// Every header, in the order sent. A value that isn't text is `None`: it is still
     /// there, and still the first of its name if it was.
     pub headers: Vec<(String, Option<String>)>,
-    body: Box<dyn FnOnce() -> Result<String, String> + Send>,
+    body: Body,
+}
+
+/// A body that hasn't been read, handed over by the app so that the library can read it as
+/// text or as JSON, the two ways the app has always read one.
+pub trait Stream: Send {
+    /// How long the answer says its body is, if it says.
+    fn length(&self) -> Option<u64>;
+    /// Waits for all of it and hands it over as text, as the app reads text.
+    fn text(self: Box<Self>) -> Result<String, String>;
+    /// The body as it arrives, no more of it than the app will read of a body
+    /// (`BODY_LIMIT`): reading past that is an error.
+    fn bytes(self: Box<Self>) -> Box<dyn std::io::Read + Send>;
+}
+
+/// The most of a body that is read: the Windows app's limit, ureq's.
+pub const BODY_LIMIT: u64 = 10 * 1024 * 1024;
+/// A body that says it's no longer than this is read whole before its JSON is read; any
+/// other is read as it arrives, so that one that doesn't begin as JSON is given up at once.
+/// This is how ureq's `read_json` reads (a third of its limit), which the app used before
+/// the library read JSON itself.
+const JSON_WHOLE: u64 = BODY_LIMIT / 3;
+
+enum Body {
+    Text(Box<dyn FnOnce() -> Result<String, String> + Send>),
+    Stream(Box<dyn Stream>),
 }
 
 impl Response {
     /// `body` waits for what the answer said and hands it over, or says why it didn't
-    /// arrive whole, under whatever limits the app puts on reading one.
+    /// arrive whole, under whatever limits the app puts on reading one. For an answer that
+    /// is only ever text (a stand-in in a test); an app hands over its bodies as a `Stream`.
     pub fn new(status: u16, headers: Vec<(String, Option<String>)>, body: impl FnOnce() -> Result<String, String> + Send + 'static) -> Response {
-        Response { status, headers, body: Box::new(body) }
+        Response { status, headers, body: Body::Text(Box::new(body)) }
+    }
+
+    /// An answer whose body is read only as it's asked for, as text or as JSON.
+    pub fn streamed(status: u16, headers: Vec<(String, Option<String>)>, body: impl Stream + 'static) -> Response {
+        Response { status, headers, body: Body::Stream(Box::new(body)) }
     }
 
     /// The first header of that name, if it is there and is text. Where a name is sent
@@ -66,7 +97,27 @@ impl Response {
 
     /// Waits for what it said. The words, if it didn't arrive whole, are the app's.
     pub fn body(self) -> Result<String, String> {
-        (self.body)()
+        match self.body {
+            Body::Text(read) => read(),
+            Body::Stream(stream) => stream.text(),
+        }
+    }
+
+    /// Reads what it said as JSON, as ureq's `read_json` does: a body that says it's short
+    /// is read whole and then parsed; any other is parsed as it arrives, so that one that
+    /// begins with something that isn't JSON is given up on without waiting for the rest.
+    /// Read as bytes, not text: bytes that aren't UTF-8 matter only where they are read.
+    pub fn json<T: serde::de::DeserializeOwned>(self) -> Result<T, String> {
+        let stream = match self.body {
+            Body::Text(read) => return serde_json::from_str(&read()?).map_err(|e| e.to_string()),
+            Body::Stream(stream) => stream,
+        };
+        if stream.length().is_some_and(|length| length <= JSON_WHOLE) {
+            let mut whole = Vec::new();
+            std::io::Read::read_to_end(&mut stream.bytes(), &mut whole).map_err(|e| e.to_string())?;
+            return serde_json::from_slice(&whole).map_err(|e| e.to_string());
+        }
+        serde_json::from_reader(stream.bytes()).map_err(|e| e.to_string())
     }
 }
 
