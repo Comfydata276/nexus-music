@@ -36,7 +36,7 @@ use super::seen::{self, Seen as Remembered};
 use super::steer::{Outcome, Peer, Press as Pressed, Tick, Told, Wait};
 use super::view::{Press, View};
 use super::words::{self, Here};
-use super::{Asks, DeviceId, LOOK_AGAIN_MS, LOOK_EVERY_MS, LOOK_IDLE_MS, Nonce, Place, WAIT_MS, minute, secret_holds, text};
+use super::{Asks, DeviceId, LOOK_AGAIN_MS, LOOK_EVERY_MS, LOOK_IDLE_MS, Nonce, Place, Token, WAIT_MS, minute, secret_holds, text};
 use crate::requests::Library;
 
 /// How long a device that was being steered may be gone from the room before the player
@@ -165,7 +165,7 @@ pub enum Do {
     End { session: u64 },
     /// Send this frame (`super::relay::send`), unless the session has ended or run out of
     /// time when its turn comes ([`may_go`]).
-    Send { session: u64, token: String, to: Place, frame: String },
+    Send { session: u64, token: Token, to: Place, frame: String },
     /// Some of the songs a command brings are not in this device's copy of the library:
     /// ask the music server for them, and answer with [`Device::found`] the ones it has.
     Find { ticket: u64, ids: Vec<String> },
@@ -258,7 +258,7 @@ struct Session {
     /// When the look that read the secret began. Ten minutes on, the secret is not used.
     since_ms: u64,
     /// This device's place in the room and the token for it, once it has entered.
-    place: Option<(Place, String)>,
+    place: Option<(Place, Token)>,
     /// The other places in the room, in the relay's order, and what is known of each.
     others: Vec<Place>,
     peers: HashMap<Place, Seen>,
@@ -342,6 +342,8 @@ pub struct Device {
     tickets: u64,
     news: News,
     remembered: Vec<Remembered>,
+    /// The day the remembered devices were last looked through for ones to forget.
+    forgot_on: u64,
     /// What the list last showed, to say when it changes.
     listed: Vec<Row>,
     /// For a test only: how long a Pause from another device is held between being
@@ -399,7 +401,7 @@ pub fn known(library: &dyn Library, ids: &[String], start: usize, queued: usize)
 impl Device {
     /// A device that remembers these others from before.
     pub fn new(remembered: Vec<Remembered>) -> Device {
-        Device { remembered, ..Device::default() }
+        Device { remembered: seen::loaded(remembered), ..Device::default() }
     }
 
     /// The session, if `number` is the one that is live **and its secret is inside its
@@ -506,6 +508,14 @@ impl Device {
             out.extend(self.stop());
             self.account = account.to_string();
             self.used = None;
+        }
+        // A device unseen for thirty days is forgotten by the calendar, whether or not
+        // another is ever seen (looked at once a day).
+        if std::mem::replace(&mut self.forgot_on, env.today) != env.today
+            && let Some(kept) = seen::without_the_forgotten(&self.remembered, env.today)
+        {
+            self.remembered = kept;
+            out.push(Do::Remember(self.remembered.clone()));
         }
         if !wanted || self.off {
             out.extend(self.stop());
@@ -636,7 +646,7 @@ impl Device {
     }
 
     /// This device has a place in the room.
-    pub fn entered(&mut self, session: u64, place: Place, token: String) {
+    pub fn entered(&mut self, session: u64, place: Place, token: Token) {
         self.news.forget();
         if let Some(live) = self.session.as_mut().filter(|live| live.number == session) {
             // A new place: whatever was asked from the old one cannot be answered to it.

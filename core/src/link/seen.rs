@@ -36,6 +36,33 @@ pub fn remembered(mut list: Vec<Seen>, seen: Option<(&str, &str)>, day: u64) -> 
     list
 }
 
+/// A list as an app kept it, held to the list's own bounds before anything is done with
+/// it: whatever a settings file has come to hold (written by another version, or by hand),
+/// no more than [`MOST`] are taken, the ones seen most lately; each device once, as it was
+/// last seen; and each name no longer than a device can give.
+pub fn loaded(mut list: Vec<Seen>) -> Vec<Seen> {
+    // (A stable sort: of two seen on one day, the one the list had first stays first.)
+    list.sort_by(|one, other| other.day.cmp(&one.day));
+    let mut kept: Vec<Seen> = Vec::new();
+    for seen in list {
+        if kept.len() < MOST && !seen.id.is_empty() && seen.id.len() <= MOST_ID && !kept.iter().any(|known| known.id == seen.id) {
+            kept.push(Seen { name: super::text::cut(&seen.name, super::message::MOST_TEXT), ..seen });
+        }
+    }
+    kept
+}
+
+/// The longest an id is taken to be: longer than any device gives (22 characters).
+const MOST_ID: usize = 64;
+
+/// The list without the ones unseen for [`DAYS`], if there are any such: `None` if it is
+/// as it should be. (A device that is never seen again is forgotten by the calendar, not
+/// only when another is seen.)
+pub fn without_the_forgotten(list: &[Seen], day: u64) -> Option<Vec<Seen>> {
+    let kept: Vec<Seen> = list.iter().filter(|known| day.saturating_sub(known.day) <= DAYS).cloned().collect();
+    (kept.len() != list.len()).then_some(kept)
+}
+
 /// Whether seeing this device under this name today is news to the list: it is new, has a
 /// new name, or was last seen on another day. (So the list is written once a day for
 /// each device, not at every look.)
@@ -63,6 +90,26 @@ mod tests {
         let many: Vec<Seen> = (0..20).map(|n| seen(&format!("d{n}"), "PC", 100)).collect();
         let list = remembered(many, Some(("new", "New PC")), 100);
         assert_eq!((list.len(), list[0].id.as_str(), list.iter().any(|known| known.id == "d19")), (16, "new", false));
+    }
+
+    #[test]
+    fn a_list_read_from_a_file_is_held_to_the_list_s_bounds() {
+        // Ten thousand of them, some twice, some with no id, one with a name as long as a book.
+        let mut kept: Vec<Seen> = (0..10_000u64).map(|n| seen(&format!("d{}", n % 6_000), "PC", n)).collect();
+        kept.push(seen("", "No id", 99_999));
+        kept.push(seen("long", &"n".repeat(100_000), 99_998));
+        kept.push(seen(&"i".repeat(1_000), "An id as long as a page", 99_997));
+        let list = loaded(kept);
+        assert_eq!((list.len(), list[0].id.as_str(), list[0].name.chars().count() <= super::super::message::MOST_TEXT), (MOST, "long", true));
+        // The ones seen most lately, each once, as last seen.
+        assert_eq!(list[1..4], [seen("d3999", "PC", 9_999), seen("d3998", "PC", 9_998), seen("d3997", "PC", 9_997)]);
+        // One that is already as it should be is left as it is.
+        let good = vec![seen("b", "Kitchen laptop", 101), seen("a", "Study PC", 100)];
+        assert_eq!(loaded(good.clone()), good);
+        // And the calendar forgets, whether or not another device is ever seen.
+        assert_eq!(without_the_forgotten(&good, 130), None);
+        assert_eq!(without_the_forgotten(&good, 131), Some(vec![seen("b", "Kitchen laptop", 101)]));
+        assert_eq!(without_the_forgotten(&good, 500), Some(Vec::new()));
     }
 
     #[test]

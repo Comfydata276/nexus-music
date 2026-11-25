@@ -86,7 +86,7 @@ impl Ways {
         if self.depth == 0 {
             (self.who, self.counted, self.claimed) = (Some(who), counted, false);
         }
-        self.depth += 1;
+        self.depth = self.depth.saturating_add(1);
     }
 
     /// A way in is being taken: it is known that something will change. `who` chose it,
@@ -95,7 +95,7 @@ impl Ways {
         if self.depth == 0 {
             (self.who, self.counted, self.claimed) = (Some(who), false, false);
         }
-        self.depth += 1;
+        self.depth = self.depth.saturating_add(1);
         let count = !std::mem::replace(&mut self.counted, true);
         let claim = what == What::Playing && self.who != Some(Who::Nobody) && !std::mem::replace(&mut self.claimed, true);
         Owed { count, claim }
@@ -205,5 +205,26 @@ mod tests {
         // Ending more than was begun leaves it as it was.
         ways.end();
         assert_eq!(ways.touch(Who::Here, What::Playing), BOTH);
+    }
+
+    /// Whatever it is handed, in whatever order, it neither stops the app nor runs out of
+    /// room: beginnings that are never ended are one choice that goes on, and are over
+    /// when as many endings have come.
+    #[test]
+    fn beginnings_without_endings_cannot_run_it_out() {
+        let mut ways = Ways { depth: u32::MAX - 1, who: Some(Who::Guest), counted: true, claimed: true };
+        ways.begin(Who::Elsewhere, false);
+        assert_eq!(ways.enter(Who::Here, What::Playing), NOTHING);
+        ways.begin(Who::Here, false);
+        assert_eq!((ways.depth, ways.whose()), (u32::MAX, Some(Who::Guest)));
+        let mut ways = Ways::default();
+        for _ in 0..1_000 {
+            ways.begin(Who::Guest, false);
+        }
+        for _ in 0..1_000 {
+            assert_eq!(ways.whose(), Some(Who::Guest));
+            ways.end();
+        }
+        assert_eq!((ways.whose(), ways.touch(Who::Here, What::Playing)), (None, BOTH));
     }
 }

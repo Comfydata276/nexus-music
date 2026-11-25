@@ -517,7 +517,7 @@ impl Controller {
                         if !may_go(stop.load(Ordering::Relaxed), since.load(Ordering::Relaxed), now_ms()) {
                             return log("send: the session ended or ran out first, not sent");
                         }
-                        let status = relay::send(&crate::corehttp::Agent(crate::subsonic::make_agent_without_redirects()), &relay, &room, &token, &to, &frame);
+                        let status = relay::send(&crate::corehttp::Agent(crate::subsonic::make_agent_without_redirects()), &relay, &room, token.as_str(), &to, &frame);
                         if status != Some(200) {
                             log(format!("send: the relay answered {status:?}"));
                         }

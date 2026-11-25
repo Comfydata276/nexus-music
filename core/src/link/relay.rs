@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use super::{Place, VERSION, text, words};
+use super::{Place, Token, VERSION, text, words};
 use crate::http::{Failure, Http, Method, Request};
 
 /// The relay, as the app holds it: its address with no `/` at the end, and the host key.
@@ -40,7 +40,7 @@ pub enum FromRelay {
     /// The system gave no random bytes for a place: linking is off.
     NoRandom,
     /// This device has a place in the room, and the token for it.
-    Entered { place: Place, token: String },
+    Entered { place: Place, token: Token },
     /// Who is in the room, and what was in this device's mailbox: who each frame is from,
     /// and the frame. A frame handed over once is not handed over again.
     Heard { places: Vec<String>, frames: Vec<(String, String)> },
@@ -133,7 +133,7 @@ pub fn keep_place(http: &dyn Http, relay: &Relay, room: &str, random: &mut dyn F
         };
         wait = 2;
         log(format!("room: entered as {name}"));
-        tell(FromRelay::Entered { place, token: token.clone() });
+        tell(FromRelay::Entered { place, token: token.as_str().into() });
         // The last frame handed over. A new token counts from 1 again.
         let mut after = 0u64;
         loop {

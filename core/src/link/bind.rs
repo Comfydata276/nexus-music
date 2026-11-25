@@ -169,7 +169,9 @@ pub enum Act {
 struct Held {
     rule: Rule,
     playing: Playing,
-    waits: Vec<(u64, Waiting)>,
+    /// The look-ups under way: each one's ticket, when it began, and its place in the
+    /// order of choices. No more than [`MOST_LOOK_UPS`], and none older than its minute.
+    waits: Vec<(u64, u64, Waiting)>,
     tickets: u64,
     acts: Vec<Act>,
     /// The number of the last act asked of the player, and of the last it has said it did.
@@ -291,6 +293,10 @@ impl Player for Held {
 /// busy on its account.
 const LOOK_UP_MS: u64 = 60_000;
 
+/// The most look-ups counted as under way at once. (A phone looks one thing up at a time;
+/// this is for one that says it has begun and never says it has ended.)
+const MOST_LOOK_UPS: usize = 16;
+
 /// How long the player is given to say it has done what it was asked, before what the
 /// relay brought meanwhile is decided against what it last said.
 pub const CATCH_UP_MS: u64 = 2_000;
@@ -405,14 +411,21 @@ impl Phone {
                 Came { acts: if owed.claim { vec![Act::Claim] } else { Vec::new() }, native: Vec::new() }
             }
             Event::LookingUp => {
-                self.player.tickets += 1;
-                let waiting = self.player.rule.wait(now_ms, LOOK_UP_MS);
-                self.player.waits.push((self.player.tickets, waiting));
-                Came { acts: vec![Act::Ticket { ticket: self.player.tickets }], native: Vec::new() }
+                // (One whose minute is up counts for nothing already, and one that was
+                // never said to be over is not kept for ever: the list has a bound.)
+                let player = &mut self.player;
+                while let Some(at) = player.waits.iter().position(|(_, began, _)| now_ms.saturating_sub(*began) >= LOOK_UP_MS).or((player.waits.len() >= MOST_LOOK_UPS).then_some(0)) {
+                    let (.., waiting) = player.waits.remove(at);
+                    player.rule.done(waiting);
+                }
+                player.tickets = player.tickets.wrapping_add(1);
+                let waiting = player.rule.wait(now_ms, LOOK_UP_MS);
+                player.waits.push((player.tickets, now_ms, waiting));
+                Came { acts: vec![Act::Ticket { ticket: player.tickets }], native: Vec::new() }
             }
             Event::LookedUp { ticket } => {
-                if let Some(at) = self.player.waits.iter().position(|(known, _)| *known == ticket) {
-                    let (_, waiting) = self.player.waits.remove(at);
+                if let Some(at) = self.player.waits.iter().position(|(known, ..)| *known == ticket) {
+                    let (.., waiting) = self.player.waits.remove(at);
                     self.player.rule.done(waiting);
                 }
                 Came::default()
@@ -616,6 +629,25 @@ mod tests {
         // Carrying it out was counted when it was decided: the phone says what its player
         // holds afterwards, and that is not another change.
         assert_eq!(phone.player.rule.generation(), 6);
+    }
+
+    #[test]
+    fn look_ups_that_are_never_said_to_be_over_do_not_pile_up() {
+        let mut n = 0;
+        let (mut phone, ..) = phone(&mut n);
+        // A thousand begun inside a second, none ended: sixteen are kept, the latest.
+        for at in 0..1_000u64 {
+            phone.handle(r#"{"event":"looking_up"}"#, 5_000 + at, 100, &mut random(&mut n));
+        }
+        assert_eq!((phone.player.waits.len(), phone.player.waits[0].0, phone.player.rule.busy(6_000)), (MOST_LOOK_UPS, 985, true));
+        // The latest can still be ended by its ticket; one that was dropped is not known.
+        phone.handle(r#"{"event":"looked_up","ticket":1000}"#, 6_000, 100, &mut random(&mut n));
+        phone.handle(r#"{"event":"looked_up","ticket":3}"#, 6_000, 100, &mut random(&mut n));
+        assert_eq!(phone.player.waits.len(), MOST_LOOK_UPS - 1);
+        // A minute on, none of them counts, and the next to begin clears them away.
+        assert!(!phone.player.rule.busy(5_999 + LOOK_UP_MS));
+        phone.handle(r#"{"event":"looking_up"}"#, 6_000 + LOOK_UP_MS, 100, &mut random(&mut n));
+        assert_eq!((phone.player.waits.len(), phone.player.rule.busy(6_001 + LOOK_UP_MS)), (1, true));
     }
 
     #[test]

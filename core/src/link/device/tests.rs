@@ -900,6 +900,24 @@ fn a_device_seen_before_is_listed_when_it_is_not_here() {
 }
 
 #[test]
+fn what_was_kept_of_devices_seen_is_bounded_when_read_and_forgotten_by_the_calendar() {
+    // A settings file with a thousand of them: sixteen are taken, the ones seen most lately.
+    let kept: Vec<Remembered> = (0..1_000u64).map(|n| Remembered { id: format!("device-{n}"), name: format!("PC {n}"), day: n }).collect();
+    let mut device = Device::new(kept);
+    let (shown, _) = device.shown(1_000);
+    assert_eq!((shown.rows.len(), shown.rows[0].name.as_str()), (16, "PC 999"));
+    // Thirty-one days after the latest was seen, with no other device ever seen: forgotten,
+    // and the app is told to keep the list as it now is. Once, not at every tick.
+    let mut world = World::new(false);
+    world.copies[A].device = Device::new(vec![Remembered { id: "an-old-device".into(), name: "Old laptop".into(), day: 69 }, Remembered { id: "a-newer-one".into(), name: "Den PC".into(), day: 95 }]);
+    world.tick();
+    assert_eq!(world.copies[A].remembered.iter().map(|seen| seen.name.as_str()).collect::<Vec<_>>(), ["Den PC"]);
+    world.copies[A].remembered.clear();
+    world.tick();
+    assert!(world.copies[A].remembered.is_empty());
+}
+
+#[test]
 fn a_device_being_steered_that_goes_is_waited_for_and_then_let_go() {
     let mut world = steering("next");
     world.copies[B].place = None;
