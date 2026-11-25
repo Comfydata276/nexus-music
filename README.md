@@ -365,6 +365,7 @@ window, the files, the connections.
 | `core/src/address.rs` | What a typed server address means, and when plain HTTP matters. |
 | `core/src/jam.rs` | Reading a jam's link; what a jam says of a song. |
 | `core/src/levelling.rs` | When a song counts as playing with its album. |
+| `core/src/queue.rs` | What becomes of the queue when the list it was started from changes. |
 | `core/src/musicbrainz.rs`, `listenbrainz.rs`, `offer.rs` | The questions put to MusicBrainz and ListenBrainz and what is made of the answers. |
 | `core/src/http.rs` | How the library asks for a request: it asks the app. `src/corehttp.rs` is the Windows app's answer, on its own connections. |
 

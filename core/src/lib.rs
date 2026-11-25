@@ -15,6 +15,7 @@ pub mod musicbrainz;
 pub mod notes;
 pub mod offer;
 pub mod playlists;
+pub mod queue;
 pub mod search;
 pub mod sync;
 pub mod text;
