@@ -571,12 +571,23 @@ impl Device {
         out
     }
 
-    /// "Reset linking" was pressed: a new secret is written at the next look, which starts
-    /// as soon as the one on its way (if any) is over.
-    pub fn reset(&mut self, _env: &mut Env) -> Vec<Do> {
+    /// "Reset linking" was pressed. **The session ends at the press**, not when the look
+    /// that writes the new secret comes back: from this moment nothing is sent, opened or
+    /// carried out under the old secret on this device. A look that was on its way is
+    /// dropped (what it reads is the old secret, and must begin nothing); the one that
+    /// writes the new secret starts at once.
+    pub fn reset(&mut self, env: &mut Env) -> Vec<Do> {
+        let mut out = vec![Do::Log("reset: asked for".into())];
+        if self.end_session(env, &mut out) {
+            out.push(Do::Log("session: ended, linking is being reset".into()));
+        }
+        if std::mem::take(&mut self.looking) {
+            out.push(Do::StopLook);
+            self.looks += 1;
+        }
         self.reset = true;
         self.note = words::RESETTING.into();
-        vec![Do::Log("reset: asked for".into())]
+        out
     }
 
     /// A look has finished. `since_ms` is when it began; `reset` is whether it was one

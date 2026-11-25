@@ -1339,11 +1339,15 @@ fn reset_linking_with_a_command_in_flight() {
     let mut world = steering("next");
     world.path.hold_commands = true;
     world.ask("next");
+    let old = world.copies[A].session;
     let did = world.with(A, |device, env| device.reset(env));
+    // The session ends at the press, not when the look that writes the new secret is back:
+    // from here nothing is sent, opened or carried out under the old secret on A.
+    assert!(did.contains(&Do::End { session: old }) && !world.copies[A].device.is_live(old, world.now), "{did:?}");
     world.act(A, did);
+    assert_eq!(world.last(A, "session:"), "session: ended, linking is being reset");
     world.pass(250);
     assert_eq!(world.copies[A].looks.last(), Some(&(1, true)));
-    let old = world.copies[A].session;
     // The look wrote a new secret and read it back.
     world.looked(A, Looked::Secret { secret: secret(8), id: "k".into(), wrote: Some(secret::Why::Reset) }, true);
     assert!(world.copies[A].ended.contains(&old) && world.copies[A].session != old);
@@ -1370,12 +1374,37 @@ fn reset_linking_with_a_command_in_flight() {
     world.pass(250);
     world.looked(A, Looked::Failed, true);
     let now = world.now;
-    assert_eq!((world.copies[A].device.shown(now).0.note, world.copies[A].ended.len()), (words::RESET_NOT_DONE.to_string(), 0));
+    // (The session ended at the press all the same: the next look that can read the
+    // secret that stands begins another.)
+    assert_eq!((world.copies[A].device.shown(now).0.note, world.copies[A].ended.len()), (words::RESET_NOT_DONE.to_string(), 1));
     let did = world.with(A, |device, env| device.reset(env));
     world.act(A, did);
     world.pass(250);
     world.looked(A, Looked::Invalid, true);
     assert_eq!((world.copies[A].device.shown(now).0.note, world.copies[A].ended.len()), (words::RESET_HALF_DONE.to_string(), 1));
+    // A look that was on its way when Reset was pressed read the old secret: it is
+    // stopped, and what it brings back begins nothing.
+    let mut world = World::new(false);
+    world.pass(crate::link::LOOK_AGAIN_MS);
+    let (number, _) = *world.copies[A].looks.last().unwrap();
+    let did = world.with(A, |device, env| device.reset(env));
+    assert!(did.contains(&Do::StopLook), "{did:?}");
+    world.act(A, did);
+    let now = world.now;
+    let did = world.with(A, |device, env| device.looked(number, now, Looked::Secret { secret: secret(7), id: "k".into(), wrote: None }, false, env));
+    assert!(did.is_empty() && !world.copies[A].device.is_live(world.copies[A].session, now));
+    // And the look that writes the new one starts at once.
+    world.pass(250);
+    assert_eq!(world.copies[A].looks.last(), Some(&(number + 1, true)));
+    // A frame sealed under the old secret that arrives after the press is not opened.
+    let mut world = steering("next");
+    world.path.hold_tells = true;
+    let did = world.with(B, |device, env| device.reset(env));
+    world.act(B, did);
+    let before = world.copies[B].log.len();
+    world.path.hold_commands = false;
+    world.ask("next");
+    assert_eq!((world.copies[B].player.did.len(), world.copies[B].log.len()), (0, before));
 }
 
 #[test]
