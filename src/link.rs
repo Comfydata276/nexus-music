@@ -451,6 +451,48 @@ impl Link {
     fn pool(&mut self) -> Arc<Pool> {
         self.pool.get_or_insert_with(|| Arc::new(Pool::new("link", 2, false))).clone()
     }
+
+    /// The session, if `serial` is the one that is live **and its secret is inside its
+    /// time**. Asked at every use of a session: when a look's answer would renew it, when
+    /// something is sent, when a frame is opened, and at the moment the player is paused.
+    /// A session that has run out is no session, whether or not the tick has got round to
+    /// ending it.
+    fn live(&self, serial: u64, now_ms: u64) -> Option<&Session> {
+        self.session.as_ref().filter(|session| session.serial == serial && secret_holds(session.since_ms, now_ms))
+    }
+
+    fn live_mut(&mut self, serial: u64, now_ms: u64) -> Option<&mut Session> {
+        self.session.as_mut().filter(|session| session.serial == serial && secret_holds(session.since_ms, now_ms))
+    }
+
+    /// Ends the session, if there is one: its thread stops, and whatever was queued to be
+    /// sent under it is not sent. Says whether there was one.
+    fn end_session(&mut self) -> bool {
+        let Some(session) = self.session.take() else { return false };
+        session.stop.store(true, Ordering::Relaxed);
+        self.serial += 1;
+        true
+    }
+
+    /// Everything of this sign-in's is over: the session, and any look at the secret that
+    /// is still on its way, whose answer must start nothing.
+    fn stop(&mut self) {
+        self.end_session();
+        self.looks += 1;
+        self.looking = false;
+        self.looked_ms = None;
+    }
+
+    /// A look starts: the number its answer must show to be taken.
+    fn look_begins(&mut self) -> u64 {
+        self.looking = true;
+        self.looks
+    }
+
+    /// Whether the answer to the look with this number is still wanted.
+    fn expects(&self, looks: u64) -> bool {
+        self.looks == looks
+    }
 }
 
 /// Whether this copy should be linked with the person's other devices the new way: signed
@@ -475,17 +517,14 @@ impl Controller {
         let account = self.settings.borrow().account();
         if self.link.borrow().account != account {
             // Another sign-in: nothing of the last one's carries over.
-            self.link_end("");
+            self.link_stop();
             let mut link = self.link.borrow_mut();
             link.account = account;
             link.used = None;
-            link.looked_ms = None;
-            link.looking = false;
-            link.looks += 1;
         }
         let wanted = wanted(self.client().is_some(), self.can_host_jam(), self.settings.borrow().link_devices, self.link.borrow().off);
         if !wanted {
-            self.link_end("");
+            self.link_stop();
             return self.link_show();
         }
         if self.link.borrow().session.as_ref().is_some_and(|session| !secret_holds(session.since_ms, now)) {
@@ -503,12 +542,10 @@ impl Controller {
         self.link_show();
     }
 
-    /// Ends the session, if there is one: at sign-out, when the secret changes or runs out.
-    pub fn link_end(&self, note: &str) {
+    /// Ends the session, if there is one: when the secret changes or runs out.
+    fn link_end(&self, note: &str) {
         let mut link = self.link.borrow_mut();
-        if let Some(session) = link.session.take() {
-            session.stop.store(true, Ordering::Relaxed);
-            link.serial += 1;
+        if link.end_session() {
             log("session: ended");
         }
         if !note.is_empty() {
@@ -516,12 +553,22 @@ impl Controller {
         }
     }
 
+    /// Ends everything of this sign-in's: at sign-out, when linking is no longer wanted,
+    /// and when the account changes. A look still on its way is answered to nobody.
+    pub fn link_stop(&self) {
+        let mut link = self.link.borrow_mut();
+        if link.session.is_some() {
+            log("session: ended, with the sign-in it belonged to");
+        }
+        link.stop();
+    }
+
     fn link_look(self: &Rc<Self>, now: u64) {
         let Some(client) = self.client() else { return };
         let (used, looks, pool) = {
             let mut link = self.link.borrow_mut();
-            link.looking = true;
-            (link.used.clone(), link.looks, link.pool())
+            let looks = link.look_begins();
+            (link.used.clone(), looks, link.pool())
         };
         pool.spawn(move || {
             let looked = look(&client, used);
@@ -534,7 +581,8 @@ impl Controller {
         let mut forget = None;
         let begin = {
             let mut link = self.link.borrow_mut();
-            if link.looks != looks {
+            // (Signed out since, or no longer wanted: the answer is nobody's.)
+            if !link.expects(looks) {
                 return;
             }
             link.looking = false;
@@ -548,7 +596,7 @@ impl Controller {
                     if wrote == Some(secret::Why::Public) {
                         link.note = "Your devices' link could be seen by others on the music server. It has been made private and reset.".into();
                     }
-                    match link.session.as_mut().filter(|session| session.secret == secret) {
+                    match link.session.as_mut().filter(|session| session.secret == secret && secret_holds(session.since_ms, now_ms())) {
                         Some(session) => {
                             session.since_ms = since;
                             None
@@ -642,11 +690,17 @@ impl Controller {
         };
         let mut link = self.link.borrow_mut();
         let pool = link.pool();
-        let session = link.session.as_ref()?;
+        // Under the session that is live now, and only inside its time.
+        let serial = link.session.as_ref()?.serial;
+        let session = link.live(serial, now_ms())?;
         let (place, token) = session.place.clone()?;
         let sealed = frame::seal(&session.keys, kind, &nonce, &place, &to, message.as_bytes())?;
-        let (wire, room) = (session.wire.clone(), session.keys.room().to_string());
+        let (wire, room, stop) = (session.wire.clone(), session.keys.room().to_string(), session.stop.clone());
         pool.spawn(move || {
+            // The session may have ended while this waited its turn: then it is not sent.
+            if stop.load(Ordering::Relaxed) {
+                return log("send: the session ended first, not sent");
+            }
             // Sent once. Whatever comes of it, it is not sent again by itself.
             let status = wire.post(&format!("api/link/{room}/send"), &token, &json!({"to": text::place(&to), "frame": sealed})).map(|(status, _)| status);
             if status != Some(200) {
@@ -695,7 +749,7 @@ impl Controller {
     fn link_heard(self: &Rc<Self>, serial: u64, places: Vec<String>, frames: Vec<(String, String)>) {
         let mine = {
             let mut link = self.link.borrow_mut();
-            let Some(session) = link.session.as_mut().filter(|session| session.serial == serial) else { return };
+            let Some(session) = link.live_mut(serial, now_ms()) else { return };
             let Some((mine, _)) = session.place.clone() else { return };
             session.others = places.iter().filter_map(|place| text::read_place(place)).filter(|place| *place != mine).take(15).collect();
             let others = session.others.clone();
@@ -706,7 +760,8 @@ impl Controller {
             let Some(from) = text::read_place(&from) else { continue };
             let opened = {
                 let link = self.link.borrow();
-                let Some(session) = link.session.as_ref().filter(|session| session.serial == serial) else { return };
+                // (Checked for each frame: the one before may have ended the session.)
+                let Some(session) = link.live(serial, now_ms()) else { return };
                 frame::open(&session.keys, &sealed, &from, &mine)
             };
             let Some(opened) = opened else {
@@ -740,7 +795,7 @@ impl Controller {
                 let done = admitted.and_then(|reservation| {
                     // ...and again at the moment the player is changed, under the session
                     // it arrived in.
-                    let same_session = self.link.borrow().session.as_ref().is_some_and(|session| session.serial == serial);
+                    let same_session = self.link.borrow().live(serial, now_ms()).is_some();
                     self.link_rule.borrow_mut().finish(reservation, at, minute(now_ms()), same_session, nonce)?;
                     self.pause_here();
                     Ok(())
@@ -767,7 +822,7 @@ impl Controller {
         };
         let (told, name) = {
             let mut link = self.link.borrow_mut();
-            let Some(session) = link.session.as_mut().filter(|session| session.serial == serial) else { return };
+            let Some(session) = link.live_mut(serial, now_ms()) else { return };
             let Some(seen) = session.peers.get_mut(&from) else { return };
             let told = seen.peer.told(tell);
             (told, name_of(seen))
@@ -935,6 +990,48 @@ mod tests {
             assert_eq!(file.exists(), kept, "{name}");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A copy with a session that began with a look at `since`.
+    fn linked(since: u64) -> Link {
+        let secret = Secret::new([7; 32]);
+        let wire = Arc::new(Wire { base: "http://127.0.0.1:9".into(), key: "a-key".into(), agent: crate::subsonic::make_agent_without_redirects() });
+        let mut link = Link::default();
+        link.serial = 1;
+        link.session = Some(Session { serial: 1, keys: Keys::of(&secret), secret, since_ms: since, wire, stop: Arc::new(AtomicBool::new(false)), place: Some(([1; 16], "token".into())), others: Vec::new(), peers: HashMap::new() });
+        link
+    }
+
+    /// Sign-out while the first look at the secret is still on its way: its answer must
+    /// start nothing, and nothing queued under the old session is sent.
+    #[test]
+    fn signing_out_leaves_a_look_s_answer_and_queued_sends_nothing_to_act_on() {
+        let mut link = linked(0);
+        let looks = link.look_begins();
+        let queued = link.session.as_ref().map(|session| session.stop.clone()).unwrap();
+        assert!(link.expects(looks) && !queued.load(Ordering::Relaxed));
+        link.stop();
+        assert!(!link.expects(looks), "the look's answer is still wanted");
+        assert!(queued.load(Ordering::Relaxed), "what was queued would still be sent");
+        assert!(link.session.is_none() && !link.looking && link.looked_ms.is_none());
+        // The next sign-in's look is its own.
+        let next = link.look_begins();
+        assert!(link.expects(next) && next != looks);
+    }
+
+    /// A session is the same session at every use: itself, and inside its time.
+    #[test]
+    fn a_session_is_live_only_as_itself_and_inside_its_ten_minutes() {
+        let mut link = linked(1_000);
+        assert!(link.live(1, 1_000).is_some() && link.live(1, 1_000 + nexus_core::link::SECRET_LIFE_MS - 1).is_some());
+        // Ten minutes on, before any tick has ended it: a frame is not opened under it, a
+        // Pause is not carried out under it, nothing is sent under it.
+        assert!(link.live(1, 1_000 + nexus_core::link::SECRET_LIFE_MS).is_none(), "a session past its time is still used");
+        assert!(link.live_mut(1, 1_000 + nexus_core::link::SECRET_LIFE_MS).is_none());
+        // Another session's number is not this one, and an ended one is nobody's.
+        assert!(link.live(2, 1_000).is_none());
+        assert!(link.end_session() && !link.end_session());
+        assert!(link.live(1, 1_000).is_none() && link.serial == 2);
     }
 
     #[test]
