@@ -1,0 +1,90 @@
+{
+  "asked": [
+    "GET http://lidarr.test/api/v1/artist ",
+    "GET http://lidarr.test/api/v1/artist/lookup?term=Far%20Hills ",
+    "GET http://lidarr.test/api/v1/artist/lookup?term=Kept%20Band ",
+    "GET http://lidarr.test/api/v1/artist/lookup?term=Nobody%20Knows ",
+    "GET http://lidarr.test/api/v1/artist/lookup?term=Shore%20Lights "
+  ],
+  "stages": [
+    {
+      "about": "",
+      "action": "",
+      "album_numbers": false,
+      "artist_id": "",
+      "can_play": false,
+      "context": "",
+      "cover": "",
+      "cover_round": false,
+      "disc_sections": false,
+      "empty": "",
+      "filter": 0,
+      "filters": [],
+      "grid": [],
+      "has_menu": false,
+      "label": "",
+      "lead": [],
+      "liked_songs": false,
+      "meta": "",
+      "more": null,
+      "notice": "",
+      "notice_action": "",
+      "notice_other": "",
+      "offers": [],
+      "offers_first": false,
+      "offers_heading": "",
+      "offers_note": "",
+      "offers_route": "",
+      "offers_title": "",
+      "play": "Songs",
+      "playlist": null,
+      "request_ids": [],
+      "shelves": [
+        {
+          "cards": [],
+          "route": "",
+          "title": "Recently played",
+          "wrap": false
+        },
+        {
+          "cards": [
+            {
+              "cover": "https://pictures.test/sl2.jpg",
+              "id": "sl2",
+              "kind": "OutsideArtist",
+              "subtitle": "Like Played A Lot",
+              "title": "Shore Lights"
+            },
+            {
+              "cover": "https://pictures.test/fh.jpg",
+              "id": "fh",
+              "kind": "OutsideArtist",
+              "subtitle": "Like Played Less",
+              "title": "Far Hills"
+            }
+          ],
+          "route": "",
+          "title": "Artists you might like",
+          "wrap": false
+        }
+      ],
+      "show_album": false,
+      "show_cover": false,
+      "show_number": false,
+      "song_notes": [],
+      "songs": [],
+      "sort": 0,
+      "sorts": [],
+      "star": null,
+      "starred": false,
+      "stats": [],
+      "subtitle": "",
+      "subtitle_route": "",
+      "tail": [],
+      "tiles": [],
+      "title": "Home",
+      "tracks_route": "",
+      "tracks_title": ""
+    }
+  ]
+}

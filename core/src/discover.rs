@@ -16,7 +16,8 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::lidarr::ArtistOffer;
+use crate::lidarr::{ArtistOffer, Lidarr};
+use crate::requests::{Library, Stopped, unless_stopped};
 use crate::model::Song;
 use crate::text::{fold, same_words};
 
@@ -130,6 +131,38 @@ pub fn meant(found: Vec<ArtistOffer>, name: &str) -> Option<ArtistOffer> {
     if first.cover.is_empty() { same.find(|artist| !artist.cover.is_empty()).or(Some(first)) } else { Some(first) }
 }
 
+/// Looks for suggestions afresh, from what the music server says of who is like each of the
+/// favourites (`similar`, in the order of `favourites`, most alike first): Lidarr is asked
+/// who each name is, a few at a time, and anyone it keeps track of already, or the library
+/// has, is left out. What comes of it is for the app to keep. Slow: a question to Lidarr for
+/// each suggestion. A stopped look gives `Err(Stopped)`, and is not to be kept as an answer.
+pub fn look(lidarr: &Lidarr, similar: &[(String, Vec<String>)], library: &dyn Library, now: i64) -> Result<Kept, Stopped> {
+    let have: HashSet<String> = library.artist_names();
+    // Anyone Lidarr is already keeping track of is on their way, not news.
+    let tracked = unless_stopped(lidarr.tracked())?.unwrap_or_default();
+    let mut artists: Vec<Suggestion> = Vec::new();
+    let bets = ranked(similar, &have);
+    // A few more than are wanted are asked about: Lidarr won't know every one.
+    for group in bets.chunks(4).take(SUGGESTIONS.div_ceil(4) + 2) {
+        let answers: Vec<Result<Option<ArtistOffer>, Stopped>> = std::thread::scope(|scope| {
+            let asked: Vec<_> = group.iter().map(|(name, _)| scope.spawn(move || unless_stopped(lidarr.find_artists(name)).map(|found| found.ok().and_then(|found| meant(found, name))))).collect();
+            asked.into_iter().map(|asked| asked.join().unwrap_or(Ok(None))).collect()
+        });
+        for ((_, like), artist) in group.iter().zip(answers) {
+            let Some(artist) = artist? else { continue };
+            if tracked.contains(&artist.id) || artists.iter().any(|known| known.id == artist.id) {
+                continue;
+            }
+            artists.push(Suggestion { id: artist.id, name: artist.name, cover: artist.cover, like: like.clone() });
+        }
+        if artists.len() >= SUGGESTIONS {
+            break;
+        }
+    }
+    artists.truncate(SUGGESTIONS);
+    Ok(Kept { at: now, artists })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,5 +199,21 @@ mod tests {
         kept.artists.clear();
         // None to be had: looked for again sooner.
         assert!(kept.fresh(1000 + TRY_AGAIN - 1) && !kept.fresh(1000 + TRY_AGAIN));
+    }
+
+    #[test]
+    fn a_stopped_look_is_not_an_answer() {
+        // Over a Lidarr that has been told to stop: no suggestions are made of it, not even
+        // none (which would hide the row for days).
+        struct Stopping;
+        impl crate::http::Http for Stopping {
+            fn send(&self, _: &crate::http::Request) -> Result<crate::http::Response, crate::http::Failure> {
+                Err(crate::http::Failure::Stopped)
+            }
+        }
+        let lidarr = Lidarr::new("http://lidarr.test", "key", None, std::sync::Arc::new(Stopping));
+        let similar = [("Loud".to_string(), vec!["Train".to_string()])];
+        let found = look(&lidarr, &similar, &crate::requests::Snapshot::default(), 100);
+        assert_eq!(found.map(|kept| kept.at), Err(Stopped));
     }
 }

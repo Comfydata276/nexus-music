@@ -1,0 +1,9 @@
+[
+  [
+    "GET http://lidarr.test/api/v1/album/lookup?term=zzqx%20vvb "
+  ],
+  [
+    "GET http://lidarr.test/api/v1/artist/lookup?term=zzqx%20vvb ",
+    "GET https://musicbrainz.org/ws/2/recording?query=zzqx%20vvb&dismax=true&limit=100&fmt=json "
+  ]
+]

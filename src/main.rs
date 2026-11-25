@@ -29,6 +29,8 @@ mod mixes;
 mod musicbrainz;
 mod offline;
 mod pages;
+#[cfg(test)]
+mod pins;
 #[cfg(windows)]
 mod picker;
 mod playback;

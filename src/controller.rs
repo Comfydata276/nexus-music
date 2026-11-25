@@ -1437,7 +1437,7 @@ impl Controller {
     /// "Lidarr is behind the sign-in at auth.example.org."
     fn behind_sign_in(&self) -> String {
         let gate = crate::gate::Found { service: self.settings.borrow().lidarr_gate.clone(), client: String::new() };
-        format!("Lidarr is behind the sign-in at {}.", gate.host())
+        nexus_core::gate::behind_sign_in(gate.host())
     }
 
     /// Saves where Lidarr is and its key, then connects: checks that it answers and, if a
@@ -1469,7 +1469,7 @@ impl Controller {
         self.connect_requests();
         self.push_settings();
         if forgotten {
-            return self.requests_state("none", "That's a different address, so the saved key was forgotten. Enter the key for it.");
+            return self.requests_state("none", nexus_core::lidarr::KEY_FORGOTTEN);
         }
         self.check_requests(true);
     }
@@ -1479,11 +1479,11 @@ impl Controller {
     /// straight away, not just offered.
     pub fn check_requests(&self, by_hand: bool) {
         let Some(lidarr) = crate::lidarr::current() else {
-            return self.requests_state("none", "Not connected yet.");
+            return self.requests_state("none", nexus_core::lidarr::NOT_CONNECTED);
         };
         let check = self.requests_check.get() + 1;
         self.requests_check.set(check);
-        self.requests_state("checking", "Checking…");
+        self.requests_state("checking", nexus_core::lidarr::CHECKING);
         let address = crate::lidarr::tidy(&self.settings.borrow().lidarr_address);
         self.api_pool.spawn(move || {
             let answer = lidarr.version();
@@ -1522,7 +1522,7 @@ impl Controller {
         self.push_settings();
         let signed_out = !self.settings.borrow().lidarr_gate.is_empty() && config::load_secret(&self.paths, "lidarr-token").is_none();
         match (answer, gate) {
-            (Ok(version), _) => self.requests_state("connected", &format!("Connected to Lidarr {version}.")),
+            (Ok(version), _) => self.requests_state("connected", &nexus_core::lidarr::connected(&version)),
             (Err(_), Some(Ok(Some(_)))) if by_hand => self.sign_in_requests(),
             (Err(_), Some(Ok(Some(_)))) => self.requests_state("sign-in", &self.behind_sign_in()),
             (Err(_), Some(Err(why))) => self.requests_state("error", &why),
@@ -1541,7 +1541,7 @@ impl Controller {
         }
         let round = crate::gate::new_round();
         self.requests_check.set(self.requests_check.get() + 1);
-        self.requests_state("waiting", &format!("Finish signing in at {} in your browser.", found.host()));
+        self.requests_state("waiting", &nexus_core::gate::finish_in_browser(found.host()));
         std::thread::spawn(move || {
             let agent = crate::subsonic::make_agent_without_redirects();
             let result = crate::gate::begin(&found).and_then(|attempt| {
@@ -1608,52 +1608,19 @@ impl Controller {
         self.save_settings();
         self.connect_requests();
         self.push_settings();
-        self.requests_state("sign-in", &format!("Signed out. {}", self.behind_sign_in()));
+        self.requests_state("sign-in", &nexus_core::gate::signed_out(&self.behind_sign_in()));
     }
 
     /// Asks whether to request an album that isn't in the library. `song` is the song that
     /// led here, if it was one: the album is what gets fetched, and that's said.
     pub fn prompt_request(self: &Rc<Self>, album: &str, title: &str, by: &str, song: &str, kind: &str) {
-        let offered = crate::lidarr::offered(album);
-        if offered.as_ref().is_some_and(|offer| offer.requested) {
-            return self.toast("That one has already been asked for. See Requests in the sidebar.");
-        }
-        // What kind of release it is, if the caller didn't say: Lidarr may have.
-        let kind = if kind.is_empty() { offered.as_ref().map(|offer| offer.kind().to_string()).unwrap_or_default() } else { kind.to_string() };
-        let whose = if by.is_empty() { "the artist".to_string() } else { by.to_string() };
-        let by = if by.is_empty() { String::new() } else { format!(" by {by}") };
-        let text = match (kind.as_str(), song.is_empty()) {
-            ("Single", _) => format!(
-                "“{title}”{by} came out as a single. It will go on Lidarr's list, and Lidarr will start looking for it. If Lidarr only lists {whose}'s albums so far, it will be set to list their singles and EPs too. None but this one is fetched, though ones they release from now on are treated as their new albums are."
-            ),
-            ("EP", true) => format!(
-                "“{title}”{by} is an EP. It will go on Lidarr's list, and Lidarr will start looking for it. If Lidarr only lists {whose}'s albums so far, it will be set to list their singles and EPs too. None but this one is fetched, though ones they release from now on are treated as their new albums are."
-            ),
-            ("EP", false) => format!(
-                "“{song}” is on the EP “{title}”{by}. That EP will go on Lidarr's list, and Lidarr will start looking for it. If Lidarr only lists {whose}'s albums so far, it will be set to list their singles and EPs too. None but this one is fetched, though ones they release from now on are treated as their new albums are."
-            ),
-            (_, true) => format!("“{title}”{by} will go on Lidarr's list, and Lidarr will start looking for it. The whole album is fetched."),
-            (_, false) => format!("“{song}” is on “{title}”{by}. That album will go on Lidarr's list, and Lidarr will start looking for it. The whole album is fetched."),
-        };
-        // A soundtrack is another kind of release Lidarr has to be set to list.
-        let soundtrack = offered.as_ref().is_some_and(|offer| offer.soundtrack);
-        let text = if !soundtrack {
-            text
-        } else if offered.as_ref().is_some_and(|offer| offer.artist_id == crate::lidarr::VARIOUS) {
-            format!("{text} It's a soundtrack credited to various artists, so it goes on Lidarr's list under “Various Artists”.")
-        } else if kind == "Album" || kind.is_empty() {
-            format!("{text} It's a soundtrack. If Lidarr doesn't list {whose}'s soundtracks so far, it will be set to. None but this one is fetched.")
-        } else {
-            text.replace("their singles and EPs too", "their singles, EPs and soundtracks too")
-        };
-        let heading = match kind.as_str() {
-            "Single" => "Ask for this single?",
-            "EP" => "Ask for this EP?",
-            _ => "Ask for this album?",
+        let (heading, text) = match nexus_core::requests::asking(crate::lidarr::offers(), album, title, by, song, kind) {
+            nexus_core::requests::Asking::Already(said) => return self.toast(format!("{said} See Requests in the sidebar.")),
+            nexus_core::requests::Asking::Ask { heading, text } => (heading, text),
         };
         *self.prompt.borrow_mut() =
             Some(crate::actions::PromptAction::RequestAlbum { album: album.to_string(), title: title.to_string(), song: song.to_string() });
-        self.open_prompt(heading, &text, "Request", None, false);
+        self.open_prompt(&heading, &text, "Request", None, false);
     }
 
     /// Reloads the page on screen if it shows music that isn't in the library, after what's
@@ -1670,32 +1637,19 @@ impl Controller {
 
     pub fn request_album(self: &Rc<Self>, album: String, title: String, song: String) {
         let Some(lidarr) = crate::lidarr::current() else { return };
-        self.toast(format!("Asking for “{title}”…"));
+        self.toast(nexus_core::requests::asking_for(&title));
         self.requests_pool.spawn(move || {
-            // Offered in this session, or (from a page drawn in an earlier one) looked up afresh.
-            let offer = crate::lidarr::offered(&album)
-                .map(Ok)
-                .unwrap_or_else(|| {
-                    lidarr.find_any(&format!("lidarr:{album}"))?.into_iter().find(|o| o.album == album).ok_or_else(|| "Lidarr no longer lists that one.".to_string())
-                });
-            let result = offer.and_then(|offer| {
-                crate::lidarr::remember(std::slice::from_ref(&offer));
-                lidarr.request(&offer).map(|()| offer.artist)
-            });
+            // (Nothing on Windows stops a request, so "stopped" can't come of it.)
+            let result = nexus_core::requests::request(&lidarr, crate::lidarr::offers(), &album).unwrap_or_else(|_| Err(nexus_core::http::STOPPED.into()));
             post(move |ctl| match result {
                 Ok(artist) => {
                     // Noted, so it can be followed up when it arrives.
-                    ctl.asked.borrow_mut().add(crate::asked::Asked {
-                        album: album.clone(),
-                        title: title.clone(),
-                        artist,
-                        at: chrono::Utc::now().timestamp(),
-                        song,
-                        ..Default::default()
-                    });
+                    let now = chrono::Utc::now().timestamp();
+                    ctl.asked.borrow_mut().add(nexus_core::requests::asked_for(&album, &title, &artist, &song, now));
+                    // Marked once the note is kept and shared (see `asked_for`).
                     crate::lidarr::mark(&album, true);
                     ctl.refresh_outside();
-                    ctl.toast(format!("Asked for “{title}”. It'll be in your library once it arrives."));
+                    ctl.toast(nexus_core::requests::asked_sentence(&title));
                 }
                 Err(reason) => ctl.toast(reason),
             });
@@ -1746,29 +1700,21 @@ impl Controller {
         if name.is_empty() || albums == 0 {
             return;
         }
+        let (heading, text) = nexus_core::requests::adding(&name, albums);
         *self.prompt.borrow_mut() = Some(crate::actions::PromptAction::AddArtist { artist, name: name.clone() });
-        self.open_prompt(
-            &format!("Add {name}?"),
-            &format!(
-                "Lidarr will look for {} by {name} that you don't have, and for new ones as they come out. That can be a lot to fetch.",
-                if albums == 1 { "the 1 album".to_string() } else { format!("all {albums} albums") }
-            ),
-            "Add artist",
-            None,
-            false,
-        );
+        self.open_prompt(&heading, &text, "Add artist", None, false);
     }
 
     pub fn add_artist(self: &Rc<Self>, artist: String, name: String) {
         let Some(lidarr) = crate::lidarr::current() else { return };
-        self.toast(format!("Adding {name}…"));
+        self.toast(nexus_core::requests::adding_now(&name));
         self.requests_pool.spawn(move || {
             let result = lidarr.add_artist(&artist, &name);
             post(move |ctl| match result {
                 Ok(_) => {
                     ctl.refresh_outside();
                     crate::discover::forget(&artist);
-                    ctl.toast(format!("Added {name}. Their albums are on Lidarr's list; see Requests in the sidebar."));
+                    ctl.toast(format!("{}; see Requests in the sidebar.", nexus_core::requests::added(&name)));
                 }
                 Err(reason) => ctl.toast(reason),
             });
@@ -1964,12 +1910,7 @@ impl Controller {
         };
         // Arrivals that are news; the rest arrived before and are here to have their
         // playlists seen to again.
-        let news = match told.as_slice() {
-            [] => String::new(),
-            [one] if !one.song.is_empty() => format!("“{}” has arrived, on “{}”.", one.song, one.title),
-            [one] => format!("“{}” by {} has arrived.", one.title, one.artist),
-            many => format!("{} albums you asked for have arrived.", many.len()),
-        };
+        let news = nexus_core::requests::arrived_news(&told);
         if !told.is_empty() {
             self.toast(format!("{news} See Requests."));
             self.refresh_outside();
@@ -2060,7 +2001,7 @@ impl Controller {
                 match result {
                     Ok(()) => {
                         ctl.asked.borrow_mut().forget(&title);
-                        ctl.toast(format!("“{title}” is off the list"));
+                        ctl.toast(nexus_core::requests::off_the_list(&title));
                     }
                     Err(reason) => ctl.toast(reason),
                 }

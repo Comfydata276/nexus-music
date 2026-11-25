@@ -1,0 +1,1356 @@
+{
+  "asked": [
+    "GET http://lidarr.test/api/v1/album/lookup?term=lim ",
+    "GET http://lidarr.test/api/v1/artist/lookup?term=lidarr%3Alim-a1 ",
+    "GET http://lidarr.test/api/v1/artist/lookup?term=lidarr%3Alim-a2 ",
+    "GET http://lidarr.test/api/v1/artist/lookup?term=lidarr%3Alim-a3 ",
+    "GET http://lidarr.test/api/v1/artist/lookup?term=lidarr%3Alim-a4 ",
+    "GET http://lidarr.test/api/v1/artist/lookup?term=lidarr%3Alim-a5 ",
+    "GET http://lidarr.test/api/v1/artist/lookup?term=lidarr%3Alim-a6 ",
+    "GET http://lidarr.test/api/v1/artist/lookup?term=lidarr%3Alim-a7 ",
+    "GET http://lidarr.test/api/v1/artist/lookup?term=lidarr%3Alim-a8 ",
+    "GET http://lidarr.test/api/v1/artist/lookup?term=lidarr%3Alim-a9 ",
+    "GET http://lidarr.test/api/v1/artist/lookup?term=lidarr%3Asa0 ",
+    "GET http://lidarr.test/api/v1/artist/lookup?term=lidarr%3Asa1 ",
+    "GET http://lidarr.test/api/v1/artist/lookup?term=lidarr%3Asa2 ",
+    "GET http://lidarr.test/api/v1/artist/lookup?term=lim ",
+    "GET https://musicbrainz.org/ws/2/recording?query=lim&dismax=true&limit=100&fmt=json ",
+    "POST https://api.listenbrainz.org/1/popularity/recording { \"recording_mbids\": [ \"rec-lim0\", \"rec-lim1\", \"rec-lim2\", \"rec-lim3\", \"rec-lim4\", \"rec-lim5\", \"rec-lim6\", \"rec-lim7\", \"rec-lim8\", \"rec-lim9\", \"rec-lim10\", \"rec-lim11\", \"rec-lim12\", \"rec-lim13\", \"rec-lim14\", \"rec-lim15\", \"rec-lim16\", \"rec-lim17\", \"rec-lim18\", \"rec-lim19\", \"rec-lim20\", \"rec-lim21\" ] }"
+  ],
+  "stages": [
+    {
+      "about": "",
+      "action": "",
+      "album_numbers": false,
+      "artist_id": "",
+      "can_play": false,
+      "context": "",
+      "cover": "",
+      "cover_round": false,
+      "disc_sections": false,
+      "empty": "",
+      "filter": 0,
+      "filters": [],
+      "grid": [],
+      "has_menu": false,
+      "label": "",
+      "lead": [],
+      "liked_songs": false,
+      "meta": "",
+      "more": null,
+      "notice": "",
+      "notice_action": "",
+      "notice_other": "",
+      "offers": [],
+      "offers_first": false,
+      "offers_heading": "",
+      "offers_note": "Looking for songs beyond your library…",
+      "offers_route": "",
+      "offers_title": "Not in your library",
+      "play": "Songs",
+      "playlist": null,
+      "request_ids": [],
+      "shelves": [],
+      "show_album": false,
+      "show_cover": false,
+      "show_number": false,
+      "song_notes": [],
+      "songs": [],
+      "sort": 0,
+      "sorts": [],
+      "star": null,
+      "starred": false,
+      "stats": [],
+      "subtitle": "",
+      "subtitle_route": "",
+      "tail": [
+        {
+          "cards": [
+            {
+              "cover": "",
+              "id": "lim-a1",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Lim Artist 1"
+            },
+            {
+              "cover": "",
+              "id": "lim-a2",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Lim Artist 2"
+            },
+            {
+              "cover": "",
+              "id": "lim-a3",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Lim Artist 3"
+            },
+            {
+              "cover": "",
+              "id": "lim-a4",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Lim Artist 4"
+            },
+            {
+              "cover": "",
+              "id": "lim-a5",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Lim Artist 5"
+            },
+            {
+              "cover": "",
+              "id": "lim-a6",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Lim Artist 6"
+            },
+            {
+              "cover": "",
+              "id": "lim-a7",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Lim Artist 7"
+            },
+            {
+              "cover": "",
+              "id": "lim-a8",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Lim Artist 8"
+            },
+            {
+              "cover": "",
+              "id": "lim-a9",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Lim Artist 9"
+            },
+            {
+              "cover": "",
+              "id": "lim-a10",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Lim Artist 10"
+            }
+          ],
+          "route": "",
+          "title": "Artists",
+          "wrap": false
+        },
+        {
+          "cards": [
+            {
+              "cover": "https://covers.test/rg-lim1.jpg",
+              "id": "rg-lim1",
+              "kind": "Request",
+              "subtitle": "Lim Maker 1 • 2010",
+              "title": "Lim Album 1"
+            },
+            {
+              "cover": "https://covers.test/rg-lim2.jpg",
+              "id": "rg-lim2",
+              "kind": "Request",
+              "subtitle": "Lim Maker 2 • 2010",
+              "title": "Lim Album 2"
+            },
+            {
+              "cover": "https://covers.test/rg-lim3.jpg",
+              "id": "rg-lim3",
+              "kind": "Request",
+              "subtitle": "Lim Maker 3 • 2010",
+              "title": "Lim Album 3"
+            },
+            {
+              "cover": "https://covers.test/rg-lim4.jpg",
+              "id": "rg-lim4",
+              "kind": "Request",
+              "subtitle": "Lim Maker 4 • 2010",
+              "title": "Lim Album 4"
+            },
+            {
+              "cover": "https://covers.test/rg-lim5.jpg",
+              "id": "rg-lim5",
+              "kind": "Request",
+              "subtitle": "Lim Maker 5 • 2010",
+              "title": "Lim Album 5"
+            },
+            {
+              "cover": "https://covers.test/rg-lim6.jpg",
+              "id": "rg-lim6",
+              "kind": "Request",
+              "subtitle": "Lim Maker 6 • 2010",
+              "title": "Lim Album 6"
+            },
+            {
+              "cover": "https://covers.test/rg-lim7.jpg",
+              "id": "rg-lim7",
+              "kind": "Request",
+              "subtitle": "Lim Maker 7 • 2010",
+              "title": "Lim Album 7"
+            },
+            {
+              "cover": "https://covers.test/rg-lim8.jpg",
+              "id": "rg-lim8",
+              "kind": "Request",
+              "subtitle": "Lim Maker 8 • 2010",
+              "title": "Lim Album 8"
+            },
+            {
+              "cover": "https://covers.test/rg-lim9.jpg",
+              "id": "rg-lim9",
+              "kind": "Request",
+              "subtitle": "Lim Maker 9 • 2010",
+              "title": "Lim Album 9"
+            },
+            {
+              "cover": "https://covers.test/rg-lim10.jpg",
+              "id": "rg-lim10",
+              "kind": "Request",
+              "subtitle": "Lim Maker 10 • 2010",
+              "title": "Lim Album 10"
+            },
+            {
+              "cover": "https://covers.test/rg-lim11.jpg",
+              "id": "rg-lim11",
+              "kind": "Request",
+              "subtitle": "Lim Maker 11 • 2010",
+              "title": "Lim Album 11"
+            },
+            {
+              "cover": "https://covers.test/rg-lim12.jpg",
+              "id": "rg-lim12",
+              "kind": "Request",
+              "subtitle": "Lim Maker 12 • 2010",
+              "title": "Lim Album 12"
+            },
+            {
+              "cover": "https://covers.test/rg-lim13.jpg",
+              "id": "rg-lim13",
+              "kind": "Request",
+              "subtitle": "Lim Maker 13 • 2010",
+              "title": "Lim Album 13"
+            },
+            {
+              "cover": "https://covers.test/rg-lim14.jpg",
+              "id": "rg-lim14",
+              "kind": "Request",
+              "subtitle": "Lim Maker 14 • 2010",
+              "title": "Lim Album 14"
+            },
+            {
+              "cover": "https://covers.test/rg-lim15.jpg",
+              "id": "rg-lim15",
+              "kind": "Request",
+              "subtitle": "Lim Maker 15 • 2010",
+              "title": "Lim Album 15"
+            },
+            {
+              "cover": "https://covers.test/rg-lim16.jpg",
+              "id": "rg-lim16",
+              "kind": "Request",
+              "subtitle": "Lim Maker 16 • 2010",
+              "title": "Lim Album 16"
+            },
+            {
+              "cover": "https://covers.test/rg-lim17.jpg",
+              "id": "rg-lim17",
+              "kind": "Request",
+              "subtitle": "Lim Maker 17 • 2010",
+              "title": "Lim Album 17"
+            },
+            {
+              "cover": "https://covers.test/rg-lim18.jpg",
+              "id": "rg-lim18",
+              "kind": "Request",
+              "subtitle": "Lim Maker 18 • 2010",
+              "title": "Lim Album 18"
+            },
+            {
+              "cover": "https://covers.test/rg-lim19.jpg",
+              "id": "rg-lim19",
+              "kind": "Request",
+              "subtitle": "Lim Maker 19 • 2010",
+              "title": "Lim Album 19"
+            },
+            {
+              "cover": "https://covers.test/rg-lim20.jpg",
+              "id": "rg-lim20",
+              "kind": "Request",
+              "subtitle": "Lim Maker 20 • 2010",
+              "title": "Lim Album 20"
+            },
+            {
+              "cover": "https://covers.test/rg-lim21.jpg",
+              "id": "rg-lim21",
+              "kind": "Request",
+              "subtitle": "Lim Maker 21 • 2010",
+              "title": "Lim Album 21"
+            },
+            {
+              "cover": "https://covers.test/rg-lim22.jpg",
+              "id": "rg-lim22",
+              "kind": "Request",
+              "subtitle": "Lim Maker 22 • 2010",
+              "title": "Lim Album 22"
+            },
+            {
+              "cover": "https://covers.test/rg-lim23.jpg",
+              "id": "rg-lim23",
+              "kind": "Request",
+              "subtitle": "Lim Maker 23 • 2010",
+              "title": "Lim Album 23"
+            },
+            {
+              "cover": "https://covers.test/rg-lim24.jpg",
+              "id": "rg-lim24",
+              "kind": "Request",
+              "subtitle": "Lim Maker 24 • 2010",
+              "title": "Lim Album 24"
+            }
+          ],
+          "route": "",
+          "title": "Albums",
+          "wrap": false
+        }
+      ],
+      "tiles": [],
+      "title": "Results for “lim”",
+      "tracks_route": "",
+      "tracks_title": ""
+    },
+    {
+      "about": "",
+      "action": "",
+      "album_numbers": false,
+      "artist_id": "",
+      "can_play": false,
+      "context": "",
+      "cover": "",
+      "cover_round": false,
+      "disc_sections": false,
+      "empty": "",
+      "filter": 0,
+      "filters": [],
+      "grid": [],
+      "has_menu": false,
+      "label": "",
+      "lead": [],
+      "liked_songs": false,
+      "meta": "",
+      "more": null,
+      "notice": "",
+      "notice_action": "",
+      "notice_other": "",
+      "offers": [
+        {
+          "about": "Lim Song Album 0 • 2001",
+          "album": "rg-ls0",
+          "album_title": "Lim Song Album 0",
+          "artist": "Song Artist Zero",
+          "artist_id": "sa0",
+          "artist_name": "Song Artist Zero",
+          "cover": "https://coverartarchive.org/release-group/rg-ls0/front-250",
+          "kind": "",
+          "requested": false,
+          "seconds": 200,
+          "song": "",
+          "title": "Lim Song 0"
+        },
+        {
+          "about": "Lim Song Album 1 • 2001",
+          "album": "rg-ls1",
+          "album_title": "Lim Song Album 1",
+          "artist": "Song Artist One",
+          "artist_id": "sa1",
+          "artist_name": "Song Artist One",
+          "cover": "https://coverartarchive.org/release-group/rg-ls1/front-250",
+          "kind": "",
+          "requested": false,
+          "seconds": 200,
+          "song": "",
+          "title": "Lim Song 1"
+        },
+        {
+          "about": "Lim Song Album 2 • 2001",
+          "album": "rg-ls2",
+          "album_title": "Lim Song Album 2",
+          "artist": "Song Artist Two",
+          "artist_id": "sa2",
+          "artist_name": "Song Artist Two",
+          "cover": "https://coverartarchive.org/release-group/rg-ls2/front-250",
+          "kind": "",
+          "requested": false,
+          "seconds": 200,
+          "song": "",
+          "title": "Lim Song 2"
+        },
+        {
+          "about": "Lim Song Album 3 • 2001",
+          "album": "rg-ls3",
+          "album_title": "Lim Song Album 3",
+          "artist": "Song Artist Three",
+          "artist_id": "sa3",
+          "artist_name": "Song Artist Three",
+          "cover": "https://coverartarchive.org/release-group/rg-ls3/front-250",
+          "kind": "",
+          "requested": false,
+          "seconds": 200,
+          "song": "",
+          "title": "Lim Song 3"
+        },
+        {
+          "about": "Lim Song Album 4 • 2001",
+          "album": "rg-ls4",
+          "album_title": "Lim Song Album 4",
+          "artist": "Song Artist Zero",
+          "artist_id": "sa0",
+          "artist_name": "Song Artist Zero",
+          "cover": "https://coverartarchive.org/release-group/rg-ls4/front-250",
+          "kind": "",
+          "requested": false,
+          "seconds": 200,
+          "song": "",
+          "title": "Lim Song 4"
+        },
+        {
+          "about": "Lim Song Album 5 • 2001",
+          "album": "rg-ls5",
+          "album_title": "Lim Song Album 5",
+          "artist": "Song Artist One",
+          "artist_id": "sa1",
+          "artist_name": "Song Artist One",
+          "cover": "https://coverartarchive.org/release-group/rg-ls5/front-250",
+          "kind": "",
+          "requested": false,
+          "seconds": 200,
+          "song": "",
+          "title": "Lim Song 5"
+        },
+        {
+          "about": "Lim Song Album 6 • 2001",
+          "album": "rg-ls6",
+          "album_title": "Lim Song Album 6",
+          "artist": "Song Artist Two",
+          "artist_id": "sa2",
+          "artist_name": "Song Artist Two",
+          "cover": "https://coverartarchive.org/release-group/rg-ls6/front-250",
+          "kind": "",
+          "requested": false,
+          "seconds": 200,
+          "song": "",
+          "title": "Lim Song 6"
+        },
+        {
+          "about": "Lim Song Album 7 • 2001",
+          "album": "rg-ls7",
+          "album_title": "Lim Song Album 7",
+          "artist": "Song Artist Three",
+          "artist_id": "sa3",
+          "artist_name": "Song Artist Three",
+          "cover": "https://coverartarchive.org/release-group/rg-ls7/front-250",
+          "kind": "",
+          "requested": false,
+          "seconds": 200,
+          "song": "",
+          "title": "Lim Song 7"
+        },
+        {
+          "about": "Lim Song Album 8 • 2001",
+          "album": "rg-ls8",
+          "album_title": "Lim Song Album 8",
+          "artist": "Song Artist Zero",
+          "artist_id": "sa0",
+          "artist_name": "Song Artist Zero",
+          "cover": "https://coverartarchive.org/release-group/rg-ls8/front-250",
+          "kind": "",
+          "requested": false,
+          "seconds": 200,
+          "song": "",
+          "title": "Lim Song 8"
+        },
+        {
+          "about": "Lim Song Album 9 • 2001",
+          "album": "rg-ls9",
+          "album_title": "Lim Song Album 9",
+          "artist": "Song Artist One",
+          "artist_id": "sa1",
+          "artist_name": "Song Artist One",
+          "cover": "https://coverartarchive.org/release-group/rg-ls9/front-250",
+          "kind": "",
+          "requested": false,
+          "seconds": 200,
+          "song": "",
+          "title": "Lim Song 9"
+        },
+        {
+          "about": "Lim Song Album 10 • 2001",
+          "album": "rg-ls10",
+          "album_title": "Lim Song Album 10",
+          "artist": "Song Artist Two",
+          "artist_id": "sa2",
+          "artist_name": "Song Artist Two",
+          "cover": "https://coverartarchive.org/release-group/rg-ls10/front-250",
+          "kind": "",
+          "requested": false,
+          "seconds": 200,
+          "song": "",
+          "title": "Lim Song 10"
+        },
+        {
+          "about": "Lim Song Album 11 • 2001",
+          "album": "rg-ls11",
+          "album_title": "Lim Song Album 11",
+          "artist": "Song Artist Three",
+          "artist_id": "sa3",
+          "artist_name": "Song Artist Three",
+          "cover": "https://coverartarchive.org/release-group/rg-ls11/front-250",
+          "kind": "",
+          "requested": false,
+          "seconds": 200,
+          "song": "",
+          "title": "Lim Song 11"
+        },
+        {
+          "about": "Lim Song Album 12 • 2001",
+          "album": "rg-ls12",
+          "album_title": "Lim Song Album 12",
+          "artist": "Song Artist Zero",
+          "artist_id": "sa0",
+          "artist_name": "Song Artist Zero",
+          "cover": "https://coverartarchive.org/release-group/rg-ls12/front-250",
+          "kind": "",
+          "requested": false,
+          "seconds": 200,
+          "song": "",
+          "title": "Lim Song 12"
+        },
+        {
+          "about": "Lim Song Album 13 • 2001",
+          "album": "rg-ls13",
+          "album_title": "Lim Song Album 13",
+          "artist": "Song Artist One",
+          "artist_id": "sa1",
+          "artist_name": "Song Artist One",
+          "cover": "https://coverartarchive.org/release-group/rg-ls13/front-250",
+          "kind": "",
+          "requested": false,
+          "seconds": 200,
+          "song": "",
+          "title": "Lim Song 13"
+        },
+        {
+          "about": "Lim Song Album 14 • 2001",
+          "album": "rg-ls14",
+          "album_title": "Lim Song Album 14",
+          "artist": "Song Artist Two",
+          "artist_id": "sa2",
+          "artist_name": "Song Artist Two",
+          "cover": "https://coverartarchive.org/release-group/rg-ls14/front-250",
+          "kind": "",
+          "requested": false,
+          "seconds": 200,
+          "song": "",
+          "title": "Lim Song 14"
+        },
+        {
+          "about": "Lim Song Album 15 • 2001",
+          "album": "rg-ls15",
+          "album_title": "Lim Song Album 15",
+          "artist": "Song Artist Three",
+          "artist_id": "sa3",
+          "artist_name": "Song Artist Three",
+          "cover": "https://coverartarchive.org/release-group/rg-ls15/front-250",
+          "kind": "",
+          "requested": false,
+          "seconds": 200,
+          "song": "",
+          "title": "Lim Song 15"
+        },
+        {
+          "about": "Lim Song Album 16 • 2001",
+          "album": "rg-ls16",
+          "album_title": "Lim Song Album 16",
+          "artist": "Song Artist Zero",
+          "artist_id": "sa0",
+          "artist_name": "Song Artist Zero",
+          "cover": "https://coverartarchive.org/release-group/rg-ls16/front-250",
+          "kind": "",
+          "requested": false,
+          "seconds": 200,
+          "song": "",
+          "title": "Lim Song 16"
+        },
+        {
+          "about": "Lim Song Album 17 • 2001",
+          "album": "rg-ls17",
+          "album_title": "Lim Song Album 17",
+          "artist": "Song Artist One",
+          "artist_id": "sa1",
+          "artist_name": "Song Artist One",
+          "cover": "https://coverartarchive.org/release-group/rg-ls17/front-250",
+          "kind": "",
+          "requested": false,
+          "seconds": 200,
+          "song": "",
+          "title": "Lim Song 17"
+        },
+        {
+          "about": "Lim Song Album 18 • 2001",
+          "album": "rg-ls18",
+          "album_title": "Lim Song Album 18",
+          "artist": "Song Artist Two",
+          "artist_id": "sa2",
+          "artist_name": "Song Artist Two",
+          "cover": "https://coverartarchive.org/release-group/rg-ls18/front-250",
+          "kind": "",
+          "requested": false,
+          "seconds": 200,
+          "song": "",
+          "title": "Lim Song 18"
+        },
+        {
+          "about": "Lim Song Album 19 • 2001",
+          "album": "rg-ls19",
+          "album_title": "Lim Song Album 19",
+          "artist": "Song Artist Three",
+          "artist_id": "sa3",
+          "artist_name": "Song Artist Three",
+          "cover": "https://coverartarchive.org/release-group/rg-ls19/front-250",
+          "kind": "",
+          "requested": false,
+          "seconds": 200,
+          "song": "",
+          "title": "Lim Song 19"
+        }
+      ],
+      "offers_first": false,
+      "offers_heading": "",
+      "offers_note": "Ask Lidarr for any of these. A song comes with the album it's on, or as its single if it isn't on one.",
+      "offers_route": "",
+      "offers_title": "Not in your library",
+      "play": "Songs",
+      "playlist": null,
+      "request_ids": [],
+      "shelves": [],
+      "show_album": false,
+      "show_cover": false,
+      "show_number": false,
+      "song_notes": [],
+      "songs": [],
+      "sort": 0,
+      "sorts": [],
+      "star": null,
+      "starred": false,
+      "stats": [],
+      "subtitle": "",
+      "subtitle_route": "",
+      "tail": [
+        {
+          "cards": [
+            {
+              "cover": "",
+              "id": "sa0",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Song Artist Zero"
+            },
+            {
+              "cover": "",
+              "id": "sa1",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Song Artist One"
+            },
+            {
+              "cover": "",
+              "id": "sa2",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Song Artist Two"
+            },
+            {
+              "cover": "",
+              "id": "lim-a1",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Lim Artist 1"
+            },
+            {
+              "cover": "",
+              "id": "lim-a2",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Lim Artist 2"
+            },
+            {
+              "cover": "",
+              "id": "lim-a3",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Lim Artist 3"
+            },
+            {
+              "cover": "",
+              "id": "lim-a4",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Lim Artist 4"
+            },
+            {
+              "cover": "",
+              "id": "lim-a5",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Lim Artist 5"
+            },
+            {
+              "cover": "",
+              "id": "lim-a6",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Lim Artist 6"
+            },
+            {
+              "cover": "",
+              "id": "lim-a7",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Lim Artist 7"
+            },
+            {
+              "cover": "",
+              "id": "lim-a8",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Lim Artist 8"
+            },
+            {
+              "cover": "",
+              "id": "lim-a9",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Lim Artist 9"
+            }
+          ],
+          "route": "",
+          "title": "Artists",
+          "wrap": false
+        },
+        {
+          "cards": [
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-ls0/front-250",
+              "id": "rg-ls0",
+              "kind": "Request",
+              "subtitle": "Song Artist Zero • 2001",
+              "title": "Lim Song Album 0"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-ls1/front-250",
+              "id": "rg-ls1",
+              "kind": "Request",
+              "subtitle": "Song Artist One • 2001",
+              "title": "Lim Song Album 1"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-ls2/front-250",
+              "id": "rg-ls2",
+              "kind": "Request",
+              "subtitle": "Song Artist Two • 2001",
+              "title": "Lim Song Album 2"
+            },
+            {
+              "cover": "https://covers.test/rg-lim1.jpg",
+              "id": "rg-lim1",
+              "kind": "Request",
+              "subtitle": "Lim Maker 1 • 2010",
+              "title": "Lim Album 1"
+            },
+            {
+              "cover": "https://covers.test/rg-lim2.jpg",
+              "id": "rg-lim2",
+              "kind": "Request",
+              "subtitle": "Lim Maker 2 • 2010",
+              "title": "Lim Album 2"
+            },
+            {
+              "cover": "https://covers.test/rg-lim3.jpg",
+              "id": "rg-lim3",
+              "kind": "Request",
+              "subtitle": "Lim Maker 3 • 2010",
+              "title": "Lim Album 3"
+            },
+            {
+              "cover": "https://covers.test/rg-lim4.jpg",
+              "id": "rg-lim4",
+              "kind": "Request",
+              "subtitle": "Lim Maker 4 • 2010",
+              "title": "Lim Album 4"
+            },
+            {
+              "cover": "https://covers.test/rg-lim5.jpg",
+              "id": "rg-lim5",
+              "kind": "Request",
+              "subtitle": "Lim Maker 5 • 2010",
+              "title": "Lim Album 5"
+            },
+            {
+              "cover": "https://covers.test/rg-lim6.jpg",
+              "id": "rg-lim6",
+              "kind": "Request",
+              "subtitle": "Lim Maker 6 • 2010",
+              "title": "Lim Album 6"
+            },
+            {
+              "cover": "https://covers.test/rg-lim7.jpg",
+              "id": "rg-lim7",
+              "kind": "Request",
+              "subtitle": "Lim Maker 7 • 2010",
+              "title": "Lim Album 7"
+            },
+            {
+              "cover": "https://covers.test/rg-lim8.jpg",
+              "id": "rg-lim8",
+              "kind": "Request",
+              "subtitle": "Lim Maker 8 • 2010",
+              "title": "Lim Album 8"
+            },
+            {
+              "cover": "https://covers.test/rg-lim9.jpg",
+              "id": "rg-lim9",
+              "kind": "Request",
+              "subtitle": "Lim Maker 9 • 2010",
+              "title": "Lim Album 9"
+            }
+          ],
+          "route": "",
+          "title": "Albums",
+          "wrap": false
+        }
+      ],
+      "tiles": [],
+      "title": "Results for “lim”",
+      "tracks_route": "",
+      "tracks_title": ""
+    },
+    {
+      "about": "",
+      "action": "",
+      "album_numbers": false,
+      "artist_id": "",
+      "can_play": false,
+      "context": "",
+      "cover": "",
+      "cover_round": false,
+      "disc_sections": false,
+      "empty": "",
+      "filter": 0,
+      "filters": [],
+      "grid": [],
+      "has_menu": false,
+      "label": "",
+      "lead": [],
+      "liked_songs": false,
+      "meta": "",
+      "more": null,
+      "notice": "",
+      "notice_action": "",
+      "notice_other": "",
+      "offers": [
+        {
+          "about": "Lim Song Album 0 • 2001",
+          "album": "rg-ls0",
+          "album_title": "Lim Song Album 0",
+          "artist": "Song Artist Zero",
+          "artist_id": "sa0",
+          "artist_name": "Song Artist Zero",
+          "cover": "https://coverartarchive.org/release-group/rg-ls0/front-250",
+          "kind": "",
+          "requested": false,
+          "seconds": 200,
+          "song": "",
+          "title": "Lim Song 0"
+        },
+        {
+          "about": "Lim Song Album 1 • 2001",
+          "album": "rg-ls1",
+          "album_title": "Lim Song Album 1",
+          "artist": "Song Artist One",
+          "artist_id": "sa1",
+          "artist_name": "Song Artist One",
+          "cover": "https://coverartarchive.org/release-group/rg-ls1/front-250",
+          "kind": "",
+          "requested": false,
+          "seconds": 200,
+          "song": "",
+          "title": "Lim Song 1"
+        },
+        {
+          "about": "Lim Song Album 2 • 2001",
+          "album": "rg-ls2",
+          "album_title": "Lim Song Album 2",
+          "artist": "Song Artist Two",
+          "artist_id": "sa2",
+          "artist_name": "Song Artist Two",
+          "cover": "https://coverartarchive.org/release-group/rg-ls2/front-250",
+          "kind": "",
+          "requested": false,
+          "seconds": 200,
+          "song": "",
+          "title": "Lim Song 2"
+        },
+        {
+          "about": "Lim Song Album 3 • 2001",
+          "album": "rg-ls3",
+          "album_title": "Lim Song Album 3",
+          "artist": "Song Artist Three",
+          "artist_id": "sa3",
+          "artist_name": "Song Artist Three",
+          "cover": "https://coverartarchive.org/release-group/rg-ls3/front-250",
+          "kind": "",
+          "requested": false,
+          "seconds": 200,
+          "song": "",
+          "title": "Lim Song 3"
+        },
+        {
+          "about": "Lim Song Album 4 • 2001",
+          "album": "rg-ls4",
+          "album_title": "Lim Song Album 4",
+          "artist": "Song Artist Zero",
+          "artist_id": "sa0",
+          "artist_name": "Song Artist Zero",
+          "cover": "https://coverartarchive.org/release-group/rg-ls4/front-250",
+          "kind": "",
+          "requested": false,
+          "seconds": 200,
+          "song": "",
+          "title": "Lim Song 4"
+        },
+        {
+          "about": "Lim Song Album 5 • 2001",
+          "album": "rg-ls5",
+          "album_title": "Lim Song Album 5",
+          "artist": "Song Artist One",
+          "artist_id": "sa1",
+          "artist_name": "Song Artist One",
+          "cover": "https://coverartarchive.org/release-group/rg-ls5/front-250",
+          "kind": "",
+          "requested": false,
+          "seconds": 200,
+          "song": "",
+          "title": "Lim Song 5"
+        },
+        {
+          "about": "Lim Song Album 6 • 2001",
+          "album": "rg-ls6",
+          "album_title": "Lim Song Album 6",
+          "artist": "Song Artist Two",
+          "artist_id": "sa2",
+          "artist_name": "Song Artist Two",
+          "cover": "https://coverartarchive.org/release-group/rg-ls6/front-250",
+          "kind": "",
+          "requested": false,
+          "seconds": 200,
+          "song": "",
+          "title": "Lim Song 6"
+        },
+        {
+          "about": "Lim Song Album 7 • 2001",
+          "album": "rg-ls7",
+          "album_title": "Lim Song Album 7",
+          "artist": "Song Artist Three",
+          "artist_id": "sa3",
+          "artist_name": "Song Artist Three",
+          "cover": "https://coverartarchive.org/release-group/rg-ls7/front-250",
+          "kind": "",
+          "requested": false,
+          "seconds": 200,
+          "song": "",
+          "title": "Lim Song 7"
+        },
+        {
+          "about": "Lim Song Album 8 • 2001",
+          "album": "rg-ls8",
+          "album_title": "Lim Song Album 8",
+          "artist": "Song Artist Zero",
+          "artist_id": "sa0",
+          "artist_name": "Song Artist Zero",
+          "cover": "https://coverartarchive.org/release-group/rg-ls8/front-250",
+          "kind": "",
+          "requested": false,
+          "seconds": 200,
+          "song": "",
+          "title": "Lim Song 8"
+        },
+        {
+          "about": "Lim Song Album 9 • 2001",
+          "album": "rg-ls9",
+          "album_title": "Lim Song Album 9",
+          "artist": "Song Artist One",
+          "artist_id": "sa1",
+          "artist_name": "Song Artist One",
+          "cover": "https://coverartarchive.org/release-group/rg-ls9/front-250",
+          "kind": "",
+          "requested": false,
+          "seconds": 200,
+          "song": "",
+          "title": "Lim Song 9"
+        },
+        {
+          "about": "Lim Song Album 10 • 2001",
+          "album": "rg-ls10",
+          "album_title": "Lim Song Album 10",
+          "artist": "Song Artist Two",
+          "artist_id": "sa2",
+          "artist_name": "Song Artist Two",
+          "cover": "https://coverartarchive.org/release-group/rg-ls10/front-250",
+          "kind": "",
+          "requested": false,
+          "seconds": 200,
+          "song": "",
+          "title": "Lim Song 10"
+        },
+        {
+          "about": "Lim Song Album 11 • 2001",
+          "album": "rg-ls11",
+          "album_title": "Lim Song Album 11",
+          "artist": "Song Artist Three",
+          "artist_id": "sa3",
+          "artist_name": "Song Artist Three",
+          "cover": "https://coverartarchive.org/release-group/rg-ls11/front-250",
+          "kind": "",
+          "requested": false,
+          "seconds": 200,
+          "song": "",
+          "title": "Lim Song 11"
+        },
+        {
+          "about": "Lim Song Album 12 • 2001",
+          "album": "rg-ls12",
+          "album_title": "Lim Song Album 12",
+          "artist": "Song Artist Zero",
+          "artist_id": "sa0",
+          "artist_name": "Song Artist Zero",
+          "cover": "https://coverartarchive.org/release-group/rg-ls12/front-250",
+          "kind": "",
+          "requested": false,
+          "seconds": 200,
+          "song": "",
+          "title": "Lim Song 12"
+        },
+        {
+          "about": "Lim Song Album 13 • 2001",
+          "album": "rg-ls13",
+          "album_title": "Lim Song Album 13",
+          "artist": "Song Artist One",
+          "artist_id": "sa1",
+          "artist_name": "Song Artist One",
+          "cover": "https://coverartarchive.org/release-group/rg-ls13/front-250",
+          "kind": "",
+          "requested": false,
+          "seconds": 200,
+          "song": "",
+          "title": "Lim Song 13"
+        },
+        {
+          "about": "Lim Song Album 14 • 2001",
+          "album": "rg-ls14",
+          "album_title": "Lim Song Album 14",
+          "artist": "Song Artist Two",
+          "artist_id": "sa2",
+          "artist_name": "Song Artist Two",
+          "cover": "https://coverartarchive.org/release-group/rg-ls14/front-250",
+          "kind": "",
+          "requested": false,
+          "seconds": 200,
+          "song": "",
+          "title": "Lim Song 14"
+        },
+        {
+          "about": "Lim Song Album 15 • 2001",
+          "album": "rg-ls15",
+          "album_title": "Lim Song Album 15",
+          "artist": "Song Artist Three",
+          "artist_id": "sa3",
+          "artist_name": "Song Artist Three",
+          "cover": "https://coverartarchive.org/release-group/rg-ls15/front-250",
+          "kind": "",
+          "requested": false,
+          "seconds": 200,
+          "song": "",
+          "title": "Lim Song 15"
+        },
+        {
+          "about": "Lim Song Album 16 • 2001",
+          "album": "rg-ls16",
+          "album_title": "Lim Song Album 16",
+          "artist": "Song Artist Zero",
+          "artist_id": "sa0",
+          "artist_name": "Song Artist Zero",
+          "cover": "https://coverartarchive.org/release-group/rg-ls16/front-250",
+          "kind": "",
+          "requested": false,
+          "seconds": 200,
+          "song": "",
+          "title": "Lim Song 16"
+        },
+        {
+          "about": "Lim Song Album 17 • 2001",
+          "album": "rg-ls17",
+          "album_title": "Lim Song Album 17",
+          "artist": "Song Artist One",
+          "artist_id": "sa1",
+          "artist_name": "Song Artist One",
+          "cover": "https://coverartarchive.org/release-group/rg-ls17/front-250",
+          "kind": "",
+          "requested": false,
+          "seconds": 200,
+          "song": "",
+          "title": "Lim Song 17"
+        },
+        {
+          "about": "Lim Song Album 18 • 2001",
+          "album": "rg-ls18",
+          "album_title": "Lim Song Album 18",
+          "artist": "Song Artist Two",
+          "artist_id": "sa2",
+          "artist_name": "Song Artist Two",
+          "cover": "https://coverartarchive.org/release-group/rg-ls18/front-250",
+          "kind": "",
+          "requested": false,
+          "seconds": 200,
+          "song": "",
+          "title": "Lim Song 18"
+        },
+        {
+          "about": "Lim Song Album 19 • 2001",
+          "album": "rg-ls19",
+          "album_title": "Lim Song Album 19",
+          "artist": "Song Artist Three",
+          "artist_id": "sa3",
+          "artist_name": "Song Artist Three",
+          "cover": "https://coverartarchive.org/release-group/rg-ls19/front-250",
+          "kind": "",
+          "requested": false,
+          "seconds": 200,
+          "song": "",
+          "title": "Lim Song 19"
+        }
+      ],
+      "offers_first": false,
+      "offers_heading": "",
+      "offers_note": "Ask Lidarr for any of these. A song comes with the album it's on, or as its single if it isn't on one.",
+      "offers_route": "",
+      "offers_title": "Not in your library",
+      "play": "Songs",
+      "playlist": null,
+      "request_ids": [],
+      "shelves": [],
+      "show_album": false,
+      "show_cover": false,
+      "show_number": false,
+      "song_notes": [],
+      "songs": [],
+      "sort": 0,
+      "sorts": [],
+      "star": null,
+      "starred": false,
+      "stats": [],
+      "subtitle": "",
+      "subtitle_route": "",
+      "tail": [
+        {
+          "cards": [
+            {
+              "cover": "",
+              "id": "sa0",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Song Artist Zero"
+            },
+            {
+              "cover": "",
+              "id": "sa1",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Song Artist One"
+            },
+            {
+              "cover": "",
+              "id": "sa2",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Song Artist Two"
+            },
+            {
+              "cover": "",
+              "id": "lim-a1",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Lim Artist 1"
+            },
+            {
+              "cover": "",
+              "id": "lim-a2",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Lim Artist 2"
+            },
+            {
+              "cover": "",
+              "id": "lim-a3",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Lim Artist 3"
+            },
+            {
+              "cover": "",
+              "id": "lim-a4",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Lim Artist 4"
+            },
+            {
+              "cover": "",
+              "id": "lim-a5",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Lim Artist 5"
+            },
+            {
+              "cover": "",
+              "id": "lim-a6",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Lim Artist 6"
+            },
+            {
+              "cover": "",
+              "id": "lim-a7",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Lim Artist 7"
+            },
+            {
+              "cover": "",
+              "id": "lim-a8",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Lim Artist 8"
+            },
+            {
+              "cover": "",
+              "id": "lim-a9",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Lim Artist 9"
+            }
+          ],
+          "route": "",
+          "title": "Artists",
+          "wrap": false
+        },
+        {
+          "cards": [
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-ls0/front-250",
+              "id": "rg-ls0",
+              "kind": "Request",
+              "subtitle": "Song Artist Zero • 2001",
+              "title": "Lim Song Album 0"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-ls1/front-250",
+              "id": "rg-ls1",
+              "kind": "Request",
+              "subtitle": "Song Artist One • 2001",
+              "title": "Lim Song Album 1"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-ls2/front-250",
+              "id": "rg-ls2",
+              "kind": "Request",
+              "subtitle": "Song Artist Two • 2001",
+              "title": "Lim Song Album 2"
+            },
+            {
+              "cover": "https://covers.test/rg-lim1.jpg",
+              "id": "rg-lim1",
+              "kind": "Request",
+              "subtitle": "Lim Maker 1 • 2010",
+              "title": "Lim Album 1"
+            },
+            {
+              "cover": "https://covers.test/rg-lim2.jpg",
+              "id": "rg-lim2",
+              "kind": "Request",
+              "subtitle": "Lim Maker 2 • 2010",
+              "title": "Lim Album 2"
+            },
+            {
+              "cover": "https://covers.test/rg-lim3.jpg",
+              "id": "rg-lim3",
+              "kind": "Request",
+              "subtitle": "Lim Maker 3 • 2010",
+              "title": "Lim Album 3"
+            },
+            {
+              "cover": "https://covers.test/rg-lim4.jpg",
+              "id": "rg-lim4",
+              "kind": "Request",
+              "subtitle": "Lim Maker 4 • 2010",
+              "title": "Lim Album 4"
+            },
+            {
+              "cover": "https://covers.test/rg-lim5.jpg",
+              "id": "rg-lim5",
+              "kind": "Request",
+              "subtitle": "Lim Maker 5 • 2010",
+              "title": "Lim Album 5"
+            },
+            {
+              "cover": "https://covers.test/rg-lim6.jpg",
+              "id": "rg-lim6",
+              "kind": "Request",
+              "subtitle": "Lim Maker 6 • 2010",
+              "title": "Lim Album 6"
+            },
+            {
+              "cover": "https://covers.test/rg-lim7.jpg",
+              "id": "rg-lim7",
+              "kind": "Request",
+              "subtitle": "Lim Maker 7 • 2010",
+              "title": "Lim Album 7"
+            },
+            {
+              "cover": "https://covers.test/rg-lim8.jpg",
+              "id": "rg-lim8",
+              "kind": "Request",
+              "subtitle": "Lim Maker 8 • 2010",
+              "title": "Lim Album 8"
+            },
+            {
+              "cover": "https://covers.test/rg-lim9.jpg",
+              "id": "rg-lim9",
+              "kind": "Request",
+              "subtitle": "Lim Maker 9 • 2010",
+              "title": "Lim Album 9"
+            }
+          ],
+          "route": "",
+          "title": "Albums",
+          "wrap": false
+        }
+      ],
+      "tiles": [],
+      "title": "Results for “lim”",
+      "tracks_route": "",
+      "tracks_title": ""
+    }
+  ]
+}

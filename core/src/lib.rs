@@ -26,6 +26,7 @@ pub mod offer;
 pub mod playlists;
 pub mod queue;
 pub mod record;
+pub mod requests;
 pub mod search;
 pub mod step;
 pub mod sync;

@@ -1,0 +1,77 @@
+{
+  "asked": [
+    "GET http://lidarr.test/api/v1/artist ",
+    "GET http://lidarr.test/api/v1/album?artistId=8 ",
+    "GET https://musicbrainz.org/ws/2/release-group?artist=mc2&type=album&limit=100&offset=0&inc=artist-credits&fmt=json ",
+    "GET https://api.listenbrainz.org/1/popularity/top-recordings-for-artist/mc2 ",
+    "POST https://api.listenbrainz.org/1/popularity/release-group { \"release_group_mbids\": [ \"rg-mc2-s\", \"rg-mc2-a\" ] }"
+  ],
+  "stages": [
+    {
+      "about": "",
+      "action": "Add artist",
+      "album_numbers": false,
+      "artist_id": "mc2",
+      "can_play": false,
+      "context": "",
+      "cover": "",
+      "cover_round": true,
+      "disc_sections": false,
+      "empty": "",
+      "filter": 0,
+      "filters": [],
+      "grid": [],
+      "has_menu": false,
+      "label": "Artist",
+      "lead": [],
+      "liked_songs": false,
+      "meta": "1 album",
+      "more": null,
+      "notice": "",
+      "notice_action": "",
+      "notice_other": "",
+      "offers": [],
+      "offers_first": false,
+      "offers_heading": "",
+      "offers_note": "",
+      "offers_route": "",
+      "offers_title": "",
+      "play": "Songs",
+      "playlist": null,
+      "request_ids": [],
+      "shelves": [],
+      "show_album": false,
+      "show_cover": false,
+      "show_number": false,
+      "song_notes": [],
+      "songs": [],
+      "sort": 0,
+      "sorts": [],
+      "star": null,
+      "starred": false,
+      "stats": [],
+      "subtitle": "",
+      "subtitle_route": "",
+      "tail": [
+        {
+          "cards": [
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-mc2-a/front-250",
+              "id": "rg-mc2-a",
+              "kind": "Request",
+              "subtitle": "2015",
+              "title": "Kept Album"
+            }
+          ],
+          "route": "",
+          "title": "Albums",
+          "wrap": true
+        }
+      ],
+      "tiles": [],
+      "title": "Kept Setting",
+      "tracks_route": "",
+      "tracks_title": ""
+    }
+  ]
+}

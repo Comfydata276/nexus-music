@@ -9,11 +9,10 @@
 //! (`nexus_core::lidarr`), for the Android app to use too. This is the Windows app's end:
 //! the connection they're asked over, the Lidarr in use, and what it has offered.
 
-use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-pub use nexus_core::lidarr::{ArtistOffer, Lidarr, host, mask, tidy};
-pub use nexus_core::offer::{Offer, VARIOUS};
+pub use nexus_core::lidarr::{ArtistOffer, Lidarr, Offers, host, mask, tidy};
+pub use nexus_core::offer::Offer;
 
 /// Lidarr at `address`, asked over an agent of the app's own. `gate` is the sign-in in front
 /// of it, if there is one.
@@ -38,8 +37,14 @@ pub fn singles() -> bool {
 // ---- the connection in use, and what it has offered -----------------------------------------------
 
 static CURRENT: RwLock<Option<Lidarr>> = RwLock::new(None);
-/// Albums that have been offered, by Lidarr's name for them, so a click on one can be acted on.
-static OFFERS: RwLock<Option<HashMap<String, Offer>>> = RwLock::new(None);
+/// Albums and artists that have been offered, by Lidarr's names for them, so a click on one
+/// can be acted on.
+static OFFERS: Offers = Offers::new();
+
+/// What has been offered, for what offers more.
+pub fn offers() -> &'static Offers {
+    &OFFERS
+}
 
 pub fn current() -> Option<Lidarr> {
     CURRENT.read().ok()?.clone()
@@ -51,45 +56,27 @@ pub fn set_current(lidarr: Option<Lidarr>) {
     }
 }
 
-/// Artists that have been offered, by Lidarr's name for them.
-static ARTISTS: RwLock<Option<HashMap<String, ArtistOffer>>> = RwLock::new(None);
-
 pub fn remember_artists(artists: &[ArtistOffer]) {
-    if let Ok(mut all) = ARTISTS.write() {
-        let all = all.get_or_insert_with(HashMap::new);
-        for artist in artists {
-            // A later mention without a picture doesn't replace one with.
-            if !artist.cover.is_empty() || !all.contains_key(&artist.id) {
-                all.insert(artist.id.clone(), artist.clone());
-            }
-        }
-    }
-}
-
-pub fn offered_artist(artist: &str) -> Option<ArtistOffer> {
-    ARTISTS.read().ok()?.as_ref()?.get(artist).cloned()
+    OFFERS.remember_artists(artists)
 }
 
 pub fn remember(offers: &[Offer]) {
-    if let Ok(mut all) = OFFERS.write() {
-        let all = all.get_or_insert_with(HashMap::new);
-        for offer in offers {
-            all.insert(offer.album.clone(), offer.clone());
-        }
-    }
+    OFFERS.remember(offers)
 }
 
 pub fn offered(album: &str) -> Option<Offer> {
-    OFFERS.read().ok()?.as_ref()?.get(album).cloned()
+    OFFERS.offered(album)
+}
+
+/// Forgets everything offered, for a test that starts from nothing.
+#[cfg(test)]
+pub fn forget_offers() {
+    OFFERS.forget()
 }
 
 /// Notes that an album has been asked for (or no longer is), so it's shown that way.
 pub fn mark(album: &str, requested: bool) {
-    if let Ok(mut all) = OFFERS.write() {
-        if let Some(offer) = all.as_mut().and_then(|all| all.get_mut(album)) {
-            offer.requested = requested;
-        }
-    }
+    OFFERS.mark(album, requested)
 }
 
 /// What goes to Lidarr and back, against a stand-in server: written against the app as it

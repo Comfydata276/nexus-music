@@ -1,0 +1,9 @@
+[
+  [
+    "GET http://lidarr.test/api/v1/album/lookup?term=saltwater "
+  ],
+  [
+    "GET http://lidarr.test/api/v1/artist/lookup?term=saltwater ",
+    "GET https://musicbrainz.org/ws/2/recording?query=saltwater&dismax=true&limit=100&fmt=json "
+  ]
+]

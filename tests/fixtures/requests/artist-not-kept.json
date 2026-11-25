@@ -1,0 +1,257 @@
+{
+  "asked": [
+    "GET http://lidarr.test/api/v1/artist ",
+    "GET https://musicbrainz.org/ws/2/release-group?artist=ml6&type=album%7Cep%7Csingle&limit=100&offset=0&inc=artist-credits&fmt=json ",
+    "GET https://api.listenbrainz.org/1/popularity/top-recordings-for-artist/ml6 ",
+    "POST https://api.listenbrainz.org/1/popularity/release-group { \"release_group_mbids\": [ \"rg-new\", \"rg-ost\", \"rg-ik\", \"rg-ep\", \"rg-sh6\", \"rg-s\" ] }",
+    "GET https://musicbrainz.org/ws/2/recording?query=rgid%3A%28rg-ik%20OR%20rg-sh6%20OR%20rg-s%29%20AND%20arid%3Aml6&limit=100&offset=0&fmt=json ",
+    "POST https://api.listenbrainz.org/1/popularity/recording { \"recording_mbids\": [ \"rec-k1\", \"rec-k2\", \"rec-k3\", \"rec-k4\", \"rec-k5\" ] }"
+  ],
+  "stages": [
+    {
+      "about": "",
+      "action": "Add artist",
+      "album_numbers": false,
+      "artist_id": "ml6",
+      "can_play": false,
+      "context": "",
+      "cover": "https://pictures.test/ml6.jpg",
+      "cover_round": true,
+      "disc_sections": false,
+      "empty": "",
+      "filter": 0,
+      "filters": [],
+      "grid": [],
+      "has_menu": false,
+      "label": "Artist",
+      "lead": [],
+      "liked_songs": false,
+      "meta": "4 albums • 1 in your library",
+      "more": null,
+      "notice": "",
+      "notice_action": "",
+      "notice_other": "",
+      "offers": [],
+      "offers_first": false,
+      "offers_heading": "",
+      "offers_note": "",
+      "offers_route": "",
+      "offers_title": "",
+      "play": "Songs",
+      "playlist": null,
+      "request_ids": [],
+      "shelves": [],
+      "show_album": false,
+      "show_cover": false,
+      "show_number": false,
+      "song_notes": [],
+      "songs": [],
+      "sort": 0,
+      "sorts": [],
+      "star": null,
+      "starred": false,
+      "stats": [],
+      "subtitle": "",
+      "subtitle_route": "",
+      "tail": [
+        {
+          "cards": [
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-new/front-250",
+              "id": "rg-new",
+              "kind": "Request",
+              "subtitle": "2024",
+              "title": "Newest"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-ost/front-250",
+              "id": "rg-ost",
+              "kind": "Request",
+              "subtitle": "2023",
+              "title": "A Film"
+            },
+            {
+              "cover": "al-lib-ik",
+              "id": "lib-ik",
+              "kind": "Album",
+              "subtitle": "2018 • In your library",
+              "title": "Iron Kite"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-sh6/front-250",
+              "id": "rg-sh6",
+              "kind": "Request",
+              "subtitle": "2016",
+              "title": "Saltwater Hours"
+            }
+          ],
+          "route": "",
+          "title": "Albums",
+          "wrap": true
+        },
+        {
+          "cards": [
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-ep/front-250",
+              "id": "rg-ep",
+              "kind": "Request",
+              "subtitle": "2017 • EP",
+              "title": "Small Hours"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-s/front-250",
+              "id": "rg-s",
+              "kind": "Request",
+              "subtitle": "Single",
+              "title": "Kite"
+            }
+          ],
+          "route": "",
+          "title": "Singles and EPs",
+          "wrap": true
+        }
+      ],
+      "tiles": [],
+      "title": "Marrow Lake",
+      "tracks_route": "",
+      "tracks_title": ""
+    },
+    {
+      "about": "",
+      "action": "Add artist",
+      "album_numbers": false,
+      "artist_id": "ml6",
+      "can_play": false,
+      "context": "",
+      "cover": "https://pictures.test/ml6.jpg",
+      "cover_round": true,
+      "disc_sections": false,
+      "empty": "",
+      "filter": 0,
+      "filters": [],
+      "grid": [],
+      "has_menu": false,
+      "label": "Artist",
+      "lead": [],
+      "liked_songs": false,
+      "meta": "4 albums • 1 in your library",
+      "more": null,
+      "notice": "",
+      "notice_action": "",
+      "notice_other": "",
+      "offers": [
+        {
+          "about": "Saltwater Hours • 2016",
+          "album": "rg-sh6",
+          "album_title": "Saltwater Hours",
+          "artist": "Marrow Lake",
+          "artist_id": "ml6",
+          "artist_name": "Marrow Lake",
+          "cover": "https://coverartarchive.org/release-group/rg-sh6/front-250",
+          "kind": "",
+          "requested": false,
+          "seconds": 200,
+          "song": "",
+          "title": "Sea Wall"
+        },
+        {
+          "about": "Saltwater Hours • 2016",
+          "album": "rg-sh6",
+          "album_title": "Saltwater Hours",
+          "artist": "Marrow Lake",
+          "artist_id": "ml6",
+          "artist_name": "Marrow Lake",
+          "cover": "https://coverartarchive.org/release-group/rg-sh6/front-250",
+          "kind": "",
+          "requested": false,
+          "seconds": 200,
+          "song": "",
+          "title": "Low Tide"
+        }
+      ],
+      "offers_first": false,
+      "offers_heading": "Popular, and not in your library",
+      "offers_note": "",
+      "offers_route": "",
+      "offers_title": "",
+      "play": "Songs",
+      "playlist": null,
+      "request_ids": [],
+      "shelves": [],
+      "show_album": false,
+      "show_cover": false,
+      "show_number": false,
+      "song_notes": [],
+      "songs": [],
+      "sort": 0,
+      "sorts": [],
+      "star": null,
+      "starred": false,
+      "stats": [],
+      "subtitle": "",
+      "subtitle_route": "",
+      "tail": [
+        {
+          "cards": [
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-new/front-250",
+              "id": "rg-new",
+              "kind": "Request",
+              "subtitle": "2024",
+              "title": "Newest"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-ost/front-250",
+              "id": "rg-ost",
+              "kind": "Request",
+              "subtitle": "2023",
+              "title": "A Film"
+            },
+            {
+              "cover": "al-lib-ik",
+              "id": "lib-ik",
+              "kind": "Album",
+              "subtitle": "2018 • In your library",
+              "title": "Iron Kite"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-sh6/front-250",
+              "id": "rg-sh6",
+              "kind": "Request",
+              "subtitle": "2016",
+              "title": "Saltwater Hours"
+            }
+          ],
+          "route": "",
+          "title": "Albums",
+          "wrap": true
+        },
+        {
+          "cards": [
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-ep/front-250",
+              "id": "rg-ep",
+              "kind": "Request",
+              "subtitle": "2017 • EP",
+              "title": "Small Hours"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-s/front-250",
+              "id": "rg-s",
+              "kind": "Request",
+              "subtitle": "Single",
+              "title": "Kite"
+            }
+          ],
+          "route": "",
+          "title": "Singles and EPs",
+          "wrap": true
+        }
+      ],
+      "tiles": [],
+      "title": "Marrow Lake",
+      "tracks_route": "",
+      "tracks_title": ""
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+[
+  [
+    "GET http://lidarr.test/api/v1/album/lookup?term=Mid%20Star "
+  ],
+  [
+    "GET http://lidarr.test/api/v1/artist/lookup?term=Mid%20Star ",
+    "POST https://api.listenbrainz.org/1/popularity/artist { \"artist_mbids\": [ \"mc4\" ] }",
+    "GET https://musicbrainz.org/ws/2/release-group?artist=mc4&type=album%7Cep%7Csingle&limit=100&offset=0&inc=artist-credits&fmt=json ",
+    "GET https://api.listenbrainz.org/1/popularity/top-recordings-for-artist/mc4 "
+  ]
+]
