@@ -41,7 +41,7 @@
 //! is asked again. (Only the numbers that looks, sessions and tickets had reached carry
 //! over, so that an answer still on its way to the last sign-in matches nothing in the next.)
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -180,17 +180,36 @@ pub enum Happened {
     FromRelay { session: u64, from: FromRelay },
     /// The songs the music server has, of those a command brought ([`Do::Find`]).
     Found { ticket: u64, songs: Vec<String> },
-    /// The phone's copy of the library changed, or was read for a new sign-in.
-    Library(Arc<Songs>),
+    /// The phone's copy of the library changed, or was read for a new sign-in. `account`
+    /// names the sign-in it was read under, as a tick names it: a copy read under a
+    /// sign-in that is no longer the one is dropped, so that a worker that was still
+    /// reading the last account's library cannot give it to the next.
+    Library { account: String, songs: Arc<Songs> },
 }
 
 impl Happened {
-    /// What it is to a call it arrives inside (`super::turn`).
-    fn kind(&self) -> Kind {
+    /// What it is to a call it arrives inside (`super::turn`). `account` is the sign-in
+    /// the linking is for now, if a tick has said: a tick that names another is the end of it.
+    fn kind(&self, account: Option<&str>) -> Kind {
         match self {
+            Happened::Event(Event::Stop) => Kind::End,
+            Happened::Event(Event::Tick { account: named, .. }) if account.is_some_and(|now| now != named.as_str()) => Kind::End,
             Happened::Event(Event::Changed { .. }) => Kind::Change,
             Happened::Event(Event::Press { .. } | Event::Add { .. } | Event::Play { .. } | Event::PlayHere | Event::LookingUp) => Kind::Question,
             _ => Kind::News,
+        }
+    }
+
+    /// About how large it is, for the bound on what is kept while a call is under way.
+    fn size(&self) -> usize {
+        let texts = |texts: &[String]| texts.iter().map(String::len).sum::<usize>();
+        64 + match self {
+            Happened::Event(Event::Add { ids, .. }) => texts(ids),
+            Happened::Event(Event::Play { ids, context, .. }) => texts(ids) + context.len(),
+            Happened::Event(_) | Happened::Looked { .. } | Happened::Library { .. } => 0,
+            Happened::FromRelay { from: FromRelay::Heard { places, frames }, .. } => texts(places) + frames.iter().map(|(from, frame)| from.len() + frame.len()).sum::<usize>(),
+            Happened::FromRelay { .. } => 0,
+            Happened::Found { songs, .. } => texts(songs),
         }
     }
 }
@@ -256,13 +275,23 @@ struct Held<'a> {
     turns: &'a Turns<Happened>,
     /// What went wrong on the app's side that does not fail what it belongs to: told.
     told: &'a mut Vec<String>,
+    /// The number the player last gave for its queue.
+    queue: Cell<u64>,
 }
 
 impl Held<'_> {
+    /// **The sign-in ended while this call was under way** (the app said so from inside
+    /// one of the calls up). The player may be another account's already: for what is left
+    /// of the call nothing more is asked of it and nothing is done to it. Every question
+    /// is answered as nothing, every act as not done.
+    fn over(&self) -> bool {
+        self.turns.ended()
+    }
+
     /// The queue is the phone's own from now. If the app could not record that, the
     /// command stands, and it is told.
     fn claim(&mut self) {
-        if !self.theirs.claim() {
+        if !self.over() && !self.theirs.claim() {
             self.told.push("queue: the phone's app could not record that its queue is its own from now".into());
         }
     }
@@ -270,19 +299,23 @@ impl Held<'_> {
 
 impl Player for Held<'_> {
     fn brief(&self) -> Brief {
-        self.theirs.brief()
+        if self.over() { Brief::default() } else { self.theirs.brief() }
     }
     fn full(&self) -> Full {
-        self.theirs.full()
+        if self.over() { Full::default() } else { self.theirs.full() }
     }
     fn handed(&self) -> Handed {
-        self.theirs.handed()
+        if self.over() { Handed::default() } else { self.theirs.handed() }
     }
     fn sounding(&self) -> Option<Sounding> {
-        self.theirs.sounding()
+        if self.over() { None } else { self.theirs.sounding() }
     }
+    /// (After the end, the number it last gave: nothing has been put in for this sign-in since.)
     fn queue(&self) -> u64 {
-        self.theirs.queue()
+        if !self.over() {
+            self.queue.set(self.theirs.queue());
+        }
+        self.queue.get()
     }
     /// (The phone says the next song has started as its player says so: there is no
     /// window here that lags the sound for this to bring up.)
@@ -290,10 +323,10 @@ impl Player for Held<'_> {
         false
     }
     fn has_song(&self) -> bool {
-        self.theirs.has_song()
+        !self.over() && self.theirs.has_song()
     }
     fn ahead(&self) -> Vec<String> {
-        self.theirs.ahead()
+        if self.over() { Vec::new() } else { self.theirs.ahead() }
     }
     /// The person chose it at another of their devices (but for the stop that ends a move,
     /// which is nobody's): the queue is theirs by it, if it changed what a saved queue
@@ -305,14 +338,17 @@ impl Player for Held<'_> {
     /// is kept from being replaced behind the person's back, at the price of a claim for
     /// a press that may have done nothing.
     fn carry_out(&mut self, command: &Command, ready: &Ready) -> Carried {
+        if self.over() {
+            return Carried::Unchanged;
+        }
         self.ways.begin(command.chosen_by(), true);
-        let before = self.theirs.queue();
+        let before = self.queue();
         let carried = {
             let _changing = self.turns.changing();
             self.theirs.carry_out(command, ready)
         };
         let changed = match command {
-            Command::Adopt(_) => self.theirs.queue() != before,
+            Command::Adopt(_) => self.queue() != before,
             _ => carried != Carried::Unchanged,
         };
         if changed && self.ways.touch(Who::Here, command.touches()).claim {
@@ -322,14 +358,19 @@ impl Player for Held<'_> {
         carried
     }
     fn handed_on(&mut self) -> bool {
-        self.theirs.handed_on()
+        !self.over() && self.theirs.handed_on()
     }
     fn handed_back(&mut self) {
-        self.theirs.handed_back();
+        if !self.over() {
+            self.theirs.handed_back();
+        }
     }
     /// (The end of a move of the phone's music to another device, or of one that did not
     /// start: the app's own doing, which claims nothing.)
     fn pause(&mut self) {
+        if self.over() {
+            return;
+        }
         if self.ways.touch(Who::Nobody, What::Playing).count {
             self.rule.moved();
         }
@@ -342,12 +383,15 @@ impl Player for Held<'_> {
     /// **Only a queue that went in is counted and claimed**: whether it did is asked of
     /// the player afterwards (its queue has a new number), whatever the call said.
     fn take(&mut self, songs: &[(String, bool)], begin: usize, position: f64, context: &str) -> bool {
-        let before = self.theirs.queue();
+        if self.over() {
+            return false;
+        }
+        let before = self.queue();
         let said = {
             let _changing = self.turns.changing();
             self.theirs.take(songs, begin, position, context)
         };
-        if self.theirs.queue() != before {
+        if self.queue() != before {
             let owed = self.ways.touch(Who::Here, What::Playing);
             if owed.count {
                 self.rule.moved();
@@ -403,6 +447,10 @@ pub struct Came {
     /// [`Do::Look`], [`Do::StopLook`], [`Do::Begin`], [`Do::Renew`], [`Do::End`],
     /// [`Do::Send`], [`Do::Find`], [`Do::Later`] and [`Do::Log`].
     pub native: Vec<Do>,
+    /// More arrived while this was decided than one call works through (a call hands over
+    /// what was waiting and a bounded number more: `super::turn`). The rest is first in
+    /// the next call: the app makes one now, with nothing new if it has nothing.
+    pub more: bool,
 }
 
 /// What a call was answered with.
@@ -413,12 +461,15 @@ pub enum Answer {
     Came(Came),
     /// The library is inside a call (this arrived from one of the app's listeners, while
     /// the player was being asked): kept, and decided when that call returns. What comes of
-    /// it is in that call's answer.
+    /// it is in that call's answer. **The end of a sign-in** that arrives so is applied
+    /// before anything else: from that moment the call in flight asks nothing more of the
+    /// player, what came of it is dropped, and whatever else was kept is dropped unread.
     Kept,
     /// The library is changing the player and this is that change, heard back: dropped.
     PartOfIt,
-    /// The library is inside a call and this needs its answer now: nothing was done. (A
-    /// press never comes from a player's listener. One that does is the app's mistake.)
+    /// The library is inside a call and this needs its answer now, or more is waiting
+    /// than is kept: nothing was done. (A press never comes from a player's listener. One
+    /// that does is the app's mistake.) The end of a sign-in is never refused.
     Refused,
 }
 
@@ -432,9 +483,10 @@ struct Inner {
     waits: Vec<(u64, u64, Waiting)>,
     tickets: u64,
     library: Arc<Songs>,
+    /// A copy of the library handed over before any tick had named the sign-in, and the
+    /// sign-in it was read under: put in place if the first tick names that one.
+    library_to_be: Option<(String, Arc<Songs>)>,
     me: Me,
-    /// The sign-in all of this belongs to, once a tick has said.
-    account: Option<String>,
 }
 
 /// The linking, for an app whose player and library are not in Rust. It belongs to the
@@ -442,16 +494,38 @@ struct Inner {
 pub struct Phone {
     turns: Turns<Happened>,
     inner: RefCell<Inner>,
+    /// The sign-in all of it belongs to, once a tick has said. (Beside the rest, so that
+    /// what arrives while a call is under way can be told from the end of the sign-in.)
+    account: RefCell<Option<String>>,
+}
+
+/// What a call brings with it.
+struct Call<'a> {
+    now_ms: u64,
+    today: u64,
+    random: &'a mut dyn FnMut(&mut [u8]) -> bool,
+    theirs: &'a mut dyn PhonePlayer,
+    turns: &'a Turns<Happened>,
+    account: &'a RefCell<Option<String>>,
 }
 
 impl Inner {
+    fn new(device: Device, me: Me, tickets: u64) -> Inner {
+        Inner { device, rule: Rule::default(), ways: Ways::default(), waits: Vec::new(), tickets, library: Arc::default(), library_to_be: None, me }
+    }
+
+    /// Everything, replaced: nothing of the sign-in that was is in it. (See
+    /// [`Device::succeed`] for the numbers that carry over, and why.)
+    fn afresh(&self) -> Inner {
+        Inner::new(self.device.succeed(), self.me.clone(), self.tickets)
+    }
+
     /// Hands the deciding something, with the player to ask, and sorts what it asks for.
-    #[allow(clippy::too_many_arguments)]
-    fn with(&mut self, now_ms: u64, today: u64, random: &mut dyn FnMut(&mut [u8]) -> bool, theirs: &mut dyn PhonePlayer, turns: &Turns<Happened>, came: &mut Came, act: impl FnOnce(&mut Device, &mut Env) -> Vec<Do>) {
+    fn with(&mut self, call: &mut Call, came: &mut Came, act: impl FnOnce(&mut Device, &mut Env) -> Vec<Do>) {
         let Inner { device, rule, ways, library, me, .. } = self;
         let mut told = Vec::new();
-        let mut player = Held { rule, ways, theirs, turns, told: &mut told };
-        let asked = act(device, &mut Env { now_ms, today, me, player: &mut player, library: &**library, random });
+        let mut player = Held { rule, ways, theirs: &mut *call.theirs, turns: call.turns, told: &mut told, queue: Cell::new(0) };
+        let asked = act(device, &mut Env { now_ms: call.now_ms, today: call.today, me, player: &mut player, library: &**library, random: &mut *call.random });
         came.native.extend(told.into_iter().map(Do::Log));
         for ask in asked {
             match ask {
@@ -464,10 +538,9 @@ impl Inner {
 
     /// Something was pressed that may be for a device being steered: asked of that device
     /// ([`Act::Handled`] says so), or the phone's own.
-    #[allow(clippy::too_many_arguments)]
-    fn pressed(&mut self, now_ms: u64, today: u64, random: &mut dyn FnMut(&mut [u8]) -> bool, theirs: &mut dyn PhonePlayer, turns: &Turns<Happened>, came: &mut Came, press: impl FnOnce(&mut Device, &mut Env) -> Option<Vec<Do>>) {
+    fn pressed(&mut self, call: &mut Call, came: &mut Came, press: impl FnOnce(&mut Device, &mut Env) -> Option<Vec<Do>>) {
         let mut by_another = false;
-        self.with(now_ms, today, random, theirs, turns, came, |device, env| {
+        self.with(call, came, |device, env| {
             let asked = press(device, env);
             by_another = asked.is_some();
             asked.unwrap_or_default()
@@ -477,41 +550,52 @@ impl Inner {
 
     /// The sign-in is over: what was under way under it is ended, and then **everything
     /// is replaced**. Nothing of the last sign-in's is asked again.
-    fn sign_in_over(&mut self, now_ms: u64, today: u64, random: &mut dyn FnMut(&mut [u8]) -> bool, theirs: &mut dyn PhonePlayer, turns: &Turns<Happened>, came: &mut Came) {
-        self.with(now_ms, today, random, theirs, turns, came, |device, env| device.stop(env));
-        *self = Inner { device: self.device.succeed(), rule: Rule::default(), ways: Ways::default(), waits: Vec::new(), tickets: self.tickets, library: Arc::default(), me: self.me.clone(), account: None };
+    fn sign_in_over(&mut self, call: &mut Call, came: &mut Came) {
+        self.with(call, came, |device, env| device.stop(env));
+        *self = self.afresh();
+        *call.account.borrow_mut() = None;
     }
 
     /// One thing that happened, decided.
-    #[allow(clippy::too_many_arguments)]
-    fn one(&mut self, what: Happened, now_ms: u64, today: u64, random: &mut dyn FnMut(&mut [u8]) -> bool, theirs: &mut dyn PhonePlayer, turns: &Turns<Happened>, came: &mut Came) {
+    fn one(&mut self, what: Happened, call: &mut Call, came: &mut Came) {
         let event = match what {
             Happened::Event(event) => event,
-            Happened::Looked { number, since_ms, looked, reset } => return self.with(now_ms, today, random, theirs, turns, came, |device, env| device.looked(number, since_ms, looked, reset, env)),
+            Happened::Looked { number, since_ms, looked, reset } => return self.with(call, came, |device, env| device.looked(number, since_ms, looked, reset, env)),
             Happened::FromRelay { session, from } => {
                 return match from {
                     FromRelay::Says(note) => self.device.said(session, note),
-                    FromRelay::NoRandom => self.with(now_ms, today, random, theirs, turns, came, |device, env| device.out_of_random(env)),
+                    FromRelay::NoRandom => self.with(call, came, |device, env| device.out_of_random(env)),
                     FromRelay::Entered { place, token } => self.device.entered(session, place, token),
-                    FromRelay::Heard { places, frames } => self.with(now_ms, today, random, theirs, turns, came, |device, env| device.heard(session, &places, &frames, env)),
+                    FromRelay::Heard { places, frames } => self.with(call, came, |device, env| device.heard(session, &places, &frames, env)),
                     FromRelay::Left => self.device.left(session),
                 };
             }
-            Happened::Found { ticket, songs } => return self.with(now_ms, today, random, theirs, turns, came, |device, env| device.found(ticket, songs, env)),
-            Happened::Library(songs) => {
-                self.library = songs;
-                return;
+            Happened::Found { ticket, songs } => return self.with(call, came, |device, env| device.found(ticket, songs, env)),
+            Happened::Library { account, songs } => {
+                let now = call.account.borrow().clone();
+                return match now {
+                    Some(now) if now == account => self.library = songs,
+                    // No tick has named the sign-in yet: kept for the one that does.
+                    None => self.library_to_be = Some((account, songs)),
+                    Some(_) => came.native.push(Do::Log("library: a copy read under a sign-in that is over, dropped".into())),
+                };
             }
         };
         match event {
             Event::Tick { account, wanted } => {
                 // Another account: the last one's is over before anything of this one's begins.
-                if self.account.as_ref().is_some_and(|was| *was != account) {
-                    self.sign_in_over(now_ms, today, &mut *random, &mut *theirs, turns, came);
+                let was = call.account.borrow().clone();
+                if was.is_some_and(|was| was != account) {
+                    self.sign_in_over(call, came);
                 }
-                self.account = Some(account.clone());
-                self.with(now_ms, today, random, theirs, turns, came, |device, env| device.tick(&account, wanted, env));
-                let (shown, logged) = self.device.shown(now_ms);
+                *call.account.borrow_mut() = Some(account.clone());
+                match self.library_to_be.take() {
+                    Some((read_under, songs)) if read_under == account => self.library = songs,
+                    Some(_) => came.native.push(Do::Log("library: a copy read under another sign-in, dropped".into())),
+                    None => {}
+                }
+                self.with(call, came, |device, env| device.tick(&account, wanted, env));
+                let (shown, logged) = self.device.shown(call.now_ms);
                 came.native.extend(logged);
                 came.acts.push(Act::Shown { shown });
             }
@@ -520,13 +604,14 @@ impl Inner {
                 if owed.count {
                     self.rule.moved();
                 }
-                if owed.claim && !theirs.claim() {
+                if owed.claim && !call.theirs.claim() {
                     came.native.push(Do::Log("queue: the phone's app could not record that its queue is its own from now".into()));
                 }
             }
             Event::LookingUp => {
                 // (One whose minute is up counts for nothing already, and one that was
                 // never said to be over is not kept for ever: the list has a bound.)
+                let now_ms = call.now_ms;
                 while let Some(at) = self.waits.iter().position(|(_, began, _)| now_ms.saturating_sub(*began) >= LOOK_UP_MS).or((self.waits.len() >= MOST_LOOK_UPS).then_some(0)) {
                     let (.., waiting) = self.waits.remove(at);
                     self.rule.done(waiting);
@@ -542,18 +627,18 @@ impl Inner {
                     self.rule.done(waiting);
                 }
             }
-            Event::Press { press } => self.pressed(now_ms, today, random, theirs, turns, came, |device, env| device.press(press, env)),
-            Event::Add { ids, next } => self.pressed(now_ms, today, random, theirs, turns, came, |device, env| device.add(&ids, next, env)),
-            Event::Play { ids, start, context } => self.pressed(now_ms, today, random, theirs, turns, came, |device, env| device.play(&ids, start, &context, env)),
-            Event::PlayHere => self.pressed(now_ms, today, random, theirs, turns, came, |device, env| device.play_here(env)),
-            Event::Choose { place, in_a_jam } => self.with(now_ms, today, random, theirs, turns, came, |device, env| device.choose(&place, in_a_jam, env)),
-            Event::Pause { place } => self.with(now_ms, today, random, theirs, turns, came, |device, env| device.pause(&place, env)),
-            Event::LetGo => self.with(now_ms, today, random, theirs, turns, came, |device, _| device.let_go()),
-            Event::Reset => self.with(now_ms, today, random, theirs, turns, came, |device, env| device.reset(env)),
-            Event::Setting { on } => self.with(now_ms, today, random, theirs, turns, came, |device, env| device.setting(on, env)),
+            Event::Press { press } => self.pressed(call, came, |device, env| device.press(press, env)),
+            Event::Add { ids, next } => self.pressed(call, came, |device, env| device.add(&ids, next, env)),
+            Event::Play { ids, start, context } => self.pressed(call, came, |device, env| device.play(&ids, start, &context, env)),
+            Event::PlayHere => self.pressed(call, came, |device, env| device.play_here(env)),
+            Event::Choose { place, in_a_jam } => self.with(call, came, |device, env| device.choose(&place, in_a_jam, env)),
+            Event::Pause { place } => self.with(call, came, |device, env| device.pause(&place, env)),
+            Event::LetGo => self.with(call, came, |device, _| device.let_go()),
+            Event::Reset => self.with(call, came, |device, env| device.reset(env)),
+            Event::Setting { on } => self.with(call, came, |device, env| device.setting(on, env)),
             Event::Named { name } => self.me.name = name,
-            Event::Stop => self.sign_in_over(now_ms, today, random, theirs, turns, came),
-            Event::Resume { ticket } => self.with(now_ms, today, random, theirs, turns, came, |device, env| device.resume(ticket, env)),
+            Event::Stop => self.sign_in_over(call, came),
+            Event::Resume { ticket } => self.with(call, came, |device, env| device.resume(ticket, env)),
         }
     }
 }
@@ -563,7 +648,7 @@ impl Phone {
     /// phone; `remembered` the devices seen before, as last kept ([`Do::Remember`]).
     pub fn new(device: DeviceId, name: &str, remembered: Vec<Seen>) -> Phone {
         let me = Me { device, name: name.to_string(), here: Here::Phone };
-        Phone { turns: Turns::default(), inner: RefCell::new(Inner { device: Device::new(remembered), rule: Rule::default(), ways: Ways::default(), waits: Vec::new(), tickets: 0, library: Arc::default(), me, account: None }) }
+        Phone { turns: Turns::default(), inner: RefCell::new(Inner::new(Device::new(remembered), me, 0)), account: RefCell::new(None) }
     }
 
     /// Something happened. Called on the thread the player lives on; `player` is asked
@@ -573,21 +658,70 @@ impl Phone {
     ///
     /// **It may be called from inside itself** (the player's listeners, told of a change
     /// while the player is being asked): see [`Answer`].
+    ///
+    /// **If anything inside it stops unexpectedly** (a panic: a fault of this library's),
+    /// it does not stay half-way: everything it held is replaced, as at a sign-out, with
+    /// one line said of it ([`Do::Log`]), and linking starts again from a look at the
+    /// next tick.
     pub fn happened(&self, what: Happened, now_ms: u64, today: u64, random: &mut dyn FnMut(&mut [u8]) -> bool, player: &mut dyn PhonePlayer) -> Answer {
-        let kind = what.kind();
-        let mut turn = match self.turns.enter(what, kind) {
+        let kind = what.kind(self.account.borrow().as_deref());
+        let size = what.size();
+        let turn = match self.turns.enter(what, kind, size) {
             Entered::Mine(turn) => turn,
             Entered::Kept => return Answer::Kept,
             Entered::PartOfIt => return Answer::PartOfIt,
             Entered::Refused => return Answer::Refused,
         };
-        // (The turn is this call's, so nothing else is inside.)
-        let Ok(mut inner) = self.inner.try_borrow_mut() else { return Answer::Refused };
-        let mut came = Came::default();
-        while let Some(what) = turn.next() {
-            inner.one(what, now_ms, today, &mut *random, &mut *player, &self.turns, &mut came);
+        let decided = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut turn = turn;
+            // (The turn is this call's, so nothing else is inside.)
+            let mut inner = self.inner.try_borrow_mut().ok()?;
+            let mut call = Call { now_ms, today, random, theirs: player, turns: &self.turns, account: &self.account };
+            let mut came = Came::default();
+            while let Some(what) = turn.next() {
+                let mut of_this = Came::default();
+                inner.one(what, &mut call, &mut of_this);
+                // The sign-in ended while this was being decided: what came of it is
+                // nobody's. (The end itself is next.)
+                if turn.overtaken() {
+                    came.native.push(Do::Log("the sign-in ended while something was being decided: what came of that is dropped".into()));
+                    continue;
+                }
+                came.acts.extend(of_this.acts);
+                came.native.extend(of_this.native);
+            }
+            came.more = turn.left() > 0;
+            Some(came)
+        }));
+        match decided {
+            Ok(Some(came)) => Answer::Came(came),
+            Ok(None) => Answer::Refused,
+            Err(stopped) => Answer::Came(self.start_again(stopped.as_ref())),
         }
-        Answer::Came(came)
+    }
+
+    /// Something inside the library stopped unexpectedly. Nothing is left as it was at
+    /// that moment: what was kept for later is dropped, the session and any look are
+    /// ended for the app's side, and everything of the sign-in is replaced.
+    fn start_again(&self, stopped: &(dyn std::any::Any + Send)) -> Came {
+        let said = stopped.downcast_ref::<&str>().map(|text| text.to_string()).or_else(|| stopped.downcast_ref::<String>().cloned()).unwrap_or_default();
+        self.turns.forget();
+        let mut came = Came::default();
+        if let Ok(mut account) = self.account.try_borrow_mut() {
+            *account = None;
+        }
+        if let Ok(mut inner) = self.inner.try_borrow_mut() {
+            if let Some(session) = inner.device.session_number() {
+                came.native.push(Do::End { session });
+            }
+            came.native.push(Do::StopLook);
+            if inner.device.steered().is_some() {
+                came.acts.push(Act::Do { ask: Do::Steering(None) });
+            }
+            *inner = inner.afresh();
+        }
+        came.native.push(Do::Log(format!("linking: it stopped unexpectedly ({}). Everything it held was let go of, and it starts again from a look.", super::text::cut(&said, 200))));
+        came
     }
 
     /// The same for an [`Event`] as JSON, giving the [`Act`]s as a JSON list and, apart,
@@ -719,6 +853,9 @@ mod tests {
         DoesNotStop,
         /// The app cannot record whose the queue is.
         CannotRecord,
+        /// Asked what it is playing, it brings the library itself down (as a fault of the
+        /// library's own would).
+        Panics,
     }
 
     impl<'p> Mock<'p> {
@@ -757,6 +894,9 @@ mod tests {
 
     impl PhonePlayer for Mock<'_> {
         fn brief(&self) -> Brief {
+            if self.wrong == Some(Wrong::Panics) {
+                panic!("the phone's player fell over");
+            }
             self.tell("brief");
             Brief { playing: self.sound.is_some(), title: self.songs.first().cloned().unwrap_or_default(), artist: String::new() }
         }
@@ -882,7 +1022,7 @@ mod tests {
         let Some(Do::Begin { session, .. }) = begun.native.iter().find(|ask| matches!(ask, Do::Begin { .. })).cloned() else { panic!("no session: {begun:?}") };
         let place = [5; 16];
         phone.happened(Happened::FromRelay { session, from: FromRelay::Entered { place, token: "a-token".into() } }, 1_200, 100, &mut random(n), &mut player);
-        phone.happened(Happened::Library(Songs::of(all)), 1_300, 100, &mut random(n), &mut player);
+        phone.happened(Happened::Library { account: "the account".into(), songs: Songs::of(all) }, 1_300, 100, &mut random(n), &mut player);
         (phone, player, session, place)
     }
 
@@ -1158,7 +1298,7 @@ mod tests {
                 let Some(Do::Begin { session, .. }) = begun.native.iter().find(|ask| matches!(ask, Do::Begin { .. })).cloned() else { panic!("no session") };
                 phone.happened(Happened::FromRelay { session, from: FromRelay::Entered { place: places[who], token: "a-token".into() } }, 1_000, 100, &mut random(&mut n), player);
                 let all = ["a0", "a1", "a2", "s0", "s1", "s2", "s3"].map(String::from);
-                phone.happened(Happened::Library(Songs::of(all)), 1_000, 100, &mut random(&mut n), player);
+                phone.happened(Happened::Library { account: "the account".into(), songs: Songs::of(all) }, 1_000, 100, &mut random(&mut n), player);
                 sessions[who] = session;
             }
             let mut pair = Pair { phones, players, sessions, places, acts: [Vec::new(), Vec::new()], now: 1_000, n };
@@ -1356,6 +1496,126 @@ mod tests {
         assert!(logged(&native, "could not record that its queue is its own"));
     }
 
+    /// The app says the sign-in is over from inside one of the library's own calls up (a
+    /// listener that heard the player change, and found the account gone). It has switched
+    /// the player already, or is about to: from that moment nothing more is asked of the
+    /// player for the old sign-in, nothing that was being decided is answered, and the
+    /// rest of what the relay handed over is not carried out on the next account's player.
+    #[test]
+    fn the_end_of_the_sign_in_arriving_inside_a_call_is_applied_at_once() {
+        for another_account in [false, true] {
+            let mut n = 0;
+            let (phone, player, session, place) = phone(&mut n);
+            let mut player: Mock = player;
+            let end = if another_account { Event::Tick { account: "somebody else".into(), wanted: true } } else { Event::Stop };
+            player.tells(&phone, "carry_out", vec![Happened::Event(end)]);
+            // Three commands in one hand-over; the first is being carried out when it ends.
+            let frames = vec![command(1, &place, Command::Pause, 1), command(2, &place, Command::Play, 2), command(3, &place, Command::Next, 3)];
+            let came = hear(&phone, &mut player, session, &place, frames, 2_000, &mut n);
+            assert_eq!(player.told(), ["kept"], "another account: {another_account}");
+            // Not the claim for the first, and nothing at all for the others.
+            assert_eq!(player.asked, ["pause"], "another account: {another_account}");
+            assert!(sends(&came.native) == 0 && came.native.contains(&Do::End { session }), "{came:?}");
+            assert!(logged(&came.native, "the sign-in ended while something was being decided"), "{came:?}");
+            assert_eq!(order(&phone, 2_000), (1, None, false));
+            // Where it was another account, that account's own look begins in the same call.
+            assert_eq!(came.native.iter().any(|ask| matches!(ask, Do::Look { .. })), another_account, "{came:?}");
+        }
+    }
+
+    /// The end of a sign-in is never refused and never waits behind what was kept: with
+    /// as much waiting as is kept at all, it is taken, and what was waiting is dropped.
+    #[test]
+    fn the_end_of_the_sign_in_is_not_refused_however_much_is_waiting() {
+        let mut n = 0;
+        let (phone, player, session, place) = phone(&mut n);
+        let mut player: Mock = player;
+        let mut told: Vec<Happened> = (0..300).map(|ticket| Happened::Event(Event::LookedUp { ticket })).collect();
+        told.push(Happened::Event(Event::Stop));
+        told.push(Happened::Event(Event::Changed { who: Who::Here, what: What::Playing }));
+        player.tells(&phone, "brief", told);
+        let came = hear(&phone, &mut player, session, &place, vec![from_pc(1, &place, Ask::Look(Want::Brief))], 2_000, &mut n);
+        let answers = player.told();
+        let count = |of: &str| answers.iter().filter(|answer| **answer == of).count();
+        assert_eq!((count("kept"), count("refused"), answers[300], answers[301]), (super::super::turn::MOST_KEPT + 2, 300 - super::super::turn::MOST_KEPT, "kept", "kept"));
+        assert!(came.native.contains(&Do::End { session }) && sends(&came.native) == 0, "{came:?}");
+        // (What was chosen on the phone after it was over is the next sign-in's first choice.)
+        assert_eq!((order(&phone, 2_000), player.asked.as_slice()), ((2, None, false), ["claim".to_string()].as_slice()));
+    }
+
+    /// A copy of the library is handed over with the sign-in it was read under, and is the
+    /// library only of that sign-in: a worker still reading the last account's library
+    /// cannot give it to the next.
+    #[test]
+    fn a_copy_of_the_library_belongs_to_the_sign_in_it_was_read_under() {
+        let mut n = 0;
+        let phone = Phone::new([9; 16], "Phone", Vec::new());
+        let mut player = Mock::with(ids(&[0, 1]), None);
+        let has = |phone: &Phone| phone.inner.borrow().library.0.len();
+        let copy = |account: &str, songs: usize| Happened::Library { account: account.into(), songs: Songs::of(ids(&(0..songs).collect::<Vec<_>>())) };
+        // Handed over before any tick has named the sign-in: kept, and put in place when
+        // a tick names that one.
+        phone.happened(copy("the account", 3), 1_000, 100, &mut random(&mut n), &mut player);
+        assert_eq!(has(&phone), 0);
+        phone.handle(TICK, 1_000, 100, &mut random(&mut n), &mut player);
+        assert_eq!(has(&phone), 3);
+        // Read under another sign-in: dropped, and said.
+        let dropped = came(phone.happened(copy("somebody else", 5), 1_100, 100, &mut random(&mut n), &mut player));
+        assert!(has(&phone) == 3 && logged(&dropped.native, "read under a sign-in that is over"));
+        // The sign-in ends, and a copy read under it arrives late: the next sign-in, which
+        // is another's, does not get it.
+        phone.handle(r#"{"event":"stop"}"#, 1_200, 100, &mut random(&mut n), &mut player);
+        phone.happened(copy("the account", 3), 1_300, 100, &mut random(&mut n), &mut player);
+        let (_, native) = phone.handle(r#"{"event":"tick","account":"somebody else","wanted":true}"#, 1_400, 100, &mut random(&mut n), &mut player).unwrap();
+        assert!(has(&phone) == 0 && logged(&native, "read under another sign-in"));
+        phone.happened(copy("somebody else", 5), 1_500, 100, &mut random(&mut n), &mut player);
+        assert_eq!(has(&phone), 5);
+    }
+
+    /// A fault inside the library does not leave it half-way through something: everything
+    /// it held is replaced, as at a sign-out, with one line said of it, and linking starts
+    /// again from a look.
+    #[test]
+    fn a_fault_inside_the_library_replaces_everything_and_linking_starts_again() {
+        let mut n = 0;
+        let (phone, mut player, session, place) = phone(&mut n);
+        phone.handle(CHANGED, 2_000, 100, &mut random(&mut n), &mut player);
+        phone.handle(r#"{"event":"looking_up"}"#, 2_000, 100, &mut random(&mut n), &mut player);
+        assert_eq!(order(&phone, 2_000), (2, None, true));
+        player.wrong = Some(Wrong::Panics);
+        let came = hear(&phone, &mut player, session, &place, vec![from_pc(1, &place, Ask::Look(Want::Brief))], 2_100, &mut n);
+        assert!(came.native.contains(&Do::End { session }) && came.native.contains(&Do::StopLook) && sends(&came.native) == 0, "{came:?}");
+        assert!(logged(&came.native, "linking: it stopped unexpectedly (the phone's player fell over). Everything it held was let go of"), "{came:?}");
+        assert_eq!(came.native.iter().filter(|ask| matches!(ask, Do::Log(_))).count(), 1);
+        player.wrong = None;
+        // Nothing is left of what it held, and it is not left thinking it is inside a call:
+        // the next thing that happens is decided, and linking starts again with a look.
+        assert_eq!(order(&phone, 2_200), (1, None, false));
+        let (acts, native) = phone.handle(TICK, 2_200, 100, &mut random(&mut n), &mut player).unwrap();
+        assert!(acts.contains(r#""act":"shown""#) && matches!(native.as_slice(), [Do::Look { number, .. }] if *number > FIRST_LOOK), "{acts} {native:?}");
+        // And what the old session's stay at the relay still brings is nobody's.
+        let came = hear(&phone, &mut player, session, &place, vec![command(2, &place, Command::Pause, 1)], 2_300, &mut n);
+        assert!(came.native.is_empty() && player.asked.iter().all(|asked| asked == "claim"), "{came:?} {:?}", player.asked);
+    }
+
+    /// A call works through what was waiting and a bounded number of what arrives while
+    /// it runs, and says when there is more: an app's callback that feeds it as fast as it
+    /// runs does not keep it running.
+    #[test]
+    fn a_call_says_when_more_arrived_than_it_works_through() {
+        use super::super::turn::MOST_MORE;
+        let mut n = 0;
+        let (phone, player, session, place) = phone(&mut n);
+        let mut player: Mock = player;
+        let told = (0..MOST_MORE + 6).map(|_| Happened::Event(Event::Changed { who: Who::Nobody, what: What::Playing })).collect();
+        player.tells(&phone, "brief", told);
+        let first = hear(&phone, &mut player, session, &place, vec![from_pc(1, &place, Ask::Look(Want::Brief))], 2_000, &mut n);
+        assert_eq!((first.more, order(&phone, 2_000).0), (true, 1 + MOST_MORE as u64));
+        // The rest is first in the next call, which then has nothing left over.
+        let next = came(phone.happened(Happened::Event(serde_json::from_str(TICK).unwrap()), 2_100, 100, &mut random(&mut n), &mut player));
+        assert_eq!((next.more, order(&phone, 2_100).0), (false, 1 + MOST_MORE as u64 + 6));
+    }
+
     /// What a frame costs the player's thread: opened, decided, answered. Not a test of
     /// anything: it prints. Run it as the phone's library is built (`native/Cargo.toml`
     /// there: for size, with everything in one unit):
@@ -1374,7 +1634,7 @@ mod tests {
         // A queue of five hundred songs in the player, and a library of fifty thousand.
         player.songs = (0..500).map(|n| format!("song-{n:05}-0123456789abcdef")).collect();
         let library: Vec<String> = (0..50_000).map(|n| format!("song-{n:05}-0123456789abcdef")).collect();
-        phone.happened(Happened::Library(Songs::of(library.clone())), 1_400, 100, &mut random(&mut n), &mut player);
+        phone.happened(Happened::Library { account: "the account".into(), songs: Songs::of(library.clone()) }, 1_400, 100, &mut random(&mut n), &mut player);
         let nonce = |at: usize| {
             let mut nonce = [0u8; 24];
             nonce[..8].copy_from_slice(&(at as u64 + 1_000).to_le_bytes());
@@ -1432,7 +1692,7 @@ mod tests {
         let ready: Vec<Arc<Songs>> = (0..20).map(|_| Songs::of(library.clone())).collect();
         let began = Instant::now();
         for songs in ready {
-            phone.happened(Happened::Library(songs), now, 100, &mut random(&mut n), &mut player);
+            phone.happened(Happened::Library { account: "the account".into(), songs }, now, 100, &mut random(&mut n), &mut player);
         }
         eprintln!("{:<58} {:>7.1} microseconds", "a library of fifty thousand songs put in place", began.elapsed().as_secs_f64() * 1e6 / 20.0);
     }

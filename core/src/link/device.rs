@@ -500,6 +500,12 @@ impl Device {
         self.session.as_mut().filter(|session| session.number == number && secret_holds(session.since_ms, now_ms))
     }
 
+    /// The number of the session there is, if there is one: what an app's stay at the
+    /// relay is told to end by ([`Do::End`]).
+    pub fn session_number(&self) -> Option<u64> {
+        self.session.as_ref().map(|session| session.number)
+    }
+
     /// Whether a session with this number is live now.
     pub fn is_live(&self, session: u64, now_ms: u64) -> bool {
         self.live(session, now_ms).is_some()

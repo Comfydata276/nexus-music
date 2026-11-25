@@ -37,6 +37,8 @@ pub use super::command::MOST_MESSAGE;
 const MAGIC: &[u8; 4] = b"NML4";
 const HEAD: usize = 4 + 1 + 24;
 const TAG: usize = 16;
+/// The longest a frame can be, as the text it travels as. Nothing longer is a frame.
+pub const MOST_FRAME_TEXT: usize = (HEAD + MOST_MESSAGE + TAG).div_ceil(3) * 4;
 
 fn most(kind: u8) -> Option<usize> {
     matches!(kind, ASK | TELL).then_some(MOST_MESSAGE)
@@ -109,7 +111,7 @@ pub struct Opened {
 /// dropped, and never answered.
 pub fn open(keys: &Keys, frame: &str, from: &Place, to: &Place) -> Option<Opened> {
     // Nothing longer than the longest frame there can be is even decoded.
-    if frame.len() > (HEAD + MOST_MESSAGE + TAG).div_ceil(3) * 4 {
+    if frame.len() > MOST_FRAME_TEXT {
         return None;
     }
     let bytes = text::from_base64(frame)?;

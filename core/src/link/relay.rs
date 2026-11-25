@@ -72,6 +72,14 @@ fn call(http: &dyn Http, relay: &Relay, method: Method, path: &str, token: &str,
     }
 }
 
+/// The most places taken from one answer of the relay's: this device's own, and one more
+/// than the fifteen others a device keeps (`super::device`), so that its own place being
+/// among them never costs it one of those.
+pub const MOST_PLACES: usize = 17;
+/// The most frames taken from one answer of the relay's. (A device answers twenty asks a
+/// second; what is over is the relay's to hand over again, or is lost with its sender told.)
+pub const MOST_FRAMES: usize = 64;
+
 /// Sends a sealed frame to a place. The relay's status, if it answered. Sent once:
 /// whatever comes of it, it is not sent again by itself.
 pub fn send(http: &dyn Http, relay: &Relay, room: &str, token: &str, to: &Place, frame: &str) -> Option<u16> {
@@ -146,14 +154,22 @@ pub fn keep_place(http: &dyn Http, relay: &Relay, room: &str, random: &mut dyn F
             match answer.ok().flatten() {
                 Some((200, heard)) => {
                     version = heard["v"].as_u64().unwrap_or(version);
-                    let places: Vec<String> = heard["places"].as_array().into_iter().flatten().filter_map(|place| place.as_str().map(str::to_string)).collect();
+                    // What the relay says is looked at before any of it is taken: only
+                    // what reads as a place, and no more places than a room is given
+                    // here; only frames from a place, no longer than a frame can be, and
+                    // no more of them than one hand-over is given.
+                    let places: Vec<String> = heard["places"].as_array().into_iter().flatten().filter_map(Value::as_str).filter(|place| text::read_place(place).is_some()).take(MOST_PLACES).map(str::to_string).collect();
                     let mut frames = Vec::new();
                     for frame in heard["frames"].as_array().into_iter().flatten() {
                         // One that was handed over before is sent again until it is said
                         // to have been dealt with: it is skipped.
                         let (Some(seq), Some(from), Some(sealed)) = (frame["seq"].as_u64(), frame["from"].as_str(), frame["frame"].as_str()) else { continue };
-                        if seq > after {
-                            after = seq;
+                        if seq <= after {
+                            continue;
+                        }
+                        // (Dealt with, whatever it is: it is not asked for again.)
+                        after = seq;
+                        if frames.len() < MOST_FRAMES && text::read_place(from).is_some() && !sealed.is_empty() && sealed.len() <= super::frame::MOST_FRAME_TEXT {
                             frames.push((from.to_string(), sealed.to_string()));
                         }
                     }
@@ -250,21 +266,53 @@ mod tests {
             n += 1;
             Some([n; 16])
         };
-        let heard = json!({"v": 7, "places": ["aaaa", "bbbb"], "frames": [{"seq": 1, "from": "bbbb", "frame": "one"}, {"seq": 2, "from": "bbbb", "frame": "two"}]});
+        let (a, b) = (text::place(&[0xa; 16]), text::place(&[0xb; 16]));
+        let heard = json!({"v": 7, "places": [a, b], "frames": [{"seq": 1, "from": b, "frame": "one"}, {"seq": 2, "from": b, "frame": "two"}]});
         // The relay sends frame 2 again with frame 3: it was not yet said to have been dealt with.
-        let again = json!({"v": 7, "places": ["aaaa", "bbbb"], "frames": [{"seq": 2, "from": "bbbb", "frame": "two"}, {"seq": 3, "from": "bbbb", "frame": "three"}, {"from": "bbbb", "frame": "no number"}]});
+        let again = json!({"v": 7, "places": [a, b], "frames": [{"seq": 2, "from": b, "frame": "two"}, {"seq": 3, "from": b, "frame": "three"}, {"from": b, "frame": "no number"}]});
         // (The last answer is one nothing is made of: the stay is told to stop as it arrives.)
         let (told, asked, waits, logged) = stay(vec![hello(), Some((200, json!({"token": "the-token", "v": 5, "places": []}))), Some((200, heard)), Some((200, again)), Some((503, json!({})))], &mut places);
         let place = text::place(&[1; 16]);
         assert_eq!(told[0], FromRelay::Entered { place: [1; 16], token: "the-token".into() });
-        assert_eq!(told[1], FromRelay::Heard { places: vec!["aaaa".into(), "bbbb".into()], frames: vec![("bbbb".into(), "one".into()), ("bbbb".into(), "two".into())] });
-        assert_eq!(told[2], FromRelay::Heard { places: vec!["aaaa".into(), "bbbb".into()], frames: vec![("bbbb".into(), "three".into())] });
+        assert_eq!(told[1], FromRelay::Heard { places: vec![a.clone(), b.clone()], frames: vec![(b.clone(), "one".into()), (b.clone(), "two".into())] });
+        assert_eq!(told[2], FromRelay::Heard { places: vec![a.clone(), b.clone()], frames: vec![(b.clone(), "three".into())] });
         assert_eq!(
             asked,
             ["GET api/hello []", "POST api/link/theroom/enter []", "GET api/link/theroom/poll?v=5&after=0 [the-token]", "GET api/link/theroom/poll?v=7&after=2 [the-token]", "GET api/link/theroom/poll?v=7&after=3 [the-token]", "POST api/link/theroom/leave [the-token]"]
         );
         assert_eq!((waits, logged), (vec![], vec![format!("room: entered as {place}")]));
         assert_eq!(format!("{:?}", relay()), "Relay(http://relay.example)");
+    }
+
+    /// Whatever the relay answers, only what could be a room and its frames is taken from
+    /// it, and no more than a room and a hand-over are given: nothing else is copied.
+    #[test]
+    fn what_the_relay_hands_over_is_checked_and_bounded_before_any_of_it_is_taken() {
+        let place = |n: usize| text::place(&[n as u8; 16]);
+        let mut places: Vec<Value> = vec![json!(7), json!("not a place"), json!(""), json!("x".repeat(1_000_000)), json!(null)];
+        places.extend((0..40).map(|n| json!(place(n))));
+        let mut frames = vec![
+            json!({"seq": 1, "from": "nobody", "frame": "from no place"}),
+            json!({"seq": 2, "from": place(1), "frame": ""}),
+            json!({"seq": 3, "from": place(1), "frame": "x".repeat(super::super::frame::MOST_FRAME_TEXT + 1)}),
+            json!({"seq": 4, "from": place(1), "frame": 7}),
+            json!({"seq": 5, "from": place(1), "frame": "x".repeat(super::super::frame::MOST_FRAME_TEXT)}),
+        ];
+        frames.extend((6..206).map(|seq| json!({"seq": seq, "from": place(2), "frame": "f"})));
+        let mut n = 0u8;
+        let mut places_given = || {
+            n += 1;
+            Some([n; 16])
+        };
+        let (told, asked, ..) = stay(vec![hello(), Some((200, json!({"token": "the-token", "v": 5}))), Some((200, json!({"v": 7, "places": places, "frames": frames}))), Some((503, json!({})))], &mut places_given);
+        let FromRelay::Heard { places, frames } = &told[1] else { panic!("{told:?}") };
+        assert_eq!((places.len(), places[0].as_str(), places.iter().all(|place| text::read_place(place).is_some())), (MOST_PLACES, place(0).as_str(), true));
+        assert_eq!((frames.len(), frames[0].1.len(), frames[1].clone()), (MOST_FRAMES, super::super::frame::MOST_FRAME_TEXT, (place(2), "f".to_string())));
+        // All of it counts as handed over: none of it is asked for again.
+        assert!(asked.iter().any(|asked| asked.starts_with("GET api/link/theroom/poll?v=7&after=205 ")), "{asked:?}");
+        // And an answer that is not of that shape at all gives an empty room, not an error.
+        let (told, ..) = stay(vec![hello(), Some((200, json!({"token": "the-token", "v": 5}))), Some((200, json!({"v": "x", "places": "all of them", "frames": {"seq": 1}}))), Some((503, json!({})))], &mut places_given);
+        assert_eq!(told[1], FromRelay::Heard { places: vec![], frames: vec![] });
     }
 
     #[test]
