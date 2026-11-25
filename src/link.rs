@@ -206,7 +206,10 @@ fn look(client: &Client, mut used: Option<String>) -> Looked {
         let Some(answer) = call("getPlaylist", &[("id", &id)]) else { return Looked::Failed };
         let playlist = &answer["playlist"];
         let said = |field: &str| playlist[field].as_str().map(str::to_string);
-        let fetched = Fetched { id: said("id").unwrap_or_default(), name: said("name").unwrap_or_default(), owner: said("owner"), public: playlist["public"].as_bool(), comment: said("comment") };
+        // Navidrome's JSON leaves `public` out when it is false, so that answer cannot state
+        // that the playlist is private. Its XML always says: that is asked for it.
+        let public = playlist["public"].as_bool().or_else(|| secret::stated_public(&client.link_call_xml(&agent, "getPlaylist", &[("id", &id)]).ok()?, &id));
+        let fetched = Fetched { id: said("id").unwrap_or_default(), name: said("name").unwrap_or_default(), owner: said("owner"), public, comment: said("comment") };
         match secret::judge(&id, replace, &fetched, client.username()) {
             Verdict::Use(secret) => return Looked::Secret { secret, id, wrote },
             Verdict::Stop(stop) => return Looked::Stopped(stop),

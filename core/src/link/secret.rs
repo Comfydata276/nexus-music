@@ -107,6 +107,56 @@ pub struct Fetched {
     pub comment: Option<String>,
 }
 
+/// Whether a playlist is public, as an XML answer to "fetch this playlist" states it.
+///
+/// Navidrome leaves `public` out of a JSON answer when it is false, as it does an empty
+/// comment, so a JSON answer cannot **state** that a playlist is private: it can only not
+/// say. Its XML answer always writes the attribute. So where the JSON does not say, the
+/// app asks again in XML and reads it here. `None` unless the answer is an "ok" one about
+/// the playlist with this id and says `public="true"` or `public="false"`.
+pub fn stated_public(xml: &str, id: &str) -> Option<bool> {
+    let ok = attributes(xml, "subsonic-response")?.into_iter().any(|(name, value)| name == "status" && value == "ok");
+    let playlist = attributes(xml, "playlist")?;
+    let said = |wanted: &str| playlist.iter().find(|(name, _)| *name == wanted).map(|(_, value)| *value);
+    if !ok || said("id") != Some(id) {
+        return None;
+    }
+    match said("public")? {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+/// The attributes of the first `<element ...>` in an XML text, as written (not unescaped:
+/// the ones read here are an id, "ok", and true or false). `None` if the tag is not there
+/// or is not well formed.
+fn attributes<'a>(xml: &'a str, element: &str) -> Option<Vec<(&'a str, &'a str)>> {
+    let open = format!("<{element}");
+    let mut from = 0;
+    let mut rest = loop {
+        let at = xml.get(from..)?.find(&open)? + from;
+        let after = xml.get(at + open.len()..)?;
+        // (Not an element whose name merely begins the same way.)
+        if after.starts_with(|c: char| c.is_whitespace() || c == '>' || c == '/') {
+            break after;
+        }
+        from = at + open.len();
+    };
+    let mut found = Vec::new();
+    loop {
+        rest = rest.trim_start();
+        if rest.starts_with('>') || rest.starts_with("/>") {
+            return Some(found);
+        }
+        let (name, after) = rest.split_once('=')?;
+        let quote = after.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+        let (value, after) = after.get(1..)?.split_once(quote)?;
+        found.push((name.trim(), value));
+        rest = after;
+    }
+}
+
 /// Why a look came to nothing.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Stop {
@@ -280,6 +330,31 @@ mod tests {
         assert_eq!(judge("k", false, &Fetched { public: None, ..fetched("k", Some(COMMENT)) }, "tester"), Verdict::Stop(Stop::NotStated));
         // One that others could see is given a new secret, whatever it holds.
         assert_eq!(judge("k", false, &Fetched { public: Some(true), ..fetched("k", Some(COMMENT)) }, "tester"), Verdict::Write(Why::Public));
+    }
+
+    #[test]
+    fn whether_a_playlist_is_public_is_read_where_the_server_always_says() {
+        // As Navidrome answers, private and public.
+        let answer = |public: &str| format!(r#"<subsonic-response xmlns="http://subsonic.org/restapi" status="ok" version="1.16.1" type="navidrome" serverVersion="0.58.0" openSubsonic="true"><playlist id="7K5dLzMvMcCEj4us2t4RO0" name="Nexus Music link" comment="{{&#34;nexus_music_link&#34;:1,&#34;secret&#34;:&#34;x&#34;}}" songCount="0" duration="0" public="{public}" owner="tester" created="2026-11-25T07:05:11Z" changed="2026-11-25T07:05:11Z"></playlist></subsonic-response>"#);
+        assert_eq!(stated_public(&answer("false"), "7K5dLzMvMcCEj4us2t4RO0"), Some(false));
+        assert_eq!(stated_public(&answer("true"), "7K5dLzMvMcCEj4us2t4RO0"), Some(true));
+        // About another playlist, or not saying, or saying something else, it states nothing.
+        assert_eq!(stated_public(&answer("false"), "another"), None);
+        assert_eq!(stated_public(&answer("false").replace(r#" public="false""#, ""), "7K5dLzMvMcCEj4us2t4RO0"), None);
+        assert_eq!(stated_public(&answer("no"), "7K5dLzMvMcCEj4us2t4RO0"), None);
+        // An answer that is an error is not one about the playlist, whatever it contains.
+        assert_eq!(stated_public(&answer("false").replace(r#"status="ok""#, r#"status="failed""#), "7K5dLzMvMcCEj4us2t4RO0"), None);
+        assert_eq!(stated_public(r#"<subsonic-response status="failed"><error code="70" message="playlist not found"/></subsonic-response>"#, "k"), None);
+        // What a comment or a name says is inside its own quotes and is not an attribute.
+        let sly = r#"<subsonic-response status="ok"><playlist id="k" name="x public=&quot;false&quot;" comment=' public="false" > ' owner="tester"/></subsonic-response>"#;
+        assert_eq!(stated_public(sly, "k"), None);
+        assert_eq!(stated_public(r#"<subsonic-response status="ok"><playlist id='k' public='true'/></subsonic-response>"#, "k"), Some(true));
+        // The element is the playlist, not one whose name begins the same way.
+        assert_eq!(stated_public(r#"<subsonic-response status="ok"><playlists><playlist id="k" public="false"/></playlists></subsonic-response>"#, "k"), Some(false));
+        // Cut short or not XML at all, it states nothing and does not trip anything up.
+        for broken in ["", "<playlist", "<playlist id=", r#"<playlist id="k"#, r#"<subsonic-response status="ok"><playlist id="k" public="false""#, "{\"playlist\":{}}", "<playlist é=\"é\">"] {
+            assert_eq!(stated_public(broken, "k"), None, "{broken}");
+        }
     }
 
     #[test]
