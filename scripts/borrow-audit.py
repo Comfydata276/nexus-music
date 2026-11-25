@@ -36,6 +36,21 @@ Its two limits:
      seen: such code has to be read.
   2. In shape C it reads a statement of at most twelve lines. A longer one is not seen.
 
+And three shapes of the same fault that it does not look for at all (the review of
+0.40.10 found none of them in the app; they are known, accepted, and to be read for):
+
+  3. A borrow held while a closure made in the same function is called there and then
+     (`let apply = || self.settings.borrow_mut()...; apply()`): the closure's body is
+     read as something that runs later.
+  4. A borrow that a helper hands back (`fn settings(&self) -> Ref<Settings>`): the
+     caller holds the cell and no `borrow()` is written where it does.
+  5. The cell borrowed again directly, not through a method, inside the statement that
+     holds it: `for x in self.cell.borrow().iter() { self.cell.borrow_mut()... }`. Only
+     calls are followed from a held borrow.
+
+So too anything the window calls back into at once, from inside a call that holds a
+borrow: a callback is taken to run later, which is what callbacks here do.
+
 It reads the source as text, so it is quick and needs no build; and for the same reason
 it can be wrong. Where it reports something that is not a fault, change the code so that
 the borrow ends before the call (read the value into a `let` of its own) rather than
