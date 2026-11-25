@@ -342,7 +342,9 @@ pub struct Controller {
     /// Something to say once the window is up (the settings file was damaged, say).
     startup_note: RefCell<Option<String>>,
     /// What another device was playing more recently than anything was done here.
-    pub elsewhere: RefCell<Option<crate::subsonic::PlayQueue>>,
+    /// What another device has been playing, on offer as "Continue here", with the server's
+    /// clock beside this PC's as the read that found it measured it.
+    pub elsewhere: RefCell<Option<(crate::subsonic::PlayQueue, nexus_core::time::Clock)>>,
     /// Songs that have been played, newest first, including the one playing now.
     pub history: RefCell<Vec<config::Played>>,
     /// Every play and when, for "Your stats".
@@ -428,11 +430,22 @@ pub struct Controller {
     pub sync_again: Cell<bool>,
     /// The server's clock minus this PC's, as the last exchange measured it; and what is
     /// said under the setting when this PC isn't sharing as it should (see `sync`).
-    pub clock_offset: Cell<Option<i64>>,
+    pub clock: Cell<nexus_core::time::Clock>,
     pub sync_note: RefCell<String>,
-    /// The queue is one taken up from another device, with nothing done to it here since;
-    /// a save of the queue is on its way; and another has been asked for meanwhile.
-    pub queue_taken_up: Cell<bool>,
+    /// Which sign-in, with sharing on, is current: a number that moves on at every sign-in
+    /// and sign-out and whenever sharing is switched off. Whatever was asked of the server
+    /// under an earlier number is dropped when it arrives, and a worker about to send
+    /// looks at it once more.
+    pub session: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Songs in other devices' Recently played that the server said it doesn't have, so
+    /// they aren't asked for again this run.
+    pub history_missing: RefCell<std::collections::HashSet<String>>,
+    /// Set while the queue is one taken up from another device, with nothing done to it
+    /// here since (when that device saved it; kept with the queue's place between runs); a
+    /// number that moves on at every change made to the queue here; a save of the queue is
+    /// on its way; and another has been asked for meanwhile.
+    pub queue_taken: RefCell<Option<String>>,
+    pub queue_revision: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub queue_saving: Cell<bool>,
     pub queue_again: Cell<bool>,
     /// When the queue last changed here (or, for one taken from another device, there), and
@@ -583,9 +596,12 @@ impl Controller {
             queue_timer: slint::Timer::default(),
             sync_busy: Cell::new(false),
             sync_again: Cell::new(false),
-            clock_offset: Cell::new(None),
+            clock: Cell::new(nexus_core::time::Clock::Unmeasured),
             sync_note: RefCell::default(),
-            queue_taken_up: Cell::new(false),
+            session: Default::default(),
+            history_missing: RefCell::default(),
+            queue_taken: RefCell::default(),
+            queue_revision: Default::default(),
             queue_saving: Cell::new(false),
             queue_again: Cell::new(false),
             queue_stamp: Cell::new(0),
@@ -3228,17 +3244,43 @@ impl Controller {
         }
     }
 
-    /// Remembers the order the list on screen is shown in, for the next visit.
-    fn remember_track_sort(&self) {
-        if !self.is_own_list(&self.page.borrow()) {
+    /// Shows the list on screen in this order, and remembers it for the next visit. The
+    /// choice is saved first, and the list is drawn from it only once it has been: a sort
+    /// that couldn't be saved leaves the list as it was, not in an order the settings
+    /// don't have.
+    fn sort_tracks(&self, sort: usize, descending: bool) {
+        let key = self.track_view.borrow().key.clone();
+        let own = self.is_own_list(&self.page.borrow());
+        if own && !key.is_empty() && !self.choose(nexus_core::step::Change::Sort { key, sort, descending }) {
             return;
         }
-        let (key, sort, descending) = {
+        {
+            let mut state = self.track_view.borrow_mut();
+            state.sort = sort;
+            state.descending = descending;
+        }
+        self.rebuild_tracks();
+    }
+
+    /// The choices for the list that is open have changed without the person choosing here
+    /// (another device's sort has arrived): the list is drawn again in the order it now has.
+    pub fn resort_page(&self) {
+        let key = self.track_view.borrow().key.clone();
+        if key.is_empty() || !self.is_own_list(&self.page.borrow()) {
+            return;
+        }
+        let (sort, descending) = self.list_sort(&key);
+        let same = {
             let state = self.track_view.borrow();
-            (state.key.clone(), state.sort, state.descending)
+            (state.sort, state.descending) == (sort, descending)
         };
-        if !key.is_empty() {
-            self.choose(nexus_core::step::Change::Sort { key, sort, descending });
+        if !same {
+            {
+                let mut state = self.track_view.borrow_mut();
+                state.sort = sort;
+                state.descending = descending;
+            }
+            self.rebuild_tracks();
         }
     }
 
@@ -3265,18 +3307,16 @@ impl Controller {
 
     /// Picking the order already in use flips its direction.
     pub fn set_track_sort(&self, sort: usize) {
-        {
-            let mut state = self.track_view.borrow_mut();
-            let sort = sort.min(TRACK_SORTS.len() - 1);
-            state.descending = match (sort, state.sort == sort) {
+        let sort = sort.min(TRACK_SORTS.len() - 1);
+        let descending = {
+            let state = self.track_view.borrow();
+            match (sort, state.sort == sort) {
                 (0, _) => false,
                 (_, true) => !state.descending,
                 (_, false) => TrackView::starts_descending(sort),
-            };
-            state.sort = sort;
-        }
-        self.remember_track_sort();
-        self.rebuild_tracks();
+            }
+        };
+        self.sort_tracks(sort, descending);
     }
 
     /// A column heading was clicked: sort by it, then the other way, then back to the
@@ -3285,21 +3325,18 @@ impl Controller {
         if column == 0 || column >= TRACK_SORTS.len() {
             return;
         }
-        {
-            let mut state = self.track_view.borrow_mut();
+        let (sort, descending) = {
+            let state = self.track_view.borrow();
             let first = TrackView::starts_descending(column);
             if state.sort != column {
-                state.sort = column;
-                state.descending = first;
+                (column, first)
             } else if state.descending == first {
-                state.descending = !first;
+                (column, !first)
             } else {
-                state.sort = 0;
-                state.descending = false;
+                (0, false)
             }
-        }
-        self.remember_track_sort();
-        self.rebuild_tracks();
+        };
+        self.sort_tracks(sort, descending);
     }
 
     /// Moves a playlist's song from one row to another and saves the new order.
@@ -4146,9 +4183,7 @@ impl Controller {
         settings.on_set_sync(|on| {
             with(|ctl| {
                 ctl.change_setting(true, |s| s.sync = on);
-                if on {
-                    ctl.look_elsewhere();
-                }
+                ctl.sync_switched(on);
             });
         });
         settings.on_set_check_updates(|on| {

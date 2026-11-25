@@ -644,10 +644,12 @@ impl Client {
         self.call_as::<serde_json::Value>(device, "savePlayQueue", &params, None, API_TIMEOUT).map(drop)
     }
 
-    /// The play queue last saved on the server; empty if there isn't one.
-    pub fn play_queue(&self) -> ApiResult<PlayQueue> {
-        self.call("getPlayQueue", &[], Some("playQueue"))
+    /// The play queue last saved on the server (empty if there isn't one), with the server's
+    /// clock as this answer gives it: the time a saved queue changed is the server's, and is compared with this PC's.
+    pub fn play_queue_timed(&self) -> ApiResult<Timed<PlayQueue>> {
+        self.call_timed(CLIENT_NAME, "getPlayQueue", &[], Some("playQueue"), API_TIMEOUT)
     }
+
 
     pub fn rename_playlist(&self, id: &str, name: &str) -> ApiResult<()> {
         self.call::<serde_json::Value>("updatePlaylist", &[("playlistId", id), ("name", name)], None)

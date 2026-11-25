@@ -203,9 +203,6 @@ pub struct Settings {
     /// 1 once `choices` has been filled in. A file from a version that stamped whole values
     /// has none: its choices are then agreed, at the times they have (see `arrange`).
     pub in_step: u8,
-    /// The version that last kept the shared record's text aside before writing to it (see
-    /// `sync`): each version does so once, before the first write it makes.
-    pub record_kept_by: String,
     /// Offline mode: don't contact the server; play downloads only.
     pub offline: bool,
     /// Keep the title bar Windows draws, instead of the app's own.
@@ -275,7 +272,6 @@ impl Default for Settings {
             theme_at: 0,
             choices: Default::default(),
             in_step: 0,
-            record_kept_by: String::new(),
             offline: false,
             standard_title_bar: false,
             theme: THEMES[0].name.to_string(),
@@ -421,10 +417,17 @@ impl Settings {
         self.show();
     }
 
+    /// The app's name for the sign-in these settings hold (the server and the user), as it
+    /// can be part of a file's name. A change the person makes is made under it, and is
+    /// only ever shared for it (see `nexus_core::step`).
+    pub fn account(&self) -> String {
+        format!("{}|{}", self.server, self.username).chars().take(80).map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).collect()
+    }
+
     /// Brings what is shown up to date with `choices`: what was agreed with the server,
-    /// with the changes made here on top.
+    /// with the changes made here, under this sign-in, on top.
     pub fn show(&mut self) {
-        let shown = self.choices.shown();
+        let shown = self.choices.shown(&self.account());
         self.pinned_playlists = shown.pins;
         self.lists = shown.lists;
         // (A theme this version doesn't have, chosen on a device that does, is left to it.)
@@ -547,6 +550,10 @@ pub struct QueuePlace {
     pub cursor: usize,
     pub position: f64,
     pub stamp: i64,
+    /// Set while the queue is one taken up from another device with nothing done to it here
+    /// since: when that device saved it, as the server said (see `nexus_core::handover`).
+    /// Kept so that a restart doesn't make the queue this PC's own.
+    pub taken: Option<String>,
 }
 
 impl QueuePlace {
@@ -807,7 +814,8 @@ mod tests {
         assert!(settings.choices.waiting.is_empty() && settings.in_step == 1);
         // A change made now is kept as the change, puts no time on anything, and is on the
         // disk before it is shown.
-        assert!(settings.choices.change(Change::Pin("p3".into())));
+        assert!(settings.choices.change(&settings.account(), Change::Pin("p3".into())));
+        assert_eq!(settings.account(), "https___music_example_org_");
         settings.show();
         assert!(settings.save_surely(&path));
         let (again, _) = Settings::load_checked(&path);

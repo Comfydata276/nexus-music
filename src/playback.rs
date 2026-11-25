@@ -1896,8 +1896,9 @@ impl Controller {
         // Note when the queue last really changed, and pass the change on to other devices.
         let fingerprint = queue_fingerprint(&pb);
         if self.queue_sig.replace(fingerprint) != fingerprint && !self.queue_quiet.get() {
-            // (On the server's clock, which the time of another device's save is on.)
-            self.queue_stamp.set(self.server_now());
+            // (By this PC's own clock. It is set beside the server's when it is compared
+            // with the time of another device's save: see `nexus_core::handover`.)
+            self.queue_stamp.set(chrono::Utc::now().timestamp());
             self.queue_changed_here();
         }
         if pb.queue.is_empty() {
@@ -1929,7 +1930,7 @@ impl Controller {
             };
             self.saver.write(self.paths.queue.clone(), move || serde_json::to_vec(&saved).ok());
         }
-        let place = crate::config::QueuePlace { shape, cursor: pb.cursor, position: pb.position, stamp };
+        let place = crate::config::QueuePlace { shape, cursor: pb.cursor, position: pb.position, stamp, taken: self.queue_taken.borrow().clone() };
         self.saver.write(self.paths.queue_place.clone(), move || serde_json::to_vec(&place).ok());
     }
 
@@ -1946,6 +1947,8 @@ impl Controller {
             saved.cursor = place.cursor;
             saved.position = place.position;
             saved.stamp = saved.stamp.max(place.stamp);
+            // A queue taken up from another device is still that device's after a restart.
+            *self.queue_taken.borrow_mut() = place.taken;
         }
         self.queue_saved.set(shape);
         {
