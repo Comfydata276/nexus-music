@@ -147,6 +147,18 @@ pub const NEEDED: &str = "Lidarr is behind a sign-in. In Settings, under Request
 
 use crate::offer::{Offer, VARIOUS};
 
+/// Where the way back from a change to Lidarr is written down **before the change is made**,
+/// and crossed off once it has been put back: an artist's "new releases" setting, turned off
+/// while their singles are read in. The batch of albums keeps it in its file
+/// (`bulk::Job`), so that a run stopped before putting it back has it put back by the next.
+pub trait WayBack {
+    /// Writes down that `artist`'s setting is to go back to `before`, and says whether it is on
+    /// the disk. If it isn't, the answer is why, and Lidarr isn't changed.
+    fn keep(&self, artist: i64, before: &str) -> Result<(), String>;
+    /// `artist`'s setting has gone back to `before`.
+    fn put_back(&self, artist: i64, before: &str);
+}
+
 /// The name of the profile this app makes in Lidarr for artists a single or an EP is asked
 /// of. Lidarr only knows the kinds of release an artist's profile lists.
 const SINGLES_PROFILE: &str = "Albums, EPs and singles";
@@ -658,11 +670,11 @@ impl Lidarr {
     /// left not taking new releases, would be worse than no request. So a stop is honoured only
     /// before the first change; just before it, the app is told to see this through
     /// (`Http::keep_going`).
-    pub fn request(&self, wanted: &Offer) -> Result<(), String> {
-        self.seeing_through().requesting(wanted)
+    pub fn request(&self, wanted: &Offer, way_back: &dyn WayBack) -> Result<(), String> {
+        self.seeing_through().requesting(wanted, way_back)
     }
 
-    fn requesting(&self, wanted: &Offer) -> Result<(), String> {
+    fn requesting(&self, wanted: &Offer, way_back: &dyn WayBack) -> Result<(), String> {
         if wanted.artist_id == VARIOUS {
             return self.request_from_various(wanted);
         }
@@ -676,7 +688,7 @@ impl Lidarr {
         let artist = match known {
             Some(artist) => {
                 if !plain {
-                    put_back = self.list_singles(artist, wanted)?;
+                    put_back = self.list_singles(artist, wanted, way_back)?;
                 }
                 artist
             }
@@ -712,6 +724,9 @@ impl Lidarr {
         match put_back {
             Some(before) => {
                 let restored = self.restore_new_releases(artist, &before);
+                if restored.is_ok() {
+                    way_back.put_back(artist, &before);
+                }
                 outcome.and(restored.map_err(|_| {
                     format!("Asked for “{}”, but couldn't turn new releases back on for {} in Lidarr. Check that artist's settings there.", wanted.title, wanted.artist)
                 }))
@@ -786,8 +801,8 @@ impl Lidarr {
     /// Left as it was, Lidarr would take every single and EP it now learns of to be a new
     /// release and fetch the lot. With the setting off while it reads them in, they're
     /// listed and nothing more; turning it back on afterwards doesn't change that.
-    fn list_singles(&self, artist: i64, wanted: &Offer) -> Result<Option<String>, String> {
-        let before = self.start_listing_singles(artist, wanted)?;
+    fn list_singles(&self, artist: i64, wanted: &Offer, way_back: &dyn WayBack) -> Result<Option<String>, String> {
+        let before = self.start_listing_singles_kept(artist, wanted, |before| way_back.keep(artist, before))?;
         if before.is_some() {
             // Lidarr starts reading the artist's releases in again; give it a moment to begin.
             // A wait cut short ends here, but the setting is still handed back to be put back.
@@ -796,14 +811,10 @@ impl Lidarr {
         Ok(before)
     }
 
-    /// The same, without waiting for Lidarr to begin: for a caller that watches for it to
-    /// finish (see `busy_with`) and puts the setting back itself (see `set_new_releases`).
-    pub fn start_listing_singles(&self, artist: i64, wanted: &Offer) -> Result<Option<String>, String> {
-        self.start_listing_singles_kept(artist, wanted, |_| Ok(()))
-    }
-
-    /// The same, handing `keep` what the setting is to be put back to **before Lidarr is
-    /// changed**: if `keep` can't keep it, Lidarr isn't changed, and its answer is the error.
+    /// The same, without waiting for Lidarr to begin, for a caller that watches for it to
+    /// finish (see `busy_with`) and puts the setting back itself (see `set_new_releases`);
+    /// handing `keep` what the setting is to be put back to **before Lidarr is changed**: if
+    /// `keep` can't keep it, Lidarr isn't changed, and its answer is the error.
     pub fn start_listing_singles_kept(&self, artist: i64, wanted: &Offer, keep: impl FnOnce(&str) -> Result<(), String>) -> Result<Option<String>, String> {
         let profiles: Vec<serde_json::Value> = self.get("metadataprofile")?;
         let mut record: serde_json::Value = self.get(&format!("artist/{artist}"))?;
@@ -1068,7 +1079,7 @@ impl Lidarr {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -1219,8 +1230,8 @@ mod tests {
     /// A Lidarr that keeps one artist, on the Standard profile with new releases wanted, and
     /// is forever busy reading artists in; asked over an app that has been told to stop, so
     /// that every wait is cut short. Every request is written down.
-    struct Stopping {
-        asked: std::sync::Mutex<Vec<String>>,
+    pub(crate) struct Stopping {
+        pub(crate) asked: std::sync::Mutex<Vec<String>>,
     }
 
     impl crate::http::Http for Stopping {
@@ -1264,11 +1275,81 @@ mod tests {
         let http = Arc::new(Stopping { asked: Default::default() });
         let lidarr = Lidarr::new("lidarr.test", "key", None, http.clone());
         let single = Offer { album: "al1".into(), artist_id: "ar1".into(), title: "A Single".into(), artist: "Someone".into(), kind: "Single".into(), ..Default::default() };
-        assert_eq!(lidarr.request(&single), Err(STOPPED.to_string()));
+        let noted = Noted::default();
+        assert_eq!(lidarr.request(&single, &noted), Err(STOPPED.to_string()));
         let puts: Vec<String> = http.asked.lock().unwrap().iter().filter(|asked| asked.starts_with("PUT artist/5")).cloned().collect();
         assert_eq!(puts.len(), 2, "{puts:?}");
         assert!(puts[0].contains(r#""monitorNewItems":"none""#) && puts[0].contains(r#""metadataProfileId":2"#), "{}", puts[0]);
         assert!(puts[1].contains(r#""monitorNewItems":"all""#), "{}", puts[1]);
+        // Written down before the change, and crossed off once it was put back.
+        assert_eq!((noted.kept(), noted.put_back.lock().unwrap().clone()), (vec![(5, "all".to_string())], vec![(5, "all".to_string())]));
+    }
+
+    /// Writes the way back down in memory; or, `refuse`, can't.
+    #[derive(Default)]
+    pub(crate) struct Noted {
+        kept: std::sync::Mutex<Vec<(i64, String)>>,
+        put_back: std::sync::Mutex<Vec<(i64, String)>>,
+        refuse: bool,
+    }
+
+    impl Noted {
+        pub(crate) fn kept(&self) -> Vec<(i64, String)> {
+            self.kept.lock().unwrap().clone()
+        }
+    }
+
+    impl WayBack for Noted {
+        fn keep(&self, artist: i64, before: &str) -> Result<(), String> {
+            if self.refuse {
+                return Err("couldn't be written down".into());
+            }
+            self.kept.lock().unwrap().push((artist, before.to_string()));
+            Ok(())
+        }
+
+        fn put_back(&self, artist: i64, before: &str) {
+            self.put_back.lock().unwrap().push((artist, before.to_string()));
+        }
+    }
+
+    /// The same Lidarr, and the app killed the moment Lidarr has been changed in a way that
+    /// has to be put back.
+    pub(crate) struct KilledAfterChange(pub(crate) Stopping);
+
+    impl crate::http::Http for KilledAfterChange {
+        fn send(&self, request: &crate::http::Request) -> Result<crate::http::Response, crate::http::Failure> {
+            let answer = self.0.send(request);
+            if self.0.asked.lock().unwrap().last().is_some_and(|asked| asked.starts_with("PUT artist/5") && asked.contains(r#""monitorNewItems":"none""#)) {
+                panic!("killed");
+            }
+            answer
+        }
+
+        fn pause(&self, wait: Duration) -> Result<(), crate::http::Failure> {
+            self.0.pause(wait)
+        }
+    }
+
+    pub(crate) fn single() -> Offer {
+        Offer { album: "al1".into(), artist_id: "ar1".into(), title: "A Single".into(), artist: "Someone".into(), kind: "Single".into(), ..Default::default() }
+    }
+
+    #[test]
+    fn a_change_to_lidarr_that_has_to_be_put_back_is_written_down_first() {
+        // Killed the moment the setting was turned off: what it goes back to was written down
+        // before, so the next run puts it back.
+        let lidarr = Lidarr::new("lidarr.test", "key", None, Arc::new(KilledAfterChange(Stopping { asked: Default::default() })));
+        let noted = Noted::default();
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lidarr.request(&single(), &noted))).is_err());
+        assert_eq!(noted.kept(), [(5, "all".to_string())]);
+        // It can't be written down: Lidarr isn't changed, and the request says why.
+        let http = Arc::new(Stopping { asked: Default::default() });
+        let lidarr = Lidarr::new("lidarr.test", "key", None, http.clone());
+        let refusing = Noted { refuse: true, ..Default::default() };
+        let done = lidarr.request(&single(), &refusing);
+        assert!(done.as_ref().is_err_and(|reason| reason.contains("couldn't be written down")), "{done:?}");
+        assert!(!http.asked.lock().unwrap().iter().any(|asked| asked.starts_with("PUT artist/5")), "Lidarr was changed");
     }
 
     /// A Lidarr that keeps one artist, with the album wanted listed, and an app that stops
@@ -1333,7 +1414,7 @@ mod tests {
         let http = Arc::new(Phone::new(stop_at));
         let lidarr = Lidarr::new("http://lidarr.test", "key", None, http.clone());
         let wanted = Offer { album: "al1".into(), artist_id: "ar1".into(), title: "First".into(), artist: "Someone".into(), ..Default::default() };
-        let done = lidarr.request(&wanted);
+        let done = lidarr.request(&wanted, &Noted::default());
         let asked = http.asked.lock().unwrap().clone();
         (done, asked)
     }

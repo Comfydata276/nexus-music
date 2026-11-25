@@ -263,7 +263,15 @@ mod wire {
         });
         let wanted = Offer { album: "al1".into(), artist_id: "ar1".into(), title: "First".into(), artist: "Someone".into(), ..Default::default() };
         let started = Instant::now();
-        assert_eq!(lidarr(&address, None).request(&wanted), Ok(()));
+        // (An album: nothing to put back, and nothing written down.)
+        struct Nowhere;
+        impl nexus_core::lidarr::WayBack for Nowhere {
+            fn keep(&self, _: i64, _: &str) -> Result<(), String> {
+                Err("not here".into())
+            }
+            fn put_back(&self, _: i64, _: &str) {}
+        }
+        assert_eq!(lidarr(&address, None).request(&wanted, &Nowhere), Ok(()));
         let took = started.elapsed();
         assert!(took >= Duration::from_secs(3) && took < Duration::from_secs(6), "took {took:?}");
         let lines: Vec<String> = sent.lock().unwrap().iter().map(|sent| format!("{} {}", sent.line(), sent.body)).collect();

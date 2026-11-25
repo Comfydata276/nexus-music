@@ -134,6 +134,13 @@ impl Desk for Windows {
 
 static JOB: LazyLock<Job> = LazyLock::new(|| Job::new(Windows));
 
+/// Where a request made by itself writes down the way back from a change to Lidarr before it
+/// makes it: the batch's file, so that a run stopped before putting it back has it put back
+/// when the batch is next carried on (`nexus_core::lidarr::WayBack`).
+pub fn way_back() -> &'static dyn nexus_core::lidarr::WayBack {
+    &*JOB
+}
+
 /// Reads the batch that was under way when the app last closed, if there was one.
 pub fn load(path: &Path) {
     let place = PLACE.get_or_init(|| Place::new(path));

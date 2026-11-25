@@ -1680,7 +1680,7 @@ impl Controller {
         self.toast(nexus_core::requests::asking_for(&title));
         self.requests_pool.spawn(move || {
             // (Nothing on Windows stops a request, so "stopped" can't come of it.)
-            let result = nexus_core::requests::request(&lidarr, crate::lidarr::offers(), &album).unwrap_or_else(|_| Err(nexus_core::http::STOPPED.into()));
+            let result = nexus_core::requests::request(&lidarr, crate::lidarr::offers(), &album, crate::bulk::way_back()).unwrap_or_else(|_| Err(nexus_core::http::STOPPED.into()));
             post(move |ctl| match result {
                 Ok(artist) => {
                     // Noted, so it can be followed up when it arrives.

@@ -760,7 +760,7 @@ pub const NO_LONGER_LISTED: &str = "Lidarr no longer lists that one.";
 /// page drawn in an earlier session). Gives who it's by, or why it couldn't be asked for.
 /// Once Lidarr has begun changing anything it runs to its end, or puts back what it changed
 /// (see `Lidarr::request`); a stop before then gives `Err(Stopped)`.
-pub fn request(lidarr: &Lidarr, offers: &Offers, album: &str) -> Result<Result<String, String>, Stopped> {
+pub fn request(lidarr: &Lidarr, offers: &Offers, album: &str, way_back: &dyn crate::lidarr::WayBack) -> Result<Result<String, String>, Stopped> {
     // Offered in this session, or (from a page drawn in an earlier one) looked up afresh.
     let offer = match offers.offered(album) {
         Some(offer) => Ok(offer),
@@ -771,7 +771,7 @@ pub fn request(lidarr: &Lidarr, offers: &Offers, album: &str) -> Result<Result<S
     };
     let Ok(offer) = offer else { return Ok(offer.map(|offer| offer.artist)) };
     offers.remember(std::slice::from_ref(&offer));
-    Ok(unless_stopped(lidarr.request(&offer))?.map(|()| offer.artist))
+    Ok(unless_stopped(lidarr.request(&offer, way_back))?.map(|()| offer.artist))
 }
 
 /// Once Lidarr has an album on its list: the note of it as asked for, to be followed up when
@@ -902,6 +902,17 @@ pub fn count(n: usize, noun: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_request_by_itself_writes_its_way_back_down_before_lidarr_is_changed() {
+        use crate::lidarr::tests::{KilledAfterChange, Noted, Stopping, single};
+        let lidarr = crate::lidarr::Lidarr::new("lidarr.test", "key", None, std::sync::Arc::new(KilledAfterChange(Stopping { asked: Default::default() })));
+        let offers = Offers::default();
+        offers.remember(&[single()]);
+        let noted = Noted::default();
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| super::request(&lidarr, &offers, "al1", &noted))).is_err());
+        assert_eq!(noted.kept(), [(5, "all".to_string())]);
+    }
+
     use super::*;
 
     /// The snapshot below, as the library as it is.
@@ -1115,7 +1126,7 @@ mod tests {
     #[test]
     fn asks_lidarr_for_what_was_offered_or_looks_it_up() {
         fn ask(services: Services) -> Result<Result<String, String>, Stopped> {
-            request(services.lidarr, &Offers::new(), "rg-9")
+            request(services.lidarr, &Offers::new(), "rg-9", &crate::lidarr::tests::Noted::default())
         }
         // Not offered, and Lidarr no longer has it.
         assert_eq!(served(&[("album/lookup", "[]")], usize::MAX, ask).0, Ok(Err(NO_LONGER_LISTED.to_string())));
