@@ -1118,6 +1118,14 @@ impl Controller {
 
     // ---- engine events and the clock -----------------------------------------------------------
 
+    /// The song the sound has rolled into by itself, if it has and this thread has not yet
+    /// been told: its token. The engine says so in its own time (`Event::Started`); what
+    /// is sounding can be read at any moment.
+    pub fn rolled_ahead(&self) -> Option<u64> {
+        let pb = self.playback.borrow();
+        self.engine.position().map(|(token, _)| token).filter(|token| *token != 0 && *token == pb.next_token && *token != pb.current_token)
+    }
+
     /// Where the sound has got to in the song the player holds, if it is playing and the
     /// engine has reached that song: its place in the song, in seconds.
     pub fn sounding_at(&self) -> Option<f64> {
@@ -1128,9 +1136,19 @@ impl Controller {
         self.engine.position().filter(|(token, _)| *token == pb.current_token).map(|(_, at)| at)
     }
 
+    /// What the engine's word that a song has started does, done now.
+    pub fn started(self: &Rc<Self>, token: u64) {
+        self.on_engine_event(Event::Started(token));
+    }
+
     pub fn on_engine_event(self: &Rc<Self>, event: Event) {
         match event {
             Event::Started(token) => {
+                // (Where the new linking is switched on, the window may have been brought
+                // up to this already: see `link_catch_up`.)
+                if self.link_caught_up(token) {
+                    return;
+                }
                 let advanced = {
                     let mut pb = self.playback.borrow_mut();
                     pb.failures = 0;

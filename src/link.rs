@@ -686,6 +686,9 @@ pub struct Link {
     take: Option<Take>,
     adoption: Option<Adoption>,
     news: News,
+    /// The song the sound was found to have rolled into before the window had been told
+    /// (see `link_catch_up`): the engine's own word of it, when it comes, is not acted on twice.
+    caught: u64,
 }
 
 impl Link {
@@ -1301,12 +1304,40 @@ impl Controller {
 
     // ---- what another device asks of this one ----------------------------------------------
 
+    /// The sound may have rolled into the next song before this thread has been told. What
+    /// a command would act on is what is sounding, so before anything from another device
+    /// is judged or answered, the window is brought up to the sound: the cursor moves to
+    /// the next song and the generation moves, exactly as they will when the engine's own
+    /// word arrives, and that word is then not acted on a second time.
+    fn link_catch_up(self: &Rc<Self>) {
+        if let Some(token) = self.rolled_ahead() {
+            log("the sound has rolled into the next song: the window is brought up to it");
+            self.started(token);
+            self.link.borrow_mut().caught = token;
+        }
+    }
+
+    /// Whether the engine's word that this song has started was acted on already, by
+    /// `link_catch_up`. Asked once for each such word.
+    pub fn link_caught_up(&self, token: u64) -> bool {
+        if !on() || token == 0 {
+            return false;
+        }
+        let mut link = self.link.borrow_mut();
+        let caught = link.caught == token;
+        if caught {
+            link.caught = 0;
+        }
+        caught
+    }
+
     /// Another device asks something of this one.
     fn link_asked(self: &Rc<Self>, serial: u64, from: Place, nonce: Nonce, message: &[u8]) {
         let now = now_ms();
         if !self.link.borrow_mut().asks.allow(now) {
             return log("ask: more than this device answers in a second, dropped");
         }
+        self.link_catch_up();
         let who = text::place(&from);
         match read_ask(message) {
             None => {
@@ -1411,6 +1442,8 @@ impl Controller {
     /// the way the same press on this PC would be.
     fn link_finish(self: &Rc<Self>, serial: u64, from: Place, nonce: Nonce, command: Command, at: At, reservation: Reservation, ready: Ready) {
         let who = text::place(&from);
+        // (The sound may have rolled on while the work was done.)
+        self.link_catch_up();
         let now = now_ms();
         let same_session = self.link.borrow().live(serial, now).is_some();
         let finished = self.link_rule.borrow_mut().finish(reservation, at, minute(now), same_session, nonce);
