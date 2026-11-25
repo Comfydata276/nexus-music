@@ -10,8 +10,8 @@
 //!
 //! 1. List the playlists and ask [`choose`], with the id it used last time under this
 //!    sign-in (`None` the first time).
-//! 2. [`Next::Fetch`]: fetch that playlist and ask [`judge`]. [`Next::Make`]: make one,
-//!    write a new secret into it, and start again from 1 with the new id as the one used.
+//! 2. [`Next::Fetch`]: fetch that playlist and ask [`judge`]. [`Next::Make`]: make one of
+//!    the name, write a new secret into it, and start again from 1.
 //! 3. [`Verdict::Use`]: that is the secret. [`Verdict::Write`]: write a new secret into that
 //!    playlist, keeping it private, and start again from 1 with its id as the one used.
 //!    Either way the secret used is the one **a look read**, never the one this device
@@ -21,6 +21,25 @@
 //!
 //! A look that goes round more than three times has met something that keeps undoing it
 //! and is given up until the next.
+//!
+//! **Which playlist, and whose it is to write in.** The record's playlist is the one of
+//! the name with the lowest id that is the account's own, looked for afresh at every look.
+//! What the app may do with it goes by what it holds, and by nothing else:
+//!
+//! - **no songs and an empty comment: it is the app's to fill.** That is what a device
+//!   leaves if it stops between making the playlist and writing into it, and the next
+//!   look, on any device, simply fills it. (So a playlist of exactly this name that the
+//!   person made themselves and put nothing in, no song and no description, is used: it
+//!   is given the record and made private. Accepted.)
+//! - **no songs and a comment that is not a record: it is the person's.** Nothing is
+//!   written, linking does not start, and they are told to rename or delete it.
+//! - **songs in it: the person's too**, whatever its comment says. The same.
+//!
+//! **Two devices that set up at the same moment** make a playlist each. Both go by the
+//! lower id from their next look on, as with the list that keeps devices in step, and the
+//! other one stays where it is, holding a record nothing reads: nothing deletes it. (It
+//! is hidden in this app. Another music app shows two playlists of the name; the one with
+//! the higher id can be deleted by hand, and "Reset linking" does not remove it.)
 
 use std::fmt;
 
@@ -35,14 +54,8 @@ pub const PLAYLIST_NAME: &str = "Nexus Music link";
 /// Whether a playlist of the person's own may have this name: not this one, **where
 /// linking is in use**. An app in which it is not has no business with the name.
 pub fn reserved(name: &str) -> bool {
-    name.trim() == PLAYLIST_NAME || name.trim() == SETTING_UP
+    name.trim() == PLAYLIST_NAME
 }
-
-/// What a playlist is called for the moment between being made and being given the record
-/// (see [`judge`]). **The name itself is only ever given together with the record**, in
-/// one request: so a playlist that has the name and no record was not left by the app,
-/// whatever happened to the app in between, and is the person's own.
-pub const SETTING_UP: &str = "Nexus Music link (being set up)";
 
 /// What the app says when a playlist of the person's own is given the name.
 pub const RESERVED: &str = "Nexus Music keeps that name for itself, for linking your devices. Choose another.";
@@ -109,7 +122,7 @@ pub fn kept_name(name: &str, linking: bool) -> Option<&'static str> {
 /// that holds the secret. What is not listed is not opened, and a page that is not opened
 /// is not written to an app's cache of pages.
 pub fn unlisted(name: &str, linking: bool) -> bool {
-    name == crate::sync::PLAYLIST_NAME || (linking && (name == PLAYLIST_NAME || name == SETTING_UP))
+    name == crate::sync::PLAYLIST_NAME || (linking && name == PLAYLIST_NAME)
 }
 
 /// Whether a playlist's page may be written to an app's cache of pages on disk: never the
@@ -179,13 +192,19 @@ pub struct Fetched {
 /// comment from one and the privacy from another, a secret that was replaced between the
 /// two would be renewed on the strength of an answer about its successor.
 ///
-/// `None` unless the answer is an "ok" one with a playlist in it. What the playlist's tag
-/// leaves out is left out here, and [`judge`] decides what that means.
+/// `None` unless the answer is an "ok" one with a playlist in it, **and all of it is
+/// there**: every element closed by its own name, the root last, and nothing after it. An
+/// answer cut short on its way (a connection dropped behind a proxy that had already said
+/// 200) states nothing, however much of it arrived. What the playlist's tag leaves out is
+/// left out here, and [`judge`] decides what that means.
 pub fn fetched(xml: &str) -> Option<Fetched> {
-    if !attributes(xml, "subsonic-response")?.into_iter().any(|(name, value)| name == "status" && value == "ok") {
+    let elements = elements(xml)?;
+    let (root, said) = elements.first().filter(|(depth, ..)| *depth == 0).map(|(_, name, said)| (*name, said))?;
+    if root != "subsonic-response" || !said.iter().any(|(name, value)| *name == "status" && *value == "ok") {
         return None;
     }
-    let playlist = attributes(xml, "playlist")?;
+    // (The answer's own playlist: not one inside something else.)
+    let playlist = elements.iter().find(|(depth, name, _)| *depth == 1 && *name == "playlist").map(|(.., said)| said)?;
     let said = |wanted: &str| playlist.iter().find(|(name, _)| *name == wanted).map(|(_, value)| unescaped(value));
     Some(Fetched {
         id: said("id")?,
@@ -239,31 +258,96 @@ fn unescaped(value: &str) -> String {
     text
 }
 
-/// The attributes of the first `<element ...>` in an XML text, as written (not unescaped:
-/// the ones read here are an id, "ok", and true or false). `None` if the tag is not there
-/// or is not well formed.
-fn attributes<'a>(xml: &'a str, element: &str) -> Option<Vec<(&'a str, &'a str)>> {
-    let open = format!("<{element}");
-    let mut from = 0;
-    let mut rest = loop {
-        let at = xml.get(from..)?.find(&open)? + from;
-        let after = xml.get(at + open.len()..)?;
-        // (Not an element whose name merely begins the same way.)
-        if after.starts_with(|c: char| c.is_whitespace() || c == '>' || c == '/') {
-            break after;
-        }
-        from = at + open.len();
-    };
+/// The root of an XML document and the elements directly inside it, in order: how deep
+/// each is (0 for the root), its name, and its attributes as written (not unescaped).
+/// `None` unless **the whole document is there and reads as XML**: every element opened is
+/// closed by its own name, there is one root, and nothing but space follows it. (What is
+/// deeper than the root's own elements is read, to see that it closes, and not kept: a
+/// playlist's songs.)
+fn elements(xml: &str) -> Option<Vec<(usize, &str, Vec<(&str, &str)>)>> {
     let mut found = Vec::new();
+    let mut open: Vec<&str> = Vec::new();
+    let mut rooted = false;
+    let mut rest = xml.trim_start_matches('\u{feff}');
     loop {
-        rest = rest.trim_start();
-        if rest.starts_with('>') || rest.starts_with("/>") {
-            return Some(found);
+        let Some(at) = rest.find('<') else {
+            // The end: the root has closed, and only space follows it.
+            return (rooted && open.is_empty() && rest.trim().is_empty()).then_some(found);
+        };
+        // (Text belongs inside an element.)
+        if open.is_empty() && !rest[..at].trim().is_empty() {
+            return None;
         }
-        let (name, after) = rest.split_once('=')?;
-        let quote = after.chars().next().filter(|c| *c == '"' || *c == '\'')?;
-        let (value, after) = after.get(1..)?.split_once(quote)?;
-        found.push((name.trim(), value));
+        rest = &rest[at..];
+        if let Some(after) = rest.strip_prefix("<?") {
+            rest = after.get(after.find("?>")? + 2..)?;
+            continue;
+        }
+        if let Some(after) = rest.strip_prefix("<!--") {
+            rest = after.get(after.find("-->")? + 3..)?;
+            continue;
+        }
+        if let Some(after) = rest.strip_prefix("<![CDATA[") {
+            if open.is_empty() {
+                return None;
+            }
+            rest = after.get(after.find("]]>")? + 3..)?;
+            continue;
+        }
+        // (A declaration of what the document may hold: nothing this server sends.)
+        if rest.starts_with("<!") {
+            return None;
+        }
+        if let Some(after) = rest.strip_prefix("</") {
+            let (name, after) = after.split_once('>')?;
+            if open.pop() != Some(name.trim_end()) {
+                return None;
+            }
+            rest = after;
+            continue;
+        }
+        // An element opens. (There is one root.)
+        if open.is_empty() && rooted {
+            return None;
+        }
+        let after = rest.get(1..)?;
+        let name = after.get(..after.find(|c: char| c.is_whitespace() || c == '>' || c == '/')?)?;
+        if name.is_empty() || name.contains(['<', '=', '"', '\'']) {
+            return None;
+        }
+        let mut after = after.get(name.len()..)?;
+        let mut attributes = Vec::new();
+        let closed = loop {
+            after = after.trim_start();
+            if let Some(rest) = after.strip_prefix("/>") {
+                after = rest;
+                break true;
+            }
+            if let Some(rest) = after.strip_prefix('>') {
+                after = rest;
+                break false;
+            }
+            let (name, value) = after.split_once('=')?;
+            let name = name.trim_end();
+            if name.is_empty() || name.contains(|c: char| c.is_whitespace() || ['<', '>', '/', '"', '\''].contains(&c)) {
+                return None;
+            }
+            let value = value.trim_start();
+            let quote = value.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+            let (value, rest) = value.get(1..)?.split_once(quote)?;
+            if value.contains('<') {
+                return None;
+            }
+            attributes.push((name, value));
+            after = rest;
+        };
+        if open.len() <= 1 {
+            found.push((open.len(), name, attributes));
+        }
+        rooted = true;
+        if !closed {
+            open.push(name);
+        }
         rest = after;
     }
 }
@@ -283,10 +367,10 @@ pub enum Stop {
     /// made before linking kept the name, and is left exactly as it is. Linking does not
     /// start until it has been renamed or deleted, and the person is told so.
     HasSongs,
-    /// The playlist of that name holds no record: empty, or with a description of the
-    /// person's own. It is theirs as much as one with songs in it, and is left exactly as
-    /// it is: nothing is written into it and it is not made private. Linking does not
-    /// start until it has been renamed or deleted, and the person is told so.
+    /// The playlist of that name has a description that is not a record: it is the
+    /// person's own as much as one with songs in it, and is left exactly as it is. Nothing
+    /// is written into it and it is not made private. Linking does not start until it has
+    /// been renamed or deleted, and the person is told so.
     Taken,
 }
 
@@ -321,7 +405,8 @@ pub fn choose(listed: &[Stated], username: &str, used: Option<&str>) -> Next {
 /// Why a new secret was written.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Why {
-    /// There was no record: a playlist was made for it.
+    /// There was no record: a playlist was made for it, or one of the name with nothing
+    /// in it at all was there to fill.
     Made,
     /// The playlist used before has gone.
     Gone,
@@ -336,7 +421,7 @@ pub enum Why {
 pub enum Verdict {
     Use(Secret),
     /// Write a new secret into it (and keep it private), then look again. Only ever said
-    /// of a playlist that holds a record.
+    /// of a playlist that holds a record, or holds nothing at all.
     Write(Why),
     Stop(Stop),
 }
@@ -345,10 +430,10 @@ pub enum Verdict {
 /// for, by id and by name, and the server **states** that it is this account's and that it
 /// is private.
 ///
-/// **Nothing is ever written into a playlist that does not hold a record.** One of the
-/// name with songs in it, with a description of the person's own, or with nothing in it at
-/// all, is theirs: the app never leaves such a one behind (the name is given with the
-/// record, in one request: [`SETTING_UP`]), so it did not make it.
+/// **Nothing is ever written into a playlist that holds something of the person's own**:
+/// songs, or a description that is not a record. One with no songs and no comment at all
+/// is the app's to fill: it is what a device leaves if it stops between making the
+/// playlist and writing into it (see the top of this file for what that accepts).
 pub fn judge(asked: &str, replace: bool, fetched: &Fetched, username: &str) -> Verdict {
     if fetched.id != asked || fetched.name != PLAYLIST_NAME {
         return Verdict::Stop(Stop::Mismatch);
@@ -371,33 +456,15 @@ pub fn judge(asked: &str, replace: bool, fetched: &Fetched, username: &str) -> V
     match record {
         // Whatever else is true of it, a later layout is left exactly as it is.
         Record::Later(_) => Verdict::Stop(Stop::Later),
-        // No record: not the app's to touch, public or private, whatever has gone.
-        Record::Empty | Record::Broken => Verdict::Stop(Stop::Taken),
+        // A description of the person's own: not the app's to touch, public or private,
+        // whatever has gone.
+        Record::Broken => Verdict::Stop(Stop::Taken),
+        // Nothing in it at all: the app's to fill (and writing into it makes it private).
+        Record::Empty => Verdict::Write(Why::Made),
         Record::Is(_) if public => Verdict::Write(Why::Public),
         Record::Is(_) if replace => Verdict::Write(Why::Gone),
         Record::Is(secret) => Verdict::Use(secret),
     }
-}
-
-/// The playlist a look that could not finish left being set up, if there is one: the
-/// lowest id among those of that name that the server says are this account's.
-pub fn left_being_set_up(listed: &[Stated], username: &str) -> Option<String> {
-    match find_named(listed, username, SETTING_UP) {
-        Found::Ours(id) => Some(id),
-        _ => None,
-    }
-}
-
-/// Whether that playlist, as fetched, is one to carry on with: the one asked for, by id
-/// and by its name, stated to be this account's, with no songs in it and nothing written
-/// in it. Anything else (somebody has put songs or a description in it) is left alone, and
-/// another is made.
-pub fn may_be_set_up(asked: &str, fetched: &Fetched, username: &str) -> bool {
-    fetched.id == asked
-        && fetched.name == SETTING_UP
-        && fetched.owner.as_ref().is_some_and(|owner| owner.to_lowercase() == username.to_lowercase())
-        && fetched.songs == Some(0)
-        && read(fetched.comment.as_deref().unwrap_or("")) == Record::Empty
 }
 
 #[cfg(test)]
@@ -573,7 +640,7 @@ mod tests {
         }
         // An empty comment is left out, as Navidrome leaves it; so is an owner it won't state.
         let bare = fetched(r#"<subsonic-response status="ok"><playlist id="k" name="Nexus Music link" songCount="0" public="false" owner="tester"/></subsonic-response>"#).unwrap();
-        assert_eq!((bare.comment.clone(), judge("k", false, &bare, "tester")), (None, Verdict::Stop(Stop::Taken)));
+        assert_eq!((bare.comment.clone(), judge("k", false, &bare, "tester")), (None, Verdict::Write(Why::Made)));
         assert_eq!(fetched(r#"<subsonic-response status="ok"><playlist id='k' public='true'/></subsonic-response>"#).map(|read| (read.owner, read.public)), Some((None, Some(true))));
     }
 
@@ -583,11 +650,50 @@ mod tests {
         assert_eq!(fetched(r#"<subsonic-response status="failed"><error code="70" message="playlist not found"/></subsonic-response>"#), None);
         assert_eq!(fetched(r#"<subsonic-response status="ok"></subsonic-response>"#), None);
         assert_eq!(fetched(r#"<subsonic-response status="ok"><playlist name="Nexus Music link"/></subsonic-response>"#), None);
-        // The element is the playlist, not one whose name begins the same way.
-        assert_eq!(fetched(r#"<subsonic-response status="ok"><playlists><playlist id="k" public="false"/></playlists></subsonic-response>"#).map(|read| read.id), Some("k".into()));
+        // The element is the answer's own playlist: not one whose name begins the same
+        // way, one inside something else, or one that is not in an answer at all.
+        assert_eq!(fetched(r#"<subsonic-response status="ok"><playlists id="j"/><playlist id="k" public="false"/></subsonic-response>"#).map(|read| read.id), Some("k".into()));
+        assert_eq!(fetched(r#"<subsonic-response status="ok"><playlists><playlist id="k" public="false"/></playlists></subsonic-response>"#), None);
+        assert_eq!(fetched(r#"<playlist id="k" public="false"/>"#), None);
+        assert_eq!(fetched(r#"<other status="ok"><playlist id="k" public="false"/></other>"#), None);
         // Cut short or not XML at all, it gives nothing and does not trip anything up.
         for broken in ["", "<playlist", "<playlist id=", r#"<playlist id="k"#, r#"<subsonic-response status="ok"><playlist id="k" public="false""#, "{\"playlist\":{}}", "<playlist é=\"é\">"] {
             assert_eq!(fetched(broken), None, "{broken}");
+        }
+    }
+
+    /// A proxy that has said 200 and then loses the connection hands over the start of an
+    /// answer. Its opening tags read perfectly well, and it states nothing.
+    #[test]
+    fn an_answer_states_something_only_if_all_of_it_arrived() {
+        let whole = answer("false");
+        assert!(fetched(&whole).is_some());
+        // Every way of stopping short of its end, a character at a time.
+        for cut in 0..whole.len() {
+            if whole.is_char_boundary(cut) {
+                assert_eq!(fetched(&whole[..cut]), None, "cut at {cut}: {}", &whole[..cut]);
+            }
+        }
+        // As a server writes it, with a declaration first and a line after: read.
+        assert!(fetched(&format!("\u{feff}<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{whole}\n")).is_some());
+        // With songs in it, each closed, and a comment between: read, and the songs counted
+        // as the playlist says.
+        let with_songs = whole.replace("></playlist>", r#"><entry id="s1" title="One &amp; only"/><!-- two --><entry id="s2" title="a > b"></entry></playlist>"#);
+        assert_eq!(fetched(&with_songs).map(|read| read.id), Some("7K5dLzMvMcCEj4us2t4RO0".into()));
+        // Not XML that holds together: closed by another name, closed twice, two roots,
+        // something after the root, an element never closed inside it.
+        let broken = [
+            whole.replace("</playlist>", "</playlists>"),
+            whole.replace("</subsonic-response>", "</subsonic-response></subsonic-response>"),
+            format!("{whole}{whole}"),
+            format!("{whole} and more"),
+            whole.replace("></playlist>", "><entry id=\"s1\"></playlist>"),
+            whole.replace("></playlist>", "><entry id=s1/></playlist>"),
+            whole.replace("<playlist ", "<!DOCTYPE x><playlist "),
+            format!("words first {whole}"),
+        ];
+        for broken in broken {
+            assert_eq!(fetched(&broken), None, "{broken}");
         }
     }
 
@@ -630,11 +736,12 @@ mod tests {
         assert_eq!(fetched(&answer("false").replace(r#"songCount="0""#, r#"songCount="many""#)).unwrap().songs, None);
     }
 
-    /// A playlist of the name that holds no record is the person's own, with songs in it
-    /// or without: nothing is written into it, whatever else is true.
+    /// A playlist of the name with a description of the person's own is theirs, with songs
+    /// in it or without: nothing is written into it, whatever else is true. One with
+    /// nothing in it at all is the app's to fill, whoever made it.
     #[test]
-    fn a_playlist_that_holds_no_record_is_never_written_into_and_a_later_layout_is_left_alone() {
-        let not_records = [None, Some(""), Some("someone's note"), Some(r#"{"nexus_music_link":null}"#), Some(r#"{"nexus_music_link":1}"#), Some(r#"{"nexus_music_link":1,"secret":"short"}"#)];
+    fn a_playlist_is_written_into_only_if_it_holds_a_record_or_nothing_at_all() {
+        let not_records = [Some("someone's note"), Some(" "), Some(r#"{"nexus_music_link":null}"#), Some(r#"{"nexus_music_link":1}"#), Some(r#"{"nexus_music_link":1,"secret":"short"}"#)];
         for comment in not_records {
             for public in [false, true] {
                 for replace in [false, true] {
@@ -642,28 +749,25 @@ mod tests {
                 }
             }
         }
-        // The name is kept from a playlist of the person's own where linking is in use, and
-        // so is the one a playlist has for the moment it is being set up.
-        assert_eq!((kept_name(SETTING_UP, true), kept_name(SETTING_UP, false), unlisted(SETTING_UP, true), unlisted(SETTING_UP, false)), (Some(RESERVED), None, true, false));
-        // One left being set up is carried on with only as the app left it: its own, by
-        // that name, with nothing in it.
-        let left = |name: &str, owner: Option<&str>| Stated { id: "s".into(), name: name.into(), owner: owner.map(str::to_string), comment: None };
-        assert_eq!(left_being_set_up(&[left(SETTING_UP, Some("tester")), listed("k", Some("tester"))], "tester"), Some("s".into()));
-        assert_eq!(left_being_set_up(&[left(SETTING_UP, Some("other")), left(SETTING_UP, None), left("Morning mix", Some("tester"))], "tester"), None);
-        let as_left = Fetched { id: "s".into(), name: SETTING_UP.into(), owner: Some("Tester".into()), public: Some(true), comment: None, songs: Some(0) };
-        assert!(may_be_set_up("s", &as_left, "tester"));
-        for touched in [
-            Fetched { songs: Some(1), ..as_left.clone() },
-            Fetched { songs: None, ..as_left.clone() },
-            Fetched { comment: Some("mine now".into()), ..as_left.clone() },
-            Fetched { comment: Some(COMMENT.into()), ..as_left.clone() },
-            Fetched { owner: Some("other".into()), ..as_left.clone() },
-            Fetched { owner: None, ..as_left.clone() },
-            Fetched { name: PLAYLIST_NAME.into(), ..as_left.clone() },
-            Fetched { id: "t".into(), ..as_left.clone() },
-        ] {
-            assert!(!may_be_set_up("s", &touched, "tester"), "{touched:?}");
+        // No comment, as the server leaves an empty one out, or an empty one: what a
+        // device leaves that stopped between making the playlist and filling it. Filled,
+        // public or private, whatever has gone; but not if it has songs in it, and not
+        // unless the server says whose it is and how many songs it has.
+        for comment in [None, Some("")] {
+            for public in [false, true] {
+                for replace in [false, true] {
+                    assert_eq!(judge("k", replace, &Fetched { public: Some(public), ..got("k", comment) }, "tester"), Verdict::Write(Why::Made), "{comment:?}, public {public}, replace {replace}");
+                }
+            }
+            assert_eq!(judge("k", false, &Fetched { songs: Some(1), ..got("k", comment) }, "tester"), Verdict::Stop(Stop::HasSongs));
+            assert_eq!(judge("k", false, &Fetched { songs: None, ..got("k", comment) }, "tester"), Verdict::Stop(Stop::NotStated));
+            assert_eq!(judge("k", false, &Fetched { owner: None, ..got("k", comment) }, "tester"), Verdict::Stop(Stop::NotStated));
+            assert_eq!(judge("k", false, &Fetched { owner: Some("other".into()), ..got("k", comment) }, "tester"), Verdict::Stop(Stop::Mismatch));
+            assert_eq!(judge("k", false, &Fetched { public: None, ..got("k", comment) }, "tester"), Verdict::Stop(Stop::NotStated));
         }
+        // Only the name itself is kept from a playlist of the person's own, where linking
+        // is in use: there is no second name.
+        assert_eq!((kept_name("Nexus Music link (being set up)", true), unlisted("Nexus Music link (being set up)", true)), (None, false));
         let later = r#"{"nexus_music_link":2,"secret":"x"}"#;
         assert_eq!(judge("k", false, &got("k", Some(later)), "tester"), Verdict::Stop(Stop::Later));
         // Not even to make it private, or because another has gone.
