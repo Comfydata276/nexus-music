@@ -1152,6 +1152,8 @@ impl Controller {
         self.let_go();
         // A jam hosted here ends with the app; its guests are told so, not left waiting.
         self.stop_linking();
+        // (The new linking's session ends with the sign-in: see `link`.)
+        self.link_end("");
         self.end_jam(true);
         self.save_queue();
         self.save_settings();
@@ -2396,6 +2398,8 @@ impl Controller {
         self.leave_jam();
         self.end_jam(false);
         self.stop_linking();
+        // (The new linking's session ends with the sign-in: see `link`.)
+        self.link_end("");
         self.ui.global::<ui::Jam>().set_open(false);
         self.stop_sync();
         self.library_timer.stop();
