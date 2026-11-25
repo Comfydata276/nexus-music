@@ -601,6 +601,132 @@ fn held_while(name: &str, at_b: impl FnOnce(&mut World)) -> World {
     world
 }
 
+/// What a way into the player does at the seam the app keeps beside its player.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Seam {
+    /// It changes what a command would act on: the app counts it.
+    Moves,
+    /// It changes nothing, and is not counted.
+    Nothing,
+    /// Its songs are looked up: busy from the choice until they arrive, and then it counts.
+    LookedUp,
+    /// It waits on something and then changes nothing.
+    Waits,
+    /// The sound is on the next song before the window has been told.
+    Rolls,
+    /// It is itself a command, counted once by the rule and not again by the player.
+    Command,
+}
+
+/// Every row of the table of ways into the player (`docs/linking-design.md`, 5.6.1), each
+/// with the cases its row names, as the order of choices sees it. (That the app does this
+/// at each of them is what the walk of the ways in shows.)
+const WAYS: &[(&str, Seam)] = &[
+    ("Play, Pause: the window's button, Space, the tray, the taskbar's buttons, the mini player, the media keys", Seam::Moves),
+    ("Play, Pause with nothing in the player", Seam::Nothing),
+    ("Next, Previous: the buttons, the keys, the tray, the taskbar, the mini player, the media keys", Seam::Moves),
+    ("Next, Previous with nothing to go to", Seam::Nothing),
+    ("Seek: the bar, the keys, the media keys", Seam::Moves),
+    ("Seek on a radio, which has nowhere to seek to", Seam::Nothing),
+    ("Volume; Mute", Seam::Moves),
+    ("Shuffle, Repeat", Seam::Moves),
+    ("The queue's own edits: double-click an entry, Remove from queue, drag, Clear", Seam::Moves),
+    ("A queue edit naming a place that is not there", Seam::Nothing),
+    ("Playing something: an album, playlist, artist or mix; a page's Play; a song in a list; a suggestion; Recently played; a radio station; a song's radio", Seam::Moves),
+    ("Playing something whose songs are looked up", Seam::LookedUp),
+    ("Playing something of which nothing can play (offline)", Seam::Nothing),
+    ("Play Next, Add to Queue: a song, songs dragged onto the queue", Seam::Moves),
+    ("Play Next, Add to Queue: an album, a playlist, looked up", Seam::LookedUp),
+    ("A guest in a jam, and a device linked the old way: something asked for", Seam::LookedUp),
+    ("A guest in a jam searching, which changes nothing", Seam::Waits),
+    ("A command from another device", Seam::Command),
+    ("The sound rolling into the next song", Seam::Rolls),
+    ("A song ending; the queue running out", Seam::Moves),
+    ("Autoplay: its songs added ahead of time, while the last song plays", Seam::Moves),
+    ("Autoplay: its songs not arrived when the queue runs out", Seam::LookedUp),
+    ("A song that will not play being passed over", Seam::Moves),
+    ("The sleep timer: set, cancelled, its pause", Seam::Moves),
+    ("The sound output being lost while playing", Seam::Moves),
+    ("The sound output being lost while paused", Seam::Nothing),
+    ("A followed playlist changing the queue", Seam::Moves),
+    ("Sync's \"Continue here\"", Seam::Moves),
+    ("The queue restored as the app starts; sign-out emptying the player", Seam::Moves),
+];
+
+#[test]
+fn every_way_into_the_player_is_judged_by_what_it_does_to_the_order_of_choices() {
+    for (way, seam) in WAYS {
+        // Next is asked of B from A, and is on its way when this happens at B.
+        let mut world = steering("next");
+        let before = world.copies[B].player.rule.generation();
+        world.path.hold_commands = true;
+        world.ask("next");
+        let now = world.now;
+        let player = &mut world.copies[B].player;
+        let waiting = match seam {
+            Seam::Moves => {
+                player.rule.moved();
+                None
+            }
+            Seam::Rolls => {
+                player.rolled = true;
+                None
+            }
+            Seam::LookedUp | Seam::Waits => Some(player.rule.wait(now, 60_000)),
+            Seam::Nothing | Seam::Command => None,
+        };
+        world.release();
+        world.path.hold_commands = false;
+        let (judged, player) = (world.last(B, "next from"), &world.copies[B].player);
+        match seam {
+            // It was counted: the command was made before it, and is refused.
+            Seam::Moves | Seam::Rolls => {
+                assert!(judged.contains("refused, Changed"), "{way}: {judged}");
+                assert_eq!((player.did.len(), player.rule.generation()), (0, before + 1), "{way}");
+            }
+            // It was not: the command is carried out, and takes the one place.
+            Seam::Nothing | Seam::Command => {
+                assert!(judged.ends_with("carried out"), "{way}: {judged}");
+                assert_eq!((player.did.clone(), player.rule.generation()), (vec!["next".to_string()], before + 1), "{way}");
+            }
+            // The device is in the middle of it: refused, and nothing counted yet.
+            Seam::LookedUp | Seam::Waits => {
+                assert!(judged.contains("refused, Busy"), "{way}: {judged}");
+                assert_eq!((player.did.len(), player.rule.generation(), player.rule.busy(now)), (0, before, true), "{way}");
+            }
+        }
+        // And afterwards.
+        match seam {
+            // The same command delivered again finds its place taken.
+            Seam::Command => {
+                let again = world.path.last_command.clone().expect("it was carried");
+                world.deliver(again);
+                assert!(world.last(B, "next from").contains("refused, Changed"), "{way}");
+                assert_eq!(world.copies[B].player.did.len(), 1, "{way}");
+            }
+            // What it waited on arrives (and, if it was something to play, is counted):
+            // the device is free again, and a command made against it as it now is, is
+            // carried out.
+            Seam::LookedUp | Seam::Waits => {
+                let player = &mut world.copies[B].player;
+                player.rule.done(waiting.expect("it was waiting"));
+                let counted = if *seam == Seam::LookedUp {
+                    player.rule.moved();
+                    1
+                } else {
+                    0
+                };
+                assert_eq!((player.rule.busy(now), player.rule.generation()), (false, before + counted), "{way}");
+                world.pass(6_000);
+                world.ask("next");
+                world.pass(1_000);
+                assert_eq!((world.copies[B].player.did.clone(), world.copies[B].player.rule.generation()), (vec!["next".to_string()], before + counted + 1), "{way}: {:?}", world.copies[A].said);
+            }
+            _ => {}
+        }
+    }
+}
+
 #[test]
 fn a_press_that_changes_nothing_takes_no_place_and_one_that_changes_something_does() {
     // Next with nothing to go to, Play with nothing loaded: the order of choices is as it
