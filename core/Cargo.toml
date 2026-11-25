@@ -9,4 +9,10 @@ publish = false
 # serve the Windows app and the Android app. Anything added here has to keep that true.
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# (`raw_value`: a field of the shared record that this version doesn't know is kept as the
+# text it was written as, and written back so. See src/record.rs.)
+serde_json = { version = "1", features = ["raw_value"] }
+# Reading the two kinds of time a server sends: when a saved queue was changed, and the
+# `Date` on an answer. The app carries chrono already; none of its clock is used here, so
+# the library still has no clock of its own.
+chrono = { version = "0.4", default-features = false, features = ["std"] }

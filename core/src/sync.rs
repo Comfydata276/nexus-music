@@ -4,14 +4,13 @@
 //! Recently played and the latest plays live as text in the comment of one playlist the app
 //! keeps for the purpose. Each item carries the time it last changed, and the newer one wins.
 //! This is the layout of that text and the merge. Every app on the account has to do both
-//! identically, or they undo each other's changes. Talking to the server, and applying what
-//! comes back, is each app's own.
+//! identically, or they undo each other's changes.
 //!
 //! `merge` combines whatever two records it is given and stamps the result with this
-//! layout. It does not look at the layout number of either: before merging what it read
-//! from the server, and before writing anything back, an app has to check that the server's
-//! copy isn't in a later layout (`nexus_music_sync` greater than `VERSION`), and leave such
-//! a copy alone (the Windows app's `exchange` does).
+//! layout. It does not look at the layout number of either, and it is not the whole of an
+//! exchange: what the comment is read as is `record`'s, and what a device may then keep,
+//! take in and write is `step::settle`'s, which is what an app calls. Talking to the server,
+//! and applying what comes back, is each app's own.
 
 use std::collections::HashMap;
 

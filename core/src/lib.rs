@@ -6,6 +6,7 @@
 //! hands it.
 
 pub mod address;
+pub mod handover;
 pub mod http;
 pub mod jam;
 pub mod levelling;
@@ -16,6 +17,9 @@ pub mod notes;
 pub mod offer;
 pub mod playlists;
 pub mod queue;
+pub mod record;
 pub mod search;
+pub mod step;
 pub mod sync;
 pub mod text;
+pub mod time;

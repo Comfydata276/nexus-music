@@ -360,7 +360,11 @@ window, the files, the connections.
 | `core/src/text.rs` | Comparing names: folding, words, what titles have tacked on. |
 | `core/src/search.rs` | How well what was typed matches a name. |
 | `core/src/model.rs` | What a server's answers are read into: a song, an album, a playlist. |
-| `core/src/sync.rs`, `notes.rs` | The record devices share, and how two copies of it are combined. |
+| `core/src/sync.rs`, `notes.rs` | The record devices share, and how two copies of it are combined; when a song's place in a playlist gets a date. |
+| `core/src/record.rs` | That record as text: the layout number read first, what this version doesn't know carried back out. |
+| `core/src/step.rs` | An exchange, decided: changes kept as changes, which playlist holds the record, what to keep, take in and write. |
+| `core/src/handover.rs` | The saved queue between devices: whether to save this one's, take up another's, or offer it. |
+| `core/src/time.rs` | The times a server sends, and a device's clock set beside the server's. |
 | `core/src/playlists.rs` | A change to a playlist, described so it means the same if the playlist has changed. |
 | `core/src/address.rs` | What a typed server address means, and when plain HTTP matters. |
 | `core/src/jam.rs` | Reading a jam's link; what a jam says of a song. |
