@@ -97,6 +97,13 @@ pub trait Player {
     /// seek on a radio, a Next with nothing to go to, change nothing. What the player does
     /// for it is not counted by the player: the rule counts it, once, if it changed anything.
     fn carry_out(&mut self, command: &Command, ready: &Ready) -> bool;
+    /// **This device's queue has been handed to another of the person's devices**, which
+    /// is playing it by the person's own choice: from this moment it is here as a queue
+    /// taken up from that device and not touched (`crate::handover::HANDED`). It is not
+    /// saved, and it follows what that device saves, until the person uses it here.
+    /// Said before this device's sound is stopped for it, so that the stop is not saved
+    /// as a change of this device's own. Counts nothing and claims nothing.
+    fn handed_on(&mut self);
     /// Stops this device's own sound, and counts it as a change.
     fn pause(&mut self);
     /// Takes a queue brought from another device and plays it, counted as a change: each
@@ -916,6 +923,11 @@ impl Device {
             Ok(carrying) => carrying,
             Err(why) => return self.refused(session, from, nonce, &command, at, why, env, out),
         };
+        // The music has moved to the device that asks: the queue is that device's now,
+        // whether or not there is any sound here left to stop.
+        if command == Command::Moved {
+            env.player.handed_on();
+        }
         // What came of it is known as the player returns: the rule is told, and the
         // command's sender answered, from the player as it now is.
         let changed = env.player.carry_out(&command, &ready);
@@ -1179,7 +1191,9 @@ impl Device {
             (Out::Give(giving, sent, left), outcome) => {
                 let gave = giving.ends(outcome, env.player.generation(), env.now_ms);
                 if gave == Gave::Moved {
-                    // The other has started: this one stops, and the player is the other's.
+                    // The other has started: the queue is that device's now, this one
+                    // stops, and the player is the other's.
+                    env.player.handed_on();
                     env.player.pause();
                     self.steer(place, env, out);
                 }

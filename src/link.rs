@@ -374,6 +374,15 @@ impl Player for Here<'_> {
         ctl.ways.taken()
     }
 
+    /// This PC's queue is another device's now. In `nexus_core::handover`'s terms it is
+    /// one taken up from that device and not touched: not saved, and it follows what that
+    /// device saves, until the person uses it here (`claim_queue`). It is another queue
+    /// for a save that was already prepared, which is then not sent.
+    fn handed_on(&mut self) {
+        log("queue: handed to another of the person's devices: not saved from here, and it follows, until it is used here");
+        self.ctl.queue_owner.taken_up(nexus_core::handover::HANDED.into());
+    }
+
     /// (The end of a move of this PC's music to another device: the app's own doing. The
     /// person's choice was that the queue go there, and that device claimed it as it took
     /// it; a claim here a moment later would make this PC, now silent, the newest.)

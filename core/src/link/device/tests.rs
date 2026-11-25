@@ -28,6 +28,9 @@ struct Fake {
     radio: bool,
     /// What was carried out for other devices, in order.
     did: Vec<String>,
+    /// Each time its queue was said to have been handed to another device: whether it was
+    /// still sounding then.
+    handed_on: Vec<bool>,
 }
 
 impl Fake {
@@ -83,6 +86,9 @@ impl Player for Fake {
     }
     fn carry_out(&mut self, command: &Command, ready: &Ready) -> bool {
         self.carry(command, ready)
+    }
+    fn handed_on(&mut self) {
+        self.handed_on.push(self.playing);
     }
     fn pause(&mut self) {
         self.rule.moved();
@@ -1307,6 +1313,45 @@ fn a_device_whose_sound_never_starts_pauses_and_says_it_could_not() {
     world.pass(1_000);
     assert_eq!(said(&world), "Copy B couldn't play that. Still playing here.");
     assert_eq!(world.copies[B].player.queue.len(), 8);
+}
+
+/// A device whose music has moved to another is told that its queue is that device's now,
+/// **before** its sound is stopped for it: so that the stop, on a device that had played
+/// on since it last saved, is not saved as a change of its own, with a fresh time that
+/// could land after the other device's first save. And only then: a move that did not
+/// happen hands nothing on.
+#[test]
+fn a_queue_is_handed_on_when_its_music_has_moved_and_before_the_stop() {
+    let handed = |world: &World| (world.copies[A].player.handed_on.clone(), world.copies[B].player.handed_on.clone());
+    // "Play here" on A: B is told when A sounds, while B is still sounding.
+    let mut world = taking(|_| {});
+    assert_eq!(handed(&world), (vec![], vec![]));
+    world.pass(1_000);
+    assert_eq!((handed(&world), world.copies[B].player.playing), ((vec![], vec![true]), false));
+    // A's music given to B: A is told when B has started, while A is still sounding.
+    let mut world = giving(|_| {});
+    world.pass(1_000);
+    assert_eq!((handed(&world), world.copies[A].player.playing), ((vec![true], vec![]), false));
+    // The stop is refused (Next was pressed at B meanwhile), or never arrives: B's queue
+    // is B's own still.
+    let mut world = taking(|world| world.path.hold_commands = true);
+    world.pass(1_000);
+    world.copies[B].player.own_next();
+    world.release();
+    assert_eq!(handed(&world), (vec![], vec![]));
+    let mut world = taking(|world| world.path.hold_commands = true);
+    world.pass(14_000);
+    assert_eq!(handed(&world), (vec![], vec![]));
+    // The other never starts, or this one was given something else to do meanwhile:
+    // nothing was handed on.
+    let mut world = giving(|world| world.copies[B].player.stream = false);
+    world.pass(22_000);
+    assert_eq!(handed(&world), (vec![], vec![]));
+    let mut world = giving(|world| world.path.hold_tells = true);
+    world.copies[A].player.own_next();
+    world.path.hold_tells = false;
+    world.release_tells();
+    assert_eq!(handed(&world), (vec![], vec![]));
 }
 
 /// A steering B, which is playing; "Play here" is pressed on A.

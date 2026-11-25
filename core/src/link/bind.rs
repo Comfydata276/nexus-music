@@ -85,6 +85,12 @@ pub trait PhonePlayer {
     /// counted here, once, if it changed anything, and whatever the player's listeners say
     /// of it meanwhile is dropped.
     fn carry_out(&mut self, command: &Command, ready: &Ready) -> bool;
+    /// The phone's queue has been handed to another of the person's devices: from this
+    /// moment it is one taken up from that device and not touched
+    /// (`handover::Here::taken` is `handover::HANDED`). It is not saved, and it follows
+    /// what that device saves, until [`PhonePlayer::claim`]. Called before the stop that
+    /// goes with it.
+    fn handed_on(&mut self);
     /// Stops the phone's own sound. Counted here already.
     fn pause(&mut self);
     /// Takes this queue and plays it: each song and whether it was queued by hand, where to
@@ -271,6 +277,9 @@ impl Player for Held<'_> {
         }
         self.ways.end();
         changed
+    }
+    fn handed_on(&mut self) {
+        self.theirs.handed_on();
     }
     /// (The end of a move of the phone's music to another device, or of one that did not
     /// start: the app's own doing, which claims nothing.)
@@ -600,6 +609,9 @@ mod tests {
         fn carry_out(&mut self, _: &Command, _: &Ready) -> bool {
             unreachable!("asked from inside a call")
         }
+        fn handed_on(&mut self) {
+            unreachable!("asked from inside a call")
+        }
         fn pause(&mut self) {
             unreachable!("asked from inside a call")
         }
@@ -718,6 +730,9 @@ mod tests {
                 self.tell("carry_out");
             }
             changed
+        }
+        fn handed_on(&mut self) {
+            self.asked.push(format!("handed on, {}", if self.sound.is_some() { "sounding" } else { "silent" }));
         }
         fn pause(&mut self) {
             self.asked.push("pause, its own".into());
@@ -1132,7 +1147,9 @@ mod tests {
         // The queue is A's own by taking it, said once it is in the player; B's going
         // quiet was nobody's choice there and claims nothing, so that A, which is playing,
         // is the one whose queue is newest.
-        assert_eq!((pair.asked(0), pair.asked(1)), (vec!["take 4 from 0", "claim"], vec!["next", "claim", "moved"]));
+        // And B is told its queue is A's now before it is asked to stop, so that the stop
+        // is not saved there as a change of B's own.
+        assert_eq!((pair.asked(0), pair.asked(1)), (vec!["take 4 from 0", "claim"], vec!["next", "claim", "handed on, sounding", "moved"]));
         assert_eq!((pair.said(0).last().copied(), pair.players[1].sound, pair.players[0].songs[0].as_str()), (Some("Playing here. Phone B is paused."), None, "s1"));
         assert!(pair.acts[0].contains(&Act::Do { ask: Do::Steering(None) }));
         assert_eq!((pair.players[0].told(), pair.players[1].told()), (vec!["part of it"], vec!["part of it"]));
@@ -1142,7 +1159,7 @@ mod tests {
         pair.event(0, &serde_json::json!({"event": "choose", "place": place, "in_a_jam": false}).to_string());
         pair.pass(1_500);
         assert_eq!((pair.said(0).last().copied(), pair.players[0].sound), (Some("Playing on Phone B."), None));
-        assert_eq!((pair.asked(0), pair.asked(1)), (vec!["take 4 from 0", "claim", "pause, its own"], vec!["next", "claim", "moved", "adopt", "claim"]));
+        assert_eq!((pair.asked(0), pair.asked(1)), (vec!["take 4 from 0", "claim", "handed on, sounding", "pause, its own"], vec!["next", "claim", "handed on, sounding", "moved", "adopt", "claim"]));
         assert_eq!(pair.players[0].told(), ["part of it"]);
     }
 

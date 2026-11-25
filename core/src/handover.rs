@@ -15,10 +15,22 @@
 //! anything played, a seek, next, previous) it is this device's own, and another device's
 //! newer queue is only ever **offered** ("Continue here"), for the person to take or leave.
 //!
+//! **A queue that has been handed to another device is that device's.** When the person
+//! moves their music from this device to another (linking: "Play here" pressed there, or
+//! this device's music carried on there), the other device took the queue by the person's
+//! own choice and it is theirs there. On this one it is from that moment in the same state
+//! as a queue taken up from that device and not touched: **it is not saved, and it
+//! follows** (what that device saves is put in its place, paused), until the person uses
+//! it here. Otherwise the stop that ends the move, on a device that had played on since
+//! its last save, would be saved with a fresh time and could land after the other
+//! device's first save: the silent device would be the newest. [`HANDED`] is what
+//! [`Here::taken`] is set to, at the moment the queue is handed on and before this
+//! device's sound is stopped.
+//!
 //! **The contract.** What an app keeps, and saves with the queue so that it is there after a
 //! restart: [`Here::stamp`], when the queue was last changed or played on here, **by this
 //! device's own clock**; and [`Here::taken`], set when the queue is one taken up from
-//! another device and cleared when anything is done to it here.
+//! another device or handed to one, and cleared when anything is done to it here.
 //!
 //! What every app owes, the Windows app and the phone alike:
 //!
@@ -106,6 +118,12 @@ pub const QUEUE_AHEAD: usize = 450;
 /// For how long after another device saved its queue it is offered as "Continue here".
 pub const OFFER_FOR: i64 = 30 * 60;
 
+/// What [`Here::taken`] is while the queue is one this device has handed to another and
+/// not used since (see the top of this file). It is no time a server gives a save, so no
+/// saved queue is ever taken for "the one already taken up": whatever the other device
+/// saves is followed.
+pub const HANDED: &str = "handed to another device";
+
 /// The name a device gives when it saves the queue, so it can tell its own from others'.
 /// `id` is made up once by the device: eight hex digits.
 pub fn device_name(id: &str) -> String {
@@ -151,7 +169,8 @@ pub struct Here {
     pub stamp: i64,
     /// Set while the queue is one taken up from another device with nothing done to it or
     /// played of it here since: when that device saved it, as the server said
-    /// ([`Place::taken`]).
+    /// ([`Place::taken`]). And while it is one handed to another device and not used here
+    /// since: [`HANDED`].
     pub taken: Option<String>,
     /// The songs of this device's queue, in order, as it would save them ([`window`]'s
     /// `ids`): what tells another device's queue with the same song current from the same
@@ -425,6 +444,41 @@ mod tests {
         let played = Here { taken: None, stamp: DAY + 660, ..taken.clone() };
         assert_eq!(save(&theirs, &played, RIGHT), Save::Save);
         assert!(matches!(look(&saved(PC, 700, &["z"], "z", 0), &taken, RIGHT, DAY + 800).then, Then::TakeUp(_)));
+    }
+
+    /// The person moved their music from this device to the PC. This device had played on
+    /// since its last save, and stops now: nobody's choice here.
+    #[test]
+    fn a_queue_handed_to_another_device_is_not_saved_and_follows_until_it_is_used_here() {
+        let handed = |playing: bool| Here { taken: Some(HANDED.into()), playing, ..here(100) };
+        // Its own last save is what the server holds (the PC has not saved yet), or the
+        // PC's first save is, made a moment before this device was told the music had
+        // moved: either way it does not save. Not even while its sound is still going.
+        let own = saved(ME, 90, &["mine", "next"], "mine", 0);
+        let theirs = saved(PC, 101, &["mine", "next"], "mine", 30_000);
+        for playing in [false, true] {
+            assert_eq!(first(&handed(playing)), First::Read);
+            for held in [&own, &theirs, &PlayQueue::default()] {
+                assert_eq!(save(held, &handed(playing), RIGHT), Save::NotNewest, "playing {playing}");
+            }
+        }
+        // (Left as its own, the stop would have been a change to save, and saved: the
+        // silent device the newest.)
+        assert_eq!(save(&own, &here(100), RIGHT), Save::Save);
+        // It follows: what the PC saves is put in its place, paused, and from then on it
+        // is a queue taken up from the PC like any other. Nothing is offered meanwhile, and
+        // no save is owed.
+        assert_eq!(look(&own, &handed(false), RIGHT, DAY + 105), Looked { offer: None, then: Then::Nothing });
+        let followed = look(&theirs, &handed(false), RIGHT, DAY + 105);
+        assert_eq!(followed, Looked { offer: None, then: Then::TakeUp(place(&theirs, RIGHT)) });
+        let next = saved(PC, 160, &["mine", "next"], "next", 5_000);
+        let taken_up = Here { taken: Some(theirs.changed.clone()), stamp: DAY + 101, ..here(0) };
+        assert_eq!(look(&next, &taken_up, RIGHT, DAY + 165).then, Then::TakeUp(place(&next, RIGHT)));
+        // The mark is no time a server gives: the PC's save is never "the one already taken up".
+        assert_ne!(theirs.changed, HANDED);
+        // Until the person uses it here: then it is this device's own, changed now, and saved.
+        let used = Here { taken: None, playing: true, ..here(170) };
+        assert_eq!((first(&used), save(&next, &Here { playing: false, ..used.clone() }, RIGHT)), (First::Save, Save::Save));
     }
 
     #[test]
