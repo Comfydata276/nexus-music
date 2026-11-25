@@ -799,6 +799,12 @@ impl Lidarr {
     /// The same, without waiting for Lidarr to begin: for a caller that watches for it to
     /// finish (see `busy_with`) and puts the setting back itself (see `set_new_releases`).
     pub fn start_listing_singles(&self, artist: i64, wanted: &Offer) -> Result<Option<String>, String> {
+        self.start_listing_singles_kept(artist, wanted, |_| Ok(()))
+    }
+
+    /// The same, handing `keep` what the setting is to be put back to **before Lidarr is
+    /// changed**: if `keep` can't keep it, Lidarr isn't changed, and its answer is the error.
+    pub fn start_listing_singles_kept(&self, artist: i64, wanted: &Offer, keep: impl FnOnce(&str) -> Result<(), String>) -> Result<Option<String>, String> {
         let profiles: Vec<serde_json::Value> = self.get("metadataprofile")?;
         let mut record: serde_json::Value = self.get(&format!("artist/{artist}"))?;
         let current = profiles.iter().find(|profile| profile.get("id") == record.get("metadataProfileId"));
@@ -815,6 +821,7 @@ impl Lidarr {
             ));
         }
         let before = record.get("monitorNewItems").and_then(|setting| setting.as_str()).unwrap_or("all").to_string();
+        keep(&before)?;
         record["metadataProfileId"] = ours.get("id").cloned().unwrap_or_default();
         record["monitorNewItems"] = "none".into();
         let _: serde_json::Value = self.send("PUT", &format!("artist/{artist}"), Some(record))?;

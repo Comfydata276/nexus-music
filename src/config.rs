@@ -782,6 +782,26 @@ pub fn clear_leftovers(dir: &Path, ours: &[&str]) {
     }
 }
 
+/// Moves a file that couldn't be read aside, under a name of its own (`asked.json` to
+/// `asked.damaged-20261126-101500.json`, with `-2` and so on after it if that is had), never
+/// over another. Says where it went, or `None` if it couldn't be moved: then it is where it
+/// was.
+pub fn set_aside(path: &Path) -> Option<PathBuf> {
+    let stem = path.file_stem()?.to_string_lossy().into_owned();
+    let extension = path.extension().map(|extension| format!(".{}", extension.to_string_lossy())).unwrap_or_default();
+    let when = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    for count in 1..100 {
+        let more = if count == 1 { String::new() } else { format!("-{count}") };
+        let aside = path.with_file_name(format!("{stem}.damaged-{when}{more}{extension}"));
+        match place_new(path, &aside) {
+            Ok(()) => return Some(aside),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
 /// The app's own files in the settings folder and the data folder, by how their names
 /// start (`clear_leftovers`).
 pub const SETTINGS_FILES: &[&str] = &["settings", "queue", "history", "pending", "playlist-added", "asked", "asking", "plays", "shared-record-kept-"];

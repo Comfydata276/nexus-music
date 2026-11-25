@@ -673,16 +673,20 @@ mod tests {
         assert_eq!(shared(), [("a".to_string(), 100), ("b".to_string(), 200)]);
         // A play made here while the file can't be written is counted, but nothing is said
         // to be kept until it has been: then it is in the file, once, with the others.
-        // (A folder stands where the file is.)
+        // (The file is made read-only, and then writable again: with nothing in between
+        // for the saver, which tries again in its own time, to write to.)
         let mut log = PlayLog::load(&old, &[]);
-        let away = path.with_extension("away");
-        std::fs::rename(&path, &away).unwrap();
-        std::fs::create_dir(&path).unwrap();
+        let writable = |yes: bool| {
+            let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            permissions.set_readonly(!yes);
+            std::fs::set_permissions(&path, permissions).unwrap();
+        };
+        writable(false);
         log.add("c", 300, "playlist:q");
         assert_eq!(shared().len(), 3);
         assert!(log.keep(&[], &[]).is_err() && log.keep(&[("d".to_string(), 400)], &[]).is_err());
-        std::fs::remove_dir(&path).unwrap();
-        std::fs::rename(&away, &path).unwrap();
+        writable(true);
         assert_eq!(log.keep(&[("d".to_string(), 400)], &[]).unwrap(), 1);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "[\"a\",100]\n[\"b\",200]\n[\"c\",300,\"playlist:q\"]\n[\"d\",400]\n");
         // A play already in the log is given a source that another device tells of later,

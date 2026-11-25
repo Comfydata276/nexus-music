@@ -138,6 +138,12 @@ pub trait Desk: Send + Sync {
     /// Writes the batch down where it's kept between runs, or removes what's written there
     /// (`None`: there's nothing to keep).
     fn keep(&self, batch: Option<Vec<u8>>);
+    /// Writes the batch down and says whether it is on the disk: for what must be kept
+    /// before Lidarr is changed (the settings to put back).
+    fn keep_checked(&self, batch: Vec<u8>) -> bool {
+        self.keep(Some(batch));
+        true
+    }
     /// The time, in seconds since 1970: when something was noted as asked for.
     fn now(&self) -> i64;
     /// Whether singles and EPs are asked for as well as albums. Read once a run, when the
@@ -216,6 +222,12 @@ impl Job {
     fn save(&self) {
         let json = self.with(|batch| if batch.wants.is_empty() && batch.restore.is_empty() && batch.proof.is_none() { None } else { serde_json::to_vec(batch).ok() });
         self.desk.keep(json);
+    }
+
+    /// Writes the batch down and says whether it is on the disk (`Desk::keep_checked`).
+    fn save_checked(&self) -> bool {
+        let json = self.with(|batch| serde_json::to_vec(batch).ok());
+        json.is_some_and(|json| self.desk.keep_checked(json))
     }
 
     /// Hands over albums to ask for. If a batch is still under way they join it; otherwise they
@@ -825,10 +837,18 @@ impl Job {
                 None if reading => Went::Sent(false),
                 // Lidarr only lists the kinds of release an artist's profile names. A single, an
                 // EP or a soundtrack may just need the artist moved to a profile that names those.
-                None if offer.kind() != "Album" || offer.soundtrack => match lidarr.start_listing_singles(artist, offer) {
-                    Ok(Some(before)) => {
-                        self.with(|batch| batch.restore.push((artist, before)));
-                        self.save();
+                // What it is to be put back to is on the disk before Lidarr is changed, or Lidarr
+                // isn't changed. (If changing it fails after, what was written down stays: it
+                // may have been changed all the same, and putting back what wasn't is nothing.)
+                None if offer.kind() != "Album" || offer.soundtrack => match lidarr.start_listing_singles_kept(artist, offer, |before| {
+                    self.with(|batch| batch.restore.push((artist, before.to_string())));
+                    if self.save_checked() {
+                        return Ok(());
+                    }
+                    self.with(|batch| batch.restore.retain(|(known, _)| *known != artist));
+                    Err(format!("What Lidarr's settings for {} would have to be put back to couldn't be written down on this PC first, so they weren't changed", offer.artist))
+                }) {
+                    Ok(Some(_)) => {
                         reading = true;
                         Went::Sent(false)
                     }
@@ -1284,6 +1304,47 @@ mod tests {
         fn singles(&self) -> bool {
             true
         }
+    }
+
+    /// Writes down what's kept in passing, and can't make sure of anything on the disk.
+    struct Unsure(Arc<Mutex<Option<Vec<u8>>>>);
+
+    impl Desk for Unsure {
+        fn keep(&self, batch: Option<Vec<u8>>) {
+            *self.0.lock().unwrap() = batch;
+        }
+
+        fn keep_checked(&self, _: Vec<u8>) -> bool {
+            false
+        }
+
+        fn now(&self) -> i64 {
+            0
+        }
+
+        fn singles(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn a_setting_that_cant_be_written_down_first_is_not_changed_on_lidarr() {
+        // The same single as below; but what is to be put back can't be made sure of on the
+        // disk before Lidarr is changed: so Lidarr isn't, and the batch says why.
+        let kept = Arc::new(Mutex::new(None));
+        let job = Job::new(Unsure(kept.clone()));
+        let changed = Arc::new(Stopped(AtomicBool::new(false)));
+        let http: Arc<dyn crate::http::Http> = changed.clone();
+        let lidarr = Lidarr::new("lidarr.test", "key", None, http.clone());
+        let musicbrainz = MusicBrainz::new(http.clone(), crate::listenbrainz::ListenBrainz::new(http));
+        job.start(vec![Want { artist: "Someone".into(), album: "A Single".into(), ..Default::default() }]);
+        assert!(job.begin());
+        job.work_through(&lidarr, &musicbrainz, &|_| {});
+        assert!(!changed.0.load(Ordering::SeqCst), "Lidarr was changed with nothing written down to put it back");
+        let written: serde_json::Value = serde_json::from_slice(kept.lock().unwrap().as_ref().unwrap()).unwrap();
+        assert_eq!(written["restore"], serde_json::json!([]));
+        assert_eq!(written["wants"][0]["state"], "Failed");
+        assert!(written["wants"][0]["reason"].as_str().unwrap().contains("couldn't be written down"), "{}", written["wants"][0]["reason"]);
     }
 
     #[test]

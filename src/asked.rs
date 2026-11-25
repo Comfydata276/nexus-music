@@ -23,45 +23,45 @@ pub struct AskedList {
     /// The file is there and could not be read: it is not written over (see `read_back`).
     held: bool,
     /// What the person is told on the Requests page about the file, if anything.
-    trouble: &'static str,
+    trouble: String,
 }
 
 /// A copy for the threads that look for arrivals and draw the Requests page.
 static SHARED: RwLock<Vec<Asked>> = RwLock::new(Vec::new());
 /// What the Requests page says about the file the list is kept in, if anything.
-static TROUBLE: RwLock<&'static str> = RwLock::new("");
+static TROUBLE: RwLock<String> = RwLock::new(String::new());
 
 pub fn shared() -> Vec<Asked> {
     SHARED.read().map(|items| items.clone()).unwrap_or_default()
 }
 
 /// For the Requests page: the list's file was found damaged or could not be read.
-pub fn trouble() -> &'static str {
-    TROUBLE.read().map(|trouble| *trouble).unwrap_or("")
+pub fn trouble() -> String {
+    TROUBLE.read().map(|trouble| trouble.clone()).unwrap_or_default()
 }
 
 const FOUND_EMPTY: &str = "The list of albums asked for through this app was found empty: the app was stopped while it was saving it. Albums asked for before then won't be announced when they arrive, or put into their playlists. Lidarr still fetches them, and what it's fetching is shown here.";
-const FOUND_DAMAGED: &str = "The list of albums asked for through this app couldn't be read, so albums asked for before now won't be announced when they arrive, or put into their playlists. Lidarr still fetches them, and what it's fetching is shown here. The file has been kept as asked.damaged.json.";
+const FOUND_DAMAGED: &str = "The list of albums asked for through this app couldn't be read, so albums asked for before now won't be announced when they arrive, or put into their playlists. Lidarr still fetches them, and what it's fetching is shown here.";
 const NOT_READ: &str = "The list of albums asked for through this app couldn't be read just now, so it has been left as it is. It is read again when something is next asked for, and when the app next starts.";
 
 /// What the file holds, read back. **A file that could not be read is never taken for an
 /// empty list**: one that is there and can't be read just now is left as it is, and not
 /// written over (`held`); one that reads and isn't a list (cut short by 0.40.10 or earlier,
-/// which wrote it in place) is kept aside as `asked.damaged.json`, and only then written
-/// afresh. An empty file is what such a cut left: there is nothing to keep of it.
-fn read_back(path: &Path) -> (Vec<Asked>, bool, &'static str) {
+/// which wrote it in place) is moved aside under a name of its own (`config::set_aside`),
+/// and only then written afresh; if it can't be moved, it is held as one that can't be read.
+/// An empty file is what such a cut left: there is nothing to keep of it.
+fn read_back(path: &Path) -> (Vec<Asked>, bool, String) {
     match std::fs::read(path) {
         Ok(bytes) => match serde_json::from_slice(&bytes) {
-            Ok(items) => (items, false, ""),
-            Err(_) if bytes.iter().all(u8::is_ascii_whitespace) => (Vec::new(), false, FOUND_EMPTY),
-            Err(_) => {
-                let aside = path.with_extension("damaged.json");
-                let kept = std::fs::rename(path, &aside).is_ok();
-                (Vec::new(), !kept, if kept { FOUND_DAMAGED } else { NOT_READ })
-            }
+            Ok(items) => (items, false, String::new()),
+            Err(_) if bytes.iter().all(u8::is_ascii_whitespace) => (Vec::new(), false, FOUND_EMPTY.into()),
+            Err(_) => match crate::config::set_aside(path) {
+                Some(aside) => (Vec::new(), false, format!("{FOUND_DAMAGED} The file has been kept as {}.", aside.file_name().unwrap_or_default().to_string_lossy())),
+                None => (Vec::new(), true, NOT_READ.into()),
+            },
         },
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (Vec::new(), false, ""),
-        Err(_) => (Vec::new(), true, NOT_READ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (Vec::new(), false, String::new()),
+        Err(_) => (Vec::new(), true, NOT_READ.into()),
     }
 }
 
@@ -78,7 +78,7 @@ impl AskedList {
             *shared = self.items.clone();
         }
         if let Ok(mut shared) = TROUBLE.write() {
-            *shared = self.trouble;
+            shared.clone_from(&self.trouble);
         }
     }
 
@@ -277,7 +277,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("asked.json");
-        let aside = dir.join("asked.damaged.json");
         let cradlesong = || Asked { title: "Cradlesong".into(), artist: "Rob Thomas".into(), at: 100, ..Default::default() };
         // What 0.40.10 left, killed while it saved the list in place: an empty file. Nothing
         // can be had back from it, and the person is told why arrivals of what they asked
@@ -293,7 +292,10 @@ mod tests {
         let whole = std::fs::read(&path).unwrap();
         std::fs::write(&path, &whole[..whole.len() / 2]).unwrap();
         let mut list = AskedList::load(&path);
-        assert_eq!((list.items.len(), list.trouble), (0, FOUND_DAMAGED));
+        // (Kept under a name of its own, which the page names: a second never replaces it.)
+        let aside = std::fs::read_dir(&dir).unwrap().map(|entry| entry.unwrap().path()).find(|path| path.file_name().unwrap().to_string_lossy().starts_with("asked.damaged-")).unwrap();
+        assert!(list.items.is_empty() && list.trouble.starts_with(FOUND_DAMAGED));
+        assert!(list.trouble.contains(&*aside.file_name().unwrap().to_string_lossy()));
         assert_eq!(std::fs::read(&aside).unwrap(), &whole[..whole.len() / 2]);
         list.add(Asked { title: "Parachutes".into(), artist: "Coldplay".into(), ..Default::default() });
         crate::saver::saver().flush();
@@ -317,7 +319,7 @@ mod tests {
         std::fs::rename(&path, &away).unwrap();
         std::fs::create_dir(&path).unwrap();
         let mut list = AskedList::load(&path);
-        assert_eq!((list.items.len(), list.trouble), (0, NOT_READ));
+        assert_eq!((list.items.len(), list.trouble.as_str()), (0, NOT_READ));
         list.add(Asked { title: "Parachutes".into(), artist: "Coldplay".into(), at: 200, ..Default::default() });
         crate::saver::saver().flush();
         assert!(path.is_dir(), "written over");

@@ -1866,6 +1866,7 @@ impl Controller {
             return;
         }
         let (notice, action, other) = crate::bulk::summary().notice();
+        let notice = pages::requests_notice(&notice);
         let view = self.ui.global::<ui::View>();
         view.set_notice(notice.as_str().into());
         view.set_notice_action(action.into());
