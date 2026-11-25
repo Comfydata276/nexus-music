@@ -665,6 +665,8 @@ export global Settings {
     in property <bool> check-updates;
     // Share the queue, pins and so on with the app on other devices.
     in property <bool> sync;
+    // What is wrong, when this PC isn't sharing as it should (its clock, say); else empty.
+    in property <string> sync-note;
     // What the last check for a new version found, in words.
     in property <string> update-status;
     // The newer version on offer; empty when there is none.

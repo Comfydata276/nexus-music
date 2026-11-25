@@ -702,18 +702,11 @@ impl Controller {
                 self.toast("Download removed");
             }
             ("pin", Target::Playlist { id, .. }) | ("unpin", Target::Playlist { id, .. }) => {
-                {
-                    let mut settings = self.settings.borrow_mut();
-                    let was_pinned = settings.pinned_playlists.contains(id);
-                    settings.pinned_playlists.retain(|p| p != id);
-                    if !was_pinned {
-                        settings.pinned_playlists.push(id.clone());
-                    }
-                    settings.pins_at = chrono::Utc::now().timestamp();
+                use nexus_core::step::Change;
+                let pinned = self.settings.borrow().pinned_playlists.contains(id);
+                if self.choose(if pinned { Change::Unpin(id.clone()) } else { Change::Pin(id.clone()) }) {
+                    self.show_playlists();
                 }
-                self.save_settings();
-                self.show_playlists();
-                self.share_soon();
             }
             ("cancel-download", Target::Song { song, .. }) => {
                 self.cancel_downloads(std::slice::from_ref(&song.id));
@@ -1154,7 +1147,8 @@ impl Controller {
                     move |ctl, result| match result {
                         Ok(()) => {
                             ctl.invalidate(&key);
-                            ctl.update_list_prefs(&key, |prefs| *prefs = Default::default());
+                            // (Back to the usual choices, on every device.)
+                            ctl.choose(nexus_core::step::Change::Usual { key: key.clone() });
                             if let Route::Playlist(id) = &page {
                                 ctl.added.borrow_mut().forget(id);
                             }

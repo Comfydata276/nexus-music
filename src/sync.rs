@@ -15,10 +15,12 @@ use std::time::Duration;
 
 use slint::ComponentHandle as _;
 
+use nexus_core::record::{self, Read};
+use nexus_core::step::{Answers, Change, Choices, Device, Found, Outcome, Plan, Stated, Write, find, settle};
+use nexus_core::sync::{PLAYS_SHARED, merge_plays};
 pub use nexus_core::sync::{HISTORY_LENGTH, PLAYLIST_NAME};
-use nexus_core::sync::{LONG_AGO, PLAYS_SHARED, Shared, VERSION, list_rank, merge, merge_history, merge_plays};
 
-use crate::added::parse_time;
+use crate::added::{Notes, parse_time};
 use crate::config::Played;
 use crate::controller::{Controller, Route, with};
 use crate::subsonic::{ApiError, ApiResult, Client, PlayQueue, Song};
@@ -31,73 +33,97 @@ const LOOK: Duration = Duration::from_secs(60);
 const QUEUE_BEHIND: usize = 50;
 /// ...and this many from it onwards.
 const QUEUE_AHEAD: usize = 450;
+/// The file, beside the settings, that holds the shared record's text as this version first
+/// found it (see `Controller::exchanged`).
+pub const RECORD_KEPT: &str = "shared-record-kept.json";
 
-/// What an exchange with the server came back with.
-pub struct Outcome {
-    playlist: String,
-    shared: Shared,
-    /// The songs of `shared.history`, for the ones that could be found.
-    songs: HashMap<String, Song>,
+// What an exchange decides is the library's (`nexus_core::step`), the same for every app:
+// which playlist holds the record, what the server's answers mean, what to keep, take in and
+// write. What follows is this app's part of it: asking the server, and (in `impl Controller`)
+// the timers, the files, and showing what came back.
+
+/// What this PC holds, as an exchange begins.
+#[derive(Debug, Clone, Default)]
+pub struct Holds {
+    pub username: String,
+    pub choices: Choices,
+    pub notes: Notes,
+    pub history: Vec<(String, i64)>,
+    pub plays: Vec<(String, i64)>,
+    pub play_sources: Vec<(String, i64, String)>,
 }
 
-fn find_or_create(client: &Client) -> ApiResult<String> {
-    let mine = client.username().to_lowercase();
-    let found = client
-        .playlists()?
-        .into_iter()
-        .filter(|p| p.name == PLAYLIST_NAME && (p.owner.is_empty() || p.owner.to_lowercase() == mine))
-        .map(|p| p.id)
-        .min();
-    match found {
-        Some(id) => Ok(id),
-        None => Ok(client.create_playlist(PLAYLIST_NAME, &[])?.id),
-    }
-}
-
-/// Reads what's on the server, combines it with what this device has, writes the result
-/// back if that adds anything, and returns it.
-fn exchange(client: &Client, known: Option<String>, local: Shared, mut songs: HashMap<String, Song>) -> ApiResult<Outcome> {
-    let now = chrono::Utc::now().timestamp();
-    let first = match known {
-        Some(id) => client.playlist(&id),
-        None => client.playlist(&find_or_create(client)?),
-    };
-    let playlist = match first {
-        Ok(playlist) if playlist.name == PLAYLIST_NAME => playlist,
-        // Renamed or deleted from another app: find it again, or start a new one.
-        Ok(_) | Err(ApiError::Server { .. }) => client.playlist(&find_or_create(client)?)?,
-        Err(e) => return Err(e),
-    };
-    let remote: Shared = serde_json::from_str(&playlist.comment).unwrap_or_default();
-    if remote.nexus_music_sync > VERSION {
-        // Written by a newer version of the app: read what's understood, change nothing.
-        return Ok(Outcome { playlist: playlist.id, shared: remote, songs });
-    }
-    let merged = merge(&local, &remote, now);
-    if merged != remote {
-        let text = serde_json::to_string(&merged).unwrap_or_default();
-        client.set_playlist_comment(&playlist.id, &text)?;
-    }
-    // Songs played elsewhere that this device hasn't met.
-    for (id, _) in &merged.history {
-        if !songs.contains_key(id) {
-            if let Ok(song) = client.song(id) {
-                songs.insert(id.clone(), song);
-            }
+/// Reads what the server has (the list of playlists, then the one that holds the record) and
+/// has the library decide what follows from it. Nothing is written.
+pub fn look(client: &Client, holds: &Holds) -> ApiResult<Outcome> {
+    let listed = client.playlists_stated()?;
+    let (playlist, date, received) = match find(&listed.value, &holds.username) {
+        Found::Ours(id) => {
+            let answer = client.playlist_stated(&id)?;
+            (Some(answer.value), answer.date, answer.received)
         }
-    }
-    Ok(Outcome { playlist: playlist.id, shared: merged, songs })
+        _ => (None, listed.date, listed.received),
+    };
+    let device = Device {
+        username: &holds.username,
+        choices: holds.choices.clone(),
+        notes: holds.notes.clone(),
+        history: holds.history.clone(),
+        plays: holds.plays.clone(),
+        play_sources: holds.play_sources.clone(),
+    };
+    Ok(settle(&device, &Answers { listed: &listed.value, playlist: playlist.as_ref(), date, received }))
 }
 
-/// Reads what's shared without changing anything, for a first look before the window opens.
-fn peek(client: &Client, known: &str) -> Option<(String, Shared)> {
-    let playlist = if known.is_empty() {
-        let id = client.playlists().ok()?.into_iter().filter(|p| p.name == PLAYLIST_NAME).map(|p| p.id).min()?;
-        client.playlist(&id).ok()?
-    } else {
-        client.playlist(known).ok()?
+/// Makes a write the library asked for: the playlist first, if there is none (asked for
+/// once: if the text then can't be written, the next exchange finds the playlist empty and
+/// fills it). Returns the playlist it went into.
+pub fn send(client: &Client, write: &Write) -> ApiResult<String> {
+    let id = match &write.into {
+        Some(id) => id.clone(),
+        None => client.create_playlist(PLAYLIST_NAME, &[])?.id,
     };
-    (playlist.name == PLAYLIST_NAME).then(|| (playlist.id, serde_json::from_str(&playlist.comment).unwrap_or_default()))
+    if id.is_empty() {
+        return Err(ApiError::NotSubsonic("The new playlist came back without an id.".into()));
+    }
+    client.set_playlist_comment(&id, &write.text)?;
+    Ok(id)
+}
+
+/// The theme the record has, without changing anything, for a first look before the window
+/// opens: the playlist it was found in, the theme and when it was chosen. `known` is the
+/// playlist the record was in last time, which saves listing them all if it is still that:
+/// still of that name, and still stated to be the account's own.
+fn peek(client: &Client, known: &str) -> Option<(String, String, i64)> {
+    let ours = |playlist: &Stated| playlist.name == PLAYLIST_NAME && matches!(find(std::slice::from_ref(playlist), client.username()), Found::Ours(_));
+    let remembered = (!known.is_empty()).then(|| client.playlist_stated(known).ok()).flatten().map(|answer| answer.value).filter(ours);
+    let playlist = match remembered {
+        Some(playlist) => playlist,
+        None => match find(&client.playlists_stated().ok()?.value, client.username()) {
+            Found::Ours(id) => Some(client.playlist_stated(&id).ok()?.value).filter(ours)?,
+            _ => return None,
+        },
+    };
+    let shared = match record::read(playlist.comment.as_deref().unwrap_or("")) {
+        Read::Record(record) => record.shared,
+        Read::Later { shared: Some(shared), .. } => shared,
+        _ => return None,
+    };
+    Some((playlist.id, shared.theme, shared.theme_at))
+}
+
+/// Whether version `a` is later than version `b` ("0.41.0" against "0.40.4"; anything
+/// against none).
+fn later_version(a: &str, b: &str) -> bool {
+    let parts = |version: &str| version.split('.').map(|part| part.parse::<u64>().unwrap_or(0)).collect::<Vec<_>>();
+    !a.is_empty() && (b.is_empty() || parts(a) > parts(b))
+}
+
+/// What came back from a look at the server, with the songs of Recently played that this PC
+/// hadn't met.
+pub struct Looked {
+    outcome: Outcome,
+    songs: HashMap<String, Song>,
 }
 
 impl Controller {
@@ -111,29 +137,27 @@ impl Controller {
         }
         let known = self.settings.borrow().sync_playlist.clone();
         self.api_pool.spawn(move || {
-            let Some((playlist, theirs)) = peek(&client, &known) else { return };
-            crate::controller::post(move |ctl| ctl.theme_arrived(playlist, theirs));
+            let Some((playlist, theme, at)) = peek(&client, &known) else { return };
+            crate::controller::post(move |ctl| ctl.theme_arrived(playlist, theme, at));
         });
     }
 
-    fn theme_arrived(&self, playlist: String, theirs: Shared) {
+    fn theme_arrived(&self, playlist: String, theme: String, at: i64) {
         if self.client().is_none() {
             return;
         }
         let changed = {
             let mut settings = self.settings.borrow_mut();
-            settings.sync_playlist = playlist.clone();
-            let known = crate::config::THEMES.iter().any(|t| t.name == theirs.theme);
-            let newer = known && (theirs.theme_at, &theirs.theme) > (settings.theme_at, &settings.theme);
-            if newer {
-                settings.theme = theirs.theme.clone();
-                settings.theme_at = theirs.theme_at;
+            settings.sync_playlist = playlist;
+            let before = settings.theme.clone();
+            // (Agreed, as the record has it; a theme chosen here since still shows on top.)
+            if crate::config::THEMES.iter().any(|t| t.name == theme) && settings.choices.theme_seen(&theme, at) {
+                settings.show();
             }
-            newer
+            settings.theme != before
         };
-        *self.sync_playlist.borrow_mut() = Some(playlist);
+        self.save_settings();
         if changed {
-            self.save_settings();
             self.apply_theme();
             self.push_settings();
         }
@@ -155,10 +179,6 @@ impl Controller {
     /// Starts keeping in step: now, and every so often from here on.
     pub fn start_sync(self: &Rc<Self>) {
         self.sync_busy.set(false);
-        if self.sync_playlist.borrow().is_none() {
-            let known = self.settings.borrow().sync_playlist.clone();
-            *self.sync_playlist.borrow_mut() = (!known.is_empty()).then_some(known);
-        }
         self.look_elsewhere();
         self.sync_look_timer.start(slint::TimerMode::Repeated, LOOK, || {
             with(|ctl| ctl.look_elsewhere());
@@ -170,7 +190,8 @@ impl Controller {
         self.sync_timer.stop();
         self.queue_timer.stop();
         self.sync_busy.set(false);
-        *self.sync_playlist.borrow_mut() = None;
+        self.clock_offset.set(None);
+        self.sync_says("");
     }
 
     /// Picks up whatever other devices have changed.
@@ -193,21 +214,49 @@ impl Controller {
         }
     }
 
-    /// What this device has to share.
-    fn shared_here(&self) -> Shared {
+    /// The person changed one of the choices that are shared between devices: a pin, a
+    /// list's shuffle or sort, the theme. It is kept as the change, to be made at the next
+    /// exchange to whatever the server has then, and it is **on the disk before it is shown
+    /// as made**. Returns whether it was made (the caller then draws it).
+    pub fn choose(&self, change: Change) -> bool {
+        let before = self.settings.borrow().choices.clone();
         {
-            // Choices from before sharing existed have no time on them: give them an old one.
             let mut settings = self.settings.borrow_mut();
-            if settings.pins_at == 0 && !settings.pinned_playlists.is_empty() {
-                settings.pins_at = LONG_AGO;
+            settings.choices.change(change);
+            settings.show();
+        }
+        if !self.settings.borrow().save_surely(&self.paths.settings) {
+            {
+                let mut settings = self.settings.borrow_mut();
+                settings.choices = before;
+                settings.show();
             }
-            if settings.theme_at == 0 && settings.theme != crate::config::THEMES[0].name {
-                settings.theme_at = LONG_AGO;
-            }
-            for prefs in settings.lists.values_mut().filter(|prefs| prefs.at == 0) {
-                prefs.at = LONG_AGO;
+            self.toast("That couldn't be saved, so it hasn't been changed.");
+            return false;
+        }
+        self.share_soon();
+        true
+    }
+
+    /// What is said under "Keep my devices in step" when this PC isn't sharing as it should,
+    /// and noted in the diagnostics when it changes. Empty when all is well.
+    fn sync_says(&self, words: &str) {
+        if *self.sync_note.borrow() == words {
+            return;
+        }
+        *self.sync_note.borrow_mut() = words.to_string();
+        if !words.is_empty() {
+            let mut said = self.said.borrow_mut();
+            said.push_back((chrono::Utc::now().timestamp(), format!("In step: {words}")));
+            if said.len() > 40 {
+                said.pop_front();
             }
         }
+        self.ui.global::<crate::ui::Settings>().set_sync_note(words.into());
+    }
+
+    /// What this PC has to share.
+    fn holds(&self) -> Holds {
         let settings = self.settings.borrow();
         let playlists = self.playlists.borrow();
         let known: HashSet<&str> = playlists.iter().map(|p| p.id.as_str()).collect();
@@ -216,15 +265,11 @@ impl Controller {
             let kept: HashSet<(&str, i64)> = plays.iter().map(|(song, at)| (song.as_str(), *at)).collect();
             crate::plays::sources().into_iter().filter(|(song, at, _)| kept.contains(&(song.as_str(), *at))).collect()
         };
-        Shared {
-            nexus_music_sync: VERSION,
-            pins: settings.pinned_playlists.clone(),
-            pins_at: settings.pins_at,
-            theme: settings.theme.clone(),
-            theme_at: settings.theme_at,
-            lists: settings.lists.clone(),
+        Holds {
+            username: settings.username.clone(),
+            choices: settings.choices.clone(),
             // Before the playlists have loaded there's no telling which still exist.
-            added: self.added.borrow().shared((!known.is_empty()).then_some(&known)),
+            notes: self.added.borrow().shared((!known.is_empty()).then_some(&known)),
             history: self.history.borrow().iter().map(|played| (played.song.id.clone(), played.at)).collect(),
             play_sources,
             plays,
@@ -240,85 +285,160 @@ impl Controller {
             self.sync_again.set(true);
             return;
         }
-        let local = self.shared_here();
-        let songs: HashMap<String, Song> =
+        let holds = self.holds();
+        let mut songs: HashMap<String, Song> =
             self.history.borrow().iter().map(|played| (played.song.id.clone(), played.song.clone())).collect();
-        let known = self.sync_playlist.borrow().clone();
         self.request(
-            move |client| exchange(client, known, local, songs),
-            |ctl, result| {
-                ctl.sync_busy.set(false);
-                if let Ok(outcome) = result {
-                    ctl.take_shared(outcome);
+            move |client| {
+                let outcome = look(client, &holds)?;
+                // Songs played elsewhere that this device hasn't met.
+                if let Outcome::Go(plan) = &outcome {
+                    for (id, _) in &plan.take.history {
+                        if !songs.contains_key(id) {
+                            if let Ok(song) = client.song(id) {
+                                songs.insert(id.clone(), song);
+                            }
+                        }
+                    }
                 }
-                if ctl.sync_again.replace(false) {
-                    ctl.share_soon();
-                }
+                Ok(Looked { outcome, songs })
+            },
+            |ctl, result| match result {
+                Ok(looked) => ctl.exchanged(looked),
+                Err(_) => ctl.exchange_over(),
             },
         );
     }
 
-    /// Takes in what came back from the server, where it's newer than what's here.
-    fn take_shared(self: &Rc<Self>, outcome: Outcome) {
-        let moved = self.settings.borrow().sync_playlist != outcome.playlist;
-        *self.sync_playlist.borrow_mut() = Some(outcome.playlist.clone());
-        let theirs = outcome.shared;
-        let (mut pins, mut theme, mut lists) = (false, false, moved);
-        {
-            let mut settings = self.settings.borrow_mut();
-            // Remembered, so the next start can look at it before the window opens.
-            settings.sync_playlist = outcome.playlist;
-            if (theirs.pins_at, &theirs.pins) > (settings.pins_at, &settings.pinned_playlists) {
-                pins = settings.pinned_playlists != theirs.pins;
-                settings.pinned_playlists = theirs.pins.clone();
-                settings.pins_at = theirs.pins_at;
+    /// An exchange has finished, one way or another: the next may begin.
+    fn exchange_over(self: &Rc<Self>) {
+        self.sync_busy.set(false);
+        if self.sync_again.replace(false) {
+            self.share_soon();
+        }
+    }
+
+    /// The server has been read and the library has decided what follows. In the order it
+    /// gives: the plays are kept, on the disk, or nothing more is done; what other devices
+    /// shared is taken in; then the write, if there is one, is made, and only when the
+    /// server has answered that it took it is what it carried counted as agreed.
+    fn exchanged(self: &Rc<Self>, looked: Looked) {
+        let plan = match looked.outcome {
+            Outcome::Stop(stop) => {
+                self.sync_says(stop.words());
+                return self.exchange_over();
             }
-            let known = crate::config::THEMES.iter().any(|t| t.name == theirs.theme);
-            if known && (theirs.theme_at, &theirs.theme) > (settings.theme_at, &settings.theme) {
-                theme = settings.theme != theirs.theme;
-                settings.theme = theirs.theme.clone();
-                settings.theme_at = theirs.theme_at;
+            Outcome::Go(plan) => plan,
+        };
+        // Plays counted on other devices go into this one's log, so the stats cover them
+        // all; and before anything is written back that no longer has room for them.
+        match self.play_log.borrow_mut().keep(&plan.keep.plays, &plan.keep.sources) {
+            Ok(new) if new > 0 => self.invalidate("stats"),
+            Ok(_) => {}
+            Err(_) => {
+                self.sync_says("What other devices shared couldn't be kept on this PC, so nothing was written. It will be asked for again.");
+                return self.exchange_over();
             }
-            for (key, prefs) in &theirs.lists {
-                if settings.lists.get(key).is_none_or(|mine| list_rank(prefs) > list_rank(mine)) {
-                    settings.lists.insert(key.clone(), *prefs);
-                    lists = true;
+        }
+        self.clock_offset.set(plan.offset);
+        self.sync_says(plan.held.map(|held| held.words()).unwrap_or(""));
+        self.take_shared(&plan, looked.songs);
+        let Some(write) = plan.write else { return self.exchange_over() };
+        // The changes it carries are marked as tried, on the disk, before it is sent: if its
+        // answer never comes they are made again at the next exchange.
+        self.settings.borrow_mut().choices.sending(&write);
+        if !self.settings.borrow().save_surely(&self.paths.settings) {
+            return self.exchange_over();
+        }
+        // Before the first write this version ever makes to a record, the text it found is
+        // kept beside the settings, so that a mistake can be undone by hand.
+        let version = env!("CARGO_PKG_VERSION");
+        let keep = !write.found.is_empty() && later_version(version, &self.settings.borrow().record_kept_by);
+        let kept_at = self.paths.settings.with_file_name(RECORD_KEPT);
+        self.request(
+            move |client| {
+                if keep && crate::config::write_surely(&kept_at, write.found.as_bytes()).is_err() {
+                    return Err(ApiError::Network("The shared record couldn't be kept aside first.".into()));
                 }
-            }
-        }
-        if pins || theme || lists {
-            self.save_settings();
-        }
-        if pins {
+                send(client, &write).map(|playlist| (playlist, write, keep))
+            },
+            move |ctl, result| {
+                if let Ok((playlist, write, kept)) = result {
+                    let before = ctl.shown();
+                    {
+                        let mut settings = ctl.settings.borrow_mut();
+                        settings.choices.written(&write);
+                        settings.show();
+                        settings.sync_playlist = playlist;
+                        if kept {
+                            settings.record_kept_by = version.to_string();
+                        }
+                    }
+                    ctl.save_settings();
+                    ctl.show_choices(before);
+                }
+                ctl.exchange_over();
+            },
+        );
+    }
+
+    /// The pins, the theme and the lists' choices as shown.
+    fn shown(&self) -> (Vec<String>, String, HashMap<String, crate::config::ListPrefs>) {
+        let settings = self.settings.borrow();
+        (settings.pinned_playlists.clone(), settings.theme.clone(), settings.lists.clone())
+    }
+
+    /// Draws whichever of the shared choices are no longer as they were `before`.
+    fn show_choices(self: &Rc<Self>, before: (Vec<String>, String, HashMap<String, crate::config::ListPrefs>)) {
+        let now = self.shown();
+        if now.0 != before.0 {
             self.show_playlists();
         }
-        if theme {
+        if now.1 != before.1 {
             self.apply_theme();
             self.push_settings();
         }
-        if lists {
+        if now.2 != before.2 {
             self.sync_page_shuffle();
         }
-        if self.added.borrow_mut().merge(&theirs.added) && matches!(self.current_route(), Some(Route::Playlist(_))) {
+    }
+
+    /// Takes in what other devices shared.
+    fn take_shared(self: &Rc<Self>, plan: &Plan, songs: HashMap<String, Song>) {
+        let before = self.shown();
+        let changed = {
+            let mut settings = self.settings.borrow_mut();
+            let was = settings.choices.clone();
+            settings.choices.take(&plan.take);
+            settings.show();
+            // Remembered, so the next start can look at it before the window opens.
+            let moved = plan.playlist.as_ref().is_some_and(|playlist| *playlist != settings.sync_playlist);
+            if let Some(playlist) = &plan.playlist {
+                settings.sync_playlist = playlist.clone();
+            }
+            moved || settings.choices != was
+        };
+        if changed {
+            self.save_settings();
+        }
+        self.show_choices(before);
+        if self.added.borrow_mut().merge(&plan.take.notes) && matches!(self.current_route(), Some(Route::Playlist(_))) {
             // The dates on screen may have changed.
             self.rebuild_tracks();
-        }
-        // Plays counted on other devices go into this one's log, so the stats cover them all.
-        if self.play_log.borrow_mut().absorb(&theirs.plays, &theirs.play_sources) > 0 {
-            self.invalidate("stats");
         }
         // Recently played: both devices' plays, in order.
         let mine: Vec<(String, i64)> =
             self.history.borrow().iter().map(|played| (played.song.id.clone(), played.at)).collect();
-        let merged = merge_history(&mine, &theirs.history);
-        if merged != mine {
-            let mut known = outcome.songs;
+        if plan.take.history != mine {
+            let mut known = songs;
             for played in self.history.borrow().iter() {
                 known.entry(played.song.id.clone()).or_insert_with(|| played.song.clone());
             }
-            let history: Vec<Played> = merged
-                .into_iter()
-                .filter_map(|(id, at)| known.get(&id).map(|song| Played { song: song.clone(), at }))
+            let history: Vec<Played> = plan
+                .take
+                .history
+                .iter()
+                .filter_map(|(id, at)| known.get(id).map(|song| Played { song: song.clone(), at: *at }))
                 .collect();
             crate::config::save_history(&self.paths.history, &history);
             *self.history.borrow_mut() = history;

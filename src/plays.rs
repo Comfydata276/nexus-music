@@ -132,23 +132,43 @@ impl PlayLog {
         self.lines = shared.len();
     }
 
-    /// Takes in plays made on other devices (see `sync`), leaving out the ones already here.
-    /// `sources` says which playlists some of them were made from. Returns how many were new.
-    pub fn absorb(&mut self, plays: &[(String, i64)], sources: &[(String, i64, String)]) -> usize {
+    /// Takes in plays made on other devices (see `sync`), leaving out the ones already here,
+    /// and **makes sure they are in the file before saying so**. `sources` says which
+    /// playlists some of them were made from. Returns how many were new; or, if they could
+    /// not be written (the disk is full, the file can't be opened), why, and then none of
+    /// them is counted here either.
+    ///
+    /// The record devices share holds only the latest plays. One that is about to fall out
+    /// of it, and that this PC has not yet got, has to be safe here before this PC writes
+    /// the record back without it: so nothing is written back on the strength of plays this
+    /// PC could not keep.
+    pub fn keep(&mut self, plays: &[(String, i64)], sources: &[(String, i64, String)]) -> std::io::Result<usize> {
         let known: std::collections::HashSet<(String, i64)> = match SHARED.read() {
             // Anything another device has to tell is recent, so the newest part is enough to
             // compare with.
             Ok(shared) => shared.iter().rev().take(5000).cloned().collect(),
-            Err(_) => return 0,
+            Err(_) => return Err(std::io::Error::other("the log of plays is in use")),
         };
         let mut new: Vec<&(String, i64)> = plays.iter().filter(|play| !known.contains(*play)).collect();
         new.sort_by_key(|(_, at)| *at);
         new.dedup();
-        for (song, at) in &new {
-            let from = sources.iter().find(|(other, when, _)| other == song && when == at).map(|(_, _, from)| from.as_str()).unwrap_or("");
-            self.add(song, *at, from);
+        if new.is_empty() {
+            return Ok(0);
         }
-        new.len()
+        let from = |song: &str, at: i64| sources.iter().find(|(other, when, _)| other == song && *when == at).map(|(_, _, from)| from.as_str()).unwrap_or("");
+        let text: String = new.iter().map(|(song, at)| line(song, *at, from(song, *at))).collect();
+        let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&self.path)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_data()?;
+        for (song, at) in &new {
+            note_source(song, *at, from(song, *at));
+        }
+        if let Ok(mut shared) = SHARED.write() {
+            shared.extend(new.iter().map(|play| (*play).clone()));
+        }
+        self.lines += new.len();
+        self.trim();
+        Ok(new.len())
     }
 
     /// Notes a play, and the playlist it was made from (its route key) if it was from one.
@@ -191,8 +211,8 @@ mod tests {
         let mut log = PlayLog::load(&old, &[("c".to_string(), 300)]);
         let elsewhere = [("z".to_string(), 350), ("c".to_string(), 300), ("y".to_string(), 320), ("z".to_string(), 350)];
         let from = [("y".to_string(), 320, "playlist:p".to_string())];
-        assert_eq!(log.absorb(&elsewhere, &from), 2);
-        assert_eq!(log.absorb(&elsewhere, &from), 0);
+        assert_eq!(log.keep(&elsewhere, &from).unwrap(), 2);
+        assert_eq!(log.keep(&elsewhere, &from).unwrap(), 0);
         assert_eq!(shared(), [("c".to_string(), 300), ("y".to_string(), 320), ("z".to_string(), 350)]);
         // A play made from a playlist says so, here and after the log is read again.
         log.add("w", 400, "playlist:q");
@@ -204,6 +224,16 @@ mod tests {
         assert_eq!(sources().len(), 2);
         assert_eq!(shared().len(), 4);
         let _ = std::fs::remove_file(&path);
+
+        // Plays that can't be written to the file are not counted as kept: the log is as it
+        // was, here and on the disk. (A folder stands where the file should be.)
+        let before = shared();
+        let blocked = PlayLog { path: std::env::temp_dir(), lines: before.len() };
+        let mut blocked = blocked;
+        assert!(blocked.keep(&[("never".to_string(), 500)], &[]).is_err());
+        assert_eq!(shared(), before);
+        // With nothing new there is nothing to write, and nothing to fail.
+        assert_eq!(blocked.keep(&before, &[]).unwrap(), 0);
 
         // No log at all: it starts from what Recently played has, which is newest first.
         PlayLog::load(&old, &[("y".to_string(), 20), ("x".to_string(), 10)]);

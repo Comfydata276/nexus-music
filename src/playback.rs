@@ -837,7 +837,7 @@ impl Controller {
         self.settings.borrow_mut().shuffle = on;
         self.save_settings();
         // The list being played remembers the choice for next time.
-        self.update_list_prefs(&source, |prefs| prefs.shuffle = on);
+        self.choose_shuffle(&source, on);
         self.sync_transport();
         self.next_changed();
         self.sync_page_shuffle();
@@ -852,7 +852,7 @@ impl Controller {
             self.toggle_shuffle();
         } else {
             let on = !self.list_prefs(&key).shuffle;
-            self.update_list_prefs(&key, |prefs| prefs.shuffle = on);
+            self.choose_shuffle(&key, on);
             self.sync_page_shuffle();
         }
     }

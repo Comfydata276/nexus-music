@@ -426,7 +426,10 @@ pub struct Controller {
     pub queue_timer: slint::Timer,
     pub sync_busy: Cell<bool>,
     pub sync_again: Cell<bool>,
-    pub sync_playlist: RefCell<Option<String>>,
+    /// The server's clock minus this PC's, as the last exchange measured it; and what is
+    /// said under the setting when this PC isn't sharing as it should (see `sync`).
+    pub clock_offset: Cell<Option<i64>>,
+    pub sync_note: RefCell<String>,
     /// When the queue last changed here (or, for one taken from another device, there), and
     /// a fingerprint of it as last saved, to tell a real change from a save of the same thing.
     pub queue_stamp: Cell<i64>,
@@ -575,7 +578,8 @@ impl Controller {
             queue_timer: slint::Timer::default(),
             sync_busy: Cell::new(false),
             sync_again: Cell::new(false),
-            sync_playlist: RefCell::new(None),
+            clock_offset: Cell::new(None),
+            sync_note: RefCell::default(),
             queue_stamp: Cell::new(0),
             queue_sig: Cell::new(crate::playback::queue_fingerprint(&Playback::new(&Settings::default()))),
             queue_quiet: Cell::new(false),
@@ -3208,20 +3212,12 @@ impl Controller {
         self.settings.borrow().lists.get(key).copied().unwrap_or_default()
     }
 
-    pub fn update_list_prefs(&self, key: &str, change: impl FnOnce(&mut crate::config::ListPrefs)) {
-        if key.is_empty() {
-            return;
+    /// The person chose whether the list `key` plays shuffled. (Kept as the change, and
+    /// given its time when it is shared: see `sync::Controller::choose`.)
+    pub fn choose_shuffle(&self, key: &str, on: bool) {
+        if !key.is_empty() {
+            self.choose(nexus_core::step::Change::Shuffle { key: key.to_string(), on });
         }
-        {
-            let mut settings = self.settings.borrow_mut();
-            let mut prefs = settings.lists.get(key).copied().unwrap_or_default();
-            change(&mut prefs);
-            // Kept even when back to the usual choices, so other devices hear of the change.
-            prefs.at = chrono::Utc::now().timestamp();
-            settings.lists.insert(key.to_string(), prefs);
-        }
-        self.save_settings();
-        self.share_soon();
     }
 
     /// Remembers the order the list on screen is shown in, for the next visit.
@@ -3233,11 +3229,9 @@ impl Controller {
             let state = self.track_view.borrow();
             (state.key.clone(), state.sort, state.descending)
         };
-        self.update_list_prefs(&key, |prefs| {
-            prefs.sort = sort;
-            prefs.descending = descending;
-            prefs.sort_chosen = true;
-        });
+        if !key.is_empty() {
+            self.choose(nexus_core::step::Change::Sort { key, sort, descending });
+        }
     }
 
     /// The page's songs in the order they're shown.
@@ -3626,6 +3620,7 @@ impl Controller {
         page.set_close_to_tray(settings.close_to_tray);
         page.set_check_updates(settings.check_updates);
         page.set_sync(settings.sync);
+        page.set_sync_note(self.sync_note.borrow().as_str().into());
         page.set_cache_limit(config::CACHE_LIMITS.iter().position(|limit| limit.1 == settings.cache_limit_mb).unwrap_or(0) as i32);
         page.set_cache_ahead(config::CACHE_AHEAD.iter().position(|songs| *songs == settings.cache_ahead).unwrap_or(0) as i32);
         page.set_requests(settings.requests);
@@ -4020,12 +4015,10 @@ impl Controller {
         settings.on_set_theme(|index| {
             with(|ctl| {
                 let Some(theme) = config::THEMES.get(index as usize) else { return };
-                ctl.change_setting(true, |s| {
-                    s.theme = theme.name.to_string();
-                    s.theme_at = chrono::Utc::now().timestamp();
-                });
-                ctl.share_soon();
-                ctl.apply_theme();
+                if ctl.choose(nexus_core::step::Change::Theme(theme.name.to_string())) {
+                    ctl.push_settings();
+                    ctl.apply_theme();
+                }
             });
         });
         settings.on_set_ui_scale(|index| {

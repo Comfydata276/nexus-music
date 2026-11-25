@@ -190,9 +190,22 @@ pub struct Settings {
     pub device_id: String,
     /// The id of the playlist that holds what's shared between devices, once known.
     pub sync_playlist: String,
-    /// When the pins and the theme were last changed, to settle which device's are newer.
+    /// When the pins and the theme that were last agreed with the server were chosen (see
+    /// `choices`; kept beside them so a version before this one reads the file as its own).
     pub pins_at: i64,
     pub theme_at: i64,
+    /// What this PC holds of the choices shared between devices (the pins, each list's
+    /// shuffle and sort, the theme): what was last agreed with the server, and the changes
+    /// made here since, each kept as the change (see `nexus_core::step`). What is shown,
+    /// and what the rest of the app reads, is the two together: `pinned_playlists`, `lists`
+    /// and `theme` above, brought up to date by `show`.
+    pub choices: nexus_core::step::Choices,
+    /// 1 once `choices` has been filled in. A file from a version that stamped whole values
+    /// has none: its choices are then agreed, at the times they have (see `arrange`).
+    pub in_step: u8,
+    /// The version that last kept the shared record's text aside before writing to it (see
+    /// `sync`): each version does so once, before the first write it makes.
+    pub record_kept_by: String,
     /// Offline mode: don't contact the server; play downloads only.
     pub offline: bool,
     /// Keep the title bar Windows draws, instead of the app's own.
@@ -260,6 +273,9 @@ impl Default for Settings {
             sync_playlist: String::new(),
             pins_at: 0,
             theme_at: 0,
+            choices: Default::default(),
+            in_step: 0,
+            record_kept_by: String::new(),
             offline: false,
             standard_title_bar: false,
             theme: THEMES[0].name.to_string(),
@@ -386,7 +402,37 @@ impl Settings {
     }
 
     fn read(path: &Path) -> Option<Settings> {
-        serde_json::from_slice(&fs::read(path).ok()?).ok()
+        let mut settings: Settings = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+        settings.arrange();
+        Some(settings)
+    }
+
+    /// Brings a file from a version that stamped whole values (0.40.4 and before) under the
+    /// present arrangement: every choice already in it is "agreed", at the time it has, or
+    /// "long ago" where it has none. Nothing is lost and nothing is given a new time; what
+    /// is shown is what was. Done once (`in_step`).
+    fn arrange(&mut self) {
+        if self.in_step >= 1 {
+            return;
+        }
+        let agreed = nexus_core::step::Agreed::from_stamped(&self.pinned_playlists, self.pins_at, &self.theme, self.theme_at, &self.lists, THEMES[0].name);
+        self.choices = nexus_core::step::Choices { agreed, ..Default::default() };
+        self.in_step = 1;
+        self.show();
+    }
+
+    /// Brings what is shown up to date with `choices`: what was agreed with the server,
+    /// with the changes made here on top.
+    pub fn show(&mut self) {
+        let shown = self.choices.shown();
+        self.pinned_playlists = shown.pins;
+        self.lists = shown.lists;
+        // (A theme this version doesn't have, chosen on a device that does, is left to it.)
+        if THEMES.iter().any(|theme| theme.name == shown.theme) {
+            self.theme = shown.theme;
+        }
+        self.pins_at = self.choices.agreed.pins_at;
+        self.theme_at = self.choices.agreed.theme_at;
     }
 
     /// Reads the settings when the app starts. A file that can't be read (cut short by a
@@ -395,9 +441,14 @@ impl Settings {
     /// file is put aside under another name. The second value says so when either happened.
     pub fn load_checked(path: &Path) -> (Settings, Option<String>) {
         let backup = backup_of(path);
+        let fresh = || {
+            let mut settings = Settings::default();
+            settings.arrange();
+            settings
+        };
         if !path.exists() {
             // A first run, or the file was deleted to start afresh.
-            return (Settings::default(), None);
+            return (fresh(), None);
         }
         if let Some(settings) = Settings::read(path) {
             // Good: this is the copy to fall back on next time.
@@ -414,13 +465,19 @@ impl Settings {
             "Your settings file couldn't be read and there was no copy to fall back on. It has been kept as {}, and the app has started with its default settings.",
             aside.file_name().map(|name| name.to_string_lossy().to_string()).unwrap_or_default()
         );
-        (Settings::default(), Some(note))
+        (fresh(), Some(note))
     }
 
     pub fn save(&self, path: &Path) {
         if let Ok(json) = serde_json::to_vec_pretty(self) {
             write_atomically(path, &json);
         }
+    }
+
+    /// Saves the settings and says whether they are on the disk: for a change that must be
+    /// kept before it is shown as made (see `Controller::choose`).
+    pub fn save_surely(&self, path: &Path) -> bool {
+        serde_json::to_vec_pretty(self).is_ok_and(|json| write_surely(path, &json).is_ok())
     }
 
     pub fn theme(&self) -> &'static ThemeColors {
@@ -569,6 +626,18 @@ pub fn write_atomically(path: &Path, bytes: &[u8]) {
     }
 }
 
+/// As `write_atomically`, for what has to be known to be on the disk: written, flushed to
+/// the disk, and put in place, or an error and the file as it was.
+pub fn write_surely(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let temp = path.with_extension("tmp");
+    let mut file = fs::File::create(&temp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(&temp, path)
+}
+
 const KEYRING_SERVICE: &str = "Nexus Music";
 
 fn account(server: &str, username: &str) -> String {
@@ -707,6 +776,51 @@ mod tests {
         assert_eq!(settings.eq_preamp_now(), -4.5);
         settings.eq_gains = [-3.0; 6];
         assert_eq!(settings.eq_preamp_now(), 0.0);
+    }
+
+    #[test]
+    fn a_settings_file_from_a_version_that_stamped_its_choices_loses_and_redates_nothing() {
+        use nexus_core::step::Change;
+        use nexus_core::sync::LONG_AGO;
+        let dir = std::env::temp_dir().join(format!("nexus-settings-step-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        // As 0.40.4 wrote it: pins with their time, a theme chosen before sharing existed
+        // (no time), a list sorted at a known time and one shuffled before lists had times.
+        fs::write(
+            &path,
+            br#"{"server":"https://music.example.org","pinned_playlists":["p1","p2"],"pins_at":1700000000,"theme":"Ocean","theme_at":0,
+                "lists":{"liked":{"shuffle":false,"sort":2,"descending":true,"sort_chosen":true,"at":1700000500},"album:a":{"shuffle":true,"sort":0,"descending":false,"sort_chosen":false,"at":0}},
+                "sync":true,"device_id":"0badc0de","sync_playlist":"abc"}"#,
+        )
+        .unwrap();
+        let (mut settings, note) = Settings::load_checked(&path);
+        assert!(note.is_none());
+        // Everything it showed, it shows.
+        assert_eq!((settings.pinned_playlists.as_slice(), settings.theme.as_str()), (["p1".to_string(), "p2".to_string()].as_slice(), "Ocean"));
+        assert_eq!((settings.lists["liked"].sort, settings.lists["liked"].descending, settings.lists["album:a"].shuffle), (2, true, true));
+        // And each choice is agreed, at the time it had, or "long ago" where it had none.
+        let agreed = &settings.choices.agreed;
+        assert_eq!((agreed.pins.len(), agreed.pins_at, agreed.theme.as_str(), agreed.theme_at), (2, 1_700_000_000, "Ocean", LONG_AGO));
+        assert_eq!((agreed.lists["liked"].at, agreed.lists["album:a"].at), (1_700_000_500, LONG_AGO));
+        assert!(settings.choices.waiting.is_empty() && settings.in_step == 1);
+        // A change made now is kept as the change, puts no time on anything, and is on the
+        // disk before it is shown.
+        assert!(settings.choices.change(Change::Pin("p3".into())));
+        settings.show();
+        assert!(settings.save_surely(&path));
+        let (again, _) = Settings::load_checked(&path);
+        assert_eq!(again.pinned_playlists, ["p1", "p2", "p3"]);
+        assert_eq!((again.pins_at, again.choices.agreed.pins.len(), again.choices.waiting.len()), (1_700_000_000, 2, 1));
+        // The usual theme, never chosen, is nobody's choice; and a first run has nothing agreed.
+        fs::write(&path, br#"{"theme":"Violet"}"#).unwrap();
+        assert_eq!(Settings::load_checked(&path).0.choices.agreed.theme_at, 0);
+        fs::remove_file(&path).unwrap();
+        let (fresh, _) = Settings::load_checked(&path);
+        let agreed = &fresh.choices.agreed;
+        assert_eq!((fresh.in_step, agreed.theme.as_str(), agreed.theme_at, agreed.pins_at, agreed.lists.len()), (1, "Violet", 0, 0, 0));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
