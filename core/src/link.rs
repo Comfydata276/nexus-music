@@ -17,13 +17,18 @@
 
 pub mod command;
 pub mod frame;
+pub mod look;
 pub mod message;
 pub mod moving;
 pub mod news;
+pub mod relay;
 pub mod rule;
 pub mod secret;
+pub mod seen;
 pub mod steer;
 pub mod text;
+pub mod view;
+pub mod words;
 
 /// What the relay's route for this is called in its `/api/hello`.
 pub const VERSION: u64 = 4;
