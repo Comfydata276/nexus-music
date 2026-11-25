@@ -271,6 +271,8 @@ writes its own pins, sorts and theme straight back. To go back to the record as 
    others, one at a time.
 
 A PC that step 3 was not done on puts back whatever it holds that is newer than the copy.
+Recently played and the plays are not gone back on either way: what has been played since
+the copy was kept stays, on the PCs and in the record.
 
 **Known, and accepted.**
 
