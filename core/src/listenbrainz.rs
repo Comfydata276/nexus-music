@@ -48,10 +48,7 @@ fn unreachable(failure: Failure) -> String {
 
 fn read(response: Response) -> Result<Value, String> {
     let status = response.status;
-    if let Some(e) = response.cut_short {
-        return Err(format!("Couldn't read ListenBrainz's answer. {e}"));
-    }
-    let text = response.body;
+    let text = response.body().map_err(|e| format!("Couldn't read ListenBrainz's answer. {e}"))?;
     if status != 200 {
         return Err(format!("ListenBrainz answered with an error ({status})."));
     }

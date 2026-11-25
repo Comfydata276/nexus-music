@@ -27,21 +27,33 @@ impl<'a> Request<'a> {
     }
 }
 
-/// What came back. A status the service counts as an error is still an answer.
-#[derive(Debug, Clone, Default, PartialEq)]
+/// What came back: the status and headers, which have arrived, and the body, which is only
+/// waited for if it's asked for. A status the service counts as an error is still an answer.
+///
+/// An answer is often judged by its status alone, and nothing need limit how long a body
+/// takes: one that is waited for when nobody will read it can hold a lookup open for as
+/// long as the other end likes. So the app hands the body over as something to ask for, and
+/// one that is never asked for is never waited for (the app lets go of the connection).
 pub struct Response {
     pub status: u16,
     pub headers: Vec<(String, String)>,
-    /// What it said; empty if that didn't arrive whole.
-    pub body: String,
-    /// Why the body didn't arrive whole, if it didn't. (Kept apart from there being no
-    /// answer: for some answers the status is all that's looked at.)
-    pub cut_short: Option<String>,
+    body: Box<dyn FnOnce() -> Result<String, String> + Send>,
 }
 
 impl Response {
+    /// `body` waits for what the answer said and hands it over, or says why it didn't
+    /// arrive whole, under whatever limits the app puts on reading one.
+    pub fn new(status: u16, headers: Vec<(String, String)>, body: impl FnOnce() -> Result<String, String> + Send + 'static) -> Response {
+        Response { status, headers, body: Box::new(body) }
+    }
+
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers.iter().find(|(known, _)| known.eq_ignore_ascii_case(name)).map(|(_, value)| value.as_str())
+    }
+
+    /// Waits for what it said. The words, if it didn't arrive whole, are the app's.
+    pub fn body(self) -> Result<String, String> {
+        (self.body)()
     }
 }
 

@@ -453,7 +453,9 @@ impl MusicBrainz {
     /// Opens that connection.
     pub fn warm(&self) {
         // The smallest thing there is to ask for, and not one of the lookups they ration.
-        let _ = self.http.send(&Request::get("https://musicbrainz.org/robots.txt"));
+        if let Ok(response) = self.http.send(&Request::get("https://musicbrainz.org/robots.txt")) {
+            let _ = response.body();
+        }
     }
 
     fn get(&self, path: &str) -> Result<Value, String> {
@@ -474,16 +476,15 @@ impl MusicBrainz {
             // soon to come back (a second, as a rule). That's waited out by the gap above.
             if status == 503 && attempt < 3 {
                 let wait = response.header("retry-after").and_then(|v| v.parse::<u64>().ok()).unwrap_or(1).clamp(1, 3);
+                let _ = response.body();
                 *self.next.lock().unwrap_or_else(|stuck| stuck.into_inner()) = Some(Instant::now() + Duration::from_secs(wait));
                 continue;
             }
             if status != 200 {
                 return Err(format!("MusicBrainz answered with an error ({status})."));
             }
-            if let Some(e) = response.cut_short {
-                return Err(format!("Couldn't read MusicBrainz's answer. {e}"));
-            }
-            return serde_json::from_str(&response.body).map_err(|_| "MusicBrainz's answer made no sense.".to_string());
+            let text = response.body().map_err(|e| format!("Couldn't read MusicBrainz's answer. {e}"))?;
+            return serde_json::from_str(&text).map_err(|_| "MusicBrainz's answer made no sense.".to_string());
         }
         Err("MusicBrainz is busy. Try again in a moment.".into())
     }
