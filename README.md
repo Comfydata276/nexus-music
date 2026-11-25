@@ -456,7 +456,7 @@ connection.
 | `src/subsonic.rs` | Client for the Subsonic API that Navidrome serves at `/rest`. |
 | `src/audio/` | Playback engine: download buffer, decoding, resampling, output device. |
 | `src/controller.rs` | Sign-in, navigation and the page on screen. |
-| `src/pages.rs` | Turns server responses into page content (runs on worker threads). |
+| `src/pages.rs` | Turns server responses into page content (runs on worker threads). The requests pages are drawn from what `core/src/requests.rs` finds. |
 | `src/playback.rs` | Queue, transport, play reporting, lyrics. |
 | `src/playlists.rs` | Describes a change to a playlist so it can be applied to the server's copy; CSV export. |
 | `src/actions.rs` | Context menus, likes, playlist edits. |
@@ -508,10 +508,11 @@ window, the files, the connections.
 | `core/src/queue.rs` | What becomes of the queue when the list it was started from changes. |
 | `core/src/musicbrainz.rs`, `listenbrainz.rs`, `offer.rs` | The questions put to MusicBrainz and ListenBrainz and what is made of the answers. |
 | `core/src/lidarr.rs` | The questions put to Lidarr and what is made of the answers: looking up, asking for an album or an artist, the profiles for singles and soundtracks, what is on its way. `src/lidarr.rs` keeps the Lidarr in use and what has been offered. |
+| `core/src/requests.rs` | Asking for music that isn't in the library, as each page and action does it: the "Not in your library" search, an artist's or an album's page, an artist's most played, asking and adding and what's said, what is on its way, what has arrived. Each takes the services, the library (`Library`: three lists, the questions answered here; the window's index answers it, and `Snapshot` is the same as plain lists) and what has been offered (`lidarr::Offers`), and returns plain data and sentences; a stopped one says so. The pages are drawn from that in `src/pages.rs`. |
 | `core/src/asked.rs` | What has been asked for: one note per album, when to stop watching, and which arrivals have songs for playlists. The app keeps the list in its file and finds albums and songs in its own copy of the library, handing `arrivals` the two look-ups. |
 | `core/src/bulk.rs` | Asking Lidarr for many albums at once: finding each, handing them over an artist at a time, seeing Lidarr through them, and how the batch stands. The app gives the job a `Desk`: where the batch is written down, the time, the singles setting, and the threads albums are looked up on (by default, one at a time on the caller's). |
-| `core/src/discover.rs` | "Artists you might like": who the favourites are, how who they're like is ranked, which of Lidarr's answers is meant, how long the answer is kept. |
-| `core/src/gate.rs` | The sign-in in front of Lidarr: finding it, the link the browser is sent to, trading the code and renewing the token. `src/gate.rs` keeps the browser's part: somewhere on this PC for it to come back to, and opening it. |
+| `core/src/discover.rs` | "Artists you might like": who the favourites are, how who they're like is ranked, who Lidarr says each is, how long the answer is kept. Asking the music server who is like each favourite is the app's. |
+| `core/src/gate.rs` | The sign-in in front of Lidarr: finding it, the link the browser is sent to, trading the code and renewing the token. `src/gate.rs` keeps the browser's part: somewhere on this PC for it to come back to, and opening it. The words of the sign-in, and the pages the browser is shown, are here too. |
 | `core/src/http.rs` | How the library asks for a request: it asks the app. `src/corehttp.rs` is the Windows app's answer, on its own connections. |
 
 Something moves into `core/` when it is free of the window, files and threads, and is moved
