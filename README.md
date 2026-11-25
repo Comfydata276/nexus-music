@@ -420,7 +420,7 @@ connection.
 | `src/media.rs` | Windows media keys and now-playing overlay. |
 | `src/lidarr.rs` | Asking a Lidarr server for albums (optional): the connection, and what has been offered. The rules are `core/src/lidarr.rs`. |
 | `src/asked.rs` | Remembers what was requested and spots when it arrives: the file, and looking in the library. The rules are `core/src/asked.rs`. |
-| `src/bulk.rs` | Asks Lidarr for many albums at once: finds each, hands them over an artist at a time, and checks what Lidarr made of them. |
+| `src/bulk.rs` | Asks Lidarr for many albums at once: the one job, its file, its thread and the three it looks albums up on. The rules are `core/src/bulk.rs`. |
 | `src/musicbrainz.rs` | Finds songs, discographies and track lists for music that isn't in the library. |
 | `src/gate.rs` | Browser sign-in for a Lidarr that sits behind Authentik: the browser's part. The rules are `core/src/gate.rs`. |
 | `src/jam.rs` | Jams and linked devices: being steered through a relay, steering someone else's playback, and handing a queue from one device to another. |
@@ -465,6 +465,7 @@ window, the files, the connections.
 | `core/src/musicbrainz.rs`, `listenbrainz.rs`, `offer.rs` | The questions put to MusicBrainz and ListenBrainz and what is made of the answers. |
 | `core/src/lidarr.rs` | The questions put to Lidarr and what is made of the answers: looking up, asking for an album or an artist, the profiles for singles and soundtracks, what is on its way. `src/lidarr.rs` keeps the Lidarr in use and what has been offered. |
 | `core/src/asked.rs` | What has been asked for: one note per album, when to stop watching, and which arrivals have songs for playlists. The app keeps the list in its file and finds albums and songs in its own copy of the library, handing `arrivals` the two look-ups. |
+| `core/src/bulk.rs` | Asking Lidarr for many albums at once: finding each, handing them over an artist at a time, seeing Lidarr through them, and how the batch stands. The app gives the job a `Desk`: where the batch is written down, the time, the singles setting, and the threads albums are looked up on (by default, one at a time on the caller's). |
 | `core/src/discover.rs` | "Artists you might like": who the favourites are, how who they're like is ranked, which of Lidarr's answers is meant, how long the answer is kept. |
 | `core/src/gate.rs` | The sign-in in front of Lidarr: finding it, the link the browser is sent to, trading the code and renewing the token. `src/gate.rs` keeps the browser's part: somewhere on this PC for it to come back to, and opening it. |
 | `core/src/http.rs` | How the library asks for a request: it asks the app. `src/corehttp.rs` is the Windows app's answer, on its own connections. |

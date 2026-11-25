@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-pub use nexus_core::lidarr::{ArtistOffer, Lidarr, Setup, host, mask, tidy};
+pub use nexus_core::lidarr::{ArtistOffer, Lidarr, host, mask, tidy};
 pub use nexus_core::offer::{Offer, VARIOUS};
 
 /// Lidarr at `address`, asked over an agent of the app's own. `gate` is the sign-in in front

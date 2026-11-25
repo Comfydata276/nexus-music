@@ -9,6 +9,7 @@
 
 pub mod address;
 pub mod asked;
+pub mod bulk;
 pub mod discover;
 pub mod gate;
 pub mod handover;
