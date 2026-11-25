@@ -312,31 +312,80 @@ fn expected_bytes(song: &Song, quality: u32) -> u64 {
     if original { song.size } else { song.duration as u64 * if quality == 0 { 320 } else { quality } as u64 * 125 }
 }
 
-/// Moves everything in one folder into another: by renaming where that works (the same
-/// drive), otherwise by copying and then removing. Returns how many files moved and how
-/// many couldn't be. Files still arriving are left out.
+/// The app's own files in a downloads folder, by name: each account's lists that read as the
+/// app's (`index-<account>.json`, a list of downloads, and `collections-<account>.json`, of
+/// playlists kept downloaded; and those from before 0.29, without an account), and the songs
+/// the lists of downloads name. Nothing else there is the app's: the folder may be one of the
+/// person's own, with files of theirs in it, named like the app's or not.
+fn own_files(dir: &Path) -> Vec<std::ffi::OsString> {
+    let mut own: Vec<std::ffi::OsString> = Vec::new();
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let named = |stem: &str| name == format!("{stem}.json") || (name.starts_with(&format!("{stem}-")) && name.ends_with(".json"));
+        if named("index") {
+            if let Ok(entries) = fs::read(entry.path()).map(|bytes| serde_json::from_slice::<Vec<Entry>>(&bytes)) {
+                if let Ok(entries) = entries {
+                    own.push(entry.file_name());
+                    own.extend(entries.into_iter().filter(|entry| !entry.file.is_empty()).map(|entry| entry.file.into()));
+                }
+            }
+        } else if named("collections") && fs::read(entry.path()).is_ok_and(|bytes| serde_json::from_slice::<Vec<String>>(&bytes).is_ok()) {
+            own.push(entry.file_name());
+        }
+    }
+    own.sort();
+    own.dedup();
+    own
+}
+
+/// Moves the app's downloads from one folder into another (`own_files`: nothing of the
+/// person's): by renaming where that works (the same drive), otherwise by copying and then
+/// removing. **Never over a file that is there**: a name had in the new folder already, by
+/// whatever, is a file that couldn't be moved, and both stay as they are. Returns how many
+/// files moved and how many couldn't be.
 pub fn move_folder(from: &Path, to: &Path) -> (usize, usize) {
     let (mut moved, mut stuck) = (0, 0);
-    for entry in fs::read_dir(from).into_iter().flatten().flatten() {
-        let path = entry.path();
-        let name = entry.file_name();
-        if !path.is_file() || name.to_string_lossy().ends_with(".part") {
+    for name in own_files(from) {
+        let path = from.join(&name);
+        if !path.is_file() {
             continue;
         }
         let target = to.join(&name);
-        let done = fs::rename(&path, &target).is_ok()
-            || (fs::copy(&path, &target).is_ok_and(|copied| fs::metadata(&path).is_ok_and(|meta| meta.len() == copied)) && fs::remove_file(&path).is_ok());
-        if done {
-            moved += 1;
-        } else {
-            // Don't leave half a copy behind where the whole file would be looked for.
-            if target.exists() && path.exists() {
-                let _ = fs::remove_file(&target);
-            }
+        if fs::symlink_metadata(&target).is_ok() {
             stuck += 1;
+            continue;
         }
+        let done = fs::rename(&path, &target).is_ok() || copy_new(&path, &target);
+        if done { moved += 1 } else { stuck += 1 }
     }
     (moved, stuck)
+}
+
+/// Copies a file to a name nothing has, whole, and then removes the first; or, if that can't
+/// be done, leaves no half a copy behind (only one it made itself) and the first as it was.
+fn copy_new(from: &Path, to: &Path) -> bool {
+    let copied = (|| {
+        let mut source = fs::File::open(from)?;
+        let mut target = fs::OpenOptions::new().write(true).create_new(true).open(to)?;
+        let length = std::io::copy(&mut source, &mut target)?;
+        target.sync_all()?;
+        Ok::<bool, std::io::Error>(fs::metadata(from)?.len() == length)
+    })();
+    match copied {
+        Ok(true) if fs::remove_file(from).is_ok() => true,
+        // Made here and not whole, or the first couldn't be removed: this copy goes.
+        Ok(_) => {
+            let _ = fs::remove_file(to);
+            false
+        }
+        // (Not made here, if it was there: then it isn't touched.)
+        Err(error) => {
+            if error.kind() != std::io::ErrorKind::AlreadyExists {
+                let _ = fs::remove_file(to);
+            }
+            false
+        }
+    }
 }
 
 /// Fetches one song's audio into the downloads folder. Runs on a worker thread. `quality`
@@ -943,10 +992,39 @@ mod tests {
     }
 
     #[test]
+    fn moving_the_downloads_takes_only_the_apps_files_and_never_writes_over_one() {
+        // The folder may be one of the person's own: their files stay where they are, though
+        // one is named like the app's, and one in the new folder has the name of one of theirs.
+        let (from, to) = (folder("from-theirs"), folder("to-theirs"));
+        let list = |entries: &[Entry]| serde_json::to_vec(entries).unwrap();
+        fs::write(from.join("index-someone.json"), list(&[entry("a", "a.flac", 3), entry("b", "b.flac", 3)])).unwrap();
+        fs::write(from.join("collections-someone.json"), br#"["liked"]"#).unwrap();
+        fs::write(from.join("a.flac"), b"one").unwrap();
+        fs::write(from.join("b.flac"), b"two").unwrap();
+        for (name, text) in [("index-tax.tmp", "theirs"), ("index-tax.json", "theirs too"), ("notes.txt", "and theirs")] {
+            fs::write(from.join(name), text).unwrap();
+        }
+        fs::write(to.join("index-tax.tmp"), "theirs, in the other folder").unwrap();
+        // One of the app's names is had in the new folder already, by a file of theirs.
+        fs::write(to.join("b.flac"), "their own b").unwrap();
+        let (moved, stuck) = move_folder(&from, &to);
+        assert_eq!((moved, stuck), (3, 1));
+        for (name, text) in [("index-tax.tmp", "theirs"), ("index-tax.json", "theirs too"), ("notes.txt", "and theirs"), ("b.flac", "two")] {
+            assert_eq!(fs::read_to_string(from.join(name)).unwrap(), text, "{name}");
+        }
+        assert_eq!(fs::read_to_string(to.join("index-tax.tmp")).unwrap(), "theirs, in the other folder");
+        assert_eq!(fs::read_to_string(to.join("b.flac")).unwrap(), "their own b");
+        assert_eq!(fs::read(to.join("a.flac")).unwrap(), b"one");
+        assert!(to.join("index-someone.json").exists() && to.join("collections-someone.json").exists());
+        let _ = fs::remove_dir_all(from);
+        let _ = fs::remove_dir_all(to);
+    }
+
+    #[test]
     fn moves_a_folder_of_downloads() {
         let (from, to) = (folder("from"), folder("to"));
         fs::write(from.join("a.flac"), b"one").unwrap();
-        fs::write(from.join("index-someone.json"), b"[]").unwrap();
+        fs::write(from.join("index-someone.json"), serde_json::to_vec(&[entry("a", "a.flac", 3)]).unwrap()).unwrap();
         fs::write(from.join("c.flac.7.part"), b"half").unwrap();
         fs::create_dir_all(from.join("a folder")).unwrap();
         assert_eq!(move_folder(&from, &to), (2, 0));
