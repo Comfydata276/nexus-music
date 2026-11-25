@@ -668,6 +668,32 @@ fn answers_that_disagree_about_the_comment_stop_the_exchange() {
 }
 
 #[test]
+fn a_comment_one_answer_states_as_empty_and_the_other_as_something_is_a_disagreement() {
+    let server = Server::with(&text(&pc()));
+    let mut device = Dev::new();
+    device.does(Change::Pin("mine".into()));
+    // The list of playlists says the comment is empty; the playlist's own answer states the
+    // record. One of them is not what the server holds now, and there is no telling which:
+    // if it is the playlist's own, the record has been emptied and this would put it back.
+    let mut reads = device.read(&server);
+    reads.listed.iter_mut().find(|listed| listed.id == "r").unwrap().comment = Some(String::new());
+    assert_eq!(device.decide(&reads), Outcome::Stop(Stop::Disagree));
+    // The other way about: the record would be written over as if nothing had been there.
+    let mut reads = device.read(&server);
+    reads.playlist.as_mut().unwrap().comment = Some(String::new());
+    assert_eq!(device.decide(&reads), Outcome::Stop(Stop::Disagree));
+    // One says it is empty and the other leaves it out, as Navidrome leaves out an empty
+    // comment: they agree that nothing is there.
+    let empty = Server::with("");
+    let mut reads = device.read(&empty);
+    assert_eq!((reads.listed[0].comment.as_deref(), reads.playlist.as_ref().unwrap().comment.as_deref()), (Some(""), None));
+    assert!(matches!(device.decide(&reads), Outcome::Go(_)));
+    reads.listed[0].comment = None;
+    reads.playlist.as_mut().unwrap().comment = Some(String::new());
+    assert!(matches!(device.decide(&reads), Outcome::Go(_)));
+}
+
+#[test]
 fn the_clock_is_measured_whatever_the_playlist_holds() {
     // An exchange that stops for another reason has still read the server's clock: the
     // queue needs it too.

@@ -649,19 +649,21 @@ pub fn settle(device: &Device, answers: &Answers) -> Outcome {
             if !answer.ours(&device.username) {
                 return Outcome::Stop(Stop::Moved);
             }
-            // What the list of playlists states for it, if it states anything but nothing.
-            let listed = answers.listed.iter().find(|listed| listed.id == id).and_then(|listed| listed.comment.as_deref()).filter(|comment| !comment.is_empty());
+            // What the list of playlists states for it, if it states it.
+            let listed = answers.listed.iter().find(|listed| listed.id == id).and_then(|listed| listed.comment.as_deref());
             let comment = match (&answer.comment, listed) {
-                // Two answers that state it, differently: one of them is not what the server
-                // holds now (an answer kept by something on the way, a write in between).
+                // Two answers that state it, differently (one of them, it may be, as the
+                // empty text): one of them is not what the server holds now (an answer kept
+                // by something on the way, a write in between), and there is no telling
+                // which.
                 (Some(comment), Some(listed)) if comment != listed => return Outcome::Stop(Stop::Disagree),
                 (Some(comment), _) => comment.as_str(),
-                // Navidrome leaves an empty comment out of every answer, so its absence alone
-                // says nothing; an answer that says little altogether leaves the owner out
-                // too, and has stopped above. But if the list of playlists states a comment
-                // for this playlist, there is one, and this answer is not saying.
-                (None, Some(_)) => return Outcome::Stop(Stop::Disagree),
-                (None, None) => "",
+                // Navidrome leaves an empty comment out of every answer, so its absence
+                // says "empty" at most; an answer that says little altogether leaves the
+                // owner out too, and has stopped above. If the list of playlists states a
+                // comment that isn't empty, there is one, and this answer is not saying.
+                (None, Some(listed)) if !listed.is_empty() => return Outcome::Stop(Stop::Disagree),
+                (None, _) => "",
             };
             (Some(id), comment)
         }
