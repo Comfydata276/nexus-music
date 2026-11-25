@@ -26,6 +26,7 @@ use nexus_core::link::command::{MOST_ADDED, id_ok};
 use nexus_core::link::frame::{self, ASK, Keys, TELL};
 use nexus_core::link::message::{Adopt, Ask, At, Command, Entry, Full, Handed, Tell, Want, Why, read_ask, read_tell};
 use nexus_core::link::moving::{Adopted, Adopting, Gave, Giving, START_MS, Taking, Took};
+use nexus_core::link::news::News;
 use nexus_core::link::rule::{Reservation, Waiting};
 use nexus_core::link::secret::{self, Next, Secret, Stop, Verdict};
 use nexus_core::link::steer::{Outcome, Peer, Press, Tick, Told, Wait};
@@ -654,6 +655,7 @@ pub struct Link {
     steering: Option<Steering>,
     take: Option<Take>,
     adoption: Option<Adoption>,
+    news: News,
 }
 
 impl Link {
@@ -684,6 +686,7 @@ impl Link {
         if matches!(self.take, Some(Take::Asked { .. })) {
             self.take = None;
         }
+        self.news.forget();
         true
     }
 
@@ -916,6 +919,7 @@ impl Controller {
         }
         self.link_peers(now);
         self.link_moves(now);
+        self.link_news(now);
         self.link_show();
     }
 
@@ -1080,6 +1084,7 @@ impl Controller {
 
     fn link_entered(&self, serial: u64, place: Place, token: String) {
         let mut link = self.link.borrow_mut();
+        link.news.forget();
         if let Some(session) = link.session.as_mut().filter(|session| session.serial == serial) {
             // A new place: whatever was asked from the old one cannot be answered to it.
             session.place = Some((place, token));
@@ -1517,6 +1522,29 @@ impl Controller {
         }
     }
 
+    /// Tells the other devices, unasked, that what this one is doing has changed: so that
+    /// they look now, not at their next turn. Bounded by the library (`link::news`).
+    fn link_news(&self, now: u64) {
+        use std::hash::{Hash, Hasher};
+        let others = {
+            let link = self.link.borrow();
+            match link.session.as_ref().filter(|session| session.place.is_some()) {
+                Some(session) => session.others.clone(),
+                None => return,
+            }
+        };
+        let state = self.link_state(None, None, None);
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        (state.at.generation, state.busy, state.playing, &state.title, &state.artist, &state.name, &state.steering).hash(&mut hasher);
+        if !self.link.borrow_mut().news.due(hasher.finish(), others.len(), now) {
+            return;
+        }
+        let text = state.text();
+        for place in others {
+            self.link_send(place, TELL, text.clone());
+        }
+    }
+
     // ---- what this device asks of another --------------------------------------------------
 
     /// Another device says something of itself.
@@ -1525,6 +1553,18 @@ impl Controller {
             return log(format!("tell from {}: breaks its shape, dropped", text::place(&from)));
         };
         let now = now_ms();
+        if tell.news() {
+            // News is a reason to look, and nothing more.
+            let look = {
+                let mut link = self.link.borrow_mut();
+                let Some(session) = link.live_mut(serial, now) else { return };
+                session.peers.get_mut(&from).is_some_and(|seen| seen.peer.news(now))
+            };
+            if look {
+                self.link_look_at(from, false);
+            }
+            return;
+        }
         // (The queue, if it carries one, is for the move that asked for it and is not kept.)
         let (handed, re, at, playing) = (tell.queue.take(), tell.re, tell.at, tell.playing);
         let (told, name, out) = {
