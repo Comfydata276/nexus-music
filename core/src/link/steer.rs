@@ -175,11 +175,16 @@ impl Peer {
         if let Some(command) = &mut self.command
             && command.nonce == re
         {
-            if command.answered {
+            // A success is believed whenever it comes, once: a refusal that got here first (of
+            // a repeat the relay's path made, say) does not stand against it. A refusal is
+            // believed once, and never over a success.
+            let done = tell.by == Some(command.nonce) || tell.ok == Some(true);
+            let known = command.outcome == Some(Outcome::Done);
+            if known || (command.answered && !done) {
                 return Told::Dropped;
             }
             command.answered = true;
-            let outcome = if tell.by == Some(command.nonce) || tell.ok == Some(true) { Outcome::Done } else { Outcome::Refused(tell.why.unwrap_or(Why::Changed)) };
+            let outcome = if done { Outcome::Done } else { Outcome::Refused(tell.why.unwrap_or(Why::Changed)) };
             command.outcome = Some(outcome);
             return Told::Settled(outcome);
         }
@@ -309,9 +314,23 @@ mod tests {
         assert_eq!(peer.outcome(), Some(Outcome::Refused(Why::Busy)));
         // The state shown is still the one a look fetched.
         assert_eq!(peer.shown().map(|shown| shown.tell.at.generation), Some(5));
-        // The same answer again changes nothing.
-        assert_eq!(peer.told(Tell { ok: Some(true), ..state(9, PAUSE) }), Told::Dropped);
+        // The same refusal again changes nothing.
+        assert_eq!(peer.told(Tell { ok: Some(false), why: Some(Why::Late), ..state(9, PAUSE) }), Told::Dropped);
         assert_eq!(peer.outcome(), Some(Outcome::Refused(Why::Busy)));
+    }
+
+    /// B carries the Pause out; someone presses Play on B; the relay's path delivers the
+    /// Pause again, and B's refusal of the repeat reaches A before the first answer does.
+    #[test]
+    fn a_success_that_arrives_after_a_refusal_of_the_same_command_corrects_it() {
+        let mut peer = paused();
+        assert_eq!(peer.told(Tell { ok: Some(false), why: Some(Why::Changed), ..state(7, PAUSE) }), Told::Settled(Outcome::Refused(Why::Changed)));
+        assert_eq!(peer.told(Tell { ok: Some(true), by: Some(PAUSE), ..state(6, PAUSE) }), Told::Settled(Outcome::Done));
+        assert_eq!(peer.outcome(), Some(Outcome::Done));
+        // And then nothing takes it back: not the refusal again, nor the success again.
+        assert_eq!(peer.told(Tell { ok: Some(false), why: Some(Why::Changed), ..state(7, PAUSE) }), Told::Dropped);
+        assert_eq!(peer.told(Tell { ok: Some(true), by: Some(PAUSE), ..state(6, PAUSE) }), Told::Dropped);
+        assert_eq!(peer.outcome(), Some(Outcome::Done));
     }
 
     /// The double skip, from the sender's side: the only answer to arrive is the refusal of
