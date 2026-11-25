@@ -37,7 +37,9 @@ impl Http for Agent {
             }
         };
         let status = response.status().as_u16();
-        let headers = response.headers().iter().filter_map(|(name, value)| Some((name.as_str().to_string(), value.to_str().ok()?.to_string()))).collect();
+        // Every header, a value that isn't text included (as one that can't be read): the
+        // first of a name is the one the library goes by, readable or not.
+        let headers = response.headers().iter().map(|(name, value)| (name.as_str().to_string(), value.to_str().ok().map(str::to_string))).collect();
         // The body is read only if the library asks for it, and then as the app has always
         // read one. An answer the library judges by its status is not waited on: nothing
         // limits how long a body may take, and a body nobody asks for is dropped unread.
@@ -64,6 +66,8 @@ mod tests {
     struct StandIn {
         agent: Agent,
         address: String,
+        /// The waits the library asked for, in order.
+        waits: std::sync::Mutex<Vec<Duration>>,
     }
 
     impl Http for StandIn {
@@ -72,14 +76,19 @@ mod tests {
             self.agent.send(&Request { url: &url, ..request.clone() })
         }
 
-        fn pause(&self, _: Duration) -> Result<(), Failure> {
+        fn pause(&self, wait: Duration) -> Result<(), Failure> {
+            self.waits.lock().unwrap().push(wait);
             Ok(())
         }
     }
 
+    fn stand_in(address: String) -> (MusicBrainz, Arc<StandIn>) {
+        let http = Arc::new(StandIn { agent: Agent(crate::subsonic::make_agent()), address, waits: Default::default() });
+        (MusicBrainz::new(http.clone(), ListenBrainz::new(http.clone())), http)
+    }
+
     fn musicbrainz(address: String) -> MusicBrainz {
-        let http = Arc::new(StandIn { agent: Agent(crate::subsonic::make_agent()), address });
-        MusicBrainz::new(http.clone(), ListenBrainz::new(http))
+        stand_in(address).0
     }
 
     /// How long a stand-in server holds an answer open after its headers, saying nothing more.
@@ -121,5 +130,41 @@ mod tests {
         assert_eq!(found.err().as_deref(), Some("MusicBrainz answered with an error (503)."));
         assert_eq!(asked.load(Ordering::SeqCst), 4);
         assert!(started.elapsed() < Duration::from_secs(5), "waited {:?} for a body nothing was going to read", started.elapsed());
+    }
+
+    #[test]
+    fn the_first_retry_after_decides_the_wait_readable_or_not() {
+        // Busy once, with two Retry-After headers: the first isn't text, the second says
+        // three seconds. The first is the one that counts, and one that can't be read means
+        // a second.
+        let asked = Arc::new(AtomicUsize::new(0));
+        let count = asked.clone();
+        let address = fake::server(move |_, _, stream| {
+            if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                let _ = stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: \xff\xfe\r\nRetry-After: 3\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbusy");
+            } else {
+                let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}");
+            }
+        });
+        let (service, http) = stand_in(address);
+        assert_eq!(service.album_tracks("an-album"), Ok(Vec::new()));
+        let waits = http.waits.lock().unwrap().clone();
+        assert_eq!(waits.len(), 1, "{waits:?}");
+        assert!(waits[0] <= Duration::from_secs(1) && waits[0] > Duration::from_millis(500), "waited {:?}", waits[0]);
+
+        // And when the first can be read, it's the one: two seconds, not the three after it.
+        let asked = Arc::new(AtomicUsize::new(0));
+        let count = asked.clone();
+        let address = fake::server(move |_, _, stream| {
+            if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                let _ = write!(stream, "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 2\r\nRetry-After: 3\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbusy");
+            } else {
+                let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}");
+            }
+        });
+        let (service, http) = stand_in(address);
+        assert_eq!(service.album_tracks("an-album"), Ok(Vec::new()));
+        let waits = http.waits.lock().unwrap().clone();
+        assert!(waits.len() == 1 && waits[0] <= Duration::from_secs(2) && waits[0] > Duration::from_millis(1500), "{waits:?}");
     }
 }

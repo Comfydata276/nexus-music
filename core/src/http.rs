@@ -36,19 +36,24 @@ impl<'a> Request<'a> {
 /// one that is never asked for is never waited for (the app lets go of the connection).
 pub struct Response {
     pub status: u16,
-    pub headers: Vec<(String, String)>,
+    /// Every header, in the order sent. A value that isn't text is `None`: it is still
+    /// there, and still the first of its name if it was.
+    pub headers: Vec<(String, Option<String>)>,
     body: Box<dyn FnOnce() -> Result<String, String> + Send>,
 }
 
 impl Response {
     /// `body` waits for what the answer said and hands it over, or says why it didn't
     /// arrive whole, under whatever limits the app puts on reading one.
-    pub fn new(status: u16, headers: Vec<(String, String)>, body: impl FnOnce() -> Result<String, String> + Send + 'static) -> Response {
+    pub fn new(status: u16, headers: Vec<(String, Option<String>)>, body: impl FnOnce() -> Result<String, String> + Send + 'static) -> Response {
         Response { status, headers, body: Box::new(body) }
     }
 
+    /// The first header of that name, if it is there and is text. Where a name is sent
+    /// twice the first is the one that counts, and a first that can't be read is not passed
+    /// over for a later one that can.
     pub fn header(&self, name: &str) -> Option<&str> {
-        self.headers.iter().find(|(known, _)| known.eq_ignore_ascii_case(name)).map(|(_, value)| value.as_str())
+        self.headers.iter().find(|(known, _)| known.eq_ignore_ascii_case(name)).and_then(|(_, value)| value.as_deref())
     }
 
     /// Waits for what it said. The words, if it didn't arrive whole, are the app's.
