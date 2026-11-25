@@ -54,7 +54,7 @@ impl Added {
 
     fn save(&self) {
         if let Ok(json) = serde_json::to_vec(&self.kept) {
-            let _ = crate::config::write_surely(&self.path, &json);
+            crate::saver::saver().write(self.path.clone(), move || Some(json));
         }
     }
 
@@ -185,12 +185,14 @@ mod tests {
         assert!(added.edited("p", &list, &crate::playlists::Edit::Remove(vec![crate::playlists::spot(&list, 3).unwrap()]), 400));
         assert_eq!(added.shared(None)["p"]["d"], Note { times: vec![], at: 400 });
         // It survives a restart.
+        crate::saver::saver().flush();
         let mut again = Added::load(path.clone());
         assert_eq!(again.dates("p", &songs(&["a", "b", "c"])), [0, 0, 200]);
         assert_eq!(again.shared(None), added.shared(None));
         // Notes from another device are taken in, and kept.
         let theirs = Notes::from([("p".to_string(), HashMap::from([("c".to_string(), Note { times: vec![150], at: 150 })]))]);
         assert!(again.merge(&theirs) && !again.merge(&theirs));
+        crate::saver::saver().flush();
         assert_eq!(Added::load(path.clone()).dates("p", &songs(&["a", "b", "c"])), [0, 0, 150]);
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }

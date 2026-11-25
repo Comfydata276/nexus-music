@@ -40,15 +40,11 @@ struct Windows;
 impl Desk for Windows {
     fn keep(&self, json: Option<Vec<u8>>) {
         let Some(path) = PLACE.get() else { return };
+        // On the saver's thread, whole, in the order asked: the window and the threads that
+        // look albums up both come here, and neither waits for the disk.
         match json {
-            None => {
-                let _ = std::fs::remove_file(path);
-            }
-            // Whole, or the batch as it was: a kill or a power cut part-way can't leave
-            // half of it, and with it the settings it has to put back on Lidarr.
-            Some(json) => {
-                let _ = crate::config::write_surely(path, &json);
-            }
+            None => crate::saver::saver().remove(path.clone()),
+            Some(json) => crate::saver::saver().write(path.clone(), move || Some(json)),
         }
     }
 

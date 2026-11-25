@@ -138,10 +138,12 @@ impl Downloads {
         if self.account.is_empty() {
             return;
         }
+        // Handed to the saver, which writes it on its own thread and, if it can't, keeps it
+        // due and tries again: from here it is the saver's to get onto the disk.
         if let Ok(json) = serde_json::to_vec(&self.entries) {
-            let _ = crate::config::write_surely(&self.dir.join(format!("index-{}.json", self.account)), &json);
+            crate::saver::saver().write(self.dir.join(format!("index-{}.json", self.account)), move || Some(json));
+            self.unsaved = false;
         }
-        self.unsaved = false;
         self.saved_at = std::time::Instant::now();
     }
 
@@ -161,7 +163,7 @@ impl Downloads {
             self.collections.push(id.to_string());
         }
         if let (Ok(json), false) = (serde_json::to_vec(&self.collections), self.account.is_empty()) {
-            let _ = crate::config::write_surely(&self.dir.join(format!("collections-{}.json", self.account)), &json);
+            crate::saver::saver().write(self.dir.join(format!("collections-{}.json", self.account)), move || Some(json));
         }
     }
 
@@ -908,6 +910,7 @@ mod tests {
         second.add(entry("b", "b.mp3", 5));
         second.save_if_due(true);
         first.save_if_due(true);
+        crate::saver::saver().flush();
         assert!(Downloads::load(dir.clone(), "server_bob").has("b"));
         assert!(!Downloads::load(dir.clone(), "server_ann").has("b"));
         let _ = fs::remove_dir_all(dir);

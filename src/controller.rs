@@ -462,7 +462,7 @@ pub struct Controller {
     /// While set, emptying the queue leaves the saved copy alone.
     pub keep_saved_queue: Cell<bool>,
     /// Writes files in the background.
-    pub saver: crate::saver::Saver,
+    pub saver: &'static crate::saver::Saver,
     /// Set while the queue is being put in place from a saved copy, which isn't a change.
     pub queue_quiet: Cell<bool>,
     /// Whether the sound device is currently held in exclusive mode.
@@ -481,6 +481,12 @@ pub struct Controller {
 
 impl Controller {
     pub fn install(ui: ui::MainWindow) -> Rc<Controller> {
+        // Files flushed on this thread are counted and, with NEXUS_TRACE, timed (`saver`).
+        config::mark_window_thread();
+        crate::saver::on_failing(|path| {
+            let what = crate::saver::describe(path);
+            post(move |ctl| ctl.toast(format!("{what} couldn't be saved on this PC. It will be tried again.")));
+        });
         let paths = Paths::new();
         // What writes killed part-way left beside the app's files: cleared now, before
         // anything is written (`config::clear_leftovers`).
@@ -627,7 +633,7 @@ impl Controller {
             queue_quiet: Cell::new(false),
             queue_saved: Cell::new(0),
             keep_saved_queue: Cell::new(false),
-            saver: crate::saver::Saver::new(),
+            saver: crate::saver::saver(),
             output_exclusive: Cell::new(false),
             devices: RefCell::default(),
             update: RefCell::new(None),
@@ -657,7 +663,8 @@ impl Controller {
         let crashed = size > seen;
         if crashed {
             // Whole or not at all: a number cut short would be taken for one that was seen.
-            let _ = config::write_surely(&seen_file, size.to_string().as_bytes());
+            let seen = size.to_string().into_bytes();
+            crate::saver::saver().write(seen_file, move || Some(seen));
         }
         let note = self.startup_note.borrow_mut().take().or_else(|| {
             crashed.then(|| "The app stopped unexpectedly last time. “Save diagnostics” under Settings, About has what was noted.".to_string())
@@ -1378,6 +1385,9 @@ impl Controller {
     /// the likes, ratings and plays still waiting to be sent for it. Each account has its
     /// own, so one person's never show up for, or get sent as, another.
     fn load_account(&self) {
+        // What is still on its way to the disk for these files gets there first: they are
+        // read back below. (The person is signing in, and waits for this.)
+        self.saver.flush();
         let account = self.account();
         let folder = self.downloads.borrow().folder().to_path_buf();
         *self.downloads.borrow_mut() = crate::downloads::Downloads::load(folder, &account);
@@ -2373,7 +2383,8 @@ impl Controller {
         config::delete_password(&self.paths, &server, &username);
         self.saver.remove(self.paths.queue.clone());
         self.saver.remove(self.paths.queue_place.clone());
-        let _ = std::fs::remove_file(&self.paths.history);
+        // (After any write of it still on its way, so that none brings it back.)
+        self.saver.remove(self.paths.history.clone());
         self.history.borrow_mut().clear();
         self.leave("");
         // Signing in again starts from whatever the server has.

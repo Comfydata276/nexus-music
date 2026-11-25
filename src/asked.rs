@@ -100,7 +100,7 @@ impl AskedList {
         }
         if !self.held {
             if let Ok(json) = serde_json::to_vec_pretty(&self.items) {
-                let _ = crate::config::write_surely(&self.path, &json);
+                crate::saver::saver().write(self.path.clone(), move || Some(json));
             }
         }
         self.share();
@@ -219,17 +219,21 @@ mod tests {
         let fill = Fill { playlist: "p1".into(), playlist_name: "Road Trip".into(), title: "Lonely No More".into(), artists: vec!["Rob Thomas".into()], seconds: 200, added: 0 };
         let mut list = AskedList::load(&path);
         list.add(Asked { title: "...Something to Be".into(), artist: "Rob Thomas".into(), at: 50, fills: vec![fill], ..Default::default() });
+        crate::saver::saver().flush();
         let first = arrivals(&index(), &list.items, 1000);
         list.mark(&first, 1000);
+        crate::saver::saver().flush();
         // It has arrived, and its song still has to go into the playlist: if that fails (or
         // the app closes first) the next look at the library offers it again.
         assert!(list.items[0].arrived == 1000 && list.items[0].unfilled && list.waiting());
         let again = arrivals(&index(), &list.items, 2000);
         assert_eq!((again.len(), again[0].fills.len()), (1, 1));
         list.mark(&again, 2000);
+        crate::saver::saver().flush();
         assert_eq!(list.items[0].arrived, 1000);
         // Once the playlist has it, there's nothing more to do.
         list.filled(50, "...Something to Be", 0);
+        crate::saver::saver().flush();
         assert!(!list.items[0].unfilled && !list.waiting());
         assert!(arrivals(&index(), &list.items, 3000).is_empty());
         // And it isn't tried for ever.
@@ -244,19 +248,25 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let mut list = AskedList::load(&path);
         list.add(Asked { album: "rg1".into(), title: "Cradlesong".into(), artist: "Rob Thomas".into(), at: 100, ..Default::default() });
+        crate::saver::saver().flush();
         list.add(Asked { album: "rg1".into(), title: "Cradlesong".into(), artist: "Rob Thomas".into(), at: 200, song: "Her Diamonds".into(), ..Default::default() });
+        crate::saver::saver().flush();
         list.add(Asked { title: "cradlesong".into(), artist: "rob thomas".into(), fills: vec![Fill { title: "Someday".into(), ..Default::default() }], ..Default::default() });
+        crate::saver::saver().flush();
         assert_eq!(list.items.len(), 1);
         assert_eq!((list.items[0].song.as_str(), list.items[0].fills.len(), list.items[0].at), ("Her Diamonds", 1, 100));
         assert!(list.waiting());
 
         list.mark(&[Arrival { place: 0, library_album: "a9".into(), ..Default::default() }], 1000);
+        crate::saver::saver().flush();
         assert!(!list.waiting());
         assert_eq!(AskedList::load(&path).items[0].library_album, "a9");
         // Taking it off Lidarr's list doesn't forget one that's already here.
         list.forget("Cradlesong");
+        crate::saver::saver().flush();
         assert_eq!(list.items.len(), 1);
         list.tidy(1000 + SHOWN_FOR + 1);
+        crate::saver::saver().flush();
         assert!(list.items.is_empty());
         let _ = std::fs::remove_file(&path);
     }
@@ -277,6 +287,7 @@ mod tests {
         assert!(list.items.is_empty());
         assert_eq!(list.trouble, FOUND_EMPTY);
         list.add(cradlesong());
+        crate::saver::saver().flush();
         assert_eq!(AskedList::load(&path).items.len(), 1);
         // Cut short part-way: it is kept aside, as it was, before anything is written.
         let whole = std::fs::read(&path).unwrap();
@@ -285,6 +296,7 @@ mod tests {
         assert_eq!((list.items.len(), list.trouble), (0, FOUND_DAMAGED));
         assert_eq!(std::fs::read(&aside).unwrap(), &whole[..whole.len() / 2]);
         list.add(Asked { title: "Parachutes".into(), artist: "Coldplay".into(), ..Default::default() });
+        crate::saver::saver().flush();
         assert_eq!(std::fs::read(&aside).unwrap(), &whole[..whole.len() / 2]);
         assert_eq!(AskedList::load(&path).items[0].title, "Parachutes");
         let _ = std::fs::remove_dir_all(&dir);
@@ -298,6 +310,7 @@ mod tests {
         let path = dir.join("asked.json");
         let mut list = AskedList::load(&path);
         list.add(Asked { title: "Cradlesong".into(), artist: "Rob Thomas".into(), at: 100, ..Default::default() });
+        crate::saver::saver().flush();
         let before = std::fs::read(&path).unwrap();
         // (A folder where the file is read is a file that can't be read, on every system.)
         let away = dir.join("away.json");
@@ -306,12 +319,14 @@ mod tests {
         let mut list = AskedList::load(&path);
         assert_eq!((list.items.len(), list.trouble), (0, NOT_READ));
         list.add(Asked { title: "Parachutes".into(), artist: "Coldplay".into(), at: 200, ..Default::default() });
+        crate::saver::saver().flush();
         assert!(path.is_dir(), "written over");
         // It can be read again: what it holds and what was asked meanwhile, both.
         std::fs::remove_dir(&path).unwrap();
         std::fs::rename(&away, &path).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), before);
         list.add(Asked { title: "Yellow".into(), artist: "Coldplay".into(), at: 300, ..Default::default() });
+        crate::saver::saver().flush();
         let titles: Vec<String> = AskedList::load(&path).items.into_iter().map(|asked| asked.title).collect();
         assert_eq!(titles, ["Cradlesong", "Parachutes", "Yellow"]);
         assert_eq!(list.trouble, "");

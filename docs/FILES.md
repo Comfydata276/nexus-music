@@ -27,6 +27,10 @@ How each is written:
   leaves the old file or the new one; a power cut can leave the name empty or holding part of
   the new one.
 
+A file written while nobody waits for the answer is written by the saver's thread
+(`src/saver.rs`), one writer for each file, so that the window never waits for the disk; a
+write that fails there stays due and is tried again.
+
 "Settings folder" is `%APPDATA%\Nexus Music\config`; "cache" is
 `%LOCALAPPDATA%\Nexus Music\cache`; "data" is `%LOCALAPPDATA%\Nexus Music\data`.
 
