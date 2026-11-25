@@ -28,19 +28,55 @@ pub fn http_date(text: &str) -> Option<i64> {
 /// The server's clock minus this device's, in seconds: the server's `Date` on an answer,
 /// against the device's clock as that answer arrived. `None` when the server gave no date.
 pub fn offset(date: Option<i64>, received: i64) -> Option<i64> {
-    date.map(|date| date - received)
+    date.map(|date| date.saturating_sub(received))
+}
+
+/// What is known of a device's clock beside the server's.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum Clock {
+    /// Nothing has been measured yet (no answer has come from the server since the app
+    /// started). Nothing that depends on comparing times may be decided.
+    Unmeasured,
+    /// The server gives no date: there is nothing to compare with, and the device's clock is
+    /// taken to be right.
+    NoDate,
+    /// The server's clock minus this device's, in seconds.
+    Offset(i64),
+}
+
+impl Clock {
+    /// By one answer: its `Date`, and what the device's clock said as it arrived.
+    pub fn measured(date: Option<i64>, received: i64) -> Clock {
+        match offset(date, received) {
+            Some(offset) => Clock::Offset(offset),
+            None => Clock::NoDate,
+        }
+    }
+
+    /// The offset, where there is one.
+    pub fn offset(self) -> Option<i64> {
+        match self {
+            Clock::Offset(offset) => Some(offset),
+            _ => None,
+        }
+    }
+
+    /// Too far from the server's to share anything from.
+    pub fn wrong(self) -> bool {
+        clock_wrong(self.offset())
+    }
 }
 
 /// Whether the device's clock is too far from the server's to share anything from. A server
 /// (or a proxy in front of it) that gives no date can't be compared with, and the clock is
 /// then taken to be right.
 pub fn clock_wrong(offset: Option<i64>) -> bool {
-    offset.is_some_and(|offset| offset.abs() > CLOCK_SLACK)
+    offset.is_some_and(|offset| offset.saturating_abs() > CLOCK_SLACK)
 }
 
 /// A time on this device's clock, as the server's clock would have had it.
 pub fn aligned(at: i64, offset: Option<i64>) -> i64 {
-    at + offset.unwrap_or(0)
+    at.saturating_add(offset.unwrap_or(0))
 }
 
 #[cfg(test)]

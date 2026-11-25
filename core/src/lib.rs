@@ -5,6 +5,8 @@
 //! file, starts a thread or opens a connection; whatever it needs from the world, the app
 //! hands it.
 
+#![forbid(unsafe_code)]
+
 pub mod address;
 pub mod handover;
 pub mod http;

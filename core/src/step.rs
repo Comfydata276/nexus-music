@@ -18,21 +18,52 @@
 //! * **Nothing is shared while the device's clock is more than five minutes from the
 //!   server's** ([`crate::time`], [`Held::ClockWrong`]).
 //!
-//! Nothing here asks the server anything, keeps a file or reads a clock. An app reads the
-//! list of playlists, asks [`find`] which of them holds the record, reads that one, and
-//! hands [`settle`] both answers as they were received, with what the device holds. What
-//! comes back is everything the app must then do, in this order:
+//! Nothing here asks the server anything, keeps a file or reads a clock. What an app must do
+//! around it is this, and the order matters as much as the steps: every fault found in an
+//! app's side of an exchange so far has been something taken, checked or saved at the wrong
+//! moment.
 //!
-//! 1. [`Outcome::Stop`]: nothing; say why in the log.
-//! 2. [`Plan::keep`]: put these plays in the device's log, **on disk**. If that can't be
-//!    done, stop here: nothing is taken in and nothing written.
-//! 3. [`Plan::take`]: take in what other devices shared ([`Choices::take`] for the pins,
-//!    the theme and the lists' choices; the notes and Recently played into the app's own
-//!    stores).
-//! 4. [`Plan::write`], if there is one: record that it is being tried
-//!    ([`Choices::sending`], saved before the request is made); keep `found` if this is the
-//!    first write this version makes; make the playlist if `into` is `None`; write `text`.
-//! 5. Only once the server has answered that it took the write: [`Choices::written`], saved.
+//! **The contract.** One exchange at a time for a sign-in, from step 1 to its last step. If
+//! the sign-in changes (signed out, another account) or the setting goes off part-way,
+//! whatever arrives afterwards is dropped: nothing of it is applied.
+//!
+//! 1. **Ask the server.** Read the list of playlists; ask [`find`] which holds the record;
+//!    read that one. Nothing of the device's state is needed for this, **and none may be
+//!    taken yet**: what the person does while these answers are on their way must be in
+//!    what is decided.
+//! 2. **With both answers in hand**, on the thread that owns the device's state, and with
+//!    no waiting between here and step 6: confirm the sign-in is the one that asked and the
+//!    setting is on. Take [`clock`] from the answers and remember it (it is good whatever
+//!    happens next: the queue needs it too, see [`crate::handover`]).
+//! 3. **Decide.** Make a [`Device`] from what the device holds *now* (its choices, with the
+//!    account signed in; its dated notes; Recently played; its newest plays,
+//!    [`crate::sync::newest_plays`]) and call [`settle`].
+//! 4. [`Outcome::Stop`]: say why ([`Stop::words`]) and do nothing else.
+//! 5. **Keep.** Put [`Plan::keep`] in the device's log of plays, **on disk, read back as
+//!    whole lines**, together with every play the device has counted and not yet written.
+//!    If that can't be done, stop here: nothing is taken in and nothing written.
+//! 6. **Take in.** [`Choices::take`], saved; the notes ([`crate::notes::Kept::take`]);
+//!    Recently played, which is [`history`] of what the device has at that moment and what
+//!    the plan brought (not the plan's alone: a song started since step 3 stays). Say
+//!    [`Plan::held`], if it is set, where the person will see it.
+//! 7. **Write**, if [`Plan::write`] is set. In this order:
+//!    1. If this version has not yet kept the record's text for this account
+//!       ([`keeps_first`]): put [`Write::found`] (the empty text too) and the note that it
+//!       has been kept on disk, in a file named for the account. If either can't be
+//!       written, send nothing. Neither is ever written again by this version.
+//!    2. [`Choices::sending`], which says whether the plan still fits the choices it was
+//!       made from. If it says no (a change the write carries was taken back meanwhile),
+//!       send nothing and start again from step 1. Save the choices, surely, before the
+//!       request is made.
+//!    3. Confirm once more that the sign-in is the same and the setting on, then make the
+//!       playlist if [`Write::into`] is `None`, and write [`Write::text`], with the
+//!       sign-in's own connection.
+//!    4. Only once the server has answered that it took the write: [`Choices::written`],
+//!       saved. If no answer comes, do nothing: the changes stay as tried, and the next
+//!       exchange makes them again.
+//!
+//! A change the person makes ([`Choices::change`]) is saved, surely, **before** it is shown
+//! as made, and is made under the account signed in: it is only ever sent for that account.
 //!
 //! **Accepted, and not solved here.** Two devices that read at the same moment both write,
 //! and the second wins: Subsonic has no write that is conditional on what was read. Nothing
@@ -50,7 +81,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::notes::Notes;
 use crate::record::{self, Read};
-use crate::sync::{LONG_AGO, ListPrefs, PLAYLIST_NAME, Shared, VERSION, merge};
+use crate::sync::{LONG_AGO, ListPrefs, PLAYLIST_NAME, Shared, VERSION, merge, merge_history};
 use crate::time;
 
 // ---- what a device holds of the choices that are shared -------------------------------------
@@ -150,6 +181,10 @@ impl Change {
 pub struct Waiting {
     /// Which change this is, among all this device has ever made.
     pub id: u64,
+    /// The account it was made under (a device's own name for a sign-in: the server and the
+    /// user). It is only ever sent for that account; under any other it waits, untouched.
+    #[serde(default)]
+    pub account: String,
     pub change: Change,
     /// A write that carried it has been sent, and it isn't yet known that the server took
     /// it. Until it is, the change stays: it will be made again at the next exchange.
@@ -158,7 +193,7 @@ pub struct Waiting {
 }
 
 /// What a device shows: what was agreed, with the waiting changes on top.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Shown {
     pub pins: Vec<String>,
     /// Empty when nothing was agreed and no theme is waiting: the app shows its own.
@@ -183,50 +218,66 @@ fn same_choices(a: &ListPrefs, b: &ListPrefs) -> bool {
 }
 
 impl Choices {
-    /// The person changed something. The change waits; an earlier one about the same thing
-    /// that no write has carried yet gives way to it; and one that only puts back what was
-    /// there before anything was sent is no change at all, and nothing waits. (Pinned and
-    /// unpinned again before either was shared, the playlist must not be unpinned on the
-    /// devices where it was pinned all along.)
-    ///
-    /// Returns whether anything now shown differs: if not, there is nothing to save or draw.
-    pub fn change(&mut self, change: Change) -> bool {
-        let before = self.shown();
-        let about = change.about();
-        self.waiting.retain(|waits| waits.tried || !waits.change.about().iter().all(|thing| about.contains(thing)));
-        let without = self.shown();
-        self.waiting.push(Waiting { id: self.next, change: change.clone(), tried: false });
-        let tried = self.waiting.iter().any(|waits| waits.tried && waits.change.about().iter().any(|thing| about.contains(thing)));
-        if !tried && self.shown() == without {
-            self.waiting.pop();
-        } else {
-            self.next += 1;
-        }
-        self.shown() != before
+    /// The changes waiting under this account, in the order they were made.
+    fn waiting_for<'a>(&'a self, account: &'a str) -> impl Iterator<Item = &'a Waiting> {
+        self.waiting.iter().filter(move |waits| waits.account == account)
     }
 
-    /// What the device shows.
-    pub fn shown(&self) -> Shown {
-        let record = made(&Shared { pins: self.agreed.pins.clone(), theme: self.agreed.theme.clone(), lists: self.agreed.lists.clone(), ..Default::default() }, &self.waiting);
+    /// The person, signed in as `account`, changed something. The change waits; an earlier
+    /// one about the same thing that no write has carried yet gives way to it; and one that
+    /// only puts back what was there before anything was sent is no change at all, and
+    /// nothing waits. (Pinned and unpinned again before either was shared, the playlist
+    /// must not be unpinned on the devices where it was pinned all along.)
+    ///
+    /// Returns whether anything now shown differs: if not, there is nothing to draw.
+    pub fn change(&mut self, account: &str, change: Change) -> bool {
+        let before = self.shown(account);
+        let about = change.about();
+        self.waiting.retain(|waits| waits.account != account || waits.tried || !waits.change.about().iter().all(|thing| about.contains(thing)));
+        let without = self.shown(account);
+        self.waiting.push(Waiting { id: self.next, account: account.to_string(), change: change.clone(), tried: false });
+        let tried = self.waiting_for(account).any(|waits| waits.tried && waits.change.about().iter().any(|thing| about.contains(thing)));
+        if !tried && self.shown(account) == without {
+            self.waiting.pop();
+        } else {
+            self.next = self.next.saturating_add(1);
+        }
+        self.shown(account) != before
+    }
+
+    /// What the device shows while signed in as `account`: what was agreed, with that
+    /// account's waiting changes on top.
+    pub fn shown(&self, account: &str) -> Shown {
+        let waiting: Vec<&Waiting> = self.waiting_for(account).collect();
+        let record = made(&Shared { pins: self.agreed.pins.clone(), theme: self.agreed.theme.clone(), lists: self.agreed.lists.clone(), ..Default::default() }, &waiting);
         Shown { pins: record.pins, theme: record.theme, lists: record.lists }
     }
 
-    /// Step 3: what other devices shared is taken in. Changes that turned out to alter
+    /// Step 6: what other devices shared is taken in. Changes that turned out to alter
     /// nothing in what the server has are done with.
     pub fn take(&mut self, take: &Take) {
         self.agreed = take.agreed.clone();
         self.waiting.retain(|waits| !take.done.contains(&waits.id));
     }
 
-    /// Step 4, before the request is made: these changes are in a write whose answer isn't
-    /// in yet.
-    pub fn sending(&mut self, write: &Write) {
+    /// Step 7.2, before the request is made: these changes are in a write whose answer
+    /// isn't in yet. **Says whether the write may be sent**: a plan is only good for the
+    /// choices it was made from, and if a change it carries no longer waits (the person
+    /// took it back while the plan was being made or acted on), sending it would publish
+    /// what was undone, with nothing left to undo it. Then nothing is marked, and the
+    /// exchange is to start again.
+    #[must_use = "a write that no longer fits the choices must not be sent"]
+    pub fn sending(&mut self, write: &Write) -> bool {
+        if !write.carried.iter().all(|id| self.waiting.iter().any(|waits| waits.id == *id)) {
+            return false;
+        }
         for waits in self.waiting.iter_mut().filter(|waits| write.carried.contains(&waits.id)) {
             waits.tried = true;
         }
+        true
     }
 
-    /// Step 5, once the server has answered that it took the write: what it carried is
+    /// Step 7.4, once the server has answered that it took the write: what it carried is
     /// agreed, and those changes are done with. One made since still waits.
     pub fn written(&mut self, write: &Write) {
         self.agreed = write.agreed.clone();
@@ -236,7 +287,7 @@ impl Choices {
     /// A theme another device chose, found by a look before the window opens (nothing is
     /// written by such a look). Taken as agreed if it is newer than what was.
     pub fn theme_seen(&mut self, theme: &str, at: i64) -> bool {
-        let newer = (at, theme) > (self.agreed.theme_at, self.agreed.theme.as_str());
+        let newer = in_range(at) && (at, theme) > (self.agreed.theme_at, self.agreed.theme.as_str());
         if newer {
             self.agreed.theme = theme.to_string();
             self.agreed.theme_at = at;
@@ -246,7 +297,7 @@ impl Choices {
 }
 
 /// The record with these changes made to it, and no time put on anything.
-fn made(record: &Shared, waiting: &[Waiting]) -> Shared {
+fn made(record: &Shared, waiting: &[&Waiting]) -> Shared {
     let mut out = record.clone();
     for waits in waiting {
         waits.change.pins(&mut out.pins);
@@ -266,7 +317,7 @@ fn made(record: &Shared, waiting: &[Waiting]) -> Shared {
 /// A time for an item changed at `now`: after the time of what it was changed from, whatever
 /// clock put that on, so the change is the newer on every device.
 fn after(at: i64, now: i64) -> i64 {
-    now.max(at + 1)
+    now.max(at.saturating_add(1))
 }
 
 /// The record with the waiting changes made to it: each on top of the item **as the record
@@ -274,7 +325,7 @@ fn after(at: i64, now: i64) -> i64 {
 /// change really altered given a time. A change that makes no difference to what is there
 /// (pinning what is pinned, the shuffle a list already has) alters nothing and puts a time on
 /// nothing.
-pub fn onto(record: &Shared, waiting: &[Waiting], now: i64) -> Shared {
+pub fn onto(record: &Shared, waiting: &[&Waiting], now: i64) -> Shared {
     let mut out = made(record, waiting);
     if out.pins != record.pins {
         out.pins_at = after(record.pins_at, now);
@@ -298,7 +349,7 @@ pub fn onto(record: &Shared, waiting: &[Waiting], now: i64) -> Shared {
 ///
 /// Navidrome leaves a playlist's owner and comment out of its answers for a client it has
 /// been told to say little to, and leaves an empty comment out of every answer.
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Stated {
     pub id: String,
@@ -314,7 +365,7 @@ impl Stated {
 }
 
 /// Which of the playlists the server listed holds the record.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Found {
     /// This one: read it, and hand its answer to [`settle`].
     Ours(String),
@@ -351,48 +402,65 @@ pub const RESERVED: &str = "Nexus Music keeps that name for itself, for keeping 
 
 // ---- an exchange ------------------------------------------------------------------------------
 
-/// What this device holds, as an exchange begins.
-#[derive(Debug, Clone, Default)]
-pub struct Device<'a> {
+/// What this device holds, **at the moment the server's answers are in hand** (step 3).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Device {
     /// The account's name, as the device signs in with it.
-    pub username: &'a str,
+    pub username: String,
+    /// The device's own name for this sign-in (the server and the user): the waiting
+    /// changes made under it are the ones this exchange may carry.
+    pub account: String,
     pub choices: Choices,
     /// The dated notes of when songs were added: the person's own changes on this device,
     /// and what it has taken in from others ([`crate::notes::Kept::shared`]).
     pub notes: Notes,
     /// Recently played: song id and when, newest first.
     pub history: Vec<(String, i64)>,
-    /// The latest plays in this device's log, and where those made from a playlist were
-    /// made from.
+    /// The newest plays in this device's log ([`crate::sync::newest_plays`]), and where
+    /// those made from a playlist were made from.
     pub plays: Vec<(String, i64)>,
     pub play_sources: Vec<(String, i64, String)>,
 }
 
 /// The server's answers, as they were received.
-#[derive(Debug, Clone, Default)]
-pub struct Answers<'a> {
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Answers {
     /// The list of playlists.
-    pub listed: &'a [Stated],
+    pub listed: Vec<Stated>,
     /// The answer for the playlist [`find`] named, if it named one.
-    pub playlist: Option<&'a Stated>,
+    pub playlist: Option<Stated>,
     /// The `Date` on the later of those answers, if it had one ([`time::http_date`]), and
     /// what the device's clock said as it arrived.
     pub date: Option<i64>,
     pub received: i64,
 }
 
+/// The device's clock beside the server's, by these answers (step 2). It doesn't depend on
+/// what the playlist holds: an exchange that then stops has still measured it.
+pub fn clock(answers: &Answers) -> time::Clock {
+    time::Clock::measured(answers.date, answers.received)
+}
+
 /// Why an exchange stopped with nothing read into the device and nothing written.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum Stop {
     /// The server didn't say whose the playlist is.
     OwnerNotStated,
-    /// The list of playlists states a comment for the playlist and its own answer has none.
+    /// The server's two answers disagree about the playlist's comment: one states it and
+    /// the other doesn't, or they state different ones.
     Disagree,
     /// The playlist's own answer wasn't handed over, or is for another playlist, or it is no
     /// longer the record's (renamed, or another's now): look again.
     Moved,
     /// What is in the comment isn't a record.
     NotARecord,
+    /// The comment, or something in the record or on the device, is larger than anything
+    /// the app would have written (see [`limits`]).
+    TooLarge,
+    /// A time in the record, or on the device, is outside any the app would have written.
+    TimeOutOfRange,
 }
 
 impl Stop {
@@ -400,15 +468,17 @@ impl Stop {
     pub fn words(self) -> &'static str {
         match self {
             Stop::OwnerNotStated => "The server didn't say whose the playlist “Nexus Music sync” is, so nothing was read from it and nothing written.",
-            Stop::Disagree => "The server's two answers about the playlist “Nexus Music sync” disagree about what is in it, so nothing was read from it and nothing written.",
+            Stop::Disagree => "The server's two answers about the playlist “Nexus Music sync” disagree about what is in it, so nothing was read from it and nothing written. It will be looked at again.",
             Stop::Moved => "The playlist “Nexus Music sync” changed as it was being read. It will be looked at again.",
             Stop::NotARecord => "The playlist “Nexus Music sync” holds something that isn't the shared record, so it was left as it is. Empty its comment to start the record again.",
+            Stop::TooLarge => "The shared record is larger than anything Nexus Music would have written, so it was left as it is.",
+            Stop::TimeOutOfRange => "A time in the shared record is out of range, so nothing was read from it and nothing written.",
         }
     }
 }
 
 /// Why what the server has was taken in and nothing written.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum Held {
     /// This device's clock is more than five minutes from the server's.
     ClockWrong,
@@ -430,14 +500,14 @@ impl Held {
 }
 
 /// Plays to put in the device's log.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Plays {
     pub plays: Vec<(String, i64)>,
     pub sources: Vec<(String, i64, String)>,
 }
 
 /// What other devices shared, for this one to take in.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Take {
     /// What is now agreed ([`Choices::take`]).
     pub agreed: Agreed,
@@ -445,17 +515,27 @@ pub struct Take {
     pub done: Vec<u64>,
     /// The server's notes of when songs were added ([`crate::notes::Kept::take`]).
     pub notes: Notes,
-    /// Recently played, this device's and the others' together, newest first.
+    /// Recently played **as the server's record has it**: to be put together with what the
+    /// device has when it is taken in ([`history`]), not put in its place.
     pub history: Vec<(String, i64)>,
 }
 
-/// A write to make.
-#[derive(Debug, Clone, Default, PartialEq)]
+/// Recently played, once a plan is taken in (step 6): what the device has at that moment
+/// and what the plan brought, newest first. A song that started playing after the plan was
+/// made is in `mine`, and stays.
+pub fn history(mine: &[(String, i64)], take: &Take) -> Vec<(String, i64)> {
+    merge_history(mine, &take.history)
+}
+
+/// A write to make. **Good only for the choices it was made from**: [`Choices::sending`]
+/// says, at the moment of sending, whether it still is.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Write {
     /// The playlist to write into; `None` to make one of the record's name first.
     pub into: Option<String>,
     pub text: String,
-    /// The comment as it was found, to keep before the first write a version makes.
+    /// The comment as it was found, to keep before the first write a version makes
+    /// ([`keeps_first`]). It may be the empty text: that is kept too.
     pub found: String,
     /// The changes this write carries ([`Choices::sending`], [`Choices::written`]).
     pub carried: Vec<u64>,
@@ -463,8 +543,16 @@ pub struct Write {
     pub agreed: Agreed,
 }
 
+/// Whether the record's text is to be kept aside before a write (step 7.1): a version does
+/// so once for an account, before the first write it makes. `kept_by` is the version noted
+/// with the copy that is there for this account, if there is one.
+pub fn keeps_first(kept_by: Option<&str>, version: &str) -> bool {
+    let parts = |version: &str| version.split('.').map(|part| part.parse::<u64>().unwrap_or(0)).collect::<Vec<_>>();
+    kept_by.is_none_or(|kept_by| parts(version) > parts(kept_by))
+}
+
 /// Everything to do after an exchange's reads, in order (see the top of this file).
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Plan {
     /// The playlist the record is in, if there is one.
     pub playlist: Option<String>,
@@ -477,7 +565,7 @@ pub struct Plan {
     pub held: Option<Held>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Outcome {
     Stop(Stop),
     Go(Box<Plan>),
@@ -496,38 +584,113 @@ pub fn says(record: &Shared) -> bool {
         || !record.play_sources.is_empty()
 }
 
-/// Decides an exchange: what to keep, take in and write, given what the device holds and
-/// what the server answered.
+/// The most that is taken in, of each thing. Each is far more than any version of the app
+/// writes (the record it writes is a few tens of thousands of characters: 100 songs of
+/// history, 500 plays, a choice or two for each list the person has ever sorted), and is
+/// there so that a comment nobody meant, or a device's own files gone wrong, is stopped at
+/// rather than worked through.
+pub mod limits {
+    /// Characters in the comment.
+    pub const TEXT: usize = 4 * 1024 * 1024;
+    /// Pinned playlists.
+    pub const PINS: usize = 10_000;
+    /// Lists with choices of their own.
+    pub const LISTS: usize = 100_000;
+    /// Playlists with notes, and notes (songs) in all of them together.
+    pub const NOTED: usize = 500_000;
+    /// Copies of one song in one playlist.
+    pub const COPIES: usize = 10_000;
+    /// Entries of Recently played, and plays.
+    pub const HISTORY: usize = 10_000;
+    pub const PLAYS: usize = 100_000;
+    /// Characters in one id, name or key.
+    pub const NAME: usize = 4_096;
+    /// The latest time anything may carry: the first second of the year 3000. Nothing is
+    /// earlier than 0.
+    pub const TIME: i64 = 32_503_680_000;
+}
+
+fn in_range(time: i64) -> bool {
+    (0..=limits::TIME).contains(&time)
+}
+
+/// Why a record (the server's, or what the device offers) is not one to work with.
+fn unfit(record: &Shared) -> Option<Stop> {
+    let notes: usize = record.added.values().map(|notes| notes.len()).sum();
+    let names = record
+        .pins
+        .iter()
+        .chain(record.lists.keys())
+        .chain(record.added.keys())
+        .chain(record.added.values().flat_map(|notes| notes.keys()))
+        .chain(record.history.iter().map(|(id, _)| id))
+        .chain(record.plays.iter().map(|(id, _)| id))
+        .chain(record.play_sources.iter().flat_map(|(id, _, from)| [id, from]))
+        .chain([&record.theme]);
+    let large = record.pins.len() > limits::PINS
+        || record.lists.len() > limits::LISTS
+        || record.added.len() > limits::NOTED
+        || notes > limits::NOTED
+        || record.added.values().flat_map(|notes| notes.values()).any(|note| note.times.len() > limits::COPIES)
+        || record.history.len() > limits::HISTORY
+        || record.plays.len() > limits::PLAYS
+        || record.play_sources.len() > limits::PLAYS
+        || names.into_iter().any(|name| name.len() > limits::NAME);
+    if large {
+        return Some(Stop::TooLarge);
+    }
+    let times = [record.pins_at, record.theme_at]
+        .into_iter()
+        .chain(record.lists.values().map(|prefs| prefs.at))
+        .chain(record.added.values().flat_map(|notes| notes.values()).flat_map(|note| note.times.iter().copied().chain([note.at])))
+        .chain(record.history.iter().map(|(_, at)| *at))
+        .chain(record.plays.iter().map(|(_, at)| *at))
+        .chain(record.play_sources.iter().map(|(_, at, _)| *at));
+    times.into_iter().any(|time| !in_range(time)).then_some(Stop::TimeOutOfRange)
+}
+
+/// Decides an exchange (step 3): what to keep, take in and write, given what the device
+/// holds now and what the server answered. It cannot fail and does not panic, whatever it
+/// is given.
 pub fn settle(device: &Device, answers: &Answers) -> Outcome {
     // Which playlist, and what is in it: nothing the server didn't say is made up.
-    let (playlist, comment) = match find(answers.listed, device.username) {
+    let (playlist, comment) = match find(&answers.listed, &device.username) {
         Found::NotStated => return Outcome::Stop(Stop::OwnerNotStated),
         Found::None => (None, ""),
         Found::Ours(id) => {
-            let Some(answer) = answers.playlist.filter(|answer| answer.id == id && answer.name == PLAYLIST_NAME) else { return Outcome::Stop(Stop::Moved) };
+            let Some(answer) = answers.playlist.as_ref().filter(|answer| answer.id == id && answer.name == PLAYLIST_NAME) else { return Outcome::Stop(Stop::Moved) };
             if answer.owner.is_none() {
                 return Outcome::Stop(Stop::OwnerNotStated);
             }
-            if !answer.ours(device.username) {
+            if !answer.ours(&device.username) {
                 return Outcome::Stop(Stop::Moved);
             }
-            let comment = match &answer.comment {
-                Some(comment) => comment.as_str(),
+            // What the list of playlists states for it, if it states anything but nothing.
+            let listed = answers.listed.iter().find(|listed| listed.id == id).and_then(|listed| listed.comment.as_deref()).filter(|comment| !comment.is_empty());
+            let comment = match (&answer.comment, listed) {
+                // Two answers that state it, differently: one of them is not what the server
+                // holds now (an answer kept by something on the way, a write in between).
+                (Some(comment), Some(listed)) if comment != listed => return Outcome::Stop(Stop::Disagree),
+                (Some(comment), _) => comment.as_str(),
                 // Navidrome leaves an empty comment out of every answer, so its absence alone
                 // says nothing; an answer that says little altogether leaves the owner out
                 // too, and has stopped above. But if the list of playlists states a comment
                 // for this playlist, there is one, and this answer is not saying.
-                None if answers.listed.iter().any(|listed| listed.id == id && listed.comment.as_ref().is_some_and(|comment| !comment.is_empty())) => {
-                    return Outcome::Stop(Stop::Disagree);
-                }
-                None => "",
+                (None, Some(_)) => return Outcome::Stop(Stop::Disagree),
+                (None, None) => "",
             };
             (Some(id), comment)
         }
     };
+    if comment.len() > limits::TEXT {
+        return Outcome::Stop(Stop::TooLarge);
+    }
     let offset = time::offset(answers.date, answers.received);
     // Times are put on things, and compared, by the server's clock where it is known.
     let now = time::aligned(answers.received, offset);
+    if !in_range(now) || !in_range(answers.received) {
+        return Outcome::Stop(Stop::TimeOutOfRange);
+    }
     let (theirs, unknown, mut held) = match record::read(comment) {
         Read::Unreadable => return Outcome::Stop(Stop::NotARecord),
         Read::Empty => (Shared::default(), Vec::new(), None),
@@ -553,11 +716,16 @@ pub fn settle(device: &Device, answers: &Answers) -> Outcome {
         plays: device.plays.clone(),
         play_sources: device.play_sources.clone(),
     };
+    if let Some(stop) = unfit(&theirs).or_else(|| unfit(&mine)) {
+        return Outcome::Stop(stop);
+    }
     let merged = merge(&mine, &theirs, now);
-    // What the person changed here is made to the record now, on top of what the server
-    // has: never to what the device happened to hold.
-    let record = onto(&merged, &device.choices.waiting, now);
-    let waiting: Vec<u64> = device.choices.waiting.iter().map(|waits| waits.id).collect();
+    // What the person changed here, under this account, is made to the record now, on top
+    // of what the server has: never to what the device happened to hold. Changes made under
+    // another account are not this exchange's: they wait for theirs.
+    let waiting: Vec<&Waiting> = device.choices.waiting_for(&device.account).collect();
+    let record = onto(&merged, &waiting, now);
+    let waiting: Vec<u64> = waiting.iter().map(|waits| waits.id).collect();
     let adds = record != theirs && (!comment.is_empty() || says(&record));
     let write = (adds && held.is_none()).then(|| Write {
         into: playlist.clone(),
@@ -578,7 +746,7 @@ pub fn settle(device: &Device, answers: &Answers) -> Outcome {
             // (Held back, it still waits.)
             done: if write.is_none() && held.is_none() && record == merged { waiting } else { Vec::new() },
             notes: theirs.added.clone(),
-            history: merged.history.clone(),
+            history: theirs.history.clone(),
         },
         // Nothing to say, and nothing it would have written: not held back from anything.
         held: held.filter(|held| *held == Held::ClockWrong || adds),

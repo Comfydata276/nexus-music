@@ -10,7 +10,8 @@ use std::collections::HashMap;
 
 use nexus_core::notes::{Kept, Note, Notes};
 use nexus_core::record::{self, Read};
-use nexus_core::step::{Agreed, Answers, Change, Choices, Device, Found, Held, Outcome, Plan, Stated, Stop, Write, find, reserved, settle};
+use nexus_core::step::{Agreed, Answers, Change, Choices, Device, Found, Held, Outcome, Plan, Stated, Stop, Write, clock, find, history, keeps_first, limits, reserved, settle};
+use nexus_core::time::Clock;
 use nexus_core::sync::{LONG_AGO, ListPrefs, PLAYLIST_NAME, PLAYS_SHARED, Shared};
 
 const NOW: i64 = 1_800_000_000;
@@ -89,6 +90,8 @@ struct Reads {
 #[derive(Clone)]
 struct Dev {
     username: String,
+    /// The device's own name for the sign-in.
+    account: String,
     choices: Choices,
     kept: Kept,
     history: Vec<(String, i64)>,
@@ -103,7 +106,7 @@ struct Dev {
 
 impl Dev {
     fn new() -> Dev {
-        Dev { username: "Tester".into(), choices: Choices::default(), kept: Kept::default(), history: Vec::new(), log: Vec::new(), sources: Vec::new(), disk: true, clock: NOW, held: None }
+        Dev { username: "Tester".into(), account: "Tester@music".into(), choices: Choices::default(), kept: Kept::default(), history: Vec::new(), log: Vec::new(), sources: Vec::new(), disk: true, clock: NOW, held: None }
     }
 
     /// The process is killed and started again: what it holds is what reached its files.
@@ -113,11 +116,11 @@ impl Dev {
     }
 
     fn does(&mut self, change: Change) -> bool {
-        self.choices.change(change)
+        self.choices.change(&self.account, change)
     }
 
     fn pins(&self) -> Vec<String> {
-        self.choices.shown().pins
+        self.choices.shown(&self.account).pins
     }
 
     fn read(&self, server: &Server) -> Reads {
@@ -129,21 +132,26 @@ impl Dev {
         Reads { listed, playlist, date: server.date }
     }
 
+    fn answers(&self, reads: &Reads) -> Answers {
+        Answers { listed: reads.listed.clone(), playlist: reads.playlist.clone(), date: reads.date, received: self.clock }
+    }
+
+    /// Step 3: with the answers in hand, from what the device holds now.
     fn decide(&self, reads: &Reads) -> Outcome {
-        let mut plays: Vec<(String, i64)> = self.log.iter().rev().take(PLAYS_SHARED).cloned().collect();
-        plays.sort_by(|x, y| y.1.cmp(&x.1).then_with(|| x.0.cmp(&y.0)));
+        let plays = nexus_core::sync::newest_plays(self.log.iter());
         let device = Device {
-            username: &self.username,
+            username: self.username.clone(),
+            account: self.account.clone(),
             choices: self.choices.clone(),
             notes: self.kept.shared(None),
             history: self.history.clone(),
             play_sources: self.sources.iter().filter(|(song, at, _)| plays.contains(&(song.clone(), *at))).cloned().collect(),
             plays,
         };
-        settle(&device, &Answers { listed: &reads.listed, playlist: reads.playlist.as_ref(), date: reads.date, received: self.clock })
+        settle(&device, &self.answers(reads))
     }
 
-    /// Steps 2 and 3: keep the plays, on disk, or stop; then take in.
+    /// Steps 5 and 6: keep the plays, on disk, or stop; then take in.
     fn take(&mut self, plan: &Plan) -> bool {
         if !self.disk {
             return false;
@@ -160,7 +168,7 @@ impl Dev {
         }
         self.choices.take(&plan.take);
         self.kept.take(&plan.take.notes);
-        self.history = plan.take.history.clone();
+        self.history = history(&self.history, &plan.take);
         self.held = plan.held;
         true
     }
@@ -176,7 +184,7 @@ impl Dev {
             return None;
         }
         if let Some(write) = &plan.write {
-            self.choices.sending(write);
+            assert!(self.choices.sending(write), "decided and sent in one go: the plan fits");
             server.take(write);
             self.choices.written(write);
         }
@@ -339,7 +347,7 @@ fn a_change_is_forgotten_only_once_its_write_is_known_to_have_succeeded() {
     let plan = plan(device.decide(&reads));
     assert!(device.take(&plan));
     let write = plan.write.unwrap();
-    device.choices.sending(&write);
+    assert!(device.choices.sending(&write));
     // The change still waits, and is still on the screen, through a restart.
     let mut device = device.restarted();
     assert_eq!((device.choices.waiting.len(), device.choices.waiting[0].tried), (1, true));
@@ -361,7 +369,7 @@ fn a_change_made_while_an_exchange_is_out_stays_on_screen_and_goes_with_the_next
     let plan = plan(device.decide(&reads));
     assert!(device.take(&plan));
     let write = plan.write.unwrap();
-    device.choices.sending(&write);
+    assert!(device.choices.sending(&write));
     // While the write is on its way the person pins another, and unpins the first.
     device.does(Change::Pin("d".into()));
     device.does(Change::Unpin("c".into()));
@@ -406,7 +414,7 @@ fn the_last_word_on_one_thing_is_the_one_that_waits_and_one_taken_back_unsent_is
     device.does(Change::Pin("c".into()));
     let reads = device.read(&server);
     let write = plan(device.decide(&reads)).write.unwrap();
-    device.choices.sending(&write);
+    assert!(device.choices.sending(&write));
     device.does(Change::Unpin("c".into()));
     assert_eq!(device.choices.waiting.len(), 2);
     assert_eq!(device.pins(), ["p1", "p2"]);
@@ -424,7 +432,7 @@ fn the_answer_to_a_write_is_lost_and_the_other_device_then_sets_the_opposite() {
     let plan = plan(device.decide(&reads));
     assert!(device.take(&plan));
     let write = plan.write.unwrap();
-    device.choices.sending(&write);
+    assert!(device.choices.sending(&write));
     server.take(&write);
     let lost = device.restarted();
     assert_eq!(server.record("r").pins, ["p1", "p2", "c"]);
@@ -461,6 +469,88 @@ fn the_answer_to_a_write_is_lost_and_the_other_device_then_sets_the_opposite() {
     // Nothing else of the other device's is touched by it: its pins were unpinned-from, not
     // replaced.
     assert_eq!(Shared { pins: pc().pins, pins_at: pc().pins_at, ..server.record("r") }, pc());
+}
+
+#[test]
+fn a_change_taken_back_while_the_server_is_being_asked_is_never_sent() {
+    let mut server = Server::with(&text(&pc()));
+    let mut device = in_step(&mut server);
+    // The person pins C, and an exchange begins: the server is asked (step 1).
+    device.does(Change::Pin("c".into()));
+    let reads = device.read(&server);
+    // While the answers are on their way the person unpins C again. Neither had been sent:
+    // the two are no change, and nothing waits.
+    device.does(Change::Unpin("c".into()));
+    assert!(device.choices.waiting.is_empty());
+    // The answers arrive, and the decision is made from what is true now: nothing to write.
+    let decided = plan(device.decide(&reads));
+    assert!(decided.write.is_none());
+
+    // An app that had decided first and acted later (the plan made while C was still
+    // pinned) is refused at the moment of sending: the plan no longer fits the choices.
+    let mut hasty = in_step(&mut server);
+    hasty.does(Change::Pin("c".into()));
+    let reads = hasty.read(&server);
+    let stale = plan(hasty.decide(&reads));
+    assert!(hasty.take(&stale));
+    hasty.does(Change::Unpin("c".into()));
+    let write = stale.write.unwrap();
+    assert!(!hasty.choices.sending(&write), "a pin that was taken back would have been sent, and counted as agreed");
+    // Nothing was sent, nothing is marked as tried, and the next exchange has nothing to say.
+    assert!(server.writes.is_empty() && hasty.choices.waiting.is_empty());
+    assert_eq!(hasty.exchange(&mut server), None);
+    assert!(server.writes.is_empty());
+    assert_eq!((server.record("r").pins, hasty.pins()), (pins(&["p1", "p2"]), pins(&["p1", "p2"])));
+    // A change made since that the write does not carry is no reason to refuse it.
+    let mut busy = in_step(&mut server);
+    busy.does(Change::Pin("c".into()));
+    let reads = busy.read(&server);
+    let write = plan(busy.decide(&reads)).write.unwrap();
+    busy.does(Change::Theme("Rose".into()));
+    assert!(busy.choices.sending(&write));
+}
+
+#[test]
+fn a_song_started_while_the_server_was_being_asked_stays_in_recently_played() {
+    let mut server = Server::with(&text(&pc()));
+    let mut device = in_step(&mut server);
+    device.history.insert(0, ("x".into(), NOW - 100));
+    let reads = device.read(&server);
+    let decided = plan(device.decide(&reads));
+    // Y starts playing after the decision and before it is taken in.
+    device.history.insert(0, ("y".into(), NOW + 1));
+    assert!(device.take(&decided));
+    // Recently played is what the device has now with what the others had: not the plan's.
+    assert_eq!(device.history, plays(&[("y", NOW + 1), ("x", NOW - 100), ("s2", 1_700_000_500), ("s1", 1_700_000_400)]));
+}
+
+#[test]
+fn a_change_waits_for_the_account_it_was_made_under() {
+    // Two accounts on one device, each with a record on its own server.
+    let (mut theirs, mut other) = (Server::with(&text(&pc())), Server::with(&text(&Shared { pins: pins(&["q1"]), pins_at: 1_700_000_900, ..pc() })));
+    let mut device = in_step(&mut theirs);
+    // Signed in as the first, with sharing off (or the server away), the person pins C.
+    device.does(Change::Pin("c".into()));
+    // Then signs in as the second.
+    device.account = "Other@elsewhere".into();
+    // The first account's change is not shown there, and not sent there: it would go into
+    // the second account's record as a choice made now.
+    assert_eq!(device.exchange(&mut other), None);
+    assert!(other.writes.is_empty());
+    assert_eq!((other.record("r").pins, device.pins()), (pins(&["q1"]), pins(&["q1"])));
+    // Nor does a change made as the second cancel or carry it.
+    device.does(Change::Unpin("c".into()));
+    device.does(Change::Pin("q2".into()));
+    assert_eq!(device.exchange(&mut other), None);
+    assert_eq!(other.record("r").pins, pins(&["q1", "q2"]));
+    assert_eq!(device.choices.waiting.len(), 1);
+    assert_eq!((device.choices.waiting[0].account.as_str(), &device.choices.waiting[0].change), ("Tester@music", &Change::Pin("c".into())));
+    // It waits, untouched, until the first signs in again: then it is made, to what that
+    // account's record has then.
+    device.account = "Tester@music".into();
+    assert_eq!(device.exchange(&mut theirs), None);
+    assert!(theirs.record("r").pins.contains(&"c".to_string()));
+    assert!(device.choices.waiting.is_empty());
 }
 
 #[test]
@@ -566,6 +656,99 @@ fn answers_that_disagree_about_the_comment_stop_the_exchange() {
     // Renamed between the two reads.
     reads.playlist = Some(Stated { id: "r".into(), name: "Road trip".into(), owner: Some("tester".into()), comment: Some(text(&pc())) });
     assert_eq!(device.decide(&reads), Outcome::Stop(Stop::Moved));
+    // Both answers state a comment, and not the same one: one of them is not what the
+    // server holds now, and there is no telling which.
+    server.says_little = false;
+    let mut reads = device.read(&server);
+    reads.playlist.as_mut().unwrap().comment = Some(text(&Shared { pins: pins(&["older"]), ..pc() }));
+    assert_eq!(device.decide(&reads), Outcome::Stop(Stop::Disagree));
+    assert!(server.writes.is_empty());
+    // The same one in both is the ordinary case.
+    assert!(matches!(device.decide(&device.read(&server)), Outcome::Go(_)));
+}
+
+#[test]
+fn the_clock_is_measured_whatever_the_playlist_holds() {
+    // An exchange that stops for another reason has still read the server's clock: the
+    // queue needs it too.
+    let mut server = Server::with("do not delete: my notes");
+    server.date = Some(NOW + 90);
+    let device = Dev::new();
+    let reads = device.read(&server);
+    assert_eq!(device.decide(&reads), Outcome::Stop(Stop::NotARecord));
+    assert_eq!(clock(&device.answers(&reads)), Clock::Offset(90));
+    server.date = None;
+    assert_eq!(clock(&device.answers(&device.read(&server))), Clock::NoDate);
+}
+
+#[test]
+fn nothing_the_library_is_given_makes_it_fail() {
+    let device = Dev::new();
+    let with = |change: &dyn Fn(&mut Shared)| {
+        let mut record = pc();
+        change(&mut record);
+        Server::with(&text(&record))
+    };
+    // A time no version would have written, anywhere in the record: stopped at, with
+    // nothing read into the device and nothing written. (Taken in, a time at the end of
+    // what a number can hold could never be bettered, and one more second could not be
+    // added to it.)
+    let times: [&dyn Fn(&mut Shared); 7] = [
+        &|r| r.pins_at = i64::MAX,
+        &|r| r.theme_at = -1,
+        &|r| r.lists.get_mut("playlist:p1").unwrap().at = limits::TIME + 1,
+        &|r| r.added.get_mut("p1").unwrap().get_mut("s1").unwrap().at = i64::MIN,
+        &|r| r.added.get_mut("p1").unwrap().get_mut("s1").unwrap().times = vec![i64::MAX],
+        &|r| r.history[0].1 = i64::MAX,
+        &|r| r.plays[1].1 = -5,
+    ];
+    for change in times {
+        let mut server = with(change);
+        let mut stopped = device.clone();
+        stopped.does(Change::Pin("c".into()));
+        assert_eq!(stopped.exchange(&mut server), Some(Stop::TimeOutOfRange));
+        assert!(server.writes.is_empty() && stopped.pins() == ["c"]);
+    }
+    // The same on the device's side, and for its clock and the server's.
+    let mut server = Server::with(&text(&pc()));
+    let mut own = device.clone();
+    own.history = plays(&[("x", i64::MAX)]);
+    assert_eq!(own.exchange(&mut server), Some(Stop::TimeOutOfRange));
+    for (clock, date) in [(i64::MAX, Some(NOW)), (i64::MIN, Some(NOW)), (NOW, Some(i64::MAX)), (NOW, Some(i64::MIN)), (-1, None)] {
+        server.date = date;
+        let mut odd = device.clone();
+        odd.clock = clock;
+        odd.does(Change::Pin("c".into()));
+        assert!(matches!(odd.exchange(&mut server), Some(Stop::TimeOutOfRange) | None), "{clock} {date:?}");
+        assert!(server.writes.is_empty(), "{clock} {date:?}");
+    }
+    // More than anything the app would have written.
+    let sizes: [&dyn Fn(&mut Shared); 4] = [
+        &|r| r.pins = (0..limits::PINS + 1).map(|n| n.to_string()).collect(),
+        &|r| r.plays = (0..limits::PLAYS as i64 + 1).map(|n| ("s".to_string(), n)).collect(),
+        &|r| r.history = (0..limits::HISTORY as i64 + 1).map(|n| (n.to_string(), n)).collect(),
+        &|r| r.theme = "x".repeat(limits::NAME + 1),
+    ];
+    for change in sizes {
+        let mut server = with(change);
+        assert_eq!(device.clone().exchange(&mut server), Some(Stop::TooLarge));
+        assert!(server.writes.is_empty());
+    }
+    let mut server = Server::with(&format!(r#"{{"nexus_music_sync":1,"junk":"{}"}}"#, "x".repeat(limits::TEXT)));
+    assert_eq!(device.clone().exchange(&mut server), Some(Stop::TooLarge));
+    // And a change's time is one more than the latest there can be, at the most.
+    let mut server = with(&|r| r.pins_at = limits::TIME);
+    let mut last = device.clone();
+    last.does(Change::Pin("c".into()));
+    assert_eq!(last.exchange(&mut server), None);
+    assert_eq!(server.record("r").pins_at, limits::TIME + 1);
+}
+
+#[test]
+fn a_version_keeps_the_record_aside_once_for_an_account() {
+    // Nothing kept yet for this account; kept by an earlier version; by this one; by a later.
+    assert!(keeps_first(None, "0.40.5") && keeps_first(Some("0.40.4"), "0.40.5") && keeps_first(Some("0.40.12"), "0.41.0"));
+    assert!(!keeps_first(Some("0.40.5"), "0.40.5") && !keeps_first(Some("0.41.0"), "0.40.5"));
 }
 
 #[test]
@@ -601,7 +784,7 @@ fn a_fresh_device_leaves_the_pcs_record_exactly_as_it_is() {
     assert!(server.writes.is_empty());
     // It holds what the PC had, and what it then holds gives nothing to write either.
     assert_eq!(device.pins(), ["p1", "p2"]);
-    assert_eq!(device.choices.shown().theme, "Ember");
+    assert_eq!(device.choices.shown(&device.account).theme, "Ember");
     assert_eq!(device.history, pc().history);
     assert_eq!(device.log.len(), 2);
     assert_eq!(device.kept.dates("p1", &["s1"]), [1_700_000_300]);
@@ -838,7 +1021,7 @@ fn two_devices_interleaved_at_every_step_converge_and_lose_nothing() {
                     let decided = plan(devices[n].decide(&reads));
                     assert!(devices[n].take(&decided));
                     if let Some(write) = &decided.write {
-                        devices[n].choices.sending(write);
+                        assert!(devices[n].choices.sending(write));
                     }
                     plans[n] = Some(decided);
                 }
@@ -869,7 +1052,7 @@ fn two_devices_interleaved_at_every_step_converge_and_lose_nothing() {
         assert_eq!(record.history[0], ("heard-on-one".to_string(), NOW - 10), "{order:?}");
         for device in &devices {
             assert_eq!(device.pins(), ["p1", "p2", "zero"], "{order:?}");
-            assert_eq!(device.choices.shown().lists["liked"].sort, 2, "{order:?}");
+            assert_eq!(device.choices.shown(&device.account).lists["liked"].sort, 2, "{order:?}");
             assert_eq!(device.log.len(), 4, "{order:?}");
             assert!(device.choices.waiting.is_empty(), "{order:?}");
         }

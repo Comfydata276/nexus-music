@@ -40,7 +40,7 @@ pub fn merge_notes(a: &Notes, b: &Notes, now: i64) -> Notes {
     }
     // Word that a song was removed has had long enough to get round.
     for notes in out.values_mut() {
-        notes.retain(|_, note| !note.times.is_empty() || now - note.at < KEEP_REMOVED);
+        notes.retain(|_, note| !note.times.is_empty() || now.saturating_sub(note.at) < KEEP_REMOVED);
     }
     out.retain(|_, notes| !notes.is_empty());
     out
@@ -118,7 +118,7 @@ impl Kept {
         let notes = self.lists.entry(playlist.to_string()).or_default();
         let mut changed = first_look;
         notes.retain(|id, note| {
-            let keep = if note.at == 0 { counts.contains_key(id.as_str()) } else { !note.times.is_empty() || now - note.at < KEEP_REMOVED };
+            let keep = if note.at == 0 { counts.contains_key(id.as_str()) } else { !note.times.is_empty() || now.saturating_sub(note.at) < KEEP_REMOVED };
             changed |= !keep;
             keep
         });
