@@ -3,7 +3,7 @@
 import { ListView, ScrollView } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { Icons } from "icons.slint";
-import { App, Player, View, CardKind, PlaylistRef, Page, Track, Drag, Search, Suggestion, Jam, Devices } from "types.slint";
+import { App, Player, View, CardKind, PlaylistRef, Page, Track, Drag, Search, Suggestion, Jam, Devices, Linked } from "types.slint";
 import { Icon, IconButton, Cover, Slider, LinkText, PlayButton, HoverIntent, ScrollThumb, Reorder, TextButton } from "widgets.slint";
 import { DeviceRow } from "overlays.slint";
 
@@ -1476,6 +1476,67 @@ export component ConnectPanel inherits Rectangle {
                     }
                 }
             }
+        }
+
+        // The new linking, shown only where it is switched on for a test (see src/link.rs).
+        if Linked.on: Text {
+            height: 28px;
+            text: "   Linked devices (new)";
+            color: Theme.muted;
+            font-size: 13px;
+            font-weight: 600;
+            vertical-alignment: center;
+        }
+
+        for device in Linked.list: Rectangle {
+            height: 56px;
+            HorizontalLayout {
+                padding-left: 12px;
+                padding-right: 28px;
+                spacing: 8px;
+                VerticalLayout {
+                    alignment: center;
+                    horizontal-stretch: 1;
+                    Text {
+                        text: device.name;
+                        color: Theme.text;
+                        font-size: 14px;
+                        font-weight: 600;
+                        overflow: elide;
+                    }
+                    Text {
+                        text: device.about;
+                        color: Theme.muted;
+                        font-size: 13px;
+                        overflow: elide;
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    TextButton {
+                        height: 32px;
+                        text: "Pause " + device.name;
+                        clicked => { Linked.pause(device.place); }
+                    }
+                }
+            }
+        }
+
+        if Linked.on && Linked.list.length == 0: Text {
+            text: Linked.entered ? "No other device is linked yet." : "Not linked yet.";
+            color: Theme.muted;
+            font-size: 13px;
+            x: 12px;
+            width: parent.width - 40px;
+        }
+
+        if Linked.on && Linked.note != "": Text {
+            text: Linked.note;
+            color: Theme.text;
+            font-size: 13px;
+            wrap: word-wrap;
+            x: 12px;
+            width: parent.width - 40px;
         }
 
         if Devices.list.length > 1: Text {

@@ -188,6 +188,10 @@ pub struct Settings {
     pub sync: bool,
     /// A made-up name for this device, so it can tell its own saved queue from others'.
     pub device_id: String,
+    /// What this installation calls itself to the person's other devices under the new
+    /// linking (see `link`): sixteen random bytes. Made the first time it is needed.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub link_device: String,
     /// The id of the playlist that holds what's shared between devices, once known.
     pub sync_playlist: String,
     /// When the pins and the theme that were last agreed with the server were chosen (see
@@ -267,6 +271,7 @@ impl Default for Settings {
             device_name: String::new(),
             sync: true,
             device_id: String::new(),
+            link_device: String::new(),
             sync_playlist: String::new(),
             pins_at: 0,
             theme_at: 0,

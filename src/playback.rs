@@ -317,6 +317,7 @@ impl Controller {
             self.play_from.take();
             return;
         }
+        let _choice = self.choice();
         // Where these songs came from, if the caller said (see `play_from`).
         let (source, origins, source_list) = match self.play_from.take() {
             Some(from) if from.rows.len() == songs.len() => {
@@ -657,6 +658,7 @@ impl Controller {
         if self.remote(Remote::Toggle) {
             return;
         }
+        let _choice = self.choice();
         let (loaded, resume_at) = {
             let mut pb = self.playback.borrow_mut();
             if pb.current().is_none() {
@@ -683,6 +685,24 @@ impl Controller {
         }
     }
 
+    /// Pauses this PC's own player, whatever else this PC is steering: what a command from
+    /// another of the person's devices does (see `link`). Unlike `set_playing`, it never
+    /// goes on to a jam this PC has joined.
+    pub fn pause_here(self: &Rc<Self>) {
+        let was_playing = {
+            let mut pb = self.playback.borrow_mut();
+            if pb.current().is_none() {
+                return;
+            }
+            std::mem::replace(&mut pb.playing, false)
+        };
+        if was_playing {
+            self.engine.set_playing(false);
+            self.sync_transport();
+            self.save_queue();
+        }
+    }
+
     /// Likes or unlikes the song that's playing. Used by the taskbar's like button.
     #[cfg_attr(not(windows), allow(dead_code))]
     pub fn toggle_current_star(self: &Rc<Self>) {
@@ -697,6 +717,8 @@ impl Controller {
         if self.remote(Remote::Play(playing)) {
             return;
         }
+        // (Asked to be as it already is, it is a choice all the same: see `link`.)
+        let _choice = self.choice();
         if self.playback.borrow().playing != playing {
             self.toggle_play();
         }
@@ -706,6 +728,7 @@ impl Controller {
         if self.remote(Remote::Next) {
             return;
         }
+        let _choice = self.choice();
         {
             let mut pb = self.playback.borrow_mut();
             if pb.order.is_empty() {
@@ -728,6 +751,7 @@ impl Controller {
         if self.remote(Remote::Previous) {
             return;
         }
+        let _choice = self.choice();
         {
             let mut pb = self.playback.borrow_mut();
             if pb.order.is_empty() {
@@ -747,6 +771,7 @@ impl Controller {
         if self.remote(Remote::Seek(seconds)) {
             return;
         }
+        self.lesser();
         let (loaded, token, duration) = {
             let mut pb = self.playback.borrow_mut();
             let Some(duration) = pb.current().map(|s| s.duration as f64) else { return };
@@ -775,6 +800,7 @@ impl Controller {
     }
 
     pub fn stop_playback(self: &Rc<Self>) {
+        let _choice = self.choice();
         {
             let mut pb = self.playback.borrow_mut();
             pb.queue.clear();
@@ -797,6 +823,7 @@ impl Controller {
         if self.remote(Remote::Volume(volume)) {
             return;
         }
+        self.lesser();
         {
             let mut pb = self.playback.borrow_mut();
             pb.volume = volume.clamp(0.0, 1.0);
@@ -819,6 +846,7 @@ impl Controller {
     /// Turns shuffle on or off for what's playing. The current song carries on: turning it
     /// on shuffles what follows; turning it off continues from this song in the list's order.
     pub fn set_shuffle(self: &Rc<Self>, on: bool) {
+        self.lesser();
         let source = {
             let mut pb = self.playback.borrow_mut();
             if pb.shuffle != on {
@@ -877,6 +905,7 @@ impl Controller {
 
     /// Sets repeat: 0 off, 1 the whole queue, 2 the current track.
     pub fn set_repeat(self: &Rc<Self>, mode: u8) {
+        self.lesser();
         {
             let mut pb = self.playback.borrow_mut();
             pb.repeat = mode.min(2);
@@ -900,6 +929,7 @@ impl Controller {
         if self.remote_add(&songs, play_next) {
             return;
         }
+        self.lesser();
         let was_empty = self.playback.borrow().order.is_empty();
         if was_empty {
             // Nothing queued yet: this becomes the queue, ready to play.
@@ -932,6 +962,7 @@ impl Controller {
         if self.remote(Remote::Remove(offset)) {
             return;
         }
+        self.lesser();
         {
             let mut pb = self.playback.borrow_mut();
             let at = pb.cursor + 1 + offset;
@@ -949,6 +980,7 @@ impl Controller {
         if self.remote(Remote::Move(from, to, queued)) {
             return;
         }
+        self.lesser();
         self.playback.borrow_mut().move_ahead(from, to, queued);
         self.next_changed();
     }
@@ -959,6 +991,7 @@ impl Controller {
         if self.remote(Remote::Clear(queued)) {
             return;
         }
+        self.lesser();
         if self.playback.borrow().current().is_none() {
             return;
         }
@@ -971,6 +1004,7 @@ impl Controller {
         if self.remote(Remote::Jump(offset)) {
             return;
         }
+        let _choice = self.choice();
         {
             let mut pb = self.playback.borrow_mut();
             if !pb.jump_ahead(offset) {
@@ -988,6 +1022,7 @@ impl Controller {
         if songs.is_empty() {
             return;
         }
+        let _choice = self.choice();
         self.engine.set_playing(false);
         self.engine.stop();
         let duration = songs.get(index).map_or(0.0, |song| song.duration as f64);
@@ -1014,6 +1049,7 @@ impl Controller {
                     pb.reconnects = 0;
                     if token != 0 && token == pb.next_token {
                         // The engine rolled into the next track by itself.
+                        self.lesser();
                         pb.cursor = pb.next_cursor;
                         pb.current_token = token;
                         pb.next_token = 0;
@@ -1043,6 +1079,9 @@ impl Controller {
                     if pb.current_token == 0 {
                         return;
                     }
+                    // The song is over: whatever comes of that, what a command from another
+                    // device would act on has changed (see `link`).
+                    self.lesser();
                     // The sleep timer asked to stop here: line up what's next, paused.
                     if self.sleep_after_song.replace(false) {
                         pb.cursor = pb.following().unwrap_or(pb.cursor);
@@ -1106,6 +1145,7 @@ impl Controller {
                 // Playing on with nothing to play through would count songs nobody heard.
                 let was_playing = std::mem::replace(&mut self.playback.borrow_mut().playing, false);
                 if was_playing {
+                    self.lesser();
                     self.engine.set_playing(false);
                     self.sync_transport();
                     self.toast("No sound device found, so playback is paused.");
@@ -1245,6 +1285,7 @@ impl Controller {
     /// Gives up on the current song: says so, and moves to the next unless too many in a row
     /// have failed or there is no next.
     fn pass_over(self: &Rc<Self>, title: &str, message: &str) {
+        let _by_itself = self.by_itself();
         self.ui.global::<ui::Player>().set_reconnecting(false);
         let give_up = {
             let mut pb = self.playback.borrow_mut();
@@ -1447,6 +1488,7 @@ impl Controller {
                 return;
             }
             pb.autoplay_loading = false;
+            self.lesser();
             let resume = std::mem::take(&mut pb.autoplay_resume);
             // The queue may have been replaced while the request was out.
             let still_at_end = pb.following().is_none()
@@ -1497,6 +1539,7 @@ impl Controller {
 
     /// Sets the sleep timer: a number of minutes, 0 for off, or `None` for "when this song ends".
     pub fn set_sleep(self: &Rc<Self>, minutes: Option<u32>) {
+        self.lesser();
         self.sleep_after_song.set(minutes.is_none());
         self.sleep_at.set(
             minutes.filter(|m| *m > 0).map(|m| Instant::now() + Duration::from_secs(m as u64 * 60)),
@@ -1517,6 +1560,7 @@ impl Controller {
         let Some(at) = self.sleep_at.get() else { return };
         if Instant::now() >= at {
             self.sleep_at.set(None);
+            let _by_itself = self.by_itself();
             self.set_playing(false);
             self.toast("Sleep timer: paused");
         }
@@ -1993,6 +2037,7 @@ impl Controller {
         if songs.is_empty() {
             return;
         }
+        let _choice = self.choice();
         {
             let mut pb = self.playback.borrow_mut();
             pb.origins = vec![None; songs.len()];
@@ -2206,6 +2251,7 @@ impl Controller {
             with(|ctl| {
                 {
                     let mut pb = ctl.playback.borrow_mut();
+                    ctl.lesser();
                     pb.muted = !pb.muted;
                     ctl.settings.borrow_mut().muted = pb.muted;
                 }
@@ -2349,6 +2395,7 @@ impl Controller {
             }
         }
         let view = self.order_for(key, songs);
+        self.lesser();
         {
             let mut pb = self.playback.borrow_mut();
             let (moved, arrivals) = compare_lists(&pb.source_list, &ids);
@@ -2406,6 +2453,8 @@ impl Controller {
             }
             crate::pages::PlaySource::Albums(ids) => {
                 let key = self.current_route().map(|route| route.cache_key()).unwrap_or_default();
+                // The choice is made now, at the press; the songs are looked up after.
+                let held = self.reserve();
                 self.request(
                     move |client| {
                         let mut all = Vec::new();
@@ -2416,11 +2465,16 @@ impl Controller {
                     },
                     move |ctl, result| match result {
                         Ok(all) => {
-                            // Played from this page, though its rows aren't these songs.
-                            ctl.play_from.replace(Some(PlayFrom { key, rows: Vec::new(), list: Vec::new() }));
-                            ctl.play_songs(all, 0, &context, true)
+                            ctl.carried(held, |ctl| {
+                                // Played from this page, though its rows aren't these songs.
+                                ctl.play_from.replace(Some(PlayFrom { key, rows: Vec::new(), list: Vec::new() }));
+                                ctl.play_songs(all, 0, &context, true)
+                            });
                         }
-                        Err(e) => ctl.toast(e.to_string()),
+                        Err(e) => {
+                            ctl.given_up(held);
+                            ctl.toast(e.to_string())
+                        }
                     },
                 );
             }

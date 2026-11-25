@@ -564,6 +564,27 @@ export global Devices {
     callback choose(id: string);
 }
 
+// One of the person's other devices, under the new linking (see src/link.rs).
+export struct LinkedDevice {
+    // Its place at the relay: what Pause is sent to.
+    place: string,
+    name: string,
+    // What it's doing, in a few words.
+    about: string,
+    playing: bool,
+}
+
+// The new linking, where it is switched on for a test. Not shown otherwise.
+export global Linked {
+    in property <bool> on;
+    // This PC has its place in the room.
+    in property <bool> entered;
+    in property <[LinkedDevice]> list;
+    // What there is to say: what became of the last Pause, or why nothing is linked.
+    in property <string> note;
+    callback pause(place: string);
+}
+
 export global Toast {
     in property <bool> visible;
     in property <string> text;

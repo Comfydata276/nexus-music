@@ -301,6 +301,13 @@ pub struct Controller {
     pub jam_pool: std::sync::Arc<Pool>,
     /// The jam being hosted or joined, if any (see `jam`).
     pub jam: RefCell<crate::jam::Jam>,
+    /// The order of choices on this PC: what a command from another of the person's
+    /// devices is judged against (see `link`).
+    pub link_rule: RefCell<nexus_core::link::rule::Rule>,
+    /// A choice is being carried out: what the player does on its way is part of it.
+    pub link_carrying: Cell<bool>,
+    /// The new linking of a person's devices, where it is switched on (see `link`).
+    pub link: RefCell<crate::link::Link>,
     /// Waits for typing in a jam's search box to pause.
     pub jam_timer: slint::Timer,
     pub downloads: RefCell<crate::downloads::Downloads>,
@@ -499,6 +506,9 @@ impl Controller {
             quick_pool: Pool::new("quick", 1, true),
             jam_pool: std::sync::Arc::new(Pool::new("jam", 4, false)),
             jam: RefCell::default(),
+            link_rule: RefCell::default(),
+            link_carrying: Cell::new(false),
+            link: RefCell::default(),
             jam_timer: slint::Timer::default(),
             download_pool: Pool::new("download", 2, false),
             // Nobody is signed in yet: whose downloads to show is known in `enter`.
@@ -4266,6 +4276,7 @@ impl Controller {
 
         self.wire_playback();
         self.wire_jam();
+        self.wire_link();
         self.wire_actions();
     }
 

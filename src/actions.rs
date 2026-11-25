@@ -458,23 +458,42 @@ impl Controller {
         target: Target,
         then: impl FnOnce(&Rc<Controller>, Vec<Song>) + Send + 'static,
     ) {
-        let finish = |ctl: &Rc<Controller>, result: crate::subsonic::ApiResult<Vec<Song>>, then: Box<dyn FnOnce(&Rc<Controller>, Vec<Song>) + Send>| match result {
-            Ok(songs) if songs.is_empty() => ctl.toast("There are no songs in that."),
+        self.with_songs_or(target, then, |_| {});
+    }
+
+    /// As `with_songs`; `otherwise` runs if there turn out to be no songs to continue with.
+    fn with_songs_or(
+        self: &Rc<Self>,
+        target: Target,
+        then: impl FnOnce(&Rc<Controller>, Vec<Song>) + Send + 'static,
+        otherwise: impl FnOnce(&Rc<Controller>) + Send + 'static,
+    ) {
+        type Then = Box<dyn FnOnce(&Rc<Controller>, Vec<Song>) + Send>;
+        type Otherwise = Box<dyn FnOnce(&Rc<Controller>) + Send>;
+        let finish = |ctl: &Rc<Controller>, result: crate::subsonic::ApiResult<Vec<Song>>, then: Then, otherwise: Otherwise| match result {
+            Ok(songs) if songs.is_empty() => {
+                otherwise(ctl);
+                ctl.toast("There are no songs in that.")
+            }
             Ok(songs) => then(ctl, songs),
-            Err(e) => ctl.toast(e.to_string()),
+            Err(e) => {
+                otherwise(ctl);
+                ctl.toast(e.to_string())
+            }
         };
-        let then: Box<dyn FnOnce(&Rc<Controller>, Vec<Song>) + Send> = Box::new(then);
+        let then: Then = Box::new(then);
+        let otherwise: Otherwise = Box::new(otherwise);
         match target {
-            Target::None | Target::Request { .. } => {}
+            Target::None | Target::Request { .. } => otherwise(self),
             Target::Song { song, .. } => then(self, vec![song]),
             Target::Songs { songs, .. } => then(self, songs),
             Target::Album { id, .. } => self.request(
                 move |client| client.album(&id).map(|a| a.songs),
-                move |ctl, result| finish(ctl, result, then),
+                move |ctl, result| finish(ctl, result, then, otherwise),
             ),
             Target::Playlist { id, .. } => self.request(
                 move |client| client.playlist(&id).map(|p| p.songs),
-                move |ctl, result| finish(ctl, result, then),
+                move |ctl, result| finish(ctl, result, then, otherwise),
             ),
             Target::Artist { id, .. } => self.request(
                 move |client| {
@@ -485,7 +504,7 @@ impl Controller {
                     }
                     Ok(songs)
                 },
-                move |ctl, result| finish(ctl, result, then),
+                move |ctl, result| finish(ctl, result, then, otherwise),
             ),
         }
     }
@@ -1331,18 +1350,21 @@ impl Controller {
 
     fn start_radio(self: &Rc<Self>, seed: Song) {
         let id = seed.id.clone();
+        // The choice is made now, at the press; the songs are looked up after.
+        let held = self.reserve();
         self.request(
             move |client| client.similar_songs(&id, 60),
             move |ctl, result| {
                 let similar = result.unwrap_or_default();
                 if similar.is_empty() {
+                    ctl.given_up(held);
                     ctl.toast("No similar songs found. Radio needs Last.fm set up in Navidrome.");
                     return;
                 }
                 let context = format!("{} radio", seed.title);
                 let mut songs = vec![seed.clone()];
                 songs.extend(similar.into_iter().filter(|s| s.id != seed.id));
-                ctl.play_songs(songs, 0, &context, false);
+                ctl.carried(held, |ctl| ctl.play_songs(songs, 0, &context, false));
             },
         );
     }
@@ -1388,17 +1410,25 @@ impl Controller {
             Target::Playlist { id, .. } => Some(id.clone()),
             _ => None,
         };
-        self.with_songs(target, move |ctl, all| {
-            // A playlist plays in the order its page shows it in.
-            let rows: Vec<usize> = match &playlist {
-                Some(id) => ctl.playlist_order(id, &all),
-                None => (0..all.len()).collect(),
-            };
-            let songs: Vec<Song> = rows.iter().filter_map(|&row| all.get(row).cloned()).collect();
-            let list = all.iter().map(|song| song.id.clone()).collect();
-            ctl.play_from.replace(source.map(|key| crate::playback::PlayFrom { key, rows, list }));
-            ctl.play_songs(songs, 0, &name, true)
-        });
+        // The choice is made now, at the press; the songs are looked up after.
+        let held = self.reserve();
+        self.with_songs_or(
+            target,
+            move |ctl, all| {
+                ctl.carried(held, |ctl| {
+                    // A playlist plays in the order its page shows it in.
+                    let rows: Vec<usize> = match &playlist {
+                        Some(id) => ctl.playlist_order(id, &all),
+                        None => (0..all.len()).collect(),
+                    };
+                    let songs: Vec<Song> = rows.iter().filter_map(|&row| all.get(row).cloned()).collect();
+                    let list = all.iter().map(|song| song.id.clone()).collect();
+                    ctl.play_from.replace(source.map(|key| crate::playback::PlayFrom { key, rows, list }));
+                    ctl.play_songs(songs, 0, &name, true)
+                });
+            },
+            move |ctl| ctl.given_up(held),
+        );
     }
 
     // ---- likes ---------------------------------------------------------------------------------
