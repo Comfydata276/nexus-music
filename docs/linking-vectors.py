@@ -105,30 +105,31 @@ for name, data, body in frames:
 
 # ---- the design's decisions ---------------------------------------------------------------------
 class Device:
-    """What a device decides about a command (5.6). `gen` advances when a choice is accepted, and
-    by itself when what a command would act on changes; `minute` is whole minutes since the app
-    started. Between accepting a choice and carrying it out the device is busy."""
-    def __init__(self): self.gen, self.minute, self.by, self.busy, self.did = 1, 0, None, False, []
-    def accept(self): self.gen += 1; self.by = None; self.busy = True; return self.gen      # the press
-    def carry_out(self, mine, what, by=None):                                              # the player being changed
-        if self.gen != mine: return False                                                  # a newer choice has the say
-        self.busy = False; self.by = by; self.did.append(what); return True
-    def choose(self, what): return self.carry_out(self.accept(), what)                     # a press with no work between
-    def by_itself(self, what): self.gen += 1; self.by = None; self.did.append(what)        # the next song starting
+    """What a device decides about a command (5.6). `gen` moves whenever what a command would act
+    on changes; `minute` is whole minutes since the app started. A choice made at the device
+    whose work is still to do makes it busy, and decides nothing else: nothing chosen there
+    displaces anything else chosen there."""
+    def __init__(self): self.gen, self.minute, self.by, self.waiting, self.command, self.did = 1, 0, None, 0, False, []
+    def busy(self): return self.waiting > 0 or self.command
+    def wait(self): self.waiting += 1                                   # the press: a look-up begins
+    def done(self): self.waiting -= 1                                   # the look-up is over, whatever it found
+    def moved(self, what): self.gen += 1; self.by = None; self.did.append(what)
+    def choose(self, what): self.moved(what)                            # a press carried out at once
+    def by_itself(self, what): self.moved(what)                         # the next song starting
     def state(self): return (self.gen, self.minute)
     def admit(self, at):
-        if self.busy: return 'busy'
+        if self.busy(): return 'busy'
         if at[0] != self.gen: return 'changed'
         if self.minute - at[1] not in (0, 1): return 'late'
     def ask(self, nonce, what, at, work=None):
         why = self.admit(at)                       # on arrival, before any work is done for it
         if why: return (False, why, self.state(), self.by)
-        mine = self.accept()                       # it is a choice: its generation is reserved now
+        self.command, accepted_at = True, self.gen
         if work: work()
-        late = self.minute - at[1] not in (0, 1)   # again, as the player is changed
-        if late or not self.carry_out(mine, what, nonce):
-            if self.gen == mine: self.busy = False
-            return (False, 'late' if late else 'changed', self.state(), self.by)
+        self.command = False                       # again, as the player is changed
+        why = 'changed' if self.gen != accepted_at else 'late' if self.minute - at[1] not in (0, 1) else None
+        if why: return (False, why, self.state(), self.by)
+        self.moved(what); self.by = nonce
         return (True, None, self.state(), self.by)
 
 def outcome(seen, nonce):
@@ -157,14 +158,14 @@ case('held Play: delivered two minutes on', (b.ask('P', 'play', at)[:2], b.did),
 b = Device(); at = b.state()
 case('a command admitted in time whose work outlasts it', b.ask('P', 'play', at, lambda: setattr(b, 'minute', 2))[:2], (False, 'late'))
 
-b = Device(); at = b.state(); mine = b.accept()   # Play pressed on a list that has to be looked up
+b = Device(); at = b.state(); b.wait()             # Play pressed on a list that has to be looked up
 during = b.state()
 case('sequence 14: a held Pause against a Play still looking its songs up', (b.ask('Q', 'pause', at)[:2], b.did), ((False, 'busy'), []))
 case('sequence 14: a second device quotes the state it was shown meanwhile', b.ask('R', 'pause', during)[:2], (False, 'busy'))
-b.carry_out(mine, 'play the list')
+b.done(); b.choose('play the list')
 case('sequence 14: the held Pause after the Play has started', (b.ask('Q', 'pause', at)[:2], b.did), ((False, 'changed'), ['play the list']))
-b = Device(); old = b.accept(); b.choose('pause')
-case('a look-up that answers after a newer choice', (b.carry_out(old, 'play the list'), b.did), (False, ['pause']))
+b = Device(); b.wait(); b.wait(); b.done(); b.done(); b.choose('play the first list')
+case('Play A then Play B, B fails: nothing chosen at the device displaces anything else', (b.busy(), b.did), (False, ['play the first list']))
 b = Device(); at = b.state(); b.by_itself('the next song starts')
 case('a Pause that crosses the start of the next song', b.ask('Q', 'pause', at)[:2], (False, 'changed'))
 b = Device(); at = b.state()

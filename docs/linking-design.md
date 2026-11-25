@@ -44,7 +44,9 @@ read them. Under this design:
 | Changing your password | Splits your devices until each signs in again | No effect once each has signed in again |
 | A PC on 0.40.6 or earlier | Sees your other devices | Does not see devices on the new version, nor they it. Jams with guests work throughout. |
 
-**The relay is updated first.** That is done for you; it ends any jam in progress.
+**The relay is updated first.** That is done for you; it ends any jam in progress. It
+gains a second port for your devices, and your proxy one rule sending `/api/link/` to
+it.
 
 **Once every device is updated,** in this order:
 
@@ -112,10 +114,10 @@ A **look** is: list the playlists; choose by the rule of `core/src/step.rs` (`fi
 the lowest id among those of that name whose owner the server states to be this
 account); fetch that playlist; check what was fetched. The fetched playlist counts
 only if its id is the one asked for, its name is the name, its **owner is stated** and
-is this account, and it is **stated private** (`public` present and `false`).
-Navidrome's JSON leaves `public` out when it is false, so that answer cannot state it;
-its XML answer always writes the attribute, and the app asks for the playlist again in
-XML and reads it there, from an "ok" answer about that id. An
+is this account, and it is **stated private** (`public` present and `false`). All four
+are read from **one answer**, and it is the XML one: Navidrome's JSON leaves `public`
+out when it is false, so only its XML states it, and a comment from one answer with
+the privacy from another could renew a secret that was replaced in between. An
 answer that fails any of these, or leaves one out, is not used, is not written over,
 and does not renew the ten minutes. A server that does not state these cannot be used
 for linking, and the app says so. The name is added to the reserved names.
@@ -145,9 +147,18 @@ look.
 - **"Reset linking"** writes a new secret into the same playlist and looks again.
   Other devices move at their next look.
 - **A session** is one sign-in with one secret. When the secret changes or runs out,
-  the person signs out, or the account changes, the session ends: looks, answers and
-  commands in flight under it are dropped, and a command is carried out only if the
-  session it arrived under is still the session (5.6).
+  the person signs out, "Link my devices" is switched off, or the account changes, the
+  session ends: looks, answers, what is queued to send and commands in flight under it
+  are dropped. **Every use asks whether the session is the live one and inside its
+  ten minutes:** a look's answer, anything sent, each frame opened, and the moment the
+  player is changed (5.6). A look that finds the record is not one to use (public and
+  not repaired, not ours, a later layout, no longer stated) ends the session there and
+  then; a look that could not ask concludes nothing.
+- **Never listed, never on disk.** With linking on, the playlist is left out of every
+  ordinary listing of playlists, as the sync record's is, and the page of a playlist
+  of either name is never written to the app's cache of pages. **Versions up to 0.40.6
+  do list it,** and opening it there writes the secret into that PC's page cache: one
+  more reason an old PC is updated before linking is switched on anywhere.
 
 ### 5.2 What is derived from it
 
@@ -168,6 +179,15 @@ Required: an app links only through a relay whose `GET /api/hello` says `"link":
 and otherwise says "This relay needs updating before your devices can be linked."
 Every call needs the host key. There are no guests, joins, peeks, covers or names on
 this route, and it shares no code with jams. Answers carry `Cache-Control: no-store`.
+
+**It is served apart from jams:** on a listener of its own (`JAM_LINK_LISTEN`, a
+second port), read and written by the relay itself on threads of its own. The proxy
+in front sends `/api/link/` there and everything else to the first port; on the first
+port the route is not there at all, and `hello` offers it only when the second is up.
+Nothing on the route's path runs where a jam is served, refusals included, so it can
+never cost a jam anything. (It cannot share the jams' listener and keep that promise:
+the HTTP library jams are served with gives no deadline on reading a body, and reads
+what is left of one on whichever thread lets go of the request.)
 
 | Call | Sends | Answer |
 |---|---|---|
@@ -190,8 +210,10 @@ this route, and it shares no code with jams. Answers carry `Cache-Control: no-st
   no longer prints the host key at start-up, whether set or made up; with none set it
   does not start.
 - Statuses: 400 a room, place or body that is not well formed; 401 the host key; 404
-  no such room, place or token; 409 the place is taken; 410 old linking is off; 411 a
-  body that does not state its length; 413; 429 with `Retry-After`; 503 full.
+  no such room, place or token; 409 the place is taken; 410 old linking is off (on the
+  first port); 411 a body that does not state its length; 413; 429 with `Retry-After`;
+  431 a head over 8 KiB; 503 full or busy.
+- Every connection carries one request and is closed.
 
 | Limit | Value | When passed |
 |---|---|---|
@@ -207,14 +229,22 @@ this route, and it shares no code with jams. Answers carry `Cache-Control: no-st
 | `send` from one place; from one address | 20 at once then 5 a second; 40 a second | 429 |
 
 **The total for the process:** at most 40 MiB of waiting frames (20 rooms of 2 MiB)
-and 320 held polls. **Work in flight is bounded too:** the route has its own threads
-and its own sweeper, so nothing it reads or writes can hold up a jam; at most 64
-requests wait for those threads and at most 8 MiB of answers are being written at
-once (a poll whose answer does not fit waits, with its frames, for the next round);
-a write that makes no progress for 20 seconds is abandoned. A body must state its
-length and is read only after the host key and token have been checked. (The HTTP
-library gives no deadline on reading a body; a stalled one holds one of the route's
-own threads, never a jam's.)
+and 320 held polls. **Work in flight is bounded too:**
+
+- at most 512 connections to the route at once; one more is closed as it arrives,
+  unread;
+- at most 64 connections waiting for one of the route's six threads; past that a
+  connection is told the relay is busy and closed, unread;
+- a request's head has a deadline (10 s) and a size (8 KiB);
+- a body is read only after the host key and token have been checked, only if it
+  states its length and that is within what its call takes (else 411 or 413 with none
+  of it read), and it has a deadline (10 s);
+- a connection refused with some of its body unread is given a quarter of a second
+  and 64 KiB at the most to finish before it is closed, so the refusal is not thrown
+  away at the other end; the body itself is never read;
+- every reply, head and body, is charged against 8 MiB **before it is built**, and
+  until it is written (a poll whose answer does not fit waits, with its frames, for
+  the next round); a write that makes no progress for 20 seconds is given up.
 
 **A caller's address** is the connection's own, unless the connection comes from the
 proxy named in a new setting, `JAM_TRUSTED_PROXY`; then it is the last address in
@@ -306,22 +336,28 @@ An answering device handles at most 20 asks a second and drops the rest.
 
 ### 5.6 The rule for commands
 
-**A device has a generation,** a number that starts at 1 with the app. It advances:
+**The rule exists for one purpose:** so that a command from another device is judged
+against what is true on this one. It never judges what the person does at the device
+itself. Nothing they press there is refused, delayed or dropped because of it, with
+linking on or off: every press does exactly what it would do without linking.
 
-- **when a choice is accepted:** at the press, before any work is done for it. A tap,
-  a media key, a tray or taskbar button, a guest's authorised action in a jam, a
-  command from another device, an explicit seek, mute and volume, setting or
-  cancelling a sleep timer. A choice that changes nothing (Pause when paused) counts;
-- **by itself, when what a command would act on changes:** the next song starting,
-  autoplay adding songs, a followed playlist changing the queue, a timer's pause, the
-  sound output being lost. Not the position ticking.
+**A device has a generation,** a number that starts at 1 with the app and moves on
+whenever what a command would act on changes:
 
-**Accepting and carrying out.** Accepting a choice *reserves* its generation, once.
-Every later step that carries the choice out (a look-up's answer arriving, the
-player being changed) first checks the reservation is still the device's generation,
-and does nothing if it is not. Between the two the device is **busy**: its state
-says so, `by` is empty, and a command from another device is refused `busy`. The
-person at the device is never refused: their next press is simply a newer choice.
+- **a choice made at the device being carried out:** play, pause, next, a new queue,
+  a seek, mute and volume, an edit to the queue, a sleep timer set or cancelled; a
+  guest's action in a jam; a command from another device. A press that changes
+  nothing (Next with nothing to go to, Pause when paused) takes no place;
+- **by itself:** the next song starting, autoplay adding songs, a followed playlist
+  changing the queue, a timer's pause, the sound output being lost. Not the position
+  ticking.
+
+**Busy.** A choice whose work is still to do (a Play whose songs are being looked up)
+marks the device **busy** from the press until the work is done or has come to
+nothing. Its state says so, and a command from another device is refused `busy`: the
+state it was made against is about to change. Several choices can be waiting at once,
+each as it would be without this; none displaces another. A wait ends by itself after
+a minute, so a look-up that never answers cannot leave a device busy for ever.
 
 **And a minute:** whole minutes since the app started, on a clock that goes on
 counting while the device sleeps (Windows: interrupt time; Android:
@@ -335,14 +371,17 @@ it arrives the receiving device checks, before any work:
 - its minute now is the minute quoted, or the one after (`late`).
 
 If any fails it does nothing and answers with its state. Otherwise the command is
-accepted like any choice: its generation is reserved. **At the moment the player is
-changed** the device checks the reservation, the minute, and that the session the
-command arrived under is still the session (5.1). Then it carries the command out,
-`by` becomes the command's nonce, and the answer says `ok`. A command carries out
-its action on this device only: a Pause never goes on to a jam the device has joined.
+accepted, and is the one open command: another is refused `busy` until it is done.
+**At the moment the player is changed** the device checks that it is still the open
+command, that the generation has not moved since it was accepted, the minute, and
+that the session it arrived under is still the live session and inside its time
+(5.1). Then it carries the command out, the generation moves, `by` becomes the
+command's nonce, and the answer says `ok`. A command is finished once. It carries
+out its action on this device only: a Pause never goes on to a jam the device has
+joined.
 
-So a repeat fails (its first delivery advanced the generation), a command held back
-fails once anything is chosen there, a song changes, or two minutes pass, and a
+So a repeat fails (its first delivery moved the generation), a command held back
+fails once anything changes there or two minutes pass, and a
 command overtaken by the person at the device fails. **A Pause that crosses the start
 of the next song is refused once like anything else,** and the sender looks again.
 Nothing is remembered about past commands but `by`.
@@ -359,7 +398,10 @@ Nothing is remembered about past commands but `by`.
   nonce, done; the generation is as it was, "That hadn't reached Study PC when
   checked" (it may still, within its two minutes); anything else, "Study PC changed.
   Check what is playing before you press again." It never sends a command again by
-  itself, and an answer that arrives after this is still believed.
+  itself, and an answer that arrives after this is still believed. A success is
+  believed whenever it comes, once, even after a refusal of the same command (a repeat
+  the relay's path made can be refused first); a refusal is never believed over a
+  success.
 
 **What this costs.** Two people steering one device at the same instant: one is
 refused and shown the result. A device someone is busy with refuses commands from
@@ -367,9 +409,21 @@ elsewhere while each choice lands: whoever is at the device wins. A command sent
 a song ends is refused once. After "not known" the person may press again and get
 two.
 
-**What still needs time:** the minute; the ten minutes a secret is used; and how long
-a sender waits before it stops waiting. No clock is compared between devices and no
-wall clock is used.
+**Accepted, and not fixed now.**
+
+- A Pause that arrives in the instant between the sound rolling into the next song and
+  the app's generation catching up pauses the device. It is a Pause; it does what was
+  meant.
+- A Pause pressed at a device that is already paused changes nothing and takes no
+  place, so it does not stop a Play another device sent a moment before and the path
+  held back.
+- The old linking and the new can run side by side on one PC while both are switched
+  on, each as it is. "Link my devices" off ends both.
+
+**What still needs time:** the minute; the ten minutes a secret is used; how long a
+sender waits before it stops waiting; and the minute a look-up is given before a
+device stops counting as busy for it. No clock is compared between devices and no wall
+clock is used.
 
 ### 5.7 Moving music
 
@@ -441,8 +495,10 @@ device no longer keeps a private session; a jam is the only kind.
 5. **At the moment it is carried out, authorise again:** the guest is still in the jam
    and steering is still on; for a device, 5.6 again.
 
-A guest's authorised action reserves the generation as a press does, before any
-look-up. A removal is applied before any question collected in the same poll. The
+A guest's action counts in the generation as it is carried out, as a press does, and
+like a press it displaces nothing the host has chosen. A removal is applied before any
+question collected in the same poll; a guest removed while their add is being looked
+up can still have it applied, as today (accepted; it goes with the jam work). The
 cases each app must pass, and the relay's changes for jams, are in version 2,
 sections 7 and 8.
 
@@ -480,9 +536,11 @@ tests must decide them the same way. B is the device being steered.
 | Held Play: nothing done at B; delivered a minute on | Carried out, up to two minutes late. |
 | Held Play: delivered two minutes on | `late`. Nothing. |
 | A command that arrives in time and whose work outlasts the minute | `late` at the player. Nothing. |
-| Review 2's sequence 14: a held Pause; meanwhile Play pressed at B on a list still being looked up | `busy` while the list is looked up, `changed` after: the press reserved the generation before anything played. The Play goes ahead. |
+| Review 2's sequence 14: a held Pause; meanwhile Play pressed at B on a list still being looked up | `busy` while the list is looked up, `changed` after: the Play being carried out moved the generation. The Play goes ahead. |
 | A look during that look-up; a second device presses Pause | The state said busy, so the sender does not send against it and looks again. One that sent anyway is refused `busy`. |
-| A look-up that answers after a newer choice | Its reservation is no longer the generation: it does nothing. |
+| Two things chosen at B, one after the other, the first still being looked up (Play then Next; Play A then Play B; a guest's add) | Each does exactly what it does without linking. The rule decides nothing between them; B is busy to other devices until both look-ups are over. |
+| A look-up that never answers | B stops counting as busy for it after a minute. |
+| B carries a Pause out, is started again by hand, and refuses a repeat; the refusal reaches A before the first answer | A says "nothing was done", and corrects it to "Paused" when the success arrives. |
 | A Pause that crosses the start of the next song | `changed`, once. The sender looks again. |
 | The secret is reset while a Pause is on its way, or between its arrival and the player | Sealed under the old secret, it does not open under the new; if it had arrived, the session has ended and it is not carried out. |
 | A tell delivered again, or an old one in place of the answer | Its `re` is not waited on (each nonce is used once): dropped. The screen is not made fresh. |
@@ -555,9 +613,9 @@ commands, news, moving music, "Reset linking" on the screen, the phone.
 2. **Signing in once is joining,** and reset is everyone's, a stolen device's too.
 3. **One nonce reused breaks the seal for everyone;** recorded traffic is readable
    later by whoever gets the secret.
-4. **The generation is only as good as the app's count of choices.** A way into the
-   player that does not reserve it is a hole. Every one has to be found and tested, on
-   both apps.
+4. **The generation is only as good as the app's count of changes.** A way into the
+   player that does not count is a hole. Every one has to be found and tested, on both
+   apps.
 5. **After a lost answer, if anyone chose since, the outcome is not known.**
 6. **A busy device starves steering from elsewhere.**
 7. **The minute and the ten minutes need a clock that counts sleep.**
