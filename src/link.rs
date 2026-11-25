@@ -284,9 +284,9 @@ impl Server for Navidrome<'_> {
 
 /// One look (see `nexus_core::link::secret`). `over` is set if the sign-in it is for ends
 /// while it is under way.
-fn look(client: &Client, used: Option<String>, over: Arc<AtomicBool>) -> Looked {
+fn look(client: &Client, used: Option<String>, over: Arc<AtomicBool>, reset: bool) -> Looked {
     let mut server = Navidrome { client, agent: crate::subsonic::make_agent_without_redirects(), over };
-    look_with(&mut server, client.username(), used)
+    look_with(&mut server, client.username(), used, reset)
 }
 
 /// One look, of whatever answers as the music server does.
@@ -301,7 +301,12 @@ fn look(client: &Client, used: Option<String>, over: Arc<AtomicBool>) -> Looked 
 /// **It stops with the sign-in.** Before each request it asks whether the sign-in it is
 /// for is still the one. If not, it makes no further request, and what it says is of no
 /// account: its answer is the answer to a look nobody is waiting on.
-fn look_with(server: &mut impl Server, username: &str, mut used: Option<String>) -> Looked {
+///
+/// **A look that resets** ("Reset linking") does everything a look does, and where it
+/// would have used the secret it read, writes a new one in its place and reads that back.
+/// It is not a different path to the playlist: the same answer is checked the same way
+/// before anything is written, so a reset cannot write into a playlist a look would not use.
+fn look_with(server: &mut impl Server, username: &str, mut used: Option<String>, mut reset: bool) -> Looked {
     let mut wrote = None;
     // The record has been seen to be no good in this look.
     let mut no_good = false;
@@ -340,6 +345,24 @@ fn look_with(server: &mut impl Server, username: &str, mut used: Option<String>)
         }
         let Some(fetched) = server.fetch(&id).as_deref().and_then(secret::fetched) else { return unasked(no_good) };
         match secret::judge(&id, replace, &fetched, username) {
+            Verdict::Use(_) if reset => {
+                reset = false;
+                let Some(fresh) = server.random().map(Secret::new) else { return Looked::NoRandom };
+                if !server.still() {
+                    return Looked::Failed;
+                }
+                // (If it cannot be written, the secret that is there stands, and the look
+                // says only that the server could not be asked.)
+                if server.write(&id, &fresh.comment()).is_none() {
+                    return unasked(no_good);
+                }
+                log(format!("look: wrote a new secret into {id} (Reset)"));
+                wrote = Some(secret::Why::Reset);
+                used = Some(id);
+                // The secret that was read is the record no longer: if the new one cannot
+                // be read back, the look says so, and the old one is not used meanwhile.
+                no_good = true;
+            }
             Verdict::Use(secret) => return Looked::Secret { secret, id, wrote },
             Verdict::Stop(stop) => return Looked::Stopped(stop),
             Verdict::Write(why) => {
@@ -644,6 +667,8 @@ pub struct Link {
     looks: u64,
     /// When the last look finished.
     looked_ms: Option<u64>,
+    /// "Reset linking" was pressed: the next look writes a new secret.
+    reset: bool,
     session: Option<Session>,
     serial: u64,
     asks: Asks,
@@ -698,6 +723,7 @@ impl Link {
         self.looks += 1;
         self.looking = false;
         self.looked_ms = None;
+        self.reset = false;
         self.steering = None;
         self.take = None;
     }
@@ -912,7 +938,7 @@ impl Controller {
         }
         let due = {
             let link = self.link.borrow();
-            !link.looking && link.looked_ms.is_none_or(|at| now.saturating_sub(at) >= LOOK_AGAIN_MS)
+            !link.looking && (link.reset || link.looked_ms.is_none_or(|at| now.saturating_sub(at) >= LOOK_AGAIN_MS))
         };
         if due {
             self.link_look(now);
@@ -973,19 +999,36 @@ impl Controller {
 
     fn link_look(self: &Rc<Self>, now: u64) {
         let Some(client) = self.client() else { return };
-        let (used, looks, over, pool) = {
+        let (used, looks, over, reset, pool) = {
             let mut link = self.link.borrow_mut();
             let (looks, over) = link.look_begins();
-            (link.used.clone(), looks, over, link.pool())
+            (link.used.clone(), looks, over, std::mem::take(&mut link.reset), link.pool())
         };
         pool.spawn(move || {
-            let looked = look(&client, used, over);
-            post(move |ctl| ctl.link_looked(looks, now, looked));
+            let looked = look(&client, used, over, reset);
+            post(move |ctl| ctl.link_looked(looks, now, looked, reset));
         });
     }
 
-    /// A look has finished. `since` is when it began.
-    fn link_looked(self: &Rc<Self>, looks: u64, since: u64, looked: Looked) {
+    /// "Reset linking" was pressed: a new secret is written into the playlist at the next
+    /// look, which starts as soon as the one on its way (if any) is over. Every device
+    /// still signed in moves to it at its own next look.
+    pub fn link_reset(self: &Rc<Self>) {
+        if !on() {
+            return;
+        }
+        {
+            let mut link = self.link.borrow_mut();
+            link.reset = true;
+            link.note = "Resetting linking…".into();
+        }
+        log("reset: asked for");
+        self.link_show();
+    }
+
+    /// A look has finished. `since` is when it began; `reset` is whether it was one that
+    /// writes a new secret.
+    fn link_looked(self: &Rc<Self>, looks: u64, since: u64, looked: Looked, reset: bool) {
         let mut forget = None;
         let begin = {
             let mut link = self.link.borrow_mut();
@@ -1000,7 +1043,10 @@ impl Controller {
             if ends_session(&looked) && link.end_session() {
                 log("session: ended, the record is no longer one to use");
             }
-            match looked {
+            let reset_done = reset && matches!(&looked, Looked::Secret { wrote: Some(secret::Why::Reset), .. });
+            // A reset that got as far as writing and no further has still ended the old secret.
+            let reset_half_done = reset && matches!(&looked, Looked::Invalid);
+            let begin = match looked {
                 Looked::Secret { secret, id, wrote } => {
                     // A page for that playlist written to disk before now (by a version that
                     // listed it) holds the secret: it goes.
@@ -1015,7 +1061,7 @@ impl Controller {
                             log("look: the secret is as it was");
                             None
                         }
-                        None => Some(secret),
+                        None => Some((secret, reset_done)),
                     }
                 }
                 Looked::Stopped(stop) => {
@@ -1042,13 +1088,24 @@ impl Controller {
                     link.note = "This PC couldn't make random numbers, so linking is off.".into();
                     None
                 }
+            };
+            if reset_half_done {
+                link.note = "Linking was reset, but the music server stopped answering before that could be confirmed. It will be asked again.".into();
+            } else if reset && !reset_done {
+                link.note = "Linking couldn't be reset: the music server didn't answer. Try again.".into();
             }
+            begin
         };
         if let Some(page) = forget {
             self.invalidate(&page);
         }
-        if let Some(secret) = begin {
+        if let Some((secret, reset_done)) = begin {
             self.link_begin(secret, since);
+            if reset_done {
+                log("reset: a new secret was written and read back");
+                // The devices this one remembers are on the old secret until their next look.
+                self.link.borrow_mut().note = "Linking was reset. Your other devices rejoin by themselves within two minutes.".into();
+            }
         }
     }
 
@@ -2115,12 +2172,19 @@ impl Controller {
         linked.on_choose(|place| {
             with(|ctl| ctl.link_choose(place.as_str()));
         });
+        linked.on_reset(|| {
+            with(|ctl| ctl.link_reset());
+        });
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn look_with_no_reset(server: &mut impl Server, username: &str, used: Option<String>) -> Looked {
+        look_with(server, username, used, false)
+    }
 
     #[test]
     fn the_playlists_the_app_keeps_for_itself_are_not_listed() {
@@ -2336,7 +2400,7 @@ mod tests {
     fn a_record_seen_to_be_no_good_is_not_forgotten_when_a_later_request_fails() {
         let found = |fetches: Vec<Option<String>>| {
             let mut server = Scripted::with(fetches);
-            let looked = look_with(&mut server, "tester", Some("k".into()));
+            let looked = look_with_no_reset(&mut server, "tester", Some("k".into()));
             (ends_session(&looked), matches!(looked, Looked::Secret { .. }), server.asked)
         };
         // Public; written; the read-back gets no answer.
@@ -2347,7 +2411,7 @@ mod tests {
         // about a playlist, and when what was written keeps not being there.
         let mut server = Scripted::with(vec![playlist(RECORD, true)]);
         server.listed.clear();
-        assert!(ends_session(&look_with(&mut server, "tester", Some("gone".into()))) || server.asked.contains(&"make"));
+        assert!(ends_session(&look_with_no_reset(&mut server, "tester", Some("gone".into()))) || server.asked.contains(&"make"));
         assert!(found(vec![playlist("somebody's note", false), Some("not an answer".into())]).0);
         assert!(found(vec![playlist(RECORD, true), playlist(RECORD, true), playlist(RECORD, true)]).0);
         // Unless a later read shows it good: then that is the secret to use.
@@ -2358,11 +2422,59 @@ mod tests {
         assert!(!ends && !good && asked == ["list", "fetch"]);
         let mut server = Scripted::with(vec![]);
         server.list_works = false;
-        assert!(!ends_session(&look_with(&mut server, "tester", Some("k".into()))));
+        assert!(!ends_session(&look_with_no_reset(&mut server, "tester", Some("k".into()))));
         // A record found no good that cannot be written over is no good either.
         let mut server = Scripted::with(vec![playlist(RECORD, true)]);
         server.write_works = false;
-        assert!(ends_session(&look_with(&mut server, "tester", Some("k".into()))));
+        assert!(ends_session(&look_with_no_reset(&mut server, "tester", Some("k".into()))));
+    }
+
+    /// "Reset linking": a look that writes a new secret where it would have used the one it
+    /// read, and uses only what it then reads back.
+    #[test]
+    fn a_look_that_resets_writes_a_new_secret_and_reads_it_back() {
+        let fresh = Secret::new([9; 32]);
+        let written = fresh.comment();
+        let mut server = Scripted::with(vec![playlist(RECORD, false), playlist(&written, false)]);
+        let looked = look_with(&mut server, "tester", Some("k".into()), true);
+        assert_eq!(server.asked, ["list", "fetch", "write", "list", "fetch"]);
+        assert!(matches!(&looked, Looked::Secret { secret, wrote: Some(secret::Why::Reset), .. } if *secret == fresh), "the reset did not come to the new secret");
+        // The same look without the reset reads the record and writes nothing.
+        let mut server = Scripted::with(vec![playlist(RECORD, false)]);
+        assert!(matches!(look_with(&mut server, "tester", Some("k".into()), false), Looked::Secret { wrote: None, .. }));
+        assert_eq!(server.asked, ["list", "fetch"]);
+        // It writes once: reading the new one back is not a reason to write another.
+        let mut server = Scripted::with(vec![playlist(RECORD, false), playlist(&written, false), playlist(&written, false)]);
+        look_with(&mut server, "tester", Some("k".into()), true);
+        assert_eq!(server.asked.iter().filter(|asked| **asked == "write").count(), 1);
+        // Nothing a look would not use is written into: a playlist that is somebody's, one
+        // with a later layout.
+        let somebody = r#"<subsonic-response status="ok"><playlist id="k" name="Nexus Music link" comment="" songCount="3" public="false" owner="tester"></playlist></subsonic-response>"#;
+        for stops in [Some(somebody.to_string()), playlist(r#"{"nexus_music_link":2}"#, false)] {
+            let mut server = Scripted::with(vec![stops]);
+            assert!(matches!(look_with(&mut server, "tester", Some("k".into()), true), Looked::Stopped(_)));
+            assert!(!server.asked.contains(&"write"), "{:?}", server.asked);
+        }
+    }
+
+    #[test]
+    fn a_reset_that_cannot_be_written_leaves_the_secret_and_one_that_cannot_be_read_back_ends_it() {
+        // The write gets no answer: nothing has changed, and nothing is concluded.
+        let mut server = Scripted::with(vec![playlist(RECORD, false)]);
+        server.write_works = false;
+        let looked = look_with(&mut server, "tester", Some("k".into()), true);
+        assert!(matches!(looked, Looked::Failed) && !ends_session(&looked));
+        assert_eq!(server.asked, ["list", "fetch", "write"]);
+        // Written, and the read-back gets no answer: the secret that was in use is the
+        // record no longer, and is not used on the strength of a request that failed.
+        let mut server = Scripted::with(vec![playlist(RECORD, false), None]);
+        let looked = look_with(&mut server, "tester", Some("k".into()), true);
+        assert!(ends_session(&looked), "the old secret would live on after a reset");
+        // Signed out as it began: nothing is written.
+        let mut server = Scripted::with(vec![playlist(RECORD, false)]);
+        server.signed_out_after = Some(2);
+        look_with(&mut server, "tester", Some("k".into()), true);
+        assert_eq!(server.asked, ["list", "fetch"]);
     }
 
     /// The person signs out while a refresh is under way: the request in flight finishes,
@@ -2372,13 +2484,13 @@ mod tests {
         // A look that would take five requests: list, fetch (public), write, list, fetch.
         let whole = || Scripted::with(vec![playlist(RECORD, true), playlist(RECORD, false)]);
         let mut server = whole();
-        look_with(&mut server, "tester", Some("k".into()));
+        look_with_no_reset(&mut server, "tester", Some("k".into()));
         assert_eq!(server.asked, ["list", "fetch", "write", "list", "fetch"]);
         // Signed out during each of them in turn: that one is the last.
         for during in 1..=5 {
             let mut server = whole();
             server.signed_out_after = Some(during);
-            let looked = look_with(&mut server, "tester", Some("k".into()));
+            let looked = look_with_no_reset(&mut server, "tester", Some("k".into()));
             assert_eq!(server.asked.len(), during.min(5), "signed out during request {during}: {:?}", server.asked);
             if during < 5 {
                 assert!(matches!(looked, Looked::Failed));
@@ -2387,12 +2499,12 @@ mod tests {
         // Signed out before it began, it asks nothing at all. And with a playlist to make.
         let mut server = whole();
         server.signed_out_after = Some(0);
-        look_with(&mut server, "tester", None);
+        look_with_no_reset(&mut server, "tester", None);
         assert!(server.asked.is_empty());
         let mut server = Scripted::with(vec![]);
         server.listed.clear();
         server.signed_out_after = Some(2);
-        look_with(&mut server, "tester", None);
+        look_with_no_reset(&mut server, "tester", None);
         assert_eq!(server.asked, ["list", "make"]);
     }
 

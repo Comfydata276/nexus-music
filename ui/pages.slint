@@ -3,7 +3,7 @@
 import { ScrollView, ListView, AboutSlint } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { Icons } from "icons.slint";
-import { App, View, Player, Lyrics, Settings, Covers, Card, CardKind, Shelf, Offer, Page, QualityOption, ThemeOption, Track, Jam, JamSong } from "types.slint";
+import { App, View, Player, Lyrics, Settings, Covers, Card, CardKind, Shelf, Offer, Page, QualityOption, ThemeOption, Track, Jam, JamSong, Linked } from "types.slint";
 import { Icon, IconButton, PlayButton, TextButton, LinkText, Cover, Field, Toggle, ChipRow, Segmented, Select, Slider, MediaCard, TrackRow, PageStatus, HoverIntent, SkeletonRows, ScrollThumb } from "widgets.slint";
 
 // Cover, title and summary at the top of an album, playlist or artist.
@@ -2725,6 +2725,18 @@ export component SettingsPage inherits Rectangle {
                                 text: Settings.device-name;
                                 label: "This device's name";
                                 accepted => { Settings.set-device-name(self.text); }
+                            }
+                        }
+
+                        // The new linking, where it is switched on for a test (see src/link.rs).
+                        if Settings.jam-host && Settings.link-devices && Linked.on: SettingRow {
+                            nested: true;
+                            title: "Reset linking";
+                            detail: "Starts all your devices afresh with a new link between them. Every device still signed in rejoins by itself within two minutes. Do this after you change your music server password, or if you lose a device." + (Linked.note != "" ? "\n" + Linked.note : "");
+                            TextButton {
+                                height: 32px;
+                                text: "Reset linking";
+                                clicked => { Linked.reset(); }
                             }
                         }
                     }

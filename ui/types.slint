@@ -592,6 +592,8 @@ export global Linked {
     // A device was picked: steer it, and move what's playing here over to it. With no
     // place: bring what the device being steered is playing back here.
     callback choose(place: string);
+    // "Reset linking": a new secret for every device.
+    callback reset();
 }
 
 export global Toast {

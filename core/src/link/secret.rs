@@ -272,6 +272,8 @@ pub enum Why {
     Gone,
     /// Other accounts could see it. The person is told.
     Public,
+    /// The person asked for a new one ("Reset linking").
+    Reset,
 }
 
 /// What a fetched playlist means.
