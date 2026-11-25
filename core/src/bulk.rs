@@ -147,6 +147,16 @@ pub trait Desk: Send + Sync {
     /// Each goes on looking albums up until none are left, so running it once, on the
     /// calling thread, looks them all up one at a time; that's what this does unless the
     /// app says otherwise.
+    ///
+    /// One at a time is not quite the same as three. The look-ups stop for the batch to be
+    /// carried on later once `GIVE_UP` (five) have failed in a row, counted across all of
+    /// them, and any that succeeds starts the count again. With three at once, one that
+    /// succeeds while the others are failing resets the count, so a Lidarr that fails most
+    /// look-ups but not all is worked through; one at a time, five failures in a row stop
+    /// the batch where three would have carried on. The Windows app runs three. An app
+    /// that runs one should know it gives up sooner on a Lidarr like that; to give the same
+    /// answers it must run `count` at once, and then each request must say which look-up it
+    /// belongs to if the app needs to tell them apart, as they arrive on threads it started.
     fn together(&self, count: usize, work: &(dyn Fn() + Sync)) {
         let _ = count;
         work()

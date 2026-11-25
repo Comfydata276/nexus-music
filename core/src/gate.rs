@@ -271,6 +271,11 @@ pub struct SignedIn {
 
 /// Collects the token once the browser has come back with `code`. `back` and `secret` are
 /// what the sign-in was started with (see `sign_in_link`).
+///
+/// This doesn't check where the code came from: the caller must, before calling it. The
+/// browser comes back with the `state` the sign-in was started with, and a code that comes
+/// with any other state (or none) is someone else's and must not be traded, as the Windows
+/// app's `gate::Attempt` refuses it. The caller must also have kept `secret` to itself.
 pub fn finish(http: &dyn Http, found: &Found, code: &str, back: &str, secret: &str) -> Result<SignedIn, String> {
     let fields = [("grant_type", "authorization_code"), ("code", code), ("redirect_uri", back), ("client_id", CLIENT), ("code_verifier", secret)];
     let tokens = ask_for_tokens(http, &found.service, &fields).map_err(|trouble| match trouble {
