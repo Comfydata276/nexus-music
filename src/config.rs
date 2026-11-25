@@ -98,16 +98,9 @@ impl Paths {
 
 pub use nexus_core::sync::ListPrefs;
 
-/// One of the person's other devices, as the new linking last saw it (see `link`): the id
-/// it gives itself, the name the person gave it, and the day it was last seen (days since
-/// 1970), after which it is in time forgotten. None of it is secret.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct LinkSeen {
-    pub id: String,
-    pub name: String,
-    pub day: u64,
-}
+/// One of the person's other devices, as the new linking last saw it: the library's own
+/// record, kept here as it is.
+pub use nexus_core::link::seen::Seen as LinkSeen;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]

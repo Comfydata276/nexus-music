@@ -110,6 +110,14 @@ pub(crate) fn make_agent_idle(idle: Duration) -> ureq::Agent {
 }
 
 /// For callers that need to see where a redirect points instead of being taken there.
+/// Splits a call's address into where the calls are and the sign-in as a form's fields:
+/// what is before the call's own name, and the query without the answer's format.
+fn account_of(url: &str) -> (String, String) {
+    let (address, form) = url.split_once('?').unwrap_or((url, ""));
+    let rest = address.rsplit_once('/').map_or(address, |(rest, _)| rest);
+    (rest.to_string(), form.replacen("&f=json", "", 1))
+}
+
 pub(crate) fn make_agent_without_redirects() -> ureq::Agent {
     agent_following(0, Duration::from_secs(300))
 }
@@ -423,47 +431,17 @@ impl Client {
             .map_err(|e| ApiError::Network(network_hint(&e)))
     }
 
-    /// One call for the look at the secret a person's devices share (see `link`), by form
-    /// POST: neither the sign-in nor what is written is in an address, where a log would
-    /// keep it. `agent` is one that follows no redirect, and an answer that is one is a
-    /// failure. Returns the whole answer.
-    pub fn link_call(&self, agent: &ureq::Agent, endpoint: &str, params: &[(&str, &str)]) -> ApiResult<serde_json::Value> {
-        let (status, text) = self.link_post(agent, endpoint, params, false)?;
-        let odd = || ApiError::NotSubsonic(format!("Check the address (HTTP status {status})."));
-        let mut root: serde_json::Value = serde_json::from_str(&text).map_err(|_| odd())?;
-        let body = root.get_mut("subsonic-response").ok_or_else(odd)?.take();
-        match body["status"].as_str() {
-            Some("ok") => Ok(body),
-            _ => Err(ApiError::Server { code: body["error"]["code"].as_i64().unwrap_or(0), message: body["error"]["message"].as_str().unwrap_or("unknown error").to_string() }),
-        }
+    /// The sign-in as a look at the linking secret uses it (`nexus_core::link::look`): where
+    /// the server's calls are, and the sign-in as the fields of a form. The look sends
+    /// every call as a form POST, so neither the sign-in nor the secret is in an address.
+    pub fn link_account(&self) -> nexus_core::link::look::Account {
+        let (rest, form) = account_of(&self.url("getPlaylists", &[]));
+        nexus_core::link::look::Account { rest, form, username: self.inner.username.clone() }
     }
 
-    /// The same call answered in XML, as the text it came as: for the one thing Navidrome
-    /// says there and leaves out of JSON (whether a playlist is public, when it isn't).
-    pub fn link_call_xml(&self, agent: &ureq::Agent, endpoint: &str, params: &[(&str, &str)]) -> ApiResult<String> {
-        self.link_post(agent, endpoint, params, true).map(|(_, text)| text)
-    }
-
-    fn link_post(&self, agent: &ureq::Agent, endpoint: &str, params: &[(&str, &str)], xml: bool) -> ApiResult<(u16, String)> {
-        self.check_online()?;
-        let url = self.url(endpoint, params);
-        let (address, form) = url.split_once('?').unwrap_or((url.as_str(), ""));
-        let form = if xml { form.replacen("&f=json", "&f=xml", 1) } else { form.to_string() };
-        let response = agent
-            .post(address)
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .config()
-            .timeout_global(Some(API_TIMEOUT))
-            .build()
-            .send(form)
-            .map_err(|e| ApiError::Network(network_hint(&e)))?;
-        let status = response.status().as_u16();
-        // (Anything but a plain answer, a redirect among them, is a failure.)
-        if status != 200 {
-            return Err(ApiError::NotSubsonic(format!("Check the address (HTTP status {status}).")));
-        }
-        let text = response.into_body().with_config().limit(1024 * 1024).read_to_string().map_err(|e| ApiError::Network(e.to_string()))?;
-        Ok((status, text))
+    /// Whether the person has put the app in offline mode: nothing is asked of the server.
+    pub fn is_offline(&self) -> bool {
+        self.check_online().is_err()
     }
 
     /// Opens connections ahead of need, so the first clicks don't pay for setting them up.

@@ -85,6 +85,40 @@ pub enum Record {
     Is(Secret),
 }
 
+/// Why a playlist of the person's own may not have this name, if it may not. Each feature
+/// keeps a name to itself with its own words, and linking only where it is on (`linking`):
+/// with it off, nothing of it exists, and a playlist of its name is the person's own.
+pub fn kept_name(name: &str, linking: bool) -> Option<&'static str> {
+    if crate::step::reserved(name) {
+        Some(crate::step::RESERVED)
+    } else if linking && reserved(name) {
+        Some(RESERVED)
+    } else {
+        None
+    }
+}
+
+/// Whether a playlist of this name is left out of every ordinary listing of playlists:
+/// the one devices are kept in step through, always; and, where linking is on, the one
+/// that holds the secret. What is not listed is not opened, and a page that is not opened
+/// is not written to an app's cache of pages.
+pub fn unlisted(name: &str, linking: bool) -> bool {
+    name == crate::sync::PLAYLIST_NAME || (linking && name == PLAYLIST_NAME)
+}
+
+/// Whether a playlist's page may be written to an app's cache of pages on disk: never one
+/// of a name the app keeps for itself, whose comment is not a description. Linking's is
+/// never written whether or not linking is on in this copy: it may be on in another, and
+/// what that one keeps there is a secret.
+///
+/// **And by what it holds, not only by its name.** A playlist renamed somewhere else (on
+/// the music server's own page, in another app) is an ordinary playlist to every listing,
+/// and its comment is still the record: so a page whose playlist's comment is a linking
+/// record is not written either, and one found on disk is thrown away unread.
+pub fn page_may_be_kept(playlist: &str, comment: &str) -> bool {
+    playlist != crate::sync::PLAYLIST_NAME && playlist != PLAYLIST_NAME && !is_record(comment)
+}
+
 /// Whether a comment is a linking record at all, of any layout, readable or not: whether
 /// it is marked as one. What is marked so is never written to a device's disk, whatever
 /// the playlist it is on has come to be called.
@@ -328,6 +362,26 @@ pub fn judge(asked: &str, replace: bool, fetched: &Fetched, username: &str) -> V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_names_the_app_keeps_for_itself() {
+        // Not listed: the sync record's always; linking's where linking is on. With it
+        // off, a playlist of that name is the person's own and is listed like any other.
+        assert!(unlisted("Nexus Music sync", false) && unlisted("Nexus Music sync", true));
+        assert!(unlisted("Nexus Music link", true) && !unlisted("Nexus Music link", false));
+        assert!(!unlisted("Morning mix", true));
+        // Not to be given to a playlist of the person's own, each with its own words.
+        assert_eq!(kept_name("Nexus Music link", false), None);
+        assert_eq!(kept_name("Nexus Music link", true), Some(RESERVED));
+        assert_eq!(kept_name("Nexus Music sync", false), Some(crate::step::RESERVED));
+        assert_eq!(kept_name("Nexus Music sync", true), Some(crate::step::RESERVED));
+        assert_eq!(kept_name("Morning mix", true), None);
+        // Never on disk, by name or by what it holds, whether linking is on here or not.
+        assert!(page_may_be_kept("Morning mix", "For the walk to work"));
+        for (name, comment) in [("Nexus Music link", ""), ("Nexus Music sync", ""), ("Renamed elsewhere", COMMENT), ("A later layout", r#"{"nexus_music_link":2,"key":"…"}"#)] {
+            assert!(!page_may_be_kept(name, comment), "{name}");
+        }
+    }
 
     #[test]
     fn a_comment_marked_as_a_record_is_one_whatever_else_is_in_it() {
