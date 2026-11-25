@@ -550,6 +550,95 @@ fn a_fault_in_one_request_ends_neither_the_route_nor_a_jam() {
     assert_eq!(call(jams, "GET", &format!("/api/jam/{jam}"), "", Value::Null).0, 200);
 }
 
+/// A request that is not written as one is refused as it is read.
+#[test]
+fn a_request_that_is_not_written_as_one_is_refused() {
+    let (to, relay) = relay(|_| {});
+    let pc = enter(to, ROOM, PC);
+    let said = |request: String| {
+        let mut stream = TcpStream::connect(to).unwrap();
+        let _ = stream.write_all(request.as_bytes());
+        let mut answer = Vec::new();
+        let _ = stream.read_to_end(&mut answer);
+        String::from_utf8_lossy(&answer).chars().take(12).collect::<String>()
+    };
+    let rest = format!("Host: relay\r\nAuthorization: Bearer {KEY}\r\nX-Nexus-Link: {pc}\r\n");
+    // The first line is a method, a path and a version, one space between each.
+    for line in [format!("GET /api/link/{ROOM}/poll"), format!("GET  /api/link/{ROOM}/poll HTTP/1.1"), format!("GET /api/link/{ROOM}/poll  HTTP/1.1"), format!("GET /api/link/{ROOM}/poll HTTP/1.1 extra"), format!("GET /api/link/{ROOM}/poll HTTP/2.0"), format!("GET /api/link/{ROOM}/poll HTTP/1.11"), format!("GET /api/link/{ROOM}/poll http/1.1"), format!("GET api/link/{ROOM}/poll HTTP/1.1"), format!(" GET /api/link/{ROOM}/poll HTTP/1.1"), format!("get /api/link/{ROOM}/poll HTTP/1.1"), format!("G\tT /api/link/{ROOM}/poll HTTP/1.1"), String::new()] {
+        assert_eq!(said(format!("{line}\r\n{rest}\r\n")), "HTTP/1.1 400", "{line:?}");
+    }
+    assert_eq!(said(format!("GET /api/link/{ROOM}/poll HTTP/1.0\r\n{rest}\r\n")), "HTTP/1.1 200");
+    // A body's length is said once. Twice, the same or not, is two requests' worth of
+    // doubt about where this one ends.
+    let body = format!(r#"{{"to":"{PC}","frame":"eA"}}"#);
+    for lengths in [format!("Content-Length: {0}\r\nContent-Length: {0}\r\n", body.len()), format!("Content-Length: {}\r\nContent-Length: 5\r\n", body.len()), format!("Content-Length: 5\r\ncontent-length: {}\r\n", body.len()), "Content-Length: 5, 5\r\n".to_string(), "Content-Length: +5\r\n".to_string(), "Content-Length: 0x5\r\n".to_string(), "Content-Length: -1\r\n".to_string()] {
+        assert_eq!(said(format!("POST /api/link/{ROOM}/send HTTP/1.1\r\n{rest}{lengths}\r\n{body}")), "HTTP/1.1 400", "{lengths:?}");
+    }
+    assert_eq!(relay.link.totals().frames, 0);
+}
+
+/// Leaving is checked like everything else: whose place it is first, and then what was sent.
+#[test]
+fn leaving_checks_its_token_before_it_reads_anything_and_does_nothing_for_a_body_it_cannot_read() {
+    let (to, relay) = relay(|config| config.link.body_wait = Duration::from_secs(30));
+    let pc = enter(to, ROOM, PC);
+    let key = format!("Bearer {KEY}");
+    // Without a place's token nothing it promises is waited for.
+    let began = Instant::now();
+    let mut stream = TcpStream::connect(to).unwrap();
+    stream.write_all(format!("POST /api/link/{ROOM}/leave HTTP/1.1\r\nHost: relay\r\nContent-Length: 4000\r\nAuthorization: {key}\r\nX-Nexus-Link: not-a-token\r\n\r\n").as_bytes()).unwrap();
+    let mut answer = Vec::new();
+    stream.read_to_end(&mut answer).unwrap();
+    assert!(answer.starts_with(b"HTTP/1.1 404 ") && began.elapsed() < Duration::from_secs(2), "{}", String::from_utf8_lossy(&answer));
+    // With it, a body that cannot be read is refused, and the place is still there.
+    let headers = [("Authorization", key.as_str()), ("X-Nexus-Link", pc.as_str())];
+    assert_eq!(raw(to, "POST", &format!("/api/link/{ROOM}/leave"), &headers, b"not json", Some(8)).0, 400);
+    assert_eq!(relay.link.totals().places, 1);
+    assert_eq!(poll(to, ROOM, &pc, 0, 0).0, 200);
+    // And with nothing, or an object, it leaves.
+    assert_eq!(raw(to, "POST", &format!("/api/link/{ROOM}/leave"), &headers, b"{}", Some(2)).0, 200);
+    assert_eq!(relay.link.totals().places, 0);
+}
+
+/// Every reply is counted against what may be being written before it is made: the short
+/// ones too, and the few words a connection is turned away with when the queue is full.
+
+#[test]
+fn the_short_replies_are_charged_like_every_other() {
+    let link = Link::default();
+    let limits = Limits::default();
+    for reply in [Short::Error(404, "Enter the room first."), Short::Done, Short::Entered { token: "t".repeat(43).as_str(), version: 12, places: &[PC.to_string(), PHONE.to_string()] }, Short::Entered { token: "", version: 0, places: &[] }] {
+        let before = link.writing.load(Ordering::SeqCst);
+        let bytes = link.admit(&reply, &limits).unwrap();
+        assert_eq!(link.writing.load(Ordering::SeqCst) - before, bytes.len());
+        let split = bytes.windows(4).position(|window| window == b"\r\n\r\n").unwrap();
+        let body: Value = serde_json::from_slice(&bytes[split + 4..]).unwrap();
+        assert!(String::from_utf8_lossy(&bytes[..split]).contains(&format!("Content-Length: {}", bytes.len() - split - 4)));
+        assert!(body.is_object());
+    }
+    assert_eq!(serde_json::from_slice::<Value>(&link.admit(&Short::Entered { token: "tok", version: 12, places: &[PC.to_string(), PHONE.to_string()] }, &limits).unwrap().split(|byte| *byte == b'\n').last().unwrap()).unwrap(), json!({"token": "tok", "v": 12, "places": [PC, PHONE]}));
+    // With no room left, nothing is made at all.
+    assert!(link.admit(&Short::Done, &Limits { writing: 10, ..Limits::default() }).is_none());
+    // And so with the route's allowance used up, a connection the queue has no room for is
+    // closed with nothing said, not told so on credit.
+    let (to, relay) = relay(|config| {
+        config.link.threads = 1;
+        config.link.queue = 1;
+        config.link.head_wait = Duration::from_millis(600);
+        config.link.writing = 20;
+    });
+    let _held: Vec<TcpStream> = (0..2).map(|_| {
+        let stream = TcpStream::connect(to).unwrap();
+        std::thread::sleep(Duration::from_millis(80));
+        stream
+    }).collect();
+    let mut over = TcpStream::connect(to).unwrap();
+    let mut answer = Vec::new();
+    let _ = over.read_to_end(&mut answer);
+    assert!(answer.is_empty(), "{}", String::from_utf8_lossy(&answer));
+    assert_eq!(relay.link.totals().writing, 0);
+}
+
 /// A request is refused before any of its body is read if the body is not one the route
 /// will take, and the connection is closed, not read to its end.
 #[test]
@@ -718,7 +807,10 @@ fn the_route_saturated_costs_a_jam_nothing() {
         let _ = stream.write_all(stalled.as_bytes());
         Some(stream)
     }).collect();
-    std::thread::sleep(Duration::from_millis(300));
+    until(|| {
+        let totals = relay.link.totals();
+        (totals.waiting, totals.open) == (64, 70)
+    });
     let totals = relay.link.totals();
     assert_eq!((totals.waiting, totals.open), (64, 70), "six being read, sixty-four waiting, the rest told the relay is busy");
     // A jam, meanwhile: started, joined, shown, asked of, answered, and watched.

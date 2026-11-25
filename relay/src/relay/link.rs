@@ -37,7 +37,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use super::{Relay, same};
 
@@ -67,6 +67,8 @@ pub const VERSION: u64 = 4;
 
 /// The most a request's head may be: its first line and its headers.
 const HEAD: usize = 8 * 1024;
+/// The most that is read from a connection after it has been answered, while it is let go of.
+const LET_GO: usize = 64 * 1024;
 /// The most the body of a call that is not `send` may be.
 const SMALL_BODY: usize = 8 * 1024;
 
@@ -194,8 +196,13 @@ fn read_head(conn: &mut Conn, wait: Duration) -> Result<Asked, Option<(u16, &'st
     let rest = bytes.split_off(end + 4);
     let head = std::str::from_utf8(&bytes[..end]).map_err(|_| None)?;
     let mut lines = head.split("\r\n");
-    let mut first = lines.next().unwrap_or("").split(' ');
-    let (method, target) = (first.next().unwrap_or(""), first.next().unwrap_or(""));
+    // The first line is a method, a path and a version with one space between each, and
+    // nothing else. Anything written another way is not guessed at.
+    let first: Vec<&str> = lines.next().unwrap_or("").split(' ').collect();
+    let (method, target) = match first.as_slice() {
+        [method, target, "HTTP/1.1" | "HTTP/1.0"] if !method.is_empty() && method.bytes().all(|byte| byte.is_ascii_uppercase()) && target.starts_with('/') && target.bytes().all(|byte| byte.is_ascii_graphic()) => (*method, *target),
+        _ => return Err(Some((400, "That wasn't understood."))),
+    };
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
     let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
     let (room, verb) = match parts.as_slice() {
@@ -214,7 +221,15 @@ fn read_head(conn: &mut Conn, wait: Duration) -> Result<Asked, Option<(u16, &'st
         match name.trim().to_ascii_lowercase().as_str() {
             "authorization" => asked.key = value.strip_prefix("Bearer ").unwrap_or("").trim().to_string(),
             "x-nexus-link" => asked.token = value.to_string(),
-            "content-length" => asked.length = Some(value.parse().map_err(|_| Some((400, "That wasn't understood.")))?),
+            // Said once, in digits. Said twice, the same or not, there are two opinions
+            // of where this request ends, and neither is taken.
+            "content-length" => {
+                let digits = !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit());
+                match (asked.length, value.parse()) {
+                    (None, Ok(length)) if digits => asked.length = Some(length),
+                    _ => return Err(Some((400, "That wasn't understood."))),
+                }
+            }
             "x-forwarded-for" => asked.forwarded = value.rsplit(',').next().and_then(|text| text.trim().parse().ok()),
             // A body that comes in pieces doesn't say how long it is: it is not read.
             "transfer-encoding" => return Err(Some((411, "Say how much is being sent."))),
@@ -257,10 +272,11 @@ fn read_body(conn: &mut Conn, asked: &mut Asked, wait: Duration) -> Result<serde
 fn let_go(stream: &mut TcpStream) {
     let _ = stream.shutdown(std::net::Shutdown::Write);
     let deadline = Instant::now() + Duration::from_millis(250);
-    let (mut piece, mut seen) = ([0u8; 8192], 0);
-    while seen < 64 * 1024 {
-        match read_some(stream, &mut piece, deadline) {
-            Some(read) => seen += read,
+    let (mut piece, mut left) = ([0u8; 8192], LET_GO);
+    while left > 0 {
+        let room = left.min(piece.len());
+        match piece.get_mut(..room).and_then(|piece| read_some(stream, piece, deadline)) {
+            Some(read) => left = left.saturating_sub(read),
             None => break,
         }
     }
@@ -359,6 +375,52 @@ fn poll_body(out: &mut impl Sink, version: u64, places: &[&str], frames: &[&Fram
     }
     out.put(if more { "],\"more\":true" } else { "],\"more\":false" });
     out.put(if replaced { ",\"replaced\":true}" } else { "}" });
+}
+
+/// A reply that is not the answer to a poll.
+enum Short<'a> {
+    /// A refusal, and why, in words of the relay's own.
+    Error(u16, &'a str),
+    /// A `send` or a `leave` that was done.
+    Done,
+    /// A place that was taken: its token, and who is in the room.
+    Entered { token: &'a str, version: u64, places: &'a [String] },
+}
+
+impl Short<'_> {
+    fn status(&self) -> u16 {
+        match self {
+            Short::Error(status, _) => *status,
+            _ => 200,
+        }
+    }
+
+    /// Written the same way to be measured and to be sent. (A refusal's words are the
+    /// relay's own and have nothing in them to escape; a token and a place are spelled in
+    /// letters that need none.)
+    fn body(&self, out: &mut impl Sink) {
+        match self {
+            Short::Error(_, message) => {
+                out.put("{\"error\":\"");
+                out.put(message);
+                out.put("\"}");
+            }
+            Short::Done => out.put("{\"ok\":true}"),
+            Short::Entered { token, version, places } => {
+                out.put("{\"token\":\"");
+                out.put(token);
+                out.put("\",\"v\":");
+                out.put(&version.to_string());
+                out.put(",\"places\":[");
+                for (at, place) in places.iter().enumerate() {
+                    out.put(if at == 0 { "\"" } else { ",\"" });
+                    out.put(place);
+                    out.put("\"");
+                }
+                out.put("]}");
+            }
+        }
+    }
 }
 
 // ---- rooms -------------------------------------------------------------------------------
@@ -537,20 +599,33 @@ impl Link {
         Some(Charged { bytes, writing: self.writing.clone() })
     }
 
+    /// A short reply, if it may be written now: measured, admitted against the budget, and
+    /// only then made, like the answer to a poll.
+    fn admit(&self, reply: &Short, limits: &Limits) -> Option<Charged> {
+        let mut measure = Measure(0);
+        reply.body(&mut measure);
+        let head = reply_head(reply.status(), measure.0);
+        let whole = head.len() + measure.0;
+        if !self.take(whole, limits.writing) {
+            return None;
+        }
+        let mut bytes = Vec::with_capacity(whole);
+        bytes.extend_from_slice(head.as_bytes());
+        reply.body(&mut bytes);
+        debug_assert_eq!(bytes.len(), whole);
+        Some(Charged { bytes, writing: self.writing.clone() })
+    }
+
     /// A short reply: a refusal, or the answer to anything but a poll. With no room in the
     /// budget even for that, the connection is closed with nothing said.
-    fn tell(&self, conn: Conn, status: u16, body: &Value, limits: &Limits, out: &mut Vec<Answer>) {
-        let body = body.to_string();
-        let head = reply_head(status, body.len());
-        if self.take(head.len() + body.len(), limits.writing) {
-            let mut bytes = head.into_bytes();
-            bytes.extend_from_slice(body.as_bytes());
-            out.push(Answer { conn, bytes: Charged { bytes, writing: self.writing.clone() } });
+    fn tell(&self, conn: Conn, reply: &Short, limits: &Limits, out: &mut Vec<Answer>) {
+        if let Some(bytes) = self.admit(reply, limits) {
+            out.push(Answer { conn, bytes });
         }
     }
 
     fn say(&self, conn: Conn, status: u16, message: &str, limits: &Limits, out: &mut Vec<Answer>) {
-        self.tell(conn, status, &json!({"error": message}), limits, out);
+        self.tell(conn, &Short::Error(status, message), limits, out);
     }
 
     /// Writes a reply and closes the connection. A write that makes no progress is given
@@ -677,9 +752,12 @@ fn take(link: &Link, limits: &Limits, stream: TcpStream) {
     // With every thread busy and the queue full it is told so, in a few bytes that a new
     // connection always has room for, and closed. Nothing of it is read.
     if link.waiting.try_update(Ordering::SeqCst, Ordering::SeqCst, |waiting| (waiting < limits.queue).then_some(waiting + 1)).is_err() {
-        let body = json!({"error": "This relay is busy. Try again in a moment."}).to_string();
-        if conn.stream.set_nonblocking(true).is_ok() {
-            let _ = conn.stream.write_all(format!("{}{body}", reply_head(503, body.len())).as_bytes());
+        // (Charged like every other reply. With no room for even that, it is closed with
+        // nothing said.)
+        if let Some(bytes) = link.admit(&Short::Error(503, "This relay is busy. Try again in a moment."), limits)
+            && conn.stream.set_nonblocking(true).is_ok()
+        {
+            let _ = conn.stream.write_all(&bytes);
         }
         return;
     }
@@ -899,7 +977,7 @@ fn enter(relay: &Relay, mut conn: Conn, mut asked: Asked, out: &mut Vec<Answer>)
     let room = rooms.entry(name.to_string()).or_default();
     room.places.push(Place { place: place.to_string(), token: token.clone(), address, seen: Instant::now(), poll: None, frames: VecDeque::new(), bytes: 0, next: 1, handed: 0 });
     room.changed(link, limits, out);
-    link.tell(conn, 200, &json!({"token": token, "v": room.version, "places": room.roster()}), limits, out);
+    link.tell(conn, &Short::Entered { token: &token, version: room.version, places: &room.roster() }, limits, out);
 }
 
 /// A device waits for a frame, or for a place to come or go.
@@ -976,14 +1054,19 @@ fn send(relay: &Relay, mut conn: Conn, mut asked: Asked, out: &mut Vec<Answer>) 
         place.seen = Instant::now();
         out.push(Answer { conn: parked.conn, bytes });
     }
-    link.tell(conn, 200, &json!({"ok": true}), limits, out);
+    link.tell(conn, &Short::Done, limits, out);
 }
 
 /// A device gives up its place: what was waiting for it is dropped.
 fn leave(relay: &Relay, mut conn: Conn, mut asked: Asked, out: &mut Vec<Answer>) {
     let (link, limits) = (&relay.link, &relay.config.link);
+    // Whose place it is, before anything it sends is read.
+    let known = locked(&link.rooms).get(&asked.room).is_some_and(|room| holder(room, &asked.token).is_some());
+    if !known {
+        return link.say(conn, 404, "Enter the room first.", limits, out);
+    }
     // (It takes nothing; but what it sends is read as every body is, and one that is not an
-    // object is refused like any other.)
+    // object is refused like any other, with nothing done.)
     match read_body(&mut conn, &mut asked, limits.body_wait) {
         Ok(_) => {}
         Err(Some((status, message))) => return link.say(conn, status, message, limits, out),
@@ -1001,7 +1084,7 @@ fn leave(relay: &Relay, mut conn: Conn, mut asked: Asked, out: &mut Vec<Answer>)
             if emptied {
                 rooms.remove(&asked.room);
             }
-            link.tell(conn, 200, &json!({"ok": true}), limits, out);
+            link.tell(conn, &Short::Done, limits, out);
         }
         None => link.say(conn, 404, "Enter the room first.", limits, out),
     }
