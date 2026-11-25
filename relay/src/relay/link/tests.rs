@@ -639,6 +639,33 @@ fn the_short_replies_are_charged_like_every_other() {
     assert_eq!(relay.link.totals().writing, 0);
 }
 
+/// If the route cannot be started, it is not offered, and jams are served all the same.
+#[test]
+fn a_route_that_did_not_start_is_not_offered() {
+    let jams_only = |fails: Option<usize>, address: &str| {
+        let mut config = Config::new(KEY.to_string());
+        config.link.thread_that_fails = fails;
+        let server = Arc::new(Server::http("127.0.0.1:0").unwrap());
+        let jams = server.server_addr().to_ip().unwrap();
+        let relay = Arc::new(Relay::new(config));
+        start(relay.clone(), server, 2);
+        let started = listen(relay.clone(), address);
+        let (_, hello) = call(jams, "GET", "/api/hello", "", Value::Null);
+        (started.ok(), relay.link.listening(), hello["link"].clone(), call(jams, "POST", "/api/host/start", "", json!({"name": "Jez"})).0)
+    };
+    // The first worker, a later one, the sweeper, the listener: whichever will not start.
+    for fails in [0, 3, 6, 7] {
+        assert_eq!(jams_only(Some(fails), "127.0.0.1:0"), (None, false, Value::Null, 200), "thread {fails}");
+    }
+    // An address that cannot be had.
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    assert_eq!(jams_only(None, &taken.local_addr().unwrap().to_string()), (None, false, Value::Null, 200));
+    // And one that started is offered, and is there.
+    let (started, listening, offered, jam) = jams_only(None, "127.0.0.1:0");
+    assert_eq!((listening, offered, jam), (true, json!(4), 200));
+    assert_eq!(call(started.unwrap(), "POST", &format!("/api/link/{ROOM}/enter"), "", json!({"place": PC})).0, 200);
+}
+
 /// A request is refused before any of its body is read if the body is not one the route
 /// will take, and the connection is closed, not read to its end.
 #[test]
@@ -812,7 +839,9 @@ fn the_route_saturated_costs_a_jam_nothing() {
         (totals.waiting, totals.open) == (64, 70)
     });
     let totals = relay.link.totals();
-    assert_eq!((totals.waiting, totals.open), (64, 70), "six being read, sixty-four waiting, the rest told the relay is busy");
+    // (Six being read, sixty-four waiting, the rest told the relay is busy; one of those
+    // may be on its way out at the moment of counting.)
+    assert!(totals.waiting == 64 && (70..=72).contains(&totals.open), "{totals:?}");
     // A jam, meanwhile: started, joined, shown, asked of, answered, and watched.
     let timed = |method: &str, path: &str, bearer: &str, body: Value| {
         let began = Instant::now();

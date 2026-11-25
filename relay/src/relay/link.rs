@@ -105,6 +105,9 @@ pub struct Limits {
     pub sends: (f64, f64),
     /// ...and from one address, a second.
     pub sends_per_address: f64,
+    /// For a test: which of the route's threads, counting from none, will not start.
+    #[cfg(test)]
+    pub thread_that_fails: Option<usize>,
 }
 
 impl Default for Limits {
@@ -128,6 +131,8 @@ impl Default for Limits {
             enters: 30.0,
             sends: (20.0, 5.0),
             sends_per_address: 40.0,
+            #[cfg(test)]
+            thread_that_fails: None,
         }
     }
 }
@@ -669,21 +674,34 @@ impl Link {
 }
 
 /// Listens for the route at `address`, on a listener and threads of its own, and comes
-/// back with where that is. From then on `/api/hello` offers the route.
+/// back with where that is. `/api/hello` offers the route from then on, **and not
+/// otherwise**: if the address cannot be had, or any of the threads will not start, this
+/// fails, the listener is let go of, and the route is not offered. Whatever threads did
+/// start wait for work that never comes.
 pub fn listen(relay: Arc<Relay>, address: &str) -> std::io::Result<SocketAddr> {
     let listener = TcpListener::bind(address)?;
     let at = listener.local_addr()?;
-    *locked(&relay.link.at) = Some(at);
+    // Each of the route's threads has to start, or the route is not there: `/api/hello`
+    // offers it only once the last of them has (see the end of this function).
+    let started = std::cell::Cell::new(0usize);
+    let start = |name: String, work: Box<dyn FnOnce() + Send>| -> std::io::Result<()> {
+        #[cfg(test)]
+        if relay.config.link.thread_that_fails == Some(started.get()) {
+            return Err(std::io::Error::other("a thread that would not start, for a test"));
+        }
+        started.set(started.get() + 1);
+        std::thread::Builder::new().name(name).spawn(work).map(drop)
+    };
     for index in 0..relay.config.link.threads.max(1) {
         let relay = relay.clone();
-        let _ = std::thread::Builder::new().name(format!("link-{index}")).spawn(move || {
+        start(format!("link-{index}"), Box::new(move || {
             loop {
                 let job = {
                     let mut jobs = locked(&relay.link.jobs);
                     loop {
                         match jobs.pop_front() {
                             Some(job) => break job,
-                            None => jobs = relay.link.wake.wait(jobs).unwrap(),
+                            None => jobs = relay.link.wake.wait(jobs).unwrap_or_else(PoisonError::into_inner),
                         }
                     }
                 };
@@ -711,11 +729,11 @@ pub fn listen(relay: Arc<Relay>, address: &str) -> std::io::Result<SocketAddr> {
                     let _ = stream.write_all(format!("{}{body}", reply_head(500, body.len())).as_bytes());
                 }
             }
-        });
+        }))?;
     }
     {
         let relay = relay.clone();
-        let _ = std::thread::Builder::new().name("link-sweeper".into()).spawn(move || {
+        start("link-sweeper".into(), Box::new(move || {
             loop {
                 std::thread::sleep(Duration::from_millis(250));
                 // It writes nothing itself: what it finds to answer goes to the route's threads.
@@ -726,18 +744,23 @@ pub fn listen(relay: Arc<Relay>, address: &str) -> std::io::Result<SocketAddr> {
                     }
                 }));
             }
-        });
+        }))?;
     }
-    let _ = std::thread::Builder::new().name("link-listener".into()).spawn(move || {
-        let (link, limits) = (&relay.link, &relay.config.link);
-        for stream in listener.incoming() {
-            let Ok(stream) = stream else {
-                std::thread::sleep(Duration::from_millis(50));
-                continue;
-            };
-            let _ = catch_unwind(AssertUnwindSafe(|| take(link, limits, stream)));
-        }
-    });
+    {
+        let relay = relay.clone();
+        start("link-listener".into(), Box::new(move || {
+            let (link, limits) = (&relay.link, &relay.config.link);
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else {
+                    std::thread::sleep(Duration::from_millis(50));
+                    continue;
+                };
+                let _ = catch_unwind(AssertUnwindSafe(|| take(link, limits, stream)));
+            }
+        }))?;
+    }
+    // All of it is there. Only now is the route offered.
+    *locked(&relay.link.at) = Some(at);
     Ok(at)
 }
 

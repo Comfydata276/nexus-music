@@ -76,10 +76,9 @@ fn main() {
     if let Some(address) = setting("JAM_LINK_LISTEN") {
         match relay::link::listen(relay.clone(), &address) {
             Ok(at) => println!("Devices link through {at}: have the proxy in front send /api/link/ there."),
-            Err(why) => {
-                eprintln!("Couldn't listen on {address} for devices to link through: {why}");
-                std::process::exit(1);
-            }
+            // Jams are what this relay is for: they are served all the same. The route is
+            // simply not there, and `/api/hello` does not say it is.
+            Err(why) => eprintln!("Devices can't link through this relay: the route for them couldn't be started at {address} ({why}). Jams are served as usual."),
         }
     }
     relay::serve(relay, server, 8);
