@@ -1,11 +1,13 @@
 # Compiles the app and the library it is built on (core/), and runs the tests of both, on
-# every push and pull request.
+# every push to main or to a working branch (t3/...) and on every pull request: on Linux,
+# where the app is developed, and on Windows, where it is used (the tests that write and
+# replace files need to be seen passing on the file system people's settings live on).
 # The Windows release itself is built and published by scripts/release.
 name: Check
 
 on:
   push:
-    branches: [main]
+    branches: [main, "t3/**"]
   pull_request:
 
 permissions:
@@ -61,3 +63,31 @@ jobs:
 
       - name: Test the jam relay
         run: cargo test --locked --manifest-path relay/Cargo.toml
+
+  windows:
+    name: Test on Windows
+    runs-on: windows-2025
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
+
+      - name: Keep build output between runs
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: check-${{ runner.os }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            check-${{ runner.os }}-${{ env.RUST_VERSION }}-
+
+      - name: Test
+        shell: bash
+        run: cargo test --locked --workspace
