@@ -487,6 +487,11 @@ impl Settings {
     /// one: the copy kept from the last good start is used, and failing that the damaged
     /// file is put aside under another name. The second value says so when either happened.
     pub fn load_checked(path: &Path) -> (Settings, Option<String>) {
+        Settings::load_checked_by(path, place_new)
+    }
+
+    /// `load_checked`, moving a damaged file aside by `aside_by` (a test's, to have it fail).
+    fn load_checked_by(path: &Path, aside_by: fn(&Path, &Path) -> std::io::Result<()>) -> (Settings, Option<String>) {
         let backup = backup_of(path);
         let fresh = || {
             let mut settings = Settings::default();
@@ -506,12 +511,14 @@ impl Settings {
             let _ = fs::copy(&backup, path);
             return (settings, Some("Your settings file was damaged, so the copy from the last time the app started was used.".into()));
         }
-        let aside = path.with_extension("damaged.json");
-        let _ = fs::rename(path, &aside);
-        let note = format!(
-            "Your settings file couldn't be read and there was no copy to fall back on. It has been kept as {}, and the app has started with its default settings.",
-            aside.file_name().map(|name| name.to_string_lossy().to_string()).unwrap_or_default()
-        );
+        // Kept under a name of its own (`set_aside`), and said to be only if it was.
+        let note = match set_aside_by(path, aside_by) {
+            Some(aside) => format!(
+                "Your settings file couldn't be read and there was no copy to fall back on. It has been kept as {}, and the app has started with its default settings.",
+                aside.file_name().map(|name| name.to_string_lossy().to_string()).unwrap_or_default()
+            ),
+            None => "Your settings file couldn't be read, there was no copy to fall back on, and it couldn't be moved aside. The app has started with its default settings, which will take its place when they are next saved.".to_string(),
+        };
         (fresh(), Some(note))
     }
 
@@ -775,13 +782,23 @@ pub fn temp_for(path: &Path) -> PathBuf {
 /// over another. Says where it went, or `None` if it couldn't be moved: then it is where it
 /// was.
 pub fn set_aside(path: &Path) -> Option<PathBuf> {
+    set_aside_by(path, place_new)
+}
+
+fn set_aside_by(path: &Path, place: fn(&Path, &Path) -> std::io::Result<()>) -> Option<PathBuf> {
     let stem = path.file_stem()?.to_string_lossy().into_owned();
     let extension = path.extension().map(|extension| format!(".{}", extension.to_string_lossy())).unwrap_or_default();
     let when = chrono::Local::now().format("%Y%m%d-%H%M%S");
     for count in 1..100 {
         let more = if count == 1 { String::new() } else { format!("-{count}") };
         let aside = path.with_file_name(format!("{stem}.damaged-{when}{more}{extension}"));
-        match place_new(path, &aside) {
+        match place(path, &aside) {
+            // On Linux the move is a second name and then the first removed: if the first is
+            // still there, it wasn't moved, and the second name goes again.
+            Ok(()) if fs::symlink_metadata(path).is_ok() => {
+                let _ = fs::remove_file(&aside);
+                return None;
+            }
             Ok(()) => return Some(aside),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(_) => return None,
@@ -1098,13 +1115,19 @@ mod tests {
         fs::write(&path, b"").unwrap();
         let (settings, note) = Settings::load_checked(&path);
         assert!(settings.server == "https://music.example.org" && note.unwrap().contains("damaged"));
-        // No copy either: the damaged file is kept under another name, not overwritten.
+        // No copy either: the damaged file is kept under a name of its own, which is said.
         fs::write(&path, b"not settings at all").unwrap();
         fs::remove_file(dir.join("settings.backup.json")).unwrap();
         let (settings, note) = Settings::load_checked(&path);
-        assert!(settings.server.is_empty() && note.unwrap().contains("settings.damaged.json"));
-        assert_eq!(fs::read(dir.join("settings.damaged.json")).unwrap(), b"not settings at all");
+        let aside = fs::read_dir(&dir).unwrap().map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned()).find(|name| name.starts_with("settings.damaged-")).expect("not kept");
+        assert!(settings.server.is_empty() && note.unwrap().contains(&aside));
+        assert_eq!(fs::read(dir.join(&aside)).unwrap(), b"not settings at all");
         assert!(!path.exists());
+        // It couldn't be moved: it isn't said to have been kept. (A folder where its name
+        // would go, for every name: the move fails.)
+        fs::write(&path, b"not settings at all").unwrap();
+        let note = Settings::load_checked_by(&path, |_, _| Err(std::io::Error::other("the disk said no"))).1.unwrap();
+        assert!(!note.contains("kept as") && note.contains("couldn't be moved"), "{note}");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1357,6 +1380,22 @@ mod tests {
     }
 
     #[test]
+    fn a_move_aside_that_couldnt_remove_the_original_is_no_move() {
+        let dir = std::env::temp_dir().join(format!("nexus-aside-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("asked.json");
+        fs::write(&path, "half a list").unwrap();
+        // (On Linux the move is a second name, then the first removed: here the second is
+        // made and the first can't be removed.)
+        let linked_only: fn(&Path, &Path) -> std::io::Result<()> = |from, to| fs::copy(from, to).map(drop);
+        assert_eq!(set_aside_by(&path, linked_only), None);
+        let names: Vec<String> = fs::read_dir(&dir).unwrap().map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, ["asked.json"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_drive_that_cant_make_hard_links_is_said_once() {
         // Linux keeps what is made once with a second name for it (`link`): on a drive that
         // can't make one, that is said, once ever, plainly; not each time it is tried.
@@ -1457,7 +1496,7 @@ mod tests {
             name(&crate::plays::log_file(&paths.plays)),
             name(&crate::plays::side_file(&crate::plays::log_file(&paths.plays))),
             name(&backup_of(&paths.settings)),
-            name(&paths.settings.with_extension("damaged.json")),
+            "settings.damaged-<date and time>.json".into(),
             // Moved aside under a name of its own (`set_aside`), and a write's own file
             // beside its place (`temp_for`).
             "asked.damaged-<date and time>.json".into(),
