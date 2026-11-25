@@ -658,6 +658,16 @@ impl Controller {
         if self.remote(Remote::Toggle) {
             return;
         }
+        self.toggle_play_here();
+    }
+
+    /// Play or pause on this PC's own player, whatever else this PC is steering. Each of the
+    /// `_here` functions is the whole of what its press does on this PC: the press itself
+    /// first asks whether it is meant for somewhere else (a jam this PC has joined, a device
+    /// it is steering), and a command from another of the person's devices (see `link`)
+    /// comes straight here, so that it is carried out exactly as the press would be and
+    /// never goes on to anywhere else.
+    pub fn toggle_play_here(self: &Rc<Self>) {
         // (With nothing in the player the press changes nothing, and takes no place.)
         if self.playback.borrow().current().is_none() {
             return;
@@ -721,8 +731,12 @@ impl Controller {
         if self.remote(Remote::Play(playing)) {
             return;
         }
+        self.set_playing_here(playing);
+    }
+
+    pub fn set_playing_here(self: &Rc<Self>, playing: bool) {
         if self.playback.borrow().playing != playing {
-            self.toggle_play();
+            self.toggle_play_here();
         }
     }
 
@@ -730,6 +744,10 @@ impl Controller {
         if self.remote(Remote::Next) {
             return;
         }
+        self.next_track_here();
+    }
+
+    pub fn next_track_here(self: &Rc<Self>) {
         // (With nothing to go to the press changes nothing, and takes no place.)
         if self.playback.borrow().order.is_empty() {
             return;
@@ -757,6 +775,10 @@ impl Controller {
         if self.remote(Remote::Previous) {
             return;
         }
+        self.previous_track_here();
+    }
+
+    pub fn previous_track_here(self: &Rc<Self>) {
         if self.playback.borrow().order.is_empty() {
             return;
         }
@@ -769,7 +791,7 @@ impl Controller {
             // Like a CD player: a few seconds in, "previous" restarts the track.
             if pb.position > 3.0 || pb.cursor == 0 {
                 drop(pb);
-                return self.seek(0.0);
+                return self.seek_here(0.0);
             }
             pb.cursor -= 1;
         }
@@ -780,6 +802,10 @@ impl Controller {
         if self.remote(Remote::Seek(seconds)) {
             return;
         }
+        self.seek_here(seconds);
+    }
+
+    pub fn seek_here(self: &Rc<Self>, seconds: f64) {
         let (loaded, token, duration) = {
             let mut pb = self.playback.borrow_mut();
             let Some(duration) = pb.current().map(|s| s.duration as f64) else { return };
@@ -832,6 +858,10 @@ impl Controller {
         if self.remote(Remote::Volume(volume)) {
             return;
         }
+        self.set_volume_here(volume);
+    }
+
+    pub fn set_volume_here(self: &Rc<Self>, volume: f32) {
         self.changed();
         {
             let mut pb = self.playback.borrow_mut();
@@ -938,6 +968,13 @@ impl Controller {
         if self.remote_add(&songs, play_next) {
             return;
         }
+        self.enqueue_here(songs, play_next);
+    }
+
+    pub fn enqueue_here(self: &Rc<Self>, songs: Vec<Song>, play_next: bool) {
+        if songs.is_empty() {
+            return;
+        }
         self.changed();
         let was_empty = self.playback.borrow().order.is_empty();
         if was_empty {
@@ -971,6 +1008,10 @@ impl Controller {
         if self.remote(Remote::Remove(offset)) {
             return;
         }
+        self.remove_upcoming_here(offset);
+    }
+
+    pub fn remove_upcoming_here(self: &Rc<Self>, offset: usize) {
         {
             let mut pb = self.playback.borrow_mut();
             let at = pb.cursor + 1 + offset;
@@ -989,6 +1030,10 @@ impl Controller {
         if self.remote(Remote::Move(from, to, queued)) {
             return;
         }
+        self.move_upcoming_here(from, to, queued);
+    }
+
+    pub fn move_upcoming_here(self: &Rc<Self>, from: usize, to: usize, queued: bool) {
         self.changed();
         self.playback.borrow_mut().move_ahead(from, to, queued);
         self.next_changed();
@@ -1000,6 +1045,10 @@ impl Controller {
         if self.remote(Remote::Clear(queued)) {
             return;
         }
+        self.clear_upcoming_here(queued);
+    }
+
+    pub fn clear_upcoming_here(self: &Rc<Self>, queued: bool) {
         if self.playback.borrow().current().is_none() {
             return;
         }
@@ -1013,6 +1062,10 @@ impl Controller {
         if self.remote(Remote::Jump(offset)) {
             return;
         }
+        self.jump_to_upcoming_here(offset);
+    }
+
+    pub fn jump_to_upcoming_here(self: &Rc<Self>, offset: usize) {
         {
             let mut pb = self.playback.borrow_mut();
             if !pb.jump_ahead(offset) {
@@ -1032,6 +1085,16 @@ impl Controller {
             return;
         }
         let _changing = self.changing();
+        self.take_queue(songs, index, position, context);
+        if playing {
+            self.toggle_play();
+        } else {
+            self.save_queue();
+        }
+    }
+
+    /// Puts a queue in the player in place of what was there, stopped at its place.
+    fn take_queue(self: &Rc<Self>, songs: Vec<Song>, index: usize, position: f64, context: &str) {
         self.engine.set_playing(false);
         self.engine.stop();
         let duration = songs.get(index).map_or(0.0, |song| song.duration as f64);
@@ -1040,11 +1103,6 @@ impl Controller {
         self.replace_queue(songs, index, position);
         self.playback.borrow_mut().context = context.to_string();
         self.track_changed();
-        if playing {
-            self.toggle_play();
-        } else {
-            self.save_queue();
-        }
     }
 
     // ---- engine events and the clock -----------------------------------------------------------
