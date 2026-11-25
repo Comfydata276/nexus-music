@@ -66,7 +66,16 @@ impl Paths {
             ),
             None => (config, cache, data),
         };
-        let paths = Paths {
+        let paths = Paths::at(&config, &cache, &data);
+        for dir in [&config, &paths.covers, &paths.pages, &paths.buffers, &paths.songs] {
+            let _ = fs::create_dir_all(dir);
+        }
+        paths
+    }
+
+    /// Where each file goes, in these three folders (see `docs/FILES.md`).
+    fn at(config: &Path, cache: &Path, data: &Path) -> Paths {
+        Paths {
             settings: config.join("settings.json"),
             queue: config.join("queue.json"),
             queue_place: config.join("queue-place.json"),
@@ -88,11 +97,7 @@ impl Paths {
             plays: config.join("plays.json"),
             #[cfg(not(windows))]
             secret: config.join("credential"),
-        };
-        for dir in [&config, &paths.covers, &paths.pages, &paths.buffers, &paths.songs] {
-            let _ = fs::create_dir_all(dir);
         }
-        paths
     }
 }
 
@@ -999,6 +1004,59 @@ mod tests {
         assert!(write_whole(&path, b"new", &Steps { sync_folder: |_| fails(), ..REPLACING }).is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), "new");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_file_the_app_keeps_is_in_the_table_of_them() {
+        // Named one by one, so that a file added to `Paths` can't be left out of this.
+        let Paths {
+            settings,
+            queue,
+            queue_place,
+            exports,
+            crash_log,
+            diagnostics,
+            history,
+            pending,
+            covers,
+            pages,
+            buffers,
+            songs,
+            downloads,
+            added,
+            asked,
+            asking,
+            discover,
+            old_lyrics: _,
+            plays,
+            #[cfg(not(windows))]
+            secret,
+        } = Paths::at(Path::new("config"), Path::new("cache"), Path::new("data"));
+        let table = include_str!("../docs/FILES.md");
+        let name = |path: &Path| path.file_name().unwrap().to_string_lossy().into_owned();
+        let mut named = vec![
+            name(&settings),
+            name(&backup_of(&settings)),
+            name(&queue),
+            name(&queue_place),
+            name(&crash_log),
+            name(&diagnostics),
+            name(&history),
+            name(&pending).replace(".json", "-<account>.json"),
+            name(&added),
+            name(&asked),
+            name(&asking),
+            name(&discover),
+            name(&plays),
+            name(&plays.with_extension("log")),
+            name(&plays.with_extension("log.new")),
+        ];
+        named.extend([&exports, &covers, &pages, &buffers, &songs, &downloads].map(|folder| format!("{}\\", name(folder))));
+        #[cfg(not(windows))]
+        named.push(name(&secret));
+        for named in named {
+            assert!(table.contains(&format!("`{named}")), "docs/FILES.md doesn't say how {named} is kept");
+        }
     }
 
     #[test]

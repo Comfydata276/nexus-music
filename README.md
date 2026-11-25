@@ -468,6 +468,7 @@ connection.
 | --- | --- |
 | `core/` | The library (`nexus-core`): what every app on an account has to do identically, kept apart so the Android app can be built on the same code. No window, files, threads or connections of its own. See below. |
 | `ui/` | The interface, in Slint. `types.slint` is the contract with the Rust side. |
+| `docs/FILES.md` | Every file the app keeps: what it holds, how it is written, what a kill or a power cut part-way leaves, and how one that can't be read is treated. A file the app must not lose is written through `config::write_whole`. |
 | `src/subsonic.rs` | Client for the Subsonic API that Navidrome serves at `/rest`. |
 | `src/audio/` | Playback engine: download buffer, decoding, resampling, output device. |
 | `src/controller.rs` | Sign-in, navigation and the page on screen. |
