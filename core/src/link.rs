@@ -6,7 +6,9 @@
 //! ([`frame`]); they say two kinds of thing, an ask and a tell ([`message`]); and a device
 //! carries out what another asks only if nothing has been chosen on it since the state the
 //! ask was made against ([`rule`]). [`steer`] is the asking side: what makes a state fresh
-//! enough to act on, and what to conclude when no answer comes.
+//! enough to act on, and what to conclude when no answer comes. What may be asked is in
+//! [`command`]; [`moving`] is music going from one device to another; and [`news`] is a
+//! device saying, unasked, that it has changed.
 //!
 //! Nothing here has a clock, a source of randomness, a connection or a player. An app
 //! hands in the time (milliseconds, on a clock that **goes on counting while the device
@@ -17,6 +19,7 @@ pub mod command;
 pub mod frame;
 pub mod message;
 pub mod moving;
+pub mod news;
 pub mod rule;
 pub mod secret;
 pub mod steer;
@@ -37,8 +40,10 @@ pub type DeviceId = [u8; 16];
 pub const LOOK_AGAIN_MS: u64 = 2 * 60 * 1000;
 /// How long a secret is used, counted from the start of the look that read it.
 pub const SECRET_LIFE_MS: u64 = 10 * 60 * 1000;
-/// How often a device that is shown on the screen is looked at.
+/// How often the device this one is steering is looked at.
 pub const LOOK_EVERY_MS: u64 = 5 * 1000;
+/// How often every other device is looked at. In between, its news prompts a look.
+pub const LOOK_IDLE_MS: u64 = 30 * 1000;
 /// How old a state may be, counted from when its look was sent, and still be acted on.
 pub const FRESH_MS: u64 = 45 * 1000;
 /// How long an answer is waited for before the asking device stops waiting.
