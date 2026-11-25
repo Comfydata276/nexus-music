@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use nexus_core::link::frame::{self, ASK, Keys, TELL};
 use nexus_core::link::message::{Ask, At, Tell, Why, read_ask, read_tell};
-use nexus_core::link::rule::Waiting;
+use nexus_core::link::rule::{Reservation, Waiting};
 use nexus_core::link::secret::{self, Next, Secret, Stop, Verdict};
 use nexus_core::link::steer::{Outcome, Peer, Tick, Told, Wait};
 use nexus_core::link::{Asks, LOOK_AGAIN_MS, LOOK_EVERY_MS, Nonce, Place, VERSION, minute, secret_holds, text};
@@ -113,6 +113,14 @@ fn random<const N: usize>() -> Option<[u8; N]> {
     let mut bytes = [0u8; N];
     getrandom::fill(&mut bytes).ok()?;
     Some(bytes)
+}
+
+/// For a test only: how long a Pause from another device is held between being accepted
+/// and being carried out, if `NEXUS_MUSIC_LINK_TEST_SLOW_PAUSE` gives a number of
+/// milliseconds. With it, a run can make the secret change in between. Never set otherwise.
+fn slow_pause() -> Option<Duration> {
+    static WAIT: OnceLock<Option<Duration>> = OnceLock::new();
+    *WAIT.get_or_init(|| std::env::var("NEXUS_MUSIC_LINK_TEST_SLOW_PAUSE").ok()?.parse().ok().map(Duration::from_millis))
 }
 
 /// Writes a line of what happened to the file named by `NEXUS_MUSIC_LINK_LOG`, if any: for
@@ -510,6 +518,21 @@ fn wanted(signed_in: bool, relay: bool, link_my_devices: bool, no_random: bool) 
     signed_in && relay && link_my_devices && !no_random
 }
 
+/// One row for each device. A copy that has been started again is in the room twice for
+/// a while: at its new place, and at its old one until the relay gives that up. It is
+/// shown once, as its latest answer has it, where it was first in the list.
+fn latest_of_each<T>(rows: Vec<([u8; 16], u64, T)>) -> Vec<T> {
+    let mut kept: Vec<([u8; 16], u64, T)> = Vec::new();
+    for (device, heard_ms, row) in rows {
+        match kept.iter_mut().find(|(other, _, _)| *other == device) {
+            Some(earlier) if heard_ms >= earlier.1 => *earlier = (device, heard_ms, row),
+            Some(_) => {}
+            None => kept.push((device, heard_ms, row)),
+        }
+    }
+    kept.into_iter().map(|(_, _, row)| row).collect()
+}
+
 fn name_of(seen: &Seen) -> String {
     seen.peer.shown().map_or_else(|| "A device".to_string(), |shown| shown.tell.name.clone())
 }
@@ -612,6 +635,7 @@ impl Controller {
                     match link.session.as_mut().filter(|session| session.secret == secret && secret_holds(session.since_ms, now_ms())) {
                         Some(session) => {
                             session.since_ms = since;
+                            log("look: the secret is as it was");
                             None
                         }
                         None => Some(secret),
@@ -809,27 +833,51 @@ impl Controller {
             Some(Ask::Pause { at }) => {
                 // Checked as it arrives, before anything is done for it...
                 let admitted = self.link_rule.borrow_mut().admit(at, minute(now), now);
-                let done = admitted.and_then(|reservation| {
-                    // ...and again at the moment the player is changed, under the session
-                    // it arrived in.
-                    let same_session = self.link.borrow().live(serial, now_ms()).is_some();
-                    self.link_rule.borrow_mut().finish(reservation, at, minute(now_ms()), same_session, nonce)?;
-                    self.pause_here();
-                    Ok(())
-                });
-                match done {
-                    Ok(()) => {
-                        log(format!("pause from {who} against generation {}: carried out", at.generation));
-                        self.link_state(Some(nonce), Some(true), None)
-                    }
-                    Err(why) => {
-                        log(format!("pause from {who} against generation {}: refused, {why:?} (this device is at {}{})", at.generation, self.link_rule.borrow().generation(), if self.link_rule.borrow().busy(now_ms()) { ", busy" } else { "" }));
-                        self.link_state(Some(nonce), Some(false), Some(why))
-                    }
+                // (For a test only: the Pause is carried out a while after it is accepted,
+                // so that something can be made to happen in between.)
+                if let (Ok(_), Some(wait)) = (&admitted, slow_pause()) {
+                    let ctl = self.clone();
+                    log(format!("pause from {who}: accepted, and held {} ms before it is carried out (a test)", wait.as_millis()));
+                    return slint::Timer::single_shot(wait, move || {
+                        let answer = ctl.link_pause_now(serial, from, admitted, at, nonce);
+                        ctl.link_answer(serial, from, answer);
+                    });
                 }
+                self.link_pause_now(serial, from, admitted, at, nonce)
             }
         };
-        self.link_send(from, TELL, answer.text());
+        self.link_answer(serial, from, answer);
+    }
+
+    /// The moment the player is changed for a Pause from another device: everything is
+    /// checked again, under the session the Pause arrived in. Returns what to tell it.
+    fn link_pause_now(self: &Rc<Self>, serial: u64, from: Place, admitted: Result<Reservation, Why>, at: At, nonce: Nonce) -> Tell {
+        let who = text::place(&from);
+        let done = admitted.and_then(|reservation| {
+            let same_session = self.link.borrow().live(serial, now_ms()).is_some();
+            self.link_rule.borrow_mut().finish(reservation, at, minute(now_ms()), same_session, nonce)?;
+            self.pause_here();
+            Ok(())
+        });
+        match done {
+            Ok(()) => {
+                log(format!("pause from {who} against generation {}: carried out", at.generation));
+                self.link_state(Some(nonce), Some(true), None)
+            }
+            Err(why) => {
+                log(format!("pause from {who} against generation {}: refused, {why:?} (this device is at {}{})", at.generation, self.link_rule.borrow().generation(), if self.link_rule.borrow().busy(now_ms()) { ", busy" } else { "" }));
+                self.link_state(Some(nonce), Some(false), Some(why))
+            }
+        }
+    }
+
+    /// Answers an ask, if the session it arrived under is still the live one: an answer is
+    /// not sent under another session, to a place that session has never heard of.
+    fn link_answer(&self, serial: u64, to: Place, answer: Tell) {
+        if self.link.borrow().live(serial, now_ms()).is_none() {
+            return log("answer: the session it belonged to has ended, not sent");
+        }
+        self.link_send(to, TELL, answer.text());
     }
 
     /// Another device says something of itself.
@@ -943,7 +991,7 @@ impl Controller {
     fn link_show(&self) {
         let now = now_ms();
         let link = self.link.borrow();
-        let mut list = Vec::new();
+        let mut rows = Vec::new();
         if let Some(session) = &link.session {
             for place in &session.others {
                 let Some(shown) = session.peers.get(place).and_then(|seen| seen.peer.shown()) else { continue };
@@ -958,9 +1006,10 @@ impl Controller {
                 if age >= 20 {
                     about.push_str(&format!(" (as of {age} seconds ago)"));
                 }
-                list.push(ui::LinkedDevice { place: text::place(place).into(), name: tell.name.as_str().into(), about: about.into(), playing: tell.playing });
+                rows.push((tell.device, shown.sent_ms, ui::LinkedDevice { place: text::place(place).into(), name: tell.name.as_str().into(), about: about.into(), playing: tell.playing }));
             }
         }
+        let list = latest_of_each(rows);
         let global = self.ui.global::<ui::Linked>();
         global.set_on(true);
         global.set_entered(link.session.as_ref().is_some_and(|session| session.place.is_some()));
@@ -1062,6 +1111,18 @@ mod tests {
         // is the session carrying on.
         assert!(!ends_session(&Looked::Failed));
         assert!(!ends_session(&Looked::Secret { secret: Secret::new([7; 32]), id: "k".into(), wrote: None }));
+    }
+
+    /// Seen in the run: a copy that was started again was listed twice, once at the place
+    /// it had left, growing older by the second.
+    #[test]
+    fn a_device_that_was_started_again_is_shown_once_as_it_last_answered() {
+        let (study, phone) = ([1; 16], [2; 16]);
+        let rows = vec![(study, 1_000, "Study PC, playing, at its old place"), (phone, 4_000, "Phone"), (study, 30_000, "Study PC, paused, at its new place")];
+        assert_eq!(latest_of_each(rows), vec!["Study PC, paused, at its new place", "Phone"]);
+        // The older answer does not replace the newer whichever order the places come in.
+        assert_eq!(latest_of_each(vec![(study, 30_000, "new"), (study, 1_000, "old")]), vec!["new"]);
+        assert_eq!(latest_of_each(Vec::<([u8; 16], u64, &str)>::new()), Vec::<&str>::new());
     }
 
     #[test]
