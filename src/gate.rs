@@ -116,13 +116,18 @@ fn first_line(stream: &mut TcpStream) -> String {
 
 impl Attempt {
     /// Waits for the browser to come back, then collects the token. `given_up` is asked now
-    /// and then whether to stop waiting.
+    /// and then whether to stop waiting. The browser is answered once the token is in hand
+    /// and gets through to Lidarr: "You're signed in" only then, "The sign-in didn't go
+    /// through" otherwise.
     pub fn finish(self, agent: &ureq::Agent, given_up: impl Fn() -> bool) -> Result<SignedIn, String> {
-        let code = self.wait(&given_up)?;
-        nexus_core::gate::finish(&over(agent), &self.found, &code, &self.back, &self.secret)
+        let (code, mut browser) = self.wait(&given_up)?;
+        let done = nexus_core::gate::finish(&over(agent), &self.found, &code, &self.back, &self.secret);
+        reply(&mut browser, "200 OK", &nexus_core::gate::page(if done.is_ok() { Page::SignedIn } else { Page::NotThrough }));
+        done
     }
 
-    fn wait(&self, given_up: &impl Fn() -> bool) -> Result<String, String> {
+    /// The code the browser came back with, and the browser, still waiting for its page.
+    fn wait(&self, given_up: &impl Fn() -> bool) -> Result<(String, TcpStream), String> {
         self.listener.set_nonblocking(true).map_err(|e| e.to_string())?;
         let deadline = Instant::now() + WAIT;
         loop {
@@ -153,8 +158,7 @@ impl Attempt {
                 return Err(nexus_core::gate::turned_down(&why));
             }
             if let Some(code) = param(query, "code").filter(|code| !code.is_empty()) {
-                reply(&mut stream, "200 OK", &nexus_core::gate::page(Page::SignedIn));
-                return Ok(code);
+                return Ok((code, stream));
             }
             reply(&mut stream, "400 Bad Request", &nexus_core::gate::page(Page::NothingHere));
         }
@@ -325,10 +329,11 @@ mod wire {
             write!(stream, "GET /callback?code=c0de%2B1&state={state} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").unwrap();
             let mut said = String::new();
             let _ = stream.read_to_string(&mut said);
-            said.lines().next().unwrap_or_default().to_string()
+            said
         });
         let done = attempt.finish(&agent(), || false).unwrap();
-        assert_eq!(browser.join().unwrap(), "HTTP/1.1 200 OK");
+        let said = browser.join().unwrap();
+        assert!(said.starts_with("HTTP/1.1 200 OK\r\n") && said.ends_with(&nexus_core::gate::page(Page::SignedIn)), "{said}");
         assert_eq!((done.token.as_str(), done.name.as_str()), ("to keep/1", "someone"));
         let sent: Vec<Sent> = sent.lock().unwrap().clone();
         let back = param(link.split_once('?').unwrap().1, "redirect_uri").unwrap();
@@ -356,15 +361,19 @@ mod wire {
         let attempt = begin(&Found { service: address, client: "lidarr-proxy".into() }).unwrap();
         let query = attempt.link.split_once('?').unwrap().1.to_string();
         let (back, state) = (param(&query, "redirect_uri").unwrap(), param(&query, "state").unwrap());
-        std::thread::spawn(move || {
+        let browser = std::thread::spawn(move || {
             let mut stream = std::net::TcpStream::connect(back.trim_start_matches("http://").trim_end_matches("/callback")).unwrap();
             write!(stream, "GET /callback?code=c&state={state} HTTP/1.1\r\n\r\n").unwrap();
-            let _ = stream.read_to_string(&mut String::new());
+            let mut said = String::new();
+            let _ = stream.read_to_string(&mut said);
+            said
         });
         assert_eq!(
             attempt.finish(&agent(), || false).err().as_deref(),
             Some("You're signed in, but the sign-in service won't let this app through to Lidarr. Either your account isn't allowed to use Lidarr, or Lidarr's sign-in hasn't been told to trust Nexus Music yet.")
         );
+        // The browser isn't told it's signed in: it's answered once the app knows it isn't.
+        assert!(browser.join().unwrap().ends_with(&nexus_core::gate::page(Page::NotThrough)));
         let sent = sent.lock().unwrap().clone();
         let revoke = "token=to+keep%2F1&client_id=nexus-music";
         assert_eq!(sent.len(), 3);

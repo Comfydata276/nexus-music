@@ -347,9 +347,10 @@ pub const NOBODY_SIGNED_IN: &str = "Nobody signed in within five minutes. Try ag
 /// The pages the browser is shown when it comes back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Page {
-    /// "You're signed in": it came back with a code.
+    /// "You're signed in": it came back with a code, and `finish` came of it.
     SignedIn,
-    /// "The sign-in didn't go through": it came back with an error.
+    /// "The sign-in didn't go through": it came back with an error, or with a code that
+    /// `finish` came to nothing of.
     NotThrough,
     /// "Nothing here": something else came to the door.
     NothingHere,
