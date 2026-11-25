@@ -216,7 +216,10 @@ pub fn look(theirs: &PlayQueue, here: &Here, clock: Clock, now: i64) -> Looked {
     // a song plays here, what another device was playing in the last half hour; otherwise
     // whatever is newer than the queue here, for as long as it is.
     let age = aligned(now, clock.offset()).saturating_sub(changed);
-    let offered = others && !same_queue(theirs, here) && if here.playing { (0..OFFER_FOR).contains(&age) } else { newer };
+    // (Offered to a device that isn't playing only if it is strictly the newer: a queue
+    // saved in the very second something was done here is not newer than that, and offering
+    // it would bring back an offer the person has just acted past.)
+    let offered = others && !same_queue(theirs, here) && if here.playing { (0..OFFER_FOR).contains(&age) } else { changed > stamp };
     let offer = offered.then(|| theirs.songs.iter().position(|song| song.id == theirs.current).unwrap_or(0));
     let owed = !newer && own && stamp > changed;
     Looked { offer, then: if owed { Then::Save } else { Then::Nothing } }
@@ -482,7 +485,11 @@ mod tests {
         // offered it. (With the save refused and the look waiting for something strictly
         // newer, this device's change was neither on the server nor answered by anything.)
         assert!(matches!(look(&theirs, &empty(600), RIGHT, DAY + 700).then, Then::TakeUp(_)));
-        assert_eq!(look(&theirs, &here(600), RIGHT, DAY + 700), Looked { offer: Some(1), then: Then::Nothing });
+        // A queue of the person's own keeps its place either way. And the PC's is not
+        // offered at a tie: it is not newer than what was done here in that same second, and
+        // an offer the person has just acted past must not come straight back.
+        assert_eq!(look(&theirs, &here(600), RIGHT, DAY + 700), Looked { offer: None, then: Then::Nothing });
+        assert_eq!(look(&theirs, &here(599), RIGHT, DAY + 700), Looked { offer: Some(1), then: Then::Nothing });
         assert_eq!(look(&theirs, &here(601), RIGHT, DAY + 700), Looked { offer: None, then: Then::Save });
     }
 

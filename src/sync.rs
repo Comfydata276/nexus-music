@@ -169,6 +169,12 @@ pub struct QueueOwner {
     /// that device's name and the time of its save (`nexus_core::handover::Here::taken`).
     taken: std::cell::RefCell<Option<String>>,
     revision: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// The offer that was last taken, or acted past: the time of that save and who made it.
+    used: std::cell::RefCell<Option<(String, String)>>,
+    /// How many looks at the server's saved queue have begun, and the newest whose answer
+    /// has been taken.
+    looks: std::cell::Cell<u64>,
+    answered: std::cell::Cell<u64>,
 }
 
 /// A save's note of the queue it was prepared for.
@@ -215,6 +221,34 @@ impl QueueOwner {
     pub fn taken_up(&self, from: String) {
         *self.taken.borrow_mut() = Some(from);
         self.revision.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// An offer of this saved queue was taken ("Continue here"), or the person did something
+    /// here while it stood: it is done with, and the same one is not made again. What that
+    /// device saves next is another.
+    pub fn offer_used(&self, theirs: &PlayQueue) {
+        *self.used.borrow_mut() = Some((theirs.changed.clone(), theirs.changed_by.clone()));
+    }
+
+    /// Whether this saved queue is the one whose offer is done with.
+    pub fn used(&self, theirs: &PlayQueue) -> bool {
+        self.used.borrow().as_ref().is_some_and(|(at, by)| *at == theirs.changed && *by == theirs.changed_by)
+    }
+
+    /// A look at the server's saved queue begins: its number.
+    pub fn look_began(&self) -> u64 {
+        self.looks.set(self.looks.get() + 1);
+        self.looks.get()
+    }
+
+    /// The answer to look `number` has come. Whether it counts: not if a later look's
+    /// answer came first (what that one decided is the newer, and stands).
+    pub fn look_counts(&self, number: u64) -> bool {
+        if number <= self.answered.get() {
+            return false;
+        }
+        self.answered.set(number);
+        true
     }
 
     /// As it was left when the app last closed.
@@ -410,7 +444,16 @@ impl Controller {
             self.sync_timer.stop();
             self.queue_timer.stop();
             self.sync_says("");
+            // Nothing of another device's is offered while this is off: what was on offer
+            // would otherwise stay there to be pressed.
+            self.withdraw_offer();
         }
+    }
+
+    /// Whatever another device's queue was on offer no longer is.
+    fn withdraw_offer(&self) {
+        *self.elsewhere.borrow_mut() = None;
+        self.ui.global::<crate::ui::Player>().set_elsewhere("".into());
     }
 
     /// Picks up whatever other devices have changed.
@@ -745,8 +788,10 @@ impl Controller {
         self.queue_stamp.set(chrono::Utc::now().timestamp());
         self.queue_owner.claimed();
         // What another device was playing was offered as the newer of the two, which it
-        // has just stopped being.
-        if self.elsewhere.borrow_mut().take().is_some() {
+        // has just stopped being: the person has acted past that offer, and it is not made
+        // again.
+        if let Some((theirs, _)) = self.elsewhere.borrow_mut().take() {
+            self.queue_owner.offer_used(&theirs);
             self.ui.global::<crate::ui::Player>().set_elsewhere("".into());
         }
         self.save_queue_soon();
@@ -848,11 +893,20 @@ impl Controller {
         }
         let Some(client) = self.client() else { return };
         let session = self.session.load(Ordering::SeqCst);
+        let number = self.queue_owner.look_began();
         self.api_pool.spawn(move || {
-            let Ok(theirs) = client.play_queue_timed() else { return };
+            let theirs = client.play_queue_timed();
             post(move |ctl| {
-                if session == ctl.session.load(Ordering::SeqCst) && ctl.sync_on() {
-                    ctl.looked_at_queue(theirs);
+                // (An answer that comes after a later look's has nothing to say: that one
+                // has decided already, from what the server held more lately.)
+                if session != ctl.session.load(Ordering::SeqCst) || !ctl.sync_on() || !ctl.queue_owner.look_counts(number) {
+                    return;
+                }
+                match theirs {
+                    Ok(theirs) => ctl.looked_at_queue(theirs),
+                    // The server couldn't be asked: an offer made from an earlier answer
+                    // is no longer known to stand, and is not left there to be pressed.
+                    Err(_) => ctl.withdraw_offer(),
                 }
             });
         });
@@ -867,9 +921,11 @@ impl Controller {
         self.clock.set(clock);
         let theirs = theirs.value;
         let looked = handover::look(&theirs, &self.here(), clock, chrono::Utc::now().timestamp());
-        let label = looked.offer.and_then(|index| theirs.songs.get(index)).map(|song| format!("{} — {}", song.title, song.artist_label())).unwrap_or_default();
+        // (An offer that was taken, or that the person acted past, is not made again.)
+        let offer = looked.offer.filter(|_| !self.queue_owner.used(&theirs));
+        let label = offer.and_then(|index| theirs.songs.get(index)).map(|song| format!("{} — {}", song.title, song.artist_label())).unwrap_or_default();
         // (Kept with the clock it was read by, for "Continue here".)
-        *self.elsewhere.borrow_mut() = looked.offer.is_some().then(|| (theirs.clone(), clock));
+        *self.elsewhere.borrow_mut() = offer.is_some().then(|| (theirs.clone(), clock));
         self.ui.global::<crate::ui::Player>().set_elsewhere(label.into());
         match looked.then {
             Then::TakeUp(place) => self.take_up(theirs, place, false),
@@ -902,6 +958,8 @@ impl Controller {
     pub fn continue_here(self: &Rc<Self>) {
         let Some((theirs, clock)) = self.elsewhere.borrow_mut().take() else { return };
         self.ui.global::<crate::ui::Player>().set_elsewhere("".into());
+        // (Taken: that offer is done with.)
+        self.queue_owner.offer_used(&theirs);
         let place = handover::place(&theirs, clock);
         self.take_up(theirs, place, true);
         // Taken by the person's own choice, it is this PC's own queue from the first
@@ -1102,6 +1160,33 @@ mod tests {
         assert_eq!((looked.then, looked.offer), (Then::Nothing, Some(2)));
         // From then on what plays here is B's own to save as it goes.
         assert!(owner.moved_on());
+    }
+
+    #[test]
+    fn an_offer_that_was_used_or_acted_past_is_not_made_again() {
+        let saved = |at: &str, by: &str| PlayQueue { changed: at.into(), changed_by: by.into(), ..Default::default() };
+        let owner = QueueOwner::default();
+        let first = saved("1970-01-02T00:10:00Z", "NexusMusic-0badc0de");
+        // Offered, and then taken (or the person did something else instead): that offer is
+        // done with. The same saved queue is never offered a second time...
+        assert!(!owner.used(&first));
+        owner.offer_used(&first);
+        assert!(owner.used(&first));
+        // ...but what that device saves next is another offer, and so is another device's.
+        assert!(!owner.used(&saved("1970-01-02T00:10:20Z", "NexusMusic-0badc0de")));
+        assert!(!owner.used(&saved("1970-01-02T00:10:00Z", "NexusMusic-feedf00d")));
+    }
+
+    #[test]
+    fn the_answer_to_an_older_look_that_comes_after_a_newer_ones_changes_nothing() {
+        let owner = QueueOwner::default();
+        let (first, second) = (owner.look_began(), owner.look_began());
+        // The second look's answer arrives first, and counts; the first's, after it, doesn't.
+        assert!(owner.look_counts(second));
+        assert!(!owner.look_counts(first));
+        // In the usual order each counts.
+        let (third, fourth) = (owner.look_began(), owner.look_began());
+        assert!(owner.look_counts(third) && owner.look_counts(fourth));
     }
 
     #[test]
