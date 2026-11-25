@@ -18,8 +18,8 @@ pub const HIDES_SONGS: &str = "Some songs in this playlist are missing from your
 pub enum Outcome {
     /// Carried out (or there was nothing to do). `elsewhere` is whether the playlist had
     /// changed since the page took its copy; `before` is the playlist as the change was
-    /// worked out from, and `after` what the change made of it.
-    Done { elsewhere: bool, before: Vec<String>, after: Vec<String> },
+    /// worked out from.
+    Done { elsewhere: bool, before: Vec<String> },
     /// Nothing was sent: the playlist holds songs the server doesn't show, so a position or
     /// a whole new list would be taken to mean something other than what the page meant.
     HidesSongs,
@@ -35,9 +35,6 @@ pub fn carry_out(client: &Client, id: &str, expected: &[String], edit: &Edit) ->
         return Ok(Outcome::HidesSongs);
     }
     let now: Vec<String> = playlist.songs.into_iter().map(|song| song.id).collect();
-    // What the change makes of the playlist as it is now: worked out, not read back
-    // afterwards (a later read can show another device's change as well).
-    let next = apply(&now, edit);
     match edit {
         Edit::Remove(spots) => {
             let places = positions(&now, spots);
@@ -46,12 +43,15 @@ pub fn carry_out(client: &Client, id: &str, expected: &[String], edit: &Edit) ->
             }
         }
         _ => {
+            let next = apply(&now, edit);
             if next != now {
                 client.replace_playlist(id, &next)?;
             }
         }
     }
-    Ok(Outcome::Done { elsewhere: now != expected, before: now, after: next })
+    // (What the change did is worked out from `before` and the change itself, not read
+    // back afterwards: a later read can show another device's change as well.)
+    Ok(Outcome::Done { elsewhere: now != expected, before: now })
 }
 
 /// A playlist as a spreadsheet file: one line per song, with the column names Spotify
@@ -162,7 +162,7 @@ mod tests {
         stored.lock().unwrap().songs[0].1 = false;
         let shown = list("x a b c d");
         let outcome = carry_out(&client, "p1", &shown, &Edit::Remove(vec![spot(&shown, 2)])).unwrap();
-        assert_eq!(outcome, Outcome::Done { elsewhere: false, before: list("x a b c d"), after: list("x a c d") });
+        assert_eq!(outcome, Outcome::Done { elsewhere: false, before: list("x a b c d") });
         assert_eq!(held(&stored), list("x a c d"));
     }
 

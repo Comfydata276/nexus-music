@@ -761,8 +761,8 @@ impl Controller {
                 // The person's own change, taken by the server: what it added is dated, and
                 // what it took out is told to the other devices. (Only what the change itself
                 // did: whatever else the playlist gained meanwhile is not this PC's to date.)
-                if let Ok(Outcome::Done { before, after, .. }) = &result {
-                    if ctl.added.borrow_mut().changed(&id, before, after, chrono::Utc::now().timestamp()) {
+                if let Ok(Outcome::Done { before, .. }) = &result {
+                    if ctl.added.borrow_mut().edited(&id, before, &edit, chrono::Utc::now().timestamp()) {
                         ctl.share_soon();
                     }
                 }

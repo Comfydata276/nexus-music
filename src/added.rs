@@ -73,10 +73,10 @@ impl Added {
     }
 
     /// A change the person has just made to a playlist here, and the server has taken:
-    /// `before` is the playlist as the change was worked out from, `after` what the change
-    /// made of it. Returns whether there is anything to tell the other devices.
-    pub fn changed(&mut self, playlist: &str, before: &[String], after: &[String], now: i64) -> bool {
-        let shared = self.kept.changed(playlist, before, after, now);
+    /// `before` is the playlist as the change was worked out from. Returns whether there is
+    /// anything to tell the other devices.
+    pub fn edited(&mut self, playlist: &str, before: &[String], edit: &crate::playlists::Edit, now: i64) -> bool {
+        let shared = self.kept.edited(playlist, before, edit, now);
         self.save();
         shared
     }
@@ -181,8 +181,8 @@ mod tests {
         assert!(added.shared(None).is_empty());
         // Songs the person adds here are dated at once, and shared; so is one taken out.
         added.record("p", &["d".to_string()], 300);
-        let list = |ids: &[&str]| ids.iter().map(|id| id.to_string()).collect::<Vec<_>>();
-        assert!(added.changed("p", &list(&["a", "b", "c", "d"]), &list(&["a", "b", "c"]), 400));
+        let list: Vec<String> = ["a", "b", "c", "d"].iter().map(|id| id.to_string()).collect();
+        assert!(added.edited("p", &list, &crate::playlists::Edit::Remove(vec![crate::playlists::spot(&list, 3)]), 400));
         assert_eq!(added.shared(None)["p"]["d"], Note { times: vec![], at: 400 });
         // It survives a restart.
         let mut again = Added::load(path.clone());

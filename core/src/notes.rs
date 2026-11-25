@@ -8,6 +8,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::playlists::{Edit, apply, positions};
+
 /// What's known about one song in one playlist.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -204,6 +206,46 @@ impl Kept {
         shared
     }
 
+    /// The person changed a playlist on this device with `edit`, worked out on the playlist
+    /// as it was `before`, and the server has taken it. As [`Kept::changed`], and where the
+    /// change took copies out it is **those copies' times that go**: the first of two copies
+    /// removed leaves the second's time, not the first's. (A note's times stand for the
+    /// song's copies in the order the playlist has them, which is how [`Kept::dates`] shows
+    /// them.) Returns whether anything worth sharing changed.
+    pub fn edited(&mut self, playlist: &str, before: &[String], edit: &Edit, now: i64) -> bool {
+        let Edit::Remove(spots) = edit else { return self.changed(playlist, before, &apply(before, edit), now) };
+        let was = counts(before.iter().map(String::as_str));
+        // Which copies of each song went: the song, and its copies' numbers, lowest first.
+        let mut gone: HashMap<&str, Vec<usize>> = HashMap::new();
+        for index in positions(before, spots) {
+            let id = before[index].as_str();
+            gone.entry(id).or_default().push(before[..index].iter().filter(|other| *other == id).count());
+        }
+        let notes = self.lists.entry(playlist.to_string()).or_default();
+        let mut shared = false;
+        for (id, copies) in gone {
+            let Some(note) = notes.get_mut(id) else { continue };
+            let mut times = fitted(&note.times, was[id]);
+            for copy in copies.into_iter().rev() {
+                times.remove(copy);
+            }
+            if note.at != 0 {
+                // Word of it is only worth passing on where there was a date to take back.
+                note.times = times;
+                note.at = now;
+                shared = true;
+            } else if times.is_empty() {
+                notes.remove(id);
+            } else {
+                note.times = times;
+            }
+        }
+        if notes.is_empty() {
+            self.lists.remove(playlist);
+        }
+        shared
+    }
+
     /// The person made a playlist on this device with these songs in it.
     pub fn create(&mut self, playlist: &str, ids: &[String], now: i64) {
         self.lists.remove(playlist);
@@ -370,6 +412,44 @@ mod tests {
         kept.added("p", &ids(&["d", "d"]), 400);
         assert!(kept.changed("p", &ids(&["b", "d", "d"]), &ids(&["b", "d"]), 450));
         assert_eq!(kept.shared(None)["p"]["d"], Note { times: vec![400], at: 450 });
+    }
+
+    #[test]
+    fn taking_out_one_of_two_copies_drops_that_copys_date_not_the_others() {
+        use crate::playlists::spot;
+        let list = ids(&["x", "a", "x", "b"]);
+        let two = || {
+            let mut kept = Kept::default();
+            // Two copies of x, added on different days; the playlist has them in that order.
+            kept.take(&Notes::from([("p".to_string(), HashMap::from([("x".to_string(), Note { times: vec![100, 200], at: 200 })]))]));
+            kept.notice("p", &["x", "a", "x", "b"], 250);
+            kept
+        };
+        // The first copy taken out: the one that is left is the one added on the second day.
+        let mut kept = two();
+        assert!(kept.edited("p", &list, &Edit::Remove(vec![spot(&list, 0)]), 300));
+        assert_eq!(kept.shared(None)["p"]["x"], Note { times: vec![200], at: 300 });
+        assert_eq!(kept.dates("p", &["a", "x", "b"]), [0, 200, 0]);
+        // The second taken out: the first day's is left.
+        let mut kept = two();
+        assert!(kept.edited("p", &list, &Edit::Remove(vec![spot(&list, 2)]), 300));
+        assert_eq!(kept.shared(None)["p"]["x"], Note { times: vec![100], at: 300 });
+        // Both, and one that was only ever noticed: x is told as gone; a says nothing.
+        let mut kept = two();
+        assert!(kept.edited("p", &list, &Edit::Remove(vec![spot(&list, 0), spot(&list, 1), spot(&list, 2)]), 300));
+        assert_eq!(kept.shared(None)["p"], HashMap::from([("x".to_string(), Note { times: vec![], at: 300 })]));
+        assert_eq!(kept.dates("p", &["b"]), [0]);
+        // A copy the note has no time for (it is one of three, and the note knows two):
+        // the times that are left are still the later copies'.
+        let three = ids(&["x", "x", "x"]);
+        let mut kept = two();
+        assert!(kept.edited("p", &three, &Edit::Remove(vec![spot(&three, 0)]), 300));
+        assert_eq!(kept.shared(None)["p"]["x"].times, [100, 200]);
+        // Putting songs in and moving them go as before: what is put in is dated.
+        let mut kept = two();
+        assert!(kept.edited("p", &list, &Edit::Insert(vec![("new".to_string(), None)]), 400));
+        assert_eq!(kept.shared(None)["p"]["new"], Note { times: vec![400], at: 400 });
+        assert!(!kept.edited("p", &list, &crate::playlists::moving(&list, 0, 3), 500));
     }
 
     #[test]
