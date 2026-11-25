@@ -49,7 +49,7 @@ use super::device::{Brief, Device, Do, Env, Me, Player, Ready, Shown};
 use super::look::Looked;
 use super::message::{At, Full, Handed, Why};
 use super::relay::FromRelay;
-use super::rule::{Reservation, Rule, Waiting};
+use super::rule::{Carrying, Reservation, Rule, Waiting};
 use super::seen::Seen;
 use super::view::{Press, View};
 use super::words::Here;
@@ -221,7 +221,7 @@ impl Player for Held {
     fn ahead(&self) -> Vec<String> {
         self.playing.ahead.clone()
     }
-    fn carry_out(&mut self, command: &Command, ready: &Ready) {
+    fn carry_out(&mut self, command: &Command, ready: &Ready) -> bool {
         match command {
             Command::Play => self.playing.brief.playing = self.playing.has_song,
             Command::Pause => self.playing.brief.playing = false,
@@ -239,6 +239,9 @@ impl Player for Held {
         }
         let number = self.ask();
         self.acts.push(Act::Carry { number, command: command.clone(), ready: ready.clone() });
+        // (Taken as having changed the player. What the phone's own player then says of
+        // it is not yet waited for: see the top of this file.)
+        true
     }
     /// (The end of a move of the phone's music to another device: the app's own doing,
     /// which claims nothing. The device that took the queue claimed it.)
@@ -275,8 +278,11 @@ impl Player for Held {
     fn admit(&mut self, at: At, minute: u64, now_ms: u64) -> Result<Reservation, Why> {
         self.rule.admit(at, minute, now_ms)
     }
-    fn finish(&mut self, reservation: Reservation, at: At, minute: u64, now_ms: u64, same_session: bool, nonce: Nonce) -> Result<(), Why> {
-        self.rule.finish(reservation, at, minute, now_ms, same_session, nonce)
+    fn finish(&mut self, reservation: Reservation, at: At, minute: u64, now_ms: u64, same_session: bool) -> Result<Carrying, Why> {
+        self.rule.finish(reservation, at, minute, now_ms, same_session)
+    }
+    fn carried(&mut self, carrying: Carrying, changed: bool, nonce: Nonce) {
+        self.rule.carried(carrying, changed, nonce)
     }
     fn refuse(&mut self, reservation: Reservation) {
         self.rule.refuse(reservation)

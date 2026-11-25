@@ -3,7 +3,7 @@
 //! the same things the walks do to two copies of the app, without the app.
 
 use super::*;
-use crate::link::rule::Rule;
+use crate::link::rule::{Carrying, Rule};
 use crate::requests::Snapshot;
 
 /// A player: a queue of ids, where it is in it, and its order of choices.
@@ -24,6 +24,8 @@ struct Fake {
     stream: bool,
     /// The sound has rolled into the next song and the window has not been told.
     rolled: bool,
+    /// What is playing is a radio station: there is nowhere in it to seek to.
+    radio: bool,
     /// What was carried out for other devices, in order.
     did: Vec<String>,
 }
@@ -79,12 +81,27 @@ impl Player for Fake {
     fn ahead(&self) -> Vec<String> {
         self.queue.iter().skip(self.cursor + 1).cloned().collect()
     }
-    fn carry_out(&mut self, command: &Command, ready: &Ready) {
+    fn carry_out(&mut self, command: &Command, ready: &Ready) -> bool {
+        // (As a real player: a press that would change nothing changes nothing.)
+        let nothing = match command {
+            Command::Play => self.playing,
+            Command::Pause => !self.playing,
+            Command::Next => self.cursor + 1 >= self.queue.len(),
+            Command::Seek { .. } => self.radio,
+            Command::Volume { to } => self.volume == *to,
+            Command::Shuffle { on } => self.shuffle == *on,
+            Command::Repeat { mode } => self.repeat == *mode,
+            Command::Clear { .. } => self.cursor + 1 >= self.queue.len(),
+            _ => false,
+        };
+        if nothing {
+            return false;
+        }
         self.did.push(command.name().to_string());
         match (command, ready) {
             (Command::Play, _) => self.play(true),
             (Command::Pause, _) => self.play(false),
-            (Command::Next, _) => self.cursor = (self.cursor + 1).min(self.queue.len().saturating_sub(1)),
+            (Command::Next, _) => self.cursor += 1,
             (Command::Previous, _) => self.position = 0.0,
             (Command::Seek { to }, _) => self.position = *to,
             (Command::Volume { to }, _) => self.volume = *to,
@@ -111,6 +128,7 @@ impl Player for Fake {
             }
             other => panic!("carried out with the wrong thing found: {other:?}"),
         }
+        true
     }
     fn pause(&mut self) {
         self.rule.moved();
@@ -135,8 +153,11 @@ impl Player for Fake {
     fn admit(&mut self, at: At, minute: u64, now_ms: u64) -> Result<Reservation, Why> {
         self.rule.admit(at, minute, now_ms)
     }
-    fn finish(&mut self, reservation: Reservation, at: At, minute: u64, now_ms: u64, same_session: bool, nonce: Nonce) -> Result<(), Why> {
-        self.rule.finish(reservation, at, minute, now_ms, same_session, nonce)
+    fn finish(&mut self, reservation: Reservation, at: At, minute: u64, now_ms: u64, same_session: bool) -> Result<Carrying, Why> {
+        self.rule.finish(reservation, at, minute, now_ms, same_session)
+    }
+    fn carried(&mut self, carrying: Carrying, changed: bool, nonce: Nonce) {
+        self.rule.carried(carrying, changed, nonce)
     }
     fn refuse(&mut self, reservation: Reservation) {
         self.rule.refuse(reservation)
@@ -817,6 +838,67 @@ fn a_command_that_cannot_be_done_changes_nothing_and_leaves_the_device_free() {
     world.ask("adopt");
     assert!(world.last(B, "adopt from").contains("refused, Cannot"));
     assert_eq!(world.copies[B].player.queue.len(), 8);
+}
+
+/// Leave to change the player is not a change. A command that reaches a player which is
+/// already as it asks, or which cannot do it, is answered as what it was: nothing has
+/// moved at the device, and the command is not named as having made its state.
+#[test]
+fn a_command_the_player_did_not_carry_out_is_not_answered_as_done() {
+    // (Each is made to happen behind the order's back, as no way into the player does: A
+    // presses against what it was last shown, and B is no longer so.)
+    let nothing_to_do: [(&str, fn(&mut Fake)); 6] = [
+        ("play", |b| b.play(true)),
+        ("pause", |b| b.play(false)),
+        ("volume", |b| b.volume = 0.3),
+        ("shuffle", |b| b.shuffle = true),
+        ("repeat", |b| b.repeat = 1),
+        ("clear", |b| b.queue.truncate(1)),
+    ];
+    for (name, already) in nothing_to_do {
+        let mut world = steering(name);
+        let before = world.copies[B].player.rule.generation();
+        already(&mut world.copies[B].player);
+        world.ask(name);
+        world.pass(1_000);
+        let b = &world.copies[B];
+        assert!(world.last(B, &format!("{name} from")).ends_with("nothing to do, it was so already"), "{name}: {:?}", b.log);
+        assert_eq!((b.player.did.len(), b.player.rule.generation(), b.player.rule.by(), b.player.rule.busy(world.now)), (0, before, None, false), "{name}");
+        // Its sender is told it is settled, and says nothing: there is nothing to say.
+        assert!(world.last(A, "outcome of").ends_with("Done") && world.copies[A].said.is_empty(), "{name}: {:?}", world.copies[A].said);
+        // The state it was made against still stands: the next press goes through.
+        world.ask("previous");
+        world.pass(1_000);
+        assert_eq!((world.copies[B].player.did.clone(), world.copies[B].player.rule.generation()), (vec!["previous".to_string()], before + 1), "{name}");
+    }
+    let cannot: [(&str, fn(&mut Fake)); 2] = [
+        // A radio station has nowhere to seek to.
+        ("seek", |b| b.radio = true),
+        // The last song of the queue has nothing after it.
+        ("next", |b| b.cursor = b.queue.len() - 1),
+    ];
+    for (name, so) in cannot {
+        let mut world = steering(name);
+        let before = world.copies[B].player.rule.generation();
+        so(&mut world.copies[B].player);
+        world.ask(name);
+        world.pass(1_000);
+        let b = &world.copies[B];
+        assert!(world.last(B, &format!("{name} from")).contains("refused, Cannot"), "{name}: {:?}", b.log);
+        assert_eq!((b.player.did.len(), b.player.rule.generation(), b.player.rule.by(), b.player.rule.busy(world.now)), (0, before, None, false), "{name}");
+        assert_eq!(world.copies[A].said.last().map(String::as_str), Some("Copy B couldn't do that."), "{name}");
+    }
+    // As it is said on the way: done, with the word that nothing needed doing.
+    let mut world = steering("play");
+    world.copies[B].player.play(true);
+    world.path.hold_tells = true;
+    world.ask("play");
+    let answer = world.path.tells.iter().rev().find_map(|frame| {
+        let keys = Keys::of(&secret(7));
+        let opened = frame::open(&keys, &frame.text, &frame.from, &frame.to)?;
+        read_tell(&opened.message).filter(|tell| tell.re.is_some() && tell.ok.is_some())
+    });
+    assert_eq!(answer.map(|tell| (tell.ok, tell.why, tell.by)), Some((Some(true), Some(Why::Nothing), None)));
 }
 
 #[test]

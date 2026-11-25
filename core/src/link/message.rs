@@ -132,6 +132,10 @@ pub enum Why {
     Invalid,
     /// The device could not do it.
     Cannot,
+    /// There was nothing to do: the device was already as the command asked (playing, for a
+    /// Play; at that volume). Said with `ok`, not as a refusal: nothing was changed, nothing
+    /// moved, and the command is not the one that made the state.
+    Nothing,
 }
 
 impl Why {
@@ -142,11 +146,12 @@ impl Why {
             Why::Late => "late",
             Why::Invalid => "invalid",
             Why::Cannot => "cannot",
+            Why::Nothing => "nothing",
         }
     }
 
     fn read(text: &str) -> Option<Why> {
-        [Why::Changed, Why::Busy, Why::Late, Why::Invalid, Why::Cannot].into_iter().find(|why| why.text() == text)
+        [Why::Changed, Why::Busy, Why::Late, Why::Invalid, Why::Cannot, Why::Nothing].into_iter().find(|why| why.text() == text)
     }
 }
 

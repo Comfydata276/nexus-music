@@ -36,7 +36,7 @@ use nexus_core::link::command::Command;
 use nexus_core::link::device::{Brief, Device, Do, Env, Me, Player, Ready, may_go, wanted};
 use nexus_core::link::message::{At, Entry, Full, Handed, Why};
 use nexus_core::link::relay::{self, FromRelay, Relay};
-use nexus_core::link::rule::{Reservation, Waiting};
+use nexus_core::link::rule::{Carrying, Reservation, Waiting};
 use nexus_core::link::view::{Press, View};
 use nexus_core::link::words::Here as Kind;
 use nexus_core::link::{Nonce, look, secret, text};
@@ -323,11 +323,27 @@ impl Player for Here<'_> {
         pb.order.iter().skip(pb.cursor + 1).filter_map(|&index| pb.queue.get(index)).map(|song| song.id.clone()).collect()
     }
 
-    fn carry_out(&mut self, command: &Command, ready: &Ready) {
+    fn carry_out(&mut self, command: &Command, ready: &Ready) -> bool {
         let ctl = self.ctl;
-        // The person chose this at another of their devices. It took its place in the order
-        // when the rule let it through, so what the player does for it is not counted
-        // again; and the queue is theirs by it as it would be by the same press here.
+        // What is so already is not done again: the functions below would count a volume
+        // set to what it is, or a queue cleared of nothing, as a change.
+        let already = {
+            let pb = ctl.playback.borrow();
+            match command {
+                Command::Volume { to } => !pb.muted && (pb.volume - (*to as f32).clamp(0.0, 1.0)).abs() < 0.001,
+                Command::Shuffle { on } => pb.shuffle == *on,
+                Command::Repeat { mode } => pb.repeat == (*mode).min(2),
+                Command::Clear { queued: true } => pb.queued_ahead() == 0,
+                Command::Clear { queued: false } => pb.order.len() <= pb.cursor + 1 + pb.queued_ahead(),
+                _ => false,
+            }
+        };
+        if already {
+            return false;
+        }
+        // The person chose this at another of their devices. The rule counts it, once, if
+        // the player changes anything for it, so the player's own counting is not added;
+        // and the queue is theirs by it as it would be by the same press here.
         let _carrying = ctl.for_another(Who::Elsewhere, true);
         match (command, ready) {
             (Command::Play, _) => ctl.set_playing_here(true),
@@ -352,6 +368,9 @@ impl Player for Here<'_> {
             (Command::Adopt(adopt), Ready::Queue(songs, begin)) => ctl.load_queue_here(self.songs(songs.iter().map(|(id, queued)| (id, *queued))), *begin, adopt.position, &adopt.context),
             _ => {}
         }
+        // Each of those takes its way into the player only once it knows something will
+        // change (`ways`): whether one was taken is whether anything did.
+        ctl.ways.borrow().taken()
     }
 
     /// (The end of a move of this PC's music to another device: the app's own doing. The
@@ -382,8 +401,12 @@ impl Player for Here<'_> {
         self.ctl.link_rule.borrow_mut().admit(at, minute, now_ms)
     }
 
-    fn finish(&mut self, reservation: Reservation, at: At, minute: u64, now_ms: u64, same_session: bool, nonce: Nonce) -> Result<(), Why> {
-        self.ctl.link_rule.borrow_mut().finish(reservation, at, minute, now_ms, same_session, nonce)
+    fn finish(&mut self, reservation: Reservation, at: At, minute: u64, now_ms: u64, same_session: bool) -> Result<Carrying, Why> {
+        self.ctl.link_rule.borrow_mut().finish(reservation, at, minute, now_ms, same_session)
+    }
+
+    fn carried(&mut self, carrying: Carrying, changed: bool, nonce: Nonce) {
+        self.ctl.link_rule.borrow_mut().carried(carrying, changed, nonce);
     }
 
     fn refuse(&mut self, reservation: Reservation) {

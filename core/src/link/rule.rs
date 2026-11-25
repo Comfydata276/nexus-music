@@ -26,6 +26,12 @@
 //! delivered twice, one held back, and one overtaken by something chosen at the device all
 //! fail the same way, and nothing is remembered about past commands but which one was
 //! carried out last ([`Rule::by`]).
+//!
+//! **Only what changed the player counts.** Being let through is leave to change the
+//! player, not a change. When the player has been asked ([`Rule::carried`]) it says whether
+//! anything was changed: if so the generation moves and the command is the one that made
+//! this state; if not (a Play when it was playing, a seek on a radio) nothing moves, and
+//! the state the command was made against still stands for the next one.
 
 use super::Nonce;
 use super::message::{At, Why};
@@ -43,6 +49,11 @@ const MOST_WAITING: usize = 32;
 /// A choice made on this device whose work is still to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Waiting(u64);
+
+/// A command the rule has let through, while the player is asked to do it: the device is
+/// busy with it until [`Rule::carried`] says what came of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Carrying(u64);
 
 /// A command from another device that has been accepted and not yet carried out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,30 +160,53 @@ impl Rule {
         }
     }
 
-    /// The moment the player is changed for a command. `Ok`: change it; the command is the
-    /// one that made this state. `Err`: change nothing. `same_session` is whether the
-    /// sign-in and the secret the command arrived under are still the ones in use, and
-    /// inside their time.
+    /// The moment the player is changed for a command. `Ok`: ask the player to do it now,
+    /// and then say what came of it ([`Rule::carried`]); the device stays busy with it
+    /// until then. `Err`: change nothing. `same_session` is whether the sign-in and the
+    /// secret the command arrived under are still the ones in use, and inside their time.
     ///
     /// Only the command that is open can be finished, and only once; and only inside the
     /// time it was given ([`OPEN_MS`]): work that took longer than that is too late.
-    pub fn finish(&mut self, reservation: Reservation, at: At, minute: u64, now_ms: u64, same_session: bool, nonce: Nonce) -> Result<(), Why> {
+    pub fn finish(&mut self, reservation: Reservation, at: At, minute: u64, now_ms: u64, same_session: bool) -> Result<Carrying, Why> {
         let Some((_, until)) = self.command.filter(|(id, _)| *id == reservation.id) else { return Err(Why::Changed) };
-        self.command = None;
-        // (A deadline at the end of the clock's range is no deadline.)
-        if until <= now_ms && until != u64::MAX {
-            return Err(Why::Late);
+        let refused = if until <= now_ms && until != u64::MAX {
+            // (A deadline at the end of the clock's range is no deadline.)
+            Some(Why::Late)
+        } else if reservation.generation != self.generation {
+            Some(Why::Changed)
+        } else if !same_session {
+            Some(Why::Cannot)
+        } else {
+            in_time(at, minute).err()
+        };
+        match refused {
+            Some(why) => {
+                self.command = None;
+                Err(why)
+            }
+            None => Ok(Carrying(reservation.id)),
         }
-        if reservation.generation != self.generation {
-            return Err(Why::Changed);
+    }
+
+    /// The player has been asked to do what a command said, and `changed` is whether it
+    /// changed anything. If it did, the generation moves, and `nonce` names the command
+    /// that made this state. If it did not, nothing moves: the device is as it was, and no
+    /// longer busy with the command.
+    ///
+    /// (If the command was given up while the player was at it, because its time ran out,
+    /// what the player changed has still changed: the generation moves, and no command is
+    /// named as having made the state.)
+    pub fn carried(&mut self, carrying: Carrying, changed: bool, nonce: Nonce) {
+        let open = self.command.is_some_and(|(id, _)| id == carrying.0);
+        if open {
+            self.command = None;
         }
-        if !same_session {
-            return Err(Why::Cannot);
+        if changed {
+            self.moved();
+            if open {
+                self.by = Some(nonce);
+            }
         }
-        in_time(at, minute)?;
-        self.moved();
-        self.by = Some(nonce);
-        Ok(())
     }
 }
 
@@ -202,7 +236,47 @@ mod tests {
     /// A command that arrives and is carried out at once, as a Pause is.
     fn command(rule: &mut Rule, at: At, minute: u64, nonce: Nonce) -> Result<(), Why> {
         let reservation = rule.admit(at, minute, minute.saturating_mul(60_000))?;
-        rule.finish(reservation, at, minute, minute.saturating_mul(60_000), true, nonce)
+        finish(rule, reservation, at, minute, minute.saturating_mul(60_000), true, nonce)
+    }
+
+    /// The moment a command is carried out, with a player that does what it says.
+    fn finish(rule: &mut Rule, reservation: Reservation, at: At, minute: u64, now_ms: u64, same_session: bool, nonce: Nonce) -> Result<(), Why> {
+        rule.finish(reservation, at, minute, now_ms, same_session).map(|carrying| rule.carried(carrying, true, nonce))
+    }
+
+    /// Leave to change the player is not a change: a command that was let through and
+    /// found the player already as it asked, or unable to do it, moves nothing.
+    #[test]
+    fn a_command_that_changed_nothing_moves_nothing() {
+        let mut rule = Rule::default();
+        let seen = at(&rule, 0);
+        let reservation = rule.admit(seen, 0, 0).unwrap();
+        let carrying = rule.finish(reservation, seen, 0, 0, true).unwrap();
+        // While the player is asked, the device is busy with it, and nothing else is let in.
+        assert!(rule.busy(0));
+        assert_eq!(rule.admit(seen, 0, 0), Err(Why::Busy));
+        rule.carried(carrying, false, X);
+        assert_eq!((rule.generation(), rule.by(), rule.busy(0)), (1, None, false));
+        // The state it was made against still stands: the next command made against it is
+        // carried out, and one that does change the player is the one that made the state.
+        assert_eq!(command(&mut rule, seen, 0, Y), Ok(()));
+        assert_eq!((rule.generation(), rule.by()), (2, Some(Y)));
+        // It is said once. Said again, and as having changed something: what is said to
+        // have changed has changed, and no command is named as having made the state.
+        rule.carried(carrying, true, X);
+        assert_eq!((rule.generation(), rule.by()), (3, None));
+        // A player that takes longer than the command was given: the command is given up,
+        // another is let in; what the player then says it changed has changed all the same.
+        let mut rule = Rule::default();
+        let seen = at(&rule, 0);
+        let reservation = rule.admit(seen, 0, 0).unwrap();
+        let carrying = rule.finish(reservation, seen, 0, 0, true).unwrap();
+        assert!(!rule.busy(OPEN_MS));
+        let next = rule.admit(seen, 0, OPEN_MS).unwrap();
+        rule.carried(carrying, true, X);
+        assert_eq!((rule.generation(), rule.by()), (2, None));
+        // And the one let in meanwhile was made against a state that is no longer there.
+        assert_eq!(finish(&mut rule, next, seen, 0, OPEN_MS, true, Y), Err(Why::Changed));
     }
 
     /// A command is accepted, and whatever was to be done for it never comes back.
@@ -216,15 +290,15 @@ mod tests {
         assert_eq!(rule.admit(seen, 0, 1_000 + OPEN_MS - 1), Err(Why::Busy));
         // From then it is not; and the work coming back at last carries nothing out.
         assert!(!rule.busy(1_000 + OPEN_MS));
-        assert_eq!(rule.clone().finish(reservation, seen, 0, 1_000 + OPEN_MS, true, X), Err(Why::Late));
+        assert_eq!(finish(&mut rule.clone(), reservation, seen, 0, 1_000 + OPEN_MS, true, X), Err(Why::Late));
         assert_eq!((rule.generation(), rule.by()), (1, None));
         // Another command is accepted in its place, and the first can no longer be the one
         // that is open, however soon its work then comes back.
         let later = rule.admit(seen, 0, 1_000 + OPEN_MS).unwrap();
-        assert_eq!(rule.finish(reservation, seen, 0, 1_000 + OPEN_MS, true, X), Err(Why::Changed));
+        assert_eq!(finish(&mut rule, reservation, seen, 0, 1_000 + OPEN_MS, true, X), Err(Why::Changed));
         // (Which touched nothing of the one that is open: it is carried out as it would be.)
         assert!(rule.busy(1_000 + OPEN_MS));
-        assert_eq!(rule.finish(later, seen, 0, 1_000 + OPEN_MS + 5, true, Y), Ok(()));
+        assert_eq!(finish(&mut rule, later, seen, 0, 1_000 + OPEN_MS + 5, true, Y), Ok(()));
         assert_eq!((rule.generation(), rule.by(), rule.busy(1_000 + OPEN_MS + 5)), (2, Some(Y), false));
     }
 
@@ -239,13 +313,13 @@ mod tests {
         rule.refuse(reservation);
         assert_eq!((rule.busy(0), rule.generation(), rule.by()), (false, 1, None));
         // It cannot be finished afterwards, and the next command is taken as usual.
-        assert_eq!(rule.finish(reservation, seen, 0, 0, true, X), Err(Why::Changed));
+        assert_eq!(finish(&mut rule, reservation, seen, 0, 0, true, X), Err(Why::Changed));
         assert_eq!(command(&mut rule, seen, 0, Y), Ok(()));
         // Letting go of a command that is not the open one touches nothing.
         let open = rule.admit(at(&rule, 0), 0, 0).unwrap();
         rule.refuse(reservation);
         assert!(rule.busy(0));
-        assert_eq!(rule.finish(open, At { generation: 2, minute: 0 }, 0, 0, true, X), Ok(()));
+        assert_eq!(finish(&mut rule, open, At { generation: 2, minute: 0 }, 0, 0, true, X), Ok(()));
     }
 
     #[test]
@@ -295,7 +369,7 @@ mod tests {
         let seen = at(&rule, 5);
         let reservation = rule.admit(seen, 6, 0).unwrap();
         assert!(rule.busy(0));
-        assert_eq!(rule.finish(reservation, seen, 7, 0, true, X), Err(Why::Late));
+        assert_eq!(finish(&mut rule, reservation, seen, 7, 0, true, X), Err(Why::Late));
         assert_eq!((rule.by(), rule.busy(0), rule.generation()), (None, false, 1));
     }
 
@@ -353,7 +427,7 @@ mod tests {
         // Its time is up. Nothing changed meanwhile, so the command stands.
         assert!(!rule.busy(61_000));
         let reservation = rule.admit(seen, 1, 61_000).unwrap();
-        assert_eq!(rule.finish(reservation, seen, 1, 61_000, true, X), Ok(()));
+        assert_eq!(finish(&mut rule, reservation, seen, 1, 61_000, true, X), Ok(()));
         // However many are left waiting, only so many count, and each for its own time.
         let mut rule = Rule::default();
         for n in 0..100 {
@@ -369,7 +443,7 @@ mod tests {
         let seen = at(&rule, 0);
         let reservation = rule.admit(seen, 0, 0).unwrap();
         rule.moved();
-        assert_eq!(rule.finish(reservation, seen, 0, 0, true, X), Err(Why::Changed));
+        assert_eq!(finish(&mut rule, reservation, seen, 0, 0, true, X), Err(Why::Changed));
         assert_eq!((rule.by(), rule.busy(0)), (None, false));
     }
 
@@ -393,7 +467,7 @@ mod tests {
         let mut rule = Rule::default();
         let first = rule.admit(seen, 0, 0).unwrap();
         assert_eq!(rule.admit(seen, 0, 0), Err(Why::Busy));
-        assert_eq!(rule.finish(first, seen, 0, 0, true, X), Ok(()));
+        assert_eq!(finish(&mut rule, first, seen, 0, 0, true, X), Ok(()));
     }
 
     #[test]
@@ -412,7 +486,7 @@ mod tests {
         let mut rule = Rule::default();
         let seen = at(&rule, 0);
         let reservation = rule.admit(seen, 0, 0).unwrap();
-        assert_eq!(rule.finish(reservation, seen, 0, 0, false, X), Err(Why::Cannot));
+        assert_eq!(finish(&mut rule, reservation, seen, 0, 0, false, X), Err(Why::Cannot));
         // It is not carried out and not named, and the device is as it was and free.
         assert_eq!((rule.by(), rule.busy(0), rule.generation()), (None, false, 1));
     }
@@ -423,15 +497,15 @@ mod tests {
         let mut rule = Rule::default();
         let seen = at(&rule, 0);
         let reservation = rule.admit(seen, 0, 0).unwrap();
-        assert_eq!(rule.finish(reservation, seen, 0, 0, true, X), Ok(()));
+        assert_eq!(finish(&mut rule, reservation, seen, 0, 0, true, X), Ok(()));
         // The same reservation again: the player must not be changed a second time.
-        assert_eq!(rule.finish(reservation, seen, 0, 0, true, X), Err(Why::Changed));
+        assert_eq!(finish(&mut rule, reservation, seen, 0, 0, true, X), Err(Why::Changed));
         assert_eq!((rule.generation(), rule.by()), (2, Some(X)));
         // One that was refused at the last step is over too.
         let seen = at(&rule, 0);
         let reservation = rule.admit(seen, 0, 0).unwrap();
-        assert_eq!(rule.finish(reservation, seen, 5, 0, true, Y), Err(Why::Late));
-        assert_eq!(rule.finish(reservation, seen, 0, 0, true, Y), Err(Why::Changed));
+        assert_eq!(finish(&mut rule, reservation, seen, 5, 0, true, Y), Err(Why::Late));
+        assert_eq!(finish(&mut rule, reservation, seen, 0, 0, true, Y), Err(Why::Changed));
         assert_eq!((rule.generation(), rule.by()), (2, Some(X)));
     }
 

@@ -123,6 +123,8 @@ pub fn outcome(outcome: Outcome, name: &str) -> String {
         Outcome::Refused(Why::Busy) => format!("{name} was in the middle of something. Nothing was done."),
         Outcome::Refused(Why::Late) => format!("That took too long to reach {name}. Nothing was done."),
         Outcome::Refused(Why::Invalid | Why::Cannot) => format!("{name} couldn't do that."),
+        // (Never said as a refusal; and if it were, there would be nothing to tell.)
+        Outcome::Refused(Why::Nothing) => String::new(),
         Outcome::NotReached => format!("That hadn't reached {name} when checked."),
         Outcome::Unknown => format!("{name} changed, or didn't answer. Check what is playing before you press again."),
     }
@@ -141,7 +143,8 @@ pub fn gave(gave: Gave, name: &str, left: usize, sent: usize, here: Here) -> Str
         // (Before the queue reached it, or after it took the queue and before it sounded.)
         Gave::Stayed(Why::Changed) => format!("{name} was given something else to do before it started. Still playing here."),
         Gave::Stayed(Why::Late) => format!("That took too long to reach {name}, so nothing was moved. Still playing here."),
-        Gave::Stayed(Why::Cannot | Why::Invalid) => format!("{name} couldn't play that. Still playing here."),
+        // (A queue to take over is never "nothing to do": if that is ever said of one, it was not taken.)
+        Gave::Stayed(Why::Cannot | Why::Invalid | Why::Nothing) => format!("{name} couldn't play that. Still playing here."),
         Gave::NotReached => format!("That hadn't reached {name} when checked. Still playing here; {name} may yet start."),
         Gave::Unknown => format!("{name} didn't answer. Still playing here; check whether {name} started too."),
     }

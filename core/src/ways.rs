@@ -74,6 +74,8 @@ pub struct Ways {
     who: Option<Who>,
     counted: bool,
     claimed: bool,
+    /// A way in has been taken in the choice under way.
+    taken: bool,
 }
 
 impl Ways {
@@ -84,7 +86,7 @@ impl Ways {
     /// Ended by [`Ways::end`]. Inside a choice that is already under way it is part of that.
     pub fn begin(&mut self, who: Who, counted: bool) {
         if self.depth == 0 {
-            (self.who, self.counted, self.claimed) = (Some(who), counted, false);
+            (self.who, self.counted, self.claimed, self.taken) = (Some(who), counted, false, false);
         }
         self.depth = self.depth.saturating_add(1);
     }
@@ -96,6 +98,7 @@ impl Ways {
             (self.who, self.counted, self.claimed) = (Some(who), false, false);
         }
         self.depth = self.depth.saturating_add(1);
+        self.taken = true;
         let count = !std::mem::replace(&mut self.counted, true);
         let claim = what == What::Playing && self.who != Some(Who::Nobody) && !std::mem::replace(&mut self.claimed, true);
         Owed { count, claim }
@@ -119,6 +122,14 @@ impl Ways {
     /// Whose choice is under way, if one is.
     pub fn whose(&self) -> Option<Who> {
         self.who
+    }
+
+    /// Whether the choice under way has taken any way in yet: whether carrying it out has
+    /// changed anything. A way in is taken only once it is known that something will
+    /// change, so a choice that reaches the player and finds nothing to do (Play when it
+    /// is playing, a seek on a radio, Next with nothing to go to) has taken none.
+    pub fn taken(&self) -> bool {
+        self.depth > 0 && self.taken
     }
 }
 
@@ -167,8 +178,19 @@ mod tests {
         ways.begin(Who::Elsewhere, false);
         assert_eq!(ways.touch(Who::Here, What::Playing), BOTH);
         ways.end();
-        // One that comes to nothing (an entry that has gone) owes nothing.
+        // One that comes to nothing (an entry that has gone) owes nothing, and is known to
+        // have changed nothing; one that takes a way in is known to have.
         ways.begin(Who::Elsewhere, true);
+        assert!(!ways.taken());
+        ways.end();
+        ways.begin(Who::Elsewhere, true);
+        ways.touch(Who::Here, What::Manner);
+        assert!(ways.taken());
+        ways.end();
+        assert!(!ways.taken());
+        // (What was taken by the choice before is not this one's.)
+        ways.begin(Who::Guest, false);
+        assert!(!ways.taken());
         ways.end();
         assert_eq!(ways.whose(), None);
         // And afterwards a press is a press.
@@ -212,7 +234,7 @@ mod tests {
     /// when as many endings have come.
     #[test]
     fn beginnings_without_endings_cannot_run_it_out() {
-        let mut ways = Ways { depth: u32::MAX - 1, who: Some(Who::Guest), counted: true, claimed: true };
+        let mut ways = Ways { depth: u32::MAX - 1, who: Some(Who::Guest), counted: true, claimed: true, taken: false };
         ways.begin(Who::Elsewhere, false);
         assert_eq!(ways.enter(Who::Here, What::Playing), NOTHING);
         ways.begin(Who::Here, false);

@@ -30,7 +30,7 @@ use super::look::{Looked, ends_session};
 use super::message::{Ask, At, Full, Handed, Tell, Want, Why, read_ask, read_tell};
 use super::moving::{Adopted, Adopting, Gave, Giving, START_MS, Taking, Took};
 use super::news::News;
-use super::rule::{self, Reservation, Waiting};
+use super::rule::{self, Carrying, Reservation, Waiting};
 use super::secret::{self, Secret};
 use super::seen::{self, Seen as Remembered};
 use super::steer::{Outcome, Peer, Press as Pressed, Tick, Told, Wait};
@@ -90,9 +90,10 @@ pub trait Player {
     /// The ids of the songs to come, in the order they would play.
     fn ahead(&self) -> Vec<String>;
     /// Carries a command out, exactly as the same press on this device would be, on this
-    /// device only. The command has taken its place in the order of choices already: what
-    /// the player does for it is not counted again.
-    fn carry_out(&mut self, command: &Command, ready: &Ready);
+    /// device only, **and says whether it changed anything**: a Play when it was playing, a
+    /// seek on a radio, a Next with nothing to go to, change nothing. What the player does
+    /// for it is not counted by the player: the rule counts it, once, if it changed anything.
+    fn carry_out(&mut self, command: &Command, ready: &Ready) -> bool;
     /// Stops this device's own sound, and counts it as a change.
     fn pause(&mut self);
     /// Takes a queue brought from another device and plays it, counted as a change: each
@@ -105,7 +106,8 @@ pub trait Player {
     fn busy(&self, now_ms: u64) -> bool;
     fn by(&self) -> Option<Nonce>;
     fn admit(&mut self, at: At, minute: u64, now_ms: u64) -> Result<Reservation, Why>;
-    fn finish(&mut self, reservation: Reservation, at: At, minute: u64, now_ms: u64, same_session: bool, nonce: Nonce) -> Result<(), Why>;
+    fn finish(&mut self, reservation: Reservation, at: At, minute: u64, now_ms: u64, same_session: bool) -> Result<Carrying, Why>;
+    fn carried(&mut self, carrying: Carrying, changed: bool, nonce: Nonce);
     fn refuse(&mut self, reservation: Reservation);
     fn wait(&mut self, now_ms: u64, for_ms: u64) -> Waiting;
     fn done(&mut self, waiting: Waiting);
@@ -879,10 +881,24 @@ impl Device {
         Device::catch_up(env, out);
         let now = env.now_ms;
         let same_session = self.is_live(session, now);
-        if let Err(why) = env.player.finish(reservation, at, minute(now), now, same_session, nonce) {
-            return self.refused(session, from, nonce, &command, at, why, env, out);
+        let carrying = match env.player.finish(reservation, at, minute(now), now, same_session) {
+            Ok(carrying) => carrying,
+            Err(why) => return self.refused(session, from, nonce, &command, at, why, env, out),
+        };
+        let changed = env.player.carry_out(&command, &ready);
+        env.player.carried(carrying, changed, nonce);
+        if !changed {
+            // The player did nothing. Either it was already as the command asked, which is
+            // no fault and is said as such; or it could not do it. Nothing has moved.
+            return match command {
+                Command::Play | Command::Pause | Command::Volume { .. } | Command::Shuffle { .. } | Command::Repeat { .. } | Command::Clear { .. } => {
+                    out.push(Do::Log(format!("{} from {} against generation {}: nothing to do, it was so already", command.name(), text::place(&from), at.generation)));
+                    let answer = self.state(Some(nonce), Some(true), Some(Why::Nothing), env);
+                    self.answer(session, from, answer, env, out);
+                }
+                _ => self.refused(session, from, nonce, &command, at, Why::Cannot, env, out),
+            };
         }
-        env.player.carry_out(&command, &ready);
         out.push(Do::Log(format!("{} from {} against generation {}: carried out", command.name(), text::place(&from), at.generation)));
         if matches!(command, Command::Adopt(_)) {
             // It answers "carried out" when its sound has started, and is busy until then.
