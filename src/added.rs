@@ -1,173 +1,102 @@
 //! When songs were added to playlists.
 //!
 //! The server doesn't record this, so the app keeps its own note. The first time it sees a
-//! playlist, the songs already in it have no known date. From then on, a song that turns up
-//! in the playlist is dated to when the app added it, or first saw it there. Dated notes are
-//! shared with the app on other devices (see `sync`).
+//! playlist, the songs already in it have no known date. From then on, a song the person
+//! adds here is dated to when it was added, and the dated notes are shared with the app on
+//! other devices (see `sync`). A song that only turns up in the playlist (added on another
+//! device, or in another app) is shown as first seen then, on this PC alone: what is merely
+//! noticed is never dated for the other devices, who may know the real date.
+//!
+//! What a note means, and when one gets a date, is the library's (`nexus_core::notes`), the
+//! same for every app. This is the file it is kept in.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 
-use serde::{Deserialize, Serialize};
-
 use crate::subsonic::Song;
 
-#[cfg(test)]
-use nexus_core::notes::merge_notes;
-pub use nexus_core::notes::{KEEP_REMOVED, Note, Notes};
-
-#[derive(Default, Serialize, Deserialize)]
-#[serde(default)]
-struct Stored {
-    lists: Notes,
-    seen: HashSet<String>,
-}
+pub use nexus_core::notes::Notes;
+use nexus_core::notes::{Kept, Note};
+pub use nexus_core::time::parse_time;
 
 #[derive(Default)]
 pub struct Added {
     path: PathBuf,
-    /// Playlist id, then song id.
-    lists: Notes,
-    /// Playlists this device has looked at. Songs found in one on the first look can't be
-    /// dated; songs that appear in it later can.
-    seen: HashSet<String>,
+    kept: Kept,
+}
+
+fn ids(songs: &[Song]) -> Vec<&str> {
+    songs.iter().map(|song| song.id.as_str()).collect()
 }
 
 impl Added {
     pub fn load(path: PathBuf) -> Added {
         let bytes = fs::read(&path).unwrap_or_default();
-        let stored: Stored = match serde_json::from_slice::<Stored>(&bytes) {
-            Ok(stored) if !stored.lists.is_empty() || !stored.seen.is_empty() => stored,
-            // The file as written before notes were shared: just the times.
+        let kept: Kept = match serde_json::from_slice::<Kept>(&bytes) {
+            Ok(kept) if !kept.lists.is_empty() || !kept.seen.is_empty() => kept,
+            // The file as written before notes were shared: just the times, which were when
+            // this PC first saw each song. They are kept for its own display, with no time
+            // on the note: never shared.
             _ => match serde_json::from_slice::<HashMap<String, HashMap<String, Vec<i64>>>>(&bytes) {
-                Ok(old) => Stored {
+                Ok(old) => Kept {
                     seen: old.keys().cloned().collect(),
                     lists: old
                         .into_iter()
-                        .map(|(playlist, songs)| {
-                            let notes = songs
-                                .into_iter()
-                                .map(|(id, times)| {
-                                    let at = times.iter().copied().max().unwrap_or(0);
-                                    (id, Note { times, at })
-                                })
-                                .collect();
-                            (playlist, notes)
-                        })
+                        .map(|(playlist, songs)| (playlist, songs.into_iter().map(|(id, times)| (id, Note { times, at: 0 })).collect()))
                         .collect(),
                 },
-                Err(_) => Stored::default(),
+                Err(_) => Kept::default(),
             },
         };
-        Added { path, lists: stored.lists, seen: stored.seen }
+        Added { path, kept }
     }
 
     fn save(&self) {
-        // Borrowed fields can't go straight into `Stored`, so write the same shape by hand.
-        let stored = serde_json::json!({ "lists": self.lists, "seen": self.seen });
-        if let Ok(json) = serde_json::to_vec(&stored) {
-            let temp = self.path.with_extension("tmp");
-            if fs::write(&temp, json).is_ok() {
-                let _ = fs::rename(&temp, &self.path);
-            }
+        if let Ok(json) = serde_json::to_vec(&self.kept) {
+            crate::config::write_atomically(&self.path, &json);
         }
     }
 
-    /// Brings the notes for a playlist in step with the songs now in it, as just read from
-    /// the server. Songs it didn't have before are dated `now`, unless this is the first
-    /// look at the playlist. Returns whether anything worth sharing changed.
-    pub fn observe(&mut self, playlist: &str, songs: &[Song], now: i64) -> bool {
-        let mut counts: HashMap<&str, usize> = HashMap::new();
-        for song in songs {
-            *counts.entry(song.id.as_str()).or_default() += 1;
-        }
-        let first_look = self.seen.insert(playlist.to_string());
-        let notes = self.lists.entry(playlist.to_string()).or_default();
-        let mut changed = first_look;
-        let mut shared = false;
-        // Songs that have gone: a dated note stays, emptied, so other devices hear of it.
-        notes.retain(|id, note| {
-            if counts.contains_key(id.as_str()) {
-                return true;
-            }
-            changed = true;
-            if note.at == 0 {
-                return false;
-            }
-            if !note.times.is_empty() {
-                note.times.clear();
-                note.at = now;
-                shared = true;
-            }
-            now - note.at < KEEP_REMOVED
-        });
-        for (id, count) in counts {
-            let known = notes.contains_key(id);
-            let note = notes.entry(id.to_string()).or_default();
-            if note.times.len() == count {
-                continue;
-            }
-            changed = true;
-            if first_look {
-                // Copies nothing is known about go in front, as the oldest.
-                while note.times.len() < count {
-                    note.times.insert(0, 0);
-                }
-                note.times.truncate(count);
-            } else {
-                note.times.resize(count, now);
-            }
-            if known || !first_look {
-                note.at = now;
-                shared = true;
-            }
-        }
-        if changed {
+    /// Notes what a playlist holds, as just read from the server, for this PC's own "Date
+    /// added". Nothing it notes is shared.
+    pub fn notice(&mut self, playlist: &str, songs: &[Song], now: i64) {
+        if self.kept.notice(playlist, &ids(songs), now) {
             self.save();
         }
-        shared
     }
 
-    /// Notes songs the app has just added to a playlist.
+    /// Songs the person has just added to a playlist here, and the server has taken.
     pub fn record(&mut self, playlist: &str, ids: &[String], now: i64) {
-        let notes = self.lists.entry(playlist.to_string()).or_default();
-        for id in ids {
-            let note = notes.entry(id.clone()).or_default();
-            note.times.push(now);
-            note.at = now;
-        }
+        self.kept.added(playlist, ids, now);
         self.save();
+    }
+
+    /// A change the person has just made to a playlist here, and the server has taken:
+    /// `before` is the playlist as the change was worked out from, `after` what the change
+    /// made of it. Returns whether there is anything to tell the other devices.
+    pub fn changed(&mut self, playlist: &str, before: &[String], after: &[String], now: i64) -> bool {
+        let shared = self.kept.changed(playlist, before, after, now);
+        self.save();
+        shared
     }
 
     /// Notes songs added to a playlist at known times, as when a playlist is brought over
     /// from somewhere that kept them. `fresh` says the app has just made the playlist, with
     /// nothing else in it.
     pub fn record_at(&mut self, playlist: &str, songs: &[(String, i64)], fresh: bool, now: i64) {
-        if fresh {
-            self.lists.remove(playlist);
-            self.seen.insert(playlist.to_string());
-        }
-        let notes = self.lists.entry(playlist.to_string()).or_default();
-        for (id, at) in songs {
-            let note = notes.entry(id.clone()).or_default();
-            note.times.push(if *at > 0 { *at } else { now });
-            note.times.sort_unstable();
-            note.at = now;
-        }
+        self.kept.added_at(playlist, songs, fresh, now);
         self.save();
     }
 
     /// Notes a playlist the app has just created with these songs in it.
     pub fn create(&mut self, playlist: &str, ids: &[String], now: i64) {
-        self.lists.remove(playlist);
-        self.seen.insert(playlist.to_string());
-        self.record(playlist, ids, now);
+        self.kept.create(playlist, ids, now);
+        self.save();
     }
 
     pub fn forget(&mut self, playlist: &str) {
-        let known = self.seen.remove(playlist);
-        if self.lists.remove(playlist).is_some() || known {
+        if self.kept.forget(playlist) {
             self.save();
         }
     }
@@ -175,49 +104,19 @@ impl Added {
     /// The time each of these songs was added to the playlist, in the same order; 0 where
     /// it isn't known.
     pub fn dates(&self, playlist: &str, songs: &[Song]) -> Vec<i64> {
-        let notes = self.lists.get(playlist);
-        let mut seen: HashMap<&str, usize> = HashMap::new();
-        songs
-            .iter()
-            .map(|song| {
-                let copy = seen.entry(song.id.as_str()).or_default();
-                *copy += 1;
-                notes
-                    .and_then(|n| n.get(&song.id))
-                    .and_then(|note| note.times.get(*copy - 1))
-                    .copied()
-                    .unwrap_or(0)
-            })
-            .collect()
+        self.kept.dates(playlist, &ids(songs))
     }
 
     /// The notes worth sharing with other devices: the dated ones, for playlists that still
     /// exist (when `playlists` lists them).
     pub fn shared(&self, playlists: Option<&HashSet<&str>>) -> Notes {
-        self.lists
-            .iter()
-            .filter(|(playlist, _)| playlists.is_none_or(|known| known.contains(playlist.as_str())))
-            .map(|(playlist, notes)| {
-                let dated = notes.iter().filter(|(_, note)| note.at > 0).map(|(id, note)| (id.clone(), note.clone()));
-                (playlist.clone(), dated.collect::<HashMap<_, _>>())
-            })
-            .filter(|(_, notes)| !notes.is_empty())
-            .collect()
+        self.kept.shared(playlists)
     }
 
     /// Takes in notes from other devices: for each song, the newer note wins. Returns
     /// whether anything changed here.
     pub fn merge(&mut self, theirs: &Notes) -> bool {
-        let mut changed = false;
-        for (playlist, notes) in theirs {
-            let mine = self.lists.entry(playlist.clone()).or_default();
-            for (id, note) in notes {
-                if mine.get(id).is_none_or(|have| note.at > have.at) {
-                    mine.insert(id.clone(), note.clone());
-                    changed = true;
-                }
-            }
-        }
+        let changed = self.kept.take(theirs);
         if changed {
             self.save();
         }
@@ -255,11 +154,6 @@ pub fn day_start(at: i64) -> i64 {
         .unwrap_or(at)
 }
 
-/// Reads a time as the server writes it, e.g. "2024-03-09T10:15:00Z"; 0 if it isn't one.
-pub fn parse_time(text: &str) -> i64 {
-    chrono::DateTime::parse_from_rfc3339(text).map(|time| time.timestamp()).unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,61 +169,30 @@ mod tests {
     }
 
     #[test]
-    fn dates_songs_added_after_the_first_look() {
+    fn keeps_its_notes_between_runs() {
         let path = scratch("dates");
         let mut added = Added::load(path.clone());
         // Songs already there on the first look have no date, and nothing to share.
-        assert!(!added.observe("p", &songs(&["a", "b"]), 100));
+        added.notice("p", &songs(&["a", "b"]), 100);
         assert_eq!(added.dates("p", &songs(&["a", "b"])), [0, 0]);
+        // One that turns up later is shown as first seen then, here; it is not shared.
+        added.notice("p", &songs(&["a", "b", "c"]), 200);
+        assert_eq!(added.dates("p", &songs(&["a", "b", "c"])), [0, 0, 200]);
         assert!(added.shared(None).is_empty());
-        // One that turns up later is dated to when it was seen; a second copy gets its own.
-        assert!(added.observe("p", &songs(&["a", "b", "c", "a"]), 200));
-        assert_eq!(added.dates("p", &songs(&["a", "b", "c", "a"])), [0, 0, 200, 200]);
-        // Songs the app adds itself are dated at once, and looking again changes nothing.
+        // Songs the person adds here are dated at once, and shared; so is one taken out.
         added.record("p", &["d".to_string()], 300);
-        assert!(!added.observe("p", &songs(&["a", "b", "c", "a", "d"]), 400));
-        assert_eq!(added.dates("p", &songs(&["d", "c", "a", "b", "a"])), [300, 200, 0, 0, 200]);
-        // Removed songs are forgotten, so adding one again dates it afresh.
-        added.observe("p", &songs(&["a", "b"]), 500);
-        added.observe("p", &songs(&["a", "b", "c"]), 600);
-        assert_eq!(added.dates("p", &songs(&["a", "b", "c"])), [0, 0, 600]);
+        let list = |ids: &[&str]| ids.iter().map(|id| id.to_string()).collect::<Vec<_>>();
+        assert!(added.changed("p", &list(&["a", "b", "c", "d"]), &list(&["a", "b", "c"]), 400));
+        assert_eq!(added.shared(None)["p"]["d"], Note { times: vec![], at: 400 });
         // It survives a restart.
-        let again = Added::load(path.clone());
-        assert_eq!(again.dates("p", &songs(&["a", "b", "c"])), [0, 0, 600]);
-        // A song added to a playlist not yet looked at keeps its date through the first look.
-        added.record("q", &["a".to_string()], 700);
-        added.observe("q", &songs(&["x", "a", "a"]), 800);
-        assert_eq!(added.dates("q", &songs(&["x", "a", "a"])), [0, 0, 700]);
+        let mut again = Added::load(path.clone());
+        assert_eq!(again.dates("p", &songs(&["a", "b", "c"])), [0, 0, 200]);
+        assert_eq!(again.shared(None), added.shared(None));
+        // Notes from another device are taken in, and kept.
+        let theirs = Notes::from([("p".to_string(), HashMap::from([("c".to_string(), Note { times: vec![150], at: 150 })]))]);
+        assert!(again.merge(&theirs) && !again.merge(&theirs));
+        assert_eq!(Added::load(path.clone()).dates("p", &songs(&["a", "b", "c"])), [0, 0, 150]);
         let _ = fs::remove_dir_all(path.parent().unwrap());
-    }
-
-    #[test]
-    fn notes_travel_between_devices() {
-        let (path_a, path_b) = (scratch("a"), scratch("b"));
-        let (mut a, mut b) = (Added::load(path_a.clone()), Added::load(path_b.clone()));
-        a.observe("p", &songs(&["x", "y"]), 100);
-        a.record("p", &["z".to_string()], 200);
-        // The other device hears of the dated song before it ever opens the playlist...
-        assert!(b.merge(&a.shared(None)));
-        assert!(!b.merge(&a.shared(None)));
-        // ...so its first look keeps that date, and has nothing new to say.
-        assert!(!b.observe("p", &songs(&["x", "y", "z"]), 300));
-        assert_eq!(b.dates("p", &songs(&["x", "y", "z"])), [0, 0, 200]);
-        // A removal seen on one device reaches the other, and a later re-add is dated anew.
-        assert!(b.observe("p", &songs(&["x", "y"]), 400));
-        assert!(a.merge(&b.shared(None)));
-        assert!(a.observe("p", &songs(&["x", "y", "z"]), 500));
-        assert_eq!(a.dates("p", &songs(&["x", "y", "z"])), [0, 0, 500]);
-        // Notes for playlists that no longer exist aren't passed on.
-        let known: HashSet<&str> = ["other"].into();
-        assert!(a.shared(Some(&known)).is_empty());
-        // Combining is the same whichever way round, and old removals drop out in time.
-        let (notes_a, notes_b) = (a.shared(None), b.shared(None));
-        assert_eq!(merge_notes(&notes_a, &notes_b, 600), merge_notes(&notes_b, &notes_a, 600));
-        assert!(merge_notes(&b.shared(None), &Notes::new(), 400 + KEEP_REMOVED + 1).is_empty());
-        for path in [path_a, path_b] {
-            let _ = fs::remove_dir_all(path.parent().unwrap());
-        }
     }
 
     #[test]
@@ -338,17 +201,30 @@ mod tests {
         fs::write(&path, r#"{"p":{"a":[0],"b":[0,250]}}"#).unwrap();
         let mut added = Added::load(path.clone());
         assert_eq!(added.dates("p", &songs(&["a", "b", "b"])), [0, 0, 250]);
-        // It counts as looked at, so a new song is dated.
-        added.observe("p", &songs(&["a", "b", "b", "c"]), 300);
+        // What that version dated was what it had noticed: nothing of it is shared.
+        assert!(added.shared(None).is_empty());
+        // It counts as looked at, so a new song is shown as seen now.
+        added.notice("p", &songs(&["a", "b", "b", "c"]), 300);
         assert_eq!(added.dates("p", &songs(&["c"])), [300]);
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
-    fn reads_server_times() {
-        assert_eq!(parse_time("1970-01-02T00:00:00Z"), 86400);
-        assert_eq!(parse_time("1970-01-02T00:00:00.123456789Z"), 86400);
-        assert_eq!(parse_time(""), 0);
+    fn reads_the_file_a_version_that_dated_what_it_noticed_wrote() {
+        // 0.40.4's file: a dated note (already shared with every device, whatever it was
+        // dated by) and one from a first look. Neither is lost, and neither given a new time.
+        let path = scratch("stamped");
+        fs::write(&path, r#"{"lists":{"p":{"a":{"times":[0],"at":0},"b":{"times":[250],"at":250}}},"seen":["p"]}"#).unwrap();
+        let mut added = Added::load(path.clone());
+        assert_eq!(added.dates("p", &songs(&["a", "b"])), [0, 250]);
+        assert_eq!(added.shared(None)["p"], HashMap::from([("b".to_string(), Note { times: vec![250], at: 250 })]));
+        added.notice("p", &songs(&["a", "b"]), 900);
+        assert_eq!(added.shared(None)["p"]["b"], Note { times: vec![250], at: 250 });
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_time_nobody_knows_has_no_label() {
         assert_eq!(date_label(0), "");
     }
 }

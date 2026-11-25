@@ -746,6 +746,14 @@ impl Controller {
             post(move |ctl| {
                 let key = format!("playlist:{id}");
                 let showing = ctl.current_route() == Some(Route::Playlist(id.clone()));
+                // The person's own change, taken by the server: what it added is dated, and
+                // what it took out is told to the other devices. (Only what the change itself
+                // did: whatever else the playlist gained meanwhile is not this PC's to date.)
+                if let Ok(Outcome::Done { before, after, .. }) = &result {
+                    if ctl.added.borrow_mut().changed(&id, before, after, chrono::Utc::now().timestamp()) {
+                        ctl.share_soon();
+                    }
+                }
                 match result {
                     // It had changed elsewhere: show how it stands now. Either way its length
                     // and running time on the page want bringing up to date.
@@ -3147,13 +3155,12 @@ impl Controller {
             .collect()
     }
 
-    /// Notes which songs a playlist has, as just read from the server, so ones that turn
-    /// up later can be dated.
+    /// Notes which songs a playlist has, as just read from the server, so this PC can show
+    /// when it first saw the ones that turn up later. (For its own display: what is only
+    /// noticed is never dated for the other devices.)
     fn observe_playlist(&self, page: &PageData) {
         if let Some(playlist) = &page.playlist {
-            if self.added.borrow_mut().observe(&playlist.id, &page.songs, chrono::Utc::now().timestamp()) {
-                self.share_soon();
-            }
+            self.added.borrow_mut().notice(&playlist.id, &page.songs, chrono::Utc::now().timestamp());
         }
     }
 
@@ -3188,9 +3195,7 @@ impl Controller {
     /// The order a playlist's page shows these songs in, as positions in `songs`. Playing
     /// the playlist from elsewhere (the sidebar, a menu) follows the same order.
     pub fn playlist_order(&self, id: &str, songs: &[Song]) -> Vec<usize> {
-        if self.added.borrow_mut().observe(id, songs, chrono::Utc::now().timestamp()) {
-            self.share_soon();
-        }
+        self.added.borrow_mut().notice(id, songs, chrono::Utc::now().timestamp());
         let (sort, descending) = self.list_sort(&format!("playlist:{id}"));
         let mut view = TrackView { sort, descending, ..Default::default() };
         view.arrange(songs, &self.playlist_dates(id, songs));

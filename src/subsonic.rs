@@ -1163,7 +1163,7 @@ mod tests {
         let page = shown();
         println!("X back: the playlist shows {} songs, the list of playlists counts {:?}", page.len(), counted());
         assert_eq!(page, [x.clone(), a.clone(), b.clone(), c.clone(), d.clone()]);
-        assert_eq!(carry_out(&client, &id, &page, &Edit::Remove(vec![spot(&page, 2)])).unwrap(), Outcome::Done { elsewhere: false });
+        assert!(matches!(carry_out(&client, &id, &page, &Edit::Remove(vec![spot(&page, 2)])).unwrap(), Outcome::Done { elsewhere: false, .. }));
         assert_eq!(shown(), [x, a, c, d]);
         client.delete_playlist(&id).unwrap();
     }

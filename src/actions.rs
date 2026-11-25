@@ -1183,9 +1183,7 @@ impl Controller {
                 // report whatever is wrong.
                 let Ok(playlist) = result else { return ctl.add_songs_to_playlist(playlist_id, songs) };
                 // Note what's in it now, so the songs about to be added can be told apart.
-                if ctl.added.borrow_mut().observe(&playlist_id, &playlist.songs, chrono::Utc::now().timestamp()) {
-                    ctl.share_soon();
-                }
+                ctl.added.borrow_mut().notice(&playlist_id, &playlist.songs, chrono::Utc::now().timestamp());
                 let present: std::collections::HashSet<&str> = playlist.songs.iter().map(|s| s.id.as_str()).collect();
                 let fresh: Vec<Song> = songs.iter().filter(|s| !present.contains(s.id.as_str())).cloned().collect();
                 let repeats = songs.len() - fresh.len();
