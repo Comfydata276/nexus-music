@@ -669,10 +669,29 @@ impl Controller {
         let note = self.startup_note.borrow_mut().take().or_else(|| {
             crashed.then(|| "The app stopped unexpectedly last time. “Save diagnostics” under Settings, About has what was noted.".to_string())
         });
+        // (Said once ever, with whatever else is said now.)
+        let links = config::no_links_note(&mut self.settings.borrow_mut().said_no_links);
+        if links.is_some() {
+            self.save_settings();
+        }
+        let note = match (note, links) {
+            (Some(note), Some(links)) => Some(format!("{note} {links}")),
+            (note, links) => note.or(links.map(str::to_string)),
+        };
         if let Some(note) = note {
             slint::Timer::single_shot(Duration::from_millis(1500), move || {
                 with(|ctl| ctl.show_toast(note.into(), "", Duration::from_secs(10)));
             });
+        }
+    }
+
+    /// Tells the person, once ever, that the settings folder's drive can't make hard links,
+    /// the first time that is found out after the app has started (`config::no_links_note`).
+    pub fn say_no_links_once(&self) {
+        let note = config::no_links_note(&mut self.settings.borrow_mut().said_no_links);
+        if let Some(note) = note {
+            self.save_settings();
+            self.show_toast(note.into(), "", Duration::from_secs(10));
         }
     }
 

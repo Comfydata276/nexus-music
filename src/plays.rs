@@ -38,6 +38,9 @@ pub struct PlayLog {
     unread: bool,
     /// There was no log, and one could not be started (`begin`, `note`).
     unstarted: bool,
+    /// Nor can it be on this drive, which can't make hard links: that is said once ever,
+    /// elsewhere (`config::no_links_note`), not at each start by the log.
+    no_links: bool,
 }
 
 /// The log is there and could not be read when the app started: what is counted is only
@@ -196,7 +199,7 @@ impl PlayLog {
     /// one fail).
     fn load_by(old: &Path, recent: &[(String, i64)], steps: &crate::config::Steps) -> PlayLog {
         let path = old.with_extension("log");
-        let mut log = PlayLog { path, lines: 0, aside: false, whole: true, unread: false, unstarted: false };
+        let mut log = PlayLog { path, lines: 0, aside: false, whole: true, unread: false, unstarted: false, no_links: false };
         if let Ok(mut sources) = SOURCES.write() {
             *sources = None;
         }
@@ -224,9 +227,10 @@ impl PlayLog {
                         Vec::new()
                     }
                 },
-                Err(_) => {
+                Err(error) => {
                     log.aside = true;
                     log.unstarted = true;
+                    log.no_links = error.kind() == std::io::ErrorKind::Unsupported;
                     Vec::new()
                 }
             },
@@ -269,7 +273,7 @@ impl PlayLog {
                 "The plays kept on this PC couldn't be read when the app started, so they have been left exactly as they are. “Your stats” counts only what's played from now until the app next starts; those plays are kept, and added to the rest then.",
             );
         }
-        self.unstarted.then_some(
+        (self.unstarted && !self.no_links).then_some(
             "The record of your plays on this PC couldn't be started, so “Your stats” counts only what's played from now on. Those plays are kept beside it, and starting it is tried again when the app next starts.",
         )
     }
@@ -308,8 +312,10 @@ impl PlayLog {
         let mut plays = carried.unwrap_or_else(|| recent.to_vec());
         plays.sort_by_key(|(_, at)| *at);
         let lines: String = plays.iter().map(|(song, at)| line(song, *at, "")).collect();
-        crate::config::write_whole(&self.path, lines.as_bytes(), steps)?;
-        if from_old {
+        // In place, the log is the log; the list goes only once its name will outlast a
+        // power cut (its folder synced), and is otherwise left, never to be read.
+        let placed = crate::config::write_whole(&self.path, lines.as_bytes(), steps)?;
+        if from_old && placed == crate::config::Placed::Synced {
             let _ = std::fs::remove_file(old);
         }
         Ok(plays)
@@ -536,7 +542,7 @@ mod tests {
         // between a check and a read for it to change in. And if one has appeared by the
         // time the new one is made, it is not written over.
         std::fs::write(&path, "[\"a\",100]\n").unwrap();
-        let log = PlayLog { path: path.clone(), lines: 0, aside: false, whole: true, unread: false, unstarted: false };
+        let log = PlayLog { path: path.clone(), lines: 0, aside: false, whole: true, unread: false, unstarted: false, no_links: false };
         assert!(log.begin(&old, &[play("z", 50)], &crate::config::ONCE).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "[\"a\",100]\n");
         std::fs::remove_file(&path).unwrap();
@@ -655,7 +661,7 @@ mod tests {
         // Plays that can't be written to the file are not counted as kept: the log is as it
         // was, here and on the disk. (A folder stands where the file should be.)
         let before = shared();
-        let mut blocked = PlayLog { path: std::env::temp_dir(), lines: before.len(), aside: false, whole: true, unread: false, unstarted: false };
+        let mut blocked = PlayLog { path: std::env::temp_dir(), lines: before.len(), aside: false, whole: true, unread: false, unstarted: false, no_links: false };
         assert!(blocked.keep(&[("never".to_string(), 500)], &[]).is_err());
         assert_eq!(shared(), before);
         // With nothing new there is nothing to write, and nothing to fail.
@@ -796,6 +802,46 @@ mod tests {
         // It is added on the saver's thread; and asked, the saver says it is there.
         assert_eq!(log.keep(&[], &[]).unwrap(), 0);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "[\"a\",100]\n[\"b\",200,\"playlist:p\"]\n");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_log_in_place_whose_folder_couldnt_be_synced_is_the_log_and_the_list_stays() {
+        use crate::config::{ONCE, Steps};
+        let _turn = turn();
+        let (old, path) = fresh("unsynced");
+        std::fs::write(&old, LIST).unwrap();
+        // Given its name, and the folder not synced: the log is there, and it is the log
+        // (read, and written to); but its name may not outlast a power cut, so the list it
+        // was made from isn't removed, and won't be, by anything (it is beside a log now).
+        let unsynced = Steps { sync_folder: |_| Err(std::io::Error::other("the disk said no")), ..ONCE };
+        let mut log = PlayLog::load_by(&old, &[play("z", 50)], &unsynced);
+        assert_eq!(shared(), [play("a", 100), play("b", 200), play("c", 300)]);
+        assert!(log.note().is_none());
+        log.add("d", 400, "");
+        crate::saver::saver().flush();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), format!("{LOGGED}[\"d\",400]\n"));
+        assert_eq!(std::fs::read_to_string(&old).unwrap(), LIST);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_log_that_cant_be_started_for_want_of_hard_links_says_so_once_and_not_at_every_start() {
+        use crate::config::{ONCE, Steps};
+        let _turn = turn();
+        let (old, path) = fresh("nolinks");
+        std::fs::write(&old, LIST).unwrap();
+        let no_links = Steps {
+            place: |_, _| {
+                crate::config::note_no_links();
+                Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "no hard links here"))
+            },
+            ..ONCE
+        };
+        // Not started, and played into the file beside it, as for any start that fails; but
+        // what is said is said once (`config::no_links_note`), not by the log at each start.
+        let log = PlayLog::load_by(&old, &[play("z", 50)], &no_links);
+        assert!(!path.exists() && log.note().is_none());
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

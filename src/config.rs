@@ -233,6 +233,9 @@ pub struct Settings {
     pub check_updates: bool,
     /// The newest version the user has already been told about.
     pub update_notified: String,
+    /// The person has been told that the settings folder's drive can't make hard links
+    /// (`no_links_note`).
+    pub said_no_links: bool,
 }
 
 impl Default for Settings {
@@ -298,6 +301,7 @@ impl Default for Settings {
             close_to_tray: true,
             check_updates: true,
             update_notified: String::new(),
+            said_no_links: false,
         }
     }
 }
@@ -683,7 +687,7 @@ pub fn save_history(path: &Path, history: &[Played]) {
 /// for a file written again and again: `write_surely`) does, `ONCE` (for a file made once and
 /// never replaced: the kept copy of the shared record, the start of the log of plays) never
 /// does, and gives `AlreadyExists` instead.
-pub fn write_whole(path: &Path, bytes: &[u8], steps: &Steps) -> std::io::Result<()> {
+pub fn write_whole(path: &Path, bytes: &[u8], steps: &Steps) -> std::io::Result<Placed> {
     let started = std::time::Instant::now();
     let written = write_whole_now(path, bytes, steps);
     flushed(path, started);
@@ -721,7 +725,15 @@ pub fn flushed(path: &Path, started: std::time::Instant) {
     }
 }
 
-fn write_whole_now(path: &Path, bytes: &[u8], steps: &Steps) -> std::io::Result<()> {
+/// A file written whole is in place: and its folder synced, or (Linux) not, so that its
+/// name may not outlast a power cut. Either way it is written: the file has changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Placed {
+    Synced,
+    Unsynced,
+}
+
+fn write_whole_now(path: &Path, bytes: &[u8], steps: &Steps) -> std::io::Result<Placed> {
     use std::io::Write;
     // A new file, never one that is there: a name of a killed run's that came round again
     // (the same process number, and its count) is passed over for the next.
@@ -747,14 +759,14 @@ fn write_whole_now(path: &Path, bytes: &[u8], steps: &Steps) -> std::io::Result<
         let _ = fs::remove_file(&temp);
     }
     placed?;
-    (steps.sync_folder)(path)
+    Ok(if (steps.sync_folder)(path).is_ok() { Placed::Synced } else { Placed::Unsynced })
 }
 
 /// `write_whole`, over whatever has the name: for what is written again and again (the
 /// settings, the queue, what waits to be sent, ...). A caller that has nothing to do about a
 /// failure leaves the error be: the file is then as it was.
 pub fn write_surely(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    write_whole(path, bytes, &REPLACING)
+    write_whole(path, bytes, &REPLACING).map(drop)
 }
 
 /// The name a write puts its file under, beside `path`, before it gives it the name: the
@@ -772,6 +784,28 @@ pub fn temp_for(path: &Path) -> PathBuf {
 /// version's names (`temp_for`) and the one name versions up to 0.40.10 used for each file
 /// (its stem, then `.tmp`). **Only when the app starts, before anything is written**: done
 /// later it could take a write's file from under it.
+/// The settings folder's drive can't make hard links (`place_new`, Linux), noted the first
+/// time a file made once is tried there.
+static NO_LINKS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn note_no_links() {
+    NO_LINKS.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// What to tell the person, **once ever** (`said` is kept in the settings), when the drive
+/// the settings are on can't make hard links: without them the files that are made once
+/// (the kept copy of the shared record, the start of the log of plays) can't be made safely
+/// on Linux, so they aren't made at all. Not each time it is tried, nor at each start.
+pub fn no_links_note(said: &mut bool) -> Option<&'static str> {
+    if *said || !NO_LINKS.load(std::sync::atomic::Ordering::SeqCst) {
+        return None;
+    }
+    *said = true;
+    Some(
+        "The drive this PC keeps Nexus Music's settings on can't make hard links, which the app needs on Linux to keep some files safely. So nothing is shared from this PC with your other devices, and “Your stats” counts only what's played while the app runs. Moving the settings to a drive formatted for Linux puts that right.",
+    )
+}
+
 pub fn clear_leftovers(dir: &Path, ours: &[&str]) {
     let Ok(entries) = fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
@@ -859,7 +893,15 @@ fn place_new(from: &Path, to: &Path) -> std::io::Result<()> {
 /// is cleared by the next attempt, and never read.)
 #[cfg(not(windows))]
 fn place_new(from: &Path, to: &Path) -> std::io::Result<()> {
-    fs::hard_link(from, to)?;
+    if let Err(error) = fs::hard_link(from, to) {
+        // A drive that can't make a second name for a file (FAT, exFAT, some network ones):
+        // "not permitted", "not supported", "too many links".
+        if error.kind() == std::io::ErrorKind::Unsupported || matches!(error.raw_os_error(), Some(1 | 31 | 95)) {
+            note_no_links();
+            return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, format!("this drive can't make hard links ({error})")));
+        }
+        return Err(error);
+    }
     let _ = fs::remove_file(from);
     Ok(())
 }
@@ -1099,9 +1141,11 @@ mod tests {
             assert_eq!(fs::read_to_string(&path).unwrap(), "as it was");
             assert_eq!(names_in(&dir), ["pending.json"]);
         }
-        // Renamed, and its folder not synced (Linux): in place, and an error all the same,
-        // for a caller that must know it will outlast a power cut.
-        assert!(write_whole(&path, b"new", &Steps { sync_folder: |_| fails(), ..REPLACING }).is_err());
+        // Renamed, and its folder not synced (Linux): it is in place, and so it is written,
+        // not "as it was": a caller that takes a change back on an error would otherwise
+        // take back what is on the disk. (A caller that must know the name will outlast a
+        // power cut is told that it may not.)
+        assert!(write_whole(&path, b"new", &Steps { sync_folder: |_| fails(), ..REPLACING }).is_ok());
         assert_eq!(fs::read_to_string(&path).unwrap(), "new");
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1131,7 +1175,7 @@ mod tests {
         }
 
         pub fn second(steps: &Steps) -> std::io::Result<()> {
-            write_whole(&dest(), SECOND, steps)
+            write_whole(&dest(), SECOND, steps).map(drop)
         }
 
         pub const AT_CREATE: Steps = Steps {
@@ -1213,6 +1257,20 @@ mod tests {
         assert!(write_whole(&log, FIRST, &AT_FLUSH).is_ok());
         assert_eq!((fs::read(&log).unwrap(), fs::read(&list).unwrap()), (FIRST.to_vec(), SECOND.to_vec()));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_drive_that_cant_make_hard_links_is_said_once() {
+        // Linux keeps what is made once with a second name for it (`link`): on a drive that
+        // can't make one, that is said, once ever, plainly; not each time it is tried.
+        let mut said = false;
+        assert_eq!(no_links_note(&mut said), None);
+        note_no_links();
+        let first = no_links_note(&mut said);
+        assert!(first.is_some_and(|note| note.contains("hard links")), "{first:?}");
+        assert_eq!(no_links_note(&mut said), None);
+        let mut said_before = true;
+        assert_eq!(no_links_note(&mut said_before), None);
     }
 
     #[test]

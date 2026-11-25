@@ -314,7 +314,15 @@ pub fn keep_first(settings: &Path, account: &str, version: &str, found: &str) ->
 /// `keep_first`, by the steps given (a test's, to stop the app at one or have one fail).
 fn keep_first_by(settings: &Path, account: &str, version: &str, found: &str, steps: &crate::config::Steps) -> std::io::Result<()> {
     let path = kept_file(settings, account, version);
-    let made = if path.is_file() { Err(std::io::ErrorKind::AlreadyExists.into()) } else { crate::config::write_whole(&path, found.as_bytes(), steps) };
+    // In place, it must be on the disk for good before anything is sent: its folder synced.
+    let made = if path.is_file() {
+        Err(std::io::ErrorKind::AlreadyExists.into())
+    } else {
+        crate::config::write_whole(&path, found.as_bytes(), steps).and_then(|placed| match placed {
+            crate::config::Placed::Synced => Ok(()),
+            crate::config::Placed::Unsynced => (steps.sync_folder)(&path),
+        })
+    };
     match made {
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && path.is_file() => {
             // There already (made by an earlier exchange, or by another attempt a moment
@@ -736,6 +744,7 @@ impl Controller {
             let account = self.settings.borrow().account_file();
             if keep_first(&self.paths.settings, &account, env!("CARGO_PKG_VERSION"), &carries.found).is_err() {
                 self.sync_says("A copy of the shared record couldn't be kept on this PC first, so nothing was written.");
+                self.say_no_links_once();
                 write = None;
             }
         }
