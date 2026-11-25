@@ -1093,6 +1093,17 @@ impl Controller {
         }
     }
 
+    /// The same, and played on this PC's own player whatever else this PC is steering: what
+    /// a queue sent by another of the person's devices does (see `link`).
+    pub fn load_queue_here(self: &Rc<Self>, songs: Vec<Song>, index: usize, position: f64, context: &str) {
+        if songs.is_empty() {
+            return;
+        }
+        let _changing = self.changing();
+        self.take_queue(songs, index, position, context);
+        self.toggle_play_here();
+    }
+
     /// Puts a queue in the player in place of what was there, stopped at its place.
     fn take_queue(self: &Rc<Self>, songs: Vec<Song>, index: usize, position: f64, context: &str) {
         self.engine.set_playing(false);
@@ -1106,6 +1117,16 @@ impl Controller {
     }
 
     // ---- engine events and the clock -----------------------------------------------------------
+
+    /// Where the sound has got to in the song the player holds, if it is playing and the
+    /// engine has reached that song: its place in the song, in seconds.
+    pub fn sounding_at(&self) -> Option<f64> {
+        let pb = self.playback.borrow();
+        if !pb.playing || pb.current_token == 0 {
+            return None;
+        }
+        self.engine.position().filter(|(token, _)| *token == pb.current_token).map(|(_, at)| at)
+    }
 
     pub fn on_engine_event(self: &Rc<Self>, event: Event) {
         match event {

@@ -117,7 +117,7 @@ fn find_songs(query: &str, client: Option<&Client>) -> Vec<Value> {
 }
 
 /// A song by its id: from the copy of the library on this PC, or else from the server.
-fn find_song(id: &str, client: Option<&Client>) -> Option<Song> {
+pub(crate) fn find_song(id: &str, client: Option<&Client>) -> Option<Song> {
     if id.is_empty() || id.len() > 128 {
         return None;
     }
@@ -1153,6 +1153,8 @@ impl Controller {
     /// other devices, to steer it.
     fn join_session(self: &Rc<Self>, address: String, id: String, name: String, own: Option<Own>) {
         self.leave_jam();
+        // (A device being steered the new way is let go of too.)
+        self.link_let_go();
         let serial = {
             let mut jam = self.jam.borrow_mut();
             jam.busy = own.is_none();
@@ -1342,12 +1344,17 @@ impl Controller {
 
     /// Brings the jam page up to date with the jam this PC is in (or none): who's there,
     /// and what the host's library has for what's typed.
-    fn show_joined(&self) {
+    pub(crate) fn show_joined(&self) {
         let ui = self.ui.global::<ui::Jam>();
         let jam = self.jam.borrow();
         let Some(joined) = &jam.joined else {
             ui.set_joined(false);
-            ui.set_linked(false);
+            // (Where the new linking is switched on, a device may be being steered that way.)
+            let steered = self.link_steered();
+            ui.set_linked(steered.is_some());
+            if let Some(name) = steered {
+                ui.set_device(name.into());
+            }
             ui.set_host("".into());
             ui.set_results(ModelRc::default());
             return;
@@ -1407,6 +1414,9 @@ impl Controller {
     /// When this PC is in someone's jam, shows the jam in the player and the queue panel,
     /// in place of this PC's own queue, and returns true. Otherwise does nothing.
     pub fn show_remote(&self) -> bool {
+        if self.link_show_remote() {
+            return true;
+        }
         let (now, rows, ahead, playing, position, duration, context, shuffle, repeat, volume) = {
             let mut jam = self.jam.borrow_mut();
             let Some(joined) = jam.joined.as_mut() else { return false };
@@ -1484,6 +1494,9 @@ impl Controller {
     /// In a jam: the song a row of its queue stands for (-1 for the one playing), as this
     /// PC's library knows it. `None` when this PC isn't in a jam.
     pub fn remote_song(&self, index: i32) -> Option<Option<Song>> {
+        if let Some(song) = self.link_remote_song(index) {
+            return Some(song);
+        }
         let jam = self.jam.borrow();
         let joined = jam.joined.as_ref()?;
         let state = &joined.heard["state"];
@@ -1494,6 +1507,9 @@ impl Controller {
     /// In a jam, asks the host to do `what` and returns true. Otherwise returns false, and
     /// the caller does it to this PC's own playback.
     pub fn remote(self: &Rc<Self>, what: Remote) -> bool {
+        if self.link_remote(&what) {
+            return true;
+        }
         let (action, data) = {
             let mut jam = self.jam.borrow_mut();
             let Some(joined) = jam.joined.as_mut() else { return false };
@@ -1576,7 +1592,10 @@ impl Controller {
     }
 
     /// Steering playback elsewhere, queues songs there and returns true. Otherwise returns false.
-    pub fn remote_add(&self, songs: &[Song], play_next: bool) -> bool {
+    pub fn remote_add(self: &Rc<Self>, songs: &[Song], play_next: bool) -> bool {
+        if self.link_remote_add(songs, play_next) {
+            return true;
+        }
         let Some(place) = self.jam.borrow().joined.as_ref().map(|joined| if joined.owner.is_some() { format!("the queue on {}", joined.device.1) } else { "the jam's queue".to_string() }) else { return false };
         let ids: Vec<&str> = songs.iter().filter(|song| song.radio_url.is_empty()).map(|song| song.id.as_str()).take(MOST_ADDED).collect();
         if ids.is_empty() {
@@ -1599,7 +1618,10 @@ impl Controller {
     /// returns true. On one of the person's own devices it plays as it would here, taking
     /// the queue's place. In a friend's jam it's queued instead: the song that was picked,
     /// or the whole list when the list itself was played. Returns false otherwise.
-    pub fn remote_play(&self, songs: &[Song], start: usize, context: &str, whole: bool) -> bool {
+    pub fn remote_play(self: &Rc<Self>, songs: &[Song], start: usize, context: &str, whole: bool) -> bool {
+        if self.link_remote_play(songs, start, context) {
+            return true;
+        }
         let Some(own) = self.jam.borrow().joined.as_ref().map(|joined| joined.owner.is_some()) else { return false };
         if !own {
             let picked = if whole { songs } else { songs.get(start..start + 1).unwrap_or_default() };
@@ -1901,11 +1923,22 @@ impl Controller {
         ui.set_list(ModelRc::new(VecModel::from(list)));
     }
 
+    /// Whether this PC is in a jam with other people: a friend's, or one of its own that
+    /// friends have the link to. It does not steer a device of the person's own meanwhile.
+    pub(crate) fn in_a_jam(&self) -> bool {
+        let jam = self.jam.borrow();
+        jam.joined.as_ref().is_some_and(|joined| joined.owner.is_none()) || jam.hosting.as_ref().is_some_and(|hosting| hosting.public)
+    }
+
     /// A device was picked from the list. Another device: this one starts steering it, and
     /// if music is playing here it carries on over there. This PC: what the other device
     /// was playing carries on here.
     fn pick_device(self: &Rc<Self>, id: &str) {
         if id.is_empty() {
+            // (Where the new linking is steering a device, "Play here" is its to do.)
+            if self.link_play_here() {
+                return;
+            }
             return self.play_here();
         }
         let (target, address, word, already, in_jam) = {
@@ -1981,7 +2014,12 @@ impl Controller {
             with(|ctl| ctl.join_jam(&link, &name));
         });
         jam.on_leave(|| {
-            with(|ctl| ctl.leave_jam());
+            with(|ctl| {
+                // ("Stop steering", where it is the new linking that is steering.)
+                if !ctl.link_let_go() {
+                    ctl.leave_jam();
+                }
+            });
         });
         jam.on_search(|text| {
             with(|ctl| ctl.jam_search(&text));

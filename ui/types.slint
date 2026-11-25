@@ -572,6 +572,10 @@ export struct LinkedDevice {
     // What it's doing, in a few words.
     about: string,
     playing: bool,
+    // It's the device the player on this PC is steering.
+    active: bool,
+    // It's here to be picked. Otherwise it is one seen before that isn't here just now.
+    ready: bool,
 }
 
 // The new linking, where it is switched on for a test. Not shown otherwise.
@@ -580,9 +584,14 @@ export global Linked {
     // This PC has its place in the room.
     in property <bool> entered;
     in property <[LinkedDevice]> list;
-    // What there is to say: what became of the last Pause, or why nothing is linked.
+    // What there is to say: what became of the last thing asked, or why nothing is linked.
     in property <string> note;
+    // The device being steered from here, by name; empty for none.
+    in property <string> steering;
     callback pause(place: string);
+    // A device was picked: steer it, and move what's playing here over to it. With no
+    // place: bring what the device being steered is playing back here.
+    callback choose(place: string);
 }
 
 export global Toast {

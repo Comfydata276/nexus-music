@@ -1352,6 +1352,10 @@ export component ConnectPanel inherits Rectangle {
     border-color: Theme.line;
     drop-shadow-blur: self.over ? 28px : 0px;
     drop-shadow-color: self.over ? #000000a0 : transparent;
+    // (With the new linking's list above the old one, the two together can be taller than
+    // a small window's panel: what does not fit is cut off at its foot, not drawn over the
+    // player. Only where the new linking is switched on: without it nothing changes here.)
+    clip: Linked.on;
 
     // Nothing clicked here reaches the page underneath.
     TouchArea { }
@@ -1478,7 +1482,10 @@ export component ConnectPanel inherits Rectangle {
             }
         }
 
-        // The new linking, shown only where it is switched on for a test (see src/link.rs).
+        // The new linking, shown only where it is switched on for a test (see src/link.rs):
+        // the person's other devices as it knows them. One that is here can be picked, to
+        // steer it and move what's playing over to it; one seen before that isn't here
+        // just now is listed all the same, and can't be.
         if Linked.on: Text {
             height: 28px;
             text: "   Linked devices (new)";
@@ -1488,34 +1495,24 @@ export component ConnectPanel inherits Rectangle {
             vertical-alignment: center;
         }
 
+        // Every device but the one being steered, which is named at the top.
         for device in Linked.list: Rectangle {
-            height: 56px;
-            HorizontalLayout {
-                padding-left: 12px;
+            height: device.active ? 0px : 56px;
+            clip: true;
+            if !device.active: HorizontalLayout {
                 padding-right: 28px;
                 spacing: 8px;
-                VerticalLayout {
-                    alignment: center;
+                DeviceRow {
                     horizontal-stretch: 1;
-                    Text {
-                        text: device.name;
-                        color: Theme.text;
-                        font-size: 14px;
-                        font-weight: 600;
-                        overflow: elide;
-                    }
-                    Text {
-                        text: device.about;
-                        color: Theme.muted;
-                        font-size: 13px;
-                        overflow: elide;
-                    }
+                    device: { id: device.place, name: device.name, about: device.about, active: false, ready: device.ready };
+                    chosen => { Linked.choose(device.place); }
                 }
-                VerticalLayout {
+                // (A small button: in a narrow window the name beside it keeps its room.)
+                if device.ready && device.playing: VerticalLayout {
                     alignment: center;
-                    TextButton {
-                        height: 32px;
-                        text: "Pause " + device.name;
+                    IconButton {
+                        icon: Icons.pause-fill;
+                        label: "Pause " + device.name;
                         clicked => { Linked.pause(device.place); }
                     }
                 }
