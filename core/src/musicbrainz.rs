@@ -490,9 +490,12 @@ impl MusicBrainz {
     }
 
     /// Looks for songs matching what was typed, each with the studio album it's on.
-    pub fn find_songs(&self, term: &str, singles: bool) -> Result<Vec<SongOffer>, String> {
+    /// `singles` says whether singles and EPs are wanted too. It is asked once the answer is
+    /// in, not when the search starts: the setting can change while MusicBrainz is being
+    /// waited for, and what's offered goes by what it is then.
+    pub fn find_songs(&self, term: &str, singles: impl Fn() -> bool) -> Result<Vec<SongOffer>, String> {
         let found = self.get(&format!("recording?query={}&dismax=true&limit=100&fmt=json", encode(term)))?;
-        Ok(songs_from(&found, term, singles))
+        Ok(songs_from(&found, term, singles()))
     }
 
     /// One artist's song of a given name, with the studio album it's on. For when it's known
@@ -879,5 +882,42 @@ mod tests {
         // Otherwise it's offered on its single: not the remix single, and not the later EP.
         let songs = songs_from(&found, "only a single", true);
         assert_eq!((songs[0].album.as_str(), songs[0].kind.as_str(), songs[0].year.as_str()), ("single", "Single", "2024"));
+    }
+
+    #[test]
+    fn a_search_goes_by_the_singles_setting_as_it_is_when_the_answer_comes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use crate::http::Response;
+
+        /// MusicBrainz answering with a song that only came out as a single; while it
+        /// answers, the person changes "singles and EPs" in Settings to `becomes`.
+        struct WhileAsking {
+            setting: Arc<AtomicBool>,
+            becomes: bool,
+        }
+        impl Http for WhileAsking {
+            fn send(&self, _: &Request) -> Result<Response, Failure> {
+                self.setting.store(self.becomes, Ordering::SeqCst);
+                let body = r#"{"recordings":[{"score":100,"title":"Only A Single","length":180000,"artist-credit":[{"name":"Someone","artist":{"id":"s","name":"Someone"}}],
+                    "releases":[{"status":"Official","date":"2024-03-01","release-group":{"id":"single","title":"Only A Single","primary-type":"Single"}}]}]}"#;
+                Ok(Response::new(200, Vec::new(), move || Ok(body.to_string())))
+            }
+
+            fn pause(&self, _: Duration) -> Result<(), Failure> {
+                Ok(())
+            }
+        }
+        let search = |was: bool, becomes: bool| {
+            let setting = Arc::new(AtomicBool::new(was));
+            let http = Arc::new(WhileAsking { setting: setting.clone(), becomes });
+            let service = MusicBrainz::new(http.clone(), ListenBrainz::new(http));
+            service.find_songs("only a single", move || setting.load(Ordering::SeqCst)).unwrap()
+        };
+        // On when the search started, off by the time MusicBrainz answered: the song isn't on
+        // an album, so it isn't offered (and so isn't kept with the page for later).
+        assert!(search(true, false).is_empty());
+        // Off when it started, on when the answer came: offered, on its single.
+        assert_eq!(search(false, true).iter().map(|song| song.kind.as_str()).collect::<Vec<_>>(), ["Single"]);
     }
 }

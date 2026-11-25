@@ -30,7 +30,7 @@ pub fn warm() {
 
 /// Looks for songs matching what was typed, each with the studio album it's on.
 pub fn find_songs(term: &str) -> Result<Vec<SongOffer>, String> {
-    service().find_songs(term, crate::lidarr::singles())
+    service().find_songs(term, crate::lidarr::singles)
 }
 
 pub fn song_by(artist: &str, title: &str) -> Result<Vec<SongOffer>, String> {
