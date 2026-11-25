@@ -70,6 +70,22 @@ pub enum Ready {
     Queue(Vec<(String, bool)>, usize),
 }
 
+/// What came of asking the player to carry a command out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Carried {
+    /// It changed the player.
+    Changed,
+    /// The player is as it was: it was so already, or could not do it.
+    Unchanged,
+    /// It has been passed to the player, which will do it in its own time: what comes of
+    /// it is said with [`Device::carried`].
+    Later,
+}
+
+/// How long a player that carries a command out later is given to say what came of it.
+/// After that the command is given up, and its sender told so.
+pub const CARRY_MS: u64 = 2_000;
+
 /// This device's own player, as the deciding needs it.
 pub trait Player {
     fn brief(&self) -> Brief;
@@ -93,7 +109,15 @@ pub trait Player {
     /// device only, **and says whether it changed anything**: a Play when it was playing, a
     /// seek on a radio, a Next with nothing to go to, change nothing. What the player does
     /// for it is not counted by the player: the rule counts it, once, if it changed anything.
-    fn carry_out(&mut self, command: &Command, ready: &Ready) -> bool;
+    ///
+    /// A player that cannot be asked from here (it is on another thread, in another
+    /// language) says [`Carried::Later`], and the app says what came of it when it is
+    /// known ([`Device::carried`]). Nothing is answered, and the device stays busy with
+    /// the command, until then.
+    fn carry_out(&mut self, command: &Command, ready: &Ready) -> Carried;
+    /// The command that was to be carried out later is given up (its time ran out, the
+    /// session ended, something was chosen here first): **it must not now be carried out.**
+    fn give_up(&mut self) {}
     /// Stops this device's own sound, and counts it as a change.
     fn pause(&mut self);
     /// Takes a queue brought from another device and plays it, counted as a change: each
@@ -321,6 +345,18 @@ struct Pending {
     until_ms: u64,
 }
 
+/// A command that the rule has let through and the player has been asked to carry out
+/// in its own time.
+struct Carry {
+    session: u64,
+    from: Place,
+    nonce: Nonce,
+    command: Command,
+    at: At,
+    carrying: Carrying,
+    until_ms: u64,
+}
+
 #[derive(Default)]
 pub struct Device {
     /// The sign-in all of this belongs to.
@@ -345,6 +381,8 @@ pub struct Device {
     take: Option<Take>,
     adoption: Option<Adoption>,
     pending: HashMap<u64, Pending>,
+    /// The command the player is carrying out in its own time, if it is.
+    being_carried: Option<Carry>,
     tickets: u64,
     news: News,
     remembered: Vec<Remembered>,
@@ -477,6 +515,13 @@ impl Device {
         if dropped > 0 {
             out.push(Do::Log(format!("session: {dropped} command{} accepted under it and not yet carried out: let go", if dropped == 1 { "" } else { "s" })));
         }
+        if let Some(carry) = self.being_carried.take() {
+            // (Nobody can be answered. If the player has done it already, it will say so,
+            // and that it changed something is counted then.)
+            env.player.give_up();
+            env.player.carried(carry.carrying, false, carry.nonce);
+            out.push(Do::Log(format!("{} from {}: the session ended while the player was asked, given up", carry.command.name(), text::place(&carry.from))));
+        }
         if let Some(adoption) = self.adoption.take() {
             env.player.done(adoption.waiting);
             out.push(Do::Log(format!("adopt from {}: the session ended before it sounded, nobody is answered", text::place(&adoption.from))));
@@ -495,6 +540,38 @@ impl Device {
             env.player.refuse(reservation);
             self.refused(session, from, nonce, &command, at, Why::Late, env, out);
         }
+        if self.being_carried.as_ref().is_some_and(|carry| carry.until_ms <= env.now_ms) {
+            self.give_up_the_carry(Why::Late, env, out);
+        }
+    }
+
+    /// The command the player was asked to carry out in its own time is given up, and its
+    /// sender told why. The player is told not to carry it out now.
+    fn give_up_the_carry(&mut self, why: Why, env: &mut Env, out: &mut Vec<Do>) {
+        let Some(Carry { session, from, nonce, command, at, carrying, .. }) = self.being_carried.take() else { return };
+        env.player.give_up();
+        env.player.carried(carrying, false, nonce);
+        self.refused(session, from, nonce, &command, at, why, env, out);
+    }
+
+    /// The player says what came of the command it was asked to carry out in its own time
+    /// ([`Carried::Later`]): whether it changed anything. The command's sender is answered
+    /// now, from the player as it is now.
+    pub fn carried(&mut self, changed: bool, env: &mut Env) -> Vec<Do> {
+        let mut out = Vec::new();
+        if let Some(carry) = self.being_carried.take() {
+            self.settle(carry, changed, env, &mut out);
+        }
+        out
+    }
+
+    /// Something was chosen at this device itself while its player was still being asked
+    /// to carry a command out: the command was made against a state that is gone. It is
+    /// given up, as it would have been refused had the choice come a moment sooner.
+    pub fn overtaken(&mut self, env: &mut Env) -> Vec<Do> {
+        let mut out = Vec::new();
+        self.give_up_the_carry(Why::Changed, env, &mut out);
+        out
     }
 
     /// Everything of this sign-in's is over: the session, and any look at the secret that
@@ -904,7 +981,21 @@ impl Device {
             Ok(carrying) => carrying,
             Err(why) => return self.refused(session, from, nonce, &command, at, why, env, out),
         };
-        let changed = env.player.carry_out(&command, &ready);
+        let carry = Carry { session, from, nonce, command, at, carrying, until_ms: now.saturating_add(CARRY_MS) };
+        match env.player.carry_out(&carry.command, &ready) {
+            Carried::Later => {
+                out.push(Do::Log(format!("{} from {} against generation {}: let through, the player is asked", carry.command.name(), text::place(&from), at.generation)));
+                self.being_carried = Some(carry);
+            }
+            done => self.settle(carry, done == Carried::Changed, env, out),
+        }
+    }
+
+    /// What came of carrying a command out is known: the rule is told, and the command's
+    /// sender answered.
+    fn settle(&mut self, carry: Carry, changed: bool, env: &mut Env, out: &mut Vec<Do>) {
+        let Carry { session, from, nonce, command, at, carrying, .. } = carry;
+        let now = env.now_ms;
         env.player.carried(carrying, changed, nonce);
         if !changed {
             // The player did nothing. Either it was already as the command asked, which is

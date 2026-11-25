@@ -26,26 +26,39 @@
 //! them back apart), and answers with [`Phone::looked`], [`Phone::from_relay`] and
 //! [`Phone::found`]. The secret never leaves Rust.
 //!
-//! **Nothing is decided against a player that has not caught up.** A command is carried
-//! out a moment after it is decided, on another thread. Until Kotlin has said what its
-//! player holds *after* doing what it was last asked ([`Event::Player`] with that act's
-//! number), what the relay brings is kept, in order, and decided then: so the second of
-//! two commands finds the queue as the first left it, exactly as on a device whose player
-//! is asked directly, and a look is answered with what is true. A report made before the
-//! act was done is not taken. A player that never reports holds nothing up for longer
-//! than [`CATCH_UP_MS`].
+//! **A command is answered when the phone's player has said what came of it, not before.**
+//! The rule lets a command through and the player is asked ([`Act::Carry`]); nothing is
+//! said to the device that sent it, and the phone stays busy with it, until Kotlin reports
+//! ([`Event::Did`]): whether the player changed anything, and what it now holds. The answer
+//! is built from that. If nothing changed, the command is answered as what it was (nothing
+//! to do, or cannot), nothing moves, and the queue is not claimed.
 //!
-//! The one thing that is not exact: the answer to a command goes at once, and says in
-//! brief what the player held before it (with play and pause, which are certain, applied).
-//! The asking device reads `ok` as done and shows nothing from an answer; what it shows
-//! comes from its next look, which waits as above.
+//! - **No report in time** ([`CATCH_UP_MS`]): the command is given up. Kotlin is told not
+//!   to carry it out now ([`Act::Cancel`]), and its sender that it took too long.
+//! - **Something chosen on the phone meanwhile** ([`Event::Changed`] before the report):
+//!   the command was made against a state that is gone. It is given up the same way, and
+//!   its sender told the phone changed. (So Kotlin reports an act **as it does it**, before
+//!   it handles anything else: a `Changed` that arrives first means the act was not done.)
+//! - **The session ending** gives it up too.
+//!
+//! **Nothing is decided against a player that has not caught up.** Until Kotlin has said
+//! what its player holds *after* doing what it was last asked, what the relay brings is
+//! kept, in order, and decided then: the second of two commands finds the queue as the
+//! first left it, exactly as on a device whose player is asked directly, and a look is
+//! answered with what is true. A report read from the player before the act was done is
+//! not taken. And **nothing is decided against a state that has gone stale**: if the
+//! player has still not said what it holds when its time is up, the phone is busy to the
+//! others until it does. A command is refused as busy, and a look is answered busy, which
+//! no device acts on.
+//!
+//! **A sign-out or another account is applied before anything that was kept is looked at.**
 
 use std::collections::VecDeque;
 
 use serde::{Deserialize, Serialize};
 
 use super::command::Command;
-use super::device::{Brief, Device, Do, Env, Me, Player, Ready, Shown};
+use super::device::{Brief, CARRY_MS, Carried, Device, Do, Env, Me, Player, Ready, Shown};
 use super::look::Looked;
 use super::message::{At, Full, Handed, Why};
 use super::relay::FromRelay;
@@ -89,6 +102,11 @@ pub enum Event {
         #[serde(default)]
         after: u64,
     },
+    /// The player was asked to carry a command out ([`Act::Carry`], this `number`) and has:
+    /// `changed` is whether it changed anything (not a Play when it was playing, a seek on
+    /// a radio, a Next with nothing to go to), and `playing` what it holds now. Sent **as
+    /// the act is done**, before anything else that happens on the phone is told.
+    Did { number: u64, changed: bool, playing: Playing },
     /// A way into the player was taken (`crate::ways`): `who` chose it (`here`, unless
     /// said: a press, a key, a notification's button, a headset's, the car's; `nobody` for
     /// what the app does by itself, as the next song starting; `guest`) and `what` it
@@ -141,13 +159,15 @@ pub enum Act {
     /// The queue is the phone's own from this moment, by the person's own doing here or at
     /// another of their devices: it is no longer one taken up from another device
     /// (`handover::Here::taken`), it changed now by the phone's clock
-    /// (`handover::Here::stamp`), and it is to be saved. Before the act it goes with.
+    /// (`handover::Here::stamp`), and it is to be saved.
     Claim,
-    /// Carry this command out on the player, exactly as the same press would be, and then
-    /// say what the player holds ([`Event::Player`], `after` this number). It has taken its
-    /// place in the order of choices already, and claimed the queue if it does: carrying it
-    /// out is **not** an [`Event::Changed`].
+    /// Carry this command out on the player, exactly as the same press would be, and say
+    /// at once what came of it ([`Event::Did`], this number). Carrying it out is **not** an
+    /// [`Event::Changed`]: it is counted here, if it changed anything, when that is said.
     Carry { number: u64, command: Command, ready: Ready },
+    /// Do not carry out the act of this number, if it has not been carried out: it was
+    /// given up (no report in time, something chosen on the phone first, the session over).
+    Cancel { number: u64 },
     /// Stop the phone's own sound, and say what the player holds. Counted already.
     Pause { number: u64 },
     /// Take this queue and play it, and say what the player holds: each song and whether
@@ -180,6 +200,12 @@ struct Held {
     /// Who chose what is being done to the player, from which the order of choices and
     /// whose the queue is are both worked out.
     ways: Ways,
+    /// The command the player has been asked to carry out and has not yet said it did: its
+    /// act's number, and the command.
+    carrying: Option<(u64, Command)>,
+    /// The player has not said what it holds since it was last asked to do something, and
+    /// its time is up: what it last said is not gone by. Busy to the others until it says.
+    stale: bool,
 }
 
 fn here() -> Who {
@@ -221,28 +247,21 @@ impl Player for Held {
     fn ahead(&self) -> Vec<String> {
         self.playing.ahead.clone()
     }
-    fn carry_out(&mut self, command: &Command, ready: &Ready) -> bool {
-        match command {
-            Command::Play => self.playing.brief.playing = self.playing.has_song,
-            Command::Pause | Command::Moved => self.playing.brief.playing = false,
-            _ => {}
-        }
-        // (Whatever was sounding was sounding before this: what sounds after it is for
-        // the player to say.)
-        self.playing.sounding_at = None;
-        // The person chose it at another of their devices (but for the stop that ends a
-        // move, which is nobody's); the rule counts it.
-        self.ways.begin(command.chosen_by(), true);
-        let owed = self.ways.touch(Who::Here, command.touches());
-        self.ways.end();
-        if owed.claim {
-            self.acts.push(Act::Claim);
-        }
+    /// The player is Kotlin's: it is asked, and what came of it is said when Kotlin says.
+    fn carry_out(&mut self, command: &Command, ready: &Ready) -> Carried {
         let number = self.ask();
+        self.carrying = Some((number, command.clone()));
         self.acts.push(Act::Carry { number, command: command.clone(), ready: ready.clone() });
-        // (Taken as having changed the player. What the phone's own player then says of
-        // it is not yet waited for: see the top of this file.)
-        true
+        Carried::Later
+    }
+    fn give_up(&mut self) {
+        if let Some((number, _)) = self.carrying.take() {
+            self.acts.push(Act::Cancel { number });
+            // (Nothing will be said of it now: it is not waited on.)
+            if self.done + 1 == number {
+                self.done = number;
+            }
+        }
     }
     /// (The end of a move of the phone's music to another device: the app's own doing,
     /// which claims nothing. The device that took the queue claimed it.)
@@ -270,13 +289,17 @@ impl Player for Held {
     fn generation(&self) -> u64 {
         self.rule.generation()
     }
+    /// (What the player last said it held has gone stale: busy, until it says.)
     fn busy(&self, now_ms: u64) -> bool {
-        self.rule.busy(now_ms)
+        self.stale || self.rule.busy(now_ms)
     }
     fn by(&self) -> Option<Nonce> {
         self.rule.by()
     }
     fn admit(&mut self, at: At, minute: u64, now_ms: u64) -> Result<Reservation, Why> {
+        if self.stale {
+            return Err(Why::Busy);
+        }
         self.rule.admit(at, minute, now_ms)
     }
     fn finish(&mut self, reservation: Reservation, at: At, minute: u64, now_ms: u64, same_session: bool) -> Result<Carrying, Why> {
@@ -304,9 +327,10 @@ const LOOK_UP_MS: u64 = 60_000;
 /// this is for one that says it has begun and never says it has ended.)
 const MOST_LOOK_UPS: usize = 16;
 
-/// How long the player is given to say it has done what it was asked, before what the
-/// relay brought meanwhile is decided against what it last said.
-pub const CATCH_UP_MS: u64 = 2_000;
+/// How long the player is given to say it has done what it was asked. After that a
+/// command it was carrying out is given up, and what it last said it held is not gone by
+/// until it says again.
+pub const CATCH_UP_MS: u64 = CARRY_MS;
 
 /// The most frames kept while the player catches up. (More than the relay lets a room
 /// send in that time.)
@@ -387,15 +411,15 @@ impl Phone {
         };
         match event {
             Event::Tick { account, wanted } => {
-                let mut came = Came::default();
+                // First what the tick itself says: a sign-out, or another account, ends
+                // the session before anything kept under it is looked at; and a command the
+                // player has not reported on in time is given up.
+                let mut came = self.with(now_ms, today, &mut *random, |device, env| device.tick(&account, wanted, env));
                 if self.player.asked != self.player.done && now_ms.saturating_sub(self.asked_ms) >= CATCH_UP_MS {
-                    came.native.push(Do::Log(format!("the player has not said it did what it was asked (act {}): going on without it", self.player.asked)));
-                    self.player.done = self.player.asked;
+                    came.native.push(Do::Log(format!("the player has not said what it holds since it was asked to do something (act {}): busy to the others until it does", self.player.asked)));
+                    (self.player.done, self.player.stale) = (self.player.asked, true);
                 }
-                self.decide_kept(&mut came, now_ms, today, &mut *random);
-                let ticked = self.with(now_ms, today, random, |device, env| device.tick(&account, wanted, env));
-                came.acts.extend(ticked.acts);
-                came.native.extend(ticked.native);
+                self.decide_kept(&mut came, now_ms, today, random);
                 let (shown, logged) = self.device.shown(now_ms);
                 came.native.extend(logged);
                 came.acts.push(Act::Shown { shown });
@@ -405,17 +429,57 @@ impl Phone {
                 let mut came = Came::default();
                 // (Read from the player before it did what it was last asked: not how it is.)
                 if after >= self.player.asked {
-                    (self.player.playing, self.player.done) = (playing, self.player.asked);
+                    (self.player.playing, self.player.done, self.player.stale) = (playing, self.player.asked, false);
                     self.decide_kept(&mut came, now_ms, today, random);
                 }
                 came
             }
+            Event::Did { number, changed, playing } => {
+                let mut came = Came::default();
+                // What it holds now is as fresh as the act it has just done.
+                if number >= self.player.done {
+                    self.player.playing = playing;
+                    self.player.done = number.min(self.player.asked);
+                    self.player.stale &= self.player.done != self.player.asked;
+                }
+                match self.player.carrying.take_if(|(asked, _)| *asked == number) {
+                    Some((_, command)) => {
+                        // The person chose it at another of their devices (but for the
+                        // stop that ends a move, which is nobody's): the queue is theirs
+                        // by it, if it changed what a saved queue holds. The rule counts it.
+                        if changed {
+                            self.player.ways.begin(command.chosen_by(), true);
+                            let owed = self.player.ways.touch(Who::Here, command.touches());
+                            self.player.ways.end();
+                            if owed.claim {
+                                came.acts.push(Act::Claim);
+                            }
+                        }
+                        let more = self.with(now_ms, today, &mut *random, |device, env| device.carried(changed, env));
+                        came.acts.extend(more.acts);
+                        came.native.extend(more.native);
+                    }
+                    // An act that had been given up was done all the same: nobody is
+                    // answered for it, and what changed has changed.
+                    None if changed => self.player.rule.moved(),
+                    None => {}
+                }
+                self.decide_kept(&mut came, now_ms, today, random);
+                came
+            }
             Event::Changed { who, what } => {
+                // Something was chosen here while the player was still being asked to
+                // carry a command out: that command was made against a state that is gone.
+                let mut came = if self.player.carrying.is_some() { self.with(now_ms, today, &mut *random, |device, env| device.overtaken(env)) } else { Came::default() };
                 let owed = self.player.ways.touch(who, what);
                 if owed.count {
                     self.player.rule.moved();
                 }
-                Came { acts: if owed.claim { vec![Act::Claim] } else { Vec::new() }, native: Vec::new() }
+                if owed.claim {
+                    came.acts.push(Act::Claim);
+                }
+                self.decide_kept(&mut came, now_ms, today, random);
+                came
             }
             Event::LookingUp => {
                 // (One whose minute is up counts for nothing already, and one that was
@@ -552,27 +616,36 @@ mod tests {
         }
     }
 
+    const TICK: &str = r#"{"event":"tick","account":"the account","wanted":true}"#;
+
+    fn ids(from: &[usize]) -> Vec<String> {
+        from.iter().map(|n| format!("s{n}")).collect()
+    }
+
     /// A phone signed in, in the room, with eight songs in its player.
     fn phone(n: &mut u64) -> (Phone, u64, [u8; 16]) {
         let mut phone = Phone::new([9; 16], "Phone", Vec::new());
-        let ids: Vec<String> = (0..8).map(|n| format!("s{n}")).collect();
-        let (acts, native) = phone.handle(r#"{"event":"tick","account":"the account","wanted":true}"#, 1_000, 100, &mut random(n));
+        let (acts, native) = phone.handle(TICK, 1_000, 100, &mut random(n));
         assert!(acts.contains(r#""act":"shown""#) && matches!(native.as_slice(), [Do::Look { reset: false, .. }]), "{acts} {native:?}");
         let Do::Look { number, .. } = native[0].clone() else { unreachable!() };
         let came = phone.looked(number, 1_000, Looked::Secret { secret: Secret::new([7; 32]), id: "k".into(), wrote: None }, false, 1_100, 100, &mut random(n));
         let Some(Do::Begin { session, .. }) = came.native.iter().find(|ask| matches!(ask, Do::Begin { .. })).cloned() else { panic!("no session: {came:?}") };
         let place = [5; 16];
         phone.from_relay(session, FromRelay::Entered { place, token: "a-token".into() }, 1_200, 100, &mut random(n));
-        phone.handle(&playing(&ids, 0).to_string(), 1_300, 100, &mut random(n));
-        phone.handle(&serde_json::json!({"event": "library", "ids": ids}).to_string(), 1_300, 100, &mut random(n));
+        let all = ids(&[0, 1, 2, 3, 4, 5, 6, 7]);
+        phone.handle(&serde_json::json!({"event": "player", "after": 0, "playing": held(&all)}).to_string(), 1_300, 100, &mut random(n));
+        phone.handle(&serde_json::json!({"event": "library", "ids": all}).to_string(), 1_300, 100, &mut random(n));
         (phone, session, place)
     }
 
-    /// What Kotlin says its player holds: these songs, the first of them playing, having
-    /// done every act up to this one.
-    fn playing(ids: &[String], after: u64) -> serde_json::Value {
-        serde_json::json!({"event": "player", "after": after, "playing": {"brief": {"playing": true, "title": ids[0]}, "ahead": ids[1..], "has_song": true, "sounding_at": 3.0,
-            "handed": {"songs": ids, "position": 3.0, "context": "an album"}}})
+    /// What Kotlin says its player holds: these songs, the first of them playing.
+    fn held(ids: &[String]) -> serde_json::Value {
+        serde_json::json!({"brief": {"playing": true, "title": ids[0]}, "ahead": ids[1..], "has_song": true, "sounding_at": 3.0, "handed": {"songs": ids, "position": 3.0, "context": "an album"}})
+    }
+
+    /// Kotlin says it has done the act of this number, and what its player then holds.
+    fn did(number: u64, changed: bool, ids: &[String]) -> String {
+        serde_json::json!({"event": "did", "number": number, "changed": changed, "playing": held(ids)}).to_string()
     }
 
     /// A frame from another device in the room, sealed for the phone.
@@ -581,40 +654,119 @@ mod tests {
         (text::place(&from), frame::seal(&Keys::of(&Secret::new([7; 32])), ASK, &[n; 24], &from, to, ask.text().as_bytes()).unwrap())
     }
 
+    fn heard(place: &[u8; 16], frames: Vec<(String, String)>) -> FromRelay {
+        FromRelay::Heard { places: vec![text::place(place), text::place(&[1; 16])], frames }
+    }
+
+    fn command(n: u8, place: &[u8; 16], command: Command, generation: u64) -> (String, String) {
+        from_pc(n, place, Ask::Do { command, at: At { generation, minute: 0 } })
+    }
+
+    fn sends(native: &[Do]) -> usize {
+        native.iter().filter(|ask| matches!(ask, Do::Send { .. })).count()
+    }
+
+    fn logged(native: &[Do], has: &str) -> bool {
+        native.iter().any(|ask| matches!(ask, Do::Log(line) if line.contains(has)))
+    }
+
     #[test]
-    fn a_command_for_the_phone_comes_out_as_data_for_its_player() {
+    fn a_command_is_asked_of_the_player_and_answered_when_the_player_says_what_came_of_it() {
         let mut n = 0;
         let (mut phone, session, place) = phone(&mut n);
-        let at = At { generation: 1, minute: 0 };
-        let heard = |frames| FromRelay::Heard { places: vec![text::place(&place), text::place(&[1; 16])], frames };
-        // Next, from a PC: the phone is told to carry it out, and answers it.
-        let came = phone.from_relay(session, heard(vec![from_pc(1, &place, Ask::Do { command: Command::Next, at })]), 2_000, 100, &mut random(&mut n));
-        assert_eq!(came.acts, [Act::Claim, Act::Carry { number: 1, command: Command::Next, ready: Ready::Nothing }]);
-        assert!(came.native.iter().any(|ask| matches!(ask, Do::Send { .. })) && came.native.iter().any(|ask| matches!(ask, Do::Log(line) if line.ends_with("carried out"))));
-        assert_eq!(serde_json::to_string(&came.acts).unwrap(), r#"[{"act":"claim"},{"act":"carry","number":1,"command":{"do":"next"},"ready":"nothing"}]"#);
-        let ids: Vec<String> = (1..8).map(|n| format!("s{n}")).collect();
-        phone.handle(&playing(&ids, 1).to_string(), 2_050, 100, &mut random(&mut n));
-        // The same frame again: nothing for the player.
-        let came = phone.from_relay(session, heard(vec![from_pc(1, &place, Ask::Do { command: Command::Next, at })]), 2_100, 100, &mut random(&mut n));
-        assert!(came.acts.is_empty() && came.native.iter().any(|ask| matches!(ask, Do::Log(line) if line.contains("refused, Changed"))));
-        // An entry of the queue is found for it; songs are named by id; a queue is taken as data.
-        let at = At { generation: 2, minute: 0 };
-        let came = phone.from_relay(session, heard(vec![from_pc(2, &place, Ask::Do { command: Command::Remove { at: 4, id: "s3".into() }, at })]), 2_200, 100, &mut random(&mut n));
-        assert_eq!(came.acts, [Act::Claim, Act::Carry { number: 2, command: Command::Remove { at: 4, id: "s3".into() }, ready: Ready::Entry(1) }]);
-        assert_eq!(serde_json::to_string(&came.acts[1..]).unwrap(), r#"[{"act":"carry","number":2,"command":{"do":"remove","with":{"at":4,"id":"s3"}},"ready":{"entry":1}}]"#);
-        // The volume is how it sounds: carried out, and the queue is no more the phone's for it.
-        phone.handle(&playing(&ids, 2).to_string(), 2_250, 100, &mut random(&mut n));
-        let at = At { generation: 3, minute: 0 };
-        let came = phone.from_relay(session, heard(vec![from_pc(3, &place, Ask::Do { command: Command::Volume { to: 0.5 }, at })]), 2_300, 100, &mut random(&mut n));
+        // Next, from a PC: the rule lets it through, the player is asked, and nobody is
+        // answered yet. The phone is busy with it.
+        let came = phone.from_relay(session, heard(&place, vec![command(1, &place, Command::Next, 1)]), 2_000, 100, &mut random(&mut n));
+        assert_eq!(came.acts, [Act::Carry { number: 1, command: Command::Next, ready: Ready::Nothing }]);
+        assert_eq!(serde_json::to_string(&came.acts).unwrap(), r#"[{"act":"carry","number":1,"command":{"do":"next"},"ready":"nothing"}]"#);
+        assert!(sends(&came.native) == 0 && logged(&came.native, "let through, the player is asked") && phone.player.rule.busy(2_000));
+        assert_eq!((phone.player.rule.generation(), phone.player.rule.by()), (1, None));
+        // Kotlin has done it. Now it is counted, the queue is the phone's by it, and its
+        // sender is answered, from the player as it is now.
+        let (acts, native) = phone.handle(&did(1, true, &ids(&[1, 2, 3, 4, 5, 6, 7])), 2_050, 100, &mut random(&mut n));
+        assert_eq!(acts, r#"[{"act":"claim"}]"#);
+        assert!(sends(&native) == 1 && logged(&native, "next from") && logged(&native, "carried out"), "{native:?}");
+        assert_eq!((phone.player.rule.generation(), phone.player.rule.by(), phone.player.rule.busy(2_050)), (2, Some([1; 24]), false));
+        assert_eq!(phone.player.playing.brief.title, "s1");
+        // The same frame again: refused, and nothing for the player.
+        let came = phone.from_relay(session, heard(&place, vec![command(1, &place, Command::Next, 1)]), 2_100, 100, &mut random(&mut n));
+        assert!(came.acts.is_empty() && logged(&came.native, "refused, Changed") && sends(&came.native) == 1);
+        // An entry of the queue is found for it, as the queue now stands.
+        let came = phone.from_relay(session, heard(&place, vec![command(2, &place, Command::Remove { at: 4, id: "s3".into() }, 2)]), 2_200, 100, &mut random(&mut n));
+        assert_eq!(serde_json::to_string(&came.acts).unwrap(), r#"[{"act":"carry","number":2,"command":{"do":"remove","with":{"at":4,"id":"s3"}},"ready":{"entry":1}}]"#);
+        assert_eq!(phone.handle(&did(2, true, &ids(&[1, 2, 4, 5, 6, 7])), 2_250, 100, &mut random(&mut n)).0, r#"[{"act":"claim"}]"#);
+        // The volume is how it sounds: done, counted, and the queue no more the phone's for it.
+        let came = phone.from_relay(session, heard(&place, vec![command(3, &place, Command::Volume { to: 0.5 }, 3)]), 2_300, 100, &mut random(&mut n));
         assert_eq!(came.acts, [Act::Carry { number: 3, command: Command::Volume { to: 0.5 }, ready: Ready::Nothing }]);
+        let (acts, native) = phone.handle(&did(3, true, &ids(&[1, 2, 4, 5, 6, 7])), 2_350, 100, &mut random(&mut n));
+        assert_eq!((acts.as_str(), sends(&native), phone.player.rule.generation()), ("[]", 1, 4));
+        // The player found it had nothing to do (Play, and it was playing): answered as
+        // that, nothing moves, nothing is claimed, and the command made no state.
+        let came = phone.from_relay(session, heard(&place, vec![command(4, &place, Command::Play, 4)]), 2_400, 100, &mut random(&mut n));
+        assert_eq!(came.acts, [Act::Carry { number: 4, command: Command::Play, ready: Ready::Nothing }]);
+        let (acts, native) = phone.handle(&did(4, false, &ids(&[1, 2, 4, 5, 6, 7])), 2_450, 100, &mut random(&mut n));
+        assert_eq!((acts.as_str(), sends(&native), logged(&native, "nothing to do")), ("[]", 1, true));
+        // (The state is still the one the volume made.)
+        assert_eq!((phone.player.rule.generation(), phone.player.rule.by(), phone.player.rule.busy(2_450)), (4, Some([3; 24]), false));
+        // And one it could not do (a seek, on a radio): refused.
+        let came = phone.from_relay(session, heard(&place, vec![command(5, &place, Command::Seek { to: 30.0 }, 4)]), 2_500, 100, &mut random(&mut n));
+        assert_eq!(came.acts.len(), 1);
+        let (acts, native) = phone.handle(&did(5, false, &ids(&[1, 2, 4, 5, 6, 7])), 2_550, 100, &mut random(&mut n));
+        assert_eq!((acts.as_str(), sends(&native), logged(&native, "refused, Cannot"), phone.player.rule.generation()), ("[]", 1, true, 4));
+    }
+
+    #[test]
+    fn a_player_that_does_not_say_in_time_is_told_not_to_and_the_sender_that_it_took_too_long() {
+        let mut n = 0;
+        let (mut phone, session, place) = phone(&mut n);
+        let came = phone.from_relay(session, heard(&place, vec![command(1, &place, Command::Next, 1)]), 2_000, 100, &mut random(&mut n));
+        assert_eq!(came.acts.len(), 1);
+        // Not yet.
+        let (acts, _) = phone.handle(TICK, 2_000 + CATCH_UP_MS - 1, 100, &mut random(&mut n));
+        assert!(!acts.contains("cancel") && phone.player.rule.busy(2_000 + CATCH_UP_MS - 1));
+        // Its time is up: Kotlin is told not to carry it out now, its sender is told it
+        // took too long, and the phone is free. Nothing moved.
+        let (acts, native) = phone.handle(TICK, 2_000 + CATCH_UP_MS, 100, &mut random(&mut n));
+        assert!(acts.starts_with(r#"[{"act":"cancel","number":1}"#), "{acts}");
+        assert!(logged(&native, "refused, Late") && sends(&native) == 1, "{native:?}");
+        assert_eq!((phone.player.rule.generation(), phone.player.rule.busy(2_000 + CATCH_UP_MS), phone.player.stale), (1, false, false));
+        // It was not carried out, so what the player last said it held is still what it
+        // holds: the next command is decided against it, and goes through.
+        let came = phone.from_relay(session, heard(&place, vec![command(2, &place, Command::Pause, 1)]), 4_100, 100, &mut random(&mut n));
+        assert_eq!(came.acts, [Act::Carry { number: 2, command: Command::Pause, ready: Ready::Nothing }]);
+        phone.handle(&did(2, true, &ids(&[0, 1, 2])), 4_150, 100, &mut random(&mut n));
+        // If Kotlin did carry the first out after all and says so: nobody is answered for
+        // it, and what changed has changed (a command made before it is refused).
+        let (acts, native) = phone.handle(&did(1, true, &ids(&[1, 2])), 4_200, 100, &mut random(&mut n));
+        assert_eq!((acts.as_str(), sends(&native), phone.player.rule.generation(), phone.player.rule.by()), ("[]", 0, 3, None));
+    }
+
+    #[test]
+    fn something_chosen_on_the_phone_while_its_player_is_asked_gives_the_command_up() {
+        let mut n = 0;
+        let (mut phone, session, place) = phone(&mut n);
+        phone.from_relay(session, heard(&place, vec![command(1, &place, Command::Next, 1)]), 2_000, 100, &mut random(&mut n));
+        // The person presses something on the phone before its player has come to the
+        // command: the command was made against a state that is gone.
+        let (acts, native) = phone.handle(r#"{"event":"changed"}"#, 2_010, 100, &mut random(&mut n));
+        assert_eq!(acts, r#"[{"act":"cancel","number":1},{"act":"claim"}]"#);
+        assert!(logged(&native, "refused, Changed") && sends(&native) == 1, "{native:?}");
+        assert_eq!((phone.player.rule.generation(), phone.player.rule.busy(2_010)), (2, false));
+        // Kotlin, told not to, says it did nothing: and that is the end of it.
+        assert_eq!(phone.handle(&did(1, false, &ids(&[0, 1, 2])), 2_020, 100, &mut random(&mut n)), ("[]".to_string(), Vec::new()));
+        // The session ending gives a command up too, and nobody is answered.
+        let came = phone.from_relay(session, heard(&place, vec![command(2, &place, Command::Next, 2)]), 2_100, 100, &mut random(&mut n));
+        assert_eq!(came.acts.len(), 1);
+        let (acts, native) = phone.handle(r#"{"event":"setting","on":false}"#, 2_110, 100, &mut random(&mut n));
+        assert_eq!(acts, r#"[{"act":"cancel","number":2}]"#);
+        assert!(sends(&native) == 0 && native.iter().any(|ask| matches!(ask, Do::End { .. })) && !phone.player.rule.busy(2_110));
     }
 
     #[test]
     fn what_counts_in_the_order_of_choices_is_told_as_it_happens() {
         let mut n = 0;
         let (mut phone, session, place) = phone(&mut n);
-        let heard = |frames| FromRelay::Heard { places: vec![text::place(&place), text::place(&[1; 16])], frames };
-        let pause = |n: u8, generation: u64| from_pc(n, &place, Ask::Do { command: Command::Pause, at: At { generation, minute: 0 } });
+        let pause = |n: u8, generation: u64| command(n, &place, Command::Pause, generation);
         // A press on the phone itself: a command made before it is refused.
         // (It is the person's, and on what plays, unless said: the queue is the phone's own.)
         assert_eq!(phone.handle(r#"{"event":"changed"}"#, 2_000, 100, &mut random(&mut n)).0, r#"[{"act":"claim"}]"#);
@@ -623,18 +775,20 @@ mod tests {
         for (event, generation) in [(r#"{"event":"changed","who":"nobody"}"#, 3), (r#"{"event":"changed","what":"manner"}"#, 4), (r#"{"event":"changed","who":"guest","what":"manner"}"#, 5)] {
             assert_eq!((phone.handle(event, 2_000, 100, &mut random(&mut n)).0.as_str(), phone.player.rule.generation()), ("[]", generation), "{event}");
         }
-        let came = phone.from_relay(session, heard(vec![pause(1, 1)]), 2_100, 100, &mut random(&mut n));
-        assert!(came.acts.is_empty() && came.native.iter().any(|ask| matches!(ask, Do::Log(line) if line.contains("refused, Changed"))));
+        let came = phone.from_relay(session, heard(&place, vec![pause(1, 1)]), 2_100, 100, &mut random(&mut n));
+        assert!(came.acts.is_empty() && logged(&came.native, "refused, Changed"));
         // Something chosen is being looked up: busy until it is said to be over.
         let (acts, _) = phone.handle(r#"{"event":"looking_up"}"#, 2_200, 100, &mut random(&mut n));
         assert_eq!(acts, r#"[{"act":"ticket","ticket":1}]"#);
-        let came = phone.from_relay(session, heard(vec![pause(2, 5)]), 2_300, 100, &mut random(&mut n));
-        assert!(came.native.iter().any(|ask| matches!(ask, Do::Log(line) if line.contains("refused, Busy"))));
+        let came = phone.from_relay(session, heard(&place, vec![pause(2, 5)]), 2_300, 100, &mut random(&mut n));
+        assert!(logged(&came.native, "refused, Busy"));
         phone.handle(r#"{"event":"looked_up","ticket":1}"#, 2_400, 100, &mut random(&mut n));
-        let came = phone.from_relay(session, heard(vec![pause(3, 5)]), 2_500, 100, &mut random(&mut n));
-        assert_eq!(came.acts, [Act::Claim, Act::Carry { number: 1, command: Command::Pause, ready: Ready::Nothing }]);
-        // Carrying it out was counted when it was decided: the phone says what its player
-        // holds afterwards, and that is not another change.
+        let came = phone.from_relay(session, heard(&place, vec![pause(3, 5)]), 2_500, 100, &mut random(&mut n));
+        assert_eq!(came.acts, [Act::Carry { number: 1, command: Command::Pause, ready: Ready::Nothing }]);
+        // Carrying it out is counted when Kotlin says it changed something, once: and
+        // saying what the player holds afterwards is not another change.
+        phone.handle(&did(1, true, &ids(&[0, 1])), 2_550, 100, &mut random(&mut n));
+        phone.handle(&serde_json::json!({"event": "player", "after": 1, "playing": held(&ids(&[0, 1]))}).to_string(), 2_600, 100, &mut random(&mut n));
         assert_eq!(phone.player.rule.generation(), 6);
     }
 
@@ -684,31 +838,69 @@ mod tests {
     fn what_arrives_before_the_player_has_caught_up_is_decided_when_it_has() {
         let mut n = 0;
         let (mut phone, session, place) = phone(&mut n);
-        let heard = |frames| FromRelay::Heard { places: vec![text::place(&place), text::place(&[1; 16])], frames };
-        let remove = |n: u8, id: &str, generation: u64| from_pc(n, &place, Ask::Do { command: Command::Remove { at: 1, id: id.into() }, at: At { generation, minute: 0 } });
-        let ids = |from: &[usize]| from.iter().map(|n| format!("s{n}")).collect::<Vec<_>>();
+        let remove = |n: u8, id: &str, generation: u64| command(n, &place, Command::Remove { at: 1, id: id.into() }, generation);
         // The first of what is to come is taken out; and, before the player has said it
-        // did that, the next: which is kept.
-        let came = phone.from_relay(session, heard(vec![remove(1, "s1", 1)]), 2_000, 100, &mut random(&mut n));
-        assert_eq!(came.acts, [Act::Claim, Act::Carry { number: 1, command: Command::Remove { at: 1, id: "s1".into() }, ready: Ready::Entry(0) }]);
-        let came = phone.from_relay(session, heard(vec![remove(2, "s2", 2)]), 2_010, 100, &mut random(&mut n));
+        // did that, the next arrives (made against the state the first will leave): kept.
+        let came = phone.from_relay(session, heard(&place, vec![remove(1, "s1", 1)]), 2_000, 100, &mut random(&mut n));
+        assert_eq!(came.acts, [Act::Carry { number: 1, command: Command::Remove { at: 1, id: "s1".into() }, ready: Ready::Entry(0) }]);
+        let came = phone.from_relay(session, heard(&place, vec![remove(2, "s2", 2)]), 2_010, 100, &mut random(&mut n));
         assert_eq!(came, Came::default());
         // What the player held before it did the first is not how it is.
-        assert_eq!(phone.handle(&playing(&ids(&[0, 1, 2, 3]), 0).to_string(), 2_020, 100, &mut random(&mut n)).0, "[]");
-        // It says it has: and the second finds the queue as the first left it. (Against
-        // the queue as it was, it would have taken out the song after the one meant.)
-        let (acts, native) = phone.handle(&playing(&ids(&[0, 2, 3]), 1).to_string(), 2_030, 100, &mut random(&mut n));
+        assert_eq!(phone.handle(&serde_json::json!({"event": "player", "after": 0, "playing": held(&ids(&[0, 1, 2, 3]))}).to_string(), 2_020, 100, &mut random(&mut n)).0, "[]");
+        // It says it has: the first is answered, and the second finds the queue as the
+        // first left it. (Against the queue as it was, it would have taken out the song
+        // after the one meant.)
+        let (acts, native) = phone.handle(&did(1, true, &ids(&[0, 2, 3])), 2_030, 100, &mut random(&mut n));
         assert_eq!(acts, r#"[{"act":"claim"},{"act":"carry","number":2,"command":{"do":"remove","with":{"at":1,"id":"s2"}},"ready":{"entry":0}}]"#);
-        assert!(native.iter().any(|ask| matches!(ask, Do::Send { .. })));
-        // A player that never says so holds nothing up for long: at two seconds what was
-        // kept is decided against what it last said.
-        let came = phone.from_relay(session, heard(vec![remove(3, "s3", 3)]), 2_100, 100, &mut random(&mut n));
+        assert_eq!(sends(&native), 1);
+    }
+
+    /// The player was asked to do something that is not a command (stop, at the end of
+    /// a move; take a queue), and has not said what it holds since. When its time is up,
+    /// what it last said is not gone by.
+    #[test]
+    fn nothing_is_decided_against_what_the_player_held_before_it_went_quiet() {
+        let mut n = 0;
+        let (mut phone, session, place) = phone(&mut n);
+        // (As after a queue was handed to it to take.)
+        phone.player.asked = 1;
+        phone.asked_ms = 2_000;
+        // A command arrives meanwhile, and is kept.
+        let came = phone.from_relay(session, heard(&place, vec![command(1, &place, Command::Next, 1)]), 2_100, 100, &mut random(&mut n));
         assert_eq!(came, Came::default());
-        let tick = r#"{"event":"tick","account":"the account","wanted":true}"#;
-        assert!(!phone.handle(tick, 3_000, 100, &mut random(&mut n)).0.contains("carry"));
-        let (acts, native) = phone.handle(tick, 4_040, 100, &mut random(&mut n));
-        assert!(acts.contains(r#"{"act":"carry","number":3,"command":{"do":"remove","with":{"at":1,"id":"s3"}},"ready":{"entry":1}}"#), "{acts}");
-        assert!(native.iter().any(|ask| matches!(ask, Do::Log(line) if line.contains("has not said it did"))));
+        // The player's time is up and it has said nothing: the phone is busy to the
+        // others, and the command is refused as that, not carried out on a guess.
+        let (acts, native) = phone.handle(TICK, 2_000 + CATCH_UP_MS, 100, &mut random(&mut n));
+        assert!(!acts.contains("carry") && logged(&native, "refused, Busy") && logged(&native, "busy to the others until it does"), "{acts} {native:?}");
+        assert!(phone.player.stale && phone.player.busy(2_000 + CATCH_UP_MS));
+        // It stays so, however long (and its state, to whoever looks, says busy).
+        let came = phone.from_relay(session, heard(&place, vec![command(2, &place, Command::Pause, 1)]), 9_000, 100, &mut random(&mut n));
+        assert!(came.acts.is_empty() && logged(&came.native, "refused, Busy"));
+        assert!(phone.player.busy(9_000));
+        // The player says what it holds: fresh again, and the next command goes through.
+        phone.handle(&serde_json::json!({"event": "player", "after": 1, "playing": held(&ids(&[4, 5, 6]))}).to_string(), 9_100, 100, &mut random(&mut n));
+        assert!(!phone.player.stale && !phone.player.busy(9_100));
+        let came = phone.from_relay(session, heard(&place, vec![command(3, &place, Command::Pause, 1)]), 9_200, 100, &mut random(&mut n));
+        assert_eq!(came.acts, [Act::Carry { number: 2, command: Command::Pause, ready: Ready::Nothing }]);
+    }
+
+    /// The person signs out, or signs in as someone else, while frames are kept waiting
+    /// for the player: the sign-in's end comes first, and nothing kept under it is done.
+    #[test]
+    fn a_sign_out_is_applied_before_anything_that_was_kept_is_looked_at() {
+        for tick in [r#"{"event":"tick","account":"the account","wanted":false}"#, r#"{"event":"tick","account":"somebody else","wanted":true}"#] {
+            let mut n = 0;
+            let (mut phone, session, place) = phone(&mut n);
+            phone.player.asked = 1;
+            phone.asked_ms = 2_000;
+            phone.from_relay(session, heard(&place, vec![command(1, &place, Command::Next, 1), command(2, &place, Command::Pause, 1)]), 2_100, 100, &mut random(&mut n));
+            assert_eq!(phone.kept.len(), 2);
+            // The tick that says so is also the one at which the player's time is up.
+            let (acts, native) = phone.handle(tick, 2_000 + CATCH_UP_MS, 100, &mut random(&mut n));
+            assert!(native.iter().any(|ask| matches!(ask, Do::End { .. })), "{tick}: {native:?}");
+            assert!(!acts.contains("carry") && sends(&native) == 0 && !logged(&native, " from "), "{tick}: {acts} {native:?}");
+            assert!(phone.kept.is_empty() && !phone.player.rule.busy(2_000 + CATCH_UP_MS));
+        }
     }
 
     /// Two phones of one account in one room, each with a few lines for a player that does
@@ -732,7 +924,7 @@ mod tests {
             let places = [[5; 16], [6; 16]];
             let phones = [0, 1].map(|who| {
                 let mut phone = Phone::new([who as u8 + 1; 16], ["Phone A", "Phone B"][who], Vec::new());
-                let (_, native) = phone.handle(r#"{"event":"tick","account":"the account","wanted":true}"#, 1_000, 100, &mut random(&mut n));
+                let (_, native) = phone.handle(TICK, 1_000, 100, &mut random(&mut n));
                 let Some(Do::Look { number, .. }) = native.first().cloned() else { panic!("no look") };
                 let came = phone.looked(number, 1_000, Looked::Secret { secret: Secret::new([7; 32]), id: "k".into(), wrote: None }, false, 1_000, 100, &mut random(&mut n));
                 let Some(Do::Begin { session, .. }) = came.native.iter().find(|ask| matches!(ask, Do::Begin { .. })).cloned() else { panic!("no session") };
@@ -754,18 +946,22 @@ mod tests {
             pair
         }
 
-        /// The player says what it holds, having done every act up to this one.
-        fn report(&mut self, who: usize, after: u64) {
+        fn holds(&self, who: usize) -> Playing {
             let songs = &self.songs[who];
             let entry = |id: &String| super::super::message::Entry { id: id.clone(), title: id.clone(), ..Default::default() };
-            let playing = Playing {
+            Playing {
                 brief: Brief { playing: self.sounds[who].is_some(), title: songs.first().cloned().unwrap_or_default(), artist: String::new() },
                 full: Full::fitted(self.sounds[who].unwrap_or(0.0), songs.first().map(entry), songs.iter().skip(1).map(entry), "", false, 0, 1.0),
                 handed: Handed::fitted(songs, 0, self.sounds[who].unwrap_or(0.0), "the queue"),
                 ahead: songs.iter().skip(1).cloned().collect(),
                 has_song: !songs.is_empty(),
                 sounding_at: self.sounds[who],
-            };
+            }
+        }
+
+        /// The player says what it holds, having done every act up to this one.
+        fn report(&mut self, who: usize, after: u64) {
+            let playing = self.holds(who);
             let came = self.phones[who].happened(Event::Player { playing, after }, self.now, 100, &mut random(&mut self.n));
             self.came(who, came);
         }
@@ -781,34 +977,39 @@ mod tests {
         /// Does what a phone was asked: its player's part, and carrying what it sends.
         fn came(&mut self, who: usize, came: Came) {
             for act in came.acts {
-                let done = match &act {
+                self.acts[who].push(act.clone());
+                match act {
+                    // The player carries a command out as the same press would be, and
+                    // says at once whether that changed anything and what it now holds.
                     Act::Carry { number, command, ready } => {
-                        match (command, ready) {
-                            (Command::Pause | Command::Moved, _) => self.sounds[who] = None,
-                            (Command::Play, _) => self.sounds[who] = Some(0.0),
-                            (Command::Next, _) if self.songs[who].len() > 1 => drop(self.songs[who].remove(0)),
+                        let changed = match (&command, &ready) {
+                            (Command::Pause | Command::Moved, _) => self.sounds[who].take().is_some(),
+                            (Command::Play, _) => self.sounds[who].replace(0.0).is_none(),
+                            (Command::Next, _) if self.songs[who].len() > 1 => {
+                                self.songs[who].remove(0);
+                                true
+                            }
                             (Command::Adopt(adopt), Ready::Queue(songs, begin)) => {
                                 self.songs[who] = songs.iter().skip(*begin).map(|(id, _)| id.clone()).collect();
                                 self.sounds[who] = Some(adopt.position);
+                                true
                             }
-                            _ => {}
-                        }
-                        Some(*number)
+                            _ => false,
+                        };
+                        let playing = self.holds(who);
+                        let came = self.phones[who].happened(Event::Did { number, changed, playing }, self.now, 100, &mut random(&mut self.n));
+                        self.came(who, came);
                     }
                     Act::Pause { number } => {
                         self.sounds[who] = None;
-                        Some(*number)
+                        self.report(who, number);
                     }
                     Act::Take { number, songs, begin, position, .. } => {
-                        self.songs[who] = songs.iter().skip(*begin).map(|(id, _)| id.clone()).collect();
-                        self.sounds[who] = Some(*position);
-                        Some(*number)
+                        self.songs[who] = songs.iter().skip(begin).map(|(id, _)| id.clone()).collect();
+                        self.sounds[who] = Some(position);
+                        self.report(who, number);
                     }
-                    _ => None,
-                };
-                self.acts[who].push(act);
-                if let Some(number) = done {
-                    self.report(who, number);
+                    _ => {}
                 }
             }
             for ask in came.native {
@@ -838,7 +1039,7 @@ mod tests {
                         let after = self.phones[who].player.asked;
                         self.report(who, after);
                     }
-                    self.event(who, r#"{"event":"tick","account":"the account","wanted":true}"#);
+                    self.event(who, TICK);
                 }
             }
         }
@@ -850,13 +1051,18 @@ mod tests {
         fn carried(&self, who: usize) -> Vec<&str> {
             self.acts[who].iter().filter_map(|act| if let Act::Carry { command, .. } = act { Some(command.name()) } else { None }).collect()
         }
+
+        /// How many times the queue has been said to be this phone's own.
+        fn claims(&self, who: usize) -> usize {
+            self.acts[who].iter().filter(|act| **act == Act::Claim).count()
+        }
     }
 
     #[test]
     fn one_phone_steers_another_and_brings_its_music_over() {
         let mut pair = Pair::new();
         // Each lists the other, with what it is doing.
-        let shown = pair.event(0, r#"{"event":"tick","account":"the account","wanted":true}"#);
+        let shown = pair.event(0, TICK);
         assert!(shown.contains(r#""name":"Phone B","about":"Playing s0","playing":true,"active":false,"ready":true"#), "{shown}");
         // A, which is playing nothing, picks B: its player is B's now, and shows what B plays.
         let place = text::place(&pair.places[1]);
@@ -869,21 +1075,24 @@ mod tests {
         assert!(acts.starts_with(r#"[{"act":"view","view":{"full":{"#) && acts.ends_with(r#"{"act":"handled","by_another":true}]"#), "{acts}");
         pair.pass(500);
         assert_eq!((pair.carried(1), pair.carried(0), pair.songs[1][0].as_str()), (vec!["next"], vec![], "s1"));
-        // "Play here": A takes B's queue as data, and when A's sound has started, B is paused.
+        // B's queue is B's own by it: the person chose it, at A.
+        assert_eq!((pair.claims(1), pair.claims(0)), (1, 0));
+        // "Play here": A takes B's queue as data, and when A's sound has started, B is
+        // told the music has moved.
         assert!(pair.event(0, r#"{"event":"play_here"}"#).ends_with(r#"{"act":"handled","by_another":true}]"#));
         pair.pass(1_500);
         assert!(pair.acts[0].iter().any(|act| matches!(act, Act::Take { songs, begin: 0, .. } if songs.len() == 3 && songs[0].0 == "s1")), "{:?}", pair.acts[0]);
         assert_eq!((pair.said(0).last().copied(), pair.carried(1), pair.sounds[1]), (Some("Playing here. Phone B is paused."), vec!["next", "moved"], None));
-        // B's going quiet was nobody's choice there: its queue is not claimed by it (as it
-        // was by the Next), so that A, which is playing, is the one whose queue is newest.
-        let before_each: Vec<bool> = pair.acts[1].iter().enumerate().filter(|(_, act)| matches!(act, Act::Carry { .. })).map(|(at, _)| at > 0 && pair.acts[1][at - 1] == Act::Claim).collect();
-        assert_eq!(before_each, [true, false]);
         assert!(pair.acts[0].contains(&Act::Do { ask: Do::Steering(None) }));
+        // The queue is A's own by taking it; B's going quiet was nobody's choice there and
+        // claims nothing, so that A, which is playing, is the one whose queue is newest.
+        assert_eq!((pair.claims(0), pair.claims(1)), (1, 1));
         // And given back: A, playing, picks B, which takes the queue and plays; A is stopped
-        // when B's sound has started.
+        // when B's sound has started. B's queue is B's by taking it; A's stop is the app's own.
         pair.event(0, &serde_json::json!({"event": "choose", "place": place, "in_a_jam": false}).to_string());
         pair.pass(1_500);
         assert_eq!((pair.said(0).last().copied(), pair.carried(1), pair.sounds[0]), (Some("Playing on Phone B."), vec!["next", "moved", "adopt"], None));
         assert!(matches!(pair.acts[0].iter().rev().find(|act| matches!(act, Act::Pause { .. } | Act::Take { .. })), Some(Act::Pause { .. })));
+        assert_eq!((pair.claims(0), pair.claims(1)), (1, 2));
     }
 }

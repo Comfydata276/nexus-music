@@ -33,7 +33,7 @@ use std::time::Duration;
 
 use nexus_core::http::{Failure, Http, Request, Response};
 use nexus_core::link::command::Command;
-use nexus_core::link::device::{Brief, Device, Do, Env, Me, Player, Ready, may_go, wanted};
+use nexus_core::link::device::{Brief, Carried, Device, Do, Env, Me, Player, Ready, may_go, wanted};
 use nexus_core::link::message::{At, Entry, Full, Handed, Why};
 use nexus_core::link::relay::{self, FromRelay, Relay};
 use nexus_core::link::rule::{Carrying, Reservation, Waiting};
@@ -323,7 +323,7 @@ impl Player for Here<'_> {
         pb.order.iter().skip(pb.cursor + 1).filter_map(|&index| pb.queue.get(index)).map(|song| song.id.clone()).collect()
     }
 
-    fn carry_out(&mut self, command: &Command, ready: &Ready) -> bool {
+    fn carry_out(&mut self, command: &Command, ready: &Ready) -> Carried {
         let ctl = self.ctl;
         // What is so already is not done again: the functions below would count a volume
         // set to what it is, or a queue cleared of nothing, as a change.
@@ -339,7 +339,7 @@ impl Player for Here<'_> {
             }
         };
         if already {
-            return false;
+            return Carried::Unchanged;
         }
         // The person chose this at another of their devices. The rule counts it, once, if
         // the player changes anything for it, so the player's own counting is not added;
@@ -371,7 +371,7 @@ impl Player for Here<'_> {
         }
         // Each of those takes its way into the player only once it knows something will
         // change (`ways`): whether one was taken is whether anything did.
-        ctl.ways.borrow().taken()
+        if ctl.ways.borrow().taken() { Carried::Changed } else { Carried::Unchanged }
     }
 
     /// (The end of a move of this PC's music to another device: the app's own doing. The
