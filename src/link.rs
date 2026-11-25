@@ -600,13 +600,25 @@ impl Controller {
                 // to the relay and read the secret: a long look-up holds neither of those
                 // up. And not for longer than the command it is for is waited on: the
                 // deciding gives the command up then, and a look-up of fifty songs at a
-                // server that has stopped answering must not go on holding a worker. It
-                // is looked at between one song and the next.)
+                // server that has stopped answering must not go on holding a worker. No
+                // request of it outlives the command: `nexus_core::link::find`.)
                 Do::Find { ticket, ids, within_ms } => {
                     let account = self.settings.borrow().account();
-                    let until = std::time::Instant::now() + Duration::from_millis(within_ms);
+                    let began = std::time::Instant::now();
                     self.request(
-                        move |client| Ok(ids.iter().take_while(|_| std::time::Instant::now() < until).filter_map(|id| crate::jam::find_song(id, Some(client))).filter(|song| song.radio_url.is_empty()).collect::<Vec<Song>>()),
+                        move |client| {
+                            // The ones this PC's copy of the library has need no asking;
+                            // the rest are asked of the music server, each request given
+                            // what is left of the command's time and no more (the time
+                            // spent waiting for a worker is part of it).
+                            let index = crate::search::current();
+                            let kept = |id: &String| index.as_ref().and_then(|index| index.library.songs.iter().find(|song| song.id == *id).cloned());
+                            let lacking: Vec<String> = ids.iter().filter(|id| kept(id).is_none()).cloned().collect();
+                            let offline = client.clone();
+                            let http = LookHttp { agent: crate::corehttp::Agent(crate::subsonic::make_agent_without_redirects()), over: Arc::new(AtomicBool::new(false)), offline: Box::new(move || offline.is_offline()) };
+                            let mut found = nexus_core::link::find::find(&http, &client.link_account(), &lacking, Duration::from_millis(within_ms), &mut || began.elapsed());
+                            Ok(ids.iter().filter_map(|id| kept(id).or_else(|| found.iter().position(|song| song.id == *id).map(|at| found.remove(at)))).filter(|song| song.radio_url.is_empty()).collect::<Vec<Song>>())
+                        },
                         move |ctl, songs| {
                             // Before anything it found is kept: is a command still waiting
                             // for it, under the sign-in it was started for? One that was

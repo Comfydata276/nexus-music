@@ -83,7 +83,7 @@ pub fn ends_session(looked: &Looked) -> bool {
 }
 
 /// Why a request came to nothing.
-enum Not {
+pub(super) enum Not {
     /// No answer, or not one the server gives when all is well.
     Asked,
     /// The sign-in has ended: ask nothing more.
@@ -91,13 +91,15 @@ enum Not {
 }
 
 /// One call: its answer's text. `with` are the call's own fields, as they are (encoded here).
-fn call(http: &dyn Http, account: &Account, endpoint: &str, with: &[(&str, &str)], xml: bool) -> Result<String, Not> {
+/// `patience` is how long this one request is given, where that is less than the app gives
+/// any request to the music server.
+pub(super) fn call(http: &dyn Http, account: &Account, endpoint: &str, with: &[(&str, &str)], xml: bool, patience: Option<std::time::Duration>) -> Result<String, Not> {
     let mut form = format!("{}&f={}", account.form, if xml { "xml" } else { "json" });
     for (name, value) in with {
         form.push_str(&format!("&{name}={}", crate::text::encode(value)));
     }
     let url = format!("{}/{endpoint}", account.rest);
-    let request = Request { method: Method::Post(&form), url: &url, headers: &[("Content-Type", "application/x-www-form-urlencoded")], patience: None };
+    let request = Request { method: Method::Post(&form), url: &url, headers: &[("Content-Type", "application/x-www-form-urlencoded")], patience };
     match http.send(&request) {
         // (Only an answer the server gives when all is well is read: a proxy's error page,
         // or a 500 with a body that happens to parse, is no answer.)
@@ -111,7 +113,7 @@ fn call(http: &dyn Http, account: &Account, endpoint: &str, with: &[(&str, &str)
 /// The same, for a call answered in JSON: what is inside its `subsonic-response`, if the
 /// server says all is well.
 fn answer(http: &dyn Http, account: &Account, endpoint: &str, with: &[(&str, &str)]) -> Result<Value, Not> {
-    let text = call(http, account, endpoint, with, false)?;
+    let text = call(http, account, endpoint, with, false, None)?;
     let mut root: Value = serde_json::from_str(&text).map_err(|_| Not::Asked)?;
     let body = root.get_mut("subsonic-response").map(Value::take).ok_or(Not::Asked)?;
     if body["status"].as_str() == Some("ok") { Ok(body) } else { Err(Not::Asked) }
@@ -238,7 +240,7 @@ pub fn look(http: &dyn Http, account: &Account, mut used: Option<String>, mut re
         };
         // One answer, and the XML one: only it states whether the playlist is public, and
         // what it is, whose, and its comment are taken from the same answer.
-        let fetched = ask!(call(http, account, "getPlaylist", &[("id", &id)], true), unasked(no_good));
+        let fetched = ask!(call(http, account, "getPlaylist", &[("id", &id)], true, None), unasked(no_good));
         let Some(fetched) = secret::fetched(&fetched) else { return unasked(no_good) };
         match secret::judge(&id, replace, &fetched, &account.username) {
             Verdict::Use(_) if reset => {

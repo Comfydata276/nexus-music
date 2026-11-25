@@ -18,6 +18,7 @@
 pub mod bind;
 pub mod command;
 pub mod device;
+pub mod find;
 pub mod frame;
 pub mod look;
 pub mod message;

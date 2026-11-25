@@ -218,8 +218,9 @@ pub enum Do {
     Send { session: u64, token: Token, to: Place, frame: String },
     /// Some of the songs a command brings are not in this device's copy of the library:
     /// ask the music server for them, and answer with [`Device::found`] the ones it has.
-    /// **For no longer than `within_ms`**, looked at between one song and the next: that
-    /// is when the command is given up, and whatever is found after it is nobody's.
+    /// **For no longer than `within_ms`** (`super::find::find` gives each request what is
+    /// left of it): that is when the command is given up, and whatever is found after it
+    /// is nobody's.
     Find { ticket: u64, ids: Vec<String>, within_ms: u64 },
     /// For a test only: carry on with what this ticket holds after this long
     /// ([`Device::resume`]).
