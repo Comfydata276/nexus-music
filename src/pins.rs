@@ -26,8 +26,11 @@ pub struct World;
 
 /// What the stand-in answers: the first route whose method and address part match.
 static ROUTES: Mutex<Vec<(String, u16, String)>> = Mutex::new(Vec::new());
-/// Every request it has been sent, as "METHOD address body".
-static ASKED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// Every request it has been sent, as "METHOD address body", with the thread it came on.
+static ASKED: Mutex<Vec<(std::thread::ThreadId, String)>> = Mutex::new(Vec::new());
+/// What to change while a request is held, before it's answered: the first request that fits
+/// each key sets it off, once.
+static HOOKS: Mutex<Vec<(String, Box<dyn FnOnce() + Send>)>> = Mutex::new(Vec::new());
 /// One scene at a time: they share the app's globals.
 static SERIAL: Mutex<()> = Mutex::new(());
 
@@ -54,15 +57,24 @@ impl Http for World {
             nexus_core::http::Method::Put(body) => ("PUT", body),
         };
         let body: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
-        ASKED.lock().unwrap().push(format!("{method} {} {body}", request.url));
+        ASKED.lock().unwrap().push((std::thread::current().id(), format!("{method} {} {body}", request.url)));
         if STOPPED.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(Failure::Stopped);
         }
+        // A key is a method and parts of the address, " && " between them, all to be there.
+        let fits = |key: &str| {
+            let (want, parts) = key.split_once(' ').unwrap();
+            want == method && parts.split(" && ").all(|part| request.url.contains(part))
+        };
+        let hook = {
+            let mut hooks = HOOKS.lock().unwrap();
+            hooks.iter().position(|(key, _)| fits(key)).map(|at| hooks.remove(at).1)
+        };
+        if let Some(hook) = hook {
+            hook();
+        }
         let routes = ROUTES.lock().unwrap();
-        let found = routes.iter().find(|(key, _, _)| {
-            let (want, part) = key.split_once(' ').unwrap();
-            want == method && request.url.contains(part)
-        });
+        let found = routes.iter().find(|(key, _, _)| fits(key));
         let (status, text) = found.map(|(_, status, text)| (*status, text.clone())).unwrap_or((404, "{}".into()));
         drop(routes);
         Ok(Response::new(status, Vec::new(), move || Ok(text)))
@@ -76,10 +88,11 @@ impl Http for World {
     }
 }
 
-/// A scene: what each service answers, by "METHOD part-of-address", the first that fits.
-/// An answer starting "@500 " is sent with that status.
+/// A scene: what each service answers, by "METHOD part-of-address" (or several parts, joined
+/// by " && "), the first that fits. An answer starting "@500 " is sent with that status.
 pub struct Scene {
     routes: Vec<(String, u16, String)>,
+    hooks: Vec<(String, Box<dyn FnOnce() + Send>)>,
     library: Library,
     asked: Vec<crate::asked::Asked>,
     singles: bool,
@@ -88,7 +101,7 @@ pub struct Scene {
 
 impl Scene {
     pub fn new() -> Scene {
-        Scene { routes: Vec::new(), library: Library::default(), asked: Vec::new(), singles: true, lidarr: true }
+        Scene { routes: Vec::new(), hooks: Vec::new(), library: Library::default(), asked: Vec::new(), singles: true, lidarr: true }
     }
 
     pub fn answer(mut self, key: &str, answer: impl Into<String>) -> Scene {
@@ -98,6 +111,13 @@ impl Scene {
             None => (200, answer),
         };
         self.routes.push((key.to_string(), status, text));
+        self
+    }
+
+    /// Does `change` while the first request that fits `key` is held, before it's answered.
+    #[allow(dead_code)]
+    pub fn meanwhile(mut self, key: &str, change: impl FnOnce() + Send + 'static) -> Scene {
+        self.hooks.push((key.to_string(), Box::new(change)));
         self
     }
 
@@ -137,6 +157,7 @@ impl Scene {
         ENTERED.store(true, std::sync::atomic::Ordering::SeqCst);
         STOPPED.store(false, std::sync::atomic::Ordering::SeqCst);
         *ROUTES.lock().unwrap() = self.routes;
+        *HOOKS.lock().unwrap() = self.hooks;
         ASKED.lock().unwrap().clear();
         crate::lidarr::forget_offers();
         crate::lidarr::set_singles(self.singles);
@@ -158,7 +179,30 @@ pub fn stop() {
 
 /// The requests made so far, in the order made.
 pub fn asked() -> Vec<String> {
-    ASKED.lock().unwrap().clone()
+    ASKED.lock().unwrap().iter().map(|(_, asked)| asked.clone()).collect()
+}
+
+/// The same, by the thread each was made on: each thread's in the order it made them.
+pub fn asked_by_thread() -> Vec<Vec<String>> {
+    let mut threads: Vec<(std::thread::ThreadId, Vec<String>)> = Vec::new();
+    for (thread, asked) in ASKED.lock().unwrap().iter() {
+        match threads.iter_mut().find(|(known, _)| known == thread) {
+            Some((_, list)) => list.push(asked.clone()),
+            None => threads.push((*thread, vec![asked.clone()])),
+        }
+    }
+    let mut threads: Vec<Vec<String>> = threads.into_iter().map(|(_, list)| list).collect();
+    threads.sort();
+    threads
+}
+
+/// A library to put in place of the scene's while it's being looked at, as the window's
+/// worker does when the server's library has changed.
+#[allow(dead_code)]
+pub fn replace_library(albums: &[(&str, &str, &str)], songs: &[(&str, &str, &str)]) -> impl FnOnce() + Send + 'static {
+    let albums: Vec<CardData> = albums.iter().map(|(id, title, artist)| CardData { kind: Kind::Album, id: (*id).into(), title: (*title).into(), subtitle: (*artist).into(), cover: format!("al-{id}") }).collect();
+    let songs: Vec<Song> = songs.iter().map(|(id, title, artist)| Song { id: (*id).into(), title: (*title).into(), artist: (*artist).into(), ..Default::default() }).collect();
+    move || crate::search::set_current(Some(Index::new(Library { albums, songs, ..Default::default() })))
 }
 
 /// A dummy client: none of these pages asks the music server.
@@ -189,7 +233,24 @@ pub fn walk(route: Route, base: Option<PageData>) -> Vec<PageData> {
 /// Compares what a scene came to with what the old code made of it; with NEXUS_RECORD set,
 /// writes that instead. `sorted` for requests made on several threads at once.
 pub fn pinned(name: &str, stages: &[PageData], sorted: bool) {
+    if sorted {
+        pinned_threads(name, asked_by_thread());
+    }
     pinned_with(name, stages, asked(), sorted)
+}
+
+/// Where requests were made on several threads, each thread's in its order, compared with
+/// what the old code made (`<name>.threads.json`).
+pub fn pinned_threads(name: &str, threads: Vec<Vec<String>>) {
+    let found = json!(threads);
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/requests").join(format!("{name}.threads.json"));
+    if std::env::var_os("NEXUS_RECORD").is_some() {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_string_pretty(&found).unwrap() + "\n").unwrap();
+        return;
+    }
+    let kept: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap_or_else(|_| panic!("no fixture {name}.threads"))).unwrap();
+    assert_eq!(kept, found, "{name}: the requests on each thread differ from what the old code made");
 }
 
 /// The same, with the requests given.
@@ -610,12 +671,19 @@ fn the_requests_page() {
     pinned_with("requests", &stages, log, false);
 }
 
+/// What the stand-in music server was asked, in "Artists you might like".
+static SERVER: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
 #[test]
 fn artists_you_might_like() {
     // The music server says who's like the artists played most; Lidarr says who each of
     // those is. Anyone it keeps track of already, or the library has, is left out.
     use std::io::Write;
+    SERVER.lock().unwrap().clear();
     let server = crate::subsonic::fake::server(|path, _, stream| {
+        // Without what changes from run to run: the salt and the token made from it.
+        let shown: Vec<&str> = path.split('&').filter(|part| !part.starts_with("t=") && !part.starts_with("s=")).collect();
+        SERVER.lock().unwrap().push(shown.join("&"));
         let similar = if path.contains("id=lib-a") {
             r#"[{"name":"Shore Lights","id":"-1"},{"name":"Kept Band","id":""},{"name":"Owned Band","id":"lib-o"},{"name":"Nobody Knows","id":"-1"}]"#
         } else {
@@ -639,40 +707,171 @@ fn artists_you_might_like() {
     let home = PageData { title: "Home".into(), shelves: vec![crate::pages::ShelfData { title: "Recently played".into(), ..Default::default() }], ..Default::default() };
     let mut stages = Vec::new();
     stages.extend(crate::pages::enrich(&client, &Route::Home, &home, &mut |_| {}));
+    pinned_threads("artists-you-might-like", asked_by_thread());
     let mut log = asked();
     log.sort();
     pinned_with("artists-you-might-like", &stages, log, false);
+    // And what the music server was asked (four at a time, so in no set order).
+    let mut server = SERVER.lock().unwrap().clone();
+    server.sort();
+    pinned_threads("artists-you-might-like.server", vec![server]);
+}
+
+// ---- what no scene above reaches -------------------------------------------------------------------
+
+fn named(id: &str, name: &str) -> Value {
+    lidarr_artist(id, name, false, "")
 }
 
 #[test]
-fn the_windows_library_answers_as_the_plain_lists_do() {
-    // The window's index and the plain lists the phone hands across, made from the same
-    // library, give the same answer to every question.
-    use nexus_core::requests::{Library as _, LibraryAlbum, Snapshot};
-    let albums = [("a1", "…Something to Be", "Rob Thomas"), ("a2", "Parachutes", "Coldplay"), ("a3", "Parachutes ", "coldplay"), ("a4", "X&Y", "Coldplay"), ("a5", "Beyoncé", "Beyoncé")];
-    let songs = [("s1", "Yellow (Live)", "Coldplay", ""), ("s2", "Lonely No More", "Rob Thomas", ""), ("s3", "Fix You", "Coldplay", "Coldplay & Friends"), ("s4", "Halo", "Beyonce", "")];
-    let artists = ["Coldplay", "Rob Thomas", "Beyoncé"];
-    let index = Index::new(Library {
-        albums: albums.iter().map(|(id, title, artist)| CardData { kind: Kind::Album, id: (*id).into(), title: (*title).into(), subtitle: (*artist).into(), cover: format!("al-{id}") }).collect(),
-        songs: songs.iter().map(|(id, title, artist, shown)| Song { id: (*id).into(), title: (*title).into(), artist: (*artist).into(), display_artist: (*shown).into(), ..Default::default() }).collect(),
-        artists: artists.iter().map(|name| CardData { kind: Kind::Artist, id: format!("ar-{name}"), title: (*name).into(), subtitle: String::new(), cover: String::new() }).collect(),
-        ..Default::default()
-    });
-    let snapshot = Snapshot {
-        albums: albums.iter().map(|(id, title, artist)| LibraryAlbum { id: (*id).into(), title: (*title).into(), artist: (*artist).into(), cover: format!("al-{id}") }).collect(),
-        songs: songs.iter().map(|(_, title, artist, shown)| ((*title).into(), if shown.is_empty() { (*artist).into() } else { (*shown).into() })).collect(),
-        artists: artists.iter().map(|name| (*name).into()).collect(),
-    };
-    assert_eq!(index.album_names(), snapshot.album_names());
-    assert_eq!(index.song_names(), snapshot.song_names());
-    assert_eq!(index.artist_names(), snapshot.artist_names());
-    for name in ["Coldplay", "coldplay", "Rob Thomas", "Beyonce", "Beyoncé", "Nobody", "", "Coldplay & Friends"] {
-        assert_eq!(index.songs_by(name), snapshot.songs_by(name), "songs by {name}");
-        assert_eq!(index.album_titles_by(name), snapshot.album_titles_by(name), "albums by {name}");
-        assert_eq!(index.albums_by(name), snapshot.albums_by(name), "albums by {name}");
-        for title in ["Parachutes", "...Something To Be", "x & y", "Beyonce", "Nothing"] {
-            assert_eq!(index.same_album(title, name), snapshot.same_album(title, name), "{title} by {name}");
-        }
+fn search_at_its_limits() {
+    // Eleven artists named in what was typed (ten are kept); twenty-six of Lidarr's albums
+    // (twenty-four are); twenty-two songs by four artists (twenty are kept, and the first three
+    // songs' artists join the artists, which then stop at twelve); the albums the first three
+    // songs are on go first, and the albums stop at twelve.
+    let artists: Vec<Value> = (1..=11).map(|n| named(&format!("lim-a{n}"), &format!("Lim Artist {n}"))).collect();
+    let albums: Vec<Value> = (1..=26).map(|n| lidarr_album(&format!("rg-lim{n}"), &format!("Lim Album {n}"), "Album", &[], "2010-01-01T00:00:00Z", (&format!("lim-x{n}"), &format!("Lim Maker {n}")), 0)).collect();
+    let by = |n: usize| (["sa0", "sa1", "sa2", "sa3"][n % 4], ["Song Artist Zero", "Song Artist One", "Song Artist Two", "Song Artist Three"][n % 4]);
+    let songs: Vec<Value> = (0..22)
+        .map(|n| {
+            let (id, name) = by(n);
+            recording(&format!("rec-lim{n}"), &format!("Lim Song {n}"), (id, name), 200, 100, &[(&format!("rg-ls{n}"), &format!("Lim Song Album {n}"), "Album", "2001-01-01")])
+        })
+        .collect();
+    let _scene = Scene::new()
+        .answer("GET lidarr.test/api/v1/artist/lookup?term=lim&", list(&artists))
+        .answer("GET lidarr.test/api/v1/artist/lookup?term=lim", list(&artists))
+        .answer("GET lidarr.test/api/v1/artist/lookup?term=lidarr", "[]")
+        .answer("GET lidarr.test/api/v1/album/lookup?term=lim", list(&albums))
+        .answer("GET musicbrainz.org/ws/2/recording?query=lim&dismax=true", recordings(&songs))
+        .answer("POST api.listenbrainz.org/1/popularity/recording", "[]")
+        .enter();
+    pinned("search-at-its-limits", &searched("lim"), true);
+}
+
+#[test]
+fn search_for_an_artist_on_plays_alone() {
+    // Three artists called exactly what was typed: one pictured and played a little, two not
+    // pictured and played as much as each other, more. Plays alone make an artist one of
+    // note; of two equal, the first is meant, and goes ahead of the pictured one. Twenty-six
+    // of their albums are listed by MusicBrainz: twenty-four are offered.
+    let vale = ("va-a", "Vale");
+    let groups_of: Vec<Value> = (1..=26).map(|n| group(&format!("rg-va{n}"), &format!("Vale Album {n}"), "Album", &[], &format!("19{:02}-01-01", 70 + n), vale)).collect();
+    let _scene = Scene::new()
+        .answer("GET lidarr.test/api/v1/artist/lookup?term=Vale", list(&[
+            lidarr_artist("va-n", "Vale", true, "pictured"),
+            named("va-a", "Vale"),
+            named("va-b", "Vale"),
+            named("va-c", "Vale Choir"),
+        ]))
+        .answer("GET lidarr.test/api/v1/album/lookup?term=Vale", list(&[lidarr_album("rg-vl", "From Lidarr", "Album", &[], "2020-01-01T00:00:00Z", ("va-n", "Vale"), 0)]))
+        .answer("POST api.listenbrainz.org/1/popularity/artist", listens("artist_mbid", &[("va-n", 15_000), ("va-a", 20_000), ("va-b", 20_000)]))
+        .answer("GET musicbrainz.org/ws/2/recording?query=Vale&dismax=true", recordings(&[recording("rec-v", "Vale", ("zz9", "Zed"), 200, 100, &[("rg-zz9", "Zed's", "Album", "2012-01-01")])]))
+        .answer("POST api.listenbrainz.org/1/popularity/recording", listens("recording_mbid", &[("rec-v", 100)]))
+        .answer("GET musicbrainz.org/ws/2/release-group?artist=va-a&type=album%7Cep%7Csingle", groups(&groups_of))
+        .answer("GET api.listenbrainz.org/1/popularity/top-recordings-for-artist/va-a", "[]")
+        .answer("POST api.listenbrainz.org/1/popularity/release-group", "[]")
+        .enter();
+    pinned("search-artist-on-plays-alone", &searched("Vale"), true);
+}
+
+#[test]
+fn search_for_an_artist_whose_releases_cannot_be_had() {
+    // The artist is meant beyond doubt, but Lidarr's search for releases fails, and so does
+    // MusicBrainz's list of theirs.
+    let _scene = Scene::new()
+        .answer("GET lidarr.test/api/v1/artist/lookup?term=Fail%20Band", list(&[lidarr_artist("fb", "Fail Band", true, "")]))
+        .answer("GET lidarr.test/api/v1/album/lookup?term=Fail%20Band", "@500 {}")
+        .answer("POST api.listenbrainz.org/1/popularity/artist", listens("artist_mbid", &[("fb", 6_000_000)]))
+        .answer("GET musicbrainz.org/ws/2/release-group?artist=fb", "@500 {}")
+        .enter();
+    pinned("search-artist-releases-fail", &searched("Fail Band"), true);
+}
+
+#[test]
+fn search_for_a_famous_single_found_only_the_wider_way() {
+    // Of the artist's song among studio albums only, MusicBrainz knows a guest's version
+    // first; asked again with only live recordings left out, theirs is there and played most.
+    let os = ("os1", "Old Singer");
+    let guest = ("gx1", "Guest Band");
+    let _scene = Scene::new()
+        .answer("GET lidarr.test/api/v1/artist/lookup?term=Old%20Song", "[]")
+        .answer("GET lidarr.test/api/v1/album/lookup?term=Old%20Song", list(&[lidarr_album("rg-os", "Old Song", "Single", &[], "1990-01-01T00:00:00Z", os, 9)]))
+        .answer("GET musicbrainz.org/ws/2/recording?query=arid%3Aos1 && limit=50", recordings(&[
+            recording("rec-g", "Old Song", guest, 200, 100, &[("rg-g", "Guest Album", "Album", "2015-01-01")]),
+        ]))
+        .answer("GET musicbrainz.org/ws/2/recording?query=arid%3Aos1 && limit=100", recordings(&[
+            recording("rec-g", "Old Song", guest, 200, 100, &[("rg-g", "Guest Album", "Album", "2015-01-01")]),
+            recording("rec-o", "Old Song", os, 210, 100, &[("rg-oa", "Old Album", "Album", "1990-05-01"), ("rg-hits", "Hits", "Album", "2000-05-01")]),
+        ]))
+        .answer("POST api.listenbrainz.org/1/popularity/recording", listens("recording_mbid", &[("rec-o", 9000), ("rec-g", 50)]))
+        .answer("GET musicbrainz.org/ws/2/recording?query=Old%20Song&dismax=true", recordings(&[
+            recording("rec-o", "Old Song", os, 210, 100, &[("rg-oa", "Old Album", "Album", "1990-05-01")]),
+            recording("rec-c", "Old Song", ("cv", "Cover Band"), 200, 90, &[("rg-cv", "Covers", "Album", "2010-05-01")]),
+        ]))
+        .answer("GET lidarr.test/api/v1/artist/lookup?term=lidarr", "[]")
+        .enter();
+    pinned("search-famous-single-wider", &searched("Old Song"), true);
+}
+
+/// Ten songs an artist is most played for, all on their one album.
+fn ten_most_played(id: &str, name: &str) -> (String, String) {
+    let songs: Vec<(String, &str, u64)> = (1..=10).map(|n| (format!("Song {n}"), "The Album", 1000 - n as u64)).collect();
+    let top_of: Vec<(&str, &str, u64)> = songs.iter().map(|(title, album, count)| (title.as_str(), *album, *count)).collect();
+    (groups(&[group(&format!("rg-{id}"), "The Album", "Album", &[], "2015-01-01", (id, name))]), top(&top_of))
+}
+
+#[test]
+fn popular_at_its_edges() {
+    // Eight of ten listed; one the library has at the eighth place leaves a ninth in its
+    // place and says some were left out; one it has only at the ninth says nothing of it.
+    let mut stages = Vec::new();
+    let mut log = Vec::new();
+    for (id, owned) in [("p8", "Song 8"), ("p9", "Song 9")] {
+        let (releases, most) = ten_most_played(id, "Eight Band");
+        let _scene = Scene::new()
+            .answer("GET lidarr.test/api/v1/artist", "[]")
+            .answer(&format!("GET musicbrainz.org/ws/2/release-group?artist={id}&"), releases)
+            .answer(&format!("GET api.listenbrainz.org/1/popularity/top-recordings-for-artist/{id}"), most)
+            .song("s-own", owned, "Eight Band", "lib-eb", 1)
+            .enter();
+        stages.extend(walk(Route::OutsideArtist(id.into()), None));
+        log.extend(asked());
     }
-    assert!(!index.songs_by("Coldplay").is_empty() && index.same_album("Parachutes", "Coldplay").is_some());
+    pinned_with("popular-at-its-edges", &stages, log, false);
+}
+
+#[test]
+fn an_artist_lidarr_keeps_with_singles_from_musicbrainz() {
+    // Singles and EPs on: Lidarr's list, and MusicBrainz's singles and EPs it hasn't got (one
+    // it has, by the same name for it, isn't listed twice; an album it hasn't isn't added).
+    // Then the same artist when MusicBrainz can't be had: Lidarr's list alone.
+    let mut stages = Vec::new();
+    let mut log = Vec::new();
+    for (id, fails) in [("tm", false), ("tf", true)] {
+        let lidarr_list = list(&[
+            json!({ "id": 91, "title": "Their Album", "foreignAlbumId": format!("rg-{id}-a"), "albumType": "Album", "secondaryTypes": [], "releaseDate": "2015-01-01T00:00:00Z", "monitored": false, "statistics": { "trackFileCount": 0 }, "artist": { "artistName": "Tracked Band", "foreignArtistId": id } }),
+            json!({ "id": 92, "title": "Their EP", "foreignAlbumId": format!("rg-{id}-e"), "albumType": "EP", "secondaryTypes": [], "releaseDate": "2016-01-01T00:00:00Z", "monitored": true, "statistics": { "trackFileCount": 0 }, "artist": { "artistName": "Tracked Band", "foreignArtistId": id } }),
+        ]);
+        let brainz = if fails {
+            "@500 {}".to_string()
+        } else {
+            groups(&[
+                group(&format!("rg-{id}-a"), "Their Album", "Album", &[], "2015-01-01", (id, "Tracked Band")),
+                group(&format!("rg-{id}-e"), "Their EP", "EP", &[], "2016-01-01", (id, "Tracked Band")),
+                group(&format!("rg-{id}-s"), "Their Single", "Single", &[], "2017-01-01", (id, "Tracked Band")),
+                group(&format!("rg-{id}-a2"), "Another Album", "Album", &[], "2018-01-01", (id, "Tracked Band")),
+            ])
+        };
+        let _scene = Scene::new()
+            .answer("GET lidarr.test/api/v1/artist", &format!(r#"[{{"id":9,"artistName":"Tracked Band","foreignArtistId":"{id}"}}]"#))
+            .answer("GET lidarr.test/api/v1/album?artistId=9", lidarr_list)
+            .answer(&format!("GET musicbrainz.org/ws/2/release-group?artist={id}&type=album%7Cep%7Csingle"), brainz)
+            .answer(&format!("GET api.listenbrainz.org/1/popularity/top-recordings-for-artist/{id}"), "[]")
+            .answer("POST api.listenbrainz.org/1/popularity/release-group", "[]")
+            .enter();
+        stages.extend(walk(Route::OutsideArtist(id.into()), None));
+        log.extend(asked());
+    }
+    pinned_with("artist-kept-with-singles", &stages, log, false);
 }

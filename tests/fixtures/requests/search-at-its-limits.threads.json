@@ -1,0 +1,46 @@
+[
+  [
+    "GET http://lidarr.test/api/v1/album/lookup?term=lim "
+  ],
+  [
+    "GET http://lidarr.test/api/v1/artist/lookup?term=lidarr%3Alim-a1 "
+  ],
+  [
+    "GET http://lidarr.test/api/v1/artist/lookup?term=lidarr%3Alim-a2 "
+  ],
+  [
+    "GET http://lidarr.test/api/v1/artist/lookup?term=lidarr%3Alim-a3 "
+  ],
+  [
+    "GET http://lidarr.test/api/v1/artist/lookup?term=lidarr%3Alim-a4 "
+  ],
+  [
+    "GET http://lidarr.test/api/v1/artist/lookup?term=lidarr%3Alim-a5 "
+  ],
+  [
+    "GET http://lidarr.test/api/v1/artist/lookup?term=lidarr%3Alim-a6 "
+  ],
+  [
+    "GET http://lidarr.test/api/v1/artist/lookup?term=lidarr%3Alim-a7 "
+  ],
+  [
+    "GET http://lidarr.test/api/v1/artist/lookup?term=lidarr%3Alim-a8 "
+  ],
+  [
+    "GET http://lidarr.test/api/v1/artist/lookup?term=lidarr%3Alim-a9 "
+  ],
+  [
+    "GET http://lidarr.test/api/v1/artist/lookup?term=lidarr%3Asa0 "
+  ],
+  [
+    "GET http://lidarr.test/api/v1/artist/lookup?term=lidarr%3Asa1 "
+  ],
+  [
+    "GET http://lidarr.test/api/v1/artist/lookup?term=lidarr%3Asa2 "
+  ],
+  [
+    "GET http://lidarr.test/api/v1/artist/lookup?term=lim ",
+    "GET https://musicbrainz.org/ws/2/recording?query=lim&dismax=true&limit=100&fmt=json ",
+    "POST https://api.listenbrainz.org/1/popularity/recording { \"recording_mbids\": [ \"rec-lim0\", \"rec-lim1\", \"rec-lim2\", \"rec-lim3\", \"rec-lim4\", \"rec-lim5\", \"rec-lim6\", \"rec-lim7\", \"rec-lim8\", \"rec-lim9\", \"rec-lim10\", \"rec-lim11\", \"rec-lim12\", \"rec-lim13\", \"rec-lim14\", \"rec-lim15\", \"rec-lim16\", \"rec-lim17\", \"rec-lim18\", \"rec-lim19\", \"rec-lim20\", \"rec-lim21\" ] }"
+  ]
+]

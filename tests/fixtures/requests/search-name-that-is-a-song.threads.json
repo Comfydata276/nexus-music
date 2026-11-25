@@ -1,0 +1,14 @@
+[
+  [
+    "GET http://lidarr.test/api/v1/album/lookup?term=Home "
+  ],
+  [
+    "GET http://lidarr.test/api/v1/artist/lookup?term=Home ",
+    "POST https://api.listenbrainz.org/1/popularity/artist { \"artist_mbids\": [ \"hm\", \"hm2\" ] }",
+    "GET https://musicbrainz.org/ws/2/recording?query=Home&dismax=true&limit=100&fmt=json ",
+    "POST https://api.listenbrainz.org/1/popularity/recording { \"recording_mbids\": [ \"rec-h3\", \"rec-h1\" ] }"
+  ],
+  [
+    "GET http://lidarr.test/api/v1/artist/lookup?term=lidarr%3Aps "
+  ]
+]

@@ -1,0 +1,11 @@
+[
+  [
+    "GET http://lidarr.test/api/v1/album/lookup?term=Quillon%20Vane "
+  ],
+  [
+    "GET http://lidarr.test/api/v1/artist/lookup?term=Quillon%20Vane ",
+    "POST https://api.listenbrainz.org/1/popularity/artist { \"artist_mbids\": [ \"qv1\" ] }",
+    "GET https://musicbrainz.org/ws/2/release-group?artist=qv1&type=album%7Cep%7Csingle&limit=100&offset=0&inc=artist-credits&fmt=json ",
+    "GET https://api.listenbrainz.org/1/popularity/top-recordings-for-artist/qv1 "
+  ]
+]

@@ -1,0 +1,740 @@
+{
+  "asked": [
+    "GET http://lidarr.test/api/v1/album/lookup?term=Vale ",
+    "GET http://lidarr.test/api/v1/artist/lookup?term=Vale ",
+    "GET https://api.listenbrainz.org/1/popularity/top-recordings-for-artist/va-a ",
+    "GET https://musicbrainz.org/ws/2/recording?query=Vale&dismax=true&limit=100&fmt=json ",
+    "GET https://musicbrainz.org/ws/2/release-group?artist=va-a&type=album%7Cep%7Csingle&limit=100&offset=0&inc=artist-credits&fmt=json ",
+    "POST https://api.listenbrainz.org/1/popularity/artist { \"artist_mbids\": [ \"va-n\", \"va-a\", \"va-b\" ] }",
+    "POST https://api.listenbrainz.org/1/popularity/recording { \"recording_mbids\": [ \"rec-v\" ] }",
+    "POST https://api.listenbrainz.org/1/popularity/release-group { \"release_group_mbids\": [ \"rg-va26\", \"rg-va25\", \"rg-va24\", \"rg-va23\", \"rg-va22\", \"rg-va21\", \"rg-va20\", \"rg-va19\", \"rg-va18\", \"rg-va17\", \"rg-va16\", \"rg-va15\", \"rg-va14\", \"rg-va13\", \"rg-va12\", \"rg-va11\", \"rg-va10\", \"rg-va9\", \"rg-va8\", \"rg-va7\", \"rg-va6\", \"rg-va5\", \"rg-va4\", \"rg-va3\", \"rg-va2\", \"rg-va1\" ] }"
+  ],
+  "stages": [
+    {
+      "about": "",
+      "action": "",
+      "album_numbers": false,
+      "artist_id": "",
+      "can_play": false,
+      "context": "",
+      "cover": "",
+      "cover_round": false,
+      "disc_sections": false,
+      "empty": "",
+      "filter": 0,
+      "filters": [],
+      "grid": [],
+      "has_menu": false,
+      "label": "",
+      "lead": [],
+      "liked_songs": false,
+      "meta": "",
+      "more": null,
+      "notice": "",
+      "notice_action": "",
+      "notice_other": "",
+      "offers": [],
+      "offers_first": false,
+      "offers_heading": "",
+      "offers_note": "Looking for songs and albums…",
+      "offers_route": "",
+      "offers_title": "Not in your library",
+      "play": "Songs",
+      "playlist": null,
+      "request_ids": [],
+      "shelves": [],
+      "show_album": false,
+      "show_cover": false,
+      "show_number": false,
+      "song_notes": [],
+      "songs": [],
+      "sort": 0,
+      "sorts": [],
+      "star": null,
+      "starred": false,
+      "stats": [],
+      "subtitle": "",
+      "subtitle_route": "",
+      "tail": [
+        {
+          "cards": [
+            {
+              "cover": "https://pictures.test/va-n.jpg",
+              "id": "va-n",
+              "kind": "OutsideArtist",
+              "subtitle": "pictured",
+              "title": "Vale"
+            },
+            {
+              "cover": "",
+              "id": "va-a",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Vale"
+            },
+            {
+              "cover": "",
+              "id": "va-b",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Vale"
+            },
+            {
+              "cover": "",
+              "id": "va-c",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Vale Choir"
+            }
+          ],
+          "route": "",
+          "title": "Artists",
+          "wrap": false
+        },
+        {
+          "cards": [
+            {
+              "cover": "https://covers.test/rg-vl.jpg",
+              "id": "rg-vl",
+              "kind": "Request",
+              "subtitle": "Vale • 2020",
+              "title": "From Lidarr"
+            }
+          ],
+          "route": "",
+          "title": "Albums",
+          "wrap": false
+        }
+      ],
+      "tiles": [],
+      "title": "Results for “Vale”",
+      "tracks_route": "",
+      "tracks_title": ""
+    },
+    {
+      "about": "",
+      "action": "",
+      "album_numbers": false,
+      "artist_id": "",
+      "can_play": false,
+      "context": "",
+      "cover": "",
+      "cover_round": false,
+      "disc_sections": false,
+      "empty": "",
+      "filter": 0,
+      "filters": [],
+      "grid": [],
+      "has_menu": false,
+      "label": "",
+      "lead": [],
+      "liked_songs": false,
+      "meta": "",
+      "more": null,
+      "notice": "",
+      "notice_action": "",
+      "notice_other": "",
+      "offers": [],
+      "offers_first": false,
+      "offers_heading": "",
+      "offers_note": "Looking for their songs and albums…",
+      "offers_route": "",
+      "offers_title": "Not in your library",
+      "play": "Songs",
+      "playlist": null,
+      "request_ids": [],
+      "shelves": [],
+      "show_album": false,
+      "show_cover": false,
+      "show_number": false,
+      "song_notes": [],
+      "songs": [],
+      "sort": 0,
+      "sorts": [],
+      "star": null,
+      "starred": false,
+      "stats": [],
+      "subtitle": "",
+      "subtitle_route": "",
+      "tail": [
+        {
+          "cards": [
+            {
+              "cover": "",
+              "id": "va-a",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Vale"
+            },
+            {
+              "cover": "https://pictures.test/va-n.jpg",
+              "id": "va-n",
+              "kind": "OutsideArtist",
+              "subtitle": "pictured",
+              "title": "Vale"
+            },
+            {
+              "cover": "",
+              "id": "va-b",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Vale"
+            },
+            {
+              "cover": "",
+              "id": "va-c",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Vale Choir"
+            }
+          ],
+          "route": "",
+          "title": "Artists",
+          "wrap": false
+        },
+        {
+          "cards": [
+            {
+              "cover": "https://covers.test/rg-vl.jpg",
+              "id": "rg-vl",
+              "kind": "Request",
+              "subtitle": "Vale • 2020",
+              "title": "From Lidarr"
+            }
+          ],
+          "route": "",
+          "title": "Albums",
+          "wrap": false
+        }
+      ],
+      "tiles": [],
+      "title": "Results for “Vale”",
+      "tracks_route": "",
+      "tracks_title": ""
+    },
+    {
+      "about": "",
+      "action": "",
+      "album_numbers": false,
+      "artist_id": "",
+      "can_play": false,
+      "context": "",
+      "cover": "",
+      "cover_round": false,
+      "disc_sections": false,
+      "empty": "",
+      "filter": 0,
+      "filters": [],
+      "grid": [],
+      "has_menu": false,
+      "label": "",
+      "lead": [],
+      "liked_songs": false,
+      "meta": "",
+      "more": null,
+      "notice": "",
+      "notice_action": "",
+      "notice_other": "",
+      "offers": [],
+      "offers_first": false,
+      "offers_heading": "",
+      "offers_note": "Looking for their most played songs…",
+      "offers_route": "",
+      "offers_title": "Not in your library",
+      "play": "Songs",
+      "playlist": null,
+      "request_ids": [],
+      "shelves": [],
+      "show_album": false,
+      "show_cover": false,
+      "show_number": false,
+      "song_notes": [],
+      "songs": [],
+      "sort": 0,
+      "sorts": [],
+      "star": null,
+      "starred": false,
+      "stats": [],
+      "subtitle": "",
+      "subtitle_route": "",
+      "tail": [
+        {
+          "cards": [
+            {
+              "cover": "",
+              "id": "va-a",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Vale"
+            },
+            {
+              "cover": "https://pictures.test/va-n.jpg",
+              "id": "va-n",
+              "kind": "OutsideArtist",
+              "subtitle": "pictured",
+              "title": "Vale"
+            },
+            {
+              "cover": "",
+              "id": "va-b",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Vale"
+            },
+            {
+              "cover": "",
+              "id": "va-c",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Vale Choir"
+            }
+          ],
+          "route": "",
+          "title": "Artists",
+          "wrap": false
+        },
+        {
+          "cards": [
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-va26/front-250",
+              "id": "rg-va26",
+              "kind": "Request",
+              "subtitle": "Vale • 1996",
+              "title": "Vale Album 26"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-va25/front-250",
+              "id": "rg-va25",
+              "kind": "Request",
+              "subtitle": "Vale • 1995",
+              "title": "Vale Album 25"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-va24/front-250",
+              "id": "rg-va24",
+              "kind": "Request",
+              "subtitle": "Vale • 1994",
+              "title": "Vale Album 24"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-va23/front-250",
+              "id": "rg-va23",
+              "kind": "Request",
+              "subtitle": "Vale • 1993",
+              "title": "Vale Album 23"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-va22/front-250",
+              "id": "rg-va22",
+              "kind": "Request",
+              "subtitle": "Vale • 1992",
+              "title": "Vale Album 22"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-va21/front-250",
+              "id": "rg-va21",
+              "kind": "Request",
+              "subtitle": "Vale • 1991",
+              "title": "Vale Album 21"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-va20/front-250",
+              "id": "rg-va20",
+              "kind": "Request",
+              "subtitle": "Vale • 1990",
+              "title": "Vale Album 20"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-va19/front-250",
+              "id": "rg-va19",
+              "kind": "Request",
+              "subtitle": "Vale • 1989",
+              "title": "Vale Album 19"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-va18/front-250",
+              "id": "rg-va18",
+              "kind": "Request",
+              "subtitle": "Vale • 1988",
+              "title": "Vale Album 18"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-va17/front-250",
+              "id": "rg-va17",
+              "kind": "Request",
+              "subtitle": "Vale • 1987",
+              "title": "Vale Album 17"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-va16/front-250",
+              "id": "rg-va16",
+              "kind": "Request",
+              "subtitle": "Vale • 1986",
+              "title": "Vale Album 16"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-va15/front-250",
+              "id": "rg-va15",
+              "kind": "Request",
+              "subtitle": "Vale • 1985",
+              "title": "Vale Album 15"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-va14/front-250",
+              "id": "rg-va14",
+              "kind": "Request",
+              "subtitle": "Vale • 1984",
+              "title": "Vale Album 14"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-va13/front-250",
+              "id": "rg-va13",
+              "kind": "Request",
+              "subtitle": "Vale • 1983",
+              "title": "Vale Album 13"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-va12/front-250",
+              "id": "rg-va12",
+              "kind": "Request",
+              "subtitle": "Vale • 1982",
+              "title": "Vale Album 12"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-va11/front-250",
+              "id": "rg-va11",
+              "kind": "Request",
+              "subtitle": "Vale • 1981",
+              "title": "Vale Album 11"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-va10/front-250",
+              "id": "rg-va10",
+              "kind": "Request",
+              "subtitle": "Vale • 1980",
+              "title": "Vale Album 10"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-va9/front-250",
+              "id": "rg-va9",
+              "kind": "Request",
+              "subtitle": "Vale • 1979",
+              "title": "Vale Album 9"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-va8/front-250",
+              "id": "rg-va8",
+              "kind": "Request",
+              "subtitle": "Vale • 1978",
+              "title": "Vale Album 8"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-va7/front-250",
+              "id": "rg-va7",
+              "kind": "Request",
+              "subtitle": "Vale • 1977",
+              "title": "Vale Album 7"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-va6/front-250",
+              "id": "rg-va6",
+              "kind": "Request",
+              "subtitle": "Vale • 1976",
+              "title": "Vale Album 6"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-va5/front-250",
+              "id": "rg-va5",
+              "kind": "Request",
+              "subtitle": "Vale • 1975",
+              "title": "Vale Album 5"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-va4/front-250",
+              "id": "rg-va4",
+              "kind": "Request",
+              "subtitle": "Vale • 1974",
+              "title": "Vale Album 4"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-va3/front-250",
+              "id": "rg-va3",
+              "kind": "Request",
+              "subtitle": "Vale • 1973",
+              "title": "Vale Album 3"
+            }
+          ],
+          "route": "",
+          "title": "Albums",
+          "wrap": false
+        }
+      ],
+      "tiles": [],
+      "title": "Results for “Vale”",
+      "tracks_route": "",
+      "tracks_title": ""
+    },
+    {
+      "about": "",
+      "action": "",
+      "album_numbers": false,
+      "artist_id": "",
+      "can_play": false,
+      "context": "",
+      "cover": "",
+      "cover_round": false,
+      "disc_sections": false,
+      "empty": "",
+      "filter": 0,
+      "filters": [],
+      "grid": [],
+      "has_menu": false,
+      "label": "",
+      "lead": [],
+      "liked_songs": false,
+      "meta": "",
+      "more": null,
+      "notice": "",
+      "notice_action": "",
+      "notice_other": "",
+      "offers": [],
+      "offers_first": false,
+      "offers_heading": "",
+      "offers_note": "Ask Lidarr for any of these albums, or open the artist for everything they've made.",
+      "offers_route": "",
+      "offers_title": "Not in your library",
+      "play": "Songs",
+      "playlist": null,
+      "request_ids": [],
+      "shelves": [],
+      "show_album": false,
+      "show_cover": false,
+      "show_number": false,
+      "song_notes": [],
+      "songs": [],
+      "sort": 0,
+      "sorts": [],
+      "star": null,
+      "starred": false,
+      "stats": [],
+      "subtitle": "",
+      "subtitle_route": "",
+      "tail": [
+        {
+          "cards": [
+            {
+              "cover": "",
+              "id": "va-a",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Vale"
+            },
+            {
+              "cover": "https://pictures.test/va-n.jpg",
+              "id": "va-n",
+              "kind": "OutsideArtist",
+              "subtitle": "pictured",
+              "title": "Vale"
+            },
+            {
+              "cover": "",
+              "id": "va-b",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Vale"
+            },
+            {
+              "cover": "",
+              "id": "va-c",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Vale Choir"
+            }
+          ],
+          "route": "",
+          "title": "Artists",
+          "wrap": false
+        },
+        {
+          "cards": [
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-va26/front-250",
+              "id": "rg-va26",
+              "kind": "Request",
+              "subtitle": "Vale • 1996",
+              "title": "Vale Album 26"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-va25/front-250",
+              "id": "rg-va25",
+              "kind": "Request",
+              "subtitle": "Vale • 1995",
+              "title": "Vale Album 25"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-va24/front-250",
+              "id": "rg-va24",
+              "kind": "Request",
+              "subtitle": "Vale • 1994",
+              "title": "Vale Album 24"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-va23/front-250",
+              "id": "rg-va23",
+              "kind": "Request",
+              "subtitle": "Vale • 1993",
+              "title": "Vale Album 23"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-va22/front-250",
+              "id": "rg-va22",
+              "kind": "Request",
+              "subtitle": "Vale • 1992",
+              "title": "Vale Album 22"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-va21/front-250",
+              "id": "rg-va21",
+              "kind": "Request",
+              "subtitle": "Vale • 1991",
+              "title": "Vale Album 21"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-va20/front-250",
+              "id": "rg-va20",
+              "kind": "Request",
+              "subtitle": "Vale • 1990",
+              "title": "Vale Album 20"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-va19/front-250",
+              "id": "rg-va19",
+              "kind": "Request",
+              "subtitle": "Vale • 1989",
+              "title": "Vale Album 19"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-va18/front-250",
+              "id": "rg-va18",
+              "kind": "Request",
+              "subtitle": "Vale • 1988",
+              "title": "Vale Album 18"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-va17/front-250",
+              "id": "rg-va17",
+              "kind": "Request",
+              "subtitle": "Vale • 1987",
+              "title": "Vale Album 17"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-va16/front-250",
+              "id": "rg-va16",
+              "kind": "Request",
+              "subtitle": "Vale • 1986",
+              "title": "Vale Album 16"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-va15/front-250",
+              "id": "rg-va15",
+              "kind": "Request",
+              "subtitle": "Vale • 1985",
+              "title": "Vale Album 15"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-va14/front-250",
+              "id": "rg-va14",
+              "kind": "Request",
+              "subtitle": "Vale • 1984",
+              "title": "Vale Album 14"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-va13/front-250",
+              "id": "rg-va13",
+              "kind": "Request",
+              "subtitle": "Vale • 1983",
+              "title": "Vale Album 13"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-va12/front-250",
+              "id": "rg-va12",
+              "kind": "Request",
+              "subtitle": "Vale • 1982",
+              "title": "Vale Album 12"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-va11/front-250",
+              "id": "rg-va11",
+              "kind": "Request",
+              "subtitle": "Vale • 1981",
+              "title": "Vale Album 11"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-va10/front-250",
+              "id": "rg-va10",
+              "kind": "Request",
+              "subtitle": "Vale • 1980",
+              "title": "Vale Album 10"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-va9/front-250",
+              "id": "rg-va9",
+              "kind": "Request",
+              "subtitle": "Vale • 1979",
+              "title": "Vale Album 9"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-va8/front-250",
+              "id": "rg-va8",
+              "kind": "Request",
+              "subtitle": "Vale • 1978",
+              "title": "Vale Album 8"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-va7/front-250",
+              "id": "rg-va7",
+              "kind": "Request",
+              "subtitle": "Vale • 1977",
+              "title": "Vale Album 7"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-va6/front-250",
+              "id": "rg-va6",
+              "kind": "Request",
+              "subtitle": "Vale • 1976",
+              "title": "Vale Album 6"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-va5/front-250",
+              "id": "rg-va5",
+              "kind": "Request",
+              "subtitle": "Vale • 1975",
+              "title": "Vale Album 5"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-va4/front-250",
+              "id": "rg-va4",
+              "kind": "Request",
+              "subtitle": "Vale • 1974",
+              "title": "Vale Album 4"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-va3/front-250",
+              "id": "rg-va3",
+              "kind": "Request",
+              "subtitle": "Vale • 1973",
+              "title": "Vale Album 3"
+            }
+          ],
+          "route": "",
+          "title": "Albums",
+          "wrap": false
+        }
+      ],
+      "tiles": [],
+      "title": "Results for “Vale”",
+      "tracks_route": "",
+      "tracks_title": ""
+    }
+  ]
+}
