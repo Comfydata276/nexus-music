@@ -760,6 +760,31 @@ pub fn asked_sentence(title: &str) -> String {
     format!("Asked for “{title}”. It'll be in your library once it arrives.")
 }
 
+// ---- "Add artist" ------------------------------------------------------------------------------
+
+/// The question before Lidarr is set to keep track of an artist: its heading and text.
+/// `open` is how many of their albums could be asked for (see `OutsideArtist::open`).
+pub fn adding(name: &str, open: usize) -> (String, String) {
+    (
+        format!("Add {name}?"),
+        format!(
+            "Lidarr will look for {} by {name} that you don't have, and for new ones as they come out. That can be a lot to fetch.",
+            if open == 1 { "the 1 album".to_string() } else { format!("all {open} albums") }
+        ),
+    )
+}
+
+/// What's said while an artist is being added.
+pub fn adding_now(name: &str) -> String {
+    format!("Adding {name}…")
+}
+
+/// What's said once they have been. It ends before where to see them, which each app adds
+/// (the Windows app: "; see Requests in the sidebar.").
+pub fn added(name: &str) -> String {
+    format!("Added {name}. Their albums are on Lidarr's list")
+}
+
 /// "1 album", "3 albums": a number of things.
 pub fn count(n: usize, noun: &str) -> String {
     if n == 1 { format!("1 {noun}") } else { format!("{n} {noun}s") }
@@ -981,5 +1006,13 @@ mod tests {
         assert_eq!(served(&[("album/lookup", "[]")], usize::MAX, ask).0, Ok(Err(NO_LONGER_LISTED.to_string())));
         // Stopped while it's looked up.
         assert_eq!(served(&[("album/lookup", "[]")], 0, ask).0, Err(Stopped));
+    }
+
+    #[test]
+    fn adds_an_artist_in_the_words_it_always_has() {
+        assert_eq!(adding("Marrow Lake", 1), ("Add Marrow Lake?".to_string(), "Lidarr will look for the 1 album by Marrow Lake that you don't have, and for new ones as they come out. That can be a lot to fetch.".to_string()));
+        assert_eq!(adding("Marrow Lake", 3).1, "Lidarr will look for all 3 albums by Marrow Lake that you don't have, and for new ones as they come out. That can be a lot to fetch.");
+        assert_eq!(adding_now("Marrow Lake"), "Adding Marrow Lake…");
+        assert_eq!(format!("{}; see Requests in the sidebar.", added("Marrow Lake")), "Added Marrow Lake. Their albums are on Lidarr's list; see Requests in the sidebar.");
     }
 }

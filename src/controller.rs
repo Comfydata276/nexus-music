@@ -1698,29 +1698,21 @@ impl Controller {
         if name.is_empty() || albums == 0 {
             return;
         }
+        let (heading, text) = nexus_core::requests::adding(&name, albums);
         *self.prompt.borrow_mut() = Some(crate::actions::PromptAction::AddArtist { artist, name: name.clone() });
-        self.open_prompt(
-            &format!("Add {name}?"),
-            &format!(
-                "Lidarr will look for {} by {name} that you don't have, and for new ones as they come out. That can be a lot to fetch.",
-                if albums == 1 { "the 1 album".to_string() } else { format!("all {albums} albums") }
-            ),
-            "Add artist",
-            None,
-            false,
-        );
+        self.open_prompt(&heading, &text, "Add artist", None, false);
     }
 
     pub fn add_artist(self: &Rc<Self>, artist: String, name: String) {
         let Some(lidarr) = crate::lidarr::current() else { return };
-        self.toast(format!("Adding {name}…"));
+        self.toast(nexus_core::requests::adding_now(&name));
         self.requests_pool.spawn(move || {
             let result = lidarr.add_artist(&artist, &name);
             post(move |ctl| match result {
                 Ok(_) => {
                     ctl.refresh_outside();
                     crate::discover::forget(&artist);
-                    ctl.toast(format!("Added {name}. Their albums are on Lidarr's list; see Requests in the sidebar."));
+                    ctl.toast(format!("{}; see Requests in the sidebar.", nexus_core::requests::added(&name)));
                 }
                 Err(reason) => ctl.toast(reason),
             });
