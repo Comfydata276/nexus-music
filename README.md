@@ -39,7 +39,7 @@ What's planned next is in the [roadmap](ROADMAP.md).
 - Playing a song from a search starts its radio: that song, then others like it.
 - Play on another of your devices: with a relay set up (see Jams, below), every PC running Nexus Music on your account shows up under “Connect to a device” in the player bar, which lists them in the side panel in the queue's place, with what each is playing. Pick one while music is playing and the music moves there, carrying on from the same place in the same queue; pick one while nothing is playing and you steer whatever it has on. Either way the player and queue panel on the PC in front of you then control the other one, volume included, and “Play here” brings the music back.
 - Jams: one queue that friends add to while the music plays on your PC. They join from a link, in a browser (a phone works) or in Nexus Music on their own PC under Jam. In the app, a joined jam takes over the player and the queue panel: they show the host's song and queue, and pausing, skipping, dragging songs into a new order or taking them out happens for everyone. “Add to queue” anywhere adds to the jam, and so does playing a song. A strip along the bottom of the window says you're in a jam for as long as you are. The browser page does the same from a phone. You choose whether guests may steer or only add songs, see who's there, and can remove anyone. The queue shows who added what. Joining a jam needs nothing set up; hosting one is off until you switch it on, and needs a small relay service (see below).
-- Keeps your devices in step: the queue and your place in it, Recently played, pinned playlists, each list's shuffle and sort, the dates songs were added and the theme follow you to the app on another PC. The queue uses the server's saved-queue feature; the rest is kept in the comment of a playlist named "Nexus Music sync". When another PC has been playing in the last half hour, the queue panel offers "Continue here", which picks its queue up where it had got to. The plays behind "Your stats" are shared too, so today, this week and this month cover every PC. Before a new version of the app first changes what that playlist holds, it keeps a copy of what it found as `shared-record-kept.json`, beside its settings (`%APPDATA%\Nexus Music\config`): to put it back, paste that file's text into the playlist's comment in Navidrome while the app is closed on every device.
+- Keeps your devices in step: the queue and your place in it, Recently played, pinned playlists, each list's shuffle and sort, the dates songs were added and the theme follow you to the app on another PC. The queue uses the server's saved-queue feature; the rest is kept in the comment of a playlist named "Nexus Music sync". When another PC has been playing in the last half hour, the queue panel offers "Continue here", which picks its queue up where it had got to. The plays behind "Your stats" are shared too, so today, this week and this month cover every PC. See "Keeping devices in step", below, for where a copy of it is kept and what is known not to be perfect.
 - Select several songs with Ctrl or Shift, then drag them onto a playlist or the queue, or
   right-click to act on them all.
 - Recently played: the last hundred songs, each playable again by itself.
@@ -236,6 +236,47 @@ page needs no installation; it tells you when a new version is out and opens the
 The app needs the Microsoft Visual C++ runtime, which most PCs already have. If Windows
 reports that `VCRUNTIME140.dll` or `MSVCP140.dll` is missing, install it from
 <https://aka.ms/vs/17/release/vc_redist.x64.exe>.
+
+## Keeping devices in step
+
+What devices share (pins, each list's shuffle and sort, the theme, the dates songs were
+added, Recently played, the latest plays) is text in the comment of a playlist named "Nexus
+Music sync", which the app makes and doesn't list. Each item carries the time it last
+changed, and the newer one wins on every device. The rules for it are in the library
+(`core/src/step.rs`, with the steps an app follows numbered at its top), so that the Windows
+app and the Android app do the same.
+
+**A copy, in case.** Before a version of the app first changes that record for an account, it
+keeps the text exactly as it found it, beside its settings (`%APPDATA%\Nexus Music\config`):
+`shared-record-kept-<account>.json`, with the version that kept it in the `.version` file of
+the same name. Nothing is written to the server until both are on the disk, and that version
+never writes them again. To put the record back: close the app on every device, and paste the
+file's text into the playlist's comment in Navidrome.
+
+**Known, and accepted.**
+
+- Two devices that read the record in the same moment both write, and the second write wins.
+  The first still holds what it wrote and puts it back at its next look (a minute at most).
+  The server has no write that is conditional on what was read.
+- If the answer to a write is lost (the app is closed, the connection drops) and, before this
+  device next looks, another device deliberately sets the opposite, this device makes its
+  change again on top of that.
+- Dates that 0.40.4 and earlier gave songs merely by looking at a playlist are already in the
+  record, with nothing to tell them from real ones. They stay.
+- Going back to 0.40.4 while changes are still waiting to be shared loses those changes:
+  0.40.4 does not know of them.
+- A song the server silently leaves out of an "add to playlist" (one the account may not see)
+  is still dated as added.
+- A play is timed by the PC's clock when it happens. While the clock is more than five
+  minutes from the server's nothing is shared, but the times already put on plays are not
+  put right afterwards.
+- A second playlist named "Nexus Music sync" with a higher id (two devices each made one
+  before either had seen the other's) holds data nobody reads: every device uses the one with
+  the lowest id. To see it, look for two playlists of that name in Navidrome's own pages; to
+  be rid of it, check its comment holds nothing wanted and delete it there.
+- The settings are one set for the PC, not one for each account: pins and list choices that
+  were agreed under one account are offered, at the times they were made, to another account
+  signed in on the same PC. (Changes still waiting are not: they wait for their own account.)
 
 ## Building
 
