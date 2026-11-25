@@ -296,7 +296,75 @@ pub fn tidy(address: &str) -> String {
     if address.is_empty() || address.contains("://") { address.to_string() } else { format!("http://{address}") }
 }
 
-/// The host (and port) an address points at, which is what a saved key belongs to.
+/// Where an address leads: the scheme, the host and the port the app connects to. A saved
+/// key (and a sign-in) belongs to one, and to no other.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Origin {
+    /// "http" or "https".
+    pub scheme: String,
+    /// As written, in lower case (a name, an IPv4 address, or an IPv6 one in brackets).
+    pub host: String,
+    pub port: u16,
+}
+
+/// Said of an address with a name and password in it, which isn't kept.
+pub const ADDRESS_WITH_NAME: &str = "That address has a name and password in it. Enter the address alone: Lidarr is reached with its API key.";
+/// Said of an address the app can't be sure of reaching as written.
+pub const ADDRESS_UNUSABLE: &str = "That isn't an address the app can use. Enter it as, say, https://lidarr.example.org or 192.168.1.5:8686.";
+
+/// Where an address leads (see `Origin`), read as the app's HTTP client reads it, or why it
+/// can't be used. Anything the client might read differently from this is refused rather than
+/// guessed at: a backslash, a space, letters beyond plain ASCII, a port that isn't a number. A
+/// name and password in the address are refused too.
+pub fn origin(address: &str) -> Result<Origin, String> {
+    let address = tidy(address);
+    if address.is_empty() || !address.is_ascii() || address.chars().any(|c| c.is_ascii_control() || c.is_ascii_whitespace() || c == '\\') {
+        return Err(ADDRESS_UNUSABLE.into());
+    }
+    let (scheme, rest) = address.split_once("://").ok_or(ADDRESS_UNUSABLE)?;
+    let scheme = scheme.to_ascii_lowercase();
+    let default = match scheme.as_str() {
+        "http" => 80,
+        "https" => 443,
+        _ => return Err(ADDRESS_UNUSABLE.into()),
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.contains('@') {
+        return Err(ADDRESS_WITH_NAME.into());
+    }
+    let (host, port) = if let Some(inside) = authority.strip_prefix('[') {
+        // An IPv6 address, in brackets.
+        let (inside, after) = inside.split_once(']').ok_or(ADDRESS_UNUSABLE)?;
+        if inside.is_empty() || !inside.chars().all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.') {
+            return Err(ADDRESS_UNUSABLE.into());
+        }
+        (format!("[{}]", inside.to_ascii_lowercase()), after)
+    } else {
+        let at = authority.find(':').unwrap_or(authority.len());
+        let host = &authority[..at];
+        if host.is_empty() || !host.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '~')) {
+            return Err(ADDRESS_UNUSABLE.into());
+        }
+        (host.to_ascii_lowercase(), &authority[at..])
+    };
+    let port = match port.strip_prefix(':') {
+        None if port.is_empty() => default,
+        Some(digits) if !digits.is_empty() && digits.len() <= 5 && digits.chars().all(|c| c.is_ascii_digit()) => match digits.parse::<u16>() {
+            Ok(port) if port > 0 => port,
+            _ => return Err(ADDRESS_UNUSABLE.into()),
+        },
+        _ => return Err(ADDRESS_UNUSABLE.into()),
+    };
+    Ok(Origin { scheme, host, port })
+}
+
+/// Whether two addresses lead to the same place (see `origin`). One that can't be used is the
+/// same as nothing.
+pub fn same_origin(a: &str, b: &str) -> bool {
+    matches!((origin(a), origin(b)), (Ok(a), Ok(b)) if a == b)
+}
+
+/// The host (and port) an address points at, as written (see `origin` for what a key belongs to).
 pub fn host(address: &str) -> String {
     let address = tidy(address);
     let rest = address.split_once("://").map_or(address.as_str(), |(_, rest)| rest);

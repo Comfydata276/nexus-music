@@ -1395,7 +1395,9 @@ impl Controller {
         let lidarr = {
             let settings = self.settings.borrow();
             let key = config::load_secret(&self.paths, "lidarr-key");
-            match (settings.requests && !settings.lidarr_address.trim().is_empty(), key) {
+            // An address the app can't be sure of reaching as written isn't connected to.
+            let usable = nexus_core::lidarr::origin(&settings.lidarr_address).is_ok();
+            match (settings.requests && !settings.lidarr_address.trim().is_empty() && usable, key) {
                 (true, Some(key)) => Some(crate::lidarr::open(&settings.lidarr_address, &key, self.gate_session(&settings))),
                 _ => None,
             }
@@ -1444,10 +1446,18 @@ impl Controller {
     /// Saves where Lidarr is and its key, then connects: checks that it answers and, if a
     /// sign-in answers instead, goes on to that.
     fn save_requests(&self, address: &str, key: &str) {
+        // An address with a name and password in it, or one the app might read otherwise than
+        // its connections would, isn't kept: nor is the key typed with it.
+        if !address.trim().is_empty() {
+            if let Err(why) = nexus_core::lidarr::origin(address) {
+                self.push_settings();
+                return self.requests_state("error", &why);
+            }
+        }
         let (moved, elsewhere) = {
             let mut settings = self.settings.borrow_mut();
             let moved = crate::lidarr::tidy(&settings.lidarr_address) != crate::lidarr::tidy(address);
-            let elsewhere = crate::lidarr::host(&settings.lidarr_address) != crate::lidarr::host(address);
+            let elsewhere = !crate::lidarr::same_origin(&settings.lidarr_address, address);
             settings.lidarr_address = address.trim().to_string();
             (moved, elsewhere)
         };
@@ -1459,8 +1469,8 @@ impl Controller {
             settings.lidarr_gate_client.clear();
         }
         self.save_settings();
-        // Blank leaves the key that's on file, unless the address now points at a different
-        // host: a key is only ever sent to the host it was typed in for.
+        // Blank leaves the key that's on file, unless the address now leads somewhere else (another
+        // scheme, host or port): a key is only ever sent to the address it was typed in for.
         let forgotten = key.trim().is_empty() && elsewhere && config::load_secret(&self.paths, "lidarr-key").is_some();
         if !key.trim().is_empty() {
             config::save_secret(&self.paths, "lidarr-key", key.trim());
@@ -1480,6 +1490,11 @@ impl Controller {
     /// straight away, not just offered.
     pub fn check_requests(&self, by_hand: bool) {
         let Some(lidarr) = crate::lidarr::current() else {
+            // One kept by an older version that this one won't use says why.
+            let address = self.settings.borrow().lidarr_address.clone();
+            if let (false, Err(why)) = (address.trim().is_empty(), nexus_core::lidarr::origin(&address)) {
+                return self.requests_state("error", &why);
+            }
             return self.requests_state("none", nexus_core::lidarr::NOT_CONNECTED);
         };
         let check = self.requests_check.get() + 1;

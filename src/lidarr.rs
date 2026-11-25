@@ -11,7 +11,7 @@
 
 use std::sync::{Arc, RwLock};
 
-pub use nexus_core::lidarr::{ArtistOffer, Lidarr, Offers, host, mask, tidy};
+pub use nexus_core::lidarr::{ArtistOffer, Lidarr, Offers, mask, tidy};
 pub use nexus_core::offer::Offer;
 
 /// Lidarr at `address`, asked over an agent of the app's own. `gate` is the sign-in in front
@@ -21,6 +21,12 @@ pub fn open(address: &str, key: &str, gate: Option<Arc<crate::gate::Session>>) -
     // front of it shows itself by sending one.
     let gate = gate.map(|gate| gate as Arc<dyn nexus_core::lidarr::SignIn>);
     Lidarr::new(address, key, gate, Arc::new(crate::corehttp::Agent(crate::subsonic::make_agent_without_redirects())))
+}
+
+/// Whether two addresses are the same Lidarr, for a saved key: a key is only ever sent to
+/// the address it was typed for.
+pub fn same_origin(a: &str, b: &str) -> bool {
+    nexus_core::lidarr::same_origin(a, b)
 }
 
 /// Whether singles and EPs are offered as well as albums. Set from Settings.
@@ -82,6 +88,76 @@ pub fn mark(album: &str, requested: bool) {
 /// What goes to Lidarr and back, against a stand-in server: written against the app as it
 /// was before Lidarr's rules moved to the library, so that the move can be seen to change
 /// nothing on the wire.
+#[cfg(test)]
+mod origins {
+    use super::*;
+
+    #[test]
+    fn a_key_belongs_to_the_scheme_host_and_port_it_was_typed_for() {
+        assert!(!same_origin("https://lidarr.example.org", "http://lidarr.example.org"));
+        assert!(!same_origin("lidarr.example.org:8686", "https://lidarr.example.org:8686"));
+        assert!(same_origin("https://Lidarr.Example.org/", "https://lidarr.example.org:443/lidarr"));
+        assert!(!same_origin("http://lidarr.example.org:8686", "http://lidarr.example.org:8687"));
+    }
+
+    /// Where the app's HTTP client would connect for an address: its scheme, host and port as
+    /// its own parser reads them.
+    fn where_the_agent_goes(address: &str) -> Option<(String, String, u16)> {
+        let uri: ureq::http::Uri = tidy(address).parse().ok()?;
+        let scheme = uri.scheme_str()?.to_ascii_lowercase();
+        let port = uri.port_u16().or(match scheme.as_str() {
+            "http" => Some(80),
+            "https" => Some(443),
+            _ => None,
+        })?;
+        Some((scheme, uri.host()?.to_ascii_lowercase(), port))
+    }
+
+    #[test]
+    fn the_library_reads_an_address_as_the_agent_does_or_refuses_it() {
+        // Each address, and what the library makes of it: where it leads, or refused.
+        let table: &[(&str, Option<(&str, &str, u16)>)] = &[
+            ("https://lidarr.example.org", Some(("https", "lidarr.example.org", 443))),
+            ("lidarr.example.org:8686", Some(("http", "lidarr.example.org", 8686))),
+            ("192.168.1.5:8686/", Some(("http", "192.168.1.5", 8686))),
+            ("HTTPS://LIDARR.Example.ORG:443/Lidarr/", Some(("https", "lidarr.example.org", 443))),
+            ("https://lidarr.example.org:443", Some(("https", "lidarr.example.org", 443))),
+            ("http://lidarr.example.org:80/", Some(("http", "lidarr.example.org", 80))),
+            ("https://lidarr.example.org.", Some(("https", "lidarr.example.org.", 443))),
+            ("http://[::1]:8686", Some(("http", "[::1]", 8686))),
+            ("http://[FE80::1]/lidarr", Some(("http", "[fe80::1]", 80))),
+            ("https://lidarr.example.org?x=1", Some(("https", "lidarr.example.org", 443))),
+            ("https://lidarr.example.org#here", Some(("https", "lidarr.example.org", 443))),
+            // Refused: a name and password; what the client might read otherwise.
+            ("https://me:secret@lidarr.example.org", None),
+            ("https://evil.example@lidarr.example.org", None),
+            ("http://lidarr.example.org\\@evil.example/", None),
+            ("http://evil.example\\.lidarr.example.org", None),
+            ("https://lidarr.example.org:", None),
+            ("https://lidarr.example.org:0", None),
+            ("https://lidarr.example.org:65536", None),
+            ("https://lidarr.example.org:8x", None),
+            ("https://lidärr.example.org", None),
+            ("https://lidarr example.org", None),
+            ("ftp://lidarr.example.org", None),
+            ("https://", None),
+            ("https://[::1", None),
+            ("https://%6cidarr.example.org", None),
+            ("", None),
+        ];
+        for (address, expected) in table {
+            let found = nexus_core::lidarr::origin(address).ok().map(|origin| (origin.scheme, origin.host, origin.port));
+            let expected = expected.map(|(scheme, host, port)| (scheme.to_string(), host.to_string(), port));
+            assert_eq!(found, expected, "the library's reading of {address:?}");
+            // Wherever the library goes by an address, the client goes to the same place.
+            if let Some(found) = found {
+                assert_eq!(where_the_agent_goes(address), Some(found), "the client's reading of {address:?}");
+            }
+        }
+        assert_eq!(nexus_core::lidarr::origin("https://me:secret@lidarr.example.org").unwrap_err(), nexus_core::lidarr::ADDRESS_WITH_NAME);
+    }
+}
+
 #[cfg(test)]
 mod wire {
     use std::io::Write;
