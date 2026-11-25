@@ -764,8 +764,8 @@ is on, on a PC and on a phone alike.
 
 **Built for Android** (arm64 and x86_64, API 31, the phone app's own native crate and
 build, with a layer that reaches all of the above): it builds as it is, with nothing
-changed for it. It adds about 283 KiB to the phone's library on arm64 (949,424 to
-1,239,184 bytes) and 358 KiB on x86_64 (1,133,776 to 1,500,376), built for size as
+changed for it. It adds about 291 KiB to the phone's library on arm64 (950,688 to
+1,248,904 bytes) and 366 KiB on x86_64 (1,135,168 to 1,510,832), built for size as
 that library is. Not checked: iOS.
 
 ## 9. The reviewers' sequences, replayed
