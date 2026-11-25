@@ -689,21 +689,24 @@ fn hammering_the_route_with_wrong_keys_locks_no_jam_s_host_out() {
 }
 
 /// A sender can make up any number of places and addresses to be counted under. Only so
-/// many are, and one more is not let through uncounted.
+/// many are counted at once; and one more is neither refused (or whoever made up the
+/// first few thousand could keep everybody else out) nor let the table grow.
 #[test]
 fn only_so_many_callers_are_counted_at_once() {
     let mut allowances = Allowances::default();
-    let now = Instant::now();
+    let began = Instant::now();
     for n in 0..MOST_COUNTED {
-        assert!(allowances.allow(&format!("enter:{n}"), 2.0, 0.0, now));
+        assert!(allowances.allow(&format!("enter:{n}"), 2.0, 0.0, began + Duration::from_millis(n as u64)));
     }
-    assert!(!allowances.allow("enter:one more", 2.0, 0.0, now));
-    // One that is counted already still has its own allowance, and no more.
+    let now = began + Duration::from_secs(10);
+    assert!(allowances.allow("enter:one more", 2.0, 0.0, now));
+    assert_eq!(allowances.buckets.len(), MOST_COUNTED);
+    // The one counted longest ago made room: it starts afresh, and the rest are as they were.
+    assert!(!allowances.buckets.contains_key("enter:0") && allowances.buckets.contains_key("enter:1"));
     assert!(allowances.allow("enter:7", 2.0, 0.0, now) && !allowances.allow("enter:7", 2.0, 0.0, now));
-    // Ten minutes on, the idle ones are forgotten and there is room again.
-    let later = now + Duration::from_secs(601);
-    assert!(allowances.allow("enter:one more", 2.0, 0.0, later));
-    assert_eq!(allowances.buckets.len(), 1);
+    // Ten minutes on, the idle ones are forgotten.
+    assert!(allowances.allow("enter:another", 2.0, 0.0, now + Duration::from_secs(601)));
+    assert!(allowances.buckets.len() <= 3);
 }
 
 /// A request is refused before any of its body is read if the body is not one the route

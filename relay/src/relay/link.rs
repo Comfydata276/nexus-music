@@ -437,16 +437,22 @@ struct Allowances {
 }
 
 /// The most keys counted at once. The keys are places and callers' addresses, which a
-/// sender can make up any number of.
+/// sender can make up any number of (an address most easily of all: see the README on
+/// what the proxy in front passes on).
 const MOST_COUNTED: usize = 4096;
 
 impl Allowances {
     fn allow(&mut self, key: &str, capacity: f64, per_second: f64, now: Instant) -> bool {
         if !self.buckets.contains_key(key) && self.buckets.len() >= MOST_COUNTED {
             self.forget_idle(now);
-            // Still as many as are counted: this one is not let through uncounted.
-            if self.buckets.len() >= MOST_COUNTED {
-                return false;
+            // Still as many as are counted: the one counted longest ago makes room. (Refusing
+            // the newcomer would let whoever made up the first four thousand keep everybody
+            // else out; forgetting the oldest only gives a sender who is making keys up the
+            // fresh start that making one more up would have given them anyway.)
+            if self.buckets.len() >= MOST_COUNTED
+                && let Some(oldest) = self.buckets.iter().min_by_key(|(_, (_, at))| *at).map(|(key, _)| key.clone())
+            {
+                self.buckets.remove(&oldest);
             }
         }
         let (left, at) = self.buckets.get(key).copied().unwrap_or((capacity, now));
