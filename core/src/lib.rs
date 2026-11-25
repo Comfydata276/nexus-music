@@ -7,6 +7,7 @@
 
 pub mod address;
 pub mod http;
+pub mod jam;
 pub mod listenbrainz;
 pub mod model;
 pub mod musicbrainz;
