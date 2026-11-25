@@ -1299,8 +1299,8 @@ impl Device {
             // It answered under this name: it is remembered, so that the list can show it
             // at once another time.
             let id = text::base64(&device);
-            if seen::is_news(&self.remembered, &id, &name, env.today) {
-                self.remembered = seen::remembered(std::mem::take(&mut self.remembered), Some((&id, &name)), env.today);
+            if seen::is_news(&self.remembered, &id, &name, env.today, &self.account) {
+                self.remembered = seen::remembered(std::mem::take(&mut self.remembered), Some((&id, &name)), env.today, &self.account);
                 out.push(Do::Remember(self.remembered.clone()));
             }
             self.show_view(from, now, out);
@@ -1713,7 +1713,8 @@ impl Device {
         let entered = self.session.as_ref().is_some_and(|session| session.place.is_some());
         let mut rows = latest_of_each(rows);
         // The devices seen before and not here now: listed at once, and not to be picked.
-        for known in self.remembered.iter().filter(|known| !here.contains(&known.id)) {
+        // (This account's: a device seen under another sign-in is not this one's to list.)
+        for known in seen::of(&self.remembered, &self.account).filter(|known| !here.contains(&known.id)) {
             rows.push(Row { place: String::new(), name: known.name.clone(), about: if entered { words::NOT_HERE } else { words::LOOKING_FOR_IT }.into(), playing: false, active: false, ready: false });
         }
         let mut out = Vec::new();

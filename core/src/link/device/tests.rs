@@ -1149,9 +1149,13 @@ fn a_device_that_changes_is_looked_at_then_and_not_at_its_next_turn() {
 fn a_device_seen_before_is_listed_when_it_is_not_here() {
     let mut world = World::new(true);
     let remembered = world.copies[A].remembered.clone();
-    // A is started again, alone.
+    // A is started again, alone: as soon as it knows who is signed in (its first tick),
+    // and before it is linked to anything.
     let mut alone = Device::new(remembered);
-    let (shown, _) = alone.shown(0);
+    std::mem::swap(&mut alone, &mut world.copies[A].device);
+    world.with(A, |device, env| device.tick("the account", false, env));
+    let (shown, _) = world.copies[A].device.shown(0);
+    std::mem::swap(&mut alone, &mut world.copies[A].device);
     assert_eq!(shown.rows, [Row { place: String::new(), name: "Copy B".into(), about: "Looking for it…".into(), playing: false, active: false, ready: false }]);
     // B leaves the room A is in.
     world.copies[B].place = None;
@@ -1163,19 +1167,40 @@ fn a_device_seen_before_is_listed_when_it_is_not_here() {
 #[test]
 fn what_was_kept_of_devices_seen_is_bounded_when_read_and_forgotten_by_the_calendar() {
     // A settings file with a thousand of them: sixteen are taken, the ones seen most lately.
-    let kept: Vec<Remembered> = (0..1_000u64).map(|n| Remembered { id: format!("device-{n}"), name: format!("PC {n}"), day: n }).collect();
-    let mut device = Device::new(kept);
-    let (shown, _) = device.shown(1_000);
+    let kept: Vec<Remembered> = (0..1_000u64).map(|n| Remembered { id: format!("device-{n}"), name: format!("PC {n}"), day: n, account: "the account".into() }).collect();
+    let mut world = World::new(false);
+    world.copies[A].device = Device::new(kept);
+    world.tick();
+    let (shown, _) = world.copies[A].device.shown(world.now);
     assert_eq!((shown.rows.len(), shown.rows[0].name.as_str()), (16, "PC 999"));
     // Thirty-one days after the latest was seen, with no other device ever seen: forgotten,
     // and the app is told to keep the list as it now is. Once, not at every tick.
     let mut world = World::new(false);
-    world.copies[A].device = Device::new(vec![Remembered { id: "an-old-device".into(), name: "Old laptop".into(), day: 69 }, Remembered { id: "a-newer-one".into(), name: "Den PC".into(), day: 95 }]);
+    let seen = |id: &str, name: &str, day: u64| Remembered { id: id.into(), name: name.into(), day, account: "the account".into() };
+    world.copies[A].device = Device::new(vec![seen("an-old-device", "Old laptop", 69), seen("a-newer-one", "Den PC", 95)]);
     world.tick();
     assert_eq!(world.copies[A].remembered.iter().map(|seen| seen.name.as_str()).collect::<Vec<_>>(), ["Den PC"]);
     world.copies[A].remembered.clear();
     world.tick();
     assert!(world.copies[A].remembered.is_empty());
+}
+
+/// Another account signs in on the same PC: the devices the first account's sign-in saw
+/// are not listed for it, by name or at all, and are there again for the first.
+#[test]
+fn devices_seen_under_one_account_are_not_listed_for_another() {
+    let mut world = World::new(false);
+    assert_eq!(world.copies[A].remembered.iter().map(|seen| (seen.name.as_str(), seen.account.as_str())).collect::<Vec<_>>(), [("Copy B", "the account")]);
+    let listed = |world: &mut World| world.copies[A].device.shown(world.now).0.rows.iter().map(|row| row.name.clone()).collect::<Vec<_>>();
+    assert_eq!(listed(&mut world), ["Copy B"]);
+    let did = world.with(A, |device, env| device.tick("somebody else", true, env));
+    world.act(A, did);
+    assert_eq!(listed(&mut world), Vec::<String>::new());
+    // (Nothing was thrown away: what is kept still holds it, for when its account is back.)
+    assert_eq!(world.copies[A].remembered.len(), 1);
+    let did = world.with(A, |device, env| device.tick("the account", true, env));
+    world.act(A, did);
+    assert_eq!(listed(&mut world), ["Copy B"]);
 }
 
 #[test]
