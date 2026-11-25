@@ -117,6 +117,42 @@ fn answer(http: &dyn Http, account: &Account, endpoint: &str, with: &[(&str, &st
     if body["status"].as_str() == Some("ok") { Ok(body) } else { Err(Not::Asked) }
 }
 
+/// The playlists an answer to "list the playlists" states. `None` unless it **is** such an
+/// answer: a `playlists` object, in which `playlist` is either left out (there are none,
+/// which is how the server says so) or a list, each entry an object with an id and a name
+/// that are text. An answer of any other shape is no answer. It is never taken to say that
+/// there are no playlists: that would be leave to make one.
+fn playlists(body: &Value) -> Option<Vec<Stated>> {
+    let listed = match body.get("playlists")?.as_object()?.get("playlist") {
+        None => return Some(Vec::new()),
+        Some(listed) => listed.as_array()?,
+    };
+    listed
+        .iter()
+        .map(|entry| {
+            let fields = entry.as_object()?;
+            // (Each of its own kind where it is there: text, not a number that reads as text.)
+            let said = |name: &str| fields.get(name).map(|value| value.as_str().map(str::to_string));
+            let id = said("id")??;
+            if id.trim().is_empty() {
+                return None;
+            }
+            Some(Stated {
+                id,
+                name: said("name")??,
+                owner: match said("owner") {
+                    None => None,
+                    Some(owner) => Some(owner?),
+                },
+                comment: match said("comment") {
+                    None => None,
+                    Some(comment) => Some(comment?),
+                },
+            })
+        })
+        .collect()
+}
+
 /// One look. `used` is the playlist the secret was last read from under this sign-in;
 /// `reset` asks for a new secret. `random` gives thirty-two bytes from the system's source
 /// of randomness, or `None` if it has none to give. `log` is told what was written, in
@@ -177,7 +213,10 @@ pub fn look(http: &dyn Http, account: &Account, mut used: Option<String>, mut re
     }
     for _ in 0..secret::ROUNDS {
         let listed = ask!(answer(http, account, "getPlaylists", &[]), unasked(no_good));
-        let listed: Vec<Stated> = serde_json::from_value(listed["playlists"]["playlist"].clone()).unwrap_or_default();
+        let Some(listed) = playlists(&listed) else {
+            log("look: the answer to listing the playlists is not a list of playlists".into());
+            return unasked(no_good);
+        };
         let (id, replace) = match secret::choose(&listed, &account.username, used.as_deref()) {
             Next::Stop(stop) => return Looked::Stopped(stop),
             Next::Fetch { id, replace } => (id, replace),
@@ -271,6 +310,9 @@ mod tests {
         /// The playlists it lists are there only once this many requests have been made:
         /// another device made them meanwhile.
         listed_from: usize,
+        /// What it answers to "list the playlists" in place of its list, if anything: an
+        /// answer the server says is ok, and of some other shape.
+        lists_as: Option<Value>,
     }
 
     /// A way one request can go wrong.
@@ -306,6 +348,7 @@ mod tests {
                 kept_going: Mutex::default(),
                 fails: None,
                 listed_from: 0,
+                lists_as: None,
             }
         }
 
@@ -367,6 +410,11 @@ mod tests {
             let mut made = self.made.lock().unwrap();
             let answer = match call {
                 "getPlaylists" if !self.list_works => None,
+                "getPlaylists" if self.lists_as.is_some() => {
+                    let mut inside = self.lists_as.clone().unwrap_or_default();
+                    inside["status"] = "ok".into();
+                    ok(inside)
+                }
                 "getPlaylists" => {
                     let mut listed = if asked.len() > self.listed_from { self.listed.clone() } else { Vec::new() };
                     if let Some((id, name, ..)) = made.as_ref() {
@@ -695,6 +743,59 @@ mod tests {
         // With no random bytes a record is not replaced either.
         let server = Scripted::with(vec![playlist(RECORD, true)]);
         assert_eq!((look(&server, &account(), Some("k".into()), false, &mut || None, &mut |_| {}), server.asked()), (Looked::NoRandom, vec!["list", "fetch"]));
+    }
+
+    /// The server says all is well and what it lists is not a list of playlists (another
+    /// program answering in its place, a version that says it another way). That is not
+    /// "there are none": nothing is made, and nothing is concluded.
+    #[test]
+    fn a_list_of_playlists_that_is_not_one_is_an_error_and_never_none() {
+        let entry = |with: Value| serde_json::json!({"playlists": {"playlist": [with]}});
+        let not_lists = [
+            serde_json::json!({}),
+            serde_json::json!({"playlists": []}),
+            serde_json::json!({"playlists": "none"}),
+            serde_json::json!({"playlists": null}),
+            serde_json::json!({"playlists": {"playlist": {}}}),
+            serde_json::json!({"playlists": {"playlist": "none"}}),
+            serde_json::json!({"playlists": {"playlist": null}}),
+            serde_json::json!({"playlists": {"playlist": {"id": "k", "name": secret::PLAYLIST_NAME, "owner": "tester"}}}),
+            entry(serde_json::json!(7)),
+            entry(serde_json::json!("k")),
+            entry(serde_json::json!({"name": secret::PLAYLIST_NAME, "owner": "tester"})),
+            entry(serde_json::json!({"id": "", "name": secret::PLAYLIST_NAME, "owner": "tester"})),
+            entry(serde_json::json!({"id": 7, "name": secret::PLAYLIST_NAME, "owner": "tester"})),
+            entry(serde_json::json!({"id": "k", "owner": "tester"})),
+            entry(serde_json::json!({"id": "k", "name": 7, "owner": "tester"})),
+            entry(serde_json::json!({"id": "k", "name": secret::PLAYLIST_NAME, "owner": 7})),
+            entry(serde_json::json!({"id": "k", "name": secret::PLAYLIST_NAME, "owner": "tester", "comment": ["x"]})),
+        ];
+        for shape in not_lists {
+            for used in [None, Some("k")] {
+                let mut server = Scripted::bare();
+                server.lists_as = Some(shape.clone());
+                let mut said = Vec::new();
+                let looked = look(&server, &account(), used.map(str::to_string), false, &mut || Some([9; 32]), &mut |line| said.push(line));
+                assert_eq!((looked, server.asked()), (Looked::Failed, vec!["list"]), "{shape}");
+                assert_eq!(said, ["look: the answer to listing the playlists is not a list of playlists"], "{shape}");
+            }
+        }
+        // What does say there are none: the list left out, as Navidrome leaves it, or empty.
+        for none in [serde_json::json!({"playlists": {}}), serde_json::json!({"playlists": {"playlist": []}})] {
+            let mut server = Scripted::bare();
+            server.lists_as = Some(none.clone());
+            server.signed_out_after = Some(2);
+            assert_eq!((looks(&server, None, false), server.asked()), (Looked::Failed, vec!["list", "make"]), "{none}");
+        }
+        // And a list with other playlists in it, each with what a playlist has, is read:
+        // what an entry leaves out (its owner, a comment) is left out, not an error.
+        let mut server = Scripted::with(vec![playlist(RECORD, false)]);
+        server.lists_as = Some(serde_json::json!({"playlists": {"playlist": [
+            {"id": "a", "name": "Morning mix", "owner": "tester", "songCount": 8, "public": true},
+            {"id": "b", "name": "Somebody's", "comment": ""},
+            {"id": "k", "name": secret::PLAYLIST_NAME, "owner": "tester"},
+        ]}}));
+        assert!(matches!(looks(&server, Some("k"), false), Looked::Secret { wrote: None, .. }));
     }
 
     /// Every request of every kind of look that is not a write, going wrong in every way a
