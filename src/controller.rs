@@ -1383,7 +1383,7 @@ impl Controller {
             let settings = self.settings.borrow();
             let key = config::load_secret(&self.paths, "lidarr-key");
             match (settings.requests && !settings.lidarr_address.trim().is_empty(), key) {
-                (true, Some(key)) => Some(crate::lidarr::Lidarr::new(&settings.lidarr_address, &key, self.gate_session(&settings))),
+                (true, Some(key)) => Some(crate::lidarr::open(&settings.lidarr_address, &key, self.gate_session(&settings))),
                 _ => None,
             }
         };

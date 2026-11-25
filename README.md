@@ -418,7 +418,7 @@ connection.
 | `src/actions.rs` | Context menus, likes, playlist edits. |
 | `src/covers.rs` | Cover art cache, on disk and in memory. |
 | `src/media.rs` | Windows media keys and now-playing overlay. |
-| `src/lidarr.rs` | Asking a Lidarr server for albums (optional). |
+| `src/lidarr.rs` | Asking a Lidarr server for albums (optional): the connection, and what has been offered. The rules are `core/src/lidarr.rs`. |
 | `src/asked.rs` | Remembers what was requested and spots when it arrives. |
 | `src/bulk.rs` | Asks Lidarr for many albums at once: finds each, hands them over an artist at a time, and checks what Lidarr made of them. |
 | `src/musicbrainz.rs` | Finds songs, discographies and track lists for music that isn't in the library. |
@@ -463,6 +463,7 @@ window, the files, the connections.
 | `core/src/levelling.rs` | When a song counts as playing with its album. |
 | `core/src/queue.rs` | What becomes of the queue when the list it was started from changes. |
 | `core/src/musicbrainz.rs`, `listenbrainz.rs`, `offer.rs` | The questions put to MusicBrainz and ListenBrainz and what is made of the answers. |
+| `core/src/lidarr.rs` | The questions put to Lidarr and what is made of the answers: looking up, asking for an album or an artist, the profiles for singles and soundtracks, what is on its way. `src/lidarr.rs` keeps the Lidarr in use and what has been offered. |
 | `core/src/http.rs` | How the library asks for a request: it asks the app. `src/corehttp.rs` is the Windows app's answer, on its own connections. |
 
 Something moves into `core/` when it is free of the window, files and threads, and is moved

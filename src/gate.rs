@@ -20,8 +20,7 @@ use sha2::{Digest, Sha256};
 /// there; the README says how.
 pub const CLIENT: &str = "nexus-music";
 
-/// Said when Lidarr can't be reached without signing in.
-pub const NEEDED: &str = "Lidarr is behind a sign-in. In Settings, under Requests, sign in with your browser.";
+pub use nexus_core::lidarr::NEEDED;
 const UNKNOWN: &str = "Lidarr is behind a sign-in this app doesn't know how to use.";
 
 /// How long to wait for someone to finish signing in in the browser.
@@ -484,6 +483,16 @@ impl Session {
         if let Ok(mut held) = self.held.lock() {
             held.until = None;
         }
+    }
+}
+
+impl nexus_core::lidarr::SignIn for Session {
+    fn pass(&self) -> Result<String, String> {
+        Session::pass(self)
+    }
+
+    fn forget_pass(&self) {
+        Session::forget_pass(self)
     }
 }
 
