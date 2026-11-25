@@ -154,6 +154,8 @@ pub fn gave(gave: Gave, name: &str, left: usize, sent: usize, here: Here) -> Str
 pub fn took(outcome: Outcome, name: &str) -> String {
     match outcome {
         Outcome::Done => format!("Playing here. {name} is paused."),
+        // (It did not know what it was told: an older version of the app.)
+        Outcome::Refused(Why::Invalid) => format!("Playing here. {name} couldn't be told to stop, so it may still be playing."),
         Outcome::Refused(_) => format!("Playing here. {name} was given something else to do before it could be paused, so it may still be playing."),
         Outcome::NotReached | Outcome::Unknown => format!("Playing here. {name} didn't answer, so it may still be playing."),
     }
@@ -225,10 +227,14 @@ mod tests {
         assert_eq!(gave(Gave::Moved, "Study PC", 2_000, 3_000, Here::Pc), "Playing on Study PC. The next 3000 of 5000 songs were moved.");
         assert_eq!(gave(Gave::StartedLate, "Study PC", 0, 1, Here::Phone), "Study PC has started, too late for this phone to stop by itself. Both are playing.");
         // "Play here": each end says the music is here, and what is known of the other.
-        for ended in [Outcome::Done, Outcome::Refused(Why::Changed), Outcome::NotReached, Outcome::Unknown] {
+        for ended in [Outcome::Done, Outcome::Refused(Why::Changed), Outcome::Refused(Why::Invalid), Outcome::NotReached, Outcome::Unknown] {
             let words = took(ended, "Study PC");
             assert!(words.starts_with("Playing here. Study PC "), "{words}");
+            assert_eq!(words.ends_with("may still be playing."), ended != Outcome::Done, "{words}");
         }
+        // A device on a version that does not know it is being told the music has moved
+        // answers that it did not understand: said as what is true, not as a choice made there.
+        assert_eq!(took(Outcome::Refused(Why::Invalid), "Study PC"), "Playing here. Study PC couldn't be told to stop, so it may still be playing.");
         // And anything else asked of a device that was not done says so, and why.
         for ended in [Outcome::Refused(Why::Changed), Outcome::Refused(Why::Busy), Outcome::Refused(Why::Late), Outcome::Refused(Why::Cannot), Outcome::NotReached, Outcome::Unknown] {
             assert!(outcome(ended, "Study PC").contains("Study PC"));

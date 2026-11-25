@@ -226,6 +226,15 @@ impl Playback {
         self.origins.resize(self.queue.len(), None);
     }
 
+    /// Whether moving the entry `from` places after the current track to `to` places after
+    /// it, as `queued` says, would change anything: there is such an entry and such a
+    /// place, and it is not where and what it is already.
+    fn moves_ahead(&self, from: usize, to: usize, queued: bool) -> bool {
+        let base = self.cursor + 1;
+        let (at, to) = (base + from, base + to);
+        at < self.order.len() && to < self.order.len() && (at != to || self.order.get(at).and_then(|&entry| self.queue.get(entry)).is_some_and(|song| song.queued != queued))
+    }
+
     /// Moves the entry `from` places after the current track to `to` places after it, into
     /// "Next in queue" or out of it as `queued` says.
     fn move_ahead(&mut self, from: usize, to: usize, queued: bool) {
@@ -787,21 +796,24 @@ impl Controller {
     }
 
     pub fn previous_track_here(self: &Rc<Self>) {
-        if self.playback.borrow().order.is_empty() {
-            return;
-        }
-        let _way = self.way_in(Who::Here, What::Playing);
         {
-            let mut pb = self.playback.borrow_mut();
+            let pb = self.playback.borrow();
             if pb.order.is_empty() {
                 return;
             }
-            // Like a CD player: a few seconds in, "previous" restarts the track.
+            // Like a CD player: a few seconds in, "previous" restarts the track. That is a
+            // seek, and takes a seek's way in: where there is nothing to go back to (a
+            // radio station with nothing before it) it changes nothing, and so takes no
+            // place in the order of choices and claims nothing.
             if pb.position > 3.0 || pb.cursor == 0 {
                 drop(pb);
                 return self.seek_here(0.0);
             }
-            pb.cursor -= 1;
+        }
+        let _way = self.way_in(Who::Here, What::Playing);
+        {
+            let mut pb = self.playback.borrow_mut();
+            pb.cursor = pb.cursor.saturating_sub(1);
         }
         self.start_current(0.0);
     }
@@ -1048,8 +1060,13 @@ impl Controller {
     }
 
     pub fn move_upcoming_here(self: &Rc<Self>, from: usize, to: usize, queued: bool) {
-        self.came_in(Who::Here, What::Playing);
-        self.playback.borrow_mut().move_ahead(from, to, queued);
+        // An entry put down where it was, as what it was, changes nothing: it takes no
+        // place in the order of choices and claims nothing.
+        let moves = self.playback.borrow().moves_ahead(from, to, queued);
+        if moves {
+            self.came_in(Who::Here, What::Playing);
+            self.playback.borrow_mut().move_ahead(from, to, queued);
+        }
         self.next_changed();
     }
 
@@ -2777,6 +2794,27 @@ mod tests {
         // Out of range: nothing happens.
         pb.move_ahead(1, 9, true);
         assert_eq!(coming(&pb), "a | b* y* c x");
+    }
+
+    /// A move that would change nothing is known to be one before anything is counted for
+    /// it: an entry put down where it was, as what it was, or one that is not there.
+    #[test]
+    fn a_move_to_the_same_place_as_the_same_thing_changes_nothing() {
+        let mut pb = queue_of(&["a", "b", "c"]);
+        pb.queue_up(vec![named("x"), named("y")], false);
+        assert_eq!(coming(&pb), "a | x* y* b c");
+        for (from, to, queued) in [(0, 0, true), (1, 1, true), (2, 2, false), (3, 3, false), (1, 9, true), (9, 1, false), (9, 9, true)] {
+            assert!(!pb.moves_ahead(from, to, queued), "{from} to {to}, queued {queued}");
+            let before = coming(&pb);
+            pb.move_ahead(from, to, queued);
+            assert_eq!(coming(&pb), before, "{from} to {to}, queued {queued}");
+        }
+        // Another place; or the same place, into the queued part or out of it.
+        for (from, to, queued) in [(0, 1, true), (2, 0, false), (1, 1, false), (2, 2, true)] {
+            assert!(pb.moves_ahead(from, to, queued), "{from} to {to}, queued {queued}");
+        }
+        pb.move_ahead(1, 1, false);
+        assert_eq!(coming(&pb), "a | x* y b c");
     }
 
     #[test]

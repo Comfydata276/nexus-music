@@ -180,7 +180,9 @@ pub enum Do {
     Send { session: u64, token: Token, to: Place, frame: String },
     /// Some of the songs a command brings are not in this device's copy of the library:
     /// ask the music server for them, and answer with [`Device::found`] the ones it has.
-    Find { ticket: u64, ids: Vec<String> },
+    /// **For no longer than `within_ms`**, looked at between one song and the next: that
+    /// is when the command is given up, and whatever is found after it is nobody's.
+    Find { ticket: u64, ids: Vec<String>, within_ms: u64 },
     /// For a test only: carry on with what this ticket holds after this long
     /// ([`Device::resume`]).
     Later { ticket: u64, after_ms: u64 },
@@ -360,11 +362,22 @@ pub struct Device {
     remembered: Vec<Remembered>,
     /// The day the remembered devices were last looked through for ones to forget.
     forgot_on: u64,
+    /// What there is to tell the person that could not be said where it came about: said
+    /// at the next tick.
+    unsaid: Vec<String>,
     /// What the list last showed, to say when it changes.
     listed: Vec<Row>,
     /// For a test only: how long a Pause from another device is held between being
     /// accepted and being carried out.
     pub slow_pause_ms: Option<u64>,
+}
+
+/// What is owed to the person when a device is let go of (it has left the room, this
+/// device has a new place in it, the session is over) with something asked of it still
+/// unanswered that they are waiting to hear of: the stop that ends "Play here". The music
+/// is playing here; whether the other stopped will not now be heard.
+fn unheard(seen: &Seen) -> Option<String> {
+    (seen.out == Some(Out::TakePause) && seen.peer.waiting()).then(|| words::took(Outcome::Unknown, &name_of(seen)))
 }
 
 fn name_of(seen: &Seen) -> String {
@@ -477,6 +490,10 @@ impl Device {
     fn end_session(&mut self, env: &mut Env, out: &mut Vec<Do>) -> bool {
         let Some(session) = self.session.take() else { return false };
         self.sessions += 1;
+        // (What was asked of the others under it will not now be answered.)
+        for note in session.peers.values().filter_map(unheard) {
+            self.say(note, out);
+        }
         match self.take.take() {
             // A queue that was asked for under it will not be answered under another.
             Some(Take::Asked { .. }) | None => {}
@@ -562,6 +579,9 @@ impl Device {
     pub fn tick(&mut self, account: &str, wanted: bool, env: &mut Env) -> Vec<Do> {
         let mut out = Vec::new();
         let now = env.now_ms;
+        for note in std::mem::take(&mut self.unsaid) {
+            self.say(note, &mut out);
+        }
         if self.account != account {
             // Another sign-in: nothing of the last one's carries over.
             out.extend(self.stop(env));
@@ -723,7 +743,7 @@ impl Device {
             // A new place: whatever was asked from the old one cannot be answered to it.
             live.place = Some((place, token));
             live.others.clear();
-            live.peers.clear();
+            self.unsaid.extend(live.peers.drain().filter_map(|(_, seen)| unheard(&seen)));
         }
     }
 
@@ -732,7 +752,7 @@ impl Device {
         if let Some(live) = self.session.as_mut().filter(|live| live.number == session) {
             live.place = None;
             live.others.clear();
-            live.peers.clear();
+            self.unsaid.extend(live.peers.drain().filter_map(|(_, seen)| unheard(&seen)));
         }
     }
 
@@ -752,8 +772,16 @@ impl Device {
     }
 
     /// What this device says of itself.
+    ///
+    /// **While a command is accepted and being worked for** (its songs are being looked
+    /// up), the state is busy and names that command in `by`, as it does for one that was
+    /// carried out and has not sounded yet: its sender, looking because no answer has
+    /// come, sees that it arrived and is under way, and waits on. (Only while busy: a
+    /// state that named it and was not busy would say it was done.)
     fn state(&self, re: Option<Nonce>, ok: Option<bool>, why: Option<Why>, env: &Env) -> Tell {
         let brief = env.player.brief();
+        let busy = env.player.busy(env.now_ms);
+        let open = self.pending.values().find(|pending| busy && pending.until_ms > env.now_ms).map(|pending| pending.nonce);
         Tell {
             re,
             ok,
@@ -761,8 +789,8 @@ impl Device {
             device: env.me.device,
             name: env.me.name.clone(),
             at: At { generation: env.player.generation(), minute: minute(env.now_ms) },
-            busy: env.player.busy(env.now_ms),
-            by: env.player.by(),
+            busy,
+            by: open.or(env.player.by()),
             playing: brief.playing,
             title: brief.title,
             artist: brief.artist,
@@ -780,9 +808,15 @@ impl Device {
             let Some((mine, _)) = live.place.clone() else { return out };
             live.others = places.iter().filter_map(|place| text::read_place(place)).filter(|place| *place != mine).take(15).collect();
             let others = live.others.clone();
+            // (A device that has left the room will not answer what was asked of it.)
+            let gone: Vec<String> = live.peers.iter().filter(|(place, _)| !others.contains(place)).filter_map(|(_, seen)| unheard(seen)).collect();
             live.peers.retain(|place, _| others.contains(place));
+            self.unsaid.extend(gone);
             mine
         };
+        for note in std::mem::take(&mut self.unsaid) {
+            self.say(note, &mut out);
+        }
         for (from, sealed) in frames {
             let Some(from) = text::read_place(from) else { continue };
             // (Checked for each frame: the one before may have ended the session.)
@@ -862,7 +896,7 @@ impl Device {
                     // are back.
                     self.tickets += 1;
                     self.pending.insert(self.tickets, Pending { session, from, nonce, command: command.clone(), at, reservation, ready: None, until_ms: now.saturating_add(rule::OPEN_MS) });
-                    return out.push(Do::Find { ticket: self.tickets, ids: ids.clone() });
+                    return out.push(Do::Find { ticket: self.tickets, ids: ids.clone(), within_ms: rule::OPEN_MS });
                 }
             }
             // It checks it can play before anything is changed: a queue none of whose songs
@@ -883,6 +917,13 @@ impl Device {
             return out.push(Do::Later { ticket: self.tickets, after_ms: wait });
         }
         self.finish(session, from, nonce, command, at, reservation, ready, env, out);
+    }
+
+    /// Whether a command is still waiting for what this ticket's look-up brings. An app
+    /// asks before it keeps anything the look-up found: one that was given up, or that
+    /// belonged to a sign-in that has ended, waits for nothing.
+    pub fn awaits(&self, ticket: u64) -> bool {
+        self.pending.contains_key(&ticket)
     }
 
     /// The songs a command brought that the music server has, of those this device's copy
@@ -1159,9 +1200,18 @@ impl Device {
                 out.push(Do::Remember(self.remembered.clone()));
             }
             self.show_view(from, now, out);
-            // The queue that was asked for, to bring its music here.
-            if matches!(&self.take, Some(Take::Asked { place, nonce, .. }) if *place == from && Some(*nonce) == re) {
-                self.took(from, handed, at, playing, env, out);
+            // The queue that was asked for, to bring its music here: if it has come in
+            // time. One that comes after that is not taken, whether or not a tick has
+            // yet said so.
+            match &self.take {
+                Some(Take::Asked { place, nonce, pressed_ms, .. }) if *place == from && Some(*nonce) == re && now.saturating_sub(*pressed_ms) < WAIT_MS => self.took(from, handed, at, playing, env, out),
+                Some(Take::Asked { place, nonce, name, .. }) if *place == from && Some(*nonce) == re => {
+                    let name = name.clone();
+                    self.take = None;
+                    self.let_go_into(out);
+                    self.say(words::queue_never_came(&name), out);
+                }
+                _ => {}
             }
         }
         match told {

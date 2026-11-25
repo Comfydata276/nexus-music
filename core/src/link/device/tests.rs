@@ -327,8 +327,8 @@ impl World {
                         to_send.push(Frame { from, to, text: frame });
                     }
                 }
-                Do::Find { ticket, ids } if self.slow_server => self.asked_of_server.push((who, ticket, ids)),
-                Do::Find { ticket, ids } => {
+                Do::Find { ticket, ids, .. } if self.slow_server => self.asked_of_server.push((who, ticket, ids)),
+                Do::Find { ticket, ids, .. } => {
                     let has = self.copies[who].library.has_songs(&ids);
                     let found: Vec<String> = ids.iter().zip(has).filter(|(id, has)| *has || self.server.contains(id)).map(|(id, _)| id.clone()).collect();
                     let did = self.with(who, |device, env| device.found(ticket, found, env));
@@ -954,6 +954,40 @@ fn server_answers(world: &mut World) {
     }
 }
 
+/// The sender hears nothing for twelve seconds and looks. The device it asked has accepted
+/// the command and is still looking its songs up: it says so, by being busy and naming the
+/// command, and the sender goes by that. It does not say the command had not arrived.
+#[test]
+fn a_command_accepted_and_being_worked_for_is_not_said_to_have_not_arrived() {
+    let mut world = add_being_looked_up();
+    let said = world.copies[A].said.len();
+    world.pass(14_000);
+    assert!(world.log(A, "outcome of").is_empty() && world.copies[A].said.len() == said, "{:?} {:?}", world.copies[A].log, world.copies[A].said);
+    // (What B says of itself meanwhile, to whoever looks.)
+    let state = world.with(B, |device, env| device.state(None, None, None, env));
+    assert!(state.busy && state.by.is_some() && state.by != world.copies[B].player.rule.by());
+    // The songs are found: it is carried out, and its sender is told then.
+    world.server = vec!["x1".into()];
+    server_answers(&mut world);
+    world.pass(1_000);
+    assert!(world.last(B, "add from").ends_with("carried out") && world.last(A, "outcome of").ends_with("Done"), "{:?}", world.copies[A].log);
+    assert_eq!(world.copies[B].player.queue.last().map(String::as_str), Some("x1"));
+    // Its state names the command no longer than it is busy with it: given up, the state
+    // is as it was before, and nobody is told it was done.
+    let mut world = add_being_looked_up();
+    world.pass(rule::OPEN_MS + 500);
+    let state = world.with(B, |device, env| device.state(None, None, None, env));
+    assert_eq!((state.busy, state.by), (false, world.copies[B].player.rule.by()));
+    assert_eq!(world.copies[A].said.last().map(String::as_str), Some("That took too long to reach Copy B. Nothing was done."));
+    assert!(!world.copies[A].said.iter().any(|said| said.contains("hadn't reached")), "{:?}", world.copies[A].said);
+    // And an app asks whether a look-up's result is still waited for before it keeps it.
+    let mut world = add_being_looked_up();
+    let ticket = world.asked_of_server[0].1;
+    assert!(world.copies[B].device.awaits(ticket) && !world.copies[B].device.awaits(ticket + 1));
+    world.pass(rule::OPEN_MS + 500);
+    assert!(!world.copies[B].device.awaits(ticket));
+}
+
 #[test]
 fn a_command_whose_songs_are_never_found_is_given_up_and_the_device_is_free() {
     let mut world = add_being_looked_up();
@@ -1412,6 +1446,71 @@ fn the_pause_that_completes_a_taking_is_judged_like_any_other() {
     let mut world = taking(|world| world.path.hold_commands = true);
     world.pass(14_000);
     assert_eq!((said(&world), world.copies[A].player.playing, world.copies[B].player.playing), ("Playing here. Copy B didn't answer, so it may still be playing.", true, true));
+}
+
+/// "Play here" has started here and the other device has been told the music has moved.
+/// Before its answer comes, that device is let go of: it leaves the room, this device is
+/// given a new place in it, or linking is reset here. Its answer will not now be heard,
+/// and the person is told what is true all the same, once.
+#[test]
+fn what_became_of_the_stop_that_ends_play_here_is_said_even_when_its_answer_cannot_come() {
+    let unheard = "Playing here. Copy B didn't answer, so it may still be playing.";
+    for how in ["the other left the room", "a new place in the room", "linking reset here", "the sign-in ended"] {
+        let mut world = taking(|world| world.path.hold_commands = true);
+        world.pass(1_000);
+        assert!(world.last(A, "take:").contains("asked Copy B to pause"), "{how}");
+        let before = world.copies[A].said.len();
+        let session = world.copies[A].session;
+        match how {
+            "the other left the room" => {
+                let mine = text::place(&world.copies[A].place.unwrap());
+                let did = world.with(A, |device, env| device.heard(session, &[mine], &[], env));
+                world.act(A, did);
+            }
+            "a new place in the room" => {
+                world.copies[A].device.entered(session, [9; 16], "another-token".into());
+                assert_eq!(world.copies[A].said.len(), before, "it is said at the next tick");
+                world.pass(250);
+            }
+            "linking reset here" => {
+                let did = world.with(A, |device, env| device.reset(env));
+                world.act(A, did);
+            }
+            _ => {
+                let did = world.with(A, |device, env| device.stop(env));
+                world.act(A, did);
+            }
+        }
+        assert_eq!((said(&world), world.copies[A].said.len(), world.copies[A].player.playing), (unheard, before + 1, true), "{how}");
+        // Once: nothing more is said of it, whatever arrives later.
+        world.release();
+        world.pass(20_000);
+        assert_eq!(world.copies[A].said.iter().filter(|said| said.as_str() == unheard).count(), 1, "{how}: {:?}", world.copies[A].said);
+    }
+    // A device let go of with nothing of the kind waiting says nothing.
+    let mut world = steering("pause");
+    let (session, mine, before) = (world.copies[A].session, text::place(&world.copies[A].place.unwrap()), world.copies[A].said.len());
+    let did = world.with(A, |device, env| device.heard(session, &[mine], &[], env));
+    world.act(A, did);
+    world.pass(1_000);
+    assert_eq!(world.copies[A].said.len(), before);
+}
+
+/// The queue that "Play here" asked for comes after its time is up, and before any tick
+/// has run to say so: it is not taken.
+#[test]
+fn a_queue_that_comes_after_its_time_is_not_taken_whether_or_not_a_tick_has_run() {
+    let mut world = taking(|world| world.path.hold_tells = true);
+    // (No tick runs: the clock is moved on, and the answer delivered.)
+    world.now += WAIT_MS;
+    world.release_tells();
+    assert_eq!((said(&world), world.copies[A].player.playing, world.copies[A].player.queue.len(), world.copies[B].player.playing), ("Copy B didn't answer, so nothing was moved. It may still be playing.", false, 3, true));
+    assert_eq!(world.copies[A].window, None);
+    // A moment inside its time, it is taken.
+    let mut world = taking(|world| world.path.hold_tells = true);
+    world.now += WAIT_MS - 1;
+    world.release_tells();
+    assert_eq!(world.copies[A].player.queue.len(), 8);
 }
 
 /// "Play here": while the queue it took has not sounded, the device that took it is in

@@ -1085,7 +1085,7 @@ mod tests {
                         let heard = FromRelay::Heard { places: self.places.iter().map(text::place).collect(), frames: vec![(text::place(&self.places[who]), frame)] };
                         self.happened(1 - who, Happened::FromRelay { session: self.sessions[1 - who], from: heard });
                     }
-                    Do::Find { ticket, ids } => {
+                    Do::Find { ticket, ids, .. } => {
                         self.happened(who, Happened::Found { ticket, songs: ids });
                     }
                     _ => {}

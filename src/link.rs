@@ -238,7 +238,8 @@ struct Inner {
     live: Option<Live>,
     /// Set when the sign-in ends, for the look that is on its way to see.
     look_over: Arc<AtomicBool>,
-    /// Songs the music server was asked for because this PC's copy of the library lacked them.
+    /// Songs the music server was asked for because this PC's copy of the library lacked
+    /// them: held while the command that brought them is carried out, and then let go of.
     found: HashMap<String, Song>,
 }
 
@@ -563,17 +564,33 @@ impl Controller {
                 }
                 // (On the app's own pool for the music server, not the two threads that send
                 // to the relay and read the secret: a long look-up holds neither of those
-                // up. The command it is for is given up by the deciding if this takes more
-                // than half a minute, and what it then brings back is nobody's.)
-                Do::Find { ticket, ids } => self.request(
-                    move |client| Ok(ids.iter().filter_map(|id| crate::jam::find_song(id, Some(client))).filter(|song| song.radio_url.is_empty()).collect::<Vec<Song>>()),
-                    move |ctl, songs| {
-                        let songs = songs.unwrap_or_default();
-                        let found: Vec<String> = songs.iter().map(|song| song.id.clone()).collect();
-                        ctl.link.borrow().inner.borrow_mut().found.extend(songs.into_iter().map(|song| (song.id.clone(), song)));
-                        ctl.link_event(|device, env| device.found(ticket, found, env));
-                    },
-                ),
+                // up. And not for longer than the command it is for is waited on: the
+                // deciding gives the command up then, and a look-up of fifty songs at a
+                // server that has stopped answering must not go on holding a worker. It
+                // is looked at between one song and the next.)
+                Do::Find { ticket, ids, within_ms } => {
+                    let account = self.settings.borrow().account();
+                    let until = std::time::Instant::now() + Duration::from_millis(within_ms);
+                    self.request(
+                        move |client| Ok(ids.iter().take_while(|_| std::time::Instant::now() < until).filter_map(|id| crate::jam::find_song(id, Some(client))).filter(|song| song.radio_url.is_empty()).collect::<Vec<Song>>()),
+                        move |ctl, songs| {
+                            // Before anything it found is kept: is a command still waiting
+                            // for it, under the sign-in it was started for? One that was
+                            // given up, and one from before a change of account, is not.
+                            let waited_for = ctl.settings.borrow().account() == account && ctl.link.borrow().inner.borrow().device.awaits(ticket);
+                            if !waited_for {
+                                return log("found: nothing is waiting for these songs any longer, not kept");
+                            }
+                            let songs = songs.unwrap_or_default();
+                            let found: Vec<String> = songs.iter().map(|song| song.id.clone()).collect();
+                            // (Kept for as long as the command they are for is being
+                            // carried out, and no longer.)
+                            ctl.link.borrow().inner.borrow_mut().found = songs.into_iter().map(|song| (song.id.clone(), song)).collect();
+                            ctl.link_event(|device, env| device.found(ticket, found, env));
+                            ctl.link.borrow().inner.borrow_mut().found.clear();
+                        },
+                    )
+                }
                 Do::Later { ticket, after_ms } => {
                     let ctl = self.clone();
                     slint::Timer::single_shot(Duration::from_millis(after_ms), move || ctl.link_event(|device, env| device.resume(ticket, env)));
