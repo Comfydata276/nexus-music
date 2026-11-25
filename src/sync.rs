@@ -24,6 +24,7 @@ pub use nexus_core::sync::{HISTORY_LENGTH, PLAYLIST_NAME};
 use crate::config::{Played, Settings};
 use crate::controller::{Controller, Route, post, with};
 use crate::subsonic::{ApiError, ApiResult, Client, PlayQueue, Song, Timed};
+use crate::ways::{What, Who};
 
 /// How long after a change before it's passed on, so a burst of changes goes as one.
 const SETTLE: Duration = Duration::from_secs(3);
@@ -195,7 +196,7 @@ impl Prepared {
 impl QueueOwner {
     /// **The person did something to the queue, or to playing it, here**: whatever it was
     /// before, it is this PC's own from this moment. Said at the press itself
-    /// (`Controller::pressing`), not found out afterwards from the queue looking different:
+    /// (`Controller::way_in`), not found out afterwards from the queue looking different:
     /// a seek while paused, or Play and then Pause inside a second, changes nothing a look
     /// at the queue would notice. And it is another queue for anything waiting to be saved.
     pub fn claimed(&self) {
@@ -812,39 +813,17 @@ impl Controller {
     // numbered steps are named below. This is the timers, the requests, and putting a queue
     // in the player.
 
-    /// A press: the person is about to change what is in the player or how it is playing
-    /// (a row played, a song queued, moved or removed, the queue cleared or jumped in,
-    /// Play, Pause, Next, Previous, shuffle; from the window, the tray, the taskbar, the
-    /// mini player, the media keys, or a guest in a jam). Everything `changing` is, and
-    /// besides: **the queue is this PC's own from this moment** (`claim_queue`).
-    ///
-    /// **This and `pressed` are the one list of the person's ways in.** What the app does
-    /// by itself goes through `changing` and `changed` alone, and claims nothing: the next
-    /// song beginning, a song that failed being passed over, similar songs arriving, the
-    /// sleep timer, the sound device going, a queue another device saved being put in the
-    /// player, the last run's queue being put back. A press carried out inside one of
-    /// those (the sleep timer pausing by "pressing" Pause) is part of it, and is no press.
-    pub fn pressing(&self) -> crate::link::Changing<'_> {
-        let own = !self.link_changing.get();
-        let changing = self.changing();
-        if own {
-            self.claim_queue();
-        }
-        changing
-    }
-
-    /// The same, for a press that is over as soon as it is made (a seek, a song queued).
-    pub fn pressed(&self) {
-        if !self.link_changing.get() {
-            self.claim_queue();
-        }
-        self.changed();
-    }
-
     /// The queue is this PC's own from this moment, by the person's own doing: no longer
     /// another device's that was taken up, changed now by this PC's clock, and to be saved
     /// on the server once things have settled. (It borrows nothing of the player: a press
     /// can be half-way through changing it.)
+    ///
+    /// **When that is, is not decided here.** Every way into the player says who chose it
+    /// and what it touches (`ways`), and this is called for the ones a person chose that
+    /// touch what a saved queue holds: a row played, a song queued, moved or removed, the
+    /// queue cleared or jumped in, Play, Pause, Next, Previous, a seek, shuffle; from the
+    /// window, the tray, the taskbar, the mini player, the media keys, a guest in a jam,
+    /// or another of the person's devices. What the app does by itself claims nothing.
     pub fn claim_queue(&self) {
         self.queue_stamp.set(chrono::Utc::now().timestamp());
         self.queue_owner.claimed();
@@ -1005,7 +984,7 @@ impl Controller {
         if theirs.songs.is_empty() {
             return;
         }
-        let _changing = self.changing();
+        let _changing = self.way_in(Who::Nobody, What::Playing);
         self.engine.set_playing(false);
         self.engine.stop();
         self.queue_stamp.set(place.stamp);

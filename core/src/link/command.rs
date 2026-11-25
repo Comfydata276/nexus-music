@@ -27,6 +27,7 @@
 //! within its bounds, before anything is done for it. A field a version does not know is
 //! ignored; a field it knows and finds wrong is not guessed at.
 
+use crate::ways::What;
 use serde_json::{Map, Value, json};
 
 use super::text;
@@ -166,6 +167,19 @@ impl Command {
             Command::Repeat { .. } => "repeat",
             Command::Add { .. } => "add",
             Command::Adopt(_) => "adopt",
+        }
+    }
+
+    /// What it touches at the device that carries it out: what a saved queue holds, or
+    /// only how the player sounds. It is sorted exactly as the press it stands for is
+    /// (`crate::ways`): a command is the person's own choice, made at another device, and
+    /// the queue is theirs by it as it would be by the same press there.
+    pub fn touches(&self) -> What {
+        match self {
+            Command::Volume { .. } | Command::Repeat { .. } => What::Manner,
+            Command::Play | Command::Pause | Command::Next | Command::Previous | Command::Seek { .. } => What::Playing,
+            Command::Jump { .. } | Command::Move { .. } | Command::Remove { .. } | Command::Clear { .. } | Command::Shuffle { .. } => What::Playing,
+            Command::Add { .. } | Command::Adopt(_) => What::Playing,
         }
     }
 

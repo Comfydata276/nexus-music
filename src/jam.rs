@@ -34,6 +34,7 @@ use crate::config;
 use crate::controller::{Controller, Route, clock, post, with};
 use crate::subsonic::{Client, Song};
 use crate::ui;
+use crate::ways::Who;
 
 /// How much of the queue guests are shown.
 const SHOWN: usize = 100;
@@ -938,6 +939,10 @@ impl Controller {
             }
             own
         };
+        // Whatever this comes to in the player was chosen by whoever asked: the person, at
+        // another of their devices, or a guest (see `ways`). It takes its place in the
+        // order of choices as it is carried out.
+        let _asked = self.for_another(if own { Who::Elsewhere } else { Who::Guest }, false);
         // Adding songs, and taking your own back out, is what a jam is for. The rest is
         // the host's to allow; and a session that isn't a jam is for the person's own devices.
         let done = match answer(session, own, self.settings.borrow().jam_guests_control, action) {

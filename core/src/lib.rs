@@ -32,3 +32,4 @@ pub mod step;
 pub mod sync;
 pub mod text;
 pub mod time;
+pub mod ways;

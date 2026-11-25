@@ -31,6 +31,10 @@
 //!   next song beginning, a failed one passed over, similar songs arriving, a sleep timer,
 //!   the sound going, another device's queue put in the player, a restart putting the last
 //!   run's queue back.
+//!   **Which is which is said once**, at each way into the player, with who chose it and
+//!   what it touches ([`crate::ways`]): this and the order of choices that linking keeps
+//!   both come of that one statement. A guest in a jam the device hosts, and the person at
+//!   another of their devices (a command carried out here), choose as the person here does.
 //! * **"Continue here", once taken, is the person's own choice**: the queue put in by it is
 //!   this device's own from that moment, not `taken`.
 //! * **[`Here::ids`] is always given**: the ids of the queue's songs, in order, as the

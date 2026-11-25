@@ -45,6 +45,7 @@ mod sync;
 #[cfg(windows)]
 mod taskbar;
 mod update;
+mod ways;
 
 /// Everything generated from the `.slint` files.
 pub mod ui {

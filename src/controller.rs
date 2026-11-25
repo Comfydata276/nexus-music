@@ -304,8 +304,9 @@ pub struct Controller {
     /// The order of choices on this PC: what a command from another of the person's
     /// devices is judged against (see `link`).
     pub link_rule: RefCell<nexus_core::link::rule::Rule>,
-    /// The player is being changed: what it does on the way is part of that one change.
-    pub link_changing: Cell<bool>,
+    /// The choices under way in the player: who chose what is being done to it now, from
+    /// which both that order and whose the queue is are worked out (see `ways`).
+    pub ways: RefCell<nexus_core::ways::Ways>,
     /// The new linking of a person's devices, where it is switched on (see `link`).
     pub link: RefCell<crate::link::Link>,
     /// Waits for typing in a jam's search box to pause.
@@ -507,7 +508,7 @@ impl Controller {
             jam_pool: std::sync::Arc::new(Pool::new("jam", 4, false)),
             jam: RefCell::default(),
             link_rule: RefCell::default(),
-            link_changing: Cell::new(false),
+            ways: RefCell::default(),
             link: RefCell::default(),
             jam_timer: slint::Timer::default(),
             download_pool: Pool::new("download", 2, false),

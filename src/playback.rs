@@ -25,6 +25,7 @@ const QUEUE_ROWS: usize = 400;
 /// How many of those Now Playing shows.
 const UP_NEXT_ROWS: usize = 6;
 use crate::sync::HISTORY_LENGTH;
+use crate::ways::{What, Who};
 /// File types that are always lossless. (M4A and CAF can be either; those are judged by
 /// whether the server reports a bit depth, which lossy formats don't have.)
 const LOSSLESS_SUFFIXES: [&str; 4] = ["flac", "wav", "aiff", "aif"];
@@ -354,7 +355,7 @@ impl Controller {
             }
             return;
         }
-        let _changing = self.pressing();
+        let _way = self.way_in(Who::Here, What::Playing);
         // Each list remembers whether it plays shuffled. Songs that aren't from a list (a
         // search result, say) leave shuffle as it is.
         let listed = (!source.is_empty()).then(|| self.list_prefs(&source).shuffle);
@@ -679,7 +680,7 @@ impl Controller {
         if self.playback.borrow().current().is_none() {
             return;
         }
-        let _changing = self.pressing();
+        let _way = self.way_in(Who::Here, What::Playing);
         let (loaded, resume_at) = {
             let mut pb = self.playback.borrow_mut();
             if pb.current().is_none() {
@@ -759,7 +760,7 @@ impl Controller {
         if self.playback.borrow().order.is_empty() {
             return;
         }
-        let _changing = self.pressing();
+        let _way = self.way_in(Who::Here, What::Playing);
         {
             let mut pb = self.playback.borrow_mut();
             if pb.order.is_empty() {
@@ -789,7 +790,7 @@ impl Controller {
         if self.playback.borrow().order.is_empty() {
             return;
         }
-        let _changing = self.pressing();
+        let _way = self.way_in(Who::Here, What::Playing);
         {
             let mut pb = self.playback.borrow_mut();
             if pb.order.is_empty() {
@@ -821,7 +822,7 @@ impl Controller {
                 return;
             }
             let seconds = seconds.clamp(0.0, (duration - 1.0).max(0.0));
-            self.pressed();
+            self.came_in(Who::Here, What::Playing);
             pb.position = seconds;
             pb.last_tick = seconds;
             pb.resume_at = seconds;
@@ -842,7 +843,7 @@ impl Controller {
     }
 
     pub fn stop_playback(self: &Rc<Self>) {
-        let _changing = self.changing();
+        let _way = self.way_in(Who::Nobody, What::Playing);
         {
             let mut pb = self.playback.borrow_mut();
             pb.queue.clear();
@@ -875,7 +876,7 @@ impl Controller {
     }
 
     pub fn set_volume_here(self: &Rc<Self>, volume: f32) {
-        self.changed();
+        self.came_in(Who::Here, What::Manner);
         {
             let mut pb = self.playback.borrow_mut();
             pb.volume = volume.clamp(0.0, 1.0);
@@ -898,7 +899,7 @@ impl Controller {
     /// Turns shuffle on or off for what's playing. The current song carries on: turning it
     /// on shuffles what follows; turning it off continues from this song in the list's order.
     pub fn set_shuffle(self: &Rc<Self>, on: bool) {
-        self.pressed();
+        self.came_in(Who::Here, What::Playing);
         let source = {
             let mut pb = self.playback.borrow_mut();
             if pb.shuffle != on {
@@ -957,7 +958,7 @@ impl Controller {
 
     /// Sets repeat: 0 off, 1 the whole queue, 2 the current track.
     pub fn set_repeat(self: &Rc<Self>, mode: u8) {
-        self.changed();
+        self.came_in(Who::Here, What::Manner);
         {
             let mut pb = self.playback.borrow_mut();
             pb.repeat = mode.min(2);
@@ -988,7 +989,7 @@ impl Controller {
         if songs.is_empty() {
             return;
         }
-        self.pressed();
+        self.came_in(Who::Here, What::Playing);
         let was_empty = self.playback.borrow().order.is_empty();
         if was_empty {
             // Nothing queued yet: this becomes the queue, ready to play.
@@ -1031,7 +1032,7 @@ impl Controller {
             if at >= pb.order.len() {
                 return;
             }
-            self.pressed();
+            self.came_in(Who::Here, What::Playing);
             pb.drop_at(at);
         }
         self.next_changed();
@@ -1047,7 +1048,7 @@ impl Controller {
     }
 
     pub fn move_upcoming_here(self: &Rc<Self>, from: usize, to: usize, queued: bool) {
-        self.pressed();
+        self.came_in(Who::Here, What::Playing);
         self.playback.borrow_mut().move_ahead(from, to, queued);
         self.next_changed();
     }
@@ -1065,7 +1066,7 @@ impl Controller {
         if self.playback.borrow().current().is_none() {
             return;
         }
-        self.pressed();
+        self.came_in(Who::Here, What::Playing);
         self.playback.borrow_mut().clear_ahead(queued);
         self.next_changed();
     }
@@ -1086,7 +1087,7 @@ impl Controller {
             }
             pb.playing = true;
         }
-        let _changing = self.pressing();
+        let _way = self.way_in(Who::Here, What::Playing);
         self.start_current(0.0);
     }
 
@@ -1097,7 +1098,7 @@ impl Controller {
         if songs.is_empty() {
             return;
         }
-        let _changing = self.pressing();
+        let _way = self.way_in(Who::Here, What::Playing);
         self.take_queue(songs, index, position, context);
         if playing {
             self.toggle_play();
@@ -1112,7 +1113,7 @@ impl Controller {
         if songs.is_empty() {
             return;
         }
-        let _changing = self.changing();
+        let _way = self.way_in(Who::Here, What::Playing);
         self.take_queue(songs, index, position, context);
         self.toggle_play_here();
     }
@@ -1168,7 +1169,7 @@ impl Controller {
                     pb.reconnects = 0;
                     if token != 0 && token == pb.next_token {
                         // The engine rolled into the next track by itself.
-                        self.changed();
+                        self.came_in(Who::Nobody, What::Playing);
                         pb.cursor = pb.next_cursor;
                         pb.current_token = token;
                         pb.next_token = 0;
@@ -1200,7 +1201,7 @@ impl Controller {
                     }
                     // The song is over: whatever comes of that, what a command from another
                     // device would act on has changed (see `link`).
-                    self.changed();
+                    self.came_in(Who::Nobody, What::Playing);
                     // The sleep timer asked to stop here: line up what's next, paused.
                     if self.sleep_after_song.replace(false) {
                         pb.cursor = pb.following().unwrap_or(pb.cursor);
@@ -1270,7 +1271,7 @@ impl Controller {
                 // Playing on with nothing to play through would count songs nobody heard.
                 let was_playing = std::mem::replace(&mut self.playback.borrow_mut().playing, false);
                 if was_playing {
-                    self.changed();
+                    self.came_in(Who::Nobody, What::Playing);
                     self.engine.set_playing(false);
                     self.sync_transport();
                     self.toast("No sound device found, so playback is paused.");
@@ -1410,7 +1411,7 @@ impl Controller {
     /// Gives up on the current song: says so, and moves to the next unless too many in a row
     /// have failed or there is no next.
     fn pass_over(self: &Rc<Self>, title: &str, message: &str) {
-        let _changing = self.changing();
+        let _way = self.way_in(Who::Nobody, What::Playing);
         self.ui.global::<ui::Player>().set_reconnecting(false);
         let give_up = {
             let mut pb = self.playback.borrow_mut();
@@ -1616,7 +1617,7 @@ impl Controller {
             if let Some(waiting) = pb.autoplay_wait.take() {
                 self.looked_up(waiting);
             }
-            self.changed();
+            self.came_in(Who::Nobody, What::Playing);
             let resume = std::mem::take(&mut pb.autoplay_resume);
             // The queue may have been replaced while the request was out.
             let still_at_end = pb.following().is_none()
@@ -1667,7 +1668,7 @@ impl Controller {
 
     /// Sets the sleep timer: a number of minutes, 0 for off, or `None` for "when this song ends".
     pub fn set_sleep(self: &Rc<Self>, minutes: Option<u32>) {
-        self.changed();
+        self.came_in(Who::Here, What::Manner);
         self.sleep_after_song.set(minutes.is_none());
         self.sleep_at.set(
             minutes.filter(|m| *m > 0).map(|m| Instant::now() + Duration::from_secs(m as u64 * 60)),
@@ -1688,7 +1689,7 @@ impl Controller {
         let Some(at) = self.sleep_at.get() else { return };
         if Instant::now() >= at {
             self.sleep_at.set(None);
-            let _changing = self.changing();
+            let _way = self.way_in(Who::Nobody, What::Playing);
             self.set_playing(false);
             self.toast("Sleep timer: paused");
         }
@@ -2069,7 +2070,7 @@ impl Controller {
         let fingerprint = queue_fingerprint(&pb);
         if self.queue_sig.replace(fingerprint) != fingerprint && !self.queue_quiet.get() {
             // The queue looks different from when it was last noted. Whose it is was said
-            // at the press that made it so, if a press did (`pressing`): here it is only a
+            // at the press that made it so, if a press did (`way_in`): here it is only a
             // change to save, if the queue is this PC's own. (Timed by this PC's own clock,
             // which is set beside the server's when it is compared with the time of another
             // device's save: see `nexus_core::handover`.)
@@ -2167,7 +2168,7 @@ impl Controller {
         if songs.is_empty() {
             return;
         }
-        let _changing = self.changing();
+        let _way = self.way_in(Who::Nobody, What::Playing);
         {
             let mut pb = self.playback.borrow_mut();
             pb.origins = vec![None; songs.len()];
@@ -2381,7 +2382,7 @@ impl Controller {
             with(|ctl| {
                 {
                     let mut pb = ctl.playback.borrow_mut();
-                    ctl.changed();
+                    ctl.came_in(Who::Here, What::Manner);
                     pb.muted = !pb.muted;
                     ctl.settings.borrow_mut().muted = pb.muted;
                 }
@@ -2525,7 +2526,7 @@ impl Controller {
             }
         }
         let view = self.order_for(key, songs);
-        self.changed();
+        self.came_in(Who::Nobody, What::Playing);
         {
             let mut pb = self.playback.borrow_mut();
             let (moved, arrivals) = compare_lists(&pb.source_list, &ids);

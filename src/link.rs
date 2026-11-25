@@ -11,9 +11,10 @@
 //!
 //! What is here is what is this app's by nature:
 //!
-//! - **the order of choices,** counted at every way into the player (`changing`, `changed`,
-//!   `looking_up`): the count is the library's (`Rule`), the places it is counted are the
-//!   player's own code;
+//! - **the order of choices:** the count is the library's (`Rule`), and what moves it on
+//!   is every way into the player, each of which says who chose it in `ways` (where whose
+//!   the queue is comes of the same statement); what is here is the count being moved,
+//!   and the busy that a choice still being looked up makes (`looking_up`);
 //! - **the clock and the random numbers** the library is handed;
 //! - **the threads:** one that keeps this PC's place at the relay for as long as a session
 //!   lasts, and a small pool for the look and for what is sent, each asking through the
@@ -48,6 +49,7 @@ use crate::jam::Remote;
 use crate::pool::Pool;
 use crate::subsonic::Song;
 use crate::ui;
+use crate::ways::{What, Who};
 
 /// Whether the new linking is on for this run of the app.
 pub fn on() -> bool {
@@ -117,7 +119,7 @@ fn slow_pause() -> Option<u64> {
 
 /// Writes a line of what happened to the file named by `NEXUS_MUSIC_LINK_LOG`, if any: for
 /// watching two copies from outside. Never a secret, a key or a token.
-fn log(line: impl AsRef<str>) {
+pub(crate) fn log(line: impl AsRef<str>) {
     use std::io::Write;
     static FILE: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
     if let Some(path) = FILE.get_or_init(|| std::env::var_os("NEXUS_MUSIC_LINK_LOG").map(Into::into))
@@ -131,53 +133,18 @@ fn log(line: impl AsRef<str>) {
 //
 // It exists so that a command from another device is judged against what is true on this
 // one, and for nothing else. Nothing the person does here is ever refused, delayed or
-// dropped because of it: these calls only keep count.
+// dropped because of it: these calls only keep count. What moves it on is every way into
+// the player, and those say so in `ways`, which is also where whose the queue is is said.
 
 /// How long a look-up for something to play is given before this PC stops counting as
 /// busy on its account: longer than any one request to the music server is given.
 const LOOK_UP_MS: u64 = 60_000;
 
-/// What the player holds is being changed. What it does on the way is part of that one
-/// change and is not counted again.
-pub struct Changing<'a> {
-    flag: &'a Cell<bool>,
-    outer: bool,
-}
-
-impl Drop for Changing<'_> {
-    fn drop(&mut self) {
-        self.flag.set(self.outer);
-    }
-}
-
 impl Controller {
-    /// What a command from another device would act on is about to change, by a press or
-    /// by itself: the generation moves on, once for everything done until this is dropped.
-    /// Called only once it is known that something will change: a press that changes
-    /// nothing (Next with nothing to go to) takes no place.
-    pub fn changing(&self) -> Changing<'_> {
-        let outer = self.link_changing.replace(true);
-        if !outer {
-            self.link_moved();
-        }
-        Changing { flag: &self.link_changing, outer }
-    }
-
-    /// A command from another device is being carried out. It took its place in the order
-    /// when the rule let it through (`Rule::finish`): what the player does for it, until
-    /// this is dropped, is that one change and is not counted again.
-    pub fn carrying_out(&self) -> Changing<'_> {
-        Changing { flag: &self.link_changing, outer: self.link_changing.replace(true) }
-    }
-
-    /// The same, for a change that is over as soon as it is made (the volume, a seek).
-    pub fn changed(&self) {
-        if !self.link_changing.get() {
-            self.link_moved();
-        }
-    }
-
-    fn link_moved(&self) {
+    /// What a command from another device would act on has changed, by a press or by
+    /// itself: the order of choices moves on one place. Called from the one place that
+    /// knows of every way into the player (`ways`), and from nowhere else.
+    pub(crate) fn link_moved(&self) {
         let mut rule = self.link_rule.borrow_mut();
         rule.moved();
         log(format!("order: moved on to {}", rule.generation()));
@@ -358,9 +325,10 @@ impl Player for Here<'_> {
 
     fn carry_out(&mut self, command: &Command, ready: &Ready) {
         let ctl = self.ctl;
-        // The command took its place in the order when the rule let it through: what the
-        // player does for it is that one change, and is not counted again.
-        let _carrying = ctl.carrying_out();
+        // The person chose this at another of their devices. It took its place in the order
+        // when the rule let it through, so what the player does for it is not counted
+        // again; and the queue is theirs by it as it would be by the same press here.
+        let _carrying = ctl.for_another(Who::Elsewhere, true);
         match (command, ready) {
             (Command::Play, _) => ctl.set_playing_here(true),
             (Command::Pause, _) => ctl.set_playing_here(false),
@@ -386,8 +354,11 @@ impl Player for Here<'_> {
         }
     }
 
+    /// (The end of a move of this PC's music to another device: the app's own doing. The
+    /// person's choice was that the queue go there, and that device claimed it as it took
+    /// it; a claim here a moment later would make this PC, now silent, the newest.)
     fn pause(&mut self) {
-        self.ctl.changed();
+        self.ctl.came_in(Who::Nobody, What::Playing);
         self.ctl.pause_here();
     }
 
