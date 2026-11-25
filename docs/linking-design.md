@@ -528,7 +528,7 @@ ways, each as the table says.
 | Playing something: an album, playlist, artist or mix; a page's Play; a song in a list; a suggestion; Recently played; a radio station; a song's radio | `play_songs` | As the queue is replaced. If nothing in it can play (offline): no. | From the press until the songs arrive, where they are looked up | The walk: an album (looked up), a song in a list, a look-up the music server never answers |
 | Play Next, Add to Queue: a song, songs dragged onto the queue, an album, a playlist | `enqueue_here` | Yes | From the choice until the songs arrive, where they are looked up | The walk: a song; an album, looked up |
 | A guest in a jam, and a device linked the old way | `jam_asked`, then the same functions as the presses above | As each is carried out | From being let in until carried out or refused | The walk: a guest's add, skip and play, and a search (which changes nothing). The second slice's walk: a device steered the old way while the new runs |
-| A command from another device | `link_finish`, then the `_here` function of the same press | Once, as the rule lets it through; what the player does for it is not counted again | From being accepted until carried out; a queue taken over, until its sound starts | The second slice's walk: every command, and its repeat refused `changed` |
+| A command from another device | `core::link::device` (judged, and counted once), then the `_here` function of the same press under `carrying_out` | Once, as the rule lets it through; what the player does for it is not counted again | From being accepted until carried out; a queue taken over, until its sound starts | The second slice's walk: every command, and its repeat refused `changed` |
 | The sound rolling into the next song | The engine's word, or the app reading what is sounding before it judges another device's command | At the sound's boundary | | The walk |
 | A song ending; the queue running out | The engine's word | Yes | | The walk: the queue running out, autoplay off |
 | Autoplay | `autoplay_loaded` | As the songs are added: ahead of time, while the last song plays | Only if they have not arrived when the queue runs out: from then until they land | The walk: both |
@@ -664,26 +664,87 @@ sections 7 and 8.
 
 ## 8. What goes in `core/`, and what it uses
 
-`core::link` holds the derivations, sealing and opening a frame, every schema and
-size, every command as data and the one function that reads it, the rule of 5.6 on
-both sides (with the presses that wait, and what the sender concludes after no
-answer), the decisions of a move (5.7) on all three of its sides, and the bounds on
-news.
-The app supplies random bytes, the minute, the generation, the server's answers, and
-the player.
+**Everything that decides is in `core::link`,** so that the phone runs the same
+deciding and writes none of it again. An app keeps only what is its own: threads and
+timers, making the requests, its player, its window.
 
-| Crate | Pin | Checked (manifests, repositories, RustSec; nothing built) |
+| In `core::link` | What it is |
+|---|---|
+| `secret`, `frame`, `text`, `message`, `command` | The record and its rules; the derivations; sealing and opening a frame; every schema and size; every command as data and the one function that reads it. |
+| `rule`, `steer`, `moving`, `news` | The rule of 5.6 on both sides (with the presses that wait, and what the sender concludes after no answer); the decisions of a move (5.7) on all three of its sides; the bounds on news. |
+| `look` | The look of 5.1 as one function over an `Http`: the list, the choice, the fetch, the write and the read back, with what it has learnt kept across its own retries, reset, and stopping the moment the sign-in ends. |
+| `relay` | The stay at the relay as one function over an `Http`: the hello, entering, the long poll, entering again when the relay forgets the place, backing off, leaving. And a send. |
+| `device` | **One device among a person's devices, as plain state.** Each thing that happens (a tick, a look's answer, what the relay brought, a press, a device picked, "Play here", "Reset linking", the setting, the sign-in ending) is a function that takes it and the time and gives back a list of things to do: start a look, begin or end a session, send this frame, say this, keep this list of devices, draw. It holds the session, each peer, a move in either direction, the news, the list. |
+| `view` | The device being steered as the player shows it, and what a press means given what is shown (a toggle becomes Play or Pause; an entry is named by its place and its song). |
+| `words` | Every sentence the person is told, for a PC and for a phone. |
+| `seen` | The devices seen before: sixteen, thirty days, by name. |
+| `bind` | The same deciding for an app whose player and library are not in Rust (below). |
+
+It owns no thread, clock, file, socket or source of randomness. An app hands in:
+
+- **the time** (milliseconds on a clock that counts through sleep) and the day;
+- **random bytes** from the system, or the word that there are none;
+- **an `Http`** (`core/src/http.rs`, the boundary the requests rules use): the app
+  makes each request, and says when one is to stop. The look is given one that stops
+  with the sign-in; the stay, one whose waits end when the session does;
+- **its player,** as `device::Player`: what is playing in brief and in full, what
+  could be handed over, where the sound has got to, the songs to come; carry this
+  command out; pause; take this queue; and the order of choices kept beside the
+  player (the generation, busy, `by`), because every way into the player counts
+  there (5.6.1);
+- **its library,** as `core::requests::Library` (`has_songs`): which of these songs
+  it has.
+
+**Windows** (`src/link.rs`) is then: the switch; the seam every way into the player
+calls (`changing`, `changed`, `looking_up`, and `carrying_out` for a command, which
+is not counted twice); two `Http`s over the app's own agents; `Player` over the
+`_here` functions of the player; the thread that keeps the place and the pool that
+sends; and the window (the list, the other device's player and queue, the toasts).
+
+**The phone** calls `bind::Phone`. Its player is Media3 and its library a database,
+both in Kotlin, and the deciding must not call into Kotlin while it decides. So:
+
+- **The player is events in and commands out.** Kotlin says what its player holds
+  whenever that changes (`Event::Player`), and tells each thing that counts in the
+  order of choices as it happens (`Event::Changed`, and `LookingUp` and `LookedUp`
+  around a look-up for something to play): every row of 5.6.1 has its like on a
+  phone, with the notification, a headset, the car and other apps' controls added.
+  What is to be done to the player comes back as data (`Act::Carry`, `Act::Pause`,
+  `Act::Take`), each numbered.
+- **Nothing is decided against a player that has not caught up.** A command is
+  carried out a moment after it is decided, on another thread. Until Kotlin has said
+  what its player holds after doing what it was last asked (the state, with that
+  act's number), what the relay brings is kept in order and decided then: the second
+  of two commands finds the queue as the first left it, as on Windows, where the
+  player is asked directly. A state read before the act was done is not taken. A
+  player that never says so holds nothing up for more than two seconds.
+- **The library is a snapshot:** the ids of its songs, handed over when the phone's
+  copy changes.
+- **What the person does is an event; what to show is data:** the list after each
+  tick, the device being steered, what to say.
+- **The requests stay in Rust.** The look, the stay and each send run over the `Http`
+  the phone's native side already gives the library (Kotlin's client underneath), on
+  threads Kotlin starts. **The secret never crosses to Kotlin:** a look hands it
+  straight to the `Phone`.
+
+Everything that crosses has serde, so each call is JSON in and JSON out, as the
+phone's other calls are.
+
+| Crate | Pin | Checked (manifests, repositories, RustSec) |
 |---|---|---|
 | `chacha20poly1305` | `=0.10.1` | RustCrypto. Has `XChaCha20Poly1305`. Released 2022 and widely used; no advisory against it. NCC Group reviewed an earlier release (0.3, 2020), not this one. 0.11.0 came out in June 2026; the older line is chosen for its years of use. |
 | `hkdf` | `=0.13.0` | RustCrypto, March 2026. Goes with the `sha2` 0.11 the app has. |
 | `zeroize` | as brought in | The sealing key and the secret are wiped when replaced. |
 
 **The secret is not stored on any device,** so there is no key to protect in
-Credential Manager or the Keystore. It is in the app's memory while linking is on. On
-Android it also passes through Kotlin as text on its way to `core/`, where it cannot
-be wiped.
+Credential Manager or the Keystore. It is in the app's memory, in Rust, while linking
+is on, on a PC and on a phone alike.
 
-Not checked: that these build for Android and iOS.
+**Built for Android** (arm64 and x86_64, API 31, the phone app's own native crate and
+build, with a layer that reaches all of the above): it builds as it is, with nothing
+changed for it. It adds about 283 KiB to the phone's library on arm64 (949,424 to
+1,239,184 bytes) and 358 KiB on x86_64 (1,133,776 to 1,500,376), built for size as
+that library is. Not checked: iOS.
 
 ## 9. The reviewers' sequences, replayed
 
@@ -744,8 +805,10 @@ under another secret, or changed in any one bit.
 The cases the script's model leaves out (the sender restarting, an arrival after the
 timeout was reported, a tell replayed, the secret changing at the player, a Play
 still looking its songs up, presses that wait, work under way, the three sides of a
-move) are tests of `core/` and of the app itself, and what needs two devices and a
-path between them is in the walks beside the kit.
+move) are tests of `core/`: of each part by itself, and of two whole devices with a
+path between them that holds, repeats, hands back, throws away and delays what it
+carries (`core/src/link/device/tests.rs`). That the app is wired to it rightly is what
+the walks beside the kit show, with two copies of the app and a real relay.
 
 ## 10. Moving from today's scheme
 
@@ -787,7 +850,15 @@ the other device's player and queue in the window; "Reset linking" under Setting
 Jam; the list as section 2 describes it. Still behind the switch.
 
 Each was seen working in two headless copies against a stand-in for a hostile relay
-path. After them: the phone.
+path.
+
+**Then, before the phone:** the deciding moved out of the Windows app into
+`core::link` (section 8), where it is tested without an app: every command carried
+out, repeated, handed back, after a change, while busy and late; the ways in; every
+ending of a move in both directions; reset with a command in flight; every failure of
+the look. The walks were run again on the app as it then stood, and read as before.
+
+After that: the phone, on `bind::Phone`.
 
 ## 12. Where it is weakest
 
@@ -799,7 +870,10 @@ path. After them: the phone.
    later by whoever gets the secret.
 4. **The generation is only as good as the app's count of changes.** A way into the
    player that does not count is a hole. Every one has to be found and tested, on both
-   apps. Windows' are listed in 5.6.1.
+   apps. Windows' are listed in 5.6.1. On the phone the count is told across a
+   boundary (`Event::Changed`), so a way in that is not told is the same hole, and
+   between a change in Media3 and its being told there is a moment in which a command
+   made before it can still be let through.
 5. **After a lost answer, if anyone chose since, the outcome is not known.**
 6. **A busy device starves steering from elsewhere.**
 7. **The minute and the ten minutes need a clock that counts sleep.**
