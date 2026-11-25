@@ -852,6 +852,19 @@ pub fn off_the_list(title: &str) -> String {
     format!("“{title}” is off the list")
 }
 
+// ---- an arrival ------------------------------------------------------------------------------------
+
+/// What's said when albums that were asked for have turned up: `told` are the ones that are
+/// news (see `asked::arrivals`). Empty when none is.
+pub fn arrived_news(told: &[Asked]) -> String {
+    match told {
+        [] => String::new(),
+        [one] if !one.song.is_empty() => format!("“{}” has arrived, on “{}”.", one.song, one.title),
+        [one] => format!("“{}” by {} has arrived.", one.title, one.artist),
+        many => format!("{} albums you asked for have arrived.", many.len()),
+    }
+}
+
 /// "1 album", "3 albums": a number of things.
 pub fn count(n: usize, noun: &str) -> String {
     if n == 1 { format!("1 {noun}") } else { format!("{n} {noun}s") }
@@ -1095,5 +1108,14 @@ mod tests {
             assert_eq!(served(&[("wanted/missing", none), ("queue", none)], stop_after, look).0, Err(Stopped));
         }
         assert_eq!(off_the_list("Title"), "“Title” is off the list");
+    }
+
+    #[test]
+    fn says_what_has_arrived() {
+        let one = Asked { title: "Parachutes".into(), artist: "Coldplay".into(), ..Default::default() };
+        assert_eq!(arrived_news(&[]), "");
+        assert_eq!(arrived_news(std::slice::from_ref(&one)), "“Parachutes” by Coldplay has arrived.");
+        assert_eq!(arrived_news(&[Asked { song: "Yellow".into(), ..one.clone() }]), "“Yellow” has arrived, on “Parachutes”.");
+        assert_eq!(arrived_news(&[one.clone(), one]), "2 albums you asked for have arrived.");
     }
 }

@@ -1908,12 +1908,7 @@ impl Controller {
         };
         // Arrivals that are news; the rest arrived before and are here to have their
         // playlists seen to again.
-        let news = match told.as_slice() {
-            [] => String::new(),
-            [one] if !one.song.is_empty() => format!("“{}” has arrived, on “{}”.", one.song, one.title),
-            [one] => format!("“{}” by {} has arrived.", one.title, one.artist),
-            many => format!("{} albums you asked for have arrived.", many.len()),
-        };
+        let news = nexus_core::requests::arrived_news(&told);
         if !told.is_empty() {
             self.toast(format!("{news} See Requests."));
             self.refresh_outside();

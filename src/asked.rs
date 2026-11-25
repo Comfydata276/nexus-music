@@ -13,7 +13,6 @@ use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
 use crate::import::Matcher;
-use crate::musicbrainz::same_words;
 use crate::search::Index;
 
 pub use nexus_core::asked::{Arrival, Asked, Fill};
@@ -104,8 +103,6 @@ impl AskedList {
     }
 }
 
-pub(crate) use nexus_core::text::same_artist;
-
 /// Looks through the library for the albums in `asked` that are still awaited, and for the
 /// ones that arrived lately with songs still to go into playlists. For each that's there
 /// now, finds the songs its playlists were missing.
@@ -117,11 +114,8 @@ pub fn arrivals(index: &Index, asked: &[Asked], now: i64) -> Vec<Arrival> {
     nexus_core::asked::arrivals(
         asked,
         now,
-        // The library's albums carry their artist as the line beneath the title.
-        |title, artist| {
-            let album = index.library.albums.iter().find(|album| same_words(&album.title, title) && same_artist(&album.subtitle, artist))?;
-            Some((album.id.clone(), album.cover.clone()))
-        },
+        // The album an arrival is, by the library's rule (the same words, the same artist).
+        |title, artist| nexus_core::requests::Library::same_album(index, title, artist),
         |wanted| matcher.find(wanted).map(|song| song.id.clone()),
     )
 }
