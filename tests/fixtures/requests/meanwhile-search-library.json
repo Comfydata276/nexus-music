@@ -1,0 +1,252 @@
+{
+  "asked": [
+    "GET http://lidarr.test/api/v1/album/lookup?term=Mid%20Star ",
+    "GET http://lidarr.test/api/v1/artist/lookup?term=Mid%20Star ",
+    "GET https://api.listenbrainz.org/1/popularity/top-recordings-for-artist/mc4 ",
+    "GET https://musicbrainz.org/ws/2/release-group?artist=mc4&type=album%7Cep%7Csingle&limit=100&offset=0&inc=artist-credits&fmt=json ",
+    "POST https://api.listenbrainz.org/1/popularity/artist { \"artist_mbids\": [ \"mc4\" ] }"
+  ],
+  "stages": [
+    {
+      "about": "",
+      "action": "",
+      "album_numbers": false,
+      "artist_id": "",
+      "can_play": false,
+      "context": "",
+      "cover": "",
+      "cover_round": false,
+      "disc_sections": false,
+      "empty": "",
+      "filter": 0,
+      "filters": [],
+      "grid": [],
+      "has_menu": false,
+      "label": "",
+      "lead": [],
+      "liked_songs": false,
+      "meta": "",
+      "more": null,
+      "notice": "",
+      "notice_action": "",
+      "notice_other": "",
+      "offers": [],
+      "offers_first": false,
+      "offers_heading": "",
+      "offers_note": "Looking for their songs and albums…",
+      "offers_route": "",
+      "offers_title": "Not in your library",
+      "play": "Songs",
+      "playlist": null,
+      "request_ids": [],
+      "shelves": [],
+      "show_album": false,
+      "show_cover": false,
+      "show_number": false,
+      "song_notes": [],
+      "songs": [],
+      "sort": 0,
+      "sorts": [],
+      "star": null,
+      "starred": false,
+      "stats": [],
+      "subtitle": "",
+      "subtitle_route": "",
+      "tail": [
+        {
+          "cards": [
+            {
+              "cover": "https://pictures.test/mc4.jpg",
+              "id": "mc4",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Mid Star"
+            }
+          ],
+          "route": "",
+          "title": "Artists",
+          "wrap": false
+        }
+      ],
+      "tiles": [],
+      "title": "Results for “Mid Star”",
+      "tracks_route": "",
+      "tracks_title": ""
+    },
+    {
+      "about": "",
+      "action": "",
+      "album_numbers": false,
+      "artist_id": "",
+      "can_play": false,
+      "context": "",
+      "cover": "",
+      "cover_round": false,
+      "disc_sections": false,
+      "empty": "",
+      "filter": 0,
+      "filters": [],
+      "grid": [],
+      "has_menu": false,
+      "label": "",
+      "lead": [],
+      "liked_songs": false,
+      "meta": "",
+      "more": null,
+      "notice": "",
+      "notice_action": "",
+      "notice_other": "",
+      "offers": [],
+      "offers_first": false,
+      "offers_heading": "",
+      "offers_note": "Looking for their most played songs…",
+      "offers_route": "",
+      "offers_title": "Not in your library",
+      "play": "Songs",
+      "playlist": null,
+      "request_ids": [],
+      "shelves": [],
+      "show_album": false,
+      "show_cover": false,
+      "show_number": false,
+      "song_notes": [],
+      "songs": [],
+      "sort": 0,
+      "sorts": [],
+      "star": null,
+      "starred": false,
+      "stats": [],
+      "subtitle": "",
+      "subtitle_route": "",
+      "tail": [
+        {
+          "cards": [
+            {
+              "cover": "https://pictures.test/mc4.jpg",
+              "id": "mc4",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Mid Star"
+            }
+          ],
+          "route": "",
+          "title": "Artists",
+          "wrap": false
+        },
+        {
+          "cards": [
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-mc4/front-250",
+              "id": "rg-mc4",
+              "kind": "Request",
+              "subtitle": "Mid Star • 2015",
+              "title": "Star Album"
+            }
+          ],
+          "route": "",
+          "title": "Albums",
+          "wrap": false
+        }
+      ],
+      "tiles": [],
+      "title": "Results for “Mid Star”",
+      "tracks_route": "",
+      "tracks_title": ""
+    },
+    {
+      "about": "",
+      "action": "",
+      "album_numbers": false,
+      "artist_id": "",
+      "can_play": false,
+      "context": "",
+      "cover": "",
+      "cover_round": false,
+      "disc_sections": false,
+      "empty": "",
+      "filter": 0,
+      "filters": [],
+      "grid": [],
+      "has_menu": false,
+      "label": "",
+      "lead": [],
+      "liked_songs": false,
+      "meta": "",
+      "more": null,
+      "notice": "",
+      "notice_action": "",
+      "notice_other": "",
+      "offers": [
+        {
+          "about": "Star Album • 2015",
+          "album": "rg-mc4",
+          "album_title": "Star Album",
+          "artist": "Mid Star",
+          "artist_id": "mc4",
+          "artist_name": "Mid Star",
+          "cover": "https://coverartarchive.org/release-group/rg-mc4/front-250",
+          "kind": "",
+          "requested": false,
+          "seconds": 200,
+          "song": "",
+          "title": "Second One"
+        }
+      ],
+      "offers_first": false,
+      "offers_heading": "",
+      "offers_note": "Their most played songs come first. Ask Lidarr for any of these, or open the artist for everything they've made.",
+      "offers_route": "",
+      "offers_title": "Not in your library",
+      "play": "Songs",
+      "playlist": null,
+      "request_ids": [],
+      "shelves": [],
+      "show_album": false,
+      "show_cover": false,
+      "show_number": false,
+      "song_notes": [],
+      "songs": [],
+      "sort": 0,
+      "sorts": [],
+      "star": null,
+      "starred": false,
+      "stats": [],
+      "subtitle": "",
+      "subtitle_route": "",
+      "tail": [
+        {
+          "cards": [
+            {
+              "cover": "https://pictures.test/mc4.jpg",
+              "id": "mc4",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Mid Star"
+            }
+          ],
+          "route": "",
+          "title": "Artists",
+          "wrap": false
+        },
+        {
+          "cards": [
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-mc4/front-250",
+              "id": "rg-mc4",
+              "kind": "Request",
+              "subtitle": "Mid Star • 2015",
+              "title": "Star Album"
+            }
+          ],
+          "route": "",
+          "title": "Albums",
+          "wrap": false
+        }
+      ],
+      "tiles": [],
+      "title": "Results for “Mid Star”",
+      "tracks_route": "",
+      "tracks_title": ""
+    }
+  ]
+}

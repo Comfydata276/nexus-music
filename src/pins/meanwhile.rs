@@ -42,3 +42,45 @@ fn an_artist_lidarr_keeps_goes_by_the_setting_as_it_is_once_lidarr_has_answered(
         .enter();
     pinned("meanwhile-artist-kept-singles-off", &walk(Route::OutsideArtist("mc2".into()), None), false);
 }
+#[test]
+fn an_artists_page_goes_by_the_library_as_it_is_once_their_releases_are_known() {
+    // One of their albums arrives in the library while MusicBrainz is asked for their list:
+    // it's shown as the library's, counted in, and not open to "Add artist".
+    let mid = ("mc3", "Mid Band");
+    let _scene = Scene::new()
+        .answer("GET lidarr.test/api/v1/artist", "[]")
+        .meanwhile("GET musicbrainz.org/ws/2/release-group?artist=mc3", replace_library(&[("lib-grown", "Grown", "Mid Band")], &[]))
+        .answer("GET musicbrainz.org/ws/2/release-group?artist=mc3", groups(&[group("rg-grown", "Grown", "Album", &[], "2015-01-01", mid)]))
+        .answer("GET api.listenbrainz.org/1/popularity/top-recordings-for-artist/mc3", "[]")
+        .answer("POST api.listenbrainz.org/1/popularity/release-group", "[]")
+        .enter();
+    pinned("meanwhile-artist-library", &walk(Route::OutsideArtist("mc3".into()), None), false);
+}
+
+#[test]
+fn a_search_goes_by_the_library_as_it_is_when_the_most_played_are_known() {
+    // An artist meant beyond doubt; one of their most played arrives in the library while
+    // ListenBrainz is asked what they're played for: it's left out, and that's said.
+    let star = ("mc4", "Mid Star");
+    let _scene = Scene::new()
+        .answer("GET lidarr.test/api/v1/artist/lookup?term=Mid%20Star", list(&[lidarr_artist("mc4", "Mid Star", true, "")]))
+        .answer("GET lidarr.test/api/v1/album/lookup?term=Mid%20Star", "[]")
+        .answer("POST api.listenbrainz.org/1/popularity/artist", listens("artist_mbid", &[("mc4", 6_000_000)]))
+        .answer("GET musicbrainz.org/ws/2/release-group?artist=mc4", groups(&[group("rg-mc4", "Star Album", "Album", &[], "2015-01-01", star)]))
+        .meanwhile("GET api.listenbrainz.org/1/popularity/top-recordings-for-artist/mc4", replace_library(&[], &[("s-top", "Top One", "Mid Star")]))
+        .answer("GET api.listenbrainz.org/1/popularity/top-recordings-for-artist/mc4", top(&[("Top One", "Star Album", 900), ("Second One", "Star Album", 800)]))
+        .enter();
+    pinned("meanwhile-search-library", &searched("Mid Star"), true);
+}
+
+#[test]
+fn an_artists_most_played_go_by_the_library_as_it_is_when_they_are_known() {
+    let pop = ("mc5", "Mid Pop");
+    let _scene = Scene::new()
+        .answer("GET lidarr.test/api/v1/artist", "[]")
+        .answer("GET musicbrainz.org/ws/2/release-group?artist=mc5", groups(&[group("rg-mc5", "Pop Album", "Album", &[], "2015-01-01", pop)]))
+        .meanwhile("GET api.listenbrainz.org/1/popularity/top-recordings-for-artist/mc5", replace_library(&[], &[("s-top5", "Top One", "Mid Pop")]))
+        .answer("GET api.listenbrainz.org/1/popularity/top-recordings-for-artist/mc5", top(&[("Top One", "Pop Album", 900), ("Second One", "Pop Album", 800)]))
+        .enter();
+    pinned("meanwhile-artist-popular-library", &walk(Route::OutsideArtist("mc5".into()), None), false);
+}

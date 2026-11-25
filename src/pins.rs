@@ -197,7 +197,6 @@ pub fn asked_by_thread() -> Vec<Vec<String>> {
 
 /// A library to put in place of the scene's while it's being looked at, as the window's
 /// worker does when the server's library has changed.
-#[allow(dead_code)]
 pub fn replace_library(albums: &[(&str, &str, &str)], songs: &[(&str, &str, &str)]) -> impl FnOnce() + Send + 'static {
     let albums: Vec<CardData> = albums.iter().map(|(id, title, artist)| CardData { kind: Kind::Album, id: (*id).into(), title: (*title).into(), subtitle: (*artist).into(), cover: format!("al-{id}") }).collect();
     let songs: Vec<Song> = songs.iter().map(|(id, title, artist)| Song { id: (*id).into(), title: (*title).into(), artist: (*artist).into(), ..Default::default() }).collect();

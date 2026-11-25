@@ -436,12 +436,12 @@ fn services(lidarr: &crate::lidarr::Lidarr) -> nexus_core::requests::Services<'_
     nexus_core::requests::Services { lidarr, musicbrainz: crate::musicbrainz::service(), listenbrainz: crate::listenbrainz::service() }
 }
 
-/// The library as the requests pages ask it: the window's index, or nothing before it's in.
-fn library(index: &Option<std::sync::Arc<crate::search::Index>>) -> &dyn nexus_core::requests::Library {
-    static NOTHING: std::sync::OnceLock<nexus_core::requests::Snapshot> = std::sync::OnceLock::new();
-    match index {
-        Some(index) => index.as_ref(),
-        None => NOTHING.get_or_init(Default::default),
+/// The library as the requests pages ask it, as it is when they ask: the window's index, or
+/// nothing before it's in.
+fn library() -> std::sync::Arc<dyn nexus_core::requests::Library> {
+    match crate::search::current() {
+        Some(index) => index,
+        None => std::sync::Arc::new(nexus_core::requests::Snapshot::default()),
     }
 }
 
@@ -450,10 +450,9 @@ fn library(index: &Option<std::sync::Arc<crate::search::Index>>) -> &dyn nexus_c
 /// more of it is known, so what's found shows as it arrives; the finished page is returned.
 fn search_extras(query: &str, page: &PageData, publish: &mut dyn FnMut(PageData)) -> Option<PageData> {
     let lidarr = crate::lidarr::current()?;
-    let index = crate::search::current();
     let found = nexus_core::requests::search(
         services(&lidarr),
-        library(&index),
+        &library,
         crate::lidarr::offers(),
         &crate::lidarr::singles,
         &crate::asked::shared,
@@ -482,9 +481,8 @@ fn requests_off(title: &str) -> PageData {
 /// `nexus_core::requests::artist`).
 fn outside_artist(id: &str) -> PageData {
     let Some(lidarr) = crate::lidarr::current() else { return requests_off("Artist") };
-    let index = crate::search::current();
     // (Nothing on Windows stops a request, so "stopped" can't come of it.)
-    let Ok(found) = nexus_core::requests::artist(services(&lidarr), library(&index), crate::lidarr::offers(), &crate::lidarr::singles, id) else {
+    let Ok(found) = nexus_core::requests::artist(services(&lidarr), &library, crate::lidarr::offers(), &crate::lidarr::singles, id) else {
         return PageData { label: "Artist".into(), cover_round: true, ..Default::default() };
     };
     if found.failed {
@@ -525,10 +523,9 @@ fn outside_artist_extras(id: &str, page: &PageData) -> Option<PageData> {
     if page.title.is_empty() || !page.offers.is_empty() {
         return None;
     }
-    let index = crate::search::current();
     let popular = nexus_core::requests::artist_popular(
         services(&lidarr),
-        library(&index),
+        &library,
         crate::lidarr::offers(),
         &crate::lidarr::singles,
         &crate::asked::shared,

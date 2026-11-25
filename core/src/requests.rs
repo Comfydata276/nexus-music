@@ -88,8 +88,13 @@ pub struct SongRef<'a> {
 
 /// The app's copy of the library, as these ask it. An app answers the three lists; the
 /// questions below are answered from them here, so that every app compares names the same
-/// way. They're asked once per page or action, as each was before it moved here.
-pub trait Library: Sync {
+/// way.
+///
+/// An app's copy changes: the server's library is read again, and the copy replaced, while
+/// a page is being found. So the functions here are given not a copy but a way to the copy as
+/// it is (`CurrentLibrary`), and ask it again at each point where the Windows app read its
+/// copy before these moved here; what they're handed may differ from one asking to the next.
+pub trait Library: Send + Sync {
     fn albums(&self) -> Box<dyn Iterator<Item = AlbumRef<'_>> + '_>;
     fn songs(&self) -> Box<dyn Iterator<Item = SongRef<'_>> + '_>;
     /// The names of the artists it has.
@@ -138,8 +143,11 @@ pub trait Library: Sync {
     }
 }
 
+/// The library as it is now: each call gives the app's copy at that moment (see `Library`).
+pub type CurrentLibrary<'a> = &'a dyn Fn() -> std::sync::Arc<dyn Library>;
+
 /// A copy of the library as plain lists: what an app hands across once whenever its own copy
-/// changes, kept, and asked as often as it likes.
+/// changes, kept, and given (as the current one, see `CurrentLibrary`) as often as it's asked.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Snapshot {
@@ -181,10 +189,10 @@ pub fn top_of(musicbrainz: &MusicBrainz, listenbrainz: &ListenBrainz, artist: &s
 /// theirs it can be asked for with. `top` is ListenBrainz's list of what they're played
 /// for and `releases` everything they've put out. Also says
 /// whether any were left out for being in the library already.
-pub fn popular_songs(top: &[TopSong], library: &dyn Library, artist: &str, name: &str, releases: &[Offer]) -> (Vec<SongOffer>, bool) {
-    let have: HashSet<String> = library.songs_by(name);
+pub fn popular_songs(top: &[TopSong], library: CurrentLibrary, artist: &str, name: &str, releases: &[Offer]) -> (Vec<SongOffer>, bool) {
+    let have: HashSet<String> = library().songs_by(name);
     // A song on an album that's here is here too, whatever the file calls it.
-    let have_albums: HashSet<String> = library.album_titles_by(name);
+    let have_albums: HashSet<String> = library().album_titles_by(name);
     let all = crate::musicbrainz::popular(top, releases, artist, name);
     let mut left_out = false;
     let mut songs: Vec<SongOffer> = Vec::new();
@@ -228,7 +236,7 @@ pub struct Outside {
 /// service is waited for), and `asked` what has been asked for, read for each stage.
 pub fn search(
     services: Services,
-    library: &dyn Library,
+    library: CurrentLibrary,
     offers: &Offers,
     singles: &(dyn Fn() -> bool + Sync),
     asked: &dyn Fn() -> Vec<Asked>,
@@ -257,8 +265,9 @@ pub fn search(
         }
     };
     // Leave out what the library already has.
-    let have_albums: HashSet<(String, String)> = library.album_names();
-    let have_songs: HashSet<(String, String)> = library.song_names();
+    let held = library();
+    let have_albums: HashSet<(String, String)> = held.album_names();
+    let have_songs: HashSet<(String, String)> = held.song_names();
     let typed = plain(query);
     let words = typed.split(' ').count();
 
@@ -496,7 +505,7 @@ pub struct OutsideArtist {
 /// in the library opening as usual and the rest there to be asked for. `id` is
 /// MusicBrainz's name for them; `singles` the "singles and EPs" setting, read once Lidarr has
 /// said whether it keeps track of them (it may be switched while Lidarr is waited for).
-pub fn artist(services: Services, library: &dyn Library, offers: &Offers, singles: &(dyn Fn() -> bool + Sync), id: &str) -> Result<OutsideArtist, Stopped> {
+pub fn artist(services: Services, library: CurrentLibrary, offers: &Offers, singles: &(dyn Fn() -> bool + Sync), id: &str) -> Result<OutsideArtist, Stopped> {
     let lidarr = services.lidarr;
     let remembered = offers.offered_artist(id);
     // If Lidarr keeps track of the artist, its list says what's wanted and what's arrived.
@@ -528,7 +537,7 @@ pub fn artist(services: Services, library: &dyn Library, offers: &Offers, single
     let offered: Vec<Offer> = albums.iter().map(|(offer, _)| offer.clone()).collect();
     offers.remember(&offered);
     // Albums the library has are shown as its own, so they open and play.
-    let library: HashMap<String, LibraryAlbum> = library.albums_by(&name);
+    let library: HashMap<String, LibraryAlbum> = library().albums_by(&name);
     let mut owned = 0;
     let mut open = 0;
     let mut card = |offer: &Offer, have: bool, counted: bool| -> Release {
@@ -582,7 +591,7 @@ pub struct Popular {
 /// they're needed.
 pub fn artist_popular(
     services: Services,
-    library: &dyn Library,
+    library: CurrentLibrary,
     offers: &Offers,
     singles: &(dyn Fn() -> bool + Sync),
     asked: &dyn Fn() -> Vec<Asked>,
@@ -877,6 +886,11 @@ pub fn count(n: usize, noun: &str) -> String {
 mod tests {
     use super::*;
 
+    /// The snapshot below, as the library as it is.
+    pub(crate) fn current() -> std::sync::Arc<dyn Library> {
+        std::sync::Arc::new(snapshot())
+    }
+
     pub(crate) fn snapshot() -> Snapshot {
         let album = |id: &str, title: &str, artist: &str| LibraryAlbum { id: id.into(), title: title.into(), artist: artist.into(), cover: format!("al-{id}") };
         Snapshot {
@@ -933,7 +947,7 @@ mod tests {
         let musicbrainz = MusicBrainz::new(http.clone(), listenbrainz.clone());
         let services = Services { lidarr: &lidarr, musicbrainz: &musicbrainz, listenbrainz: &listenbrainz };
         let mut published = Vec::new();
-        let found = search(services, &snapshot(), &Offers::new(), &|| true, &Vec::new, query, &mut |stage| {
+        let found = search(services, &current, &Offers::new(), &|| true, &Vec::new, query, &mut |stage| {
             // Nothing is to be published once a stop has been met.
             assert!(http.asked.lock().unwrap().len() <= http.stop_after, "published after the stop: {stage:?}");
             published.push(stage)
@@ -995,11 +1009,11 @@ mod tests {
 
     #[test]
     fn an_artists_page_says_what_they_have_made() {
-        let (found, _) = served(MARROW_LAKE, usize::MAX, |services| artist(services, &snapshot(), &Offers::new(), &|| true, "ml"));
+        let (found, _) = served(MARROW_LAKE, usize::MAX, |services| artist(services, &current, &Offers::new(), &|| true, "ml"));
         let found = found.unwrap();
         assert_eq!((found.name.as_str(), found.about.as_str(), found.open), ("Marrow Lake", "1 album", 1));
         assert_eq!(found.albums.iter().chain(&found.smaller).map(|release| release.caption.as_str()).collect::<Vec<_>>(), ["2018", "2017 • EP"]);
-        let (popular, _) = served(MARROW_LAKE, usize::MAX, |services| artist_popular(services, &snapshot(), &Offers::new(), &|| true, &Vec::new, "ml", "Marrow Lake"));
+        let (popular, _) = served(MARROW_LAKE, usize::MAX, |services| artist_popular(services, &current, &Offers::new(), &|| true, &Vec::new, "ml", "Marrow Lake"));
         let popular = popular.unwrap().unwrap();
         assert_eq!((popular.heading.as_str(), popular.songs.len()), ("Popular", 1));
     }
@@ -1007,10 +1021,10 @@ mod tests {
     #[test]
     fn a_stopped_artists_page_says_so() {
         fn page(services: Services) -> Result<OutsideArtist, Stopped> {
-            artist(services, &snapshot(), &Offers::new(), &|| true, "ml")
+            artist(services, &current, &Offers::new(), &|| true, "ml")
         }
         fn popular(services: Services) -> Result<Option<Popular>, Stopped> {
-            artist_popular(services, &snapshot(), &Offers::new(), &|| true, &Vec::new, "ml", "Marrow Lake")
+            artist_popular(services, &current, &Offers::new(), &|| true, &Vec::new, "ml", "Marrow Lake")
         }
         let (_, all) = served(MARROW_LAKE, usize::MAX, page);
         for stop_after in 0..all {
