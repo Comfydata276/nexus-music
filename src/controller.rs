@@ -478,6 +478,15 @@ impl Controller {
     pub fn install(ui: ui::MainWindow) -> Rc<Controller> {
         let paths = Paths::new();
         let (settings, settings_note) = Settings::load_checked(&paths.settings);
+        let play_log = {
+            let recent: Vec<(String, i64)> = config::load_history(&paths.history).into_iter().map(|played| (played.song.id, played.at)).collect();
+            crate::plays::PlayLog::load(&paths.plays, &recent)
+        };
+        // (Both, if both: each is said once, when the app has started.)
+        let startup_note = match (settings_note, play_log.note()) {
+            (Some(settings), Some(plays)) => Some(format!("{settings} {plays}")),
+            (settings, plays) => settings.or(plays.map(str::to_string)),
+        };
         let settings_songs_dir = settings.songs_dir.clone();
         crate::mixes::set_rules(settings.rule_mixes.clone());
         crate::audio::source::clean_stale(&paths.buffers);
@@ -520,12 +529,9 @@ impl Controller {
             moving_downloads: Cell::new(false),
             menu_rule: Cell::new(None),
             said: RefCell::default(),
-            startup_note: RefCell::new(settings_note),
+            startup_note: RefCell::new(startup_note),
             elsewhere: RefCell::default(),
-            play_log: RefCell::new({
-                let recent: Vec<(String, i64)> = config::load_history(&paths.history).into_iter().map(|played| (played.song.id, played.at)).collect();
-                crate::plays::PlayLog::load(&paths.plays, &recent)
-            }),
+            play_log: RefCell::new(play_log),
             history: RefCell::new(config::load_history(&paths.history)),
             history_model: Rc::new(VecModel::default()),
             grid_model: Rc::new(VecModel::default()),

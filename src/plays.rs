@@ -31,6 +31,37 @@ pub struct PlayLog {
     /// was full): they are counted for this run, and written with the next thing that is.
     /// Until they are, nothing is said to be kept (see `keep`).
     unwritten: Vec<(String, i64, String)>,
+    /// The log is not to be written to in this run: it could not be read when the app
+    /// started (see `load`). What would be added to it is added to a file beside it
+    /// instead (`side`), and joined to it the next time it reads.
+    aside: bool,
+    /// Every line of the file was read. Only then is the file ever written again whole
+    /// (from the plays in memory): never over lines that this run could not read.
+    whole: bool,
+    /// The log is there and could not be read (`note`).
+    unread: bool,
+}
+
+/// The log is there and could not be read when the app started: what is counted is only
+/// what has been played since, and nothing says the rest is gone.
+static UNREAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn unread() -> bool {
+    UNREAD.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// The plays in a log's text, each with where it was played from if that was noted; and
+/// whether every line of it read. The lines that read, read; the last record ends where
+/// `ending` says.
+fn read(bytes: &[u8]) -> (Vec<(String, i64, String)>, bool) {
+    let lines: Vec<&[u8]> = bytes[..ending(bytes).0].split(|byte| *byte == b'\n').filter(|line| !line.iter().all(u8::is_ascii_whitespace)).collect();
+    let plays: Vec<(String, i64, String)> = lines.iter().filter_map(|line| read_line(line)).collect();
+    let whole = plays.len() == lines.len();
+    (plays, whole)
+}
+
+fn text(plays: &[(String, i64, String)]) -> String {
+    plays.iter().map(|(song, at, from)| line(song, *at, from)).collect()
 }
 
 /// A line of the log as it lies in the file.
@@ -142,40 +173,113 @@ fn parse(line: &str) -> Option<(String, i64, String)> {
 }
 
 impl PlayLog {
-    /// Reads the log. `old` is where versions before 0.26 kept it, as one list rewritten on
-    /// every play; that's carried over once. Failing that it's started off with `recent`:
-    /// what Recently played remembers, so the log isn't empty on day one.
+    /// Reads the log.
+    ///
+    /// **A log that could not be read is never taken for a log that is not there.** Only
+    /// "there is no such file" means there is none: then one is started (`begin`). Any
+    /// other failure to read it (something else has the file open, the disk gave an error)
+    /// leaves it exactly as it is on the disk: nothing is written to it in this run, the
+    /// app says so (`note`), and what is played meanwhile is kept in the file beside it and
+    /// joined to it the next time it reads. A log that reads but has damaged lines in it
+    /// is read for the lines that read, and added to as usual; it is not written again
+    /// whole (see `whole`).
     pub fn load(old: &Path, recent: &[(String, i64)]) -> PlayLog {
         let path = old.with_extension("log");
-        let mut log = PlayLog { path, lines: 0, unwritten: Vec::new() };
+        let mut log = PlayLog { path, lines: 0, unwritten: Vec::new(), aside: false, whole: true, unread: false };
         if let Ok(mut sources) = SOURCES.write() {
             *sources = None;
         }
-        let plays: Vec<(String, i64)> = match std::fs::read_to_string(&log.path) {
-            // The lines that read, read; and the last record ends where `ending` says.
-            Ok(text) => text.as_bytes()[..ending(text.as_bytes()).0]
-                .split(|byte| *byte == b'\n')
-                .filter_map(read_line)
-                .map(|(song, at, from)| {
-                    note_source(&song, at, &from);
-                    (song, at)
-                })
-                .collect(),
-            Err(_) => {
-                let carried = std::fs::read(old).ok().and_then(|bytes| serde_json::from_slice::<Vec<(String, i64)>>(&bytes).ok());
-                let mut plays = carried.unwrap_or_else(|| recent.to_vec());
-                plays.sort_by_key(|(_, at)| *at);
-                log.rewrite(&plays);
-                let _ = std::fs::remove_file(old);
+        // (Reading it is the one way of asking whether it is there: there is no check
+        // first for the answer to change after.)
+        let mut plays = match std::fs::read(&log.path) {
+            Ok(bytes) => {
+                let (plays, whole) = read(&bytes);
+                log.whole = whole;
                 plays
             }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => match log.begin(old, recent) {
+                Ok(plays) => plays.into_iter().map(|(song, at)| (song, at, String::new())).collect(),
+                Err(_) => {
+                    log.aside = true;
+                    Vec::new()
+                }
+            },
+            Err(_) => {
+                log.aside = true;
+                log.unread = true;
+                Vec::new()
+            }
         };
+        UNREAD.store(log.unread, std::sync::atomic::Ordering::SeqCst);
+        // What was kept beside the log while it could not be read: joined to it now that
+        // it can, each play once; or, if it still can't, counted for this run as it is.
+        if let Ok(bytes) = std::fs::read(log.side()) {
+            let mut have: std::collections::HashSet<(String, i64)> = plays.iter().map(|(song, at, _)| (song.clone(), *at)).collect();
+            let beside: Vec<(String, i64, String)> = read(&bytes).0.into_iter().filter(|(song, at, _)| have.insert((song.clone(), *at))).collect();
+            if !log.aside {
+                match append(&log.path, &text(&beside)) {
+                    Ok(()) => drop(std::fs::remove_file(log.side())),
+                    Err(_) => log.aside = true,
+                }
+            }
+            plays.extend(beside);
+        }
+        for (song, at, from) in &plays {
+            note_source(song, *at, from);
+        }
         log.lines = plays.len();
         if let Ok(mut shared) = SHARED.write() {
-            *shared = plays;
+            *shared = plays.into_iter().map(|(song, at, _)| (song, at)).collect();
         }
         log.trim();
         log
+    }
+
+    /// What to tell the person, once, when the log was there and could not be read.
+    pub fn note(&self) -> Option<&'static str> {
+        self.unread.then_some(
+            "The plays kept on this PC couldn't be read when the app started, so they have been left exactly as they are. “Your stats” counts only what's played from now until the app next starts; those plays are kept, and added to the rest then.",
+        )
+    }
+
+    /// Where plays are kept while the log itself is not to be written to (see `aside`).
+    fn side(&self) -> PathBuf {
+        self.path.with_extension("log.new")
+    }
+
+    /// The file plays are added to in this run.
+    fn target(&self) -> PathBuf {
+        if self.aside { self.side() } else { self.path.clone() }
+    }
+
+    /// Starts a log where there is none. `old` is where versions before 0.26 kept the plays,
+    /// as one list rewritten on every play: that is carried over, once, and goes when the
+    /// log has it. If it is there and can't be read just now, no log is made without it
+    /// (an error); if it reads and isn't such a list, it is left where it is. Failing a
+    /// list, the log starts with `recent`: what Recently played remembers, so that it
+    /// isn't empty on day one. The file is made only if it is still not there: a log is
+    /// never written over by this.
+    fn begin(&self, old: &Path, recent: &[(String, i64)]) -> std::io::Result<Vec<(String, i64)>> {
+        let carried = match std::fs::read(old) {
+            Ok(bytes) => serde_json::from_slice::<Vec<(String, i64)>>(&bytes).ok(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        let from_old = carried.is_some();
+        let mut plays = carried.unwrap_or_else(|| recent.to_vec());
+        plays.sort_by_key(|(_, at)| *at);
+        let lines: String = plays.iter().map(|(song, at)| line(song, *at, "")).collect();
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&self.path)?;
+        if let Err(error) = file.write_all(lines.as_bytes()).and_then(|()| file.sync_data()) {
+            // (It is this call's own file, made a moment ago: nothing else's is removed.)
+            drop(file);
+            let _ = std::fs::remove_file(&self.path);
+            return Err(error);
+        }
+        if from_old {
+            let _ = std::fs::remove_file(old);
+        }
+        Ok(plays)
     }
 
     fn rewrite(&self, plays: &[(String, i64)]) {
@@ -185,7 +289,7 @@ impl PlayLog {
 
     /// Takes the oldest plays out once the log is well past its limit.
     fn trim(&mut self) {
-        if self.lines <= LIMIT + SLACK {
+        if self.lines <= LIMIT + SLACK || !self.whole || self.aside {
             return;
         }
         let Ok(mut shared) = SHARED.write() else { return };
@@ -207,8 +311,7 @@ impl PlayLog {
         if self.unwritten.is_empty() {
             return Ok(());
         }
-        let text: String = self.unwritten.iter().map(|(song, at, from)| line(song, *at, from)).collect();
-        append(&self.path, &text)?;
+        append(&self.target(), &text(&self.unwritten))?;
         self.unwritten.clear();
         Ok(())
     }
@@ -240,7 +343,7 @@ impl PlayLog {
         new.dedup();
         if !new.is_empty() {
             let text: String = new.iter().map(|(song, at)| line(song, *at, from(song, *at))).collect();
-            append(&self.path, &text)?;
+            append(&self.target(), &text)?;
             for (song, at) in &new {
                 note_source(song, *at, from(song, *at));
             }
@@ -257,7 +360,8 @@ impl PlayLog {
             .filter(|(song, at, from)| !from.is_empty() && known.contains(&(song.clone(), *at)) && source_of(song, *at).is_empty())
             .map(|(song, at, from)| ((song.clone(), *at), from.as_str()))
             .collect();
-        if !late.is_empty() {
+        // (Only a file that was read whole, and is being written to, is written again.)
+        if !late.is_empty() && self.whole && !self.aside {
             let all = SHARED.read().map(|shared| shared.clone()).unwrap_or_default();
             let text: String = all.iter().map(|play| line(&play.0, play.1, late.get(play).map(|from| from.to_string()).unwrap_or_else(|| source_of(&play.0, play.1)).as_str())).collect();
             crate::config::write_surely(&self.path, text.as_bytes())?;
@@ -306,6 +410,131 @@ mod tests {
 
     fn play(song: &str, at: i64) -> (String, i64) {
         (song.to_string(), at)
+    }
+
+    /// Keeps a file from being read, as a virus scanner holding it does, until dropped.
+    struct Held(PathBuf, #[allow(dead_code)] Option<std::fs::File>);
+
+    fn hold(path: &Path) -> Held {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            // Open, and sharing it with nobody: any other open of it fails.
+            Held(path.to_path_buf(), Some(std::fs::OpenOptions::new().read(true).share_mode(0).open(path).unwrap()))
+        }
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
+            Held(path.to_path_buf(), None)
+        }
+    }
+
+    impl Drop for Held {
+        fn drop(&mut self) {
+            #[cfg(not(windows))]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o644));
+            }
+        }
+    }
+
+    #[test]
+    fn a_log_that_could_not_be_read_is_never_taken_for_a_log_that_is_not_there() {
+        let _turn = turn();
+        let (old, path) = fresh("unread");
+        let side = path.with_extension("log.new");
+        let years = "[\"a\",100]\n[\"b\",200]\n";
+        std::fs::write(&path, years).unwrap();
+        // What Recently played has: what a log would be started from if there were none.
+        let recent = [play("z", 50)];
+        {
+            let held = hold(&path);
+            if std::fs::read(&path).is_ok() {
+                // (Whoever runs this may read anything: nothing here can be made unreadable.)
+                return;
+            }
+            let mut log = PlayLog::load(&old, &recent);
+            // It says so, and counts nothing it could not read.
+            assert!(log.note().is_some() && unread());
+            assert!(shared().is_empty());
+            // A play made meanwhile, and plays other devices tell of (one of them a play the
+            // log has, for all this run knows), are kept: beside the log, not in it.
+            log.add("c", 300, "playlist:q");
+            assert_eq!(log.keep(&[play("a", 100), play("d", 400)], &[]).unwrap(), 2);
+            assert_eq!(shared(), [play("c", 300), play("a", 100), play("d", 400)]);
+            drop(held);
+        }
+        // The log is exactly as it was.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), years);
+        assert_eq!(std::fs::read_to_string(&side).unwrap(), "[\"c\",300,\"playlist:q\"]\n[\"a\",100]\n[\"d\",400]\n");
+        // The next start reads it, and what was kept beside it is joined to it: each play once.
+        let log = PlayLog::load(&old, &recent);
+        assert!(log.note().is_none() && !unread());
+        assert_eq!(shared(), [play("a", 100), play("b", 200), play("c", 300), play("d", 400)]);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), format!("{years}[\"c\",300,\"playlist:q\"]\n[\"d\",400]\n"));
+        assert!(!side.exists());
+        assert_eq!(sources(), [("c".to_string(), 300, "playlist:q".to_string())]);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_log_with_a_damaged_part_is_read_for_what_reads_and_never_written_again_whole() {
+        let _turn = turn();
+        let (old, path) = fresh("damaged");
+        // Not valid text part-way, and a line that is no play.
+        let damaged = b"[\"a\",100]\n\xff\xfe[\"b\",2\nnot a play\n[\"c\",300]\n".to_vec();
+        std::fs::write(&path, &damaged).unwrap();
+        let mut log = PlayLog::load(&old, &[play("z", 50)]);
+        assert!(log.note().is_none());
+        assert_eq!(shared(), [play("a", 100), play("c", 300)]);
+        // A play is added after it; the rest of the file is as it was.
+        log.add("d", 400, "");
+        let after = [damaged.as_slice(), b"[\"d\",400]\n"].concat();
+        assert_eq!(std::fs::read(&path).unwrap(), after);
+        // A source told later would have the file written again, whole, from the plays that
+        // were read: that is not done to a file with lines that were not.
+        assert_eq!(log.keep(&[play("c", 300)], &[("c".to_string(), 300, "playlist:p".to_string())]).unwrap(), 0);
+        assert_eq!(std::fs::read(&path).unwrap(), after);
+        assert!(sources().is_empty());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_log_is_started_only_where_there_is_none_and_from_a_list_that_could_be_read() {
+        let _turn = turn();
+        let (old, path) = fresh("begin");
+        // Whether there is a log is told by reading it, in one step: there is no moment
+        // between a check and a read for it to change in. And if one has appeared by the
+        // time the new one is made, it is not written over.
+        std::fs::write(&path, "[\"a\",100]\n").unwrap();
+        let log = PlayLog { path: path.clone(), lines: 0, unwritten: Vec::new(), aside: false, whole: true, unread: false };
+        assert!(log.begin(&old, &[play("z", 50)]).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[\"a\",100]\n");
+        std::fs::remove_file(&path).unwrap();
+        // The list from before 0.26 is there and is damaged: the log starts from Recently
+        // played, and the list is left where it is.
+        std::fs::write(&old, "[[\"a\",1").unwrap();
+        PlayLog::load(&old, &[play("z", 50)]);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[\"z\",50]\n");
+        assert_eq!(std::fs::read_to_string(&old).unwrap(), "[[\"a\",1");
+        std::fs::remove_file(&path).unwrap();
+        // It is there and can't be read just now: no log is made without it.
+        std::fs::write(&old, "[[\"a\",100]]").unwrap();
+        {
+            let _held = hold(&old);
+            if std::fs::read(&old).is_err() {
+                let mut log = PlayLog::load(&old, &[play("z", 50)]);
+                log.add("c", 300, "");
+                assert!(!path.exists());
+            }
+        }
+        // And when it can: carried over, with what was played meanwhile.
+        PlayLog::load(&old, &[play("z", 50)]);
+        assert!(!old.exists());
+        assert_eq!(shared().first(), Some(&play("a", 100)));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
@@ -392,7 +621,7 @@ mod tests {
         // Plays that can't be written to the file are not counted as kept: the log is as it
         // was, here and on the disk. (A folder stands where the file should be.)
         let before = shared();
-        let mut blocked = PlayLog { path: std::env::temp_dir(), lines: before.len(), unwritten: Vec::new() };
+        let mut blocked = PlayLog { path: std::env::temp_dir(), lines: before.len(), unwritten: Vec::new(), aside: false, whole: true, unread: false };
         assert!(blocked.keep(&[("never".to_string(), 500)], &[]).is_err());
         assert_eq!(shared(), before);
         // With nothing new there is nothing to write, and nothing to fail.

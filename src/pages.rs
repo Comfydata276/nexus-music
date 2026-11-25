@@ -1151,8 +1151,13 @@ fn stats(client: &Client, period: usize) -> PageData {
         Some((from, _)) if from < started => format!("Plays here are the ones Nexus Music has counted, which start on {since}. “All time” uses your server's own count, which takes in every app."),
         Some(_) => String::new(),
     };
+    // The plays kept on this PC could not be read this time: what is here is not all of it,
+    // and none of it is gone.
+    let unread = "The plays kept on this PC couldn't be read when the app started, so only what's been played since is counted here. Nothing has been deleted: they are read again the next time the app starts.";
+    let note = if crate::plays::unread() { format!("{unread} {note}").trim_end().to_string() } else { note };
     if songs.is_empty() {
         let empty = match period {
+            _ if crate::plays::unread() => unread,
             STATS_TODAY => "Nothing played yet today. Songs show up here once you're half way through them.",
             STATS_WEEK => "Nothing played yet this week.",
             STATS_MONTH => "Nothing played yet this month.",
