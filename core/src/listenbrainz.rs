@@ -26,7 +26,8 @@ pub struct ListenBrainz {
 }
 
 /// One of an artist's most played songs.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct TopSong {
     pub title: String,
     /// The release it's best known from, by title.

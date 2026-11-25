@@ -13,7 +13,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::http::{Failure, Http, Method, Request, STOPPED};
@@ -26,7 +26,8 @@ pub const CLIENT: &str = "nexus-music";
 const UNKNOWN: &str = "Lidarr is behind a sign-in this app doesn't know how to use.";
 
 /// Where the sign-in service is, and the name it knows the sign-in in front of Lidarr by.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Found {
     /// E.g. "https://auth.example.org".
     pub service: String,
@@ -262,6 +263,8 @@ pub fn give_up_token(http: &dyn Http, service: &str, token: &str) {
 // ---- finishing a sign-in --------------------------------------------------------------------------
 
 /// What a finished sign-in leaves behind.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct SignedIn {
     /// The token to keep.
     pub token: String,
@@ -294,6 +297,74 @@ pub fn finish(http: &dyn Http, found: &Found, code: &str, back: &str, secret: &s
     Ok(SignedIn { name: name_of(http, &found.service, &tokens.access_token), token: tokens.refresh_token })
 }
 
+// ---- the browser's part ---------------------------------------------------------------------------
+
+/// How long to wait for someone to finish signing in in the browser.
+pub const WAIT: Duration = Duration::from_secs(5 * 60);
+
+/// Said when nobody did.
+pub const NOBODY_SIGNED_IN: &str = "Nobody signed in within five minutes. Try again when you're ready.";
+
+/// The pages the browser is shown when it comes back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Page {
+    /// "You're signed in": it came back with a code.
+    SignedIn,
+    /// "The sign-in didn't go through": it came back with an error.
+    NotThrough,
+    /// "Nothing here": something else came to the door.
+    NothingHere,
+}
+
+/// A page to show the browser, as HTML.
+pub fn page(which: Page) -> String {
+    let (heading, body) = match which {
+        Page::SignedIn => ("You're signed in", "You can close this tab and go back to Nexus Music."),
+        Page::NotThrough => ("The sign-in didn't go through", "Go back to Nexus Music to try again."),
+        Page::NothingHere => ("Nothing here", "This page only finishes a sign-in to Nexus Music."),
+    };
+    format!(
+        "<!doctype html><meta charset=\"utf-8\"><title>Nexus Music</title>\
+         <body style=\"margin:0;height:100vh;display:grid;place-items:center;background:#0d1117;color:#e6edf3;font:16px system-ui,sans-serif\">\
+         <div style=\"text-align:center;max-width:28em;padding:24px\"><h1 style=\"font-size:22px\">{heading}</h1><p style=\"color:#9da7b3\">{body}</p></div>"
+    )
+}
+
+/// Said when the service turned the sign-in down, with its reason.
+pub fn turned_down(why: &str) -> String {
+    format!("The sign-in service turned the sign-in down: {why}")
+}
+
+/// Said when there was nowhere for the browser to come back to.
+pub fn not_ready(why: &dyn std::fmt::Display) -> String {
+    format!("Couldn't get ready for the browser to come back. {why}")
+}
+
+/// Said when listening for the browser failed.
+pub fn not_heard(why: &dyn std::fmt::Display) -> String {
+    format!("Couldn't hear back from the browser. {why}")
+}
+
+/// Said when the device had no random numbers to give; `device` is what it's called ("PC").
+pub fn no_random_numbers(device: &str) -> String {
+    format!("This {device} couldn't supply random numbers for the sign-in.")
+}
+
+/// "Lidarr is behind the sign-in at auth.example.org."
+pub fn behind_sign_in(host: &str) -> String {
+    format!("Lidarr is behind the sign-in at {host}.")
+}
+
+/// Said while the browser is open at the sign-in.
+pub fn finish_in_browser(host: &str) -> String {
+    format!("Finish signing in at {host} in your browser.")
+}
+
+/// Said once signed out: "Signed out." and where the sign-in is (`behind_sign_in`).
+pub fn signed_out(behind: &str) -> String {
+    format!("Signed out. {behind}")
+}
+
 // ---- staying signed in ----------------------------------------------------------------------------
 
 struct Held {
@@ -314,7 +385,12 @@ pub struct Session {
 }
 
 impl Session {
-    /// `http` is what the service is asked over.
+    /// `http` is what the service is asked over. It must be one that nothing stops: no screen
+    /// left, no search typed afresh, no operation given up. Renewing the pass replaces the
+    /// token kept for this sign-in, at the service, the moment the service answers; a renewal
+    /// cut off after that, before the new token is kept, leaves only the old one, which the
+    /// service no longer honours, and the person is signed out. (A request to Lidarr that is
+    /// stopped meanwhile is the Lidarr's `Http`'s affair, not this one's.)
     pub fn new(found: Found, token: String, keep: impl Fn(&str) + Send + Sync + 'static, http: Arc<dyn Http>) -> Session {
         Session {
             found,

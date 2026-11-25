@@ -1,0 +1,17 @@
+[
+  [
+    "GET http://lidarr.test/api/v1/album/lookup?term=Lantern%20Hymn "
+  ],
+  [
+    "GET http://lidarr.test/api/v1/artist/lookup?term=Lantern%20Hymn ",
+    "GET https://musicbrainz.org/ws/2/recording?query=arid%3Aqv2%20AND%20recording%3A%22Lantern%20Hymn%22%20AND%20primarytype%3Aalbum%20AND%20status%3Aofficial%20AND%20NOT%20secondarytype%3A%2A&limit=50&fmt=json ",
+    "GET https://musicbrainz.org/ws/2/recording?query=Lantern%20Hymn&dismax=true&limit=100&fmt=json ",
+    "POST https://api.listenbrainz.org/1/popularity/recording { \"recording_mbids\": [ \"rec-2\", \"rec-3\", \"rec-1\" ] }"
+  ],
+  [
+    "GET http://lidarr.test/api/v1/artist/lookup?term=lidarr%3Aob2 "
+  ],
+  [
+    "GET http://lidarr.test/api/v1/artist/lookup?term=lidarr%3Aqv2 "
+  ]
+]

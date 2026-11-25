@@ -1,0 +1,14 @@
+[
+  [
+    "GET http://lidarr.test/api/v1/album/lookup?term=Vale "
+  ],
+  [
+    "GET http://lidarr.test/api/v1/artist/lookup?term=Vale ",
+    "POST https://api.listenbrainz.org/1/popularity/artist { \"artist_mbids\": [ \"va-n\", \"va-a\", \"va-b\" ] }",
+    "GET https://musicbrainz.org/ws/2/recording?query=Vale&dismax=true&limit=100&fmt=json ",
+    "POST https://api.listenbrainz.org/1/popularity/recording { \"recording_mbids\": [ \"rec-v\" ] }",
+    "GET https://musicbrainz.org/ws/2/release-group?artist=va-a&type=album%7Cep%7Csingle&limit=100&offset=0&inc=artist-credits&fmt=json ",
+    "GET https://api.listenbrainz.org/1/popularity/top-recordings-for-artist/va-a ",
+    "POST https://api.listenbrainz.org/1/popularity/release-group { \"release_group_mbids\": [ \"rg-va26\", \"rg-va25\", \"rg-va24\", \"rg-va23\", \"rg-va22\", \"rg-va21\", \"rg-va20\", \"rg-va19\", \"rg-va18\", \"rg-va17\", \"rg-va16\", \"rg-va15\", \"rg-va14\", \"rg-va13\", \"rg-va12\", \"rg-va11\", \"rg-va10\", \"rg-va9\", \"rg-va8\", \"rg-va7\", \"rg-va6\", \"rg-va5\", \"rg-va4\", \"rg-va3\", \"rg-va2\", \"rg-va1\" ] }"
+  ]
+]

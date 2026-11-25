@@ -1,0 +1,6 @@
+[
+  [
+    "/rest/getArtistInfo2?u=tester&v=1.16.1&c=NexusMusic&f=json&id=lib-a&count=20&includeNotPresent=true",
+    "/rest/getArtistInfo2?u=tester&v=1.16.1&c=NexusMusic&f=json&id=lib-b&count=20&includeNotPresent=true"
+  ]
+]

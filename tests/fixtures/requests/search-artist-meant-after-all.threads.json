@@ -1,0 +1,14 @@
+[
+  [
+    "GET http://lidarr.test/api/v1/album/lookup?term=homeland "
+  ],
+  [
+    "GET http://lidarr.test/api/v1/artist/lookup?term=homeland ",
+    "POST https://api.listenbrainz.org/1/popularity/artist { \"artist_mbids\": [ \"hm4\" ] }",
+    "GET https://musicbrainz.org/ws/2/recording?query=homeland&dismax=true&limit=100&fmt=json ",
+    "POST https://api.listenbrainz.org/1/popularity/recording { \"recording_mbids\": [ \"rec-hl\" ] }",
+    "GET https://musicbrainz.org/ws/2/release-group?artist=hm4&type=album&limit=100&offset=0&inc=artist-credits&fmt=json ",
+    "GET https://api.listenbrainz.org/1/popularity/top-recordings-for-artist/hm4 ",
+    "POST https://api.listenbrainz.org/1/popularity/release-group { \"release_group_mbids\": [ \"rg-hl1\" ] }"
+  ]
+]

@@ -1,0 +1,142 @@
+{
+  "asked": [
+    "GET http://lidarr.test/api/v1/album/lookup?term=Fail%20Band ",
+    "GET http://lidarr.test/api/v1/artist/lookup?term=Fail%20Band ",
+    "GET https://musicbrainz.org/ws/2/release-group?artist=fb&type=album%7Cep%7Csingle&limit=100&offset=0&inc=artist-credits&fmt=json ",
+    "POST https://api.listenbrainz.org/1/popularity/artist { \"artist_mbids\": [ \"fb\" ] }"
+  ],
+  "stages": [
+    {
+      "about": "",
+      "action": "",
+      "album_numbers": false,
+      "artist_id": "",
+      "can_play": false,
+      "context": "",
+      "cover": "",
+      "cover_round": false,
+      "disc_sections": false,
+      "empty": "",
+      "filter": 0,
+      "filters": [],
+      "grid": [],
+      "has_menu": false,
+      "label": "",
+      "lead": [],
+      "liked_songs": false,
+      "meta": "",
+      "more": null,
+      "notice": "",
+      "notice_action": "",
+      "notice_other": "",
+      "offers": [],
+      "offers_first": false,
+      "offers_heading": "",
+      "offers_note": "Looking for their songs and albums…",
+      "offers_route": "",
+      "offers_title": "Not in your library",
+      "play": "Songs",
+      "playlist": null,
+      "request_ids": [],
+      "shelves": [],
+      "show_album": false,
+      "show_cover": false,
+      "show_number": false,
+      "song_notes": [],
+      "songs": [],
+      "sort": 0,
+      "sorts": [],
+      "star": null,
+      "starred": false,
+      "stats": [],
+      "subtitle": "",
+      "subtitle_route": "",
+      "tail": [
+        {
+          "cards": [
+            {
+              "cover": "https://pictures.test/fb.jpg",
+              "id": "fb",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Fail Band"
+            }
+          ],
+          "route": "",
+          "title": "Artists",
+          "wrap": false
+        }
+      ],
+      "tiles": [],
+      "title": "Results for “Fail Band”",
+      "tracks_route": "",
+      "tracks_title": ""
+    },
+    {
+      "about": "",
+      "action": "",
+      "album_numbers": false,
+      "artist_id": "",
+      "can_play": false,
+      "context": "",
+      "cover": "",
+      "cover_round": false,
+      "disc_sections": false,
+      "empty": "",
+      "filter": 0,
+      "filters": [],
+      "grid": [],
+      "has_menu": false,
+      "label": "",
+      "lead": [],
+      "liked_songs": false,
+      "meta": "",
+      "more": null,
+      "notice": "",
+      "notice_action": "",
+      "notice_other": "",
+      "offers": [],
+      "offers_first": false,
+      "offers_heading": "",
+      "offers_note": "Ask Lidarr for any of these albums, or open the artist for everything they've made.",
+      "offers_route": "",
+      "offers_title": "Not in your library",
+      "play": "Songs",
+      "playlist": null,
+      "request_ids": [],
+      "shelves": [],
+      "show_album": false,
+      "show_cover": false,
+      "show_number": false,
+      "song_notes": [],
+      "songs": [],
+      "sort": 0,
+      "sorts": [],
+      "star": null,
+      "starred": false,
+      "stats": [],
+      "subtitle": "",
+      "subtitle_route": "",
+      "tail": [
+        {
+          "cards": [
+            {
+              "cover": "https://pictures.test/fb.jpg",
+              "id": "fb",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Fail Band"
+            }
+          ],
+          "route": "",
+          "title": "Artists",
+          "wrap": false
+        }
+      ],
+      "tiles": [],
+      "title": "Results for “Fail Band”",
+      "tracks_route": "",
+      "tracks_title": ""
+    }
+  ]
+}

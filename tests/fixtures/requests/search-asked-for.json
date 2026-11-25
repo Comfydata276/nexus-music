@@ -1,0 +1,400 @@
+{
+  "asked": [
+    "GET http://lidarr.test/api/v1/album/lookup?term=saltwater ",
+    "GET http://lidarr.test/api/v1/artist/lookup?term=lidarr%3Aml5 ",
+    "GET http://lidarr.test/api/v1/artist/lookup?term=saltwater ",
+    "GET https://musicbrainz.org/ws/2/recording?query=saltwater&dismax=true&limit=100&fmt=json ",
+    "POST https://api.listenbrainz.org/1/popularity/recording { \"recording_mbids\": [ \"rec-s1\", \"rec-s2\", \"rec-s3\", \"rec-s4\" ] }"
+  ],
+  "stages": [
+    {
+      "about": "",
+      "action": "",
+      "album_numbers": false,
+      "artist_id": "",
+      "can_play": false,
+      "context": "",
+      "cover": "",
+      "cover_round": false,
+      "disc_sections": false,
+      "empty": "",
+      "filter": 0,
+      "filters": [],
+      "grid": [],
+      "has_menu": false,
+      "label": "",
+      "lead": [],
+      "liked_songs": false,
+      "meta": "",
+      "more": null,
+      "notice": "",
+      "notice_action": "",
+      "notice_other": "",
+      "offers": [],
+      "offers_first": false,
+      "offers_heading": "",
+      "offers_note": "Looking for songs beyond your library…",
+      "offers_route": "",
+      "offers_title": "Not in your library",
+      "play": "Songs",
+      "playlist": null,
+      "request_ids": [],
+      "shelves": [],
+      "show_album": false,
+      "show_cover": false,
+      "show_number": false,
+      "song_notes": [],
+      "songs": [],
+      "sort": 0,
+      "sorts": [],
+      "star": null,
+      "starred": false,
+      "stats": [],
+      "subtitle": "",
+      "subtitle_route": "",
+      "tail": [
+        {
+          "cards": [
+            {
+              "cover": "",
+              "id": "rg-sh5",
+              "kind": "Request",
+              "subtitle": "Marrow Lake • Requested",
+              "title": "Saltwater Hours"
+            },
+            {
+              "cover": "https://covers.test/rg-in.jpg",
+              "id": "rg-in",
+              "kind": "Request",
+              "subtitle": "Marrow Lake • 2018",
+              "title": "Saltwater Live"
+            }
+          ],
+          "route": "",
+          "title": "Albums",
+          "wrap": false
+        }
+      ],
+      "tiles": [],
+      "title": "Results for “saltwater”",
+      "tracks_route": "",
+      "tracks_title": ""
+    },
+    {
+      "about": "",
+      "action": "",
+      "album_numbers": false,
+      "artist_id": "",
+      "can_play": false,
+      "context": "",
+      "cover": "",
+      "cover_round": false,
+      "disc_sections": false,
+      "empty": "",
+      "filter": 0,
+      "filters": [],
+      "grid": [],
+      "has_menu": false,
+      "label": "",
+      "lead": [],
+      "liked_songs": false,
+      "meta": "",
+      "more": null,
+      "notice": "",
+      "notice_action": "",
+      "notice_other": "",
+      "offers": [
+        {
+          "about": "Saltwater Hours • 2016",
+          "album": "rg-sh5",
+          "album_title": "Saltwater Hours",
+          "artist": "Marrow Lake",
+          "artist_id": "ml5",
+          "artist_name": "Marrow Lake",
+          "cover": "https://coverartarchive.org/release-group/rg-sh5/front-250",
+          "kind": "",
+          "requested": true,
+          "seconds": 200,
+          "song": "",
+          "title": "Saltwater"
+        },
+        {
+          "about": "Asked One • 2017",
+          "album": "rg-asked",
+          "album_title": "Asked One",
+          "artist": "Marrow Lake",
+          "artist_id": "ml5",
+          "artist_name": "Marrow Lake",
+          "cover": "https://coverartarchive.org/release-group/rg-asked/front-250",
+          "kind": "",
+          "requested": true,
+          "seconds": 200,
+          "song": "",
+          "title": "Saltwater Song"
+        },
+        {
+          "about": "Marked One • 2019",
+          "album": "rg-marked",
+          "album_title": "Marked One",
+          "artist": "Marrow Lake",
+          "artist_id": "ml5",
+          "artist_name": "Marrow Lake",
+          "cover": "https://coverartarchive.org/release-group/rg-marked/front-250",
+          "kind": "",
+          "requested": true,
+          "seconds": 200,
+          "song": "",
+          "title": "Saltwater Blues"
+        },
+        {
+          "about": "Free One • 2020",
+          "album": "rg-free",
+          "album_title": "Free One",
+          "artist": "Marrow Lake",
+          "artist_id": "ml5",
+          "artist_name": "Marrow Lake",
+          "cover": "https://coverartarchive.org/release-group/rg-free/front-250",
+          "kind": "",
+          "requested": false,
+          "seconds": 200,
+          "song": "",
+          "title": "Saltwater Heart"
+        }
+      ],
+      "offers_first": false,
+      "offers_heading": "",
+      "offers_note": "Ask Lidarr for any of these. A song comes with the album it's on, or as its single if it isn't on one.",
+      "offers_route": "",
+      "offers_title": "Not in your library",
+      "play": "Songs",
+      "playlist": null,
+      "request_ids": [],
+      "shelves": [],
+      "show_album": false,
+      "show_cover": false,
+      "show_number": false,
+      "song_notes": [],
+      "songs": [],
+      "sort": 0,
+      "sorts": [],
+      "star": null,
+      "starred": false,
+      "stats": [],
+      "subtitle": "",
+      "subtitle_route": "",
+      "tail": [
+        {
+          "cards": [
+            {
+              "cover": "",
+              "id": "ml5",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Marrow Lake"
+            }
+          ],
+          "route": "",
+          "title": "Artists",
+          "wrap": false
+        },
+        {
+          "cards": [
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-asked/front-250",
+              "id": "rg-asked",
+              "kind": "Request",
+              "subtitle": "Marrow Lake • 2017",
+              "title": "Asked One"
+            },
+            {
+              "cover": "",
+              "id": "rg-marked",
+              "kind": "Request",
+              "subtitle": "Marrow Lake • Requested",
+              "title": "Marked One"
+            },
+            {
+              "cover": "",
+              "id": "rg-sh5",
+              "kind": "Request",
+              "subtitle": "Marrow Lake • Requested",
+              "title": "Saltwater Hours"
+            },
+            {
+              "cover": "https://covers.test/rg-in.jpg",
+              "id": "rg-in",
+              "kind": "Request",
+              "subtitle": "Marrow Lake • 2018",
+              "title": "Saltwater Live"
+            }
+          ],
+          "route": "",
+          "title": "Albums",
+          "wrap": false
+        }
+      ],
+      "tiles": [],
+      "title": "Results for “saltwater”",
+      "tracks_route": "",
+      "tracks_title": ""
+    },
+    {
+      "about": "",
+      "action": "",
+      "album_numbers": false,
+      "artist_id": "",
+      "can_play": false,
+      "context": "",
+      "cover": "",
+      "cover_round": false,
+      "disc_sections": false,
+      "empty": "",
+      "filter": 0,
+      "filters": [],
+      "grid": [],
+      "has_menu": false,
+      "label": "",
+      "lead": [],
+      "liked_songs": false,
+      "meta": "",
+      "more": null,
+      "notice": "",
+      "notice_action": "",
+      "notice_other": "",
+      "offers": [
+        {
+          "about": "Saltwater Hours • 2016",
+          "album": "rg-sh5",
+          "album_title": "Saltwater Hours",
+          "artist": "Marrow Lake",
+          "artist_id": "ml5",
+          "artist_name": "Marrow Lake",
+          "cover": "https://coverartarchive.org/release-group/rg-sh5/front-250",
+          "kind": "",
+          "requested": true,
+          "seconds": 200,
+          "song": "",
+          "title": "Saltwater"
+        },
+        {
+          "about": "Asked One • 2017",
+          "album": "rg-asked",
+          "album_title": "Asked One",
+          "artist": "Marrow Lake",
+          "artist_id": "ml5",
+          "artist_name": "Marrow Lake",
+          "cover": "https://coverartarchive.org/release-group/rg-asked/front-250",
+          "kind": "",
+          "requested": true,
+          "seconds": 200,
+          "song": "",
+          "title": "Saltwater Song"
+        },
+        {
+          "about": "Marked One • 2019",
+          "album": "rg-marked",
+          "album_title": "Marked One",
+          "artist": "Marrow Lake",
+          "artist_id": "ml5",
+          "artist_name": "Marrow Lake",
+          "cover": "https://coverartarchive.org/release-group/rg-marked/front-250",
+          "kind": "",
+          "requested": true,
+          "seconds": 200,
+          "song": "",
+          "title": "Saltwater Blues"
+        },
+        {
+          "about": "Free One • 2020",
+          "album": "rg-free",
+          "album_title": "Free One",
+          "artist": "Marrow Lake",
+          "artist_id": "ml5",
+          "artist_name": "Marrow Lake",
+          "cover": "https://coverartarchive.org/release-group/rg-free/front-250",
+          "kind": "",
+          "requested": false,
+          "seconds": 200,
+          "song": "",
+          "title": "Saltwater Heart"
+        }
+      ],
+      "offers_first": false,
+      "offers_heading": "",
+      "offers_note": "Ask Lidarr for any of these. A song comes with the album it's on, or as its single if it isn't on one.",
+      "offers_route": "",
+      "offers_title": "Not in your library",
+      "play": "Songs",
+      "playlist": null,
+      "request_ids": [],
+      "shelves": [],
+      "show_album": false,
+      "show_cover": false,
+      "show_number": false,
+      "song_notes": [],
+      "songs": [],
+      "sort": 0,
+      "sorts": [],
+      "star": null,
+      "starred": false,
+      "stats": [],
+      "subtitle": "",
+      "subtitle_route": "",
+      "tail": [
+        {
+          "cards": [
+            {
+              "cover": "",
+              "id": "ml5",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Marrow Lake"
+            }
+          ],
+          "route": "",
+          "title": "Artists",
+          "wrap": false
+        },
+        {
+          "cards": [
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-asked/front-250",
+              "id": "rg-asked",
+              "kind": "Request",
+              "subtitle": "Marrow Lake • 2017",
+              "title": "Asked One"
+            },
+            {
+              "cover": "",
+              "id": "rg-marked",
+              "kind": "Request",
+              "subtitle": "Marrow Lake • Requested",
+              "title": "Marked One"
+            },
+            {
+              "cover": "",
+              "id": "rg-sh5",
+              "kind": "Request",
+              "subtitle": "Marrow Lake • Requested",
+              "title": "Saltwater Hours"
+            },
+            {
+              "cover": "https://covers.test/rg-in.jpg",
+              "id": "rg-in",
+              "kind": "Request",
+              "subtitle": "Marrow Lake • 2018",
+              "title": "Saltwater Live"
+            }
+          ],
+          "route": "",
+          "title": "Albums",
+          "wrap": false
+        }
+      ],
+      "tiles": [],
+      "title": "Results for “saltwater”",
+      "tracks_route": "",
+      "tracks_title": ""
+    }
+  ]
+}

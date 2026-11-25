@@ -1,0 +1,13 @@
+[
+  [
+    "GET http://lidarr.test/api/v1/album/lookup?term=saltwater "
+  ],
+  [
+    "GET http://lidarr.test/api/v1/artist/lookup?term=lidarr%3Aml5 "
+  ],
+  [
+    "GET http://lidarr.test/api/v1/artist/lookup?term=saltwater ",
+    "GET https://musicbrainz.org/ws/2/recording?query=saltwater&dismax=true&limit=100&fmt=json ",
+    "POST https://api.listenbrainz.org/1/popularity/recording { \"recording_mbids\": [ \"rec-s1\", \"rec-s2\", \"rec-s3\", \"rec-s4\" ] }"
+  ]
+]

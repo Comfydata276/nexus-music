@@ -1,0 +1,156 @@
+{
+  "asked": [
+    "GET http://lidarr.test/api/v1/artist ",
+    "GET https://musicbrainz.org/ws/2/release-group?artist=mc5&type=album%7Cep%7Csingle&limit=100&offset=0&inc=artist-credits&fmt=json ",
+    "GET https://api.listenbrainz.org/1/popularity/top-recordings-for-artist/mc5 "
+  ],
+  "stages": [
+    {
+      "about": "",
+      "action": "Add artist",
+      "album_numbers": false,
+      "artist_id": "mc5",
+      "can_play": false,
+      "context": "",
+      "cover": "",
+      "cover_round": true,
+      "disc_sections": false,
+      "empty": "",
+      "filter": 0,
+      "filters": [],
+      "grid": [],
+      "has_menu": false,
+      "label": "Artist",
+      "lead": [],
+      "liked_songs": false,
+      "meta": "1 album",
+      "more": null,
+      "notice": "",
+      "notice_action": "",
+      "notice_other": "",
+      "offers": [],
+      "offers_first": false,
+      "offers_heading": "",
+      "offers_note": "",
+      "offers_route": "",
+      "offers_title": "",
+      "play": "Songs",
+      "playlist": null,
+      "request_ids": [],
+      "shelves": [],
+      "show_album": false,
+      "show_cover": false,
+      "show_number": false,
+      "song_notes": [],
+      "songs": [],
+      "sort": 0,
+      "sorts": [],
+      "star": null,
+      "starred": false,
+      "stats": [],
+      "subtitle": "",
+      "subtitle_route": "",
+      "tail": [
+        {
+          "cards": [
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-mc5/front-250",
+              "id": "rg-mc5",
+              "kind": "Request",
+              "subtitle": "2015",
+              "title": "Pop Album"
+            }
+          ],
+          "route": "",
+          "title": "Albums",
+          "wrap": true
+        }
+      ],
+      "tiles": [],
+      "title": "Mid Pop",
+      "tracks_route": "",
+      "tracks_title": ""
+    },
+    {
+      "about": "",
+      "action": "Add artist",
+      "album_numbers": false,
+      "artist_id": "mc5",
+      "can_play": false,
+      "context": "",
+      "cover": "",
+      "cover_round": true,
+      "disc_sections": false,
+      "empty": "",
+      "filter": 0,
+      "filters": [],
+      "grid": [],
+      "has_menu": false,
+      "label": "Artist",
+      "lead": [],
+      "liked_songs": false,
+      "meta": "1 album",
+      "more": null,
+      "notice": "",
+      "notice_action": "",
+      "notice_other": "",
+      "offers": [
+        {
+          "about": "Pop Album • 2015",
+          "album": "rg-mc5",
+          "album_title": "Pop Album",
+          "artist": "Mid Pop",
+          "artist_id": "mc5",
+          "artist_name": "Mid Pop",
+          "cover": "https://coverartarchive.org/release-group/rg-mc5/front-250",
+          "kind": "",
+          "requested": false,
+          "seconds": 200,
+          "song": "",
+          "title": "Second One"
+        }
+      ],
+      "offers_first": false,
+      "offers_heading": "Popular, and not in your library",
+      "offers_note": "",
+      "offers_route": "",
+      "offers_title": "",
+      "play": "Songs",
+      "playlist": null,
+      "request_ids": [],
+      "shelves": [],
+      "show_album": false,
+      "show_cover": false,
+      "show_number": false,
+      "song_notes": [],
+      "songs": [],
+      "sort": 0,
+      "sorts": [],
+      "star": null,
+      "starred": false,
+      "stats": [],
+      "subtitle": "",
+      "subtitle_route": "",
+      "tail": [
+        {
+          "cards": [
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-mc5/front-250",
+              "id": "rg-mc5",
+              "kind": "Request",
+              "subtitle": "2015",
+              "title": "Pop Album"
+            }
+          ],
+          "route": "",
+          "title": "Albums",
+          "wrap": true
+        }
+      ],
+      "tiles": [],
+      "title": "Mid Pop",
+      "tracks_route": "",
+      "tracks_title": ""
+    }
+  ]
+}

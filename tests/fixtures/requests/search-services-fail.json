@@ -1,0 +1,141 @@
+{
+  "asked": [
+    "GET http://lidarr.test/api/v1/album/lookup?term=saltwater ",
+    "GET http://lidarr.test/api/v1/artist/lookup?term=saltwater ",
+    "GET https://musicbrainz.org/ws/2/recording?query=saltwater&dismax=true&limit=100&fmt=json "
+  ],
+  "stages": [
+    {
+      "about": "",
+      "action": "",
+      "album_numbers": false,
+      "artist_id": "",
+      "can_play": false,
+      "context": "",
+      "cover": "",
+      "cover_round": false,
+      "disc_sections": false,
+      "empty": "",
+      "filter": 0,
+      "filters": [],
+      "grid": [],
+      "has_menu": false,
+      "label": "",
+      "lead": [],
+      "liked_songs": false,
+      "meta": "",
+      "more": null,
+      "notice": "",
+      "notice_action": "",
+      "notice_other": "",
+      "offers": [],
+      "offers_first": false,
+      "offers_heading": "",
+      "offers_note": "Looking for songs beyond your library…",
+      "offers_route": "",
+      "offers_title": "Not in your library",
+      "play": "Songs",
+      "playlist": null,
+      "request_ids": [],
+      "shelves": [],
+      "show_album": false,
+      "show_cover": false,
+      "show_number": false,
+      "song_notes": [],
+      "songs": [],
+      "sort": 0,
+      "sorts": [],
+      "star": null,
+      "starred": false,
+      "stats": [],
+      "subtitle": "",
+      "subtitle_route": "",
+      "tail": [
+        {
+          "cards": [
+            {
+              "cover": "https://covers.test/rg-sh.jpg",
+              "id": "rg-sh",
+              "kind": "Request",
+              "subtitle": "Marrow Lake • 2016",
+              "title": "Saltwater Hours"
+            }
+          ],
+          "route": "",
+          "title": "Albums",
+          "wrap": false
+        }
+      ],
+      "tiles": [],
+      "title": "Results for “saltwater”",
+      "tracks_route": "",
+      "tracks_title": ""
+    },
+    {
+      "about": "",
+      "action": "",
+      "album_numbers": false,
+      "artist_id": "",
+      "can_play": false,
+      "context": "",
+      "cover": "",
+      "cover_round": false,
+      "disc_sections": false,
+      "empty": "",
+      "filter": 0,
+      "filters": [],
+      "grid": [],
+      "has_menu": false,
+      "label": "",
+      "lead": [],
+      "liked_songs": false,
+      "meta": "",
+      "more": null,
+      "notice": "",
+      "notice_action": "",
+      "notice_other": "",
+      "offers": [],
+      "offers_first": false,
+      "offers_heading": "",
+      "offers_note": "Ask Lidarr for any of these. A song comes with the album it's on, or as its single if it isn't on one.",
+      "offers_route": "",
+      "offers_title": "Not in your library",
+      "play": "Songs",
+      "playlist": null,
+      "request_ids": [],
+      "shelves": [],
+      "show_album": false,
+      "show_cover": false,
+      "show_number": false,
+      "song_notes": [],
+      "songs": [],
+      "sort": 0,
+      "sorts": [],
+      "star": null,
+      "starred": false,
+      "stats": [],
+      "subtitle": "",
+      "subtitle_route": "",
+      "tail": [
+        {
+          "cards": [
+            {
+              "cover": "https://covers.test/rg-sh.jpg",
+              "id": "rg-sh",
+              "kind": "Request",
+              "subtitle": "Marrow Lake • 2016",
+              "title": "Saltwater Hours"
+            }
+          ],
+          "route": "",
+          "title": "Albums",
+          "wrap": false
+        }
+      ],
+      "tiles": [],
+      "title": "Results for “saltwater”",
+      "tracks_route": "",
+      "tracks_title": ""
+    }
+  ]
+}

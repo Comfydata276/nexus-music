@@ -233,6 +233,22 @@ static CURRENT: RwLock<Option<Arc<Index>>> = RwLock::new(None);
 /// Songs that are liked: the library's own word on it goes out of date as hearts are clicked.
 static LIKED: RwLock<Option<HashSet<String>>> = RwLock::new(None);
 
+/// The library as the requests pages ask it (see `nexus_core::requests::Library`), over the
+/// index as it is: nothing is copied or rebuilt to answer.
+impl nexus_core::requests::Library for Index {
+    fn albums(&self) -> Box<dyn Iterator<Item = nexus_core::requests::AlbumRef<'_>> + '_> {
+        Box::new(self.library.albums.iter().map(|album| nexus_core::requests::AlbumRef { id: &album.id, title: &album.title, artist: &album.subtitle, cover: &album.cover }))
+    }
+
+    fn songs(&self) -> Box<dyn Iterator<Item = nexus_core::requests::SongRef<'_>> + '_> {
+        Box::new(self.library.songs.iter().map(|song| nexus_core::requests::SongRef { title: &song.title, artist: song.artist_label() }))
+    }
+
+    fn artists(&self) -> Box<dyn Iterator<Item = &str> + '_> {
+        Box::new(self.library.artists.iter().map(|artist| artist.title.as_str()))
+    }
+}
+
 pub fn current() -> Option<Arc<Index>> {
     CURRENT.read().ok()?.clone()
 }
@@ -516,4 +532,45 @@ pub fn playlists_matching(query: &str) -> Vec<CardData> {
         })
         .cloned()
         .collect()
+}
+
+/// The window's index answers the library's questions as the plain lists do.
+#[cfg(test)]
+mod library {
+    use super::*;
+    use crate::pages::Kind;
+
+    #[test]
+    fn the_windows_library_answers_as_the_plain_lists_do() {
+        // The window's index and the plain lists the phone hands across, made from the same
+        // library, give the same answer to every question.
+        use nexus_core::requests::{Library as _, LibraryAlbum, Snapshot};
+        let albums = [("a1", "…Something to Be", "Rob Thomas"), ("a2", "Parachutes", "Coldplay"), ("a3", "Parachutes ", "coldplay"), ("a4", "X&Y", "Coldplay"), ("a5", "Beyoncé", "Beyoncé"), ("a6", "Harbour Lights: A Compilation", "Various Artists")];
+        let songs = [("s1", "Yellow (Live)", "Coldplay", ""), ("s2", "Lonely No More", "Rob Thomas", ""), ("s3", "Fix You", "Coldplay", "Coldplay & Friends"), ("s4", "Halo", "Beyonce", ""), ("s5", "Harbour Song", "Various Artists", "The Quiet Harbour")];
+        let artists = ["Coldplay", "Rob Thomas", "Beyoncé", "Various Artists"];
+        let index = Index::new(Library {
+            albums: albums.iter().map(|(id, title, artist)| CardData { kind: Kind::Album, id: (*id).into(), title: (*title).into(), subtitle: (*artist).into(), cover: format!("al-{id}") }).collect(),
+            songs: songs.iter().map(|(id, title, artist, shown)| Song { id: (*id).into(), title: (*title).into(), artist: (*artist).into(), display_artist: (*shown).into(), ..Default::default() }).collect(),
+            artists: artists.iter().map(|name| CardData { kind: Kind::Artist, id: format!("ar-{name}"), title: (*name).into(), subtitle: String::new(), cover: String::new() }).collect(),
+            ..Default::default()
+        });
+        let snapshot = Snapshot {
+            albums: albums.iter().map(|(id, title, artist)| LibraryAlbum { id: (*id).into(), title: (*title).into(), artist: (*artist).into(), cover: format!("al-{id}") }).collect(),
+            songs: songs.iter().map(|(_, title, artist, shown)| ((*title).into(), if shown.is_empty() { (*artist).into() } else { (*shown).into() })).collect(),
+            artists: artists.iter().map(|name| (*name).into()).collect(),
+        };
+        assert_eq!(index.album_names(), snapshot.album_names());
+        assert_eq!(index.song_names(), snapshot.song_names());
+        assert_eq!(index.artist_names(), snapshot.artist_names());
+        for name in ["Coldplay", "coldplay", "Rob Thomas", "Beyonce", "Beyoncé", "Nobody", "", "Coldplay & Friends", "Various Artists", "The Quiet Harbour"] {
+            assert_eq!(index.songs_by(name), snapshot.songs_by(name), "songs by {name}");
+            assert_eq!(index.album_titles_by(name), snapshot.album_titles_by(name), "albums by {name}");
+            assert_eq!(index.albums_by(name), snapshot.albums_by(name), "albums by {name}");
+            for title in ["Parachutes", "...Something To Be", "x & y", "Beyonce", "Nothing", "Harbour Lights: A Compilation"] {
+                assert_eq!(index.same_album(title, name), snapshot.same_album(title, name), "{title} by {name}");
+            }
+        }
+        assert!(!index.songs_by("Coldplay").is_empty() && index.same_album("Parachutes", "Coldplay").is_some());
+        assert!(index.same_album("Harbour Lights: A Compilation", "Various Artists").is_some() && !index.songs_by("The Quiet Harbour").is_empty());
+    }
 }

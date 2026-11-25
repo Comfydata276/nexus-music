@@ -1,0 +1,76 @@
+{
+  "asked": [
+    "GET http://lidarr.test/api/v1/artist ",
+    "GET https://musicbrainz.org/ws/2/release-group?artist=mc3&type=album%7Cep%7Csingle&limit=100&offset=0&inc=artist-credits&fmt=json ",
+    "GET https://api.listenbrainz.org/1/popularity/top-recordings-for-artist/mc3 ",
+    "POST https://api.listenbrainz.org/1/popularity/release-group { \"release_group_mbids\": [ \"rg-grown\" ] }"
+  ],
+  "stages": [
+    {
+      "about": "",
+      "action": "",
+      "album_numbers": false,
+      "artist_id": "mc3",
+      "can_play": false,
+      "context": "",
+      "cover": "",
+      "cover_round": true,
+      "disc_sections": false,
+      "empty": "",
+      "filter": 0,
+      "filters": [],
+      "grid": [],
+      "has_menu": false,
+      "label": "Artist",
+      "lead": [],
+      "liked_songs": false,
+      "meta": "1 album • 1 in your library",
+      "more": null,
+      "notice": "",
+      "notice_action": "",
+      "notice_other": "",
+      "offers": [],
+      "offers_first": false,
+      "offers_heading": "",
+      "offers_note": "",
+      "offers_route": "",
+      "offers_title": "",
+      "play": "Songs",
+      "playlist": null,
+      "request_ids": [],
+      "shelves": [],
+      "show_album": false,
+      "show_cover": false,
+      "show_number": false,
+      "song_notes": [],
+      "songs": [],
+      "sort": 0,
+      "sorts": [],
+      "star": null,
+      "starred": false,
+      "stats": [],
+      "subtitle": "",
+      "subtitle_route": "",
+      "tail": [
+        {
+          "cards": [
+            {
+              "cover": "al-lib-grown",
+              "id": "lib-grown",
+              "kind": "Album",
+              "subtitle": "2015 • In your library",
+              "title": "Grown"
+            }
+          ],
+          "route": "",
+          "title": "Albums",
+          "wrap": true
+        }
+      ],
+      "tiles": [],
+      "title": "Mid Band",
+      "tracks_route": "",
+      "tracks_title": ""
+    }
+  ]
+}

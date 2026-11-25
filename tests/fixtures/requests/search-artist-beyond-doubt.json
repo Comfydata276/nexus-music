@@ -1,0 +1,357 @@
+{
+  "asked": [
+    "GET http://lidarr.test/api/v1/album/lookup?term=Quillon%20Vane ",
+    "GET http://lidarr.test/api/v1/artist/lookup?term=Quillon%20Vane ",
+    "GET https://api.listenbrainz.org/1/popularity/top-recordings-for-artist/qv1 ",
+    "GET https://musicbrainz.org/ws/2/release-group?artist=qv1&type=album%7Cep%7Csingle&limit=100&offset=0&inc=artist-credits&fmt=json ",
+    "POST https://api.listenbrainz.org/1/popularity/artist { \"artist_mbids\": [ \"qv1\" ] }"
+  ],
+  "stages": [
+    {
+      "about": "",
+      "action": "",
+      "album_numbers": false,
+      "artist_id": "",
+      "can_play": false,
+      "context": "",
+      "cover": "",
+      "cover_round": false,
+      "disc_sections": false,
+      "empty": "",
+      "filter": 0,
+      "filters": [],
+      "grid": [],
+      "has_menu": false,
+      "label": "",
+      "lead": [],
+      "liked_songs": false,
+      "meta": "",
+      "more": null,
+      "notice": "",
+      "notice_action": "",
+      "notice_other": "",
+      "offers": [],
+      "offers_first": false,
+      "offers_heading": "",
+      "offers_note": "Looking for their songs and albums…",
+      "offers_route": "",
+      "offers_title": "Not in your library",
+      "play": "Songs",
+      "playlist": null,
+      "request_ids": [],
+      "shelves": [],
+      "show_album": false,
+      "show_cover": false,
+      "show_number": false,
+      "song_notes": [],
+      "songs": [],
+      "sort": 0,
+      "sorts": [],
+      "star": null,
+      "starred": false,
+      "stats": [],
+      "subtitle": "",
+      "subtitle_route": "",
+      "tail": [
+        {
+          "cards": [
+            {
+              "cover": "https://pictures.test/qv1.jpg",
+              "id": "qv1",
+              "kind": "OutsideArtist",
+              "subtitle": "the band",
+              "title": "Quillon Vane"
+            },
+            {
+              "cover": "",
+              "id": "qvx",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "The Quillon Vane Experience"
+            },
+            {
+              "cover": "",
+              "id": "qx",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Vane"
+            }
+          ],
+          "route": "",
+          "title": "Artists",
+          "wrap": false
+        },
+        {
+          "cards": [
+            {
+              "cover": "https://covers.test/rg-go.jpg",
+              "id": "rg-go",
+              "kind": "Request",
+              "subtitle": "Quillon Vane • 2019",
+              "title": "Glass Orchard"
+            },
+            {
+              "cover": "https://covers.test/rg-old.jpg",
+              "id": "rg-old",
+              "kind": "Request",
+              "subtitle": "Somebody • 2001",
+              "title": "An Old One"
+            }
+          ],
+          "route": "",
+          "title": "Albums",
+          "wrap": false
+        }
+      ],
+      "tiles": [],
+      "title": "Results for “Quillon Vane”",
+      "tracks_route": "",
+      "tracks_title": ""
+    },
+    {
+      "about": "",
+      "action": "",
+      "album_numbers": false,
+      "artist_id": "",
+      "can_play": false,
+      "context": "",
+      "cover": "",
+      "cover_round": false,
+      "disc_sections": false,
+      "empty": "",
+      "filter": 0,
+      "filters": [],
+      "grid": [],
+      "has_menu": false,
+      "label": "",
+      "lead": [],
+      "liked_songs": false,
+      "meta": "",
+      "more": null,
+      "notice": "",
+      "notice_action": "",
+      "notice_other": "",
+      "offers": [],
+      "offers_first": false,
+      "offers_heading": "",
+      "offers_note": "Looking for their most played songs…",
+      "offers_route": "",
+      "offers_title": "Not in your library",
+      "play": "Songs",
+      "playlist": null,
+      "request_ids": [],
+      "shelves": [],
+      "show_album": false,
+      "show_cover": false,
+      "show_number": false,
+      "song_notes": [],
+      "songs": [],
+      "sort": 0,
+      "sorts": [],
+      "star": null,
+      "starred": false,
+      "stats": [],
+      "subtitle": "",
+      "subtitle_route": "",
+      "tail": [
+        {
+          "cards": [
+            {
+              "cover": "https://pictures.test/qv1.jpg",
+              "id": "qv1",
+              "kind": "OutsideArtist",
+              "subtitle": "the band",
+              "title": "Quillon Vane"
+            },
+            {
+              "cover": "",
+              "id": "qvx",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "The Quillon Vane Experience"
+            },
+            {
+              "cover": "",
+              "id": "qx",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Vane"
+            }
+          ],
+          "route": "",
+          "title": "Artists",
+          "wrap": false
+        },
+        {
+          "cards": [
+            {
+              "cover": "https://covers.test/rg-go.jpg",
+              "id": "rg-go",
+              "kind": "Request",
+              "subtitle": "Quillon Vane • 2019",
+              "title": "Glass Orchard"
+            },
+            {
+              "cover": "https://covers.test/rg-old.jpg",
+              "id": "rg-old",
+              "kind": "Request",
+              "subtitle": "Somebody • 2001",
+              "title": "An Old One"
+            }
+          ],
+          "route": "",
+          "title": "Albums",
+          "wrap": false
+        }
+      ],
+      "tiles": [],
+      "title": "Results for “Quillon Vane”",
+      "tracks_route": "",
+      "tracks_title": ""
+    },
+    {
+      "about": "",
+      "action": "",
+      "album_numbers": false,
+      "artist_id": "",
+      "can_play": false,
+      "context": "",
+      "cover": "",
+      "cover_round": false,
+      "disc_sections": false,
+      "empty": "",
+      "filter": 0,
+      "filters": [],
+      "grid": [],
+      "has_menu": false,
+      "label": "",
+      "lead": [],
+      "liked_songs": false,
+      "meta": "",
+      "more": null,
+      "notice": "",
+      "notice_action": "",
+      "notice_other": "",
+      "offers": [
+        {
+          "about": "Single • 2021",
+          "album": "rg-lh",
+          "album_title": "Lantern Hymn",
+          "artist": "Quillon Vane",
+          "artist_id": "qv1",
+          "artist_name": "Quillon Vane",
+          "cover": "https://coverartarchive.org/release-group/rg-lh/front-250",
+          "kind": "Single",
+          "requested": false,
+          "seconds": 200,
+          "song": "",
+          "title": "Lantern Hymn"
+        },
+        {
+          "about": "Glass Orchard • 2019",
+          "album": "rg-go",
+          "album_title": "Glass Orchard",
+          "artist": "Quillon Vane",
+          "artist_id": "qv1",
+          "artist_name": "Quillon Vane",
+          "cover": "https://coverartarchive.org/release-group/rg-go/front-250",
+          "kind": "",
+          "requested": false,
+          "seconds": 200,
+          "song": "",
+          "title": "Orchard Light"
+        },
+        {
+          "about": "Night Ferry (EP) • 2020",
+          "album": "rg-nf",
+          "album_title": "Night Ferry",
+          "artist": "Quillon Vane",
+          "artist_id": "qv1",
+          "artist_name": "Quillon Vane",
+          "cover": "https://coverartarchive.org/release-group/rg-nf/front-250",
+          "kind": "EP",
+          "requested": false,
+          "seconds": 200,
+          "song": "",
+          "title": "Ferry Song"
+        }
+      ],
+      "offers_first": false,
+      "offers_heading": "",
+      "offers_note": "Their most played songs come first. Ask Lidarr for any of these, or open the artist for everything they've made.",
+      "offers_route": "",
+      "offers_title": "Not in your library",
+      "play": "Songs",
+      "playlist": null,
+      "request_ids": [],
+      "shelves": [],
+      "show_album": false,
+      "show_cover": false,
+      "show_number": false,
+      "song_notes": [],
+      "songs": [],
+      "sort": 0,
+      "sorts": [],
+      "star": null,
+      "starred": false,
+      "stats": [],
+      "subtitle": "",
+      "subtitle_route": "",
+      "tail": [
+        {
+          "cards": [
+            {
+              "cover": "https://pictures.test/qv1.jpg",
+              "id": "qv1",
+              "kind": "OutsideArtist",
+              "subtitle": "the band",
+              "title": "Quillon Vane"
+            },
+            {
+              "cover": "",
+              "id": "qvx",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "The Quillon Vane Experience"
+            },
+            {
+              "cover": "",
+              "id": "qx",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Vane"
+            }
+          ],
+          "route": "",
+          "title": "Artists",
+          "wrap": false
+        },
+        {
+          "cards": [
+            {
+              "cover": "https://covers.test/rg-go.jpg",
+              "id": "rg-go",
+              "kind": "Request",
+              "subtitle": "Quillon Vane • 2019",
+              "title": "Glass Orchard"
+            },
+            {
+              "cover": "https://covers.test/rg-old.jpg",
+              "id": "rg-old",
+              "kind": "Request",
+              "subtitle": "Somebody • 2001",
+              "title": "An Old One"
+            }
+          ],
+          "route": "",
+          "title": "Albums",
+          "wrap": false
+        }
+      ],
+      "tiles": [],
+      "title": "Results for “Quillon Vane”",
+      "tracks_route": "",
+      "tracks_title": ""
+    }
+  ]
+}

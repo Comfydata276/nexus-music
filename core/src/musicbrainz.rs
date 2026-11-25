@@ -36,11 +36,21 @@ type Releases = (String, Vec<Offer>);
 ///
 /// An app makes one of these and uses it for everything. The gap MusicBrainz asks for
 /// between requests, and the wait when it says it's busy, are kept by the one that made
-/// the last request: two of them would each keep their own, and together ask twice as
-/// often as allowed. Nothing here stops an app making two.
+/// the last request: two made with `new` would each keep their own, and together ask twice
+/// as often as allowed. Nothing here stops an app making two.
+///
+/// An app that needs to ask through more than one `Http` (one per thing it may stop, so
+/// that it can tell their requests apart) makes the others with `over`: they keep one gap,
+/// one note of when MusicBrainz was last talked to, and one store of artists' releases
+/// with the one they were made from.
 pub struct MusicBrainz {
     http: Arc<dyn Http>,
     listenbrainz: ListenBrainz,
+    shared: Arc<Shared>,
+}
+
+/// What every `MusicBrainz` made from one keeps together.
+struct Shared {
     /// When the next request may be made.
     next: Mutex<Option<Instant>>,
     /// When MusicBrainz was last talked to.
@@ -57,7 +67,8 @@ fn unreachable(failure: Failure) -> String {
 }
 
 /// A song that isn't in the library, and the album it could be had on.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct SongOffer {
     pub title: String,
     pub artist: String,
@@ -80,7 +91,8 @@ pub struct SongOffer {
 }
 
 /// A song on an album, by name only.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct TrackName {
     pub title: String,
     pub seconds: u32,
@@ -437,12 +449,19 @@ fn tracks_from(found: &Value) -> Vec<TrackName> {
 
 impl MusicBrainz {
     pub fn new(http: Arc<dyn Http>, listenbrainz: ListenBrainz) -> MusicBrainz {
-        MusicBrainz { http, listenbrainz, next: Mutex::new(None), touched: Mutex::new(None), releases: Mutex::new(Vec::new()) }
+        let shared = Shared { next: Mutex::new(None), touched: Mutex::new(None), releases: Mutex::new(Vec::new()) };
+        MusicBrainz { http, listenbrainz, shared: Arc::new(shared) }
+    }
+
+    /// The same MusicBrainz, asked through another `Http`: its gap between requests, its
+    /// note of when it was last talked to and its store of artists' releases are this one's.
+    pub fn over(&self, http: Arc<dyn Http>, listenbrainz: ListenBrainz) -> MusicBrainz {
+        MusicBrainz { http, listenbrainz, shared: self.shared.clone() }
     }
 
     /// Notes that MusicBrainz is being talked to now; says whether it had been lately.
     fn touch(&self) -> bool {
-        let mut touched = self.touched.lock().unwrap_or_else(|stuck| stuck.into_inner());
+        let mut touched = self.shared.touched.lock().unwrap_or_else(|stuck| stuck.into_inner());
         let lately = touched.is_some_and(|at| at.elapsed() < THEIR_IDLE - Duration::from_secs(2));
         *touched = Some(Instant::now());
         lately
@@ -467,7 +486,7 @@ impl MusicBrainz {
         for attempt in 0..4u64 {
             // One caller at a time, each waiting out the gap since the one before.
             {
-                let mut next = self.next.lock().unwrap_or_else(|stuck| stuck.into_inner());
+                let mut next = self.shared.next.lock().unwrap_or_else(|stuck| stuck.into_inner());
                 if let Some(wait) = next.and_then(|at| at.checked_duration_since(Instant::now())) {
                     self.http.pause(wait).map_err(unreachable)?;
                 }
@@ -482,7 +501,7 @@ impl MusicBrainz {
             if status == 503 && attempt < 3 {
                 let wait = response.header("retry-after").and_then(|v| v.parse::<u64>().ok()).unwrap_or(1).clamp(1, 3);
                 let _ = response.body();
-                *self.next.lock().unwrap_or_else(|stuck| stuck.into_inner()) = Some(Instant::now() + Duration::from_secs(wait));
+                *self.shared.next.lock().unwrap_or_else(|stuck| stuck.into_inner()) = Some(Instant::now() + Duration::from_secs(wait));
                 continue;
             }
             if status != 200 {
@@ -527,8 +546,11 @@ impl MusicBrainz {
             // that's played most is taken to be it.
             let mut wider = ask("NOT secondarytype:live", 100)?;
             let recordings: Vec<String> = wider.iter().flat_map(|song| song.recordings.iter().cloned()).collect();
-            if let Ok(counts) = self.listenbrainz.listens(&recordings) {
-                by_listens(&mut wider, &counts);
+            match self.listenbrainz.listens(&recordings) {
+                Ok(counts) => by_listens(&mut wider, &counts),
+                // Stopped is passed on; ListenBrainz not answering only leaves them unsorted.
+                Err(reason) if reason == STOPPED => return Err(reason),
+                Err(_) => {}
             }
             order(&mut wider);
             if wider.first().is_some_and(|song| song.artist_id == artist) {
@@ -573,13 +595,13 @@ impl MusicBrainz {
         // page, then for what's on the page. Kept a while so only the first has to wait.
         let key = (artist.to_string(), singles);
         {
-            let kept = self.releases.lock().unwrap_or_else(|stuck| stuck.into_inner());
+            let kept = self.shared.releases.lock().unwrap_or_else(|stuck| stuck.into_inner());
             if let Some((_, _, found)) = kept.iter().find(|(known, at, _)| *known == key && at.elapsed() < RELEASES_KEPT) {
                 return Ok(found.clone());
             }
         }
         let found = self.fetch_artist_releases(artist, singles)?;
-        let mut kept = self.releases.lock().unwrap_or_else(|stuck| stuck.into_inner());
+        let mut kept = self.shared.releases.lock().unwrap_or_else(|stuck| stuck.into_inner());
         kept.retain(|(known, at, _)| *known != key && at.elapsed() < RELEASES_KEPT);
         if kept.len() >= 40 {
             kept.remove(0);
@@ -924,5 +946,64 @@ mod tests {
         assert!(search(true, false).is_empty());
         // Off when it started, on when the answer came: offered, on its single.
         assert_eq!(search(false, true).iter().map(|song| song.kind.as_str()).collect::<Vec<_>>(), ["Single"]);
+    }
+
+    /// Answers everything with an empty list of recordings, and notes each wait asked for.
+    struct Pacing {
+        asked: Mutex<Vec<String>>,
+        waits: Mutex<Vec<Duration>>,
+    }
+
+    impl Http for Pacing {
+        fn send(&self, request: &Request) -> Result<crate::http::Response, Failure> {
+            self.asked.lock().unwrap().push(request.url.to_string());
+            Ok(crate::http::Response::new(200, Vec::new(), || Ok(r#"{"recordings":[],"release-groups":[],"release-group-count":0}"#.to_string())))
+        }
+
+        fn pause(&self, wait: Duration) -> Result<(), Failure> {
+            self.waits.lock().unwrap().push(wait);
+            Ok(())
+        }
+    }
+
+    fn pacing() -> Arc<Pacing> {
+        Arc::new(Pacing { asked: Mutex::default(), waits: Mutex::default() })
+    }
+
+    #[test]
+    fn one_musicbrainz_keeps_one_gap_between_its_requests() {
+        let http = pacing();
+        let service = MusicBrainz::new(http.clone(), ListenBrainz::new(http.clone()));
+        assert!(service.find_songs("one", || true).is_ok());
+        assert!(http.waits.lock().unwrap().is_empty());
+        assert!(service.find_songs("two", || true).is_ok());
+        let waits = http.waits.lock().unwrap().clone();
+        assert!(waits.len() == 1 && waits[0] > GAP - Duration::from_millis(200) && waits[0] <= GAP, "{waits:?}");
+    }
+
+    #[test]
+    fn handles_made_over_another_http_share_the_gap_and_the_store() {
+        let (first, second) = (pacing(), pacing());
+        let service = MusicBrainz::new(first.clone(), ListenBrainz::new(first.clone()));
+        let other = service.over(second.clone(), ListenBrainz::new(second.clone()));
+        // One asks; the other, asking straight after, waits out the gap the first began.
+        assert!(service.find_songs("one", || true).is_ok());
+        assert!(other.find_songs("two", || true).is_ok());
+        let waits = second.waits.lock().unwrap().clone();
+        assert!(waits.len() == 1 && waits[0] > GAP - Duration::from_millis(200), "{waits:?}");
+        assert!(first.waits.lock().unwrap().is_empty());
+        // Each asks through its own.
+        assert_eq!((first.asked.lock().unwrap().len(), second.asked.lock().unwrap().len()), (1, 1));
+        // An artist's releases fetched through one are kept for the other.
+        assert!(other.artist_releases("an-artist", true).is_ok());
+        assert!(service.artist_releases("an-artist", true).is_ok());
+        assert_eq!((first.asked.lock().unwrap().len(), second.asked.lock().unwrap().len()), (1, 2));
+        // And one talked to lately is so for both.
+        assert!(!service.needs_warming());
+        // A MusicBrainz made afresh keeps its own.
+        let third = pacing();
+        let apart = MusicBrainz::new(third.clone(), ListenBrainz::new(third.clone()));
+        assert!(apart.find_songs("three", || true).is_ok());
+        assert!(third.waits.lock().unwrap().is_empty());
     }
 }

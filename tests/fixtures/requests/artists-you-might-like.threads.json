@@ -1,0 +1,17 @@
+[
+  [
+    "GET http://lidarr.test/api/v1/artist "
+  ],
+  [
+    "GET http://lidarr.test/api/v1/artist/lookup?term=Far%20Hills "
+  ],
+  [
+    "GET http://lidarr.test/api/v1/artist/lookup?term=Kept%20Band "
+  ],
+  [
+    "GET http://lidarr.test/api/v1/artist/lookup?term=Nobody%20Knows "
+  ],
+  [
+    "GET http://lidarr.test/api/v1/artist/lookup?term=Shore%20Lights "
+  ]
+]

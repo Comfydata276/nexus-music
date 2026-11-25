@@ -175,6 +175,12 @@ pub trait Http: Send + Sync {
         std::thread::sleep(wait);
         Ok(())
     }
+
+    /// Said just before what's being done first changes something on a service that it must
+    /// then see through, or put back (see `Lidarr::request`): from now on, an app that can be
+    /// told to stop lets this one's requests and waits run to their end rather than saying
+    /// `Failure::Stopped`. One that never stops (the Windows app) has nothing to do.
+    fn keep_going(&self) {}
 }
 
 #[cfg(test)]

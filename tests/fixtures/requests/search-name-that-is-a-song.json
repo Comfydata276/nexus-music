@@ -1,0 +1,446 @@
+{
+  "asked": [
+    "GET http://lidarr.test/api/v1/album/lookup?term=Home ",
+    "GET http://lidarr.test/api/v1/artist/lookup?term=Home ",
+    "GET http://lidarr.test/api/v1/artist/lookup?term=lidarr%3Aps ",
+    "GET https://musicbrainz.org/ws/2/recording?query=Home&dismax=true&limit=100&fmt=json ",
+    "POST https://api.listenbrainz.org/1/popularity/artist { \"artist_mbids\": [ \"hm\", \"hm2\" ] }",
+    "POST https://api.listenbrainz.org/1/popularity/recording { \"recording_mbids\": [ \"rec-h3\", \"rec-h1\" ] }"
+  ],
+  "stages": [
+    {
+      "about": "",
+      "action": "",
+      "album_numbers": false,
+      "artist_id": "",
+      "can_play": false,
+      "context": "",
+      "cover": "",
+      "cover_round": false,
+      "disc_sections": false,
+      "empty": "",
+      "filter": 0,
+      "filters": [],
+      "grid": [],
+      "has_menu": false,
+      "label": "",
+      "lead": [],
+      "liked_songs": false,
+      "meta": "",
+      "more": null,
+      "notice": "",
+      "notice_action": "",
+      "notice_other": "",
+      "offers": [],
+      "offers_first": false,
+      "offers_heading": "",
+      "offers_note": "Looking for songs and albums…",
+      "offers_route": "",
+      "offers_title": "Not in your library",
+      "play": "Songs",
+      "playlist": null,
+      "request_ids": [],
+      "shelves": [],
+      "show_album": false,
+      "show_cover": false,
+      "show_number": false,
+      "song_notes": [],
+      "songs": [],
+      "sort": 0,
+      "sorts": [],
+      "star": null,
+      "starred": false,
+      "stats": [],
+      "subtitle": "",
+      "subtitle_route": "",
+      "tail": [
+        {
+          "cards": [
+            {
+              "cover": "https://pictures.test/hm.jpg",
+              "id": "hm",
+              "kind": "OutsideArtist",
+              "subtitle": "a band",
+              "title": "Home"
+            },
+            {
+              "cover": "",
+              "id": "hm2",
+              "kind": "OutsideArtist",
+              "subtitle": "another",
+              "title": "Home"
+            }
+          ],
+          "route": "",
+          "title": "Artists",
+          "wrap": false
+        },
+        {
+          "cards": [
+            {
+              "cover": "https://covers.test/rg-home.jpg",
+              "id": "rg-home",
+              "kind": "Request",
+              "subtitle": "Home • 2010",
+              "title": "Home"
+            }
+          ],
+          "route": "",
+          "title": "Albums",
+          "wrap": false
+        }
+      ],
+      "tiles": [],
+      "title": "Results for “Home”",
+      "tracks_route": "",
+      "tracks_title": ""
+    },
+    {
+      "about": "",
+      "action": "",
+      "album_numbers": false,
+      "artist_id": "",
+      "can_play": false,
+      "context": "",
+      "cover": "",
+      "cover_round": false,
+      "disc_sections": false,
+      "empty": "",
+      "filter": 0,
+      "filters": [],
+      "grid": [],
+      "has_menu": false,
+      "label": "",
+      "lead": [],
+      "liked_songs": false,
+      "meta": "",
+      "more": null,
+      "notice": "",
+      "notice_action": "",
+      "notice_other": "",
+      "offers": [],
+      "offers_first": false,
+      "offers_heading": "",
+      "offers_note": "Looking for songs beyond your library…",
+      "offers_route": "",
+      "offers_title": "Not in your library",
+      "play": "Songs",
+      "playlist": null,
+      "request_ids": [],
+      "shelves": [],
+      "show_album": false,
+      "show_cover": false,
+      "show_number": false,
+      "song_notes": [],
+      "songs": [],
+      "sort": 0,
+      "sorts": [],
+      "star": null,
+      "starred": false,
+      "stats": [],
+      "subtitle": "",
+      "subtitle_route": "",
+      "tail": [
+        {
+          "cards": [
+            {
+              "cover": "https://pictures.test/hm.jpg",
+              "id": "hm",
+              "kind": "OutsideArtist",
+              "subtitle": "a band",
+              "title": "Home"
+            },
+            {
+              "cover": "",
+              "id": "hm2",
+              "kind": "OutsideArtist",
+              "subtitle": "another",
+              "title": "Home"
+            }
+          ],
+          "route": "",
+          "title": "Artists",
+          "wrap": false
+        },
+        {
+          "cards": [
+            {
+              "cover": "https://covers.test/rg-home.jpg",
+              "id": "rg-home",
+              "kind": "Request",
+              "subtitle": "Home • 2010",
+              "title": "Home"
+            }
+          ],
+          "route": "",
+          "title": "Albums",
+          "wrap": false
+        }
+      ],
+      "tiles": [],
+      "title": "Results for “Home”",
+      "tracks_route": "",
+      "tracks_title": ""
+    },
+    {
+      "about": "",
+      "action": "",
+      "album_numbers": false,
+      "artist_id": "",
+      "can_play": false,
+      "context": "",
+      "cover": "",
+      "cover_round": false,
+      "disc_sections": false,
+      "empty": "",
+      "filter": 0,
+      "filters": [],
+      "grid": [],
+      "has_menu": false,
+      "label": "",
+      "lead": [],
+      "liked_songs": false,
+      "meta": "",
+      "more": null,
+      "notice": "",
+      "notice_action": "",
+      "notice_other": "",
+      "offers": [
+        {
+          "about": "Home • 2010",
+          "album": "rg-home",
+          "album_title": "Home",
+          "artist": "Home",
+          "artist_id": "hm",
+          "artist_name": "Home",
+          "cover": "https://coverartarchive.org/release-group/rg-home/front-250",
+          "kind": "",
+          "requested": false,
+          "seconds": 200,
+          "song": "",
+          "title": "Home"
+        },
+        {
+          "about": "Homeward • 2012",
+          "album": "rg-ps",
+          "album_title": "Homeward",
+          "artist": "Phillip Someone",
+          "artist_id": "ps",
+          "artist_name": "Phillip Someone",
+          "cover": "https://coverartarchive.org/release-group/rg-ps/front-250",
+          "kind": "",
+          "requested": false,
+          "seconds": 210,
+          "song": "",
+          "title": "Home"
+        }
+      ],
+      "offers_first": false,
+      "offers_heading": "",
+      "offers_note": "Ask Lidarr for any of these. A song comes with the album it's on, or as its single if it isn't on one.",
+      "offers_route": "",
+      "offers_title": "Not in your library",
+      "play": "Songs",
+      "playlist": null,
+      "request_ids": [],
+      "shelves": [],
+      "show_album": false,
+      "show_cover": false,
+      "show_number": false,
+      "song_notes": [],
+      "songs": [],
+      "sort": 0,
+      "sorts": [],
+      "star": null,
+      "starred": false,
+      "stats": [],
+      "subtitle": "",
+      "subtitle_route": "",
+      "tail": [
+        {
+          "cards": [
+            {
+              "cover": "https://pictures.test/hm.jpg",
+              "id": "hm",
+              "kind": "OutsideArtist",
+              "subtitle": "a band",
+              "title": "Home"
+            },
+            {
+              "cover": "",
+              "id": "ps",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Phillip Someone"
+            },
+            {
+              "cover": "",
+              "id": "hm2",
+              "kind": "OutsideArtist",
+              "subtitle": "another",
+              "title": "Home"
+            }
+          ],
+          "route": "",
+          "title": "Artists",
+          "wrap": false
+        },
+        {
+          "cards": [
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-ps/front-250",
+              "id": "rg-ps",
+              "kind": "Request",
+              "subtitle": "Phillip Someone • 2012",
+              "title": "Homeward"
+            },
+            {
+              "cover": "https://covers.test/rg-home.jpg",
+              "id": "rg-home",
+              "kind": "Request",
+              "subtitle": "Home • 2010",
+              "title": "Home"
+            }
+          ],
+          "route": "",
+          "title": "Albums",
+          "wrap": false
+        }
+      ],
+      "tiles": [],
+      "title": "Results for “Home”",
+      "tracks_route": "",
+      "tracks_title": ""
+    },
+    {
+      "about": "",
+      "action": "",
+      "album_numbers": false,
+      "artist_id": "",
+      "can_play": false,
+      "context": "",
+      "cover": "",
+      "cover_round": false,
+      "disc_sections": false,
+      "empty": "",
+      "filter": 0,
+      "filters": [],
+      "grid": [],
+      "has_menu": false,
+      "label": "",
+      "lead": [],
+      "liked_songs": false,
+      "meta": "",
+      "more": null,
+      "notice": "",
+      "notice_action": "",
+      "notice_other": "",
+      "offers": [
+        {
+          "about": "Home • 2010",
+          "album": "rg-home",
+          "album_title": "Home",
+          "artist": "Home",
+          "artist_id": "hm",
+          "artist_name": "Home",
+          "cover": "https://coverartarchive.org/release-group/rg-home/front-250",
+          "kind": "",
+          "requested": false,
+          "seconds": 200,
+          "song": "",
+          "title": "Home"
+        },
+        {
+          "about": "Homeward • 2012",
+          "album": "rg-ps",
+          "album_title": "Homeward",
+          "artist": "Phillip Someone",
+          "artist_id": "ps",
+          "artist_name": "Phillip Someone",
+          "cover": "https://coverartarchive.org/release-group/rg-ps/front-250",
+          "kind": "",
+          "requested": false,
+          "seconds": 210,
+          "song": "",
+          "title": "Home"
+        }
+      ],
+      "offers_first": false,
+      "offers_heading": "",
+      "offers_note": "Ask Lidarr for any of these. A song comes with the album it's on, or as its single if it isn't on one.",
+      "offers_route": "",
+      "offers_title": "Not in your library",
+      "play": "Songs",
+      "playlist": null,
+      "request_ids": [],
+      "shelves": [],
+      "show_album": false,
+      "show_cover": false,
+      "show_number": false,
+      "song_notes": [],
+      "songs": [],
+      "sort": 0,
+      "sorts": [],
+      "star": null,
+      "starred": false,
+      "stats": [],
+      "subtitle": "",
+      "subtitle_route": "",
+      "tail": [
+        {
+          "cards": [
+            {
+              "cover": "https://pictures.test/hm.jpg",
+              "id": "hm",
+              "kind": "OutsideArtist",
+              "subtitle": "a band",
+              "title": "Home"
+            },
+            {
+              "cover": "",
+              "id": "ps",
+              "kind": "OutsideArtist",
+              "subtitle": "Artist",
+              "title": "Phillip Someone"
+            },
+            {
+              "cover": "",
+              "id": "hm2",
+              "kind": "OutsideArtist",
+              "subtitle": "another",
+              "title": "Home"
+            }
+          ],
+          "route": "",
+          "title": "Artists",
+          "wrap": false
+        },
+        {
+          "cards": [
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-ps/front-250",
+              "id": "rg-ps",
+              "kind": "Request",
+              "subtitle": "Phillip Someone • 2012",
+              "title": "Homeward"
+            },
+            {
+              "cover": "https://covers.test/rg-home.jpg",
+              "id": "rg-home",
+              "kind": "Request",
+              "subtitle": "Home • 2010",
+              "title": "Home"
+            }
+          ],
+          "route": "",
+          "title": "Albums",
+          "wrap": false
+        }
+      ],
+      "tiles": [],
+      "title": "Results for “Home”",
+      "tracks_route": "",
+      "tracks_title": ""
+    }
+  ]
+}

@@ -16,9 +16,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{OnceLock, RwLock};
 
-use nexus_core::discover::{Kept, SUGGESTIONS, favourites, meant, ranked};
+use nexus_core::discover::{Kept, favourites};
 
-use crate::lidarr::{ArtistOffer, Lidarr};
+use crate::lidarr::Lidarr;
 use crate::search::{Index, fold};
 use crate::subsonic::Client;
 
@@ -90,7 +90,6 @@ static LOOKING: AtomicBool = AtomicBool::new(false);
 
 fn look(client: &Client, index: &Index, lidarr: &Lidarr, now: i64) -> Vec<Suggestion> {
     let favourites = favourites(&index.library.songs);
-    let have: HashSet<String> = index.library.artists.iter().map(|artist| fold(&artist.title)).collect();
     // Four questions at a time, so neither the server nor Lidarr is leaned on.
     let mut similar: Vec<(String, Vec<String>)> = Vec::new();
     for group in favourites.chunks(4) {
@@ -100,28 +99,9 @@ fn look(client: &Client, index: &Index, lidarr: &Lidarr, now: i64) -> Vec<Sugges
         });
         similar.extend(group.iter().map(|(_, name)| name.clone()).zip(answers));
     }
-    // Anyone Lidarr is already keeping track of is on their way, not news.
-    let tracked = lidarr.tracked().unwrap_or_default();
-    let mut artists: Vec<Suggestion> = Vec::new();
-    let bets = ranked(&similar, &have);
-    // A few more than are wanted are asked about: Lidarr won't know every one.
-    for group in bets.chunks(4).take(SUGGESTIONS.div_ceil(4) + 2) {
-        let answers: Vec<Option<ArtistOffer>> = std::thread::scope(|scope| {
-            let asked: Vec<_> = group.iter().map(|(name, _)| scope.spawn(move || lidarr.find_artists(name).ok().and_then(|found| meant(found, name)))).collect();
-            asked.into_iter().map(|asked| asked.join().ok().flatten()).collect()
-        });
-        for ((_, like), artist) in group.iter().zip(answers) {
-            let Some(artist) = artist else { continue };
-            if tracked.contains(&artist.id) || artists.iter().any(|known| known.id == artist.id) {
-                continue;
-            }
-            artists.push(Suggestion { id: artist.id, name: artist.name, cover: artist.cover, like: like.clone() });
-        }
-        if artists.len() >= SUGGESTIONS {
-            break;
-        }
-    }
-    artists.truncate(SUGGESTIONS);
-    keep(Kept { at: now, artists: artists.clone() });
-    artists
+    // Who each of those is, by Lidarr; what it keeps, or the library has, left out. (Nothing
+    // on Windows stops a request, so "stopped" can't come of it.)
+    let Ok(found) = nexus_core::discover::look(lidarr, &similar, index, now) else { return Vec::new() };
+    keep(found.clone());
+    found.artists
 }
