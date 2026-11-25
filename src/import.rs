@@ -276,6 +276,9 @@ pub fn run(client: &crate::subsonic::Client, index: &Index, paths: &[PathBuf]) -
                 }
                 None => {
                     let ids: Vec<String> = found.iter().map(|(id, _)| id.clone()).collect();
+                    if nexus_core::step::reserved(&list.name) {
+                        return Err(nexus_core::step::RESERVED.to_string());
+                    }
                     report.playlist = client.create_playlist(&list.name, &ids).map_err(|e| e.to_string())?.id;
                     report.added = found.len();
                     report.dated = found;

@@ -1104,6 +1104,10 @@ impl Controller {
                 if name.is_empty() {
                     return;
                 }
+                if nexus_core::step::reserved(&name) {
+                    // The name of the playlist the app keeps what devices share in.
+                    return self.toast(nexus_core::step::RESERVED);
+                }
                 let ids: Vec<String> = songs.iter().map(|s| s.id.clone()).collect();
                 let label = name.clone();
                 self.request(
@@ -1122,6 +1126,10 @@ impl Controller {
             PromptAction::RenamePlaylist(id) => {
                 if name.is_empty() {
                     return;
+                }
+                if nexus_core::step::reserved(&name) {
+                    // The name of the playlist the app keeps what devices share in.
+                    return self.toast(nexus_core::step::RESERVED);
                 }
                 let key = format!("playlist:{id}");
                 let page = Route::Playlist(id.clone());
