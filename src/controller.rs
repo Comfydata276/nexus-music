@@ -1614,46 +1614,13 @@ impl Controller {
     /// Asks whether to request an album that isn't in the library. `song` is the song that
     /// led here, if it was one: the album is what gets fetched, and that's said.
     pub fn prompt_request(self: &Rc<Self>, album: &str, title: &str, by: &str, song: &str, kind: &str) {
-        let offered = crate::lidarr::offered(album);
-        if offered.as_ref().is_some_and(|offer| offer.requested) {
-            return self.toast("That one has already been asked for. See Requests in the sidebar.");
-        }
-        // What kind of release it is, if the caller didn't say: Lidarr may have.
-        let kind = if kind.is_empty() { offered.as_ref().map(|offer| offer.kind().to_string()).unwrap_or_default() } else { kind.to_string() };
-        let whose = if by.is_empty() { "the artist".to_string() } else { by.to_string() };
-        let by = if by.is_empty() { String::new() } else { format!(" by {by}") };
-        let text = match (kind.as_str(), song.is_empty()) {
-            ("Single", _) => format!(
-                "“{title}”{by} came out as a single. It will go on Lidarr's list, and Lidarr will start looking for it. If Lidarr only lists {whose}'s albums so far, it will be set to list their singles and EPs too. None but this one is fetched, though ones they release from now on are treated as their new albums are."
-            ),
-            ("EP", true) => format!(
-                "“{title}”{by} is an EP. It will go on Lidarr's list, and Lidarr will start looking for it. If Lidarr only lists {whose}'s albums so far, it will be set to list their singles and EPs too. None but this one is fetched, though ones they release from now on are treated as their new albums are."
-            ),
-            ("EP", false) => format!(
-                "“{song}” is on the EP “{title}”{by}. That EP will go on Lidarr's list, and Lidarr will start looking for it. If Lidarr only lists {whose}'s albums so far, it will be set to list their singles and EPs too. None but this one is fetched, though ones they release from now on are treated as their new albums are."
-            ),
-            (_, true) => format!("“{title}”{by} will go on Lidarr's list, and Lidarr will start looking for it. The whole album is fetched."),
-            (_, false) => format!("“{song}” is on “{title}”{by}. That album will go on Lidarr's list, and Lidarr will start looking for it. The whole album is fetched."),
-        };
-        // A soundtrack is another kind of release Lidarr has to be set to list.
-        let soundtrack = offered.as_ref().is_some_and(|offer| offer.soundtrack);
-        let text = if !soundtrack {
-            text
-        } else if offered.as_ref().is_some_and(|offer| offer.artist_id == crate::lidarr::VARIOUS) {
-            format!("{text} It's a soundtrack credited to various artists, so it goes on Lidarr's list under “Various Artists”.")
-        } else if kind == "Album" || kind.is_empty() {
-            format!("{text} It's a soundtrack. If Lidarr doesn't list {whose}'s soundtracks so far, it will be set to. None but this one is fetched.")
-        } else {
-            text.replace("their singles and EPs too", "their singles, EPs and soundtracks too")
-        };
-        let heading = match kind.as_str() {
-            "Single" => "Ask for this single?",
-            "EP" => "Ask for this EP?",
-            _ => "Ask for this album?",
+        let (heading, text) = match nexus_core::requests::asking(crate::lidarr::offers(), album, title, by, song, kind) {
+            nexus_core::requests::Asking::Already(said) => return self.toast(format!("{said} See Requests in the sidebar.")),
+            nexus_core::requests::Asking::Ask { heading, text } => (heading, text),
         };
         *self.prompt.borrow_mut() =
             Some(crate::actions::PromptAction::RequestAlbum { album: album.to_string(), title: title.to_string(), song: song.to_string() });
-        self.open_prompt(heading, &text, "Request", None, false);
+        self.open_prompt(&heading, &text, "Request", None, false);
     }
 
     /// Reloads the page on screen if it shows music that isn't in the library, after what's
@@ -1670,32 +1637,17 @@ impl Controller {
 
     pub fn request_album(self: &Rc<Self>, album: String, title: String, song: String) {
         let Some(lidarr) = crate::lidarr::current() else { return };
-        self.toast(format!("Asking for “{title}”…"));
+        self.toast(nexus_core::requests::asking_for(&title));
         self.requests_pool.spawn(move || {
-            // Offered in this session, or (from a page drawn in an earlier one) looked up afresh.
-            let offer = crate::lidarr::offered(&album)
-                .map(Ok)
-                .unwrap_or_else(|| {
-                    lidarr.find_any(&format!("lidarr:{album}"))?.into_iter().find(|o| o.album == album).ok_or_else(|| "Lidarr no longer lists that one.".to_string())
-                });
-            let result = offer.and_then(|offer| {
-                crate::lidarr::remember(std::slice::from_ref(&offer));
-                lidarr.request(&offer).map(|()| offer.artist)
-            });
+            // (Nothing on Windows stops a request, so "stopped" can't come of it.)
+            let result = nexus_core::requests::request(&lidarr, crate::lidarr::offers(), &album).unwrap_or_else(|_| Err(nexus_core::http::STOPPED.into()));
             post(move |ctl| match result {
                 Ok(artist) => {
                     // Noted, so it can be followed up when it arrives.
-                    ctl.asked.borrow_mut().add(crate::asked::Asked {
-                        album: album.clone(),
-                        title: title.clone(),
-                        artist,
-                        at: chrono::Utc::now().timestamp(),
-                        song,
-                        ..Default::default()
-                    });
-                    crate::lidarr::mark(&album, true);
+                    let now = chrono::Utc::now().timestamp();
+                    ctl.asked.borrow_mut().add(nexus_core::requests::asked_for(crate::lidarr::offers(), &album, &title, &artist, &song, now));
                     ctl.refresh_outside();
-                    ctl.toast(format!("Asked for “{title}”. It'll be in your library once it arrives."));
+                    ctl.toast(nexus_core::requests::asked_sentence(&title));
                 }
                 Err(reason) => ctl.toast(reason),
             });

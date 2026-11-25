@@ -668,6 +668,98 @@ pub fn album(services: Services, offers: &Offers, id: &str) -> Result<AlbumPage,
     }))
 }
 
+// ---- asking for an album, a single, an EP, a soundtrack, or a song's album ------------------------------
+
+/// Whether to ask, and how the question is put.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum Asking {
+    /// It has been asked for already: this says so. (Each app adds where to see it.)
+    Already(String),
+    Ask { heading: String, text: String },
+}
+
+/// Asks whether to request an album that isn't in the library: Lidarr's name for it, its
+/// title, whose it is (may be empty), the song that led here if it was one (the album is
+/// what gets fetched, and that's said), and what kind of release it is if the caller knows.
+pub fn asking(offers: &Offers, album: &str, title: &str, by: &str, song: &str, kind: &str) -> Asking {
+    let offered = offers.offered(album);
+    if offered.as_ref().is_some_and(|offer| offer.requested) {
+        return Asking::Already("That one has already been asked for.".into());
+    }
+    // What kind of release it is, if the caller didn't say: Lidarr may have.
+    let kind = if kind.is_empty() { offered.as_ref().map(|offer| offer.kind().to_string()).unwrap_or_default() } else { kind.to_string() };
+    let whose = if by.is_empty() { "the artist".to_string() } else { by.to_string() };
+    let by = if by.is_empty() { String::new() } else { format!(" by {by}") };
+    let text = match (kind.as_str(), song.is_empty()) {
+        ("Single", _) => format!(
+            "“{title}”{by} came out as a single. It will go on Lidarr's list, and Lidarr will start looking for it. If Lidarr only lists {whose}'s albums so far, it will be set to list their singles and EPs too. None but this one is fetched, though ones they release from now on are treated as their new albums are."
+        ),
+        ("EP", true) => format!(
+            "“{title}”{by} is an EP. It will go on Lidarr's list, and Lidarr will start looking for it. If Lidarr only lists {whose}'s albums so far, it will be set to list their singles and EPs too. None but this one is fetched, though ones they release from now on are treated as their new albums are."
+        ),
+        ("EP", false) => format!(
+            "“{song}” is on the EP “{title}”{by}. That EP will go on Lidarr's list, and Lidarr will start looking for it. If Lidarr only lists {whose}'s albums so far, it will be set to list their singles and EPs too. None but this one is fetched, though ones they release from now on are treated as their new albums are."
+        ),
+        (_, true) => format!("“{title}”{by} will go on Lidarr's list, and Lidarr will start looking for it. The whole album is fetched."),
+        (_, false) => format!("“{song}” is on “{title}”{by}. That album will go on Lidarr's list, and Lidarr will start looking for it. The whole album is fetched."),
+    };
+    // A soundtrack is another kind of release Lidarr has to be set to list.
+    let soundtrack = offered.as_ref().is_some_and(|offer| offer.soundtrack);
+    let text = if !soundtrack {
+        text
+    } else if offered.as_ref().is_some_and(|offer| offer.artist_id == crate::offer::VARIOUS) {
+        format!("{text} It's a soundtrack credited to various artists, so it goes on Lidarr's list under “Various Artists”.")
+    } else if kind == "Album" || kind.is_empty() {
+        format!("{text} It's a soundtrack. If Lidarr doesn't list {whose}'s soundtracks so far, it will be set to. None but this one is fetched.")
+    } else {
+        text.replace("their singles and EPs too", "their singles, EPs and soundtracks too")
+    };
+    let heading = match kind.as_str() {
+        "Single" => "Ask for this single?",
+        "EP" => "Ask for this EP?",
+        _ => "Ask for this album?",
+    };
+    Asking::Ask { heading: heading.into(), text }
+}
+
+/// What's said while an album is being asked for.
+pub fn asking_for(title: &str) -> String {
+    format!("Asking for “{title}”…")
+}
+
+/// Said of an album Lidarr had a record of and no longer has.
+pub const NO_LONGER_LISTED: &str = "Lidarr no longer lists that one.";
+
+/// Asks Lidarr for an album that's been offered: as remembered, or looked up afresh (from a
+/// page drawn in an earlier session). Gives who it's by, or why it couldn't be asked for.
+/// Once Lidarr has begun changing anything it runs to its end, or puts back what it changed
+/// (see `Lidarr::request`); a stop before then gives `Err(Stopped)`.
+pub fn request(lidarr: &Lidarr, offers: &Offers, album: &str) -> Result<Result<String, String>, Stopped> {
+    // Offered in this session, or (from a page drawn in an earlier one) looked up afresh.
+    let offer = match offers.offered(album) {
+        Some(offer) => Ok(offer),
+        None => match unless_stopped(lidarr.find_any(&format!("lidarr:{album}")))? {
+            Ok(found) => found.into_iter().find(|o| o.album == album).ok_or_else(|| NO_LONGER_LISTED.to_string()),
+            Err(reason) => Err(reason),
+        },
+    };
+    let Ok(offer) = offer else { return Ok(offer.map(|offer| offer.artist)) };
+    offers.remember(std::slice::from_ref(&offer));
+    Ok(unless_stopped(lidarr.request(&offer))?.map(|()| offer.artist))
+}
+
+/// Once Lidarr has an album on its list: notes it as asked for, to be followed up when it
+/// arrives (for the app to `asked::put` and keep), and marks it so among what's offered.
+pub fn asked_for(offers: &Offers, album: &str, title: &str, artist: &str, song: &str, now: i64) -> Asked {
+    offers.mark(album, true);
+    Asked { album: album.to_string(), title: title.to_string(), artist: artist.to_string(), at: now, song: song.to_string(), ..Default::default() }
+}
+
+/// What's said once it has been asked for.
+pub fn asked_sentence(title: &str) -> String {
+    format!("Asked for “{title}”. It'll be in your library once it arrives.")
+}
+
 /// "1 album", "3 albums": a number of things.
 pub fn count(n: usize, noun: &str) -> String {
     if n == 1 { format!("1 {noun}") } else { format!("{n} {noun}s") }
@@ -774,7 +866,7 @@ mod tests {
     }
 
     /// Asks `ask` of the stand-in, stopped from its `stop_after`th request on.
-    fn asking<T>(routes: &[(&'static str, &str)], stop_after: usize, ask: impl Fn(Services) -> T) -> (T, usize) {
+    fn served<T>(routes: &[(&'static str, &str)], stop_after: usize, ask: impl Fn(Services) -> T) -> (T, usize) {
         let routes = routes.iter().map(|(part, answer)| (*part, answer.to_string())).collect();
         let http = std::sync::Arc::new(Scripted { routes, stop_after, asked: Default::default() });
         let lidarr = Lidarr::new("http://lidarr.test", "key", None, http.clone());
@@ -795,11 +887,11 @@ mod tests {
 
     #[test]
     fn an_artists_page_says_what_they_have_made() {
-        let (found, _) = asking(MARROW_LAKE, usize::MAX, |services| artist(services, &snapshot(), &Offers::new(), true, "ml"));
+        let (found, _) = served(MARROW_LAKE, usize::MAX, |services| artist(services, &snapshot(), &Offers::new(), true, "ml"));
         let found = found.unwrap();
         assert_eq!((found.name.as_str(), found.about.as_str(), found.open), ("Marrow Lake", "1 album", 1));
         assert_eq!(found.albums.iter().chain(&found.smaller).map(|release| release.caption.as_str()).collect::<Vec<_>>(), ["2018", "2017 • EP"]);
-        let (popular, _) = asking(MARROW_LAKE, usize::MAX, |services| artist_popular(services, &snapshot(), &Offers::new(), true, &Vec::new, "ml", "Marrow Lake"));
+        let (popular, _) = served(MARROW_LAKE, usize::MAX, |services| artist_popular(services, &snapshot(), &Offers::new(), true, &Vec::new, "ml", "Marrow Lake"));
         let popular = popular.unwrap().unwrap();
         assert_eq!((popular.heading.as_str(), popular.songs.len()), ("Popular", 1));
     }
@@ -812,14 +904,14 @@ mod tests {
         fn popular(services: Services) -> Result<Option<Popular>, Stopped> {
             artist_popular(services, &snapshot(), &Offers::new(), true, &Vec::new, "ml", "Marrow Lake")
         }
-        let (_, all) = asking(MARROW_LAKE, usize::MAX, page);
+        let (_, all) = served(MARROW_LAKE, usize::MAX, page);
         for stop_after in 0..all {
-            assert_eq!(asking(MARROW_LAKE, stop_after, page).0, Err(Stopped), "stopped after {stop_after} of {all}");
+            assert_eq!(served(MARROW_LAKE, stop_after, page).0, Err(Stopped), "stopped after {stop_after} of {all}");
         }
-        let (_, all) = asking(MARROW_LAKE, usize::MAX, popular);
+        let (_, all) = served(MARROW_LAKE, usize::MAX, popular);
         assert!(all >= 2);
         for stop_after in 0..all {
-            assert_eq!(asking(MARROW_LAKE, stop_after, popular).0, Err(Stopped), "popular, stopped after {stop_after} of {all}");
+            assert_eq!(served(MARROW_LAKE, stop_after, popular).0, Err(Stopped), "popular, stopped after {stop_after} of {all}");
         }
     }
 
@@ -832,13 +924,62 @@ mod tests {
             ("album/lookup?term=lidarr%3Arg-9", r#"[{"title":"Nine","foreignAlbumId":"rg-9","albumType":"EP","releaseDate":"2019-01-01","artist":{"artistName":"Someone","foreignArtistId":"so"}}]"#),
             ("release?release-group=rg-9", r#"{"releases":[{"media":[{"position":1,"tracks":[{"title":"One","length":100000,"position":1}]}]}]}"#),
         ];
-        let (found, all) = asking(ROUTES, usize::MAX, page);
+        let (found, all) = served(ROUTES, usize::MAX, page);
         let Ok(AlbumPage::Found(found)) = found else { panic!("{found:?}") };
         assert_eq!((found.about.as_str(), found.action.as_str(), found.tracks.len()), ("2019 • 1 song • Not in your library", "Request EP", 1));
         assert_eq!(all, 2);
         for stop_after in 0..all {
-            assert_eq!(asking(ROUTES, stop_after, page).0, Err(Stopped), "stopped after {stop_after}");
+            assert_eq!(served(ROUTES, stop_after, page).0, Err(Stopped), "stopped after {stop_after}");
         }
-        assert_eq!(asking(&[], usize::MAX, page).0, Ok(AlbumPage::Unavailable(NOT_LISTED.into())));
+        assert_eq!(served(&[], usize::MAX, page).0, Ok(AlbumPage::Unavailable(NOT_LISTED.into())));
+    }
+
+    #[test]
+    fn asks_as_it_always_has() {
+        // Every question, as the Windows app put it before the words moved here.
+        let offers = Offers::new();
+        let offer = |album: &str, kind: &str, soundtrack: bool, artist_id: &str| Offer { album: album.into(), kind: kind.into(), soundtrack, artist_id: artist_id.into(), ..Default::default() };
+        offers.remember(&[
+            offer("asked", "", false, "a"),
+            offer("ost", "", true, "a"),
+            offer("ost-various", "", true, crate::offer::VARIOUS),
+            offer("ost-ep", "EP", true, "a"),
+            offer("lidarr-ep", "EP", false, "a"),
+        ]);
+        offers.mark("asked", true);
+        let ask = |album: &str, by: &str, song: &str, kind: &str| match asking(&offers, album, "Title", by, song, kind) {
+            Asking::Ask { heading, text } => format!("{heading} | {text}"),
+            Asking::Already(said) => said,
+        };
+        let more = "If Lidarr only lists Them's albums so far, it will be set to list their singles and EPs too. None but this one is fetched, though ones they release from now on are treated as their new albums are.";
+        assert_eq!(ask("asked", "Them", "", ""), "That one has already been asked for.");
+        assert_eq!(ask("x", "Them", "", "Single"), format!("Ask for this single? | “Title” by Them came out as a single. It will go on Lidarr's list, and Lidarr will start looking for it. {more}"));
+        assert_eq!(ask("x", "Them", "A Song", "Single"), format!("Ask for this single? | “Title” by Them came out as a single. It will go on Lidarr's list, and Lidarr will start looking for it. {more}"));
+        assert_eq!(ask("x", "Them", "", "EP"), format!("Ask for this EP? | “Title” by Them is an EP. It will go on Lidarr's list, and Lidarr will start looking for it. {more}"));
+        assert_eq!(ask("x", "Them", "A Song", "EP"), format!("Ask for this EP? | “A Song” is on the EP “Title” by Them. That EP will go on Lidarr's list, and Lidarr will start looking for it. {more}"));
+        assert_eq!(ask("x", "Them", "", ""), "Ask for this album? | “Title” by Them will go on Lidarr's list, and Lidarr will start looking for it. The whole album is fetched.");
+        assert_eq!(ask("x", "", "A Song", "Album"), "Ask for this album? | “A Song” is on “Title”. That album will go on Lidarr's list, and Lidarr will start looking for it. The whole album is fetched.");
+        // What kind it is, when the caller doesn't say: what Lidarr said.
+        assert_eq!(ask("lidarr-ep", "", "", ""), "Ask for this EP? | “Title” is an EP. It will go on Lidarr's list, and Lidarr will start looking for it. If Lidarr only lists the artist's albums so far, it will be set to list their singles and EPs too. None but this one is fetched, though ones they release from now on are treated as their new albums are.");
+        // Soundtracks.
+        assert_eq!(ask("ost", "Them", "", ""), "Ask for this album? | “Title” by Them will go on Lidarr's list, and Lidarr will start looking for it. The whole album is fetched. It's a soundtrack. If Lidarr doesn't list Them's soundtracks so far, it will be set to. None but this one is fetched.");
+        assert_eq!(ask("ost-various", "Various Artists", "", ""), "Ask for this album? | “Title” by Various Artists will go on Lidarr's list, and Lidarr will start looking for it. The whole album is fetched. It's a soundtrack credited to various artists, so it goes on Lidarr's list under “Various Artists”.");
+        assert_eq!(ask("ost-ep", "Them", "", ""), "Ask for this EP? | “Title” by Them is an EP. It will go on Lidarr's list, and Lidarr will start looking for it. If Lidarr only lists Them's albums so far, it will be set to list their singles, EPs and soundtracks too. None but this one is fetched, though ones they release from now on are treated as their new albums are.");
+        assert_eq!(asking_for("Title"), "Asking for “Title”…");
+        assert_eq!(asked_sentence("Title"), "Asked for “Title”. It'll be in your library once it arrives.");
+        let note = asked_for(&offers, "lidarr-ep", "Title", "Them", "A Song", 50);
+        assert_eq!((note.album.as_str(), note.title.as_str(), note.artist.as_str(), note.song.as_str(), note.at, note.arrived), ("lidarr-ep", "Title", "Them", "A Song", 50, 0));
+        assert!(offers.offered("lidarr-ep").unwrap().requested);
+    }
+
+    #[test]
+    fn asks_lidarr_for_what_was_offered_or_looks_it_up() {
+        fn ask(services: Services) -> Result<Result<String, String>, Stopped> {
+            request(services.lidarr, &Offers::new(), "rg-9")
+        }
+        // Not offered, and Lidarr no longer has it.
+        assert_eq!(served(&[("album/lookup", "[]")], usize::MAX, ask).0, Ok(Err(NO_LONGER_LISTED.to_string())));
+        // Stopped while it's looked up.
+        assert_eq!(served(&[("album/lookup", "[]")], 0, ask).0, Err(Stopped));
     }
 }

@@ -12,7 +12,7 @@
 use std::sync::{Arc, RwLock};
 
 pub use nexus_core::lidarr::{ArtistOffer, Lidarr, Offers, host, mask, tidy};
-pub use nexus_core::offer::{Offer, VARIOUS};
+pub use nexus_core::offer::Offer;
 
 /// Lidarr at `address`, asked over an agent of the app's own. `gate` is the sign-in in front
 /// of it, if there is one.
