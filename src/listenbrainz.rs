@@ -14,7 +14,14 @@ pub use nexus_core::listenbrainz::TopSong;
 
 pub(crate) fn service() -> &'static ListenBrainz {
     static SERVICE: OnceLock<ListenBrainz> = OnceLock::new();
-    SERVICE.get_or_init(|| ListenBrainz::new(Arc::new(crate::corehttp::Agent(crate::subsonic::make_agent_idle(Duration::from_secs(50))))))
+    SERVICE.get_or_init(|| {
+        // In the pinned tests, the stand-in (see `pins`): never the real service.
+        #[cfg(test)]
+        if crate::pins::entered() {
+            return ListenBrainz::new(crate::pins::world());
+        }
+        ListenBrainz::new(Arc::new(crate::corehttp::Agent(crate::subsonic::make_agent_idle(Duration::from_secs(50)))))
+    })
 }
 
 pub fn top_songs(artist: &str) -> Result<Vec<TopSong>, String> {

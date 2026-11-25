@@ -1,0 +1,227 @@
+{
+  "asked": [
+    "GET http://lidarr.test/api/v1/artist ",
+    "GET http://lidarr.test/api/v1/album?artistId=7 ",
+    "GET https://musicbrainz.org/ws/2/release-group?artist=sm7&type=album&limit=100&offset=0&inc=artist-credits&fmt=json ",
+    "GET https://api.listenbrainz.org/1/popularity/top-recordings-for-artist/sm7 "
+  ],
+  "stages": [
+    {
+      "about": "",
+      "action": "Add artist",
+      "album_numbers": false,
+      "artist_id": "sm7",
+      "can_play": false,
+      "context": "",
+      "cover": "",
+      "cover_round": true,
+      "disc_sections": false,
+      "empty": "",
+      "filter": 0,
+      "filters": [],
+      "grid": [],
+      "has_menu": false,
+      "label": "Artist",
+      "lead": [],
+      "liked_songs": false,
+      "meta": "3 albums",
+      "more": null,
+      "notice": "",
+      "notice_action": "",
+      "notice_other": "",
+      "offers": [],
+      "offers_first": false,
+      "offers_heading": "",
+      "offers_note": "",
+      "offers_route": "",
+      "offers_title": "",
+      "play": "Songs",
+      "playlist": null,
+      "request_ids": [],
+      "shelves": [],
+      "show_album": false,
+      "show_cover": false,
+      "show_number": false,
+      "song_notes": [],
+      "songs": [],
+      "sort": 0,
+      "sorts": [],
+      "star": null,
+      "starred": false,
+      "stats": [],
+      "subtitle": "",
+      "subtitle_route": "",
+      "tail": [
+        {
+          "cards": [
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-a2/front-250",
+              "id": "rg-a2",
+              "kind": "Request",
+              "subtitle": "2012 • Requested",
+              "title": "Wanted One"
+            },
+            {
+              "cover": "https://covers.test/a1.jpg",
+              "id": "rg-a1",
+              "kind": "Request",
+              "subtitle": "2010 • Arrived",
+              "title": "Arrived One"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-a3/front-250",
+              "id": "rg-a3",
+              "kind": "Request",
+              "subtitle": "",
+              "title": "Open One"
+            }
+          ],
+          "route": "",
+          "title": "Albums",
+          "wrap": true
+        },
+        {
+          "cards": [
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-a4/front-250",
+              "id": "rg-a4",
+              "kind": "Request",
+              "subtitle": "2013 • EP",
+              "title": "An EP"
+            }
+          ],
+          "route": "",
+          "title": "Singles and EPs",
+          "wrap": true
+        }
+      ],
+      "tiles": [],
+      "title": "Saltmarsh",
+      "tracks_route": "",
+      "tracks_title": ""
+    },
+    {
+      "about": "",
+      "action": "Add artist",
+      "album_numbers": false,
+      "artist_id": "sm7",
+      "can_play": false,
+      "context": "",
+      "cover": "",
+      "cover_round": true,
+      "disc_sections": false,
+      "empty": "",
+      "filter": 0,
+      "filters": [],
+      "grid": [],
+      "has_menu": false,
+      "label": "Artist",
+      "lead": [],
+      "liked_songs": false,
+      "meta": "3 albums",
+      "more": null,
+      "notice": "",
+      "notice_action": "",
+      "notice_other": "",
+      "offers": [
+        {
+          "about": "Open One • 2014",
+          "album": "rg-a3",
+          "album_title": "Open One",
+          "artist": "Saltmarsh",
+          "artist_id": "sm7",
+          "artist_name": "Saltmarsh",
+          "cover": "https://coverartarchive.org/release-group/rg-a3/front-250",
+          "kind": "",
+          "requested": false,
+          "seconds": 200,
+          "song": "",
+          "title": "First Song"
+        },
+        {
+          "about": "Arrived One • 2010",
+          "album": "rg-a1",
+          "album_title": "Arrived One",
+          "artist": "Saltmarsh",
+          "artist_id": "sm7",
+          "artist_name": "Saltmarsh",
+          "cover": "https://coverartarchive.org/release-group/rg-a1/front-250",
+          "kind": "",
+          "requested": false,
+          "seconds": 200,
+          "song": "",
+          "title": "Second Song"
+        }
+      ],
+      "offers_first": false,
+      "offers_heading": "Popular, and not in your library",
+      "offers_note": "",
+      "offers_route": "",
+      "offers_title": "",
+      "play": "Songs",
+      "playlist": null,
+      "request_ids": [],
+      "shelves": [],
+      "show_album": false,
+      "show_cover": false,
+      "show_number": false,
+      "song_notes": [],
+      "songs": [],
+      "sort": 0,
+      "sorts": [],
+      "star": null,
+      "starred": false,
+      "stats": [],
+      "subtitle": "",
+      "subtitle_route": "",
+      "tail": [
+        {
+          "cards": [
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-a2/front-250",
+              "id": "rg-a2",
+              "kind": "Request",
+              "subtitle": "2012 • Requested",
+              "title": "Wanted One"
+            },
+            {
+              "cover": "https://covers.test/a1.jpg",
+              "id": "rg-a1",
+              "kind": "Request",
+              "subtitle": "2010 • Arrived",
+              "title": "Arrived One"
+            },
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-a3/front-250",
+              "id": "rg-a3",
+              "kind": "Request",
+              "subtitle": "",
+              "title": "Open One"
+            }
+          ],
+          "route": "",
+          "title": "Albums",
+          "wrap": true
+        },
+        {
+          "cards": [
+            {
+              "cover": "https://coverartarchive.org/release-group/rg-a4/front-250",
+              "id": "rg-a4",
+              "kind": "Request",
+              "subtitle": "2013 • EP",
+              "title": "An EP"
+            }
+          ],
+          "route": "",
+          "title": "Singles and EPs",
+          "wrap": true
+        }
+      ],
+      "tiles": [],
+      "title": "Saltmarsh",
+      "tracks_route": "",
+      "tracks_title": ""
+    }
+  ]
+}

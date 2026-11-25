@@ -15,6 +15,11 @@ use crate::lidarr::Offer;
 pub(crate) fn service() -> &'static MusicBrainz {
     static SERVICE: OnceLock<MusicBrainz> = OnceLock::new();
     SERVICE.get_or_init(|| {
+        // In the pinned tests, the stand-in (see `pins`): never the real service.
+        #[cfg(test)]
+        if crate::pins::entered() {
+            return MusicBrainz::new(crate::pins::world(), crate::listenbrainz::service().clone());
+        }
         let agent = crate::subsonic::make_agent_idle(THEIR_IDLE);
         MusicBrainz::new(Arc::new(crate::corehttp::Agent(agent)), crate::listenbrainz::service().clone())
     })

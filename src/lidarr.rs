@@ -83,6 +83,17 @@ pub fn offered(album: &str) -> Option<Offer> {
     OFFERS.read().ok()?.as_ref()?.get(album).cloned()
 }
 
+/// Forgets everything offered, for a test that starts from nothing.
+#[cfg(test)]
+pub fn forget_offers() {
+    if let Ok(mut all) = OFFERS.write() {
+        *all = None;
+    }
+    if let Ok(mut all) = ARTISTS.write() {
+        *all = None;
+    }
+}
+
 /// Notes that an album has been asked for (or no longer is), so it's shown that way.
 pub fn mark(album: &str, requested: bool) {
     if let Ok(mut all) = OFFERS.write() {
