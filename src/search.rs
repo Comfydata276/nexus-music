@@ -233,6 +233,22 @@ static CURRENT: RwLock<Option<Arc<Index>>> = RwLock::new(None);
 /// Songs that are liked: the library's own word on it goes out of date as hearts are clicked.
 static LIKED: RwLock<Option<HashSet<String>>> = RwLock::new(None);
 
+/// The library as the requests pages ask it (see `nexus_core::requests::Library`), over the
+/// index as it is: nothing is copied or rebuilt to answer.
+impl nexus_core::requests::Library for Index {
+    fn albums(&self) -> Box<dyn Iterator<Item = nexus_core::requests::AlbumRef<'_>> + '_> {
+        Box::new(self.library.albums.iter().map(|album| nexus_core::requests::AlbumRef { id: &album.id, title: &album.title, artist: &album.subtitle, cover: &album.cover }))
+    }
+
+    fn songs(&self) -> Box<dyn Iterator<Item = nexus_core::requests::SongRef<'_>> + '_> {
+        Box::new(self.library.songs.iter().map(|song| nexus_core::requests::SongRef { title: &song.title, artist: song.artist_label() }))
+    }
+
+    fn artists(&self) -> Box<dyn Iterator<Item = &str> + '_> {
+        Box::new(self.library.artists.iter().map(|artist| artist.title.as_str()))
+    }
+}
+
 pub fn current() -> Option<Arc<Index>> {
     CURRENT.read().ok()?.clone()
 }

@@ -546,8 +546,11 @@ impl MusicBrainz {
             // that's played most is taken to be it.
             let mut wider = ask("NOT secondarytype:live", 100)?;
             let recordings: Vec<String> = wider.iter().flat_map(|song| song.recordings.iter().cloned()).collect();
-            if let Ok(counts) = self.listenbrainz.listens(&recordings) {
-                by_listens(&mut wider, &counts);
+            match self.listenbrainz.listens(&recordings) {
+                Ok(counts) => by_listens(&mut wider, &counts),
+                // Stopped is passed on; ListenBrainz not answering only leaves them unsorted.
+                Err(reason) if reason == STOPPED => return Err(reason),
+                Err(_) => {}
             }
             order(&mut wider);
             if wider.first().is_some_and(|song| song.artist_id == artist) {

@@ -8,7 +8,7 @@
 use std::sync::{Arc, OnceLock};
 
 use nexus_core::musicbrainz::{MusicBrainz, THEIR_IDLE};
-pub use nexus_core::musicbrainz::{SongOffer, TrackName, base, by_listens, cover, popular, same_words, words};
+pub use nexus_core::musicbrainz::{SongOffer, TrackName, base, cover, same_words, words};
 
 use crate::lidarr::Offer;
 
@@ -33,15 +33,6 @@ pub fn warm() {
     }
 }
 
-/// Looks for songs matching what was typed, each with the studio album it's on.
-pub fn find_songs(term: &str) -> Result<Vec<SongOffer>, String> {
-    service().find_songs(term, crate::lidarr::singles)
-}
-
-pub fn song_by(artist: &str, title: &str) -> Result<Vec<SongOffer>, String> {
-    service().song_by(artist, title)
-}
-
 /// An artist's studio albums, newest first, and what the artist is called.
 pub fn artist_albums(artist: &str) -> Result<(String, Vec<Offer>), String> {
     // Asked for as their page asks, so the one answer serves both.
@@ -50,10 +41,6 @@ pub fn artist_albums(artist: &str) -> Result<(String, Vec<Offer>), String> {
 
 pub fn artist_releases(artist: &str, singles: bool) -> Result<(String, Vec<Offer>), String> {
     service().artist_releases(artist, singles)
-}
-
-pub fn played_most(artist: &str, releases: &[Offer]) -> Result<Vec<crate::listenbrainz::TopSong>, String> {
-    service().played_most(artist, releases)
 }
 
 /// The songs on an album.
@@ -68,12 +55,12 @@ mod live {
     #[ignore]
     fn song_search() {
         let term = std::env::var("TERM_TYPED").unwrap_or_else(|_| "somebody that i used to know".into());
-        let mut found = super::find_songs(&term).unwrap();
+        let mut found = super::service().find_songs(&term, crate::lidarr::singles).unwrap();
         let recordings: Vec<String> = found.iter().flat_map(|song| song.recordings.iter().cloned()).collect();
-        let counts = crate::listenbrainz::listens(&recordings);
+        let counts = crate::listenbrainz::service().listens(&recordings);
         println!("{} songs, {} recordings, listens {:?}", found.len(), recordings.len(), counts.as_ref().map(|c| c.len()));
         if let Ok(counts) = counts {
-            super::by_listens(&mut found, &counts);
+            nexus_core::musicbrainz::by_listens(&mut found, &counts);
         }
         for song in found.iter().take(12) {
             println!("{} {} | {} | {} | {} {} {}", song.close, song.listens, song.title, song.artist, song.album_title, song.year, song.kind);
@@ -85,12 +72,12 @@ mod live {
     fn most_played_by_artist() {
         let artist = std::env::var("ARTIST_ID").unwrap_or_else(|_| "e42680f7-e439-4666-9c2c-536c2b3c6db3".into());
         let (name, releases) = super::artist_releases(&artist, true).unwrap();
-        let top = super::played_most(&artist, &releases).unwrap();
+        let top = super::service().played_most(&artist, &releases).unwrap();
         println!("{name}: {} releases, {} songs", releases.len(), top.len());
         for song in top.iter().take(12) {
             println!("{} | {} | {}", song.listens, song.title, song.album_title);
         }
-        for song in super::popular(&top, &releases, &artist, &name).iter().take(12) {
+        for song in nexus_core::musicbrainz::popular(&top, &releases, &artist, &name).iter().take(12) {
             println!("  -> {} | {} {} {}", song.title, song.album_title, song.year, song.kind);
         }
     }
@@ -100,7 +87,7 @@ mod live {
     fn song_by_artist() {
         let artist = std::env::var("ARTIST_ID").unwrap_or_else(|_| "6f6fd596-76e0-4b82-aa37-f558ac2d337b".into());
         let title = std::env::var("TITLE_TYPED").unwrap_or_else(|_| "Somebody That I Used to Know".into());
-        for song in super::song_by(&artist, &title).unwrap().iter().take(5) {
+        for song in super::service().song_by(&artist, &title).unwrap().iter().take(5) {
             println!("{} | {} | {} | {} {} {}", song.listens, song.title, song.artist, song.album_title, song.year, song.kind);
         }
     }

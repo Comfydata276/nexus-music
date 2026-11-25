@@ -643,3 +643,36 @@ fn artists_you_might_like() {
     log.sort();
     pinned_with("artists-you-might-like", &stages, log, false);
 }
+
+#[test]
+fn the_windows_library_answers_as_the_plain_lists_do() {
+    // The window's index and the plain lists the phone hands across, made from the same
+    // library, give the same answer to every question.
+    use nexus_core::requests::{Library as _, LibraryAlbum, Snapshot};
+    let albums = [("a1", "…Something to Be", "Rob Thomas"), ("a2", "Parachutes", "Coldplay"), ("a3", "Parachutes ", "coldplay"), ("a4", "X&Y", "Coldplay"), ("a5", "Beyoncé", "Beyoncé")];
+    let songs = [("s1", "Yellow (Live)", "Coldplay", ""), ("s2", "Lonely No More", "Rob Thomas", ""), ("s3", "Fix You", "Coldplay", "Coldplay & Friends"), ("s4", "Halo", "Beyonce", "")];
+    let artists = ["Coldplay", "Rob Thomas", "Beyoncé"];
+    let index = Index::new(Library {
+        albums: albums.iter().map(|(id, title, artist)| CardData { kind: Kind::Album, id: (*id).into(), title: (*title).into(), subtitle: (*artist).into(), cover: format!("al-{id}") }).collect(),
+        songs: songs.iter().map(|(id, title, artist, shown)| Song { id: (*id).into(), title: (*title).into(), artist: (*artist).into(), display_artist: (*shown).into(), ..Default::default() }).collect(),
+        artists: artists.iter().map(|name| CardData { kind: Kind::Artist, id: format!("ar-{name}"), title: (*name).into(), subtitle: String::new(), cover: String::new() }).collect(),
+        ..Default::default()
+    });
+    let snapshot = Snapshot {
+        albums: albums.iter().map(|(id, title, artist)| LibraryAlbum { id: (*id).into(), title: (*title).into(), artist: (*artist).into(), cover: format!("al-{id}") }).collect(),
+        songs: songs.iter().map(|(_, title, artist, shown)| ((*title).into(), if shown.is_empty() { (*artist).into() } else { (*shown).into() })).collect(),
+        artists: artists.iter().map(|name| (*name).into()).collect(),
+    };
+    assert_eq!(index.album_names(), snapshot.album_names());
+    assert_eq!(index.song_names(), snapshot.song_names());
+    assert_eq!(index.artist_names(), snapshot.artist_names());
+    for name in ["Coldplay", "coldplay", "Rob Thomas", "Beyonce", "Beyoncé", "Nobody", "", "Coldplay & Friends"] {
+        assert_eq!(index.songs_by(name), snapshot.songs_by(name), "songs by {name}");
+        assert_eq!(index.album_titles_by(name), snapshot.album_titles_by(name), "albums by {name}");
+        assert_eq!(index.albums_by(name), snapshot.albums_by(name), "albums by {name}");
+        for title in ["Parachutes", "...Something To Be", "x & y", "Beyonce", "Nothing"] {
+            assert_eq!(index.same_album(title, name), snapshot.same_album(title, name), "{title} by {name}");
+        }
+    }
+    assert!(!index.songs_by("Coldplay").is_empty() && index.same_album("Parachutes", "Coldplay").is_some());
+}

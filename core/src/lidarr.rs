@@ -37,6 +37,75 @@ pub trait SignIn: Send + Sync {
     fn forget_pass(&self);
 }
 
+/// What has been offered while a connection to Lidarr lasts: albums and artists by Lidarr's
+/// names for them, so that one clicked on can be acted on, and whether each album has been
+/// asked for. An app keeps one for as long as it's connected, and hands it to what offers
+/// and asks.
+pub struct Offers {
+    albums: std::sync::RwLock<Option<HashMap<String, Offer>>>,
+    artists: std::sync::RwLock<Option<HashMap<String, ArtistOffer>>>,
+}
+
+impl Default for Offers {
+    fn default() -> Offers {
+        Offers::new()
+    }
+}
+
+impl Offers {
+    pub const fn new() -> Offers {
+        Offers { albums: std::sync::RwLock::new(None), artists: std::sync::RwLock::new(None) }
+    }
+
+    pub fn remember_artists(&self, artists: &[ArtistOffer]) {
+        if let Ok(mut all) = self.artists.write() {
+            let all = all.get_or_insert_with(HashMap::new);
+            for artist in artists {
+                // A later mention without a picture doesn't replace one with.
+                if !artist.cover.is_empty() || !all.contains_key(&artist.id) {
+                    all.insert(artist.id.clone(), artist.clone());
+                }
+            }
+        }
+    }
+
+    pub fn offered_artist(&self, artist: &str) -> Option<ArtistOffer> {
+        self.artists.read().ok()?.as_ref()?.get(artist).cloned()
+    }
+
+    pub fn remember(&self, offers: &[Offer]) {
+        if let Ok(mut all) = self.albums.write() {
+            let all = all.get_or_insert_with(HashMap::new);
+            for offer in offers {
+                all.insert(offer.album.clone(), offer.clone());
+            }
+        }
+    }
+
+    pub fn offered(&self, album: &str) -> Option<Offer> {
+        self.albums.read().ok()?.as_ref()?.get(album).cloned()
+    }
+
+    /// Notes that an album has been asked for (or no longer is), so it's shown that way.
+    pub fn mark(&self, album: &str, requested: bool) {
+        if let Ok(mut all) = self.albums.write() {
+            if let Some(offer) = all.as_mut().and_then(|all| all.get_mut(album)) {
+                offer.requested = requested;
+            }
+        }
+    }
+
+    /// Forgets everything offered.
+    pub fn forget(&self) {
+        if let Ok(mut all) = self.albums.write() {
+            *all = None;
+        }
+        if let Ok(mut all) = self.artists.write() {
+            *all = None;
+        }
+    }
+}
+
 /// Said when Lidarr can't be reached without signing in.
 pub const NEEDED: &str = "Lidarr is behind a sign-in. In Settings, under Requests, sign in with your browser.";
 
