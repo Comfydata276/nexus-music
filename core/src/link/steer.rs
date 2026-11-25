@@ -225,7 +225,7 @@ mod tests {
     const PAUSE: Nonce = [9; 24];
 
     fn state(generation: u64, re: Nonce) -> Tell {
-        Tell { re: Some(re), ok: None, why: None, device: [7; 16], name: "Study PC".into(), at: At { generation, minute: 0 }, busy: false, by: None, playing: true, title: "Song".into(), artist: "Artist".into() }
+        Tell { re: Some(re), ok: None, why: None, device: [7; 16], name: "Study PC".into(), at: At { generation, minute: 0 }, busy: false, by: None, playing: true, title: "Song".into(), artist: "Artist".into(), steering: String::new(), full: None, queue: None }
     }
 
     /// A peer that has been looked at once, at `sent`, and answered with generation 5.

@@ -21,7 +21,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use nexus_core::link::frame::{self, ASK, Keys, TELL};
-use nexus_core::link::message::{Ask, At, Tell, Why, read_ask, read_tell};
+use nexus_core::link::message::{Ask, At, Command, Tell, Want, Why, read_ask, read_tell};
 use nexus_core::link::rule::{Reservation, Waiting};
 use nexus_core::link::secret::{self, Next, Secret, Stop, Verdict};
 use nexus_core::link::steer::{Outcome, Peer, Tick, Told, Wait};
@@ -897,6 +897,9 @@ impl Controller {
             playing: pb.playing && now.is_some(),
             title: now.map(|song| song.title.clone()).unwrap_or_default(),
             artist: now.map(|song| song.artist_label().to_string()).unwrap_or_default(),
+            steering: String::new(),
+            full: None,
+            queue: None,
         }
     }
 
@@ -956,8 +959,13 @@ impl Controller {
                 log(format!("ask from {who}: not one this version carries out"));
                 self.link_state(Some(nonce), Some(false), Some(Why::Invalid))
             }
-            Some(Ask::Look) => self.link_state(Some(nonce), None, None),
-            Some(Ask::Pause { at }) => {
+            Some(Ask::Look(_)) => self.link_state(Some(nonce), None, None),
+            // (The other commands are named, and not yet carried out here.)
+            Some(Ask::Do { command, .. }) if command != Command::Pause => {
+                log(format!("ask from {who}: {} is not carried out by this version", command.name()));
+                self.link_state(Some(nonce), Some(false), Some(Why::Invalid))
+            }
+            Some(Ask::Do { at, .. }) => {
                 // Checked as it arrives, before anything is done for it...
                 let admitted = self.link_rule.borrow_mut().admit(at, minute(now), now);
                 // (For a test only: the Pause is carried out a while after it is accepted,
@@ -1047,7 +1055,7 @@ impl Controller {
     /// Sends a look to a place. `checking` says it is the one look that asks what became of
     /// a command that has gone unanswered.
     fn link_look_at(&self, to: Place, checking: bool) {
-        let Some(nonce) = self.link_send(to, ASK, Ask::Look.text()) else { return };
+        let Some(nonce) = self.link_send(to, ASK, Ask::Look(Want::Brief).text()) else { return };
         let now = now_ms();
         let mut link = self.link.borrow_mut();
         if let Some(seen) = link.session.as_mut().and_then(|session| session.peers.get_mut(&to)) {
@@ -1105,7 +1113,7 @@ impl Controller {
                 return self.link_show();
             }
         };
-        let Some(nonce) = self.link_send(to, ASK, Ask::Pause { at }.text()) else { return };
+        let Some(nonce) = self.link_send(to, ASK, Ask::Do { command: Command::Pause, at }.text()) else { return };
         log(format!("pause: asked {name}, against generation {} in minute {}", at.generation, at.minute));
         let mut link = self.link.borrow_mut();
         link.note = format!("Asked {name} to pause…");

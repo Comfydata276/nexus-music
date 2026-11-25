@@ -30,21 +30,16 @@ use super::{Nonce, Place, text};
 pub const ASK: u8 = 1;
 pub const TELL: u8 = 2;
 
-/// The most an ask may be, and a tell, in bytes of message. (The first slice's: a look, a
-/// Pause, and a brief state.)
-pub const MOST_ASK: usize = 256;
-pub const MOST_TELL: usize = 4096;
+/// The most a message may be, in bytes, of either kind: one `adopt`, or one state with a
+/// queue in it. What each message may be is narrower, and is [`super::message`]'s to say.
+pub use super::command::MOST_MESSAGE;
 
 const MAGIC: &[u8; 4] = b"NML4";
 const HEAD: usize = 4 + 1 + 24;
 const TAG: usize = 16;
 
 fn most(kind: u8) -> Option<usize> {
-    match kind {
-        ASK => Some(MOST_ASK),
-        TELL => Some(MOST_TELL),
-        _ => None,
-    }
+    matches!(kind, ASK | TELL).then_some(MOST_MESSAGE)
 }
 
 /// What is made from the secret: the key frames are sealed with, and the room's name at
@@ -114,7 +109,7 @@ pub struct Opened {
 /// dropped, and never answered.
 pub fn open(keys: &Keys, frame: &str, from: &Place, to: &Place) -> Option<Opened> {
     // Nothing longer than the longest frame there can be is even decoded.
-    if frame.len() > (HEAD + MOST_TELL + TAG).div_ceil(3) * 4 {
+    if frame.len() > (HEAD + MOST_MESSAGE + TAG).div_ceil(3) * 4 {
         return None;
     }
     let bytes = text::from_base64(frame)?;
@@ -235,13 +230,13 @@ mod tests {
     fn a_message_over_its_size_is_neither_sealed_nor_opened() {
         let keys = keys();
         let nonce = [9u8; 24];
-        assert!(seal(&keys, ASK, &nonce, &PC, &PHONE, &[b'x'; MOST_ASK]).is_some());
-        assert_eq!(seal(&keys, ASK, &nonce, &PC, &PHONE, &[b'x'; MOST_ASK + 1]), None);
-        assert_eq!(seal(&keys, TELL, &nonce, &PC, &PHONE, &[b'x'; MOST_TELL + 1]), None);
+        assert!(seal(&keys, ASK, &nonce, &PC, &PHONE, &vec![b'x'; MOST_MESSAGE]).is_some());
+        assert_eq!(seal(&keys, ASK, &nonce, &PC, &PHONE, &vec![b'x'; MOST_MESSAGE + 1]), None);
+        assert_eq!(seal(&keys, TELL, &nonce, &PC, &PHONE, &vec![b'x'; MOST_MESSAGE + 1]), None);
         assert_eq!(seal(&keys, 3, &nonce, &PC, &PHONE, b"x"), None);
         // An ask as long as a tell may be: sealed by a device that does not keep the rule, it
         // is refused by its length before it is refused by anything else.
-        let big = vec![b'x'; MOST_TELL];
+        let big = vec![b'x'; MOST_MESSAGE];
         let as_tell = seal(&keys, TELL, &nonce, &PC, &PHONE, &big).unwrap();
         assert!(open(&keys, &as_tell, &PC, &PHONE).is_some());
         let mut bytes = text::from_base64(&as_tell).unwrap();
