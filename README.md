@@ -225,6 +225,38 @@ with HTTPS. Three things matter there:
   proxy that gives up on a quiet request sooner than that needs its read timeout raised.
 - The `Authorization` header must be passed through to it.
 
+**The route for a person's own devices** (`JAM_LINK_LISTEN`; no released version uses it
+yet). It is served on a second port so that nothing done to it can slow a jam, and the proxy
+has to send it there:
+
+- **The rule.** Everything under `/api/link/` goes to the relay's second port; everything
+  else goes to the first, as now. In Nginx Proxy Manager: the proxy host, *Custom locations*,
+  *Add location*; location `/api/link/`, scheme `http`, the relay's address, the second port;
+  nothing in the location's own settings box.
+- **`JAM_TRUSTED_PROXY`** is the address the proxy connects to the relay from (its
+  container's address on the network they share). From that address, and no other, the relay
+  takes the caller to be the last address in `X-Forwarded-For`.
+- **Which address that is.** Nginx Proxy Manager writes one address there for a custom
+  location, the one it takes the caller to be; and it takes a caller's own word for that
+  (an `X-Real-IP` header) whenever the connection comes from a private range or from
+  Cloudflare or CloudFront:
+
+  | The device | Reaches the proxy from | The relay counts it as |
+  |---|---|---|
+  | On the home network, straight to the proxy | Its own private address | That address, or whatever `X-Real-IP` it chose to send |
+  | On mobile data, or anywhere else, through Cloudflare | A Cloudflare address | That Cloudflare address, which it shares with everyone else coming through Cloudflare; or whatever `X-Real-IP` it chose to send, which Cloudflare passes on and the proxy believes |
+  | From outside, not through Cloudflare | Its own public address | That address; an `X-Real-IP` it sends is ignored |
+
+  So behind Cloudflare the relay's limits for each address count Cloudflare, or a claim.
+  To have them count the real address, put `real_ip_header CF-Connecting-IP;` in the proxy
+  host's *Advanced* box: Cloudflare writes that header itself, over anything a caller sent.
+  The limits that do not go by address (for each place, for each room, and for the relay as
+  a whole) hold either way.
+
+  This is from Nginx Proxy Manager's own templates (`backend/templates/_location.conf` and
+  `docker/rootfs/etc/nginx/nginx.conf`, as they stood on 25 November 2026), not from any
+  running server.
+
 The app refuses a host link or jam link that starts with `http://` unless it points at your
 own network, since the key travels with every request.
 
