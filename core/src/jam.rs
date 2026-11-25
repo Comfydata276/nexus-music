@@ -122,6 +122,34 @@ pub fn answer(session: Session, owner: bool, guests_steer: bool, action: &str) -
     }
 }
 
+/// The guests a host has removed from the session it is hosting, by the id the relay gave
+/// each. **A guest who has been removed is no longer answered or obeyed**, whatever of
+/// theirs was under way: a song they asked for that was still being looked up when they
+/// were removed is not queued when it is found. (The relay stops taking their asks; this is
+/// for what it had already passed on.) The most lately removed are kept, and no more than
+/// a session could have.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Removed(Vec<String>);
+
+/// The most removed guests remembered for one session.
+const MOST_REMOVED: usize = 64;
+
+impl Removed {
+    pub fn add(&mut self, guest: &str) {
+        if guest.is_empty() || self.has(guest) {
+            return;
+        }
+        if self.0.len() >= MOST_REMOVED {
+            self.0.remove(0);
+        }
+        self.0.push(guest.to_string());
+    }
+
+    pub fn has(&self, guest: &str) -> bool {
+        !guest.is_empty() && self.0.iter().any(|removed| removed == guest)
+    }
+}
+
 /// Whether what came with an ask shows the owner word `word` (`None` when this device has
 /// none to compare with). Compared in full whatever differs, so the time taken says nothing.
 pub fn shows_owner(word: Option<&str>, data: &Value) -> bool {
@@ -132,6 +160,21 @@ pub fn shows_owner(word: Option<&str>, data: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_guest_who_has_been_removed_is_known_as_removed_and_the_list_has_a_bound() {
+        let mut removed = Removed::default();
+        assert!(!removed.has("g1") && !removed.has(""));
+        removed.add("g1");
+        removed.add("g1");
+        removed.add("");
+        assert!(removed.has("g1") && !removed.has("g2") && !removed.has("") && removed.0.len() == 1);
+        // More than a session could have: the earliest are forgotten, the latest kept.
+        for n in 0..1_000 {
+            removed.add(&format!("guest-{n}"));
+        }
+        assert!(removed.0.len() == MOST_REMOVED && removed.has("guest-999") && !removed.has("g1"));
+    }
 
     #[test]
     fn reads_host_links() {
