@@ -70,7 +70,8 @@ pub struct Asked {
 }
 
 /// An album that has turned up, with what's to be done about it.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Arrival {
     /// Its place among what's been asked for.
     pub place: usize,

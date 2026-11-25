@@ -67,7 +67,8 @@ fn unreachable(failure: Failure) -> String {
 }
 
 /// A song that isn't in the library, and the album it could be had on.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct SongOffer {
     pub title: String,
     pub artist: String,
@@ -90,7 +91,8 @@ pub struct SongOffer {
 }
 
 /// A song on an album, by name only.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct TrackName {
     pub title: String,
     pub seconds: u32,

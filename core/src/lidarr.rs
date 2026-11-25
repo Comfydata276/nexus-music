@@ -49,7 +49,8 @@ const SINGLES_PROFILE: &str = "Albums, EPs and singles";
 const SOUNDTRACKS_PROFILE: &str = "Albums, EPs, singles and soundtracks";
 
 /// An artist Lidarr knows of.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct ArtistOffer {
     /// Lidarr's name for the artist (a MusicBrainz id).
     pub id: String,
@@ -62,7 +63,8 @@ pub struct ArtistOffer {
 
 /// A song that was put out on its own, as Lidarr knows it. Not something that can be asked
 /// for, but it says whose a well-known song is.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Single {
     pub title: String,
     pub artist_id: String,
@@ -71,7 +73,8 @@ pub struct Single {
 }
 
 /// An album on Lidarr's list that hasn't fully arrived.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Pending {
     /// Lidarr's own number for the album.
     pub id: i64,
@@ -150,7 +153,8 @@ const PAGE: usize = 500;
 const PAGES: usize = 100;
 
 /// A release Lidarr lists for an artist it keeps track of.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Listed {
     /// Its MusicBrainz id, and Lidarr's own number for it.
     pub album: String,

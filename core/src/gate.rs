@@ -26,7 +26,8 @@ pub const CLIENT: &str = "nexus-music";
 const UNKNOWN: &str = "Lidarr is behind a sign-in this app doesn't know how to use.";
 
 /// Where the sign-in service is, and the name it knows the sign-in in front of Lidarr by.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Found {
     /// E.g. "https://auth.example.org".
     pub service: String,
@@ -262,6 +263,8 @@ pub fn give_up_token(http: &dyn Http, service: &str, token: &str) {
 // ---- finishing a sign-in --------------------------------------------------------------------------
 
 /// What a finished sign-in leaves behind.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct SignedIn {
     /// The token to keep.
     pub token: String,
