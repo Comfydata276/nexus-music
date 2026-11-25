@@ -1395,7 +1395,7 @@ impl Controller {
             let settings = self.settings.borrow();
             let key = config::load_secret(&self.paths, "lidarr-key");
             match (settings.requests && !settings.lidarr_address.trim().is_empty(), key) {
-                (true, Some(key)) => Some(crate::lidarr::Lidarr::new(&settings.lidarr_address, &key, self.gate_session(&settings))),
+                (true, Some(key)) => Some(crate::lidarr::open(&settings.lidarr_address, &key, self.gate_session(&settings))),
                 _ => None,
             }
         };
@@ -1422,7 +1422,7 @@ impl Controller {
 
     fn new_gate(&self, found: crate::gate::Found, token: String) -> crate::gate::Session {
         let paths = self.paths.clone();
-        crate::gate::Session::new(found, token, move |token| config::save_secret(&paths, "lidarr-token", token))
+        crate::gate::session(found, token, move |token| config::save_secret(&paths, "lidarr-token", token))
     }
 
     /// Shows where the connection to Lidarr stands: `state` picks the marker and the one

@@ -4,76 +4,19 @@
 //! was asked, the album would just turn up in the library one day. With one, the app can say
 //! it's arrived, name the song that was wanted from it, and put the songs a playlist was
 //! missing into that playlist.
+//!
+//! The list and its rules are in the library (`nexus_core::asked`), for the Android app to
+//! use too. This is the Windows app's end: the file the list is kept in, the copy the other
+//! threads read, and the library copy arrivals are looked for in.
 
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
-use serde::{Deserialize, Serialize};
-
-use crate::import::{Matcher, Wanted};
+use crate::import::Matcher;
 use crate::musicbrainz::same_words;
 use crate::search::Index;
 
-/// How long an arrival stays listed on the Requests page.
-const SHOWN_FOR: i64 = 14 * 24 * 3600;
-/// How long to go on watching for something that never arrives.
-const GIVEN_UP_AFTER: i64 = 180 * 24 * 3600;
-/// How long after an album arrives to go on trying to get its songs into the playlists that
-/// were waiting for them. An album can show up in the library before all its songs have,
-/// and a playlist can fail to save.
-const FILLED_WITHIN: i64 = 3 * 24 * 3600;
-
-/// A song a playlist is missing, to be put in once its album arrives.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Fill {
-    /// The playlist it belongs in: its id if it exists, and its name either way.
-    pub playlist: String,
-    pub playlist_name: String,
-    pub title: String,
-    pub artists: Vec<String>,
-    pub seconds: u32,
-    /// When it was added to the playlist it came from, in seconds since 1970; 0 if unknown.
-    pub added: i64,
-}
-
-/// One album that was asked for.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Asked {
-    /// Lidarr's name for the album; may be empty.
-    pub album: String,
-    pub title: String,
-    pub artist: String,
-    /// When it was asked for.
-    pub at: i64,
-    /// The song that led to it, if it was asked for from a song.
-    pub song: String,
-    pub fills: Vec<Fill>,
-    /// When it turned up in the library (0 until then), and what the library calls it.
-    pub arrived: i64,
-    pub library_album: String,
-    pub cover: String,
-    /// It has arrived, but not all the songs playlists were waiting for are in them yet.
-    pub unfilled: bool,
-}
-
-/// An album that has turned up, with what's to be done about it.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct Arrival {
-    /// Its place among what's been asked for.
-    pub place: usize,
-    pub library_album: String,
-    pub cover: String,
-    /// Songs to put into playlists: the playlist (id, name), the song's id, and when it was
-    /// added where it came from.
-    pub fills: Vec<(String, String, String, i64)>,
-    /// How many songs its playlists are waiting for that aren't in the library yet.
-    pub missing: usize,
-    /// When it was asked for and by what title: what tells it apart once places have moved.
-    pub at: i64,
-    pub title: String,
-}
+pub use nexus_core::asked::{Arrival, Asked, Fill};
 
 pub struct AskedList {
     path: PathBuf,
@@ -111,7 +54,7 @@ impl AskedList {
     /// Notes something asked for. Asking again for the same album adds to the note that's
     /// there: more songs for playlists, or the song that's wanted from it.
     pub fn add(&mut self, asked: Asked) {
-        self.put(asked);
+        nexus_core::asked::put(&mut self.items, asked);
         self.save();
     }
 
@@ -121,38 +64,14 @@ impl AskedList {
             return;
         }
         for one in asked {
-            self.put(one);
+            nexus_core::asked::put(&mut self.items, one);
         }
         self.save();
     }
 
-    fn put(&mut self, asked: Asked) {
-        let same = |other: &Asked| {
-            other.arrived == 0 && ((!asked.album.is_empty() && other.album == asked.album) || (same_words(&other.title, &asked.title) && same_artist(&other.artist, &asked.artist)))
-        };
-        match self.items.iter_mut().find(|other| same(other)) {
-            Some(known) => {
-                if known.song.is_empty() {
-                    known.song = asked.song;
-                }
-                if known.album.is_empty() {
-                    known.album = asked.album;
-                }
-                for fill in asked.fills {
-                    if !known.fills.contains(&fill) {
-                        known.fills.push(fill);
-                    }
-                }
-            }
-            None => self.items.push(asked),
-        }
-    }
-
     /// Stops watching for an album that's been taken off Lidarr's list.
     pub fn forget(&mut self, title: &str) {
-        let before = self.items.len();
-        self.items.retain(|asked| asked.arrived != 0 || !same_words(&asked.title, title));
-        if self.items.len() != before {
+        if nexus_core::asked::forget(&mut self.items, title) {
             self.save();
         }
     }
@@ -160,39 +79,27 @@ impl AskedList {
     /// Whether anything asked for is still on its way, or has songs still to go into
     /// playlists.
     pub fn waiting(&self) -> bool {
-        self.items.iter().any(|asked| asked.arrived == 0 || asked.unfilled)
+        nexus_core::asked::waiting(&self.items)
     }
 
     /// Notes how getting an arrival's songs into its playlists went: done unless some of them
     /// still aren't in the library.
     pub fn filled(&mut self, at: i64, title: &str, missing: usize) {
-        if let Some(asked) = self.items.iter_mut().find(|asked| asked.at == at && asked.title == title && asked.arrived != 0) {
-            asked.unfilled = missing > 0;
+        if nexus_core::asked::filled(&mut self.items, at, title, missing) {
             self.save();
         }
     }
 
     /// Drops what's been listed long enough, and what's been waited for too long.
     pub fn tidy(&mut self, now: i64) {
-        let before = self.items.len();
-        self.items.retain(|asked| if asked.arrived != 0 { now - asked.arrived < SHOWN_FOR } else { now - asked.at < GIVEN_UP_AFTER });
-        if self.items.len() != before {
+        if nexus_core::asked::tidy(&mut self.items, now) {
             self.save();
         }
     }
 
     /// Marks arrivals as such.
     pub fn mark(&mut self, arrivals: &[Arrival], now: i64) {
-        for arrival in arrivals {
-            let Some(asked) = self.items.get_mut(arrival.place) else { continue };
-            if asked.arrived == 0 {
-                asked.arrived = now;
-                asked.library_album = arrival.library_album.clone();
-                asked.cover = arrival.cover.clone();
-            }
-            // Until its songs are known to be in their playlists (see `filled`).
-            asked.unfilled = !arrival.fills.is_empty() || arrival.missing > 0;
-        }
+        nexus_core::asked::mark(&mut self.items, arrivals, now);
         self.save();
     }
 }
@@ -203,38 +110,26 @@ pub(crate) use nexus_core::text::same_artist;
 /// ones that arrived lately with songs still to go into playlists. For each that's there
 /// now, finds the songs its playlists were missing.
 pub fn arrivals(index: &Index, asked: &[Asked], now: i64) -> Vec<Arrival> {
-    let due = |asked: &Asked| asked.arrived == 0 || (asked.unfilled && now - asked.arrived < FILLED_WITHIN);
-    let awaited: Vec<(usize, &Asked)> = asked.iter().enumerate().filter(|(_, asked)| due(asked)).collect();
-    if awaited.is_empty() {
+    if !asked.iter().any(|asked| nexus_core::asked::due(asked, now)) {
         return Vec::new();
     }
     let matcher = Matcher::new(index);
-    awaited
-        .into_iter()
-        .filter_map(|(place, asked)| {
-            // The library's albums carry their artist as the line beneath the title.
-            let album = index.library.albums.iter().find(|album| same_words(&album.title, &asked.title) && same_artist(&album.subtitle, &asked.artist))?;
-            let fills: Vec<(String, String, String, i64)> = asked
-                .fills
-                .iter()
-                .filter_map(|fill| {
-                    let wanted = Wanted { title: fill.title.clone(), artists: fill.artists.clone(), album: asked.title.clone(), seconds: fill.seconds, added: fill.added };
-                    let song = matcher.find(&wanted)?;
-                    Some((fill.playlist.clone(), fill.playlist_name.clone(), song.id.clone(), fill.added))
-                })
-                .collect();
-            let missing = asked.fills.len() - fills.len();
-            // One that arrived before and still has nothing to add is no news.
-            if asked.arrived != 0 && fills.is_empty() {
-                return None;
-            }
-            Some(Arrival { place, library_album: album.id.clone(), cover: album.cover.clone(), fills, missing, at: asked.at, title: asked.title.clone() })
-        })
-        .collect()
+    nexus_core::asked::arrivals(
+        asked,
+        now,
+        // The library's albums carry their artist as the line beneath the title.
+        |title, artist| {
+            let album = index.library.albums.iter().find(|album| same_words(&album.title, title) && same_artist(&album.subtitle, artist))?;
+            Some((album.id.clone(), album.cover.clone()))
+        },
+        |wanted| matcher.find(wanted).map(|song| song.id.clone()),
+    )
 }
 
 #[cfg(test)]
 mod tests {
+    use nexus_core::asked::{FILLED_WITHIN, SHOWN_FOR};
+
     use super::*;
     use crate::pages::{CardData, Kind};
     use crate::search::Library;

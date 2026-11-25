@@ -11,17 +11,7 @@ use std::path::PathBuf;
 use crate::search::{Index, fold, slips};
 use crate::subsonic::Song;
 
-/// A song a playlist asks for.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct Wanted {
-    pub title: String,
-    pub artists: Vec<String>,
-    pub album: String,
-    /// Its length in seconds; 0 if the file doesn't say.
-    pub seconds: u32,
-    /// When it was added to the playlist, in seconds since 1970; 0 if the file doesn't say.
-    pub added: i64,
-}
+pub use nexus_core::asked::Wanted;
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct WantedList {

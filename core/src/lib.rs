@@ -8,10 +8,15 @@
 #![forbid(unsafe_code)]
 
 pub mod address;
+pub mod asked;
+pub mod bulk;
+pub mod discover;
+pub mod gate;
 pub mod handover;
 pub mod http;
 pub mod jam;
 pub mod levelling;
+pub mod lidarr;
 pub mod link;
 pub mod listenbrainz;
 pub mod model;

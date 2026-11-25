@@ -21,5 +21,7 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 # an app hands the random bytes in.
 chacha20poly1305 = { version = "=0.10.1", default-features = false, features = ["alloc"] }
 hkdf = "=0.13.0"
-sha2 = "0.11"
 zeroize = "1.8"
+# The check sent ahead of the secret in a browser sign-in (see src/gate.rs), and the key
+# for linking devices. The app carries the same version already.
+sha2 = "0.11"

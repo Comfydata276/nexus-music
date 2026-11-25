@@ -5,7 +5,7 @@
 //! the same connections, name lookups, timeouts, certificates and User-Agent as every other
 //! request the app makes.
 
-use nexus_core::http::{Failure, Http, Method, Request, Response};
+use nexus_core::http::{BODY_LIMIT, Failure, Http, Method, Request, Response, Stream};
 
 pub struct Agent(pub ureq::Agent);
 
@@ -43,8 +43,24 @@ impl Http for Agent {
         // The body is read only if the library asks for it, and then as the app has always
         // read one. An answer the library judges by its status is not waited on: nothing
         // limits how long a body may take, and a body nobody asks for is dropped unread.
-        let mut body = response.into_body();
-        Ok(Response::new(status, headers, move || body.read_to_string().map_err(|e| e.to_string())))
+        Ok(Response::streamed(status, headers, Body(response.into_body())))
+    }
+}
+
+/// An answer's body, unread.
+struct Body(ureq::Body);
+
+impl Stream for Body {
+    fn length(&self) -> Option<u64> {
+        self.0.content_length()
+    }
+
+    fn text(mut self: Box<Self>) -> Result<String, String> {
+        self.0.read_to_string().map_err(|e| e.to_string())
+    }
+
+    fn bytes(self: Box<Self>) -> Box<dyn std::io::Read + Send> {
+        Box::new(self.0.into_with_config().limit(BODY_LIMIT).reader())
     }
 }
 
@@ -166,5 +182,53 @@ mod tests {
         assert_eq!(service.album_tracks("an-album"), Ok(Vec::new()));
         let waits = http.waits.lock().unwrap().clone();
         assert!(waits.len() == 1 && waits[0] <= Duration::from_secs(2) && waits[0] > Duration::from_millis(1500), "{waits:?}");
+    }
+
+    #[test]
+    fn json_is_read_as_ureq_reads_it() {
+        // The same answers read by ureq's own read_json, as the app read JSON before the
+        // library did, and by the library through the app's agent: the same outcome each time.
+        #[derive(serde::Deserialize, Default, Debug, PartialEq)]
+        #[serde(default)]
+        struct Person {
+            preferred_username: String,
+            name: String,
+        }
+        let length = |kind: &str, body: &[u8]| {
+            let mut answer = format!("HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).into_bytes();
+            answer.extend_from_slice(body);
+            answer
+        };
+        let chunked = |kind: &str, body: &[u8]| {
+            let mut answer = format!("HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n", body.len()).into_bytes();
+            answer.extend_from_slice(body);
+            answer.extend_from_slice(b"\r\n0\r\n\r\n");
+            answer
+        };
+        let cases: Vec<Vec<u8>> = vec![
+            length("application/json", br#"{"preferred_username":"someone","name":"Some One"}"#),
+            chunked("application/json", br#"{"name":"Some One"}"#),
+            length("application/json", b"{\"sub\":\"\xff\",\"preferred_username\":\"someone\"}"),
+            chunked("text/plain", b"{\"sub\":\"\xff\",\"preferred_username\":\"someone\"}"),
+            length("text/plain", b"{\"preferred_username\":\"some\xffone\"}"),
+            chunked("application/json", b"{\"preferred_username\":\"some\xffone\"}"),
+            length("text/html", b"<html>not this</html>"),
+            chunked("text/html", b"<html>not this</html>"),
+            length("application/json", b"{\"name\":\"x\"} trailing"),
+            length("application/json; charset=iso-8859-1", b"{\"name\":\"Ren\xe9\"}"),
+            length("application/json", b"\xef\xbb\xbf{\"name\":\"x\"}"),
+            length("application/json", b""),
+        ];
+        for case in cases {
+            let answer = Arc::new(case);
+            let sent = answer.clone();
+            let address = fake::server(move |_, _, stream| {
+                let _ = stream.write_all(&sent);
+            });
+            let agent = crate::subsonic::make_agent_without_redirects();
+            let theirs: Option<Person> = agent.get(&address).call().unwrap().into_body().read_json().ok();
+            let ours: Option<Person> = Agent(agent).send(&Request::get(&address)).unwrap().json().ok();
+            assert_eq!(ours, theirs, "for {:?}", String::from_utf8_lossy(&answer));
+        }
     }
 }

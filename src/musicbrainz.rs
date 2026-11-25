@@ -12,7 +12,7 @@ pub use nexus_core::musicbrainz::{SongOffer, TrackName, base, by_listens, cover,
 
 use crate::lidarr::Offer;
 
-fn service() -> &'static MusicBrainz {
+pub(crate) fn service() -> &'static MusicBrainz {
     static SERVICE: OnceLock<MusicBrainz> = OnceLock::new();
     SERVICE.get_or_init(|| {
         let agent = crate::subsonic::make_agent_idle(THEIR_IDLE);
@@ -35,10 +35,6 @@ pub fn find_songs(term: &str) -> Result<Vec<SongOffer>, String> {
 
 pub fn song_by(artist: &str, title: &str) -> Result<Vec<SongOffer>, String> {
     service().song_by(artist, title)
-}
-
-pub fn release_with(artist: &str, title: &str, album: &str, singles: bool) -> Result<Option<String>, String> {
-    service().release_with(artist, title, album, singles)
 }
 
 /// An artist's studio albums, newest first, and what the artist is called.
