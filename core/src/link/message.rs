@@ -223,8 +223,11 @@ impl Full {
     pub fn fitted(position: f64, now: Option<Entry>, coming: impl Iterator<Item = Entry>, context: &str, shuffle: bool, repeat: u8, volume: f64) -> Full {
         let (mut queue, mut used, mut more) = (Vec::new(), 0usize, 0u64);
         for entry in coming {
-            let cost = entry.value().to_string().len() + 1;
-            if more > 0 || queue.len() >= MOST_SHOWN || used + cost > MOST_SHOWN_BYTES {
+            // (Once no more fit, the rest are only counted: what one would have cost is
+            // not worked out for a queue of thousands.)
+            let fits = more == 0 && queue.len() < MOST_SHOWN;
+            let cost = if fits { entry.value().to_string().len() + 1 } else { 0 };
+            if !fits || used + cost > MOST_SHOWN_BYTES {
                 more += 1;
                 continue;
             }

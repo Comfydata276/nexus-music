@@ -26,11 +26,6 @@ struct Fake {
     rolled: bool,
     /// What is playing is a radio station: there is nowhere in it to seek to.
     radio: bool,
-    /// The player is on another thread: it carries a command out when it comes to it
-    /// (`Fake::carry`, then `Device::carried`), not when it is asked.
-    in_its_own_time: bool,
-    asked_later: Option<(Command, Ready)>,
-    given_up: usize,
     /// What was carried out for other devices, in order.
     did: Vec<String>,
 }
@@ -86,16 +81,8 @@ impl Player for Fake {
     fn ahead(&self) -> Vec<String> {
         self.queue.iter().skip(self.cursor + 1).cloned().collect()
     }
-    fn carry_out(&mut self, command: &Command, ready: &Ready) -> Carried {
-        if self.in_its_own_time {
-            self.asked_later = Some((command.clone(), ready.clone()));
-            return Carried::Later;
-        }
-        if self.carry(command, ready) { Carried::Changed } else { Carried::Unchanged }
-    }
-    fn give_up(&mut self) {
-        self.asked_later = None;
-        self.given_up += 1;
+    fn carry_out(&mut self, command: &Command, ready: &Ready) -> bool {
+        self.carry(command, ready)
     }
     fn pause(&mut self) {
         self.rule.moved();
@@ -138,13 +125,6 @@ impl Player for Fake {
 }
 
 impl Fake {
-    /// The player, in its own time, comes to what it was asked to carry out: says whether
-    /// it changed anything, or `None` if it was asked nothing (or told to give it up).
-    fn comes_to_it(&mut self) -> Option<bool> {
-        let (command, ready) = self.asked_later.take()?;
-        Some(self.carry(&command, &ready))
-    }
-
     /// Does what a command says, as the same press would, and says whether it changed
     /// anything.
     fn carry(&mut self, command: &Command, ready: &Ready) -> bool {
@@ -929,77 +909,6 @@ fn a_command_the_player_did_not_carry_out_is_not_answered_as_done() {
         read_tell(&opened.message).filter(|tell| tell.re.is_some() && tell.ok.is_some())
     });
     assert_eq!(answer.map(|tell| (tell.ok, tell.why, tell.by)), Some((Some(true), Some(Why::Nothing), None)));
-}
-
-/// A player that cannot be asked directly (the phone's: another thread, another language)
-/// is asked, and says what came of it when it has come to it. Until then nobody is
-/// answered and the device is busy with the command; and it is not waited on for ever.
-#[test]
-fn a_player_that_carries_out_in_its_own_time_is_waited_for_and_not_for_long() {
-    let asked = |name: &str| {
-        let mut world = steering(name);
-        world.copies[B].player.in_its_own_time = true;
-        let before = world.copies[B].player.rule.generation();
-        world.ask(name);
-        let b = &world.copies[B];
-        assert!(world.last(B, &format!("{name} from")).ends_with("let through, the player is asked"), "{:?}", b.log);
-        assert!(b.player.rule.busy(world.now) && b.player.rule.generation() == before && b.player.did.is_empty());
-        assert!(world.log(A, "outcome of").is_empty());
-        (world, before)
-    };
-    let comes_to_it = |world: &mut World| {
-        let changed = world.copies[B].player.comes_to_it();
-        if let Some(changed) = changed {
-            let did = world.with(B, |device, env| device.carried(changed, env));
-            world.act(B, did);
-        }
-        changed
-    };
-    // It comes to it, and it changed something: carried out, counted once, answered then.
-    let (mut world, before) = asked("next");
-    assert_eq!(comes_to_it(&mut world), Some(true));
-    assert!(world.last(B, "next from").ends_with("carried out") && world.last(A, "outcome of").ends_with("Done"));
-    assert_eq!((world.copies[B].player.rule.generation(), world.copies[B].player.rule.busy(world.now), world.copies[B].player.given_up), (before + 1, false, 0));
-    // It comes to it, and there was nothing to do.
-    let (mut world, before) = asked("play");
-    world.copies[B].player.playing = true;
-    assert_eq!(comes_to_it(&mut world), Some(false));
-    assert!(world.last(B, "play from").ends_with("nothing to do, it was so already"));
-    assert_eq!((world.copies[B].player.rule.generation(), world.copies[B].player.rule.busy(world.now)), (before, false));
-    // It never comes to it: at two seconds it is told not to, its sender is told it took
-    // too long, and the device is free. Nothing moved.
-    let (mut world, before) = asked("next");
-    world.pass(CARRY_MS - 250);
-    assert!(world.copies[B].player.rule.busy(world.now) && world.copies[B].player.given_up == 0);
-    world.pass(500);
-    let b = &world.copies[B].player;
-    assert!(world.last(B, "next from").contains("refused, Late"), "{:?}", world.copies[B].log);
-    assert_eq!((b.given_up, b.asked_later.is_none(), b.rule.busy(world.now), b.rule.generation(), b.did.len()), (1, true, false, before, 0));
-    assert_eq!(world.copies[A].said.last().map(String::as_str), Some("That took too long to reach Copy B. Nothing was done."));
-    assert_eq!(comes_to_it(&mut world), None);
-    // Something is chosen at the device before its player has come to the command: the
-    // command was made against a state that is gone, and is given up as changed.
-    let (mut world, before) = asked("next");
-    world.copies[B].player.own_next();
-    let did = world.with(B, |device, env| device.overtaken(env));
-    world.act(B, did);
-    let b = &world.copies[B].player;
-    assert!(world.last(B, "next from").contains("refused, Changed"));
-    assert_eq!((b.given_up, b.rule.busy(world.now), b.rule.generation(), b.cursor), (1, false, before + 1, 1));
-    assert_eq!(world.copies[A].said.last().map(String::as_str), Some("Copy B changed before that reached it. Nothing was done."));
-    // The session ends while the player has it: given up, and nobody is answered.
-    let (mut world, _) = asked("next");
-    world.looked(B, Looked::Secret { secret: secret(8), id: "k".into(), wrote: None }, false);
-    assert_eq!((world.copies[B].player.given_up, world.copies[B].player.rule.busy(world.now)), (1, false));
-    assert_eq!(world.log(B, "the session ended while the player was asked, given up").len(), 1);
-    assert!(world.with(B, |device, env| device.carried(true, env)).is_empty());
-    // A queue to take over: it is answered when it sounds, as with a player asked directly,
-    // counted from when the player says it has it.
-    let mut world = giving(|world| world.copies[B].player.in_its_own_time = true);
-    assert!(world.copies[A].player.playing && world.copies[B].player.queue.len() == 8);
-    assert_eq!(comes_to_it(&mut world), Some(true));
-    world.pass(1_000);
-    assert_eq!((said(&world), world.copies[A].player.playing, world.copies[B].player.playing), ("Playing on Copy B.", false, true));
 }
 
 #[test]
