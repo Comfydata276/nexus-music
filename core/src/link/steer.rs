@@ -12,17 +12,27 @@
 //! state's age is counted from when its look was **sent**, not from when the answer
 //! came. An answer to an older look never replaces the answer to a newer one.
 //!
-//! **A command** is sent only against a fresh state that is not busy, one at a time. Its
-//! answer settles it and nothing else: it never changes the state on the screen. After
+//! **A command** is sent only against a fresh state that is not busy, one at a time. A
+//! press made while one is unanswered waits ([`Peer::press`]), and is sent only once that
+//! one is answered "carried out", against the state in that answer ([`Peer::next`]). An
+//! answer settles its command and nothing else: it never changes the state on the screen. After
 //! [`WAIT_MS`](super::WAIT_MS) with no answer the device looks once ([`Tick::Check`]) and
 //! says what is true ([`Outcome`]). It never sends the command again by itself; and an
 //! answer that arrives after that is still believed.
 
+use super::command::Command;
 use super::message::{At, Tell, Why};
 use super::{FRESH_MS, Nonce, WAIT_MS};
 
 /// The most looks waited on at once for one device. An older one is forgotten.
 const MOST_LOOKS: usize = 4;
+/// The most presses that wait behind a command that has not been answered.
+pub const MOST_PRESSED: usize = 8;
+/// How many times a command whose work is still under way on the other device is asked
+/// after before the asking device stops waiting.
+const MOST_CHECKS: u32 = 4;
+/// News from a device prompts a look at it no more often than this.
+pub const NEWS_LOOK_MS: u64 = 1_000;
 
 /// What became of a command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,8 +56,21 @@ pub enum Wait {
     Look,
     /// The other device has accepted a choice and not carried it out: look again.
     Busy,
-    /// The last command has not been answered or given up on.
+    /// The last command has not been answered or given up on, and as many presses as are
+    /// kept are waiting behind it already.
     Unanswered,
+}
+
+/// What a press comes to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Press {
+    /// Send it now, made against this state, and say so with [`Peer::sent`].
+    Send(At),
+    /// It waits for the answer to the command that is out, and is handed back by
+    /// [`Peer::next`] if that answer is that it was carried out.
+    Waits,
+    /// It is not sent, and does not wait.
+    No(Wait),
 }
 
 /// What a tell that arrived came to.
@@ -81,22 +104,40 @@ pub struct Shown {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct Command {
+struct Sent {
     nonce: Nonce,
     at: At,
     sent_ms: u64,
+    /// When the wait for its answer is counted from: when it was sent, or the last time
+    /// the other device said its work was still under way.
+    waited_from: u64,
     /// The look that asks what became of it, and when that was sent.
     check: Option<(Nonce, u64)>,
+    checks: u32,
     outcome: Option<Outcome>,
     /// Its own answer has arrived. A second one is a repeat.
     answered: bool,
+}
+
+/// The state the next command may be made against: a fresh look's answer, or the answer
+/// that said the last command was carried out; and when it was asked for.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Base {
+    at: At,
+    busy: bool,
+    ms: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Peer {
     shown: Option<Shown>,
     looks: Vec<(Nonce, u64)>,
-    command: Option<Command>,
+    command: Option<Sent>,
+    base: Option<Base>,
+    /// Presses made while a command is unanswered, in the order they were made.
+    pressed: Vec<Command>,
+    /// When news from this device last prompted a look.
+    news_ms: Option<u64>,
 }
 
 impl Peer {
@@ -115,6 +156,11 @@ impl Peer {
         self.command.as_ref().is_some_and(|command| command.outcome.is_none())
     }
 
+    /// How many presses are waiting behind the command that is out.
+    pub fn pressed(&self) -> usize {
+        self.pressed.len()
+    }
+
     /// A look was sent.
     pub fn looked(&mut self, nonce: Nonce, now_ms: u64) {
         if self.looks.len() >= MOST_LOOKS {
@@ -128,22 +174,59 @@ impl Peer {
         if self.waiting() {
             return Err(Wait::Unanswered);
         }
-        let Some(shown) = &self.shown else { return Err(Wait::Look) };
-        // A state from before the last command says nothing of what that command did.
-        let since_command = self.command.as_ref().is_none_or(|command| shown.sent_ms > command.sent_ms);
-        let age = now_ms.checked_sub(shown.sent_ms);
-        if !since_command || !age.is_some_and(|age| age < FRESH_MS) {
+        // (A state from before the last command says nothing of what that command did: it
+        // was let go of when the command was sent.)
+        let Some(base) = &self.base else { return Err(Wait::Look) };
+        if !now_ms.checked_sub(base.ms).is_some_and(|age| age < FRESH_MS) {
             return Err(Wait::Look);
         }
-        if shown.tell.busy {
+        if base.busy {
             return Err(Wait::Busy);
         }
-        Ok(shown.tell.at)
+        Ok(base.at)
+    }
+
+    /// Something was pressed for this device. One command is out at a time: a press made
+    /// while one is unanswered waits behind it, up to [`MOST_PRESSED`] of them; of presses
+    /// that mean only their last (a volume slider's), only the last waits.
+    pub fn press(&mut self, command: &Command, now_ms: u64) -> Press {
+        if self.waiting() {
+            if command.latest_only() {
+                self.pressed.retain(|earlier| earlier.name() != command.name());
+            }
+            if self.pressed.len() >= MOST_PRESSED {
+                return Press::No(Wait::Unanswered);
+            }
+            self.pressed.push(command.clone());
+            return Press::Waits;
+        }
+        match self.may_send(now_ms) {
+            Ok(at) => Press::Send(at),
+            Err(wait) => Press::No(wait),
+        }
+    }
+
+    /// The next press that was waiting, and the state to make it against, once the command
+    /// before it has been answered "carried out". If that one was refused, or what became
+    /// of it is not known, those waiting were let go of when that was learnt: they were
+    /// made on the strength of something that did not happen.
+    pub fn next(&mut self, now_ms: u64) -> Option<(Command, At)> {
+        if self.waiting() || self.pressed.is_empty() {
+            return None;
+        }
+        match self.may_send(now_ms) {
+            Ok(at) => Some((self.pressed.remove(0), at)),
+            Err(_) => {
+                self.pressed.clear();
+                None
+            }
+        }
     }
 
     /// A command was sent, made against `at`.
     pub fn sent(&mut self, nonce: Nonce, at: At, now_ms: u64) {
-        self.command = Some(Command { nonce, at, sent_ms: now_ms, check: None, outcome: None, answered: false });
+        self.command = Some(Sent { nonce, at, sent_ms: now_ms, waited_from: now_ms, check: None, checks: 0, outcome: None, answered: false });
+        self.base = None;
     }
 
     /// The look [`Tick::Check`] called for was sent.
@@ -159,13 +242,25 @@ impl Peer {
         let waited = |since: u64| now_ms.checked_sub(since).is_some_and(|age| age >= WAIT_MS);
         match command.check {
             _ if command.outcome.is_some() => Tick::Nothing,
-            None if waited(command.sent_ms) => Tick::Check,
+            None if waited(command.waited_from) => Tick::Check,
             Some((_, sent)) if waited(sent) => {
                 command.outcome = Some(Outcome::Unknown);
+                self.pressed.clear();
                 Tick::Settled(Outcome::Unknown)
             }
             _ => Tick::Nothing,
         }
+    }
+
+    /// News arrived from this device and opened: whether to look at it now. News is never
+    /// itself a state to show or to act on (anything on the way can deliver it again
+    /// later); it is a reason to ask, and no more often than once a second.
+    pub fn news(&mut self, now_ms: u64) -> bool {
+        if self.news_ms.is_some_and(|last| now_ms.checked_sub(last).is_none_or(|since| since < NEWS_LOOK_MS)) {
+            return false;
+        }
+        self.news_ms = Some(now_ms);
+        true
     }
 
     /// A tell arrived from this device's place and opened.
@@ -178,7 +273,7 @@ impl Peer {
             // A success is believed whenever it comes, once: a refusal that got here first (of
             // a repeat the relay's path made, say) does not stand against it. A refusal is
             // believed once, and never over a success.
-            let done = tell.by == Some(command.nonce) || tell.ok == Some(true);
+            let done = tell.ok == Some(true) || (tell.by == Some(command.nonce) && !tell.busy);
             let known = command.outcome == Some(Outcome::Done);
             if known || (command.answered && !done) {
                 return Told::Dropped;
@@ -186,15 +281,29 @@ impl Peer {
             command.answered = true;
             let outcome = if done { Outcome::Done } else { Outcome::Refused(tell.why.unwrap_or(Why::Changed)) };
             command.outcome = Some(outcome);
+            if done {
+                // What it says of the device is the state the next command is made against.
+                self.base = Some(Base { at: tell.at, busy: tell.busy, ms: command.sent_ms });
+            } else {
+                self.pressed.clear();
+            }
             return Told::Settled(outcome);
         }
         // The answer to a look that is waited on: once.
         let Some(waiting) = self.looks.iter().position(|(nonce, _)| *nonce == re) else { return Told::Dropped };
         let (_, sent_ms) = self.looks.remove(waiting);
         let settled = self.command.as_mut().filter(|command| command.outcome.is_none()).and_then(|command| {
-            let outcome = if tell.by == Some(command.nonce) {
+            let checked = command.check.is_some_and(|(check, _)| check == re);
+            let outcome = if tell.by == Some(command.nonce) && !tell.busy {
                 Outcome::Done
-            } else if command.check.is_some_and(|(check, _)| check == re) {
+            } else if checked && tell.by == Some(command.nonce) && command.checks + 1 < MOST_CHECKS {
+                // It made the state, and its work is still under way there (a queue taken
+                // over that has not begun to sound): wait on, and ask again.
+                command.checks += 1;
+                command.check = None;
+                command.waited_from = sent_ms;
+                return None;
+            } else if checked {
                 if tell.at.generation == command.at.generation { Outcome::NotReached } else { Outcome::Unknown }
             } else {
                 return None;
@@ -202,9 +311,16 @@ impl Peer {
             command.outcome = Some(outcome);
             Some(outcome)
         });
+        if settled.is_some_and(|outcome| outcome != Outcome::Done) {
+            self.pressed.clear();
+        }
         // An answer to an older look never replaces the answer to a newer one.
         let newer = self.shown.as_ref().is_none_or(|shown| sent_ms >= shown.sent_ms);
         if newer {
+            // A state to act on only if it was asked for after the last command was sent.
+            if self.command.as_ref().is_none_or(|command| sent_ms > command.sent_ms) {
+                self.base = Some(Base { at: tell.at, busy: tell.busy, ms: sent_ms });
+            }
             self.shown = Some(Shown { tell, sent_ms });
         }
         match (settled, newer) {
@@ -219,6 +335,7 @@ impl Peer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::link::command::Command;
 
     const LOOK: Nonce = [1; 24];
     const LOOK_2: Nonce = [2; 24];
@@ -298,13 +415,141 @@ mod tests {
         assert_eq!(peer.may_send(100), Err(Wait::Busy));
         let mut peer = paused();
         assert_eq!(peer.may_send(1_500), Err(Wait::Unanswered));
-        // Once it is answered, the state it was made against is no state to make another
-        // against: a look sent since is needed.
+        // Once it is answered "carried out", the state in that answer is the one the next is
+        // made against: not the one from before it, which it changed.
         assert_eq!(peer.told(Tell { ok: Some(true), by: Some(PAUSE), ..state(6, PAUSE) }), Told::Settled(Outcome::Done));
+        assert_eq!(peer.may_send(2_000), Ok(At { generation: 6, minute: 0 }));
+        // It is as old as the command it answers, and no fresher.
+        assert_eq!(peer.may_send(1_000 + FRESH_MS), Err(Wait::Look));
+        // A refusal leaves nothing to send against: look first.
+        let mut peer = paused();
+        assert_eq!(peer.told(Tell { ok: Some(false), why: Some(Why::Changed), ..state(7, PAUSE) }), Told::Settled(Outcome::Refused(Why::Changed)));
         assert_eq!(peer.may_send(2_000), Err(Wait::Look));
+        // And an answer to a look sent before the command says nothing of what it did.
+        let mut peer = Peer::default();
+        peer.looked(LOOK, 0);
+        peer.told(state(5, LOOK));
+        peer.looked(LOOK_2, 500);
+        peer.sent(PAUSE, At { generation: 5, minute: 0 }, 1_000);
+        peer.told(Tell { ok: Some(false), why: Some(Why::Late), ..state(5, PAUSE) });
+        assert_eq!(peer.told(state(5, LOOK_2)), Told::Shown);
+        assert_eq!(peer.may_send(2_000), Err(Wait::Look));
+        peer.looked([3; 24], 2_000);
+        assert_eq!(peer.told(state(5, [3; 24])), Told::Shown);
+        assert_eq!(peer.may_send(2_100), Ok(At { generation: 5, minute: 0 }));
+    }
+
+    #[test]
+    fn presses_made_while_a_command_is_unanswered_wait_and_go_one_at_a_time_after_an_ok() {
+        let mut peer = paused();
+        assert_eq!(peer.press(&Command::Next, 1_100), Press::Waits);
+        assert_eq!(peer.press(&Command::Next, 1_200), Press::Waits);
+        // Nothing goes until the one that is out is answered.
+        assert_eq!(peer.next(1_300), None);
+        assert_eq!(peer.told(Tell { ok: Some(true), by: Some(PAUSE), ..state(6, PAUSE) }), Told::Settled(Outcome::Done));
+        // Then the first, against the state in that answer; and the second only after the
+        // first's own answer.
+        assert_eq!(peer.next(1_400), Some((Command::Next, At { generation: 6, minute: 0 })));
+        peer.sent(LOOK_2, At { generation: 6, minute: 0 }, 1_400);
+        assert_eq!((peer.next(1_500), peer.pressed()), (None, 1));
+        assert_eq!(peer.told(Tell { ok: Some(true), by: Some(LOOK_2), ..state(7, LOOK_2) }), Told::Settled(Outcome::Done));
+        assert_eq!(peer.next(1_600), Some((Command::Next, At { generation: 7, minute: 0 })));
+        assert_eq!(peer.pressed(), 0);
+        // With nothing out, a press is sent at once, or not at all: it never waits on a look.
+        let mut fresh = seen(0);
+        assert_eq!(fresh.press(&Command::Next, 100), Press::Send(At { generation: 5, minute: 0 }));
+        assert_eq!(Peer::default().press(&Command::Next, 100), Press::No(Wait::Look));
+    }
+
+    #[test]
+    fn eight_presses_wait_at_the_most_and_of_a_slider_s_only_the_last() {
+        let mut peer = paused();
+        for n in 0..12 {
+            assert_eq!(peer.press(&Command::Volume { to: f64::from(n) / 20.0 }, 1_100), Press::Waits);
+        }
+        assert_eq!(peer.pressed(), 1);
+        for n in 0..7 {
+            assert_eq!(peer.press(&Command::Next, 1_200), Press::Waits, "{n}");
+        }
+        assert_eq!(peer.press(&Command::Next, 1_300), Press::No(Wait::Unanswered));
+        // A later turn of the slider still takes the place of the earlier one.
+        assert_eq!(peer.press(&Command::Volume { to: 0.9 }, 1_300), Press::Waits);
+        assert_eq!(peer.pressed(), MOST_PRESSED);
+        assert_eq!(peer.told(Tell { ok: Some(true), by: Some(PAUSE), ..state(6, PAUSE) }), Told::Settled(Outcome::Done));
+        assert_eq!(peer.next(1_400).map(|(command, _)| command), Some(Command::Next));
+    }
+
+    #[test]
+    fn a_refusal_or_an_unknown_outcome_lets_go_of_what_was_waiting() {
+        let mut peer = paused();
+        peer.press(&Command::Next, 1_100);
+        assert_eq!(peer.told(Tell { ok: Some(false), why: Some(Why::Changed), ..state(7, PAUSE) }), Told::Settled(Outcome::Refused(Why::Changed)));
+        assert_eq!((peer.pressed(), peer.next(1_200)), (0, None));
+        // No answer, and the check not answered either.
+        let mut peer = paused();
+        peer.press(&Command::Next, 1_100);
+        assert_eq!(peer.tick(13_000), Tick::Check);
+        peer.checking(LOOK_2, 13_000);
+        assert_eq!(peer.tick(13_000 + WAIT_MS), Tick::Settled(Outcome::Unknown));
+        assert_eq!(peer.pressed(), 0);
+        // It had not arrived when checked: what was pressed after it is not sent ahead of it.
+        let mut peer = paused();
+        peer.press(&Command::Next, 1_100);
+        peer.tick(13_000);
+        peer.checking(LOOK_2, 13_000);
+        assert_eq!(peer.told(state(5, LOOK_2)), Told::ShownAndSettled(Outcome::NotReached));
+        assert_eq!((peer.pressed(), peer.next(13_100)), (0, None));
+    }
+
+    /// A queue taken over is the state's maker from the moment it is loaded, and is not
+    /// "done" until it sounds: until then the device says it is busy.
+    #[test]
+    fn a_command_whose_work_is_still_under_way_is_waited_on_and_asked_after_again() {
+        let mut peer = paused();
         peer.looked(LOOK_2, 2_000);
-        assert_eq!(peer.told(Tell { by: Some(PAUSE), ..state(6, LOOK_2) }), Told::Shown);
-        assert_eq!(peer.may_send(2_100), Ok(At { generation: 6, minute: 0 }));
+        assert_eq!(peer.told(Tell { by: Some(PAUSE), busy: true, ..state(6, LOOK_2) }), Told::Shown);
+        assert!(peer.waiting());
+        // No answer in twelve seconds: it asks, is told the work is under way, and waits
+        // another twelve from then before asking again.
+        assert_eq!(peer.tick(13_000), Tick::Check);
+        peer.checking([3; 24], 13_000);
+        assert_eq!(peer.told(Tell { by: Some(PAUSE), busy: true, ..state(6, [3; 24]) }), Told::Shown);
+        assert_eq!((peer.waiting(), peer.tick(13_000 + WAIT_MS - 1)), (true, Tick::Nothing));
+        assert_eq!(peer.tick(13_000 + WAIT_MS), Tick::Check);
+        peer.checking([4; 24], 25_000);
+        // Its own answer, when the sound has started.
+        assert_eq!(peer.told(Tell { ok: Some(true), by: Some(PAUSE), ..state(6, PAUSE) }), Told::Settled(Outcome::Done));
+        // One that never finishes is not waited on for ever.
+        let mut peer = paused();
+        let mut now = 1_000;
+        let outcome = loop {
+            now += WAIT_MS;
+            assert_eq!(peer.tick(now), Tick::Check);
+            let look = [(now / 1_000) as u8; 24];
+            peer.checking(look, now);
+            if let Told::ShownAndSettled(outcome) = peer.told(Tell { by: Some(PAUSE), busy: true, ..state(6, look) }) {
+                break outcome;
+            }
+        };
+        assert_eq!((outcome, now), (Outcome::Unknown, 1_000 + 4 * WAIT_MS));
+        // And an answer that says "busy" beside the name of the command is no success yet.
+        let mut peer = paused();
+        assert_eq!(peer.told(Tell { ok: Some(false), why: Some(Why::Busy), by: Some(PAUSE), busy: true, ..state(6, PAUSE) }), Told::Settled(Outcome::Refused(Why::Busy)));
+        assert_eq!(peer.told(Tell { ok: Some(true), by: Some(PAUSE), ..state(6, PAUSE) }), Told::Settled(Outcome::Done));
+    }
+
+    #[test]
+    fn news_prompts_a_look_once_a_second_at_the_most_and_is_never_a_state() {
+        let mut peer = seen(0);
+        let news = Tell { re: None, ..state(9, LOOK) };
+        assert_eq!(peer.told(news.clone()), Told::Dropped);
+        assert_eq!(peer.shown().map(|shown| shown.tell.at.generation), Some(5));
+        assert_eq!(peer.may_send(100), Ok(At { generation: 5, minute: 0 }));
+        assert!(peer.news(1_000));
+        assert!(!peer.news(1_500) && !peer.news(1_999));
+        assert!(peer.news(2_000));
+        // A clock that reads earlier is no reason to look more often.
+        assert!(!peer.news(1_000));
     }
 
     #[test]
