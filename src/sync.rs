@@ -36,6 +36,51 @@ const LOOK: Duration = Duration::from_secs(60);
 // follows is this app's part: asking the server, the files, and (in `impl Controller`) the
 // timers and showing what came back.
 
+/// One thing at a time on its way to the server and back: an exchange, or a save of the
+/// queue. **Something asked of the server that has been let go still counts as on its way
+/// until it has answered.** Letting go means its result will not be applied; it does not
+/// mean the next may start, because its write may be on its way still, and a second
+/// exchange run across it would read the record from before that write and then see it
+/// land. So the next waits until the earlier one's requests have all come back (they have
+/// the time limits every request has).
+#[derive(Default)]
+pub struct Turn {
+    out: std::cell::Cell<bool>,
+    again: std::cell::Cell<bool>,
+}
+
+impl Turn {
+    /// Asks to start. True if nothing is out: this now is. Otherwise it is noted that
+    /// another turn is wanted when what is out comes back.
+    #[must_use]
+    pub fn begin(&self) -> bool {
+        if self.out.replace(true) {
+            self.again.set(true);
+            return false;
+        }
+        true
+    }
+
+    /// Another turn is wanted after this one.
+    pub fn again(&self) {
+        self.again.set(true);
+    }
+
+    /// What was out has come back, whether or not anything is done with it: says whether
+    /// another turn was wanted meanwhile.
+    #[must_use]
+    pub fn back(&self) -> bool {
+        self.out.set(false);
+        self.again.replace(false)
+    }
+
+    /// What is out is let go: it stays out until it comes back (`back`). Only the wish
+    /// for another after it is forgotten; whoever wants one asks again.
+    pub fn let_go(&self) {
+        self.again.set(false);
+    }
+}
+
 /// Step 1: asks the server for the list of playlists and for the one that holds the record.
 /// Nothing of what this PC holds is needed for it, and nothing is written.
 pub fn read(client: &Client) -> ApiResult<Answers> {
@@ -52,17 +97,24 @@ pub fn read(client: &Client) -> ApiResult<Answers> {
 
 /// Step 7.3: makes a write the library asked for: the playlist first, if there is none
 /// (asked for once: if the text then can't be written, the next exchange finds the playlist
-/// empty and fills it). Returns the playlist it went into.
-pub fn send(client: &Client, write: &Write) -> ApiResult<String> {
+/// empty and fills it). `still` is asked immediately before **each** request that changes
+/// the server, the second as well as the first: whether it is still the same sign-in, with
+/// sharing on and the app not shutting down. Returns the playlist the record went into;
+/// `None` if `still` said no, and then nothing more was sent.
+pub fn send(client: &Client, write: &Write, still: &dyn Fn() -> bool) -> ApiResult<Option<String>> {
     let id = match &write.into {
         Some(id) => id.clone(),
-        None => client.create_playlist(PLAYLIST_NAME, &[])?.id,
+        None if still() => client.create_playlist(PLAYLIST_NAME, &[])?.id,
+        None => return Ok(None),
     };
     if id.is_empty() {
         return Err(ApiError::NotSubsonic("The new playlist came back without an id.".into()));
     }
+    if !still() {
+        return Ok(None);
+    }
     client.set_playlist_comment(&id, &write.text)?;
-    Ok(id)
+    Ok(Some(id))
 }
 
 /// The theme the record has, for a first look before the window opens, and when it was
@@ -212,13 +264,13 @@ impl Controller {
     }
 
     /// Whatever is on its way for the sign-in (or the setting) as it was is let go: an
-    /// answer that arrives for it is dropped, and nothing of it is applied or sent.
-    fn let_go(&self) {
+    /// answer that arrives for it is dropped, and nothing of it is applied or sent. It is
+    /// still on its way until it has come back, and the next waits for that (`Turn`). The
+    /// app shutting down lets go too, from its first moment.
+    pub fn let_go(&self) {
         self.session.fetch_add(1, Ordering::SeqCst);
-        self.sync_busy.set(false);
-        self.sync_again.set(false);
-        self.queue_saving.set(false);
-        self.queue_again.set(false);
+        self.exchange.let_go();
+        self.queue_save.let_go();
     }
 
     /// Starts keeping in step: now, and every so often from here on.
@@ -343,12 +395,11 @@ impl Controller {
         if !self.sync_on() {
             return;
         }
-        if self.sync_busy.replace(true) {
-            // One exchange at a time; go again when this one is back.
-            self.sync_again.set(true);
+        let Some(client) = self.client() else { return };
+        if !self.exchange.begin() {
+            // One exchange at a time, one let go included: again when it is back.
             return;
         }
-        let Some(client) = self.client() else { return self.sync_busy.set(false) };
         let session = self.session.load(Ordering::SeqCst);
         self.api_pool.spawn(move || {
             let answers = read(&client);
@@ -356,10 +407,10 @@ impl Controller {
         });
     }
 
-    /// An exchange has finished, one way or another: the next may begin.
+    /// An exchange has finished, one way or another (applied, stopped, or let go and now
+    /// back): the next may begin.
     fn exchange_over(self: &Rc<Self>) {
-        self.sync_busy.set(false);
-        if self.sync_again.replace(false) {
+        if self.exchange.back() {
             self.share_soon();
         }
     }
@@ -389,9 +440,9 @@ impl Controller {
     /// no longer the one signed in, or sharing has been switched off, everything here is
     /// dropped.
     fn answered(self: &Rc<Self>, session: u64, client: Client, answers: ApiResult<Answers>) {
-        // Step 2.
+        // Step 2. (Let go: dropped. But it has come back, so the next may begin.)
         if session != self.session.load(Ordering::SeqCst) {
-            return;
+            return self.exchange_over();
         }
         if !self.sync_on() {
             return self.exchange_over();
@@ -451,7 +502,7 @@ impl Controller {
             // 7.2: the plan must still fit the choices; and they are saved, as tried,
             // before the request is made.
             if !self.settings.borrow_mut().choices.sending(carries) {
-                self.sync_again.set(true);
+                self.exchange.again();
                 write = None;
             } else if !self.settings.borrow().save_surely(&self.paths.settings) {
                 write = None;
@@ -463,9 +514,10 @@ impl Controller {
         let live = self.session.clone();
         let take = plan.take;
         self.api_pool.spawn(move || {
-            // 7.3: still the same sign-in, with sharing on, at the moment of sending.
+            // 7.3: still the same sign-in, with sharing on, immediately before each request
+            // that changes the server.
             let sent = write.map(|write| {
-                let went = if live.load(Ordering::SeqCst) == session { send(&client, &write).ok() } else { None };
+                let went = send(&client, &write, &|| live.load(Ordering::SeqCst) == session).ok().flatten();
                 (write, went)
             });
             let songs: HashMap<String, Option<Song>> = wanted.into_iter().map(|id| (id.clone(), client.song(&id).ok().filter(|song| song.id == id))).collect();
@@ -476,7 +528,7 @@ impl Controller {
     /// The end of an exchange that had something to send or to ask for.
     fn finished(self: &Rc<Self>, session: u64, take: Take, songs: HashMap<String, Option<Song>>, sent: Option<(Write, Option<String>)>) {
         if session != self.session.load(Ordering::SeqCst) {
-            return;
+            return self.exchange_over();
         }
         let mut found = HashMap::new();
         for (id, song) in songs {
@@ -546,17 +598,16 @@ impl Controller {
         if !self.sync_on() {
             return;
         }
-        if self.queue_saving.replace(true) {
-            self.queue_again.set(true);
-            return;
-        }
         let here = self.here();
         let saved = {
             let pb = self.playback.borrow();
             let in_order: Vec<&Song> = pb.order.iter().filter_map(|&i| pb.queue.get(i)).collect();
             handover::window(&in_order, pb.cursor, pb.position)
         };
-        let (Some(saved), Some(client)) = (saved, self.client()) else { return self.queue_saving.set(false) };
+        let (Some(saved), Some(client)) = (saved, self.client()) else { return };
+        if !self.queue_save.begin() {
+            return;
+        }
         let (session, live) = (self.session.load(Ordering::SeqCst), self.session.clone());
         let (revision, revisions) = (self.queue_revision.load(Ordering::SeqCst), self.queue_revision.clone());
         self.api_pool.spawn(move || {
@@ -576,14 +627,15 @@ impl Controller {
                 let _ = client.save_play_queue(&here.device, &saved.ids, &saved.current, saved.position);
             }
             post(move |ctl| {
+                // (Back, whether or not it was let go meanwhile: the next may begin.)
+                let again = ctl.queue_save.back();
                 if session != ctl.session.load(Ordering::SeqCst) {
                     return;
                 }
                 if let Some(clock) = clock {
                     ctl.clock.set(clock);
                 }
-                ctl.queue_saving.set(false);
-                if ctl.queue_again.replace(false) {
+                if again {
                     ctl.upload_queue();
                 }
             });
@@ -762,6 +814,43 @@ mod tests {
     }
 
     #[test]
+    fn what_was_let_go_is_still_on_its_way_until_it_has_answered() {
+        let turn = Turn::default();
+        assert!(turn.begin());
+        // Sharing is switched off, and on again at once. The exchange that was let go may
+        // have a write on its way still: the next does not start across it.
+        turn.let_go();
+        assert!(!turn.begin(), "a second exchange would run across the first's write");
+        // It comes back (to be dropped), and the one that was wanted may begin.
+        assert!(turn.back());
+        assert!(turn.begin());
+        // Let go with nothing wanted after it: nothing follows when it comes back, and
+        // what was wanted before the letting go is forgotten with it.
+        assert!(!turn.begin());
+        turn.let_go();
+        assert!(!turn.back());
+        assert!(turn.begin() && !turn.back());
+    }
+
+    #[test]
+    fn each_request_that_changes_the_server_is_asked_about_first() {
+        let (client, stored) = navidrome();
+        let write = plan(decided(&client, &pc(&[Change::Pin("p1".into())]))).write.unwrap();
+        assert_eq!(write.into, None);
+        let asked = |what: &str| stored.lock().unwrap().asked.iter().filter(|asked| *asked == what).count();
+        // No longer the same sign-in, or sharing is off: nothing is sent.
+        assert_eq!(send(&client, &write, &|| false).unwrap(), None);
+        assert_eq!((asked("createPlaylist"), asked("updatePlaylist")), (0, 0));
+        // It stopped being so while the playlist was being made: the record is not then
+        // written into it.
+        let times = std::cell::Cell::new(0);
+        let once = || times.replace(times.get() + 1) == 0;
+        assert_eq!(send(&client, &write, &once).unwrap(), None);
+        assert_eq!((asked("createPlaylist"), asked("updatePlaylist"), times.get()), (1, 0, 2));
+        assert!(stored.lock().unwrap().playlists.iter().all(|playlist| playlist.3.is_empty()));
+    }
+
+    #[test]
     fn an_exchange_through_the_apps_own_client() {
         let (client, stored) = navidrome();
         let comment = |stored: &Mutex<Stored>, id: &str| stored.lock().unwrap().playlists.iter().find(|playlist| playlist.0 == id).map(|playlist| playlist.3.clone()).unwrap_or_default();
@@ -771,7 +860,7 @@ mod tests {
         // With a pin, the playlist is made (once) and the record written into it.
         let write = plan(decided(&client, &pc(&[Change::Pin("p1".into())]))).write.unwrap();
         assert_eq!(write.into, None);
-        let id = send(&client, &write).unwrap();
+        let id = send(&client, &write, &|| true).unwrap().unwrap();
         assert!(comment(&stored, &id).contains(r#""pins":["p1"]"#));
         assert_eq!(stored.lock().unwrap().asked.iter().filter(|asked| *asked == "createPlaylist").count(), 1);
         // A second device finds it by its name and owner (among others' of that name, and
@@ -783,7 +872,7 @@ mod tests {
         }
         let second = plan(decided(&client, &pc(&[Change::Pin("p2".into())])));
         assert_eq!(second.playlist.as_deref(), Some(id.as_str()));
-        assert_eq!(send(&client, &second.write.unwrap()).unwrap(), id);
+        assert_eq!(send(&client, &second.write.unwrap(), &|| true).unwrap().as_ref(), Some(&id));
         assert!(comment(&stored, &id).contains(r#""pins":["p1","p2"]"#));
         assert_eq!(comment(&stored, "a-guests"), "theirs");
         // The look before the window opens finds the theme there: in the playlist an

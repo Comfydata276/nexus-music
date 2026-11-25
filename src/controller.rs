@@ -426,8 +426,9 @@ pub struct Controller {
     pub sync_timer: slint::Timer,
     pub sync_look_timer: slint::Timer,
     pub queue_timer: slint::Timer,
-    pub sync_busy: Cell<bool>,
-    pub sync_again: Cell<bool>,
+    /// The exchange with the server, and the save of the queue: one of each at a time.
+    pub exchange: crate::sync::Turn,
+    pub queue_save: crate::sync::Turn,
     /// The server's clock minus this PC's, as the last exchange measured it; and what is
     /// said under the setting when this PC isn't sharing as it should (see `sync`).
     pub clock: Cell<nexus_core::time::Clock>,
@@ -446,8 +447,6 @@ pub struct Controller {
     /// on its way; and another has been asked for meanwhile.
     pub queue_taken: RefCell<Option<String>>,
     pub queue_revision: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    pub queue_saving: Cell<bool>,
-    pub queue_again: Cell<bool>,
     /// When the queue last changed here (or, for one taken from another device, there), and
     /// a fingerprint of it as last saved, to tell a real change from a save of the same thing.
     pub queue_stamp: Cell<i64>,
@@ -600,16 +599,14 @@ impl Controller {
             sync_timer: slint::Timer::default(),
             sync_look_timer: slint::Timer::default(),
             queue_timer: slint::Timer::default(),
-            sync_busy: Cell::new(false),
-            sync_again: Cell::new(false),
+            exchange: Default::default(),
+            queue_save: Default::default(),
             clock: Cell::new(nexus_core::time::Clock::Unmeasured),
             sync_note: RefCell::default(),
             session: Default::default(),
             history_missing: RefCell::default(),
             queue_taken: RefCell::default(),
             queue_revision: Default::default(),
-            queue_saving: Cell::new(false),
-            queue_again: Cell::new(false),
             queue_stamp: Cell::new(0),
             queue_sig: Cell::new(crate::playback::queue_fingerprint(&Playback::new(&Settings::default()))),
             queue_quiet: Cell::new(false),
@@ -1143,6 +1140,9 @@ impl Controller {
     }
 
     pub fn quit(self: &Rc<Self>) {
+        // From the first moment of shutting down, nothing more is sent to keep in step: a
+        // write about to be made is not, and an answer on its way is dropped.
+        self.let_go();
         // A jam hosted here ends with the app; its guests are told so, not left waiting.
         self.stop_linking();
         self.end_jam(true);
