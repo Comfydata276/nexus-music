@@ -945,7 +945,11 @@ impl Controller {
         let _asked = self.for_another(if own { Who::Elsewhere } else { Who::Guest }, false);
         // Adding songs, and taking your own back out, is what a jam is for. The rest is
         // the host's to allow; and a session that isn't a jam is for the person's own devices.
-        let done = match answer(session, own, self.settings.borrow().jam_guests_control, action) {
+        // (The setting is read into a value of its own first: a borrow taken in the `match`
+        // itself would be held until the match ends, and the volume, shuffle and repeat arms
+        // write the settings.)
+        let guests_control = self.settings.borrow().jam_guests_control;
+        let done = match answer(session, own, guests_control, action) {
             Answer::No(why) => Err(why.to_string()),
             Answer::Do { steer } => match action {
                 "add" => self.jam_add_for(&guest, songs, steer && data["next"].as_bool() == Some(true), own),
