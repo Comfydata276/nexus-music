@@ -276,6 +276,11 @@ A PC that step 3 was not done on puts back whatever it holds that is newer than 
 Recently played and the plays are not gone back on either way: what has been played since
 the copy was kept stays, on the PCs and in the record.
 
+Look at the file's text before you paste it: a copy made by 0.40.5 to 0.40.7 can be empty or
+cut short if the app was stopped or the PC lost power at the moment it was made, and nothing
+can tell that from a whole copy afterwards (later versions give the file its name only once
+it is whole).
+
 **Known, and accepted.**
 
 - Two devices that read the record in the same moment both write, and the second write wins.
