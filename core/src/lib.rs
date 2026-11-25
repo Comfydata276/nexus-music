@@ -12,6 +12,7 @@ pub mod handover;
 pub mod http;
 pub mod jam;
 pub mod levelling;
+pub mod link;
 pub mod listenbrainz;
 pub mod model;
 pub mod musicbrainz;

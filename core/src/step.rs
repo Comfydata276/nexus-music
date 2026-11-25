@@ -394,7 +394,13 @@ pub enum Found {
 /// stated may be anybody's: with none known to be ours, nothing is made beside it and
 /// nothing written into it.
 pub fn find(listed: &[Stated], username: &str) -> Found {
-    let named = || listed.iter().filter(|playlist| !playlist.id.is_empty() && playlist.name == PLAYLIST_NAME);
+    find_named(listed, username, PLAYLIST_NAME)
+}
+
+/// The same rule for a playlist of another name the app keeps for itself (the secret the
+/// account's devices share is found this way: see `link::secret`).
+pub fn find_named(listed: &[Stated], username: &str, name: &str) -> Found {
+    let named = || listed.iter().filter(|playlist| !playlist.id.is_empty() && playlist.name == name);
     match named().filter(|playlist| playlist.ours(username)).map(|playlist| &playlist.id).min() {
         Some(id) => Found::Ours(id.clone()),
         None if named().any(|playlist| playlist.owner.is_none()) => Found::NotStated,
@@ -402,9 +408,15 @@ pub fn find(listed: &[Stated], username: &str) -> Found {
     }
 }
 
-/// Whether a playlist of the person's own may have this name: not the record's.
+/// Whether a playlist as the server stated it is this account's own.
+pub fn ours(playlist: &Stated, username: &str) -> bool {
+    playlist.ours(username)
+}
+
+/// Whether a playlist of the person's own may have this name: not the record's, nor the
+/// one the secret the account's devices share is kept in.
 pub fn reserved(name: &str) -> bool {
-    name.trim() == PLAYLIST_NAME
+    name.trim() == PLAYLIST_NAME || name.trim() == crate::link::secret::PLAYLIST_NAME
 }
 
 /// What the app says when a playlist of the person's own is given the record's name.
