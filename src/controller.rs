@@ -1410,7 +1410,8 @@ impl Controller {
     /// The sign-in in front of Lidarr, picked up from what's on file if it isn't in use yet.
     fn gate_session(&self, settings: &config::Settings) -> Option<std::sync::Arc<crate::gate::Session>> {
         let found = crate::gate::Found { service: settings.lidarr_gate.clone(), client: settings.lidarr_gate_client.clone() };
-        if found.service.is_empty() {
+        // One kept by an older version that isn't believed now is not used (see `Found::trusted`).
+        if found.service.is_empty() || found.trusted(&settings.lidarr_address).is_err() {
             self.gate.replace(None);
             return None;
         }
@@ -1455,19 +1456,20 @@ impl Controller {
             }
         }
         let (moved, elsewhere) = {
-            let mut settings = self.settings.borrow_mut();
+            let settings = self.settings.borrow();
             let moved = crate::lidarr::tidy(&settings.lidarr_address) != crate::lidarr::tidy(address);
             let elsewhere = !crate::lidarr::same_origin(&settings.lidarr_address, address);
-            settings.lidarr_address = address.trim().to_string();
             (moved, elsewhere)
         };
         if moved {
-            // A sign-in belongs to the address it was found in front of.
+            // A sign-in belongs to the address it was found in front of: dropped while that's
+            // still the address, so it's handed back only where it was believed.
             self.drop_sign_in();
             let mut settings = self.settings.borrow_mut();
             settings.lidarr_gate.clear();
             settings.lidarr_gate_client.clear();
         }
+        self.settings.borrow_mut().lidarr_address = address.trim().to_string();
         self.save_settings();
         // Blank leaves the key that's on file, unless the address now leads somewhere else (another
         // scheme, host or port): a key is only ever sent to the address it was typed in for.
@@ -1555,6 +1557,9 @@ impl Controller {
         if found.service.is_empty() {
             return;
         }
+        if let Err(why) = found.trusted(&self.settings.borrow().lidarr_address) {
+            return self.requests_state("error", &why);
+        }
         let round = crate::gate::new_round();
         self.requests_check.set(self.requests_check.get() + 1);
         self.requests_state("waiting", &nexus_core::gate::finish_in_browser(found.host()));
@@ -1602,6 +1607,8 @@ impl Controller {
         let session = self.gate.replace(None);
         let on_file = config::load_secret(&self.paths, "lidarr-token");
         let service = self.settings.borrow().lidarr_gate.clone();
+        // A token is handed back only to a sign-in that's believed (see `Found::trusted`).
+        let believed = crate::gate::Found { service: service.clone(), client: String::new() }.trusted(&self.settings.borrow().lidarr_address).is_ok();
         config::save_secret(&self.paths, "lidarr-token", "");
         self.settings.borrow_mut().lidarr_signed_in.clear();
         if session.is_none() && on_file.is_none() {
@@ -1612,7 +1619,7 @@ impl Controller {
             // Closing waits out a renewal that's under way, so the token handed back is the
             // one that's good now.
             let token = session.map(|session| session.close()).filter(|token| !token.is_empty()).or(on_file);
-            if let Some(token) = token {
+            if let Some(token) = token.filter(|_| believed) {
                 crate::gate::give_up_token(&crate::subsonic::make_agent_without_redirects(), &service, &token);
             }
             config::save_secret(&paths, "lidarr-token", "");

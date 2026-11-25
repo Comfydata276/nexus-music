@@ -39,6 +39,39 @@ impl Found {
     pub fn host(&self) -> &str {
         self.service.split_once("://").map_or(self.service.as_str(), |(_, host)| host)
     }
+
+    /// Whether this sign-in service may be used for a Lidarr at `lidarr` (the address as typed):
+    /// it's on HTTPS, or it has exactly the scheme and host typed for Lidarr (a home network on
+    /// plain HTTP is the person's own choice; a step down they didn't type is not). It must be
+    /// a place and nothing more: a scheme, a host and a port. Checked when it's found, and
+    /// before a kept one is used.
+    pub fn trusted(&self, lidarr: &str) -> Result<(), String> {
+        let refused = || Err(not_trusted(self.host()));
+        let Ok(service) = crate::lidarr::origin(&self.service) else { return refused() };
+        if origin(&self.service) != self.service {
+            return refused();
+        }
+        if service.scheme == "https" {
+            return Ok(());
+        }
+        match crate::lidarr::origin(lidarr) {
+            Ok(lidarr) if lidarr.scheme == service.scheme && lidarr.host == service.host => Ok(()),
+            _ => refused(),
+        }
+    }
+}
+
+/// Where at the sign-in service a request goes: `path` under the service, which must be a place
+/// and nothing more (see `Found::trusted`), so that every request goes where the service was
+/// accepted, and nowhere else.
+fn endpoint(service: &str, path: &str) -> Option<String> {
+    (crate::lidarr::origin(service).is_ok() && origin(service) == service).then(|| format!("{service}{path}"))
+}
+
+/// Said when Lidarr sends the app to a sign-in it won't go to: one on plain HTTP away from the
+/// address typed for Lidarr, where the sign-in would cross the network unprotected.
+pub fn not_trusted(service: &str) -> String {
+    format!("The sign-in at {service} wasn't trusted: it isn't on HTTPS, and isn't where Lidarr's own address is, so signing in there would send your sign-in across the network unprotected.")
 }
 
 // ---- small helpers for web addresses ------------------------------------------------------------
@@ -186,7 +219,10 @@ pub fn find(http: &dyn Http, lidarr: &str) -> Result<Option<Found>, String> {
         Some(found) => Some(found),
         None => redirect_from(http, &first)?.and_then(|second| parse_sign_in(&second)),
     };
-    sign_in.map(Some).ok_or_else(|| UNKNOWN.to_string())
+    let found = sign_in.ok_or_else(|| UNKNOWN.to_string())?;
+    // Believed only on HTTPS, or where Lidarr itself was typed to be.
+    found.trusted(lidarr)?;
+    Ok(Some(found))
 }
 
 // ---- talking to the sign-in service ---------------------------------------------------------------
@@ -207,7 +243,8 @@ enum Trouble {
 }
 
 fn ask_for_tokens(http: &dyn Http, service: &str, fields: &[(&str, &str)]) -> Result<Tokens, Trouble> {
-    let response = post_form(http, &format!("{service}/application/o/token/"), fields).map_err(|failure| match failure {
+    let Some(url) = endpoint(service, "/application/o/token/") else { return Err(Trouble::Unreachable(not_trusted(service))) };
+    let response = post_form(http, &url, fields).map_err(|failure| match failure {
         Failure::Reach(e) => Trouble::Unreachable(format!("Couldn't reach the sign-in service. {e}")),
         Failure::Stopped => Trouble::Unreachable(STOPPED.to_string()),
     })?;
@@ -247,7 +284,8 @@ fn name_of(http: &dyn Http, service: &str, access: &str) -> String {
         preferred_username: String,
         name: String,
     }
-    let (url, bearer) = (format!("{service}/application/o/userinfo/"), format!("Bearer {access}"));
+    let Some(url) = endpoint(service, "/application/o/userinfo/") else { return String::new() };
+    let bearer = format!("Bearer {access}");
     let Ok(response) = http.send(&Request { headers: &[("Authorization", &bearer)], ..Request::get(&url) }) else {
         return String::new();
     };
@@ -257,7 +295,8 @@ fn name_of(http: &dyn Http, service: &str, access: &str) -> String {
 
 /// Tells the service a token is no longer wanted. Best effort.
 pub fn give_up_token(http: &dyn Http, service: &str, token: &str) {
-    let _ = post_form(http, &format!("{service}/application/o/revoke/"), &[("token", token), ("client_id", CLIENT)]);
+    let Some(url) = endpoint(service, "/application/o/revoke/") else { return };
+    let _ = post_form(http, &url, &[("token", token), ("client_id", CLIENT)]);
 }
 
 // ---- finishing a sign-in --------------------------------------------------------------------------
@@ -534,5 +573,32 @@ mod tests {
             sign_in_link(&found, "http://127.0.0.1:5000/callback", "st4te", "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
             "https://auth.example.org/application/o/authorize/?response_type=code&client_id=nexus-music&redirect_uri=http%3A%2F%2F127.0.0.1%3A5000%2Fcallback&scope=openid+profile+offline_access&state=st4te&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256"
         );
+    }
+
+    /// A Lidarr whose door sends every caller to a sign-in at `service`.
+    struct Door {
+        service: &'static str,
+    }
+
+    impl Http for Door {
+        fn send(&self, request: &Request) -> Result<crate::http::Response, Failure> {
+            let to = format!("{}/application/o/authorize/?client_id=proxy&response_type=code", self.service);
+            assert!(request.url.contains("/api/v1/system/status"), "{}", request.url);
+            Ok(crate::http::Response::new(302, vec![("Location".into(), Some(to))], || Ok(String::new())))
+        }
+    }
+
+    #[test]
+    fn a_sign_in_is_believed_only_on_https_or_where_lidarr_was_typed() {
+        let found = |lidarr: &str, service: &'static str| find(&Door { service }, lidarr).map(|found| found.map(|found| found.service));
+        // On HTTPS, wherever it is.
+        assert_eq!(found("https://lidarr.example.org", "https://auth.example.org"), Ok(Some("https://auth.example.org".into())));
+        assert_eq!(found("http://192.168.1.5:8686", "https://auth.example.org"), Ok(Some("https://auth.example.org".into())));
+        // Plain HTTP only at the scheme and host typed for Lidarr (any port): a home network.
+        assert_eq!(found("http://192.168.1.5:8686", "http://192.168.1.5:9000"), Ok(Some("http://192.168.1.5:9000".into())));
+        // Not a step down from what was typed, and not elsewhere.
+        assert_eq!(found("https://lidarr.example.org", "http://auth.example.org"), Err(not_trusted("auth.example.org")));
+        assert_eq!(found("https://lidarr.example.org", "http://lidarr.example.org"), Err(not_trusted("lidarr.example.org")));
+        assert_eq!(found("http://192.168.1.5:8686", "http://192.168.1.9:9000"), Err(not_trusted("192.168.1.9:9000")));
     }
 }
