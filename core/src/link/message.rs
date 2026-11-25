@@ -332,8 +332,16 @@ pub struct Tell {
     pub at: At,
     /// A choice has been accepted and not yet carried out, or its work is still under way.
     pub busy: bool,
-    /// The nonce of the command last carried out, if nothing has been chosen since.
+    /// The nonce of the command last carried out, if nothing has been chosen since; or,
+    /// while busy, of the command the device is busy with.
     pub by: Option<Nonce>,
+    /// **The command named in `by` was carried out, to its end.** Not said while the
+    /// device is still at work on it (its songs are being looked up; the queue it brought
+    /// has not sounded), nor if that work came to nothing (the queue never sounded). It is
+    /// the only thing a sender takes for "done" when it has no answer of its own: `by`
+    /// alone, and `by` with a device that is no longer busy, say who made the state and
+    /// not how it ended.
+    pub done: bool,
     pub playing: bool,
     pub title: String,
     pub artist: String,
@@ -366,6 +374,9 @@ impl Tell {
         }
         if let Some(by) = &self.by {
             fields.insert("by".into(), json!(text::nonce(by)));
+        }
+        if self.done {
+            fields.insert("done".into(), json!(true));
         }
         fields.insert("playing".into(), json!(self.playing));
         fields.insert("title".into(), json!(text::cut(&self.title, MOST_TEXT)));
@@ -436,6 +447,7 @@ pub fn read_tell(message: &[u8]) -> Option<Tell> {
         at: at(fields.get("at")?)?,
         busy: flag("busy")?.unwrap_or(false),
         by: nonce("by")?,
+        done: flag("done")?.unwrap_or(false),
         playing: fields.get("playing")?.as_bool()?,
         title: words("title")?,
         artist: words("artist")?,
@@ -464,7 +476,7 @@ mod tests {
     const MOST_TELL: usize = MOST_BRIEF;
 
     fn tell() -> Tell {
-        Tell { re: Some([0x60; 24]), ok: Some(true), why: None, device: [0x81; 16], name: "Phone".into(), at: At { generation: 8, minute: 12 }, busy: false, by: Some([0x60; 24]), playing: false, title: "Song".into(), artist: "Artist".into(), steering: String::new(), full: None, queue: None }
+        Tell { re: Some([0x60; 24]), ok: Some(true), why: None, device: [0x81; 16], name: "Phone".into(), at: At { generation: 8, minute: 12 }, busy: false, by: Some([0x60; 24]), done: true, playing: false, title: "Song".into(), artist: "Artist".into(), steering: String::new(), full: None, queue: None }
     }
 
     #[test]
@@ -537,11 +549,16 @@ mod tests {
         let told = tell();
         assert_eq!(read_tell(told.text().as_bytes()), Some(told.clone()));
         // The design's own, as its vector has it.
-        let vector = br#"{"re":"YGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3","ok":true,"device":"gYKDhIWGh4iJiouMjY6PkA","name":"Phone","at":[8,12],"by":"YGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3","playing":false,"title":"Song","artist":"Artist"}"#;
+        let vector = br#"{"re":"YGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3","ok":true,"device":"gYKDhIWGh4iJiouMjY6PkA","name":"Phone","at":[8,12],"by":"YGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3","done":true,"playing":false,"title":"Song","artist":"Artist"}"#;
         let read = read_tell(vector).unwrap();
-        assert_eq!((read.re.map(|re| re[0]), read.device[0], read.at, read.by == read.re, read.busy), (Some(0x60), 0x81, At { generation: 8, minute: 12 }, true, false));
+        assert_eq!((read.re.map(|re| re[0]), read.device[0], read.at, read.by == read.re, read.busy, read.done), (Some(0x60), 0x81, At { generation: 8, minute: 12 }, true, false, true));
+        // A tell that names a command and does not say it was carried out to its end does
+        // not say so: left out is "no", and it must be true or false where it is there.
+        let unsaid = String::from_utf8_lossy(vector).replace(r#""done":true,"#, "");
+        assert_eq!(read_tell(unsaid.as_bytes()).map(|tell| (tell.by.is_some(), tell.done)), Some((true, false)));
+        assert_eq!(read_tell(String::from_utf8_lossy(vector).replace(r#""done":true"#, r#""done":"yes""#).as_bytes()), None);
         // What need not be there, isn't: a state nobody asked a command of, with nothing playing.
-        let bare = Tell { re: None, ok: None, why: None, by: None, busy: true, title: String::new(), artist: String::new(), ..told.clone() };
+        let bare = Tell { re: None, ok: None, why: None, by: None, done: false, busy: true, title: String::new(), artist: String::new(), ..told.clone() };
         assert_eq!(bare.text(), r#"{"artist":"","at":[8,12],"busy":true,"device":"gYGBgYGBgYGBgYGBgYGBgQ","name":"Phone","playing":false,"title":""}"#);
         assert_eq!(read_tell(bare.text().as_bytes()), Some(bare));
         let refused = Tell { ok: Some(false), why: Some(Why::Busy), ..told };

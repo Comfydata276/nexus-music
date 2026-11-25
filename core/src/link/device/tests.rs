@@ -1450,6 +1450,46 @@ fn a_player_that_cannot_say_what_it_did_is_answered_as_not_known() {
     assert_eq!((said(&world), world.copies[B].player.queue.len(), world.copies[A].player.playing), ("Playing on Copy B.", 3, false));
 }
 
+/// A device that took a queue stalls: its wait for the sound runs out and, before its own
+/// tick has said so, it answers a look. It names the command and is no longer busy; it does
+/// not say the command was carried out, and the sender does not take it to have been: the
+/// music it gave away is still playing where it was.
+#[test]
+fn a_queue_that_ran_past_its_wait_without_sounding_is_not_taken_to_have_started() {
+    let mut world = giving(|world| world.copies[B].player.stream = false);
+    let nonce = world.copies[B].player.rule.by();
+    // (Time passes on B's clock with none of its ticks run: the look below is the first
+    // thing it handles after its wait has run out.)
+    world.now += START_MS + 6_000;
+    let state = world.with(B, |device, env| device.state(None, None, None, env));
+    assert_eq!((state.by, state.busy, state.done), (nonce, false, false));
+    // While it was still inside its wait it said it was busy with it; and one that
+    // sounded says it was carried out.
+    let mut world = giving(|world| world.copies[B].player.stream = false);
+    let state = world.with(B, |device, env| device.state(None, None, None, env));
+    assert_eq!((state.by.is_some(), state.busy, state.done), (true, true, false));
+    let mut world = giving(|_| {});
+    world.pass(1_000);
+    let state = world.with(B, |device, env| device.state(None, None, None, env));
+    assert_eq!((state.by.is_some(), state.busy, state.done), (true, false, true));
+    // An ordinary command is carried out when it is carried out.
+    let mut world = steering("next");
+    world.ask("next");
+    let state = world.with(B, |device, env| device.state(None, None, None, env));
+    assert_eq!((state.by.is_some(), state.done), (true, true));
+    // And the sender, looking at the stalled device after twelve seconds, is not told
+    // that its music has moved: it plays on, and says the other could not play it.
+    let mut world = giving(|world| {
+        world.copies[B].player.stream = false;
+        world.path.eat_tells = true;
+    });
+    world.now += START_MS + 6_000;
+    world.path.eat_tells = false;
+    let did = world.with(A, |device, env| device.tick("the account", true, env));
+    world.act(A, did);
+    assert_eq!((said(&world), world.copies[A].player.playing, world.copies[A].window.clone()), ("Copy B couldn't play that. Still playing here.", true, None), "{:?}", world.copies[A].log);
+}
+
 /// A device whose music has moved to another is told that its queue is that device's now,
 /// **before** its sound is stopped for it: so that the stop, on a device that had played
 /// on since it last saved, is not saved as a change of its own, with a fresh time that

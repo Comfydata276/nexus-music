@@ -272,8 +272,11 @@ impl Peer {
         {
             // A success is believed whenever it comes, once: a refusal that got here first (of
             // a repeat the relay's path made, say) does not stand against it. A refusal is
-            // believed once, and never over a success.
-            let done = tell.ok == Some(true) || (tell.by == Some(command.nonce) && !tell.busy);
+            // believed once, and never over a success. **Success is what the device says
+            // it is**: its `ok`, or that the command it names as having made its state was
+            // carried out to its end. That it names the command and is not busy is not
+            // that: a queue it took may have run past its wait without ever sounding.
+            let done = tell.ok == Some(true) || (tell.by == Some(command.nonce) && tell.done);
             // The device says this command made its state and that its work is still under
             // way there (a queue it took has not sounded yet). Whatever this is the answer
             // to (a repeat of the command made on the way, refused as busy), it settles
@@ -308,15 +311,19 @@ impl Peer {
         let (_, sent_ms) = self.looks.remove(waiting);
         let settled = self.command.as_mut().filter(|command| command.outcome.is_none()).and_then(|command| {
             let checked = command.check.is_some_and(|(check, _)| check == re);
-            let outcome = if tell.by == Some(command.nonce) && !tell.busy {
+            let outcome = if tell.by == Some(command.nonce) && tell.done {
                 Outcome::Done
-            } else if checked && tell.by == Some(command.nonce) && command.checks + 1 < MOST_CHECKS {
+            } else if checked && tell.by == Some(command.nonce) && tell.busy && command.checks + 1 < MOST_CHECKS {
                 // It made the state, and its work is still under way there (a queue taken
                 // over that has not begun to sound): wait on, and ask again.
                 command.checks += 1;
                 command.check = None;
                 command.waited_from = sent_ms;
                 return None;
+            } else if checked && tell.by == Some(command.nonce) && !tell.busy {
+                // It names the command, is no longer at work on it, and does not say it
+                // was carried out: the work came to nothing (the queue never sounded).
+                Outcome::Refused(Why::Cannot)
             } else if checked {
                 if tell.at.generation == command.at.generation { Outcome::NotReached } else { Outcome::Unknown }
             } else {
@@ -356,7 +363,7 @@ mod tests {
     const PAUSE: Nonce = [9; 24];
 
     fn state(generation: u64, re: Nonce) -> Tell {
-        Tell { re: Some(re), ok: None, why: None, device: [7; 16], name: "Study PC".into(), at: At { generation, minute: 0 }, busy: false, by: None, playing: true, title: "Song".into(), artist: "Artist".into(), steering: String::new(), full: None, queue: None }
+        Tell { re: Some(re), ok: None, why: None, device: [7; 16], name: "Study PC".into(), at: At { generation, minute: 0 }, busy: false, by: None, done: false, playing: true, title: "Song".into(), artist: "Artist".into(), steering: String::new(), full: None, queue: None }
     }
 
     /// A peer that has been looked at once, at `sent`, and answered with generation 5.
@@ -629,16 +636,44 @@ mod tests {
     #[test]
     fn by_is_believed_whatever_else_the_tell_says() {
         let mut peer = paused();
-        assert_eq!(peer.told(Tell { ok: Some(false), why: Some(Why::Changed), by: Some(PAUSE), ..state(6, PAUSE) }), Told::Settled(Outcome::Done));
+        assert_eq!(peer.told(Tell { ok: Some(false), why: Some(Why::Changed), by: Some(PAUSE), done: true, ..state(6, PAUSE) }), Told::Settled(Outcome::Done));
         // And a look's answer that names it settles it before any answer of its own comes.
         let mut peer = paused();
         peer.looked(LOOK_2, 2_000);
-        assert_eq!(peer.told(Tell { by: Some(PAUSE), ..state(6, LOOK_2) }), Told::ShownAndSettled(Outcome::Done));
+        assert_eq!(peer.told(Tell { by: Some(PAUSE), done: true, ..state(6, LOOK_2) }), Told::ShownAndSettled(Outcome::Done));
         // Another look's answer that does not name it settles nothing.
         let mut peer = paused();
         peer.looked(LOOK_2, 2_000);
         assert_eq!(peer.told(state(6, LOOK_2)), Told::Shown);
         assert!(peer.waiting());
+    }
+
+    /// The device took the queue, ran past its wait without its sound ever starting, and is
+    /// looked at before it has said so: it names the command and is not busy. That is who
+    /// made its state, not how the command ended. A sender that took it for "done" would
+    /// stop its own music for a device that never started.
+    #[test]
+    fn a_command_named_by_a_device_that_is_not_busy_is_not_done_unless_the_device_says_so() {
+        let named = |re: Nonce| Tell { by: Some(PAUSE), ..state(6, re) };
+        // A look's answer before any check: it settles nothing.
+        let mut peer = paused();
+        peer.looked(LOOK_2, 2_000);
+        assert_eq!(peer.told(named(LOOK_2)), Told::Shown);
+        assert!(peer.waiting());
+        // Its own answer delivered again as a refusal, naming it: a refusal, not a success.
+        let mut peer = paused();
+        assert_eq!(peer.told(Tell { ok: Some(false), why: Some(Why::Changed), ..named(PAUSE) }), Told::Settled(Outcome::Refused(Why::Changed)));
+        // At the check after twelve seconds: its work came to nothing.
+        let mut peer = paused();
+        peer.press(&Command::Next, 1_100);
+        assert_eq!(peer.tick(1_000 + WAIT_MS), Tick::Check);
+        peer.checking(LOOK_2, 13_000);
+        assert_eq!(peer.told(named(LOOK_2)), Told::ShownAndSettled(Outcome::Refused(Why::Cannot)));
+        assert_eq!((peer.pressed(), peer.waiting()), (0, false));
+        // And when the device does say it: done, by a look's answer or by its own.
+        let mut peer = paused();
+        peer.looked(LOOK_2, 2_000);
+        assert_eq!(peer.told(Tell { done: true, ..named(LOOK_2) }), Told::ShownAndSettled(Outcome::Done));
     }
 
     #[test]
@@ -653,7 +688,7 @@ mod tests {
             (peer.told(answer), peer)
         };
         // It made the state: done. The device is as it was: it had not arrived. Anything else: not known.
-        assert_eq!(outcome_of(Tell { by: Some(PAUSE), ..state(6, LOOK_2) }).0, Told::ShownAndSettled(Outcome::Done));
+        assert_eq!(outcome_of(Tell { by: Some(PAUSE), done: true, ..state(6, LOOK_2) }).0, Told::ShownAndSettled(Outcome::Done));
         assert_eq!(outcome_of(state(5, LOOK_2)).0, Told::ShownAndSettled(Outcome::NotReached));
         assert_eq!(outcome_of(state(7, LOOK_2)).0, Told::ShownAndSettled(Outcome::Unknown));
         // Nothing more is sent for it, whatever the outcome.

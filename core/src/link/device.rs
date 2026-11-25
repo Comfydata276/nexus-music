@@ -407,6 +407,10 @@ pub struct Device {
     /// What there is to tell the person that could not be said where it came about: said
     /// at the next tick.
     unsaid: Vec<String>,
+    /// The queue another device sent that this one took and that has not sounded: the
+    /// command that brought it made the state, and has not been carried out to its end.
+    /// It is cleared when the queue sounds, and stays if it never does.
+    unfinished: Option<Nonce>,
     /// What the list last showed, to say when it changes.
     listed: Vec<Row>,
     /// For a test only: how long a Pause from another device is held between being
@@ -824,6 +828,10 @@ impl Device {
         let brief = env.player.brief();
         let busy = env.player.busy(env.now_ms);
         let open = self.pending.values().find(|pending| busy && pending.until_ms > env.now_ms).map(|pending| pending.nonce);
+        let by = open.or(env.player.by());
+        // The command named was carried out to its end: it is not one still being worked
+        // for, and not a queue that was taken and has not sounded (or never did).
+        let done = by.is_some() && open.is_none() && by != self.unfinished;
         Tell {
             re,
             ok,
@@ -832,7 +840,8 @@ impl Device {
             name: env.me.name.clone(),
             at: At { generation: env.player.generation(), minute: minute(env.now_ms) },
             busy,
-            by: open.or(env.player.by()),
+            by,
+            done,
             playing: brief.playing,
             title: brief.title,
             artist: brief.artist,
@@ -1058,6 +1067,7 @@ impl Device {
             // It answers "carried out" when its sound has started, and is busy until then.
             let waiting = env.player.wait(now, START_MS + 5_000);
             let adoption = Adoption { session, from, nonce, adopting: Adopting::begin(env.player.generation(), now), waiting, queue: env.player.queue(), heard_from: None };
+            self.unfinished = Some(nonce);
             if let Some(earlier) = self.adoption.replace(adoption) {
                 env.player.done(earlier.waiting);
             }
@@ -1127,7 +1137,10 @@ impl Device {
         };
         if let Some((adoption, adopted)) = step.and_then(|adopted| self.adoption.take().map(|adoption| (adoption, adopted))) {
             let (ok, why) = match adopted {
-                Some(Adopted::Started) => (true, None),
+                Some(Adopted::Started) => {
+                    self.unfinished = None;
+                    (true, None)
+                }
                 Some(Adopted::Changed) => (false, Some(Why::Changed)),
                 Some(Adopted::Failed) => {
                     // No sound came: it stops trying, and says so.

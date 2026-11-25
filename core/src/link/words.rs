@@ -211,7 +211,7 @@ mod tests {
     use super::*;
 
     fn state(playing: bool) -> Tell {
-        Tell { re: None, ok: None, why: None, device: [7; 16], name: "Study PC".into(), at: At { generation: 4, minute: 0 }, busy: false, by: None, playing, title: "Harbour Lights".into(), artist: "The Tide".into(), steering: String::new(), full: None, queue: None }
+        Tell { re: None, ok: None, why: None, device: [7; 16], name: "Study PC".into(), at: At { generation: 4, minute: 0 }, busy: false, by: None, done: false, playing, title: "Harbour Lights".into(), artist: "The Tide".into(), steering: String::new(), full: None, queue: None }
     }
 
     #[test]
