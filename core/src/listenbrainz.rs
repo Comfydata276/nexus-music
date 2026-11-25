@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::http::{Failure, Http, Request, Response, STOPPED};
+use crate::http::{Failure, Http, Method, Request, Response, STOPPED};
 
 const BASE: &str = "https://api.listenbrainz.org/1";
 /// Long enough for a slow answer, short enough that a page isn't held up by it for long.
@@ -63,7 +63,7 @@ impl ListenBrainz {
     /// Sends a question as JSON, set out as the app has always sent it.
     fn post(&self, url: &str, body: Value) -> Result<Response, String> {
         let body = serde_json::to_string_pretty(&body).unwrap_or_default();
-        let request = Request { method: "POST", url, headers: &[("Content-Type", "application/json; charset=utf-8")], body: Some(&body), patience: Some(PATIENCE) };
+        let request = Request { method: Method::Post(&body), url, headers: &[("Content-Type", "application/json; charset=utf-8")], patience: Some(PATIENCE) };
         self.http.send(&request).map_err(unreachable)
     }
 

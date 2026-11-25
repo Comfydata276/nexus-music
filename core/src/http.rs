@@ -8,22 +8,30 @@
 
 use std::time::Duration;
 
+/// What kind of request, with the text it sends if it sends any. These are the kinds the
+/// app makes: there is no asking for a GET with a body or a POST without one, so neither
+/// app has to decide what one would mean.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Method<'a> {
+    Get,
+    Post(&'a str),
+    /// (Lidarr's, for when it moves here; nothing in the library makes one yet.)
+    Put(&'a str),
+}
+
 /// One request, whole.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Request<'a> {
-    /// "GET", "POST" or "PUT".
-    pub method: &'a str,
+    pub method: Method<'a>,
     pub url: &'a str,
     pub headers: &'a [(&'a str, &'a str)],
-    /// Text to send.
-    pub body: Option<&'a str>,
     /// The longest the whole call may take, where that's shorter than the app's usual limit.
     pub patience: Option<Duration>,
 }
 
 impl<'a> Request<'a> {
     pub fn get(url: &'a str) -> Request<'a> {
-        Request { method: "GET", url, headers: &[], body: None, patience: None }
+        Request { method: Method::Get, url, headers: &[], patience: None }
     }
 }
 

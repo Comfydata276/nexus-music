@@ -5,15 +5,15 @@
 //! the same connections, name lookups, timeouts, certificates and User-Agent as every other
 //! request the app makes.
 
-use nexus_core::http::{Failure, Http, Request, Response};
+use nexus_core::http::{Failure, Http, Method, Request, Response};
 
 pub struct Agent(pub ureq::Agent);
 
 impl Http for Agent {
     fn send(&self, request: &Request) -> Result<Response, Failure> {
         let unreachable = |e: ureq::Error| Failure::Reach(e.to_string());
-        let response = match request.body {
-            None => {
+        let response = match request.method {
+            Method::Get => {
                 let mut ask = self.0.get(request.url);
                 for (name, value) in request.headers {
                     ask = ask.header(*name, *value);
@@ -24,8 +24,8 @@ impl Http for Agent {
                 }
                 .map_err(unreachable)?
             }
-            Some(body) => {
-                let mut ask = if request.method == "PUT" { self.0.put(request.url) } else { self.0.post(request.url) };
+            Method::Post(body) | Method::Put(body) => {
+                let mut ask = if matches!(request.method, Method::Put(_)) { self.0.put(request.url) } else { self.0.post(request.url) };
                 for (name, value) in request.headers {
                     ask = ask.header(*name, *value);
                 }
