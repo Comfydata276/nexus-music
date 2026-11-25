@@ -1612,7 +1612,7 @@ mod tests {
             };
             keep_first_by(&settings, "tester", "0.40.8", FOUND, &steps).unwrap();
             assert_eq!(read(COPY).as_deref(), Some(FOUND));
-            crate::config::clear_leftovers(&dir, crate::config::SETTINGS_FILES);
+            crate::config::clear_settings_leftovers(&dir, "tester", "");
             assert_eq!(names_in(&dir), vec![COPY.to_string()]);
             std::fs::remove_file(dir.join(COPY)).unwrap();
         };

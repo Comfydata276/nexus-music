@@ -18,7 +18,8 @@ be read for none, or that a power cut can still leave cut short.
   name of that write's own (the file's whole name, the process's number, a count, then
   `.tmp`), flushed to the disk, renamed over the old file, and on Linux its folder synced.
   Each write renames and removes only its own file. What a killed run left beside a file is
-  never read, and is cleared when the app next starts, before anything is written.
+  never read, and is cleared by exact name when the app next starts, before anything is
+  written (the last row below).
   - A kill leaves the old file or the new one.
   - A power cut: on Linux, the old file or the new one (if the folder's sync failed, the write
     still counts as made, and the name may come back as the old file). On Windows the
@@ -84,4 +85,4 @@ be read for none, or that a power cut can still leave cut short.
 | `songs\*` (cache) | Songs kept as they're played and fetched ahead | Renamed, unflushed (from `….fetch`, or a second name for the streamed file) | The old or nothing | Possibly an empty file, or part of a song | An empty one is not kept, and is fetched again. Any file with something in it is taken for the song: one a power cut left cut short plays short |
 | `lyrics\` (data) | Where version 0.22 kept lyrics it fetched itself | Not written | — | — | Removed at the start |
 | `buffers\*` (cache) | What is streaming now | In place, while it streams | — | — | Cleared at the start |
-| `<file>.<process>.<count>.tmp`, and `<name>.tmp` from 0.40.10 and earlier, beside the files above | A write under way, or left by a run killed during one | (The first step of "whole") | — | — | Never read; cleared when the app starts, before anything is written |
+| `<file>.<process>.<count>.tmp`, and the names 0.40.10 and before could leave (`settings.tmp`, `queue.tmp`, `queue-place.tmp`, `history.tmp`, `playlist-added.tmp`, `plays.tmp`, `asking.json.part`, `pending-<account>.tmp`, `shared-record-kept-<account>-<0.40.8 to 0.40.10>.tmp`; `index-<account>.tmp`, `collections-<account>.tmp` in a downloads folder) | A write under way, or left by a run killed during one | (The first step of "whole") | — | — | Never read. Cleared when the app starts, once, before anything is written, and only by exact name: in the settings and data folders, an app file's own name with this version's ending, or one of the old names above, for the account signed in; in a downloads folder, which may be the person's own, only that account's two lists'. Another account's are left until it is the one signed in when the app starts |

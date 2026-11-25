@@ -482,14 +482,20 @@ pub struct Controller {
 impl Controller {
     pub fn install(ui: ui::MainWindow) -> Rc<Controller> {
         let paths = Paths::new();
-        // What writes killed part-way left beside the app's files: cleared now, before
-        // anything is written (`config::clear_leftovers`).
-        for (dir, ours) in [(paths.settings.parent(), config::SETTINGS_FILES), (paths.crash_log.parent(), config::DATA_FILES)] {
-            if let Some(dir) = dir {
-                config::clear_leftovers(dir, ours);
-            }
-        }
         let (settings, settings_note) = Settings::load_checked(&paths.settings);
+        // What writes killed part-way left beside the app's files, for the account signed
+        // in: cleared now, once, before anything is written (`config::clear_leftovers`).
+        {
+            let stem = if settings.server.is_empty() { String::new() } else { account_stem(&settings.server, &settings.username) };
+            let downloads = if settings.downloads_dir.is_empty() { paths.downloads.clone() } else { PathBuf::from(&settings.downloads_dir) };
+            if let Some(dir) = paths.settings.parent() {
+                config::clear_settings_leftovers(dir, &settings.account_file(), &stem);
+            }
+            if let Some(dir) = paths.crash_log.parent() {
+                config::clear_data_leftovers(dir);
+            }
+            config::clear_downloads_leftovers(&downloads, &stem);
+        }
         let play_log = {
             let recent: Vec<(String, i64)> = config::load_history(&paths.history).into_iter().map(|played| (played.song.id, played.at)).collect();
             crate::plays::PlayLog::load(&paths.plays, &recent)
@@ -1390,7 +1396,7 @@ impl Controller {
 
     /// Who is signed in, as a name that can be part of a file's name; empty when nobody is.
     pub fn account(&self) -> String {
-        self.client().map(|client| file_stem(&format!("{}|{}", client.server(), client.username()))).unwrap_or_default()
+        self.client().map(|client| account_stem(client.server(), client.username())).unwrap_or_default()
     }
 
     /// Where the changes held for the server are kept for whoever is signed in.
@@ -4326,6 +4332,11 @@ pub(crate) fn store_page(file: &std::path::Path, page: &PageData) {
         let _ = std::fs::create_dir_all(dir);
     }
     let _ = std::fs::write(file, json);
+}
+
+/// An account as the names of its lists of downloads and what waits to be sent have it.
+pub(crate) fn account_stem(server: &str, username: &str) -> String {
+    file_stem(&format!("{server}|{username}"))
 }
 
 /// A file-system-safe rendering of a cache key. Keys that differ only in characters this

@@ -762,7 +762,7 @@ mod tests {
         assert_eq!(shared(), [play("a", 100), play("b", 200), play("c", 300)]);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), LOGGED);
         assert!(!old.exists() && log.note().is_none());
-        crate::config::clear_leftovers(path.parent().unwrap(), crate::config::SETTINGS_FILES);
+        crate::config::clear_settings_leftovers(path.parent().unwrap(), "", "");
         assert!(left.iter().all(|left| !left.exists()) && path.exists());
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }

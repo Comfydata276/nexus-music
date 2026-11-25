@@ -770,11 +770,26 @@ pub fn temp_for(path: &Path) -> PathBuf {
     path.with_file_name(format!("{name}.{}.{count}.tmp", std::process::id()))
 }
 
-/// Clears from `dir` what writes killed part-way left: files whose names end `.tmp` and
-/// start with one of `ours` (the names of the app's own files there). These are this
-/// version's names (`temp_for`) and the one name versions up to 0.40.10 used for each file
-/// (its stem, then `.tmp`). **Only when the app starts, before anything is written**: done
-/// later it could take a write's file from under it.
+/// Moves a file that couldn't be read aside, under a name of its own (`asked.json` to
+/// `asked.damaged-20261126-101500.json`, with `-2` and so on after it if that is had), never
+/// over another. Says where it went, or `None` if it couldn't be moved: then it is where it
+/// was.
+pub fn set_aside(path: &Path) -> Option<PathBuf> {
+    let stem = path.file_stem()?.to_string_lossy().into_owned();
+    let extension = path.extension().map(|extension| format!(".{}", extension.to_string_lossy())).unwrap_or_default();
+    let when = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    for count in 1..100 {
+        let more = if count == 1 { String::new() } else { format!("-{count}") };
+        let aside = path.with_file_name(format!("{stem}.damaged-{when}{more}{extension}"));
+        match place_new(path, &aside) {
+            Ok(()) => return Some(aside),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
 /// The settings folder's drive can't make hard links (`place_new`, Linux), noted the first
 /// time a file made once is tried there.
 static NO_LINKS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -797,42 +812,13 @@ pub fn no_links_note(said: &mut bool) -> Option<&'static str> {
     )
 }
 
-pub fn clear_leftovers(dir: &Path, ours: &[&str]) {
-    let Ok(entries) = fs::read_dir(dir) else { return };
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.ends_with(".tmp") && ours.iter().any(|own| name.starts_with(own)) && entry.file_type().is_ok_and(|kind| kind.is_file()) {
-            let _ = fs::remove_file(entry.path());
-        }
-    }
-}
-
-/// Moves a file that couldn't be read aside, under a name of its own (`asked.json` to
-/// `asked.damaged-20261126-101500.json`, with `-2` and so on after it if that is had), never
-/// over another. Says where it went, or `None` if it couldn't be moved: then it is where it
-/// was.
-pub fn set_aside(path: &Path) -> Option<PathBuf> {
-    let stem = path.file_stem()?.to_string_lossy().into_owned();
-    let extension = path.extension().map(|extension| format!(".{}", extension.to_string_lossy())).unwrap_or_default();
-    let when = chrono::Local::now().format("%Y%m%d-%H%M%S");
-    for count in 1..100 {
-        let more = if count == 1 { String::new() } else { format!("-{count}") };
-        let aside = path.with_file_name(format!("{stem}.damaged-{when}{more}{extension}"));
-        match place_new(path, &aside) {
-            Ok(()) => return Some(aside),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(_) => return None,
-        }
-    }
-    None
-}
 
 /// How much of the crash log has been mentioned already, kept beside it.
 pub fn crash_seen(paths: &Paths) -> PathBuf {
     paths.crash_log.with_extension("seen")
 }
 
-/// What waits to be sent to the server for an account (`Settings::account_file`).
+/// What waits to be sent to the server for an account (`controller::account_stem`).
 pub fn pending_file(paths: &Paths, account: &str) -> PathBuf {
     paths.pending.with_file_name(format!("pending-{account}.json"))
 }
@@ -847,10 +833,73 @@ pub fn lyrics_dir(pages: &Path) -> PathBuf {
     pages.join("lyrics")
 }
 
-/// The app's own files in the settings folder and the data folder, by how their names
-/// start (`clear_leftovers`).
-pub const SETTINGS_FILES: &[&str] = &["settings", "queue", "history", "pending", "playlist-added", "asked", "asking", "plays", "shared-record-kept-"];
-pub const DATA_FILES: &[&str] = &["crash"];
+/// The file a write's own file (`temp_for`) was made for, if `name` is one:
+/// `<file>.<process>.<count>.tmp`.
+fn made_for(name: &str) -> Option<&str> {
+    let rest = name.strip_suffix(".tmp")?;
+    let (rest, count) = rest.rsplit_once('.')?;
+    let (file, process) = rest.rsplit_once('.')?;
+    let digits = |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
+    (digits(process) && digits(count) && !file.is_empty()).then_some(file)
+}
+
+/// Clears from `dir` what writes killed part-way left, and **only what is provably the
+/// app's**: a file whose whole name is one of its own files' (`own`) followed by this
+/// version's temporary ending (`temp_for`), or is exactly one of the names versions up to
+/// 0.40.10 could leave (`old`). Never by a pattern over a folder the person also uses.
+/// **Only when the app starts, once, before the first write**: later it could take a write's
+/// file from under it.
+fn clear_leftovers(dir: &Path, own: impl Fn(&str) -> bool, old: &[String]) {
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let ours = old.contains(&name) || made_for(&name).is_some_and(&own);
+        if ours && entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// The settings folder's leftovers, for the account signed in: `account_file` as the kept
+/// copy of the shared record names it (`Settings::account_file`), `account_stem` as what
+/// waits to be sent does (`controller::account_stem`). Another account's are left: they
+/// are never read, and are cleared when it next starts the app.
+pub fn clear_settings_leftovers(dir: &Path, account_file: &str, account_stem: &str) {
+    const FILES: [&str; 8] = ["settings.json", "queue.json", "queue-place.json", "history.json", "playlist-added.json", "asked.json", "asking.json", "plays.log"];
+    let pending = format!("pending-{account_stem}.json");
+    let kept = format!("shared-record-kept-{account_file}-");
+    let own = |name: &str| {
+        FILES.contains(&name) || (!account_stem.is_empty() && name == pending) || (!account_file.is_empty() && name.starts_with(&kept) && name.ends_with(".json"))
+    };
+    // What 0.40.10 and the versions before it could leave: each file's stem with `.tmp`
+    // (written beside its place and renamed: the settings, the queue's two files, Recently
+    // played, when songs were added, the log of plays rewritten, what waits to be sent), the
+    // batch's `asking.json.part`, and the kept copy's `.tmp` from 0.40.8 to 0.40.10.
+    let mut old: Vec<String> = ["settings.tmp", "queue.tmp", "queue-place.tmp", "history.tmp", "playlist-added.tmp", "plays.tmp", "asking.json.part"].map(String::from).to_vec();
+    if !account_stem.is_empty() {
+        old.push(format!("pending-{account_stem}.tmp"));
+    }
+    if !account_file.is_empty() {
+        old.extend(["0.40.8", "0.40.9", "0.40.10"].map(|version| format!("shared-record-kept-{account_file}-{version}.tmp")));
+    }
+    clear_leftovers(dir, own, &old);
+}
+
+/// The data folder's: the crash note's marker's (0.40.10 wrote it in place: nothing old).
+pub fn clear_data_leftovers(dir: &Path) {
+    clear_leftovers(dir, |name| name == "crash.seen", &[]);
+}
+
+/// A downloads folder's, which may be the person's own: only the two lists of the account
+/// signed in, by exact name.
+pub fn clear_downloads_leftovers(dir: &Path, account_stem: &str) {
+    if account_stem.is_empty() {
+        return;
+    }
+    let (index, collections) = (format!("index-{account_stem}.json"), format!("collections-{account_stem}.json"));
+    let old = [format!("index-{account_stem}.tmp"), format!("collections-{account_stem}.tmp")];
+    clear_leftovers(dir, |name| name == index || name == collections, &old);
+}
 
 /// The steps by which `write_whole` puts a file on the disk, given so that a test can have
 /// the app stopped at one of them, or have one fail. `ONCE` and `REPLACING` are the real
@@ -1125,7 +1174,7 @@ mod tests {
         write_surely(&path, b"the new queue").unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "the new queue");
         assert!(left.iter().all(|left| fs::read_to_string(left).unwrap() == "the new q"));
-        clear_leftovers(&dir, &["queue"]);
+        clear_settings_leftovers(&dir, "", "");
         assert_eq!(names_in(&dir), ["queue.json"]);
         // The power goes the moment the new file has its name: it is the whole new file,
         // because it was flushed before it was given the name. (Not flushed, as
@@ -1322,18 +1371,70 @@ mod tests {
     }
 
     #[test]
-    fn what_killed_runs_left_is_cleared_at_the_start_and_nothing_else() {
-        let dir = std::env::temp_dir().join(format!("nexus-leftovers-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        // What a run killed part-way through writing left: under this version's names, and
-        // the one name versions up to 0.40.10 used. And what isn't the app's to clear.
-        for name in ["asking.json", "asking.json.4242.17.tmp", "asking.tmp", "settings.json.1.0.tmp", "someone's notes.tmp", "asking.json.4242.17.tmp.txt"] {
-            fs::write(dir.join(name), "x").unwrap();
-        }
-        clear_leftovers(&dir, &["asking", "settings"]);
-        assert_eq!(names_in(&dir), ["asking.json", "asking.json.4242.17.tmp.txt", "someone's notes.tmp"]);
-        let _ = fs::remove_dir_all(&dir);
+    fn what_killed_runs_left_is_cleared_at_the_start_and_only_what_is_provably_the_apps() {
+        let root = std::env::temp_dir().join(format!("nexus-leftovers-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let names = |dir: &Path| {
+            let mut names: Vec<String> = fs::read_dir(dir).unwrap().map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned()).collect();
+            names.sort();
+            names
+        };
+        let made = |dir: &Path, list: &[&str]| {
+            fs::create_dir_all(dir).unwrap();
+            for name in list {
+                fs::write(dir.join(name), "x").unwrap();
+            }
+        };
+        // The settings folder, for the account signed in ("acct-1a2b" in the kept copy's
+        // name, "server_ann" in the lists'): this version's names for its own files, and the
+        // exact names 0.40.10 and before could leave. Not another account's, nor anything
+        // else.
+        let settings = root.join("config");
+        let cleared = [
+            "settings.json.4242.0.tmp",
+            "plays.log.1.17.tmp",
+            "pending-server_ann.json.9.3.tmp",
+            "shared-record-kept-acct-1a2b-0.40.11.json.77.0.tmp",
+            "settings.tmp",
+            "queue.tmp",
+            "queue-place.tmp",
+            "history.tmp",
+            "playlist-added.tmp",
+            "plays.tmp",
+            "asking.json.part",
+            "pending-server_ann.tmp",
+            "shared-record-kept-acct-1a2b-0.40.10.tmp",
+        ];
+        let left = [
+            "asked.json",
+            "notes.tmp",
+            "pending-server_bob.tmp",
+            "pending-server_bob.json.9.3.tmp",
+            "queue.json.12.tmp",
+            "settings.json.x.0.tmp",
+            "settings.json.4242.0.tmp.txt",
+            "settingsx.tmp",
+            "shared-record-kept-acct-9f9f-0.40.10.tmp",
+        ];
+        made(&settings, &cleared);
+        made(&settings, &left);
+        clear_settings_leftovers(&settings, "acct-1a2b", "server_ann");
+        let mut left = left.to_vec();
+        left.sort();
+        assert_eq!(names(&settings), left);
+        // The data folder: the crash note's marker's.
+        let data = root.join("data");
+        made(&data, &["crash.seen.5.0.tmp", "crash.tmp", "diagnostics.txt"]);
+        clear_data_leftovers(&data);
+        assert_eq!(names(&data), ["crash.tmp", "diagnostics.txt"]);
+        // A downloads folder, which may be one of the person's own: only the account's two
+        // lists', by exact name. Their own index-tax.tmp is never touched.
+        let downloads = root.join("Music");
+        made(&downloads, &["index-server_ann.json.4242.1.tmp", "collections-server_ann.json.4242.2.tmp", "index-server_ann.tmp", "collections-server_ann.tmp"]);
+        made(&downloads, &["index-tax.tmp", "index-server_bob.tmp", "collections-2024.tmp", "song.flac"]);
+        clear_downloads_leftovers(&downloads, "server_ann");
+        assert_eq!(names(&downloads), ["collections-2024.tmp", "index-server_bob.tmp", "index-tax.tmp", "song.flac"]);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
