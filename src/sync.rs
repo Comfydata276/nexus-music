@@ -620,6 +620,13 @@ impl Controller {
     /// settled. (Whatever it was before, it is this PC's own now.)
     pub fn queue_changed_here(&self) {
         self.queue_owner.changed_here();
+        // What another device was playing is offered to a PC that isn't playing only while
+        // that is newer than the queue here, which it has just stopped being. (While a song
+        // plays this comes round with every note of its place, and the offer is the look's
+        // to keep or withdraw.)
+        if !self.playback.try_borrow().map(|pb| pb.playing).unwrap_or(true) && self.elsewhere.borrow_mut().take().is_some() {
+            self.ui.global::<crate::ui::Player>().set_elsewhere("".into());
+        }
         if self.settings.borrow().sync {
             self.queue_timer.start(slint::TimerMode::SingleShot, SETTLE, || {
                 with(|ctl| ctl.upload_queue());
@@ -630,12 +637,16 @@ impl Controller {
     /// This PC's side of a comparison of queues.
     fn here(&self) -> Here {
         let pb = self.playback.borrow();
+        let in_order: Vec<&Song> = pb.order.iter().filter_map(|&i| pb.queue.get(i)).collect();
         Here {
             device: self.device_name(),
             current: pb.current().map(|song| song.id.clone()),
             playing: pb.playing,
             stamp: self.queue_stamp.get(),
             taken: self.queue_owner.taken(),
+            // What this PC would save of its queue: what tells another device's queue with
+            // the same song current from this one.
+            ids: handover::window(&in_order, pb.cursor, pb.position).map(|saved| saved.ids).unwrap_or_default(),
         }
     }
 

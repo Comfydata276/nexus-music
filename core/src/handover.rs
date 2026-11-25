@@ -7,6 +7,14 @@
 //! saved a moment before, and its save is then the newest there is. Hence the rule: **a
 //! device saves its queue only if it is still the newest thing that happened.**
 //!
+//! And the rule for what comes the other way: **a queue the person has made their own is
+//! never replaced by itself.** A device puts another device's newer queue in its own
+//! queue's place only while it has nothing of the person's to lose: its queue is empty, or
+//! is one it took up from another device and nothing has been done to since. From the
+//! first thing done to a queue here (a song added, removed or moved, the queue cleared,
+//! anything played, a seek, next, previous) it is this device's own, and another device's
+//! newer queue is only ever **offered** ("Continue here"), for the person to take or leave.
+//!
 //! **The contract.** What an app keeps, and saves with the queue so that it is there after a
 //! restart: [`Here::stamp`], when the queue was last changed or played on here, **by this
 //! device's own clock**; and [`Here::taken`], set when the queue is one taken up from
@@ -31,7 +39,10 @@
 //!    [`Place::stamp`] and [`Place::taken`] as the queue's own. [`Then::Save`]: this
 //!    device's queue is newer than what the server holds, so a save is owed: make one, from
 //!    step 1 of a save. [`Looked::offer`] is what to offer as "Continue here", or to
-//!    withdraw.
+//!    withdraw: an offer stands only as long as the looks go on making it.
+//!
+//! *"Continue here"*, when the person takes the offer: put that queue in the player
+//! ([`place`]) and play it. Playing it makes it this device's own.
 //!
 //! **A tie goes to the other device**, in a save and in a look alike: both times are whole
 //! seconds, and the other's save is already there. A device whose clock is more than five
@@ -41,6 +52,14 @@
 //!
 //! Accepted, and not solved here: between the read and the save another device can still
 //! save, and is overwritten.
+//!
+//! Accepted too: a device that is not playing saves a queue the person has just changed
+//! though another device is playing, and for the seconds until that device's next save (it
+//! saves as it plays, without looking) the server holds the one that is not being played.
+//! A third device that looks in those seconds, with nothing of its own, takes that one up,
+//! and puts it right at its next look (what it took is still `taken`, so it follows). The
+//! saved queue doesn't say whether its device is playing; guessing so from how lately it
+//! was saved would hold back a person's own change for longer than the mistake lasts.
 
 use serde::{Deserialize, Serialize};
 
@@ -102,6 +121,10 @@ pub struct Here {
     /// played of it here since: when that device saved it, as the server said
     /// ([`Place::taken`]).
     pub taken: Option<String>,
+    /// The songs of this device's queue as it would save them ([`window`]'s `ids`): what
+    /// tells another device's queue with the same song current from the same queue. Left
+    /// empty, only the current song is compared.
+    pub ids: Vec<String>,
 }
 
 /// Where to pick a saved queue up, and what to keep with it.
@@ -134,7 +157,9 @@ pub fn place(theirs: &PlayQueue, clock: Clock) -> Place {
 pub enum Then {
     Nothing,
     /// Another device changed its queue at or after the time anything was last done here,
-    /// and nothing is playing here: put it in this one's place, paused.
+    /// and this device has nothing of the person's to lose by it (its queue is empty, or
+    /// is one taken up from another device and left alone): put it in this one's place,
+    /// paused.
     TakeUp(Place),
     /// This device's queue is newer than what the server holds: its save is owed.
     Save,
@@ -142,8 +167,10 @@ pub enum Then {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Looked {
-    /// Another device has been playing something else in the last half hour: the song of
-    /// the server's queue (by its place there) to offer as "Continue here". `None` withdraws
+    /// The song of the server's queue (by its place there) to offer as "Continue here":
+    /// another device's queue, different from the one here, that is not taken up by itself.
+    /// To a device that isn't playing it is offered for as long as it is the newer of the
+    /// two; to one that is playing, for half an hour after it was saved. `None` withdraws
     /// any offer made before.
     pub offer: Option<usize>,
     pub then: Then,
@@ -158,6 +185,12 @@ fn usable(clock: Clock) -> bool {
     clock != Clock::Unmeasured && !clock.wrong()
 }
 
+/// Whether the server's queue is the one this device has: the same song current and, where
+/// the device says what its queue holds, the same songs around it.
+fn same_queue(theirs: &PlayQueue, here: &Here) -> bool {
+    here.current.as_deref() == Some(theirs.current.as_str()) && (here.ids.is_empty() || here.ids.iter().eq(theirs.songs.iter().map(|song| &song.id)))
+}
+
 /// Decides what a look at the server's saved queue leads to. `clock` is this device's clock
 /// beside the server's as that very read measured it, and `now` this device's clock.
 pub fn look(theirs: &PlayQueue, here: &Here, clock: Clock, now: i64) -> Looked {
@@ -167,19 +200,25 @@ pub fn look(theirs: &PlayQueue, here: &Here, clock: Clock, now: i64) -> Looked {
     let changed = parse_time(&theirs.changed);
     let stamp = aligned(here.stamp, clock.offset());
     let others = others(theirs, here);
-    let age = aligned(now, clock.offset()).saturating_sub(changed);
-    let offer = (others && (0..OFFER_FOR).contains(&age) && here.current.as_deref() != Some(theirs.current.as_str()))
-        .then(|| theirs.songs.iter().position(|song| song.id == theirs.current).unwrap_or(0));
     // The one this device has already taken up, untouched since.
     if others && here.taken.as_deref() == Some(theirs.changed.as_str()) {
-        return Looked { offer, then: Then::Nothing };
+        return Looked { offer: None, then: Then::Nothing };
     }
     // (A tie goes to the other device, as it does in a save.)
-    if others && changed >= stamp {
-        // A device that's playing keeps its own queue, and is offered the other.
-        return if here.playing { Looked { offer, then: Then::Nothing } } else { Looked { offer: None, then: Then::TakeUp(place(theirs, clock)) } };
+    let newer = others && changed >= stamp;
+    // The queue here is the person's own: something is in it, and it is not one taken up
+    // from another device and left alone.
+    let own = here.current.is_some() && here.taken.is_none();
+    if newer && !here.playing && !own {
+        return Looked { offer: None, then: Then::TakeUp(place(theirs, clock)) };
     }
-    let owed = here.current.is_some() && here.taken.is_none() && stamp > changed;
+    // Whatever is not taken up is offered, if it is another queue than the one here: while
+    // a song plays here, what another device was playing in the last half hour; otherwise
+    // whatever is newer than the queue here, for as long as it is.
+    let age = aligned(now, clock.offset()).saturating_sub(changed);
+    let offered = others && !same_queue(theirs, here) && if here.playing { (0..OFFER_FOR).contains(&age) } else { newer };
+    let offer = offered.then(|| theirs.songs.iter().position(|song| song.id == theirs.current).unwrap_or(0));
+    let owed = !newer && own && stamp > changed;
     Looked { offer, then: if owed { Then::Save } else { Then::Nothing } }
 }
 
@@ -244,9 +283,15 @@ mod tests {
         PlayQueue { songs: ids.iter().map(|id| song(id)).collect(), current: current.into(), position, changed, changed_by: device.into() }
     }
 
-    /// This device, its queue last changed `stamp` seconds into that day by its own clock.
+    /// This device, its queue last changed `stamp` seconds into that day by its own clock:
+    /// a queue of the person's own, with the song "mine" current.
     fn here(stamp: i64) -> Here {
-        Here { device: ME.into(), current: Some("mine".into()), playing: false, stamp: DAY + stamp, taken: None }
+        Here { device: ME.into(), current: Some("mine".into()), playing: false, stamp: DAY + stamp, taken: None, ids: Vec::new() }
+    }
+
+    /// The same device with nothing in its queue.
+    fn empty(stamp: i64) -> Here {
+        Here { current: None, ..here(stamp) }
     }
 
     #[test]
@@ -312,7 +357,7 @@ mod tests {
     fn a_queue_taken_up_from_another_device_is_not_saved_as_this_ones_own() {
         // The PC's queue, saved at 00:10:00, was taken up here.
         let theirs = saved(PC, 600, &["a", "b", "c"], "b", 30_000);
-        let Then::TakeUp(taken_up) = look(&theirs, &here(100), RIGHT, DAY + 700).then else { panic!("not taken up") };
+        let Then::TakeUp(taken_up) = look(&theirs, &empty(100), RIGHT, DAY + 700).then else { panic!("not taken up") };
         let taken = Here { current: Some("b".into()), stamp: taken_up.stamp, taken: Some(taken_up.taken.clone()), ..here(0) };
         // A save asked for before it was taken up comes due: what is in the player is the
         // PC's queue, untouched, and it is not passed on as this device's, changed now.
@@ -338,19 +383,28 @@ mod tests {
     #[test]
     fn the_saved_queue_is_taken_up_offered_or_left() {
         let theirs = saved(PC, 600, &["a", "b", "c"], "b", 30_000);
-        // Not playing, and nothing done here since: taken up, paused, and nothing offered.
+        let place_there = Place { cursor: 1, position: 30.0, stamp: DAY + 600, taken: theirs.changed.clone() };
+        // Nothing in the queue here: taken up, paused, and nothing offered.
+        assert_eq!(look(&theirs, &empty(100), RIGHT, DAY + 700), Looked { offer: None, then: Then::TakeUp(place_there.clone()) });
+        // A queue of the person's own, not playing: left as it is, and the other offered,
+        // for as long as it is the newer. Not for half an hour: the next morning too.
         let idle = here(100);
-        assert_eq!(look(&theirs, &idle, RIGHT, DAY + 700), Looked { offer: None, then: Then::TakeUp(Place { cursor: 1, position: 30.0, stamp: DAY + 600, taken: theirs.changed.clone() }) });
-        // Playing something of its own: left alone, and offered.
+        assert_eq!(look(&theirs, &idle, RIGHT, DAY + 700), Looked { offer: Some(1), then: Then::Nothing });
+        assert_eq!(look(&theirs, &idle, RIGHT, DAY + 600 + 20 * 3_600), Looked { offer: Some(1), then: Then::Nothing });
+        // Playing something of its own: left alone, and offered what another device was
+        // playing in the last half hour.
         let busy = Here { playing: true, ..here(100) };
         assert_eq!(look(&theirs, &busy, RIGHT, DAY + 700), Looked { offer: Some(1), then: Then::Nothing });
-        // Not offered the song it is on already, nor after half an hour, nor its own queue.
-        assert_eq!(look(&theirs, &Here { current: Some("b".into()), ..busy.clone() }, RIGHT, DAY + 700).offer, None);
         assert_eq!(look(&theirs, &busy, RIGHT, DAY + 600 + OFFER_FOR).offer, None);
-        assert_eq!(look(&saved(ME, 600, &["a", "b"], "b", 0), &busy, RIGHT, DAY + 700), Looked { offer: None, then: Then::Nothing });
-        // Changed here after the PC saved, and paused: the PC's is neither taken up (this
-        // one's is the newer) nor left to stand: this device's save is owed.
-        assert_eq!(look(&theirs, &here(650), RIGHT, DAY + 700), Looked { offer: Some(1), then: Then::Save });
+        // Nobody is offered the song they are on already, nor their own queue.
+        for device in [&idle, &busy] {
+            assert_eq!(look(&theirs, &Here { current: Some("b".into()), ..device.clone() }, RIGHT, DAY + 700).offer, None);
+            assert_eq!(look(&saved(ME, 600, &["a", "b"], "b", 0), device, RIGHT, DAY + 700), Looked { offer: None, then: Then::Nothing });
+        }
+        // Changed here after the PC saved, and paused: the PC's is the older, so it is
+        // neither taken up nor offered, and it is not left to stand: this device's save is
+        // owed.
+        assert_eq!(look(&theirs, &here(650), RIGHT, DAY + 700), Looked { offer: None, then: Then::Save });
         // A song that had all but ended is picked up from its start; one the queue doesn't
         // name, at its first song.
         assert_eq!(place(&saved(PC, 600, &["a", "b"], "b", 199_500), RIGHT).position, 0.0);
@@ -358,15 +412,78 @@ mod tests {
     }
 
     #[test]
+    fn the_same_song_in_another_queue_is_another_queue() {
+        // Both devices are on the song "b". Where this one says what is in its queue, it is
+        // offered the other's only if the songs around "b" are not the same ones.
+        let theirs = saved(PC, 600, &["a", "b", "c"], "b", 30_000);
+        let ids = |ids: &[&str]| ids.iter().map(|id| id.to_string()).collect::<Vec<_>>();
+        let on_b = Here { current: Some("b".into()), ..here(100) };
+        assert_eq!(look(&theirs, &Here { ids: ids(&["a", "b", "c"]), ..on_b.clone() }, RIGHT, DAY + 700).offer, None);
+        // The person added a song here: another queue, and the PC's is offered.
+        assert_eq!(look(&theirs, &Here { ids: ids(&["a", "b", "c", "x"]), ..on_b.clone() }, RIGHT, DAY + 700).offer, Some(1));
+        // Or the PC's list was changed after the song both are on.
+        assert_eq!(look(&saved(PC, 600, &["a", "b", "z"], "b", 0), &Here { ids: ids(&["a", "b", "c"]), ..on_b.clone() }, RIGHT, DAY + 700).offer, Some(1));
+        // The same while a song plays here, within the half hour.
+        let playing = Here { playing: true, ids: ids(&["a", "b", "c", "x"]), ..on_b.clone() };
+        assert_eq!(look(&theirs, &playing, RIGHT, DAY + 700).offer, Some(1));
+        assert_eq!(look(&theirs, &Here { ids: ids(&["a", "b", "c"]), ..playing }, RIGHT, DAY + 700).offer, None);
+        // A device that doesn't say what is in its queue is judged by its current song alone.
+        assert_eq!(look(&theirs, &on_b, RIGHT, DAY + 700).offer, None);
+        // What is in the queue here never decides whether another's is taken up: only
+        // whether there is anything of the person's to lose.
+        assert_eq!(look(&theirs, &Here { ids: ids(&["a", "b", "c"]), ..on_b.clone() }, RIGHT, DAY + 700).then, Then::Nothing);
+    }
+
+    #[test]
+    fn a_queue_the_person_has_made_their_own_is_never_replaced_by_itself() {
+        // What happened on a phone: a PC is playing, and saves its queue as it goes. The
+        // phone, not playing, took that queue up (00:10:00), and has followed it since.
+        let theirs = saved(PC, 600, &["a", "b", "c"], "b", 30_000);
+        let Then::TakeUp(taken_up) = look(&theirs, &empty(0), RIGHT, DAY + 610).then else { panic!("not taken up") };
+        let following = Here { current: Some("b".into()), stamp: taken_up.stamp, taken: Some(taken_up.taken.clone()), ..here(0) };
+        // Left alone it goes on following: the PC's next save is taken up as the last was.
+        assert!(matches!(look(&saved(PC, 620, &["a", "b", "c"], "b", 50_000), &following, RIGHT, DAY + 625).then, Then::TakeUp(_)));
+
+        // The person adds a song to it at 00:11:00. From then it is this device's own queue.
+        let own = Here { taken: None, stamp: DAY + 660, ..following.clone() };
+        // Its save goes (the PC's last save is the older)...
+        assert_eq!(save(&saved(PC, 640, &["a", "b", "c"], "b", 70_000), &own, RIGHT), Save::Save);
+        // ...and the PC, playing, saves over it twenty seconds later without a look. The
+        // look after that finds the PC's queue the newer. It is not put in this one's
+        // place: the song just added is still here.
+        let again = saved(PC, 680, &["a", "b", "c"], "b", 110_000);
+        assert_eq!(look(&again, &own, RIGHT, DAY + 700), Looked { offer: None, then: Then::Nothing });
+        // Nor does this device save over the PC again: the two don't take turns.
+        assert_eq!(save(&again, &own, RIGHT), Save::NotNewest);
+        // When the PC moves on to another song, that is offered, and still nothing is done
+        // by itself, however many looks go by.
+        let moved = saved(PC, 800, &["a", "b", "c"], "c", 0);
+        assert_eq!(look(&moved, &own, RIGHT, DAY + 815), Looked { offer: Some(2), then: Then::Nothing });
+        assert_eq!(look(&moved, &own, RIGHT, DAY + 830), Looked { offer: Some(2), then: Then::Nothing });
+        // All of which is so after a restart: what says the queue is the person's own is
+        // what the device keeps with it.
+        let restarted: Here = serde_json::from_str(&serde_json::to_string(&own).unwrap()).unwrap();
+        assert_eq!(look(&moved, &restarted, RIGHT, DAY + 815).then, Then::Nothing);
+
+        // A queue is the person's own from the first thing done to it, whatever that was
+        // and however long ago: one played here yesterday is not replaced either.
+        assert_eq!(look(&moved, &here(-80_000), RIGHT, DAY + 815).then, Then::Nothing);
+        // A device with nothing in its queue has nothing of the person's to lose: taken up.
+        assert!(matches!(look(&moved, &empty(-80_000), RIGHT, DAY + 815).then, Then::TakeUp(_)));
+    }
+
+    #[test]
     fn a_tie_goes_to_the_other_device_when_saving_and_when_looking_alike() {
         // Changed here in the very second the PC saved its own.
         let theirs = saved(PC, 600, &["a", "b", "c"], "b", 30_000);
         assert_eq!(save(&theirs, &here(600), RIGHT), Save::NotNewest);
-        // And so a look takes the PC's up, where nothing is playing: the two rules agree,
-        // and the devices end with the same queue. (With the save refused and the look
-        // waiting for something strictly newer, each kept its own for good.)
-        assert!(matches!(look(&theirs, &here(600), RIGHT, DAY + 700).then, Then::TakeUp(_)));
-        assert_eq!(look(&theirs, &here(601), RIGHT, DAY + 700).then, Then::Save);
+        // And so a look counts the PC's as the newer: the two rules agree. Where there is
+        // nothing of the person's to lose it is taken up; a queue of the person's own is
+        // offered it. (With the save refused and the look waiting for something strictly
+        // newer, this device's change was neither on the server nor answered by anything.)
+        assert!(matches!(look(&theirs, &empty(600), RIGHT, DAY + 700).then, Then::TakeUp(_)));
+        assert_eq!(look(&theirs, &here(600), RIGHT, DAY + 700), Looked { offer: Some(1), then: Then::Nothing });
+        assert_eq!(look(&theirs, &here(601), RIGHT, DAY + 700), Looked { offer: None, then: Then::Save });
     }
 
     #[test]
