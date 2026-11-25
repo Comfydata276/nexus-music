@@ -1152,19 +1152,21 @@ fn stats(client: &Client, period: usize) -> PageData {
         Some(_) => String::new(),
     };
     // The plays kept on this PC could not be read this time: what is here is not all of it,
-    // and none of it is gone.
-    let unread = "The plays kept on this PC couldn't be read when the app started, so only what's been played since is counted here. Nothing has been deleted: they are read again the next time the app starts.";
-    let note = if crate::plays::unread() { format!("{unread} {note}").trim_end().to_string() } else { note };
+    // and none of it is gone. Said at the top of the page, where it is seen.
+    let notice = if crate::plays::unread() {
+        "The plays kept on this PC couldn't be read when the app started, so only what's been played since is counted here. Nothing has been deleted: they are read again the next time the app starts."
+    } else {
+        ""
+    };
     if songs.is_empty() {
         let empty = match period {
-            _ if crate::plays::unread() => unread,
             STATS_TODAY => "Nothing played yet today. Songs show up here once you're half way through them.",
             STATS_WEEK => "Nothing played yet this week.",
             STATS_MONTH => "Nothing played yet this month.",
             STATS_ALL => "Nothing has been played yet.",
             _ => "Nothing was played in this time.",
         };
-        return PageData { empty: empty.into(), about: if all_time { note } else { String::new() }, ..blank };
+        return PageData { empty: empty.into(), about: if all_time { note } else { String::new() }, notice: notice.into(), ..blank };
     }
 
     // The same plays, added up by artist, by album and by kind of music.
@@ -1230,6 +1232,7 @@ fn stats(client: &Client, period: usize) -> PageData {
     PageData {
         stats: figures,
         about: note,
+        notice: notice.into(),
         lead: shelf("Top artists", top_artists).into_iter().collect(),
         songs: top.iter().map(|(song, _)| (*song).clone()).collect(),
         song_notes: top.iter().map(|(_, times)| plays(*times)).collect(),
