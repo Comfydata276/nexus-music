@@ -129,6 +129,16 @@ impl Rule {
         Ok(Reservation { id, generation: self.generation })
     }
 
+    /// A command that was accepted turns out not to be one this device can carry out (the
+    /// song it names is no longer in the queue; none of the songs it brings are in this
+    /// library). Nothing was changed for it, so nothing moves: the device is no longer
+    /// busy with it, and that is all.
+    pub fn refuse(&mut self, reservation: Reservation) {
+        if self.command == Some(reservation.id) {
+            self.command = None;
+        }
+    }
+
     /// The moment the player is changed for a command. `Ok`: change it; the command is the
     /// one that made this state. `Err`: change nothing. `same_session` is whether the
     /// sign-in and the secret the command arrived under are still the ones in use, and
@@ -180,6 +190,26 @@ mod tests {
     fn command(rule: &mut Rule, at: At, minute: u64, nonce: Nonce) -> Result<(), Why> {
         let reservation = rule.admit(at, minute, minute.saturating_mul(60_000))?;
         rule.finish(reservation, at, minute, true, nonce)
+    }
+
+    /// A command that is accepted and then found to be one this device cannot carry out
+    /// (the song it names has gone from the queue) changes nothing and leaves nothing open.
+    #[test]
+    fn a_command_that_cannot_be_carried_out_is_let_go_and_moves_nothing() {
+        let mut rule = Rule::default();
+        let seen = at(&rule, 0);
+        let reservation = rule.admit(seen, 0, 0).unwrap();
+        assert!(rule.busy(0));
+        rule.refuse(reservation);
+        assert_eq!((rule.busy(0), rule.generation(), rule.by()), (false, 1, None));
+        // It cannot be finished afterwards, and the next command is taken as usual.
+        assert_eq!(rule.finish(reservation, seen, 0, true, X), Err(Why::Changed));
+        assert_eq!(command(&mut rule, seen, 0, Y), Ok(()));
+        // Letting go of a command that is not the open one touches nothing.
+        let open = rule.admit(at(&rule, 0), 0, 0).unwrap();
+        rule.refuse(reservation);
+        assert!(rule.busy(0));
+        assert_eq!(rule.finish(open, At { generation: 2, minute: 0 }, 0, true, X), Ok(()));
     }
 
     #[test]
