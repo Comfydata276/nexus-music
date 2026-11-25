@@ -116,25 +116,72 @@ pub struct Fetched {
     pub comment: Option<String>,
 }
 
-/// Whether a playlist is public, as an XML answer to "fetch this playlist" states it.
+/// A playlist as one XML answer to "fetch this playlist" gives it: what it is, whose,
+/// whether it is public, and its comment, **all from the one answer**.
 ///
-/// Navidrome leaves `public` out of a JSON answer when it is false, as it does an empty
-/// comment, so a JSON answer cannot **state** that a playlist is private: it can only not
-/// say. Its XML answer always writes the attribute. So where the JSON does not say, the
-/// app asks again in XML and reads it here. `None` unless the answer is an "ok" one about
-/// the playlist with this id and says `public="true"` or `public="false"`.
-pub fn stated_public(xml: &str, id: &str) -> Option<bool> {
-    let ok = attributes(xml, "subsonic-response")?.into_iter().any(|(name, value)| name == "status" && value == "ok");
-    let playlist = attributes(xml, "playlist")?;
-    let said = |wanted: &str| playlist.iter().find(|(name, _)| *name == wanted).map(|(_, value)| *value);
-    if !ok || said("id") != Some(id) {
+/// It has to be the XML answer. Navidrome leaves `public` out of a JSON answer when it is
+/// false, as it does an empty comment, so a JSON answer cannot **state** that a playlist is
+/// private; its XML always writes the attribute. And it has to be one answer: with the
+/// comment from one and the privacy from another, a secret that was replaced between the
+/// two would be renewed on the strength of an answer about its successor.
+///
+/// `None` unless the answer is an "ok" one with a playlist in it. What the playlist's tag
+/// leaves out is left out here, and [`judge`] decides what that means.
+pub fn fetched(xml: &str) -> Option<Fetched> {
+    if !attributes(xml, "subsonic-response")?.into_iter().any(|(name, value)| name == "status" && value == "ok") {
         return None;
     }
-    match said("public")? {
-        "true" => Some(true),
-        "false" => Some(false),
-        _ => None,
+    let playlist = attributes(xml, "playlist")?;
+    let said = |wanted: &str| playlist.iter().find(|(name, _)| *name == wanted).map(|(_, value)| unescaped(value));
+    Some(Fetched {
+        id: said("id")?,
+        name: said("name").unwrap_or_default(),
+        owner: said("owner"),
+        public: match said("public").as_deref() {
+            Some("true") => Some(true),
+            Some("false") => Some(false),
+            _ => None,
+        },
+        comment: said("comment"),
+    })
+}
+
+/// An attribute's value as the text it stands for.
+fn unescaped(value: &str) -> String {
+    let mut text = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(at) = rest.find('&') {
+        text.push_str(&rest[..at]);
+        rest = &rest[at..];
+        let named = rest.find(';').filter(|end| *end <= 10).and_then(|end| {
+            let name = &rest[1..end];
+            let c = match name {
+                "quot" => Some('"'),
+                "apos" => Some('\''),
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "amp" => Some('&'),
+                _ => match name.strip_prefix("#x").or_else(|| name.strip_prefix("#X")) {
+                    Some(hex) => u32::from_str_radix(hex, 16).ok().and_then(char::from_u32),
+                    None => name.strip_prefix('#').and_then(|digits| digits.parse().ok()).and_then(char::from_u32),
+                },
+            }?;
+            Some((c, end))
+        });
+        match named {
+            Some((c, end)) => {
+                text.push(c);
+                rest = &rest[end + 1..];
+            }
+            // Not a reference this knows: the text is as written.
+            None => {
+                text.push('&');
+                rest = &rest[1..];
+            }
+        }
     }
+    text.push_str(rest);
+    text
 }
 
 /// The attributes of the first `<element ...>` in an XML text, as written (not unescaped:
@@ -272,7 +319,7 @@ mod tests {
         Stated { id: id.into(), name: PLAYLIST_NAME.into(), owner: owner.map(str::to_string), comment: None }
     }
 
-    fn fetched(id: &str, comment: Option<&str>) -> Fetched {
+    fn got(id: &str, comment: Option<&str>) -> Fetched {
         Fetched { id: id.into(), name: PLAYLIST_NAME.into(), owner: Some("tester".into()), public: Some(false), comment: comment.map(str::to_string) }
     }
 
@@ -330,7 +377,7 @@ mod tests {
         // "k" was used and has been deleted. "m" is still there, with whatever it held.
         let left = [listed("m", Some("tester"))];
         assert_eq!(choose(&left, "tester", Some("k")), Next::Fetch { id: "m".into(), replace: true });
-        assert_eq!(judge("m", true, &fetched("m", Some(COMMENT)), "tester"), Verdict::Write(Why::Gone));
+        assert_eq!(judge("m", true, &got("m", Some(COMMENT)), "tester"), Verdict::Write(Why::Gone));
         // With none left, one is made. With the one used now somebody else's, it has gone too.
         assert_eq!(choose(&[], "tester", Some("k")), Next::Make);
         assert_eq!(choose(&[listed("k", Some("other")), listed("m", Some("tester"))], "tester", Some("k")), Next::Fetch { id: "m".into(), replace: true });
@@ -338,51 +385,77 @@ mod tests {
 
     #[test]
     fn a_fetched_playlist_counts_only_if_it_is_stated_to_be_ours_and_private() {
-        assert_eq!(judge("k", false, &fetched("k", Some(COMMENT)), "Tester"), Verdict::Use(secret()));
+        assert_eq!(judge("k", false, &got("k", Some(COMMENT)), "Tester"), Verdict::Use(secret()));
         // Not the one asked for, by id or by name.
-        assert_eq!(judge("k", false, &fetched("j", Some(COMMENT)), "tester"), Verdict::Stop(Stop::Mismatch));
-        assert_eq!(judge("k", false, &Fetched { name: "Renamed".into(), ..fetched("k", Some(COMMENT)) }, "tester"), Verdict::Stop(Stop::Mismatch));
+        assert_eq!(judge("k", false, &got("j", Some(COMMENT)), "tester"), Verdict::Stop(Stop::Mismatch));
+        assert_eq!(judge("k", false, &Fetched { name: "Renamed".into(), ..got("k", Some(COMMENT)) }, "tester"), Verdict::Stop(Stop::Mismatch));
         // Whose it is, and whether it is private, have to be said.
-        assert_eq!(judge("k", false, &Fetched { owner: None, ..fetched("k", Some(COMMENT)) }, "tester"), Verdict::Stop(Stop::NotStated));
-        assert_eq!(judge("k", false, &Fetched { owner: Some("other".into()), ..fetched("k", Some(COMMENT)) }, "tester"), Verdict::Stop(Stop::Mismatch));
-        assert_eq!(judge("k", false, &Fetched { public: None, ..fetched("k", Some(COMMENT)) }, "tester"), Verdict::Stop(Stop::NotStated));
+        assert_eq!(judge("k", false, &Fetched { owner: None, ..got("k", Some(COMMENT)) }, "tester"), Verdict::Stop(Stop::NotStated));
+        assert_eq!(judge("k", false, &Fetched { owner: Some("other".into()), ..got("k", Some(COMMENT)) }, "tester"), Verdict::Stop(Stop::Mismatch));
+        assert_eq!(judge("k", false, &Fetched { public: None, ..got("k", Some(COMMENT)) }, "tester"), Verdict::Stop(Stop::NotStated));
         // One that others could see is given a new secret, whatever it holds.
-        assert_eq!(judge("k", false, &Fetched { public: Some(true), ..fetched("k", Some(COMMENT)) }, "tester"), Verdict::Write(Why::Public));
+        assert_eq!(judge("k", false, &Fetched { public: Some(true), ..got("k", Some(COMMENT)) }, "tester"), Verdict::Write(Why::Public));
+    }
+
+    /// What Navidrome answers, private and public.
+    fn answer(public: &str) -> String {
+        format!(r#"<subsonic-response xmlns="http://subsonic.org/restapi" status="ok" version="1.16.1" type="navidrome" serverVersion="0.58.0" openSubsonic="true"><playlist id="7K5dLzMvMcCEj4us2t4RO0" name="Nexus Music link" comment="{{&#34;nexus_music_link&#34;:1,&#34;secret&#34;:&#34;ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8&#34;}}" songCount="0" duration="0" public="{public}" owner="tester" created="2026-11-25T07:05:11Z" changed="2026-11-25T07:05:11Z"></playlist></subsonic-response>"#)
     }
 
     #[test]
-    fn whether_a_playlist_is_public_is_read_where_the_server_always_says() {
-        // As Navidrome answers, private and public.
-        let answer = |public: &str| format!(r#"<subsonic-response xmlns="http://subsonic.org/restapi" status="ok" version="1.16.1" type="navidrome" serverVersion="0.58.0" openSubsonic="true"><playlist id="7K5dLzMvMcCEj4us2t4RO0" name="Nexus Music link" comment="{{&#34;nexus_music_link&#34;:1,&#34;secret&#34;:&#34;x&#34;}}" songCount="0" duration="0" public="{public}" owner="tester" created="2026-11-25T07:05:11Z" changed="2026-11-25T07:05:11Z"></playlist></subsonic-response>"#);
-        assert_eq!(stated_public(&answer("false"), "7K5dLzMvMcCEj4us2t4RO0"), Some(false));
-        assert_eq!(stated_public(&answer("true"), "7K5dLzMvMcCEj4us2t4RO0"), Some(true));
-        // About another playlist, or not saying, or saying something else, it states nothing.
-        assert_eq!(stated_public(&answer("false"), "another"), None);
-        assert_eq!(stated_public(&answer("false").replace(r#" public="false""#, ""), "7K5dLzMvMcCEj4us2t4RO0"), None);
-        assert_eq!(stated_public(&answer("no"), "7K5dLzMvMcCEj4us2t4RO0"), None);
-        // An answer that is an error is not one about the playlist, whatever it contains.
-        assert_eq!(stated_public(&answer("false").replace(r#"status="ok""#, r#"status="failed""#), "7K5dLzMvMcCEj4us2t4RO0"), None);
-        assert_eq!(stated_public(r#"<subsonic-response status="failed"><error code="70" message="playlist not found"/></subsonic-response>"#, "k"), None);
-        // What a comment or a name says is inside its own quotes and is not an attribute.
-        let sly = r#"<subsonic-response status="ok"><playlist id="k" name="x public=&quot;false&quot;" comment=' public="false" > ' owner="tester"/></subsonic-response>"#;
-        assert_eq!(stated_public(sly, "k"), None);
-        assert_eq!(stated_public(r#"<subsonic-response status="ok"><playlist id='k' public='true'/></subsonic-response>"#, "k"), Some(true));
+    fn a_playlist_is_read_whole_from_the_one_answer_that_says_whether_it_is_public() {
+        let private = fetched(&answer("false")).unwrap();
+        assert_eq!(private, Fetched { id: "7K5dLzMvMcCEj4us2t4RO0".into(), name: PLAYLIST_NAME.into(), owner: Some("tester".into()), public: Some(false), comment: Some(COMMENT.into()) });
+        // And so judged: the secret in it is the one to use.
+        assert_eq!(judge("7K5dLzMvMcCEj4us2t4RO0", false, &private, "tester"), Verdict::Use(secret()));
+        assert_eq!(judge("7K5dLzMvMcCEj4us2t4RO0", false, &fetched(&answer("true")).unwrap(), "tester"), Verdict::Write(Why::Public));
+        // Not saying, or saying something else, it states nothing, and nothing is used.
+        for unsaid in [answer("false").replace(r#" public="false""#, ""), answer("no")] {
+            let read = fetched(&unsaid).unwrap();
+            assert_eq!((read.public, judge(&read.id, false, &read, "tester")), (None, Verdict::Stop(Stop::NotStated)));
+        }
+        // An empty comment is left out, as Navidrome leaves it; so is an owner it won't state.
+        let bare = fetched(r#"<subsonic-response status="ok"><playlist id="k" name="Nexus Music link" public="false" owner="tester"/></subsonic-response>"#).unwrap();
+        assert_eq!((bare.comment.clone(), judge("k", false, &bare, "tester")), (None, Verdict::Write(Why::Empty)));
+        assert_eq!(fetched(r#"<subsonic-response status="ok"><playlist id='k' public='true'/></subsonic-response>"#).map(|read| (read.owner, read.public)), Some((None, Some(true))));
+    }
+
+    #[test]
+    fn an_answer_that_is_not_an_ok_one_about_a_playlist_gives_nothing() {
+        assert_eq!(fetched(&answer("false").replace(r#"status="ok""#, r#"status="failed""#)), None);
+        assert_eq!(fetched(r#"<subsonic-response status="failed"><error code="70" message="playlist not found"/></subsonic-response>"#), None);
+        assert_eq!(fetched(r#"<subsonic-response status="ok"></subsonic-response>"#), None);
+        assert_eq!(fetched(r#"<subsonic-response status="ok"><playlist name="Nexus Music link"/></subsonic-response>"#), None);
         // The element is the playlist, not one whose name begins the same way.
-        assert_eq!(stated_public(r#"<subsonic-response status="ok"><playlists><playlist id="k" public="false"/></playlists></subsonic-response>"#, "k"), Some(false));
-        // Cut short or not XML at all, it states nothing and does not trip anything up.
+        assert_eq!(fetched(r#"<subsonic-response status="ok"><playlists><playlist id="k" public="false"/></playlists></subsonic-response>"#).map(|read| read.id), Some("k".into()));
+        // Cut short or not XML at all, it gives nothing and does not trip anything up.
         for broken in ["", "<playlist", "<playlist id=", r#"<playlist id="k"#, r#"<subsonic-response status="ok"><playlist id="k" public="false""#, "{\"playlist\":{}}", "<playlist é=\"é\">"] {
-            assert_eq!(stated_public(broken, "k"), None, "{broken}");
+            assert_eq!(fetched(broken), None, "{broken}");
+        }
+    }
+
+    #[test]
+    fn what_a_name_or_a_comment_says_is_inside_its_own_quotes() {
+        // Text made to look like an attribute, in a name and in a comment.
+        let sly = r#"<subsonic-response status="ok"><playlist id="k" name="x public=&quot;false&quot; owner=&quot;tester&quot;" comment=' public="false" > ' owner="other"/></subsonic-response>"#;
+        let read = fetched(sly).unwrap();
+        assert_eq!((read.public, read.owner.as_deref(), read.comment.as_deref()), (None, Some("other"), Some(r#" public="false" > "#)));
+        assert_eq!(read.name, r#"x public="false" owner="tester""#);
+        // References are read as what they stand for, each way they can be written, and
+        // what is not a reference is left as it is.
+        for (written, meant) in [("a&amp;b", "a&b"), ("&lt;&gt;&quot;&apos;", "<>\"'"), ("&#34;&#x22;&#X22;", "\"\"\""), ("fish &chips; & more", "fish &chips; & more"), ("&#xD83D;", "&#xD83D;"), ("&", "&"), ("caf&#233;", "café")] {
+            assert_eq!(unescaped(written), meant, "{written}");
         }
     }
 
     #[test]
     fn an_empty_or_broken_record_of_ours_is_repaired_and_a_later_one_left_alone() {
-        assert_eq!(judge("k", false, &fetched("k", None), "tester"), Verdict::Write(Why::Empty));
-        assert_eq!(judge("k", false, &fetched("k", Some("")), "tester"), Verdict::Write(Why::Empty));
-        assert_eq!(judge("k", false, &fetched("k", Some("someone's note")), "tester"), Verdict::Write(Why::Broken));
+        assert_eq!(judge("k", false, &got("k", None), "tester"), Verdict::Write(Why::Empty));
+        assert_eq!(judge("k", false, &got("k", Some("")), "tester"), Verdict::Write(Why::Empty));
+        assert_eq!(judge("k", false, &got("k", Some("someone's note")), "tester"), Verdict::Write(Why::Broken));
         let later = r#"{"nexus_music_link":2,"secret":"x"}"#;
-        assert_eq!(judge("k", false, &fetched("k", Some(later)), "tester"), Verdict::Stop(Stop::Later));
+        assert_eq!(judge("k", false, &got("k", Some(later)), "tester"), Verdict::Stop(Stop::Later));
         // Not even to make it private, or because another has gone.
-        assert_eq!(judge("k", true, &Fetched { public: Some(true), ..fetched("k", Some(later)) }, "tester"), Verdict::Stop(Stop::Later));
+        assert_eq!(judge("k", true, &Fetched { public: Some(true), ..got("k", Some(later)) }, "tester"), Verdict::Stop(Stop::Later));
     }
 }

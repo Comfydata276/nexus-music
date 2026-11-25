@@ -23,7 +23,7 @@ use std::time::Duration;
 use nexus_core::link::frame::{self, ASK, Keys, TELL};
 use nexus_core::link::message::{Ask, At, Tell, Why, read_ask, read_tell};
 use nexus_core::link::rule::Waiting;
-use nexus_core::link::secret::{self, Fetched, Next, Secret, Stop, Verdict};
+use nexus_core::link::secret::{self, Next, Secret, Stop, Verdict};
 use nexus_core::link::steer::{Outcome, Peer, Tick, Told, Wait};
 use nexus_core::link::{Asks, LOOK_AGAIN_MS, LOOK_EVERY_MS, Nonce, Place, VERSION, minute, secret_holds, text};
 use nexus_core::step::Stated;
@@ -194,7 +194,17 @@ enum Looked {
     /// The server could not be asked, or kept undoing what was written. Nothing is
     /// concluded: what is held is neither renewed nor replaced.
     Failed,
+    /// The record was found to be no good (public, another playlist's, not a record) and a
+    /// new secret could not be written in its place: what is held is not to be used.
+    Invalid,
     NoRandom,
+}
+
+/// Whether what a look found means the secret in use must not go on being used. That the
+/// server could not be asked means nothing of the kind: the secret then runs out in its own
+/// time. (A look that read a different secret ends the old session by beginning a new one.)
+fn ends_session(looked: &Looked) -> bool {
+    matches!(looked, Looked::Stopped(_) | Looked::Invalid)
 }
 
 /// One look (see `nexus_core::link::secret`). Every call is a form POST, so neither the
@@ -203,10 +213,11 @@ fn look(client: &Client, mut used: Option<String>) -> Looked {
     let agent = crate::subsonic::make_agent_without_redirects();
     let call = |endpoint: &str, params: &[(&str, &str)]| client.link_call(&agent, endpoint, params).ok();
     // A new secret into a playlist, which is kept private. The secret used afterwards is the
-    // one the next round reads back, not this one.
+    // one the next round reads back, not this one. If it cannot be written, the record that
+    // called for it is still no good.
     let write = |id: &str| match random::<32>().map(Secret::new) {
         None => Some(Looked::NoRandom),
-        Some(fresh) => call("updatePlaylist", &[("playlistId", id), ("comment", &fresh.comment()), ("public", "false")]).is_none().then_some(Looked::Failed),
+        Some(fresh) => call("updatePlaylist", &[("playlistId", id), ("comment", &fresh.comment()), ("public", "false")]).is_none().then_some(Looked::Invalid),
     };
     let mut wrote = None;
     for _ in 0..secret::ROUNDS {
@@ -227,13 +238,10 @@ fn look(client: &Client, mut used: Option<String>) -> Looked {
             Next::Fetch { id, replace } => (id, replace),
         };
         let (id, replace) = id;
-        let Some(answer) = call("getPlaylist", &[("id", &id)]) else { return Looked::Failed };
-        let playlist = &answer["playlist"];
-        let said = |field: &str| playlist[field].as_str().map(str::to_string);
-        // Navidrome's JSON leaves `public` out when it is false, so that answer cannot state
-        // that the playlist is private. Its XML always says: that is asked for it.
-        let public = playlist["public"].as_bool().or_else(|| secret::stated_public(&client.link_call_xml(&agent, "getPlaylist", &[("id", &id)]).ok()?, &id));
-        let fetched = Fetched { id: said("id").unwrap_or_default(), name: said("name").unwrap_or_default(), owner: said("owner"), public, comment: said("comment") };
+        // One answer, and the XML one: only it states whether the playlist is public, and
+        // what it is, whose, and its comment are taken from the same answer.
+        let Ok(answer) = client.link_call_xml(&agent, "getPlaylist", &[("id", &id)]) else { return Looked::Failed };
+        let Some(fetched) = secret::fetched(&answer) else { return Looked::Failed };
         match secret::judge(&id, replace, &fetched, client.username()) {
             Verdict::Use(secret) => return Looked::Secret { secret, id, wrote },
             Verdict::Stop(stop) => return Looked::Stopped(stop),
@@ -587,6 +595,11 @@ impl Controller {
             }
             link.looking = false;
             link.looked_ms = Some(now_ms());
+            // A look that found the record is not one to use ends the session that used it
+            // now, not when its ten minutes are up.
+            if ends_session(&looked) && link.end_session() {
+                log("session: ended, the record is no longer one to use");
+            }
             match looked {
                 Looked::Secret { secret, id, wrote } => {
                     // A page for that playlist written to disk before now (by a version that
@@ -616,6 +629,10 @@ impl Controller {
                 }
                 Looked::Failed => {
                     log("look: the music server could not be asked");
+                    None
+                }
+                Looked::Invalid => {
+                    link.note = "Your devices' link on the music server needs resetting, and couldn't be. It will be tried again.".into();
                     None
                 }
                 Looked::NoRandom => {
@@ -1032,6 +1049,19 @@ mod tests {
         assert!(link.live(2, 1_000).is_none());
         assert!(link.end_session() && !link.end_session());
         assert!(link.live(1, 1_000).is_none() && link.serial == 2);
+    }
+
+    /// A refresh that finds the record public and cannot repair it, not ours, changed in
+    /// layout, or no longer stated, ends the session at once.
+    #[test]
+    fn a_look_that_finds_the_record_no_good_ends_the_session_at_once() {
+        for found in [Looked::Invalid, Looked::Stopped(Stop::Mismatch), Looked::Stopped(Stop::NotStated), Looked::Stopped(Stop::Later)] {
+            assert!(ends_session(&found));
+        }
+        // Not being able to ask is no evidence of anything, and the same secret read again
+        // is the session carrying on.
+        assert!(!ends_session(&Looked::Failed));
+        assert!(!ends_session(&Looked::Secret { secret: Secret::new([7; 32]), id: "k".into(), wrote: None }));
     }
 
     #[test]
