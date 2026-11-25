@@ -653,6 +653,11 @@ const SOUNDS_AFTER: f64 = 0.2;
 /// How long a device that was being steered may be gone from the room before the player
 /// goes back to this PC.
 const LOST_MS: u64 = 45_000;
+/// The most devices whose names are remembered, and how many days one is remembered
+/// without being seen.
+const MOST_REMEMBERED: usize = 16;
+const REMEMBERED_DAYS: u64 = 30;
+
 #[derive(Default)]
 pub struct Link {
     /// The sign-in all of this belongs to.
@@ -797,6 +802,23 @@ fn about(tell: &Tell, age_s: u64) -> String {
         about.push_str(&format!(" (as of {age_s} seconds ago)"));
     }
     about
+}
+
+/// The devices whose names are remembered, with one seen now put first in line to be
+/// kept: no more than [`MOST_REMEMBERED`], none unseen for [`REMEMBERED_DAYS`], and each
+/// under the name it last gave. `day` is today, counted in days.
+fn remembered(mut list: Vec<config::LinkSeen>, seen: Option<(&str, &str)>, day: u64) -> Vec<config::LinkSeen> {
+    if let Some((id, name)) = seen {
+        list.retain(|known| known.id != id);
+        list.insert(0, config::LinkSeen { id: id.to_string(), name: name.to_string(), day });
+    }
+    list.retain(|known| day.saturating_sub(known.day) <= REMEMBERED_DAYS);
+    list.truncate(MOST_REMEMBERED);
+    list
+}
+
+fn today() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_secs() / 86_400)
 }
 
 /// What a command needs found before it can be carried out.
@@ -1623,7 +1645,7 @@ impl Controller {
             return;
         }
         // (The queue, if it carries one, is for the move that asked for it and is not kept.)
-        let (handed, re, at, playing) = (tell.queue.take(), tell.re, tell.at, tell.playing);
+        let (handed, re, at, playing, device) = (tell.queue.take(), tell.re, tell.at, tell.playing, tell.device);
         let (told, name, out) = {
             let mut link = self.link.borrow_mut();
             let Some(session) = link.live_mut(serial, now) else { return };
@@ -1638,6 +1660,7 @@ impl Controller {
             (told, name_of(seen), out)
         };
         if matches!(told, Told::Shown | Told::ShownAndSettled(_)) {
+            self.link_remember(&device, &name);
             self.link_view(from);
             // The queue that was asked for, to bring its music here.
             let asked = matches!(&self.link.borrow().take, Some(Take::Asked { place, nonce, .. }) if *place == from && Some(*nonce) == re);
@@ -1658,6 +1681,20 @@ impl Controller {
                 self.link_look_at(from, false);
             }
         }
+    }
+
+    /// A device answered under this name: it is remembered, so that the list can show it
+    /// at once another time.
+    fn link_remember(&self, device: &DeviceId, name: &str) {
+        let id = text::base64(device);
+        let known = self.settings.borrow().link_seen.clone();
+        // (Written when it is new, has a new name, or was last seen on another day.)
+        let day = today();
+        if known.iter().any(|seen| seen.id == id && seen.name == name && seen.day == day) {
+            return;
+        }
+        self.settings.borrow_mut().link_seen = remembered(known, Some((&id, name)), day);
+        self.save_settings();
     }
 
     /// Says what became of something asked of another device.
@@ -2142,15 +2179,21 @@ impl Controller {
         let link = self.link.borrow();
         let steered = link.steering.as_ref().map(|steering| steering.device);
         let mut rows = Vec::new();
+        let mut here = Vec::new();
         if let Some(session) = &link.session {
             for place in &session.others {
                 let Some(shown) = session.peers.get(place).and_then(|seen| seen.peer.shown()) else { continue };
                 let tell = &shown.tell;
+                here.push(text::base64(&tell.device));
                 let row = ui::LinkedDevice { place: text::place(place).into(), name: tell.name.as_str().into(), about: about(tell, now.saturating_sub(shown.sent_ms) / 1000).into(), playing: tell.playing, active: steered == Some(tell.device), ready: true };
                 rows.push((tell.device, shown.sent_ms, row));
             }
         }
-        let list = latest_of_each(rows);
+        let mut list = latest_of_each(rows);
+        // The devices seen before and not here now: listed at once, and not to be picked.
+        for known in self.settings.borrow().link_seen.iter().filter(|known| !here.contains(&known.id)) {
+            list.push(ui::LinkedDevice { place: "".into(), name: known.name.as_str().into(), about: if link.session.as_ref().is_some_and(|session| session.place.is_some()) { "Not here just now" } else { "Looking for it…" }.into(), playing: false, active: false, ready: false });
+        }
         let global = self.ui.global::<ui::Linked>();
         global.set_on(true);
         global.set_entered(link.session.as_ref().is_some_and(|session| session.place.is_some()));
@@ -2209,6 +2252,21 @@ mod tests {
             assert_eq!(file.exists(), kept, "{name}");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn devices_are_remembered_by_name_up_to_sixteen_and_for_thirty_days() {
+        let seen = |id: &str, name: &str, day: u64| config::LinkSeen { id: id.into(), name: name.into(), day };
+        // One seen now goes first; under a new name it is the same device.
+        let list = remembered(vec![seen("a", "Study PC", 100), seen("b", "Laptop", 90)], Some(("b", "Kitchen laptop")), 101);
+        assert_eq!(list, vec![seen("b", "Kitchen laptop", 101), seen("a", "Study PC", 100)]);
+        // Thirty days unseen, it is kept; thirty-one, forgotten.
+        assert_eq!(remembered(vec![seen("a", "Study PC", 100)], None, 130).len(), 1);
+        assert_eq!(remembered(vec![seen("a", "Study PC", 100)], None, 131).len(), 0);
+        // Sixteen at the most: the ones seen longest ago make room.
+        let many: Vec<config::LinkSeen> = (0..20).map(|n| seen(&format!("d{n}"), "PC", 100)).collect();
+        let list = remembered(many, Some(("new", "New PC")), 100);
+        assert_eq!((list.len(), list[0].id.as_str(), list.iter().any(|known| known.id == "d19")), (16, "new", false));
     }
 
     fn state(playing: bool) -> Tell {

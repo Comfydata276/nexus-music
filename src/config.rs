@@ -98,6 +98,17 @@ impl Paths {
 
 pub use nexus_core::sync::ListPrefs;
 
+/// One of the person's other devices, as the new linking last saw it (see `link`): the id
+/// it gives itself, the name the person gave it, and the day it was last seen (days since
+/// 1970), after which it is in time forgotten. None of it is secret.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LinkSeen {
+    pub id: String,
+    pub name: String,
+    pub day: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -192,6 +203,10 @@ pub struct Settings {
     /// linking (see `link`): sixteen random bytes. Made the first time it is needed.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub link_device: String,
+    /// The person's other devices as the new linking has seen them, so that the list can
+    /// show them at once. Written only where that linking is switched on.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub link_seen: Vec<LinkSeen>,
     /// The id of the playlist that holds what's shared between devices, once known.
     pub sync_playlist: String,
     /// When the pins and the theme that were last agreed with the server were chosen (see
@@ -272,6 +287,7 @@ impl Default for Settings {
             sync: true,
             device_id: String::new(),
             link_device: String::new(),
+            link_seen: Vec::new(),
             sync_playlist: String::new(),
             pins_at: 0,
             theme_at: 0,
