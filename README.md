@@ -248,12 +248,29 @@ app and the Android app do the same.
 
 **A copy, in case.** Before a version of the app first changes that record for an account, it
 keeps the text exactly as it found it, beside its settings (`%APPDATA%\Nexus Music\config`):
-`shared-record-kept-<account>-<version>.json`. Nothing is written to the server until that
-file, and a note beside it of the version that kept it, are on the disk. That version never
-writes its copy again and no later version writes over it, so the file with the lowest version
-in its name is the record as it was before any of them changed it. To put the record back:
-close the app on every device, and paste the file's text into the playlist's comment in
-Navidrome.
+`shared-record-kept-<account>-<version>.json` (an empty file, if the record was empty). The
+file is made once and never written again, by that version or a later one, and nothing is
+sent to the server until it is there. The one with the lowest version in its name is the
+record as it was before any of them changed it.
+
+**Putting the record back.** Pasting that text into the playlist's comment is not enough by
+itself. Each device remembers what it last agreed with the server, the newer of two values
+always wins, and a device's own are newer than an old copy: so the first device to look
+writes its own pins, sorts and theme straight back. To go back to the record as it was kept:
+
+1. Quit the app on every device (from the tray, not only the window), and leave it closed.
+2. In Navidrome, open the playlist "Nexus Music sync" and paste the file's text in as its
+   comment.
+3. On each PC, before starting the app again, open `settings.json` in the same folder and
+   delete the whole `"choices"` entry (from `"choices": {` to its closing `}`, and the comma
+   that goes with it). That is what the PC last agreed and what it still means to send; with
+   it gone, the PC takes its pins, sorts, shuffles and theme from the record. To take the
+   dates songs were added from the record as well, delete `playlist-added.json`. Leave
+   `plays.log` alone: plays are only ever added to, and none of this touches them.
+4. Start the app on one PC and look that it shows what the record holds. Then start the
+   others, one at a time.
+
+A PC that step 3 was not done on puts back whatever it holds that is newer than the copy.
 
 **Known, and accepted.**
 

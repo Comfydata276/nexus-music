@@ -47,11 +47,11 @@
 //!    the plan brought (not the plan's alone: a song started since step 3 stays). Say
 //!    [`Plan::held`], if it is set, where the person will see it.
 //! 7. **Write**, if [`Plan::write`] is set. In this order:
-//!    1. If this version has not yet kept the record's text for this account
-//!       ([`keeps_first`]): put [`Write::found`] (the empty text too) and the note that it
-//!       has been kept on disk, the text in a file named for the account and the version.
-//!       If either can't be written, send nothing. This version never writes its copy
-//!       again, and a later version's copy never goes over an earlier one's.
+//!    1. Keep the record's text as it was found, once for each account and version of the
+//!       app: a file named for both, holding [`Write::found`] exactly (the empty text too:
+//!       an empty file). The file is its own proof. If it is there, leave it, and never
+//!       open it for writing; if it is not, make it, only if it is still not there, and
+//!       flush it. If it can't be made, send nothing.
 //!    2. [`Choices::sending`], which says whether the plan still fits the choices it was
 //!       made from. If it says no (a change the write carries was taken back meanwhile),
 //!       send nothing and start again from step 1. Save the choices, surely, before the
@@ -537,22 +537,13 @@ pub struct Write {
     /// The playlist to write into; `None` to make one of the record's name first.
     pub into: Option<String>,
     pub text: String,
-    /// The comment as it was found, to keep before the first write a version makes
-    /// ([`keeps_first`]). It may be the empty text: that is kept too.
+    /// The comment as it was found, to keep before the first write a version makes (step
+    /// 7.1). It may be the empty text: that is kept too.
     pub found: String,
     /// The changes this write carries ([`Choices::sending`], [`Choices::written`]).
     pub carried: Vec<u64>,
     /// What is agreed once the server has taken it.
     pub agreed: Agreed,
-}
-
-/// Whether the record's text is to be kept aside before a write (step 7.1): a version does
-/// so once for an account, before the first write it makes. `kept_by` is the latest version
-/// noted as having kept a copy for this account, if one has. (Each version's copy is a file
-/// of its own: the caller never writes one version's over another's.)
-pub fn keeps_first(kept_by: Option<&str>, version: &str) -> bool {
-    let parts = |version: &str| version.split('.').map(|part| part.parse::<u64>().unwrap_or(0)).collect::<Vec<_>>();
-    kept_by.is_none_or(|kept_by| parts(version) > parts(kept_by))
 }
 
 /// Everything to do after an exchange's reads, in order (see the top of this file).

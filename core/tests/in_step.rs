@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use nexus_core::notes::{Kept, Note, Notes};
 use nexus_core::record::{self, Read};
-use nexus_core::step::{Agreed, Answers, Change, Choices, Device, Found, Held, Outcome, Plan, Stated, Stop, Write, clock, find, history, keeps_first, limits, reserved, settle};
+use nexus_core::step::{Agreed, Answers, Change, Choices, Device, Found, Held, Outcome, Plan, Stated, Stop, Write, clock, find, history, limits, reserved, settle};
 use nexus_core::time::Clock;
 use nexus_core::sync::{LONG_AGO, ListPrefs, PLAYLIST_NAME, PLAYS_SHARED, Shared};
 
@@ -742,13 +742,6 @@ fn nothing_the_library_is_given_makes_it_fail() {
     last.does(Change::Pin("c".into()));
     assert_eq!(last.exchange(&mut server), None);
     assert_eq!(server.record("r").pins_at, limits::TIME + 1);
-}
-
-#[test]
-fn a_version_keeps_the_record_aside_once_for_an_account() {
-    // Nothing kept yet for this account; kept by an earlier version; by this one; by a later.
-    assert!(keeps_first(None, "0.40.5") && keeps_first(Some("0.40.4"), "0.40.5") && keeps_first(Some("0.40.12"), "0.41.0"));
-    assert!(!keeps_first(Some("0.40.5"), "0.40.5") && !keeps_first(Some("0.41.0"), "0.40.5"));
 }
 
 #[test]
