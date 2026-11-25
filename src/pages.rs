@@ -484,7 +484,7 @@ fn outside_artist(id: &str) -> PageData {
     let Some(lidarr) = crate::lidarr::current() else { return requests_off("Artist") };
     let index = crate::search::current();
     // (Nothing on Windows stops a request, so "stopped" can't come of it.)
-    let Ok(found) = nexus_core::requests::artist(services(&lidarr), library(&index), crate::lidarr::offers(), crate::lidarr::singles(), id) else {
+    let Ok(found) = nexus_core::requests::artist(services(&lidarr), library(&index), crate::lidarr::offers(), &crate::lidarr::singles, id) else {
         return PageData { label: "Artist".into(), cover_round: true, ..Default::default() };
     };
     if found.failed {
@@ -530,7 +530,7 @@ fn outside_artist_extras(id: &str, page: &PageData) -> Option<PageData> {
         services(&lidarr),
         library(&index),
         crate::lidarr::offers(),
-        crate::lidarr::singles(),
+        &crate::lidarr::singles,
         &crate::asked::shared,
         id,
         &page.title,

@@ -115,7 +115,6 @@ impl Scene {
     }
 
     /// Does `change` while the first request that fits `key` is held, before it's answered.
-    #[allow(dead_code)]
     pub fn meanwhile(mut self, key: &str, change: impl FnOnce() + Send + 'static) -> Scene {
         self.hooks.push((key.to_string(), Box::new(change)));
         self
@@ -875,3 +874,5 @@ fn an_artist_lidarr_keeps_with_singles_from_musicbrainz() {
     }
     pinned_with("artist-kept-with-singles", &stages, log, false);
 }
+
+mod meanwhile;

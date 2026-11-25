@@ -494,12 +494,14 @@ pub struct OutsideArtist {
 
 /// An artist as the wider world knows them: every studio album they've made, with the ones
 /// in the library opening as usual and the rest there to be asked for. `id` is
-/// MusicBrainz's name for them; `singles` the "singles and EPs" setting.
-pub fn artist(services: Services, library: &dyn Library, offers: &Offers, singles: bool, id: &str) -> Result<OutsideArtist, Stopped> {
+/// MusicBrainz's name for them; `singles` the "singles and EPs" setting, read once Lidarr has
+/// said whether it keeps track of them (it may be switched while Lidarr is waited for).
+pub fn artist(services: Services, library: &dyn Library, offers: &Offers, singles: &(dyn Fn() -> bool + Sync), id: &str) -> Result<OutsideArtist, Stopped> {
     let lidarr = services.lidarr;
     let remembered = offers.offered_artist(id);
     // If Lidarr keeps track of the artist, its list says what's wanted and what's arrived.
     let known = unless_stopped(lidarr.known_artist(id))?.ok().flatten();
+    let singles = singles();
     let found = match &known {
         Some((number, name)) => match unless_stopped(lidarr.releases_of(*number, name))? {
             Ok(mut releases) => {
@@ -576,17 +578,18 @@ pub struct Popular {
 
 /// The songs an artist is most played for that the library doesn't have, for the top of
 /// their page; `None` if there are none. Found after the page itself, since it takes a few
-/// more questions. `name` is what the page calls them.
+/// more questions. `name` is what the page calls them; `singles` and `asked` are read when
+/// they're needed.
 pub fn artist_popular(
     services: Services,
     library: &dyn Library,
     offers: &Offers,
-    singles: bool,
+    singles: &(dyn Fn() -> bool + Sync),
     asked: &dyn Fn() -> Vec<Asked>,
     id: &str,
     name: &str,
 ) -> Result<Option<Popular>, Stopped> {
-    let Ok((_, releases)) = unless_stopped(services.musicbrainz.artist_releases(id, singles))? else { return Ok(None) };
+    let Ok((_, releases)) = unless_stopped(services.musicbrainz.artist_releases(id, singles()))? else { return Ok(None) };
     let (popular, left_out) = popular_songs(&top_of(services.musicbrainz, services.listenbrainz, id, &releases)?, library, id, name, &releases);
     if popular.is_empty() {
         return Ok(None);
@@ -992,11 +995,11 @@ mod tests {
 
     #[test]
     fn an_artists_page_says_what_they_have_made() {
-        let (found, _) = served(MARROW_LAKE, usize::MAX, |services| artist(services, &snapshot(), &Offers::new(), true, "ml"));
+        let (found, _) = served(MARROW_LAKE, usize::MAX, |services| artist(services, &snapshot(), &Offers::new(), &|| true, "ml"));
         let found = found.unwrap();
         assert_eq!((found.name.as_str(), found.about.as_str(), found.open), ("Marrow Lake", "1 album", 1));
         assert_eq!(found.albums.iter().chain(&found.smaller).map(|release| release.caption.as_str()).collect::<Vec<_>>(), ["2018", "2017 • EP"]);
-        let (popular, _) = served(MARROW_LAKE, usize::MAX, |services| artist_popular(services, &snapshot(), &Offers::new(), true, &Vec::new, "ml", "Marrow Lake"));
+        let (popular, _) = served(MARROW_LAKE, usize::MAX, |services| artist_popular(services, &snapshot(), &Offers::new(), &|| true, &Vec::new, "ml", "Marrow Lake"));
         let popular = popular.unwrap().unwrap();
         assert_eq!((popular.heading.as_str(), popular.songs.len()), ("Popular", 1));
     }
@@ -1004,10 +1007,10 @@ mod tests {
     #[test]
     fn a_stopped_artists_page_says_so() {
         fn page(services: Services) -> Result<OutsideArtist, Stopped> {
-            artist(services, &snapshot(), &Offers::new(), true, "ml")
+            artist(services, &snapshot(), &Offers::new(), &|| true, "ml")
         }
         fn popular(services: Services) -> Result<Option<Popular>, Stopped> {
-            artist_popular(services, &snapshot(), &Offers::new(), true, &Vec::new, "ml", "Marrow Lake")
+            artist_popular(services, &snapshot(), &Offers::new(), &|| true, &Vec::new, "ml", "Marrow Lake")
         }
         let (_, all) = served(MARROW_LAKE, usize::MAX, page);
         for stop_after in 0..all {
