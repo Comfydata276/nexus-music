@@ -59,6 +59,26 @@ fn kept_name_when(name: &str, linking: bool) -> Option<&'static str> {
     }
 }
 
+/// Whether a playlist of this name is left out of every ordinary listing of playlists:
+/// the one the app keeps devices in step through, always; and, where linking is on, the
+/// one that holds the secret devices share. What is not listed is not opened, and a page
+/// that is not opened is not written to the cache of pages on disk.
+pub fn unlisted(name: &str) -> bool {
+    unlisted_when(name, on())
+}
+
+fn unlisted_when(name: &str, linking: bool) -> bool {
+    name == crate::sync::PLAYLIST_NAME || (linking && name == secret::PLAYLIST_NAME)
+}
+
+/// Whether a playlist's page may be written to the cache of pages on disk: never one of a
+/// name the app keeps for itself, whose comment is not a description. Linking's is never
+/// written whether or not linking is on in this copy: it may be on in another, and what
+/// that one keeps there is a secret.
+pub fn page_may_be_kept(playlist: &str) -> bool {
+    playlist != crate::sync::PLAYLIST_NAME && playlist != secret::PLAYLIST_NAME
+}
+
 /// Milliseconds since the app started, on a clock that goes on counting while the PC
 /// sleeps: the rule's minute, and the life of the secret, are read off it.
 pub fn now_ms() -> u64 {
@@ -504,6 +524,7 @@ impl Controller {
 
     /// A look has finished. `since` is when it began.
     fn link_looked(self: &Rc<Self>, looks: u64, since: u64, looked: Looked) {
+        let mut forget = None;
         let begin = {
             let mut link = self.link.borrow_mut();
             if link.looks != looks {
@@ -513,6 +534,9 @@ impl Controller {
             link.looked_ms = Some(now_ms());
             match looked {
                 Looked::Secret { secret, id, wrote } => {
+                    // A page for that playlist written to disk before now (by a version that
+                    // listed it) holds the secret: it goes.
+                    forget = Some(format!("playlist:{id}"));
                     link.used = Some(id);
                     if wrote == Some(secret::Why::Public) {
                         link.note = "Your devices' link could be seen by others on the music server. It has been made private and reset.".into();
@@ -546,6 +570,9 @@ impl Controller {
                 }
             }
         };
+        if let Some(page) = forget {
+            self.invalidate(&page);
+        }
         if let Some(secret) = begin {
             self.link_begin(secret, since);
         }
@@ -877,6 +904,31 @@ impl Controller {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_playlists_the_app_keeps_for_itself_are_not_listed() {
+        assert!(unlisted_when("Nexus Music sync", false) && unlisted_when("Nexus Music sync", true));
+        // The one that holds the secret: where linking is on. With it off, a playlist of
+        // that name is the person's own and is listed like any other.
+        assert!(unlisted_when("Nexus Music link", true) && !unlisted_when("Nexus Music link", false));
+        assert!(!unlisted_when("Morning mix", true));
+    }
+
+    /// The secret is the comment of a playlist, and a playlist's page holds its comment.
+    #[test]
+    fn a_page_for_a_playlist_the_app_keeps_for_itself_is_never_written_to_disk() {
+        use crate::pages::PageData;
+        use crate::subsonic::Playlist;
+        let dir = std::env::temp_dir().join(format!("nexus-link-page-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let page = |name: &str| PageData { title: name.to_string(), playlist: Some(Playlist { id: "p".into(), name: name.into(), comment: r#"{"nexus_music_link":1,"secret":"ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8"}"#.into(), ..Default::default() }), ..Default::default() };
+        for (name, kept) in [("Morning mix", true), ("Nexus Music link", false), ("Nexus Music sync", false)] {
+            let file = dir.join(name);
+            crate::controller::store_page(&file, &page(name));
+            assert_eq!(file.exists(), kept, "{name}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn with_linking_off_its_playlist_s_name_is_anyone_s_to_use() {

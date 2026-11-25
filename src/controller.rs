@@ -3512,7 +3512,7 @@ impl Controller {
             |ctl, result| {
                 let Ok(mut playlists) = result else { return };
                 // The playlist the app keeps its shared data in isn't one to listen to.
-                playlists.retain(|p| p.name != crate::sync::PLAYLIST_NAME);
+                playlists.retain(|p| !crate::link::unlisted(&p.name));
                 *ctl.playlists.borrow_mut() = playlists;
                 ctl.show_playlists();
                 ctl.reload_changed_playlist();
@@ -4325,9 +4325,14 @@ fn fetch_whole(client: &Client, route: &Route, file: &std::path::Path) -> ApiRes
     Ok(whole)
 }
 
-fn store_page(file: &std::path::Path, page: &PageData) {
+pub(crate) fn store_page(file: &std::path::Path, page: &PageData) {
     // A page made from what's already on this PC is quicker made again than read back.
     if page.local {
+        return;
+    }
+    // The page of a playlist the app keeps for itself holds, as its comment, what the app
+    // keeps there: for one of them that is a secret. It is never written to disk.
+    if page.playlist.as_ref().is_some_and(|playlist| !crate::link::page_may_be_kept(&playlist.name)) {
         return;
     }
     let Ok(json) = serde_json::to_vec(page) else { return };
