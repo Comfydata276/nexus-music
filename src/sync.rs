@@ -20,7 +20,7 @@ use nexus_core::step::{Answers, Change, Choices, Device, Found, Outcome, Plan, S
 use nexus_core::sync::{PLAYS_SHARED, merge_plays};
 pub use nexus_core::sync::{HISTORY_LENGTH, PLAYLIST_NAME};
 
-use crate::added::{Notes, parse_time};
+use crate::added::Notes;
 use crate::config::Played;
 use crate::controller::{Controller, Route, with};
 use crate::subsonic::{ApiError, ApiResult, Client, PlayQueue, Song};
@@ -29,10 +29,6 @@ use crate::subsonic::{ApiError, ApiResult, Client, PlayQueue, Song};
 const SETTLE: Duration = Duration::from_secs(3);
 /// How often to look for changes made elsewhere.
 const LOOK: Duration = Duration::from_secs(60);
-/// How much of a long queue is passed on: this many songs before the current one...
-const QUEUE_BEHIND: usize = 50;
-/// ...and this many from it onwards.
-const QUEUE_AHEAD: usize = 450;
 /// The file, beside the settings, that holds the shared record's text as this version first
 /// found it (see `Controller::exchanged`).
 pub const RECORD_KEPT: &str = "shared-record-kept.json";
@@ -178,7 +174,10 @@ impl Controller {
 
     /// Starts keeping in step: now, and every so often from here on.
     pub fn start_sync(self: &Rc<Self>) {
+        // (An answer for a session that has since signed out is never handed back, so what
+        // was waiting on one is let go here.)
         self.sync_busy.set(false);
+        self.queue_saving.set(false);
         self.look_elsewhere();
         self.sync_look_timer.start(slint::TimerMode::Repeated, LOOK, || {
             with(|ctl| ctl.look_elsewhere());
@@ -190,6 +189,8 @@ impl Controller {
         self.sync_timer.stop();
         self.queue_timer.stop();
         self.sync_busy.set(false);
+        self.queue_saving.set(false);
+        self.queue_taken_up.set(false);
         self.clock_offset.set(None);
         self.sync_says("");
     }
@@ -447,9 +448,14 @@ impl Controller {
     }
 
     // ---- the queue -----------------------------------------------------------------------------
+    //
+    // Whose queue is the newest is the library's to say (`nexus_core::handover`): this is the
+    // timers, the requests, and putting a queue in the player.
 
-    /// The queue changed here: save it on the server once things have settled.
+    /// The queue changed here, or was played on: save it on the server once things have
+    /// settled. (Whatever it was before, it is this PC's own now.)
     pub fn queue_changed_here(&self) {
+        self.queue_taken_up.set(false);
         if self.settings.borrow().sync {
             self.queue_timer.start(slint::TimerMode::SingleShot, SETTLE, || {
                 with(|ctl| ctl.upload_queue());
@@ -457,31 +463,50 @@ impl Controller {
         }
     }
 
+    /// The time on this PC's clock as the server's clock has it, for the queue's stamp: the
+    /// time a saved queue changed is the server's, and the two are compared.
+    pub fn server_now(&self) -> i64 {
+        nexus_core::time::aligned(chrono::Utc::now().timestamp(), self.clock_offset.get())
+    }
+
+    /// Saves this PC's queue on the server, **if it is still the newest thing that
+    /// happened**. Saves take turns; immediately before each the server's saved queue is
+    /// read, and the library says whether another device's stands. A save that can't be
+    /// made now (no server, the setting off, the clock wrong) is still owed: the next look
+    /// at the server's queue finds this one newer, and comes back here.
     fn upload_queue(self: &Rc<Self>) {
         if !self.sync_on() {
             return;
         }
+        if self.queue_saving.replace(true) {
+            self.queue_again.set(true);
+            return;
+        }
         let device = self.device_name();
-        let (ids, current, position) = {
+        let (saved, current, playing) = {
             let pb = self.playback.borrow();
-            let Some(current) = pb.current() else { return };
-            // A radio station isn't something another device could pick up by id.
-            if !current.radio_url.is_empty() {
-                return;
-            }
-            let from = pb.cursor.saturating_sub(QUEUE_BEHIND);
-            let ids: Vec<String> = pb
-                .order
-                .iter()
-                .skip(from)
-                .take(pb.cursor - from + QUEUE_AHEAD)
-                .filter_map(|&i| pb.queue.get(i))
-                .filter(|song| song.radio_url.is_empty())
-                .map(|song| song.id.clone())
-                .collect();
-            (ids, current.id.clone(), (pb.position.max(0.0) * 1000.0) as u64)
+            let in_order: Vec<&Song> = pb.order.iter().filter_map(|&i| pb.queue.get(i)).collect();
+            (nexus_core::handover::window(&in_order, pb.cursor, pb.position), pb.current().map(|song| song.id.clone()), pb.playing)
         };
-        self.request(move |client| client.save_play_queue(&device, &ids, &current, position), |_, _| {});
+        let Some(saved) = saved else { return self.queue_saving.set(false) };
+        let (stamp, taken_up, offset) = (self.queue_stamp.get(), self.queue_taken_up.get(), self.clock_offset.get());
+        self.request(
+            move |client| {
+                use nexus_core::handover::{Here, Save, save};
+                let theirs = client.play_queue()?;
+                let here = Here { device: &device, current: current.as_deref(), playing, stamp, taken_up, offset };
+                match save(&theirs, &here) {
+                    Save::Save => client.save_play_queue(&device, &saved.ids, &saved.current, saved.position),
+                    Save::NotNewest | Save::NotNow => Ok(()),
+                }
+            },
+            |ctl, _| {
+                ctl.queue_saving.set(false);
+                if ctl.queue_again.replace(false) {
+                    ctl.upload_queue();
+                }
+            },
+        );
     }
 
     /// Asks the server for the saved queue, and takes it up if another device changed it
@@ -494,62 +519,62 @@ impl Controller {
             |client| client.play_queue(),
             |ctl, result| {
                 if let Ok(theirs) = result {
-                    ctl.note_elsewhere(&theirs);
-                    ctl.adopt_queue(theirs);
+                    ctl.looked_at_queue(theirs);
                 }
             },
         );
     }
 
-    /// Remembers what another device has been playing in the last half hour, so it can be
-    /// offered as "Continue here". (A device that's paused takes up a newer queue without
-    /// being asked; this is for one that's playing something of its own.)
-    fn note_elsewhere(&self, theirs: &PlayQueue) {
-        let age = chrono::Utc::now().timestamp() - parse_time(&theirs.changed);
-        let same = self.playback.borrow().current().is_some_and(|song| song.id == theirs.current);
-        let newer = !theirs.songs.is_empty() && theirs.changed_by != self.device_name() && (0..30 * 60).contains(&age) && !same;
-        let label = newer
-            .then(|| theirs.songs.iter().find(|song| song.id == theirs.current).or(theirs.songs.first()))
-            .flatten()
-            .map(|song| format!("{} — {}", song.title, song.artist_label()))
-            .unwrap_or_default();
-        *self.elsewhere.borrow_mut() = newer.then(|| theirs.clone());
+    /// What a look at the server's saved queue leads to: another device's offered as
+    /// "Continue here" (it has been playing in the last half hour, and this PC is playing
+    /// something of its own), or taken up, paused (this PC isn't playing, and nothing has
+    /// been done here since); or this PC's own save, still owed.
+    fn looked_at_queue(self: &Rc<Self>, theirs: PlayQueue) {
+        use nexus_core::handover::{Here, Then, look};
+        let device = self.device_name();
+        let looked = {
+            let pb = self.playback.borrow();
+            let here = Here {
+                device: &device,
+                current: pb.current().map(|song| song.id.as_str()),
+                playing: pb.playing,
+                stamp: self.queue_stamp.get(),
+                taken_up: self.queue_taken_up.get(),
+                offset: self.clock_offset.get(),
+            };
+            look(&theirs, &here, chrono::Utc::now().timestamp())
+        };
+        let label = looked.offer.and_then(|index| theirs.songs.get(index)).map(|song| format!("{} — {}", song.title, song.artist_label())).unwrap_or_default();
+        *self.elsewhere.borrow_mut() = looked.offer.is_some().then(|| theirs.clone());
         self.ui.global::<crate::ui::Player>().set_elsewhere(label.into());
+        match looked.then {
+            Then::TakeUp(place) => {
+                self.engine.set_playing(false);
+                self.engine.stop();
+                self.queue_stamp.set(place.stamp);
+                self.replace_queue(theirs.songs, place.cursor, place.position);
+                // It is that device's still, and not this PC's to save, until something is
+                // done to it here.
+                self.queue_taken_up.set(true);
+            }
+            // (Unless a save is already on its way.)
+            Then::Save if !self.queue_timer.running() => self.upload_queue(),
+            Then::Save | Then::Nothing => {}
+        }
     }
 
     /// Takes up what another device was playing, from where it had got to, and plays it.
     pub fn continue_here(self: &Rc<Self>) {
         let Some(theirs) = self.elsewhere.borrow_mut().take() else { return };
         self.ui.global::<crate::ui::Player>().set_elsewhere("".into());
-        let cursor = theirs.songs.iter().position(|song| song.id == theirs.current).unwrap_or(0);
-        let duration = theirs.songs[cursor].duration as f64;
-        let position = theirs.position as f64 / 1000.0;
-        let position = if duration > 0.0 && position >= duration - 1.0 { 0.0 } else { position.max(0.0) };
+        if theirs.songs.is_empty() {
+            return;
+        }
+        let place = nexus_core::handover::place(&theirs);
         self.engine.set_playing(false);
         self.engine.stop();
-        self.queue_stamp.set(parse_time(&theirs.changed));
-        self.replace_queue(theirs.songs, cursor, position);
+        self.queue_stamp.set(place.stamp);
+        self.replace_queue(theirs.songs, place.cursor, place.position);
         self.toggle_play();
-    }
-
-    fn adopt_queue(self: &Rc<Self>, theirs: PlayQueue) {
-        let stamp = parse_time(&theirs.changed);
-        if theirs.songs.is_empty() || theirs.changed_by == self.device_name() || stamp <= self.queue_stamp.get() {
-            return;
-        }
-        if self.playback.borrow().playing {
-            return;
-        }
-        // Taken up: there's nothing left to offer.
-        self.elsewhere.borrow_mut().take();
-        self.ui.global::<crate::ui::Player>().set_elsewhere("".into());
-        let cursor = theirs.songs.iter().position(|song| song.id == theirs.current).unwrap_or(0);
-        let duration = theirs.songs[cursor].duration as f64;
-        let position = theirs.position as f64 / 1000.0;
-        let position = if duration > 0.0 && position >= duration - 1.0 { 0.0 } else { position.max(0.0) };
-        self.engine.set_playing(false);
-        self.engine.stop();
-        self.queue_stamp.set(stamp);
-        self.replace_queue(theirs.songs, cursor, position);
     }
 }

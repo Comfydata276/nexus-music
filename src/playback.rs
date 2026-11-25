@@ -1896,7 +1896,8 @@ impl Controller {
         // Note when the queue last really changed, and pass the change on to other devices.
         let fingerprint = queue_fingerprint(&pb);
         if self.queue_sig.replace(fingerprint) != fingerprint && !self.queue_quiet.get() {
-            self.queue_stamp.set(chrono::Utc::now().timestamp());
+            // (On the server's clock, which the time of another device's save is on.)
+            self.queue_stamp.set(self.server_now());
             self.queue_changed_here();
         }
         if pb.queue.is_empty() {

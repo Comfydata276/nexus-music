@@ -430,6 +430,11 @@ pub struct Controller {
     /// said under the setting when this PC isn't sharing as it should (see `sync`).
     pub clock_offset: Cell<Option<i64>>,
     pub sync_note: RefCell<String>,
+    /// The queue is one taken up from another device, with nothing done to it here since;
+    /// a save of the queue is on its way; and another has been asked for meanwhile.
+    pub queue_taken_up: Cell<bool>,
+    pub queue_saving: Cell<bool>,
+    pub queue_again: Cell<bool>,
     /// When the queue last changed here (or, for one taken from another device, there), and
     /// a fingerprint of it as last saved, to tell a real change from a save of the same thing.
     pub queue_stamp: Cell<i64>,
@@ -580,6 +585,9 @@ impl Controller {
             sync_again: Cell::new(false),
             clock_offset: Cell::new(None),
             sync_note: RefCell::default(),
+            queue_taken_up: Cell::new(false),
+            queue_saving: Cell::new(false),
+            queue_again: Cell::new(false),
             queue_stamp: Cell::new(0),
             queue_sig: Cell::new(crate::playback::queue_fingerprint(&Playback::new(&Settings::default()))),
             queue_quiet: Cell::new(false),
