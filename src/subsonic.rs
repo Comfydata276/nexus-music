@@ -1058,6 +1058,75 @@ pub(crate) mod fake {
         address
     }
 
+    /// A request as a stand-in server was sent it: the request line and headers exactly as
+    /// they came, with the server's own address written as "standin", and the body.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct Sent {
+        pub head: String,
+        pub body: String,
+    }
+
+    impl Sent {
+        /// The request line, e.g. "GET /api/v1/system/status HTTP/1.1".
+        pub fn line(&self) -> &str {
+            self.head.lines().next().unwrap_or_default()
+        }
+    }
+
+    /// A server that writes down every request whole before it's answered. `answer` is given
+    /// the request's place in the order they came (from 0), the request, and the connection.
+    /// Gives the server's address and what it has been sent so far.
+    pub fn recorder(answer: impl Fn(usize, &Sent, &mut TcpStream) + Send + Sync + 'static) -> (String, Arc<std::sync::Mutex<Vec<Sent>>>) {
+        use std::io::Read;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let host = listener.local_addr().unwrap().to_string();
+        let address = format!("http://{host}");
+        let sent: Arc<std::sync::Mutex<Vec<Sent>>> = Arc::default();
+        let (answer, record) = (Arc::new(answer), sent.clone());
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let (answer, record, host) = (answer.clone(), record.clone(), host.clone());
+                std::thread::spawn(move || {
+                    let mut stream = stream;
+                    let mut lines = BufReader::new(stream.try_clone().unwrap());
+                    let mut head = String::new();
+                    let mut length = 0;
+                    loop {
+                        let mut line = String::new();
+                        if lines.read_line(&mut line).unwrap_or(0) == 0 {
+                            return;
+                        }
+                        if line == "\r\n" {
+                            break;
+                        }
+                        if let Some(value) = line.to_lowercase().strip_prefix("content-length:") {
+                            length = value.trim().parse().unwrap_or(0);
+                        }
+                        head.push_str(&line);
+                    }
+                    let mut body = vec![0; length];
+                    if lines.read_exact(&mut body).is_err() {
+                        return;
+                    }
+                    let request = Sent { head: head.replace(&host, "standin"), body: String::from_utf8_lossy(&body).into_owned() };
+                    let place = {
+                        let mut record = record.lock().unwrap();
+                        record.push(request.clone());
+                        record.len() - 1
+                    };
+                    answer(place, &request, &mut stream);
+                });
+            }
+        });
+        (address, sent)
+    }
+
+    /// Answers with a status and some JSON, and closes the connection.
+    pub fn json(stream: &mut TcpStream, status: &str, body: &str) {
+        let _ = write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        let _ = stream.flush();
+    }
+
     /// Answers with a Subsonic response holding `fields` (a JSON object's insides).
     pub fn ok(stream: &mut TcpStream, fields: &str) {
         let comma = if fields.is_empty() { "" } else { "," };

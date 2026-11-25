@@ -541,3 +541,228 @@ mod tests {
         assert_ne!(one, two);
     }
 }
+
+/// What goes to the sign-in service and back, against a stand-in server: written against the
+/// app as it was before the sign-in's rules moved to the library, so that the move can be
+/// seen to change nothing on the wire.
+#[cfg(test)]
+mod wire {
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    use super::*;
+    use crate::subsonic::fake::{Sent, json, recorder};
+
+    fn agent() -> ureq::Agent {
+        crate::subsonic::make_agent_without_redirects()
+    }
+
+    fn session(service: &str, token: &str, kept: Arc<Mutex<Vec<String>>>) -> Session {
+        let found = Found { service: service.into(), client: "lidarr-proxy".into() };
+        Session::new(found, token.into(), move |token| kept.lock().unwrap().push(token.to_string()))
+    }
+
+    /// A request's head as the app has always sent it: what every request carries, in the
+    /// order it goes, then the caller's own headers.
+    fn head(line: &str, length: Option<usize>, own: &str) -> String {
+        let length = length.map(|length| format!("content-length: {length}\r\n")).unwrap_or_default();
+        format!("{line} HTTP/1.1\r\naccept-encoding: gzip\r\n{length}user-agent: NexusMusic/{}\r\naccept: */*\r\nhost: standin\r\n{own}", env!("CARGO_PKG_VERSION"))
+    }
+
+    fn form(path: &str, length: usize) -> String {
+        head(&format!("POST /application/o/{path}/"), Some(length), "content-type: application/x-www-form-urlencoded\r\n")
+    }
+
+    fn redirect(stream: &mut std::net::TcpStream, to: &[u8]) {
+        let _ = stream.write_all(b"HTTP/1.1 302 Found\r\nLocation: ");
+        let _ = stream.write_all(to);
+        let _ = stream.write_all(b"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    }
+
+    #[test]
+    fn finds_the_sign_in_in_front_of_lidarr() {
+        let (address, sent) = recorder(|_, request, stream| {
+            if request.line().starts_with("GET /api/v1/system/status ") {
+                redirect(stream, b"/outpost.goauthentik.io/start?rd=http%3A%2F%2Fx");
+            } else {
+                redirect(stream, b"https://auth.example.org/application/o/authorize/?client_id=abc%20123&response_type=code");
+            }
+        });
+        assert_eq!(find(&agent(), &address), Ok(Some(Found { service: "https://auth.example.org".into(), client: "abc 123".into() })));
+        let heads: Vec<String> = sent.lock().unwrap().iter().map(|sent| sent.head.clone()).collect();
+        assert_eq!(
+            heads,
+            [
+                head("GET /api/v1/system/status", None, ""),
+                head("GET /outpost.goauthentik.io/start?rd=http%3A%2F%2Fx", None, ""),
+            ]
+        );
+        // Lidarr itself, and something else.
+        let (address, _) = recorder(|_, _, stream| json(stream, "200 OK", "{}"));
+        assert_eq!(find(&agent(), &address), Ok(None));
+        let (address, _) = recorder(|_, _, stream| redirect(stream, b"/login"));
+        assert_eq!(find(&agent(), &address), Err(UNKNOWN.to_string()));
+    }
+
+    #[test]
+    fn the_first_place_a_redirect_names_is_the_one_that_counts() {
+        // Two Location headers: the first, readable or not, is the one gone by.
+        let (address, _) = recorder(|_, _, stream| {
+            let _ = stream.write_all(b"HTTP/1.1 302 Found\r\nLocation: \xff\xfe\r\nLocation: https://auth.example.org/application/o/authorize/?client_id=x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        });
+        assert_eq!(find(&agent(), &address), Ok(None));
+        let (address, _) = recorder(|_, _, stream| {
+            let _ = stream.write_all(b"HTTP/1.1 302 Found\r\nLocation: https://auth.example.org/application/o/authorize/?client_id=first\r\nLocation: https://auth.example.org/application/o/authorize/?client_id=second\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        });
+        assert_eq!(find(&agent(), &address).map(|found| found.map(|found| found.client)), Ok(Some("first".to_string())));
+    }
+
+    #[test]
+    fn signs_in_through_the_browser() {
+        let (address, sent) = recorder(|_, request, stream| match request.line() {
+            line if line.starts_with("POST /application/o/token/ ") && request.body.contains("authorization_code") => {
+                json(stream, "200 OK", r#"{"access_token":"first-access","refresh_token":"to keep/1","expires_in":300}"#)
+            }
+            line if line.starts_with("POST /application/o/token/ ") => json(stream, "200 OK", r#"{"access_token":"a-pass","expires_in":600}"#),
+            _ => json(stream, "200 OK", r#"{"preferred_username":"someone","name":"Some One"}"#),
+        });
+        let found = Found { service: address.clone(), client: "lidarr-proxy".into() };
+        let attempt = begin(&found).unwrap();
+        let link = attempt.link.clone();
+        let back = param(link.split_once('?').unwrap().1, "redirect_uri").unwrap();
+        let state = param(link.split_once('?').unwrap().1, "state").unwrap();
+        assert!(link.starts_with(&format!("{address}/application/o/authorize/?response_type=code&client_id=nexus-music&redirect_uri=http%3A%2F%2F127.0.0.1%3A")));
+        assert!(link.contains("&scope=openid+profile+offline_access&state=") && link.ends_with("&code_challenge_method=S256"));
+        // The browser, coming back.
+        let browser = std::thread::spawn(move || {
+            let port = back.trim_start_matches("http://127.0.0.1:").trim_end_matches("/callback").to_string();
+            let mut stream = std::net::TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+            write!(stream, "GET /callback?code=c0de%2B1&state={state} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").unwrap();
+            let mut said = String::new();
+            let _ = stream.read_to_string(&mut said);
+            said.lines().next().unwrap_or_default().to_string()
+        });
+        let done = attempt.finish(&agent(), || false).unwrap();
+        assert_eq!(browser.join().unwrap(), "HTTP/1.1 200 OK");
+        assert_eq!((done.token.as_str(), done.name.as_str()), ("to keep/1", "someone"));
+        let sent: Vec<Sent> = sent.lock().unwrap().clone();
+        let back = param(link.split_once('?').unwrap().1, "redirect_uri").unwrap();
+        let code = format!(
+            "grant_type=authorization_code&code=c0de%2B1&redirect_uri={}&client_id=nexus-music&code_verifier=",
+            back.replace(':', "%3A").replace('/', "%2F")
+        );
+        let trade = "grant_type=client_credentials&client_assertion_type=urn%3Aietf%3Aparams%3Aoauth%3Aclient-assertion-type%3Ajwt-bearer&client_assertion=first-access&client_id=lidarr-proxy&scope=openid+profile+email+ak_proxy";
+        assert_eq!(sent.len(), 3);
+        assert_eq!(sent[0].head, form("token", sent[0].body.len()));
+        assert!(sent[0].body.starts_with(&code) && sent[0].body.len() == code.len() + 64, "{}", sent[0].body);
+        assert_eq!((sent[1].head.clone(), sent[1].body.as_str()), (form("token", trade.len()), trade));
+        assert_eq!(sent[2].head, head("GET /application/o/userinfo/", None, "authorization: Bearer first-access\r\n"));
+    }
+
+    #[test]
+    fn a_sign_in_that_does_not_get_through_hands_its_token_back() {
+        let (address, sent) = recorder(|_, request, stream| match request.line() {
+            line if line.starts_with("POST /application/o/token/ ") && request.body.contains("authorization_code") => {
+                json(stream, "200 OK", r#"{"access_token":"first-access","refresh_token":"to keep/1"}"#)
+            }
+            line if line.starts_with("POST /application/o/token/ ") => json(stream, "403 Forbidden", r#"{"error":"invalid_grant"}"#),
+            _ => json(stream, "200 OK", "{}"),
+        });
+        let attempt = begin(&Found { service: address, client: "lidarr-proxy".into() }).unwrap();
+        let query = attempt.link.split_once('?').unwrap().1.to_string();
+        let (back, state) = (param(&query, "redirect_uri").unwrap(), param(&query, "state").unwrap());
+        std::thread::spawn(move || {
+            let mut stream = std::net::TcpStream::connect(back.trim_start_matches("http://").trim_end_matches("/callback")).unwrap();
+            write!(stream, "GET /callback?code=c&state={state} HTTP/1.1\r\n\r\n").unwrap();
+            let _ = stream.read_to_string(&mut String::new());
+        });
+        assert_eq!(
+            attempt.finish(&agent(), || false).err().as_deref(),
+            Some("You're signed in, but the sign-in service won't let this app through to Lidarr. Either your account isn't allowed to use Lidarr, or Lidarr's sign-in hasn't been told to trust Nexus Music yet.")
+        );
+        let sent = sent.lock().unwrap().clone();
+        let revoke = "token=to+keep%2F1&client_id=nexus-music";
+        assert_eq!(sent.len(), 3);
+        assert_eq!((sent[2].head.clone(), sent[2].body.as_str()), (form("revoke", revoke.len()), revoke));
+    }
+
+    #[test]
+    fn hands_a_token_back() {
+        let (address, sent) = recorder(|_, _, stream| json(stream, "200 OK", ""));
+        give_up_token(&agent(), &address, "a token+/=é");
+        let sent = sent.lock().unwrap().clone();
+        let body = "token=a+token%2B%2F%3D%C3%A9&client_id=nexus-music";
+        assert_eq!(sent.len(), 1);
+        assert_eq!((sent[0].head.clone(), sent[0].body.as_str()), (form("revoke", body.len()), body));
+    }
+
+    #[test]
+    fn a_pass_lasts_until_a_minute_before_it_runs_out() {
+        let (address, sent) = recorder(|_, request, stream| {
+            if request.body.contains("client_credentials") {
+                json(stream, "200 OK", r#"{"access_token":"a-pass","expires_in":600}"#);
+            } else {
+                json(stream, "200 OK", r#"{"access_token":"access","refresh_token":"kept"}"#);
+            }
+        });
+        let kept = Arc::new(Mutex::new(Vec::new()));
+        let held = session(&address, "kept", kept.clone());
+        assert_eq!(held.pass().as_deref(), Ok("a-pass"));
+        assert_eq!(held.pass().as_deref(), Ok("a-pass"));
+        // The same token came back: nothing new to put away.
+        assert_eq!((sent.lock().unwrap().len(), kept.lock().unwrap().len()), (2, 0));
+        held.forget_pass();
+        assert_eq!(held.pass().as_deref(), Ok("a-pass"));
+        assert_eq!(sent.lock().unwrap().len(), 4);
+        // One that's about to run out is renewed.
+        let (address, sent) = recorder(|_, request, stream| {
+            if request.body.contains("client_credentials") {
+                json(stream, "200 OK", r#"{"access_token":"short","expires_in":"59"}"#);
+            } else {
+                json(stream, "200 OK", r#"{"access_token":"access","refresh_token":"new"}"#);
+            }
+        });
+        let held = session(&address, "old", kept.clone());
+        assert_eq!(held.pass().as_deref(), Ok("short"));
+        assert_eq!(held.pass().as_deref(), Ok("short"));
+        assert_eq!(sent.lock().unwrap().len(), 4);
+        assert_eq!(*kept.lock().unwrap(), ["new"]);
+        assert_eq!(held.close(), "new");
+    }
+
+    #[test]
+    fn a_sign_in_the_service_has_ended_is_said_so_and_forgotten() {
+        let (address, sent) = recorder(|_, _, stream| json(stream, "400 Bad Request", r#"{"error":"invalid_grant"}"#));
+        let kept = Arc::new(Mutex::new(Vec::new()));
+        let held = session(&address, "kept", kept.clone());
+        assert_eq!(
+            held.pass().err().as_deref(),
+            Some("Your sign-in to Lidarr has ended. In Settings, under Requests, sign in with your browser again.")
+        );
+        assert_eq!(*kept.lock().unwrap(), [""]);
+        assert_eq!(held.pass().err().as_deref(), Some(NEEDED));
+        assert_eq!(sent.lock().unwrap().len(), 1);
+        // An error that isn't a refusal is only passed on.
+        let (address, _) = recorder(|_, _, stream| json(stream, "400 Bad Request", "{}"));
+        let held = session(&address, "kept", kept.clone());
+        assert_eq!(held.pass().err().as_deref(), Some("The sign-in service answered with an error (400)."));
+        assert_eq!(held.close(), "kept");
+    }
+
+    #[test]
+    fn an_error_from_the_sign_in_service_is_judged_once_its_body_has_been_waited_for() {
+        const STALL: Duration = Duration::from_secs(3);
+        let (address, _) = recorder(|_, _, stream| {
+            let _ = write!(stream, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n{{");
+            let _ = stream.flush();
+            std::thread::sleep(STALL);
+        });
+        let started = Instant::now();
+        let held = session(&address, "kept", Arc::default());
+        assert_eq!(held.pass().err().as_deref(), Some("The sign-in service answered with an error (502)."));
+        assert!(started.elapsed() >= STALL - Duration::from_millis(500), "took {:?}", started.elapsed());
+        let found = session("http://127.0.0.1:9", "kept", Arc::default()).pass().unwrap_err();
+        assert!(found.starts_with("Couldn't reach the sign-in service. "), "{found}");
+    }
+}
