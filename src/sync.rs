@@ -77,18 +77,21 @@ fn peek(client: &Client) -> Option<(String, i64)> {
     }
 }
 
-/// The two files, beside the settings, that hold an account's shared record as a version
-/// first found it: the text, exactly, and the version that kept it.
-pub fn kept_files(settings: &Path, account: &str) -> (std::path::PathBuf, std::path::PathBuf) {
-    (settings.with_file_name(format!("shared-record-kept-{account}.json")), settings.with_file_name(format!("shared-record-kept-{account}.version")))
+/// The two files, beside the settings, for an account's shared record as a version first
+/// found it: the text, exactly, in a file of that version's own; and the note of the latest
+/// version to have kept one. A later version's copy goes beside an earlier one's and never
+/// over it: the earliest is the record from before any of them wrote.
+pub fn kept_files(settings: &Path, account: &str, version: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    (settings.with_file_name(format!("shared-record-kept-{account}-{version}.json")), settings.with_file_name(format!("shared-record-kept-{account}.version")))
 }
 
 /// Step 7.1: before the first write this version makes to an account's record, the text as
 /// it was found (the empty text too) and the note that it has been kept are both put on the
 /// disk, so that a mistake can be undone by hand. An error means one of them isn't there:
-/// then nothing may be sent. Once both are, neither is written again by this version.
+/// then nothing may be sent. Once both are, this version writes neither again, and no later
+/// version writes over this one's copy.
 pub fn keep_first(settings: &Path, account: &str, version: &str, found: &str) -> std::io::Result<()> {
-    let (text, note) = kept_files(settings, account);
+    let (text, note) = kept_files(settings, account, version);
     let kept_by = std::fs::read_to_string(&note).ok();
     if !keeps_first(kept_by.as_deref().map(str::trim), version) {
         return Ok(());
@@ -913,27 +916,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let settings = dir.join("settings.json");
-        let (text, note) = kept_files(&settings, "music_example_org_tester");
+        let read = |name: &str| std::fs::read_to_string(dir.join(name)).ok();
+        let (first, note) = ("shared-record-kept-music_example_org_tester-0.40.5.json", "shared-record-kept-music_example_org_tester.version");
         // The first write this version makes for the account: the text as found, and the
         // note that it has been kept, are both there.
         keep_first(&settings, "music_example_org_tester", "0.40.5", "the record as 0.40.4 left it").unwrap();
-        assert_eq!((std::fs::read_to_string(&text).unwrap().as_str(), std::fs::read_to_string(&note).unwrap().as_str()), ("the record as 0.40.4 left it", "0.40.5"));
+        assert_eq!((read(first).as_deref(), read(note).as_deref()), (Some("the record as 0.40.4 left it"), Some("0.40.5")));
         // Its later writes (the answer to the first never came; the record is by now this
         // version's own text) leave the copy as it is.
         keep_first(&settings, "music_example_org_tester", "0.40.5", "what this version wrote").unwrap();
-        assert_eq!(std::fs::read_to_string(&text).unwrap(), "the record as 0.40.4 left it");
+        assert_eq!(read(first).as_deref(), Some("the record as 0.40.4 left it"));
         // An empty record is kept as the empty text, and noted: a later write does not keep
         // this version's own text as "the original".
         keep_first(&settings, "another_account", "0.40.5", "").unwrap();
         keep_first(&settings, "another_account", "0.40.5", "what this version wrote").unwrap();
-        assert_eq!(std::fs::read_to_string(kept_files(&settings, "another_account").0).unwrap(), "");
-        // Each account has its own; a later version keeps what it finds, once.
-        assert_eq!(std::fs::read_to_string(&text).unwrap(), "the record as 0.40.4 left it");
+        assert_eq!(read("shared-record-kept-another_account-0.40.5.json").as_deref(), Some(""));
+        // Each account has its own. A later version keeps what it finds, once, in a file of
+        // its own: the copy an earlier version made is the one from before either of them
+        // wrote, and is the one wanted when a mistake of the earlier version is found only
+        // after the update, so it stays as it is.
         keep_first(&settings, "music_example_org_tester", "0.41.0", "as 0.40.5 left it").unwrap();
-        assert_eq!((std::fs::read_to_string(&text).unwrap().as_str(), std::fs::read_to_string(&note).unwrap().as_str()), ("as 0.40.5 left it", "0.41.0"));
+        assert_eq!(read("shared-record-kept-music_example_org_tester-0.41.0.json").as_deref(), Some("as 0.40.5 left it"));
+        assert_eq!((read(first).as_deref(), read(note).as_deref()), (Some("the record as 0.40.4 left it"), Some("0.41.0")));
+        // Going back to the earlier version keeps nothing more and changes neither copy.
+        keep_first(&settings, "music_example_org_tester", "0.40.5", "as 0.41.0 left it").unwrap();
+        assert_eq!(read(first).as_deref(), Some("the record as 0.40.4 left it"));
         // If the copy can't be written, or the note can't, that is an error: nothing is
         // sent on the strength of it. (A folder stands where each file should be.)
-        let (text, note) = kept_files(&settings, "blocked");
+        let (text, note) = (dir.join("shared-record-kept-blocked-0.40.5.json"), dir.join("shared-record-kept-blocked.version"));
         std::fs::create_dir_all(&text).unwrap();
         assert!(keep_first(&settings, "blocked", "0.40.5", "x").is_err());
         std::fs::remove_dir_all(&text).unwrap();

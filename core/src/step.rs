@@ -49,8 +49,9 @@
 //! 7. **Write**, if [`Plan::write`] is set. In this order:
 //!    1. If this version has not yet kept the record's text for this account
 //!       ([`keeps_first`]): put [`Write::found`] (the empty text too) and the note that it
-//!       has been kept on disk, in a file named for the account. If either can't be
-//!       written, send nothing. Neither is ever written again by this version.
+//!       has been kept on disk, the text in a file named for the account and the version.
+//!       If either can't be written, send nothing. This version never writes its copy
+//!       again, and a later version's copy never goes over an earlier one's.
 //!    2. [`Choices::sending`], which says whether the plan still fits the choices it was
 //!       made from. If it says no (a change the write carries was taken back meanwhile),
 //!       send nothing and start again from step 1. Save the choices, surely, before the
@@ -544,8 +545,9 @@ pub struct Write {
 }
 
 /// Whether the record's text is to be kept aside before a write (step 7.1): a version does
-/// so once for an account, before the first write it makes. `kept_by` is the version noted
-/// with the copy that is there for this account, if there is one.
+/// so once for an account, before the first write it makes. `kept_by` is the latest version
+/// noted as having kept a copy for this account, if one has. (Each version's copy is a file
+/// of its own: the caller never writes one version's over another's.)
 pub fn keeps_first(kept_by: Option<&str>, version: &str) -> bool {
     let parts = |version: &str| version.split('.').map(|part| part.parse::<u64>().unwrap_or(0)).collect::<Vec<_>>();
     kept_by.is_none_or(|kept_by| parts(version) > parts(kept_by))

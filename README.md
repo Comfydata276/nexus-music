@@ -248,10 +248,12 @@ app and the Android app do the same.
 
 **A copy, in case.** Before a version of the app first changes that record for an account, it
 keeps the text exactly as it found it, beside its settings (`%APPDATA%\Nexus Music\config`):
-`shared-record-kept-<account>.json`, with the version that kept it in the `.version` file of
-the same name. Nothing is written to the server until both are on the disk, and that version
-never writes them again. To put the record back: close the app on every device, and paste the
-file's text into the playlist's comment in Navidrome.
+`shared-record-kept-<account>-<version>.json`. Nothing is written to the server until that
+file, and a note beside it of the version that kept it, are on the disk. That version never
+writes its copy again and no later version writes over it, so the file with the lowest version
+in its name is the record as it was before any of them changed it. To put the record back:
+close the app on every device, and paste the file's text into the playlist's comment in
+Navidrome.
 
 **Known, and accepted.**
 
