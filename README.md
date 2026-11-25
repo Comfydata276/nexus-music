@@ -293,9 +293,35 @@ A PC that step 3 was not done on puts back whatever it holds that is newer than 
   before either had seen the other's) holds data nobody reads: every device uses the one with
   the lowest id. To see it, look for two playlists of that name in Navidrome's own pages; to
   be rid of it, check its comment holds nothing wanted and delete it there.
-- The settings are one set for the PC, not one for each account: pins and list choices that
-  were agreed under one account are offered, at the times they were made, to another account
-  signed in on the same PC. (Changes still waiting are not: they wait for their own account.)
+- An edit made in the fraction of a second between the app deciding what to send and sending
+  it goes as it was decided, and is put right by the next exchange.
+- What arrives from other devices (pins, sorts, the theme, dates, Recently played) is written
+  to the disk as the app writes everything else: a moment after it is shown, not before. If
+  that write fails it is reported like any other, and the same things arrive again at the
+  next exchange. (A change you make yourself is on the disk before it is shown.)
+- A profile opened by two copies of the app at once (possible only by pointing both at one
+  folder with `NEXUS_MUSIC_HOME`) is not protected: each writes its files as if alone.
+- Some things are one set for the PC, not one for each account, as they were in 0.40.4. With
+  two accounts signed in on one PC in turn:
+  - pins, list choices and the theme that were agreed under one account are offered, at the
+    times they were made, to the other (changes still waiting are not: they wait for their
+    own account);
+  - the dates songs were added (`playlist-added.json`) are one set, so dates noted under one
+    account are shared into the other's record for playlists of the same id;
+  - the plays (`plays.log`) are one log, so "Your stats" counts whoever listened on this PC,
+    and the latest of them are shared into whichever account's record is exchanged;
+  - likes, ratings and downloads waiting to be sent are kept per account under a name that
+    turns punctuation into `_`, so two usernames on one server that differ only in
+    punctuation share them.
+
+  Signing out clears Recently played, the saved queue and the "Continue here" offer.
+
+**Your plays.** `plays.log`, in the same folder, holds every play the app has counted, one to
+a line, and is only ever added to. If it can't be read when the app starts (another program
+has it open, the disk gave an error) it is left exactly as it is: the app says so once,
+"Your stats" counts only what is played from then on and says that nothing is gone, and
+those plays go to `plays.log.new` beside it, which is joined to the log the next time the
+log reads. A log that is simply not there is started from Recently played.
 
 ## Building
 

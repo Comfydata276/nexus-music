@@ -326,6 +326,11 @@ impl Controller {
         self.let_go();
         self.clock.set(Clock::Unmeasured);
         self.sync_says("");
+        // What was learnt under the sign-in that is going is not the next one's: the queue
+        // another device of that account offered, and the songs its server said it lacks.
+        *self.elsewhere.borrow_mut() = None;
+        self.ui.global::<crate::ui::Player>().set_elsewhere("".into());
+        self.history_missing.borrow_mut().clear();
     }
 
     /// "Keep my devices in step" was switched: off, nothing already on its way is applied
