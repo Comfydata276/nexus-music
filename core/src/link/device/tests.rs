@@ -1062,12 +1062,17 @@ fn a_command_whose_songs_are_never_found_is_given_up_and_the_device_is_free() {
 #[test]
 fn the_end_of_a_session_ends_what_was_waiting_under_it() {
     // "Link my devices" switched off, the sign-in ending, linking reset from elsewhere (a
-    // look reads another secret), the secret not read for ten minutes: each ends the
+    // look reads another secret) or here, the secret not read for ten minutes: each ends the
     // session, and with it the command whose songs were being looked up. At once, not
     // when its half minute is up.
-    for how in ["setting", "sign-out", "another secret", "ten minutes"] {
+    for how in ["setting", "sign-out", "another secret", "reset linking", "ten minutes"] {
         let mut world = add_being_looked_up();
         match how {
+            // ("Reset linking" pressed on this device itself: the session ends at the press.)
+            "reset linking" => {
+                let did = world.with(B, |device, env| device.reset(env));
+                world.act(B, did);
+            }
             "setting" => {
                 let did = world.with(B, |device, env| device.setting(false, env));
                 world.act(B, did);

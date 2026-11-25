@@ -371,7 +371,7 @@ impl Player for Here<'_> {
         }
         // Each of those takes its way into the player only once it knows something will
         // change (`ways`): whether one was taken is whether anything did.
-        if ctl.ways.borrow().taken() { Carried::Changed } else { Carried::Unchanged }
+        if ctl.ways.taken() { Carried::Changed } else { Carried::Unchanged }
     }
 
     /// (The end of a move of this PC's music to another device: the app's own doing. The
