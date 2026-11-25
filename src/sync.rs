@@ -578,3 +578,166 @@ impl Controller {
         self.toggle_play();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write as _;
+    use std::sync::{Arc, Mutex};
+
+    use nexus_core::step::{Held, Stop};
+
+    use super::*;
+    use crate::subsonic::fake;
+
+    /// A stand-in Navidrome: its playlists (id, name, owner, comment), and the `Date` it puts
+    /// on its answers. Like Navidrome, it leaves an empty comment out of an answer.
+    #[derive(Default)]
+    struct Stored {
+        playlists: Vec<(String, String, Option<String>, String)>,
+        date: Option<String>,
+        asked: Vec<String>,
+    }
+
+    fn decoded(text: &str) -> String {
+        let bytes = text.as_bytes();
+        let (mut out, mut i) = (Vec::new(), 0);
+        while i < bytes.len() {
+            match bytes[i] {
+                b'%' if i + 2 < bytes.len() => {
+                    out.push(u8::from_str_radix(&text[i + 1..i + 3], 16).unwrap());
+                    i += 2;
+                }
+                b'+' => out.push(b' '),
+                other => out.push(other),
+            }
+            i += 1;
+        }
+        String::from_utf8(out).unwrap()
+    }
+
+    fn navidrome() -> (Client, Arc<Mutex<Stored>>) {
+        let stored = Arc::new(Mutex::new(Stored::default()));
+        let held = stored.clone();
+        let address = fake::server(move |target, _, stream| {
+            let (path, query) = target.split_once('?').unwrap_or((target, ""));
+            let value = |name: &str| query.split('&').filter_map(|pair| pair.split_once('=')).find(|(key, _)| *key == name).map(|(_, value)| decoded(value));
+            let mut stored = held.lock().unwrap();
+            stored.asked.push(path.trim_start_matches("/rest/").to_string());
+            let said = |(id, name, owner, comment): &(String, String, Option<String>, String)| {
+                let owner = owner.as_ref().map(|owner| format!(r#","owner":"{owner}""#)).unwrap_or_default();
+                let comment = if comment.is_empty() { String::new() } else { format!(r#","comment":{}"#, serde_json::to_string(comment).unwrap()) };
+                format!(r#"{{"id":"{id}","name":"{name}"{owner}{comment}}}"#)
+            };
+            let fields = match path {
+                "/rest/getPlaylists" => format!(r#""playlists":{{"playlist":[{}]}}"#, stored.playlists.iter().map(said).collect::<Vec<_>>().join(",")),
+                "/rest/getPlaylist" => {
+                    let id = value("id").unwrap_or_default();
+                    stored.playlists.iter().find(|playlist| playlist.0 == id).map(|playlist| format!(r#""playlist":{}"#, said(playlist))).unwrap_or_default()
+                }
+                "/rest/createPlaylist" => {
+                    let made = (format!("made{}", stored.playlists.len()), value("name").unwrap_or_default(), Some("tester".to_string()), String::new());
+                    stored.playlists.push(made.clone());
+                    format!(r#""playlist":{}"#, said(&made))
+                }
+                "/rest/updatePlaylist" => {
+                    let (id, comment) = (value("playlistId").unwrap_or_default(), value("comment").unwrap_or_default());
+                    if let Some(playlist) = stored.playlists.iter_mut().find(|playlist| playlist.0 == id) {
+                        playlist.3 = comment;
+                    }
+                    String::new()
+                }
+                _ => String::new(),
+            };
+            let comma = if fields.is_empty() { "" } else { "," };
+            let body = format!(r#"{{"subsonic-response":{{"status":"ok","version":"1.16.1"{comma}{fields}}}}}"#);
+            let date = stored.date.as_ref().map(|date| format!("Date: {date}\r\n")).unwrap_or_default();
+            let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{date}Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        });
+        (Client::new(&address, "tester", "a password"), stored)
+    }
+
+    fn holds(changes: &[Change]) -> Holds {
+        let mut holds = Holds { username: "tester".into(), ..Default::default() };
+        for change in changes {
+            holds.choices.change(change.clone());
+        }
+        holds
+    }
+
+    fn plan(outcome: Outcome) -> Plan {
+        match outcome {
+            Outcome::Go(plan) => *plan,
+            Outcome::Stop(stop) => panic!("stopped: {stop:?}"),
+        }
+    }
+
+    #[test]
+    fn an_exchange_through_the_apps_own_client() {
+        let (client, stored) = navidrome();
+        let comment = |stored: &Mutex<Stored>, id: &str| stored.lock().unwrap().playlists.iter().find(|playlist| playlist.0 == id).map(|playlist| playlist.3.clone()).unwrap_or_default();
+        // Nothing on the server, and nothing to say: nothing is made.
+        let looked = plan(look(&client, &holds(&[])).unwrap());
+        assert!(looked.write.is_none() && looked.playlist.is_none());
+        // With a pin, the playlist is made (once) and the record written into it.
+        let pinned = holds(&[Change::Pin("p1".into())]);
+        let write = plan(look(&client, &pinned).unwrap()).write.unwrap();
+        assert_eq!(write.into, None);
+        let id = send(&client, &write).unwrap();
+        let Read::Record(record) = record::read(&comment(&stored, &id)) else { panic!("not a record") };
+        assert_eq!(record.shared.pins, ["p1"]);
+        assert_eq!(stored.lock().unwrap().asked.iter().filter(|asked| *asked == "createPlaylist").count(), 1);
+        // A second device finds it by its name and owner (among others' of that name, and
+        // one whose owner the server doesn't state), and its pin goes in beside the first.
+        {
+            let mut stored = stored.lock().unwrap();
+            stored.playlists.push(("a-guests".into(), PLAYLIST_NAME.into(), Some("guest".into()), "theirs".into()));
+            stored.playlists.push(("a-whose".into(), PLAYLIST_NAME.into(), None, String::new()));
+        }
+        let second = plan(look(&client, &holds(&[Change::Pin("p2".into())])).unwrap());
+        assert_eq!(second.playlist.as_deref(), Some(id.as_str()));
+        assert_eq!(send(&client, &second.write.unwrap()).unwrap(), id);
+        let Read::Record(record) = record::read(&comment(&stored, &id)) else { panic!("not a record") };
+        assert_eq!(record.shared.pins, ["p1", "p2"]);
+        assert_eq!(comment(&stored, "a-guests"), "theirs");
+        // The look before the window opens finds the theme there, by the remembered playlist
+        // or, when that is no longer the account's, by looking for it.
+        stored.lock().unwrap().playlists.iter_mut().find(|playlist| playlist.0 == id).unwrap().3 = r#"{"nexus_music_sync":1,"theme":"Ocean","theme_at":77}"#.into();
+        for known in [id.as_str(), "", "a-guests", "gone"] {
+            assert_eq!(peek(&client, known), Some((id.clone(), "Ocean".to_string(), 77)), "{known:?}");
+        }
+    }
+
+    #[test]
+    fn what_the_server_does_not_say_and_what_its_clock_says() {
+        let (client, stored) = navidrome();
+        let pinned = holds(&[Change::Pin("p1".into())]);
+        // The server's clock, from the Date on its answers, against this PC's: an hour out,
+        // and nothing is to be written.
+        let record = r#"{"nexus_music_sync":1,"pins":["theirs"],"pins_at":5}"#;
+        stored.lock().unwrap().playlists.push(("r".into(), PLAYLIST_NAME.into(), Some("Tester".into()), record.into()));
+        let hour_ago = chrono::Utc::now() - chrono::Duration::hours(1);
+        stored.lock().unwrap().date = Some(hour_ago.format("%a, %d %b %Y %H:%M:%S GMT").to_string());
+        let looked = plan(look(&client, &pinned).unwrap());
+        assert!((-3_602..=-3_598).contains(&looked.offset.unwrap()), "{:?}", looked.offset);
+        assert_eq!((looked.held, looked.write.is_none(), looked.take.agreed.pins.as_slice()), (Some(Held::ClockWrong), true, ["theirs".to_string()].as_slice()));
+        // The right time, and it is.
+        stored.lock().unwrap().date = Some(chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string());
+        let looked = plan(look(&client, &pinned).unwrap());
+        assert!(looked.held.is_none() && looked.write.is_some() && looked.offset.unwrap().abs() <= 2);
+        // No date at all: nothing to compare with.
+        stored.lock().unwrap().date = None;
+        let looked = plan(look(&client, &pinned).unwrap());
+        assert!(looked.offset.is_none() && looked.write.is_some());
+        // The owner left out of the answers: the playlist is not taken for the account's.
+        stored.lock().unwrap().playlists[0].2 = None;
+        assert_eq!(look(&client, &pinned).unwrap(), Outcome::Stop(Stop::OwnerNotStated));
+        assert_eq!(peek(&client, "r"), None);
+        assert_eq!(stored.lock().unwrap().playlists[0].3, record);
+    }
+
+    #[test]
+    fn a_later_version_is_told_from_an_earlier_one() {
+        assert!(later_version("0.40.5", "0.40.4") && later_version("0.41.0", "0.40.12") && later_version("0.40.4", ""));
+        assert!(!later_version("0.40.4", "0.40.4") && !later_version("0.40.4", "0.41.0") && !later_version("", "0.40.4"));
+    }
+}
