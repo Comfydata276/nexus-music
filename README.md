@@ -323,8 +323,9 @@ it is whole).
 **Known, and accepted.**
 
 - Two devices that read the record in the same moment both write, and the second write wins.
-  The first still holds what it wrote and puts it back at its next look (a minute at most).
-  The server has no write that is conditional on what was read.
+  The first still holds what it wrote and puts it back at its next look (a quarter of a
+  minute at most with the window open, a minute hidden in the notification area). The
+  server has no write that is conditional on what was read.
 - A device that isn't playing saves a queue you have just changed there, though another
   device is playing; for the seconds until that device's next save (it saves as it plays,
   without looking) the server holds the queue that isn't being played. A third device that

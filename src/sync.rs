@@ -18,7 +18,7 @@ use std::time::Duration;
 use slint::ComponentHandle as _;
 
 use nexus_core::handover::{self, Clock, First, Here, Save, Then};
-use nexus_core::step::{Answers, Change, Device, Found, Outcome, Plan, Take, Write, find, settle};
+use nexus_core::step::{Answers, Change, Device, Found, Outcome, Plan, Stop, Take, Write, find, settle};
 pub use nexus_core::sync::{HISTORY_LENGTH, PLAYLIST_NAME};
 
 use crate::config::{Played, Settings};
@@ -27,8 +27,30 @@ use crate::subsonic::{ApiError, ApiResult, Client, PlayQueue, Song, Timed};
 
 /// How long after a change before it's passed on, so a burst of changes goes as one.
 const SETTLE: Duration = Duration::from_secs(3);
-/// How often to look for changes made elsewhere.
-const LOOK: Duration = Duration::from_secs(60);
+/// How often to look for changes made elsewhere, while the window is open: what another
+/// device changed shows here within a quarter of a minute.
+const LOOK: Duration = Duration::from_secs(15);
+/// And while the window is hidden in the notification area, where nobody is looking at it:
+/// every so many of those, which is once a minute, as it always was.
+const LOOKS_WHEN_HIDDEN: u32 = 4;
+
+/// The looks the timer has come round for while the window was hidden, since the last one
+/// made. (The timer is the window's own thread's.)
+static HIDDEN_LOOKS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Whether a look is made at this turn of the timer. `hidden` counts the turns let go by
+/// while the window was hidden.
+fn due(window_open: bool, hidden: &std::sync::atomic::AtomicU32) -> bool {
+    if window_open {
+        hidden.store(0, Ordering::SeqCst);
+        return true;
+    }
+    if hidden.fetch_add(1, Ordering::SeqCst) + 1 < LOOKS_WHEN_HIDDEN {
+        return false;
+    }
+    hidden.store(0, Ordering::SeqCst);
+    true
+}
 
 // What an exchange decides is the library's (`nexus_core::step`), the same for every app:
 // which playlist holds the record, what the server's answers mean, what to keep, take in and
@@ -318,8 +340,17 @@ impl Controller {
         self.settings.borrow_mut().show();
         self.look_elsewhere();
         self.sync_look_timer.start(slint::TimerMode::Repeated, LOOK, || {
-            with(|ctl| ctl.look_elsewhere());
+            with(|ctl| ctl.look_is_due());
         });
+    }
+
+    /// The timer has come round. With the window open, a look; hidden in the notification
+    /// area, one in every [`LOOKS_WHEN_HIDDEN`].
+    fn look_is_due(self: &Rc<Self>) {
+        if !due(self.ui.window().is_visible(), &HIDDEN_LOOKS) {
+            return;
+        }
+        self.look_elsewhere();
     }
 
     pub fn stop_sync(&self) {
@@ -446,7 +477,7 @@ impl Controller {
         let session = self.session.load(Ordering::SeqCst);
         self.api_pool.spawn(move || {
             let answers = read(&client);
-            post(move |ctl| ctl.answered(session, client, answers));
+            post(move |ctl| ctl.answered(session, client, answers, false));
         });
     }
 
@@ -482,7 +513,13 @@ impl Controller {
     /// connection of the sign-in that asked, and `session` says which that was: if it is
     /// no longer the one signed in, or sharing has been switched off, everything here is
     /// dropped.
-    fn answered(self: &Rc<Self>, session: u64, client: Client, answers: ApiResult<Answers>) {
+    ///
+    /// `again`: these are the answers of a second asking, made at once because the first
+    /// two disagreed about what is in the playlist. That is what another device writing
+    /// between the two reads looks like, and it is no fault: the server is asked once more
+    /// straight away, and only answers that disagree a second time running stop the
+    /// exchange and are said.
+    fn answered(self: &Rc<Self>, session: u64, client: Client, answers: ApiResult<Answers>, again: bool) {
         // Step 2. (Let go: dropped. But it has come back, so the next may begin.)
         if session != self.session.load(Ordering::SeqCst) {
             return self.exchange_over();
@@ -495,6 +532,14 @@ impl Controller {
         // Step 3: decided from what this PC holds now.
         let plan = match settle(&self.device(), &answers) {
             // Step 4.
+            Outcome::Stop(Stop::Disagree) if !again => {
+                // (Still this exchange: nothing else begins until it is back.)
+                self.api_pool.spawn(move || {
+                    let answers = read(&client);
+                    post(move |ctl| ctl.answered(session, client, answers, true));
+                });
+                return;
+            }
             Outcome::Stop(stop) => {
                 self.sync_says(stop.words());
                 return self.exchange_over();
@@ -774,7 +819,7 @@ mod tests {
     use std::io::Write as _;
     use std::sync::{Arc, Mutex};
 
-    use nexus_core::step::{Held, Stop};
+    use nexus_core::step::Held;
 
     use super::*;
     use crate::subsonic::fake;
@@ -875,6 +920,20 @@ mod tests {
 
     fn pins(settings: &Settings) -> Vec<&str> {
         settings.pinned_playlists.iter().map(String::as_str).collect()
+    }
+
+    #[test]
+    fn a_look_is_made_each_time_round_with_the_window_open_and_one_time_in_four_hidden() {
+        let hidden = std::sync::atomic::AtomicU32::new(0);
+        // Open: every time the timer comes round (every quarter of a minute).
+        assert!((0..5).all(|_| due(true, &hidden)));
+        // Hidden in the notification area: once a minute, as before.
+        let looks: Vec<bool> = (0..9).map(|_| due(false, &hidden)).collect();
+        assert_eq!(looks, [false, false, false, true, false, false, false, true, false]);
+        // Opened again, and hidden again: the count starts from the last look made.
+        assert!(due(true, &hidden));
+        assert_eq!((0..4).map(|_| due(false, &hidden)).collect::<Vec<_>>(), [false, false, false, true]);
+        assert_eq!(LOOK * LOOKS_WHEN_HIDDEN, Duration::from_secs(60));
     }
 
     #[test]
