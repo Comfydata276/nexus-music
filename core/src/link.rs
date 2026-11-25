@@ -16,6 +16,7 @@
 pub mod command;
 pub mod frame;
 pub mod message;
+pub mod moving;
 pub mod rule;
 pub mod secret;
 pub mod steer;
