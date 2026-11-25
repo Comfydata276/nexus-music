@@ -422,7 +422,7 @@ connection.
 | `src/asked.rs` | Remembers what was requested and spots when it arrives. |
 | `src/bulk.rs` | Asks Lidarr for many albums at once: finds each, hands them over an artist at a time, and checks what Lidarr made of them. |
 | `src/musicbrainz.rs` | Finds songs, discographies and track lists for music that isn't in the library. |
-| `src/gate.rs` | Browser sign-in for a Lidarr that sits behind Authentik. |
+| `src/gate.rs` | Browser sign-in for a Lidarr that sits behind Authentik: the browser's part. The rules are `core/src/gate.rs`. |
 | `src/jam.rs` | Jams and linked devices: being steered through a relay, steering someone else's playback, and handing a queue from one device to another. |
 | `relay/` | The jam relay: a separate small program (its own `Cargo.toml`) with the page guests without the app use. |
 | `src/update.rs` | Finds, downloads and verifies new releases. |
@@ -464,6 +464,7 @@ window, the files, the connections.
 | `core/src/queue.rs` | What becomes of the queue when the list it was started from changes. |
 | `core/src/musicbrainz.rs`, `listenbrainz.rs`, `offer.rs` | The questions put to MusicBrainz and ListenBrainz and what is made of the answers. |
 | `core/src/lidarr.rs` | The questions put to Lidarr and what is made of the answers: looking up, asking for an album or an artist, the profiles for singles and soundtracks, what is on its way. `src/lidarr.rs` keeps the Lidarr in use and what has been offered. |
+| `core/src/gate.rs` | The sign-in in front of Lidarr: finding it, the link the browser is sent to, trading the code and renewing the token. `src/gate.rs` keeps the browser's part: somewhere on this PC for it to come back to, and opening it. |
 | `core/src/http.rs` | How the library asks for a request: it asks the app. `src/corehttp.rs` is the Windows app's answer, on its own connections. |
 
 Something moves into `core/` when it is free of the window, files and threads, and is moved

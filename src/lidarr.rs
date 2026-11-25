@@ -111,7 +111,7 @@ mod wire {
 
     fn session(service: &str, token: &str) -> Arc<crate::gate::Session> {
         let found = crate::gate::Found { service: service.into(), client: "lidarr-proxy".into() };
-        Arc::new(crate::gate::Session::new(found, token.into(), |_| {}))
+        Arc::new(crate::gate::session(found, token.into(), |_| {}))
     }
 
     /// A request's head as the app has always sent it: what every request carries, in the

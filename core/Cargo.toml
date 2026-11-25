@@ -16,3 +16,6 @@ serde_json = { version = "1", features = ["raw_value"] }
 # `Date` on an answer. The app carries chrono already; none of its clock is used here, so
 # the library still has no clock of its own.
 chrono = { version = "0.4", default-features = false, features = ["std"] }
+# The check sent ahead of the secret in a browser sign-in (see src/gate.rs). The app carries
+# the same version already.
+sha2 = "0.11"

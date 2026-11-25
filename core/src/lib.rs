@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 pub mod address;
+pub mod gate;
 pub mod handover;
 pub mod http;
 pub mod jam;

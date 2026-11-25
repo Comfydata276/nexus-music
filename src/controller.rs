@@ -1410,7 +1410,7 @@ impl Controller {
 
     fn new_gate(&self, found: crate::gate::Found, token: String) -> crate::gate::Session {
         let paths = self.paths.clone();
-        crate::gate::Session::new(found, token, move |token| config::save_secret(&paths, "lidarr-token", token))
+        crate::gate::session(found, token, move |token| config::save_secret(&paths, "lidarr-token", token))
     }
 
     /// Shows where the connection to Lidarr stands: `state` picks the marker and the one
