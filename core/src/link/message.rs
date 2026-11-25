@@ -152,7 +152,8 @@ impl Why {
 
 /// A song as a device steering another shows it: enough to draw a row with, for a song
 /// the steering device's own library does not have.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Entry {
     pub id: String,
     pub title: String,
@@ -197,7 +198,8 @@ impl Entry {
 
 /// What a device steering this one shows: what a jam's guests are shown, between a
 /// person's own devices.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Full {
     /// How far into the song it is, in seconds, as the tell was written.
     pub position: f64,
@@ -265,7 +267,8 @@ impl Full {
 
 /// What a device is playing and has to come, by id, for another to carry on with: the song
 /// that is playing first, then the rest in the order they would play.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Handed {
     pub songs: Vec<String>,
     /// How many straight after the first were queued by hand.

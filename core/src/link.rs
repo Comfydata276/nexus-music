@@ -15,6 +15,7 @@
 //! sleeps**), random bytes from the system, and the server's answers, and is told what to do.
 //! Nothing here panics, whatever it is given.
 
+pub mod bind;
 pub mod command;
 pub mod device;
 pub mod frame;

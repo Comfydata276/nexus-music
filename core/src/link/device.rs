@@ -47,7 +47,8 @@ pub const LOST_MS: u64 = 45_000;
 pub const SOUNDS_AFTER: f64 = 0.2;
 
 /// What a device says it is playing, in brief.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Brief {
     pub playing: bool,
     pub title: String,
@@ -55,7 +56,8 @@ pub struct Brief {
 }
 
 /// What a command needs found before it can be carried out, as the app is handed it.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Ready {
     Nothing,
     /// The entry of the queue it means, as the queue stands now: its place after the
@@ -141,7 +143,8 @@ impl Env<'_> {
 }
 
 /// What the device asks of the app.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Do {
     /// Write this down, if anything is being written down (for watching copies from
     /// outside). Never a secret, a key or a token.
@@ -193,7 +196,7 @@ pub fn wanted(signed_in: bool, relay: bool, link_my_devices: bool) -> bool {
 }
 
 /// One line of the list.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct Row {
     /// Its place at the relay, as text: what picking it names. Empty for one that is not here.
     pub place: String,
@@ -208,7 +211,7 @@ pub struct Row {
 }
 
 /// What the panel shows.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct Shown {
     /// This device has its place in the room.
     pub entered: bool,

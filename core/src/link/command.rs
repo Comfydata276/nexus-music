@@ -231,10 +231,38 @@ impl Command {
         })
     }
 
+    /// As one value, the way it travels in a `do`: `{"do": name, "with": {…}}`.
+    pub fn value(&self) -> Value {
+        match self.with() {
+            Some(with) => json!({"do": self.name(), "with": with}),
+            None => json!({"do": self.name()}),
+        }
+    }
+
+    /// Reads [`Command::value`] back, with the same checks as [`Command::read`].
+    pub fn from_value(value: &Value) -> Option<Command> {
+        Command::read(value.get("do")?.as_str()?, value.get("with"))
+    }
+
     /// Whether only the latest of several waiting to be sent is worth sending: a slider
     /// dragged across its range asks for many, and means the last.
     pub fn latest_only(&self) -> bool {
         matches!(self, Command::Volume { .. })
+    }
+}
+
+/// A command crosses to an app's own side (the phone's player) spelt as it is in a
+/// message, and is read back through the one function that checks it.
+impl serde::Serialize for Command {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.value().serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Command {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Command, D::Error> {
+        let value = <Value as serde::Deserialize>::deserialize(deserializer)?;
+        Command::from_value(&value).ok_or_else(|| serde::de::Error::custom("not a command"))
     }
 }
 
@@ -273,6 +301,13 @@ mod tests {
             let back: Option<Value> = text.as_deref().map(|text| serde_json::from_str(text).unwrap());
             assert_eq!(Command::read(command.name(), back.as_ref()), Some(command));
         }
+        // And as one value, for an app's own side: spelt the same, checked the same.
+        for command in every() {
+            let text = serde_json::to_string(&command).unwrap();
+            assert_eq!(serde_json::from_str::<Command>(&text).ok(), Some(command), "{text}");
+        }
+        assert_eq!(serde_json::to_string(&Command::Seek { to: 5.0 }).unwrap(), r#"{"do":"seek","with":{"to":5.0}}"#);
+        assert!(serde_json::from_str::<Command>(r#"{"do":"seek","with":{"to":-1}}"#).is_err());
         // What takes nothing may come with an empty `with`, and a field not known is ignored.
         assert_eq!(Command::read("pause", Some(&json!({}))), Some(Command::Pause));
         assert_eq!(Command::read("seek", Some(&json!({"to": 5, "later": [1]}))), Some(Command::Seek { to: 5.0 }));

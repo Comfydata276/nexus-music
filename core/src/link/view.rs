@@ -17,7 +17,7 @@ use super::message::Full;
 
 /// What the device being steered was last heard to be doing, with what has been asked of it
 /// since shown as done until its own word arrives.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct View {
     pub full: Full,
     pub playing: bool,
@@ -26,7 +26,8 @@ pub struct View {
 }
 
 /// Something pressed in the player or the queue panel while another device is shown there.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Press {
     /// The play button, or the key that does the same.
     Toggle,
