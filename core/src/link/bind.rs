@@ -275,8 +275,8 @@ impl Player for Held {
     fn admit(&mut self, at: At, minute: u64, now_ms: u64) -> Result<Reservation, Why> {
         self.rule.admit(at, minute, now_ms)
     }
-    fn finish(&mut self, reservation: Reservation, at: At, minute: u64, same_session: bool, nonce: Nonce) -> Result<(), Why> {
-        self.rule.finish(reservation, at, minute, same_session, nonce)
+    fn finish(&mut self, reservation: Reservation, at: At, minute: u64, now_ms: u64, same_session: bool, nonce: Nonce) -> Result<(), Why> {
+        self.rule.finish(reservation, at, minute, now_ms, same_session, nonce)
     }
     fn refuse(&mut self, reservation: Reservation) {
         self.rule.refuse(reservation)
@@ -469,9 +469,9 @@ impl Phone {
             Event::Choose { place, in_a_jam } => self.with(now_ms, today, random, |device, env| device.choose(&place, in_a_jam, env)),
             Event::Pause { place } => self.with(now_ms, today, random, |device, env| device.pause(&place, env)),
             Event::LetGo => self.with(now_ms, today, random, |device, _| device.let_go()),
-            Event::Reset => self.with(now_ms, today, random, |device, _| device.reset()),
-            Event::Setting { on } => self.with(now_ms, today, random, |device, _| device.setting(on)),
-            Event::Stop => self.with(now_ms, today, random, |device, _| device.stop()),
+            Event::Reset => self.with(now_ms, today, random, |device, env| device.reset(env)),
+            Event::Setting { on } => self.with(now_ms, today, random, |device, env| device.setting(on, env)),
+            Event::Stop => self.with(now_ms, today, random, |device, env| device.stop(env)),
             Event::Resume { ticket } => self.with(now_ms, today, random, |device, env| device.resume(ticket, env)),
         }
     }
@@ -497,7 +497,7 @@ impl Phone {
                 self.device.said(session, note);
                 Came::default()
             }
-            FromRelay::NoRandom => self.with(now_ms, today, random, |device, env| device.out_of_random(env.me.here)),
+            FromRelay::NoRandom => self.with(now_ms, today, random, |device, env| device.out_of_random(env)),
             FromRelay::Entered { place, token } => {
                 self.device.entered(session, place, token);
                 Came::default()

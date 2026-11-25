@@ -382,8 +382,8 @@ impl Player for Here<'_> {
         self.ctl.link_rule.borrow_mut().admit(at, minute, now_ms)
     }
 
-    fn finish(&mut self, reservation: Reservation, at: At, minute: u64, same_session: bool, nonce: Nonce) -> Result<(), Why> {
-        self.ctl.link_rule.borrow_mut().finish(reservation, at, minute, same_session, nonce)
+    fn finish(&mut self, reservation: Reservation, at: At, minute: u64, now_ms: u64, same_session: bool, nonce: Nonce) -> Result<(), Why> {
+        self.ctl.link_rule.borrow_mut().finish(reservation, at, minute, now_ms, same_session, nonce)
     }
 
     fn refuse(&mut self, reservation: Reservation) {
@@ -445,6 +445,11 @@ impl Controller {
     /// and the random numbers it may ask for. `None` if the deciding is already at work
     /// (nothing here calls back into it while it is).
     fn link_with<T>(self: &Rc<Self>, event: impl FnOnce(&mut Device, &mut Env) -> T) -> Option<T> {
+        // (With the switch off there is no new linking: nothing of it runs, whoever calls,
+        // and this device is given no id for it.)
+        if !on() {
+            return None;
+        }
         let me = self.link_me();
         let link = self.link.borrow();
         let mut inner = link.inner.try_borrow_mut().ok()?;
@@ -523,17 +528,19 @@ impl Controller {
                         }
                     });
                 }
-                Do::Find { ticket, ids } => {
-                    let client = self.client();
-                    self.link_pool().spawn(move || {
-                        let songs: Vec<Song> = ids.iter().filter_map(|id| crate::jam::find_song(id, client.as_ref())).filter(|song| song.radio_url.is_empty()).collect();
-                        post(move |ctl| {
-                            let found: Vec<String> = songs.iter().map(|song| song.id.clone()).collect();
-                            ctl.link.borrow().inner.borrow_mut().found.extend(songs.into_iter().map(|song| (song.id.clone(), song)));
-                            ctl.link_event(|device, env| device.found(ticket, found, env));
-                        });
-                    });
-                }
+                // (On the app's own pool for the music server, not the two threads that send
+                // to the relay and read the secret: a long look-up holds neither of those
+                // up. The command it is for is given up by the deciding if this takes more
+                // than half a minute, and what it then brings back is nobody's.)
+                Do::Find { ticket, ids } => self.request(
+                    move |client| Ok(ids.iter().filter_map(|id| crate::jam::find_song(id, Some(client))).filter(|song| song.radio_url.is_empty()).collect::<Vec<Song>>()),
+                    move |ctl, songs| {
+                        let songs = songs.unwrap_or_default();
+                        let found: Vec<String> = songs.iter().map(|song| song.id.clone()).collect();
+                        ctl.link.borrow().inner.borrow_mut().found.extend(songs.into_iter().map(|song| (song.id.clone(), song)));
+                        ctl.link_event(|device, env| device.found(ticket, found, env));
+                    },
+                ),
                 Do::Later { ticket, after_ms } => {
                     let ctl = self.clone();
                     slint::Timer::single_shot(Duration::from_millis(after_ms), move || ctl.link_event(|device, env| device.resume(ticket, env)));
@@ -588,7 +595,7 @@ impl Controller {
             let mut tell = |from: FromRelay| {
                 post(move |ctl| match from {
                     FromRelay::Says(note) => ctl.link.borrow().inner.borrow_mut().device.said(session, note),
-                    FromRelay::NoRandom => ctl.link_event(|device, env| device.out_of_random(env.me.here)),
+                    FromRelay::NoRandom => ctl.link_event(|device, env| device.out_of_random(env)),
                     FromRelay::Entered { place, token } => ctl.link.borrow().inner.borrow_mut().device.entered(session, place, token),
                     FromRelay::Heard { places, frames } => ctl.link_event(|device, env| device.heard(session, &places, &frames, env)),
                     FromRelay::Left => ctl.link.borrow().inner.borrow_mut().device.left(session),
@@ -629,15 +636,13 @@ impl Controller {
         if !on() {
             return;
         }
-        let asked = self.link.borrow().inner.borrow_mut().device.setting(link_my_devices);
-        self.link_do(asked);
+        self.link_event(|device, env| device.setting(link_my_devices, env));
         self.link_show();
     }
 
     /// Ends everything of this sign-in's: at sign-out, and as the app closes.
     pub fn link_stop(self: &Rc<Self>) {
-        let asked = self.link.borrow().inner.borrow_mut().device.stop();
-        self.link_do(asked);
+        self.link_event(|device, env| device.stop(env));
     }
 
     /// "Reset linking" was pressed.
@@ -645,8 +650,7 @@ impl Controller {
         if !on() {
             return;
         }
-        let asked = self.link.borrow().inner.borrow_mut().device.reset();
-        self.link_do(asked);
+        self.link_event(|device, env| device.reset(env));
         self.link_show();
     }
 

@@ -135,8 +135,8 @@ impl Player for Fake {
     fn admit(&mut self, at: At, minute: u64, now_ms: u64) -> Result<Reservation, Why> {
         self.rule.admit(at, minute, now_ms)
     }
-    fn finish(&mut self, reservation: Reservation, at: At, minute: u64, same_session: bool, nonce: Nonce) -> Result<(), Why> {
-        self.rule.finish(reservation, at, minute, same_session, nonce)
+    fn finish(&mut self, reservation: Reservation, at: At, minute: u64, now_ms: u64, same_session: bool, nonce: Nonce) -> Result<(), Why> {
+        self.rule.finish(reservation, at, minute, now_ms, same_session, nonce)
     }
     fn refuse(&mut self, reservation: Reservation) {
         self.rule.refuse(reservation)
@@ -193,6 +193,10 @@ struct World {
     path: Path,
     /// The songs the music server has (asked when a device's own copy of the library lacks one).
     server: Vec<String>,
+    /// The music server is slow to say: what was asked of it waits here (whose, the
+    /// ticket, the songs).
+    slow_server: bool,
+    asked_of_server: Vec<(usize, u64, Vec<String>)>,
 }
 
 const A: usize = 0;
@@ -229,6 +233,8 @@ impl World {
             now: 1_000,
             path: Path::default(),
             server: Vec::new(),
+            slow_server: false,
+            asked_of_server: Vec::new(),
         };
         // (The first tick asks for a look; its answer begins the session.)
         world.tick();
@@ -286,6 +292,7 @@ impl World {
                         to_send.push(Frame { from, to, text: frame });
                     }
                 }
+                Do::Find { ticket, ids } if self.slow_server => self.asked_of_server.push((who, ticket, ids)),
                 Do::Find { ticket, ids } => {
                     let has = self.copies[who].library.has_songs(&ids);
                     let found: Vec<String> = ids.iter().zip(has).filter(|(id, has)| *has || self.server.contains(id)).map(|(id, _)| id.clone()).collect();
@@ -830,6 +837,91 @@ fn songs_a_device_s_own_copy_of_the_library_lacks_are_asked_of_the_music_server(
     assert!(!world.copies[B].player.rule.busy(world.now) && world.copies[B].player.did.is_empty());
 }
 
+/// An Add brings a song this device's copy of the library lacks, and the music server
+/// never says whether it has it.
+fn add_being_looked_up() -> World {
+    let mut world = steering("add");
+    world.copies[B].library.ids.retain(|id| id != "x1");
+    world.slow_server = true;
+    world.ask("add");
+    assert_eq!((world.asked_of_server.len(), world.copies[B].player.rule.busy(world.now)), (1, true));
+    world
+}
+
+/// The music server answers at last for what was asked of it.
+fn server_answers(world: &mut World) {
+    for (who, ticket, ids) in std::mem::take(&mut world.asked_of_server) {
+        let did = world.with(who, |device, env| device.found(ticket, ids, env));
+        world.act(who, did);
+    }
+}
+
+#[test]
+fn a_command_whose_songs_are_never_found_is_given_up_and_the_device_is_free() {
+    let mut world = add_being_looked_up();
+    // For half a minute it is busy with it, and says so to whoever looks.
+    world.pass(rule::OPEN_MS - 1_000);
+    assert!(world.copies[B].player.rule.busy(world.now) && world.log(B, "add from").is_empty());
+    // Then it gives it up: its sender is told, and it is busy no longer.
+    world.pass(1_500);
+    assert!(world.last(B, "add from").contains("refused, Late"), "{:?}", world.copies[B].log);
+    assert!(!world.copies[B].player.rule.busy(world.now));
+    assert_eq!(world.copies[A].said.last().map(String::as_str), Some("That took too long to reach Copy B. Nothing was done."));
+    // The answer coming at last queues nothing, and says nothing more.
+    let (logged, queued) = (world.copies[B].log.len(), world.copies[B].player.queue.len());
+    server_answers(&mut world);
+    assert_eq!((world.copies[B].log.len(), world.copies[B].player.queue.len(), world.copies[B].player.did.len()), (logged, queued, 0));
+    // And B carries out the next thing asked of it.
+    world.pass(6_000);
+    world.ask("next");
+    world.pass(1_000);
+    assert_eq!(world.copies[B].player.did, ["next"]);
+}
+
+#[test]
+fn the_end_of_a_session_ends_what_was_waiting_under_it() {
+    // "Link my devices" switched off, the sign-in ending, linking reset from elsewhere (a
+    // look reads another secret), the secret not read for ten minutes: each ends the
+    // session, and with it the command whose songs were being looked up. At once, not
+    // when its half minute is up.
+    for how in ["setting", "sign-out", "another secret", "ten minutes"] {
+        let mut world = add_being_looked_up();
+        match how {
+            "setting" => {
+                let did = world.with(B, |device, env| device.setting(false, env));
+                world.act(B, did);
+            }
+            "sign-out" => {
+                let did = world.with(B, |device, env| device.stop(env));
+                world.act(B, did);
+            }
+            "another secret" => world.looked(B, Looked::Secret { secret: secret(8), id: "k".into(), wrote: None }, false),
+            _ => {
+                // (Nothing can be read of the secret, and B's own tick finds it too old.)
+                world.copies[B].looks.clear();
+                let now = world.now + crate::link::SECRET_LIFE_MS;
+                world.now = now;
+                let did = world.with(B, |device, env| device.tick("the account", true, env));
+                world.act(B, did);
+            }
+        }
+        assert!(!world.copies[B].player.rule.busy(world.now), "{how}: B is still busy");
+        assert_eq!(world.log(B, "accepted under it and not yet carried out: let go").len(), 1, "{how}: {:?}", world.copies[B].log);
+        // What the music server then says is nobody's: nothing is queued, under the
+        // session that ended or any that follows.
+        let queued = world.copies[B].player.queue.len();
+        server_answers(&mut world);
+        assert_eq!((world.copies[B].player.queue.len(), world.copies[B].player.did.len()), (queued, 0), "{how}");
+    }
+    // A queue that was taken and has not sounded yet: the same. B plays on with what it
+    // took (it is in its player), and is not left busy for the twenty-five seconds.
+    let mut world = giving(|world| world.copies[B].player.stream = false);
+    assert!(world.copies[B].player.rule.busy(world.now) && world.copies[B].player.queue.len() == 3);
+    world.looked(B, Looked::Secret { secret: secret(8), id: "k".into(), wrote: None }, false);
+    assert!(!world.copies[B].player.rule.busy(world.now));
+    assert_eq!(world.log(B, "the session ended before it sounded, nobody is answered").len(), 1);
+}
+
 #[test]
 fn presses_made_while_one_is_unanswered_go_one_at_a_time() {
     let mut world = steering("next");
@@ -939,8 +1031,8 @@ fn link_my_devices_off_and_signing_out_end_everything_at_once() {
         world.ask("next");
         let session = world.copies[A].session;
         let did = match end {
-            "setting" => world.copies[A].device.setting(false),
-            "sign-out" => world.copies[A].device.stop(),
+            "setting" => world.with(A, |device, env| device.setting(false, env)),
+            "sign-out" => world.with(A, |device, env| device.stop(env)),
             _ => world.with(A, |device, env| device.tick("somebody else", true, env)),
         };
         // The session is over, the window is A's own, and a look under way is told to stop.
@@ -952,7 +1044,7 @@ fn link_my_devices_off_and_signing_out_end_everything_at_once() {
         let did = world.with(A, |device, env| device.heard(session, &[], &[], env));
         assert!(did.is_empty() && world.copies[A].log.len() == before, "{end}");
         if end == "setting" {
-            assert!(world.copies[A].device.setting(true).is_empty());
+            assert!(world.with(A, |device, env| device.setting(true, env)).is_empty());
         }
     }
     // A look that was on its way is stopped, and its answer starts nothing.
@@ -961,7 +1053,7 @@ fn link_my_devices_off_and_signing_out_end_everything_at_once() {
     let did = world.with(A, |_, env| device.tick("the account", true, env));
     // (Its first tick is for a sign-in it has not seen before: the look is that sign-in's.)
     assert!(matches!(did.as_slice(), [Do::Look { number: 1, reset: false, .. }]), "{did:?}");
-    assert_eq!(device.stop(), [Do::StopLook]);
+    assert_eq!(world.with(A, |_, env| device.stop(env)), [Do::StopLook]);
     let did = world.with(A, |_, env| device.looked(1, 0, Looked::Secret { secret: secret(7), id: "k".into(), wrote: None }, false, env));
     assert!(did.is_empty());
 }
@@ -1165,7 +1257,7 @@ fn reset_linking_with_a_command_in_flight() {
     let mut world = steering("next");
     world.path.hold_commands = true;
     world.ask("next");
-    let did = world.copies[A].device.reset();
+    let did = world.with(A, |device, env| device.reset(env));
     world.act(A, did);
     world.pass(250);
     assert_eq!(world.copies[A].looks.last(), Some(&(1, true)));
@@ -1191,13 +1283,13 @@ fn reset_linking_with_a_command_in_flight() {
     assert_eq!(world.row(B, "Copy A").map(|row| row.ready), Some(true));
     // A reset that could not be written, and one written and not read back.
     let mut world = World::new(false);
-    let did = world.copies[A].device.reset();
+    let did = world.with(A, |device, env| device.reset(env));
     world.act(A, did);
     world.pass(250);
     world.looked(A, Looked::Failed, true);
     let now = world.now;
     assert_eq!((world.copies[A].device.shown(now).0.note, world.copies[A].ended.len()), (words::RESET_NOT_DONE.to_string(), 0));
-    let did = world.copies[A].device.reset();
+    let did = world.with(A, |device, env| device.reset(env));
     world.act(A, did);
     world.pass(250);
     world.looked(A, Looked::Invalid, true);
@@ -1214,11 +1306,14 @@ fn a_command_accepted_under_one_secret_is_not_carried_out_under_another() {
     assert!(world.copies[B].player.rule.busy(world.now) && world.copies[B].player.playing);
     // The secret is reset meanwhile, and B has looked.
     world.looked(B, Looked::Secret { secret: secret(8), id: "k".into(), wrote: None }, false);
+    // The command is let go with the session it came under, there and then: B is not busy
+    // with it a moment longer, and nobody is answered under a session that has ended.
+    assert!(!world.copies[B].player.rule.busy(world.now));
+    assert_eq!(world.log(B, "accepted under it and not yet carried out: let go").len(), 1);
+    // The work it was held for coming back carries nothing out.
     let did = world.with(B, |device, env| device.resume(ticket, env));
-    world.act(B, did);
-    assert!(world.last(B, "pause from").contains("refused, Cannot"));
-    assert!(world.copies[B].player.playing && !world.copies[B].player.rule.busy(world.now));
-    assert_eq!(world.last(B, "answer:"), "answer: the session it belonged to has ended, not sent");
+    assert!(did.is_empty() && world.copies[B].player.playing && world.copies[B].player.did.is_empty());
+    assert_eq!(world.log(B, "pause from").len(), 1, "{:?}", world.copies[B].log);
 }
 
 #[test]

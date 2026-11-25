@@ -30,7 +30,7 @@ use super::look::{Looked, ends_session};
 use super::message::{Ask, At, Full, Handed, Tell, Want, Why, read_ask, read_tell};
 use super::moving::{Adopted, Adopting, Gave, Giving, START_MS, Taking, Took};
 use super::news::News;
-use super::rule::{Reservation, Waiting};
+use super::rule::{self, Reservation, Waiting};
 use super::secret::{self, Secret};
 use super::seen::{self, Seen as Remembered};
 use super::steer::{Outcome, Peer, Press as Pressed, Tick, Told, Wait};
@@ -105,7 +105,7 @@ pub trait Player {
     fn busy(&self, now_ms: u64) -> bool;
     fn by(&self) -> Option<Nonce>;
     fn admit(&mut self, at: At, minute: u64, now_ms: u64) -> Result<Reservation, Why>;
-    fn finish(&mut self, reservation: Reservation, at: At, minute: u64, same_session: bool, nonce: Nonce) -> Result<(), Why>;
+    fn finish(&mut self, reservation: Reservation, at: At, minute: u64, now_ms: u64, same_session: bool, nonce: Nonce) -> Result<(), Why>;
     fn refuse(&mut self, reservation: Reservation);
     fn wait(&mut self, now_ms: u64, for_ms: u64) -> Waiting;
     fn done(&mut self, waiting: Waiting);
@@ -313,6 +313,9 @@ struct Pending {
     reservation: Reservation,
     /// What it needs, if that is already found (a command held for a test).
     ready: Option<Ready>,
+    /// When it is given up, if its work has not come back: as long as the rule keeps the
+    /// device busy with it, and no longer.
+    until_ms: u64,
 }
 
 #[derive(Default)]
@@ -444,22 +447,49 @@ impl Device {
     }
 
     /// Ends the session, if there is one. Says whether there was one.
-    fn end_session(&mut self, out: &mut Vec<Do>) -> bool {
+    ///
+    /// **The end of a session ends everything that was waiting under it**, here and now:
+    /// a command that was accepted and whose songs are still being looked up, a queue that
+    /// was taken and has not sounded yet. None of them can be answered under another
+    /// session, and none is left keeping this device busy to the others.
+    fn end_session(&mut self, env: &mut Env, out: &mut Vec<Do>) -> bool {
         let Some(session) = self.session.take() else { return false };
         self.sessions += 1;
         // A queue that was asked for under it will not be answered under another.
         if matches!(self.take, Some(Take::Asked { .. })) {
             self.take = None;
         }
+        let dropped = self.pending.len();
+        for (_, pending) in self.pending.drain() {
+            env.player.refuse(pending.reservation);
+        }
+        if dropped > 0 {
+            out.push(Do::Log(format!("session: {dropped} command{} accepted under it and not yet carried out: let go", if dropped == 1 { "" } else { "s" })));
+        }
+        if let Some(adoption) = self.adoption.take() {
+            env.player.done(adoption.waiting);
+            out.push(Do::Log(format!("adopt from {}: the session ended before it sounded, nobody is answered", text::place(&adoption.from))));
+        }
         self.news.forget();
         out.push(Do::End { session: session.number });
         true
     }
 
+    /// Gives up each command that was accepted and has outlived its time ([`rule::OPEN_MS`]):
+    /// its sender is told, and whatever its work then brings back is nobody's.
+    fn give_up_the_overdue(&mut self, env: &mut Env, out: &mut Vec<Do>) {
+        let overdue: Vec<u64> = self.pending.iter().filter(|(_, pending)| pending.until_ms <= env.now_ms).map(|(ticket, _)| *ticket).collect();
+        for ticket in overdue {
+            let Some(Pending { session, from, nonce, command, at, reservation, .. }) = self.pending.remove(&ticket) else { continue };
+            env.player.refuse(reservation);
+            self.refused(session, from, nonce, &command, at, Why::Late, env, out);
+        }
+    }
+
     /// Everything of this sign-in's is over: the session, and any look at the secret that
     /// is still on its way, whose answer must start nothing.
-    fn stop_all(&mut self, out: &mut Vec<Do>) {
-        self.end_session(out);
+    fn stop_all(&mut self, env: &mut Env, out: &mut Vec<Do>) {
+        self.end_session(env, out);
         if self.looking {
             out.push(Do::StopLook);
         }
@@ -475,25 +505,25 @@ impl Device {
 
     /// Ends everything of this sign-in's: at sign-out, when linking is no longer wanted,
     /// and when the account changes.
-    pub fn stop(&mut self) -> Vec<Do> {
+    pub fn stop(&mut self, env: &mut Env) -> Vec<Do> {
         let mut out = Vec::new();
         if self.session.is_some() {
             out.push(Do::Log("session: ended, with the sign-in it belonged to".into()));
         }
-        self.stop_all(&mut out);
+        self.stop_all(env, &mut out);
         out
     }
 
     /// "Link my devices" was set. Off is off at once: everything of this sign-in's ends
     /// here, in the same step as the setting is saved, so that a frame already on its way
     /// to this thread finds no session to act under.
-    pub fn setting(&mut self, link_my_devices: bool) -> Vec<Do> {
+    pub fn setting(&mut self, link_my_devices: bool, env: &mut Env) -> Vec<Do> {
         let mut out = Vec::new();
         if !link_my_devices {
             if self.session.is_some() {
                 out.push(Do::Log("session: ended, \"Link my devices\" was switched off".into()));
             }
-            self.stop_all(&mut out);
+            self.stop_all(env, &mut out);
         }
         out
     }
@@ -505,7 +535,7 @@ impl Device {
         let now = env.now_ms;
         if self.account != account {
             // Another sign-in: nothing of the last one's carries over.
-            out.extend(self.stop());
+            out.extend(self.stop(env));
             self.account = account.to_string();
             self.used = None;
         }
@@ -518,12 +548,12 @@ impl Device {
             out.push(Do::Remember(self.remembered.clone()));
         }
         if !wanted || self.off {
-            out.extend(self.stop());
+            out.extend(self.stop(env));
             return out;
         }
         if self.session.as_ref().is_some_and(|session| !secret_holds(session.since_ms, now)) {
             out.push(Do::Log("session: the secret has not been read for ten minutes".into()));
-            if self.end_session(&mut out) {
+            if self.end_session(env, &mut out) {
                 out.push(Do::Log("session: ended".into()));
             }
             self.note = words::SERVER_SILENT.into();
@@ -532,6 +562,7 @@ impl Device {
             self.looking = true;
             out.push(Do::Look { number: self.looks, used: self.used.clone(), reset: std::mem::take(&mut self.reset) });
         }
+        self.give_up_the_overdue(env, &mut out);
         self.peers(env, &mut out);
         self.moves(env, &mut out);
         self.tell_news(env, &mut out);
@@ -540,7 +571,7 @@ impl Device {
 
     /// "Reset linking" was pressed: a new secret is written at the next look, which starts
     /// as soon as the one on its way (if any) is over.
-    pub fn reset(&mut self) -> Vec<Do> {
+    pub fn reset(&mut self, _env: &mut Env) -> Vec<Do> {
         self.reset = true;
         self.note = words::RESETTING.into();
         vec![Do::Log("reset: asked for".into())]
@@ -558,7 +589,7 @@ impl Device {
         self.looked_ms = Some(env.now_ms);
         // A look that found the record is not one to use ends the session that used it
         // now, not when its ten minutes are up.
-        if ends_session(&looked) && self.end_session(&mut out) {
+        if ends_session(&looked) && self.end_session(env, &mut out) {
             out.push(Do::Log("session: ended, the record is no longer one to use".into()));
         }
         let reset_done = reset && matches!(&looked, Looked::Secret { wrote: Some(secret::Why::Reset), .. });
@@ -595,7 +626,7 @@ impl Device {
                 None
             }
             Looked::NoRandom => {
-                self.no_random(env.me.here, &mut out);
+                self.no_random(env, &mut out);
                 None
             }
         };
@@ -606,7 +637,7 @@ impl Device {
         }
         if let Some(secret) = begin {
             // A secret that is not the one in use: a new session, and the end of the old one.
-            if self.end_session(&mut out) {
+            if self.end_session(env, &mut out) {
                 out.push(Do::Log("session: ended".into()));
             }
             let keys = Keys::of(&secret);
@@ -623,18 +654,18 @@ impl Device {
         out
     }
 
-    fn no_random(&mut self, here: Here, out: &mut Vec<Do>) {
-        if self.end_session(out) {
+    fn no_random(&mut self, env: &mut Env, out: &mut Vec<Do>) {
+        if self.end_session(env, out) {
             out.push(Do::Log("session: ended".into()));
         }
-        self.note = words::no_random(here);
+        self.note = words::no_random(env.me.here);
         self.off = true;
     }
 
     /// The system gave no random bytes where some were needed: linking is off for this run.
-    pub fn out_of_random(&mut self, here: Here) -> Vec<Do> {
+    pub fn out_of_random(&mut self, env: &mut Env) -> Vec<Do> {
         let mut out = Vec::new();
-        self.no_random(here, &mut out);
+        self.no_random(env, &mut out);
         out
     }
 
@@ -668,7 +699,7 @@ impl Device {
     /// Seals a message for another place, to be sent. Its nonce.
     fn send(&mut self, to: Place, kind: u8, message: String, env: &mut Env, out: &mut Vec<Do>) -> Option<Nonce> {
         let Some(nonce) = env.nonce() else {
-            self.no_random(env.me.here, out);
+            self.no_random(env, out);
             return None;
         };
         // Under the session that is live now, and only inside its time.
@@ -790,7 +821,7 @@ impl Device {
                     // one that is open, and this device is busy to the others, until they
                     // are back.
                     self.tickets += 1;
-                    self.pending.insert(self.tickets, Pending { session, from, nonce, command: command.clone(), at, reservation, ready: None });
+                    self.pending.insert(self.tickets, Pending { session, from, nonce, command: command.clone(), at, reservation, ready: None, until_ms: now.saturating_add(rule::OPEN_MS) });
                     return out.push(Do::Find { ticket: self.tickets, ids: ids.clone() });
                 }
             }
@@ -808,7 +839,7 @@ impl Device {
         if let (Command::Pause, Some(wait)) = (&command, self.slow_pause_ms) {
             out.push(Do::Log(format!("pause from {}: accepted, and held {wait} ms before it is carried out (a test)", text::place(&from))));
             self.tickets += 1;
-            self.pending.insert(self.tickets, Pending { session, from, nonce, command, at, reservation, ready: Some(ready) });
+            self.pending.insert(self.tickets, Pending { session, from, nonce, command, at, reservation, ready: Some(ready), until_ms: now.saturating_add(rule::OPEN_MS) });
             return out.push(Do::Later { ticket: self.tickets, after_ms: wait });
         }
         self.finish(session, from, nonce, command, at, reservation, ready, env, out);
@@ -833,7 +864,7 @@ impl Device {
     /// Carries on with what a ticket holds ([`Do::Later`]).
     pub fn resume(&mut self, ticket: u64, env: &mut Env) -> Vec<Do> {
         let mut out = Vec::new();
-        if let Some(Pending { session, from, nonce, command, at, reservation, ready: Some(ready) }) = self.pending.remove(&ticket) {
+        if let Some(Pending { session, from, nonce, command, at, reservation, ready: Some(ready), .. }) = self.pending.remove(&ticket) {
             self.finish(session, from, nonce, command, at, reservation, ready, env, &mut out);
         }
         out
@@ -848,7 +879,7 @@ impl Device {
         Device::catch_up(env, out);
         let now = env.now_ms;
         let same_session = self.is_live(session, now);
-        if let Err(why) = env.player.finish(reservation, at, minute(now), same_session, nonce) {
+        if let Err(why) = env.player.finish(reservation, at, minute(now), now, same_session, nonce) {
             return self.refused(session, from, nonce, &command, at, why, env, out);
         }
         env.player.carry_out(&command, &ready);
