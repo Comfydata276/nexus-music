@@ -49,9 +49,13 @@
 //! 7. **Write**, if [`Plan::write`] is set. In this order:
 //!    1. Keep the record's text as it was found, once for each account and version of the
 //!       app: a file named for both, holding [`Write::found`] exactly (the empty text too:
-//!       an empty file). The file is its own proof. If it is there, leave it, and never
-//!       open it for writing; if it is not, make it, only if it is still not there, and
-//!       flush it. If it can't be made, send nothing.
+//!       an empty file). The file is its own proof, so it comes to its name whole or not
+//!       at all. If it is there, leave it, and never open it for writing; if it is not,
+//!       write it under another name beside it, flush it, and only then give it its name
+//!       by a move that never replaces what has that name. What a stopped attempt left
+//!       under the other name is not the copy, and is never read. Where the platform lets
+//!       a folder be synced, sync its folder before anything is sent, whether it was just
+//!       made or found there. If any of that fails, send nothing.
 //!    2. [`Choices::sending`], which says whether the plan still fits the choices it was
 //!       made from. If it says no (a change the write carries was taken back meanwhile),
 //!       send nothing and start again from step 1. Save the choices, surely, before the
