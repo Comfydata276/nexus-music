@@ -1645,7 +1645,9 @@ impl Controller {
                 Ok(artist) => {
                     // Noted, so it can be followed up when it arrives.
                     let now = chrono::Utc::now().timestamp();
-                    ctl.asked.borrow_mut().add(nexus_core::requests::asked_for(crate::lidarr::offers(), &album, &title, &artist, &song, now));
+                    ctl.asked.borrow_mut().add(nexus_core::requests::asked_for(&album, &title, &artist, &song, now));
+                    // Marked once the note is kept and shared (see `asked_for`).
+                    crate::lidarr::mark(&album, true);
                     ctl.refresh_outside();
                     ctl.toast(nexus_core::requests::asked_sentence(&title));
                 }

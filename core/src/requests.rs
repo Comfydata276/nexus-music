@@ -760,10 +760,14 @@ pub fn request(lidarr: &Lidarr, offers: &Offers, album: &str) -> Result<Result<S
     Ok(unless_stopped(lidarr.request(&offer))?.map(|()| offer.artist))
 }
 
-/// Once Lidarr has an album on its list: notes it as asked for, to be followed up when it
-/// arrives (for the app to `asked::put` and keep), and marks it so among what's offered.
-pub fn asked_for(offers: &Offers, album: &str, title: &str, artist: &str, song: &str, now: i64) -> Asked {
-    offers.mark(album, true);
+/// Once Lidarr has an album on its list: the note of it as asked for, to be followed up when
+/// it arrives.
+///
+/// The order after it is the caller's to keep, as the Windows app always has: first the note
+/// is kept (`asked::put`, written down and shared), and only then is the offer marked asked for
+/// (`Offers::mark`). A page being found meanwhile may remember the offer afresh, unmarked; it
+/// then reads the note, which already says it's asked for, and the mark that follows stands.
+pub fn asked_for(album: &str, title: &str, artist: &str, song: &str, now: i64) -> Asked {
     Asked { album: album.to_string(), title: title.to_string(), artist: artist.to_string(), at: now, song: song.to_string(), ..Default::default() }
 }
 
@@ -1089,9 +1093,8 @@ mod tests {
         assert_eq!(ask("ost-ep", "Them", "", ""), "Ask for this EP? | “Title” by Them is an EP. It will go on Lidarr's list, and Lidarr will start looking for it. If Lidarr only lists Them's albums so far, it will be set to list their singles, EPs and soundtracks too. None but this one is fetched, though ones they release from now on are treated as their new albums are.");
         assert_eq!(asking_for("Title"), "Asking for “Title”…");
         assert_eq!(asked_sentence("Title"), "Asked for “Title”. It'll be in your library once it arrives.");
-        let note = asked_for(&offers, "lidarr-ep", "Title", "Them", "A Song", 50);
+        let note = asked_for("lidarr-ep", "Title", "Them", "A Song", 50);
         assert_eq!((note.album.as_str(), note.title.as_str(), note.artist.as_str(), note.song.as_str(), note.at, note.arrived), ("lidarr-ep", "Title", "Them", "A Song", 50, 0));
-        assert!(offers.offered("lidarr-ep").unwrap().requested);
     }
 
     #[test]
@@ -1134,5 +1137,16 @@ mod tests {
         assert_eq!(arrived_news(std::slice::from_ref(&one)), "“Parachutes” by Coldplay has arrived.");
         assert_eq!(arrived_news(&[Asked { song: "Yellow".into(), ..one.clone() }]), "“Yellow” has arrived, on “Parachutes”.");
         assert_eq!(arrived_news(&[one.clone(), one]), "2 albums you asked for have arrived.");
+    }
+
+    #[test]
+    fn the_note_of_a_request_is_made_before_the_offer_is_marked() {
+        // The caller keeps the note (saves it, shares it) and then marks the offer: making the
+        // note marks nothing.
+        let offers = Offers::new();
+        offers.remember(&[Offer { album: "rg-1".into(), ..Default::default() }]);
+        let note = asked_for("rg-1", "Title", "Them", "", 7);
+        assert_eq!((note.album.as_str(), note.at), ("rg-1", 7));
+        assert!(!offers.offered("rg-1").unwrap().requested);
     }
 }
