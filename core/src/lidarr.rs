@@ -118,6 +118,30 @@ pub const CHECKING: &str = "Checking…";
 /// Said when the address has moved to another host, so the key kept for the last is gone.
 pub const KEY_FORGOTTEN: &str = "That's a different address, so the saved key was forgotten. Enter the key for it.";
 
+/// The app's `Http`, for one request that's to be seen through once it has begun changing
+/// Lidarr (see `Lidarr::request`). Everything is passed on as it is.
+struct SeeingThrough {
+    http: Arc<dyn Http>,
+    said: std::sync::atomic::AtomicBool,
+}
+
+impl Http for SeeingThrough {
+    fn send(&self, request: &Request) -> Result<crate::http::Response, Failure> {
+        if !matches!(request.method, Method::Get) && !self.said.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            self.http.keep_going();
+        }
+        self.http.send(request)
+    }
+
+    fn pause(&self, wait: Duration) -> Result<(), Failure> {
+        self.http.pause(wait)
+    }
+
+    fn keep_going(&self) {
+        self.http.keep_going()
+    }
+}
+
 /// Said when Lidarr can't be reached without signing in.
 pub const NEEDED: &str = "Lidarr is behind a sign-in. In Settings, under Requests, sign in with your browser.";
 
@@ -457,6 +481,12 @@ impl Lidarr {
         Ok((status, response.body().unwrap_or_default()))
     }
 
+    /// The same Lidarr, asked through a view of the app's `Http` that tells it to see what's
+    /// being done through just before the first request that changes anything is sent.
+    fn seeing_through(&self) -> Lidarr {
+        Lidarr { http: Arc::new(SeeingThrough { http: self.http.clone(), said: std::sync::atomic::AtomicBool::new(false) }), ..self.clone() }
+    }
+
     /// Waits while Lidarr works, as the app waits.
     pub fn pause(&self, wait: Duration) -> Result<(), String> {
         self.http.pause(wait).map_err(|_| STOPPED.to_string())
@@ -577,8 +607,13 @@ impl Lidarr {
     }
 
     /// Has Lidarr keep track of an artist: every album of theirs goes on its list, and new
-    /// ones will as they come out. Returns how many albums that put on the list.
+    /// ones will as they come out. Returns how many albums that put on the list. Seen through
+    /// once it has changed anything, as `request` is.
     pub fn add_artist(&self, artist: &str, name: &str) -> Result<usize, String> {
+        self.seeing_through().adding_artist(artist, name)
+    }
+
+    fn adding_artist(&self, artist: &str, name: &str) -> Result<usize, String> {
         let Some((known, _)) = self.known_artist(artist)? else {
             let folders: Vec<RootFolder> = self.get("rootfolder")?;
             let folder = folders.first().ok_or("Lidarr has no music folder set up yet.")?;
@@ -616,7 +651,18 @@ impl Lidarr {
 
     /// Puts an album (or an EP, or a single) on Lidarr's list and has Lidarr start looking
     /// for it. Nothing else by the artist is asked for.
+    ///
+    /// It takes several steps, and once the first has changed anything on Lidarr (an artist
+    /// added, a profile made, a setting turned off, an album marked) the rest are seen through,
+    /// or what was changed is put back: an album marked and never looked for, or an artist
+    /// left not taking new releases, would be worse than no request. So a stop is honoured only
+    /// before the first change; just before it, the app is told to see this through
+    /// (`Http::keep_going`).
     pub fn request(&self, wanted: &Offer) -> Result<(), String> {
+        self.seeing_through().requesting(wanted)
+    }
+
+    fn requesting(&self, wanted: &Offer) -> Result<(), String> {
         if wanted.artist_id == VARIOUS {
             return self.request_from_various(wanted);
         }
@@ -1216,5 +1262,84 @@ mod tests {
         assert_eq!(puts.len(), 2, "{puts:?}");
         assert!(puts[0].contains(r#""monitorNewItems":"none""#) && puts[0].contains(r#""metadataProfileId":2"#), "{}", puts[0]);
         assert!(puts[1].contains(r#""monitorNewItems":"all""#), "{}", puts[1]);
+    }
+
+    /// A Lidarr that keeps one artist, with the album wanted listed, and an app that stops
+    /// what's being done once `stop_at` has been sent; it goes on answering a request the
+    /// library has said must be seen through (`Http::keep_going`).
+    struct Phone {
+        stop_at: &'static str,
+        stopped: std::sync::atomic::AtomicBool,
+        seeing_through: std::sync::atomic::AtomicBool,
+        asked: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Phone {
+        fn new(stop_at: &'static str) -> Phone {
+            Phone { stop_at, stopped: Default::default(), seeing_through: Default::default(), asked: Default::default() }
+        }
+
+        fn stops(&self) -> bool {
+            self.stopped.load(std::sync::atomic::Ordering::SeqCst) && !self.seeing_through.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl crate::http::Http for Phone {
+        fn send(&self, request: &crate::http::Request) -> Result<crate::http::Response, crate::http::Failure> {
+            use crate::http::Method;
+            if self.stops() {
+                return Err(crate::http::Failure::Stopped);
+            }
+            let method = match request.method {
+                Method::Get => "GET",
+                Method::Post(_) => "POST",
+                Method::Put(_) => "PUT",
+            };
+            let path = request.url.trim_start_matches("http://lidarr.test/api/v1/").to_string();
+            let line = format!("{method} {path}");
+            self.asked.lock().unwrap().push(line.clone());
+            let answer = match line.as_str() {
+                "GET artist" => r#"[{"id":5,"artistName":"Someone","foreignArtistId":"ar1"}]"#,
+                "GET album?artistId=5" => r#"[{"id":9,"title":"First","foreignAlbumId":"al1","albumType":"Album"}]"#,
+                "GET command" => "[]",
+                "GET artist/5" => r#"{"id":5,"monitored":true}"#,
+                "GET album/9" => r#"{"id":9,"monitored":true}"#,
+                _ => "{}",
+            };
+            // The stop comes once this has been answered.
+            if line == self.stop_at {
+                self.stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(crate::http::Response::new(200, Vec::new(), move || Ok(answer.to_string())))
+        }
+
+        fn pause(&self, _: Duration) -> Result<(), crate::http::Failure> {
+            if self.stops() { Err(crate::http::Failure::Stopped) } else { Ok(()) }
+        }
+
+        fn keep_going(&self) {
+            self.seeing_through.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn requested(stop_at: &'static str) -> (Result<(), String>, Vec<String>) {
+        let http = Arc::new(Phone::new(stop_at));
+        let lidarr = Lidarr::new("http://lidarr.test", "key", None, http.clone());
+        let wanted = Offer { album: "al1".into(), artist_id: "ar1".into(), title: "First".into(), artist: "Someone".into(), ..Default::default() };
+        let done = lidarr.request(&wanted);
+        let asked = http.asked.lock().unwrap().clone();
+        (done, asked)
+    }
+
+    #[test]
+    fn a_request_lidarr_has_been_changed_for_is_seen_through() {
+        // Stopped once the album is marked: Lidarr is still told to look for it.
+        let (done, asked) = requested("PUT album/monitor");
+        assert_eq!(done, Ok(()));
+        assert_eq!(asked.last().map(String::as_str), Some("POST command"));
+        // Stopped before anything was changed: it stops, and nothing is changed.
+        let (done, asked) = requested("GET album?artistId=5");
+        assert_eq!(done, Err(STOPPED.to_string()));
+        assert!(asked.iter().all(|line| line.starts_with("GET ")), "{asked:?}");
     }
 }

@@ -385,7 +385,12 @@ pub struct Session {
 }
 
 impl Session {
-    /// `http` is what the service is asked over.
+    /// `http` is what the service is asked over. It must be one that nothing stops: no screen
+    /// left, no search typed afresh, no operation given up. Renewing the pass replaces the
+    /// token kept for this sign-in, at the service, the moment the service answers; a renewal
+    /// cut off after that, before the new token is kept, leaves only the old one, which the
+    /// service no longer honours, and the person is signed out. (A request to Lidarr that is
+    /// stopped meanwhile is the Lidarr's `Http`'s affair, not this one's.)
     pub fn new(found: Found, token: String, keep: impl Fn(&str) + Send + Sync + 'static, http: Arc<dyn Http>) -> Session {
         Session {
             found,
