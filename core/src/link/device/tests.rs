@@ -706,7 +706,9 @@ const WAYS: &[(&str, Seam)] = &[
     ("The sound output being lost while paused", Seam::Nothing),
     ("A followed playlist changing the queue", Seam::Moves),
     ("Sync's \"Continue here\"", Seam::Moves),
-    ("The queue restored as the app starts; sign-out emptying the player", Seam::Moves),
+    // (Put back before the app has told any state: there is no command it could be made against.)
+    ("The queue restored as the app starts", Seam::Nothing),
+    ("Sign-out emptying the player", Seam::Moves),
 ];
 
 #[test]
