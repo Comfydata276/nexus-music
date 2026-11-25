@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -227,6 +227,9 @@ trait Server {
     fn write(&mut self, id: &str, comment: &str) -> Option<()>;
     /// Thirty-two bytes from the system's source of randomness, if it has any to give.
     fn random(&mut self) -> Option<[u8; 32]>;
+    /// Whether the sign-in this look is for is still the one. Asked before every request:
+    /// once the person has signed out, the look makes no more of them.
+    fn still(&self) -> bool;
 }
 
 /// The music server itself. Every call is a form POST, so neither the sign-in nor the
@@ -234,6 +237,8 @@ trait Server {
 struct Navidrome<'a> {
     client: &'a Client,
     agent: ureq::Agent,
+    /// Set when the sign-in this look is for ends.
+    over: Arc<AtomicBool>,
 }
 
 impl Server for Navidrome<'_> {
@@ -258,11 +263,16 @@ impl Server for Navidrome<'_> {
     fn random(&mut self) -> Option<[u8; 32]> {
         random()
     }
+
+    fn still(&self) -> bool {
+        !self.over.load(Ordering::Relaxed)
+    }
 }
 
-/// One look (see `nexus_core::link::secret`).
-fn look(client: &Client, used: Option<String>) -> Looked {
-    let mut server = Navidrome { client, agent: crate::subsonic::make_agent_without_redirects() };
+/// One look (see `nexus_core::link::secret`). `over` is set if the sign-in it is for ends
+/// while it is under way.
+fn look(client: &Client, used: Option<String>, over: Arc<AtomicBool>) -> Looked {
+    let mut server = Navidrome { client, agent: crate::subsonic::make_agent_without_redirects(), over };
     look_with(&mut server, client.username(), used)
 }
 
@@ -274,12 +284,19 @@ fn look(client: &Client, used: Option<String>) -> Looked {
 /// or the look says the record is no good ([`Looked::Invalid`]), which ends the session.
 /// It never ends "the server could not be asked", which would leave the old secret in use
 /// until its time ran out, on the strength of a request that happened to fail afterwards.
+///
+/// **It stops with the sign-in.** Before each request it asks whether the sign-in it is
+/// for is still the one. If not, it makes no further request, and what it says is of no
+/// account: its answer is the answer to a look nobody is waiting on.
 fn look_with(server: &mut impl Server, username: &str, mut used: Option<String>) -> Looked {
     let mut wrote = None;
     // The record has been seen to be no good in this look.
     let mut no_good = false;
     let unasked = |no_good: bool| if no_good { Looked::Invalid } else { Looked::Failed };
     for _ in 0..secret::ROUNDS {
+        if !server.still() {
+            return Looked::Failed;
+        }
         let Some(listed) = server.list() else { return unasked(no_good) };
         let (id, replace) = match secret::choose(&listed, username, used.as_deref()) {
             Next::Stop(stop) => return Looked::Stopped(stop),
@@ -287,8 +304,14 @@ fn look_with(server: &mut impl Server, username: &str, mut used: Option<String>)
             Next::Make => {
                 // There is none. If one was in use, that one has gone.
                 no_good |= used.is_some();
+                if !server.still() {
+                    return Looked::Failed;
+                }
                 let Some(id) = server.make() else { return unasked(no_good) };
                 let Some(fresh) = server.random().map(Secret::new) else { return Looked::NoRandom };
+                if !server.still() {
+                    return Looked::Failed;
+                }
                 if server.write(&id, &fresh.comment()).is_none() {
                     return unasked(no_good);
                 }
@@ -299,6 +322,9 @@ fn look_with(server: &mut impl Server, username: &str, mut used: Option<String>)
         };
         // One answer, and the XML one: only it states whether the playlist is public, and
         // what it is, whose, and its comment are taken from the same answer.
+        if !server.still() {
+            return Looked::Failed;
+        }
         let Some(fetched) = server.fetch(&id).as_deref().and_then(secret::fetched) else { return unasked(no_good) };
         match secret::judge(&id, replace, &fetched, username) {
             Verdict::Use(secret) => return Looked::Secret { secret, id, wrote },
@@ -308,6 +334,9 @@ fn look_with(server: &mut impl Server, username: &str, mut used: Option<String>)
                 // A new secret into it, and it is kept private. The secret used afterwards
                 // is the one the next round reads back, not this one.
                 let Some(fresh) = server.random().map(Secret::new) else { return Looked::NoRandom };
+                if !server.still() {
+                    return Looked::Failed;
+                }
                 if server.write(&id, &fresh.comment()).is_none() {
                     return Looked::Invalid;
                 }
@@ -479,7 +508,9 @@ struct Session {
     secret: Secret,
     keys: Keys,
     /// When the look that read the secret began. Ten minutes on, the secret is not used.
-    since_ms: u64,
+    /// (Shared with what is queued to send under the session, which reads it when its turn
+    /// comes: a look that renews the secret meanwhile renews it for that too.)
+    since_ms: Arc<AtomicU64>,
     wire: Arc<Wire>,
     stop: Arc<AtomicBool>,
     /// This device's place in the room and the token for it, once it has entered.
@@ -487,6 +518,19 @@ struct Session {
     /// The other places in the room, in the relay's order, and what is known of each.
     others: Vec<Place>,
     peers: HashMap<Place, Seen>,
+}
+
+impl Session {
+    fn since(&self) -> u64 {
+        self.since_ms.load(Ordering::Relaxed)
+    }
+}
+
+/// Whether something queued to be sent under a session may go when its turn comes: only if
+/// the session has not ended and its secret is still inside its time. Both, because a
+/// session that has run out is no session, whether or not anything has ended it yet.
+fn may_go(session_ended: bool, since_ms: u64, now_ms: u64) -> bool {
+    !session_ended && secret_holds(since_ms, now_ms)
 }
 
 #[derive(Default)]
@@ -504,6 +548,8 @@ pub struct Link {
     used: Option<String>,
     /// A look is on its way: there is never more than one for a sign-in.
     looking: bool,
+    /// Set when the sign-in ends, for the look that is on its way to see.
+    look_over: Arc<AtomicBool>,
     /// Goes up when the sign-in changes, so the answer to an earlier look is dropped.
     looks: u64,
     /// When the last look finished.
@@ -529,11 +575,11 @@ impl Link {
     /// A session that has run out is no session, whether or not the tick has got round to
     /// ending it.
     fn live(&self, serial: u64, now_ms: u64) -> Option<&Session> {
-        self.session.as_ref().filter(|session| session.serial == serial && secret_holds(session.since_ms, now_ms))
+        self.session.as_ref().filter(|session| session.serial == serial && secret_holds(session.since(), now_ms))
     }
 
     fn live_mut(&mut self, serial: u64, now_ms: u64) -> Option<&mut Session> {
-        self.session.as_mut().filter(|session| session.serial == serial && secret_holds(session.since_ms, now_ms))
+        self.session.as_mut().filter(|session| session.serial == serial && secret_holds(session.since(), now_ms))
     }
 
     /// Ends the session, if there is one: its thread stops, and whatever was queued to be
@@ -549,15 +595,18 @@ impl Link {
     /// is still on its way, whose answer must start nothing.
     fn stop(&mut self) {
         self.end_session();
+        self.look_over.store(true, Ordering::Relaxed);
         self.looks += 1;
         self.looking = false;
         self.looked_ms = None;
     }
 
-    /// A look starts: the number its answer must show to be taken.
-    fn look_begins(&mut self) -> u64 {
+    /// A look starts: the number its answer must show to be taken, and what it watches to
+    /// see whether the sign-in it is for has ended.
+    fn look_begins(&mut self) -> (u64, Arc<AtomicBool>) {
         self.looking = true;
-        self.looks
+        self.look_over = Arc::new(AtomicBool::new(false));
+        (self.looks, self.look_over.clone())
     }
 
     /// Whether the answer to the look with this number is still wanted.
@@ -613,7 +662,7 @@ impl Controller {
             self.link_stop();
             return self.link_show();
         }
-        if self.link.borrow().session.as_ref().is_some_and(|session| !secret_holds(session.since_ms, now)) {
+        if self.link.borrow().session.as_ref().is_some_and(|session| !secret_holds(session.since(), now)) {
             log("session: the secret has not been read for ten minutes");
             self.link_end("Your devices can't be seen: the music server hasn't answered for ten minutes.");
         }
@@ -653,11 +702,12 @@ impl Controller {
         let Some(client) = self.client() else { return };
         let (used, looks, pool) = {
             let mut link = self.link.borrow_mut();
-            let looks = link.look_begins();
-            (link.used.clone(), looks, link.pool())
+            let (looks, over) = link.look_begins();
+            (link.used.clone(), (looks, over), link.pool())
         };
+        let (looks, over) = looks;
         pool.spawn(move || {
-            let looked = look(&client, used);
+            let looked = look(&client, used, over);
             post(move |ctl| ctl.link_looked(looks, now, looked));
         });
     }
@@ -687,9 +737,9 @@ impl Controller {
                     if wrote == Some(secret::Why::Public) {
                         link.note = "Your devices' link could be seen by others on the music server. It has been made private and reset.".into();
                     }
-                    match link.session.as_mut().filter(|session| session.secret == secret && secret_holds(session.since_ms, now_ms())) {
+                    match link.session.as_mut().filter(|session| session.secret == secret && secret_holds(session.since(), now_ms())) {
                         Some(session) => {
-                            session.since_ms = since;
+                            session.since_ms.store(since, Ordering::Relaxed);
                             log("look: the secret is as it was");
                             None
                         }
@@ -741,7 +791,7 @@ impl Controller {
             let mut link = self.link.borrow_mut();
             link.serial += 1;
             link.note.clear();
-            link.session = Some(Session { serial: link.serial, secret, keys, since_ms: since, wire: wire.clone(), stop: stop.clone(), place: None, others: Vec::new(), peers: HashMap::new() });
+            link.session = Some(Session { serial: link.serial, secret, keys, since_ms: Arc::new(AtomicU64::new(since)), wire: wire.clone(), stop: stop.clone(), place: None, others: Vec::new(), peers: HashMap::new() });
             link.serial
         };
         log("session: begun with a secret a look read");
@@ -792,11 +842,12 @@ impl Controller {
         let session = link.live(serial, now_ms())?;
         let (place, token) = session.place.clone()?;
         let sealed = frame::seal(&session.keys, kind, &nonce, &place, &to, message.as_bytes())?;
-        let (wire, room, stop) = (session.wire.clone(), session.keys.room().to_string(), session.stop.clone());
+        let (wire, room, stop, since) = (session.wire.clone(), session.keys.room().to_string(), session.stop.clone(), session.since_ms.clone());
         pool.spawn(move || {
-            // The session may have ended while this waited its turn: then it is not sent.
-            if stop.load(Ordering::Relaxed) {
-                return log("send: the session ended first, not sent");
+            // The session may have ended, or run out of time, while this waited its turn:
+            // then it is not sent.
+            if !may_go(stop.load(Ordering::Relaxed), since.load(Ordering::Relaxed), now_ms()) {
+                return log("send: the session ended or ran out first, not sent");
             }
             // Sent once. Whatever comes of it, it is not sent again by itself.
             let status = wire.post(&format!("api/link/{room}/send"), &token, &json!({"to": text::place(&to), "frame": sealed})).map(|(status, _)| status);
@@ -1120,7 +1171,7 @@ mod tests {
         let wire = Arc::new(Wire { base: "http://127.0.0.1:9".into(), key: "a-key".into(), agent: crate::subsonic::make_agent_without_redirects() });
         let mut link = Link::default();
         link.serial = 1;
-        link.session = Some(Session { serial: 1, keys: Keys::of(&secret), secret, since_ms: since, wire, stop: Arc::new(AtomicBool::new(false)), place: Some(([1; 16], "token".into())), others: Vec::new(), peers: HashMap::new() });
+        link.session = Some(Session { serial: 1, keys: Keys::of(&secret), secret, since_ms: Arc::new(AtomicU64::new(since)), wire, stop: Arc::new(AtomicBool::new(false)), place: Some(([1; 16], "token".into())), others: Vec::new(), peers: HashMap::new() });
         link
     }
 
@@ -1129,7 +1180,7 @@ mod tests {
     #[test]
     fn signing_out_leaves_a_look_s_answer_and_queued_sends_nothing_to_act_on() {
         let mut link = linked(0);
-        let looks = link.look_begins();
+        let (looks, _) = link.look_begins();
         let queued = link.session.as_ref().map(|session| session.stop.clone()).unwrap();
         assert!(link.expects(looks) && !queued.load(Ordering::Relaxed));
         link.stop();
@@ -1137,7 +1188,7 @@ mod tests {
         assert!(queued.load(Ordering::Relaxed), "what was queued would still be sent");
         assert!(link.session.is_none() && !link.looking && link.looked_ms.is_none());
         // The next sign-in's look is its own.
-        let next = link.look_begins();
+        let (next, _) = link.look_begins();
         assert!(link.expects(next) && next != looks);
     }
 
@@ -1164,12 +1215,14 @@ mod tests {
         list_works: bool,
         write_works: bool,
         asked: Vec<&'static str>,
+        /// The person signs out once this many requests have been made.
+        signed_out_after: Option<usize>,
     }
 
     impl Scripted {
         fn with(fetches: Vec<Option<String>>) -> Scripted {
             let listed = vec![Stated { id: "k".into(), name: secret::PLAYLIST_NAME.into(), owner: Some("tester".into()), comment: None }];
-            Scripted { fetches, listed, list_works: true, write_works: true, asked: Vec::new() }
+            Scripted { fetches, listed, list_works: true, write_works: true, asked: Vec::new(), signed_out_after: None }
         }
     }
 
@@ -1192,6 +1245,9 @@ mod tests {
         }
         fn random(&mut self) -> Option<[u8; 32]> {
             Some([9; 32])
+        }
+        fn still(&self) -> bool {
+            self.signed_out_after.is_none_or(|requests| self.asked.len() < requests)
         }
     }
 
@@ -1236,6 +1292,69 @@ mod tests {
         let mut server = Scripted::with(vec![playlist(RECORD, true)]);
         server.write_works = false;
         assert!(ends_session(&look_with(&mut server, "tester", Some("k".into()))));
+    }
+
+    /// The person signs out while a refresh is under way: the request in flight finishes,
+    /// and the refresh makes no other.
+    #[test]
+    fn a_refresh_makes_no_request_after_the_sign_in_it_is_for_has_ended() {
+        // A look that would take five requests: list, fetch (public), write, list, fetch.
+        let whole = || Scripted::with(vec![playlist(RECORD, true), playlist(RECORD, false)]);
+        let mut server = whole();
+        look_with(&mut server, "tester", Some("k".into()));
+        assert_eq!(server.asked, ["list", "fetch", "write", "list", "fetch"]);
+        // Signed out during each of them in turn: that one is the last.
+        for during in 1..=5 {
+            let mut server = whole();
+            server.signed_out_after = Some(during);
+            let looked = look_with(&mut server, "tester", Some("k".into()));
+            assert_eq!(server.asked.len(), during.min(5), "signed out during request {during}: {:?}", server.asked);
+            if during < 5 {
+                assert!(matches!(looked, Looked::Failed));
+            }
+        }
+        // Signed out before it began, it asks nothing at all. And with a playlist to make.
+        let mut server = whole();
+        server.signed_out_after = Some(0);
+        look_with(&mut server, "tester", None);
+        assert!(server.asked.is_empty());
+        let mut server = Scripted::with(vec![]);
+        server.listed.clear();
+        server.signed_out_after = Some(2);
+        look_with(&mut server, "tester", None);
+        assert_eq!(server.asked, ["list", "make"]);
+    }
+
+    /// The flag a look watches is the one the end of its sign-in sets, and the next look's
+    /// is another.
+    #[test]
+    fn the_end_of_a_sign_in_is_seen_by_the_look_that_is_under_way() {
+        let mut link = linked(0);
+        let (_, over) = link.look_begins();
+        assert!(!over.load(Ordering::Relaxed));
+        link.stop();
+        assert!(over.load(Ordering::Relaxed), "the look would go on asking the music server");
+        let (_, next) = link.look_begins();
+        assert!(!next.load(Ordering::Relaxed) && over.load(Ordering::Relaxed));
+        // A session that merely ends (its secret changed or ran out) is not the sign-in ending.
+        link.end_session();
+        assert!(!next.load(Ordering::Relaxed));
+    }
+
+    /// What is queued to send goes only under a session that has not ended and is inside
+    /// its ten minutes when its turn comes.
+    #[test]
+    fn something_queued_to_send_is_not_sent_once_the_session_has_ended_or_run_out() {
+        let life = nexus_core::link::SECRET_LIFE_MS;
+        assert!(may_go(false, 1_000, 1_000) && may_go(false, 1_000, 1_000 + life - 1));
+        assert!(!may_go(true, 1_000, 1_000), "ended");
+        assert!(!may_go(false, 1_000, 1_000 + life), "run out, and nothing has ended it yet");
+        // A look that renews the secret while it waits renews it for what is queued too.
+        let link = linked(1_000);
+        let session = link.session.as_ref().unwrap();
+        let (queued_since, queued_stop) = (session.since_ms.clone(), session.stop.clone());
+        session.since_ms.store(1_000 + life, Ordering::Relaxed);
+        assert!(may_go(queued_stop.load(Ordering::Relaxed), queued_since.load(Ordering::Relaxed), 1_500 + life));
     }
 
     /// A refresh that finds the record public and cannot repair it, not ours, changed in
