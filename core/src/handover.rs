@@ -250,6 +250,10 @@ mod tests {
         // PC's queue, untouched, and it is not passed on as this device's, changed now.
         assert_eq!(save(&theirs, &taken), Save::NotNewest);
         assert_eq!(look(&theirs, &taken, DAY + 700).then, Then::Nothing);
+        // Nor if the server's saved queue has gone since (cleared from another app): it
+        // was never this device's, and nothing of it is owed.
+        assert_eq!(save(&PlayQueue::default(), &taken), Save::NotNewest);
+        assert_eq!(look(&PlayQueue::default(), &taken, DAY + 700).then, Then::Nothing);
         // Played on here, it is this device's to save.
         let played = Here { taken_up: false, stamp: DAY + 660, ..taken };
         assert_eq!(save(&theirs, &played), Save::Save);
