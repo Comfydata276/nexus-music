@@ -419,7 +419,7 @@ impl Controller {
     fn device_name(&self) -> String {
         if self.settings.borrow().device_id.is_empty() {
             self.settings.borrow_mut().device_id = format!("{:08x}", fastrand::u32(..));
-            self.save_settings();
+            self.save_settings_in_passing();
         }
         handover::device_name(&self.settings.borrow().device_id)
     }

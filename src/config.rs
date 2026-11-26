@@ -722,6 +722,44 @@ pub enum Durable {
 }
 
 pub fn write_whole(path: &Path, bytes: &[u8], durable: Durable, steps: &Steps) -> std::io::Result<Placed> {
+    let started = std::time::Instant::now();
+    let placed = write_whole_now(path, bytes, durable, steps);
+    if durable == Durable::Flushed {
+        flushed(path, started);
+    }
+    placed
+}
+
+thread_local! {
+    /// This is the window's thread (`mark_window_thread`), and how many files it has flushed.
+    static WINDOW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static WINDOW_FLUSHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Marks the calling thread as the window's: each file flushed on it is counted and, with
+/// `NEXUS_TRACE` set, printed. On it a write waits for the disk only inside the handler of a
+/// press on a discrete control, once per press (`docs/FILES.md`): the trace is the proof.
+pub fn mark_window_thread() {
+    WINDOW.set(true);
+}
+
+#[cfg(test)]
+pub fn window_flushes() -> u64 {
+    WINDOW_FLUSHES.get()
+}
+
+/// Notes that a file was flushed: counted and traced, if this is the window's thread.
+pub fn flushed(path: &Path, started: std::time::Instant) {
+    if !WINDOW.get() {
+        return;
+    }
+    WINDOW_FLUSHES.set(WINDOW_FLUSHES.get() + 1);
+    if std::env::var_os("NEXUS_TRACE").is_some() {
+        eprintln!("[trace] flushed on the window's thread in {:.1} ms: {}", started.elapsed().as_secs_f64() * 1000.0, path.display());
+    }
+}
+
+fn write_whole_now(path: &Path, bytes: &[u8], durable: Durable, steps: &Steps) -> std::io::Result<Placed> {
     use std::io::Write;
     // A new file, never one that is there: a name of a killed run's that came round again
     // (the same process number, and its count) is passed over for the next.

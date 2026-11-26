@@ -112,7 +112,8 @@ fn main() -> Result<(), slint::PlatformError> {
     slint::run_event_loop_until_quit()?;
     // Remember where playback was for next time.
     controller.save_queue();
-    controller.save_settings();
+    // (The press that quit flushed them, once: `Controller::quit`.)
+    controller.save_settings_in_passing();
     controller.downloads.borrow_mut().save_if_due(true);
     // The queue is written by a thread of its own: wait for it to finish.
     controller.saver.flush();

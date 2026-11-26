@@ -1778,7 +1778,7 @@ impl Controller {
     pub(crate) fn this_device(&self) -> (String, String) {
         if self.settings.borrow().device_id.is_empty() {
             self.settings.borrow_mut().device_id = format!("{:08x}", fastrand::u32(..));
-            self.save_settings();
+            self.save_settings_in_passing();
         }
         let settings = self.settings.borrow();
         let chosen = settings.device_name.trim();

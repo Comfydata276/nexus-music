@@ -434,7 +434,7 @@ impl Controller {
                 // to give, nothing is sent at all, so what this falls back on is never seen.)
                 let id = random::<16>().unwrap_or_default();
                 self.settings.borrow_mut().link_device = text::base64(&id);
-                self.save_settings();
+                self.save_settings_in_passing();
                 id
             }
         };
@@ -540,7 +540,7 @@ impl Controller {
                 }
                 Do::Remember(list) => {
                     self.settings.borrow_mut().link_seen = list;
-                    self.save_settings();
+                    self.save_settings_in_passing();
                 }
                 Do::Forget { playlist } => self.invalidate(&format!("playlist:{playlist}")),
                 Do::Steering(name) => {

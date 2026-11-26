@@ -96,6 +96,13 @@ fn ending(bytes: &[u8]) -> (usize, bool) {
 /// the file is put back as it was before them, so that writing them again later doesn't
 /// make some of them twice.
 fn append(path: &Path, text: &str) -> std::io::Result<()> {
+    let started = std::time::Instant::now();
+    let added = append_now(path, text);
+    crate::config::flushed(path, started);
+    added
+}
+
+fn append_now(path: &Path, text: &str) -> std::io::Result<()> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = std::fs::OpenOptions::new().create(true).read(true).write(true).truncate(false).open(path)?;
     let length = file.metadata()?.len();

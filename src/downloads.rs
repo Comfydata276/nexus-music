@@ -181,12 +181,36 @@ impl Downloads {
     /// be the whole list rewritten for every song, so it's done every couple of seconds
     /// instead, and once more when the batch is over (`now`).
     pub fn save_if_due(&mut self, now: bool) {
+        // (A download finishing, a batch's end, quitting: in passing. A removal the person
+        // asked for is saved, flushed, by `remove_downloads`.)
         if self.unsaved && (now || self.saved_at.elapsed() > std::time::Duration::from_secs(2)) {
-            self.save(if now { crate::config::Durable::Flushed } else { crate::config::Durable::InPassing });
+            self.save(crate::config::Durable::InPassing);
         }
     }
 
     /// Remembers (or forgets) that a playlist is kept downloaded.
+    /// Removes downloads the person asked to: the list saved once for all of them, flushed
+    /// (it is their press).
+    pub fn remove_many(&mut self, ids: &[String]) {
+        for id in ids {
+            self.remove(id);
+        }
+        if self.unsaved {
+            self.save(crate::config::Durable::Flushed);
+        }
+    }
+
+    /// Keeps no playlist downloaded any more: saved once (the person's "Remove all").
+    fn forget_collections(&mut self) {
+        if self.collections.is_empty() {
+            return;
+        }
+        self.collections.clear();
+        if let (Ok(json), false) = (serde_json::to_vec(&self.collections), self.account.is_empty()) {
+            let _ = crate::config::write_surely(&collections_file(&self.dir, &self.account), &json);
+        }
+    }
+
     fn keep_collection(&mut self, id: &str, keep: bool) {
         self.collections.retain(|c| c != id);
         if keep {
@@ -297,7 +321,7 @@ impl Downloads {
             let _ = fs::remove_file(self.dir.join(file));
             self.entries.retain(|e| e.song.id != id);
             self.arrived.remove(id);
-            self.save(crate::config::Durable::Flushed);
+            self.unsaved = true;
         }
     }
 }
@@ -764,12 +788,7 @@ impl Controller {
 
     /// Deletes these songs' saved copies, and stops any that are still on their way.
     pub fn remove_downloads(self: &Rc<Self>, ids: &[String]) {
-        {
-            let mut downloads = self.downloads.borrow_mut();
-            for id in ids {
-                downloads.remove(id);
-            }
-        }
+        self.downloads.borrow_mut().remove_many(ids);
         self.cancel_downloads(ids);
     }
 
@@ -854,10 +873,7 @@ impl Controller {
 
     pub fn remove_all_downloads(self: &Rc<Self>) {
         let ids: Vec<String> = self.downloads.borrow().songs().into_iter().map(|song| song.id).collect();
-        let collections = self.downloads.borrow().collections.clone();
-        for id in collections {
-            self.keep_downloaded(&id, false);
-        }
+        self.downloads.borrow_mut().forget_collections();
         self.remove_downloads(&ids);
         self.toast("Downloads removed");
     }
@@ -1236,6 +1252,32 @@ mod tests {
         }
         let _ = Downloads::load(dir.clone(), "someone");
         assert_eq!(names(&dir), ["a.flac", "index-someone.json", "movie.2.part", "report.part", "two words.mp3.3.part", "video.mp4.part"]);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn on_the_windows_thread_only_a_press_waits_for_the_disk_and_once() {
+        let dir = folder("window");
+        crate::config::mark_window_thread();
+        let flushes = crate::config::window_flushes;
+        let mut downloads = Downloads::load(dir.clone(), "someone");
+        let ids: Vec<String> = (0..20).map(|n| format!("s{n}")).collect();
+        let before = flushes();
+        // In passing: a batch arriving and ending, Recently played, the settings saved by an
+        // exchange, when songs were added, the crash note's marker.
+        for id in &ids {
+            fs::write(dir.join(format!("{id}.flac")), b"x").unwrap();
+            downloads.add(entry(id, &format!("{id}.flac"), 1));
+            downloads.save_if_due(false);
+        }
+        downloads.save_if_due(true);
+        crate::config::save_history(&dir.join("history.json"), &[]);
+        crate::config::Settings::default().save_in_passing(&dir.join("settings.json"));
+        crate::added::Added::load(dir.join("playlist-added.json")).record("p", &ids, 1_700_000_000);
+        assert_eq!(flushes(), before, "a write in passing waited for the disk on the window's thread");
+        // A press: twenty downloads removed at once, the list flushed once.
+        downloads.remove_many(&ids);
+        assert_eq!(flushes(), before + 1);
         let _ = fs::remove_dir_all(dir);
     }
 

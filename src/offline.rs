@@ -7,6 +7,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use slint::ComponentHandle;
 
+use crate::config::Durable;
 use crate::controller::{Controller, Route, with};
 use crate::subsonic::{ApiError, ApiResult, Client};
 use crate::ui;
@@ -96,12 +97,12 @@ impl Controller {
 
     /// Writes down what's still to be sent. Changes on their way to the server stay on file
     /// until it has answered, so closing the app part-way can't lose them.
-    fn save_pending(&self) {
+    fn save_pending(&self, durable: Durable) {
         let Some(path) = self.pending_path() else { return };
         let (sending, pending) = (self.sending.borrow(), self.pending.borrow());
         let held: Vec<&Pending> = sending.iter().chain(pending.iter()).collect();
         if let Ok(json) = serde_json::to_vec(&held) {
-            let _ = crate::config::write_surely(&path, &json);
+            let _ = crate::config::write_whole(&path, &json, durable, &crate::config::REPLACING);
         }
     }
 
@@ -109,8 +110,11 @@ impl Controller {
     /// `refused` runs if the server answers but says no.
     pub fn submit(self: &Rc<Self>, change: Pending, refused: impl FnOnce(&Rc<Controller>, String) + Send + 'static) {
         if self.is_offline() {
+            // A like or a rating is the person's press, and waits for the disk; a play counted
+            // is playback moving on, and doesn't.
+            let durable = if matches!(change, Pending::Played { .. }) { Durable::InPassing } else { Durable::Flushed };
             self.pending.borrow_mut().push(change);
-            return self.save_pending();
+            return self.save_pending(durable);
         }
         let sent = change.clone();
         self.request(
@@ -120,9 +124,10 @@ impl Controller {
                 // The server said no.
                 Err(error @ ApiError::Server { .. }) if !error.sign_in_refused() => refused(ctl, error.to_string()),
                 // It couldn't be asked: no connection, or a proxy answering in its place.
+                // (An answer from the network: in passing.)
                 Err(_) => {
                     ctl.pending.borrow_mut().push(change);
-                    ctl.save_pending();
+                    ctl.save_pending(Durable::InPassing);
                     ctl.set_unreachable(true);
                 }
             },
@@ -149,7 +154,7 @@ impl Controller {
                         let mut held = sent.kept;
                         held.extend(load_pending(&path).into_iter().skip(waiting.len()));
                         if let Ok(json) = serde_json::to_vec(&held) {
-                            let _ = crate::config::write_surely(&path, &json);
+                            let _ = crate::config::write_in_passing(&path, &json);
                         }
                     }
                     return;
@@ -157,7 +162,7 @@ impl Controller {
                 ctl.sending.borrow_mut().clear();
                 // Anything changed while this was going on comes after what was kept.
                 ctl.pending.borrow_mut().splice(0..0, sent.kept);
-                ctl.save_pending();
+                ctl.save_pending(Durable::InPassing);
                 if sent.done > 0 {
                     ctl.invalidate("liked");
                 }

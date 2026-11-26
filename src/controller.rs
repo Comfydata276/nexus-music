@@ -481,6 +481,8 @@ pub struct Controller {
 
 impl Controller {
     pub fn install(ui: ui::MainWindow) -> Rc<Controller> {
+        // Files flushed on this thread are counted and, with NEXUS_TRACE, printed.
+        config::mark_window_thread();
         let paths = Paths::new();
         let (settings, settings_note) = Settings::load_checked(&paths.settings);
         // What writes killed part-way left beside the app's files, for the account signed
@@ -663,7 +665,7 @@ impl Controller {
         let crashed = size > seen;
         if crashed {
             // Whole or not at all: a number cut short would be taken for one that was seen.
-            let _ = config::write_surely(&seen_file, size.to_string().as_bytes());
+            let _ = config::write_in_passing(&seen_file, size.to_string().as_bytes());
         }
         let note = self.startup_note.borrow_mut().take().or_else(|| {
             crashed.then(|| "The app stopped unexpectedly last time. “Save diagnostics” under Settings, About has what was noted.".to_string())
@@ -671,7 +673,7 @@ impl Controller {
         // (Said once ever, with whatever else is said now.)
         let links = config::no_links_note(&mut self.settings.borrow_mut().said_no_links);
         if links.is_some() {
-            self.save_settings();
+            self.save_settings_in_passing();
         }
         let note = match (note, links) {
             (Some(note), Some(links)) => Some(format!("{note} {links}")),
@@ -689,7 +691,7 @@ impl Controller {
     pub fn say_no_links_once(&self) {
         let note = config::no_links_note(&mut self.settings.borrow_mut().said_no_links);
         if let Some(note) = note {
-            self.save_settings();
+            self.save_settings_in_passing();
             self.show_toast(note.into(), "", Duration::from_secs(10));
         }
     }
@@ -1230,7 +1232,7 @@ impl Controller {
                         // Mention each new version once; after that the dot on the cog is enough.
                         if ctl.settings.borrow().update_notified != release.version {
                             ctl.settings.borrow_mut().update_notified = release.version.clone();
-                            ctl.save_settings();
+                            ctl.save_settings_in_passing();
                             ctl.toast(format!(
                                 "Nexus Music {} is available. Open Settings to update.",
                                 release.version
@@ -1337,7 +1339,7 @@ impl Controller {
                             settings.server = client.server().to_string();
                             settings.username = username.clone();
                         }
-                        ctl.save_settings();
+                        ctl.save_settings_in_passing();
                         if !config::save_password(&ctl.paths, client.server(), &username, &password) {
                             ctl.toast("Couldn't save your password; you'll need to sign in next time.");
                         }
@@ -1555,7 +1557,7 @@ impl Controller {
                     settings.lidarr_gate = found.service.clone();
                     settings.lidarr_gate_client = found.client.clone();
                 }
-                self.save_settings();
+                self.save_settings_in_passing();
                 self.connect_requests();
             }
         }
@@ -1601,7 +1603,7 @@ impl Controller {
             Ok(done) => {
                 config::save_secret(&self.paths, "lidarr-token", &done.token);
                 self.settings.borrow_mut().lidarr_signed_in = done.name;
-                self.save_settings();
+                self.save_settings_in_passing();
                 self.gate.replace(Some(std::sync::Arc::new(self.new_gate(found, done.token))));
                 self.connect_requests();
                 self.push_settings();
@@ -3685,6 +3687,14 @@ impl Controller {
 
     /// Changes a setting, shows it, applies it to the audio and, when `save` is set, writes
     /// it to disk. Dragging a slider passes `save: false` until the drag ends.
+    /// A slider's: saved, when its drag ends, in passing (a continuous control is no press).
+    fn change_setting_slid(&self, save: bool, change: impl FnOnce(&mut Settings)) {
+        self.change_setting(false, change);
+        if save {
+            self.save_settings_in_passing();
+        }
+    }
+
     fn change_setting(&self, save: bool, change: impl FnOnce(&mut Settings)) {
         change(&mut self.settings.borrow_mut());
         self.push_settings();
@@ -3979,7 +3989,7 @@ impl Controller {
             });
         });
         settings.on_set_crossfade(|seconds, save| {
-            with(|ctl| ctl.change_setting(save, |s| s.crossfade = seconds.round().clamp(0.0, 12.0)));
+            with(|ctl| ctl.change_setting_slid(save, |s| s.crossfade = seconds.round().clamp(0.0, 12.0)));
         });
         settings.on_set_gapless(|on| {
             with(|ctl| ctl.change_setting(true, |s| s.gapless = on));
@@ -4030,7 +4040,7 @@ impl Controller {
         });
         settings.on_set_eq_band(|band, gain, save| {
             with(|ctl| {
-                ctl.change_setting(save, |s| {
+                ctl.change_setting_slid(save, |s| {
                     if let Some(slot) = s.eq_gains.get_mut(band as usize) {
                         // Half-decibel steps are finer than anyone can hear and keep values tidy.
                         *slot = ((gain * 2.0).round() / 2.0).clamp(-EQ_RANGE, EQ_RANGE);
