@@ -1288,6 +1288,24 @@ to give way to them, or to stand against what does not take one.
 | `looking_up`, `looked_up` `{"ticket"}` | Around a look-up for something to play. `looking_up` is answered with `{"act":"ticket","ticket":n}`; the phone is busy to other devices until `looked_up` with that ticket, or a minute, whichever is first, and no more than sixteen are counted at once. No ticket comes back while linking is off, and then there is nothing to end. |
 | `stop` | **The sign-in has ended**: a sign-out, a change of account, the service going. |
 
+**What the phone's screens are handed** (built in the adapter; nothing draws a list
+yet). The list the library says after each tick is kept where a screen can collect it,
+with what the list calls (pick, pause, "Play here", stop steering, reset); a row for a
+device of another generation (5.10) carries its sentence and is not to be picked. The
+device being steered is put in the same place a jam's host is, which the phone's player,
+Now Playing and queue already draw another player from: so they show it, and what is
+pressed in them is told as `press`, `add` and `play`. Two rules of the adapter's own:
+
+- **One thing is in the phone's player at a time.** If a friend's jam is there when a
+  view of the device arrives, the jam stays and the library is told `let_go`.
+- **The device is out of the phone's player before the phone is asked to take its
+  queue.** The phone's service starts nothing of its own while its player shows
+  another's; the library has let go of the device by the time it calls `take`, and
+  says so only in what follows the call. So the adapter stops showing the device as
+  `take` is called, not when it is told. (While the phone steers a device it carries
+  out no command that would start its own music: a third device that gives it a queue
+  is told it could not play it. That is the service's rule, from before linking.)
+
 **`changed` is never said from a Media3 listener for something a command did.**
 ExoPlayer tells its listeners of some things later (`onEvents`, posted to the looper),
 and `ForwardingSimpleBasePlayer` brings its state up to date from that; a `changed`
