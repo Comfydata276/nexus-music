@@ -343,21 +343,30 @@ impl Player for Here<'_> {
 
     fn carry_out(&mut self, command: &Command, ready: &Ready) -> Carried {
         let ctl = self.ctl;
-        // What is so already is not done again: the functions below would count a volume
-        // set to what it is, or a queue cleared of nothing, as a change.
+        // **What is so already is said as that, and is not done again** (the functions
+        // below would count a volume set to what it is, or a queue cleared of nothing, as
+        // a change). It is found here, before anything is asked of the player, so that
+        // "the player took no way in" below means one thing only: it refused.
         let already = {
             let pb = ctl.playback.borrow();
-            match command {
-                Command::Volume { to } => !pb.muted && (pb.volume - (*to as f32).clamp(0.0, 1.0)).abs() < 0.001,
-                Command::Shuffle { on } => pb.shuffle == *on,
-                Command::Repeat { mode } => pb.repeat == (*mode).min(2),
-                Command::Clear { queued: true } => pb.queued_ahead() == 0,
-                Command::Clear { queued: false } => pb.order.len() <= pb.cursor + 1 + pb.queued_ahead(),
+            match (command, ready) {
+                (Command::Play, _) => pb.playing,
+                (Command::Pause | Command::Moved, _) => !pb.playing,
+                (Command::Volume { to }, _) => !pb.muted && (pb.volume - (*to as f32).clamp(0.0, 1.0)).abs() < 0.001,
+                (Command::Shuffle { on }, _) => pb.shuffle == *on,
+                (Command::Repeat { mode }, _) => pb.repeat == (*mode).min(2),
+                (Command::Clear { queued: true }, _) => pb.queued_ahead() == 0,
+                (Command::Clear { queued: false }, _) => pb.order.len() <= pb.cursor + 1 + pb.queued_ahead(),
+                // An entry put down where it is, as what it is.
+                (Command::Move { to, queued, .. }, Ready::Entry(from)) => {
+                    let last = pb.order.len().saturating_sub(pb.cursor + 2);
+                    pb.cursor + 1 + from < pb.order.len() && !pb.moves_ahead(*from, (*to as usize).min(last), *queued)
+                }
                 _ => false,
             }
         };
         if already {
-            return Carried::Unchanged;
+            return Carried::AlreadySo;
         }
         // The person chose this at another of their devices. The rule counts it, once, if
         // the player changes anything for it, so the player's own counting is not added;
@@ -388,8 +397,9 @@ impl Player for Here<'_> {
             _ => {}
         }
         // Each of those takes its way into the player only once it knows something will
-        // change (`ways`): whether one was taken is whether anything did.
-        if ctl.ways.taken() { Carried::Changed } else { Carried::Unchanged }
+        // change (`ways`): whether one was taken is whether anything did. One that took
+        // none, for something that was not so already, could not do it.
+        if ctl.ways.taken() { Carried::Changed } else { Carried::Refused }
     }
 
     /// This PC's queue is another device's now. In `nexus_core::handover`'s terms it is

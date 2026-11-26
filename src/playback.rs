@@ -229,7 +229,7 @@ impl Playback {
     /// Whether moving the entry `from` places after the current track to `to` places after
     /// it, as `queued` says, would change anything: there is such an entry and such a
     /// place, and it is not where and what it is already.
-    fn moves_ahead(&self, from: usize, to: usize, queued: bool) -> bool {
+    pub(crate) fn moves_ahead(&self, from: usize, to: usize, queued: bool) -> bool {
         let base = self.cursor + 1;
         let (at, to) = (base + from, base + to);
         at < self.order.len() && to < self.order.len() && (at != to || self.order.get(at).and_then(|&entry| self.queue.get(entry)).is_some_and(|song| song.queued != queued))

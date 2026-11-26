@@ -92,11 +92,14 @@ pub trait PhonePlayer {
     /// The ids of the songs to come, in the order they would play.
     fn ahead(&self) -> Vec<String>;
     /// Carries a command out, exactly as the same press on the phone would be, **and says
-    /// whether it changed anything**: a Play when it was playing, a seek on a radio, a Next
-    /// with nothing to go to, change nothing. What is said is what happened to the
-    /// player, not what was asked of it: a call the app's own rules refused is "changed
-    /// nothing". It is **not** an [`Event::Changed`]: it is counted here, once, if it
-    /// changed anything, and whatever the player's listeners say of it meanwhile is dropped.
+    /// which of three things came of it** ([`Carried`]): it changed the player; it was so
+    /// already (Play while the player is set to play, Pause while it is not, the volume,
+    /// shuffle or repeat at what was asked, nothing to clear); or it refused (the app's
+    /// own rules would not start playing, a seek where there is nowhere to seek to, a
+    /// Next with nothing to go to, an entry that is not there). What is said is what
+    /// happened to the player, not what was asked of it. It is **not** an
+    /// [`Event::Changed`]: it is counted here, once, if it changed anything, and
+    /// whatever the player's listeners say of it meanwhile is dropped.
     fn carry_out(&mut self, command: &Command, ready: &Ready) -> Carried;
     /// The phone's queue has been handed to another of the person's devices: from this
     /// moment it is one taken up from that device and not touched
@@ -343,7 +346,7 @@ impl Player for Held<'_> {
     /// the player's queue has a new number.
     fn carry_out(&mut self, command: &Command, ready: &Ready) -> Carried {
         if self.over() {
-            return Carried::Unchanged;
+            return Carried::Refused;
         }
         self.ways.begin(command.chosen_by(), true);
         let before = self.queue();
@@ -893,6 +896,8 @@ mod tests {
         ThrewAfterChanging,
         /// Told to stop, the player goes on sounding (by a command or by the phone itself).
         DoesNotStop,
+        /// The app's own rules will not start playing (a call is on).
+        MayNotPlay,
         /// The app cannot record whose the queue is: the call fails.
         CannotRecord,
         /// Asked what it is playing, the call fails.
@@ -962,45 +967,56 @@ mod tests {
         }
         fn carry_out(&mut self, command: &Command, ready: &Ready) -> Carried {
             self.asked.push(command.name().to_string());
-            let changed = match (command, ready) {
-                (Command::Pause | Command::Moved, _) if self.wrong == Some(Wrong::DoesNotStop) => false,
-                (Command::Pause | Command::Moved, _) => self.sound.take().is_some(),
-                (Command::Play, _) if self.sound.is_none() => {
+            let (changed, already, refused) = (Carried::Changed, Carried::AlreadySo, Carried::Refused);
+            let carried = match (command, ready) {
+                (Command::Pause | Command::Moved, _) if self.sound.is_none() => already,
+                (Command::Pause | Command::Moved, _) if self.wrong == Some(Wrong::DoesNotStop) => refused,
+                (Command::Pause | Command::Moved, _) => {
+                    self.sound = None;
+                    changed
+                }
+                (Command::Play, _) if self.sound.is_some() => already,
+                (Command::Play, _) if self.wrong == Some(Wrong::MayNotPlay) => refused,
+                (Command::Play, _) => {
                     self.sound = Some(0.0);
-                    true
+                    changed
                 }
                 (Command::Next, _) if self.songs.len() > 1 => {
                     self.songs.rotate_left(1);
-                    true
+                    changed
                 }
                 (Command::Seek { to }, _) if !self.radio => {
                     self.sound = Some(*to);
-                    true
+                    changed
                 }
-                (Command::Volume { to }, _) => std::mem::replace(&mut self.volume, *to) != *to,
+                (Command::Volume { to }, _) if self.volume == *to => already,
+                (Command::Volume { to }, _) => {
+                    self.volume = *to;
+                    changed
+                }
                 (Command::Remove { .. }, Ready::Entry(entry)) => {
                     self.songs.remove(entry + 1);
-                    true
+                    changed
                 }
                 (Command::Add { .. }, Ready::Songs(songs)) => {
                     self.songs.extend(songs.iter().cloned());
-                    true
+                    changed
                 }
                 (Command::Adopt(adopt), Ready::Queue(songs, begin)) => {
                     self.songs = songs.iter().skip(*begin).map(|(id, _)| id.clone()).collect();
                     self.sound = Some(adopt.position);
                     self.queue += 1;
-                    true
+                    changed
                 }
-                _ => false,
+                _ => refused,
             };
-            if changed {
+            if carried == changed {
                 self.tell("carry_out");
             }
             if self.wrong == Some(Wrong::ThrewAfterChanging) {
                 panic!("the app threw after the player changed");
             }
-            if changed { Carried::Changed } else { Carried::Unchanged }
+            carried
         }
         fn handed_on(&mut self) {
             self.asked.push(format!("handed on, {}", if self.sound.is_some() { "sounding" } else { "silent" }));
@@ -1492,6 +1508,34 @@ mod tests {
         assert_eq!(pair.asked(0), ["handed on, sounding", "pause, its own", "handed back"]);
         assert_eq!((pair.said(0).last().copied(), pair.players[0].sound.is_some(), pair.players[1].sound.is_some()), (Some("Phone B has started, and this phone couldn't be stopped. Both are playing."), true, true));
         assert!(!pair.acts[0].iter().any(|act| matches!(act, Act::Do { ask: Do::Steering(Some(_)) })));
+    }
+
+    /// The tell a phone sent to the other place in the room, opened.
+    fn answered(came: &Came, place: &[u8; 16]) -> super::super::message::Tell {
+        let Some(Do::Send { frame: sent, .. }) = came.native.iter().find(|ask| matches!(ask, Do::Send { .. })) else { panic!("no answer: {came:?}") };
+        let opened = frame::open(&Keys::of(&secret()), sent, place, &[1; 16]).expect("the answer opens");
+        read_tell(&opened.message).expect("a tell")
+    }
+
+    /// The phone's own rules will not start playing (`mayPlay()` says no: a call is on).
+    /// That is a refusal, said as one: not "it was so already", which would be answered
+    /// as done and let the sender's next press go.
+    #[test]
+    fn a_phone_that_may_not_play_refuses_and_does_not_say_it_was_so_already() {
+        let mut n = 0;
+        let (phone, mut player, session, place) = phone(&mut n);
+        player.sound = None;
+        player.wrong = Some(Wrong::MayNotPlay);
+        let came = hear(&phone, &mut player, session, &place, vec![command(1, &place, Command::Play, 1)], 2_000, &mut n);
+        let tell = answered(&came, &place);
+        assert_eq!((tell.ok, tell.why, tell.by, tell.done, tell.playing), (Some(false), Some(Why::Cannot), None, false, false));
+        assert_eq!((order(&phone, 2_000), player.claims()), ((1, None, false), 0));
+        // Play while it is playing is so already, and is said as that.
+        player.wrong = None;
+        player.sound = Some(1.0);
+        let came = hear(&phone, &mut player, session, &place, vec![command(2, &place, Command::Play, 1)], 2_100, &mut n);
+        let tell = answered(&came, &place);
+        assert_eq!((tell.ok, tell.why, order(&phone, 2_100)), (Some(true), Some(Why::Nothing), (1, None, false)));
     }
 
     /// A call up that changed the player and then failed, at whatever point: there is no

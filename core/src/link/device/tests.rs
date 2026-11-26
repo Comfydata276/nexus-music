@@ -39,6 +39,8 @@ struct Fake {
     takes_nothing: bool,
     /// Told to stop, it goes on sounding.
     does_not_stop: bool,
+    /// Its own rules refuse to start playing (as a phone's do while a call is on).
+    may_not_play: bool,
 }
 
 impl Fake {
@@ -96,10 +98,11 @@ impl Player for Fake {
         self.queue.iter().skip(self.cursor + 1).cloned().collect()
     }
     fn carry_out(&mut self, command: &Command, ready: &Ready) -> Carried {
-        if self.does_not_stop && matches!(command, Command::Pause | Command::Moved) {
-            return Carried::Unchanged;
+        match command {
+            Command::Pause | Command::Moved if self.does_not_stop => Carried::Refused,
+            Command::Play if self.may_not_play && !self.playing => Carried::Refused,
+            _ => self.carry(command, ready),
         }
-        if self.carry(command, ready) { Carried::Changed } else { Carried::Unchanged }
     }
     fn handed_on(&mut self) {
         self.handed_on.push(self.playing);
@@ -154,23 +157,26 @@ impl Player for Fake {
 }
 
 impl Fake {
-    /// Does what a command says, as the same press would, and says whether it changed
-    /// anything.
-    fn carry(&mut self, command: &Command, ready: &Ready) -> bool {
-        // (As a real player: a press that would change nothing changes nothing.)
-        let nothing = match command {
+    /// Does what a command says, as the same press would, and says what came of it.
+    fn carry(&mut self, command: &Command, ready: &Ready) -> Carried {
+        // (As a real player: what is so already is not done again, and what cannot be
+        // done is not done.)
+        let already = match command {
             Command::Play => self.playing,
             Command::Pause | Command::Moved => !self.playing,
-            Command::Next => self.cursor + 1 >= self.queue.len(),
-            Command::Seek { .. } => self.radio,
             Command::Volume { to } => self.volume == *to,
             Command::Shuffle { on } => self.shuffle == *on,
             Command::Repeat { mode } => self.repeat == *mode,
             Command::Clear { .. } => self.cursor + 1 >= self.queue.len(),
             _ => false,
         };
-        if nothing {
-            return false;
+        let cannot = match command {
+            Command::Next => self.cursor + 1 >= self.queue.len(),
+            Command::Seek { .. } => self.radio,
+            _ => false,
+        };
+        if already || cannot {
+            return if already { Carried::AlreadySo } else { Carried::Refused };
         }
         self.did.push(command.name().to_string());
         match (command, ready) {
@@ -204,7 +210,7 @@ impl Fake {
             }
             other => panic!("carried out with the wrong thing found: {other:?}"),
         }
-        true
+        Carried::Changed
     }
 }
 
@@ -933,12 +939,7 @@ fn a_command_the_player_did_not_carry_out_is_not_answered_as_done() {
     world.copies[B].player.play(true);
     world.path.hold_tells = true;
     world.ask("play");
-    let answer = world.path.tells.iter().rev().find_map(|frame| {
-        let keys = Keys::of(&secret(7));
-        let opened = frame::open(&keys, &frame.text, &frame.from, &frame.to)?;
-        read_tell(&opened.message).filter(|tell| tell.re.is_some() && tell.ok.is_some())
-    });
-    assert_eq!(answer.map(|tell| (tell.ok, tell.why, tell.by)), Some((Some(true), Some(Why::Nothing), None)));
+    assert_eq!(answer_on_the_path(&world).map(|tell| (tell.ok, tell.why, tell.by)), Some((Some(true), Some(Why::Nothing), None)));
 }
 
 #[test]
@@ -1081,6 +1082,46 @@ fn the_end_of_a_session_ends_what_was_waiting_under_it() {
     world.looked(B, Looked::Secret { secret: secret(8), id: "k".into(), wrote: None }, false);
     assert!(!world.copies[B].player.rule.busy(world.now));
     assert_eq!(world.log(B, "the session ended before it sounded, nobody is answered").len(), 1);
+}
+
+/// A player that refuses is not a player that was so already. A phone may truthfully
+/// refuse to start playing (a call is on): its sender is told it could not, and what was
+/// pressed after it, and was waiting on it, is dropped as after any failure.
+#[test]
+fn a_player_that_refuses_is_answered_as_could_not_and_what_waited_on_it_is_dropped() {
+    let mut world = steering("play");
+    let before = world.copies[B].player.rule.generation();
+    world.copies[B].player.may_not_play = true;
+    world.path.hold_commands = true;
+    world.ask("play");
+    world.ask("next");
+    world.path.hold_commands = false;
+    world.release();
+    world.pass(1_000);
+    let b = &world.copies[B];
+    assert!(world.last(B, "play from").contains("refused, Cannot"), "{:?}", b.log);
+    assert_eq!((b.player.did.len(), b.player.playing, b.player.rule.generation(), b.player.rule.by(), b.player.rule.busy(world.now)), (0, false, before, None, false));
+    assert_eq!(world.copies[A].said.last().map(String::as_str), Some("Copy B couldn't do that."));
+    // Where it was so already, the press that waited goes.
+    let mut world = steering("play");
+    world.copies[B].player.play(true);
+    world.path.hold_commands = true;
+    world.ask("play");
+    world.ask("next");
+    world.path.hold_commands = false;
+    world.release();
+    world.pass(1_000);
+    assert!(world.last(B, "play from").ends_with("nothing to do, it was so already"));
+    assert_eq!(world.copies[B].player.did, ["next"]);
+}
+
+/// The answer to a command, as it went on the path: the last one that answers anything.
+fn answer_on_the_path(world: &World) -> Option<super::super::message::Tell> {
+    world.path.tells.iter().rev().find_map(|frame| {
+        let keys = Keys::of(&secret(7));
+        let opened = frame::open(&keys, &frame.text, &frame.from, &frame.to)?;
+        read_tell(&opened.message).filter(|tell| tell.re.is_some() && tell.ok.is_some())
+    })
 }
 
 #[test]

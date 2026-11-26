@@ -70,13 +70,20 @@ pub enum Ready {
     Queue(Vec<(String, bool)>, usize),
 }
 
-/// What came of asking the player to carry a command out.
+/// What came of asking the player to carry a command out: one of three things, and the
+/// player says which. (Which it was is not worked out from "nothing changed".)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Carried {
     /// It changed the player.
     Changed,
-    /// The player is as it was: it was so already, or could not do it.
-    Unchanged,
+    /// **It was so already**, and nothing was done: Play while playing, Pause or the stop
+    /// that ends a move while not playing, the volume, shuffle or repeat set to what it
+    /// is, nothing to clear, an entry put down where it was as what it was.
+    AlreadySo,
+    /// **It refused**, or could not: the player's own rules would not have it (it may not
+    /// play just now), there is nowhere to seek to, nothing to go on to, the entry is not
+    /// there. The player is as it was.
+    Refused,
 }
 
 /// Where the sound has got to, and in which queue.
@@ -1053,10 +1060,12 @@ impl Device {
             return self.refused(session, from, nonce, &command, at, Why::Cannot, env, out);
         }
         if !changed {
-            // The player did nothing. Either it was already as the command asked, which is
-            // no fault and is said as such; or it could not do it. Nothing has moved.
-            return match command {
-                Command::Play | Command::Pause | Command::Moved | Command::Volume { .. } | Command::Shuffle { .. } | Command::Repeat { .. } | Command::Clear { .. } => {
+            // The player did nothing, and has said which: it was already as the command
+            // asked, which is no fault and is said as such; or it refused, or could not.
+            // Nothing has moved. (A queue to take over is never "so already": one that is
+            // not in the player was not taken.)
+            return match carried {
+                Carried::AlreadySo if !matches!(command, Command::Adopt(_)) => {
                     out.push(Do::Log(format!("{} from {} against generation {}: nothing to do, it was so already", command.name(), text::place(&from), at.generation)));
                     let answer = self.state(Some(nonce), Some(true), Some(Why::Nothing), env);
                     self.answer(session, from, answer, env, out);
