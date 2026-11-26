@@ -710,6 +710,8 @@ impl Controller {
                     FromRelay::Heard { places, frames } => ctl.link_event(|device, env| device.heard(session, &places, &frames, env)),
                     FromRelay::Left => ctl.link.borrow().inner.borrow_mut().device.left(session),
                 });
+                // (Posted to the window's thread, which takes everything.)
+                true
             };
             relay::keep_place(&http, &relay, &room, &mut random::<16>, &mut tell, &mut |line| log(line));
         });

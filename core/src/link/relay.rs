@@ -79,6 +79,53 @@ pub const MOST_PLACES: usize = 17;
 /// The most frames taken from one answer of the relay's. (A device answers twenty asks a
 /// second; what is over is the relay's to hand over again, or is lost with its sender told.)
 pub const MOST_FRAMES: usize = 64;
+/// The longest a place's token can be, in characters.
+pub const MOST_TOKEN: usize = 256;
+/// The most text one hand-over holds, the places its frames are from and the frames: half
+/// of what may wait for the player's thread (`super::turn::MOST_KEPT_BYTES`), so that a
+/// hand-over fits there whenever little else is waiting. The longest frame there can be
+/// is less.
+pub const MOST_HEARD_BYTES: usize = super::turn::MOST_KEPT_BYTES / 2;
+const _: () = assert!(super::frame::MOST_FRAME_TEXT + 64 <= MOST_HEARD_BYTES);
+
+/// What is taken from one answer of the relay's: chosen where it lies in the answer,
+/// before any of it is copied.
+struct Chosen<'a> {
+    places: Vec<&'a str>,
+    /// Who each frame is from, and the frame.
+    frames: Vec<(&'a str, &'a str)>,
+    /// The number of the last frame this deals with: asked for from there next, once
+    /// what was chosen has been taken.
+    upto: u64,
+}
+
+/// Chooses from an answer to a poll. `after` is the number of the last frame dealt with.
+fn chosen(heard: &Value, after: u64) -> Chosen<'_> {
+    let places = heard["places"].as_array().into_iter().flatten().filter_map(Value::as_str).filter(|place| text::read_place(place).is_some()).take(MOST_PLACES).collect();
+    let (mut frames, mut upto, mut bytes) = (Vec::new(), after, 0usize);
+    for frame in heard["frames"].as_array().into_iter().flatten() {
+        let (Some(seq), Some(from), Some(sealed)) = (frame["seq"].as_u64(), frame["from"].as_str(), frame["frame"].as_str()) else { continue };
+        // One that was handed over before is sent again until it is said to have been
+        // dealt with: it is skipped.
+        if seq <= upto {
+            continue;
+        }
+        // Only frames from a place, and no longer than a frame can be. (One that is not
+        // is dealt with by being passed over: it is not asked for again.)
+        if text::read_place(from).is_some() && !sealed.is_empty() && sealed.len() <= super::frame::MOST_FRAME_TEXT {
+            // No more of them than one hand-over holds, by number or by size: this one
+            // and what follows it are left with the relay, and asked for from here.
+            let size = from.len() + sealed.len();
+            if frames.len() >= MOST_FRAMES || bytes + size > MOST_HEARD_BYTES {
+                break;
+            }
+            bytes += size;
+            frames.push((from, sealed));
+        }
+        upto = seq;
+    }
+    Chosen { places, frames, upto }
+}
 
 /// Sends a sealed frame to a place. The relay's status, if it answered. Sent once:
 /// whatever comes of it, it is not sent again by itself.
@@ -89,15 +136,28 @@ pub fn send(http: &dyn Http, relay: &Relay, room: &str, token: &str, to: &Place,
 
 /// Keeps this device's place in `room` until the app's `Http` says to stop. `random` gives
 /// sixteen bytes from the system's source of randomness for each new place, or `None`.
-/// `tell` is told what happens; `log` what is worth writing down, in words that name no
-/// key and no token. Trying again is spaced out, up to a minute.
-pub fn keep_place(http: &dyn Http, relay: &Relay, room: &str, random: &mut dyn FnMut() -> Option<Place>, tell: &mut dyn FnMut(FromRelay), log: &mut dyn FnMut(String)) {
+/// `tell` is told what happens, **and says whether it took what it was told**: whoever
+/// is told may keep only so much waiting, and what it does not take is not lost. A place
+/// entered or forgotten is said again until it is taken, and frames not taken are not
+/// counted as handed over: the relay is asked for the same ones again. `log` is told what
+/// is worth writing down, in words that name no key and no token. Trying again is spaced
+/// out, up to a minute.
+pub fn keep_place(http: &dyn Http, relay: &Relay, room: &str, random: &mut dyn FnMut() -> Option<Place>, tell: &mut dyn FnMut(FromRelay) -> bool, log: &mut dyn FnMut(String)) {
     // How long to leave it before trying again: longer each time, up to a minute.
     let mut wait = 2u64;
     macro_rules! pause {
         ($seconds:expr) => {
             if http.pause(Duration::from_secs($seconds)).is_err() {
                 return;
+            }
+        };
+    }
+    // What must be heard is said until it is taken: a second is left between. (What is
+    // only for the person, and is said again in a minute anyway, is said once.)
+    macro_rules! told {
+        ($from:expr) => {
+            while !tell($from) {
+                pause!(1);
             }
         };
     }
@@ -127,12 +187,16 @@ pub fn keep_place(http: &dyn Http, relay: &Relay, room: &str, random: &mut dyn F
             }
             Ok(_) => again!('entering),
         }
-        let Some(place) = random() else { return tell(FromRelay::NoRandom) };
+        let Some(place) = random() else {
+            told!(FromRelay::NoRandom);
+            return;
+        };
         let name = text::place(&place);
         let (token, mut version) = match call(http, relay, Method::Post(&json!({"place": name}).to_string()), &format!("api/link/{room}/enter"), "", POST) {
             Err(()) => return,
             Ok(Some((200, entered))) => {
-                let Some(token) = entered["token"].as_str().map(str::to_string) else { continue };
+                // (A token is a short thing: what is not is not one.)
+                let Some(token) = entered["token"].as_str().filter(|token| token.len() <= MOST_TOKEN).map(str::to_string) else { continue };
                 (token, entered["v"].as_u64().unwrap_or(0))
             }
             // (A place that is taken: so unlikely that it is simply tried again with another.)
@@ -141,7 +205,7 @@ pub fn keep_place(http: &dyn Http, relay: &Relay, room: &str, random: &mut dyn F
         };
         wait = 2;
         log(format!("room: entered as {name}"));
-        tell(FromRelay::Entered { place, token: token.as_str().into() });
+        told!(FromRelay::Entered { place, token: token.as_str().into() });
         // The last frame handed over. A new token counts from 1 again.
         let mut after = 0u64;
         loop {
@@ -157,28 +221,21 @@ pub fn keep_place(http: &dyn Http, relay: &Relay, room: &str, random: &mut dyn F
                     // What the relay says is looked at before any of it is taken: only
                     // what reads as a place, and no more places than a room is given
                     // here; only frames from a place, no longer than a frame can be, and
-                    // no more of them than one hand-over is given.
-                    let places: Vec<String> = heard["places"].as_array().into_iter().flatten().filter_map(Value::as_str).filter(|place| text::read_place(place).is_some()).take(MOST_PLACES).map(str::to_string).collect();
-                    let mut frames = Vec::new();
-                    for frame in heard["frames"].as_array().into_iter().flatten() {
-                        // One that was handed over before is sent again until it is said
-                        // to have been dealt with: it is skipped.
-                        let (Some(seq), Some(from), Some(sealed)) = (frame["seq"].as_u64(), frame["from"].as_str(), frame["frame"].as_str()) else { continue };
-                        if seq <= after {
-                            continue;
-                        }
-                        // (Dealt with, whatever it is: it is not asked for again.)
-                        after = seq;
-                        if frames.len() < MOST_FRAMES && text::read_place(from).is_some() && !sealed.is_empty() && sealed.len() <= super::frame::MOST_FRAME_TEXT {
-                            frames.push((from.to_string(), sealed.to_string()));
-                        }
+                    // no more of them than one hand-over holds.
+                    let chosen = chosen(&heard, after);
+                    let heard = FromRelay::Heard { places: chosen.places.iter().map(|place| place.to_string()).collect(), frames: chosen.frames.iter().map(|(from, frame)| (from.to_string(), frame.to_string())).collect() };
+                    // **Counted as handed over only once it has been taken.** If there is
+                    // no room for it just now, the same frames are asked for again.
+                    if tell(heard) {
+                        after = chosen.upto;
+                    } else {
+                        pause!(1);
                     }
-                    tell(FromRelay::Heard { places, frames });
                 }
                 // The relay has forgotten this place (it restarted, or the device slept).
                 Some((404, _)) => {
                     log("room: the relay has forgotten this place".to_string());
-                    tell(FromRelay::Left);
+                    told!(FromRelay::Left);
                     pause!(1);
                     continue 'entering;
                 }
@@ -248,9 +305,22 @@ mod tests {
     }
 
     fn stay(script: Vec<Option<(u16, Value)>>, places: &mut dyn FnMut() -> Option<Place>) -> (Vec<FromRelay>, Vec<String>, Vec<u64>, Vec<String>) {
+        stay_taking(script, places, &mut |_| true)
+    }
+
+    /// The same, where whoever is told takes what it is told or does not (`takes`): what
+    /// it did not take is not among what was told.
+    fn stay_taking(script: Vec<Option<(u16, Value)>>, places: &mut dyn FnMut() -> Option<Place>, takes: &mut dyn FnMut(&FromRelay) -> bool) -> (Vec<FromRelay>, Vec<String>, Vec<u64>, Vec<String>) {
         let http = Scripted::with(script);
         let (mut told, mut logged) = (Vec::new(), Vec::new());
-        keep_place(&http, &relay(), "theroom", places, &mut |from| told.push(from), &mut |line| logged.push(line));
+        let mut tell = |from: FromRelay| {
+            let taken = takes(&from);
+            if taken {
+                told.push(from);
+            }
+            taken
+        };
+        keep_place(&http, &relay(), "theroom", places, &mut tell, &mut |line| logged.push(line));
         let (asked, waits) = (http.asked.lock().unwrap().clone(), http.waits.lock().unwrap().clone());
         (told, asked, waits, logged)
     }
@@ -308,11 +378,81 @@ mod tests {
         let FromRelay::Heard { places, frames } = &told[1] else { panic!("{told:?}") };
         assert_eq!((places.len(), places[0].as_str(), places.iter().all(|place| text::read_place(place).is_some())), (MOST_PLACES, place(0).as_str(), true));
         assert_eq!((frames.len(), frames[0].1.len(), frames[1].clone()), (MOST_FRAMES, super::super::frame::MOST_FRAME_TEXT, (place(2), "f".to_string())));
-        // All of it counts as handed over: none of it is asked for again.
-        assert!(asked.iter().any(|asked| asked.starts_with("GET api/link/theroom/poll?v=7&after=205 ")), "{asked:?}");
+        // What one hand-over holds counts as handed over, with what was passed over on
+        // the way; the rest is asked for from there.
+        assert!(asked.iter().any(|asked| asked.starts_with(&format!("GET api/link/theroom/poll?v=7&after={} ", 5 + MOST_FRAMES - 1))), "{asked:?}");
         // And an answer that is not of that shape at all gives an empty room, not an error.
         let (told, ..) = stay(vec![hello(), Some((200, json!({"token": "the-token", "v": 5}))), Some((200, json!({"v": "x", "places": "all of them", "frames": {"seq": 1}}))), Some((503, json!({})))], &mut places_given);
         assert_eq!(told[1], FromRelay::Heard { places: vec![], frames: vec![] });
+    }
+
+    /// Whoever is told may have no room for what it is told just now (the player's thread
+    /// is busy, and what waits for it is bounded). **Nothing is lost by that**: frames not
+    /// taken are not counted as handed over, and are asked for again; a place that was
+    /// entered is said again until it is heard.
+    #[test]
+    fn what_was_not_taken_is_offered_again_and_frames_are_not_counted_as_handed_over() {
+        let mut n = 0u8;
+        let mut places = || {
+            n += 1;
+            Some([n; 16])
+        };
+        let b = text::place(&[0xb; 16]);
+        let heard = || Some((200, json!({"v": 7, "places": [b], "frames": [{"seq": 1, "from": b, "frame": "one"}, {"seq": 2, "from": b, "frame": "two"}]})));
+        // The place is not taken the first time it is said, and the frames not the first twice.
+        let mut refusals = vec![("entered", 1), ("heard", 2)];
+        let mut takes = |from: &FromRelay| {
+            let kind = match from {
+                FromRelay::Entered { .. } => "entered",
+                FromRelay::Heard { .. } => "heard",
+                _ => "other",
+            };
+            match refusals.iter_mut().find(|(of, left)| *of == kind && *left > 0) {
+                Some((_, left)) => {
+                    *left -= 1;
+                    false
+                }
+                None => true,
+            }
+        };
+        let script = vec![hello(), Some((200, json!({"token": "the-token", "v": 5}))), heard(), heard(), heard(), Some((200, json!({"v": 7, "places": [b], "frames": []}))), Some((503, json!({})))];
+        let (told, asked, waits, _) = stay_taking(script, &mut places, &mut takes);
+        assert_eq!(told[0], FromRelay::Entered { place: [1; 16], token: "the-token".into() });
+        assert_eq!(told[1], FromRelay::Heard { places: vec![b.clone()], frames: vec![(b.clone(), "one".into()), (b.clone(), "two".into())] });
+        assert_eq!(told[2], FromRelay::Heard { places: vec![b.clone()], frames: vec![] });
+        let polls: Vec<&str> = asked.iter().filter(|asked| asked.contains("/poll?")).map(|asked| asked.split("&after=").nth(1).unwrap_or_default().split(' ').next().unwrap_or_default()).collect();
+        assert_eq!(polls, ["0", "0", "0", "2", "2"], "{asked:?}");
+        // (A second is left before each is offered again.)
+        assert_eq!(waits, [1, 1, 1]);
+    }
+
+    /// One hand-over holds so many frames and so much text, and no more: what is over is
+    /// left with the relay, not counted as handed over, and comes at the next asking.
+    /// And it is chosen from the relay's answer where it lies, before any of it is copied.
+    #[test]
+    fn a_hand_over_is_cut_to_size_and_what_is_over_is_left_with_the_relay() {
+        let place = |n: usize| text::place(&[n as u8; 16]);
+        let longest = "x".repeat(super::super::frame::MOST_FRAME_TEXT);
+        let frames: Vec<Value> = (1..=6).map(|seq| json!({"seq": seq, "from": place(2), "frame": longest})).collect();
+        let heard = json!({"v": 7, "places": [place(1), place(2)], "frames": frames});
+        let chosen = chosen(&heard, 0);
+        let bytes: usize = chosen.frames.iter().map(|(from, frame)| from.len() + frame.len()).sum();
+        assert!(!chosen.frames.is_empty() && chosen.frames.len() < 6 && bytes <= MOST_HEARD_BYTES, "{} frames, {bytes} bytes", chosen.frames.len());
+        assert_eq!(chosen.upto, chosen.frames.len() as u64);
+        // (Chosen where it lies: what is chosen is the relay's own text, not a copy of it.)
+        assert!(std::ptr::eq(chosen.frames[0].1.as_ptr(), heard["frames"][0]["frame"].as_str().unwrap().as_ptr()));
+        // The rest comes when asked for from there; and a frame that is not one is passed
+        // over and counted, so that it is not asked for again for ever.
+        let rest = super::chosen(&heard, chosen.upto);
+        assert_eq!(rest.frames.len(), chosen.frames.len().min(6 - chosen.frames.len()));
+        let odd = json!({"frames": [{"seq": 1, "from": "nobody", "frame": "x"}, {"seq": 2, "from": place(2), "frame": ""}, {"seq": 3, "from": place(2), "frame": "f"}, {"seq": 2, "from": place(2), "frame": "again"}]});
+        let chosen = super::chosen(&odd, 0);
+        assert_eq!((chosen.frames.len(), chosen.frames[0].1, chosen.upto, chosen.places.len()), (1, "f", 3, 0));
+        // More frames than one hand-over holds: the first so many, and the cursor at the last of them.
+        let many: Vec<Value> = (1..=200).map(|seq| json!({"seq": seq, "from": place(2), "frame": "f"})).collect();
+        let many = json!({"frames": many});
+        let chosen = super::chosen(&many, 0);
+        assert_eq!((chosen.frames.len(), chosen.upto), (MOST_FRAMES, MOST_FRAMES as u64));
     }
 
     #[test]

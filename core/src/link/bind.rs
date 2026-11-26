@@ -31,10 +31,12 @@
 //! relay, each send and each look-up of songs are requests, made by `super::look::look`,
 //! `super::relay::keep_place` and `super::relay::send` over the `Http` the phone's native
 //! side already gives this library, on threads that side owns. It is told to start them by
-//! [`Do::Look`], [`Do::Begin`], [`Do::Send`] and [`Do::Find`] ([`Came::native`]), and hands
-//! what they bring to the player's thread ([`Happened::Looked`], [`Happened::FromRelay`],
-//! [`Happened::Found`]). The secret never leaves Rust. The phone's copy of the library is
-//! made ready on whichever thread it is read on ([`Songs::of`]) and only put in place here.
+//! [`Do::Look`], [`Do::Begin`], [`Do::Send`] and [`Do::Find`] ([`Came::native`]), and puts
+//! what they bring where it waits for the player's thread ([`Inbox`]: [`Happened::Looked`],
+//! [`Happened::FromRelay`], [`Happened::Found`]), which works through it in
+//! [`Phone::turn`]. The secret never leaves Rust. The phone's copy of the library is
+//! made ready on whichever thread it is read on ([`Songs::of`]), waits in the same place,
+//! and is only put in place here.
 //!
 //! **A sign-out, or another account, replaces everything**: the device, the order of
 //! choices, the look-ups under way, the copy of the library. Nothing of the last sign-in's
@@ -42,8 +44,8 @@
 //! over, so that an answer still on its way to the last sign-in matches nothing in the next.)
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::collections::{HashSet, VecDeque};
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
@@ -54,7 +56,7 @@ use super::message::{At, Full, Handed, Why};
 use super::relay::FromRelay;
 use super::rule::{Carrying, Reservation, Rule, Waiting};
 use super::seen::Seen;
-use super::turn::{Entered, Kind, Turns};
+use super::turn::{Entered, Kind, MOST_KEPT, MOST_KEPT_BYTES, Turn, Turns};
 use super::view::{Press, View};
 use super::words::Here;
 use super::{DeviceId, Nonce};
@@ -186,12 +188,6 @@ pub enum Happened {
     FromRelay { session: u64, from: FromRelay },
     /// The songs the music server has, of those a command brought ([`Do::Find`]).
     Found { ticket: u64, songs: Vec<String> },
-    /// The phone's copy of the library changed, or was read for a new sign-in. `sign_in`
-    /// is the number of the sign-in it was read for: the one that was current when the
-    /// reading began ([`Phone::sign_in`]). A copy read for a sign-in that is over is
-    /// dropped, so that a worker still reading the last sign-in's library cannot give it
-    /// to the next, **whether or not the two are the same account**.
-    Library { sign_in: u64, songs: Arc<Songs> },
 }
 
 impl Happened {
@@ -207,17 +203,106 @@ impl Happened {
         }
     }
 
-    /// About how large it is, for the bound on what is kept while a call is under way.
+    /// How large it is, as it is held: for the bounds on what waits. Every text in it is
+    /// counted, with what a text costs to hold beside its characters.
     fn size(&self) -> usize {
-        let texts = |texts: &[String]| texts.iter().map(String::len).sum::<usize>();
-        64 + match self {
-            Happened::Event(Event::Add { ids, .. }) => texts(ids),
-            Happened::Event(Event::Play { ids, context, .. }) => texts(ids) + context.len(),
-            Happened::Event(_) | Happened::Looked { .. } | Happened::Library { .. } => 0,
-            Happened::FromRelay { from: FromRelay::Heard { places, frames }, .. } => texts(places) + frames.iter().map(|(from, frame)| from.len() + frame.len()).sum::<usize>(),
-            Happened::FromRelay { .. } => 0,
-            Happened::Found { songs, .. } => texts(songs),
+        const TEXT: usize = std::mem::size_of::<String>();
+        let texts = |texts: &[String]| texts.iter().map(|text| TEXT + text.len()).sum::<usize>();
+        std::mem::size_of::<Happened>()
+            + match self {
+                Happened::Event(Event::Add { ids, .. }) => texts(ids),
+                Happened::Event(Event::Play { ids, context, .. }) => texts(ids) + context.len(),
+                Happened::Event(Event::Tick { account: text, .. } | Event::Choose { place: text, .. } | Event::Pause { place: text } | Event::Named { name: text }) => text.len(),
+                Happened::Event(_) => 0,
+                Happened::Looked { looked: Looked::Secret { id, .. }, .. } => id.len(),
+                Happened::Looked { .. } => 0,
+                Happened::FromRelay { from: FromRelay::Heard { places, frames }, .. } => texts(places) + frames.iter().map(|(from, frame)| 2 * TEXT + from.len() + frame.len()).sum::<usize>(),
+                Happened::FromRelay { from: FromRelay::Entered { token, .. }, .. } => token.as_str().len(),
+                Happened::FromRelay { .. } => 0,
+                Happened::Found { songs, .. } => texts(songs),
+            }
+    }
+}
+
+/// **What the requests bring back, waiting for the player's thread.** The look, the stay
+/// at the relay and each look-up of songs run on threads of their own ([`Came::native`]);
+/// what they bring is put here, from whichever thread it is on, and the player's thread
+/// works through it in [`Phone::turn`]. It is the one place such things wait, and the
+/// one drain of it is there.
+///
+/// **It is bounded, by number ([`MOST_KEPT`]) and by size ([`MOST_KEPT_BYTES`], each
+/// thing counted at what it holds), and nothing is dropped at the bound.** What does not
+/// fit is handed back to the thread that brought it ([`Inbox::put`]), which keeps it,
+/// waits, and offers it again: the stay at the relay does that by itself
+/// (`super::relay::keep_place`: frames not taken are not counted as handed over). So
+/// what waits is this much, and one thing in the hand of each thread that brings.
+///
+/// **The phone's copy of the library does not wait in line.** There is one place for
+/// it, the newest sign-in's copy stays in it, and a copy read for an earlier sign-in
+/// cannot push a later one's out ([`Inbox::library`]).
+#[derive(Default)]
+pub struct Inbox {
+    waiting: Mutex<Brought>,
+}
+
+/// What is waiting in an [`Inbox`].
+#[derive(Default)]
+struct Brought {
+    things: VecDeque<(Happened, usize)>,
+    bytes: usize,
+    library: Option<(u64, Arc<Songs>)>,
+}
+
+impl Inbox {
+    fn waiting(&self) -> std::sync::MutexGuard<'_, Brought> {
+        self.waiting.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Something a request brought back, from any thread. **`Err` hands it back**: there
+    /// is no room for it just now, and whoever brought it offers it again in a while.
+    /// (Only what requests bring: something that happened on the phone is told on the
+    /// player's own thread, [`Phone::happened`], and is never taken here.)
+    pub fn put(&self, what: Happened) -> Result<(), Happened> {
+        let size = what.size();
+        let mut waiting = self.waiting();
+        if matches!(what, Happened::Event(_)) || waiting.things.len() >= MOST_KEPT || waiting.bytes.saturating_add(size) > MOST_KEPT_BYTES {
+            return Err(what);
         }
+        waiting.bytes += size;
+        waiting.things.push_back((what, size));
+        Ok(())
+    }
+
+    /// The phone's copy of the library, read for the sign-in with this number (the one
+    /// that was current when the reading began: [`Phone::sign_in`]), from any thread.
+    pub fn library(&self, sign_in: u64, songs: Arc<Songs>) {
+        let mut waiting = self.waiting();
+        // (A copy read for an earlier sign-in than the one whose copy is waiting is of a
+        // sign-in that is over: it is let go of here, and displaces nothing.)
+        if waiting.library.as_ref().is_none_or(|(held, _)| *held <= sign_in) {
+            waiting.library = Some((sign_in, songs));
+        }
+    }
+
+    /// Whether nothing is waiting.
+    pub fn is_empty(&self) -> bool {
+        let waiting = self.waiting();
+        waiting.things.is_empty() && waiting.library.is_none()
+    }
+
+    fn take(&self) -> Option<Happened> {
+        let mut waiting = self.waiting();
+        let (what, size) = waiting.things.pop_front()?;
+        waiting.bytes = waiting.bytes.saturating_sub(size);
+        Some(what)
+    }
+
+    fn take_library(&self) -> Option<(u64, Arc<Songs>)> {
+        self.waiting().library.take()
+    }
+
+    fn clear(&self) {
+        *self.waiting() = Brought::default();
     }
 }
 
@@ -479,9 +564,10 @@ pub struct Came {
     /// [`Do::Look`], [`Do::StopLook`], [`Do::Begin`], [`Do::Renew`], [`Do::End`],
     /// [`Do::Send`], [`Do::Find`], [`Do::Later`] and [`Do::Log`].
     pub native: Vec<Do>,
-    /// More arrived while this was decided than one call works through (a call hands over
-    /// what was waiting and a bounded number more: `super::turn`). The rest is first in
-    /// the next call: the app makes one now, with nothing new if it has nothing.
+    /// **More is waiting than this call worked through** (a call hands over what the
+    /// library had kept, and a bounded number of things more: `super::turn`): kept by the
+    /// library, or in the [`Inbox`] the call was given. The app makes another call now,
+    /// [`Phone::turn`], which needs nothing new to carry on.
     pub more: bool,
     /// The number of the sign-in the linking is for now ([`Phone::sign_in`]).
     pub sign_in: u64,
@@ -521,7 +607,8 @@ struct Inner {
 }
 
 /// The linking, for an app whose player and library are not in Rust. It belongs to the
-/// thread the player lives on, and is called from nowhere else.
+/// thread the player lives on, and is called from nowhere else. (What other threads bring
+/// waits in an [`Inbox`], which is theirs to put things in.)
 pub struct Phone {
     turns: Turns<Happened>,
     inner: RefCell<Inner>,
@@ -544,7 +631,6 @@ struct Call<'a> {
     theirs: &'a mut dyn PhonePlayer,
     turns: &'a Turns<Happened>,
     account: &'a RefCell<Option<String>>,
-    sign_in: &'a Cell<u64>,
 }
 
 impl Inner {
@@ -590,7 +676,6 @@ impl Inner {
         self.with(call, came, |device, env| device.stop(env));
         *self = self.afresh();
         *call.account.borrow_mut() = None;
-        call.sign_in.set(call.sign_in.get() + 1);
     }
 
     /// One thing that happened, decided.
@@ -608,12 +693,6 @@ impl Inner {
                 };
             }
             Happened::Found { ticket, songs } => return self.with(call, came, |device, env| device.found(ticket, songs, env)),
-            Happened::Library { sign_in, songs } => {
-                return match sign_in == call.sign_in.get() {
-                    true => self.library = songs,
-                    false => came.native.push(Do::Log("library: a copy read for a sign-in that is over, dropped".into())),
-                };
-            }
         };
         match event {
             Event::Tick { account, wanted } => {
@@ -706,20 +785,71 @@ impl Phone {
             }
         }
         let kind = what.kind(self.account.borrow().as_deref());
+        // The sign-in has another number from the moment it is said to be over, wherever
+        // that is said from: whatever the app begins next is the next sign-in's.
+        if kind == Kind::End {
+            self.sign_in.set(self.sign_in.get() + 1);
+        }
         let size = what.size();
-        let turn = match self.turns.enter(what, kind, size) {
-            Entered::Mine(turn) => turn,
-            Entered::Kept => return Answer::Kept,
-            Entered::PartOfIt => return Answer::PartOfIt,
-            Entered::Refused => return Answer::Refused,
-        };
+        match self.turns.enter(what, kind, size) {
+            Entered::Mine(turn) => self.run(turn, None, now_ms, today, random, player),
+            Entered::Kept => Answer::Kept,
+            Entered::PartOfIt => Answer::PartOfIt,
+            Entered::Refused => Answer::Refused,
+        }
+    }
+
+    /// **The one drain.** Works through what the library kept from the calls before, and
+    /// then what the requests have brought ([`Inbox`]): a bounded number of things, the
+    /// oldest first. With nothing new it carries on with what was kept. The app calls it
+    /// on the player's thread whenever something has been put in the inbox, and again
+    /// whenever an answer says there is more ([`Came::more`]): it has no loop of its own.
+    ///
+    /// [`Answer::Refused`] if it is called from inside a call (it never needs to be).
+    pub fn turn(&self, inbox: &Inbox, now_ms: u64, today: u64, random: &mut dyn FnMut(&mut [u8]) -> bool, player: &mut dyn PhonePlayer) -> Answer {
+        if self.off.get() {
+            // (Off after a fault: what the requests still bring is nobody's.)
+            inbox.clear();
+            return Answer::Came(Came { sign_in: self.sign_in.get(), ..Came::default() });
+        }
+        match self.turns.carry_on() {
+            Some(turn) => self.run(turn, Some(inbox), now_ms, today, random, player),
+            None => Answer::Refused,
+        }
+    }
+
+    /// A turn, worked through: what the library kept first, and then, if the turn was
+    /// given an inbox, what is waiting there, up to the turn's bound.
+    fn run(&self, turn: Turn<'_, Happened>, inbox: Option<&Inbox>, now_ms: u64, today: u64, random: &mut dyn FnMut(&mut [u8]) -> bool, player: &mut dyn PhonePlayer) -> Answer {
         let decided = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut turn = turn;
             // (The turn is this call's, so nothing else is inside.)
             let mut inner = self.inner.try_borrow_mut().ok()?;
-            let mut call = Call { now_ms, today, random, theirs: player, turns: &self.turns, account: &self.account, sign_in: &self.sign_in };
+            let mut call = Call { now_ms, today, random, theirs: player, turns: &self.turns, account: &self.account };
             let mut came = Came::default();
-            while let Some(what) = turn.next() {
+            loop {
+                let what = match (turn.next(), inbox) {
+                    (Some(what), _) => what,
+                    // (More is kept than this turn hands over, or nothing was brought.)
+                    (None, _) if turn.left() > 0 => break,
+                    (None, None) => break,
+                    // Everything kept has been decided, the end of a sign-in among it if
+                    // there was one: so the copy of the library that is waiting is put in
+                    // place for the sign-in there now is, and not for one that was about
+                    // to be replaced.
+                    (None, Some(inbox)) => {
+                        if let Some((sign_in, songs)) = inbox.take_library() {
+                            match sign_in == self.sign_in.get() {
+                                true => inner.library = songs,
+                                false => came.native.push(Do::Log("library: a copy read for a sign-in that is over, dropped".into())),
+                            }
+                        }
+                        match turn.spend().then(|| inbox.take()).flatten() {
+                            Some(what) => what,
+                            None => break,
+                        }
+                    }
+                };
                 inner.one(what, &mut call, &mut came);
                 // The sign-in ended while this was being decided. **All the call had come
                 // to is of the sign-in that is over, and is dropped**: what came of this,
@@ -732,7 +862,7 @@ impl Phone {
                     came.native.push(Do::Log("the sign-in ended while something was being decided: what the call had come to is dropped".into()));
                 }
             }
-            came.more = turn.left() > 0;
+            came.more = turn.left() > 0 || inbox.is_some_and(|inbox| !inbox.is_empty());
             came.sign_in = self.sign_in.get();
             Some(came)
         }));
@@ -744,10 +874,12 @@ impl Phone {
     }
 
     /// **The number of the sign-in the linking is for now**: a new one each time a
-    /// sign-in ends (a sign-out, another account, a fault). It is in every answer
-    /// ([`Came::sign_in`]). What an app reads for a sign-in away from the player's thread
-    /// (its copy of the library) is handed over with the number that was current when the
-    /// reading began ([`Happened::Library`]).
+    /// sign-in ends (a sign-out, another account, a fault), **from the moment the app
+    /// says so**, wherever it says so from. It is in every answer ([`Came::sign_in`]).
+    /// What an app reads for a sign-in away from the player's thread (its copy of the
+    /// library) is handed over with the number that was current when the reading began
+    /// ([`Inbox::library`]): so an app that says the sign-in is over and then begins to
+    /// read for the next one asks for the number in between.
     pub fn sign_in(&self) -> u64 {
         self.sign_in.get()
     }
@@ -803,19 +935,6 @@ impl Phone {
         came.native.push(Do::Log(format!("linking: it stopped unexpectedly ({}). Everything it held was let go of, and linking is off here until the next sign-in or start.", super::text::cut(&said, 200))));
         came
     }
-
-    /// The same for an [`Event`] as JSON, giving the [`Act`]s as a JSON list and, apart,
-    /// what the Rust side does itself. An event that cannot be read does nothing and says
-    /// nothing; one that is kept or dropped says nothing here; `None` is [`Answer::Refused`].
-    pub fn handle(&self, event: &str, now_ms: u64, today: u64, random: &mut dyn FnMut(&mut [u8]) -> bool, player: &mut dyn PhonePlayer) -> Option<(String, Vec<Do>)> {
-        let nothing = || Some(("[]".to_string(), Vec::new()));
-        let Ok(event) = serde_json::from_str::<Event>(event) else { return nothing() };
-        match self.happened(Happened::Event(event), now_ms, today, random, player) {
-            Answer::Came(came) => Some((serde_json::to_string(&came.acts).unwrap_or_else(|_| "[]".to_string()), came.native)),
-            Answer::Kept | Answer::PartOfIt => nothing(),
-            Answer::Refused => None,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -833,6 +952,35 @@ mod tests {
                 *byte = n.to_le_bytes()[at % 8] ^ (at as u8).wrapping_mul(29);
             }
             true
+        }
+    }
+
+    /// As the phone's app calls: an [`Event`] as JSON, giving the [`Act`]s as a JSON list
+    /// and, apart, what the Rust side does itself. An event that cannot be read does
+    /// nothing and says nothing; one that is kept or dropped says nothing here; `None` is
+    /// [`Answer::Refused`].
+    trait AsTheAppCalls {
+        fn handle(&self, event: &str, now_ms: u64, today: u64, random: &mut dyn FnMut(&mut [u8]) -> bool, player: &mut dyn PhonePlayer) -> Option<(String, Vec<Do>)>;
+        /// Puts a copy of the library, read for this sign-in, where such copies wait, and
+        /// takes a turn.
+        fn library(&self, sign_in: u64, songs: Arc<Songs>, now_ms: u64, n: &mut u64, player: &mut dyn PhonePlayer) -> Came;
+    }
+
+    impl AsTheAppCalls for Phone {
+        fn handle(&self, event: &str, now_ms: u64, today: u64, random: &mut dyn FnMut(&mut [u8]) -> bool, player: &mut dyn PhonePlayer) -> Option<(String, Vec<Do>)> {
+            let nothing = || Some(("[]".to_string(), Vec::new()));
+            let Ok(event) = serde_json::from_str::<Event>(event) else { return nothing() };
+            match self.happened(Happened::Event(event), now_ms, today, random, player) {
+                Answer::Came(came) => Some((serde_json::to_string(&came.acts).unwrap_or_else(|_| "[]".to_string()), came.native)),
+                Answer::Kept | Answer::PartOfIt => nothing(),
+                Answer::Refused => None,
+            }
+        }
+
+        fn library(&self, sign_in: u64, songs: Arc<Songs>, now_ms: u64, n: &mut u64, player: &mut dyn PhonePlayer) -> Came {
+            let inbox = Inbox::default();
+            inbox.library(sign_in, songs);
+            came(self.turn(&inbox, now_ms, 100, &mut random(n), player))
         }
     }
 
@@ -1128,7 +1276,7 @@ mod tests {
         let Some(Do::Begin { session, .. }) = begun.native.iter().find(|ask| matches!(ask, Do::Begin { .. })).cloned() else { panic!("no session: {begun:?}") };
         let place = [5; 16];
         phone.happened(Happened::FromRelay { session, from: FromRelay::Entered { place, token: "a-token".into() } }, 1_200, 100, &mut random(n), &mut player);
-        phone.happened(Happened::Library { sign_in: 1, songs: Songs::of(all) }, 1_300, 100, &mut random(n), &mut player);
+        phone.library(1, Songs::of(all), 1_300, n, &mut player);
         (phone, player, session, place)
     }
 
@@ -1404,7 +1552,7 @@ mod tests {
                 let Some(Do::Begin { session, .. }) = begun.native.iter().find(|ask| matches!(ask, Do::Begin { .. })).cloned() else { panic!("no session") };
                 phone.happened(Happened::FromRelay { session, from: FromRelay::Entered { place: places[who], token: "a-token".into() } }, 1_000, 100, &mut random(&mut n), player);
                 let all = ["a0", "a1", "a2", "s0", "s1", "s2", "s3"].map(String::from);
-                phone.happened(Happened::Library { sign_in: 1, songs: Songs::of(all) }, 1_000, 100, &mut random(&mut n), player);
+                phone.library(1, Songs::of(all), 1_000, &mut n, player);
                 sessions[who] = session;
             }
             let mut pair = Pair { phones, players, sessions, places, acts: [Vec::new(), Vec::new()], now: 1_000, n };
@@ -1724,13 +1872,13 @@ mod tests {
         phone.handle(TICK, 2_100, 100, &mut random(&mut n), &mut player);
         assert_eq!((phone.sign_in(), has(&phone)), (2, 0));
         // The old worker finishes, late.
-        let late = came(phone.happened(Happened::Library { sign_in: before, songs: Songs::of(ids(&[0, 1, 2])) }, 2_200, 100, &mut random(&mut n), &mut player));
+        let late = phone.library(before, Songs::of(ids(&[0, 1, 2])), 2_200, &mut n, &mut player);
         assert!(has(&phone) == 0 && logged(&late.native, "library: a copy read for a sign-in that is over, dropped"), "{late:?}");
         // This sign-in's own copy is put in place, before a tick or after one.
-        phone.happened(Happened::Library { sign_in: 2, songs: Songs::of(ids(&[0, 1])) }, 2_300, 100, &mut random(&mut n), &mut player);
+        phone.library(2, Songs::of(ids(&[0, 1])), 2_300, &mut n, &mut player);
         assert_eq!(has(&phone), 2);
         phone.handle(r#"{"event":"stop"}"#, 2_400, 100, &mut random(&mut n), &mut player);
-        phone.happened(Happened::Library { sign_in: 3, songs: Songs::of(ids(&[0, 1, 2, 3])) }, 2_500, 100, &mut random(&mut n), &mut player);
+        phone.library(3, Songs::of(ids(&[0, 1, 2, 3])), 2_500, &mut n, &mut player);
         assert_eq!(has(&phone), 4);
     }
 
@@ -1823,6 +1971,140 @@ mod tests {
         assert_eq!((next.more, order(&phone, 2_100).0), (false, 1 + MOST_MORE as u64 + 6));
     }
 
+    /// The songs a look-up found, as its thread hands them over.
+    fn found(ticket: u64) -> Happened {
+        Happened::Found { ticket, songs: vec!["s1".into()] }
+    }
+
+    /// **The one drain.** What a call leaves for the next is carried on with by a turn
+    /// that brings nothing new: the app does not have to wait for something else to
+    /// happen, and has no loop of its own to get wrong.
+    #[test]
+    fn a_turn_with_nothing_new_carries_on_with_what_the_library_kept() {
+        use super::super::turn::MOST_MORE;
+        let mut n = 0;
+        let (phone, player, session, place) = phone(&mut n);
+        let mut player: Mock = player;
+        let told = (0..2 * MOST_MORE + 6).map(|_| Happened::Event(Event::Changed { who: Who::Nobody, what: What::Playing })).collect();
+        player.tells(&phone, "brief", told);
+        let first = hear(&phone, &mut player, session, &place, vec![from_pc(1, &place, Ask::Look(Want::Brief))], 2_000, &mut n);
+        assert_eq!((first.more, order(&phone, 2_000).0), (true, 1 + MOST_MORE as u64));
+        // Nothing has been brought: the inbox is empty. The turn carries on, a bounded
+        // number of things at a time, and says when there is no more.
+        let inbox = Inbox::default();
+        let next = came(phone.turn(&inbox, 2_100, 100, &mut random(&mut n), &mut player));
+        assert_eq!((next.more, order(&phone, 2_100).0), (true, 1 + 2 * MOST_MORE as u64));
+        let last = came(phone.turn(&inbox, 2_200, 100, &mut random(&mut n), &mut player));
+        assert_eq!((last.more, order(&phone, 2_200).0), (false, 1 + 2 * MOST_MORE as u64 + 6));
+        let none = came(phone.turn(&inbox, 2_300, 100, &mut random(&mut n), &mut player));
+        assert_eq!((none.more, none.sign_in, order(&phone, 2_300).0), (false, 1, 1 + 2 * MOST_MORE as u64 + 6));
+    }
+
+    /// What the requests bring waits in one bounded place, counted at its real size, and
+    /// is worked through a bounded number of things at a turn, the oldest first. What
+    /// does not fit is handed back to whoever brought it: nothing is dropped.
+    #[test]
+    fn what_the_requests_bring_waits_in_a_bounded_place_and_is_worked_through_a_turn_at_a_time() {
+        use super::super::turn::MOST_MORE;
+        let mut n = 0;
+        let (phone, mut player, session, place) = phone(&mut n);
+        let inbox = Inbox::default();
+        // By number.
+        for ticket in 0..MOST_KEPT as u64 {
+            assert!(inbox.put(found(ticket)).is_ok(), "{ticket}");
+        }
+        let Err(Happened::Found { ticket: 7_000, .. }) = inbox.put(found(7_000)) else { panic!("one more than may wait was taken") };
+        // A turn takes so many, and says there is more; when room has been made, what
+        // was handed back is taken.
+        let first = came(phone.turn(&inbox, 2_000, 100, &mut random(&mut n), &mut player));
+        assert_eq!((first.more, inbox.waiting().things.len()), (true, MOST_KEPT - MOST_MORE));
+        assert!(inbox.put(found(7_000)).is_ok());
+        let mut turns = 1;
+        loop {
+            turns += 1;
+            if !came(phone.turn(&inbox, 2_000, 100, &mut random(&mut n), &mut player)).more {
+                break;
+            }
+        }
+        assert_eq!((turns, inbox.is_empty(), inbox.waiting().bytes), ((MOST_KEPT + 1).div_ceil(MOST_MORE), true, 0));
+        // By size: each thing is counted at what it holds.
+        let large = |seq: u8| {
+            let frame = "x".repeat(300_000);
+            Happened::FromRelay { session, from: FromRelay::Heard { places: vec![text::place(&place)], frames: vec![(text::place(&[seq; 16]), frame)] } }
+        };
+        assert!(inbox.put(large(1)).is_ok());
+        assert!(inbox.waiting().bytes > 300_000 && inbox.waiting().bytes < 301_000, "{}", inbox.waiting().bytes);
+        assert!(inbox.put(large(2)).is_ok() && inbox.put(large(3)).is_ok() && inbox.put(large(4)).is_err());
+        // (There is room still for what is small.)
+        assert!(inbox.put(found(1)).is_ok() && inbox.waiting().bytes <= MOST_KEPT_BYTES);
+        // Something that happened on the phone is not brought by a request, and is not taken.
+        inbox.clear();
+        assert!(inbox.put(Happened::Event(Event::Stop)).is_err());
+        // In the order it was brought: two commands are each decided against the player
+        // as the one before left it.
+        for (n, command_sent, generation) in [(1, Command::Pause, 1), (2, Command::Play, 2)] {
+            let from = FromRelay::Heard { places: vec![text::place(&place), text::place(&[1; 16])], frames: vec![command(n, &place, command_sent, generation)] };
+            assert!(inbox.put(Happened::FromRelay { session, from }).is_ok());
+        }
+        let both = came(phone.turn(&inbox, 3_000, 100, &mut random(&mut n), &mut player));
+        assert_eq!((sends(&both.native), both.more, order(&phone, 3_000)), (2, false, (3, Some([2; 24]), false)));
+    }
+
+    /// The phone's copy of the library does not wait in line, and a copy read for an
+    /// earlier sign-in cannot push out one read for a later sign-in, whichever of the
+    /// two threads gets there first.
+    #[test]
+    fn a_stale_copy_of_the_library_cannot_displace_a_newer_one() {
+        let mut n = 0;
+        let (phone, mut player, ..) = phone(&mut n);
+        let has = |phone: &Phone| phone.inner.borrow().library.0.len();
+        phone.handle(r#"{"event":"stop"}"#, 2_000, 100, &mut random(&mut n), &mut player);
+        assert_eq!((phone.sign_in(), has(&phone)), (2, 0));
+        let inbox = Inbox::default();
+        // This sign-in's copy is waiting when the old worker finishes.
+        inbox.library(2, Songs::of(ids(&[0, 1])));
+        inbox.library(1, Songs::of(ids(&[0, 1, 2, 3, 4])));
+        phone.turn(&inbox, 2_100, 100, &mut random(&mut n), &mut player);
+        assert_eq!(has(&phone), 2);
+        // The other way about: the old worker's is waiting, and this sign-in's replaces it.
+        inbox.library(1, Songs::of(ids(&[0, 1, 2, 3, 4])));
+        inbox.library(2, Songs::of(ids(&[0, 1, 2])));
+        phone.turn(&inbox, 2_200, 100, &mut random(&mut n), &mut player);
+        assert_eq!(has(&phone), 3);
+        // Alone, the old worker's is dropped when it is looked at, and said.
+        inbox.library(1, Songs::of(ids(&[0])));
+        let late = came(phone.turn(&inbox, 2_300, 100, &mut random(&mut n), &mut player));
+        assert!(has(&phone) == 3 && logged(&late.native, "library: a copy read for a sign-in that is over, dropped"), "{late:?}");
+        // The sign-in has its next number from the moment it is said to be over, even
+        // from inside a call: what the app begins then is tagged for the next sign-in,
+        // and is not put in place before the end has been applied.
+        // (As a call leaves it that had handed over all it may when the app said so: the
+        // end is kept, first for the next turn.)
+        let running = phone.turns.carry_on().expect("nothing is running");
+        assert_eq!(phone.happened(Happened::Event(Event::Stop), 2_400, 100, &mut random(&mut n), &mut player), Answer::Kept);
+        drop(running);
+        assert_eq!((phone.sign_in(), has(&phone)), (3, 3));
+        inbox.library(phone.sign_in(), Songs::of(ids(&[0, 1, 2, 3])));
+        phone.turn(&inbox, 2_500, 100, &mut random(&mut n), &mut player);
+        assert_eq!(has(&phone), 4);
+    }
+
+    /// While linking is off after a fault, what the requests still bring is let go of
+    /// unread, and nothing waits.
+    #[test]
+    fn while_linking_is_off_what_the_requests_bring_is_let_go_of() {
+        let mut n = 0;
+        let (phone, mut player, session, place) = phone(&mut n);
+        player.wrong = Some(Wrong::Panics);
+        hear(&phone, &mut player, session, &place, vec![from_pc(1, &place, Ask::Look(Want::Brief))], 2_100, &mut n);
+        let inbox = Inbox::default();
+        assert!(inbox.put(found(1)).is_ok());
+        inbox.library(phone.sign_in(), Songs::of(ids(&[0])));
+        let nothing = came(phone.turn(&inbox, 2_200, 100, &mut random(&mut n), &mut player));
+        assert!(nothing.acts.is_empty() && nothing.native.is_empty() && !nothing.more && inbox.is_empty(), "{nothing:?}");
+        assert_eq!(phone.inner.borrow().library.0.len(), 0);
+    }
+
     /// What a frame costs the player's thread: opened, decided, answered. Not a test of
     /// anything: it prints. Run it as the phone's library is built (`native/Cargo.toml`
     /// there: for size, with everything in one unit):
@@ -1841,7 +2123,7 @@ mod tests {
         // A queue of five hundred songs in the player, and a library of fifty thousand.
         player.songs = (0..500).map(|n| format!("song-{n:05}-0123456789abcdef")).collect();
         let library: Vec<String> = (0..50_000).map(|n| format!("song-{n:05}-0123456789abcdef")).collect();
-        phone.happened(Happened::Library { sign_in: 1, songs: Songs::of(library.clone()) }, 1_400, 100, &mut random(&mut n), &mut player);
+        phone.library(1, Songs::of(library.clone()), 1_400, &mut n, &mut player);
         let nonce = |at: usize| {
             let mut nonce = [0u8; 24];
             nonce[..8].copy_from_slice(&(at as u64 + 1_000).to_le_bytes());
@@ -1899,7 +2181,7 @@ mod tests {
         let ready: Vec<Arc<Songs>> = (0..20).map(|_| Songs::of(library.clone())).collect();
         let began = Instant::now();
         for songs in ready {
-            phone.happened(Happened::Library { sign_in: 1, songs }, now, 100, &mut random(&mut n), &mut player);
+            phone.library(1, songs, now, &mut n, &mut player);
         }
         eprintln!("{:<58} {:>7.1} microseconds", "a library of fifty thousand songs put in place", began.elapsed().as_secs_f64() * 1e6 / 20.0);
     }

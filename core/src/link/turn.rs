@@ -29,10 +29,12 @@
 //!
 //! **And nothing is kept, or worked through, without end.** What is kept for a turn is
 //! bounded by how many things ([`MOST_KEPT`]) and by how large they are together
-//! ([`MOST_KEPT_BYTES`]); what does not fit is refused. A turn hands over what was waiting
-//! when it began and a bounded number of things that arrive while it runs ([`MOST_MORE`]):
-//! a listener that feeds the turn as fast as the turn runs does not keep it running. What
-//! is left is first in the next turn ([`Turn::left`]).
+//! ([`MOST_KEPT_BYTES`]); what does not fit is refused, and so is anything larger than
+//! that bound by itself, wherever it arrives. A turn hands over what was waiting when it
+//! began and a bounded number of things more ([`MOST_MORE`]): a listener that feeds the
+//! turn as fast as the turn runs does not keep it running, and neither does an app that
+//! says the sign-in is over each time it is told of one. What is left is first in the
+//! next turn ([`Turn::left`]), which can be taken with nothing new ([`Turns::carry_on`]).
 //!
 //! [`Turns`] is that rule, and nothing else: it holds no player and decides nothing. An app
 //! (through `super::bind`) enters with each thing that happens ([`Turns::enter`]); if the
@@ -64,8 +66,8 @@ pub const MOST_KEPT: usize = 256;
 /// The most kept for one turn, by size: a megabyte, which is three of the longest frames
 /// there can be.
 pub const MOST_KEPT_BYTES: usize = 1 << 20;
-/// The most a turn hands over of what arrived while it ran. What was waiting when it
-/// began is handed over whatever its number, which [`MOST_KEPT`] bounds.
+/// The most a turn hands over beyond what was waiting when something began it; and the
+/// most a turn taken with nothing new hands over at all.
 pub const MOST_MORE: usize = 64;
 
 struct State<T> {
@@ -126,19 +128,26 @@ impl<T> Turns<T> {
             state.kept.clear();
             state.bytes = 0;
         }
+        // (Counted at its size wherever it arrives: what is larger than all that may wait
+        // is not taken, even to begin a turn with.)
+        if kind != Kind::End && bytes > MOST_KEPT_BYTES {
+            return Entered::Refused;
+        }
         if !state.inside {
             state.inside = true;
             state.bytes = state.bytes.saturating_add(bytes);
             state.kept.push_back((what, bytes));
+            // (What was left waiting is handed over first, whatever its number, so that
+            // this reaches what it was entered with: a press is answered in its own call.)
             state.budget = state.kept.len().saturating_add(MOST_MORE);
             return Entered::Mine(Turn { turns: self });
         }
         match kind {
             Kind::End => {
-                // It is next, whatever the turn has handed over already; and the turn is
-                // told now.
+                // It is next, and the turn is told now. (It does not lengthen the turn: if
+                // the turn has handed over all it may, the end is first in the next one,
+                // with nothing in front of it.)
                 state.ended = true;
-                state.budget = state.budget.max(1);
             }
             Kind::Change if state.changing > 0 => return Entered::PartOfIt,
             Kind::Question => return Entered::Refused,
@@ -156,6 +165,18 @@ impl<T> Turns<T> {
         let mut state = self.state.borrow_mut();
         state.changing = state.changing.saturating_add(1);
         Changing { turns: self }
+    }
+
+    /// A turn with nothing new, to carry on with what the one before left; none, if a
+    /// turn is running.
+    pub fn carry_on(&self) -> Option<Turn<'_, T>> {
+        let mut state = self.state.borrow_mut();
+        if state.inside {
+            return None;
+        }
+        state.inside = true;
+        state.budget = MOST_MORE;
+        Some(Turn { turns: self })
     }
 
     /// Drops whatever is kept, unread: for when everything it was kept for has been
@@ -195,6 +216,15 @@ impl<T> Turn<'_, T> {
     /// came of that thing is then nobody's. Asked once for each: asking forgets it.
     pub fn overtaken(&mut self) -> bool {
         std::mem::take(&mut self.turns.state.borrow_mut().ended)
+    }
+
+    /// Takes one of the things this turn may still hand over, for something that comes
+    /// from elsewhere than what was kept. Says whether there was one to take.
+    pub fn spend(&mut self) -> bool {
+        let mut state = self.turns.state.borrow_mut();
+        let any = state.budget > 0;
+        state.budget = state.budget.saturating_sub(1);
+        any
     }
 
     /// How many things are left for the next turn: the caller comes back for them.
@@ -331,8 +361,7 @@ mod tests {
     #[test]
     fn what_is_kept_for_a_turn_is_bounded_by_its_size() {
         let turns = Turns::default();
-        // (However large what begins a turn is, the turn is its own.)
-        let mut turn = mine(turns.enter("a hand-over of frames", Kind::News, 2 * MOST_KEPT_BYTES));
+        let mut turn = mine(turns.enter("a hand-over of frames", Kind::News, MOST_KEPT_BYTES));
         assert_eq!(turn.next(), Some("a hand-over of frames"));
         assert_eq!(outcome(&turns.enter("half of what may wait", Kind::News, MOST_KEPT_BYTES / 2)), "kept");
         assert_eq!(outcome(&turns.enter("the other half", Kind::News, MOST_KEPT_BYTES / 2)), "kept");
@@ -405,13 +434,66 @@ mod tests {
         drop(turn);
         let mut turn = mine(turns.enter("another account", Kind::End, 1));
         assert_eq!((turn.overtaken(), turn.next(), turn.next()), (false, Some("another account"), None));
-        // Even a turn that has handed over all it may hands over the end.
-        drop(turn);
+    }
+
+    /// A turn that has handed over all it may does not go on for the end of a sign-in
+    /// either (an app that says "another account" each time it is told of one would keep
+    /// it running for ever). The end waits, alone and first, for the next turn: nothing
+    /// that arrives before then can get in front of it.
+    #[test]
+    fn the_end_of_the_sign_in_does_not_lengthen_a_turn_and_is_first_in_the_next() {
+        let turns = Turns::default();
         let mut turn = mine(turns.enter("a change", Kind::Change, 1));
         while turn.next().is_some() {
             turns.enter("and another", Kind::Change, 1);
         }
-        assert_eq!(outcome(&turns.enter("signed out", Kind::End, 1)), "kept");
-        assert_eq!((turn.next(), turn.left()), (Some("signed out"), 0));
+        for _ in 0..3 {
+            assert_eq!(outcome(&turns.enter("signed out", Kind::End, 1)), "kept");
+            // (The turn is told, and has no more to hand over.)
+            assert!(turns.ended() && turn.overtaken());
+            assert_eq!((turn.next(), turn.left()), (None, 1));
+        }
+        drop(turn);
+        let mut turn = mine(turns.enter("a press", Kind::Question, 1));
+        assert_eq!((turn.next(), turn.next(), turn.next()), (Some("signed out"), Some("a press"), None));
+    }
+
+    /// A turn can be taken with nothing new, to carry on with what the one before left:
+    /// it hands over a bounded number of things, and none if a turn is already running.
+    #[test]
+    fn a_turn_with_nothing_new_carries_on_with_what_was_left() {
+        let turns = Turns::default();
+        let turn = mine(turns.enter("a frame", Kind::News, 1));
+        for _ in 0..MOST_MORE + 10 {
+            turns.enter("a change", Kind::Change, 1);
+        }
+        assert!(turns.carry_on().is_none(), "a turn is running");
+        drop(turn);
+        let mut turn = turns.carry_on().expect("nothing is running");
+        let mut handed = 0;
+        while turn.next().is_some() {
+            handed += 1;
+        }
+        // (The frame the first turn never handed over is among them.)
+        assert_eq!((handed, turn.left()), (MOST_MORE, 11));
+        // What a turn may still hand over can be spent on things that come from elsewhere.
+        drop(turn);
+        let mut turn = turns.carry_on().expect("nothing is running");
+        let spent = (0..MOST_MORE + 5).filter(|_| turn.spend()).count();
+        assert_eq!((spent, turn.next()), (MOST_MORE, None));
+    }
+
+    /// Whatever begins a turn is counted at its size too: something larger than all that
+    /// may wait is not taken at all. (The end of a sign-in is, whatever its size.)
+    #[test]
+    fn what_begins_a_turn_is_held_to_the_bound_on_size_as_well() {
+        let turns = Turns::default();
+        assert_eq!(outcome(&turns.enter("more than may wait", Kind::News, MOST_KEPT_BYTES + 1)), "refused");
+        // (Nothing was begun by it.)
+        let mut turn = mine(turns.enter("as much as may wait", Kind::News, MOST_KEPT_BYTES));
+        assert_eq!((turn.next(), turn.next()), (Some("as much as may wait"), None));
+        drop(turn);
+        let mut turn = mine(turns.enter("signed out", Kind::End, MOST_KEPT_BYTES + 1));
+        assert_eq!(turn.next(), Some("signed out"));
     }
 }
