@@ -194,7 +194,7 @@ mod tests {
         // A batch, written down whole, is taken up.
         std::fs::write(&place.path, BATCH).unwrap();
         assert_eq!(place.take_up(read), "");
-        assert!(job.unfinished());
+        assert!(job.unfinished(""));
         // What 0.40.10 could leave after a power cut: an empty file, or the batch cut short;
         // twice, and each kept under a name of its own, which the page names.
         std::fs::write(&place.path, "").unwrap();
@@ -289,12 +289,18 @@ mod tests {
 /// Hands over albums to ask for. If a batch is still under way they join it; otherwise they
 /// replace what's left of the last one.
 pub fn start(wants: Vec<Want>) {
-    JOB.start(wants)
+    JOB.start(&here(), wants)
 }
 
-/// Whether there's a batch with something still to do.
+/// Whether there's a batch with something still to do with the Lidarr set up now. A way back
+/// written for another Lidarr isn't: it is left for that one (`nexus_core::bulk::Job::unfinished`).
 pub fn unfinished() -> bool {
-    JOB.unfinished()
+    JOB.unfinished(&here())
+}
+
+/// The address of the Lidarr set up now, as its way back is written under (empty if none).
+fn here() -> String {
+    crate::lidarr::current().map(|lidarr| lidarr.address().to_string()).unwrap_or_default()
 }
 
 pub fn running() -> bool {
