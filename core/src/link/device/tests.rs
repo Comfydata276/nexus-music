@@ -1464,6 +1464,40 @@ fn a_device_whose_sound_never_starts_pauses_and_says_it_could_not() {
     assert_eq!(world.copies[B].player.queue.len(), 8);
 }
 
+/// A move gives up waiting for the sound of the queue it put in, and stops this device:
+/// **that queue, and no other.** If another whole queue is in the player by then (put
+/// there by something that is not a choice in the order: a queue brought back at a
+/// start, say), it is not the one that failed to sound, and it is left playing.
+#[test]
+fn a_move_that_gives_up_does_not_stop_a_queue_it_was_not_waiting_on() {
+    /// Another whole queue, sounding, put in behind the order's back.
+    fn another_queue(player: &mut Fake) {
+        player.queue = vec!["s7".into()];
+        player.cursor = 0;
+        player.queue_number += 1;
+        player.stream = true;
+        player.play(true);
+    }
+    // A queue sent to B never sounds there, and B holds another queue when it gives up.
+    let mut world = giving(|world| world.copies[B].player.stream = false);
+    world.pass(2_000);
+    another_queue(&mut world.copies[B].player);
+    let generation = world.copies[B].player.rule.generation();
+    world.pass(20_000);
+    let b = &world.copies[B].player;
+    assert_eq!((b.playing, b.rule.generation(), b.rule.busy(world.now)), (true, generation, false), "{:?}", world.copies[B].log);
+    assert_eq!(said(&world), "Copy B couldn't play that. Still playing here.");
+    // "Play here" on A never sounds, and A holds another queue when it gives up.
+    let mut world = taking(|world| world.copies[A].player.stream = false);
+    world.pass(2_000);
+    another_queue(&mut world.copies[A].player);
+    let generation = world.copies[A].player.rule.generation();
+    world.pass(29_000);
+    let a = &world.copies[A].player;
+    assert_eq!((a.playing, a.rule.generation(), world.copies[B].player.playing), (true, generation, true), "{:?}", world.copies[A].log);
+    assert_eq!(said(&world), "This PC didn't start in time, so Copy B was left playing.");
+}
+
 /// "Play here" on a device whose player does not take the queue (the app could not build
 /// it, the player refused it). What was in its player before goes on sounding. That is not
 /// the sound of the queue that was taken: nothing is claimed, and the other device is not

@@ -456,9 +456,12 @@ pub struct Controller {
     /// When the queue last changed here (or, for one taken from another device, there), and
     /// a fingerprint of it as last saved, to tell a real change from a save of the same thing.
     pub queue_stamp: Cell<i64>,
-    /// How many times a queue has been put in the player whole (`replace_queue`): the
-    /// number of the queue that is in it now, for a move of music that waits for the
-    /// sound of the queue it put in and of no other (`link`).
+    /// The number of the queue that is in the player now, for a move of music that waits
+    /// for the sound of the queue it put in and of no other (`link`). **It moves at one
+    /// point, `Controller::whole_queue`, each time a whole queue is in the player in
+    /// place of what was there**: something chosen to play, a queue from another device
+    /// or the server, the queue brought back at a start, the player emptied. Changing a
+    /// queue in place (adding, removing, moving, shuffling, following its list) keeps it.
     pub queue_number: Cell<u64>,
     pub queue_sig: Cell<u64>,
     /// The shape (see `config::queue_shape`) of the queue as last written to disk.

@@ -1171,8 +1171,12 @@ impl Device {
                 }
                 Some(Adopted::Changed) => (false, Some(Why::Changed)),
                 Some(Adopted::Failed) => {
-                    // No sound came: it stops trying, and says so.
-                    env.player.pause();
+                    // No sound came: it stops trying, and says so. (The queue that was
+                    // waited on, if it is the one in the player still: another queue, put
+                    // in since, is not the one that failed to sound and is left alone.)
+                    if env.player.queue() == adoption.queue {
+                        env.player.pause();
+                    }
                     (false, Some(Why::Cannot))
                 }
                 None => (false, None),
@@ -1196,7 +1200,7 @@ impl Device {
                 self.let_go_into(out);
                 self.say(words::queue_never_came(&name), out);
             }
-            Some((Take::Loaded { place, name, waiting, .. }, Some(took))) => {
+            Some((Take::Loaded { place, name, waiting, queue, .. }, Some(took))) => {
                 // However it ends, this device is no longer in the middle of it.
                 env.player.done(waiting);
                 match took {
@@ -1233,8 +1237,11 @@ impl Device {
                     Took::ThisChanged => self.say(words::chosen_here_meanwhile(&name), out),
                     Took::NotStarted => {
                         // It is stopped, not left to start sounding later with the other
-                        // still playing: the app's own doing.
-                        env.player.pause();
+                        // still playing: the app's own doing. (The queue that was taken,
+                        // if it is the one in the player still.)
+                        if env.player.queue() == queue {
+                            env.player.pause();
+                        }
                         self.say(words::did_not_start_here(&name, env.me.here), out);
                     }
                 }

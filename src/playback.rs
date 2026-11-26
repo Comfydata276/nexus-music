@@ -396,6 +396,7 @@ impl Controller {
                 self.looked_up(waiting);
             }
         }
+        self.whole_queue();
         self.save_settings();
         self.start_current(0.0);
         self.sync_transport();
@@ -875,6 +876,7 @@ impl Controller {
             pb.autoplay_loading = false;
             pb.autoplay_resume = false;
         }
+        self.whole_queue();
         self.engine.set_playing(false);
         self.engine.stop();
         self.track_changed();
@@ -1022,6 +1024,7 @@ impl Controller {
                 pb.resume_at = 0.0;
                 pb.position = 0.0;
             }
+            self.whole_queue();
             self.track_changed();
             return;
         }
@@ -2163,6 +2166,7 @@ impl Controller {
             pb.playing = false;
             pb.current_token = 0;
         }
+        self.whole_queue();
         // A queue saved before changes were timed: the file's own date says when it was.
         let stamp = if saved.stamp > 0 {
             saved.stamp
@@ -2187,7 +2191,6 @@ impl Controller {
         if songs.is_empty() {
             return;
         }
-        self.queue_number.set(self.queue_number.get() + 1);
         let _way = self.way_in(Who::Nobody, What::Playing);
         {
             let mut pb = self.playback.borrow_mut();
@@ -2207,9 +2210,16 @@ impl Controller {
             pb.current_token = 0;
             pb.next_token = 0;
         }
+        self.whole_queue();
         self.queue_quiet.set(true);
         self.track_changed();
         self.queue_quiet.set(false);
+    }
+
+    /// **A whole queue is in the player in place of what was there** (or the player has
+    /// been emptied): it has a new number. The one place the number moves.
+    fn whole_queue(&self) {
+        self.queue_number.set(self.queue_number.get() + 1);
     }
 
     // ---- lyrics --------------------------------------------------------------------------------
