@@ -152,12 +152,25 @@ use crate::offer::{Offer, VARIOUS};
 /// while their singles are read in. The batch of albums keeps it in its file
 /// (`bulk::Job`), so that a run stopped before putting it back has it put back by the next.
 pub trait WayBack {
+    /// One step at a time, for everyone: reading an artist's setting, writing the way back
+    /// and changing the setting are one step, and so are putting it back and crossing it off.
+    /// The step is held while what this returns is. A request asked for by itself holds it
+    /// for its whole sequence; the batch, for each step of its own. The window's thread never
+    /// takes it.
+    fn turn(&self) -> Box<dyn Turn + '_>;
     /// Writes down that `artist`'s setting is to go back to `before`, and says whether it is on
-    /// the disk. If it isn't, the answer is why, and Lidarr isn't changed.
-    fn keep(&self, artist: i64, before: &str) -> Result<(), String>;
-    /// `artist`'s setting has gone back to `before`.
+    /// the disk: `Ok(true)`, written by this call; `Ok(false)`, a way back for the artist was
+    /// on the disk already, from before this step, and is that one's to cross off. If it can't
+    /// be written, the answer is why, and Lidarr isn't changed.
+    fn keep(&self, artist: i64, before: &str) -> Result<bool, String>;
+    /// `artist`'s setting has gone back to `before`: the way back this step wrote is crossed off.
     fn put_back(&self, artist: i64, before: &str);
 }
+
+/// Held while a step of the way back is under way (`WayBack::turn`).
+pub trait Turn {}
+
+impl<T> Turn for T {}
 
 /// The name of the profile this app makes in Lidarr for artists a single or an EP is asked
 /// of. Lidarr only knows the kinds of release an artist's profile lists.
@@ -678,13 +691,16 @@ impl Lidarr {
         if wanted.artist_id == VARIOUS {
             return self.request_from_various(wanted);
         }
+        // The whole of it, one at a time with every other change that has to be put back
+        // (`WayBack::turn`): it is a few requests long.
+        let _turn = way_back.turn();
         let kind = wanted.kind();
         // An album by an artist Lidarr lists the albums of needs nothing special.
         let plain = kind == "Album" && !wanted.soundtrack;
         let artists: Vec<ArtistRes> = self.get("artist")?;
         let known = artists.into_iter().find(|artist| artist.foreign_artist_id == wanted.artist_id).map(|artist| artist.id);
         // What the artist's "new releases" setting was, if it had to be turned off meanwhile.
-        let mut put_back: Option<String> = None;
+        let mut put_back: Option<(String, bool)> = None;
         let artist = match known {
             Some(artist) => {
                 if !plain {
@@ -722,9 +738,10 @@ impl Lidarr {
         };
         let outcome = self.place(artist, wanted);
         match put_back {
-            Some(before) => {
+            Some((before, wrote)) => {
                 let restored = self.restore_new_releases(artist, &before);
-                if restored.is_ok() {
+                // Crossed off only if this request wrote it.
+                if restored.is_ok() && wrote {
                     way_back.put_back(artist, &before);
                 }
                 outcome.and(restored.map_err(|_| {
@@ -801,8 +818,8 @@ impl Lidarr {
     /// Left as it was, Lidarr would take every single and EP it now learns of to be a new
     /// release and fetch the lot. With the setting off while it reads them in, they're
     /// listed and nothing more; turning it back on afterwards doesn't change that.
-    fn list_singles(&self, artist: i64, wanted: &Offer, way_back: &dyn WayBack) -> Result<Option<String>, String> {
-        let before = self.start_listing_singles_kept(artist, wanted, |before| way_back.keep(artist, before))?;
+    fn list_singles(&self, artist: i64, wanted: &Offer, way_back: &dyn WayBack) -> Result<Option<(String, bool)>, String> {
+        let before = self.start_listing_singles_kept(artist, wanted, way_back)?;
         if before.is_some() {
             // Lidarr starts reading the artist's releases in again; give it a moment to begin.
             // A wait cut short ends here, but the setting is still handed back to be put back.
@@ -812,31 +829,42 @@ impl Lidarr {
     }
 
     /// The same, without waiting for Lidarr to begin, for a caller that watches for it to
-    /// finish (see `busy_with`) and puts the setting back itself (see `set_new_releases`);
-    /// handing `keep` what the setting is to be put back to **before Lidarr is changed**: if
-    /// `keep` can't keep it, Lidarr isn't changed, and its answer is the error.
-    pub fn start_listing_singles_kept(&self, artist: i64, wanted: &Offer, keep: impl FnOnce(&str) -> Result<(), String>) -> Result<Option<String>, String> {
+    /// finish (see `busy_with`) and puts the setting back itself (see `set_new_releases`). The
+    /// caller holds `way_back`'s turn. What the setting is to be put back to is written down
+    /// (`WayBack::keep`) **before anything on Lidarr is changed**, the profile made for this
+    /// included: if it can't be, nothing is. Returns it, and whether this wrote it. The
+    /// requests sent to Lidarr, and their order, are 0.40.10's.
+    pub fn start_listing_singles_kept(&self, artist: i64, wanted: &Offer, way_back: &dyn WayBack) -> Result<Option<(String, bool)>, String> {
         let profiles: Vec<serde_json::Value> = self.get("metadataprofile")?;
         let mut record: serde_json::Value = self.get(&format!("artist/{artist}"))?;
         let current = profiles.iter().find(|profile| profile.get("id") == record.get("metadataProfileId"));
         if current.is_some_and(|profile| suits(profile, wanted)) {
             return Ok(None);
         }
-        let ours = self.profile_for(&profiles, wanted.soundtrack)?;
+        let before = record.get("monitorNewItems").and_then(|setting| setting.as_str()).unwrap_or("all").to_string();
+        let wrote = way_back.keep(artist, &before)?;
+        // Turned back before the setting is changed: nothing to put back, and what was
+        // written is crossed off.
+        let refused = |reason: String| {
+            if wrote {
+                way_back.put_back(artist, &before);
+            }
+            reason
+        };
+        let ours = self.profile_for(&profiles, wanted.soundtrack).map_err(&refused)?;
         if let Some(current) = current.filter(|current| !covers(&ours, current)) {
             let name = current.get("name").and_then(|name| name.as_str()).unwrap_or("its own");
-            return Err(format!(
+            return Err(refused(format!(
                 "{} is on Lidarr's “{name}” profile, which doesn't list {}s. Add them to that profile in Lidarr, then ask again.",
                 wanted.artist,
                 if wanted.soundtrack && allows(current, wanted.kind()) { "soundtrack" } else { wanted.kind_word() }
-            ));
+            )));
         }
-        let before = record.get("monitorNewItems").and_then(|setting| setting.as_str()).unwrap_or("all").to_string();
-        keep(&before)?;
         record["metadataProfileId"] = ours.get("id").cloned().unwrap_or_default();
         record["monitorNewItems"] = "none".into();
+        // (A change that fails here may have been made all the same: what was written stays.)
         let _: serde_json::Value = self.send("PUT", &format!("artist/{artist}"), Some(record))?;
-        Ok(Some(before))
+        Ok(Some((before, wrote)))
     }
 
     /// Sets what Lidarr does about an artist's new releases ("all", "new" or "none").
@@ -1300,12 +1328,16 @@ pub(crate) mod tests {
     }
 
     impl WayBack for Noted {
-        fn keep(&self, artist: i64, before: &str) -> Result<(), String> {
+        fn turn(&self) -> Box<dyn Turn + '_> {
+            Box::new(())
+        }
+
+        fn keep(&self, artist: i64, before: &str) -> Result<bool, String> {
             if self.refuse {
                 return Err("couldn't be written down".into());
             }
             self.kept.lock().unwrap().push((artist, before.to_string()));
-            Ok(())
+            Ok(true)
         }
 
         fn put_back(&self, artist: i64, before: &str) {
@@ -1329,6 +1361,43 @@ pub(crate) mod tests {
         fn pause(&self, wait: Duration) -> Result<(), crate::http::Failure> {
             self.0.pause(wait)
         }
+    }
+
+    pub(crate) const SINGLES: &str = SINGLES_PROFILE;
+
+    /// The same Lidarr without the profile for singles, which is made for the request; and
+    /// the app killed the moment it is asked to make it.
+    struct KilledMakingTheProfile(Stopping);
+
+    impl crate::http::Http for KilledMakingTheProfile {
+        fn send(&self, request: &crate::http::Request) -> Result<crate::http::Response, crate::http::Failure> {
+            if matches!(request.method, crate::http::Method::Post(_)) && request.url.ends_with("/metadataprofile") {
+                self.0.asked.lock().unwrap().push("POST metadataprofile".into());
+                panic!("killed");
+            }
+            let answer = self.0.send(request)?;
+            if request.url.ends_with("/metadataprofile") {
+                let only_standard = r#"[{"id":1,"name":"Standard","primaryAlbumTypes":[{"albumType":{"id":1,"name":"Album"},"allowed":true}],"secondaryAlbumTypes":[{"albumType":{"id":1,"name":"Studio"},"allowed":true}],"releaseStatuses":[{"releaseStatus":{"id":1,"name":"Official"},"allowed":true}]}]"#;
+                return Ok(crate::http::Response::new(200, Vec::new(), move || Ok(only_standard.to_string())));
+            }
+            Ok(answer)
+        }
+
+        fn pause(&self, wait: Duration) -> Result<(), crate::http::Failure> {
+            self.0.pause(wait)
+        }
+    }
+
+    #[test]
+    fn the_way_back_is_written_down_before_a_profile_is_made_and_lidarr_is_asked_as_before() {
+        let http = Arc::new(KilledMakingTheProfile(Stopping { asked: Default::default() }));
+        let lidarr = Lidarr::new("lidarr.test", "key", None, http.clone());
+        let noted = Noted::default();
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lidarr.request(&single(), &noted))).is_err());
+        assert_eq!(noted.kept(), [(5, "all".to_string())]);
+        // The requests, and their order, are 0.40.10's: the profiles, the artist, the profile made.
+        let asked: Vec<String> = http.0.asked.lock().unwrap().iter().map(|asked| asked.split(' ').take(2).collect::<Vec<_>>().join(" ")).collect();
+        assert_eq!(asked, ["GET artist", "GET metadataprofile", "GET artist/5", "POST metadataprofile"]);
     }
 
     pub(crate) fn single() -> Offer {
