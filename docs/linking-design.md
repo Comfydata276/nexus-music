@@ -1169,7 +1169,9 @@ be allowed now, by what the service's gate goes by that can be read without doin
 anything (its player is not showing another device's music, and the service is in the
 foreground). The service's own "no" to a start stops the player, which is right for a
 start that was refused and would stop music the person is listening to; so that gate
-is never reached for a refusal. Refused, the phone plays on exactly as it was. A
+is never reached for a refusal. Refused, the phone plays on exactly as it was. (The
+answer is a reading taken at that moment: if what it reads changes before the player
+starts, the command can still meet the service's gate. Accepted.) A
 command from another device never goes through a path that stops a phone that was
 already playing. What each answer means:
 
@@ -1247,10 +1249,12 @@ its own. So the adapter goes by **what the player holds, not by what it is told*
 
 - It keeps **what the library last knew of the player**: the entry that is current as
   ExoPlayer has it (`exo.currentMediaItem`, which a seek or a Next sets at once, not
-  the queue's cursor, which follows later), `exo.playWhenReady`, **whether it is
-  sounding or about to** (`brief().playing`: so playback that ends, by an error or by
-  reaching the end, is a change, and so is the sound being held back and let go
-  again), the queue's `revision` (which moves with every edit of the list and with
+  the queue's cursor, which follows later), `exo.playWhenReady`, **whether playing
+  is under way** (set to play, with a song made ready or being made ready: so playback
+  that ends, by an error or by reaching the end, is a change; **the sound being held
+  back for a call is not**, though `brief().playing` says the phone is not playing
+  while it is: counted as a change, a call arriving refused the stop that ends a move
+  of music, and both devices played when it ended, which the walk found), the queue's `revision` (which moves with every edit of the list and with
   nothing else), repeat, the queue's number, the newest place in `Choices`, and **how
   many times the current entry has begun again by itself** (a song on repeat:
   `onMediaItemTransition` with `REASON_REPEAT`, counted and never told from). Every one
