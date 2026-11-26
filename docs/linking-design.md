@@ -887,6 +887,12 @@ not taken. What became of the command is "not known". If the new place has not b
 seen yet the device cannot tell, and the thirty seconds a move is given still bound
 what it does.
 
+**The note under the list is of two kinds.** Most notes say what became of the last
+thing asked ("Paused Study PC."), and stay until there is something else to say. One
+says how things are for as long as a device is steered: that the music is playing on it
+("Playing on Study PC."). That one goes when the device is let go of, however that comes
+about, so the line under the list never says the music is somewhere it is not.
+
 **In the list**, a row for a device that speaks otherwise has what any row has, its name
 and what it is playing, and one thing more: the sentence saying which of the two to
 update. It is not to be picked and has no Pause. The sentence is under the row ("Update
@@ -1149,6 +1155,7 @@ would playing, with `playing` false.
 | `sounding()` | `{"queue","at"}` **only while audio is advancing for the entry that was current when a queue was put in for a move of music** (`take`, `adopt`), in that queue; `null` otherwise, and for good once that entry is no longer the one playing. The rules: (1) when `take` or `adopt` has put a queue in, the adapter notes the queue's number and **the entry's own number** (`SongTag.uid`, never used twice in a run, so it is that queue's entry and no other's); (2) "advancing" is the audio track's own word, `AnalyticsListener.onAudioPositionAdvancing`, **which Media3 posts**: by the time it arrives another queue may be in the player, so it counts only if **the entry its `eventTime` belongs to** (the media item of `eventTime.timeline` at `eventTime.windowIndex`) is the noted one, never by what is current when it arrives; **and only if the event has a period of its own** (`eventTime.mediaPeriodId`): one without is filled in by Media3 from whatever is current as it is made, and proves nothing; (3) what was heard is let go of when the player stops playing (`isPlaying` false) or is given a new place to play from, **and is not believed again on a later word of the same loading of the entry** (the same period, by `windowSequenceNumber`): only of one that began after; (4) **one song ending and the next beginning, or the same one beginning again, ends it for good**: the library measures how far the sound has gone by subtracting places in one entry. `playWhenReady`, `isPlaying` and a position that has only been set do not show that a queue which was taken has sounded; and the service's own `heardThisTime` is a latch for its diagnostics and does not say which queue was heard. `at` is seconds into the entry. A queue the person started on the phone is waited on by no move and is never said to sound. | `null` |
 | `hasSong()` | Whether there is a song in the player. | false |
 | `ahead()` | The ids of **every** entry to come (radio stations too), in the order they would play, as a JSON list: the first is what Next goes to, and the same entry as `full().coming[0]`. | `[]` |
+| `entryAt(n)` | The id of the entry `n` places after the song playing: what `ahead()[n]` is, without the list being made. **Asked first for a command that names an entry**; `ahead()` is asked only if this is not the song the command names (the queue has moved since its sender saw it). | null: the queue does not reach so far |
 | `toCome()` | How many are to come: the length of `ahead()`, without making it. | 0 |
 
 Acts, each done before the call returns:
