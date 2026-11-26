@@ -352,19 +352,27 @@ pub fn finish(http: &dyn Http, found: &Found, code: &str, back: &str, secret: &s
 /// How long to wait for someone to finish signing in in the browser.
 pub const WAIT: Duration = Duration::from_secs(5 * 60);
 
+/// How long the browser's page waits, once it has come back with a code, for the app to say
+/// whether the sign-in went through: after that it's told the app is still signing in.
+pub const ANSWER_WITHIN: Duration = Duration::from_secs(30);
+
 /// Said when nobody did.
 pub const NOBODY_SIGNED_IN: &str = "Nobody signed in within five minutes. Try again when you're ready.";
 
 /// The pages the browser is shown when it comes back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Page {
-    /// "You're signed in": it came back with a code, and `finish` came of it.
+    /// "You're signed in": it came back with a code, and the app has kept what `finish` came
+    /// to, for the sign-in that's still the one under way.
     SignedIn,
     /// "The sign-in didn't go through": it came back with an error, or with a code that
     /// `finish` came to nothing of.
     NotThrough,
     /// "Nothing here": something else came to the door.
     NothingHere,
+    /// "Still signing in": it came back with a code, and the app hasn't decided yet within
+    /// the time a page is waited for (`ANSWER_WITHIN`).
+    StillSigningIn,
 }
 
 /// A page to show the browser, as HTML.
@@ -373,6 +381,7 @@ pub fn page(which: Page) -> String {
         Page::SignedIn => ("You're signed in", "You can close this tab and go back to Nexus Music."),
         Page::NotThrough => ("The sign-in didn't go through", "Go back to Nexus Music to try again."),
         Page::NothingHere => ("Nothing here", "This page only finishes a sign-in to Nexus Music."),
+        Page::StillSigningIn => ("Still signing in", "Go back to Nexus Music to see whether it went through."),
     };
     format!(
         "<!doctype html><meta charset=\"utf-8\"><title>Nexus Music</title>\

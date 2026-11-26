@@ -1639,24 +1639,39 @@ impl Controller {
         self.requests_state("waiting", &nexus_core::gate::finish_in_browser(found.host()));
         std::thread::spawn(move || {
             let agent = crate::subsonic::make_agent_without_redirects();
-            let result = crate::gate::begin(&found).and_then(|attempt| {
-                let link = attempt.link.clone();
-                post(move |_| crate::gate::open_link(&link));
-                attempt.finish(&agent, || !crate::gate::is_current(round))
-            });
-            post(move |ctl| ctl.signed_in(round, found, result));
+            let (result, browser) = match crate::gate::begin(&found) {
+                Ok(attempt) => {
+                    let link = attempt.link.clone();
+                    post(move |_| crate::gate::open_link(&link));
+                    attempt.finish(&agent, || !crate::gate::is_current(round))
+                }
+                Err(why) => (Err(why), None),
+            };
+            post(move |ctl| ctl.signed_in(round, found, result, browser));
         });
     }
 
-    fn signed_in(&self, round: u64, found: crate::gate::Found, result: Result<crate::gate::SignedIn, String>) {
+    /// What a sign-in came to. `browser`, if it came back with a code, is told what the app
+    /// decided: "You're signed in" only once the token is kept for the round still under way
+    /// (a cancelled or replaced round, or a failed exchange, is told it didn't go through).
+    fn signed_in(&self, round: u64, found: crate::gate::Found, result: Result<crate::gate::SignedIn, String>, browser: Option<crate::gate::Browser>) {
+        use nexus_core::gate::Page;
+        let tell = |page: Page| {
+            if let Some(browser) = &browser {
+                browser.answer(page);
+            }
+        };
         if !crate::gate::is_current(round) {
-            return;
+            return tell(Page::NotThrough);
         }
         match result {
             Ok(done) => {
                 // From here this sign-in owns the token kept: whatever an earlier one still has
                 // on its way writes nothing.
-                if !crate::keep::keep_token(&*self.vault(), &found.service, &done.token) {
+                if crate::keep::keep_token(&*self.vault(), &found.service, &done.token) {
+                    tell(Page::SignedIn);
+                } else {
+                    tell(Page::StillSigningIn);
                     self.toast("Couldn't save your sign-in; you'll need to sign in next time.");
                 }
                 self.settings.borrow_mut().lidarr_signed_in = done.name;
