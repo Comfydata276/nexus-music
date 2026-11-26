@@ -44,6 +44,11 @@ struct Fake {
     stops_and_starts_again: bool,
     /// Its own rules refuse to start playing (as a phone's do while a call is on).
     may_not_play: bool,
+    /// The mark of a queue handed on cannot be written where the next start would find it.
+    cannot_write: bool,
+    /// Its sound is held back (a call), with its intent to play still set: it does not
+    /// look as if it were playing, and it has not stopped.
+    held_back: bool,
 }
 
 impl Fake {
@@ -71,7 +76,7 @@ impl Fake {
 
 impl Player for Fake {
     fn brief(&self) -> Brief {
-        Brief { playing: self.playing && !self.queue.is_empty(), title: self.queue.get(self.cursor).cloned().unwrap_or_default(), artist: String::new() }
+        Brief { playing: self.playing && !self.held_back && !self.queue.is_empty(), title: self.queue.get(self.cursor).cloned().unwrap_or_default(), artist: String::new() }
     }
     fn full(&self) -> Full {
         let entry = |id: &String| crate::link::message::Entry { id: id.clone(), title: id.clone(), duration: 300, ..Default::default() };
@@ -115,17 +120,22 @@ impl Player for Fake {
             _ => self.carry(command, ready),
         }
     }
-    fn handed_on(&mut self) {
+    fn handed_on(&mut self) -> bool {
+        if self.cannot_write {
+            return false;
+        }
         self.handed_on.push(self.playing);
+        true
     }
     fn handed_back(&mut self) {
         self.handed_back += 1;
     }
-    fn pause(&mut self) {
+    fn pause(&mut self) -> bool {
         self.rule.moved();
         if !self.does_not_stop {
             self.play(false);
         }
+        !self.playing
     }
     fn take(&mut self, songs: &[(String, bool)], begin: usize, position: f64, _context: &str) {
         if self.takes_nothing {
@@ -1600,6 +1610,31 @@ fn a_device_that_did_not_stop_is_not_said_to_have_and_keeps_its_queue() {
     world.pass(1_000);
     let a = &world.copies[A].player;
     assert_eq!((said(&world), a.playing, a.handed_on.len(), a.handed_back, world.copies[A].window.clone()), ("Copy B has started, and this PC couldn't be stopped. Both are playing.", true, 1, 1, None));
+    // One whose sound is only held back (a call is on), and whose stop was refused: it
+    // does not look as if it were playing, and it has not stopped. When the call ends it
+    // would play on; so it is not acknowledged as stopped either.
+    let mut world = taking(|world| {
+        world.path.hold_commands = true;
+        world.copies[B].player.does_not_stop = true;
+    });
+    world.pass(1_000);
+    world.copies[B].player.held_back = true;
+    world.release();
+    let b = &world.copies[B].player;
+    assert_eq!((b.playing, b.handed_on.len(), b.handed_back), (true, 1, 1));
+    assert!(world.last(B, "moved from").contains("refused, Cannot"), "{:?}", world.copies[B].log);
+    // A hand-over whose mark cannot be written down is no hand-over: **it is refused
+    // before the device is stopped**, which plays on with its queue its own.
+    let mut world = taking(|world| world.copies[B].player.cannot_write = true);
+    world.pass(1_000);
+    let b = &world.copies[B].player;
+    assert_eq!((said(&world), b.playing, b.handed_on.len(), b.handed_back), ("Playing here. Copy B couldn't be stopped, so it is still playing too.", true, 0, 0));
+    assert!(world.last(B, "moved from").contains("refused, Cannot") && world.log(B, "could not be written down").len() == 1, "{:?}", world.copies[B].log);
+    assert!(world.copies[B].player.did.iter().all(|did| !did.contains("moved")), "{:?}", world.copies[B].player.did);
+    let mut world = giving(|world| world.copies[A].player.cannot_write = true);
+    world.pass(1_000);
+    let a = &world.copies[A].player;
+    assert_eq!((said(&world), a.playing, a.handed_on.len(), a.handed_back), ("Copy B has started, and this PC couldn't be stopped. Both are playing.", true, 0, 0));
     // One that was already quiet when told is stopped, and says there was nothing to do:
     // its queue is handed on all the same.
     let mut world = taking(|world| world.path.hold_commands = true);

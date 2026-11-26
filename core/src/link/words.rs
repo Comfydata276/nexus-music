@@ -42,11 +42,14 @@ pub const NEEDS_RESETTING: &str = "Your devices' link on the music server needs 
 pub const RESET_HALF_DONE: &str = "Linking was reset, but the music server stopped answering before that could be confirmed. It will be asked again.";
 pub const RESET_NOT_DONE: &str = "Linking couldn't be reset: the music server didn't answer. Try again.";
 pub const RESET_DONE: &str = "Linking was reset. Your other devices rejoin by themselves within two minutes.";
-/// Linking has stopped on this device after a fault, until the app is next started. (And
-/// what the person is most likely to be wondering: nothing was stopped anywhere else.)
+/// Linking has stopped on this device after a fault, until the app is next started. (It
+/// says nothing of the person's other devices: a stop may already have been sent to one.)
 pub fn fault(here: Here) -> String {
-    format!("Linking has stopped on {} until the app is next opened. If another device was playing, it still is.", here.this_lower())
+    format!("Linking has stopped on {} until the app is next opened.", here.this_lower())
 }
+
+/// A session's stay at the relay could not be begun on this device at all.
+pub const NO_STAY: &str = "This device couldn't begin to keep its place among your devices. It tries again when linking next starts.";
 
 pub const NOT_RADIO: &str = "Radio stations can't be added from here";
 pub const IN_A_JAM: &str = "Leave the jam before moving to another device";

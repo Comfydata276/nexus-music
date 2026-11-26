@@ -146,12 +146,19 @@ pub trait Player {
     /// saved, and it follows what that device saves, until the person uses it here.
     /// Said before this device's sound is stopped for it, so that the stop is not saved
     /// as a change of this device's own. Counts nothing and claims nothing.
-    fn handed_on(&mut self);
+    ///
+    /// **Whether the mark is written where the next start of the app will find it**: the
+    /// write's own result, not its being asked for. False (it failed, or did not get there
+    /// in the time the app allows): **nothing is marked**, the queue is as it was, and the
+    /// hand-over is refused before this device is stopped.
+    fn handed_on(&mut self) -> bool;
     /// The hand-over did not happen after all (this device could not be stopped): the
     /// queue is as it was before [`Player::handed_on`].
     fn handed_back(&mut self);
-    /// Stops this device's own sound, and counts it as a change.
-    fn pause(&mut self);
+    /// Stops this device's own sound, and counts it as a change. **Whether the device is
+    /// then not set to play**: its intent, not whether anything sounds (a device whose
+    /// sound is held back by a call, still set to play, has not stopped).
+    fn pause(&mut self) -> bool;
     /// How many songs are to come: known to the player without walking its queue.
     fn to_come(&self) -> usize;
     /// Takes a queue brought from another device and plays it: each song and whether it
@@ -791,9 +798,13 @@ impl Device {
     }
 
     /// The system gave no random bytes where some were needed: linking is off for this run.
-    pub fn out_of_random(&mut self, env: &mut Env) -> Vec<Do> {
+    /// (From a session's stay at the relay: only the live session's word counts. One
+    /// from a stay that has been ended switches nothing off.)
+    pub fn out_of_random(&mut self, session: u64, env: &mut Env) -> Vec<Do> {
         let mut out = Vec::new();
-        self.no_random(env, &mut out);
+        if self.session.as_ref().is_some_and(|live| live.number == session) {
+            self.no_random(env, &mut out);
+        }
         out
     }
 
@@ -806,8 +817,8 @@ impl Device {
 
     /// This device has a place in the room.
     pub fn entered(&mut self, session: u64, place: Place, token: Token) {
-        self.news.forget();
         if let Some(live) = self.session.as_mut().filter(|live| live.number == session) {
+            self.news.forget();
             // A new place: whatever was asked from the old one cannot be answered to it.
             live.place = Some((place, token));
             live.others.clear();
@@ -1069,14 +1080,21 @@ impl Device {
         // before the sound is stopped, so that the stop is not saved as a change of this
         // device's own; and the mark stands only if the sound did stop.
         let handing = command == Command::Moved;
-        if handing {
-            env.player.handed_on();
+        if handing && !env.player.handed_on() {
+            // The mark could not be written where the next start would find it: there is
+            // no hand-over. Nothing was stopped and nothing is recorded; the device that
+            // asked is told this one could not, and says so to the person.
+            env.player.carried(carrying, false, None);
+            out.push(Do::Log(format!("moved from {}: the hand-over could not be written down here, so this device plays on", text::place(&from))));
+            return self.refused(session, from, nonce, &command, at, Why::Cannot, env, out);
         }
         // What came of it is known as the player returns: the rule is told, and the
         // command's sender answered, from the player as it now is.
         let before = env.player.queue();
         let carried = env.player.carry_out(&command, &ready);
-        if handing && env.player.brief().playing {
+        // (Stopped is the player saying it stopped, or was stopped already; and nothing
+        // sounding. A stop that was refused is not one because the sound is held back.)
+        if handing && (carried == Carried::Refused || env.player.brief().playing) {
             // It was told to stop and is still sounding. **Nothing is recorded as carried
             // out**: whatever the player changed on the way is counted as a change nobody
             // is named for, so that the answer, which says it could not, cannot also name
@@ -1395,9 +1413,11 @@ impl Device {
                     // The other has started: the queue is that device's now, this one
                     // stops, and the player is the other's. (Marked before the stop, and
                     // only kept if this device did stop.)
-                    env.player.handed_on();
-                    env.player.pause();
-                    if env.player.brief().playing {
+                    if !env.player.handed_on() {
+                        // (Not written down: no hand-over, and this device is not stopped.)
+                        out.push(Do::Log(format!("give: {name} has started, and the hand-over could not be written down here, so this device plays on")));
+                        words::gave_and_did_not_stop(name, env.me.here)
+                    } else if !env.player.pause() || env.player.brief().playing {
                         env.player.handed_back();
                         out.push(Do::Log(format!("give: {name} has started and this device could not be stopped")));
                         words::gave_and_did_not_stop(name, env.me.here)

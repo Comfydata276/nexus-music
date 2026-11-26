@@ -421,13 +421,21 @@ impl Player for Here<'_> {
     /// find it (`save_queue_surely`, the queue's place): on a PC that was quiet already
     /// nothing else would write it, since the stop that follows changes nothing; and
     /// "written" is the file being on disk, not its being in line for the saver.
-    fn handed_on(&mut self) {
+    fn handed_on(&mut self) -> bool {
         log("queue: handed to another of the person's devices: not saved from here, and it follows, until it is used here");
         let mark = self.ctl.link.borrow().handed.borrow_mut().on(self.ctl.queue_number.get(), self.ctl.queue_owner.taken());
         self.ctl.queue_owner.taken_up(mark);
-        if !self.ctl.save_queue_surely() {
-            log("queue: handed on, and that could not be written down in time: it is written with the next save");
+        if self.ctl.save_queue_surely() {
+            return true;
         }
+        // Not on disk (a write failed, or the saver did not get to it in time): there is
+        // no hand-over. The queue is whose it was, and this PC is not stopped for it.
+        log("queue: handing it on could not be written down, so it is not handed on");
+        if let Some(was) = self.ctl.link.borrow().handed.borrow_mut().back(self.ctl.queue_number.get()) {
+            self.ctl.queue_owner.handed_back(was);
+        }
+        self.ctl.save_queue();
+        false
     }
 
     /// This PC did not stop: the queue that was marked is whose it was. (If another whole
@@ -437,16 +445,21 @@ impl Player for Here<'_> {
         if let Some(was) = was {
             log("queue: this PC did not stop, so its queue is not handed on after all");
             self.ctl.queue_owner.handed_back(was);
-            self.ctl.save_queue_surely();
+            // (A PC has no fault to stop linking for: if this is not on disk, it is said,
+            // the queue is this PC's again in memory, and the next save writes it.)
+            if !self.ctl.save_queue_surely() {
+                log("queue: taking the hand-over back could not be written down yet");
+            }
         }
     }
 
     /// (The end of a move of this PC's music to another device: the app's own doing. The
     /// person's choice was that the queue go there, and that device claimed it as it took
     /// it; a claim here a moment later would make this PC, now silent, the newest.)
-    fn pause(&mut self) {
+    fn pause(&mut self) -> bool {
         self.ctl.came_in(Who::Nobody, What::Playing);
         self.ctl.pause_here();
+        !self.ctl.playback.borrow().playing
     }
 
     /// (Whether it went in is the player's own word: its queue has a new number.)
@@ -706,6 +719,13 @@ impl Controller {
     /// as long as the session lasts.
     fn link_begin(self: &Rc<Self>, session: u64, room: String, since_ms: u64) {
         let (address, Some(key)) = (self.settings.borrow().jam_relay.clone(), config::load_secret(&self.paths, "jam-key")) else { return };
+        // A relay at the music server's own address would be sent the host key there, with
+        // whatever else answers at that address: it is not used.
+        let server = self.settings.borrow().server.clone();
+        if crate::keep::origin_of(&address).is_some_and(|relay| crate::keep::origin_of(&server).as_deref() == Some(relay.as_str())) {
+            log("session: the relay is set to the music server's own address, which it cannot be: not used");
+            return;
+        }
         let relay = Arc::new(Relay { base: address.trim_end_matches('/').to_string(), key });
         let stop = Arc::new(AtomicBool::new(false));
         let live = Live { session, stop: stop.clone(), since: Arc::new(AtomicU64::new(since_ms)), relay: relay.clone(), room: room.clone() };
@@ -717,7 +737,7 @@ impl Controller {
             let mut tell = |from: FromRelay| {
                 post(move |ctl| match from {
                     FromRelay::Says(note) => ctl.link.borrow().inner.borrow_mut().device.said(session, note),
-                    FromRelay::NoRandom => ctl.link_event(|device, env| device.out_of_random(env)),
+                    FromRelay::NoRandom => ctl.link_event(|device, env| device.out_of_random(session, env)),
                     FromRelay::Entered { place, token } => ctl.link.borrow().inner.borrow_mut().device.entered(session, place, token),
                     FromRelay::Heard { places, frames } => ctl.link_event(|device, env| device.heard(session, &places, &frames, env)),
                     FromRelay::Left => ctl.link.borrow().inner.borrow_mut().device.left(session),

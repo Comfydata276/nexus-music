@@ -110,13 +110,18 @@ pub trait PhonePlayer {
     /// (`handover::Here::taken` is `handover::HANDED`). It is not saved, and it follows
     /// what that device saves, until [`PhonePlayer::claim`]. Called before the stop that
     /// goes with it, so that the stop is not saved as the phone's own change.
-    fn handed_on(&mut self);
+    ///
+    /// **Whether the mark is in the queue's file**: the write's own result, within the
+    /// short time the app allows. False: nothing is marked, and the hand-over is refused
+    /// before the phone is stopped.
+    fn handed_on(&mut self) -> bool;
     /// The hand-over did not happen (the phone did not stop): the queue is as it was
     /// before [`PhonePlayer::handed_on`].
     fn handed_back(&mut self);
-    /// Stops the phone's own sound. Counted here already. Whether it stopped is asked
-    /// afterwards ([`PhonePlayer::brief`]).
-    fn pause(&mut self);
+    /// Stops the phone's own sound. Counted here already. **Whether the phone is then not
+    /// set to play** (its intent: a phone whose sound a call holds back, still set to
+    /// play, has not stopped).
+    fn pause(&mut self) -> bool;
     /// Takes this queue and plays it: each song and whether it was queued by hand, where to
     /// start, and how far in. Whether the queue is in the player afterwards is what
     /// [`PhonePlayer::queue`] says: a new number if it is, and it is counted and claimed
@@ -480,10 +485,9 @@ impl Player for Held<'_> {
         self.ways.end();
         carried
     }
-    fn handed_on(&mut self) {
-        if !self.over() {
-            self.theirs.handed_on();
-        }
+    fn handed_on(&mut self) -> bool {
+        // (A sign-in that is over hands nothing on.)
+        !self.over() && self.theirs.handed_on()
     }
     fn handed_back(&mut self) {
         if !self.over() {
@@ -492,15 +496,15 @@ impl Player for Held<'_> {
     }
     /// (The end of a move of the phone's music to another device, or of one that did not
     /// start: the app's own doing, which claims nothing.)
-    fn pause(&mut self) {
+    fn pause(&mut self) -> bool {
         if self.over() {
-            return;
+            return false;
         }
         if self.ways.touch(Who::Nobody, What::Playing).count {
             self.rule.moved();
         }
         let _changing = self.turns.changing();
-        self.theirs.pause();
+        self.theirs.pause()
     }
     /// ("Play here": the person's own choice, at the phone. The queue is the phone's own
     /// once it is in the player.)
@@ -694,7 +698,7 @@ impl Inner {
             Happened::FromRelay { session, from } => {
                 return match from {
                     FromRelay::Says(note) => self.device.said(session, note),
-                    FromRelay::NoRandom => self.with(call, came, |device, env| device.out_of_random(env)),
+                    FromRelay::NoRandom => self.with(call, came, |device, env| device.out_of_random(session, env)),
                     FromRelay::Entered { place, token } => self.device.entered(session, place, token),
                     FromRelay::Heard { places, frames } => self.with(call, came, |device, env| device.heard(session, &places, &frames, env)),
                     FromRelay::Left => self.device.left(session),
@@ -1023,13 +1027,13 @@ mod tests {
         fn carry_out(&mut self, _: &Command, _: &Ready) -> Carried {
             unreachable!("asked from inside a call")
         }
-        fn handed_on(&mut self) {
+        fn handed_on(&mut self) -> bool {
             unreachable!("asked from inside a call")
         }
         fn handed_back(&mut self) {
             unreachable!("asked from inside a call")
         }
-        fn pause(&mut self) {
+        fn pause(&mut self) -> bool {
             unreachable!("asked from inside a call")
         }
         fn take(&mut self, _: &[(String, bool)], _: usize, _: f64, _: &str) {
@@ -1214,18 +1218,20 @@ mod tests {
             }
             carried
         }
-        fn handed_on(&mut self) {
+        fn handed_on(&mut self) -> bool {
             self.asked.push(format!("handed on, {}", if self.sound.is_some() { "sounding" } else { "silent" }));
+            true
         }
         fn handed_back(&mut self) {
             self.asked.push("handed back".into());
         }
-        fn pause(&mut self) {
+        fn pause(&mut self) -> bool {
             self.asked.push("pause, its own".into());
             if !matches!(self.wrong, Some(Wrong::DoesNotStop | Wrong::StopsAndStartsAgain)) {
                 self.sound = None;
                 self.tell("pause");
             }
+            self.sound.is_none()
         }
         fn take(&mut self, songs: &[(String, bool)], begin: usize, position: f64, _context: &str) {
             self.asked.push(format!("take {} from {begin}", songs.len()));
@@ -1446,7 +1452,7 @@ mod tests {
     #[test]
     fn a_press_is_the_phone_s_own_unless_another_device_is_being_steered() {
         let mut n = 0;
-        let (phone, mut player, ..) = phone(&mut n);
+        let (phone, mut player, session, _) = phone(&mut n);
         for event in [r#"{"event":"press","press":"next"}"#, r#"{"event":"press","press":{"seek":12.5}}"#, r#"{"event":"add","ids":["s1"],"next":false}"#, r#"{"event":"play","ids":["s1"],"start":0,"context":""}"#, r#"{"event":"play_here"}"#] {
             let (acts, native) = phone.handle(event, 3_000, 100, &mut random(&mut n), &mut player).unwrap();
             assert_eq!((acts.as_str(), native.len()), (r#"[{"act":"handled","by_another":false}]"#, 0), "{event}");
@@ -1459,8 +1465,12 @@ mod tests {
         }
         // Nothing of all that was asked of the player.
         assert!(player.asked.is_empty());
-        // It calls itself what it is.
-        phone.happened(Happened::FromRelay { session: 0, from: FromRelay::NoRandom }, 3_200, 100, &mut random(&mut n), &mut player);
+        // It calls itself what it is. (Said by the live session's stay: the same word
+        // from a stay that has been ended switches nothing off.)
+        phone.happened(Happened::FromRelay { session: session + 7, from: FromRelay::NoRandom }, 3_100, 100, &mut random(&mut n), &mut player);
+        let (acts, _) = phone.handle(TICK, 3_150, 100, &mut random(&mut n), &mut player).unwrap();
+        assert!(!acts.contains("couldn't make random numbers"), "{acts}");
+        phone.happened(Happened::FromRelay { session, from: FromRelay::NoRandom }, 3_200, 100, &mut random(&mut n), &mut player);
         let (acts, _) = phone.handle(TICK, 3_300, 100, &mut random(&mut n), &mut player).unwrap();
         assert!(acts.contains("This phone couldn't make random numbers, so linking is off."), "{acts}");
     }
@@ -1926,7 +1936,7 @@ mod tests {
         let asked = player.asked.len();
         for tick in 0..8 {
             let (acts, native) = phone.handle(TICK, 2_200 + 250 * tick, 100, &mut random(&mut n), &mut player).unwrap();
-            assert!(native.is_empty() && acts.contains("Linking has stopped on this phone until the app is next opened. If another device was playing, it still is."), "{acts} {native:?}");
+            assert!(native.is_empty() && acts.contains("Linking has stopped on this phone until the app is next opened."), "{acts} {native:?}");
         }
         // What the old session's stay at the relay still brings, what is chosen on the
         // phone, a press: none of it is decided, and a press is the phone's own.
