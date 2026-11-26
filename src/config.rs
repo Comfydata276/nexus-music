@@ -1142,24 +1142,79 @@ pub fn save_secret(paths: &Paths, name: &str, value: &str) -> bool {
     }
 }
 
-/// A secret kept by `save_secret`: there, not there (`Ok(None)`), or couldn't be read (`Err`).
+// ---- what's kept for Lidarr (see `keep`): written as bytes ------------------------------------
+
+/// The first bytes of what `keep` binds to a place: what tells this version's entries, written
+/// as UTF-8 bytes, from 0.40.10's, written on Windows as UTF-16 text.
+#[cfg_attr(not(windows), allow(dead_code))]
+const KEPT_MARK: &[u8] = b"nexus-bound-1\n";
+
+/// What's written for a value `keep` keeps: its UTF-8 bytes. (Windows allows a credential
+/// 2,560 bytes: as UTF-16 text that's 1,280 characters; as these, 2,560 of plain ASCII.)
+pub fn kept_bytes(value: &str) -> Vec<u8> {
+    value.as_bytes().to_vec()
+}
+
+/// What `kept_bytes` wrote, read back; `None` if it isn't text.
+pub fn kept_text(bytes: &[u8]) -> Option<String> {
+    String::from_utf8(bytes.to_vec()).ok()
+}
+
+/// On Windows: what this version wrote (`KEPT_MARK` first, UTF-8), or what 0.40.10 wrote
+/// (UTF-16 text, little-endian, as the credential store's password).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn kept_text_windows(bytes: &[u8]) -> Option<String> {
+    if bytes.starts_with(KEPT_MARK) {
+        return kept_text(bytes);
+    }
+    if bytes.len() % 2 != 0 {
+        return None;
+    }
+    let units: Vec<u16> = bytes.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect();
+    String::from_utf16(&units).ok()
+}
+
+/// What `keep` keeps under `name`: there, not there (`Ok(None)`), or couldn't be read (`Err`,
+/// which is not the same as not there).
 #[cfg(windows)]
-pub fn read_secret(_paths: &Paths, name: &str) -> Result<Option<String>, ()> {
+pub fn read_kept(_paths: &Paths, name: &str) -> Result<Option<String>, ()> {
     let entry = keyring::Entry::new(KEYRING_SERVICE, &format!("secret:{name}")).map_err(drop)?;
-    match entry.get_password() {
-        Ok(value) => Ok(Some(value)),
+    match entry.get_secret() {
+        Ok(bytes) => kept_text_windows(&bytes).map(Some).ok_or(()),
         Err(keyring::Error::NoEntry) => Ok(None),
         Err(_) => Err(()),
     }
 }
 
+/// Writes what `keep` keeps under `name` as bytes (`kept_bytes`); empty forgets it. Says
+/// whether that was done.
+#[cfg(windows)]
+pub fn write_kept(_paths: &Paths, name: &str, value: &str) -> bool {
+    let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &format!("secret:{name}")) else { return false };
+    if value.is_empty() {
+        matches!(entry.delete_credential(), Ok(()) | Err(keyring::Error::NoEntry))
+    } else {
+        entry.set_secret(&kept_bytes(value)).is_ok()
+    }
+}
+
 #[cfg(not(windows))]
-pub fn read_secret(paths: &Paths, name: &str) -> Result<Option<String>, ()> {
-    match fs::read_to_string(paths.secret.with_file_name(format!("secret-{name}"))) {
-        Ok(value) => Ok(Some(value)),
+pub fn read_kept(paths: &Paths, name: &str) -> Result<Option<String>, ()> {
+    match fs::read(paths.secret.with_file_name(format!("secret-{name}"))) {
+        Ok(bytes) => kept_text(&bytes).map(Some).ok_or(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(_) => Err(()),
     }
+}
+
+#[cfg(not(windows))]
+pub fn write_kept(paths: &Paths, name: &str, value: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let file = paths.secret.with_file_name(format!("secret-{name}"));
+    if value.is_empty() {
+        return save_secret(paths, name, "");
+    }
+    fs::write(&file, kept_bytes(value)).is_ok() && fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).is_ok()
 }
 
 #[cfg(not(windows))]
