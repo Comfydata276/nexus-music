@@ -1558,19 +1558,22 @@ impl Controller {
             }
         }
         let moved = crate::lidarr::tidy(&self.settings.borrow().lidarr_address) != crate::lidarr::tidy(address);
-        if moved {
-            // A sign-in belongs to the address it was found in front of: dropped while that's
-            // still the address, so it's handed back only where it was believed.
-            self.drop_sign_in();
-            let mut settings = self.settings.borrow_mut();
-            settings.lidarr_gate.clear();
-            settings.lidarr_gate_client.clear();
-        }
         // The key is kept with the origin it was typed for, before the address is saved: blank
         // leaves the key that's on file, unless the address now leads somewhere else (another
         // scheme, host or port). See `keep::change`.
         let old = self.settings.borrow().lidarr_address.clone();
-        let changed = crate::keep::change(&*self.vault(), &old, address.trim(), key.trim(), &mut || {
+        // A sign-in belongs to the address it was found in front of: let go of only once the
+        // change is going through, and while that's still the address, so it's handed back
+        // only where it was believed. A change that's refused keeps it.
+        let mut let_go = || {
+            if moved {
+                self.drop_sign_in();
+                let mut settings = self.settings.borrow_mut();
+                settings.lidarr_gate.clear();
+                settings.lidarr_gate_client.clear();
+            }
+        };
+        let changed = crate::keep::change(&*self.vault(), &old, address.trim(), key.trim(), &mut let_go, &mut || {
             let mut settings = self.settings.borrow_mut();
             settings.lidarr_address = address.trim().to_string();
             settings.save_surely(&self.paths.settings)

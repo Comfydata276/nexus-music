@@ -131,7 +131,9 @@ pub enum Changed {
 /// where it doesn't belong: a key typed is kept bound to the new address; with none typed and
 /// the origin changed, the old key is bound to the old address (if it wasn't yet) and then
 /// let go of. A write that fails stops the change, unless what's kept is bound already.
-pub fn change(vault: &dyn Vault, old: &str, new: &str, typed: &str, save_address: &mut dyn FnMut() -> bool) -> Changed {
+/// `let_go` is what goes with the old address (the sign-in in front of it): done once the
+/// change is going through, just before the address is saved, and not at all if it isn't.
+pub fn change(vault: &dyn Vault, old: &str, new: &str, typed: &str, let_go: &mut dyn FnMut(), save_address: &mut dyn FnMut() -> bool) -> Changed {
     let mut forgotten = false;
     if !typed.is_empty() {
         let Some(origin) = origin_of(new) else { return Changed::Not(NOT_SAVED) };
@@ -158,6 +160,7 @@ pub fn change(vault: &dyn Vault, old: &str, new: &str, typed: &str, save_address
             }
         }
     }
+    let_go();
     if !save_address() {
         return Changed::Not(NOT_SAVED);
     }
@@ -367,7 +370,7 @@ pub mod tests {
                     let saves = std::cell::Cell::new(0);
                     // The settings file: written after every write before it, or not at all if
                     // the app was closed before; and failing for the "fail" case 3.
-                    let changed = change(&vault, A, C, typed, &mut || {
+                    let changed = change(&vault, A, C, typed, &mut || {}, &mut || {
                         saves.set(saves.get() + 1);
                         if fail.contains(&3) || stop.is_some_and(|stop| *vault.writes.lock().unwrap() > stop) {
                             return false;
@@ -390,7 +393,7 @@ pub mod tests {
             }
             // And the settings file failing: the change isn't made, and says so.
             let vault = with(&[(KEY, &kept)]);
-            assert_eq!(change(&vault, A, C, "key-c", &mut || false), Changed::Not(NOT_SAVED));
+            assert_eq!(change(&vault, A, C, "key-c", &mut || {}, &mut || false), Changed::Not(NOT_SAVED));
             assert_eq!(next_start(&vault, A).1, None);
         }
     }
@@ -399,17 +402,37 @@ pub mod tests {
     fn a_key_that_cant_be_kept_stops_the_change_and_is_said() {
         let vault = Memory { fail: vec![1], ..with(&[(KEY, &bound("https://lidarr.example.org:443", "key-a"))]) };
         let mut saved = false;
-        assert_eq!(change(&vault, A, C, "key-c", &mut || { saved = true; true }), Changed::Not(NOT_SAVED));
+        assert_eq!(change(&vault, A, C, "key-c", &mut || {}, &mut || { saved = true; true }), Changed::Not(NOT_SAVED));
         assert!(!saved);
         assert_eq!(key(&vault, A, None).as_deref(), Some("key-a"));
         // An old key that can be neither bound nor let go of stops a change of origin.
         let vault = Memory { fail: vec![1, 2], ..with(&[(KEY, "key-a")]) };
-        assert_eq!(change(&vault, A, C, "", &mut || { saved = true; true }), Changed::Not(NOT_SAVED));
+        assert_eq!(change(&vault, A, C, "", &mut || {}, &mut || { saved = true; true }), Changed::Not(NOT_SAVED));
         // The same origin keeps the key, and changes nothing in the store.
         let vault = with(&[(KEY, &bound("https://lidarr.example.org:443", "key-a"))]);
-        assert_eq!(change(&vault, A, "https://lidarr.example.org:443/lidarr", "", &mut || true), Changed::Made { forgotten: false });
+        assert_eq!(change(&vault, A, "https://lidarr.example.org:443/lidarr", "", &mut || {}, &mut || true), Changed::Made { forgotten: false });
         assert_eq!(*vault.writes.lock().unwrap(), 0);
-        assert_eq!(change(&vault, A, C, "", &mut || true), Changed::Made { forgotten: true });
+        assert_eq!(change(&vault, A, C, "", &mut || {}, &mut || true), Changed::Made { forgotten: true });
+    }
+
+    #[test]
+    fn a_change_that_is_refused_lets_go_of_nothing() {
+        // The kept key can't be read: the change is refused, and the sign-in in front of the
+        // old address is kept.
+        let vault = with(&[(KEY, "key-a")]);
+        vault.unreadable.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut let_go = false;
+        assert_eq!(change(&vault, A, C, "", &mut || let_go = true, &mut || true), Changed::Not(NOT_SAVED));
+        assert!(!let_go);
+        // A key that can't be kept: the same.
+        let vault = Memory { fail: vec![1], ..with(&[]) };
+        assert_eq!(change(&vault, A, C, "key-c", &mut || let_go = true, &mut || true), Changed::Not(NOT_SAVED));
+        assert!(!let_go);
+        // Going through: let go of before the address is saved.
+        let vault = with(&[(KEY, &bound("https://lidarr.example.org:443", "key-a"))]);
+        let order = std::cell::RefCell::new(Vec::new());
+        assert!(matches!(change(&vault, A, C, "", &mut || order.borrow_mut().push("let go"), &mut || { order.borrow_mut().push("saved"); true }), Changed::Made { .. }));
+        assert_eq!(*order.borrow(), ["let go", "saved"]);
     }
 
     #[test]
@@ -422,7 +445,7 @@ pub mod tests {
         // The address is changed, no key typed, while the store still can't be read: not made,
         // and said as a change that couldn't be saved.
         let mut on_disk = A.to_string();
-        assert_eq!(change(&vault, A, C, "", &mut || { on_disk = C.to_string(); true }), Changed::Not(NOT_SAVED));
+        assert_eq!(change(&vault, A, C, "", &mut || {}, &mut || { on_disk = C.to_string(); true }), Changed::Not(NOT_SAVED));
         assert_eq!(on_disk, A);
         // Readable again: the next start binds it to the address it was kept for, and C never
         // has it.
@@ -431,7 +454,7 @@ pub mod tests {
         assert_eq!(key(&vault, C, None), None);
         // A key typed with the new address needs nothing read: it replaces what's kept.
         vault.unreadable.store(true, Ordering::SeqCst);
-        assert!(matches!(change(&vault, A, C, "key-c", &mut || true), Changed::Made { .. }));
+        assert!(matches!(change(&vault, A, C, "key-c", &mut || {}, &mut || true), Changed::Made { .. }));
         vault.unreadable.store(false, Ordering::SeqCst);
         assert_eq!(next_start(&vault, C).1.as_deref(), Some("key-c"));
     }
