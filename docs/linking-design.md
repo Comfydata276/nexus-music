@@ -364,7 +364,9 @@ secret is made any other way. Linking stops and says so.
 ### 5.5 Messages
 
 A message is JSON of at most 210,000 bytes. Unknown fields are ignored. A field a
-version knows and finds wrong is never guessed at.
+version knows and finds wrong is never guessed at. **A message that names a field
+twice is not read**, whichever field and however deep in it: a reader that kept one
+of the two would let a message say two things of itself.
 
 **Asks** (kind 1):
 
@@ -867,11 +869,23 @@ this device's own, lower or higher.
 | A command arrives from one that speaks otherwise | Refused `invalid`, **before the player is touched**: before the window is brought up to the sound, before the order of choices is asked to admit it, before anything is looked up for it. Nothing is counted and no place is kept for it. Its sender is answered, as any sender is. |
 | A look arrives from one that speaks otherwise | Answered as any look is: that is what lists this device there. **But a look for the queue is answered with no queue**, "nothing here to carry on with", which every generation reads alike. Otherwise a device that knows nothing of the rule would take this device's queue, play it, and then tell this one to stop in a command this one refuses, and both would play. |
 | Something is to be asked of one that speaks otherwise | **No command is sealed for it.** Every command this device sends (a press while steering, one that waited its turn, a queue given, the stop that ends "Play here") goes out through one function, which sends only to a device whose last fresh state said it speaks as this one does. One that has not been seen is sent nothing but looks either. The person is told which of the two to update. |
-| One is picked in the list | Not steered, whatever the list on the screen showed when it was pressed. |
+| One is picked in the list | Not steered, whatever the list on the screen showed when it was pressed. An app that gives something up for a pick (Windows leaves a device it steers the old way) asks first whether the pick will be taken, and gives it up only then. |
 | The device being steered turns out to speak otherwise (it was updated and has started again) | Let go of as soon as a fresh state from it says so. What is pressed after that is this device's own. |
 | "Play here", and the queue comes back from one that speaks otherwise | Not taken. Nothing is loaded, nothing is stopped anywhere. |
 | An answer comes from one that speaks otherwise: to a command, or to the look that asks what became of one | **It never says the command was carried out**, whatever its `ok`, `by` and `done` say: two generations read those differently, which is what makes them two. What became of the command is "not known", and this device does what it does for not known: it does not stop, and it does not mark its queue as handed on. |
 | The stop that ends "Play here", when the device the queue came from has since said it speaks otherwise | Not sent. This device plays; the person is told the other could not be told to stop. |
+
+**An answer from a place its device has left** is held to the same, and for the same
+reason: it cannot be taken for what it says. A device that is started again (an
+update, or the person closing and opening it) comes back at a new place in the room,
+its queue restored paused, and its old place is listed until the relay gives it up.
+What its last run said may still arrive from the old place: "the queue you gave me has
+started". So when a tell arrives, the device asks where the device that says it is
+now, which is the place that last answered as it; if that is another place, the tell
+settles nothing as carried out, nothing is made against it, and a queue it brings is
+not taken. What became of the command is "not known". If the new place has not been
+seen yet the device cannot tell, and the thirty seconds a move is given still bound
+what it does.
 
 **In the list**, a row for a device that speaks otherwise has what any row has, its name
 and what it is playing, and one thing more: the sentence saying which of the two to
