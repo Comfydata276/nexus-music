@@ -5,7 +5,7 @@
 //! end: the connection they're asked over. Nothing here is used unless requests are
 //! switched on.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use nexus_core::listenbrainz::ListenBrainz;
@@ -18,6 +18,6 @@ pub(crate) fn service() -> &'static ListenBrainz {
         if crate::pins::entered() {
             return ListenBrainz::new(crate::pins::world());
         }
-        ListenBrainz::new(Arc::new(crate::corehttp::Agent(crate::subsonic::make_agent_idle(Duration::from_secs(50)))))
+        ListenBrainz::new(crate::corehttp::public(Duration::from_secs(50)))
     })
 }

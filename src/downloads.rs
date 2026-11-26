@@ -58,6 +58,9 @@ pub struct Downloads {
     arrived: HashMap<String, i64>,
     /// The list of downloads has changed since it was last written to disk.
     unsaved: bool,
+    /// The list was there and couldn't be read when this was loaded (and so is taken for
+    /// none): a move never writes over it.
+    unreadable: bool,
     /// Whose downloads these are (see `account`): each account has its own list, in the same
     /// folder, so signing in as someone else doesn't show the last person's.
     account: String,
@@ -70,6 +73,37 @@ pub struct Downloads {
     batch_total: usize,
     batch_done: usize,
     batch_failed: usize,
+}
+
+/// Whether `name` is what a copy across drives (`copy_whole`) left when it was stopped: a
+/// listed song's name, then `.<process>.<count>.tmp`.
+fn move_leftover(name: &str, entries: &[Entry]) -> bool {
+    let Some(rest) = name.strip_suffix(".tmp") else { return false };
+    let mut parts = rest.rsplitn(3, '.');
+    let (Some(count), Some(process), Some(song)) = (parts.next(), parts.next(), parts.next()) else { return false };
+    let digits = |part: &str| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit());
+    digits(count) && digits(process) && entries.iter().any(|entry| entry.file == song)
+}
+
+/// Whether `name` is a download of the app's that was cut short (see `Downloads::load`).
+fn partial_download(name: &str, entries: &[Entry]) -> bool {
+    let Some(file) = name.strip_suffix(".part") else { return false };
+    if entries.iter().any(|entry| entry.file == file) {
+        return true;
+    }
+    let mut parts = file.rsplitn(3, '.');
+    let (Some(attempt), Some(extension), Some(stem)) = (parts.next(), parts.next(), parts.next()) else { return false };
+    let word = |part: &str, more: &str| !part.is_empty() && part.chars().all(|c| c.is_ascii_alphanumeric() || more.contains(c));
+    attempt.chars().all(|c| c.is_ascii_digit()) && !attempt.is_empty() && word(extension, "") && word(stem, "-_")
+}
+
+/// Which songs an account has downloaded here, and which lists it keeps downloaded.
+pub fn index_file(dir: &Path, account: &str) -> PathBuf {
+    dir.join(format!("index-{account}.json"))
+}
+
+pub fn collections_file(dir: &Path, account: &str) -> PathBuf {
+    dir.join(format!("collections-{account}.json"))
 }
 
 impl Downloads {
@@ -86,22 +120,26 @@ impl Downloads {
                 }
             }
         }
-        let mut entries: Vec<Entry> = fs::read(dir.join(format!("index-{account}.json")))
-            .ok()
-            .filter(|_| !account.is_empty())
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default();
+        let (mut entries, unreadable): (Vec<Entry>, bool) = match fs::read(index_file(&dir, account)) {
+            _ if account.is_empty() => (Vec::new(), false),
+            Ok(bytes) => serde_json::from_slice(&bytes).map_or((Vec::new(), true), |entries| (entries, false)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (Vec::new(), false),
+            Err(_) => (Vec::new(), true),
+        };
         // Trust the folder over the index: a file deleted by hand is simply not downloaded.
         entries.retain(|entry| dir.join(&entry.file).is_file());
-        // Fetches that were cut short by the app closing.
+        // Fetches that were cut short by the app closing: only of the shapes the app writes
+        // (`<id>.<extension>.<attempt>.part`, since 0.29), or a bare `<file>.part` (before)
+        // for a file the list names. A browser's unfinished `….part` there is the person's.
         for stale in fs::read_dir(&dir).into_iter().flatten().flatten() {
-            if stale.file_name().to_string_lossy().ends_with(".part") {
+            let name = stale.file_name().to_string_lossy().into_owned();
+            if (partial_download(&name, &entries) || move_leftover(&name, &entries)) && stale.file_type().is_ok_and(|kind| kind.is_file()) {
                 let _ = fs::remove_file(stale.path());
             }
         }
         let files = entries.iter().map(|e| (e.song.id.clone(), e.file.clone())).collect();
         let arrived = entries.iter().map(|e| (e.song.id.clone(), arrival(&dir, e))).collect();
-        let collections = fs::read(dir.join(format!("collections-{account}.json")))
+        let collections = fs::read(collections_file(&dir, account))
             .ok()
             .filter(|_| !account.is_empty())
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
@@ -115,6 +153,7 @@ impl Downloads {
             under_way: HashMap::new(),
             arrived,
             unsaved: false,
+            unreadable,
             account: account.to_string(),
             next_attempt: 0,
             failed: Vec::new(),
@@ -125,34 +164,83 @@ impl Downloads {
         }
     }
 
-    fn save(&mut self) {
+    /// Writes the list: flushed when a batch is over, or after a removal (`Durable`); in
+    /// passing while a batch is arriving.
+    fn save(&mut self, durable: crate::config::Durable) {
         if self.account.is_empty() {
             return;
         }
+        // Only a list that is on the disk is no longer due (and one that isn't is tried
+        // again a couple of seconds later, or at the end of the batch).
         if let Ok(json) = serde_json::to_vec(&self.entries) {
-            crate::config::write_atomically(&self.dir.join(format!("index-{}.json", self.account)), &json);
+            let written = crate::config::write_whole(&index_file(&self.dir, &self.account), &json, durable, &crate::config::REPLACING);
+            if written.is_ok() {
+                self.unsaved = false;
+                // The list on the disk is whole again: it can be moved.
+                self.unreadable = false;
+            }
         }
-        self.unsaved = false;
         self.saved_at = std::time::Instant::now();
+    }
+
+    /// Whether the downloads can be moved, as their list stands: never one that couldn't be
+    /// read (it would be written over, or left behind); and only once what it has that isn't
+    /// written yet is (flushed: the person pressed Move). A list with nothing unwritten isn't
+    /// written again, as 0.40.10 didn't.
+    pub fn ready_to_move(&mut self) -> Result<(), String> {
+        if self.unreadable {
+            return Err(format!("The list of downloads in {} couldn't be read, so nothing was moved.", self.dir.display()));
+        }
+        if self.unsaved && !self.account.is_empty() {
+            self.save(crate::config::Durable::Flushed);
+            if self.unsaved {
+                return Err("The list of downloads couldn't be saved first, so nothing was moved.".into());
+            }
+        }
+        Ok(())
     }
 
     /// Writes the list of downloads if it has changed. While a batch is arriving that would
     /// be the whole list rewritten for every song, so it's done every couple of seconds
     /// instead, and once more when the batch is over (`now`).
     pub fn save_if_due(&mut self, now: bool) {
+        // (A download finishing, a batch's end, quitting: in passing. A removal the person
+        // asked for is saved, flushed, by `remove_downloads`.)
         if self.unsaved && (now || self.saved_at.elapsed() > std::time::Duration::from_secs(2)) {
-            self.save();
+            self.save(crate::config::Durable::InPassing);
         }
     }
 
     /// Remembers (or forgets) that a playlist is kept downloaded.
+    /// Removes downloads the person asked to: the list saved once for all of them, flushed
+    /// (it is their press).
+    pub fn remove_many(&mut self, ids: &[String]) {
+        for id in ids {
+            self.remove(id);
+        }
+        if self.unsaved {
+            self.save(crate::config::Durable::Flushed);
+        }
+    }
+
+    /// Keeps no playlist downloaded any more: saved once (the person's "Remove all").
+    fn forget_collections(&mut self) {
+        if self.collections.is_empty() {
+            return;
+        }
+        self.collections.clear();
+        if let (Ok(json), false) = (serde_json::to_vec(&self.collections), self.account.is_empty()) {
+            let _ = crate::config::write_surely(&collections_file(&self.dir, &self.account), &json);
+        }
+    }
+
     fn keep_collection(&mut self, id: &str, keep: bool) {
         self.collections.retain(|c| c != id);
         if keep {
             self.collections.push(id.to_string());
         }
         if let (Ok(json), false) = (serde_json::to_vec(&self.collections), self.account.is_empty()) {
-            crate::config::write_atomically(&self.dir.join(format!("collections-{}.json", self.account)), &json);
+            let _ = crate::config::write_surely(&collections_file(&self.dir, &self.account), &json);
         }
     }
 
@@ -256,7 +344,7 @@ impl Downloads {
             let _ = fs::remove_file(self.dir.join(file));
             self.entries.retain(|e| e.song.id != id);
             self.arrived.remove(id);
-            self.save();
+            self.unsaved = true;
         }
     }
 }
@@ -297,31 +385,176 @@ fn expected_bytes(song: &Song, quality: u32) -> u64 {
     if original { song.size } else { song.duration as u64 * if quality == 0 { 320 } else { quality } as u64 * 125 }
 }
 
-/// Moves everything in one folder into another: by renaming where that works (the same
-/// drive), otherwise by copying and then removing. Returns how many files moved and how
-/// many couldn't be. Files still arriving are left out.
-pub fn move_folder(from: &Path, to: &Path) -> (usize, usize) {
-    let (mut moved, mut stuck) = (0, 0);
-    for entry in fs::read_dir(from).into_iter().flatten().flatten() {
-        let path = entry.path();
-        let name = entry.file_name();
-        if !path.is_file() || name.to_string_lossy().ends_with(".part") {
-            continue;
-        }
-        let target = to.join(&name);
-        let done = fs::rename(&path, &target).is_ok()
-            || (fs::copy(&path, &target).is_ok_and(|copied| fs::metadata(&path).is_ok_and(|meta| meta.len() == copied)) && fs::remove_file(&path).is_ok());
-        if done {
-            moved += 1;
+/// What moving the downloads moves: **decided once, before anything moves**. The lists that
+/// read as the app's (`index-<account>.json`, a list of downloads, and the one from before
+/// 0.29 without an account; and beside each, the same account's `collections-…json` if it
+/// reads as a list of playlists), and the songs the lists of downloads name: each only if
+/// its name is a plain file name (no folder in it, not `.` or `..`) and it is a file in the
+/// folder. Nothing else there is the app's: the folder may be one of the person's own.
+pub struct Plan {
+    pub names: Vec<std::ffi::OsString>,
+    /// How much the files come to, for the room check.
+    pub bytes: u64,
+}
+
+/// `plan`, for the downloads of `account`: refused if their own list is there and can't be
+/// read as the move is planned (it would be left out, and the move said to be done with the
+/// songs still where they were). Another account's that can't be read is left out, as `plan`
+/// leaves it.
+pub fn plan_for(dir: &Path, account: &str) -> Result<Plan, String> {
+    let list = index_file(dir, account);
+    match fs::read(&list) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(bytes) if serde_json::from_slice::<Vec<Entry>>(&bytes).is_ok() => {}
+        _ => return Err(format!("The list of downloads in {} couldn't be read, so nothing was moved.", dir.display())),
+    }
+    Ok(plan(dir))
+}
+
+pub fn plan(dir: &Path) -> Plan {
+    let plain = |name: &str| !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\']) && Path::new(name).file_name().is_some_and(|only| only == name);
+    let mut names: Vec<std::ffi::OsString> = Vec::new();
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let account = if name == "index.json" {
+            Some(String::new())
         } else {
-            // Don't leave half a copy behind where the whole file would be looked for.
-            if target.exists() && path.exists() {
-                let _ = fs::remove_file(&target);
-            }
+            name.strip_prefix("index-").and_then(|rest| rest.strip_suffix(".json")).map(str::to_string)
+        };
+        let Some(account) = account else { continue };
+        let Ok(entries) = fs::read(entry.path()).map(|bytes| serde_json::from_slice::<Vec<Entry>>(&bytes)) else { continue };
+        let Ok(entries) = entries else { continue };
+        names.push(entry.file_name());
+        names.extend(entries.into_iter().map(|entry| entry.file).filter(|file| plain(file) && dir.join(file).is_file()).map(Into::into));
+        let collections = if account.is_empty() { "collections.json".to_string() } else { format!("collections-{account}.json") };
+        if fs::read(dir.join(&collections)).is_ok_and(|bytes| serde_json::from_slice::<Vec<String>>(&bytes).is_ok()) {
+            names.push(collections.into());
+        }
+    }
+    names.sort();
+    names.dedup();
+    let bytes = names.iter().filter_map(|name| fs::metadata(dir.join(name)).ok()).map(|meta| meta.len()).sum();
+    Plan { names, bytes }
+}
+
+/// How a move of the downloads went.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Moved {
+    /// All of them are in the new folder.
+    All(usize),
+    /// So many of their names are had in the new folder already: nothing was moved.
+    Taken(usize),
+    /// So many of the `of` couldn't be moved, and every one that had moved came back.
+    Back { stuck: usize, of: usize },
+    /// Some couldn't be moved, and `left` of those that had couldn't be brought back: those
+    /// are in the new folder, the rest in the old.
+    Split { left: usize },
+}
+
+/// The steps a move takes for each file, given so that a test can have one fail, or have the
+/// app stopped at one.
+#[derive(Clone, Copy)]
+pub struct MoveSteps {
+    /// Renames a file, on the same drive.
+    pub rename: fn(&Path, &Path) -> std::io::Result<()>,
+    /// Makes sure what was copied is on the disk.
+    pub flush: fn(&fs::File) -> std::io::Result<()>,
+    /// The temporary name a copy is made under, beside where it goes.
+    pub temp: fn(&Path) -> PathBuf,
+}
+
+pub const MOVING: MoveSteps = MoveSteps { rename: |from, to| fs::rename(from, to), flush: fs::File::sync_all, temp: crate::config::temp_for };
+
+/// Moves the app's downloads (`plan`) from one folder into another. **A name of the plan had
+/// in the new folder already stops the move before anything moves.** A file that can't be
+/// moved has what this move moved put back, by the list this move kept: never by looking at
+/// a folder. Each file is whole in one folder or the other throughout; a kill part-way leaves
+/// them so, split, and is not resumed (see `docs/FILES.md`).
+#[cfg(test)]
+pub fn move_folder(from: &Path, to: &Path) -> Moved {
+    move_folder_by(from, to, &plan(from), &MOVING)
+}
+
+pub fn move_folder_by(from: &Path, to: &Path, plan: &Plan, steps: &MoveSteps) -> Moved {
+    let taken = plan.names.iter().filter(|name| fs::symlink_metadata(to.join(name)).is_ok()).count();
+    if taken > 0 {
+        return Moved::Taken(taken);
+    }
+    let mut moved: Vec<&std::ffi::OsString> = Vec::new();
+    let mut stuck = 0;
+    for name in &plan.names {
+        if move_one(&from.join(name), &to.join(name), steps) {
+            moved.push(name);
+        } else {
             stuck += 1;
         }
     }
-    (moved, stuck)
+    if stuck == 0 {
+        return Moved::All(moved.len());
+    }
+    let left = moved.iter().filter(|name| !move_one(&to.join(name), &from.join(name), steps)).count();
+    if left == 0 { Moved::Back { stuck, of: plan.names.len() } } else { Moved::Split { left } }
+}
+
+/// Moves one file to a name nothing has: by renaming, or else (another drive) by copying.
+fn move_one(from: &Path, to: &Path, steps: &MoveSteps) -> bool {
+    // Looked for just before: the standard library's rename replaces what has the name, and
+    // a file given that name in the few microseconds between is the one case this doesn't
+    // guard against.
+    if fs::symlink_metadata(to).is_ok() {
+        return false;
+    }
+    (steps.rename)(from, to).is_ok() || copy_whole(from, to, steps)
+}
+
+/// Across drives a file arrives under its name whole or not at all: copied under a name of
+/// the app's own beside it (`config::temp_for`), flushed, then given its name, and only then
+/// the first removed. A copy that can't be finished goes; if the first can't be removed, the
+/// copy goes too, and the file is where it was.
+fn copy_whole(from: &Path, to: &Path, steps: &MoveSteps) -> bool {
+    // A temporary name of its own: one that is taken (a file there, of whoever's) is passed
+    // over for the next, and left as it is. Only what this copy made is ever removed.
+    let made = (0..8).find_map(|_| {
+        let temp = (steps.temp)(to);
+        match fs::OpenOptions::new().write(true).create_new(true).open(&temp) {
+            Ok(file) => Some(Ok((temp, file))),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
+            Err(error) => Some(Err(error)),
+        }
+    });
+    let Some(Ok((temp, mut target))) = made else { return false };
+    let copied = (|| {
+        let mut source = fs::File::open(from)?;
+        let length = std::io::copy(&mut source, &mut target)?;
+        (steps.flush)(&target)?;
+        if fs::metadata(from)?.len() != length {
+            return Err(std::io::Error::other("the copy came out a different length"));
+        }
+        Ok(())
+    })();
+    if copied.is_err() || fs::symlink_metadata(to).is_ok() || fs::rename(&temp, to).is_err() {
+        let _ = fs::remove_file(&temp);
+        return false;
+    }
+    if fs::remove_file(from).is_err() {
+        let _ = fs::remove_file(to);
+        return false;
+    }
+    true
+}
+
+/// Whether two folders are on one drive (a rename between them works), tried with a scrap of
+/// a file under a name nothing has (`create_new`); only the file it made is removed.
+pub fn same_drive(from: &Path, to: &Path) -> bool {
+    let probe = crate::config::temp_for(&from.join("move-test"));
+    let Some(name) = probe.file_name() else { return false };
+    let there = to.join(name);
+    if fs::OpenOptions::new().write(true).create_new(true).open(&probe).is_err() {
+        return false;
+    }
+    let same = fs::symlink_metadata(&there).is_err() && fs::rename(&probe, &there).is_ok();
+    let _ = fs::remove_file(if same { &there } else { &probe });
+    same
 }
 
 /// Fetches one song's audio into the downloads folder. Runs on a worker thread. `quality`
@@ -603,12 +836,7 @@ impl Controller {
 
     /// Deletes these songs' saved copies, and stops any that are still on their way.
     pub fn remove_downloads(self: &Rc<Self>, ids: &[String]) {
-        {
-            let mut downloads = self.downloads.borrow_mut();
-            for id in ids {
-                downloads.remove(id);
-            }
-        }
+        self.downloads.borrow_mut().remove_many(ids);
         self.cancel_downloads(ids);
     }
 
@@ -624,42 +852,61 @@ impl Controller {
         if fs::create_dir_all(&folder).is_err() || !folder.is_dir() {
             return self.toast(format!("{} can't be used as a folder.", folder.display()));
         }
-        // Room for them all, unless it's the same drive (when nothing is copied). Renaming a
-        // scrap of a file across tells which.
-        let probe = from.join("move-test.part");
-        let same_drive = fs::write(&probe, b"").is_ok() && fs::rename(&probe, folder.join("move-test.part")).is_ok();
-        let _ = fs::remove_file(&probe);
-        let _ = fs::remove_file(folder.join("move-test.part"));
-        let needed = crate::config::dir_size(&from);
-        if let Some(free) = free_space(&folder).filter(|free| !same_drive && needed + SPARE > *free) {
+        // The list as it stands, on the disk, before anything is decided from it.
+        if let Err(said) = self.downloads.borrow_mut().ready_to_move() {
+            return self.toast(said);
+        }
+        let account = self.downloads.borrow().account.clone();
+        let plan = match plan_for(&from, &account) {
+            Ok(plan) => plan,
+            Err(said) => return self.toast(said),
+        };
+        // Room for what moves, unless it's the same drive (when nothing is copied).
+        if let Some(free) = free_space(&folder).filter(|free| !same_drive(&from, &folder) && plan.bytes + SPARE > *free) {
             return self.toast(format!(
                 "Not enough room there: the downloads come to {}, and that drive has {} free. (Half a gigabyte is always left spare.)",
-                size_label(needed),
+                size_label(plan.bytes),
                 size_label(free)
             ));
         }
-        self.downloads.borrow_mut().save_if_due(true);
         self.moving_downloads.set(true);
         self.toast(format!("Moving your downloads to {}…", folder.display()));
         std::thread::spawn(move || {
-            let (moved, stuck) = move_folder(&from, &folder);
+            let moved = move_folder_by(&from, &folder, &plan, &MOVING);
             post(move |ctl| {
                 ctl.moving_downloads.set(false);
-                // What couldn't be moved is still where it was: stay there with everything
-                // else left behind, so nothing is lost sight of.
-                if stuck > 0 {
-                    let (back, _) = move_folder(&folder, &from);
-                    let account = ctl.account();
-                    *ctl.downloads.borrow_mut() = Downloads::load(from, &account);
-                    ctl.toast(format!("{stuck} of {} files couldn't be moved, so the downloads are staying where they were.", moved + stuck));
-                    let _ = back;
-                } else {
-                    ctl.settings.borrow_mut().downloads_dir =
-                        if folder == ctl.paths.downloads { String::new() } else { folder.display().to_string() };
-                    ctl.save_settings();
-                    let account = ctl.account();
-                    *ctl.downloads.borrow_mut() = Downloads::load(folder.clone(), &account);
-                    ctl.toast(format!("Your downloads are now in {}", folder.display()));
+                let account = ctl.account();
+                match moved {
+                    Moved::All(_) => {
+                        ctl.settings.borrow_mut().downloads_dir =
+                            if folder == ctl.paths.downloads { String::new() } else { folder.display().to_string() };
+                        *ctl.downloads.borrow_mut() = Downloads::load(folder.clone(), &account);
+                        if ctl.settings.borrow().save_surely(&ctl.paths.settings) {
+                            ctl.toast(format!("Your downloads are now in {}", folder.display()));
+                        } else {
+                            ctl.toast(format!(
+                                "Your downloads have moved to {}, but the setting that says so couldn't be saved. If they aren't shown after the app next starts, choose that folder again under Settings, Storage.",
+                                folder.display()
+                            ));
+                        }
+                    }
+                    Moved::Taken(taken) => ctl.toast(if taken == 1 {
+                        format!("A file with the same name as one of your downloads is already in {}, so nothing was moved. Choose an empty folder, or move it out of that one first.", folder.display())
+                    } else {
+                        format!("{taken} files with the same names as your downloads are already in {}, so nothing was moved. Choose an empty folder, or move those out of it first.", folder.display())
+                    }),
+                    Moved::Back { stuck, of } => {
+                        *ctl.downloads.borrow_mut() = Downloads::load(from, &account);
+                        ctl.toast(format!("{stuck} of {of} files couldn't be moved, so the downloads are staying where they were."));
+                    }
+                    Moved::Split { left } => {
+                        *ctl.downloads.borrow_mut() = Downloads::load(from.clone(), &account);
+                        ctl.toast(format!(
+                            "Some files couldn't be moved, and {left} of those that had been couldn't be brought back: they are in {}. The rest are still in {}, where the app goes on keeping your downloads.",
+                            folder.display(),
+                            from.display()
+                        ));
+                    }
                 }
                 ctl.sync_downloads();
                 ctl.rebuild_tracks();
@@ -677,10 +924,7 @@ impl Controller {
 
     pub fn remove_all_downloads(self: &Rc<Self>) {
         let ids: Vec<String> = self.downloads.borrow().songs().into_iter().map(|song| song.id).collect();
-        let collections = self.downloads.borrow().collections.clone();
-        for id in collections {
-            self.keep_downloaded(&id, false);
-        }
+        self.downloads.borrow_mut().forget_collections();
         self.remove_downloads(&ids);
         self.toast("Downloads removed");
     }
@@ -927,14 +1171,248 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    fn list(entries: &[Entry]) -> Vec<u8> {
+        serde_json::to_vec(entries).unwrap()
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir).unwrap().map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        names
+    }
+
+    /// A downloads folder of the person's: the app's list and songs, and files of theirs.
+    fn their_folder(name: &str) -> PathBuf {
+        // (One down, so that what `..` names is a file of the test's own.)
+        let from = folder(name).join("dl");
+        fs::create_dir_all(from.join("sub")).unwrap();
+        // Named in the list with a folder in them, and there: never followed.
+        fs::write(from.join("../c.flac"), b"outside").unwrap();
+        fs::write(from.join("sub/d.flac"), b"below").unwrap();
+        fs::write(from.join("index-someone.json"), list(&[entry("a", "a.flac", 3), entry("b", "b.flac", 3), entry("c", "../c.flac", 3), entry("d", "sub/d.flac", 3)])).unwrap();
+        fs::write(from.join("collections-someone.json"), br#"["liked"]"#).unwrap();
+        fs::write(from.join("a.flac"), b"one").unwrap();
+        fs::write(from.join("b.flac"), b"two").unwrap();
+        // Theirs: named like the app's, and a list of strings with no list of downloads beside it.
+        for (name, text) in [("index-tax.tmp", "theirs"), ("index-tax.json", "theirs too"), ("collections-tax.json", r#"["a list of theirs"]"#), ("notes.txt", "and theirs")] {
+            fs::write(from.join(name), text).unwrap();
+        }
+        from
+    }
+
+    const THEIRS: [&str; 5] = ["collections-tax.json", "index-tax.json", "index-tax.tmp", "notes.txt", "sub"];
+    const APPS: [&str; 4] = ["a.flac", "b.flac", "collections-someone.json", "index-someone.json"];
+
+    #[test]
+    fn the_move_is_decided_before_anything_moves_and_takes_only_the_apps_files() {
+        let from = their_folder("plan");
+        let planned: Vec<String> = plan(&from).names.into_iter().map(|name| name.to_string_lossy().into_owned()).collect();
+        // A song named with a folder in it, or `..`, isn't followed; nor is a list of theirs.
+        assert_eq!(planned, APPS);
+        let to = folder("plan-to");
+        assert_eq!(move_folder(&from, &to), Moved::All(4));
+        assert_eq!(names(&to), APPS);
+        assert_eq!(names(&from), THEIRS);
+        let _ = fs::remove_dir_all(from.parent().unwrap());
+        let _ = fs::remove_dir_all(to);
+    }
+
+    #[test]
+    fn a_name_taken_in_the_new_folder_stops_the_move_before_it_starts() {
+        // The new folder was a downloads folder once: its own list has the same name. Nothing
+        // moves, and nothing in either folder is touched.
+        let from = their_folder("taken");
+        let to = folder("taken-to");
+        fs::write(to.join("index-someone.json"), list(&[entry("z", "z.flac", 3)])).unwrap();
+        fs::write(to.join("z.flac"), b"theirs, listed there").unwrap();
+        let before = (names(&from), names(&to));
+        assert_eq!(move_folder(&from, &to), Moved::Taken(1));
+        assert_eq!((names(&from), names(&to)), before);
+        let _ = fs::remove_dir_all(from.parent().unwrap());
+        let _ = fs::remove_dir_all(to);
+    }
+
+    #[test]
+    fn what_moved_is_put_back_by_the_moves_own_list_when_a_file_cant_move() {
+        // b.flac can't be moved, by rename or by copy: what moved comes back, and what was in
+        // the new folder before stays there.
+        let from = their_folder("back");
+        let to = folder("back-to");
+        // The new folder's own: a list of another account's, and the song it names. Put back
+        // by looking at that folder, they would be taken too.
+        fs::write(to.join("index-other.json"), list(&[entry("t", "theirs.flac", 3)])).unwrap();
+        fs::write(to.join("theirs.flac"), b"in the new folder already").unwrap();
+        let stuck = MoveSteps {
+            rename: |from, to| if from.ends_with("b.flac") { Err(std::io::Error::other("no")) } else { fs::rename(from, to) },
+            flush: |_| Err(std::io::Error::other("no")),
+            ..MOVING
+        };
+        let before = names(&from);
+        assert_eq!(move_folder_by(&from, &to, &plan(&from), &stuck), Moved::Back { stuck: 1, of: 4 });
+        assert_eq!(names(&from), before);
+        assert_eq!(names(&to), ["index-other.json", "theirs.flac"]);
+        // And one that can't come back either: said, with how many are left where.
+        let split = MoveSteps {
+            rename: |from, to| {
+                let back = to.to_string_lossy().contains("split-from");
+                if from.ends_with("b.flac") || (back && to.ends_with("a.flac")) { Err(std::io::Error::other("no")) } else { fs::rename(from, to) }
+            },
+            flush: |_| Err(std::io::Error::other("no")),
+            ..MOVING
+        };
+        let (from, to) = (their_folder("split-from"), folder("split-to"));
+        assert_eq!(move_folder_by(&from, &to, &plan(&from), &split), Moved::Split { left: 1 });
+        assert!(to.join("a.flac").exists() && from.join("b.flac").exists() && from.join("index-someone.json").exists());
+        for dir in ["back", "back-to", "split-from", "split-to"] {
+            let _ = fs::remove_dir_all(folder(dir));
+        }
+    }
+
+    #[test]
+    fn across_drives_a_song_arrives_whole_or_not_at_all() {
+        // Another drive: copied. Killed once the copy is written and before it has its name:
+        // nothing at the song's name in the new folder, and the song whole in the old.
+        let from = their_folder("copy");
+        let to = folder("copy-to");
+        let killed = MoveSteps { rename: |_, _| Err(std::io::Error::other("another drive")), flush: |_| panic!("killed"), ..MOVING };
+        let planned = plan(&from);
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| move_folder_by(&from, &to, &planned, &killed))).is_err());
+        assert!(!to.join("a.flac").exists() && fs::read(from.join("a.flac")).unwrap() == b"one");
+        // What it was copying into is there, under a temporary name of the app's, never the song's.
+        assert!(!names(&to).is_empty() && names(&to).iter().all(|name| name.starts_with("a.flac.") && name.ends_with(".tmp")), "{:?}", names(&to));
+        // Not killed: each copied whole, and gone from the old folder.
+        let (from, to) = (their_folder("copy2"), folder("copy2-to"));
+        let copying = MoveSteps { rename: |_, _| Err(std::io::Error::other("another drive")), ..MOVING };
+        assert_eq!(move_folder_by(&from, &to, &plan(&from), &copying), Moved::All(4));
+        assert_eq!(fs::read(to.join("a.flac")).unwrap(), b"one");
+        assert_eq!(names(&from), THEIRS);
+        for dir in ["copy", "copy-to", "copy2", "copy2-to"] {
+            let _ = fs::remove_dir_all(folder(dir));
+        }
+    }
+
+    #[test]
+    fn a_temporary_name_that_is_taken_is_passed_over_and_left_as_it_is() {
+        // Across drives, the first name a copy would be made under is had already, by a file
+        // of whoever's: it isn't touched, the next is used, and the move goes through.
+        thread_local!(static COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) });
+        let (from, to) = (their_folder("taken-temp"), folder("taken-temp-to"));
+        fs::write(to.join("a.flac.999.0.tmp"), b"not the app's").unwrap();
+        let counted = MoveSteps {
+            rename: |_, _| Err(std::io::Error::other("another drive")),
+            temp: |to| {
+                let count = COUNT.get();
+                COUNT.set(count + 1);
+                to.with_file_name(format!("{}.999.{count}.tmp", to.file_name().unwrap().to_string_lossy()))
+            },
+            ..MOVING
+        };
+        assert_eq!(move_folder_by(&from, &to, &plan(&from), &counted), Moved::All(4));
+        assert_eq!(fs::read(to.join("a.flac.999.0.tmp")).unwrap(), b"not the app's");
+        assert_eq!(names(&to), ["a.flac", "a.flac.999.0.tmp", "b.flac", "collections-someone.json", "index-someone.json"]);
+        let _ = fs::remove_dir_all(folder("taken-temp"));
+        let _ = fs::remove_dir_all(to);
+    }
+
+    #[test]
+    fn a_move_never_writes_over_a_list_it_couldnt_read_nor_rewrites_a_clean_one() {
+        let dir = folder("unread-list");
+        fs::write(dir.join("index-someone.json"), b"half a lis").unwrap();
+        let mut downloads = Downloads::load(dir.clone(), "someone");
+        assert!(downloads.ready_to_move().is_err_and(|said| said.contains("couldn't be read")));
+        assert_eq!(fs::read(dir.join("index-someone.json")).unwrap(), b"half a lis");
+        // A list that reads, with nothing unwritten: not written again (a rewrite would lose
+        // the spaces it was written with here).
+        let written = serde_json::to_vec_pretty(&[entry("a", "a.flac", 3)]).unwrap();
+        fs::write(dir.join("index-someone.json"), &written).unwrap();
+        fs::write(dir.join("a.flac"), b"one").unwrap();
+        let mut downloads = Downloads::load(dir.clone(), "someone");
+        assert!(downloads.ready_to_move().is_ok());
+        assert_eq!(fs::read(dir.join("index-someone.json")).unwrap(), written);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_list_made_good_can_be_moved_and_one_that_cant_be_read_when_planned_cant() {
+        // A damaged list, loaded; then a song arrives and the list is written whole again.
+        let dir = folder("made-good");
+        fs::write(dir.join("index-someone.json"), b"half a lis").unwrap();
+        let mut downloads = Downloads::load(dir.clone(), "someone");
+        fs::write(dir.join("a.flac"), b"one").unwrap();
+        downloads.add(entry("a", "a.flac", 3));
+        downloads.save_if_due(true);
+        assert!(serde_json::from_slice::<Vec<Entry>>(&fs::read(dir.join("index-someone.json")).unwrap()).is_ok());
+        assert_eq!(downloads.ready_to_move(), Ok(()), "a list written good since was still refused");
+        assert_eq!(plan_for(&dir, "someone").map(|plan| plan.names.len()), Ok(2));
+        // The list in use can't be read as the move is planned: refused, not "moved" with the
+        // songs left where they are. Another account's that can't be read is left out, as before.
+        fs::write(dir.join("index-other.json"), b"not a list").unwrap();
+        assert_eq!(plan_for(&dir, "someone").map(|plan| plan.names.len()), Ok(2));
+        fs::write(dir.join("index-someone.json"), b"half a lis").unwrap();
+        assert!(plan_for(&dir, "someone").is_err_and(|said| said.contains("couldn't be read")));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_drive_is_told_without_touching_a_file_of_theirs() {
+        let (from, to) = (folder("probe"), folder("probe-to"));
+        fs::write(from.join("move-test.part"), "theirs").unwrap();
+        fs::write(to.join("move-test.part"), "theirs too").unwrap();
+        assert!(same_drive(&from, &to));
+        assert_eq!((names(&from), names(&to)), (vec!["move-test.part".to_string()], vec!["move-test.part".to_string()]));
+        assert_eq!((fs::read_to_string(from.join("move-test.part")).unwrap(), fs::read_to_string(to.join("move-test.part")).unwrap()), ("theirs".to_string(), "theirs too".to_string()));
+        let _ = fs::remove_dir_all(from);
+        let _ = fs::remove_dir_all(to);
+    }
+
+    #[test]
+    fn only_the_apps_own_cut_short_downloads_are_cleared() {
+        let dir = folder("partials");
+        fs::write(dir.join("index-someone.json"), list(&[entry("a", "a.flac", 3)])).unwrap();
+        fs::write(dir.join("a.flac"), b"one").unwrap();
+        // And what a copy across drives left: only for a song the list names.
+        for name in ["b-1_X.mp3.7.part", "a.flac.part", "video.mp4.part", "movie.2.part", "report.part", "two words.mp3.3.part", "a.flac.12.3.tmp", "b.flac.12.3.tmp", "a.flac.x.3.tmp"] {
+            fs::write(dir.join(name), "x").unwrap();
+        }
+        let _ = Downloads::load(dir.clone(), "someone");
+        assert_eq!(names(&dir), ["a.flac", "a.flac.x.3.tmp", "b.flac.12.3.tmp", "index-someone.json", "movie.2.part", "report.part", "two words.mp3.3.part", "video.mp4.part"]);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn on_the_windows_thread_only_a_press_waits_for_the_disk_and_once() {
+        let dir = folder("window");
+        crate::config::mark_window_thread();
+        let flushes = crate::config::window_flushes;
+        let mut downloads = Downloads::load(dir.clone(), "someone");
+        let ids: Vec<String> = (0..20).map(|n| format!("s{n}")).collect();
+        let before = flushes();
+        // In passing: a batch arriving and ending, Recently played, the settings saved by an
+        // exchange, when songs were added, the crash note's marker.
+        for id in &ids {
+            fs::write(dir.join(format!("{id}.flac")), b"x").unwrap();
+            downloads.add(entry(id, &format!("{id}.flac"), 1));
+            downloads.save_if_due(false);
+        }
+        downloads.save_if_due(true);
+        crate::config::save_history(&dir.join("history.json"), &[]);
+        crate::config::Settings::default().save_in_passing(&dir.join("settings.json"));
+        crate::added::Added::load(dir.join("playlist-added.json")).record("p", &ids, 1_700_000_000);
+        assert_eq!(flushes(), before, "a write in passing waited for the disk on the window's thread");
+        // A press: twenty downloads removed at once, the list flushed once.
+        downloads.remove_many(&ids);
+        assert_eq!(flushes(), before + 1);
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn moves_a_folder_of_downloads() {
         let (from, to) = (folder("from"), folder("to"));
         fs::write(from.join("a.flac"), b"one").unwrap();
-        fs::write(from.join("index-someone.json"), b"[]").unwrap();
+        fs::write(from.join("index-someone.json"), serde_json::to_vec(&[entry("a", "a.flac", 3)]).unwrap()).unwrap();
         fs::write(from.join("c.flac.7.part"), b"half").unwrap();
         fs::create_dir_all(from.join("a folder")).unwrap();
-        assert_eq!(move_folder(&from, &to), (2, 0));
+        assert_eq!(move_folder(&from, &to), Moved::All(2));
         assert_eq!(fs::read(to.join("a.flac")).unwrap(), b"one");
         assert!(to.join("index-someone.json").exists() && !from.join("a.flac").exists());
         // A file still arriving stays behind, and folders aren't touched.

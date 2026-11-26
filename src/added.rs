@@ -52,9 +52,12 @@ impl Added {
         Added { path, kept }
     }
 
+    /// In passing, always: it is written on the window's thread when the server has taken an
+    /// edit, a look at a playlist or a scan has noted something, or other devices' notes are
+    /// taken in; never inside a press (`docs/FILES.md`).
     fn save(&self) {
         if let Ok(json) = serde_json::to_vec(&self.kept) {
-            crate::config::write_atomically(&self.path, &json);
+            let _ = crate::config::write_in_passing(&self.path, &json);
         }
     }
 

@@ -12,7 +12,7 @@ use nexus_core::levelling::in_album_order;
 use nexus_core::queue::{Lineup, compare_lists, follow_list};
 
 use crate::audio::engine::{Event, TrackRequest};
-use crate::config::{SavedQueue, Settings, VOLUME_LEVELS};
+use crate::config::{Durable, SavedQueue, Settings, VOLUME_LEVELS};
 use crate::controller::{Controller, Route, with};
 use crate::jam::Remote;
 use crate::subsonic::{ApiError, Lyrics, Song};
@@ -397,7 +397,8 @@ impl Controller {
             }
         }
         self.whole_queue();
-        self.save_settings();
+        // (A new queue starting: in passing.)
+        self.save_settings_in_passing();
         self.start_current(0.0);
         self.sync_transport();
         self.sync_page_shuffle();
@@ -913,6 +914,16 @@ impl Controller {
     /// Turns shuffle on or off for what's playing. The current song carries on: turning it
     /// on shuffles what follows; turning it off continues from this song in the list's order.
     pub fn set_shuffle(self: &Rc<Self>, on: bool) {
+        self.shuffle_saving(on, Durable::Flushed);
+    }
+
+    /// Shuffle turned on or off by a jam's guest or a linked device: no press here, so the
+    /// settings are written in passing.
+    pub fn set_shuffle_from_afar(self: &Rc<Self>, on: bool) {
+        self.shuffle_saving(on, Durable::InPassing);
+    }
+
+    fn shuffle_saving(self: &Rc<Self>, on: bool, durable: Durable) {
         self.came_in(Who::Here, What::Playing);
         let source = {
             let mut pb = self.playback.borrow_mut();
@@ -930,9 +941,16 @@ impl Controller {
             pb.source.clone()
         };
         self.settings.borrow_mut().shuffle = on;
-        self.save_settings();
-        // The list being played remembers the choice for next time.
-        self.choose_shuffle(&source, on);
+        if source.is_empty() {
+            match durable {
+                Durable::Flushed => self.save_settings(),
+                Durable::InPassing => self.save_settings_in_passing(),
+            }
+        } else {
+            // The list being played remembers the choice for next time: that writes the
+            // settings, shuffle and all, once.
+            self.choose_shuffle_saving(&source, on, durable);
+        }
         self.sync_transport();
         self.next_changed();
         self.sync_page_shuffle();
@@ -972,13 +990,25 @@ impl Controller {
 
     /// Sets repeat: 0 off, 1 the whole queue, 2 the current track.
     pub fn set_repeat(self: &Rc<Self>, mode: u8) {
+        self.repeat_saving(mode, Durable::Flushed);
+    }
+
+    /// Repeat set by a jam's guest or a linked device: written in passing.
+    pub fn set_repeat_from_afar(self: &Rc<Self>, mode: u8) {
+        self.repeat_saving(mode, Durable::InPassing);
+    }
+
+    fn repeat_saving(self: &Rc<Self>, mode: u8, durable: Durable) {
         self.came_in(Who::Here, What::Manner);
         {
             let mut pb = self.playback.borrow_mut();
             pb.repeat = mode.min(2);
             self.settings.borrow_mut().repeat = pb.repeat;
         }
-        self.save_settings();
+        match durable {
+            Durable::Flushed => self.save_settings(),
+            Durable::InPassing => self.save_settings_in_passing(),
+        }
         self.sync_transport();
         self.next_changed();
     }
@@ -2129,12 +2159,13 @@ impl Controller {
         self.saver.write(self.paths.queue_place.clone(), move || serde_json::to_vec(&place).ok());
     }
 
-    /// [`Self::save_queue`], and **not back until it is on disk** (or five seconds have
-    /// gone): for the mark of a queue handed to another device, which the next start of
-    /// the app must find whatever becomes of this run. Linking only.
-    pub(crate) fn save_queue_surely(&self) {
+    /// [`Self::save_queue`], and **not back until it is on disk**: for the mark of a queue
+    /// handed to another device, which the next start of the app must find whatever becomes
+    /// of this run. Whether it is there (false if a write failed, or five seconds went by
+    /// first: it is then written with the next save). Linking only.
+    pub(crate) fn save_queue_surely(&self) -> bool {
         self.save_queue();
-        self.saver.flush();
+        self.saver.flush()
     }
 
     /// Brings back the queue from the last run, paused where it stopped.

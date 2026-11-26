@@ -208,6 +208,15 @@ pub struct PageData {
     pub action: String,
     /// On the Requests page: Lidarr's number for the album on each row.
     pub request_ids: Vec<i64>,
+    /// And what the album is: its MusicBrainz id and its artist, to forget the note of it
+    /// once it's taken off the list. (Not among what the pins compare: the old code that
+    /// recorded them had no such thing.)
+    #[serde(skip)]
+    pub request_albums: Vec<(String, String)>,
+    /// And the number of the Lidarr connection they were drawn under (see
+    /// `lidarr::for_connection`).
+    #[serde(skip)]
+    pub request_connection: u64,
     /// Music that isn't in the library: the section's heading, songs that could be asked
     /// for, and the shelves beneath them.
     pub offers_title: String,
@@ -594,11 +603,19 @@ pub fn request_card(offer: &crate::lidarr::Offer) -> CardData {
     }
 }
 
+/// What the Requests page says at its top: what was found wrong with the files what's asked
+/// for is kept in, when the app started, and after that how a batch stands. A batch's
+/// progress, drawn as it changes, never takes the place of the first.
+pub fn requests_notice(batch: &str) -> String {
+    [crate::asked::trouble(), crate::bulk::trouble(), batch.to_string()].into_iter().filter(|said| !said.is_empty()).collect::<Vec<_>>().join(" ")
+}
+
 /// The albums that have been asked for: those that have arrived lately, then those still on
 /// their way (see `nexus_core::requests::on_their_way`).
 fn requests() -> PageData {
     let title = "Requests".to_string();
-    let Some(lidarr) = crate::lidarr::current() else {
+    let (lidarr, connection) = crate::lidarr::current_numbered();
+    let Some(lidarr) = lidarr else {
         return PageData { title, empty: "Requests are switched off. Turn them on in Settings.".into(), ..Default::default() };
     };
     // (Nothing on Windows stops a request, so "stopped" can't come of it.)
@@ -622,6 +639,8 @@ fn requests() -> PageData {
         lead,
         tracks_title: waiting.heading,
         request_ids: waiting.pending.iter().map(|(album, _)| album.id).collect(),
+        request_albums: waiting.pending.iter().map(|(album, _)| (album.album.clone(), album.artist.clone())).collect(),
+        request_connection: connection,
         // Rows that name an album, not songs that can be played.
         songs: waiting.pending.into_iter().map(|(album, line)| Song { title: album.title, artist: line, ..Default::default() }).collect(),
         empty: waiting.empty,
@@ -629,7 +648,7 @@ fn requests() -> PageData {
     };
     // A batch of albums being asked for (see `bulk`): how it stands, and what it couldn't ask for.
     let (notice, action, other) = crate::bulk::summary().notice();
-    page.notice = notice;
+    page.notice = requests_notice(&notice);
     page.notice_action = action.to_string();
     page.notice_other = other.to_string();
     let missed = crate::bulk::missed();

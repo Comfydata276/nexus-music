@@ -29,8 +29,9 @@ pub enum Target {
     Album { id: String, title: String },
     Artist { id: String, name: String },
     Playlist { id: String, name: String },
-    /// An album on the Requests page: Lidarr's number for it, and its title.
-    Request { id: i64, title: String },
+    /// An album on the Requests page: the Lidarr connection it was drawn under, Lidarr's
+    /// number for it, its MusicBrainz id, its title and its artist.
+    Request { connection: u64, id: i64, album: String, title: String, artist: String },
 }
 
 impl Target {
@@ -254,11 +255,15 @@ impl Controller {
         // On the Requests page a row is an album that's been asked for.
         let request = {
             let page = self.page.borrow();
-            self.song_index(row).and_then(|index| Some((*page.request_ids.get(index)?, page.songs.get(index)?.title.clone())))
+            self.song_index(row).and_then(|index| {
+                let (album, artist) = page.request_albums.get(index).cloned().unwrap_or_default();
+                let title = page.songs.get(index)?.title.clone();
+                Some((Target::Request { connection: page.request_connection, id: *page.request_ids.get(index)?, album, title: title.clone(), artist }, title))
+            })
         };
-        if let Some((id, title)) = request {
+        if let Some((target, title)) = request {
             let entries = vec![self.entry("cancel-request", "Take off the list", self.ui.global::<ui::Icons>().get_x())];
-            return self.open_menu(Target::Request { id, title: title.clone() }, &title, entries, x, y);
+            return self.open_menu(target, &title, entries, x, y);
         }
         // Right-clicking inside a selection acts on all of it.
         let rows = self.rows_for(row);
@@ -657,9 +662,9 @@ impl Controller {
             Target::Songs { songs, .. } => format!("{} songs", songs.len()),
             Target::Album { title, .. } => title.clone(),
             Target::Artist { name, .. } | Target::Playlist { name, .. } => name.clone(),
-            Target::Request { id: album, title } => {
+            Target::Request { connection, id: number, album, title, artist } => {
                 if id == "cancel-request" {
-                    self.cancel_request(*album, title.clone());
+                    self.cancel_request(*connection, *number, album.clone(), title.clone(), artist.clone());
                 }
                 return;
             }
@@ -1465,7 +1470,11 @@ impl Controller {
     /// Likes or unlikes these songs. Unliked songs leave the Liked songs page if it's showing.
     fn set_song_stars(self: &Rc<Self>, ids: Vec<String>, starred: bool) {
         for id in &ids {
-            self.set_star("id", id.clone(), starred);
+            self.star_saving("id", id.clone(), starred, false);
+        }
+        // Offline, what "Like all" holds is written down once for the press, not once a song.
+        if self.is_offline() && !ids.is_empty() {
+            self.save_pending_for_press();
         }
         if starred || ids.is_empty() || !self.page.borrow().liked_songs {
             return;
@@ -1504,19 +1513,24 @@ impl Controller {
     }
 
     fn set_star(self: &Rc<Self>, kind: &'static str, id: String, starred: bool) {
+        self.star_saving(kind, id, starred, true);
+    }
+
+    /// `set_star`; offline, `save` false leaves writing it down to the caller.
+    fn star_saving(self: &Rc<Self>, kind: &'static str, id: String, starred: bool, save: bool) {
         self.apply_star(kind, &id, starred);
         // Lists of liked things are now out of date.
         self.invalidate("liked");
         self.invalidate("albums:");
         let change = crate::offline::Pending::Star { kind: kind.to_string(), id: id.clone(), starred };
-        self.submit(change, move |ctl, reason| {
+        self.submit_saving(change, move |ctl, reason| {
             ctl.apply_star(kind, &id, !starred);
             ctl.toast(format!("That didn't save. {reason}"));
             // A song taken off the Liked songs page is still liked after all: show it again.
             if ctl.page.borrow().liked_songs {
                 ctl.refresh();
             }
-        });
+        }, save);
     }
 
     // ---- callbacks from the interface ----------------------------------------------------------

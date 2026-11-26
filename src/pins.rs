@@ -170,6 +170,12 @@ impl Scene {
     }
 }
 
+/// Keeps a test that changes what's shared of the list of what was asked for apart from the
+/// scenes, which read it.
+pub fn apart() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|stuck| stuck.into_inner())
+}
+
 /// From now on, every request and wait says "stopped".
 #[allow(dead_code)]
 pub fn stop() {

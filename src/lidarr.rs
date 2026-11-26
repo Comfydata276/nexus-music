@@ -11,7 +11,7 @@
 
 use std::sync::{Arc, RwLock};
 
-pub use nexus_core::lidarr::{ArtistOffer, Lidarr, Offers, host, mask, tidy};
+pub use nexus_core::lidarr::{ArtistOffer, Lidarr, Offers, mask, tidy};
 pub use nexus_core::offer::Offer;
 
 /// Lidarr at `address`, asked over an agent of the app's own. `gate` is the sign-in in front
@@ -22,6 +22,7 @@ pub fn open(address: &str, key: &str, gate: Option<Arc<crate::gate::Session>>) -
     let gate = gate.map(|gate| gate as Arc<dyn nexus_core::lidarr::SignIn>);
     Lidarr::new(address, key, gate, Arc::new(crate::corehttp::Agent(crate::subsonic::make_agent_without_redirects())))
 }
+
 
 /// Whether singles and EPs are offered as well as albums. Set from Settings.
 static SINGLES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
@@ -36,7 +37,9 @@ pub fn singles() -> bool {
 
 // ---- the connection in use, and what it has offered -----------------------------------------------
 
-static CURRENT: RwLock<Option<Lidarr>> = RwLock::new(None);
+/// The Lidarr in use; the number of its connection, which goes up whenever what it's made of
+/// changes (its address, its key, the sign-in in front); and what it's made of.
+static CURRENT: RwLock<(Option<Lidarr>, u64, String)> = RwLock::new((None, 0, String::new()));
 /// Albums and artists that have been offered, by Lidarr's names for them, so a click on one
 /// can be acted on.
 static OFFERS: Offers = Offers::new();
@@ -47,12 +50,37 @@ pub fn offers() -> &'static Offers {
 }
 
 pub fn current() -> Option<Lidarr> {
-    CURRENT.read().ok()?.clone()
+    CURRENT.read().ok()?.0.clone()
 }
 
+/// The Lidarr in use, and the number of its connection, read together: what a page and what's
+/// started from it carry (see `for_connection`).
+pub fn current_numbered() -> (Option<Lidarr>, u64) {
+    CURRENT.read().map(|current| (current.0.clone(), current.1)).unwrap_or_default()
+}
+
+/// The Lidarr in use, if it's still the connection numbered `number`: an action begun under
+/// an earlier one (a row of a page drawn before the address, key or sign-in changed) is for
+/// a Lidarr that isn't this one, and does nothing.
+pub fn for_connection(number: u64) -> Option<Lidarr> {
+    let current = CURRENT.read().ok()?;
+    current.0.clone().filter(|_| current.1 == number)
+}
+
+/// Sets the Lidarr in use, for a test.
+#[cfg(test)]
 pub fn set_current(lidarr: Option<Lidarr>) {
+    set_current_made_of(lidarr, String::new());
+}
+
+/// Sets the Lidarr in use, `made_of` saying what it's made of: its address, its key and the
+/// sign-in in front. Its connection's number goes up if that has changed.
+pub fn set_current_made_of(lidarr: Option<Lidarr>, made_of: String) {
     if let Ok(mut current) = CURRENT.write() {
-        *current = lidarr;
+        if current.2 != made_of || current.0.is_some() != lidarr.is_some() {
+            current.1 += 1;
+        }
+        *current = (lidarr, current.1, made_of);
     }
 }
 
@@ -82,6 +110,114 @@ pub fn mark(album: &str, requested: bool) {
 /// What goes to Lidarr and back, against a stand-in server: written against the app as it
 /// was before Lidarr's rules moved to the library, so that the move can be seen to change
 /// nothing on the wire.
+#[cfg(test)]
+mod origins {
+    use super::*;
+    use nexus_core::lidarr::same_origin;
+
+    #[test]
+    fn an_action_is_for_the_lidarr_it_was_begun_under() {
+        let _apart = crate::pins::apart();
+        let at = |address: &str| Some(Lidarr::new(address, "key", None, Arc::new(crate::corehttp::Agent(crate::subsonic::make_agent_without_redirects()))));
+        set_current_made_of(at("http://a.example"), "a\nkey-a\n".into());
+        let (_, begun) = current_numbered();
+        assert!(for_connection(begun).is_some());
+        // Nothing changed: the same connection.
+        set_current_made_of(at("http://a.example"), "a\nkey-a\n".into());
+        assert!(for_connection(begun).is_some());
+        // Another address, another key, a sign-in: another connection, and the row's action
+        // does nothing.
+        for made_of in ["b\nkey-a\n", "b\nkey-b\n", "b\nkey-b\n1"] {
+            set_current_made_of(at("http://b.example"), made_of.into());
+            assert!(for_connection(begun).is_none(), "{made_of}");
+        }
+        set_current(None);
+    }
+
+    #[test]
+    fn a_key_belongs_to_the_scheme_host_and_port_it_was_typed_for() {
+        assert!(!same_origin("https://lidarr.example.org", "http://lidarr.example.org"));
+        assert!(!same_origin("lidarr.example.org:8686", "https://lidarr.example.org:8686"));
+        assert!(same_origin("https://Lidarr.Example.org/", "https://lidarr.example.org:443/lidarr"));
+        assert!(!same_origin("http://lidarr.example.org:8686", "http://lidarr.example.org:8687"));
+    }
+
+    /// Where the app's HTTP client would connect for an address: its scheme, host and port as
+    /// its own parser reads them.
+    fn where_the_agent_goes(address: &str) -> Option<(String, String, u16)> {
+        let uri: ureq::http::Uri = tidy(address).parse().ok()?;
+        let scheme = uri.scheme_str()?.to_ascii_lowercase();
+        let port = uri.port_u16().or(match scheme.as_str() {
+            "http" => Some(80),
+            "https" => Some(443),
+            _ => None,
+        })?;
+        Some((scheme, uri.host()?.to_ascii_lowercase(), port))
+    }
+
+    #[test]
+    fn the_library_reads_an_address_as_the_agent_does_or_refuses_it() {
+        // Each address, and what the library makes of it: where it leads, or refused.
+        let table: &[(&str, Option<(&str, &str, u16)>)] = &[
+            ("https://lidarr.example.org", Some(("https", "lidarr.example.org", 443))),
+            ("lidarr.example.org:8686", Some(("http", "lidarr.example.org", 8686))),
+            ("192.168.1.5:8686/", Some(("http", "192.168.1.5", 8686))),
+            ("HTTPS://LIDARR.Example.ORG:443/Lidarr/", Some(("https", "lidarr.example.org", 443))),
+            ("https://lidarr.example.org:443", Some(("https", "lidarr.example.org", 443))),
+            ("http://lidarr.example.org:80/", Some(("http", "lidarr.example.org", 80))),
+            ("https://lidarr.example.org.", Some(("https", "lidarr.example.org.", 443))),
+            ("http://[::1]:8686", Some(("http", "[::1]", 8686))),
+            ("http://[FE80::1]/lidarr", Some(("http", "[fe80::1]", 80))),
+            ("https://lidarr.example.org?x=1", Some(("https", "lidarr.example.org", 443))),
+            ("https://lidarr.example.org#here", Some(("https", "lidarr.example.org", 443))),
+            // Only the origin is judged: a path is the address's own, as 0.40.10 took it, and a
+            // port is its number.
+            ("https://lidarr.example.org/musique/lidärr", Some(("https", "lidarr.example.org", 443))),
+            ("http://192.168.1.5:08686/lidarr", Some(("http", "192.168.1.5", 8686))),
+            ("http://192.168.1.5:0000008686", Some(("http", "192.168.1.5", 8686))),
+            ("https://lidarr.example.org/a b", Some(("https", "lidarr.example.org", 443))),
+            // Refused: a name and password; what the client might read otherwise.
+            ("https://me:secret@lidarr.example.org", None),
+            ("https://evil.example@lidarr.example.org", None),
+            ("http://lidarr.example.org\\@evil.example/", None),
+            ("http://evil.example\\.lidarr.example.org", None),
+            ("https://lidarr.example.org:", None),
+            ("https://lidarr.example.org:0", None),
+            ("https://lidarr.example.org:65536", None),
+            ("https://lidarr.example.org:000", None),
+            ("https://lidarr.example.org:8x", None),
+            ("https://lidärr.example.org", None),
+            ("https://lidarr example.org", None),
+            ("ftp://lidarr.example.org", None),
+            ("https://", None),
+            ("https://[::1", None),
+            ("https://%6cidarr.example.org", None),
+            ("", None),
+        ];
+        for (address, expected) in table {
+            let found = nexus_core::lidarr::origin(address).ok().map(|origin| (origin.scheme, origin.host, origin.port));
+            let expected = expected.map(|(scheme, host, port)| (scheme.to_string(), host.to_string(), port));
+            assert_eq!(found, expected, "the library's reading of {address:?}");
+            // Wherever the library goes by an address, the client goes to the same place, or
+            // (an address its parser won't take, by its path) nowhere.
+            if let (Some(found), Some(agent)) = (found.clone(), where_the_agent_goes(address)) {
+                assert_eq!(agent, found, "the client's reading of {address:?}");
+            }
+            // (Only a path beyond plain ASCII, or with a space, keeps the client from it.)
+            if found.is_some() && address.is_ascii() && !address.contains(' ') {
+                assert!(where_the_agent_goes(address).is_some(), "the client reads {address:?}");
+            }
+        }
+        assert_eq!(nexus_core::lidarr::origin("https://me:secret@lidarr.example.org").unwrap_err(), nexus_core::lidarr::ADDRESS_WITH_NAME);
+        // An address already saved is read as 0.40.10 used it, and goes where the client goes.
+        for address in ["http://me:secret@lidarr.example.org:8686", "https://me@lidarr.example.org/lidarr", "http://lidarr.example.org:", "http://192.168.1.5:/"] {
+            let found = nexus_core::lidarr::origin_saved(address).ok().map(|origin| (origin.scheme, origin.host, origin.port));
+            assert!(found.is_some(), "{address:?}");
+            assert_eq!(where_the_agent_goes(address), found, "the client's reading of {address:?}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod wire {
     use std::io::Write;
@@ -263,7 +399,18 @@ mod wire {
         });
         let wanted = Offer { album: "al1".into(), artist_id: "ar1".into(), title: "First".into(), artist: "Someone".into(), ..Default::default() };
         let started = Instant::now();
-        assert_eq!(lidarr(&address, None).request(&wanted), Ok(()));
+        // (An album: nothing to put back, and nothing written down.)
+        struct Nowhere;
+        impl nexus_core::lidarr::WayBack for Nowhere {
+            fn turn(&self) -> Box<dyn nexus_core::lidarr::Turn + '_> {
+                Box::new(())
+            }
+            fn keep(&self, _: &str, _: i64, _: &str) -> Result<bool, String> {
+                Err("not here".into())
+            }
+            fn put_back(&self, _: &str, _: i64, _: &str) {}
+        }
+        assert_eq!(lidarr(&address, None).request(&wanted, &Nowhere), Ok(()));
         let took = started.elapsed();
         assert!(took >= Duration::from_secs(3) && took < Duration::from_secs(6), "took {took:?}");
         let lines: Vec<String> = sent.lock().unwrap().iter().map(|sent| format!("{} {}", sent.line(), sent.body)).collect();

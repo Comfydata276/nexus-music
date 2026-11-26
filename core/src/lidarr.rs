@@ -147,6 +147,35 @@ pub const NEEDED: &str = "Lidarr is behind a sign-in. In Settings, under Request
 
 use crate::offer::{Offer, VARIOUS};
 
+/// Where the way back from a change to Lidarr is written down **before the change is made**,
+/// and crossed off once it has been put back: an artist's "new releases" setting, turned off
+/// while their singles are read in. The batch of albums keeps it in its file
+/// (`bulk::Job`), so that a run stopped before putting it back has it put back by the next.
+pub trait WayBack {
+    /// One step at a time, for everyone: reading an artist's setting, writing the way back
+    /// and changing the setting are one step, and so are putting it back and crossing it off.
+    /// The step is held while what this returns is. A request asked for by itself holds it
+    /// for its whole sequence; the batch, for each step of its own. The window's thread never
+    /// takes it.
+    fn turn(&self) -> Box<dyn Turn + '_>;
+    /// Writes down that `artist`'s setting on the Lidarr at `lidarr` (its address, as
+    /// `Lidarr::address` has it) is to go back to `before`, and says whether it is on the disk:
+    /// `Ok(true)`, written by this call; `Ok(false)`, a way back for the artist on that Lidarr
+    /// was on the disk already, from before this step, and is that one's to cross off. If it
+    /// can't be written, the answer is why, and Lidarr isn't changed. A way back is only ever
+    /// acted on at the Lidarr it was written for: an artist's number on another means another
+    /// artist.
+    fn keep(&self, lidarr: &str, artist: i64, before: &str) -> Result<bool, String>;
+    /// `artist`'s setting on the Lidarr at `lidarr` has gone back to `before`: the way back
+    /// this step wrote is crossed off.
+    fn put_back(&self, lidarr: &str, artist: i64, before: &str);
+}
+
+/// Held while a step of the way back is under way (`WayBack::turn`).
+pub trait Turn {}
+
+impl<T> Turn for T {}
+
 /// The name of the profile this app makes in Lidarr for artists a single or an EP is asked
 /// of. Lidarr only knows the kinds of release an artist's profile lists.
 const SINGLES_PROFILE: &str = "Albums, EPs and singles";
@@ -183,6 +212,9 @@ pub struct Single {
 pub struct Pending {
     /// Lidarr's own number for the album.
     pub id: i64,
+    /// Its MusicBrainz id (Lidarr's `foreignAlbumId`): what tells it apart from another
+    /// album of the same name.
+    pub album: String,
     pub title: String,
     pub artist: String,
     /// How far along, from 0 to 100, if it's being downloaded; `None` while it's still
@@ -296,7 +328,99 @@ pub fn tidy(address: &str) -> String {
     if address.is_empty() || address.contains("://") { address.to_string() } else { format!("http://{address}") }
 }
 
-/// The host (and port) an address points at, which is what a saved key belongs to.
+/// Where an address leads: the scheme, the host and the port the app connects to. A saved
+/// key (and a sign-in) belongs to one, and to no other.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Origin {
+    /// "http" or "https".
+    pub scheme: String,
+    /// As written, in lower case (a name, an IPv4 address, or an IPv6 one in brackets).
+    pub host: String,
+    pub port: u16,
+}
+
+/// Said of an address with a name and password in it, which isn't kept.
+pub const ADDRESS_WITH_NAME: &str = "That address has a name and password in it. Enter the address alone: Lidarr is reached with its API key.";
+/// Said of an address the app can't be sure of reaching as written.
+pub const ADDRESS_UNUSABLE: &str = "That isn't an address the app can use. Enter it as, say, https://lidarr.example.org or 192.168.1.5:8686.";
+
+/// Where an address leads (see `Origin`), read as the app's HTTP client reads it, or why it
+/// can't be used. Only the origin is judged: the scheme, the host and the port (by its number,
+/// leading zeros and all). Anything there the client might read differently from this is
+/// refused rather than guessed at: a backslash, a space, letters beyond plain ASCII, a port
+/// that isn't a number. A name and password in the address are refused too. What comes after
+/// the host and port (a path) is the address's own, as it always was.
+pub fn origin(address: &str) -> Result<Origin, String> {
+    let address = tidy(address);
+    let (scheme, rest) = address.split_once("://").ok_or(ADDRESS_UNUSABLE)?;
+    let judged = &address[..scheme.len() + 3 + rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+    if !judged.is_ascii() || judged.chars().any(|c| c.is_ascii_control() || c.is_ascii_whitespace() || c == '\\') {
+        return Err(ADDRESS_UNUSABLE.into());
+    }
+    let scheme = scheme.to_ascii_lowercase();
+    let default = match scheme.as_str() {
+        "http" => 80,
+        "https" => 443,
+        _ => return Err(ADDRESS_UNUSABLE.into()),
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.contains('@') {
+        return Err(ADDRESS_WITH_NAME.into());
+    }
+    let (host, port) = if let Some(inside) = authority.strip_prefix('[') {
+        // An IPv6 address, in brackets.
+        let (inside, after) = inside.split_once(']').ok_or(ADDRESS_UNUSABLE)?;
+        if inside.is_empty() || !inside.chars().all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.') {
+            return Err(ADDRESS_UNUSABLE.into());
+        }
+        (format!("[{}]", inside.to_ascii_lowercase()), after)
+    } else {
+        let at = authority.find(':').unwrap_or(authority.len());
+        let host = &authority[..at];
+        if host.is_empty() || !host.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '~')) {
+            return Err(ADDRESS_UNUSABLE.into());
+        }
+        (host.to_ascii_lowercase(), &authority[at..])
+    };
+    let port = match port.strip_prefix(':') {
+        None if port.is_empty() => default,
+        Some(digits) if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) => match digits.trim_start_matches('0').parse::<u16>() {
+            Ok(port) if port > 0 => port,
+            _ => return Err(ADDRESS_UNUSABLE.into()),
+        },
+        _ => return Err(ADDRESS_UNUSABLE.into()),
+    };
+    Ok(Origin { scheme, host, port })
+}
+
+/// Where an address already saved leads, read as 0.40.10 used it: as `origin`, but a name and
+/// password in it (a reverse proxy's HTTP Basic) are passed over, and an empty port (`host:`)
+/// is the scheme's own. For an address loaded from what was kept, never one being typed: what
+/// the person types or changes is held to `origin`. (The phone keeps `origin` always.)
+pub fn origin_saved(address: &str) -> Result<Origin, String> {
+    let address = tidy(address);
+    let Some((scheme, rest)) = address.split_once("://") else { return origin(&address) };
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, after) = rest.split_at(end);
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+    let authority = authority.strip_suffix(':').unwrap_or(authority);
+    origin(&format!("{scheme}://{authority}{after}"))
+}
+
+/// Where an address submitted in Settings leads: if it's the address already `saved`, as it
+/// was saved (`origin_saved`: only a new key was typed); if it differs, by the rule for what's
+/// typed (`origin`).
+pub fn origin_entered(entered: &str, saved: &str) -> Result<Origin, String> {
+    if entered.trim() == saved.trim() { origin_saved(entered) } else { origin(entered) }
+}
+
+/// Whether two addresses lead to the same place (see `origin`). One that can't be used is the
+/// same as nothing.
+pub fn same_origin(a: &str, b: &str) -> bool {
+    matches!((origin(a), origin(b)), (Ok(a), Ok(b)) if a == b)
+}
+
+/// The host (and port) an address points at, as written (see `origin` for what a key belongs to).
 pub fn host(address: &str) -> String {
     let address = tidy(address);
     let rest = address.split_once("://").map_or(address.as_str(), |(_, rest)| rest);
@@ -501,7 +625,10 @@ impl Lidarr {
         let pass = self.gate.as_ref().map(|gate| gate.pass()).transpose()?;
         let (mut status, mut text) = self.once(method, &url, body.as_deref(), pass.as_deref())?;
         if (300..400).contains(&status) {
-            // The sign-in in front turned the pass away; it may only have run out early.
+            // The sign-in in front turned the pass away; it may only have run out early. A
+            // write is sent again too, once, with a fresh pass: a 3xx comes from the sign-in in
+            // front, which did not pass the request on; Lidarr's API does not redirect a write,
+            // and a release or an artist added twice is refused by Lidarr as already there.
             if let Some(gate) = &self.gate {
                 gate.forget_pass();
                 let pass = gate.pass()?;
@@ -608,12 +735,14 @@ impl Lidarr {
 
     /// Has Lidarr keep track of an artist: every album of theirs goes on its list, and new
     /// ones will as they come out. Returns how many albums that put on the list. Seen through
-    /// once it has changed anything, as `request` is.
-    pub fn add_artist(&self, artist: &str, name: &str) -> Result<usize, String> {
-        self.seeing_through().adding_artist(artist, name)
+    /// once it has changed anything, as `request` is, and one step at a time with every other
+    /// change to an artist's record (`WayBack::turn`): it reads the record and writes it back.
+    pub fn add_artist(&self, artist: &str, name: &str, way_back: &dyn WayBack) -> Result<usize, String> {
+        self.seeing_through().adding_artist(artist, name, way_back)
     }
 
-    fn adding_artist(&self, artist: &str, name: &str) -> Result<usize, String> {
+    fn adding_artist(&self, artist: &str, name: &str, way_back: &dyn WayBack) -> Result<usize, String> {
+        let _turn = way_back.turn();
         let Some((known, _)) = self.known_artist(artist)? else {
             let folders: Vec<RootFolder> = self.get("rootfolder")?;
             let folder = folders.first().ok_or("Lidarr has no music folder set up yet.")?;
@@ -658,11 +787,15 @@ impl Lidarr {
     /// left not taking new releases, would be worse than no request. So a stop is honoured only
     /// before the first change; just before it, the app is told to see this through
     /// (`Http::keep_going`).
-    pub fn request(&self, wanted: &Offer) -> Result<(), String> {
-        self.seeing_through().requesting(wanted)
+    pub fn request(&self, wanted: &Offer, way_back: &dyn WayBack) -> Result<(), String> {
+        self.seeing_through().requesting(wanted, way_back)
     }
 
-    fn requesting(&self, wanted: &Offer) -> Result<(), String> {
+    fn requesting(&self, wanted: &Offer, way_back: &dyn WayBack) -> Result<(), String> {
+        // The whole of it, one at a time with every other change that has to be put back
+        // (`WayBack::turn`): it is a few requests long. An album by Various Artists too: it
+        // reads their record and writes it back.
+        let _turn = way_back.turn();
         if wanted.artist_id == VARIOUS {
             return self.request_from_various(wanted);
         }
@@ -672,11 +805,11 @@ impl Lidarr {
         let artists: Vec<ArtistRes> = self.get("artist")?;
         let known = artists.into_iter().find(|artist| artist.foreign_artist_id == wanted.artist_id).map(|artist| artist.id);
         // What the artist's "new releases" setting was, if it had to be turned off meanwhile.
-        let mut put_back: Option<String> = None;
+        let mut put_back: Option<(String, bool)> = None;
         let artist = match known {
             Some(artist) => {
                 if !plain {
-                    put_back = self.list_singles(artist, wanted)?;
+                    put_back = self.list_singles(artist, wanted, way_back)?;
                 }
                 artist
             }
@@ -710,8 +843,12 @@ impl Lidarr {
         };
         let outcome = self.place(artist, wanted);
         match put_back {
-            Some(before) => {
+            Some((before, wrote)) => {
                 let restored = self.restore_new_releases(artist, &before);
+                // Crossed off only if this request wrote it.
+                if restored.is_ok() && wrote {
+                    way_back.put_back(&self.way_back_address(), artist, &before);
+                }
                 outcome.and(restored.map_err(|_| {
                     format!("Asked for “{}”, but couldn't turn new releases back on for {} in Lidarr. Check that artist's settings there.", wanted.title, wanted.artist)
                 }))
@@ -786,8 +923,8 @@ impl Lidarr {
     /// Left as it was, Lidarr would take every single and EP it now learns of to be a new
     /// release and fetch the lot. With the setting off while it reads them in, they're
     /// listed and nothing more; turning it back on afterwards doesn't change that.
-    fn list_singles(&self, artist: i64, wanted: &Offer) -> Result<Option<String>, String> {
-        let before = self.start_listing_singles(artist, wanted)?;
+    fn list_singles(&self, artist: i64, wanted: &Offer, way_back: &dyn WayBack) -> Result<Option<(String, bool)>, String> {
+        let before = self.start_listing_singles_kept(artist, wanted, way_back)?;
         if before.is_some() {
             // Lidarr starts reading the artist's releases in again; give it a moment to begin.
             // A wait cut short ends here, but the setting is still handed back to be put back.
@@ -796,29 +933,43 @@ impl Lidarr {
         Ok(before)
     }
 
-    /// The same, without waiting for Lidarr to begin: for a caller that watches for it to
-    /// finish (see `busy_with`) and puts the setting back itself (see `set_new_releases`).
-    pub fn start_listing_singles(&self, artist: i64, wanted: &Offer) -> Result<Option<String>, String> {
+    /// The same, without waiting for Lidarr to begin, for a caller that watches for it to
+    /// finish (see `busy_with`) and puts the setting back itself (see `set_new_releases`). The
+    /// caller holds `way_back`'s turn. What the setting is to be put back to is written down
+    /// (`WayBack::keep`) **before anything on Lidarr is changed**, the profile made for this
+    /// included: if it can't be, nothing is. Returns it, and whether this wrote it. The
+    /// requests sent to Lidarr, and their order, are 0.40.10's.
+    pub fn start_listing_singles_kept(&self, artist: i64, wanted: &Offer, way_back: &dyn WayBack) -> Result<Option<(String, bool)>, String> {
         let profiles: Vec<serde_json::Value> = self.get("metadataprofile")?;
         let mut record: serde_json::Value = self.get(&format!("artist/{artist}"))?;
         let current = profiles.iter().find(|profile| profile.get("id") == record.get("metadataProfileId"));
         if current.is_some_and(|profile| suits(profile, wanted)) {
             return Ok(None);
         }
-        let ours = self.profile_for(&profiles, wanted.soundtrack)?;
+        let before = record.get("monitorNewItems").and_then(|setting| setting.as_str()).unwrap_or("all").to_string();
+        let wrote = way_back.keep(&self.way_back_address(), artist, &before)?;
+        // Turned back before the setting is changed: nothing to put back, and what was
+        // written is crossed off.
+        let refused = |reason: String| {
+            if wrote {
+                way_back.put_back(&self.way_back_address(), artist, &before);
+            }
+            reason
+        };
+        let ours = self.profile_for(&profiles, wanted.soundtrack).map_err(&refused)?;
         if let Some(current) = current.filter(|current| !covers(&ours, current)) {
             let name = current.get("name").and_then(|name| name.as_str()).unwrap_or("its own");
-            return Err(format!(
+            return Err(refused(format!(
                 "{} is on Lidarr's “{name}” profile, which doesn't list {}s. Add them to that profile in Lidarr, then ask again.",
                 wanted.artist,
                 if wanted.soundtrack && allows(current, wanted.kind()) { "soundtrack" } else { wanted.kind_word() }
-            ));
+            )));
         }
-        let before = record.get("monitorNewItems").and_then(|setting| setting.as_str()).unwrap_or("all").to_string();
         record["metadataProfileId"] = ours.get("id").cloned().unwrap_or_default();
         record["monitorNewItems"] = "none".into();
+        // (A change that fails here may have been made all the same: what was written stays.)
         let _: serde_json::Value = self.send("PUT", &format!("artist/{artist}"), Some(record))?;
-        Ok(Some(before))
+        Ok(Some((before, wrote)))
     }
 
     /// Sets what Lidarr does about an artist's new releases ("all", "new" or "none").
@@ -836,6 +987,19 @@ impl Lidarr {
     /// Where this Lidarr is: what tells one from another.
     pub fn address(&self) -> &str {
         &self.base
+    }
+
+    /// The address a way back is written under and matched by (`WayBack::keep`): as
+    /// `address`, without a name and password in it (a reverse proxy's), so that none is
+    /// written down beside the way back and a changed password doesn't strand it.
+    pub fn way_back_address(&self) -> String {
+        let Some((scheme, rest)) = self.base.split_once("://") else { return self.base.clone() };
+        let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        let (authority, after) = rest.split_at(end);
+        let authority = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+        // An empty port is the scheme's own (`origin_saved`).
+        let authority = authority.strip_suffix(':').unwrap_or(authority);
+        format!("{scheme}://{authority}{after}")
     }
 
     /// Lidarr's own numbers for the artists it keeps track of, by their MusicBrainz ids.
@@ -1045,6 +1209,7 @@ impl Lidarr {
             .map(|album| Pending {
                 progress: progress.get(&album.id).copied(),
                 id: album.id,
+                album: album.foreign_album_id,
                 title: album.title,
                 artist: album.artist.artist_name,
             })
@@ -1061,8 +1226,34 @@ impl Lidarr {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn an_address_submitted_unchanged_is_judged_as_saved() {
+        let saved = "http://me:secret@lidarr.example.org:8686";
+        // Only a new key typed: the address as it was saved.
+        assert_eq!(origin_entered(saved, saved), origin_saved(saved));
+        assert_eq!(origin_entered(&format!(" {saved} "), saved), origin_saved(saved));
+        // Changed: by the rule for what's typed.
+        assert_eq!(origin_entered("http://me:other@lidarr.example.org:8686", saved).unwrap_err(), ADDRESS_WITH_NAME);
+        assert_eq!(origin_entered("http://lidarr.example.org:", saved).unwrap_err(), ADDRESS_UNUSABLE);
+    }
+
+    #[test]
+    fn a_saved_address_is_read_as_0_40_10_used_it_and_a_typed_one_held_to_the_rule() {
+        let at = |scheme: &str, host: &str, port: u16| Ok(Origin { scheme: scheme.into(), host: host.into(), port });
+        // A name and password (a reverse proxy's HTTP Basic), and an empty port: refused when
+        // typed, read as 0.40.10 used them when saved.
+        assert_eq!(origin("http://me:secret@lidarr.example.org:8686").unwrap_err(), ADDRESS_WITH_NAME);
+        assert_eq!(origin_saved("http://me:secret@lidarr.example.org:8686"), at("http", "lidarr.example.org", 8686));
+        assert_eq!(origin_saved("https://me:s%40cret@Lidarr.example.org/lidarr"), at("https", "lidarr.example.org", 443));
+        assert_eq!(origin("http://lidarr.example.org:").unwrap_err(), ADDRESS_UNUSABLE);
+        assert_eq!(origin_saved("http://lidarr.example.org:/lidarr"), at("http", "lidarr.example.org", 80));
+        // Otherwise the same reading.
+        assert_eq!(origin_saved("lidarr.example.org:08686"), origin("lidarr.example.org:08686"));
+        assert!(origin_saved("http://lid\\arr.example.org").is_err() && origin_saved("ftp://lidarr.example.org").is_err());
+    }
 
     #[test]
     fn tidies_addresses() {
@@ -1212,8 +1403,8 @@ mod tests {
     /// A Lidarr that keeps one artist, on the Standard profile with new releases wanted, and
     /// is forever busy reading artists in; asked over an app that has been told to stop, so
     /// that every wait is cut short. Every request is written down.
-    struct Stopping {
-        asked: std::sync::Mutex<Vec<String>>,
+    pub(crate) struct Stopping {
+        pub(crate) asked: std::sync::Mutex<Vec<String>>,
     }
 
     impl crate::http::Http for Stopping {
@@ -1257,11 +1448,122 @@ mod tests {
         let http = Arc::new(Stopping { asked: Default::default() });
         let lidarr = Lidarr::new("lidarr.test", "key", None, http.clone());
         let single = Offer { album: "al1".into(), artist_id: "ar1".into(), title: "A Single".into(), artist: "Someone".into(), kind: "Single".into(), ..Default::default() };
-        assert_eq!(lidarr.request(&single), Err(STOPPED.to_string()));
+        let noted = Noted::default();
+        assert_eq!(lidarr.request(&single, &noted), Err(STOPPED.to_string()));
         let puts: Vec<String> = http.asked.lock().unwrap().iter().filter(|asked| asked.starts_with("PUT artist/5")).cloned().collect();
         assert_eq!(puts.len(), 2, "{puts:?}");
         assert!(puts[0].contains(r#""monitorNewItems":"none""#) && puts[0].contains(r#""metadataProfileId":2"#), "{}", puts[0]);
         assert!(puts[1].contains(r#""monitorNewItems":"all""#), "{}", puts[1]);
+        // Written down before the change, and crossed off once it was put back.
+        assert_eq!((noted.kept(), noted.put_back.lock().unwrap().clone()), (vec![(5, "all".to_string())], vec![(5, "all".to_string())]));
+    }
+
+    /// Writes the way back down in memory; or, `refuse`, can't.
+    #[derive(Default)]
+    pub(crate) struct Noted {
+        kept: std::sync::Mutex<Vec<(i64, String)>>,
+        put_back: std::sync::Mutex<Vec<(i64, String)>>,
+        refuse: bool,
+    }
+
+    impl Noted {
+        pub(crate) fn kept(&self) -> Vec<(i64, String)> {
+            self.kept.lock().unwrap().clone()
+        }
+    }
+
+    impl WayBack for Noted {
+        fn turn(&self) -> Box<dyn Turn + '_> {
+            Box::new(())
+        }
+
+        fn keep(&self, _: &str, artist: i64, before: &str) -> Result<bool, String> {
+            if self.refuse {
+                return Err("couldn't be written down".into());
+            }
+            self.kept.lock().unwrap().push((artist, before.to_string()));
+            Ok(true)
+        }
+
+        fn put_back(&self, _: &str, artist: i64, before: &str) {
+            self.put_back.lock().unwrap().push((artist, before.to_string()));
+        }
+    }
+
+    /// The same Lidarr, and the app killed the moment Lidarr has been changed in a way that
+    /// has to be put back.
+    pub(crate) struct KilledAfterChange(pub(crate) Stopping);
+
+    impl crate::http::Http for KilledAfterChange {
+        fn send(&self, request: &crate::http::Request) -> Result<crate::http::Response, crate::http::Failure> {
+            let answer = self.0.send(request);
+            if self.0.asked.lock().unwrap().last().is_some_and(|asked| asked.starts_with("PUT artist/5") && asked.contains(r#""monitorNewItems":"none""#)) {
+                panic!("killed");
+            }
+            answer
+        }
+
+        fn pause(&self, wait: Duration) -> Result<(), crate::http::Failure> {
+            self.0.pause(wait)
+        }
+    }
+
+    pub(crate) const SINGLES: &str = SINGLES_PROFILE;
+
+    /// The same Lidarr without the profile for singles, which is made for the request; and
+    /// the app killed the moment it is asked to make it.
+    struct KilledMakingTheProfile(Stopping);
+
+    impl crate::http::Http for KilledMakingTheProfile {
+        fn send(&self, request: &crate::http::Request) -> Result<crate::http::Response, crate::http::Failure> {
+            if matches!(request.method, crate::http::Method::Post(_)) && request.url.ends_with("/metadataprofile") {
+                self.0.asked.lock().unwrap().push("POST metadataprofile".into());
+                panic!("killed");
+            }
+            let answer = self.0.send(request)?;
+            if request.url.ends_with("/metadataprofile") {
+                let only_standard = r#"[{"id":1,"name":"Standard","primaryAlbumTypes":[{"albumType":{"id":1,"name":"Album"},"allowed":true}],"secondaryAlbumTypes":[{"albumType":{"id":1,"name":"Studio"},"allowed":true}],"releaseStatuses":[{"releaseStatus":{"id":1,"name":"Official"},"allowed":true}]}]"#;
+                return Ok(crate::http::Response::new(200, Vec::new(), move || Ok(only_standard.to_string())));
+            }
+            Ok(answer)
+        }
+
+        fn pause(&self, wait: Duration) -> Result<(), crate::http::Failure> {
+            self.0.pause(wait)
+        }
+    }
+
+    #[test]
+    fn the_way_back_is_written_down_before_a_profile_is_made_and_lidarr_is_asked_as_before() {
+        let http = Arc::new(KilledMakingTheProfile(Stopping { asked: Default::default() }));
+        let lidarr = Lidarr::new("lidarr.test", "key", None, http.clone());
+        let noted = Noted::default();
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lidarr.request(&single(), &noted))).is_err());
+        assert_eq!(noted.kept(), [(5, "all".to_string())]);
+        // The requests, and their order, are 0.40.10's: the profiles, the artist, the profile made.
+        let asked: Vec<String> = http.0.asked.lock().unwrap().iter().map(|asked| asked.split(' ').take(2).collect::<Vec<_>>().join(" ")).collect();
+        assert_eq!(asked, ["GET artist", "GET metadataprofile", "GET artist/5", "POST metadataprofile"]);
+    }
+
+    pub(crate) fn single() -> Offer {
+        Offer { album: "al1".into(), artist_id: "ar1".into(), title: "A Single".into(), artist: "Someone".into(), kind: "Single".into(), ..Default::default() }
+    }
+
+    #[test]
+    fn a_change_to_lidarr_that_has_to_be_put_back_is_written_down_first() {
+        // Killed the moment the setting was turned off: what it goes back to was written down
+        // before, so the next run puts it back.
+        let lidarr = Lidarr::new("lidarr.test", "key", None, Arc::new(KilledAfterChange(Stopping { asked: Default::default() })));
+        let noted = Noted::default();
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lidarr.request(&single(), &noted))).is_err());
+        assert_eq!(noted.kept(), [(5, "all".to_string())]);
+        // It can't be written down: Lidarr isn't changed, and the request says why.
+        let http = Arc::new(Stopping { asked: Default::default() });
+        let lidarr = Lidarr::new("lidarr.test", "key", None, http.clone());
+        let refusing = Noted { refuse: true, ..Default::default() };
+        let done = lidarr.request(&single(), &refusing);
+        assert!(done.as_ref().is_err_and(|reason| reason.contains("couldn't be written down")), "{done:?}");
+        assert!(!http.asked.lock().unwrap().iter().any(|asked| asked.starts_with("PUT artist/5")), "Lidarr was changed");
     }
 
     /// A Lidarr that keeps one artist, with the album wanted listed, and an app that stops
@@ -1326,7 +1628,7 @@ mod tests {
         let http = Arc::new(Phone::new(stop_at));
         let lidarr = Lidarr::new("http://lidarr.test", "key", None, http.clone());
         let wanted = Offer { album: "al1".into(), artist_id: "ar1".into(), title: "First".into(), artist: "Someone".into(), ..Default::default() };
-        let done = lidarr.request(&wanted);
+        let done = lidarr.request(&wanted, &Noted::default());
         let asked = http.asked.lock().unwrap().clone();
         (done, asked)
     }

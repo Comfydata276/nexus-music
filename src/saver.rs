@@ -1,10 +1,12 @@
-//! Writes files in the background, in the order they were asked for.
+//! Writes the queue's two files in the background, in the order they were asked for.
 //!
-//! Saving the queue or a list of downloads means turning thousands of songs into text and
-//! putting it on disk. Done on the UI thread that is a pause in everything on screen, so it
-//! is handed to one thread here instead. When several versions of the same file are waiting,
-//! only the newest is written.
+//! Saving the queue means turning thousands of songs into text and putting it on disk. Done
+//! on the window's thread that is a pause in everything on screen, so it is handed to one
+//! thread here instead. When several versions of the same file are waiting, only the newest
+//! is written. Nothing else is written here: every other file is written where it changes,
+//! by the thread that changes it (`docs/FILES.md`).
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
@@ -14,8 +16,9 @@ type Make = Box<dyn FnOnce() -> Option<Vec<u8>> + Send>;
 enum Job {
     Write(PathBuf, Make),
     Remove(PathBuf),
-    /// Answered once everything asked for before it has been done.
-    Sync(Sender<()>),
+    /// Answered once everything asked for before it has been tried: with whether the last
+    /// write of every file was done.
+    Sync(Sender<bool>),
 }
 
 pub struct Saver {
@@ -39,17 +42,19 @@ impl Saver {
         let _ = self.jobs.send(Job::Remove(path));
     }
 
-    /// Waits until everything asked for so far is on disk. For when the app is closing, or
-    /// a file is about to be read back.
-    pub fn flush(&self) {
+    /// Waits until everything asked for so far has been tried, and says whether it is on the
+    /// disk: false if the last write of any file failed (it is not said to be done), or if
+    /// five seconds went by first. For when the app is closing, or a file is about to be read
+    /// back.
+    pub fn flush(&self) -> bool {
         let (done, wait) = mpsc::channel();
-        if self.jobs.send(Job::Sync(done)).is_ok() {
-            let _ = wait.recv_timeout(Duration::from_secs(5));
-        }
+        self.jobs.send(Job::Sync(done)).is_ok() && wait.recv_timeout(Duration::from_secs(5)).unwrap_or(false)
     }
 }
 
 fn work(waiting: Receiver<Job>) {
+    // The files whose last write failed: until a later one of each is done.
+    let mut failed: HashSet<PathBuf> = HashSet::new();
     while let Ok(first) = waiting.recv() {
         // Take everything that's waiting, and drop what a later job for the same file undoes.
         let mut batch = vec![first];
@@ -67,14 +72,21 @@ fn work(waiting: Receiver<Job>) {
                 _ if superseded => {}
                 Job::Write(path, make) => {
                     if let Some(bytes) = make() {
-                        crate::config::write_atomically(&path, &bytes);
+                        // In passing, as 0.40.10 wrote them (`config::Durable::InPassing`).
+                        match crate::config::write_in_passing(&path, &bytes) {
+                            Ok(()) => failed.remove(&path),
+                            Err(_) => failed.insert(path),
+                        };
                     }
                 }
                 Job::Remove(path) => {
-                    let _ = std::fs::remove_file(path);
+                    match std::fs::remove_file(&path) {
+                        Err(error) if error.kind() != std::io::ErrorKind::NotFound => failed.insert(path),
+                        _ => failed.remove(&path),
+                    };
                 }
                 Job::Sync(done) => {
-                    let _ = done.send(());
+                    let _ = done.send(failed.is_empty());
                 }
             }
         }
@@ -107,7 +119,7 @@ mod tests {
         }
         saver.write(b.clone(), || Some(b"kept".to_vec()));
         saver.remove(b.clone());
-        saver.flush();
+        assert!(saver.flush());
         assert_eq!(std::fs::read(&a).unwrap(), b"fourth");
         // The versions in between were never built, let alone written.
         assert_eq!(built.load(std::sync::atomic::Ordering::Relaxed), 1);
@@ -115,8 +127,25 @@ mod tests {
         // A removal followed by a write leaves the file there.
         saver.remove(a.clone());
         saver.write(a.clone(), || Some(b"again".to_vec()));
-        saver.flush();
+        assert!(saver.flush());
         assert_eq!(std::fs::read(&a).unwrap(), b"again");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_write_that_failed_is_not_said_to_be_done() {
+        let dir = std::env::temp_dir().join(format!("nexus-saver-failed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Its folder isn't there: it can't be written.
+        let queue = dir.join("not yet").join("queue.json");
+        let saver = Saver::new();
+        saver.write(queue.clone(), || Some(b"[]".to_vec()));
+        assert!(!saver.flush(), "said to be done when it was not");
+        // A later write of it that is done: all done.
+        std::fs::create_dir_all(queue.parent().unwrap()).unwrap();
+        saver.write(queue.clone(), || Some(b"[1]".to_vec()));
+        assert!(saver.flush());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

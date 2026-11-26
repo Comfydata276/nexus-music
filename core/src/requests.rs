@@ -760,7 +760,7 @@ pub const NO_LONGER_LISTED: &str = "Lidarr no longer lists that one.";
 /// page drawn in an earlier session). Gives who it's by, or why it couldn't be asked for.
 /// Once Lidarr has begun changing anything it runs to its end, or puts back what it changed
 /// (see `Lidarr::request`); a stop before then gives `Err(Stopped)`.
-pub fn request(lidarr: &Lidarr, offers: &Offers, album: &str) -> Result<Result<String, String>, Stopped> {
+pub fn request(lidarr: &Lidarr, offers: &Offers, album: &str, way_back: &dyn crate::lidarr::WayBack) -> Result<Result<String, String>, Stopped> {
     // Offered in this session, or (from a page drawn in an earlier one) looked up afresh.
     let offer = match offers.offered(album) {
         Some(offer) => Ok(offer),
@@ -771,7 +771,7 @@ pub fn request(lidarr: &Lidarr, offers: &Offers, album: &str) -> Result<Result<S
     };
     let Ok(offer) = offer else { return Ok(offer.map(|offer| offer.artist)) };
     offers.remember(std::slice::from_ref(&offer));
-    Ok(unless_stopped(lidarr.request(&offer))?.map(|()| offer.artist))
+    Ok(unless_stopped(lidarr.request(&offer, way_back))?.map(|()| offer.artist))
 }
 
 /// Once Lidarr has an album on its list: the note of it as asked for, to be followed up when
@@ -788,6 +788,32 @@ pub fn asked_for(album: &str, title: &str, artist: &str, song: &str, now: i64) -
 /// What's said once it has been asked for.
 pub fn asked_sentence(title: &str) -> String {
     format!("Asked for “{title}”. It'll be in your library once it arrives.")
+}
+
+/// What's said instead when Lidarr has it, but the note of it couldn't be kept on this
+/// `device` ("computer", "phone"): it will still arrive, but nothing will say so. Short, as
+/// a toast is one line: what matters comes before the end, which a narrow one cuts off.
+pub fn asked_unnoted(title: &str, device: &str) -> String {
+    format!("Asked for “{title}”, but this {device} couldn't note it to say when it arrives.")
+}
+
+/// The same for a batch of albums asked for at once (see `bulk`): said once for the batch,
+/// however many of its notes couldn't be kept.
+pub fn asked_unnoted_batch(device: &str) -> String {
+    format!("Albums in this batch are on Lidarr's list, but this {device} couldn't note them to say when they arrive.")
+}
+
+/// What's said once an album has been taken off Lidarr's list (see `off_the_list`), when that
+/// couldn't be noted on this `device`: the note of it may come back, and its arrival be said.
+pub fn off_the_list_unnoted(title: &str, device: &str) -> String {
+    format!("“{title}” is off the list, but this {device} couldn't note that, so its arrival may still be announced.")
+}
+
+/// Said on the Requests page when the list of what was asked for on this `device` couldn't be
+/// read: what's on its way still is, as Lidarr says, but what arrives of what was asked for
+/// before won't be said, or put into the playlists waiting for it.
+pub fn asked_unreadable(device: &str) -> String {
+    format!("The list of what was asked for on this {device} couldn't be read, so albums asked for before won't be said to have arrived, or put into the playlists waiting for them. What's on its way is still shown.")
 }
 
 // ---- "Add artist" ------------------------------------------------------------------------------
@@ -902,6 +928,17 @@ pub fn count(n: usize, noun: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_request_by_itself_writes_its_way_back_down_before_lidarr_is_changed() {
+        use crate::lidarr::tests::{KilledAfterChange, Noted, Stopping, single};
+        let lidarr = crate::lidarr::Lidarr::new("lidarr.test", "key", None, std::sync::Arc::new(KilledAfterChange(Stopping { asked: Default::default() })));
+        let offers = Offers::default();
+        offers.remember(&[single()]);
+        let noted = Noted::default();
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| super::request(&lidarr, &offers, "al1", &noted))).is_err());
+        assert_eq!(noted.kept(), [(5, "all".to_string())]);
+    }
+
     use super::*;
 
     /// The snapshot below, as the library as it is.
@@ -1108,6 +1145,13 @@ mod tests {
         assert_eq!(ask("ost-ep", "Them", "", ""), "Ask for this EP? | “Title” by Them is an EP. It will go on Lidarr's list, and Lidarr will start looking for it. If Lidarr only lists Them's albums so far, it will be set to list their singles, EPs and soundtracks too. None but this one is fetched, though ones they release from now on are treated as their new albums are.");
         assert_eq!(asking_for("Title"), "Asking for “Title”…");
         assert_eq!(asked_sentence("Title"), "Asked for “Title”. It'll be in your library once it arrives.");
+        assert_eq!(asked_unnoted("Title", "computer"), "Asked for “Title”, but this computer couldn't note it to say when it arrives.");
+        assert_eq!(asked_unnoted_batch("phone"), "Albums in this batch are on Lidarr's list, but this phone couldn't note them to say when they arrive.");
+        assert_eq!(off_the_list_unnoted("Title", "computer"), "“Title” is off the list, but this computer couldn't note that, so its arrival may still be announced.");
+        assert_eq!(
+            asked_unreadable("phone"),
+            "The list of what was asked for on this phone couldn't be read, so albums asked for before won't be said to have arrived, or put into the playlists waiting for them. What's on its way is still shown."
+        );
         let note = asked_for("lidarr-ep", "Title", "Them", "A Song", 50);
         assert_eq!((note.album.as_str(), note.title.as_str(), note.artist.as_str(), note.song.as_str(), note.at, note.arrived), ("lidarr-ep", "Title", "Them", "A Song", 50, 0));
     }
@@ -1115,7 +1159,7 @@ mod tests {
     #[test]
     fn asks_lidarr_for_what_was_offered_or_looks_it_up() {
         fn ask(services: Services) -> Result<Result<String, String>, Stopped> {
-            request(services.lidarr, &Offers::new(), "rg-9")
+            request(services.lidarr, &Offers::new(), "rg-9", &crate::lidarr::tests::Noted::default())
         }
         // Not offered, and Lidarr no longer has it.
         assert_eq!(served(&[("album/lookup", "[]")], usize::MAX, ask).0, Ok(Err(NO_LONGER_LISTED.to_string())));

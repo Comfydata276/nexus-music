@@ -30,6 +30,9 @@ pub fn with<R>(f: impl FnOnce(&Rc<Controller>) -> R) -> Option<R> {
 }
 
 /// Queues `f` to run on the UI thread, from any thread.
+/// Said when the sign-in's token couldn't be kept (written down) on this PC.
+const SIGN_IN_NOT_SAVED: &str = "Couldn't save your sign-in; you'll need to sign in next time.";
+
 pub fn post(f: impl FnOnce(&Rc<Controller>) + Send + 'static) {
     let _ = slint::invoke_from_event_loop(move || {
         with(f);
@@ -406,6 +409,9 @@ pub struct Controller {
     /// What's been asked for and is being watched for, and a count that paces the watching.
     pub asked: RefCell<crate::asked::AskedList>,
     asked_ticks: Cell<u32>,
+    /// A note of the batch being asked for couldn't be written down; and whether that has
+    /// been said (once per batch: see `bulk_event`).
+    bulk_unnoted: Cell<(bool, bool)>,
     /// Counts ticks, to refresh the Requests page now and then while it's open.
     requests_ticks: Cell<u32>,
     /// The search on screen: everything it found, which kind of result it's narrowed to
@@ -424,6 +430,15 @@ pub struct Controller {
     /// The sign-in in front of Lidarr, once signed in to. The one copy is kept for as long
     /// as it's good, so its token is only ever renewed in one place.
     gate: RefCell<Option<std::sync::Arc<crate::gate::Session>>>,
+    /// How many sign-in sessions have been begun: part of what a Lidarr connection is made of.
+    sign_ins: Cell<u64>,
+    /// Whether the key kept by 0.40.10 has been looked at, at this start; and the address it
+    /// belongs to if it couldn't be bound then (see `keep::bind_old_key`).
+    keys_looked_at: Cell<bool>,
+    key_old_for: RefCell<Option<String>>,
+    /// The same for the sign-in's token, and the service it belongs to.
+    tokens_looked_at: Cell<bool>,
+    token_old_for: RefCell<Option<String>>,
     suggestions: RefCell<Vec<Suggestion>>,
     preview_count: Cell<u64>,
     /// The same count, where the search thread can see it: a search that is no longer the
@@ -488,8 +503,23 @@ pub struct Controller {
 
 impl Controller {
     pub fn install(ui: ui::MainWindow) -> Rc<Controller> {
+        // Files flushed on this thread are counted and, with NEXUS_TRACE, printed.
+        config::mark_window_thread();
         let paths = Paths::new();
         let (settings, settings_note) = Settings::load_checked(&paths.settings);
+        // What writes killed part-way left beside the app's files, for the account signed
+        // in: cleared now, once, before anything is written (`config::clear_leftovers`).
+        {
+            let stem = if settings.server.is_empty() { String::new() } else { account_stem(&settings.server, &settings.username) };
+            let downloads = if settings.downloads_dir.is_empty() { paths.downloads.clone() } else { PathBuf::from(&settings.downloads_dir) };
+            if let Some(dir) = paths.settings.parent() {
+                config::clear_settings_leftovers(dir, &settings.account_file(), &stem);
+            }
+            if let Some(dir) = paths.crash_log.parent() {
+                config::clear_data_leftovers(dir);
+            }
+            config::clear_downloads_leftovers(&downloads, &stem);
+        }
         let play_log = {
             let recent: Vec<(String, i64)> = config::load_history(&paths.history).into_iter().map(|played| (played.song.id, played.at)).collect();
             crate::plays::PlayLog::load(&paths.plays, &recent)
@@ -585,6 +615,7 @@ impl Controller {
                 crate::asked::AskedList::load(&paths.asked)
             }),
             asked_ticks: Cell::new(0),
+            bulk_unnoted: Cell::new((false, false)),
             requests_ticks: Cell::new(0),
             search_whole: RefCell::new(None),
             search_filter: Cell::new(0),
@@ -607,6 +638,11 @@ impl Controller {
             keep_rounds: Cell::new(0),
             requests_check: Cell::new(0),
             gate: RefCell::new(None),
+            sign_ins: Cell::new(0),
+            keys_looked_at: Cell::new(false),
+            key_old_for: RefCell::new(None),
+            tokens_looked_at: Cell::new(false),
+            token_old_for: RefCell::new(None),
             suggestions: RefCell::default(),
             preview_count: Cell::new(0),
             preview_latest: Default::default(),
@@ -652,20 +688,40 @@ impl Controller {
     /// last time.
     fn say_startup_notes(self: &Rc<Self>) {
         // How much of the crash log has been mentioned already is kept beside it.
-        let seen_file = self.paths.crash_log.with_extension("seen");
+        let seen_file = config::crash_seen(&self.paths);
         let size = std::fs::metadata(&self.paths.crash_log).map(|meta| meta.len()).unwrap_or(0);
         let seen: u64 = std::fs::read_to_string(&seen_file).ok().and_then(|text| text.trim().parse().ok()).unwrap_or(0);
         let crashed = size > seen;
         if crashed {
-            let _ = std::fs::write(&seen_file, size.to_string());
+            // Whole or not at all: a number cut short would be taken for one that was seen.
+            let _ = config::write_in_passing(&seen_file, size.to_string().as_bytes());
         }
         let note = self.startup_note.borrow_mut().take().or_else(|| {
             crashed.then(|| "The app stopped unexpectedly last time. “Save diagnostics” under Settings, About has what was noted.".to_string())
         });
+        // (Said once ever, with whatever else is said now.)
+        let links = config::no_links_note(&mut self.settings.borrow_mut().said_no_links);
+        if links.is_some() {
+            self.save_settings_in_passing();
+        }
+        let note = match (note, links) {
+            (Some(note), Some(links)) => Some(format!("{note} {links}")),
+            (note, links) => note.or(links.map(str::to_string)),
+        };
         if let Some(note) = note {
             slint::Timer::single_shot(Duration::from_millis(1500), move || {
                 with(|ctl| ctl.show_toast(note.into(), "", Duration::from_secs(10)));
             });
+        }
+    }
+
+    /// Tells the person, once ever, that the settings folder's drive can't make hard links,
+    /// the first time that is found out after the app has started (`config::no_links_note`).
+    pub fn say_no_links_once(&self) {
+        let note = config::no_links_note(&mut self.settings.borrow_mut().said_no_links);
+        if let Some(note) = note {
+            self.save_settings_in_passing();
+            self.show_toast(note.into(), "", Duration::from_secs(10));
         }
     }
 
@@ -876,8 +932,14 @@ impl Controller {
         self.edit_playlist(playlist, expected, edit);
     }
 
+    /// Saves the settings after a change the person made: flushed to the disk.
     pub fn save_settings(&self) {
         self.settings.borrow().save(&self.paths.settings);
+    }
+
+    /// Saves the settings in passing, as an exchange or a new queue starting does.
+    pub fn save_settings_in_passing(&self) {
+        self.settings.borrow().save_in_passing(&self.paths.settings);
     }
 
     // ---- start-up and sign-in ----------------------------------------------------------------
@@ -1165,7 +1227,7 @@ impl Controller {
         self.link_stop();
         self.end_jam(true);
         self.save_queue();
-        self.save_settings();
+        // (The settings are written once, waiting for the disk, as the app ends: `main`.)
         let _ = slint::quit_event_loop();
     }
 
@@ -1199,7 +1261,7 @@ impl Controller {
                         // Mention each new version once; after that the dot on the cog is enough.
                         if ctl.settings.borrow().update_notified != release.version {
                             ctl.settings.borrow_mut().update_notified = release.version.clone();
-                            ctl.save_settings();
+                            ctl.save_settings_in_passing();
                             ctl.toast(format!(
                                 "Nexus Music {} is available. Open Settings to update.",
                                 release.version
@@ -1251,6 +1313,9 @@ impl Controller {
             post(move |ctl| {
                 let page = ctl.ui.global::<ui::Settings>();
                 let launched = result.and_then(|path| {
+                    // The installer closes the app as it starts, maybe before the save at the
+                    // end of `main`: the settings are on the disk first, as 0.40.10 had them.
+                    ctl.save_settings();
                     crate::update::run_installer(&path).map_err(|e| format!("Couldn't start the installer: {e}"))
                 });
                 match launched {
@@ -1306,7 +1371,7 @@ impl Controller {
                             settings.server = client.server().to_string();
                             settings.username = username.clone();
                         }
-                        ctl.save_settings();
+                        ctl.save_settings_in_passing();
                         if !config::save_password(&ctl.paths, client.server(), &username, &password) {
                             ctl.toast("Couldn't save your password; you'll need to sign in next time.");
                         }
@@ -1365,13 +1430,13 @@ impl Controller {
 
     /// Who is signed in, as a name that can be part of a file's name; empty when nobody is.
     pub fn account(&self) -> String {
-        self.client().map(|client| file_stem(&format!("{}|{}", client.server(), client.username()))).unwrap_or_default()
+        self.client().map(|client| account_stem(client.server(), client.username())).unwrap_or_default()
     }
 
     /// Where the changes held for the server are kept for whoever is signed in.
     pub fn pending_path(&self) -> Option<PathBuf> {
         let account = self.account();
-        (!account.is_empty()).then(|| self.paths.pending.with_file_name(format!("pending-{account}.json")))
+        (!account.is_empty()).then(|| config::pending_file(&self.paths, &account))
     }
 
     /// Brings in what belongs to the account that has just signed in: its downloads, and
@@ -1402,36 +1467,71 @@ impl Controller {
         }
         let lidarr = {
             let settings = self.settings.borrow();
-            let key = config::load_secret(&self.paths, "lidarr-key");
-            match (settings.requests && !settings.lidarr_address.trim().is_empty(), key) {
-                (true, Some(key)) => Some(crate::lidarr::open(&settings.lidarr_address, &key, self.gate_session(&settings))),
+            let vault = self.vault();
+            // At the start, a key kept by 0.40.10 is bound to the address configured then. If
+            // that can't be done (its write failed, or the store couldn't be read), it's used,
+            // unbound, for that address only, and tried again at the next start.
+            if !self.keys_looked_at.replace(true) && crate::keep::bind_old_key(&*vault, &settings.lidarr_address) == crate::keep::Bind::NotYet {
+                self.key_old_for.replace(Some(settings.lidarr_address.clone()));
+            }
+            let key = crate::keep::key(&*vault, &settings.lidarr_address, self.key_old_for.borrow().as_deref());
+            // An address the app can't be sure of reaching as written isn't connected to.
+            // (Read as 0.40.10 used it: a saved address isn't held to what's asked of a typed one.)
+            let usable = nexus_core::lidarr::origin_saved(&settings.lidarr_address).is_ok();
+            match (settings.requests && !settings.lidarr_address.trim().is_empty() && usable, key) {
+                (true, Some(key)) => {
+                    let gate = self.gate_session(&settings);
+                    // What the connection is made of: when it changes, so does its number, and
+                    // what was begun under the old one does nothing (see `lidarr::for_connection`).
+                    let made_of = format!("{}\n{key}\n{}", crate::lidarr::tidy(&settings.lidarr_address), gate.as_ref().map_or(0, |_| self.sign_ins.get()));
+                    Some((crate::lidarr::open(&settings.lidarr_address, &key, gate), made_of))
+                }
                 _ => None,
             }
         };
         self.ui.global::<ui::App>().set_requests(lidarr.is_some());
         crate::lidarr::set_singles(self.settings.borrow().request_singles);
-        crate::lidarr::set_current(lidarr);
+        let (lidarr, made_of) = lidarr.map_or((None, String::new()), |(lidarr, made_of)| (Some(lidarr), made_of));
+        crate::lidarr::set_current_made_of(lidarr, made_of);
+    }
+
+    /// The credential store, where Lidarr's key and the sign-in's token are kept (see `keep`).
+    fn vault(&self) -> std::sync::Arc<dyn crate::keep::Vault> {
+        std::sync::Arc::new(crate::keep::Store(self.paths.clone()))
     }
 
     /// The sign-in in front of Lidarr, picked up from what's on file if it isn't in use yet.
     fn gate_session(&self, settings: &config::Settings) -> Option<std::sync::Arc<crate::gate::Session>> {
         let found = crate::gate::Found { service: settings.lidarr_gate.clone(), client: settings.lidarr_gate_client.clone() };
-        if found.service.is_empty() {
+        let trusted = !found.service.is_empty() && found.trusted(&settings.lidarr_address).is_ok();
+        // At the start, and then only, a token kept by 0.40.10 is bound to the service saved
+        // with it if that one is believed, and is otherwise left unused (see `keep`). If that
+        // can't be done it's used, unbound, for that service only, tried again next start, and
+        // said.
+        if !self.tokens_looked_at.replace(true) && crate::keep::bind_old_token(&*self.vault(), &found.service, trusted, settings.lidarr_token_spent) == crate::keep::Bind::NotYet {
+            self.token_old_for.replace(Some(found.service.clone()));
+            self.toast(SIGN_IN_NOT_SAVED);
+        }
+        // One kept by an older version that isn't believed now is not used (see `Found::trusted`).
+        if !trusted {
             self.gate.replace(None);
             return None;
         }
         if let Some(session) = self.gate.borrow().as_ref().filter(|session| *session.found() == found) {
             return Some(session.clone());
         }
-        let token = config::load_secret(&self.paths, "lidarr-token")?;
+        let token = crate::keep::token(&*self.vault(), &found.service, self.token_old_for.borrow().as_deref())?;
         let session = std::sync::Arc::new(self.new_gate(found, token));
         self.gate.replace(Some(session.clone()));
         Some(session)
     }
 
+    /// A session for the sign-in at `found`, begun with `token`: its renewals are written only
+    /// while the token kept is still the one it renewed (see `keep::renewals`).
     fn new_gate(&self, found: crate::gate::Found, token: String) -> crate::gate::Session {
-        let paths = self.paths.clone();
-        crate::gate::session(found, token, move |token| config::save_secret(&paths, "lidarr-token", token))
+        self.sign_ins.set(self.sign_ins.get() + 1);
+        let keep = crate::keep::renewals(self.vault(), found.service.clone(), token.clone(), || post(|ctl| ctl.toast(SIGN_IN_NOT_SAVED)));
+        crate::gate::session(found, token, keep)
     }
 
     /// Shows where the connection to Lidarr stands: `state` picks the marker and the one
@@ -1452,29 +1552,46 @@ impl Controller {
     /// Saves where Lidarr is and its key, then connects: checks that it answers and, if a
     /// sign-in answers instead, goes on to that.
     fn save_requests(&self, address: &str, key: &str) {
-        let (moved, elsewhere) = {
-            let mut settings = self.settings.borrow_mut();
-            let moved = crate::lidarr::tidy(&settings.lidarr_address) != crate::lidarr::tidy(address);
-            let elsewhere = crate::lidarr::host(&settings.lidarr_address) != crate::lidarr::host(address);
-            settings.lidarr_address = address.trim().to_string();
-            (moved, elsewhere)
+        // An address with a name and password in it, or one the app might read otherwise than
+        // its connections would, isn't kept: nor is the key typed with it.
+        // (The address already saved, submitted with only a new key, is judged as it was saved.)
+        if !address.trim().is_empty() {
+            let saved = self.settings.borrow().lidarr_address.clone();
+            if let Err(why) = nexus_core::lidarr::origin_entered(address, &saved) {
+                self.push_settings();
+                return self.requests_state("error", &why);
+            }
+        }
+        let moved = crate::lidarr::tidy(&self.settings.borrow().lidarr_address) != crate::lidarr::tidy(address);
+        // The key is kept with the origin it was typed for, before the address is saved: blank
+        // leaves the key that's on file, unless the address now leads somewhere else (another
+        // scheme, host or port). See `keep::change`.
+        let old = self.settings.borrow().lidarr_address.clone();
+        // A sign-in belongs to the address it was found in front of: let go of only once the
+        // change is going through, and while that's still the address, so it's handed back
+        // only where it was believed. A change that's refused keeps it.
+        let mut let_go = || {
+            if moved {
+                self.drop_sign_in();
+                let mut settings = self.settings.borrow_mut();
+                settings.lidarr_gate.clear();
+                settings.lidarr_gate_client.clear();
+            }
         };
-        if moved {
-            // A sign-in belongs to the address it was found in front of.
-            self.drop_sign_in();
+        let changed = crate::keep::change(&*self.vault(), &old, address.trim(), key.trim(), &mut let_go, &mut || {
             let mut settings = self.settings.borrow_mut();
-            settings.lidarr_gate.clear();
-            settings.lidarr_gate_client.clear();
-        }
-        self.save_settings();
-        // Blank leaves the key that's on file, unless the address now points at a different
-        // host: a key is only ever sent to the host it was typed in for.
-        let forgotten = key.trim().is_empty() && elsewhere && config::load_secret(&self.paths, "lidarr-key").is_some();
-        if !key.trim().is_empty() {
-            config::save_secret(&self.paths, "lidarr-key", key.trim());
-        } else if elsewhere {
-            config::save_secret(&self.paths, "lidarr-key", "");
-        }
+            settings.lidarr_address = address.trim().to_string();
+            settings.save_surely(&self.paths.settings)
+        });
+        let forgotten = match changed {
+            crate::keep::Changed::Made { forgotten } => forgotten,
+            crate::keep::Changed::Not(why) => {
+                self.settings.borrow_mut().lidarr_address = old;
+                self.connect_requests();
+                self.push_settings();
+                return self.requests_state("error", why);
+            }
+        };
         self.connect_requests();
         self.push_settings();
         if forgotten {
@@ -1488,6 +1605,11 @@ impl Controller {
     /// straight away, not just offered.
     pub fn check_requests(&self, by_hand: bool) {
         let Some(lidarr) = crate::lidarr::current() else {
+            // One kept by an older version that this one won't use says why.
+            let address = self.settings.borrow().lidarr_address.clone();
+            if let (false, Err(why)) = (address.trim().is_empty(), nexus_core::lidarr::origin_saved(&address)) {
+                return self.requests_state("error", &why);
+            }
             return self.requests_state("none", nexus_core::lidarr::NOT_CONNECTED);
         };
         let check = self.requests_check.get() + 1;
@@ -1524,12 +1646,13 @@ impl Controller {
                     settings.lidarr_gate = found.service.clone();
                     settings.lidarr_gate_client = found.client.clone();
                 }
-                self.save_settings();
+                self.save_settings_in_passing();
                 self.connect_requests();
             }
         }
         self.push_settings();
-        let signed_out = !self.settings.borrow().lidarr_gate.is_empty() && config::load_secret(&self.paths, "lidarr-token").is_none();
+        let service = self.settings.borrow().lidarr_gate.clone();
+        let signed_out = !service.is_empty() && crate::keep::token(&*self.vault(), &service, self.token_old_for.borrow().as_deref()).is_none();
         match (answer, gate) {
             (Ok(version), _) => self.requests_state("connected", &nexus_core::lidarr::connected(&version)),
             (Err(_), Some(Ok(Some(_)))) if by_hand => self.sign_in_requests(),
@@ -1548,29 +1671,53 @@ impl Controller {
         if found.service.is_empty() {
             return;
         }
+        if let Err(why) = found.trusted(&self.settings.borrow().lidarr_address) {
+            return self.requests_state("error", &why);
+        }
         let round = crate::gate::new_round();
         self.requests_check.set(self.requests_check.get() + 1);
         self.requests_state("waiting", &nexus_core::gate::finish_in_browser(found.host()));
         std::thread::spawn(move || {
             let agent = crate::subsonic::make_agent_without_redirects();
-            let result = crate::gate::begin(&found).and_then(|attempt| {
-                let link = attempt.link.clone();
-                post(move |_| crate::gate::open_link(&link));
-                attempt.finish(&agent, || !crate::gate::is_current(round))
-            });
-            post(move |ctl| ctl.signed_in(round, found, result));
+            let (result, browser) = match crate::gate::begin(&found) {
+                Ok(attempt) => {
+                    let link = attempt.link.clone();
+                    post(move |_| crate::gate::open_link(&link));
+                    attempt.finish(&agent, || !crate::gate::is_current(round))
+                }
+                Err(why) => (Err(why), None),
+            };
+            post(move |ctl| ctl.signed_in(round, found, result, browser));
         });
     }
 
-    fn signed_in(&self, round: u64, found: crate::gate::Found, result: Result<crate::gate::SignedIn, String>) {
+    /// What a sign-in came to. `browser`, if it came back with a code, is told what the app
+    /// decided: "You're signed in" only once the token is kept for the round still under way
+    /// (a cancelled or replaced round, or a failed exchange, is told it didn't go through).
+    fn signed_in(&self, round: u64, found: crate::gate::Found, result: Result<crate::gate::SignedIn, String>, browser: Option<crate::gate::Browser>) {
+        use nexus_core::gate::Page;
+        let tell = |page: Page| {
+            if let Some(browser) = &browser {
+                browser.answer(page);
+            }
+        };
         if !crate::gate::is_current(round) {
-            return;
+            return tell(Page::NotThrough);
         }
         match result {
             Ok(done) => {
-                config::save_secret(&self.paths, "lidarr-token", &done.token);
+                // From here this sign-in owns the token kept: whatever an earlier one still has
+                // on its way writes nothing.
+                if crate::keep::keep_token(&*self.vault(), &found.service, &done.token) {
+                    // Whatever 0.40.10 kept is gone now (written over): nothing is spent.
+                    self.settings.borrow_mut().lidarr_token_spent = false;
+                    tell(Page::SignedIn);
+                } else {
+                    tell(Page::StillSigningIn);
+                    self.toast(SIGN_IN_NOT_SAVED);
+                }
                 self.settings.borrow_mut().lidarr_signed_in = done.name;
-                self.save_settings();
+                self.save_settings_in_passing();
                 self.gate.replace(Some(std::sync::Arc::new(self.new_gate(found, done.token))));
                 self.connect_requests();
                 self.push_settings();
@@ -1593,22 +1740,35 @@ impl Controller {
     fn drop_sign_in(&self) {
         crate::gate::new_round();
         let session = self.gate.replace(None);
-        let on_file = config::load_secret(&self.paths, "lidarr-token");
         let service = self.settings.borrow().lidarr_gate.clone();
-        config::save_secret(&self.paths, "lidarr-token", "");
+        // Whatever is kept goes; it's handed back only if it was made at this service, and that
+        // one is believed (see `Found::trusted`): otherwise it's sent nowhere.
+        let vault = self.vault();
+        let (on_file, spent) = crate::keep::take_token_telling(&*vault, &service);
+        // A token from 0.40.10, unbound, is never used again from here: not this run (it was
+        // only ever used for the service saved at the start), nor after a restart, if it
+        // couldn't be deleted (written down in the settings, at once).
+        self.token_old_for.replace(None);
+        if spent {
+            self.settings.borrow_mut().lidarr_token_spent = true;
+            self.save_settings();
+        }
+        let believed = crate::gate::Found { service: service.clone(), client: String::new() }.trusted(&self.settings.borrow().lidarr_address).is_ok();
         self.settings.borrow_mut().lidarr_signed_in.clear();
         if session.is_none() && on_file.is_none() {
             return;
         }
-        let paths = self.paths.clone();
         self.api_pool.spawn(move || {
             // Closing waits out a renewal that's under way, so the token handed back is the
             // one that's good now.
             let token = session.map(|session| session.close()).filter(|token| !token.is_empty()).or(on_file);
-            if let Some(token) = token {
+            let Some(token) = token else { return };
+            if believed {
                 crate::gate::give_up_token(&crate::subsonic::make_agent_without_redirects(), &service, &token);
             }
-            config::save_secret(&paths, "lidarr-token", "");
+            // Cleared again only if it's still this very token (its first clearing failed):
+            // anything else there by now is a sign-in made meanwhile.
+            crate::keep::clear_token_if(&*vault, &token);
         });
     }
 
@@ -1617,7 +1777,15 @@ impl Controller {
         self.save_settings();
         self.connect_requests();
         self.push_settings();
-        self.requests_state("sign-in", &nexus_core::gate::signed_out(&self.behind_sign_in()));
+        // Signed out of one that's refused, it's still said why: there's nothing to sign in to.
+        let refused = {
+            let settings = self.settings.borrow();
+            crate::gate::Found { service: settings.lidarr_gate.clone(), client: String::new() }.trusted(&settings.lidarr_address).err()
+        };
+        match refused {
+            Some(why) => self.requests_state("error", &why),
+            None => self.requests_state("sign-in", &nexus_core::gate::signed_out(&self.behind_sign_in())),
+        }
     }
 
     /// Asks whether to request an album that isn't in the library. `song` is the song that
@@ -1649,16 +1817,16 @@ impl Controller {
         self.toast(nexus_core::requests::asking_for(&title));
         self.requests_pool.spawn(move || {
             // (Nothing on Windows stops a request, so "stopped" can't come of it.)
-            let result = nexus_core::requests::request(&lidarr, crate::lidarr::offers(), &album).unwrap_or_else(|_| Err(nexus_core::http::STOPPED.into()));
+            let result = nexus_core::requests::request(&lidarr, crate::lidarr::offers(), &album, crate::bulk::way_back()).unwrap_or_else(|_| Err(nexus_core::http::STOPPED.into()));
             post(move |ctl| match result {
                 Ok(artist) => {
                     // Noted, so it can be followed up when it arrives.
                     let now = chrono::Utc::now().timestamp();
-                    ctl.asked.borrow_mut().add(nexus_core::requests::asked_for(&album, &title, &artist, &song, now));
+                    let noted = ctl.asked.borrow_mut().add(nexus_core::requests::asked_for(&album, &title, &artist, &song, now));
                     // Marked once the note is kept and shared (see `asked_for`).
                     crate::lidarr::mark(&album, true);
                     ctl.refresh_outside();
-                    ctl.toast(nexus_core::requests::asked_sentence(&title));
+                    ctl.toast(if noted { nexus_core::requests::asked_sentence(&title) } else { nexus_core::requests::asked_unnoted(&title, "computer") });
                 }
                 Err(reason) => ctl.toast(reason),
             });
@@ -1718,7 +1886,7 @@ impl Controller {
         let Some(lidarr) = crate::lidarr::current() else { return };
         self.toast(nexus_core::requests::adding_now(&name));
         self.requests_pool.spawn(move || {
-            let result = lidarr.add_artist(&artist, &name);
+            let result = lidarr.add_artist(&artist, &name, crate::bulk::way_back());
             post(move |ctl| match result {
                 Ok(_) => {
                     ctl.refresh_outside();
@@ -1807,6 +1975,7 @@ impl Controller {
         if !crate::bulk::unfinished() {
             return;
         }
+        self.bulk_unnoted.set((false, false));
         crate::bulk::run(lidarr, |event| post(move |ctl| ctl.bulk_event(event)));
     }
 
@@ -1818,14 +1987,26 @@ impl Controller {
                 for note in &notes {
                     crate::lidarr::mark(&note.album, true);
                 }
-                self.asked.borrow_mut().add_all(notes);
+                if !self.asked.borrow_mut().add_all(notes) {
+                    self.bulk_unnoted.set((true, self.bulk_unnoted.get().1));
+                }
                 self.invalidate("requests");
             }
-            Event::Forgot(titles) => {
+            Event::Forgot(gone) => {
                 let mut asked = self.asked.borrow_mut();
-                for title in titles {
-                    asked.forget(&title);
+                for album in gone {
+                    if !asked.forget(&album.album, &album.title, &album.artist, config::Durable::InPassing) {
+                        self.bulk_unnoted.set((true, self.bulk_unnoted.get().1));
+                    }
+                    crate::lidarr::mark(&album.album, false);
                 }
+            }
+            // Notes that couldn't be written down are said once for the batch, in place of its
+            // summary (the Requests page has the counts).
+            Event::Asked if self.bulk_unnoted.get() == (true, false) => {
+                self.bulk_unnoted.set((true, true));
+                self.toast(nexus_core::requests::asked_unnoted_batch("computer"));
+                self.reload_requests();
             }
             Event::Asked => {
                 let summary = crate::bulk::summary();
@@ -1844,6 +2025,14 @@ impl Controller {
                     // Nothing left to say about it.
                     crate::bulk::clear();
                 }
+                // The batch's notes, written in passing while it ran: flushed once, now.
+                if !self.asked.borrow_mut().flush() {
+                    self.bulk_unnoted.set((true, self.bulk_unnoted.get().1));
+                }
+                if self.bulk_unnoted.get() == (true, false) {
+                    self.bulk_unnoted.set((true, true));
+                    self.toast(nexus_core::requests::asked_unnoted_batch("computer"));
+                }
                 self.refresh_outside();
                 self.reload_requests();
             }
@@ -1856,6 +2045,7 @@ impl Controller {
             return;
         }
         let (notice, action, other) = crate::bulk::summary().notice();
+        let notice = pages::requests_notice(&notice);
         let view = self.ui.global::<ui::View>();
         view.set_notice(notice.as_str().into());
         view.set_notice_action(action.into());
@@ -1912,8 +2102,8 @@ impl Controller {
         let now = chrono::Utc::now().timestamp();
         let told: Vec<crate::asked::Asked> = {
             let mut asked = self.asked.borrow_mut();
-            let fresh: Vec<crate::asked::Asked> =
-                arrivals.iter().filter_map(|arrival| asked.items.get(arrival.place).filter(|asked| asked.arrived == 0).cloned()).collect();
+            // By the note each was found for, as it's marked (see `asked::is_note`).
+            let fresh = nexus_core::asked::news(&asked.items, &arrivals);
             asked.mark(&arrivals, now);
             fresh
         };
@@ -2001,21 +2191,34 @@ impl Controller {
         );
     }
 
-    /// Takes an album off Lidarr's list.
-    pub fn cancel_request(self: &Rc<Self>, id: i64, title: String) {
-        let Some(lidarr) = crate::lidarr::current() else { return };
+    /// Takes an album off Lidarr's list (its number there), and forgets the note of it: the
+    /// one with its MusicBrainz id, or its title and artist both (see `asked::forget`). It's
+    /// no longer shown as asked for where it's offered.
+    /// `connection` is the number of the connection the row was drawn under: if it's changed
+    /// since, the row is another Lidarr's, nothing is sent, and the page is drawn afresh.
+    pub fn cancel_request(self: &Rc<Self>, connection: u64, id: i64, album: String, title: String, artist: String) {
+        let Some(lidarr) = crate::lidarr::for_connection(connection) else {
+            self.invalidate("requests");
+            if self.current_route() == Some(Route::Requests) {
+                self.show(Route::Requests, 0.0, true, None);
+            }
+            return;
+        };
         self.api_pool.spawn(move || {
             let result = lidarr.cancel(id);
             post(move |ctl| {
                 match result {
                     Ok(()) => {
-                        ctl.asked.borrow_mut().forget(&title);
-                        ctl.toast(nexus_core::requests::off_the_list(&title));
+                        let noted = ctl.asked.borrow_mut().forget(&album, &title, &artist, config::Durable::Flushed);
+                        crate::lidarr::mark(&album, false);
+                        ctl.toast(if noted { nexus_core::requests::off_the_list(&title) } else { nexus_core::requests::off_the_list_unnoted(&title, "computer") });
                     }
                     Err(reason) => ctl.toast(reason),
                 }
                 ctl.invalidate("requests");
                 ctl.invalidate("search:");
+                // Its page and its artist's, kept from before, would still say "Requested".
+                ctl.invalidate("outside-");
                 if ctl.current_route() == Some(Route::Requests) {
                     ctl.show(Route::Requests, 0.0, true, None);
                 }
@@ -2192,7 +2395,7 @@ impl Controller {
         let online = !self.is_offline();
         self.api_pool.spawn(move || {
             let _ = std::fs::create_dir_all(&dir);
-            let file = dir.join("library.json");
+            let file = config::library_file(&dir);
             let mut renewed = false;
             if crate::search::current().is_none() {
                 if let Some(library) = crate::search::Library::load(&file) {
@@ -2471,7 +2674,7 @@ impl Controller {
 
     /// Where lyrics are kept for the server that's signed in to (see `lyrics`).
     pub fn lyrics_dir(&self) -> Option<PathBuf> {
-        Some(self.pages_dir()?.join("lyrics"))
+        Some(config::lyrics_dir(&self.pages_dir()?))
     }
 
     /// A stored copy of a page and its age: from memory, or from disk on the first visit of
@@ -3203,8 +3406,14 @@ impl Controller {
     /// The person chose whether the list `key` plays shuffled. (Kept as the change, and
     /// given its time when it is shared: see `sync::Controller::choose`.)
     pub fn choose_shuffle(&self, key: &str, on: bool) {
+        self.choose_shuffle_saving(key, on, crate::config::Durable::Flushed);
+    }
+
+    /// `choose_shuffle`, for a choice that came from afar too: `InPassing` doesn't wait for
+    /// the disk.
+    pub fn choose_shuffle_saving(&self, key: &str, on: bool, durable: crate::config::Durable) {
         if !key.is_empty() {
-            self.choose(nexus_core::step::Change::Shuffle { key: key.to_string(), on });
+            self.choose_saving(nexus_core::step::Change::Shuffle { key: key.to_string(), on }, durable);
         }
     }
 
@@ -3642,17 +3851,31 @@ impl Controller {
         page.set_requests(settings.requests);
         page.set_request_singles(settings.request_singles);
         page.set_lidarr_address(settings.lidarr_address.as_str().into());
-        page.set_lidarr_key_hint(config::load_secret(&self.paths, "lidarr-key").map(|key| crate::lidarr::mask(&key)).unwrap_or_default().into());
+        page.set_lidarr_key_hint(crate::keep::key(&*self.vault(), &settings.lidarr_address, self.key_old_for.borrow().as_deref()).map(|key| crate::lidarr::mask(&key)).unwrap_or_default().into());
         let gate = crate::gate::Found { service: settings.lidarr_gate.clone(), client: String::new() };
         page.set_lidarr_gate(gate.host().into());
         page.set_lidarr_signed_in(settings.lidarr_signed_in.as_str().into());
-        page.set_lidarr_has_token(!settings.lidarr_gate.is_empty() && config::load_secret(&self.paths, "lidarr-token").is_some());
+        // "Signed in" only at a service that's believed (see `Found::trusted`); a token kept for
+        // one that's refused is offered only to be signed out of, which sends it nowhere.
+        let trusted = gate.trusted(&settings.lidarr_address).is_ok();
+        let vault = self.vault();
+        let usable = !settings.lidarr_gate.is_empty() && trusted && crate::keep::token(&*vault, &settings.lidarr_gate, self.token_old_for.borrow().as_deref()).is_some();
+        page.set_lidarr_has_token(usable);
+        page.set_lidarr_token_unused(!settings.lidarr_gate.is_empty() && !usable && crate::keep::any_kept(&*vault));
         drop(settings);
         self.push_jam();
     }
 
     /// Changes a setting, shows it, applies it to the audio and, when `save` is set, writes
     /// it to disk. Dragging a slider passes `save: false` until the drag ends.
+    /// A slider's: saved, when its drag ends, in passing (a continuous control is no press).
+    fn change_setting_slid(&self, save: bool, change: impl FnOnce(&mut Settings)) {
+        self.change_setting(false, change);
+        if save {
+            self.save_settings_in_passing();
+        }
+    }
+
     fn change_setting(&self, save: bool, change: impl FnOnce(&mut Settings)) {
         change(&mut self.settings.borrow_mut());
         self.push_settings();
@@ -3947,7 +4170,7 @@ impl Controller {
             });
         });
         settings.on_set_crossfade(|seconds, save| {
-            with(|ctl| ctl.change_setting(save, |s| s.crossfade = seconds.round().clamp(0.0, 12.0)));
+            with(|ctl| ctl.change_setting_slid(save, |s| s.crossfade = seconds.round().clamp(0.0, 12.0)));
         });
         settings.on_set_gapless(|on| {
             with(|ctl| ctl.change_setting(true, |s| s.gapless = on));
@@ -3998,7 +4221,7 @@ impl Controller {
         });
         settings.on_set_eq_band(|band, gain, save| {
             with(|ctl| {
-                ctl.change_setting(save, |s| {
+                ctl.change_setting_slid(save, |s| {
                     if let Some(slot) = s.eq_gains.get_mut(band as usize) {
                         // Half-decibel steps are finer than anyone can hear and keep values tidy.
                         *slot = ((gain * 2.0).round() / 2.0).clamp(-EQ_RANGE, EQ_RANGE);
@@ -4302,6 +4525,11 @@ pub(crate) fn store_page(file: &std::path::Path, page: &PageData) {
     let _ = std::fs::write(file, json);
 }
 
+/// An account as the names of its lists of downloads and what waits to be sent have it.
+pub(crate) fn account_stem(server: &str, username: &str) -> String {
+    file_stem(&format!("{server}|{username}"))
+}
+
 /// A file-system-safe rendering of a cache key. Keys that differ only in characters this
 /// replaces are told apart by the hash `file_name` appends.
 fn file_stem(key: &str) -> String {
@@ -4403,5 +4631,24 @@ impl Controller {
                 s.eq_saved.remove(index);
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_page_cut_short_is_not_there_and_is_fetched_again() {
+        let path = std::env::temp_dir().join(format!("nexus-page-{}.json", std::process::id()));
+        let page = crate::pages::PageData { title: "Road Trip".into(), ..Default::default() };
+        let whole = serde_json::to_vec(&page).unwrap();
+        std::fs::write(&path, &whole).unwrap();
+        assert_eq!(super::read_page(&path).map(|(_, read)| read), Some(page));
+        // Written in place (it can be fetched again): cut short, or emptied, it is no page,
+        // and the page is fetched as if none was kept.
+        for cut in [&whole[..0], &whole[..whole.len() / 2], &whole[..whole.len() - 1]] {
+            std::fs::write(&path, cut).unwrap();
+            assert!(super::read_page(&path).is_none(), "{}", String::from_utf8_lossy(cut));
+        }
+        let _ = std::fs::remove_file(&path);
     }
 }

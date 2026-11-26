@@ -400,8 +400,8 @@ impl Player for Here<'_> {
                 ctl.move_upcoming_here(*from, (*to as usize).min(last), *queued);
             }
             (Command::Clear { queued }, _) => ctl.clear_upcoming_here(*queued),
-            (Command::Shuffle { on }, _) => ctl.set_shuffle(*on),
-            (Command::Repeat { mode }, _) => ctl.set_repeat(*mode),
+            (Command::Shuffle { on }, _) => ctl.set_shuffle_from_afar(*on),
+            (Command::Repeat { mode }, _) => ctl.set_repeat_from_afar(*mode),
             (Command::Add { next, .. }, Ready::Songs(ids)) => ctl.enqueue_here(self.songs(ids.iter().map(|id| (id, false))), *next),
             (Command::Adopt(adopt), Ready::Queue(songs, begin)) => ctl.load_queue_here(self.songs(songs.iter().map(|(id, queued)| (id, *queued))), *begin, adopt.position, &adopt.context),
             _ => {}
@@ -425,7 +425,9 @@ impl Player for Here<'_> {
         log("queue: handed to another of the person's devices: not saved from here, and it follows, until it is used here");
         let mark = self.ctl.link.borrow().handed.borrow_mut().on(self.ctl.queue_number.get(), self.ctl.queue_owner.taken());
         self.ctl.queue_owner.taken_up(mark);
-        self.ctl.save_queue_surely();
+        if !self.ctl.save_queue_surely() {
+            log("queue: handed on, and that could not be written down in time: it is written with the next save");
+        }
     }
 
     /// This PC did not stop: the queue that was marked is whose it was. (If another whole
@@ -527,7 +529,7 @@ impl Controller {
                 // to give, nothing is sent at all, so what this falls back on is never seen.)
                 let id = random::<16>().unwrap_or_default();
                 self.settings.borrow_mut().link_device = text::base64(&id);
-                self.save_settings();
+                self.save_settings_in_passing();
                 id
             }
         };
@@ -667,7 +669,7 @@ impl Controller {
                 }
                 Do::Remember(list) => {
                     self.settings.borrow_mut().link_seen = list;
-                    self.save_settings();
+                    self.save_settings_in_passing();
                 }
                 Do::Forget { playlist } => self.invalidate(&format!("playlist:{playlist}")),
                 Do::Steering(name) => {

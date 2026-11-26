@@ -39,6 +39,43 @@ impl Found {
     pub fn host(&self) -> &str {
         self.service.split_once("://").map_or(self.service.as_str(), |(_, host)| host)
     }
+
+    /// Whether this sign-in service may be used for a Lidarr at `lidarr` (the address as typed):
+    /// it's on HTTPS, or it has exactly the scheme and host typed for Lidarr (a home network on
+    /// plain HTTP is the person's own choice; a step down they didn't type is not). It must be
+    /// a place and nothing more: a scheme, a host and a port. Checked when it's found, and
+    /// before a kept one is used.
+    pub fn trusted(&self, lidarr: &str) -> Result<(), String> {
+        let refused = || Err(not_trusted(self.host()));
+        let Ok(service) = crate::lidarr::origin(&self.service) else { return refused() };
+        if origin(&self.service) != self.service {
+            return refused();
+        }
+        if service.scheme == "https" {
+            return Ok(());
+        }
+        // (Lidarr's address as it was saved: see `lidarr::origin_saved`.)
+        match crate::lidarr::origin_saved(lidarr) {
+            Ok(lidarr) if lidarr.scheme == service.scheme && lidarr.host == service.host => Ok(()),
+            _ => refused(),
+        }
+    }
+}
+
+/// Where at the sign-in service a request goes: `path` under the service, which must be a place
+/// and nothing more (see `Found::trusted`), so that every request goes where the service was
+/// accepted, and nowhere else.
+fn endpoint(service: &str, path: &str) -> Option<String> {
+    (crate::lidarr::origin(service).is_ok() && origin(service) == service).then(|| format!("{service}{path}"))
+}
+
+/// Said when Lidarr sends the app to a sign-in it won't go to: one on plain HTTP away from the
+/// address typed for Lidarr, where the sign-in would cross the network unprotected. What is
+/// refused, and what makes it work.
+pub fn not_trusted(service: &str) -> String {
+    format!(
+        "The sign-in at {service} is refused because it isn't on https, or where Lidarr's own address is, so signing in would cross the network unprotected: put the sign-in on https, or, with Lidarr on plain http, on Lidarr's own host."
+    )
 }
 
 // ---- small helpers for web addresses ------------------------------------------------------------
@@ -52,11 +89,15 @@ fn origin(url: &str) -> &str {
     }
 }
 
-/// Where a redirect leads, given the address that sent it.
+/// Where a redirect leads, given the address that sent it. "//host/path" is the scheme of
+/// the address that sent it, and that host.
 fn absolute(from: &str, location: &str) -> String {
     let whole = location.split_once("://").is_some_and(|(scheme, _)| !scheme.is_empty() && scheme.chars().all(|c| c.is_ascii_alphanumeric()));
     if whole {
         location.to_string()
+    } else if let Some(elsewhere) = location.strip_prefix("//") {
+        let scheme = from.split_once("://").map_or("http", |(scheme, _)| scheme);
+        format!("{scheme}://{elsewhere}")
     } else {
         format!("{}/{}", origin(from), location.trim_start_matches('/'))
     }
@@ -182,11 +223,18 @@ pub fn find(http: &dyn Http, lidarr: &str) -> Result<Option<Found>, String> {
         return Ok(None);
     };
     // The door in front of Lidarr sends the caller to itself first, then on to the service.
+    // Where it sends the caller is judged before it's asked, as the service itself is.
     let sign_in = match parse_sign_in(&first) {
         Some(found) => Some(found),
-        None => redirect_from(http, &first)?.and_then(|second| parse_sign_in(&second)),
+        None => {
+            Found { service: origin(&first).to_string(), client: String::new() }.trusted(lidarr)?;
+            redirect_from(http, &first)?.and_then(|second| parse_sign_in(&second))
+        }
     };
-    sign_in.map(Some).ok_or_else(|| UNKNOWN.to_string())
+    let found = sign_in.ok_or_else(|| UNKNOWN.to_string())?;
+    // Believed only on HTTPS, or where Lidarr itself was typed to be.
+    found.trusted(lidarr)?;
+    Ok(Some(found))
 }
 
 // ---- talking to the sign-in service ---------------------------------------------------------------
@@ -207,7 +255,8 @@ enum Trouble {
 }
 
 fn ask_for_tokens(http: &dyn Http, service: &str, fields: &[(&str, &str)]) -> Result<Tokens, Trouble> {
-    let response = post_form(http, &format!("{service}/application/o/token/"), fields).map_err(|failure| match failure {
+    let Some(url) = endpoint(service, "/application/o/token/") else { return Err(Trouble::Unreachable(not_trusted(service))) };
+    let response = post_form(http, &url, fields).map_err(|failure| match failure {
         Failure::Reach(e) => Trouble::Unreachable(format!("Couldn't reach the sign-in service. {e}")),
         Failure::Stopped => Trouble::Unreachable(STOPPED.to_string()),
     })?;
@@ -247,7 +296,8 @@ fn name_of(http: &dyn Http, service: &str, access: &str) -> String {
         preferred_username: String,
         name: String,
     }
-    let (url, bearer) = (format!("{service}/application/o/userinfo/"), format!("Bearer {access}"));
+    let Some(url) = endpoint(service, "/application/o/userinfo/") else { return String::new() };
+    let bearer = format!("Bearer {access}");
     let Ok(response) = http.send(&Request { headers: &[("Authorization", &bearer)], ..Request::get(&url) }) else {
         return String::new();
     };
@@ -257,7 +307,8 @@ fn name_of(http: &dyn Http, service: &str, access: &str) -> String {
 
 /// Tells the service a token is no longer wanted. Best effort.
 pub fn give_up_token(http: &dyn Http, service: &str, token: &str) {
-    let _ = post_form(http, &format!("{service}/application/o/revoke/"), &[("token", token), ("client_id", CLIENT)]);
+    let Some(url) = endpoint(service, "/application/o/revoke/") else { return };
+    let _ = post_form(http, &url, &[("token", token), ("client_id", CLIENT)]);
 }
 
 // ---- finishing a sign-in --------------------------------------------------------------------------
@@ -302,18 +353,27 @@ pub fn finish(http: &dyn Http, found: &Found, code: &str, back: &str, secret: &s
 /// How long to wait for someone to finish signing in in the browser.
 pub const WAIT: Duration = Duration::from_secs(5 * 60);
 
+/// How long the browser's page waits, once it has come back with a code, for the app to say
+/// whether the sign-in went through: after that it's told the app is still signing in.
+pub const ANSWER_WITHIN: Duration = Duration::from_secs(30);
+
 /// Said when nobody did.
 pub const NOBODY_SIGNED_IN: &str = "Nobody signed in within five minutes. Try again when you're ready.";
 
 /// The pages the browser is shown when it comes back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Page {
-    /// "You're signed in": it came back with a code.
+    /// "You're signed in": it came back with a code, and the app has kept what `finish` came
+    /// to, for the sign-in that's still the one under way.
     SignedIn,
-    /// "The sign-in didn't go through": it came back with an error.
+    /// "The sign-in didn't go through": it came back with an error, or with a code that
+    /// `finish` came to nothing of.
     NotThrough,
     /// "Nothing here": something else came to the door.
     NothingHere,
+    /// "Still signing in": it came back with a code, and the app hasn't decided yet within
+    /// the time a page is waited for (`ANSWER_WITHIN`).
+    StillSigningIn,
 }
 
 /// A page to show the browser, as HTML.
@@ -322,6 +382,7 @@ pub fn page(which: Page) -> String {
         Page::SignedIn => ("You're signed in", "You can close this tab and go back to Nexus Music."),
         Page::NotThrough => ("The sign-in didn't go through", "Go back to Nexus Music to try again."),
         Page::NothingHere => ("Nothing here", "This page only finishes a sign-in to Nexus Music."),
+        Page::StillSigningIn => ("Still signing in", "Go back to Nexus Music to see whether it went through."),
     };
     format!(
         "<!doctype html><meta charset=\"utf-8\"><title>Nexus Music</title>\
@@ -534,5 +595,84 @@ mod tests {
             sign_in_link(&found, "http://127.0.0.1:5000/callback", "st4te", "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
             "https://auth.example.org/application/o/authorize/?response_type=code&client_id=nexus-music&redirect_uri=http%3A%2F%2F127.0.0.1%3A5000%2Fcallback&scope=openid+profile+offline_access&state=st4te&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256"
         );
+    }
+
+    /// A Lidarr whose door sends every caller to a sign-in at `service`.
+    struct Door {
+        service: &'static str,
+    }
+
+    impl Http for Door {
+        fn send(&self, request: &Request) -> Result<crate::http::Response, Failure> {
+            let to = format!("{}/application/o/authorize/?client_id=proxy&response_type=code", self.service);
+            assert!(request.url.contains("/api/v1/system/status"), "{}", request.url);
+            Ok(crate::http::Response::new(302, vec![("Location".into(), Some(to))], || Ok(String::new())))
+        }
+    }
+
+    #[test]
+    fn a_sign_in_is_believed_only_on_https_or_where_lidarr_was_typed() {
+        let found = |lidarr: &str, service: &'static str| find(&Door { service }, lidarr).map(|found| found.map(|found| found.service));
+        // On HTTPS, wherever it is.
+        assert_eq!(found("https://lidarr.example.org", "https://auth.example.org"), Ok(Some("https://auth.example.org".into())));
+        assert_eq!(found("http://192.168.1.5:8686", "https://auth.example.org"), Ok(Some("https://auth.example.org".into())));
+        // Plain HTTP only at the scheme and host typed for Lidarr (any port): a home network.
+        assert_eq!(found("http://192.168.1.5:8686", "http://192.168.1.5:9000"), Ok(Some("http://192.168.1.5:9000".into())));
+        // Not a step down from what was typed, and not elsewhere.
+        assert_eq!(found("https://lidarr.example.org", "http://auth.example.org"), Err(not_trusted("auth.example.org")));
+        assert_eq!(found("https://lidarr.example.org", "http://lidarr.example.org"), Err(not_trusted("lidarr.example.org")));
+        assert_eq!(found("http://192.168.1.5:8686", "http://192.168.1.9:9000"), Err(not_trusted("192.168.1.9:9000")));
+        // Lidarr's address as 0.40.10 saved it, a name and password in it: its host is its host.
+        assert_eq!(found("http://me:secret@192.168.1.5:8686", "http://192.168.1.5:9000"), Ok(Some("http://192.168.1.5:9000".into())));
+    }
+
+    /// A Lidarr whose door sends every caller first to `outpost` (as written in its
+    /// `Location`), and the outpost on to a sign-in at "https://auth.example.org". What's
+    /// asked is written down.
+    struct Outpost {
+        outpost: &'static str,
+        asked: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Http for Outpost {
+        fn send(&self, request: &Request) -> Result<crate::http::Response, Failure> {
+            self.asked.lock().unwrap().push(request.url.to_string());
+            let to = if request.url.contains("/api/v1/system/status") {
+                self.outpost.to_string()
+            } else {
+                "https://auth.example.org/application/o/authorize/?client_id=proxy&response_type=code".to_string()
+            };
+            Ok(crate::http::Response::new(302, vec![("Location".into(), Some(to))], || Ok(String::new())))
+        }
+    }
+
+    #[test]
+    fn a_refused_sign_in_is_said_with_what_makes_it_work() {
+        assert_eq!(
+            not_trusted("auth.example.org"),
+            "The sign-in at auth.example.org is refused because it isn't on https, or where Lidarr's own address is, so signing in would cross the network unprotected: put the sign-in on https, or, with Lidarr on plain http, on Lidarr's own host."
+        );
+    }
+
+    #[test]
+    fn every_address_on_the_way_to_the_sign_in_is_judged_before_it_is_asked() {
+        let ask = |lidarr: &str, outpost: &'static str| {
+            let http = Outpost { outpost, asked: Default::default() };
+            let found = find(&http, lidarr).map(|found| found.map(|found| found.service));
+            let asked = http.asked.lock().unwrap().len();
+            (found, asked)
+        };
+        let there = Ok(Some("https://auth.example.org".to_string()));
+        // Lidarr's own door, at the address typed for it: asked.
+        assert_eq!(ask("http://192.168.1.5:8686", "/outpost.goauthentik.io/start?rd=x"), (there.clone(), 2));
+        assert_eq!(ask("http://192.168.1.5:8686", "http://192.168.1.5:8686/outpost.goauthentik.io/start"), (there.clone(), 2));
+        // Anywhere on HTTPS: asked.
+        assert_eq!(ask("http://192.168.1.5:8686", "https://door.example.org/start"), (there.clone(), 2));
+        // Plain HTTP elsewhere, or a step down: not asked at all.
+        assert_eq!(ask("http://192.168.1.5:8686", "http://door.example.org/start"), (Err(not_trusted("door.example.org")), 1));
+        assert_eq!(ask("https://lidarr.example.org", "http://lidarr.example.org/start"), (Err(not_trusted("lidarr.example.org")), 1));
+        // "//host/path" is that host, on the scheme of the address that sent it, and judged so.
+        assert_eq!(ask("https://lidarr.example.org", "//door.example.org/start"), (there, 2));
+        assert_eq!(ask("http://192.168.1.5:8686", "//door.example.org/start"), (Err(not_trusted("door.example.org")), 1));
     }
 }

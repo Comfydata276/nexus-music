@@ -73,7 +73,8 @@ pub struct Asked {
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct Arrival {
-    /// Its place among what's been asked for.
+    /// Its place among what's been asked for when it was looked for: not what it's marked by,
+    /// as the list can change meanwhile (see `mark`).
     pub place: usize,
     pub library_album: String,
     pub cover: String,
@@ -82,16 +83,26 @@ pub struct Arrival {
     pub fills: Vec<(String, String, String, i64)>,
     /// How many songs its playlists are waiting for that aren't in the library yet.
     pub missing: usize,
-    /// When it was asked for and by what title: what tells it apart once places have moved.
+    /// When it was asked for, and its MusicBrainz id, title and artist: the note it is, what
+    /// tells it apart once places have moved.
     pub at: i64,
     pub title: String,
+    pub album: String,
+    pub artist: String,
 }
 
 /// Notes something asked for. Asking again for the same album adds to the note that's
 /// there: more songs for playlists, or the song that's wanted from it.
 pub fn put(items: &mut Vec<Asked>, asked: Asked) {
+    // Two notes with ids are the same album only if the ids are; without one, by title and
+    // artist.
     let same = |other: &Asked| {
-        other.arrived == 0 && ((!asked.album.is_empty() && other.album == asked.album) || (same_words(&other.title, &asked.title) && same_artist(&other.artist, &asked.artist)))
+        other.arrived == 0
+            && if !asked.album.is_empty() && !other.album.is_empty() {
+                other.album == asked.album
+            } else {
+                same_words(&other.title, &asked.title) && same_artist(&other.artist, &asked.artist)
+            }
     };
     match items.iter_mut().find(|other| same(other)) {
         Some(known) => {
@@ -111,11 +122,22 @@ pub fn put(items: &mut Vec<Asked>, asked: Asked) {
     }
 }
 
-/// Stops watching for an album that's been taken off Lidarr's list. Says whether the list
-/// changed.
-pub fn forget(items: &mut Vec<Asked>, title: &str) -> bool {
+/// Stops watching for an album that's been taken off Lidarr's list: the one with its
+/// MusicBrainz id (`album`), or, where either side has none (a note written by an older
+/// version), the one with the same title and the same artist, once both are normalised (the
+/// same words). Never by its title alone, nor by an artist that's only part of the other's
+/// credit: two albums of one name are two albums, and a note left until it expires is the
+/// safer mistake. Says whether the list changed.
+pub fn forget(items: &mut Vec<Asked>, album: &str, title: &str, artist: &str) -> bool {
     let before = items.len();
-    items.retain(|asked| asked.arrived != 0 || !same_words(&asked.title, title));
+    items.retain(|asked| {
+        let same = if !album.is_empty() && !asked.album.is_empty() {
+            asked.album == album
+        } else {
+            !artist.is_empty() && same_words(&asked.title, title) && same_words(&asked.artist, artist)
+        };
+        asked.arrived != 0 || !same
+    });
     items.len() != before
 }
 
@@ -143,10 +165,26 @@ pub fn tidy(items: &mut Vec<Asked>, now: i64) -> bool {
     items.len() != before
 }
 
-/// Marks arrivals as such.
+/// Whether `asked` is the note `arrival` was found for: asked at the same moment, by the same
+/// title and artist, and with the same id if the note had one when the scan looked (a repeat
+/// request may have given an older note its id since: it's the same note).
+pub fn is_note(asked: &Asked, arrival: &Arrival) -> bool {
+    asked.at == arrival.at && asked.title == arrival.title && asked.artist == arrival.artist && (arrival.album.is_empty() || asked.album == arrival.album)
+}
+
+/// The notes the arrivals were found for that haven't arrived before: what's news, to be
+/// said. By what each is (`is_note`), as `mark` goes, not by its place.
+pub fn news(items: &[Asked], arrivals: &[Arrival]) -> Vec<Asked> {
+    arrivals.iter().filter_map(|arrival| items.iter().find(|asked| is_note(asked, arrival)).filter(|asked| asked.arrived == 0).cloned()).collect()
+}
+
+/// Marks arrivals as such: each the note it was found for, by what it is (`is_note`), not by
+/// its place. A note taken off the list since is marked nothing.
 pub fn mark(items: &mut [Asked], arrivals: &[Arrival], now: i64) {
     for arrival in arrivals {
-        let Some(asked) = items.get_mut(arrival.place) else { continue };
+        let Some(asked) = items.iter_mut().find(|asked| is_note(asked, arrival)) else {
+            continue;
+        };
         if asked.arrived == 0 {
             asked.arrived = now;
             asked.library_album = arrival.library_album.clone();
@@ -197,7 +235,7 @@ pub fn arrivals(
             if asked.arrived != 0 && fills.is_empty() {
                 return None;
             }
-            Some(Arrival { place, library_album, cover, fills, missing, at: asked.at, title: asked.title.clone() })
+            Some(Arrival { place, library_album, cover, fills, missing, at: asked.at, title: asked.title.clone(), album: asked.album.clone(), artist: asked.artist.clone() })
         })
         .collect()
 }
@@ -274,11 +312,13 @@ mod tests {
         assert_eq!((items[0].song.as_str(), items[0].fills.len(), items[0].at), ("Her Diamonds", 1, 100));
         assert!(waiting(&items));
 
-        mark(&mut items, &[Arrival { place: 0, library_album: "a9".into(), ..Default::default() }], 1000);
+        let this = |items: &[Asked]| Arrival { library_album: "a9".into(), at: items[0].at, title: items[0].title.clone(), album: items[0].album.clone(), artist: items[0].artist.clone(), ..Default::default() };
+        let arrived = this(&items);
+        mark(&mut items, &[arrived], 1000);
         assert!(!waiting(&items));
         assert_eq!(items[0].library_album, "a9");
         // Taking it off Lidarr's list doesn't forget one that's already here.
-        assert!(!forget(&mut items, "Cradlesong"));
+        assert!(!forget(&mut items, "", "Cradlesong", "Rob Thomas"));
         assert_eq!(items.len(), 1);
         assert!(!tidy(&mut items, 1000 + SHOWN_FOR - 1));
         assert!(tidy(&mut items, 1000 + SHOWN_FOR + 1));
@@ -286,7 +326,81 @@ mod tests {
         // One still awaited is forgotten by its title, and given up on after half a year.
         put(&mut items, Asked { title: "Cradlesong".into(), artist: "Rob Thomas".into(), at: 100, ..Default::default() });
         put(&mut items, Asked { title: "Something to Be".into(), artist: "Rob Thomas".into(), at: 100, ..Default::default() });
-        assert!(forget(&mut items, "cradlesong") && items.len() == 1);
+        assert!(forget(&mut items, "", "cradlesong", "rob thomas") && items.len() == 1);
         assert!(!tidy(&mut items, 100 + GIVEN_UP_AFTER - 1) && tidy(&mut items, 100 + GIVEN_UP_AFTER));
     }
+
+    #[test]
+    fn what_was_asked_for_is_forgotten_by_what_it_is() {
+        // Two albums of one name, by two artists, both asked for; and one noted by an older
+        // version, with no id. Taking one off forgets that one alone.
+        let mut items = vec![
+            Asked { album: "rg-a".into(), title: "Greatest Hits".into(), artist: "Queen".into(), ..Default::default() },
+            Asked { album: "rg-b".into(), title: "Greatest Hits".into(), artist: "ABBA".into(), ..Default::default() },
+            Asked { title: "Greatest Hits".into(), artist: "Blondie".into(), ..Default::default() },
+        ];
+        assert!(forget(&mut items, "rg-b", "Greatest Hits", "ABBA"));
+        assert_eq!(items.iter().map(|asked| asked.artist.as_str()).collect::<Vec<_>>(), ["Queen", "Blondie"]);
+        // One with no id is found by its title and artist together, never its title alone.
+        assert!(!forget(&mut items, "rg-z", "Greatest Hits", "Someone Else"));
+        assert!(forget(&mut items, "rg-c", "greatest hits", "blondie"));
+        assert_eq!(items.iter().map(|asked| asked.artist.as_str()).collect::<Vec<_>>(), ["Queen"]);
+        // An id that doesn't match isn't overruled by a title and artist that do.
+        assert!(!forget(&mut items, "rg-other", "Greatest Hits", "Queen"));
+    }
+
+    #[test]
+    fn a_note_is_one_album() {
+        // Two albums of one title by one artist (a reissue under its own id, say): two notes.
+        let mut items = Vec::new();
+        put(&mut items, Asked { album: "rg-1".into(), title: "Live".into(), artist: "Queen".into(), at: 1, ..Default::default() });
+        put(&mut items, Asked { album: "rg-2".into(), title: "Live".into(), artist: "Queen".into(), at: 2, ..Default::default() });
+        assert_eq!(items.len(), 2);
+        // Without an id, an artist that's only part of another's credit is another artist.
+        let mut items = vec![
+            Asked { title: "Greatest Hits".into(), artist: "Queen & David Bowie".into(), ..Default::default() },
+            Asked { title: "Greatest Hits".into(), artist: "Queen".into(), ..Default::default() },
+        ];
+        assert!(forget(&mut items, "", "Greatest Hits", "Queen"));
+        assert_eq!(items.iter().map(|asked| asked.artist.as_str()).collect::<Vec<_>>(), ["Queen & David Bowie"]);
+        assert!(!forget(&mut items, "", "Greatest Hits", "Queen"));
+        assert!(forget(&mut items, "", "greatest hits", "queen & david bowie"));
+    }
+
+    #[test]
+    fn an_arrival_is_marked_on_the_note_it_was_found_for_wherever_it_is_now() {
+        let note = |album: &str, title: &str, at: i64| Asked { album: album.into(), title: title.into(), artist: "Them".into(), at, ..Default::default() };
+        let mut items = vec![note("rg-a", "First", 1), note("rg-b", "Second", 2)];
+        let found = arrivals(&items, 10, |title, _| (title == "Second").then(|| ("lib-2".to_string(), "cover-2".to_string())), |_| None);
+        assert_eq!(found.len(), 1);
+        // Meanwhile the first is taken off the list, and another asked for: the second is now
+        // first, and another is where it was.
+        assert!(forget(&mut items, "rg-a", "First", "Them"));
+        items.push(note("rg-c", "Third", 3));
+        mark(&mut items, &found, 10);
+        assert_eq!(items.iter().map(|asked| (asked.title.as_str(), asked.arrived)).collect::<Vec<_>>(), [("Second", 10), ("Third", 0)]);
+    }
+
+    #[test]
+    fn an_arrival_is_said_marked_and_filled_by_the_one_note_the_scan_saw() {
+        // A note from 0.40.10, with no id, and another.
+        let mut items = vec![
+            Asked { title: "Other".into(), artist: "Them".into(), at: 1, ..Default::default() },
+            Asked { title: "Cradlesong".into(), artist: "Rob Thomas".into(), at: 2, ..Default::default() },
+        ];
+        let found = arrivals(&items, 10, |title, _| (title == "Cradlesong").then(|| ("lib".to_string(), "cover".to_string())), |_| None);
+        assert_eq!(found.len(), 1);
+        // Before the scan answers: the first is taken off the list (places move), and the same
+        // album is asked for again, which gives the old note its id.
+        assert!(forget(&mut items, "", "Other", "Them"));
+        put(&mut items, Asked { album: "rg-c".into(), title: "Cradlesong".into(), artist: "Rob Thomas".into(), at: 3, ..Default::default() });
+        assert_eq!((items.len(), items[0].album.as_str()), (1, "rg-c"));
+        // It's news once, and marked: the next scan has nothing to say of it.
+        assert_eq!(news(&items, &found).iter().map(|asked| asked.title.as_str()).collect::<Vec<_>>(), ["Cradlesong"]);
+        mark(&mut items, &found, 10);
+        assert_eq!(items[0].arrived, 10);
+        assert!(news(&items, &found).is_empty());
+        assert!(arrivals(&items, 20, |_, _| Some(("lib".to_string(), "cover".to_string())), |_| None).is_empty());
+    }
 }
+

@@ -13,8 +13,10 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+use nexus_core::http::{Failure, Http, Request, Response};
 use std::time::{Duration, Instant};
 
 use nexus_core::gate::{base64url, param};
@@ -75,6 +77,10 @@ pub struct Attempt {
     secret: String,
     state: String,
     back: String,
+    /// When the whole attempt gives up (`WAIT` after it began).
+    deadline: Instant,
+    /// How long the browser waits for its page once it's back (`ANSWER_WITHIN`).
+    answer_within: Duration,
     /// The page to open in the browser.
     pub link: String,
 }
@@ -87,7 +93,7 @@ pub fn begin(found: &Found) -> Result<Attempt, String> {
     let secret = unguessable(48)?;
     let state = unguessable(18)?;
     let link = nexus_core::gate::sign_in_link(found, &back, &state, &secret);
-    Ok(Attempt { listener, found: found.clone(), secret, state, back, link })
+    Ok(Attempt { listener, found: found.clone(), secret, state, back, deadline: Instant::now() + WAIT, answer_within: nexus_core::gate::ANSWER_WITHIN, link })
 }
 
 fn reply(stream: &mut TcpStream, status: &str, body: &str) {
@@ -114,17 +120,82 @@ fn first_line(stream: &mut TcpStream) -> String {
     String::from_utf8_lossy(&seen).lines().next().unwrap_or_default().to_string()
 }
 
-impl Attempt {
-    /// Waits for the browser to come back, then collects the token. `given_up` is asked now
-    /// and then whether to stop waiting.
-    pub fn finish(self, agent: &ureq::Agent, given_up: impl Fn() -> bool) -> Result<SignedIn, String> {
-        let code = self.wait(&given_up)?;
-        nexus_core::gate::finish(&over(agent), &self.found, &code, &self.back, &self.secret)
+/// The browser, come back with a code and waiting for its page. It's answered once, with what
+/// the app decided (`answer`): "You're signed in" only once the token is kept for the sign-in
+/// still under way. If nothing is decided within `ANSWER_WITHIN`, it's told the app is still
+/// signing in; let go of unanswered, it's told the sign-in didn't go through.
+pub struct Browser(Arc<Mutex<Option<TcpStream>>>);
+
+impl Browser {
+    fn held(stream: TcpStream, within: Duration) -> Browser {
+        let held = Arc::new(Mutex::new(Some(stream)));
+        let late = held.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(within);
+            answer_once(&late, Page::StillSigningIn);
+        });
+        Browser(held)
     }
 
-    fn wait(&self, given_up: &impl Fn() -> bool) -> Result<String, String> {
+    pub fn answer(&self, page: Page) {
+        answer_once(&self.0, page);
+    }
+}
+
+fn answer_once(held: &Mutex<Option<TcpStream>>, page: Page) {
+    let stream = held.lock().unwrap_or_else(|stuck| stuck.into_inner()).take();
+    if let Some(mut stream) = stream {
+        reply(&mut stream, "200 OK", &nexus_core::gate::page(page));
+    }
+}
+
+impl Drop for Browser {
+    fn drop(&mut self) {
+        answer_once(&self.0, Page::NotThrough);
+    }
+}
+
+/// The app's agent for the sign-in, with every request held to what's left of the attempt's
+/// time: the whole attempt, from opening the browser to the token in hand, keeps its limit.
+struct Until {
+    agent: crate::corehttp::Agent,
+    deadline: Instant,
+}
+
+impl Http for Until {
+    fn send(&self, request: &Request) -> Result<Response, Failure> {
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(Failure::Reach(nexus_core::gate::NOBODY_SIGNED_IN.into()));
+        }
+        let patience = request.patience.map_or(left, |patience| patience.min(left));
+        self.agent.send(&Request { patience: Some(patience), ..request.clone() })
+    }
+}
+
+impl Attempt {
+    /// Waits for the browser to come back, then collects the token, all within `WAIT` of the
+    /// attempt's start. `given_up` is asked now and then whether to stop waiting. The browser,
+    /// if it came back with a code, is handed over still waiting for its page: it's the
+    /// caller's to answer once it has kept the token (see `Browser`).
+    pub fn finish(self, agent: &ureq::Agent, given_up: impl Fn() -> bool) -> (Result<SignedIn, String>, Option<Browser>) {
+        let (code, browser) = match self.wait(&given_up) {
+            Ok(came_back) => came_back,
+            Err(why) => return (Err(why), None),
+        };
+        let browser = Browser::held(browser, self.answer_within);
+        let http = Until { agent: over(agent), deadline: self.deadline };
+        let done = nexus_core::gate::finish(&http, &self.found, &code, &self.back, &self.secret);
+        if done.is_err() {
+            browser.answer(Page::NotThrough);
+        }
+        (done, Some(browser))
+    }
+
+    /// The code the browser came back with, and the browser, still waiting for its page.
+    fn wait(&self, given_up: &impl Fn() -> bool) -> Result<(String, TcpStream), String> {
         self.listener.set_nonblocking(true).map_err(|e| e.to_string())?;
-        let deadline = Instant::now() + WAIT;
+        let deadline = self.deadline;
         loop {
             if given_up() {
                 return Err(String::new());
@@ -153,8 +224,7 @@ impl Attempt {
                 return Err(nexus_core::gate::turned_down(&why));
             }
             if let Some(code) = param(query, "code").filter(|code| !code.is_empty()) {
-                reply(&mut stream, "200 OK", &nexus_core::gate::page(Page::SignedIn));
-                return Ok(code);
+                return Ok((code, stream));
             }
             reply(&mut stream, "400 Bad Request", &nexus_core::gate::page(Page::NothingHere));
         }
@@ -325,10 +395,16 @@ mod wire {
             write!(stream, "GET /callback?code=c0de%2B1&state={state} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").unwrap();
             let mut said = String::new();
             let _ = stream.read_to_string(&mut said);
-            said.lines().next().unwrap_or_default().to_string()
+            said
         });
-        let done = attempt.finish(&agent(), || false).unwrap();
-        assert_eq!(browser.join().unwrap(), "HTTP/1.1 200 OK");
+        let (done, held) = attempt.finish(&agent(), || false);
+        let done = done.unwrap();
+        // Not told yet: the app hasn't kept the token. Once it has, it's told.
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!browser.is_finished());
+        held.unwrap().answer(Page::SignedIn);
+        let said = browser.join().unwrap();
+        assert!(said.starts_with("HTTP/1.1 200 OK\r\n") && said.ends_with(&nexus_core::gate::page(Page::SignedIn)), "{said}");
         assert_eq!((done.token.as_str(), done.name.as_str()), ("to keep/1", "someone"));
         let sent: Vec<Sent> = sent.lock().unwrap().clone();
         let back = param(link.split_once('?').unwrap().1, "redirect_uri").unwrap();
@@ -356,15 +432,19 @@ mod wire {
         let attempt = begin(&Found { service: address, client: "lidarr-proxy".into() }).unwrap();
         let query = attempt.link.split_once('?').unwrap().1.to_string();
         let (back, state) = (param(&query, "redirect_uri").unwrap(), param(&query, "state").unwrap());
-        std::thread::spawn(move || {
+        let browser = std::thread::spawn(move || {
             let mut stream = std::net::TcpStream::connect(back.trim_start_matches("http://").trim_end_matches("/callback")).unwrap();
             write!(stream, "GET /callback?code=c&state={state} HTTP/1.1\r\n\r\n").unwrap();
-            let _ = stream.read_to_string(&mut String::new());
+            let mut said = String::new();
+            let _ = stream.read_to_string(&mut said);
+            said
         });
         assert_eq!(
-            attempt.finish(&agent(), || false).err().as_deref(),
+            attempt.finish(&agent(), || false).0.err().as_deref(),
             Some("You're signed in, but the sign-in service won't let this app through to Lidarr. Either your account isn't allowed to use Lidarr, or Lidarr's sign-in hasn't been told to trust Nexus Music yet.")
         );
+        // The browser isn't told it's signed in: it's answered once the app knows it isn't.
+        assert!(browser.join().unwrap().ends_with(&nexus_core::gate::page(Page::NotThrough)));
         let sent = sent.lock().unwrap().clone();
         let revoke = "token=to+keep%2F1&client_id=nexus-music";
         assert_eq!(sent.len(), 3);
@@ -482,7 +562,7 @@ mod wire {
             let _ = stream.read_to_string(&mut String::new());
         });
         let started = Instant::now();
-        let done = attempt.finish(&agent(), || false);
+        let (done, _) = attempt.finish(&agent(), || false);
         (done, started.elapsed())
     }
 
@@ -533,4 +613,63 @@ mod wire {
             assert_eq!(done.unwrap().name, "", "as {kind}");
         }
     }
+
+    /// A sign-in that comes back with a code, its exchange answered by `token` (held as long as
+    /// that likes): the attempt, and the browser's thread, which gives the page it was shown.
+    fn came_back(token: impl Fn(&mut std::net::TcpStream) + Send + Sync + 'static, within: Duration) -> (Attempt, std::thread::JoinHandle<String>) {
+        let (address, _) = recorder(move |_, request, stream| match request.line() {
+            line if line.starts_with("POST /application/o/token/ ") && request.body.contains("authorization_code") => token(stream),
+            line if line.starts_with("POST /application/o/token/ ") => json(stream, "200 OK", r#"{"access_token":"a-pass","expires_in":600}"#),
+            _ => json(stream, "200 OK", r#"{"preferred_username":"someone"}"#),
+        });
+        let mut attempt = begin(&Found { service: address, client: "lidarr-proxy".into() }).unwrap();
+        attempt.answer_within = within;
+        let query = attempt.link.split_once('?').unwrap().1.to_string();
+        let (back, state) = (param(&query, "redirect_uri").unwrap(), param(&query, "state").unwrap());
+        let browser = std::thread::spawn(move || {
+            let mut stream = std::net::TcpStream::connect(back.trim_start_matches("http://").trim_end_matches("/callback")).unwrap();
+            write!(stream, "GET /callback?code=c&state={state} HTTP/1.1\r\n\r\n").unwrap();
+            let mut said = String::new();
+            let _ = stream.read_to_string(&mut said);
+            said
+        });
+        (attempt, browser)
+    }
+
+    #[test]
+    fn the_browser_is_told_what_the_app_decided_within_a_limit() {
+        let fine = |stream: &mut std::net::TcpStream| json(stream, "200 OK", r#"{"access_token":"first-access","refresh_token":"to keep"}"#);
+        // Let go of unanswered (a round cancelled or replaced): it didn't go through.
+        let (attempt, browser) = came_back(fine, Duration::from_secs(30));
+        let (done, held) = attempt.finish(&agent(), || false);
+        assert!(done.is_ok());
+        drop(held);
+        assert!(browser.join().unwrap().ends_with(&nexus_core::gate::page(Page::NotThrough)));
+        // Nothing decided within the limit: still signing in, and the exchange carries on.
+        let slow = |stream: &mut std::net::TcpStream| {
+            std::thread::sleep(Duration::from_millis(1500));
+            json(stream, "200 OK", r#"{"access_token":"first-access","refresh_token":"to keep"}"#)
+        };
+        let (attempt, browser) = came_back(slow, Duration::from_millis(300));
+        let started = Instant::now();
+        let (done, held) = attempt.finish(&agent(), || false);
+        assert!(browser.join().unwrap().ends_with(&nexus_core::gate::page(Page::StillSigningIn)));
+        assert!(done.is_ok() && started.elapsed() >= Duration::from_millis(1400));
+        // (Answered once: what's decided later is shown nowhere.)
+        held.unwrap().answer(Page::SignedIn);
+    }
+
+    #[test]
+    fn the_whole_attempt_keeps_its_limit() {
+        // An exchange that never answers ends when the attempt's time is up.
+        let never = |_: &mut std::net::TcpStream| std::thread::sleep(Duration::from_secs(20));
+        let (mut attempt, browser) = came_back(never, Duration::from_secs(30));
+        attempt.deadline = Instant::now() + Duration::from_secs(2);
+        let started = Instant::now();
+        let (done, held) = attempt.finish(&agent(), || false);
+        assert!(done.is_err() && started.elapsed() < Duration::from_secs(5), "{:?} after {:?}", done.err(), started.elapsed());
+        drop(held);
+        assert!(browser.join().unwrap().ends_with(&nexus_core::gate::page(Page::NotThrough)));
+    }
 }
+

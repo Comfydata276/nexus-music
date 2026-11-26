@@ -5,7 +5,7 @@
 //! end: the connection they're asked over, and the settings they're asked with. Nothing
 //! here is used unless requests are switched on.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
 use nexus_core::musicbrainz::{MusicBrainz, THEIR_IDLE};
 pub use nexus_core::musicbrainz::{SongOffer, base, cover, same_words, words};
@@ -20,8 +20,7 @@ pub(crate) fn service() -> &'static MusicBrainz {
         if crate::pins::entered() {
             return MusicBrainz::new(crate::pins::world(), crate::listenbrainz::service().clone());
         }
-        let agent = crate::subsonic::make_agent_idle(THEIR_IDLE);
-        MusicBrainz::new(Arc::new(crate::corehttp::Agent(agent)), crate::listenbrainz::service().clone())
+        MusicBrainz::new(crate::corehttp::public(THEIR_IDLE), crate::listenbrainz::service().clone())
     })
 }
 
