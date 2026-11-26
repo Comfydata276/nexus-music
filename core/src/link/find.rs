@@ -5,11 +5,14 @@
 //! sign-in in the form, as every request of a look is.
 //!
 //! **The whole look-up has what the command has, and no more.** A command is waited on for
-//! half a minute; after that it is given up, and whatever is found for it is nobody's. So
-//! each request is given what is then left of that time as its own limit, **the last one
-//! too**: a request to a server that has stopped answering ends when the command does, not
-//! when the app's own patience with the server runs out, and no worker is held past it.
-//! When no time is left, no further request is made.
+//! half a minute **from when it arrived**; after that it is given up, and whatever is
+//! found for it is nobody's. So each request is given what is then left of that time as
+//! its own limit, **the last one too**: a request to a server that has stopped answering
+//! ends when the command does, not when the app's own patience with the server runs out,
+//! and no worker is held past it. When no time is left, no further request is made. How
+//! long is left is asked of the app before each request ([`find`]'s `left`): the app
+//! counts it from the moment the command ends ([`super::device::Do::Find`]'s `until_ms`),
+//! so the time a look-up spends waiting to begin is part of it.
 
 use std::time::Duration;
 
@@ -18,14 +21,17 @@ use super::look::{self, Account, Not};
 use crate::http::Http;
 use crate::model::Song;
 
-/// The songs of `ids` that the music server has, in the order asked. `within` is how long
-/// the command is still waited on, and `spent` says how much of that has gone, asked
-/// before each request. A song the server does not have, or does not answer for in time,
-/// is left out; if the sign-in has ended, nothing more is asked.
-pub fn find(http: &dyn Http, account: &Account, ids: &[String], within: Duration, spent: &mut dyn FnMut() -> Duration) -> Vec<Song> {
+/// The songs of `ids` that the music server has, in the order asked. `left` says how
+/// long the command is still waited on, asked before each request. A song the server
+/// does not have, or does not answer for in time, is left out; if the sign-in has ended
+/// (the app's `Http` says so), nothing more is asked.
+pub fn find(http: &dyn Http, account: &Account, ids: &[String], left: &mut dyn FnMut() -> Duration) -> Vec<Song> {
     let mut found = Vec::new();
     for id in ids.iter().filter(|id| id_ok(id)) {
-        let Some(left) = within.checked_sub(spent()).filter(|left| !left.is_zero()) else { break };
+        let left = left();
+        if left.is_zero() {
+            break;
+        }
         match look::call(http, account, "getSong", &[("id", id)], false, Some(left)) {
             Ok(text) => found.extend(song(&text).filter(|song| song.id == *id)),
             Err(Not::Wanted) => break,
@@ -62,11 +68,13 @@ mod tests {
         clock_ms: Mutex<u64>,
         given: Mutex<Vec<(String, Option<Duration>)>>,
         signed_out_after: Option<usize>,
+        /// Whatever song it is asked for, it answers with this one.
+        answers_with: Option<&'static str>,
     }
 
     impl Server {
         fn with(has: &[&'static str], takes_ms: u64) -> Server {
-            Server { has: has.to_vec(), takes_ms, clock_ms: Mutex::new(0), given: Mutex::default(), signed_out_after: None }
+            Server { has: has.to_vec(), takes_ms, clock_ms: Mutex::new(0), given: Mutex::default(), signed_out_after: None, answers_with: None }
         }
 
         fn spent(&self) -> Duration {
@@ -90,7 +98,7 @@ mod tests {
                 return Err(Failure::Reach("timed out".into()));
             }
             let text = match self.has.contains(&id.as_str()) {
-                true => serde_json::json!({"subsonic-response": {"status": "ok", "song": {"id": id, "title": format!("Song {id}"), "duration": 200}}}),
+                true => serde_json::json!({"subsonic-response": {"status": "ok", "song": {"id": self.answers_with.unwrap_or(&id), "title": format!("Song {id}"), "duration": 200}}}),
                 false => serde_json::json!({"subsonic-response": {"status": "failed", "error": {"code": 70, "message": "Song not found"}}}),
             }
             .to_string();
@@ -111,7 +119,7 @@ mod tests {
     }
 
     fn found(server: &Server, asked: &[&str], within_ms: u64) -> Vec<String> {
-        find(server, &account(), &ids(asked), Duration::from_millis(within_ms), &mut || server.spent()).into_iter().map(|song| song.id).collect()
+        find(server, &account(), &ids(asked), &mut || Duration::from_millis(within_ms).saturating_sub(server.spent())).into_iter().map(|song| song.id).collect()
     }
 
     #[test]
@@ -150,8 +158,19 @@ mod tests {
         assert_eq!((found(&server, &["a", "b", "c"], 30_000), server.given.lock().unwrap().len()), (vec!["a".to_string()], 1));
     }
 
-    /// The answer is the server's word on that song and nothing else: an answer about
-    /// another song, one that is not well, and one that is not an answer, give nothing.
+    /// A server that answers about another song than the one it was asked for (a proxy in
+    /// front of it, an answer kept from another request): that is not the song asked
+    /// for, and it is not handed back as if it were.
+    #[test]
+    fn an_answer_about_another_song_than_the_one_asked_for_is_not_taken() {
+        let mut server = Server::with(&["a", "b", "c"], 100);
+        server.answers_with = Some("b");
+        assert_eq!(found(&server, &["a", "b", "c"], 30_000), ["b"]);
+        assert_eq!(server.given.lock().unwrap().len(), 3);
+    }
+
+    /// The answer is the server's word on that song and nothing else: one that is not
+    /// well, and one that is not an answer, give nothing.
     #[test]
     fn only_the_servers_own_word_on_the_song_asked_for_counts() {
         assert_eq!(song(r#"{"subsonic-response":{"status":"ok","song":{"id":"a","title":"A"}}}"#).map(|song| song.id), Some("a".into()));

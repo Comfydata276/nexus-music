@@ -246,6 +246,9 @@ struct Inner {
     live: Option<Live>,
     /// Set when the sign-in ends, for the look that is on its way to see.
     look_over: Arc<AtomicBool>,
+    /// Set when the sign-in ends, for whatever is asking the music server for songs a
+    /// command brought: a new one for each sign-in.
+    sign_in_over: Arc<AtomicBool>,
     /// Songs the music server was asked for because this PC's copy of the library lacked
     /// them: held while the command that brought them is carried out, and then let go of.
     found: HashMap<String, Song>,
@@ -616,22 +619,21 @@ impl Controller {
                 // deciding gives the command up then, and a look-up of fifty songs at a
                 // server that has stopped answering must not go on holding a worker. No
                 // request of it outlives the command: `nexus_core::link::find`.)
-                Do::Find { ticket, ids, within_ms } => {
+                Do::Find { ticket, ids, until_ms } => {
                     let account = self.settings.borrow().account();
-                    let began = std::time::Instant::now();
+                    // What is left of the command's time, counted here and now from the
+                    // moment it ends: the time spent waiting for a worker is part of it.
+                    let (left, began) = (Duration::from_millis(until_ms.saturating_sub(now_ms())), std::time::Instant::now());
+                    // (And it asks nothing more once this sign-in has ended.)
+                    let over = self.link.borrow().inner.borrow().sign_in_over.clone();
                     self.request(
                         move |client| {
-                            // The ones this PC's copy of the library has need no asking;
-                            // the rest are asked of the music server, each request given
-                            // what is left of the command's time and no more (the time
-                            // spent waiting for a worker is part of it).
-                            let index = crate::search::current();
-                            let kept = |id: &String| index.as_ref().and_then(|index| index.library.songs.iter().find(|song| song.id == *id).cloned());
-                            let lacking: Vec<String> = ids.iter().filter(|id| kept(id).is_none()).cloned().collect();
+                            // These are the songs this PC's copy of the library lacks:
+                            // each is asked of the music server, given what is then left.
                             let offline = client.clone();
-                            let http = LookHttp { agent: crate::corehttp::Agent(crate::subsonic::make_agent_without_redirects()), over: Arc::new(AtomicBool::new(false)), offline: Box::new(move || offline.is_offline()) };
-                            let mut found = nexus_core::link::find::find(&http, &client.link_account(), &lacking, Duration::from_millis(within_ms), &mut || began.elapsed());
-                            Ok(ids.iter().filter_map(|id| kept(id).or_else(|| found.iter().position(|song| song.id == *id).map(|at| found.remove(at)))).filter(|song| song.radio_url.is_empty()).collect::<Vec<Song>>())
+                            let http = LookHttp { agent: crate::corehttp::Agent(crate::subsonic::make_agent_without_redirects()), over, offline: Box::new(move || offline.is_offline()) };
+                            let found = nexus_core::link::find::find(&http, &client.link_account(), &ids, &mut || left.saturating_sub(began.elapsed()));
+                            Ok(found.into_iter().filter(|song| song.radio_url.is_empty()).collect::<Vec<Song>>())
                         },
                         move |ctl, songs| {
                             // Before anything it found is kept: is a command still waiting
@@ -754,6 +756,10 @@ impl Controller {
 
     /// Ends everything of this sign-in's: at sign-out, and as the app closes.
     pub fn link_stop(self: &Rc<Self>) {
+        // Whatever is still asking the music server for songs under this sign-in asks
+        // nothing more.
+        let over = std::mem::take(&mut self.link.borrow().inner.borrow_mut().sign_in_over);
+        over.store(true, Ordering::Relaxed);
         self.link_event(|device, env| device.stop(env));
     }
 

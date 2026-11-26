@@ -224,11 +224,12 @@ pub enum Do {
     /// time when its turn comes ([`may_go`]).
     Send { session: u64, token: Token, to: Place, frame: String },
     /// Some of the songs a command brings are not in this device's copy of the library:
-    /// ask the music server for them, and answer with [`Device::found`] the ones it has.
-    /// **For no longer than `within_ms`** (`super::find::find` gives each request what is
-    /// left of it): that is when the command is given up, and whatever is found after it
-    /// is nobody's.
-    Find { ticket: u64, ids: Vec<String>, within_ms: u64 },
+    /// ask the music server for **these, the ones it lacks**, and answer with
+    /// [`Device::found`] the ones the server has. **Until `until_ms` and no longer**, on
+    /// the clock this device is told the time by ([`Env::now_ms`]): that is the moment
+    /// the command is given up, counted from when it arrived, and whatever is found
+    /// after it is nobody's. (`super::find::find` gives each request what is then left.)
+    Find { ticket: u64, ids: Vec<String>, until_ms: u64 },
     /// For a test only: carry on with what this ticket holds after this long
     /// ([`Device::resume`]).
     Later { ticket: u64, after_ms: u64 },
@@ -972,8 +973,12 @@ impl Device {
                     // one that is open, and this device is busy to the others, until they
                     // are back.
                     self.tickets += 1;
-                    self.pending.insert(self.tickets, Pending { session, from, nonce, command: command.clone(), at, reservation, ready: None, until_ms: now.saturating_add(rule::OPEN_MS) });
-                    return out.push(Do::Find { ticket: self.tickets, ids: ids.clone(), within_ms: rule::OPEN_MS });
+                    // (Its time runs from now, when the command arrived: not from when
+                    // whatever looks the songs up gets round to it.)
+                    let until_ms = now.saturating_add(rule::OPEN_MS);
+                    self.pending.insert(self.tickets, Pending { session, from, nonce, command: command.clone(), at, reservation, ready: None, until_ms });
+                    let lacking = ids.iter().enumerate().filter(|(at, _)| !has.get(*at).copied().unwrap_or(false)).map(|(_, id)| id.clone()).collect();
+                    return out.push(Do::Find { ticket: self.tickets, ids: lacking, until_ms });
                 }
             }
             // It checks it can play before anything is changed: a queue none of whose songs
@@ -1003,13 +1008,22 @@ impl Device {
         self.pending.contains_key(&ticket)
     }
 
-    /// The songs a command brought that the music server has, of those this device's copy
-    /// of the library lacked ([`Do::Find`]): every song the command names that can be
-    /// played here, by id, the ones the library had and the ones that were found.
+    /// The songs the music server has, of those a command brought that this device's copy
+    /// of the library lacked ([`Do::Find`]), by id. **What the command is carried out with
+    /// is put together here**: every song it names that can be played on this device, in
+    /// the command's own order, the ones the library has and the ones that were found.
     pub fn found(&mut self, ticket: u64, songs: Vec<String>, env: &mut Env) -> Vec<Do> {
         let mut out = Vec::new();
         let Some(pending) = self.pending.remove(&ticket) else { return out };
         let Pending { session, from, nonce, command, at, reservation, .. } = pending;
+        let songs = match &command {
+            Command::Add { ids, .. } => {
+                let found: std::collections::HashSet<&str> = songs.iter().map(String::as_str).collect();
+                let has = env.library.has_songs(ids);
+                ids.iter().enumerate().filter(|(at, id)| has.get(*at).copied().unwrap_or(false) || found.contains(id.as_str())).map(|(_, id)| id.clone()).collect()
+            }
+            _ => songs,
+        };
         if songs.is_empty() {
             env.player.refuse(reservation);
             self.refused(session, from, nonce, &command, at, Why::Cannot, env, &mut out);

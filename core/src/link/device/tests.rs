@@ -270,6 +270,8 @@ struct World {
     /// ticket, the songs).
     slow_server: bool,
     asked_of_server: Vec<(usize, u64, Vec<String>)>,
+    /// Each look-up of songs that was asked for: the songs, and the moment it ends.
+    finds: Vec<(Vec<String>, u64)>,
 }
 
 const A: usize = 0;
@@ -308,6 +310,7 @@ impl World {
             server: Vec::new(),
             slow_server: false,
             asked_of_server: Vec::new(),
+            finds: Vec::new(),
         };
         // (The first tick asks for a look; its answer begins the session.)
         world.tick();
@@ -365,10 +368,15 @@ impl World {
                         to_send.push(Frame { from, to, text: frame });
                     }
                 }
-                Do::Find { ticket, ids, .. } if self.slow_server => self.asked_of_server.push((who, ticket, ids)),
-                Do::Find { ticket, ids, .. } => {
-                    let has = self.copies[who].library.has_songs(&ids);
-                    let found: Vec<String> = ids.iter().zip(has).filter(|(id, has)| *has || self.server.contains(id)).map(|(id, _)| id.clone()).collect();
+                Do::Find { ticket, ids, until_ms } if self.slow_server => {
+                    self.finds.push((ids.clone(), until_ms));
+                    self.asked_of_server.push((who, ticket, ids))
+                }
+                Do::Find { ticket, ids, until_ms } => {
+                    // (As an app does: the music server is asked for the songs named, and
+                    // what it has of them is handed back. Nothing else is added.)
+                    self.finds.push((ids.clone(), until_ms));
+                    let found: Vec<String> = ids.iter().filter(|id| self.server.contains(id)).cloned().collect();
                     let did = self.with(who, |device, env| device.found(ticket, found, env));
                     self.act(who, did);
                 }
@@ -966,6 +974,34 @@ fn songs_a_device_s_own_copy_of_the_library_lacks_are_asked_of_the_music_server(
     world.pass(1_000);
     assert!(world.last(B, "add from").contains("refused, Cannot"));
     assert!(!world.copies[B].player.rule.busy(world.now) && world.copies[B].player.did.is_empty());
+}
+
+/// An Add names a song this device has and one its copy of the library lacks. **Only the
+/// one it lacks is asked of the music server**, and what is queued is every song the
+/// command names that can be played here, in the command's order: the one it had and the
+/// one that was found. And **the look-up's time is the command's**: it ends at a moment
+/// counted from when the command arrived, however long the look-up waits to begin.
+#[test]
+fn an_add_asks_the_server_only_for_what_is_lacking_and_queues_what_it_had_too() {
+    let mut world = steering("add");
+    world.copies[B].library.ids.retain(|id| id != "x1");
+    world.server = vec!["x1".into(), "s3".into()];
+    let arrived = world.now;
+    let ids: Vec<String> = ["s3", "x1", "s5"].iter().map(|id| id.to_string()).collect();
+    let did = world.with(A, |device, env| device.add(&ids, false, env));
+    world.act(A, did.expect("A is steering B"));
+    world.pass(1_000);
+    assert_eq!(world.finds, [(vec!["x1".to_string()], arrived + rule::OPEN_MS)]);
+    let queue = &world.copies[B].player.queue;
+    assert_eq!(queue[queue.len() - 3..], ["s3", "x1", "s5"], "{:?}", world.copies[B].log);
+    // The server has none of what was lacking: what this device had is queued all the same.
+    let mut world = steering("add");
+    world.copies[B].library.ids.retain(|id| id != "x1");
+    let did = world.with(A, |device, env| device.add(&ids, false, env));
+    world.act(A, did.expect("A is steering B"));
+    world.pass(1_000);
+    let queue = &world.copies[B].player.queue;
+    assert_eq!(queue[queue.len() - 2..], ["s3", "s5"], "{:?}", world.copies[B].log);
 }
 
 /// An Add brings a song this device's copy of the library lacks, and the music server
