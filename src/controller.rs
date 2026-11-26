@@ -1505,7 +1505,7 @@ impl Controller {
         // with it if that one is believed, and is otherwise left unused (see `keep`). If that
         // can't be done it's used, unbound, for that service only, tried again next start, and
         // said.
-        if !self.tokens_looked_at.replace(true) && crate::keep::bind_old_token(&*self.vault(), &found.service, trusted) == crate::keep::Bind::NotYet {
+        if !self.tokens_looked_at.replace(true) && crate::keep::bind_old_token(&*self.vault(), &found.service, trusted, settings.lidarr_token_spent) == crate::keep::Bind::NotYet {
             self.token_old_for.replace(Some(found.service.clone()));
             self.toast(SIGN_IN_NOT_SAVED);
         }
@@ -1704,6 +1704,8 @@ impl Controller {
                 // From here this sign-in owns the token kept: whatever an earlier one still has
                 // on its way writes nothing.
                 if crate::keep::keep_token(&*self.vault(), &found.service, &done.token) {
+                    // Whatever 0.40.10 kept is gone now (written over): nothing is spent.
+                    self.settings.borrow_mut().lidarr_token_spent = false;
                     tell(Page::SignedIn);
                 } else {
                     tell(Page::StillSigningIn);
@@ -1737,7 +1739,15 @@ impl Controller {
         // Whatever is kept goes; it's handed back only if it was made at this service, and that
         // one is believed (see `Found::trusted`): otherwise it's sent nowhere.
         let vault = self.vault();
-        let on_file = crate::keep::take_token(&*vault, &service);
+        let (on_file, spent) = crate::keep::take_token_telling(&*vault, &service);
+        // A token from 0.40.10, unbound, is never used again from here: not this run (it was
+        // only ever used for the service saved at the start), nor after a restart, if it
+        // couldn't be deleted (written down in the settings, at once).
+        self.token_old_for.replace(None);
+        if spent {
+            self.settings.borrow_mut().lidarr_token_spent = true;
+            self.save_settings();
+        }
         let believed = crate::gate::Found { service: service.clone(), client: String::new() }.trusted(&self.settings.borrow().lidarr_address).is_ok();
         self.settings.borrow_mut().lidarr_signed_in.clear();
         if session.is_none() && on_file.is_none() {

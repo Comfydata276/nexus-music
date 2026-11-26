@@ -212,8 +212,13 @@ pub fn any_kept(vault: &dyn Vault) -> bool {
 /// it's `Bind::NotYet`: the token is used, unbound, for that service only (`token`'s
 /// `old_for`), and binding is tried again at the next start. It's never bound to a service
 /// found or saved later: a change of service takes it away (`take_token`).
-pub fn bind_old_token(vault: &dyn Vault, service: &str, trusted: bool) -> Bind {
+/// `spent`: a token kept by 0.40.10 that couldn't be taken away when it was to go
+/// (`take_token_telling`): it isn't bound, or used.
+pub fn bind_old_token(vault: &dyn Vault, service: &str, trusted: bool, spent: bool) -> Bind {
     let _slot = SLOT.lock().unwrap_or_else(|stuck| stuck.into_inner());
+    if spent {
+        return Bind::Done;
+    }
     match (read(vault, TOKEN), origin_of(service), trusted) {
         (Kept::Old(secret), Some(origin), true) if !vault.write(TOKEN, &bound(&origin, &secret)) => Bind::NotYet,
         (Kept::Unreadable, _, true) => Bind::NotYet,
@@ -229,13 +234,20 @@ pub fn keep_token(vault: &dyn Vault, service: &str, token: &str) -> bool {
 
 /// Takes the kept token away, whatever it is, and gives it if it was the one for `service`:
 /// a sign-out, or a sign-in being let go of.
+#[cfg(test)]
 pub fn take_token(vault: &dyn Vault, service: &str) -> Option<String> {
+    take_token_telling(vault, service).0
+}
+
+/// `take_token`, also saying whether what was kept was a token from 0.40.10, still unbound,
+/// that couldn't be taken away: it's spent, and must be neither used nor bound from now on,
+/// across a restart too (see `bind_old_token`'s `spent`).
+pub fn take_token_telling(vault: &dyn Vault, service: &str) -> (Option<String>, bool) {
     let _slot = SLOT.lock().unwrap_or_else(|stuck| stuck.into_inner());
     let token = held(vault, service);
-    if read(vault, TOKEN) != Kept::Nothing {
-        let _ = vault.write(TOKEN, "");
-    }
-    token
+    let kept = read(vault, TOKEN);
+    let taken = kept == Kept::Nothing || vault.write(TOKEN, "");
+    (token, !taken && matches!(kept, Kept::Old(_)))
 }
 
 /// After a sign-out has handed `token` back: clears the entry only if it still holds that
@@ -471,11 +483,11 @@ pub mod tests {
         // One kept by 0.40.10 is bound to a trusted service, and is otherwise left unused.
         let vault = with(&[(TOKEN, "old")]);
         assert_eq!(token(&vault, S, None), None);
-        bind_old_token(&vault, S, false);
+        bind_old_token(&vault, S, false, false);
         assert_eq!(token(&vault, S, None), None);
         assert!(any_kept(&vault));
         assert_eq!(vault.read(TOKEN), Ok(Some("old".to_string())));
-        bind_old_token(&vault, S, true);
+        bind_old_token(&vault, S, true, false);
         assert_eq!(token(&vault, S, None).as_deref(), Some("old"));
     }
 
@@ -485,7 +497,7 @@ pub mod tests {
         // Its binding write fails: used for the service saved with it, at this start, and no
         // other; and tried again at the next start.
         let vault: Arc<Memory> = Arc::new(Memory { fail: vec![1], ..with(&[(TOKEN, "old")]) });
-        assert_eq!(bind_old_token(&*vault, S, true), Bind::NotYet);
+        assert_eq!(bind_old_token(&*vault, S, true, false), Bind::NotYet);
         assert_eq!(token(&*vault, S, Some(S)).as_deref(), Some("old"));
         assert_eq!(token(&*vault, "https://found.later.example.org", Some(S)), None);
         // Its first renewal is written, bound to the service.
@@ -509,10 +521,10 @@ pub mod tests {
         // later; the next start binds it to the service it was kept with.
         let vault = with(&[(TOKEN, "old")]);
         vault.unreadable.store(true, Ordering::SeqCst);
-        assert_eq!(bind_old_token(&vault, S, true), Bind::NotYet);
+        assert_eq!(bind_old_token(&vault, S, true, false), Bind::NotYet);
         vault.unreadable.store(false, Ordering::SeqCst);
         assert_eq!(token(&vault, "https://found.later.example.org", Some(S)), None);
-        assert_eq!(bind_old_token(&vault, S, true), Bind::Done);
+        assert_eq!(bind_old_token(&vault, S, true, false), Bind::Done);
         assert_eq!(token(&vault, S, None).as_deref(), Some("old"));
     }
 
@@ -570,6 +582,28 @@ pub mod tests {
         assert_eq!(token(&vault, S, None).as_deref(), Some("t1"));
         clear_token_if(&vault, &handed_back);
         assert_eq!(token(&vault, S, None), None);
+    }
+
+    #[test]
+    fn an_unbound_token_that_couldnt_be_taken_away_is_spent_across_a_restart() {
+        // A 0.40.10 token, unbound; the service changes (or the person signs out), and it
+        // can't be deleted.
+        let vault = Memory { fail: vec![1], ..with(&[(TOKEN, "old")]) };
+        let (handed, spent) = take_token_telling(&vault, S);
+        assert_eq!((handed, spent), (None, true));
+        assert_eq!(vault.read(TOKEN), Ok(Some("old".to_string())));
+        // The next start, spent written down: it's neither bound to the service now saved, nor
+        // used.
+        let elsewhere = "https://auth.other.example.org";
+        assert_eq!(bind_old_token(&vault, elsewhere, true, true), Bind::Done);
+        assert_eq!(token(&vault, elsewhere, None), None);
+        assert_eq!(vault.read(TOKEN), Ok(Some("old".to_string())));
+        // A bound token taken away, or one taken away as asked, is no such thing.
+        let vault = with(&[(TOKEN, "old")]);
+        assert_eq!(take_token_telling(&vault, S), (None, false));
+        let vault = Memory { fail: vec![2], ..with(&[]) };
+        keep_token(&vault, S, "t1");
+        assert_eq!(take_token_telling(&vault, S), (Some("t1".to_string()), false));
     }
 
     #[test]
