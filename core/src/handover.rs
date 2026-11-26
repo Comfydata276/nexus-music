@@ -124,6 +124,37 @@ pub const OFFER_FOR: i64 = 30 * 60;
 /// saves is followed.
 pub const HANDED: &str = "handed to another device";
 
+/// **The mark of a queue handed to another device belongs to that queue**: the one that
+/// was in the player when it was handed on, by its number (a new number each time a whole
+/// queue is put in the player). An app keeps one of these beside [`Here::taken`].
+///
+/// A hand-over is marked before this device's sound is stopped, and taken back if the
+/// device then did not stop. It is taken back from the queue it was put on and no other:
+/// if another whole queue is in the player by then, whose that queue is was settled by
+/// whatever put it there, and nothing is given back.
+#[derive(Debug, Default)]
+pub struct Mark(Option<(u64, Option<String>)>);
+
+impl Mark {
+    /// The queue with this number is handed on. `taken` is what [`Here::taken`] was;
+    /// what it is to be now is given back ([`HANDED`]).
+    pub fn on(&mut self, queue: u64, taken: Option<String>) -> String {
+        // (Marked twice with nothing between: what it was before the first still stands.)
+        let was = match self.0.take() {
+            Some((marked, was)) if marked == queue => was,
+            _ => taken,
+        };
+        self.0 = Some((queue, was));
+        HANDED.into()
+    }
+
+    /// The device did not stop, and `queue` is the number of the queue in the player now.
+    /// What [`Here::taken`] is to be again, if that queue is the one that was marked.
+    pub fn back(&mut self, queue: u64) -> Option<Option<String>> {
+        self.0.take().filter(|(marked, _)| *marked == queue).map(|(_, was)| was)
+    }
+}
+
 /// The name a device gives when it saves the queue, so it can tell its own from others'.
 /// `id` is made up once by the device: eight hex digits.
 pub fn device_name(id: &str) -> String {
@@ -444,6 +475,33 @@ mod tests {
         let played = Here { taken: None, stamp: DAY + 660, ..taken.clone() };
         assert_eq!(save(&theirs, &played, RIGHT), Save::Save);
         assert!(matches!(look(&saved(PC, 700, &["z"], "z", 0), &taken, RIGHT, DAY + 800).then, Then::TakeUp(_)));
+    }
+
+    /// The mark is of one queue. Taken back, it gives that queue back to whoever had it;
+    /// and it is not taken back from another queue that has been put in the player since.
+    #[test]
+    fn a_hand_over_is_taken_back_from_the_queue_it_was_marked_on_and_no_other() {
+        let mut mark = Mark::default();
+        // Nothing was marked: nothing to give back.
+        assert_eq!(mark.back(4), None);
+        // Its own queue, marked and taken back: its own again. Once.
+        assert_eq!(mark.on(4, None), HANDED);
+        assert_eq!((mark.back(4), mark.back(4)), (Some(None), None));
+        // One taken up from another device and not touched: that device's again.
+        mark.on(4, Some("2026-11-26T10:00:00Z".into()));
+        assert_eq!(mark.back(4), Some(Some("2026-11-26T10:00:00Z".into())));
+        // Marked twice (the stop was asked for twice): what it was before the first.
+        mark.on(4, None);
+        mark.on(4, Some(HANDED.into()));
+        assert_eq!(mark.back(4), Some(None));
+        // Another whole queue is in the player by the time it is taken back: nothing is
+        // given back, then or later.
+        mark.on(4, None);
+        assert_eq!((mark.back(5), mark.back(4)), (None, None));
+        // And a mark left on a queue that has gone says nothing of the next one marked.
+        mark.on(4, Some("theirs".into()));
+        mark.on(6, None);
+        assert_eq!(mark.back(6), Some(None));
     }
 
     /// The person moved their music from this device to the PC. This device had played on

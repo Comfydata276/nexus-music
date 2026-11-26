@@ -268,9 +268,9 @@ pub struct Link {
     /// The song the sound was found to have rolled into before the window had been told:
     /// the engine's own word of it, when it comes, is not acted on twice.
     caught: Cell<u64>,
-    /// Whose the queue was before it was marked as handed to another device, while the
-    /// stop that goes with the hand-over has not yet been seen to work.
-    before_handed: RefCell<Option<Option<String>>>,
+    /// The mark of the queue handed to another device: which queue, and whose it was
+    /// before (`nexus_core::handover::Mark`).
+    handed: RefCell<nexus_core::handover::Mark>,
 }
 
 /// This PC's own player, as the deciding asks it. Each command is carried out by the
@@ -406,18 +406,25 @@ impl Player for Here<'_> {
     /// one taken up from that device and not touched: not saved, and it follows what that
     /// device saves, until the person uses it here (`claim_queue`). It is another queue
     /// for a save that was already prepared, which is then not sent.
+    ///
+    /// **And it is written at once**, where the next start of the app will find it
+    /// (`save_queue`, the queue's place): on a PC that was quiet already nothing else
+    /// would write it, since the stop that follows changes nothing.
     fn handed_on(&mut self) {
         log("queue: handed to another of the person's devices: not saved from here, and it follows, until it is used here");
-        *self.ctl.link.borrow().before_handed.borrow_mut() = Some(self.ctl.queue_owner.taken());
-        self.ctl.queue_owner.taken_up(nexus_core::handover::HANDED.into());
+        let mark = self.ctl.link.borrow().handed.borrow_mut().on(self.ctl.queue_number.get(), self.ctl.queue_owner.taken());
+        self.ctl.queue_owner.taken_up(mark);
+        self.ctl.save_queue();
     }
 
-    /// This PC did not stop: its queue is whose it was.
+    /// This PC did not stop: the queue that was marked is whose it was. (If another whole
+    /// queue is in the player by now, whose that is was settled when it was put there.)
     fn handed_back(&mut self) {
-        let was = self.ctl.link.borrow().before_handed.borrow_mut().take();
+        let was = self.ctl.link.borrow().handed.borrow_mut().back(self.ctl.queue_number.get());
         if let Some(was) = was {
             log("queue: this PC did not stop, so its queue is not handed on after all");
             self.ctl.queue_owner.handed_back(was);
+            self.ctl.save_queue();
         }
     }
 
