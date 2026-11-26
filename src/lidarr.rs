@@ -396,7 +396,10 @@ mod wire {
         // (An album: nothing to put back, and nothing written down.)
         struct Nowhere;
         impl nexus_core::lidarr::WayBack for Nowhere {
-            fn keep(&self, _: i64, _: &str) -> Result<(), String> {
+            fn turn(&self) -> Box<dyn nexus_core::lidarr::Turn + '_> {
+                Box::new(())
+            }
+            fn keep(&self, _: i64, _: &str) -> Result<bool, String> {
                 Err("not here".into())
             }
             fn put_back(&self, _: i64, _: &str) {}

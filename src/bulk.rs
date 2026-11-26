@@ -47,13 +47,15 @@ impl Place {
         Place { path: path.to_path_buf(), held: AtomicBool::new(false) }
     }
 
-    /// Its progress, in passing: whole, or the batch as it was, without waiting for the disk.
-    fn keep(&self, json: Option<Vec<u8>>) {
+    /// Whole, or the batch as it was: in passing, or (while the batch holds a way back)
+    /// flushed.
+    fn keep(&self, json: Option<Vec<u8>>, flushed: bool) {
         if self.held.load(Ordering::SeqCst) {
             return;
         }
         match json {
             None => drop(std::fs::remove_file(&self.path)),
+            Some(json) if flushed => drop(crate::config::write_surely(&self.path, &json)),
             Some(json) => drop(crate::config::write_in_passing(&self.path, &json)),
         }
     }
@@ -104,9 +106,9 @@ impl Place {
 struct Windows;
 
 impl Desk for Windows {
-    fn keep(&self, json: Option<Vec<u8>>) {
+    fn keep(&self, json: Option<Vec<u8>>, flushed: bool) {
         if let Some(place) = PLACE.get() {
-            place.keep(json);
+            place.keep(json, flushed);
         }
     }
 
@@ -224,7 +226,7 @@ mod tests {
         assert_eq!(place.take_up(|written| job.load(written)), NOT_READ);
         // Nothing is written over it, in passing or surely: what would need putting back on
         // Lidarr isn't changed.
-        place.keep(Some(BATCH.to_vec()));
+        place.keep(Some(BATCH.to_vec()), false);
         assert!(!place.keep_checked(BATCH.to_vec()));
         assert!(place.path.is_dir());
         // A batch that reads, as before: written, and surely.
@@ -247,7 +249,7 @@ mod tests {
         }
         let job = Job::new(Windows);
         assert_eq!(place.take_up(|written| job.load(written)), NOT_MOVED);
-        place.keep(Some(BATCH.to_vec()));
+        place.keep(Some(BATCH.to_vec()), false);
         assert!(!place.keep_checked(BATCH.to_vec()));
         drop(pinned);
         assert_eq!(std::fs::read(&place.path).unwrap(), &BATCH[..30]);
