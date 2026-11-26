@@ -1025,8 +1025,8 @@ impl Controller {
                 self.move_upcoming(from, (data["to"].as_u64().unwrap_or(0) as usize).min(last), data["queued"].as_bool() == Some(true));
             }
             "clear" => self.clear_upcoming(data["queued"].as_bool() == Some(true)),
-            "shuffle" => self.set_shuffle(data["on"].as_bool() == Some(true)),
-            _ => self.set_repeat(data["mode"].as_u64().unwrap_or(0).min(2) as u8),
+            "shuffle" => self.set_shuffle_from_afar(data["on"].as_bool() == Some(true)),
+            _ => self.set_repeat_from_afar(data["mode"].as_u64().unwrap_or(0).min(2) as u8),
         }
         Ok(())
     }

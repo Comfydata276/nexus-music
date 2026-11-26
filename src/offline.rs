@@ -40,6 +40,16 @@ impl Pending {
     }
 }
 
+/// Writes down the changes still to be sent. While one of them is a like or a rating, every
+/// write of the file waits for the disk, whatever asked for it: a play counted, or an answer
+/// from the network, writes the person's press again too. Only plays: as `asked`.
+fn write_pending(path: &std::path::Path, held: &[&Pending], asked: Durable) {
+    let durable = if held.iter().any(|change| !matches!(change, Pending::Played { .. })) { Durable::Flushed } else { asked };
+    if let Ok(json) = serde_json::to_vec(held) {
+        let _ = crate::config::write_whole(path, &json, durable, &crate::config::REPLACING);
+    }
+}
+
 pub fn load_pending(path: &std::path::Path) -> Vec<Pending> {
     std::fs::read(path).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default()
 }
@@ -101,20 +111,32 @@ impl Controller {
         let Some(path) = self.pending_path() else { return };
         let (sending, pending) = (self.sending.borrow(), self.pending.borrow());
         let held: Vec<&Pending> = sending.iter().chain(pending.iter()).collect();
-        if let Ok(json) = serde_json::to_vec(&held) {
-            let _ = crate::config::write_whole(&path, &json, durable, &crate::config::REPLACING);
-        }
+        write_pending(&path, &held, durable);
+    }
+
+    /// "Like all" offline: the changes it held, written down once for the press.
+    pub(crate) fn save_pending_for_press(&self) {
+        self.save_pending(Durable::Flushed);
     }
 
     /// Sends a change to the server, or keeps it for later when that isn't possible.
     /// `refused` runs if the server answers but says no.
     pub fn submit(self: &Rc<Self>, change: Pending, refused: impl FnOnce(&Rc<Controller>, String) + Send + 'static) {
+        self.submit_saving(change, refused, true);
+    }
+
+    /// `submit`; offline, `save` false leaves writing it down to the caller, once for many
+    /// (`save_pending_for_press`).
+    pub(crate) fn submit_saving(self: &Rc<Self>, change: Pending, refused: impl FnOnce(&Rc<Controller>, String) + Send + 'static, save: bool) {
         if self.is_offline() {
             // A like or a rating is the person's press, and waits for the disk; a play counted
-            // is playback moving on, and doesn't.
+            // is playback moving on, and doesn't (unless a like is waiting too: `write_pending`).
             let durable = if matches!(change, Pending::Played { .. }) { Durable::InPassing } else { Durable::Flushed };
             self.pending.borrow_mut().push(change);
-            return self.save_pending(durable);
+            if save {
+                self.save_pending(durable);
+            }
+            return;
         }
         let sent = change.clone();
         self.request(
@@ -153,9 +175,7 @@ impl Controller {
                     if let Some(path) = path {
                         let mut held = sent.kept;
                         held.extend(load_pending(&path).into_iter().skip(waiting.len()));
-                        if let Ok(json) = serde_json::to_vec(&held) {
-                            let _ = crate::config::write_in_passing(&path, &json);
-                        }
+                        write_pending(&path, &held.iter().collect::<Vec<_>>(), Durable::InPassing);
                     }
                     return;
                 }
@@ -324,5 +344,30 @@ mod tests {
             page()
         });
         assert_eq!((sent.done, ids(&sent.kept), sent.lost_touch, calls), (0, vec!["a", "b", "c", "d"], true, 3));
+    }
+
+    #[test]
+    fn while_a_like_waits_every_write_of_the_file_waits_for_the_disk() {
+        let dir = std::env::temp_dir().join(format!("nexus-pending-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pending-someone.json");
+        crate::config::mark_window_thread();
+        let flushes = crate::config::window_flushes;
+        let played = |id: &str| Pending::Played { id: id.into(), at: 1 };
+        let liked = Pending::Star { kind: "id".into(), id: "b".into(), starred: true };
+        let rated = Pending::Rating { id: "c".into(), rating: 4 };
+        let before = flushes();
+        // Only plays: in passing, as asked.
+        write_pending(&path, &[&played("a")], Durable::InPassing);
+        assert_eq!(flushes(), before, "a write holding only plays waited for the disk");
+        // A like waiting, and a play counted (or an answer from the network) writes it again:
+        // that write waits for the disk too. So does one while a rating waits.
+        write_pending(&path, &[&liked, &played("a")], Durable::InPassing);
+        assert_eq!(flushes(), before + 1, "a write holding a like went in passing");
+        write_pending(&path, &[&played("a"), &rated], Durable::InPassing);
+        assert_eq!(flushes(), before + 2, "a write holding a rating went in passing");
+        assert_eq!(load_pending(&path).len(), 2);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

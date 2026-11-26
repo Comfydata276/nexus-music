@@ -542,6 +542,12 @@ impl Controller {
     /// is **on the disk before it is shown as made**. Returns whether it was made (the
     /// caller then draws it).
     pub fn choose(&self, change: Change) -> bool {
+        self.choose_saving(change, crate::config::Durable::Flushed)
+    }
+
+    /// `choose`, written as `durable` says: in passing for a choice that came from afar (a
+    /// jam's guest turning shuffle on). Still kept before it is shown as made.
+    pub fn choose_saving(&self, change: Change, durable: crate::config::Durable) -> bool {
         let before = self.settings.borrow().choices.clone();
         {
             let mut settings = self.settings.borrow_mut();
@@ -549,7 +555,7 @@ impl Controller {
             settings.choices.change(&account, change);
             settings.show();
         }
-        if !self.settings.borrow().save_surely(&self.paths.settings) {
+        if !self.settings.borrow().save_checked(&self.paths.settings, durable) {
             {
                 let mut settings = self.settings.borrow_mut();
                 settings.choices = before;
