@@ -1032,6 +1032,13 @@ service made again in the same process starts with nothing of the one before, an
 nothing of the one before can reach it, whatever numbers the two give their sign-ins,
 looks and sessions.
 
+**The phone is in the room only while its playback service lives.** Android ends the
+service when nothing plays and no screen of the app is connected to it, and the app
+ends it at a sign-out; to the person's other devices the phone is then "not here just
+now", and it is back when the service is next made (the app opened, something
+played). So on a phone the same account signing in again is always a new linking,
+never the old one carried on.
+
 **The start leaves everything or nothing.** The library is asked first (`linkNew`
 reads what it is given before it keeps anything, and puts the linking, the way up and
 the waiting place in together, last); only when it has answered does the adapter read
@@ -1565,7 +1572,12 @@ device to say so (a field in its full state), which no build does yet.
    made no state, so the state it was made against still stands.
 10. **Setting the record up** (5.1): a playlist of exactly the reserved name that the
     person made and left empty and undescribed is used; and two devices set up at the
-    same moment leave a second playlist of the name behind for good.
+    same moment leave a second playlist of the name behind for good. So does one
+    device whose sign-in ends while it is writing: the write under way is let finish
+    (it cannot be known not to have reached the server), nothing more is asked for
+    that sign-in, and the next writes its own. Walked on a phone: an empty playlist of
+    the name was left beside the one that holds the secret, and both devices joined
+    through that one.
 11. **A fault in the middle of a move of music can leave both devices playing**
     (5.6, 8): the phone that faults stops linking and answers nothing more, so the
     other device is never told what became of its command, and says so. It does not
@@ -1594,7 +1606,14 @@ device to say so (a field in its full state), which no build does yet.
     know). No XML library is added for that.
 17. **The longest queue one message carries costs the phone's main thread several
     milliseconds** in the library alone (7 ms on a desktop), once, when someone sends
-    one. Frames are opened on the player's thread all the same: opening them elsewhere
+    one. **And with the phone's own side, far more than a frame.** Measured on the
+    emulator (a debug build, 5,000 songs in the phone's queue, the whole of one call
+    into the library on the player's thread): a full look 7 ms, a seek 8, a queue
+    handed on 17, Next 25, Remove 29, Move 33 to 41, Play 89, a queue of 4,997 taken
+    from another device 119. Nothing has been changed for it yet; what is proposed is
+    in the round's report (the entries to come asked for only by the commands that
+    name one, and handed over as one text; a queue from another device built off the
+    player's thread and put in as a second step). Frames are opened on the player's thread all the same: opening them elsewhere
     would put the session's keys on two threads.
 18. **The audit of borrows on Windows** (`scripts/borrow-audit.py`, run by the check)
     does not look for three shapes of the fault it exists for: a borrow held while a
