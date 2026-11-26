@@ -1052,11 +1052,14 @@ pub fn delete_password(paths: &Paths, _server: &str, _username: &str) {
 
 /// Keeps a secret other than the account password, by name, where that one is kept: the
 /// Windows credential store, or elsewhere a file only this user can read. An empty value
-/// forgets it.
+/// forgets it. Says whether that was done (forgetting one that isn't there is done).
 #[cfg(windows)]
-pub fn save_secret(_paths: &Paths, name: &str, value: &str) {
-    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &format!("secret:{name}")) {
-        let _ = if value.is_empty() { entry.delete_credential() } else { entry.set_password(value) };
+pub fn save_secret(_paths: &Paths, name: &str, value: &str) -> bool {
+    let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &format!("secret:{name}")) else { return false };
+    if value.is_empty() {
+        matches!(entry.delete_credential(), Ok(()) | Err(keyring::Error::NoEntry))
+    } else {
+        entry.set_password(value).is_ok()
     }
 }
 
@@ -1066,13 +1069,16 @@ pub fn load_secret(_paths: &Paths, name: &str) -> Option<String> {
 }
 
 #[cfg(not(windows))]
-pub fn save_secret(paths: &Paths, name: &str, value: &str) {
+pub fn save_secret(paths: &Paths, name: &str, value: &str) -> bool {
     use std::os::unix::fs::PermissionsExt;
     let file = paths.secret.with_file_name(format!("secret-{name}"));
     if value.is_empty() {
-        let _ = fs::remove_file(file);
-    } else if fs::write(&file, value).is_ok() {
-        let _ = fs::set_permissions(&file, fs::Permissions::from_mode(0o600));
+        match fs::remove_file(file) {
+            Ok(()) => true,
+            Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+        }
+    } else {
+        fs::write(&file, value).is_ok() && fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).is_ok()
     }
 }
 

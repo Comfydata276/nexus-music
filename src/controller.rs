@@ -1433,7 +1433,12 @@ impl Controller {
         }
         let lidarr = {
             let settings = self.settings.borrow();
-            let key = config::load_secret(&self.paths, "lidarr-key");
+            let vault = self.vault();
+            // A key kept by 0.40.10 is bound to the address configured now, once. (If that
+            // write fails it's tried again at the next start, and used meanwhile only at this
+            // address: see `keep::change`.)
+            let _ = crate::keep::bind_old_key(&*vault, &settings.lidarr_address);
+            let key = crate::keep::key(&*vault, &settings.lidarr_address);
             // An address the app can't be sure of reaching as written isn't connected to.
             let usable = nexus_core::lidarr::origin(&settings.lidarr_address).is_ok();
             match (settings.requests && !settings.lidarr_address.trim().is_empty() && usable, key) {
@@ -1444,6 +1449,11 @@ impl Controller {
         self.ui.global::<ui::App>().set_requests(lidarr.is_some());
         crate::lidarr::set_singles(self.settings.borrow().request_singles);
         crate::lidarr::set_current(lidarr);
+    }
+
+    /// The credential store, where Lidarr's key and the sign-in's token are kept (see `keep`).
+    fn vault(&self) -> std::sync::Arc<dyn crate::keep::Vault> {
+        std::sync::Arc::new(crate::keep::Store(self.paths.clone()))
     }
 
     /// The sign-in in front of Lidarr, picked up from what's on file if it isn't in use yet.
@@ -1465,7 +1475,9 @@ impl Controller {
 
     fn new_gate(&self, found: crate::gate::Found, token: String) -> crate::gate::Session {
         let paths = self.paths.clone();
-        crate::gate::session(found, token, move |token| config::save_secret(&paths, "lidarr-token", token))
+        crate::gate::session(found, token, move |token| {
+            config::save_secret(&paths, "lidarr-token", token);
+        })
     }
 
     /// Shows where the connection to Lidarr stands: `state` picks the marker and the one
@@ -1494,12 +1506,7 @@ impl Controller {
                 return self.requests_state("error", &why);
             }
         }
-        let (moved, elsewhere) = {
-            let settings = self.settings.borrow();
-            let moved = crate::lidarr::tidy(&settings.lidarr_address) != crate::lidarr::tidy(address);
-            let elsewhere = !crate::lidarr::same_origin(&settings.lidarr_address, address);
-            (moved, elsewhere)
-        };
+        let moved = crate::lidarr::tidy(&self.settings.borrow().lidarr_address) != crate::lidarr::tidy(address);
         if moved {
             // A sign-in belongs to the address it was found in front of: dropped while that's
             // still the address, so it's handed back only where it was believed.
@@ -1508,16 +1515,24 @@ impl Controller {
             settings.lidarr_gate.clear();
             settings.lidarr_gate_client.clear();
         }
-        self.settings.borrow_mut().lidarr_address = address.trim().to_string();
-        self.save_settings();
-        // Blank leaves the key that's on file, unless the address now leads somewhere else (another
-        // scheme, host or port): a key is only ever sent to the address it was typed in for.
-        let forgotten = key.trim().is_empty() && elsewhere && config::load_secret(&self.paths, "lidarr-key").is_some();
-        if !key.trim().is_empty() {
-            config::save_secret(&self.paths, "lidarr-key", key.trim());
-        } else if elsewhere {
-            config::save_secret(&self.paths, "lidarr-key", "");
-        }
+        // The key is kept with the origin it was typed for, before the address is saved: blank
+        // leaves the key that's on file, unless the address now leads somewhere else (another
+        // scheme, host or port). See `keep::change`.
+        let old = self.settings.borrow().lidarr_address.clone();
+        let changed = crate::keep::change(&*self.vault(), &old, address.trim(), key.trim(), &mut || {
+            let mut settings = self.settings.borrow_mut();
+            settings.lidarr_address = address.trim().to_string();
+            settings.save_surely(&self.paths.settings)
+        });
+        let forgotten = match changed {
+            crate::keep::Changed::Made { forgotten } => forgotten,
+            crate::keep::Changed::Not(why) => {
+                self.settings.borrow_mut().lidarr_address = old;
+                self.connect_requests();
+                self.push_settings();
+                return self.requests_state("error", why);
+            }
+        };
         self.connect_requests();
         self.push_settings();
         if forgotten {
@@ -3702,7 +3717,7 @@ impl Controller {
         page.set_requests(settings.requests);
         page.set_request_singles(settings.request_singles);
         page.set_lidarr_address(settings.lidarr_address.as_str().into());
-        page.set_lidarr_key_hint(config::load_secret(&self.paths, "lidarr-key").map(|key| crate::lidarr::mask(&key)).unwrap_or_default().into());
+        page.set_lidarr_key_hint(crate::keep::key(&*self.vault(), &settings.lidarr_address).map(|key| crate::lidarr::mask(&key)).unwrap_or_default().into());
         let gate = crate::gate::Found { service: settings.lidarr_gate.clone(), client: String::new() };
         page.set_lidarr_gate(gate.host().into());
         page.set_lidarr_signed_in(settings.lidarr_signed_in.as_str().into());

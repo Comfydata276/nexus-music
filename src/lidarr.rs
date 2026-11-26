@@ -23,11 +23,6 @@ pub fn open(address: &str, key: &str, gate: Option<Arc<crate::gate::Session>>) -
     Lidarr::new(address, key, gate, Arc::new(crate::corehttp::Agent(crate::subsonic::make_agent_without_redirects())))
 }
 
-/// Whether two addresses are the same Lidarr, for a saved key: a key is only ever sent to
-/// the address it was typed for.
-pub fn same_origin(a: &str, b: &str) -> bool {
-    nexus_core::lidarr::same_origin(a, b)
-}
 
 /// Whether singles and EPs are offered as well as albums. Set from Settings.
 static SINGLES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
@@ -91,6 +86,7 @@ pub fn mark(album: &str, requested: bool) {
 #[cfg(test)]
 mod origins {
     use super::*;
+    use nexus_core::lidarr::same_origin;
 
     #[test]
     fn a_key_belongs_to_the_scheme_host_and_port_it_was_typed_for() {
