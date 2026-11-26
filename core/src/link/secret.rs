@@ -104,34 +104,25 @@ pub enum Record {
     Is(Secret),
 }
 
-/// Why a playlist of the person's own may not be given this name, if it may not: each
-/// feature keeps a name to itself, with its own words. **In every copy of the app,
-/// whether or not linking is on in it**: another of the person's devices may have it on,
-/// and would take a playlist of that name for the one its record is kept in.
-pub fn kept_name(name: &str) -> Option<&'static str> {
+/// Why a playlist of the person's own may not have this name, if it may not. Each feature
+/// keeps a name to itself with its own words, and linking only where it is on (`linking`):
+/// with it off, nothing of it exists, and a playlist of its name is the person's own.
+pub fn kept_name(name: &str, linking: bool) -> Option<&'static str> {
     if crate::step::reserved(name) {
         Some(crate::step::RESERVED)
-    } else if reserved(name) {
+    } else if linking && reserved(name) {
         Some(RESERVED)
     } else {
         None
     }
 }
 
-/// Whether a playlist is left out of every ordinary listing of playlists, **in every
-/// copy of the app, whatever its own switch**: a playlist's description is on show
-/// wherever the playlist is, and this one's description is the secret.
-///
-/// - the one devices are kept in step through, by its name;
-/// - **one whose comment is a linking record, whatever it is called** ([`is_record`]);
-/// - one of linking's name with an empty comment: a device has made it and has not yet
-///   written into it.
-///
-/// What is not listed is not opened, is not offered to add songs to, and has no page
-/// written to an app's cache. A playlist that only has linking's name, with a
-/// description of the person's own, is theirs and is listed like any other.
-pub fn unlisted(name: &str, comment: &str) -> bool {
-    name == crate::sync::PLAYLIST_NAME || (name == PLAYLIST_NAME && comment.is_empty()) || is_record(comment)
+/// Whether a playlist of this name is left out of every ordinary listing of playlists:
+/// the one devices are kept in step through, always; and, where linking is on, the one
+/// that holds the secret. What is not listed is not opened, and a page that is not opened
+/// is not written to an app's cache of pages.
+pub fn unlisted(name: &str, linking: bool) -> bool {
+    name == crate::sync::PLAYLIST_NAME || (linking && name == PLAYLIST_NAME)
 }
 
 /// Whether a playlist's page may be written to an app's cache of pages on disk: never the
@@ -482,23 +473,17 @@ mod tests {
 
     #[test]
     fn the_names_the_app_keeps_for_itself() {
-        // Not listed, in any copy of the app: the sync record's, by its name; and
-        // linking's **by what it holds**, whatever it is called (renamed on the server's
-        // own page, its description is still the secret), and by its name while it is
-        // being set up (nothing written into it yet).
-        let record = r#"{"nexus_music_link":1,"secret":"ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8"}"#;
-        assert!(unlisted("Nexus Music sync", "") && unlisted("Nexus Music sync", "anything"));
-        assert!(unlisted("Nexus Music link", record) && unlisted("Old stuff", record) && unlisted("Nexus Music link", ""));
-        assert!(unlisted("Old stuff", r#"{"nexus_music_link":2,"secret":"x"}"#));
-        // A playlist of the person's own that only has the name, or whose description
-        // only looks like a record, is theirs.
-        assert!(!unlisted("Nexus Music link", "Songs for linking arms to") && !unlisted("Notes", r#"{"nexus_music_link":1}"#));
-        assert!(!unlisted("Morning mix", "") && !unlisted("Morning mix", "For the walk to work"));
+        // Not listed: the sync record's always; linking's where linking is on. With it
+        // off, a playlist of that name is the person's own and is listed like any other.
+        assert!(unlisted("Nexus Music sync", false) && unlisted("Nexus Music sync", true));
+        assert!(unlisted("Nexus Music link", true) && !unlisted("Nexus Music link", false));
+        assert!(!unlisted("Morning mix", true));
         // Not to be given to a playlist of the person's own, each with its own words.
-        assert_eq!(kept_name("Nexus Music link"), Some(RESERVED));
-        assert_eq!(kept_name(" Nexus Music link "), Some(RESERVED));
-        assert_eq!(kept_name("Nexus Music sync"), Some(crate::step::RESERVED));
-        assert_eq!(kept_name("Morning mix"), None);
+        assert_eq!(kept_name("Nexus Music link", false), None);
+        assert_eq!(kept_name("Nexus Music link", true), Some(RESERVED));
+        assert_eq!(kept_name("Nexus Music sync", false), Some(crate::step::RESERVED));
+        assert_eq!(kept_name("Nexus Music sync", true), Some(crate::step::RESERVED));
+        assert_eq!(kept_name("Morning mix", true), None);
         // Never on disk, by what it holds, whether linking is on here or not.
         assert!(page_may_be_kept("Morning mix", "For the walk to work"));
         for (name, comment) in [("Nexus Music link", COMMENT), ("Nexus Music sync", ""), ("Renamed elsewhere", COMMENT), ("A later layout", r#"{"nexus_music_link":2,"key":"…"}"#)] {
@@ -780,9 +765,9 @@ mod tests {
             assert_eq!(judge("k", false, &Fetched { owner: Some("other".into()), ..got("k", comment) }, "tester"), Verdict::Stop(Stop::Mismatch));
             assert_eq!(judge("k", false, &Fetched { public: None, ..got("k", comment) }, "tester"), Verdict::Stop(Stop::NotStated));
         }
-        // Only the name itself is kept from a playlist of the person's own: there is no
-        // second name.
-        assert_eq!((kept_name("Nexus Music link (being set up)"), unlisted("Nexus Music link (being set up)", "")), (None, false));
+        // Only the name itself is kept from a playlist of the person's own, where linking
+        // is in use: there is no second name.
+        assert_eq!((kept_name("Nexus Music link (being set up)", true), unlisted("Nexus Music link (being set up)", true)), (None, false));
         let later = r#"{"nexus_music_link":2,"secret":"x"}"#;
         assert_eq!(judge("k", false, &got("k", Some(later)), "tester"), Verdict::Stop(Stop::Later));
         // Not even to make it private, or because another has gone.

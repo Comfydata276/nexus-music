@@ -221,7 +221,7 @@ pub fn run(client: &crate::subsonic::Client, index: &Index, paths: &[PathBuf]) -
         .playlists()
         .map_err(|e| e.to_string())?
         .into_iter()
-        .filter(|p| !crate::link::unlisted(&p.name, &p.comment) && (p.owner.is_empty() || p.owner.to_lowercase() == mine))
+        .filter(|p| !crate::link::unlisted(&p.name) && (p.owner.is_empty() || p.owner.to_lowercase() == mine))
         .map(|p| (name_of(&p.name), p.id))
         .collect();
     let mut reports = Vec::new();

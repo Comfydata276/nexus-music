@@ -59,14 +59,12 @@ pub fn on() -> bool {
 
 /// Why a playlist of the person's own may not have this name, if it may not.
 pub fn kept_name(name: &str) -> Option<&'static str> {
-    secret::kept_name(name)
+    secret::kept_name(name, on())
 }
 
-/// Whether a playlist is left out of every ordinary listing of playlists: **whatever this
-/// PC's own switch** (the one devices are kept in step through; and one that holds the
-/// secret another of the person's devices links by, known by its comment).
-pub fn unlisted(name: &str, comment: &str) -> bool {
-    secret::unlisted(name, comment)
+/// Whether a playlist of this name is left out of every ordinary listing of playlists.
+pub fn unlisted(name: &str) -> bool {
+    secret::unlisted(name, on())
 }
 
 /// Whether a playlist's page may be written to the cache of pages on disk, and read back
