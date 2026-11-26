@@ -1398,7 +1398,12 @@ Then: the phone's adapter, on `bind::Phone`, from 8.1. One review covers both.
 
 **Before linking is switched on for anyone** (the list): the review of the library's
 changes and the adapter together; **devices of different generations in one room**
-(5.10, designed, not built); the walk of the phone against a PC.
+(5.10, designed, not built); the walk of the phone against a PC; and **a phone's
+volume**. A phone refuses `volume` today and says 1 (weakness 19). The question for
+the owner is whether a PC should be able to turn a phone's media volume up and down
+at all. Whatever the answer, a device that says it has no volume of its own is to be
+**shown without a volume slider**, not with one that springs back: that needs the
+device to say so (a field in its full state), which no build does yet.
 
 ## 12. Where it is weakest
 
