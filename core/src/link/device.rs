@@ -31,7 +31,7 @@
 //! | A command that arrives from one that speaks otherwise is refused `invalid`, before the player or its order of choices is asked anything | [`Device::asked`] |
 //! | A look for this device's queue from one that speaks otherwise is answered with no queue: its music is not given | [`Device::asked`] |
 //! | No command is sealed for one that speaks otherwise: **every** command goes out by one function | [`Device::command`] (and `super::steer::Peer::may_send`, which says why to the person) |
-//! | One that speaks otherwise is not steered, and is let go of when it turns out to | [`Device::steer`], [`Device::choose`], [`Device::told`] |
+//! | One that speaks otherwise is not steered, and is let go of when it turns out to. An app asks before it gives anything up for a pick | [`Device::steer`], [`Device::choose`], [`Device::told`]; [`Device::pickable`] |
 //! | Its queue is not taken: the answer that brings it says how its sender speaks | [`Device::told`] |
 //! | Its answers never say a command was carried out | `super::steer::Peer::told` |
 //! | It is listed, with which of the two to update | [`Device::shown`] |
@@ -1398,14 +1398,22 @@ impl Device {
         }
         // (The queue, if it carries one, is for the move that asked for it and is not kept.)
         let (handed, re, at, playing, device, speaks) = (tell.queue.take(), tell.re, tell.at, tell.playing, tell.device, tell.speaks);
-        let (told, name, sent_for) = {
-            let Some(seen) = self.live_mut(session, now).and_then(|live| live.peers.get_mut(&from)) else { return };
-            let told = seen.peer.told(tell);
+        let (told, name, sent_for, left) = {
+            let Some(live) = self.live_mut(session, now) else { return };
+            // **Where the device that says this is now**: the place that last answered
+            // as it. If that is another place than this tell came from, the device was
+            // started again, and this is what its last run said, late.
+            let left = live.place_of(&device).is_some_and(|at| at != from);
+            let Some(seen) = live.peers.get_mut(&from) else { return };
+            if left {
+                out.push(Do::Log(format!("tell from {}: its device has since answered from another place, so it settles nothing", text::place(&from))));
+            }
+            let told = seen.peer.told(tell, left);
             let sent_for = seen.out;
             if matches!(told, Told::Settled(Outcome::Done) | Told::ShownAndSettled(Outcome::Done)) {
                 seen.out = None;
             }
-            (told, name_of(seen), sent_for)
+            (told, name_of(seen), sent_for, left)
         };
         if matches!(told, Told::Shown | Told::ShownAndSettled(_)) {
             // It answered under this name: it is remembered, so that the list can show it
@@ -1438,8 +1446,10 @@ impl Device {
             self.show_view(from, now, out);
             // The queue that was asked for, to bring its music here: if it has come in
             // time. One that comes after that is not taken, whether or not a tick has
-            // yet said so.
+            // yet said so. (And one from a place its device has left is no answer: what
+            // was asked for is given up in its own time.)
             match &self.take {
+                _ if left => {}
                 Some(Take::Asked { place, nonce, pressed_ms, .. }) if *place == from && Some(*nonce) == re && now.saturating_sub(*pressed_ms) < WAIT_MS => self.took(from, handed, at, playing, env, out),
                 Some(Take::Asked { place, nonce, name, .. }) if *place == from && Some(*nonce) == re => {
                     let name = name.clone();
@@ -1744,6 +1754,14 @@ impl Device {
             self.not_sent(place, &name, wait, true, env, &mut out);
         }
         Some(out)
+    }
+
+    /// Whether a pick of this place would be taken up at all: it is in the room, has been
+    /// seen, and speaks as this device does. For an app that gives something of its own
+    /// up for a pick (another way of steering that it leaves): it asks first, and gives
+    /// that up only for a pick that will be taken.
+    pub fn pickable(&self, place: &str) -> bool {
+        text::read_place(place).is_some_and(|to| self.speaks(&to) == Some(SPEAKS))
     }
 
     /// A device was picked in the list: this one starts steering it, and if music is

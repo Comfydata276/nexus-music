@@ -12,7 +12,8 @@
 //! | a tell with the queue | the same, and `queue`: what is playing and to come, to carry on with elsewhere | 210,000 bytes |
 //!
 //! Fields a version doesn't know are ignored. A message that breaks its shape is not
-//! guessed at: an ask that opened is answered `invalid`, a tell is dropped.
+//! guessed at: an ask that opened is answered `invalid`, a tell is dropped. **One that
+//! names a field twice breaks its shape**, whichever field and however deep.
 //!
 //! **Every ask and every tell says how its sender speaks** ([`SPEAKS`]): one number, which
 //! moves only when the meaning of something already said changes. What is done with it is
@@ -40,6 +41,66 @@ fn speaks(fields: &Map<String, Value>) -> Option<u64> {
     match fields.get("speaks") {
         None => Some(SPEAKS_UNSAID),
         Some(said) => said.as_u64().filter(|said| *said >= 1),
+    }
+}
+
+/// A message's fields, **read strictly: one that names a field twice, at any depth, is
+/// not read**. (A reader that keeps the last of two, as a plain `serde_json::Value`
+/// does, would let a message say two things of itself, one for each way of reading it;
+/// and one of the things a message says decides whether a command is carried out.)
+fn fields(message: &[u8]) -> Option<Map<String, Value>> {
+    use serde::de::{Deserialize, Deserializer, Error, MapAccess, SeqAccess, Visitor};
+    struct Once(Value);
+    struct Reads;
+    impl<'de> Visitor<'de> for Reads {
+        type Value = Once;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a value of a message")
+        }
+        fn visit_bool<E>(self, value: bool) -> Result<Once, E> {
+            Ok(Once(Value::Bool(value)))
+        }
+        fn visit_i64<E>(self, value: i64) -> Result<Once, E> {
+            Ok(Once(value.into()))
+        }
+        fn visit_u64<E>(self, value: u64) -> Result<Once, E> {
+            Ok(Once(value.into()))
+        }
+        fn visit_f64<E>(self, value: f64) -> Result<Once, E> {
+            Ok(Once(serde_json::Number::from_f64(value).map_or(Value::Null, Value::Number)))
+        }
+        fn visit_str<E>(self, value: &str) -> Result<Once, E> {
+            Ok(Once(Value::String(value.to_string())))
+        }
+        fn visit_unit<E>(self) -> Result<Once, E> {
+            Ok(Once(Value::Null))
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut values: A) -> Result<Once, A::Error> {
+            let mut listed = Vec::new();
+            while let Some(Once(value)) = values.next_element()? {
+                listed.push(value);
+            }
+            Ok(Once(Value::Array(listed)))
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut named: A) -> Result<Once, A::Error> {
+            let mut fields = Map::new();
+            while let Some(name) = named.next_key::<String>()? {
+                let Once(value) = named.next_value()?;
+                if fields.insert(name, value).is_some() {
+                    return Err(A::Error::custom("a field is named twice"));
+                }
+            }
+            Ok(Once(Value::Object(fields)))
+        }
+    }
+    impl<'de> Deserialize<'de> for Once {
+        fn deserialize<D: Deserializer<'de>>(from: D) -> Result<Once, D::Error> {
+            from.deserialize_any(Reads)
+        }
+    }
+    match serde_json::from_slice::<Once>(message).ok()?.0 {
+        Value::Object(fields) => Some(fields),
+        _ => None,
     }
 }
 
@@ -126,7 +187,7 @@ pub fn read_ask(message: &[u8]) -> Option<(Ask, u64)> {
     if message.len() > MOST_MESSAGE {
         return None;
     }
-    let Ok(Value::Object(fields)) = serde_json::from_slice(message) else { return None };
+    let fields = fields(message)?;
     let speaks = speaks(&fields)?;
     let ask = match fields.get("t")?.as_str()? {
         "look" if message.len() <= MOST_LOOK => {
@@ -431,7 +492,7 @@ pub fn read_tell(message: &[u8]) -> Option<Tell> {
     if message.len() > MOST_MESSAGE {
         return None;
     }
-    let Ok(Value::Object(fields)) = serde_json::from_slice(message) else { return None };
+    let fields = fields(message)?;
     let most = match (fields.contains_key("queue"), fields.contains_key("full")) {
         (true, _) => MOST_MESSAGE,
         (false, true) => MOST_FULL,
@@ -566,6 +627,40 @@ mod tests {
         }
     }
 
+    /// **A message that names a field twice is not read** (the review of generations, G2).
+    /// A reader that kept the last of two would take `"speaks":1,…,"speaks":2` for 2, and
+    /// the number now decides whether a command is carried out. No build writes one.
+    #[test]
+    fn a_message_with_a_field_named_twice_is_not_read() {
+        for twice in [
+            r#"{"t":"look","want":"brief","speaks":1,"speaks":2}"#,
+            r#"{"t":"look","want":"brief","want":"queue"}"#,
+            r#"{"t":"do","do":"pause","at":[7,12],"speaks":1,"speaks":2}"#,
+            r#"{"speaks":2,"t":"do","do":"pause","at":[7,12],"speaks":2}"#,
+            r#"{"t":"do","do":"pause","do":"play","at":[7,12]}"#,
+            r#"{"t":"do","do":"seek","at":[7,12],"with":{"to":1,"to":2}}"#,
+            r#"{"t":"do","do":"pause","at":[7,12],"later":{"a":1,"a":2}}"#,
+            r#"{"t":"do","do":"pause","at":[7,12],"later":[{"a":1,"a":2}]}"#,
+        ] {
+            assert_eq!(read_ask(twice.as_bytes()), None, "{twice}");
+        }
+        let good = r#"{"device":"gYGBgYGBgYGBgYGBgYGBgQ","name":"Phone","at":[8,12],"playing":false}"#;
+        assert!(read_tell(good.as_bytes()).is_some());
+        for (from, to) in [
+            (r#""playing":false"#, r#""playing":false,"speaks":1,"speaks":2"#),
+            (r#""playing":false"#, r#""playing":false,"playing":true"#),
+            (r#""playing":false"#, r#""playing":false,"done":false,"done":true"#),
+            (r#""playing":false"#, r#""playing":false,"full":{"position":0,"position":1,"queue":[],"shuffle":false,"repeat":0,"volume":1}"#),
+            (r#""playing":false"#, r#""playing":false,"queue":{"songs":["a"],"queued":0,"position":0,"songs":["b"]}"#),
+            (r#""playing":false"#, r#""playing":false,"full":{"position":0,"queue":[{"id":"a","id":"b"}],"shuffle":false,"repeat":0,"volume":1}"#),
+        ] {
+            let twice = good.replace(from, to);
+            assert_eq!(read_tell(twice.as_bytes()), None, "{twice}");
+        }
+        // The same fields once each are read.
+        assert_eq!(read_ask(br#"{"t":"do","do":"seek","at":[7,12],"with":{"to":1},"later":[{"a":1,"b":2}]}"#).map(|(_, speaks)| speaks), Some(1));
+    }
+
     /// The number is room every message already had: the biggest of each kind still fits
     /// what its kind is allowed, as an older reader counts it too.
     #[test]
@@ -594,14 +689,23 @@ mod tests {
         let add = Ask::Do { command: Command::Add { ids: vec![id.clone(); 50], next: false }, at: most };
         assert!(add.text().len() <= super::super::command::MOST_ADD, "{}", add.text().len());
         assert!(read_ask(add.text().as_bytes()).is_some());
-        // A queue cut to fit one message, with the longest ids, the longest context and
-        // the biggest numbers there are.
-        let ids: Vec<String> = (0..5_000).map(|n| format!("{n:064}")).collect();
-        let (adopt, left) = Adopt::fitted(&ids, 4_999, 0, 86_399.999_999, &"🎵".repeat(200)).unwrap();
-        assert!(left > 0);
-        let adopt = Ask::Do { command: Command::Adopt(adopt), at: most };
-        assert!(adopt.text().len() <= MOST_MESSAGE, "{}", adopt.text().len());
-        assert!(read_ask(adopt.text().as_bytes()).is_some());
+        // A queue packed as full as one message goes, from its first song: ids of every
+        // length, the longest context, the biggest numbers there are, and a place in the
+        // song that takes the most digits a number can.
+        for (length, position) in [(64, 86_399.999_999_999_99), (64, 0.000_012_345_678_901_234_567), (22, 86_399.999_999_999_99), (1, 1.234_567_890_123_456_7e-5), (63, 12.5)] {
+            let ids: Vec<String> = (0..120_000).map(|n| format!("{n:0length$}").chars().rev().take(length).collect()).collect();
+            for context in [String::new(), "🎵".repeat(200), "\"".repeat(200)] {
+                let (adopt, left) = Adopt::fitted(&ids, 0, 0, position, &context).unwrap();
+                assert!(left > 0 && adopt.songs.len() > 3_000 / 64 * length.min(64), "{length}: {}", adopt.songs.len());
+                let sent = adopt.songs.len();
+                let adopt = Ask::Do { command: Command::Adopt(adopt), at: most };
+                let size = adopt.text().len();
+                assert!(size <= MOST_MESSAGE, "ids of {length}, {position}: {size} bytes");
+                // (And packed: not so cautious that a song more would have fitted twice over.)
+                assert!(size + 2 * (length + 3) + 64 > MOST_MESSAGE, "ids of {length}: only {size} bytes for {sent} songs");
+                assert!(read_ask(adopt.text().as_bytes()).is_some());
+            }
+        }
     }
 
     #[test]

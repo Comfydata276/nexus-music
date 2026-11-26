@@ -291,6 +291,9 @@ struct World {
     asked_of_server: Vec<(usize, u64, Vec<String>)>,
     /// Each look-up of songs that was asked for: the songs, and the moment it ends.
     finds: Vec<(Vec<String>, u64)>,
+    /// Places the relay still lists that nobody is at: a copy that was started again has
+    /// its old place there until the relay gives it up.
+    left: Vec<Place>,
 }
 
 const A: usize = 0;
@@ -330,6 +333,7 @@ impl World {
             slow_server: false,
             asked_of_server: Vec::new(),
             finds: Vec::new(),
+            left: Vec::new(),
         };
         // (The first tick asks for a look; its answer begins the session.)
         world.tick();
@@ -472,7 +476,24 @@ impl World {
     fn room(&self) -> Vec<String> {
         // (Both devices are in one room only while they hold one secret; the tests that
         // split them say who hears of whom themselves.)
-        self.copies.iter().filter_map(|copy| copy.place).map(|place| text::place(&place)).collect()
+        self.copies.iter().filter_map(|copy| copy.place).chain(self.left.iter().copied()).map(|place| text::place(&place)).collect()
+    }
+
+    /// A copy exits and is started again (an update, or the person closing and opening
+    /// it): a new run of the app, which remembers nothing of the last but what is on
+    /// disk. Its queue is restored paused, its order of choices begins again, and it is
+    /// given a new place in the room, with its old one still listed by the relay.
+    fn start_again(&mut self, who: usize) {
+        self.left.extend(self.copies[who].place.take());
+        let copy = &mut self.copies[who];
+        copy.device = Device::new(copy.remembered.clone());
+        copy.player.rule = Rule::default();
+        copy.player.play(false);
+        copy.looks.clear();
+        let did = self.with(who, |device, env| device.tick("the account", true, env));
+        self.act(who, did);
+        self.looked(who, Looked::Secret { secret: secret(7), id: "k".into(), wrote: None }, false);
+        self.hear_places();
     }
 
     fn hear_places(&mut self) {
@@ -2153,6 +2174,9 @@ fn a_device_of_another_generation_is_listed_and_sent_nothing_but_looks() {
         let row = world.row(A, "Copy B").unwrap();
         assert_eq!((row.about.as_str(), row.playing, row.ready, row.update.as_str(), row.place.is_empty()), ("Playing s0", true, false, under, false), "{theirs}");
         // Picked all the same (a list drawn before the look came back): not steered.
+        // And an app that asks first is told it would not be.
+        let place = world.b_place();
+        assert!(!world.copies[A].device.pickable(&place) && !world.copies[A].device.pickable("") && !world.copies[A].device.pickable(&text::place(&[0xEE; 16])));
         world.choose();
         assert_eq!((world.copies[A].window.clone(), said(&world), commands_sent(&world)), (None, aloud, 0), "{theirs}");
         assert!(world.copies[A].device.steered().is_none());
@@ -2196,6 +2220,7 @@ fn a_device_of_another_generation_is_listed_and_sent_nothing_but_looks() {
         world.path.hold_commands = false;
         let row = world.row(A, "Copy B").unwrap();
         assert_eq!((row.ready, row.update.as_str()), (true, ""));
+        assert!(world.copies[A].device.pickable(&place));
     }
 }
 
@@ -2288,4 +2313,57 @@ fn the_stop_that_ends_play_here_is_not_sent_to_a_device_of_another_generation() 
     world.pass(2_000);
     assert_eq!((commands_sent(&world), world.copies[B].player.playing), (0, true));
     assert_eq!(said(&world), "Playing here. Copy B couldn't be told to stop, so it may still be playing.");
+}
+
+// ---- an answer from a place the device has left (the review of generations, G1) ---------------
+
+/// A gives B its queue. B takes it, starts, and says so; the answer waits on the way.
+/// B exits and is started again: at a new place in the room, its queue restored paused,
+/// its old place still listed. A has seen B at its new place when the answer arrives
+/// from the old one. **The answer says what a run of B that is over had done**: it
+/// settles nothing. A does not stop, does not mark its queue as handed on, and does not
+/// say the music is playing on B, where nothing is playing.
+#[test]
+fn an_answer_from_a_place_its_device_has_left_never_settles_a_hand_over() {
+    let mut world = giving(|world| world.path.hold_tells = true);
+    world.pass(2_000);
+    assert!(world.copies[B].player.playing, "B took the queue and has started");
+    let old = world.copies[B].place.unwrap();
+    world.start_again(B);
+    assert!(!world.copies[B].player.playing && world.copies[B].place.is_some_and(|new| new != old));
+    // A hears of the new place, looks at it, and is answered from it.
+    world.path.hold_tells = false;
+    world.pass(1_000);
+    assert_eq!(world.row(A, "Copy B").map(|row| row.place), world.copies[B].place.map(|place| text::place(&place)), "A lists B where it now is");
+    // What B's last run said, from its old place: the looks' answers, and "it has started".
+    assert!(world.path.tells.iter().all(|frame| frame.from == old) && !world.path.tells.is_empty());
+    world.release_tells();
+    world.pass(1_000);
+    assert_eq!((world.copies[A].player.playing, world.copies[A].player.handed_on.len(), world.copies[A].window.clone()), (true, 0, None));
+    assert_eq!(said(&world), "Copy B didn't answer. Still playing here; check whether Copy B started too.");
+    assert!(world.last(A, "outcome of Give").ends_with("Unknown"), "{:?}", world.copies[A].log);
+    // The same for "Play here": the queue that comes back from a place its device has
+    // left is not taken. What was asked for is given up in its own time.
+    let mut world = steering("pause");
+    world.path.hold_tells = true;
+    let did = world.with(A, |device, env| device.play_here(env));
+    world.act(A, did.expect("A is steering B"));
+    let old = world.copies[B].place.unwrap();
+    world.start_again(B);
+    world.path.hold_tells = false;
+    world.pass(1_000);
+    assert!(world.path.tells.iter().any(|frame| frame.from == old));
+    world.release_tells();
+    world.pass(1_000);
+    assert!(world.log(A, "take: loaded").is_empty(), "{:?}", world.copies[A].log);
+    assert_eq!((world.copies[A].player.queue.len(), world.copies[A].player.playing), (3, false));
+    world.pass(12_000);
+    assert_eq!(said(&world), "Copy B didn't answer, so nothing was moved. It may still be playing.");
+    // An answer from the place the device is at is believed as it always was: a copy
+    // that has two places in the room is not thereby one whose every answer is doubted.
+    let mut world = giving(|_| {});
+    world.left.push([0xEE; 16]);
+    world.hear_places();
+    world.pass(1_000);
+    assert_eq!((said(&world), world.copies[A].player.playing, world.copies[B].player.playing), ("Playing on Copy B.", false, true));
 }

@@ -30,6 +30,7 @@
 use crate::ways::{What, Who};
 use serde_json::{Map, Value, json};
 
+use super::message::SPEAKS;
 use super::text;
 
 /// The longest id of a song that is carried.
@@ -77,9 +78,12 @@ impl Adopt {
     pub fn fitted_within(songs: &[String], index: usize, queued: usize, position: f64, context: &str, most: usize) -> Option<(Adopt, usize)> {
         let start = songs.get(index).filter(|id| id_ok(id))?;
         let context = text::cut(context, MOST_CONTEXT);
-        // What the message costs apart from its songs, with room to spare; then each song
-        // costs its id, two quotes and a comma.
-        let fixed = 160 + context.len() * 2;
+        let position = if position.is_finite() && position > 0.0 { position } else { 0.0 };
+        // What the message costs apart from its songs: **measured, as it will be written**,
+        // with everything it carries beside them (how its sender speaks among them) and
+        // the longest state it could be made against, which is not known here. Then each
+        // song costs its id, two quotes and a comma.
+        let fixed = json!({"t": "do", "do": "adopt", "speaks": SPEAKS, "at": [u64::MAX, u64::MAX], "with": {"songs": [], "index": index, "queued": queued, "position": position, "context": context}}).to_string().len();
         let cost = |id: &String| id.len() + 3;
         let whole: usize = songs.iter().filter(|id| id_ok(id)).map(cost).sum();
         let from = if fixed + whole <= most { 0 } else { index };
@@ -102,7 +106,6 @@ impl Adopt {
         // Those queued by hand are the ones straight after the song to start with: no more
         // of them than are still there.
         let queued = queued.min(kept.len() - at - 1);
-        let position = if position.is_finite() && position > 0.0 { position } else { 0.0 };
         Some((Adopt { songs: kept, index: at, queued, position, context }, left))
     }
 }

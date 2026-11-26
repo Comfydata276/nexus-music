@@ -278,16 +278,26 @@ impl Peer {
     }
 
     /// A tell arrived from this device's place and opened.
-    pub fn told(&mut self, tell: Tell) -> Told {
+    ///
+    /// `left`: **the device has since answered from another place in the room.** It was
+    /// started again, and this is what its last run said, late. It says what a run that
+    /// is over had done, and nothing of the device as it is now (its queue restored,
+    /// paused): like a tell in another generation, it is shown for what it is worth and
+    /// **settles nothing as carried out**, and nothing is made against it.
+    pub fn told(&mut self, tell: Tell, left: bool) -> Told {
         let Some(re) = tell.re else { return Told::Dropped };
+        // What this device takes its word from: one that speaks as it does, from the
+        // place its device is at.
+        let read = tell.speaks == SPEAKS && !left;
         // The answer to the command itself: once.
         if let Some(command) = &mut self.command
             && command.nonce == re
         {
-            // From a device that does not speak as this one does, it is not read: once,
-            // it says that what became of the command is not known. (A success in this
-            // device's own generation, if one comes, is still believed.)
-            if tell.speaks != SPEAKS {
+            // From a device that does not speak as this one does, or from a place its
+            // device has left, it is not read: once, it says that what became of the
+            // command is not known. (A success that can be read, if one comes, is still
+            // believed.)
+            if !read {
                 if command.answered || command.outcome == Some(Outcome::Done) {
                     return Told::Dropped;
                 }
@@ -331,7 +341,7 @@ impl Peer {
         let (_, sent_ms) = self.looks.remove(waiting);
         let settled = self.command.as_mut().filter(|command| command.outcome.is_none()).and_then(|command| {
             let checked = command.check.is_some_and(|(check, _)| check == re);
-            let outcome = if tell.speaks != SPEAKS {
+            let outcome = if !read {
                 // (Not read, whatever it names: the look that was to say what became of
                 // the command has not said, and no other look says anything of it.)
                 if checked { Outcome::Unknown } else { return None }
@@ -363,7 +373,9 @@ impl Peer {
         let newer = self.shown.as_ref().is_none_or(|shown| sent_ms >= shown.sent_ms);
         if newer {
             // A state to act on only if it was asked for after the last command was sent.
-            if self.command.as_ref().is_none_or(|command| sent_ms > command.sent_ms) {
+            // (And not one from a place the device has left: nothing is asked of a
+            // run of the app that is over.)
+            if !left && self.command.as_ref().is_none_or(|command| sent_ms > command.sent_ms) {
                 self.base = Some(Base { at: tell.at, busy: tell.busy, ms: sent_ms, speaks: tell.speaks });
             }
             self.shown = Some(Shown { tell, sent_ms });
@@ -394,7 +406,7 @@ mod tests {
     fn seen(sent: u64) -> Peer {
         let mut peer = Peer::default();
         peer.looked(LOOK, sent);
-        assert_eq!(peer.told(state(5, LOOK)), Told::Shown);
+        assert_eq!(peer.told(state(5, LOOK), false), Told::Shown);
         peer
     }
 
@@ -411,10 +423,10 @@ mod tests {
         let mut peer = Peer::default();
         assert_eq!(peer.may_send(0), Err(Wait::Look));
         // A tell nobody asked for, and an answer to somebody else's look.
-        assert_eq!(peer.told(Tell { re: None, ..state(5, LOOK) }), Told::Dropped);
-        assert_eq!(peer.told(state(5, LOOK)), Told::Dropped);
+        assert_eq!(peer.told(Tell { re: None, ..state(5, LOOK) }, false), Told::Dropped);
+        assert_eq!(peer.told(state(5, LOOK), false), Told::Dropped);
         peer.looked(LOOK, 100);
-        assert_eq!(peer.told(state(5, LOOK)), Told::Shown);
+        assert_eq!(peer.told(state(5, LOOK), false), Told::Shown);
         assert_eq!(peer.may_send(200), Ok(At { generation: 5, minute: 0 }));
     }
 
@@ -425,35 +437,56 @@ mod tests {
         for theirs in [1, SPEAKS + 1] {
             let mut peer = Peer::default();
             peer.looked(LOOK, 0);
-            assert_eq!(peer.told(Tell { speaks: theirs, ..state(5, LOOK) }), Told::Shown);
+            assert_eq!(peer.told(Tell { speaks: theirs, ..state(5, LOOK) }, false), Told::Shown);
             assert_eq!(peer.shown().map(|shown| shown.tell.speaks), Some(theirs));
             assert_eq!(peer.may_send(100), Err(Wait::Speaks(theirs)));
             assert_eq!(peer.press(&Command::Pause, 100), Press::No(Wait::Speaks(theirs)));
             // Looked at again once it speaks as this device does: as any other.
             peer.looked(LOOK_2, 1_000);
-            assert_eq!(peer.told(state(5, LOOK_2)), Told::Shown);
+            assert_eq!(peer.told(state(5, LOOK_2), false), Told::Shown);
             assert!(peer.may_send(1_100).is_ok());
             // The command's own answer, saying `ok` in another generation: what became of
             // the command is not known, and nothing is made against what it says.
             let mut peer = paused();
             assert_eq!(peer.press(&Command::Next, 1_100), Press::Waits);
-            assert_eq!(peer.told(Tell { ok: Some(true), by: Some(PAUSE), done: true, speaks: theirs, ..state(6, PAUSE) }), Told::Settled(Outcome::Unknown));
+            assert_eq!(peer.told(Tell { ok: Some(true), by: Some(PAUSE), done: true, speaks: theirs, ..state(6, PAUSE) }, false), Told::Settled(Outcome::Unknown));
             assert_eq!((peer.outcome(), peer.pressed(), peer.may_send(1_200)), (Some(Outcome::Unknown), 0, Err(Wait::Look)));
             // (A success in this device's own generation is still believed when it comes.)
-            assert_eq!(peer.told(Tell { ok: Some(true), ..state(6, PAUSE) }), Told::Settled(Outcome::Done));
+            assert_eq!(peer.told(Tell { ok: Some(true), ..state(6, PAUSE) }, false), Told::Settled(Outcome::Done));
             // The look that checks on an unanswered command, answered "it made my state,
             // to its end" in another generation: not known, and never done.
             let mut peer = paused();
             assert_eq!(peer.tick(1_000 + WAIT_MS), Tick::Check);
             peer.checking(LOOK_2, 1_000 + WAIT_MS);
-            assert_eq!(peer.told(Tell { by: Some(PAUSE), done: true, speaks: theirs, ..state(6, LOOK_2) }), Told::ShownAndSettled(Outcome::Unknown));
+            assert_eq!(peer.told(Tell { by: Some(PAUSE), done: true, speaks: theirs, ..state(6, LOOK_2) }, false), Told::ShownAndSettled(Outcome::Unknown));
             assert_eq!(peer.may_send(1_100 + WAIT_MS), Err(Wait::Speaks(theirs)));
             // And an ordinary look's answer that names the command so settles nothing.
             let mut peer = paused();
             peer.looked(LOOK_2, 2_000);
-            assert_eq!(peer.told(Tell { by: Some(PAUSE), done: true, speaks: theirs, ..state(6, LOOK_2) }), Told::Shown);
+            assert_eq!(peer.told(Tell { by: Some(PAUSE), done: true, speaks: theirs, ..state(6, LOOK_2) }, false), Told::Shown);
             assert!(peer.waiting());
         }
+    }
+
+    /// G1: what a device's last run said, arriving from the place it has left, settles
+    /// nothing as carried out, and nothing is made against it.
+    #[test]
+    fn an_answer_from_a_place_the_device_has_left_settles_nothing_as_done() {
+        // The command's own answer, `ok`.
+        let mut peer = paused();
+        assert_eq!(peer.told(Tell { ok: Some(true), by: Some(PAUSE), done: true, ..state(6, PAUSE) }, true), Told::Settled(Outcome::Unknown));
+        assert_eq!((peer.outcome(), peer.may_send(1_200)), (Some(Outcome::Unknown), Err(Wait::Look)));
+        // The look that checks on it, answered "it made my state, to its end".
+        let mut peer = paused();
+        assert_eq!(peer.tick(1_000 + WAIT_MS), Tick::Check);
+        peer.checking(LOOK_2, 1_000 + WAIT_MS);
+        assert_eq!(peer.told(Tell { by: Some(PAUSE), done: true, ..state(6, LOOK_2) }, true), Told::ShownAndSettled(Outcome::Unknown));
+        assert_eq!(peer.may_send(1_100 + WAIT_MS), Err(Wait::Look));
+        // An ordinary look's answer from there is shown, and nothing is made against it.
+        let mut peer = Peer::default();
+        peer.looked(LOOK, 0);
+        assert_eq!(peer.told(state(5, LOOK), true), Told::Shown);
+        assert_eq!(peer.may_send(100), Err(Wait::Look));
     }
 
     #[test]
@@ -463,7 +496,7 @@ mod tests {
         // answers to every later look.
         peer.looked(LOOK_2, 30_000);
         for _ in 0..3 {
-            assert_eq!(peer.told(state(5, LOOK)), Told::Dropped);
+            assert_eq!(peer.told(state(5, LOOK), false), Told::Dropped);
         }
         assert_eq!(peer.shown().map(|shown| shown.sent_ms), Some(0));
         // The state is as old as its look, and is not acted on once that is too old.
@@ -478,47 +511,47 @@ mod tests {
         let mut peer = Peer::default();
         peer.looked(LOOK, 0);
         peer.looked(LOOK_2, 5_000);
-        assert_eq!(peer.told(state(6, LOOK_2)), Told::Shown);
-        assert_eq!(peer.told(state(5, LOOK)), Told::Dropped);
+        assert_eq!(peer.told(state(6, LOOK_2), false), Told::Shown);
+        assert_eq!(peer.told(state(5, LOOK), false), Told::Dropped);
         assert_eq!(peer.shown().map(|shown| (shown.tell.at.generation, shown.sent_ms)), Some((6, 5_000)));
         // Only so many looks are waited on: the oldest is forgotten, and its answer with it.
         let mut peer = Peer::default();
         for n in 0..6u8 {
             peer.looked([n; 24], u64::from(n));
         }
-        assert_eq!(peer.told(state(5, [0; 24])), Told::Dropped);
-        assert_eq!(peer.told(state(5, [5; 24])), Told::Shown);
+        assert_eq!(peer.told(state(5, [0; 24]), false), Told::Dropped);
+        assert_eq!(peer.told(state(5, [5; 24]), false), Told::Shown);
     }
 
     #[test]
     fn a_command_is_not_sent_against_a_busy_state_or_while_one_is_unanswered() {
         let mut peer = Peer::default();
         peer.looked(LOOK, 0);
-        peer.told(Tell { busy: true, ..state(5, LOOK) });
+        peer.told(Tell { busy: true, ..state(5, LOOK) }, false);
         assert_eq!(peer.may_send(100), Err(Wait::Busy));
         let mut peer = paused();
         assert_eq!(peer.may_send(1_500), Err(Wait::Unanswered));
         // Once it is answered "carried out", the state in that answer is the one the next is
         // made against: not the one from before it, which it changed.
-        assert_eq!(peer.told(Tell { ok: Some(true), by: Some(PAUSE), ..state(6, PAUSE) }), Told::Settled(Outcome::Done));
+        assert_eq!(peer.told(Tell { ok: Some(true), by: Some(PAUSE), ..state(6, PAUSE) }, false), Told::Settled(Outcome::Done));
         assert_eq!(peer.may_send(2_000), Ok(At { generation: 6, minute: 0 }));
         // It is as old as the command it answers, and no fresher.
         assert_eq!(peer.may_send(1_000 + FRESH_MS), Err(Wait::Look));
         // A refusal leaves nothing to send against: look first.
         let mut peer = paused();
-        assert_eq!(peer.told(Tell { ok: Some(false), why: Some(Why::Changed), ..state(7, PAUSE) }), Told::Settled(Outcome::Refused(Why::Changed)));
+        assert_eq!(peer.told(Tell { ok: Some(false), why: Some(Why::Changed), ..state(7, PAUSE) }, false), Told::Settled(Outcome::Refused(Why::Changed)));
         assert_eq!(peer.may_send(2_000), Err(Wait::Look));
         // And an answer to a look sent before the command says nothing of what it did.
         let mut peer = Peer::default();
         peer.looked(LOOK, 0);
-        peer.told(state(5, LOOK));
+        peer.told(state(5, LOOK), false);
         peer.looked(LOOK_2, 500);
         peer.sent(PAUSE, At { generation: 5, minute: 0 }, 1_000);
-        peer.told(Tell { ok: Some(false), why: Some(Why::Late), ..state(5, PAUSE) });
-        assert_eq!(peer.told(state(5, LOOK_2)), Told::Shown);
+        peer.told(Tell { ok: Some(false), why: Some(Why::Late), ..state(5, PAUSE) }, false);
+        assert_eq!(peer.told(state(5, LOOK_2), false), Told::Shown);
         assert_eq!(peer.may_send(2_000), Err(Wait::Look));
         peer.looked([3; 24], 2_000);
-        assert_eq!(peer.told(state(5, [3; 24])), Told::Shown);
+        assert_eq!(peer.told(state(5, [3; 24]), false), Told::Shown);
         assert_eq!(peer.may_send(2_100), Ok(At { generation: 5, minute: 0 }));
     }
 
@@ -529,13 +562,13 @@ mod tests {
         assert_eq!(peer.press(&Command::Next, 1_200), Press::Waits);
         // Nothing goes until the one that is out is answered.
         assert_eq!(peer.next(1_300), None);
-        assert_eq!(peer.told(Tell { ok: Some(true), by: Some(PAUSE), ..state(6, PAUSE) }), Told::Settled(Outcome::Done));
+        assert_eq!(peer.told(Tell { ok: Some(true), by: Some(PAUSE), ..state(6, PAUSE) }, false), Told::Settled(Outcome::Done));
         // Then the first, against the state in that answer; and the second only after the
         // first's own answer.
         assert_eq!(peer.next(1_400), Some((Command::Next, At { generation: 6, minute: 0 })));
         peer.sent(LOOK_2, At { generation: 6, minute: 0 }, 1_400);
         assert_eq!((peer.next(1_500), peer.pressed()), (None, 1));
-        assert_eq!(peer.told(Tell { ok: Some(true), by: Some(LOOK_2), ..state(7, LOOK_2) }), Told::Settled(Outcome::Done));
+        assert_eq!(peer.told(Tell { ok: Some(true), by: Some(LOOK_2), ..state(7, LOOK_2) }, false), Told::Settled(Outcome::Done));
         assert_eq!(peer.next(1_600), Some((Command::Next, At { generation: 7, minute: 0 })));
         assert_eq!(peer.pressed(), 0);
         // With nothing out, a press is sent at once, or not at all: it never waits on a look.
@@ -558,7 +591,7 @@ mod tests {
         // A later turn of the slider still takes the place of the earlier one.
         assert_eq!(peer.press(&Command::Volume { to: 0.9 }, 1_300), Press::Waits);
         assert_eq!(peer.pressed(), MOST_PRESSED);
-        assert_eq!(peer.told(Tell { ok: Some(true), by: Some(PAUSE), ..state(6, PAUSE) }), Told::Settled(Outcome::Done));
+        assert_eq!(peer.told(Tell { ok: Some(true), by: Some(PAUSE), ..state(6, PAUSE) }, false), Told::Settled(Outcome::Done));
         assert_eq!(peer.next(1_400).map(|(command, _)| command), Some(Command::Next));
     }
 
@@ -566,7 +599,7 @@ mod tests {
     fn a_refusal_or_an_unknown_outcome_lets_go_of_what_was_waiting() {
         let mut peer = paused();
         peer.press(&Command::Next, 1_100);
-        assert_eq!(peer.told(Tell { ok: Some(false), why: Some(Why::Changed), ..state(7, PAUSE) }), Told::Settled(Outcome::Refused(Why::Changed)));
+        assert_eq!(peer.told(Tell { ok: Some(false), why: Some(Why::Changed), ..state(7, PAUSE) }, false), Told::Settled(Outcome::Refused(Why::Changed)));
         assert_eq!((peer.pressed(), peer.next(1_200)), (0, None));
         // No answer, and the check not answered either.
         let mut peer = paused();
@@ -580,7 +613,7 @@ mod tests {
         peer.press(&Command::Next, 1_100);
         peer.tick(13_000);
         peer.checking(LOOK_2, 13_000);
-        assert_eq!(peer.told(state(5, LOOK_2)), Told::ShownAndSettled(Outcome::NotReached));
+        assert_eq!(peer.told(state(5, LOOK_2), false), Told::ShownAndSettled(Outcome::NotReached));
         assert_eq!((peer.pressed(), peer.next(13_100)), (0, None));
     }
 
@@ -590,18 +623,18 @@ mod tests {
     fn a_command_whose_work_is_still_under_way_is_waited_on_and_asked_after_again() {
         let mut peer = paused();
         peer.looked(LOOK_2, 2_000);
-        assert_eq!(peer.told(Tell { by: Some(PAUSE), busy: true, ..state(6, LOOK_2) }), Told::Shown);
+        assert_eq!(peer.told(Tell { by: Some(PAUSE), busy: true, ..state(6, LOOK_2) }, false), Told::Shown);
         assert!(peer.waiting());
         // No answer in twelve seconds: it asks, is told the work is under way, and waits
         // another twelve from then before asking again.
         assert_eq!(peer.tick(13_000), Tick::Check);
         peer.checking([3; 24], 13_000);
-        assert_eq!(peer.told(Tell { by: Some(PAUSE), busy: true, ..state(6, [3; 24]) }), Told::Shown);
+        assert_eq!(peer.told(Tell { by: Some(PAUSE), busy: true, ..state(6, [3; 24]) }, false), Told::Shown);
         assert_eq!((peer.waiting(), peer.tick(13_000 + WAIT_MS - 1)), (true, Tick::Nothing));
         assert_eq!(peer.tick(13_000 + WAIT_MS), Tick::Check);
         peer.checking([4; 24], 25_000);
         // Its own answer, when the sound has started.
-        assert_eq!(peer.told(Tell { ok: Some(true), by: Some(PAUSE), ..state(6, PAUSE) }), Told::Settled(Outcome::Done));
+        assert_eq!(peer.told(Tell { ok: Some(true), by: Some(PAUSE), ..state(6, PAUSE) }, false), Told::Settled(Outcome::Done));
         // One that never finishes is not waited on for ever.
         let mut peer = paused();
         let mut now = 1_000;
@@ -610,7 +643,7 @@ mod tests {
             assert_eq!(peer.tick(now), Tick::Check);
             let look = [(now / 1_000) as u8; 24];
             peer.checking(look, now);
-            if let Told::ShownAndSettled(outcome) = peer.told(Tell { by: Some(PAUSE), busy: true, ..state(6, look) }) {
+            if let Told::ShownAndSettled(outcome) = peer.told(Tell { by: Some(PAUSE), busy: true, ..state(6, look) }, false) {
                 break outcome;
             }
         };
@@ -618,16 +651,16 @@ mod tests {
         // And an answer that says "busy" beside the name of the command is no success yet,
         // and no refusal either: the command is the one under way, and is waited on.
         let mut peer = paused();
-        assert_eq!(peer.told(Tell { ok: Some(false), why: Some(Why::Busy), by: Some(PAUSE), busy: true, ..state(6, PAUSE) }), Told::Dropped);
+        assert_eq!(peer.told(Tell { ok: Some(false), why: Some(Why::Busy), by: Some(PAUSE), busy: true, ..state(6, PAUSE) }, false), Told::Dropped);
         assert!(peer.waiting());
-        assert_eq!(peer.told(Tell { ok: Some(true), by: Some(PAUSE), ..state(6, PAUSE) }), Told::Settled(Outcome::Done));
+        assert_eq!(peer.told(Tell { ok: Some(true), by: Some(PAUSE), ..state(6, PAUSE) }, false), Told::Settled(Outcome::Done));
     }
 
     #[test]
     fn news_prompts_a_look_once_a_second_at_the_most_and_is_never_a_state() {
         let mut peer = seen(0);
         let news = Tell { re: None, ..state(9, LOOK) };
-        assert_eq!(peer.told(news.clone()), Told::Dropped);
+        assert_eq!(peer.told(news.clone(), false), Told::Dropped);
         assert_eq!(peer.shown().map(|shown| shown.tell.at.generation), Some(5));
         assert_eq!(peer.may_send(100), Ok(At { generation: 5, minute: 0 }));
         assert!(peer.news(1_000));
@@ -640,12 +673,12 @@ mod tests {
     #[test]
     fn an_answer_settles_its_command_and_does_not_touch_the_screen() {
         let mut peer = paused();
-        assert_eq!(peer.told(Tell { ok: Some(false), why: Some(Why::Busy), busy: true, ..state(9, PAUSE) }), Told::Settled(Outcome::Refused(Why::Busy)));
+        assert_eq!(peer.told(Tell { ok: Some(false), why: Some(Why::Busy), busy: true, ..state(9, PAUSE) }, false), Told::Settled(Outcome::Refused(Why::Busy)));
         assert_eq!(peer.outcome(), Some(Outcome::Refused(Why::Busy)));
         // The state shown is still the one a look fetched.
         assert_eq!(peer.shown().map(|shown| shown.tell.at.generation), Some(5));
         // The same refusal again changes nothing.
-        assert_eq!(peer.told(Tell { ok: Some(false), why: Some(Why::Late), ..state(9, PAUSE) }), Told::Dropped);
+        assert_eq!(peer.told(Tell { ok: Some(false), why: Some(Why::Late), ..state(9, PAUSE) }, false), Told::Dropped);
         assert_eq!(peer.outcome(), Some(Outcome::Refused(Why::Busy)));
     }
 
@@ -654,12 +687,12 @@ mod tests {
     #[test]
     fn a_success_that_arrives_after_a_refusal_of_the_same_command_corrects_it() {
         let mut peer = paused();
-        assert_eq!(peer.told(Tell { ok: Some(false), why: Some(Why::Changed), ..state(7, PAUSE) }), Told::Settled(Outcome::Refused(Why::Changed)));
-        assert_eq!(peer.told(Tell { ok: Some(true), by: Some(PAUSE), ..state(6, PAUSE) }), Told::Settled(Outcome::Done));
+        assert_eq!(peer.told(Tell { ok: Some(false), why: Some(Why::Changed), ..state(7, PAUSE) }, false), Told::Settled(Outcome::Refused(Why::Changed)));
+        assert_eq!(peer.told(Tell { ok: Some(true), by: Some(PAUSE), ..state(6, PAUSE) }, false), Told::Settled(Outcome::Done));
         assert_eq!(peer.outcome(), Some(Outcome::Done));
         // And then nothing takes it back: not the refusal again, nor the success again.
-        assert_eq!(peer.told(Tell { ok: Some(false), why: Some(Why::Changed), ..state(7, PAUSE) }), Told::Dropped);
-        assert_eq!(peer.told(Tell { ok: Some(true), by: Some(PAUSE), ..state(6, PAUSE) }), Told::Dropped);
+        assert_eq!(peer.told(Tell { ok: Some(false), why: Some(Why::Changed), ..state(7, PAUSE) }, false), Told::Dropped);
+        assert_eq!(peer.told(Tell { ok: Some(true), by: Some(PAUSE), ..state(6, PAUSE) }, false), Told::Dropped);
         assert_eq!(peer.outcome(), Some(Outcome::Done));
     }
 
@@ -669,17 +702,17 @@ mod tests {
     #[test]
     fn a_repeat_refused_while_the_command_itself_is_under_way_settles_nothing() {
         let mut peer = paused();
-        assert_eq!(peer.told(Tell { ok: Some(false), why: Some(Why::Busy), by: Some(PAUSE), busy: true, ..state(6, PAUSE) }), Told::Dropped);
+        assert_eq!(peer.told(Tell { ok: Some(false), why: Some(Why::Busy), by: Some(PAUSE), busy: true, ..state(6, PAUSE) }, false), Told::Dropped);
         assert_eq!(peer.outcome(), None);
         // Its own answer then settles it, either way.
-        assert_eq!(peer.told(Tell { ok: Some(true), by: Some(PAUSE), ..state(6, PAUSE) }), Told::Settled(Outcome::Done));
+        assert_eq!(peer.told(Tell { ok: Some(true), by: Some(PAUSE), ..state(6, PAUSE) }, false), Told::Settled(Outcome::Done));
         let mut peer = paused();
-        assert_eq!(peer.told(Tell { ok: Some(false), why: Some(Why::Busy), by: Some(PAUSE), busy: true, ..state(6, PAUSE) }), Told::Dropped);
-        assert_eq!(peer.told(Tell { ok: Some(false), why: Some(Why::Cannot), ..state(7, PAUSE) }), Told::Settled(Outcome::Refused(Why::Cannot)));
+        assert_eq!(peer.told(Tell { ok: Some(false), why: Some(Why::Busy), by: Some(PAUSE), busy: true, ..state(6, PAUSE) }, false), Told::Dropped);
+        assert_eq!(peer.told(Tell { ok: Some(false), why: Some(Why::Cannot), ..state(7, PAUSE) }, false), Told::Settled(Outcome::Refused(Why::Cannot)));
         // A refusal as busy that does not name the command is the device being busy with
         // something else: the command was not taken, and that is that.
         let mut peer = paused();
-        assert_eq!(peer.told(Tell { ok: Some(false), why: Some(Why::Busy), busy: true, ..state(5, PAUSE) }), Told::Settled(Outcome::Refused(Why::Busy)));
+        assert_eq!(peer.told(Tell { ok: Some(false), why: Some(Why::Busy), busy: true, ..state(5, PAUSE) }, false), Told::Settled(Outcome::Refused(Why::Busy)));
     }
 
     /// The double skip, from the sender's side: the only answer to arrive is the refusal of
@@ -687,15 +720,15 @@ mod tests {
     #[test]
     fn by_is_believed_whatever_else_the_tell_says() {
         let mut peer = paused();
-        assert_eq!(peer.told(Tell { ok: Some(false), why: Some(Why::Changed), by: Some(PAUSE), done: true, ..state(6, PAUSE) }), Told::Settled(Outcome::Done));
+        assert_eq!(peer.told(Tell { ok: Some(false), why: Some(Why::Changed), by: Some(PAUSE), done: true, ..state(6, PAUSE) }, false), Told::Settled(Outcome::Done));
         // And a look's answer that names it settles it before any answer of its own comes.
         let mut peer = paused();
         peer.looked(LOOK_2, 2_000);
-        assert_eq!(peer.told(Tell { by: Some(PAUSE), done: true, ..state(6, LOOK_2) }), Told::ShownAndSettled(Outcome::Done));
+        assert_eq!(peer.told(Tell { by: Some(PAUSE), done: true, ..state(6, LOOK_2) }, false), Told::ShownAndSettled(Outcome::Done));
         // Another look's answer that does not name it settles nothing.
         let mut peer = paused();
         peer.looked(LOOK_2, 2_000);
-        assert_eq!(peer.told(state(6, LOOK_2)), Told::Shown);
+        assert_eq!(peer.told(state(6, LOOK_2), false), Told::Shown);
         assert!(peer.waiting());
     }
 
@@ -709,22 +742,22 @@ mod tests {
         // A look's answer before any check: it settles nothing.
         let mut peer = paused();
         peer.looked(LOOK_2, 2_000);
-        assert_eq!(peer.told(named(LOOK_2)), Told::Shown);
+        assert_eq!(peer.told(named(LOOK_2), false), Told::Shown);
         assert!(peer.waiting());
         // Its own answer delivered again as a refusal, naming it: a refusal, not a success.
         let mut peer = paused();
-        assert_eq!(peer.told(Tell { ok: Some(false), why: Some(Why::Changed), ..named(PAUSE) }), Told::Settled(Outcome::Refused(Why::Changed)));
+        assert_eq!(peer.told(Tell { ok: Some(false), why: Some(Why::Changed), ..named(PAUSE) }, false), Told::Settled(Outcome::Refused(Why::Changed)));
         // At the check after twelve seconds: its work came to nothing.
         let mut peer = paused();
         peer.press(&Command::Next, 1_100);
         assert_eq!(peer.tick(1_000 + WAIT_MS), Tick::Check);
         peer.checking(LOOK_2, 13_000);
-        assert_eq!(peer.told(named(LOOK_2)), Told::ShownAndSettled(Outcome::Refused(Why::Cannot)));
+        assert_eq!(peer.told(named(LOOK_2), false), Told::ShownAndSettled(Outcome::Refused(Why::Cannot)));
         assert_eq!((peer.pressed(), peer.waiting()), (0, false));
         // And when the device does say it: done, by a look's answer or by its own.
         let mut peer = paused();
         peer.looked(LOOK_2, 2_000);
-        assert_eq!(peer.told(Tell { done: true, ..named(LOOK_2) }), Told::ShownAndSettled(Outcome::Done));
+        assert_eq!(peer.told(Tell { done: true, ..named(LOOK_2) }, false), Told::ShownAndSettled(Outcome::Done));
     }
 
     #[test]
@@ -736,7 +769,7 @@ mod tests {
             peer.checking(LOOK_2, 13_000);
             // Asked again before the check is answered, it does not ask twice.
             assert_eq!(peer.tick(14_000), Tick::Nothing);
-            (peer.told(answer), peer)
+            (peer.told(answer, false), peer)
         };
         // It made the state: done. The device is as it was: it had not arrived. Anything else: not known.
         assert_eq!(outcome_of(Tell { by: Some(PAUSE), done: true, ..state(6, LOOK_2) }).0, Told::ShownAndSettled(Outcome::Done));
@@ -763,15 +796,15 @@ mod tests {
         let mut peer = paused();
         peer.tick(13_000);
         peer.checking(LOOK_2, 13_000);
-        assert_eq!(peer.told(state(5, LOOK_2)), Told::ShownAndSettled(Outcome::NotReached));
-        assert_eq!(peer.told(Tell { ok: Some(true), by: Some(PAUSE), ..state(6, PAUSE) }), Told::Settled(Outcome::Done));
+        assert_eq!(peer.told(state(5, LOOK_2), false), Told::ShownAndSettled(Outcome::NotReached));
+        assert_eq!(peer.told(Tell { ok: Some(true), by: Some(PAUSE), ..state(6, PAUSE) }, false), Told::Settled(Outcome::Done));
         assert_eq!(peer.outcome(), Some(Outcome::Done));
         // And after "not known", a late refusal is believed the same.
         let mut peer = paused();
         peer.tick(13_000);
         peer.checking(LOOK_2, 13_000);
         peer.tick(13_000 + WAIT_MS);
-        assert_eq!(peer.told(Tell { ok: Some(false), why: Some(Why::Late), ..state(5, PAUSE) }), Told::Settled(Outcome::Refused(Why::Late)));
+        assert_eq!(peer.told(Tell { ok: Some(false), why: Some(Why::Late), ..state(5, PAUSE) }, false), Told::Settled(Outcome::Refused(Why::Late)));
     }
 
     /// The app is closed after a Pause is sent and opened again. The new run has a new
@@ -780,11 +813,11 @@ mod tests {
     #[test]
     fn the_sender_restarting_learns_nothing_from_what_the_old_run_asked() {
         let mut peer = Peer::default();
-        assert_eq!(peer.told(Tell { ok: Some(true), by: Some(PAUSE), ..state(6, PAUSE) }), Told::Dropped);
+        assert_eq!(peer.told(Tell { ok: Some(true), by: Some(PAUSE), ..state(6, PAUSE) }, false), Told::Dropped);
         assert_eq!((peer.outcome(), peer.shown().is_some(), peer.may_send(0)), (None, false, Err(Wait::Look)));
         // What the other device is doing, it learns from its own first look.
         peer.looked(LOOK, 0);
-        assert_eq!(peer.told(Tell { by: Some(PAUSE), ..state(6, LOOK) }), Told::Shown);
+        assert_eq!(peer.told(Tell { by: Some(PAUSE), ..state(6, LOOK) }, false), Told::Shown);
         assert_eq!(peer.outcome(), None);
     }
 }

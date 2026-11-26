@@ -945,8 +945,11 @@ impl Controller {
             return;
         }
         let in_a_jam = self.in_a_jam();
-        if !in_a_jam {
-            // (A device being steered the old way is let go of.)
+        // (A device being steered the old way is let go of: for a pick that will be
+        // taken up, and not for one the library is about to refuse, as it does a device
+        // that has just turned out not to speak as this PC does. Asked first.)
+        let taken = self.link.borrow().inner.try_borrow().is_ok_and(|inner| inner.device.pickable(place));
+        if !in_a_jam && taken {
             self.leave_jam();
         }
         self.link_event(|device, env| device.choose(place, in_a_jam, env));
