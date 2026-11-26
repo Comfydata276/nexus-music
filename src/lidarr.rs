@@ -124,6 +124,12 @@ mod origins {
             ("http://[FE80::1]/lidarr", Some(("http", "[fe80::1]", 80))),
             ("https://lidarr.example.org?x=1", Some(("https", "lidarr.example.org", 443))),
             ("https://lidarr.example.org#here", Some(("https", "lidarr.example.org", 443))),
+            // Only the origin is judged: a path is the address's own, as 0.40.10 took it, and a
+            // port is its number.
+            ("https://lidarr.example.org/musique/lidärr", Some(("https", "lidarr.example.org", 443))),
+            ("http://192.168.1.5:08686/lidarr", Some(("http", "192.168.1.5", 8686))),
+            ("http://192.168.1.5:0000008686", Some(("http", "192.168.1.5", 8686))),
+            ("https://lidarr.example.org/a b", Some(("https", "lidarr.example.org", 443))),
             // Refused: a name and password; what the client might read otherwise.
             ("https://me:secret@lidarr.example.org", None),
             ("https://evil.example@lidarr.example.org", None),
@@ -132,6 +138,7 @@ mod origins {
             ("https://lidarr.example.org:", None),
             ("https://lidarr.example.org:0", None),
             ("https://lidarr.example.org:65536", None),
+            ("https://lidarr.example.org:000", None),
             ("https://lidarr.example.org:8x", None),
             ("https://lidärr.example.org", None),
             ("https://lidarr example.org", None),
@@ -145,9 +152,14 @@ mod origins {
             let found = nexus_core::lidarr::origin(address).ok().map(|origin| (origin.scheme, origin.host, origin.port));
             let expected = expected.map(|(scheme, host, port)| (scheme.to_string(), host.to_string(), port));
             assert_eq!(found, expected, "the library's reading of {address:?}");
-            // Wherever the library goes by an address, the client goes to the same place.
-            if let Some(found) = found {
-                assert_eq!(where_the_agent_goes(address), Some(found), "the client's reading of {address:?}");
+            // Wherever the library goes by an address, the client goes to the same place, or
+            // (an address its parser won't take, by its path) nowhere.
+            if let (Some(found), Some(agent)) = (found.clone(), where_the_agent_goes(address)) {
+                assert_eq!(agent, found, "the client's reading of {address:?}");
+            }
+            // (Only a path beyond plain ASCII, or with a space, keeps the client from it.)
+            if found.is_some() && address.is_ascii() && !address.contains(' ') {
+                assert!(where_the_agent_goes(address).is_some(), "the client reads {address:?}");
             }
         }
         assert_eq!(nexus_core::lidarr::origin("https://me:secret@lidarr.example.org").unwrap_err(), nexus_core::lidarr::ADDRESS_WITH_NAME);

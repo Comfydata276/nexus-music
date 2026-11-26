@@ -164,6 +164,12 @@ fn held(vault: &dyn Vault, service: &str) -> Option<String> {
     }
 }
 
+/// Whether any token is kept at all, used or not (one kept by 0.40.10 for a service that
+/// isn't trusted, say: there to be cleared).
+pub fn any_kept(vault: &dyn Vault) -> bool {
+    read(vault, TOKEN) != Kept::Nothing
+}
+
 /// At the start: binds a token kept by 0.40.10 to the saved sign-in service, if that one is
 /// `trusted`; otherwise it's left unused (and cleared at a sign-out, sent nowhere).
 pub fn bind_old_token(vault: &dyn Vault, service: &str, trusted: bool) {
@@ -371,6 +377,7 @@ pub mod tests {
         assert_eq!(token(&vault, S), None);
         bind_old_token(&vault, S, false);
         assert_eq!(token(&vault, S), None);
+        assert!(any_kept(&vault));
         assert_eq!(vault.read(TOKEN).as_deref(), Some("old"));
         bind_old_token(&vault, S, true);
         assert_eq!(token(&vault, S).as_deref(), Some("old"));

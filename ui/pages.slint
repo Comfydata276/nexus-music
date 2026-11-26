@@ -2558,7 +2558,7 @@ export component SettingsPage inherits Rectangle {
                                                 wrap: word-wrap;
                                             }
 
-                                            if Settings.lidarr-has-token && Settings.requests-state != "waiting": HorizontalLayout {
+                                            if (Settings.lidarr-has-token || Settings.lidarr-token-unused) && Settings.requests-state != "waiting": HorizontalLayout {
                                                 alignment: start;
 
                                                 LinkText {

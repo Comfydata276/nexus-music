@@ -3733,7 +3733,13 @@ impl Controller {
         let gate = crate::gate::Found { service: settings.lidarr_gate.clone(), client: String::new() };
         page.set_lidarr_gate(gate.host().into());
         page.set_lidarr_signed_in(settings.lidarr_signed_in.as_str().into());
-        page.set_lidarr_has_token(!settings.lidarr_gate.is_empty() && crate::keep::token(&*self.vault(), &settings.lidarr_gate).is_some());
+        // "Signed in" only at a service that's believed (see `Found::trusted`); a token kept for
+        // one that's refused is offered only to be signed out of, which sends it nowhere.
+        let trusted = gate.trusted(&settings.lidarr_address).is_ok();
+        let vault = self.vault();
+        let usable = !settings.lidarr_gate.is_empty() && trusted && crate::keep::token(&*vault, &settings.lidarr_gate).is_some();
+        page.set_lidarr_has_token(usable);
+        page.set_lidarr_token_unused(!settings.lidarr_gate.is_empty() && !usable && crate::keep::any_kept(&*vault));
         drop(settings);
         self.push_jam();
     }

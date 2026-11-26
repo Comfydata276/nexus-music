@@ -328,15 +328,18 @@ pub const ADDRESS_WITH_NAME: &str = "That address has a name and password in it.
 pub const ADDRESS_UNUSABLE: &str = "That isn't an address the app can use. Enter it as, say, https://lidarr.example.org or 192.168.1.5:8686.";
 
 /// Where an address leads (see `Origin`), read as the app's HTTP client reads it, or why it
-/// can't be used. Anything the client might read differently from this is refused rather than
-/// guessed at: a backslash, a space, letters beyond plain ASCII, a port that isn't a number. A
-/// name and password in the address are refused too.
+/// can't be used. Only the origin is judged: the scheme, the host and the port (by its number,
+/// leading zeros and all). Anything there the client might read differently from this is
+/// refused rather than guessed at: a backslash, a space, letters beyond plain ASCII, a port
+/// that isn't a number. A name and password in the address are refused too. What comes after
+/// the host and port (a path) is the address's own, as it always was.
 pub fn origin(address: &str) -> Result<Origin, String> {
     let address = tidy(address);
-    if address.is_empty() || !address.is_ascii() || address.chars().any(|c| c.is_ascii_control() || c.is_ascii_whitespace() || c == '\\') {
+    let (scheme, rest) = address.split_once("://").ok_or(ADDRESS_UNUSABLE)?;
+    let judged = &address[..scheme.len() + 3 + rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+    if !judged.is_ascii() || judged.chars().any(|c| c.is_ascii_control() || c.is_ascii_whitespace() || c == '\\') {
         return Err(ADDRESS_UNUSABLE.into());
     }
-    let (scheme, rest) = address.split_once("://").ok_or(ADDRESS_UNUSABLE)?;
     let scheme = scheme.to_ascii_lowercase();
     let default = match scheme.as_str() {
         "http" => 80,
@@ -364,7 +367,7 @@ pub fn origin(address: &str) -> Result<Origin, String> {
     };
     let port = match port.strip_prefix(':') {
         None if port.is_empty() => default,
-        Some(digits) if !digits.is_empty() && digits.len() <= 5 && digits.chars().all(|c| c.is_ascii_digit()) => match digits.parse::<u16>() {
+        Some(digits) if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) => match digits.trim_start_matches('0').parse::<u16>() {
             Ok(port) if port > 0 => port,
             _ => return Err(ADDRESS_UNUSABLE.into()),
         },

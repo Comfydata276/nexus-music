@@ -69,9 +69,12 @@ fn endpoint(service: &str, path: &str) -> Option<String> {
 }
 
 /// Said when Lidarr sends the app to a sign-in it won't go to: one on plain HTTP away from the
-/// address typed for Lidarr, where the sign-in would cross the network unprotected.
+/// address typed for Lidarr, where the sign-in would cross the network unprotected. What is
+/// refused, and what makes it work.
 pub fn not_trusted(service: &str) -> String {
-    format!("The sign-in at {service} wasn't trusted: it isn't on HTTPS, and isn't where Lidarr's own address is, so signing in there would send your sign-in across the network unprotected.")
+    format!(
+        "The sign-in at {service} is refused because it isn't on https, or where Lidarr's own address is, so signing in would cross the network unprotected: put the sign-in on https, or Lidarr and the sign-in on the same host."
+    )
 }
 
 // ---- small helpers for web addresses ------------------------------------------------------------
@@ -629,6 +632,14 @@ mod tests {
             };
             Ok(crate::http::Response::new(302, vec![("Location".into(), Some(to))], || Ok(String::new())))
         }
+    }
+
+    #[test]
+    fn a_refused_sign_in_is_said_with_what_makes_it_work() {
+        assert_eq!(
+            not_trusted("auth.example.org"),
+            "The sign-in at auth.example.org is refused because it isn't on https, or where Lidarr's own address is, so signing in would cross the network unprotected: put the sign-in on https, or Lidarr and the sign-in on the same host."
+        );
     }
 
     #[test]

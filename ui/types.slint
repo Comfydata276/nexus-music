@@ -746,6 +746,9 @@ export global Settings {
     // this PC is signed in to it, and as whom.
     in property <string> lidarr-gate;
     in property <bool> lidarr-has-token;
+    // A token is kept that isn't used: for a sign-in service that's refused (see
+    // `gate::not_trusted`). Signing out clears it, sending it nowhere.
+    in property <bool> lidarr-token-unused;
     in property <string> lidarr-signed-in;
     // Where the connection stands: "none", "checking", "connected", "sign-in" (a sign-in is
     // needed), "waiting" (on the browser) or "error"; and the same in words.
