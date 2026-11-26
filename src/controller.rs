@@ -306,7 +306,7 @@ pub struct Controller {
     pub link_rule: RefCell<nexus_core::link::rule::Rule>,
     /// The choices under way in the player: who chose what is being done to it now, from
     /// which both that order and whose the queue is are worked out (see `ways`).
-    pub ways: RefCell<nexus_core::ways::Ways>,
+    pub ways: crate::ways::Choices,
     /// The new linking of a person's devices, where it is switched on (see `link`).
     pub link: RefCell<crate::link::Link>,
     /// Waits for typing in a jam's search box to pause.
@@ -461,6 +461,10 @@ pub struct Controller {
     /// When the queue last changed here (or, for one taken from another device, there), and
     /// a fingerprint of it as last saved, to tell a real change from a save of the same thing.
     pub queue_stamp: Cell<i64>,
+    /// How many times a queue has been put in the player whole (`replace_queue`): the
+    /// number of the queue that is in it now, for a move of music that waits for the
+    /// sound of the queue it put in and of no other (`link`).
+    pub queue_number: Cell<u64>,
     pub queue_sig: Cell<u64>,
     /// The shape (see `config::queue_shape`) of the queue as last written to disk.
     pub queue_saved: Cell<u64>,
@@ -528,7 +532,7 @@ impl Controller {
             jam_pool: std::sync::Arc::new(Pool::new("jam", 4, false)),
             jam: RefCell::default(),
             link_rule: RefCell::default(),
-            ways: RefCell::default(),
+            ways: Default::default(),
             link: RefCell::default(),
             jam_timer: slint::Timer::default(),
             download_pool: Pool::new("download", 2, false),
@@ -638,6 +642,7 @@ impl Controller {
             history_missing: RefCell::default(),
             queue_owner: Default::default(),
             queue_stamp: Cell::new(0),
+            queue_number: Cell::new(0),
             queue_sig: Cell::new(crate::playback::queue_fingerprint(&Playback::new(&Settings::default()))),
             queue_quiet: Cell::new(false),
             queue_saved: Cell::new(0),

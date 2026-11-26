@@ -18,6 +18,7 @@
 pub mod bind;
 pub mod command;
 pub mod device;
+pub mod find;
 pub mod frame;
 pub mod look;
 pub mod message;
@@ -29,6 +30,7 @@ pub mod secret;
 pub mod seen;
 pub mod steer;
 pub mod text;
+pub mod turn;
 pub mod view;
 pub mod words;
 
@@ -42,6 +44,32 @@ pub type Nonce = [u8; 24];
 /// A device, as it names itself to the others: made once for an installation. Not secret,
 /// and only ever sent sealed.
 pub type DeviceId = [u8; 16];
+
+/// The token the relay gives a place: what lets a device send and collect as that place
+/// until it leaves. It is not the secret (nothing can be read or sealed with it), and it is
+/// still not for a log: **its debug form shows nothing of it**, so that whatever holds one
+/// can be written out whole.
+#[derive(Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct Token(String);
+
+impl Token {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<T: Into<String>> From<T> for Token {
+    fn from(text: T) -> Token {
+        Token(text.into())
+    }
+}
+
+impl std::fmt::Debug for Token {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Token(not shown)")
+    }
+}
 
 /// How long after one look at the secret finished the next one starts.
 pub const LOOK_AGAIN_MS: u64 = 2 * 60 * 1000;
@@ -92,6 +120,20 @@ impl Asks {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_place_s_token_is_not_shown_by_whatever_holds_it() {
+        let token = Token::from("the-token-of-a-place");
+        assert_eq!((token.as_str(), format!("{token:?}")), ("the-token-of-a-place", "Token(not shown)".to_string()));
+        // What an app is asked to send, and what the relay said, written out whole.
+        let send = device::Do::Send { session: 3, token: token.clone(), to: [1; 16], frame: "a-sealed-frame".into() };
+        let entered = relay::FromRelay::Entered { place: [1; 16], token: token.clone() };
+        for shown in [format!("{send:?}"), format!("{entered:?}"), format!("{:?}", vec![send.clone()])] {
+            assert!(!shown.contains("the-token") && shown.contains("Token(not shown)"), "{shown}");
+        }
+        // It still crosses as itself where it has to (to whatever makes the request).
+        assert_eq!(serde_json::to_string(&token).unwrap(), "\"the-token-of-a-place\"");
+    }
 
     #[test]
     fn a_secret_runs_out_ten_minutes_after_its_look_began() {

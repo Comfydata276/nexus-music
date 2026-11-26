@@ -33,10 +33,10 @@ use std::time::Duration;
 
 use nexus_core::http::{Failure, Http, Request, Response};
 use nexus_core::link::command::Command;
-use nexus_core::link::device::{Brief, Device, Do, Env, Me, Player, Ready, may_go, wanted};
+use nexus_core::link::device::{Brief, Carried, Device, Do, Env, Me, Player, Ready, Sounding, may_go, wanted};
 use nexus_core::link::message::{At, Entry, Full, Handed, Why};
 use nexus_core::link::relay::{self, FromRelay, Relay};
-use nexus_core::link::rule::{Reservation, Waiting};
+use nexus_core::link::rule::{Carrying, Reservation, Waiting};
 use nexus_core::link::view::{Press, View};
 use nexus_core::link::words::Here as Kind;
 use nexus_core::link::{Nonce, look, secret, text};
@@ -115,6 +115,14 @@ fn random<const N: usize>() -> Option<[u8; N]> {
 fn slow_pause() -> Option<u64> {
     static WAIT: OnceLock<Option<u64>> = OnceLock::new();
     *WAIT.get_or_init(|| std::env::var("NEXUS_MUSIC_LINK_TEST_SLOW_PAUSE").ok()?.parse().ok())
+}
+
+/// For a test only: with `NEXUS_MUSIC_LINK_TEST_FAIL_TAKE` set, a queue brought from another
+/// device ("Play here") is not put in this PC's player, as if the player had refused it.
+/// Never set otherwise.
+fn fail_take() -> bool {
+    static FAIL: OnceLock<bool> = OnceLock::new();
+    *FAIL.get_or_init(|| std::env::var_os("NEXUS_MUSIC_LINK_TEST_FAIL_TAKE").is_some())
 }
 
 /// Writes a line of what happened to the file named by `NEXUS_MUSIC_LINK_LOG`, if any: for
@@ -238,7 +246,8 @@ struct Inner {
     live: Option<Live>,
     /// Set when the sign-in ends, for the look that is on its way to see.
     look_over: Arc<AtomicBool>,
-    /// Songs the music server was asked for because this PC's copy of the library lacked them.
+    /// Songs the music server was asked for because this PC's copy of the library lacked
+    /// them: held while the command that brought them is carried out, and then let go of.
     found: HashMap<String, Song>,
 }
 
@@ -259,6 +268,9 @@ pub struct Link {
     /// The song the sound was found to have rolled into before the window had been told:
     /// the engine's own word of it, when it comes, is not acted on twice.
     caught: Cell<u64>,
+    /// Whose the queue was before it was marked as handed to another device, while the
+    /// stop that goes with the hand-over has not yet been seen to work.
+    before_handed: RefCell<Option<Option<String>>>,
 }
 
 /// This PC's own player, as the deciding asks it. Each command is carried out by the
@@ -303,8 +315,14 @@ impl Player for Here<'_> {
         Handed::fitted(&ids, pb.queued_ahead(), pb.position, &pb.context)
     }
 
-    fn sounding_at(&self) -> Option<f64> {
-        self.ctl.sounding_at()
+    fn sounding(&self) -> Option<Sounding> {
+        // (The engine's own place in the song the player holds: sound that has come out,
+        // of the queue that is in the player now.)
+        self.ctl.sounding_at().map(|at| Sounding { queue: self.ctl.queue_number.get(), at })
+    }
+
+    fn queue(&self) -> u64 {
+        self.ctl.queue_number.get()
     }
 
     fn catch_up(&mut self) -> bool {
@@ -323,15 +341,32 @@ impl Player for Here<'_> {
         pb.order.iter().skip(pb.cursor + 1).filter_map(|&index| pb.queue.get(index)).map(|song| song.id.clone()).collect()
     }
 
-    fn carry_out(&mut self, command: &Command, ready: &Ready) {
+    fn carry_out(&mut self, command: &Command, ready: &Ready) -> Carried {
         let ctl = self.ctl;
-        // The person chose this at another of their devices. It took its place in the order
-        // when the rule let it through, so what the player does for it is not counted
-        // again; and the queue is theirs by it as it would be by the same press here.
-        let _carrying = ctl.for_another(Who::Elsewhere, true);
+        // What is so already is not done again: the functions below would count a volume
+        // set to what it is, or a queue cleared of nothing, as a change.
+        let already = {
+            let pb = ctl.playback.borrow();
+            match command {
+                Command::Volume { to } => !pb.muted && (pb.volume - (*to as f32).clamp(0.0, 1.0)).abs() < 0.001,
+                Command::Shuffle { on } => pb.shuffle == *on,
+                Command::Repeat { mode } => pb.repeat == (*mode).min(2),
+                Command::Clear { queued: true } => pb.queued_ahead() == 0,
+                Command::Clear { queued: false } => pb.order.len() <= pb.cursor + 1 + pb.queued_ahead(),
+                _ => false,
+            }
+        };
+        if already {
+            return Carried::Unchanged;
+        }
+        // The person chose this at another of their devices. The rule counts it, once, if
+        // the player changes anything for it, so the player's own counting is not added;
+        // and the queue is theirs by it as it would be by the same press here.
+        // (The stop that ends a move of music to the device that asks is nobody's.)
+        let _carrying = ctl.for_another(command.chosen_by(), true);
         match (command, ready) {
             (Command::Play, _) => ctl.set_playing_here(true),
-            (Command::Pause, _) => ctl.set_playing_here(false),
+            (Command::Pause | Command::Moved, _) => ctl.set_playing_here(false),
             (Command::Next, _) => ctl.next_track_here(),
             (Command::Previous, _) => ctl.previous_track_here(),
             (Command::Seek { to }, _) => ctl.seek_here(*to),
@@ -352,6 +387,29 @@ impl Player for Here<'_> {
             (Command::Adopt(adopt), Ready::Queue(songs, begin)) => ctl.load_queue_here(self.songs(songs.iter().map(|(id, queued)| (id, *queued))), *begin, adopt.position, &adopt.context),
             _ => {}
         }
+        // Each of those takes its way into the player only once it knows something will
+        // change (`ways`): whether one was taken is whether anything did.
+        if ctl.ways.taken() { Carried::Changed } else { Carried::Unchanged }
+    }
+
+    /// This PC's queue is another device's now. In `nexus_core::handover`'s terms it is
+    /// one taken up from that device and not touched: not saved, and it follows what that
+    /// device saves, until the person uses it here (`claim_queue`). It is another queue
+    /// for a save that was already prepared, which is then not sent.
+    fn handed_on(&mut self) -> bool {
+        log("queue: handed to another of the person's devices: not saved from here, and it follows, until it is used here");
+        *self.ctl.link.borrow().before_handed.borrow_mut() = Some(self.ctl.queue_owner.taken());
+        self.ctl.queue_owner.taken_up(nexus_core::handover::HANDED.into());
+        true
+    }
+
+    /// This PC did not stop: its queue is whose it was.
+    fn handed_back(&mut self) {
+        let was = self.ctl.link.borrow().before_handed.borrow_mut().take();
+        if let Some(was) = was {
+            log("queue: this PC did not stop, so its queue is not handed on after all");
+            self.ctl.queue_owner.handed_back(was);
+        }
     }
 
     /// (The end of a move of this PC's music to another device: the app's own doing. The
@@ -362,8 +420,14 @@ impl Player for Here<'_> {
         self.ctl.pause_here();
     }
 
-    fn take(&mut self, songs: &[(String, bool)], begin: usize, position: f64, context: &str) {
+    /// (Whether it went in is the player's own word: its queue has a new number.)
+    fn take(&mut self, songs: &[(String, bool)], begin: usize, position: f64, context: &str) -> bool {
+        if fail_take() {
+            return false;
+        }
+        let before = self.ctl.queue_number.get();
         self.ctl.load_queue_here(self.songs(songs.iter().map(|(id, queued)| (id, *queued))), begin, position, context);
+        self.ctl.queue_number.get() != before
     }
 
     fn generation(&self) -> u64 {
@@ -382,8 +446,12 @@ impl Player for Here<'_> {
         self.ctl.link_rule.borrow_mut().admit(at, minute, now_ms)
     }
 
-    fn finish(&mut self, reservation: Reservation, at: At, minute: u64, same_session: bool, nonce: Nonce) -> Result<(), Why> {
-        self.ctl.link_rule.borrow_mut().finish(reservation, at, minute, same_session, nonce)
+    fn finish(&mut self, reservation: Reservation, at: At, minute: u64, now_ms: u64, same_session: bool) -> Result<Carrying, Why> {
+        self.ctl.link_rule.borrow_mut().finish(reservation, at, minute, now_ms, same_session)
+    }
+
+    fn carried(&mut self, carrying: Carrying, changed: bool, by: Option<Nonce>) {
+        self.ctl.link_rule.borrow_mut().carried(carrying, changed, by);
     }
 
     fn refuse(&mut self, reservation: Reservation) {
@@ -445,6 +513,11 @@ impl Controller {
     /// and the random numbers it may ask for. `None` if the deciding is already at work
     /// (nothing here calls back into it while it is).
     fn link_with<T>(self: &Rc<Self>, event: impl FnOnce(&mut Device, &mut Env) -> T) -> Option<T> {
+        // (With the switch off there is no new linking: nothing of it runs, whoever calls,
+        // and this device is given no id for it.)
+        if !on() {
+            return None;
+        }
         let me = self.link_me();
         let link = self.link.borrow();
         let mut inner = link.inner.try_borrow_mut().ok()?;
@@ -517,22 +590,52 @@ impl Controller {
                         if !may_go(stop.load(Ordering::Relaxed), since.load(Ordering::Relaxed), now_ms()) {
                             return log("send: the session ended or ran out first, not sent");
                         }
-                        let status = relay::send(&crate::corehttp::Agent(crate::subsonic::make_agent_without_redirects()), &relay, &room, &token, &to, &frame);
+                        let status = relay::send(&crate::corehttp::Agent(crate::subsonic::make_agent_without_redirects()), &relay, &room, token.as_str(), &to, &frame);
                         if status != Some(200) {
                             log(format!("send: the relay answered {status:?}"));
                         }
                     });
                 }
-                Do::Find { ticket, ids } => {
-                    let client = self.client();
-                    self.link_pool().spawn(move || {
-                        let songs: Vec<Song> = ids.iter().filter_map(|id| crate::jam::find_song(id, client.as_ref())).filter(|song| song.radio_url.is_empty()).collect();
-                        post(move |ctl| {
+                // (On the app's own pool for the music server, not the two threads that send
+                // to the relay and read the secret: a long look-up holds neither of those
+                // up. And not for longer than the command it is for is waited on: the
+                // deciding gives the command up then, and a look-up of fifty songs at a
+                // server that has stopped answering must not go on holding a worker. No
+                // request of it outlives the command: `nexus_core::link::find`.)
+                Do::Find { ticket, ids, within_ms } => {
+                    let account = self.settings.borrow().account();
+                    let began = std::time::Instant::now();
+                    self.request(
+                        move |client| {
+                            // The ones this PC's copy of the library has need no asking;
+                            // the rest are asked of the music server, each request given
+                            // what is left of the command's time and no more (the time
+                            // spent waiting for a worker is part of it).
+                            let index = crate::search::current();
+                            let kept = |id: &String| index.as_ref().and_then(|index| index.library.songs.iter().find(|song| song.id == *id).cloned());
+                            let lacking: Vec<String> = ids.iter().filter(|id| kept(id).is_none()).cloned().collect();
+                            let offline = client.clone();
+                            let http = LookHttp { agent: crate::corehttp::Agent(crate::subsonic::make_agent_without_redirects()), over: Arc::new(AtomicBool::new(false)), offline: Box::new(move || offline.is_offline()) };
+                            let mut found = nexus_core::link::find::find(&http, &client.link_account(), &lacking, Duration::from_millis(within_ms), &mut || began.elapsed());
+                            Ok(ids.iter().filter_map(|id| kept(id).or_else(|| found.iter().position(|song| song.id == *id).map(|at| found.remove(at)))).filter(|song| song.radio_url.is_empty()).collect::<Vec<Song>>())
+                        },
+                        move |ctl, songs| {
+                            // Before anything it found is kept: is a command still waiting
+                            // for it, under the sign-in it was started for? One that was
+                            // given up, and one from before a change of account, is not.
+                            let waited_for = ctl.settings.borrow().account() == account && ctl.link.borrow().inner.borrow().device.awaits(ticket);
+                            if !waited_for {
+                                return log("found: nothing is waiting for these songs any longer, not kept");
+                            }
+                            let songs = songs.unwrap_or_default();
                             let found: Vec<String> = songs.iter().map(|song| song.id.clone()).collect();
-                            ctl.link.borrow().inner.borrow_mut().found.extend(songs.into_iter().map(|song| (song.id.clone(), song)));
+                            // (Kept for as long as the command they are for is being
+                            // carried out, and no longer.)
+                            ctl.link.borrow().inner.borrow_mut().found = songs.into_iter().map(|song| (song.id.clone(), song)).collect();
                             ctl.link_event(|device, env| device.found(ticket, found, env));
-                        });
-                    });
+                            ctl.link.borrow().inner.borrow_mut().found.clear();
+                        },
+                    )
                 }
                 Do::Later { ticket, after_ms } => {
                     let ctl = self.clone();
@@ -588,7 +691,7 @@ impl Controller {
             let mut tell = |from: FromRelay| {
                 post(move |ctl| match from {
                     FromRelay::Says(note) => ctl.link.borrow().inner.borrow_mut().device.said(session, note),
-                    FromRelay::NoRandom => ctl.link_event(|device, env| device.out_of_random(env.me.here)),
+                    FromRelay::NoRandom => ctl.link_event(|device, env| device.out_of_random(env)),
                     FromRelay::Entered { place, token } => ctl.link.borrow().inner.borrow_mut().device.entered(session, place, token),
                     FromRelay::Heard { places, frames } => ctl.link_event(|device, env| device.heard(session, &places, &frames, env)),
                     FromRelay::Left => ctl.link.borrow().inner.borrow_mut().device.left(session),
@@ -629,15 +732,13 @@ impl Controller {
         if !on() {
             return;
         }
-        let asked = self.link.borrow().inner.borrow_mut().device.setting(link_my_devices);
-        self.link_do(asked);
+        self.link_event(|device, env| device.setting(link_my_devices, env));
         self.link_show();
     }
 
     /// Ends everything of this sign-in's: at sign-out, and as the app closes.
     pub fn link_stop(self: &Rc<Self>) {
-        let asked = self.link.borrow().inner.borrow_mut().device.stop();
-        self.link_do(asked);
+        self.link_event(|device, env| device.stop(env));
     }
 
     /// "Reset linking" was pressed.
@@ -645,8 +746,7 @@ impl Controller {
         if !on() {
             return;
         }
-        let asked = self.link.borrow().inner.borrow_mut().device.reset();
-        self.link_do(asked);
+        self.link_event(|device, env| device.reset(env));
         self.link_show();
     }
 
@@ -851,8 +951,13 @@ mod tests {
         for (name, comment, kept) in [
             ("Morning mix", "For the walk to work", true),
             ("Nexus Music link", RECORD, false),
-            ("Nexus Music link", "", false),
             ("Nexus Music sync", "", false),
+            // A playlist of the person's own that only has the name, or whose description
+            // only looks like a record: theirs, and kept as any other.
+            ("Nexus Music link", "", true),
+            ("Nexus Music link", "Songs for linking arms to", true),
+            ("Road trip", r#"{"nexus_music_link":null}"#, true),
+            ("Road trip", r#"{"nexus_music_link":1,"secret":"not one"}"#, true),
             // Renamed on the music server's own page: an ordinary playlist to every listing,
             // and its comment is still the record.
             ("Renamed elsewhere", RECORD, false),

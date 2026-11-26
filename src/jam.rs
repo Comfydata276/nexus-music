@@ -225,6 +225,8 @@ pub struct Hosting {
     link: String,
     /// Who's here: each guest's id and name.
     guests: Vec<(String, String)>,
+    /// Who the host has removed. Nothing of theirs that was still under way is carried out.
+    removed: nexus_core::jam::Removed,
     /// Who added which of the songs still to come: song id to the guest's id and name.
     added: HashMap<String, (String, String)>,
     out: mpsc::Sender<Out>,
@@ -806,6 +808,7 @@ impl Controller {
             owners: HashSet::new(),
             link,
             guests: Vec::new(),
+            removed: Default::default(),
             added: HashMap::new(),
             out,
             stop,
@@ -891,6 +894,9 @@ impl Controller {
         if let Some(hosting) = self.jam.borrow_mut().hosting.as_mut() {
             let _ = hosting.out.send(Out::Remove(guest.to_string()));
             hosting.guests.retain(|(id, _)| id != guest);
+            // (What they asked before this, and has not been carried out yet, is dropped:
+            // see `jam_admits` and `jam_asked`.)
+            hosting.removed.add(guest);
         }
         self.show_hosting();
     }
@@ -901,6 +907,11 @@ impl Controller {
     fn jam_admits(&self, serial: u64, event: &Value) -> bool {
         let jam = self.jam.borrow();
         let Some(hosting) = jam.hosting.as_ref().filter(|hosting| hosting.serial == serial) else { return false };
+        // A guest the host has removed is not answered: the relay has stopped taking what
+        // they ask, and this is one it had passed on already.
+        if hosting.removed.has(event["guest"]["id"].as_str().unwrap_or("")) {
+            return false;
+        }
         let cover = event["kind"].as_str() == Some("cover");
         let action = if cover { "cover" } else { event["action"].as_str().unwrap_or("") };
         // Covers are asked for by address and carry no word: only a jam's guests get them.
@@ -927,6 +938,11 @@ impl Controller {
     /// when that's what was asked, as far as the library has them.
     fn jam_asked(self: &Rc<Self>, serial: u64, ask: u64, guest: (String, String), action: &str, data: &Value, songs: Vec<Song>) {
         let Some(session) = self.jam.borrow().hosting.as_ref().filter(|hosting| hosting.serial == serial).map(Hosting::session) else { return };
+        // Removed by the host while what they asked for was being looked up: it is dropped.
+        // Nothing is queued, nothing is played, and nobody is answered.
+        if self.jam.borrow().hosting.as_ref().is_some_and(|hosting| hosting.removed.has(&guest.0)) {
+            return;
+        }
         // One of this person's own devices says so with a word only copies signed in to
         // their account can work out. It has the run of this one.
         let own = {
@@ -1339,7 +1355,9 @@ impl Controller {
             if let Some(host) = body["host"].as_str() {
                 joined.host = host.to_string();
             }
-            joined.heard = body;
+            // (Somebody else's JSON, which this PC's own presses are written into: its
+            // shape is made sure of as it is kept.)
+            joined.heard = nexus_core::jam::heard(body);
             joined.heard_at = Instant::now();
             joined.trouble.clear();
         }

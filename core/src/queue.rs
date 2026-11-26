@@ -123,9 +123,45 @@ pub fn follow_list(
     Lineup { songs: new_songs, origins: new_origins, order: new_order, cursor: new_cursor }
 }
 
+/// How far into a song a queue says it is, **made safe where it comes in**: from another
+/// device, from the server's saved queue, from a file. Nothing negative and nothing that
+/// is not a number; nothing past the song's length where that is known (`duration`, in
+/// seconds; 0 for not known); and nothing past a day where it is not.
+pub fn place_in_song(seconds: f64, duration: u32) -> f64 {
+    let most = if duration > 0 { f64::from(duration) } else { 86_400.0 };
+    if seconds.is_finite() { seconds.clamp(0.0, most) } else { 0.0 }
+}
+
+/// A place in a song as a length of time, **whatever number it is handed**: what is not a
+/// number, or is below nothing, is nothing; what is beyond a day is a day. (Turning a
+/// number of seconds into a `Duration` stops the app if the number is too large.)
+pub fn span(seconds: f64) -> std::time::Duration {
+    std::time::Duration::try_from_secs_f64(place_in_song(seconds, 0)).unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A queue handed over by another device says how far into the song it is, and the app
+    /// took the number as it came: a large enough one stopped it, where the system's media
+    /// controls are told the position (0.40.10 and before).
+    #[test]
+    fn a_place_in_a_song_is_made_safe_whatever_number_is_handed() {
+        // As it should be: left as it is.
+        assert_eq!((place_in_song(12.5, 200), place_in_song(12.5, 0), place_in_song(0.0, 200)), (12.5, 12.5, 0.0));
+        // Past the end of the song, where its length is known; past a day, where it is not.
+        assert_eq!((place_in_song(1e18, 200), place_in_song(201.0, 200), place_in_song(1e18, 0), place_in_song(86_401.0, 0)), (200.0, 200.0, 86_400.0, 86_400.0));
+        // Below nothing, and not a number at all.
+        for not_one in [-1.0, -1e300, f64::NAN, f64::INFINITY, f64::NEG_INFINITY, f64::MAX, f64::MIN] {
+            let made = place_in_song(not_one, 0);
+            assert!(made == 0.0 || made == 86_400.0, "{not_one} became {made}");
+            assert!((0.0..=200.0).contains(&place_in_song(not_one, 200)), "{not_one}");
+            // And it becomes a length of time without stopping anything.
+            assert!(span(not_one) <= std::time::Duration::from_secs(86_400), "{not_one}");
+        }
+        assert_eq!((span(1.5), span(-3.0), span(f64::NAN), span(1e300)), (std::time::Duration::from_millis(1500), std::time::Duration::ZERO, std::time::Duration::ZERO, std::time::Duration::from_secs(86_400)));
+    }
 
     fn named(id: &str) -> Song {
         Song { id: id.to_string(), ..Default::default() }

@@ -55,6 +55,11 @@ jobs:
           restore-keys: |
             check-${{ runner.os }}-${{ env.RUST_VERSION }}-
 
+      # What the compiler cannot see: a cell of the controller borrowed twice at once, which
+      # closes the released app (see the top of scripts/borrow-audit.py).
+      - name: Audit the borrows
+        run: python3 scripts/borrow-audit.py --self-test && python3 scripts/borrow-audit.py
+
       - name: Build
         run: cargo build --locked --workspace
 
@@ -87,6 +92,12 @@ jobs:
           key: check-${{ runner.os }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             check-${{ runner.os }}-${{ env.RUST_VERSION }}-
+
+      # (The same source is read on Linux; here it shows the script runs where the app is
+      # used, with that system's Python and its way of reading files.)
+      - name: Audit the borrows
+        shell: bash
+        run: python scripts/borrow-audit.py --self-test && python scripts/borrow-audit.py
 
       - name: Test
         shell: bash

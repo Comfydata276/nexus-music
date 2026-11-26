@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # Compile for Linux inside the dev container and print only the diagnostics. Exits with
-# cargo's own status, so a build that fails is a failure here too.
+# cargo's own status, so a build that fails is a failure here too. Before the build, the
+# audit of borrows: a fault there is a failure here as well.
 cd "$(dirname "$0")/.."
+# First, what the compiler cannot see: a cell of the controller borrowed twice at once (see
+# the top of scripts/borrow-audit.py). The script is tested on the fault it exists for, and
+# then reads the app's source. A second or so, and no build.
+python="$(command -v python3 || command -v python)" || { echo "scripts/check: there is no Python here to run scripts/borrow-audit.py with" >&2; exit 1; }
+"$python" scripts/borrow-audit.py --self-test && "$python" scripts/borrow-audit.py || exit 1
 scripts/dx cargo build "$@" 2>&1 | grep -vE "^\s*(Compiling|Downloading|Downloaded|Locking|Adding|Updating|Blocking|Fresh)" | grep -v "^warning: unused manifest\|consider removing the dependency\|^help: consider removing" | head -${LINES_MAX:-120}
 exit "${PIPESTATUS[0]}"

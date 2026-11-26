@@ -748,6 +748,11 @@ fn host_state(relay: &Relay, mut request: Request, id: &str, out: &mut Outbox) {
         Ok(body) => body,
         Err(refusal) => return out.push(request, refusal),
     };
+    // A jam's state is an object. Anything else is not one, and is not passed on to
+    // guests, whose apps write what they press into it.
+    if !body.is_object() {
+        return out.push(request, error(400, "That wasn't understood."));
+    }
     let mut jams = relay.jams.lock().unwrap();
     let jam = match host_jam(&mut jams, id, &request) {
         Ok(jam) => jam,
@@ -1201,6 +1206,23 @@ mod tests {
         let refused: Vec<u16> = (0..14).map(|_| ask(to, "GET", "/api/hello", "guess", Value::Null).0).collect();
         assert!(refused[..10].iter().all(|status| *status == 401), "{refused:?}");
         assert!(refused[11..].iter().all(|status| *status == 429), "{refused:?}");
+    }
+
+    /// A jam's state is an object. A guest's app writes what its person presses into the
+    /// state it was sent, and an app handed a number there stopped (0.40.10 and before).
+    #[test]
+    fn a_state_that_is_not_an_object_is_refused_and_not_passed_on() {
+        let to = relay(|_| {});
+        let (id, secret) = jam(to);
+        let (token, _) = join(to, &id, "Sam");
+        let state = json!({"playing": true, "queue": []});
+        assert_eq!(ask(to, "POST", &format!("/api/host/{id}/state"), &secret, state.clone()).0, 200);
+        for not_one in [json!(7), json!("playing"), json!([1, 2]), json!(true)] {
+            assert_eq!(ask(to, "POST", &format!("/api/host/{id}/state"), &secret, not_one.clone()).0, 400, "{not_one}");
+        }
+        // The guest still has the state that was one.
+        let (_, seen) = ask(to, "GET", &format!("/api/jam/{id}/state?v=0"), &token, Value::Null);
+        assert_eq!(seen["state"], state);
     }
 
     #[test]

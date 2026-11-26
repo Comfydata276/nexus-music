@@ -132,6 +132,13 @@ pub enum Why {
     Invalid,
     /// The device could not do it.
     Cannot,
+    /// There was nothing to do: the device was already as the command asked (playing, for a
+    /// Play; at that volume). Said with `ok`, not as a refusal: nothing was changed, nothing
+    /// moved, and the command is not the one that made the state.
+    Nothing,
+    /// The device asked its player and could not learn what came of it. It may have been
+    /// carried out. The state in the answer is the player's, asked afresh.
+    Unknown,
 }
 
 impl Why {
@@ -142,11 +149,13 @@ impl Why {
             Why::Late => "late",
             Why::Invalid => "invalid",
             Why::Cannot => "cannot",
+            Why::Nothing => "nothing",
+            Why::Unknown => "unknown",
         }
     }
 
     fn read(text: &str) -> Option<Why> {
-        [Why::Changed, Why::Busy, Why::Late, Why::Invalid, Why::Cannot].into_iter().find(|why| why.text() == text)
+        [Why::Changed, Why::Busy, Why::Late, Why::Invalid, Why::Cannot, Why::Nothing, Why::Unknown].into_iter().find(|why| why.text() == text)
     }
 }
 
@@ -218,8 +227,11 @@ impl Full {
     pub fn fitted(position: f64, now: Option<Entry>, coming: impl Iterator<Item = Entry>, context: &str, shuffle: bool, repeat: u8, volume: f64) -> Full {
         let (mut queue, mut used, mut more) = (Vec::new(), 0usize, 0u64);
         for entry in coming {
-            let cost = entry.value().to_string().len() + 1;
-            if more > 0 || queue.len() >= MOST_SHOWN || used + cost > MOST_SHOWN_BYTES {
+            // (Once no more fit, the rest are only counted: what one would have cost is
+            // not worked out for a queue of thousands.)
+            let fits = more == 0 && queue.len() < MOST_SHOWN;
+            let cost = if fits { entry.value().to_string().len() + 1 } else { 0 };
+            if !fits || used + cost > MOST_SHOWN_BYTES {
                 more += 1;
                 continue;
             }
@@ -299,7 +311,8 @@ impl Handed {
         Some(Handed {
             queued: fields.get("queued")?.as_u64().filter(|queued| (*queued as usize) < songs.len().max(1))? as usize,
             songs,
-            position: fields.get("position")?.as_f64().filter(|at| at.is_finite() && *at >= 0.0)?,
+            // (A day is longer than any song: the bound a queue sent as a command has.)
+            position: fields.get("position")?.as_f64().filter(|at| at.is_finite() && (0.0..=86_400.0).contains(at))?,
             context: text::cut(fields.get("context").map_or(Some(""), Value::as_str)?, MOST_CONTEXT),
             more: fields.get("more").map_or(Some(0), Value::as_u64)?,
         })
@@ -319,8 +332,16 @@ pub struct Tell {
     pub at: At,
     /// A choice has been accepted and not yet carried out, or its work is still under way.
     pub busy: bool,
-    /// The nonce of the command last carried out, if nothing has been chosen since.
+    /// The nonce of the command last carried out, if nothing has been chosen since; or,
+    /// while busy, of the command the device is busy with.
     pub by: Option<Nonce>,
+    /// **The command named in `by` was carried out, to its end.** Not said while the
+    /// device is still at work on it (its songs are being looked up; the queue it brought
+    /// has not sounded), nor if that work came to nothing (the queue never sounded). It is
+    /// the only thing a sender takes for "done" when it has no answer of its own: `by`
+    /// alone, and `by` with a device that is no longer busy, say who made the state and
+    /// not how it ended.
+    pub done: bool,
     pub playing: bool,
     pub title: String,
     pub artist: String,
@@ -353,6 +374,9 @@ impl Tell {
         }
         if let Some(by) = &self.by {
             fields.insert("by".into(), json!(text::nonce(by)));
+        }
+        if self.done {
+            fields.insert("done".into(), json!(true));
         }
         fields.insert("playing".into(), json!(self.playing));
         fields.insert("title".into(), json!(text::cut(&self.title, MOST_TEXT)));
@@ -423,6 +447,7 @@ pub fn read_tell(message: &[u8]) -> Option<Tell> {
         at: at(fields.get("at")?)?,
         busy: flag("busy")?.unwrap_or(false),
         by: nonce("by")?,
+        done: flag("done")?.unwrap_or(false),
         playing: fields.get("playing")?.as_bool()?,
         title: words("title")?,
         artist: words("artist")?,
@@ -436,11 +461,22 @@ pub fn read_tell(message: &[u8]) -> Option<Tell> {
 mod tests {
     use super::*;
 
+    /// Where in the song a queue handed over says it is: a number another device made.
+    #[test]
+    fn a_queue_handed_over_names_a_place_no_later_than_a_day_into_its_song() {
+        let handed = |position: Value| Handed::read(&json!({"songs": ["s1", "s2"], "queued": 0, "position": position, "context": "", "more": 0}));
+        assert_eq!(handed(json!(12.5)).map(|handed| handed.position), Some(12.5));
+        assert!(handed(json!(0)).is_some() && handed(json!(86_400)).is_some());
+        for not_one in [json!(86_400.5), json!(1e18), json!(1.7e308), json!(-0.5), json!("12"), Value::Null] {
+            assert_eq!(handed(not_one.clone()), None, "{not_one}");
+        }
+    }
+
     const MOST_ASK: usize = super::super::command::MOST_SIMPLE;
     const MOST_TELL: usize = MOST_BRIEF;
 
     fn tell() -> Tell {
-        Tell { re: Some([0x60; 24]), ok: Some(true), why: None, device: [0x81; 16], name: "Phone".into(), at: At { generation: 8, minute: 12 }, busy: false, by: Some([0x60; 24]), playing: false, title: "Song".into(), artist: "Artist".into(), steering: String::new(), full: None, queue: None }
+        Tell { re: Some([0x60; 24]), ok: Some(true), why: None, device: [0x81; 16], name: "Phone".into(), at: At { generation: 8, minute: 12 }, busy: false, by: Some([0x60; 24]), done: true, playing: false, title: "Song".into(), artist: "Artist".into(), steering: String::new(), full: None, queue: None }
     }
 
     #[test]
@@ -513,11 +549,16 @@ mod tests {
         let told = tell();
         assert_eq!(read_tell(told.text().as_bytes()), Some(told.clone()));
         // The design's own, as its vector has it.
-        let vector = br#"{"re":"YGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3","ok":true,"device":"gYKDhIWGh4iJiouMjY6PkA","name":"Phone","at":[8,12],"by":"YGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3","playing":false,"title":"Song","artist":"Artist"}"#;
+        let vector = br#"{"re":"YGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3","ok":true,"device":"gYKDhIWGh4iJiouMjY6PkA","name":"Phone","at":[8,12],"by":"YGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3","done":true,"playing":false,"title":"Song","artist":"Artist"}"#;
         let read = read_tell(vector).unwrap();
-        assert_eq!((read.re.map(|re| re[0]), read.device[0], read.at, read.by == read.re, read.busy), (Some(0x60), 0x81, At { generation: 8, minute: 12 }, true, false));
+        assert_eq!((read.re.map(|re| re[0]), read.device[0], read.at, read.by == read.re, read.busy, read.done), (Some(0x60), 0x81, At { generation: 8, minute: 12 }, true, false, true));
+        // A tell that names a command and does not say it was carried out to its end does
+        // not say so: left out is "no", and it must be true or false where it is there.
+        let unsaid = String::from_utf8_lossy(vector).replace(r#""done":true,"#, "");
+        assert_eq!(read_tell(unsaid.as_bytes()).map(|tell| (tell.by.is_some(), tell.done)), Some((true, false)));
+        assert_eq!(read_tell(String::from_utf8_lossy(vector).replace(r#""done":true"#, r#""done":"yes""#).as_bytes()), None);
         // What need not be there, isn't: a state nobody asked a command of, with nothing playing.
-        let bare = Tell { re: None, ok: None, why: None, by: None, busy: true, title: String::new(), artist: String::new(), ..told.clone() };
+        let bare = Tell { re: None, ok: None, why: None, by: None, done: false, busy: true, title: String::new(), artist: String::new(), ..told.clone() };
         assert_eq!(bare.text(), r#"{"artist":"","at":[8,12],"busy":true,"device":"gYGBgYGBgYGBgYGBgYGBgQ","name":"Phone","playing":false,"title":""}"#);
         assert_eq!(read_tell(bare.text().as_bytes()), Some(bare));
         let refused = Tell { ok: Some(false), why: Some(Why::Busy), ..told };
