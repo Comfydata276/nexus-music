@@ -406,6 +406,9 @@ pub struct Controller {
     /// What's been asked for and is being watched for, and a count that paces the watching.
     pub asked: RefCell<crate::asked::AskedList>,
     asked_ticks: Cell<u32>,
+    /// A note of the batch being asked for couldn't be written down; and whether that has
+    /// been said (once per batch: see `bulk_event`).
+    bulk_unnoted: Cell<(bool, bool)>,
     /// Counts ticks, to refresh the Requests page now and then while it's open.
     requests_ticks: Cell<u32>,
     /// The search on screen: everything it found, which kind of result it's narrowed to
@@ -593,6 +596,7 @@ impl Controller {
                 crate::asked::AskedList::load(&paths.asked)
             }),
             asked_ticks: Cell::new(0),
+            bulk_unnoted: Cell::new((false, false)),
             requests_ticks: Cell::new(0),
             search_whole: RefCell::new(None),
             search_filter: Cell::new(0),
@@ -1898,6 +1902,7 @@ impl Controller {
         if !crate::bulk::unfinished() {
             return;
         }
+        self.bulk_unnoted.set((false, false));
         crate::bulk::run(lidarr, |event| post(move |ctl| ctl.bulk_event(event)));
     }
 
@@ -1909,15 +1914,26 @@ impl Controller {
                 for note in &notes {
                     crate::lidarr::mark(&note.album, true);
                 }
-                self.asked.borrow_mut().add_all(notes);
+                if !self.asked.borrow_mut().add_all(notes) {
+                    self.bulk_unnoted.set((true, self.bulk_unnoted.get().1));
+                }
                 self.invalidate("requests");
             }
             Event::Forgot(gone) => {
                 let mut asked = self.asked.borrow_mut();
                 for album in gone {
-                    asked.forget(&album.album, &album.title, &album.artist);
+                    if !asked.forget(&album.album, &album.title, &album.artist) {
+                        self.bulk_unnoted.set((true, self.bulk_unnoted.get().1));
+                    }
                     crate::lidarr::mark(&album.album, false);
                 }
+            }
+            // Notes that couldn't be written down are said once for the batch, in place of its
+            // summary (the Requests page has the counts).
+            Event::Asked if self.bulk_unnoted.get() == (true, false) => {
+                self.bulk_unnoted.set((true, true));
+                self.toast(nexus_core::requests::asked_unnoted_batch("computer"));
+                self.reload_requests();
             }
             Event::Asked => {
                 let summary = crate::bulk::summary();
@@ -1935,6 +1951,10 @@ impl Controller {
                 } else if summary.unknown + summary.failed == 0 {
                     // Nothing left to say about it.
                     crate::bulk::clear();
+                }
+                if self.bulk_unnoted.get() == (true, false) {
+                    self.bulk_unnoted.set((true, true));
+                    self.toast(nexus_core::requests::asked_unnoted_batch("computer"));
                 }
                 self.refresh_outside();
                 self.reload_requests();
@@ -2112,9 +2132,9 @@ impl Controller {
             post(move |ctl| {
                 match result {
                     Ok(()) => {
-                        ctl.asked.borrow_mut().forget(&album, &title, &artist);
+                        let noted = ctl.asked.borrow_mut().forget(&album, &title, &artist);
                         crate::lidarr::mark(&album, false);
-                        ctl.toast(nexus_core::requests::off_the_list(&title));
+                        ctl.toast(if noted { nexus_core::requests::off_the_list(&title) } else { nexus_core::requests::off_the_list_unnoted(&title, "computer") });
                     }
                     Err(reason) => ctl.toast(reason),
                 }

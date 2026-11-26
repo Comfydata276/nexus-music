@@ -119,25 +119,28 @@ impl AskedList {
         self.save()
     }
 
-    /// Notes several things asked for at once.
-    pub fn add_all(&mut self, asked: Vec<Asked>) {
+    /// Notes several things asked for at once. Says whether they were written down.
+    pub fn add_all(&mut self, asked: Vec<Asked>) -> bool {
         if asked.is_empty() {
-            return;
+            return true;
         }
         for one in asked {
             nexus_core::asked::put(&mut self.items, one);
         }
-        self.save();
+        self.save()
     }
 
-    /// Stops watching for an album that's been taken off Lidarr's list.
-    pub fn forget(&mut self, album: &str, title: &str, artist: &str) {
+    /// Stops watching for an album that's been taken off Lidarr's list. Says whether that was
+    /// written down (or there was nothing to write): if not, the note may come back when the
+    /// app starts again.
+    pub fn forget(&mut self, album: &str, title: &str, artist: &str) -> bool {
         if self.held {
             self.gone.push((album.to_string(), title.to_string(), artist.to_string()));
         }
         if nexus_core::asked::forget(&mut self.items, album, title, artist) || self.held {
-            self.save();
+            return self.save();
         }
+        true
     }
 
     /// Whether anything asked for is still on its way, or has songs still to go into
@@ -312,6 +315,11 @@ mod tests {
         assert!(!list.add(Asked { album: "rg1".into(), title: "Cradlesong".into(), artist: "Rob Thomas".into(), ..Default::default() }));
         // Still followed up while the app is open.
         assert_eq!(shared().iter().filter(|asked| asked.album == "rg1" && asked.title == "Cradlesong").count(), 1);
+        // A batch's notes, and a cancellation, say so too.
+        assert!(!list.add_all(vec![Asked { album: "rg2".into(), title: "Parachutes".into(), artist: "Coldplay".into(), ..Default::default() }]));
+        assert!(!list.forget("rg1", "Cradlesong", "Rob Thomas"));
+        // (Nothing to write is nothing that failed.)
+        assert!(list.forget("rg-none", "Nothing", "Nobody") && list.add_all(Vec::new()));
     }
 
     #[test]

@@ -797,6 +797,18 @@ pub fn asked_unnoted(title: &str, device: &str) -> String {
     format!("Asked for “{title}”, but this {device} couldn't note it to say when it arrives.")
 }
 
+/// The same for a batch of albums asked for at once (see `bulk`): said once for the batch,
+/// however many of its notes couldn't be kept.
+pub fn asked_unnoted_batch(device: &str) -> String {
+    format!("Albums in this batch are on Lidarr's list, but this {device} couldn't note them to say when they arrive.")
+}
+
+/// What's said once an album has been taken off Lidarr's list (see `off_the_list`), when that
+/// couldn't be noted on this `device`: the note of it may come back, and its arrival be said.
+pub fn off_the_list_unnoted(title: &str, device: &str) -> String {
+    format!("“{title}” is off the list, but this {device} couldn't note that, so its arrival may still be announced.")
+}
+
 /// Said on the Requests page when the list of what was asked for on this `device` couldn't be
 /// read: what's on its way still is, as Lidarr says, but what arrives of what was asked for
 /// before won't be said, or put into the playlists waiting for it.
@@ -1134,6 +1146,8 @@ mod tests {
         assert_eq!(asking_for("Title"), "Asking for “Title”…");
         assert_eq!(asked_sentence("Title"), "Asked for “Title”. It'll be in your library once it arrives.");
         assert_eq!(asked_unnoted("Title", "computer"), "Asked for “Title”, but this computer couldn't note it to say when it arrives.");
+        assert_eq!(asked_unnoted_batch("phone"), "Albums in this batch are on Lidarr's list, but this phone couldn't note them to say when they arrive.");
+        assert_eq!(off_the_list_unnoted("Title", "computer"), "“Title” is off the list, but this computer couldn't note that, so its arrival may still be announced.");
         assert_eq!(
             asked_unreadable("phone"),
             "The list of what was asked for on this phone couldn't be read, so albums asked for before won't be said to have arrived, or put into the playlists waiting for them. What's on its way is still shown."
