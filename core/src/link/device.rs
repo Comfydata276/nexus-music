@@ -384,8 +384,9 @@ struct Steering {
 
 /// Music is being brought here from another device.
 enum Take {
-    /// Its queue has been asked for.
-    Asked { place: Place, nonce: Nonce, name: String, pressed_ms: u64 },
+    /// Its queue has been asked for. (`generation`: this device's own when it was asked.
+    /// If anything is chosen here before the queue comes, the queue is not taken.)
+    Asked { place: Place, nonce: Nonce, name: String, pressed_ms: u64, generation: u64 },
     /// Its queue is loaded here, and this device's sound is awaited: `heard_from` is where
     /// in the song the sound was when it was first heard on it. This device is busy to the
     /// others until then (`waiting`): what it holds is about to become what is sounding.
@@ -1878,7 +1879,7 @@ impl Device {
                 if let Some(seen) = self.peer_mut(&place) {
                     seen.peer.looked(nonce, now);
                 }
-                self.take = Some(Take::Asked { place, nonce, name: name.clone(), pressed_ms: now });
+                self.take = Some(Take::Asked { place, nonce, name: name.clone(), pressed_ms: now, generation: env.player.generation() });
                 out.push(Do::Log(format!("take: asked {name} for its queue")));
             }
             None => {
@@ -1892,13 +1893,19 @@ impl Device {
     /// The queue that was asked for has arrived: it is taken and started here. The other
     /// device is paused once this one sounds (`moves`).
     fn took(&mut self, from: Place, handed: Option<Handed>, at: At, playing: bool, env: &mut Env, out: &mut Vec<Do>) {
-        let Some(Take::Asked { name, pressed_ms, .. }) = self.take.take() else { return };
+        let Some(Take::Asked { name, pressed_ms, generation, .. }) = self.take.take() else { return };
         // The player is this device's own from here, whatever comes of it.
         self.let_go_into(out);
         let Some(handed) = handed.filter(|handed| playing && !handed.songs.is_empty()) else {
             // Nothing was playing there to bring over: it is just let go of.
             return out.push(Do::Log(format!("take: {name} was not playing anything")));
         };
+        // Something was chosen here while the queue was on its way (a Next from a car, say):
+        // that choice stands. The queue is not put in, and nothing is stopped there.
+        if env.player.generation() != generation {
+            out.push(Do::Log(format!("take: something was chosen here since {name}'s queue was asked for; it is not taken")));
+            return self.say(words::chosen_here_meanwhile(&name), out);
+        }
         let (songs, begin) = known(env.library, &handed.songs, 0, handed.queued);
         if songs.is_empty() {
             return self.say(words::none_of_those_songs(&name, env.me.here), out);

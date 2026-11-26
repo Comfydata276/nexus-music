@@ -1907,6 +1907,25 @@ fn a_queue_that_comes_after_its_time_is_not_taken_whether_or_not_a_tick_has_run(
     assert_eq!(world.copies[A].player.queue.len(), 8);
 }
 
+/// "Play here" has asked for the other device's queue, and before it comes Next is
+/// pressed here, on this device's own queue (by a car, say). What was chosen here stands:
+/// the queue that comes is not put in, nothing is stopped there, and the person is told.
+#[test]
+fn a_queue_that_comes_after_something_was_chosen_here_is_not_taken() {
+    let mut world = taking(|world| world.path.hold_tells = true);
+    world.copies[A].player.own_next();
+    let chosen = world.copies[A].player.generation();
+    world.release_tells();
+    world.pass(1_000);
+    let a = &world.copies[A].player;
+    assert_eq!((said(&world), a.queue.clone(), a.cursor, a.generation()), ("Something else was chosen here, so Copy B was left as it is: it is still playing.", vec!["a0".to_string(), "a1".into(), "a2".into()], 1, chosen));
+    assert_eq!((world.copies[A].window.clone(), world.copies[B].player.playing, world.copies[B].player.did.clone()), (None, true, Vec::<String>::new()));
+    // Nothing chosen here meanwhile, and it is taken.
+    let mut world = taking(|world| world.path.hold_tells = true);
+    world.release_tells();
+    assert_eq!(world.copies[A].player.queue.len(), 8);
+}
+
 /// "Play here": while the queue it took has not sounded, the device that took it is in
 /// the middle of something to the others; if it never sounds it is stopped, not left to
 /// start later with the other still playing; and the other is told the music has moved,
