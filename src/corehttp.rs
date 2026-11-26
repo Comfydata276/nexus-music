@@ -458,7 +458,7 @@ mod tests {
     }
 
     #[test]
-    fn a_write_to_lidarr_or_the_sign_in_is_sent_once_whatever_comes_back() {
+    fn the_agent_sends_a_write_to_lidarr_or_the_sign_in_once_whatever_comes_back() {
         // Lidarr's requests and the sign-in's go out on this agent (`make_agent_without_redirects`,
         // through `Agent`). Whatever answers a POST or a PUT, ureq doesn't send it again: not
         // when busy, not when sent elsewhere, not when told it went to the wrong server, not
