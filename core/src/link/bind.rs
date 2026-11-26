@@ -73,7 +73,7 @@ use crate::ways::{Ways, What, Who};
 /// an act that threw. If a call into the player does fail (an exception on the app's side,
 /// a read that could not be made), the app's side of this **stops the call by unwinding**
 /// (a panic), and that is a fault ([`Act::Fault`]): everything is replaced and linking is
-/// off on the phone until the next sign-in or start of the app.
+/// off on the phone until the app is next started.
 pub trait PhonePlayer {
     fn brief(&self) -> Brief;
     /// What a device steering this one shows.
@@ -303,7 +303,9 @@ impl Inbox {
         self.waiting().library.take()
     }
 
-    fn clear(&self) {
+    /// Everything waiting is let go of: the linking it was for is over (the service that
+    /// had it is going, or it has stopped for a fault).
+    pub fn clear(&self) {
         *self.waiting() = Brought::default();
     }
 }
@@ -323,7 +325,7 @@ pub enum Act {
     Handled { by_another: bool },
     /// The ticket for a look-up that has begun.
     Ticket { ticket: u64 },
-    /// **Linking has stopped on this phone**, until the next sign-in or start of the app:
+    /// **Linking has stopped on this phone**, until the app is next started:
     /// a call into the player failed, or something inside the library did
     /// ([`Phone::happened`]). The library asks nothing more of the player. The app puts
     /// right what only it can, since the library can no longer ask: if its queue is marked
@@ -620,8 +622,9 @@ pub struct Phone {
     /// The sign-in all of it belongs to, once a tick has said. (Beside the rest, so that
     /// what arrives while a call is under way can be told from the end of the sign-in.)
     account: RefCell<Option<String>>,
-    /// **Linking is off after a fault**, until the next sign-in. (A new start of the app
-    /// makes a new one of these.)
+    /// **Linking is off after a fault**, and nothing puts it on again. (A new start of the
+    /// app makes a new one of these; an app that makes a second one in the same run, as a
+    /// phone's service made again does, does not make it after a fault.)
     off: Cell<bool>,
     here: Here,
     /// The number of the sign-in all of it belongs to: a new one each time a sign-in ends.
@@ -777,17 +780,13 @@ impl Phone {
     /// not stay half-way, and it does not go on with an answer it did not get. Everything
     /// it held is replaced, as at a sign-out; the session and the look are ended for the
     /// app's side; one line is said of it ([`Do::Log`]); the app is told ([`Act::Fault`]);
-    /// and **linking is off on this phone until the next sign-in or start of the app**:
+    /// and **linking is off on this phone until the app is next started**:
     /// until then nothing is asked of the player, nothing is looked for and nothing is
     /// sent, so a fault that is still there cannot come round again at every tick. A
     /// press is the phone's own ([`Act::Handled`]), a tick says why the list is empty.
     pub fn happened(&self, what: Happened, now_ms: u64, today: u64, random: &mut dyn FnMut(&mut [u8]) -> bool, player: &mut dyn PhonePlayer) -> Answer {
         if self.off.get() {
-            match self.while_off(&what) {
-                Some(came) => return Answer::Came(came),
-                // The next sign-in: linking is on again, and this is the first of it.
-                None => self.off.set(false),
-            }
+            return Answer::Came(self.while_off(&what));
         }
         let kind = what.kind(self.account.borrow().as_deref());
         // The sign-in has another number from the moment it is said to be over, wherever
@@ -889,32 +888,17 @@ impl Phone {
         self.sign_in.get()
     }
 
-    /// What something comes to while linking is off after a fault; `None` for what ends
-    /// that (a sign-out, or a tick that names another sign-in than the one it happened under).
-    fn while_off(&self, what: &Happened) -> Option<Came> {
+    /// What something comes to while linking is off after a fault: a tick says why the
+    /// list is empty, a press is the phone's own, and nothing else is anything. Nothing
+    /// ends it.
+    fn while_off(&self, what: &Happened) -> Came {
         let mut came = Came { sign_in: self.sign_in.get(), ..Came::default() };
         match what {
-            Happened::Event(Event::Stop) => {
-                *self.account.borrow_mut() = None;
-                return None;
-            }
-            Happened::Event(Event::Tick { account, .. }) => {
-                let mut under = self.account.borrow_mut();
-                match under.as_deref() {
-                    // (It happened before any tick had named the sign-in: this one is it.)
-                    None => *under = Some(account.clone()),
-                    Some(under) if under == account => {}
-                    Some(_) => {
-                        *under = None;
-                        return None;
-                    }
-                }
-                came.acts.push(Act::Shown { shown: Shown { note: super::words::fault(self.here), ..Shown::default() } });
-            }
+            Happened::Event(Event::Tick { .. }) => came.acts.push(Act::Shown { shown: Shown { note: super::words::fault(self.here), ..Shown::default() } }),
             Happened::Event(Event::Press { .. } | Event::Add { .. } | Event::Play { .. } | Event::PlayHere) => came.acts.push(Act::Handled { by_another: false }),
             _ => {}
         }
-        Some(came)
+        came
     }
 
     /// Something stopped unexpectedly: a fault. Nothing is left as it was at that moment:
@@ -937,7 +921,7 @@ impl Phone {
             }
             *inner = inner.afresh();
         }
-        came.native.push(Do::Log(format!("linking: it stopped unexpectedly ({}). Everything it held was let go of, and linking is off here until the next sign-in or start.", super::text::cut(&said, 200))));
+        came.native.push(Do::Log(format!("linking: it stopped unexpectedly ({}). Everything it held was let go of, and linking is off here until the app is next started.", super::text::cut(&said, 200))));
         came
     }
 }
@@ -1780,7 +1764,7 @@ mod tests {
             assert!(came.acts.contains(&Act::Fault) && sends(&came.native) == 0 && came.native.contains(&Do::End { session }), "{wrong:?}: {came:?}");
             assert_eq!(player.asked, asked, "{wrong:?}");
             let (acts, native) = phone.handle(TICK, 2_250, 100, &mut random(&mut n), &mut player).unwrap();
-            assert!(native.is_empty() && acts.contains("Linking stopped on this phone"), "{wrong:?}: {acts} {native:?}");
+            assert!(native.is_empty() && acts.contains("Linking has stopped on this phone"), "{wrong:?}: {acts} {native:?}");
         }
         // And the same for something chosen on the phone itself, which the app could not record.
         let mut n = 0;
@@ -1918,10 +1902,11 @@ mod tests {
     /// is not answered with a made-up value and it is not tried again. Everything the
     /// linking held is replaced, as at a sign-out, with one line said of it; nothing more
     /// is asked of the player and nothing is sent; and **linking stays off on this phone
-    /// until the next sign-in or start of the app**, so that a fault that is still there
-    /// cannot come round again at every tick.
+    /// until the app is next started**, so that a fault that is still there cannot come
+    /// round again at every tick, and nothing the app does next (a sign-out, another
+    /// account) has to be told from a fresh start to bring it back.
     #[test]
-    fn a_fault_puts_linking_off_until_the_next_sign_in_and_asks_nothing_more_of_the_player() {
+    fn a_fault_puts_linking_off_until_the_app_starts_again_and_asks_nothing_more_of_the_player() {
         let mut n = 0;
         let (phone, mut player, session, place) = phone(&mut n);
         phone.handle(CHANGED, 2_000, 100, &mut random(&mut n), &mut player);
@@ -1941,7 +1926,7 @@ mod tests {
         let asked = player.asked.len();
         for tick in 0..8 {
             let (acts, native) = phone.handle(TICK, 2_200 + 250 * tick, 100, &mut random(&mut n), &mut player).unwrap();
-            assert!(native.is_empty() && acts.contains("Linking stopped on this phone"), "{acts} {native:?}");
+            assert!(native.is_empty() && acts.contains("Linking has stopped on this phone until the app is next opened. If another device was playing, it still is."), "{acts} {native:?}");
         }
         // What the old session's stay at the relay still brings, what is chosen on the
         // phone, a press: none of it is decided, and a press is the phone's own.
@@ -1950,18 +1935,15 @@ mod tests {
         assert_eq!(phone.handle(CHANGED, 4_400, 100, &mut random(&mut n), &mut player).unwrap().0, "[]");
         assert_eq!(phone.handle(r#"{"event":"press","press":"next"}"#, 4_400, 100, &mut random(&mut n), &mut player).unwrap().0, r#"[{"act":"handled","by_another":false}]"#);
         assert_eq!((player.asked.len(), order(&phone, 4_500)), (asked, (1, None, false)));
-        // The next sign-in (a sign-out, and then a tick): linking is on again, from a look.
+        // Nothing in this run of the app brings it back: not a sign-out and the same
+        // account again, and not another account. (The fault may be gone; nobody asks.)
         player.wrong = None;
-        phone.handle(r#"{"event":"stop"}"#, 5_000, 100, &mut random(&mut n), &mut player);
+        assert_eq!(phone.handle(r#"{"event":"stop"}"#, 5_000, 100, &mut random(&mut n), &mut player).unwrap(), ("[]".to_string(), vec![]));
         let (acts, native) = phone.handle(TICK, 5_100, 100, &mut random(&mut n), &mut player).unwrap();
-        assert!(!acts.contains("Linking stopped") && matches!(native.as_slice(), [Do::Look { number, .. }] if *number > FIRST_LOOK), "{acts} {native:?}");
-        // And another account signing in does the same.
-        let (phone, mut player, session, place) = self::phone(&mut n);
-        player.wrong = Some(Wrong::Panics);
-        hear(&phone, &mut player, session, &place, vec![from_pc(1, &place, Ask::Look(Want::Brief))], 2_100, &mut n);
-        player.wrong = None;
-        let (acts, native) = phone.handle(r#"{"event":"tick","account":"somebody else","wanted":true}"#, 2_200, 100, &mut random(&mut n), &mut player).unwrap();
-        assert!(!acts.contains("Linking stopped") && native.iter().any(|ask| matches!(ask, Do::Look { .. })), "{acts} {native:?}");
+        assert!(native.is_empty() && acts.contains("Linking has stopped on this phone"), "{acts} {native:?}");
+        let (acts, native) = phone.handle(r#"{"event":"tick","account":"somebody else","wanted":true}"#, 5_400, 100, &mut random(&mut n), &mut player).unwrap();
+        assert!(native.is_empty() && acts.contains("Linking has stopped on this phone"), "{acts} {native:?}");
+        assert_eq!(player.asked.len(), asked);
     }
 
     /// A call works through what was waiting and a bounded number of what arrives while

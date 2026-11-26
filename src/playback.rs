@@ -2129,6 +2129,14 @@ impl Controller {
         self.saver.write(self.paths.queue_place.clone(), move || serde_json::to_vec(&place).ok());
     }
 
+    /// [`Self::save_queue`], and **not back until it is on disk** (or five seconds have
+    /// gone): for the mark of a queue handed to another device, which the next start of
+    /// the app must find whatever becomes of this run. Linking only.
+    pub(crate) fn save_queue_surely(&self) {
+        self.save_queue();
+        self.saver.flush();
+    }
+
     /// Brings back the queue from the last run, paused where it stopped.
     pub fn restore_queue(self: &Rc<Self>) {
         // Anything still on its way to disk gets there first.
@@ -2143,7 +2151,9 @@ impl Controller {
             saved.position = place.position;
             saved.stamp = saved.stamp.max(place.stamp);
             // A queue taken up from another device is still that device's after a restart.
-            self.queue_owner.restored(place.taken);
+            // (One marked as handed on by a run in which linking existed is this PC's own
+            // in a run in which it does not: `nexus_core::handover::restored`.)
+            self.queue_owner.restored(nexus_core::handover::restored(place.taken, crate::link::on()));
         }
         self.queue_saved.set(shape);
         {

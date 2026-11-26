@@ -417,14 +417,15 @@ impl Player for Here<'_> {
     /// device saves, until the person uses it here (`claim_queue`). It is another queue
     /// for a save that was already prepared, which is then not sent.
     ///
-    /// **And it is written at once**, where the next start of the app will find it
-    /// (`save_queue`, the queue's place): on a PC that was quiet already nothing else
-    /// would write it, since the stop that follows changes nothing.
+    /// **And it is written before this returns**, where the next start of the app will
+    /// find it (`save_queue_surely`, the queue's place): on a PC that was quiet already
+    /// nothing else would write it, since the stop that follows changes nothing; and
+    /// "written" is the file being on disk, not its being in line for the saver.
     fn handed_on(&mut self) {
         log("queue: handed to another of the person's devices: not saved from here, and it follows, until it is used here");
         let mark = self.ctl.link.borrow().handed.borrow_mut().on(self.ctl.queue_number.get(), self.ctl.queue_owner.taken());
         self.ctl.queue_owner.taken_up(mark);
-        self.ctl.save_queue();
+        self.ctl.save_queue_surely();
     }
 
     /// This PC did not stop: the queue that was marked is whose it was. (If another whole
@@ -434,7 +435,7 @@ impl Player for Here<'_> {
         if let Some(was) = was {
             log("queue: this PC did not stop, so its queue is not handed on after all");
             self.ctl.queue_owner.handed_back(was);
-            self.ctl.save_queue();
+            self.ctl.save_queue_surely();
         }
     }
 

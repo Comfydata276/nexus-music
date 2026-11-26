@@ -42,9 +42,10 @@ pub const NEEDS_RESETTING: &str = "Your devices' link on the music server needs 
 pub const RESET_HALF_DONE: &str = "Linking was reset, but the music server stopped answering before that could be confirmed. It will be asked again.";
 pub const RESET_NOT_DONE: &str = "Linking couldn't be reset: the music server didn't answer. Try again.";
 pub const RESET_DONE: &str = "Linking was reset. Your other devices rejoin by themselves within two minutes.";
-/// Linking has stopped on this device after a fault, until the next sign-in or start.
+/// Linking has stopped on this device after a fault, until the app is next started. (And
+/// what the person is most likely to be wondering: nothing was stopped anywhere else.)
 pub fn fault(here: Here) -> String {
-    format!("Linking stopped on {}. It starts again when you sign in again or restart the app.", here.this_lower())
+    format!("Linking has stopped on {} until the app is next opened. If another device was playing, it still is.", here.this_lower())
 }
 
 pub const NOT_RADIO: &str = "Radio stations can't be added from here";

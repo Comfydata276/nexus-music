@@ -132,6 +132,11 @@ pub const HANDED: &str = "handed to another device";
 /// device then did not stop. It is taken back from the queue it was put on and no other:
 /// if another whole queue is in the player by then, whose that queue is was settled by
 /// whatever put it there, and nothing is given back.
+///
+/// **What it was before lives from the mark to the stop that follows it in the same
+/// call**, and is never needed after: so it is kept in memory and nowhere else. A start
+/// of the app finds the mark ([`Here::taken`] is kept with the queue's place) and no
+/// record of what was before it, and needs none: nothing is under way to take back.
 #[derive(Debug, Default)]
 pub struct Mark(Option<(u64, Option<String>)>);
 
@@ -139,10 +144,13 @@ impl Mark {
     /// The queue with this number is handed on. `taken` is what [`Here::taken`] was;
     /// what it is to be now is given back ([`HANDED`]).
     pub fn on(&mut self, queue: u64, taken: Option<String>) -> String {
-        // (Marked twice with nothing between: what it was before the first still stands.)
+        // (Marked twice with nothing between, which is to say while it is still marked:
+        // what it was before the first still stands. Used here in between, it was made
+        // this device's own, and that is what it was. Nothing goes back to "handed on".)
+        let still = taken.as_deref() == Some(HANDED);
         let was = match self.0.take() {
-            Some((marked, was)) if marked == queue => was,
-            _ => taken,
+            Some((marked, was)) if marked == queue && still => was,
+            _ => taken.filter(|_| !still),
         };
         self.0 = Some((queue, was));
         HANDED.into()
@@ -153,6 +161,15 @@ impl Mark {
     pub fn back(&mut self, queue: u64) -> Option<Option<String>> {
         self.0.take().filter(|(marked, _)| *marked == queue).map(|(_, was)| was)
     }
+}
+
+/// What [`Here::taken`] is as the app starts, from what was kept with the queue's place.
+/// **Where linking the person's devices does not exist in this run** (it is behind a
+/// switch), a queue found marked as handed to another device is this device's own:
+/// nothing in such a run hands a queue on or takes a mark back, and the mark would keep
+/// the queue from being saved for as long as it was left alone.
+pub fn restored(taken: Option<String>, linking: bool) -> Option<String> {
+    taken.filter(|taken| linking || taken != HANDED)
 }
 
 /// The name a device gives when it saves the queue, so it can tell its own from others'.
@@ -502,6 +519,37 @@ mod tests {
         mark.on(4, Some("theirs".into()));
         mark.on(6, None);
         assert_eq!(mark.back(6), Some(None));
+    }
+
+    /// What a queue goes back to is what it was **at this hand-over**. A queue handed on,
+    /// then used here (the person's own again, which the mark is not told of), then
+    /// handed on once more, does not go back to what it was before the first.
+    #[test]
+    fn a_queue_used_here_and_handed_on_again_does_not_go_back_to_what_it_was_the_first_time() {
+        let mut mark = Mark::default();
+        mark.on(4, Some("theirs".into()));
+        // (Used here: `taken` is nothing again. Then the same queue is handed on.)
+        mark.on(4, None);
+        assert_eq!(mark.back(4), Some(None));
+        // And nothing goes back to "handed on": a queue found marked when the app started
+        // (there is no record of what it was before), marked again and taken back, is
+        // this device's own.
+        let mut mark = Mark::default();
+        mark.on(9, Some(HANDED.into()));
+        assert_eq!(mark.back(9), Some(None));
+    }
+
+    /// A run of the app in which linking does not exist never hands a queue on, follows
+    /// nothing and gives nothing back: a mark left by a run in which it did is not kept.
+    #[test]
+    fn a_queue_found_marked_as_handed_on_is_this_devices_own_where_linking_does_not_exist() {
+        assert_eq!(restored(Some(HANDED.into()), false), None);
+        assert_eq!(restored(Some(HANDED.into()), true), Some(HANDED.into()));
+        // One taken up from another device is that device's still, either way.
+        for linking in [false, true] {
+            assert_eq!(restored(Some("2026-11-26T10:00:00Z".into()), linking), Some("2026-11-26T10:00:00Z".into()));
+            assert_eq!(restored(None, linking), None);
+        }
     }
 
     /// The person moved their music from this device to the PC. This device had played on
