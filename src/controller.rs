@@ -1729,7 +1729,15 @@ impl Controller {
         self.save_settings();
         self.connect_requests();
         self.push_settings();
-        self.requests_state("sign-in", &nexus_core::gate::signed_out(&self.behind_sign_in()));
+        // Signed out of one that's refused, it's still said why: there's nothing to sign in to.
+        let refused = {
+            let settings = self.settings.borrow();
+            crate::gate::Found { service: settings.lidarr_gate.clone(), client: String::new() }.trusted(&settings.lidarr_address).err()
+        };
+        match refused {
+            Some(why) => self.requests_state("error", &why),
+            None => self.requests_state("sign-in", &nexus_core::gate::signed_out(&self.behind_sign_in())),
+        }
     }
 
     /// Asks whether to request an album that isn't in the library. `song` is the song that
