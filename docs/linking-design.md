@@ -116,21 +116,24 @@ Its comment:
 
 `secret` is 32 random bytes, base64url without padding.
 
-**Both apps hide it, in every copy, whether or not linking is on in that copy.** A
-playlist's description is on show wherever the playlist is, and this one's is the
-secret; and the copies with linking off are the person's other devices during a test,
-and everyone else's for good. So in every build of both apps a playlist **whose
-comment is a linking record by the library's own reading** (`secret::is_record`),
-whatever it is called, and one of the reserved name with an empty comment (a device
-has made it and not yet written into it), is not listed, not opened, not offered to
-add songs to, and never written to a cache of pages; from a list an older version
-kept, that one row is dropped and the rest stays. It goes by what the playlist holds:
-one that only has the name, with a description of the person's own, is theirs and is
-shown. A playlist of the person's own may not be *given* the name in any copy ("Nexus
-Music keeps that name for itself, for linking your devices. Choose another."): made
-with an empty comment, it would be hidden at once and taken for the record by a
-device with linking on. Other apps, and the music server's own pages, show the
-playlist and its description as they show any (weakness 1).
+**Where linking is on, the app leaves it out of the lists of playlists it shows; where
+linking is off, nothing is different.** A PC with linking on leaves the playlist of
+that name out of its list where the list arrives, and does not let a playlist of the
+person's own be given the name; a phone on which linking exists, is running and is
+wanted leaves it out of the app's list, the list songs are added to, and the car's,
+in memory as each is shown. **A copy with linking off (which is every released copy)
+behaves exactly as it did before linking was written**: the playlist is one like any
+other, its name is nobody's, and no cache, import, download or list is touched. Hiding
+it in every copy was built, for both apps, and withdrawn after its review: it took a
+rule that only matters where linking is on and enforced it where it is off, and there
+it reached into things every person relies on (a kept list rewritten or thrown away,
+the import resolving against a filtered list, pages still opening by id). The secret
+is the owner's own, readable by anything signed in to the account (weakness 1); seen
+on the owner's other devices during a test it does no harm. **How the record's
+playlist is kept out of sight and out of caches in every copy is for when linking is
+switched on for everyone**, designed as a whole and reviewed as a change to everybody's
+playlists; until then a phone's kept list of playlists holds this one's description as
+it holds every playlist's.
 
 A **look** is: list the playlists; choose by the rule of `core/src/step.rs` (`find`:
 the lowest id among those of that name whose owner the server states to be this
@@ -1104,7 +1107,7 @@ Acts, each done before the call returns:
 | `take(bytes)` | `{"songs":[[id,queued],…],"begin","position","context"}`: this queue built and put in the player, **playing from** entry `begin` (zero-based) at `position` ("Installing a queue", below). It answers nothing: **whether the queue is in the player is what `queue()` says afterwards.** |
 | `pause()` | The phone's own sound stopped, through the player's own pause (so that it takes its place in `Choices` once, as a pause there does). **It answers whether the phone is then not set to play** (`!exo.playWhenReady`): the intent, not whether anything sounds. A phone whose sound a call holds back, still set to play, has not stopped. |
 | `claim()` | **The queue is the phone's own from now**: what `claimQueue` does (`queueTaken` cleared, `queueStamp` now, the save's revision moved, a save owed). Called by the library once the change it is for is in the player, for a command another device sent. |
-| `handedOn()` | **The queue has been handed to another device**: `queueTaken` set to `HANDED` (`core::handover`), the save's revision moved, and the queue's place written. **It answers whether the queue's file holds the mark: the write's own result.** The app's one writer of saved queues says what it last wrote the place file with; the adapter waits for it on the player's thread for up to 250 ms and answers yes only if the place file was written, with the mark. **If not (the write failed, nothing is saved for this sign-in yet, or it did not get there in time), nothing is marked**: `queueTaken` is what it was, and the library refuses the hand-over before the phone is stopped (the device that asked is told this one could not; the phone plays on). Called before the stop that goes with it, and when the phone was already quiet too. |
+| `handedOn()` | **The queue has been handed to another device**: `queueTaken` set to `HANDED` (`core::handover`), the save's revision moved, and the queue's place written. **It answers whether the queue's file holds the mark: this write's own result.** Each thing asked of the app's one writer of saved queues has a number, and the writer says the number of the last ask whose place reached the disk; the adapter waits on the player's thread for up to 250 ms and answers yes only if that number is the one it asked under (so an earlier write that once put the same mark there, for another queue, answers for nothing). **If not (the write failed, nothing is saved for this sign-in yet, or it did not get there in time), nothing is marked**: `queueTaken` is what it was, and the library refuses the hand-over before the phone is stopped (the device that asked is told this one could not; the phone plays on). Called before the stop that goes with it, and when the phone was already quiet too. |
 | `handedBack()` | The phone did not stop: `queueTaken` is what it was, the revision moved, written the same way. **If that cannot be written it throws, which is a fault** (the clean-up has the queue the phone's own in memory, and a run without linking reads the mark as that). **Only if the queue in the player is still the one that was marked** (by number); if another whole queue is in the player, whose that is was settled when it was put there. |
 
 **What a queue was before it was marked is kept from `handedOn` to the end of the call
@@ -1160,12 +1163,15 @@ command is judged by the one thing it is for:
 Nothing is said to have changed on the strength of having been asked. **A command
 that starts playing (`play`, `jump`, `adopt`, and `take`) asks the service's
 `mayPlay()` first**, before anything is made ready, put in or moved to: one that may
-not start leaves the player exactly as it was. **Except on a phone that is already
-sounding or about to: that one is not asked.** The service's "no" to a start stops the
-player, which is right for a start that was refused and would stop music the person
-is listening to; so such a command goes the player's own way, as the same press on
-the phone would. A command from another device never goes through a path that stops
-a phone that was already playing. What each answer means:
+not start leaves the player exactly as it was. **A phone that is already sounding or
+about to is asked another question, one that touches nothing**: whether a start would
+be allowed now, by what the service's gate goes by that can be read without doing
+anything (its player is not showing another device's music, and the service is in the
+foreground). The service's own "no" to a start stops the player, which is right for a
+start that was refused and would stop music the person is listening to; so that gate
+is never reached for a refusal. Refused, the phone plays on exactly as it was. A
+command from another device never goes through a path that stops a phone that was
+already playing. What each answer means:
 
 | `do` | `with` | `ready` | 1, changed | 2, so already | 0, refused |
 |---|---|---|---|---|---|
@@ -1300,7 +1306,8 @@ with something too large: nothing was done, and it is noted.
 **`acts`**, for the app: `{"act":"do","ask":{"say":text}}` (a toast);
 `{"ask":{"remember":[…]}}` (the devices seen: keep this list, and give it back to
 `linkNew` at the next start); `{"ask":{"forget":{"playlist":id}}}` (a page of that
-playlist kept on disk holds the secret: delete it); `{"ask":{"steering":name|null}}`
+playlist kept on disk holds the secret: a PC deletes it; **a phone notes it and
+deletes nothing yet**, see 5.1); `{"ask":{"steering":name|null}}`
 (the phone's player is another device's, or its own again); `{"act":"shown","shown":…}`
 (the list, after a tick); `{"act":"view","view":…}` (the device being steered);
 `{"act":"handled",…}`, `{"act":"ticket",…}`; and **`{"act":"fault"}`**.
@@ -1398,7 +1405,9 @@ adapter then:
   was, if the fault came in the very call that marked it; to the phone's own
   otherwise): the library can no longer ask, and a queue left marked would not be
   saved while it played. This is the one thing only the adapter can put right;
-- **tells the person once**, with the sentence `linkNew` handed over: "Linking has
+- **tells the person once**, with the library's sentence (asked for before anything
+  is started; the phone has the same words of its own for when the library's cannot
+  be had): "Linking has
   stopped on this phone until the app is next opened."
 
 A fault in the middle of a move of music can leave both devices playing. It does not
@@ -1707,7 +1716,11 @@ device to say so (a field in its full state), which no build does yet.
 
 **For everyone, not for a tester's pair** (added to the list above): at set-up, an
 empty playlist of the reserved name with an empty comment, of the person's own, found
-beside one that holds the record, is removed (weakness 10 leaves it there today).
+beside one that holds the record, is removed (weakness 10 leaves it there today). And
+**how the record's playlist is kept out of sight and out of caches in every copy**
+(5.1): designed as a whole, with the pages that open by id, the import, sync's notes,
+downloads and the car's offline tree in it, and reviewed as a change to everybody's
+playlists.
 
 The relay's path can still hold a command up to two minutes, show a stale state until
 the next look, and stop linking altogether.
