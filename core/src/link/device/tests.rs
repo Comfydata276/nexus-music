@@ -49,6 +49,8 @@ struct Fake {
     /// Its sound is held back (a call), with its intent to play still set: it does not
     /// look as if it were playing, and it has not stopped.
     held_back: bool,
+    /// How many times the whole of what is to come was asked for.
+    listed: std::cell::Cell<usize>,
 }
 
 impl Fake {
@@ -103,7 +105,11 @@ impl Player for Fake {
         !self.queue.is_empty()
     }
     fn ahead(&self) -> Vec<String> {
+        self.listed.set(self.listed.get() + 1);
         self.queue.iter().skip(self.cursor + 1).cloned().collect()
+    }
+    fn entry_at(&self, at: usize) -> Option<String> {
+        self.queue.get(self.cursor + 1 + at).cloned()
     }
     fn to_come(&self) -> usize {
         self.queue.len().saturating_sub(self.cursor + 1)
@@ -2366,4 +2372,48 @@ fn an_answer_from_a_place_its_device_has_left_never_settles_a_hand_over() {
     world.hear_places();
     world.pass(1_000);
     assert_eq!((said(&world), world.copies[A].player.playing, world.copies[B].player.playing), ("Playing on Copy B.", false, true));
+}
+
+// ---- a long queue (what a command costs the player's thread) -----------------------------------
+
+/// **The whole of what is to come is listed for a command only when it has to be.** A
+/// command that names an entry names it by its place and its song; the player is asked
+/// what is at that place, one song, and if it is that song the entry is found. Only if
+/// it is not (the queue has moved on since the sender saw it) is everything to come
+/// listed, to find the nearest copy. A command that names no entry never asks for it. On
+/// a phone the list crosses into the library as text, a song at a time, on the thread
+/// the music plays from: five thousand of them for a long queue.
+#[test]
+fn what_is_to_come_is_listed_only_for_a_command_whose_entry_is_not_where_it_was_seen() {
+    for name in COMMANDS {
+        let mut world = steering(name);
+        world.ask(name);
+        world.pass(1_000);
+        assert!(world.log(B, &format!("{name} from")).iter().any(|line| line.ends_with("carried out")), "{name}: {:?}", world.copies[B].log);
+        assert_eq!(world.copies[B].player.listed.get(), 0, "{name}");
+    }
+    // An entry that is not where the command says: the song is two places on, and is
+    // found there, by the list. (As the device being steered's own queue moved on.)
+    let command = |world: &mut World, n: u8, command: Command| {
+        let (from, to) = (world.copies[A].place.unwrap(), world.copies[B].place.unwrap());
+        let at = At { generation: world.copies[B].player.rule.generation(), minute: minute(world.now) };
+        let sealed = frame::seal(&Keys::of(&secret(7)), ASK, &[n; 24], &from, &to, Ask::Do { command, at }.text().as_bytes()).unwrap();
+        world.deliver_to(B, Frame { from, to, text: sealed });
+    };
+    let mut world = steering("remove");
+    command(&mut world, 201, Command::Remove { at: 3, id: "s2".into() });
+    assert_eq!((world.copies[B].player.listed.get(), &world.copies[B].player.queue[..3]), (1, &["s0".to_string(), "s1".into(), "s3".into()][..]));
+    // A place past the end of the queue, for a song that is in it: found the same way.
+    command(&mut world, 202, Command::Jump { at: 99_999, id: "s5".into() });
+    assert_eq!((world.copies[B].player.listed.get(), world.copies[B].player.queue[world.copies[B].player.cursor].as_str()), (2, "s5"));
+    // A song that is nowhere in what is to come: it cannot be done, having been looked for.
+    command(&mut world, 203, Command::Remove { at: 0, id: "nowhere".into() });
+    assert_eq!(world.copies[B].player.listed.get(), 3);
+    assert!(world.last(B, "remove from").contains("refused, Cannot"), "{:?}", world.copies[B].log);
+    // The same song twice in the queue, named at the place of its second copy: that
+    // copy, and no list.
+    let mut world = steering("remove");
+    world.copies[B].player.queue = ["s0", "s1", "s2", "s1", "s3"].iter().map(|id| id.to_string()).collect();
+    command(&mut world, 204, Command::Remove { at: 2, id: "s1".into() });
+    assert_eq!((world.copies[B].player.listed.get(), world.copies[B].player.queue.join(" ")), (0, "s0 s1 s2 s3".to_string()));
 }

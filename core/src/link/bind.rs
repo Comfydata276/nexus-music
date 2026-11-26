@@ -91,8 +91,13 @@ pub trait PhonePlayer {
     fn queue(&self) -> u64;
     /// Whether there is a song in the player at all.
     fn has_song(&self) -> bool;
-    /// The ids of the songs to come, in the order they would play.
+    /// The ids of the songs to come, in the order they would play. The whole of them:
+    /// asked only when a command names an entry that is not where it says.
     fn ahead(&self) -> Vec<String>;
+    /// The id of the song `at` places after the current one; `None` if the queue does
+    /// not reach so far. (One song: what a command that names an entry costs when the
+    /// entry is where its sender saw it.)
+    fn entry_at(&self, at: usize) -> Option<String>;
     /// How many songs are to come, which the player knows without walking its queue.
     fn to_come(&self) -> usize;
     /// Carries a command out, exactly as the same press on the phone would be, **and says
@@ -448,6 +453,9 @@ impl Player for Held<'_> {
     }
     fn ahead(&self) -> Vec<String> {
         self.ask(|player| player.ahead())
+    }
+    fn entry_at(&self, at: usize) -> Option<String> {
+        self.ask(|player| player.entry_at(at))
     }
     fn to_come(&self) -> usize {
         self.ask(|player| player.to_come())
@@ -1021,6 +1029,9 @@ mod tests {
         fn ahead(&self) -> Vec<String> {
             unreachable!("asked from inside a call")
         }
+        fn entry_at(&self, _: usize) -> Option<String> {
+            unreachable!("asked from inside a call")
+        }
         fn to_come(&self) -> usize {
             unreachable!("asked from inside a call")
         }
@@ -1160,6 +1171,9 @@ mod tests {
         }
         fn ahead(&self) -> Vec<String> {
             self.songs.iter().skip(1).cloned().collect()
+        }
+        fn entry_at(&self, at: usize) -> Option<String> {
+            self.songs.get(1 + at).cloned()
         }
         fn to_come(&self) -> usize {
             self.songs.len().saturating_sub(1)

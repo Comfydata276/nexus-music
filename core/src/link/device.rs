@@ -147,8 +147,13 @@ pub trait Player {
     fn catch_up(&mut self) -> bool;
     /// Whether there is a song in the player at all.
     fn has_song(&self) -> bool;
-    /// The ids of the songs to come, in the order they would play.
+    /// The ids of the songs to come, in the order they would play. **The whole of them:
+    /// asked only when a command names an entry that is not where it says** (see
+    /// [`Player::entry_at`]), since a long queue is long to list.
     fn ahead(&self) -> Vec<String>;
+    /// The id of the song `at` places after the current one: what `ahead()[at]` is,
+    /// without the list being made. `None` if the queue does not reach so far.
+    fn entry_at(&self, at: usize) -> Option<String>;
     /// Carries a command out, exactly as the same press on this device would be, on this
     /// device only, **and says whether it changed anything**: a Play when it was playing, a
     /// seek on a radio, a Next with nothing to go to, change nothing. What the player does
@@ -1017,7 +1022,13 @@ impl Device {
             env.player.refuse(reservation);
             device.refused(session, from, nonce, &command, at, Why::Cannot, env, out);
         };
-        let entry_of = |env: &Env, at: u64, id: &str| entry(&env.player.ahead(), at, id).map(Ready::Entry);
+        // The entry a command names, by its place and its song. **Where the sender saw it,
+        // if that is still that song**: one song asked of the player. Everything to come
+        // is listed only if it is not, to find the nearest copy of the song.
+        let entry_of = |env: &Env, at: u64, id: &str| {
+            let seen = usize::try_from(at).ok().filter(|at| env.player.entry_at(*at).is_some_and(|there| there == id));
+            seen.or_else(|| entry(&env.player.ahead(), at, id)).map(Ready::Entry)
+        };
         // What it needs found, or that it cannot be done. Nothing is changed here.
         let ready = match &command {
             Command::Play | Command::Pause | Command::Moved | Command::Next | Command::Previous | Command::Seek { .. } | Command::Clear { .. } if !env.player.has_song() => None,

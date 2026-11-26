@@ -346,6 +346,11 @@ impl Player for Here<'_> {
         pb.order.iter().skip(pb.cursor + 1).filter_map(|&index| pb.queue.get(index)).map(|song| song.id.clone()).collect()
     }
 
+    fn entry_at(&self, at: usize) -> Option<String> {
+        let pb = self.ctl.playback.borrow();
+        pb.order.iter().skip(pb.cursor + 1).filter_map(|&index| pb.queue.get(index)).nth(at).map(|song| song.id.clone())
+    }
+
     fn to_come(&self) -> usize {
         let pb = self.ctl.playback.borrow();
         pb.order.len().saturating_sub(pb.cursor + 1)
