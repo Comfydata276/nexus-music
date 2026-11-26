@@ -1786,6 +1786,19 @@ fn a_source_that_leaves_while_the_taker_is_starting_is_sent_nothing_and_the_pers
     world.act(A, did);
     let did = world.with(A, |device, env| device.pause(&b, env));
     assert!(!did.iter().any(|ask| matches!(ask, Do::Send { .. })), "{did:?}");
+    // The relay hands over a frame its sender put in the mailbox before leaving: the
+    // device that sent it is not in the room to be answered. What it asked is carried
+    // out, and the answer goes nowhere. (This is the send's own refusal: nothing
+    // earlier knows the place has gone.)
+    let mut world = steering("next");
+    world.path.hold_commands = true;
+    world.ask("next");
+    let frame = world.path.commands.pop().expect("the command, on the path");
+    let (session, mine) = (world.copies[B].session, world.b_place());
+    let did = world.with(B, |device, env| device.heard(session, &[mine], &[(text::place(&frame.from), frame.text.clone())], env));
+    assert_eq!(world.copies[B].player.did, ["next"]);
+    assert!(!did.iter().any(|ask| matches!(ask, Do::Send { .. })), "{did:?}");
+    assert!(did.iter().any(|ask| matches!(ask, Do::Log(line) if line.contains("is not in the room, nothing is sent to it"))), "{did:?}");
 }
 
 /// The queue that "Play here" asked for comes after its time is up, and before any tick
