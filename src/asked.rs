@@ -84,13 +84,17 @@ impl AskedList {
         }
     }
 
-    /// Writes the list down, whole or not at all (`config::write_surely`): a kill or a power
-    /// cut part-way leaves the list as it was. A file that could not be read when the app
-    /// started is tried again first, and what it holds is joined to what has been asked
-    /// since; what was taken off the list meanwhile stays off. Says whether the list was
-    /// written: if not, what's in it now is kept only until the app closes (or, for a file
-    /// held, until it can be read).
-    pub fn save(&mut self) -> bool {
+    /// Writes the list down, whole or not at all (`config::write_whole`): a kill or a power
+    /// cut part-way leaves the list as it was. `durable` says whether it waits for the disk
+    /// (docs/FILES.md): **flushed** for what the person asked for (a request's note, a
+    /// take-off-the-list's answer, a batch's notes once it ends), the one record that it was
+    /// done; **in passing** for what the app found by itself (an arrival, a fill, an expiry, a
+    /// batch's notes while it runs), which the next look finds again if a power cut loses it.
+    /// A file that could not be read when the app started is tried again first, and what it
+    /// holds is joined to what has been asked since; what was taken off the list meanwhile
+    /// stays off. Says whether the list was written: if not, what's in it now is kept only
+    /// until the app closes (or, for a file held, until it can be read).
+    pub fn save(&mut self, durable: crate::config::Durable) -> bool {
         if self.held {
             let (items, held, trouble) = read_back(&self.path);
             if !held {
@@ -106,7 +110,7 @@ impl AskedList {
                 self.trouble = trouble;
             }
         }
-        let written = !self.held && serde_json::to_vec_pretty(&self.items).is_ok_and(|json| crate::config::write_surely(&self.path, &json).is_ok());
+        let written = !self.held && serde_json::to_vec_pretty(&self.items).is_ok_and(|json| crate::config::write_whole(&self.path, &json, durable, &crate::config::REPLACING).is_ok());
         self.share();
         written
     }
@@ -114,12 +118,14 @@ impl AskedList {
     /// Notes something asked for. Asking again for the same album adds to the note that's
     /// there: more songs for playlists, or the song that's wanted from it. Says whether the
     /// note was written down: if not, it's kept only until the app closes.
+    /// Flushed: it's the record that the person asked.
     pub fn add(&mut self, asked: Asked) -> bool {
         nexus_core::asked::put(&mut self.items, asked);
-        self.save()
+        self.save(crate::config::Durable::Flushed)
     }
 
-    /// Notes several things asked for at once. Says whether they were written down.
+    /// Notes several things asked for at once, by a batch while it runs: in passing (the batch
+    /// flushes the list once when it ends: `flush`). Says whether they were written down.
     pub fn add_all(&mut self, asked: Vec<Asked>) -> bool {
         if asked.is_empty() {
             return true;
@@ -127,18 +133,24 @@ impl AskedList {
         for one in asked {
             nexus_core::asked::put(&mut self.items, one);
         }
-        self.save()
+        self.save(crate::config::Durable::InPassing)
     }
 
-    /// Stops watching for an album that's been taken off Lidarr's list. Says whether that was
-    /// written down (or there was nothing to write): if not, the note may come back when the
-    /// app starts again.
-    pub fn forget(&mut self, album: &str, title: &str, artist: &str) -> bool {
+    /// Writes the list down, waiting for the disk: once, as a batch ends or is stopped.
+    pub fn flush(&mut self) -> bool {
+        self.save(crate::config::Durable::Flushed)
+    }
+
+    /// Stops watching for an album that's been taken off Lidarr's list: `durable` is
+    /// `Flushed` for the person's own take-off-the-list, `InPassing` for a batch's. Says
+    /// whether that was written down (or there was nothing to write): if not, the note may
+    /// come back when the app starts again.
+    pub fn forget(&mut self, album: &str, title: &str, artist: &str, durable: crate::config::Durable) -> bool {
         if self.held {
             self.gone.push((album.to_string(), title.to_string(), artist.to_string()));
         }
         if nexus_core::asked::forget(&mut self.items, album, title, artist) || self.held {
-            return self.save();
+            return self.save(durable);
         }
         true
     }
@@ -153,21 +165,21 @@ impl AskedList {
     /// still aren't in the library.
     pub fn filled(&mut self, at: i64, title: &str, missing: usize) {
         if nexus_core::asked::filled(&mut self.items, at, title, missing) {
-            self.save();
+            self.save(crate::config::Durable::InPassing);
         }
     }
 
     /// Drops what's been listed long enough, and what's been waited for too long.
     pub fn tidy(&mut self, now: i64) {
         if nexus_core::asked::tidy(&mut self.items, now) {
-            self.save();
+            self.save(crate::config::Durable::InPassing);
         }
     }
 
     /// Marks arrivals as such.
     pub fn mark(&mut self, arrivals: &[Arrival], now: i64) {
         nexus_core::asked::mark(&mut self.items, arrivals, now);
-        self.save();
+        self.save(crate::config::Durable::InPassing);
     }
 }
 
@@ -267,7 +279,7 @@ mod tests {
         assert!(!list.waiting());
         assert_eq!(AskedList::load(&path).items[0].library_album, "a9");
         // Taking it off Lidarr's list doesn't forget one that's already here.
-        list.forget("", "Cradlesong", "Rob Thomas");
+        list.forget("", "Cradlesong", "Rob Thomas", crate::config::Durable::Flushed);
         assert_eq!(list.items.len(), 1);
         list.tidy(1000 + SHOWN_FOR + 1);
         assert!(list.items.is_empty());
@@ -317,9 +329,9 @@ mod tests {
         assert_eq!(shared().iter().filter(|asked| asked.album == "rg1" && asked.title == "Cradlesong").count(), 1);
         // A batch's notes, and a cancellation, say so too.
         assert!(!list.add_all(vec![Asked { album: "rg2".into(), title: "Parachutes".into(), artist: "Coldplay".into(), ..Default::default() }]));
-        assert!(!list.forget("rg1", "Cradlesong", "Rob Thomas"));
+        assert!(!list.forget("rg1", "Cradlesong", "Rob Thomas", crate::config::Durable::Flushed));
         // (Nothing to write is nothing that failed.)
-        assert!(list.forget("rg-none", "Nothing", "Nobody") && list.add_all(Vec::new()));
+        assert!(list.forget("rg-none", "Nothing", "Nobody", crate::config::Durable::Flushed) && list.add_all(Vec::new()));
     }
 
     #[test]
@@ -368,7 +380,7 @@ mod tests {
         std::fs::create_dir(&path).unwrap();
         let mut list = AskedList::load(&path);
         // Queen's is taken off Lidarr's list while the file is held.
-        list.forget("rg-q", "Greatest Hits", "Queen");
+        list.forget("rg-q", "Greatest Hits", "Queen", crate::config::Durable::Flushed);
         // The file can be read again: Queen's doesn't come back with it, ABBA's stays.
         std::fs::remove_dir(&path).unwrap();
         std::fs::rename(&away, &path).unwrap();
@@ -377,4 +389,42 @@ mod tests {
         assert_eq!(kept, ["ABBA", "Coldplay"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn on_the_windows_thread_only_what_was_asked_for_waits_for_the_disk_and_once() {
+        let _apart = crate::pins::apart();
+        let dir = std::env::temp_dir().join(format!("nexus-asked-durable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("asked.json");
+        crate::config::mark_window_thread();
+        let flushes = crate::config::window_flushes;
+        let mut list = AskedList::load(&path);
+        // A request's answer: flushed, once.
+        let before = flushes();
+        assert!(list.add(Asked { album: "rg1".into(), title: "...Something to Be".into(), artist: "Rob Thomas".into(), at: 50, ..Default::default() }));
+        assert_eq!(flushes(), before + 1);
+        // The scan finding it arrived, and its fill, and an expiry: in passing.
+        let before = flushes();
+        let found = arrivals(&index(), &list.items, 1000);
+        list.mark(&found, 1000);
+        list.filled(50, "...Something to Be", 0);
+        list.tidy(1000 + SHOWN_FOR + 1);
+        assert_eq!(flushes(), before, "the scan waited for the disk on the window's thread");
+        // A batch's notes and forgets while it runs: in passing; once when it ends.
+        let before = flushes();
+        let note = |album: &str| Asked { album: album.into(), title: format!("Album {album}"), artist: "Them".into(), ..Default::default() };
+        assert!(list.add_all(vec![note("b1"), note("b2")]));
+        assert!(list.add_all(vec![note("b3")]));
+        assert!(list.forget("b2", "Album b2", "Them", crate::config::Durable::InPassing));
+        assert_eq!(flushes(), before);
+        assert!(list.flush());
+        assert_eq!(flushes(), before + 1);
+        // A take-off-the-list's answer: flushed, once.
+        let before = flushes();
+        assert!(list.forget("b1", "Album b1", "Them", crate::config::Durable::Flushed));
+        assert_eq!(flushes(), before + 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
+

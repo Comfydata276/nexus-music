@@ -1939,7 +1939,7 @@ impl Controller {
             Event::Forgot(gone) => {
                 let mut asked = self.asked.borrow_mut();
                 for album in gone {
-                    if !asked.forget(&album.album, &album.title, &album.artist) {
+                    if !asked.forget(&album.album, &album.title, &album.artist, config::Durable::InPassing) {
                         self.bulk_unnoted.set((true, self.bulk_unnoted.get().1));
                     }
                     crate::lidarr::mark(&album.album, false);
@@ -1968,6 +1968,10 @@ impl Controller {
                 } else if summary.unknown + summary.failed == 0 {
                     // Nothing left to say about it.
                     crate::bulk::clear();
+                }
+                // The batch's notes, written in passing while it ran: flushed once, now.
+                if !self.asked.borrow_mut().flush() {
+                    self.bulk_unnoted.set((true, self.bulk_unnoted.get().1));
                 }
                 if self.bulk_unnoted.get() == (true, false) {
                     self.bulk_unnoted.set((true, true));
@@ -2149,7 +2153,7 @@ impl Controller {
             post(move |ctl| {
                 match result {
                     Ok(()) => {
-                        let noted = ctl.asked.borrow_mut().forget(&album, &title, &artist);
+                        let noted = ctl.asked.borrow_mut().forget(&album, &title, &artist, config::Durable::Flushed);
                         crate::lidarr::mark(&album, false);
                         ctl.toast(if noted { nexus_core::requests::off_the_list(&title) } else { nexus_core::requests::off_the_list_unnoted(&title, "computer") });
                     }
