@@ -73,8 +73,7 @@ playing and steer them.
 
 **If linking stops on a device.** If something goes wrong inside linking on one of
 your devices, linking stops on that device and it tells you, once: "Linking has
-stopped on this phone until the app is next opened. If another device was playing, it
-still is." The music on it is not affected, and your other devices carry on without
+stopped on this phone until the app is next opened." The music on it is not affected, and your other devices carry on without
 it. It starts again when the app next starts from scratch.
 
 ## 3. Beyond the brief, and kept by the review
@@ -984,7 +983,7 @@ are no reports of what the player holds, no numbered acts, and nothing to cancel
   Until then the player is asked nothing, nothing is looked for and nothing is sent,
   so a fault that is still there cannot come round at every tick. The person is told
   once, in the library's words for both apps: "Linking has stopped on this phone
-  until the app is next opened. If another device was playing, it still is."
+  until the app is next opened."
 - **Every list has a bound, and nothing is dropped at the one that matters:** what
   the requests bring waits in one place (256 things, a megabyte, each counted at what
   it holds), and what does not fit is kept by the thread that brought it and offered
@@ -1019,13 +1018,15 @@ nothing with it. With linking switched off none of this exists: nothing is creat
 no listener is added, no tick runs.
 
 **One linking for each playback service, and nothing of it is the process's.**
-`linkNew` answers `{"link","sign_in","stopped"}`: the number of this linking, which
-**every other call names** (`link`); the number of its first sign-in; and the sentence
-for the person if it stops for a fault (taken at the start, since a fault may be the
-library no longer answering). The way up into the player, the place where what the
+`linkNew` answers `{"link","sign_in"}`: the number of this linking, which **every
+other call names** (`link`), and the number of its first sign-in. The sentence for the
+person if it stops for a fault is asked for by itself, before anything is started
+(`linkStoppedWords`, which needs nothing to have been), since a fault may be the
+library no longer answering. The way up into the player, the place where what the
 requests bring waits, and the library's half all belong to that linking and are let go
 of by `linkClose(link)`, which the adapter calls as the service goes and after a
-fault, and which may be called twice. A call that names a linking that has been
+fault, and which may be called twice (`linkClose(0)` closes whatever there is: for a
+start whose answer could not be read, which has no number to name). A call that names a linking that has been
 closed, or that another has taken the place of, does nothing and fails; a request
 still under way for it finds nowhere to put what it brought and lets it go. So a
 service made again in the same process starts with nothing of the one before, and
@@ -1043,9 +1044,9 @@ never the old one carried on.
 reads what it is given before it keeps anything, and puts the linking, the way up and
 the waiting place in together, last); only when it has answered does the adapter read
 the player, add its listeners, point the two lines of its requests (below) and begin
-to tick. If any step fails, what the steps before it set up is taken down again, and
-there is no linking in that service. It is started on the player's thread and
-nowhere else.
+to tick. If any step fails, what the steps before it set up is taken down again, **and that is
+a fault like any other**: the person is told, and linking is not started again in
+that run of the app. It is started on the player's thread and nowhere else.
 
 **What crosses.** UTF-8 bytes holding JSON, both ways, as with the phone's other calls
 into the library. **Units:** a place in a song is **seconds, as a decimal number**
@@ -1074,7 +1075,7 @@ would playing, with `playing` false.
 | `full()` | `{"position","now","coming","in_all","context","shuffle","repeat","volume"}`. `now` and each of `coming` is an entry: `{"id","title","artist","album","duration","queued"}` (`queued`: put in "Next in queue" by hand). `coming` is **the first 200 entries to come and no more**, in the order they would play; `in_all` is how many are to come altogether (`QueuePlayer.ahead`), known without walking the queue. The library cuts `coming` to what one message holds and counts the rest from `in_all`. `repeat` is 0 off, 1 the whole queue, 2 one song. `volume` is 0 to 1. | `now` null, `coming` empty, `in_all` 0 |
 | `handed()` | `{"songs","queued","position","context"}`: what another device could carry on with. `songs` is the ids **from the song playing on**, in the order they would play, with **radio stations left out** (another device cannot be handed one); `queued` how many straight after the first were queued by hand, **counted along this very list** (from the entry that is current as ExoPlayer has it, and only entries that are given: one left out is not counted). A song this phone cannot play just now (not downloaded, offline) is handed on by its id all the same: whether it plays is the taker's to find. The library cuts the list to one message. | `{"songs":[]}`; **and the same when what is playing is a radio station** |
 | `queue()` | **The number of the queue in the player.** It moves at one point: when a whole queue is in the player in place of what was there, which is the end of `QueuePlayer.load` (the model adopted **and** Media3 given its items; before anything is asked to play), and when the player is emptied (`clear`). So it moves for a list started here, a queue from another device or the server, the last run's queue put back, and the first songs added to an empty player; it does **not** move for an edit in place (adding, removing, moving, shuffling, following its list) or for the window of items sliding along. If building or loading throws part-way, the number has not moved. **The queue that is already in the player, handed to the session to be carried on with and come back to be loaded again, is not another queue**, and does not move it. Never used twice in a run. | the number, as ever |
-| `sounding()` | `{"queue","at"}` **only while audio is advancing for the entry that was current when a queue was put in for a move of music** (`take`, `adopt`), in that queue; `null` otherwise, and for good once that entry is no longer the one playing. The rules: (1) when `take` or `adopt` has put a queue in, the adapter notes the queue's number and **the entry's own number** (`SongTag.uid`, never used twice in a run, so it is that queue's entry and no other's); (2) "advancing" is the audio track's own word, `AnalyticsListener.onAudioPositionAdvancing`, **which Media3 posts**: by the time it arrives another queue may be in the player, so it counts only if **the entry its `eventTime` belongs to** (the media item of `eventTime.timeline` at `eventTime.windowIndex`) is the noted one, never by what is current when it arrives; (3) what was heard is let go of when the player stops playing (`isPlaying` false) or is given a new place to play from, and may be heard again; (4) **one song ending and the next beginning, or the same one beginning again, ends it for good**: the library measures how far the sound has gone by subtracting places in one entry. `playWhenReady`, `isPlaying` and a position that has only been set do not show that a queue which was taken has sounded; and the service's own `heardThisTime` is a latch for its diagnostics and does not say which queue was heard. `at` is seconds into the entry. A queue the person started on the phone is waited on by no move and is never said to sound. | `null` |
+| `sounding()` | `{"queue","at"}` **only while audio is advancing for the entry that was current when a queue was put in for a move of music** (`take`, `adopt`), in that queue; `null` otherwise, and for good once that entry is no longer the one playing. The rules: (1) when `take` or `adopt` has put a queue in, the adapter notes the queue's number and **the entry's own number** (`SongTag.uid`, never used twice in a run, so it is that queue's entry and no other's); (2) "advancing" is the audio track's own word, `AnalyticsListener.onAudioPositionAdvancing`, **which Media3 posts**: by the time it arrives another queue may be in the player, so it counts only if **the entry its `eventTime` belongs to** (the media item of `eventTime.timeline` at `eventTime.windowIndex`) is the noted one, never by what is current when it arrives; **and only if the event has a period of its own** (`eventTime.mediaPeriodId`): one without is filled in by Media3 from whatever is current as it is made, and proves nothing; (3) what was heard is let go of when the player stops playing (`isPlaying` false) or is given a new place to play from, **and is not believed again on a later word of the same loading of the entry** (the same period, by `windowSequenceNumber`): only of one that began after; (4) **one song ending and the next beginning, or the same one beginning again, ends it for good**: the library measures how far the sound has gone by subtracting places in one entry. `playWhenReady`, `isPlaying` and a position that has only been set do not show that a queue which was taken has sounded; and the service's own `heardThisTime` is a latch for its diagnostics and does not say which queue was heard. `at` is seconds into the entry. A queue the person started on the phone is waited on by no move and is never said to sound. | `null` |
 | `hasSong()` | Whether there is a song in the player. | false |
 | `ahead()` | The ids of **every** entry to come (radio stations too), in the order they would play, as a JSON list: the first is what Next goes to, and the same entry as `full().coming[0]`. | `[]` |
 | `toCome()` | How many are to come: the length of `ahead()`, without making it. | 0 |
@@ -1085,10 +1086,10 @@ Acts, each done before the call returns:
 |---|---|
 | `carryOut(bytes)` | One command, below. Answers **1: it changed the player; 2: it was so already; 0: it refused, or could not.** |
 | `take(bytes)` | `{"songs":[[id,queued],…],"begin","position","context"}`: this queue built and put in the player, **playing from** entry `begin` (zero-based) at `position` ("Installing a queue", below). It answers nothing: **whether the queue is in the player is what `queue()` says afterwards.** |
-| `pause()` | The phone's own sound stopped, through the player's own pause (so that it takes its place in `Choices` once, as a pause there does). Whether it stopped is asked afterwards, with `brief()`. |
+| `pause()` | The phone's own sound stopped, through the player's own pause (so that it takes its place in `Choices` once, as a pause there does). **It answers whether the phone is then not set to play** (`!exo.playWhenReady`): the intent, not whether anything sounds. A phone whose sound a call holds back, still set to play, has not stopped. |
 | `claim()` | **The queue is the phone's own from now**: what `claimQueue` does (`queueTaken` cleared, `queueStamp` now, the save's revision moved, a save owed). Called by the library once the change it is for is in the player, for a command another device sent. |
-| `handedOn()` | **The queue has been handed to another device**: `queueTaken` set to `HANDED` (`core::handover`), the save's revision moved, and the queue's place **written, and this does not return until the queue's file holds it**. "Written" is the write's own completion: the app's one writer of saved queues has got to it (`QueueSaver.flush`), not its being in line. The adapter waits for that on the player's thread for up to a second; if it has not happened by then (or nothing is saved for this sign-in yet), it says so in the diagnostics, and the mark is written with the next save. Called before the stop that goes with it, and when the phone was already quiet too. |
-| `handedBack()` | The phone did not stop: `queueTaken` is what it was, the revision moved, written the same way. **Only if the queue in the player is still the one that was marked** (by number); if another whole queue is in the player, whose that is was settled when it was put there. |
+| `handedOn()` | **The queue has been handed to another device**: `queueTaken` set to `HANDED` (`core::handover`), the save's revision moved, and the queue's place written. **It answers whether the queue's file holds the mark: the write's own result.** The app's one writer of saved queues says what it last wrote the place file with; the adapter waits for it on the player's thread for up to 250 ms and answers yes only if the place file was written, with the mark. **If not (the write failed, nothing is saved for this sign-in yet, or it did not get there in time), nothing is marked**: `queueTaken` is what it was, and the library refuses the hand-over before the phone is stopped (the device that asked is told this one could not; the phone plays on). Called before the stop that goes with it, and when the phone was already quiet too. |
+| `handedBack()` | The phone did not stop: `queueTaken` is what it was, the revision moved, written the same way. **If that cannot be written it throws, which is a fault** (the clean-up has the queue the phone's own in memory, and a run without linking reads the mark as that). **Only if the queue in the player is still the one that was marked** (by number); if another whole queue is in the player, whose that is was settled when it was put there. |
 
 **What a queue was before it was marked is kept from `handedOn` to the end of the call
 into the library that made it, and no longer.** That is as long as the library can
@@ -1125,18 +1126,30 @@ where in it to start.
 Each is carried out **by the same function a press on the phone reaches**, so that it
 is the same act to the player, the car and the notification.
 
-**The answer is the player after the call against the player before it.** For
-everything that plays, pauses or moves (`play`, `pause`, `moved`, `next`, `previous`,
-`seek`, `jump`), the adapter notes what a device looking at this one would see (the
-entry that is current, the place in it, whether it is set to play, whether it is
-sounding or about to, the list's revision, the queue's number), makes the call, and
-looks again: **1 only if something is different, 2 only if it was so before the call,
-and otherwise 0**, whatever the call was meant to do. So a Next with nowhere to go, a
-seek to where the player already is, and a Previous at the top of the first song are
-refusals; and nothing is said to have changed on the strength of having been asked.
-**A command that starts playing (`play`, `jump`, `adopt`, and `take`) asks the
-service's `mayPlay()` first**, before anything is made ready, put in or moved to: one
-that may not start leaves the player exactly as it was. What each answer means:
+**The answer is the player after the call against the player before it**, and each
+command is judged by the one thing it is for:
+
+- **`play`: done is the player being about to sound** (`brief().playing`) after the
+  call, and nothing less. That something about it moved is not enough.
+- **`pause`, `moved`: done is the intent to play being cleared** (`!exo.playWhenReady`),
+  not nothing sounding. The library takes a `moved` that was refused as not stopped,
+  whatever is or is not sounding.
+- **`next`, `previous`, `seek`, `jump`: done is another entry being current, or the
+  place in the entry being somewhere the song playing on would not have taken it** in
+  the time the call took (before where it was, or further on than that time and 150
+  ms). So a Next with nowhere to go, a seek to where the player already is, and a
+  Previous at the top of the first song are refusals, and a song simply playing on
+  during the call is not a change.
+
+Nothing is said to have changed on the strength of having been asked. **A command
+that starts playing (`play`, `jump`, `adopt`, and `take`) asks the service's
+`mayPlay()` first**, before anything is made ready, put in or moved to: one that may
+not start leaves the player exactly as it was. **Except on a phone that is already
+sounding or about to: that one is not asked.** The service's "no" to a start stops the
+player, which is right for a start that was refused and would stop music the person
+is listening to; so such a command goes the player's own way, as the same press on
+the phone would. A command from another device never goes through a path that stops
+a phone that was already playing. What each answer means:
 
 | `do` | `with` | `ready` | 1, changed | 2, so already | 0, refused |
 |---|---|---|---|---|---|
@@ -1288,7 +1301,7 @@ waiting.
 | Ask | The adapter | Ended by |
 |---|---|---|
 | `{"look":{"number","used","reset"}}` | `linkLook` with the music server's sign-in, `since` (now) and the ask's fields. One at a time. | `"stop_look"`: end that operation |
-| `{"begin":{"session","room","since_ms"}}` | Read the relay's address and host key (off the player's thread), then `linkStay` with them: it runs for as long as the session lasts. Note `since_ms` for the session. **A relay whose address is the music server's, Lidarr's or Lidarr's sign-in's is not used**: its key would go to whatever else is there; the diagnostics say so, and no session begins. | `{"end":{"session"}}` |
+| `{"begin":{"session","room","since_ms"}}` | Read the relay's address and host key (off the player's thread), **as one thing: the pair one save put there, never an address from one save with a key from another** (the phone keeps them sealed together, `link-relay.sealed`, apart from jams' own), then `linkStay` with them: it runs for as long as the session lasts. **A save of the pair ends the session**: at the next tick the adapter says linking is not wanted, which ends everything asked for under it, and at the one after that it is wanted again and begins with what is saved now. Note `since_ms` for the session. **A relay whose address is the music server's, Lidarr's or Lidarr's sign-in's is not used**: its key would go to whatever else is there; the diagnostics say so, and no session begins. | `{"end":{"session"}}` |
 | `{"renew":{"session","since_ms"}}` | Note the new `since_ms` for the session. | |
 | `{"end":{"session"}}` | End the stay's operation, and **send nothing more that was queued under that session**. | |
 | `{"send":{"session","token","to","frame"}}` | (`to` is the place as text, as it is handed back.) `linkSend`, in the order asked, with the session's `since` and `now`: it sends nothing if the session's secret has run out of its ten minutes by the time its turn comes. Sent once; whatever comes of it, it is not sent again. | the session's end |
@@ -1319,6 +1332,15 @@ tells the transport to "keep going" before its first write, which for a request 
 for the app's screens means a later stop does nothing; **for one of linking's it means
 only that the write in flight is let finish**: nothing more is sent after it, and its
 waits end. At `stop`, and at a fault, the adapter ends every one of them.
+
+**Every asker gets an end.** A look, a session's stay or a look-up of songs that could
+not even be begun (no room in linking's threads, the relay's key unreadable, a relay
+that is refused, a failure of its own on the way) is told to the library as that
+request having failed, at once: `linkLookFailed` (a look that could not ask the
+server), `linkStayFailed` (said under the list: this device could not begin to keep
+its place), `linkFindFailed` (it found none). Nothing is left waiting for a request
+that was never made. A session's sender clears its own flag on every way out, so one
+that failed does not leave the session unable to send.
 
 **Nothing started for a sign-in outlives it.** Everything the adapter starts (a look,
 the reading of the relay's key, a stay, a session's sends, a look-up of songs) is
@@ -1361,8 +1383,7 @@ adapter then:
   otherwise): the library can no longer ask, and a queue left marked would not be
   saved while it played. This is the one thing only the adapter can put right;
 - **tells the person once**, with the sentence `linkNew` handed over: "Linking has
-  stopped on this phone until the app is next opened. If another device was playing,
-  it still is."
+  stopped on this phone until the app is next opened."
 
 A fault in the middle of a move of music can leave both devices playing. It does not
 leave neither.
@@ -1649,13 +1670,28 @@ device to say so (a field in its full state), which no build does yet.
     on playing. The same if the phone was handed a queue in which only a song on
     repeat-one would have proved it after its first time round.
 23. **The mark of a queue handed on waits for the disk on the player's thread**, for
-    up to a second on a phone and five on a PC, once for each hand-over. If the disk
-    does not take it in that time the hand-over goes on, the diagnostics say so, and
-    for that moment a restart would find the queue as the device's own.
+    up to 250 ms on a phone and five seconds on a PC, once for each hand-over. **If
+    the disk does not take it in that time the hand-over is refused**: the source
+    plays on, the device that took the music is told it could not be stopped, and
+    both play until the person stops one. A slow disk therefore costs a hand-over,
+    not a queue.
 24. **A phone that may not start playing refuses a queue outright.** It is asked
     before anything is put in, so a queue sent to a phone that Android will not let
     start (or whose player is showing another device) is not there to be started by
     hand afterwards.
+
+25. **Moving music proves that the taker sounded, once.** If the taker then stops by
+    itself (an error, the end of a very short queue) before the word that it has
+    started reaches the source, the source stops too and both are silent: the person
+    presses play. And a queue taken onto a device replaces that device's queue before
+    the proof: if the proof fails, the source keeps playing and the taker keeps the
+    new queue, paused.
+26. **On a phone a press and what it did can still be two choices** when Media3 puts
+    the command behind other work of its own (weakness 20 says when they are one).
+
+**For everyone, not for a tester's pair** (added to the list above): at set-up, an
+empty playlist of the reserved name with an empty comment, of the person's own, found
+beside one that holds the record, is removed (weakness 10 leaves it there today).
 
 The relay's path can still hold a command up to two minutes, show a stale state until
 the next look, and stop linking altogether.
