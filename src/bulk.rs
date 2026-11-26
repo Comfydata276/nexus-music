@@ -300,7 +300,7 @@ pub fn unfinished() -> bool {
 
 /// The address of the Lidarr set up now, as its way back is written under (empty if none).
 fn here() -> String {
-    crate::lidarr::current().map(|lidarr| lidarr.address().to_string()).unwrap_or_default()
+    crate::lidarr::current().map(|lidarr| lidarr.way_back_address()).unwrap_or_default()
 }
 
 pub fn running() -> bool {

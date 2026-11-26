@@ -940,7 +940,7 @@ impl Job {
         // Lidarr may be reading the artist in still: their singles, for an earlier go at this,
         // or all of them, if they were added a moment before the app last closed. Then what
         // isn't listed yet may be soon, and is looked for again when Lidarr has finished.
-        let mut reading = self.with(|batch| batch.restore.iter().any(|known| known.of(lidarr.address(), artist)));
+        let mut reading = self.with(|batch| batch.restore.iter().any(|known| known.of(&lidarr.way_back_address(), artist)));
         if !reading && offers.iter().any(|offer| !listed.iter().any(|known| known.album == offer.album)) {
             reading = listed.is_empty() || twice(lidarr, || lidarr.busy_with(&HashSet::from([artist])))?.contains(&artist);
         }
@@ -1066,7 +1066,7 @@ impl Job {
         let mut errors = 0;
         loop {
             let waiting: HashSet<i64> = self.with(|batch| {
-                batch.wants.iter().filter(|want| want.state == State::Asked).map(|want| want.lidarr_artist).chain(batch.restore.iter().filter(|back| back.for_lidarr(lidarr.address())).map(|back| back.artist)).collect()
+                batch.wants.iter().filter(|want| want.state == State::Asked).map(|want| want.lidarr_artist).chain(batch.restore.iter().filter(|back| back.for_lidarr(&lidarr.way_back_address())).map(|back| back.artist)).collect()
             });
             if waiting.is_empty() {
                 return Ok(());
@@ -1138,9 +1138,9 @@ impl Job {
         let wanted: Vec<i64> =
             places.iter().filter_map(|(_, offer)| listed.iter().find(|known| known.album == offer.album)).filter(|known| !known.wanted && !known.have).map(|known| known.id).collect();
         lidarr.want(artist, &wanted)?;
-        if let Some(before) = self.with(|batch| batch.restore.iter().find(|known| known.of(lidarr.address(), artist)).map(|known| known.before.clone())) {
+        if let Some(before) = self.with(|batch| batch.restore.iter().find(|known| known.of(&lidarr.way_back_address(), artist)).map(|known| known.before.clone())) {
             lidarr.set_new_releases(artist, &before)?;
-            self.with(|batch| batch.restore.retain(|known| !known.of(lidarr.address(), artist)));
+            self.with(|batch| batch.restore.retain(|known| !known.of(&lidarr.way_back_address(), artist)));
         }
         drop(turn);
         let (notes, gone) = self.with(|batch| {
@@ -2011,7 +2011,7 @@ mod tests {
         let written = job.with(|batch| serde_json::to_value(&*batch).unwrap());
         assert_eq!(written["restore"], serde_json::json!([[5, "all"]]));
         let (b, sent_b) = recording("lidarr-b.test");
-        assert!(job.unfinished(b.address()));
+        assert!(job.unfinished(&b.way_back_address()));
         assert_eq!(job.finish(&b, 5, true, &|_| {}), Ok(Finished::Done));
         assert_eq!(puts(&sent_b).len(), 1);
         assert!(job.with(|batch| batch.restore.is_empty()));
@@ -2027,5 +2027,23 @@ mod tests {
         assert_eq!(job.finish(&lidarr, 5, true, &|_| {}), Ok(Finished::Busy));
         assert_eq!(puts(&sent), Vec::<String>::new());
         assert_eq!(job.with(|batch| batch.restore.len()), 1);
+    }
+
+    #[test]
+    fn a_way_back_names_its_lidarr_without_the_name_and_password_in_its_address() {
+        // An address saved with a reverse proxy's name and password in it (and an empty port).
+        let (before, _) = recording("http://walk:old-secret@lidarr.test:/base/");
+        let kept = Arc::new(Mutex::new(None));
+        let job = Job::new(Kept(kept.clone()));
+        assert_eq!(crate::lidarr::WayBack::keep(&job, &before.way_back_address(), 5, "all"), Ok(true));
+        let written = String::from_utf8(kept.lock().unwrap().clone().unwrap()).unwrap();
+        assert!(!written.contains("walk") && !written.contains("old-secret"), "{written}");
+        assert!(written.contains(r#"[5,"all","http://lidarr.test/base"]"#), "{written}");
+        // The password changed since: still that Lidarr's way back, and put back there.
+        let (after, sent) = recording("http://walk:new-secret@lidarr.test/base");
+        assert!(job.unfinished(&after.way_back_address()));
+        assert_eq!(job.finish(&after, 5, true, &|_| {}), Ok(Finished::Done));
+        assert_eq!(puts(&sent).len(), 1);
+        assert!(job.with(|batch| batch.restore.is_empty()));
     }
 }
