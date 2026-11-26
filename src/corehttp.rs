@@ -341,6 +341,26 @@ mod tests {
     }
 
     #[test]
+    fn the_public_services_agent_never_so_much_as_opens_a_connection_here() {
+        // A name with more than one answer on this machine ("localhost": 127.0.0.1 and ::1)
+        // is one the app's resolver would probe, connecting to each to see which answers
+        // first. For the public services, what's on this machine is left out before that.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let public = super::public(Duration::from_secs(5));
+        let names: Vec<std::net::SocketAddr> = std::net::ToSocketAddrs::to_socket_addrs(&("localhost", port)).unwrap().collect();
+        assert!(names.len() > 1, "this test needs \"localhost\" to have more than one answer: {names:?}");
+        assert!(public.send(&Request::get(&format!("http://localhost:{port}/ws/2/release"))).is_err());
+        std::thread::sleep(Duration::from_millis(300));
+        let mut opened = 0;
+        while listener.accept().is_ok() {
+            opened += 1;
+        }
+        assert_eq!(opened, 0, "a connection was opened to this machine");
+    }
+
+    #[test]
     fn the_public_services_agent_never_connects_to_this_machine_or_its_network() {
         // A server here, on this machine: asked by its address and by a name that leads to
         // it, it is never reached. What's judged is what the agent connects to.
