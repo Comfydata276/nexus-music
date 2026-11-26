@@ -858,7 +858,12 @@ pub fn note_no_links() {
 /// (the kept copy of the shared record, the start of the log of plays) can't be made safely
 /// on Linux, so they aren't made at all. Not each time it is tried, nor at each start.
 pub fn no_links_note(said: &mut bool) -> Option<&'static str> {
-    if *said || !NO_LINKS.load(std::sync::atomic::Ordering::SeqCst) {
+    no_links_note_given(NO_LINKS.load(std::sync::atomic::Ordering::SeqCst), said)
+}
+
+/// `no_links_note`, given whether the drive has been found without hard links.
+fn no_links_note_given(found: bool, said: &mut bool) -> Option<&'static str> {
+    if *said || !found {
         return None;
     }
     *said = true;
@@ -924,7 +929,10 @@ pub fn clear_settings_leftovers(dir: &Path, account_file: &str, account_stem: &s
     let pending = format!("pending-{account_stem}.json");
     let kept = format!("shared-record-kept-{account_file}-");
     let own = |name: &str| {
-        FILES.contains(&name) || (!account_stem.is_empty() && name == pending) || (!account_file.is_empty() && name.starts_with(&kept) && name.ends_with(".json"))
+        // (The kept copy's version is digits and dots, and nothing else.)
+        let version = name.strip_prefix(kept.as_str()).and_then(|rest| rest.strip_suffix(".json"));
+        let kept_copy = version.is_some_and(|version| !version.is_empty() && version.chars().all(|c| c.is_ascii_digit() || c == '.'));
+        FILES.contains(&name) || (!account_stem.is_empty() && name == pending) || (!account_file.is_empty() && kept_copy)
     };
     // What 0.40.10 and the versions before it could leave: each file's stem with `.tmp`
     // (written beside its place and renamed: the settings, the queue's two files, Recently
@@ -1437,14 +1445,14 @@ mod tests {
     fn a_drive_that_cant_make_hard_links_is_said_once() {
         // Linux keeps what is made once with a second name for it (`link`): on a drive that
         // can't make one, that is said, once ever, plainly; not each time it is tried.
+        // (Given the finding, not the one flag the whole run shares: another test may set it.)
         let mut said = false;
-        assert_eq!(no_links_note(&mut said), None);
-        note_no_links();
-        let first = no_links_note(&mut said);
+        assert_eq!(no_links_note_given(false, &mut said), None);
+        let first = no_links_note_given(true, &mut said);
         assert!(first.is_some_and(|note| note.contains("hard links")), "{first:?}");
-        assert_eq!(no_links_note(&mut said), None);
+        assert_eq!(no_links_note_given(true, &mut said), None);
         let mut said_before = true;
-        assert_eq!(no_links_note(&mut said_before), None);
+        assert_eq!(no_links_note_given(true, &mut said_before), None);
     }
 
     #[test]
@@ -1492,6 +1500,7 @@ mod tests {
             "settings.json.4242.0.tmp.txt",
             "settingsx.tmp",
             "shared-record-kept-acct-9f9f-0.40.10.tmp",
+            "shared-record-kept-acct-1a2b-notes.json.77.0.tmp",
         ];
         made(&settings, &cleared);
         made(&settings, &left);
