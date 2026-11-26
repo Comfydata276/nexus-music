@@ -40,6 +40,11 @@ pub struct PlayLog {
     whole: bool,
     /// The log is there and could not be read (`note`).
     unread: bool,
+    /// There was no log, and one could not be started (`begin`, `note`).
+    unstarted: bool,
+    /// Nor can it be on this drive, which can't make hard links: that is said once ever,
+    /// elsewhere (`config::no_links_note`), not at each start by the log.
+    no_links: bool,
 }
 
 /// The log is there and could not be read when the app started: what is counted is only
@@ -172,6 +177,16 @@ fn parse(line: &str) -> Option<(String, i64, String)> {
         .or_else(|| serde_json::from_str::<(String, i64)>(line).ok().map(|(song, at)| (song, at, String::new())))
 }
 
+/// The log, beside where versions before 0.26 kept the plays (`old`); and the file beside
+/// the log that plays go to while it can't be written (`PlayLog::aside`).
+pub fn log_file(old: &Path) -> PathBuf {
+    old.with_extension("log")
+}
+
+pub fn side_file(log: &Path) -> PathBuf {
+    log.with_extension("log.new")
+}
+
 impl PlayLog {
     /// Reads the log.
     ///
@@ -184,8 +199,14 @@ impl PlayLog {
     /// is read for the lines that read, and added to as usual; it is not written again
     /// whole (see `whole`).
     pub fn load(old: &Path, recent: &[(String, i64)]) -> PlayLog {
-        let path = old.with_extension("log");
-        let mut log = PlayLog { path, lines: 0, unwritten: Vec::new(), aside: false, whole: true, unread: false };
+        PlayLog::load_by(old, recent, &crate::config::ONCE)
+    }
+
+    /// `load`, starting a log by the steps given (a test's, to stop the app at one or have
+    /// one fail).
+    fn load_by(old: &Path, recent: &[(String, i64)], steps: &crate::config::Steps) -> PlayLog {
+        let path = log_file(old);
+        let mut log = PlayLog { path, lines: 0, unwritten: Vec::new(), aside: false, whole: true, unread: false, unstarted: false, no_links: false };
         if let Ok(mut sources) = SOURCES.write() {
             *sources = None;
         }
@@ -197,10 +218,26 @@ impl PlayLog {
                 log.whole = whole;
                 plays
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => match log.begin(old, recent) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => match log.begin(old, recent, steps) {
                 Ok(plays) => plays.into_iter().map(|(song, at)| (song, at, String::new())).collect(),
-                Err(_) => {
+                // Another start gave a log its name meanwhile: that is the log, and it is
+                // read as any other is.
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => match std::fs::read(&log.path) {
+                    Ok(bytes) => {
+                        let (plays, whole) = read(&bytes);
+                        log.whole = whole;
+                        plays
+                    }
+                    Err(_) => {
+                        log.aside = true;
+                        log.unread = true;
+                        Vec::new()
+                    }
+                },
+                Err(error) => {
                     log.aside = true;
+                    log.unstarted = true;
+                    log.no_links = error.kind() == std::io::ErrorKind::Unsupported;
                     Vec::new()
                 }
             },
@@ -235,16 +272,22 @@ impl PlayLog {
         log
     }
 
-    /// What to tell the person, once, when the log was there and could not be read.
+    /// What to tell the person, once, when the app has started: the log was there and
+    /// could not be read, or there was none and one could not be started.
     pub fn note(&self) -> Option<&'static str> {
-        self.unread.then_some(
-            "The plays kept on this PC couldn't be read when the app started, so they have been left exactly as they are. “Your stats” counts only what's played from now until the app next starts; those plays are kept, and added to the rest then.",
+        if self.unread {
+            return Some(
+                "The plays kept on this PC couldn't be read when the app started, so they have been left exactly as they are. “Your stats” counts only what's played from now until the app next starts; those plays are kept, and added to the rest then.",
+            );
+        }
+        (self.unstarted && !self.no_links).then_some(
+            "The record of your plays on this PC couldn't be started, so “Your stats” counts only what's played from now on. Those plays are kept beside it, and starting it is tried again when the app next starts.",
         )
     }
 
     /// Where plays are kept while the log itself is not to be written to (see `aside`).
     fn side(&self) -> PathBuf {
-        self.path.with_extension("log.new")
+        side_file(&self.path)
     }
 
     /// The file plays are added to in this run.
@@ -257,9 +300,16 @@ impl PlayLog {
     /// log has it. If it is there and can't be read just now, no log is made without it
     /// (an error); if it reads and isn't such a list, it is left where it is. Failing a
     /// list, the log starts with `recent`: what Recently played remembers, so that it
-    /// isn't empty on day one. The file is made only if it is still not there: a log is
-    /// never written over by this.
-    fn begin(&self, old: &Path, recent: &[(String, i64)]) -> std::io::Result<Vec<(String, i64)>> {
+    /// isn't empty on day one. The file comes to its name whole or not at all, and only if
+    /// nothing has the name (`config::write_whole`, with `config::ONCE`): a log is never
+    /// written over by this, and what a stopped start left beside it is never the log.
+    ///
+    /// **The list is removed by this run, the one that made the log from it, right after the
+    /// log is in place, and by nothing else.** A list found beside a log that is already
+    /// there (left by a run stopped between the two, or brought back from a backup) is never
+    /// read and never removed: the log is the log. Nor is a log that an earlier version left
+    /// cut short mended from it.
+    fn begin(&self, old: &Path, recent: &[(String, i64)], steps: &crate::config::Steps) -> std::io::Result<Vec<(String, i64)>> {
         let carried = match std::fs::read(old) {
             Ok(bytes) => serde_json::from_slice::<Vec<(String, i64)>>(&bytes).ok(),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -269,14 +319,10 @@ impl PlayLog {
         let mut plays = carried.unwrap_or_else(|| recent.to_vec());
         plays.sort_by_key(|(_, at)| *at);
         let lines: String = plays.iter().map(|(song, at)| line(song, *at, "")).collect();
-        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&self.path)?;
-        if let Err(error) = file.write_all(lines.as_bytes()).and_then(|()| file.sync_data()) {
-            // (It is this call's own file, made a moment ago: nothing else's is removed.)
-            drop(file);
-            let _ = std::fs::remove_file(&self.path);
-            return Err(error);
-        }
-        if from_old {
+        // In place, the log is the log; the list goes only once its name will outlast a
+        // power cut (its folder synced), and is otherwise left, never to be read.
+        let placed = crate::config::write_whole(&self.path, lines.as_bytes(), crate::config::Durable::Flushed, steps)?;
+        if from_old && placed == crate::config::Placed::Synced {
             let _ = std::fs::remove_file(old);
         }
         Ok(plays)
@@ -284,7 +330,7 @@ impl PlayLog {
 
     fn rewrite(&self, plays: &[(String, i64)]) {
         let text: String = plays.iter().map(|(song, at)| line(song, *at, &source_of(song, *at))).collect();
-        crate::config::write_atomically(&self.path, text.as_bytes());
+        let _ = crate::config::write_surely(&self.path, text.as_bytes());
     }
 
     /// Takes the oldest plays out once the log is well past its limit.
@@ -509,8 +555,8 @@ mod tests {
         // between a check and a read for it to change in. And if one has appeared by the
         // time the new one is made, it is not written over.
         std::fs::write(&path, "[\"a\",100]\n").unwrap();
-        let log = PlayLog { path: path.clone(), lines: 0, unwritten: Vec::new(), aside: false, whole: true, unread: false };
-        assert!(log.begin(&old, &[play("z", 50)]).is_err());
+        let log = PlayLog { path: path.clone(), lines: 0, unwritten: Vec::new(), aside: false, whole: true, unread: false, unstarted: false, no_links: false };
+        assert!(log.begin(&old, &[play("z", 50)], &crate::config::ONCE).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "[\"a\",100]\n");
         std::fs::remove_file(&path).unwrap();
         // The list from before 0.26 is there and is damaged: the log starts from Recently
@@ -528,6 +574,7 @@ mod tests {
                 let mut log = PlayLog::load(&old, &[play("z", 50)]);
                 log.add("c", 300, "");
                 assert!(!path.exists());
+                assert!(log.note().is_some_and(|note| note.contains("couldn't be started")));
             }
         }
         // And when it can: carried over, with what was played meanwhile.
@@ -568,13 +615,15 @@ mod tests {
         std::fs::write(&path, "[\"a\",100]\n[\"b\",200]\n").unwrap();
         let mut log = PlayLog::load(&old, &[]);
         let told = [("b".to_string(), 200, "playlist:p".to_string())];
-        // The file can't be written again (a folder stands where its new text is put first).
-        let way = path.with_extension("tmp");
-        std::fs::create_dir_all(&way).unwrap();
+        // The file can't be written again (a folder stands where it is to be renamed to).
+        let away = path.with_extension("away");
+        std::fs::rename(&path, &away).unwrap();
+        std::fs::create_dir_all(&path).unwrap();
         assert!(log.keep(&[play("b", 200)], &told).is_err());
         assert!(sources().is_empty(), "the source is not known here while the file does not have it");
         // It can now: the source is asked about again, and this time it is in the file.
-        std::fs::remove_dir_all(&way).unwrap();
+        std::fs::remove_dir_all(&path).unwrap();
+        std::fs::rename(&away, &path).unwrap();
         assert_eq!(log.keep(&[play("b", 200)], &told).unwrap(), 0);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "[\"a\",100]\n[\"b\",200,\"playlist:p\"]\n");
         assert_eq!(sources(), told);
@@ -621,7 +670,7 @@ mod tests {
         // Plays that can't be written to the file are not counted as kept: the log is as it
         // was, here and on the disk. (A folder stands where the file should be.)
         let before = shared();
-        let mut blocked = PlayLog { path: std::env::temp_dir(), lines: before.len(), unwritten: Vec::new(), aside: false, whole: true, unread: false };
+        let mut blocked = PlayLog { path: std::env::temp_dir(), lines: before.len(), unwritten: Vec::new(), aside: false, whole: true, unread: false, unstarted: false, no_links: false };
         assert!(blocked.keep(&[("never".to_string(), 500)], &[]).is_err());
         assert_eq!(shared(), before);
         // With nothing new there is nothing to write, and nothing to fail.
@@ -639,12 +688,19 @@ mod tests {
         assert_eq!(shared(), [("a".to_string(), 100), ("b".to_string(), 200)]);
         // A play made here while the file can't be written is counted, but nothing is said
         // to be kept until it has been: then it is in the file, once, with the others.
+        // (The file is made read-only, and then writable again.)
         let mut log = PlayLog::load(&old, &[]);
-        let file = std::mem::replace(&mut log.path, std::env::temp_dir());
+        let writable = |yes: bool| {
+            let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            permissions.set_readonly(!yes);
+            std::fs::set_permissions(&path, permissions).unwrap();
+        };
+        writable(false);
         log.add("c", 300, "playlist:q");
         assert_eq!(shared().len(), 3);
         assert!(log.keep(&[], &[]).is_err() && log.keep(&[("d".to_string(), 400)], &[]).is_err());
-        log.path = file;
+        writable(true);
         assert_eq!(log.keep(&[("d".to_string(), 400)], &[]).unwrap(), 1);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "[\"a\",100]\n[\"b\",200]\n[\"c\",300,\"playlist:q\"]\n[\"d\",400]\n");
         // A play already in the log is given a source that another device tells of later,
@@ -663,4 +719,167 @@ mod tests {
         assert_eq!(shared(), [("x".to_string(), 10), ("y".to_string(), 20)]);
         let _ = std::fs::remove_file(&path);
     }
+
+    /// Runs `load_by` and has the app "killed" where `steps` panic: what was done up to
+    /// there stays on the disk, and nothing after it is done. Says whether it was killed.
+    fn killed(old: &Path, steps: crate::config::Steps) -> bool {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| PlayLog::load_by(old, &[play("z", 50)], &steps))).is_err()
+    }
+
+    const LIST: &str = r#"[["a",100],["b",200],["c",300]]"#;
+    const LOGGED: &str = "[\"a\",100]\n[\"b\",200]\n[\"c\",300]\n";
+
+    #[test]
+    fn a_log_cut_short_by_a_kill_while_it_is_started_is_never_at_its_name() {
+        use crate::config::{ONCE, Steps};
+        let _turn = turn();
+        let (old, path) = fresh("kill");
+        // What a killed run left beside it (as this version names it, and as 0.40.10 did).
+        let left = [path.with_file_name("plays.log.4242.0.tmp"), path.with_file_name("plays.tmp")];
+        std::fs::write(&old, LIST).unwrap();
+        // Killed the moment the file was made, empty, and again when it was written and
+        // made sure of and not yet named: there is no log, and the list it is started from
+        // is still there.
+        let made_then_killed = Steps {
+            create: |path| {
+                let _empty = (ONCE.create)(path)?;
+                panic!("killed")
+            },
+            ..ONCE
+        };
+        assert!(killed(&old, made_then_killed));
+        assert!(!path.exists(), "an empty log at its name");
+        let written_then_killed = Steps { place: |_, _| panic!("killed"), ..ONCE };
+        assert!(killed(&old, written_then_killed));
+        assert!(!path.exists(), "a log at its name before it was given it");
+        assert_eq!(std::fs::read_to_string(&old).unwrap(), LIST);
+        // What a kill left beside it, half written, is not the log: the next start makes
+        // the log whole, from the list, and never reads it. (The app clears it as it starts.)
+        for left in &left {
+            std::fs::write(left, "[\"a\",100]\n[\"b\",2").unwrap();
+        }
+        let log = PlayLog::load(&old, &[play("z", 50)]);
+        assert_eq!(shared(), [play("a", 100), play("b", 200), play("c", 300)]);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), LOGGED);
+        assert!(!old.exists() && log.note().is_none());
+        crate::config::clear_settings_leftovers(path.parent().unwrap(), "", "");
+        assert!(left.iter().all(|left| !left.exists()) && path.exists());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_log_that_cannot_be_made_sure_of_or_named_is_not_started_and_nothing_is_lost() {
+        use crate::config::{ONCE, Steps};
+        let _turn = turn();
+        let (old, path) = fresh("fail");
+        fn fails() -> std::io::Result<()> {
+            Err(std::io::Error::other("the disk said no"))
+        }
+        std::fs::write(&old, LIST).unwrap();
+        for steps in [Steps { flush: |_| fails(), ..ONCE }, Steps { place: |_, _| fails(), ..ONCE }] {
+            let mut log = PlayLog::load_by(&old, &[play("z", 50)], &steps);
+            // Nothing at its name, and nothing of this start's beside it.
+            let names: Vec<String> = std::fs::read_dir(path.parent().unwrap()).unwrap().map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned()).filter(|name| name != "plays.log.new").collect();
+            assert_eq!(names, ["plays.json"]);
+            // And says so, once, when the app has started.
+            assert!(log.note().is_some_and(|note| note.contains("couldn't be started")));
+            // What is played meanwhile is kept beside it, as for a log that can't be read.
+            log.add("d", 400, "");
+            assert_eq!(std::fs::read_to_string(&old).unwrap(), LIST);
+        }
+        // The next start that can make it starts it from the list, and joins what was
+        // played meanwhile (once).
+        PlayLog::load(&old, &[play("z", 50)]);
+        assert_eq!(shared(), [play("a", 100), play("b", 200), play("c", 300), play("d", 400)]);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), format!("{LOGGED}[\"d\",400]\n"));
+        assert!(!old.exists());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_log_in_place_whose_folder_couldnt_be_synced_is_the_log_and_the_list_stays() {
+        use crate::config::{ONCE, Steps};
+        let _turn = turn();
+        let (old, path) = fresh("unsynced");
+        std::fs::write(&old, LIST).unwrap();
+        // Given its name, and the folder not synced: the log is there, and it is the log
+        // (read, and written to); but its name may not outlast a power cut, so the list it
+        // was made from isn't removed, and won't be, by anything (it is beside a log now).
+        let unsynced = Steps { sync_folder: |_| Err(std::io::Error::other("the disk said no")), ..ONCE };
+        let mut log = PlayLog::load_by(&old, &[play("z", 50)], &unsynced);
+        assert_eq!(shared(), [play("a", 100), play("b", 200), play("c", 300)]);
+        assert!(log.note().is_none());
+        log.add("d", 400, "");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), format!("{LOGGED}[\"d\",400]\n"));
+        assert_eq!(std::fs::read_to_string(&old).unwrap(), LIST);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_log_that_cant_be_started_for_want_of_hard_links_says_so_once_and_not_at_every_start() {
+        use crate::config::{ONCE, Steps};
+        let _turn = turn();
+        let (old, path) = fresh("nolinks");
+        std::fs::write(&old, LIST).unwrap();
+        let no_links = Steps {
+            place: |_, _| {
+                crate::config::note_no_links();
+                Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "no hard links here"))
+            },
+            ..ONCE
+        };
+        // Not started, and played into the file beside it, as for any start that fails; but
+        // what is said is said once (`config::no_links_note`), not by the log at each start.
+        let log = PlayLog::load_by(&old, &[play("z", 50)], &no_links);
+        assert!(!path.exists() && log.note().is_none());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_list_beside_a_log_that_is_there_is_never_read_or_removed() {
+        let _turn = turn();
+        let (old, path) = fresh("beside");
+        // A list from before 0.26 beside a log: left by a run that made the log and was
+        // stopped before it removed the list, or brought back from a backup or another PC.
+        // Whichever it is, the log is the log: nothing of the list is read into it, and the
+        // list is not touched. Nor is a log an earlier version left cut short mended from
+        // it: the log's own rules read what is there, and no more.
+        let list = r#"[["a",100],["b",200],["c",300],["new",900]]"#;
+        for log in ["[\"a\",100]\n[\"b\",200]\n", "[\"a\",100]\n[\"b\",2", ""] {
+            std::fs::write(&old, list).unwrap();
+            std::fs::write(&path, log).unwrap();
+            let started = PlayLog::load(&old, &[play("z", 50)]);
+            assert_eq!(std::fs::read(&path).unwrap(), log.as_bytes(), "the log changed");
+            assert_eq!(std::fs::read_to_string(&old).unwrap(), list, "the list changed");
+            let want: Vec<(String, i64)> = read(log.as_bytes()).0.into_iter().map(|(song, at, _)| (song, at)).collect();
+            assert_eq!(shared(), want);
+            assert!(started.note().is_none());
+        }
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_log_that_appears_while_one_is_started_is_read() {
+        use crate::config::{ONCE, Steps};
+        let _turn = turn();
+        let (old, path) = fresh("appears");
+        std::fs::write(&old, LIST).unwrap();
+        // Another start gives the log its name first: that log is read and written to, and
+        // the list, which this run did not make a log from, stays.
+        let raced = Steps {
+            place: |from, to| {
+                std::fs::write(to, "[\"x\",1]\n").unwrap();
+                (ONCE.place)(from, to)
+            },
+            ..ONCE
+        };
+        let mut log = PlayLog::load_by(&old, &[play("z", 50)], &raced);
+        assert_eq!(shared(), [play("x", 1)]);
+        assert!(log.note().is_none());
+        log.add("d", 400, "");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[\"x\",1]\n[\"d\",400]\n");
+        assert_eq!(std::fs::read_to_string(&old).unwrap(), LIST);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
 }

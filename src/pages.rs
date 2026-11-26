@@ -599,6 +599,13 @@ pub fn request_card(offer: &crate::lidarr::Offer) -> CardData {
     }
 }
 
+/// What the Requests page says at its top: what was found wrong with the files what's asked
+/// for is kept in, when the app started, and after that how a batch stands. A batch's
+/// progress, drawn as it changes, never takes the place of the first.
+pub fn requests_notice(batch: &str) -> String {
+    [crate::asked::trouble(), crate::bulk::trouble(), batch.to_string()].into_iter().filter(|said| !said.is_empty()).collect::<Vec<_>>().join(" ")
+}
+
 /// The albums that have been asked for: those that have arrived lately, then those still on
 /// their way (see `nexus_core::requests::on_their_way`).
 fn requests() -> PageData {
@@ -635,12 +642,7 @@ fn requests() -> PageData {
     };
     // A batch of albums being asked for (see `bulk`): how it stands, and what it couldn't ask for.
     let (notice, action, other) = crate::bulk::summary().notice();
-    // The list of what was asked for couldn't be read when the app started: said first.
-    page.notice = match (crate::asked::unreadable(), notice.is_empty()) {
-        (true, true) => nexus_core::requests::asked_unreadable("computer"),
-        (true, false) => format!("{} {notice}", nexus_core::requests::asked_unreadable("computer")),
-        (false, _) => notice,
-    };
+    page.notice = requests_notice(&notice);
     page.notice_action = action.to_string();
     page.notice_other = other.to_string();
     let missed = crate::bulk::missed();

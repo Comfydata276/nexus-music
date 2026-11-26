@@ -387,7 +387,8 @@ impl Controller {
                 self.looked_up(waiting);
             }
         }
-        self.save_settings();
+        // (A new queue starting: in passing.)
+        self.save_settings_in_passing();
         self.start_current(0.0);
         self.sync_transport();
         self.sync_page_shuffle();

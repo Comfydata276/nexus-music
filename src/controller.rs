@@ -483,6 +483,19 @@ impl Controller {
     pub fn install(ui: ui::MainWindow) -> Rc<Controller> {
         let paths = Paths::new();
         let (settings, settings_note) = Settings::load_checked(&paths.settings);
+        // What writes killed part-way left beside the app's files, for the account signed
+        // in: cleared now, once, before anything is written (`config::clear_leftovers`).
+        {
+            let stem = if settings.server.is_empty() { String::new() } else { account_stem(&settings.server, &settings.username) };
+            let downloads = if settings.downloads_dir.is_empty() { paths.downloads.clone() } else { PathBuf::from(&settings.downloads_dir) };
+            if let Some(dir) = paths.settings.parent() {
+                config::clear_settings_leftovers(dir, &settings.account_file(), &stem);
+            }
+            if let Some(dir) = paths.crash_log.parent() {
+                config::clear_data_leftovers(dir);
+            }
+            config::clear_downloads_leftovers(&downloads, &stem);
+        }
         let play_log = {
             let recent: Vec<(String, i64)> = config::load_history(&paths.history).into_iter().map(|played| (played.song.id, played.at)).collect();
             crate::plays::PlayLog::load(&paths.plays, &recent)
@@ -644,20 +657,40 @@ impl Controller {
     /// last time.
     fn say_startup_notes(self: &Rc<Self>) {
         // How much of the crash log has been mentioned already is kept beside it.
-        let seen_file = self.paths.crash_log.with_extension("seen");
+        let seen_file = config::crash_seen(&self.paths);
         let size = std::fs::metadata(&self.paths.crash_log).map(|meta| meta.len()).unwrap_or(0);
         let seen: u64 = std::fs::read_to_string(&seen_file).ok().and_then(|text| text.trim().parse().ok()).unwrap_or(0);
         let crashed = size > seen;
         if crashed {
-            let _ = std::fs::write(&seen_file, size.to_string());
+            // Whole or not at all: a number cut short would be taken for one that was seen.
+            let _ = config::write_surely(&seen_file, size.to_string().as_bytes());
         }
         let note = self.startup_note.borrow_mut().take().or_else(|| {
             crashed.then(|| "The app stopped unexpectedly last time. “Save diagnostics” under Settings, About has what was noted.".to_string())
         });
+        // (Said once ever, with whatever else is said now.)
+        let links = config::no_links_note(&mut self.settings.borrow_mut().said_no_links);
+        if links.is_some() {
+            self.save_settings();
+        }
+        let note = match (note, links) {
+            (Some(note), Some(links)) => Some(format!("{note} {links}")),
+            (note, links) => note.or(links.map(str::to_string)),
+        };
         if let Some(note) = note {
             slint::Timer::single_shot(Duration::from_millis(1500), move || {
                 with(|ctl| ctl.show_toast(note.into(), "", Duration::from_secs(10)));
             });
+        }
+    }
+
+    /// Tells the person, once ever, that the settings folder's drive can't make hard links,
+    /// the first time that is found out after the app has started (`config::no_links_note`).
+    pub fn say_no_links_once(&self) {
+        let note = config::no_links_note(&mut self.settings.borrow_mut().said_no_links);
+        if let Some(note) = note {
+            self.save_settings();
+            self.show_toast(note.into(), "", Duration::from_secs(10));
         }
     }
 
@@ -868,8 +901,14 @@ impl Controller {
         self.edit_playlist(playlist, expected, edit);
     }
 
+    /// Saves the settings after a change the person made: flushed to the disk.
     pub fn save_settings(&self) {
         self.settings.borrow().save(&self.paths.settings);
+    }
+
+    /// Saves the settings in passing, as an exchange or a new queue starting does.
+    pub fn save_settings_in_passing(&self) {
+        self.settings.borrow().save_in_passing(&self.paths.settings);
     }
 
     // ---- start-up and sign-in ----------------------------------------------------------------
@@ -1357,13 +1396,13 @@ impl Controller {
 
     /// Who is signed in, as a name that can be part of a file's name; empty when nobody is.
     pub fn account(&self) -> String {
-        self.client().map(|client| file_stem(&format!("{}|{}", client.server(), client.username()))).unwrap_or_default()
+        self.client().map(|client| account_stem(client.server(), client.username())).unwrap_or_default()
     }
 
     /// Where the changes held for the server are kept for whoever is signed in.
     pub fn pending_path(&self) -> Option<PathBuf> {
         let account = self.account();
-        (!account.is_empty()).then(|| self.paths.pending.with_file_name(format!("pending-{account}.json")))
+        (!account.is_empty()).then(|| config::pending_file(&self.paths, &account))
     }
 
     /// Brings in what belongs to the account that has just signed in: its downloads, and
@@ -1663,7 +1702,7 @@ impl Controller {
         self.toast(nexus_core::requests::asking_for(&title));
         self.requests_pool.spawn(move || {
             // (Nothing on Windows stops a request, so "stopped" can't come of it.)
-            let result = nexus_core::requests::request(&lidarr, crate::lidarr::offers(), &album).unwrap_or_else(|_| Err(nexus_core::http::STOPPED.into()));
+            let result = nexus_core::requests::request(&lidarr, crate::lidarr::offers(), &album, crate::bulk::way_back()).unwrap_or_else(|_| Err(nexus_core::http::STOPPED.into()));
             post(move |ctl| match result {
                 Ok(artist) => {
                     // Noted, so it can be followed up when it arrives.
@@ -1871,6 +1910,7 @@ impl Controller {
             return;
         }
         let (notice, action, other) = crate::bulk::summary().notice();
+        let notice = pages::requests_notice(&notice);
         let view = self.ui.global::<ui::View>();
         view.set_notice(notice.as_str().into());
         view.set_notice_action(action.into());
@@ -2212,7 +2252,7 @@ impl Controller {
         let online = !self.is_offline();
         self.api_pool.spawn(move || {
             let _ = std::fs::create_dir_all(&dir);
-            let file = dir.join("library.json");
+            let file = config::library_file(&dir);
             let mut renewed = false;
             if crate::search::current().is_none() {
                 if let Some(library) = crate::search::Library::load(&file) {
@@ -2491,7 +2531,7 @@ impl Controller {
 
     /// Where lyrics are kept for the server that's signed in to (see `lyrics`).
     pub fn lyrics_dir(&self) -> Option<PathBuf> {
-        Some(self.pages_dir()?.join("lyrics"))
+        Some(config::lyrics_dir(&self.pages_dir()?))
     }
 
     /// A stored copy of a page and its age: from memory, or from disk on the first visit of
@@ -4322,6 +4362,11 @@ pub(crate) fn store_page(file: &std::path::Path, page: &PageData) {
     let _ = std::fs::write(file, json);
 }
 
+/// An account as the names of its lists of downloads and what waits to be sent have it.
+pub(crate) fn account_stem(server: &str, username: &str) -> String {
+    file_stem(&format!("{server}|{username}"))
+}
+
 /// A file-system-safe rendering of a cache key. Keys that differ only in characters this
 /// replaces are told apart by the hash `file_name` appends.
 fn file_stem(key: &str) -> String {
@@ -4423,5 +4468,24 @@ impl Controller {
                 s.eq_saved.remove(index);
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_page_cut_short_is_not_there_and_is_fetched_again() {
+        let path = std::env::temp_dir().join(format!("nexus-page-{}.json", std::process::id()));
+        let page = crate::pages::PageData { title: "Road Trip".into(), ..Default::default() };
+        let whole = serde_json::to_vec(&page).unwrap();
+        std::fs::write(&path, &whole).unwrap();
+        assert_eq!(super::read_page(&path).map(|(_, read)| read), Some(page));
+        // Written in place (it can be fetched again): cut short, or emptied, it is no page,
+        // and the page is fetched as if none was kept.
+        for cut in [&whole[..0], &whole[..whole.len() / 2], &whole[..whole.len() - 1]] {
+            std::fs::write(&path, cut).unwrap();
+            assert!(super::read_page(&path).is_none(), "{}", String::from_utf8_lossy(cut));
+        }
+        let _ = std::fs::remove_file(&path);
     }
 }

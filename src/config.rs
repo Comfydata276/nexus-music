@@ -66,7 +66,16 @@ impl Paths {
             ),
             None => (config, cache, data),
         };
-        let paths = Paths {
+        let paths = Paths::at(&config, &cache, &data);
+        for dir in [&config, &paths.covers, &paths.pages, &paths.buffers, &paths.songs] {
+            let _ = fs::create_dir_all(dir);
+        }
+        paths
+    }
+
+    /// Where each file goes, in these three folders (see `docs/FILES.md`).
+    fn at(config: &Path, cache: &Path, data: &Path) -> Paths {
+        Paths {
             settings: config.join("settings.json"),
             queue: config.join("queue.json"),
             queue_place: config.join("queue-place.json"),
@@ -88,11 +97,7 @@ impl Paths {
             plays: config.join("plays.json"),
             #[cfg(not(windows))]
             secret: config.join("credential"),
-        };
-        for dir in [&config, &paths.covers, &paths.pages, &paths.buffers, &paths.songs] {
-            let _ = fs::create_dir_all(dir);
         }
-        paths
     }
 }
 
@@ -228,6 +233,9 @@ pub struct Settings {
     pub check_updates: bool,
     /// The newest version the user has already been told about.
     pub update_notified: String,
+    /// The person has been told that the settings folder's drive can't make hard links
+    /// (`no_links_note`).
+    pub said_no_links: bool,
 }
 
 impl Default for Settings {
@@ -293,6 +301,7 @@ impl Default for Settings {
             close_to_tray: true,
             check_updates: true,
             update_notified: String::new(),
+            said_no_links: false,
         }
     }
 }
@@ -478,6 +487,11 @@ impl Settings {
     /// one: the copy kept from the last good start is used, and failing that the damaged
     /// file is put aside under another name. The second value says so when either happened.
     pub fn load_checked(path: &Path) -> (Settings, Option<String>) {
+        Settings::load_checked_by(path, place_new)
+    }
+
+    /// `load_checked`, moving a damaged file aside by `aside_by` (a test's, to have it fail).
+    fn load_checked_by(path: &Path, aside_by: fn(&Path, &Path) -> std::io::Result<()>) -> (Settings, Option<String>) {
         let backup = backup_of(path);
         let fresh = || {
             let mut settings = Settings::default();
@@ -497,18 +511,29 @@ impl Settings {
             let _ = fs::copy(&backup, path);
             return (settings, Some("Your settings file was damaged, so the copy from the last time the app started was used.".into()));
         }
-        let aside = path.with_extension("damaged.json");
-        let _ = fs::rename(path, &aside);
-        let note = format!(
-            "Your settings file couldn't be read and there was no copy to fall back on. It has been kept as {}, and the app has started with its default settings.",
-            aside.file_name().map(|name| name.to_string_lossy().to_string()).unwrap_or_default()
-        );
+        // Kept under a name of its own (`set_aside`), and said to be only if it was.
+        let note = match set_aside_by(path, aside_by) {
+            Some(aside) => format!(
+                "Your settings file couldn't be read and there was no copy to fall back on. It has been kept as {}, and the app has started with its default settings.",
+                aside.file_name().map(|name| name.to_string_lossy().to_string()).unwrap_or_default()
+            ),
+            None => "Your settings file couldn't be read, there was no copy to fall back on, and it couldn't be moved aside. The app has started with its default settings, which will take its place when they are next saved.".to_string(),
+        };
         (fresh(), Some(note))
     }
 
+    /// Saves the settings after a change the person made: flushed to the disk.
     pub fn save(&self, path: &Path) {
         if let Ok(json) = serde_json::to_vec_pretty(self) {
-            write_atomically(path, &json);
+            let _ = write_surely(path, &json);
+        }
+    }
+
+    /// Saves the settings in passing, as an exchange or a new queue starting does: not
+    /// waiting for the disk (`Durable::InPassing`).
+    pub fn save_in_passing(&self, path: &Path) {
+        if let Ok(json) = serde_json::to_vec_pretty(self) {
+            let _ = write_in_passing(path, &json);
         }
     }
 
@@ -655,55 +680,67 @@ pub fn load_history(path: &Path) -> Vec<Played> {
     songs.into_iter().enumerate().map(|(index, song)| Played { song, at: newest - 200 * index as i64 }).collect()
 }
 
+/// Saves Recently played as a song starts, or as an exchange brings plays from elsewhere: in
+/// passing (`Durable::InPassing`).
 pub fn save_history(path: &Path, history: &[Played]) {
     if let Ok(json) = serde_json::to_vec(history) {
-        write_atomically(path, &json);
+        let _ = write_in_passing(path, &json);
     }
 }
 
-pub fn write_atomically(path: &Path, bytes: &[u8]) {
-    let temp = path.with_extension("tmp");
-    if fs::write(&temp, bytes).is_ok() {
-        let _ = fs::rename(&temp, path);
-    }
+/// **The one way the app writes a file it must not lose**, so that a kill or a power cut
+/// leaves either the file as it was or the file as it is now, never one cut short, and never
+/// an empty one: written beside its place under a name of this write's own (`temp_for`),
+/// flushed to the disk, given its name by `steps.place`, and its folder synced (Linux). It
+/// renames only its own file, and removes only its own if a step fails; then it is an
+/// error, and the file as it was. What killed runs left beside it is never read, and is
+/// cleared when the app starts (`clear_leftovers`), never by a write in passing: it could
+/// be another write's, under way.
+///
+/// Whether it may replace a file that has the name is the steps': `REPLACING` (`fs::rename`,
+/// for a file written again and again: `write_surely`) does, `ONCE` (for a file made once and
+/// never replaced: the kept copy of the shared record, the start of the log of plays) never
+/// does, and gives `AlreadyExists` instead.
+/// A file written whole is in place: and its folder synced, or (Linux) not, so that its
+/// name may not outlast a power cut. Either way it is written: the file has changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Placed {
+    Synced,
+    Unsynced,
 }
 
-/// As `write_atomically`, for what has to be known to be on the disk: written, flushed to
-/// the disk, and put in place, or an error and the file as it was.
-pub fn write_surely(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+/// Whether a write waits for the disk: the rule at the top of `docs/FILES.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Durable {
+    /// Made because the person just did something, or wanted on the disk before the app
+    /// acts on it: flushed before it is given its name, and its folder synced (Linux).
+    Flushed,
+    /// Made by a timer, or by playback moving on: renamed into place without a flush, as
+    /// 0.40.10 wrote everything. A kill leaves the old file or the new one; a power cut within
+    /// a few seconds of it can leave the name empty.
+    InPassing,
+}
+
+pub fn write_whole(path: &Path, bytes: &[u8], durable: Durable, steps: &Steps) -> std::io::Result<Placed> {
     use std::io::Write;
-    let temp = beside(path);
-    let mut file = fs::File::create(&temp)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    drop(file);
-    fs::rename(&temp, path)
-}
-
-/// The name beside a file's that it is written under before it is put in place.
-pub fn beside(path: &Path) -> PathBuf {
-    path.with_extension("tmp")
-}
-
-/// As `write_surely`, for a file that is made once and never replaced: written beside its
-/// place, flushed to the disk, and only then given its name, if nothing has that name; then
-/// its folder is synced. So whatever is at the name is the whole file, or nothing is. If
-/// something has the name already it is left as it is, and the error is `AlreadyExists`.
-/// What a stopped attempt left beside the name is never read: it is cleared first.
-pub fn write_once(path: &Path, bytes: &[u8], steps: &Steps) -> std::io::Result<()> {
-    use std::io::Write;
-    let temp = beside(path);
-    // Removed, not written over: the next file there is a new one, so nothing else that
-    // names the old one (on Linux, the copy itself, if an attempt was stopped between the
-    // two steps of its move) is written through it.
-    match fs::remove_file(&temp) {
-        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
-        _ => {}
-    }
+    // A new file, never one that is there: a name of a killed run's that came round again
+    // (the same process number, and its count) is passed over for the next.
+    let (temp, mut file) = {
+        let mut tries = 0;
+        loop {
+            let temp = temp_for(path);
+            match (steps.create)(&temp) {
+                Ok(file) => break (temp, file),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && tries < 8 => tries += 1,
+                Err(error) => return Err(error),
+            }
+        }
+    };
     let placed = (|| {
-        let mut file = (steps.create)(&temp)?;
         file.write_all(bytes)?;
-        (steps.flush)(&file)?;
+        if durable == Durable::Flushed {
+            (steps.flush)(&file)?;
+        }
         drop(file);
         (steps.place)(&temp, path)
     })();
@@ -712,29 +749,203 @@ pub fn write_once(path: &Path, bytes: &[u8], steps: &Steps) -> std::io::Result<(
         let _ = fs::remove_file(&temp);
     }
     placed?;
-    (steps.sync_folder)(path)
+    if durable == Durable::InPassing {
+        return Ok(Placed::Unsynced);
+    }
+    Ok(if (steps.sync_folder)(path).is_ok() { Placed::Synced } else { Placed::Unsynced })
 }
 
-/// The steps by which `write_once` puts a file on the disk, given so that a test can have
-/// the app stopped at one of them, or have one fail. `ON_DISK` are the real ones.
+/// `write_whole`, over whatever has the name: for what is written again and again (the
+/// settings, the queue, what waits to be sent, ...). A caller that has nothing to do about a
+/// failure leaves the error be: the file is then as it was.
+pub fn write_surely(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_whole(path, bytes, Durable::Flushed, &REPLACING).map(drop)
+}
+
+/// `write_whole`, over whatever has the name, not waiting for the disk (`Durable::InPassing`).
+pub fn write_in_passing(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_whole(path, bytes, Durable::InPassing, &REPLACING).map(drop)
+}
+
+/// The name a write puts its file under, beside `path`, before it gives it the name: the
+/// whole of `path`'s name, this process's number, and a count of this process's writes. No
+/// other write, here or in another copy of the app, makes the same one.
+pub fn temp_for(path: &Path) -> PathBuf {
+    static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let count = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+    path.with_file_name(format!("{name}.{}.{count}.tmp", std::process::id()))
+}
+
+/// Moves a file that couldn't be read aside, under a name of its own (`asked.json` to
+/// `asked.damaged-20261126-101500.json`, with `-2` and so on after it if that is had), never
+/// over another. Says where it went, or `None` if it couldn't be moved: then it is where it
+/// was.
+pub fn set_aside(path: &Path) -> Option<PathBuf> {
+    set_aside_by(path, place_new)
+}
+
+fn set_aside_by(path: &Path, place: fn(&Path, &Path) -> std::io::Result<()>) -> Option<PathBuf> {
+    let stem = path.file_stem()?.to_string_lossy().into_owned();
+    let extension = path.extension().map(|extension| format!(".{}", extension.to_string_lossy())).unwrap_or_default();
+    let when = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    for count in 1..100 {
+        let more = if count == 1 { String::new() } else { format!("-{count}") };
+        let aside = path.with_file_name(format!("{stem}.damaged-{when}{more}{extension}"));
+        match place(path, &aside) {
+            // On Linux the move is a second name and then the first removed: if the first is
+            // still there, it wasn't moved, and the second name goes again.
+            Ok(()) if fs::symlink_metadata(path).is_ok() => {
+                let _ = fs::remove_file(&aside);
+                return None;
+            }
+            Ok(()) => return Some(aside),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+/// The settings folder's drive can't make hard links (`place_new`, Linux), noted the first
+/// time a file made once is tried there.
+static NO_LINKS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn note_no_links() {
+    NO_LINKS.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// What to tell the person, **once ever** (`said` is kept in the settings), when the drive
+/// the settings are on can't make hard links: without them the files that are made once
+/// (the kept copy of the shared record, the start of the log of plays) can't be made safely
+/// on Linux, so they aren't made at all. Not each time it is tried, nor at each start.
+pub fn no_links_note(said: &mut bool) -> Option<&'static str> {
+    if *said || !NO_LINKS.load(std::sync::atomic::Ordering::SeqCst) {
+        return None;
+    }
+    *said = true;
+    Some(
+        "The drive this PC keeps Nexus Music's settings on can't make hard links, which the app needs on Linux to keep some files safely. So nothing is shared from this PC with your other devices, and “Your stats” counts only what's played while the app runs. Moving the settings to a drive formatted for Linux puts that right.",
+    )
+}
+
+
+/// How much of the crash log has been mentioned already, kept beside it.
+pub fn crash_seen(paths: &Paths) -> PathBuf {
+    paths.crash_log.with_extension("seen")
+}
+
+/// What waits to be sent to the server for an account (`controller::account_stem`).
+pub fn pending_file(paths: &Paths, account: &str) -> PathBuf {
+    paths.pending.with_file_name(format!("pending-{account}.json"))
+}
+
+/// The copy of the library search goes by, and the lyrics kept, in a sign-in's folder of
+/// the page cache.
+pub fn library_file(pages: &Path) -> PathBuf {
+    pages.join("library.json")
+}
+
+pub fn lyrics_dir(pages: &Path) -> PathBuf {
+    pages.join("lyrics")
+}
+
+/// The file a write's own file (`temp_for`) was made for, if `name` is one:
+/// `<file>.<process>.<count>.tmp`.
+fn made_for(name: &str) -> Option<&str> {
+    let rest = name.strip_suffix(".tmp")?;
+    let (rest, count) = rest.rsplit_once('.')?;
+    let (file, process) = rest.rsplit_once('.')?;
+    let digits = |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
+    (digits(process) && digits(count) && !file.is_empty()).then_some(file)
+}
+
+/// Clears from `dir` what writes killed part-way left, and **only what is provably the
+/// app's**: a file whose whole name is one of its own files' (`own`) followed by this
+/// version's temporary ending (`temp_for`), or is exactly one of the names versions up to
+/// 0.40.10 could leave (`old`). Never by a pattern over a folder the person also uses.
+/// **Only when the app starts, once, before the first write**: later it could take a write's
+/// file from under it.
+fn clear_leftovers(dir: &Path, own: impl Fn(&str) -> bool, old: &[String]) {
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let ours = old.contains(&name) || made_for(&name).is_some_and(&own);
+        if ours && entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// The settings folder's leftovers, for the account signed in: `account_file` as the kept
+/// copy of the shared record names it (`Settings::account_file`), `account_stem` as what
+/// waits to be sent does (`controller::account_stem`). Another account's are left: they
+/// are never read, and are cleared when it next starts the app.
+pub fn clear_settings_leftovers(dir: &Path, account_file: &str, account_stem: &str) {
+    const FILES: [&str; 8] = ["settings.json", "queue.json", "queue-place.json", "history.json", "playlist-added.json", "asked.json", "asking.json", "plays.log"];
+    let pending = format!("pending-{account_stem}.json");
+    let kept = format!("shared-record-kept-{account_file}-");
+    let own = |name: &str| {
+        FILES.contains(&name) || (!account_stem.is_empty() && name == pending) || (!account_file.is_empty() && name.starts_with(&kept) && name.ends_with(".json"))
+    };
+    // What 0.40.10 and the versions before it could leave: each file's stem with `.tmp`
+    // (written beside its place and renamed: the settings, the queue's two files, Recently
+    // played, when songs were added, the log of plays rewritten, what waits to be sent), the
+    // batch's `asking.json.part`, and the kept copy's `.tmp` from 0.40.8 to 0.40.10.
+    let mut old: Vec<String> = ["settings.tmp", "queue.tmp", "queue-place.tmp", "history.tmp", "playlist-added.tmp", "plays.tmp", "asking.json.part"].map(String::from).to_vec();
+    if !account_stem.is_empty() {
+        old.push(format!("pending-{account_stem}.tmp"));
+    }
+    if !account_file.is_empty() {
+        old.extend(["0.40.8", "0.40.9", "0.40.10"].map(|version| format!("shared-record-kept-{account_file}-{version}.tmp")));
+    }
+    clear_leftovers(dir, own, &old);
+}
+
+/// The data folder's: the crash note's marker's (0.40.10 wrote it in place: nothing old).
+pub fn clear_data_leftovers(dir: &Path) {
+    clear_leftovers(dir, |name| name == "crash.seen", &[]);
+}
+
+/// A downloads folder's, which may be the person's own: only the two lists of the account
+/// signed in, by exact name.
+pub fn clear_downloads_leftovers(dir: &Path, account_stem: &str) {
+    if account_stem.is_empty() {
+        return;
+    }
+    let (index, collections) = (format!("index-{account_stem}.json"), format!("collections-{account_stem}.json"));
+    let old = [format!("index-{account_stem}.tmp"), format!("collections-{account_stem}.tmp")];
+    clear_leftovers(dir, |name| name == index || name == collections, &old);
+}
+
+/// The steps by which `write_whole` puts a file on the disk, given so that a test can have
+/// the app stopped at one of them, or have one fail. `ONCE` and `REPLACING` are the real
+/// ones.
 #[derive(Clone, Copy)]
 pub struct Steps {
     /// Makes a new, empty file to write, only if nothing has its name.
     pub create: fn(&Path) -> std::io::Result<fs::File>,
     /// Makes sure what was written to it is on the disk.
     pub flush: fn(&fs::File) -> std::io::Result<()>,
-    /// Gives the file written beside its place its own name, if nothing has that name.
+    /// Gives the file written beside its place its own name: over what has it
+    /// (`REPLACING`), or only if nothing has it (`ONCE`).
     pub place: fn(&Path, &Path) -> std::io::Result<()>,
     /// Makes the names in a file's folder outlast a power cut.
     pub sync_folder: fn(&Path) -> std::io::Result<()>,
 }
 
-pub const ON_DISK: Steps = Steps {
+/// For a file made once and never replaced.
+pub const ONCE: Steps = Steps {
     create: |path| fs::OpenOptions::new().write(true).create_new(true).open(path),
     flush: fs::File::sync_all,
     place: place_new,
     sync_folder,
 };
+
+/// For a file written again and again: it replaces what has the name. (Without
+/// write-through on Windows: the file was flushed before the rename, so a power cut leaves
+/// the old file or the new one, whichever the rename had got to.)
+pub const REPLACING: Steps = Steps { place: |from, to| fs::rename(from, to), ..ONCE };
 
 /// Moves `from` to `to` only if nothing has the name `to`, and never over what has it:
 /// `AlreadyExists` then, and both left as they are. (`fs::rename` replaces.) Windows:
@@ -759,7 +970,15 @@ fn place_new(from: &Path, to: &Path) -> std::io::Result<()> {
 /// is cleared by the next attempt, and never read.)
 #[cfg(not(windows))]
 fn place_new(from: &Path, to: &Path) -> std::io::Result<()> {
-    fs::hard_link(from, to)?;
+    if let Err(error) = fs::hard_link(from, to) {
+        // A drive that can't make a second name for a file (FAT, exFAT, some network ones):
+        // "not permitted", "not supported", "too many links".
+        if error.kind() == std::io::ErrorKind::Unsupported || matches!(error.raw_os_error(), Some(1 | 31 | 95)) {
+            note_no_links();
+            return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, format!("this drive can't make hard links ({error})")));
+        }
+        return Err(error);
+    }
     let _ = fs::remove_file(from);
     Ok(())
 }
@@ -891,14 +1110,440 @@ mod tests {
         assert!(settings.server == "https://music.example.org" && settings.volume == 0.4);
         assert!(note.unwrap().contains("damaged"));
         assert_eq!(Settings::load_checked(&path).0.server, "https://music.example.org");
-        // No copy either: the damaged file is kept under another name, not overwritten.
+        // Empty, as a power cut could leave it when it was renamed into place unflushed: the
+        // same.
+        fs::write(&path, b"").unwrap();
+        let (settings, note) = Settings::load_checked(&path);
+        assert!(settings.server == "https://music.example.org" && note.unwrap().contains("damaged"));
+        // No copy either: the damaged file is kept under a name of its own, which is said.
         fs::write(&path, b"not settings at all").unwrap();
         fs::remove_file(dir.join("settings.backup.json")).unwrap();
         let (settings, note) = Settings::load_checked(&path);
-        assert!(settings.server.is_empty() && note.unwrap().contains("settings.damaged.json"));
-        assert_eq!(fs::read(dir.join("settings.damaged.json")).unwrap(), b"not settings at all");
+        let aside = fs::read_dir(&dir).unwrap().map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned()).find(|name| name.starts_with("settings.damaged-")).expect("not kept");
+        assert!(settings.server.is_empty() && note.unwrap().contains(&aside));
+        assert_eq!(fs::read(dir.join(&aside)).unwrap(), b"not settings at all");
         assert!(!path.exists());
+        // It couldn't be moved: it isn't said to have been kept. (A folder where its name
+        // would go, for every name: the move fails.)
+        fs::write(&path, b"not settings at all").unwrap();
+        let note = Settings::load_checked_by(&path, |_, _| Err(std::io::Error::other("the disk said no"))).1.unwrap();
+        assert!(!note.contains("kept as") && note.contains("couldn't be moved"), "{note}");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+
+    /// A disk on which what was never flushed is lost at a power cut: `flush` notes that
+    /// what was written is on it, and `place`, given the file its name, then cuts the power,
+    /// and the name keeps only what was flushed.
+    mod power_cut {
+        use super::*;
+        use std::cell::Cell;
+
+        thread_local!(static FLUSHED: Cell<bool> = const { Cell::new(false) });
+
+        pub const STEPS: Steps = Steps {
+            flush: |file| {
+                FLUSHED.set(true);
+                file.sync_all()
+            },
+            place: |from, to| {
+                fs::rename(from, to)?;
+                if !FLUSHED.get() {
+                    fs::File::create(to)?;
+                }
+                panic!("the power went")
+            },
+            ..REPLACING
+        };
+
+        pub fn reset() {
+            FLUSHED.set(false);
+        }
+    }
+
+    /// Writes `bytes` over `path` and has the app "killed" where `steps` panic: what was done
+    /// up to there stays on the disk, and nothing after it is done.
+    fn killed(path: &Path, bytes: &str, steps: Steps) -> bool {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| write_whole(path, bytes.as_bytes(), Durable::Flushed, &steps))).is_err()
+    }
+
+    #[test]
+    fn a_file_written_over_is_the_old_one_or_the_new_one_after_a_kill_or_a_power_cut() {
+        let dir = std::env::temp_dir().join(format!("nexus-whole-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("queue.json");
+        fs::write(&path, "the old queue").unwrap();
+        // Killed once the file beside it was made, and once it was written and not yet
+        // renamed: the file is as it was.
+        let made_then_killed = Steps {
+            create: |path| {
+                let _empty = (REPLACING.create)(path)?;
+                panic!("killed")
+            },
+            ..REPLACING
+        };
+        assert!(killed(&path, "the new queue", made_then_killed));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "the old queue");
+        assert!(killed(&path, "the new queue", Steps { place: |_, _| panic!("killed"), ..REPLACING }));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "the old queue");
+        // What a killed run left beside it, half written, is never read; nor is it cleared
+        // by a write in passing (it could be another write's, under way), only when the app
+        // starts, before anything is written.
+        let left = [dir.join("queue.json.999999.0.tmp"), dir.join("queue.tmp")];
+        for left in &left {
+            fs::write(left, "the new q").unwrap();
+        }
+        write_surely(&path, b"the new queue").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "the new queue");
+        assert!(left.iter().all(|left| fs::read_to_string(left).unwrap() == "the new q"));
+        clear_settings_leftovers(&dir, "", "");
+        assert_eq!(names_in(&dir), ["queue.json"]);
+        // The power goes the moment the new file has its name: it is the whole new file,
+        // because it was flushed before it was given the name. (Not flushed, as
+        // `write_atomically` did before, the name would be left with nothing in it.)
+        power_cut::reset();
+        assert!(killed(&path, "the newest queue", power_cut::STEPS));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "the newest queue");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_flush_or_rename_that_fails_leaves_the_file_as_it_was() {
+        let dir = std::env::temp_dir().join(format!("nexus-whole-fail-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pending.json");
+        fn fails() -> std::io::Result<()> {
+            Err(std::io::Error::other("the disk said no"))
+        }
+        fs::write(&path, "as it was").unwrap();
+        for steps in [Steps { flush: |_| fails(), ..REPLACING }, Steps { place: |_, _| fails(), ..REPLACING }] {
+            assert!(write_whole(&path, b"new", Durable::Flushed, &steps).is_err());
+            assert_eq!(fs::read_to_string(&path).unwrap(), "as it was");
+            assert_eq!(names_in(&dir), ["pending.json"]);
+        }
+        // Renamed, and its folder not synced (Linux): it is in place, and so it is written,
+        // not "as it was": a caller that takes a change back on an error would otherwise
+        // take back what is on the disk. (A caller that must know the name will outlast a
+        // power cut is told that it may not.)
+        assert!(write_whole(&path, b"new", Durable::Flushed, &Steps { sync_folder: |_| fails(), ..REPLACING }).is_ok());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir).unwrap().map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        names
+    }
+
+    /// A second write of the same file, run whole while the first is at one of its steps.
+    mod two_writers {
+        use super::*;
+        use std::cell::RefCell;
+
+        thread_local! {
+            /// The file both write.
+            pub static DEST: RefCell<PathBuf> = RefCell::new(PathBuf::new());
+            static FIRST_PLACE: RefCell<Option<(PathBuf, PathBuf)>> = const { RefCell::new(None) };
+        }
+
+        pub const FIRST: &[u8] = b"the first write, whole";
+        pub const SECOND: &[u8] = b"the second write, whole";
+
+        fn dest() -> PathBuf {
+            DEST.with(|dest| dest.borrow().clone())
+        }
+
+        pub fn second(steps: &Steps) -> std::io::Result<()> {
+            write_whole(&dest(), SECOND, Durable::Flushed, steps).map(drop)
+        }
+
+        pub const AT_CREATE: Steps = Steps {
+            create: |path| {
+                let file = (REPLACING.create)(path)?;
+                second(&REPLACING)?;
+                Ok(file)
+            },
+            ..REPLACING
+        };
+        pub const AT_FLUSH: Steps = Steps {
+            flush: |file| {
+                (REPLACING.flush)(file)?;
+                second(&REPLACING)
+            },
+            ..REPLACING
+        };
+        pub const AT_PLACE: Steps = Steps {
+            place: |from, to| {
+                second(&REPLACING)?;
+                (REPLACING.place)(from, to)
+            },
+            ..REPLACING
+        };
+        /// The first gives its file its name in the middle of the second's write: once the
+        /// second has flushed its own, and before the second gives it the name.
+        pub const INSIDE: Steps = Steps {
+            place: |from, to| {
+                FIRST_PLACE.with(|first| *first.borrow_mut() = Some((from.to_path_buf(), to.to_path_buf())));
+                second(&Steps {
+                    flush: |file| {
+                        (REPLACING.flush)(file)?;
+                        let (from, to) = FIRST_PLACE.with(|first| first.borrow_mut().take()).unwrap();
+                        (REPLACING.place)(&from, &to)
+                    },
+                    ..REPLACING
+                })
+            },
+            ..REPLACING
+        };
+        /// Made once: the second is given the name while the first is flushing its own.
+        pub const ONCE_RACED: Steps = Steps {
+            flush: |file| {
+                (ONCE.flush)(file)?;
+                second(&ONCE)
+            },
+            ..ONCE
+        };
+    }
+
+    #[test]
+    fn two_writes_of_one_file_never_publish_each_others_bytes() {
+        use two_writers::*;
+        let dir = std::env::temp_dir().join(format!("nexus-two-writers-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("asking.json");
+        DEST.with(|dest| *dest.borrow_mut() = path.clone());
+        // Whichever step the first is at when the second runs, each writes only its own file
+        // and gives the name only its own: both are done, the one that gave the name last is
+        // there whole, and nothing is left beside it.
+        for (at, steps, last) in [("create", AT_CREATE, FIRST), ("flush", AT_FLUSH, FIRST), ("place", AT_PLACE, FIRST), ("inside", INSIDE, SECOND)] {
+            fs::write(&path, "as it was").unwrap();
+            assert!(write_whole(&path, FIRST, Durable::Flushed, &steps).is_ok(), "at {at}");
+            assert_eq!(fs::read(&path).unwrap(), last, "at {at}");
+            assert_eq!(names_in(&dir), ["asking.json"], "at {at}");
+        }
+        // Made once (the kept copy, the start of the log): the second gives it the name
+        // first, and the first finds it there, and leaves it.
+        fs::remove_file(&path).unwrap();
+        let first = write_whole(&path, FIRST, Durable::Flushed, &ONCE_RACED);
+        assert_eq!(first.map_err(|error| error.kind()), Err(std::io::ErrorKind::AlreadyExists));
+        assert_eq!(fs::read(&path).unwrap(), SECOND);
+        assert_eq!(names_in(&dir), ["asking.json"]);
+        // Two files of one name but for what follows the last dot, in one folder (the log of
+        // plays and the list from before it), written at once.
+        let (log, list) = (dir.join("plays.log"), dir.join("plays.json"));
+        DEST.with(|dest| *dest.borrow_mut() = list.clone());
+        assert!(write_whole(&log, FIRST, Durable::Flushed, &AT_FLUSH).is_ok());
+        assert_eq!((fs::read(&log).unwrap(), fs::read(&list).unwrap()), (FIRST.to_vec(), SECOND.to_vec()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_write_in_passing_is_renamed_into_place_without_waiting_for_the_disk() {
+        let dir = std::env::temp_dir().join(format!("nexus-in-passing-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.json");
+        fs::write(&path, "as it was").unwrap();
+        // Neither flushed nor its folder synced: whole at its name all the same, and said not
+        // to be synced.
+        let waits = Steps { flush: |_| panic!("flushed"), sync_folder: |_| panic!("synced"), ..REPLACING };
+        assert_eq!(write_whole(&path, b"new", Durable::InPassing, &waits).unwrap(), Placed::Unsynced);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new");
+        // Flushed, it is both.
+        let flushed = std::panic::catch_unwind(|| write_whole(&path, b"newer", Durable::Flushed, &waits));
+        assert!(flushed.is_err(), "a flushed write that didn't flush");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_change_is_on_the_disk_when_its_save_returns_whatever_else_is_being_written() {
+        let dir = std::env::temp_dir().join(format!("nexus-save-now-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        // The queue's write, slow on its own thread (a stalled disk, a network drive).
+        let saver = crate::saver::Saver::new();
+        saver.write(dir.join("queue.json"), || {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            Some(b"[]".to_vec())
+        });
+        let started = std::time::Instant::now();
+        Settings { theme: "Violet".into(), ..Default::default() }.save(&path);
+        assert!(path.exists(), "the settings weren't on the disk when their save returned");
+        assert!(Settings { theme: "Ocean".into(), ..Default::default() }.save_surely(&path));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1), "a save waited for another file's write");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_move_aside_that_couldnt_remove_the_original_is_no_move() {
+        let dir = std::env::temp_dir().join(format!("nexus-aside-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("asked.json");
+        fs::write(&path, "half a list").unwrap();
+        // (On Linux the move is a second name, then the first removed: here the second is
+        // made and the first can't be removed.)
+        let linked_only: fn(&Path, &Path) -> std::io::Result<()> = |from, to| fs::copy(from, to).map(drop);
+        assert_eq!(set_aside_by(&path, linked_only), None);
+        let names: Vec<String> = fs::read_dir(&dir).unwrap().map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, ["asked.json"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_drive_that_cant_make_hard_links_is_said_once() {
+        // Linux keeps what is made once with a second name for it (`link`): on a drive that
+        // can't make one, that is said, once ever, plainly; not each time it is tried.
+        let mut said = false;
+        assert_eq!(no_links_note(&mut said), None);
+        note_no_links();
+        let first = no_links_note(&mut said);
+        assert!(first.is_some_and(|note| note.contains("hard links")), "{first:?}");
+        assert_eq!(no_links_note(&mut said), None);
+        let mut said_before = true;
+        assert_eq!(no_links_note(&mut said_before), None);
+    }
+
+    #[test]
+    fn what_killed_runs_left_is_cleared_at_the_start_and_only_what_is_provably_the_apps() {
+        let root = std::env::temp_dir().join(format!("nexus-leftovers-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let names = |dir: &Path| {
+            let mut names: Vec<String> = fs::read_dir(dir).unwrap().map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned()).collect();
+            names.sort();
+            names
+        };
+        let made = |dir: &Path, list: &[&str]| {
+            fs::create_dir_all(dir).unwrap();
+            for name in list {
+                fs::write(dir.join(name), "x").unwrap();
+            }
+        };
+        // The settings folder, for the account signed in ("acct-1a2b" in the kept copy's
+        // name, "server_ann" in the lists'): this version's names for its own files, and the
+        // exact names 0.40.10 and before could leave. Not another account's, nor anything
+        // else.
+        let settings = root.join("config");
+        let cleared = [
+            "settings.json.4242.0.tmp",
+            "plays.log.1.17.tmp",
+            "pending-server_ann.json.9.3.tmp",
+            "shared-record-kept-acct-1a2b-0.40.11.json.77.0.tmp",
+            "settings.tmp",
+            "queue.tmp",
+            "queue-place.tmp",
+            "history.tmp",
+            "playlist-added.tmp",
+            "plays.tmp",
+            "asking.json.part",
+            "pending-server_ann.tmp",
+            "shared-record-kept-acct-1a2b-0.40.10.tmp",
+        ];
+        let left = [
+            "asked.json",
+            "notes.tmp",
+            "pending-server_bob.tmp",
+            "pending-server_bob.json.9.3.tmp",
+            "queue.json.12.tmp",
+            "settings.json.x.0.tmp",
+            "settings.json.4242.0.tmp.txt",
+            "settingsx.tmp",
+            "shared-record-kept-acct-9f9f-0.40.10.tmp",
+        ];
+        made(&settings, &cleared);
+        made(&settings, &left);
+        clear_settings_leftovers(&settings, "acct-1a2b", "server_ann");
+        let mut left = left.to_vec();
+        left.sort();
+        assert_eq!(names(&settings), left);
+        // The data folder: the crash note's marker's.
+        let data = root.join("data");
+        made(&data, &["crash.seen.5.0.tmp", "crash.tmp", "diagnostics.txt"]);
+        clear_data_leftovers(&data);
+        assert_eq!(names(&data), ["crash.tmp", "diagnostics.txt"]);
+        // A downloads folder, which may be one of the person's own: only the account's two
+        // lists', by exact name. Their own index-tax.tmp is never touched.
+        let downloads = root.join("Music");
+        made(&downloads, &["index-server_ann.json.4242.1.tmp", "collections-server_ann.json.4242.2.tmp", "index-server_ann.tmp", "collections-server_ann.tmp"]);
+        made(&downloads, &["index-tax.tmp", "index-server_bob.tmp", "collections-2024.tmp", "song.flac"]);
+        clear_downloads_leftovers(&downloads, "server_ann");
+        assert_eq!(names(&downloads), ["collections-2024.tmp", "index-server_bob.tmp", "index-tax.tmp", "song.flac"]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn every_file_the_app_keeps_is_in_the_table_of_them() {
+        let paths = Paths::at(Path::new("config"), Path::new("cache"), Path::new("data"));
+        let table = include_str!("../docs/FILES.md");
+        let name = |path: &Path| path.file_name().unwrap().to_string_lossy().into_owned();
+        let folder = |path: &Path| format!("{}\\", name(path));
+        // Each named by what the app names it with, for an account and a version.
+        let (account, version) = ("<account>", "<version>");
+        let pages = paths.pages.join("<sign-in>");
+        let mut named = vec![
+            name(&crash_seen(&paths)),
+            name(&pending_file(&paths, account)),
+            name(&library_file(&pages)),
+            folder(&lyrics_dir(&pages)),
+            name(&crate::sync::kept_file(&paths.settings, account, version)),
+            name(&crate::downloads::index_file(&paths.downloads, account)),
+            name(&crate::downloads::collections_file(&paths.downloads, account)),
+            name(&crate::plays::log_file(&paths.plays)),
+            name(&crate::plays::side_file(&crate::plays::log_file(&paths.plays))),
+            name(&backup_of(&paths.settings)),
+            "settings.damaged-<date and time>.json".into(),
+            // Moved aside under a name of its own (`set_aside`), and a write's own file
+            // beside its place (`temp_for`).
+            "asked.damaged-<date and time>.json".into(),
+            "asking.damaged-<date and time>.json".into(),
+            "<file>.<process>.<count>.tmp".into(),
+        ];
+        let temp = name(&temp_for(Path::new("<file>")));
+        let parts: Vec<&str> = temp.split('.').collect();
+        assert!(parts.len() == 4 && parts[0] == "<file>" && parts[3] == "tmp" && parts[1..3].iter().all(|part| part.parse::<u64>().is_ok()), "{temp}");
+        // And every one of `Paths`, named one by one, so that a file added there can't be
+        // left out of this.
+        let Paths {
+            settings,
+            queue,
+            queue_place,
+            exports,
+            crash_log,
+            diagnostics,
+            history,
+            pending: _,
+            covers,
+            pages: _,
+            buffers,
+            songs,
+            downloads,
+            added,
+            asked,
+            asking,
+            discover,
+            old_lyrics,
+            plays,
+            #[cfg(not(windows))]
+            secret,
+        } = paths;
+        named.extend([&settings, &queue, &queue_place, &crash_log, &diagnostics, &history, &added, &asked, &asking, &discover, &plays].map(|path| name(path)));
+        named.extend([&exports, &covers, &buffers, &songs, &downloads, &old_lyrics].map(|path| folder(path)));
+        named.push("pages\\".into());
+        #[cfg(not(windows))]
+        named.extend([name(&secret), "secret-<name>".into()]);
+        for named in named {
+            assert!(table.contains(&named), "docs/FILES.md doesn't say how {named} is kept");
+        }
+        // Every row says all of it: what it holds, how it is written, what a kill leaves, what
+        // a power cut leaves, and how one that can't be read is taken.
+        for row in table.lines().filter(|line| line.starts_with("| ")) {
+            assert_eq!(row.matches(" | ").count() + 2, 7, "a row without all six: {row}");
+        }
     }
 
     #[test]

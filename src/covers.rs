@@ -351,3 +351,27 @@ pub fn trim_disk(dir: &Path, budget: u64) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_cover_cut_short_is_not_shown_and_is_fetched_again() {
+        let dir = std::env::temp_dir().join(format!("nexus-covers-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // (Never asked: the file is read first.)
+        let client = Client::new("http://127.0.0.1:9", "tester", "a password");
+        // Written beside its place and renamed, not flushed: after a power cut the name can
+        // hold nothing, or part of a picture. Either is no picture: not shown, and taken
+        // away, so the next look fetches it again.
+        for cut in [&b""[..], &b"\xff\xd8\xff\xe0\x00\x10JFIF"[..]] {
+            let path = dir.join(file_name("al-1", MEDIUM));
+            fs::write(&path, cut).unwrap();
+            assert!(load(&client, &dir, "al-1", MEDIUM).is_none());
+            assert!(!path.exists());
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+}

@@ -138,6 +138,12 @@ pub trait Desk: Send + Sync {
     /// Writes the batch down where it's kept between runs, or removes what's written there
     /// (`None`: there's nothing to keep).
     fn keep(&self, batch: Option<Vec<u8>>);
+    /// Writes the batch down and says whether it is on the disk: for what must be kept
+    /// before Lidarr is changed (the settings to put back).
+    fn keep_checked(&self, batch: Vec<u8>) -> bool {
+        self.keep(Some(batch));
+        true
+    }
     /// The time, in seconds since 1970: when something was noted as asked for.
     fn now(&self) -> i64;
     /// Whether singles and EPs are asked for as well as albums. Read once a run, when the
@@ -160,6 +166,36 @@ pub trait Desk: Send + Sync {
     fn together(&self, count: usize, work: &(dyn Fn() + Sync)) {
         let _ = count;
         work()
+    }
+}
+
+/// The batch's file is where the way back from a change to Lidarr is written down: those of
+/// the batch's own requests, and of one asked for by itself (`requests::request`).
+impl crate::lidarr::WayBack for Job {
+    /// Written down, surely (`Desk::keep_checked`), before Lidarr is changed. An artist the
+    /// batch already has a way back for keeps that one: it is from before either change.
+    fn keep(&self, artist: i64, before: &str) -> Result<(), String> {
+        if self.with(|batch| batch.restore.iter().any(|(known, _)| *known == artist)) {
+            return Ok(());
+        }
+        self.with(|batch| batch.restore.push((artist, before.to_string())));
+        if self.save_checked() {
+            return Ok(());
+        }
+        self.with(|batch| batch.restore.retain(|known| *known != (artist, before.to_string())));
+        Err("What Lidarr's settings would have to be put back to couldn't be written down on this PC first, so they weren't changed".into())
+    }
+
+    /// Crossed off: only the way back this request wrote, not one the batch had before it.
+    fn put_back(&self, artist: i64, before: &str) {
+        let crossed = self.with(|batch| {
+            let had = batch.restore.len();
+            batch.restore.retain(|known| *known != (artist, before.to_string()));
+            batch.restore.len() != had
+        });
+        if crossed {
+            self.save();
+        }
     }
 }
 
@@ -205,16 +241,28 @@ impl Job {
     }
 
     /// Takes up the batch that was under way when the app last closed, as it was written down
-    /// (see `Desk::keep`). What can't be read is left alone.
-    pub fn load(&self, written: &[u8]) {
-        if let Ok(batch) = serde_json::from_slice::<Batch>(written) {
-            self.with(|now| *now = batch);
-        }
+    /// (see `Desk::keep`), and says whether it could be read. What can't be read is left
+    /// alone: what to do with it, and what to tell the person, is the app's.
+    pub fn load(&self, written: &[u8]) -> bool {
+        let Ok(batch) = serde_json::from_slice::<Batch>(written) else { return false };
+        self.with(|now| *now = batch);
+        true
     }
 
+    /// Writes the batch down **while it is held**, so that a copy taken earlier can never be
+    /// written over one taken later by another thread (the window and the look-ups both
+    /// save it).
     fn save(&self) {
-        let json = self.with(|batch| if batch.wants.is_empty() && batch.restore.is_empty() && batch.proof.is_none() { None } else { serde_json::to_vec(batch).ok() });
-        self.desk.keep(json);
+        self.with(|batch| {
+            let json = if batch.wants.is_empty() && batch.restore.is_empty() && batch.proof.is_none() { None } else { serde_json::to_vec(batch).ok() };
+            self.desk.keep(json);
+        });
+    }
+
+    /// Writes the batch down, held as `save` does, and says whether it is on the disk
+    /// (`Desk::keep_checked`).
+    fn save_checked(&self) -> bool {
+        self.with(|batch| serde_json::to_vec(batch).ok().is_some_and(|json| self.desk.keep_checked(json)))
     }
 
     /// Hands over albums to ask for. If a batch is still under way they join it; otherwise they
@@ -712,7 +760,7 @@ impl Job {
                     0,
                     offers
                         .iter()
-                        .map(|offer| match lidarr.request(offer) {
+                        .map(|offer| match lidarr.request(offer, self) {
                             Ok(()) => Went::Listed,
                             Err(reason) => Went::Failed(reason.trim_end_matches('.').to_string()),
                         })
@@ -824,10 +872,11 @@ impl Job {
                 None if reading => Went::Sent(false),
                 // Lidarr only lists the kinds of release an artist's profile names. A single, an
                 // EP or a soundtrack may just need the artist moved to a profile that names those.
-                None if offer.kind() != "Album" || offer.soundtrack => match lidarr.start_listing_singles(artist, offer) {
-                    Ok(Some(before)) => {
-                        self.with(|batch| batch.restore.push((artist, before)));
-                        self.save();
+                // What it is to be put back to is on the disk before Lidarr is changed, or Lidarr
+                // isn't changed. (If changing it fails after, what was written down stays: it
+                // may have been changed all the same, and putting back what wasn't is nothing.)
+                None if offer.kind() != "Album" || offer.soundtrack => match lidarr.start_listing_singles_kept(artist, offer, |before| crate::lidarr::WayBack::keep(self, artist, before)) {
+                    Ok(Some(_)) => {
                         reading = true;
                         Went::Sent(false)
                     }
@@ -849,7 +898,7 @@ impl Job {
             // The long way: one release at a time, each seen onto the list before the next.
             let went: Vec<Went> = offers
                 .iter()
-                .map(|offer| match lidarr.request(offer) {
+                .map(|offer| match lidarr.request(offer, self) {
                     Ok(()) => Went::Listed,
                     Err(reason) => Went::Failed(reason.trim_end_matches('.').to_string()),
                 })
@@ -1285,6 +1334,97 @@ mod tests {
         }
     }
 
+    /// Writes down what's kept in passing, and can't make sure of anything on the disk.
+    struct Unsure(Arc<Mutex<Option<Vec<u8>>>>);
+
+    impl Desk for Unsure {
+        fn keep(&self, batch: Option<Vec<u8>>) {
+            *self.0.lock().unwrap() = batch;
+        }
+
+        fn keep_checked(&self, _: Vec<u8>) -> bool {
+            false
+        }
+
+        fn now(&self) -> i64 {
+            0
+        }
+
+        fn singles(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn the_batch_is_where_a_request_by_itself_writes_its_way_back_down() {
+        // Asked for by itself (or one release at a time by the batch, when Lidarr can't be
+        // told which releases are wanted): the batch's file has the way back before Lidarr is
+        // changed, so a kill after the change leaves it there for the next run to put back.
+        use crate::lidarr::tests::{KilledAfterChange, Stopping, single};
+        let kept = Arc::new(Mutex::new(None));
+        let job = Job::new(Kept(kept.clone()));
+        let lidarr = Lidarr::new("lidarr.test", "key", None, Arc::new(KilledAfterChange(Stopping { asked: Default::default() })));
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lidarr.request(&single(), &job))).is_err());
+        let written: serde_json::Value = serde_json::from_slice(kept.lock().unwrap().as_ref().expect("nothing written down")).unwrap();
+        assert_eq!(written["restore"], serde_json::json!([[5, "all"]]));
+        // Not killed: put back, and crossed off.
+        let kept = Arc::new(Mutex::new(None));
+        let job = Job::new(Kept(kept.clone()));
+        let lidarr = Lidarr::new("lidarr.test", "key", None, Arc::new(Stopping { asked: Default::default() }));
+        let _ = lidarr.request(&single(), &job);
+        assert!(job.with(|batch| batch.restore.is_empty()));
+    }
+
+    /// Notes, each time the batch is written down, whether the batch was held while it was.
+    struct Held(Arc<Mutex<Vec<bool>>>);
+
+    static HELD_JOB: std::sync::OnceLock<&'static Job> = std::sync::OnceLock::new();
+
+    impl Desk for Held {
+        fn keep(&self, _: Option<Vec<u8>>) {
+            let held = HELD_JOB.get().is_some_and(|job| job.batch.try_lock().is_err());
+            self.0.lock().unwrap().push(held);
+        }
+
+        fn now(&self) -> i64 {
+            0
+        }
+
+        fn singles(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn the_batch_is_written_down_while_it_is_held_so_no_older_copy_overtakes_a_newer() {
+        let noted = Arc::new(Mutex::new(Vec::new()));
+        let job: &'static Job = Box::leak(Box::new(Job::new(Held(noted.clone()))));
+        HELD_JOB.set(job).ok().unwrap();
+        job.start(vec![Want { artist: "Someone".into(), album: "A Single".into(), ..Default::default() }]);
+        job.save();
+        assert!(!noted.lock().unwrap().is_empty() && noted.lock().unwrap().iter().all(|held| *held), "{:?}", noted.lock().unwrap());
+    }
+
+    #[test]
+    fn a_setting_that_cant_be_written_down_first_is_not_changed_on_lidarr() {
+        // The same single as below; but what is to be put back can't be made sure of on the
+        // disk before Lidarr is changed: so Lidarr isn't, and the batch says why.
+        let kept = Arc::new(Mutex::new(None));
+        let job = Job::new(Unsure(kept.clone()));
+        let changed = Arc::new(Stopped(AtomicBool::new(false)));
+        let http: Arc<dyn crate::http::Http> = changed.clone();
+        let lidarr = Lidarr::new("lidarr.test", "key", None, http.clone());
+        let musicbrainz = MusicBrainz::new(http.clone(), crate::listenbrainz::ListenBrainz::new(http));
+        job.start(vec![Want { artist: "Someone".into(), album: "A Single".into(), ..Default::default() }]);
+        assert!(job.begin());
+        job.work_through(&lidarr, &musicbrainz, &|_| {});
+        assert!(!changed.0.load(Ordering::SeqCst), "Lidarr was changed with nothing written down to put it back");
+        let written: serde_json::Value = serde_json::from_slice(kept.lock().unwrap().as_ref().unwrap()).unwrap();
+        assert_eq!(written["restore"], serde_json::json!([]));
+        assert_eq!(written["wants"][0]["state"], "Failed");
+        assert!(written["wants"][0]["reason"].as_str().unwrap().contains("couldn't be written down"), "{}", written["wants"][0]["reason"]);
+    }
+
     #[test]
     fn a_setting_to_put_back_is_kept_however_the_wait_ends() {
         // A single of an artist whose profile lists albums only: their "new releases" setting
@@ -1302,5 +1442,10 @@ mod tests {
         assert_eq!(written["restore"], serde_json::json!([[5, "all"]]));
         assert_eq!(written["stopped"], STOPPED);
         assert!(job.unfinished());
+        // Read back, it is taken up; cut short, or empty, it is not, and the app is told so.
+        let again = Job::new(Nowhere);
+        let written = kept.lock().unwrap().clone().unwrap();
+        assert!(!again.load(b"") && !again.load(&written[..written.len() / 2]) && !again.unfinished());
+        assert!(again.load(&written) && again.unfinished());
     }
 }
