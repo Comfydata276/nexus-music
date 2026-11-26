@@ -3679,8 +3679,12 @@ impl Controller {
     /// The list of playlists has been read from the server, by [`Self::reload_playlists`]
     /// or by a look at what other devices have changed (which reads it anyway).
     pub fn playlists_arrived(self: &Rc<Self>, mut playlists: Vec<Playlist>) {
-        // The playlist the app keeps its shared data in isn't one to listen to.
-        playlists.retain(|p| !crate::link::unlisted(&p.name));
+        // The playlists the app keeps for itself aren't ones to listen to: the one it
+        // keeps its shared data in, and the one that holds the secret the person's
+        // devices are linked by (in every copy, linking on here or not: its description
+        // is the secret). Everything that lists playlists reads this list: the sidebar,
+        // the playlists page, "Add to playlist", the jam's picker.
+        playlists.retain(|p| !crate::link::unlisted(&p.name, &p.comment));
         *self.playlists.borrow_mut() = playlists;
         self.show_playlists();
         self.reload_changed_playlist();
