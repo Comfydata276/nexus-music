@@ -162,6 +162,9 @@ only has the mark's name in it is a description.
   nor a new address carrying it reaches a log. (Navidrome takes form POST for every
   call; checked in its source.) Every write sets the playlist private. Redirects are
   not followed.
+- **A list of playlists that is not one is an error, and never "there are none"**: an
+  answer the server calls ok whose list is of some other shape leads to nothing being
+  made.
 - **Only a 200 whose whole document parses is an answer.** A proxy's error page, or
   any other status with a body that happens to read as a good answer, is no answer;
   nor is the start of a good answer that was cut short on its way (every element has
@@ -392,11 +395,12 @@ itself.
 | Field | |
 |---|---|
 | `re` | The nonce of the ask this answers. Absent in news. |
-| `ok`, `why` | In an answer to a command. Refused: `ok` false, and `why` is `changed`, `busy`, `late`, `invalid` or `cannot`. Carried out: `ok` true. **Nothing to do** (the device was already as the command asked: playing, for a `play`): `ok` true with `why` `nothing`. |
+| `ok`, `why` | In an answer to a command. Refused: `ok` false, and `why` is `changed`, `busy`, `late`, `invalid` or `cannot`. Carried out: `ok` true. **Nothing to do** (the device was already as the command asked: playing, for a `play`): `ok` true with `why` `nothing`. **Not known** (the device asked its player and could not learn what came of it): `ok` false with `why` `unknown`, and the state beside it is the player's, asked afresh. |
 | `device`, `name` | Who is speaking: its device id and the name the person gave it. |
 | `at` | Its generation and minute now. |
 | `busy` | A choice has been accepted and not yet carried out, or its work is still under way (5.6, 5.7). |
-| `by` | The nonce of the command that was last **carried out**, if nothing has been chosen since. And, **while `busy`**, the command the device is busy with: one carried out whose queue has not sounded yet, or one accepted whose songs are still being looked up. |
+| `by` | The nonce of the command that made this state, if nothing has been chosen since. And, **while `busy`**, the command the device is busy with: one carried out whose queue has not sounded yet, or one accepted whose songs are still being looked up. |
+| `done` | The command named in `by` was **carried out, to its end**. Absent while the device is still at work on it, and if that work came to nothing (a queue it took that never sounded). It is the only thing a sender with no answer of its own takes for success. |
 | `steering` | The name of the device this one is steering, if it is steering one. |
 | `full` | In answer to a look that asked for it: `position`, `now` and `queue` (entries of `id`, `title`, `artist`, `album`, `duration`, `queued`), `more`, `context`, `shuffle`, `repeat`, `volume`. |
 | `queue` | In answer to a look that asked for it: `songs` (ids, the one playing first), `queued`, `position`, `context`, `more`. Empty when nothing is playing that another device could carry on with. |
@@ -512,7 +516,12 @@ asked. **Only what changed the player counts:**
   nothing): nothing moves, `by` is as it was, and the answer says `ok` with `why`
   `nothing`. Its sender takes it as settled and says nothing;
 - it could not (a seek on a radio, `next` with nothing to go to): nothing moves, and
-  the answer is `cannot`.
+  the answer is `cannot`;
+- the player could not say what it did (on the phone, a call into Kotlin that failed
+  part-way): it is not taken to have done it, nor to have done nothing. The device
+  asks the player what it holds, counts a change that no command is named for, and
+  answers `unknown`. For a queue to take over it goes by whether the queue is in the
+  player.
 
 A command is finished once. It carries out its action on this device only: a Pause
 never goes on to a jam the device has joined. **The player is asked, and has answered
@@ -539,14 +548,18 @@ Nothing is remembered about past commands but `by`.
   look and then goes by itself, against a state the person had not seen. After an
   `ok`, the state in that answer serves for the next press too, until a look's answer
   replaces it or it is 45 seconds old, counted from when its command was sent;
-- reads **`by` equal to its command's nonce as "done"**, whatever else the tell says,
-  **unless the tell says `busy`:** then the command was taken and its work is still
-  under way (its songs are being looked up, or the queue it brought has not begun to
-  sound). It waits on, and asks again every 12 seconds, four times at the most. It
-  never says "hadn't reached" of a command the other device says it is busy with;
+- **takes for "done" only what the device says is done:** the answer's own `ok`, or
+  `by` equal to its command's nonce **with `done`**, whatever else the tell says. `by`
+  with `busy` is "taken, and its work is still under way" (its songs are being looked
+  up, or the queue it brought has not begun to sound): it waits on, and asks again
+  every 12 seconds, four times at the most, and never says "hadn't reached" of it.
+  `by` with neither `busy` nor `done`, found at the check, is "it could not": the work
+  came to nothing. (A device that took a queue and ran past its wait without sounding
+  names the command and is idle, and its sender must not stop its own music for that.)
+  An answer of `unknown` is said as not known;
 - after 12 seconds with no answer, looks once and says what is true: `by` is its
-  nonce, done; the generation is as it was, "That hadn't reached Study PC when
-  checked" (it may still, within its two minutes); anything else, "Study PC changed.
+  nonce with `done`, done; the generation is as it was, "That hadn't reached Study PC
+  when checked" (it may still, within its two minutes); anything else, "Study PC changed.
   Check what is playing before you press again." It never sends a command again by
   itself, and an answer that arrives after this is still believed. A success is
   believed whenever it comes, once, even after a refusal of the same command (a repeat
@@ -649,7 +662,8 @@ person told where.
   device, the source, notes its own generation, then sends `adopt` with its queue from
   the song that is playing, and where in it. The other checks that its library has
   the songs before changing anything (`cannot` if it has none), takes the queue,
-  starts it, and **answers `ok` only when its sound has started**. Until then its
+  starts it, and **answers `ok` only when its sound has started**: the sound of the
+  queue it took, and of no other (below). Until then its
   state says `busy` and names the command in `by`. On that answer, or on a state that
   names the command and is no longer busy, the source pauses and the player in its
   window becomes the other device's, **only if** its own generation is still the one
@@ -680,6 +694,16 @@ person told where.
   on the way both sound, and both save.
 - **Sound has started** when the song is playing and has moved on a fifth of a second
   from where it was first heard: a song that has been opened is not yet sound.
+- **Taking a queue and stopping for a handover have outcomes, and none is assumed.**
+  The player numbers the queue it holds, a new number each time one is put in whole.
+  A take says whether the queue is in the player, and whether it is is asked of the
+  player afterwards, whatever the take said: only a queue that went in is counted and
+  claimed, and the sound a move waits for is the sound **of that queue**. So a queue
+  that never went in (the player refused it, the app could not build it) is said
+  ("This PC couldn't load that"), and the queue that was there before, still playing,
+  does not stand in for it and stop the other device. And the stop: a device told the
+  music has `moved` answers `ok` only if its player then says it is stopped; if it is
+  still sounding it answers `cannot`, and its queue is its own still.
 - **A device that took a queue** gives its sound 20 seconds. If something else is
   chosen on it first, it answers `changed` and does whatever was chosen. If no sound
   comes, it pauses and answers `cannot`. Twenty is less than thirty so that its
@@ -698,6 +722,10 @@ person told where.
 | No answer, and the other changed or could not be looked at | "Study PC didn't answer. Still playing here; check whether Study PC started too." | Here; there not known |
 | "Play here": the other's queue never came, or came after its 12 seconds (it is not taken then, whether or not a tick has yet said so) | "Study PC didn't answer, so nothing was moved. It may still be playing." | There, as it was |
 | "Play here": this device has none of the songs | "This PC's library has none of those songs. Study PC is still playing." | There |
+| "Play here": the queue could not be put in this device's player | "This PC couldn't load that. Study PC is still playing." | There, and whatever was playing here before |
+| "Play here": started here; the other was told and did not stop | "Playing here. Study PC couldn't be stopped, so it is still playing too." | Both |
+| "Play here": started here; the other left the room while this one was starting | "Playing here. Study PC is no longer there to be told, so it may still be playing." Nothing is sent to the place it had. | Here; there not known |
+| Giving: the other started, and this device did not stop when it should have | "Study PC has started, and this PC couldn't be stopped. Both are playing." | Both |
 | "Play here": this device's sound did not start in 30 seconds | "This PC didn't start in time, so Study PC was left playing." | There; this device is stopped |
 | "Play here": something else was chosen here before the sound started | "Something else was chosen here, so Study PC was left as it is: it is still playing." | There, and whatever was chosen here |
 | "Play here": started here, and the other paused | "Playing here. Study PC is paused." | Here |
@@ -735,7 +763,11 @@ far end, keeping the song to start with: "The next 3,000 of 5,000 songs were mov
 A device enters the room and looks at every other place. A place is shown once it has
 answered, under the name in its answer; names are remembered against device ids so the
 list shows them at once next time: the sixteen seen most lately, each for thirty days
-after it was last seen. One that is remembered and has no place in the room is listed
+after it was last seen. **A remembered device belongs to the account it was seen
+under**: it is kept with that sign-in and listed for it only, so another account
+signed in on the same PC or phone is not shown the names of somebody else's devices,
+and they are there again when the first signs back in (sixteen for an account,
+sixty-four together). One that is remembered and has no place in the room is listed
 as not being there, and cannot be picked. A device started again is in the room twice
 for a while; it is shown once, and what is asked of it goes to the place that answered
 last. After "Reset linking", a device still on the old
@@ -789,6 +821,7 @@ timers, making the requests, its player, its window.
 |---|---|
 | `secret`, `frame`, `text`, `message`, `command` | The record and its rules; the derivations; sealing and opening a frame; every schema and size; every command as data and the one function that reads it. |
 | `rule`, `steer`, `moving`, `news` | The rule of 5.6 on both sides (with the presses that wait, and what the sender concludes after no answer); the decisions of a move (5.7) on all three of its sides; the bounds on news. |
+| `find` | Asking the music server for songs a command brought that this device's copy of the library lacks: each request is given what is left of the command's half minute as its own limit, the last one too. |
 | `look` | The look of 5.1 as one function over an `Http`: the list, the choice, the fetch, the write and the read back, with what it has learnt kept across its own retries, reset, and stopping the moment the sign-in ends. |
 | `relay` | The stay at the relay as one function over an `Http`: the hello, entering, the long poll, entering again when the relay forgets the place, backing off, leaving. And a send. |
 | `device` | **One device among a person's devices, as plain state.** Each thing that happens (a tick, a look's answer, what the relay brought, a press, a device picked, "Play here", "Reset linking", the setting, the sign-in ending) is a function that takes it and the time and gives back a list of things to do: start a look, begin or end a session, send this frame, say this, keep this list of devices, draw. It holds the session, each peer, a move in either direction, the news, the list. |
@@ -807,10 +840,11 @@ It owns no thread, clock, file, socket or source of randomness. An app hands in:
   makes each request, and says when one is to stop. The look is given one that stops
   with the sign-in; the stay, one whose waits end when the session does;
 - **its player,** as `device::Player`, **asked and answered in the one call**: what
-  is playing in brief and in full, what could be handed over, where the sound has got
-  to, the songs to come; carry this command out, and say whether that changed
-  anything; pause; take this queue; "your queue has been handed on" (5.7); and the
-  order of choices kept beside the
+  is playing in brief and in full, what could be handed over, the number of the queue
+  it holds, where the sound has got to and in which queue, the songs to come; carry
+  this command out, and say whether that changed anything (or that it cannot say);
+  pause; take this queue, and say whether it went in; "your queue has been handed on",
+  and "it was not after all" (5.7); and the order of choices kept beside the
   player (the generation, busy, `by`), because every way into the player counts
   there (5.6.1);
 - **its library,** as `core::requests::Library` (`has_songs`): which of these songs
@@ -852,11 +886,11 @@ are no reports of what the player holds, no numbered acts, and nothing to cancel
 - **What a frame costs that thread** (opened, decided, answered), built as the phone's
   library is and timed on this project's build machine (a desktop: a phone is several
   times slower): a look answered in brief, 8 microseconds; Next carried out, 10; an
-  Add of fifty songs, 57; a tick, under 1. The dear ones are dear by their size: a look
+  Add of fifty songs, 54; a tick, under 1. The dear ones are dear by their size: a look
   answered with everything the player shows (a queue of five hundred), 0.5 ms, asked
   every few seconds by a device that is steering this one; with the queue to carry on
   with, 0.2 ms; and a queue to take over as long as one message carries (7,000 songs,
-  280,000 characters), 6.7 ms, once, when a person sends one. What is not small stays
+  280,000 characters), 6.4 ms, once, when a person sends one. What is not small stays
   where it was: the look, the stay at the relay, each send and each look-up of songs
   run on threads Kotlin starts, over the `Http` the phone's native side already gives
   the library, and hand what they bring to the player's thread; the phone's copy of
@@ -865,13 +899,109 @@ are no reports of what the player holds, no numbered acts, and nothing to cancel
 - **A sign-out or another account replaces everything** (the device, the order of
   choices, the look-ups under way, the copy of the library); only the numbers that
   looks, sessions and tickets had reached carry over, so that an answer still on its
-  way to the last sign-in matches nothing in the next.
-- **Every list has a bound:** what is kept for one turn (256), look-ups counted as
-  under way (16, none past its minute), devices remembered (16, and forgotten by the
-  calendar after thirty days).
+  way to the last sign-in matches nothing in the next. **It is never refused and never
+  waits behind frames:** arriving while a call is under way, it is applied before
+  anything else, what was kept is dropped unread, and what is left of the call in
+  flight asks nothing more of a player that may be the next account's already. A copy
+  of the library is handed over with the sign-in it was read under, and is dropped if
+  that is not the sign-in now.
+- **If anything inside a call stops unexpectedly** (a fault of the library's own), it
+  is not left half-way: everything it held is replaced, as at a sign-out, one line is
+  said of it, and linking starts again from a look.
+- **Every list has a bound:** what is kept for one turn (256 things, a megabyte), what
+  one turn works through of what arrives while it runs (64; the rest is first in the
+  next), look-ups counted as under way (16, none past its minute), what is taken from
+  one answer of the relay's (17 places, 64 frames, each checked before it is copied),
+  devices remembered (16 for an account, and forgotten by the calendar after thirty
+  days).
 
 Everything that crosses has serde, so each call is JSON in and JSON out, as the
 phone's other calls are.
+
+### 8.1 What the phone's adapter owes
+
+The brief for whoever builds the Kotlin side. The library decides; the adapter is the
+only thing that knows the phone's player, and each line here is something no rule in
+`core/` can check for it. File names are the Android repository's, under
+`app/src/main/kotlin/org/medianexus/music/playback/`.
+
+**Where it lives.** In `PlaybackService`, with the player the session exposes
+(`QueuePlayer`, over ExoPlayer), on the player's looper. Every call into the library
+(`linkHappened`, `linkTurn`) is made on that looper, and every call the library makes
+up arrives on it. `wake` may be called from any thread and **posts to that looper**;
+it never runs a turn on the thread that called it. A call from another thread is an
+error and does nothing: it must not take anything from the inbox before it finds that
+out.
+
+**The player it supplies**, each answered before the call returns:
+
+| Call | It owes |
+|---|---|
+| `brief`, `full`, `handed`, `hasSong`, `ahead` | The player's **logical** state as Media3 has it on that thread now (the masked item and position, play-when-ready, the queue as `Queue` holds it): what the next command would act on. |
+| `queue` | A number that changes every time a queue is put in the player whole, and is never used twice in a run. |
+| `sounding` | Seconds into the current entry **and that queue's number**, only while **audio is advancing** for the current entry of the current queue. The service already hears that (`onAudioPositionAdvancing`, kept as `heardThisTime`); it has to be kept for the entry and queue it was heard for. `playWhenReady`, `isPlaying` and a masked position do not show that a queue that was taken has sounded. |
+| `carryOut` | The command done by the same service function a press on the phone reaches, and **what happened to the player's logical state**, not what was asked: whether it changed anything. (If it throws, what it did before it threw is taken as not known.) Calls that are refused or do nothing, found by reading: Play when `mayPlay` says no (`QueuePlayer.handleSetPlayWhenReady`); a seek the player does not offer (a radio station; what `QueuePlayer` says is available for seeking, which changed lately); an entry named by a place that is no longer sure (`placeIsSure`); a start whose ticket no longer stands (`playFor` returns false). Each of those changed nothing, and says so. |
+| `take` | The queue built and put in the player, playing from the place given; `true` only if it is in. The number of `queue` is new if and only if it is. |
+| `pause` | The phone's sound stopped. |
+| `claim` | The queue is the phone's own from now: `queueTaken` cleared, `queueStamp` now, the save's revision moved, a save owed. `true` if recorded. |
+| `handedOn` | `queueTaken` set to `core::handover::HANDED`, **kept on disk** with the queue, and the save's revision moved, **before** the stop that follows; `true` if recorded. `handedBack` undoes exactly that. |
+| `random`, `elapsed`, `wake` | From any thread: random bytes from the system; milliseconds on the clock that counts through sleep; and "come for what is waiting". |
+
+A call that throws is answered for the adapter as nothing (no song, not sounding,
+`unknown`, `false`). The library then asks again what the player holds and goes by
+that; it never takes "asked" for "done". So a throw is safe, and is still a fault.
+
+**`Changed` is said once, where the choice is made or where the player moves on by
+itself. Never from a Media3 listener.** The phone already has one place where a
+person's choice is taken (`Choices`, and the service's command hooks:
+`onPlayerCommandRequest` and the app's own commands for the queue) and one where a
+song ends. Say it there, with who chose it and what it touches (5.6.1). ExoPlayer
+tells its listeners **later**, in `onEvents`, posted to the looper, and
+`ForwardingSimpleBasePlayer` invalidates its state from that; the playback thread's
+acknowledgements, timeline updates, readiness, errors and transitions all arrive after
+the call that caused them has returned. None of those is a choice. A `Changed` said
+from one of them turns one remote Next into two choices: the library records the
+command's nonce, then the posted `Changed` moves the generation again, clears `by`,
+may claim the queue a second time, and on a take makes the wait for sound read as
+"something else was chosen", leaving both devices playing. The library drops a change
+it hears **inside** its own call to the player (8); it cannot know that one posted
+afterwards was its own.
+
+- What the player does by itself (the next song beginning, a failed song passed over,
+  the queue running out, the sound taken away, similar songs arriving) is `Changed`
+  with `who: nobody`, said where the service handles it.
+- **A command carried out for another device goes through the same service functions
+  as a press, marked as chosen elsewhere**, so that the service's own hooks neither
+  take a place in `Choices` for it as a person's press, say `Changed` for it, nor call
+  `claimQueue` for it: the library counts it once, by `carryOut`'s answer, and calls
+  `claim` itself if the queue is the phone's by it.
+- **Whose the queue is has one path.** Today `claimQueue` (the command hooks) and
+  `save()` (which stamps a queue whose list has changed, whoever changed it) can each
+  make the queue the phone's own. With linking on, the library's `claim`, `handedOn`
+  and `handedBack` must be the only way a command from another device changes
+  `queueTaken`, and `save()` must not stamp a queue that is `HANDED`, or one a command
+  for `moved` has just stopped.
+
+**The end of a sign-in is said before the player is switched.** `stop`, or a tick
+with the new account, goes to the library before Kotlin puts another account's queue
+in the player. The library applies it at once, even from inside one of its own calls,
+and asks nothing more of the player for the old account. Whatever the adapter still
+holds for the old account (its inbox, a library copy being read) it drops; a library
+copy is handed over with the account it was read for, and the library drops one that
+is not the account's now.
+
+**What the adapter bounds, because `core/` cannot:** its own inbox of what other
+threads brought (by count and by bytes; the library's own queue for a turn is bounded,
+256 things and a megabyte); one library copy waiting to be put in place, not a pile;
+and the building of a large queue in Kotlin. The library's own cost for the longest
+queue one message carries (7,000 songs) is 6.4 ms on a desktop, **without** the call
+across, the Kotlin objects, or Media3 taking the items: that has to be measured on a
+phone build, and if it is long, the items are made off the looper and only put in on
+it, as `QueuePlayer` already does for its own queues (`made`).
+
+**When a turn says there is more** (`more` in its answer), the adapter posts another
+`linkTurn`: a turn hands over what was waiting and a bounded number more, so that a
+callback which feeds it cannot keep it running.
 
 | Crate | Pin | Checked (manifests, repositories, RustSec) |
 |---|---|---|
@@ -885,9 +1015,9 @@ is on, on a PC and on a phone alike.
 
 **Built for Android** (arm64 and x86_64, API 31, the phone app's own native crate and
 build, with a layer that reaches all of the above and calls up into one Kotlin object
-for the player): it builds as it is, with nothing changed for it. It adds about 294 KiB
-to the phone's library on arm64 (1,267,056 to 1,568,304 bytes) and 371 KiB on x86_64
-(1,533,776 to 1,913,240), built for size as that library is. Not checked: iOS.
+for the player): it builds as it is, with nothing changed for it. It adds about 338 KiB
+to the phone's library on arm64 (1,267,056 to 1,613,544 bytes) and 421 KiB on x86_64
+(1,533,760 to 1,964,528), built for size as that library is. Not checked: iOS.
 
 ## 9. The reviewers' sequences, replayed
 
@@ -1008,6 +1138,12 @@ is asked on its own thread and answers at once, as the Windows app's is (section
 the record is set up by the plain rule of 5.1, with no second name; and a queue that
 has been handed to another device is that device's (5.7).
 
+**The last round on the library by itself** gave every act on the player an outcome
+(a queue that went in or did not, a stop that stopped or did not, a call that cannot
+say), made "done" something a device says and a sender does not infer, bounded what
+the phone's binding keeps and works through, and wrote down what the phone's adapter
+owes (8.1). The next review reads the adapter's real code against the real Media3.
+
 After that: the phone, on `bind::Phone`.
 
 ## 12. Where it is weakest
@@ -1039,7 +1175,26 @@ After that: the phone, on `bind::Phone`.
 11. **A look-up for an Add is stopped between one song and the next**, not inside a
     request: one request to a server that has stopped answering can outlast the
     command it was for, holding one of the app's four workers until it gives up.
-12. **The audit of borrows on Windows** (`scripts/borrow-audit.py`, run by the check)
+12. **A person editing the linking playlist's description in the moment between the
+    app's read and its write loses the edit**, or finds the playlist made private: the
+    music server has no update that is conditional on what was read.
+13. **A save already on its way when a queue is handed on can still land after the
+    taker's first save.** It is put right by the taker's next save, seconds later.
+    **A source whose taker never saves** (its sharing of the queue is off) goes on
+    following, with a queue it does not save, until the person uses it there.
+14. **Putting a queue entry down in the same place with the other flag** (into "Next
+    in queue" or out of it) counts as a change, as any move does.
+15. **A queue's place in its song is clamped** to the song's stated length where that
+    is known, and to a day where it is not: a length the server has wrong, or rounded
+    down, can move a resume point back to it.
+16. **The whole-document check of an XML answer is not a strict parser**: it takes some
+    malformed XML one would refuse (the same attribute twice, a reference it does not
+    know). No XML library is added for that.
+17. **The longest queue one message carries costs the phone's main thread several
+    milliseconds** in the library alone (6.4 ms on a desktop), once, when someone sends
+    one. Frames are opened on the player's thread all the same: opening them elsewhere
+    would put the session's keys on two threads.
+18. **The audit of borrows on Windows** (`scripts/borrow-audit.py`, run by the check)
     does not look for three shapes of the fault it exists for: a borrow held while a
     closure made in the same function is called there and then; a borrow handed back
     by a helper; and a cell borrowed again directly inside the statement that holds
