@@ -37,7 +37,9 @@ pub fn singles() -> bool {
 
 // ---- the connection in use, and what it has offered -----------------------------------------------
 
-static CURRENT: RwLock<Option<Lidarr>> = RwLock::new(None);
+/// The Lidarr in use; the number of its connection, which goes up whenever what it's made of
+/// changes (its address, its key, the sign-in in front); and what it's made of.
+static CURRENT: RwLock<(Option<Lidarr>, u64, String)> = RwLock::new((None, 0, String::new()));
 /// Albums and artists that have been offered, by Lidarr's names for them, so a click on one
 /// can be acted on.
 static OFFERS: Offers = Offers::new();
@@ -48,12 +50,37 @@ pub fn offers() -> &'static Offers {
 }
 
 pub fn current() -> Option<Lidarr> {
-    CURRENT.read().ok()?.clone()
+    CURRENT.read().ok()?.0.clone()
 }
 
+/// The Lidarr in use, and the number of its connection, read together: what a page and what's
+/// started from it carry (see `for_connection`).
+pub fn current_numbered() -> (Option<Lidarr>, u64) {
+    CURRENT.read().map(|current| (current.0.clone(), current.1)).unwrap_or_default()
+}
+
+/// The Lidarr in use, if it's still the connection numbered `number`: an action begun under
+/// an earlier one (a row of a page drawn before the address, key or sign-in changed) is for
+/// a Lidarr that isn't this one, and does nothing.
+pub fn for_connection(number: u64) -> Option<Lidarr> {
+    let current = CURRENT.read().ok()?;
+    current.0.clone().filter(|_| current.1 == number)
+}
+
+/// Sets the Lidarr in use, for a test.
+#[cfg(test)]
 pub fn set_current(lidarr: Option<Lidarr>) {
+    set_current_made_of(lidarr, String::new());
+}
+
+/// Sets the Lidarr in use, `made_of` saying what it's made of: its address, its key and the
+/// sign-in in front. Its connection's number goes up if that has changed.
+pub fn set_current_made_of(lidarr: Option<Lidarr>, made_of: String) {
     if let Ok(mut current) = CURRENT.write() {
-        *current = lidarr;
+        if current.2 != made_of || current.0.is_some() != lidarr.is_some() {
+            current.1 += 1;
+        }
+        *current = (lidarr, current.1, made_of);
     }
 }
 
@@ -87,6 +114,25 @@ pub fn mark(album: &str, requested: bool) {
 mod origins {
     use super::*;
     use nexus_core::lidarr::same_origin;
+
+    #[test]
+    fn an_action_is_for_the_lidarr_it_was_begun_under() {
+        let _apart = crate::pins::apart();
+        let at = |address: &str| Some(Lidarr::new(address, "key", None, Arc::new(crate::corehttp::Agent(crate::subsonic::make_agent_without_redirects()))));
+        set_current_made_of(at("http://a.example"), "a\nkey-a\n".into());
+        let (_, begun) = current_numbered();
+        assert!(for_connection(begun).is_some());
+        // Nothing changed: the same connection.
+        set_current_made_of(at("http://a.example"), "a\nkey-a\n".into());
+        assert!(for_connection(begun).is_some());
+        // Another address, another key, a sign-in: another connection, and the row's action
+        // does nothing.
+        for made_of in ["b\nkey-a\n", "b\nkey-b\n", "b\nkey-b\n1"] {
+            set_current_made_of(at("http://b.example"), made_of.into());
+            assert!(for_connection(begun).is_none(), "{made_of}");
+        }
+        set_current(None);
+    }
 
     #[test]
     fn a_key_belongs_to_the_scheme_host_and_port_it_was_typed_for() {

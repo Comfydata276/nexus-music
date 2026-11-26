@@ -29,9 +29,9 @@ pub enum Target {
     Album { id: String, title: String },
     Artist { id: String, name: String },
     Playlist { id: String, name: String },
-    /// An album on the Requests page: Lidarr's number for it, its MusicBrainz id, its title
-    /// and its artist.
-    Request { id: i64, album: String, title: String, artist: String },
+    /// An album on the Requests page: the Lidarr connection it was drawn under, Lidarr's
+    /// number for it, its MusicBrainz id, its title and its artist.
+    Request { connection: u64, id: i64, album: String, title: String, artist: String },
 }
 
 impl Target {
@@ -258,7 +258,7 @@ impl Controller {
             self.song_index(row).and_then(|index| {
                 let (album, artist) = page.request_albums.get(index).cloned().unwrap_or_default();
                 let title = page.songs.get(index)?.title.clone();
-                Some((Target::Request { id: *page.request_ids.get(index)?, album, title: title.clone(), artist }, title))
+                Some((Target::Request { connection: page.request_connection, id: *page.request_ids.get(index)?, album, title: title.clone(), artist }, title))
             })
         };
         if let Some((target, title)) = request {
@@ -662,9 +662,9 @@ impl Controller {
             Target::Songs { songs, .. } => format!("{} songs", songs.len()),
             Target::Album { title, .. } => title.clone(),
             Target::Artist { name, .. } | Target::Playlist { name, .. } => name.clone(),
-            Target::Request { id: number, album, title, artist } => {
+            Target::Request { connection, id: number, album, title, artist } => {
                 if id == "cancel-request" {
-                    self.cancel_request(*number, album.clone(), title.clone(), artist.clone());
+                    self.cancel_request(*connection, *number, album.clone(), title.clone(), artist.clone());
                 }
                 return;
             }

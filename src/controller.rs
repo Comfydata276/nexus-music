@@ -424,6 +424,8 @@ pub struct Controller {
     /// The sign-in in front of Lidarr, once signed in to. The one copy is kept for as long
     /// as it's good, so its token is only ever renewed in one place.
     gate: RefCell<Option<std::sync::Arc<crate::gate::Session>>>,
+    /// How many sign-in sessions have been begun: part of what a Lidarr connection is made of.
+    sign_ins: Cell<u64>,
     suggestions: RefCell<Vec<Suggestion>>,
     preview_count: Cell<u64>,
     /// The same count, where the search thread can see it: a search that is no longer the
@@ -613,6 +615,7 @@ impl Controller {
             keep_rounds: Cell::new(0),
             requests_check: Cell::new(0),
             gate: RefCell::new(None),
+            sign_ins: Cell::new(0),
             suggestions: RefCell::default(),
             preview_count: Cell::new(0),
             preview_latest: Default::default(),
@@ -1442,13 +1445,20 @@ impl Controller {
             // An address the app can't be sure of reaching as written isn't connected to.
             let usable = nexus_core::lidarr::origin(&settings.lidarr_address).is_ok();
             match (settings.requests && !settings.lidarr_address.trim().is_empty() && usable, key) {
-                (true, Some(key)) => Some(crate::lidarr::open(&settings.lidarr_address, &key, self.gate_session(&settings))),
+                (true, Some(key)) => {
+                    let gate = self.gate_session(&settings);
+                    // What the connection is made of: when it changes, so does its number, and
+                    // what was begun under the old one does nothing (see `lidarr::for_connection`).
+                    let made_of = format!("{}\n{key}\n{}", crate::lidarr::tidy(&settings.lidarr_address), gate.as_ref().map_or(0, |_| self.sign_ins.get()));
+                    Some((crate::lidarr::open(&settings.lidarr_address, &key, gate), made_of))
+                }
                 _ => None,
             }
         };
         self.ui.global::<ui::App>().set_requests(lidarr.is_some());
         crate::lidarr::set_singles(self.settings.borrow().request_singles);
-        crate::lidarr::set_current(lidarr);
+        let (lidarr, made_of) = lidarr.map_or((None, String::new()), |(lidarr, made_of)| (Some(lidarr), made_of));
+        crate::lidarr::set_current_made_of(lidarr, made_of);
     }
 
     /// The credential store, where Lidarr's key and the sign-in's token are kept (see `keep`).
@@ -1480,6 +1490,7 @@ impl Controller {
     /// A session for the sign-in at `found`, begun with `token`: its renewals are written only
     /// while the token kept is still the one it renewed (see `keep::renewals`).
     fn new_gate(&self, found: crate::gate::Found, token: String) -> crate::gate::Session {
+        self.sign_ins.set(self.sign_ins.get() + 1);
         let keep = crate::keep::renewals(self.vault(), found.service.clone(), token.clone());
         crate::gate::session(found, token, keep)
     }
@@ -2086,8 +2097,16 @@ impl Controller {
     /// Takes an album off Lidarr's list (its number there), and forgets the note of it: the
     /// one with its MusicBrainz id, or its title and artist both (see `asked::forget`). It's
     /// no longer shown as asked for where it's offered.
-    pub fn cancel_request(self: &Rc<Self>, id: i64, album: String, title: String, artist: String) {
-        let Some(lidarr) = crate::lidarr::current() else { return };
+    /// `connection` is the number of the connection the row was drawn under: if it's changed
+    /// since, the row is another Lidarr's, nothing is sent, and the page is drawn afresh.
+    pub fn cancel_request(self: &Rc<Self>, connection: u64, id: i64, album: String, title: String, artist: String) {
+        let Some(lidarr) = crate::lidarr::for_connection(connection) else {
+            self.invalidate("requests");
+            if self.current_route() == Some(Route::Requests) {
+                self.show(Route::Requests, 0.0, true, None);
+            }
+            return;
+        };
         self.api_pool.spawn(move || {
             let result = lidarr.cancel(id);
             post(move |ctl| {

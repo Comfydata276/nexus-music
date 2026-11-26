@@ -213,6 +213,10 @@ pub struct PageData {
     /// recorded them had no such thing.)
     #[serde(skip)]
     pub request_albums: Vec<(String, String)>,
+    /// And the number of the Lidarr connection they were drawn under (see
+    /// `lidarr::for_connection`).
+    #[serde(skip)]
+    pub request_connection: u64,
     /// Music that isn't in the library: the section's heading, songs that could be asked
     /// for, and the shelves beneath them.
     pub offers_title: String,
@@ -610,7 +614,8 @@ pub fn requests_notice(batch: &str) -> String {
 /// their way (see `nexus_core::requests::on_their_way`).
 fn requests() -> PageData {
     let title = "Requests".to_string();
-    let Some(lidarr) = crate::lidarr::current() else {
+    let (lidarr, connection) = crate::lidarr::current_numbered();
+    let Some(lidarr) = lidarr else {
         return PageData { title, empty: "Requests are switched off. Turn them on in Settings.".into(), ..Default::default() };
     };
     // (Nothing on Windows stops a request, so "stopped" can't come of it.)
@@ -635,6 +640,7 @@ fn requests() -> PageData {
         tracks_title: waiting.heading,
         request_ids: waiting.pending.iter().map(|(album, _)| album.id).collect(),
         request_albums: waiting.pending.iter().map(|(album, _)| (album.album.clone(), album.artist.clone())).collect(),
+        request_connection: connection,
         // Rows that name an album, not songs that can be played.
         songs: waiting.pending.into_iter().map(|(album, line)| Song { title: album.title, artist: line, ..Default::default() }).collect(),
         empty: waiting.empty,

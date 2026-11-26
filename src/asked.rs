@@ -259,7 +259,8 @@ mod tests {
         assert_eq!((list.items[0].song.as_str(), list.items[0].fills.len(), list.items[0].at), ("Her Diamonds", 1, 100));
         assert!(list.waiting());
 
-        list.mark(&[Arrival { place: 0, library_album: "a9".into(), ..Default::default() }], 1000);
+        let this = Arrival { library_album: "a9".into(), at: 100, title: "Cradlesong".into(), album: "rg1".into(), artist: "Rob Thomas".into(), ..Default::default() };
+        list.mark(&[this], 1000);
         assert!(!list.waiting());
         assert_eq!(AskedList::load(&path).items[0].library_album, "a9");
         // Taking it off Lidarr's list doesn't forget one that's already here.
