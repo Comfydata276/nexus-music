@@ -123,7 +123,7 @@ mod tests {
 
     fn view() -> View {
         let entry = |n: usize| Entry { id: format!("s{n}"), title: format!("Song {n}"), duration: 200, queued: n == 1, ..Default::default() };
-        View { full: Full::fitted(40.0, Some(entry(0)), (1..5).map(entry), "Morning mix", false, 0, 0.5), playing: true, heard_ms: 10_000 }
+        View { full: Full::fitted(40.0, Some(entry(0)), (1..5).map(entry), 4, "Morning mix", false, 0, 0.5), playing: true, heard_ms: 10_000 }
     }
 
     #[test]

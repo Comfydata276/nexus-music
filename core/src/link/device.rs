@@ -45,6 +45,11 @@ pub const LOST_MS: u64 = 45_000;
 /// How far the sound has to have moved on, in seconds, to count as having started: a song
 /// that has been opened is not yet sound.
 pub const SOUNDS_AFTER: f64 = 0.2;
+/// The most songs to come that a command from another device may leave in this device's
+/// queue. An Add that would leave more is refused. (A queue to take over is bounded by
+/// what one message carries, which is less. What the person adds at the device itself
+/// is not bounded by this: an app's own bound for that, if it has one, is its own.)
+pub const MOST_TO_COME: usize = 10_000;
 
 /// What a device says it is playing, in brief.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -147,6 +152,8 @@ pub trait Player {
     fn handed_back(&mut self);
     /// Stops this device's own sound, and counts it as a change.
     fn pause(&mut self);
+    /// How many songs are to come: known to the player without walking its queue.
+    fn to_come(&self) -> usize;
     /// Takes a queue brought from another device and plays it: each song and whether it
     /// was queued by hand, where to start, and how far in. **Whether the queue is in the
     /// player afterwards is what [`Player::queue`] says**: a new number if it is, and then
@@ -964,6 +971,9 @@ impl Device {
             Command::Play | Command::Pause | Command::Moved | Command::Next | Command::Previous | Command::Seek { .. } | Command::Clear { .. } if !env.player.has_song() => None,
             Command::Jump { at, id } | Command::Remove { at, id } => entry_of(env, *at, id),
             Command::Move { from, id, .. } => entry_of(env, *from, id),
+            // (A queue is let hold so much to come and no more, for a command's sake:
+            // refused here, before anything is looked up for it.)
+            Command::Add { ids, .. } if env.player.to_come().saturating_add(ids.len()) > MOST_TO_COME => None,
             Command::Add { ids, .. } => {
                 let has = env.library.has_songs(ids);
                 if has.iter().all(|has| *has) && has.len() == ids.len() {

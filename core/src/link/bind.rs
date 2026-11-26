@@ -93,6 +93,8 @@ pub trait PhonePlayer {
     fn has_song(&self) -> bool;
     /// The ids of the songs to come, in the order they would play.
     fn ahead(&self) -> Vec<String>;
+    /// How many songs are to come, which the player knows without walking its queue.
+    fn to_come(&self) -> usize;
     /// Carries a command out, exactly as the same press on the phone would be, **and says
     /// which of three things came of it** ([`Carried`]): it changed the player; it was so
     /// already (Play while the player is set to play, Pause while it is not, the volume,
@@ -439,6 +441,9 @@ impl Player for Held<'_> {
     }
     fn ahead(&self) -> Vec<String> {
         self.ask(|player| player.ahead())
+    }
+    fn to_come(&self) -> usize {
+        self.ask(|player| player.to_come())
     }
     /// The person chose it at another of their devices (but for the stop that ends a move,
     /// which is nobody's): the queue is theirs by it, if it changed what a saved queue
@@ -1028,6 +1033,9 @@ mod tests {
         fn ahead(&self) -> Vec<String> {
             unreachable!("asked from inside a call")
         }
+        fn to_come(&self) -> usize {
+            unreachable!("asked from inside a call")
+        }
         fn carry_out(&mut self, _: &Command, _: &Ready) -> Carried {
             unreachable!("asked from inside a call")
         }
@@ -1147,7 +1155,7 @@ mod tests {
         }
         fn full(&self) -> Full {
             let entry = |id: &String| Entry { id: id.clone(), title: id.clone(), ..Default::default() };
-            Full::fitted(self.sound.unwrap_or(0.0), self.songs.first().map(entry), self.songs.iter().skip(1).map(entry), "", false, 0, self.volume)
+            Full::fitted(self.sound.unwrap_or(0.0), self.songs.first().map(entry), self.songs.iter().skip(1).map(entry), self.songs.len().saturating_sub(1), "", false, 0, self.volume)
         }
         fn handed(&self) -> Handed {
             if self.radio { Handed::default() } else { Handed::fitted(&self.songs, 0, self.sound.unwrap_or(0.0), "the queue") }
@@ -1164,6 +1172,9 @@ mod tests {
         }
         fn ahead(&self) -> Vec<String> {
             self.songs.iter().skip(1).cloned().collect()
+        }
+        fn to_come(&self) -> usize {
+            self.songs.len().saturating_sub(1)
         }
         fn carry_out(&mut self, command: &Command, ready: &Ready) -> Carried {
             self.asked.push(command.name().to_string());

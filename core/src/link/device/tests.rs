@@ -75,7 +75,7 @@ impl Player for Fake {
     }
     fn full(&self) -> Full {
         let entry = |id: &String| crate::link::message::Entry { id: id.clone(), title: id.clone(), duration: 300, ..Default::default() };
-        Full::fitted(self.position, self.queue.get(self.cursor).map(entry), self.queue.iter().skip(self.cursor + 1).map(entry), "", self.shuffle, self.repeat, self.volume)
+        Full::fitted(self.position, self.queue.get(self.cursor).map(entry), self.queue.iter().skip(self.cursor + 1).map(entry), self.to_come(), "", self.shuffle, self.repeat, self.volume)
     }
     fn handed(&self) -> Handed {
         Handed::fitted(&self.queue[self.cursor.min(self.queue.len())..], 0, self.position, "the queue")
@@ -99,6 +99,9 @@ impl Player for Fake {
     }
     fn ahead(&self) -> Vec<String> {
         self.queue.iter().skip(self.cursor + 1).cloned().collect()
+    }
+    fn to_come(&self) -> usize {
+        self.queue.len().saturating_sub(self.cursor + 1)
     }
     fn carry_out(&mut self, command: &Command, ready: &Ready) -> Carried {
         match command {
@@ -1002,6 +1005,30 @@ fn an_add_asks_the_server_only_for_what_is_lacking_and_queues_what_it_had_too() 
     world.pass(1_000);
     let queue = &world.copies[B].player.queue;
     assert_eq!(queue[queue.len() - 2..], ["s3", "s5"], "{:?}", world.copies[B].log);
+}
+
+/// Another device can add songs to this one's queue, command after command. **Not
+/// without end**: an Add that would leave more to come than a queue is let hold is
+/// refused, before anything is looked up for it, and the queue is as it was.
+#[test]
+fn an_add_from_another_device_cannot_grow_the_queue_past_its_bound() {
+    let mut world = steering("add");
+    let b = &mut world.copies[B].player;
+    b.queue.extend((0..MOST_TO_COME - 7).map(|_| "s1".to_string()));
+    assert_eq!(b.to_come(), MOST_TO_COME);
+    let before = b.queue.len();
+    world.ask("add");
+    world.pass(1_000);
+    assert!(world.last(B, "add from").contains("refused, Cannot"), "{:?}", world.copies[B].log);
+    assert_eq!((world.copies[B].player.queue.len(), world.finds.len(), world.copies[B].player.rule.busy(world.now)), (before, 0, false));
+    assert_eq!(world.copies[A].said.last().map(String::as_str), Some("Copy B couldn't do that."));
+    // With room for it, it is added.
+    let mut world = steering("add");
+    let b = &mut world.copies[B].player;
+    b.queue.extend((0..MOST_TO_COME - 8).map(|_| "s1".to_string()));
+    world.ask("add");
+    world.pass(1_000);
+    assert_eq!((world.copies[B].player.to_come(), world.copies[B].player.queue.last().map(String::as_str)), (MOST_TO_COME, Some("x1")));
 }
 
 /// An Add brings a song this device's copy of the library lacks, and the music server

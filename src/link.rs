@@ -305,8 +305,10 @@ impl Player for Here<'_> {
 
     fn full(&self) -> Full {
         let pb = self.ctl.playback.borrow();
+        // (As many of what is to come as a tell carries are looked at, and no more: the
+        // rest are counted from how many there are.)
         let coming = pb.order.iter().skip(pb.cursor + 1).filter_map(|&index| pb.queue.get(index)).map(entry_of);
-        Full::fitted(pb.position, pb.current().map(entry_of), coming, &pb.context, pb.shuffle, pb.repeat, f64::from(pb.volume))
+        Full::fitted(pb.position, pb.current().map(entry_of), coming, pb.order.len().saturating_sub(pb.cursor + 1), &pb.context, pb.shuffle, pb.repeat, f64::from(pb.volume))
     }
 
     fn handed(&self) -> Handed {
@@ -342,6 +344,11 @@ impl Player for Here<'_> {
     fn ahead(&self) -> Vec<String> {
         let pb = self.ctl.playback.borrow();
         pb.order.iter().skip(pb.cursor + 1).filter_map(|&index| pb.queue.get(index)).map(|song| song.id.clone()).collect()
+    }
+
+    fn to_come(&self) -> usize {
+        let pb = self.ctl.playback.borrow();
+        pb.order.len().saturating_sub(pb.cursor + 1)
     }
 
     fn carry_out(&mut self, command: &Command, ready: &Ready) -> Carried {

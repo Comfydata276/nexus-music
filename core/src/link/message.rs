@@ -219,21 +219,22 @@ pub struct Full {
 }
 
 impl Full {
-    /// A state with as much of what is to come as a tell carries.
-    pub fn fitted(position: f64, now: Option<Entry>, coming: impl Iterator<Item = Entry>, context: &str, shuffle: bool, repeat: u8, volume: f64) -> Full {
-        let (mut queue, mut used, mut more) = (Vec::new(), 0usize, 0u64);
-        for entry in coming {
-            // (Once no more fit, the rest are only counted: what one would have cost is
-            // not worked out for a queue of thousands.)
-            let fits = more == 0 && queue.len() < MOST_SHOWN;
-            let cost = if fits { entry.value().to_string().len() + 1 } else { 0 };
-            if !fits || used + cost > MOST_SHOWN_BYTES {
-                more += 1;
-                continue;
+    /// A state with as much of what is to come as a tell carries. `coming` is what is to
+    /// come, in order, and `in_all` how many of them there are: **no more of `coming` is
+    /// looked at than is sent**, and the rest are counted from `in_all`, so that this
+    /// costs what a tell holds whatever the length of the queue.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fitted(position: f64, now: Option<Entry>, coming: impl Iterator<Item = Entry>, in_all: usize, context: &str, shuffle: bool, repeat: u8, volume: f64) -> Full {
+        let (mut queue, mut used) = (Vec::new(), 0usize);
+        for entry in coming.take(MOST_SHOWN) {
+            let cost = entry.value().to_string().len() + 1;
+            if used + cost > MOST_SHOWN_BYTES {
+                break;
             }
             used += cost;
             queue.push(entry);
         }
+        let more = in_all.saturating_sub(queue.len()) as u64;
         Full { position: if position.is_finite() && position > 0.0 { position } else { 0.0 }, now, queue, more, context: text::cut(context, MOST_CONTEXT), shuffle, repeat: repeat.min(2), volume: if volume.is_finite() { volume.clamp(0.0, 1.0) } else { 1.0 } }
     }
 
@@ -613,7 +614,7 @@ mod tests {
 
     #[test]
     fn a_full_tell_and_one_with_the_queue_are_written_and_read_back() {
-        let full = Full::fitted(41.5, Some(entry(0)), (1..6).map(entry), "Harbour Lights", true, 1, 0.6);
+        let full = Full::fitted(41.5, Some(entry(0)), (1..6).map(entry), 5, "Harbour Lights", true, 1, 0.6);
         assert_eq!((full.queue.len(), full.more), (5, 0));
         let told = Tell { full: Some(full), steering: "Study PC".into(), ..tell() };
         assert_eq!(read_tell(told.text().as_bytes()), Some(told));
@@ -631,15 +632,33 @@ mod tests {
     fn a_full_tell_carries_only_so_much_of_what_is_to_come_and_counts_the_rest() {
         // Titles as long as they are let be, in letters of four bytes each.
         let wide = |n: usize| Entry { id: format!("{n:064}"), title: "🎵".repeat(200), artist: "🎵".repeat(200), album: "🎵".repeat(200), duration: 200, queued: false };
-        let full = Full::fitted(0.0, Some(wide(0)), (1..500).map(wide), &"🎵".repeat(200), false, 0, 1.0);
+        let full = Full::fitted(0.0, Some(wide(0)), (1..500).map(wide), 499, &"🎵".repeat(200), false, 0, 1.0);
         assert!(full.queue.len() >= 50 && full.queue.len() < 200, "{}", full.queue.len());
         assert_eq!(full.queue.len() as u64 + full.more, 499);
         let told = Tell { full: Some(full), name: "🎵".repeat(200), title: "🎵".repeat(200), artist: "🎵".repeat(200), steering: "🎵".repeat(200), ..tell() };
         assert!(told.text().len() <= MOST_FULL, "{}", told.text().len());
         assert!(read_tell(told.text().as_bytes()).is_some());
         // Short ones: no more than two hundred are sent whatever their size.
-        let full = Full::fitted(0.0, None, (0..1_000).map(entry), "", false, 0, 1.0);
+        let full = Full::fitted(0.0, None, (0..1_000).map(entry), 1_000, "", false, 0, 1.0);
         assert_eq!((full.queue.len(), full.more), (MOST_SHOWN, 800));
+        // **What is past what a tell carries is not looked at**: it is counted from how
+        // many there are in all, which whoever holds the queue knows without walking it.
+        // (A device being steered is asked for this as often as its steerer looks.)
+        let looked_at = std::cell::Cell::new(0usize);
+        let coming = (0..100_000).map(|n| {
+            looked_at.set(looked_at.get() + 1);
+            entry(n)
+        });
+        let full = Full::fitted(0.0, None, coming, 100_000, "", false, 0, 1.0);
+        assert_eq!((full.queue.len(), full.more), (MOST_SHOWN, 100_000 - MOST_SHOWN as u64));
+        assert!(looked_at.get() <= MOST_SHOWN + 1, "{} entries were looked at", looked_at.get());
+        let looked_at = std::cell::Cell::new(0usize);
+        let coming = (1..100_000).map(|n| {
+            looked_at.set(looked_at.get() + 1);
+            wide(n)
+        });
+        let full = Full::fitted(0.0, None, coming, 99_999, "", false, 0, 1.0);
+        assert!(full.queue.len() < MOST_SHOWN && full.queue.len() as u64 + full.more == 99_999 && looked_at.get() <= full.queue.len() + 1, "{} of {}", looked_at.get(), full.queue.len());
         // A queue of five thousand songs with the longest ids fits one message, cut.
         let ids: Vec<String> = (0..5_000).map(|n| format!("{n:064}")).collect();
         let handed = Handed::fitted(&ids, 2, 0.0, "Everything");
