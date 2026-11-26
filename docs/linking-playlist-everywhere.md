@@ -86,8 +86,10 @@ So that the change, when it comes, is a list of lines.
 What the sync playlist has always left. From the review's findings, as the ruling gives
 them (the review's thread has each in full):
 
-- **Reachable by a remembered id.** Something that kept the playlist's id before it was
-  left out (a saved queue's source, an Undo, a link) can still name it.
+- **Reachable by a remembered id, for writing too.** Something that kept the playlist's
+  id before it was left out (a saved queue's source, an Undo, a link) can still name it;
+  and a menu or prompt opened while the row was still listed (Add to playlist, rename,
+  delete) still goes through, because the id is what is sent.
 - **A renamed record shows.** A playlist renamed somewhere else is an ordinary playlist
   to every list; its description is still the record. Its page is still never written to
   a cache.
