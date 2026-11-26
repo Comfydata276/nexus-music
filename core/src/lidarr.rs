@@ -407,6 +407,13 @@ pub fn origin_saved(address: &str) -> Result<Origin, String> {
     origin(&format!("{scheme}://{authority}{after}"))
 }
 
+/// Where an address submitted in Settings leads: if it's the address already `saved`, as it
+/// was saved (`origin_saved`: only a new key was typed); if it differs, by the rule for what's
+/// typed (`origin`).
+pub fn origin_entered(entered: &str, saved: &str) -> Result<Origin, String> {
+    if entered.trim() == saved.trim() { origin_saved(entered) } else { origin(entered) }
+}
+
 /// Whether two addresses lead to the same place (see `origin`). One that can't be used is the
 /// same as nothing.
 pub fn same_origin(a: &str, b: &str) -> bool {
@@ -1208,6 +1215,17 @@ impl Lidarr {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn an_address_submitted_unchanged_is_judged_as_saved() {
+        let saved = "http://me:secret@lidarr.example.org:8686";
+        // Only a new key typed: the address as it was saved.
+        assert_eq!(origin_entered(saved, saved), origin_saved(saved));
+        assert_eq!(origin_entered(&format!(" {saved} "), saved), origin_saved(saved));
+        // Changed: by the rule for what's typed.
+        assert_eq!(origin_entered("http://me:other@lidarr.example.org:8686", saved).unwrap_err(), ADDRESS_WITH_NAME);
+        assert_eq!(origin_entered("http://lidarr.example.org:", saved).unwrap_err(), ADDRESS_UNUSABLE);
+    }
 
     #[test]
     fn a_saved_address_is_read_as_0_40_10_used_it_and_a_typed_one_held_to_the_rule() {

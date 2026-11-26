@@ -1551,8 +1551,10 @@ impl Controller {
     fn save_requests(&self, address: &str, key: &str) {
         // An address with a name and password in it, or one the app might read otherwise than
         // its connections would, isn't kept: nor is the key typed with it.
+        // (The address already saved, submitted with only a new key, is judged as it was saved.)
         if !address.trim().is_empty() {
-            if let Err(why) = nexus_core::lidarr::origin(address) {
+            let saved = self.settings.borrow().lidarr_address.clone();
+            if let Err(why) = nexus_core::lidarr::origin_entered(address, &saved) {
                 self.push_settings();
                 return self.requests_state("error", &why);
             }
