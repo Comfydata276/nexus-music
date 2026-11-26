@@ -290,13 +290,7 @@ impl Peer {
                 return Told::Dropped;
             }
             command.answered = true;
-            // (The device could not learn what its player did with it: not known, and
-            // said as that, not as a refusal.)
-            let outcome = match tell.why {
-                _ if done => Outcome::Done,
-                Some(Why::Unknown) => Outcome::Unknown,
-                why => Outcome::Refused(why.unwrap_or(Why::Changed)),
-            };
+            let outcome = if done { Outcome::Done } else { Outcome::Refused(tell.why.unwrap_or(Why::Changed)) };
             command.outcome = Some(outcome);
             if done {
                 // What it says of the device is the state the next command is made against.
@@ -520,17 +514,6 @@ mod tests {
         peer.checking(LOOK_2, 13_000);
         assert_eq!(peer.told(state(5, LOOK_2)), Told::ShownAndSettled(Outcome::NotReached));
         assert_eq!((peer.pressed(), peer.next(13_100)), (0, None));
-    }
-
-    /// The other device asked its player and could not learn what came of it. That is
-    /// neither "done" nor "nothing was done": it is not known, and what was pressed
-    /// behind it is let go of.
-    #[test]
-    fn an_answer_of_not_known_is_said_as_not_known() {
-        let mut peer = paused();
-        peer.press(&Command::Next, 1_100);
-        assert_eq!(peer.told(Tell { ok: Some(false), why: Some(Why::Unknown), ..state(7, PAUSE) }), Told::Settled(Outcome::Unknown));
-        assert_eq!((peer.pressed(), peer.next(1_200), peer.outcome()), (0, None, Some(Outcome::Unknown)));
     }
 
     /// A queue taken over is the state's maker from the moment it is loaded, and is not

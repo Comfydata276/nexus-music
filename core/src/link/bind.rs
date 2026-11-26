@@ -65,10 +65,13 @@ use crate::ways::{Ways, What, Who};
 /// the player lives on, from inside [`Phone::happened`], and is answered before it
 /// returns.**
 ///
-/// **Each act has an outcome, and none is assumed.** A question that cannot be answered
-/// (the app threw) is answered as nothing: no song, not sounding. An act that cannot say
-/// what it did says so ([`Carried::Unknown`], `false`): the library then asks the player
-/// what it holds and goes by that, and never takes "asked" for "done".
+/// **None of these can fail: each is a total function of the player's state.** There is
+/// no answer for "could not be asked", and the app never gives one in its place: no zero
+/// for a queue's number, no "not playing" for a state it could not read, no "not done" for
+/// an act that threw. If a call into the player does fail (an exception on the app's side,
+/// a read that could not be made), the app's side of this **stops the call by unwinding**
+/// (a panic), and that is a fault ([`Act::Fault`]): everything is replaced and linking is
+/// off on the phone until the next sign-in or start of the app.
 pub trait PhonePlayer {
     fn brief(&self) -> Brief;
     /// What a device steering this one shows.
@@ -99,9 +102,8 @@ pub trait PhonePlayer {
     /// moment it is one taken up from that device and not touched
     /// (`handover::Here::taken` is `handover::HANDED`). It is not saved, and it follows
     /// what that device saves, until [`PhonePlayer::claim`]. Called before the stop that
-    /// goes with it, so that the stop is not saved as the phone's own change. Says whether
-    /// it was marked.
-    fn handed_on(&mut self) -> bool;
+    /// goes with it, so that the stop is not saved as the phone's own change.
+    fn handed_on(&mut self);
     /// The hand-over did not happen (the phone did not stop): the queue is as it was
     /// before [`PhonePlayer::handed_on`].
     fn handed_back(&mut self);
@@ -109,16 +111,17 @@ pub trait PhonePlayer {
     /// afterwards ([`PhonePlayer::brief`]).
     fn pause(&mut self);
     /// Takes this queue and plays it: each song and whether it was queued by hand, where to
-    /// start, and how far in. Says whether the queue is in the player; if it is,
-    /// [`PhonePlayer::queue`] has a new number. Counted and claimed here only if so.
-    fn take(&mut self, songs: &[(String, bool)], begin: usize, position: f64, context: &str) -> bool;
+    /// start, and how far in. Whether the queue is in the player afterwards is what
+    /// [`PhonePlayer::queue`] says: a new number if it is, and it is counted and claimed
+    /// here only then. A player that does not take it (its own rules refuse) leaves the
+    /// number as it was, and that is an answer, not a failure.
+    fn take(&mut self, songs: &[(String, bool)], begin: usize, position: f64, context: &str);
     /// The queue is the phone's own from this moment, by the person's own doing here or at
     /// another of their devices: it is no longer one taken up from another device
     /// (`handover::Here::taken`), it changed now by the phone's clock
     /// (`handover::Here::stamp`), and it is to be saved. Said after the change it is for
-    /// is in the player. Says whether that was done: if not, the command it belongs to
-    /// stands all the same, and the failure is told ([`Do::Log`]).
-    fn claim(&mut self) -> bool;
+    /// is in the player.
+    fn claim(&mut self);
 }
 
 /// Something that happened on the phone, told to the linking.
@@ -229,6 +232,13 @@ pub enum Act {
     Handled { by_another: bool },
     /// The ticket for a look-up that has begun.
     Ticket { ticket: u64 },
+    /// **Linking has stopped on this phone**, until the next sign-in or start of the app:
+    /// a call into the player failed, or something inside the library did
+    /// ([`Phone::happened`]). The library asks nothing more of the player. The app puts
+    /// right what only it can, since the library can no longer ask: if its queue is marked
+    /// as handed to another device and the phone is the one playing, the app takes the
+    /// mark back, as [`PhonePlayer::handed_back`] would.
+    Fault,
 }
 
 /// The ids of the songs in the phone's copy of the library. Made ready where the copy is
@@ -273,8 +283,6 @@ struct Held<'a> {
     ways: &'a mut Ways,
     theirs: &'a mut dyn PhonePlayer,
     turns: &'a Turns<Happened>,
-    /// What went wrong on the app's side that does not fail what it belongs to: told.
-    told: &'a mut Vec<String>,
     /// The number the player last gave for its queue.
     queue: Cell<u64>,
 }
@@ -288,11 +296,10 @@ impl Held<'_> {
         self.turns.ended()
     }
 
-    /// The queue is the phone's own from now. If the app could not record that, the
-    /// command stands, and it is told.
+    /// The queue is the phone's own from now.
     fn claim(&mut self) {
-        if !self.over() && !self.theirs.claim() {
-            self.told.push("queue: the phone's app could not record that its queue is its own from now".into());
+        if !self.over() {
+            self.theirs.claim();
         }
     }
 }
@@ -333,10 +340,7 @@ impl Player for Held<'_> {
     /// holds. The rule counts it.
     ///
     /// **Only what is in the player is claimed.** A queue to take over is in the player if
-    /// the player's queue has a new number, whatever the call said. For anything else, a
-    /// call that could not say what it did is taken to have changed something: the queue
-    /// is kept from being replaced behind the person's back, at the price of a claim for
-    /// a press that may have done nothing.
+    /// the player's queue has a new number.
     fn carry_out(&mut self, command: &Command, ready: &Ready) -> Carried {
         if self.over() {
             return Carried::Unchanged;
@@ -349,7 +353,7 @@ impl Player for Held<'_> {
         };
         let changed = match command {
             Command::Adopt(_) => self.queue() != before,
-            _ => carried != Carried::Unchanged,
+            _ => carried == Carried::Changed,
         };
         if changed && self.ways.touch(Who::Here, command.touches()).claim {
             self.claim();
@@ -357,8 +361,10 @@ impl Player for Held<'_> {
         self.ways.end();
         carried
     }
-    fn handed_on(&mut self) -> bool {
-        !self.over() && self.theirs.handed_on()
+    fn handed_on(&mut self) {
+        if !self.over() {
+            self.theirs.handed_on();
+        }
     }
     fn handed_back(&mut self) {
         if !self.over() {
@@ -381,16 +387,16 @@ impl Player for Held<'_> {
     /// once it is in the player.)
     ///
     /// **Only a queue that went in is counted and claimed**: whether it did is asked of
-    /// the player afterwards (its queue has a new number), whatever the call said.
-    fn take(&mut self, songs: &[(String, bool)], begin: usize, position: f64, context: &str) -> bool {
+    /// the player afterwards (its queue has a new number).
+    fn take(&mut self, songs: &[(String, bool)], begin: usize, position: f64, context: &str) {
         if self.over() {
-            return false;
+            return;
         }
         let before = self.queue();
-        let said = {
+        {
             let _changing = self.turns.changing();
-            self.theirs.take(songs, begin, position, context)
-        };
+            self.theirs.take(songs, begin, position, context);
+        }
         if self.queue() != before {
             let owed = self.ways.touch(Who::Here, What::Playing);
             if owed.count {
@@ -400,7 +406,6 @@ impl Player for Held<'_> {
                 self.claim();
             }
         }
-        said
     }
     fn generation(&self) -> u64 {
         self.rule.generation()
@@ -497,6 +502,10 @@ pub struct Phone {
     /// The sign-in all of it belongs to, once a tick has said. (Beside the rest, so that
     /// what arrives while a call is under way can be told from the end of the sign-in.)
     account: RefCell<Option<String>>,
+    /// **Linking is off after a fault**, until the next sign-in. (A new start of the app
+    /// makes a new one of these.)
+    off: Cell<bool>,
+    here: Here,
 }
 
 /// What a call brings with it.
@@ -523,10 +532,8 @@ impl Inner {
     /// Hands the deciding something, with the player to ask, and sorts what it asks for.
     fn with(&mut self, call: &mut Call, came: &mut Came, act: impl FnOnce(&mut Device, &mut Env) -> Vec<Do>) {
         let Inner { device, rule, ways, library, me, .. } = self;
-        let mut told = Vec::new();
-        let mut player = Held { rule, ways, theirs: &mut *call.theirs, turns: call.turns, told: &mut told, queue: Cell::new(0) };
+        let mut player = Held { rule, ways, theirs: &mut *call.theirs, turns: call.turns, queue: Cell::new(0) };
         let asked = act(device, &mut Env { now_ms: call.now_ms, today: call.today, me, player: &mut player, library: &**library, random: &mut *call.random });
-        came.native.extend(told.into_iter().map(Do::Log));
         for ask in asked {
             match ask {
                 Do::Say(_) | Do::Remember(_) | Do::Forget { .. } | Do::Steering(_) => came.acts.push(Act::Do { ask }),
@@ -604,8 +611,8 @@ impl Inner {
                 if owed.count {
                     self.rule.moved();
                 }
-                if owed.claim && !call.theirs.claim() {
-                    came.native.push(Do::Log("queue: the phone's app could not record that its queue is its own from now".into()));
+                if owed.claim {
+                    call.theirs.claim();
                 }
             }
             Event::LookingUp => {
@@ -648,7 +655,7 @@ impl Phone {
     /// phone; `remembered` the devices seen before, as last kept ([`Do::Remember`]).
     pub fn new(device: DeviceId, name: &str, remembered: Vec<Seen>) -> Phone {
         let me = Me { device, name: name.to_string(), here: Here::Phone };
-        Phone { turns: Turns::default(), inner: RefCell::new(Inner::new(Device::new(remembered), me, 0)), account: RefCell::new(None) }
+        Phone { turns: Turns::default(), inner: RefCell::new(Inner::new(Device::new(remembered), me, 0)), account: RefCell::new(None), off: Cell::new(false), here: Here::Phone }
     }
 
     /// Something happened. Called on the thread the player lives on; `player` is asked
@@ -659,11 +666,23 @@ impl Phone {
     /// **It may be called from inside itself** (the player's listeners, told of a change
     /// while the player is being asked): see [`Answer`].
     ///
-    /// **If anything inside it stops unexpectedly** (a panic: a fault of this library's),
-    /// it does not stay half-way: everything it held is replaced, as at a sign-out, with
-    /// one line said of it ([`Do::Log`]), and linking starts again from a look at the
-    /// next tick.
+    /// **A fault.** If anything inside it stops unexpectedly (a panic: a call into the
+    /// player that failed, see [`PhonePlayer`], or a fault of this library's own), it does
+    /// not stay half-way, and it does not go on with an answer it did not get. Everything
+    /// it held is replaced, as at a sign-out; the session and the look are ended for the
+    /// app's side; one line is said of it ([`Do::Log`]); the app is told ([`Act::Fault`]);
+    /// and **linking is off on this phone until the next sign-in or start of the app**:
+    /// until then nothing is asked of the player, nothing is looked for and nothing is
+    /// sent, so a fault that is still there cannot come round again at every tick. A
+    /// press is the phone's own ([`Act::Handled`]), a tick says why the list is empty.
     pub fn happened(&self, what: Happened, now_ms: u64, today: u64, random: &mut dyn FnMut(&mut [u8]) -> bool, player: &mut dyn PhonePlayer) -> Answer {
+        if self.off.get() {
+            match self.while_off(&what) {
+                Some(came) => return Answer::Came(came),
+                // The next sign-in: linking is on again, and this is the first of it.
+                None => self.off.set(false),
+            }
+        }
         let kind = what.kind(self.account.borrow().as_deref());
         let size = what.size();
         let turn = match self.turns.enter(what, kind, size) {
@@ -700,16 +719,43 @@ impl Phone {
         }
     }
 
-    /// Something inside the library stopped unexpectedly. Nothing is left as it was at
-    /// that moment: what was kept for later is dropped, the session and any look are
-    /// ended for the app's side, and everything of the sign-in is replaced.
+    /// What something comes to while linking is off after a fault; `None` for what ends
+    /// that (a sign-out, or a tick that names another sign-in than the one it happened under).
+    fn while_off(&self, what: &Happened) -> Option<Came> {
+        let mut came = Came::default();
+        match what {
+            Happened::Event(Event::Stop) => {
+                *self.account.borrow_mut() = None;
+                return None;
+            }
+            Happened::Event(Event::Tick { account, .. }) => {
+                let mut under = self.account.borrow_mut();
+                match under.as_deref() {
+                    // (It happened before any tick had named the sign-in: this one is it.)
+                    None => *under = Some(account.clone()),
+                    Some(under) if under == account => {}
+                    Some(_) => {
+                        *under = None;
+                        return None;
+                    }
+                }
+                came.acts.push(Act::Shown { shown: Shown { note: super::words::fault(self.here), ..Shown::default() } });
+            }
+            Happened::Event(Event::Press { .. } | Event::Add { .. } | Event::Play { .. } | Event::PlayHere) => came.acts.push(Act::Handled { by_another: false }),
+            _ => {}
+        }
+        Some(came)
+    }
+
+    /// Something stopped unexpectedly: a fault. Nothing is left as it was at that moment:
+    /// what was kept for later is dropped, the session and any look are ended for the
+    /// app's side, everything of the sign-in is replaced, and linking is off.
     fn start_again(&self, stopped: &(dyn std::any::Any + Send)) -> Came {
         let said = stopped.downcast_ref::<&str>().map(|text| text.to_string()).or_else(|| stopped.downcast_ref::<String>().cloned()).unwrap_or_default();
         self.turns.forget();
+        self.off.set(true);
         let mut came = Came::default();
-        if let Ok(mut account) = self.account.try_borrow_mut() {
-            *account = None;
-        }
+        came.acts.push(Act::Fault);
         if let Ok(mut inner) = self.inner.try_borrow_mut() {
             if let Some(session) = inner.device.session_number() {
                 came.native.push(Do::End { session });
@@ -720,7 +766,7 @@ impl Phone {
             }
             *inner = inner.afresh();
         }
-        came.native.push(Do::Log(format!("linking: it stopped unexpectedly ({}). Everything it held was let go of, and it starts again from a look.", super::text::cut(&said, 200))));
+        came.native.push(Do::Log(format!("linking: it stopped unexpectedly ({}). Everything it held was let go of, and linking is off here until the next sign-in or start.", super::text::cut(&said, 200))));
         came
     }
 
@@ -801,7 +847,7 @@ mod tests {
         fn carry_out(&mut self, _: &Command, _: &Ready) -> Carried {
             unreachable!("asked from inside a call")
         }
-        fn handed_on(&mut self) -> bool {
+        fn handed_on(&mut self) {
             unreachable!("asked from inside a call")
         }
         fn handed_back(&mut self) {
@@ -810,10 +856,10 @@ mod tests {
         fn pause(&mut self) {
             unreachable!("asked from inside a call")
         }
-        fn take(&mut self, _: &[(String, bool)], _: usize, _: f64, _: &str) -> bool {
+        fn take(&mut self, _: &[(String, bool)], _: usize, _: f64, _: &str) {
             unreachable!("asked from inside a call")
         }
-        fn claim(&mut self) -> bool {
+        fn claim(&mut self) {
             unreachable!("asked from inside a call")
         }
     }
@@ -843,18 +889,13 @@ mod tests {
     enum Wrong {
         /// A queue to take does not go into the player: nothing changes.
         TakeNotInstalled,
-        /// A queue to take goes in, and then the call fails: the app says "not installed".
-        TakeThrewAfterInstalling,
-        /// A command is carried out, and then the call fails: the app cannot say what it did.
+        /// A command is carried out, and then the call into the app fails.
         ThrewAfterChanging,
-        /// A command is not carried out, and the call fails all the same.
-        ThrewChangingNothing,
         /// Told to stop, the player goes on sounding (by a command or by the phone itself).
         DoesNotStop,
-        /// The app cannot record whose the queue is.
+        /// The app cannot record whose the queue is: the call fails.
         CannotRecord,
-        /// Asked what it is playing, it brings the library itself down (as a fault of the
-        /// library's own would).
+        /// Asked what it is playing, the call fails.
         Panics,
     }
 
@@ -921,9 +962,6 @@ mod tests {
         }
         fn carry_out(&mut self, command: &Command, ready: &Ready) -> Carried {
             self.asked.push(command.name().to_string());
-            if self.wrong == Some(Wrong::ThrewChangingNothing) {
-                return Carried::Unknown;
-            }
             let changed = match (command, ready) {
                 (Command::Pause | Command::Moved, _) if self.wrong == Some(Wrong::DoesNotStop) => false,
                 (Command::Pause | Command::Moved, _) => self.sound.take().is_some(),
@@ -959,15 +997,13 @@ mod tests {
             if changed {
                 self.tell("carry_out");
             }
-            match (changed, self.wrong) {
-                (_, Some(Wrong::ThrewAfterChanging)) => Carried::Unknown,
-                (true, _) => Carried::Changed,
-                (false, _) => Carried::Unchanged,
+            if self.wrong == Some(Wrong::ThrewAfterChanging) {
+                panic!("the app threw after the player changed");
             }
+            if changed { Carried::Changed } else { Carried::Unchanged }
         }
-        fn handed_on(&mut self) -> bool {
+        fn handed_on(&mut self) {
             self.asked.push(format!("handed on, {}", if self.sound.is_some() { "sounding" } else { "silent" }));
-            self.wrong != Some(Wrong::CannotRecord)
         }
         fn handed_back(&mut self) {
             self.asked.push("handed back".into());
@@ -979,20 +1015,21 @@ mod tests {
                 self.tell("pause");
             }
         }
-        fn take(&mut self, songs: &[(String, bool)], begin: usize, position: f64, _context: &str) -> bool {
+        fn take(&mut self, songs: &[(String, bool)], begin: usize, position: f64, _context: &str) {
             self.asked.push(format!("take {} from {begin}", songs.len()));
             if self.wrong == Some(Wrong::TakeNotInstalled) {
-                return false;
+                return;
             }
             self.songs = songs.iter().skip(begin).map(|(id, _)| id.clone()).collect();
             self.sound = Some(position);
             self.queue += 1;
             self.tell("take");
-            self.wrong != Some(Wrong::TakeThrewAfterInstalling)
         }
-        fn claim(&mut self) -> bool {
+        fn claim(&mut self) {
             self.asked.push("claim".into());
-            self.wrong != Some(Wrong::CannotRecord)
+            if self.wrong == Some(Wrong::CannotRecord) {
+                panic!("the app could not record whose the queue is");
+            }
         }
     }
 
@@ -1411,11 +1448,10 @@ mod tests {
 
     /// "Play here" on a phone whose player does not take the queue, while what it held
     /// before goes on sounding: that sound is not the sound of the queue that was taken.
-    /// Nothing is claimed and the other device is not told to stop. If the queue did go in
-    /// and the call then failed, the player is asked, and gone by.
+    /// Nothing is claimed and the other device is not told to stop.
     #[test]
     fn only_a_queue_that_went_in_is_claimed_and_only_its_sound_stops_the_other() {
-        for wrong in [Wrong::TakeNotInstalled, Wrong::TakeThrewAfterInstalling] {
+        {
             let phones = two_phones();
             let mut pair = Pair::new(&phones);
             let place = text::place(&pair.places[1]);
@@ -1423,16 +1459,11 @@ mod tests {
             pair.pass(500);
             // (A is sounding what it held before, as if the car had started it.)
             pair.players[0].sound = Some(1.0);
-            pair.players[0].wrong = Some(wrong);
+            pair.players[0].wrong = Some(Wrong::TakeNotInstalled);
             pair.event(0, r#"{"event":"play_here"}"#);
             pair.pass(2_000);
-            if wrong == Wrong::TakeNotInstalled {
-                assert_eq!((pair.asked(0), pair.asked(1)), (vec!["take 4 from 0"], vec![]));
-                assert_eq!((pair.said(0).last().copied(), pair.players[1].sound.is_some(), order(&phones[0], pair.now).2), (Some("This phone couldn't load that. Phone B is still playing."), true, false));
-            } else {
-                assert_eq!((pair.asked(0), pair.asked(1)), (vec!["take 4 from 0", "claim"], vec!["handed on, sounding", "moved"]));
-                assert_eq!((pair.said(0).last().copied(), pair.players[1].sound), (Some("Playing here. Phone B is paused."), None));
-            }
+            assert_eq!((pair.asked(0), pair.asked(1)), (vec!["take 4 from 0"], vec![]));
+            assert_eq!((pair.said(0).last().copied(), pair.players[1].sound.is_some(), order(&phones[0], pair.now).2), (Some("This phone couldn't load that. Phone B is still playing."), true, false));
         }
     }
 
@@ -1463,37 +1494,28 @@ mod tests {
         assert!(!pair.acts[0].iter().any(|act| matches!(act, Act::Do { ask: Do::Steering(Some(_)) })));
     }
 
-    /// The tell a phone sent to the other place in the room, opened.
-    fn answered(came: &Came, place: &[u8; 16]) -> super::super::message::Tell {
-        let Some(Do::Send { frame: sent, .. }) = came.native.iter().find(|ask| matches!(ask, Do::Send { .. })) else { panic!("no answer: {came:?}") };
-        let opened = frame::open(&Keys::of(&secret()), sent, place, &[1; 16]).expect("the answer opens");
-        read_tell(&opened.message).expect("a tell")
-    }
-
-    /// A call up that changed the player and then failed cannot say what it did. The
-    /// library does not take "asked" for "done": it asks the player what it holds, counts
-    /// a change that no command is named for, and tells the sender it is not known.
+    /// A call up that changed the player and then failed, at whatever point: there is no
+    /// answer for it, and none is made up. It is a fault. Nothing is sent to the command's
+    /// sender (which finds out by asking, and is told nothing by a device that is off),
+    /// and the phone's player is asked nothing more.
     #[test]
-    fn a_call_that_cannot_say_what_it_did_is_answered_as_not_known_with_the_state_asked_afresh() {
+    fn a_call_into_the_player_that_fails_is_a_fault_whatever_it_had_done() {
+        for (wrong, command_sent, asked) in [(Wrong::ThrewAfterChanging, Command::Next, vec!["next"]), (Wrong::CannotRecord, Command::Pause, vec!["pause", "claim"])] {
+            let mut n = 0;
+            let (phone, mut player, session, place) = phone(&mut n);
+            player.wrong = Some(wrong);
+            let came = hear(&phone, &mut player, session, &place, vec![command(1, &place, command_sent, 1), command(2, &place, Command::Play, 2)], 2_000, &mut n);
+            assert!(came.acts.contains(&Act::Fault) && sends(&came.native) == 0 && came.native.contains(&Do::End { session }), "{wrong:?}: {came:?}");
+            assert_eq!(player.asked, asked, "{wrong:?}");
+            let (acts, native) = phone.handle(TICK, 2_250, 100, &mut random(&mut n), &mut player).unwrap();
+            assert!(native.is_empty() && acts.contains("Linking stopped on this phone"), "{wrong:?}: {acts} {native:?}");
+        }
+        // And the same for something chosen on the phone itself, which the app could not record.
         let mut n = 0;
-        let (phone, mut player, session, place) = phone(&mut n);
-        player.wrong = Some(Wrong::ThrewAfterChanging);
-        let came = hear(&phone, &mut player, session, &place, vec![command(1, &place, Command::Next, 1)], 2_000, &mut n);
-        let tell = answered(&came, &place);
-        assert_eq!((tell.ok, tell.why, tell.at.generation, tell.by, tell.title.as_str()), (Some(false), Some(Why::Unknown), 2, None, "s1"));
-        assert_eq!((order(&phone, 2_000), player.asked.as_slice()), ((2, None, false), ["next".to_string(), "claim".to_string()].as_slice()));
-        // One that failed having changed nothing is not known either, and is told the same.
-        player.wrong = Some(Wrong::ThrewChangingNothing);
-        let came = hear(&phone, &mut player, session, &place, vec![command(2, &place, Command::Next, 2)], 2_100, &mut n);
-        let tell = answered(&came, &place);
-        assert_eq!((tell.ok, tell.why, tell.at.generation, tell.title.as_str()), (Some(false), Some(Why::Unknown), 3, "s1"));
-        // The app cannot record whose the queue is: the command stands, and that is told.
+        let (phone, mut player, ..) = phone(&mut n);
         player.wrong = Some(Wrong::CannotRecord);
-        let came = hear(&phone, &mut player, session, &place, vec![command(3, &place, Command::Pause, 3)], 2_200, &mut n);
-        assert!(logged(&came.native, "carried out") && logged(&came.native, "could not record that its queue is its own"), "{came:?}");
-        assert_eq!(answered(&came, &place).ok, Some(true));
-        let (_, native) = phone.handle(CHANGED, 2_300, 100, &mut random(&mut n), &mut player).unwrap();
-        assert!(logged(&native, "could not record that its queue is its own"));
+        let (acts, native) = phone.handle(CHANGED, 2_300, 100, &mut random(&mut n), &mut player).unwrap();
+        assert!(acts.contains(r#""act":"fault""#) && logged(&native, "linking: it stopped unexpectedly (the app could not record whose the queue is)"), "{acts} {native:?}");
     }
 
     /// The app says the sign-in is over from inside one of the library's own calls up (a
@@ -1572,11 +1594,15 @@ mod tests {
         assert_eq!(has(&phone), 5);
     }
 
-    /// A fault inside the library does not leave it half-way through something: everything
-    /// it held is replaced, as at a sign-out, with one line said of it, and linking starts
-    /// again from a look.
+    /// A call into the player cannot fail. If one does (the app threw, a read could not be
+    /// made), or anything else inside the library stops unexpectedly, that is a fault: it
+    /// is not answered with a made-up value and it is not tried again. Everything the
+    /// linking held is replaced, as at a sign-out, with one line said of it; nothing more
+    /// is asked of the player and nothing is sent; and **linking stays off on this phone
+    /// until the next sign-in or start of the app**, so that a fault that is still there
+    /// cannot come round again at every tick.
     #[test]
-    fn a_fault_inside_the_library_replaces_everything_and_linking_starts_again() {
+    fn a_fault_puts_linking_off_until_the_next_sign_in_and_asks_nothing_more_of_the_player() {
         let mut n = 0;
         let (phone, mut player, session, place) = phone(&mut n);
         phone.handle(CHANGED, 2_000, 100, &mut random(&mut n), &mut player);
@@ -1585,17 +1611,38 @@ mod tests {
         player.wrong = Some(Wrong::Panics);
         let came = hear(&phone, &mut player, session, &place, vec![from_pc(1, &place, Ask::Look(Want::Brief))], 2_100, &mut n);
         assert!(came.native.contains(&Do::End { session }) && came.native.contains(&Do::StopLook) && sends(&came.native) == 0, "{came:?}");
-        assert!(logged(&came.native, "linking: it stopped unexpectedly (the phone's player fell over). Everything it held was let go of"), "{came:?}");
+        assert!(logged(&came.native, "linking: it stopped unexpectedly (the phone's player fell over)"), "{came:?}");
         assert_eq!(came.native.iter().filter(|ask| matches!(ask, Do::Log(_))).count(), 1);
-        player.wrong = None;
-        // Nothing is left of what it held, and it is not left thinking it is inside a call:
-        // the next thing that happens is decided, and linking starts again with a look.
+        // The app is told, so that it can put right what only it can (8.1).
+        assert!(came.acts.contains(&Act::Fault), "{came:?}");
+        // Nothing is left of what it held, and it is not left thinking it is inside a call.
         assert_eq!(order(&phone, 2_200), (1, None, false));
-        let (acts, native) = phone.handle(TICK, 2_200, 100, &mut random(&mut n), &mut player).unwrap();
-        assert!(acts.contains(r#""act":"shown""#) && matches!(native.as_slice(), [Do::Look { number, .. }] if *number > FIRST_LOOK), "{acts} {native:?}");
-        // And what the old session's stay at the relay still brings is nobody's.
-        let came = hear(&phone, &mut player, session, &place, vec![command(2, &place, Command::Pause, 1)], 2_300, &mut n);
-        assert!(came.native.is_empty() && player.asked.iter().all(|asked| asked == "claim"), "{came:?} {:?}", player.asked);
+        // The fault is still there. Nothing finds that out: at tick after tick the player
+        // is asked nothing, no look begins, nothing is sent, and the list says why.
+        let asked = player.asked.len();
+        for tick in 0..8 {
+            let (acts, native) = phone.handle(TICK, 2_200 + 250 * tick, 100, &mut random(&mut n), &mut player).unwrap();
+            assert!(native.is_empty() && acts.contains("Linking stopped on this phone"), "{acts} {native:?}");
+        }
+        // What the old session's stay at the relay still brings, what is chosen on the
+        // phone, a press: none of it is decided, and a press is the phone's own.
+        let came = hear(&phone, &mut player, session, &place, vec![command(2, &place, Command::Pause, 1)], 4_300, &mut n);
+        assert!(came.native.is_empty() && came.acts.is_empty(), "{came:?}");
+        assert_eq!(phone.handle(CHANGED, 4_400, 100, &mut random(&mut n), &mut player).unwrap().0, "[]");
+        assert_eq!(phone.handle(r#"{"event":"press","press":"next"}"#, 4_400, 100, &mut random(&mut n), &mut player).unwrap().0, r#"[{"act":"handled","by_another":false}]"#);
+        assert_eq!((player.asked.len(), order(&phone, 4_500)), (asked, (1, None, false)));
+        // The next sign-in (a sign-out, and then a tick): linking is on again, from a look.
+        player.wrong = None;
+        phone.handle(r#"{"event":"stop"}"#, 5_000, 100, &mut random(&mut n), &mut player);
+        let (acts, native) = phone.handle(TICK, 5_100, 100, &mut random(&mut n), &mut player).unwrap();
+        assert!(!acts.contains("Linking stopped") && matches!(native.as_slice(), [Do::Look { number, .. }] if *number > FIRST_LOOK), "{acts} {native:?}");
+        // And another account signing in does the same.
+        let (phone, mut player, session, place) = self::phone(&mut n);
+        player.wrong = Some(Wrong::Panics);
+        hear(&phone, &mut player, session, &place, vec![from_pc(1, &place, Ask::Look(Want::Brief))], 2_100, &mut n);
+        player.wrong = None;
+        let (acts, native) = phone.handle(r#"{"event":"tick","account":"somebody else","wanted":true}"#, 2_200, 100, &mut random(&mut n), &mut player).unwrap();
+        assert!(!acts.contains("Linking stopped") && native.iter().any(|ask| matches!(ask, Do::Look { .. })), "{acts} {native:?}");
     }
 
     /// A call works through what was waiting and a bounded number of what arrives while

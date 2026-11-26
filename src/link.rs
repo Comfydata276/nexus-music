@@ -396,11 +396,10 @@ impl Player for Here<'_> {
     /// one taken up from that device and not touched: not saved, and it follows what that
     /// device saves, until the person uses it here (`claim_queue`). It is another queue
     /// for a save that was already prepared, which is then not sent.
-    fn handed_on(&mut self) -> bool {
+    fn handed_on(&mut self) {
         log("queue: handed to another of the person's devices: not saved from here, and it follows, until it is used here");
         *self.ctl.link.borrow().before_handed.borrow_mut() = Some(self.ctl.queue_owner.taken());
         self.ctl.queue_owner.taken_up(nexus_core::handover::HANDED.into());
-        true
     }
 
     /// This PC did not stop: its queue is whose it was.
@@ -421,13 +420,11 @@ impl Player for Here<'_> {
     }
 
     /// (Whether it went in is the player's own word: its queue has a new number.)
-    fn take(&mut self, songs: &[(String, bool)], begin: usize, position: f64, context: &str) -> bool {
+    fn take(&mut self, songs: &[(String, bool)], begin: usize, position: f64, context: &str) {
         if fail_take() {
-            return false;
+            return;
         }
-        let before = self.ctl.queue_number.get();
         self.ctl.load_queue_here(self.songs(songs.iter().map(|(id, queued)| (id, *queued))), begin, position, context);
-        self.ctl.queue_number.get() != before
     }
 
     fn generation(&self) -> u64 {

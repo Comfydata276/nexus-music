@@ -77,11 +77,6 @@ pub enum Carried {
     Changed,
     /// The player is as it was: it was so already, or could not do it.
     Unchanged,
-    /// The player could not say what it did (asking it went wrong part-way, in an app
-    /// whose player is not in this language). It may have changed. The deciding then goes
-    /// by what the player says of itself when asked afresh, counts a change that no
-    /// command is named for, and tells the command's sender that it is not known.
-    Unknown,
 }
 
 /// Where the sound has got to, and in which queue.
@@ -93,7 +88,13 @@ pub struct Sounding {
     pub at: f64,
 }
 
-/// This device's own player, as the deciding needs it. **It is asked, and has answered
+/// This device's own player, as the deciding needs it. **Every one of these is a total
+/// function of the player's state: none of them can fail.** There is no "could not be
+/// asked" among the answers, and nothing ever stands in for an answer that was not got.
+/// Where the player is in another language and a call into it does fail, that is a fault
+/// of the app's, handled as a fault and not here (`super::bind`).
+///
+/// **It is asked, and has answered
 /// when the call returns**: the deciding and the player live on one thread. (For a player
 /// that tells its listeners of a change before the call that made it returns, see
 /// `super::turn`.)
@@ -132,19 +133,19 @@ pub trait Player {
     /// taken up from that device and not touched (`crate::handover::HANDED`). It is not
     /// saved, and it follows what that device saves, until the person uses it here.
     /// Said before this device's sound is stopped for it, so that the stop is not saved
-    /// as a change of this device's own. Counts nothing and claims nothing. Says whether
-    /// it could be marked so: if not, the stop goes ahead all the same, and it is told.
-    fn handed_on(&mut self) -> bool;
+    /// as a change of this device's own. Counts nothing and claims nothing.
+    fn handed_on(&mut self);
     /// The hand-over did not happen after all (this device could not be stopped): the
     /// queue is as it was before [`Player::handed_on`].
     fn handed_back(&mut self);
     /// Stops this device's own sound, and counts it as a change.
     fn pause(&mut self);
     /// Takes a queue brought from another device and plays it: each song and whether it
-    /// was queued by hand, where to start, and how far in. **Says whether the queue is in
-    /// the player**; if it is, [`Player::queue`] has a new number and it is counted as a
-    /// change, and if not, nothing is counted and nothing is claimed.
-    fn take(&mut self, songs: &[(String, bool)], begin: usize, position: f64, context: &str) -> bool;
+    /// was queued by hand, where to start, and how far in. **Whether the queue is in the
+    /// player afterwards is what [`Player::queue`] says**: a new number if it is, and then
+    /// it is counted as a change; the same number if the player did not take it, and then
+    /// nothing is counted and nothing is claimed.
+    fn take(&mut self, songs: &[(String, bool)], begin: usize, position: f64, context: &str);
 
     // The order of choices (see `super::rule`), which the app keeps beside its player
     // because every way into the player counts there.
@@ -153,8 +154,7 @@ pub trait Player {
     fn by(&self) -> Option<Nonce>;
     fn admit(&mut self, at: At, minute: u64, now_ms: u64) -> Result<Reservation, Why>;
     fn finish(&mut self, reservation: Reservation, at: At, minute: u64, now_ms: u64, same_session: bool) -> Result<Carrying, Why>;
-    /// (`by` is the command to name as having made the state, if it changed anything:
-    /// none, where what it did is not known.)
+    /// (`by` is the command to name as having made the state, if it changed anything.)
     fn carried(&mut self, carrying: Carrying, changed: bool, by: Option<Nonce>);
     fn refuse(&mut self, reservation: Reservation);
     fn wait(&mut self, now_ms: u64, for_ms: u64) -> Waiting;
@@ -1031,9 +1031,8 @@ impl Device {
         // before the sound is stopped, so that the stop is not saved as a change of this
         // device's own; and the mark stands only if the sound did stop.
         let handing = command == Command::Moved;
-        let marked = handing && env.player.handed_on();
-        if handing && !marked {
-            out.push(Do::Log("queue: it could not be marked as handed on".into()));
+        if handing {
+            env.player.handed_on();
         }
         // What came of it is known as the player returns: the rule is told, and the
         // command's sender answered, from the player as it now is.
@@ -1041,26 +1040,17 @@ impl Device {
         let carried = env.player.carry_out(&command, &ready);
         let changed = match (&command, carried) {
             // A queue to take over is in the player if the player's queue has a new
-            // number, whatever was said: that is asked afresh, and gone by.
+            // number: that is the one thing gone by.
             (Command::Adopt(_), _) => env.player.queue() != before,
-            (_, carried) => carried != Carried::Unchanged,
+            (_, carried) => carried == Carried::Changed,
         };
-        // (What it did is not known: a change, and no command is named for it.)
-        let unknown = carried == Carried::Unknown && !matches!(command, Command::Adopt(_));
-        env.player.carried(carrying, changed, (!unknown).then_some(nonce));
+        env.player.carried(carrying, changed, Some(nonce));
         if handing && env.player.brief().playing {
             // It was told to stop and is still sounding: it is not acknowledged as
             // stopped, and its queue is its own still.
-            if marked {
-                env.player.handed_back();
-            }
+            env.player.handed_back();
             out.push(Do::Log(format!("moved from {}: this device could not be stopped, and is still playing", text::place(&from))));
             return self.refused(session, from, nonce, &command, at, Why::Cannot, env, out);
-        }
-        if unknown && !handing {
-            out.push(Do::Log(format!("{} from {} against generation {}: the player could not say what came of it; answered as not known", command.name(), text::place(&from), at.generation)));
-            let answer = self.state(Some(nonce), Some(false), Some(Why::Unknown), env);
-            return self.answer(session, from, answer, env, out);
         }
         if !changed {
             // The player did nothing. Either it was already as the command asked, which is
@@ -1348,15 +1338,10 @@ impl Device {
                     // The other has started: the queue is that device's now, this one
                     // stops, and the player is the other's. (Marked before the stop, and
                     // only kept if this device did stop.)
-                    let marked = env.player.handed_on();
-                    if !marked {
-                        out.push(Do::Log("queue: it could not be marked as handed on".into()));
-                    }
+                    env.player.handed_on();
                     env.player.pause();
                     if env.player.brief().playing {
-                        if marked {
-                            env.player.handed_back();
-                        }
+                        env.player.handed_back();
                         out.push(Do::Log(format!("give: {name} has started and this device could not be stopped")));
                         words::gave_and_did_not_stop(name, env.me.here)
                     } else {
@@ -1679,12 +1664,12 @@ impl Device {
         // Whether it went in is asked of the player afresh, and gone by: its queue has a
         // new number, or it has not.
         let before = env.player.queue();
-        let said = env.player.take(&songs, begin, handed.position, &handed.context);
+        env.player.take(&songs, begin, handed.position, &handed.context);
         let queue = env.player.queue();
         if queue == before {
             // Nothing was installed: nothing is waited for, and the other device is not
             // told to stop on the strength of what was playing here before.
-            out.push(Do::Log(format!("take: {name}'s queue could not be put in the player here{}", if said { " (though the player said it was)" } else { "" })));
+            out.push(Do::Log(format!("take: {name}'s queue could not be put in the player here")));
             return self.say(words::could_not_load_here(&name, env.me.here), out);
         }
         let taking = Taking::begin(at, env.player.generation(), pressed_ms);

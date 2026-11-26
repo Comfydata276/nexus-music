@@ -136,9 +136,6 @@ pub enum Why {
     /// Play; at that volume). Said with `ok`, not as a refusal: nothing was changed, nothing
     /// moved, and the command is not the one that made the state.
     Nothing,
-    /// The device asked its player and could not learn what came of it. It may have been
-    /// carried out. The state in the answer is the player's, asked afresh.
-    Unknown,
 }
 
 impl Why {
@@ -150,12 +147,11 @@ impl Why {
             Why::Invalid => "invalid",
             Why::Cannot => "cannot",
             Why::Nothing => "nothing",
-            Why::Unknown => "unknown",
         }
     }
 
     fn read(text: &str) -> Option<Why> {
-        [Why::Changed, Why::Busy, Why::Late, Why::Invalid, Why::Cannot, Why::Nothing, Why::Unknown].into_iter().find(|why| why.text() == text)
+        [Why::Changed, Why::Busy, Why::Late, Why::Invalid, Why::Cannot, Why::Nothing].into_iter().find(|why| why.text() == text)
     }
 }
 

@@ -42,6 +42,11 @@ pub const NEEDS_RESETTING: &str = "Your devices' link on the music server needs 
 pub const RESET_HALF_DONE: &str = "Linking was reset, but the music server stopped answering before that could be confirmed. It will be asked again.";
 pub const RESET_NOT_DONE: &str = "Linking couldn't be reset: the music server didn't answer. Try again.";
 pub const RESET_DONE: &str = "Linking was reset. Your other devices rejoin by themselves within two minutes.";
+/// Linking has stopped on this device after a fault, until the next sign-in or start.
+pub fn fault(here: Here) -> String {
+    format!("Linking stopped on {}. It starts again when you sign in again or restart the app.", here.this_lower())
+}
+
 pub const NOT_RADIO: &str = "Radio stations can't be added from here";
 pub const IN_A_JAM: &str = "Leave the jam before moving to another device";
 /// A device seen before that has no place in the room: while this one has, and while it
@@ -127,8 +132,7 @@ pub fn outcome(outcome: Outcome, name: &str) -> String {
         // (Never said as a refusal; and if it were, there would be nothing to tell.)
         Outcome::Refused(Why::Nothing) => String::new(),
         Outcome::NotReached => format!("That hadn't reached {name} when checked."),
-        // (An answer of "not known" is `Outcome::Unknown`, and is never said as a refusal.)
-        Outcome::Unknown | Outcome::Refused(Why::Unknown) => format!("{name} changed, or didn't answer. Check what is playing before you press again."),
+        Outcome::Unknown => format!("{name} changed, or didn't answer. Check what is playing before you press again."),
     }
 }
 
@@ -146,7 +150,7 @@ pub fn gave(gave: Gave, name: &str, left: usize, sent: usize, here: Here) -> Str
         Gave::Stayed(Why::Changed) => format!("{name} was given something else to do before it started. Still playing here."),
         Gave::Stayed(Why::Late) => format!("That took too long to reach {name}, so nothing was moved. Still playing here."),
         // (A queue to take over is never "nothing to do": if that is ever said of one, it was not taken.)
-        Gave::Stayed(Why::Cannot | Why::Invalid | Why::Nothing | Why::Unknown) => format!("{name} couldn't play that. Still playing here."),
+        Gave::Stayed(Why::Cannot | Why::Invalid | Why::Nothing) => format!("{name} couldn't play that. Still playing here."),
         Gave::NotReached => format!("That hadn't reached {name} when checked. Still playing here; {name} may yet start."),
         Gave::Unknown => format!("{name} didn't answer. Still playing here; check whether {name} started too."),
     }
