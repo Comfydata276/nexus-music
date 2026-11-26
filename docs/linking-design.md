@@ -1803,6 +1803,24 @@ linking is off until the app is closed and opened.
     new queue, paused.
 26. **On a phone a press and what it did can still be two choices** when Media3 puts
     the command behind other work of its own (weakness 20 says when they are one).
+27. **While a phone steers another device it will play nothing of its own for anyone.**
+    The phone's service starts none of its own music while its player shows another's
+    (its rule from jams, and not linking's to change). Seen from linking: a third
+    device that gives the phone its music, or presses Play for it, while the phone is
+    steering, is told the phone could not. The person stops steering first.
+28. **A look-up before something plays does not make a phone busy.** The library has
+    the tickets for it and the adapter hands them on (`looking_up`, `looked_up`), but
+    nothing on the phone calls them: the look-ups that run before a start (a voice
+    request, a list a car picks) are the playback service's own, where a start that is
+    being looked up is already ordered against what other devices ask by the service's
+    order of choices. What is lost is only that another device is told "busy" a moment
+    early; it is told "changed" instead, once the start lands.
+29. **A sentence said on a phone with none of the app's screens alive is not seen.**
+    Linking speaks through the app's own notes, which wait for the person while the
+    app is behind and are shown by its screens. A phone whose service is alive with no
+    screen made (played from a car, or steered from a PC, with the app closed) says the
+    sentence to nobody. It is still in the list's note when the list is next drawn, and
+    a phone on which linking has stopped says so there.
 
 **For everyone, not for a tester's pair** (added to the list above): at set-up, an
 empty playlist of the reserved name with an empty comment, of the person's own, found
