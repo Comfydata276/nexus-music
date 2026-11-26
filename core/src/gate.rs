@@ -85,11 +85,15 @@ fn origin(url: &str) -> &str {
     }
 }
 
-/// Where a redirect leads, given the address that sent it.
+/// Where a redirect leads, given the address that sent it. "//host/path" is the scheme of
+/// the address that sent it, and that host.
 fn absolute(from: &str, location: &str) -> String {
     let whole = location.split_once("://").is_some_and(|(scheme, _)| !scheme.is_empty() && scheme.chars().all(|c| c.is_ascii_alphanumeric()));
     if whole {
         location.to_string()
+    } else if let Some(elsewhere) = location.strip_prefix("//") {
+        let scheme = from.split_once("://").map_or("http", |(scheme, _)| scheme);
+        format!("{scheme}://{elsewhere}")
     } else {
         format!("{}/{}", origin(from), location.trim_start_matches('/'))
     }
@@ -215,9 +219,13 @@ pub fn find(http: &dyn Http, lidarr: &str) -> Result<Option<Found>, String> {
         return Ok(None);
     };
     // The door in front of Lidarr sends the caller to itself first, then on to the service.
+    // Where it sends the caller is judged before it's asked, as the service itself is.
     let sign_in = match parse_sign_in(&first) {
         Some(found) => Some(found),
-        None => redirect_from(http, &first)?.and_then(|second| parse_sign_in(&second)),
+        None => {
+            Found { service: origin(&first).to_string(), client: String::new() }.trusted(lidarr)?;
+            redirect_from(http, &first)?.and_then(|second| parse_sign_in(&second))
+        }
     };
     let found = sign_in.ok_or_else(|| UNKNOWN.to_string())?;
     // Believed only on HTTPS, or where Lidarr itself was typed to be.
@@ -601,5 +609,47 @@ mod tests {
         assert_eq!(found("https://lidarr.example.org", "http://auth.example.org"), Err(not_trusted("auth.example.org")));
         assert_eq!(found("https://lidarr.example.org", "http://lidarr.example.org"), Err(not_trusted("lidarr.example.org")));
         assert_eq!(found("http://192.168.1.5:8686", "http://192.168.1.9:9000"), Err(not_trusted("192.168.1.9:9000")));
+    }
+
+    /// A Lidarr whose door sends every caller first to `outpost` (as written in its
+    /// `Location`), and the outpost on to a sign-in at "https://auth.example.org". What's
+    /// asked is written down.
+    struct Outpost {
+        outpost: &'static str,
+        asked: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Http for Outpost {
+        fn send(&self, request: &Request) -> Result<crate::http::Response, Failure> {
+            self.asked.lock().unwrap().push(request.url.to_string());
+            let to = if request.url.contains("/api/v1/system/status") {
+                self.outpost.to_string()
+            } else {
+                "https://auth.example.org/application/o/authorize/?client_id=proxy&response_type=code".to_string()
+            };
+            Ok(crate::http::Response::new(302, vec![("Location".into(), Some(to))], || Ok(String::new())))
+        }
+    }
+
+    #[test]
+    fn every_address_on_the_way_to_the_sign_in_is_judged_before_it_is_asked() {
+        let ask = |lidarr: &str, outpost: &'static str| {
+            let http = Outpost { outpost, asked: Default::default() };
+            let found = find(&http, lidarr).map(|found| found.map(|found| found.service));
+            let asked = http.asked.lock().unwrap().len();
+            (found, asked)
+        };
+        let there = Ok(Some("https://auth.example.org".to_string()));
+        // Lidarr's own door, at the address typed for it: asked.
+        assert_eq!(ask("http://192.168.1.5:8686", "/outpost.goauthentik.io/start?rd=x"), (there.clone(), 2));
+        assert_eq!(ask("http://192.168.1.5:8686", "http://192.168.1.5:8686/outpost.goauthentik.io/start"), (there.clone(), 2));
+        // Anywhere on HTTPS: asked.
+        assert_eq!(ask("http://192.168.1.5:8686", "https://door.example.org/start"), (there.clone(), 2));
+        // Plain HTTP elsewhere, or a step down: not asked at all.
+        assert_eq!(ask("http://192.168.1.5:8686", "http://door.example.org/start"), (Err(not_trusted("door.example.org")), 1));
+        assert_eq!(ask("https://lidarr.example.org", "http://lidarr.example.org/start"), (Err(not_trusted("lidarr.example.org")), 1));
+        // "//host/path" is that host, on the scheme of the address that sent it, and judged so.
+        assert_eq!(ask("https://lidarr.example.org", "//door.example.org/start"), (there, 2));
+        assert_eq!(ask("http://192.168.1.5:8686", "//door.example.org/start"), (Err(not_trusted("door.example.org")), 1));
     }
 }
