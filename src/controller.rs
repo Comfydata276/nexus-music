@@ -1205,7 +1205,7 @@ impl Controller {
         self.link_stop();
         self.end_jam(true);
         self.save_queue();
-        self.save_settings();
+        // (The settings are written once, waiting for the disk, as the app ends: `main`.)
         let _ = slint::quit_event_loop();
     }
 
@@ -1838,7 +1838,7 @@ impl Controller {
         let Some(lidarr) = crate::lidarr::current() else { return };
         self.toast(nexus_core::requests::adding_now(&name));
         self.requests_pool.spawn(move || {
-            let result = lidarr.add_artist(&artist, &name);
+            let result = lidarr.add_artist(&artist, &name, crate::bulk::way_back());
             post(move |ctl| match result {
                 Ok(_) => {
                     ctl.refresh_outside();
@@ -3358,8 +3358,14 @@ impl Controller {
     /// The person chose whether the list `key` plays shuffled. (Kept as the change, and
     /// given its time when it is shared: see `sync::Controller::choose`.)
     pub fn choose_shuffle(&self, key: &str, on: bool) {
+        self.choose_shuffle_saving(key, on, crate::config::Durable::Flushed);
+    }
+
+    /// `choose_shuffle`, for a choice that came from afar too: `InPassing` doesn't wait for
+    /// the disk.
+    pub fn choose_shuffle_saving(&self, key: &str, on: bool, durable: crate::config::Durable) {
         if !key.is_empty() {
-            self.choose(nexus_core::step::Change::Shuffle { key: key.to_string(), on });
+            self.choose_saving(nexus_core::step::Change::Shuffle { key: key.to_string(), on }, durable);
         }
     }
 

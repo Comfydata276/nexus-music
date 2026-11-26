@@ -1470,7 +1470,11 @@ impl Controller {
     /// Likes or unlikes these songs. Unliked songs leave the Liked songs page if it's showing.
     fn set_song_stars(self: &Rc<Self>, ids: Vec<String>, starred: bool) {
         for id in &ids {
-            self.set_star("id", id.clone(), starred);
+            self.star_saving("id", id.clone(), starred, false);
+        }
+        // Offline, what "Like all" holds is written down once for the press, not once a song.
+        if self.is_offline() && !ids.is_empty() {
+            self.save_pending_for_press();
         }
         if starred || ids.is_empty() || !self.page.borrow().liked_songs {
             return;
@@ -1509,19 +1513,24 @@ impl Controller {
     }
 
     fn set_star(self: &Rc<Self>, kind: &'static str, id: String, starred: bool) {
+        self.star_saving(kind, id, starred, true);
+    }
+
+    /// `set_star`; offline, `save` false leaves writing it down to the caller.
+    fn star_saving(self: &Rc<Self>, kind: &'static str, id: String, starred: bool, save: bool) {
         self.apply_star(kind, &id, starred);
         // Lists of liked things are now out of date.
         self.invalidate("liked");
         self.invalidate("albums:");
         let change = crate::offline::Pending::Star { kind: kind.to_string(), id: id.clone(), starred };
-        self.submit(change, move |ctl, reason| {
+        self.submit_saving(change, move |ctl, reason| {
             ctl.apply_star(kind, &id, !starred);
             ctl.toast(format!("That didn't save. {reason}"));
             // A song taken off the Liked songs page is still liked after all: show it again.
             if ctl.page.borrow().liked_songs {
                 ctl.refresh();
             }
-        });
+        }, save);
     }
 
     // ---- callbacks from the interface ----------------------------------------------------------

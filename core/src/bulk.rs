@@ -140,12 +140,10 @@ pub trait Desk: Send + Sync {
     /// holds a way back (a power cut must not leave the file without it); otherwise in
     /// passing.
     fn keep(&self, batch: Option<Vec<u8>>, flushed: bool);
-    /// Writes the batch down and says whether it is on the disk: for what must be kept
-    /// before Lidarr is changed (the settings to put back).
-    fn keep_checked(&self, batch: Vec<u8>) -> bool {
-        self.keep(Some(batch), true);
-        true
-    }
+    /// Writes the batch down, waiting for the disk, and says whether it is there: for what
+    /// must be kept before Lidarr is changed (the settings to put back). Every app says;
+    /// `true` for a write that failed is a way back that isn't there.
+    fn keep_checked(&self, batch: Vec<u8>) -> bool;
     /// The time, in seconds since 1970: when something was noted as asked for.
     fn now(&self) -> i64;
     /// Whether singles and EPs are asked for as well as albums. Read once a run, when the
@@ -911,7 +909,12 @@ impl Job {
                 None => Went::Failed(not_listed(offer)),
             });
         }
-        lidarr.want(artist, &wanted)?;
+        // Reading the artist's record and writing it back is a step of its own: another step
+        // changing the same record meanwhile would be written over (`WayBack::turn`).
+        {
+            let _turn = crate::lidarr::WayBack::turn(self);
+            lidarr.want(artist, &wanted)?;
+        }
         Ok(went)
     }
 
@@ -1047,6 +1050,10 @@ impl Job {
     /// Checks one artist Lidarr has finished reading in. `Ok(false)` if Lidarr lists nothing
     /// for them yet and it's worth looking again later.
     fn finish(&self, lidarr: &Lidarr, artist: i64, given_up: bool, tell: &Tell) -> Result<bool, String> {
+        // Wanted, put back and crossed off, as one step of the way back (`WayBack::turn`):
+        // what Lidarr lists is read once the step is this one's, so that what is decided from
+        // it isn't from before another step changed the artist.
+        let turn = crate::lidarr::WayBack::turn(self);
         let listed = lidarr.listed(artist)?;
         let places: Vec<(usize, Offer)> = self.with(|batch| {
             batch.wants.iter().enumerate().filter(|(_, want)| want.state == State::Asked && want.lidarr_artist == artist).filter_map(|(at, want)| Some((at, want.offer.clone()?))).collect()
@@ -1057,8 +1064,6 @@ impl Job {
         let wanted: Vec<i64> =
             places.iter().filter_map(|(_, offer)| listed.iter().find(|known| known.album == offer.album)).filter(|known| !known.wanted && !known.have).map(|known| known.id).collect();
         lidarr.want(artist, &wanted)?;
-        // Put back and crossed off, as one step of the way back (`WayBack::turn`).
-        let turn = crate::lidarr::WayBack::turn(self);
         if let Some(before) = self.with(|batch| batch.restore.iter().find(|(known, _)| *known == artist).map(|(_, before)| before.clone())) {
             lidarr.set_new_releases(artist, &before)?;
             self.with(|batch| batch.restore.retain(|(known, _)| *known != artist));
@@ -1172,6 +1177,10 @@ mod tests {
     impl Desk for Nowhere {
         fn keep(&self, _: Option<Vec<u8>>, _: bool) {}
 
+        fn keep_checked(&self, _: Vec<u8>) -> bool {
+            true
+        }
+
         fn now(&self) -> i64 {
             0
         }
@@ -1242,6 +1251,10 @@ mod tests {
 
     impl Desk for Threads {
         fn keep(&self, _: Option<Vec<u8>>, _: bool) {}
+
+        fn keep_checked(&self, _: Vec<u8>) -> bool {
+            true
+        }
 
         fn now(&self) -> i64 {
             0
@@ -1353,6 +1366,11 @@ mod tests {
             *self.0.lock().unwrap() = batch;
         }
 
+        fn keep_checked(&self, batch: Vec<u8>) -> bool {
+            self.keep(Some(batch), true);
+            true
+        }
+
         fn now(&self) -> i64 {
             0
         }
@@ -1414,6 +1432,11 @@ mod tests {
             let held = self.1.get().is_some_and(|job| job.batch.try_lock().is_err());
             let wants = batch.and_then(|json| serde_json::from_slice::<serde_json::Value>(&json).ok()).map_or(0, |json| json["wants"].as_array().map_or(0, Vec::len));
             self.0.lock().unwrap().push((held, flushed, wants));
+        }
+
+        fn keep_checked(&self, batch: Vec<u8>) -> bool {
+            self.keep(Some(batch), true);
+            true
         }
 
         fn now(&self) -> i64 {
@@ -1663,5 +1686,163 @@ mod tests {
         let written = kept.lock().unwrap().clone().unwrap();
         assert!(!again.load(b"") && !again.load(&written[..written.len() / 2]) && !again.unfinished());
         assert!(again.load(&written) && again.unfinished());
+    }
+
+    /// A Lidarr whose artist record is written back whole by every PUT, as the real one's is,
+    /// and whose answers are held until something else has happened: what decides the order of
+    /// two threads, not how long either sleeps.
+    struct Answering {
+        state: Mutex<Lidarrs>,
+        happened: std::sync::Condvar,
+    }
+
+    #[derive(Default)]
+    struct Lidarrs {
+        /// The artist's record. Its `_v` counts the writes, so that one written back over a
+        /// later write shows.
+        record: serde_json::Value,
+        album_wanted: bool,
+        happened: HashSet<&'static str>,
+        /// Every record written back over one written after it was read.
+        stale: Vec<String>,
+    }
+
+    impl Answering {
+        fn new() -> Self {
+            let record = serde_json::json!({ "id": 5, "metadataProfileId": 1, "monitorNewItems": "all", "monitored": false, "_v": 0 });
+            Answering { state: Mutex::new(Lidarrs { record, ..Default::default() }), happened: Default::default() }
+        }
+
+        fn note(&self, event: &'static str) {
+            self.state.lock().unwrap().happened.insert(event);
+            self.happened.notify_all();
+        }
+
+        /// Held until `event` has happened; or, if it can't (the other thread is waiting for
+        /// this one's turn), for a second.
+        fn until(&self, event: &'static str) {
+            let state = self.state.lock().unwrap();
+            let _ = self.happened.wait_timeout_while(state, Duration::from_secs(1), |state| !state.happened.contains(event)).unwrap();
+        }
+    }
+
+    impl crate::http::Http for Answering {
+        fn send(&self, request: &crate::http::Request) -> Result<crate::http::Response, crate::http::Failure> {
+            use crate::http::Method;
+            let (method, body) = match request.method {
+                Method::Get => ("GET", ""),
+                Method::Post(body) => ("POST", body),
+                Method::Put(body) => ("PUT", body),
+            };
+            let who = std::thread::current().name().unwrap_or("").to_string();
+            let path = request.url.trim_start_matches("http://lidarr.test/api/v1/").to_string();
+            let entry = |item: &str, name: &str, allowed: bool| serde_json::json!({ item: { "id": 1, "name": name }, "allowed": allowed });
+            let profile = |id: i64, name: &str, singles: bool| {
+                serde_json::json!({ "id": id, "name": name,
+                    "primaryAlbumTypes": [entry("albumType", "Album", true), entry("albumType", "Single", singles), entry("albumType", "EP", singles)],
+                    "secondaryAlbumTypes": [entry("albumType", "Studio", true)],
+                    "releaseStatuses": [entry("releaseStatus", "Official", true)] })
+            };
+            let album = |monitored: bool| serde_json::json!({ "id": 9, "title": "A Single", "foreignAlbumId": "al1", "albumType": "Single", "monitored": monitored });
+            let answer = match (method, path.as_str()) {
+                ("GET", "artist") => r#"[{"id":5,"artistName":"Someone","foreignArtistId":"ar1"}]"#.to_string(),
+                ("GET", "metadataprofile") => serde_json::json!([profile(1, "Standard", false), profile(2, crate::lidarr::tests::SINGLES, true)]).to_string(),
+                ("GET", "artist/5") => {
+                    // The record as it is when asked for; the answer arrives later, for the batch.
+                    let record = self.state.lock().unwrap().record.clone();
+                    if who == "batch" {
+                        self.note("the batch read the artist");
+                        self.until("the single put the setting back");
+                    }
+                    record.to_string()
+                }
+                ("PUT", "artist/5") => {
+                    let mut record: serde_json::Value = serde_json::from_str(body).unwrap();
+                    let (was, now) = {
+                        let mut state = self.state.lock().unwrap();
+                        let was = state.record["monitorNewItems"].clone();
+                        let writes = state.record["_v"].as_i64().unwrap();
+                        if record["_v"].as_i64() != Some(writes) {
+                            state.stale.push(format!("{who} wrote back a record read before the last write ({record})"));
+                        }
+                        record["_v"] = (writes + 1).into();
+                        state.record = record;
+                        (was, state.record["monitorNewItems"].clone())
+                    };
+                    if who == "single" && now == "none" {
+                        self.note("the single turned the setting off");
+                    }
+                    if who == "single" && was == "none" && now == "all" {
+                        self.note("the single put the setting back");
+                    }
+                    "{}".to_string()
+                }
+                ("GET", "album?artistId=5") => {
+                    // The single, waiting for Lidarr to list the release: held until the batch
+                    // has read the artist meanwhile (which, one step at a time, it can't).
+                    if who == "single" {
+                        self.until("the batch read the artist");
+                    }
+                    serde_json::json!([album(self.state.lock().unwrap().album_wanted)]).to_string()
+                }
+                ("PUT", "album/monitor") => {
+                    self.state.lock().unwrap().album_wanted = true;
+                    "{}".to_string()
+                }
+                ("GET", "album/9") => album(self.state.lock().unwrap().album_wanted).to_string(),
+                ("GET", "command") => "[]".to_string(),
+                _ => "{}".to_string(),
+            };
+            Ok(crate::http::Response::new(200, Vec::new(), move || Ok(answer)))
+        }
+
+        fn pause(&self, _: Duration) -> Result<(), crate::http::Failure> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_batch_reads_and_writes_an_artist_only_in_its_turn() {
+        // A single asked for by itself turns the artist's "new releases" setting off while
+        // Lidarr reads their singles in. Meanwhile the batch wants a release of the same
+        // artist, which reads the artist's record and writes it back: read while the setting
+        // was off and written after it was put back, it would write the old record over the
+        // new (leaving the setting off for good). Both of the batch's ways of wanting (asking,
+        // and finishing), and keeping track of an artist.
+        type Step = fn(&Job, &Lidarr);
+        let steps: [(&str, Step); 3] = [
+            ("asking", |job, lidarr| {
+                job.ask_known(lidarr, 5, &[crate::lidarr::tests::single()]).unwrap();
+            }),
+            ("finishing", |job, lidarr| {
+                job.with(|batch| {
+                    batch.wants.push(Want { state: State::Asked, lidarr_artist: 5, offer: Some(crate::lidarr::tests::single()), ..Default::default() });
+                });
+                job.finish(lidarr, 5, false, &|_| {}).unwrap();
+            }),
+            ("keeping track of the artist", |job, lidarr| {
+                lidarr.add_artist("ar1", "Someone", job).unwrap();
+            }),
+        ];
+        for (what, step) in steps {
+            let http = Arc::new(Answering::new());
+            let job = Job::new(Kept(Arc::new(Mutex::new(None))));
+            let lidarr = Lidarr::new("lidarr.test", "key", None, http.clone());
+            std::thread::scope(|scope| {
+                let (job, lidarr, http) = (&job, &lidarr, &http);
+                std::thread::Builder::new().name("single".into()).spawn_scoped(scope, || lidarr.request(&crate::lidarr::tests::single(), job).unwrap()).unwrap();
+                std::thread::Builder::new()
+                    .name("batch".into())
+                    .spawn_scoped(scope, move || {
+                        http.until("the single turned the setting off");
+                        step(job, lidarr);
+                    })
+                    .unwrap();
+            });
+            let state = http.state.lock().unwrap();
+            assert!(state.stale.is_empty(), "{what}: {:?}", state.stale);
+            assert_eq!(state.record["monitorNewItems"], "all", "{what}: the artist's setting was left off");
+            assert!(job.with(|batch| batch.restore.is_empty()), "{what}");
+        }
     }
 }

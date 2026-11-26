@@ -346,8 +346,8 @@ impl Player for Here<'_> {
                 ctl.move_upcoming_here(*from, (*to as usize).min(last), *queued);
             }
             (Command::Clear { queued }, _) => ctl.clear_upcoming_here(*queued),
-            (Command::Shuffle { on }, _) => ctl.set_shuffle(*on),
-            (Command::Repeat { mode }, _) => ctl.set_repeat(*mode),
+            (Command::Shuffle { on }, _) => ctl.set_shuffle_from_afar(*on),
+            (Command::Repeat { mode }, _) => ctl.set_repeat_from_afar(*mode),
             (Command::Add { next, .. }, Ready::Songs(ids)) => ctl.enqueue_here(self.songs(ids.iter().map(|id| (id, false))), *next),
             (Command::Adopt(adopt), Ready::Queue(songs, begin)) => ctl.load_queue_here(self.songs(songs.iter().map(|(id, queued)| (id, *queued))), *begin, adopt.position, &adopt.context),
             _ => {}

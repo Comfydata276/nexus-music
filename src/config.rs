@@ -540,7 +540,12 @@ impl Settings {
     /// Saves the settings and says whether they are on the disk: for a change that must be
     /// kept before it is shown as made (see `Controller::choose`).
     pub fn save_surely(&self, path: &Path) -> bool {
-        serde_json::to_vec_pretty(self).is_ok_and(|json| write_surely(path, &json).is_ok())
+        self.save_checked(path, Durable::Flushed)
+    }
+
+    /// `save_surely`, written as `durable` says.
+    pub fn save_checked(&self, path: &Path, durable: Durable) -> bool {
+        serde_json::to_vec_pretty(self).is_ok_and(|json| write_whole(path, &json, durable, &REPLACING).is_ok())
     }
 
     pub fn theme(&self) -> &'static ThemeColors {
