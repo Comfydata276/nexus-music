@@ -2081,8 +2081,8 @@ impl Controller {
         let now = chrono::Utc::now().timestamp();
         let told: Vec<crate::asked::Asked> = {
             let mut asked = self.asked.borrow_mut();
-            let fresh: Vec<crate::asked::Asked> =
-                arrivals.iter().filter_map(|arrival| asked.items.get(arrival.place).filter(|asked| asked.arrived == 0).cloned()).collect();
+            // By the note each was found for, as it's marked (see `asked::is_note`).
+            let fresh = nexus_core::asked::news(&asked.items, &arrivals);
             asked.mark(&arrivals, now);
             fresh
         };
