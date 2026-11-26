@@ -370,8 +370,8 @@ version knows and finds wrong is never guessed at.
 
 | Message | Meaning | At most |
 |---|---|---|
-| `{"t":"look","want":w}` | Tell me your state. `w` is `brief` (for the list), `full` (for steering: what a jam's state holds today), or `queue` (everything playing and to come, by id, to carry on with it elsewhere). | 64 bytes |
-| `{"t":"do","do":name,"at":[g, m],"with":{…}}` | A command, made against generation `g` and minute `m`. | 256 bytes; 4,096 for `add`; 210,000 for `adopt` |
+| `{"t":"look","want":w,"speaks":2}` | Tell me your state. `w` is `brief` (for the list), `full` (for steering: what a jam's state holds today), or `queue` (everything playing and to come, by id, to carry on with it elsewhere). | 64 bytes |
+| `{"t":"do","do":name,"at":[g, m],"with":{…},"speaks":2}` | A command, made against generation `g` and minute `m`. | 256 bytes; 4,096 for `add`; 210,000 for `adopt` |
 
 **The commands** are what one PC could do to another before this, and no others. None
 is a toggle: each says the state it wants, so one delivered late, or twice, cannot undo
@@ -412,7 +412,7 @@ itself.
 
 ```json
 {"re": "…", "ok": true, "why": "…",
- "device": "…", "name": "Study PC", "at": [8, 12], "by": "…",
+ "device": "…", "name": "Study PC", "speaks": 2, "at": [8, 12], "by": "…",
  "playing": false, "title": "…", "artist": "…"}
 ```
 
@@ -421,6 +421,7 @@ itself.
 | `re` | The nonce of the ask this answers. Absent in news. |
 | `ok`, `why` | In an answer to a command. Refused: `ok` false, and `why` is `changed`, `busy`, `late`, `invalid` or `cannot`. Carried out: `ok` true. **Nothing to do** (the device was already as the command asked: playing, for a `play`): `ok` true with `why` `nothing`. |
 | `device`, `name` | Who is speaking: its device id and the name the person gave it. |
+| `speaks` | How its sender speaks (5.10), in every ask too. Left out: 1. |
 | `at` | Its generation and minute now. |
 | `busy` | A choice has been accepted and not yet carried out, or its work is still under way (5.6, 5.7). |
 | `by` | The nonce of the command that made this state, if nothing has been chosen since. And, **while `busy`**, the command the device is busy with: one carried out whose queue has not sounded yet, or one accepted whose songs are still being looked up. |
@@ -819,7 +820,9 @@ minutes (ten if it cannot reach the music server). Then it leaves.
 
 ### 5.10 Devices of different generations in one room
 
-**Designed; not built. It is on the list for switching on (section 11).**
+**Built, in the library both apps share, switched off with the rest.** The rule is
+one sentence, and it is held at every point where one device acts on another, each by
+itself (the table below).
 
 What devices say to each other has changed while linking has been switched off: a
 state now says `done`, where a reader once worked "done" out from `by` and `busy`
@@ -848,6 +851,41 @@ know that of the other before it sends anything.
 - **Nothing is negotiated**, and no device speaks down to another: one rule to test,
   and both apps update themselves. The cost is that linking between two devices waits
   until both are up to date.
+
+**The number as it is written and read.** `"speaks": 2`, a whole number from 1, in every
+look, every command and every tell (an answer, and news). Left out, it is 1. There and
+not such a number (0, a fraction, text), the message breaks its shape: an ask is answered
+`invalid` and a tell is dropped, like any other field a version knows and finds wrong
+(5.5). It fits inside the sizes every message already had, the 64 bytes of a look
+included, so a device that knows nothing of it reads the rest as before.
+
+**Where the rule is held.** A device that speaks otherwise is one whose number is not
+this device's own, lower or higher.
+
+| | What this device does |
+|---|---|
+| A command arrives from one that speaks otherwise | Refused `invalid`, **before the player is touched**: before the window is brought up to the sound, before the order of choices is asked to admit it, before anything is looked up for it. Nothing is counted and no place is kept for it. Its sender is answered, as any sender is. |
+| A look arrives from one that speaks otherwise | Answered as any look is: that is what lists this device there. **But a look for the queue is answered with no queue**, "nothing here to carry on with", which every generation reads alike. Otherwise a device that knows nothing of the rule would take this device's queue, play it, and then tell this one to stop in a command this one refuses, and both would play. |
+| Something is to be asked of one that speaks otherwise | **No command is sealed for it.** Every command this device sends (a press while steering, one that waited its turn, a queue given, the stop that ends "Play here") goes out through one function, which sends only to a device whose last fresh state said it speaks as this one does. One that has not been seen is sent nothing but looks either. The person is told which of the two to update. |
+| One is picked in the list | Not steered, whatever the list on the screen showed when it was pressed. |
+| The device being steered turns out to speak otherwise (it was updated and has started again) | Let go of as soon as a fresh state from it says so. What is pressed after that is this device's own. |
+| "Play here", and the queue comes back from one that speaks otherwise | Not taken. Nothing is loaded, nothing is stopped anywhere. |
+| An answer comes from one that speaks otherwise: to a command, or to the look that asks what became of one | **It never says the command was carried out**, whatever its `ok`, `by` and `done` say: two generations read those differently, which is what makes them two. What became of the command is "not known", and this device does what it does for not known: it does not stop, and it does not mark its queue as handed on. |
+| The stop that ends "Play here", when the device the queue came from has since said it speaks otherwise | Not sent. This device plays; the person is told the other could not be told to stop. |
+
+**In the list**, a row for a device that speaks otherwise has what any row has, its name
+and what it is playing, and one thing more: the sentence saying which of the two to
+update. It is not to be picked and has no Pause. The sentence is under the row ("Update
+Nexus Music on Study PC to control it from here"; "Update Nexus Music on this PC to
+control it from here" when this one is behind), and where it is said away from the row
+it names the other device ("…on this phone to control Study PC from here").
+
+**What this does not cover.** A device that knows nothing of the rule (one that speaks
+1) holds to none of it: it lists a newer device as any other, lets the person pick it,
+and shows them "couldn't do that" for each thing they then press. Nothing is changed on
+either device by that. And the rule is about what devices say to each other, not about
+the relay or the secret: a change to either of those is 5.1's and 5.3's to carry, by
+their own version numbers.
 
 ## 6. What a holder of the host key can do to the relay
 
@@ -1590,7 +1628,8 @@ Then: the phone's adapter, on `bind::Phone`, from 8.1. One review covers both.
 
 **Before linking is switched on for anyone** (the list): the review of the library's
 changes and the adapter together; **devices of different generations in one room**
-(5.10, designed, not built); the walk of the phone against a PC; and **a phone's
+(5.10: built in the library, to be reviewed by itself, and then walked between a build
+that says how it speaks and one that does not); the walk of the phone against a PC; and **a phone's
 volume**. A phone refuses `volume` today and says 1 (weakness 19). The question for
 the owner is whether a PC should be able to turn a phone's media volume up and down
 at all. Whatever the answer, a device that says it has no volume of its own is to be
