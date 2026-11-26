@@ -755,7 +755,16 @@ pub fn flushed(path: &Path, started: std::time::Instant) {
     }
     WINDOW_FLUSHES.set(WINDOW_FLUSHES.get() + 1);
     if std::env::var_os("NEXUS_TRACE").is_some() {
-        eprintln!("[trace] flushed on the window's thread in {:.1} ms: {}", started.elapsed().as_secs_f64() * 1000.0, path.display());
+        // Which of the app's own functions asked for it, nearest first: the press, or not.
+        let trace = std::backtrace::Backtrace::force_capture().to_string();
+        let callers: Vec<&str> = trace
+            .lines()
+            .filter_map(|line| line.trim().split_once(": ").map(|(_, name)| name))
+            .filter(|name| name.starts_with("nexus_music::") && !name.starts_with("nexus_music::config::"))
+            .map(|name| name.trim_start_matches("nexus_music::").split("::{{closure}}").next().unwrap_or(name))
+            .take(4)
+            .collect();
+        eprintln!("[trace] flushed on the window's thread in {:.1} ms: {} (from {})", started.elapsed().as_secs_f64() * 1000.0, path.display(), callers.join(" < "));
     }
 }
 

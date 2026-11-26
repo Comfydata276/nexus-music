@@ -838,12 +838,11 @@ impl Controller {
                             ));
                         }
                     }
-                    Moved::Taken(taken) => ctl.toast(format!(
-                        "{taken} {} with the same names as your downloads {} already in {}, so nothing was moved. Choose an empty folder, or move those out of it first.",
-                        if taken == 1 { "file" } else { "files" },
-                        if taken == 1 { "is" } else { "are" },
-                        folder.display()
-                    )),
+                    Moved::Taken(taken) => ctl.toast(if taken == 1 {
+                        format!("A file with the same name as one of your downloads is already in {}, so nothing was moved. Choose an empty folder, or move it out of that one first.", folder.display())
+                    } else {
+                        format!("{taken} files with the same names as your downloads are already in {}, so nothing was moved. Choose an empty folder, or move those out of it first.", folder.display())
+                    }),
                     Moved::Back { stuck, of } => {
                         *ctl.downloads.borrow_mut() = Downloads::load(from, &account);
                         ctl.toast(format!("{stuck} of {of} files couldn't be moved, so the downloads are staying where they were."));
