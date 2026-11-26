@@ -25,16 +25,16 @@ printed. **Flushed there outside a press, by choice:** the waiting-changes file 
 holds a like or a rating not yet sent (a play counted, or an answer from the network, writes
 it again: its row); the settings once as the app ends, after the window has gone; the settings
 when a move of the downloads completes; the installer finishing, which quits; the play log's
-trim; a batch of albums' file while it holds a way back (its row). Each is the end of something
-the person started, or a repair at the start. **Not yet so** (they
+trim; a batch of albums' file while it holds a way back (its row); `asked.json` for a request's
+note and a take-off-the-list's answer, once each when Lidarr answers (the one record that it
+was done), and for a batch's notes once when it ends or is stopped, while what a scan finds
+(an arrival, a fill, an expiry), sign-in's tidy and a batch's notes as it runs are written in
+passing (the next look finds them again). Each is the end of something the person started,
+or a repair at the start. **Not yet so** (they
 are flushed on the window's thread outside a press, and moving them would take more than
 this change): what an exchange with the server must have on the disk before it sends (the
 kept copy of the shared record, the shared choices saved before a write, the plays checked
-on the disk before they are sent), and a play's line added to the log as it is counted. `asked.json` is flushed only for what
-the person asked: a request's note, and a take-off-the-list's answer, once each when Lidarr
-answers (the one record that it was done), and a batch's notes once when it ends or is
-stopped; what the scan finds (an arrival, a fill, an expiry), sign-in's tidy, and a batch's
-notes while it runs are written in passing, and the next look finds them again.
+on the disk before they are sent), and a play's line added to the log as it is counted.
 
 ## How a file is written
 
