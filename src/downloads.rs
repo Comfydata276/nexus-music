@@ -176,6 +176,8 @@ impl Downloads {
             let written = crate::config::write_whole(&index_file(&self.dir, &self.account), &json, durable, &crate::config::REPLACING);
             if written.is_ok() {
                 self.unsaved = false;
+                // The list on the disk is whole again: it can be moved.
+                self.unreadable = false;
             }
         }
         self.saved_at = std::time::Instant::now();
@@ -393,6 +395,20 @@ pub struct Plan {
     pub names: Vec<std::ffi::OsString>,
     /// How much the files come to, for the room check.
     pub bytes: u64,
+}
+
+/// `plan`, for the downloads of `account`: refused if their own list is there and can't be
+/// read as the move is planned (it would be left out, and the move said to be done with the
+/// songs still where they were). Another account's that can't be read is left out, as `plan`
+/// leaves it.
+pub fn plan_for(dir: &Path, account: &str) -> Result<Plan, String> {
+    let list = index_file(dir, account);
+    match fs::read(&list) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(bytes) if serde_json::from_slice::<Vec<Entry>>(&bytes).is_ok() => {}
+        _ => return Err(format!("The list of downloads in {} couldn't be read, so nothing was moved.", dir.display())),
+    }
+    Ok(plan(dir))
 }
 
 pub fn plan(dir: &Path) -> Plan {
@@ -840,7 +856,11 @@ impl Controller {
         if let Err(said) = self.downloads.borrow_mut().ready_to_move() {
             return self.toast(said);
         }
-        let plan = plan(&from);
+        let account = self.downloads.borrow().account.clone();
+        let plan = match plan_for(&from, &account) {
+            Ok(plan) => plan,
+            Err(said) => return self.toast(said),
+        };
         // Room for what moves, unless it's the same drive (when nothing is copied).
         if let Some(free) = free_space(&folder).filter(|free| !same_drive(&from, &folder) && plan.bytes + SPARE > *free) {
             return self.toast(format!(
@@ -1309,6 +1329,27 @@ mod tests {
         let mut downloads = Downloads::load(dir.clone(), "someone");
         assert!(downloads.ready_to_move().is_ok());
         assert_eq!(fs::read(dir.join("index-someone.json")).unwrap(), written);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_list_made_good_can_be_moved_and_one_that_cant_be_read_when_planned_cant() {
+        // A damaged list, loaded; then a song arrives and the list is written whole again.
+        let dir = folder("made-good");
+        fs::write(dir.join("index-someone.json"), b"half a lis").unwrap();
+        let mut downloads = Downloads::load(dir.clone(), "someone");
+        fs::write(dir.join("a.flac"), b"one").unwrap();
+        downloads.add(entry("a", "a.flac", 3));
+        downloads.save_if_due(true);
+        assert!(serde_json::from_slice::<Vec<Entry>>(&fs::read(dir.join("index-someone.json")).unwrap()).is_ok());
+        assert_eq!(downloads.ready_to_move(), Ok(()), "a list written good since was still refused");
+        assert_eq!(plan_for(&dir, "someone").map(|plan| plan.names.len()), Ok(2));
+        // The list in use can't be read as the move is planned: refused, not "moved" with the
+        // songs left where they are. Another account's that can't be read is left out, as before.
+        fs::write(dir.join("index-other.json"), b"not a list").unwrap();
+        assert_eq!(plan_for(&dir, "someone").map(|plan| plan.names.len()), Ok(2));
+        fs::write(dir.join("index-someone.json"), b"half a lis").unwrap();
+        assert!(plan_for(&dir, "someone").is_err_and(|said| said.contains("couldn't be read")));
         let _ = fs::remove_dir_all(dir);
     }
 

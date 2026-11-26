@@ -399,10 +399,10 @@ mod wire {
             fn turn(&self) -> Box<dyn nexus_core::lidarr::Turn + '_> {
                 Box::new(())
             }
-            fn keep(&self, _: i64, _: &str) -> Result<bool, String> {
+            fn keep(&self, _: &str, _: i64, _: &str) -> Result<bool, String> {
                 Err("not here".into())
             }
-            fn put_back(&self, _: i64, _: &str) {}
+            fn put_back(&self, _: &str, _: i64, _: &str) {}
         }
         assert_eq!(lidarr(&address, None).request(&wanted, &Nowhere), Ok(()));
         let took = started.elapsed();

@@ -158,13 +158,17 @@ pub trait WayBack {
     /// for its whole sequence; the batch, for each step of its own. The window's thread never
     /// takes it.
     fn turn(&self) -> Box<dyn Turn + '_>;
-    /// Writes down that `artist`'s setting is to go back to `before`, and says whether it is on
-    /// the disk: `Ok(true)`, written by this call; `Ok(false)`, a way back for the artist was
-    /// on the disk already, from before this step, and is that one's to cross off. If it can't
-    /// be written, the answer is why, and Lidarr isn't changed.
-    fn keep(&self, artist: i64, before: &str) -> Result<bool, String>;
-    /// `artist`'s setting has gone back to `before`: the way back this step wrote is crossed off.
-    fn put_back(&self, artist: i64, before: &str);
+    /// Writes down that `artist`'s setting on the Lidarr at `lidarr` (its address, as
+    /// `Lidarr::address` has it) is to go back to `before`, and says whether it is on the disk:
+    /// `Ok(true)`, written by this call; `Ok(false)`, a way back for the artist on that Lidarr
+    /// was on the disk already, from before this step, and is that one's to cross off. If it
+    /// can't be written, the answer is why, and Lidarr isn't changed. A way back is only ever
+    /// acted on at the Lidarr it was written for: an artist's number on another means another
+    /// artist.
+    fn keep(&self, lidarr: &str, artist: i64, before: &str) -> Result<bool, String>;
+    /// `artist`'s setting on the Lidarr at `lidarr` has gone back to `before`: the way back
+    /// this step wrote is crossed off.
+    fn put_back(&self, lidarr: &str, artist: i64, before: &str);
 }
 
 /// Held while a step of the way back is under way (`WayBack::turn`).
@@ -767,12 +771,13 @@ impl Lidarr {
     }
 
     fn requesting(&self, wanted: &Offer, way_back: &dyn WayBack) -> Result<(), String> {
+        // The whole of it, one at a time with every other change that has to be put back
+        // (`WayBack::turn`): it is a few requests long. An album by Various Artists too: it
+        // reads their record and writes it back.
+        let _turn = way_back.turn();
         if wanted.artist_id == VARIOUS {
             return self.request_from_various(wanted);
         }
-        // The whole of it, one at a time with every other change that has to be put back
-        // (`WayBack::turn`): it is a few requests long.
-        let _turn = way_back.turn();
         let kind = wanted.kind();
         // An album by an artist Lidarr lists the albums of needs nothing special.
         let plain = kind == "Album" && !wanted.soundtrack;
@@ -821,7 +826,7 @@ impl Lidarr {
                 let restored = self.restore_new_releases(artist, &before);
                 // Crossed off only if this request wrote it.
                 if restored.is_ok() && wrote {
-                    way_back.put_back(artist, &before);
+                    way_back.put_back(self.address(), artist, &before);
                 }
                 outcome.and(restored.map_err(|_| {
                     format!("Asked for “{}”, but couldn't turn new releases back on for {} in Lidarr. Check that artist's settings there.", wanted.title, wanted.artist)
@@ -921,12 +926,12 @@ impl Lidarr {
             return Ok(None);
         }
         let before = record.get("monitorNewItems").and_then(|setting| setting.as_str()).unwrap_or("all").to_string();
-        let wrote = way_back.keep(artist, &before)?;
+        let wrote = way_back.keep(self.address(), artist, &before)?;
         // Turned back before the setting is changed: nothing to put back, and what was
         // written is crossed off.
         let refused = |reason: String| {
             if wrote {
-                way_back.put_back(artist, &before);
+                way_back.put_back(self.address(), artist, &before);
             }
             reason
         };
@@ -1412,7 +1417,7 @@ pub(crate) mod tests {
             Box::new(())
         }
 
-        fn keep(&self, artist: i64, before: &str) -> Result<bool, String> {
+        fn keep(&self, _: &str, artist: i64, before: &str) -> Result<bool, String> {
             if self.refuse {
                 return Err("couldn't be written down".into());
             }
@@ -1420,7 +1425,7 @@ pub(crate) mod tests {
             Ok(true)
         }
 
-        fn put_back(&self, artist: i64, before: &str) {
+        fn put_back(&self, _: &str, artist: i64, before: &str) {
             self.put_back.lock().unwrap().push((artist, before.to_string()));
         }
     }
