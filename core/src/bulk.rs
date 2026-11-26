@@ -167,6 +167,17 @@ impl Back {
     }
 }
 
+/// How checking an artist Lidarr was found to have finished with went (`Job::finish`).
+#[derive(Debug, PartialEq, Eq)]
+enum Finished {
+    /// Wanted, put back and crossed off.
+    Done,
+    /// Lidarr lists nothing for them yet: worth looking again later.
+    Empty,
+    /// Lidarr was at the artist again by the time this had the turn: nothing done yet.
+    Busy,
+}
+
 /// What the batch has to say to the rest of the app.
 pub enum Event {
     /// The counts have moved.
@@ -1080,9 +1091,14 @@ impl Job {
                         }
                         let given_up = empty.get(&artist).is_some_and(|since| since.elapsed() > NOTHING_LISTED);
                         match self.finish(lidarr, artist, given_up, tell) {
-                            Ok(true) => moved = Instant::now(),
-                            Ok(false) => {
+                            Ok(Finished::Done) => moved = Instant::now(),
+                            Ok(Finished::Empty) => {
                                 empty.entry(artist).or_insert_with(Instant::now);
+                            }
+                            // Busy again by the time it was this one's turn: quiet for a while
+                            // first, as before.
+                            Ok(Finished::Busy) => {
+                                quiet.remove(&artist);
                             }
                             Err(reason) => {
                                 errors += 1;
@@ -1102,19 +1118,22 @@ impl Job {
         }
     }
 
-    /// Checks one artist Lidarr has finished reading in. `Ok(false)` if Lidarr lists nothing
-    /// for them yet and it's worth looking again later.
-    fn finish(&self, lidarr: &Lidarr, artist: i64, given_up: bool, tell: &Tell) -> Result<bool, String> {
+    /// Checks one artist Lidarr has finished reading in.
+    fn finish(&self, lidarr: &Lidarr, artist: i64, given_up: bool, tell: &Tell) -> Result<Finished, String> {
         // Wanted, put back and crossed off, as one step of the way back (`WayBack::turn`):
         // what Lidarr lists is read once the step is this one's, so that what is decided from
         // it isn't from before another step changed the artist.
         let turn = crate::lidarr::WayBack::turn(self);
+        // It was found idle before the turn was this one's: looked at again, now that it is.
+        if lidarr.busy_with(&HashSet::from([artist]))?.contains(&artist) {
+            return Ok(Finished::Busy);
+        }
         let listed = lidarr.listed(artist)?;
         let places: Vec<(usize, Offer)> = self.with(|batch| {
             batch.wants.iter().enumerate().filter(|(_, want)| want.state == State::Asked && want.lidarr_artist == artist).filter_map(|(at, want)| Some((at, want.offer.clone()?))).collect()
         });
         if listed.is_empty() && !places.is_empty() && !given_up {
-            return Ok(false);
+            return Ok(Finished::Empty);
         }
         let wanted: Vec<i64> =
             places.iter().filter_map(|(_, offer)| listed.iter().find(|known| known.album == offer.album)).filter(|known| !known.wanted && !known.have).map(|known| known.id).collect();
@@ -1152,7 +1171,7 @@ impl Job {
         if !gone.is_empty() {
             tell(Event::Forgot(gone));
         }
-        Ok(true)
+        Ok(Finished::Done)
     }
 }
 
@@ -1803,7 +1822,9 @@ mod tests {
             };
             let album = |monitored: bool| serde_json::json!({ "id": 9, "title": "A Single", "foreignAlbumId": "al1", "albumType": "Single", "monitored": monitored });
             let answer = match (method, path.as_str()) {
-                ("GET", "artist") => r#"[{"id":5,"artistName":"Someone","foreignArtistId":"ar1"}]"#.to_string(),
+                // (The same record stands for "Various Artists" too, for the one request that
+                // writes theirs.)
+                ("GET", "artist") => serde_json::json!([{ "id": 5, "artistName": "Someone", "foreignArtistId": "ar1" }, { "id": 5, "artistName": "Various Artists", "foreignArtistId": crate::offer::VARIOUS }]).to_string(),
                 ("GET", "metadataprofile") => serde_json::json!([profile(1, "Standard", false), profile(2, crate::lidarr::tests::SINGLES, true)]).to_string(),
                 ("GET", "artist/5") => {
                     // The record as it is when asked for; the answer arrives later, for the batch.
@@ -1866,9 +1887,9 @@ mod tests {
         // artist, which reads the artist's record and writes it back: read while the setting
         // was off and written after it was put back, it would write the old record over the
         // new (leaving the setting off for good). Both of the batch's ways of wanting (asking,
-        // and finishing), and keeping track of an artist.
+        // and finishing), keeping track of an artist, and an album by Various Artists.
         type Step = fn(&Job, &Lidarr);
-        let steps: [(&str, Step); 3] = [
+        let steps: [(&str, Step); 4] = [
             ("asking", |job, lidarr| {
                 job.ask_known(lidarr, 5, &[crate::lidarr::tests::single()]).unwrap();
             }),
@@ -1880,6 +1901,10 @@ mod tests {
             }),
             ("keeping track of the artist", |job, lidarr| {
                 lidarr.add_artist("ar1", "Someone", job).unwrap();
+            }),
+            ("an album by Various Artists", |job, lidarr| {
+                let album = Offer { artist_id: crate::offer::VARIOUS.into(), artist: "Various Artists".into(), kind: "Album".into(), ..crate::lidarr::tests::single() };
+                lidarr.request(&album, job).unwrap();
             }),
         ];
         for (what, step) in steps {
@@ -1904,8 +1929,9 @@ mod tests {
         }
     }
 
-    /// A Lidarr that has artist 5 with "new releases" off, and writes down every request.
-    struct Recording(Mutex<Vec<String>>);
+    /// A Lidarr that has artist 5 with "new releases" off, and writes down every request;
+    /// busy reading artist 5 in, if the flag says so.
+    struct Recording(Mutex<Vec<String>>, bool);
 
     impl crate::http::Http for Recording {
         fn send(&self, request: &crate::http::Request) -> Result<crate::http::Response, crate::http::Failure> {
@@ -1919,6 +1945,7 @@ mod tests {
             self.0.lock().unwrap().push(format!("{method} {path} {body}"));
             let answer = match (method, path.as_str()) {
                 ("GET", "artist/5") => r#"{"id":5,"metadataProfileId":2,"monitorNewItems":"none","monitored":true}"#,
+                ("GET", "command") if self.1 => r#"[{"name":"RefreshArtist","status":"started","body":{"artistId":5}}]"#,
                 ("GET", "album?artistId=5") | ("GET", "command") => "[]",
                 _ => "{}",
             };
@@ -1931,7 +1958,11 @@ mod tests {
     }
 
     fn recording(address: &str) -> (Lidarr, Arc<Recording>) {
-        let http = Arc::new(Recording(Mutex::new(Vec::new())));
+        recording_busy(address, false)
+    }
+
+    fn recording_busy(address: &str, busy: bool) -> (Lidarr, Arc<Recording>) {
+        let http = Arc::new(Recording(Mutex::new(Vec::new()), busy));
         (Lidarr::new(address, "key", None, http.clone()), http)
     }
 
@@ -1958,7 +1989,7 @@ mod tests {
         let musicbrainz = MusicBrainz::new(sent_b.clone(), crate::listenbrainz::ListenBrainz::new(sent_b.clone()));
         assert!(job.begin());
         job.work_through(&b, &musicbrainz, &|_| {});
-        assert_eq!(job.finish(&b, 5, true, &|_| {}), Ok(true));
+        assert_eq!(job.finish(&b, 5, true, &|_| {}), Ok(Finished::Done));
         assert_eq!(puts(&sent_b), Vec::<String>::new(), "A's setting was written to B");
         // Left in the file as it was, for A.
         let now: serde_json::Value = serde_json::from_slice(kept.lock().unwrap().as_ref().unwrap()).unwrap();
@@ -1966,7 +1997,7 @@ mod tests {
         // Settings names A again: put back there, and crossed off.
         assert!(job.unfinished(HERE));
         let (a, sent_a) = recording("lidarr.test");
-        assert_eq!(job.finish(&a, 5, true, &|_| {}), Ok(true));
+        assert_eq!(job.finish(&a, 5, true, &|_| {}), Ok(Finished::Done));
         assert_eq!(puts(&sent_a).len(), 1);
         assert!(puts(&sent_a)[0].contains(r#""monitorNewItems":"all""#), "{:?}", puts(&sent_a));
         assert!(job.with(|batch| batch.restore.is_empty()));
@@ -1981,8 +2012,20 @@ mod tests {
         assert_eq!(written["restore"], serde_json::json!([[5, "all"]]));
         let (b, sent_b) = recording("lidarr-b.test");
         assert!(job.unfinished(b.address()));
-        assert_eq!(job.finish(&b, 5, true, &|_| {}), Ok(true));
+        assert_eq!(job.finish(&b, 5, true, &|_| {}), Ok(Finished::Done));
         assert_eq!(puts(&sent_b).len(), 1);
         assert!(job.with(|batch| batch.restore.is_empty()));
+    }
+
+    #[test]
+    fn an_artist_found_idle_is_looked_at_again_once_finishing_has_the_turn() {
+        // Found idle a moment ago; by the time finishing has the turn, Lidarr is reading the
+        // artist in again (another step's change). Nothing is wanted or put back yet.
+        let job = Job::new(Kept(Arc::new(Mutex::new(None))));
+        job.with(|batch| batch.restore.push(Back { artist: 5, before: "all".into(), lidarr: Some(HERE.into()) }));
+        let (lidarr, sent) = recording_busy("lidarr.test", true);
+        assert_eq!(job.finish(&lidarr, 5, true, &|_| {}), Ok(Finished::Busy));
+        assert_eq!(puts(&sent), Vec::<String>::new());
+        assert_eq!(job.with(|batch| batch.restore.len()), 1);
     }
 }

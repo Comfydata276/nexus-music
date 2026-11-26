@@ -771,12 +771,13 @@ impl Lidarr {
     }
 
     fn requesting(&self, wanted: &Offer, way_back: &dyn WayBack) -> Result<(), String> {
+        // The whole of it, one at a time with every other change that has to be put back
+        // (`WayBack::turn`): it is a few requests long. An album by Various Artists too: it
+        // reads their record and writes it back.
+        let _turn = way_back.turn();
         if wanted.artist_id == VARIOUS {
             return self.request_from_various(wanted);
         }
-        // The whole of it, one at a time with every other change that has to be put back
-        // (`WayBack::turn`): it is a few requests long.
-        let _turn = way_back.turn();
         let kind = wanted.kind();
         // An album by an artist Lidarr lists the albums of needs nothing special.
         let plain = kind == "Album" && !wanted.soundtrack;
