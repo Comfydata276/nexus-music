@@ -1081,7 +1081,7 @@ is the same act to the player, the car and the notification. What each answer me
 
 | `do` | `with` | `ready` | 1, changed | 2, so already | 0, refused |
 |---|---|---|---|---|---|
-| `play` | | nothing | the player was set to play | it was set to play | **`mayPlay()` said no** (Android would not let the service start it), or nothing to play |
+| `play` | | nothing | the player was set to play, **and made ready if it was not** (what the play button does: a queue put back from the last run has never been made ready, and asked only to play it sits set to play and silent until the service gives up on it) | it was set to play | **`mayPlay()` said no** (Android would not let the service start it), or nothing to play |
 | `pause`, `moved` | | nothing | it was set to pause | it was not set to play | |
 | `next` | | nothing | another entry is current, or the same one started again | | nothing to go to |
 | `previous` | | nothing | as a press | | a station with nothing before it |
@@ -1118,7 +1118,7 @@ to give way to them, or to stand against what does not take one.
 
 | Event | When |
 |---|---|
-| `tick` `{"account","wanted"}` | **Every 250 ms** while the service is alive and linking is switched on, from the main looper. `account` names the sign-in; `wanted` is signed in, a relay set up and "Link my devices" on. |
+| `tick` `{"account","wanted"}` | **Every 250 ms** while the service is alive, linking is switched on **and somebody is signed in**, from the main looper. `account` names the sign-in; `wanted` is a relay set up and "Link my devices" on. (With nobody signed in there is no tick: a tick that named nobody, and then somebody, would be read as one sign-in ending and another beginning.) |
 | `changed` `{"who","what"}` | **Something changed what plays, or how, that the library did not do itself.** `who`: `here` (the person, on the phone, the notification, a headset, the car), `nobody` (the app by itself), `guest`; `what`: `playing` or `manner`. Below. |
 | `press`, `add`, `play`, `play_here` | The person pressed something **while the phone's screens show another device's player**. Answered with `{"act":"handled","by_another":…}` as the last act: **false, and the press is the phone's own**, carried out as it always was; true, and it was asked of the other device and nothing is done here. |
 | `choose` `{"place","in_a_jam"}`, `let_go`, `pause` `{"place"}`, `reset`, `setting` `{"on"}`, `named` `{"name"}` | The list of devices, and its settings. |
@@ -1190,10 +1190,16 @@ playlist kept on disk holds the secret: delete it); `{"ask":{"steering":name|nul
 | `{"begin":{"session","room","since_ms"}}` | `linkStay` with the relay's address and host key: it runs for as long as the session lasts. Note `since_ms` for the session. | `{"end":{"session"}}` |
 | `{"renew":{"session","since_ms"}}` | Note the new `since_ms` for the session. | |
 | `{"end":{"session"}}` | End the stay's operation, and **send nothing more that was queued under that session**. | |
-| `{"send":{"session","token","to","frame"}}` | `linkSend`, in the order asked, with the session's `since` and `now`: it sends nothing if the session's secret has run out of its ten minutes by the time its turn comes. Sent once; whatever comes of it, it is not sent again. | the session's end |
+| `{"send":{"session","token","to","frame"}}` | (`to` is the place as text, as it is handed back.) `linkSend`, in the order asked, with the session's `since` and `now`: it sends nothing if the session's secret has run out of its ten minutes by the time its turn comes. Sent once; whatever comes of it, it is not sent again. | the session's end |
 | `{"find":{"ticket","ids","until_ms"}}` | `linkFind` with the ids and `until` (it gives each request what is then left, and asks nothing once the moment has passed). **Its answer is the songs**: keep them where `carryOut` will find them, and **then** call `linkFound({"operation","ticket","ids"})` with the ids kept. Until `linkFound`, the library has heard nothing. | the sign-in's end |
 | `{"log":text}` | The diagnostics log. Never a secret, a key or a token. | |
 | `{"later":{…}}` | For a test only. | |
+
+**Before the first of these requests** the adapter sees that the library has been told
+which object makes its requests (the phone's `Core` does that the first time anything
+of its asks for the network; linking may be the first). **And nothing the library says
+can bring the app down**: an act or an ask the adapter cannot read is noted and passed
+over.
 
 **Ending an operation is how anything here is cancelled.** A look, a stay and a
 look-up each stop at their next request or wait once their operation is ended; what
