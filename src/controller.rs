@@ -1505,7 +1505,7 @@ impl Controller {
         // with it if that one is believed, and is otherwise left unused (see `keep`). If that
         // can't be done it's used, unbound, for that service only, tried again next start, and
         // said.
-        if !self.tokens_looked_at.replace(true) && crate::keep::bind_old_token(&*self.vault(), &found.service, trusted) == crate::keep::Bind::NotYet {
+        if !self.tokens_looked_at.replace(true) && crate::keep::bind_old_token(&*self.vault(), &found.service, trusted, settings.lidarr_token_spent) == crate::keep::Bind::NotYet {
             self.token_old_for.replace(Some(found.service.clone()));
             self.toast(SIGN_IN_NOT_SAVED);
         }
@@ -1551,26 +1551,31 @@ impl Controller {
     fn save_requests(&self, address: &str, key: &str) {
         // An address with a name and password in it, or one the app might read otherwise than
         // its connections would, isn't kept: nor is the key typed with it.
+        // (The address already saved, submitted with only a new key, is judged as it was saved.)
         if !address.trim().is_empty() {
-            if let Err(why) = nexus_core::lidarr::origin(address) {
+            let saved = self.settings.borrow().lidarr_address.clone();
+            if let Err(why) = nexus_core::lidarr::origin_entered(address, &saved) {
                 self.push_settings();
                 return self.requests_state("error", &why);
             }
         }
         let moved = crate::lidarr::tidy(&self.settings.borrow().lidarr_address) != crate::lidarr::tidy(address);
-        if moved {
-            // A sign-in belongs to the address it was found in front of: dropped while that's
-            // still the address, so it's handed back only where it was believed.
-            self.drop_sign_in();
-            let mut settings = self.settings.borrow_mut();
-            settings.lidarr_gate.clear();
-            settings.lidarr_gate_client.clear();
-        }
         // The key is kept with the origin it was typed for, before the address is saved: blank
         // leaves the key that's on file, unless the address now leads somewhere else (another
         // scheme, host or port). See `keep::change`.
         let old = self.settings.borrow().lidarr_address.clone();
-        let changed = crate::keep::change(&*self.vault(), &old, address.trim(), key.trim(), &mut || {
+        // A sign-in belongs to the address it was found in front of: let go of only once the
+        // change is going through, and while that's still the address, so it's handed back
+        // only where it was believed. A change that's refused keeps it.
+        let mut let_go = || {
+            if moved {
+                self.drop_sign_in();
+                let mut settings = self.settings.borrow_mut();
+                settings.lidarr_gate.clear();
+                settings.lidarr_gate_client.clear();
+            }
+        };
+        let changed = crate::keep::change(&*self.vault(), &old, address.trim(), key.trim(), &mut let_go, &mut || {
             let mut settings = self.settings.borrow_mut();
             settings.lidarr_address = address.trim().to_string();
             settings.save_surely(&self.paths.settings)
@@ -1701,6 +1706,8 @@ impl Controller {
                 // From here this sign-in owns the token kept: whatever an earlier one still has
                 // on its way writes nothing.
                 if crate::keep::keep_token(&*self.vault(), &found.service, &done.token) {
+                    // Whatever 0.40.10 kept is gone now (written over): nothing is spent.
+                    self.settings.borrow_mut().lidarr_token_spent = false;
                     tell(Page::SignedIn);
                 } else {
                     tell(Page::StillSigningIn);
@@ -1734,7 +1741,15 @@ impl Controller {
         // Whatever is kept goes; it's handed back only if it was made at this service, and that
         // one is believed (see `Found::trusted`): otherwise it's sent nowhere.
         let vault = self.vault();
-        let on_file = crate::keep::take_token(&*vault, &service);
+        let (on_file, spent) = crate::keep::take_token_telling(&*vault, &service);
+        // A token from 0.40.10, unbound, is never used again from here: not this run (it was
+        // only ever used for the service saved at the start), nor after a restart, if it
+        // couldn't be deleted (written down in the settings, at once).
+        self.token_old_for.replace(None);
+        if spent {
+            self.settings.borrow_mut().lidarr_token_spent = true;
+            self.save_settings();
+        }
         let believed = crate::gate::Found { service: service.clone(), client: String::new() }.trusted(&self.settings.borrow().lidarr_address).is_ok();
         self.settings.borrow_mut().lidarr_signed_in.clear();
         if session.is_none() && on_file.is_none() {

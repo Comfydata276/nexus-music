@@ -131,7 +131,9 @@ pub enum Changed {
 /// where it doesn't belong: a key typed is kept bound to the new address; with none typed and
 /// the origin changed, the old key is bound to the old address (if it wasn't yet) and then
 /// let go of. A write that fails stops the change, unless what's kept is bound already.
-pub fn change(vault: &dyn Vault, old: &str, new: &str, typed: &str, save_address: &mut dyn FnMut() -> bool) -> Changed {
+/// `let_go` is what goes with the old address (the sign-in in front of it): done once the
+/// change is going through, just before the address is saved, and not at all if it isn't.
+pub fn change(vault: &dyn Vault, old: &str, new: &str, typed: &str, let_go: &mut dyn FnMut(), save_address: &mut dyn FnMut() -> bool) -> Changed {
     let mut forgotten = false;
     if !typed.is_empty() {
         let Some(origin) = origin_of(new) else { return Changed::Not(NOT_SAVED) };
@@ -158,6 +160,7 @@ pub fn change(vault: &dyn Vault, old: &str, new: &str, typed: &str, save_address
             }
         }
     }
+    let_go();
     if !save_address() {
         return Changed::Not(NOT_SAVED);
     }
@@ -209,8 +212,13 @@ pub fn any_kept(vault: &dyn Vault) -> bool {
 /// it's `Bind::NotYet`: the token is used, unbound, for that service only (`token`'s
 /// `old_for`), and binding is tried again at the next start. It's never bound to a service
 /// found or saved later: a change of service takes it away (`take_token`).
-pub fn bind_old_token(vault: &dyn Vault, service: &str, trusted: bool) -> Bind {
+/// `spent`: a token kept by 0.40.10 that couldn't be taken away when it was to go
+/// (`take_token_telling`): it isn't bound, or used.
+pub fn bind_old_token(vault: &dyn Vault, service: &str, trusted: bool, spent: bool) -> Bind {
     let _slot = SLOT.lock().unwrap_or_else(|stuck| stuck.into_inner());
+    if spent {
+        return Bind::Done;
+    }
     match (read(vault, TOKEN), origin_of(service), trusted) {
         (Kept::Old(secret), Some(origin), true) if !vault.write(TOKEN, &bound(&origin, &secret)) => Bind::NotYet,
         (Kept::Unreadable, _, true) => Bind::NotYet,
@@ -226,13 +234,20 @@ pub fn keep_token(vault: &dyn Vault, service: &str, token: &str) -> bool {
 
 /// Takes the kept token away, whatever it is, and gives it if it was the one for `service`:
 /// a sign-out, or a sign-in being let go of.
+#[cfg(test)]
 pub fn take_token(vault: &dyn Vault, service: &str) -> Option<String> {
+    take_token_telling(vault, service).0
+}
+
+/// `take_token`, also saying whether what was kept was a token from 0.40.10, still unbound,
+/// that couldn't be taken away: it's spent, and must be neither used nor bound from now on,
+/// across a restart too (see `bind_old_token`'s `spent`).
+pub fn take_token_telling(vault: &dyn Vault, service: &str) -> (Option<String>, bool) {
     let _slot = SLOT.lock().unwrap_or_else(|stuck| stuck.into_inner());
     let token = held(vault, service);
-    if read(vault, TOKEN) != Kept::Nothing {
-        let _ = vault.write(TOKEN, "");
-    }
-    token
+    let kept = read(vault, TOKEN);
+    let taken = kept == Kept::Nothing || vault.write(TOKEN, "");
+    (token, !taken && matches!(kept, Kept::Old(_)))
 }
 
 /// After a sign-out has handed `token` back: clears the entry only if it still holds that
@@ -367,7 +382,7 @@ pub mod tests {
                     let saves = std::cell::Cell::new(0);
                     // The settings file: written after every write before it, or not at all if
                     // the app was closed before; and failing for the "fail" case 3.
-                    let changed = change(&vault, A, C, typed, &mut || {
+                    let changed = change(&vault, A, C, typed, &mut || {}, &mut || {
                         saves.set(saves.get() + 1);
                         if fail.contains(&3) || stop.is_some_and(|stop| *vault.writes.lock().unwrap() > stop) {
                             return false;
@@ -390,7 +405,7 @@ pub mod tests {
             }
             // And the settings file failing: the change isn't made, and says so.
             let vault = with(&[(KEY, &kept)]);
-            assert_eq!(change(&vault, A, C, "key-c", &mut || false), Changed::Not(NOT_SAVED));
+            assert_eq!(change(&vault, A, C, "key-c", &mut || {}, &mut || false), Changed::Not(NOT_SAVED));
             assert_eq!(next_start(&vault, A).1, None);
         }
     }
@@ -399,17 +414,37 @@ pub mod tests {
     fn a_key_that_cant_be_kept_stops_the_change_and_is_said() {
         let vault = Memory { fail: vec![1], ..with(&[(KEY, &bound("https://lidarr.example.org:443", "key-a"))]) };
         let mut saved = false;
-        assert_eq!(change(&vault, A, C, "key-c", &mut || { saved = true; true }), Changed::Not(NOT_SAVED));
+        assert_eq!(change(&vault, A, C, "key-c", &mut || {}, &mut || { saved = true; true }), Changed::Not(NOT_SAVED));
         assert!(!saved);
         assert_eq!(key(&vault, A, None).as_deref(), Some("key-a"));
         // An old key that can be neither bound nor let go of stops a change of origin.
         let vault = Memory { fail: vec![1, 2], ..with(&[(KEY, "key-a")]) };
-        assert_eq!(change(&vault, A, C, "", &mut || { saved = true; true }), Changed::Not(NOT_SAVED));
+        assert_eq!(change(&vault, A, C, "", &mut || {}, &mut || { saved = true; true }), Changed::Not(NOT_SAVED));
         // The same origin keeps the key, and changes nothing in the store.
         let vault = with(&[(KEY, &bound("https://lidarr.example.org:443", "key-a"))]);
-        assert_eq!(change(&vault, A, "https://lidarr.example.org:443/lidarr", "", &mut || true), Changed::Made { forgotten: false });
+        assert_eq!(change(&vault, A, "https://lidarr.example.org:443/lidarr", "", &mut || {}, &mut || true), Changed::Made { forgotten: false });
         assert_eq!(*vault.writes.lock().unwrap(), 0);
-        assert_eq!(change(&vault, A, C, "", &mut || true), Changed::Made { forgotten: true });
+        assert_eq!(change(&vault, A, C, "", &mut || {}, &mut || true), Changed::Made { forgotten: true });
+    }
+
+    #[test]
+    fn a_change_that_is_refused_lets_go_of_nothing() {
+        // The kept key can't be read: the change is refused, and the sign-in in front of the
+        // old address is kept.
+        let vault = with(&[(KEY, "key-a")]);
+        vault.unreadable.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut let_go = false;
+        assert_eq!(change(&vault, A, C, "", &mut || let_go = true, &mut || true), Changed::Not(NOT_SAVED));
+        assert!(!let_go);
+        // A key that can't be kept: the same.
+        let vault = Memory { fail: vec![1], ..with(&[]) };
+        assert_eq!(change(&vault, A, C, "key-c", &mut || let_go = true, &mut || true), Changed::Not(NOT_SAVED));
+        assert!(!let_go);
+        // Going through: let go of before the address is saved.
+        let vault = with(&[(KEY, &bound("https://lidarr.example.org:443", "key-a"))]);
+        let order = std::cell::RefCell::new(Vec::new());
+        assert!(matches!(change(&vault, A, C, "", &mut || order.borrow_mut().push("let go"), &mut || { order.borrow_mut().push("saved"); true }), Changed::Made { .. }));
+        assert_eq!(*order.borrow(), ["let go", "saved"]);
     }
 
     #[test]
@@ -422,7 +457,7 @@ pub mod tests {
         // The address is changed, no key typed, while the store still can't be read: not made,
         // and said as a change that couldn't be saved.
         let mut on_disk = A.to_string();
-        assert_eq!(change(&vault, A, C, "", &mut || { on_disk = C.to_string(); true }), Changed::Not(NOT_SAVED));
+        assert_eq!(change(&vault, A, C, "", &mut || {}, &mut || { on_disk = C.to_string(); true }), Changed::Not(NOT_SAVED));
         assert_eq!(on_disk, A);
         // Readable again: the next start binds it to the address it was kept for, and C never
         // has it.
@@ -431,7 +466,7 @@ pub mod tests {
         assert_eq!(key(&vault, C, None), None);
         // A key typed with the new address needs nothing read: it replaces what's kept.
         vault.unreadable.store(true, Ordering::SeqCst);
-        assert!(matches!(change(&vault, A, C, "key-c", &mut || true), Changed::Made { .. }));
+        assert!(matches!(change(&vault, A, C, "key-c", &mut || {}, &mut || true), Changed::Made { .. }));
         vault.unreadable.store(false, Ordering::SeqCst);
         assert_eq!(next_start(&vault, C).1.as_deref(), Some("key-c"));
     }
@@ -448,11 +483,11 @@ pub mod tests {
         // One kept by 0.40.10 is bound to a trusted service, and is otherwise left unused.
         let vault = with(&[(TOKEN, "old")]);
         assert_eq!(token(&vault, S, None), None);
-        bind_old_token(&vault, S, false);
+        bind_old_token(&vault, S, false, false);
         assert_eq!(token(&vault, S, None), None);
         assert!(any_kept(&vault));
         assert_eq!(vault.read(TOKEN), Ok(Some("old".to_string())));
-        bind_old_token(&vault, S, true);
+        bind_old_token(&vault, S, true, false);
         assert_eq!(token(&vault, S, None).as_deref(), Some("old"));
     }
 
@@ -462,7 +497,7 @@ pub mod tests {
         // Its binding write fails: used for the service saved with it, at this start, and no
         // other; and tried again at the next start.
         let vault: Arc<Memory> = Arc::new(Memory { fail: vec![1], ..with(&[(TOKEN, "old")]) });
-        assert_eq!(bind_old_token(&*vault, S, true), Bind::NotYet);
+        assert_eq!(bind_old_token(&*vault, S, true, false), Bind::NotYet);
         assert_eq!(token(&*vault, S, Some(S)).as_deref(), Some("old"));
         assert_eq!(token(&*vault, "https://found.later.example.org", Some(S)), None);
         // Its first renewal is written, bound to the service.
@@ -486,10 +521,10 @@ pub mod tests {
         // later; the next start binds it to the service it was kept with.
         let vault = with(&[(TOKEN, "old")]);
         vault.unreadable.store(true, Ordering::SeqCst);
-        assert_eq!(bind_old_token(&vault, S, true), Bind::NotYet);
+        assert_eq!(bind_old_token(&vault, S, true, false), Bind::NotYet);
         vault.unreadable.store(false, Ordering::SeqCst);
         assert_eq!(token(&vault, "https://found.later.example.org", Some(S)), None);
-        assert_eq!(bind_old_token(&vault, S, true), Bind::Done);
+        assert_eq!(bind_old_token(&vault, S, true, false), Bind::Done);
         assert_eq!(token(&vault, S, None).as_deref(), Some("old"));
     }
 
@@ -547,6 +582,28 @@ pub mod tests {
         assert_eq!(token(&vault, S, None).as_deref(), Some("t1"));
         clear_token_if(&vault, &handed_back);
         assert_eq!(token(&vault, S, None), None);
+    }
+
+    #[test]
+    fn an_unbound_token_that_couldnt_be_taken_away_is_spent_across_a_restart() {
+        // A 0.40.10 token, unbound; the service changes (or the person signs out), and it
+        // can't be deleted.
+        let vault = Memory { fail: vec![1], ..with(&[(TOKEN, "old")]) };
+        let (handed, spent) = take_token_telling(&vault, S);
+        assert_eq!((handed, spent), (None, true));
+        assert_eq!(vault.read(TOKEN), Ok(Some("old".to_string())));
+        // The next start, spent written down: it's neither bound to the service now saved, nor
+        // used.
+        let elsewhere = "https://auth.other.example.org";
+        assert_eq!(bind_old_token(&vault, elsewhere, true, true), Bind::Done);
+        assert_eq!(token(&vault, elsewhere, None), None);
+        assert_eq!(vault.read(TOKEN), Ok(Some("old".to_string())));
+        // A bound token taken away, or one taken away as asked, is no such thing.
+        let vault = with(&[(TOKEN, "old")]);
+        assert_eq!(take_token_telling(&vault, S), (None, false));
+        let vault = Memory { fail: vec![2], ..with(&[]) };
+        keep_token(&vault, S, "t1");
+        assert_eq!(take_token_telling(&vault, S), (Some("t1".to_string()), false));
     }
 
     #[test]

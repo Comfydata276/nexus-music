@@ -180,6 +180,10 @@ pub struct Settings {
     pub lidarr_gate_client: String,
     /// Who is signed in there, for showing. The token itself is kept with the passwords.
     pub lidarr_signed_in: String,
+    /// A token kept by 0.40.10, never bound, was to be deleted and couldn't be: it's spent,
+    /// neither used nor bound (see `keep::take_token_telling`), until a token is next kept
+    /// bound.
+    pub lidarr_token_spent: bool,
     /// Hosting jams is switched on, and the relay they're hosted at. (The host key for it is
     /// kept with the account password, not here.)
     pub jam_host: bool,
@@ -279,6 +283,7 @@ impl Default for Settings {
             lidarr_gate: String::new(),
             lidarr_gate_client: String::new(),
             lidarr_signed_in: String::new(),
+            lidarr_token_spent: false,
             jam_host: false,
             jam_relay: String::new(),
             jam_name: String::new(),
