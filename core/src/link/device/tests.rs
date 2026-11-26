@@ -2417,3 +2417,59 @@ fn what_is_to_come_is_listed_only_for_a_command_whose_entry_is_not_where_it_was_
     command(&mut world, 204, Command::Remove { at: 2, id: "s1".into() });
     assert_eq!((world.copies[B].player.listed.get(), world.copies[B].player.queue.join(" ")), (0, "s0 s1 s2 s3".to_string()));
 }
+
+// ---- the note under the list -----------------------------------------------------------------
+
+/// **A note that says how things are goes when they stop being so.** "Playing on Copy
+/// B." is said when this device's music has moved there and it steers that device; it is
+/// under the list for as long as that is so, and goes when the device is let go of, by
+/// whatever way: "Stop steering", "Play here", the device leaving. A note of what became
+/// of something asked ("Paused Copy B.") is not of that kind, and stays until there is
+/// something else to say.
+#[test]
+fn a_note_that_says_where_the_music_is_goes_when_the_device_is_let_go_of() {
+    let note = |world: &mut World| world.copies[A].device.shown(world.now, Here::Pc).0.note;
+    // "Stop steering".
+    let mut world = giving(|_| {});
+    world.pass(1_000);
+    assert_eq!((note(&mut world).as_str(), world.copies[A].window.as_deref()), ("Playing on Copy B.", Some("Copy B")));
+    // (It stands while the device is steered, whatever else is pressed for it.)
+    world.ask("next");
+    world.pass(6_000);
+    assert_eq!(note(&mut world), "Playing on Copy B.");
+    let did = world.with(A, |device, _| device.let_go());
+    world.act(A, did);
+    assert_eq!((note(&mut world).as_str(), world.copies[A].window.clone()), ("", None));
+    // "Play here": what is said next is what became of that.
+    let mut world = giving(|_| {});
+    world.pass(1_000);
+    let did = world.with(A, |device, env| device.play_here(env));
+    world.act(A, did.expect("A is steering B"));
+    assert_ne!(note(&mut world), "Playing on Copy B.");
+    world.pass(2_000);
+    assert_eq!(note(&mut world), "Playing here. Copy B is paused.");
+    // The device leaves the room: the note stands while it is still being waited for,
+    // and what is said when it is given up takes its place.
+    let mut world = giving(|_| {});
+    world.pass(1_000);
+    world.copies[B].place = None;
+    world.hear_places();
+    world.pass(10_000);
+    assert_eq!(note(&mut world), "Playing on Copy B.");
+    world.pass(LOST_MS);
+    assert_eq!(note(&mut world), "Copy B can't be reached any more, so the player is back on this PC.");
+    // A note of what became of something asked is not of that kind: it stays when a
+    // device that was steered is let go of.
+    let mut world = World::new(true);
+    let place = world.b_place();
+    let did = world.with(A, |device, env| device.pause(&place, env));
+    world.act(A, did);
+    world.pass(1_000);
+    assert_eq!(note(&mut world), "Paused Copy B.");
+    world.choose();
+    world.pass(1_000);
+    assert_eq!(world.copies[A].window.as_deref(), Some("Copy B"));
+    let did = world.with(A, |device, _| device.let_go());
+    world.act(A, did);
+    assert_eq!(note(&mut world), "Paused Copy B.");
+}

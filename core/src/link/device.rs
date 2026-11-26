@@ -439,7 +439,7 @@ pub struct Device {
     session: Option<Session>,
     sessions: u64,
     asks: Asks,
-    note: String,
+    note: Note,
     /// The system could not give random numbers: linking is off for this run.
     off: bool,
     steering: Option<Steering>,
@@ -463,6 +463,43 @@ pub struct Device {
     /// For a test only: how long a Pause from another device is held between being
     /// accepted and being carried out.
     pub slow_pause_ms: Option<u64>,
+}
+
+/// What there is to say under the list.
+///
+/// **A note is one of two kinds.** Most say what became of the last thing asked ("Paused
+/// Study PC."), and stay until there is something else to say. One says how things are
+/// while a device is being steered: that the music is playing there ("Playing on Study
+/// PC."). That one **goes when the device is let go of**, however that comes about, since
+/// from then on it is no longer so.
+#[derive(Default)]
+struct Note {
+    text: String,
+    /// It says how things are while a device is steered, and goes when one no longer is.
+    while_steering: bool,
+}
+
+impl Note {
+    /// What became of something asked, or why nothing is linked.
+    fn say(&mut self, text: String) {
+        (self.text, self.while_steering) = (text, false);
+    }
+
+    /// How things are for as long as the device just picked is being steered.
+    fn say_while_steering(&mut self, text: String) {
+        (self.text, self.while_steering) = (text, true);
+    }
+
+    fn clear(&mut self) {
+        self.say(String::new());
+    }
+
+    /// The device being steered has been let go of.
+    fn let_go(&mut self) {
+        if self.while_steering {
+            self.clear();
+        }
+    }
 }
 
 /// What is owed to the person when a device is let go of (it has left the room, this
@@ -704,7 +741,7 @@ impl Device {
             if self.end_session(env, &mut out) {
                 out.push(Do::Log("session: ended".into()));
             }
-            self.note = words::SERVER_SILENT.into();
+            self.note.say(words::SERVER_SILENT.into());
         }
         if !self.looking && (self.reset || self.looked_ms.is_none_or(|at| now.saturating_sub(at) >= LOOK_AGAIN_MS)) {
             self.looking = true;
@@ -732,7 +769,7 @@ impl Device {
             self.looks += 1;
         }
         self.reset = true;
-        self.note = words::RESETTING.into();
+        self.note.say(words::RESETTING.into());
         out
     }
 
@@ -759,7 +796,7 @@ impl Device {
                 out.push(Do::Forget { playlist: id.clone() });
                 self.used = Some(id);
                 if wrote == Some(secret::Why::Public) {
-                    self.note = words::WAS_PUBLIC.into();
+                    self.note.say(words::WAS_PUBLIC.into());
                 }
                 match self.session.as_mut().filter(|session| session.secret == secret && secret_holds(session.since_ms, env.now_ms)) {
                     Some(session) => {
@@ -772,7 +809,7 @@ impl Device {
                 }
             }
             Looked::Stopped(stop) => {
-                self.note = words::stopped(stop, env.me.here);
+                self.note.say(words::stopped(stop, env.me.here));
                 out.push(Do::Log(format!("look: stopped ({stop:?})")));
                 None
             }
@@ -781,7 +818,7 @@ impl Device {
                 None
             }
             Looked::Invalid => {
-                self.note = words::NEEDS_RESETTING.into();
+                self.note.say(words::NEEDS_RESETTING.into());
                 None
             }
             Looked::NoRandom => {
@@ -790,9 +827,9 @@ impl Device {
             }
         };
         if reset_half_done {
-            self.note = words::RESET_HALF_DONE.into();
+            self.note.say(words::RESET_HALF_DONE.into());
         } else if reset && !reset_done {
-            self.note = words::RESET_NOT_DONE.into();
+            self.note.say(words::RESET_NOT_DONE.into());
         }
         if let Some(secret) = begin {
             // A secret that is not the one in use: a new session, and the end of the old one.
@@ -807,7 +844,7 @@ impl Device {
             out.push(Do::Log("session: begun with a secret a look read".into()));
             if reset_done {
                 out.push(Do::Log("reset: a new secret was written and read back".into()));
-                self.note = words::RESET_DONE.into();
+                self.note.say(words::RESET_DONE.into());
             }
         }
         out
@@ -817,7 +854,7 @@ impl Device {
         if self.end_session(env, out) {
             out.push(Do::Log("session: ended".into()));
         }
-        self.note = words::no_random(env.me.here);
+        self.note.say(words::no_random(env.me.here));
         self.off = true;
     }
 
@@ -835,7 +872,7 @@ impl Device {
     /// The relay had something for the person (why no place can be had).
     pub fn said(&mut self, session: u64, note: &str) {
         if self.session.as_ref().is_some_and(|live| live.number == session) {
-            self.note = note.to_string();
+            self.note.say(note.to_string());
         }
     }
 
@@ -1389,7 +1426,7 @@ impl Device {
     /// Says something to the person: where they are looking, and under the list.
     fn say(&mut self, note: String, out: &mut Vec<Do>) {
         out.push(Do::Log(format!("said: {note}")));
-        self.note = note.clone();
+        self.note.say(note.clone());
         out.push(Do::Say(note));
     }
 
@@ -1490,6 +1527,9 @@ impl Device {
     fn outcome(&mut self, place: Place, name: &str, sent_for: Option<Out>, outcome: Outcome, env: &mut Env, out: &mut Vec<Do>) {
         let sent_for = sent_for.unwrap_or(Out::Steer);
         out.push(Do::Log(format!("outcome of {sent_for:?} to {name}: {outcome:?}")));
+        // (Whether what is said is how things are from here on, for as long as the device
+        // is steered: the music is playing on it.)
+        let mut standing = false;
         let note = match (sent_for, outcome) {
             (Out::Pause, Outcome::Done) => words::paused(name),
             (Out::Steer | Out::PlayThere(0), Outcome::Done) => String::new(),
@@ -1511,6 +1551,7 @@ impl Device {
                         words::gave_and_did_not_stop(name, env.me.here)
                     } else {
                         self.steer(place, env, out);
+                        standing = self.steering.is_some();
                         words::gave(gave, name, left, sent, env.me.here)
                     }
                 } else {
@@ -1524,7 +1565,7 @@ impl Device {
             return;
         }
         out.push(Do::Log(format!("said: {note}")));
-        self.note = note.clone();
+        if standing { self.note.say_while_steering(note.clone()) } else { self.note.say(note.clone()) }
         // Under the list for a Pause pressed there; anything else is said where the person is looking.
         if sent_for != Out::Pause {
             out.push(Do::Say(note));
@@ -1631,7 +1672,7 @@ impl Device {
         if wait != Wait::Unanswered && self.name(&to).is_some() {
             self.look_at(to, false, env, out);
         }
-        self.note = note.clone();
+        self.note.say(note.clone());
         if aloud {
             out.push(Do::Say(note));
         }
@@ -1651,7 +1692,7 @@ impl Device {
             return out;
         }
         match self.ask(to, Command::Pause, Out::Pause, env, &mut out) {
-            Pressed::Send(_) | Pressed::Waits => self.note = words::asked_to_pause(&name),
+            Pressed::Send(_) | Pressed::Waits => self.note.say(words::asked_to_pause(&name)),
             Pressed::No(wait) => self.not_sent(to, &name, wait, false, env, &mut out),
         }
         out
@@ -1678,6 +1719,8 @@ impl Device {
         if was {
             out.push(Do::Log("steering: stopped".into()));
             out.push(Do::Steering(None));
+            // (What was said of the music being on that device is no longer so.)
+            self.note.let_go();
         }
         was
     }
@@ -1813,7 +1856,7 @@ impl Device {
         let sent = adopt.songs.len();
         match self.ask(to, Command::Adopt(adopt), Out::Give(giving, sent, handed.more as usize), env, &mut out) {
             Pressed::Send(_) => {
-                self.note = words::moving(&name);
+                self.note.say(words::moving(&name));
                 out.push(Do::Say(words::moving(&name)));
             }
             Pressed::Waits => {}
@@ -1911,7 +1954,7 @@ impl Device {
             out.push(Do::Log(format!("shown: {}", if rows.is_empty() { "no other devices".to_string() } else { rows.iter().map(line).collect::<Vec<_>>().join("; ") })));
             self.listed = rows.clone();
         }
-        (Shown { entered, rows, note: self.note.clone(), steering: self.steered().unwrap_or_default().to_string() }, out)
+        (Shown { entered, rows, note: self.note.text.clone(), steering: self.steered().unwrap_or_default().to_string() }, out)
     }
 }
 
