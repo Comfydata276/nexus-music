@@ -1,126 +1,103 @@
-# The linking playlist, out of sight in every copy
+# The linking playlist in every copy: the ruling
 
-**A design, not built. For review as a change to everybody's playlists, before any of it
-is written.** It is the last item of "for everyone, not for a tester's pair" in
-`linking-design.md`, section 12, and it replaces the hiding that was built for both apps
-and withdrawn (5.1).
+**Nothing here is built, and nothing here is to be built before linking is switched on
+for everyone.** This page replaces a design that proposed hiding the playlist by what it
+holds, at the two requests that bring playlists in. That design was reviewed as a change
+to everybody's playlists and the lead ruled against building it, in that form or a
+corrected one. This is the ruling, where it will land, and what it leaves.
 
-## What it is for
+## Why not by what it holds
 
-The secret a person's devices trust each other by is kept in the description of a
-playlist of theirs, "Nexus Music link" (5.1). A playlist's description is on show
-wherever the playlist is: in the list, on its page, in the files an app keeps of both.
-Today a copy hides it only where linking is switched on in that copy. When linking is
-switched on for everyone, every copy a person has is one of their linked devices or is
-about to be, and the playlist should then be what the sync playlist ("Nexus Music sync")
-already is in every copy of both apps: **never listed, never opened, never kept on
-disk, never offered as a place to put songs, and its name not one a playlist of the
-person's own can be given.**
+The review found that to hide a playlist by its contents properly the rule has to reach
+about twenty places across the two apps: every change made by a remembered id (Add to
+playlist, rename, delete, Undo), the Spotify import and its deferred fill, Stats, export,
+the download top-up, the car and the watch offline, the caches and their clean-up, sync's
+date notes, and the sources of saved queues. Even then it cannot be kept on a device that
+has not updated, and it cannot tell an interrupted set-up from an empty playlist of the
+person's own, because the music server does not say enough. That is a large change to
+everybody's playlists to keep one row out of sight.
 
-## Why the first attempt was withdrawn, and what this does differently
+It also found what takes most of the urgency away: **neither app shows a playlist's
+description anywhere.** What a person sees, with no hiding at all, is a playlist called
+"Nexus Music link" with no songs in it.
 
-It went by what a playlist holds, everywhere, in copies with linking switched off, and
-reached into three things every person relies on:
+## The ruling
 
-1. **A kept list was rewritten, or thrown away**, when it was found to hold the row.
-2. **The import resolved names against a filtered list**, so a playlist it could not see
-   could be made a second time.
-3. **Pages still opened by id**, from a link kept somewhere else, past the filter.
+**"Nexus Music link" is treated exactly as "Nexus Music sync" is treated today: by the
+code that already treats that name specially, and by nothing else.** The apps have left
+the sync playlist out by its exact name since keeping in step shipped, with a sentence in
+Settings saying it is there and to leave it be, and that has been enough.
 
-This design has one rule, applied **where playlists come in from the music server**,
-which is two requests in each app, and nowhere after. Nothing downstream of those two
-is changed, so nothing that already holds a list is rewritten: the list is simply
-right the next time it arrives.
+At general switch-on, and not before:
 
-## The rule
+- **Windows:** the two names are unlisted and reserved alike, whatever the switch. The
+  library already has the shape: `secret::unlisted(name, linking)` and
+  `secret::kept_name(name, linking)` take a flag for the second name, and the flag goes.
+- **The phone:** each place that names the sync playlist gains the second name, the same
+  way, and `link/LinkShown.kt` (the in-memory leaving-out used while linking is being
+  tried) goes.
+- **Settings:** "Link my devices" says what the sync setting says: it is kept on your
+  server in a playlist named "Nexus Music link", which other apps will show; leave it be.
+- **Nothing by content.** No classifier at the cache beyond what is there today, no
+  clean-up, no rewriting of anything kept, and nothing in the import, Stats, downloads or
+  the car beyond what the sync name already has there.
 
-A playlist is **linking's** if, as the music server describes it,
+**Until then the rule is as it is** (`linking-design.md`, 5.1): switched off means
+nothing changes; with linking on, the name is left out of the lists shown, in memory.
 
-- its description **reads as a linking record** (the library's `is_record`: the mark,
-  with a layout this version knows and a well-formed secret, or a later layout),
-  **whatever it is called**; or
-- it has linking's name, **no description, no songs, is private and is the account's
-  own**: one being set up, in the moment between being made and being written.
+## Where the sync name is treated specially today
 
-Anything else is the person's own, including a playlist that only has the name: one
-with songs in it, or a description of their own, or that is somebody else's. Linking
-already refuses to use such a playlist and tells the person to rename it (5.1); it has
-to stay in sight for them to do that.
+So that the change, when it comes, is a list of lines.
 
-The rule is one function in the shared library, which both apps call. It does not ask
-whether linking is on in this copy.
+**The shared library** (`core/src/link/secret.rs`, `core/src/sync.rs`, `core/src/step.rs`)
 
-## Where it is applied
+| | |
+|---|---|
+| `sync::PLAYLIST_NAME`, `link::secret::PLAYLIST_NAME` | The two names. |
+| `secret::unlisted(name, linking)` | The sync name always; linking's only with the flag. |
+| `secret::kept_name(name, linking)` | The sync name is refused for a playlist of the person's own, with its own words (`step::reserved`); linking's only with the flag. |
+| `secret::page_may_be_kept(name, comment)` | Never the sync playlist's page; never a page whose description is a linking record. Already so in every copy, and stays. |
 
-| | Windows | Phone |
-|---|---|---|
-| **The list of playlists arrives** | `playlists_arrived` (`src/controller.rs`), where "Nexus Music sync" is taken out today. The sidebar, the playlists page, "Add to playlist" and the jam's picker read the list it keeps, which is in memory and not on disk. | `Library.playlists()` (`library/Library.kt`), the one fetch behind the Library page, search, the menu's picker, the car's tree and Downloads, where the sync playlist is taken out today. What is kept on disk is the list after the rule. |
-| **One playlist is fetched by id** | The page loader (`src/pages.rs`). A playlist that is linking's is "not found", as one that has been deleted is. | `Library.playlist(id)`, which already answers "not found" for the sync playlist. |
-| **A kept file from before this version is read** | The page cache already refuses to write, and throws away unread, a page whose description is a record (`page_may_be_kept`), in every copy today. | The kept list is filtered as it is read, as it already is for the sync playlist; a kept page that is linking's is thrown away unread, as the sync playlist's is. **Neither file is rewritten for it.** |
-| **The import reads the server's playlists itself** | `src/import.rs` filters its own reading by the same function, and refuses the name with linking's words. It resolves against the same list the person sees, so nothing is made twice. | (No import.) |
-| **The name** | `kept_name`: refused for a new playlist and for a rename, in every copy. | `Playlists.reserved`: the same. |
+**Windows**
 
-What reads its playlists **outside** those two requests is not touched and must not be:
-linking's own look at the secret, and keeping in step, which reads the sync playlist.
-Each has its own request already.
+| | |
+|---|---|
+| `src/controller.rs`, `playlists_arrived` | The list as it arrives: `unlisted` names are taken out. The sidebar, the playlists page, "Add to playlist" and the jam's picker read what is left. |
+| `src/import.rs` | Its own reading of the server's playlists leaves `unlisted` names out; a playlist to import with a kept name is refused (`kept_name`). |
+| `src/actions.rs` | A new playlist, and a rename: `kept_name`. |
+| `src/controller.rs`, the page cache (two places) | `page_may_be_kept`, on writing and on reading. |
+| `src/link.rs` | `unlisted` and `kept_name` pass the switch as the flag: the two lines that change. |
 
-## What a person could notice
+**The phone**
 
-- **Nothing, for nearly everyone**: the playlist was made by the app, has no songs, and
-  disappears from one list.
-- **Someone who gave a playlist of their own that exact name, with nothing in it and no
-  description**, private: it reads as one being set up, and is hidden; linking then
-  writes its record into it. This is the one case where a playlist of the person's own
-  is taken. It is the same today wherever linking is on (5.1, weakness 10), and the
-  first write is refused unless the playlist is empty, private and theirs.
-- **Sync's notes** (a pin, a sort, a shuffle kept for a playlist by id) can name the
-  playlist only if the person pinned or sorted it while a copy showed it. Such a note is
-  left where it is and matches nothing, as a note for a deleted playlist does.
-- **A download of it** cannot exist: it has no songs. A phone's Downloads leaves the
-  sync playlist out by name today; nothing is added there.
-- **Recently played and "Your stats"** list what was played from; nothing can be played
-  from an empty playlist.
+| | |
+|---|---|
+| `sync/Names.kt` | The name. |
+| `library/Library.kt`, `playlists()` | The list as it is fetched: the sync playlist is filtered out, so what is kept on disk is the list without it. |
+| `library/Library.kt`, the kept list's reader | The same filter as an old kept list is read. |
+| `library/Library.kt`, `playlist(id)` | Fetched by id, it is "not found". |
+| `library/Library.kt`, a kept page's reader | A kept page of it is not read. |
+| `library/Playlists.kt`, `canEdit` | Never editable. |
+| `library/Playlists.kt`, `reserved` | The name is not one a playlist of the person's own can take. |
+| `downloads/DownloadedViews.kt` | Left out of the downloaded playlists. |
 
-## What stays on disk until it is next replaced
+## What it leaves
 
-A phone's kept list of playlists, written by a version from before this one, holds this
-playlist's description with every other's until the list is next fetched and written,
-which is the first time the app is opened online. It is not shown (it is filtered as
-it is read) and it is not rewritten for this. The secret is the owner's own, and
-anything signed in to the account can read it from the music server (weakness 1); a
-copy of it in the app's private files for one more start is not a new exposure. If the
-review wants it gone at once, the smallest way is to have the first start of the new
-version fetch the list before showing it, and that is a change to how every phone
-starts.
+What the sync playlist has always left. From the review's findings, as the ruling gives
+them (the review's thread has each in full):
 
-## What has to ship together
+- **Reachable by a remembered id.** Something that kept the playlist's id before it was
+  left out (a saved queue's source, an Undo, a link) can still name it.
+- **A renamed record shows.** A playlist renamed somewhere else is an ordinary playlist
+  to every list; its description is still the record. Its page is still never written to
+  a cache.
+- **An older build shows it.** A copy from before the change lists it like any other.
 
-The rule is useful only once it is in **every** copy a person has, and harmless before
-linking is on anywhere. So it goes out in the release that switches linking on for
-everyone, or in one before it, never after: a copy that has linking on while another
-of the person's copies still lists the playlist is where the secret is on show. The
-update check already says which copies are behind; 5.10 already keeps a copy that is
-behind from being steered.
+## Two things the review found about set-up, not hiding
 
-## Tests it would need
+For the "for everyone" list in `linking-design.md`, section 12:
 
-- The rule, as a table: a record under its name, renamed, in a later layout; one being
-  set up; the name with songs, with a description, public, somebody else's; a
-  description that only looks like a record. One table, in the library, which both
-  apps' tests name.
-- Each app: the list with such a playlist in it, as each screen that draws from it gets
-  it; the page by id; a kept file from before read once and not rewritten (its bytes
-  unchanged); the import, with a playlist of the name on the server.
-- The switch-off walk of each app's playlists, before and after, with such a playlist
-  left on the test server on purpose.
-
-## Questions for the review
-
-1. Is "no description, no songs, private, the account's own, and the name" too wide for
-   "being set up"? The alternative is to hide only a playlist that already holds a
-   record, and let one being set up show for the second it takes.
-2. Should the kept list on a phone be left to be replaced at its next fetch (above), or
-   fetched before it is first shown?
-3. Search on a phone and "Your stats" were left listing the playlist in the trial. With
-   the rule at the fetch they are covered without being touched; is there any other
-   reader of the server's playlists in either app that this table has missed?
+- **`judge` adopts an existing empty playlist of the name that is public.** Setting up
+  should not take a public playlist for its own.
+- **An interrupted set-up leaves a blank row**: a playlist of the name, empty, with no
+  description, made and not yet written.

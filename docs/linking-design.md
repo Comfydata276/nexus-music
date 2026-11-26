@@ -129,10 +129,11 @@ rule that only matters where linking is on and enforced it where it is off, and 
 it reached into things every person relies on (a kept list rewritten or thrown away,
 the import resolving against a filtered list, pages still opening by id). The secret
 is the owner's own, readable by anything signed in to the account (weakness 1); seen
-on the owner's other devices during a test it does no harm. **How the record's
-playlist is kept out of sight and out of caches in every copy is for when linking is
-switched on for everyone**, designed as a whole and reviewed as a change to everybody's
-playlists; until then a phone's kept list of playlists holds this one's description as
+on the owner's other devices during a test it does no harm. **In every copy, at general switch-on and not before, the
+playlist is treated exactly as the sync playlist is today: by its name, where that name
+is already treated specially, and by nothing else** (`linking-playlist-everywhere.md`:
+the ruling, after a design that went by what the playlist holds was reviewed as a change
+to everybody's playlists and not built). Until then a phone's kept list of playlists holds this one's description as
 it holds every playlist's.
 
 A **look** is: list the playlists; choose by the rule of `core/src/step.rs` (`find`:
@@ -1831,11 +1832,16 @@ linking is off until the app is closed and opened.
 
 **For everyone, not for a tester's pair** (added to the list above): at set-up, an
 empty playlist of the reserved name with an empty comment, of the person's own, found
-beside one that holds the record, is removed (weakness 10 leaves it there today). And
-**how the record's playlist is kept out of sight and out of caches in every copy**
-(5.1): designed as a whole, with the pages that open by id, the import, sync's notes,
-downloads and the car's offline tree in it, and reviewed as a change to everybody's
-playlists.
+beside one that holds the record, is removed (weakness 10 leaves it there today).
+**The record's playlist in every copy** (5.1) is ruled on: it is treated as the sync
+playlist is, by name, and `linking-playlist-everywhere.md` lists the lines that change.
+Two things about set-up that the review of the earlier design found: setting up takes an
+existing empty playlist of the name for its own **even when it is public**, which it
+should not; and a set-up that is interrupted leaves a blank row, a playlist of the name
+with nothing in it. And **taking a long queue from another device**: on an emulator's
+debug build it held a phone's player for about 80 ms with 5,000 songs; building the
+queue away from the player's thread would change what the player owes the library, so
+it is to be measured on a real phone with a real large queue before anything is done.
 
 The relay's path can still hold a command up to two minutes, show a stale state until
 the next look, and stop linking altogether.
