@@ -393,6 +393,20 @@ pub fn origin(address: &str) -> Result<Origin, String> {
     Ok(Origin { scheme, host, port })
 }
 
+/// Where an address already saved leads, read as 0.40.10 used it: as `origin`, but a name and
+/// password in it (a reverse proxy's HTTP Basic) are passed over, and an empty port (`host:`)
+/// is the scheme's own. For an address loaded from what was kept, never one being typed: what
+/// the person types or changes is held to `origin`. (The phone keeps `origin` always.)
+pub fn origin_saved(address: &str) -> Result<Origin, String> {
+    let address = tidy(address);
+    let Some((scheme, rest)) = address.split_once("://") else { return origin(&address) };
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, after) = rest.split_at(end);
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+    let authority = authority.strip_suffix(':').unwrap_or(authority);
+    origin(&format!("{scheme}://{authority}{after}"))
+}
+
 /// Whether two addresses lead to the same place (see `origin`). One that can't be used is the
 /// same as nothing.
 pub fn same_origin(a: &str, b: &str) -> bool {
@@ -1194,6 +1208,21 @@ impl Lidarr {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn a_saved_address_is_read_as_0_40_10_used_it_and_a_typed_one_held_to_the_rule() {
+        let at = |scheme: &str, host: &str, port: u16| Ok(Origin { scheme: scheme.into(), host: host.into(), port });
+        // A name and password (a reverse proxy's HTTP Basic), and an empty port: refused when
+        // typed, read as 0.40.10 used them when saved.
+        assert_eq!(origin("http://me:secret@lidarr.example.org:8686").unwrap_err(), ADDRESS_WITH_NAME);
+        assert_eq!(origin_saved("http://me:secret@lidarr.example.org:8686"), at("http", "lidarr.example.org", 8686));
+        assert_eq!(origin_saved("https://me:s%40cret@Lidarr.example.org/lidarr"), at("https", "lidarr.example.org", 443));
+        assert_eq!(origin("http://lidarr.example.org:").unwrap_err(), ADDRESS_UNUSABLE);
+        assert_eq!(origin_saved("http://lidarr.example.org:/lidarr"), at("http", "lidarr.example.org", 80));
+        // Otherwise the same reading.
+        assert_eq!(origin_saved("lidarr.example.org:08686"), origin("lidarr.example.org:08686"));
+        assert!(origin_saved("http://lid\\arr.example.org").is_err() && origin_saved("ftp://lidarr.example.org").is_err());
+    }
 
     #[test]
     fn tidies_addresses() {

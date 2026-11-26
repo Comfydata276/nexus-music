@@ -54,7 +54,8 @@ impl Found {
         if service.scheme == "https" {
             return Ok(());
         }
-        match crate::lidarr::origin(lidarr) {
+        // (Lidarr's address as it was saved: see `lidarr::origin_saved`.)
+        match crate::lidarr::origin_saved(lidarr) {
             Ok(lidarr) if lidarr.scheme == service.scheme && lidarr.host == service.host => Ok(()),
             _ => refused(),
         }
@@ -73,7 +74,7 @@ fn endpoint(service: &str, path: &str) -> Option<String> {
 /// refused, and what makes it work.
 pub fn not_trusted(service: &str) -> String {
     format!(
-        "The sign-in at {service} is refused because it isn't on https, or where Lidarr's own address is, so signing in would cross the network unprotected: put the sign-in on https, or Lidarr and the sign-in on the same host."
+        "The sign-in at {service} is refused because it isn't on https, or where Lidarr's own address is, so signing in would cross the network unprotected: put the sign-in on https, or, with Lidarr on plain http, on Lidarr's own host."
     )
 }
 
@@ -621,6 +622,8 @@ mod tests {
         assert_eq!(found("https://lidarr.example.org", "http://auth.example.org"), Err(not_trusted("auth.example.org")));
         assert_eq!(found("https://lidarr.example.org", "http://lidarr.example.org"), Err(not_trusted("lidarr.example.org")));
         assert_eq!(found("http://192.168.1.5:8686", "http://192.168.1.9:9000"), Err(not_trusted("192.168.1.9:9000")));
+        // Lidarr's address as 0.40.10 saved it, a name and password in it: its host is its host.
+        assert_eq!(found("http://me:secret@192.168.1.5:8686", "http://192.168.1.5:9000"), Ok(Some("http://192.168.1.5:9000".into())));
     }
 
     /// A Lidarr whose door sends every caller first to `outpost` (as written in its
@@ -647,7 +650,7 @@ mod tests {
     fn a_refused_sign_in_is_said_with_what_makes_it_work() {
         assert_eq!(
             not_trusted("auth.example.org"),
-            "The sign-in at auth.example.org is refused because it isn't on https, or where Lidarr's own address is, so signing in would cross the network unprotected: put the sign-in on https, or Lidarr and the sign-in on the same host."
+            "The sign-in at auth.example.org is refused because it isn't on https, or where Lidarr's own address is, so signing in would cross the network unprotected: put the sign-in on https, or, with Lidarr on plain http, on Lidarr's own host."
         );
     }
 

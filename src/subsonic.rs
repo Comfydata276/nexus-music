@@ -197,8 +197,17 @@ mod dns {
             config: &Config,
             timeout: NextTimeout,
         ) -> Result<ResolvedSocketAddrs, Error> {
+            self.resolve_keeping(uri, config, timeout, "", |_| true)
+        }
+    }
+
+    impl CachingResolver {
+        /// Looks `uri`'s name up, keeping only the addresses `keep` lets through: left out
+        /// before any is probed, and remembered under `kind` (so that one cache never hands
+        /// another what it left out).
+        fn resolve_keeping(&self, uri: &Uri, config: &Config, timeout: NextTimeout, kind: &str, keep: impl Fn(&SocketAddr) -> bool) -> Result<ResolvedSocketAddrs, Error> {
             let key = match (uri.scheme(), uri.authority()) {
-                (Some(scheme), Some(authority)) => DefaultResolver::host_and_port(scheme, authority),
+                (Some(scheme), Some(authority)) => DefaultResolver::host_and_port(scheme, authority).map(|key| format!("{kind}{key}")),
                 _ => None,
             };
             if let Some(key) = &key {
@@ -213,7 +222,11 @@ mod dns {
                 }
             }
             let resolved = self.inner.resolve(uri, config, timeout)?;
-            let ordered = fastest_first(resolved.iter().copied().collect());
+            let kept: Vec<SocketAddr> = resolved.iter().copied().filter(|addr| keep(addr)).collect();
+            if kept.is_empty() {
+                return Err(Error::HostNotFound);
+            }
+            let ordered = fastest_first(kept);
             let mut out = self.empty();
             for addr in &ordered {
                 out.push(*addr);
@@ -241,19 +254,13 @@ mod dns {
 
     impl Resolver for PublicResolver {
         fn resolve(&self, uri: &Uri, config: &Config, timeout: NextTimeout) -> Result<ResolvedSocketAddrs, Error> {
-            let found = self.inner.resolve(uri, config, timeout)?;
             let the_proxy = config.proxy().is_some_and(|proxy| uri.host() == Some(proxy.host()) && uri.port_u16().unwrap_or(0) == proxy.port());
             if the_proxy {
-                return Ok(found);
+                return self.inner.resolve(uri, config, timeout);
             }
-            let mut out = self.empty();
-            for addr in found.iter().filter(|addr| far_away(addr.ip())) {
-                out.push(*addr);
-            }
-            if out.is_empty() {
-                return Err(Error::HostNotFound);
-            }
-            Ok(out)
+            // Left out before anything is probed (`fastest_first` connects to each to see which
+            // answers first), and remembered apart from the other agents' look-ups.
+            self.inner.resolve_keeping(uri, config, timeout, "public:", |addr| far_away(addr.ip()))
         }
     }
 

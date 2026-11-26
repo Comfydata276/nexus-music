@@ -165,11 +165,24 @@ pub fn tidy(items: &mut Vec<Asked>, now: i64) -> bool {
     items.len() != before
 }
 
-/// Marks arrivals as such: each the note it was found for, by what it is (see `Arrival`), not by
+/// Whether `asked` is the note `arrival` was found for: asked at the same moment, by the same
+/// title and artist, and with the same id if the note had one when the scan looked (a repeat
+/// request may have given an older note its id since: it's the same note).
+pub fn is_note(asked: &Asked, arrival: &Arrival) -> bool {
+    asked.at == arrival.at && asked.title == arrival.title && asked.artist == arrival.artist && (arrival.album.is_empty() || asked.album == arrival.album)
+}
+
+/// The notes the arrivals were found for that haven't arrived before: what's news, to be
+/// said. By what each is (`is_note`), as `mark` goes, not by its place.
+pub fn news(items: &[Asked], arrivals: &[Arrival]) -> Vec<Asked> {
+    arrivals.iter().filter_map(|arrival| items.iter().find(|asked| is_note(asked, arrival)).filter(|asked| asked.arrived == 0).cloned()).collect()
+}
+
+/// Marks arrivals as such: each the note it was found for, by what it is (`is_note`), not by
 /// its place. A note taken off the list since is marked nothing.
 pub fn mark(items: &mut [Asked], arrivals: &[Arrival], now: i64) {
     for arrival in arrivals {
-        let Some(asked) = items.iter_mut().find(|asked| asked.at == arrival.at && asked.title == arrival.title && asked.album == arrival.album && asked.artist == arrival.artist) else {
+        let Some(asked) = items.iter_mut().find(|asked| is_note(asked, arrival)) else {
             continue;
         };
         if asked.arrived == 0 {
@@ -366,6 +379,28 @@ mod tests {
         items.push(note("rg-c", "Third", 3));
         mark(&mut items, &found, 10);
         assert_eq!(items.iter().map(|asked| (asked.title.as_str(), asked.arrived)).collect::<Vec<_>>(), [("Second", 10), ("Third", 0)]);
+    }
+
+    #[test]
+    fn an_arrival_is_said_marked_and_filled_by_the_one_note_the_scan_saw() {
+        // A note from 0.40.10, with no id, and another.
+        let mut items = vec![
+            Asked { title: "Other".into(), artist: "Them".into(), at: 1, ..Default::default() },
+            Asked { title: "Cradlesong".into(), artist: "Rob Thomas".into(), at: 2, ..Default::default() },
+        ];
+        let found = arrivals(&items, 10, |title, _| (title == "Cradlesong").then(|| ("lib".to_string(), "cover".to_string())), |_| None);
+        assert_eq!(found.len(), 1);
+        // Before the scan answers: the first is taken off the list (places move), and the same
+        // album is asked for again, which gives the old note its id.
+        assert!(forget(&mut items, "", "Other", "Them"));
+        put(&mut items, Asked { album: "rg-c".into(), title: "Cradlesong".into(), artist: "Rob Thomas".into(), at: 3, ..Default::default() });
+        assert_eq!((items.len(), items[0].album.as_str()), (1, "rg-c"));
+        // It's news once, and marked: the next scan has nothing to say of it.
+        assert_eq!(news(&items, &found).iter().map(|asked| asked.title.as_str()).collect::<Vec<_>>(), ["Cradlesong"]);
+        mark(&mut items, &found, 10);
+        assert_eq!(items[0].arrived, 10);
+        assert!(news(&items, &found).is_empty());
+        assert!(arrivals(&items, 20, |_, _| Some(("lib".to_string(), "cover".to_string())), |_| None).is_empty());
     }
 }
 

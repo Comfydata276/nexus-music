@@ -98,12 +98,15 @@ impl AskedList {
         if self.held {
             let (items, held, trouble) = read_back(&self.path);
             if !held {
+                // What was taken off the list meanwhile was taken off what was there: applied to
+                // the file's notes, before what was noted since is joined to them (an album
+                // taken off and asked for again stays asked for).
                 let mut joined = items;
-                for asked in self.items.drain(..) {
-                    nexus_core::asked::put(&mut joined, asked);
-                }
                 for (album, title, artist) in self.gone.drain(..) {
                     nexus_core::asked::forget(&mut joined, &album, &title, &artist);
+                }
+                for asked in self.items.drain(..) {
+                    nexus_core::asked::put(&mut joined, asked);
                 }
                 self.items = joined;
                 self.held = false;
@@ -424,6 +427,32 @@ mod tests {
         let before = flushes();
         assert!(list.forget("b1", "Album b1", "Them", crate::config::Durable::Flushed));
         assert_eq!(flushes(), before + 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn taken_off_while_held_then_asked_again_stays_asked_for() {
+        let _apart = crate::pins::apart();
+        let dir = std::env::temp_dir().join(format!("nexus-asked-held-again-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("asked.json");
+        let mut list = AskedList::load(&path);
+        list.add(Asked { album: "rg-q".into(), title: "Greatest Hits".into(), artist: "Queen".into(), at: 1, ..Default::default() });
+        // Held: the file can't be read for now.
+        let away = dir.join("away.json");
+        std::fs::rename(&path, &away).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let mut list = AskedList::load(&path);
+        // Taken off the list, then asked for again, while held.
+        list.forget("rg-q", "Greatest Hits", "Queen", crate::config::Durable::Flushed);
+        list.add(Asked { album: "rg-q".into(), title: "Greatest Hits".into(), artist: "Queen".into(), at: 5, ..Default::default() });
+        // Readable again: what's asked for now is kept; the cancellation was of what was there.
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(&away, &path).unwrap();
+        assert!(list.add(Asked { album: "rg-y".into(), title: "Yellow".into(), artist: "Coldplay".into(), ..Default::default() }));
+        let kept: Vec<(String, i64)> = AskedList::load(&path).items.into_iter().map(|asked| (asked.artist, asked.at)).collect();
+        assert_eq!(kept, [("Queen".to_string(), 5), ("Coldplay".to_string(), 0)]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

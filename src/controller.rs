@@ -30,6 +30,9 @@ pub fn with<R>(f: impl FnOnce(&Rc<Controller>) -> R) -> Option<R> {
 }
 
 /// Queues `f` to run on the UI thread, from any thread.
+/// Said when the sign-in's token couldn't be kept (written down) on this PC.
+const SIGN_IN_NOT_SAVED: &str = "Couldn't save your sign-in; you'll need to sign in next time.";
+
 pub fn post(f: impl FnOnce(&Rc<Controller>) + Send + 'static) {
     let _ = slint::invoke_from_event_loop(move || {
         with(f);
@@ -429,6 +432,13 @@ pub struct Controller {
     gate: RefCell<Option<std::sync::Arc<crate::gate::Session>>>,
     /// How many sign-in sessions have been begun: part of what a Lidarr connection is made of.
     sign_ins: Cell<u64>,
+    /// Whether the key kept by 0.40.10 has been looked at, at this start; and the address it
+    /// belongs to if it couldn't be bound then (see `keep::bind_old_key`).
+    keys_looked_at: Cell<bool>,
+    key_old_for: RefCell<Option<String>>,
+    /// The same for the sign-in's token, and the service it belongs to.
+    tokens_looked_at: Cell<bool>,
+    token_old_for: RefCell<Option<String>>,
     suggestions: RefCell<Vec<Suggestion>>,
     preview_count: Cell<u64>,
     /// The same count, where the search thread can see it: a search that is no longer the
@@ -626,6 +636,10 @@ impl Controller {
             requests_check: Cell::new(0),
             gate: RefCell::new(None),
             sign_ins: Cell::new(0),
+            keys_looked_at: Cell::new(false),
+            key_old_for: RefCell::new(None),
+            tokens_looked_at: Cell::new(false),
+            token_old_for: RefCell::new(None),
             suggestions: RefCell::default(),
             preview_count: Cell::new(0),
             preview_latest: Default::default(),
@@ -1451,13 +1465,16 @@ impl Controller {
         let lidarr = {
             let settings = self.settings.borrow();
             let vault = self.vault();
-            // A key kept by 0.40.10 is bound to the address configured now, once. (If that
-            // write fails it's tried again at the next start, and used meanwhile only at this
-            // address: see `keep::change`.)
-            let _ = crate::keep::bind_old_key(&*vault, &settings.lidarr_address);
-            let key = crate::keep::key(&*vault, &settings.lidarr_address);
+            // At the start, a key kept by 0.40.10 is bound to the address configured then. If
+            // that can't be done (its write failed, or the store couldn't be read), it's used,
+            // unbound, for that address only, and tried again at the next start.
+            if !self.keys_looked_at.replace(true) && crate::keep::bind_old_key(&*vault, &settings.lidarr_address) == crate::keep::Bind::NotYet {
+                self.key_old_for.replace(Some(settings.lidarr_address.clone()));
+            }
+            let key = crate::keep::key(&*vault, &settings.lidarr_address, self.key_old_for.borrow().as_deref());
             // An address the app can't be sure of reaching as written isn't connected to.
-            let usable = nexus_core::lidarr::origin(&settings.lidarr_address).is_ok();
+            // (Read as 0.40.10 used it: a saved address isn't held to what's asked of a typed one.)
+            let usable = nexus_core::lidarr::origin_saved(&settings.lidarr_address).is_ok();
             match (settings.requests && !settings.lidarr_address.trim().is_empty() && usable, key) {
                 (true, Some(key)) => {
                     let gate = self.gate_session(&settings);
@@ -1484,9 +1501,14 @@ impl Controller {
     fn gate_session(&self, settings: &config::Settings) -> Option<std::sync::Arc<crate::gate::Session>> {
         let found = crate::gate::Found { service: settings.lidarr_gate.clone(), client: settings.lidarr_gate_client.clone() };
         let trusted = !found.service.is_empty() && found.trusted(&settings.lidarr_address).is_ok();
-        // A token kept by 0.40.10 is bound to the saved service if that one is believed, and
-        // is otherwise left unused (see `keep`).
-        crate::keep::bind_old_token(&*self.vault(), &found.service, trusted);
+        // At the start, and then only, a token kept by 0.40.10 is bound to the service saved
+        // with it if that one is believed, and is otherwise left unused (see `keep`). If that
+        // can't be done it's used, unbound, for that service only, tried again next start, and
+        // said.
+        if !self.tokens_looked_at.replace(true) && crate::keep::bind_old_token(&*self.vault(), &found.service, trusted) == crate::keep::Bind::NotYet {
+            self.token_old_for.replace(Some(found.service.clone()));
+            self.toast(SIGN_IN_NOT_SAVED);
+        }
         // One kept by an older version that isn't believed now is not used (see `Found::trusted`).
         if !trusted {
             self.gate.replace(None);
@@ -1495,7 +1517,7 @@ impl Controller {
         if let Some(session) = self.gate.borrow().as_ref().filter(|session| *session.found() == found) {
             return Some(session.clone());
         }
-        let token = crate::keep::token(&*self.vault(), &found.service)?;
+        let token = crate::keep::token(&*self.vault(), &found.service, self.token_old_for.borrow().as_deref())?;
         let session = std::sync::Arc::new(self.new_gate(found, token));
         self.gate.replace(Some(session.clone()));
         Some(session)
@@ -1505,7 +1527,7 @@ impl Controller {
     /// while the token kept is still the one it renewed (see `keep::renewals`).
     fn new_gate(&self, found: crate::gate::Found, token: String) -> crate::gate::Session {
         self.sign_ins.set(self.sign_ins.get() + 1);
-        let keep = crate::keep::renewals(self.vault(), found.service.clone(), token.clone());
+        let keep = crate::keep::renewals(self.vault(), found.service.clone(), token.clone(), || post(|ctl| ctl.toast(SIGN_IN_NOT_SAVED)));
         crate::gate::session(found, token, keep)
     }
 
@@ -1577,7 +1599,7 @@ impl Controller {
         let Some(lidarr) = crate::lidarr::current() else {
             // One kept by an older version that this one won't use says why.
             let address = self.settings.borrow().lidarr_address.clone();
-            if let (false, Err(why)) = (address.trim().is_empty(), nexus_core::lidarr::origin(&address)) {
+            if let (false, Err(why)) = (address.trim().is_empty(), nexus_core::lidarr::origin_saved(&address)) {
                 return self.requests_state("error", &why);
             }
             return self.requests_state("none", nexus_core::lidarr::NOT_CONNECTED);
@@ -1622,7 +1644,7 @@ impl Controller {
         }
         self.push_settings();
         let service = self.settings.borrow().lidarr_gate.clone();
-        let signed_out = !service.is_empty() && crate::keep::token(&*self.vault(), &service).is_none();
+        let signed_out = !service.is_empty() && crate::keep::token(&*self.vault(), &service, self.token_old_for.borrow().as_deref()).is_none();
         match (answer, gate) {
             (Ok(version), _) => self.requests_state("connected", &nexus_core::lidarr::connected(&version)),
             (Err(_), Some(Ok(Some(_)))) if by_hand => self.sign_in_requests(),
@@ -1682,7 +1704,7 @@ impl Controller {
                     tell(Page::SignedIn);
                 } else {
                     tell(Page::StillSigningIn);
-                    self.toast("Couldn't save your sign-in; you'll need to sign in next time.");
+                    self.toast(SIGN_IN_NOT_SAVED);
                 }
                 self.settings.borrow_mut().lidarr_signed_in = done.name;
                 self.save_settings_in_passing();
@@ -2062,8 +2084,8 @@ impl Controller {
         let now = chrono::Utc::now().timestamp();
         let told: Vec<crate::asked::Asked> = {
             let mut asked = self.asked.borrow_mut();
-            let fresh: Vec<crate::asked::Asked> =
-                arrivals.iter().filter_map(|arrival| asked.items.get(arrival.place).filter(|asked| asked.arrived == 0).cloned()).collect();
+            // By the note each was found for, as it's marked (see `asked::is_note`).
+            let fresh = nexus_core::asked::news(&asked.items, &arrivals);
             asked.mark(&arrivals, now);
             fresh
         };
@@ -3811,7 +3833,7 @@ impl Controller {
         page.set_requests(settings.requests);
         page.set_request_singles(settings.request_singles);
         page.set_lidarr_address(settings.lidarr_address.as_str().into());
-        page.set_lidarr_key_hint(crate::keep::key(&*self.vault(), &settings.lidarr_address).map(|key| crate::lidarr::mask(&key)).unwrap_or_default().into());
+        page.set_lidarr_key_hint(crate::keep::key(&*self.vault(), &settings.lidarr_address, self.key_old_for.borrow().as_deref()).map(|key| crate::lidarr::mask(&key)).unwrap_or_default().into());
         let gate = crate::gate::Found { service: settings.lidarr_gate.clone(), client: String::new() };
         page.set_lidarr_gate(gate.host().into());
         page.set_lidarr_signed_in(settings.lidarr_signed_in.as_str().into());
@@ -3819,7 +3841,7 @@ impl Controller {
         // one that's refused is offered only to be signed out of, which sends it nowhere.
         let trusted = gate.trusted(&settings.lidarr_address).is_ok();
         let vault = self.vault();
-        let usable = !settings.lidarr_gate.is_empty() && trusted && crate::keep::token(&*vault, &settings.lidarr_gate).is_some();
+        let usable = !settings.lidarr_gate.is_empty() && trusted && crate::keep::token(&*vault, &settings.lidarr_gate, self.token_old_for.borrow().as_deref()).is_some();
         page.set_lidarr_has_token(usable);
         page.set_lidarr_token_unused(!settings.lidarr_gate.is_empty() && !usable && crate::keep::any_kept(&*vault));
         drop(settings);
