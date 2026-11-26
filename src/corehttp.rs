@@ -36,21 +36,9 @@ impl Public {
         if from.scheme_str()? != "https" {
             return None;
         }
-        // Resolved against the address that answered, then judged: "//host/path" is that host
-        // on this scheme; "/path" a path on this host; "?query" this path asked otherwise; "path" one beside this one.
-        let is_whole = location.split_once("://").is_some_and(|(scheme, _)| !scheme.is_empty() && scheme.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')));
-        let to = if is_whole {
-            location.to_string()
-        } else if location.starts_with("//") {
-            format!("https:{location}")
-        } else if location.starts_with('/') {
-            format!("https://{}{location}", from.authority()?)
-        } else if location.starts_with('?') {
-            format!("https://{}{}{location}", from.authority()?, from.path())
-        } else {
-            let path = from.path();
-            format!("https://{}{}{location}", from.authority()?, &path[..path.rfind('/').map_or(0, |end| end + 1)])
-        };
+        // Resolved against the address that answered as the old client (ureq) resolved it, then
+        // judged.
+        let to = join(&from, location)?;
         let uri: ureq::http::Uri = to.parse().ok()?;
         if !uri.scheme_str()?.eq_ignore_ascii_case("https") || uri.authority()?.as_str().contains('@') {
             return None;
@@ -65,6 +53,44 @@ impl Public {
             Err(_) => Some(to),
         }
     }
+}
+
+/// Where a redirect from `base` to `location` leads, resolved as ureq-proto 0.7.1 (the client
+/// 0.40.10 followed redirects with) resolves it (`client::amended::join`): a whole address as it
+/// is; "//host/path" that host on the base's scheme; "/path" a path on the base's host; anything
+/// else against the base's folder, "." passed over and ".." a folder up, and refused above the
+/// root (so "?query" lands in the folder, as there). `None` where it refused.
+fn join(base: &ureq::http::Uri, location: &str) -> Option<String> {
+    if location.parse::<ureq::http::Uri>().ok().is_some_and(|uri| uri.scheme().is_some()) {
+        return Some(location.to_string());
+    }
+    let scheme = base.scheme_str()?;
+    if location.starts_with("//") {
+        let joined: ureq::http::Uri = format!("{scheme}:{location}").parse().ok()?;
+        return Some(joined.to_string());
+    }
+    let authority = base.authority()?;
+    let path = if location.starts_with('/') {
+        location.to_string()
+    } else {
+        let mut joiner: Vec<&str> = base.path().split('/').collect();
+        if joiner.len() > 1 {
+            joiner.pop();
+        }
+        for segment in location.split('/') {
+            match segment {
+                "." => {}
+                ".." if joiner.len() == 1 => return None,
+                ".." => {
+                    joiner.pop();
+                }
+                _ => joiner.push(segment),
+            }
+        }
+        joiner.join("/")
+    };
+    let joined: ureq::http::Uri = format!("{scheme}://{authority}{path}").parse().ok()?;
+    Some(joined.to_string())
 }
 
 impl Http for Public {
@@ -390,9 +416,20 @@ mod tests {
         }
         // A relative or "//host" place is resolved against the address that answered, then
         // judged by the same rule.
-        for (to, lands) in [("//b.example/x", "https://b.example/x"), ("next", "https://a.example/next"), ("?page=2", "https://a.example/start?page=2")] {
+        // ("?query" is resolved as the old client resolved it: in the place's folder.)
+        for (to, lands) in [("//b.example/x", "https://b.example/x"), ("next", "https://a.example/next"), ("?page=2", "https://a.example/?page=2")] {
             let (status, asked) = hops(vec![("https://a.example/start", to)]);
             assert_eq!((status, asked.last().map(String::as_str)), (200, Some(lands)), "a redirect to {to}");
+        }
+        // "../" and "./" are walked as the old client walked them, then judged.
+        for (to, lands) in [("../g", "https://a.example/d/g"), ("./h", "https://a.example/d/e/h"), ("../../../x", "")] {
+            let (status, asked) = hops(vec![("https://a.example/start", "/d/e/f"), ("https://a.example/d/e/f", to)]);
+            if lands.is_empty() {
+                // Above the root: not followed, as the old client didn't.
+                assert_eq!((status, asked.len()), (302, 2), "a redirect to {to}");
+            } else {
+                assert_eq!((status, asked.last().map(String::as_str)), (200, Some(lands)), "a redirect to {to}");
+            }
         }
         for to in ["//127.0.0.1/x", "//localhost/x", "//user@b.example/x"] {
             let (status, asked) = hops(vec![("https://a.example/start", to)]);
