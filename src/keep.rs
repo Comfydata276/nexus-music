@@ -1,12 +1,21 @@
-//! What's kept for Lidarr in the credential store: its API key. **It is kept with the origin
-//! it belongs to, in one entry**: the scheme, host and port of the address the key was typed
-//! for. A key is used only where the origin kept with it is the origin in use, so no order of
-//! failed or interrupted writes (the settings file and the credential store are written
-//! apart) can pair one address with another's key.
+//! What's kept for Lidarr in the credential store: its API key, and the token of the sign-in
+//! in front of it. **Each is kept with the origin it belongs to, in one entry**: the scheme,
+//! host and port of the address the key was typed for, or of the sign-in service the token was
+//! made at. A secret is used only where the origin kept with it is the origin in use, so no
+//! order of failed or interrupted writes (the settings file and the credential store are
+//! written apart) can pair one place with another's secret.
 //!
-//! A key kept by 0.40.10 has no origin. It is bound once, at the first start, to the address
-//! then configured, which is what 0.40.10 would have used it for (and, until that one write is
-//! made, used only there: changing the address binds or forgets it first, see `change`).
+//! A secret kept by 0.40.10 has no origin. It is bound once, at the first start, to the place
+//! then configured, which is what 0.40.10 would have used it for: the key to Lidarr's address
+//! (and, until that one write is made, used only there: changing the address binds or forgets
+//! it first, see `change`); the token to the saved sign-in service if that one is trusted
+//! (`Found::trusted`), and otherwise left unused.
+//!
+//! The token has one more rule: **one sign-in owns it at a time.** A renewal writes only if
+//! the entry still holds the token it renewed, and a sign-out's late tidying-up clears only the
+//! token it handed back, so that an old sign-in can neither write over nor clear a new one.
+
+use std::sync::{Arc, Mutex};
 
 /// The credential store, as this needs it: a seam, so that the tests can make any write fail.
 pub trait Vault: Send + Sync {
@@ -29,6 +38,7 @@ impl Vault for Store {
 }
 
 const KEY: &str = "lidarr-key";
+const TOKEN: &str = "lidarr-token";
 /// The first line of an entry that's kept with its origin; the second is the origin.
 const BOUND: &str = "nexus-bound-1";
 
@@ -135,10 +145,85 @@ pub fn change(vault: &dyn Vault, old: &str, new: &str, typed: &str, save_address
     Changed::Made { forgotten }
 }
 
+// ---- the sign-in's token -------------------------------------------------------------------------
+
+/// Every read and write of the token, together, so that "only if it still holds" is so.
+static SLOT: Mutex<()> = Mutex::new(());
+
+/// The token kept for the sign-in service at `service`, if it was made there.
+pub fn token(vault: &dyn Vault, service: &str) -> Option<String> {
+    let _slot = SLOT.lock().unwrap_or_else(|stuck| stuck.into_inner());
+    held(vault, service)
+}
+
+fn held(vault: &dyn Vault, service: &str) -> Option<String> {
+    let origin = origin_of(service)?;
+    match read(vault, TOKEN) {
+        Kept::Bound { origin: kept, secret } if kept == origin => Some(secret),
+        _ => None,
+    }
+}
+
+/// At the start: binds a token kept by 0.40.10 to the saved sign-in service, if that one is
+/// `trusted`; otherwise it's left unused (and cleared at a sign-out, sent nowhere).
+pub fn bind_old_token(vault: &dyn Vault, service: &str, trusted: bool) {
+    let _slot = SLOT.lock().unwrap_or_else(|stuck| stuck.into_inner());
+    if let (Kept::Old(secret), Some(origin), true) = (read(vault, TOKEN), origin_of(service), trusted) {
+        let _ = vault.write(TOKEN, &bound(&origin, &secret));
+    }
+}
+
+/// Keeps the token of a sign-in just made at `service`: from now on it's the one kept.
+pub fn keep_token(vault: &dyn Vault, service: &str, token: &str) -> bool {
+    let _slot = SLOT.lock().unwrap_or_else(|stuck| stuck.into_inner());
+    origin_of(service).is_some_and(|origin| vault.write(TOKEN, &bound(&origin, token)))
+}
+
+/// Takes the kept token away, whatever it is, and gives it if it was the one for `service`:
+/// a sign-out, or a sign-in being let go of.
+pub fn take_token(vault: &dyn Vault, service: &str) -> Option<String> {
+    let _slot = SLOT.lock().unwrap_or_else(|stuck| stuck.into_inner());
+    let token = held(vault, service);
+    if read(vault, TOKEN) != Kept::Nothing {
+        let _ = vault.write(TOKEN, "");
+    }
+    token
+}
+
+/// After a sign-out has handed `token` back: clears the entry only if it still holds that
+/// very token (its first clearing failed, say). Anything else there is a later sign-in's.
+pub fn clear_token_if(vault: &dyn Vault, token: &str) {
+    let _slot = SLOT.lock().unwrap_or_else(|stuck| stuck.into_inner());
+    if matches!(read(vault, TOKEN), Kept::Bound { secret, .. } | Kept::Old(secret) if secret == token) {
+        let _ = vault.write(TOKEN, "");
+    }
+}
+
+/// What a sign-in session at `service`, begun with `token`, does with each fresh token the
+/// service gives it (every renewal), or "" when the service stopped honouring it: written only
+/// if what's kept is still the token it renewed. One that's been signed out of, or replaced,
+/// writes and clears nothing.
+pub fn renewals(vault: Arc<dyn Vault>, service: String, token: String) -> impl Fn(&str) + Send + Sync + 'static {
+    let last = Mutex::new(token);
+    move |fresh: &str| {
+        let mut last = last.lock().unwrap_or_else(|stuck| stuck.into_inner());
+        let _slot = SLOT.lock().unwrap_or_else(|stuck| stuck.into_inner());
+        if held(&*vault, &service).as_deref() != Some(last.as_str()) {
+            return;
+        }
+        let written = match origin_of(&service) {
+            Some(origin) if !fresh.is_empty() => vault.write(TOKEN, &bound(&origin, fresh)),
+            _ => vault.write(TOKEN, ""),
+        };
+        if written {
+            *last = fresh.to_string();
+        }
+    }
+}
+
 #[cfg(test)]
 pub mod tests {
     use std::collections::HashMap;
-    use std::sync::Mutex;
 
     use super::*;
 
@@ -270,5 +355,82 @@ pub mod tests {
         assert_eq!(change(&vault, A, "https://lidarr.example.org:443/lidarr", "", &mut || true), Changed::Made { forgotten: false });
         assert_eq!(*vault.writes.lock().unwrap(), 0);
         assert_eq!(change(&vault, A, C, "", &mut || true), Changed::Made { forgotten: true });
+    }
+
+    const S: &str = "https://auth.example.org";
+
+    #[test]
+    fn a_token_is_used_only_at_the_service_it_was_made_at() {
+        let vault = with(&[]);
+        assert!(keep_token(&vault, S, "t1"));
+        assert_eq!(token(&vault, S).as_deref(), Some("t1"));
+        assert_eq!(token(&vault, "https://elsewhere.example.org"), None);
+        assert_eq!(token(&vault, "http://auth.example.org"), None);
+        // One kept by 0.40.10 is bound to a trusted service, and is otherwise left unused.
+        let vault = with(&[(TOKEN, "old")]);
+        assert_eq!(token(&vault, S), None);
+        bind_old_token(&vault, S, false);
+        assert_eq!(token(&vault, S), None);
+        assert_eq!(vault.read(TOKEN).as_deref(), Some("old"));
+        bind_old_token(&vault, S, true);
+        assert_eq!(token(&vault, S).as_deref(), Some("old"));
+    }
+
+    #[test]
+    fn a_renewal_writes_only_over_the_token_it_renewed() {
+        let vault: Arc<Memory> = Arc::new(with(&[]));
+        keep_token(&*vault, S, "t1");
+        let renew = renewals(vault.clone(), S.into(), "t1".into());
+        renew("t2");
+        assert_eq!(token(&*vault, S).as_deref(), Some("t2"));
+        // Signed out, and in again: the old session's late renewal writes nothing.
+        assert_eq!(take_token(&*vault, S).as_deref(), Some("t2"));
+        keep_token(&*vault, S, "new");
+        renew("t3");
+        assert_eq!(token(&*vault, S).as_deref(), Some("new"));
+        // Nor does its being turned away clear the new one.
+        renew("");
+        assert_eq!(token(&*vault, S).as_deref(), Some("new"));
+        // The new one's own renewals and ending are written.
+        let renew = renewals(vault.clone(), S.into(), "new".into());
+        renew("new2");
+        assert_eq!(token(&*vault, S).as_deref(), Some("new2"));
+        renew("");
+        assert_eq!(token(&*vault, S), None);
+    }
+
+    #[test]
+    fn a_sign_out_clears_only_the_sign_in_it_was_signing_out() {
+        let vault = with(&[]);
+        keep_token(&vault, S, "t1");
+        let handed_back = take_token(&vault, S).unwrap();
+        // A new sign-in meanwhile, while the old token's hand-back was slow.
+        keep_token(&vault, S, "new");
+        clear_token_if(&vault, &handed_back);
+        assert_eq!(token(&vault, S).as_deref(), Some("new"));
+        // Its own, still there (the first clearing failed): cleared.
+        let vault = Memory { fail: vec![2], ..with(&[]) };
+        keep_token(&vault, S, "t1");
+        let handed_back = take_token(&vault, S).unwrap();
+        assert_eq!(token(&vault, S).as_deref(), Some("t1"));
+        clear_token_if(&vault, &handed_back);
+        assert_eq!(token(&vault, S), None);
+    }
+
+    #[test]
+    fn a_token_left_behind_by_a_change_of_service_is_never_sent_to_the_new_one() {
+        // Moved from service A to B: B saved, and A's token not taken away (its write failed,
+        // or the app was closed first). Under B it isn't there.
+        let vault = Memory { fail: vec![2], ..with(&[]) };
+        keep_token(&vault, S, "token-a");
+        take_token(&vault, S);
+        assert_eq!(token(&vault, "https://auth.other.example.org"), None);
+        assert_eq!(token(&vault, S).as_deref(), Some("token-a"));
+        // Nor does a renewal of A's write it as B's.
+        let vault: Arc<Memory> = Arc::new(with(&[]));
+        keep_token(&*vault, S, "token-a");
+        let renew = renewals(vault.clone(), "https://auth.other.example.org".into(), "token-a".into());
+        renew("token-a2");
+        assert_eq!(token(&*vault, "https://auth.other.example.org"), None);
     }
 }

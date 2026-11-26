@@ -1459,25 +1459,29 @@ impl Controller {
     /// The sign-in in front of Lidarr, picked up from what's on file if it isn't in use yet.
     fn gate_session(&self, settings: &config::Settings) -> Option<std::sync::Arc<crate::gate::Session>> {
         let found = crate::gate::Found { service: settings.lidarr_gate.clone(), client: settings.lidarr_gate_client.clone() };
+        let trusted = !found.service.is_empty() && found.trusted(&settings.lidarr_address).is_ok();
+        // A token kept by 0.40.10 is bound to the saved service if that one is believed, and
+        // is otherwise left unused (see `keep`).
+        crate::keep::bind_old_token(&*self.vault(), &found.service, trusted);
         // One kept by an older version that isn't believed now is not used (see `Found::trusted`).
-        if found.service.is_empty() || found.trusted(&settings.lidarr_address).is_err() {
+        if !trusted {
             self.gate.replace(None);
             return None;
         }
         if let Some(session) = self.gate.borrow().as_ref().filter(|session| *session.found() == found) {
             return Some(session.clone());
         }
-        let token = config::load_secret(&self.paths, "lidarr-token")?;
+        let token = crate::keep::token(&*self.vault(), &found.service)?;
         let session = std::sync::Arc::new(self.new_gate(found, token));
         self.gate.replace(Some(session.clone()));
         Some(session)
     }
 
+    /// A session for the sign-in at `found`, begun with `token`: its renewals are written only
+    /// while the token kept is still the one it renewed (see `keep::renewals`).
     fn new_gate(&self, found: crate::gate::Found, token: String) -> crate::gate::Session {
-        let paths = self.paths.clone();
-        crate::gate::session(found, token, move |token| {
-            config::save_secret(&paths, "lidarr-token", token);
-        })
+        let keep = crate::keep::renewals(self.vault(), found.service.clone(), token.clone());
+        crate::gate::session(found, token, keep)
     }
 
     /// Shows where the connection to Lidarr stands: `state` picks the marker and the one
@@ -1592,7 +1596,8 @@ impl Controller {
             }
         }
         self.push_settings();
-        let signed_out = !self.settings.borrow().lidarr_gate.is_empty() && config::load_secret(&self.paths, "lidarr-token").is_none();
+        let service = self.settings.borrow().lidarr_gate.clone();
+        let signed_out = !service.is_empty() && crate::keep::token(&*self.vault(), &service).is_none();
         match (answer, gate) {
             (Ok(version), _) => self.requests_state("connected", &nexus_core::lidarr::connected(&version)),
             (Err(_), Some(Ok(Some(_)))) if by_hand => self.sign_in_requests(),
@@ -1634,7 +1639,11 @@ impl Controller {
         }
         match result {
             Ok(done) => {
-                config::save_secret(&self.paths, "lidarr-token", &done.token);
+                // From here this sign-in owns the token kept: whatever an earlier one still has
+                // on its way writes nothing.
+                if !crate::keep::keep_token(&*self.vault(), &found.service, &done.token) {
+                    self.toast("Couldn't save your sign-in; you'll need to sign in next time.");
+                }
                 self.settings.borrow_mut().lidarr_signed_in = done.name;
                 self.save_settings();
                 self.gate.replace(Some(std::sync::Arc::new(self.new_gate(found, done.token))));
@@ -1659,24 +1668,27 @@ impl Controller {
     fn drop_sign_in(&self) {
         crate::gate::new_round();
         let session = self.gate.replace(None);
-        let on_file = config::load_secret(&self.paths, "lidarr-token");
         let service = self.settings.borrow().lidarr_gate.clone();
-        // A token is handed back only to a sign-in that's believed (see `Found::trusted`).
+        // Whatever is kept goes; it's handed back only if it was made at this service, and that
+        // one is believed (see `Found::trusted`): otherwise it's sent nowhere.
+        let vault = self.vault();
+        let on_file = crate::keep::take_token(&*vault, &service);
         let believed = crate::gate::Found { service: service.clone(), client: String::new() }.trusted(&self.settings.borrow().lidarr_address).is_ok();
-        config::save_secret(&self.paths, "lidarr-token", "");
         self.settings.borrow_mut().lidarr_signed_in.clear();
         if session.is_none() && on_file.is_none() {
             return;
         }
-        let paths = self.paths.clone();
         self.api_pool.spawn(move || {
             // Closing waits out a renewal that's under way, so the token handed back is the
             // one that's good now.
             let token = session.map(|session| session.close()).filter(|token| !token.is_empty()).or(on_file);
-            if let Some(token) = token.filter(|_| believed) {
+            let Some(token) = token else { return };
+            if believed {
                 crate::gate::give_up_token(&crate::subsonic::make_agent_without_redirects(), &service, &token);
             }
-            config::save_secret(&paths, "lidarr-token", "");
+            // Cleared again only if it's still this very token (its first clearing failed):
+            // anything else there by now is a sign-in made meanwhile.
+            crate::keep::clear_token_if(&*vault, &token);
         });
     }
 
@@ -3721,7 +3733,7 @@ impl Controller {
         let gate = crate::gate::Found { service: settings.lidarr_gate.clone(), client: String::new() };
         page.set_lidarr_gate(gate.host().into());
         page.set_lidarr_signed_in(settings.lidarr_signed_in.as_str().into());
-        page.set_lidarr_has_token(!settings.lidarr_gate.is_empty() && config::load_secret(&self.paths, "lidarr-token").is_some());
+        page.set_lidarr_has_token(!settings.lidarr_gate.is_empty() && crate::keep::token(&*self.vault(), &settings.lidarr_gate).is_some());
         drop(settings);
         self.push_jam();
     }
