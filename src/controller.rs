@@ -429,6 +429,10 @@ pub struct Controller {
     gate: RefCell<Option<std::sync::Arc<crate::gate::Session>>>,
     /// How many sign-in sessions have been begun: part of what a Lidarr connection is made of.
     sign_ins: Cell<u64>,
+    /// Whether the key kept by 0.40.10 has been looked at, at this start; and the address it
+    /// belongs to if it couldn't be bound then (see `keep::bind_old_key`).
+    keys_looked_at: Cell<bool>,
+    key_old_for: RefCell<Option<String>>,
     suggestions: RefCell<Vec<Suggestion>>,
     preview_count: Cell<u64>,
     /// The same count, where the search thread can see it: a search that is no longer the
@@ -626,6 +630,8 @@ impl Controller {
             requests_check: Cell::new(0),
             gate: RefCell::new(None),
             sign_ins: Cell::new(0),
+            keys_looked_at: Cell::new(false),
+            key_old_for: RefCell::new(None),
             suggestions: RefCell::default(),
             preview_count: Cell::new(0),
             preview_latest: Default::default(),
@@ -1448,11 +1454,13 @@ impl Controller {
         let lidarr = {
             let settings = self.settings.borrow();
             let vault = self.vault();
-            // A key kept by 0.40.10 is bound to the address configured now, once. (If that
-            // write fails it's tried again at the next start, and used meanwhile only at this
-            // address: see `keep::change`.)
-            let _ = crate::keep::bind_old_key(&*vault, &settings.lidarr_address);
-            let key = crate::keep::key(&*vault, &settings.lidarr_address);
+            // At the start, a key kept by 0.40.10 is bound to the address configured then. If
+            // that can't be done (its write failed, or the store couldn't be read), it's used,
+            // unbound, for that address only, and tried again at the next start.
+            if !self.keys_looked_at.replace(true) && crate::keep::bind_old_key(&*vault, &settings.lidarr_address) == crate::keep::Bind::NotYet {
+                self.key_old_for.replace(Some(settings.lidarr_address.clone()));
+            }
+            let key = crate::keep::key(&*vault, &settings.lidarr_address, self.key_old_for.borrow().as_deref());
             // An address the app can't be sure of reaching as written isn't connected to.
             let usable = nexus_core::lidarr::origin(&settings.lidarr_address).is_ok();
             match (settings.requests && !settings.lidarr_address.trim().is_empty() && usable, key) {
@@ -3808,7 +3816,7 @@ impl Controller {
         page.set_requests(settings.requests);
         page.set_request_singles(settings.request_singles);
         page.set_lidarr_address(settings.lidarr_address.as_str().into());
-        page.set_lidarr_key_hint(crate::keep::key(&*self.vault(), &settings.lidarr_address).map(|key| crate::lidarr::mask(&key)).unwrap_or_default().into());
+        page.set_lidarr_key_hint(crate::keep::key(&*self.vault(), &settings.lidarr_address, self.key_old_for.borrow().as_deref()).map(|key| crate::lidarr::mask(&key)).unwrap_or_default().into());
         let gate = crate::gate::Found { service: settings.lidarr_gate.clone(), client: String::new() };
         page.set_lidarr_gate(gate.host().into());
         page.set_lidarr_signed_in(settings.lidarr_signed_in.as_str().into());

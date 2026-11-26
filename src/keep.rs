@@ -19,7 +19,9 @@ use std::sync::{Arc, Mutex};
 
 /// The credential store, as this needs it: a seam, so that the tests can make any write fail.
 pub trait Vault: Send + Sync {
-    fn read(&self, name: &str) -> Option<String>;
+    /// What's kept under `name`: there (`Ok(Some)`), not there (`Ok(None)`), or couldn't be
+    /// read (`Err`), which is not the same as not there.
+    fn read(&self, name: &str) -> Result<Option<String>, ()>;
     /// Writes `value` under `name` (empty: forgets it), and says whether that was done.
     fn write(&self, name: &str, value: &str) -> bool;
 }
@@ -28,8 +30,8 @@ pub trait Vault: Send + Sync {
 pub struct Store(pub crate::config::Paths);
 
 impl Vault for Store {
-    fn read(&self, name: &str) -> Option<String> {
-        crate::config::load_secret(&self.0, name)
+    fn read(&self, name: &str) -> Result<Option<String>, ()> {
+        crate::config::read_secret(&self.0, name)
     }
 
     fn write(&self, name: &str, value: &str) -> bool {
@@ -49,13 +51,16 @@ pub const NOT_SAVED: &str = "That couldn't be saved, so it hasn't been changed."
 #[derive(Debug, PartialEq)]
 enum Kept {
     Nothing,
+    /// Something may be kept, but the store couldn't say what: nothing may be taken for gone.
+    Unreadable,
     /// Kept by 0.40.10, with no origin.
     Old(String),
     Bound { origin: String, secret: String },
 }
 
 fn read(vault: &dyn Vault, name: &str) -> Kept {
-    match vault.read(name).filter(|value| !value.is_empty()) {
+    let Ok(value) = vault.read(name) else { return Kept::Unreadable };
+    match value.filter(|value| !value.is_empty()) {
         None => Kept::Nothing,
         Some(value) => match value.split_once('\n') {
             Some((BOUND, rest)) => match rest.split_once('\n') {
@@ -78,24 +83,34 @@ fn bound(origin: &str, secret: &str) -> String {
 
 // ---- the key ---------------------------------------------------------------------------------
 
-/// The key for Lidarr at `address`, if one is kept for its origin.
-pub fn key(vault: &dyn Vault, address: &str) -> Option<String> {
+/// The key for Lidarr at `address`, if one is kept for its origin. `old_for` is the address
+/// configured at this start if a key kept by 0.40.10 couldn't be bound to it then
+/// (`bind_old_key`): that key, still unbound, is used for that address and no other.
+pub fn key(vault: &dyn Vault, address: &str, old_for: Option<&str>) -> Option<String> {
     let origin = origin_of(address)?;
     match read(vault, KEY) {
         Kept::Bound { origin: kept, secret } if kept == origin => Some(secret),
-        // Not bound yet (its one write failed at the start): it belongs to the address in use,
-        // as `change` binds or forgets it before that is ever changed.
-        Kept::Old(secret) => Some(secret),
+        Kept::Old(secret) if old_for.and_then(origin_of).as_ref() == Some(&origin) => Some(secret),
         _ => None,
     }
 }
 
-/// At the start: binds a key kept by 0.40.10 to the address configured now. Says whether
-/// there was one, and it couldn't be bound.
-pub fn bind_old_key(vault: &dyn Vault, address: &str) -> bool {
+/// How binding a key kept by 0.40.10 went, at the start.
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum Bind {
+    /// Bound, or there was nothing to bind.
+    Done,
+    /// There's one, and it couldn't be bound (its write failed), or the store couldn't be read:
+    /// it's used, unbound, only for the address configured now, and tried again next start.
+    NotYet,
+}
+
+/// At the start: binds a key kept by 0.40.10 to the address configured now.
+pub fn bind_old_key(vault: &dyn Vault, address: &str) -> Bind {
     match (read(vault, KEY), origin_of(address)) {
-        (Kept::Old(secret), Some(origin)) => !vault.write(KEY, &bound(&origin, &secret)),
-        _ => false,
+        (Kept::Old(secret), Some(origin)) if !vault.write(KEY, &bound(&origin, &secret)) => Bind::NotYet,
+        (Kept::Unreadable, _) => Bind::NotYet,
+        _ => Bind::Done,
     }
 }
 
@@ -125,6 +140,9 @@ pub fn change(vault: &dyn Vault, old: &str, new: &str, typed: &str, save_address
     } else if origin_of(old) != origin_of(new) {
         match read(vault, KEY) {
             Kept::Nothing => {}
+            // What's kept can't be read: it may be a key for the old address, which a change
+            // now would leave behind for the new one. Not made.
+            Kept::Unreadable => return Changed::Not(NOT_SAVED),
             Kept::Bound { .. } => {
                 forgotten = true;
                 // (Bound to the old one: if it stays, it's never used for the new one.)
@@ -238,14 +256,19 @@ pub mod tests {
     #[derive(Default)]
     pub struct Memory {
         pub kept: Mutex<HashMap<String, String>>,
+        /// While set, nothing can be read.
+        pub unreadable: std::sync::atomic::AtomicBool,
         pub writes: Mutex<usize>,
         pub fail: Vec<usize>,
         pub stop: Option<usize>,
     }
 
     impl Vault for Memory {
-        fn read(&self, name: &str) -> Option<String> {
-            self.kept.lock().unwrap().get(name).cloned()
+        fn read(&self, name: &str) -> Result<Option<String>, ()> {
+            if self.unreadable.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(());
+            }
+            Ok(self.kept.lock().unwrap().get(name).cloned())
         }
 
         fn write(&self, name: &str, value: &str) -> bool {
@@ -278,32 +301,32 @@ pub mod tests {
     #[test]
     fn a_key_is_used_only_at_the_origin_it_was_kept_with() {
         let vault = with(&[(KEY, &bound("https://lidarr.example.org:443", "key-a"))]);
-        assert_eq!(key(&vault, A).as_deref(), Some("key-a"));
-        assert_eq!(key(&vault, "https://LIDARR.example.org:443/lidarr").as_deref(), Some("key-a"));
-        assert_eq!(key(&vault, B), None);
-        assert_eq!(key(&vault, C), None);
+        assert_eq!(key(&vault, A, None).as_deref(), Some("key-a"));
+        assert_eq!(key(&vault, "https://LIDARR.example.org:443/lidarr", None).as_deref(), Some("key-a"));
+        assert_eq!(key(&vault, B, None), None);
+        assert_eq!(key(&vault, C, None), None);
     }
 
     #[test]
     fn a_key_kept_by_0_40_10_is_bound_once_to_the_address_then_configured() {
         let vault = with(&[(KEY, "key-old")]);
-        assert_eq!(key(&vault, A).as_deref(), Some("key-old"));
-        assert!(!bind_old_key(&vault, A));
-        assert_eq!(key(&vault, A).as_deref(), Some("key-old"));
-        assert_eq!(key(&vault, C), None);
+        assert_eq!(bind_old_key(&vault, A), Bind::Done);
+        assert_eq!(key(&vault, A, None).as_deref(), Some("key-old"));
+        assert_eq!(key(&vault, C, None), None);
         // Once: bound, it isn't bound again to whatever is configured next.
-        assert!(!bind_old_key(&vault, C));
-        assert_eq!((key(&vault, A).as_deref(), key(&vault, C)), (Some("key-old"), None));
-        // Its one write failing is said.
+        assert_eq!(bind_old_key(&vault, C), Bind::Done);
+        assert_eq!((key(&vault, A, None).as_deref(), key(&vault, C, None)), (Some("key-old"), None));
+        // Its one write failing: used, unbound, for the address configured at this start only.
         let failing = Memory { fail: vec![1], ..with(&[(KEY, "key-old")]) };
-        assert!(bind_old_key(&failing, A));
+        assert_eq!(bind_old_key(&failing, A), Bind::NotYet);
+        assert_eq!((key(&failing, A, Some(A)).as_deref(), key(&failing, C, Some(A))), (Some("key-old"), None));
     }
 
     /// What's on the disk after a change, read as the next start reads it: the address, and
     /// the key that would be sent to it.
     fn next_start(vault: &Memory, address: &str) -> (String, Option<String>) {
-        bind_old_key(vault, address);
-        (address.to_string(), key(vault, address))
+        let old_for = (bind_old_key(vault, address) == Bind::NotYet).then_some(address);
+        (address.to_string(), key(vault, address, old_for))
     }
 
     #[test]
@@ -352,7 +375,7 @@ pub mod tests {
         let mut saved = false;
         assert_eq!(change(&vault, A, C, "key-c", &mut || { saved = true; true }), Changed::Not(NOT_SAVED));
         assert!(!saved);
-        assert_eq!(key(&vault, A).as_deref(), Some("key-a"));
+        assert_eq!(key(&vault, A, None).as_deref(), Some("key-a"));
         // An old key that can be neither bound nor let go of stops a change of origin.
         let vault = Memory { fail: vec![1, 2], ..with(&[(KEY, "key-a")]) };
         assert_eq!(change(&vault, A, C, "", &mut || { saved = true; true }), Changed::Not(NOT_SAVED));
@@ -361,6 +384,30 @@ pub mod tests {
         assert_eq!(change(&vault, A, "https://lidarr.example.org:443/lidarr", "", &mut || true), Changed::Made { forgotten: false });
         assert_eq!(*vault.writes.lock().unwrap(), 0);
         assert_eq!(change(&vault, A, C, "", &mut || true), Changed::Made { forgotten: true });
+    }
+
+    #[test]
+    fn a_key_that_couldnt_be_read_is_not_taken_for_none() {
+        use std::sync::atomic::Ordering;
+        // A 0.40.10 key, and the first read at the start fails: nothing is bound.
+        let vault = with(&[(KEY, "key-a")]);
+        vault.unreadable.store(true, Ordering::SeqCst);
+        assert_eq!(bind_old_key(&vault, A), Bind::NotYet);
+        // The address is changed, no key typed, while the store still can't be read: not made,
+        // and said as a change that couldn't be saved.
+        let mut on_disk = A.to_string();
+        assert_eq!(change(&vault, A, C, "", &mut || { on_disk = C.to_string(); true }), Changed::Not(NOT_SAVED));
+        assert_eq!(on_disk, A);
+        // Readable again: the next start binds it to the address it was kept for, and C never
+        // has it.
+        vault.unreadable.store(false, Ordering::SeqCst);
+        assert_eq!(next_start(&vault, &on_disk), (A.to_string(), Some("key-a".to_string())));
+        assert_eq!(key(&vault, C, None), None);
+        // A key typed with the new address needs nothing read: it replaces what's kept.
+        vault.unreadable.store(true, Ordering::SeqCst);
+        assert!(matches!(change(&vault, A, C, "key-c", &mut || true), Changed::Made { .. }));
+        vault.unreadable.store(false, Ordering::SeqCst);
+        assert_eq!(next_start(&vault, C).1.as_deref(), Some("key-c"));
     }
 
     const S: &str = "https://auth.example.org";
@@ -378,7 +425,7 @@ pub mod tests {
         bind_old_token(&vault, S, false);
         assert_eq!(token(&vault, S), None);
         assert!(any_kept(&vault));
-        assert_eq!(vault.read(TOKEN).as_deref(), Some("old"));
+        assert_eq!(vault.read(TOKEN), Ok(Some("old".to_string())));
         bind_old_token(&vault, S, true);
         assert_eq!(token(&vault, S).as_deref(), Some("old"));
     }

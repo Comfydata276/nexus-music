@@ -1142,6 +1142,26 @@ pub fn save_secret(paths: &Paths, name: &str, value: &str) -> bool {
     }
 }
 
+/// A secret kept by `save_secret`: there, not there (`Ok(None)`), or couldn't be read (`Err`).
+#[cfg(windows)]
+pub fn read_secret(_paths: &Paths, name: &str) -> Result<Option<String>, ()> {
+    let entry = keyring::Entry::new(KEYRING_SERVICE, &format!("secret:{name}")).map_err(drop)?;
+    match entry.get_password() {
+        Ok(value) => Ok(Some(value)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(_) => Err(()),
+    }
+}
+
+#[cfg(not(windows))]
+pub fn read_secret(paths: &Paths, name: &str) -> Result<Option<String>, ()> {
+    match fs::read_to_string(paths.secret.with_file_name(format!("secret-{name}"))) {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(()),
+    }
+}
+
 #[cfg(not(windows))]
 pub fn load_secret(paths: &Paths, name: &str) -> Option<String> {
     fs::read_to_string(paths.secret.with_file_name(format!("secret-{name}"))).ok().filter(|value| !value.is_empty())
