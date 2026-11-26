@@ -19,9 +19,15 @@
 //! [`WAIT_MS`](super::WAIT_MS) with no answer the device looks once ([`Tick::Check`]) and
 //! says what is true ([`Outcome`]). It never sends the command again by itself; and an
 //! answer that arrives after that is still believed.
+//!
+//! **Only a device that speaks as this one does** (`docs/linking-design.md`, 5.10; a tell's
+//! `speaks`). A state from one that does not is shown, and nothing is made against it
+//! ([`Wait::Speaks`]). An answer from one that does not never says a command was carried
+//! out, whatever it says: two generations read `ok`, `by` and `done` differently, which
+//! is what makes them two. What became of the command is then not known.
 
 use super::command::Command;
-use super::message::{At, Tell, Why};
+use super::message::{At, SPEAKS, Tell, Why};
 use super::{FRESH_MS, Nonce, WAIT_MS};
 
 /// The most looks waited on at once for one device. An older one is forgotten.
@@ -59,6 +65,9 @@ pub enum Wait {
     /// The last command has not been answered or given up on, and as many presses as are
     /// kept are waiting behind it already.
     Unanswered,
+    /// The other device does not speak as this one does (it says this number): nothing is
+    /// sent to it but looks, until both are up to date (5.10).
+    Speaks(u64),
 }
 
 /// What a press comes to.
@@ -126,6 +135,8 @@ struct Base {
     at: At,
     busy: bool,
     ms: u64,
+    /// How the device that said it speaks.
+    speaks: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -179,6 +190,9 @@ impl Peer {
         let Some(base) = &self.base else { return Err(Wait::Look) };
         if !now_ms.checked_sub(base.ms).is_some_and(|age| age < FRESH_MS) {
             return Err(Wait::Look);
+        }
+        if base.speaks != SPEAKS {
+            return Err(Wait::Speaks(base.speaks));
         }
         if base.busy {
             return Err(Wait::Busy);
@@ -270,6 +284,18 @@ impl Peer {
         if let Some(command) = &mut self.command
             && command.nonce == re
         {
+            // From a device that does not speak as this one does, it is not read: once,
+            // it says that what became of the command is not known. (A success in this
+            // device's own generation, if one comes, is still believed.)
+            if tell.speaks != SPEAKS {
+                if command.answered || command.outcome == Some(Outcome::Done) {
+                    return Told::Dropped;
+                }
+                command.answered = true;
+                command.outcome = Some(Outcome::Unknown);
+                self.pressed.clear();
+                return Told::Settled(Outcome::Unknown);
+            }
             // A success is believed whenever it comes, once: a refusal that got here first (of
             // a repeat the relay's path made, say) does not stand against it. A refusal is
             // believed once, and never over a success. **Success is what the device says
@@ -294,7 +320,7 @@ impl Peer {
             command.outcome = Some(outcome);
             if done {
                 // What it says of the device is the state the next command is made against.
-                self.base = Some(Base { at: tell.at, busy: tell.busy, ms: command.sent_ms });
+                self.base = Some(Base { at: tell.at, busy: tell.busy, ms: command.sent_ms, speaks: tell.speaks });
             } else {
                 self.pressed.clear();
             }
@@ -305,7 +331,11 @@ impl Peer {
         let (_, sent_ms) = self.looks.remove(waiting);
         let settled = self.command.as_mut().filter(|command| command.outcome.is_none()).and_then(|command| {
             let checked = command.check.is_some_and(|(check, _)| check == re);
-            let outcome = if tell.by == Some(command.nonce) && tell.done {
+            let outcome = if tell.speaks != SPEAKS {
+                // (Not read, whatever it names: the look that was to say what became of
+                // the command has not said, and no other look says anything of it.)
+                if checked { Outcome::Unknown } else { return None }
+            } else if tell.by == Some(command.nonce) && tell.done {
                 Outcome::Done
             } else if checked && tell.by == Some(command.nonce) && tell.busy && command.checks + 1 < MOST_CHECKS {
                 // It made the state, and its work is still under way there (a queue taken
@@ -334,7 +364,7 @@ impl Peer {
         if newer {
             // A state to act on only if it was asked for after the last command was sent.
             if self.command.as_ref().is_none_or(|command| sent_ms > command.sent_ms) {
-                self.base = Some(Base { at: tell.at, busy: tell.busy, ms: sent_ms });
+                self.base = Some(Base { at: tell.at, busy: tell.busy, ms: sent_ms, speaks: tell.speaks });
             }
             self.shown = Some(Shown { tell, sent_ms });
         }
@@ -357,7 +387,7 @@ mod tests {
     const PAUSE: Nonce = [9; 24];
 
     fn state(generation: u64, re: Nonce) -> Tell {
-        Tell { re: Some(re), ok: None, why: None, device: [7; 16], name: "Study PC".into(), at: At { generation, minute: 0 }, busy: false, by: None, done: false, playing: true, title: "Song".into(), artist: "Artist".into(), steering: String::new(), full: None, queue: None }
+        Tell { re: Some(re), ok: None, why: None, device: [7; 16], name: "Study PC".into(), speaks: SPEAKS, at: At { generation, minute: 0 }, busy: false, by: None, done: false, playing: true, title: "Song".into(), artist: "Artist".into(), steering: String::new(), full: None, queue: None }
     }
 
     /// A peer that has been looked at once, at `sent`, and answered with generation 5.
@@ -386,6 +416,44 @@ mod tests {
         peer.looked(LOOK, 100);
         assert_eq!(peer.told(state(5, LOOK)), Told::Shown);
         assert_eq!(peer.may_send(200), Ok(At { generation: 5, minute: 0 }));
+    }
+
+    /// 5.10: a state from a device that speaks otherwise is shown, and nothing is made
+    /// against it. Its answers settle nothing as done.
+    #[test]
+    fn nothing_is_made_against_a_state_from_another_generation_and_its_answers_say_nothing_was_done() {
+        for theirs in [1, SPEAKS + 1] {
+            let mut peer = Peer::default();
+            peer.looked(LOOK, 0);
+            assert_eq!(peer.told(Tell { speaks: theirs, ..state(5, LOOK) }), Told::Shown);
+            assert_eq!(peer.shown().map(|shown| shown.tell.speaks), Some(theirs));
+            assert_eq!(peer.may_send(100), Err(Wait::Speaks(theirs)));
+            assert_eq!(peer.press(&Command::Pause, 100), Press::No(Wait::Speaks(theirs)));
+            // Looked at again once it speaks as this device does: as any other.
+            peer.looked(LOOK_2, 1_000);
+            assert_eq!(peer.told(state(5, LOOK_2)), Told::Shown);
+            assert!(peer.may_send(1_100).is_ok());
+            // The command's own answer, saying `ok` in another generation: what became of
+            // the command is not known, and nothing is made against what it says.
+            let mut peer = paused();
+            assert_eq!(peer.press(&Command::Next, 1_100), Press::Waits);
+            assert_eq!(peer.told(Tell { ok: Some(true), by: Some(PAUSE), done: true, speaks: theirs, ..state(6, PAUSE) }), Told::Settled(Outcome::Unknown));
+            assert_eq!((peer.outcome(), peer.pressed(), peer.may_send(1_200)), (Some(Outcome::Unknown), 0, Err(Wait::Look)));
+            // (A success in this device's own generation is still believed when it comes.)
+            assert_eq!(peer.told(Tell { ok: Some(true), ..state(6, PAUSE) }), Told::Settled(Outcome::Done));
+            // The look that checks on an unanswered command, answered "it made my state,
+            // to its end" in another generation: not known, and never done.
+            let mut peer = paused();
+            assert_eq!(peer.tick(1_000 + WAIT_MS), Tick::Check);
+            peer.checking(LOOK_2, 1_000 + WAIT_MS);
+            assert_eq!(peer.told(Tell { by: Some(PAUSE), done: true, speaks: theirs, ..state(6, LOOK_2) }), Told::ShownAndSettled(Outcome::Unknown));
+            assert_eq!(peer.may_send(1_100 + WAIT_MS), Err(Wait::Speaks(theirs)));
+            // And an ordinary look's answer that names the command so settles nothing.
+            let mut peer = paused();
+            peer.looked(LOOK_2, 2_000);
+            assert_eq!(peer.told(Tell { by: Some(PAUSE), done: true, speaks: theirs, ..state(6, LOOK_2) }), Told::Shown);
+            assert!(peer.waiting());
+        }
     }
 
     #[test]

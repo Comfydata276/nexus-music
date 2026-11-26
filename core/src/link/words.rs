@@ -3,7 +3,7 @@
 //!
 //! The only difference between them is what a device calls itself ([`Here`]).
 
-use super::message::{Tell, Why};
+use super::message::{SPEAKS, Tell, Why};
 use super::moving::Gave;
 use super::secret::Stop;
 use super::steer::{Outcome, Wait};
@@ -90,12 +90,31 @@ pub fn about(tell: &Tell, age_s: u64) -> String {
 }
 
 /// Why something could not be asked of a device just now.
-pub fn not_sent(wait: Wait, name: &str) -> String {
+pub fn not_sent(wait: Wait, name: &str, here: Here) -> String {
     match wait {
         Wait::Look => format!("Looking at {name} first. Press again in a moment."),
         Wait::Busy => format!("{name} is in the middle of something. Press again in a moment."),
         Wait::Unanswered => format!("Still waiting for {name} to answer."),
+        Wait::Speaks(theirs) => update_to_control(name, theirs, here, true),
     }
+}
+
+/// What is said of a device that does not speak as this one does (5.10): which of the two
+/// to update. It is the one whose number is lower; this one knows it is behind when the
+/// other's is higher than its own. `named`: said where the device is not already named
+/// (anywhere but under its own row in the list).
+pub fn update_to_control(name: &str, theirs: u64, here: Here, named: bool) -> String {
+    match (theirs > SPEAKS, named) {
+        (false, _) => format!("Update Nexus Music on {name} to control it from here"),
+        (true, false) => format!("Update Nexus Music on {} to control it from here", here.this_lower()),
+        (true, true) => format!("Update Nexus Music on {} to control {name} from here", here.this_lower()),
+    }
+}
+
+/// "Play here", when the device being steered turns out not to speak as this one does:
+/// nothing is moved.
+pub fn update_to_move(name: &str, theirs: u64, here: Here) -> String {
+    format!("{}. Nothing was moved.", update_to_control(name, theirs, here, true))
 }
 
 pub fn asked_to_pause(name: &str) -> String {
@@ -224,7 +243,7 @@ mod tests {
     use super::*;
 
     fn state(playing: bool) -> Tell {
-        Tell { re: None, ok: None, why: None, device: [7; 16], name: "Study PC".into(), at: At { generation: 4, minute: 0 }, busy: false, by: None, done: false, playing, title: "Harbour Lights".into(), artist: "The Tide".into(), steering: String::new(), full: None, queue: None }
+        Tell { re: None, ok: None, why: None, device: [7; 16], name: "Study PC".into(), speaks: SPEAKS, at: At { generation: 4, minute: 0 }, busy: false, by: None, done: false, playing, title: "Harbour Lights".into(), artist: "The Tide".into(), steering: String::new(), full: None, queue: None }
     }
 
     #[test]
@@ -276,6 +295,21 @@ mod tests {
         assert_eq!(stopped(Stop::Later, Here::Pc), "Update Nexus Music on this PC to link it with your other devices.");
         assert_eq!(none_of_those_songs("Study PC", Here::Pc), "This PC's library has none of those songs. Study PC is still playing.");
         assert_eq!((added(1, "Den"), added(3, "Den")), ("Added to the queue on Den".to_string(), "Added 3 songs to the queue on Den".to_string()));
-        assert_eq!(not_sent(Wait::Unanswered, "Den"), "Still waiting for Den to answer.");
+        assert_eq!(not_sent(Wait::Unanswered, "Den", Here::Pc), "Still waiting for Den to answer.");
+    }
+
+    /// 5.10: the device to update is the one that is behind, and each sentence names it.
+    #[test]
+    fn a_device_of_another_generation_is_said_as_which_one_to_update() {
+        // Under the device's own row in the list.
+        assert_eq!(update_to_control("Study PC", 1, Here::Pc, false), "Update Nexus Music on Study PC to control it from here");
+        assert_eq!(update_to_control("Study PC", SPEAKS + 1, Here::Pc, false), "Update Nexus Music on this PC to control it from here");
+        assert_eq!(update_to_control("Study PC", SPEAKS + 1, Here::Phone, false), "Update Nexus Music on this phone to control it from here");
+        // Anywhere else: the other device is named.
+        assert_eq!(update_to_control("Study PC", 1, Here::Phone, true), "Update Nexus Music on Study PC to control it from here");
+        assert_eq!(update_to_control("Study PC", SPEAKS + 1, Here::Phone, true), "Update Nexus Music on this phone to control Study PC from here");
+        assert_eq!(not_sent(Wait::Speaks(1), "Den", Here::Pc), "Update Nexus Music on Den to control it from here");
+        assert_eq!(not_sent(Wait::Speaks(SPEAKS + 1), "Den", Here::Pc), "Update Nexus Music on this PC to control Den from here");
+        assert_eq!(update_to_move("Den", 1, Here::Pc), "Update Nexus Music on Den to control it from here. Nothing was moved.");
     }
 }

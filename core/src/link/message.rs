@@ -13,12 +13,35 @@
 //!
 //! Fields a version doesn't know are ignored. A message that breaks its shape is not
 //! guessed at: an ask that opened is answered `invalid`, a tell is dropped.
+//!
+//! **Every ask and every tell says how its sender speaks** ([`SPEAKS`]): one number, which
+//! moves only when the meaning of something already said changes. What is done with it is
+//! `super::device`'s and `super::steer`'s; here it is written, and read.
 
 use serde_json::{Map, Value, json};
 
 pub use super::command::{Adopt, Command, MOST_MESSAGE};
 use super::command::{MOST_CONTEXT, id_ok};
 use super::{DeviceId, Nonce, text};
+
+/// How this build speaks (`docs/linking-design.md`, 5.10): 2, for the first build that is
+/// ever switched on. **It moves only when the meaning of something already said changes**
+/// (as `done` changed what `by` means), never when something is added that an older
+/// reader can ignore. Two devices steer each other, and hand music to each other, only if
+/// their numbers are the same.
+pub const SPEAKS: u64 = 2;
+/// How a device speaks that does not say: every build from before the number was said.
+pub const SPEAKS_UNSAID: u64 = 1;
+
+/// How the sender of a message speaks: what it says, or 1 if it does not say. `None` if
+/// it says something that is not such a number (a whole number from 1): the message
+/// breaks its shape.
+fn speaks(fields: &Map<String, Value>) -> Option<u64> {
+    match fields.get("speaks") {
+        None => Some(SPEAKS_UNSAID),
+        Some(said) => said.as_u64().filter(|said| *said >= 1),
+    }
+}
 
 /// The most characters of a name, a title or an artist.
 pub const MOST_TEXT: usize = 80;
@@ -73,10 +96,11 @@ pub enum Ask {
 impl Ask {
     pub fn text(&self) -> String {
         match self {
-            Ask::Look(want) => json!({"t": "look", "want": want.text()}).to_string(),
+            Ask::Look(want) => json!({"t": "look", "want": want.text(), "speaks": SPEAKS}).to_string(),
             Ask::Do { command, at } => {
                 let mut fields = Map::new();
                 fields.insert("t".into(), json!("do"));
+                fields.insert("speaks".into(), json!(SPEAKS));
                 fields.insert("do".into(), json!(command.name()));
                 fields.insert("at".into(), json!([at.generation, at.minute]));
                 if let Some(with) = command.with() {
@@ -95,28 +119,30 @@ fn at(value: &Value) -> Option<At> {
     }
 }
 
-/// Reads an ask that opened. `None` is "not an ask this version carries out": the device
-/// answers `invalid` and does nothing.
-pub fn read_ask(message: &[u8]) -> Option<Ask> {
+/// Reads an ask that opened, and how its sender speaks. `None` is "not an ask this version
+/// carries out": the device answers `invalid` and does nothing.
+pub fn read_ask(message: &[u8]) -> Option<(Ask, u64)> {
     // (Nothing bigger than the biggest there is gets as far as being read.)
     if message.len() > MOST_MESSAGE {
         return None;
     }
     let Ok(Value::Object(fields)) = serde_json::from_slice(message) else { return None };
-    match fields.get("t")?.as_str()? {
+    let speaks = speaks(&fields)?;
+    let ask = match fields.get("t")?.as_str()? {
         "look" if message.len() <= MOST_LOOK => {
             let want = fields.get("want")?.as_str()?;
-            [Want::Brief, Want::Full, Want::Queue].into_iter().find(|known| known.text() == want).map(Ask::Look)
+            [Want::Brief, Want::Full, Want::Queue].into_iter().find(|known| known.text() == want).map(Ask::Look)?
         }
         "do" => {
             let name = fields.get("do")?.as_str()?;
             if message.len() > Command::most(name) {
                 return None;
             }
-            Some(Ask::Do { command: Command::read(name, fields.get("with"))?, at: at(fields.get("at")?)? })
+            Ask::Do { command: Command::read(name, fields.get("with"))?, at: at(fields.get("at")?)? }
         }
-        _ => None,
-    }
+        _ => return None,
+    };
+    Some((ask, speaks))
 }
 
 /// Why a command was not carried out.
@@ -326,6 +352,8 @@ pub struct Tell {
     pub why: Option<Why>,
     pub device: DeviceId,
     pub name: String,
+    /// How the device speaks ([`SPEAKS`]): 1, if it did not say.
+    pub speaks: u64,
     pub at: At,
     /// A choice has been accepted and not yet carried out, or its work is still under way.
     pub busy: bool,
@@ -365,6 +393,7 @@ impl Tell {
         }
         fields.insert("device".into(), json!(text::base64(&self.device)));
         fields.insert("name".into(), json!(text::cut(&self.name, MOST_TEXT)));
+        fields.insert("speaks".into(), json!(self.speaks));
         fields.insert("at".into(), json!([self.at.generation, self.at.minute]));
         if self.busy {
             fields.insert("busy".into(), json!(true));
@@ -441,6 +470,7 @@ pub fn read_tell(message: &[u8]) -> Option<Tell> {
         why,
         device: text::read_id(fields.get("device")?.as_str()?)?,
         name: text::cut(fields.get("name")?.as_str()?, MOST_TEXT),
+        speaks: speaks(&fields)?,
         at: at(fields.get("at")?)?,
         busy: flag("busy")?.unwrap_or(false),
         by: nonce("by")?,
@@ -473,27 +503,105 @@ mod tests {
     const MOST_TELL: usize = MOST_BRIEF;
 
     fn tell() -> Tell {
-        Tell { re: Some([0x60; 24]), ok: Some(true), why: None, device: [0x81; 16], name: "Phone".into(), at: At { generation: 8, minute: 12 }, busy: false, by: Some([0x60; 24]), done: true, playing: false, title: "Song".into(), artist: "Artist".into(), steering: String::new(), full: None, queue: None }
+        Tell { re: Some([0x60; 24]), ok: Some(true), why: None, device: [0x81; 16], name: "Phone".into(), speaks: SPEAKS, at: At { generation: 8, minute: 12 }, busy: false, by: Some([0x60; 24]), done: true, playing: false, title: "Song".into(), artist: "Artist".into(), steering: String::new(), full: None, queue: None }
     }
 
     #[test]
     fn the_asks_are_written_and_read() {
         let pause = Ask::Do { command: Command::Pause, at: At { generation: 7, minute: 12 } };
-        assert_eq!(Ask::Look(Want::Brief).text(), r#"{"t":"look","want":"brief"}"#);
-        assert_eq!(pause.text(), r#"{"at":[7,12],"do":"pause","t":"do"}"#);
+        assert_eq!(Ask::Look(Want::Brief).text(), r#"{"speaks":2,"t":"look","want":"brief"}"#);
+        assert_eq!(pause.text(), r#"{"at":[7,12],"do":"pause","speaks":2,"t":"do"}"#);
         for want in [Want::Brief, Want::Full, Want::Queue] {
             let look = Ask::Look(want);
             assert!(look.text().len() <= 64);
-            assert_eq!(read_ask(look.text().as_bytes()), Some(look));
+            assert_eq!(read_ask(look.text().as_bytes()), Some((look, SPEAKS)));
         }
-        assert_eq!(read_ask(pause.text().as_bytes()), Some(pause.clone()));
-        // As the design's vector writes it, with an empty `with` and a field not known.
-        assert_eq!(read_ask(br#"{"t":"do","do":"pause","at":[7,12],"with":{},"later":[1]}"#), Some(pause));
+        assert_eq!(read_ask(pause.text().as_bytes()), Some((pause.clone(), SPEAKS)));
+        // As the design's vector writes it, with an empty `with` and a field not known:
+        // and from a device that does not say how it speaks, which is one that speaks 1.
+        assert_eq!(read_ask(br#"{"t":"do","do":"pause","at":[7,12],"with":{},"later":[1]}"#), Some((pause, 1)));
         assert!(Ask::Do { command: Command::Pause, at: At { generation: u64::MAX, minute: u64::MAX } }.text().len() <= MOST_ASK);
         // A command that takes something with it.
         let seek = Ask::Do { command: Command::Seek { to: 61.5 }, at: At { generation: 7, minute: 12 } };
-        assert_eq!(seek.text(), r#"{"at":[7,12],"do":"seek","t":"do","with":{"to":61.5}}"#);
-        assert_eq!(read_ask(seek.text().as_bytes()), Some(seek));
+        assert_eq!(seek.text(), r#"{"at":[7,12],"do":"seek","speaks":2,"t":"do","with":{"to":61.5}}"#);
+        assert_eq!(read_ask(seek.text().as_bytes()), Some((seek, SPEAKS)));
+    }
+
+    /// 5.10: one number in every ask and every tell. Left out, it is 1; there and not such
+    /// a number, the message breaks its shape like any other.
+    #[test]
+    fn every_ask_and_every_tell_says_how_its_sender_speaks() {
+        let at = At { generation: 7, minute: 12 };
+        let id = "x".repeat(64);
+        let asks = [
+            Ask::Look(Want::Brief),
+            Ask::Look(Want::Queue),
+            Ask::Do { command: Command::Pause, at },
+            Ask::Do { command: Command::Moved, at },
+            Ask::Do { command: Command::Add { ids: vec![id.clone(); 50], next: true }, at },
+            Ask::Do { command: Command::Adopt(Adopt::fitted(&[id.clone(), id.clone()], 0, 1, 3.5, "An album").unwrap().0), at },
+        ];
+        for ask in asks {
+            let said: Value = serde_json::from_str(&ask.text()).unwrap();
+            assert_eq!(said.get("speaks"), Some(&json!(SPEAKS)), "{}", &ask.text()[..40]);
+            assert_eq!(read_ask(ask.text().as_bytes()), Some((ask, SPEAKS)));
+        }
+        for told in [tell(), Tell { re: None, ok: None, by: None, done: false, ..tell() }, Tell { ok: Some(false), why: Some(Why::Invalid), ..tell() }, Tell { queue: Some(Handed::fitted(&[id.clone()], 0, 0.0, "")), ..tell() }] {
+            let said: Value = serde_json::from_str(&told.text()).unwrap();
+            assert_eq!(said.get("speaks"), Some(&json!(SPEAKS)));
+            assert_eq!(read_tell(told.text().as_bytes()).map(|read| read.speaks), Some(SPEAKS));
+        }
+        // What a device says is what is read, whatever the number; and nothing said is 1.
+        assert_eq!(read_ask(br#"{"t":"look","want":"brief"}"#), Some((Ask::Look(Want::Brief), 1)));
+        assert_eq!(read_ask(br#"{"t":"look","want":"brief","speaks":3}"#), Some((Ask::Look(Want::Brief), 3)));
+        assert_eq!(read_ask(br#"{"t":"do","do":"pause","at":[7,12],"speaks":1}"#), Some((Ask::Do { command: Command::Pause, at }, 1)));
+        let unsaid = r#"{"device":"gYGBgYGBgYGBgYGBgYGBgQ","name":"Phone","at":[8,12],"playing":false}"#;
+        assert_eq!(read_tell(unsaid.as_bytes()).map(|read| read.speaks), Some(1));
+        assert_eq!(read_tell(unsaid.replace(r#""playing":false"#, r#""playing":false,"speaks":7"#).as_bytes()).map(|read| read.speaks), Some(7));
+        // Not such a number: not guessed at.
+        for wrong in ["0", "-1", "2.5", r#""2""#, "null", "[2]", "true"] {
+            assert_eq!(read_ask(format!(r#"{{"t":"look","want":"brief","speaks":{wrong}}}"#).as_bytes()), None, "{wrong}");
+            assert_eq!(read_ask(format!(r#"{{"t":"do","do":"pause","at":[7,12],"speaks":{wrong}}}"#).as_bytes()), None, "{wrong}");
+            assert_eq!(read_tell(unsaid.replace(r#""playing":false"#, &format!(r#""playing":false,"speaks":{wrong}"#)).as_bytes()), None, "{wrong}");
+        }
+    }
+
+    /// The number is room every message already had: the biggest of each kind still fits
+    /// what its kind is allowed, as an older reader counts it too.
+    #[test]
+    fn saying_how_it_speaks_puts_no_message_over_its_size() {
+        let most = At { generation: u64::MAX, minute: u64::MAX };
+        let id = "x".repeat(64);
+        for want in [Want::Brief, Want::Full, Want::Queue] {
+            assert!(Ask::Look(want).text().len() <= MOST_LOOK);
+        }
+        let simple = [
+            Command::Moved,
+            Command::Seek { to: 86_399.999_999 },
+            Command::Volume { to: 0.123_456_789_012 },
+            Command::Jump { at: 100_000, id: id.clone() },
+            Command::Remove { at: 100_000, id: id.clone() },
+            Command::Move { from: 100_000, to: 100_000, queued: false, id: id.clone() },
+            Command::Clear { queued: false },
+            Command::Shuffle { on: false },
+            Command::Repeat { mode: 2 },
+        ];
+        for command in simple {
+            let ask = Ask::Do { command, at: most };
+            assert!(ask.text().len() <= MOST_ASK, "{}: {}", ask.text(), ask.text().len());
+            assert!(read_ask(ask.text().as_bytes()).is_some());
+        }
+        let add = Ask::Do { command: Command::Add { ids: vec![id.clone(); 50], next: false }, at: most };
+        assert!(add.text().len() <= super::super::command::MOST_ADD, "{}", add.text().len());
+        assert!(read_ask(add.text().as_bytes()).is_some());
+        // A queue cut to fit one message, with the longest ids, the longest context and
+        // the biggest numbers there are.
+        let ids: Vec<String> = (0..5_000).map(|n| format!("{n:064}")).collect();
+        let (adopt, left) = Adopt::fitted(&ids, 4_999, 0, 86_399.999_999, &"🎵".repeat(200)).unwrap();
+        assert!(left > 0);
+        let adopt = Ask::Do { command: Command::Adopt(adopt), at: most };
+        assert!(adopt.text().len() <= MOST_MESSAGE, "{}", adopt.text().len());
+        assert!(read_ask(adopt.text().as_bytes()).is_some());
     }
 
     #[test]
@@ -509,7 +617,7 @@ mod tests {
         assert_eq!(left, 0);
         let adopt = Ask::Do { command: Command::Adopt(adopt), at: At { generation: 7, minute: 12 } };
         assert!(adopt.text().len() > 190_000 && adopt.text().len() <= MOST_MESSAGE, "{}", adopt.text().len());
-        assert_eq!(read_ask(adopt.text().as_bytes()), Some(adopt));
+        assert_eq!(read_ask(adopt.text().as_bytes()), Some((adopt, SPEAKS)));
         assert_eq!(read_ask(&vec![b' '; MOST_MESSAGE + 1]), None);
     }
 
@@ -556,7 +664,7 @@ mod tests {
         assert_eq!(read_tell(String::from_utf8_lossy(vector).replace(r#""done":true"#, r#""done":"yes""#).as_bytes()), None);
         // What need not be there, isn't: a state nobody asked a command of, with nothing playing.
         let bare = Tell { re: None, ok: None, why: None, by: None, done: false, busy: true, title: String::new(), artist: String::new(), ..told.clone() };
-        assert_eq!(bare.text(), r#"{"artist":"","at":[8,12],"busy":true,"device":"gYGBgYGBgYGBgYGBgYGBgQ","name":"Phone","playing":false,"title":""}"#);
+        assert_eq!(bare.text(), r#"{"artist":"","at":[8,12],"busy":true,"device":"gYGBgYGBgYGBgYGBgYGBgQ","name":"Phone","playing":false,"speaks":2,"title":""}"#);
         assert_eq!(read_tell(bare.text().as_bytes()), Some(bare));
         let refused = Tell { ok: Some(false), why: Some(Why::Busy), ..told };
         assert_eq!(read_tell(refused.text().as_bytes()).and_then(|tell| tell.why), Some(Why::Busy));

@@ -1495,26 +1495,44 @@ export component ConnectPanel inherits Rectangle {
             vertical-alignment: center;
         }
 
-        // Every device but the one being steered, which is named at the top.
-        for device in Linked.list: Rectangle {
-            height: device.active ? 0px : 56px;
-            clip: true;
-            if !device.active: HorizontalLayout {
-                padding-right: 28px;
-                spacing: 8px;
-                DeviceRow {
-                    horizontal-stretch: 1;
-                    device: { id: device.place, name: device.name, about: device.about, active: false, ready: device.ready };
-                    chosen => { Linked.choose(device.place); }
-                }
-                // (A small button: in a narrow window the name beside it keeps its room.)
-                if device.ready && device.playing: VerticalLayout {
-                    alignment: center;
-                    IconButton {
-                        icon: Icons.pause-fill;
-                        label: "Pause " + device.name;
-                        clicked => { Linked.pause(device.place); }
+        // Every device but the one being steered, which is named at the top. One that
+        // does not speak as this PC does is listed as it is, with which of the two to
+        // update under it, and cannot be picked or paused.
+        for device in Linked.list: VerticalLayout {
+            Rectangle {
+                height: device.active ? 0px : 56px;
+                clip: true;
+                if !device.active: HorizontalLayout {
+                    padding-right: 28px;
+                    spacing: 8px;
+                    DeviceRow {
+                        horizontal-stretch: 1;
+                        device: { id: device.place, name: device.name, about: device.about, active: false, ready: device.ready };
+                        opacity: device.ready || device.update != "" ? 1 : 0.5;
+                        accessible-label: device.name + ", " + device.about + (device.update != "" ? ". " + device.update : "");
+                        chosen => { Linked.choose(device.place); }
                     }
+                    // (A small button: in a narrow window the name beside it keeps its room.)
+                    if device.ready && device.playing: VerticalLayout {
+                        alignment: center;
+                        IconButton {
+                            icon: Icons.pause-fill;
+                            label: "Pause " + device.name;
+                            clicked => { Linked.pause(device.place); }
+                        }
+                    }
+                }
+            }
+            if !device.active && device.update != "": HorizontalLayout {
+                padding-left: 44px;
+                padding-right: 28px;
+                padding-bottom: 8px;
+                Text {
+                    text: device.update;
+                    color: Theme.muted;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                    accessible-role: none;
                 }
             }
         }

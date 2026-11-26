@@ -21,13 +21,27 @@
 //! its place (the reservation), worked for (its entry found, its songs looked up), and at
 //! the moment it is carried out authorised again ([`Rule::finish`], under the session it
 //! arrived in). Each of those is a line of [`Device::commanded`] and [`Device::finish`].
+//!
+//! **Devices of different generations** (5.10; [`SPEAKS`]). Two devices steer each other
+//! and hand music to each other only if they speak alike, and each point where one acts
+//! on the other holds to it by itself:
+//!
+//! | | Where |
+//! |---|---|
+//! | A command that arrives from one that speaks otherwise is refused `invalid`, before the player or its order of choices is asked anything | [`Device::asked`] |
+//! | A look for this device's queue from one that speaks otherwise is answered with no queue: its music is not given | [`Device::asked`] |
+//! | No command is sealed for one that speaks otherwise: **every** command goes out by one function | [`Device::command`] (and `super::steer::Peer::may_send`, which says why to the person) |
+//! | One that speaks otherwise is not steered, and is let go of when it turns out to | [`Device::steer`], [`Device::choose`], [`Device::told`] |
+//! | Its queue is not taken: the answer that brings it says how its sender speaks | [`Device::told`] |
+//! | Its answers never say a command was carried out | `super::steer::Peer::told` |
+//! | It is listed, with which of the two to update | [`Device::shown`] |
 
 use std::collections::HashMap;
 
 use super::command::{Adopt, Command, MOST_ADDED, id_ok};
 use super::frame::{self, ASK, Keys, TELL};
 use super::look::{Looked, ends_session};
-use super::message::{Ask, At, Full, Handed, Tell, Want, Why, read_ask, read_tell};
+use super::message::{Ask, At, Full, Handed, SPEAKS, Tell, Want, Why, read_ask, read_tell};
 use super::moving::{Adopted, Adopting, Gave, Giving, MOVE_MS, START_MS, Taking, Took};
 use super::news::News;
 use super::rule::{self, Carrying, Reservation, Waiting};
@@ -281,8 +295,13 @@ pub struct Row {
     pub playing: bool,
     /// It's the device the player here is steering.
     pub active: bool,
-    /// It's here to be picked. Otherwise it is one seen before that isn't here just now.
+    /// It's here to be picked. Otherwise it is one seen before that isn't here just now,
+    /// or one that does not speak as this device does (`update`).
     pub ready: bool,
+    /// **It does not speak as this device does** (5.10): what to do about that, said under
+    /// its row. It is listed with its name and what it is playing, cannot be picked, and
+    /// is sent nothing but looks. Empty for every other row.
+    pub update: String,
 }
 
 /// What the panel shows.
@@ -883,6 +902,7 @@ impl Device {
             why,
             device: env.me.device,
             name: env.me.name.clone(),
+            speaks: SPEAKS,
             at: At { generation: env.player.generation(), minute: minute(env.now_ms) },
             busy,
             by,
@@ -944,23 +964,44 @@ impl Device {
         if !self.asks.allow(env.now_ms) {
             return out.push(Do::Log("ask: more than this device answers in a second, dropped".into()));
         }
+        let ask = read_ask(message);
+        // A command is carried out only for a sender that speaks as this device does.
+        // Any other is refused here, as "not one this version carries out": before the
+        // window is brought up to the sound for it, before the rule is asked to admit
+        // it, before anything is found for it. The player is asked nothing but what the
+        // answer says of it, as for a look.
+        if let Some((Ask::Do { command, at }, speaks)) = &ask
+            && *speaks != SPEAKS
+        {
+            out.push(Do::Log(format!("{} from {} against generation {}: refused, Invalid (it speaks {speaks} and this device {SPEAKS})", command.name(), text::place(&from), at.generation)));
+            let answer = self.state(Some(nonce), Some(false), Some(Why::Invalid), env);
+            return self.answer(session, from, answer, env, out);
+        }
         Device::catch_up(env, out);
-        match read_ask(message) {
+        match ask {
             None => {
                 out.push(Do::Log(format!("ask from {}: not one this version carries out", text::place(&from))));
                 let answer = self.state(Some(nonce), Some(false), Some(Why::Invalid), env);
                 self.answer(session, from, answer, env, out);
             }
-            Some(Ask::Look(want)) => {
+            Some((Ask::Look(want), speaks)) => {
                 let mut state = self.state(Some(nonce), None, None, env);
                 match want {
                     Want::Brief => {}
                     Want::Full => state.full = Some(env.player.full()),
+                    // A device gives its music only to one that speaks as it does. One
+                    // that does not would play this queue and then tell this device to
+                    // stop in words this device refuses: it is told there is nothing here
+                    // for it to carry on with, which every generation reads the same way.
+                    Want::Queue if speaks != SPEAKS => {
+                        out.push(Do::Log(format!("look from {}: it speaks {speaks} and this device {SPEAKS}, so it is not given its queue", text::place(&from))));
+                        state.queue = Some(Handed::default());
+                    }
                     Want::Queue => state.queue = Some(env.player.handed()),
                 }
                 self.answer(session, from, state, env, out);
             }
-            Some(Ask::Do { command, at }) => self.commanded(session, from, nonce, command, at, env, out),
+            Some((Ask::Do { command, at }, _)) => self.commanded(session, from, nonce, command, at, env, out),
         }
     }
 
@@ -1254,13 +1295,19 @@ impl Device {
                         out.push(Do::Log(format!("take: {} sounds; {name} has left the room and cannot be told to stop", env.me.here.this_lower())));
                         self.say(words::took_and_it_has_left(&name), out);
                     }
+                    // It has turned out, since its queue was read, not to speak as this
+                    // device does: it is sent no command, this one included.
+                    Took::Pause(_) if self.speaks(&place).is_some_and(|theirs| theirs != SPEAKS) => {
+                        out.push(Do::Log(format!("take: {} sounds; {name} does not speak as this device does and is not told to stop", env.me.here.this_lower())));
+                        self.say(words::took(Outcome::Refused(Why::Invalid), &name), out);
+                    }
                     Took::Pause(at) => {
                         // The other stops now that this one sounds: against the state its
                         // queue was taken from, so that if it has been given anything else
                         // to do since, it is left to it. It is told the music has moved, not
                         // asked to pause as a press would: its going quiet is nobody's choice
                         // there, and claims nothing.
-                        match self.send(place, ASK, Ask::Do { command: Command::Moved, at }.text(), env, out) {
+                        match self.command(place, Command::Moved, at, env, out) {
                             Some(nonce) => {
                                 out.push(Do::Log(format!("take: {} sounds; asked {name} to pause, against generation {}", env.me.here.this_lower(), at.generation)));
                                 if let Some(seen) = self.peer_mut(&place) {
@@ -1350,7 +1397,7 @@ impl Device {
             return;
         }
         // (The queue, if it carries one, is for the move that asked for it and is not kept.)
-        let (handed, re, at, playing, device) = (tell.queue.take(), tell.re, tell.at, tell.playing, tell.device);
+        let (handed, re, at, playing, device, speaks) = (tell.queue.take(), tell.re, tell.at, tell.playing, tell.device, tell.speaks);
         let (told, name, sent_for) = {
             let Some(seen) = self.live_mut(session, now).and_then(|live| live.peers.get_mut(&from)) else { return };
             let told = seen.peer.told(tell);
@@ -1367,6 +1414,26 @@ impl Device {
             if seen::is_news(&self.remembered, &id, &name, env.today, &self.account) {
                 self.remembered = seen::remembered(std::mem::take(&mut self.remembered), Some((&id, &name)), env.today, &self.account);
                 out.push(Do::Remember(self.remembered.clone()));
+            }
+            // **It does not speak as this device does** (it was updated and has started
+            // again, or this one is behind). If its queue was asked for, to bring its
+            // music here, the queue is not taken; if it is being steered, it is let go
+            // of. Either way the person is told which of the two to update.
+            if speaks != SPEAKS {
+                let asked_for = matches!(&self.take, Some(Take::Asked { place, nonce, .. }) if *place == from && Some(*nonce) == re);
+                let note = match (asked_for, self.steered_place() == Some(from)) {
+                    (true, _) => Some(words::update_to_move(&name, speaks, env.me.here)),
+                    (false, true) => Some(words::update_to_control(&name, speaks, env.me.here, true)),
+                    (false, false) => None,
+                };
+                if let Some(note) = note {
+                    out.push(Do::Log(format!("{name} speaks {speaks} and this device {SPEAKS}: it is let go of")));
+                    // (Letting go drops a queue that was asked for and has not come. A
+                    // queue already loaded here from another device is not this one's
+                    // to drop: it goes on to its own end.)
+                    self.let_go_into(out);
+                    self.say(note, out);
+                }
             }
             self.show_view(from, now, out);
             // The queue that was asked for, to bring its music here: if it has come in
@@ -1484,6 +1551,24 @@ impl Device {
         }
     }
 
+    /// How the device at a place speaks, as its last fresh state said. `None` for one that
+    /// has not been seen.
+    fn speaks(&self, place: &Place) -> Option<u64> {
+        self.session.as_ref()?.peers.get(place)?.peer.shown().map(|shown| shown.tell.speaks)
+    }
+
+    /// **The one place a command is sealed for another device**: a press while steering,
+    /// one that waited its turn, a queue given, and the stop that ends "Play here". Only
+    /// for a device that has said it speaks as this one does; nothing but looks is sent
+    /// to any other, or to one that has not been seen.
+    fn command(&mut self, to: Place, command: Command, at: At, env: &mut Env, out: &mut Vec<Do>) -> Option<Nonce> {
+        if self.speaks(&to) != Some(SPEAKS) {
+            out.push(Do::Log(format!("{}: not sent, {} has not said it speaks as this device does", command.name(), text::place(&to))));
+            return None;
+        }
+        self.send(to, ASK, Ask::Do { command, at }.text(), env, out)
+    }
+
     /// Asks a device to do something: now, if nothing asked of it is unanswered and there
     /// is a fresh state to make it against; after the command that is out, if one is; or
     /// not at all.
@@ -1492,7 +1577,7 @@ impl Device {
         let Some(press) = self.peer_mut(&to).map(|seen| seen.peer.press(&command, now)) else { return Pressed::No(Wait::Look) };
         let Pressed::Send(at) = press else { return press };
         let name = command.name();
-        let Some(nonce) = self.send(to, ASK, Ask::Do { command, at }.text(), env, out) else { return Pressed::No(Wait::Look) };
+        let Some(nonce) = self.command(to, command, at, env, out) else { return Pressed::No(Wait::Look) };
         if let Some(seen) = self.peer_mut(&to) {
             out.push(Do::Log(format!("{name}: asked {}, against generation {} in minute {}", name_of(seen), at.generation, at.minute)));
             seen.peer.sent(nonce, at, now);
@@ -1511,7 +1596,7 @@ impl Device {
             _ => Out::Steer,
         };
         let name = command.name();
-        let Some(nonce) = self.send(to, ASK, Ask::Do { command, at }.text(), env, out) else { return };
+        let Some(nonce) = self.command(to, command, at, env, out) else { return };
         if let Some(seen) = self.peer_mut(&to) {
             out.push(Do::Log(format!("{name}: asked {} next, against generation {} in minute {}", name_of(seen), at.generation, at.minute)));
             seen.peer.sent(nonce, at, now);
@@ -1521,7 +1606,7 @@ impl Device {
 
     /// Says why something could not be asked of a device just now, and looks at it.
     fn not_sent(&mut self, to: Place, name: &str, wait: Wait, aloud: bool, env: &mut Env, out: &mut Vec<Do>) {
-        let note = words::not_sent(wait, name);
+        let note = words::not_sent(wait, name, env.me.here);
         if wait != Wait::Unanswered && self.name(&to).is_some() {
             self.look_at(to, false, env, out);
         }
@@ -1555,7 +1640,8 @@ impl Device {
 
     /// From here the player and the queue panel are that device's.
     fn steer(&mut self, place: Place, env: &mut Env, out: &mut Vec<Do>) {
-        let found = self.session.as_ref().and_then(|session| session.peers.get(&place)).and_then(|seen| seen.peer.shown()).map(|shown| (shown.tell.device, shown.tell.name.clone()));
+        // (Only one that speaks as this device does: any other is listed, and that is all.)
+        let found = self.session.as_ref().and_then(|session| session.peers.get(&place)).and_then(|seen| seen.peer.shown()).filter(|shown| shown.tell.speaks == SPEAKS).map(|shown| (shown.tell.device, shown.tell.name.clone()));
         let Some((device, name)) = found else { return };
         out.push(Do::Log(format!("steering {name}")));
         out.push(Do::Steering(Some(name.clone())));
@@ -1670,6 +1756,13 @@ impl Device {
         if self.steered_place() == Some(to) {
             return out;
         }
+        // It does not speak as this device does: it cannot be picked, whatever the list
+        // on the screen showed when it was pressed.
+        if let Some(theirs) = self.speaks(&to).filter(|theirs| *theirs != SPEAKS) {
+            out.push(Do::Log(format!("choose: {name} speaks {theirs} and this device {SPEAKS}, so it is not steered")));
+            self.say(words::update_to_control(&name, theirs, env.me.here, true), &mut out);
+            return out;
+        }
         if in_a_jam {
             out.push(Do::Say(words::IN_A_JAM.into()));
             return out;
@@ -1760,7 +1853,11 @@ impl Device {
     /// The list: the other devices and what each is doing, and after them the ones seen
     /// before that are not here now. Says, the first time and whenever it changes, what
     /// it shows ([`Do::Log`]).
-    pub fn shown(&mut self, now_ms: u64) -> (Shown, Vec<Do>) {
+    ///
+    /// A device that does not speak as this one does is listed with its name and what it
+    /// is playing, which every generation says the same way, and with which of the two to
+    /// update; it is not to be picked.
+    pub fn shown(&mut self, now_ms: u64, this: Here) -> (Shown, Vec<Do>) {
         let steered = self.steering.as_ref().map(|steering| steering.device);
         let (mut rows, mut here) = (Vec::new(), Vec::new());
         if let Some(session) = &self.session {
@@ -1768,7 +1865,7 @@ impl Device {
                 let Some(shown) = session.peers.get(place).and_then(|seen| seen.peer.shown()) else { continue };
                 let tell = &shown.tell;
                 here.push(text::base64(&tell.device));
-                let row = Row { place: text::place(place), name: tell.name.clone(), about: words::about(tell, now_ms.saturating_sub(shown.sent_ms) / 1000), playing: tell.playing, active: steered == Some(tell.device), ready: true };
+                let row = Row { place: text::place(place), name: tell.name.clone(), about: words::about(tell, now_ms.saturating_sub(shown.sent_ms) / 1000), playing: tell.playing, active: steered == Some(tell.device), ready: tell.speaks == SPEAKS, update: if tell.speaks == SPEAKS { String::new() } else { words::update_to_control(&tell.name, tell.speaks, this, false) } };
                 rows.push((tell.device, shown.sent_ms, row));
             }
         }
@@ -1777,11 +1874,12 @@ impl Device {
         // The devices seen before and not here now: listed at once, and not to be picked.
         // (This account's: a device seen under another sign-in is not this one's to list.)
         for known in seen::of(&self.remembered, &self.account).filter(|known| !here.contains(&known.id)) {
-            rows.push(Row { place: String::new(), name: known.name.clone(), about: if entered { words::NOT_HERE } else { words::LOOKING_FOR_IT }.into(), playing: false, active: false, ready: false });
+            rows.push(Row { place: String::new(), name: known.name.clone(), about: if entered { words::NOT_HERE } else { words::LOOKING_FOR_IT }.into(), playing: false, active: false, ready: false, update: String::new() });
         }
         let mut out = Vec::new();
         if rows != self.listed {
-            out.push(Do::Log(format!("shown: {}", if rows.is_empty() { "no other devices".to_string() } else { rows.iter().map(|row| format!("{}: {}", row.name, row.about)).collect::<Vec<_>>().join("; ") })));
+            let line = |row: &Row| if row.update.is_empty() { format!("{}: {}", row.name, row.about) } else { format!("{}: {} ({})", row.name, row.about, row.update) };
+            out.push(Do::Log(format!("shown: {}", if rows.is_empty() { "no other devices".to_string() } else { rows.iter().map(line).collect::<Vec<_>>().join("; ") })));
             self.listed = rows.clone();
         }
         (Shown { entered, rows, note: self.note.clone(), steering: self.steered().unwrap_or_default().to_string() }, out)

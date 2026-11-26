@@ -715,7 +715,7 @@ impl Inner {
                 }
                 *call.account.borrow_mut() = Some(account.clone());
                 self.with(call, came, |device, env| device.tick(&account, wanted, env));
-                let (shown, logged) = self.device.shown(call.now_ms);
+                let (shown, logged) = self.device.shown(call.now_ms, self.me.here);
                 came.native.extend(logged);
                 came.acts.push(Act::Shown { shown });
             }

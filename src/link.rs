@@ -955,9 +955,9 @@ impl Controller {
 
     /// Shows the other devices and what each is doing.
     fn link_show(self: &Rc<Self>) {
-        let Ok((shown, asked)) = self.link.borrow().inner.try_borrow_mut().map(|mut inner| inner.device.shown(now_ms())) else { return };
+        let Ok((shown, asked)) = self.link.borrow().inner.try_borrow_mut().map(|mut inner| inner.device.shown(now_ms(), Kind::Pc)) else { return };
         self.link_do(asked);
-        let list: Vec<ui::LinkedDevice> = shown.rows.into_iter().map(|row| ui::LinkedDevice { place: row.place.into(), name: row.name.into(), about: row.about.into(), playing: row.playing, active: row.active, ready: row.ready }).collect();
+        let list: Vec<ui::LinkedDevice> = shown.rows.into_iter().map(|row| ui::LinkedDevice { place: row.place.into(), name: row.name.into(), about: row.about.into(), playing: row.playing, active: row.active, ready: row.ready, update: row.update.into() }).collect();
         let global = self.ui.global::<ui::Linked>();
         global.set_on(true);
         global.set_entered(shown.entered);

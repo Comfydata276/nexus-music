@@ -574,8 +574,12 @@ export struct LinkedDevice {
     playing: bool,
     // It's the device the player on this PC is steering.
     active: bool,
-    // It's here to be picked. Otherwise it is one seen before that isn't here just now.
+    // It's here to be picked. Otherwise it is one seen before that isn't here just now,
+    // or one that does not speak as this PC does (`update`).
     ready: bool,
+    // It does not speak as this PC does: which of the two to update, said under its row.
+    // Empty for every other device.
+    update: string,
 }
 
 // The new linking, where it is switched on for a test. Not shown otherwise.

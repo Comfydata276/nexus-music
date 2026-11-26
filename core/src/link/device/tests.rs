@@ -271,6 +271,12 @@ struct Path {
     commands: Vec<Frame>,
     tells: Vec<Frame>,
     last_command: Option<Frame>,
+    /// What each device's frames say of how it speaks as they are delivered, if not what
+    /// it wrote: 1 is the number left out, as a build from before it was said leaves it.
+    /// (The device itself is this version's, and to it the other speaks as it does: so it
+    /// enforces nothing against the other, as a build from before the rule enforces
+    /// nothing at all.)
+    speaks: [Option<u64>; 2],
 }
 
 struct World {
@@ -409,7 +415,8 @@ impl World {
         let bytes = text::from_base64(&frame.text).unwrap_or_default();
         match bytes.get(4) {
             Some(2) => "tell",
-            Some(1) if bytes.len() - 45 > 30 => "command",
+            // (The longest look is 38 bytes and the shortest command 43.)
+            Some(1) if bytes.len() - 45 > 40 => "command",
             _ => "look",
         }
     }
@@ -430,9 +437,29 @@ impl World {
     /// Hands a frame to whichever device has the place it is for. (One for a place nobody
     /// has is the relay's to refuse.)
     fn deliver(&mut self, frame: Frame) {
+        let from = [A, B].into_iter().find(|who| self.copies[*who].place == Some(frame.from));
+        let frame = match from.and_then(|who| self.path.speaks[who]) {
+            Some(speaks) => World::respoken(&frame, speaks),
+            None => frame,
+        };
         if let Some(who) = [A, B].into_iter().find(|who| self.copies[*who].place == Some(frame.to)) {
             self.deliver_to(who, frame);
         }
+    }
+
+    /// A frame as a device that speaks otherwise would have written it: opened, its
+    /// `speaks` left out (1) or set, and sealed again under the same nonce.
+    fn respoken(frame: &Frame, speaks: u64) -> Frame {
+        let keys = Keys::of(&secret(7));
+        let opened = frame::open(&keys, &frame.text, &frame.from, &frame.to).expect("a frame of this room");
+        let mut fields: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&opened.message).expect("a message");
+        if speaks == 1 {
+            fields.remove("speaks");
+        } else {
+            fields.insert("speaks".into(), speaks.into());
+        }
+        let message = serde_json::Value::Object(fields).to_string();
+        Frame { text: frame::seal(&keys, opened.kind, &opened.nonce, &frame.from, &frame.to, message.as_bytes()).expect("sealed"), ..frame.clone() }
     }
 
     fn deliver_to(&mut self, who: usize, frame: Frame) {
@@ -548,7 +575,7 @@ impl World {
 
     fn row(&mut self, who: usize, name: &str) -> Option<Row> {
         let now = self.now;
-        let (shown, did) = self.copies[who].device.shown(now);
+        let (shown, did) = self.copies[who].device.shown(now, Here::Pc);
         self.act(who, did);
         shown.rows.into_iter().find(|row| row.name == name)
     }
@@ -1285,9 +1312,9 @@ fn a_device_seen_before_is_listed_when_it_is_not_here() {
     let mut alone = Device::new(remembered);
     std::mem::swap(&mut alone, &mut world.copies[A].device);
     world.with(A, |device, env| device.tick("the account", false, env));
-    let (shown, _) = world.copies[A].device.shown(0);
+    let (shown, _) = world.copies[A].device.shown(0, Here::Pc);
     std::mem::swap(&mut alone, &mut world.copies[A].device);
-    assert_eq!(shown.rows, [Row { place: String::new(), name: "Copy B".into(), about: "Looking for it…".into(), playing: false, active: false, ready: false }]);
+    assert_eq!(shown.rows, [Row { place: String::new(), name: "Copy B".into(), about: "Looking for it…".into(), playing: false, active: false, ready: false, update: String::new() }]);
     // B leaves the room A is in.
     world.copies[B].place = None;
     world.hear_places();
@@ -1302,7 +1329,7 @@ fn what_was_kept_of_devices_seen_is_bounded_when_read_and_forgotten_by_the_calen
     let mut world = World::new(false);
     world.copies[A].device = Device::new(kept);
     world.tick();
-    let (shown, _) = world.copies[A].device.shown(world.now);
+    let (shown, _) = world.copies[A].device.shown(world.now, Here::Pc);
     assert_eq!((shown.rows.len(), shown.rows[0].name.as_str()), (16, "PC 999"));
     // Thirty-one days after the latest was seen, with no other device ever seen: forgotten,
     // and the app is told to keep the list as it now is. Once, not at every tick.
@@ -1322,7 +1349,7 @@ fn what_was_kept_of_devices_seen_is_bounded_when_read_and_forgotten_by_the_calen
 fn devices_seen_under_one_account_are_not_listed_for_another() {
     let mut world = World::new(false);
     assert_eq!(world.copies[A].remembered.iter().map(|seen| (seen.name.as_str(), seen.account.as_str())).collect::<Vec<_>>(), [("Copy B", "the account")]);
-    let listed = |world: &mut World| world.copies[A].device.shown(world.now).0.rows.iter().map(|row| row.name.clone()).collect::<Vec<_>>();
+    let listed = |world: &mut World| world.copies[A].device.shown(world.now, Here::Pc).0.rows.iter().map(|row| row.name.clone()).collect::<Vec<_>>();
     assert_eq!(listed(&mut world), ["Copy B"]);
     let did = world.with(A, |device, env| device.tick("somebody else", true, env));
     world.act(A, did);
@@ -1401,12 +1428,12 @@ fn a_secret_is_used_for_ten_minutes_and_a_look_that_reads_it_again_renews_it() {
     }
     assert_eq!(world.copies[A].ended, [session]);
     let now = world.now;
-    assert_eq!(world.copies[A].device.shown(now).0.note, words::SERVER_SILENT);
+    assert_eq!(world.copies[A].device.shown(now, Here::Pc).0.note, words::SERVER_SILENT);
     // A record found to be no good ends it there and then.
     let session = world.copies[B].session;
     world.looked(B, Looked::Invalid, false);
     assert_eq!(world.copies[B].ended, [session]);
-    assert_eq!(world.copies[B].device.shown(now).0.note, words::NEEDS_RESETTING);
+    assert_eq!(world.copies[B].device.shown(now, Here::Pc).0.note, words::NEEDS_RESETTING);
     let mut world = World::new(false);
     world.looked(A, Looked::Stopped(secret::Stop::HasSongs), false);
     assert_eq!(world.copies[A].ended.len(), 1);
@@ -1417,7 +1444,7 @@ fn a_secret_is_used_for_ten_minutes_and_a_look_that_reads_it_again_renews_it() {
     world.pass(crate::link::LOOK_AGAIN_MS * 3);
     assert_eq!(world.copies[A].looks.len(), looks);
     let now = world.now;
-    assert_eq!(world.copies[A].device.shown(now).0.note, "This PC couldn't make random numbers, so linking is off.");
+    assert_eq!(world.copies[A].device.shown(now, Here::Pc).0.note, "This PC couldn't make random numbers, so linking is off.");
 }
 
 // ---- moving music ------------------------------------------------------------------------------
@@ -1939,7 +1966,7 @@ fn reset_linking_with_a_command_in_flight() {
     world.looked(A, Looked::Secret { secret: secret(8), id: "k".into(), wrote: Some(secret::Why::Reset) }, true);
     assert!(world.copies[A].ended.contains(&old) && world.copies[A].session != old);
     let now = world.now;
-    assert_eq!(world.copies[A].device.shown(now).0.note, words::RESET_DONE);
+    assert_eq!(world.copies[A].device.shown(now, Here::Pc).0.note, words::RESET_DONE);
     // B is still on the old secret, in the old room: a command sealed under it is B's to
     // carry out until B's own next look (up to two minutes), as the design says.
     let frame = world.path.commands[0].clone();
@@ -1963,12 +1990,12 @@ fn reset_linking_with_a_command_in_flight() {
     let now = world.now;
     // (The session ended at the press all the same: the next look that can read the
     // secret that stands begins another.)
-    assert_eq!((world.copies[A].device.shown(now).0.note, world.copies[A].ended.len()), (words::RESET_NOT_DONE.to_string(), 1));
+    assert_eq!((world.copies[A].device.shown(now, Here::Pc).0.note, world.copies[A].ended.len()), (words::RESET_NOT_DONE.to_string(), 1));
     let did = world.with(A, |device, env| device.reset(env));
     world.act(A, did);
     world.pass(250);
     world.looked(A, Looked::Invalid, true);
-    assert_eq!((world.copies[A].device.shown(now).0.note, world.copies[A].ended.len()), (words::RESET_HALF_DONE.to_string(), 1));
+    assert_eq!((world.copies[A].device.shown(now, Here::Pc).0.note, world.copies[A].ended.len()), (words::RESET_HALF_DONE.to_string(), 1));
     // A look that was on its way when Reset was pressed read the old secret: it is
     // stopped, and what it brings back begins nothing.
     let mut world = World::new(false);
@@ -2044,4 +2071,221 @@ fn an_entry_is_found_where_it_was_seen_or_at_its_nearest_copy() {
     assert_eq!(known(&library, &ids, 0, 2), (vec![("a".to_string(), false), ("c".to_string(), true), ("d".to_string(), false)], 0));
     assert_eq!(known(&library, &ids, 1, 1), (vec![("a".to_string(), false), ("c".to_string(), true), ("d".to_string(), false)], 1));
     assert_eq!(known(&Snapshot::default(), &ids, 0, 0), (vec![], 0));
+}
+
+// ---- devices of different generations in one room (the design's 5.10) -------------------------
+
+const UPDATE_B: &str = "Update Nexus Music on Copy B to control it from here";
+
+/// How many commands a device has put on the path, with every one of them kept there.
+fn commands_sent(world: &World) -> usize {
+    world.path.commands.len()
+}
+
+/// **A device that speaks 1 commands one that speaks 2**: every command there is, the
+/// queue that gives it music, and the stop that would end a "Play here". Each is refused
+/// as `invalid`, the word a device of any generation can say, **before the player or its
+/// order of choices is touched**: nothing is carried out, nothing is counted, no place is
+/// reserved, and the device is not busy.
+#[test]
+fn a_command_from_a_device_of_another_generation_is_refused_before_the_player_is_touched() {
+    for theirs in [1, SPEAKS + 1] {
+        for name in COMMANDS {
+            let mut world = steering(name);
+            // (A is the one that speaks otherwise, as B hears it.)
+            world.path.speaks[A] = Some(theirs);
+            let (before, queue, playing) = (world.copies[B].player.rule.generation(), world.copies[B].player.queue.clone(), world.copies[B].player.playing);
+            world.ask(name);
+            world.pass(1_000);
+            let refused = world.last(B, &format!("{name} from"));
+            assert!(refused.contains("refused, Invalid") && refused.contains(&format!("speaks {theirs}")), "{name}: {:?}", world.copies[B].log);
+            let player = &world.copies[B].player;
+            assert!(player.did.is_empty(), "{name}: {:?}", player.did);
+            assert_eq!((player.rule.generation(), player.queue.clone(), player.playing, player.rule.busy(world.now)), (before, queue, playing, false), "{name}");
+            // The device that asked is told what any generation can say.
+            assert!(world.last(A, "outcome of").ends_with("Refused(Invalid)"), "{name}: {:?}", world.copies[A].log);
+            assert_eq!(said(&world), "Copy B couldn't do that.", "{name}");
+        }
+        // Not even the first thing done for any ask this device answers, bringing the
+        // window up to the sound, is done for it. (Its answer is held, so that the look
+        // the asking device sends after it, which any device is answered, does not come.)
+        let mut world = steering("pause");
+        world.path.speaks[A] = Some(theirs);
+        world.path.hold_tells = true;
+        world.copies[B].player.rolled = true;
+        let before = world.copies[B].player.rule.generation();
+        world.ask("pause");
+        assert_eq!(world.log(B, "pause from").len(), 1);
+        assert!(world.copies[B].player.rolled && world.copies[B].player.rule.generation() == before && world.copies[B].player.playing);
+        // Its music, given: the queue is not taken, and it plays on where it was.
+        let mut before = 0;
+        let mut world = giving(|world| {
+            world.path.speaks[A] = Some(theirs);
+            before = world.copies[B].player.rule.generation();
+        });
+        world.pass(1_000);
+        assert_eq!((said(&world), world.copies[A].player.playing, world.copies[B].player.playing), ("Copy B couldn't play that. Still playing here.", true, false));
+        assert_eq!((world.copies[B].player.queue.len(), world.copies[B].player.rule.generation(), world.copies[A].player.handed_on.len()), (8, before, 0));
+        // "Play here" from it: the queue it asks for is not given, so nothing moves, and
+        // this device is not left playing beside a copy of its own queue.
+        let mut world = taking(|world| world.path.speaks[A] = Some(theirs));
+        world.pass(2_000);
+        assert_eq!((world.copies[A].player.queue.len(), world.copies[A].player.playing, world.copies[B].player.playing), (3, false, true));
+        assert_eq!(world.log(B, "is not given its queue").len(), 1, "{:?}", world.copies[B].log);
+        assert!(world.log(B, "moved from").is_empty() && world.copies[B].player.handed_on.is_empty());
+        // A look from it is answered like any other: it is listed there, and shown.
+        assert_eq!(world.row(A, "Copy B").map(|row| row.about), Some("Playing s0".to_string()));
+    }
+}
+
+/// **A device that speaks 2 among one that speaks 1** (and one that speaks 3): it is
+/// listed with its name and what it is playing, and under it which of the two to update.
+/// It cannot be picked, paused from the list, or given this device's music: nothing is
+/// sent to it but looks.
+#[test]
+fn a_device_of_another_generation_is_listed_and_sent_nothing_but_looks() {
+    for (theirs, under, aloud) in [(1, UPDATE_B, UPDATE_B), (SPEAKS + 1, "Update Nexus Music on this PC to control it from here", "Update Nexus Music on this PC to control Copy B from here")] {
+        let mut world = World::new(true);
+        world.path.speaks[B] = Some(theirs);
+        // (The next look at it is answered as it now speaks.)
+        world.pass(31_000);
+        world.path.hold_commands = true;
+        let row = world.row(A, "Copy B").unwrap();
+        assert_eq!((row.about.as_str(), row.playing, row.ready, row.update.as_str(), row.place.is_empty()), ("Playing s0", true, false, under, false), "{theirs}");
+        // Picked all the same (a list drawn before the look came back): not steered.
+        world.choose();
+        assert_eq!((world.copies[A].window.clone(), said(&world), commands_sent(&world)), (None, aloud, 0), "{theirs}");
+        assert!(world.copies[A].device.steered().is_none());
+        // Pause, from the list.
+        let place = world.b_place();
+        let did = world.with(A, |device, env| device.pause(&place, env));
+        world.act(A, did);
+        world.pass(1_000);
+        let now = world.now;
+        assert_eq!((world.copies[A].device.shown(now, Here::Pc).0.note.as_str(), commands_sent(&world), world.copies[B].player.playing), (aloud, 0, true), "{theirs}");
+        // The two ways in that nothing on a screen reaches while the list is right: the
+        // one function that seals a command, and the one that begins steering. Each
+        // holds to the rule by itself.
+        let to = world.copies[B].place.unwrap();
+        let did = world.with(A, |device, env| {
+            let mut out = Vec::new();
+            let at = At { generation: env.player.generation(), minute: 0 };
+            for command in [Command::Pause, Command::Moved, Command::Adopt(Adopt::fitted(&["a0".to_string()], 0, 0, 0.0, "").unwrap().0)] {
+                assert_eq!(device.command(to, command, at, env, &mut out), None);
+            }
+            device.steer(to, env, &mut out);
+            out
+        });
+        assert!(did.iter().all(|did| matches!(did, Do::Log(_))), "{did:?}");
+        assert_eq!(did.len(), 3);
+        assert!(world.copies[A].device.steered().is_none());
+        // And with music playing here: it is not given, and plays on here.
+        world.copies[A].player.play(true);
+        world.pass(3_000);
+        world.choose();
+        world.pass(3_000);
+        assert_eq!((said(&world), commands_sent(&world), world.copies[A].player.playing, world.copies[A].window.clone()), (aloud, 0, true, None), "{theirs}");
+        assert!(world.copies[A].player.handed_on.is_empty() && world.copies[B].player.did.is_empty());
+        // It goes on being looked at, and shown as it is.
+        world.copies[B].player.own_next();
+        world.pass(31_000);
+        assert_eq!(world.row(A, "Copy B").map(|row| row.about), Some("Playing s1".to_string()), "{theirs}");
+        // Once it speaks as this one does (it was updated), it is picked like any other.
+        world.path.speaks[B] = None;
+        world.pass(31_000);
+        world.path.hold_commands = false;
+        let row = world.row(A, "Copy B").unwrap();
+        assert_eq!((row.ready, row.update.as_str()), (true, ""));
+    }
+}
+
+/// A device being steered is updated, starts again, and speaks otherwise: it is let go
+/// of as soon as that is known, and the person is told which to update. What is pressed
+/// after that is this device's own. And "Play here" pressed in the moment before it is
+/// known takes nothing: the queue that comes back is not this generation's to play.
+#[test]
+fn a_device_being_steered_that_turns_out_to_speak_otherwise_is_let_go_of() {
+    let mut world = steering("play");
+    world.path.speaks[B] = Some(SPEAKS + 1);
+    world.path.hold_commands = true;
+    world.pass(6_000);
+    assert_eq!((world.copies[A].window.clone(), said(&world)), (None, "Update Nexus Music on this PC to control Copy B from here"));
+    assert!(!world.press(Press::Toggle), "a press is this device's own again");
+    assert_eq!(commands_sent(&world), 0);
+    // "Play here", before the next look has said so.
+    let mut world = steering("pause");
+    world.path.speaks[B] = Some(1);
+    world.path.hold_commands = true;
+    let did = world.with(A, |device, env| device.play_here(env));
+    world.act(A, did.expect("A is steering B"));
+    world.pass(2_000);
+    assert_eq!((said(&world), world.copies[A].player.queue.len(), world.copies[A].player.playing, world.copies[B].player.playing), ("Update Nexus Music on Copy B to control it from here. Nothing was moved.", 3, false, true));
+    assert_eq!((world.copies[A].window.clone(), commands_sent(&world)), (None, 0));
+    assert!(world.log(A, "take: loaded").is_empty());
+}
+
+/// **A reply or a probe that could settle a hand-over is held to the same**: the answer
+/// to the queue this device gave, and the look that asks what became of it, from a
+/// device that does not speak as this one does, never say "it has started". This device
+/// is not stopped, and its queue is not marked as handed on.
+#[test]
+fn an_answer_from_another_generation_never_settles_a_hand_over() {
+    for theirs in [1, SPEAKS + 1] {
+        // The answer itself: `ok`, written by a device of another generation.
+        let mut world = giving(|world| world.path.hold_tells = true);
+        world.pass(2_000);
+        assert!(world.copies[B].player.playing, "B took the queue and has started");
+        world.path.speaks[B] = Some(theirs);
+        world.path.hold_tells = false;
+        world.release_tells();
+        world.pass(1_000);
+        assert_eq!((world.copies[A].player.playing, world.copies[A].player.handed_on.len(), world.copies[A].window.clone()), (true, 0, None), "{theirs}");
+        assert!(world.last(A, "outcome of Give").ends_with("Unknown"), "{:?}", world.copies[A].log);
+        assert_eq!(said(&world), "Copy B didn't answer. Still playing here; check whether Copy B started too.");
+        // The probe: the answer was lost, and the look that asks after the command is
+        // answered "it made my state, and was carried out to its end" in another generation.
+        let mut world = giving(|world| world.path.eat_tells = true);
+        world.pass(6_000);
+        world.path.speaks[B] = Some(theirs);
+        world.path.eat_tells = false;
+        world.pass(30_000);
+        assert_eq!((world.copies[A].player.playing, world.copies[A].player.handed_on.len(), world.copies[A].window.clone()), (true, 0, None), "{theirs}");
+        assert!(world.log(A, "outcome of Give").iter().all(|line| !line.ends_with("Done")) && !world.log(A, "outcome of Give").is_empty(), "{:?}", world.copies[A].log);
+        // The stop that ends "Play here": its `ok` in another generation is not "it is
+        // paused". (It is; this device does not take that from a tell it cannot read.)
+        let mut world = taking(|_| {});
+        world.path.hold_commands = true;
+        world.pass(1_000);
+        assert!(world.copies[A].player.playing && commands_sent(&world) == 1, "A sounds and has sent the stop");
+        world.path.speaks[B] = Some(theirs);
+        world.path.hold_commands = false;
+        world.release();
+        world.pass(1_000);
+        assert_eq!(said(&world), "Playing here. Copy B didn't answer, so it may still be playing.", "{theirs}");
+    }
+}
+
+/// The stop that ends "Play here" is a command like any other: it is not sent to a
+/// device that has turned out, since its queue was read, to speak otherwise.
+#[test]
+fn the_stop_that_ends_play_here_is_not_sent_to_a_device_of_another_generation() {
+    // (A's own sound is slow to start: B is looked at again meanwhile, as it now speaks.)
+    let mut world = taking(|world| world.copies[A].player.stream = false);
+    world.path.hold_commands = true;
+    world.pass(500);
+    assert!(!world.log(A, "take: loaded").is_empty());
+    world.path.speaks[B] = Some(1);
+    let place = world.b_place();
+    let did = world.with(A, |device, env| {
+        let mut out = Vec::new();
+        device.look_at(text::read_place(&place).unwrap(), false, env, &mut out);
+        out
+    });
+    world.act(A, did);
+    world.copies[A].player.stream = true;
+    let playing = world.copies[A].player.playing;
+    world.copies[A].player.play(playing);
+    world.pass(2_000);
+    assert_eq!((commands_sent(&world), world.copies[B].player.playing), (0, true));
+    assert_eq!(said(&world), "Playing here. Copy B couldn't be told to stop, so it may still be playing.");
 }
