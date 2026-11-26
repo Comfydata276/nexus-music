@@ -681,9 +681,8 @@ impl Device {
         self.looking = false;
         self.looked_ms = None;
         self.reset = false;
-        if self.steering.take().is_some() {
-            out.push(Do::Steering(None));
-        }
+        // (As "Stop steering" lets go: what was said of the music being there goes too.)
+        self.let_go_into(out);
     }
 
     /// Ends everything of this sign-in's: at sign-out, when linking is no longer wanted,

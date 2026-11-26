@@ -2459,6 +2459,14 @@ fn a_note_that_says_where_the_music_is_goes_when_the_device_is_let_go_of() {
     let did = world.with(A, |device, _| device.let_go());
     world.act(A, did);
     assert_eq!((note(&mut world).as_str(), world.copies[A].window.clone()), ("", None));
+    // "Link my devices" switched off: the device is let go of as by "Stop steering", and
+    // the note goes with it.
+    let mut world = giving(|_| {});
+    world.pass(1_000);
+    assert_eq!(note(&mut world), "Playing on Copy B.");
+    let did = world.with(A, |device, env| device.setting(false, env));
+    world.act(A, did);
+    assert_eq!((note(&mut world).as_str(), world.copies[A].window.clone()), ("", None));
     // "Play here": what is said next is what became of that.
     let mut world = giving(|_| {});
     world.pass(1_000);
