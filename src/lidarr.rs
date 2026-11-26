@@ -209,6 +209,12 @@ mod origins {
             }
         }
         assert_eq!(nexus_core::lidarr::origin("https://me:secret@lidarr.example.org").unwrap_err(), nexus_core::lidarr::ADDRESS_WITH_NAME);
+        // An address already saved is read as 0.40.10 used it, and goes where the client goes.
+        for address in ["http://me:secret@lidarr.example.org:8686", "https://me@lidarr.example.org/lidarr", "http://lidarr.example.org:", "http://192.168.1.5:/"] {
+            let found = nexus_core::lidarr::origin_saved(address).ok().map(|origin| (origin.scheme, origin.host, origin.port));
+            assert!(found.is_some(), "{address:?}");
+            assert_eq!(where_the_agent_goes(address), found, "the client's reading of {address:?}");
+        }
     }
 }
 

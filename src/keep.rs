@@ -72,9 +72,10 @@ fn read(vault: &dyn Vault, name: &str) -> Kept {
     }
 }
 
-/// The origin an address leads to, written out: "https://lidarr.example.org:443".
+/// The origin an address leads to, written out: "https://lidarr.example.org:443". Read as a
+/// saved address is (`origin_saved`): what's typed has been held to the rule before it's kept.
 pub fn origin_of(address: &str) -> Option<String> {
-    nexus_core::lidarr::origin(address).ok().map(|origin| format!("{}://{}:{}", origin.scheme, origin.host, origin.port))
+    nexus_core::lidarr::origin_saved(address).ok().map(|origin| format!("{}://{}:{}", origin.scheme, origin.host, origin.port))
 }
 
 fn bound(origin: &str, secret: &str) -> String {

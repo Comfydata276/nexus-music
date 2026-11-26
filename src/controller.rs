@@ -1470,7 +1470,8 @@ impl Controller {
             }
             let key = crate::keep::key(&*vault, &settings.lidarr_address, self.key_old_for.borrow().as_deref());
             // An address the app can't be sure of reaching as written isn't connected to.
-            let usable = nexus_core::lidarr::origin(&settings.lidarr_address).is_ok();
+            // (Read as 0.40.10 used it: a saved address isn't held to what's asked of a typed one.)
+            let usable = nexus_core::lidarr::origin_saved(&settings.lidarr_address).is_ok();
             match (settings.requests && !settings.lidarr_address.trim().is_empty() && usable, key) {
                 (true, Some(key)) => {
                     let gate = self.gate_session(&settings);
@@ -1595,7 +1596,7 @@ impl Controller {
         let Some(lidarr) = crate::lidarr::current() else {
             // One kept by an older version that this one won't use says why.
             let address = self.settings.borrow().lidarr_address.clone();
-            if let (false, Err(why)) = (address.trim().is_empty(), nexus_core::lidarr::origin(&address)) {
+            if let (false, Err(why)) = (address.trim().is_empty(), nexus_core::lidarr::origin_saved(&address)) {
                 return self.requests_state("error", &why);
             }
             return self.requests_state("none", nexus_core::lidarr::NOT_CONNECTED);
