@@ -1597,6 +1597,21 @@ at all. Whatever the answer, a device that says it has no volume of its own is t
 **shown without a volume slider**, not with one that springs back: that needs the
 device to say so (a field in its full state), which no build does yet.
 
+**A tester's pair** (one PC and one phone of the owner's, before any of the list
+above): on Windows, the released app with the environment variable
+`NEXUS_MUSIC_LINK=1` set for that one PC; on the phone, the released source built with
+`-PlinkExists=true` (`BuildConfig.LINK`, off in every other build) and signed with the
+release key, which adds two rows under Settings, Account ("Link my devices", and the
+relay's host link, kept sealed as one pair of address and key) and nothing else: the
+phone has no list of devices and no way to steer or ask for the music yet, so
+everything is done from the PC. The relay is the owner's, with its devices' route
+served. What the tester is told to expect is the reviews' list: the phone is in the
+room only while the app is open or playing; music cannot be taken from the phone
+while a call holds it; "Play here" replaces the taker's queue; a slow disk or a very
+short first song can cost a hand-over; the record's playlist shows in a few lists and
+on the other PCs and is to be left alone; after a fault the phone says so once and
+linking is off until the app is closed and opened.
+
 ## 12. Where it is weakest
 
 1. **The secret is in plain sight:** every app signed in to the account shows the
