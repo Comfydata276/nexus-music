@@ -103,11 +103,11 @@ pub(crate) fn make_agent() -> ureq::Agent {
     agent_following(10, Duration::from_secs(300))
 }
 
-/// For a server that closes idle connections sooner than most: one kept longer than `idle`
-/// isn't used again. It follows no redirects: its caller does that by its own rules (see
-/// `corehttp::public`).
-pub(crate) fn make_agent_idle_without_redirects(idle: Duration) -> ureq::Agent {
-    agent_following(0, idle)
+/// For the public services (see `corehttp::public`): one kept longer than `idle` isn't used
+/// again; it follows no redirects (its caller does that by its own rules); and it never
+/// connects to this machine or its network (`dns::PublicResolver`).
+pub(crate) fn make_public_agent(idle: Duration) -> ureq::Agent {
+    ureq::Agent::with_parts(config_following(0, idle), ureq::unversioned::transport::DefaultConnector::new(), dns::PublicResolver::default())
 }
 
 /// For callers that need to see where a redirect points instead of being taken there.
@@ -123,14 +123,25 @@ pub(crate) fn make_agent_without_redirects() -> ureq::Agent {
     agent_following(0, Duration::from_secs(300))
 }
 
+/// The public agent, through a proxy at `proxy` (as one from the environment would be).
+#[cfg(test)]
+pub(crate) fn make_public_agent_through(proxy: &str) -> ureq::Agent {
+    let config = ureq::Agent::config_builder().proxy(Some(ureq::Proxy::new(proxy).unwrap())).http_status_as_error(false).max_redirects(0).build();
+    ureq::Agent::with_parts(config, ureq::unversioned::transport::DefaultConnector::new(), dns::PublicResolver::default())
+}
+
 fn agent_following(redirects: u32, idle: Duration) -> ureq::Agent {
-    use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
     use ureq::unversioned::transport::DefaultConnector;
+    ureq::Agent::with_parts(config_following(redirects, idle), DefaultConnector::new(), dns::CachingResolver::default())
+}
+
+fn config_following(redirects: u32, idle: Duration) -> ureq::config::Config {
+    use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
     let tls = TlsConfig::builder()
         .provider(TlsProvider::NativeTls)
         .root_certs(RootCerts::PlatformVerifier)
         .build();
-    let config = ureq::Agent::config_builder()
+    ureq::Agent::config_builder()
         .tls_config(tls)
         .http_status_as_error(false)
         .max_redirects(redirects)
@@ -144,8 +155,7 @@ fn agent_following(redirects: u32, idle: Duration) -> ureq::Agent {
         .max_idle_connections_per_host(24)
         .max_idle_age(idle)
         .user_agent(concat!("NexusMusic/", env!("CARGO_PKG_VERSION")))
-        .build();
-    ureq::Agent::with_parts(config, DefaultConnector::new(), dns::CachingResolver::default())
+        .build()
 }
 
 /// Name lookups, remembered.
@@ -215,6 +225,57 @@ mod dns {
         }
     }
 
+    /// The public services' resolver: the same look-ups, with every address on this machine or
+    /// its network left out (`far_away`), for every connection the agent makes, redirected or
+    /// not. What's judged is what's connected to: there is no second look-up to differ. A name
+    /// that leads nowhere else is not found.
+    ///
+    /// With a proxy (ureq takes one from the environment: `ALL_PROXY`, `HTTPS_PROXY` and the
+    /// like), the proxy looks the service's name up, not this; only the proxy's own address
+    /// comes here, and it's the person's choice, so it's let through as it is. Then only the
+    /// written-address rule (`corehttp::Public`) applies to where a redirect leads.
+    #[derive(Debug, Default)]
+    pub struct PublicResolver {
+        inner: CachingResolver,
+    }
+
+    impl Resolver for PublicResolver {
+        fn resolve(&self, uri: &Uri, config: &Config, timeout: NextTimeout) -> Result<ResolvedSocketAddrs, Error> {
+            let found = self.inner.resolve(uri, config, timeout)?;
+            let the_proxy = config.proxy().is_some_and(|proxy| uri.host() == Some(proxy.host()) && uri.port_u16().unwrap_or(0) == proxy.port());
+            if the_proxy {
+                return Ok(found);
+            }
+            let mut out = self.empty();
+            for addr in found.iter().filter(|addr| far_away(addr.ip())) {
+                out.push(*addr);
+            }
+            if out.is_empty() {
+                return Err(Error::HostNotFound);
+            }
+            Ok(out)
+        }
+    }
+
+    /// An address on the open internet: not this machine, not its network, not one that isn't
+    /// anywhere.
+    pub fn far_away(ip: std::net::IpAddr) -> bool {
+        use std::net::IpAddr;
+        match ip {
+            IpAddr::V4(v4) => {
+                let [a, b, ..] = v4.octets();
+                !(v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified() || v4.is_broadcast() || (a == 100 && (64..128).contains(&b)))
+            }
+            IpAddr::V6(v6) => {
+                if let Some(v4) = v6.to_ipv4_mapped() {
+                    return far_away(IpAddr::V4(v4));
+                }
+                let first = v6.segments()[0];
+                !(v6.is_loopback() || v6.is_unspecified() || (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80)
+            }
+        }
+    }
+
     /// Puts the address that accepts a connection soonest at the front. A name often resolves
     /// to an IPv6 address that goes nowhere ahead of the IPv4 one that works; trying them in
     /// order would wait out a timeout on every new connection.
@@ -248,6 +309,7 @@ fn random_salt() -> String {
 }
 
 pub use nexus_core::text::encode;
+pub(crate) use dns::far_away;
 
 impl Client {
     pub fn new(server: &str, username: &str, password: &str) -> Client {

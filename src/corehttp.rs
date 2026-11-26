@@ -10,10 +10,10 @@ use nexus_core::http::{BODY_LIMIT, Failure, Http, Method, Request, Response, Str
 pub struct Agent(pub ureq::Agent);
 
 /// What the app asks the public services through (MusicBrainz, ListenBrainz): an agent that
-/// lets go of a connection idle for longer than `idle`, and follows a redirect only by
-/// `Public`'s rule.
+/// lets go of a connection idle for longer than `idle`, never connects to this machine or its
+/// network (`subsonic::make_public_agent`), and follows a redirect only by `Public`'s rule.
 pub fn public(idle: std::time::Duration) -> std::sync::Arc<dyn Http> {
-    std::sync::Arc::new(Public { inner: Box::new(Agent(crate::subsonic::make_agent_idle_without_redirects(idle))), resolve: resolve_name })
+    std::sync::Arc::new(Public { inner: Box::new(Agent(crate::subsonic::make_public_agent(idle))) })
 }
 
 /// How many redirects in a row a public service's answer is followed through.
@@ -21,37 +21,12 @@ const HOPS: usize = 5;
 
 /// A public service's requests, with its redirects followed by hand: only for a GET (a POST's
 /// answer is the answer, its redirect included), only from HTTPS to HTTPS, at most `HOPS` in a
-/// row, and never to an address on this machine or its network (loopback, link-local,
-/// private), whether written so or found so by looking the name up. A redirect that isn't
-/// followed is handed over as the answer.
+/// row, and never to an address written as one on this machine or its network (loopback,
+/// link-local, private, "localhost"). Where a name leads is judged where it's connected to, by
+/// the agent's resolver (`subsonic::dns::PublicResolver`), for every request. A redirect that
+/// isn't followed is handed over as the answer.
 pub struct Public {
     inner: Box<dyn Http>,
-    /// Looks a name up: the addresses a host and port lead to.
-    resolve: fn(&str, u16) -> Vec<std::net::IpAddr>,
-}
-
-fn resolve_name(host: &str, port: u16) -> Vec<std::net::IpAddr> {
-    use std::net::ToSocketAddrs;
-    (host, port).to_socket_addrs().map(|found| found.map(|address| address.ip()).collect()).unwrap_or_default()
-}
-
-/// An address on the open internet: not this machine, not its network, not one that isn't
-/// anywhere.
-fn far_away(ip: std::net::IpAddr) -> bool {
-    use std::net::IpAddr;
-    match ip {
-        IpAddr::V4(v4) => {
-            let [a, b, ..] = v4.octets();
-            !(v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified() || v4.is_broadcast() || (a == 100 && (64..128).contains(&b)))
-        }
-        IpAddr::V6(v6) => {
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                return far_away(IpAddr::V4(v4));
-            }
-            let first = v6.segments()[0];
-            !(v6.is_loopback() || v6.is_unspecified() || (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80)
-        }
-    }
 }
 
 impl Public {
@@ -74,11 +49,11 @@ impl Public {
         if host == "localhost" || host.ends_with(".localhost") {
             return None;
         }
-        let addresses = match host.parse::<std::net::IpAddr>() {
-            Ok(ip) => vec![ip],
-            Err(_) => (self.resolve)(&host, uri.port_u16().unwrap_or(443)),
-        };
-        (!addresses.is_empty() && addresses.into_iter().all(far_away)).then_some(to)
+        // (A name is judged where it's connected to: see `PublicResolver`.)
+        match host.parse::<std::net::IpAddr>() {
+            Ok(ip) => crate::subsonic::far_away(ip).then_some(to),
+            Err(_) => Some(to),
+        }
     }
 }
 
@@ -330,30 +305,30 @@ mod tests {
     }
 
     #[test]
-    fn the_public_services_redirects_are_followed_only_from_https_to_https() {
-        // A plain-HTTP answer that sends the caller elsewhere, here on this machine: not
-        // followed, for a GET or a POST; the redirect is the answer.
+    fn the_public_services_agent_never_connects_to_this_machine_or_its_network() {
+        // A server here, on this machine: asked by its address and by a name that leads to
+        // it, it is never reached. What's judged is what the agent connects to.
         let asked = Arc::new(AtomicUsize::new(0));
         let count = asked.clone();
-        let address = fake::server(move |path, _, stream| {
+        let address = fake::server(move |_, _, stream| {
             count.fetch_add(1, Ordering::SeqCst);
-            if path.starts_with("/moved") {
-                let _ = write!(stream, "HTTP/1.1 302 Found\r\nLocation: /here\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-            } else if path.starts_with("/kept") {
-                let _ = write!(stream, "HTTP/1.1 307 Temporary Redirect\r\nLocation: /here\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-            } else {
-                let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
-            }
+            let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
         });
         let public = super::public(Duration::from_secs(5));
-        let got = public.send(&Request::get(&format!("{address}/moved"))).unwrap();
-        assert_eq!((got.status, got.header("location")), (302, Some("/here")));
-        let body = "{\"recording_mbids\":[\"a\"]}";
-        let got = public.send(&Request { method: Method::Post(body), ..Request::get(&format!("{address}/moved")) }).unwrap();
-        assert_eq!(got.status, 302);
-        let got = public.send(&Request { method: Method::Post(body), ..Request::get(&format!("{address}/kept")) }).unwrap();
-        assert_eq!(got.status, 307);
-        assert_eq!(asked.load(Ordering::SeqCst), 3, "only the requests asked for were made");
+        let by_name = address.replace("127.0.0.1", "localhost");
+        for url in [address.clone(), by_name] {
+            assert!(public.send(&Request::get(&format!("{url}/ws/2/release"))).is_err(), "{url}");
+        }
+        assert_eq!(asked.load(Ordering::SeqCst), 0);
+        // The app's other agents still reach it (the music server is often on this network).
+        let got = Agent(crate::subsonic::make_agent_without_redirects()).send(&Request::get(&address)).unwrap();
+        assert_eq!((got.status, asked.load(Ordering::SeqCst)), (200, 1));
+        // A proxy on this machine is the person's own choice: it's reached (asked to connect
+        // on to the service, which it then looks up itself; this stand-in can't, which is
+        // no matter here).
+        let through = Agent(crate::subsonic::make_public_agent_through(&address));
+        let _ = through.send(&Request::get("http://musicbrainz.invalid/ws/2/release"));
+        assert_eq!(asked.load(Ordering::SeqCst), 2);
     }
 
     /// A public service that answers each address with a redirect to the next one listed,
@@ -373,15 +348,9 @@ mod tests {
         }
     }
 
-    /// Names resolve to addresses on the open internet, but for "inside.example", which
-    /// leads to one on the home network.
-    fn names(host: &str, _: u16) -> Vec<std::net::IpAddr> {
-        if host == "inside.example" { vec!["192.168.1.20".parse().unwrap()] } else { vec!["93.184.216.34".parse().unwrap()] }
-    }
-
     fn hops(to: Vec<(&'static str, &'static str)>) -> (u16, Vec<String>) {
         let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let public = super::Public { inner: Box::new(Hops { to, asked: asked.clone() }), resolve: names };
+        let public = super::Public { inner: Box::new(Hops { to, asked: asked.clone() }) };
         let status = public.send(&Request::get("https://a.example/start")).unwrap().status;
         let asked = asked.lock().unwrap().clone();
         (status, asked)
@@ -403,11 +372,17 @@ mod tests {
         six.push(("https://e.example/5", "https://f.example/6"));
         let (status, asked) = hops(six);
         assert_eq!((status, asked.len()), (302, 6));
-        // Not to plain HTTP, nor anywhere on this machine or its network, written or looked up.
-        for to in ["http://b.example/", "https://127.0.0.1/", "https://[::1]/", "https://10.0.0.5/", "https://169.254.1.1/", "https://[fe80::1]/", "https://[fd00::1]/", "https://localhost/", "https://inside.example/", "https://user@b.example/"] {
+        // Not to plain HTTP, nor anywhere written as on this machine or its network (a name
+        // that leads there is the resolver's: see the test above).
+        for to in ["http://b.example/", "https://127.0.0.1/", "https://[::1]/", "https://10.0.0.5/", "https://169.254.1.1/", "https://[fe80::1]/", "https://[fd00::1]/", "https://localhost/", "https://user@b.example/"] {
             let (status, asked) = hops(vec![("https://a.example/start", to)]);
             assert_eq!((status, asked.len()), (302, 1), "a redirect to {to}");
         }
+        // A POST's redirect is its answer.
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let public = super::Public { inner: Box::new(Hops { to: vec![("https://a.example/start", "https://b.example/1")], asked: asked.clone() }) };
+        let got = public.send(&Request { method: Method::Post("{}"), ..Request::get("https://a.example/start") }).unwrap();
+        assert_eq!((got.status, asked.lock().unwrap().len()), (302, 1));
     }
 
     /// A server for the writes test: every request on every connection written down by its
@@ -504,4 +479,3 @@ mod tests {
         assert_eq!(seen.iter().filter(|first| first.starts_with("PUT")).count(), 1, "{seen:?}");
     }
 }
-
