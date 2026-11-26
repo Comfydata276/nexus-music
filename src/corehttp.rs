@@ -36,10 +36,20 @@ impl Public {
         if from.scheme_str()? != "https" {
             return None;
         }
-        let to = if location.starts_with('/') && !location.starts_with("//") {
-            format!("https://{}{location}", from.authority()?)
-        } else {
+        // Resolved against the address that answered, then judged: "//host/path" is that host
+        // on this scheme; "/path" a path on this host; "?query" this path asked otherwise; "path" one beside this one.
+        let is_whole = location.split_once("://").is_some_and(|(scheme, _)| !scheme.is_empty() && scheme.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')));
+        let to = if is_whole {
             location.to_string()
+        } else if location.starts_with("//") {
+            format!("https:{location}")
+        } else if location.starts_with('/') {
+            format!("https://{}{location}", from.authority()?)
+        } else if location.starts_with('?') {
+            format!("https://{}{}{location}", from.authority()?, from.path())
+        } else {
+            let path = from.path();
+            format!("https://{}{}{location}", from.authority()?, &path[..path.rfind('/').map_or(0, |end| end + 1)])
         };
         let uri: ureq::http::Uri = to.parse().ok()?;
         if !uri.scheme_str()?.eq_ignore_ascii_case("https") || uri.authority()?.as_str().contains('@') {
@@ -375,6 +385,16 @@ mod tests {
         // Not to plain HTTP, nor anywhere written as on this machine or its network (a name
         // that leads there is the resolver's: see the test above).
         for to in ["http://b.example/", "https://127.0.0.1/", "https://[::1]/", "https://10.0.0.5/", "https://169.254.1.1/", "https://[fe80::1]/", "https://[fd00::1]/", "https://localhost/", "https://user@b.example/"] {
+            let (status, asked) = hops(vec![("https://a.example/start", to)]);
+            assert_eq!((status, asked.len()), (302, 1), "a redirect to {to}");
+        }
+        // A relative or "//host" place is resolved against the address that answered, then
+        // judged by the same rule.
+        for (to, lands) in [("//b.example/x", "https://b.example/x"), ("next", "https://a.example/next"), ("?page=2", "https://a.example/start?page=2")] {
+            let (status, asked) = hops(vec![("https://a.example/start", to)]);
+            assert_eq!((status, asked.last().map(String::as_str)), (200, Some(lands)), "a redirect to {to}");
+        }
+        for to in ["//127.0.0.1/x", "//localhost/x", "//user@b.example/x"] {
             let (status, asked) = hops(vec![("https://a.example/start", to)]);
             assert_eq!((status, asked.len()), (302, 1), "a redirect to {to}");
         }
