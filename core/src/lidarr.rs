@@ -633,12 +633,14 @@ impl Lidarr {
 
     /// Has Lidarr keep track of an artist: every album of theirs goes on its list, and new
     /// ones will as they come out. Returns how many albums that put on the list. Seen through
-    /// once it has changed anything, as `request` is.
-    pub fn add_artist(&self, artist: &str, name: &str) -> Result<usize, String> {
-        self.seeing_through().adding_artist(artist, name)
+    /// once it has changed anything, as `request` is, and one step at a time with every other
+    /// change to an artist's record (`WayBack::turn`): it reads the record and writes it back.
+    pub fn add_artist(&self, artist: &str, name: &str, way_back: &dyn WayBack) -> Result<usize, String> {
+        self.seeing_through().adding_artist(artist, name, way_back)
     }
 
-    fn adding_artist(&self, artist: &str, name: &str) -> Result<usize, String> {
+    fn adding_artist(&self, artist: &str, name: &str, way_back: &dyn WayBack) -> Result<usize, String> {
+        let _turn = way_back.turn();
         let Some((known, _)) = self.known_artist(artist)? else {
             let folders: Vec<RootFolder> = self.get("rootfolder")?;
             let folder = folders.first().ok_or("Lidarr has no music folder set up yet.")?;

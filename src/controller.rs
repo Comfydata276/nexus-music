@@ -1751,7 +1751,7 @@ impl Controller {
         let Some(lidarr) = crate::lidarr::current() else { return };
         self.toast(nexus_core::requests::adding_now(&name));
         self.requests_pool.spawn(move || {
-            let result = lidarr.add_artist(&artist, &name);
+            let result = lidarr.add_artist(&artist, &name, crate::bulk::way_back());
             post(move |ctl| match result {
                 Ok(_) => {
                     ctl.refresh_outside();
