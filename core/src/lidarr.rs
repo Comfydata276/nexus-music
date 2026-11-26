@@ -840,7 +840,7 @@ impl Lidarr {
                 let restored = self.restore_new_releases(artist, &before);
                 // Crossed off only if this request wrote it.
                 if restored.is_ok() && wrote {
-                    way_back.put_back(self.address(), artist, &before);
+                    way_back.put_back(&self.way_back_address(), artist, &before);
                 }
                 outcome.and(restored.map_err(|_| {
                     format!("Asked for “{}”, but couldn't turn new releases back on for {} in Lidarr. Check that artist's settings there.", wanted.title, wanted.artist)
@@ -940,12 +940,12 @@ impl Lidarr {
             return Ok(None);
         }
         let before = record.get("monitorNewItems").and_then(|setting| setting.as_str()).unwrap_or("all").to_string();
-        let wrote = way_back.keep(self.address(), artist, &before)?;
+        let wrote = way_back.keep(&self.way_back_address(), artist, &before)?;
         // Turned back before the setting is changed: nothing to put back, and what was
         // written is crossed off.
         let refused = |reason: String| {
             if wrote {
-                way_back.put_back(self.address(), artist, &before);
+                way_back.put_back(&self.way_back_address(), artist, &before);
             }
             reason
         };
@@ -980,6 +980,19 @@ impl Lidarr {
     /// Where this Lidarr is: what tells one from another.
     pub fn address(&self) -> &str {
         &self.base
+    }
+
+    /// The address a way back is written under and matched by (`WayBack::keep`): as
+    /// `address`, without a name and password in it (a reverse proxy's), so that none is
+    /// written down beside the way back and a changed password doesn't strand it.
+    pub fn way_back_address(&self) -> String {
+        let Some((scheme, rest)) = self.base.split_once("://") else { return self.base.clone() };
+        let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        let (authority, after) = rest.split_at(end);
+        let authority = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+        // An empty port is the scheme's own (`origin_saved`).
+        let authority = authority.strip_suffix(':').unwrap_or(authority);
+        format!("{scheme}://{authority}{after}")
     }
 
     /// Lidarr's own numbers for the artists it keeps track of, by their MusicBrainz ids.

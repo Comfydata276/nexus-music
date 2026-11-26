@@ -46,6 +46,9 @@ const POLL: Duration = Duration::from_secs(5);
 /// How long Lidarr must have had nothing under way for an artist before what it ended up
 /// with is looked at: it does its reading-in as several jobs with a moment between them.
 const QUIET: Duration = Duration::from_secs(10);
+/// How many times finishing an artist is put off because Lidarr is at them again once the turn
+/// is finishing's: after that, the artist found quiet before the turn is enough.
+const PUT_OFF: u32 = 3;
 /// How long Lidarr's list of jobs can go without changing at all before the batch stops
 /// waiting for it. (It reads artists in a few at a time and finishes most of them together
 /// at the end, so a long wait for the first to finish means nothing.)
@@ -280,6 +283,9 @@ pub struct Job {
     /// One step of the way back at a time (`WayBack::turn`). Never taken by the window's
     /// thread.
     turn: Mutex<()>,
+    /// How many times in a row finishing has found an artist busy again once it had the turn
+    /// (`finish`): after `PUT_OFF`, it goes by the look before the turn.
+    put_off: Mutex<HashMap<i64, u32>>,
     /// Held by whoever writes the batch down, from taking the copy to writing it, so that a
     /// copy taken earlier is never written over one taken later; the batch itself is let go
     /// before the disk is touched (`save`).
@@ -311,6 +317,7 @@ impl Job {
             told: Mutex::new(None),
             desk: Box::new(desk),
             turn: Mutex::new(()),
+            put_off: Mutex::new(HashMap::new()),
             writing: Mutex::new(()),
         }
     }
@@ -940,7 +947,7 @@ impl Job {
         // Lidarr may be reading the artist in still: their singles, for an earlier go at this,
         // or all of them, if they were added a moment before the app last closed. Then what
         // isn't listed yet may be soon, and is looked for again when Lidarr has finished.
-        let mut reading = self.with(|batch| batch.restore.iter().any(|known| known.of(lidarr.address(), artist)));
+        let mut reading = self.with(|batch| batch.restore.iter().any(|known| known.of(&lidarr.way_back_address(), artist)));
         if !reading && offers.iter().any(|offer| !listed.iter().any(|known| known.album == offer.album)) {
             reading = listed.is_empty() || twice(lidarr, || lidarr.busy_with(&HashSet::from([artist])))?.contains(&artist);
         }
@@ -1066,7 +1073,7 @@ impl Job {
         let mut errors = 0;
         loop {
             let waiting: HashSet<i64> = self.with(|batch| {
-                batch.wants.iter().filter(|want| want.state == State::Asked).map(|want| want.lidarr_artist).chain(batch.restore.iter().filter(|back| back.for_lidarr(lidarr.address())).map(|back| back.artist)).collect()
+                batch.wants.iter().filter(|want| want.state == State::Asked).map(|want| want.lidarr_artist).chain(batch.restore.iter().filter(|back| back.for_lidarr(&lidarr.way_back_address())).map(|back| back.artist)).collect()
             });
             if waiting.is_empty() {
                 return Ok(());
@@ -1124,8 +1131,12 @@ impl Job {
         // what Lidarr lists is read once the step is this one's, so that what is decided from
         // it isn't from before another step changed the artist.
         let turn = crate::lidarr::WayBack::turn(self);
-        // It was found idle before the turn was this one's: looked at again, now that it is.
-        if lidarr.busy_with(&HashSet::from([artist]))?.contains(&artist) {
+        // It was found idle before the turn was this one's: looked at again, now that it is;
+        // but not more than `PUT_OFF` times, or finishing could be put off for ever.
+        let put_off = || self.put_off.lock().unwrap_or_else(|stuck| stuck.into_inner());
+        let times = put_off().get(&artist).copied().unwrap_or(0);
+        if times < PUT_OFF && lidarr.busy_with(&HashSet::from([artist]))?.contains(&artist) {
+            *put_off().entry(artist).or_default() += 1;
             return Ok(Finished::Busy);
         }
         let listed = lidarr.listed(artist)?;
@@ -1138,10 +1149,11 @@ impl Job {
         let wanted: Vec<i64> =
             places.iter().filter_map(|(_, offer)| listed.iter().find(|known| known.album == offer.album)).filter(|known| !known.wanted && !known.have).map(|known| known.id).collect();
         lidarr.want(artist, &wanted)?;
-        if let Some(before) = self.with(|batch| batch.restore.iter().find(|known| known.of(lidarr.address(), artist)).map(|known| known.before.clone())) {
+        if let Some(before) = self.with(|batch| batch.restore.iter().find(|known| known.of(&lidarr.way_back_address(), artist)).map(|known| known.before.clone())) {
             lidarr.set_new_releases(artist, &before)?;
-            self.with(|batch| batch.restore.retain(|known| !known.of(lidarr.address(), artist)));
+            self.with(|batch| batch.restore.retain(|known| !known.of(&lidarr.way_back_address(), artist)));
         }
+        put_off().remove(&artist);
         drop(turn);
         let (notes, gone) = self.with(|batch| {
             let (mut notes, mut gone) = (Vec::new(), Vec::new());
@@ -2011,7 +2023,7 @@ mod tests {
         let written = job.with(|batch| serde_json::to_value(&*batch).unwrap());
         assert_eq!(written["restore"], serde_json::json!([[5, "all"]]));
         let (b, sent_b) = recording("lidarr-b.test");
-        assert!(job.unfinished(b.address()));
+        assert!(job.unfinished(&b.way_back_address()));
         assert_eq!(job.finish(&b, 5, true, &|_| {}), Ok(Finished::Done));
         assert_eq!(puts(&sent_b).len(), 1);
         assert!(job.with(|batch| batch.restore.is_empty()));
@@ -2027,5 +2039,38 @@ mod tests {
         assert_eq!(job.finish(&lidarr, 5, true, &|_| {}), Ok(Finished::Busy));
         assert_eq!(puts(&sent), Vec::<String>::new());
         assert_eq!(job.with(|batch| batch.restore.len()), 1);
+    }
+
+    #[test]
+    fn a_way_back_names_its_lidarr_without_the_name_and_password_in_its_address() {
+        // An address saved with a reverse proxy's name and password in it (and an empty port).
+        let (before, _) = recording("http://walk:old-secret@lidarr.test:/base/");
+        let kept = Arc::new(Mutex::new(None));
+        let job = Job::new(Kept(kept.clone()));
+        assert_eq!(crate::lidarr::WayBack::keep(&job, &before.way_back_address(), 5, "all"), Ok(true));
+        let written = String::from_utf8(kept.lock().unwrap().clone().unwrap()).unwrap();
+        assert!(!written.contains("walk") && !written.contains("old-secret"), "{written}");
+        assert!(written.contains(r#"[5,"all","http://lidarr.test/base"]"#), "{written}");
+        // The password changed since: still that Lidarr's way back, and put back there.
+        let (after, sent) = recording("http://walk:new-secret@lidarr.test/base");
+        assert!(job.unfinished(&after.way_back_address()));
+        assert_eq!(job.finish(&after, 5, true, &|_| {}), Ok(Finished::Done));
+        assert_eq!(puts(&sent).len(), 1);
+        assert!(job.with(|batch| batch.restore.is_empty()));
+    }
+
+    #[test]
+    fn finishing_is_put_off_for_an_artist_busy_in_the_turn_three_times_and_not_a_fourth() {
+        // Found quiet before the turn each time; busy again once finishing has it, four times.
+        let job = Job::new(Kept(Arc::new(Mutex::new(None))));
+        job.with(|batch| batch.restore.push(Back { artist: 5, before: "all".into(), lidarr: Some(HERE.into()) }));
+        let (lidarr, sent) = recording_busy("lidarr.test", true);
+        for _ in 0..3 {
+            assert_eq!(job.finish(&lidarr, 5, true, &|_| {}), Ok(Finished::Busy));
+        }
+        assert_eq!(puts(&sent), Vec::<String>::new());
+        assert_eq!(job.finish(&lidarr, 5, true, &|_| {}), Ok(Finished::Done), "finishing was put off for ever");
+        assert_eq!(puts(&sent).len(), 1);
+        assert!(job.with(|batch| batch.restore.is_empty()));
     }
 }
