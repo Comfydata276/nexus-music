@@ -1296,6 +1296,9 @@ impl Controller {
             post(move |ctl| {
                 let page = ctl.ui.global::<ui::Settings>();
                 let launched = result.and_then(|path| {
+                    // The installer closes the app as it starts, maybe before the save at the
+                    // end of `main`: the settings are on the disk first, as 0.40.10 had them.
+                    ctl.save_settings();
                     crate::update::run_installer(&path).map_err(|e| format!("Couldn't start the installer: {e}"))
                 });
                 match launched {
