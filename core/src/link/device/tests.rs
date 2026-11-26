@@ -39,6 +39,9 @@ struct Fake {
     takes_nothing: bool,
     /// Told to stop, it goes on sounding.
     does_not_stop: bool,
+    /// Told to stop, it does, and is sounding again when asked: something changed, and
+    /// it has not stopped.
+    stops_and_starts_again: bool,
     /// Its own rules refuse to start playing (as a phone's do while a call is on).
     may_not_play: bool,
 }
@@ -100,6 +103,11 @@ impl Player for Fake {
     fn carry_out(&mut self, command: &Command, ready: &Ready) -> Carried {
         match command {
             Command::Pause | Command::Moved if self.does_not_stop => Carried::Refused,
+            // (It pauses, and something starts it again before the call is over.)
+            Command::Pause | Command::Moved if self.stops_and_starts_again && self.playing => {
+                self.position += 1.0;
+                Carried::Changed
+            }
             Command::Play if self.may_not_play && !self.playing => Carried::Refused,
             _ => self.carry(command, ready),
         }
@@ -1122,6 +1130,23 @@ fn answer_on_the_path(world: &World) -> Option<super::super::message::Tell> {
         let opened = frame::open(&keys, &frame.text, &frame.from, &frame.to)?;
         read_tell(&opened.message).filter(|tell| tell.re.is_some() && tell.ok.is_some())
     })
+}
+
+/// A device told its music has moved changes something for it (it pauses, and something
+/// starts it again) and is still playing. **Nothing is recorded as carried out until the
+/// player says it has stopped**: the change is counted, as nobody's; the command is not
+/// named as having made the state; and its sender, told it could not, is not also told
+/// it was done.
+#[test]
+fn a_stop_that_changed_something_and_did_not_stop_is_not_recorded_as_carried_out() {
+    let mut world = taking(|world| world.copies[B].player.stops_and_starts_again = true);
+    world.pass(1_000);
+    let b = &world.copies[B].player;
+    assert_eq!((b.playing, b.handed_on.len(), b.handed_back, b.rule.by()), (true, 1, 1, None), "{:?}", world.copies[B].log);
+    // (The change is counted: a command made against the state before it is refused.)
+    assert_eq!(b.rule.generation(), 2);
+    assert!(world.last(B, "moved from").contains("refused, Cannot"), "{:?}", world.copies[B].log);
+    assert_eq!(said(&world), "Playing here. Copy B couldn't be stopped, so it is still playing too.");
 }
 
 #[test]

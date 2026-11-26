@@ -896,6 +896,8 @@ mod tests {
         ThrewAfterChanging,
         /// Told to stop, the player goes on sounding (by a command or by the phone itself).
         DoesNotStop,
+        /// Told to stop, it does, and something has started it again when it is asked.
+        StopsAndStartsAgain,
         /// The app's own rules will not start playing (a call is on).
         MayNotPlay,
         /// The app cannot record whose the queue is: the call fails.
@@ -971,6 +973,7 @@ mod tests {
             let carried = match (command, ready) {
                 (Command::Pause | Command::Moved, _) if self.sound.is_none() => already,
                 (Command::Pause | Command::Moved, _) if self.wrong == Some(Wrong::DoesNotStop) => refused,
+                (Command::Pause | Command::Moved, _) if self.wrong == Some(Wrong::StopsAndStartsAgain) => changed,
                 (Command::Pause | Command::Moved, _) => {
                     self.sound = None;
                     changed
@@ -1026,7 +1029,7 @@ mod tests {
         }
         fn pause(&mut self) {
             self.asked.push("pause, its own".into());
-            if self.wrong != Some(Wrong::DoesNotStop) {
+            if !matches!(self.wrong, Some(Wrong::DoesNotStop | Wrong::StopsAndStartsAgain)) {
                 self.sound = None;
                 self.tell("pause");
             }
@@ -1536,6 +1539,22 @@ mod tests {
         let came = hear(&phone, &mut player, session, &place, vec![command(2, &place, Command::Play, 1)], 2_100, &mut n);
         let tell = answered(&came, &place);
         assert_eq!((tell.ok, tell.why, order(&phone, 2_100)), (Some(true), Some(Why::Nothing), (1, None, false)));
+    }
+
+    /// Told its music has moved, the phone pauses and something starts it again before
+    /// it is asked whether it stopped. The command changed something and the phone has
+    /// not stopped: its answer says it could not, and does not also name the command as
+    /// carried out; the queue is the phone's own still.
+    #[test]
+    fn a_stop_is_not_recorded_until_the_phone_says_it_has_stopped() {
+        let mut n = 0;
+        let (phone, mut player, session, place) = phone(&mut n);
+        player.wrong = Some(Wrong::StopsAndStartsAgain);
+        let came = hear(&phone, &mut player, session, &place, vec![command(1, &place, Command::Moved, 1)], 2_000, &mut n);
+        let tell = answered(&came, &place);
+        assert_eq!((tell.ok, tell.why, tell.by, tell.done, tell.playing, tell.at.generation), (Some(false), Some(Why::Cannot), None, false, true, 2));
+        assert_eq!(player.asked, ["handed on, sounding", "moved", "handed back"]);
+        assert_eq!(order(&phone, 2_000), (2, None, false));
     }
 
     /// A call up that changed the player and then failed, at whatever point: there is no

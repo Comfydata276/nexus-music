@@ -197,8 +197,9 @@ impl Rule {
     /// what the player changed has still changed: the generation moves, and no command is
     /// named as having made the state.)
     ///
-    /// `by` is that command's nonce; or nothing, where the player could not say what it
-    /// did: then it is a change that no command is named for.
+    /// `by` is that command's nonce; or nothing, for a command that changed something and
+    /// was not carried out (told to stop for a move, the player changed and went on
+    /// playing): then it is a change that no command is named for.
     pub fn carried(&mut self, carrying: Carrying, changed: bool, by: Option<Nonce>) {
         let open = self.command.is_some_and(|(id, _)| id == carrying.0);
         if open {

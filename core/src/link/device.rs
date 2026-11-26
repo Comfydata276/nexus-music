@@ -843,6 +843,13 @@ impl Device {
     /// carried out and has not sounded yet: its sender, looking because no answer has
     /// come, sees that it arrived and is under way, and waits on. (Only while busy: a
     /// state that named it and was not busy would say it was done.)
+    ///
+    /// **A command is named in `by` with `done` only if it was carried out to its end.**
+    /// One that was not (the player refused it, or it was the stop that ends a move and
+    /// the player did not stop) is never recorded as the state's maker, so the answer
+    /// that refuses it cannot also say it was done. (The one refusal that does name its
+    /// own command so is the refusal of a second copy of a frame whose first copy was
+    /// carried out: there `by` and `done` are the truth, and the sender goes by them.)
     fn state(&self, re: Option<Nonce>, ok: Option<bool>, why: Option<Why>, env: &Env) -> Tell {
         let brief = env.player.brief();
         let busy = env.player.busy(env.now_ms);
@@ -1045,6 +1052,16 @@ impl Device {
         // command's sender answered, from the player as it now is.
         let before = env.player.queue();
         let carried = env.player.carry_out(&command, &ready);
+        if handing && env.player.brief().playing {
+            // It was told to stop and is still sounding. **Nothing is recorded as carried
+            // out**: whatever the player changed on the way is counted as a change nobody
+            // is named for, so that the answer, which says it could not, cannot also name
+            // this command as the one that made the state. Its queue is its own still.
+            env.player.handed_back();
+            env.player.carried(carrying, carried == Carried::Changed, None);
+            out.push(Do::Log(format!("moved from {}: this device could not be stopped, and is still playing", text::place(&from))));
+            return self.refused(session, from, nonce, &command, at, Why::Cannot, env, out);
+        }
         let changed = match (&command, carried) {
             // A queue to take over is in the player if the player's queue has a new
             // number: that is the one thing gone by.
@@ -1052,19 +1069,19 @@ impl Device {
             (_, carried) => carried == Carried::Changed,
         };
         env.player.carried(carrying, changed, Some(nonce));
-        if handing && env.player.brief().playing {
-            // It was told to stop and is still sounding: it is not acknowledged as
-            // stopped, and its queue is its own still.
-            env.player.handed_back();
-            out.push(Do::Log(format!("moved from {}: this device could not be stopped, and is still playing", text::place(&from))));
-            return self.refused(session, from, nonce, &command, at, Why::Cannot, env, out);
-        }
         if !changed {
             // The player did nothing, and has said which: it was already as the command
             // asked, which is no fault and is said as such; or it refused, or could not.
             // Nothing has moved. (A queue to take over is never "so already": one that is
             // not in the player was not taken.)
+            // (And the stop that ends a move is answered by the one thing that counts for
+            // it, looked at above: the player says it is not playing.)
             return match carried {
+                _ if handing => {
+                    out.push(Do::Log(format!("{} from {} against generation {}: nothing to do, it was so already", command.name(), text::place(&from), at.generation)));
+                    let answer = self.state(Some(nonce), Some(true), Some(Why::Nothing), env);
+                    self.answer(session, from, answer, env, out);
+                }
                 Carried::AlreadySo if !matches!(command, Command::Adopt(_)) => {
                     out.push(Do::Log(format!("{} from {} against generation {}: nothing to do, it was so already", command.name(), text::place(&from), at.generation)));
                     let answer = self.state(Some(nonce), Some(true), Some(Why::Nothing), env);
