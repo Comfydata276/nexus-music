@@ -116,6 +116,22 @@ Its comment:
 
 `secret` is 32 random bytes, base64url without padding.
 
+**Both apps hide it, in every copy, whether or not linking is on in that copy.** A
+playlist's description is on show wherever the playlist is, and this one's is the
+secret; and the copies with linking off are the person's other devices during a test,
+and everyone else's for good. So in every build of both apps a playlist **whose
+comment is a linking record by the library's own reading** (`secret::is_record`),
+whatever it is called, and one of the reserved name with an empty comment (a device
+has made it and not yet written into it), is not listed, not opened, not offered to
+add songs to, and never written to a cache of pages; from a list an older version
+kept, that one row is dropped and the rest stays. It goes by what the playlist holds:
+one that only has the name, with a description of the person's own, is theirs and is
+shown. A playlist of the person's own may not be *given* the name in any copy ("Nexus
+Music keeps that name for itself, for linking your devices. Choose another."): made
+with an empty comment, it would be hidden at once and taken for the record by a
+device with linking on. Other apps, and the music server's own pages, show the
+playlist and its description as they show any (weakness 1).
+
 A **look** is: list the playlists; choose by the rule of `core/src/step.rs` (`find`:
 the lowest id among those of that name whose owner the server states to be this
 account); fetch that playlist; check what was fetched. The fetched playlist counts
