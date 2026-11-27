@@ -195,7 +195,7 @@ mod tests {
         for value in [
             "http://navidrome:4533",
             "https://music.example.org",
-            "http://192.168.1.20:4533/music/",
+            "http://192.0.2.20:4533/music/",
             "http://[fd00::20]:4533",
             "http://[fd00::20]",
             "http://navidrome.local:4533/a-b_c.d~e",
