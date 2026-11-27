@@ -288,7 +288,7 @@ fn due(ui: &ui::MainWindow, generation: u64) {
             note(format_args!("offline {generation}"));
             schedule(ui, generation, later());
         }
-        Dispatch::Busy => schedule(ui, generation, BUSY),
+        Dispatch::Busy => schedule(ui, generation, test_ms("NEXUS_TEST_PROBE_AGAIN_MS").unwrap_or(BUSY)),
         Dispatch::Go => {
             IN_FLIGHT.store(true, Ordering::SeqCst);
             note(format_args!("dispatch {generation} offline=false"));

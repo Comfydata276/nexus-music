@@ -8,8 +8,8 @@ The mode file is read at every request, so a test can change the mode under a ru
 
     found      `hello` answered as the backend answers it
     stalled    the request is read, and nothing is ever sent back (the connection is held)
-    saturated  every answer is "busy" (503), slowly: nothing for 10 s, then the body a byte
-               every half second
+    saturated  every answer is "busy" (503), slowly: nothing for 10 s, then a long body a
+               byte a second
     ended      every answer is "not signed in" (401), at once
     half       `hello`'s headers and half its body, then the connection is reset
     bodystall  200 and `hello`'s headers, and the body never comes
@@ -67,19 +67,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             while True:
                 time.sleep(3600)
         if m == "saturated":
+            # "Busy", slowly: the status after 10 s, then a long body a byte a second.
             time.sleep(10)
-            body = b'{"error":"busy, try again later"}'
             self.send_response(503)
             self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Content-Length", "100000")
             self.send_header("Retry-After", "60")
             self.end_headers()
             self.wfile.flush()
-            for byte in body:
-                self.wfile.write(bytes([byte]))
+            while True:
+                self.wfile.write(b" ")
                 self.wfile.flush()
-                time.sleep(0.5)
-            return
+                time.sleep(1)
         if m == "bodystall":
             # A 200 whose body never comes.
             self.send_response(200)

@@ -401,15 +401,19 @@ def populate():
 
 # ---- one run -------------------------------------------------------------------------------
 
-SUITE = 2   # results of an earlier form of the suite are not compared with
-# The stand-in's modes in which a look is held up (it waits, and ends only at its deadline):
-# in these the component is made to look again 0.2 s after each look ends, so that one is
-# being waited on through every action, and the run shows it was.
+SUITE = 3   # results of an earlier form of the suite are not compared with
+# The stand-in's modes in which a look is held up. In these one look is held for as long as
+# the stand-in holds it (the component's deadline made an hour long, a test hook), a look is
+# started just before an action when none is running (another), and the same look's process
+# must still be running, unanswered, when the action has completed.
 STUCK = ("stalled", "blackhole", "saturated")
+# The proxy ends a connection it is still trying to make after 75 s: in the black-hole mode a
+# look older than this is let end before an action, and a new one started.
+FRESH_FOR = {"blackhole": 35.0}
 # What else the component (the "new" build) is put through, beside the stand-in's mode.
 HOOKS = {
     None: "",
-    # Its look's thread held in a call that never returns, from its first look on.
+    # Its look's thread held in a call that never returns, from the first tick on.
     "held": "",
     # Not switched on: nothing of it may be made.
     "switch-off": "",
@@ -417,6 +421,9 @@ HOOKS = {
     # 0.3 s at each look (shorter than the 1 s allowed for timers).
     "sabotage": "",
 }
+# Steps during which the music server is lost on purpose: not held to the music server's
+# own answers being quick.
+MUSIC_DOWN_STEPS = ("by_loss_and_retry", "resumed")
 
 
 class Failed(Exception):
@@ -433,8 +440,9 @@ class Run:
         self.on = self.new and hook != "switch-off"
         self.stuck = self.on and mode in STUCK and hook not in ("sabotage", "held")
         self.held = self.on and hook == "held"
-        self.enforce = False   # holds are checked from the component's first look of a start
+        self.faulted = self.stuck or self.held
         self.music_down = False
+        self.holds = []
 
     def say(self, *what):
         line = " ".join(str(w) for w in what)
@@ -460,21 +468,22 @@ class Run:
         if not ok:
             self.fail(test, f"{what}: {seen}")
 
-    def step(self, test, body):
-        """One action: the component's hold verified live before it, the action, and the
-        same hold verified again when it has completed."""
+    def step(self, test, body, cold=False):
+        """One action, under the fault: the fault made sure of and named before it (for the
+        first action of a start, the fault from the first tick, checked after), the action,
+        and the SAME fault found still in force when the action has completed."""
         self.say(f"\n{test}")
         self.music_down = False
+        name = getattr(body, "__name__", test)
         try:
-            checked = self.enforce
-            before = self.hold(test, "before")
+            before = None if cold else self.arm(test)
             began = time.time()
             body()
-            if checked:
-                self.windows.append((test, began, time.time()))
-            after = self.hold(test, "after")
-            if self.held and self.enforce and before != after:
-                self.fail(test, f"the hold before ({before}) is not the hold after ({after})")
+            ended = time.time()
+            self.windows.append((test, name, began, ended))
+            after = self.still(test, before, cold, ended)
+            if self.faulted:
+                self.holds.append((test, name, after))
         except Exception as error:  # A test that fails says so, and the run goes on.
             self.fail(test, f"{type(error).__name__}: {error}")
             try:
@@ -489,90 +498,125 @@ class Run:
             if self.music_down:
                 self.front.music(True)
 
-    # -- the component's side, live ------------------------------------------------------------
+    # -- the fault, live ------------------------------------------------------------------------
 
     def nexus_log(self):
-        """What the component did (NEXUS_TEST_NEXUS_LOG): (time, word, rest) a line each."""
+        """What the component did (NEXUS_TEST_NEXUS_LOG): (time, word, the rest) a line each."""
         try:
             lines = open(self.copy.path("nexus.log")).read().splitlines()
         except OSError:
             return []
-        return [(float(t), word, rest) for t, word, *more in (l.split(" ", 2) + [""] for l in lines) for rest in [more[0] if more else ""]]
+        out = []
+        for line in lines:
+            parts = line.split(" ", 2)
+            if len(parts) >= 2:
+                out.append((float(parts[0]), parts[1], parts[2] if len(parts) > 2 else ""))
+        return out
 
-    def in_flight(self):
-        """A look the component is waiting on right now."""
-        started = ended = 0
-        for _, word, _ in self.nexus_log():
-            started += word == "start"
-            ended += word == "end"
-        return started > ended
+    def looks(self):
+        """Each look's process this start: pid -> (when spawned, when it ended or None)."""
+        looks = {}
+        for t, word, rest in self.nexus_log():
+            if t < self.copy.started:
+                continue
+            fields = rest.split()
+            if word == "spawned" and len(fields) >= 2:
+                looks[fields[1]] = [t, None]
+            elif word in ("ended", "killed") and len(fields) >= 2 and fields[1] in looks:
+                looks[fields[1]][1] = t
+        return looks
 
-    def hold(self, test, when):
-        """Verifies, live, that the component's side is held up now: its look's thread held
-        (`held`), or a look being waited on (the stuck modes). Returns what it saw."""
-        if not self.enforce:
-            return None
+    def alive(self, pid):
+        return A.sh(f"docker exec {A.NAME} test -d /proc/{pid}").returncode == 0
+
+    def live_look(self):
+        for pid, (spawned, ended) in self.looks().items():
+            if ended is None and self.alive(pid):
+                return pid, spawned
+        return None, None
+
+    def held_thread(self):
+        marker = self.copy.path("held")
+        if not os.path.exists(marker):
+            return None, None
+        thread = open(marker).read().strip()
+        return (thread, os.path.getmtime(marker)) if thread and self.alive(thread) else (None, None)
+
+    def arm(self, test):
+        """Before an action: the fault in force now, and which it is."""
         if self.held:
-            marker = self.copy.path("held")
-            if not os.path.exists(marker):
-                raise Failed(f"{when}: no held look")
-            thread = open(marker).read().strip()
-            alive = A.sh(f"docker exec {A.NAME} test -d /proc/{thread}").returncode == 0
-            if not alive:
-                raise Failed(f"{when}: the held look's thread {thread} is gone")
-            return thread
+            thread, _ = self.held_thread()
+            if not thread:
+                raise Failed("before: no held look")
+            return ("thread", thread)
         if self.stuck:
-            try:
-                until(self.in_flight, 3, 0.05, "a look being waited on")
-            except TimeoutError:
-                raise Failed(f"{when}: no look was being waited on")
-            return "in flight"
+            pid, spawned = self.live_look()
+            fresh = FRESH_FOR.get(self.mode)
+            if pid and fresh and time.time() - spawned > fresh:
+                # (The proxy would end it during the action: let it end first.)
+                until(lambda: self.looks()[pid][1] is not None or not self.alive(pid), 90, 0.2, "the old look to end")
+                pid = None
+            if not pid:
+                open(self.copy.path("trigger"), "w").write("")
+                pid, _ = until(lambda: (lambda found: found if found[0] else None)(self.live_look()), 10, 0.05, "a look started")
+            return ("look", pid)
         return None
 
-    def wait_for_first_look(self, launched):
-        """From the component's first look of this start on, its holds are checked. Its first
-        look must come after the account's first page and its queue are usable."""
-        if not (self.held or self.stuck):
-            return
+    def still(self, test, before, cold, ended):
+        """After an action: the same fault still in force."""
+        if not self.faulted:
+            return None
         if self.held:
-            until(lambda: os.path.exists(self.copy.path("held")), 20, 0.05, "the held look")
-        else:
-            until(self.in_flight, 20, 0.05, "the first look")
-        first = min((t for t, word, _ in self.nexus_log() if word == "start" and t > self.copy.started), default=None)
-        if self.held:
-            first = os.path.getmtime(self.copy.path("held"))
-        usable = getattr(self, "usable_at", None)
-        self.expect("ordering", f"first_look_after_home_and_queue ({launched})", first is not None and usable is not None and first > usable, f"{first} > {usable}")
-        self.enforce = True
+            thread, since = self.held_thread()
+            if not thread:
+                raise Failed("after: the held look's thread is gone")
+            if cold and since > self.home_at:
+                raise Failed(f"after: the hold began {since - self.home_at:.2f} s after the first page was drawn")
+            if before and before[1] != thread:
+                raise Failed(f"after: held thread {thread}, not {before[1]}")
+            return ("thread", thread)
+        pid, spawned = self.live_look()
+        if before:
+            pid = before[1]
+            spawned, gone = self.looks().get(pid, (None, True))
+            if gone is not None or not self.alive(pid):
+                raise Failed(f"after: look {pid} ended during the action")
+        elif not pid:
+            raise Failed("after: no look in flight")
+        elif cold and spawned > self.home_at:
+            raise Failed(f"after: the look began {spawned - self.home_at:.2f} s after the first page was drawn")
+        return ("look", pid)
 
-    def coverage(self):
-        """In the stuck modes: for every action from the first look on, a look was being
-        waited on throughout, with no gap longer than 1 s between two looks."""
-        if not self.stuck:
+    def first_look_after_home(self, launched):
+        """Unfaulted, the component's first look of a start comes after the account's first
+        page and its queue are usable (five seconds after the account is published)."""
+        if not self.on or self.faulted or self.hook == "sabotage":
             return
-        looks, opened = [], None
-        for t, word, _ in self.nexus_log():
-            if word == "start":
-                opened = t
-            elif word == "end" and opened is not None:
-                looks.append((opened, t))
-                opened = None
-        if opened is not None:
-            looks.append((opened, time.time()))
-        worst = 0.0
-        for test, t0, t1 in self.windows:
-            if t1 < (looks[0][0] if looks else 0) or test == "ordering":
+        until(lambda: any(word == "dispatch" and t > self.copy.started for t, word, _ in self.nexus_log()), 20, 0.1, "the first look")
+        first = min(t for t, word, _ in self.nexus_log() if word == "dispatch" and t > self.copy.started)
+        self.expect("ordering", f"first_look_after_home_and_queue ({launched})", first > self.usable_at, f"{first:.3f} > {self.usable_at:.3f}")
+
+    def music_was_answering(self):
+        """Through every action (but those that lose the music server on purpose), the music
+        server's own API answered every request the app made, each within a second."""
+        api = []
+        for line in open(os.path.join(self.out, "front", "access.log")):
+            parts = line.split(" ", 3)
+            if len(parts) < 4 or "/rest/" not in parts[3] or any(x in parts[3] for x in ("/rest/stream", "/rest/download", "/rest/getCoverArt")):
                 continue
-            covered, at = [l for l in looks if l[1] >= t0 and l[0] <= t1], t0
-            gap = 0.0
-            for start, end in covered:
-                gap = max(gap, start - at)
-                at = max(at, end)
-            gap = max(gap, t1 - at)
-            worst = max(worst, gap)
-            if gap > 1.0:
-                self.fail(test, f"no look was waited on for {gap:.2f} s of it")
-        self.fact("backend", "longest_time_no_look_was_waited_on_during_an_action", round(worst, 3))
+            end, took, status = float(parts[0]), float(parts[1]), parts[2]
+            api.append((end - took, took, status, parts[3].split("?")[0]))
+        slowest, bad = 0.0, []
+        for test, name, t0, t1 in self.windows:
+            if name in MUSIC_DOWN_STEPS:
+                continue
+            for start, took, status, what in api:
+                if t0 <= start <= t1:
+                    slowest = max(slowest, took)
+                    if status != "200" or took > 1.0:
+                        bad.append(f"{test}: {what} {status} in {took} s")
+        self.time("music_server", "slowest_api_answer_during_the_actions", slowest)
+        self.expect("music_server", "every_api_request_answered_within_1_s", not bad, bad[:5])
 
     # -- a run -----------------------------------------------------------------------------------
 
@@ -591,8 +635,14 @@ class Run:
             env.update({"NEXUS_MUSIC_NEXUS": "1", "NEXUS_TEST_NEXUS_LOG": f"{inside}/nexus.log"})
         if self.new:
             env["NEXUS_TEST_NEXUS_LOG"] = f"{inside}/nexus.log"
-        if self.stuck or self.hook == "sabotage":
+        if self.hook == "sabotage":
             env["NEXUS_TEST_PROBE_AGAIN_MS"] = "200"
+        if self.stuck:
+            env.update({"NEXUS_TEST_DEADLINE_MS": "3600000", "NEXUS_TEST_PROBE_WHOLE_MS": "3600000"})
+        if self.faulted:
+            # A look at the first tick of each start (and on demand), so that the fault is in
+            # force from the first page on.
+            env["NEXUS_TEST_TRIGGER"] = f"{inside}/trigger"
         if self.held:
             env["NEXUS_TEST_HOLD_NEXUS"] = f"{inside}/held"
         if self.hook == "sabotage":
@@ -608,8 +658,11 @@ class Run:
                     self.copy.stop(keep=self.keep)
                 self.dump.stop()
             self.backend_seen()
-        self.coverage()
+        self.music_was_answering()
         self.gapless_sources()
+        if self.faulted:
+            self.fact("backend", "the_fault_at_each_action", [f"{test}/{name}: {what[0]} {what[1]}" for test, name, what in self.holds])
+            self.expect("backend", "every_action_ran_under_the_fault", len(self.holds) == len(self.windows), f"{len(self.holds)} of {len(self.windows)}")
         if self.hook == "sabotage":
             # The deliberate fault is judged as every W1 run is (`table`), at once.
             for why in compare(self.results, [r for r in load_results() if r["build"] == "old"]):
@@ -634,13 +687,17 @@ class Run:
         self.log_before = open(c.path("config", "plays.log"), "rb").read()
         self.expect("a_play_is_counted_as_released", "the_kept_log_is_not_empty", len(self.log_before) > 0, len(self.log_before))
         self.dump = Dump(c.dump)
+        self.initial_log = self.log_before
+        if self.faulted:
+            open(c.path("trigger"), "w").write("")
         a = c.launch()
         t0 = c.started
 
         def cold_start():
             until(lambda: home_drawn(a), 60, 0.02, "the first page")
+            self.home_at = time.time()
             self.time("cold_start_publishes_the_saved_account", "launch_to_home_drawn", time.time() - t0)
-        self.step("cold_start_publishes_the_saved_account", cold_start)
+        self.step("cold_start_publishes_the_saved_account", cold_start, cold=True)
 
         def queue_back():
             until(lambda: a.find(label="Runout Groove", type="LinkText") and a.find(label="Play"), 60, 0.02, "the queue put back")
@@ -654,7 +711,7 @@ class Run:
             sound = self.dump.sound_after(pressed)
             self.time("cold_start_puts_the_queue_back_and_plays", "play_to_sound", sound - pressed)
         self.step("cold_start_puts_the_queue_back_and_plays", queue_back)
-        self.wait_for_first_look("first start")
+        self.first_look_after_home("first start")
 
         def counted():
             log = c.path("config", "plays.log")
@@ -663,7 +720,6 @@ class Run:
             self.time("a_play_is_counted_as_released", "play_to_counted", self.counted_at - self.pressed_play)
             now = open(log, "rb").read()
             self.expect("a_play_is_counted_as_released", "the_log_was_only_added_to", now.startswith(self.log_before))
-            self.fact("a_play_is_counted_as_released", "added_with_times_masked (first start)", masked(now[len(self.log_before):]))
         self.step("a_play_is_counted_as_released", counted)
 
         intro = self.by[FIRST]["id"]
@@ -726,21 +782,22 @@ class Run:
             self.kept_queue = saved_queue(c)
             self.fact(test, "queue_before_kill", self.kept_queue)
         self.step("the_queue_is_changed_and_kept", queue_edits)
-        self.log_before = open(c.path("config", "plays.log"), "rb").read()
         c.stop(kill=True, keep=self.keep)
-        # A look the kill cut short ended with the process.
-        if self.on and self.in_flight():
-            with open(c.path("nexus.log"), "a") as log:
-                log.write(f"{time.time():.3f} end killed\n")
+        # What the first start added, through to its end (kill -9), byte for byte.
+        self.log_before = open(c.path("config", "plays.log"), "rb").read()
+        self.expect("a_play_is_counted_as_released", "the_log_was_only_added_to (first start, at its end)", self.log_before.startswith(self.initial_log))
+        self.fact("a_play_is_counted_as_released", "added_with_times_masked (first start)", masked(self.log_before[len(self.initial_log):]))
         # (The held look's marker is the process's: the next start holds a look of its own.)
-        if os.path.exists(c.path("held")):
-            os.remove(c.path("held"))
-        self.enforce = False
+        for name in ("held", "trigger"):
+            if os.path.exists(c.path(name)):
+                os.remove(c.path(name))
 
     # -- launch 2: after kill -9 ---------------------------------------------------------------
 
     def second_launch(self):
         c = self.copy
+        if self.faulted:
+            open(c.path("trigger"), "w").write("")
         a = c.launch()
         t0 = c.started
 
@@ -748,11 +805,11 @@ class Run:
             test = "the_queue_is_changed_and_kept"
             until(lambda: a.find(label="Play") and a.find(type="QueueRow"), 60, 0.02, "the queue after kill -9")
             self.time(test, "restart_to_queue_shown", time.time() - t0)
-            self.usable_at = time.time()
+            self.usable_at = self.home_at = time.time()
             self.log_unchanged("second start")
             self.expect(test, "queue_after_kill_is_the_queue_before", saved_queue(c) == getattr(self, "kept_queue", None), saved_queue(c))
-        self.step("the_queue_is_changed_and_kept", put_back)
-        self.wait_for_first_look("second start")
+        self.step("the_queue_is_changed_and_kept", put_back, cold=True)
+        self.first_look_after_home("second start")
 
         def direct():
             test = "a_direct_play_starts_it_cold"
@@ -800,12 +857,9 @@ class Run:
 
         self.joins = {}
 
-        def joins():
-            test = "two_songs_join_without_a_gap"
-            for kind, start in (("streamed", lambda: album_play(a, "Continuous Sweep (MP3)")),
-                                ("cached", lambda: album_play(a, "Continuous Sweep (MP3)")),
-                                # (Its songs are the ones "Gapless sweep" has, downloaded.)
-                                ("downloaded", lambda: album_play(a, "Continuous Sweep"))):
+        def join(kind, start):
+            def body():
+                test = "two_songs_join_without_a_gap"
                 pressed = time.time()
                 start()
                 sound = self.dump.sound_after(pressed, 30)
@@ -821,7 +875,14 @@ class Run:
                 self.fact(test, f"{kind}_largest_step_at_the_join", round(jump, 4))
                 a.press("Pause")
                 time.sleep(0.5)
-        self.step("two_songs_join_without_a_gap", joins)
+            body.__name__ = f"join_{kind}"
+            return body
+        for kind, start in (("streamed", lambda: album_play(a, "Continuous Sweep (MP3)")),
+                            ("cached", lambda: album_play(a, "Continuous Sweep (MP3)")),
+                            # (Its songs are the ones "Gapless sweep" has, downloaded.)
+                            ("downloaded", lambda: album_play(a, "Continuous Sweep"))):
+            self.step("two_songs_join_without_a_gap", join(kind, start))
+
 
         def by_hand():
             test = "downloads_start_and_resume"
@@ -931,7 +992,7 @@ class Run:
         """The row under Settings, Account, for `who`; and the component's threads."""
         test = "settings_row"
         settings_tab(a, "Account", "Sign out")
-        if self.on and not self.held:
+        if self.on and not self.faulted:
             # (The first look is 5 s after an account is published.)
             try:
                 until(lambda: any(l.startswith("Found at") or l == "None found" for l in labels(a)), 20, 0.5, "the row")
@@ -941,7 +1002,8 @@ class Run:
         heading = "Nexus server" in labels(a)
         if not self.on:
             want = []
-        elif self.held:
+        elif self.faulted:
+            # (Its look never answers; the next account's waits behind it.)
             want = []
         elif who == "tester" and self.mode == "found":
             want = [f"Found at {front.SERVER}/nexus/"]
@@ -969,7 +1031,8 @@ class Run:
             # The released app, the component switched off, or its look held before it asks.
             self.expect(test, "requests_under_nexus", count == 0, count)
         elif self.stuck:
-            self.expect(test, "requests_under_nexus (looks kept going)", count >= 3, count)
+            # One look started at the first tick of each start, held through it.
+            self.expect(test, "requests_under_nexus (one held look a start)", 2 <= count <= 4, count)
         else:
             # One at each start (5 s after the account is published) and one for the guest.
             self.expect(test, "requests_under_nexus (one per account published)", count == 3, count)
@@ -1074,9 +1137,22 @@ def allowed(released, test, metric):
 
 # ---- the two scenarios that are not a whole run ----------------------------------------------
 
+def component_log(path):
+    out = []
+    if os.path.exists(path):
+        for line in open(path).read().splitlines():
+            parts = line.split(" ", 2)
+            if len(parts) >= 2:
+                out.append((float(parts[0]), parts[1], parts[2] if len(parts) > 2 else ""))
+    return out
+
+
 def scenario_offline(build="new"):
-    """Offline mode on from the start: no look while it is on; looks once a start has it off;
-    none again once it is switched back on. Exits 1 if not."""
+    """Offline mode is a boundary, at a look's dispatch on the window's thread. On from the
+    start: nothing dispatched, nothing asked. Off (a start with it off): looks dispatched and
+    asked, each request one dispatch's. Switched on by hand while looks come every 0.2 s: no
+    look dispatched after the switch is seen on the disk, and every request the proxy saw
+    belongs to a dispatch (none without one). No grace period. Exits 1 if not."""
     out = os.path.join(RUNS, f"{build}-offline-scenario")
     shutil.rmtree(out, ignore_errors=True)
     os.makedirs(out)
@@ -1088,43 +1164,108 @@ def scenario_offline(build="new"):
     settings = os.path.join(A.HOMES, home, "config", "settings.json")
     s = json.load(open(settings)); s["offline"] = True; json.dump(s, open(settings, "w"))
     inside = f"/work/target/walk/{home}"
-    # (Its looks come a second apart here, so that one would show at once.)
-    env = {"NEXUS_MUSIC_NEXUS": "1", "NEXUS_TEST_NEXUS_LOG": f"{inside}/nexus.log", "NEXUS_TEST_PROBE_AGAIN_MS": "1000"}
+    log = os.path.join(A.HOMES, home, "nexus.log")
+    # (Looks 0.2 s apart here, so that one would come at once.)
+    env = {"NEXUS_MUSIC_NEXUS": "1", "NEXUS_TEST_NEXUS_LOG": f"{inside}/nexus.log", "NEXUS_TEST_PROBE_AGAIN_MS": "200"}
     if os.environ.get("E13A_SABOTAGE"):
         env["NEXUS_TEST_SABOTAGE_NO_OFFLINE"] = "1"
+    dispatches = lambda since=0.0: [t for t, word, _ in component_log(log) if word == "dispatch" and t > since]
     with front.Front("found", os.path.join(out, "front")) as f:
         copy = A.Copy(build, home, env=env)
         a = copy.launch()
         until(lambda: home_drawn(a), 60, 0.1, "Home")
         time.sleep(12)
-        first = len(f.nexus_in_access_log())
-        if first:
-            failures.append(f"{first} requests while Offline mode was on from the start")
+        cold = (len(dispatches()), len(f.nexus_in_access_log()))
+        if cold != (0, 0):
+            failures.append(f"in Offline mode from the start: {cold[0]} dispatched, {cold[1]} asked")
+        if not any(word == "offline" for _, word, _ in component_log(log)):
+            failures.append("no look came due while Offline mode was on: nothing was tested")
         # (The released app does not show Offline mode's switch as on after a start in it,
-        # and its press asks for "on" again, which changes nothing: it cannot be switched off
-        # from that window. So the app is stopped, and started again with it off.)
+        # and its press asks for "on" again: it cannot be switched off from that window. The
+        # app is started again with it off. Another engineer is fixing that in the released
+        # app; once that fix is in, this can press the switch instead.)
         copy.stop(keep=os.path.join(out, "app-output.txt"))
         s = json.load(open(settings)); s["offline"] = False; json.dump(s, open(settings, "w"))
         a = copy.launch()
         until(lambda: home_drawn(a), 60, 0.1, "Home")
         offline_now = lambda: json.load(open(copy.path("config", "settings.json"))).get("offline")
         try:
-            until(lambda: len(f.nexus_in_access_log()) > 0, 15, 0.2, "a look once Offline mode is off")
+            until(lambda: len(dispatches(copy.started)) >= 3, 20, 0.1, "looks once Offline mode is off")
         except TimeoutError:
-            failures.append("no look within 15 s of a start with Offline mode off")
+            failures.append("no looks at a start with Offline mode off")
         settings_tab(a, "Storage", "Offline mode")
         a.click(a.one(label="Offline mode", role="Switch")["handle"])
-        until(lambda: offline_now() is True, 5, 0.1, "Offline mode on again")
-        time.sleep(1.5)   # (a look already started may finish)
-        on_again = len(f.nexus_in_access_log())
+        until(lambda: offline_now() is True, 5, 0.02, "Offline mode on again")
+        seen_on = time.time()
         time.sleep(8)
-        later = len(f.nexus_in_access_log())
-        if later != on_again:
-            failures.append(f"{later - on_again} requests after Offline mode went back on")
+        after = dispatches(seen_on)
+        if after:
+            failures.append(f"{len(after)} looks dispatched after Offline mode was on")
         copy.stop(keep=os.path.join(out, "app-output.txt"))
-        shutil.copy(copy.path("nexus.log"), os.path.join(out, "nexus.log")) if os.path.exists(copy.path("nexus.log")) else None
+        total_dispatched = len(dispatches())
+        total_asked = len(f.nexus_in_access_log())
+        if total_asked != total_dispatched:
+            failures.append(f"{total_asked} requests for {total_dispatched} looks dispatched")
+        if os.path.exists(log):
+            shutil.copy(log, os.path.join(out, "nexus.log"))
     shutil.rmtree(os.path.join(A.HOMES, home), ignore_errors=True)
-    print(f"offline: {first} while on from the start; looks after off; {later - on_again} after on again; failures: {failures or 'none'}")
+    print(f"offline: cold {cold}; dispatched {total_dispatched}, asked {total_asked}; after on: {len(after)}; failures: {failures or 'none'}")
+    return 1 if failures else 0
+
+
+def scenario_sign_out(build="new"):
+    """A look that comes due as the account signs out. Looks come every millisecond, so that
+    a timer is due at every turn of the event loop, before the window's account-changed
+    handler runs. Signed out and in again ten times: each time, no look is dispatched for the
+    account that has gone (the component says "not-ours" when it catches one), and every
+    request the proxy saw belongs to a dispatch. Exits 1 if not."""
+    out = os.path.join(RUNS, f"{build}-sign-out-scenario")
+    shutil.rmtree(out, ignore_errors=True)
+    os.makedirs(out)
+    failures = []
+    prepare_server()
+    home = "scenario-sign-out"
+    shutil.rmtree(os.path.join(A.HOMES, home), ignore_errors=True)
+    shutil.copytree(KEPT, os.path.join(A.HOMES, home))
+    inside = f"/work/target/walk/{home}"
+    log = os.path.join(A.HOMES, home, "nexus.log")
+    env = {"NEXUS_MUSIC_NEXUS": "1", "NEXUS_TEST_NEXUS_LOG": f"{inside}/nexus.log", "NEXUS_TEST_PROBE_AGAIN_MS": "1"}
+    if os.environ.get("E13A_SABOTAGE"):
+        env["NEXUS_TEST_SABOTAGE_NO_GENERATION"] = "1"
+    caught = 0
+    with front.Front("absent", os.path.join(out, "front")) as f:
+        copy = A.Copy(build, home, env=env)
+        a = copy.launch()
+        until(lambda: home_drawn(a), 60, 0.1, "Home")
+        until(lambda: any(word == "dispatch" for _, word, _ in component_log(log)), 20, 0.1, "looks")
+        for cycle in range(10):
+            settings_tab(a, "Account", "Sign out")
+            a.press("Sign out")
+            until(lambda: a.find(label="Connect"), 20, 0.02, "the sign-in form")
+            form_seen = time.time()
+            time.sleep(1)
+            lines = component_log(log)
+            # The generation of the account that went: the last published before the form.
+            gone = [rest.split()[0] for t, word, rest in lines if word == "published" and t < form_seen and rest.split()[0] != "0"]
+            gen = gone[-1] if gone else None
+            late = [t for t, word, rest in lines if word == "dispatch" and rest.split()[0] == gen and t > form_seen]
+            if late:
+                failures.append(f"cycle {cycle}: {len(late)} looks dispatched for the account that signed out")
+            caught += len([1 for t, word, rest in lines if word == "not-ours" and rest.split()[0] == gen])
+            sign_in(a, "tester")
+            until(lambda: home_drawn(a), 60, 0.05, "signed in again")
+            time.sleep(1)
+        copy.stop(keep=os.path.join(out, "app-output.txt"))
+        if not caught:
+            failures.append("no look came due as the account went: the race was never caught, so nothing was shown")
+        dispatched = len([1 for _, word, _ in component_log(log) if word == "dispatch"])
+        asked = len(f.nexus_in_access_log())
+        if asked > dispatched:
+            failures.append(f"{asked} requests for {dispatched} looks dispatched")
+        if os.path.exists(log):
+            shutil.copy(log, os.path.join(out, "nexus.log"))
+    shutil.rmtree(os.path.join(A.HOMES, home), ignore_errors=True)
+    print(f"sign-out: {dispatched} dispatched, {asked} asked; a look due as the account went, caught {caught} times; failures: {failures or 'none'}")
     return 1 if failures else 0
 
 
@@ -1273,7 +1414,13 @@ KINDS = {
     "by_hand_switch_to_offline": "file", "by_hand_switch_back": "file", "offline_play_downloaded_to_sound": "file",
     "by_loss_noticed": "ui", "by_loss_play_downloaded_to_sound": "file", "server_back_to_online": "timer",
     "continue_here_to_kept": "file", "offered_after_another_device_saved": "cadence",
+    "slowest_api_answer_during_the_actions": "file",
 }
+# Every run must have measured each of these: one missing is a failure (`table`).
+REQUIRED = [m for m in KINDS] + [f"{k}_{m}" for k in ("streamed", "cached", "downloaded") for m in ("play_to_sound", "longest_stall_around_the_join")]
+# The runs `table` requires: each mode of both builds at least twice, and the component's
+# hooks, before it says anything.
+MODES_REQUIRED = ("absent", "refused", "blackhole", "found", "stalled", "saturated", "ended", "half")
 # "cadence": the sync's look at the server's saved queue, every 15 s with the window open.
 SLACK = {"ui": 0.25, "file": 0.25, "timer": 1.0, "gap": 0.02, "cadence": 15.0}
 
@@ -1336,13 +1483,31 @@ def table():
     text = "\n".join(lines + facts + gaps + plays) + "\n"
     within = all(v for v in verdicts if v is not None)
     failed = [r["run"] for r in runs if r["failures"]]
+    # Missing evidence is a failure: too few runs, or a measure a run lacks.
+    missing = []
+    for mode in MODES_REQUIRED:
+        for build in ("old", "new"):
+            n = len([r for r in runs if r["build"] == build and r["mode"] == mode and not r.get("hook")])
+            if n < 2:
+                missing.append(f"{build} {mode}: {n} runs of 2")
+    for mode, hook in (("absent", "held"), ("stalled", "held"), ("absent", "switch-off")):
+        n = len([r for r in runs if r["mode"] == mode and r.get("hook") == hook])
+        if n < 2:
+            missing.append(f"new {mode} {hook}: {n} runs of 2")
+    for r in runs:
+        have = {m for values in r["results"].values() for m, v in values.items() if isinstance(v, (int, float)) and not isinstance(v, bool)}
+        lacking = [m for m in REQUIRED if m not in have]
+        if lacking:
+            missing.append(f"{r['run']} lacks {lacking}")
+    text += "\n## Missing evidence\n\n" + ("\n".join(f"- {m}" for m in missing) or "None.") + "\n"
+    failed += [f"missing: {m}" for m in missing]
     compared = {r["run"]: compare(r["results"], old) for r in new if r.get("hook") != "switch-off"}
     text += "\n## Each W1 run against every released run\n\n" + "\n".join(
         f"- {run}: " + ("as released" if not why else "; ".join(why)) for run, why in compared.items()) + "\n"
     failed += [run for run, why in compared.items() if why]
     print(text)
     print("all within:", within, "| runs with a failure:", failed or "none", "| W1 runs:", len(new), "| released runs:", len(old))
-    return 0 if within and not failed else 1
+    return 0 if within and not failed and old and new else 1
 
 
 if __name__ == "__main__":
@@ -1355,6 +1520,8 @@ if __name__ == "__main__":
         sys.exit(Run(sys.argv[2], sys.argv[3], sys.argv[4] if len(sys.argv) > 4 else None).go())
     elif what == "offline":
         sys.exit(scenario_offline(sys.argv[2] if len(sys.argv) > 2 else "new"))
+    elif what == "sign-out":
+        sys.exit(scenario_sign_out(sys.argv[2] if len(sys.argv) > 2 else "new"))
     elif what == "late-answer":
         sys.exit(scenario_late_answer(sys.argv[2] if len(sys.argv) > 2 else "new"))
     else:
