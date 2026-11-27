@@ -610,7 +610,10 @@ class Run:
             self.backend_seen()
         self.coverage()
         self.gapless_sources()
-        self.compare_with_released()
+        if self.hook == "sabotage":
+            # The deliberate fault is judged as every W1 run is (`table`), at once.
+            for why in compare(self.results, [r for r in load_results() if r["build"] == "old"]):
+                self.fail("compare", why)
         self.save()
         for name in ("plays.log", "queue.json", "settings.json", "nexus.log"):
             for src in (os.path.join(A.HOMES, home, "config", name), os.path.join(A.HOMES, home, name)):
@@ -1003,37 +1006,6 @@ class Run:
             got = asked("downloaded")
             self.expect(test, "downloaded: nothing streamed", got == [], got)
 
-    def compare_with_released(self):
-        """For the new build: every measure the released app has, within its slowest plus the
-        slack; every outcome as the released app's."""
-        if not self.new:
-            return
-        released = [r for r in load_results() if r["build"] == "old"]
-        if not released:
-            self.fail("compare", "no released runs to compare with")
-            return
-        for test, metric in released_metrics(released):
-            limit, worst = allowed(released, test, metric)
-            value = self.results.get(test, {}).get(metric)
-            if not isinstance(value, (int, float)) or isinstance(value, bool):
-                self.fail(test, f"{metric}: not measured")
-            elif value > limit:
-                self.fail(test, f"{metric}: {value:.3f} s, over {limit:.3f} (released slowest {worst:.3f})")
-        for metric in ("added_with_times_masked (first start)", "added_with_times_masked (second start)"):
-            theirs = {json.dumps(r["results"].get("a_play_is_counted_as_released", {}).get(metric)) for r in released}
-            mine = json.dumps(self.results.get("a_play_is_counted_as_released", {}).get(metric))
-            if mine not in theirs:
-                self.fail("a_play_is_counted_as_released", f"{metric}: {mine} is not what the released app wrote ({theirs})")
-        for kind in ("streamed", "cached", "downloaded"):
-            # Silent frames exactly as few; the largest step within a tenth of the released
-            # app's largest (it moves with where the 20 ms tick falls on the join).
-            for metric, margin in ((f"{kind}_silent_frames_at_the_join", lambda v: v), (f"{kind}_largest_step_at_the_join", lambda v: v * 1.1)):
-                theirs = [r["results"].get("two_songs_join_without_a_gap", {}).get(metric) for r in released]
-                theirs = [v for v in theirs if isinstance(v, (int, float))]
-                mine = self.results.get("two_songs_join_without_a_gap", {}).get(metric)
-                if theirs and (not isinstance(mine, (int, float)) or mine > margin(max(theirs))):
-                    self.fail("two_songs_join_without_a_gap", f"{metric}: {mine}, released at most {max(theirs)}")
-
     def save(self):
         os.makedirs(RESULTS, exist_ok=True)
         self.load.append(os.getloadavg()[0])
@@ -1048,6 +1020,35 @@ def masked(added):
     """Lines added to the play log, byte for byte, with each time (whole seconds since 1970)
     written as T: the only part that differs between two runs of the same plays."""
     return re.sub(rb"(?<=,)\d{10}(?=[,\]])", b"T", added).decode()
+
+
+def compare(results, released):
+    """A W1 run's results against every released run's: each measure within the released
+    app's slowest plus the slack; what was added to the play log as the released app wrote
+    it; each join no worse. Returns what failed."""
+    failures = []
+    for test, metric in released_metrics(released):
+        limit, worst = allowed(released, test, metric)
+        value = results.get(test, {}).get(metric)
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            failures.append(f"{test}: {metric}: not measured")
+        elif value > limit:
+            failures.append(f"{test}: {metric}: {value:.3f} s, over {limit:.3f} (released slowest {worst:.3f})")
+    for metric in ("added_with_times_masked (first start)", "added_with_times_masked (second start)"):
+        theirs = {json.dumps(r["results"].get("a_play_is_counted_as_released", {}).get(metric)) for r in released}
+        mine = json.dumps(results.get("a_play_is_counted_as_released", {}).get(metric))
+        if mine not in theirs:
+            failures.append(f"a_play_is_counted_as_released: {metric}: {mine} is not what the released app wrote ({theirs})")
+    for kind_ in ("streamed", "cached", "downloaded"):
+        # Silent frames exactly as few; the largest step within a tenth of the released app's
+        # largest (it moves with where the 20 ms tick falls on the join).
+        for metric, margin in ((f"{kind_}_silent_frames_at_the_join", lambda v: v), (f"{kind_}_largest_step_at_the_join", lambda v: v * 1.1)):
+            theirs = [r["results"].get("two_songs_join_without_a_gap", {}).get(metric) for r in released]
+            theirs = [v for v in theirs if isinstance(v, (int, float))]
+            mine = results.get("two_songs_join_without_a_gap", {}).get(metric)
+            if theirs and (not isinstance(mine, (int, float)) or mine > margin(max(theirs))):
+                failures.append(f"two_songs_join_without_a_gap: {metric}: {mine}, released at most {max(theirs)}")
+    return failures
 
 
 def load_results():
@@ -1310,15 +1311,13 @@ def table():
         verdicts.append(ok)
         lines.append(f"| `{test}` | {metric} | {', '.join(f'{v:.3f}' for v in before)} | {worst:.3f} | {allowed:.3f} ({kind(metric)}) | "
                      f"{', '.join(f'{v:.3f}' for v in after) or '-'} | {max(after) if after else float('nan'):.3f} | {'yes' if ok else ('-' if ok is None else '**no**')} |")
-    facts = ["", "| Run | Load at start, end | Failed | Log line (time as seconds after Play) | Queue kept through kill -9 | Settings row | Under /nexus/ at the proxy | At the stand-in |", "|---|---|---|---|---|---|---|---|"]
+    facts = ["", "| Run | Load at start, end | Failed | Row for tester / guest | Requests under /nexus/ | Longest stretch of an action with no look waited on (s) |", "|---|---|---|---|---|---|"]
     for r in runs:
         res = r["results"]
-        get = lambda t, m: res.get(t, {}).get(m)
-        stand = get("backend", "requests_at_the_stand_in") or []
+        nexus = [v for k, v in res.get("backend", {}).items() if k.startswith("requests_under_nexus")]
         facts.append(f"| {r['run']} | {r.get('machine_load_at_start_and_end')} | {len(r['failures'])} | "
-                     f"{get('a_play_is_counted_as_released', 'line_with_time_as_offset')} | {get('the_queue_is_changed_and_kept', 'queue_after_kill_is_the_queue_before')} | "
-                     f"{get('settings_row', 'shown')} / {get('settings_row', 'shown (account change)')} | {get('backend', 'requests_under_nexus_at_the_proxy')} | "
-                     f"{len(stand)}: {sorted(set(tuple(x) for x in stand))} |")
+                     f"{res.get('settings_row', {}).get('shown for tester')} / {res.get('settings_row', {}).get('shown for guest')} | "
+                     f"{nexus[0] if nexus else '-'} | {res.get('backend', {}).get('longest_time_no_look_was_waited_on_during_an_action', '-')} |")
     gaps = ["", "| Run | " + " | ".join(f"{k} silent frames, largest step" for k in ("streamed", "cached", "downloaded")) + " |", "|---|---|---|---|"]
     for r in runs:
         res = r["results"].get("two_songs_join_without_a_gap", {})
@@ -1335,9 +1334,13 @@ def table():
     plays = ["", "| plays.log at the end of the run, times left out (song, source; bytes per line) | Runs |", "|---|---|"]
     plays += [f"| `{shape}` | {len(names)}: {', '.join(names)} |" for shape, names in logs.items()]
     text = "\n".join(lines + facts + gaps + plays) + "\n"
-    print(text)
     within = all(v for v in verdicts if v is not None)
     failed = [r["run"] for r in runs if r["failures"]]
+    compared = {r["run"]: compare(r["results"], old) for r in new if r.get("hook") != "switch-off"}
+    text += "\n## Each W1 run against every released run\n\n" + "\n".join(
+        f"- {run}: " + ("as released" if not why else "; ".join(why)) for run, why in compared.items()) + "\n"
+    failed += [run for run, why in compared.items() if why]
+    print(text)
     print("all within:", within, "| runs with a failure:", failed or "none", "| W1 runs:", len(new), "| released runs:", len(old))
     return 0 if within and not failed else 1
 
