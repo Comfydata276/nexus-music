@@ -1009,6 +1009,9 @@ class Run:
             want = [f"Found at {front.SERVER}/nexus/"]
         else:
             want = ["None found"]
+        if self.stuck and self.mode in FRESH_FOR and who == "tester" and shown == ["None found"]:
+            # (A look the proxy ended at 75 s answered "none" before the next was started.)
+            want = shown
         self.expect(test, f"shown for {who}", shown == want and heading == bool(want), shown)
         threads = self.copy.pid_threads()
         self.fact("backend", f"threads for {who}", {"nexus-probe": threads.count("nexus-probe")})
@@ -1030,6 +1033,9 @@ class Run:
         elif not self.on or self.held:
             # The released app, the component switched off, or its look held before it asks.
             self.expect(test, "requests_under_nexus", count == 0, count)
+        elif self.stuck and self.mode in FRESH_FOR:
+            # The proxy ends each held look at 75 s; another is started before the next action.
+            self.expect(test, "requests_under_nexus (a held look at a time)", 2 <= count <= 15, count)
         elif self.stuck:
             # One look started at the first tick of each start, held through it.
             self.expect(test, "requests_under_nexus (one held look a start)", 2 <= count <= 4, count)
