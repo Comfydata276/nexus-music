@@ -7,8 +7,12 @@ app with the Nexus server's component ("new"), with the component's own workers 
 disk blocked as well.
 
     suite.py populate                       the released app makes the profile every run starts from
-    suite.py run <old|new> <mode> [hook]    one run of every test; hook: held, disk-hang, disk-full
-    suite.py table                          every run's numbers, side by side (NUMBERS.md)
+    suite.py run <old|new> <mode> [hook]    one run of every test; exits 1 on any failure.
+                                            hook (new only): held, switch-off, sabotage
+    suite.py offline [build]                Offline mode on from the start, off, on again
+    suite.py late-answer [build]            a late answer for one account, another signed in
+    suite.py table                          every run's numbers (NUMBERS.md); exits 1 if any
+                                            W1 time is over its bar, or any run failed
 
 Everything is on this machine: the test Navidrome "w1" (http://127.0.0.1:4680, made by the
 phone repository's `scripts/server --instance w1 start` with NEXUS_TEST_PORT=4680), nginx in
@@ -27,9 +31,6 @@ RUNS = os.path.join(KIT, "runs")
 RESULTS = os.path.join(HERE, "results")
 NAV = "http://127.0.0.1:4680"
 ACCOUNTS = {"tester": "tester-pass-1", "guest": "guest-pass-1"}
-# Where the design gives the component files of its own (5.1). W1 keeps none; the disk hooks
-# block this folder, and the run checks it was never touched.
-NEXUS_FILES = ("data", "nexus")
 
 
 # ---- the test server, asked directly ------------------------------------------------------
@@ -341,8 +342,8 @@ def close_settings(a):
         time.sleep(0.8)
 
 
-def sign_in(a, user):
-    for label, text in (("Server address", front.SERVER), ("Username", user), ("Password", ACCOUNTS[user])):
+def sign_in(a, user, server=None):
+    for label, text in (("Server address", server or front.SERVER), ("Username", user), ("Password", ACCOUNTS[user])):
         a.set(a.one(label=label, role="TextInput")["handle"], text)
     pressed = time.time()
     a.press("Connect")
@@ -385,6 +386,8 @@ def populate():
         time.sleep(4)
         copy.stop(keep=os.path.join(out, "app-output.txt"))
     keep_server_state()
+    # A play log that is not empty: three lines the released app wrote (seed-plays.log).
+    shutil.copy(os.path.join(HERE, "seed-plays.log"), copy.path("config", "plays.log"))
     s = json.load(open(copy.path("config", "settings.json")))
     s["check_updates"] = False
     json.dump(s, open(copy.path("config", "settings.json"), "w"))
@@ -398,16 +401,26 @@ def populate():
 
 # ---- one run -------------------------------------------------------------------------------
 
+SUITE = 2   # results of an earlier form of the suite are not compared with
+# The stand-in's modes in which a look is held up (it waits, and ends only at its deadline):
+# in these the component is made to look again 0.2 s after each look ends, so that one is
+# being waited on through every action, and the run shows it was.
+STUCK = ("stalled", "blackhole", "saturated")
+# What else the component (the "new" build) is put through, beside the stand-in's mode.
 HOOKS = {
-    None: {},
-    # Every worker of the component held in a call that never returns (a test hook of the
-    # component's own, read only by a debug build).
-    "held": {"env": {"NEXUS_TEST_HOLD_NEXUS": "1"}},
-    # The component's folder is a named pipe: opening anything in it for writing hangs.
-    "disk-hang": {"fifo": True},
-    # The component's folder is a full file system of its own.
-    "disk-full": {"tmpfs": True},
+    None: "",
+    # Its look's thread held in a call that never returns, from its first look on.
+    "held": "",
+    # Not switched on: nothing of it may be made.
+    "switch-off": "",
+    # A deliberate fault, which the run must catch and FAIL on: the window's thread held
+    # 0.3 s at each look (shorter than the 1 s allowed for timers).
+    "sabotage": "",
 }
+
+
+class Failed(Exception):
+    pass
 
 
 class Run:
@@ -415,7 +428,13 @@ class Run:
         self.build, self.mode, self.hook = build, mode, hook
         self.label = f"{build}-{mode}" + (f"-{hook}" if hook else "") + (f"-{os.environ['E13A_REPEAT']}" if os.environ.get("E13A_REPEAT") else "")
         self.out = os.path.join(RUNS, self.label)
-        self.results, self.notes, self.failures = {}, [], []
+        self.results, self.failures, self.windows = {}, [], []
+        self.new = build == "new"
+        self.on = self.new and hook != "switch-off"
+        self.stuck = self.on and mode in STUCK and hook not in ("sabotage", "held")
+        self.held = self.on and hook == "held"
+        self.enforce = False   # holds are checked from the component's first look of a start
+        self.music_down = False
 
     def say(self, *what):
         line = " ".join(str(w) for w in what)
@@ -435,11 +454,27 @@ class Run:
         self.failures.append(f"{test}: {why}")
         self.say(f"  FAILED {test}: {why}")
 
+    def expect(self, test, what, ok, seen=""):
+        """An outcome the run asserts: a failure if it does not hold."""
+        self.fact(test, what, ok if seen == "" else seen)
+        if not ok:
+            self.fail(test, f"{what}: {seen}")
+
     def step(self, test, body):
+        """One action: the component's hold verified live before it, the action, and the
+        same hold verified again when it has completed."""
         self.say(f"\n{test}")
         self.music_down = False
         try:
+            checked = self.enforce
+            before = self.hold(test, "before")
+            began = time.time()
             body()
+            if checked:
+                self.windows.append((test, began, time.time()))
+            after = self.hold(test, "after")
+            if self.held and self.enforce and before != after:
+                self.fail(test, f"the hold before ({before}) is not the hold after ({after})")
         except Exception as error:  # A test that fails says so, and the run goes on.
             self.fail(test, f"{type(error).__name__}: {error}")
             try:
@@ -454,6 +489,93 @@ class Run:
             if self.music_down:
                 self.front.music(True)
 
+    # -- the component's side, live ------------------------------------------------------------
+
+    def nexus_log(self):
+        """What the component did (NEXUS_TEST_NEXUS_LOG): (time, word, rest) a line each."""
+        try:
+            lines = open(self.copy.path("nexus.log")).read().splitlines()
+        except OSError:
+            return []
+        return [(float(t), word, rest) for t, word, *more in (l.split(" ", 2) + [""] for l in lines) for rest in [more[0] if more else ""]]
+
+    def in_flight(self):
+        """A look the component is waiting on right now."""
+        started = ended = 0
+        for _, word, _ in self.nexus_log():
+            started += word == "start"
+            ended += word == "end"
+        return started > ended
+
+    def hold(self, test, when):
+        """Verifies, live, that the component's side is held up now: its look's thread held
+        (`held`), or a look being waited on (the stuck modes). Returns what it saw."""
+        if not self.enforce:
+            return None
+        if self.held:
+            marker = self.copy.path("held")
+            if not os.path.exists(marker):
+                raise Failed(f"{when}: no held look")
+            thread = open(marker).read().strip()
+            alive = A.sh(f"docker exec {A.NAME} test -d /proc/{thread}").returncode == 0
+            if not alive:
+                raise Failed(f"{when}: the held look's thread {thread} is gone")
+            return thread
+        if self.stuck:
+            try:
+                until(self.in_flight, 3, 0.05, "a look being waited on")
+            except TimeoutError:
+                raise Failed(f"{when}: no look was being waited on")
+            return "in flight"
+        return None
+
+    def wait_for_first_look(self, launched):
+        """From the component's first look of this start on, its holds are checked. Its first
+        look must come after the account's first page and its queue are usable."""
+        if not (self.held or self.stuck):
+            return
+        if self.held:
+            until(lambda: os.path.exists(self.copy.path("held")), 20, 0.05, "the held look")
+        else:
+            until(self.in_flight, 20, 0.05, "the first look")
+        first = min((t for t, word, _ in self.nexus_log() if word == "start" and t > self.copy.started), default=None)
+        if self.held:
+            first = os.path.getmtime(self.copy.path("held"))
+        usable = getattr(self, "usable_at", None)
+        self.expect("ordering", f"first_look_after_home_and_queue ({launched})", first is not None and usable is not None and first > usable, f"{first} > {usable}")
+        self.enforce = True
+
+    def coverage(self):
+        """In the stuck modes: for every action from the first look on, a look was being
+        waited on throughout, with no gap longer than 1 s between two looks."""
+        if not self.stuck:
+            return
+        looks, opened = [], None
+        for t, word, _ in self.nexus_log():
+            if word == "start":
+                opened = t
+            elif word == "end" and opened is not None:
+                looks.append((opened, t))
+                opened = None
+        if opened is not None:
+            looks.append((opened, time.time()))
+        worst = 0.0
+        for test, t0, t1 in self.windows:
+            if t1 < (looks[0][0] if looks else 0) or test == "ordering":
+                continue
+            covered, at = [l for l in looks if l[1] >= t0 and l[0] <= t1], t0
+            gap = 0.0
+            for start, end in covered:
+                gap = max(gap, start - at)
+                at = max(at, end)
+            gap = max(gap, t1 - at)
+            worst = max(worst, gap)
+            if gap > 1.0:
+                self.fail(test, f"no look was waited on for {gap:.2f} s of it")
+        self.fact("backend", "longest_time_no_look_was_waited_on_during_an_action", round(worst, 3))
+
+    # -- a run -----------------------------------------------------------------------------------
+
     def go(self):
         shutil.rmtree(self.out, ignore_errors=True)
         os.makedirs(self.out)
@@ -463,15 +585,19 @@ class Run:
         home = f"run-{self.label}"
         shutil.rmtree(os.path.join(A.HOMES, home), ignore_errors=True)
         shutil.copytree(KEPT, os.path.join(A.HOMES, home))
-        hook = HOOKS[self.hook]
-        mounts = []
-        nexus_dir = os.path.join(A.HOMES, home, *NEXUS_FILES)
-        if hook.get("fifo"):
-            os.mkfifo(nexus_dir)
-        if hook.get("tmpfs"):
-            mounts.append(f"type=tmpfs,destination=/work/target/walk/{home}/{'/'.join(NEXUS_FILES)},tmpfs-size=4096")
-        self.log_bytes = open(os.path.join(A.HOMES, home, "config", "plays.log"), "rb").read()
-        self.copy = A.Copy(self.build, home, env=hook.get("env"), mounts=mounts)
+        inside = f"/work/target/walk/{home}"
+        env = {}
+        if self.on:
+            env.update({"NEXUS_MUSIC_NEXUS": "1", "NEXUS_TEST_NEXUS_LOG": f"{inside}/nexus.log"})
+        if self.new:
+            env["NEXUS_TEST_NEXUS_LOG"] = f"{inside}/nexus.log"
+        if self.stuck or self.hook == "sabotage":
+            env["NEXUS_TEST_PROBE_AGAIN_MS"] = "200"
+        if self.held:
+            env["NEXUS_TEST_HOLD_NEXUS"] = f"{inside}/held"
+        if self.hook == "sabotage":
+            env["NEXUS_TEST_SABOTAGE_UI_MS"] = "300"
+        self.copy = A.Copy(self.build, home, env=env)
         self.keep = os.path.join(self.out, "app-output.txt")
         with front.Front(self.mode, os.path.join(self.out, "front")) as self.front:
             try:
@@ -482,22 +608,30 @@ class Run:
                     self.copy.stop(keep=self.keep)
                 self.dump.stop()
             self.backend_seen()
-        self.disk_untouched(nexus_dir, hook)
+        self.coverage()
+        self.gapless_sources()
+        self.compare_with_released()
         self.save()
-        # The profile's files are kept beside the run's log; the songs and the sound are not.
-        for name in ("plays.log", "queue.json", "settings.json"):
-            src = os.path.join(A.HOMES, home, "config", name)
-            if os.path.exists(src):
-                shutil.copy(src, os.path.join(self.out, name))
+        for name in ("plays.log", "queue.json", "settings.json", "nexus.log"):
+            for src in (os.path.join(A.HOMES, home, "config", name), os.path.join(A.HOMES, home, name)):
+                if os.path.exists(src):
+                    shutil.copy(src, os.path.join(self.out, name))
         shutil.rmtree(os.path.join(A.HOMES, home), ignore_errors=True)
+        return 1 if self.failures else 0
 
-    # -- launch 1: a cold start on the kept profile --------------------------------------------
+    def log_unchanged(self, launched):
+        """At a start, before anything is played: the play log byte for byte as it was."""
+        now = open(self.copy.path("config", "plays.log"), "rb").read()
+        self.expect("a_play_is_counted_as_released", f"start_up_left_the_log_byte_for_byte ({launched})", now == self.log_before, f"{len(now)} bytes, {len(self.log_before)} before")
+
+    # -- launch 1: a cold start on the kept profile ------------------------------------------
 
     def first_launch(self):
         c = self.copy
+        self.log_before = open(c.path("config", "plays.log"), "rb").read()
+        self.expect("a_play_is_counted_as_released", "the_kept_log_is_not_empty", len(self.log_before) > 0, len(self.log_before))
         self.dump = Dump(c.dump)
         a = c.launch()
-        self.fill_disk()
         t0 = c.started
 
         def cold_start():
@@ -508,6 +642,8 @@ class Run:
         def queue_back():
             until(lambda: a.find(label="Runout Groove", type="LinkText") and a.find(label="Play"), 60, 0.02, "the queue put back")
             self.time("cold_start_puts_the_queue_back_and_plays", "launch_to_queue_shown", time.time() - t0)
+            self.usable_at = time.time()
+            self.log_unchanged("first start")
             self.server_plays_before = plays_of(self.by[FIRST]["id"])
             pressed = time.time()
             a.press("Play")
@@ -515,16 +651,16 @@ class Run:
             sound = self.dump.sound_after(pressed)
             self.time("cold_start_puts_the_queue_back_and_plays", "play_to_sound", sound - pressed)
         self.step("cold_start_puts_the_queue_back_and_plays", queue_back)
+        self.wait_for_first_look("first start")
 
         def counted():
             log = c.path("config", "plays.log")
-            line = until(lambda: open(log, "rb").read()[len(self.log_bytes):], 60, 0.02, "the play in the log")
+            until(lambda: open(log, "rb").read()[len(self.log_before):], 60, 0.02, "the play in the log")
             self.counted_at = time.time()
             self.time("a_play_is_counted_as_released", "play_to_counted", self.counted_at - self.pressed_play)
             now = open(log, "rb").read()
-            self.fact("a_play_is_counted_as_released", "start_up_left_the_log_as_it_was", now.startswith(self.log_bytes))
-            self.fact("a_play_is_counted_as_released", "lines_added", now[len(self.log_bytes):].count(b"\n"))
-            self.fact("a_play_is_counted_as_released", "line_with_time_as_offset", normalised(now[len(self.log_bytes):], self.pressed_play))
+            self.expect("a_play_is_counted_as_released", "the_log_was_only_added_to", now.startswith(self.log_before))
+            self.fact("a_play_is_counted_as_released", "added_with_times_masked (first start)", masked(now[len(self.log_before):]))
         self.step("a_play_is_counted_as_released", counted)
 
         intro = self.by[FIRST]["id"]
@@ -532,6 +668,8 @@ class Run:
         def scrobbled():
             until(lambda: plays_of(intro) > self.server_plays_before, 60, 0.1, "the play on the server")
             self.time("a_like_and_a_play_reach_the_music_server", "counted_to_server_has_play", time.time() - self.counted_at)
+            time.sleep(1)
+            self.expect("a_like_and_a_play_reach_the_music_server", "the_play_reached_the_server_once", plays_of(intro) == self.server_plays_before + 1, plays_of(intro) - self.server_plays_before)
         self.step("a_like_and_a_play_reach_the_music_server", scrobbled)
 
         def schedule():
@@ -560,7 +698,6 @@ class Run:
 
         def queue_edits():
             test = "the_queue_is_changed_and_kept"
-            # Paused, so that the queue moves only by the edits.
             if a.find(label="Pause"):
                 a.press("Pause")
             time.sleep(0.5)
@@ -586,22 +723,33 @@ class Run:
             self.kept_queue = saved_queue(c)
             self.fact(test, "queue_before_kill", self.kept_queue)
         self.step("the_queue_is_changed_and_kept", queue_edits)
+        self.log_before = open(c.path("config", "plays.log"), "rb").read()
         c.stop(kill=True, keep=self.keep)
+        # A look the kill cut short ended with the process.
+        if self.on and self.in_flight():
+            with open(c.path("nexus.log"), "a") as log:
+                log.write(f"{time.time():.3f} end killed\n")
+        # (The held look's marker is the process's: the next start holds a look of its own.)
+        if os.path.exists(c.path("held")):
+            os.remove(c.path("held"))
+        self.enforce = False
 
-    # -- launch 2: after kill -9 -------------------------------------------------------------
+    # -- launch 2: after kill -9 ---------------------------------------------------------------
 
     def second_launch(self):
         c = self.copy
         a = c.launch()
-        self.fill_disk()
         t0 = c.started
 
         def put_back():
             test = "the_queue_is_changed_and_kept"
             until(lambda: a.find(label="Play") and a.find(type="QueueRow"), 60, 0.02, "the queue after kill -9")
             self.time(test, "restart_to_queue_shown", time.time() - t0)
-            self.fact(test, "queue_after_kill_is_the_queue_before", saved_queue(c) == getattr(self, "kept_queue", None))
+            self.usable_at = time.time()
+            self.log_unchanged("second start")
+            self.expect(test, "queue_after_kill_is_the_queue_before", saved_queue(c) == getattr(self, "kept_queue", None), saved_queue(c))
         self.step("the_queue_is_changed_and_kept", put_back)
+        self.wait_for_first_look("second start")
 
         def direct():
             test = "a_direct_play_starts_it_cold"
@@ -609,8 +757,34 @@ class Run:
             a.key(" ")
             sound = self.dump.sound_after(pressed, 30)
             self.time(test, "space_to_sound", sound - pressed)
+            # Paused again at once: what is counted must not depend on how long the next
+            # step takes.
             a.key(" ")
+            until(lambda: a.find(label="Play"), 5, 0.05, "paused")
         self.step("a_direct_play_starts_it_cold", direct)
+
+        def continue_here():
+            # Another device's queue, saved to the server while this PC is paused with its
+            # own: newer than this PC's, it is offered.
+            test = "the_queue_is_changed_and_kept"
+            theirs = [s["id"] for s in playlist("Morning mix")["entry"]][:3]
+            title = api("getSong", id=theirs[1])["song"]["title"]
+            # (A device that is playing saves where it has got to every second or so, as this
+            # PC does: so does the other one here, until the offer is made.)
+            saved = time.time()
+            def offered():
+                api("savePlayQueue", id=theirs, current=theirs[1], position=int((time.time() - saved) * 1000), c="e13a-other-device")
+                return a.find(label="Continue here", role="Button")
+            button = until(offered, 60, 1.0, "Continue here offered")
+            self.time(test, "offered_after_another_device_saved", time.time() - saved)
+            pressed = time.time()
+            a.click(button[0]["handle"])
+            until(lambda: (lambda q: q and q[0][q[1]] == title)(saved_queue(c)), 20, 0.02, "their queue taken up")
+            self.time(test, "continue_here_to_kept", time.time() - pressed)
+            if a.find(label="Pause"):
+                a.press("Pause")
+            # (The other device stops saving here.)
+        self.step("the_queue_is_changed_and_kept", continue_here)
 
         def clear():
             test = "the_queue_is_changed_and_kept"
@@ -620,6 +794,8 @@ class Run:
             until(lambda: len((saved_queue(c) or [[0] * length])[0]) < length, 20, 0.02, "the queue cleared")
             self.time(test, "clear_to_kept", time.time() - pressed)
         self.step("the_queue_is_changed_and_kept", clear)
+
+        self.joins = {}
 
         def joins():
             test = "two_songs_join_without_a_gap"
@@ -635,6 +811,7 @@ class Run:
                 rate = rate_of(self.dump, sound + 2, sound + 12)
                 stall = self.dump.stalls(sound + 17, sound + 23)
                 silent, jump = zero_run(c.dump, int(base + 20 * rate), int(rate // 2))
+                self.joins[kind] = (pressed, sound + 20, time.time())
                 self.time(test, f"{kind}_play_to_sound", sound - pressed)
                 self.time(test, f"{kind}_longest_stall_around_the_join", stall)
                 self.fact(test, f"{kind}_silent_frames_at_the_join", silent)
@@ -684,7 +861,6 @@ class Run:
             self.front.music(False)
             self.music_down = True
             down = time.time()
-            # A page not seen yet in this run: its load finds the server gone.
             close_settings(a)
             nav(a, "Artists")
             until(lambda: offline_shown(a), 60, 0.05, "the app to see the server gone")
@@ -701,6 +877,8 @@ class Run:
             self.time("a_like_and_a_play_reach_the_music_server", "server_back_to_play_told_again", time.time() - up)
             until(lambda: not offline_shown(a), 60, 0.1, "back online")
             self.time(test, "server_back_to_online", time.time() - up)
+            time.sleep(1)
+            self.expect("a_like_and_a_play_reach_the_music_server", "the_held_play_reached_the_server_once", plays_of(intro) == before + 1, plays_of(intro) - before)
         self.step("offline_by_hand_and_by_loss", by_loss_and_retry)
 
         def resumed():
@@ -724,62 +902,277 @@ class Run:
             self.time(test, "server_back_to_downloads_done", time.time() - up)
         self.step("downloads_start_and_resume", resumed)
 
-        self.settings_row(a)
+        now = open(c.path("config", "plays.log"), "rb").read()
+        self.expect("a_play_is_counted_as_released", "the_log_was_only_added_to (second start)", now.startswith(self.log_before))
+        self.fact("a_play_is_counted_as_released", "added_with_times_masked (second start)", masked(now[len(self.log_before):]))
+
+        self.settings_row(a, "tester")
 
         def account():
             test = "an_account_change_is_not_held_up"
             settings_tab(a, "Account", "Sign out")
             a.press("Sign out")
             until(lambda: a.find(label="Connect"), 20, 0.05, "the sign-in form")
-            pressed = sign_in(a, "guest")
+            # Another account, at another origin of the same music server (nothing under
+            # /nexus/ there).
+            pressed = sign_in(a, "guest", front.SERVER2)
             until(lambda: home_drawn(a), 60, 0.02, "the new account's first page")
             self.time(test, "connect_to_home_drawn", time.time() - pressed)
-            self.fact(test, "signed_in_as", json.load(open(c.path("config", "settings.json"))).get("username"))
+            self.expect(test, "signed_in_as_guest", json.load(open(c.path("config", "settings.json"))).get("username") == "guest")
         self.step("an_account_change_is_not_held_up", account)
-        self.settings_row(a, after="account change")
+        self.settings_row(a, "guest")
 
-    # -- what the component showed and asked -------------------------------------------------
+    # -- what the component showed and asked -----------------------------------------------------
 
-    def settings_row(self, a, after=""):
-        try:
-            settings_tab(a, "Account", "Sign out")
-            found = [l for l in labels(a) if l.startswith("Found at") or l == "None found"]
-            self.fact("settings_row", "shown" + (f" ({after})" if after else ""), found or "no row")
-            # The component's threads alive now (a held one never ends; a let-go one ends
-            # when its call returns).
-            self.fact("backend", "its_threads" + (f" ({after})" if after else ""), self.copy.pid_threads().count("nexus"))
-            close_settings(a)
-        except Exception as error:
-            self.fact("settings_row", "error", str(error))
+    def settings_row(self, a, who):
+        """The row under Settings, Account, for `who`; and the component's threads."""
+        test = "settings_row"
+        settings_tab(a, "Account", "Sign out")
+        if self.on and not self.held:
+            # (The first look is 5 s after an account is published.)
+            try:
+                until(lambda: any(l.startswith("Found at") or l == "None found" for l in labels(a)), 20, 0.5, "the row")
+            except TimeoutError:
+                pass
+        shown = [l for l in labels(a) if l.startswith("Found at") or l == "None found"]
+        heading = "Nexus server" in labels(a)
+        if not self.on:
+            want = []
+        elif self.held:
+            want = []
+        elif who == "tester" and self.mode == "found":
+            want = [f"Found at {front.SERVER}/nexus/"]
+        else:
+            want = ["None found"]
+        self.expect(test, f"shown for {who}", shown == want and heading == bool(want), shown)
+        threads = self.copy.pid_threads()
+        self.fact("backend", f"threads for {who}", {"nexus-probe": threads.count("nexus-probe")})
+        if not self.on:
+            self.expect("backend", f"no thread of the component ({who})", threads.count("nexus-probe") == 0, threads.count("nexus-probe"))
+        if self.held:
+            self.expect("backend", f"the held look is still held ({who})", threads.count("nexus-probe") >= 1, threads.count("nexus-probe"))
+        close_settings(a)
 
     def backend_seen(self):
-        asked = self.front.asked()
         seen = self.front.nexus_in_access_log()
-        self.fact("backend", "requests_under_nexus_at_the_proxy", len(seen))
-        self.fact("backend", "requests_at_the_stand_in", [(r["method"], r["target"], r["agent"].split("/")[0]) for r in asked][:10])
+        asked = self.front.asked()
         with open(os.path.join(self.out, "nexus-requests.txt"), "w") as f:
             f.writelines(seen)
+        count = len(seen)
+        test = "backend"
+        if self.hook == "sabotage":
+            pass
+        elif not self.on or self.held:
+            # The released app, the component switched off, or its look held before it asks.
+            self.expect(test, "requests_under_nexus", count == 0, count)
+        elif self.stuck:
+            self.expect(test, "requests_under_nexus (looks kept going)", count >= 3, count)
+        else:
+            # One at each start (5 s after the account is published) and one for the guest.
+            self.expect(test, "requests_under_nexus (one per account published)", count == 3, count)
+        for line in seen:
+            ok = '"GET /nexus/api/hello HTTP/1.1"' in line and "NexusMusic/" in line
+            if not ok:
+                self.fail(test, f"a request that is not a plain GET of hello: {line.strip()}")
+        self.fact(test, "requests_at_the_stand_in", len(asked))
 
-    def fill_disk(self):
-        """For disk-full: the component's file system filled to the last byte."""
-        if self.hook == "disk-full":
-            where = f"/work/target/walk/{self.copy.home}/{'/'.join(NEXUS_FILES)}"
-            A.sh(f"docker exec {A.NAME} sh -c 'cat /dev/zero > {where}/filler 2>/dev/null; df {where} | tail -1'")
+    def gapless_sources(self):
+        """Where each join's songs came from, by the proxy's log: streamed with the next one
+        fetched before the join; cached, and downloaded, not asked of the server."""
+        if not getattr(self, "joins", None):
+            return
+        streams = []
+        for line in open(os.path.join(self.out, "front", "access.log")):
+            parts = line.split(" ", 3)
+            if len(parts) > 3 and "/rest/stream?" in parts[3]:
+                end, took = float(parts[0]), float(parts[1])
+                song = re.search(r"[?&]id=([^& ]+)", parts[3])
+                streams.append((end - took, song.group(1) if song else ""))
+        mp3 = [self.by[("Continuous Sweep (MP3)", 1, n)]["id"] for n in (1, 2)]
+        test = "two_songs_join_without_a_gap"
+        asked = lambda kind: [(t, song) for t, song in streams if self.joins[kind][0] <= t <= self.joins[kind][2]]
+        if "streamed" in self.joins:
+            got = asked("streamed")
+            second = [t for t, song in got if song == mp3[1]]
+            self.expect(test, "streamed: both songs streamed, the second fetched before the join",
+                        any(song == mp3[0] for _, song in got) and second and second[0] < self.joins["streamed"][1], got)
+        if "cached" in self.joins:
+            got = [song for _, song in asked("cached") if song in mp3]
+            self.expect(test, "cached: neither song asked of the server", got == [], got)
+        if "downloaded" in self.joins:
+            got = asked("downloaded")
+            self.expect(test, "downloaded: nothing streamed", got == [], got)
 
-    def disk_untouched(self, nexus_dir, hook):
-        if hook.get("fifo"):
-            # Nothing was ever written into the pipe, and it is still a pipe.
-            import stat
-            self.fact("backend", "its_folder_untouched", stat.S_ISFIFO(os.lstat(nexus_dir).st_mode))
+    def compare_with_released(self):
+        """For the new build: every measure the released app has, within its slowest plus the
+        slack; every outcome as the released app's."""
+        if not self.new:
+            return
+        released = [r for r in load_results() if r["build"] == "old"]
+        if not released:
+            self.fail("compare", "no released runs to compare with")
+            return
+        for test, metric in released_metrics(released):
+            limit, worst = allowed(released, test, metric)
+            value = self.results.get(test, {}).get(metric)
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                self.fail(test, f"{metric}: not measured")
+            elif value > limit:
+                self.fail(test, f"{metric}: {value:.3f} s, over {limit:.3f} (released slowest {worst:.3f})")
+        for metric in ("added_with_times_masked (first start)", "added_with_times_masked (second start)"):
+            theirs = {json.dumps(r["results"].get("a_play_is_counted_as_released", {}).get(metric)) for r in released}
+            mine = json.dumps(self.results.get("a_play_is_counted_as_released", {}).get(metric))
+            if mine not in theirs:
+                self.fail("a_play_is_counted_as_released", f"{metric}: {mine} is not what the released app wrote ({theirs})")
+        for kind in ("streamed", "cached", "downloaded"):
+            # Silent frames exactly as few; the largest step within a tenth of the released
+            # app's largest (it moves with where the 20 ms tick falls on the join).
+            for metric, margin in ((f"{kind}_silent_frames_at_the_join", lambda v: v), (f"{kind}_largest_step_at_the_join", lambda v: v * 1.1)):
+                theirs = [r["results"].get("two_songs_join_without_a_gap", {}).get(metric) for r in released]
+                theirs = [v for v in theirs if isinstance(v, (int, float))]
+                mine = self.results.get("two_songs_join_without_a_gap", {}).get(metric)
+                if theirs and (not isinstance(mine, (int, float)) or mine > margin(max(theirs))):
+                    self.fail("two_songs_join_without_a_gap", f"{metric}: {mine}, released at most {max(theirs)}")
 
     def save(self):
         os.makedirs(RESULTS, exist_ok=True)
         self.load.append(os.getloadavg()[0])
-        record = {"run": self.label, "machine_load_at_start_and_end": [round(x, 2) for x in self.load], "build": self.build, "mode": self.mode, "hook": self.hook,
-                  "at": time.strftime("%Y-%m-%d %H:%M:%S"), "binary": digest(os.path.join(A.HOMES, f"nexus-music-{self.build}")),
-                  "results": self.results, "failures": self.failures}
+        record = {"suite": SUITE, "run": self.label, "machine_load_at_start_and_end": [round(x, 2) for x in self.load], "build": self.build,
+                  "mode": self.mode, "hook": self.hook, "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                  "binary": digest(os.path.join(A.HOMES, f"nexus-music-{self.build}")), "results": self.results, "failures": self.failures}
         json.dump(record, open(os.path.join(RESULTS, f"{self.label}.json"), "w"), indent=1, ensure_ascii=False)
         self.say(f"\n{len(self.failures)} failed" + ("".join(f"\n  {f}" for f in self.failures)))
+
+
+def masked(added):
+    """Lines added to the play log, byte for byte, with each time (whole seconds since 1970)
+    written as T: the only part that differs between two runs of the same plays."""
+    return re.sub(rb"(?<=,)\d{10}(?=[,\]])", b"T", added).decode()
+
+
+def load_results():
+    return [r for r in (json.load(open(os.path.join(RESULTS, n))) for n in sorted(os.listdir(RESULTS)) if n.endswith(".json")) if r.get("suite") == SUITE]
+
+
+def released_metrics(released):
+    out = []
+    for r in released:
+        for test, values in r["results"].items():
+            for metric, value in values.items():
+                if isinstance(value, (int, float)) and not isinstance(value, bool) and kind(metric) and (test, metric) not in out:
+                    out.append((test, metric))
+    return out
+
+
+def allowed(released, test, metric):
+    values = [r["results"].get(test, {}).get(metric) for r in released]
+    values = [v for v in values if isinstance(v, (int, float)) and not isinstance(v, bool)]
+    worst = max(values)
+    return worst + SLACK[kind(metric)], worst
+
+
+# ---- the two scenarios that are not a whole run ----------------------------------------------
+
+def scenario_offline(build="new"):
+    """Offline mode on from the start: no look while it is on; looks once a start has it off;
+    none again once it is switched back on. Exits 1 if not."""
+    out = os.path.join(RUNS, f"{build}-offline-scenario")
+    shutil.rmtree(out, ignore_errors=True)
+    os.makedirs(out)
+    failures = []
+    prepare_server()
+    home = "scenario-offline"
+    shutil.rmtree(os.path.join(A.HOMES, home), ignore_errors=True)
+    shutil.copytree(KEPT, os.path.join(A.HOMES, home))
+    settings = os.path.join(A.HOMES, home, "config", "settings.json")
+    s = json.load(open(settings)); s["offline"] = True; json.dump(s, open(settings, "w"))
+    inside = f"/work/target/walk/{home}"
+    # (Its looks come a second apart here, so that one would show at once.)
+    env = {"NEXUS_MUSIC_NEXUS": "1", "NEXUS_TEST_NEXUS_LOG": f"{inside}/nexus.log", "NEXUS_TEST_PROBE_AGAIN_MS": "1000"}
+    if os.environ.get("E13A_SABOTAGE"):
+        env["NEXUS_TEST_SABOTAGE_NO_OFFLINE"] = "1"
+    with front.Front("found", os.path.join(out, "front")) as f:
+        copy = A.Copy(build, home, env=env)
+        a = copy.launch()
+        until(lambda: home_drawn(a), 60, 0.1, "Home")
+        time.sleep(12)
+        first = len(f.nexus_in_access_log())
+        if first:
+            failures.append(f"{first} requests while Offline mode was on from the start")
+        # (The released app does not show Offline mode's switch as on after a start in it,
+        # and its press asks for "on" again, which changes nothing: it cannot be switched off
+        # from that window. So the app is stopped, and started again with it off.)
+        copy.stop(keep=os.path.join(out, "app-output.txt"))
+        s = json.load(open(settings)); s["offline"] = False; json.dump(s, open(settings, "w"))
+        a = copy.launch()
+        until(lambda: home_drawn(a), 60, 0.1, "Home")
+        offline_now = lambda: json.load(open(copy.path("config", "settings.json"))).get("offline")
+        try:
+            until(lambda: len(f.nexus_in_access_log()) > 0, 15, 0.2, "a look once Offline mode is off")
+        except TimeoutError:
+            failures.append("no look within 15 s of a start with Offline mode off")
+        settings_tab(a, "Storage", "Offline mode")
+        a.click(a.one(label="Offline mode", role="Switch")["handle"])
+        until(lambda: offline_now() is True, 5, 0.1, "Offline mode on again")
+        time.sleep(1.5)   # (a look already started may finish)
+        on_again = len(f.nexus_in_access_log())
+        time.sleep(8)
+        later = len(f.nexus_in_access_log())
+        if later != on_again:
+            failures.append(f"{later - on_again} requests after Offline mode went back on")
+        copy.stop(keep=os.path.join(out, "app-output.txt"))
+        shutil.copy(copy.path("nexus.log"), os.path.join(out, "nexus.log")) if os.path.exists(copy.path("nexus.log")) else None
+    shutil.rmtree(os.path.join(A.HOMES, home), ignore_errors=True)
+    print(f"offline: {first} while on from the start; looks after off; {later - on_again} after on again; failures: {failures or 'none'}")
+    return 1 if failures else 0
+
+
+def scenario_late_answer(build="new"):
+    """A look for account A finds the backend; its answer is held until account B (at another
+    origin, with none) is signed in; then let through. It must never be shown under B, and
+    B's own look must say "None found". Exits 1 if not."""
+    out = os.path.join(RUNS, f"{build}-late-answer-scenario")
+    shutil.rmtree(out, ignore_errors=True)
+    os.makedirs(out)
+    failures = []
+    prepare_server()
+    home = "scenario-late"
+    shutil.rmtree(os.path.join(A.HOMES, home), ignore_errors=True)
+    shutil.copytree(KEPT, os.path.join(A.HOMES, home))
+    inside = f"/work/target/walk/{home}"
+    env = {"NEXUS_MUSIC_NEXUS": "1", "NEXUS_TEST_NEXUS_LOG": f"{inside}/nexus.log", "NEXUS_TEST_HOLD_NEXUS_RESULT": f"{inside}/release"}
+    if os.environ.get("E13A_SABOTAGE"):
+        env["NEXUS_TEST_SABOTAGE_NO_GENERATION"] = "1"
+    release = os.path.join(A.HOMES, home, "release")
+    with front.Front("found", os.path.join(out, "front")):
+        copy = A.Copy(build, home, env=env)
+        a = copy.launch()
+        until(lambda: home_drawn(a), 60, 0.1, "Home")
+        until(lambda: os.path.exists(release + ".waiting"), 30, 0.1, "A's answer found and held")
+        settings_tab(a, "Account", "Sign out")
+        a.press("Sign out")
+        until(lambda: a.find(label="Connect"), 20, 0.05, "the sign-in form")
+        sign_in(a, "guest", front.SERVER2)
+        until(lambda: home_drawn(a), 60, 0.05, "B's first page")
+        settings_tab(a, "Account", "Sign out")
+        open(release, "w").write("")
+        seen = set()
+        end = time.time() + 15
+        while time.time() < end:
+            seen.update(l for l in labels(a) if l.startswith("Found at") or l == "None found")
+            time.sleep(0.1)
+        copy.stop(keep=os.path.join(out, "app-output.txt"))
+        log = open(copy.path("nexus.log")).read() if os.path.exists(copy.path("nexus.log")) else ""
+        open(os.path.join(out, "nexus.log"), "w").write(log)
+    shutil.rmtree(os.path.join(A.HOMES, home), ignore_errors=True)
+    if any(l.startswith("Found at") for l in seen):
+        failures.append(f"A's answer was shown under B: {sorted(seen)}")
+    if "None found" not in seen:
+        failures.append(f"B's own row never said None found: {sorted(seen)}")
+    if " dropped " not in log:
+        failures.append("the component did not drop A's late answer")
+    print(f"late answer: rows seen under B {sorted(seen)}; failures: {failures or 'none'}")
+    return 1 if failures else 0
 
 
 def inside(e, box):
@@ -878,8 +1271,10 @@ KINDS = {
     "add_to_kept": "file", "move_to_kept": "file", "remove_to_kept": "file", "clear_to_kept": "file",
     "by_hand_switch_to_offline": "file", "by_hand_switch_back": "file", "offline_play_downloaded_to_sound": "file",
     "by_loss_noticed": "ui", "by_loss_play_downloaded_to_sound": "file", "server_back_to_online": "timer",
+    "continue_here_to_kept": "file", "offered_after_another_device_saved": "cadence",
 }
-SLACK = {"ui": 0.25, "file": 0.25, "timer": 1.0, "gap": 0.02}
+# "cadence": the sync's look at the server's saved queue, every 15 s with the window open.
+SLACK = {"ui": 0.25, "file": 0.25, "timer": 1.0, "gap": 0.02, "cadence": 15.0}
 
 
 def kind(metric):
@@ -891,7 +1286,7 @@ def kind(metric):
 
 
 def table():
-    runs = [json.load(open(os.path.join(RESULTS, name))) for name in sorted(os.listdir(RESULTS)) if name.endswith(".json")]
+    runs = [r for r in load_results() if r.get("hook") != "sabotage"]
     old = [r for r in runs if r["build"] == "old"]
     new = [r for r in runs if r["build"] == "new"]
     metrics = []
@@ -941,8 +1336,10 @@ def table():
     plays += [f"| `{shape}` | {len(names)}: {', '.join(names)} |" for shape, names in logs.items()]
     text = "\n".join(lines + facts + gaps + plays) + "\n"
     print(text)
-    print("all within:", all(v for v in verdicts if v is not None), "| W1 runs:", len(new), "| released runs:", len(old))
-    return text
+    within = all(v for v in verdicts if v is not None)
+    failed = [r["run"] for r in runs if r["failures"]]
+    print("all within:", within, "| runs with a failure:", failed or "none", "| W1 runs:", len(new), "| released runs:", len(old))
+    return 0 if within and not failed else 1
 
 
 if __name__ == "__main__":
@@ -950,8 +1347,12 @@ if __name__ == "__main__":
     if what == "populate":
         populate()
     elif what == "table":
-        table()
+        sys.exit(table())
     elif what == "run":
-        Run(sys.argv[2], sys.argv[3], sys.argv[4] if len(sys.argv) > 4 else None).go()
+        sys.exit(Run(sys.argv[2], sys.argv[3], sys.argv[4] if len(sys.argv) > 4 else None).go())
+    elif what == "offline":
+        sys.exit(scenario_offline(sys.argv[2] if len(sys.argv) > 2 else "new"))
+    elif what == "late-answer":
+        sys.exit(scenario_late_answer(sys.argv[2] if len(sys.argv) > 2 else "new"))
     else:
         raise SystemExit(__doc__)

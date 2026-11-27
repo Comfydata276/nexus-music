@@ -38,7 +38,8 @@
 //!   an account only after the window has published that account: the window's own
 //!   `account-changed`, which fires after `controller::enter` (or `leave`) has returned.
 //! - On the window's thread it does only this: reads three properties of the window and
-//!   Offline mode's switch, arms a timer, starts a thread, and sets its own row. The thread
+//!   whether Offline mode is on (`try_borrow` of the settings: busy counts as on), arms a
+//!   timer, starts a thread, and sets its own row. The thread
 //!   waits for the process; nothing waits for the thread.
 //! - When the account changes its timer is dropped at once, and a look still running is let
 //!   go of (never waited for). Each look carries the generation of the account it was asked
@@ -208,7 +209,8 @@ fn due(ui: &ui::MainWindow, generation: u64) {
     }) else {
         return;
     };
-    if ui.global::<ui::Settings>().get_offline() {
+    // (A deliberate fault, to show that the test of Offline mode catches it.)
+    if offline() && test_var("NEXUS_TEST_SABOTAGE_NO_OFFLINE").is_none() {
         note(format_args!("offline {generation}"));
         schedule(ui, generation, later());
         return;
@@ -237,21 +239,32 @@ fn due(ui: &ui::MainWindow, generation: u64) {
 /// the window publishes now, and Offline mode is still off.
 fn commit(ui: &ui::MainWindow, generation: u64, account: &str, outcome: Outcome) {
     let current = RUNNING.with(|running| running.borrow().as_ref().is_some_and(|running| running.generation == generation));
-    if !current || published(ui) != account {
+    // (A deliberate fault, to show that the test of a late answer catches it.)
+    let sabotaged = test_var("NEXUS_TEST_SABOTAGE_NO_GENERATION").is_some();
+    if !sabotaged && (!current || published(ui) != account) {
         note(format_args!("dropped {generation} {outcome:?}"));
         return;
     }
-    if ui.global::<ui::Settings>().get_offline() {
+    if offline() && test_var("NEXUS_TEST_SABOTAGE_NO_OFFLINE").is_none() {
         note(format_args!("dropped-offline {generation} {outcome:?}"));
         schedule(ui, generation, later());
         return;
     }
-    let url = RUNNING.with(|running| running.borrow().as_ref().and_then(|running| running.url.clone())).unwrap_or_default();
     let settings = ui.global::<ui::Settings>();
+    let server = account.split('\n').next().unwrap_or_default();
+    let url = proto::hello_url(server).unwrap_or_default();
     settings.set_nexus_server(words(outcome, &url).into());
-    settings.set_nexus_for(account.into());
+    // (With the fault above, the late answer is put under the account published now.)
+    settings.set_nexus_for(if sabotaged { published(ui) } else { account.to_string() }.into());
     note(format_args!("shown {generation} {outcome:?}"));
     schedule(ui, generation, again());
+}
+
+/// Whether Offline mode is switched on, as the controller's settings have it (the window's
+/// switch is not told of it at a start). Read, never borrowed for long, and never waited for:
+/// held elsewhere at this moment, it counts as on, and the look waits for the next turn.
+fn offline() -> bool {
+    crate::controller::with(|ctl| ctl.settings.try_borrow().map(|settings| settings.offline).unwrap_or(true)).unwrap_or(true)
 }
 
 /// What the row says.

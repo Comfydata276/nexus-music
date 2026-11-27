@@ -1,25 +1,36 @@
 #!/usr/bin/env bash
-# One pass of the suite: every mode, and for each mode every build named, one after the other
-# (so that whatever else this machine is doing at the time falls on both alike); then, for
-# "new", its own workers held and its disk blocked.
+# One pass of the suite. Every mode of the stand-in, the released app ("old") and the app with
+# the component ("new") one after the other, so that whatever else this machine is doing
+# falls on both alike; then the component's look held, the component switched off, the two
+# scenarios, and each deliberate fault, which must be caught.
 #
-#   tests/e13a/run-pass.sh <pass number> old [new]
+#   tests/e13a/run-pass.sh <pass number>        exits 1 if anything is not as it must be
 set -u
 cd "$(dirname "$0")/../.."
-pass="$1"; shift
-summary() { echo "$1 pass $pass: $(grep -E '^[0-9]+ failed' "$HOME/.cache/nexus-music-android/shots/nexus-w1/runs/$1-$pass/run.log" 2>/dev/null)"; }
+pass="$1"
+bad=0
+runs="$HOME/.cache/nexus-music-android/shots/nexus-w1/runs"
+say() { echo "$*"; }
+must_pass() {   # label, command...
+  local label="$1"; shift
+  if "$@" > /dev/null 2>&1; then say "$label pass $pass: ok"; else say "$label pass $pass: FAILED"; bad=1; fi
+}
+must_fail() {   # a deliberate fault: the check must catch it
+  local label="$1"; shift
+  if "$@" > /dev/null 2>&1; then say "$label pass $pass: NOT CAUGHT"; bad=1; else say "$label pass $pass: caught, as it must be"; fi
+}
+export E13A_REPEAT=$pass
 for mode in absent refused blackhole found stalled saturated ended half; do
-  for build in "$@"; do
-    E13A_REPEAT=$pass python3 tests/e13a/suite.py run "$build" "$mode" > /dev/null 2>&1
-    summary "$build-$mode"
-  done
+  must_pass "old-$mode" python3 tests/e13a/suite.py run old "$mode"
+  must_pass "new-$mode" python3 tests/e13a/suite.py run new "$mode"
 done
-for build in "$@"; do
-  [ "$build" = new ] || continue
-  for hook in held disk-hang disk-full; do
-    for mode in absent stalled; do
-      E13A_REPEAT=$pass python3 tests/e13a/suite.py run new "$mode" "$hook" > /dev/null 2>&1
-      summary "new-$mode-$hook"
-    done
-  done
-done
+must_pass "new-absent-held" python3 tests/e13a/suite.py run new absent held
+must_pass "new-stalled-held" python3 tests/e13a/suite.py run new stalled held
+must_pass "new-absent-switch-off" python3 tests/e13a/suite.py run new absent switch-off
+must_pass "offline scenario" python3 tests/e13a/suite.py offline new
+must_pass "late-answer scenario" python3 tests/e13a/suite.py late-answer new
+must_fail "CONTROL window's thread held 0.3 s a look" python3 tests/e13a/suite.py run new absent sabotage
+must_fail "CONTROL offline not honoured" env E13A_SABOTAGE=1 python3 tests/e13a/suite.py offline new
+must_fail "CONTROL late answer not dropped" env E13A_SABOTAGE=1 python3 tests/e13a/suite.py late-answer new
+must_pass "phases (with their own control)" python3 tests/e13a/phases.py new
+exit $bad
