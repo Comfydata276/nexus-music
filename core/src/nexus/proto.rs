@@ -566,6 +566,10 @@ pub fn classify(status: u16, body: impl Read) -> Found {
 /// - anything but `https://` (the backend's line is HTTPS only, R5), plain `http://` included;
 /// - an address with a name or password in it (`user@host`), a backslash, a space or a
 ///   control character, or an empty host;
+/// - a host name that is not ASCII letters, digits, dots and dashes in labels of 1 to 63
+///   (an internationalised name is accepted in its ASCII form, `xn--…`, only: both apps'
+///   HTTP stacks refuse it otherwise), or a bracketed IPv6 literal that is not hex digits and
+///   colons;
 /// - a port that is not 1 to 65535 in digits, or a bracketed IPv6 host that is not closed;
 /// - a music server that is itself under `/nexus` (design 6.1: it cannot have a backend).
 ///
@@ -586,7 +590,7 @@ pub fn hello_url(music_server: &str) -> Option<String> {
     let (host, port) = match authority.strip_prefix('[') {
         Some(bracketed) => {
             let (inside, tail) = bracketed.split_once(']')?;
-            if inside.is_empty() || !inside.bytes().all(|byte| byte.is_ascii_hexdigit() || byte == b':' || byte == b'.') {
+            if !inside.contains(':') || !inside.bytes().all(|byte| byte.is_ascii_hexdigit() || byte == b':' || byte == b'.') {
                 return None;
             }
             let port = match tail.strip_prefix(':') {
@@ -601,7 +605,15 @@ pub fn hello_url(music_server: &str) -> Option<String> {
             None => (authority, None),
         },
     };
-    if host.is_empty() || (!host.starts_with('[') && host.contains(':')) {
+    // A name is ASCII letters, digits, dots and dashes: an internationalised name is given in
+    // its ASCII form (`xn--…`), as the HTTP stacks of both apps require. No empty label, and
+    // none that begins or ends with a dash.
+    let name_ok = |name: &str| {
+        name.split('.').all(|label| {
+            !label.is_empty() && label.len() <= 63 && !label.starts_with('-') && !label.ends_with('-') && label.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+    };
+    if host.is_empty() || (!host.starts_with('[') && (host.len() > 253 || !name_ok(host))) {
         return None;
     }
     if let Some(port) = port {
@@ -667,6 +679,12 @@ mod tests {
             "https://music.example.org/nexus/",
             "https://music.example.org/NEXUS/navidrome",
         ] {
+            assert_eq!(asked(server), None, "{server:?}");
+        }
+        // An internationalised name in its ASCII form; not as typed. A malformed literal.
+        assert_eq!(asked("https://xn--bcher-kva.example/music"), at("https://xn--bcher-kva.example"));
+        for server in ["https://bücher.example/music", "https://[abc]", "https://[::g]", "https://music..example.org",
+                       "https://-music.example.org", "https://music-.example.org", "https://music.example.org.", "https://mu_sic.example.org"] {
             assert_eq!(asked(server), None, "{server:?}");
         }
         // Under a path that merely begins with the letters, it can.
