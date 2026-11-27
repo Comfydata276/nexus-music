@@ -7,19 +7,34 @@
 //!   somewhere else and keep the answer).
 //! - **`hello`** (design 12.1): `GET /nexus/api/hello` answers
 //!   `{"nexus":"0.1.0","id":"…","speaks":[1,1],"has":["plays"]}`. [`Hello::read`] reads it,
-//!   checking every field before anything is made of it.
-//! - **Known by its body, never by its status** (design 6.1, experiment E1): a music server
-//!   left to answer under `/nexus/` sends a redirect to its own web app, or "method not
-//!   allowed", not "not found". [`classify`] says "this is the backend" only for an answer
-//!   whose body is a valid `hello`; anything else, whatever its status, is "no backend here".
+//!   checking every byte and every field before anything is made of it.
+//! - **Known by its status and its body together, never by a header** (design 6.1 and 12.1,
+//!   as the lead has ruled; experiment E1): a music server left to answer under `/nexus/`
+//!   sends a redirect to its own web app, or "method not allowed", not "not found".
+//!   [`classify`] says "this is the backend" only for status 200 with a complete body that is
+//!   a valid `hello`. Any other status is "no backend here" whatever the body; no header is
+//!   required or trusted; a redirect is never followed.
+//! - **The complete body or nothing**: a body is only ever read as a [`Body`], which can only
+//!   be made by reading the transport's reader to its end under [`HELLO_MAX_BYTES`].
 //! - **The plain form of an address** (design 6.1, experiment E2): the proxy chooses where to
 //!   send a request by the tidied path and hands on the untidied one, so the backend itself
 //!   refuses, unread, any request target that [`plain`] does not pass. The apps never send
 //!   such a thing.
+//!
+//! **Wire rules this sets, beyond the design's words** (each a constant or a function here,
+//! and each one that a later backend or app must keep, or the older side refuses):
+//!
+//! - A path of the backend's is at most [`TARGET_MAX_BYTES`], and each segment after
+//!   `/nexus/` is spelled with lower-case ASCII letters, digits, `-` and `_` alone. So no
+//!   path has a dot in it (`/nexus/v1.2` is refused), and none a `;`.
+//! - A `hello` is at most [`HELLO_MAX_BYTES`], nested at most [`HELLO_MAX_DEPTH`] deep, with
+//!   no key twice in any object of it. `has` holds at most [`HAS_MAX`] names, each of at most
+//!   [`HAS_NAME_MAX_BYTES`], beginning with a lower-case letter and spelled with lower-case
+//!   letters, digits and `_`: a name like `playlists-v2`, or a 33rd name, makes an older app
+//!   refuse the whole `hello`.
 
 use std::fmt;
-
-use serde::Deserialize;
+use std::io::Read;
 
 /// Everything of the backend's is under this, at the root of the music server's origin.
 /// With the slash: without it a proxy's rule also catches `/nexusx`.
@@ -38,6 +53,8 @@ pub const HAS_PLAYS: &str = "plays";
 /// The most of an answer to `hello` that is read. A real `hello` is a tenth of this; a larger
 /// answer is not the backend's.
 pub const HELLO_MAX_BYTES: usize = 4096;
+/// How deep a `hello` may nest arrays and objects, counting its own object as the first.
+pub const HELLO_MAX_DEPTH: usize = 16;
 /// The longest request target in plain form. Every path above is a fraction of this.
 pub const TARGET_MAX_BYTES: usize = 256;
 /// The most names `has` may carry, and the longest of them.
@@ -164,8 +181,10 @@ impl fmt::Debug for BackendId {
     }
 }
 
-/// The backend's own version, as `MAJOR.MINOR.PATCH`. Shown, never used to decide anything:
-/// [`Speaks`] is what says whether two sides understand each other.
+/// The backend's own version, as `MAJOR.MINOR.PATCH`, each any number from 0 to
+/// `u32::MAX`. Shown, never used to decide anything: [`Speaks`] is what says whether two
+/// sides understand each other. Every `Version` that can be made is written as text that
+/// [`Version::parse`] reads back as the same.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Version {
     pub major: u32,
@@ -175,12 +194,12 @@ pub struct Version {
 
 impl Version {
     /// Exactly three numbers with a dot between each: digits only, no sign, no leading zero
-    /// (but `0` itself), nothing before or after.
+    /// (but `0` itself), each no more than `u32::MAX`, nothing before or after.
     pub fn parse(text: &str) -> Option<Self> {
         let mut parts = text.split('.');
         let mut number = || -> Option<u32> {
             let part = parts.next()?;
-            if part.is_empty() || part.len() > 9 || !part.bytes().all(|byte| byte.is_ascii_digit()) {
+            if part.is_empty() || part.len() > 10 || !part.bytes().all(|byte| byte.is_ascii_digit()) {
                 return None;
             }
             if part.len() > 1 && part.starts_with('0') {
@@ -243,8 +262,9 @@ pub struct Hello {
 /// Why a body is not a valid `hello`. Each is "no backend here".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HelloWrong {
-    /// Not one JSON object in UTF-8, or a known field missing, given twice, or of the wrong
-    /// type.
+    /// Not one JSON object in UTF-8 (every byte of it, in fields this version passes over
+    /// too); a key given twice in any object of it, known or not; nested deeper than
+    /// [`HELLO_MAX_DEPTH`]; or a known field missing or of the wrong type.
     Form,
     /// `nexus` is not `MAJOR.MINOR.PATCH`.
     Version,
@@ -258,14 +278,111 @@ pub enum HelloWrong {
     Has,
 }
 
-/// A known field missing, given twice or of the wrong type fails here; a field this version
-/// doesn't know is passed over.
-#[derive(Deserialize)]
-struct Wire {
-    nexus: String,
-    id: String,
-    speaks: Vec<u32>,
-    has: Vec<String>,
+/// The known fields as they were found, before they are checked.
+#[derive(Default)]
+struct Fields {
+    nexus: Option<String>,
+    id: Option<String>,
+    speaks: Option<Vec<u32>>,
+    has: Option<Vec<String>>,
+}
+
+/// Reads one object's keys, refusing any key given twice. Keys are compared as JSON reads
+/// them, so `"id"` and `"id"` are the same key.
+fn first_time<E: serde::de::Error>(seen: &mut Vec<String>, key: String) -> Result<(), E> {
+    if seen.contains(&key) {
+        return Err(E::custom("a key given twice"));
+    }
+    seen.push(key);
+    Ok(())
+}
+
+/// The whole `hello` object: the four known fields read, every other passed over.
+struct Top;
+
+impl<'de> serde::de::Visitor<'de> for Top {
+    type Value = Fields;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("one object")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Fields, A::Error> {
+        let mut fields = Fields::default();
+        let mut seen = Vec::new();
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "nexus" => fields.nexus = Some(map.next_value()?),
+                "id" => fields.id = Some(map.next_value()?),
+                "speaks" => fields.speaks = Some(map.next_value()?),
+                "has" => fields.has = Some(map.next_value()?),
+                _ => map.next_value_seed(PassOver(1))?,
+            }
+            first_time(&mut seen, key)?;
+        }
+        Ok(fields)
+    }
+}
+
+/// A value this version doesn't know, passed over: read to its end, kept nowhere, held to
+/// [`HELLO_MAX_DEPTH`] and to one of each key in each object inside it.
+struct PassOver(usize);
+
+impl<'de> serde::de::DeserializeSeed<'de> for PassOver {
+    type Value = ();
+
+    fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        if self.0 > HELLO_MAX_DEPTH {
+            return Err(serde::de::Error::custom("nested too deep"));
+        }
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for PassOver {
+    type Value = ();
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("any JSON value")
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+        while seq.next_element_seed(PassOver(self.0 + 1))?.is_some() {}
+        Ok(())
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        let mut seen = Vec::new();
+        while let Some(key) = map.next_key::<String>()? {
+            map.next_value_seed(PassOver(self.0 + 1))?;
+            first_time(&mut seen, key)?;
+        }
+        Ok(())
+    }
 }
 
 fn has_name(name: &str) -> bool {
@@ -298,26 +415,23 @@ impl Hello {
         Some(Hello { nexus, id, speaks, has })
     }
 
-    /// Reads a body that may be a `hello`: no more than [`HELLO_MAX_BYTES`], one JSON object,
-    /// every known field present once and right, other fields passed over.
-    pub fn read(body: &[u8]) -> Result<Self, HelloWrong> {
-        if body.len() > HELLO_MAX_BYTES {
+    /// Reads a complete body as a `hello`: every byte of it UTF-8, one JSON object, no key
+    /// given twice, every known field present and right, other fields passed over.
+    pub fn read(body: &Body) -> Result<Self, HelloWrong> {
+        let text = std::str::from_utf8(&body.0).map_err(|_| HelloWrong::Form)?;
+        let mut deserializer = serde_json::Deserializer::from_str(text);
+        let fields = serde::Deserializer::deserialize_map(&mut deserializer, Top).map_err(|_| HelloWrong::Form)?;
+        deserializer.end().map_err(|_| HelloWrong::Form)?;
+        let (Some(nexus), Some(id), Some(speaks), Some(has)) = (fields.nexus, fields.id, fields.speaks, fields.has) else {
             return Err(HelloWrong::Form);
-        }
-        // One object, and nothing else: a list of the same values in the same order would
-        // otherwise be read as the same fields.
-        let first = body.iter().find(|byte| !matches!(byte, b' ' | b'\t' | b'\n' | b'\r'));
-        if first != Some(&b'{') {
-            return Err(HelloWrong::Form);
-        }
-        let wire: Wire = serde_json::from_slice(body).map_err(|_| HelloWrong::Form)?;
-        let nexus = Version::parse(&wire.nexus).ok_or(HelloWrong::Version)?;
-        let id = BackendId::from_hex(&wire.id).ok_or(HelloWrong::Id)?;
-        let speaks = match wire.speaks[..] {
+        };
+        let nexus = Version::parse(&nexus).ok_or(HelloWrong::Version)?;
+        let id = BackendId::from_hex(&id).ok_or(HelloWrong::Id)?;
+        let speaks = match speaks[..] {
             [low, high] => Speaks::new(low, high).ok_or(HelloWrong::Speaks)?,
             _ => return Err(HelloWrong::Speaks),
         };
-        let has = has_list(wire.has).ok_or(HelloWrong::Has)?;
+        let has = has_list(has).ok_or(HelloWrong::Has)?;
         Ok(Hello { nexus, id, speaks, has })
     }
 
@@ -347,38 +461,57 @@ impl Hello {
 // Telling the backend from anything else
 // ---------------------------------------------------------------------------------------
 
-/// An answer to `GET /nexus/api/hello`, as the app's transport got it, **without following
-/// any redirect**.
-#[derive(Debug, Clone, Copy)]
-pub struct Answer<'a> {
-    pub status: u16,
-    /// Every `Content-Type` the answer carried, in order (usually one, or none).
-    pub content_types: &'a [&'a str],
-    /// Whether it carried a `Location`.
-    pub location: bool,
-    /// The body after the transport has undone any compression. A transport that stops
-    /// reading past [`HELLO_MAX_BYTES`] hands in what it has, or one byte more, and the
-    /// answer is too large either way.
-    pub body: &'a [u8],
+/// The whole body of an answer, read to its end, and no larger than [`HELLO_MAX_BYTES`]. It
+/// can only be made by [`Body::read`], so whatever holds one holds a body that was neither
+/// cut short nor cut to fit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Body(Vec<u8>);
+
+/// Why a body was not had whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BodyWrong {
+    /// Larger than [`HELLO_MAX_BYTES`]: reading stopped at the first byte past it.
+    TooLarge,
+    /// Reading it failed before its end.
+    Cut,
+}
+
+impl Body {
+    /// Reads `source` to its end: the transport's own reader for the body, after it has undone
+    /// any compression, and **not a copy of the body cut to a size**. Reads at most one byte
+    /// past [`HELLO_MAX_BYTES`], so a body of any size costs no more than that.
+    pub fn read(source: impl Read) -> Result<Self, BodyWrong> {
+        let mut bytes = Vec::new();
+        let limit = HELLO_MAX_BYTES as u64 + 1;
+        source.take(limit).read_to_end(&mut bytes).map_err(|_| BodyWrong::Cut)?;
+        if bytes.len() > HELLO_MAX_BYTES {
+            return Err(BodyWrong::TooLarge);
+        }
+        Ok(Body(bytes))
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.0
+    }
 }
 
 /// Why an answer is not the backend's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NoBackend {
-    /// A 3xx, or a `Location`: a music server left to answer under `/nexus/` redirects to its
-    /// own web app. A redirect is an answer, never a place to go.
+    /// A 3xx: a music server left to answer under `/nexus/` redirects to its own web app. A
+    /// redirect is an answer, never a place to go.
     Redirect,
-    /// Any status but 200: Navidrome's 405 for a method other than GET, a proxy's 404, 502,
-    /// 403, and every other.
+    /// Any other status but 200: Navidrome's 405 for a method other than GET, a proxy's 404,
+    /// 502 or 403, and every other.
     Status(u16),
-    /// Not one `Content-Type` of `application/json`: HTML, the music server's XML, a picture.
-    NotJson,
-    /// No body at all.
+    /// A 200 with no body at all.
     Empty,
-    /// A body larger than [`HELLO_MAX_BYTES`].
+    /// A 200 with a body larger than [`HELLO_MAX_BYTES`].
     TooLarge,
-    /// JSON, but not a valid `hello`: the music server's own JSON, or a `hello` wrong in a
-    /// known field.
+    /// A 200 whose body could not be read to its end.
+    Cut,
+    /// A 200 whose body is not a valid `hello`: HTML, the music server's XML or JSON, or a
+    /// `hello` wrong in a known field.
     NotHello(HelloWrong),
 }
 
@@ -389,41 +522,34 @@ pub enum Found {
     NoBackend(NoBackend),
 }
 
-/// Whether one `Content-Type` value is JSON: `application/json`, in any case, with nothing
-/// after it but `charset=utf-8`.
-fn json_type(value: &str) -> bool {
-    let mut parts = value.split(';');
-    let essence = parts.next().unwrap_or("").trim();
-    if !essence.eq_ignore_ascii_case("application/json") {
-        return false;
-    }
-    parts.all(|parameter| {
-        let parameter = parameter.trim();
-        parameter.is_empty() || parameter.eq_ignore_ascii_case("charset=utf-8")
-    })
-}
-
-/// "This is the backend" for an answer of 200, with one JSON `Content-Type`, no `Location`,
-/// and a body that [`Hello::read`] reads. "No backend here", with why, for everything else.
-pub fn classify(answer: &Answer<'_>) -> Found {
+/// What an answer to `GET /nexus/api/hello` says is at the address, from its status and its
+/// body alone (design 6.1 and 12.1, as the lead has ruled):
+///
+/// - **"This is the backend" only for status 200 with a complete body that is a valid
+///   `hello`** ([`Hello::read`]).
+/// - **Any other status is "no backend here", whatever the body**, and the body is not read.
+/// - **No header is required or trusted**: not `Content-Type`, not `Location`.
+/// - **A redirect is never followed**: the transport must hand in the 3xx itself, and it is
+///   "no backend here".
+///
+/// `body` is the transport's reader for the body (see [`Body::read`]).
+pub fn classify(status: u16, body: impl Read) -> Found {
     let refused = Found::NoBackend;
-    if (300..400).contains(&answer.status) || answer.location {
+    if (300..400).contains(&status) {
         return refused(NoBackend::Redirect);
     }
-    if answer.status != 200 {
-        return refused(NoBackend::Status(answer.status));
+    if status != 200 {
+        return refused(NoBackend::Status(status));
     }
-    match answer.content_types {
-        [only] if json_type(only) => {}
-        _ => return refused(NoBackend::NotJson),
-    }
-    if answer.body.is_empty() {
+    let body = match Body::read(body) {
+        Ok(body) => body,
+        Err(BodyWrong::TooLarge) => return refused(NoBackend::TooLarge),
+        Err(BodyWrong::Cut) => return refused(NoBackend::Cut),
+    };
+    if body.0.is_empty() {
         return refused(NoBackend::Empty);
     }
-    if answer.body.len() > HELLO_MAX_BYTES {
-        return refused(NoBackend::TooLarge);
-    }
-    match Hello::read(answer.body) {
+    match Hello::read(&body) {
         Ok(hello) => Found::Backend(hello),
         Err(wrong) => refused(NoBackend::NotHello(wrong)),
     }
@@ -448,8 +574,10 @@ mod tests {
     }
     use Reached::*;
 
-    /// Every target in E2.2's table, and E1's that are not already in it: what reached the
-    /// backend, and the verdict on what it would see. `Err` is refused unread.
+    /// Every request target in E2.2's table, and E1's that are not already in it: what reached
+    /// the backend, and the verdict on what it would see. `Err` is refused unread. (E2.2's rows
+    /// that differ only in the method or the `Host` are routing by the proxy, which this
+    /// function does not see; the target they all sent is here once.)
     ///
     /// E2 records where each target went, not a verdict; the verdicts are the report's change
     /// 9 ("the backend must itself refuse anything that is not already in normal form ... It
@@ -485,9 +613,13 @@ mod tests {
         ("/rest/../nexus/api/hello", AsSent, Err(NotPlain::DotSegment)),
         ("/rest/%2e%2e/nexus/api/hello", AsSent, Err(NotPlain::Escape)),
         ("/app/../nexus/", AsSent, Err(NotPlain::DotSegment)),
-        ("http://music.example.org/nexus/api/hello", As("/nexus/api/hello"), Err(NotPlain::DoubledSlash)),
-        // With Cache Assets off these reach the backend; with it on, the music server and the
-        // proxy's cache. No path of the backend's ends so.
+        // The measured absolute form (E2.2), to the test set-up's own made-up name.
+        ("http://music.test/nexus/api/hello", As("/nexus/api/hello"), Err(NotPlain::DoubledSlash)),
+        // These four rows are the `plain` variant, with the host's Cache Assets and Block
+        // Common Exploits off, as design 6.2 has them. With those boxes on (variant
+        // `ws-cache-block`) none of the four reached the backend: the asset names went to the
+        // music server and into the proxy's cache, and both queries got the proxy's 403. No
+        // path of the backend's ends so, or has a query.
         ("/nexus/app.js", AsSent, Err(NotPlain::Byte)),
         ("/nexus/x.png", AsSent, Err(NotPlain::Byte)),
         ("/nexus/?q=union+select+(1)", AsSent, Err(NotPlain::Query)),
@@ -495,8 +627,13 @@ mod tests {
         // Sent with POST, PUT, DELETE, OPTIONS and PATCH; the method is the backend's to
         // refuse, not the target's.
         ("/nexus/api/prove/begin", AsSent, Ok(())),
-        // E1's, under a music server with no rule for `/nexus/`.
+        // E1's, under a music server with no rule for `/nexus/`: there they reached the music
+        // server alone, so `Reached` is what E2's proxy, rule in place, did with each.
         ("/nexus/ws", AsSent, Ok(())),
+        ("/NEXUS/", Never, Err(NotPlain::Outside)),
+        ("//nexus/", As("/nexus/"), Err(NotPlain::DoubledSlash)),
+        ("/nexus%2fapi", AsSent, Err(NotPlain::Escape)),
+        ("/%6eexus/", AsSent, Err(NotPlain::Escape)),
         ("/app/nexus/", Never, Err(NotPlain::Outside)),
         ("/rest/nexus", Never, Err(NotPlain::Outside)),
         ("/api/nexus", Never, Err(NotPlain::Outside)),
@@ -603,9 +740,23 @@ mod tests {
         hello_json(r#""0.1.0""#, &format!("\"{ID}\""), "[1,1]", r#"["plays"]"#)
     }
 
+    /// The design's `hello` with `extra` put in before its last brace, as bytes.
+    fn good_with(extra: &[u8]) -> Vec<u8> {
+        let mut bytes = good().into_bytes();
+        let last = bytes.pop();
+        assert_eq!(last, Some(b'}'));
+        bytes.extend_from_slice(extra);
+        bytes.push(b'}');
+        bytes
+    }
+
+    fn read(bytes: &[u8]) -> Result<Hello, HelloWrong> {
+        Hello::read(&Body::read(bytes).expect("a body within the bound"))
+    }
+
     #[test]
     fn the_designs_hello_is_read_and_every_field_is_kept() {
-        let hello = Hello::read(good().as_bytes()).unwrap();
+        let hello = read(good().as_bytes()).unwrap();
         assert_eq!(hello.nexus, Version { major: 0, minor: 1, patch: 0 });
         assert_eq!(hello.id.to_hex(), ID);
         assert_eq!((hello.speaks.low(), hello.speaks.high()), (1, 1));
@@ -617,11 +768,21 @@ mod tests {
     #[test]
     fn what_the_backend_writes_is_read_back_the_same() {
         let id = BackendId::from_bytes([0xa5; 16]);
-        for has in [&[][..], &["plays"][..], &["plays", "queue", "a_2"][..]] {
-            let hello = Hello::new(Version { major: 12, minor: 0, patch: 345 }, id, Speaks::new(1, 3).unwrap(), has).unwrap();
-            let json = hello.to_json();
-            assert!(json.len() < HELLO_MAX_BYTES);
-            assert_eq!(Hello::read(json.as_bytes()), Ok(hello));
+        let versions = [
+            Version { major: 0, minor: 0, patch: 0 },
+            Version { major: 12, minor: 0, patch: 345 },
+            // Ten digits, in range.
+            Version { major: 1_000_000_000, minor: 0, patch: 0 },
+            Version { major: u32::MAX, minor: u32::MAX, patch: u32::MAX },
+        ];
+        for nexus in versions {
+            assert_eq!(Version::parse(&nexus.to_string()), Some(nexus));
+            for has in [&[][..], &["plays"][..], &["plays", "queue", "a_2"][..]] {
+                let hello = Hello::new(nexus, id, Speaks::new(1, u32::MAX).unwrap(), has).unwrap();
+                let json = hello.to_json();
+                assert!(json.len() < HELLO_MAX_BYTES);
+                assert_eq!(read(json.as_bytes()), Ok(hello));
+            }
         }
         // And it will not write what no app would take.
         let version = Version { major: 0, minor: 1, patch: 0 };
@@ -633,16 +794,68 @@ mod tests {
     fn fields_it_does_not_know_are_passed_over() {
         let id = format!("\"{ID}\"");
         let with_more = format!(
-            r#"{{"later":{{"deep":[1,{{"x":null}}]}},"nexus":"0.1.0","id":{id},"speaks":[1,2],"has":["plays","queue"],"motd":"hi","n":1.5}}"#
+            r#"{{"later":{{"deep":[1,{{"x":null}}]}},"nexus":"0.1.0","id":{id},"speaks":[1,2],"has":["plays","queue"],"motd":"hi","n":1.5,"t":true,"m":-3}}"#
         );
-        let hello = Hello::read(with_more.as_bytes()).unwrap();
+        let hello = read(with_more.as_bytes()).unwrap();
         assert_eq!(hello.has(), ["plays", "queue"]);
+        // A later release, speaking only numbers this one doesn't: still the backend, so the
+        // app can say it is too old (design 12.2).
+        let later = hello_json(r#""2.1.0""#, &id, "[2,3]", r#"["plays","queue"]"#);
+        let later = format!("{},\"words\":{{\"x\":[1]}}}}", &later[..later.len() - 1]);
+        let hello = read(later.as_bytes()).unwrap();
+        assert_eq!(hello.nexus, Version { major: 2, minor: 1, patch: 0 });
+        assert!(!hello.speaks.understands(SPEAKS.high()));
         // Whitespace about it is JSON's, and allowed.
         let spaced = format!(" \r\n\t{} \n", good());
-        assert!(Hello::read(spaced.as_bytes()).is_ok());
+        assert!(read(spaced.as_bytes()).is_ok());
         // `has` may be empty: a backend that does nothing yet.
         let empty = hello_json(r#""0.1.0""#, &id, "[1,1]", "[]");
-        assert_eq!(Hello::read(empty.as_bytes()).unwrap().has(), [] as [String; 0]);
+        assert_eq!(read(empty.as_bytes()).unwrap().has(), [] as [String; 0]);
+        // Nested as deep as allowed.
+        let deep = format!(r#","x":{}0{}"#, "[".repeat(HELLO_MAX_DEPTH - 1), "]".repeat(HELLO_MAX_DEPTH - 1));
+        assert!(read(&good_with(deep.as_bytes())).is_ok());
+    }
+
+    #[test]
+    fn every_byte_of_the_body_is_utf8_even_in_fields_passed_over() {
+        // The review's case: a raw 0xFF in a string this version doesn't read.
+        assert_eq!(read(&good_with(b",\"extra\":\"\xff\"")), Err(HelloWrong::Form));
+        assert_eq!(read(&good_with(b",\"\xff\":1")), Err(HelloWrong::Form));
+        assert_eq!(read(&good_with(b",\"extra\":[\"a\",{\"b\":\"\xc3\"}]")), Err(HelloWrong::Form));
+        // And in a known one.
+        let mut bytes = good().into_bytes();
+        let at = bytes.iter().position(|&byte| byte == b'p').unwrap();
+        bytes[at] = 0xff;
+        assert_eq!(read(&bytes), Err(HelloWrong::Form));
+        // UTF-8 that is right is no trouble.
+        assert!(read(&good_with(",\"extra\":\"é ✓\"".as_bytes())).is_ok());
+    }
+
+    #[test]
+    fn a_key_given_twice_is_refused_known_or_not() {
+        // The review's case.
+        assert_eq!(read(&good_with(b",\"extra\":0,\"extra\":1")), Err(HelloWrong::Form));
+        assert_eq!(read(&good_with(b",\"extra\":0,\"extra\":0")), Err(HelloWrong::Form));
+        // The same key, spelled with an escape.
+        assert_eq!(read(&good_with(b",\"extra\":0,\"\\u0065xtra\":1")), Err(HelloWrong::Form));
+        assert_eq!(read(&good_with(b",\"\\u0069d\":\"0123456789abcdef0123456789abcdef\"")), Err(HelloWrong::Form));
+        // Inside a field passed over, at any depth.
+        assert_eq!(read(&good_with(b",\"extra\":{\"a\":1,\"a\":2}")), Err(HelloWrong::Form));
+        assert_eq!(read(&good_with(b",\"extra\":[{\"x\":{\"a\":1,\"a\":2}}]")), Err(HelloWrong::Form));
+        // Different keys, and the same key in different objects, are no trouble.
+        assert!(read(&good_with(b",\"extra\":0,\"extras\":1")).is_ok());
+        assert!(read(&good_with(b",\"a\":{\"a\":{\"a\":1}},\"b\":[{\"a\":1},{\"a\":2}]")).is_ok());
+    }
+
+    #[test]
+    fn a_body_nested_too_deep_is_refused() {
+        let deep = format!(r#","x":{}0{}"#, "[".repeat(HELLO_MAX_DEPTH), "]".repeat(HELLO_MAX_DEPTH));
+        assert_eq!(read(&good_with(deep.as_bytes())), Err(HelloWrong::Form));
+        let deep = format!(r#","x":{}0{}"#, "{\"a\":".repeat(HELLO_MAX_DEPTH), "}".repeat(HELLO_MAX_DEPTH));
+        assert_eq!(read(&good_with(deep.as_bytes())), Err(HelloWrong::Form));
+        // The review's case: a thousand arrays about a 0.
+        let deep = format!(r#","x":{}0{}"#, "[".repeat(1000), "]".repeat(1000));
+        assert_eq!(read(&good_with(deep.as_bytes())), Err(HelloWrong::Form));
     }
 
     #[test]
@@ -697,7 +910,8 @@ mod tests {
             (hello_json(r#""01.1.0""#, &id, "[1,1]", "[]"), Version),
             (hello_json(r#""0.+1.0""#, &id, "[1,1]", "[]"), Version),
             (hello_json(r#""0..0""#, &id, "[1,1]", "[]"), Version),
-            (hello_json(r#""9999999999.0.0""#, &id, "[1,1]", "[]"), Version),
+            (hello_json(r#""4294967296.0.0""#, &id, "[1,1]", "[]"), Version),
+            (hello_json(r#""0.0.99999999999""#, &id, "[1,1]", "[]"), Version),
             // id.
             (hello_json(v, r#""""#, "[1,1]", "[]"), Id),
             (hello_json(v, &format!("\"{}\"", &ID[..31]), "[1,1]", "[]"), Id),
@@ -727,21 +941,13 @@ mod tests {
             ),
         ];
         for (body, wrong) in cases {
-            assert_eq!(Hello::read(body.as_bytes()), Err(wrong), "{body}");
+            assert_eq!(read(body.as_bytes()), Err(wrong), "{body}");
         }
-        // Not UTF-8.
-        let mut bytes = good().into_bytes();
-        let at = bytes.iter().position(|&byte| byte == b'p').unwrap();
-        bytes[at] = 0xff;
-        assert_eq!(Hello::read(&bytes), Err(HelloWrong::Form));
-        // Too large, however valid.
-        let padded = format!(r#"{{"pad":"{}",{}"#, " ".repeat(HELLO_MAX_BYTES), &good()[1..]);
-        assert_eq!(Hello::read(padded.as_bytes()), Err(HelloWrong::Form));
         // The most `has` may hold is allowed.
         let most = (0..HAS_MAX).map(|n| format!("\"n{n}\"")).collect::<Vec<_>>().join(",");
-        assert!(Hello::read(hello_json(v, &id, "[1,1]", &format!("[{most}]")).as_bytes()).is_ok());
+        assert!(read(hello_json(v, &id, "[1,1]", &format!("[{most}]")).as_bytes()).is_ok());
         let longest = format!("[\"{}\"]", "a".repeat(HAS_NAME_MAX_BYTES));
-        assert!(Hello::read(hello_json(v, &id, "[1,1]", &longest).as_bytes()).is_ok());
+        assert!(read(hello_json(v, &id, "[1,1]", &longest).as_bytes()).is_ok());
     }
 
     #[test]
@@ -755,87 +961,121 @@ mod tests {
         assert_eq!(BackendId::from_hex("ÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿ"), None);
     }
 
+    // ---- the complete body ----------------------------------------------------------------
+
+    /// A valid `hello` padded with spaces to exactly `size` bytes.
+    fn padded(size: usize) -> Vec<u8> {
+        let mut bytes = good().into_bytes();
+        bytes.resize(size, b' ');
+        bytes
+    }
+
+    /// A reader that gives `bytes` a few at a time, then fails.
+    struct Failing<'a>(&'a [u8]);
+
+    impl std::io::Read for Failing<'_> {
+        fn read(&mut self, into: &mut [u8]) -> std::io::Result<usize> {
+            if self.0.is_empty() {
+                return Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "cut"));
+            }
+            let n = into.len().min(self.0.len()).min(7);
+            into[..n].copy_from_slice(&self.0[..n]);
+            self.0 = &self.0[n..];
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn a_body_is_had_whole_or_not_at_all() {
+        // At the bound, whole: the backend.
+        let exactly = padded(HELLO_MAX_BYTES);
+        assert_eq!(Body::read(&exactly[..]).map(|body| body.bytes().len()), Ok(HELLO_MAX_BYTES));
+        assert!(matches!(classify(200, &exactly[..]), Found::Backend(_)));
+        // The review's case: the same and one byte more is not, though its first 4,096 bytes
+        // are a valid `hello`.
+        let mut more = exactly.clone();
+        more.push(b'x');
+        assert_eq!(Body::read(&more[..]), Err(BodyWrong::TooLarge));
+        assert_eq!(classify(200, &more[..]), Found::NoBackend(NoBackend::TooLarge));
+        // However much more there is, no more than one byte past the bound is read.
+        let mut huge = std::io::Read::chain(&exactly[..], std::io::repeat(b' '));
+        assert_eq!(classify(200, &mut huge), Found::NoBackend(NoBackend::TooLarge));
+        // A body cut off by a failed read is not had, even if what came is a valid `hello`.
+        assert_eq!(Body::read(Failing(good().as_bytes())), Err(BodyWrong::Cut));
+        assert_eq!(classify(200, Failing(good().as_bytes())), Found::NoBackend(NoBackend::Cut));
+    }
+
     // ---- telling the backend from anything else -------------------------------------------
 
-    const JSON: &[&str] = &["application/json"];
+    /// A reader that must not be read: the body of an answer that is not 200.
+    struct Untouched;
 
-    fn answer<'a>(status: u16, content_types: &'a [&'a str], location: bool, body: &'a [u8]) -> Answer<'a> {
-        Answer { status, content_types, location, body }
-    }
-
-    #[test]
-    fn the_backends_answer_is_the_backend() {
-        let body = good();
-        for types in [JSON, &["application/json; charset=utf-8"][..], &["Application/JSON;charset=UTF-8"][..], &["application/json;"][..]] {
-            match classify(&answer(200, types, false, body.as_bytes())) {
-                Found::Backend(hello) => assert_eq!(hello.id.to_hex(), ID),
-                other => panic!("{types:?}: {other:?}"),
-            }
+    impl std::io::Read for Untouched {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            panic!("the body of an answer that is not 200 was read");
         }
     }
 
     #[test]
-    fn what_the_music_server_and_the_proxy_answer_is_no_backend_whatever_the_status() {
+    fn a_200_with_a_valid_hello_is_the_backend_whatever_its_headers() {
+        // No header is an input at all: a `hello` without a Content-Type, or under any type,
+        // is the backend. (So a captive portal's page labelled JSON is no backend either: its
+        // body is not a `hello`.)
+        match classify(200, good().as_bytes()) {
+            Found::Backend(hello) => assert_eq!(hello.id.to_hex(), ID),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn any_other_status_is_no_backend_whatever_the_body() {
         use NoBackend::*;
-        let hello = good();
-        let hello = hello.as_bytes();
-        // What Navidrome 0.64.2 sent in E1 and E2, and what a proxy may.
-        let found = b"<a href=\"/app/\">Found</a>.\n\n";
-        let subsonic_json = br#"{"subsonic-response":{"status":"ok","version":"1.16.1","type":"navidrome","serverVersion":"0.64.2","openSubsonic":true}}"#;
-        let subsonic_xml = br#"<?xml version="1.0" encoding="UTF-8"?><subsonic-response xmlns="http://subsonic.org/restapi" status="ok" version="1.16.1"></subsonic-response>"#;
-        let html = b"<!doctype html><html><head><title>Navidrome</title></head><body></body></html>";
+        for status in [300, 301, 302, 303, 304, 307, 308, 399] {
+            assert_eq!(classify(status, Untouched), Found::NoBackend(Redirect), "{status}");
+        }
+        for status in [0, 100, 101, 201, 202, 204, 206, 299, 400, 401, 403, 404, 405, 408, 413, 429, 500, 502, 503, 504, 999] {
+            assert_eq!(classify(status, Untouched), Found::NoBackend(Status(status)), "{status}");
+        }
+        // And with the backend's own body, read or not: the review's 201 case.
+        for status in [201, 302, 404, 500] {
+            assert!(matches!(classify(status, good().as_bytes()), Found::NoBackend(_)), "{status}");
+        }
+    }
+
+    #[test]
+    fn what_the_music_server_and_the_proxy_answer_is_no_backend() {
+        use NoBackend::*;
+        // What Navidrome 0.64.2 sent in E1 and E2, and what a proxy or a portal may.
+        let found: &[u8] = b"<a href=\"/app/\">Found</a>.\n\n";
+        let subsonic_json: &[u8] = br#"{"subsonic-response":{"status":"ok","version":"1.16.1","type":"navidrome","serverVersion":"0.64.2","openSubsonic":true}}"#;
+        let subsonic_xml: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?><subsonic-response xmlns="http://subsonic.org/restapi" status="ok" version="1.16.1"></subsonic-response>"#;
+        let html: &[u8] = b"<!doctype html><html><head><title>Navidrome</title></head><body></body></html>";
         let large = vec![b' '; HELLO_MAX_BYTES + 1];
-        let cases: &[(Answer<'_>, NoBackend)] = &[
+        let cases: &[(u16, &[u8], NoBackend)] = &[
             // Navidrome's redirect to its web app, for a GET under `/nexus/`.
-            (answer(302, &["text/html; charset=utf-8"], true, found), Redirect),
+            (302, found, Redirect),
             // The proxy's 301 for `/nexus` without the slash.
-            (answer(301, &["text/html"], true, b"<html>301</html>"), Redirect),
-            // A redirect carrying the backend's own body is still a redirect.
-            (answer(302, JSON, true, hello), Redirect),
-            (answer(307, JSON, false, hello), Redirect),
-            (answer(200, JSON, true, hello), Redirect),
-            (answer(304, &[], false, b""), Redirect),
+            (301, b"<html>301</html>", Redirect),
             // Navidrome's "method not allowed", empty.
-            (answer(405, &[], false, b""), Status(405)),
-            (answer(404, &["text/plain; charset=utf-8"], false, b"404 page not found\n"), Status(404)),
-            (answer(400, &[], false, b""), Status(400)),
-            (answer(403, &["text/html"], false, b"<html>403 Forbidden</html>"), Status(403)),
-            (answer(413, &["text/html"], false, b"<html>413</html>"), Status(413)),
-            (answer(502, &["text/html"], false, b"<html>502 Bad Gateway</html>"), Status(502)),
-            // The backend's own body under any status but 200.
-            (answer(201, JSON, false, hello), Status(201)),
-            (answer(204, JSON, false, b""), Status(204)),
-            (answer(404, JSON, false, hello), Status(404)),
-            (answer(500, JSON, false, hello), Status(500)),
-            (answer(0, JSON, false, hello), Status(0)),
-            (answer(999, JSON, false, hello), Status(999)),
-            // A 200 that is not JSON: HTML, Navidrome's XML, a picture, no type at all.
-            (answer(200, &["text/html"], false, html), NotJson),
-            (answer(200, &["application/xml"], false, subsonic_xml), NotJson),
-            (answer(200, &["text/xml"], false, subsonic_xml), NotJson),
-            (answer(200, &["image/png"], false, b"\x89PNG"), NotJson),
-            (answer(200, &[], false, hello), NotJson),
-            (answer(200, &["text/plain"], false, hello), NotJson),
-            (answer(200, &["application/json", "application/json"], false, hello), NotJson),
-            (answer(200, &["application/json; charset=latin-1"], false, hello), NotJson),
-            (answer(200, &["application/jsonx"], false, hello), NotJson),
-            (answer(200, &["application/problem+json"], false, hello), NotJson),
-            // A 200 of JSON with nothing in it, or too much.
-            (answer(200, JSON, false, b""), Empty),
-            (answer(200, JSON, false, &large), TooLarge),
-            // Navidrome's own JSON, and JSON that is nearly a `hello`.
-            (answer(200, JSON, false, subsonic_json), NotHello(HelloWrong::Form)),
-            (answer(200, JSON, false, b"{}"), NotHello(HelloWrong::Form)),
-            (answer(200, JSON, false, b"null"), NotHello(HelloWrong::Form)),
-            (answer(200, JSON, false, b"   "), NotHello(HelloWrong::Form)),
+            (405, b"", Status(405)),
+            (404, b"404 page not found\n", Status(404)),
+            (502, b"<html>502 Bad Gateway</html>", Status(502)),
+            // A 200 that is not a `hello`.
+            (200, html, NotHello(HelloWrong::Form)),
+            (200, subsonic_xml, NotHello(HelloWrong::Form)),
+            (200, subsonic_json, NotHello(HelloWrong::Form)),
+            (200, b"{}", NotHello(HelloWrong::Form)),
+            (200, br#"{"nexus":"0.1.0"}"#, NotHello(HelloWrong::Form)),
+            (200, b"null", NotHello(HelloWrong::Form)),
+            (200, b"   ", NotHello(HelloWrong::Form)),
+            (200, b"\x89PNG\r\n", NotHello(HelloWrong::Form)),
+            (200, b"", Empty),
+            (200, &large, TooLarge),
         ];
-        for (answer, why) in cases {
-            assert_eq!(classify(answer), Found::NoBackend(*why), "{answer:?}");
+        for &(status, body, why) in cases {
+            assert_eq!(classify(status, body), Found::NoBackend(why), "{status} {:?}", String::from_utf8_lossy(body));
         }
         let wrong_id = good().replace(ID, &ID.to_uppercase());
-        assert_eq!(
-            classify(&answer(200, JSON, false, wrong_id.as_bytes())),
-            Found::NoBackend(NoBackend::NotHello(HelloWrong::Id))
-        );
+        assert_eq!(classify(200, wrong_id.as_bytes()), Found::NoBackend(NotHello(HelloWrong::Id)));
     }
 }
