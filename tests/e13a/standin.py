@@ -12,6 +12,8 @@ The mode file is read at every request, so a test can change the mode under a ru
                every half second
     ended      every answer is "not signed in" (401), at once
     half       `hello`'s headers and half its body, then the connection is reset
+    bodystall  200 and `hello`'s headers, and the body never comes
+    gzip302    a 302 said to be gzip-compressed, and the body never comes
 
 ("absent" and "blackhole" are the proxy's: front.py sends /nexus/ to the music server, or to
 a port whose queue of connections is full, and this stand-in never sees them.)
@@ -78,6 +80,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.wfile.flush()
                 time.sleep(0.5)
             return
+        if m == "bodystall":
+            # A 200 whose body never comes.
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(HELLO)))
+            self.end_headers()
+            self.wfile.flush()
+            while True:
+                time.sleep(3600)
+        if m == "gzip302":
+            # A redirect said to be compressed, whose body never comes.
+            self.send_response(302)
+            self.send_header("Location", "/app/")
+            self.send_header("Content-Encoding", "gzip")
+            self.send_header("Content-Length", "100")
+            self.end_headers()
+            self.wfile.flush()
+            while True:
+                time.sleep(3600)
         if m == "ended":
             return self.answer(401, b'{"error":"not signed in"}')
         if m == "half":

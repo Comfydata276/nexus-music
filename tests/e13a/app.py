@@ -37,7 +37,7 @@ class Copy:
         env = {"SLINT_MCP_PORT": MCP, "SLINT_BACKEND": "headless-skia", "NEXUS_MUSIC_HOME": f"/work/target/walk/{self.home}",
                "NEXUS_WINDOW_SIZE": "1280x800", "NEXUS_AUDIO_DUMP": f"/work/target/walk/{self.home}/audio.raw", "NEXUS_TRACE": "1",
                "SSL_CERT_FILE": "/work/target/walk/certs/ca.pem", "SSL_CERT_DIR": "/nonexistent", **self.env}
-        args = f"-d --name {NAME} --add-host {front.HOST}:127.0.0.1 " + " ".join(f"-e {k}={v}" for k, v in env.items())
+        args = f"-d --name {NAME} --add-host {front.HOST}:127.0.0.1 --add-host {front.HOST2}:127.0.0.1 " + " ".join(f"-e {k}={v}" for k, v in env.items())
         args += "".join(f" --mount {m}" for m in self.mounts)
         for _ in range(10):
             self.started = time.time()

@@ -351,7 +351,9 @@ pub fn probe_mode() -> Option<i32> {
     use std::io::Write;
     let said = match look(&url) {
         Some(proto::Found::Backend(hello)) => format!("found {}\n", hello.id.to_hex()),
-        _ => "none\n".to_string(),
+        Some(proto::Found::NoBackend(_)) => "none\n".to_string(),
+        // Nothing answered: nothing is said, and the look ends otherwise than well.
+        None => return Some(1),
     };
     let mut out = std::io::stdout().lock();
     let _ = out.write_all(said.as_bytes()).and_then(|_| out.flush());
@@ -378,6 +380,11 @@ fn look(url: &str) -> Option<proto::Found> {
         .new_agent();
     let mut response = agent.get(url).call().ok()?;
     let status = response.status().as_u16();
+    if test_var("NEXUS_TEST_PROBE_BODY_FIRST").is_some() {
+        // A deliberate fault, to show that tests/e13a/phases.py catches it: the body's reader
+        // opened before the status is looked at, as W1's first version did.
+        return Some(proto::classify(status, response.body_mut().as_reader()));
+    }
     if status != 200 {
         return Some(proto::classify(status, std::io::empty()));
     }

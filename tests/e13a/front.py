@@ -20,13 +20,16 @@ import os, socket, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 HOST, TLS_PORT = "music.example.org", 4681
+# A second origin on the same music server, with nothing under /nexus/: another account's.
+HOST2, TLS_PORT2 = "music2.example.org", 4686
 NAVIDROME = 4680
 STANDIN, BLACKHOLE, REFUSED = 4682, 4683, 4684
 SERVER = f"https://{HOST}:{TLS_PORT}"
+SERVER2 = f"https://{HOST2}:{TLS_PORT2}"
 NGINX = "nexus-w1-front"
 STATE = os.path.expanduser("~/.cache/nexus-music-android/shots/nexus-w1/front")
 CERTS = os.path.join(STATE, "certs")
-MODES = ("absent", "refused", "blackhole", "found", "stalled", "saturated", "ended", "half")
+MODES = ("absent", "refused", "blackhole", "found", "stalled", "saturated", "ended", "half", "bodystall", "gzip302")
 
 
 def sh(cmd, check=False):
@@ -39,14 +42,15 @@ def sh(cmd, check=False):
 def certs():
     """A certificate authority for the run, and music.example.org's certificate from it."""
     os.makedirs(CERTS, exist_ok=True)
-    if os.path.exists(os.path.join(CERTS, "music.pem")):
+    if os.path.exists(os.path.join(CERTS, "two-names")):
         return
     run = lambda cmd: sh(f"cd {CERTS} && {cmd}", check=True)
     run("openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.pem -days 30 -subj '/CN=Nexus W1 test authority'")
     run("openssl req -newkey rsa:2048 -nodes -keyout music.key -out music.csr -subj '/CN=music.example.org'")
-    open(os.path.join(CERTS, "ext.cnf"), "w").write("subjectAltName=DNS:music.example.org\nbasicConstraints=CA:FALSE\n")
+    open(os.path.join(CERTS, "ext.cnf"), "w").write("subjectAltName=DNS:music.example.org,DNS:music2.example.org\nbasicConstraints=CA:FALSE\n")
     run("openssl x509 -req -in music.csr -CA ca.pem -CAkey ca.key -CAcreateserial -out music.pem -days 30 -extfile ext.cnf")
     os.chmod(os.path.join(CERTS, "music.key"), 0o644)
+    open(os.path.join(CERTS, "two-names"), "w").write("")
 
 
 RULE = """
@@ -61,7 +65,7 @@ RULE = """
             proxy_no_cache 1;
             proxy_cache_bypass 1;
             # (The rule says "access_log off"; here it is logged apart, for the tests.)
-            access_log /state/nexus-access.log;
+            access_log /state/nexus-access.log timed;
             client_max_body_size 1m;"""
 
 
@@ -84,7 +88,8 @@ pid /tmp/nginx.pid;
 error_log /dev/stderr warn;
 events {{ worker_connections 1024; }}
 http {{
-    access_log /state/access.log;
+    log_format timed '$msec $request_time $status "$request" "$http_user_agent"';
+    access_log /state/access.log timed;
     client_body_temp_path /tmp/client_temp;
     proxy_temp_path /tmp/proxy_temp;
     fastcgi_temp_path /tmp/fastcgi_temp;
@@ -106,6 +111,22 @@ http {{
             proxy_buffering off;
             proxy_read_timeout 3600s;
         }}{nexus}
+    }}
+    server {{
+        listen 127.0.0.1:{TLS_PORT2} ssl;
+        server_name {HOST2};
+        ssl_certificate /certs/music.pem;
+        ssl_certificate_key /certs/music.key;
+        client_max_body_size 0;
+        location / {{{"" if music else """
+            return 444;"""}
+            proxy_pass http://navidrome;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+            proxy_set_header Host $host;
+            proxy_buffering off;
+            proxy_read_timeout 3600s;
+        }}
     }}
 }}
 """
@@ -147,7 +168,7 @@ class Front:
         certs()
         sh(f"docker rm -f {NGINX}")
         sh(f"pkill -f 'standin[.]py {STANDIN}'")
-        self.set(self.mode if self.mode in ("found", "stalled", "saturated", "ended", "half") else "found")
+        self.set(self.mode if self.mode in ("found", "stalled", "saturated", "ended", "half", "bodystall", "gzip302") else "found")
         self.procs.append(subprocess.Popen([sys.executable, "-I", os.path.join(HERE, "standin.py"), str(STANDIN), self.mode_file, self.log],
                                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
         if self.mode == "blackhole":
