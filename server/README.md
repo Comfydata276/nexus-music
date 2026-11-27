@@ -32,14 +32,8 @@ These are what the backend relies on; none of them can it check for itself.
 
 - **Its port is reachable from the proxy alone.** Do not publish the container's port on
   the machine; put the container on a network it shares with the proxy, and nothing else.
-- **Both have fixed addresses on that network.** `NEXUS_PROXY` is the proxy's: a
-  container's address can change when it is started again, and then nothing is answered.
-  **The proxy forwards to the backend's fixed address, never to its container's name**:
-  measured on Nginx Proxy Manager 2.17.1, a location forwarded to a name while that
-  container is stopped makes the proxy's configuration fail to load ("host not found in
-  upstream"), so that the proxy cannot apply any change, and cannot start at all, the
-  music server's own host with it. Forwarded to an address, a stopped backend is only a
-  502 for `/nexus/`.
+- **The proxy's address on that network is fixed**, and it is `NEXUS_PROXY`: a container's
+  address can change when it is started again, and then nothing is answered.
 - **The rule sets `X-Nexus-Scheme` from `$scheme`, as below, and never to a fixed
   value.** The rule's line replaces whatever a caller sent under that name; without it, a
   caller's own header would reach the backend. `$scheme` is how the caller reached the
@@ -48,24 +42,50 @@ These are what the backend relies on; none of them can it check for itself.
 
 ## The proxy's rule
 
-On Nginx Proxy Manager (design 6.2 and 13.3): **Hosts, Proxy Hosts**, the music server's
-host, **Edit**. On **Details**: Cache Assets off, Websockets Support on. On **Custom
-Locations**: **Add location**, `/nexus/` with both slashes, scheme `http`, **the backend's
-fixed address** with no path, its port, and under the gear exactly these lines:
+**Not as a Custom Location.** Measured on Nginx Proxy Manager 2.17.1: a custom location
+forwarded to a container's name is written so that the name must be found when the proxy
+loads its configuration. While that container is stopped, the proxy refuses every change to
+every host, and if the proxy starts then (a reboot, say), it does not start at all, and no
+host it serves answers, the music server's included. So the rule is written in the music
+server's host's own **Advanced** box, where the name is looked up for each request instead:
+a stopped backend is then a 502 for `/nexus/` and nothing more.
 
-    proxy_set_header Cookie "";
-    proxy_set_header X-Nexus-Peer $realip_remote_addr;
-    proxy_set_header X-Nexus-Scheme $scheme;
-    proxy_set_header Remote-User "";
-    proxy_set_header Forwarded "";
-    proxy_set_header True-Client-IP "";
-    proxy_set_header CF-Connecting-IP "";
-    proxy_set_header X-Forwarded-Host "";
-    proxy_no_cache 1;
-    proxy_cache_bypass 1;
-    access_log off;
-    error_log /dev/null crit;
-    client_max_body_size 1m;
+In Nginx Proxy Manager: **Hosts, Proxy Hosts**, the music server's host, **Edit**.
+
+1. On **Details**: **Cache Assets** off.
+2. On **Custom Locations**: if there is a `/nexus/` location, delete it. There must be only
+   this one.
+3. On **Advanced**, add exactly these lines below anything already there, with the backend
+   container's name in place of `nexus-server` and its port in place of `8080`:
+
+       location /nexus/ {
+           resolver 127.0.0.11 valid=10s;
+           set $nexus_up nexus-server;
+           proxy_set_header Cookie "";
+           proxy_set_header X-Nexus-Peer $realip_remote_addr;
+           proxy_set_header X-Nexus-Scheme $scheme;
+           proxy_set_header Remote-User "";
+           proxy_set_header Forwarded "";
+           proxy_set_header True-Client-IP "";
+           proxy_set_header CF-Connecting-IP "";
+           proxy_set_header X-Forwarded-Host "";
+           proxy_no_cache 1;
+           proxy_cache_bypass 1;
+           access_log off;
+           error_log /dev/null crit;
+           client_max_body_size 1m;
+           proxy_http_version 1.1;
+           proxy_set_header Upgrade $http_upgrade;
+           proxy_set_header Connection $http_connection;
+           proxy_pass http://$nexus_up:8080;
+       }
+
+4. **Save.**
+
+What the lines do: `127.0.0.11` is Docker's own name service, so the proxy and the backend
+must share a network Docker made (not the default bridge); `proxy_pass` has no path, so the
+backend sees the address exactly as the caller wrote it and can refuse it; the `Cookie` and
+the other emptied headers never reach it; the last three lines pass a WebSocket (stage 2).
 
 **`error_log /dev/null crit;` is required.** A backend that is down, restarting or too slow
 otherwise has the proxy write, for every request, a line to its error log holding the
