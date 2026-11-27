@@ -135,6 +135,9 @@ export global App {
     in property <bool> signed-in;
     in property <string> server;
     in property <string> username;
+    // Set by the Nexus server's component when it is switched on (src/nexus.rs): only then
+    // does the window track the account for it.
+    in property <bool> nexus-on;
     // Called once the account in use has changed (see `account` in app.slint), for what
     // follows the account without being told by the controller: the Nexus server's
     // component (src/nexus.rs).

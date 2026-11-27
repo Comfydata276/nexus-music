@@ -130,5 +130,9 @@ fn main() -> Result<(), slint::PlatformError> {
     controller.downloads.borrow_mut().save_if_due(true);
     // The queue is written by a thread of its own: wait for it to finish.
     controller.saver.flush();
+    // A look of the Nexus server's component still running is ended (at most two seconds).
+    if nexus::switched_on() {
+        nexus::shutdown();
+    }
     Ok(())
 }
