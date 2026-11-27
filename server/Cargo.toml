@@ -13,10 +13,13 @@ publish = false
 [dependencies]
 nexus-core = { path = "../core" }
 # The runtime the listener, its deadlines and each request's own task run on.
-tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "time", "sync"] }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "time", "sync", "io-util"] }
 # The HTTP/1 connection itself, served one connection at a time with its bounds set by hand:
 # the deadline for a request's head, the size of a head, the number of its headers.
 hyper = { version = "1", default-features = false, features = ["server", "http1"] }
+# Reading and judging a request's head before hyper sees a byte of it, so that nothing is
+# written before the gate has passed. The parser hyper itself uses (already in the lock).
+httparse = "1"
 # hyper's link to tokio: its sockets and its timer.
 hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
 # Routing a request, once it has passed the bounds, to what answers it.

@@ -1,25 +1,36 @@
 //! The listener, and everything a request meets before it is answered (design 6.2, 13.5;
-//! slice S1). In order:
+//! slice S1). Each connection carries **one request**, and then it is closed. In order:
 //!
-//! 1. **Who opened the connection.** Only the proxy (`NEXUS_PROXY`) is answered. One from
-//!    anywhere else is closed as soon as it is accepted, without a byte read or written; but
-//!    a connection from this machine's own loopback address may ask `hello`, and nothing
-//!    else, for the container's health check.
-//! 2. **How many are open.** Past [`CONNECTIONS_MAX`], one more is closed the same way.
-//! 3. **Whether the proxy marked it HTTPS.** A request from the proxy that does not carry
-//!    exactly one `X-Nexus-Scheme: https` is not answered: the connection is closed.
-//! 4. **Its head:** it must all come within [`HEAD_DEADLINE`], in at most [`HEAD_MAX_BYTES`]
-//!    and [`HEAD_MAX_HEADERS`] headers.
-//! 5. **Its target**, exactly as it came: in plain form ([`proto::plain`]) and in origin form,
-//!    or 400, and its body is not read.
-//! 6. **Its body:** at most [`BODY_MAX_BYTES`], within [`BODY_DEADLINE`], or 413 / 408.
+//! 1. **Who opened the connection.** Anyone but the proxy (`NEXUS_PROXY`) is closed as soon as
+//!    it is accepted, without a byte read or written; except that this machine's own loopback
+//!    address may ask `GET /nexus/api/hello`, and nothing else, for the container's health
+//!    check.
+//! 2. **How many are open:** past [`CONNECTIONS_MAX`], one more is turned away.
+//! 3. **Its head**, read here and not by hyper ([`crate::head`]): all of it within
+//!    [`HEAD_DEADLINE`], in at most [`HEAD_MAX_BYTES`] and [`HEAD_MAX_HEADERS`] headers.
+//! 4. **The gate:** a request from the proxy must carry exactly one `X-Nexus-Scheme: https`.
+//!
+//!    Whatever fails before or at the gate is answered by **one fixed bare refusal when the
+//!    connection is the proxy's** ([`GATE`]: the same bytes whatever the cause, so that the
+//!    proxy hands the caller a plain answer and writes nothing to its error log; a connection
+//!    closed under it would be written there with the caller's address and the request line,
+//!    as measured), and **with nothing at all when it is not**.
+//! 5. **The target exactly as it came**, the method, and the body's framing and declared size,
+//!    each refused with a bare answer before a byte of the body is read.
+//! 6. **The body**, read by hyper within [`BODY_DEADLINE`] into one buffer of the size it
+//!    declared.
 //! 7. **What answers it**, in a task of its own, within [`ANSWER_DEADLINE`] or 503; a fault
 //!    there is that request's 500 and nothing else's.
+//!
+//! After a bare answer, whatever more the caller sends is discarded, for a moment and up to a
+//! bound ([`LINGER_DEADLINE`], [`LINGER_MAX_BYTES`]), so that closing does not reset the
+//! connection under the answer before the proxy has read it.
 //!
 //! Every answer has `Cache-Control: no-store` and no cookie. Nothing about a request is
 //! written to the log: not its address, a header, its target or its body. Only how many of
 //! each kind were refused, now and then.
 
+use std::convert::Infallible;
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -30,26 +41,27 @@ use std::task::{Context, Poll};
 
 use axum::Router;
 use axum::body::{Body, Bytes};
-use axum::http::header::{CACHE_CONTROL, CONNECTION, CONTENT_TYPE, SET_COOKIE};
-use axum::http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, Uri};
+use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, SET_COOKIE};
+use axum::http::{HeaderValue, Request, Response, StatusCode};
 use axum::routing::get;
-use http_body_util::{BodyExt, LengthLimitError, Limited};
-use hyper::body::{Body as _, Incoming};
+use http_body_util::BodyExt;
+use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use nexus_core::nexus::proto::{self, Hello};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::time::Sleep;
 use tower::ServiceExt;
 
 use crate::bounds::*;
+use crate::head::{self, NoHead, Verdict};
 
 /// Who opened a connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Peer {
-    /// The proxy: answered, if it marks each request as having come by HTTPS.
+    /// The proxy: answered, if it marks the request as having come by HTTPS.
     Proxy,
     /// This machine's own loopback address, when that is not the proxy's: may ask `hello`
     /// alone, for the health check.
@@ -71,64 +83,68 @@ pub fn peer(from: IpAddr, proxy: IpAddr) -> Peer {
     }
 }
 
-/// Whether the proxy marked a request as having come to it by HTTPS (design 6.2:
-/// `proxy_set_header X-Nexus-Scheme $scheme;`): the header exactly once, exactly `https`.
-pub fn marked_https(headers: &HeaderMap) -> bool {
-    let mut values = headers.get_all("x-nexus-scheme").iter();
-    values.next().is_some_and(|value| value.as_bytes() == b"https") && values.next().is_none()
-}
-
-/// The target exactly as it came, if it is in origin form (`/…`): not the absolute form, and
-/// not `*`.
-fn origin_target(uri: &Uri) -> Option<&str> {
-    if uri.scheme().is_some() || uri.authority().is_some() {
-        return None;
-    }
-    uri.path_and_query().map(|target| target.as_str())
-}
-
 /// Each kind of refusal, counted for the log and nothing else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
     Stranger,
     Full,
+    SlowHead,
+    BadHead,
     NotMarked,
     NotHealth,
     NotPlain,
+    NoSuchPath,
+    NotAllowed,
+    Framing,
     TooLarge,
     SlowBody,
     BadBody,
     Slow,
     Fault,
+    Stalled,
 }
 
-const REFUSALS: [(Refusal, &str); 10] = [
+const REFUSALS: [(Refusal, &str); 16] = [
     (Refusal::Stranger, "from an address other than the proxy's"),
     (Refusal::Full, "with every connection taken"),
+    (Refusal::SlowHead, "with a head too slow"),
+    (Refusal::BadHead, "with a head too large or not read"),
     (Refusal::NotMarked, "not marked by the proxy as HTTPS"),
     (Refusal::NotHealth, "from this machine, for anything but hello"),
     (Refusal::NotPlain, "for an address not in plain form"),
+    (Refusal::NoSuchPath, "for a path there is not"),
+    (Refusal::NotAllowed, "with a method not allowed"),
+    (Refusal::Framing, "with a body framed otherwise than by its length"),
     (Refusal::TooLarge, "with a body too large"),
     (Refusal::SlowBody, "with a body too slow"),
     (Refusal::BadBody, "with a body that could not be read"),
     (Refusal::Slow, "answered too slowly"),
     (Refusal::Fault, "with a fault in what answered"),
+    (Refusal::Stalled, "whose caller stopped taking the answer"),
 ];
 
 /// The listener's own state: whom it answers, what answers, and its counts.
 pub struct Shell {
     proxy: IpAddr,
     router: Router,
+    routes: Vec<(&'static str, &'static str)>,
     open: AtomicUsize,
     refused: [AtomicU64; REFUSALS.len()],
 }
 
 impl Shell {
-    pub fn new(proxy: IpAddr, router: Router) -> Arc<Self> {
-        Arc::new(Shell { proxy: proxy.to_canonical(), router, open: AtomicUsize::new(0), refused: Default::default() })
+    /// The backend's own: [`router`] and [`head::ROUTES`].
+    pub fn new(proxy: IpAddr, hello: &Hello) -> Arc<Self> {
+        Self::with_routes(proxy, router(hello), head::ROUTES.to_vec())
     }
 
-    /// How many connections are open now.
+    /// With other routes (the tests add some): `routes` names each path `router` answers, and
+    /// the one method it answers there.
+    pub fn with_routes(proxy: IpAddr, router: Router, routes: Vec<(&'static str, &'static str)>) -> Arc<Self> {
+        Arc::new(Shell { proxy: proxy.to_canonical(), router, routes, open: AtomicUsize::new(0), refused: Default::default() })
+    }
+
+    /// How many connections are open now, turned-away ones included.
     pub fn open(&self) -> usize {
         self.open.load(Ordering::SeqCst)
     }
@@ -155,8 +171,8 @@ impl Shell {
     }
 }
 
-/// What answers, once a request is through every bound: `hello`, and "not found" for every
-/// other path in plain form.
+/// What answers, once a request is through every bound: `hello` alone. Every other path and
+/// method was refused before this ([`head::ROUTES`]).
 pub fn router(hello: &Hello) -> Router {
     let body = Bytes::from(hello.to_json());
     Router::new()
@@ -169,6 +185,23 @@ pub fn router(hello: &Hello) -> Router {
         )
         .fallback(|| async { StatusCode::NOT_FOUND })
 }
+
+/// A bare answer: a status, nothing else said, no body, and the connection closed.
+pub fn bare(status: StatusCode) -> Vec<u8> {
+    format!(
+        "HTTP/1.1 {} {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        status.as_str(),
+        status.canonical_reason().unwrap_or("")
+    )
+    .into_bytes()
+}
+
+/// What the proxy is answered for everything that fails before or at the gate: a bad, large
+/// or slow head, no mark, every connection taken. One status for every cause, so that it says
+/// nothing of which. A 400, because the proxy hands any status of the backend's to the caller
+/// as it is (it intercepts none), and a 400, unlike a reset or a timeout, is never a reason
+/// for it to try elsewhere or to note the backend as failing.
+pub const GATE: StatusCode = StatusCode::BAD_REQUEST;
 
 /// Accepts and serves connections on `listener` for as long as the program runs. With `log`,
 /// it writes the counts of refusals every [`COUNTS_EVERY`] that there were any.
@@ -187,6 +220,7 @@ pub async fn serve(listener: TcpListener, shell: Arc<Shell>, log: bool) {
         });
     }
     let slots = Arc::new(Semaphore::new(CONNECTIONS_MAX));
+    let turned = Arc::new(Semaphore::new(TURNED_AWAY_MAX));
     loop {
         let (stream, from) = match listener.accept().await {
             Ok(accepted) => accepted,
@@ -203,30 +237,105 @@ pub async fn serve(listener: TcpListener, shell: Arc<Shell>, log: bool) {
             drop(stream);
             continue;
         }
-        let Ok(slot) = slots.clone().try_acquire_owned() else {
-            shell.count(Refusal::Full);
-            drop(stream);
-            continue;
-        };
         let _ = stream.set_nodelay(true);
         let shell = shell.clone();
-        tokio::spawn(async move {
-            let _slot = slot;
-            let _open = Open::new(&shell);
+        match slots.clone().try_acquire_owned() {
+            Ok(slot) => {
+                tokio::spawn(async move {
+                    let _slot = slot;
+                    let _open = Open::new(&shell);
+                    connection(Guarded::new(stream, shell.clone()), peer, shell).await;
+                });
+            }
+            Err(_) => {
+                shell.count(Refusal::Full);
+                // The proxy is told so, by the gate's one answer, while there is room to; no
+                // one else is told anything.
+                if peer != Peer::Proxy {
+                    continue;
+                }
+                let Ok(room) = turned.clone().try_acquire_owned() else { continue };
+                tokio::spawn(async move {
+                    let _room = room;
+                    let _open = Open::new(&shell);
+                    answer_bare(Guarded::new(stream, shell.clone()), GATE).await;
+                });
+            }
+        }
+    }
+}
+
+/// One connection: its head read and judged, then refused or served.
+async fn connection(mut stream: Guarded, peer: Peer, shell: Arc<Shell>) {
+    let refused = |kind| {
+        shell.count(kind);
+        peer == Peer::Proxy
+    };
+    let head = match tokio::time::timeout(HEAD_DEADLINE, head::read(&mut stream)).await {
+        Ok(Ok(head)) => head,
+        // Opened and closed with nothing said: there is no one to answer.
+        Ok(Err(NoHead::Closed)) => return,
+        Ok(Err(_)) => {
+            if refused(Refusal::BadHead) {
+                answer_bare(stream, GATE).await;
+            }
+            return;
+        }
+        Err(_) => {
+            if refused(Refusal::SlowHead) {
+                answer_bare(stream, GATE).await;
+            }
+            return;
+        }
+    };
+    match head::judge(peer, &head, &shell.routes) {
+        Verdict::Unanswered(kind) => {
+            if refused(kind) {
+                answer_bare(stream, GATE).await;
+            }
+        }
+        Verdict::Refused(status, kind) => {
+            shell.count(kind);
+            answer_bare(stream, status).await;
+        }
+        Verdict::Serve(length) => {
             let service = {
                 let shell = shell.clone();
-                hyper::service::service_fn(move |request| answer(request, shell.clone(), peer))
+                hyper::service::service_fn(move |request| answer(request, length, shell.clone()))
             };
             let mut http = http1::Builder::new();
             http.timer(TokioTimer::new())
+                .keep_alive(false)
                 .header_read_timeout(HEAD_DEADLINE)
                 .max_buf_size(HEAD_MAX_BYTES)
+                .max_header_size(HEAD_MAX_BYTES)
                 .max_headers(HEAD_MAX_HEADERS);
-            // However it ends (closed, refused, a deadline, a write that made no progress),
-            // nothing of it is written out.
-            let _ = http.serve_connection(TokioIo::new(Guarded::new(stream)), service).await;
-        });
+            // hyper reads the same head again, from what was read already: a head that passed
+            // every check above, so that hyper has nothing of its own to answer. However the
+            // connection ends, nothing of it is written out.
+            let replay = Replay { ahead: head.read, at: 0, stream };
+            let _ = http.serve_connection(TokioIo::new(replay), service).await;
+        }
     }
+}
+
+/// Writes a bare answer, and then discards whatever more comes, for a moment and up to a
+/// bound, so that closing does not reset the connection under the answer.
+async fn answer_bare(mut stream: Guarded, status: StatusCode) {
+    if stream.write_all(&bare(status)).await.is_err() || stream.shutdown().await.is_err() {
+        return;
+    }
+    let _ = tokio::time::timeout(LINGER_DEADLINE, async {
+        let mut left = LINGER_MAX_BYTES;
+        let mut sink = [0u8; 8192];
+        while left > 0 {
+            match stream.read(&mut sink[..left.min(8192)]).await {
+                Ok(0) | Err(_) => break,
+                Ok(got) => left -= got,
+            }
+        }
+    })
+    .await;
 }
 
 /// Counts a connection as open for as long as it lives.
@@ -245,27 +354,6 @@ impl Drop for Open {
     }
 }
 
-/// A request left unanswered: hyper closes the connection without writing a byte.
-#[derive(Debug)]
-struct Unanswered;
-
-impl std::fmt::Display for Unanswered {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("not answered")
-    }
-}
-
-impl std::error::Error for Unanswered {}
-
-/// An answer with no body that closes the connection.
-fn refusal(status: StatusCode) -> Response<Body> {
-    let mut response = Response::new(Body::empty());
-    *response.status_mut() = status;
-    response.headers_mut().insert(CONNECTION, HeaderValue::from_static("close"));
-    finish(&mut response);
-    response
-}
-
 /// What every answer carries, and what none does.
 fn finish(response: &mut Response<Body>) {
     let headers = response.headers_mut();
@@ -274,43 +362,47 @@ fn finish(response: &mut Response<Body>) {
     headers.remove(SET_COOKIE);
 }
 
-async fn answer(request: Request<Incoming>, shell: Arc<Shell>, peer: Peer) -> Result<Response<Body>, Unanswered> {
-    match peer {
-        Peer::Proxy if !marked_https(request.headers()) => {
-            shell.count(Refusal::NotMarked);
-            return Err(Unanswered);
+fn refusal(status: StatusCode) -> Response<Body> {
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = status;
+    finish(&mut response);
+    response
+}
+
+/// Reads a body that declared `length` bytes into one buffer of that size, each piece as it
+/// comes and then let go, so that what it costs is its length however it is cut up.
+pub async fn take_body<B>(mut body: B, length: usize) -> Result<Vec<u8>, Refusal>
+where
+    B: hyper::body::Body<Data = Bytes> + Unpin,
+{
+    let mut bytes = Vec::with_capacity(length);
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|_| Refusal::BadBody)?;
+        if let Ok(data) = frame.into_data() {
+            if data.len() > length - bytes.len() {
+                return Err(Refusal::TooLarge);
+            }
+            bytes.extend_from_slice(&data);
         }
-        Peer::Health if !(request.method() == Method::GET && origin_target(request.uri()) == Some(proto::HELLO)) => {
-            shell.count(Refusal::NotHealth);
-            return Err(Unanswered);
-        }
-        Peer::Stranger => return Err(Unanswered),
-        _ => {}
     }
-    if !origin_target(request.uri()).is_some_and(|target| proto::plain(target).is_ok()) {
-        shell.count(Refusal::NotPlain);
-        return Ok(refusal(StatusCode::BAD_REQUEST));
+    if bytes.len() != length {
+        return Err(Refusal::BadBody);
     }
+    Ok(bytes)
+}
+
+async fn answer(request: Request<Incoming>, length: usize, shell: Arc<Shell>) -> Result<Response<Body>, Infallible> {
     let (parts, body) = request.into_parts();
-    // A body that says it is too large is refused before a byte of it is read.
-    if body.size_hint().lower() > BODY_MAX_BYTES as u64 {
-        shell.count(Refusal::TooLarge);
-        return Ok(refusal(StatusCode::PAYLOAD_TOO_LARGE));
-    }
-    let bytes = match tokio::time::timeout(BODY_DEADLINE, Limited::new(body, BODY_MAX_BYTES).collect()).await {
+    let bytes = match tokio::time::timeout(BODY_DEADLINE, take_body(body, length)).await {
         Err(_) => {
             shell.count(Refusal::SlowBody);
             return Ok(refusal(StatusCode::REQUEST_TIMEOUT));
         }
-        Ok(Err(why)) if why.downcast_ref::<LengthLimitError>().is_some() => {
-            shell.count(Refusal::TooLarge);
-            return Ok(refusal(StatusCode::PAYLOAD_TOO_LARGE));
+        Ok(Err(kind)) => {
+            shell.count(kind);
+            return Ok(refusal(if kind == Refusal::TooLarge { StatusCode::PAYLOAD_TOO_LARGE } else { StatusCode::BAD_REQUEST }));
         }
-        Ok(Err(_)) => {
-            shell.count(Refusal::BadBody);
-            return Ok(refusal(StatusCode::BAD_REQUEST));
-        }
-        Ok(Ok(collected)) => collected.to_bytes(),
+        Ok(Ok(bytes)) => Bytes::from(bytes),
     };
     let request = Request::from_parts(parts, Body::from(bytes));
     let mut task = tokio::spawn(shell.router.clone().oneshot(request));
@@ -331,16 +423,59 @@ async fn answer(request: Request<Incoming>, shell: Arc<Shell>, peer: Peer) -> Re
     Ok(response)
 }
 
+/// The bytes read with the head, given again ahead of the rest of the connection.
+struct Replay {
+    ahead: Vec<u8>,
+    at: usize,
+    stream: Guarded,
+}
+
+impl AsyncRead for Replay {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, into: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if this.at < this.ahead.len() {
+            let given = into.remaining().min(this.ahead.len() - this.at);
+            into.put_slice(&this.ahead[this.at..this.at + given]);
+            this.at += given;
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut this.stream).poll_read(cx, into)
+    }
+}
+
+impl AsyncWrite for Replay {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, bytes: &[u8]) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().stream).poll_write(cx, bytes)
+    }
+
+    fn poll_write_vectored(self: Pin<&mut Self>, cx: &mut Context<'_>, bytes: &[io::IoSlice<'_>]) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().stream).poll_write_vectored(cx, bytes)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.stream.is_write_vectored()
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().stream).poll_shutdown(cx)
+    }
+}
+
 /// A connection whose writes may make no progress for no longer than [`WRITE_DEADLINE`]:
-/// past it, the write fails and the connection is closed.
+/// past it, the write fails, the connection is closed, and it is counted.
 struct Guarded {
     stream: TcpStream,
     stalled: Option<Pin<Box<Sleep>>>,
+    shell: Arc<Shell>,
 }
 
 impl Guarded {
-    fn new(stream: TcpStream) -> Self {
-        Guarded { stream, stalled: None }
+    fn new(stream: TcpStream, shell: Arc<Shell>) -> Self {
+        Guarded { stream, stalled: None, shell }
     }
 
     fn watch<T>(&mut self, done: Poll<io::Result<T>>, cx: &mut Context<'_>) -> Poll<io::Result<T>> {
@@ -352,7 +487,10 @@ impl Guarded {
             Poll::Pending => {
                 let stalled = self.stalled.get_or_insert_with(|| Box::pin(tokio::time::sleep(WRITE_DEADLINE)));
                 match stalled.as_mut().poll(cx) {
-                    Poll::Ready(()) => Poll::Ready(Err(io::Error::new(io::ErrorKind::TimedOut, "a write made no progress"))),
+                    Poll::Ready(()) => {
+                        self.shell.count(Refusal::Stalled);
+                        Poll::Ready(Err(io::Error::new(io::ErrorKind::TimedOut, "a write made no progress")))
+                    }
                     Poll::Pending => Poll::Pending,
                 }
             }
@@ -415,23 +553,17 @@ mod tests {
     }
 
     #[test]
-    fn marked_once_and_exactly() {
-        let mark = |values: &[&str]| {
-            let mut headers = HeaderMap::new();
-            for value in values {
-                headers.append("x-nexus-scheme", HeaderValue::from_str(value).unwrap());
-            }
-            marked_https(&headers)
-        };
-        assert!(mark(&["https"]));
-        for wrong in [&[][..], &["http"], &["HTTPS"], &["https "], &["https", "https"], &["http", "https"], &["https,http"]] {
-            assert!(!mark(wrong), "{wrong:?}");
-        }
+    fn the_gates_answer_is_one_and_bare() {
+        let gate = String::from_utf8(bare(GATE)).unwrap();
+        assert_eq!(
+            gate,
+            "HTTP/1.1 400 Bad Request\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
     }
 
     #[test]
     fn the_counts_are_taken_once() {
-        let shell = Shell::new("172.18.0.2".parse().unwrap(), Router::new());
+        let shell = Shell::with_routes("172.18.0.2".parse().unwrap(), Router::new(), Vec::new());
         assert_eq!(shell.take_counts(), None);
         shell.count(Refusal::Stranger);
         shell.count(Refusal::Stranger);
@@ -444,5 +576,35 @@ mod tests {
         for (index, (kind, _)) in REFUSALS.iter().enumerate() {
             assert_eq!(*kind as usize, index);
         }
+    }
+
+    /// A body in as many one-byte pieces as it has bytes.
+    struct Crumbs(usize);
+
+    impl hyper::body::Body for Crumbs {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Result<hyper::body::Frame<Bytes>, Infallible>>> {
+            let this = self.get_mut();
+            if this.0 == 0 {
+                return Poll::Ready(None);
+            }
+            this.0 -= 1;
+            Poll::Ready(Some(Ok(hyper::body::Frame::data(Bytes::from_static(b"a")))))
+        }
+    }
+
+    #[test]
+    fn a_body_in_crumbs_costs_its_length_and_no_more() {
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        runtime.block_on(async {
+            let bytes = take_body(Crumbs(BODY_MAX_BYTES), BODY_MAX_BYTES).await.unwrap();
+            assert_eq!(bytes.len(), BODY_MAX_BYTES);
+            // One buffer, of exactly the length declared: the pieces were each let go.
+            assert_eq!(bytes.capacity(), BODY_MAX_BYTES);
+            assert_eq!(take_body(Crumbs(11), 10).await, Err(Refusal::TooLarge));
+            assert_eq!(take_body(Crumbs(9), 10).await, Err(Refusal::BadBody));
+        });
     }
 }

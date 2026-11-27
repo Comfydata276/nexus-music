@@ -51,10 +51,14 @@ fn command(settings: &[(&str, &str)], arguments: &[&str]) -> Command {
 }
 
 fn settings_for(folders: &Folders, port: u16) -> Vec<(&'static str, String)> {
+    // A made-up address of a documentation range: nothing on loopback is the proxy.
+    settings_with_proxy(folders, port, "192.0.2.10")
+}
+
+fn settings_with_proxy(folders: &Folders, port: u16, proxy: &str) -> Vec<(&'static str, String)> {
     vec![
         ("NEXUS_MUSIC_SERVER", "http://navidrome:4533".into()),
-        // A made-up address of a documentation range: nothing on loopback is the proxy.
-        ("NEXUS_PROXY", "192.0.2.10".into()),
+        ("NEXUS_PROXY", proxy.into()),
         ("NEXUS_DATA", folders.data().display().to_string()),
         ("NEXUS_STATE", folders.state().display().to_string()),
         ("NEXUS_LISTEN", format!("127.0.0.1:{port}")),
@@ -109,7 +113,7 @@ fn a_missing_or_wrong_setting_is_named_and_it_stops() {
     std::fs::create_dir_all(&inside).unwrap();
     let inside = inside.display().to_string();
     let missing = folders.root.join("nowhere").display().to_string();
-    let base = [("NEXUS_MUSIC_SERVER", "http://navidrome:4533"), ("NEXUS_PROXY", "172.18.0.2"), ("NEXUS_DATA", data.as_str()), ("NEXUS_STATE", state.as_str()), ("NEXUS_LISTEN", "127.0.0.1:0")];
+    let base = [("NEXUS_MUSIC_SERVER", "http://navidrome:4533"), ("NEXUS_PROXY", "172.18.0.2"), ("NEXUS_DATA", data.as_str()), ("NEXUS_STATE", state.as_str()), ("NEXUS_LISTEN", "127.0.0.1:9")];
     let cases: &[(&str, Option<&str>, &str)] = &[
         ("NEXUS_MUSIC_SERVER", None, "NEXUS_MUSIC_SERVER is missing"),
         ("NEXUS_PROXY", None, "NEXUS_PROXY is missing"),
@@ -162,6 +166,26 @@ fn it_serves_its_id_kept_across_starts_and_says_it_is_healthy() {
 }
 
 #[test]
+fn two_started_at_once_serve_the_one_id_there_is() {
+    for round in 0..5 {
+        let folders = Folders::new(&format!("twice-{round}"));
+        let first = settings_for(&folders, free_port());
+        let second = settings_for(&folders, free_port());
+        let children = [serve(&first), serve(&second)];
+        healthy(&first);
+        healthy(&second);
+        let names: Vec<_> = std::fs::read_dir(folders.state()).unwrap().map(|entry| entry.unwrap().file_name()).collect();
+        assert_eq!(names, ["id"], "round {round}");
+        let id = kept_id(&folders.state());
+        let [one, other] = children.map(stop);
+        // One made it, the other kept it; both name the one on the disk.
+        let made = [&one, &other].iter().filter(|written| written.contains(&format!("with id {id} (made now)"))).count();
+        let kept = [&one, &other].iter().filter(|written| written.contains(&format!("with id {id} (kept)"))).count();
+        assert_eq!((made, kept), (1, 1), "round {round}: {one} / {other}");
+    }
+}
+
+#[test]
 fn a_kept_id_that_is_not_an_id_stops_it_and_is_left() {
     let folders = Folders::new("wrong-id");
     std::fs::write(folders.state().join("id"), "not an id\n").unwrap();
@@ -176,13 +200,15 @@ fn a_kept_id_that_is_not_an_id_stops_it_and_is_left() {
 fn its_log_holds_no_address_header_target_or_body() {
     let folders = Folders::new("log");
     let port = free_port();
-    let settings = settings_for(&folders, port);
+    // The proxy played from 127.0.0.2.
+    let settings = settings_with_proxy(&folders, port, "127.0.0.2");
     let child = serve(&settings);
     healthy(&settings);
     let at: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let request = "POST /nexus/x/../marker-target HTTP/1.1\r\nHost: marker-host\r\nX-Nexus-Scheme: https\r\nX-Marker: marker-header\r\nContent-Length: 11\r\n\r\nmarker-body";
-    // From this machine (asking more than hello), and as a stranger.
-    for from in ["127.0.0.1", "127.0.0.3"] {
+    // From the proxy (refused for its target), from this machine (asking more than hello),
+    // and as a stranger.
+    for (from, answered) in [("127.0.0.2", true), ("127.0.0.1", false), ("127.0.0.3", false)] {
         let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
         socket.bind(&SocketAddr::new(from.parse().unwrap(), 0).into()).unwrap();
         socket.connect(&at.into()).unwrap();
@@ -191,13 +217,13 @@ fn its_log_holds_no_address_header_target_or_body() {
         let _ = stream.write_all(request.as_bytes());
         let mut answer = Vec::new();
         let _ = stream.read_to_end(&mut answer);
-        assert!(answer.is_empty(), "{from}: {}", String::from_utf8_lossy(&answer));
+        assert_eq!(!answer.is_empty(), answered, "{from}: {}", String::from_utf8_lossy(&answer));
     }
     let written = stop(child);
-    for secret in ["127.0.0.3", "marker"] {
+    for secret in ["127.0.0.3", "127.0.0.2:", "marker"] {
         assert!(!written.contains(secret), "the log holds {secret:?}: {written}");
     }
     // What it does say: that it started, and with which settings.
     assert!(written.contains("Nexus server 0.1.0 started"), "{written}");
-    assert!(written.contains("192.0.2.10") && written.contains("http://navidrome:4533"), "{written}");
+    assert!(written.contains("127.0.0.2") && written.contains("http://navidrome:4533"), "{written}");
 }

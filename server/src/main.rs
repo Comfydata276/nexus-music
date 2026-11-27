@@ -64,23 +64,24 @@ fn run(settings: Settings) -> ExitCode {
         let listener = match tokio::net::TcpListener::bind(settings.listen).await {
             Ok(listener) => listener,
             Err(why) => {
-                eprintln!("NEXUS_LISTEN is wrong: nothing can listen on {} ({}).", settings.listen, why.kind());
+                eprintln!("NEXUS_LISTEN is wrong: nothing can listen there ({}).", why.kind());
                 return ExitCode::from(2);
             }
         };
-        // The settings, none of them secret, and the id, which is not.
+        // The settings, none of them secret, and the id, which is not. What the owner typed is
+        // written quoted and escaped, so that nothing in it can pass for another line.
         println!(
-            "Nexus server {} started, with id {} ({}). Listening on {}; answering the proxy at {}; music server {}; data {}; store kept apart {}.",
+            "Nexus server {} started, with id {} ({}). Listening on {}; answering the proxy at {}; music server {:?}; data {:?}; store kept apart {:?}.",
             nexus_music_server::version(),
             id.to_hex(),
             if made { "made now" } else { "kept" },
             settings.listen,
             settings.proxy,
             settings.music_server,
-            settings.data.display(),
-            settings.state.display(),
+            settings.data,
+            settings.state,
         );
-        let shell = serve::Shell::new(settings.proxy, serve::router(&nexus_music_server::hello(id)));
+        let shell = serve::Shell::new(settings.proxy, &nexus_music_server::hello(id));
         serve::serve(listener, shell, true).await;
         ExitCode::SUCCESS
     })

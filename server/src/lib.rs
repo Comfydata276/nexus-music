@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 pub mod bounds;
+pub mod head;
 pub mod health;
 pub mod identity;
 pub mod probe;

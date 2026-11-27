@@ -37,7 +37,7 @@ impl Settings {
         let proxy = match setting("NEXUS_PROXY") {
             None => return Err("NEXUS_PROXY is missing: give the one address the proxy connects to this container from, for example 172.18.0.2".into()),
             Some(value) => match value.parse::<IpAddr>() {
-                Ok(address) if !address.is_unspecified() && !address.is_multicast() => address.to_canonical(),
+                Ok(address) if !address.to_canonical().is_unspecified() && !address.to_canonical().is_multicast() => address.to_canonical(),
                 _ => return Err("NEXUS_PROXY is wrong: give one IP address (not a name, a range or a port), the one the proxy connects to this container from, for example 172.18.0.2".into()),
             },
         };
@@ -60,22 +60,47 @@ impl Settings {
             return Err("NEXUS_DATA is wrong: it must not be inside the folder of the store kept apart (NEXUS_STATE)".into());
         }
         let listen = setting("NEXUS_LISTEN").unwrap_or_else(|| LISTEN_DEFAULT.to_string());
-        let listen = listen
-            .parse::<SocketAddr>()
-            .map_err(|_| format!("NEXUS_LISTEN is wrong: give an address and a port, for example {LISTEN_DEFAULT}"))?;
+        let listen = match listen.parse::<SocketAddr>() {
+            // Port 0 would be a port chosen afresh at each start, which the proxy and the
+            // health check could not know.
+            Ok(listen) if listen.port() != 0 => listen,
+            _ => return Err(format!("NEXUS_LISTEN is wrong: give an address and a port other than 0, for example {LISTEN_DEFAULT}")),
+        };
         Ok(Settings { music_server, proxy, data, state, listen })
     }
 
-    /// Whether both folders are there. The store kept apart is written to; the data folder is
-    /// not used yet.
+    /// Whether both folders are there, and apart on the disk as well as in their names: not
+    /// the same folder through a link or a second mount, and neither inside the other once
+    /// links are followed. The store kept apart is written to; the data folder is not used yet.
     pub fn check_folders(&self) -> Result<(), String> {
+        let mut found = Vec::new();
         for (name, path) in [("NEXUS_DATA", &self.data), ("NEXUS_STATE", &self.state)] {
-            if !Path::new(path).is_dir() {
-                return Err(format!("{name} is wrong: there is no folder at {}", path.display()));
+            match std::fs::canonicalize(path) {
+                Ok(real) if real.is_dir() => found.push(real),
+                _ => return Err(format!("{name} is wrong: there is no folder there")),
             }
+        }
+        let (data, state) = (&found[0], &found[1]);
+        if state.starts_with(data) || data.starts_with(state) || same_folder(data, state) {
+            return Err("NEXUS_STATE is wrong: on the disk it is the data folder (NEXUS_DATA), inside it, or around it, through a link or a mount; a copy of the data must not hold it".into());
         }
         Ok(())
     }
+}
+
+/// Whether two paths are one folder on the disk (two mounts of it, say).
+#[cfg(unix)]
+fn same_folder(one: &Path, other: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(one), std::fs::metadata(other)) {
+        (Ok(one), Ok(other)) => one.dev() == other.dev() && one.ino() == other.ino(),
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn same_folder(_: &Path, _: &Path) -> bool {
+    false
 }
 
 /// The music server's address if it is one: `http` or `https`, a host (a name, an IPv4
@@ -110,6 +135,31 @@ fn music_server(value: &str) -> Option<String> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[cfg(unix)]
+    #[test]
+    fn folders_apart_in_name_but_not_on_the_disk_are_refused() {
+        let root = std::env::temp_dir().join(format!("nexus-server-settings-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("data")).unwrap();
+        std::os::unix::fs::symlink(root.join("data"), root.join("state-link")).unwrap();
+        std::fs::create_dir_all(root.join("data/inner")).unwrap();
+        std::os::unix::fs::symlink(root.join("data/inner"), root.join("inner-link")).unwrap();
+        std::fs::create_dir_all(root.join("state")).unwrap();
+        let settings = |state: &str| Settings {
+            music_server: "http://navidrome:4533".into(),
+            proxy: "172.18.0.2".parse().unwrap(),
+            data: root.join("data"),
+            state: root.join(state),
+            listen: "0.0.0.0:8080".parse().unwrap(),
+        };
+        assert_eq!(settings("state").check_folders(), Ok(()));
+        for state in ["state-link", "inner-link"] {
+            assert!(settings(state).check_folders().unwrap_err().starts_with("NEXUS_STATE is wrong"), "{state}");
+        }
+        assert!(settings("nowhere").check_folders().unwrap_err().starts_with("NEXUS_STATE is wrong: there is no folder"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     fn read(pairs: &[(&str, &str)]) -> Result<Settings, String> {
         let table: HashMap<String, String> = pairs.iter().map(|(name, value)| (name.to_string(), value.to_string())).collect();
@@ -180,6 +230,9 @@ mod tests {
             ("NEXUS_LISTEN", "8080"),
             ("NEXUS_LISTEN", "localhost:8080"),
             ("NEXUS_LISTEN", "0.0.0.0:99999"),
+            ("NEXUS_LISTEN", "0.0.0.0:0"),
+            ("NEXUS_PROXY", "::ffff:0.0.0.0"),
+            ("NEXUS_PROXY", "::ffff:224.0.0.1"),
         ];
         for &(name, value) in cases {
             let pairs = with(&[(name, value)]);

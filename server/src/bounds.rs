@@ -9,12 +9,12 @@
 use std::time::Duration;
 
 /// The whole head of a request (its line and every header) must arrive within this, counted
-/// from when the backend starts waiting for it. An idle connection between requests is
-/// waiting for a head, so it is closed after this too.
+/// from when the connection is taken. A connection carries one request, so this is also how
+/// long one may stay open saying nothing.
 pub const HEAD_DEADLINE: Duration = Duration::from_secs(10);
 
-/// The most a request's head may be, in bytes. Past it the connection is answered 431 and
-/// closed.
+/// The most a request's head may be, in bytes, and the most read before its end is found.
+/// Past it, the proxy is given the gate's one answer and anyone else nothing.
 pub const HEAD_MAX_BYTES: usize = 16 * 1024;
 
 /// The most headers a request may carry.
@@ -38,6 +38,15 @@ pub const WRITE_DEADLINE: Duration = Duration::from_secs(5);
 
 /// How long what answers a request may take, once its body is in. Past it the answer is 503.
 pub const ANSWER_DEADLINE: Duration = Duration::from_secs(10);
+
+/// After a bare answer, whatever more the caller sends is discarded for at most this long
+/// and this many bytes, so that closing does not reset the connection under the answer.
+pub const LINGER_DEADLINE: Duration = Duration::from_secs(2);
+pub const LINGER_MAX_BYTES: usize = BODY_MAX_BYTES + HEAD_MAX_BYTES;
+
+/// How many connections past [`CONNECTIONS_MAX`] may be open at once only to be given the
+/// gate's answer. Past these, one more from the proxy is closed with nothing.
+pub const TURNED_AWAY_MAX: usize = 16;
 
 /// How often the log says how many requests of each kind were refused, when any were.
 pub const COUNTS_EVERY: Duration = Duration::from_secs(15 * 60);

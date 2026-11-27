@@ -13,8 +13,9 @@ use nexus_core::nexus::proto::BackendId;
 
 /// The file's name inside the store kept apart.
 pub const FILE: &str = "id";
-/// Written there first, then linked into place.
-const NEW: &str = "id.new";
+/// Each start that makes an id writes it first to a file of its own, named for it, and links
+/// that into place.
+const STAGING: &str = "id.new-";
 /// The most the file may be: an id, and a line's end or two.
 const FILE_MAX_BYTES: u64 = 64;
 
@@ -46,42 +47,46 @@ fn not_an_id(path: &Path) -> String {
     )
 }
 
-/// The id kept in `state`, made there from `random` if there is none yet; and whether it was
-/// made now.
+/// The id kept in `state`, made there from `random` if there is none yet; and whether this
+/// start made it.
+///
+/// Two starts at once each write their own staging file, and each links it into place only
+/// where there is nothing yet, so one wins and neither replaces the other. Both then read back
+/// what is on the disk and take that, so that both serve the one id there is.
 pub fn read_or_make(state: &Path, random: impl FnOnce() -> Result<[u8; 16], String>) -> Result<(BackendId, bool), String> {
     if let Some(id) = read(state)? {
         return Ok((id, false));
     }
     let id = BackendId::from_bytes(random()?);
-    let new = state.join(NEW);
+    // Named for the id this start made: no other start's has the same name.
+    let staging = state.join(format!("{STAGING}{}", id.to_hex()));
     let failed = |why: io::Error| format!("The backend's id couldn't be written in {} ({}).", state.display(), why.kind());
-    // Left by a start that stopped half way: it was never the id.
-    match fs::remove_file(&new) {
-        Err(why) if why.kind() != io::ErrorKind::NotFound => return Err(failed(why)),
-        _ => {}
-    }
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    let mut file = options.open(&new).map_err(failed)?;
-    file.write_all(format!("{}\n", id.to_hex()).as_bytes()).map_err(failed)?;
-    file.sync_all().map_err(failed)?;
-    drop(file);
-    // A link, not a rename: it fails if the id appeared meanwhile, so one is never replaced.
-    let linked = fs::hard_link(&new, place(state));
-    let _ = fs::remove_file(&new);
+    let written = options.open(&staging).and_then(|mut file| {
+        file.write_all(format!("{}\n", id.to_hex()).as_bytes())?;
+        file.sync_all()
+    });
+    if let Err(why) = written {
+        let _ = fs::remove_file(&staging);
+        return Err(failed(why));
+    }
+    // A link, not a rename: it fails if an id is there already, so one is never replaced.
+    let linked = fs::hard_link(&staging, place(state));
+    let _ = fs::remove_file(&staging);
     match linked {
         Ok(()) => {}
-        Err(why) if why.kind() == io::ErrorKind::AlreadyExists => {
-            return read(state)?.map(|id| (id, false)).ok_or_else(|| not_an_id(&place(state)));
-        }
+        Err(why) if why.kind() == io::ErrorKind::AlreadyExists => {}
         Err(why) => return Err(failed(why)),
     }
-    // The folder's own record of the new name, on the disk.
+    // The folder's own record of the names, on the disk.
     #[cfg(unix)]
     fs::File::open(state).and_then(|folder| folder.sync_all()).map_err(failed)?;
-    Ok((id, true))
+    // What is there now is the id, whichever start put it there.
+    let kept = read(state)?.ok_or_else(|| not_an_id(&place(state)))?;
+    Ok((kept, kept == id))
 }
 
 #[cfg(test)]
@@ -106,7 +111,7 @@ mod tests {
         assert!(!new);
         assert_eq!(again, made);
         assert_eq!(fs::read_to_string(state.join(FILE)).unwrap(), format!("{}\n", made.to_hex()));
-        assert!(!state.join(NEW).exists());
+        assert!(fs::read_dir(&state).unwrap().all(|entry| entry.unwrap().file_name() == FILE));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -133,13 +138,37 @@ mod tests {
     }
 
     #[test]
-    fn a_half_made_id_is_never_the_id() {
+    fn a_staging_file_left_behind_is_never_the_id() {
         let state = folder("half");
-        fs::write(state.join(NEW), "half").unwrap();
+        fs::write(state.join(format!("{STAGING}{}", "0".repeat(32))), "half").unwrap();
         let (made, new) = read_or_make(&state, || Ok([9; 16])).unwrap();
         assert!(new && made == BackendId::from_bytes([9; 16]));
-        assert!(!state.join(NEW).exists());
+        assert_eq!(read(&state).unwrap(), Some(made));
         fs::remove_dir_all(&state).unwrap();
+    }
+
+    #[test]
+    fn starts_at_once_end_with_one_id_that_each_of_them_has() {
+        for round in 0..40 {
+            let state = folder(&format!("race-{round}"));
+            let start = std::sync::Arc::new(std::sync::Barrier::new(8));
+            let starts: Vec<_> = (0..8u8)
+                .map(|n| {
+                    let state = state.clone();
+                    let start = start.clone();
+                    std::thread::spawn(move || {
+                        start.wait();
+                        read_or_make(&state, || Ok([n + 1; 16]))
+                    })
+                })
+                .collect();
+            let had: Vec<(BackendId, bool)> = starts.into_iter().map(|start| start.join().unwrap().unwrap()).collect();
+            let kept = read(&state).unwrap().unwrap();
+            assert!(had.iter().all(|(id, _)| *id == kept), "round {round}: {had:?}, kept {kept:?}");
+            assert_eq!(had.iter().filter(|(_, made)| *made).count(), 1, "round {round}");
+            assert!(fs::read_dir(&state).unwrap().all(|entry| entry.unwrap().file_name() == FILE), "round {round}: staging left");
+            fs::remove_dir_all(&state).unwrap();
+        }
     }
 
     #[test]
