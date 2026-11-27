@@ -10,7 +10,7 @@ publish = false
 [workspace]
 members = ["core"]
 default-members = [".", "core"]
-exclude = ["relay"]
+exclude = ["relay", "server"]
 
 [dependencies]
 # What every app on an account must do identically. It has no window, starts no threads and
