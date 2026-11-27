@@ -2752,7 +2752,7 @@ export component SettingsPage inherits Rectangle {
                             }
                         }
 
-                        if Settings.nexus-server != "": SettingRow {
+                        if Settings.nexus-server != "" && Settings.nexus-for == (App.signed-in ? App.server + "\n" + App.username : ""): SettingRow {
                             title: "Nexus server";
                             detail: Settings.nexus-server;
                         }

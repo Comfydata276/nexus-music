@@ -628,8 +628,11 @@ export struct QualityOption {
 
 export global Settings {
     // Whether there is a Nexus server at the music server's address: empty until it has been
-    // looked for, then what was found. Set by src/nexus.rs alone.
+    // looked for, then what was found, for the account in `nexus-for` (the server and the
+    // name, on two lines). Shown only while that account is the one signed in. Set by
+    // src/nexus.rs alone.
     in property <string> nexus-server;
+    in property <string> nexus-for;
     in property <[QualityOption]> qualities;
     // Their names alone, for the control that chooses between them.
     in property <[string]> quality-names;
