@@ -1,0 +1,7 @@
+# Only what the Nexus server is built from is sent to Docker: not the app or its build output.
+*
+!core
+!server
+core/target
+server/target
+server/Dockerfile*
