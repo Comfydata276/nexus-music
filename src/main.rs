@@ -28,6 +28,9 @@ mod lyrics;
 mod listenbrainz;
 mod mixes;
 mod musicbrainz;
+// The Nexus server's component: installed here, after the controller, and named by nothing
+// that plays music (see its own notes).
+mod nexus;
 mod offline;
 mod pages;
 #[cfg(test)]
@@ -107,6 +110,8 @@ fn main() -> Result<(), slint::PlatformError> {
     apply_interface_size();
     let window = ui::MainWindow::new()?;
     let controller = controller::Controller::install(window);
+    // After the controller is made (and a saved sign-in entered), never by it.
+    nexus::install(&controller.ui);
     controller.ui.show()?;
     // The loop is ended explicitly (see `Controller::quit`): with a tray icon present it
     // would otherwise outlive the window.
