@@ -22,7 +22,7 @@ def main(build):
                 home = f"shots-{mode}-{size}"
                 shutil.rmtree(os.path.join(A.HOMES, home), ignore_errors=True)
                 shutil.copytree(suite.KEPT, os.path.join(A.HOMES, home))
-                copy = A.Copy(build, home, env={"NEXUS_WINDOW_SIZE": size})
+                copy = A.Copy(build, home, env={"NEXUS_WINDOW_SIZE": size, "NEXUS_MUSIC_NEXUS": "1"})
                 a = copy.launch()
                 suite.until(lambda: suite.home_drawn(a), 60, 0.2, "Home")
                 for panel in ("panel-open", "panel-closed"):

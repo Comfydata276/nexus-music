@@ -380,6 +380,15 @@ it is whole).
     punctuation share them.
 
   Signing out clears Recently played, the saved queue and the "Continue here" offer.
+- **The Nexus server's component is switched off for everyone** (it is made only when the
+  app is started with `NEXUS_MUSIC_NEXUS=1`, which no one is told to do). It stays off until
+  these checks, which can only be run on a real Windows PC, have been run there, with the
+  component on and its look held (`tests/e13a/README.md`, "Owed to a real Windows PC"):
+  - a play started by the keyboard's media keys with the window hidden, and from the
+    notification-area icon and the taskbar's buttons;
+  - a look's process started, given no console window, read and killed at its deadline by
+    Windows itself, and a certificate check that fetches certificates of its own (Schannel)
+    held up and ended by that deadline.
 
 **Your plays.** `plays.log`, in the same folder, holds every play the app has counted, one to
 a line, and is only ever added to. If it can't be read when the app starts (another program
