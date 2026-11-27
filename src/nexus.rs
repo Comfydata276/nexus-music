@@ -545,12 +545,24 @@ fn deadline() -> Duration {
 /// once, so that the tests can have a look start just before an action.
 fn trigger_for_tests(ui: &ui::MainWindow) {
     let Some(path) = test_var("NEXUS_TEST_TRIGGER") else { return };
+    // One there already: a look in the first turn of the event loop, before the first frame.
+    if std::fs::remove_file(&path).is_ok() {
+        let weak = ui.as_weak();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = weak.upgrade()
+                && let Some(generation) = RUNNING.with(|running| running.borrow().as_ref().map(|running| running.generation))
+            {
+                due(&ui, generation);
+            }
+        });
+    }
     let weak = ui.as_weak();
     let timer = slint::Timer::default();
     timer.start(slint::TimerMode::Repeated, Duration::from_millis(100), move || {
-        if std::fs::remove_file(&path).is_ok()
+        // (Taken only when there is an account to look for.)
+        if let Some(generation) = RUNNING.with(|running| running.borrow().as_ref().map(|running| running.generation))
             && let Some(ui) = weak.upgrade()
-            && let Some(generation) = RUNNING.with(|running| running.borrow().as_ref().map(|running| running.generation))
+            && std::fs::remove_file(&path).is_ok()
         {
             due(&ui, generation);
         }
