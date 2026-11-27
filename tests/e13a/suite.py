@@ -313,10 +313,23 @@ def settings_tab(a, tab, shows):
     if not a.find(label="Close settings", role="Button"):
         a.press("Settings")
         time.sleep(1.5)
-    for attempt in range(6):
+    for attempt in range(10):
         if any(l == shows for l in labels(a)):
             return
         found = [e for e in a.find(label=tab) if any(n.get("typeName") == "Chip" for n in e.get("typeNamesAndIds", []))] or a.find(label=tab, role="Text")
+        if not found:
+            # A narrow window: the row of tabs scrolls sideways, by its arrow.
+            more = a.find(label="Show more", role="Button")
+            if more:
+                a.click(more[0]["handle"])
+            time.sleep(0.8)
+            continue
+        more = a.find(label="Show more", role="Button")
+        if more and found[-1]["absolutePosition"]["x"] + 60 > more[0]["absolutePosition"]["x"]:
+            # Under the row's arrow: scroll the row along first.
+            a.click(more[0]["handle"])
+            time.sleep(0.8)
+            continue
         a.click(found[-1]["handle"])
         time.sleep(1)
     raise RuntimeError(f"the {tab} tab didn't open")
