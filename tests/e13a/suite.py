@@ -484,6 +484,7 @@ class Run:
         c = self.copy
         self.dump = Dump(c.dump)
         a = c.launch()
+        self.fill_disk()
         t0 = c.started
 
         def cold_start():
@@ -579,6 +580,7 @@ class Run:
     def second_launch(self):
         c = self.copy
         a = c.launch()
+        self.fill_disk()
         t0 = c.started
 
         def put_back():
@@ -730,6 +732,9 @@ class Run:
             settings_tab(a, "Account", "Sign out")
             found = [l for l in labels(a) if l.startswith("Found at") or l == "None found"]
             self.fact("settings_row", "shown" + (f" ({after})" if after else ""), found or "no row")
+            # The component's threads alive now (a held one never ends; a let-go one ends
+            # when its call returns).
+            self.fact("backend", "its_threads" + (f" ({after})" if after else ""), self.copy.pid_threads().count("nexus"))
             close_settings(a)
         except Exception as error:
             self.fact("settings_row", "error", str(error))
@@ -741,6 +746,12 @@ class Run:
         self.fact("backend", "requests_at_the_stand_in", [(r["method"], r["target"], r["agent"].split("/")[0]) for r in asked][:10])
         with open(os.path.join(self.out, "nexus-requests.txt"), "w") as f:
             f.writelines(seen)
+
+    def fill_disk(self):
+        """For disk-full: the component's file system filled to the last byte."""
+        if self.hook == "disk-full":
+            where = f"/work/target/walk/{self.copy.home}/{'/'.join(NEXUS_FILES)}"
+            A.sh(f"docker exec {A.NAME} sh -c 'cat /dev/zero > {where}/filler 2>/dev/null; df {where} | tail -1'")
 
     def disk_untouched(self, nexus_dir, hook):
         if hook.get("fifo"):
@@ -904,7 +915,18 @@ def table():
     for r in runs:
         res = r["results"].get("two_songs_join_without_a_gap", {})
         gaps.append(f"| {r['run']} | " + " | ".join(f"{res.get(k + '_silent_frames_at_the_join')}, {res.get(k + '_largest_step_at_the_join')}" for k in ("streamed", "cached", "downloaded")) + " |")
-    text = "\n".join(lines + facts + gaps) + "\n"
+    # The whole of each run's plays.log at its end, with each time left out: the same plays,
+    # the same bytes otherwise, in every run of either build.
+    logs = {}
+    for r in runs:
+        path = os.path.join(RUNS, r["run"], "plays.log")
+        if os.path.exists(path):
+            lines_ = [json.loads(l) for l in open(path, encoding="utf-8") if l.strip()]
+            shape = json.dumps([[l[0]] + l[2:] for l in lines_]) + f" {[len(l) for l in open(path, 'rb').read().split(b'\n')]}"
+            logs.setdefault(shape, []).append(r["run"])
+    plays = ["", "| plays.log at the end of the run, times left out (song, source; bytes per line) | Runs |", "|---|---|"]
+    plays += [f"| `{shape}` | {len(names)}: {', '.join(names)} |" for shape, names in logs.items()]
+    text = "\n".join(lines + facts + gaps + plays) + "\n"
     print(text)
     print("all within:", all(v for v in verdicts if v is not None), "| W1 runs:", len(new), "| released runs:", len(old))
     return text
