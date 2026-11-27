@@ -5,7 +5,11 @@
 //!    it is accepted, without a byte read or written; except that this machine's own loopback
 //!    address may ask `GET /nexus/api/hello`, and nothing else, for the container's health
 //!    check.
-//! 2. **How many are open:** past [`CONNECTIONS_MAX`], one more is turned away.
+//! 2. **How many are open:** past [`CONNECTIONS_MAX`], one more from the proxy is given the
+//!    gate's answer; past [`TURNED_AWAY_MAX`] more, none is taken until there is room, and it
+//!    waits in the kernel's backlog ([`LISTEN_BACKLOG`]).
+//!
+//!    Every connection's head deadline counts from when it is taken.
 //! 3. **Its head**, read here and not by hyper ([`crate::head`]): all of it within
 //!    [`HEAD_DEADLINE`], in at most [`HEAD_MAX_BYTES`] and [`HEAD_MAX_HEADERS`] headers.
 //! 4. **The gate:** a request from the proxy must carry exactly one `X-Nexus-Scheme: https`.

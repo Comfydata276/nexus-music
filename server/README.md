@@ -61,14 +61,27 @@ In Nginx Proxy Manager: **Hosts, Proxy Hosts**, the music server's host, **Edit*
        location /nexus/ {
            resolver 127.0.0.11 valid=10s;
            set $nexus_up nexus-server;
-           proxy_set_header Cookie "";
            proxy_set_header X-Nexus-Peer $realip_remote_addr;
            proxy_set_header X-Nexus-Scheme $scheme;
+           proxy_set_header Cookie "";
            proxy_set_header Remote-User "";
            proxy_set_header Forwarded "";
            proxy_set_header True-Client-IP "";
            proxy_set_header CF-Connecting-IP "";
+           proxy_set_header X-Real-IP "";
+           proxy_set_header X-Forwarded-For "";
+           proxy_set_header X-Forwarded-Proto "";
+           proxy_set_header X-Forwarded-Scheme "";
            proxy_set_header X-Forwarded-Host "";
+           proxy_set_header X-Forwarded-Port "";
+           proxy_set_header X-Forwarded-Server "";
+           proxy_set_header X-Forwarded-Ssl "";
+           proxy_set_header X-Client-IP "";
+           proxy_set_header X-Original-Forwarded-For "";
+           proxy_set_header X-Cluster-Client-IP "";
+           proxy_request_buffering on;
+           proxy_intercept_errors off;
+           proxy_cache off;
            proxy_no_cache 1;
            proxy_cache_bypass 1;
            access_log off;
@@ -84,8 +97,25 @@ In Nginx Proxy Manager: **Hosts, Proxy Hosts**, the music server's host, **Edit*
 
 What the lines do: `127.0.0.11` is Docker's own name service, so the proxy and the backend
 must share a network Docker made (not the default bridge); `proxy_pass` has no path, so the
-backend sees the address exactly as the caller wrote it and can refuse it; the `Cookie` and
-the other emptied headers never reach it; the last three lines pass a WebSocket (stage 2).
+backend sees the address exactly as the caller wrote it and can refuse it. **The only
+headers that say who and how are the rule's own two**, `X-Nexus-Peer` and `X-Nexus-Scheme`,
+which replace whatever a caller sent under those names; every other header by which a
+caller could claim an address, a scheme, a host or a name (`X-Real-IP`, `X-Forwarded-For`
+and the rest above), and its cookies, are emptied and never reach the backend (measured:
+without these lines the caller's own values arrive). The three lines after them keep the
+proxy from caching, or from putting answers of its own in place of the backend's, whatever
+the host is set to. The last three before `proxy_pass` pass a WebSocket (stage 2).
+
+**An Access List on the host does not cover `/nexus/`** (measured: with one, the music
+server's own paths asked for the password and `/nexus/` did not). The backend has its own
+gate, and at a later stage its own sign-in, so it does not need one. To have the list apply
+here too, copy into this block, above `resolver`, the lines the proxy writes for it in the
+host's own `location /` (in `/data/nginx/proxy_host/<the host's number>.conf`): for a list
+with a user, `auth_basic "Authorization required";`, `auth_basic_user_file
+/data/access/<the list's number>;` and `satisfy all;` (or `any`, as the list says), and for
+a list with addresses, its `allow` lines and `deny all;` (measured: with them, `/nexus/` asks
+for the password too). The apps are then refused here as they are on the rest of the host,
+unless the list lets them by.
 
 **`error_log /dev/null crit;` is required.** A backend that is down, restarting or too slow
 otherwise has the proxy write, for every request, a line to its error log holding the

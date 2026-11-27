@@ -6,8 +6,9 @@
 //! hyper uses (`httparse`), and judged ([`judge`]) on its exact bytes: who opened the
 //! connection and whether the proxy marked it; the target exactly as it came, fragment and
 //! all, before any parsing of it as a URI; the method; and how the body is framed and how
-//! large it says it is. **Nothing is written to the connection until the gate has passed**,
-//! and nothing of the body is read until all of it has.
+//! large it says it is. **Nothing of ours is written until the gate has decided**: a request
+//! that fails it is given the gate's one fixed answer if it came from the proxy and nothing
+//! otherwise ([`crate::serve`]); and nothing of the body is read until every check has passed.
 //!
 //! Only a head that passes every check is handed on to hyper, which then serves that one
 //! request and closes the connection.
@@ -38,7 +39,8 @@ impl Head {
     }
 }
 
-/// Why no head was had. Each is answered with nothing.
+/// Why no head was had. Each fails the gate: the proxy is given the gate's one answer, anyone
+/// else nothing (and a connection closed before a byte, nothing at all).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoHead {
     /// The connection ended before a byte.
@@ -110,7 +112,8 @@ pub async fn read_by(deadline: tokio::time::Instant, from: &mut (impl AsyncRead 
 /// What is done with a request, decided from its head alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
-    /// Nothing is written: the connection is closed.
+    /// It failed the gate: the proxy is given the gate's one fixed answer, anyone else nothing,
+    /// and the connection is closed.
     Unanswered(Refusal),
     /// One fixed answer with no body, and the connection is closed.
     Refused(StatusCode, Refusal),
