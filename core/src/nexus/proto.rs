@@ -555,8 +555,127 @@ pub fn classify(status: u16, body: impl Read) -> Found {
     }
 }
 
+// ---------------------------------------------------------------------------------------
+// Where hello is asked
+// ---------------------------------------------------------------------------------------
+
+/// The address an app asks `hello` at, made from the music server's address as the app
+/// signed in with it (design 6.1): `https://` and the music server's host and port, then
+/// [`HELLO`], whatever path the music server itself is under. `None` (nothing is asked) for:
+///
+/// - anything but `https://` (the backend's line is HTTPS only, R5), plain `http://` included;
+/// - an address with a name or password in it (`user@host`), a backslash, a space or a
+///   control character, or an empty host;
+/// - a port that is not 1 to 65535 in digits, or a bracketed IPv6 host that is not closed;
+/// - a music server that is itself under `/nexus` (design 6.1: it cannot have a backend).
+///
+/// A query or fragment on the music server's address, and a trailing slash, are dropped with
+/// its path. The scheme and host are compared and written in lower case.
+pub fn hello_url(music_server: &str) -> Option<String> {
+    let text = music_server.trim();
+    let (scheme, rest) = text.split_once("://")?;
+    if !scheme.eq_ignore_ascii_case("https") {
+        return None;
+    }
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, after) = rest.split_at(end);
+    if authority.is_empty() || authority.bytes().any(|byte| byte <= b' ' || matches!(byte, b'@' | b'\\' | b'%' | 0x7f)) {
+        return None;
+    }
+    // The host, and the port if there is one.
+    let (host, port) = match authority.strip_prefix('[') {
+        Some(bracketed) => {
+            let (inside, tail) = bracketed.split_once(']')?;
+            if inside.is_empty() || !inside.bytes().all(|byte| byte.is_ascii_hexdigit() || byte == b':' || byte == b'.') {
+                return None;
+            }
+            let port = match tail.strip_prefix(':') {
+                Some(port) => Some(port),
+                None if tail.is_empty() => None,
+                None => return None,
+            };
+            (&authority[..inside.len() + 2], port)
+        }
+        None => match authority.rsplit_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (authority, None),
+        },
+    };
+    if host.is_empty() || (!host.starts_with('[') && host.contains(':')) {
+        return None;
+    }
+    if let Some(port) = port {
+        let number: u32 = if !port.is_empty() && port.len() <= 5 && port.bytes().all(|byte| byte.is_ascii_digit()) { port.parse().ok()? } else { return None };
+        if !(1..=65535).contains(&number) {
+            return None;
+        }
+    }
+    // The music server's own path: under /nexus it cannot have a backend.
+    let path = after.split(['?', '#']).next().unwrap_or("");
+    let first = path.trim_start_matches('/').split('/').next().unwrap_or("");
+    if first.eq_ignore_ascii_case("nexus") {
+        return None;
+    }
+    Some(format!("https://{}{HELLO}", authority.to_ascii_lowercase()))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hello_is_asked_at_the_music_servers_origin_and_nowhere_else() {
+        let asked = |server: &str| hello_url(server);
+        let at = |origin: &str| Some(format!("{origin}/nexus/api/hello"));
+        // The origin alone, whatever path the music server is under.
+        assert_eq!(asked("https://music.example.org"), at("https://music.example.org"));
+        assert_eq!(asked("https://music.example.org/"), at("https://music.example.org"));
+        assert_eq!(asked("https://music.example.org/navidrome"), at("https://music.example.org"));
+        assert_eq!(asked("https://music.example.org/navidrome/"), at("https://music.example.org"));
+        assert_eq!(asked("https://music.example.org/a/b?x=1#y"), at("https://music.example.org"));
+        assert_eq!(asked("https://music.example.org?x=1"), at("https://music.example.org"));
+        assert_eq!(asked("  https://music.example.org  "), at("https://music.example.org"));
+        // A port; an IPv4 and an IPv6 literal; case.
+        assert_eq!(asked("https://music.example.org:4443/navidrome"), at("https://music.example.org:4443"));
+        assert_eq!(asked("https://192.0.2.7:4443"), at("https://192.0.2.7:4443"));
+        assert_eq!(asked("https://[2001:db8::1]"), at("https://[2001:db8::1]"));
+        assert_eq!(asked("https://[2001:db8::1]:4443/music"), at("https://[2001:db8::1]:4443"));
+        assert_eq!(asked("HTTPS://Music.Example.ORG"), at("https://music.example.org"));
+        // Nothing is asked over plain HTTP, or of anything else.
+        for server in [
+            "http://music.example.org",
+            "http://music.example.org:4533",
+            "ftp://music.example.org",
+            "music.example.org",
+            "https://",
+            "https:///navidrome",
+            "https://name:secret@music.example.org",
+            "https://name@music.example.org",
+            "https://music.example.org:0",
+            "https://music.example.org:65536",
+            "https://music.example.org:",
+            "https://music.example.org:44x3",
+            "https://music.example.org:1:2",
+            "https://[2001:db8::1",
+            "https://[2001:db8::1]x",
+            "https://[]",
+            "https://2001:db8::1",
+            "https://music example.org",
+            "https://music.example.org\\evil",
+            "https://music%2eexample.org",
+            "https://music.example.org\u{7f}",
+            // A music server that is itself under /nexus cannot have a backend.
+            "https://music.example.org/nexus",
+            "https://music.example.org/nexus/",
+            "https://music.example.org/NEXUS/navidrome",
+        ] {
+            assert_eq!(asked(server), None, "{server:?}");
+        }
+        // Under a path that merely begins with the letters, it can.
+        assert_eq!(asked("https://music.example.org/nexusmusic"), at("https://music.example.org"));
+        // Every address made is in plain form at the backend.
+        let made = asked("https://music.example.org:4443/navidrome").unwrap();
+        assert_eq!(plain(made.trim_start_matches("https://music.example.org:4443")), Ok(()));
+    }
+
     use super::*;
 
     // ---- the plain form -----------------------------------------------------------------
