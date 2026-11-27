@@ -1214,11 +1214,11 @@ def scenario_offline(build="new"):
 
 
 def scenario_sign_out(build="new"):
-    """A look that comes due as the account signs out. Looks come every millisecond, so that
-    a timer is due at every turn of the event loop, before the window's account-changed
-    handler runs. Signed out and in again ten times: each time, no look is dispatched for the
-    account that has gone (the component says "not-ours" when it catches one), and every
-    request the proxy saw belongs to a dispatch. Exits 1 if not."""
+    """A look that comes due as the account signs out, before the window's account-changed
+    handler has run (made 0.3 s late, a test hook; looks 0.1 s apart, so that one is due in
+    that time). Signed out and in again ten times: no look is dispatched for the account that
+    has gone (the component says "not-ours" when it catches one), it is caught at least once,
+    and every request the proxy saw belongs to a dispatch. Exits 1 if not."""
     out = os.path.join(RUNS, f"{build}-sign-out-scenario")
     shutil.rmtree(out, ignore_errors=True)
     os.makedirs(out)
@@ -1229,7 +1229,9 @@ def scenario_sign_out(build="new"):
     shutil.copytree(KEPT, os.path.join(A.HOMES, home))
     inside = f"/work/target/walk/{home}"
     log = os.path.join(A.HOMES, home, "nexus.log")
-    env = {"NEXUS_MUSIC_NEXUS": "1", "NEXUS_TEST_NEXUS_LOG": f"{inside}/nexus.log", "NEXUS_TEST_PROBE_AGAIN_MS": "1"}
+    # The window's account-changed handler 0.3 s late (a test hook): looks come due between an
+    # account's going and the handler every time, as they may by Slint's order of work.
+    env = {"NEXUS_MUSIC_NEXUS": "1", "NEXUS_TEST_NEXUS_LOG": f"{inside}/nexus.log", "NEXUS_TEST_PROBE_AGAIN_MS": "100", "NEXUS_TEST_LATE_FOLLOW_MS": "300"}
     if os.environ.get("E13A_SABOTAGE"):
         env["NEXUS_TEST_SABOTAGE_NO_GENERATION"] = "1"
     caught = 0
@@ -1241,6 +1243,9 @@ def scenario_sign_out(build="new"):
         for cycle in range(10):
             settings_tab(a, "Account", "Sign out")
             a.press("Sign out")
+            # (The inspection port answers once the window has handled the press: the account
+            # has gone by now.)
+            clicked = time.time()
             until(lambda: a.find(label="Connect"), 20, 0.02, "the sign-in form")
             form_seen = time.time()
             time.sleep(1)
@@ -1248,13 +1253,18 @@ def scenario_sign_out(build="new"):
             # The generation of the account that went: the last published before the form.
             gone = [rest.split()[0] for t, word, rest in lines if word == "published" and t < form_seen and rest.split()[0] != "0"]
             gen = gone[-1] if gone else None
-            late = [t for t, word, rest in lines if word == "dispatch" and rest.split()[0] == gen and t > form_seen]
+            # Looks for the gone account dispatched after it had gone.
+            late = [t for t, word, rest in lines if word == "dispatch" and rest.split()[0] == gen and t > clicked]
             if late:
                 failures.append(f"cycle {cycle}: {len(late)} looks dispatched for the account that signed out")
             caught += len([1 for t, word, rest in lines if word == "not-ours" and rest.split()[0] == gen])
             sign_in(a, "tester")
             until(lambda: home_drawn(a), 60, 0.05, "signed in again")
-            time.sleep(1)
+            # Looks coming again (five seconds after the account is published) before the next
+            # sign-out.
+            mark = time.time()
+            until(lambda: any(word == "dispatch" and t > mark for t, word, _ in component_log(log)), 15, 0.1, "looks again")
+            time.sleep(0.5)
         copy.stop(keep=os.path.join(out, "app-output.txt"))
         if not caught:
             failures.append("no look came due as the account went: the race was never caught, so nothing was shown")

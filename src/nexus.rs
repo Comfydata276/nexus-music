@@ -161,7 +161,16 @@ pub fn install(ui: &ui::MainWindow) {
     app.set_nexus_on(true);
     let weak = ui.as_weak();
     app.on_account_changed(move || {
-        if let Some(ui) = weak.upgrade() {
+        if let Some(late) = test_ms("NEXUS_TEST_LATE_FOLLOW_MS") {
+            // For the tests only: the window's account-changed handler made to come late, so
+            // that looks come due between an account's going and the handler, every time.
+            let weak = weak.clone();
+            slint::Timer::single_shot(late, move || {
+                if let Some(ui) = weak.upgrade() {
+                    follow(&ui);
+                }
+            });
+        } else if let Some(ui) = weak.upgrade() {
             follow(&ui);
         }
     });
