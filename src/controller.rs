@@ -960,6 +960,7 @@ impl Controller {
         self.ui.global::<ui::Player>().set_history(ModelRc::from(self.history_model.clone()));
         self.sync_history();
         self.sync_transport();
+        self.sync_offline();
 
         let (covers_dir, pages_dir) = (self.paths.covers.clone(), self.paths.pages.clone());
         self.api_pool.spawn(move || {
@@ -975,7 +976,6 @@ impl Controller {
                 config::load_password(&self.paths, &settings.server, &settings.username)
             {
                 let client = Client::new(&settings.server, &settings.username, &password);
-                client.set_offline(settings.offline);
                 self.enter(client, None);
                 // Confirm the saved login still works (if not, go back to the sign-in
                 // screen), and find out whether the server can be reached at all.
@@ -1409,6 +1409,9 @@ impl Controller {
         if let Some(version) = version {
             app.set_server_version(version.into());
         }
+        // Offline mode holds for whichever way this sign-in came: restored at start-up, or
+        // typed in after signing out with it on. (Before the warm-up: nothing is sent.)
+        client.set_offline(self.settings.borrow().offline);
         // Have connections open before the first clicks need them.
         let warm = client.clone();
         self.art_pool.spawn(move || warm.warm_up(6));

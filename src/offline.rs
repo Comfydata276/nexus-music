@@ -193,8 +193,10 @@ impl Controller {
         });
     }
 
-    /// Shows whether the app is offline, and why.
-    fn sync_offline(self: &Rc<Self>) {
+    /// Shows whether the app is offline, and why. Also at start-up: the saved setting is
+    /// what the window shows, or its switch would say "off" while the app is offline, and
+    /// asking for "on" again (all a click on it can do) would change nothing.
+    pub fn sync_offline(self: &Rc<Self>) {
         let manual = self.settings.borrow().offline;
         let app = self.ui.global::<ui::App>();
         app.set_offline(manual || self.unreachable.get());
