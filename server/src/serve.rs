@@ -203,6 +203,15 @@ pub fn bare(status: StatusCode) -> Vec<u8> {
 /// for it to try elsewhere or to note the backend as failing.
 pub const GATE: StatusCode = StatusCode::BAD_REQUEST;
 
+/// A listener on `address` whose backlog, the connections the kernel holds before they are
+/// taken, is [`LISTEN_BACKLOG`].
+pub fn listen(address: std::net::SocketAddr) -> io::Result<TcpListener> {
+    let socket = if address.is_ipv4() { tokio::net::TcpSocket::new_v4()? } else { tokio::net::TcpSocket::new_v6()? };
+    socket.set_reuseaddr(true)?;
+    socket.bind(address)?;
+    socket.listen(LISTEN_BACKLOG)
+}
+
 /// Accepts and serves connections on `listener` for as long as the program runs. With `log`,
 /// it writes the counts of refusals every [`COUNTS_EVERY`] that there were any.
 pub async fn serve(listener: TcpListener, shell: Arc<Shell>, log: bool) {
@@ -219,9 +228,15 @@ pub async fn serve(listener: TcpListener, shell: Arc<Shell>, log: bool) {
             }
         });
     }
+    // Room for every connection taken: those served, and those only given the gate's answer.
+    // A connection is taken only when there is room at least to answer it, so that one from
+    // the proxy is never taken and then closed with nothing (which the proxy would log, and
+    // answer with a 502). Past that, it waits in the kernel's backlog ([`LISTEN_BACKLOG`])
+    // until there is room.
+    let room = Arc::new(Semaphore::new(CONNECTIONS_MAX + TURNED_AWAY_MAX));
     let slots = Arc::new(Semaphore::new(CONNECTIONS_MAX));
-    let turned = Arc::new(Semaphore::new(TURNED_AWAY_MAX));
     loop {
+        let Ok(roomed) = room.clone().acquire_owned().await else { return };
         let (stream, from) = match listener.accept().await {
             Ok(accepted) => accepted,
             // Out of file handles, or a connection gone before it was taken: wait a moment
@@ -231,6 +246,8 @@ pub async fn serve(listener: TcpListener, shell: Arc<Shell>, log: bool) {
                 continue;
             }
         };
+        // The head's deadline counts from here, not from when its task first runs.
+        let deadline = tokio::time::Instant::now() + HEAD_DEADLINE;
         let peer = peer(from.ip(), shell.proxy);
         if peer == Peer::Stranger {
             shell.count(Refusal::Stranger);
@@ -242,21 +259,21 @@ pub async fn serve(listener: TcpListener, shell: Arc<Shell>, log: bool) {
         match slots.clone().try_acquire_owned() {
             Ok(slot) => {
                 tokio::spawn(async move {
+                    let _room = roomed;
                     let _slot = slot;
                     let _open = Open::new(&shell);
-                    connection(Guarded::new(stream, shell.clone()), peer, shell).await;
+                    connection(Guarded::new(stream, shell.clone()), peer, deadline, shell).await;
                 });
             }
             Err(_) => {
                 shell.count(Refusal::Full);
-                // The proxy is told so, by the gate's one answer, while there is room to; no
-                // one else is told anything.
+                // The proxy is told so, by the gate's one answer, for which there is always room
+                // here; no one else is told anything.
                 if peer != Peer::Proxy {
                     continue;
                 }
-                let Ok(room) = turned.clone().try_acquire_owned() else { continue };
                 tokio::spawn(async move {
-                    let _room = room;
+                    let _room = roomed;
                     let _open = Open::new(&shell);
                     answer_bare(Guarded::new(stream, shell.clone()), GATE).await;
                 });
@@ -266,23 +283,17 @@ pub async fn serve(listener: TcpListener, shell: Arc<Shell>, log: bool) {
 }
 
 /// One connection: its head read and judged, then refused or served.
-async fn connection(mut stream: Guarded, peer: Peer, shell: Arc<Shell>) {
+async fn connection(mut stream: Guarded, peer: Peer, deadline: tokio::time::Instant, shell: Arc<Shell>) {
     let refused = |kind| {
         shell.count(kind);
         peer == Peer::Proxy
     };
-    let head = match tokio::time::timeout(HEAD_DEADLINE, head::read(&mut stream)).await {
-        Ok(Ok(head)) => head,
+    let head = match head::read_by(deadline, &mut stream).await {
+        Ok(head) => head,
         // Opened and closed with nothing said: there is no one to answer.
-        Ok(Err(NoHead::Closed)) => return,
-        Ok(Err(_)) => {
-            if refused(Refusal::BadHead) {
-                answer_bare(stream, GATE).await;
-            }
-            return;
-        }
-        Err(_) => {
-            if refused(Refusal::SlowHead) {
+        Err(NoHead::Closed) => return,
+        Err(why) => {
+            if refused(if why == NoHead::Late { Refusal::SlowHead } else { Refusal::BadHead }) {
                 answer_bare(stream, GATE).await;
             }
             return;

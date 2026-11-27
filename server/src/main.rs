@@ -61,7 +61,7 @@ fn run(settings: Settings) -> ExitCode {
         }
     };
     runtime.block_on(async {
-        let listener = match tokio::net::TcpListener::bind(settings.listen).await {
+        let listener = match serve::listen(settings.listen) {
             Ok(listener) => listener,
             Err(why) => {
                 eprintln!("NEXUS_LISTEN is wrong: nothing can listen there ({}).", why.kind());

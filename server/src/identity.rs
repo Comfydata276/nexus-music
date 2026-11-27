@@ -47,45 +47,78 @@ fn not_an_id(path: &Path) -> String {
     )
 }
 
+/// Making what was written lasting on the disk. The program's is [`Real`]; a test's records
+/// what was made lasting, and when.
+pub trait Disk {
+    /// Makes the file at `path` (its bytes), or the folder at `path` (its names), lasting.
+    fn sync(&mut self, path: &Path) -> io::Result<()>;
+}
+
+/// The disk itself.
+pub struct Real;
+
+impl Disk for Real {
+    fn sync(&mut self, path: &Path) -> io::Result<()> {
+        fs::File::open(path)?.sync_all()
+    }
+}
+
+/// Where this start writes the id `id` it made before linking it into place: a name no other
+/// start uses, since it holds this program's process number and the id itself.
+pub fn staging(state: &Path, id: &BackendId) -> PathBuf {
+    state.join(format!("{STAGING}{}-{}", std::process::id(), id.to_hex()))
+}
+
 /// The id kept in `state`, made there from `random` if there is none yet; and whether this
 /// start made it.
-///
-/// Two starts at once each write their own staging file, and each links it into place only
-/// where there is nothing yet, so one wins and neither replaces the other. Both then read back
-/// what is on the disk and take that, so that both serve the one id there is.
 pub fn read_or_make(state: &Path, random: impl FnOnce() -> Result<[u8; 16], String>) -> Result<(BackendId, bool), String> {
-    if let Some(id) = read(state)? {
+    read_or_make_on(state, random, &mut Real)
+}
+
+/// [`read_or_make`], on `disk`.
+///
+/// - **No id is served before it is lasting**: the id's file and the folder that names it
+///   are made lasting first, whoever wrote it, and a start that finds an id already there
+///   does the same before it takes it.
+/// - **Two starts at once** each write a staging file of their own, make it lasting, and link
+///   it into place only where there is nothing yet: one wins and neither replaces the other.
+///   Both then take what is on the disk.
+/// - **A start removes only the staging file it made itself**: one it could not make (it was
+///   there already) is left as it is.
+pub fn read_or_make_on(state: &Path, random: impl FnOnce() -> Result<[u8; 16], String>, disk: &mut impl Disk) -> Result<(BackendId, bool), String> {
+    let failed = |why: io::Error| format!("The backend's id couldn't be written in {} ({}).", state.display(), why.kind());
+    let lasting = |disk: &mut dyn FnMut(&Path) -> io::Result<()>| -> Result<Option<BackendId>, String> {
+        let Some(id) = read(state)? else { return Ok(None) };
+        disk(&place(state)).map_err(failed)?;
+        disk(state).map_err(failed)?;
+        Ok(Some(id))
+    };
+    if let Some(id) = lasting(&mut |path| disk.sync(path))? {
         return Ok((id, false));
     }
     let id = BackendId::from_bytes(random()?);
-    // Named for the id this start made: no other start's has the same name.
-    let staging = state.join(format!("{STAGING}{}", id.to_hex()));
-    let failed = |why: io::Error| format!("The backend's id couldn't be written in {} ({}).", state.display(), why.kind());
+    let staging = staging(state, &id);
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    let written = options.open(&staging).and_then(|mut file| {
+    // If it cannot be made, it is not this start's, and it is not touched.
+    let mut file = options.open(&staging).map_err(failed)?;
+    // From here it is this start's, and it is removed on every way out.
+    let published = (|| {
         file.write_all(format!("{}\n", id.to_hex()).as_bytes())?;
-        file.sync_all()
-    });
-    if let Err(why) = written {
-        let _ = fs::remove_file(&staging);
-        return Err(failed(why));
-    }
-    // A link, not a rename: it fails if an id is there already, so one is never replaced.
-    let linked = fs::hard_link(&staging, place(state));
+        drop(file);
+        disk.sync(&staging)?;
+        // A link, not a rename: it fails if an id is there already, so one is never replaced.
+        match fs::hard_link(&staging, place(state)) {
+            Err(why) if why.kind() != io::ErrorKind::AlreadyExists => Err(why),
+            _ => Ok(()),
+        }
+    })();
     let _ = fs::remove_file(&staging);
-    match linked {
-        Ok(()) => {}
-        Err(why) if why.kind() == io::ErrorKind::AlreadyExists => {}
-        Err(why) => return Err(failed(why)),
-    }
-    // The folder's own record of the names, on the disk.
-    #[cfg(unix)]
-    fs::File::open(state).and_then(|folder| folder.sync_all()).map_err(failed)?;
-    // What is there now is the id, whichever start put it there.
-    let kept = read(state)?.ok_or_else(|| not_an_id(&place(state)))?;
+    published.map_err(failed)?;
+    // What is there now is the id, whichever start put it there: lasting, then taken.
+    let kept = lasting(&mut |path| disk.sync(path))?.ok_or_else(|| not_an_id(&place(state)))?;
     Ok((kept, kept == id))
 }
 
@@ -134,6 +167,55 @@ mod tests {
             fs::write(state.join(FILE), right).unwrap();
             assert_eq!(read(&state).unwrap().unwrap().to_hex(), "0123456789abcdef0123456789abcdef");
         }
+        fs::remove_dir_all(&state).unwrap();
+    }
+
+    /// A disk that records what was made lasting, and whether the id was in place by then.
+    struct Recorded<'a> {
+        state: &'a Path,
+        synced: Vec<(String, bool)>,
+    }
+
+    impl Disk for Recorded<'_> {
+        fn sync(&mut self, path: &Path) -> io::Result<()> {
+            let name = if path == self.state { "the folder".to_string() } else { path.file_name().unwrap().to_string_lossy().into_owned() };
+            self.synced.push((name, place(self.state).exists()));
+            Real.sync(path)
+        }
+    }
+
+    #[test]
+    fn an_id_found_already_there_is_made_lasting_before_it_is_taken() {
+        let state = folder("found");
+        fs::write(place(&state), "0123456789abcdef0123456789abcdef\n").unwrap();
+        let mut disk = Recorded { state: &state, synced: Vec::new() };
+        let (id, made) = read_or_make_on(&state, || panic!("no id is made"), &mut disk).unwrap();
+        assert!(!made && id.to_hex() == "0123456789abcdef0123456789abcdef");
+        assert_eq!(disk.synced, [("id".to_string(), true), ("the folder".to_string(), true)]);
+        fs::remove_dir_all(&state).unwrap();
+    }
+
+    #[test]
+    fn an_id_made_here_is_lasting_before_it_is_in_place_and_before_it_is_taken() {
+        let state = folder("made");
+        let mut disk = Recorded { state: &state, synced: Vec::new() };
+        let (id, made) = read_or_make_on(&state, || Ok([4; 16]), &mut disk).unwrap();
+        assert!(made);
+        let staged = staging(&state, &id).file_name().unwrap().to_string_lossy().into_owned();
+        // The staging file lasting while the id is not yet in place; then the id and its
+        // folder, before the id is given back.
+        assert_eq!(disk.synced, [(staged, false), ("id".to_string(), true), ("the folder".to_string(), true)]);
+        fs::remove_dir_all(&state).unwrap();
+    }
+
+    #[test]
+    fn a_staging_file_this_start_did_not_make_is_left_as_it_is() {
+        let state = folder("theirs");
+        let id = BackendId::from_bytes([3; 16]);
+        fs::write(staging(&state, &id), "another start's").unwrap();
+        assert!(read_or_make(&state, || Ok([3; 16])).is_err());
+        assert_eq!(fs::read_to_string(staging(&state, &id)).unwrap(), "another start's");
+        assert_eq!(read(&state), Ok(None));
         fs::remove_dir_all(&state).unwrap();
     }
 

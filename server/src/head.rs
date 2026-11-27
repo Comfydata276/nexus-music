@@ -51,6 +51,8 @@ pub enum NoHead {
     TooManyHeaders,
     /// Not a head that `httparse` reads.
     Wrong,
+    /// Not whole by its deadline.
+    Late,
 }
 
 /// What a complete head in `bytes` is, if `bytes` holds one.
@@ -90,6 +92,18 @@ pub async fn read(from: &mut (impl AsyncRead + Unpin)) -> Result<Head, NoHead> {
             head.read = read;
             return Ok(head);
         }
+    }
+}
+
+/// Reads one request's head from `from`, whole by `deadline` (counted from when the connection
+/// was taken) or not at all: a head that is read only as the deadline passes is late too.
+pub async fn read_by(deadline: tokio::time::Instant, from: &mut (impl AsyncRead + Unpin)) -> Result<Head, NoHead> {
+    match tokio::time::timeout_at(deadline, read(from)).await {
+        // The timer and the read may be ready together, and the read is looked at first: the
+        // deadline wins.
+        Ok(Ok(_)) if tokio::time::Instant::now() >= deadline => Err(NoHead::Late),
+        Ok(done) => done,
+        Err(_) => Err(NoHead::Late),
     }
 }
 
@@ -229,6 +243,20 @@ mod tests {
         ] {
             assert_eq!(ok(framing), Verdict::Refused(StatusCode::BAD_REQUEST, Refusal::Framing), "{framing}");
         }
+    }
+
+    #[test]
+    fn a_head_ready_only_as_its_deadline_passes_is_late() {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        runtime.block_on(async {
+            let whole = b"GET /nexus/api/hello HTTP/1.1\r\nX-Nexus-Scheme: https\r\n\r\n";
+            // Its deadline already passed when the head is first looked at, though every byte
+            // of it is there to be read.
+            let passed = tokio::time::Instant::now() - std::time::Duration::from_millis(1);
+            assert_eq!(read_by(passed, &mut &whole[..]).await.map(|_| ()), Err(NoHead::Late));
+            let ahead = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+            assert!(read_by(ahead, &mut &whole[..]).await.is_ok());
+        });
     }
 
     #[test]

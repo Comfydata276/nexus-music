@@ -64,19 +64,19 @@ fn start(proxy: &str) -> Running {
         routes.push((path, "GET"));
     }
     let proxy: IpAddr = proxy.parse().unwrap();
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let at = listener.local_addr().unwrap();
     let shell = Shell::with_routes(proxy, router, routes);
     let serving = shell.clone();
+    let (bound, at) = std::sync::mpsc::channel();
     thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
         runtime.block_on(async move {
-            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            // The program's own listener, with its backlog.
+            let listener = serve::listen("127.0.0.1:0".parse().unwrap()).unwrap();
+            bound.send(listener.local_addr().unwrap()).unwrap();
             serve::serve(listener, serving, false).await;
         });
     });
-    Running { at, shell, stalling }
+    Running { at: at.recv().unwrap(), shell, stalling }
 }
 
 /// A connection to `to` from the loopback address `from`.
@@ -444,6 +444,56 @@ fn one_connection_more_than_the_cap_is_turned_away_and_the_rest_are_served() {
     drop(held.remove(0));
     wait_until("one let go", || backend.shell.open() == CONNECTIONS_MAX - 1);
     assert_is_the_backend(&exchange(PROXY, backend.at, hello_request().as_bytes()));
+}
+
+/// Whether `done` comes true within `within`, looking every few milliseconds.
+fn comes_true(within: Duration, mut done: impl FnMut() -> bool) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < within {
+        if done() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    done()
+}
+
+/// With every connection taken, those served and those being given the gate's answer, one
+/// more from the proxy is not taken and closed with nothing (which the proxy would log, and
+/// answer with a 502): it waits in the backlog and is answered when there is room.
+///
+/// Whether the room was all taken when it came depends on how quickly this runs (the gate's
+/// answers let go within LINGER_DEADLINE); a run where it was not proves nothing either way,
+/// and is tried again. However slow the machine, what is asserted holds.
+#[test]
+fn with_every_room_taken_one_more_from_the_proxy_waits_and_is_answered() {
+    let all = CONNECTIONS_MAX + TURNED_AWAY_MAX;
+    for _ in 0..5 {
+        let backend = start(PROXY);
+        // Every service slot, held by callers that have said nothing yet.
+        let _held: Vec<TcpStream> = (0..CONNECTIONS_MAX).map(|_| connect(PROXY, backend.at)).collect();
+        if !comes_true(Duration::from_secs(5), || backend.shell.open() == CONNECTIONS_MAX) {
+            continue;
+        }
+        // Every room for the gate's answer, by callers that keep their connection open after it.
+        let started = Instant::now();
+        let _turned: Vec<TcpStream> = (0..TURNED_AWAY_MAX).map(|_| connect(PROXY, backend.at)).collect();
+        if !comes_true(LINGER_DEADLINE / 4, || backend.shell.open() == all) || started.elapsed() > LINGER_DEADLINE / 2 {
+            continue;
+        }
+        // One more.
+        let mut more = connect(PROXY, backend.at);
+        more.write_all(hello_request().as_bytes()).unwrap();
+        if started.elapsed() > LINGER_DEADLINE / 2 || backend.shell.open() != all {
+            continue;
+        }
+        let written = everything(&mut more);
+        assert!(!written.is_empty(), "taken and closed with nothing");
+        let answered = written == serve::bare(GATE) || one_answer(&written).0.status == 200;
+        assert!(answered, "{}", String::from_utf8_lossy(&written));
+        return;
+    }
+    panic!("in five tries, the room was never all taken in time to try one more");
 }
 
 #[test]

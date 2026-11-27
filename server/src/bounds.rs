@@ -45,8 +45,14 @@ pub const LINGER_DEADLINE: Duration = Duration::from_secs(2);
 pub const LINGER_MAX_BYTES: usize = BODY_MAX_BYTES + HEAD_MAX_BYTES;
 
 /// How many connections past [`CONNECTIONS_MAX`] may be open at once only to be given the
-/// gate's answer. Past these, one more from the proxy is closed with nothing.
+/// gate's answer. Past these, no more is taken: one waits in the kernel's backlog.
 pub const TURNED_AWAY_MAX: usize = 16;
+
+/// How many connections the kernel holds, ready, before they are taken. With every one of
+/// those held too, the kernel answers a new one with nothing, and the caller (the proxy)
+/// tries again until its own deadline to connect (60 s in nginx unless set), then answers its
+/// caller 504. With `error_log /dev/null crit;` in the proxy's rule, that is not logged.
+pub const LISTEN_BACKLOG: u32 = 1024;
 
 /// How often the log says how many requests of each kind were refused, when any were.
 pub const COUNTS_EVERY: Duration = Duration::from_secs(15 * 60);
