@@ -400,7 +400,7 @@ HOOKS = {
 class Run:
     def __init__(self, build, mode, hook=None):
         self.build, self.mode, self.hook = build, mode, hook
-        self.label = f"{build}-{mode}" + (f"-{hook}" if hook else "")
+        self.label = f"{build}-{mode}" + (f"-{hook}" if hook else "") + (f"-{os.environ['E13A_REPEAT']}" if os.environ.get("E13A_REPEAT") else "")
         self.out = os.path.join(RUNS, self.label)
         self.results, self.notes, self.failures = {}, [], []
 
@@ -445,6 +445,7 @@ class Run:
         shutil.rmtree(self.out, ignore_errors=True)
         os.makedirs(self.out)
         self.say(f"run {self.label} at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        self.load = [os.getloadavg()[0]]
         self.by = prepare_server()
         home = f"run-{self.label}"
         shutil.rmtree(os.path.join(A.HOMES, home), ignore_errors=True)
@@ -527,13 +528,18 @@ class Run:
 
         def like():
             outro = self.by[SHORT[1]]["id"]
+            # Paused from here, so that the queue moves only by what the tests do.
+            if a.find(label="Pause"):
+                a.press("Pause")
             open_list(a, "Short songs")
+            # The page settled: the list as the server has it now, four songs.
+            until(lambda: len(a.find(role="ListItem", type="TrackRow")) == 4, 20, 0.2, "the list's four songs")
             target = row(a, "Outro")
-            like = [e for e in a.find(label="Add to Liked songs", role="Button") if inside(e, target)] or None
-            if not like:
-                raise RuntimeError("no like button on Outro's row")
+            a.click(target["handle"], button="Right")
+            until(lambda: "   Outro" in labels(a), 5, 0.1, "Outro's menu")
+            item = until(lambda: a.find(label="Add to Liked songs", type="MenuRow"), 5, 0.1, "the menu's like")
             pressed = time.time()
-            a.click(like[0]["handle"])
+            a.click(item[-1]["handle"])
             until(lambda: starred(outro), 30, 0.05, "the like on the server")
             self.time("a_like_and_a_play_reach_the_music_server", "like_to_server", time.time() - pressed)
         self.step("a_like_and_a_play_reach_the_music_server", like)
@@ -744,7 +750,8 @@ class Run:
 
     def save(self):
         os.makedirs(RESULTS, exist_ok=True)
-        record = {"run": self.label, "build": self.build, "mode": self.mode, "hook": self.hook,
+        self.load.append(os.getloadavg()[0])
+        record = {"run": self.label, "machine_load_at_start_and_end": [round(x, 2) for x in self.load], "build": self.build, "mode": self.mode, "hook": self.hook,
                   "at": time.strftime("%Y-%m-%d %H:%M:%S"), "binary": digest(os.path.join(A.HOMES, f"nexus-music-{self.build}")),
                   "results": self.results, "failures": self.failures}
         json.dump(record, open(os.path.join(RESULTS, f"{self.label}.json"), "w"), indent=1, ensure_ascii=False)
@@ -828,10 +835,87 @@ def digest(path):
     return h.hexdigest()[:16]
 
 
+# ---- the numbers --------------------------------------------------------------------------
+
+# How much slower than the released app's slowest a W1 time may be, and why (NUMBERS.md says
+# it again): what the measurement itself can vary by.
+#  - "ui": seen by reading the window's element tree, which takes 20-60 ms a read: 0.25 s.
+#  - "file": seen in a file, every 20-50 ms; the app's own work is a few ms: 0.25 s.
+#  - "timer": waits on one of the app's timers or the server (a count at half the song, the
+#    reconnect every 15 s, a retry): 1.0 s, a tenth or less of the wait itself.
+#  - "gap": a stall in the sound, sampled every 2 ms against 20 ms ticks of the null output:
+#    one tick, 0.02 s.
+KINDS = {
+    "launch_to_home_drawn": "ui", "launch_to_queue_shown": "ui", "restart_to_queue_shown": "ui",
+    "connect_to_home_drawn": "ui", "play_to_sound": "file", "space_to_sound": "file",
+    "play_to_counted": "timer", "counted_to_server_has_play": "timer", "like_to_server": "file",
+    "server_back_to_play_told_again": "timer", "launch_to_list_scheduled_its_own": "timer",
+    "by_hand_8_songs": "file", "server_back_to_downloads_done": "timer",
+    "add_to_kept": "file", "move_to_kept": "file", "remove_to_kept": "file", "clear_to_kept": "file",
+    "by_hand_switch_to_offline": "file", "by_hand_switch_back": "file", "offline_play_downloaded_to_sound": "file",
+    "by_loss_noticed": "ui", "by_loss_play_downloaded_to_sound": "file", "server_back_to_online": "timer",
+}
+SLACK = {"ui": 0.25, "file": 0.25, "timer": 1.0, "gap": 0.02}
+
+
+def kind(metric):
+    if metric.endswith("_longest_stall_around_the_join"):
+        return "gap"
+    if metric.endswith("_play_to_sound"):
+        return "file"
+    return KINDS.get(metric)
+
+
+def table():
+    runs = [json.load(open(os.path.join(RESULTS, name))) for name in sorted(os.listdir(RESULTS)) if name.endswith(".json")]
+    old = [r for r in runs if r["build"] == "old"]
+    new = [r for r in runs if r["build"] == "new"]
+    metrics = []
+    for r in runs:
+        for test, values in r["results"].items():
+            for metric, value in values.items():
+                if isinstance(value, (int, float)) and not isinstance(value, bool) and kind(metric) and (test, metric) not in metrics:
+                    metrics.append((test, metric))
+    lines = ["| Test | Measure | Released: each run | Released: slowest | Allowed (slack) | W1: each run | W1: slowest | Within |", "|---|---|---|---|---|---|---|---|"]
+    verdicts = []
+    for test, metric in metrics:
+        get = lambda rs: [r["results"].get(test, {}).get(metric) for r in rs]
+        before = [v for v in get(old) if isinstance(v, (int, float))]
+        after = [v for v in get(new) if isinstance(v, (int, float))]
+        if not before:
+            continue
+        worst = max(before)
+        slack = SLACK[kind(metric)]
+        allowed = worst + slack
+        ok = all(v <= allowed for v in after) if after else None
+        verdicts.append(ok)
+        lines.append(f"| `{test}` | {metric} | {', '.join(f'{v:.3f}' for v in before)} | {worst:.3f} | {allowed:.3f} ({kind(metric)}) | "
+                     f"{', '.join(f'{v:.3f}' for v in after) or '-'} | {max(after) if after else float('nan'):.3f} | {'yes' if ok else ('-' if ok is None else '**no**')} |")
+    facts = ["", "| Run | Load at start, end | Failed | Log line (time as seconds after Play) | Queue kept through kill -9 | Settings row | Under /nexus/ at the proxy | At the stand-in |", "|---|---|---|---|---|---|---|---|"]
+    for r in runs:
+        res = r["results"]
+        get = lambda t, m: res.get(t, {}).get(m)
+        stand = get("backend", "requests_at_the_stand_in") or []
+        facts.append(f"| {r['run']} | {r.get('machine_load_at_start_and_end')} | {len(r['failures'])} | "
+                     f"{get('a_play_is_counted_as_released', 'line_with_time_as_offset')} | {get('the_queue_is_changed_and_kept', 'queue_after_kill_is_the_queue_before')} | "
+                     f"{get('settings_row', 'shown')} / {get('settings_row', 'shown (account change)')} | {get('backend', 'requests_under_nexus_at_the_proxy')} | "
+                     f"{len(stand)}: {sorted(set(tuple(x) for x in stand))} |")
+    gaps = ["", "| Run | " + " | ".join(f"{k} silent frames, largest step" for k in ("streamed", "cached", "downloaded")) + " |", "|---|---|---|---|"]
+    for r in runs:
+        res = r["results"].get("two_songs_join_without_a_gap", {})
+        gaps.append(f"| {r['run']} | " + " | ".join(f"{res.get(k + '_silent_frames_at_the_join')}, {res.get(k + '_largest_step_at_the_join')}" for k in ("streamed", "cached", "downloaded")) + " |")
+    text = "\n".join(lines + facts + gaps) + "\n"
+    print(text)
+    print("all within:", all(v for v in verdicts if v is not None), "| W1 runs:", len(new), "| released runs:", len(old))
+    return text
+
+
 if __name__ == "__main__":
     what = sys.argv[1]
     if what == "populate":
         populate()
+    elif what == "table":
+        table()
     elif what == "run":
         Run(sys.argv[2], sys.argv[3], sys.argv[4] if len(sys.argv) > 4 else None).go()
     else:

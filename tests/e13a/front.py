@@ -146,7 +146,7 @@ class Front:
     def __enter__(self):
         certs()
         sh(f"docker rm -f {NGINX}")
-        sh(f"pkill -f 'standin.py {STANDIN}'")
+        sh(f"pkill -f 'standin[.]py {STANDIN}'")
         self.set(self.mode if self.mode in ("found", "stalled", "saturated", "ended", "half") else "found")
         self.procs.append(subprocess.Popen([sys.executable, "-I", os.path.join(HERE, "standin.py"), str(STANDIN), self.mode_file, self.log],
                                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
