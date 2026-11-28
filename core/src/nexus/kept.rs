@@ -25,7 +25,7 @@ pub const RENEW_MS: u64 = 12 * HOUR;
 pub const SECRET_BYTES: usize = 32;
 
 pub(super) fn within(start: u64, now: u64, limit: u64) -> bool {
-    // the design does not say whether the last instant counts. End at the deadline.
+    // §7.6: at the deadline the permission has ended.
     now.checked_sub(start).is_some_and(|age| age < limit)
 }
 
@@ -125,6 +125,7 @@ impl Session {
 pub struct Device {
     recorded: Scope,
     last_session: u64,
+    interrupted_promotion: Option<u64>,
     working: Option<Session>,
     waiting: Option<Session>,
     serial: u64,
@@ -140,6 +141,7 @@ pub enum Denied {
     Exhausted,
     WrongPurpose,
     ReusedSession,
+    StartAgain,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -162,6 +164,7 @@ impl Device {
         Self {
             recorded: scope.clone(),
             last_session: 0,
+            interrupted_promotion: None,
             working: None,
             waiting: None,
             serial: 0,
@@ -178,6 +181,7 @@ impl Device {
         let number = scope.number.checked_add(1).ok_or(Denied::Exhausted)?;
         scope.number = number;
         self.recorded.number = number;
+        self.interrupted_promotion = None;
         self.working = None;
         self.waiting = None;
         self.pending = None;
@@ -185,7 +189,7 @@ impl Device {
     }
 
     /// §7.7. Expiry of the working session ends the whole device, even if a newer one waits.
-    /// the design does not say which clock governs this overlap; use the older deadline.
+    /// §7.5 keeps the older deadline until promotion.
     fn expire(&mut self, scope: &mut Scope, now: u64) -> Result<(), Denied> {
         if &self.recorded != scope {
             return Err(Denied::NotSignedIn);
@@ -193,7 +197,9 @@ impl Device {
         if self
             .working
             .as_ref()
-            .is_some_and(|s| now.checked_sub(s.proven).is_some_and(|age| age >= SESSION_MS))
+            .map(|s| s.proven)
+            .or(self.interrupted_promotion)
+            .is_some_and(|proof| now.checked_sub(proof).is_some_and(|age| age >= SESSION_MS))
         {
             self.end(scope)?;
         }
@@ -207,6 +213,7 @@ impl Device {
             .is_some_and(|s| &s.hash == hash && within(s.proven, now, SESSION_MS))
         {
             self.working = self.waiting.take();
+            self.interrupted_promotion = None;
             // A proof under the old session cannot give anything after promotion.
             self.pending = None;
         }
@@ -221,13 +228,7 @@ impl Device {
     fn begin(&mut self, scope: &mut Scope, purpose: Purpose, now: u64) -> Result<Try, Denied> {
         self.expire(scope, now)?;
         if let Purpose::Again(hash) | Purpose::Delete(hash) = &purpose {
-            let session = self.use_session(hash, now)?;
-            if matches!(purpose, Purpose::Delete(_)) && !within(session.proven, now, SEND_MS) {
-                // §7.5: the design does not say if delete survives both ordinary powers.
-                // Once both ordinary powers end, only renewal may BEGIN. Leave already
-                // granted (or a delete proof already begun) has its own deadline.
-                return Err(Denied::ProveAgain);
-            }
+            self.use_session(hash, now)?;
         }
         self.serial = self.serial.checked_add(1).ok_or(Denied::Exhausted)?;
         self.pending = Some(self.serial);
@@ -247,12 +248,25 @@ impl Device {
     /// Called after a bound proof, in the step granting power. A newer begin also invalidates
     /// a spend already waiting on Navidrome. Supply a fresh random session's hash only for
     /// Connect/Again. A different authenticated name ends this device's sessions (§7.7).
+    #[cfg(test)]
     fn finish(
+        &mut self,
+        scope: &mut Scope,
+        ticket: Try,
+        account: &str,
+        fresh: Option<Fingerprint>,
+        now: u64,
+    ) -> Result<(), Denied> {
+        self.finish_at(scope, ticket, account, fresh, now, now)
+    }
+
+    fn finish_at(
         &mut self,
         scope: &mut Scope,
         ticket: Try,
         authenticated: &str,
         fresh: Option<Fingerprint>,
+        proven: u64,
         now: u64,
     ) -> Result<(), Denied> {
         self.expire(scope, now)?;
@@ -283,10 +297,10 @@ impl Device {
         match (ticket.purpose, fresh) {
             (Purpose::Connect, Some(hash)) => {
                 self.end(scope)?;
-                self.working = Some(Session::new(new_id, hash, now));
+                self.working = Some(Session::new(new_id, hash, proven));
             }
-            (Purpose::Again(_), Some(hash)) => self.waiting = Some(Session::new(new_id, hash, now)),
-            (Purpose::Delete(hash), None) => self.use_session(&hash, now)?.delete_proven = Some(now),
+            (Purpose::Again(_), Some(hash)) => self.waiting = Some(Session::new(new_id, hash, proven)),
+            (Purpose::Delete(hash), None) => self.use_session(&hash, now)?.delete_proven = Some(proven),
             _ => return Err(Denied::WrongPurpose),
         }
         self.last_session = new_id;
@@ -398,7 +412,7 @@ impl Position {
     }
 }
 
-/// §9.2. the design does not say which MAC or byte layout. Use HMAC-SHA-256 with a
+/// §9.2 fixes the stamp encoding. Use HMAC-SHA-256 with a
 /// 32-byte random key. After a fixed domain, encode id, restore, life and change at fixed
 /// widths (big endian numbers), followed by all bytes of the exact UTF-8 account name.
 pub struct StampKey(Zeroizing<[u8; SECRET_BYTES]>);

@@ -106,7 +106,7 @@ fn two_proofs_finishing_together_only_grant_the_latest_begin() -> Result<(), Den
 }
 
 #[test]
-fn after_send_and_read_expire_only_proving_again_remains() -> Result<(), Denied> {
+fn after_send_and_read_expire_reproof_restores_them_and_delete_is_separate() -> Result<(), Denied> {
     let (mut d, mut s) = connected()?;
     for (access, limit) in [(Access::Read, READ_MS), (Access::Send, SEND_MS)] {
         let r = d.arrive(&mut s, &hash(1), access, false, limit - 1)?;
@@ -116,10 +116,7 @@ fn after_send_and_read_expire_only_proving_again_remains() -> Result<(), Denied>
             Some(Denied::ProveAgain)
         );
     }
-    assert_eq!(
-        d.begin(&mut s, Purpose::Delete(hash(1)), SEND_MS).err(),
-        Some(Denied::ProveAgain)
-    );
+    leave(&mut d, &mut s, 1, SEND_MS)?;
     again(&mut d, &mut s, 1, 2, SEND_MS)?;
     assert_eq!(
         d.arrive(&mut s, &hash(1), Access::Send, false, SEND_MS).err(),
@@ -293,7 +290,7 @@ fn a_restore_between_two_calls_ends_both_sessions_and_invalidates_the_first_call
 }
 
 #[test]
-fn a_write_or_grant_interrupted_between_stores_is_recovered_in_the_safe_direction() {
+fn store_order_and_startup_plans_distinguish_an_interrupted_ending_from_an_unrecognized_grant() {
     use Where::*;
     assert_eq!(Change::EndDevice.order(), [Apart, Data]);
     assert_eq!(Change::DeleteAccount.order(), [Apart, Data]);

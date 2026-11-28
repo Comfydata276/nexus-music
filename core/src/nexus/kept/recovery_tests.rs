@@ -52,6 +52,7 @@ impl Stored {
                 if let Some(update) = &effects.update {
                     self.last_family = update.family;
                     self.apart = update.apart_first.clone();
+                    assert_eq!(self.apart.scope, update.data.scope);
                     self.data = update.data.clone();
                     self.apart = update.apart_last.clone();
                 }
@@ -65,7 +66,7 @@ impl Stored {
 
     fn proof(&mut self, purpose: Purpose, fresh: Option<u8>, t: u64) -> Result<(), Denied> {
         let ticket = self.step(t, |turn| turn.begin(purpose))?;
-        self.step(t, |turn| turn.finish(ticket, "Alice", fresh.map(hash)))
+        self.step(t, |turn| turn.finish_fixture(ticket, "Alice", fresh.map(hash)))
     }
 
     fn send(&mut self, bearer: u8, t: u64) -> Result<Request, Denied> {
@@ -83,7 +84,7 @@ fn an_ending_is_persisted_even_when_the_call_that_discovered_it_is_refused() -> 
         let number = s.apart.scope.number;
         let refusal = if wrong_account {
             let t = s.step(2, |turn| turn.begin(Purpose::Again(hash(1))))?;
-            s.step(3, |turn| turn.finish(t, "Bob", Some(hash(3))))
+            s.step(3, |turn| turn.finish_fixture(t, "Bob", Some(hash(3))))
         } else {
             s.send(1, SESSION_MS).map(|_| ())
         };
@@ -134,7 +135,7 @@ fn a_crash_at_either_cut_of_a_mixed_replacement_keeps_neither_the_revoked_nor_un
             now: 3,
             high_water: s.mark,
         },
-        |turn| turn.finish(t, "Alice", Some(hash(3))),
+        |turn| turn.finish_fixture(t, "Alice", Some(hash(3))),
     );
     decision.apply(|effects| {
         let u = effects.update.as_ref().ok_or(Denied::NotSignedIn)?;
@@ -231,12 +232,12 @@ fn delete_proof_and_ending_in_either_order_cannot_leave_power_to_delete() -> Res
         s.proof(Purpose::Connect, Some(1), 0)?;
         let t = s.step(1, |turn| turn.begin(Purpose::Delete(hash(1))))?;
         if finish_first {
-            s.step(2, |turn| turn.finish(t, "Alice", None))?;
+            s.step(2, |turn| turn.finish_fixture(t, "Alice", None))?;
             s.step(2, |turn| turn.end())?;
         } else {
             s.step(2, |turn| turn.end())?;
             assert_eq!(
-                s.step(2, |turn| turn.finish(t, "Alice", None)),
+                s.step(2, |turn| turn.finish_fixture(t, "Alice", None)),
                 Err(Denied::NotSignedIn)
             );
         }
@@ -273,4 +274,83 @@ fn deleting_on_one_device_also_advances_the_sleeping_devices_number() -> Result<
         assert!(!may_refill(Some(other.life), next.life));
         Ok(())
     })?
+}
+
+#[test]
+fn a_crash_after_ending_o_leaves_n_waiting_under_the_old_family_deadline() -> Result<(), Denied> {
+    let mut s = Stored::new();
+    s.proof(Purpose::Connect, Some(1), 0)?;
+    s.proof(Purpose::Again(hash(1)), Some(2), SESSION_MS - 2)?;
+    let call = s.device.decide(
+        &s.apart.scope,
+        Clock {
+            now: SESSION_MS - 1,
+            high_water: s.mark,
+        },
+        |t| t.arrive(&hash(2), Access::Read, false),
+    );
+    call.apply(|effects| {
+        let u = effects.update.as_ref().ok_or(Denied::NotSignedIn)?;
+        for (at, result) in [(SESSION_MS - 1, None), (SESSION_MS, Some(Denied::NotSignedIn))] {
+            let mut recovered = Device::load(&u.apart_first, &s.data);
+            let mut scope = s.apart.scope.clone();
+            assert_eq!(
+                recovered
+                    .arrive(&mut scope, &hash(1), Access::Read, false, at)
+                    .err(),
+                Some(Denied::NotSignedIn)
+            );
+            assert_eq!(
+                recovered
+                    .arrive(&mut scope, &hash(2), Access::Read, false, at)
+                    .err(),
+                result
+            );
+        }
+        Ok(())
+    })??;
+    Ok(())
+}
+
+#[test]
+fn reauthentication_still_cannot_fetch_from_a_cursor_under_the_old_restore() -> Result<(), Denied> {
+    let mut s = Stored::new();
+    s.proof(Purpose::Connect, Some(1), 0)?;
+    let old_restore = s.apart.scope.restore;
+    s.step(1, |t| t.restore_device(old_restore + 1))?;
+    assert_eq!(s.send(1, 1).err(), Some(Denied::NotSignedIn));
+    s.proof(Purpose::Connect, Some(2), 2)?;
+    let cursor = 31_u64;
+    let read = s.device.request(
+        &s.apart.scope,
+        old_restore,
+        Clock {
+            now: 3,
+            high_water: s.mark,
+        },
+        |turn| turn.arrive(&hash(2), Access::Read, false).map(|_| cursor),
+    );
+    assert_eq!(
+        read.apply(|e| {
+            s.mark = e.high_water;
+            Ok(())
+        })?,
+        Err(Denied::StartAgain)
+    );
+    Ok(())
+}
+
+#[test]
+fn an_expired_send_can_still_prove_to_delete_until_the_hard_session_end() -> Result<(), Denied> {
+    let mut s = Stored::new();
+    s.proof(Purpose::Connect, Some(1), 0)?;
+    s.proof(Purpose::Delete(hash(1)), None, SESSION_MS - 1)?;
+    assert_eq!(
+        s.step(SESSION_MS, |turn| turn.delete(&hash(1))),
+        Err(Denied::NotSignedIn)
+    );
+    let mut s = Stored::new();
+    s.proof(Purpose::Connect, Some(1), 0)?;
+    s.proof(Purpose::Delete(hash(1)), None, SEND_MS + 1)?;
+    s.step(SEND_MS + 2, |turn| turn.delete(&hash(1)))
 }

@@ -39,6 +39,8 @@ pub struct Permit {
 pub struct Apart {
     pub scope: Scope,
     pub last_session: u64,
+    /// The original family deadline survives a crash while N is taking O's place.
+    pub family_proven: Option<u64>,
     pub working: Option<Permit>,
     pub waiting: Option<Permit>,
 }
@@ -66,6 +68,7 @@ impl Apart {
         Self {
             scope: after.scope.clone(),
             last_session: after.last_session,
+            family_proven: self.family_proven.filter(|_| self.scope == after.scope),
             working: self.working.and_then(retain),
             waiting: self.waiting.and_then(retain),
         }
@@ -93,6 +96,16 @@ pub struct Update {
     pub apart_last: Apart,
 }
 
+/// A separate, empty device row for a verified switch. Insert it under the new
+/// account in the data transaction, with no sessions, leave or fetch cursor. S3
+/// allocates the vacant destination by secret, under its serialization lock.
+#[derive(Debug)]
+pub struct NewDevice {
+    pub scope: Scope,
+    pub device_hash: Fingerprint,
+    pub description: crate::nexus::prove::Description,
+}
+
 /// Order: atomically persist high_water, family fences and apart_first in the apart
 /// store; install data in a data transaction; finally recognize new grants apart.
 /// Recovery at either cut uses Device::load. Publish no response on a storage error.
@@ -101,6 +114,7 @@ pub struct Update {
 pub struct Effects {
     pub high_water: u64,
     pub update: Option<Update>,
+    pub new_device: Option<NewDevice>,
 }
 
 #[must_use = "apply the durable effects even when the device's request was refused"]
@@ -139,8 +153,11 @@ impl Device {
         let mut device = Self::new(&apart.scope);
         device.last_session = apart.last_session;
         device.working = apart.working.and_then(recover);
-        if device.working.is_some() && apart.waiting.map(|p| p.id) != apart.working.map(|p| p.id) {
+        if apart.family_proven.is_some() && apart.waiting.map(|p| p.id) != apart.working.map(|p| p.id) {
             device.waiting = apart.waiting.and_then(recover);
+            if device.working.is_none() && device.waiting.is_some() {
+                device.interrupted_promotion = apart.family_proven;
+            }
         }
         device
     }
@@ -161,9 +178,32 @@ impl Device {
         Apart {
             scope: self.recorded.clone(),
             last_session: self.last_session,
+            family_proven: self
+                .working
+                .as_ref()
+                .map(|s| s.proven)
+                .or(self.interrupted_promotion),
             working: self.working.as_ref().map(permit),
             waiting: self.waiting.as_ref().map(permit),
         }
+    }
+
+    /// §9.2. The entry for every device request. Check the restore it actually named
+    /// before applying any part of the request, including a fetch under a new bearer.
+    pub fn request<T>(
+        &mut self,
+        authority: &Scope,
+        received_restore: u64,
+        clock: Clock,
+        action: impl FnOnce(Turn<'_>) -> Result<T, Denied>,
+    ) -> Decision<Result<T, Denied>> {
+        self.decide(authority, clock, |turn| {
+            if received_restore != turn.scope().restore {
+                Err(Denied::StartAgain)
+            } else {
+                action(turn)
+            }
+        })
     }
 
     /// The one entry to a serialized decision. A Turn is consumed by its operation. If
@@ -177,7 +217,9 @@ impl Device {
         let before = self.apart();
         let mut scope = authority.clone();
         let now = clock.effective();
+        let mut new_device = None;
         let answer = action(Turn {
+            new_device: &mut new_device,
             device: self,
             scope: &mut scope,
             now,
@@ -204,6 +246,7 @@ impl Device {
         Decision {
             effects: Effects {
                 high_water: now,
+                new_device,
                 update,
             },
             answer,
@@ -215,6 +258,7 @@ impl Device {
 /// C4 proof. The authenticated name must be the name the device asked to prove, including
 /// for an account change. An unexpected getUser answer alone never ends a device.
 pub struct Turn<'a> {
+    new_device: &'a mut Option<NewDevice>,
     device: &'a mut Device,
     scope: &'a mut Scope,
     now: u64,
@@ -244,14 +288,46 @@ impl Turn<'_> {
             Err(Denied::NotSignedIn)
         }
     }
+    /// Only a receipt from the completed exchange can grant power. Supply the current
+    /// destination scope from the apart store; for a changed account it must still be
+    /// the vacant row allocated at begin. A change ends A and creates B empty even
+    /// though this request under A is answered NotSignedIn (§7.5, §7.7).
     pub fn finish(
         self,
-        ticket: Try,
-        authenticated: &str,
+        receipt: crate::nexus::prove::Receipt,
+        current_target: &Scope,
         fresh: Option<Fingerprint>,
     ) -> Result<(), Denied> {
+        self.device.expire(self.scope, self.now)?;
+        if !within(receipt.made(), self.now, crate::nexus::prove::RECEIPT_MS)
+            || !self.device.current_try(self.scope, receipt.ticket_ref())
+            || receipt.target() != current_target
+        {
+            return Err(Denied::NotSignedIn);
+        }
+        let proven = receipt.made();
+        let (ticket, target, device_hash, description) = receipt.into_parts();
+        if target.account != self.scope.account {
+            self.device.end(self.scope)?;
+            *self.new_device = Some(NewDevice {
+                scope: target,
+                device_hash,
+                description,
+            });
+            return Err(Denied::NotSignedIn);
+        }
         self.device
-            .finish(self.scope, ticket, authenticated, fresh, self.now)
+            .finish_at(self.scope, ticket, &target.account, fresh, proven, self.now)
+    }
+
+    #[cfg(test)]
+    pub(super) fn finish_fixture(
+        self,
+        ticket: Try,
+        name: &str,
+        fresh: Option<Fingerprint>,
+    ) -> Result<(), Denied> {
+        self.device.finish(self.scope, ticket, name, fresh, self.now)
     }
     pub fn arrive(self, session: &Fingerprint, action: Access, held: bool) -> Result<Request, Denied> {
         self.device.arrive(self.scope, session, action, held, self.now)
