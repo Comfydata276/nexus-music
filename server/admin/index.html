@@ -232,7 +232,7 @@ dd, li { overflow-wrap: anywhere; }
               <dl><dt>Lidarr address</dt><dd id="lidarr-address"></dd></dl>
               <p id="lidarr-key-status"></p>
               <details id="lidarr-details">
-                <summary>Set up Lidarr</summary>
+                <summary id="lidarr-setup-label">Set up Lidarr</summary>
                 <form id="lidarr-form" method="post" autocomplete="off">
                   <label>Lidarr key <input id="lidarr-key" type="password" autocomplete="new-password" maxlength="512" required></label>
                   <button type="submit">Review Lidarr key</button>
@@ -404,6 +404,7 @@ dd, li { overflow-wrap: anywhere; }
   let musicAddress = null;
   let diagnosticsEnabled = null;
   let lidarrAddress = null;
+  let uncheckedLidarrAddress = null;
   let loginAccount = null;
   let draft = null;
   let changing = false;
@@ -1346,6 +1347,14 @@ dd, li { overflow-wrap: anywhere; }
       { saved: "The music sign-in works.", refresh: "accounts" });
   });
 
+  function showLidarrKeyStatus(configured) {
+    const unchecked = configured && lidarrAddress !== null && lidarrAddress === uncheckedLidarrAddress;
+    writeText(byId("lidarr-key-status"), !lidarrAddress ? "" :
+      unchecked ? "Lidarr key is saved but hasn’t been checked." :
+      configured ? "Lidarr key is set." : "Lidarr key is not set.");
+    writeText(byId("lidarr-setup-label"), unchecked ? "Set the Lidarr key again to check it" : "Set up Lidarr");
+  }
+
   async function loadLidarr(current) {
     try {
       const result = await readAdmin(current, "/nexus/api/admin/lidarr", {}, 4096);
@@ -1353,11 +1362,11 @@ dd, li { overflow-wrap: anywhere; }
       if (typeof result.configured !== "boolean" ||
           (result.address !== null && typeof result.address !== "string")) throw new Error();
       lidarrAddress = result.address;
+      if (!result.configured || lidarrAddress !== uncheckedLidarrAddress) uncheckedLidarrAddress = null;
       lidarrSettings.hidden = !lidarrAddress;
       requestsAvailability.hidden = Boolean(lidarrAddress);
       writeText(byId("lidarr-address"), lidarrAddress ?? "");
-      writeText(byId("lidarr-key-status"), !lidarrAddress ? "" :
-        result.configured ? "Lidarr key is set." : "Lidarr key is not set.");
+      showLidarrKeyStatus(result.configured);
       if (!lidarrAddress) {
         lidarrDetails.open = false;
         lidarrForm.reset();
@@ -1371,7 +1380,7 @@ dd, li { overflow-wrap: anywhere; }
       lidarrForm.reset();
       requestsAvailability.hidden = false;
       writeText(byId("lidarr-address"), "");
-      writeText(byId("lidarr-key-status"), "");
+      showLidarrKeyStatus(false);
       writeText(requestsAvailability, "Could not load Lidarr settings. Sign out and back in to try again.");
     }
   }
@@ -1442,10 +1451,11 @@ dd, li { overflow-wrap: anywhere; }
   requestHistoryPage.more.addEventListener("click", loadRequestHistory);
 
   function lidarrKeySaved({ check }) {
-    if (check === "works") return "The Lidarr key works and is set.";
-    if (check === "unreachable") return "Lidarr could not be reached. The key was saved without a check.";
-    if (check === undefined) return "Lidarr key saved.";
-    throw new Error();
+    if (check !== "works" && check !== "unreachable") throw new Error();
+    uncheckedLidarrAddress = check === "unreachable" ? lidarrAddress : null;
+    showLidarrKeyStatus(true);
+    return check === "works" ? "The Lidarr key works and is set." :
+      "Nexus saved the key without checking it because Lidarr could not be reached.";
   }
 
   lidarrForm.addEventListener("submit", event => {
@@ -1509,9 +1519,10 @@ dd, li { overflow-wrap: anywhere; }
     musicAddress = null;
     diagnosticsEnabled = null;
     lidarrAddress = null;
+    uncheckedLidarrAddress = null;
     writeText(requestsAvailability, "");
     writeText(byId("lidarr-address"), "");
-    writeText(byId("lidarr-key-status"), "");
+    showLidarrKeyStatus(false);
     addressForm.hidden = true;
     diagnosticsToggle.hidden = true;
     requests.replaceChildren();

@@ -337,7 +337,10 @@ function adminStandIn() {
     if (action === "set_account_enabled") enabled = data.change.enabled;
     if (action === "set_requests_enabled") canRequest = data.change.enabled;
     if (action === "set_admin") isAdmin = data.change.admin;
-    if (action === "set_lidarr") lidarrConfigured = true;
+    if (action === "set_lidarr") {
+      lidarrConfigured = true;
+      return done({ check: "works" });
+    }
     if (action === "set_music_server") publicAddress = data.change.public;
     if (action === "set_diagnostics_default") diagnostics = data.change.enabled;
     if (action === "force_out") hasSession = false;
@@ -715,17 +718,21 @@ test("Lidarr key setup distinguishes a refusal from both successful saves", asyn
   });
   await page.signIn("owner@example.test", adminPassword);
   await settle();
-  for (const [outcome, message, configured] of [
-    ["refused", "Lidarr refused that key. Check it and try again.", false],
-    ["unreachable", "Lidarr could not be reached. The key was saved without a check.", true],
-    ["works", "The Lidarr key works and is set.", true],
+  for (const [outcome, message, rowStatus] of [
+    ["works", "The Lidarr key works and is set.", "Lidarr key is set."],
+    ["refused", "Lidarr refused that key. Check it and try again.", "Lidarr key is set."],
+    ["unreachable", "Nexus saved the key without checking it because Lidarr could not be reached.",
+      "Lidarr key is saved but hasn’t been checked."],
+    ["works", "The Lidarr key works and is set.", "Lidarr key is set."],
   ]) {
     check = outcome;
     page.submit("lidarr-form", { "lidarr-key": lidarrKey });
     await page.submit("grant-form", { "grant-password": adminPassword });
     await settle();
     assert.equal(page.from("lidarr-key").value, "");
-    assert.equal(page.from("lidarr-key-status").textContent, configured ? "Lidarr key is set." : "Lidarr key is not set.");
+    assert.equal(page.from("lidarr-key-status").textContent, rowStatus);
+    assert.equal(page.from("lidarr-setup-label").textContent, outcome === "unreachable" ?
+      "Set the Lidarr key again to check it" : "Set up Lidarr");
     assert.equal(page.from("change-status").textContent, message);
   }
 });
