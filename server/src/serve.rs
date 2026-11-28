@@ -139,7 +139,11 @@ pub struct Shell {
 impl Shell {
     /// The backend's own: [`router`] and [`head::ROUTES`].
     pub fn new(proxy: IpAddr, hello: &Hello) -> Arc<Self> {
-        Self::with_routes(proxy, router(hello), head::ROUTES.to_vec())
+        Self::new_with_public_origin(proxy, hello, None)
+    }
+
+    pub fn new_with_public_origin(proxy: IpAddr, hello: &Hello, public_origin: Option<&str>) -> Arc<Self> {
+        Self::with_routes(proxy, router_with_public_origin(hello, public_origin), head::ROUTES.to_vec())
     }
 
     /// With other routes (the tests add some): `routes` names each path `router` answers, and
@@ -178,6 +182,11 @@ impl Shell {
 /// What answers, once a request is through every bound. Every other path and
 /// method was refused before this ([`head::ROUTES`]).
 pub fn router(hello: &Hello) -> Router {
+    router_with_public_origin(hello, None)
+}
+
+fn router_with_public_origin(hello: &Hello, public_origin: Option<&str>) -> Router {
+    let public_origin = public_origin.map(Arc::<str>::from);
     let body = Bytes::from(hello.to_json());
     Router::new()
         .route(
@@ -188,18 +197,34 @@ pub fn router(hello: &Hello) -> Router {
             }),
         )
         .route(crate::admin::PAGE, get(crate::admin::document))
-        .route(crate::admin::SIGN_IN, axum::routing::post(crate::admin::signin))
+        .route(crate::admin::SIGN_IN, axum::routing::post(move |headers| {
+            let public_origin = public_origin.clone();
+            async move { crate::admin::signin(headers, public_origin.as_deref()) }
+        }))
         .fallback(|| async { StatusCode::NOT_FOUND })
 }
 
 /// A bare answer: a status, nothing else said, no body, and the connection closed.
 pub fn bare(status: StatusCode) -> Vec<u8> {
-    format!(
-        "HTTP/1.1 {} {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    bare_response(status, false)
+}
+
+pub(crate) fn bare_response(status: StatusCode, admin_path: bool) -> Vec<u8> {
+    let mut response = format!(
+        "HTTP/1.1 {} {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nContent-Length: 0\r\nConnection: close\r\n",
         status.as_str(),
         status.canonical_reason().unwrap_or("")
-    )
-    .into_bytes()
+    );
+    if admin_path {
+        for (name, value) in crate::admin::PAGE_HEADERS {
+            response.push_str(name);
+            response.push_str(": ");
+            response.push_str(value);
+            response.push_str("\r\n");
+        }
+    }
+    response.push_str("\r\n");
+    response.into_bytes()
 }
 
 /// What the proxy is answered for everything that fails before or at the gate: a bad, large
@@ -281,7 +306,7 @@ pub async fn serve(listener: TcpListener, shell: Arc<Shell>, log: bool) {
                 tokio::spawn(async move {
                     let _room = roomed;
                     let _open = Open::new(&shell);
-                    answer_bare(Guarded::new(stream, shell.clone()), GATE).await;
+                    answer_bare(Guarded::new(stream, shell.clone()), GATE, false).await;
                 });
             }
         }
@@ -300,7 +325,7 @@ async fn connection(mut stream: Guarded, peer: Peer, deadline: tokio::time::Inst
         Err(NoHead::Closed) => return,
         Err(why) => {
             if refused(if why == NoHead::Late { Refusal::SlowHead } else { Refusal::BadHead }) {
-                answer_bare(stream, GATE).await;
+                answer_bare(stream, GATE, false).await;
             }
             return;
         }
@@ -308,17 +333,29 @@ async fn connection(mut stream: Guarded, peer: Peer, deadline: tokio::time::Inst
     match head::judge(peer, &head, &shell.routes) {
         Verdict::Unanswered(kind) => {
             if refused(kind) {
-                answer_bare(stream, GATE).await;
+                answer_bare(stream, GATE, false).await;
             }
         }
         Verdict::Refused(status, kind) => {
             shell.count(kind);
-            answer_bare(stream, status).await;
+            answer_bare(stream, status, head.target.starts_with(crate::admin::PAGE)).await;
         }
         Verdict::Serve(length) => {
             let service = {
                 let shell = shell.clone();
-                hyper::service::service_fn(move |request| answer(request, length, shell.clone()))
+                let admin_path = head.target.starts_with(crate::admin::PAGE);
+                hyper::service::service_fn(move |request| {
+                    let shell = shell.clone();
+                    async move {
+                        let mut response = answer(request, length, shell).await?;
+                        if admin_path {
+                            for (name, value) in crate::admin::PAGE_HEADERS {
+                                response.headers_mut().insert(name, HeaderValue::from_static(value));
+                            }
+                        }
+                        Ok::<_, Infallible>(response)
+                    }
+                })
             };
             let mut http = http1::Builder::new();
             http.timer(TokioTimer::new())
@@ -338,8 +375,8 @@ async fn connection(mut stream: Guarded, peer: Peer, deadline: tokio::time::Inst
 
 /// Writes a bare answer, and then discards whatever more comes, for a moment and up to a
 /// bound, so that closing does not reset the connection under the answer.
-async fn answer_bare(mut stream: Guarded, status: StatusCode) {
-    if stream.write_all(&bare(status)).await.is_err() || stream.shutdown().await.is_err() {
+async fn answer_bare(mut stream: Guarded, status: StatusCode, admin_path: bool) {
+    if stream.write_all(&bare_response(status, admin_path)).await.is_err() || stream.shutdown().await.is_err() {
         return;
     }
     let _ = tokio::time::timeout(LINGER_DEADLINE, async {

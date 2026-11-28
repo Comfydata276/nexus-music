@@ -259,7 +259,7 @@ article p, aside p { color: var(--muted); }
     } catch {
       if (!request.signal.aborted) writeText(status, "The Nexus server could not sign you in.");
     } finally {
-      password.value = "";
+      form.reset();
       pending = null;
       submit.disabled = false;
     }

@@ -86,6 +86,7 @@ test("submit calls the sign-in route and shows the bare 501 as not built", async
   await page.signIn("sample@example.test", "example admin password");
   assert.equal(page.from("status").textContent, "Sign-in has not been built yet.");
   assert.equal(page.from("password").value, "");
+  assert.equal(page.from("email").value, "");
   assert.equal(page.from("admin").hidden, true);
 });
 
