@@ -328,7 +328,9 @@ fn commit(ui: &ui::MainWindow, generation: u64, account: &str, outcome: Outcome)
         return;
     }
     let settings = ui.global::<ui::Settings>();
-    let url = RUNNING.with(|running| running.borrow().as_ref().and_then(|running| running.url.clone())).unwrap_or_default();
+    // The address the answer was asked at: that of the account it was for.
+    let (server, name) = account.split_once('\n').unwrap_or_default();
+    let url = signin::backend_for(server, name).and_then(|backend| proto::hello_url(&backend)).unwrap_or_default();
     settings.set_nexus_server(words(outcome, &url).into());
     // (With the fault above, the late answer is put under the account published now.)
     settings.set_nexus_for(if sabotaged { published(ui) } else { account.to_string() }.into());
