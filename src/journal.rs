@@ -8,7 +8,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use nexus_core::nexus::{
-    client::Saved, events::{self, DeviceKind, EventId, Kind, LossCounts}, proto::BackendId,
+    account::AccountId,
+    client::{Happened, JournalAccount, JournalDo, Saved}, events::{self, DeviceKind, EventId, Kind, LossCounts}, proto::BackendId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -103,13 +104,10 @@ pub(crate) fn install(root: PathBuf) {
 pub(crate) fn publish_account(saved: Option<&Saved>) {
     let scope = saved
         .filter(|saved| saved.session.is_some() && saved.notice.is_none())
-        .and_then(|saved| Some(Scope {
-            account: Account {
-                backend: *BackendId::from_hex(&saved.backend_id)?.as_bytes(),
-                number: saved.account.get(),
-            },
-            life: saved.life,
-        }));
+        .and_then(|saved| Some(Scope::new(JournalAccount {
+            backend_id: BackendId::from_hex(&saved.backend_id)?,
+            account: saved.account,
+        }, saved.life)));
     publish(scope);
 }
 
@@ -134,6 +132,77 @@ fn publish(scope: Option<Scope>) {
             Some(Kind::Open { version, device: DeviceKind::Pc })
         });
     }
+}
+
+impl Scope {
+    fn new(account: JournalAccount, life: u64) -> Self {
+        Self {
+            account: Account {
+                backend: *account.backend_id.as_bytes(),
+                number: account.account.get(),
+            },
+            life,
+        }
+    }
+
+    fn owner(self) -> Option<JournalAccount> {
+        Some(JournalAccount {
+            backend_id: BackendId::from_bytes(self.account.backend),
+            account: AccountId::new(self.account.number)?,
+        })
+    }
+}
+
+/// The C10 machine's journal effects, on its adapter's window-thread turn.
+/// W6 answers the Diagnostics read. The transport remains with the adapter.
+#[allow(dead_code)] // The live caller belongs to W7 and the sending slice.
+pub(crate) fn handle_client(
+    command: JournalDo,
+    happened: impl FnOnce(Happened) + Send + 'static,
+) -> Result<(), JournalDo> {
+    use reader::Update;
+    use writer::Settlement;
+    let update = match command {
+        JournalDo::ReadEvents { read, account, life, from_sequence, max_events, max_bytes } => {
+            let scope = Scope::new(account, life);
+            let answered = move |events| happened(Happened::EventsRead { read, account, life, events });
+            if let Some(service) = SERVICE.get().filter(|_| SCOPE.get() == Some(scope)) {
+                let request = reader::Read {
+                    scope, from: from_sequence, max_events, max_bytes, answered: Box::new(answered),
+                };
+                if let Err(TrySendError::Full(request) | TrySendError::Disconnected(request)) =
+                    service.read.try_send(request)
+                {
+                    (request.answered)(Vec::new());
+                }
+            } else {
+                answered(Vec::new());
+            }
+            return Ok(());
+        }
+        JournalDo::ReadDiagnostics { .. } => return Err(command),
+        JournalDo::Taken { account, life, ids, at_ms } =>
+            Update::Settle(Scope::new(account, life), ids, Settlement::Taken(at_ms)),
+        JournalDo::Refused { account, life, ids } =>
+            Update::Settle(Scope::new(account, life), ids, Settlement::Refused(now_ms())),
+        JournalDo::LifeMoved { account, life } => Update::LifeMoved(Scope::new(account, life)),
+        JournalDo::ResendAll { backend_id } => Update::ResendAll(*backend_id.as_bytes()),
+    };
+    if let Some(service) = SERVICE.get() {
+        let _ = service.update.send(update);
+    }
+    Ok(())
+}
+
+/// The client adapter drains this outside playback. The writer coalesces notices and
+/// publishes only immutable counts. A previous sign-in's notice cannot start a round.
+#[allow(dead_code)] // The live caller belongs to W7 and the sending slice.
+pub(crate) fn take_waiting() -> Option<Happened> {
+    let scope = SCOPE.get()?;
+    let waiting = SERVICE.get()?.waiting.try_lock().ok()?.take()?;
+    (waiting.scope == scope).then_some(Happened::EventsWaiting {
+        account: scope.owner()?, life: scope.life, pending: waiting.pending, from_sequence: waiting.from,
+    })
 }
 
 pub(crate) fn finish() {
