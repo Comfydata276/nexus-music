@@ -24,8 +24,12 @@ use super::*;
 /// The sending half's events, between `start` and `stop`.
 #[derive(Default)]
 pub(super) struct Sending {
-    /// The journal's latest summary, for whichever account it named.
+    /// The journal's latest summary for the account signed in and its life; one for any
+    /// other is ignored entirely.
     waiting: Option<Waiting>,
+    /// A summary came while a read was out: an empty read then reads once more, so that a
+    /// flush after the read's snapshot is not lost.
+    fresh: bool,
     /// A round under way: the sequence the next read starts from.
     round: Option<u64>,
     /// The read waited for, by its number.
@@ -94,6 +98,7 @@ impl Sending {
         self.reading = None;
         self.held = None;
         self.held_now = false;
+        self.fresh = false;
     }
 
     /// The answer being dealt with is done: a hold it made may be lifted from now.
@@ -163,6 +168,7 @@ impl Client {
         let Some(live) = self.live.as_mut() else { return };
         live.sending.round = Some(from_sequence);
         live.sending.reading = Some(read);
+        live.sending.fresh = false;
         out.push(Do::Journal(JournalDo::ReadEvents {
             read,
             account,
@@ -194,9 +200,11 @@ impl Client {
         }
     }
 
-    fn hold(&mut self, seconds: Option<u64>, given: &Given) {
+    /// Holds sending after a batch of this account and life. The baseline is that scope's
+    /// own summary (it is the only one kept); with none, only reachability lifts it.
+    fn hold(&mut self, scope: (JournalAccount, u64), seconds: Option<u64>, given: &Given) {
         let Some(live) = self.live.as_mut() else { return };
-        let pending = live.sending.waiting.map_or(0, |waiting| waiting.pending);
+        let pending = live.sending.waiting.filter(|waiting| (waiting.account, waiting.life) == scope).map_or(u64::MAX, |waiting| waiting.pending);
         let until_ms = seconds.map(|seconds| given.now_ms.saturating_add(seconds.saturating_mul(1000)));
         live.sending.round = None;
         live.sending.held = Some(Held { pending, until_ms });
@@ -205,7 +213,15 @@ impl Client {
 
     pub(super) fn events_waiting(&mut self, account: JournalAccount, life: u64, pending: u64, from_sequence: u64, given: &Given, out: &mut Vec<Do>) {
         let Some(live) = self.live.as_mut() else { return };
+        // Another account's, or another life's: ignored entirely. It sets no baseline and
+        // lifts no hold.
+        if live.journal() != Some((account, life)) {
+            return;
+        }
         live.sending.waiting = Some(Waiting { account, life, pending, from_sequence });
+        if live.sending.reading.is_some() {
+            live.sending.fresh = true;
+        }
         self.lift_hold(None, given);
         self.events_due(out);
     }
@@ -218,10 +234,19 @@ impl Client {
             return;
         }
         live.sending.reading = None;
+        let fresh = std::mem::take(&mut live.sending.fresh);
+        let cursor = live.sending.round;
         let ours = live.journal() == Some((account, life));
         if !ours || found.is_empty() || !self.may_send() {
             if let Some(live) = self.live.as_mut() {
                 live.sending.round = None;
+            }
+            // A flush was reported after this read's snapshot: read once more, from the same
+            // place. Once: a second empty read with nothing new ends the round.
+            if ours && found.is_empty() && fresh && self.may_send()
+                && let Some(from) = cursor
+            {
+                self.read_events(account, life, from, out);
             }
             return;
         }
@@ -243,6 +268,8 @@ impl Client {
     /// call (another backend, the session ended, the data put back, a moved life) is dealt
     /// with first; a life that moved applies none of the outcomes.
     pub(super) fn answered_events(&mut self, account: JournalAccount, batch: events::Batch, status: u16, bytes: &[u8], given: &Given, out: &mut Vec<Do>) {
+        let scope = (account, batch.life());
+        let before = self.live.as_ref().map(|live| live.reach);
         let shared = outcome(account::read_reply::<events::BatchAnswer>(status, bytes));
         let Some(shared) = self.common(shared, given, out) else {
             if let Some(live) = self.live.as_mut() {
@@ -250,10 +277,30 @@ impl Client {
             }
             return;
         };
+        // The answer itself moved the life on: it is retired (in `absorb`); nothing of it is
+        // applied and it makes no hold.
+        if self.live.as_ref().and_then(Live::journal) != Some(scope) {
+            return;
+        }
         match shared {
             Outcome::Done(..) => {}
-            Outcome::Refused(Why::Busy { seconds }, _) => return self.hold(seconds, given),
-            Outcome::Refused(..) | Outcome::Nothing => return self.hold(None, given),
+            Outcome::Refused(why, seen) => {
+                // A refusal of the whole call, stamped or not, is the backend answering: it
+                // holds as "busy" does, and is not "down".
+                if seen.is_none() {
+                    if matches!(before, Some(Reach::Down { .. })) {
+                        self.reached();
+                    } else if let Some(live) = self.live.as_mut() {
+                        live.reach = Reach::Up;
+                    }
+                }
+                let seconds = match why {
+                    Why::Busy { seconds } => seconds,
+                    _ => None,
+                };
+                return self.hold(scope, seconds, given);
+            }
+            Outcome::Nothing => return self.hold(scope, None, given),
         }
         let answer = match events::read_reply(status, bytes, &batch) {
             Ok(Reply::Done { result, .. }) => result,
@@ -265,7 +312,7 @@ impl Client {
                 }
                 return;
             }
-            _ => return self.hold(None, given),
+            _ => return self.hold(scope, None, given),
         };
         let mut taken = Vec::new();
         let mut refused = Vec::new();
@@ -287,7 +334,7 @@ impl Client {
         }
         if !progress {
             // Nothing taken and nothing refused: the backend is full (13.4). Wait.
-            return self.hold(None, given);
+            return self.hold(scope, None, given);
         }
         // More may wait: read on from after what was sent, in this same round.
         let next = batch.events().iter().map(Placed::sequence).max().unwrap_or(0).saturating_add(1);
@@ -298,18 +345,51 @@ impl Client {
         }
     }
 
-    pub(super) fn failed_events(&mut self, given: &Given) {
+    pub(super) fn failed_events(&mut self, scope: (JournalAccount, u64), given: &Given) {
         self.unreached(given);
-        self.hold(None, given);
+        self.hold(scope, None, given);
         if let Some(live) = self.live.as_mut() {
             // A failure is not an answer: nothing settles after it to lift this.
             live.sending.held_now = false;
         }
     }
 
+    /// The account's life moved on to `life`: every read, round, hold and batch of an
+    /// earlier life is retired at once, so that nothing of it is posted (its batch fails
+    /// `waits_for`, its answers and reads are dropped) and the new life's events go at the
+    /// next thing that changes.
+    pub(super) fn retire_life(&mut self, life: u64) {
+        let Some(live) = self.live.as_mut() else { return };
+        live.flight.retain(|flight| !matches!(&flight.what, Purpose::Events { batch, .. } if batch.life() < life));
+        live.sending.reset();
+        if live.sending.waiting.is_some_and(|waiting| waiting.life < life) {
+            live.sending.waiting = None;
+        }
+    }
+
     // -----------------------------------------------------------------------------------
     // Diagnostics
     // -----------------------------------------------------------------------------------
+
+    /// The effective switch now: the person's choice, else the default this run's `hello`
+    /// said at the active address. Not known is off.
+    fn diagnostics_on(&self) -> bool {
+        let Some(live) = self.live.as_ref() else { return false };
+        let Some(saved) = live.saved.as_ref() else { return false };
+        self.default_at(&saved.nexus).is_some_and(|default| diag::enabled(live.diagnostics.choice, default))
+    }
+
+    /// Once the switch is off, nothing of Diagnostics leaves: a read out is dropped when it
+    /// answers, and an upload queued fails `waits_for`. The attempt stays spent.
+    pub(super) fn fence_diagnostics(&mut self) {
+        if self.diagnostics_on() {
+            return;
+        }
+        if let Some(live) = self.live.as_mut() {
+            live.diagnostics.reading = None;
+            live.flight.retain(|flight| !matches!(flight.what, Purpose::Diagnostics));
+        }
+    }
 
     /// On a tick: an attempt, if C6's schedule says one is due. The schedule is kept before
     /// anything is read or sent (C6: recorded before the I/O).
@@ -346,7 +426,7 @@ impl Client {
             return;
         }
         live.diagnostics.reading = None;
-        if !self.may_send() {
+        if !self.may_send() || !self.diagnostics_on() {
             return;
         }
         let Some(report) = text.and_then(|text| diag::Report::read(&text).ok()) else { return };
@@ -376,6 +456,7 @@ impl Client {
         if let Some(live) = self.live.as_mut() {
             live.diagnostics.choice = choice;
         }
+        self.fence_diagnostics();
     }
 
     pub(super) fn in_use(&mut self, on: bool) {

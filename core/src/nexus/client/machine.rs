@@ -614,7 +614,7 @@ impl Client {
     /// The backend answered as the backend: it can be reached, and it is not one the phone
     /// lacks the permission for. If it could not be reached before, what was owed is asked
     /// when the answer's own part is done ([`Client::settle`]).
-    fn reached(&mut self) {
+    pub(super) fn reached(&mut self) {
         let Some(live) = self.live.as_mut() else { return };
         if matches!(live.reach, Reach::Down { .. }) {
             live.restored = true;
@@ -715,8 +715,14 @@ impl Client {
         if moved && let Some(backend_id) = BackendId::from_hex(&saved.backend_id) {
             out.push(Do::Journal(JournalDo::LifeMoved { account: JournalAccount { backend_id, account: saved.account }, life }));
         }
+
         if seen.music_count > live.music_seen {
             live.renewal.announced = Some(live.renewal.announced.map_or(seen.music_count, |announced| announced.max(seen.music_count)));
+        }
+        // Everything read, queued or held under the earlier life is retired at once: nothing
+        // of a deleted life is posted once the machine knows the life moved.
+        if moved {
+            self.retire_life(life);
         }
         true
     }
@@ -810,11 +816,18 @@ impl Client {
         let backend_id = backend.to_hex();
         let Some(live) = self.live.as_mut() else { return };
         let Some(note) = live.notes.iter().find(|note| note.key() == (backend_id.as_str(), session)) else { return };
+        let put_back = matches!(outcome, Outcome::Refused(Why::DataPutBack, _));
         let settled = match outcome {
             Outcome::Done(_, seen) => seen.backend == backend,
             Outcome::Refused(Why::SessionEnded | Why::DataPutBack, _) => true,
             _ => false,
         };
+        // 13.3: the note's answer may be the only one to say the data was put back. Every
+        // event held for that backend is to be sent again, each under its own account; the
+        // account signed in now, and its session, are not touched.
+        if put_back {
+            out.push(Do::Journal(JournalDo::ResendAll { backend_id: backend }));
+        }
         if settled {
             out.push(Do::Forget(note.forget()));
             retire(live, &backend_id, session);
@@ -836,6 +849,7 @@ impl Client {
         };
         self.saw(&origin, hello.id);
         self.heard_default(&origin, hello.diagnostics_default());
+        self.fence_diagnostics();
         let Some(live) = self.live.as_mut() else { return };
         let ours = live.saved.as_ref().filter(|saved| saved.nexus == origin).map(|saved| BackendId::from_hex(&saved.backend_id) == Some(hello.id));
         if ours == Some(false) && live.signed_in() {
@@ -876,6 +890,7 @@ impl Client {
         let at = pending.origin.origin().to_string();
         self.saw(&at, hello.id);
         self.heard_default(&at, hello.diagnostics_default());
+        self.fence_diagnostics();
         let ours: Speaks = SPEAKS;
         if hello.speaks.low() > ours.high() {
             return self.set_form(SignInState::AppTooOld, 0);
@@ -1203,7 +1218,7 @@ impl Client {
             }
             // The note stays kept, and is told later.
             Purpose::Tell { .. } => {}
-            Purpose::Events { .. } => self.failed_events(given),
+            Purpose::Events { account, batch } => self.failed_events((account, batch.life()), given),
             // That attempt is spent; the next is the schedule's.
             Purpose::Diagnostics => self.unreached(given),
         }

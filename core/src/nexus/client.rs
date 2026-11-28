@@ -10,9 +10,10 @@
 //!    before anything is asked** (R1, 6.1): playing never waits on this.
 //! 2. [`Client::happened`], whenever something does ([`Happened`]): a press, an answer, a
 //!    failure, the network, Offline, a tick, the music server refusing the login.
-//! 3. For each thing given back, **do** it. Each is one of a closed set ([`Do`]): **ask**
-//!    the backend this, **keep** this (whole), **forget** this, **show** this, **hand**
-//!    the player this. Nothing else.
+//! 3. For each thing given back, **do** it, **in the order given**. Each is one of a closed
+//!    set ([`Do`]): **ask** the backend this, **keep** this (whole), **forget** this,
+//!    **show** this, **hand** the player this, and for the sending half, **read or change
+//!    the journal** ([`Do::Journal`]). Nothing else.
 //! 4. [`Client::stop`], at the moment the account changes: nothing asked for the old one is
 //!    acted on afterwards (ruled: an account switch fences the old account's work).
 //!
@@ -68,8 +69,66 @@
 //! **What a person sees is decided here too** ([`Shown`]), in words this module owns, so the
 //! two apps say the same.
 //!
-//! The half that sends what was listened to (C8) and Diagnostics (C6) is a seam here: see
-//! [`Happened::Tick`]. Its tests are marked as owed.
+//! **The sending half** (13.3, 14.4; C8's `events`, C6's `diag`): what was listened to, and
+//! the Diagnostics report, go to the backend as [`Ask`]s like any other: under the session,
+//! after this run's `hello` named the backend expected, never while Offline, fenced at every
+//! account change, `waits_for` before each send. **The player and the journal's writer are
+//! never in this machine's call graph:** it holds only the journal's summary and the batches
+//! it asked for. What the apps do:
+//!
+//! - **THE JOURNAL REPORTS [`Happened::EventsWaiting`]** (its account, life, how many wait,
+//!   the lowest waiting sequence) after a flush (at most once a second), at start, when its
+//!   account changes at a sign-in, and after doing any [`JournalDo`] that changes what waits.
+//!   The writer never waits for the machine.
+//! - **[`JournalDo::ReadEvents`] IS DONE BY THE JOURNAL'S READER, NEVER ITS WRITER, AND EVERY
+//!   READ IS ANSWERED** with [`Happened::EventsRead`] under its `read`, with no events when
+//!   there are none (that ends the round). Likewise **[`JournalDo::ReadDiagnostics`] IS
+//!   ANSWERED** with [`Happened::DiagnosticsRead`] (the report's text, `None` if it cannot),
+//!   read from the record's own file, taking no lock the player takes. A read not answered
+//!   stops that kind of sending until the next start.
+//! - **[`JournalDo::Taken`], [`JournalDo::Refused`], [`JournalDo::LifeMoved`] and
+//!   [`JournalDo::ResendAll`] ARE DONE IN THE ORDER GIVEN, AFTER THE THINGS BEFORE THEM.**
+//!   `LifeMoved` always follows the [`Keep::Saved`] that carries the new life, so nothing is
+//!   removed before what replaces it is kept; `ResendAll` comes before the `Keep::Saved`
+//!   that drops the session at "the data was put back".
+//! - **THE APP KEEPS [`Keep::DiagSchedule`] (PER DEVICE) AND HANDS IT BACK AT START**
+//!   ([`Kept::diag_schedule`]), with the person's own Diagnostics choice
+//!   ([`Kept::diagnostics`]; changes by [`Happened::DiagnosticsSwitch`]). It reports
+//!   [`Happened::DiagnosticsFault`] when it notes something going wrong, and
+//!   [`Happened::InUse`] when it starts or stops being used (`false` at each start).
+//!
+//! **When.** Events: a round begins on a new summary, on the backend being reachable again
+//! (a start, the network back, Offline off, an answer after it could not be reached), or on
+//! an answer once what kept it back is gone (the `hello` read, a sign-in). **NEVER ON A BARE
+//! TICK.** Up to 500 events and 512 KiB to a request, each answered by itself; the round reads
+//! on from after what it sent until a read is empty. An answer that takes or refuses
+//! nothing, "busy", a refusal of the whole call, a failure or an answer that does not read
+//! **holds** sending, without trying again by itself: until the backend is reachable again
+//! (never from that same answer), or, while it answers, more of this account's events wait
+//! than when it held, past any "come back in" it said. Diagnostics: on a tick only, because
+//! 14.4 names its timing (C6's [`diag::Schedule`]: a few minutes after a fault, else daily
+//! while in use, never within ten minutes, thirty a day); the switch is
+//! [`diag::enabled`]`(the person's choice, hello's default)`, and nothing is sent until a
+//! `hello` read this run has said that default (absent there is "on"). One request; a failure
+//! wastes that attempt only.
+//!
+//! **The fence.** An event written under one account is never sent under another: a read is
+//! asked for the signed-in account and life, and an [`Happened::EventsRead`] for another
+//! account or life, or from before a stop, a sign-out, Offline or a sign-in, is dropped. An
+//! [`Happened::EventsWaiting`] for any account or life but the signed-in one's is ignored
+//! entirely. **When any answer says the life moved**, everything read, queued or held under
+//! the earlier life is retired at once: its batch fails `waits_for`, its read and its answer
+//! are dropped, and the new life's events go at the next thing that changes. **When the
+//! Diagnostics switch becomes off** (the person's choice, or a `hello` whose default is off
+//! with no choice made), a read out is dropped when it answers and an upload queued fails
+//! `waits_for`. A read answered empty after a summary came in while it was out is read once
+//! more, from the same place.
+//!
+//! **"The data was put back"** (13.3), from whichever answer says it (a call under the
+//! session, or a sign-out note's telling): [`JournalDo::ResendAll`] names the BACKEND. Every
+//! account's journal kept under that backend id is told at once, and each account's events
+//! are sent again under that account only, when it is next signed in. The account signed in
+//! now and its session are not touched by a note's answer.
 
 use super::account::{
     self, AccountId, ChangePassword, Credential, DeviceId, DeviceKind, DevicePage, DeviceSecret, Email, ForceOut, ForcedOut,
@@ -314,8 +373,8 @@ impl Note {
     }
 }
 
-/// Something that happened.
-#[derive(Debug)]
+/// Something that happened. Its debug form shows no Diagnostics text and no event's
+/// content (its events show as `Placed(..)`): lengths and counts only.
 pub enum Happened {
     /// The person pressed something.
     Pressed(Press),
@@ -330,8 +389,8 @@ pub enum Happened {
     /// Offline mode was switched on or off.
     Offline(bool),
     /// A tick: about every [`TICK_MS`]. A tick alone asks nothing of the session; it tells
-    /// waiting sign-outs at their pace. (The sending half, C8 and C6, will be driven from
-    /// here.)
+    /// waiting sign-outs at their pace, and sends Diagnostics when C6's schedule says. It
+    /// never sends events.
     Tick,
     /// A part of the app that asks the music server (a stream, a range opened again, the
     /// next song fetched ahead, a download, a cover, a page) was refused "wrong name or
@@ -363,6 +422,39 @@ pub enum Happened {
     DiagnosticsFault { at_ms: u64 },
     /// The app is in use, or no longer (14.4: daily "while in use"). `false` at each start.
     InUse(bool),
+}
+
+impl fmt::Debug for Happened {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Happened::Pressed(press) => f.debug_tuple("Pressed").field(press).finish(),
+            Happened::Answered { ask, status, body } => f.debug_struct("Answered").field("ask", ask).field("status", status).field("body", body).finish(),
+            Happened::Failed { ask, failure } => f.debug_struct("Failed").field("ask", ask).field("failure", failure).finish(),
+            Happened::Network { up } => f.debug_struct("Network").field("up", up).finish(),
+            Happened::Offline(on) => f.debug_tuple("Offline").field(on).finish(),
+            Happened::Tick => f.write_str("Tick"),
+            Happened::MusicRefused { count, generation } => f.debug_struct("MusicRefused").field("count", count).field("generation", generation).finish(),
+            Happened::MusicLooked { look, count, generation } => {
+                f.debug_struct("MusicLooked").field("look", look).field("count", count).field("generation", generation).finish()
+            }
+            Happened::EventsWaiting { account, life, pending, from_sequence } => f
+                .debug_struct("EventsWaiting")
+                .field("account", account)
+                .field("life", life)
+                .field("pending", pending)
+                .field("from_sequence", from_sequence)
+                .finish(),
+            Happened::EventsRead { read, account, life, events } => {
+                f.debug_struct("EventsRead").field("read", read).field("account", account).field("life", life).field("events", &events.len()).finish()
+            }
+            Happened::DiagnosticsRead { read, text } => {
+                f.debug_struct("DiagnosticsRead").field("read", read).field("text_bytes", &text.as_ref().map(String::len)).finish()
+            }
+            Happened::DiagnosticsSwitch(choice) => f.debug_tuple("DiagnosticsSwitch").field(choice).finish(),
+            Happened::DiagnosticsFault { at_ms } => f.debug_struct("DiagnosticsFault").field("at_ms", at_ms).finish(),
+            Happened::InUse(on) => f.debug_tuple("InUse").field(on).finish(),
+        }
+    }
 }
 
 /// On the phone, where an address leads on this network and whether the local-network
@@ -638,6 +730,9 @@ pub enum Forget {
     UnreadableNote { index: usize },
     /// The Diagnostics schedule, when what was kept of it did not read: a new one is kept.
     DiagSchedule,
+    /// The person's Diagnostics choice, when what was kept of it did not read: taken as no
+    /// choice made.
+    Diagnostics,
 }
 
 /// What the player is handed.
