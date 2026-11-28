@@ -73,6 +73,10 @@ pub struct Playback {
     /// connection failed, and whether it's now waiting for the server to come back.
     reconnects: u32,
     waiting_for_server: bool,
+    /// The music login the current song was asked for under (its number and generation): a
+    /// stream that stops under an older one than the login in use now is asked for again at
+    /// once under the current one (W7c item 4).
+    opened_with: (u64, u64),
     /// Where the song had got to when last looked at, and for how many looks in a row (four
     /// a second) it hasn't moved although it's meant to be playing.
     seen_at: Option<f64>,
@@ -124,6 +128,7 @@ impl Playback {
             failures: 0,
             reconnects: 0,
             waiting_for_server: false,
+            opened_with: (0, 0),
             seen_at: None,
             stuck_ticks: 0,
             dropped_kept: HashSet::new(),
@@ -446,6 +451,7 @@ impl Controller {
             pb.last_tick = at;
             pb.scrobbled = false;
             pb.waiting_for_server = false;
+            pb.opened_with = client.handed();
             let request = self.request_for(&mut pb, &song, token, at);
             (request, pb.playing)
         };
@@ -1336,6 +1342,11 @@ impl Controller {
         const WAITS: [u64; 4] = [1, 2, 4, 8];
         let player = self.ui.global::<ui::Player>();
         player.set_reconnecting(true);
+        // Asked for under a login that has since been renewed (it missed the renewal's edge):
+        // asked for again at once, once, under the current one (W7c item 4).
+        if attempt == 0 && self.renewed_since(self.playback.borrow().opened_with) {
+            return self.retry_current(token);
+        }
         if let Some(&wait) = WAITS.get(attempt as usize) {
             self.retry_timer.start(slint::TimerMode::SingleShot, Duration::from_secs(wait), move || {
                 with(|ctl| ctl.retry_current(token));
@@ -1378,6 +1389,11 @@ impl Controller {
         let radio = self.playback.borrow().current().is_some_and(|song| !song.radio_url.is_empty());
         self.restart_current(if radio { 0.0 } else { position });
         self.ui.global::<ui::Player>().set_reconnecting(true);
+    }
+
+    /// Whether the login in use now is another than the one handed as `then`, and may send.
+    pub fn renewed_since(&self, then: (u64, u64)) -> bool {
+        self.client().is_some_and(|client| client.handed() != then && !client.refused() && !client.retired())
     }
 
     /// A renewed music login (design 6.3): the song that was waiting for the server, or

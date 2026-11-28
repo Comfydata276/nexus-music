@@ -40,6 +40,9 @@ struct Job {
     progress: Arc<AtomicU32>,
     /// Set to abandon the fetch.
     cancel: Arc<AtomicBool>,
+    /// The music login it was asked for under (number, generation): held under an older one
+    /// than the login in use when it reports, it is asked for again at once (W7c item 4).
+    login: (u64, u64),
 }
 
 pub struct Downloads {
@@ -265,6 +268,24 @@ impl Downloads {
         }
         self.under_way.clear();
         self.held.clear();
+    }
+
+    /// A song whose download a refusal stopped, under the login `login`: kept to be asked for
+    /// again once under a renewed login; or, if the login in use (`current`) is already
+    /// another one that may send (the download missed the renewal's edge), handed back to be
+    /// asked for again at once (W7c item 4).
+    fn hold(&mut self, song: Song, login: (u64, u64), current: Option<&Client>) -> Option<Song> {
+        self.held.retain(|held| held.id != song.id);
+        if current.is_some_and(|client| client.handed() != login && !client.refused() && !client.retired()) {
+            return Some(song);
+        }
+        self.held.push(song);
+        None
+    }
+
+    /// Cancelled: no longer asked for again under a renewed login either.
+    fn forget_held(&mut self, ids: &[String]) {
+        self.held.retain(|held| !ids.contains(&held.id));
     }
 
     /// What a refused login held, to be asked for again (once) under a renewed one.
@@ -629,7 +650,7 @@ fn fetch(
     // Each go has a file of its own to arrive in, so two goes at one song can't trip over
     // each other.
     let temp = dir.join(format!("{file}.{attempt}.part"));
-    let (mut body, length) = client.open_stream(&url, None).map_err(|e| if client.refused() { FetchFailure::Held } else { FetchFailure::failed(diagnostics::connection_shape(&e), e) })?;
+    let (mut body, length) = client.open_stream(&url, None).map_err(|e| if client.refused() || client.retired() { FetchFailure::Held } else { FetchFailure::failed(diagnostics::connection_shape(&e), e) })?;
     let expected = length.filter(|n| *n > 0).unwrap_or(expected).max(1);
     let mut out = fs::File::create(&temp).map_err(|e| FetchFailure::failed(FaultShape::Write, e))?;
     let mut buf = vec![0u8; 128 * 1024];
@@ -761,6 +782,7 @@ impl Controller {
                         attempt: downloads.next_attempt,
                         progress: Arc::new(AtomicU32::new(0)),
                         cancel: Arc::new(AtomicBool::new(false)),
+                        login: client.handed(),
                     };
                     // Asked for again: it's no longer among the ones that failed.
                     downloads.failed.retain(|(failed, _)| failed.id != song.id);
@@ -818,6 +840,7 @@ impl Controller {
     }
 
     fn download_finished(self: &Rc<Self>, id: &str, attempt: u64, result: Result<Entry, FetchFailure>) {
+        let mut again = None;
         let finished = {
             let mut downloads = self.downloads.borrow_mut();
             // No longer listed means this go was cancelled while it was fetching. (The song
@@ -839,10 +862,10 @@ impl Controller {
                     }
                 }
                 (Err(FetchFailure::Held), Some(job)) => {
-                    // Not failed: asked for again, once, when the login is renewed.
+                    // Not failed: asked for again, once, when the login is renewed; at once if
+                    // it already has been (it missed the renewal's edge: W7c item 4).
                     downloads.batch_total = downloads.batch_total.saturating_sub(1);
-                    downloads.held.retain(|held| held.id != job.song.id);
-                    downloads.held.push(job.song);
+                    again = downloads.hold(job.song, job.login, self.client().as_ref());
                 }
                 (Err(failure), Some(job)) => {
                     let reason = match failure {
@@ -865,6 +888,9 @@ impl Controller {
             (over && downloads.batch_total > 0).then_some((downloads.batch_done, downloads.batch_failed))
         };
         self.mark_download(id);
+        if let Some(song) = again {
+            self.download_songs_with(vec![song], true);
+        }
         if let Some((done, failed)) = finished {
             self.downloads.borrow_mut().batch_total = 0;
             match (done, failed) {
@@ -893,6 +919,7 @@ impl Controller {
             for id in ids {
                 downloads.under_way.remove(id);
             }
+            downloads.forget_held(ids);
             let over = downloads.jobs.is_empty();
             downloads.save_if_due(over);
             let cancelled = before - downloads.jobs.len();
@@ -1214,6 +1241,26 @@ mod tests {
 
     fn entry(id: &str, file: &str, bytes: u64) -> Entry {
         Entry { song: Song { id: id.into(), title: id.to_uppercase(), suffix: "flac".into(), duration: 100, ..Default::default() }, file: file.into(), bytes, at: 5 }
+    }
+
+    /// W7c item 4: a download held under an older login than the one in use is handed back
+    /// to be asked for at once; under the current one (or with nothing newer that may send)
+    /// it waits for the renewal; cancelled, it is not asked for again.
+    #[test]
+    fn a_download_held_under_an_older_login_is_asked_for_again_at_once() {
+        let dir = folder("held");
+        let mut downloads = Downloads::load(dir.clone(), "a");
+        let song = |id: &str| Song { id: id.into(), ..Song::default() };
+        let current = Client::new("http://127.0.0.1:9", "a", "p");
+        current.handed_as((2, 1));
+        assert_eq!(downloads.hold(song("old"), (1, 1), Some(&current)).map(|song| song.id), Some("old".into()));
+        assert!(downloads.hold(song("now"), (2, 1), Some(&current)).is_none());
+        current.set_aside();
+        assert!(downloads.hold(song("aside"), (1, 1), Some(&current)).is_none(), "nothing newer that may send: it waits");
+        downloads.forget_held(&["now".to_string()]);
+        let held: Vec<String> = downloads.take_held().into_iter().map(|song| song.id).collect();
+        assert_eq!(held, vec!["aside".to_string()]);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
