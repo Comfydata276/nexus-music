@@ -123,3 +123,73 @@ fn a_known_device_and_a_recovery_code_get_through_a_flood_of_strangers() {
     assert_eq!(known.status, 200, "the known device was not let through: {:?}", account::read_reply::<account::SignedIn>(known.status, known.body.bytes()));
     assert_eq!(recovered.status, 200, "the recovery code was not let through: {:?}", account::read_reply::<account::SignedIn>(recovered.status, recovered.body.bytes()));
 }
+
+/// A1 (the review of S8): a code seen as expired stays expired when the clock is then set back
+/// across its deadline.
+#[test]
+fn a_code_seen_expired_stays_expired_through_a_clock_set_back() {
+    let (bench, made) = Bench::new("expired", &[("late@example.test", false)]);
+    let until = bench::START + account::CODE_LIFETIME_MS;
+    bench.set(until);
+    assert_eq!(bench.sign_in(bench::with_code(&made[0].code, PASSWORD), 1).status, 403);
+    bench.set(until - 60_000);
+    let again = bench.sign_in(bench::with_code(&made[0].code, PASSWORD), 1);
+    assert_eq!(again.status, 403, "the code was good again after the clock went back");
+}
+
+/// B3 (the review of S8): a redemption whose account changes while the new password's
+/// fingerprint is made (here its revision moves, as a role change moves it) does not sign in;
+/// and of two redemptions of one code at once, at most one does.
+#[test]
+fn a_redemption_is_fenced_by_a_change_made_during_its_slow_work_and_a_code_is_redeemed_once() {
+    use nexus_core::nexus::kept::{DataChange, Effects, Update};
+    let (bench, made) = Bench::new("redeem-fence", &[("fence@example.test", false), ("twice@example.test", false)]);
+    let number = made[0].number;
+    let desk = &bench.accounts.desk;
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let accounts = bench.accounts.clone();
+    let code = account::OneTimeCode::new(made[0].code.expose()).unwrap();
+    bench.runtime.block_on(async {
+        // Hold the thread that writes; the redemption's first step waits behind it, and the
+        // revision's change behind that.
+        let holding = tokio::spawn({
+            let accounts = accounts.clone();
+            async move { accounts.desk.ask(move |_| held.recv().ok()).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let redeeming = tokio::spawn({
+            let accounts = accounts.clone();
+            async move { accounts.sign_in(bench::sign_in(bench::with_code(&code, PASSWORD), 1), false).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let changing = desk.ask(move |keeper| {
+            let account = keeper.load(number).unwrap();
+            let mut moved = account.apart();
+            moved.account.revision += 1;
+            let mut rows = account.rows();
+            rows.account = moved.account.clone();
+            let effects = Effects { high_water: bench::START, updates: vec![Update { apart_first: moved.clone(), data: rows, change: DataChange::Keep, music: None, apart_last: moved }] };
+            keeper.persist(&effects, &[], bench::START).unwrap();
+        });
+        release.send(()).unwrap();
+        changing.await.unwrap();
+        holding.await.unwrap().unwrap();
+        let answer = redeeming.await.unwrap();
+        assert_ne!(answer.status, 200, "signed in under the revision before the change");
+    });
+    // Two at once, from two devices: one at most.
+    let first = account::OneTimeCode::new(made[1].code.expose()).unwrap();
+    let second = account::OneTimeCode::new(made[1].code.expose()).unwrap();
+    let (a, b) = bench.runtime.block_on(async {
+        let one = tokio::spawn({
+            let accounts = accounts.clone();
+            async move { accounts.sign_in(bench::sign_in(bench::with_code(&first, PASSWORD), 2), false).await.status }
+        });
+        let two = tokio::spawn({
+            let accounts = accounts.clone();
+            async move { accounts.sign_in(bench::sign_in(bench::with_code(&second, PASSWORD), 3), false).await.status }
+        });
+        (one.await.unwrap(), two.await.unwrap())
+    });
+    assert_eq!([a, b].iter().filter(|status| **status == 200).count(), 1, "{a} {b}");
+}

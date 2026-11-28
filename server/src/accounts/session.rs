@@ -304,42 +304,56 @@ impl Accounts {
         // The code's own door: ten a second in all (8.3), taken before it is looked up.
         self.workers.admit_code()?;
         let clock = self.clock.clone();
-        // Whose code it is, and that it is live and in time.
+        let secret_for_check = secret.clone();
+        // (1) On the thread that writes: whose code it is, that it is live and in time, and
+        // kept's check of it, made NOW, before the slow work (the review of S8, B3): the
+        // receipt is bound to the account as it is at this moment, so a change to it while the
+        // new password's fingerprint is made (its role, say) fences this redemption.
         let found = self
             .desk
-            .ask(move |keeper| -> Result<Option<(u64, u64, Email, Fingerprint)>, Refusal> {
-                let now = keeper.clock(clock()).effective();
+            .ask(move |keeper| -> Result<Option<(u64, Email, DeviceId, PasswordCheck, Fingerprint)>, Refusal> {
+                let now = clock();
+                let effective = keeper.clock(now).effective();
+                // A1 (the review of S8): the time a code was judged at is kept as the backend's
+                // latest, whatever the judgement, so a clock set back afterwards cannot make an
+                // expired code good again. (At most ten a second: the code's door.)
+                // CARRIED until the keeper keeps the clock's observations in memory (core's
+                // `Clock::observe`, with the store's port to it): until then each is written.
+                keeper.persist(&Effects { high_water: effective, updates: Vec::new() }, &[], now).map_err(not_dealt_with)?;
                 let print = CodeKey::of(keeper).print(&code);
                 let Some((number, code_number, until)) = rows::code(keeper.data().connection(), &print).map_err(not_dealt_with)? else { return Ok(None) };
-                if now >= until {
+                if effective >= until {
                     return Ok(None);
                 }
-                let state = keeper.load(number).map_err(not_dealt_with)?.state().clone();
-                Ok(Some((number, code_number, state.email, Fingerprint::from_bytes(print))))
+                let mut account = keeper.load(number).map_err(not_dealt_with)?;
+                let email = account.state().email.clone();
+                let vacant = DeviceId::new(keeper.vacant_device()).ok_or(Refusal::NotDealtWith)?;
+                let mine = Fingerprint::of(secret_for_check.expose_bytes());
+                let device = account.rows().devices.iter().find(|(_, row)| row.secret == mine).map_or(vacant, |(id, _)| *id);
+                let print = Fingerprint::from_bytes(print);
+                let check = account
+                    .sign_in_turn(keeper.clock(now), |turn| turn.check_code(&secret_for_check, vacant, code_number, print.clone()))
+                    .apply(|effects| keeper.persist(effects, &[], now))
+                    .map_err(not_dealt_with)?
+                    .map_err(said)?;
+                Ok(Some((number, email, device, check, print)))
             })
             .await??;
-        let Some((number, code_number, email, print)) = found else { return Err(wrong()) };
+        let Some((number, email, device, check, print)) = found else { return Err(wrong()) };
         if !new_password.allowed_for(&email, COMMON_PASSWORDS) {
             return Err(Refusal::NotAllowed(NotAllowed::PasswordNotAllowed));
         }
-        // The new password's fingerprint, before the code is spent: the code is a live one, so
-        // this is the known-device worker's, one at a time for an account, with no wait (the
+        // (2) The new password's fingerprint, before the code is spent: the code is a live one,
+        // so this is the known-device worker's, one at a time for an account, with no wait (the
         // lead's ruling of 14:06; a stranger at the other door cannot stop it).
         let stored = self.workers.fingerprint(&email, PasswordDoor::RedeemedCode, None, new_password).await?;
         let clock = self.clock.clone();
         let seen = self.seen.clone();
+        // (3) On the thread that writes: the receipt taken at (1) consumed against the account
+        // loaded afresh, and the code spent, in the one step.
         self.desk
             .ask(move |keeper| {
                 let now = clock();
-                let mut account = keeper.load(number).map_err(not_dealt_with)?;
-                let vacant = DeviceId::new(keeper.vacant_device()).ok_or(Refusal::NotDealtWith)?;
-                let mine = Fingerprint::of(secret.expose_bytes());
-                let device = account.rows().devices.iter().find(|(_, row)| row.secret == mine).map_or(vacant, |(id, _)| *id);
-                let check = account
-                    .sign_in_turn(keeper.clock(now), |turn| turn.check_code(&secret, vacant, code_number, print.clone()))
-                    .apply(|effects| keeper.persist(effects, &[], now))
-                    .map_err(not_dealt_with)?
-                    .map_err(said)?;
                 let receipt = check.check(print, keeper.clock(now)).map_err(said)?;
                 let verifier = Fingerprint::from_bytes(stored.hash);
                 finish_sign_in(keeper, &seen, number, device, &secret, &described, std::slice::from_ref(&stored), now, |turn, fresh, previous| {
