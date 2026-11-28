@@ -1,0 +1,1834 @@
+//! Requests use the released Lidarr operations over a line owned by the server.
+//! No request data can select the line's origin, credentials, or redirect target.
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use axum::body::Bytes;
+use axum::http::header::{CONNECTION, CONTENT_TYPE, HOST};
+use axum::http::{HeaderValue, Method, Request};
+use http_body_util::{BodyExt, Full, Limited};
+use hyper_util::rt::TokioIo;
+use nexus_core::http;
+use nexus_core::lidarr::{self, Lidarr};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpStream;
+use tokio::runtime::Handle;
+use tokio_rustls::TlsConnector;
+use tokio_rustls::rustls::{ClientConfig, RootCertStore, crypto, pki_types::ServerName};
+use url::Url;
+
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::num::NonZeroU64;
+use std::sync::{Mutex, MutexGuard};
+
+use axum::Router;
+use axum::body::Body;
+use axum::extract::State;
+use axum::http::header::AUTHORIZATION;
+use axum::http::{HeaderMap, Response, StatusCode};
+use axum::routing::post;
+use nexus_core::nexus::account::{
+    self, AccountId, DeviceId, NotSignedIn, Receipt, RequestHead, SessionId,
+};
+use nexus_core::nexus::admin;
+use nexus_core::nexus::kept::{
+    Access, Account, Bearer, Denied, Fingerprint, GrantUse, LeaveFor, SessionKind,
+};
+use nexus_core::nexus::requests::{
+    self as wire, AlbumView, Answer, ArtistView, Availability, BatchAlbum, BatchLine,
+    BatchLineProgress, BatchLineView, Call, Change, Completed, JobId, LidarrNumber,
+    ListedView, MusicBrainzId, PageCursor, PendingView, Refusal, Search, SessionOffers,
+    lidarr_items,
+};
+use nexus_core::offer::Offer;
+use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::sync::atomic::{AtomicBool, Ordering};
+use zeroize::Zeroizing;
+use tokio::sync::Notify;
+
+use crate::accounts::{desk::Lane, rows, session::Accounts};
+use crate::events;
+use crate::store::keeper::Keeper;
+
+const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(8);
+const UPSTREAM_HEAD_BYTES: usize = 16 * 1024;
+
+#[derive(Clone)]
+pub struct Endpoint {
+    url: Url,
+    api: String,
+    tls: Option<TlsConnector>,
+}
+
+impl Endpoint {
+    pub fn read(configured: Option<String>) -> Result<Option<Self>, &'static str> {
+        let Some(address) = configured.filter(|address| !address.trim().is_empty()) else {
+            return Ok(None);
+        };
+        Self::parse(address.trim()).map(Some).ok_or("NEXUS_LIDARR is wrong")
+    }
+
+    fn parse(address: &str) -> Option<Self> {
+        if !(address.starts_with("http://") || address.starts_with("https://")) {
+            return None;
+        }
+        let origin = lidarr::origin(address).ok()?;
+        let url = Url::parse(address).ok()?;
+        if url.query().is_some() || url.fragment().is_some() || origin.port != url.port_or_known_default()? {
+            return None;
+        }
+        let written_path = address.split_once("://")?.1.split_once('/').map_or("", |(_, path)| path);
+        if !written_path.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"/-_.~".contains(&byte))
+            || written_path.split('/').any(|part| part == "." || part == "..")
+            || written_path.contains("//")
+        {
+            return None;
+        }
+        let api = format!("{}/api/v1/", url.path().trim_end_matches('/'));
+        let tls = (url.scheme() == "https").then(|| {
+            let mut roots = RootCertStore::empty();
+            roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
+            let mut config = ClientConfig::builder_with_provider(Arc::new(crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .expect("ring supports the default TLS versions")
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            config.alpn_protocols = vec![b"http/1.1".to_vec()];
+            TlsConnector::from(Arc::new(config))
+        });
+        Some(Self { url, api, tls })
+    }
+
+    fn lidarr(&self, runtime: Handle, key: &str, deadline: Option<Instant>) -> Lidarr {
+        Lidarr::new(self.url.as_str(), key, None, Arc::new(Line {
+            endpoint: self.clone(), runtime, deadline, within: UPSTREAM_TIMEOUT, before_write: None,
+        }))
+    }
+
+    fn request(&self, sent: &http::Request<'_>) -> Option<Request<Full<Bytes>>> {
+        let url = Url::parse(sent.url).ok()?;
+        if url.origin() != self.url.origin()
+            || !url.username().is_empty() || url.password().is_some()
+            || url.fragment().is_some() || !url.path().starts_with(&self.api)
+        {
+            return None;
+        }
+        let (method, data) = match sent.method {
+            http::Method::Get => (Method::GET, ""),
+            http::Method::Post(body) => (Method::POST, body),
+            http::Method::Put(body) => (Method::PUT, body),
+        };
+        let authority = &self.url[url::Position::BeforeHost..url::Position::AfterPort];
+        let target = &url[url::Position::BeforePath..url::Position::AfterQuery];
+        let mut builder = Request::builder().method(method).uri(target)
+            .header(HOST, authority).header(CONNECTION, "close");
+        for &(name, value) in sent.headers {
+            if name.eq_ignore_ascii_case("x-api-key") {
+                let mut value = HeaderValue::from_str(value).ok()?;
+                value.set_sensitive(true);
+                builder = builder.header("x-api-key", value);
+            } else if name.eq_ignore_ascii_case(CONTENT_TYPE.as_str()) {
+                builder = builder.header(CONTENT_TYPE, value);
+            }
+        }
+        builder.body(Full::new(Bytes::copy_from_slice(data.as_bytes()))).ok()
+    }
+
+    async fn ask(&self, request: Request<Full<Bytes>>) -> Option<(u16, String)> {
+        let host = match self.url.host()? {
+            url::Host::Domain(host) => host.to_owned(),
+            url::Host::Ipv4(host) => host.to_string(),
+            url::Host::Ipv6(host) => host.to_string(),
+        };
+        let key = request.headers().get("x-api-key")?.clone();
+        let tcp = TcpStream::connect((host.as_str(), self.url.port_or_known_default()?)).await.ok()?;
+        let (status, body) = match &self.tls {
+            None => exchange(tcp, request).await,
+            Some(tls) => {
+                let name = ServerName::try_from(host).ok()?;
+                exchange(tls.connect(name, tcp).await.ok()?, request).await
+            }
+        }?;
+        // A service may reflect its own address or request headers. Refuse
+        // the reflected result before the core sees any of that text.
+        let key = key.to_str().ok()?;
+        let address = self.url.as_str().trim_end_matches('/');
+        let body = if contains_secret(&body, key, address) { "Invalid upstream JSON".into() } else { body };
+        Some((status, body))
+    }
+}
+
+fn contains_secret(body: &str, key: &str, address: &str) -> bool {
+    let matches = |text: &str| text.contains(key) || text.contains(address);
+    if matches(body) {
+        return true;
+    }
+    if !body.contains('\\') {
+        return false;
+    }
+    // JSON escaping can hide either value from comparison with the received
+    // bytes. Inspect decoded string values only when escapes occur.
+    fn includes(value: &serde_json::Value, matches: &impl Fn(&str) -> bool) -> bool {
+        match value {
+            serde_json::Value::String(text) => matches(text),
+            serde_json::Value::Array(items) => items.iter().any(|item| includes(item, matches)),
+            serde_json::Value::Object(items) => items.values().any(|item| includes(item, matches)),
+            _ => false,
+        }
+    }
+    serde_json::from_str::<serde_json::Value>(body).is_ok_and(|value| includes(&value, &matches))
+}
+
+struct Line {
+    endpoint: Endpoint,
+    runtime: Handle,
+    deadline: Option<Instant>,
+    within: Duration,
+    before_write: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+}
+
+impl http::Http for Line {
+    fn send(&self, question: &http::Request<'_>) -> Result<http::Response, http::Failure> {
+        let unreachable = || http::Failure::Reach("No usable response.".into());
+        let request = self.endpoint.request(question).ok_or_else(unreachable)?;
+        if request.method() != Method::GET && self.before_write.as_ref().is_some_and(|keep| !keep()) {
+            return Err(unreachable());
+        }
+        let within = question.patience.unwrap_or(self.within).min(self.within);
+        let within = self.deadline.map_or(within, |deadline| within.min(deadline.saturating_duration_since(Instant::now())));
+        if within.is_zero() {
+            return Err(unreachable());
+        }
+        let (status, body) = self.runtime.block_on(async {
+            tokio::time::timeout(within, self.endpoint.ask(request)).await.ok().flatten()
+        }).ok_or_else(unreachable)?;
+        Ok(http::Response::new(status, Vec::new(), move || Ok(body)))
+    }
+}
+
+async fn exchange(io: impl AsyncRead + AsyncWrite + Unpin + Send + 'static, request: Request<Full<Bytes>>) -> Option<(u16, String)> {
+    let (mut sender, connection) = hyper::client::conn::http1::Builder::new()
+        .max_buf_size(UPSTREAM_HEAD_BYTES).handshake(TokioIo::new(io)).await.ok()?;
+    let answer = async {
+        let response = sender.send_request(request).await.ok()?;
+        let status = response.status();
+        if !status.is_success() {
+            return Some((status.as_u16(), String::new()));
+        }
+        let body = Limited::new(response.into_body(), http::BODY_LIMIT as usize).collect().await.ok()?.to_bytes();
+        Some((status.as_u16(), String::from_utf8(body.to_vec()).ok()?))
+    };
+    let _driver = ConnectionDriver(tokio::spawn(connection).abort_handle());
+    answer.await
+}
+
+struct ConnectionDriver(tokio::task::AbortHandle);
+
+impl Drop for ConnectionDriver {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests;
+
+const MAX_BOOKS: usize = 64;
+const MAX_SNAPSHOTS: usize = 16;
+const ACCOUNT_SLOT_MAX: usize = 24;
+
+// CARRIED until C9's read type lands. The existing GetMusicServer request
+// is the same head-only shape.
+pub(crate) const GET_LIDARR: &str = "/nexus/api/admin/lidarr";
+
+pub(crate) struct Requests {
+    accounts: Arc<Accounts>,
+    origin: Option<Arc<str>>,
+    endpoint: Option<Endpoint>,
+    rooms: Arc<Mutex<Rooms>>,
+    books: Mutex<Books>,
+    wake: Arc<Notify>,
+    mutation: Mutex<()>,
+}
+
+impl Requests {
+    pub(crate) fn new(accounts: Arc<Accounts>, origin: Option<Arc<str>>, endpoint: Option<Endpoint>) -> Arc<Self> {
+        Arc::new(Self {
+            accounts,
+            origin,
+            endpoint,
+            rooms: Arc::default(),
+            books: Mutex::default(),
+            wake: Arc::new(Notify::new()),
+            mutation: Mutex::new(()),
+        })
+    }
+
+    pub(crate) fn router(self: &Arc<Self>, base: Router) -> Router {
+        let base = base.layer(axum::middleware::from_fn_with_state(self.clone(), admin_grant));
+        base.merge(Router::new()
+            .route(wire::REQUESTS, post(call))
+            .route(admin::SET_REQUESTS_ENABLED, post(set_requests_enabled))
+            .route(GET_LIDARR, post(get_lidarr))
+            .with_state(self.clone()))
+    }
+
+    pub(crate) async fn admit(self: &Arc<Self>, path: &str, headers: &HeaderMap) -> Result<Ingress, Response<Body>> {
+        let outcome = async {
+            if crate::admin::is_browser(headers)
+                && !crate::admin::browser_origin_allowed(headers, self.origin.as_deref())
+            {
+                return Err(account::Refusal::Malformed);
+            }
+            let page = crate::admin::browser_origin_allowed(headers, self.origin.as_deref());
+            let hash = Fingerprint::of(bearer(headers)?.expose_bytes());
+            let copied = hash.clone();
+            let clock = self.accounts.clock.clone();
+            let who = events::answer(self.accounts.desk.ask_in(Lane::Stranger, move |keeper| {
+                let (number, device) = rows::session_by_hash(keeper.data().connection(), copied.as_bytes())
+                    .map_err(events::unavailable)?.ok_or_else(ended)?;
+                let mut account = keeper.load(number).map_err(events::unavailable)?;
+                let kind = events::inspect_session(keeper, &mut account, device, &copied, clock())?;
+                let session = session_id(&account, device)?;
+                Ok((number, session, kind))
+            }).await)?;
+            if matches!(path, GET_LIDARR | admin::SET_REQUESTS_ENABLED) && (!page || who.2 != SessionKind::AdminPage) {
+                return Err(account::Refusal::NotAllowed(account::NotAllowed::Denied));
+            }
+            let place = Place::ingress(self.rooms.clone(), who.0).ok_or_else(events::busy)?;
+            Ok(Ingress { hash, session: who.1, kind: who.2, page, _place: place })
+        }.await;
+        outcome.map_err(|why| events::respond(crate::accounts::session::refused(why)))
+    }
+
+    async fn shown<T: Send + 'static>(
+        &self,
+        hash: Fingerprint,
+        head: RequestHead,
+        expected: SessionId,
+        step: impl FnOnce(&mut Keeper, Actor) -> Result<T, account::Refusal> + Send + 'static,
+    ) -> Result<(T, Receipt), account::Refusal> {
+        let clock = self.accounts.clock.clone();
+        events::answer(self.accounts.desk.ask(move |keeper| {
+            let now = clock();
+            let (_, device, account, _) = events::authenticated(keeper, &head, &hash, Access::Read, now)?;
+            if session_id(&account, device)? != expected {
+                return Err(ended());
+            }
+            let actor = Actor { account: account.state().id, session: expected, admin: account.state().admin,
+                restore: head.restore, now: keeper.clock(now).effective() };
+            let done = step(keeper, actor)?;
+            Ok((done, events::receipt(keeper, account.state())?))
+        }).await)
+    }
+}
+
+fn bearer(headers: &HeaderMap) -> Result<account::Session, account::Refusal> {
+    let mut values = headers.get_all(AUTHORIZATION).iter();
+    let value = values.next().and_then(|value| value.to_str().ok()).ok_or_else(ended)?;
+    if values.next().is_some() {
+        return Err(ended());
+    }
+    account::Session::from_authorization(value).ok_or_else(ended)
+}
+
+fn ended() -> account::Refusal {
+    account::Refusal::NotSignedIn(NotSignedIn::SessionEnded)
+}
+
+fn session_id(account: &Account, device: DeviceId) -> Result<SessionId, account::Refusal> {
+    account.rows().devices.get(&device).and_then(|row| row.session.as_ref()).map(|session| session.id).ok_or_else(ended)
+}
+
+/// Held from header admission through body reading and dispatch. This is
+/// separate from the upstream worker place so polls can run during a job.
+pub(crate) struct Ingress {
+    hash: Fingerprint,
+    session: SessionId,
+    kind: SessionKind,
+    page: bool,
+    _place: Place,
+}
+
+#[derive(Clone, Copy)]
+struct Actor {
+    account: AccountId,
+    session: SessionId,
+    admin: bool,
+    restore: u64,
+    now: u64,
+}
+
+fn access(db: &Connection, account: AccountId) -> rusqlite::Result<wire::RequestsAccess> {
+    let on: bool = db.query_row("SELECT enabled FROM requests_access WHERE account = ?1",
+        [events::sql(account.get())?], |row| row.get(0)).optional()?.unwrap_or(true);
+    Ok(if on { wire::RequestsAccess::On } else { wire::RequestsAccess::Off })
+}
+
+fn lock<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
+    lock.lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
+#[derive(Default)]
+struct Rooms {
+    ingress: HashSet<u64>,
+    upstream: HashSet<u64>,
+}
+
+struct Place {
+    rooms: Arc<Mutex<Rooms>>,
+    account: u64,
+    upstream: bool,
+}
+
+impl Place {
+    fn ingress(rooms: Arc<Mutex<Rooms>>, account: u64) -> Option<Self> {
+        let mut held = lock(&rooms);
+        if held.ingress.len() == ACCOUNT_SLOT_MAX || !held.ingress.insert(account) {
+            return None;
+        }
+        drop(held);
+        Some(Self { rooms, account, upstream: false })
+    }
+
+    fn upstream(rooms: Arc<Mutex<Rooms>>, account: u64) -> Option<Self> {
+        let mut held = lock(&rooms);
+        if held.upstream.len() == wire::RUNNING_MAX || !held.upstream.insert(account) {
+            return None;
+        }
+        drop(held);
+        Some(Self { rooms, account, upstream: true })
+    }
+}
+
+impl Drop for Place {
+    fn drop(&mut self) {
+        let mut held = lock(&self.rooms);
+        if self.upstream { &mut held.upstream } else { &mut held.ingress }.remove(&self.account);
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum Read {
+    Status,
+    FindReleases(Search),
+    FindAny(Search),
+    FindArtists(Search),
+    Tracked,
+    ArtistNumbers,
+    KnownArtist(MusicBrainzId),
+    Albums(LidarrNumber),
+    Releases(LidarrNumber),
+    Listed(LidarrNumber),
+    Busy(Vec<LidarrNumber>),
+    Pending,
+    Batch(JobId),
+}
+
+impl Read {
+    fn from_call(call: Call) -> Option<(Self, Option<PageCursor>)> {
+        Some(match call {
+            Call::Status => (Self::Status, None),
+            Call::FindReleases { search, after } => (Self::FindReleases(search), after),
+            Call::FindAny { search, after } => (Self::FindAny(search), after),
+            Call::FindArtists { search, after } => (Self::FindArtists(search), after),
+            Call::Tracked { after } => (Self::Tracked, after),
+            Call::ArtistNumbers { after } => (Self::ArtistNumbers, after),
+            Call::KnownArtist { artist } => (Self::KnownArtist(artist), None),
+            Call::AlbumsOf { artist, after } => (Self::Albums(artist), after),
+            Call::ReleasesOf { artist, after } => (Self::Releases(artist), after),
+            Call::Listed { artist, after } => (Self::Listed(artist), after),
+            Call::Busy { artists } => (Self::Busy(artists), None),
+            Call::Pending { after } => (Self::Pending, after),
+            _ => return None,
+        })
+    }
+
+    fn ask(&self, lidarr: &Lidarr) -> Result<Answer, String> {
+        let next = None;
+        Ok(match self {
+            Self::Status => Answer::Status { lidarr: if lidarr.version().is_ok() { Availability::Ready } else { Availability::Unavailable } },
+            Self::FindReleases(search) => {
+                let (albums, singles) = lidarr.find_releases(search.as_str())?;
+                Answer::FoundReleases { albums: lidarr_items(albums), singles: lidarr_items(singles), next }
+            }
+            Self::FindAny(search) => Answer::FoundAny { albums: lidarr_items(lidarr.find_any(search.as_str())?), next },
+            Self::FindArtists(search) => Answer::FoundArtists { artists: lidarr_items(lidarr.find_artists(search.as_str())?), next },
+            Self::Tracked => {
+                let mut artists: Vec<_> = lidarr.tracked()?.into_iter().filter_map(|id| MusicBrainzId::try_from(id).ok()).collect();
+                artists.sort_unstable();
+                Answer::Tracked { artists, next }
+            }
+            Self::ArtistNumbers => {
+                let mut artists: Vec<_> = lidarr.artist_numbers()?.into_iter().filter_map(|(id, number)| {
+                    Some((MusicBrainzId::try_from(id).ok()?, LidarrNumber::new(number)?))
+                }).collect();
+                artists.sort_unstable();
+                Answer::ArtistNumbers { artists, next }
+            }
+            Self::KnownArtist(artist) => {
+                let artist = lidarr.known_artist(artist.as_str())?.and_then(|(number, name)| {
+                    (name.len() <= wire::NAME_MAX_BYTES && !name.chars().any(char::is_control))
+                        .then_some((LidarrNumber::new(number)?, name))
+                });
+                Answer::KnownArtist { artist }
+            }
+            Self::Albums(artist) | Self::Releases(artist) => {
+                let number = i64::from(*artist);
+                let mut releases = if matches!(self, Self::Albums(_)) {
+                    lidarr.albums_of(number, "")?
+                } else {
+                    lidarr.releases_of(number, "")?
+                };
+                // Offer booking needs the trusted artist ID even when the album
+                // endpoint returns no embedded artist.
+                if releases.iter().any(|(album, _)| album.artist_id.is_empty()) {
+                    if let Some((id, _)) = lidarr.artist_numbers()?.into_iter().find(|(_, known)| *known == number) {
+                        for (album, _) in &mut releases {
+                            if album.artist_id.is_empty() {
+                                album.artist_id.clone_from(&id);
+                            }
+                        }
+                    }
+                }
+                let releases = lidarr_items(releases);
+                if matches!(self, Self::Albums(_)) {
+                    Answer::AlbumsOf { albums: releases, next }
+                } else {
+                    Answer::ReleasesOf { releases, next }
+                }
+            }
+            Self::Listed(artist) => Answer::Listed { releases: lidarr_items(lidarr.listed((*artist).into())?), next },
+            Self::Busy(artists) => {
+                let numbers = artists.iter().map(|number| i64::from(*number)).collect();
+                let (busy, stamp) = lidarr.busy(&numbers)?;
+                let positions = artists.iter().enumerate().filter(|(_, number)| busy.contains(&i64::from(**number)))
+                    .map(|(index, _)| index as u16).collect();
+                Answer::Busy { positions, stamp }
+            }
+            Self::Pending => Answer::Pending { albums: lidarr_items(lidarr.pending()?), next },
+            Self::Batch(_) => unreachable!("batch progress is loaded from the data"),
+        })
+    }
+}
+
+#[derive(Default)]
+struct Books {
+    sessions: VecDeque<(SessionId, SessionBook)>,
+    snapshots: VecDeque<Snapshot>,
+    last_snapshot: u64,
+}
+
+struct Snapshot {
+    id: NonZeroU64,
+    session: SessionId,
+    last_seen: Instant,
+    read: Read,
+    found: Answer,
+}
+
+impl Books {
+    fn expire(&mut self) {
+        self.snapshots.retain(|snapshot| snapshot.last_seen.elapsed() < Duration::from_secs(wire::SNAPSHOT_IDLE_SECONDS));
+    }
+
+    fn peek(&mut self, session: SessionId, read: &Read, after: PageCursor) -> Result<Answer, Refusal> {
+        self.expire();
+        let index = self.snapshots.iter().position(|known|
+            known.id == after.snapshot() && known.session == session && &known.read == read)
+            .ok_or(Refusal::SearchAgain)?;
+        let mut snapshot = self.snapshots.remove(index).ok_or(Refusal::SearchAgain)?;
+        let answer = page(&snapshot.found, snapshot.id, after.offset() as usize)?;
+        snapshot.last_seen = Instant::now();
+        self.snapshots.push_back(snapshot);
+        Ok(answer)
+    }
+
+    fn first(&mut self, session: SessionId, read: &Read, found: Answer) -> Result<Answer, Refusal> {
+        if page_size(&found).is_none() {
+            return Ok(found);
+        }
+        self.expire();
+        self.last_snapshot = self.last_snapshot.checked_add(1).ok_or(Refusal::NotDealtWith)?;
+        let id = NonZeroU64::new(self.last_snapshot).ok_or(Refusal::NotDealtWith)?;
+        let answer = page(&found, id, 0)?;
+        if page_size(&found).is_some_and(|(count, limit)| count > limit) {
+            let matching = self.snapshots.iter().enumerate().filter(|(_, known)| known.session == session);
+            if let Some((index, _)) = matching.clone().next().filter(|_| matching.count() >= wire::SNAPSHOTS_PER_SESSION) {
+                self.snapshots.remove(index);
+            }
+            if self.snapshots.len() == MAX_SNAPSHOTS {
+                self.snapshots.pop_front();
+            }
+            self.snapshots.push_back(Snapshot { id, session, last_seen: Instant::now(), read: read.clone(), found });
+        }
+        Ok(answer)
+    }
+
+    fn remember(&mut self, session: SessionId, now: i64, read: &Read, page: &Answer) {
+        let (mut book, artists) = match page {
+            Answer::FoundAny { albums, .. } | Answer::FoundReleases { albums, .. } => (albums.clone(), &[][..]),
+            Answer::FoundArtists { artists, .. } => (Vec::new(), artists.as_slice()),
+            Answer::AlbumsOf { albums, .. } | Answer::ReleasesOf { releases: albums, .. } =>
+                (albums.iter().map(|release| release.album.clone()).collect(), &[][..]),
+            Answer::Listed { .. } => (Vec::new(), &[][..]),
+            _ => return,
+        };
+        let existing = self.sessions.iter().position(|(known, _)| *known == session)
+            .and_then(|index| self.sessions.remove(index)).map(|(_, offers)| offers);
+        let mut offers = existing.unwrap_or_default();
+        for album in book.drain(..) {
+            let _ = offers.offers.remember_album(album, now);
+        }
+        for artist in artists {
+            let _ = offers.offers.remember_artist(artist.clone(), now);
+        }
+        if let (Read::Listed(artist), Answer::Listed { releases, .. }) = (read, page) {
+            offers.listed.retain(|(_, _, seen)| recent(*seen, now));
+            for row in releases {
+                offers.listed.retain(|(known_artist, known, _)| known_artist != artist || known.id != row.id);
+                if offers.listed.len() == wire::KEPT_ALBUMS {
+                    offers.listed.pop_front();
+                }
+                offers.listed.push_back((*artist, row.clone(), now));
+            }
+        }
+        if self.sessions.len() == MAX_BOOKS {
+            self.sessions.pop_front();
+        }
+        self.sessions.push_back((session, offers));
+    }
+}
+
+fn page_size(found: &Answer) -> Option<(usize, usize)> {
+    Some((match found {
+        Answer::FoundReleases { albums, singles, .. } => albums.len() + singles.len(),
+        Answer::FoundAny { albums, .. } => albums.len(),
+        Answer::FoundArtists { artists, .. } => artists.len(),
+        Answer::Tracked { artists, .. } => artists.len(),
+        Answer::ArtistNumbers { artists, .. } => return Some((artists.len(), wire::NUMBER_PAGE_MAX_ITEMS)),
+        Answer::AlbumsOf { albums, .. } => albums.len(),
+        Answer::ReleasesOf { releases, .. } => releases.len(),
+        Answer::Listed { releases, .. } => releases.len(),
+        Answer::Pending { albums, .. } => albums.len(),
+        Answer::BatchLines { lines, .. } => lines.len(),
+        _ => return None,
+    }, wire::PAGE_MAX_ITEMS))
+}
+
+fn page(found: &Answer, id: NonZeroU64, from: usize) -> Result<Answer, Refusal> {
+    let (len, limit) = page_size(found).ok_or(Refusal::SearchAgain)?;
+    if len > wire::LIST_MAX_ITEMS {
+        return Err(Refusal::TooLarge);
+    }
+    if from >= len && from != 0 {
+        return Err(Refusal::SearchAgain);
+    }
+    let to = (from + limit).min(len);
+    let next = if to < len { PageCursor::new(id, to as u32) } else { None };
+    Ok(match found {
+        Answer::FoundReleases { albums, singles, .. } => {
+            let last_album = albums.len();
+            Answer::FoundReleases {
+                albums: albums[from.min(last_album)..to.min(last_album)].to_vec(),
+                singles: singles[from.saturating_sub(last_album)..to.saturating_sub(last_album)].to_vec(),
+                next,
+            }
+        }
+        Answer::FoundAny { albums, .. } => Answer::FoundAny { albums: albums[from..to].to_vec(), next },
+        Answer::FoundArtists { artists, .. } => Answer::FoundArtists { artists: artists[from..to].to_vec(), next },
+        Answer::Tracked { artists, .. } => Answer::Tracked { artists: artists[from..to].to_vec(), next },
+        Answer::ArtistNumbers { artists, .. } => Answer::ArtistNumbers { artists: artists[from..to].to_vec(), next },
+        Answer::AlbumsOf { albums, .. } => Answer::AlbumsOf { albums: albums[from..to].to_vec(), next },
+        Answer::ReleasesOf { releases, .. } => Answer::ReleasesOf { releases: releases[from..to].to_vec(), next },
+        Answer::Listed { releases, .. } => Answer::Listed { releases: releases[from..to].to_vec(), next },
+        Answer::Pending { albums, .. } => Answer::Pending { albums: albums[from..to].to_vec(), next },
+        Answer::BatchLines { lines, .. } => Answer::BatchLines { lines: lines[from..to].to_vec(), next },
+        _ => return Err(Refusal::SearchAgain),
+    })
+}
+
+fn send(answer: Result<Answer, Refusal>, receipt: Receipt) -> Response<Body> {
+    let result = answer.unwrap_or_else(|reason| Answer::Refused { reason });
+    let reply = wire::Reply::Done { result, receipt };
+    match events::result(reply, wire::write_reply) {
+        Ok(answer) => events::respond(answer),
+        Err(why) => events::respond(crate::accounts::session::refused(why)),
+    }
+}
+
+#[derive(Default)]
+struct SessionBook {
+    offers: SessionOffers,
+    listed: VecDeque<(LidarrNumber, ListedView, i64)>,
+}
+
+fn recent(seen: i64, now: i64) -> bool {
+    (0..wire::OFFER_LIFETIME_SECONDS).contains(&now.saturating_sub(seen))
+}
+
+fn seconds(ms: u64) -> i64 {
+    i64::try_from(ms / 1_000).unwrap_or(i64::MAX)
+}
+
+#[derive(Serialize, Deserialize)]
+struct Plan {
+    binding: [u8; 32],
+    revision: u64,
+    artist: Option<ArtistView>,
+    offers: Vec<AlbumView>,
+    listed: Vec<ListedView>,
+}
+
+impl Plan {
+    fn resolve(
+        change: &Change,
+        books: &Books,
+        actor: Actor,
+        binding: [u8; 32],
+        revision: u64,
+    ) -> Result<Self, Refusal> {
+        let book = || books.sessions.iter().find(|(id, _)| *id == actor.session)
+            .map(|(_, book)| book).ok_or(Refusal::SearchAgain);
+        let now = seconds(actor.now);
+        let mut plan = Self { binding, revision, artist: None, offers: Vec::new(), listed: Vec::new() };
+        match change {
+            Change::Request { offer } | Change::ListSingles { offer, .. } => {
+                plan.offers.push(book()?.offers.album(offer, now)?.clone());
+            }
+            Change::AddArtist { artist } => {
+                plan.artist = Some(book()?.offers.artist(artist, now)?.clone());
+            }
+            Change::AddWanting { offers } => {
+                let book = book()?;
+                for offer in offers {
+                    plan.offers.push(book.offers.album(offer, now)?.clone());
+                }
+                // CARRIED from C11's integration rules while the shared check is pending.
+                let first = plan.offers.first().ok_or(Refusal::SearchAgain)?;
+                if plan.offers.iter().any(|offer| offer.artist_id != first.artist_id) {
+                    return Err(Refusal::SearchAgain);
+                }
+            }
+            Change::Want { artist, albums } => {
+                let book = book()?;
+                for album in albums {
+                    let (_, row, _) = book.listed.iter().find(|(known, row, seen)|
+                        known == artist && &row.id == album && recent(*seen, now))
+                        .ok_or(Refusal::SearchAgain)?;
+                    plan.listed.push(row.clone());
+                }
+            }
+            Change::Cancel { .. } | Change::Batch { .. } => {}
+        }
+        Ok(plan)
+    }
+}
+
+const QUEUED: i64 = 0;
+const STARTED: i64 = 1;
+const MAY_HAVE_CHANGED: i64 = 2;
+const FINISHED: i64 = 3;
+
+#[derive(Serialize, Deserialize)]
+enum JobResult {
+    Done(Completed),
+    Failed(Refusal),
+}
+
+impl JobResult {
+    fn answer(self) -> Answer {
+        match self {
+            Self::Done(result) => Answer::Done { result },
+            Self::Failed(reason) => Answer::Failed { reason },
+        }
+    }
+}
+
+fn encode(value: &impl Serialize) -> Result<Vec<u8>, Refusal> {
+    serde_json::to_vec(value).map_err(|_| Refusal::NotDealtWith)
+}
+
+fn decode<T: serde::de::DeserializeOwned>(value: &[u8]) -> Result<T, Refusal> {
+    serde_json::from_slice(value).map_err(|_| Refusal::NotDealtWith)
+}
+
+fn sql_error(_: rusqlite::Error) -> Refusal {
+    Refusal::NotDealtWith
+}
+
+fn job_id(row: i64) -> Result<JobId, Refusal> {
+    u64::try_from(row).ok().and_then(NonZeroU64::new).map(JobId).ok_or(Refusal::NotDealtWith)
+}
+
+fn row_id(job: JobId) -> Result<i64, Refusal> {
+    i64::try_from(job.0.get()).map_err(|_| Refusal::JobNotFound)
+}
+
+fn unsigned(number: i64) -> Result<u64, Refusal> {
+    u64::try_from(number).map_err(|_| Refusal::NotDealtWith)
+}
+
+fn sql(number: u64) -> Result<i64, Refusal> {
+    events::sql(number).map_err(sql_error)
+}
+
+struct Job {
+    row: i64,
+    account: AccountId,
+    restore: u64,
+    admin: bool,
+    change: Change,
+    plan: Plan,
+    recovering: bool,
+}
+
+fn existing_job(db: &Connection, actor: Actor, request: wire::RequestId, change: &[u8]) -> Result<Option<JobId>, Refusal> {
+    let existing: Option<(i64, Vec<u8>)> = db.query_row(
+        "SELECT id, change FROM requests_jobs WHERE restore = ?1 AND account = ?2 AND session = ?3 AND request = ?4",
+        params![sql(actor.restore)?, sql(actor.account.get())?, sql(actor.session.get())?, request.get().to_be_bytes().as_slice()],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).optional().map_err(sql_error)?;
+    match existing {
+        Some((row, saved)) if saved == change => job_id(row).map(Some),
+        Some(_) => Err(Refusal::Malformed),
+        None => Ok(None),
+    }
+}
+
+fn enqueue(
+    keeper: &mut Keeper,
+    actor: Actor,
+    request: wire::RequestId,
+    change: &[u8],
+    plan: &Plan,
+) -> Result<JobId, Refusal> {
+    let plan = encode(plan)?;
+    let restore = sql(actor.restore)?;
+    let account = sql(actor.account.get())?;
+    let session = sql(actor.session.get())?;
+    let occupied: bool = keeper.data().connection().query_row(
+        "SELECT EXISTS(SELECT 1 FROM requests_jobs WHERE restore = ?1 AND account = ?2 AND stage < ?3)",
+        params![restore, account, FINISHED], |row| row.get(0),
+    ).map_err(sql_error)?;
+    let waiting: i64 = keeper.data().connection().query_row(
+        "SELECT count(*) FROM requests_jobs WHERE restore = ?1 AND stage = ?2",
+        params![restore, QUEUED], |row| row.get(0),
+    ).map_err(sql_error)?;
+    if occupied || waiting >= wire::WAITING_MAX as i64 {
+        return Err(Refusal::Busy);
+    }
+    let row = keeper.write_data(actor.now, |tx| {
+        tx.execute(
+            "INSERT INTO requests_jobs (restore, account, session, request, change, work) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![restore, account, session, request.get().to_be_bytes().as_slice(), change, plan],
+        )?;
+        Ok((tx.last_insert_rowid(), true))
+    }).map_err(|_| Refusal::NotDealtWith)?;
+    job_id(row)
+}
+
+fn after_job(db: &Connection, actor: Actor, job: JobId) -> Result<Answer, Refusal> {
+    let (stage, result): (i64, Option<String>) = db.query_row(
+        "SELECT stage, result FROM requests_jobs WHERE id = ?1 AND restore = ?2 AND account = ?3 AND session = ?4",
+        params![row_id(job)?, sql(actor.restore)?, sql(actor.account.get())?, sql(actor.session.get())?],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).optional().map_err(sql_error)?.ok_or(Refusal::JobNotFound)?;
+    if stage != FINISHED {
+        return Ok(Answer::Working);
+    }
+    result.ok_or(Refusal::NotDealtWith).and_then(|text| decode::<JobResult>(text.as_bytes())).map(JobResult::answer)
+}
+
+fn batch_lines(db: &Connection, actor: Actor, job: JobId) -> Result<Answer, Refusal> {
+    let change: Vec<u8> = db.query_row(
+        "SELECT change FROM requests_jobs WHERE id = ?1 AND restore = ?2 AND account = ?3 AND session = ?4",
+        params![row_id(job)?, sql(actor.restore)?, sql(actor.account.get())?, sql(actor.session.get())?],
+        |row| row.get(0),
+    ).optional().map_err(sql_error)?.ok_or(Refusal::JobNotFound)?;
+    let Change::Batch { lines, .. } = decode(&change)? else { return Err(Refusal::JobNotFound) };
+    let mut select = db.prepare("SELECT line, progress FROM requests_lines WHERE job = ?1").map_err(sql_error)?;
+    let mut progress = HashMap::new();
+    let saved = select.query_map([row_id(job)?], |row| Ok((row.get::<_, u16>(0)?, row.get::<_, String>(1)?))).map_err(sql_error)?;
+    for item in saved {
+        let (line, text) = item.map_err(sql_error)?;
+        progress.insert(line, decode(text.as_bytes())?);
+    }
+    let lines = (0..lines.len() as u16).map(|index| BatchLineView {
+        index,
+        progress: progress.remove(&index).unwrap_or(BatchLineProgress::Waiting),
+    }).collect();
+    Ok(Answer::BatchLines { lines, next: None })
+}
+
+fn owners(
+    db: &Connection,
+    binding: &[u8; 32],
+    account: AccountId,
+    releases: &[&str],
+) -> Result<HashMap<String, Vec<AccountId>>, Refusal> {
+    if releases.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let releases = serde_json::to_string(releases).map_err(|_| Refusal::NotDealtWith)?;
+    let mut select = db.prepare(
+        "SELECT DISTINCT value,
+            (SELECT account FROM requests_owners WHERE binding = ?2 AND release = value AND account = ?3),
+            (SELECT account FROM requests_owners WHERE binding = ?2 AND release = value AND account <> ?3 LIMIT 1)
+         FROM json_each(?1)",
+    ).map_err(sql_error)?;
+    let rows = select.query_map(params![releases, binding.as_slice(), sql(account.get())?], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?, row.get::<_, Option<i64>>(2)?))
+    }).map_err(sql_error)?;
+    let mut found = HashMap::new();
+    for row in rows {
+        let (release, mine, other) = row.map_err(sql_error)?;
+        let requesters: Vec<_> = [mine, other].into_iter().flatten()
+            .filter_map(|number| u64::try_from(number).ok().and_then(AccountId::new)).collect();
+        if !requesters.is_empty() {
+            found.insert(release, requesters);
+        }
+    }
+    Ok(found)
+}
+
+fn owner_view(
+    db: &Connection,
+    binding: &[u8; 32],
+    actor: Actor,
+    found: &mut Answer,
+) -> Result<(), Refusal> {
+    let mine = |known: &HashMap<String, Vec<AccountId>>, release: &MusicBrainzId| {
+        known.get(release.as_str()).is_some_and(|requesters| requesters.contains(&actor.account))
+    };
+    match found {
+        Answer::Pending { albums, .. } => {
+            let known = owners(db, binding, actor.account, &albums.iter().map(|album| album.album.as_str()).collect::<Vec<_>>())?;
+            albums.retain_mut(|album| {
+                let requesters = known.get(album.album.as_str()).map(Vec::as_slice).unwrap_or_default();
+                album.removable = wire::may_cancel(wire::RequestsAccess::On, actor.account, actor.admin, requesters).is_ok();
+                actor.admin || requesters.contains(&actor.account)
+            });
+        }
+        Answer::FoundReleases { albums, .. } | Answer::FoundAny { albums, .. } if !actor.admin => {
+            let known = owners(db, binding, actor.account, &albums.iter().map(|album| album.album.0.as_str()).collect::<Vec<_>>())?;
+            for album in albums {
+                album.requested &= mine(&known, &album.album.0);
+            }
+        }
+        Answer::AlbumsOf { albums, .. } | Answer::ReleasesOf { releases: albums, .. } if !actor.admin => {
+            let known = owners(db, binding, actor.account, &albums.iter().map(|release| release.album.album.0.as_str()).collect::<Vec<_>>())?;
+            for release in albums {
+                release.album.requested &= mine(&known, &release.album.album.0);
+            }
+        }
+        Answer::Listed { releases, .. } if !actor.admin => {
+            let known = owners(db, binding, actor.account, &releases.iter().map(|release| release.album.as_str()).collect::<Vec<_>>())?;
+            for release in releases {
+                release.wanted &= mine(&known, &release.album);
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn binding(endpoint: &Endpoint) -> [u8; 32] {
+    endpoint_binding(endpoint.url.as_str())
+}
+
+struct Credential {
+    revision: u64,
+    key: Zeroizing<String>,
+}
+
+enum Dispatch {
+    Done(Answer),
+    Read { ask: Read, actor: Actor, credential: Credential },
+}
+
+async fn call(
+    State(service): State<Arc<Requests>>,
+    axum::Extension(ingress): axum::Extension<Arc<Ingress>>,
+    body: Bytes,
+) -> Response<Body> {
+    let message = match wire::read_call(&body) {
+        Ok(message) => message,
+        Err(_) => return events::respond(crate::accounts::session::refused(account::Refusal::Malformed)),
+    };
+    let hash = ingress.hash.clone();
+    let head = message.head;
+    let for_finish = RequestHead { speaks: head.speaks, restore: head.restore };
+    let session = ingress.session;
+    let state = service.clone();
+    let result = service.shown(hash.clone(), head, session, move |keeper, actor| {
+        Ok(state.dispatch(keeper, actor, message.call))
+    }).await;
+    match result {
+        Ok((Ok(Dispatch::Done(answer)), receipt)) => send(Ok(answer), receipt),
+        Ok((Err(reason), receipt)) => send(Err(reason), receipt),
+        Ok((Ok(Dispatch::Read { ask, actor, credential }), receipt)) => {
+            let Some(place) = Place::upstream(service.rooms.clone(), actor.account.get()) else {
+                return send(Err(Refusal::Busy), receipt);
+            };
+            let endpoint = service.endpoint.clone().expect("a credential has an endpoint");
+            let for_read = ask.clone();
+            let runtime = Handle::current();
+            let binding = binding(&endpoint);
+            let found = tokio::task::spawn_blocking(move || {
+                let _place = place;
+                let lidarr = endpoint.lidarr(runtime, &credential.key, Some(Instant::now() + UPSTREAM_TIMEOUT));
+                for_read.ask(&lidarr).map_err(|error| wire::refusal_for(&error, None))
+            }).await.unwrap_or(Err(Refusal::NotDealtWith));
+            let state = service.clone();
+            match service.shown(hash, for_finish, session, move |keeper, actor| {
+                Ok((|| {
+                    let db = keeper.data().connection();
+                    access(db, actor.account).map_err(sql_error)?.check()?;
+                    let mut found = found?;
+                    owner_view(db, &binding, actor, &mut found)?;
+                    let mut books = lock(&state.books);
+                    let answer = books.first(actor.session, &ask, found)?;
+                    books.remember(actor.session, seconds(actor.now), &ask, &answer);
+                    Ok(answer)
+                })())
+            }).await {
+                Ok((answer, receipt)) => send(answer, receipt),
+                Err(why) => events::respond(crate::accounts::session::refused(why)),
+            }
+        }
+        Err(why) => events::respond(crate::accounts::session::refused(why)),
+    }
+}
+
+impl Requests {
+    fn dispatch(&self, keeper: &mut Keeper, actor: Actor, call: Call) -> Result<Dispatch, Refusal> {
+        let endpoint = self.endpoint.as_ref().ok_or(Refusal::LidarrNotSetUp)?;
+        access(keeper.data().connection(), actor.account).map_err(sql_error)?.check()?;
+        let binding = binding(endpoint);
+        let db = keeper.data().connection();
+        let answer = match call {
+            Call::Begin { request_id, change } => {
+                let change_bytes = encode(&change)?;
+                if let Some(job) = existing_job(db, actor, request_id, &change_bytes)? {
+                    return Ok(Dispatch::Done(Answer::Begun { job }));
+                }
+                if let Change::Cancel { release, .. } = &change {
+                    let owners = owners(db, &binding, actor.account, &[release.as_str()])?;
+                    wire::may_cancel(wire::RequestsAccess::On, actor.account, actor.admin,
+                        owners.get(release.as_str()).map(Vec::as_slice).unwrap_or_default())?;
+                }
+                let credential = credential(keeper, endpoint)?.ok_or(Refusal::LidarrNotSetUp)?;
+                let work = Plan::resolve(&change, &lock(&self.books), actor, binding, credential.revision)?;
+                let job = enqueue(keeper, actor, request_id, &change_bytes, &work)?;
+                self.wake.notify_one();
+                Answer::Begun { job }
+            }
+            Call::After { job } => after_job(db, actor, job)?,
+            Call::BatchLines { job, after } => {
+                let found = batch_lines(db, actor, job)?;
+                let mut books = lock(&self.books);
+                let key = Read::Batch(job);
+                if let Some(after) = after {
+                    books.peek(actor.session, &key, after)?
+                } else {
+                    books.first(actor.session, &key, found)?
+                }
+            }
+            call => {
+                let (ask, cursor) = Read::from_call(call).ok_or(Refusal::Malformed)?;
+                if let Some(cursor) = cursor {
+                    let mut books = lock(&self.books);
+                    let answer = books.peek(actor.session, &ask, cursor)?;
+                    books.remember(actor.session, seconds(actor.now), &ask, &answer);
+                    return Ok(Dispatch::Done(answer));
+                }
+                let credential = credential(keeper, endpoint)?.ok_or(Refusal::LidarrNotSetUp)?;
+                return Ok(Dispatch::Read { ask, actor, credential });
+            }
+        };
+        Ok(Dispatch::Done(answer))
+    }
+
+    pub(crate) fn start(self: &Arc<Self>) {
+        if self.endpoint.is_none() {
+            return;
+        }
+        let service = Arc::downgrade(self);
+        let wake = self.wake.clone();
+        tokio::spawn(async move {
+            loop {
+                let Some(state) = service.upgrade() else { return };
+                state.restore_at_start().await;
+                loop {
+                    let dispatching = state.clone();
+                    let clock = state.accounts.clock.clone();
+                    let selected = state.accounts.desk.ask(move |keeper| {
+                        dispatching.claim(keeper, clock())
+                    }).await;
+                    let Ok(Ok(Some((job, place, credential)))) = selected else { break };
+                    let state = state.clone();
+                    let runtime = Handle::current();
+                    tokio::task::spawn_blocking(move || {
+                        let _place = place;
+                        state.run(job, credential, runtime);
+                        state.wake.notify_one();
+                    });
+                }
+                drop(state);
+                let _ = tokio::time::timeout(Duration::from_secs(2), wake.notified()).await;
+            }
+        });
+    }
+
+    async fn restore_at_start(self: &Arc<Self>) {
+        let Some(endpoint) = self.endpoint.clone() else { return };
+        let identity = binding(&endpoint);
+        let lookup = endpoint.clone();
+        let found = self.accounts.desk.ask(move |keeper| {
+            let pending = keeper.data().connection().query_row(
+                "SELECT EXISTS(SELECT 1 FROM requests_way_back WHERE binding = ?1)",
+                [identity.as_slice()], |row| row.get::<_, bool>(0),
+            ).map_err(sql_error)?;
+            if !pending {
+                return Ok(None);
+            }
+            Ok(credential(keeper, &lookup)?.map(|credential| (keeper.restore(), credential)))
+        }).await;
+        let Ok(Ok::<_, Refusal>(Some((restore, key)))) = found else { return };
+        let Some(place) = Place::upstream(self.rooms.clone(), 0) else { return };
+        let runtime = Handle::current();
+        let journal = Journal {
+            service: self.clone(), runtime: runtime.clone(), binding: identity, restore, row: 0, artist: None,
+        };
+        let _ = tokio::task::spawn_blocking(move || {
+            let _place = place;
+            let _turn = lock(&journal.service.mutation);
+            let lidarr = endpoint.lidarr(runtime, &key.key, None);
+            journal.restore_pending(&lidarr)
+        }).await;
+    }
+
+    fn claim(&self, keeper: &mut Keeper, now: u64) -> Result<Option<(Job, Place, Credential)>, Refusal> {
+        let Some(endpoint) = &self.endpoint else { return Ok(None) };
+        let db = keeper.data().connection();
+        let (
+            row, account, session, change, plan, stage, place,
+        ) = {
+            let mut query = db.prepare(
+                "SELECT id, account, session, change, work, stage FROM requests_jobs
+                 WHERE restore = ?1 AND stage < ?2 ORDER BY id LIMIT ?3",
+            ).map_err(sql_error)?;
+            let mut rows = query.query(params![sql(keeper.restore())?, FINISHED, (wire::WAITING_MAX + wire::RUNNING_MAX) as i64])
+                .map_err(sql_error)?;
+            loop {
+                let Some(row) = rows.next().map_err(sql_error)? else { return Ok(None) };
+                let account = unsigned(row.get::<_, i64>(1).map_err(sql_error)?)?;
+                let Some(place) = Place::upstream(self.rooms.clone(), account) else { continue };
+                break (row.get::<_, i64>(0).map_err(sql_error)?, account, row.get::<_, i64>(2).map_err(sql_error)?,
+                    row.get::<_, Vec<u8>>(3).map_err(sql_error)?, row.get::<_, Vec<u8>>(4).map_err(sql_error)?,
+                    row.get::<_, i64>(5).map_err(sql_error)?, place);
+            }
+        };
+        let plan: Plan = decode(&plan)?;
+        let mut actor = keeper.load(account).map_err(|_| Refusal::NotDealtWith)?;
+        let account_id = actor.state().id;
+        let restore = keeper.restore();
+        let live = SessionId::new(unsigned(session)?).ok_or(Refusal::NotDealtWith)?;
+        let db = keeper.data().connection();
+        let live = rows::session_by_id(db, live).map_err(sql_error)?;
+        let access = access(db, account_id).map_err(sql_error)?.check();
+        let key = credential(keeper, endpoint)?;
+        let allowed = (|| {
+            if access.is_err() {
+                return Err(Refusal::SwitchedOff);
+            }
+            let (number, device, hash, _) = live.ok_or(Refusal::NotSignedIn)?;
+            if number != account {
+                return Err(Refusal::NotSignedIn);
+            }
+            events::inspect_session(keeper, &mut actor, device, &Fingerprint::from_bytes(hash), now)
+                .map_err(|_| Refusal::NotSignedIn)?;
+            let key = key.ok_or(Refusal::LidarrNotSetUp)?;
+            if plan.binding != binding(endpoint) || plan.revision != key.revision {
+                return Err(Refusal::LidarrNotSetUp);
+            }
+            Ok(key)
+        })();
+        let key = match allowed {
+            Ok(key) => key,
+            Err(reason) => {
+                finish_job(keeper, now, row, &JobResult::Failed(reason), &[], None)?;
+                self.wake.notify_one();
+                return Ok(None);
+            }
+        };
+        if stage == QUEUED {
+            keeper.write_data(now, |tx| {
+                tx.execute("UPDATE requests_jobs SET stage = ?1 WHERE id = ?2 AND stage = ?3", params![STARTED, row, QUEUED])
+                    .map(|count| ((), count != 0))
+            }).map_err(|_| Refusal::NotDealtWith)?;
+        }
+        Ok(Some((Job {
+            row,
+            account: account_id,
+            restore,
+            admin: actor.state().admin,
+            change: decode(&change)?,
+            plan,
+            recovering: stage == MAY_HAVE_CHANGED,
+        }, place, key)))
+    }
+
+    fn run(self: &Arc<Self>, job: Job, credential: Credential, runtime: Handle) {
+        let Some(endpoint) = &self.endpoint else { return };
+        let journal = Journal {
+            service: self.clone(), runtime: runtime.clone(), binding: job.plan.binding,
+            restore: job.restore, row: job.row,
+            artist: job.plan.offers.first().and_then(|offer| offer.artist_id.clone()),
+        };
+        let ready = Arc::new(AtomicBool::new(job.recovering));
+        let pre_write = {
+            let journal = journal.clone();
+            Arc::new(move || {
+                if ready.load(Ordering::Relaxed) {
+                    return true;
+                }
+                let was_kept = journal.ask(|keeper, now, row| {
+                    keeper.write_data(now, |tx| tx.execute(
+                        "UPDATE requests_jobs SET stage = ?1 WHERE id = ?2 AND stage = ?3",
+                        params![MAY_HAVE_CHANGED, row, STARTED],
+                    ).map(|count| (count != 0, count != 0))).map_err(|_| Refusal::NotDealtWith)
+                }).unwrap_or(false);
+                ready.store(was_kept, Ordering::Relaxed);
+                was_kept
+            })
+        };
+        let lidarr = Lidarr::new(endpoint.url.as_str(), &credential.key, None, Arc::new(Line {
+            endpoint: endpoint.clone(), runtime: runtime.clone(), within: UPSTREAM_TIMEOUT,
+            deadline: None, before_write: Some(pre_write),
+        }));
+        let _mutation = (!matches!(job.change, Change::Batch { .. })).then(|| lock(&self.mutation));
+        let result = if let Change::Batch { singles, lines } = &job.change {
+            self.run_batch(&job, &journal, &lidarr, *singles, lines)
+                .map(|()| (Completed::Batch, Vec::new(), None))
+        } else {
+            let cleaned = journal.restore_pending(&endpoint.lidarr(runtime, &credential.key, None));
+            cleaned.and_then(|()| {
+                if job.recovering { job.recover(&lidarr) } else { job.run(&journal, &lidarr) }
+            })
+        };
+        let account = job.account;
+        let binding = job.plan.binding;
+        let (result, adds, removed) = match result {
+            Ok((done, releases, removed)) => (JobResult::Done(done), releases, removed),
+            Err(reason) => (JobResult::Failed(reason), Vec::new(), None),
+        };
+        let _ = journal.ask(move |keeper, now, row| {
+            finish_job(keeper, now, row, &result, &adds, Some((binding, account, removed)))
+        });
+    }
+}
+
+fn finish_job(
+    keeper: &mut Keeper,
+    now: u64,
+    row: i64,
+    result: &JobResult,
+    adds: &[MusicBrainzId],
+    ownership: Option<([u8; 32], AccountId, Option<MusicBrainzId>)>,
+) -> Result<(), Refusal> {
+    let text = serde_json::to_string(result).map_err(|_| Refusal::NotDealtWith)?;
+    let at = keeper.clock(now).effective();
+    keeper.write_data(now, |tx| {
+        let changed = tx.execute(
+            "UPDATE requests_jobs SET stage = ?1, result = ?2 WHERE id = ?3 AND stage < ?1",
+            params![FINISHED, text, row],
+        )? != 0;
+        if let Some((binding, account, removed)) = ownership.filter(|_| changed) {
+            for release in adds {
+                keep_owner(tx, &binding, account, release, at)?;
+            }
+            if let Some(release) = removed {
+                tx.execute("DELETE FROM requests_owners WHERE binding = ?1 AND release = ?2",
+                    params![binding.as_slice(), release.as_str()])?;
+            }
+        }
+        Ok(((), changed))
+    }).map_err(|_| Refusal::NotDealtWith)
+}
+
+fn keep_owner(db: &Connection, binding: &[u8; 32], account: AccountId, release: &MusicBrainzId, now: u64) -> rusqlite::Result<()> {
+    db.execute(
+        "INSERT OR IGNORE INTO requests_owners (binding, account, release, asked_ms)
+         SELECT ?1, number, ?2, ?3 FROM accounts WHERE number = ?4",
+        params![binding.as_slice(), release.as_str(), events::sql(now)?, events::sql(account.get())?],
+    ).map(drop)
+}
+
+#[derive(Clone)]
+struct Journal {
+    service: Arc<Requests>,
+    runtime: Handle,
+    binding: [u8; 32],
+    restore: u64,
+    row: i64,
+    artist: Option<MusicBrainzId>,
+}
+
+impl Journal {
+    fn ask<T: Send + 'static>(
+        &self,
+        step: impl FnOnce(&mut Keeper, u64, i64) -> Result<T, Refusal> + Send + 'static,
+    ) -> Result<T, Refusal> {
+        let clock = self.service.accounts.clock.clone();
+        let row = self.row;
+        let restore = self.restore;
+        self.runtime.block_on(self.service.accounts.desk.ask(move |keeper| {
+            if keeper.restore() != restore {
+                return Err(Refusal::StartAgain);
+            }
+            step(keeper, clock(), row)
+        })).map_err(|_| Refusal::Busy)?
+    }
+
+    fn restore_pending(&self, lidarr: &Lidarr) -> Result<(), Refusal> {
+        let binding = self.binding;
+        let pending = self.ask(move |keeper, _, _| {
+            let mut query = keeper.data().connection().prepare(
+                "SELECT artist, artist_key, setting FROM requests_way_back WHERE binding = ?1 ORDER BY id LIMIT 20",
+            ).map_err(sql_error)?;
+            let rows = query.query_map([binding.as_slice()], |row| Ok((
+                row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
+            ))).map_err(sql_error)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(sql_error)
+        })?;
+        for (artist, artist_key, setting) in pending {
+            let known = lidarr_result(lidarr.known_artist(&artist_key), None)?;
+            if known.is_some_and(|(number, _)| number == artist) {
+                lidarr.set_new_releases(artist, &setting).map_err(|_| Refusal::LidarrCouldNotRestore)?;
+                self.cross_off(artist, setting)?;
+            } else {
+                return Err(Refusal::LidarrCouldNotRestore);
+            }
+        }
+        Ok(())
+    }
+
+    fn cross_off(&self, artist: i64, setting: String) -> Result<(), Refusal> {
+        let binding = self.binding;
+        self.ask(move |keeper, now, _| {
+            keeper.write_data(now, |tx| tx.execute(
+                "DELETE FROM requests_way_back WHERE binding = ?1 AND artist = ?2 AND setting = ?3",
+                params![binding.as_slice(), artist, setting],
+            ).map(|count| ((), count != 0))).map_err(|_| Refusal::NotDealtWith)
+        })
+    }
+}
+
+// A job's outer mutation turn serializes the check, effect and ownership
+// commit with every other job. Core's nested WayBack turn uses the same scope.
+impl lidarr::WayBack for Journal {
+    fn turn(&self) -> Box<dyn lidarr::Turn + '_> {
+        Box::new(())
+    }
+
+    fn keep(&self, address: &str, artist: i64, before: &str) -> Result<bool, String> {
+        let fail = || "Couldn't keep the way back.".to_owned();
+        let binding = self.binding;
+        if binding != endpoint_binding(address) || !matches!(before, "all" | "new" | "none") {
+            return Err(fail());
+        }
+        let before = before.to_owned();
+        let artist_key = self.artist.clone().ok_or_else(fail)?;
+        let kept = self.ask(move |keeper, now, _| {
+            keeper.write_data(now, |tx| tx.execute(
+                "INSERT OR IGNORE INTO requests_way_back (binding, artist, artist_key, setting) VALUES (?1, ?2, ?3, ?4)",
+                params![binding.as_slice(), artist, artist_key.as_str(), before],
+            ).map(|count| (count != 0, count != 0))).map_err(|_| Refusal::NotDealtWith)
+        }).map_err(|_| fail())?;
+        if kept { Ok(true) } else { Err(fail()) }
+    }
+
+    fn put_back(&self, address: &str, artist: i64, before: &str) {
+        if self.binding == endpoint_binding(address) {
+            let _ = self.cross_off(artist, before.to_owned());
+        }
+    }
+}
+
+fn endpoint_binding(address: &str) -> [u8; 32] {
+    Sha256::digest(address.trim_end_matches('/')).into()
+}
+
+type Changed = (Completed, Vec<MusicBrainzId>, Option<MusicBrainzId>);
+
+fn lidarr_result<T>(value: Result<T, String>, wanted: Option<&Offer>) -> Result<T, Refusal> {
+    value.map_err(|why| wire::refusal_for(&why, wanted))
+}
+
+impl Job {
+    fn run(&self, journal: &Journal, lidarr: &Lidarr) -> Result<Changed, Refusal> {
+        let done = |result| Ok((result, Vec::new(), None));
+        match &self.change {
+            Change::Request { offer } => {
+                let wanted = self.plan.offers.first().ok_or(Refusal::SearchAgain)?.clone().into();
+                self.request_album(journal, lidarr, &offer.0, &wanted)?;
+                Ok((Completed::Requested, vec![offer.0.clone()], None))
+            }
+            Change::AddArtist { artist } => {
+                let name = &self.plan.artist.as_ref().ok_or(Refusal::SearchAgain)?.name;
+                let count = lidarr_result(lidarr.add_artist(artist.as_str(), name, journal), None)?;
+                let count = u32::try_from(count).map_err(|_| Refusal::TooLarge)?;
+                done(Completed::ArtistAdded { count })
+            }
+            Change::AddWanting { .. } => {
+                let offers: Vec<Offer> = self.plan.offers.iter().cloned().map(Offer::from).collect();
+                let mut setup = lidarr_result(lidarr.setup(), None)?;
+                let artist = lidarr_result(lidarr.add_wanting(&mut setup, &offers), None)?;
+                let artist = LidarrNumber::new(artist).ok_or(Refusal::LidarrUnrecognized)?;
+                Ok((Completed::AddedWanting { artist }, self.plan.offers.iter().map(|offer| offer.album.0.clone()).collect(), None))
+            }
+            Change::Want { artist, albums } => {
+                let current = lidarr_result(lidarr.listed((*artist).into()), None)?;
+                self.check_listed(&current)?;
+                let albums: Vec<_> = albums.iter().map(|album| i64::from(*album)).collect();
+                lidarr_result(lidarr.want((*artist).into(), &albums), None)?;
+                Ok((Completed::Wanted, self.plan.listed.iter().map(|row| row.album.clone()).collect(), None))
+            }
+            Change::ListSingles { artist, .. } => {
+                let wanted: Offer = self.plan.offers.first().ok_or(Refusal::SearchAgain)?.clone().into();
+                let current = lidarr_result(lidarr.known_artist(&wanted.artist_id), Some(&wanted))?;
+                if current.is_none_or(|(number, _)| number != i64::from(*artist)) {
+                    return Err(Refusal::SearchAgain);
+                }
+                let started = lidarr_result(lidarr.start_listing_singles_kept((*artist).into(), &wanted, journal), Some(&wanted))?;
+                if let Some((before, wrote)) = started {
+                    let artist = i64::from(*artist);
+                    let started = Instant::now();
+                    let watched = HashSet::from([artist]);
+                    let wait = (|| {
+                        lidarr_result(lidarr.pause(Duration::from_secs(3)), Some(&wanted))?;
+                        while lidarr_result(lidarr.busy_with(&watched), Some(&wanted))?.contains(&artist) {
+                            if started.elapsed() >= Duration::from_secs(90) {
+                                return Err(Refusal::LidarrUnavailable);
+                            }
+                            lidarr_result(lidarr.pause(Duration::from_secs(2)), Some(&wanted))?;
+                        }
+                        Ok(())
+                    })();
+                    let restored = lidarr.set_new_releases(artist, &before).map_err(|_| Refusal::LidarrCouldNotRestore);
+                    if restored.is_ok() && wrote {
+                        journal.cross_off(artist, before)?;
+                    }
+                    wait.and(restored)?;
+                }
+                done(Completed::ListedSingles)
+            }
+            Change::Cancel { album, release } => {
+                let pending = pending_target(lidarr, *album, release)?;
+                pending.check_cancel_target(*album, release)?;
+                let binding = self.plan.binding;
+                let account = self.account;
+                let admin = self.admin;
+                let target = release.clone();
+                journal.ask(move |keeper, _, _| {
+                    let current = keeper.load(account.get()).map_err(|_| Refusal::NotAllowed)?;
+                    let db = keeper.data().connection();
+                    let access = access(db, account).map_err(sql_error)?;
+                    let owners = owners(db, &binding, account, &[target.as_str()])?;
+                    wire::may_cancel(access, account, admin && current.state().admin, owners.get(target.as_str()).map(Vec::as_slice).unwrap_or_default())
+                })?;
+                lidarr_result(lidarr.cancel((*album).into()), None)?;
+                Ok((Completed::Cancelled, Vec::new(), Some(release.clone())))
+            }
+            Change::Batch { .. } => Err(Refusal::NotDealtWith),
+        }
+    }
+
+    fn request_album(&self, journal: &Journal, lidarr: &Lidarr, release: &MusicBrainzId, wanted: &Offer) -> Result<(), Refusal> {
+        let binding = self.plan.binding;
+        let release = release.clone();
+        let owned = journal.ask(move |keeper, _, _| {
+            keeper.data().connection().query_row(
+                "SELECT EXISTS(SELECT 1 FROM requests_owners WHERE binding = ?1 AND release = ?2)",
+                params![binding.as_slice(), release.as_str()], |row| row.get::<_, bool>(0),
+            ).map_err(sql_error)
+        })?;
+        // Someone has already had this exact group placed. Associate the new
+        // request with it without issuing another AlbumSearch.
+        if owned {
+            return Ok(());
+        }
+        lidarr_result(lidarr.request(wanted, journal), Some(wanted))
+    }
+
+    fn check_listed(&self, current: &[lidarr::Listed]) -> Result<(), Refusal> {
+        if self.plan.listed.iter().all(|selected| current.iter().any(|row|
+            row.id == i64::from(selected.id) && row.album == selected.album.as_str()))
+        {
+            Ok(())
+        } else {
+            Err(Refusal::NoLongerListed)
+        }
+    }
+
+    /// CARRIED while core supplies interrupted-operation decisions. A restart
+    /// can run a job which made no writes, or verify a remote effect which may
+    /// already have happened. It must never replay an uncertain mutation.
+    fn recover(&self, lidarr: &Lidarr) -> Result<Changed, Refusal> {
+        match &self.change {
+            Change::Request { offer } => {
+                let wanted: Offer = self.plan.offers.first().ok_or(Refusal::SearchAgain)?.clone().into();
+                if album_is_wanted(lidarr, &wanted)? {
+                    Ok((Completed::Requested, vec![offer.0.clone()], None))
+                } else {
+                    Err(Refusal::NotDealtWith)
+                }
+            }
+            Change::Want { artist, .. } => {
+                let current = lidarr_result(lidarr.listed((*artist).into()), None)?;
+                self.check_listed(&current)?;
+                let requested = self.plan.listed.iter().all(|wanted| current.iter().any(|row|
+                    row.id == i64::from(wanted.id) && (row.wanted || row.have)));
+                if requested {
+                    Ok((Completed::Wanted, self.plan.listed.iter().map(|row| row.album.clone()).collect(), None))
+                } else {
+                    Err(Refusal::NotDealtWith)
+                }
+            }
+            Change::AddWanting { .. } => {
+                let wanted: Offer = self.plan.offers.first().ok_or(Refusal::SearchAgain)?.clone().into();
+                let Some((number, _)) = lidarr_result(lidarr.known_artist(&wanted.artist_id), Some(&wanted))? else {
+                    return Err(Refusal::NotDealtWith);
+                };
+                let current = lidarr_result(lidarr.listed(number), Some(&wanted))?;
+                if !self.plan.offers.iter().all(|offer| current.iter().any(|row|
+                    row.album == offer.album.0.as_str() && (row.wanted || row.have)))
+                {
+                    return Err(Refusal::NotDealtWith);
+                }
+                let artist = LidarrNumber::new(number).ok_or(Refusal::LidarrUnrecognized)?;
+                Ok((Completed::AddedWanting { artist }, self.plan.offers.iter().map(|offer| offer.album.0.clone()).collect(), None))
+            }
+            _ => Err(Refusal::NotDealtWith),
+        }
+    }
+}
+
+fn album_is_wanted(lidarr: &Lidarr, wanted: &Offer) -> Result<bool, Refusal> {
+    let Some((artist, _)) = lidarr_result(lidarr.known_artist(&wanted.artist_id), Some(wanted))? else {
+        return Ok(false);
+    };
+    let listed = lidarr_result(lidarr.listed(artist), Some(wanted))?;
+    Ok(listed.iter().any(|known| known.album == wanted.album && (known.wanted || known.have)))
+}
+
+fn pending_target(lidarr: &Lidarr, album: LidarrNumber, release: &MusicBrainzId) -> Result<PendingView, Refusal> {
+    let rows: Vec<PendingView> = lidarr_items(lidarr_result(lidarr.pending(), None)?);
+    rows.into_iter().find(|row| row.check_cancel_target(album, release).is_ok()).ok_or(Refusal::NoLongerListed)
+}
+
+impl Requests {
+    fn run_batch(&self, job: &Job, journal: &Journal, lidarr: &Lidarr, singles: bool, lines: &[BatchLine]) -> Result<(), Refusal> {
+        for (index, line) in lines.iter().enumerate() {
+            let index = index as u16;
+            let saved = journal.progress(index)?;
+            let (view, resume) = match saved {
+                Some(BatchLineProgress::Found { album }) => {
+                    let text = format!("lidarr:{}", album.offer.0.as_str());
+                    let found = lidarr_result(lidarr.find_any(&text), None)?;
+                    let found: Vec<AlbumView> = lidarr_items(found);
+                    let Some(view) = found.into_iter().find(|view| view.album == album.offer) else {
+                        journal.save_line(index, BatchLineProgress::Failed { reason: Refusal::NoLongerListed }, None)?;
+                        continue;
+                    };
+                    (view, true)
+                }
+                Some(_) => continue,
+                None => {
+                    match find_line(lidarr, line, singles) {
+                        Ok(Some(view)) => {
+                            journal.save_line(index, BatchLineProgress::Found { album: batch_album(&view) }, None)?;
+                            (view, false)
+                        }
+                        Ok(None) => {
+                            journal.save_line(index, BatchLineProgress::NotFound, None)?;
+                            continue;
+                        }
+                        Err(reason) => {
+                            journal.save_line(index, BatchLineProgress::Failed { reason }, None)?;
+                            continue;
+                        }
+                    }
+                }
+            };
+            let _turn = lock(&self.mutation);
+            let line_journal = Journal { artist: view.artist_id.clone(), ..journal.clone() };
+            let result = line_journal.restore_pending(lidarr).and_then(|()| {
+                if resume {
+                    if album_is_wanted(lidarr, &view.clone().into())? {
+                        Ok(())
+                    } else {
+                        Err(Refusal::NotDealtWith)
+                    }
+                } else {
+                    job.request_album(&line_journal, lidarr, &view.album.0, &view.clone().into())
+                }
+            });
+            let (progress, owner) = match result {
+                Ok(()) => (BatchLineProgress::Asked { album: batch_album(&view) }, Some((job.account, view.album.0))),
+                Err(reason) => (BatchLineProgress::Failed { reason }, None),
+            };
+            journal.save_line(index, progress, owner)?;
+        }
+        Ok(())
+    }
+}
+
+fn batch_album(view: &AlbumView) -> BatchAlbum {
+    BatchAlbum { offer: view.album.clone(), title: view.title.clone(), artist: view.artist.clone() }
+}
+
+// CARRIED while bulk provides a projection for indexed server jobs and a
+// songs-only fallback that preserves the apps' MusicBrainz boundary.
+fn find_line(lidarr: &Lidarr, line: &BatchLine, singles: bool) -> Result<Option<AlbumView>, Refusal> {
+    if line.album.is_empty() {
+        return Ok(None);
+    }
+    let find = |name: &str| {
+        lidarr_result(lidarr.find_any(&format!("{name} {}", line.artist)), None)
+            .map(|found| nexus_core::bulk::choose(&found, &line.artist, &line.album, singles))
+    };
+    let mut found = find(&line.album)?;
+    let bare = nexus_core::text::undecorated(&line.album);
+    if found.is_none() && bare != line.album.trim() {
+        found = find(&bare)?;
+    }
+    Ok(lidarr_items::<AlbumView, _>(found).pop().filter(|view| view.artist_id.is_some()))
+}
+
+impl Journal {
+    fn progress(&self, index: u16) -> Result<Option<BatchLineProgress>, Refusal> {
+        self.ask(move |keeper, _, row| {
+            let text: Option<String> = keeper.data().connection().query_row(
+                "SELECT progress FROM requests_lines WHERE job = ?1 AND line = ?2",
+                params![row, index], |row| row.get(0),
+            ).optional().map_err(sql_error)?;
+            text.map(|text| decode(text.as_bytes())).transpose()
+        })
+    }
+
+    fn save_line(&self, index: u16, progress: BatchLineProgress, owner: Option<(AccountId, MusicBrainzId)>) -> Result<(), Refusal> {
+        let text = serde_json::to_string(&progress).map_err(|_| Refusal::NotDealtWith)?;
+        let binding = self.binding;
+        self.ask(move |keeper, now, row| {
+            let at = keeper.clock(now).effective();
+            keeper.write_data(now, |tx| {
+                tx.execute(
+                    "INSERT INTO requests_lines (job, line, progress) VALUES (?1, ?2, ?3)
+                     ON CONFLICT(job, line) DO UPDATE SET progress = excluded.progress",
+                    params![row, index, text],
+                )?;
+                if let Some((account, release)) = owner {
+                    keep_owner(tx, &binding, account, &release, at)?;
+                }
+                Ok(((), true))
+            }).map_err(|_| Refusal::NotDealtWith)
+        })
+    }
+}
+
+
+// Pending the apart-store adapter. The request path stays closed without a
+// key bound to this endpoint.
+#[cfg(not(test))]
+fn credential(_: &Keeper, _: &Endpoint) -> Result<Option<Credential>, Refusal> {
+    Ok(None)
+}
+
+#[cfg(test)]
+fn credential(_: &Keeper, _: &Endpoint) -> Result<Option<Credential>, Refusal> {
+    Ok(Some(Credential { revision: 1, key: Zeroizing::new(tests::TEST_KEY.to_owned()) }))
+}
+
+pub(crate) fn guards(path: &str) -> bool {
+    matches!(path, wire::REQUESTS | admin::REQUEST_GRANT | admin::SET_REQUESTS_ENABLED | GET_LIDARR)
+}
+
+fn admin_reply<T: admin::ResultBody>(answer: Result<T, admin::Refusal>) -> Response<Body> {
+    let reply = match answer {
+        Ok(result) => admin::Reply::Done(result),
+        Err(why) => admin::Reply::Refused(why),
+    };
+    match admin::encode(&reply) {
+        Ok(body) => events::respond(crate::accounts::session::Answer { status: reply.status(), body }),
+        Err(_) => events::respond(crate::accounts::music::refused(admin::Refusal::NotDealtWith)),
+    }
+}
+
+fn admin_denied() -> admin::Refusal {
+    admin::Refusal::NotAllowed(admin::Denial::Denied)
+}
+
+fn send_admin_denied() -> Response<Body> {
+    admin_reply::<admin::Applied>(Err(admin_denied()))
+}
+
+fn read_admin<T>(body: Bytes, read: impl FnOnce(&[u8]) -> Result<T, account::BadMessage>) -> Result<T, admin::Refusal> {
+    use zeroize::Zeroize;
+    let result = read(&body).map_err(|_| admin::Refusal::Malformed);
+    if let Ok(mut unique) = body.try_into_mut() {
+        unique.as_mut().zeroize();
+    }
+    result
+}
+
+async fn admin_grant(
+    State(service): State<Arc<Requests>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response<Body> {
+    if request.uri().path() != admin::REQUEST_GRANT {
+        return next.run(request).await;
+    }
+    let (parts, body) = request.into_parts();
+    let Some(ingress) = parts.extensions.get::<Arc<Ingress>>() else { return send_admin_denied() };
+    let Ok(session) = bearer(&parts.headers) else { return send_admin_denied() };
+    let Ok(body) = axum::body::to_bytes(body, account::PASSWORD_REQUEST_MAX_BYTES).await else {
+        return admin_reply::<admin::Applied>(Err(admin::Refusal::Malformed));
+    };
+    let grant = match read_admin(body, admin::read::<admin::RequestGrant>) {
+        Ok(grant) => grant,
+        Err(reason) => return admin_reply::<admin::Applied>(Err(reason)),
+    };
+    if matches!(grant.change.action, admin::Action::SetRequestsEnabled(_))
+        && (!ingress.page || ingress.kind != SessionKind::AdminPage)
+    {
+        return send_admin_denied();
+    }
+    events::respond(service.accounts.admin_grant(session, grant).await)
+}
+
+async fn set_requests_enabled(
+    State(service): State<Arc<Requests>>,
+    axum::Extension(ingress): axum::Extension<Arc<Ingress>>,
+    body: Bytes,
+) -> Response<Body> {
+    if !ingress.page || ingress.kind != SessionKind::AdminPage {
+        return send_admin_denied();
+    }
+    let request = match read_admin(body, admin::read::<admin::SetRequestsEnabled>) {
+        Ok(request) => request,
+        Err(why) => return admin_reply::<admin::Applied>(Err(why)),
+    };
+    let clock = service.accounts.clock.clone();
+    let finished = service.accounts.desk.ask(move |keeper| {
+        let now = clock();
+        let (device, mut actor) = admin_actor(keeper, &request.head, &ingress, now)?;
+        let target_id = request.change.account;
+        let mut target = if actor.state().id == target_id {
+            None
+        } else {
+            Some(keeper.load(target_id.get()).map_err(|_| admin::Refusal::NotAllowed(admin::Denial::NoSuchAccount))?)
+        };
+        let named = admin::NamedChange::for_request(&request);
+        let intent = named.grant_intent(Some(target.as_ref().unwrap_or(&actor).state()))
+            .ok_or(admin::Refusal::Malformed)?;
+        let LeaveFor::Admin { action, target: named } = intent.change else { return Err(admin::Refusal::Malformed) };
+        let bearer = Bearer { device, hash: &ingress.hash, grant: Some(GrantUse { request_id: intent.request_id, secret: &request.grant }) };
+        actor.request(request.head.restore, keeper.clock(now), |turn| {
+            turn.administer(bearer, action, named, target.as_mut())
+        }).apply(|effects| keeper.persist(effects, &[], now))
+            .map_err(|_| admin::Refusal::NotDealtWith)?
+            .map_err(admin_said)?;
+        // The store applies the switch alongside the accepted action. Until
+        // that adapter lands the setter cannot claim a change was kept.
+        let kept = access(keeper.data().connection(), target_id).map_err(|_| admin::Refusal::NotDealtWith)?;
+        if (kept == wire::RequestsAccess::On) != request.change.enabled {
+            return Err(admin::Refusal::NotDealtWith);
+        }
+        Ok(admin::Applied {})
+    }).await.unwrap_or(Err(admin::Refusal::Busy { retry_after_seconds: account::Wait::new(1) }));
+    admin_reply(finished)
+}
+
+fn admin_actor(keeper: &mut Keeper, head: &RequestHead, ingress: &Ingress, now: u64) -> Result<(DeviceId, Account), admin::Refusal> {
+    let (_, device, mut actor, kind) = events::authenticated(keeper, head, &ingress.hash, Access::Read, now)
+        .map_err(admin_from_account)?;
+    // CARRIED until kept supplies a page-only admin decision.
+    if session_id(&actor, device).map_err(admin_from_account)? != ingress.session || kind != SessionKind::AdminPage {
+        return Err(admin_denied());
+    }
+    actor.request(head.restore, keeper.clock(now), |turn| {
+        turn.admin_read(Bearer { device, hash: &ingress.hash, grant: None })
+    }).apply(|effects| keeper.persist(effects, &[], now))
+        .map_err(|_| admin::Refusal::NotDealtWith)?
+        .map_err(admin_said)?;
+    Ok((device, actor))
+}
+
+fn admin_from_account(why: account::Refusal) -> admin::Refusal {
+    match why {
+        account::Refusal::Malformed => admin::Refusal::Malformed,
+        account::Refusal::NotSignedIn(reason) => admin::Refusal::NotSignedIn(reason),
+        account::Refusal::NotAllowed(_) => admin_denied(),
+        account::Refusal::Busy { retry_after_seconds } => admin::Refusal::Busy { retry_after_seconds },
+        account::Refusal::NotDealtWith => admin::Refusal::NotDealtWith,
+    }
+}
+
+fn admin_said(why: Denied) -> admin::Refusal {
+    match why {
+        Denied::NotSignedIn => admin::Refusal::NotSignedIn(NotSignedIn::SessionEnded),
+        Denied::StartAgain => admin::Refusal::NotSignedIn(NotSignedIn::DataPutBack),
+        Denied::WrongPurpose => admin::Refusal::NotAllowed(admin::Denial::Conflict),
+        Denied::LeaveRequired => admin::Refusal::NotAllowed(admin::Denial::GrantRequired),
+        Denied::WrongPassword => admin::Refusal::NotAllowed(admin::Denial::WrongPassword),
+        Denied::Time => admin::Refusal::Busy { retry_after_seconds: account::Wait::new(1) },
+        Denied::Exhausted | Denied::ReusedSession | Denied::DeviceInUse => admin::Refusal::NotDealtWith,
+        Denied::AdminRequired | Denied::AccountOff | Denied::HistoryHeld => admin_denied(),
+    }
+}
+
+fn raw_json(status: StatusCode, body: Vec<u8>) -> Response<Body> {
+    let mut response = Response::new(Body::from(body));
+    *response.status_mut() = status;
+    response.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    response
+}
+
+async fn get_lidarr(
+    State(service): State<Arc<Requests>>,
+    axum::Extension(ingress): axum::Extension<Arc<Ingress>>,
+    body: Bytes,
+) -> Response<Body> {
+    if !ingress.page || ingress.kind != SessionKind::AdminPage {
+        return send_admin_denied();
+    }
+    let request = match read_admin(body, admin::read::<admin::GetMusicServer>) {
+        Ok(request) => request,
+        Err(why) => return admin_reply::<admin::Applied>(Err(why)),
+    };
+    let clock = service.accounts.clock.clone();
+    let endpoint = service.endpoint.clone();
+    let address = endpoint.as_ref().map(|endpoint| endpoint.url.as_str().trim_end_matches('/').to_owned());
+    let configured = service.accounts.desk.ask(move |keeper| {
+        admin_actor(keeper, &request.head, &ingress, clock())?;
+        match endpoint {
+            None => Ok(false),
+            Some(endpoint) => credential(keeper, &endpoint).map(|key| key.is_some())
+                .map_err(|_| admin::Refusal::NotDealtWith),
+        }
+    }).await.unwrap_or(Err(admin::Refusal::Busy { retry_after_seconds: account::Wait::new(1) }));
+    match configured {
+        Ok(configured) => {
+            let body = serde_json::json!({ "done": { "address": address, "configured": configured } });
+            raw_json(StatusCode::OK, body.to_string().into_bytes())
+        }
+        Err(reason) => admin_reply::<admin::Applied>(Err(reason)),
+    }
+}
