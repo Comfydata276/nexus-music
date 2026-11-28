@@ -32,6 +32,7 @@ use crate::store::apart::{self, Account, Reading, Store};
 use crate::store::copies;
 use crate::store::data::{self, Change, Data, Opened, why};
 use crate::store::lock;
+use crate::store::private;
 
 /// How often, at most, the store hears how far the data's changes have got from a change the
 /// data alone has (12.3).
@@ -160,6 +161,7 @@ impl Keeper {
     /// compares them, **before anything is served** (12.3, 12.4).
     pub fn open(state: &Path, folder: &Path, now: u64) -> Result<(Keeper, Started), Refused> {
         let held = lock::hold(state, folder).map_err(Refused)?;
+        private::at_start(state, folder).map_err(Refused)?;
         let found = find(state, folder, now)?;
         match (found.id, found.store, found.data) {
             (_, Reading::Unreadable(what), _) => Err(Refused(format!(
@@ -706,6 +708,7 @@ pub type Said = Vec<String>;
 /// 12.4's steps. Refused while the backend serves.
 pub fn put_back(state: &Path, folder: &Path, copy: &Path, now: u64) -> Result<Said, Refused> {
     let held = lock::hold(state, folder).map_err(Refused)?;
+    private::at_start(state, folder).map_err(Refused)?;
     apart::tidy(state);
     data::tidy(folder);
     let mut store = match apart::read(state) {
@@ -774,6 +777,7 @@ pub fn put_back(state: &Path, folder: &Path, copy: &Path, now: u64) -> Result<Sa
 /// serves, and when the store and the data agree.
 pub fn take_as_is(state: &Path, folder: &Path, now: u64) -> Result<Said, Refused> {
     let held = lock::hold(state, folder).map_err(Refused)?;
+    private::at_start(state, folder).map_err(Refused)?;
     let found = find(state, folder, now)?;
     match (found.id, found.store, found.data) {
         (_, Reading::Missing, Opened::Absent) => Err(Refused("There is neither data nor a store kept apart: there is nothing to take. Start the backend, and it makes both.".into())),

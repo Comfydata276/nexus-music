@@ -7,6 +7,7 @@
 //!   change written in the order 12.3 sets, and the owner's two commands.
 //! - [`copies`]: the nightly copy, and the copies made before a change of form or a put-back.
 //! - [`lock`]: one program at a time on a backend's folders.
+//! - [`private`]: every file the owner's alone, from the moment it is made.
 //! - [`crash`]: the points between durable steps, for X2's tests.
 
 pub mod apart;
@@ -15,3 +16,4 @@ pub mod crash;
 pub mod data;
 pub mod keeper;
 pub mod lock;
+pub mod private;

@@ -86,6 +86,8 @@ fn copy(source: &Connection, into: &Path) -> Result<(), String> {
     let making = into.with_file_name(format!("{MAKING}{}-{}", std::process::id(), into.file_name().and_then(|name| name.to_str()).unwrap_or("copy")));
     let _ = fs::remove_file(&making);
     let made = (|| -> Result<(), String> {
+        // Made empty and the owner's alone before SQLite writes a byte to it.
+        crate::store::private::create(&making).map_err(|error| format!("{}", error.kind()))?;
         let mut target = Connection::open(&making).map_err(|error| why(&error))?;
         {
             let backup = Backup::new(source, &mut target).map_err(|error| why(&error))?;
@@ -122,7 +124,12 @@ fn copy(source: &Connection, into: &Path) -> Result<(), String> {
 
 fn make_folder(data: &Path) -> Result<PathBuf, String> {
     let copies = folder(data);
-    fs::create_dir_all(&copies).map_err(|error| format!("The folder for copies, {}, can't be made ({}).", copies.display(), error.kind()))?;
+    let fresh = !copies.exists();
+    crate::store::private::folder(&copies).map_err(|error| format!("The folder for copies, {}, can't be made ({}).", copies.display(), error.kind()))?;
+    if fresh {
+        // The folder's name in the data folder is lasting before anything is kept in it.
+        fs::File::open(data).and_then(|folder| folder.sync_all()).map_err(|error| format!("The data folder couldn't be made lasting ({}).", error.kind()))?;
+    }
     Ok(copies)
 }
 

@@ -260,6 +260,8 @@ impl Data {
         let failed = |error: String| format!("The data couldn't be made in {}: {error}.", folder.display());
         let _ = fs::remove_file(&making);
         let made = (|| -> rusqlite::Result<()> {
+            // Made empty and the owner's alone before SQLite writes a byte to it (finding 8).
+            crate::store::private::create(&making).map_err(io_error)?;
             let mut connection = Connection::open(&making)?;
             connection.busy_timeout(BUSY)?;
             connection.execute_batch("PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON;")?;

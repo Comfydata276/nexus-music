@@ -20,11 +20,11 @@ pub struct Held {
 
 fn take(folder: &Path, name: &str) -> Result<File, String> {
     let path = folder.join(FILE);
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let file = options
         .open(&path)
         .map_err(|why| format!("{name} can't be used: the lock file {} can't be opened ({}).", path.display(), why.kind()))?;
     match file.try_lock() {
