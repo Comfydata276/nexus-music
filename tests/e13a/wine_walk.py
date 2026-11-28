@@ -149,6 +149,15 @@ def walk(exe, image, keep, origin, real):
             print([e.get("accessibleLabel") for e in a.tree() if e.get("accessibleLabel")][:80])
             raise
         step("signed in through the Nexus server")
+        # W7c item 10: the server's notice stays over the window until OK is pressed.
+        notice = until(lambda: a.find(label="What your Nexus server records", role="Text"), 30, "the server's notice")
+        time.sleep(4)
+        assert a.find(label="What your Nexus server records", role="Text"), "the notice went by itself"
+        a.shot(os.path.join(home, "notice.png"))
+        a.press("OK")
+        until(lambda: not a.find(label="What your Nexus server records", role="Text"), 10, "the notice gone after OK")
+        time.sleep(3)
+        step("the server's notice shown until OK was pressed")
         if real:
             played = play_something(a, home)
             step(f"playing: {played} bytes of audio")
@@ -165,6 +174,9 @@ def walk(exe, image, keep, origin, real):
         assert not sign_in_form(a), "the sign-in form came back"
         handed = until(lambda: "music login handed" in open(os.path.join(home, "nexus.log"), errors="replace").read().split("client started")[-1], 30, "the kept login handed to the player")
         step("second start: signed in, nothing typed")
+        time.sleep(3)
+        assert not a.find(label="What your Nexus server records", role="Text"), "the notice seen came back"
+        step("second start: the notice seen is not shown again")
         a.click(until(lambda: a.find(label="Settings", role="Button"), 30, "Settings")[0]["handle"])
         time.sleep(2)
         if real:
