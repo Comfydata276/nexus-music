@@ -678,3 +678,16 @@ test("the code instructions match the app fields and preserve the lifetime", () 
   assert.doesNotMatch(instructions, /email/);
   assert.match(html, /works once and expires in 7 days/);
 });
+
+test("requests shows one container instruction and no key field when Lidarr has no address", async () => {
+  const mock = adminStandIn();
+  const page = loadPage((path, options) => path === "/nexus/api/admin/lidarr"
+    ? new Response('{"done":{"address":null,"configured":false}}') : mock.fetch(path, options),
+    { requestsEnabled: true });
+  await page.signIn("owner@example.test", adminPassword);
+  await settle();
+  assert.equal(page.from("lidarr-details").hidden, true);
+  assert.equal(page.from("requests-availability").hidden, false);
+  assert.match(page.from("requests-availability").textContent, /server owner sets the Lidarr address in the container/);
+  assert.ok(page.button("requests-list", "Turn requests off"));
+});

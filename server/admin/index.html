@@ -278,6 +278,8 @@ dd, li { overflow-wrap: anywhere; }
   const createForm = byId("create-form");
   const addressForm = byId("address-form");
   const lidarrForm = byId("lidarr-form");
+  const lidarrDetails = byId("lidarr-details");
+  const requestsAvailability = byId("requests-availability");
   const loginForm = byId("music-login-form");
   const accountNames = new Map();
   const deviceOwners = new Map();
@@ -938,18 +940,27 @@ dd, li { overflow-wrap: anywhere; }
       if (typeof result.configured !== "boolean" ||
           (result.address !== null && typeof result.address !== "string")) throw new Error();
       lidarrAddress = result.address;
-      const keyStatus = result.configured ? " A key is saved." : " Enter a key to set up requests.";
-      writeText(byId("lidarr-address"), result.address ? "Address Nexus uses: " + result.address + "." + keyStatus :
-        "Set the Lidarr address in the Nexus container first.");
+      lidarrDetails.hidden = !lidarrAddress;
+      requestsAvailability.hidden = Boolean(lidarrAddress);
+      if (lidarrAddress) {
+        const keyStatus = result.configured ? " A key is saved." : " Enter a key to set up requests.";
+        writeText(byId("lidarr-address"), "Address Nexus uses: " + lidarrAddress + "." + keyStatus);
+      } else {
+        lidarrForm.reset();
+        writeText(byId("lidarr-address"), "");
+        writeText(requestsAvailability, "Requests are not set up on this server. The server owner sets the Lidarr address in the container.");
+      }
     } catch {
       if (session !== current) return;
       lidarrAddress = null;
-      writeText(byId("lidarr-address"), "Could not load Lidarr settings. Sign out and back in to try again.");
+      lidarrDetails.hidden = true;
+      lidarrForm.reset();
+      requestsAvailability.hidden = false;
+      writeText(byId("lidarr-address"), "");
+      writeText(requestsAvailability, "Could not load Lidarr settings. Sign out and back in to try again.");
     }
   }
 
-  byId("lidarr-details").hidden = !enableRequestChanges;
-  byId("requests-availability").hidden = enableRequestChanges;
   lidarrForm.addEventListener("submit", event => {
     event.preventDefault();
     if (!enableRequestChanges) return;
@@ -999,7 +1010,8 @@ dd, li { overflow-wrap: anywhere; }
     closeReports();
     for (const form of [createForm, addressForm, lidarrForm]) form.reset();
     byId("new-account-details").open = false;
-    byId("lidarr-details").open = false;
+    lidarrDetails.open = false;
+    lidarrDetails.hidden = true;
     for (const pager of [accountPage, devicePage]) resetPage(pager);
     accountNames.clear();
     musicAddress = null;
@@ -1197,7 +1209,11 @@ dd, li { overflow-wrap: anywhere; }
       void loadDevices();
       void loadMusic(session);
       void loadDiagnostics(session);
-      if (enableRequestChanges) void loadLidarr(session);
+      if (enableRequestChanges) {
+        requestsAvailability.hidden = false;
+        writeText(requestsAvailability, "Checking request settings…");
+        void loadLidarr(session);
+      }
       form.reset();
       form.hidden = true;
       admin.hidden = document.hidden;
