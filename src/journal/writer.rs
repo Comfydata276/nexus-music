@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::config::clear_leftovers;
 
-use super::{Account, Counters, Message, Scope, events, new_id, now_ms, reader::{Update, Waiting}};
+use super::{Account, Counters, Message, Scope, events, new_id, now_ms, reader::{ChangeRequest, Update, Waiting}};
 use events::{EventId, FileTail, JournalFile, KeptFile, Loss, LossCounts, Record};
 
 const RESERVATION: u64 = 64;
@@ -650,7 +650,7 @@ impl Writer {
 pub(super) fn run(
     root: PathBuf,
     line: Receiver<Message>,
-    updates: Receiver<Update>,
+    updates: Receiver<ChangeRequest>,
     current_waiting: Arc<Mutex<Option<Waiting>>>,
     counters: Arc<Counters>,
 ) {
@@ -678,14 +678,16 @@ pub(super) fn run(
                 first_open = false;
             }
             queued_updates.extend(updates.try_iter());
-            while let Some(update) = queued_updates.front() {
-                if let Update::ScopeChanged(scope) = update {
+            while let Some(request) = queued_updates.front() {
+                if let Update::ScopeChanged(scope) = &request.update {
                     visible = *scope;
                 }
-                if writer.update(update).is_err() {
+                if writer.update(&request.update).is_err() {
                     break;
                 }
-                queued_updates.pop_front();
+                if let Some(finished) = queued_updates.pop_front().and_then(|request| request.finished) {
+                    let _ = finished.send(());
+                }
                 dirty = true;
             }
             if let Ok(message) = message {

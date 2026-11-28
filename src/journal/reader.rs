@@ -1,6 +1,7 @@
 //! A separate reader can answer while the journal writer is waiting for the disk.
 
 use std::path::Path;
+use std::sync::mpsc::Sender;
 
 use super::{Scope, events, writer::{JournalDirectory, Settlement}};
 use events::{EventId, Placed};
@@ -55,6 +56,11 @@ pub(super) enum Update {
     Settle(Scope, Vec<EventId>, Settlement),
     LifeMoved(Scope),
     ResendAll([u8; 16]),
+}
+
+pub(super) struct ChangeRequest {
+    pub(super) update: Update,
+    pub(super) finished: Option<Sender<()>>,
 }
 
 #[derive(Clone, Copy)]

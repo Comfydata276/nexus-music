@@ -61,7 +61,7 @@ struct Service {
     counters: Arc<Counters>,
     finished: Mutex<Receiver<()>>,
     read: SyncSender<reader::Read>,
-    update: mpsc::Sender<reader::Update>,
+    update: mpsc::Sender<reader::ChangeRequest>,
     waiting: Arc<Mutex<Option<reader::Waiting>>>,
 }
 
@@ -125,7 +125,9 @@ fn publish(scope: Option<Scope>) {
     GENERATION.set(GENERATION.get().wrapping_add(1));
     SCOPE.set(scope);
     if let Some(service) = SERVICE.get() {
-        let _ = service.update.send(reader::Update::ScopeChanged(scope));
+        let _ = service.update.send(reader::ChangeRequest {
+            update: reader::Update::ScopeChanged(scope), finished: None,
+        });
     }
     if scope.is_some() && !OPENED.replace(true) {
         note(|| {
@@ -160,12 +162,14 @@ impl Scope {
 
 /// The C10 machine's journal effects, on its adapter's window-thread turn.
 /// W6 answers the Diagnostics read. The transport remains with the adapter.
+/// A disk mutation returns a receipt. Resume the remaining C10 effects only
+/// after that receipt arrives, without waiting on the window thread.
 #[allow(dead_code)] // The live caller belongs to W7 and the sending slice.
 pub(crate) fn handle_client(
     command: JournalDo,
     happened: impl FnOnce(Happened) + Send + 'static,
-) -> Result<(), JournalDo> {
-    use reader::Update;
+) -> Result<Option<Receiver<()>>, JournalDo> {
+    use reader::{ChangeRequest, Update};
     use writer::Settlement;
     let update = match command {
         JournalDo::ReadEvents { read, account, life, from_sequence, max_events, max_bytes } => {
@@ -183,7 +187,7 @@ pub(crate) fn handle_client(
             } else {
                 answered(Vec::new());
             }
-            return Ok(());
+            return Ok(None);
         }
         JournalDo::ReadDiagnostics { .. } => return Err(command),
         JournalDo::Taken { account, life, ids, at_ms } =>
@@ -193,10 +197,11 @@ pub(crate) fn handle_client(
         JournalDo::LifeMoved { account, life } => Update::LifeMoved(Scope::new(account, life)),
         JournalDo::ResendAll { backend_id } => Update::ResendAll(*backend_id.as_bytes()),
     };
+    let (finished, receipt) = mpsc::channel();
     if let Some(service) = SERVICE.get() {
-        let _ = service.update.send(update);
+        let _ = service.update.send(ChangeRequest { update, finished: Some(finished) });
     }
-    Ok(())
+    Ok(Some(receipt))
 }
 
 /// The client adapter drains this outside playback. The writer coalesces notices and
