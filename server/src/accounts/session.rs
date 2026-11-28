@@ -193,13 +193,14 @@ impl Described {
         if self.page { SessionKind::AdminPage } else { SessionKind::App }
     }
 
-    fn of(sign_in: &SignIn) -> Self {
+    fn of(sign_in: &SignIn, page: bool) -> Self {
         let kind = match sign_in.device_kind {
             account::DeviceKind::Pc => "pc",
             account::DeviceKind::Phone => "phone",
         };
         let version = format!("{}.{}.{}", sign_in.app_version.major, sign_in.app_version.minor, sign_in.app_version.patch);
-        Described { name: sign_in.device_name.clone(), kind, version, page: false }
+        let version = if page { format!("{}{version}", rows::PAGE_VERSION_PREFIX) } else { version };
+        Described { name: sign_in.device_name.clone(), kind, version, page }
     }
 }
 
@@ -218,7 +219,7 @@ impl Accounts {
         if !speaks_with(&request.speaks) {
             return Err(incompatible());
         }
-        let described = Described { page, ..Described::of(&request) };
+        let described = Described::of(&request, page);
         let secret = request.device_secret.clone();
         match request.credential {
             Credential::Password { email, password } => self.with_password(email, password, secret, described).await,

@@ -135,6 +135,26 @@ impl wire::Value for InternalAddress {
     }
 }
 
+/// What an administrator needs to know about a saved music sign-in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MusicState {
+    NoneSet,
+    Set,
+    TypeAgain,
+}
+
+impl wire::Value for MusicState {
+    fn read(raw: &RawValue) -> Result<Self, BadMessage> {
+        read_text(raw, |tag| match tag {
+            "none_set" => Some(Self::NoneSet),
+            "set" => Some(Self::Set),
+            "type_again" => Some(Self::TypeAgain),
+            _ => None,
+        })
+    }
+}
+
 object! {
     Account {
         id: AccountId,
@@ -143,6 +163,7 @@ object! {
         admin: bool,
         enabled: bool,
         requests_enabled: bool,
+        music: MusicState,
     }
 }
 
@@ -171,6 +192,7 @@ object! {
         app_version: Version,
         last_seen_ms: u64,
         session: Option<SessionId>,
+        page: bool,
     }
 }
 
@@ -829,7 +851,7 @@ mod tests {
             id: AccountId::new(u64::MAX - id as u64).unwrap(),
             email: Email::new(&email).unwrap(),
             name: Name::new(&"\"".repeat(account::NAME_MAX_BYTES)).unwrap(),
-            admin: true, enabled: false, requests_enabled: false,
+            admin: true, enabled: false, requests_enabled: false, music: MusicState::TypeAgain,
         }
     }
 
@@ -842,6 +864,7 @@ mod tests {
             app_version: Version { major: u32::MAX, minor: u32::MAX, patch: u32::MAX },
             last_seen_ms: u64::MAX,
             session: signed_in.then(|| SessionId::new(u64::MAX).unwrap()),
+            page: signed_in,
         }
     }
 

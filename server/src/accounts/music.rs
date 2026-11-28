@@ -72,7 +72,7 @@ impl MusicSide {
 
 /// An admin call's answer, of `nexus::admin`'s shapes. A reply that cannot be encoded is "not
 /// dealt with", which always can.
-fn answer<T: admin::ResultBody>(reply: Reply<T>) -> Answer {
+pub(super) fn answer<T: admin::ResultBody>(reply: Reply<T>) -> Answer {
     let status = reply.status();
     match admin::encode(&reply) {
         Ok(body) => Answer { status, body },
@@ -86,7 +86,7 @@ pub fn refused(refusal: Refusal) -> Answer {
     Answer { status, body: admin::encode(&reply).expect("a refusal always fits its 4 KiB") }
 }
 
-fn not_dealt_with<E>(_: E) -> Refusal {
+pub(super) fn not_dealt_with<E>(_: E) -> Refusal {
     Refusal::NotDealtWith
 }
 
@@ -95,7 +95,7 @@ fn busy() -> Refusal {
 }
 
 /// What a refusal of kept's is said as, to an admin's call.
-fn said(denied: Denied) -> Refusal {
+pub(super) fn said(denied: Denied) -> Refusal {
     match denied {
         Denied::NotSignedIn => Refusal::NotSignedIn(account::NotSignedIn::SessionEnded),
         Denied::StartAgain => Refusal::NotSignedIn(account::NotSignedIn::DataPutBack),
@@ -121,7 +121,7 @@ fn asked(outcome: Outcome) -> Refusal {
     }
 }
 
-fn flatten(done: Result<Result<Answer, Refusal>, super::desk::Busy>) -> Answer {
+pub(super) fn flatten(done: Result<Result<Answer, Refusal>, super::desk::Busy>) -> Answer {
     match done {
         Ok(Ok(answer)) => answer,
         Ok(Err(refusal)) => refused(refusal),
@@ -131,7 +131,7 @@ fn flatten(done: Result<Result<Answer, Refusal>, super::desk::Busy>) -> Answer {
 
 /// The signed-in admin of a call: the account and device of the session `hash`, under the
 /// restore number and speaking a version in common.
-fn caller(keeper: &mut Keeper, head: &RequestHead, hash: &Fingerprint) -> Result<(u64, account::DeviceId, nexus_core::nexus::kept::Account), Refusal> {
+pub(super) fn caller(keeper: &mut Keeper, head: &RequestHead, hash: &Fingerprint) -> Result<(u64, account::DeviceId, nexus_core::nexus::kept::Account), Refusal> {
     if !speaks_with(&head.speaks) {
         return Err(Refusal::Malformed);
     }
@@ -148,7 +148,7 @@ fn caller(keeper: &mut Keeper, head: &RequestHead, hash: &Fingerprint) -> Result
 /// S9-2 (the review of S9): the caller is a live admin, by kept's `admin_read`, **before**
 /// anything of the target or of the backend's settings is looked at, so that a refusal says
 /// nothing of which accounts there are or what is set.
-fn live_admin(keeper: &mut Keeper, account: &mut nexus_core::nexus::kept::Account, restore: u64, device: account::DeviceId, hash: &Fingerprint, now: u64) -> Result<(), Refusal> {
+pub(super) fn live_admin(keeper: &mut Keeper, account: &mut nexus_core::nexus::kept::Account, restore: u64, device: account::DeviceId, hash: &Fingerprint, now: u64) -> Result<(), Refusal> {
     account
         .request(restore, keeper.clock(now), |turn| turn.admin_read(Bearer { device, hash, grant: None }))
         .apply(|effects| keeper.persist(effects, &[], now))
@@ -196,7 +196,7 @@ pub fn grant_intent(keeper: &mut Keeper, caller: &Account, change: &NamedChange,
 }
 
 /// The account `id` names, loaded, if it is not the caller's own; `Ok(None)` for the caller's.
-fn target(keeper: &mut Keeper, caller: u64, id: AccountId) -> Result<Option<nexus_core::nexus::kept::Account>, Refusal> {
+pub(super) fn target(keeper: &mut Keeper, caller: u64, id: AccountId) -> Result<Option<nexus_core::nexus::kept::Account>, Refusal> {
     if id.get() == caller {
         return Ok(None);
     }
@@ -220,18 +220,13 @@ pub fn hand(keeper: &Keeper, number: u64, state: &AccountState, kind: SessionKin
     music::hand_out(state, kind, install.as_ref(), &key, internal, public.as_ref(), MusicSalt::from_random(*salt))
 }
 
+pub use nexus_core::nexus::admin::MusicState;
+
 /// What the admin's page is told of an account's music login (S10b's `admin::Account.music`,
 /// shape posted at `t3/nexus-s10` 059fbc8: `none_set | set | type_again`), by the very rule a
 /// device is handed one by ([`hand`], as for an app's session): none set yet; one that would
 /// be handed out; or one that cannot be used now and is to be typed again (9.4). Nothing of the
 /// login itself is kept: the salt and token made to decide it are dropped at once.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MusicState {
-    NoneSet,
-    Set,
-    TypeAgain,
-}
-
 pub fn music_state(keeper: &Keeper, number: u64, state: &AccountState, internal: &str) -> MusicState {
     match hand(keeper, number, state, SessionKind::App, internal) {
         MusicLoginResult::NoneSetYet => MusicState::NoneSet,
@@ -243,7 +238,7 @@ pub fn music_state(keeper: &Keeper, number: u64, state: &AccountState, internal:
 impl Accounts {
     /// C1 (the review of S8; the lead's ruling of 15:38): an admin's call has its session looked
     /// up on the cheap read path first; only one found there goes on to the thread that writes.
-    fn admin_live(&self, speaks: &nexus_core::nexus::proto::Speaks, restore: u64, hash: &Fingerprint) -> Result<(), Refusal> {
+    pub(super) fn admin_live(&self, speaks: &nexus_core::nexus::proto::Speaks, restore: u64, hash: &Fingerprint) -> Result<(), Refusal> {
         if !speaks_with(speaks) {
             return Err(Refusal::Malformed);
         }

@@ -4,15 +4,15 @@ use axum::http::header::{CONTENT_TYPE, ORIGIN};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 pub(crate) use nexus_core::nexus::{
-    account::{PASSWORD_REQUEST_MAX_BYTES as SIGN_IN_MAX_BYTES, SIGN_IN},
+    account::SIGN_IN,
     admin::PAGE,
 };
 
 const DOCUMENT: &str = include_str!("../admin/index.html");
 const CSP: &str = concat!(
     "default-src 'none'; ",
-    "script-src 'sha256-1E7FDHWntUbALVYvrRUn2uIh9K+Z0gFdHd2SOfKZYIE='; ",
-    "style-src 'sha256-hMPkyKmkL7ZlO0dZE2lFPHiMGmEtFA+qjP8h35jOd6o='; ",
+    "script-src 'sha256-Rv7H0YGmNBCKvSkX11jkEjzOD1m+q4rb9RvqN7V0HYQ='; ",
+    "style-src 'sha256-VMSfc+YGxB56qFr29cBKeyMXMjjPO5V4iYQguxxco4I='; ",
     "connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; ",
     "require-trusted-types-for 'script'; trusted-types 'none'",
 );
@@ -242,7 +242,7 @@ mod tests {
         let wrong_type = format!("{HTTPS}{ORIGIN_HEADERS}Content-Type: text/plain\r\nContent-Length: 2\r\n");
         assert_eq!(split(&server.request(PROXY, "POST", account::SIGN_IN, &wrong_type, "{}")).0.status, 400);
         assert_eq!(server.request(PROXY, "POST", account::SIGN_IN,
-            &format!("{HTTPS}Content-Length: {}\r\n", SIGN_IN_MAX_BYTES + 1), ""),
+            &format!("{HTTPS}Content-Length: {}\r\n", account::PASSWORD_REQUEST_MAX_BYTES + 1), ""),
             serve::bare(StatusCode::PAYLOAD_TOO_LARGE));
     }
 

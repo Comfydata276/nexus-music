@@ -47,6 +47,16 @@ pub fn router(base: Router, accounts: Arc<Accounts>, public_origin: Option<Arc<s
         .route(admin::SET_MUSIC_LOGIN, post(set_music_login))
         .route(admin::SET_MUSIC_SERVER, post(set_music_server))
         .route(admin::GET_MUSIC_SERVER, post(get_music_server))
+        .route(admin::LIST_ACCOUNTS, post(admin_accounts))
+        .route(admin::LIST_DEVICES, post(admin_devices))
+        .route(admin::GET_DIAGNOSTICS_DEFAULT, post(get_diagnostics_default))
+        .route(admin::CREATE_ACCOUNT, post(create_account))
+        .route(admin::SET_ACCOUNT_ENABLED, post(set_account_enabled))
+        .route(admin::FORCE_OUT, post(admin_force_out))
+        .route(admin::SET_DIAGNOSTICS_DEFAULT, post(set_diagnostics_default))
+        .route(admin::DELETE_ACCOUNT, post(delete_account))
+        .route(admin::SET_ADMIN, post(set_admin))
+        .route(admin::RESET_PASSWORD, post(reset_admin_password))
         .with_state(Calls { accounts, public_origin });
     base.merge(calls)
 }
@@ -198,3 +208,14 @@ admin_call!(admin_grant, RequestGrant, admin_grant);
 admin_call!(set_music_login, SetMusicLogin, set_music_login);
 admin_call!(set_music_server, SetMusicServer, set_music_server);
 admin_call!(get_music_server, GetMusicServer, get_music_server);
+
+admin_call!(admin_accounts, admin::ListAccounts, admin_accounts);
+admin_call!(admin_devices, admin::ListDevices, admin_devices);
+admin_call!(get_diagnostics_default, admin::GetDiagnosticsDefault, get_diagnostics_default);
+admin_call!(create_account, admin::CreateAccount, create_account);
+admin_call!(set_account_enabled, admin::SetAccountEnabled, admin_apply);
+admin_call!(admin_force_out, admin::ForceOut, admin_apply);
+admin_call!(set_diagnostics_default, admin::SetDiagnosticsDefault, set_diagnostics_default);
+admin_call!(delete_account, admin::DeleteAccount, admin_apply);
+admin_call!(set_admin, admin::SetAdmin, admin_apply);
+admin_call!(reset_admin_password, admin::ResetPassword, reset_admin_password);
