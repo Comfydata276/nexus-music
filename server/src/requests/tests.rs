@@ -168,7 +168,7 @@ fn snapshot_cursor_must_match_session_and_exact_read() {
         album: ALBUM.into(), artist_id: ARTIST.into(), title: "Glass Orchard".into(), ..Offer::default()
     }).unwrap();
     let found = Answer::FoundAny { albums: vec![album; wire::PAGE_MAX_ITEMS + 1], next: None };
-    let Answer::FoundAny { albums, next: Some(next) } = books.first(session, &read, found).unwrap() else {
+    let Answer::FoundAny { albums, next: Some(next) } = books.first(AccountId::new(1).unwrap(), session, &read, found).unwrap() else {
         panic!("a continuation is required");
     };
     assert_eq!(albums.len(), wire::PAGE_MAX_ITEMS);
@@ -1171,7 +1171,7 @@ fn switching_off_a_running_batch_blocks_its_next_lidarr_write() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         ).unwrap();
         if stage == FINISHED {
-            assert!(matches!(decode::<JobResult>(result.unwrap().as_bytes()).unwrap(),
+            assert!(matches!(read_job_result(&result.unwrap()).unwrap(),
                 JobResult::Failed(Refusal::SwitchedOff)));
             break;
         }

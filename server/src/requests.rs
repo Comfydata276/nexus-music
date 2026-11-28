@@ -227,6 +227,7 @@ impl Drop for ConnectionDriver {
 mod tests;
 
 const MAX_BOOKS: usize = 64;
+const BOOKS_PER_ACCOUNT: usize = 4;
 const MAX_SNAPSHOTS: usize = 16;
 const ACCOUNT_SLOT_MAX: usize = 24;
 
@@ -512,13 +513,14 @@ impl Read {
 
 #[derive(Default)]
 struct Books {
-    sessions: VecDeque<(SessionId, SessionBook)>,
+    sessions: VecDeque<(AccountId, SessionId, SessionBook)>,
     snapshots: VecDeque<Snapshot>,
     last_snapshot: u64,
 }
 
 struct Snapshot {
     id: NonZeroU64,
+    account: AccountId,
     session: SessionId,
     last_seen: Instant,
     content: SnapshotContent,
@@ -554,16 +556,16 @@ impl Books {
         NonZeroU64::new(self.last_snapshot).ok_or(Refusal::NotDealtWith)
     }
 
-    fn keep_snapshot(&mut self, id: NonZeroU64, session: SessionId, content: SnapshotContent) {
+    fn keep_snapshot(&mut self, id: NonZeroU64, account: AccountId, session: SessionId, content: SnapshotContent) {
         self.expire();
-        let matching = self.snapshots.iter().enumerate().filter(|(_, known)| known.session == session);
+        let matching = self.snapshots.iter().enumerate().filter(|(_, known)| known.account == account);
         if let Some((index, _)) = matching.clone().next().filter(|_| matching.count() >= wire::SNAPSHOTS_PER_SESSION) {
             self.snapshots.remove(index);
         }
         if self.snapshots.len() == MAX_SNAPSHOTS {
             self.snapshots.pop_front();
         }
-        self.snapshots.push_back(Snapshot { id, session, last_seen: Instant::now(), content });
+        self.snapshots.push_back(Snapshot { id, account, session, last_seen: Instant::now(), content });
     }
 
     fn peek(&mut self, session: SessionId, read: &Read, after: PageCursor) -> Result<Answer, Refusal> {
@@ -576,21 +578,21 @@ impl Books {
         Ok(answer)
     }
 
-    fn first(&mut self, session: SessionId, read: &Read, found: Answer) -> Result<Answer, Refusal> {
+    fn first(&mut self, account: AccountId, session: SessionId, read: &Read, found: Answer) -> Result<Answer, Refusal> {
         let Some((count, limit)) = page_size(&found) else { return Ok(found) };
         let id = self.next_id()?;
         let answer = page(&found, id, 0)?;
         if count > limit {
-            self.keep_snapshot(id, session, SnapshotContent::App { read: read.clone(), found });
+            self.keep_snapshot(id, account, session, SnapshotContent::App { read: read.clone(), found });
         }
         Ok(answer)
     }
 
-    fn attribution_first(&mut self, session: SessionId, rows: Vec<AttributionRow>) -> Result<AttributionPage, Refusal> {
+    fn attribution_first(&mut self, account: AccountId, session: SessionId, rows: Vec<AttributionRow>) -> Result<AttributionPage, Refusal> {
         let id = self.next_id()?;
         let answer = attribution_page(&rows, id, 0)?;
         if answer.next.is_some() {
-            self.keep_snapshot(id, session, SnapshotContent::Attribution(rows));
+            self.keep_snapshot(id, account, session, SnapshotContent::Attribution(rows));
         }
         Ok(answer)
     }
@@ -603,7 +605,7 @@ impl Books {
         Ok(answer)
     }
 
-    fn remember(&mut self, session: SessionId, now: i64, read: &Read, page: &Answer) {
+    fn remember(&mut self, account: AccountId, session: SessionId, now: i64, read: &Read, page: &Answer) {
         let (mut book, artists) = match page {
             Answer::FoundAny { albums, .. } | Answer::FoundReleases { albums, .. } => (albums.clone(), &[][..]),
             Answer::FoundArtists { artists, .. } => (Vec::new(), artists.as_slice()),
@@ -612,8 +614,8 @@ impl Books {
             Answer::Listed { .. } => (Vec::new(), &[][..]),
             _ => return,
         };
-        let existing = self.sessions.iter().position(|(known, _)| *known == session)
-            .and_then(|index| self.sessions.remove(index)).map(|(_, offers)| offers);
+        let existing = self.sessions.iter().position(|(owner, known, _)| *owner == account && *known == session)
+            .and_then(|index| self.sessions.remove(index)).map(|(_, _, offers)| offers);
         let mut offers = existing.unwrap_or_default();
         for album in book.drain(..) {
             let _ = offers.offers.remember_album(album, now);
@@ -631,10 +633,14 @@ impl Books {
                 offers.listed.push_back((*artist, row.clone(), now));
             }
         }
+        let own = self.sessions.iter().enumerate().filter(|(_, (owner, _, _))| *owner == account);
+        if let Some((index, _)) = own.clone().next().filter(|_| own.count() >= BOOKS_PER_ACCOUNT) {
+            self.sessions.remove(index);
+        }
         if self.sessions.len() == MAX_BOOKS {
             self.sessions.pop_front();
         }
-        self.sessions.push_back((session, offers));
+        self.sessions.push_back((account, session, offers));
     }
 }
 
@@ -749,8 +755,8 @@ impl Plan {
         binding: [u8; 32],
         revision: u64,
     ) -> Result<Self, Refusal> {
-        let book = || books.sessions.iter().find(|(id, _)| *id == actor.session)
-            .map(|(_, book)| book).ok_or(Refusal::SearchAgain);
+        let book = || books.sessions.iter().find(|(owner, id, _)| *owner == actor.account && *id == actor.session)
+            .map(|(_, _, book)| book).ok_or(Refusal::SearchAgain);
         let now = seconds(actor.now);
         let mut plan = Self {
             binding, revision, artist: None, offers: Vec::new(), listed: Vec::new(), added_artist: None,
@@ -793,10 +799,23 @@ const STARTED: i64 = 1;
 const MAY_HAVE_CHANGED: i64 = 2;
 const FINISHED: i64 = 3;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 enum JobResult {
     Done(Completed),
     Failed(Refusal),
+}
+
+#[derive(Serialize, Deserialize)]
+struct FinishedJob {
+    finished_ms: u64,
+    result: JobResult,
+}
+
+fn read_job_result(text: &str) -> Result<JobResult, Refusal> {
+    match serde_json::from_str::<FinishedJob>(text) {
+        Ok(finished) => Ok(finished.result),
+        Err(_) => decode(text.as_bytes()),
+    }
 }
 
 impl JobResult {
@@ -918,7 +937,7 @@ fn after_job(db: &Connection, actor: Actor, job: JobId, rooms: &Mutex<Rooms>) ->
     if stage != FINISHED || lock(rooms).jobs.contains(&row) {
         return Ok(Answer::Working);
     }
-    result.ok_or(Refusal::NotDealtWith).and_then(|text| decode::<JobResult>(text.as_bytes())).map(JobResult::answer)
+    result.as_deref().ok_or(Refusal::NotDealtWith).and_then(read_job_result).map(JobResult::answer)
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -1280,8 +1299,8 @@ async fn call(
                     let mut found = found?;
                     owner_view(db, &binding, actor, &mut found)?;
                     let mut books = lock(&state.books);
-                    let answer = books.first(actor.session, &ask, found)?;
-                    books.remember(actor.session, seconds(actor.now), &ask, &answer);
+                    let answer = books.first(actor.account, actor.session, &ask, found)?;
+                    books.remember(actor.account, actor.session, seconds(actor.now), &ask, &answer);
                     Ok(answer)
                 })())
             }).await {
@@ -1331,7 +1350,7 @@ impl Requests {
                     lock(&self.books).peek(actor.session, &Read::AskedHistory, after)?
                 } else {
                     let found = Answer::AskedHistory { rows: asked_history(db, &binding, actor.account)?, next: None };
-                    lock(&self.books).first(actor.session, &Read::AskedHistory, found)?
+                    lock(&self.books).first(actor.account, actor.session, &Read::AskedHistory, found)?
                 }
             }
             Call::BatchLines { job, after } => {
@@ -1340,7 +1359,7 @@ impl Requests {
                     lock(&self.books).peek(actor.session, &key, after)?
                 } else {
                     let found = batch_lines(db, actor, job)?;
-                    lock(&self.books).first(actor.session, &key, found)?
+                    lock(&self.books).first(actor.account, actor.session, &key, found)?
                 }
             }
             call => {
@@ -1348,7 +1367,7 @@ impl Requests {
                 if let Some(cursor) = cursor {
                     let mut books = lock(&self.books);
                     let answer = books.peek(actor.session, &ask, cursor)?;
-                    books.remember(actor.session, seconds(actor.now), &ask, &answer);
+                    books.remember(actor.account, actor.session, seconds(actor.now), &ask, &answer);
                     return Ok(Dispatch::Done(answer));
                 }
                 return Ok(Dispatch::Read { ask, actor, credential });
@@ -1593,8 +1612,10 @@ fn finish_job(
     adds: &[RecordedAsk],
     ownership: Option<([u8; 32], AccountId, Option<MusicBrainzId>)>,
 ) -> Result<(), Refusal> {
-    let text = serde_json::to_string(result).map_err(|_| Refusal::NotDealtWith)?;
     let at = keeper.clock(now).effective();
+    let text = serde_json::to_string(&FinishedJob { finished_ms: at, result: result.clone() })
+        .map_err(|_| Refusal::NotDealtWith)?;
+    let restore = sql(keeper.restore())?;
     keeper.write_data(now, |tx| {
         let changed = tx.execute(
             "UPDATE requests_jobs SET stage = ?1, result = ?2 WHERE id = ?3 AND stage < ?1",
@@ -1609,7 +1630,17 @@ fn finish_job(
                     params![binding.as_slice(), release.as_str()])?;
             }
         }
-        Ok(((), changed))
+        // Drop previous terminal job receipts and their lines. Ownership
+        // lives independently. Bound each cleanup to one small transaction.
+        let expired = tx.execute(
+            "DELETE FROM requests_jobs WHERE id IN (
+                SELECT id FROM requests_jobs WHERE restore <= ?1 AND stage = ?2
+                  AND json_extract(result, '$.finished_ms') < ?3
+                ORDER BY id LIMIT 32
+            )",
+            params![restore, FINISHED, events::sql(at.saturating_sub(24 * 60 * 60 * 1000))?],
+        )?;
+        Ok(((), changed || expired != 0))
     }).map_err(|_| Refusal::NotDealtWith)
 }
 
@@ -2461,7 +2492,7 @@ async fn attribution(
             let rows = state.endpoint.as_ref().map(|endpoint| {
                 attributed_requests(keeper.data().connection(), &binding(endpoint))
             }).transpose().map_err(|_| admin::Refusal::NotDealtWith)?.unwrap_or_default();
-            lock(&state.books).attribution_first(ingress.caller.session, rows)
+            lock(&state.books).attribution_first(ingress.caller.account, ingress.caller.session, rows)
         };
         answer.map_err(|why| match why {
             Refusal::SearchAgain => admin::Refusal::NotAllowed(admin::Denial::Conflict),
