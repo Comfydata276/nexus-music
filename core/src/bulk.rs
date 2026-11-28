@@ -1792,7 +1792,7 @@ impl Job {
 #[cfg(test)]
 mod tests {
     use crate::lidarr::Lidarr;
-    use std::sync::Arc;
+    use std::sync::{Arc, mpsc};
 
     use super::*;
 
@@ -2393,17 +2393,26 @@ mod tests {
         assert!(job.with(|batch| batch.restore.is_empty()));
     }
 
-    /// Notes, each time the batch is written down, whether the batch was held while it was,
-    /// whether it was flushed, and how many wants the copy had.
-    struct Held(Arc<Mutex<Vec<(bool, bool, usize)>>>, &'static std::sync::OnceLock<&'static Job>);
+    struct HoldWrite {
+        entered: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    }
+
+    /// Records each write's flush flag and number of wants. The first write can be held.
+    struct Held {
+        writes: Arc<Mutex<Vec<(bool, usize)>>>,
+        first: Mutex<Option<HoldWrite>>,
+    }
 
     impl Desk for Held {
         fn keep(&self, batch: Option<Vec<u8>>, flushed: bool) {
-            // (A little while on the disk, so that writers overlap.)
-            std::thread::sleep(Duration::from_millis(2));
-            let held = self.1.get().is_some_and(|job| job.batch.try_lock().is_err());
+            let first = self.first.lock().unwrap().take();
+            if let Some(hold) = first {
+                hold.entered.send(()).unwrap();
+                let _ = hold.release.recv();
+            }
             let wants = batch.and_then(|json| serde_json::from_slice::<serde_json::Value>(&json).ok()).map_or(0, |json| json["wants"].as_array().map_or(0, Vec::len));
-            self.0.lock().unwrap().push((held, flushed, wants));
+            self.writes.lock().unwrap().push((flushed, wants));
         }
 
         fn keep_checked(&self, batch: Vec<u8>) -> bool {
@@ -2422,42 +2431,52 @@ mod tests {
 
     #[test]
     fn the_batch_is_written_down_after_it_is_let_go_and_never_older_over_newer() {
-        static JOB: std::sync::OnceLock<&'static Job> = std::sync::OnceLock::new();
-        let noted = Arc::new(Mutex::new(Vec::new()));
-        let job: &'static Job = Box::leak(Box::new(Job::new(Held(noted.clone(), &JOB))));
-        JOB.set(job).ok().unwrap();
-        // Eight threads, each adding a want and writing the batch down, at once.
-        std::thread::scope(|scope| {
-            for at in 0..8 {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let (entered, writing) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let job = Job::new(Held { writes: writes.clone(), first: Mutex::new(Some(HoldWrite { entered, release: released })) });
+        let job = &job;
+        let want = |at| Want { artist: format!("Someone {at}"), album: format!("Album {at}"), ..Default::default() };
+        std::thread::scope(move |scope| {
+            scope.spawn(move || job.start(HERE, vec![want(0)]));
+            writing.recv_timeout(Duration::from_secs(30)).expect("the first write did not start");
+            // Only the thread doing the disk write could have taken these locks so far.
+            assert!(job.batch.try_lock().is_ok(), "the window must be able to read during a disk write");
+            assert!(job.writing.try_lock().is_err(), "another writer must wait for this write");
+            let (added, want_added) = mpsc::channel();
+            for at in 1..8 {
+                let added = added.clone();
                 scope.spawn(move || {
-                    job.start(HERE, vec![Want { artist: format!("Someone {at}"), album: format!("Album {at}"), ..Default::default() }]);
+                    job.with(|batch| batch.wants.push(want(at)));
+                    added.send(()).unwrap();
                     job.save();
                 });
             }
+            drop(added);
+            for _ in 1..8 {
+                want_added.recv_timeout(Duration::from_secs(30)).expect("a want could not be added during the write");
+            }
+            release.send(()).unwrap();
         });
-        let noted = noted.lock().unwrap().clone();
-        // The batch was never held while the disk was being written to (the Requests page
-        // reads it on the window's thread) ...
-        assert!(noted.iter().all(|(held, _, _)| !held), "{noted:?}");
-        // ... and no copy was written over one taken after it.
-        assert!(noted.windows(2).all(|pair| pair[0].2 <= pair[1].2), "{noted:?}");
-        assert_eq!(noted.last().map(|last| last.2), Some(8));
+        let writes = writes.lock().unwrap();
+        assert_eq!(writes.len(), 8);
+        assert_eq!(writes[0].1, 1);
+        assert!(writes.windows(2).all(|pair| pair[0].1 <= pair[1].1), "{writes:?}");
+        assert_eq!(writes.last().map(|last| last.1), Some(8));
     }
 
     #[test]
     fn while_the_batch_holds_a_way_back_every_write_of_it_waits_for_the_disk() {
-        static JOB: std::sync::OnceLock<&'static Job> = std::sync::OnceLock::new();
-        let noted = Arc::new(Mutex::new(Vec::new()));
-        let job: &'static Job = Box::leak(Box::new(Job::new(Held(noted.clone(), &JOB))));
-        JOB.set(job).ok().unwrap();
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let job = Job::new(Held { writes: writes.clone(), first: Mutex::new(None) });
         job.start(HERE, vec![Want { artist: "Someone".into(), album: "A Single".into(), ..Default::default() }]);
-        assert!(!noted.lock().unwrap().last().unwrap().1, "with no way back, progress is written in passing");
+        assert!(!writes.lock().unwrap().last().unwrap().0, "with no way back, progress is written in passing");
         job.with(|batch| batch.restore.push(Back { artist: 5, before: "all".into(), lidarr: Some(HERE.into()), artist_id: None }));
         std::thread::scope(|scope| {
             scope.spawn(|| job.save());
             scope.spawn(|| job.save());
         });
-        assert!(noted.lock().unwrap().iter().rev().take(2).all(|(_, flushed, _)| *flushed));
+        assert!(writes.lock().unwrap().iter().rev().take(2).all(|(flushed, _)| *flushed));
     }
 
     /// A Lidarr with one artist, whose "new releases" setting is kept (and whose profile, so

@@ -596,7 +596,8 @@ fn display_cleaning_removes_controls_and_preserves_ordinary_scripts() {
         .chain('\u{202a}'..='\u{202e}').chain('\u{2066}'..='\u{2069}');
     let controls = ('\u{0}'..='\u{1f}').chain('\u{7f}'..='\u{9f}').chain(bidi);
     for ch in controls {
-        assert_eq!(clean_text(&format!("A{ch}B")), "AB", "U+{:04X}", ch as u32);
+        let expected = if matches!(ch, '\t' | '\n' | '\r') { "A B" } else { "AB" };
+        assert_eq!(clean_text(&format!("A{ch}B")), expected, "U+{:04X}", ch as u32);
     }
     assert_eq!(clean_text("A \u{2028}\u{2029}  \u{202e} B"), "A B");
     for title in ["تملي معاك", "שיר לשלום", "春よ、来い", "می\u{200c}روم"] {
@@ -605,6 +606,16 @@ fn display_cleaning_removes_controls_and_preserves_ordinary_scripts() {
     let long = "音".repeat(TEXT_CHARS + 1);
     assert_eq!(clean_display_text(&long), long);
     assert_eq!(clean_text(&format!("\u{2066}{long}")).chars().count(), TEXT_CHARS);
+}
+
+#[test]
+fn display_whitespace_does_not_join_words_or_leave_padding() {
+    let title = " \r\n\tA\r\n\u{202e} \tB\r \t\n";
+    assert_eq!(clean_display_text(title), "A B");
+    assert_eq!(clean_text(title), "A B");
+    assert_eq!(clean_display_text(" \n\t\r "), "");
+    let before_limit = "音".repeat(TEXT_CHARS - 1);
+    assert_eq!(clean_text(&format!("{before_limit}\nB")), before_limit);
 }
 
 #[test]

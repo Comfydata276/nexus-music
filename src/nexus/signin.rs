@@ -652,7 +652,7 @@ fn wait_or_quit(pause: Duration) -> bool {
 /// The machine's start: what is kept, read on this thread; then `start`. What it says is
 /// done as any list is.
 fn start_machine(paths: &config::Paths) -> Option<Batch> {
-    let (kept, view) = loop {
+    let (kept, mut view) = loop {
         match read_kept(paths) {
             Ok(read) => break read,
             Err(_) => {
@@ -666,7 +666,7 @@ fn start_machine(paths: &config::Paths) -> Option<Batch> {
             }
         }
     };
-    record_decision_kept_before(paths, &view.record);
+    record_decision_kept_before(paths, &kept, &mut view.record);
     *VIEW.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = view;
     let batch = {
         let mut machine = machine();
@@ -971,14 +971,9 @@ fn legacy_now() -> MutexGuard<'static, Option<config::Legacy>> {
     LEGACY.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// The folder for the person signed in (design 11, the review's MUST 14, W7c item 7): **the
-/// folder this PC had before becomes theirs, once**, if the core says the login they are
-/// handed names that same music server and user (`client::carries_over`), and only if that
-/// has not been decided already. **The decision is made with the first sign-in that keeps a
-/// music login here**: given back (the second part) to be recorded once that sign-in is
-/// kept, so that a sign-in that did not complete never makes it. Everyone else's folder is
-/// named by who they are to the backend, the same at every sign-in. `None` if the decision
-/// could not be read.
+/// The first matching music login kept here gives its account the released folder.
+/// Return the decision for recording after the sign-in is kept. Other accounts use the
+/// folder named by their backend and account number. `None` if the decision cannot be read.
 fn folder_for(paths: &config::Paths, saved: &Saved, login: &MusicLogin) -> Option<(String, Option<config::Legacy>)> {
     let who = config::Legacy::who(&saved.backend_id, saved.account.get());
     let known = legacy_now().clone();
@@ -986,21 +981,18 @@ fn folder_for(paths: &config::Paths, saved: &Saved, login: &MusicLogin) -> Optio
         Some(legacy) => legacy,
         None => config::load_legacy(paths).ok()?,
     };
-    let (legacy, decided) = if legacy.decided {
-        (legacy, None)
-    } else {
+    if !legacy.decided && core::carries_over(&legacy.server, &legacy.username, login) {
         let mut decided = legacy;
         decided.decided = true;
-        if !decided.server.is_empty() && !decided.username.is_empty() && core::carries_over(&decided.server, &decided.username, login) {
-            decided.carried_to = Some(who.clone());
-        }
-        (decided.clone(), Some(decided))
+        decided.carried_to = Some(who);
+        return Some((decided.stem(), Some(decided)));
+    }
+    let folder = if legacy.carried_to.as_ref() == Some(&who) {
+        legacy.stem()
+    } else {
+        config::person_folder(&saved.backend_id, saved.account.get())
     };
-    let folder = match &legacy.carried_to {
-        Some(owner) if *owner == who => legacy.stem(),
-        _ => config::person_folder(&saved.backend_id, saved.account.get()),
-    };
-    Some((folder, decided))
+    Some((folder, None))
 }
 
 /// The decision this run made, written if it is not yet: after the sign-in it came with is
@@ -1016,15 +1008,33 @@ fn record_decision(paths: &config::Paths) {
     }
 }
 
-/// At a start: a decision made with a sign-in that is kept, whose own write did not hold, is
-/// recorded now, from that kept sign-in (its folder says whether it was carried over).
-fn record_decision_kept_before(paths: &config::Paths, record: &SignedIn) {
-    let Some(legacy) = legacy_now().clone() else { return };
-    let who = record.saved.as_ref().and_then(|saved| Some(config::Legacy::who(saved.get("backend_id")?.as_str()?, saved.get("account")?.as_u64()?)));
-    let Some(who) = who.filter(|_| !legacy.decided && !record.folder.is_empty()) else { return };
-    let mut decided = legacy;
-    decided.decided = true;
-    decided.carried_to = (record.folder == decided.stem()).then_some(who);
+/// Recover a decision whose sign-in was kept before its own write, or give a matching
+/// login already kept by 0.41.0 the released folder before handing it to the player.
+fn record_decision_kept_before(paths: &config::Paths, kept: &Kept, record: &mut SignedIn) {
+    let Some(mut legacy) = legacy_now().clone().filter(|legacy| !legacy.decided) else { return };
+    let Some(saved) = kept.saved.as_ref() else { return };
+    let decided = if record.folder == legacy.stem() {
+        // The kept sign-in already carried the folder, even if a later renewal changed its login.
+        legacy.decided = true;
+        legacy.carried_to = Some(config::Legacy::who(&saved.backend_id, saved.account.get()));
+        legacy
+    } else {
+        let Some(login) = saved.music.as_ref() else { return };
+        if saved.sign_out.as_ref().is_some_and(|revoke| {
+            kept.notes.iter().any(|note| note.key() == (saved.backend_id.as_str(), revoke.session.get()))
+        }) {
+            // This sign-in was already signed out before the previous run ended.
+            return;
+        }
+        let Some((folder, Some(decided))) = folder_for(paths, saved, login) else { return };
+        let updated = SignedIn { folder, ..record.clone() };
+        let Ok(text) = serde_json::to_string(&updated).map(Zeroizing::new) else { return };
+        if !vault::write(paths, SIGNED_IN, &text) {
+            return;
+        }
+        *record = updated;
+        decided
+    };
     *legacy_now() = Some(decided);
     record_decision(paths);
 }
@@ -1480,8 +1490,8 @@ mod tests {
         std::fs::remove_dir_all(&file).unwrap();
         config::keep_legacy(&paths, &legacy).unwrap();
         *legacy_now() = Some(config::load_legacy(&paths).unwrap());
-        let (_, view) = read_kept(&paths).unwrap();
-        record_decision_kept_before(&paths, &view.record);
+        let (kept, mut view) = read_kept(&paths).unwrap();
+        record_decision_kept_before(&paths, &kept, &mut view.record);
         let kept = config::load_legacy(&paths).unwrap();
         assert!(kept.decided);
         assert_eq!(kept.carried_to, Some(config::Legacy::who(&ada.backend_id, 7)));
@@ -1489,38 +1499,64 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// MUST 14: the folder this PC had before is carried over once, at the first music login
-    /// kept here, and the decision is never made again: not after a sign-out, not for a
-    /// later account, whatever the settings name by then.
     #[test]
-    fn the_folder_before_is_decided_once_and_survives_sign_out() {
+    fn only_the_first_matching_login_inherits_the_released_folder() {
         let (_one, dir, paths) = profile("legacy");
-        let legacy = config::Legacy { server: "https://music.example.org".into(), username: "ada".into(), decided: false, carried_to: None };
+        let legacy = config::Legacy { server: "https://music.example.org".into(), username: "ada".into(), ..Default::default() };
         config::keep_legacy(&paths, &legacy).unwrap();
-        // Kept once: a later start's settings (another music user by then) change nothing.
-        config::keep_legacy(&paths, &config::Legacy { server: "https://music.example.org".into(), username: "bob".into(), ..legacy.clone() }).unwrap();
-        let mut bob = saved();
-        bob.account = AccountId::new(8).unwrap();
-        bob.music = Some(account::read::<MusicLogin>(
+        let bob = |music| {
+            let mut bob = saved();
+            bob.account = AccountId::new(8).unwrap();
+            bob.music = music;
+            bob
+        };
+        // Keeping a sign-in without a music login leaves the folder open.
+        let separate = config::person_folder(&saved().backend_id, 8);
+        assert!(keep_saved(&paths, epoch_now(), bob(None), &Cause::Other));
+        assert_eq!(config::load_legacy(&paths).unwrap(), legacy);
+        let login = account::read::<MusicLogin>(
             br#"{"address":"https://music.example.org","name":"bob","salt":"0101010101010101010101010101010101010101010101010101010101010101","token":"0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f","count":1}"#,
-        ).unwrap());
-        // Bob first: not Ada's music user, so the folder before goes to nobody, for good.
-        let first = decide(&paths, &bob);
-        assert_eq!(first, config::person_folder(&bob.backend_id, 8));
+        ).unwrap();
+        assert!(keep_saved(&paths, epoch_now(), bob(Some(login)), &Cause::Other));
+        let (kept, mut view) = read_kept(&paths).unwrap();
+        assert_eq!(view.record.folder, separate);
+        *legacy_now() = Some(config::load_legacy(&paths).unwrap());
+        record_decision_kept_before(&paths, &kept, &mut view.record);
+        assert_eq!(config::load_legacy(&paths).unwrap(), legacy);
+        assert_eq!(legacy_now().as_ref(), Some(&legacy));
+
         let ada = saved();
-        let later = decide(&paths, &ada);
-        assert_eq!(later, config::person_folder(&ada.backend_id, 7), "decided once: never carried over later");
-        // And Bob's again after a sign-out (nothing of the sign-in kept): the same folder.
-        assert_eq!(decide(&paths, &bob), first);
-        // Had Ada come first, it would have been hers, and hers alone, at every sign-in.
+        assert_eq!(decide(&paths, &ada), legacy.stem());
+        *legacy_now() = None; // Restart after sign-out.
+        assert_eq!(decide(&paths, &bob(saved().music)), separate);
+        assert_eq!(decide(&paths, &ada), legacy.stem());
         let _ = std::fs::remove_dir_all(&dir);
-        let paths = config::Paths::in_dir(&dir);
-        config::keep_legacy(&paths, &legacy).unwrap();
-        *legacy_now() = None;
-        let carried = decide(&paths, &ada);
-        assert_eq!(carried, legacy.stem());
-        assert_eq!(decide(&paths, &ada), carried);
-        assert_eq!(decide(&paths, &bob), config::person_folder(&bob.backend_id, 8));
+    }
+
+    #[test]
+    fn a_version_0_41_0_decision_without_an_owner_is_open() {
+        let (_one, dir, paths) = profile("legacy-nobody");
+        let legacy = config::Legacy { server: "https://music.example.org".into(), username: "ada".into(), decided: true, carried_to: None };
+        config::save_legacy(&paths, &legacy).unwrap();
+        *legacy_now() = Some(config::load_legacy(&paths).unwrap());
+        assert!(!legacy_now().as_ref().unwrap().decided);
+        let ada = saved();
+        let separate = config::person_folder(&ada.backend_id, 7);
+        let mut record = SignedIn { saved: Some(serde_json::to_value(&ada).unwrap()), folder: separate.clone(), handed_at: String::new() };
+        assert!(vault::write(&paths, SIGNED_IN, &serde_json::to_string(&record).unwrap()));
+        let kept = Kept { saved: Some(ada), ..Kept::default() };
+        vault::fail_writes(Some(SIGNED_IN));
+        record_decision_kept_before(&paths, &kept, &mut record);
+        vault::fail_writes(None);
+        assert_eq!(record.folder, separate);
+        assert!(!config::load_legacy(&paths).unwrap().decided);
+
+        record_decision_kept_before(&paths, &kept, &mut record);
+        assert_eq!(record.folder, legacy.stem());
+        let (_, kept_view) = read_kept(&paths).unwrap();
+        assert_eq!(kept_view.record, record);
+        let ada = kept.saved.as_ref().unwrap();
+        assert_eq!(config::load_legacy(&paths).unwrap().carried_to, Some(config::Legacy::who(&ada.backend_id, 7)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
