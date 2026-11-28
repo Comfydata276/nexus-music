@@ -717,15 +717,15 @@ fn adoption_requires_reset_and_a_newer_stamp_cannot_change_the_account_life() ->
 }
 
 #[test]
-fn provisioning_requires_the_grant_both_exact_logins_and_current_authority() -> Result<(), Denied> {
+fn provisioning_requires_the_grant_the_exact_internal_login_and_current_authority() -> Result<(), Denied> {
     use crate::nexus::{
         account::{MusicAddress, MusicLoginResult, MusicSalt, Name, SALT_BYTES},
         music::{
-            Checked, CredentialBinding, CurrentEndpoints, MusicInstallation, Outcome, Ping,
+            CredentialBinding, MusicInstallation, Outcome, Ping,
             Provisioning, SaltedToken, SealingKey, VerifiedLogin, hand_out,
         },
     };
-    const PRIVATE: &str = "http://navidrome.example.test:4533";
+    const INTERNAL: &str = "http://navidrome.example.test:4533";
     let public = MusicAddress::new("https://music.example.test").unwrap();
     let key = SealingKey::new([8; 32]);
     let mut admin = Stored::admin()?;
@@ -735,7 +735,7 @@ fn provisioning_requires_the_grant_both_exact_logins_and_current_authority() -> 
     let old_binding = CredentialBinding {
         backend: alice.apart.account.backend,
         account: alice.apart.account.id,
-        address: public.clone(),
+        internal: INTERNAL.into(),
         name: Name::new("Alice").unwrap(),
         count: 1,
     };
@@ -774,7 +774,7 @@ fn provisioning_requires_the_grant_both_exact_logins_and_current_authority() -> 
     let checked = |admin: &mut Stored,
                    alice: &Stored,
                    n: u8,
-                   public_name: &[u8]|
+                   reported_name: &[u8]|
      -> Result<VerifiedLogin, Outcome> {
         admin
             .leave(
@@ -793,32 +793,20 @@ fn provisioning_requires_the_grant_both_exact_logins_and_current_authority() -> 
             })
             .unwrap();
         let input = Provisioning {
-            internal: PRIVATE,
-            public: public.clone(),
+            internal: INTERNAL,
             name: Name::new("Alice").unwrap(),
             password: Zeroizing::new(b"Example password".to_vec()),
             salt: MusicSalt::from_random([n; SALT_BYTES]),
             nonce: [n; 24],
         };
         let ping = Ping::provision(auth, input, &key)?;
-        assert_eq!(ping.post().address(), PRIVATE);
-        let first_form = ping.post().form().to_owned();
+        assert_eq!(ping.post().address(), INTERNAL);
+        assert_eq!(ping.post().path(), "/rest/ping");
         let ok = br#"{"subsonic-response":{"status":"ok"}}"#;
-        let person = br#"{"subsonic-response":{"status":"ok","user":{"username":"Alice"}}}"#;
         let user = ping.answer(Some((200, ok)))?;
+        assert_eq!(user.post().address(), INTERNAL);
         assert_eq!(user.post().path(), "/rest/getUser");
-        let Checked::Public(ping) = user.answer(Some((200, person)))? else {
-            panic!("public login wasn't checked")
-        };
-        assert_eq!(ping.post().address(), public.as_str());
-        assert_eq!(ping.post().form(), first_form);
-        let Checked::Verified(result) = ping
-            .answer(Some((200, ok)))?
-            .answer(Some((200, public_name)))?
-        else {
-            panic!("public login wasn't verified")
-        };
-        Ok(result)
+        user.answer(Some((200, reported_name)))
     };
 
     let other = br#"{"subsonic-response":{"status":"ok","user":{"username":"Bob"}}}"#;
@@ -834,25 +822,18 @@ fn provisioning_requires_the_grant_both_exact_logins_and_current_authority() -> 
         admin.step(4, |t| t.install_music(
             bearer(1, &actor),
             replaced,
-            CurrentEndpoints {
-                internal: PRIVATE,
-                public: &public
-            },
+            INTERNAL,
             Some(&mut bob.account)
         )),
         Err(Denied::WrongPurpose)
     );
 
-    let wrong_address = MusicAddress::new("https://changed.example.test").unwrap();
     let replaced = checked(&mut admin, &alice, 5, exact).ok().unwrap();
     assert_eq!(
         admin.step(5, |t| t.install_music(
             bearer(1, &actor),
             replaced,
-            CurrentEndpoints {
-                internal: PRIVATE,
-                public: &wrong_address
-            },
+            "http://changed.example.test:4533",
             Some(&mut alice.account)
         )),
         Err(Denied::WrongPurpose)
@@ -866,10 +847,7 @@ fn provisioning_requires_the_grant_both_exact_logins_and_current_authority() -> 
             t.install_music(
                 bearer(1, &actor),
                 replaced,
-                CurrentEndpoints {
-                    internal: PRIVATE,
-                    public: &public,
-                },
+                INTERNAL,
                 Some(&mut alice.account),
             )
         })
@@ -891,7 +869,8 @@ fn provisioning_requires_the_grant_both_exact_logins_and_current_authority() -> 
                     SessionKind::App,
                     Some(&old_login),
                     &key,
-                    &public,
+                    INTERNAL,
+                    Some(&public),
                     salt()
                 ),
                 MusicLoginResult::UnusableNow
@@ -902,7 +881,8 @@ fn provisioning_requires_the_grant_both_exact_logins_and_current_authority() -> 
                 SessionKind::App,
                 Some(login),
                 &key,
-                &public,
+                INTERNAL,
+                Some(&public),
                 salt(),
             ) else {
                 panic!("committed replacement should work before the last apart write");
@@ -918,7 +898,8 @@ fn provisioning_requires_the_grant_both_exact_logins_and_current_authority() -> 
                     SessionKind::App,
                     Some(&old_login),
                     &key,
-                    &public,
+                    INTERNAL,
+                    Some(&public),
                     salt()
                 ),
                 MusicLoginResult::UnusableNow
@@ -930,10 +911,7 @@ fn provisioning_requires_the_grant_both_exact_logins_and_current_authority() -> 
         admin.step(7, |t| t.install_music(
             bearer(1, &actor),
             stale_count,
-            CurrentEndpoints {
-                internal: PRIVATE,
-                public: &public
-            },
+            INTERNAL,
             Some(&mut alice.account)
         )),
         Err(Denied::WrongPurpose)
@@ -945,10 +923,7 @@ fn provisioning_requires_the_grant_both_exact_logins_and_current_authority() -> 
         admin.step(8, |t| t.install_music(
             bearer(1, &actor),
             replaced,
-            CurrentEndpoints {
-                internal: PRIVATE,
-                public: &public
-            },
+            INTERNAL,
             Some(&mut alice.account)
         )),
         Err(Denied::NotSignedIn)

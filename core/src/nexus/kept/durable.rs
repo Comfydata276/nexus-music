@@ -3,7 +3,7 @@
 
 use super::receipt::Purpose;
 use super::*;
-use crate::nexus::music::{CurrentEndpoints, MusicInstallation, VerifiedLogin};
+use crate::nexus::music::{MusicInstallation, VerifiedLogin};
 use std::collections::BTreeMap;
 
 pub const CLOCK_MARK_INTERVAL_MS: u64 = 60_000;
@@ -1275,16 +1275,16 @@ impl Turn<'_> {
         })
     }
 
-    /// Install the verified login only while the same authorization and endpoints
-    /// are current. S3 commits the count and sealed bytes under the same lock.
+    /// Install the verified login only while the same authorization and internal
+    /// address are current. S3 commits the count and sealed bytes under the same lock.
     pub fn install_music(
         self,
         bearer: Bearer<'_>,
         verified: VerifiedLogin,
-        endpoints: CurrentEndpoints<'_>,
+        internal: &str,
         target: Option<&mut Account>,
     ) -> Result<u64, Denied> {
-        let (auth, login) = verified.into_parts(endpoints).ok_or(Denied::WrongPurpose)?;
+        let (auth, login) = verified.into_parts(internal).ok_or(Denied::WrongPurpose)?;
         let session = self
             .account
             .session(bearer.device, bearer.hash, self.now)?
