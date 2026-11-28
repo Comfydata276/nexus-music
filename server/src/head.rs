@@ -20,8 +20,10 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use crate::bounds::{BODY_MAX_BYTES, HEAD_MAX_BYTES, HEAD_MAX_HEADERS};
 use crate::serve::{Peer, Refusal};
 
-/// A request's head as it came, and the bytes read with it.
-#[derive(Debug, Clone)]
+/// A request's head as it came, and the bytes read with it. Its `Debug` says how large each
+/// part is and which headers came, never a header's value or a byte read: a session, a note, a
+/// password or a code can be in them (the review of S8, C2).
+#[derive(Clone)]
 pub struct Head {
     /// Every byte read from the connection so far: the head, and whatever of the body the
     /// last read happened to bring with it (never more than [`HEAD_MAX_BYTES`] in all).
@@ -31,6 +33,18 @@ pub struct Head {
     pub target: String,
     /// Each header as it came, the name in lower case.
     pub headers: Vec<(String, Vec<u8>)>,
+}
+
+impl std::fmt::Debug for Head {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let names: Vec<&str> = self.headers.iter().map(|(name, _)| name.as_str()).collect();
+        f.debug_struct("Head")
+            .field("read_bytes", &self.read.len())
+            .field("method", &self.method)
+            .field("target_bytes", &self.target.len())
+            .field("header_names", &names)
+            .finish()
+    }
 }
 
 impl Head {
@@ -229,6 +243,28 @@ mod tests {
 
     fn get(target: &str, extra: &str) -> Head {
         head(&format!("GET {target} HTTP/1.1\r\nHost: x\r\nX-Nexus-Scheme: https\r\n{extra}\r\n"))
+    }
+
+    /// C2 (the review of S8): a head read with its body's first bytes shows neither the
+    /// session in its `Authorization` nor anything of the body.
+    #[test]
+    fn a_head_s_debug_shows_no_header_value_and_no_byte_read() {
+        let session = "Bearer sess-0123456789abcdef0123456789abcdef";
+        let body = r#"{"credential":{"password":{"email":"someone@example.test","password":"hunter2-hunter2-hunter2"}},"code":"ABCDEF-GHJKMN","revoke":{"secret":"note-secret-77"}}"#;
+        let request = format!(
+            "POST {} HTTP/1.1\r\nHost: x\r\nX-Nexus-Scheme: https\r\nAuthorization: {session}\r\nContent-Length: {}\r\n\r\n{body}",
+            account::SIGN_IN,
+            body.len()
+        );
+        let mut from = request.as_bytes();
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let read = runtime.block_on(read(&mut from)).unwrap();
+        assert!(read.read.len() > body.len(), "the body came with the head");
+        let shown = format!("{read:?} {read:#?}");
+        for secret in ["sess-0123", "hunter2", "someone@", "ABCDEF", "note-secret", "Bearer", "credential"] {
+            assert!(!shown.contains(secret), "Debug showed {secret:?}: {shown}");
+        }
+        assert!(shown.contains("authorization"), "the header's name is shown: {shown}");
     }
 
     #[test]
