@@ -76,6 +76,7 @@ use crate::ui;
 
 mod call;
 mod signin;
+pub mod vault;
 
 /// How the program is told it is a look, and at what.
 const PROBE_ARG: &str = "--nexus-probe";
@@ -583,6 +584,11 @@ fn trigger_for_tests(ui: &ui::MainWindow) {
 }
 
 /// `NEXUS_TEST_NEXUS_LOG=<file>`: what the component does, a line each, with the time.
+/// A line of the component's test log (`NEXUS_TEST_NEXUS_LOG`), from anywhere in the app.
+pub fn trace(what: std::fmt::Arguments<'_>) {
+    note(what);
+}
+
 fn note(what: std::fmt::Arguments<'_>) {
     if let Some(path) = test_var("NEXUS_TEST_NEXUS_LOG") {
         use std::io::Write;

@@ -160,7 +160,7 @@ fn read_device(text: &str) -> Option<DeviceKey> {
 /// and the core says to forget it. What is kept never stops a start.
 fn read_kept(paths: &config::Paths) -> Kept {
     let mut unreadable = Vec::new();
-    let device_secret = match config::read_kept(paths, DEVICE) {
+    let device_secret = match super::vault::read(paths, DEVICE) {
         Ok(Some(text)) => read_device(&text).or_else(|| {
             unreadable.push(Forget::DeviceSecret);
             None
@@ -333,10 +333,10 @@ fn run(ui: &ui::MainWindow, dos: Vec<Do>) {
         match thing {
             Do::Keep(Keep::DeviceSecret(key)) => {
                 let text = Zeroizing::new(serde_json::json!({"secret": key.secret.expose_hex().as_str(), "backend_id": key.backend_id}).to_string());
-                config::write_kept(&paths(), DEVICE, &text);
+                super::vault::write(&paths(), DEVICE, &text);
             }
             Do::Forget(Forget::DeviceSecret) => {
-                config::write_kept(&paths(), DEVICE, "");
+                super::vault::forget(&paths(), DEVICE);
             }
             Do::Forget(Forget::UnreadableNote { index }) => {
                 let paths = paths();

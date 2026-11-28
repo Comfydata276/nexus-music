@@ -73,6 +73,20 @@ impl Paths {
         paths
     }
 
+    /// The files of a profile in `dir`, its folders made (for the tests).
+    #[cfg(test)]
+    pub fn in_dir(dir: &Path) -> Paths {
+        let paths = Paths::at(&dir.join("config"), &dir.join("cache"), &dir.join("data"));
+        let _ = fs::create_dir_all(dir.join("config"));
+        paths
+    }
+
+    /// Where a credential named `name` is kept off Windows: a file beside the settings.
+    #[cfg(not(windows))]
+    pub fn secret_file(&self, name: &str) -> PathBuf {
+        self.secret.with_file_name(name)
+    }
+
     /// Where each file goes, in these three folders (see `docs/FILES.md`).
     fn at(config: &Path, cache: &Path, data: &Path) -> Paths {
         Paths {
@@ -1049,33 +1063,6 @@ fn sync_folder(_: &Path) -> std::io::Result<()> {
 #[cfg(windows)]
 const KEYRING_SERVICE: &str = "Nexus Music";
 
-/// How 0.40 and before named the music-server password it kept: removed at the first start of
-/// this version (`forget_old_password`), and never read.
-#[cfg_attr(not(windows), allow(dead_code))]
-fn old_password_entry(server: &str, username: &str) -> String {
-    format!("{username}@{server}")
-}
-
-/// The music-server password that 0.40 and before kept for a sign-in of their own, removed.
-/// Nothing reads it: from this version the app is handed a salt and token instead (design
-/// 9.4) and keeps no music-server password at all.
-#[cfg(windows)]
-pub fn forget_old_password(_paths: &Paths, server: &str, username: &str) {
-    if server.is_empty() || username.is_empty() {
-        return;
-    }
-    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &old_password_entry(server, username)) {
-        let _ = entry.delete_credential();
-    }
-}
-
-// Other platforms are only used for development, and kept it in a file readable by the
-// current user.
-#[cfg(not(windows))]
-pub fn forget_old_password(paths: &Paths, _server: &str, _username: &str) {
-    let _ = fs::remove_file(&paths.secret);
-}
-
 /// The sign-in to the music server this device was handed by the Nexus server (design 9.4):
 /// the server's address, the name of the person's user there, and a salt and token made for
 /// this device, with the number of the login they were made from. Never a password.
@@ -1139,7 +1126,7 @@ const SIGNED_IN: &str = "nexus-sign-in";
 
 /// What the last sign-in left, if anything is kept and it can be read whole.
 pub fn load_sign_in(paths: &Paths) -> Option<SignedIn> {
-    let text = read_kept(paths, SIGNED_IN).ok()??;
+    let text = crate::nexus::vault::read(paths, SIGNED_IN).ok()??;
     serde_json::from_str(&text).ok()
 }
 
@@ -1147,9 +1134,9 @@ pub fn load_sign_in(paths: &Paths) -> Option<SignedIn> {
 /// Says whether it was done.
 pub fn save_sign_in(paths: &Paths, kept: &SignedIn) -> bool {
     if kept.saved.is_none() {
-        return write_kept(paths, SIGNED_IN, "");
+        return crate::nexus::vault::forget(paths, SIGNED_IN);
     }
-    serde_json::to_string(kept).is_ok_and(|text| write_kept(paths, SIGNED_IN, &text))
+    serde_json::to_string(kept).is_ok_and(|text| crate::nexus::vault::write(paths, SIGNED_IN, &zeroize::Zeroizing::new(text)))
 }
 
 /// The folder a person's things are kept under, decided at their first sign-in on this PC
@@ -1185,15 +1172,15 @@ pub fn person_folder(backend: &str, account: u64) -> String {
 const NOTES: &str = "nexus-sign-out-notes";
 
 pub fn load_notes(paths: &Paths) -> Vec<serde_json::Value> {
-    read_kept(paths, NOTES).ok().flatten().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default()
+    crate::nexus::vault::read(paths, NOTES).ok().flatten().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default()
 }
 
 /// Puts the notes in place, whole, in one step; says whether it was done.
 pub fn save_notes(paths: &Paths, notes: &[serde_json::Value]) -> bool {
     if notes.is_empty() {
-        return write_kept(paths, NOTES, "");
+        return crate::nexus::vault::forget(paths, NOTES);
     }
-    serde_json::to_string(notes).is_ok_and(|text| write_kept(paths, NOTES, &text))
+    serde_json::to_string(notes).is_ok_and(|text| crate::nexus::vault::write(paths, NOTES, &text))
 }
 
 /// Keeps a secret by name: in the Windows credential store, or elsewhere a file only this

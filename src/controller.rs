@@ -898,8 +898,16 @@ impl Controller {
             }
         });
 
-        // The music-server password that versions before this one kept is removed, unread.
-        config::forget_old_password(&self.paths, &settings.server, &settings.username);
+        // Every music-server password that versions before this one kept is removed, unread,
+        // whichever music server and user it was for (and one a failed delete left last
+        // time): off the window's thread.
+        let paths = self.paths.clone();
+        let _ = std::thread::Builder::new().name("legacy-passwords".into()).spawn(move || {
+            let (gone, left) = crate::nexus::vault::forget_legacy_passwords(&paths);
+            if gone + left > 0 {
+                crate::nexus::trace(format_args!("legacy passwords removed {gone}, left {left}"));
+            }
+        });
         // Come back signed in when a sign-in is kept: what the Nexus server handed this
         // device (design 6.1). It is read from this PC and its music login goes straight to
         // the music server; the Nexus server is asked nothing first.
