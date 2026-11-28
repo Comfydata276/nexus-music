@@ -220,10 +220,11 @@ dd, li { overflow-wrap: anywhere; }
         </div>
       </form>
     </dialog>
-    <dialog id="new-code" aria-labelledby="code-title" aria-describedby="code-person code-instructions code-expiry">
+    <dialog id="new-code" aria-labelledby="code-title" aria-describedby="code-person code-server code-instructions code-expiry">
       <h2 id="code-title">One-time sign-in code</h2>
       <p id="code-person"></p>
-      <p id="code-instructions">Pass this code to them privately. They open the Nexus Music app, choose “I have a one-time code” on the sign-in screen, enter their email and this code, then choose a password.</p>
+      <p id="code-server">Nexus server <strong id="code-origin"></strong></p>
+      <p id="code-instructions">Pass the address and code to them privately. In Nexus Music, they choose “I have a one-time code” on the sign-in screen, enter the Nexus server address and this code, then enter a password of their own at least 15 characters long, twice.</p>
       <p id="code-expiry">The code works once and expires in 7 days. You can see it here just once.</p>
       <p id="code-value"></p>
       <button id="code-done" type="button">Done</button>
@@ -272,6 +273,7 @@ dd, li { overflow-wrap: anywhere; }
   const codeDialog = byId("new-code");
   const codeValue = byId("code-value");
   const codePerson = byId("code-person");
+  const codeOrigin = byId("code-origin");
   const loginDialog = byId("music-login");
   const createForm = byId("create-form");
   const addressForm = byId("address-form");
@@ -764,6 +766,7 @@ dd, li { overflow-wrap: anywhere; }
   function clearCode() {
     writeText(codeValue, "");
     writeText(codePerson, "");
+    writeText(codeOrigin, "");
     if (codeDialog.open) codeDialog.close();
   }
 
@@ -776,6 +779,8 @@ dd, li { overflow-wrap: anywhere; }
       throw new Error();
     }
     writeText(codePerson, "Code for " + person);
+    /* Sign-in accepted this exact browser origin as NEXUS_PUBLIC_ORIGIN. */
+    writeText(codeOrigin, window.location.origin);
     writeText(codeValue, code.issued);
     codeDialog.showModal();
     byId("code-done").focus();
