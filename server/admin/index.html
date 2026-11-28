@@ -467,7 +467,7 @@ dd, li { overflow-wrap: anywhere; }
       label: row.name + " · " + row.email + (row.admin ? " · Administrator" : "") +
         (row.enabled ? "" : " · Switched off") +
         (row.music === "type_again" ? " · Enter their music sign-in again" :
-          row.music === "none_set" ? " · Music sign-in not set" : ""),
+          row.music === "none_set" ? " · Music sign-in not set" : " · Music sign-in set"),
     };
   }
 
@@ -623,8 +623,8 @@ dd, li { overflow-wrap: anywhere; }
     menu.append(summary, buttons);
     entry.append(menu);
 
-    const requestRow = appendRow(requests, row.name + " · " + (row.requestsEnabled ? "On" : "Off"));
     if (!enableRequestChanges) return;
+    const requestRow = appendRow(requests, row.name + " · " + (row.requestsEnabled ? "On" : "Off"));
     const requestButtons = document.createElement("div");
     requestButtons.className = "row-actions";
     const mayRequest = !row.requestsEnabled;

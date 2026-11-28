@@ -208,7 +208,7 @@ test("authorized reads render text, paginate losslessly, and rearm idle expiry",
   assert.equal(page.from("music-internal").textContent, injected);
   assert.equal(page.from("music-public").textContent, "Unset");
   assert.equal(page.from("diagnostics-status").textContent, "New devices send diagnostics by default.");
-  assert.equal(page.from("requests-list").children[0].textContent, injected + " · On");
+  assert.equal(page.from("requests-list").children.length, 0);
   assert.equal(page.from("accounts-more").hidden, false);
   await page.from("accounts-more").events.get("click")();
   assert.match(requests.at(-1)[1].body, /"after":18446744073709551614/);
