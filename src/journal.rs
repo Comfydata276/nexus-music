@@ -129,7 +129,11 @@ fn publish(scope: Option<Scope>) {
     }
     if scope.is_some() && !OPENED.replace(true) {
         note(|| {
-            let version = nexus_core::nexus::proto::Version::parse(env!("CARGO_PKG_VERSION"))?;
+            let version = nexus_core::nexus::proto::Version {
+                major: env!("CARGO_PKG_VERSION_MAJOR").parse().ok()?,
+                minor: env!("CARGO_PKG_VERSION_MINOR").parse().ok()?,
+                patch: env!("CARGO_PKG_VERSION_PATCH").parse().ok()?,
+            };
             Some(Kind::Open { version, device: DeviceKind::Pc })
         });
     }
