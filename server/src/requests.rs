@@ -1103,10 +1103,10 @@ fn loaded_bulk(payload: &[u8], desk: impl bulk::Desk + 'static) -> Result<bulk::
 
 fn asked_history(db: &Connection, binding: &[u8; 32], account: AccountId) -> Result<Vec<AskedRelease>, Refusal> {
     let mut query = db.prepare(
-        "SELECT metadata FROM requests_owners WHERE binding = ?1 AND account = ?2
+        "SELECT metadata FROM requests_owners WHERE binding = ?1 AND account = ?2 AND length(metadata) > 0
          ORDER BY asked_ms DESC, release LIMIT ?3",
     ).map_err(sql_error)?;
-    let rows = query.query_map(params![binding.as_slice(), sql(account.get())?, wire::LIST_MAX_ITEMS as i64 + 1],
+    let rows = query.query_map(params![binding.as_slice(), sql(account.get())?, wire::LIST_MAX_ITEMS as i64],
         |row| row.get::<_, Vec<u8>>(0)).map_err(sql_error)?;
     rows.map(|row| decode(&row.map_err(sql_error)?)).collect()
 }
@@ -1115,9 +1115,10 @@ fn attributed_requests(db: &Connection, binding: &[u8; 32]) -> Result<Vec<Attrib
     let mut query = db.prepare(
         "SELECT owners.account, accounts.shown, owners.metadata FROM requests_owners AS owners
          JOIN accounts ON accounts.number = owners.account
-         WHERE owners.binding = ?1 ORDER BY owners.asked_ms DESC, owners.account, owners.release LIMIT ?2",
+         WHERE owners.binding = ?1 AND length(owners.metadata) > 0
+         ORDER BY owners.asked_ms DESC, owners.account, owners.release LIMIT ?2",
     ).map_err(sql_error)?;
-    let rows = query.query_map(params![binding.as_slice(), wire::LIST_MAX_ITEMS as i64 + 1], |row| {
+    let rows = query.query_map(params![binding.as_slice(), wire::LIST_MAX_ITEMS as i64], |row| {
         Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, Vec<u8>>(2)?))
     }).map_err(sql_error)?;
     let mut found = Vec::new();
@@ -1577,8 +1578,11 @@ fn keep_owner(db: &Connection, binding: &[u8; 32], account: AccountId, ask: &Rec
     db.execute(
         "INSERT INTO requests_owners (binding, account, release, asked_ms, metadata, placed)
          SELECT ?1, number, ?2, ?3, ?4, ?6 FROM accounts WHERE number = ?5
-         ON CONFLICT(binding, account, release) DO UPDATE SET placed = 1
-         WHERE excluded.placed = 1 AND requests_owners.placed = 0",
+         ON CONFLICT(binding, account, release) DO UPDATE SET
+            placed = MAX(requests_owners.placed, excluded.placed),
+            metadata = CASE WHEN length(requests_owners.metadata) = 0 THEN excluded.metadata ELSE requests_owners.metadata END,
+            asked_ms = CASE WHEN length(requests_owners.metadata) = 0 THEN excluded.asked_ms ELSE requests_owners.asked_ms END
+         WHERE length(requests_owners.metadata) = 0 OR excluded.placed > requests_owners.placed",
         params![binding.as_slice(), row.asked.release.as_str(), events::sql(now)?, metadata,
             events::sql(account.get())?, row.placed],
     ).map(drop)
@@ -1656,10 +1660,11 @@ impl Journal {
             let known = lidarr_result(lidarr.known_artist(&artist_key), None)?;
             if known.is_some_and(|(number, _)| number == artist) {
                 lidarr.set_new_releases(artist, &setting).map_err(|_| Refusal::LidarrCouldNotRestore)?;
-                self.cross_off(artist, setting)?;
             } else {
-                return Err(Refusal::LidarrCouldNotRestore);
+                // A successful lookup with a different number cannot restore this row.
+                eprintln!("An obsolete Lidarr setting recovery entry was discarded.");
             }
+            self.cross_off(artist, setting)?;
         }
         Ok(())
     }

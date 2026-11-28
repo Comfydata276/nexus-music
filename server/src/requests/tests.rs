@@ -390,10 +390,14 @@ impl TestServer {
     fn start_child(name: &str, endpoint: SocketAddr) -> (Self, [OneTimeCode; 3]) {
         let (root, keeper, codes) = fixture(name);
         keeper.close();
+        (Self::launch_saved(root, endpoint), codes)
+    }
+
+    fn launch_saved(root: PathBuf, endpoint: SocketAddr) -> Self {
         let address = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
         let mut server = Self { root, address, accounts: None, stop: None, thread: None, child: None };
         server.launch(endpoint);
-        (server, codes)
+        server
     }
 
     fn launch(&mut self, lidarr: SocketAddr) {
@@ -764,6 +768,57 @@ fn a_member_can_complete_the_full_walk_using_the_page_configured_key() {
     assert_eq!(server.done(&member, job), Completed::Cancelled);
     assert!(matches!(server.call(&member, Call::Pending { after: None }),
         Answer::Pending { albums, .. } if albums.is_empty()));
+}
+
+#[test]
+fn a_request_works_after_upgrading_the_deployed_form() {
+    let lidarr = MockLidarr::start();
+    let (root, mut keeper, [admin, member, _]) = fixture("deployed-form");
+    let binding = binding(&endpoint(lidarr.address));
+    keeper.write_data(now(), |tx| {
+        tx.execute(
+            "INSERT INTO requests_owners (binding, account, release, asked_ms)
+             SELECT ?1, number, ?2, 1 FROM accounts WHERE email = 'person1@example.org'",
+            params![binding.as_slice(), ALBUM],
+        ).map(|count| ((), count != 0))
+    }).unwrap();
+    keeper.close();
+
+    let db = Connection::open(root.join("data/nexus.db")).unwrap();
+    db.execute_batch("DROP TRIGGER requests_owners_placed_stays;
+        ALTER TABLE requests_owners DROP COLUMN placed;
+        ALTER TABLE requests_owners DROP COLUMN metadata;
+        PRAGMA user_version = 1; PRAGMA journal_mode = DELETE;").unwrap();
+    let deployed = Connection::open_in_memory().unwrap();
+    deployed.execute_batch(include_str!("../../tests/fixtures/form-1-4097756.sql")).unwrap();
+    let old_rows = |db: &Connection| {
+        db.prepare("SELECT name, type FROM pragma_table_info('requests_owners') ORDER BY cid").unwrap()
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))).unwrap()
+            .map(Result::unwrap).collect::<Vec<_>>()
+    };
+    assert_eq!(old_rows(&db), old_rows(&deployed));
+    drop(db);
+
+    let server = TestServer::launch_saved(root, lidarr.address);
+    let page = server.redeem(admin, 1, TEST_PAGE);
+    server.configure(&page);
+    let member = server.redeem(member, 2, "");
+    let db = Connection::open(server.root.join("data/nexus.db")).unwrap();
+    let stored: (Vec<u8>, bool) = db.query_row("SELECT metadata, placed FROM requests_owners",
+        [], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+    assert_eq!(stored, (Vec::new(), false));
+    assert!(matches!(server.call(&member, Call::AskedHistory { after: None }),
+        Answer::AskedHistory { rows, .. } if rows.is_empty()));
+
+    let offer = server.offer(&member);
+    let job = begun(server.call(&member, begin(1, Change::Request { offer })));
+    assert_eq!(server.done(&member, job), Completed::Requested { placed: true });
+    assert!(matches!(server.call(&member, Call::AskedHistory { after: None }),
+        Answer::AskedHistory { rows, .. } if rows.len() == 1 && rows[0].release.as_str() == ALBUM));
+    let job = begun(server.call(&member, begin(2, cancelled())));
+    assert_eq!(server.done(&member, job), Completed::Cancelled);
+    let form: i64 = db.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
+    assert_eq!(form, crate::store::data::FORM);
 }
 
 #[test]
