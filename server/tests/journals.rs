@@ -66,7 +66,7 @@ impl Fixture {
         assert!(out.status.success(), "set-up failed");
         let out = String::from_utf8(out.stdout).unwrap();
         let (_, code) = out.split_once("one-time code ").unwrap();
-        OneTimeCode::new(&code[..13].replace('-', "")).unwrap()
+        OneTimeCode::typed(&code[..13]).unwrap()
     }
 
     fn other(&self) -> OneTimeCode {
@@ -350,6 +350,7 @@ fn report(count: u64, populated: bool) -> Report {
             local_permission: None,
             android_auto: None,
             loss: events::LossCounts { refused: count, ..Default::default() },
+            pc: None,
         },
         record,
     }
@@ -419,6 +420,28 @@ fn restart_keeps_acknowledged_events_and_reports() {
     let (status, body) = fixture.post_with(nexus_music_server::diag::ADMIN_PATH, Some(&who), BROWSER, page(&stamp, None).bytes());
     assert_eq!(status, 200);
     assert_eq!(json::<String>(&body, "$.done.result.reports[0].text"), report(1, false).text().unwrap());
+    assert_eq!(count(&fixture, "diagnostic_reports"), 1);
+}
+
+#[test]
+fn opening_an_s8_database_without_journal_tables_keeps_its_sessions() {
+    let mut fixture = Fixture::new("s8-form");
+    let code = fixture.set_up();
+    fixture.start();
+    let (who, stamp) = fixture.sign_in(with_code(code), 1);
+    fixture.stop();
+    // Model the form-1 schema from S8, which predates the journal tables.
+    fixture.db().execute_batch(
+        "DROP TRIGGER listening_erase_life;
+         DROP TABLE listening_events;
+         DROP TABLE listening_totals;
+         DROP TABLE diagnostic_reports;",
+    ).unwrap();
+    fixture.start();
+    let sent = batch(&stamp, &[start(1, 100, 0)]);
+    assert_outcomes(send(&fixture, &who, &sent), &sent, &[Outcome::Taken]);
+    upload(&fixture, &who, &stamp, 1, &report(1, false));
+    assert_eq!(count(&fixture, "listening_events"), 1);
     assert_eq!(count(&fixture, "diagnostic_reports"), 1);
 }
 

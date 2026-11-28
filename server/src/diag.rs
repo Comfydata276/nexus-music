@@ -10,23 +10,22 @@ use axum::extract::State;
 use axum::http::{HeaderMap, Response};
 use nexus_core::nexus::account::{self, DeviceId, ListDevices, Refusal, Reply};
 use nexus_core::nexus::diag::{self, MAX_AGE_MS, STORED_REPORTS, Upload, Uploaded};
-use nexus_core::nexus::kept::{Access, Effects};
+use nexus_core::nexus::kept::Access;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::accounts::session::{Accounts, refused};
 use crate::events::{
     Calls, answer, authenticated, bearer, denied, finish, list_response, receipt, respond, result,
-    schema, sql, unavailable, write_data,
+    schema, sql, unavailable,
 };
 
 pub const SEND_PATH: &str = diag::SEND_PATH;
 pub const LIST_PATH: &str = "/nexus/api/diag/list";
 pub const ADMIN_PATH: &str = "/nexus/api/admin/diagnostics";
 pub const LIST_PAGE: usize = 50;
-const EXPIRE_STEP: usize = STORED_REPORTS * 2;
 const EXPIRY_INTERVAL: Duration = Duration::from_secs(60);
 
-// CARRIED until S3b registers the migration.
+// CARRIED for form-1 data created before the store included the report table.
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS diagnostic_reports (
     row_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -53,7 +52,8 @@ pub(crate) async fn send(State(calls): State<Calls>, headers: HeaderMap, body: B
             let (number, device, account) = authenticated(keeper, &upload.head, &hash, Access::Write, now)?;
             let at = keeper.clock(now).effective();
             schema(keeper.data().connection(), "diagnostic_reports", SCHEMA).map_err(unavailable)?;
-            let matches = write_data(keeper, Some(device), now, |tx| keep(tx, number, device, upload, at))?;
+            let matches = keeper.write_data(now, |tx| keep(tx, number, device, upload, at))
+                .map_err(unavailable)?;
             if !matches {
                 return Err(Refusal::Malformed);
             }
@@ -99,51 +99,24 @@ fn keep(tx: &Transaction<'_>, account: u64, device: DeviceId, upload: Upload, no
     Ok((true, true))
 }
 
-// CARRIED until the writer's idle service has a Diagnostics hook. Each tick can
-// perform at most one small indexed delete. The task doesn't own the server's lifetime.
+// CARRIED until the desk calls Keeper::idle itself (S9). Enqueue one idle turn
+// immediately at startup, then at most once per minute. The store owns the work.
 pub(crate) fn start_expiry(accounts: &Arc<Accounts>) {
     let Ok(runtime) = tokio::runtime::Handle::try_current() else { return };
     let accounts = Arc::downgrade(accounts);
     runtime.spawn(async move {
-        let mut pause = Duration::ZERO;
+        let mut interval = tokio::time::interval(EXPIRY_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            tokio::time::sleep(pause).await;
+            interval.tick().await;
             let Some(accounts) = accounts.upgrade() else { break };
             let clock = accounts.clock.clone();
-            let expired = accounts.desk.ask(move |keeper| expire(keeper, clock())).await;
-            pause = match expired {
-                Ok(Ok(EXPIRE_STEP)) => Duration::from_millis(50),
-                _ => EXPIRY_INTERVAL,
-            };
+            let _ = accounts.desk.ask(move |keeper| {
+                schema(keeper.data().connection(), "diagnostic_reports", SCHEMA).map_err(unavailable)?;
+                keeper.idle(clock()).map_err(unavailable)
+            }).await;
         }
     });
-}
-
-fn expire(keeper: &mut crate::store::keeper::Keeper, now: u64) -> Result<usize, Refusal> {
-    let at = keeper.clock(now).effective();
-    // CARRIED for the S8 base's writer, which has no idle hook. Flush the cached
-    // data-change mark even when no upload follows the one that made it dirty.
-    // This step is not an authenticated decision and does not move the clock.
-    keeper.persist(&Effects { high_water: 0, updates: Vec::new() }, &[], now).map_err(unavailable)?;
-    let cutoff = sql(at.saturating_sub(MAX_AGE_MS)).map_err(unavailable)?;
-    let db = keeper.data().connection();
-    let present: bool = db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = 'diagnostic_reports')",
-        [], |row| row.get(0),
-    ).map_err(unavailable)?;
-    if !present {
-        return Ok(0);
-    }
-    write_data(keeper, None, now, |tx| {
-        let deleted = tx.execute(
-            "DELETE FROM diagnostic_reports WHERE row_id IN (
-                SELECT row_id FROM diagnostic_reports WHERE received_ms < ?1
-                ORDER BY received_ms, row_id LIMIT ?2
-            )",
-            params![cutoff, EXPIRE_STEP as i64],
-        )?;
-        Ok((deleted, deleted != 0))
-    })
 }
 
 /// Device numbers and server receipt times for the signed-in account.

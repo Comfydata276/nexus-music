@@ -30,8 +30,8 @@ pub const STATS_PATH: &str = "/nexus/api/events/stats";
 pub const STATS_PAGE: usize = 50;
 const DEFAULT_DATA_BUDGET: u64 = 4_000_000_000;
 
-// CARRIED until S3b registers the migration. Keep the life transition in the same
-// transaction as the deletion. During recovery a held history must stay inaccessible.
+// CARRIED for form-1 data created before the store included these tables.
+// The life transition and deletion share a transaction. Recovery can hold old history.
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS listening_events (
     row_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -216,33 +216,6 @@ pub(crate) fn schema(db: &Connection, table: &str, migration: &str) -> rusqlite:
     Ok(())
 }
 
-// CARRIED on the existing Desk's only writer. Keep meta with the rows. heard brings the
-// Keeper's cached change mark up to date after the transaction until write_data is available.
-pub(crate) fn write_data<T>(
-    keeper: &mut Keeper,
-    heard: Option<DeviceId>,
-    now: u64,
-    step: impl FnOnce(&Transaction<'_>) -> rusqlite::Result<(T, bool)>,
-) -> Result<T, Refusal> {
-    let at = keeper.clock(now).effective();
-    let (value, changed) = {
-        let tx = keeper.data().connection().unchecked_transaction().map_err(unavailable)?;
-        let (value, changed) = step(&tx).map_err(unavailable)?;
-        if changed {
-            tx.execute("UPDATE meta SET changes = changes + 1, written_at = max(written_at, ?1) WHERE one = 1", [sql(at).map_err(unavailable)?])
-                .map_err(unavailable)?;
-            tx.commit().map_err(unavailable)?;
-        } else {
-            tx.rollback().map_err(unavailable)?;
-        }
-        (value, changed)
-    };
-    if changed && let Some(device) = heard {
-        keeper.heard(device.get(), now).map_err(unavailable)?;
-    }
-    Ok(value)
-}
-
 struct Prepared {
     id: events::EventId,
     event: Result<StoredEvent, Outcome>,
@@ -290,7 +263,8 @@ async fn send(State(calls): State<Calls>, headers: HeaderMap, body: Bytes) -> Re
             arrive(keeper, &head, &hash, device, &mut account, access, now)?;
             let answers = if life == current_life {
                 schema(keeper.data().connection(), "listening_events", SCHEMA).map_err(unavailable)?;
-                write_data(keeper, Some(device), now, |tx| insert(tx, number, device, current_life, life, budget, rows))?
+                keeper.write_data(now, |tx| insert(tx, number, device, current_life, life, budget, rows))
+                    .map_err(unavailable)?
             } else {
                 // The client's core reader interprets the stamp as LifeMoved before
                 // applying any outcomes.
