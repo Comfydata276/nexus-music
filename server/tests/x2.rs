@@ -850,9 +850,33 @@ fn a_change_the_data_alone_has_is_seen_once_the_store_has_its_mark() {
     let copy = snapshot(&root, &["nexus.db"]);
     let mut keeper = opened(&root, T0 + 2 * MINUTE + 10_000);
     keeper.heard(ids.b1, T0 + 2 * MINUTE + 10_000).unwrap();
-    keeper.close();
+    // Stopped as a kill would, before the minute was out: the store has not heard.
+    drop(keeper);
     put_by_hand(&root, &copy);
     assert_eq!(settled(&root, T0 + 3 * MINUTE).1, Started::Ready);
+}
+
+/// Finding 6: in idle time the one thread that writes gives the store the mark once its
+/// minute is out, though nothing else is asked; a kill after that cannot hide the change.
+#[test]
+fn the_last_change_the_data_alone_has_is_marked_in_idle_time() {
+    let root = Root::new("mark-idle");
+    let ids = world(&root);
+    let mut keeper = opened(&root, T0 + 2 * MINUTE);
+    keeper.heard(ids.b1, T0 + 2 * MINUTE).unwrap();
+    keeper.close();
+    let copy = snapshot(&root, &["nexus.db"]);
+    let mut keeper = opened(&root, T0 + 2 * MINUTE + 10_000);
+    keeper.heard(ids.b1, T0 + 2 * MINUTE + 10_000).unwrap();
+    let due = keeper.mark_due().expect("a mark is due");
+    keeper.idle(due - 1).unwrap();
+    assert_eq!(keeper.mark_due(), Some(due), "written before its minute was out");
+    keeper.idle(due).unwrap();
+    assert_eq!(keeper.mark_due(), None);
+    drop(keeper);
+    put_by_hand(&root, &copy);
+    let (_, started) = settled(&root, T0 + 7 * 24 * 60 * MINUTE);
+    assert!(matches!(started, Started::Restored { .. }), "{started:?}");
 }
 
 #[test]

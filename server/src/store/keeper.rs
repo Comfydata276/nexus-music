@@ -704,7 +704,42 @@ impl Keeper {
         &self.folder
     }
 
-    pub fn close(self) {
+    /// When the store is next to hear how far the data's changes have got, if the data has
+    /// changes it has not heard of: the one thread that writes calls [`Keeper::idle`] then,
+    /// whether or not anything else is asked of it (12.3; the review's finding 6).
+    pub fn mark_due(&self) -> Option<u64> {
+        (self.changes > self.store.mark).then(|| self.store.mark_at.saturating_add(MARK_EVERY_MS))
+    }
+
+    /// In idle time: the store hears how far the data's changes have got, if it has not and
+    /// a minute has passed since it last did (or the clock went back). It is no decision and
+    /// moves no clock.
+    pub fn idle(&mut self, now: u64) -> Result<(), Failed> {
+        self.heal()?;
+        let due = now.saturating_sub(self.store.mark_at) >= MARK_EVERY_MS || now < self.store.mark_at;
+        if self.changes > self.store.mark && due {
+            self.write_mark(now)?;
+        }
+        Ok(())
+    }
+
+    fn write_mark(&mut self, at: u64) -> Result<(), Failed> {
+        let mut next = self.store.clone();
+        next.mark = self.changes;
+        next.mark_at = at;
+        self.write_store(next)
+    }
+
+    /// Stops: the store hears how far the data's changes have got, whatever the minute, so
+    /// that a copy from before the last of them is found older; then the data is folded
+    /// back into its one file and closed.
+    pub fn close(mut self) {
+        if !self.broken && self.changes > self.store.mark {
+            let at = self.store.mark_at.max(self.store.high_water);
+            if let Err(failed) = self.write_mark(at) {
+                eprintln!("As the backend stopped, {}", failed.0);
+            }
+        }
         self.data.close();
     }
 }
