@@ -228,8 +228,22 @@ pub fn send(request: &Request<'_>, deadline: Duration, grant: &dyn Fn() -> bool)
         _ => return failed(How::Connect),
     }
     // The process has ended, so its output has too: what is left is the reader's last read.
-    let bytes = answer.recv_timeout(Duration::from_secs(2)).ok().flatten().ok_or(Unsent::Failed(How::Cut))?;
-    read_answer(&bytes, request.max_body).ok_or(Unsent::Failed(How::Cut))
+    let bytes = match answer.recv_timeout(Duration::from_secs(2)) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => {
+            note(format_args!("ask {number} answer unreadable"));
+            return failed(How::Cut);
+        }
+        Err(_) => {
+            note(format_args!("ask {number} answer not read in time"));
+            return failed(How::Cut);
+        }
+    };
+    let read = read_answer(&bytes, request.max_body);
+    if read.is_none() {
+        note(format_args!("ask {number} answer of {} bytes not an answer", bytes.len()));
+    }
+    read.ok_or(Unsent::Failed(How::Cut))
 }
 
 fn kill(number: u64) {
@@ -266,39 +280,46 @@ pub fn in_process(mut args: impl Iterator<Item = std::ffi::OsString>) -> i32 {
     if args.next().is_some() {
         return BAD;
     }
-    let mut stdin = std::io::stdin().lock();
-    let mut line = |most: usize| -> Option<Zeroizing<Vec<u8>>> {
-        let mut bytes = Zeroizing::new(Vec::new());
-        let mut byte = [0u8; 1];
-        loop {
-            stdin.read_exact(&mut byte).ok()?;
-            if byte[0] == b'\n' {
-                return Some(bytes);
+    // The request, read under the standard input's lock, which is let go of before the
+    // send is asked for (`granted` reads the same input).
+    let read = {
+        let mut stdin = std::io::stdin().lock();
+        let mut line = |most: usize| -> Option<Zeroizing<Vec<u8>>> {
+            let mut bytes = Zeroizing::new(Vec::new());
+            let mut byte = [0u8; 1];
+            loop {
+                stdin.read_exact(&mut byte).ok()?;
+                if byte[0] == b'\n' {
+                    return Some(bytes);
+                }
+                if bytes.len() >= most {
+                    return None;
+                }
+                bytes.push(byte[0]);
             }
-            if bytes.len() >= most {
-                return None;
-            }
-            bytes.push(byte[0]);
+        };
+        let (Some(method), Some(url), Some(authorization), Some(max_body), Some(within), Some(length)) =
+            (line(8), line(4096), line(4096), line(32), line(32), line(32))
+        else {
+            return BAD;
+        };
+        let number = |bytes: &[u8]| std::str::from_utf8(bytes).ok().and_then(|text| text.parse::<usize>().ok());
+        let (Ok(url), Ok(authorization), Some(max_body), Some(within), Some(length)) =
+            (std::str::from_utf8(&url), std::str::from_utf8(&authorization), number(&max_body), number(&within), number(&length))
+        else {
+            return BAD;
+        };
+        if length > REQUEST_MAX {
+            return BAD;
         }
+        let mut body = Zeroizing::new(vec![0u8; length]);
+        if stdin.read_exact(&mut body).is_err() {
+            return BAD;
+        }
+        (method, url.to_string(), Zeroizing::new(authorization.to_string()), max_body, within, body)
     };
-    let (Some(method), Some(url), Some(authorization), Some(max_body), Some(within), Some(length)) =
-        (line(8), line(4096), line(4096), line(32), line(32), line(32))
-    else {
-        return BAD;
-    };
-    let number = |bytes: &[u8]| std::str::from_utf8(bytes).ok().and_then(|text| text.parse::<usize>().ok());
-    let (Ok(url), Ok(authorization), Some(max_body), Some(within), Some(length)) =
-        (std::str::from_utf8(&url), std::str::from_utf8(&authorization), number(&max_body), number(&within), number(&length))
-    else {
-        return BAD;
-    };
-    if length > REQUEST_MAX {
-        return BAD;
-    }
-    let mut body = Zeroizing::new(vec![0u8; length]);
-    if stdin.read_exact(&mut body).is_err() {
-        return BAD;
-    }
+    let (method, url, authorization, max_body, within, body) = read;
+    let (url, authorization) = (url.as_str(), authorization.as_str());
     match test_var("NEXUS_TEST_PROBE_CHILD").as_deref() {
         Some("abort") => std::process::abort(),
         Some("stall") => loop {
