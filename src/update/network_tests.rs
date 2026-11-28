@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
-const RELEASE: &str = r#"{"tag_name":"v99.0.0","html_url":"https://releases.example/v99"}"#;
+const RELEASE: &str = r#"{"tag_name":"v99.0.0","html_url":"https://anything.example/"}"#;
 const BYTES: &str = "example installer";
 
 fn client(header_timeout: Duration) -> ureq::Agent {
@@ -94,12 +94,12 @@ impl Server {
     }
 
     fn download(&self, assets: &Server, installer: &Installer, timeout: Duration) -> Result<PathBuf, String> {
-        let source = Source::Installer { repository: &self.origin, assets: &assets.origin };
+        let source = Source::Installer { repository: &self.origin, assets: &[&assets.origin] };
         let agent = client(timeout);
         let mut calls = 0;
         let result = download_with(installer, |_| {}, || {
             calls += 1;
-            get(&agent, source, &installer.url, None)
+            get(&agent, source, &installer.url, Instant::now() + INSTALLER_BUDGET, Some(INSTALLER_READ_IDLE))
         });
         // The fetch function is the only downloader and consumes its single call.
         assert_eq!(calls, 1);
@@ -125,7 +125,10 @@ fn api_same_origin_redirect_returns_the_release() {
         0 => redirect("/published"),
         _ => answer("200 OK", "", RELEASE),
     });
-    assert_eq!(api.check(Duration::from_secs(4)).unwrap().unwrap().version, "99.0.0");
+    let release = api.check(Duration::from_secs(4)).unwrap().unwrap();
+    assert_eq!(release.version, "99.0.0");
+    // This is the destination used by all three browser actions, even with a foreign html_url.
+    assert_eq!(release.page, format!("https://github.com/{REPO}/releases/tag/v99.0.0"));
     let log = api.requests.lock().unwrap();
     assert_eq!(log.len(), 2);
     for (request, path) in log.iter().zip(["/latest", "/published"]) {
@@ -192,7 +195,7 @@ fn installer_follows_one_or_five_redirects_and_refuses_the_sixth() {
             if i + 1 < hops { redirect(&format!("/asset-{}", i + 2)) }
             else { answer("200 OK", "", BYTES) }
         });
-        let target = format!("{}/asset-1?signature=example", store.origin);
+        let target = format!("{}/asset-1?sig=example%2Bvalue%2F%3D&name=setup.exe", store.origin);
         let repo = Server::new(move |_| redirect(&target));
         let result = repo.download(&store, &repo.installer(), Duration::from_secs(4));
         if hops == 6 {
@@ -205,7 +208,7 @@ fn installer_follows_one_or_five_redirects_and_refuses_the_sixth() {
         assert_eq!(repo.count(), 1);
         let requests = store.requests.lock().unwrap();
         assert_eq!(requests.len(), hops.min(5));
-        assert!(requests[0].starts_with("GET /asset-1?signature=example HTTP/1.1\r\n"));
+        assert!(requests[0].starts_with("GET /asset-1?sig=example%2Bvalue%2F%3D&name=setup.exe HTTP/1.1\r\n"));
         for (i, request) in requests.iter().enumerate().skip(1) {
             assert!(request.starts_with(&format!("GET /asset-{} HTTP/1.1\r\n", i + 1)));
         }
@@ -235,6 +238,36 @@ fn installer_timeout_ends_after_the_single_fetch() {
     assert_eq!(repo.download(&store, &repo.installer(), Duration::from_millis(350)).unwrap_err(),
         CheckError::TimedOut.to_string());
     assert_eq!((repo.count(), store.count()), (1, 0));
+}
+
+#[test]
+fn stalled_installer_body_is_cancelled_by_either_limit() {
+    // In each case only one deadline can expire before the server finishes its safety wait.
+    let short = Duration::from_millis(800);
+    let long = Duration::from_secs(30);
+    for (budget, idle) in [(long, short), (short, long)] {
+        let (resume, wait) = std::sync::mpsc::channel::<()>();
+        let repo = Server::serve(move |_, stream| {
+            let (first, rest) = BYTES.split_at(BYTES.len() / 2);
+            let header = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{first}", BYTES.len());
+            if stream.write_all(header.as_bytes()).and_then(|()| stream.flush()).is_err() { return }
+            let _ = wait.recv_timeout(Duration::from_secs(10));
+            let _ = stream.write_all(rest.as_bytes());
+        });
+        let source = Source::Installer { repository: &repo.origin, assets: &[] };
+        let installer = repo.installer();
+        let agent = client(long);
+        let mut progress = 0.0;
+        let result = download_with(&installer, |fraction| progress = fraction, || {
+            get(&agent, source, &installer.url, Instant::now() + budget, Some(idle))
+        });
+        let _ = resume.send(());
+        assert!(progress > 0.0 && progress < 1.0, "the installer must have stalled mid-body");
+        assert_eq!(result.unwrap_err(), "The download was interrupted.");
+        assert_eq!(repo.count(), 1);
+        assert!(!std::env::temp_dir().read_dir().unwrap().flatten()
+            .any(|entry| entry.file_name().to_string_lossy().ends_with(&installer.name)));
+    }
 }
 
 #[test]

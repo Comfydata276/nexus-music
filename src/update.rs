@@ -31,7 +31,6 @@ pub struct Installer {
 #[derive(Deserialize)]
 struct ApiRelease {
     tag_name: String,
-    html_url: String,
     #[serde(default)]
     assets: Vec<ApiAsset>,
 }
@@ -76,7 +75,10 @@ pub fn is_newer(candidate: &str, current: &str) -> bool {
     }
 }
 
-fn release_from(api: ApiRelease) -> Release {
+fn release_from(api: ApiRelease) -> Option<Release> {
+    let (major, minor, patch) = parse_version(&api.tag_name)?;
+    let version = format!("{major}.{minor}.{patch}");
+    let page = format!("https://github.com/{REPO}/releases/tag/v{version}");
     let installer = api
         .assets
         .into_iter()
@@ -90,7 +92,7 @@ fn release_from(api: ApiRelease) -> Release {
             name: asset.name,
             size: asset.size,
         });
-    Release { version: api.tag_name.trim_start_matches('v').to_string(), page: api.html_url, installer }
+    Some(Release { version, page, installer })
 }
 
 #[derive(Debug, PartialEq)]
@@ -114,30 +116,33 @@ impl std::fmt::Display for CheckError {
     }
 }
 
-/// A manual GET chain. Only the checked, resolved URL reaches the wire. For metadata the
-/// remaining wall-clock budget also applies to the final body. Large installers can stream
-/// past their existing per-hop response-header timeout.
+/// A manual GET chain. Each hop and the final body share one deadline. Installers
+/// also bound each blocking read so a stalled transfer releases the update button.
 fn get(
     agent: &ureq::Agent,
     source: Source<'_>,
     start: &str,
-    deadline: Option<Instant>,
+    deadline: Instant,
+    read_idle: Option<Duration>,
 ) -> Result<ureq::http::Response<ureq::Body>, CheckError> {
     let mut address = source.start(start).ok_or(CheckError::Refused)?;
     let trace = matches!(source, Source::Installer { .. }) && std::env::var_os("NEXUS_TRACE").is_some();
     let mut followed = 0;
     loop {
         let started = Instant::now();
-        let mut request = agent.get(address.as_str());
+        let uri: ureq::http::Uri = address.wire().parse().map_err(|_| CheckError::Refused)?;
+        if !address.matches_request(uri.scheme_str().unwrap_or_default(), uri.host().unwrap_or_default(),
+            uri.port_u16().unwrap_or(443), uri.path(), uri.query())
+        {
+            return Err(CheckError::Refused);
+        }
+        let mut request = agent.get(uri);
         if matches!(source, Source::Metadata { .. }) {
             request = request.header("Accept", "application/vnd.github+json");
         }
-        let mut config = request.config();
-        if let Some(deadline) = deadline {
-            let remaining = deadline.checked_duration_since(Instant::now())
-                .filter(|time| !time.is_zero()).ok_or(CheckError::TimedOut)?;
-            config = config.timeout_global(Some(remaining));
-        }
+        let remaining = deadline.checked_duration_since(Instant::now())
+            .filter(|time| !time.is_zero()).ok_or(CheckError::TimedOut)?;
+        let config = request.config().timeout_global(Some(remaining)).timeout_per_read(read_idle);
         let response = config.build().call().map_err(|err| {
             let reason = match err {
                 ureq::Error::Timeout(_) => CheckError::TimedOut,
@@ -151,7 +156,7 @@ fn get(
         if trace {
             eprintln!("[trace] update download: hop {followed} answered {} in {:?}", response.status(), started.elapsed());
         }
-        if deadline.is_some_and(|end| Instant::now() >= end) {
+        if Instant::now() >= deadline {
             return Err(CheckError::TimedOut);
         }
         if !response.status().is_redirection() {
@@ -177,7 +182,7 @@ pub fn check() -> Result<Option<Release>, CheckError> {
 
 fn check_at(agent: &ureq::Agent, source: Source<'_>, start: &str, budget: Duration) -> Result<Option<Release>, CheckError> {
     let deadline = Instant::now() + budget;
-    let response = get(agent, source, start, Some(deadline))?;
+    let response = get(agent, source, start, deadline, None)?;
     match response.status().as_u16() {
         404 => return Ok(None), // Nothing has been published yet.
         200 => {}
@@ -188,18 +193,22 @@ fn check_at(agent: &ureq::Agent, source: Source<'_>, start: &str, budget: Durati
         return Err(CheckError::TimedOut);
     }
     let release = release_from(api.map_err(|_| CheckError::InvalidRelease)?);
-    Ok(is_newer(&release.version, env!("CARGO_PKG_VERSION")).then_some(release))
+    Ok(release.filter(|release| is_newer(&release.version, env!("CARGO_PKG_VERSION"))))
 }
 
 const NO_CHECKSUM: &str =
     "GitHub didn't publish a checksum for this update, so it can't be checked and wasn't installed. Download it from the release page instead.";
+
+const INSTALLER_BUDGET: Duration = Duration::from_secs(10 * 60);
+const INSTALLER_READ_IDLE: Duration = Duration::from_secs(30);
 
 /// Downloads the installer to the temporary folder, checking it against the size and
 /// checksum GitHub published. `progress` is called with the fraction done.
 pub fn download(installer: &Installer, progress: impl FnMut(f32)) -> Result<PathBuf, String> {
     let agent = agent_config(RootCerts::PlatformVerifier)
         .timeout_recv_response(Some(Duration::from_secs(12))).build().into();
-    download_with(installer, progress, || get(&agent, INSTALLER, &installer.url, None))
+    let deadline = Instant::now() + INSTALLER_BUDGET;
+    download_with(installer, progress, || get(&agent, INSTALLER, &installer.url, deadline, Some(INSTALLER_READ_IDLE)))
 }
 
 /// A single fetch supplies the body. Only a verified file can be handed to the install action.
@@ -310,7 +319,7 @@ mod tests {
                  "digest":"sha256:ABCDEF"}]}"#,
         )
         .unwrap();
-        let release = release_from(api);
+        let release = release_from(api).unwrap();
         assert_eq!(release.version, "0.4.0");
         let installer = release.installer.unwrap();
         assert_eq!(installer.name, "NexusMusic-Setup-0.4.0.exe");
