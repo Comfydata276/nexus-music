@@ -32,13 +32,39 @@ use crate::store::crash;
 /// The file's name inside `NEXUS_STATE`.
 pub const FILE: &str = "kept";
 const STAGING: &str = "kept.new-";
-const HEAD: &str = "nexus-music-server store kept apart 5";
+const HEAD: &str = "nexus-music-server store kept apart 6";
 /// The most a store may be: what [`read`] reads, and so what [`write`] ever publishes.
 pub const FILE_MAX_BYTES: u64 = 16 * 1024 * 1024;
 /// The most a store may be after a write that adds an account or a device. The room above it
 /// is kept for what takes leave away (an ending, a switch off, a deletion's tombstone), which
 /// adds no record, so that nothing a capacity rule refuses is ever a revocation.
 pub const GROWTH_MAX_BYTES: u64 = FILE_MAX_BYTES - 1024 * 1024;
+
+/// An account's switch for requests (step 4) and its own revision, which a grant to change it
+/// is bound to. Kept here alone (authority): a copy of the data put back never brings back an
+/// old one. An account never switched: on, revision 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestsSwitch {
+    pub enabled: bool,
+    pub revision: u64,
+}
+
+impl Default for RequestsSwitch {
+    fn default() -> Self {
+        RequestsSwitch { enabled: true, revision: 0 }
+    }
+}
+
+/// The backend's Lidarr key, sealed (S13): the address it was set for (`NEXUS_LIDARR` as it
+/// was), the revision the seal is bound to, and the sealed bytes; or none. Kept here alone.
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct LidarrKept {
+    /// The revision now; a key sealed under another is never opened.
+    pub revision: u64,
+    /// The address last seen configured (`None`: unset, or never seen).
+    pub address: Option<String>,
+    pub sealed: Option<Vec<u8>>,
+}
 
 /// One account: the fingerprint of its email, and C3r's record. The record's `email` is not
 /// kept: it is filled from the data when the two are used together ([`Store::apart`]).
@@ -69,6 +95,9 @@ pub struct Store {
     /// The next session id: never given twice, across restores too (C3r's `FreshSession`).
     pub next_session: u64,
     pub accounts: BTreeMap<u64, Account>,
+    /// Each account's switch for requests, if it was ever set.
+    pub requests: BTreeMap<u64, RequestsSwitch>,
+    pub lidarr: LidarrKept,
     pub pending: Option<Pending>,
 }
 
@@ -116,6 +145,8 @@ impl Store {
             next_device: 1,
             next_session: 1,
             accounts: BTreeMap::new(),
+            requests: BTreeMap::new(),
+            lidarr: LidarrKept::default(),
             pending: None,
         }
     }
@@ -184,6 +215,15 @@ impl Store {
         line(format!("next-account {}", self.next_account));
         line(format!("next-device {}", self.next_device));
         line(format!("next-session {}", self.next_session));
+        line(format!(
+            "lidarr {} {} {}",
+            self.lidarr.revision,
+            self.lidarr.address.as_deref().map_or_else(|| "-".to_string(), text_word),
+            self.lidarr.sealed.as_deref().map_or_else(|| "-".to_string(), hex)
+        ));
+        for (number, switch) in &self.requests {
+            line(format!("requests {number} {} {}", u8::from(switch.enabled), switch.revision));
+        }
         for (number, account) in &self.accounts {
             let a = &account.apart.account;
             line(format!(
@@ -254,9 +294,25 @@ impl Store {
         let next_account = number(field(next()?, "next-account")?)?;
         let next_device = number(field(next()?, "next-device")?)?;
         let next_session = number(field(next()?, "next-session")?)?;
+        let lidarr = match field(next()?, "lidarr")?.split(' ').collect::<Vec<_>>().as_slice() {
+            [revision, address, sealed] => LidarrKept {
+                revision: number(revision)?,
+                address: if *address == "-" { None } else { Some(untext(address)?) },
+                sealed: if *sealed == "-" { None } else { Some(unhex_any(sealed)?) },
+            },
+            _ => return None,
+        };
         drop(next);
-        let mut store = Store { restore, high_water, mark, mark_at, set_up, data_made, next_account, next_device, next_session, ..Store::new(backend, key, seal, 0) };
+        let mut store = Store { restore, high_water, mark, mark_at, set_up, data_made, next_account, next_device, next_session, lidarr, ..Store::new(backend, key, seal, 0) };
         let mut line = lines.next()?;
+        while let Some(rest) = line.strip_prefix("requests ") {
+            let [n, enabled, revision] = rest.split(' ').collect::<Vec<_>>()[..] else { return None };
+            let n = number(n)?;
+            if n == 0 || n >= next_account || store.requests.insert(n, RequestsSwitch { enabled: flag(enabled)?, revision: number(revision)? }).is_some() {
+                return None;
+            }
+            line = lines.next()?;
+        }
         let mut devices_seen = std::collections::BTreeSet::new();
         while let Some(rest) = line.strip_prefix("account ") {
             let words: Vec<&str> = rest.split(' ').collect();
@@ -530,6 +586,23 @@ fn uncode(text: &str) -> Option<Option<LiveCode>> {
 }
 
 /// Text a person typed (an email, an address), as one word: its bytes in hex.
+fn unhex_any(text: &str) -> Option<Vec<u8>> {
+    if text.len() % 2 != 0 || text.is_empty() {
+        return None;
+    }
+    text.as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let digit = |byte: u8| match byte {
+                b'0'..=b'9' => Some(byte - b'0'),
+                b'a'..=b'f' => Some(byte - b'a' + 10),
+                _ => None,
+            };
+            Some(digit(pair[0])? * 16 + digit(pair[1])?)
+        })
+        .collect()
+}
+
 fn text_word(text: &str) -> String {
     hex(text.as_bytes())
 }
@@ -582,8 +655,8 @@ fn action_word(action: &AdminAction) -> String {
         AdminAction::ForceOut(target) => format!("force-out.{}.{}", target.device.get(), target.session.get()),
         AdminAction::SetMusicAddress(address) => format!("music-address.{}", text_word(address.as_str())),
         AdminAction::SetDiagnosticsDefault(on) => format!("diagnostics.{}", u8::from(*on)),
-        AdminAction::SetRequests(on) => format!("requests.{}", u8::from(*on)),
-        AdminAction::SetLidarr => "lidarr".into(),
+        AdminAction::SetRequests { enabled, revision } => format!("requests.{}.{revision}", u8::from(*enabled)),
+        AdminAction::SetLidarr { fingerprint, address, revision } => format!("lidarr.{}.{}.{revision}", hex(fingerprint.as_bytes()), text_word(address.as_str())),
         other => ADMIN_WORDS.iter().find(|(a, _)| a == other).map_or_else(|| "?".into(), |(_, word)| (*word).to_string()),
     }
 }
@@ -599,11 +672,21 @@ fn unaction(word: &str) -> Option<AdminAction> {
     if let Some(on) = word.strip_prefix("diagnostics.") {
         return Some(AdminAction::SetDiagnosticsDefault(flag(on)?));
     }
-    if let Some(on) = word.strip_prefix("requests.") {
-        return Some(AdminAction::SetRequests(flag(on)?));
+    if let Some(rest) = word.strip_prefix("requests.") {
+        let (enabled, revision) = rest.split_once('.')?;
+        return Some(AdminAction::SetRequests { enabled: flag(enabled)?, revision: number(revision)? });
     }
-    if word == "lidarr" {
-        return Some(AdminAction::SetLidarr);
+    if let Some(rest) = word.strip_prefix("lidarr.") {
+        let mut parts = rest.split('.');
+        let (fingerprint, address, revision) = (parts.next()?, parts.next()?, parts.next()?);
+        if parts.next().is_some() {
+            return None;
+        }
+        return Some(AdminAction::SetLidarr {
+            fingerprint: Fingerprint::from_bytes(unhex(fingerprint)?),
+            address: nexus_core::nexus::admin::InternalAddress::new(&untext(address)?)?,
+            revision: number(revision)?,
+        });
     }
     ADMIN_WORDS.iter().find(|(_, w)| *w == word).map(|(a, _)| a.clone())
 }
@@ -678,6 +761,8 @@ mod tests {
 
     fn full() -> Store {
         let mut store = Store::new(BackendId::from_bytes([5; 16]), [9; 32], [8; 32], 1234);
+        store.requests.insert(1, RequestsSwitch { enabled: false, revision: 7 });
+        store.lidarr = LidarrKept { revision: 2, address: Some("http://lidarr:8686".into()), sealed: Some(vec![1, 2, 3, 0xff]) };
         store.restore = 3;
         store.mark = 40;
         store.mark_at = 1200;
@@ -736,8 +821,12 @@ mod tests {
             AdminAction::SetMusicAddress(MusicAddress::new("https://music.example.org:4533/music/").unwrap()),
             AdminAction::SetDiagnosticsDefault(true),
             AdminAction::SetDiagnosticsDefault(false),
-            AdminAction::SetRequests(true),
-            AdminAction::SetLidarr,
+            AdminAction::SetRequests { enabled: true, revision: 4 },
+            AdminAction::SetLidarr {
+                fingerprint: Fingerprint::of(&[5; SECRET_BYTES]),
+                address: nexus_core::nexus::admin::InternalAddress::new("http://lidarr:8686").unwrap(),
+                revision: 3,
+            },
         ];
         for action in ADMIN_WORDS.iter().map(|(a, _)| a.clone()).chain(more) {
             for target in &targets {
