@@ -4,28 +4,18 @@
 use nexus_core::nexus::account::{self, AccountId, DeviceId, DeviceKind, Email, Name, RequestHead, SessionId};
 use nexus_core::nexus::admin::{
     self, AccountCreated, Accounts as AccountPage, AdminDevice, Applied, CodeDelivery, Denial,
-    Devices, DiagnosticsDefault, ListAccounts, ListDevices, MusicState, NamedChange, PasswordReset,
+    Devices, DiagnosticsDefault, ListAccounts, ListDevices, NamedChange, PasswordReset,
     Refusal, Reply,
 };
-use nexus_core::nexus::kept::{Account, Bearer, DataChange, Fingerprint, GrantUse, LeaveFor, SessionKind, Status};
+use nexus_core::nexus::kept::{AdminAction, Bearer, DataChange, Fingerprint, GrantUse, LeaveFor, Status};
 use nexus_core::nexus::proto::Version;
 use rusqlite::params;
 
-use super::music::{answer, caller, flatten, hand, not_dealt_with, said, target};
+use super::admit::Seen;
+use super::music::{answer, caller, flatten, live_admin, music_state, not_dealt_with, refused, said, target};
 use super::session::{Accounts, Answer};
 use super::{rows, setup};
 use crate::store::{data::Change, keeper::{First, Keeper}};
-
-fn check_admin(
-    keeper: &mut Keeper, actor: &mut Account, head: &RequestHead, device: DeviceId,
-    hash: &Fingerprint, now: u64,
-) -> Result<(), Refusal> {
-    actor
-        .request(head.restore, keeper.clock(now), |turn| turn.admin_read(Bearer { device, hash, grant: None }))
-        .apply(|effects| keeper.persist(effects, &[], now))
-        .map_err(not_dealt_with)?
-        .map_err(said)
-}
 
 fn cursor(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
@@ -51,11 +41,6 @@ fn list_accounts(keeper: &mut Keeper, after: Option<AccountId>, internal: &str) 
         let number = unsigned(number)?;
         let decoded = keeper.load(number).map_err(not_dealt_with)?;
         let state = decoded.state();
-        let music = match hand(keeper, number, state, SessionKind::App, internal) {
-            account::MusicLoginResult::NoneSetYet => MusicState::NoneSet,
-            account::MusicLoginResult::Login(_) => MusicState::Set,
-            account::MusicLoginResult::UnusableNow => MusicState::TypeAgain,
-        };
         Ok(admin::Account {
             id: state.id,
             email: Email::new(&email).ok_or(Refusal::NotDealtWith)?,
@@ -63,7 +48,7 @@ fn list_accounts(keeper: &mut Keeper, after: Option<AccountId>, internal: &str) 
             admin: state.admin,
             enabled: state.status == Status::On,
             requests_enabled: admin::REQUESTS_DEFAULT_ENABLED,
-            music,
+            music: music_state(keeper, number, state, internal),
         })
     }).collect::<Result<_, _>>()?;
     AccountPage::new(rows, more).ok_or(Refusal::NotDealtWith)
@@ -110,15 +95,20 @@ fn spend<T: admin::Change>(
     hash: &Fingerprint,
     now: u64,
     reset_print: Option<&[u8; 32]>,
+    seen: &Seen,
 ) -> Result<(), Refusal> {
     let (number, device, mut actor) = caller(keeper, &request.head, hash)?;
-    check_admin(keeper, &mut actor, &request.head, device, hash, now)?;
+    live_admin(keeper, &mut actor, request.head.restore, device, hash, now)?;
     let change = NamedChange::for_request(request);
     let mut other = change.action.target_account()
         .map(|id| target(keeper, number, id)).transpose()?.flatten();
     let state = change.action.target_account().map(|_| other.as_ref().unwrap_or(&actor).state());
     let intent = change.grant_intent(state).ok_or(Refusal::Malformed)?;
     let LeaveFor::Admin { action, target: named } = intent.change else { return Err(Refusal::Malformed) };
+    let forced = match &action {
+        AdminAction::ForceOut(target) => Some(target.device),
+        _ => None,
+    };
     let bearer = Bearer { device, hash, grant: Some(GrantUse { request_id: intent.request_id, secret: &request.grant }) };
     actor.request(request.head.restore, keeper.clock(now), |turn| turn.administer(bearer, action, named, other.as_mut()))
         .apply(|effects| {
@@ -133,19 +123,37 @@ fn spend<T: admin::Change>(
             keeper.persist(effects, extra.as_slice(), now)
         })
         .map_err(not_dealt_with)?
-        .map_err(said)
+        .map_err(said)?;
+    if let Some(device) = forced {
+        let account = other.as_ref().unwrap_or(&actor);
+        if account.apart().devices.get(&device).is_some_and(|device| !device.known)
+            && let Some(row) = account.rows().devices.get(&device)
+        {
+            seen.remove(account.state().id.get(), row.secret.as_bytes());
+        }
+    }
+    Ok(())
 }
 
 impl Accounts {
+    fn admin_hash(&self, session: &account::Session, head: &RequestHead) -> Result<Fingerprint, Refusal> {
+        let hash = Fingerprint::of(session.expose_bytes());
+        self.admin_live(&head.speaks, head.restore, &hash)?;
+        Ok(hash)
+    }
+
     async fn read_admin<T: admin::ResultBody + Send + 'static>(
         &self, session: account::Session, head: RequestHead,
         read: impl FnOnce(&mut Keeper) -> Result<T, Refusal> + Send + 'static,
     ) -> Answer {
+        let hash = match self.admin_hash(&session, &head) {
+            Ok(hash) => hash,
+            Err(refusal) => return refused(refusal),
+        };
         let clock = self.clock.clone();
         flatten(self.desk.ask(move |keeper| {
-            let hash = Fingerprint::of(session.expose_bytes());
             let (_, device, mut actor) = caller(keeper, &head, &hash)?;
-            check_admin(keeper, &mut actor, &head, device, &hash, clock())?;
+            live_admin(keeper, &mut actor, head.restore, device, &hash, clock())?;
             read(keeper).map(|page| answer(Reply::Done(page)))
         }).await)
     }
@@ -168,9 +176,14 @@ impl Accounts {
     }
 
     pub async fn admin_apply<T: admin::Change + Send + 'static>(&self, session: account::Session, request: admin::Granted<T>) -> Answer {
+        let hash = match self.admin_hash(&session, &request.head) {
+            Ok(hash) => hash,
+            Err(refusal) => return refused(refusal),
+        };
+        let admission = self.admission.clone();
         let clock = self.clock.clone();
         flatten(self.desk.ask(move |keeper| {
-            spend(keeper, &request, &Fingerprint::of(session.expose_bytes()), clock(), None)?;
+            spend(keeper, &request, &hash, clock(), None, &admission.seen)?;
             Ok(answer(Reply::Done(Applied {})))
         }).await)
     }
@@ -178,21 +191,31 @@ impl Accounts {
     pub async fn set_diagnostics_default(
         &self, session: account::Session, request: admin::SetDiagnosticsDefault,
     ) -> Answer {
+        let hash = match self.admin_hash(&session, &request.head) {
+            Ok(hash) => hash,
+            Err(refusal) => return refused(refusal),
+        };
+        let admission = self.admission.clone();
         let clock = self.clock.clone();
         let diagnostics = self.desk.diagnostics.clone();
         flatten(self.desk.ask(move |keeper| {
-            spend(keeper, &request, &Fingerprint::of(session.expose_bytes()), clock(), None)?;
+            spend(keeper, &request, &hash, clock(), None, &admission.seen)?;
             diagnostics.set(request.change.enabled);
             Ok(answer(Reply::Done(Applied {})))
         }).await)
     }
 
     pub async fn create_account(&self, session: account::Session, request: admin::CreateAccount) -> Answer {
+        let hash = match self.admin_hash(&session, &request.head) {
+            Ok(hash) => hash,
+            Err(refusal) => return refused(refusal),
+        };
+        let admission = self.admission.clone();
         let clock = self.clock.clone();
         flatten(self.desk.ask(move |keeper| {
             let now = clock();
             // Persist the grant spend first. A crash between writes only loses a grant.
-            spend(keeper, &request, &Fingerprint::of(session.expose_bytes()), now, None)?;
+            spend(keeper, &request, &hash, now, None, &admission.seen)?;
             let email = request.change.email.as_str();
             if keeper.account_named(email).map_err(not_dealt_with)?.is_some() {
                 return Err(Refusal::NotAllowed(Denial::Conflict));
@@ -208,10 +231,15 @@ impl Accounts {
     }
 
     pub async fn reset_admin_password(&self, session: account::Session, request: admin::ResetPassword) -> Answer {
+        let hash = match self.admin_hash(&session, &request.head) {
+            Ok(hash) => hash,
+            Err(refusal) => return refused(refusal),
+        };
+        let admission = self.admission.clone();
         let clock = self.clock.clone();
         flatten(self.desk.ask(move |keeper| {
             let (code, print) = setup::make_code(&setup::CodeKey::of(keeper)).ok_or(Refusal::NotDealtWith)?;
-            spend(keeper, &request, &Fingerprint::of(session.expose_bytes()), clock(), Some(&print))?;
+            spend(keeper, &request, &hash, clock(), Some(&print), &admission.seen)?;
             Ok(answer(Reply::Done(PasswordReset { code: CodeDelivery::Issued(code) })))
         }).await)
     }
