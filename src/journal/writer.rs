@@ -352,7 +352,9 @@ impl Writer {
             return Err(invalid(()));
         }
         if prior_life != Some(scope.life) {
-            remove(&directory.checkpoint())?;
+            if prior_life.is_some() {
+                remove(&directory.checkpoint())?;
+            }
             write_json(&directory.life(), &scope.life)?;
         }
         let mut current = Current {

@@ -279,7 +279,8 @@ def walk(profile, port, temporary):
         assert rows(recorded)[:len(old_rows)] == old_rows
         state = json.loads((recorded / "data/listening-journal/state.json").read_bytes())
         assert state["damaged"] == 1
-        assert any(row["event"]["kind"] == "open" for row in rows(recorded)[len(old_rows):])
+        until(lambda: any(row["event"]["kind"] == "open" for row in rows(recorded)[len(old_rows):]),
+              "the new Open recorded while offline")
         assert json.loads(settings_path.read_bytes())["repeat"] == 1
     print("Kept log prefix and exact appended line, PCM parity, gapless Start/Stop, pause/resume, "
           "seek, zero-result search, Diagnostics privacy, no journal window flushes, Repeat across SIGKILL, "
