@@ -1340,7 +1340,9 @@ def scenario_sign_out(build="new"):
     if os.environ.get("E13A_SABOTAGE"):
         env["NEXUS_TEST_SABOTAGE_NO_GENERATION"] = "1"
     caught = 0
-    with front.Front("absent", os.path.join(out, "front")) as f:
+    # (W7: signing in again needs the backend, so for the new build it is there and
+    # answering; the looks still come every 0.1 s.)
+    with front.Front("found" if build == "new" else "absent", os.path.join(out, "front")) as f:
         copy = A.Copy(build, home, env=env)
         a = copy.launch()
         until(lambda: home_drawn(a), 60, 0.1, "Home")
