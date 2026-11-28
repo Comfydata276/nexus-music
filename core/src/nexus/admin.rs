@@ -16,6 +16,7 @@ use serde_json::value::RawValue;
 use zeroize::Zeroizing;
 
 mod lidarr;
+pub mod listening;
 pub use lidarr::{
     LIDARR_KEY_MAX_BYTES, LIDARR_NONCE_BYTES, LidarrBinding, LidarrKey, LidarrSealingKey,
     SealedLidarrKey,
@@ -45,7 +46,7 @@ pub const POST_PATHS: &[&str] = &[
     LIST_ACCOUNTS, CREATE_ACCOUNT, SET_ACCOUNT_ENABLED, SET_ADMIN, DELETE_ACCOUNT,
     RESET_PASSWORD, GET_MUSIC_SERVER, SET_MUSIC_SERVER, SET_MUSIC_LOGIN, LIST_DEVICES,
     FORCE_OUT, GET_DIAGNOSTICS_DEFAULT, SET_DIAGNOSTICS_DEFAULT, SET_REQUESTS_ENABLED,
-    GET_LIDARR_SETTING, SET_LIDARR, REQUEST_GRANT,
+    GET_LIDARR_SETTING, SET_LIDARR, REQUEST_GRANT, listening::PATH,
 ];
 
 // §7.2 bounds password-bearing calls at 4 KiB. Use that ceiling for all admin
@@ -328,6 +329,27 @@ impl wire::Value for LidarrKeyChange {
 
 object! { Applied {} }
 
+/// A saved key was either accepted by Lidarr or could not be checked. A refused
+/// key is a denial, with no successful save.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LidarrKeyCheck {
+    Works,
+    Unreachable,
+}
+
+impl wire::Value for LidarrKeyCheck {
+    fn read(raw: &RawValue) -> Result<Self, BadMessage> {
+        read_text(raw, |tag| match tag {
+            "works" => Some(Self::Works),
+            "unreachable" => Some(Self::Unreachable),
+            _ => None,
+        })
+    }
+}
+
+object! { LidarrKeySaved { check: LidarrKeyCheck } }
+
 /// the design does not say how a code-bearing reply is retried without showing
 /// the code twice. Persist only the result with the code set to AlreadyShown.
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -558,6 +580,7 @@ pub enum Denial {
     NoSuchAccount,
     NoSuchSession,
     MusicLoginRefused,
+    LidarrLoginRefused,
     Conflict,
 }
 
@@ -570,6 +593,7 @@ impl wire::Value for Denial {
             "no_such_account" => Some(Self::NoSuchAccount),
             "no_such_session" => Some(Self::NoSuchSession),
             "music_login_refused" => Some(Self::MusicLoginRefused),
+            "lidarr_login_refused" => Some(Self::LidarrLoginRefused),
             "conflict" => Some(Self::Conflict),
             _ => None,
         })
@@ -668,6 +692,7 @@ impl ResultBody for Devices {
 }
 impl ResultBody for MusicServer {}
 impl ResultBody for LidarrSetting {}
+impl ResultBody for LidarrKeySaved {}
 impl ResultBody for DiagnosticsDefault {}
 impl ResultBody for GrantIssued {}
 
@@ -760,6 +785,27 @@ mod tests {
     }
 
     #[test]
+    fn lidarr_key_save_distinguishes_checked_and_unchecked_success() {
+        for (check, body) in [
+            (LidarrKeyCheck::Works, br#"{"done":{"check":"works"}}"#.as_slice()),
+            (LidarrKeyCheck::Unreachable, br#"{"done":{"check":"unreachable"}}"#.as_slice()),
+        ] {
+            let reply = Reply::Done(LidarrKeySaved { check });
+            assert_eq!(encode(&reply).unwrap().bytes(), body);
+            assert_eq!(read_reply(200, body), Ok(reply));
+        }
+        let refused = br#"{"refused":{"not_allowed":"lidarr_login_refused"}}"#;
+        assert_eq!(
+            read_reply::<LidarrKeySaved>(403, refused),
+            Ok(Reply::Refused(Refusal::NotAllowed(Denial::LidarrLoginRefused))),
+        );
+        assert_eq!(
+            read_reply::<LidarrKeySaved>(200, br#"{"done":{"check":"refused"}}"#),
+            Err(BadMessage::Form),
+        );
+    }
+
+    #[test]
     fn routes_are_unique_and_plain() {
         assert_eq!(proto::plain(PAGE), Ok(()));
         let mut seen = std::collections::BTreeSet::new();
@@ -833,6 +879,7 @@ mod tests {
             Refusal::NotAllowed(Denial::NoSuchAccount),
             Refusal::NotAllowed(Denial::NoSuchSession),
             Refusal::NotAllowed(Denial::MusicLoginRefused),
+            Refusal::NotAllowed(Denial::LidarrLoginRefused),
             Refusal::NotAllowed(Denial::Conflict),
             Refusal::Busy { retry_after_seconds: Wait::new(1) },
             Refusal::Busy { retry_after_seconds: None },
@@ -1125,8 +1172,16 @@ mod tests {
             }).map(|answer| assert_eq!(answer, Err(Denied::LeaveRequired))).unwrap();
         }
 
-        actor.request(1, kept::Clock::new(3, 3), |turn| {
-            turn.set_lidarr(bearer(request_id), &current, &key, &sealing, [0x68; LIDARR_NONCE_BYTES])
+        let authorized = actor.request(1, kept::Clock::new(3, 3), |mut turn| {
+            turn.authorize_lidarr(bearer(request_id), &current, &key)
+        }).apply(|effects| {
+            let [update] = effects.updates.as_slice() else { panic!("expected a consumed grant") };
+            assert_eq!(update.change, DataChange::Keep);
+            assert!(update.apart_first.devices.get(&device).unwrap().permit.as_ref().unwrap().leave.is_none());
+            Ok::<_, std::convert::Infallible>(())
+        }).unwrap().unwrap();
+        actor.request(1, kept::Clock::new(4, 4), |turn| {
+            turn.install_lidarr(bearer(request_id), authorized, &current, &key, &sealing, [0x68; LIDARR_NONCE_BYTES])
         }).apply(|effects| {
             let [update] = effects.updates.as_slice() else { panic!("expected one update") };
             let DataChange::InstallLidarrKey { binding, sealed } = &update.change else {
@@ -1140,7 +1195,7 @@ mod tests {
             Ok::<_, std::convert::Infallible>(())
         }).unwrap().unwrap();
         assert_eq!(
-            step(&mut actor, 3, |turn| turn.set_lidarr(bearer(request_id), &current, &key, &sealing, [0x69; LIDARR_NONCE_BYTES])),
+            step(&mut actor, 4, |turn| turn.set_lidarr(bearer(request_id), &current, &key, &sealing, [0x69; LIDARR_NONCE_BYTES])),
             Err(Denied::LeaveRequired)
         );
     }

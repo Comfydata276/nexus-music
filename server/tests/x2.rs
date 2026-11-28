@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use nexus_core::nexus::account::{AccountId, CODE_LIFETIME_MS, DeviceId, DeviceSecret, GrantSecret, RequestId, SECRET_BYTES, SESSION_IDLE_MS as SESSION_MS};
 use nexus_core::nexus::kept::{SessionKind, Access, Account, AdminAction, AdminTarget, Bearer, Denied, FreshSession, Fingerprint, GrantIntent, GrantUse, LeaveFor, SessionTarget, Status, Turn};
+use nexus_core::nexus::proto::BackendId;
 use nexus_music_server::identity;
 use nexus_music_server::store::data::{self, Change, Data, Migration};
 use nexus_music_server::store::keeper::{self, Failed, Keeper, Started};
@@ -448,7 +449,11 @@ fn run(scenario: &str, root: &Root) -> Result<(), String> {
         }
         "take-as-is" => keeper::take_as_is(&root.state(), &root.data(), now).map(|_| ()).map_err(|why| why.0),
         "the nightly copy" => copies::nightly(&root.data(), now).map(|_| ()),
-        "a change of form" => Data::open_with(&root.data(), now, &[data::MIGRATIONS[0], FORM_2]).map(|_| ()),
+        "a change of form" => {
+            let known: Vec<Migration> = data::MIGRATIONS.iter().copied().chain([NEXT_FORM]).collect();
+            Data::open_with(&root.data(), now, &known).map(|_| ())
+        }
+        "the form brought forward" => Keeper::open(&root.state(), &root.data(), now).map(|(keeper, _)| keeper.close()).map_err(|why| why.0),
         other => Err(format!("no scenario {other}")),
     }
 }
@@ -458,8 +463,8 @@ fn the_copy(root: &Root) -> PathBuf {
     copies::list(&root.data()).first().map(|copy| copy.path.clone()).unwrap_or_default()
 }
 
-/// A form 2, for the tests alone.
-const FORM_2: Migration = Migration { form: 2, sql: "ALTER TABLE devices ADD COLUMN a_test_note TEXT;" };
+/// A form after this program's, for the tests alone.
+const NEXT_FORM: Migration = Migration { form: data::FORM + 1, sql: "ALTER TABLE devices ADD COLUMN a_test_note TEXT;" };
 
 /// Runs `scenario` in a child on `root`, stopped at the `kill`-th point or failing at the
 /// `fail`-th (0: neither). The points it passed, and whether it ended by itself.
@@ -795,8 +800,9 @@ fn a_change_of_form_cut_at_any_point_leaves_the_old_form_or_the_new_with_a_copy_
         let form: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
         drop(connection);
         let before: usize = fs::read_dir(copies::folder(&root.data())).map(|entries| entries.flatten().filter(|entry| entry.file_name().to_string_lossy().starts_with("before-form-")).count()).unwrap_or(0);
-        assert!(form == 1 || form == 2, "{form}");
-        if form == 2 {
+        let (old, new) = (data::FORM, data::FORM + 1);
+        assert!(form == old || form == new, "{form}");
+        if form == new {
             assert_eq!(before, 1, "at {}: changed with no copy made first", cut.at);
             let why = unlocked(|| Keeper::open(&root.state(), &root.data(), T0 + 20 * MINUTE)).err().unwrap();
             assert!(why.0.contains("made by a newer Nexus server"), "{why}");
@@ -804,7 +810,7 @@ fn a_change_of_form_cut_at_any_point_leaves_the_old_form_or_the_new_with_a_copy_
             settled(root, T0 + 20 * MINUTE).0.close();
         }
         if cut.whole() {
-            assert_eq!(form, 2);
+            assert_eq!(form, new);
         }
     });
 }
@@ -2192,8 +2198,8 @@ fn the_requests_tables_take_s13s_rows_through_the_one_writer() {
         .write_data(T0 + 2 * MINUTE, |tx| {
             tx.execute("INSERT INTO requests_jobs (id, restore, account, session, request, change, work) VALUES (1, 0, ?1, 5, x'01', x'02', x'03')", [BOB as i64])?;
             tx.execute("INSERT INTO requests_lines (job, line, progress) VALUES (1, 0, 'asked')", [])?;
-            tx.execute("INSERT INTO requests_owners (binding, account, release, asked_ms) VALUES (x'aa', ?1, 'release-1', 1)", [BOB as i64])?;
-            tx.execute("INSERT INTO requests_owners (binding, account, release, asked_ms) VALUES (x'bb', ?1, 'release-1', 1)", [BOB as i64])?;
+            tx.execute("INSERT INTO requests_owners (binding, account, release, asked_ms, metadata, placed) VALUES (x'aa', ?1, 'release-1', 1, x'01', 1)", [BOB as i64])?;
+            tx.execute("INSERT INTO requests_owners (binding, account, release, asked_ms, metadata) VALUES (x'bb', ?1, 'release-1', 1, x'01')", [BOB as i64])?;
             tx.execute("INSERT INTO requests_way_back (binding, artist, artist_key, setting) VALUES (x'aa', 7, 'a-musicbrainz-id', 'monitored')", [])?;
             Ok(((), true))
         })
@@ -2208,5 +2214,247 @@ fn the_requests_tables_take_s13s_rows_through_the_one_writer() {
     });
     assert!(twice.is_err());
     assert_eq!(count_all(&keeper, "requests_lines"), 1);
+    // A placement once recorded is ORed, never cleared: a later ask that only joined the
+    // history cannot take the right to remove away, and an attempt to clear it fails whole.
+    let placed = |keeper: &Keeper, binding: &str| -> i64 {
+        keeper.data().connection().query_row(&format!("SELECT placed FROM requests_owners WHERE binding = x'{binding}' AND account = ?1"), [BOB as i64], |row| row.get(0)).unwrap()
+    };
+    keeper
+        .write_data(T0 + 3 * MINUTE, |tx| {
+            tx.execute(
+                "INSERT INTO requests_owners (binding, account, release, asked_ms, metadata, placed) VALUES (x'aa', ?1, 'release-1', 2, x'02', 0)
+                 ON CONFLICT (binding, account, release) DO UPDATE SET placed = max(placed, excluded.placed), metadata = excluded.metadata, asked_ms = excluded.asked_ms",
+                [BOB as i64],
+            )?;
+            Ok(((), true))
+        })
+        .unwrap();
+    assert_eq!((placed(&keeper, "aa"), placed(&keeper, "bb")), (1, 0));
+    let cleared = keeper.write_data(T0 + 3 * MINUTE, |tx| {
+        tx.execute("UPDATE requests_owners SET placed = 0 WHERE binding = x'aa'", [])?;
+        Ok(((), true))
+    });
+    assert!(cleared.is_err(), "a recorded placement was cleared");
+    assert_eq!(placed(&keeper, "aa"), 1);
+
     keeper.close();
+}
+
+// ---- The data's forms carried forward (the backend is live since `4097756`) ----
+
+/// Form 1 is exactly what the deployed `4097756` creates: its text, kept as a fixture.
+#[test]
+fn form_1_is_exactly_what_the_deployed_build_creates() {
+    let deployed = include_str!("fixtures/form-1-4097756.sql");
+    assert_eq!(data::MIGRATIONS[0].form, 1);
+    assert_eq!(format!("{}\n", data::MIGRATIONS[0].sql.trim_start_matches('\n').trim_end_matches('\n')), deployed, "form 1 was edited: add a step instead");
+}
+
+/// The form's table columns and its named objects, with index and trigger definitions.
+fn shape(connection: &rusqlite::Connection) -> Vec<String> {
+    let objects: Vec<(String, String, Option<String>)> = {
+        let mut statement = connection.prepare(
+            "SELECT type, name, CASE WHEN type IN ('index', 'trigger') THEN sql END
+             FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+        ).unwrap();
+        statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap().map(Result::unwrap).collect()
+    };
+    let mut out = Vec::new();
+    for (kind, name, definition) in objects {
+        out.push(format!("{kind} {name}"));
+        if let Some(definition) = definition {
+            out.push(definition);
+        }
+        if kind == "table" {
+            let mut statement = connection.prepare(&format!("PRAGMA table_xinfo({name})")).unwrap();
+            let columns: Vec<String> = statement
+                .query_map([], |row| Ok(format!("  {} {} notnull={} default={:?} pk={}", row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, i64>(3)?, row.get::<_, Option<String>>(4)?, row.get::<_, i64>(5)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            out.extend(columns);
+        }
+    }
+    out
+}
+
+#[test]
+fn schema_shape_detects_redefined_indexes_and_triggers() {
+    let connection = rusqlite::Connection::open_in_memory().unwrap();
+    connection.execute_batch(
+        "CREATE TABLE rows (number INTEGER);
+         CREATE INDEX by_number ON rows(number);
+         CREATE TRIGGER keep_row AFTER INSERT ON rows BEGIN SELECT 1; END;",
+    ).unwrap();
+    let original = shape(&connection);
+    connection.execute_batch("DROP INDEX by_number; CREATE INDEX by_number ON rows(number) WHERE number > 0;").unwrap();
+    let new_index = shape(&connection);
+    assert_ne!(new_index, original);
+    connection.execute_batch("DROP TRIGGER keep_row; CREATE TRIGGER keep_row AFTER INSERT ON rows BEGIN SELECT 2; END;").unwrap();
+    assert_ne!(shape(&connection), new_index);
+}
+
+fn form_of(root: &Root) -> i64 {
+    let connection = rusqlite::Connection::open(data::place(&root.data())).unwrap();
+    connection.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap()
+}
+
+/// A world as the deployed build would hold it: made, with an account's music login, events,
+/// a Diagnostics report and an asked release; then its data taken back to form 1 exactly (the
+/// shape a fresh form-1 database has, which is `4097756`'s).
+fn a_deployed_world(root: &Root) -> Ids {
+    use nexus_core::nexus::account::Name;
+    use nexus_core::nexus::kept::{DataChange, Effects, Update};
+    use nexus_core::nexus::music::{CredentialBinding, MusicInstallation, SealedCredential};
+    let ids = world(root);
+    let mut keeper = opened(root, T0 + 2 * MINUTE);
+    let loaded = keeper.load(ALICE).unwrap();
+    let (mut rows, mut apart) = (loaded.rows(), loaded.apart());
+    rows.account.music_login = 1;
+    apart.account.music_login = 1;
+    let install = MusicInstallation {
+        binding: CredentialBinding { backend: keeper.backend(), account: AccountId::new(ALICE).unwrap(), internal: "http://navidrome:4533".into(), name: Name::new("alice").unwrap(), count: 1 },
+        sealed: SealedCredential::from_bytes(&[7; 64]).unwrap(),
+    };
+    let effects = Effects { high_water: keeper.clock(T0 + 2 * MINUTE).effective(), updates: vec![Update { apart_first: apart.clone(), data: rows, change: DataChange::InstallMusicLogin(install), music: None, apart_last: apart }] };
+    keeper.persist(&effects, &[], T0 + 2 * MINUTE).unwrap();
+    for n in 0..3 {
+        an_event(&mut keeper, ALICE, ids.a1, n, T0 + 2 * MINUTE).unwrap();
+    }
+    keeper
+        .write_data(T0 + 2 * MINUTE, |tx| {
+            tx.execute("INSERT INTO diagnostic_reports (account, device, restore, request_id, received_ms, text) VALUES (?1, ?2, 0, x'0102030405060708', ?3, 'a made-up report')", rusqlite::params![ALICE as i64, ids.a1 as i64, (T0 + 2 * MINUTE) as i64])?;
+            tx.execute("INSERT INTO requests_owners (binding, account, release, asked_ms, metadata) VALUES (x'aa', ?1, 'release-1', 1, x'01')", [BOB as i64])?;
+            Ok(((), true))
+        })
+        .unwrap();
+    keeper.close();
+    let connection = rusqlite::Connection::open(data::place(&root.data())).unwrap();
+    let fresh = Root::new(&format!("{}-fresh", root.path.file_name().unwrap().to_string_lossy()));
+    Data::create_with(&fresh.data(), &BackendId::from_bytes([1; 16]), T0, &data::MIGRATIONS[..1]).unwrap().close();
+    let deployed = data::place(&fresh.data());
+    connection.execute("ATTACH DATABASE ?1 AS deployed", [deployed.to_str().unwrap()]).unwrap();
+
+    // Undo additions by comparing the seeded database with form 1, rather
+    // than maintaining a second list of the changes made by each migration.
+    connection.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+    let additions: Vec<(String, String)> = {
+        let mut query = connection.prepare(
+            "SELECT actual.type, actual.name FROM main.sqlite_schema AS actual
+             WHERE actual.name NOT LIKE 'sqlite_%'
+               AND actual.type IN ('trigger', 'view', 'index', 'table')
+               AND NOT EXISTS (SELECT 1 FROM deployed.sqlite_schema AS original
+                               WHERE original.type = actual.type AND original.name = actual.name)
+             ORDER BY CASE actual.type WHEN 'trigger' THEN 0 WHEN 'view' THEN 1 WHEN 'index' THEN 2 ELSE 3 END",
+        ).unwrap();
+        query.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap().map(Result::unwrap).collect()
+    };
+    let quote = |name: &str| format!(r#""{}""#, name.replace('"', r#""""#));
+    let undo = |sql: &str| connection.execute_batch(sql)
+        .unwrap_or_else(|error| panic!("the deployed fixture cannot undo a later form: {sql}: {error}"));
+    for (kind, name) in additions {
+        undo(&format!("DROP {kind} main.{}", quote(&name)));
+    }
+
+    let columns: Vec<(String, String)> = {
+        let mut query = connection.prepare(
+            "SELECT original.name, added.name FROM deployed.sqlite_schema AS original
+             JOIN pragma_table_xinfo(original.name, 'main') AS added
+             WHERE original.type = 'table' AND original.name NOT LIKE 'sqlite_%'
+               AND NOT EXISTS (SELECT 1 FROM pragma_table_xinfo(original.name, 'deployed') AS prior
+                               WHERE prior.name = added.name)
+             ORDER BY original.name, added.cid DESC",
+        ).unwrap();
+        query.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap().map(Result::unwrap).collect()
+    };
+    for (table, column) in columns {
+        undo(&format!("ALTER TABLE main.{} DROP COLUMN {}", quote(&table), quote(&column)));
+    }
+    connection.execute_batch("DETACH DATABASE deployed; PRAGMA user_version = 1; PRAGMA journal_mode = DELETE;").unwrap();
+    let made = rusqlite::Connection::open(deployed).unwrap();
+    assert_eq!(shape(&connection), shape(&made), "the fixture is not form 1's shape");
+    ids
+}
+
+fn before_form_copies(root: &Root) -> usize {
+    fs::read_dir(copies::folder(&root.data())).map(|entries| entries.flatten().filter(|entry| entry.file_name().to_string_lossy().starts_with("before-form-")).count()).unwrap_or(0)
+}
+
+#[test]
+fn a_database_of_the_deployed_form_is_brought_forward_whole_and_works() {
+    let root = Root::new("deployed");
+    let ids = a_deployed_world(&root);
+    assert_eq!(form_of(&root), 1);
+    let (mut keeper, started) = settled(&root, T0 + 3 * MINUTE);
+    assert_eq!(started, Started::Ready, "the data was taken for older than the store");
+    assert_eq!(form_of(&root), data::FORM);
+    assert_eq!(before_form_copies(&root), 1, "no copy was made before the change of form");
+    // Everything is there and works.
+    assert_eq!(readers(&mut keeper, &ids, T0 + 3 * MINUTE), [30, 1, 3, 5]);
+    sign_in(&mut keeper, ALICE, 15, 12, 8, T0 + 3 * MINUTE).unwrap();
+    assert_eq!(events(&keeper, ALICE), 3);
+    assert_eq!(count(&keeper, "SELECT starts FROM listening_totals WHERE account = ?1", ALICE), 3);
+    assert_eq!(count(&keeper, "SELECT count(*) FROM diagnostic_reports WHERE account = ?1", ALICE), 1);
+    let (login, sealed): (i64, Vec<u8>) = keeper.data().connection().query_row("SELECT count, sealed FROM music_logins WHERE account = ?1", [ALICE as i64], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+    assert_eq!((login, sealed), (1, vec![7; 64]), "the sealed music login is not as it was");
+    assert_eq!(state(&mut keeper, ALICE).unwrap().music_login, 1);
+    let (metadata, placed): (Vec<u8>, i64) = keeper.data().connection().query_row("SELECT metadata, placed FROM requests_owners WHERE account = ?1", [BOB as i64], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+    assert_eq!((metadata, placed), (Vec::new(), 0), "a release asked before form 2 gives no right to take it off");
+    keeper.close();
+    // A second start changes nothing more.
+    let (_, again) = settled(&root, T0 + 4 * MINUTE);
+    assert_eq!((again, form_of(&root), before_form_copies(&root)), (Started::Ready, data::FORM, 1));
+}
+
+#[test]
+fn bringing_the_form_forward_cut_at_any_point_leaves_the_old_form_whole_or_the_new() {
+    let setup = Root::new("forward");
+    a_deployed_world(&setup);
+    let expected: Vec<_> = data::MIGRATIONS.iter().enumerate().map(|(index, step)| {
+        let model = Root::new(&format!("forward-form-{}", step.form));
+        Data::create_with(&model.data(), &BackendId::from_bytes([1; 16]), T0, &data::MIGRATIONS[..=index])
+            .unwrap().close();
+        let connection = rusqlite::Connection::open(data::place(&model.data())).unwrap();
+        (step.form, shape(&connection))
+    }).collect();
+    at_every_point("the form brought forward", &setup, |root, cut| {
+        let found = {
+            let connection = rusqlite::Connection::open(data::place(&root.data())).unwrap();
+            (connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), shape(&connection))
+        };
+        let (_, schema) = expected.iter().find(|(form, _)| *form == found.0)
+            .unwrap_or_else(|| panic!("at {}: unknown form {}", cut.at, found.0));
+        assert_eq!(&found.1, schema, "at {}: form {}, not whole", cut.at, found.0);
+        let (keeper, _) = settled(root, T0 + 20 * MINUTE);
+        assert_eq!(form_of(root), data::FORM, "at {}", cut.at);
+        assert_eq!(count(&keeper, "SELECT count(*) FROM requests_owners WHERE account = ?1", BOB), 1, "at {}", cut.at);
+        keeper.close();
+    });
+}
+
+#[test]
+fn a_copy_of_the_deployed_form_put_back_is_brought_forward_and_a_newer_one_refused() {
+    let root = Root::new("put-back-form");
+    let ids = a_deployed_world(&root);
+    let old_copy = root.path.join("deployed-copy.db");
+    fs::copy(data::place(&root.data()), &old_copy).unwrap();
+    settled(&root, T0 + 3 * MINUTE).0.close();
+    unlocked(|| keeper::put_back(&root.state(), &root.data(), &old_copy, T0 + 4 * MINUTE)).unwrap();
+    let (mut keeper, _) = settled(&root, T0 + 5 * MINUTE);
+    assert_eq!(form_of(&root), data::FORM);
+    assert_eq!(events(&keeper, ALICE), 3);
+    sign_in(&mut keeper, ALICE, 15, 12, 8, T0 + 5 * MINUTE).unwrap();
+    keeper.close();
+    // A copy of a form this program does not know: refused, nothing changed.
+    let newer = root.path.join("newer-copy.db");
+    fs::copy(&old_copy, &newer).unwrap();
+    rusqlite::Connection::open(&newer).unwrap().execute_batch(&format!("PRAGMA user_version = {};", data::FORM + 1)).unwrap();
+    let (live, store) = (fs::read(data::place(&root.data())).unwrap(), fs::read(apart::place(&root.state())).unwrap());
+    let why = unlocked(|| keeper::put_back(&root.state(), &root.data(), &newer, T0 + 6 * MINUTE)).err().unwrap();
+    assert!(why.0.contains("newer Nexus server") && why.0.contains("Nothing was changed"), "{why}");
+    assert_eq!((fs::read(data::place(&root.data())).unwrap(), fs::read(apart::place(&root.state())).unwrap()), (live, store));
+    let _ = ids;
 }

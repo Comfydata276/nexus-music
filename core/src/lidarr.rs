@@ -237,6 +237,10 @@ pub trait WayBack {
     /// acted on at the Lidarr it was written for: an artist's number on another means another
     /// artist.
     fn keep(&self, lidarr: &str, artist: i64, before: &str) -> Result<bool, String>;
+    /// The same way back with the release's canonical artist identity available.
+    fn keep_for_artist(&self, lidarr: &str, artist: i64, before: &str, _artist_id: &str) -> Result<bool, String> {
+        self.keep(lidarr, artist, before)
+    }
     /// Persist this exact observation under the job's endpoint binding just
     /// before its first album placement write. An earlier artist or profile
     /// write may already have occurred. Keep this baseline across retries.
@@ -1132,7 +1136,7 @@ impl Lidarr {
             return Ok(None);
         }
         let before = record.get("monitorNewItems").and_then(|setting| setting.as_str()).unwrap_or("all").to_string();
-        let wrote = way_back.keep(&self.way_back_address(), artist, &before)?;
+        let wrote = way_back.keep_for_artist(&self.way_back_address(), artist, &before, &wanted.artist_id)?;
         // Turned back before the setting is changed: nothing to put back, and what was
         // written is crossed off.
         let refused = |reason: String| {
@@ -1247,6 +1251,26 @@ impl Lidarr {
             })),
         )?;
         Ok(added.id)
+    }
+
+    /// Library releases with at least one track file, by exact artist and
+    /// release MusicBrainz IDs. The transport bounds both upstream lists.
+    pub fn arrived_releases(&self) -> Result<HashMap<String, HashSet<String>>, String> {
+        let mut artists = HashMap::new();
+        for (artist, number) in self.artist_numbers()? {
+            artists.entry(number).and_modify(|known| *known = None).or_insert(Some(artist));
+        }
+        let albums: Vec<AlbumRes> = self.get("album")?;
+        let mut arrived = HashMap::<_, HashSet<_>>::new();
+        for album in albums {
+            if album.artist_id > 0 && album.statistics.track_file_count > 0
+                && let Some(Some(artist)) = artists.get(&album.artist_id)
+                && (album.artist.foreign_artist_id.is_empty() || album.artist.foreign_artist_id == *artist)
+            {
+                arrived.entry(artist.clone()).or_default().insert(album.foreign_album_id);
+            }
+        }
+        Ok(arrived)
     }
 
     /// What Lidarr lists for an artist it keeps track of.

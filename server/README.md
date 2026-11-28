@@ -4,7 +4,8 @@ One small service of our own, in one container, beside the music server. The des
 `docs/backend-design.md` on its own branch. It answers `hello` (S1), keeps its data and a
 store kept apart (S3), signs people in with an email and a password (S8), and hands each of a
 person's devices a music login made for it from the one an admin typed in (S9). The admin's
-page's other calls (S10b) are not in yet.
+page manages accounts, devices, music logins and Diagnostics (S10b). The backend also handles
+music requests through the Lidarr configured by the operator (S13).
 
 ## Building and testing
 
@@ -22,7 +23,7 @@ against the program itself; `tests/program.rs` is the program's settings, log an
 
 | Setting | |
 |---|---|
-| `NEXUS_MUSIC_SERVER` | The music server as the container reaches it, for example `http://navidrome:4533` (plain HTTP is fine: it is inside the container's network). **Must be given, and only here**: never set from the page. **The only address the backend ever connects to**: a login typed in is checked here and nowhere else; a login checked at another value of this is "cannot be used now" until it is typed again. |
+| `NEXUS_MUSIC_SERVER` | The music server as the container reaches it, for example `http://navidrome:4533` (plain HTTP is fine: it is inside the container's network). **Must be given, and only here**: never set from the page. **The only music-server address the backend connects to**: a login typed in is checked here and nowhere else; a login checked at another value of this is "cannot be used now" until it is typed again. |
 | `NEXUS_DATA_BUDGET` | How large the data may grow before new events wait: bytes, or a whole number of MB, GB or TB (`4GB`), at least 1 MB. 4 GB unless given. |
 | `NEXUS_LIDARR` | Lidarr as this container reaches it, for requests through the backend, for example `http://lidarr:8686` (plain HTTP is fine inside the container's network; no name, password, query or `#`). Not given: requests through the backend are not set up. It is set here only, never from the admin's page; the key is typed on the page and sealed to this address. |
 | `SSL_CERT_FILE` | Optional, and only if `NEXUS_MUSIC_SERVER` is HTTPS: a file of the certificates the backend trusts for it, in place of the container's own. |
@@ -33,6 +34,19 @@ against the program itself; `tests/program.rs` is the program's settings, log an
 | `NEXUS_PUBLIC_ORIGIN` | The backend's own HTTPS name, which nothing else shares (below), as a browser has it: `https://` and the name, and `:port` only if it is not 443, nothing after it, for example `https://nexus.example.org`. The admin's page's sign-in and set-up are taken only from it. Unset, they are refused, and the log says so once at the start. |
 
 A setting that is wrong or missing is said by name as it starts, and it stops.
+
+## Requests through the backend
+
+1. Add `NEXUS_LIDARR=http://lidarr:8686` to the Nexus container's settings. Use the address
+   reachable from that container. Plain HTTP is supported on the shared container network.
+2. Sign in to the admin page. Under **Set up Lidarr**, confirm the read-only address and enter
+   the Lidarr API key. Confirm the change with your Nexus password. The backend seals the key
+   to its configured address in the store kept apart.
+3. Use the **May request** switch for each person. Access starts on. Switching it off also
+   stops further writes from that person's running batch.
+
+Apps that use the server's Requests interface use the Nexus session for searches, history
+and cancellation. The key remains on the backend.
 
 ## The owner's commands
 

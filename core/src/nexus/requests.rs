@@ -546,7 +546,9 @@ pub fn batch_effect_confirmed(
     }
     let mut matching = listed.iter().filter(|row| row.album == offer.album);
     let Some(row) = matching.next() else { return PlacementRecovery::Unconfirmed };
-    if row.id <= 0 || (!row.wanted && !row.have) || matching.next().is_some() {
+    if row.id <= 0 || (!row.wanted && !row.have) || matching.next().is_some()
+        || listed.iter().filter(|other| other.id == row.id).count() != 1
+    {
         return PlacementRecovery::Unconfirmed;
     }
     let placed = placement.is_some_and(|before| {
@@ -707,6 +709,7 @@ pub fn refusal_for(error: &str, wanted: Option<&Offer>) -> Refusal {
     let error = if error.ends_with('.') { Cow::Borrowed(error) } else { Cow::Owned(format!("{error}.")) };
     match error.as_ref() {
         crate::requests::NO_LONGER_LISTED => Refusal::NoLongerListed,
+        error if error == Refusal::SwitchedOff.sentence(None) => Refusal::SwitchedOff,
         lidarr::NO_MUSIC_FOLDER => Refusal::LidarrNotSetUp,
         lidarr::NO_PROFILES => Refusal::LidarrNoProfiles,
         lidarr::SINGLES_PROFILE_NO_NUMBER => Refusal::LidarrSinglesProfileNoNumber,
@@ -941,6 +944,8 @@ pub struct AttributionRow {
     pub account: AccountId,
     pub name: account::Name,
     pub asked: AskedRelease,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arrived: Option<bool>,
 }
 
 impl Value for AttributionRow {
@@ -950,6 +955,7 @@ impl Value for AttributionRow {
             account: fields.get("account")?,
             name: fields.get("name")?,
             asked: object_json(raw_member(&fields, "asked")?)?,
+            arrived: fields.0.get("arrived").map(|raw| bool::read(raw)).transpose()?,
         })
     }
 }
@@ -2131,13 +2137,18 @@ mod tests {
         assert_eq!(read_attribution(body.bytes()), Ok(read));
         assert!(read_call(body.bytes()).is_err());
 
-        let page = admin::Reply::Done(AttributionPage {
-            rows: vec![AttributionRow { account: AccountId::new(7).unwrap(), name: account::Name::new("Avery").unwrap(), asked }],
-            next: None,
-        });
-        let body = write_attribution_reply(&page).unwrap();
-        assert_eq!(read_attribution_reply(200, body.bytes()), Ok(page));
-        assert!(read_reply(200, body.bytes()).is_err());
+        for arrived in [None, Some(false), Some(true)] {
+            let page = admin::Reply::Done(AttributionPage {
+                rows: vec![AttributionRow {
+                    account: AccountId::new(7).unwrap(), name: account::Name::new("Avery").unwrap(),
+                    asked: asked.clone(), arrived,
+                }],
+                next: None,
+            });
+            let body = write_attribution_reply(&page).unwrap();
+            assert_eq!(read_attribution_reply(200, body.bytes()), Ok(page));
+            assert!(read_reply(200, body.bytes()).is_err());
+        }
     }
 
     fn artist_target() -> ArtistTarget { ArtistTarget { id: one(), artist: id(1) } }

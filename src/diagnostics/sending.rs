@@ -248,24 +248,32 @@ fn save_schedule(path: &Path, schedule: Option<&DiagSchedule>) -> io::Result<()>
 #[allow(dead_code)] // W7 owns the live client.
 /// Says when it is done, and whether it was written (W7c item 11: the sign-in's driver waits
 /// for it).
-pub(crate) fn keep_schedule(schedule: Option<DiagSchedule>) -> Option<std::sync::mpsc::Receiver<bool>> {
-    let path = with(|ctl| schedule_path(&ctl.paths))?;
+pub(crate) fn keep_schedule_for_window(schedule: Option<DiagSchedule>) -> Option<std::sync::mpsc::Receiver<bool>> {
+    let paths = with(|ctl| ctl.paths.clone())?;
+    Some(keep_schedule(&paths, schedule))
+}
+
+fn keep_schedule(paths: &config::Paths, schedule: Option<DiagSchedule>) -> std::sync::mpsc::Receiver<bool> {
+    let path = schedule_path(paths);
     let (done, receipt) = std::sync::mpsc::channel();
     on_worker(move || {
         let written = save_schedule(&path, schedule.as_ref()).is_ok();
         SCHEDULE_KEPT.set(written && schedule.is_some());
         let _ = done.send(written);
     });
-    Some(receipt)
+    receipt
 }
 
 /// Queue the matching reply for W7 to feed back into the same live client.
 #[allow(dead_code)] // W7 owns the live client.
-pub(crate) fn read(read: u64, answer: impl FnOnce(Happened) + Send + 'static) {
-    let paths = with(|ctl| ctl.paths.clone());
+pub(crate) fn read_for_window(number: u64, answer: impl FnOnce(Happened) + Send + 'static) {
+    read(with(|ctl| ctl.paths.clone()), number, answer);
+}
+
+fn read(paths: Option<config::Paths>, number: u64, answer: impl FnOnce(Happened) + Send + 'static) {
     on_worker(move || {
         let ready = SCHEDULE_KEPT.get() && STORE.with_borrow(|store| store.current);
-        answer(read_for_machine(paths.as_ref(), read, ready));
+        answer(read_for_machine(paths.as_ref(), number, ready));
     });
 }
 
