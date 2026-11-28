@@ -1253,6 +1253,26 @@ impl Lidarr {
         Ok(added.id)
     }
 
+    /// Library releases with at least one track file, by exact artist and
+    /// release MusicBrainz IDs. The transport bounds both upstream lists.
+    pub fn arrived_releases(&self) -> Result<HashMap<String, HashSet<String>>, String> {
+        let mut artists = HashMap::new();
+        for (artist, number) in self.artist_numbers()? {
+            artists.entry(number).and_modify(|known| *known = None).or_insert(Some(artist));
+        }
+        let albums: Vec<AlbumRes> = self.get("album")?;
+        let mut arrived = HashMap::<_, HashSet<_>>::new();
+        for album in albums {
+            if album.artist_id > 0 && album.statistics.track_file_count > 0
+                && let Some(Some(artist)) = artists.get(&album.artist_id)
+                && (album.artist.foreign_artist_id.is_empty() || album.artist.foreign_artist_id == *artist)
+            {
+                arrived.entry(artist.clone()).or_default().insert(album.foreign_album_id);
+            }
+        }
+        Ok(arrived)
+    }
+
     /// What Lidarr lists for an artist it keeps track of.
     pub fn listed(&self, artist: i64) -> Result<Vec<Listed>, String> {
         let albums: Vec<AlbumRes> = self.get(&format!("album?artistId={artist}"))?;
