@@ -2072,10 +2072,8 @@ impl Controller {
     fn prompt_request_missing(self: &Rc<Self>) {
         let albums = self.missing_wants().len();
         let Some(connection) = crate::requests::current().filter(|_| albums > 0) else { return };
-        let running = if connection.server() { crate::requests::batch::running() } else { crate::bulk::running() };
-        if running {
-            self.toast("Lidarr is still being asked for the last lot. See Requests.");
-            return self.navigate(Route::Requests);
+        if let Some(message) = crate::requests::batch::busy_message() {
+            return self.toast(message);
         }
         let songs = count(self.import_missing.borrow().len() as u32, "song");
         let many = count(albums as u32, "album");
@@ -2102,7 +2100,11 @@ impl Controller {
     /// is worked through in the background and shown on the Requests page (see `bulk`).
     pub(crate) fn request_missing(self: &Rc<Self>, connection: crate::requests::Connection) {
         let wants = self.missing_wants();
-        if wants.is_empty() || !connection.still_selected() { return; }
+        if wants.is_empty() { return; }
+        if let Some(message) = crate::requests::batch::busy_message() {
+            return self.toast(message);
+        }
+        if !connection.still_selected() { return; }
         self.toast(format!("Asking Lidarr for {}. How it's going is shown here.", count(wants.len() as u32, "album")));
         if connection.server() {
             let folder = self.requests_folder();
@@ -2117,7 +2119,7 @@ impl Controller {
 
     /// Carries on with a batch of albums being asked for, if there is one and Lidarr is set up.
     pub fn run_bulk(self: &Rc<Self>) {
-        if !crate::requests::direct_selected() { return; }
+        if !crate::requests::direct_selected() || crate::requests::batch::running() { return; }
         let Some(lidarr) = crate::lidarr::current() else { return };
         if !crate::bulk::unfinished() {
             return;
@@ -2221,6 +2223,11 @@ impl Controller {
             let page = self.page.borrow();
             if other { page.notice_other.clone() } else { page.notice_action.clone() }
         };
+        if matches!(action.as_str(), "Carry on" | "Try again")
+            && let Some(message) = crate::requests::batch::busy_message()
+        {
+            return self.toast(message);
+        }
         match action.as_str() {
             "Stop" => {
                 crate::bulk::stop();

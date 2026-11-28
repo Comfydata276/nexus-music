@@ -53,6 +53,14 @@ pub(crate) fn running() -> bool {
     RUNNING.load(Ordering::Acquire)
 }
 
+pub(crate) fn busy_message() -> Option<&'static str> {
+    running_batch_message(crate::bulk::running(), running())
+}
+
+fn running_batch_message(direct: bool, server: bool) -> Option<&'static str> {
+    (direct || server).then_some("Wait for the current Requests batch to finish before starting another.")
+}
+
 fn path(folder: &Path, context: Context) -> PathBuf {
     folder.join(format!("requests-{}-{}-{}.json", context.backend.to_hex(), context.account.get(), context.restore))
 }
@@ -85,7 +93,7 @@ fn show(context: Context, view: View) {
 /// ID and body. A restart may also pick up a batch whose begin already answered.
 pub(crate) fn run(connection: Connection, folder: PathBuf, input: Option<(Vec<Want>, bool)>) {
     let Connection::Server { context, client, .. } = &connection else { return };
-    if RUNNING.swap(true, Ordering::AcqRel) {
+    if crate::bulk::running() || RUNNING.swap(true, Ordering::AcqRel) {
         return;
     }
     let context = *context;
@@ -278,6 +286,15 @@ fn settle(
 mod tests {
     use super::*;
     use nexus_core::nexus::requests::TransportError;
+
+    #[test]
+    fn either_batches_worker_blocks_a_new_batch() {
+        let wait = Some("Wait for the current Requests batch to finish before starting another.");
+        assert_eq!(running_batch_message(false, false), None);
+        assert_eq!(running_batch_message(true, false), wait);
+        assert_eq!(running_batch_message(false, true), wait);
+        assert_eq!(running_batch_message(true, true), wait);
+    }
 
     #[test]
     fn interrupted_batch_replays_a_saved_resolution_at_most_once() {
