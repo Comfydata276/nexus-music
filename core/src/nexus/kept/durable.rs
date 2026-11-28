@@ -69,6 +69,9 @@ pub enum DataChange {
         verifier: Fingerprint,
     },
     EraseHistory,
+    /// Delete the password verifier and every code in the same transaction as
+    /// the data rows that drop the sessions.
+    DiscardCredentials,
     DeleteAccount,
     ApplyAdmin {
         action: AdminAction,
@@ -86,6 +89,7 @@ impl fmt::Debug for DataChange {
             Self::OwnerRecovery { .. } => "OwnerRecovery",
             Self::RedeemCode { .. } => "RedeemCode",
             Self::EraseHistory => "EraseHistory",
+            Self::DiscardCredentials => "DiscardCredentials",
             Self::DeleteAccount => "DeleteAccount",
             Self::ApplyAdmin { .. } => "ApplyAdmin",
             Self::InstallMusicLogin(_) => "InstallMusicLogin",
@@ -476,6 +480,75 @@ impl Account {
         Ok(())
     }
 
+    /// Recovery works from the data when the store is unavailable, and from
+    /// both when a matching apart record can still be read. S3/S8 use the
+    /// returned fences and discard the stored password verifier and codes.
+    pub fn recover_from_lost_store(
+        rows: &Rows,
+        readable: Option<&Apart>,
+        new_restore: u64,
+        clock: Clock,
+    ) -> Decision<Result<(), Denied>> {
+        let baseline;
+        let authority = match readable {
+            Some(apart) => apart,
+            None => {
+                baseline = Apart {
+                    account: rows.account.clone(),
+                    devices: BTreeMap::new(),
+                };
+                &baseline
+            }
+        };
+        Self::restore(
+            authority,
+            Some(rows),
+            new_restore,
+            RestoreMode::Adopt,
+            clock,
+        )
+    }
+
+    fn merge_adoption_baseline(&mut self, rows: &Rows) {
+        let data = &rows.account;
+        let state = &mut self.state;
+        state.status = match (state.status, data.status) {
+            (Status::Deleted, _) | (_, Status::Deleted) => Status::Deleted,
+            (Status::Off, _) | (_, Status::Off) => Status::Off,
+            _ => Status::On,
+        };
+        state.admin &= data.admin && state.status != Status::Deleted;
+        state.history_held |= data.history_held;
+        state.life = state.life.max(data.life);
+        state.revision = state.revision.max(data.revision);
+        state.password_changes = state.password_changes.max(data.password_changes);
+        state.music_login = state.music_login.max(data.music_login);
+        state.music_recovery = state.music_recovery.or(data.music_recovery);
+        for (&id, row) in &rows.devices {
+            let device = self
+                .devices
+                .entry(id)
+                .or_insert_with(|| Device::new(id, row.secret.clone()));
+            // A data row ahead of a partial store does not establish that the
+            // device escaped force-out. It may become known after signing in.
+            if row.number > device.number {
+                device.known = false;
+                device.number = row.number;
+            }
+            if let Some(session) = &row.session {
+                device.last_session = device.last_session.max(session.id.get());
+                if let Some(leave) = &session.leave {
+                    device.last_leave = device.last_leave.max(leave.serial);
+                }
+            }
+        }
+        if state.status == Status::Deleted {
+            for device in self.devices.values_mut() {
+                device.secret = None;
+            }
+        }
+    }
+
     /// S3 calls once per account before serving any request, all under one new
     /// restore number. Persist the new backend restore number apart with the effects.
     pub fn restore(
@@ -501,6 +574,9 @@ impl Account {
         new_restore: u64,
         mode: RestoreMode,
     ) -> Result<Option<Update>, Denied> {
+        if data.is_some_and(|rows| !apart.account.same_account(&rows.account)) {
+            return Err(Denied::WrongPurpose);
+        }
         let mut account = Self::load(apart, data);
         if new_restore < account.state.restore
             || data.is_some_and(|data| new_restore < data.account.restore)
@@ -509,20 +585,37 @@ impl Account {
         }
         let advancing = new_restore > account.state.restore;
         if advancing {
+            if mode == RestoreMode::Adopt {
+                if let Some(rows) = data {
+                    account.merge_adoption_baseline(rows);
+                }
+                account.state.password_reset_required = true;
+                account.state.code = None;
+                if account.state.status != Status::Deleted {
+                    account.state.password_changes = next(account.state.password_changes)?;
+                    account.state.revision = next(account.state.revision)?;
+                }
+            }
             for device in account.devices.values_mut() {
                 device.number = next(device.number)?;
                 device.session = None;
                 device.last_accepted = None;
             }
             account.state.restore = new_restore;
-            if mode == RestoreMode::Adopt && account.state.status != Status::Deleted {
-                account.state.password_reset_required = true;
-                account.state.code = None;
-                account.state.revision = next(account.state.revision)?;
-            }
         }
         let change = if account.state.status == Status::Deleted {
             DataChange::DeleteAccount
+        } else if mode == RestoreMode::Adopt {
+            // Repeating the same plan must have the apart credential fence
+            // from its first write. Repeat the data purge without moving it.
+            if !advancing
+                && (!apart.account.password_reset_required
+                    || apart.account.code.is_some()
+                    || apart.devices.values().any(|device| device.permit.is_some()))
+            {
+                return Err(Denied::StartAgain);
+            }
+            DataChange::DiscardCredentials
         } else {
             DataChange::Keep
         };
@@ -547,7 +640,8 @@ impl Account {
     }
 }
 
-/// Adoption uses an apart baseline rebuilt by S3 from data, including the new keys.
+/// Adopt is the operator's recovery with lost authority. WholeMachine is the
+/// session-only response to an ahead stamp, not the operator's recovery command.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum RestoreMode {
     DataOnly,

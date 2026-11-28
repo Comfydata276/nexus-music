@@ -1238,3 +1238,122 @@ fn persisted_effects_debug_omits_identity_text_and_verifier_bytes() -> Result<()
     );
     Ok(())
 }
+
+#[test]
+fn lost_store_recovery_discards_verifier_and_codes_at_both_cuts_and_is_repeatable()
+-> Result<(), Denied> {
+    let mut account = state("alice@example.test");
+    account.code = Some(LiveCode::new(8, 0)?);
+    account.password_changes = 8;
+    let mut s = Stored::new(account);
+    s.sign_in(8, 1, 1, 0)?;
+    let copy = s.data.clone();
+    Account::recover_from_lost_store(&copy, None, 2, clock(2, 2)).apply(|e| {
+        let update = e.updates.first().unwrap();
+        assert_eq!(update.change, DataChange::DiscardCredentials);
+        assert_eq!(update.apart_first.account.password_changes, 9);
+        assert!(update.apart_first.account.password_reset_required);
+        assert!(update.apart_first.account.code.is_none());
+        assert_eq!(update.apart_first.devices.get(&dev(1)).unwrap().number, 1);
+        assert!(
+            update
+                .apart_first
+                .devices
+                .get(&dev(1))
+                .unwrap()
+                .permit
+                .is_none()
+        );
+        assert!(update.data.devices.get(&dev(1)).unwrap().session.is_none());
+        let secret = DeviceSecret::from_bytes([8; 32]);
+        for data in [&copy, &update.data] {
+            let mut loaded = Account::load(&update.apart_first, Some(data));
+            let checked = loaded
+                .sign_in_turn(clock(2, 2), |t| t.check_sign_in(&secret, dev(2), hash(42)))
+                .apply(|_| Ok::<_, Denied>(()))??;
+            let old = checked.check(hash(42), clock(2, 2))?;
+            assert_eq!(
+                loaded
+                    .sign_in_turn(clock(2, 2), |t| t.sign_in(old, fresh(2), None))
+                    .apply(|_| Ok::<_, Denied>(()))?,
+                Err(Denied::WrongPassword)
+            );
+            assert_eq!(
+                loaded
+                    .sign_in_turn(clock(2, 2), |t| t.check_code(&secret, dev(2), 8, hash(43)))
+                    .apply(|_| Ok::<_, Denied>(()))?
+                    .err(),
+                Some(Denied::WrongPassword)
+            );
+            Account::recover_from_lost_store(data, Some(&update.apart_first), 2, clock(2, 2))
+                .apply(|resumed| {
+                    let same = resumed.updates.first().unwrap();
+                    assert_eq!(same.change, DataChange::DiscardCredentials);
+                    assert_eq!(same.data, update.data);
+                    assert_eq!(same.apart_last, update.apart_last);
+                    Ok::<_, Denied>(())
+                })??;
+        }
+        Ok::<_, Denied>(())
+    })??;
+    Ok(())
+}
+
+#[test]
+fn lost_store_recovery_preserves_partial_authority_and_takes_the_higher_counters()
+-> Result<(), Denied> {
+    let mut account = state("alice@example.test");
+    account.admin = true;
+    account.password_changes = 9;
+    let mut s = Stored::new(account);
+    s.sign_in(8, 1, 1, 0)?;
+    s.sign_in(9, 2, 2, 0)?;
+    let copy = s.data.clone();
+    let mut partial = s.apart.clone();
+    partial.account.status = Status::Off;
+    partial.account.admin = false;
+    partial.account.revision = 23;
+    partial.account.password_changes = 7;
+    partial.account.life = 4;
+    partial.account.music_login = 5;
+    partial.devices.remove(&dev(2));
+    let retained = partial.devices.get_mut(&dev(1)).unwrap();
+    retained.number = 13;
+    retained.last_session = 99;
+    retained.known = false;
+    for (status, change) in [
+        (Status::Off, DataChange::DiscardCredentials),
+        (Status::Deleted, DataChange::DeleteAccount),
+    ] {
+        partial.account.status = status;
+        Account::recover_from_lost_store(&copy, Some(&partial), 2, clock(2, 2)).apply(|e| {
+            let u = e.updates.first().unwrap();
+            let locked = &u.apart_first.account;
+            assert_eq!(locked.status, status);
+            assert!(!locked.admin);
+            assert_eq!(locked.life, 4);
+            assert_eq!(locked.music_login, 5);
+            assert_eq!(u.change, change);
+            assert_eq!(u.apart_first.devices.get(&dev(1)).unwrap().number, 14);
+            assert_eq!(u.apart_first.devices.get(&dev(1)).unwrap().last_session, 99);
+            if status == Status::Off {
+                assert_eq!(locked.revision, 24);
+                assert_eq!(locked.password_changes, 10);
+                assert!(u.data.devices.get(&dev(2)).unwrap().session.is_none());
+                assert!(!u.apart_first.devices.get(&dev(2)).unwrap().known);
+            } else {
+                assert!(u.data.devices.is_empty());
+            }
+            Ok::<_, Denied>(())
+        })??;
+    }
+    partial.account.backend = BackendId::from_bytes([18; 16]);
+    assert_eq!(
+        Account::recover_from_lost_store(&copy, Some(&partial), 2, clock(2, 2)).apply(|e| {
+            assert!(e.updates.is_empty());
+            Ok::<_, Denied>(())
+        })?,
+        Err(Denied::WrongPurpose)
+    );
+    Ok(())
+}
