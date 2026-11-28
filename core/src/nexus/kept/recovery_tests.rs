@@ -501,3 +501,127 @@ fn counter_exhaustion_never_wraps_or_opens_an_ended_session() -> Result<(), Deni
     user.read(1, 1, 1)?;
     Ok(())
 }
+
+#[test]
+fn admin_payload_is_authorized_in_the_effects_only_when_the_change_is_allowed() -> Result<(), Denied>
+{
+    let mut admin = Stored::admin()?;
+    let mut wrong = Stored::new(state("other@example.test"));
+    wrong.account = {
+        wrong.apart.account.restore = 2;
+        wrong.data.account.restore = 2;
+        Account::load(&wrong.apart, Some(&wrong.data))
+    };
+    for wrong_target in [true, false] {
+        admin.leave(1, 7, LeaveFor::Admin(AdminKind::SetLidarr), 2)?;
+        let target = wrong_target.then_some(&mut wrong.account);
+        let result = admin
+            .account
+            .request(1, clock(2, admin.mark), |turn| {
+                turn.administer(bearer(1, &hash(7)), AdminAction::SetLidarr, target)
+            })
+            .apply(|effects| {
+                let update = effects.updates.first().unwrap();
+                assert_eq!(
+                    update.change,
+                    if wrong_target {
+                        DataChange::Keep
+                    } else {
+                        DataChange::ApplyAdmin(AdminKind::SetLidarr)
+                    }
+                );
+                assert!(
+                    update
+                        .apart_first
+                        .devices
+                        .get(&1)
+                        .unwrap()
+                        .permit
+                        .unwrap()
+                        .leave
+                        .is_none()
+                );
+                Ok::<_, Denied>(())
+            })?;
+        assert_eq!(
+            result,
+            if wrong_target {
+                Err(Denied::WrongPurpose)
+            } else {
+                Ok(())
+            }
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn restore_before_or_after_sign_in_retires_old_authorization_and_cursor() -> Result<(), Denied> {
+    for sign_in_first in [false, true] {
+        let mut user = Stored::new(state("alice@example.test"));
+        user.sign_in(8, 1, 1, 0)?;
+        let copy = user.data.clone();
+        let receipt = user.bind(8, 1, 1)?;
+        if sign_in_first {
+            user.step(1, |turn| turn.sign_in(receipt, hash(2), None))?;
+            user.restore_copy(&copy, RestoreMode::DataOnly, 2)?;
+        } else {
+            user.restore_copy(&copy, RestoreMode::DataOnly, 2)?;
+            assert_eq!(
+                user.step(2, |turn| turn.sign_in(receipt, hash(2), None)),
+                Err(Denied::NotSignedIn)
+            );
+        }
+        for n in [1, 2] {
+            assert_eq!(user.read(1, n, 2).err(), Some(Denied::NotSignedIn));
+        }
+        user.sign_in(8, 1, 3, 2)?;
+        let result = user
+            .account
+            .request(1, clock(3, user.mark), |turn| {
+                turn.arrive(bearer(1, &hash(3)), Access::ReadHistory)
+            })
+            .apply(|_| Ok::<_, Denied>(()))?;
+        assert_eq!(result.err(), Some(Denied::StartAgain));
+        user.step(3, |turn| {
+            turn.arrive(bearer(1, &hash(3)), Access::ReadHistory)
+        })?;
+    }
+    Ok(())
+}
+
+#[test]
+fn adoption_renews_music_access_and_a_genuine_newer_life_holds_restored_history()
+-> Result<(), Denied> {
+    for managed in [false, true] {
+        let mut state = state("alice@example.test");
+        state.music_managed = managed;
+        let mut user = Stored::new(state);
+        user.sign_in(8, 1, 1, 0)?;
+        let copy = user.data.clone();
+        user.restore_copy(&copy, RestoreMode::Adopt, 1)?;
+        assert_eq!(
+            user.apart.account.music_recovery,
+            Some(if managed {
+                MusicRecovery::RotateManaged
+            } else {
+                MusicRecovery::EnterAgain
+            })
+        );
+        assert_eq!(user.read(1, 1, 1).err(), Some(Denied::NotSignedIn));
+        assert!(!user.apart.account.history_held);
+        let key = StampKey::new([4; SECRET_BYTES]);
+        let current = user.apart.account.position(10);
+        let newer = Position {
+            life: current.life + 1,
+            change: 0,
+            ..current.clone()
+        };
+        let evidence = key.presented(&current, &newer, &key.stamp(&newer));
+        let copy = user.data.clone();
+        user.restore_copy(&copy, RestoreMode::WholeMachine(evidence), 2)?;
+        assert!(user.apart.account.history_held);
+        assert_eq!(user.apart.account.life, newer.life);
+    }
+    Ok(())
+}

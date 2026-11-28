@@ -60,6 +60,8 @@ pub enum DataChange {
     SpendCode,
     EraseHistory,
     DeleteAccount,
+    ApplyAdmin(AdminKind),
+    InstallMusicLogin,
 }
 
 /// When credentials must be renewed, S3/S9 apply this alongside the data changes.
@@ -835,6 +837,7 @@ impl Turn<'_> {
         }
         state.music_login = next(state.music_login)?;
         state.music_recovery = None;
+        *self.change = DataChange::InstallMusicLogin;
         Ok(state.music_login)
     }
 
@@ -848,7 +851,8 @@ impl Turn<'_> {
     }
 
     /// Other account, or None for a change to the actor's own account or a global
-    /// setting. S3 writes the authorized action in the data step and only on success.
+    /// setting. ApplyAdmin/InstallMusicLogin tell S3 to include the action's
+    /// payload in the data write. A denied change may still consume leave.
     pub fn administer(
         mut self,
         bearer: Bearer<'_>,
@@ -985,12 +989,13 @@ fn admin_change(
             // S9 supplies this action when the replacement is ready for its data write.
             account.state.music_login = next(account.state.music_login)?;
             account.state.music_recovery = None;
+            *change = DataChange::InstallMusicLogin;
         }
         AdminAction::CreateAccount
         | AdminAction::SetMusicAddress
         | AdminAction::SetDiagnosticsDefault
         | AdminAction::SetRequests
-        | AdminAction::SetLidarr => {}
+        | AdminAction::SetLidarr => *change = DataChange::ApplyAdmin(action.kind()),
     }
     Ok(())
 }
