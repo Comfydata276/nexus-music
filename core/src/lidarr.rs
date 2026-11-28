@@ -30,15 +30,22 @@ pub struct Lidarr {
 }
 
 /// What request pages and discovery ask of Lidarr, either directly or through Nexus.
+///
+/// S13 supplies an [`Http`] that follows no redirects and enforces
+/// [`crate::http::BODY_LIMIT`]. Its only permitted plain HTTP destination is the
+/// inside address configured by the admin.
 pub trait RequestLidarr: Send + Sync {
     fn find_releases(&self, term: &str) -> Result<(Vec<Offer>, Vec<Single>), String>;
     fn find_any(&self, term: &str) -> Result<Vec<Offer>, String>;
     fn find_artists(&self, term: &str) -> Result<Vec<ArtistOffer>, String>;
     fn tracked(&self) -> Result<HashSet<String>, String>;
     fn known_artist(&self, artist: &str) -> Result<Option<(i64, String)>, String>;
+    fn albums_of(&self, artist: i64, name: &str) -> Result<Vec<(Offer, bool)>, String>;
     fn releases_of(&self, artist: i64, name: &str) -> Result<Vec<(Offer, bool)>, String>;
+    fn add_artist(&self, artist: &str, name: &str, way_back: &dyn WayBack) -> Result<usize, String>;
     fn request(&self, wanted: &Offer, way_back: &dyn WayBack) -> Result<(), String>;
     fn pending(&self) -> Result<Vec<Pending>, String>;
+    fn cancel(&self, id: i64) -> Result<(), String>;
 }
 
 /// What the bulk worker needs in addition to the interactive requests.
@@ -174,6 +181,26 @@ impl Http for SeeingThrough {
 
 /// Said when Lidarr can't be reached without signing in.
 pub const NEEDED: &str = "Lidarr is behind a sign-in. In Settings, under Requests, sign in with your browser.";
+
+pub(crate) const NO_MUSIC_FOLDER: &str = "Lidarr has no music folder set up yet.";
+pub(crate) const NO_PROFILES: &str = "Lidarr has no profiles to copy from.";
+pub(crate) const SINGLES_PROFILE_NO_NUMBER: &str = "Lidarr's profile for singles has no number.";
+pub(crate) const SOUNDTRACKS_PROFILE_NO_NUMBER: &str = "Lidarr's profile for soundtracks has no number.";
+pub(crate) const KEY_REFUSED: &str = "Lidarr turned the request away. Check the API key.";
+pub(crate) const UNRECOGNIZED_LIDARR: &str = "That address answered, but not as Lidarr. Check the address.";
+pub(crate) const SIGN_IN_REJECTED: &str = "You're signed in, but the sign-in in front of Lidarr still turned the app away. The proxy in front of Lidarr may not be passing the sign-in on.";
+
+pub(crate) fn not_among_releases(wanted: &Offer) -> String {
+    format!("Lidarr has {} but doesn't list “{}” among their releases.", wanted.artist, wanted.title)
+}
+
+pub(crate) fn would_not_keep(wanted: &Offer) -> String {
+    format!("Lidarr wouldn't keep “{}” on its list. Try again in a minute.", wanted.title)
+}
+
+pub(crate) fn could_not_restore(wanted: &Offer) -> String {
+    format!("Asked for “{}”, but couldn't turn new releases back on for {} in Lidarr. Check that artist's settings there.", wanted.title, wanted.artist)
+}
 
 use crate::offer::{Offer, VARIOUS};
 
@@ -664,17 +691,15 @@ impl Lidarr {
                 let pass = gate.pass()?;
                 (status, text) = self.once(method, &url, body.as_deref(), Some(&pass))?;
                 if (300..400).contains(&status) {
-                    return Err("You're signed in, but the sign-in in front of Lidarr still turned the app away. \
-                                The proxy in front of Lidarr may not be passing the sign-in on."
-                        .into());
+                    return Err(SIGN_IN_REJECTED.into());
                 }
             }
         }
         match status {
             200..=299 => serde_json::from_str(if text.trim().is_empty() { "null" } else { &text })
-                .map_err(|_| "That address answered, but not as Lidarr. Check the address.".to_string()),
+                .map_err(|_| UNRECOGNIZED_LIDARR.to_string()),
             300..=399 => Err(NEEDED.into()),
-            401 | 403 => Err("Lidarr turned the request away. Check the API key.".into()),
+            401 | 403 => Err(KEY_REFUSED.into()),
             _ => Err(format!("Lidarr answered with an error ({status}).")),
         }
     }
@@ -775,7 +800,7 @@ impl Lidarr {
         let _turn = way_back.turn();
         let Some((known, _)) = self.known_artist(artist)? else {
             let folders: Vec<RootFolder> = self.get("rootfolder")?;
-            let folder = folders.first().ok_or("Lidarr has no music folder set up yet.")?;
+            let folder = folders.first().ok_or(NO_MUSIC_FOLDER)?;
             let _: ArtistRes = self.send(
                 "POST",
                 "artist",
@@ -847,12 +872,12 @@ impl Lidarr {
                 // New to Lidarr. Added with none of their albums wanted, or Lidarr would
                 // set about fetching everything they've made.
                 let folders: Vec<RootFolder> = self.get("rootfolder")?;
-                let folder = folders.first().ok_or("Lidarr has no music folder set up yet.")?;
+                let folder = folders.first().ok_or(NO_MUSIC_FOLDER)?;
                 let profile = if plain {
                     folder.default_metadata_profile_id
                 } else {
                     let profiles: Vec<serde_json::Value> = self.get("metadataprofile")?;
-                    self.profile_for(&profiles, wanted.soundtrack)?.get("id").and_then(|id| id.as_i64()).ok_or("Lidarr's profile for singles has no number.")?
+                    self.profile_for(&profiles, wanted.soundtrack)?.get("id").and_then(|id| id.as_i64()).ok_or(SINGLES_PROFILE_NO_NUMBER)?
                 };
                 let added: ArtistRes = self.send(
                     "POST",
@@ -879,9 +904,7 @@ impl Lidarr {
                 if restored.is_ok() && wrote {
                     way_back.put_back(&self.way_back_address(), artist, &before);
                 }
-                outcome.and(restored.map_err(|_| {
-                    format!("Asked for “{}”, but couldn't turn new releases back on for {} in Lidarr. Check that artist's settings there.", wanted.title, wanted.artist)
-                }))
+                outcome.and(restored.map_err(|_| could_not_restore(wanted)))
             }
             None => outcome,
         }
@@ -894,7 +917,7 @@ impl Lidarr {
         if let Some(ours) = profiles.iter().find(|profile| profile.get("name").and_then(|known| known.as_str()) == Some(name)) {
             return Ok(ours.clone());
         }
-        let template = profiles.first().ok_or("Lidarr has no profiles to copy from.")?;
+        let template = profiles.first().ok_or(NO_PROFILES)?;
         self.send("POST", "metadataprofile", Some(made_profile(template, soundtracks)))
     }
 
@@ -913,14 +936,14 @@ impl Lidarr {
         let mut album = found
             .into_iter()
             .find(|album| album.get("foreignAlbumId").and_then(|id| id.as_str()) == Some(wanted.album.as_str()))
-            .ok_or("Lidarr no longer lists that one.")?;
+            .ok_or(crate::requests::NO_LONGER_LISTED)?;
         let folders: Vec<RootFolder> = self.get("rootfolder")?;
-        let folder = folders.first().ok_or("Lidarr has no music folder set up yet.")?;
+        let folder = folders.first().ok_or(NO_MUSIC_FOLDER)?;
         let profile = if wanted.kind() == "Album" && !wanted.soundtrack {
             folder.default_metadata_profile_id
         } else {
             let profiles: Vec<serde_json::Value> = self.get("metadataprofile")?;
-            self.profile_for(&profiles, wanted.soundtrack)?.get("id").and_then(|id| id.as_i64()).ok_or("Lidarr's profile for soundtracks has no number.")?
+            self.profile_for(&profiles, wanted.soundtrack)?.get("id").and_then(|id| id.as_i64()).ok_or(SOUNDTRACKS_PROFILE_NO_NUMBER)?
         };
         album["monitored"] = true.into();
         album["addOptions"] = serde_json::json!({ "addType": "manual", "searchForNewAlbum": true });
@@ -1041,7 +1064,7 @@ impl Lidarr {
     /// What's needed to add an artist.
     pub fn setup(&self) -> Result<Setup, String> {
         let folders: Vec<RootFolder> = self.get("rootfolder")?;
-        let folder = folders.first().ok_or("Lidarr has no music folder set up yet.")?;
+        let folder = folders.first().ok_or(NO_MUSIC_FOLDER)?;
         Ok(Setup { folder: folder.path.clone(), quality: folder.default_quality_profile_id, albums: folder.default_metadata_profile_id, singles: None, soundtracks: None })
     }
 
@@ -1059,7 +1082,7 @@ impl Lidarr {
                 Some(id) => id,
                 None => {
                     let profiles: Vec<serde_json::Value> = self.get("metadataprofile")?;
-                    let id = self.profile_for(&profiles, soundtracks)?.get("id").and_then(|id| id.as_i64()).ok_or("Lidarr's profile for singles has no number.")?;
+                    let id = self.profile_for(&profiles, soundtracks)?.get("id").and_then(|id| id.as_i64()).ok_or(SINGLES_PROFILE_NO_NUMBER)?;
                     if soundtracks {
                         setup.soundtracks = Some(id);
                     } else {
@@ -1161,7 +1184,7 @@ impl Lidarr {
                 break album.id;
             }
             if started.elapsed() > LEARN_ARTIST {
-                return Err(format!("Lidarr has {} but doesn't list “{}” among their releases.", wanted.artist, wanted.title));
+                return Err(not_among_releases(wanted));
             }
             self.pause(Duration::from_secs(3))?;
         };
@@ -1192,7 +1215,7 @@ impl Lidarr {
                 break;
             }
         }
-        Err(format!("Lidarr wouldn't keep “{}” on its list. Try again in a minute.", wanted.title))
+        Err(would_not_keep(wanted))
     }
 
     /// Whether Lidarr is in the middle of setting artists up.
@@ -1276,8 +1299,16 @@ impl RequestLidarr for Lidarr {
         Lidarr::known_artist(self, artist)
     }
 
+    fn albums_of(&self, artist: i64, name: &str) -> Result<Vec<(Offer, bool)>, String> {
+        Lidarr::albums_of(self, artist, name)
+    }
+
     fn releases_of(&self, artist: i64, name: &str) -> Result<Vec<(Offer, bool)>, String> {
         Lidarr::releases_of(self, artist, name)
+    }
+
+    fn add_artist(&self, artist: &str, name: &str, way_back: &dyn WayBack) -> Result<usize, String> {
+        Lidarr::add_artist(self, artist, name, way_back)
     }
 
     fn request(&self, wanted: &Offer, way_back: &dyn WayBack) -> Result<(), String> {
@@ -1286,6 +1317,10 @@ impl RequestLidarr for Lidarr {
 
     fn pending(&self) -> Result<Vec<Pending>, String> {
         Lidarr::pending(self)
+    }
+
+    fn cancel(&self, id: i64) -> Result<(), String> {
+        Lidarr::cancel(self, id)
     }
 }
 
