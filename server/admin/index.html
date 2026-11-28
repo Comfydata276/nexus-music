@@ -16,18 +16,21 @@
   --accent: #a98bfb;
 }
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 body { margin: 0; }
 main { width: min(100% - 2rem, 68rem); margin: clamp(2rem, 8vw, 5rem) auto; }
 h1 { margin: 0 0 1.25rem; font-size: clamp(1.65rem, 5vw, 2.3rem); }
 h2 { margin: 0 0 .35rem; font-size: 1.15rem; }
 p { margin: 0; overflow-wrap: anywhere; }
-#signin, article, dialog {
+#signin, #setup-details, article, dialog {
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: .75rem;
   padding: 1.25rem;
 }
-#signin { max-width: 26rem; }
+#signin, #setup-details { max-width: 26rem; }
+#setup-details { margin-top: .85rem; }
+#report-text { white-space: pre-wrap; overflow-wrap: anywhere; }
 article { min-width: 0; }
 .dialog-actions, .account-bar, .row-actions {
   display: flex;
@@ -107,6 +110,17 @@ dd, li { overflow-wrap: anywhere; }
     <button id="submit" type="submit" disabled>Sign in</button>
     <noscript><p>Enable JavaScript to sign in.</p></noscript>
   </form>
+  <details id="setup-details">
+    <summary>Set up this server for the first time</summary>
+    <p>Use the one-time setup code from the Nexus server’s log.</p>
+    <form id="setup-form" method="post" autocomplete="off">
+      <label>Setup code <input id="setup-code" inputmode="text" autocomplete="off" spellcheck="false" required></label>
+      <label>Your name <input id="setup-name" maxlength="128" required></label>
+      <label>Email <input id="setup-email" inputmode="email" autocapitalize="none" spellcheck="false" maxlength="254" required></label>
+      <label>New password <input id="setup-password" type="password" autocomplete="new-password" minlength="15" maxlength="256" required></label>
+      <button id="setup-submit" type="submit">Create my administrator account</button>
+    </form>
+  </details>
   <section id="admin" hidden>
     <div class="account-bar">
       <p id="identity"></p>
@@ -140,6 +154,7 @@ dd, li { overflow-wrap: anywhere; }
           <label>New address people will use
             <input id="new-address" type="url" inputmode="url" maxlength="2048" required>
           </label>
+          <p>Nexus doesn’t test this address. Check it by signing in on a phone or PC.</p>
           <button type="submit">Review new address</button>
         </form>
       </article>
@@ -153,21 +168,32 @@ dd, li { overflow-wrap: anywhere; }
         <h2>Diagnostics</h2>
         <p id="diagnostics-status" role="status"></p>
         <button id="diagnostics-toggle" type="button" hidden></button>
+        <button id="reports-open" type="button" class="secondary">Read device reports</button>
       </article>
       <article>
         <h2>Requests</h2>
         <p id="requests-status" role="status"></p>
         <ul id="requests-list"></ul>
-        <details id="lidarr-details">
+        <p id="requests-availability">Settings for requests will be available when music requests are turned on for this server.</p>
+        <details id="lidarr-details" hidden>
           <summary>Set up Lidarr</summary>
           <form id="lidarr-form" method="post" autocomplete="off">
-            <label>Lidarr address <input id="lidarr-address" type="url" inputmode="url" maxlength="2048" required></label>
+            <p id="lidarr-address"></p>
             <label>Lidarr key <input id="lidarr-key" type="password" autocomplete="off" maxlength="512" required></label>
             <button type="submit">Review Lidarr settings</button>
           </form>
         </details>
       </article>
     </div>
+    <dialog id="reports" aria-labelledby="reports-title">
+      <h2 id="reports-title">Device reports</h2>
+      <p id="reports-status" role="status"></p>
+      <pre id="report-text"></pre>
+      <div class="dialog-actions">
+        <button id="reports-more" type="button" hidden>Older report</button>
+        <button id="reports-close" type="button" class="secondary">Close</button>
+      </div>
+    </dialog>
     <dialog id="music-login" aria-labelledby="music-login-title">
       <h2 id="music-login-title">Set music sign-in</h2>
       <p id="music-login-account"></p>
@@ -208,6 +234,10 @@ dd, li { overflow-wrap: anywhere; }
   "use strict";
   const byId = id => document.getElementById(id);
   const form = byId("signin");
+  const setupDetails = byId("setup-details");
+  const setupForm = byId("setup-form");
+  const setupSubmit = byId("setup-submit");
+  const enableRequestChanges = false;
   const email = byId("email");
   const password = byId("password");
   const submit = byId("submit");
@@ -227,6 +257,11 @@ dd, li { overflow-wrap: anywhere; }
   const publicAddress = byId("music-public");
   const diagnostics = byId("diagnostics-status");
   const diagnosticsToggle = byId("diagnostics-toggle");
+  const reportsDialog = byId("reports");
+  const reportsMore = byId("reports-more");
+  let reportCursor = null;
+  let reportGeneration = 0;
+  const deviceNames = new Map();
   const changeStatus = byId("change-status");
   const grantDialog = byId("grant");
   const grantPassword = byId("grant-password");
@@ -242,6 +277,7 @@ dd, li { overflow-wrap: anywhere; }
   const deviceOwners = new Map();
   let musicAddress = null;
   let diagnosticsEnabled = null;
+  let lidarrAddress = null;
   let loginAccount = null;
   let draft = null;
   let changing = false;
@@ -354,7 +390,7 @@ dd, li { overflow-wrap: anywhere; }
     grant_required: "Your confirmation has expired. Review the change and try again.",
     no_such_account: "That account is no longer here. Refresh the accounts and try again.",
     no_such_session: "That device has signed out or signed in again. Refresh the devices first.",
-    music_login_refused: "The music server did not accept that sign-in. Check the username and password.",
+    music_login_refused: "That music server username or password is not right. Check both and try again.",
     lidarr_login_refused: "Lidarr did not accept those settings. Check the address and key.",
     conflict: "Someone changed these settings already. Refresh them and try again.",
   };
@@ -423,12 +459,15 @@ dd, li { overflow-wrap: anywhere; }
   function accountRow(row) {
     if (typeof row.name !== "string" || typeof row.email !== "string" ||
         typeof row.enabled !== "boolean" || typeof row.admin !== "boolean" ||
-        typeof row.requests_enabled !== "boolean") throw new Error();
+        typeof row.requests_enabled !== "boolean" ||
+        !["none_set", "set", "type_again"].includes(row.music)) throw new Error();
     return {
       after: id(row.id), name: row.name, email: row.email, enabled: row.enabled,
       admin: row.admin, requestsEnabled: row.requests_enabled,
       label: row.name + " · " + row.email + (row.admin ? " · Administrator" : "") +
-        (row.enabled ? "" : " · Switched off"),
+        (row.enabled ? "" : " · Switched off") +
+        (row.music === "type_again" ? " · Enter their music sign-in again" :
+          row.music === "none_set" ? " · Music sign-in not set" : ""),
     };
   }
 
@@ -563,7 +602,8 @@ dd, li { overflow-wrap: anywhere; }
         const body = { account, enabled };
         reviewChange("set-account-enabled", body, body, switchLabel,
           enabled ? "Let " + person + " sign in again." : "Sign out " + person + " on all devices and stop them signing in.",
-          { saved: enabled ? "Account switched on. They can sign in again." : "Account switched off.", refresh: "accounts" });
+          { saved: enabled ? "Account switched on. They can sign in again." : "Account switched off.",
+            refresh: "accounts-and-devices" });
       }),
       makeButton("Set music sign-in", () => openLogin(account, person)),
       makeButton("Reset password", () => reviewChange("reset-password", { account }, account, "Reset password",
@@ -584,6 +624,7 @@ dd, li { overflow-wrap: anywhere; }
     entry.append(menu);
 
     const requestRow = appendRow(requests, row.name + " · " + (row.requestsEnabled ? "On" : "Off"));
+    if (!enableRequestChanges) return;
     const requestButtons = document.createElement("div");
     requestButtons.className = "row-actions";
     const mayRequest = !row.requestsEnabled;
@@ -599,6 +640,7 @@ dd, li { overflow-wrap: anywhere; }
 
   function renderDevice(row) {
     const account = row.after.account;
+    deviceNames.set(row.after.device, row.name);
     const entry = appendRow(devicePage.list, row.label);
     const owner = document.createElement("span");
     const known = accountNames.get(account);
@@ -764,8 +806,8 @@ dd, li { overflow-wrap: anywhere; }
       const fallback = sentChange
         ? "Could not confirm the change. Check the current settings before trying again."
         : "Could not confirm your password. Check your connection and try again.";
-      const lidarrUnavailable = proposed.path === "set-lidarr" && (!sentChange && error.reason === "malformed");
-      message(lidarrUnavailable ? "Lidarr setup isn’t available yet. Try again after Requests is set up." :
+      const musicUnreachable = proposed.path === "set-music-login" && sentChange && error.reason === "unavailable";
+      message(musicUnreachable ? "The music server could not be reached. Check it is running, then try again." :
         error instanceof AdminProblem ? error.message : fallback, true);
     } finally {
       if (session === current) changing = false;
@@ -802,12 +844,12 @@ dd, li { overflow-wrap: anywhere; }
       { code: true, saved: "Account added.", refresh: "accounts", done: () => createForm.reset() });
   });
 
-  function addressInput(value, httpsOnly) {
+  function addressInput(value) {
     const text = value.trim();
     try {
       const address = new URL(text);
       const scheme = address.protocol;
-      if (scheme !== "https:" && (httpsOnly || scheme !== "http:")) return null;
+      if (scheme !== "https:") return null;
       if (!text.startsWith(scheme + "/" + "/")) return null;
       if (!address.hostname || address.username || address.password || /[?#\s\\]/u.test(text) ||
           bytes(text) > 2048) return null;
@@ -820,7 +862,7 @@ dd, li { overflow-wrap: anywhere; }
   addressForm.addEventListener("submit", event => {
     event.preventDefault();
     if (!musicAddress) return;
-    const address = addressInput(field("new-address"), true);
+    const address = addressInput(field("new-address"));
     if (!address) return message("Enter the full secure address people will use, then try again.", true);
     reviewChange("set-music-server", { public: address }, address, "Save music server address",
       "Check both addresses. Nexus uses " + musicAddress.internal + ". People will use " + address + ".",
@@ -841,19 +883,35 @@ dd, li { overflow-wrap: anywhere; }
     closeLogin();
     reviewChange("set-music-login", { account: selected.account, name, password }, selected.account,
       "Check music sign-in", "Check and save the music sign-in you entered for " + selected.person + ".",
-      { saved: "The music sign-in works." });
+      { saved: "The music sign-in works.", refresh: "accounts" });
   });
 
+  async function loadLidarr(current) {
+    try {
+      const result = await readAdmin(current, "/nexus/api/admin/lidarr", {}, 4096);
+      if (session !== current || (result.address !== null && typeof result.address !== "string")) return;
+      lidarrAddress = result.address;
+      writeText(byId("lidarr-address"), result.address ? "Address Nexus uses: " + result.address :
+        "Set the Lidarr address in the Nexus container first.");
+    } catch {
+      if (session === current) writeText(byId("lidarr-address"), "Could not load the Lidarr address.");
+    }
+  }
+
+  byId("lidarr-details").hidden = !enableRequestChanges;
+  byId("requests-availability").hidden = enableRequestChanges;
   lidarrForm.addEventListener("submit", event => {
     event.preventDefault();
-    const address = addressInput(field("lidarr-address"), false);
+    if (!enableRequestChanges) return;
     const key = field("lidarr-key");
     lidarrForm.reset();
-    if (!address || !key || bytes(key) > 512 || /\p{Cc}/u.test(key)) {
-      return message("Check the Lidarr address and key, then enter both again.", true);
+    if (!lidarrAddress) return message("Set the Lidarr address in the Nexus container first.", true);
+    if (!key || bytes(key) > 512 || /\p{Cc}/u.test(key)) {
+      return message("Check the Lidarr key and enter it again.", true);
     }
-    reviewChange("set-lidarr", { address, key }, address, "Save Lidarr settings",
-      "Connect Nexus to Lidarr at " + address + ".", { saved: "Lidarr settings saved." });
+    const change = { key };
+    reviewChange("set-lidarr", change, change, "Save Lidarr key",
+      "Save the key for the Lidarr address Nexus uses, " + lidarrAddress + ".", { saved: "Lidarr key saved." });
   });
 
   diagnosticsToggle.addEventListener("click", () => {
@@ -867,7 +925,10 @@ dd, li { overflow-wrap: anywhere; }
   });
 
   function resetPage(pager) {
-    if (pager === devicePage) deviceOwners.clear();
+    if (pager === devicePage) {
+      deviceOwners.clear();
+      deviceNames.clear();
+    }
     pager.generation++;
     pager.list.replaceChildren();
     pager.after = null;
@@ -884,6 +945,7 @@ dd, li { overflow-wrap: anywhere; }
     cancelChange();
     closeLogin();
     clearCode();
+    closeReports();
     for (const form of [createForm, addressForm, lidarrForm]) form.reset();
     byId("new-account-details").open = false;
     byId("lidarr-details").open = false;
@@ -891,6 +953,8 @@ dd, li { overflow-wrap: anywhere; }
     accountNames.clear();
     musicAddress = null;
     diagnosticsEnabled = null;
+    lidarrAddress = null;
+    writeText(byId("lidarr-address"), "");
     addressForm.hidden = true;
     diagnosticsToggle.hidden = true;
     requests.replaceChildren();
@@ -899,10 +963,131 @@ dd, li { overflow-wrap: anywhere; }
     }
     clearTimeout(idleTimer);
     form.hidden = false;
+    setupDetails.hidden = false;
     admin.hidden = true;
     writeText(identity, "");
     password.value = "";
   }
+
+  function typedCode(input) {
+    const code = input.replace(/[ -]/g, "");
+    if (!/^[A-Za-z0-9]{12}$/.test(code)) return null;
+    const canonical = code.toUpperCase().replace(/[IL]/g, "1").replace(/O/g, "0");
+    return /^[0-9A-HJKMNP-TV-Z]{12}$/.test(canonical) ? canonical : null;
+  }
+
+  setupForm.addEventListener("submit", async event => {
+    event.preventDefault();
+    if (pending || session) return;
+    const code = typedCode(field("setup-code"));
+    const name = field("setup-name");
+    const address = field("setup-email").trim().replace(/[A-Z]/g, letter => letter.toLowerCase());
+    const password = field("setup-password");
+    byId("setup-password").value = "";
+    byId("setup-code").value = "";
+    if (!code || !validName(name) || bytes(address) > 254 ||
+        !/^[^\s@\p{Cc}]+@[^\s@\p{Cc}]+$/u.test(address) ||
+        Array.from(password).length < 15 || Array.from(password).length > 128) {
+      writeText(status, "Check the setup code, name and email. Choose a password of at least 15 characters.");
+      return;
+    }
+    const request = new AbortController();
+    pending = request;
+    submit.disabled = true;
+    setupSubmit.disabled = true;
+    writeText(status, "Creating the first account…");
+    try {
+      const response = await post("/nexus/api/set-up", json({ code, email: address, name, password }), request.signal);
+      const reply = response.body && await readReply(response, 4096);
+      if (request.signal.aborted) return;
+      if (response.status === 200 && reply?.done?.result?.admin === true &&
+          reply.done.receipt === undefined && reply.refused === undefined) {
+        setupForm.reset();
+        setupDetails.open = false;
+        email.value = address;
+        writeText(status, "Your account is ready. Sign in with the password you just chose.");
+        byId("password").focus();
+        return;
+      }
+      const reason = reply?.refused?.not_allowed;
+      writeText(status, reason === "wrong_login" ? "That setup code isn’t right or has expired. Check the current code in the server log." :
+        reason === "password_not_allowed" ? "Choose a less common password and enter the setup code again." :
+        response.status === 429 ? "Nexus is busy. Wait a moment and try setup again." :
+        "Setup didn’t go through. If an account already exists, sign in below the Nexus heading.");
+    } catch {
+      if (!request.signal.aborted) writeText(status, "Could not set up Nexus. Check the connection and try again.");
+    } finally {
+      pending = null;
+      submit.disabled = false;
+      setupSubmit.disabled = false;
+    }
+  });
+
+  function closeReports() {
+    reportGeneration++;
+    reportCursor = null;
+    reportsMore.hidden = true;
+    reportsMore.disabled = false;
+    writeText(byId("reports-status"), "");
+    writeText(byId("report-text"), "");
+    if (reportsDialog.open) reportsDialog.close();
+  }
+
+  async function loadReport() {
+    const current = session;
+    if (!current || reportsMore.disabled) return;
+    const generation = reportGeneration;
+    reportsMore.disabled = true;
+    writeText(byId("reports-status"), "Loading…");
+    try {
+      const answer = await readAdmin(current, "/nexus/api/admin/diagnostics", { after: reportCursor }, 1024 * 1024);
+      if (session !== current || generation !== reportGeneration) return;
+      const stamp = answer.receipt?.stamp;
+      const result = answer.result;
+      if (stamp?.account !== current.account || stamp?.restore !== current.restore ||
+          !Array.isArray(result?.reports) || result.reports.length > 1 ||
+          (result.next !== null && (!isU64(result.next) || result.next === 0n ||
+            (reportCursor !== null && result.next >= reportCursor)))) throw new Error();
+      const report = result.reports[0];
+      if (!report) {
+        if (result.next !== null) throw new Error();
+        writeText(byId("reports-status"), "No device reports to show.");
+        writeText(byId("report-text"), "");
+      } else {
+        const device = id(report.device);
+        const owner = id(report.account);
+        const reportId = id(report.id);
+        if (typeof report.text !== "string" || !isU64(report.received_ms) ||
+            (result.next !== null && result.next !== reportId)) throw new Error();
+        const time = new Date(Number(report.received_ms));
+        const who = [deviceNames.get(device) ?? "Device " + device, accountNames.get(owner)].filter(Boolean).join(" · ");
+        writeText(byId("reports-status"), who + " · " + time.toLocaleString());
+        writeText(byId("report-text"), report.text);
+      }
+      reportCursor = result.next;
+      reportsMore.hidden = reportCursor === null;
+      writeText(reportsMore, "Older report");
+    } catch {
+      if (session !== current || generation !== reportGeneration) return;
+      writeText(byId("reports-status"), "Could not load the report. Select Retry.");
+      writeText(reportsMore, "Retry");
+      reportsMore.hidden = false;
+    } finally {
+      if (session === current && generation === reportGeneration) reportsMore.disabled = false;
+    }
+  }
+
+  byId("reports-open").addEventListener("click", () => {
+    if (!session || reportsDialog.open) return;
+    reportsDialog.showModal();
+    void loadReport();
+  });
+  reportsMore.addEventListener("click", loadReport);
+  byId("reports-close").addEventListener("click", closeReports);
+  reportsDialog.addEventListener("cancel", event => {
+    event.preventDefault();
+    closeReports();
+  });
 
   form.addEventListener("submit", async event => {
     event.preventDefault();
@@ -952,12 +1137,16 @@ dd, li { overflow-wrap: anywhere; }
         writeText(status, "Use an administrator account to sign in here.");
         return;
       }
-      session = { bearer: signedIn.session, restore, controller: new AbortController() };
+      session = { bearer: signedIn.session, account: signedIn.person.id, restore, controller: new AbortController() };
+      setupDetails.open = false;
+      setupDetails.hidden = true;
+      setupForm.reset();
       armIdleTimer();
       void loadAccounts();
       void loadDevices();
       void loadMusic(session);
       void loadDiagnostics(session);
+      if (enableRequestChanges) void loadLidarr(session);
       form.reset();
       form.hidden = true;
       admin.hidden = false;
@@ -1001,6 +1190,8 @@ dd, li { overflow-wrap: anywhere; }
   window.addEventListener("pagehide", () => {
     pending?.abort();
     form.reset();
+    setupForm.reset();
+    setupDetails.open = false;
     forgetSession();
     writeText(status, "");
   });

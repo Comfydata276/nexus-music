@@ -9,14 +9,14 @@ const route = readFileSync(new URL("../src/admin.rs", import.meta.url), "utf8");
 const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
 const style = html.match(/<style>([\s\S]*?)<\/style>/)[1];
 
-function loadPage(fetch) {
+function loadPage(fetch, { requestsEnabled = false } = {}) {
   const elements = new Map();
   const windowEvents = new Map();
   const timers = [];
   const fields = {
     signin: ["email", "password"], "grant-form": ["grant-password"],
     "create-form": ["create-email", "create-name"], "address-form": ["new-address"],
-    "lidarr-form": ["lidarr-address", "lidarr-key"], "music-login-form": ["music-user", "music-password"],
+    "lidarr-form": ["lidarr-key"], "setup-form": ["setup-code", "setup-name", "setup-email", "setup-password"], "music-login-form": ["music-user", "music-password"],
   };
   const node = (tag, id) => ({
     tag, id, textContent: "", value: "", disabled: false, hidden: id === "admin", open: false,
@@ -60,8 +60,9 @@ function loadPage(fetch) {
     AbortController,
     fetch,
   };
-  const instrumentation = "globalThis.forTest = { writeText, parseReply };";
-  runInNewContext(script.replace(/\}\)\(\);\s*$/, instrumentation + "})();"), context);
+  const instrumentation = "globalThis.forTest = { writeText, parseReply, typedCode };";
+  const source = requestsEnabled ? script.replace("const enableRequestChanges = false;", "const enableRequestChanges = true;") : script;
+  runInNewContext(source.replace(/\}\)\(\);\s*$/, instrumentation + "})();"), context);
   const findButton = (node, label) => {
     if (node.tag === "button" && node.textContent === label) return node;
     for (const child of node.children) {
@@ -182,9 +183,9 @@ test("authorized reads render text, paginate losslessly, and rearm idle expiry",
       const after = JSON.parse(options.body).after;
       return after === null ?
         new Response('{"done":{"rows":[{"id":18446744073709551614,"email":"one@example.test",' +
-          '"name":' + JSON.stringify(injected) + ',"admin":false,"enabled":true,"requests_enabled":true}],"more":true}}') :
+          '"name":' + JSON.stringify(injected) + ',"admin":false,"enabled":true,"requests_enabled":true,"music":"none_set"}],"more":true}}') :
         new Response('{"done":{"rows":[{"id":18446744073709551615,"email":"two@example.test",' +
-          '"name":"Two","admin":false,"enabled":true,"requests_enabled":false}],"more":false}}');
+          '"name":"Two","admin":false,"enabled":true,"requests_enabled":false,"music":"type_again"}],"more":false}}');
     }
     if (path === "/nexus/api/admin/devices") {
       return done({ rows: [{ account: 1, device: 4, name: injected, kind: "phone",
@@ -267,7 +268,7 @@ function adminStandIn() {
     if (path === "/nexus/api/admin/accounts") {
       const row = JSON.stringify({
         name: "Pat <script>sample()</script>", email: "pat@example.test", enabled,
-        admin: isAdmin, requests_enabled: canRequest,
+        admin: isAdmin, requests_enabled: canRequest, music: "set",
       });
       return new Response('{"done":{"rows":' + (hasAccount ? '[{"id":' + id + ',' + row.slice(1) + ']' : "[]") + ',"more":false}}');
     }
@@ -278,6 +279,7 @@ function adminStandIn() {
     }
     if (path === "/nexus/api/admin/music-server") return done({ internal: internalAddress, public: publicAddress });
     if (path === "/nexus/api/admin/diagnostics-default") return done({ enabled: diagnostics });
+    if (path === "/nexus/api/admin/lidarr") return done({ address: lidarrAddress, configured: false });
     if (path === "/nexus/api/admin/grant") {
       calls.push({ phase: "grant", request_id: data.change.request_id, action: data.change.action });
       if (nextRefusal) {
@@ -297,7 +299,7 @@ function adminStandIn() {
       reset_password: () => data.change.account,
       set_music_login: () => data.change.account,
       set_music_server: () => data.change.public,
-      set_lidarr: () => data.change.address,
+      set_lidarr: () => data.change,
     }[action]?.() ?? data.change;
     assert.ok(pendingGrant, "Each mutation must have its own grant");
     assert.equal(data.grant, pendingGrant.secret);
@@ -327,7 +329,7 @@ function adminStandIn() {
 
 test("all changes show a confirmation and spend one grant on the exact wire target", async () => {
   const mock = adminStandIn();
-  const page = loadPage(mock.fetch);
+  const page = loadPage(mock.fetch, { requestsEnabled: true });
   await page.signIn("owner@example.test", "example sign-in password");
   await settle();
   const confirm = async (password) => {
@@ -388,9 +390,10 @@ test("all changes show a confirmation and spend one grant on the exact wire targ
   await confirm();
   assert.equal(page.from("music-public").textContent, address);
 
-  page.submit("lidarr-form", { "lidarr-address": lidarrAddress, "lidarr-key": lidarrKey });
+  assert.match(page.from("lidarr-address").textContent, /requests-inside/);
+  page.submit("lidarr-form", { "lidarr-key": lidarrKey });
   assert.equal(page.from("lidarr-key").value, "");
-  assert.equal(page.from("lidarr-address").value, "");
+
   assert.equal(page.from("grant-summary").textContent.includes(lidarrKey), false);
   await confirm();
   page.click("diagnostics-toggle");
@@ -411,9 +414,9 @@ test("all changes show a confirmation and spend one grant on the exact wire targ
   ]);
   assert.deepEqual(changes.find(call => call.action === "force_out").payload, { account: mock.id, device: 19, session: 23 });
   assert.deepEqual(changes.find(call => call.action === "set_music_server").payload, { public: address });
-  assert.deepEqual(changes.find(call => call.action === "set_lidarr").payload, { address: lidarrAddress, key: lidarrKey });
+  assert.deepEqual(changes.find(call => call.action === "set_lidarr").payload, { key: lidarrKey });
   assert.ok(!JSON.stringify(grants).includes(typedMusicPassword));
-  assert.ok(!JSON.stringify(grants).includes(lidarrKey));
+  assert.ok(!JSON.stringify(grants.filter(grant => !grant.action.set_lidarr)).includes(lidarrKey));
 });
 
 test("refusals give a next step, cancel does not spend, and expired password asks again", async () => {
@@ -453,7 +456,7 @@ test("refusals give a next step, cancel does not spend, and expired password ask
   page.press("accounts-list", "Set music sign-in");
   page.submit("music-login-form", { "music-user": "Pat", "music-password": "wrong music password" });
   await page.submit("grant-form");
-  assert.match(page.from("change-status").textContent, /did not accept that sign-in/);
+  assert.match(page.from("change-status").textContent, /username or password is not right/);
   mock.code(code);
   page.submit("create-form", { "create-name": "Example", "create-email": "one@example.test" });
   await page.submit("grant-form");
@@ -464,4 +467,57 @@ test("refusals give a next step, cancel does not spend, and expired password ask
   assert.equal(page.from("music-password").value, "");
   assert.equal(page.from("grant-password").value, "");
   assert.equal(page.from("change-status").textContent, "");
+});
+
+test("setup normalizes a grouped code, clears its secret fields, and requires normal sign-in", async () => {
+  const page = loadPage(async (path, options) => {
+    assert.equal(path, "/nexus/api/set-up");
+    assert.equal(options.headers.Authorization, undefined);
+    assert.deepEqual(JSON.parse(options.body), {
+      code: "01A1ABC23456", email: "owner@example.test", name: "Owner <b>example</b>",
+      password: "example setup password for tests",
+    });
+    return new Response(JSON.stringify({ done: { result: { admin: true } } }));
+  });
+  assert.equal(page.typedCode(" oia-l abc 234-56 "), "01A1ABC23456");
+  for (const code of ["oia\u00a0l-abc23456", "01A1ABC2345U", "01A1ABC2345ſ", "01A1ABC2345", "01A1ABC234567"]) {
+    assert.equal(page.typedCode(code), null);
+  }
+  const request = page.submit("setup-form", {
+    "setup-code": "oia-l abc 234-56", "setup-email": "OWNER@example.test",
+    "setup-name": "Owner <b>example</b>", "setup-password": "example setup password for tests",
+  });
+  assert.equal(page.from("setup-code").value, "");
+  assert.equal(page.from("setup-password").value, "");
+  await request;
+  assert.equal(page.from("admin").hidden, true);
+  assert.equal(page.from("email").value, "owner@example.test");
+  assert.match(page.from("status").textContent, /Sign in with the password/);
+});
+
+test("device report text uses its stamped page and clears as soon as the dialog closes", async () => {
+  const mock = adminStandIn();
+  const report = "<script>sample()</script> Test report";
+  const cursors = [];
+  const page = loadPage(async (path, options) => {
+    if (path !== "/nexus/api/admin/diagnostics") return mock.fetch(path, options);
+    const after = JSON.parse(options.body).after;
+    cursors.push(after);
+    const result = {
+      reports: [{ id: after === null ? 5 : 4, account: 2, device: 19, received_ms: 1000, text: report }],
+      next: after === null ? 5 : null,
+    };
+    return new Response(JSON.stringify({ done: { result, receipt: { stamp: { account: 1, restore: 2 } } } }));
+  });
+  await page.signIn("owner@example.test", adminPassword);
+  await settle();
+  page.click("reports-open");
+  await settle();
+  assert.equal(page.from("report-text").textContent, report);
+  assert.equal(page.from("reports-more").hidden, false);
+  await page.click("reports-more");
+  assert.deepEqual(cursors, [null, 5]);
+  assert.equal(page.from("reports-more").hidden, true);
+  page.click("reports-close");
+  assert.equal(page.from("report-text").textContent, "");
 });
