@@ -18,14 +18,16 @@ struct Question {
     body: Vec<u8>,
 }
 
-fn question(socket: &mut Socket) -> Question {
+fn question(socket: &mut Socket) -> Option<Question> {
     socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
     let mut reader = BufReader::new(socket);
     let mut line = String::new();
-    reader.read_line(&mut line).unwrap();
+    if reader.read_line(&mut line).ok()? == 0 {
+        return None;
+    }
     let mut parts = line.split_whitespace();
-    let method = parts.next().unwrap().to_owned();
-    let target = parts.next().unwrap().to_owned();
+    let method = parts.next()?.to_owned();
+    let target = parts.next()?.to_owned();
     let mut headers = HashMap::new();
     loop {
         line.clear();
@@ -39,7 +41,7 @@ fn question(socket: &mut Socket) -> Question {
     let length = headers.get("content-length").map(|len| len.parse().unwrap()).unwrap_or_default();
     let mut body = vec![0; length];
     reader.read_exact(&mut body).unwrap();
-    Question { method, target, headers, body }
+    Some(Question { method, target, headers, body })
 }
 
 fn response(socket: &mut Socket, status: &str, headers: &str, body: &[u8]) -> std::io::Result<()> {
@@ -52,7 +54,7 @@ fn once(reply: impl FnOnce(&mut Socket, Question) + Send + 'static) -> (SocketAd
     let address = listener.local_addr().unwrap();
     let running = thread::spawn(move || {
         let (mut socket, _) = listener.accept().unwrap();
-        let ask = question(&mut socket);
+        let ask = question(&mut socket).expect("the transport sent no request");
         assert!(ask.headers.get("x-api-key").is_some_and(|key| key == TEST_KEY));
         reply(&mut socket, ask);
     });
@@ -248,7 +250,7 @@ impl MockLidarr {
             while !stopped.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((mut socket, _)) => {
-                        let incoming = question(&mut socket);
+                        let Some(incoming) = question(&mut socket) else { continue };
                         assert!(incoming.headers.get("x-api-key").is_some_and(|key| key == TEST_KEY));
                         let body = mock(&incoming, &mut lock(&available));
                         let stop = lock(&blocked.0);
@@ -287,7 +289,10 @@ impl Drop for MockLidarr {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         self.hold_response(None);
-        self.thread.take().unwrap().join().unwrap();
+        let finished = self.thread.take().unwrap().join();
+        if !thread::panicking() {
+            finished.unwrap();
+        }
     }
 }
 
@@ -701,6 +706,31 @@ fn a_member_can_complete_the_full_walk_using_the_page_configured_key() {
     assert_eq!(server.done(&member, job), Completed::Cancelled);
     assert!(matches!(server.call(&member, Call::Pending { after: None }),
         Answer::Pending { albums, .. } if albums.is_empty()));
+}
+
+#[test]
+fn the_page_can_switch_off_every_requests_call_for_a_signed_in_member() {
+    let lidarr = MockLidarr::start();
+    let (server, [admin, member, _]) = TestServer::start("switch", Some(endpoint(lidarr.address)));
+    let admin = server.redeem(admin, 1, TEST_PAGE);
+    server.configure(&admin);
+    let member = server.redeem(member, 2, "");
+    server.set_switch(&admin, &member, false);
+
+    let job = job_id(1).unwrap();
+    for call in [
+        Call::Status,
+        find_artist_call(),
+        Call::Pending { after: None },
+        Call::AskedHistory { after: None },
+        Call::After { job },
+        Call::BatchLines { job, after: None },
+        Call::ResolveBatchLine { job, index: 0, release: None },
+        begin(1, cancelled()),
+    ] {
+        assert!(matches!(server.call(&member, call), Answer::Refused { reason: Refusal::SwitchedOff }));
+    }
+    assert!(lidarr.take_calls().is_empty());
 }
 
 #[test]
