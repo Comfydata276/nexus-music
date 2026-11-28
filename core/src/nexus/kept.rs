@@ -2,8 +2,8 @@
 //! serialization lock and applies the returned effects before releasing the answer.
 
 use super::account::{
-    AccountId, CODE_LIFETIME_MS, DeviceId, DeviceSecret, Email, GrantSecret, PASSWORD_LEAVE_MS,
-    SECRET_BYTES, SESSION_IDLE_MS, SessionId, StampTag,
+    AccountId, CODE_LIFETIME_MS, DeviceId, DeviceSecret, Email, GrantSecret, MusicAddress,
+    PASSWORD_LEAVE_MS, RequestId, SECRET_BYTES, SESSION_IDLE_MS, SessionId, StampTag,
 };
 use super::proto::BackendId;
 use hkdf::hmac::{Hmac, Mac};
@@ -132,6 +132,13 @@ impl AccountState {
         self.backend == other.backend && self.id == other.id
     }
 
+    pub fn admin_target(&self) -> AdminTarget {
+        AdminTarget::Account {
+            id: self.id,
+            revision: self.revision,
+        }
+    }
+
     pub fn position(&self, change: u64) -> Position {
         Position {
             backend: self.backend,
@@ -182,14 +189,14 @@ pub struct SessionTarget {
     pub session: SessionId,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub enum AdminTarget {
-    Account(AccountId),
-    NewAccount(AccountId),
+    Account { id: AccountId, revision: u64 },
+    NewAccount(Email),
     Backend,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub enum LeaveFor {
     ChangePassword,
     DeleteHistory,
@@ -199,9 +206,16 @@ pub enum LeaveFor {
     },
 }
 
+/// The mutation and request number the password check authorizes.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct GrantIntent {
+    pub request_id: RequestId,
+    pub change: LeaveFor,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Leave {
-    purpose: LeaveFor,
+    intent: GrantIntent,
     life: u64,
     revision: u64,
     admin: bool,
@@ -212,7 +226,7 @@ pub struct Leave {
 
 impl Leave {
     pub fn stored(
-        purpose: LeaveFor,
+        intent: GrantIntent,
         life: u64,
         revision: u64,
         admin: bool,
@@ -221,7 +235,7 @@ impl Leave {
         hash: Fingerprint,
     ) -> Self {
         Self {
-            purpose,
+            intent,
             life,
             revision,
             admin,
@@ -231,9 +245,9 @@ impl Leave {
         }
     }
 
-    pub fn fields(&self) -> (LeaveFor, u64, u64, bool, u64, u64, &Fingerprint) {
+    pub fn fields(&self) -> (&GrantIntent, u64, u64, bool, u64, u64, &Fingerprint) {
         (
-            self.purpose,
+            &self.intent,
             self.life,
             self.revision,
             self.admin,

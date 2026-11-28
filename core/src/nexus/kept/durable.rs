@@ -544,7 +544,12 @@ pub struct Bearer<'a> {
     pub device: DeviceId,
     pub hash: &'a Fingerprint,
     /// Supplied by a grant-bearing request. Ordinary authenticated calls omit it.
-    pub grant: Option<&'a GrantSecret>,
+    pub grant: Option<GrantUse<'a>>,
+}
+
+pub struct GrantUse<'a> {
+    pub request_id: RequestId,
+    pub secret: &'a GrantSecret,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -569,6 +574,7 @@ pub struct MusicAuthorization {
     actor: Scope,
     session: SessionId,
     granted: u64,
+    request_id: RequestId,
     target: AccountId,
     target_revision: u64,
     next_count: u64,
@@ -795,19 +801,19 @@ impl Turn<'_> {
     pub fn check_leave(
         self,
         bearer: Bearer<'_>,
-        for_what: LeaveFor,
+        intent: GrantIntent,
         expected: Fingerprint,
     ) -> Result<PasswordCheck, Denied> {
         let session = self
             .account
             .session(bearer.device, bearer.hash, self.now)?
             .id;
-        if matches!(for_what, LeaveFor::Admin { .. }) && !self.account.state.admin {
+        if matches!(&intent.change, LeaveFor::Admin { .. }) && !self.account.state.admin {
             return Err(Denied::AdminRequired);
         }
         Ok(PasswordCheck::new(
             self.account.scope(bearer.device)?,
-            Purpose::Leave { session, for_what },
+            Purpose::Leave { session, intent },
             expected,
             self.now,
             true,
@@ -829,7 +835,7 @@ impl Turn<'_> {
         device.expire(self.now)?;
         let scope = self.account.state.scope(device);
         let checked = receipt.checked();
-        let Purpose::Leave { session, for_what } = receipt.consume(&scope, self.now)? else {
+        let Purpose::Leave { session, intent } = receipt.consume(&scope, self.now)? else {
             return Err(Denied::WrongPurpose);
         };
         let row = device
@@ -837,14 +843,14 @@ impl Turn<'_> {
             .as_mut()
             .filter(|s| s.id == session)
             .ok_or(Denied::NotSignedIn)?;
-        if matches!(for_what, LeaveFor::Admin { .. }) && !self.account.state.admin {
+        if matches!(&intent.change, LeaveFor::Admin { .. }) && !self.account.state.admin {
             return Err(Denied::AdminRequired);
         }
         device.last_leave = next(device.last_leave)?;
         // The design does not say how simultaneous leave for different operations
         // interacts. Retain just one, and spend it on a single matching change.
         row.leave = Some(Leave::stored(
-            for_what,
+            intent,
             scope.life,
             scope.revision,
             self.account.state.admin,
@@ -945,16 +951,15 @@ impl Turn<'_> {
         let revision = self.account.state.revision;
         let admin = self.account.state.admin;
         let session = self.account.session(bearer.device, bearer.hash, self.now)?;
-        let hash = bearer
-            .grant
-            .map(|grant| Fingerprint::of(grant.expose_bytes()))
-            .ok_or(Denied::LeaveRequired)?;
+        let offered = bearer.grant.ok_or(Denied::LeaveRequired)?;
+        let hash = Fingerprint::of(offered.secret.expose_bytes());
         if !session.leave.as_ref().is_some_and(|leave| {
             leave.hash == hash
                 && leave.life == life
                 && leave.revision == revision
                 && leave.admin == admin
-                && leave.purpose == purpose
+                && leave.intent.change == purpose
+                && leave.intent.request_id == offered.request_id
                 && within(leave.granted, self.now, PASSWORD_LEAVE_MS)
         }) {
             return Err(Denied::LeaveRequired);
@@ -1010,6 +1015,7 @@ impl Turn<'_> {
         {
             return Err(Denied::WrongPurpose);
         }
+        let named = target_state.admin_target();
         let target = target_state.id;
         let target_revision = target_state.revision;
         let next_count = next(target_state.music_login)?;
@@ -1019,7 +1025,7 @@ impl Turn<'_> {
             bearer,
             LeaveFor::Admin {
                 action: AdminAction::MusicLoginChanged,
-                target: AdminTarget::Account(target),
+                target: named,
             },
         )?;
         let session = self.account.session(device, hash, self.now)?.id;
@@ -1027,6 +1033,7 @@ impl Turn<'_> {
             actor: self.account.scope(device)?,
             session,
             granted: grant.granted,
+            request_id: grant.intent.request_id,
             target,
             target_revision,
             next_count,
@@ -1050,6 +1057,7 @@ impl Turn<'_> {
         if !self.account.state.admin
             || self.account.scope(bearer.device)? != auth.actor
             || session != auth.session
+            || bearer.grant.map(|grant| grant.request_id) != Some(auth.request_id)
             || !within(auth.granted, self.now, PASSWORD_LEAVE_MS)
         {
             return Err(Denied::LeaveRequired);
@@ -1101,12 +1109,12 @@ impl Turn<'_> {
         self.consume_leave(
             bearer,
             LeaveFor::Admin {
-                action,
-                target: named,
+                action: action.clone(),
+                target: named.clone(),
             },
         )?;
-        let selected = target.as_deref().unwrap_or(self.account).state.id;
-        if !action.matches_target(named, selected, target.is_some()) {
+        let selected = &target.as_deref().unwrap_or(self.account).state;
+        if !action.matches_target(&named, selected, target.is_some()) {
             return Err(Denied::WrongPurpose);
         }
         if let Some(target) = target {
@@ -1175,7 +1183,7 @@ fn force_out(
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub enum AdminAction {
     SetOn(bool),
     DeleteAccount,
@@ -1184,20 +1192,20 @@ pub enum AdminAction {
     ForceOut(SessionTarget),
     MusicLoginChanged,
     CreateAccount,
-    SetMusicAddress,
-    SetDiagnosticsDefault,
-    SetRequests,
+    SetMusicAddress(MusicAddress),
+    SetDiagnosticsDefault(bool),
+    SetRequests(bool),
     SetLidarr,
 }
 
 impl AdminAction {
-    fn matches_target(self, target: AdminTarget, selected: AccountId, other: bool) -> bool {
+    fn matches_target(&self, target: &AdminTarget, selected: &AccountState, other: bool) -> bool {
         match self {
             Self::CreateAccount => matches!(target, AdminTarget::NewAccount(_)) && !other,
-            Self::SetMusicAddress | Self::SetDiagnosticsDefault | Self::SetLidarr => {
-                target == AdminTarget::Backend && !other
+            Self::SetMusicAddress(_) | Self::SetDiagnosticsDefault(_) | Self::SetLidarr => {
+                *target == AdminTarget::Backend && !other
             }
-            _ => target == AdminTarget::Account(selected),
+            _ => *target == selected.admin_target(),
         }
     }
 }
@@ -1272,9 +1280,9 @@ fn admin_change(
         AdminAction::ForceOut(device) => force_out(account, device, music)?,
         AdminAction::MusicLoginChanged => return Err(Denied::WrongPurpose),
         AdminAction::CreateAccount
-        | AdminAction::SetMusicAddress
-        | AdminAction::SetDiagnosticsDefault
-        | AdminAction::SetRequests
+        | AdminAction::SetMusicAddress(_)
+        | AdminAction::SetDiagnosticsDefault(_)
+        | AdminAction::SetRequests(_)
         | AdminAction::SetLidarr => *change = DataChange::ApplyAdmin { action, target },
     }
     Ok(())

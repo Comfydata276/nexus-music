@@ -13,7 +13,7 @@ pub(super) enum Purpose {
     },
     Leave {
         session: SessionId,
-        for_what: LeaveFor,
+        intent: GrantIntent,
     },
     RedeemCode {
         secret: Fingerprint,

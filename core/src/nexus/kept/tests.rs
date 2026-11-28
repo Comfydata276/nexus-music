@@ -252,7 +252,7 @@ impl Stored {
         at: u64,
     ) -> Result<PasswordReceipt, Denied> {
         let binding = self.step(at, |turn| {
-            turn.check_leave(bearer(id, &hash(n)), purpose, hash(42))
+            turn.check_leave(bearer(id, &hash(n)), intent(purpose), hash(42))
         })?;
         binding.check(hash(42), clock(at, self.mark))
     }
@@ -271,6 +271,24 @@ impl Stored {
     }
 }
 
+pub(super) fn req(number: u64) -> RequestId {
+    RequestId::new(number).unwrap()
+}
+
+pub(super) fn intent(change: LeaveFor) -> GrantIntent {
+    GrantIntent {
+        request_id: req(1),
+        change,
+    }
+}
+
+pub(super) fn grant_use(secret: &GrantSecret) -> GrantUse<'_> {
+    GrantUse {
+        request_id: req(1),
+        secret,
+    }
+}
+
 pub(super) fn grant() -> &'static GrantSecret {
     static SECRET: std::sync::OnceLock<GrantSecret> = std::sync::OnceLock::new();
     SECRET.get_or_init(|| GrantSecret::from_bytes([14; SECRET_BYTES]))
@@ -280,7 +298,7 @@ pub(super) fn bearer(device: u64, hash: &Fingerprint) -> Bearer<'_> {
     Bearer {
         device: dev(device),
         hash,
-        grant: Some(grant()),
+        grant: Some(grant_use(grant())),
     }
 }
 
@@ -698,7 +716,7 @@ fn a_grant_secret_cannot_be_omitted_or_spend_its_replacement() -> Result<(), Den
     let replacement = GrantSecret::from_bytes([15; SECRET_BYTES]);
     let receipt = s.leave_receipt(1, 1, LeaveFor::DeleteHistory, 1)?;
     s.step(1, |turn| turn.grant_leave(receipt, &replacement))?;
-    for grant in [None, Some(grant())] {
+    for grant in [None, Some(grant_use(grant()))] {
         assert_eq!(
             s.step(1, |turn| turn.delete_history(Bearer {
                 device: dev(1),
@@ -713,7 +731,7 @@ fn a_grant_secret_cannot_be_omitted_or_spend_its_replacement() -> Result<(), Den
         turn.delete_history(Bearer {
             device: dev(1),
             hash: &hash(1),
-            grant: Some(&replacement),
+            grant: Some(grant_use(&replacement)),
         })
     })?;
     assert_eq!(s.apart.account.life, 2);
@@ -758,7 +776,7 @@ fn a_note_only_ends_its_session_and_ordinary_sign_out_preserves_the_known_door()
     assert_eq!(
         s.step(1, |t| t.check_leave(
             bearer(1, &note),
-            LeaveFor::DeleteHistory,
+            intent(LeaveFor::DeleteHistory),
             hash(42)
         ))
         .err(),
