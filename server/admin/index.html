@@ -593,33 +593,44 @@ dd, li { overflow-wrap: anywhere; }
     const buttons = document.createElement("div");
     buttons.className = "row-actions";
 
-    const enabled = !row.enabled;
-    const switchLabel = enabled ? "Switch account on" : "Switch account off";
-    const admin = !row.admin;
-    const roleLabel = admin ? "Make administrator" : "Remove administrator access";
-    buttons.append(
-      makeButton(switchLabel, () => {
+    const own = account === session.account;
+    if (own) {
+      const note = document.createElement("p");
+      writeText(note, "You can’t switch off, remove or take away administrator access from the account you’re signed in with.");
+      entry.append(note);
+    } else {
+      const enabled = !row.enabled;
+      const switchLabel = enabled ? "Switch account on" : "Switch account off";
+      buttons.append(makeButton(switchLabel, () => {
         const body = { account, enabled };
         reviewChange("set-account-enabled", body, body, switchLabel,
           enabled ? "Let " + person + " sign in again." : "Sign out " + person + " on all devices and stop them signing in.",
           { saved: enabled ? "Account switched on. They can sign in again." : "Account switched off.",
             refresh: "accounts-and-devices" });
-      }),
+      }));
+    }
+    buttons.append(
       makeButton("Set music sign-in", () => openLogin(account, person)),
       makeButton("Reset password", () => reviewChange("reset-password", { account }, account, "Reset password",
         "Reset the password for " + person + ". They’ll need the new code to sign in again.",
         { code: true, saved: "Password reset.", refresh: "accounts" })),
-      makeButton(roleLabel, () => {
-        const body = { account, admin };
-        reviewChange("set-admin", body, body, roleLabel,
-          (admin ? "Let " : "Stop ") + person + (admin ? " manage this server." : " from managing this server."),
-          { saved: admin ? "Administrator access added." : "Administrator access removed.", refresh: "accounts" });
-      }),
-      makeButton("Remove account", () => reviewChange("delete-account", { account }, account, "Remove account",
-        "Remove " + person + " and their listening history from Nexus.",
-        { note: "Any copy already downloaded stays where it was saved. You can’t undo this here.",
-          saved: "Account removed.", refresh: "accounts-and-devices" }), true),
     );
+    if (!own) {
+      const admin = !row.admin;
+      const roleLabel = admin ? "Make administrator" : "Remove administrator access";
+      buttons.append(
+        makeButton(roleLabel, () => {
+          const body = { account, admin };
+          reviewChange("set-admin", body, body, roleLabel,
+            (admin ? "Let " : "Stop ") + person + (admin ? " manage this server." : " from managing this server."),
+            { saved: admin ? "Administrator access added." : "Administrator access removed.", refresh: "accounts" });
+        }),
+        makeButton("Remove account", () => reviewChange("delete-account", { account }, account, "Remove account",
+          "Remove " + person + " and their listening history from Nexus.",
+          { note: "Any copy already downloaded stays where it was saved. You can’t undo this here.",
+            saved: "Account removed.", refresh: "accounts-and-devices" }), true),
+      );
+    }
     menu.append(summary, buttons);
     entry.append(menu);
 
