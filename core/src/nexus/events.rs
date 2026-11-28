@@ -403,7 +403,7 @@ fn bad_message(error: Wrong) -> BadMessage {
     }
 }
 
-fn text_ok(text: &str) -> bool {
+pub(super) fn text_ok(text: &str) -> bool {
     text.chars().take(TEXT_CHARS + 1).count() <= TEXT_CHARS
         && !text.chars().any(char::is_control)
 }

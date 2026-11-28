@@ -48,7 +48,7 @@ pub const INCOMING: &str = "nexus.db.incoming";
 /// "NXMS": the mark that the file is the Nexus server's data.
 pub const APPLICATION_ID: i64 = 0x4e58_4d53;
 /// The form this program writes and reads.
-pub const FORM: i64 = 1;
+pub const FORM: i64 = MIGRATIONS[MIGRATIONS.len() - 1].form;
 /// How long a step waits for another connection's lock.
 pub const BUSY: Duration = Duration::from_secs(5);
 
@@ -65,6 +65,8 @@ pub const BUSY: Duration = Duration::from_secs(5);
 /// step as the account's life moves on (a trigger) unless they are held (12.5); and its
 /// Diagnostics reports (S7, 14); and for requests (S13, written by it through `write_data`):
 /// their jobs and each job's lines, who asked for each release at which Lidarr (`binding`),
+/// with what the history shows of it and whether their ask put it on the list (`placed`, once
+/// set never cleared: only that gives the right to take it off, 16.1),
 /// and what is kept to undo an artist's setting. The switch for requests and the Lidarr key
 /// are authority, and are in the store kept apart alone. No
 /// password, code or session is kept but as a fingerprint; a music login only sealed.
@@ -232,7 +234,27 @@ pub struct Migration {
 }
 
 /// Every form this program knows, in order. A later slice adds its own at the end.
-pub const MIGRATIONS: &[Migration] = &[Migration { form: 1, sql: FORM_1 }];
+pub const MIGRATIONS: &[Migration] = &[
+    Migration { form: 1, sql: FORM_1 },
+    Migration { form: 2, sql: FORM_2 },
+    Migration {
+        form: 3,
+        sql: "CREATE INDEX listening_by_time ON listening_events(at_ms DESC, row_id DESC) WHERE is_start = 1;",
+    },
+];
+
+/// Form 2 (S13, for the audit's B-M1): the asked history keeps what it shows of each release
+/// (`metadata`) and whether this person's ask put it on the list (`placed`, once set never
+/// cleared). From form 1, as `4097756` made it: rows asked before have empty metadata and no
+/// placement (so no one may take those off by their own right).
+const FORM_2: &str = "
+ALTER TABLE requests_owners ADD COLUMN metadata BLOB NOT NULL DEFAULT x'';
+ALTER TABLE requests_owners ADD COLUMN placed INTEGER NOT NULL DEFAULT 0 CHECK (placed IN (0, 1));
+CREATE TRIGGER requests_owners_placed_stays BEFORE UPDATE OF placed ON requests_owners
+WHEN OLD.placed = 1 AND NEW.placed = 0 BEGIN
+    SELECT RAISE(ABORT, 'a placement once recorded is never cleared');
+END;
+";
 
 /// The data, open, with its settings set and its form checked.
 pub struct Data {
@@ -409,24 +431,17 @@ impl Data {
         }
     }
 
-    /// Copies the data first (11.2), then changes its form in one step.
+    /// Copies the data first (11.2, and the backend's own copy an update needs to go back
+    /// with), then brings its form forward a step at a time: each step one transaction, the
+    /// form's number moved in it. A step that fails changes nothing and stops the start, naming
+    /// the forms; steps before it stay done (each whole), and the next start goes on from there.
     fn migrate(&mut self, folder: &Path, form: i64, known: &[Migration], now: u64) -> Result<(), String> {
         let copy = crate::store::copies::before_form(folder, &self.connection, form, now)?;
         let what = format!("The data at {}", self.path.display());
-        let changed = (|| -> rusqlite::Result<()> {
-            let step = self.connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
-            for migration in known.iter().filter(|migration| migration.form > form) {
-                step.execute_batch(migration.sql)?;
-            }
-            step.execute_batch(&format!("PRAGMA user_version = {};", known.last().map_or(form, |migration| migration.form)))?;
-            crash::point("data: before commit").map_err(io_error)?;
-            step.commit()?;
-            crash::point("data: committed").map_err(io_error)
-        })();
-        changed.map_err(|error| {
-            format!("{what} couldn't be changed from form {form}: {}. It is as it was; a copy made before is {}.", why(&error), copy.display())
+        let to = forward(&mut self.connection, form, known).map_err(|(step, error)| {
+            format!("{what} couldn't be brought from form {} to form {step}: {}. That step changed nothing; a copy made before is {}. Nothing is served.", step - 1, why(&error), copy.display())
         })?;
-        println!("The data's form was changed from {form} to {}; a copy made before is {}.", known.last().map_or(form, |m| m.form), copy.display());
+        println!("The data's form was brought forward from {form} to {to}; a copy made before is {}.", copy.display());
         Ok(())
     }
 
@@ -943,6 +958,40 @@ impl Change<'_> {
         }
         Ok(())
     }
+}
+
+/// Brings an open database of an older form forward, a step at a time: each step one
+/// transaction with `user_version` moved in it. The form it reached, or the step that failed
+/// (which changed nothing) and why.
+fn forward(connection: &mut Connection, from: i64, known: &[Migration]) -> Result<i64, (i64, rusqlite::Error)> {
+    let mut form = from;
+    for migration in known.iter().filter(|migration| migration.form > from) {
+        let stepped = (|| -> rusqlite::Result<()> {
+            let step = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+            step.execute_batch(migration.sql)?;
+            step.execute_batch(&format!("PRAGMA user_version = {};", migration.form))?;
+            crash::point("data: before commit").map_err(io_error)?;
+            step.commit()?;
+            crash::point("data: committed").map_err(io_error)
+        })();
+        stepped.map_err(|error| (migration.form, error))?;
+        form = migration.form;
+    }
+    Ok(form)
+}
+
+/// A put-back's staged copy of an older form, brought forward in place before it is read
+/// for planning (the copy it was made from is untouched). Newer forms are refused by the
+/// form check before this.
+pub fn bring_forward(path: &Path) -> Result<(), String> {
+    let what = format!("The staged copy at {}", path.display());
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_URI;
+    let mut connection = Connection::open_with_flags(path, flags).map_err(|error| format!("{what} can't be opened: {}.", why(&error)))?;
+    connection.busy_timeout(BUSY).map_err(|error| format!("{what} can't be opened: {}.", why(&error)))?;
+    let form = check_form(&connection, &what, MIGRATIONS)?;
+    forward(&mut connection, form, MIGRATIONS).map_err(|(step, error)| format!("{what} couldn't be brought to form {step}: {}.", why(&error)))?;
+    connection.close().map_err(|(_, error)| format!("{what} can't be closed: {}.", why(&error)))?;
+    fs::File::open(path).and_then(|file| file.sync_all()).map_err(|error| format!("{what} couldn't be made lasting ({}).", error.kind()))
 }
 
 /// Removes what a cut making of the data left behind (only files of its own making name).

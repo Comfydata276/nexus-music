@@ -162,6 +162,67 @@ fn a_container_address_given_as_https_is_asked_with_a_certificate_this_machine_t
     });
 }
 
+/// A connection whose closing never ends (as a TLS stream's does when its last record cannot
+/// be written to a peer that has stopped reading): it says when it is let go.
+struct Stuck {
+    inner: tokio::io::DuplexStream,
+    let_go: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl tokio::io::AsyncRead for Stuck {
+    fn poll_read(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for Stuck {
+    fn poll_write(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Pending
+    }
+}
+
+impl Drop for Stuck {
+    fn drop(&mut self) {
+        self.let_go.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// S9-3's guard itself (the lead's ask): when a question is given up at its deadline, the
+/// connection is let go even if closing it would never end. hyper ends its connection's driver
+/// on its own once the question is dropped, by closing it, which ends at once on a plain socket
+/// (so the tests over real sockets pass without the guard); here closing never ends, and only
+/// the guard (`Driving`, aborted when the exchange is dropped) lets the connection go.
+#[test]
+fn a_connection_whose_closing_never_ends_is_let_go_when_the_question_is_given_up() {
+    runtime().block_on(async {
+        let (ours, mut theirs) = tokio::io::duplex(64 * 1024);
+        let let_go = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stuck = Stuck { inner: ours, let_go: let_go.clone() };
+        // The peer takes the question and says nothing, holding its end.
+        let peer = tokio::spawn(async move {
+            request(&mut theirs).await;
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(theirs);
+        });
+        let asked = tokio::time::timeout(Duration::from_millis(300), exchange(stuck, "music.example.test", "/rest/ping", Bytes::from_static(b"f=json"))).await;
+        assert!(asked.is_err(), "answered: {asked:?}");
+        let started = std::time::Instant::now();
+        while !let_go.load(std::sync::atomic::Ordering::SeqCst) && started.elapsed() < Duration::from_secs(2) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(let_go.load(std::sync::atomic::Ordering::SeqCst), "the connection was held after the question was given up");
+        peer.abort();
+    });
+}
+
 /// S9-3 (the review of S9): a music server that sends part of an answer and then holds the
 /// connection open gives no answer within the client's time, and the connection is closed
 /// from this side as soon as the question is given up: nothing of it is left running.

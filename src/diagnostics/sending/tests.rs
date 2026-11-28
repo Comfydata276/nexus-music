@@ -1,11 +1,41 @@
 use super::*;
-use crate::diagnostics::{ReportStore, Session, record_path, save_text, tests::TestFolder};
+use crate::diagnostics::{ReportStore, Session, export_report, preview_text, record_path, tests::TestFolder};
 use nexus_core::nexus::{
     account::{AccountId, DeviceKind, Name, Session as NexusSession},
     client::{AnswerBody, App, Ask, Client, Do, Given, JournalDo, Keep, Random, Saved},
     proto::{self, SPEAKS, Version},
 };
-use std::fs;
+use std::{fs, sync::{Mutex, mpsc}, time::Duration};
+
+// The production worker owns one profile. Keep tests that exercise its whole queue
+// from interleaving their different temporary profiles.
+static WORKER_FIXTURE: Mutex<()> = Mutex::new(());
+
+fn queued_read(paths: &config::Paths, number: u64) -> Happened {
+    let (send, receive) = mpsc::channel();
+    read(Some(paths.clone()), number, move |reply| send.send(reply).unwrap());
+    receive.recv_timeout(Duration::from_secs(10)).expect("Diagnostics read must answer")
+}
+
+fn session() -> Session {
+    Session {
+        about: Session::about(&config::Settings { server: NEXUS.into(), ..Default::default() }, true),
+        observations: diag::Record::default(),
+    }
+}
+
+fn local_reports(paths: &config::Paths) -> io::Result<String> {
+    let paths = paths.clone();
+    let (sent, received) = mpsc::channel();
+    on_worker(move || {
+        let preview = preview_text(&paths, session());
+        let export = export_report(&paths, session());
+        sent.send((preview, export)).unwrap();
+    });
+    let (preview, export) = received.recv_timeout(Duration::from_secs(10)).unwrap();
+    export?;
+    Ok(preview)
+}
 
 const START: u64 = 1_700_000_000_000;
 const NEXUS: &str = "https://diagnostics.example.invalid";
@@ -80,11 +110,7 @@ fn read_number(actions: &[Do]) -> Option<u64> {
 }
 
 fn fixture_report(paths: &config::Paths) -> io::Result<()> {
-    let session = Session {
-        about: Session::about(&config::Settings { server: NEXUS.into(), ..Default::default() }, true),
-        observations: diag::Record::default(),
-    };
-    ReportStore::default().checkpoint(&record_path(paths), session)
+    ReportStore::default().checkpoint(&record_path(paths), session())
 }
 
 #[test]
@@ -179,7 +205,7 @@ fn a_fault_does_not_send_without_a_signed_in_account() {
     assert!(asking(&actions, diag::SEND_PATH).is_none());
 }
 
-fn due_read(client: &mut Client, paths: &config::Paths) -> io::Result<(u64, Given)> {
+fn due_read(client: &mut Client) -> (u64, Given, DiagSchedule) {
     client.happened(Happened::DiagnosticsFault { at_ms: START }, &given(START));
     let early = client.happened(Happened::Tick, &given(START + diag::FAULT_WAIT_MS - 1));
     assert!(read_number(&early).is_none());
@@ -190,8 +216,7 @@ fn due_read(client: &mut Client, paths: &config::Paths) -> io::Result<(u64, Give
         panic!("the schedule must be kept before the read: {actions:?}");
     };
     assert_eq!(schedule.attempts, [due.now_ms]);
-    save_schedule(&schedule_path(paths), Some(schedule))?;
-    Ok((*read, due))
+    (*read, due, schedule.clone())
 }
 
 #[test]
@@ -203,7 +228,8 @@ fn the_profiles_choice_and_attempt_survive_a_client_restart() -> io::Result<()> 
     load_kept(&paths, &mut kept);
     assert_eq!(kept.diagnostics, Some(true));
     let mut client = start(Some(false), kept, START);
-    let (_, due) = due_read(&mut client, &paths)?;
+    let (_, due, schedule) = due_read(&mut client);
+    save_schedule(&schedule_path(&paths), Some(&schedule))?;
 
     let mut kept = Kept { saved: Some(saved()), ..Kept::default() };
     load_kept(&paths, &mut kept);
@@ -221,16 +247,35 @@ fn the_profiles_choice_and_attempt_survive_a_client_restart() -> io::Result<()> 
 }
 
 #[test]
-fn the_reader_always_answers_and_requires_a_kept_attempt_and_readable_record() -> io::Result<()> {
+fn the_worker_requires_a_saved_schedule_before_returning_diagnostics() -> io::Result<()> {
+    let _worker = WORKER_FIXTURE.lock().unwrap();
     let temp = TestFolder::new()?;
     let paths = temp.paths();
-    fixture_report(&paths)?;
+    fs::write(&paths.crash_log, "1700000000000\tFault in app: no panic payload\n")?;
+    let preview = local_reports(&paths)?;
+    assert!(preview.contains("Fault in app: no panic payload"));
+    assert_eq!(fs::read(&paths.diagnostics)?, preview.as_bytes());
+
     let schedule = DiagSchedule { started_ms: START, fault_ms: None, attempts: vec![START] };
-    let kept = save_schedule(&paths.settings.join("missing-folder"), Some(&schedule)).is_ok();
-    assert!(!kept);
-    assert!(matches!(read_for_machine(Some(&paths), 5, kept), Happened::DiagnosticsRead { read: 5, text: None }));
+    let path = schedule_path(&paths);
+    keep_schedule(&paths, Some(schedule.clone()));
+    assert!(matches!(queued_read(&paths, 4), Happened::DiagnosticsRead { read: 4, text: Some(text) } if text == preview));
+    fs::remove_file(&path)?;
+    fs::create_dir(&path)?;
+
+    let mut client = start(Some(true), Kept { saved: Some(saved()), ..Kept::default() }, START);
+    let (read, due, attempt) = due_read(&mut client);
+    keep_schedule(&paths, Some(attempt));
+    let answer = queued_read(&paths, read);
+    assert!(matches!(&answer, Happened::DiagnosticsRead { read: number, text: None } if *number == read));
+    assert!(asking(&client.happened(answer, &due), diag::SEND_PATH).is_none());
+
+    fs::remove_dir(&path)?;
+    keep_schedule(&paths, Some(schedule.clone()));
+    assert!(matches!(queued_read(&paths, 8), Happened::DiagnosticsRead { read: 8, text: Some(_) }));
+    assert_eq!(read_profile::<DiagSchedule>(&path, 2_048)?, Some(schedule));
     fs::write(record_path(&paths), "a name or address would fail C6 validation")?;
-    assert!(matches!(read_for_machine(Some(&paths), 9, true), Happened::DiagnosticsRead { read: 9, text: None }));
+    assert!(matches!(queued_read(&paths, 9), Happened::DiagnosticsRead { read: 9, text: None }));
     Ok(())
 }
 
@@ -254,7 +299,6 @@ fn the_record_keeps_typed_observations_across_restart() -> io::Result<()> {
 fn e13a_receives_the_same_bytes_as_preview_and_export() -> io::Result<()> {
     use std::io::{BufRead, BufReader};
     use std::process::{Child, Command, Stdio};
-    use std::time::Duration;
 
     struct StandIn(Child);
     impl Drop for StandIn {
@@ -264,13 +308,12 @@ fn e13a_receives_the_same_bytes_as_preview_and_export() -> io::Result<()> {
         }
     }
 
+    let _worker = WORKER_FIXTURE.lock().unwrap();
     let temp = TestFolder::new()?;
     let paths = temp.paths();
-    fixture_report(&paths)?;
     fs::write(&paths.crash_log, "1700000000000\tFault in app: no panic payload\n")?;
-    let preview = report_text(&paths)?;
+    let preview = local_reports(&paths)?;
     assert!(preview.contains("Fault in app: no panic payload"));
-    save_text(&paths, &preview)?;
 
     let received = paths.settings.with_file_name("received.json");
     let mut standin = StandIn(Command::new("python3")
@@ -289,8 +332,9 @@ fn e13a_receives_the_same_bytes_as_preview_and_export() -> io::Result<()> {
     let body = agent.get(format!("{origin}{}", proto::HELLO)).call().unwrap()
         .body_mut().read_to_vec().unwrap();
     accept_hello(&mut client, hello, body, START);
-    let (read, due) = due_read(&mut client, &paths)?;
-    let answer = read_for_machine(Some(&paths), read, true);
+    let (read, due, schedule) = due_read(&mut client);
+    keep_schedule(&paths, Some(schedule));
+    let answer = queued_read(&paths, read);
     assert!(matches!(&answer, Happened::DiagnosticsRead { text: Some(text), .. } if text == &preview));
     let actions = client.happened(answer, &due);
     let ask = asking(&actions, diag::SEND_PATH).unwrap();
