@@ -1,6 +1,6 @@
 //! The journal's sole writer. This thread owns ordering, retention and recovery.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -18,8 +18,33 @@ use events::{EventId, FileTail, JournalFile, KeptFile, Loss, LossCounts, Record}
 
 const RESERVATION: u64 = 64;
 const POLL: Duration = Duration::from_millis(150);
+const FIRST_RETRY: Duration = Duration::from_millis(500);
+const MAX_RETRY: Duration = Duration::from_secs(30);
+
+#[derive(Default)]
+struct Retry {
+    at: Option<Instant>,
+    delay: Option<Duration>,
+}
+
+impl Retry {
+    fn ready(&self, now: Instant) -> bool {
+        self.at.is_none_or(|at| now >= at)
+    }
+
+    fn failed(&mut self, now: Instant) {
+        let delay = self.delay.map_or(FIRST_RETRY, |delay| (delay * 2).min(MAX_RETRY));
+        self.delay = Some(delay);
+        self.at = Some(now + delay);
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
 
 #[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
 struct State {
     reserved: u64,
     loss: LossCounts,
@@ -263,7 +288,12 @@ fn retention(directory: &JournalDirectory, life: u64) -> io::Result<events::Remo
 impl Writer {
     fn open(root: PathBuf) -> io::Result<Self> {
         clear_leftovers(&root, |name| name == "state.json", &[]);
-        let mut state: State = read_json(&root.join("state.json"))?.unwrap_or_default();
+        let path = root.join("state.json");
+        let mut state: State = match read_json(&path) {
+            Ok(state) => state.unwrap_or_default(),
+            Err(error) if error.kind() == io::ErrorKind::InvalidData && crate::config::set_aside(&path).is_some() => State::default(),
+            Err(error) => return Err(error),
+        };
         if state.reserved == 0 {
             state.reserved = kept_high_water(&root)?;
         }
@@ -483,13 +513,8 @@ impl Writer {
         match message {
             Message::Event(scope, observation) => {
                 let new_scope = self.current.as_ref().is_none_or(|current| current.scope != scope);
-                if new_scope {
-                    let directory = JournalDirectory::new(&self.root, scope.account);
-                    let known_life: Option<u64> = read_json(&directory.life())?;
-                    if known_life.is_some_and(|life| life > scope.life) {
-                        return Ok(());
-                    }
-                    self.activate(scope)?;
+                if new_scope && !self.activate_current_life(scope)? {
+                    return Ok(());
                 }
                 let Some(mut current) = self.current.take() else { return Err(invalid(())) };
                 let record = Record::new(observation.id, observation.at, observation.kind).map_err(invalid);
@@ -500,6 +525,7 @@ impl Writer {
                 }
                 result.map(drop)
             }
+            Message::Wake => Ok(()),
             Message::Checkpoint(scope, start, position) => {
                 if let Some(current) = self.current.as_ref().filter(|current| current.scope == scope) {
                     write_json(&current.directory.checkpoint(), &Checkpoint {
@@ -509,6 +535,23 @@ impl Writer {
                 Ok(())
             }
         }
+    }
+
+    fn activate_current_life(&mut self, scope: Scope) -> io::Result<bool> {
+        if self.current.as_ref().is_some_and(|current| current.scope == scope) {
+            return Ok(true);
+        }
+        let directory = JournalDirectory::new(&self.root, scope.account);
+        let known_life: Option<u64> = read_json(&directory.life())?;
+        if known_life.is_some_and(|life| life > scope.life) {
+            return Ok(false);
+        }
+        self.activate(scope)?;
+        Ok(true)
+    }
+
+    fn recovery_pending(&self) -> bool {
+        self.state.pending.is_some() || self.state.resending.is_some()
     }
 
     fn waiting(&self) -> Option<Waiting> {
@@ -524,12 +567,7 @@ impl Writer {
         self.complete_change()?;
         self.complete_resend()?;
         match *update {
-            Update::ScopeChanged(Some(scope)) => {
-                if self.current.as_ref().is_none_or(|current| current.scope != scope) {
-                    self.activate(scope)?;
-                }
-            }
-            Update::ScopeChanged(None) => {}
+            Update::ScopeChanged(_) => {}
             Update::LifeMoved(scope) => {
                 let directory = JournalDirectory::new(&self.root, scope.account);
                 let prior: Option<u64> = read_json(&directory.life())?;
@@ -666,6 +704,58 @@ impl Writer {
     }
 }
 
+struct QueuedChange {
+    request: ChangeRequest,
+    retry: Retry,
+}
+
+fn changes_overlap(first: &Update, second: &Update) -> bool {
+    fn target(update: &Update) -> Option<([u8; 16], Option<u64>)> {
+        match *update {
+            Update::Settle(scope, ..) | Update::LifeMoved(scope) =>
+                Some((scope.account.backend, Some(scope.account.number))),
+            Update::ResendAll(backend) => Some((backend, None)),
+            Update::ScopeChanged(_) => None,
+        }
+    }
+
+    match (target(first), target(second)) {
+        (Some((a, first)), Some((b, second))) => {
+            a == b && (first.is_none() || second.is_none() || first == second)
+        }
+        _ => false,
+    }
+}
+
+fn apply_changes(writer: &mut Writer, queue: &mut VecDeque<QueuedChange>, now: Instant) -> bool {
+    let mut blocked = VecDeque::<QueuedChange>::new();
+    let mut changed = false;
+    while let Some(mut next) = queue.pop_front() {
+        if !writer.recovery_pending() && next.retry.ready(now) && !blocked.iter()
+            .any(|earlier| changes_overlap(&earlier.request.update, &next.request.update))
+        {
+            if writer.update(&next.request.update).is_ok() {
+                if let Some(finished) = next.request.finished {
+                    let _ = finished.send(());
+                }
+                changed = true;
+                continue;
+            }
+            next.retry.failed(now);
+        }
+        blocked.push_back(next);
+    }
+    *queue = blocked;
+    changed
+}
+
+fn retry_recording(recording: &mut Option<(Scope, Retry)>, scope: Scope) -> &mut (Scope, Retry) {
+    if recording.as_ref().is_none_or(|(account, _)| *account != scope) {
+        *recording = Some((scope, Retry::default()));
+    }
+    recording.as_mut().expect("the scope was just set")
+}
+
 pub(super) fn run(
     root: PathBuf,
     line: Receiver<Message>,
@@ -674,73 +764,148 @@ pub(super) fn run(
     counters: &Counters,
 ) {
     let mut writer = Writer::open(root.clone()).ok();
-    let mut last_totals = Instant::now();
+    let mut opening = Retry::default();
+    if writer.is_none() {
+        opening.failed(Instant::now());
+    }
+    let mut recover = Retry::default();
+    let mut recording = None::<(Scope, Retry)>;
+    let mut totals = Retry::default();
     let mut last_retention = Instant::now();
     let mut last_notice = None::<Instant>;
     let mut visible = None::<Scope>;
     let mut dirty = false;
-    let mut queued_updates = std::collections::VecDeque::new();
+    let mut queued_updates = VecDeque::new();
+    let mut message = Ok(Message::Wake);
+
     loop {
-        let message = line.recv_timeout(POLL);
+        let now = Instant::now();
         let closing = counters.closing.load(Ordering::Acquire);
         let done = matches!(message, Err(RecvTimeoutError::Disconnected))
             || (closing && matches!(message, Err(RecvTimeoutError::Timeout)));
-        if writer.is_none() {
-            writer = Writer::open(root.clone()).ok();
-        }
-        if let Some(writer) = &mut writer {
-            queued_updates.extend(updates.try_iter());
-            while let Some(request) = queued_updates.front() {
-                if let Update::ScopeChanged(scope) = &request.update {
-                    visible = *scope;
-                }
-                if writer.update(&request.update).is_err() {
-                    break;
-                }
-                if let Some(finished) = queued_updates.pop_front().and_then(|request| request.finished) {
-                    let _ = finished.send(());
-                }
+        for request in updates.try_iter() {
+            if let Update::ScopeChanged(scope) = request.update {
+                visible = scope;
                 dirty = true;
+                if let Ok(mut waiting) = current_waiting.lock() {
+                    *waiting = None;
+                }
+            } else {
+                queued_updates.push_back(QueuedChange { request, retry: Retry::default() });
             }
-            if let Ok(message) = message {
+        }
+
+        let unkept = |writer: Option<&Writer>| {
+            counters.dropped.load(Ordering::Relaxed) > writer.map_or(0, |writer| writer.persisted_drops)
+        };
+        if writer.is_none() && opening.ready(now) && (visible.is_some() || unkept(None)
+            || !queued_updates.is_empty() || matches!(message, Ok(Message::Event(..))))
+        {
+            writer = Writer::open(root.clone()).ok();
+            if writer.is_none() {
+                opening.failed(Instant::now());
+            }
+        }
+
+        if let Some(writer) = &mut writer {
+            if writer.recovery_pending() && recover.ready(now) {
+                if writer.complete_change().and_then(|_| writer.complete_resend()).is_ok() {
+                    recover.clear();
+                    dirty = true;
+                } else {
+                    recover.failed(Instant::now());
+                }
+            }
+            if !writer.recovery_pending() {
+                dirty |= apply_changes(writer, &mut queued_updates, now);
+                if writer.recovery_pending() {
+                    recover.failed(Instant::now());
+                }
+            }
+
+            if let Ok(message @ (Message::Event(scope, _) | Message::Checkpoint(scope, ..))) = message {
                 let event = matches!(message, Message::Event(..));
-                if writer.handle(message).is_err() && event {
-                    counters.drop_event();
+                let ready = recording.as_ref().is_none_or(|(account, retry)| *account != scope || retry.ready(now));
+                if writer.recovery_pending() || !ready {
+                    if event {
+                        counters.drop_event();
+                    }
+                } else if writer.handle(message).is_err() {
+                    if event {
+                        counters.drop_event();
+                    }
+                    let (_, retry) = retry_recording(&mut recording, scope);
+                    retry.failed(Instant::now());
+                    if writer.recovery_pending() {
+                        recover.failed(Instant::now());
+                    }
+                } else {
+                    recording = recording.filter(|(account, _)| *account != scope);
                 }
                 dirty |= event;
             }
-            if last_retention.elapsed() >= Duration::from_secs(60) {
-                if let Some(mut current) = writer.current.take() {
-                    if writer.prune(&mut current).is_ok() {
-                        writer.current = Some(current);
-                    }
+
+            if !writer.recovery_pending() && visible.is_some() && last_retention.elapsed() >= Duration::from_secs(60) {
+                if let Some(mut current) = writer.current.take()
+                    && writer.prune(&mut current).is_ok()
+                {
+                    writer.current = Some(current);
+                }
+                if writer.recovery_pending() {
+                    recover.failed(Instant::now());
                 }
                 last_retention = Instant::now();
                 dirty = true;
             }
-            if done || last_totals.elapsed() >= POLL {
-                let _ = writer.keep_losses(counters);
-                last_totals = Instant::now();
+            if unkept(Some(writer)) && (done || totals.ready(now)) {
+                if writer.keep_losses(counters).is_ok() {
+                    totals.clear();
+                } else {
+                    totals.failed(Instant::now());
+                }
             }
-            if dirty && (done || last_notice.is_none_or(|last| last.elapsed() >= Duration::from_secs(1))) {
+
+            let notice_due = dirty && (done || last_notice.is_none_or(|last| last.elapsed() >= Duration::from_secs(1)));
+            if notice_due && !writer.recovery_pending() {
                 if let Some(scope) = visible {
-                    if writer.current.as_ref().is_none_or(|current| current.scope != scope) {
-                        let _ = writer.activate(scope);
+                    let ready = recording.as_ref().is_none_or(|(account, retry)| *account != scope || retry.ready(now));
+                    if ready {
+                        if writer.activate_current_life(scope).is_err() {
+                            let (_, retry) = retry_recording(&mut recording, scope);
+                            retry.failed(Instant::now());
+                            if writer.recovery_pending() {
+                                recover.failed(Instant::now());
+                            }
+                        } else {
+                            recording = recording.filter(|(account, _)| *account != scope);
+                            dirty = false;
+                        }
                     }
+                } else {
+                    dirty = false;
                 }
                 if let Ok(mut waiting) = current_waiting.lock() {
                     *waiting = writer.waiting().filter(|waiting| Some(waiting.scope) == visible);
                 }
-                dirty = false;
                 last_notice = Some(Instant::now());
             }
             writer.publish_losses(counters);
         } else if matches!(message, Ok(Message::Event(..))) {
             counters.drop_event();
         }
+
         if done {
             break;
         }
+        message = if closing {
+            line.try_recv().map_err(|_| RecvTimeoutError::Timeout)
+        } else if visible.is_some() || !queued_updates.is_empty() || unkept(writer.as_ref())
+            || writer.as_ref().is_some_and(Writer::recovery_pending)
+        {
+            line.recv_timeout(POLL)
+        } else {
+            line.recv().map_err(|_| RecvTimeoutError::Disconnected)
+        };
     }
 }
 
@@ -1056,6 +1221,83 @@ mod tests {
         assert_eq!(events[0].record().id(), start_id);
         assert!(matches!(events[1].record().kind(), Kind::Stop { start, position_ms: Some(1_250), why: Stopped::Unknown, .. } if *start == start_id));
         assert_eq!(writer.state.damaged, 1);
+    }
+
+    #[test]
+    fn a_failed_change_backs_off_without_blocking_another_account() {
+        let folder = Folder::new();
+        let first = scope(7, 1, 1);
+        let other = scope(7, 2, 1);
+        let mut writer = Writer::open(folder.0.clone()).unwrap();
+        for (scope, id) in [(first, 1), (other, 2)] {
+            writer.handle(Message::Event(scope, open(id))).unwrap();
+        }
+        let path = JournalDirectory::new(&folder.0, first.account).outcomes(1);
+        fs::write(&path, b"bad sidecar").unwrap();
+        let mut queue = VecDeque::new();
+        let mut receipts = Vec::new();
+        for (scope, id) in [(first, 1), (first, 1), (other, 2)] {
+            let (finished, receipt) = mpsc::channel();
+            let update = Update::Settle(scope, vec![open(id).id], Settlement::Taken(now_ms()));
+            queue.push_back(QueuedChange {
+                request: ChangeRequest { update, finished: Some(finished) }, retry: Retry::default(),
+            });
+            receipts.push(receipt);
+        }
+        let now = Instant::now();
+        assert!(apply_changes(&mut writer, &mut queue, now));
+        assert_eq!(queue.len(), 2);
+        assert!(receipts[2].try_recv().is_ok());
+        assert!(receipts[0].try_recv().is_err() && receipts[1].try_recv().is_err());
+
+        fs::remove_file(path).unwrap();
+        assert!(!apply_changes(&mut writer, &mut queue, now + FIRST_RETRY - Duration::from_millis(1)));
+        assert!(apply_changes(&mut writer, &mut queue, now + FIRST_RETRY));
+        assert!(queue.is_empty());
+        assert!(receipts[0].try_recv().is_ok() && receipts[1].try_recv().is_ok());
+    }
+
+    #[test]
+    fn an_old_scope_cannot_block_the_current_scope() {
+        let folder = Folder::new();
+        let old = scope(7, 1, 1);
+        let current = scope(7, 1, 2);
+        let mut writer = Writer::open(folder.0.clone()).unwrap();
+        writer.activate(current).unwrap();
+        assert!(!writer.activate_current_life(old).unwrap());
+        assert!(writer.activate_current_life(current).unwrap());
+        assert_eq!(writer.waiting().unwrap().scope.life, 2);
+    }
+
+    #[test]
+    fn malformed_state_is_kept_aside_without_reusing_a_sequence() {
+        let folder = Folder::new();
+        let scope = scope(7, 1, 1);
+        let mut writer = Writer::open(folder.0.clone()).unwrap();
+        writer.handle(Message::Event(scope, open(1))).unwrap();
+        drop(writer);
+        fs::write(folder.0.join("state.json"), b"bad state").unwrap();
+        let mut writer = Writer::open(folder.0.clone()).unwrap();
+        writer.handle(Message::Event(scope, open(2))).unwrap();
+        let rows = read(&folder.0, scope, 0, 5, usize::MAX);
+        assert_eq!(rows.iter().map(events::Placed::sequence).collect::<Vec<_>>(), [1, 2]);
+        assert!(fs::read_dir(&folder.0).unwrap().flatten()
+            .any(|entry| fs::read(entry.path()).is_ok_and(|bytes| bytes == b"bad state")));
+    }
+
+    #[test]
+    fn a_batch_skips_files_wholly_before_its_cursor() {
+        let folder = Folder::new();
+        let scope = scope(7, 1, 1);
+        let directory = JournalDirectory::new(&folder.0, scope.account);
+        fs::create_dir_all(directory.journal(1)).unwrap(); // fails if opened as a file
+        let event = open(2);
+        let mut contents = events::file_header(scope.life).unwrap();
+        contents.extend(Record::new(event.id, event.at, event.kind).unwrap().place(50).unwrap().line().unwrap());
+        fs::write(directory.journal(50), contents).unwrap();
+        let rows = read(&folder.0, scope, 50, 5, usize::MAX);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].sequence(), 50);
     }
 
     #[test]

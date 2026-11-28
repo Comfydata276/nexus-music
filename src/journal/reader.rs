@@ -25,7 +25,11 @@ impl Read {
         let limit = self.max_events.min(events::BATCH_EVENTS);
         let mut bytes_left = self.max_bytes.min(events::BATCH_BYTES);
         let mut pending = Vec::new();
-        for number in directory.numbers()? {
+        let numbers = directory.numbers()?;
+        // A file ends before the next file's first sequence. Keep the possible
+        // containing file, then read forwards from it.
+        let start = numbers.partition_point(|number| *number <= self.from).saturating_sub(1);
+        for number in numbers.into_iter().skip(start) {
             let Some(file) = directory.read(number)?.1 else { continue };
             if file.life != self.scope.life {
                 continue;

@@ -14,6 +14,7 @@ use nexus_core::nexus::{
     client::{Happened, JournalAccount, JournalDo, Saved}, events::{self, DeviceKind, EventId, Kind, LossCounts}, proto::BackendId,
 };
 use serde::{Deserialize, Serialize};
+use slint::ComponentHandle;
 
 pub(crate) type SearchTicket = EventId;
 
@@ -45,6 +46,7 @@ struct Observation {
 enum Message {
     Event(Scope, Observation),
     Checkpoint(Scope, EventId, u32),
+    Wake,
 }
 
 #[derive(Default)]
@@ -62,6 +64,15 @@ struct Service {
     read: SyncSender<reader::Read>,
     update: mpsc::Sender<reader::ChangeRequest>,
     waiting: Arc<Mutex<Option<reader::Waiting>>>,
+}
+
+impl Service {
+    fn change(&self, request: reader::ChangeRequest) {
+        if self.update.send(request).is_ok() {
+            // A full event line already wakes the writer.
+            let _ = self.send.try_send(Message::Wake);
+        }
+    }
 }
 
 static SERVICE: OnceLock<Service> = OnceLock::new();
@@ -141,8 +152,11 @@ fn publish(scope: Option<Scope>) {
     PLAY.with_borrow_mut(|play| *play = Play::new());
     GENERATION.set(GENERATION.get().wrapping_add(1));
     SCOPE.set(scope);
+    crate::controller::with(|ctl| {
+        ctl.ui.global::<crate::ui::Settings>().set_nexus_records_listening(scope.is_some());
+    });
     if let Some(service) = SERVICE.get() {
-        let _ = service.update.send(reader::ChangeRequest {
+        service.change(reader::ChangeRequest {
             update: reader::Update::ScopeChanged(scope), finished: None,
         });
     }
@@ -216,7 +230,7 @@ pub(crate) fn handle_client(
     };
     let (finished, receipt) = mpsc::channel();
     if let Some(service) = SERVICE.get() {
-        let _ = service.update.send(ChangeRequest { update, finished: Some(finished) });
+        service.change(ChangeRequest { update, finished: Some(finished) });
     }
     Ok(Some(receipt))
 }
@@ -236,6 +250,7 @@ pub(crate) fn finish() {
     publish(None);
     if let Some(service) = SERVICE.get() {
         COUNTERS.closing.store(true, Ordering::Release);
+        let _ = service.send.try_send(Message::Wake);
         if let Ok(finished) = service.finished.lock() {
             let _ = finished.recv_timeout(Duration::from_secs(5));
         }
