@@ -725,3 +725,148 @@ fn a_force_out_retry_keeps_the_old_session_number() {
     assert_eq!(retried.device, live.id);
     assert_ne!(Some(retried.session), live.session);
 }
+
+fn load(worker_busy: bool, account_busy: bool, waiting: usize) -> PasswordLoad {
+    PasswordLoad { worker_busy, account_busy, waiting }
+}
+
+#[test]
+fn the_known_device_worker_is_isolated_and_has_no_startup_closure() {
+    let email = email();
+    let mut waits = PasswordWaits::default();
+    assert_eq!(PasswordDoor::for_device(true), PasswordDoor::KnownDevice);
+    assert_eq!(PasswordDoor::for_device(false), PasswordDoor::Other);
+    assert_eq!(admit_password_check(PasswordDoor::KnownDevice, load(false, false, 0), &waits, &email, 0), PasswordAdmission::Check);
+    waits.record_wrong(PasswordDoor::KnownDevice, &email, 0);
+    assert_eq!(waits.retry_after(&email, 0), None);
+
+    waits.record_wrong(PasswordDoor::Other, &email, 0);
+    assert_eq!(admit_password_check(PasswordDoor::Other, load(true, true, usize::MAX), &waits, &email, 0),
+        PasswordAdmission::ComeBack(Wait::new(1).unwrap()));
+    assert_eq!(admit_password_check(PasswordDoor::KnownDevice, load(false, false, usize::MAX), &waits, &email, 0),
+        PasswordAdmission::Check);
+    for busy in [load(true, false, 0), load(false, true, 0)] {
+        assert_eq!(admit_password_check(PasswordDoor::KnownDevice, busy, &waits, &email, 0), PasswordAdmission::Busy);
+    }
+}
+
+#[test]
+fn the_other_door_waits_for_its_worker_for_ten_seconds_and_holds_eight() {
+    let email = email();
+    let waits = PasswordWaits::default();
+    let door = PasswordDoor::Other;
+    assert_eq!(admit_password_check(door, load(false, false, 0), &waits, &email, 0), PasswordAdmission::Check);
+    for waiting in 0..OTHER_PASSWORDS_WAITING {
+        assert_eq!(admit_password_check(door, load(true, false, waiting), &waits, &email, 0), PasswordAdmission::WaitForWorker);
+        assert_eq!(admit_password_check(door, load(false, true, waiting), &waits, &email, 0), PasswordAdmission::WaitForWorker);
+    }
+    assert_eq!(admit_password_check(door, load(true, false, OTHER_PASSWORDS_WAITING), &waits, &email, 0), PasswordAdmission::Busy);
+    assert_eq!(admit_password_check(door, load(false, false, 1), &waits, &email, 0), PasswordAdmission::WaitForWorker);
+    assert_eq!(resume_password_check(0, true, false, &waits, &email, 9_999), PasswordAdmission::WaitForWorker);
+    assert_eq!(resume_password_check(0, false, false, &waits, &email, 9_999), PasswordAdmission::Check);
+    assert_eq!(resume_password_check(0, false, false, &waits, &email, 10_000), PasswordAdmission::Busy);
+}
+
+#[test]
+fn wrong_password_waits_double_to_a_minute_without_preventing_the_next_check() {
+    let email = email();
+    let mut waits = PasswordWaits::default();
+    let door = PasswordDoor::Other;
+    let available = load(false, false, 0);
+    let mut now = 100;
+    for seconds in [1, 2, 4, 8, 16, 32, 60, 60, 60] {
+        assert_eq!(admit_password_check(door, available, &waits, &email, now), PasswordAdmission::Check);
+        waits.record_wrong(door, &email, now);
+        let outcome = admit_password_check(door, load(true, false, 8), &waits, &email, now);
+        assert_eq!(outcome.refusal(), Some(Refusal::Busy { retry_after_seconds: Wait::new(seconds) }));
+        assert_eq!(resume_password_check(now, false, false, &waits, &email, now), outcome);
+        let until = now + seconds * 1000;
+        assert_eq!(waits.retry_after(&email, until - 1).map(Wait::seconds), Some(1));
+        assert_eq!(waits.retry_after(&email, until), None);
+        now = until;
+    }
+    assert_eq!(admit_password_check(door, available, &waits, &email, now), PasswordAdmission::Check);
+}
+
+#[test]
+fn wait_records_forget_at_an_hour_and_evict_the_oldest_name_at_the_cap() {
+    let first = email();
+    let mut waits = PasswordWaits::default();
+    let door = PasswordDoor::Other;
+    waits.record_wrong(door, &first, 0);
+    for i in 1..=PASSWORD_WAIT_NAMES {
+        let other = Email::new(&format!("ada-{i}@example.org")).unwrap();
+        waits.record_wrong(door, &other, i as u64);
+    }
+    assert!(!waits.by_email.contains_key(&first));
+    assert_eq!(waits.by_email.len(), PASSWORD_WAIT_NAMES);
+    assert_eq!(waits.oldest.len(), PASSWORD_WAIT_NAMES);
+
+    let last = Email::new(&format!("ada-{PASSWORD_WAIT_NAMES}@example.org")).unwrap();
+    let end = PASSWORD_WAIT_NAMES as u64 + PASSWORD_WAIT_MEMORY_MS;
+    waits.expire(end - 1);
+    assert!(waits.by_email.contains_key(&last));
+    waits.expire(end);
+    assert!(waits.by_email.is_empty());
+    waits.record_wrong(door, &last, end);
+    assert_eq!(waits.retry_after(&last, end).map(Wait::seconds), Some(1));
+}
+
+#[test]
+fn the_independent_code_door_takes_ten_in_any_rolling_second() {
+    let mut limit = CodeLimit::default();
+    let first = 999;
+    for time in first..first + 10 {
+        assert_eq!(limit.admit(time), Ok(()));
+    }
+    assert_eq!(limit.admit(first + 10), Err(Wait::new(1).unwrap()));
+    assert_eq!(limit.admit(first - 1), Err(Wait::new(1).unwrap()));
+    for time in first..first + 10 {
+        assert_eq!(limit.admit(time + 999), Err(Wait::new(1).unwrap()));
+        assert_eq!(limit.admit(time + 1000), Ok(()));
+    }
+    assert_eq!(CodeLimit::default().admit(0), Ok(()));
+    assert_eq!(CodeLimit::default().admit(u64::MAX), Ok(()));
+}
+
+#[test]
+fn a_dummy_salt_is_stable_for_a_canonical_name_and_is_keyed() {
+    let key = DummySaltKey::from_bytes([7; SECRET_BYTES]);
+    let first = key.salt_for(&email());
+    assert_eq!(first.as_ref(), key.salt_for(&Email::new(" Ada@Example.Org ").unwrap()).as_ref());
+    assert_ne!(first.as_ref(), key.salt_for(&Email::new("another@example.org").unwrap()).as_ref());
+    assert_ne!(first.as_ref(), DummySaltKey::from_bytes([8; SECRET_BYTES]).salt_for(&email()).as_ref());
+    assert_eq!(format!("{key:?}"), "DummySaltKey(..)");
+}
+
+#[test]
+fn wire_can_read_a_type_that_cannot_be_written() {
+    #[derive(Debug, PartialEq, Eq)]
+    struct OnlyRead(u64);
+
+    impl wire::Value for OnlyRead {
+        fn read(raw: &RawValue) -> Result<Self, BadMessage> {
+            Fields::read(raw)?.get("known").map(Self)
+        }
+    }
+
+    let body = br#"{"known":4,"future":[true]}"#;
+    assert_eq!(wire::read_value(body, body.len()), Ok(OnlyRead(4)));
+    assert_eq!(wire::read_value::<OnlyRead>(body, body.len() - 1), Err(BadMessage::TooLarge));
+    assert_eq!(wire::read_value::<OnlyRead>(br#"{"known":4,"future":{"x":1,"x":2}}"#, 64), Err(BadMessage::Form));
+}
+
+#[test]
+fn a_granted_change_can_hold_four_kibibytes() {
+    let change = GrantedChange {
+        head: head(), request_id: request_id(),
+        change: GrantChange::DeleteListeningData { account: person().id },
+        grant: GrantSecret::from_bytes([72; SECRET_BYTES]),
+    };
+    let wire = encode(&change).unwrap();
+    let mut bytes = wire.bytes().to_vec();
+    bytes.resize(4 * 1024, b' ');
+    assert_eq!(read::<GrantedChange>(&bytes), Ok(change));
+    bytes.push(b' ');
+    assert_eq!(read::<GrantedChange>(&bytes), Err(BadMessage::TooLarge));
+}

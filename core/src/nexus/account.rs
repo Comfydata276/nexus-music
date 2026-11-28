@@ -7,7 +7,10 @@ use super::wire::{self, Fields, object, plain_json, read_text, write_backend, wr
 pub use super::wire::{BODY_MAX_BYTES, BadMessage, WireBody, encode, read};
 use serde::{Serialize, Serializer};
 use serde_json::value::RawValue;
+use hkdf::hmac::{Hmac, Mac};
+use sha2::Sha256;
 use sha2::digest::{CtOutput, Output, OutputSizeUser, array::ArraySize, consts::{U8, U12, U16, U32, U64, U512}};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use crate::origin::{Address, AddressError, HandoverSource, MusicBase, Origin};
 use zeroize::Zeroizing;
@@ -41,6 +44,9 @@ pub const SMALL_REPLY_MAX_BYTES: usize = 4 * 1024;
 pub const SIGN_IN_REPLY_MAX_BYTES: usize = 8 * 1024;
 pub const LIST_REPLY_MAX_BYTES: usize = BODY_MAX_BYTES;
 pub const PASSWORD_REQUEST_MAX_BYTES: usize = 4 * 1024;
+// the design does not say the bound of a generic grant use. Allow the same 4 KiB
+// here because an admin can send both music addresses or login text in the change.
+pub const GRANTED_CHANGE_MAX_BYTES: usize = PASSWORD_REQUEST_MAX_BYTES;
 // the design does not say the size of calls without passwords; their fixed fields fit in 1 KiB.
 pub const SMALL_REQUEST_MAX_BYTES: usize = 1024;
 
@@ -64,7 +70,7 @@ pub fn tidy_email(text: &str) -> Option<String> {
     Some(text.to_ascii_lowercase())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct Email(String);
 
@@ -1100,7 +1106,7 @@ impl<T: wire::Value + Serialize> wire::Message for GrantRequest<T> {
 }
 
 impl<T: wire::Value + Serialize> wire::Message for GrantedChange<T> {
-    const MAX_BYTES: usize = SMALL_REQUEST_MAX_BYTES;
+    const MAX_BYTES: usize = GRANTED_CHANGE_MAX_BYTES;
 }
 
 impl<T: ReplyResult> wire::Message for Reply<T> {
@@ -1111,6 +1117,226 @@ impl<T: ReplyResult> wire::Message for Reply<T> {
             Self::Done { .. } => T::MAX_DONE_BYTES,
             _ => SMALL_REPLY_MAX_BYTES,
         }
+    }
+}
+
+
+// Password work uses one reserved worker per door. The server owns the worker,
+// queue, and account reservations. No rate state contains a password or a code.
+pub const OTHER_PASSWORDS_WAITING: usize = 8;
+pub const PASSWORD_QUEUE_MS: u64 = 10_000;
+pub const FIRST_PASSWORD_WAIT_MS: u64 = 1_000;
+pub const MAX_PASSWORD_WAIT_MS: u64 = 60_000;
+pub const PASSWORD_WAIT_MEMORY_MS: u64 = 60 * 60 * 1000;
+pub const PASSWORD_WAIT_NAMES: usize = 10_000;
+pub const CODES_PER_SECOND: usize = 10;
+const SECOND_MS: u64 = 1_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasswordDoor {
+    KnownDevice,
+    Other,
+}
+
+impl PasswordDoor {
+    /// Select by the account's verified device secret, after checking its history.
+    /// A claimed device ID and a device known to a different account confer nothing.
+    pub fn for_device(known_to_this_account: bool) -> Self {
+        if known_to_this_account { Self::KnownDevice } else { Self::Other }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PasswordLoad {
+    /// The worker reserved for this door, including work whose client disconnected.
+    pub worker_busy: bool,
+    /// In-progress work for this name at this door.
+    pub account_busy: bool,
+    /// The number already waiting at this door.
+    pub waiting: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasswordAdmission {
+    Check,
+    WaitForWorker,
+    ComeBack(Wait),
+    Busy,
+}
+
+impl PasswordAdmission {
+    pub fn refusal(self) -> Option<Refusal> {
+        match self {
+            Self::Check | Self::WaitForWorker => None,
+            Self::ComeBack(wait) => Some(Refusal::Busy { retry_after_seconds: Some(wait) }),
+            Self::Busy => Some(Refusal::Busy { retry_after_seconds: None }),
+        }
+    }
+}
+
+/// Decide under this door's admission lock. Retain a worker's reservation until
+/// the work finishes. The other door's queue and checks cannot reserve this worker.
+pub fn admit_password_check(
+    door: PasswordDoor,
+    load: PasswordLoad,
+    waits: &PasswordWaits,
+    email: &Email,
+    now_ms: u64,
+) -> PasswordAdmission {
+    match door {
+        PasswordDoor::KnownDevice => {
+            // the design does not say how much the known door holds while occupied.
+            // Keep no queue there. Busy is a retry, and the other door has no effect.
+            if load.worker_busy || load.account_busy {
+                PasswordAdmission::Busy
+            } else {
+                PasswordAdmission::Check
+            }
+        }
+        PasswordDoor::Other => {
+            // Backoff is a reply, never time spent in the worker queue.
+            if let Some(wait) = waits.retry_after(email, now_ms) {
+                return PasswordAdmission::ComeBack(wait);
+            }
+            if !load.worker_busy && !load.account_busy && load.waiting == 0 {
+                PasswordAdmission::Check
+            } else if load.waiting < OTHER_PASSWORDS_WAITING {
+                PasswordAdmission::WaitForWorker
+            } else {
+                PasswordAdmission::Busy
+            }
+        }
+    }
+}
+
+/// Ask when the head of the other door's queue can start. Age is counted from
+/// its original admission, including time before a worker becomes free.
+pub fn resume_password_check(
+    queued_at_ms: u64,
+    worker_busy: bool,
+    account_busy: bool,
+    waits: &PasswordWaits,
+    email: &Email,
+    now_ms: u64,
+) -> PasswordAdmission {
+    if now_ms.saturating_sub(queued_at_ms) >= PASSWORD_QUEUE_MS {
+        return PasswordAdmission::Busy;
+    }
+    admit_password_check(
+        PasswordDoor::Other,
+        PasswordLoad { worker_busy, account_busy, waiting: 0 },
+        waits,
+        email,
+        now_ms,
+    )
+}
+
+#[derive(Clone, Copy)]
+struct AccountWait {
+    last_wrong_ms: u64,
+    delay_ms: u64,
+}
+
+/// Only the other door consults these counts. Keep a single instance in memory
+/// for typed, canonical names, including names that have no account.
+#[derive(Default)]
+pub struct PasswordWaits {
+    by_email: BTreeMap<Email, AccountWait>,
+    oldest: BTreeSet<(u64, Email)>,
+    latest_ms: u64,
+}
+
+impl PasswordWaits {
+    pub fn retry_after(&self, email: &Email, now_ms: u64) -> Option<Wait> {
+        let wait = self.by_email.get(email)?;
+        let elapsed = now_ms.max(self.latest_ms).saturating_sub(wait.last_wrong_ms);
+        let remaining = wait.delay_ms.saturating_sub(elapsed);
+        Wait::new(remaining.div_ceil(SECOND_MS))
+    }
+
+    pub fn expire(&mut self, now_ms: u64) {
+        self.latest_ms = self.latest_ms.max(now_ms);
+        while self.oldest.first().is_some_and(|(last, _)| self.latest_ms.saturating_sub(*last) >= PASSWORD_WAIT_MEMORY_MS) {
+            if let Some((_, email)) = self.oldest.pop_first() {
+                self.by_email.remove(&email);
+            }
+        }
+    }
+
+    /// Call after an actual completed wrong check. Use this for the unknown-email
+    /// dummy check too. A correct check cannot create a refusal for future checks.
+    pub fn record_wrong(&mut self, door: PasswordDoor, email: &Email, now_ms: u64) {
+        if door == PasswordDoor::KnownDevice {
+            return;
+        }
+        self.expire(now_ms);
+        // the design does not say when a successful check resets the sequence.
+        // Remember the last wrong check for the stated hour, or until eviction.
+        let delay_ms = if let Some(prior) = self.by_email.get(email) {
+            self.oldest.remove(&(prior.last_wrong_ms, email.clone()));
+            prior.delay_ms.saturating_mul(2).min(MAX_PASSWORD_WAIT_MS)
+        } else {
+            // the design does not say which tied name is oldest. Break ties by name.
+            if self.by_email.len() >= PASSWORD_WAIT_NAMES {
+                if let Some((_, oldest_email)) = self.oldest.pop_first() {
+                    self.by_email.remove(&oldest_email);
+                }
+            }
+            FIRST_PASSWORD_WAIT_MS
+        };
+        self.by_email.insert(email.clone(), AccountWait { last_wrong_ms: self.latest_ms, delay_ms });
+        self.oldest.insert((self.latest_ms, email.clone()));
+    }
+}
+
+/// The fast code check has its own rolling window. Issuing the new password
+/// verifier after a valid code still uses the server's fixed password workers.
+#[derive(Default)]
+pub struct CodeLimit {
+    seen: VecDeque<u64>,
+    latest_ms: u64,
+}
+
+impl CodeLimit {
+    pub fn admit(&mut self, now_ms: u64) -> Result<(), Wait> {
+        self.latest_ms = self.latest_ms.max(now_ms);
+        // the design does not say whether the second is fixed or rolling.
+        while self.seen.front().is_some_and(|first| self.latest_ms.saturating_sub(*first) >= SECOND_MS) {
+            self.seen.pop_front();
+        }
+        if self.seen.len() >= CODES_PER_SECOND {
+            return Err(Wait(1));
+        }
+        self.seen.push_back(self.latest_ms);
+        Ok(())
+    }
+}
+
+pub const PASSWORD_SALT_BYTES: usize = 16;
+
+/// A key from the backend used only to derive the stable dummy salt for an
+/// unknown canonical email. The server still does the same slow Argon2id check.
+pub struct DummySaltKey(Zeroizing<[u8; SECRET_BYTES]>);
+
+secret_debug!(DummySaltKey);
+
+impl DummySaltKey {
+    pub fn from_bytes(key: [u8; SECRET_BYTES]) -> Self {
+        Self(Zeroizing::new(key))
+    }
+
+    pub fn salt_for(&self, email: &Email) -> Zeroizing<[u8; PASSWORD_SALT_BYTES]> {
+        // the design does not say the keyed function. Use a domain-separated
+        // HMAC-SHA-256, taking the first 16 bytes for the Argon2id salt.
+        let mut mac: Hmac<Sha256> = hkdf::HmacImpl::new_from_slice(self.0.as_slice());
+        mac.update(b"Nexus Music dummy password salt v1\0");
+        mac.update(email.as_str().as_bytes());
+        let digest = mac.finalize();
+        let mut salt = Zeroizing::new([0; PASSWORD_SALT_BYTES]);
+        for (out, byte) in salt.iter_mut().zip(digest.as_bytes()) {
+            *out = *byte;
+        }
+        salt
     }
 }
 
