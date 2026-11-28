@@ -1,5 +1,5 @@
 use super::*;
-use crate::nexus::account::{Receipt, Refusal, Stamp, StampTag};
+use crate::nexus::account::{Receipt, Refusal, RefusedWithReceipt, Stamp, StampTag};
 use crate::nexus::proto::SPEAKS;
 use serde_json::{Value, json};
 
@@ -382,10 +382,7 @@ fn a_batch_fits_count_and_bytes_and_refuses_only_the_bad_identified_event() {
         Batch::prefix(head(), 5, &events, first_size - 1).err(),
         Some(Wrong::Size)
     );
-    assert_eq!(
-        Batch::prefix(head(), 5, &[start(1), start(1)], BATCH_BYTES).err(),
-        Some(Wrong::RepeatedId)
-    );
+
 
     let pair = Batch::prefix(head(), 5, &events[..2], BATCH_BYTES)
         .unwrap()
@@ -617,24 +614,48 @@ fn the_player_makes_and_cleans_a_record_before_the_writer_places_it() {
 }
 
 #[test]
-fn overall_event_bytes_are_bounded_even_with_individually_valid_text() {
-    let kind = Kind::Start {
-        song_id: "id".into(),
-        title: "🎵".repeat(TEXT_CHARS),
-        artist: "🎵".repeat(TEXT_CHARS),
-        album: "🎵".repeat(TEXT_CHARS),
-        from: PlayedFrom::Queue,
-        began: Began::PressedHere,
-        sound: Sound::Streamed,
-        position_ms: 0,
-    };
-    assert_eq!(Record::new(id(1), 1, kind.clone()), Err(Wrong::Size));
-    let oversized = event(1, kind);
-    assert_eq!(oversized.line(), Err(Wrong::Size));
-    assert_eq!(
-        Batch::prefix(head(), 1, &[oversized], BATCH_BYTES).err(),
-        Some(Wrong::Size)
-    );
+fn long_display_fields_are_trimmed_but_untrimmed_wire_events_are_refused() {
+    let song = "音".repeat(TEXT_CHARS);
+    let source = "🎵".repeat(TEXT_CHARS);
+    let title = "🎵".repeat(TEXT_CHARS);
+    let artist = "楽".repeat(TEXT_CHARS);
+    let album = "\"\\".repeat(TEXT_CHARS / 2);
+    for (from, known_source) in [
+        (PlayedFrom::Album { id: source.clone() }, Some(&source)),
+        (PlayedFrom::Search { words: "曲".repeat(TEXT_CHARS) }, None),
+    ] {
+        let kind = Kind::Start {
+            song_id: song.clone(),
+            title: title.clone(),
+            artist: artist.clone(),
+            album: album.clone(),
+            from,
+            began: Began::PressedHere,
+            sound: Sound::Streamed,
+            position_ms: 0,
+        };
+        let placed = Record::new(id(1), TIME_MAX_MS, kind.clone()).unwrap().place(u64::MAX).unwrap();
+        let Kind::Start { song_id, title: shortened, artist: kept_artist, album: kept_album, from, .. } = placed.record().kind() else {
+            panic!("expected a start");
+        };
+        assert_eq!(song_id, &song);
+        assert!(shortened.len() < title.len());
+        assert!(title.starts_with(shortened));
+        assert!(artist.starts_with(kept_artist));
+        assert!(album.starts_with(kept_album));
+        match (from, known_source) {
+            (PlayedFrom::Album { id }, Some(expected)) => assert_eq!(id, expected),
+            (PlayedFrom::Search { words }, None) => assert!(!words.trim().is_empty() && words.chars().all(|ch| ch == '曲')),
+            _ => panic!("expected original source kind"),
+        }
+        let line = placed.line().unwrap();
+        assert!(line.len() <= EVENT_BYTES + 1);
+        assert_eq!(Placed::read(line.strip_suffix(b"\n").unwrap()), Ok(placed));
+
+        let oversized = event(1, kind);
+        assert_eq!(oversized.line(), Err(Wrong::Size));
+        assert_eq!(Batch::prefix(head(), 1, &[oversized], BATCH_BYTES).err(), Some(Wrong::Size));
+    }
 }
 
 #[test]
@@ -655,7 +676,14 @@ fn a_finished_song_may_run_through_the_fraction_truncated_from_its_duration() {
     let end = finished(215_480).unwrap().place(2).unwrap();
     assert_eq!(Placed::read(&end.line().unwrap()).unwrap(), end);
     assert!(finished(215_999).is_ok());
-    assert_eq!(finished(216_000), Err(Wrong::Field));
+    let late = finished(220_480).unwrap().place(3).unwrap();
+    assert!(matches!(late.record().kind(), Kind::Stop {
+        position_ms: Some(215_999), duration_ms: Some(215_000),
+        heard_ms: Some(220_480), why: Stopped::Finished, ..
+    }));
+    let mut wire = serde_json::to_value(&late).unwrap();
+    wire["event"]["position_ms"] = json!(216_000);
+    assert_eq!(read_value(wire), Err(Wrong::Form));
 }
 
 #[test]
@@ -687,4 +715,34 @@ fn journal_loss_totals_are_separate_and_saturate_for_persistence() {
     assert_eq!(counts, LossCounts { line_full: 2, files_full: u64::MAX, refused: 4 });
     let saved = serde_json::to_vec(&counts).unwrap();
     assert_eq!(serde_json::from_slice::<LossCounts>(&saved).unwrap(), counts);
+}
+
+#[test]
+fn later_duplicate_journal_ids_do_not_block_the_batch() {
+    let first = start(1);
+    let mut duplicate = first.clone();
+    duplicate.sequence += 1;
+    let later = start(3);
+    let mut journal = vec![first.clone(); BATCH_EVENTS];
+    journal.push(duplicate);
+    journal.push(later.clone());
+    let batch = Batch::prefix(head(), 1, &journal, BATCH_BYTES).unwrap();
+    assert_eq!(batch.events(), &[first, later]);
+}
+
+#[test]
+fn a_stamp_for_another_life_returns_no_event_outcomes() {
+    let sent = Batch::prefix(head(), 4, &[start(1), start(2)], BATCH_BYTES).unwrap();
+    let refused = BatchAnswer::new(vec![
+        Answered { id: id(1), outcome: Outcome::Refused },
+        Answered { id: id(2), outcome: Outcome::Refused },
+    ]).unwrap();
+    let done = Reply::Done { result: refused, receipt: receipt(5) };
+    let refusal = Reply::RefusedWithReceipt(
+        RefusedWithReceipt::new(Refusal::NotDealtWith, receipt(3)).unwrap(),
+    );
+    for (reply, life) in [(done, 5), (refusal, 3)] {
+        let bytes = write_reply(&reply).unwrap();
+        assert_eq!(read_reply(reply.status(), bytes.bytes(), &sent), Err(Wrong::LifeMoved { life }));
+    }
 }

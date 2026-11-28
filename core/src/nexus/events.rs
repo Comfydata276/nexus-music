@@ -379,6 +379,9 @@ pub enum Wrong {
     Count,
     RepeatedId,
     UnaskedId,
+    /// The reply has no outcomes to apply. Reconcile the account before changing
+    /// the local life or deleting files.
+    LifeMoved { life: u64 },
     Status,
 }
 
@@ -418,6 +421,33 @@ pub fn clean_text(text: &str) -> String {
         .collect()
 }
 
+// Only quotes and backslashes are escaped in cleaned strings. Count them while
+// removing characters so the playback path serializes the record at most once.
+fn trim_start(kind: &mut Kind, mut over: usize) -> Result<(), Wrong> {
+    let Kind::Start { title, artist, album, from, .. } = kind else {
+        return Err(Wrong::Size);
+    };
+    let search = if let PlayedFrom::Search { words } = from {
+        // The remaining search prefix must still contain a non-whitespace character.
+        let (offset, ch) = words.char_indices().find(|(_, ch)| !ch.is_whitespace())
+            .ok_or(Wrong::Field)?;
+        Some((words, offset + ch.len_utf8()))
+    } else {
+        None
+    };
+    let mut texts = [Some((title, 0)), Some((artist, 0)), Some((album, 0)), search];
+    while over > 0 {
+        let (text, _) = texts.iter_mut().flatten()
+            .filter(|(text, minimum)| text.len() > *minimum)
+            .max_by_key(|(text, _)| text.len())
+            .ok_or(Wrong::Size)?;
+        let ch = text.pop().ok_or(Wrong::Size)?;
+        let removed = ch.len_utf8() + usize::from(matches!(ch, '"' | '\\'));
+        over = over.saturating_sub(removed);
+    }
+    Ok(())
+}
+
 impl Record {
     pub fn new(id: EventId, at_ms: u64, mut kind: Kind) -> Result<Self, Wrong> {
         match &mut kind {
@@ -430,15 +460,25 @@ impl Record {
                 }
             }
             Kind::Search { words, .. } => *words = clean_text(words),
+            Kind::Stop { position_ms: Some(position), duration_ms: Some(duration), .. }
+                if *position <= PLAY_MAX_MS && *duration <= PLAY_MAX_MS =>
+            {
+                // An estimated duration can be short even after allowing for the
+                // fractional second. Keep the stop reason and heard time.
+                *position = (*position).min(duration.saturating_add(STOP_TOLERANCE_MS));
+            }
             _ => {}
         }
         let record = Self { id, at_ms, kind };
         record.check()?;
-        // The design does not say which field to discard if individually bounded
-        // text still exceeds 2 KiB together. Refuse rather than silently changing it.
-        // Reserve room for the biggest sequence so placing this record always fits.
-        let largest = Placed { record, sequence: u64::MAX };
-        largest.check_size()?;
+        // The design does not say which display field to shorten when an event
+        // is too large. Trim the longest by UTF-8 byte length, keeping IDs exact.
+        // Reserve room for the biggest sequence so placement always fits.
+        let mut largest = Placed { record, sequence: u64::MAX };
+        let over = largest.encoded_len()?.saturating_sub(EVENT_BYTES);
+        if over > 0 {
+            trim_start(&mut largest.record.kind, over)?;
+        }
         Ok(largest.record)
     }
 
@@ -535,8 +575,12 @@ impl Placed {
         self.sequence
     }
 
+    fn encoded_len(&self) -> Result<usize, Wrong> {
+        serde_json::to_vec(self).map(|bytes| bytes.len()).map_err(|_| Wrong::Form)
+    }
+
     fn check_size(&self) -> Result<(), Wrong> {
-        if serde_json::to_vec(self).map_err(|_| Wrong::Form)?.len() > EVENT_BYTES {
+        if self.encoded_len()? > EVENT_BYTES {
             return Err(Wrong::Size);
         }
         Ok(())
@@ -872,7 +916,7 @@ impl Batch {
         &self.events
     }
 
-    /// Take the longest prefix that fits the complete request body, head included.
+    /// Take the first distinct ids that fit the complete request body, head included.
     pub fn prefix(
         head: RequestHead,
         life: u64,
@@ -887,17 +931,20 @@ impl Batch {
         };
         let mut bytes = serde_json::to_vec(&batch).map_err(|_| Wrong::Form)?.len();
         let mut seen = BTreeSet::new();
-        for event in events.iter().take(BATCH_EVENTS) {
+        for event in events {
+            if !seen.insert(event.record.id) {
+                continue;
+            }
             event.check()?;
             let event_bytes = serde_json::to_vec(event).map_err(|_| Wrong::Form)?.len();
             bytes += event_bytes + usize::from(!batch.events.is_empty());
             if bytes > limit {
                 break;
             }
-            if !seen.insert(event.record.id) {
-                return Err(Wrong::RepeatedId);
-            }
             batch.events.push(event.clone());
+            if batch.events.len() == BATCH_EVENTS {
+                break;
+            }
         }
         if batch.events.is_empty() {
             return Err(if events.is_empty() {
@@ -1066,6 +1113,14 @@ pub fn read_reply(status: u16, whole_body: &[u8], sent: &Batch) -> Result<BatchR
         return Err(Wrong::Size);
     }
     let reply = account::read_reply::<BatchAnswer>(status, whole_body)?;
+    let receipt = match &reply {
+        Reply::Done { receipt, .. } => Some(receipt),
+        Reply::RefusedWithReceipt(context) => Some(context.receipt()),
+        Reply::Refused(_) => None,
+    };
+    if let Some(life) = receipt.map(|receipt| receipt.stamp.life).filter(|&life| life != sent.life()) {
+        return Err(Wrong::LifeMoved { life });
+    }
     if let Reply::Done { result, .. } = &reply {
         let wanted: BTreeSet<_> = sent.events().iter().map(|event| event.record.id).collect();
         if result
