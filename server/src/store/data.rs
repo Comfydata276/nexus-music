@@ -919,6 +919,33 @@ pub fn backend_of(path: &Path) -> Result<BackendId, String> {
     Ok(backend)
 }
 
+/// What a data file says of itself, read only (nothing set, nothing migrated): whose it is,
+/// its restore number, how far its changes have got and when its last step was written.
+/// `None` if there is no file there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Identity {
+    pub backend: BackendId,
+    pub restore: u64,
+    pub changes: u64,
+    pub written_at: u64,
+}
+
+pub fn identity_of(path: &Path) -> Result<Option<Identity>, String> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("The data at {} can't be read ({}).", path.display(), error.kind())),
+        Ok(_) => {}
+    }
+    let what = format!("The data at {}", path.display());
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_URI;
+    let connection = Connection::open_with_flags(path, flags).map_err(|error| format!("{what} can't be opened: {}.", why(&error)))?;
+    connection.busy_timeout(BUSY).map_err(|error| format!("{what} can't be opened: {}.", why(&error)))?;
+    check_form(&connection, &what, MIGRATIONS)?;
+    let meta = meta_of(&connection).map_err(|error| format!("{what} can't be read: {}.", why(&error)))?;
+    connection.close().map_err(|(_, error)| format!("{what} can't be read: {}.", why(&error)))?;
+    Ok(Some(Identity { backend: meta.backend, restore: meta.restore, changes: meta.changes, written_at: meta.written_at }))
+}
+
 /// The backend id and the time of the last step of a data file opened to read.
 pub fn identify(connection: &Connection) -> rusqlite::Result<(BackendId, u64)> {
     connection.query_row("SELECT backend, written_at FROM meta WHERE one = 1", [], |row| {

@@ -24,12 +24,31 @@ pub enum Pending {
     /// The owner's put-back, planned from the exact copy staged beside the data and written
     /// here whole (the new restore number, each device's number moved) before anything of
     /// the data in use was replaced: the staged copy may still be waiting to take its place.
-    PutBack { restore: u64 },
+    /// `copy` says which file it is, so that nothing else is ever taken for it.
+    PutBack { restore: u64, copy: CopyIdentity },
     /// The owner took the data as it is.
     TakeAsIs { restore: u64 },
 }
 
 /// Its `Debug`, and [`DataView`]'s, count accounts: an account's state holds its email.
+/// Which copy a put-back planned (the review of S3b, 3, 4 and C): the SHA-256 of the exact
+/// file staged, and how far its changes had got and when its last step was written, which a
+/// copy keeps once in place until the restore's own step is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CopyIdentity {
+    pub hash: [u8; 32],
+    pub changes: u64,
+    pub written_at: u64,
+}
+
+/// The data in place, as read (only read) before anything of it is opened to write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InPlace {
+    pub restore: u64,
+    pub changes: u64,
+    pub written_at: u64,
+}
+
 #[derive(Clone, PartialEq, Eq, Default)]
 pub struct StoreView {
     pub restore: u64,
@@ -113,7 +132,7 @@ impl Found {
 /// The design does not say how a cut write is told from an older copy. The store names the
 /// accounts of the change under way; anything else that differs is an older copy.
 pub fn compare(store: &StoreView, data: &DataView) -> Found {
-    if let Some(Pending::Restore { restore } | Pending::PutBack { restore } | Pending::TakeAsIs { restore }) = store.pending {
+    if let Some(Pending::Restore { restore } | Pending::PutBack { restore, .. } | Pending::TakeAsIs { restore }) = store.pending {
         if data.restore > restore {
             return Found::stop(Contradiction::DataRestoreAhead);
         }
@@ -225,21 +244,34 @@ pub enum Halt {
     NoData,
     /// The data has a restore number the store never gave.
     DataRestoreAhead,
+    /// The copy waiting beside the data, or the data in place, is not the copy the put-back
+    /// planned: nothing is done with it.
+    NotTheCopy,
 }
 
-/// [`Resume`], from what the store has under way (`pending`), whether a put-back's copy is
-/// staged beside the data, and the restore number of the data in place, if there is any.
-pub fn resume(pending: Option<&Pending>, staged: bool, data: Option<u64>) -> Resume {
-    match (pending, data) {
-        (None | Some(Pending::Change { .. }), _) => Resume::Nothing,
-        (Some(&Pending::PutBack { restore }), _) if staged => Resume::PutInPlace { restore },
-        (Some(Pending::PutBack { .. }), None) => Resume::Stop(Halt::CopyLost),
-        (Some(Pending::Restore { .. } | Pending::TakeAsIs { .. }), None) => Resume::Stop(Halt::NoData),
-        (Some(&(Pending::Restore { restore } | Pending::PutBack { restore } | Pending::TakeAsIs { restore })), Some(data)) if data > restore => {
+/// [`Resume`], from what the store has under way (`pending`), the SHA-256 of a put-back's
+/// copy staged beside the data if one is, and the data in place, if there is any (read only).
+/// A put-back goes on only with the very copy it planned: staged, by its hash; in place, by
+/// how far its changes had got and when it was last written, or by the restore's own number
+/// once that step is written.
+pub fn resume(pending: Option<&Pending>, staged: Option<&[u8; 32]>, data: Option<InPlace>) -> Resume {
+    let Some(pending) = pending else { return Resume::Nothing };
+    match (pending, staged, data) {
+        (Pending::Change { .. }, ..) => Resume::Nothing,
+        (&Pending::PutBack { restore, copy }, Some(hash), _) => {
+            if *hash == copy.hash { Resume::PutInPlace { restore } } else { Resume::Stop(Halt::NotTheCopy) }
+        }
+        (Pending::PutBack { .. }, None, None) => Resume::Stop(Halt::CopyLost),
+        (Pending::Restore { .. } | Pending::TakeAsIs { .. }, _, None) => Resume::Stop(Halt::NoData),
+        (&(Pending::Restore { restore } | Pending::PutBack { restore, .. } | Pending::TakeAsIs { restore }), _, Some(data)) if data.restore > restore => {
             Resume::Stop(Halt::DataRestoreAhead)
         }
-        (Some(&Pending::TakeAsIs { restore }), Some(_)) => Resume::Restore { restore, adopt: true },
-        (Some(&(Pending::Restore { restore } | Pending::PutBack { restore })), Some(_)) => Resume::Restore { restore, adopt: false },
+        (&Pending::PutBack { restore, copy }, None, Some(data)) => {
+            let the_copy = data.restore == restore || (data.changes == copy.changes && data.written_at == copy.written_at);
+            if the_copy { Resume::Restore { restore, adopt: false } } else { Resume::Stop(Halt::NotTheCopy) }
+        }
+        (&Pending::TakeAsIs { restore }, _, Some(_)) => Resume::Restore { restore, adopt: true },
+        (&Pending::Restore { restore }, _, Some(_)) => Resume::Restore { restore, adopt: false },
     }
 }
 
@@ -267,15 +299,6 @@ pub fn put_back(store: &StoreView, copy: &DataView) -> Result<u64, NotPutBack> {
         return Err(NotPutBack::Contradiction(why));
     }
     store.restore.checked_add(1).filter(|&new| new > copy.restore).ok_or(NotPutBack::Spent)
-}
-
-/// Whether `copy` is already the data in place, put back (or found older and restored) and
-/// nothing written since: the data's restore is the store's, its changes are the store's
-/// mark, and it was restored from a copy last written when `copy` was. Then the command run
-/// again (killed after its last step, before it said so) changes nothing, rather than putting
-/// the same copy back a second time and moving every number again (the review's finding 4).
-pub fn already_put_back(store: &StoreView, data: &DataView, restored_from: Option<u64>, copy_written_at: u64) -> bool {
-    store.pending.is_none() && store.restore > 0 && data.restore == store.restore && data.changes == store.mark && restored_from == Some(copy_written_at)
 }
 
 /// 12.4, the owner's take-as-is: whether there is anything to take. `store` is the store kept

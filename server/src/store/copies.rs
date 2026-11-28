@@ -190,25 +190,19 @@ pub fn keep_replaced(source: &Connection, data: &Path, restore: u64, now: u64) -
     Ok(path)
 }
 
-/// Keeps, byte for byte, data a put-back is about to replace that SQLite cannot read (it is
-/// damaged, or not this program's): each of its files beside the others, lasting. Where the
-/// main file went.
-pub fn keep_raw(data: &Path, restore: u64, now: u64) -> Result<PathBuf, String> {
-    let copies = make_folder(data)?;
-    let main = copies.join(format!("replaced-{restore}-{now}.raw"));
-    let kind = |error: std::io::Error| format!("{}", error.kind());
-    for suffix in ["", "-wal", "-shm"] {
-        let from = PathBuf::from(format!("{}{suffix}", data::place(data).display()));
-        let into = PathBuf::from(format!("{}{suffix}", main.display()));
-        let mut source = match fs::File::open(&from) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            other => other.map_err(kind)?,
-        };
-        let _ = fs::remove_file(&into);
-        let mut file = crate::store::private::create(&into).map_err(kind)?;
-        std::io::copy(&mut source, &mut file).map_err(kind)?;
-        file.sync_all().map_err(kind)?;
+/// The SHA-256 of the file at `path`, read to its end: which copy it is (a put-back's plan
+/// names the one it staged).
+pub fn hash(path: &Path) -> std::io::Result<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = fs::File::open(path)?;
+    let mut sum = Sha256::new();
+    let mut buffer = vec![0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(sum.finalize().into());
+        }
+        sum.update(&buffer[..read]);
     }
-    fs::File::open(&copies).and_then(|folder| folder.sync_all()).map_err(kind)?;
-    Ok(main)
 }

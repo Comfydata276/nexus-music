@@ -21,11 +21,17 @@ pub struct Settings {
     /// name, and a port if not 443, nothing else. The page's two calls with no session (its
     /// sign-in and setting up) are taken only from it. Unset, they are refused.
     pub public_origin: Option<String>,
+    /// How large the data may grow, in bytes, before new events wait (`NEXUS_DATA_BUDGET`,
+    /// design 19.2; S12's intake). 4 GB unless given.
+    pub data_budget: u64,
 }
 
 pub const DATA_DEFAULT: &str = "/data";
 pub const STATE_DEFAULT: &str = "/state";
 pub const LISTEN_DEFAULT: &str = "0.0.0.0:8080";
+pub const DATA_BUDGET_DEFAULT: u64 = 4_000_000_000;
+/// Less than this is surely a slip (a number of gigabytes written without its unit, say).
+pub const DATA_BUDGET_LEAST: u64 = 1_000_000;
 
 impl Settings {
     /// Reads the settings through `get` (the environment, or a test's table). A value that is
@@ -77,7 +83,13 @@ impl Settings {
                 "NEXUS_PUBLIC_ORIGIN is wrong: give the admin's page's address as a browser has it, https:// and the name (and :port if it is not 443), with nothing after it, for example https://nexus.example.org".to_string()
             })?),
         };
-        Ok(Settings { music_server, proxy, data, state, listen, public_origin })
+        let data_budget = match setting("NEXUS_DATA_BUDGET") {
+            None => DATA_BUDGET_DEFAULT,
+            Some(value) => data_budget(&value).ok_or_else(|| {
+                format!("NEXUS_DATA_BUDGET is wrong: give how large the data may grow, as a whole number of bytes or with MB, GB or TB after it, at least 1 MB, for example 4GB (the default is {DATA_BUDGET_DEFAULT} bytes)")
+            })?,
+        };
+        Ok(Settings { music_server, proxy, data, state, listen, public_origin, data_budget })
     }
 
     /// Whether both folders are there, and apart on the disk as well as in their names: not
@@ -110,6 +122,22 @@ fn public_origin(value: &str) -> Option<String> {
     let origin = nexus_core::nexus::account::NexusOrigin::typed(value).ok()?;
     let plain = origin.origin().to_string();
     (plain == value).then_some(plain)
+}
+
+/// A size: a whole number of bytes, or of MB, GB or TB (a thousand to the next; the unit in any
+/// case, a space before it or not), at least [`DATA_BUDGET_LEAST`].
+fn data_budget(value: &str) -> Option<u64> {
+    let digits = value.find(|c: char| !c.is_ascii_digit()).unwrap_or(value.len());
+    let (number, unit) = value.split_at(digits);
+    let number: u64 = number.parse().ok()?;
+    let times: u64 = match unit.trim_start().to_ascii_uppercase().as_str() {
+        "" => 1,
+        "MB" => 1_000_000,
+        "GB" => 1_000_000_000,
+        "TB" => 1_000_000_000_000,
+        _ => return None,
+    };
+    number.checked_mul(times).filter(|bytes| *bytes >= DATA_BUDGET_LEAST)
 }
 
 /// Whether two paths are one folder on the disk (two mounts of it, say).
@@ -187,6 +215,7 @@ mod tests {
             state: root.join(state),
             listen: "0.0.0.0:8080".parse().unwrap(),
             public_origin: None,
+            data_budget: DATA_BUDGET_DEFAULT,
         };
         assert_eq!(settings("state").check_folders(), Ok(()));
         for state in ["state-link", "inner-link"] {
@@ -298,5 +327,23 @@ mod tests {
         // Folders that only begin alike are apart.
         let pairs = with(&[("NEXUS_DATA", "/srv/data"), ("NEXUS_STATE", "/srv/data-state")]);
         assert!(read(&pairs).is_ok());
+    }
+
+    /// S12's audit, S1: a data budget mistyped stops the start, by name; a right one is taken.
+    #[test]
+    fn the_data_budget_is_a_size_or_the_start_stops() {
+        let base = [("NEXUS_MUSIC_SERVER", "http://navidrome:4533"), ("NEXUS_PROXY", "172.18.0.2")];
+        let with_budget = |value: &'static str| {
+            let mut pairs = base.to_vec();
+            pairs.push(("NEXUS_DATA_BUDGET", value));
+            read(&pairs)
+        };
+        assert_eq!(read(&base).unwrap().data_budget, 4_000_000_000);
+        for (given, bytes) in [("4GB", 4_000_000_000), ("4 gb", 4_000_000_000), ("500MB", 500_000_000), ("2000000000", 2_000_000_000), ("1TB", 1_000_000_000_000)] {
+            assert_eq!(with_budget(given).unwrap().data_budget, bytes, "{given}");
+        }
+        for wrong in ["4G", "4.5GB", "-1", "4", "0", "lots", "4GiB", "99999999999999999999"] {
+            assert!(with_budget(wrong).unwrap_err().starts_with("NEXUS_DATA_BUDGET is wrong"), "{wrong}");
+        }
     }
 }

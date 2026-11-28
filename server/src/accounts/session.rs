@@ -26,7 +26,7 @@ use nexus_core::nexus::kept::{Access, Account, AccountState, Bearer, Denied, Eff
 use nexus_core::nexus::proto::{BackendId, SPEAKS, Speaks};
 
 use super::check::{Checked, PasswordWorkers};
-use super::desk::{Busy, Desk};
+use super::desk::{Busy, Desk, Lane};
 use super::rows;
 use super::setup::{CodeKey, SetUpCode, random};
 use crate::store::data::{self, Change};
@@ -50,6 +50,33 @@ pub struct Accounts {
     pub set_up_code: SetUpCode,
     pub clock: Clock,
     pub backend: BackendId,
+    /// The devices this backend has seen, by their secret's fingerprint: which lane of the line
+    /// a sign-in's first step waits in (the review of S8, C1).
+    pub seen: Arc<Seen>,
+    /// The music server as the backend reaches it (S9).
+    pub music: super::music::MusicSide,
+}
+
+/// The fingerprints of every device secret the data has had a device for, read at the start and
+/// added to at each sign-in. Only which lane a sign-in waits in is chosen by it; kept still says
+/// which door it goes through. A device secret is 32 random bytes, so a stranger cannot be in it.
+#[derive(Default)]
+pub struct Seen(std::sync::RwLock<std::collections::HashSet<[u8; 32]>>);
+
+impl Seen {
+    pub fn new(prints: impl IntoIterator<Item = [u8; 32]>) -> Self {
+        Seen(std::sync::RwLock::new(prints.into_iter().collect()))
+    }
+
+    fn has(&self, print: &[u8; 32]) -> bool {
+        self.0.read().is_ok_and(|seen| seen.contains(print))
+    }
+
+    fn add(&self, print: [u8; 32]) {
+        if let Ok(mut seen) = self.0.write() {
+            seen.insert(print);
+        }
+    }
 }
 
 /// An answer: its status, and its body (C7's shapes, encoded).
@@ -79,8 +106,9 @@ pub fn refused(refusal: Refusal) -> Answer {
     Answer { status, body }
 }
 
+/// The line is full: come back in a second (the line empties in steps of milliseconds).
 fn busy() -> Refusal {
-    Refusal::Busy { retry_after_seconds: None }
+    Refusal::Busy { retry_after_seconds: account::Wait::new(1) }
 }
 
 impl From<Busy> for Refusal {
@@ -116,7 +144,7 @@ fn said(denied: Denied) -> Refusal {
 
 /// CARRIED (asked of C7: a `Speaks` that says whether two meet). The caller and this backend
 /// meet when they have a number in common.
-fn speaks_with(caller: &Speaks) -> bool {
+pub(crate) fn speaks_with(caller: &Speaks) -> bool {
     caller.low() <= SPEAKS.high() && SPEAKS.low() <= caller.high()
 }
 
@@ -215,10 +243,12 @@ impl Accounts {
     async fn with_password(&self, email: Email, password: Password, secret: DeviceSecret, described: Described) -> Result<Answer, Refusal> {
         let clock = self.clock.clone();
         let (asked, secret_for_check) = (email.clone(), secret.clone());
+        // A device this backend has never seen waits in the strangers' lane (C1).
+        let lane = if self.seen.has(Fingerprint::of(secret.expose_bytes()).as_bytes()) { Lane::Kept } else { Lane::Stranger };
         // (1) On the thread that writes: kept's check, bound to the account and device as they are.
         let prepared = self
             .desk
-            .ask(move |keeper| -> Result<Option<Prepared>, Refusal> {
+            .ask_in(lane, move |keeper| -> Result<Option<Prepared>, Refusal> {
                 let now = clock();
                 let Some(number) = keeper.account_named(asked.as_str()).map_err(not_dealt_with)? else {
                     // 8.3: an email with no account does the same work here as one with an
@@ -258,6 +288,8 @@ impl Accounts {
         let Checked::Match { derived, replacement } = checked else { return Err(wrong()) };
         // (3) On the thread that writes: the sign-in, made in the one step that looks again.
         let clock = self.clock.clone();
+        let seen = self.seen.clone();
+        let internal = self.music.internal.clone();
         self.desk
             .ask(move |keeper| {
                 let now = clock();
@@ -266,7 +298,7 @@ impl Accounts {
                 if let Some(replacement) = replacement {
                     extra_passwords.push(replacement);
                 }
-                finish_sign_in(keeper, prepared.number, prepared.device, &secret, &described, &extra_passwords, now, |turn, fresh, previous| turn.sign_in(receipt, fresh, previous))
+                finish_sign_in(keeper, &seen, &internal, prepared.number, prepared.device, &secret, &described, &extra_passwords, now, |turn, fresh, previous| turn.sign_in(receipt, fresh, previous))
             })
             .await?
     }
@@ -275,44 +307,60 @@ impl Accounts {
         // The code's own door: ten a second in all (8.3), taken before it is looked up.
         self.workers.admit_code()?;
         let clock = self.clock.clone();
-        // Whose code it is, and that it is live and in time.
+        let secret_for_check = secret.clone();
+        // (1) On the thread that writes: whose code it is, that it is live and in time, and
+        // kept's check of it, made NOW, before the slow work (the review of S8, B3): the
+        // receipt is bound to the account as it is at this moment, so a change to it while the
+        // new password's fingerprint is made (its role, say) fences this redemption.
         let found = self
             .desk
-            .ask(move |keeper| -> Result<Option<(u64, u64, Email, Fingerprint)>, Refusal> {
-                let now = keeper.clock(clock()).effective();
+            .ask(move |keeper| -> Result<Option<(u64, Email, DeviceId, PasswordCheck, Fingerprint)>, Refusal> {
+                let now = clock();
+                let effective = keeper.clock(now).effective();
+                // A1 (the review of S8): the time a code was judged at is kept as the backend's
+                // latest, whatever the judgement, so a clock set back afterwards cannot make an
+                // expired code good again. (At most ten a second: the code's door.)
+                // CARRIED until the keeper keeps the clock's observations in memory (core's
+                // `Clock::observe`, with the store's port to it): until then each is written.
+                keeper.persist(&Effects { high_water: effective, updates: Vec::new() }, &[], now).map_err(not_dealt_with)?;
                 let print = CodeKey::of(keeper).print(&code);
                 let Some((number, code_number, until)) = rows::code(keeper.data().connection(), &print).map_err(not_dealt_with)? else { return Ok(None) };
-                if now >= until {
+                if effective >= until {
                     return Ok(None);
                 }
-                let state = keeper.load(number).map_err(not_dealt_with)?.state().clone();
-                Ok(Some((number, code_number, state.email, Fingerprint::from_bytes(print))))
-            })
-            .await??;
-        let Some((number, code_number, email, print)) = found else { return Err(wrong()) };
-        if !new_password.allowed_for(&email, COMMON_PASSWORDS) {
-            return Err(Refusal::NotAllowed(NotAllowed::PasswordNotAllowed));
-        }
-        // The new password's fingerprint, before the code is spent: the code is a live one, so
-        // this is the known-device worker's, one at a time for an account, with no wait (the
-        // lead's ruling of 14:06; a stranger at the other door cannot stop it).
-        let stored = self.workers.fingerprint(&email, PasswordDoor::RedeemedCode, None, new_password).await?;
-        let clock = self.clock.clone();
-        self.desk
-            .ask(move |keeper| {
-                let now = clock();
                 let mut account = keeper.load(number).map_err(not_dealt_with)?;
+                let email = account.state().email.clone();
                 let vacant = DeviceId::new(keeper.vacant_device()).ok_or(Refusal::NotDealtWith)?;
-                let mine = Fingerprint::of(secret.expose_bytes());
+                let mine = Fingerprint::of(secret_for_check.expose_bytes());
                 let device = account.rows().devices.iter().find(|(_, row)| row.secret == mine).map_or(vacant, |(id, _)| *id);
+                let print = Fingerprint::from_bytes(print);
                 let check = account
-                    .sign_in_turn(keeper.clock(now), |turn| turn.check_code(&secret, vacant, code_number, print.clone()))
+                    .sign_in_turn(keeper.clock(now), |turn| turn.check_code(&secret_for_check, vacant, code_number, print.clone()))
                     .apply(|effects| keeper.persist(effects, &[], now))
                     .map_err(not_dealt_with)?
                     .map_err(said)?;
+                Ok(Some((number, email, device, check, print)))
+            })
+            .await??;
+        let Some((number, email, device, check, print)) = found else { return Err(wrong()) };
+        if !new_password.allowed_for(&email, COMMON_PASSWORDS) {
+            return Err(Refusal::NotAllowed(NotAllowed::PasswordNotAllowed));
+        }
+        // (2) The new password's fingerprint, before the code is spent: the code is a live one,
+        // so this is the known-device worker's, one at a time for an account, with no wait (the
+        // lead's ruling of 14:06; a stranger at the other door cannot stop it).
+        let stored = self.workers.fingerprint(&email, PasswordDoor::RedeemedCode, None, new_password).await?;
+        let clock = self.clock.clone();
+        let seen = self.seen.clone();
+        let internal = self.music.internal.clone();
+        // (3) On the thread that writes: the receipt taken at (1) consumed against the account
+        // loaded afresh, and the code spent, in the one step.
+        self.desk
+            .ask(move |keeper| {
+                let now = clock();
                 let receipt = check.check(print, keeper.clock(now)).map_err(said)?;
                 let verifier = Fingerprint::from_bytes(stored.hash);
-                finish_sign_in(keeper, number, device, &secret, &described, std::slice::from_ref(&stored), now, |turn, fresh, previous| {
+                finish_sign_in(keeper, &seen, &internal, number, device, &secret, &described, std::slice::from_ref(&stored), now, |turn, fresh, previous| {
                     turn.redeem_code(receipt, verifier, fresh, previous)
                 })
             })
@@ -404,17 +452,20 @@ impl Accounts {
         flatten(done)
     }
 
-    /// 9.4: the music login for this device, or why there is none. Until S9, there is none.
-    pub async fn music_login(&self, bearer: account::Session, head: RequestHead) -> Answer {
+    /// 9.4: the music login for this device, a salt made now and its token, or why there is
+    /// none. `page`: the call came from the admin's page, which is never handed one (7.3).
+    pub async fn music_login(&self, bearer: account::Session, head: RequestHead, page: bool) -> Answer {
         let clock = self.clock.clone();
+        let internal = self.music.internal.clone();
         let done = self
             .desk
             .ask(move |keeper| -> Result<Answer, Refusal> {
                 let now = clock();
                 let hash = Fingerprint::of(bearer.expose_bytes());
-                let (_, _, account) = arrived(keeper, &head, &hash, Access::Read, now)?;
+                let (number, _, account) = arrived(keeper, &head, &hash, Access::Read, now)?;
+                let result = if page { MusicLoginResult::NoneSetYet } else { super::music::hand(keeper, number, account.state(), &internal) };
                 let receipt = receipt(keeper, account.state())?;
-                Ok(answer!(Reply::Done { result: MusicLoginResult::NoneSetYet, receipt }))
+                Ok(answer!(Reply::Done { result, receipt }))
             })
             .await;
         flatten(done)
@@ -432,6 +483,14 @@ impl Accounts {
 
     async fn changing_password(&self, bearer: account::Session, request: ChangePassword) -> Result<Answer, Refusal> {
         let ChangePassword { head, request_id, current_password, new_password } = request;
+        // CARRIED (asked of core: `ChangePassword`'s own check): a "change" to the password
+        // already set is refused as a malformed request, before anything is looked at, so that
+        // a retry of it can never prove a still-current password again and end sessions made
+        // since (the review of S8, B2; the lead's ruling). The comparison takes the same time
+        // whatever the two are (`Password`'s equality).
+        if current_password == new_password {
+            return Err(Refusal::Malformed);
+        }
         let clock = self.clock.clone();
         let hash = Fingerprint::of(bearer.expose_bytes());
         let (number, device, email, check, stored) = {
@@ -527,28 +586,34 @@ fn arrived(keeper: &mut Keeper, head: &RequestHead, hash: &Fingerprint, access: 
 }
 
 /// Section 11: the note ends its one session and nothing else, and needs no session (kept's
-/// `sign_out_by_note`). A note for a session that has gone is already done; one whose secret
-/// is not that session's is refused as a session that has ended.
+/// `sign_out_by_note`). **Whatever came of it** (ended now, gone already, the data put back,
+/// or a secret that is not that session's) **the answer is the same "that session has ended",
+/// with no receipt**: a note gives leave to end one session and nothing more, so it is told
+/// nothing of the account (the review of S8, B1; the lead's ruling). The app forgets its note
+/// on that answer (C10's `answered_tell`). Only "busy" and "not dealt with" differ: the note
+/// is then told again.
 fn by_note(keeper: &mut Keeper, head: &RequestHead, note: SignOutNote, now: u64) -> Result<Answer, Refusal> {
     if !speaks_with(&head.speaks) {
         return Err(incompatible());
     }
+    let ended_by_note = || refused(ended());
     if head.restore != keeper.restore() {
         // Every session was ended when the data was put back: so was this one.
-        return Err(Refusal::NotSignedIn(NotSignedIn::DataPutBack));
+        return Ok(ended_by_note());
     }
     let Some((number, device, _, _)) = rows::session_by_id(keeper.data().connection(), note.session).map_err(not_dealt_with)? else {
-        return Err(ended());
+        return Ok(ended_by_note());
     };
     let given = Fingerprint::of(note.secret.expose_bytes());
     let mut account = keeper.load(number).map_err(not_dealt_with)?;
-    account
+    let done = account
         .request(head.restore, keeper.clock(now), |turn| turn.sign_out_by_note(SessionTarget { device, session: note.session }, &given))
         .apply(|effects| keeper.persist(effects, &[], now))
-        .map_err(not_dealt_with)?
-        .map_err(said)?;
-    let receipt = receipt(keeper, account.state())?;
-    Ok(answer!(Reply::Done { result: SignedOut {}, receipt }))
+        .map_err(not_dealt_with)?;
+    match done.map_err(said) {
+        Ok(()) | Err(Refusal::NotSignedIn(_) | Refusal::NotAllowed(_)) => Ok(ended_by_note()),
+        Err(other) => Err(other),
+    }
 }
 
 /// The step that writes a sign-in (8.6 step 4, 8.5): the account loaded afresh, a session made
@@ -557,6 +622,8 @@ fn by_note(keeper: &mut Keeper, head: &RequestHead, note: SignOutNote, now: u64)
 #[allow(clippy::too_many_arguments)]
 fn finish_sign_in(
     keeper: &mut Keeper,
+    seen: &Seen,
+    internal: &str,
     number: u64,
     device: DeviceId,
     secret: &DeviceSecret,
@@ -595,6 +662,7 @@ fn finish_sign_in(
         return Err(Refusal::NotDealtWith);
     }
     heard(keeper, device, now);
+    seen.add(*print.as_bytes());
     let state = account.state().clone();
     let shown = rows::shown(keeper.data().connection(), number).map_err(not_dealt_with)?.and_then(|shown| Name::new(&shown));
     let name = shown.unwrap_or_else(|| Name::new("You").expect("a fixed name is a name"));
@@ -605,9 +673,9 @@ fn finish_sign_in(
         person: Person { id: AccountId::new(number).ok_or(Refusal::NotDealtWith)?, revision: state.revision, email: state.email.clone(), name, admin: state.admin },
         device,
         restore: keeper.restore(),
-        // Until S9 there is never a music login to hand out (the slice notes, S8); and the
-        // admin's page is never handed one (S10a's ask; 7.3, no secret in the page).
-        music: MusicLoginResult::NoneSetYet,
+        // 9.4: a salt made now and its token, or why not. The admin's page is never handed one
+        // (7.3: no secret in the page).
+        music: if described.page { MusicLoginResult::NoneSetYet } else { super::music::hand(keeper, number, &state, internal) },
         notice: Notice::new(RECORDED).ok_or(Refusal::NotDealtWith)?,
     };
     let receipt = receipt(keeper, &state)?;

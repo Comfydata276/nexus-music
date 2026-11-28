@@ -274,9 +274,11 @@ mod tests {
         // Another code is not it, and leaves it as it was.
         let other = OneTimeCode::from_random(7);
         assert!(!live.take(&other, 2_000));
-        // Past fifteen minutes it is not taken.
-        assert!(!live.take(&typed(), 1_000 + SET_UP_CODE_MS));
-        assert!(live.take(&typed(), 1_000 + SET_UP_CODE_MS - 1));
+        // Past fifteen minutes it is not taken (written out, not the constant: a change to it
+        // must fail here).
+        const FIFTEEN_MINUTES: u64 = 15 * 60 * 1000;
+        assert!(!live.take(&typed(), 1_000 + FIFTEEN_MINUTES));
+        assert!(live.take(&typed(), 1_000 + FIFTEEN_MINUTES - 1));
         // Once.
         assert!(!live.take(&typed(), 2_000));
         assert!(!live.open(2_000));
