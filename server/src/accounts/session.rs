@@ -398,6 +398,51 @@ impl Accounts {
             .await?
     }
 
+    /// 8.4: setting up from the admin's page, once: the set-up code said in this start's log,
+    /// the first admin's email, name and new password, in one call that comes from the page's
+    /// own origin (the door's, `routes`). The code has its own door (ten a second in all); the
+    /// new password's fingerprint is the redeemed-code lane's (a live code was shown); the code
+    /// is taken, and the backend set up, in one step on the thread that writes: of two at once,
+    /// one is. The browser is not signed in by it.
+    pub async fn set_up_from_page(&self, request: account::SetUp) -> Answer {
+        let reply = match self.setting_up(request).await {
+            Ok(person) => account::SetUpReply::Done { result: person },
+            Err(refusal) => account::SetUpReply::Refused(refusal),
+        };
+        let status = reply.status();
+        match account::encode(&reply) {
+            Ok(body) => Answer { status, body },
+            Err(_) => refused(Refusal::NotDealtWith),
+        }
+    }
+
+    async fn setting_up(&self, request: account::SetUp) -> Result<Person, Refusal> {
+        let account::SetUp { code, email, name, password } = request;
+        self.workers.admit_code()?;
+        if !self.set_up_code.matches(&code, (self.clock)()) {
+            return Err(wrong());
+        }
+        if !password.allowed_for(&email, COMMON_PASSWORDS) {
+            return Err(Refusal::NotAllowed(NotAllowed::PasswordNotAllowed));
+        }
+        let verifier = self.workers.fingerprint(&email, PasswordDoor::RedeemedCode, None, password).await?;
+        if !self.set_up_code.take(&code, (self.clock)()) {
+            return Err(wrong());
+        }
+        let clock = self.clock.clone();
+        self.desk
+            .ask(move |keeper| -> Result<Person, Refusal> {
+                let now = clock();
+                let number = super::setup::set_up(keeper, &email, name.as_str(), crate::store::keeper::First::Password(&verifier), now).map_err(|why| match why {
+                    super::setup::NotSetUp::Already => Refusal::NotAllowed(NotAllowed::Denied),
+                    super::setup::NotSetUp::Failed(_) => Refusal::NotDealtWith,
+                })?;
+                let state = keeper.load(number).map_err(not_dealt_with)?.state().clone();
+                Ok(Person { id: AccountId::new(number).ok_or(Refusal::NotDealtWith)?, revision: state.revision, email: state.email.clone(), name, admin: state.admin })
+            })
+            .await?
+    }
+
     /// Section 11, 8.7: signing out on this session, or with the note that can end it and do
     /// nothing else (and needs no session).
     pub async fn sign_out(&self, bearer: Option<account::Session>, request: SignOut) -> Answer {

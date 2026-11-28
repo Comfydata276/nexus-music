@@ -87,8 +87,12 @@ impl Serving {
             let _ = child.kill();
             let _ = child.wait();
             let mut written = String::new();
-            let _ = child.stdout.take().unwrap().read_to_string(&mut written);
-            let _ = child.stderr.take().unwrap().read_to_string(&mut written);
+            if let Some(mut out) = child.stdout.take() {
+                let _ = out.read_to_string(&mut written);
+            }
+            if let Some(mut out) = child.stderr.take() {
+                let _ = out.read_to_string(&mut written);
+            }
             self.written = written;
         }
         &self.written
@@ -631,4 +635,51 @@ fn three_kinds_of_wrong_login_take_about_the_same_time_and_say_the_same_bytes() 
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64
+}
+
+/// 8.4, 7.3: setting up from the admin's page, once, with the set-up code said in the log of
+/// this start: only from the page's own origin; the second is refused; the admin then signs in
+/// at the page with the password chosen.
+#[test]
+fn the_page_sets_up_once_with_the_code_in_the_log_and_from_its_own_origin_only() {
+    use std::io::BufRead;
+    const PAGE: &str = "https://nexus.example.test";
+    let folders = Folders::new("page-set-up");
+    let port = free_port();
+    let mut settings = folders.settings(port);
+    settings.push(("NEXUS_PUBLIC_ORIGIN", PAGE.into()));
+    let mut child = program(&settings, &[]).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let said = "Its set-up code, good for fifteen minutes from now and once, is ";
+    let code = loop {
+        let line = lines.next().expect("the log ended before a set-up code").unwrap();
+        if let Some(at) = line.find(said) {
+            break OneTimeCode::typed(&line[at + said.len()..at + said.len() + 13]).unwrap();
+        }
+    };
+    let at: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    while TcpStream::connect(at).is_err() {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let backend = Serving { child: Some(child), at, written: String::new() };
+    let body = |code: &OneTimeCode| account::encode(&account::SetUp { code: OneTimeCode::new(code.expose()).unwrap(), email: Email::new(EMAIL).unwrap(), name: Name::new("Robin").unwrap(), password: Password::new(PASSWORD).unwrap() }).unwrap().bytes().to_vec();
+    let page = format!("Origin: {PAGE}\r\nX-Nexus-Admin: 1\r\n");
+    // Not from the page: malformed, and the code is not spent.
+    for other in ["", "Origin: https://other.example.test\r\nX-Nexus-Admin: 1\r\n", "Origin: https://nexus.example.test\r\n"] {
+        assert_eq!(backend.post_with(account::SET_UP, None, other, &body(&code)).0, 400, "{other:?}");
+    }
+    // A wrong code: the one answer for a wrong login.
+    assert_eq!(backend.post_with(account::SET_UP, None, &page, &body(&OneTimeCode::from_random(7))).0, 403);
+    std::thread::sleep(Duration::from_millis(150));
+    let (status, reply) = backend.post_with(account::SET_UP, None, &page, &body(&code));
+    match account::SetUpReply::read(status, &reply).unwrap() {
+        account::SetUpReply::Done { result } => assert!(result.admin && result.email.as_str() == EMAIL),
+        other => panic!("not set up: {other:?}"),
+    }
+    // Once.
+    std::thread::sleep(Duration::from_millis(150));
+    assert_eq!(backend.post_with(account::SET_UP, None, &page, &body(&code)).0, 403);
+    // The admin signs in at the page with the password chosen.
+    let (status, body) = backend.post_with(account::SIGN_IN, None, &page, &sign_in(with_password(EMAIL, PASSWORD), 7, "Nexus admin browser", DeviceKind::Pc));
+    assert!(signed_in(status, &body).person.admin);
 }

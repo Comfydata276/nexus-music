@@ -37,6 +37,7 @@ fn from_a_browser_not_the_page(calls: &Calls, headers: &HeaderMap) -> bool {
 pub fn router(base: Router, accounts: Arc<Accounts>, public_origin: Option<Arc<str>>) -> Router {
     let calls: Router = Router::new()
         .route(account::SIGN_IN, post(sign_in))
+        .route(account::SET_UP, post(set_up))
         .route(account::SIGN_OUT, post(sign_out))
         .route(account::LIST_DEVICES, post(devices))
         .route(account::FORCE_OUT, post(force_out))
@@ -89,6 +90,19 @@ async fn sign_in(State(calls): State<Calls>, headers: HeaderMap, body: Bytes) ->
     let page = crate::admin::is_browser(&headers);
     match read(body, account::read::<SignIn>) {
         Ok(request) => respond(calls.accounts.sign_in(request, page).await),
+        Err(answer) => respond(answer),
+    }
+}
+
+/// 8.4, 7.3: setting up, from the admin's page only: JSON, marked, from exactly
+/// `NEXUS_PUBLIC_ORIGIN`. Anything else (an app, another origin, none set) is malformed.
+async fn set_up(State(calls): State<Calls>, headers: HeaderMap, body: Bytes) -> Response<Body> {
+    if !crate::admin::browser_origin_allowed(&headers, calls.public_origin.as_deref()) {
+        let _ = read(body, |_| Ok(()));
+        return respond(refused(Refusal::Malformed));
+    }
+    match read(body, account::read::<account::SetUp>) {
+        Ok(request) => respond(calls.accounts.set_up_from_page(request).await),
         Err(answer) => respond(answer),
     }
 }
