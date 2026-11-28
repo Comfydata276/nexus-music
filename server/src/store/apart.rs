@@ -120,9 +120,18 @@ impl Store {
         }
     }
 
-    /// How many records it holds: its accounts (tombstones included) and their devices.
+    /// How much it gives, counted for the room kept for revocations (the re-review's 10): its
+    /// accounts (tombstones included), their devices, the sessions it permits and the grants
+    /// on them. A write that takes leave away lowers none of these but the last two, and
+    /// raises none.
     pub fn records(&self) -> usize {
-        self.accounts.values().map(|account| 1 + account.apart.devices.len()).sum()
+        self.accounts
+            .values()
+            .map(|account| {
+                let given = account.apart.devices.values().map(|device| device.permit.as_ref().map_or(0, |permit| 1 + usize::from(permit.leave.is_some()))).sum::<usize>();
+                1 + account.apart.devices.len() + given
+            })
+            .sum()
     }
 
     pub fn stamp_key(&self) -> StampKey {

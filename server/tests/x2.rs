@@ -1857,3 +1857,127 @@ fn a_row_written_carries_the_running_clock_to_the_store_first() {
     assert_eq!(last_heard(&keeper, ids.b1), Some(T0 + 3 * MINUTE), "the observation's own time is kept");
     keeper.close();
 }
+
+/// The re-review's 8: a link at the data's place is refused, never followed, and what it
+/// points at is left as it is.
+#[cfg(unix)]
+#[test]
+fn a_link_at_the_datas_place_is_refused_and_its_target_left_as_it_is() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = Root::new("link");
+    world(&root);
+    let elsewhere = root.path.join("elsewhere.db");
+    fs::rename(data::place(&root.data()), &elsewhere).unwrap();
+    fs::set_permissions(&elsewhere, fs::Permissions::from_mode(0o644)).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, data::place(&root.data())).unwrap();
+    let bytes = fs::read(&elsewhere).unwrap();
+    let why = unlocked(|| Keeper::open(&root.state(), &root.data(), T0 + 5 * MINUTE)).err().unwrap();
+    assert!(why.0.contains("is a link"), "{why}");
+    assert_eq!(mode(&elsewhere), 0o644);
+    assert_eq!(fs::read(&elsewhere).unwrap(), bytes);
+    // A copy that is a link is refused too.
+    fs::remove_file(data::place(&root.data())).unwrap();
+    fs::rename(&elsewhere, data::place(&root.data())).unwrap();
+    let nightly = copies::nightly(&root.data(), T0 + 6 * MINUTE).unwrap();
+    let moved = root.path.join("copy-elsewhere.db");
+    fs::rename(&nightly.path, &moved).unwrap();
+    std::os::unix::fs::symlink(&moved, &nightly.path).unwrap();
+    let why = unlocked(|| Keeper::open(&root.state(), &root.data(), T0 + 7 * MINUTE)).err().unwrap();
+    assert!(why.0.contains("is a link"), "{why}");
+}
+
+/// The re-review's C, 3 and 4: a put-back cut after its plan is in the store goes on only
+/// with the very copy it planned: never with another file waiting, other data in place, or
+/// another backend's data at the wrong folder.
+#[test]
+fn a_put_back_under_way_goes_on_only_with_the_copy_it_planned() {
+    let setup = Root::new("putback-which");
+    let ids = world(&setup);
+    let other = Root::new("putback-which-other");
+    world(&other);
+    copies::nightly(&setup.data(), T0 + 2 * MINUTE).unwrap();
+    // The data goes on after the copy: it is not the copy.
+    let mut keeper = opened(&setup, T0 + 3 * MINUTE);
+    keeper.heard(ids.b1, T0 + 3 * MINUTE).unwrap();
+    keeper.close();
+    let dry = setup.copied("putback-which-dry");
+    let (points, _) = child("put-back", &dry, 0, 0, None);
+    let begun = points.iter().position(|point| point == "put-back: begun").expect("no point before the copy is put in place") + 1;
+    let cut = |name: &str| {
+        let root = setup.copied(name);
+        let (_, ended) = child("put-back", &root, begun, 0, None);
+        assert!(!ended);
+        assert!(matches!(store_of(&root).pending, Some(compare::Pending::PutBack { .. })));
+        root
+    };
+    let refused = |root: &Root, what: &str| {
+        let live = fs::read(data::place(&root.data())).unwrap_or_default();
+        let store = fs::read(apart::place(&root.state())).unwrap();
+        let why = unlocked(|| Keeper::open(&root.state(), &root.data(), T0 + 20 * MINUTE)).err().unwrap_or_else(|| panic!("{what}: served"));
+        let again = unlocked(|| keeper::put_back(&root.state(), &root.data(), &the_copy(root), T0 + 20 * MINUTE)).err().unwrap_or_else(|| panic!("{what}: the command went on"));
+        assert_eq!(fs::read(data::place(&root.data())).unwrap_or_default(), live, "{what}: the data was changed");
+        assert_eq!(fs::read(apart::place(&root.state())).unwrap(), store, "{what}: the store was changed");
+        (why.0, again.0)
+    };
+    // Another file waiting in the copy's place.
+    let root = cut("putback-which-swapped");
+    fs::write(data::incoming(&root.data()), b"made up").unwrap();
+    let (why, again) = refused(&root, "another file waiting");
+    assert!(why.contains("not the copy it planned") && again.contains("not the copy it planned"), "{why} / {again}");
+    // The copy gone, and the data it was to replace still in place.
+    let root = cut("putback-which-incumbent");
+    fs::remove_file(data::incoming(&root.data())).unwrap();
+    let (why, _) = refused(&root, "the incumbent");
+    assert!(why.contains("not the copy it planned"), "{why}");
+    // The wrong folder at NEXUS_DATA: another backend's data, no copy waiting.
+    let root = cut("putback-which-foreign");
+    fs::remove_file(data::incoming(&root.data())).unwrap();
+    for file in [data::FILE, "nexus.db-wal", "nexus.db-shm"] {
+        let _ = fs::remove_file(root.data().join(file));
+    }
+    fs::copy(copies::nightly(&other.data(), T0 + 3 * MINUTE).unwrap().path, data::place(&root.data())).unwrap();
+    let (why, again) = refused(&root, "another backend's data");
+    assert!(why.contains("another backend's") && again.contains("another backend's"), "{why} / {again}");
+    // And the copy planned, untouched: the start finishes it.
+    let root = cut("putback-which-right");
+    let (keeper, started) = settled(&root, T0 + 20 * MINUTE);
+    assert_eq!(keeper.restore(), 1, "{started:?}");
+}
+
+/// The re-review's 10: at the edge of the store's room, what takes leave away is still
+/// written, and what gives leave (a session) is refused.
+#[test]
+fn at_the_stores_edge_a_reset_is_written_and_a_sign_in_is_refused() {
+    let root = Root::new("edge");
+    let ids = world(&root);
+    {
+        let mut keeper = opened(&root, T0 + 2 * MINUTE);
+        let purpose = admin_leave(&mut keeper, AdminAction::ResetPassword, BOB);
+        leave(&mut keeper, ROOT, ids.root, 30, 32, purpose, T0 + 2 * MINUTE).unwrap();
+        keeper.close();
+    }
+    // Tombstones of accounts long gone, to just past the room kept for growth.
+    let mut big = store_of(&root);
+    let mut tombstone = big.accounts[&BOB].clone();
+    tombstone.apart.account.status = Status::Deleted;
+    tombstone.apart.devices.clear();
+    let mut number = 100;
+    while apart::write_within(&root.state(), &big, apart::GROWTH_MAX_BYTES).is_ok() {
+        let line = 300;
+        for _ in 0..((apart::GROWTH_MAX_BYTES as usize - fs::metadata(apart::place(&root.state())).unwrap().len() as usize) / line / 2).max(50) {
+            big.accounts.insert(number, tombstone.clone());
+            number += 1;
+        }
+        big.next_account = number;
+    }
+    apart::write(&root.state(), &big).unwrap();
+    let now = T0 + 3 * MINUTE;
+    let mut keeper = opened(&root, now);
+    assert!(sign_in(&mut keeper, ALICE, 15, 12, 9, now).is_err(), "a session was given past the room for growth");
+    assert!(leave(&mut keeper, ALICE, ids.a1, 1, 12, LeaveFor::ChangePassword, now).is_err(), "a grant was given past the room for growth");
+    let until = keeper.clock(now).effective() + CODE_LIFETIME_MS;
+    administer(&mut keeper, &ids, AdminAction::ResetPassword, BOB, &[Change::Code { account: BOB, number: 2, code: &[47; 32], made_at: now, until }], now).unwrap();
+    assert!(!reads(&mut keeper, BOB, ids.b1, 5, now), "the reset did not take Bob's session away");
+    assert!(state(&mut keeper, BOB).unwrap().password_reset_required);
+    keeper.close();
+}
