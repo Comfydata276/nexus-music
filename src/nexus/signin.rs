@@ -1215,6 +1215,80 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// W7c item 9: both sign-in forms and the no-music screen say exactly the words both apps
+    /// use (the lead's ruling of 17:35, "one set of words for signing in"), at every window
+    /// size: every literal in those screens is one of them or one of the few controls the
+    /// review kept (Offline, Back, Check now), and every one of them is there; the hint is
+    /// directly under "Choose a password".
+    #[test]
+    fn the_sign_in_screens_say_the_words_both_apps_use() {
+        let source = include_str!("../../ui/pages.slint");
+        let part = |from: &str, to: Option<&str>| {
+            let start = source.find(from).expect(from);
+            let end = to.map_or(source.len(), |to| start + source[start..].find(to).expect(to));
+            &source[start..end]
+        };
+        let literals = |text: &str| -> Vec<String> {
+            let mut found = Vec::new();
+            let mut rest = text;
+            while let Some(at) = rest.find('"') {
+                let after = &rest[at + 1..];
+                let end = after.find('"').expect("a closed literal");
+                found.push(after[..end].to_string());
+                rest = &after[end + 1..];
+            }
+            found
+        };
+        let login = part("export component LoginPage", Some("export component NoMusicPage"));
+        let bulletin = [
+            "Sign in to Nexus Music",
+            "Type your Nexus server's address, and the email and password of your account there.",
+            "Nexus server",
+            "nexus.example.org",
+            "Email",
+            "Password",
+            "Sign in",
+            "Signing in…",
+            "I have a one-time code",
+            "Your first sign-in",
+            "Type your Nexus server's address, the one-time code its admin gave you, and the password you'll sign in with from now on.",
+            "One-time code",
+            "ABCD EFGH JKMN",
+            "Choose a password",
+            "At least 15 characters, and not your email.",
+            "The same again",
+            "Sign in with my password instead",
+            "Try again in ",
+            " s",
+            "Your password goes only to your Nexus server, and is never kept on this PC.",
+        ];
+        let kept = ["", "Offline mode is on.", "Turn off Offline mode", "Back"];
+        let found = literals(login);
+        for literal in &found {
+            assert!(bulletin.contains(&literal.as_str()) || kept.contains(&literal.as_str()), "not one of the words: {literal:?}");
+        }
+        for words in bulletin {
+            assert!(found.iter().any(|literal| literal == words), "missing: {words:?}");
+        }
+        // The hint, directly under the field "Choose a password" (and before "The same again").
+        let field = login.find("label: root.code ? \"Choose a password\"").unwrap();
+        let hint = login.find("At least 15 characters").unwrap();
+        let again = login.find("text: \"The same again\"").unwrap();
+        assert!(field < hint && hint < again);
+        assert!(!login[field..hint].contains("Field {"), "nothing between the field and its hint");
+        // The no-music screen.
+        let no_music = part("export component NoMusicPage", None);
+        let found = literals(no_music);
+        let (heading, body) = ("You're signed in", "Your admin hasn't set your music sign-in yet. Ask them to set it on the Nexus server's admin page.");
+        assert_eq!(format!("{heading}. {body}"), "You're signed in. Your admin hasn't set your music sign-in yet. Ask them to set it on the Nexus server's admin page.");
+        let allowed = [heading, body, "Checking…", "Check now", "Offline mode is on.", "Turn off Offline mode"];
+        for literal in &found {
+            assert!(allowed.contains(&literal.as_str()), "not one of the words: {literal:?}");
+        }
+        assert!(found.iter().any(|literal| literal == heading) && found.iter().any(|literal| literal == body));
+        assert!(source.contains("\"The PCs and phones signed in to your account. Signing one out ends its sign-in at once.\""));
+    }
+
     /// The folder for `saved`, as a sign-in that is kept records it.
     fn decide(paths: &config::Paths, saved: &Saved) -> String {
         let (folder, decided) = folder_for(paths, saved, saved.music.as_ref().unwrap()).unwrap();
