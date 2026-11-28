@@ -763,3 +763,43 @@ fn a_stamp_for_another_life_returns_no_event_outcomes() {
         assert_eq!(read_reply(reply.status(), bytes.bytes(), &sent), Err(Wrong::LifeMoved { life }));
     }
 }
+
+#[test]
+fn stats_reads_only_bounded_pages_of_starts() {
+    let page = StatsPage {
+        starts: 1,
+        recent: vec![RecentPlay { device: DeviceId::new(32).unwrap(), event: start(1) }],
+        next: None,
+    };
+    let reply = Reply::Done { result: page, receipt: receipt(5) };
+    let bytes = account::encode(&reply).unwrap();
+    assert_eq!(read_stats_reply(200, bytes.bytes()), Ok(reply));
+    let original: Value = serde_json::from_slice(bytes.bytes()).unwrap();
+    let read = |value: &Value| read_stats_reply(200, &serde_json::to_vec(value).unwrap());
+    let path = "/done/result";
+    let mut invalid = original.clone();
+    invalid.pointer_mut(path).unwrap()["recent"][0]["event"] = json!(event(2, Kind::Fault { fault: fault(), count: 1 }));
+    assert_eq!(read(&invalid), Err(BadMessage::Form));
+
+    for broken in [json!(0), json!("1"), json!(null)] {
+        let mut invalid = original.clone();
+        invalid.pointer_mut(path).unwrap()["recent"][0]["device"] = broken;
+        assert_eq!(read(&invalid), Err(BadMessage::Form));
+    }
+    let mut invalid = original.clone();
+    invalid.pointer_mut(path).unwrap()["next"] = json!(1);
+    assert_eq!(read(&invalid), Err(BadMessage::Form));
+
+    let row = original.pointer(path).unwrap()["recent"][0].clone();
+    let mut invalid = original;
+    invalid.pointer_mut(path).unwrap()["recent"] = json!(vec![row; STATS_PAGE + 1]);
+    invalid.pointer_mut(path).unwrap()["starts"] = json!(STATS_PAGE + 1);
+    assert_eq!(read(&invalid), Err(BadMessage::Form));
+
+    let refusal: StatsReply = Reply::Refused(Refusal::NotDealtWith);
+    let mut bytes = account::encode(&refusal).unwrap().bytes().to_vec();
+    assert_eq!(read_stats_reply(503, &bytes), Ok(refusal));
+    assert!(read_stats_reply(200, &bytes).is_err());
+    bytes.resize(account::SMALL_REPLY_MAX_BYTES + 1, b' ');
+    assert_eq!(read_stats_reply(503, &bytes), Err(BadMessage::TooLarge));
+}

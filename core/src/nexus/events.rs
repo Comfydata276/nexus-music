@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
 pub use super::account::DeviceKind;
-use super::account::{self, AccountId, Reply, ReplyResult, RequestHead};
+use super::account::{self, AccountId, DeviceId, Reply, ReplyResult, RequestHead};
 use super::proto::{BackendId, Version};
 use super::wire::{self, BadMessage, Fields, WireBody};
 
@@ -37,6 +37,85 @@ pub const STOP_TOLERANCE_MS: u32 = 999;
 // in its authenticated request. Stats and deletion are separate calls.
 pub const SEND_PATH: &str = "/nexus/api/events/send";
 pub const DELETE_PATH: &str = "/nexus/api/events/delete";
+pub const STATS_PATH: &str = "/nexus/api/events/stats";
+pub const STATS_PAGE: usize = 50;
+pub const STATS_REPLY_BYTES: usize = STATS_PAGE * (EVENT_BYTES + 64) + account::SMALL_REPLY_MAX_BYTES;
+
+/// An opaque position in the account's recent plays, as given by the backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct StatsCursor(u64);
+
+impl StatsCursor {
+    pub fn new(number: u64) -> Option<Self> {
+        (number > 0 && number <= i64::MAX as u64).then_some(Self(number))
+    }
+
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl wire::Value for StatsCursor {
+    fn read(raw: &RawValue) -> Result<Self, BadMessage> {
+        Self::new(u64::read(raw)?).ok_or(BadMessage::Form)
+    }
+}
+
+wire::object! {
+    StatsRequest { head: RequestHead, after: Option<StatsCursor> }
+}
+
+impl wire::Message for StatsRequest {
+    const MAX_BYTES: usize = account::SMALL_REQUEST_MAX_BYTES;
+}
+
+wire::object! {
+    RecentPlay { device: DeviceId, event: Placed }
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct StatsPage {
+    pub starts: u64,
+    pub recent: Vec<RecentPlay>,
+    pub next: Option<StatsCursor>,
+}
+
+impl wire::Value for StatsPage {
+    fn read(raw: &RawValue) -> Result<Self, BadMessage> {
+        let fields = Fields::read(raw)?;
+        let rows: Vec<&RawValue> = wire::plain_json(raw_field(&fields, "recent")?.get())?;
+        if rows.len() > STATS_PAGE {
+            return Err(BadMessage::Form);
+        }
+        let recent = rows.into_iter().map(RecentPlay::read).collect::<Result<Vec<_>, _>>()?;
+        let page = Self { starts: fields.get("starts")?, recent, next: fields.get("next")? };
+        page.check()?;
+        Ok(page)
+    }
+
+    fn check(&self) -> Result<(), BadMessage> {
+        if self.recent.len() > STATS_PAGE
+            || self.recent.len() as u64 > self.starts
+            || (self.next.is_some() && self.recent.len() != STATS_PAGE)
+            || self.recent.iter().any(|row| !matches!(row.event.record().kind(), Kind::Start { .. }))
+        {
+            return Err(BadMessage::Form);
+        }
+        Ok(())
+    }
+}
+
+impl ReplyResult for StatsPage {
+    const MAX_DONE_BYTES: usize = STATS_REPLY_BYTES;
+}
+
+pub type StatsReply = Reply<StatsPage>;
+
+/// Read the complete stamped stats page. Refusals keep the account reply's small limit.
+pub fn read_stats_reply(status: u16, whole_body: &[u8]) -> Result<StatsReply, BadMessage> {
+    account::read_reply(status, whole_body)
+}
 
 /// The design does not say the id's text spelling. Use the backend id's 32 lower-case
 /// hex digits, in its own type. Make the id once, before writing, and send it unchanged.
