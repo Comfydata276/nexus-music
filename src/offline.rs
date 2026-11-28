@@ -266,7 +266,10 @@ impl Controller {
                 // trying. Nor is a sign-in the music server refuses: the client has already
                 // stopped sending it and asked for the current one (`Client::was_refused`,
                 // design 6.3), and what is on this PC plays meanwhile.
-                Err(_) => ctl.set_unreachable(true),
+                Err(error) => {
+                    crate::diagnostics::music_connection_failed(&error);
+                    ctl.set_unreachable(true);
+                }
             },
         );
     }
@@ -281,7 +284,10 @@ impl Controller {
             |client| client.ping().map(|_| ()),
             |ctl, answer| match answer {
                 Ok(()) => {}
-                Err(_) => ctl.set_unreachable(true),
+                Err(error) => {
+                    crate::diagnostics::music_connection_failed(&error);
+                    ctl.set_unreachable(true);
+                }
             },
         );
     }

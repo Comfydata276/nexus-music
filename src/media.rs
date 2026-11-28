@@ -9,6 +9,8 @@ use slint::ComponentHandle;
 use souvlaki::{MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, MediaPosition, PlatformConfig, SeekDirection};
 
 use crate::controller::{Controller, post};
+use crate::diagnostics::{self, Line, Note};
+use crate::jam::Remote;
 use crate::subsonic::Song;
 
 pub struct MediaKeys {
@@ -34,9 +36,9 @@ impl Controller {
         let Ok(mut controls) = MediaControls::new(config) else { return false };
         let attached = controls.attach(|event| {
             post(move |ctl| match event {
-                MediaControlEvent::Play => ctl.set_playing(true),
+                MediaControlEvent::Play => ctl.media_play(false),
                 MediaControlEvent::Pause | MediaControlEvent::Stop => ctl.set_playing(false),
-                MediaControlEvent::Toggle => ctl.toggle_play(),
+                MediaControlEvent::Toggle => ctl.media_play(true),
                 MediaControlEvent::Next => ctl.next_track(),
                 MediaControlEvent::Previous => ctl.previous_track(),
                 MediaControlEvent::SetPosition(MediaPosition(at)) => ctl.seek(at.as_secs_f64()),
@@ -58,6 +60,29 @@ impl Controller {
         }
         *self.media.borrow_mut() = Some(MediaKeys { controls, reported: 0.0 });
         true
+    }
+
+    fn media_play(self: &Rc<Self>, toggle: bool) {
+        if self.remote(if toggle { Remote::Toggle } else { Remote::Play(true) }) {
+            return;
+        }
+        let was_playing = {
+            let playback = self.playback.borrow();
+            if playback.current().is_none() {
+                diagnostics::observe(Line::Note(Note::MediaButtonNothingToResume));
+                return;
+            }
+            playback.playing
+        };
+        let can_play = self.client().is_some();
+        if toggle {
+            self.toggle_play_here();
+        } else {
+            self.set_playing_here(true);
+        }
+        if !was_playing && can_play && self.playback.borrow().playing {
+            diagnostics::observe(Line::Note(Note::MediaButtonStarted));
+        }
     }
 
     pub fn media_track(self: &Rc<Self>, song: Option<&Song>) {

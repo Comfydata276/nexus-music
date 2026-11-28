@@ -697,5 +697,7 @@ export global Settings {
     callback set-device-name(name: string);
     callback check-updates-now();
     callback save-diagnostics();
+    callback preview-diagnostics();
+    in-out property <string> diagnostics-preview;
     callback install-update();
 }
