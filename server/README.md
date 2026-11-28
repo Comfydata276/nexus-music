@@ -23,7 +23,7 @@ against the program itself; `tests/program.rs` is the program's settings, log an
 
 | Setting | |
 |---|---|
-| `NEXUS_MUSIC_SERVER` | The music server as the container reaches it, for example `http://navidrome:4533` (plain HTTP is fine: it is inside the container's network). **Must be given, and only here**: never set from the page. **The only address the backend ever connects to**: a login typed in is checked here and nowhere else; a login checked at another value of this is "cannot be used now" until it is typed again. |
+| `NEXUS_MUSIC_SERVER` | The music server as the container reaches it, for example `http://navidrome:4533` (plain HTTP is fine: it is inside the container's network). **Must be given, and only here**: never set from the page. **The only music-server address the backend connects to**: a login typed in is checked here and nowhere else; a login checked at another value of this is "cannot be used now" until it is typed again. |
 | `NEXUS_DATA_BUDGET` | How large the data may grow before new events wait: bytes, or a whole number of MB, GB or TB (`4GB`), at least 1 MB. 4 GB unless given. |
 | `NEXUS_LIDARR` | Lidarr as this container reaches it, for requests through the backend, for example `http://lidarr:8686` (plain HTTP is fine inside the container's network; no name, password, query or `#`). Not given: requests through the backend are not set up. It is set here only, never from the admin's page; the key is typed on the page and sealed to this address. |
 | `SSL_CERT_FILE` | Optional, and only if `NEXUS_MUSIC_SERVER` is HTTPS: a file of the certificates the backend trusts for it, in place of the container's own. |

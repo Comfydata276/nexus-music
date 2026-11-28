@@ -896,13 +896,15 @@ fn enqueue(
     job_id(row)
 }
 
-fn after_job(db: &Connection, actor: Actor, job: JobId) -> Result<Answer, Refusal> {
+fn after_job(db: &Connection, actor: Actor, job: JobId, rooms: &Mutex<Rooms>) -> Result<Answer, Refusal> {
+    let row = row_id(job)?;
     let (stage, result): (i64, Option<String>) = db.query_row(
         "SELECT stage, result FROM requests_jobs WHERE id = ?1 AND restore = ?2 AND account = ?3 AND session = ?4",
-        params![row_id(job)?, sql(actor.restore)?, sql(actor.account.get())?, sql(actor.session.get())?],
+        params![row, sql(actor.restore)?, sql(actor.account.get())?, sql(actor.session.get())?],
         |row| Ok((row.get(0)?, row.get(1)?)),
     ).optional().map_err(sql_error)?.ok_or(Refusal::JobNotFound)?;
-    if stage != FINISHED {
+    // Once the app sees completion, its next upstream read can use this place.
+    if stage != FINISHED || lock(rooms).jobs.contains(&row) {
         return Ok(Answer::Working);
     }
     result.ok_or(Refusal::NotDealtWith).and_then(|text| decode::<JobResult>(text.as_bytes())).map(JobResult::answer)
@@ -1306,7 +1308,7 @@ impl Requests {
                 self.wake.notify_one();
                 Answer::Begun { job }
             }
-            Call::After { job } => after_job(db, actor, job)?,
+            Call::After { job } => after_job(db, actor, job, &self.rooms)?,
             Call::ResolveBatchLine { job, index, release } => {
                 resolve_batch_line(keeper, actor, job, index, release)?;
                 self.wake.notify_one();
@@ -1365,8 +1367,8 @@ impl Requests {
                     let state = state.clone();
                     let runtime = Handle::current();
                     tokio::task::spawn_blocking(move || {
-                        let _place = place;
                         state.run(job, credential, runtime);
+                        drop(place);
                         state.wake.notify_one();
                     });
                 }

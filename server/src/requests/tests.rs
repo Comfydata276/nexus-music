@@ -697,6 +697,33 @@ fn authenticated_loopback_requests_keep_order_and_ownership_and_survive_the_clie
 }
 
 #[test]
+fn a_finished_job_releases_its_worker_before_reporting_completion() {
+    let (root, mut keeper, _) = fixture("completed-worker");
+    let rooms = Arc::new(Mutex::new(Rooms::default()));
+    let actor = Actor {
+        account: AccountId::new(1).unwrap(),
+        session: SessionId::new(1).unwrap(),
+        admin: false,
+        restore: keeper.restore(),
+        now: now(),
+    };
+    let change = cancelled();
+    let plan = Plan::resolve(&change, &Books::default(), actor, [0; 32], 0).unwrap();
+    let job = enqueue(
+        &mut keeper, actor, wire::RequestId::new(1).unwrap(), &encode(&change).unwrap(), &plan, false, &rooms,
+    ).unwrap();
+    let row = row_id(job).unwrap();
+    let place = Place::take_upstream(rooms.clone(), actor.account.get(), Some(row)).unwrap();
+    finish_job(&mut keeper, actor.now, row, &JobResult::Done(Completed::Cancelled), &[], None).unwrap();
+    assert!(matches!(after_job(keeper.data().connection(), actor, job, &rooms), Ok(Answer::Working)));
+    drop(place);
+    assert!(matches!(after_job(keeper.data().connection(), actor, job, &rooms),
+        Ok(Answer::Done { result: Completed::Cancelled })));
+    keeper.close();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn a_member_can_complete_the_full_walk_using_the_page_configured_key() {
     let lidarr = MockLidarr::start();
     let (server, [admin, member, other]) = TestServer::start("member-walk", Some(endpoint(lidarr.address)));
