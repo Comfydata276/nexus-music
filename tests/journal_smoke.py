@@ -20,6 +20,7 @@ import wave
 
 sys.path.insert(0, str(Path.cwd() / "tests/e13a"))
 from drive import App
+from suite import settings_tab
 
 PLAYLIST = "W8 fictional set"
 PLAYLIST_ID = "w8-set"
@@ -210,8 +211,12 @@ def walk(profile, port, temporary):
                 app.press("Pause")
                 until(lambda: any(row["sequence"] > paused["sequence"] and row["event"]["kind"] == "pause"
                                   for row in rows(home)), "the second Pause")
+                app.key("→")
+                sought = until(lambda: event(home, "seek", start=second["id"]), "Seek")
+                assert sought["event"]["to_ms"] > sought["event"]["from_ms"]
             else:
                 until(lambda: app.find(label=SONGS[1]["title"]) and
+                      (home / "audio.pcm").is_file() and
                       (home / "audio.pcm").stat().st_size >= 48000 * 6 * 8, "baseline playback")
                 time.sleep(3)
             raw = until(lambda: (home / media).read_bytes() if (home / media).stat().st_size > len(original) else None, "legacy play count")
@@ -230,6 +235,14 @@ def walk(profile, port, temporary):
                 app.press("Repeat")
                 time.sleep(1)
                 assert json.loads((home / "config/settings.json").read_bytes())["repeat"] == 1
+                settings_tab(app, "About", "Save diagnostics")
+                if not app.find(label="What is sent", role="Button"):
+                    scroller = app.one(type="ScrollView")
+                    app.tool("scroll_element", elementHandle=scroller["handle"], deltaY=-260)
+                app.press("What is sent")
+                report = app.one(contains="What the player has met")["accessibleLabel"]
+                for private in [FORGOTTEN_SEARCH, "Paper Astronauts", "Tin Weather", SONGS[0]["title"]]:
+                    assert private not in report and private not in player.log.read_text()
                 player.kill()
             else:
                 assert not journal_files(home)
@@ -253,7 +266,8 @@ def walk(profile, port, temporary):
         assert state["damaged"] == 1
         assert json.loads((recorded / "config/settings.json").read_bytes())["repeat"] == 1
     print("Kept log prefix and exact appended line, PCM parity, gapless Start/Stop, pause/resume, "
-          "zero-result search, no journal window flushes, Repeat across SIGKILL, and torn-tail recovery verified.")
+          "seek, zero-result search, Diagnostics privacy, no journal window flushes, Repeat across SIGKILL, "
+          "and torn-tail recovery verified.")
 
 
 if __name__ == "__main__":

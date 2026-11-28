@@ -521,3 +521,25 @@ pub(crate) fn test_account() {
         publish(Some(Scope { account: Account { backend: [7; 16], number: 1 }, life: 1 }));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_read_for_an_inactive_account_is_answered_empty() {
+        let (send, receive) = mpsc::channel();
+        let account = JournalAccount {
+            backend_id: BackendId::from_bytes([5; 16]),
+            account: AccountId::new(7).unwrap(),
+        };
+        assert!(handle_client(JournalDo::ReadEvents {
+            read: 17, account, life: 2, from_sequence: 1, max_events: 5, max_bytes: 4096,
+        }, move |event| send.send(event).unwrap()).is_ok());
+        let Happened::EventsRead { read, account: owner, life, events } = receive.try_recv().unwrap() else {
+            panic!("expected EventsRead");
+        };
+        assert_eq!((read, owner, life), (17, account, 2));
+        assert!(events.is_empty());
+    }
+}
