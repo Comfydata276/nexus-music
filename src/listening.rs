@@ -30,6 +30,7 @@ enum Error {
     Transport(TransportError),
     Refused(account::Refusal),
     MissingRevision,
+    AlreadyDeleted,
     Invalid,
 }
 
@@ -61,6 +62,7 @@ impl Error {
             }
             Self::Transport(TransportError::Unreachable) => "Couldn't reach your Nexus server.".into(),
             Self::MissingRevision => "This Nexus server didn't provide the account revision needed to delete history.".into(),
+            Self::AlreadyDeleted => "Your listening history was already deleted.".into(),
             Self::Invalid | Self::Refused(_) => "Your Nexus server couldn't complete this action. Try again.".into(),
         }
     }
@@ -270,11 +272,17 @@ fn start_delete(window: &ui::MainWindow, password: Password) {
     });
 }
 
+fn check_delete_life(started: u64, current: u64) -> Result<(), Error> {
+    match current.cmp(&started) {
+        std::cmp::Ordering::Greater => Err(Error::AlreadyDeleted),
+        std::cmp::Ordering::Less => Err(Error::Transport(TransportError::Stopped)),
+        std::cmp::Ordering::Equal => Ok(()),
+    }
+}
+
 fn delete(context: Context, password: Password) -> Result<u64, Error> {
     let (stamp, latest) = read_stats(context)?;
-    if stamp.life != context.life {
-        return Err(Error::Transport(TransportError::Stopped));
-    }
+    check_delete_life(context.life, stamp.life)?;
     let deletion = HistoryDeletion::new(context.head(), &stamp, &latest, calls::new_id()?)?;
     let grant_request = deletion.grant(password)?;
     let grant = calls::post(context, account::GRANT, grant_request.bytes())?;
@@ -302,6 +310,15 @@ mod tests {
             offline: false,
             verified: true,
         }
+    }
+
+    #[test]
+    fn retry_after_a_lost_delete_reply_reports_the_advanced_life() {
+        let started = context().life;
+        assert!(check_delete_life(started, started).is_ok());
+        assert!(matches!(check_delete_life(started, started - 1), Err(Error::Transport(TransportError::Stopped))));
+        let error = check_delete_life(started, started + 1).unwrap_err();
+        assert_eq!(error.words(), "Your listening history was already deleted.");
     }
 
     #[test]
