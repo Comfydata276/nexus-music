@@ -302,7 +302,7 @@ fn due(ui: &ui::MainWindow, generation: u64) {
                 let outcome = supervise(&url, generation, deadline());
                 IN_FLIGHT.store(false, Ordering::SeqCst);
                 hold_result_for_tests(outcome);
-                let _ = weak.upgrade_in_event_loop(move |ui| commit(&ui, generation, &account, outcome));
+                let _ = weak.upgrade_in_event_loop(move |ui| commit(&ui, generation, &account, &url, outcome));
             });
             if started.is_err() {
                 IN_FLIGHT.store(false, Ordering::SeqCst);
@@ -314,7 +314,7 @@ fn due(ui: &ui::MainWindow, generation: u64) {
 
 /// An answer has come back: shown only if it is for the generation in use and the account
 /// the window publishes now, and Offline mode is still off.
-fn commit(ui: &ui::MainWindow, generation: u64, account: &str, outcome: Outcome) {
+fn commit(ui: &ui::MainWindow, generation: u64, account: &str, url: &str, outcome: Outcome) {
     let current = RUNNING.with(|running| running.borrow().as_ref().is_some_and(|running| running.generation == generation));
     // (A deliberate fault, to show that the test of a late answer catches it.)
     let sabotaged = test_var("NEXUS_TEST_SABOTAGE_NO_GENERATION").is_some();
@@ -328,10 +328,8 @@ fn commit(ui: &ui::MainWindow, generation: u64, account: &str, outcome: Outcome)
         return;
     }
     let settings = ui.global::<ui::Settings>();
-    // The address the answer was asked at: that of the account it was for.
-    let (server, name) = account.split_once('\n').unwrap_or_default();
-    let url = signin::backend_for(server, name).and_then(|backend| proto::hello_url(&backend)).unwrap_or_default();
-    settings.set_nexus_server(words(outcome, &url).into());
+    // Worded by the address it was asked at.
+    settings.set_nexus_server(words(outcome, url).into());
     // (With the fault above, the late answer is put under the account published now.)
     settings.set_nexus_for(if sabotaged { published(ui) } else { account.to_string() }.into());
     note(format_args!("shown {generation} {outcome:?}"));
