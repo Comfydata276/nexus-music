@@ -3,7 +3,9 @@
 //!
 //! None of them is secret, so the log may say what they are.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
+
+pub use crate::proxy::ProxySetting;
 use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -11,8 +13,9 @@ pub struct Settings {
     /// The music server as the container reaches it, e.g. `http://navidrome:4533`. Not used
     /// at stage 1's first slice; checked all the same, so that a wrong one is said now.
     pub music_server: String,
-    /// The one address the proxy connects to this container from.
-    pub proxy: IpAddr,
+    /// Who the proxy is: the one address it connects to this container from, or the name of
+    /// its container on a network they share, looked up as connections come ([`crate::proxy`]).
+    pub proxy: ProxySetting,
     pub data: PathBuf,
     pub state: PathBuf,
     pub listen: SocketAddr,
@@ -46,11 +49,10 @@ impl Settings {
             })?,
         };
         let proxy = match setting("NEXUS_PROXY") {
-            None => return Err("NEXUS_PROXY is missing: give the one address the proxy connects to this container from, for example 172.18.0.2".into()),
-            Some(value) => match value.parse::<IpAddr>() {
-                Ok(address) if !address.to_canonical().is_unspecified() && !address.to_canonical().is_multicast() => address.to_canonical(),
-                _ => return Err("NEXUS_PROXY is wrong: give one IP address (not a name, a range or a port), the one the proxy connects to this container from, for example 172.18.0.2".into()),
-            },
+            None => return Err("NEXUS_PROXY is missing: give the one address the proxy connects to this container from, for example 172.18.0.2, or the name of the proxy's container on a network it shares with this one, for example Nginx-Proxy-Manager-Official".into()),
+            Some(value) => value.parse::<ProxySetting>().map_err(|_| {
+                "NEXUS_PROXY is wrong: give one IP address (not a range or a port), the one the proxy connects to this container from, for example 172.18.0.2, or the plain name of the proxy's container (no scheme, port, path or space), for example Nginx-Proxy-Manager-Official".to_string()
+            })?,
         };
         let folder = |name: &str, default: &str| -> Result<PathBuf, String> {
             let value = setting(name).unwrap_or_else(|| default.to_string());
@@ -187,6 +189,7 @@ fn music_server(value: &str) -> Option<String> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::net::IpAddr;
 
     #[cfg(unix)]
     #[test]
@@ -279,8 +282,12 @@ mod tests {
             ("NEXUS_MUSIC_SERVER", "http://[::1]x"),
             ("NEXUS_MUSIC_SERVER", "http://navidrome/../rest"),
             ("NEXUS_MUSIC_SERVER", "http://navidrome//music"),
-            ("NEXUS_PROXY", "npm"),
             ("NEXUS_PROXY", "172.18.0.0/16"),
+            ("NEXUS_PROXY", "http://npm"),
+            ("NEXUS_PROXY", "npm:81"),
+            ("NEXUS_PROXY", "npm/"),
+            ("NEXUS_PROXY", "npm proxy"),
+            ("NEXUS_PROXY", "172.18.0"),
             ("NEXUS_PROXY", "172.18.0.2:80"),
             ("NEXUS_PROXY", "0.0.0.0"),
             ("NEXUS_PROXY", "::"),
@@ -327,6 +334,17 @@ mod tests {
         // Folders that only begin alike are apart.
         let pairs = with(&[("NEXUS_DATA", "/srv/data"), ("NEXUS_STATE", "/srv/data-state")]);
         assert!(read(&pairs).is_ok());
+    }
+
+    /// The lead's ruling of 28 Nov: the proxy by its container's name, when its address is not fixed.
+    #[test]
+    fn the_proxy_may_be_named_by_its_containers_name() {
+        for name in ["Nginx-Proxy-Manager-Official", "npm", "proxy_1.lan"] {
+            let pairs = with(&[("NEXUS_PROXY", name)]);
+            assert_eq!(read(&pairs).unwrap().proxy, ProxySetting::Name(name.into()), "{name}");
+        }
+        let pairs = with(&[("NEXUS_PROXY", "fd00::2")]);
+        assert_eq!(read(&pairs).unwrap().proxy, ProxySetting::Address("fd00::2".parse().unwrap()));
     }
 
     /// S12's audit, S1: a data budget mistyped stops the start, by name; a right one is taken.

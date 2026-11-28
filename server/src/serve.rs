@@ -74,6 +74,7 @@ use crate::accounts::admit::Admission;
 use crate::accounts::desk::{ADMITTED, Admitted};
 use crate::bounds::*;
 use crate::head::{self, NoHead, Route, Verdict};
+use crate::proxy::Proxy;
 
 /// Who opened a connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,8 +91,13 @@ pub enum Peer {
 /// Who `from` is, for a proxy at `proxy`. Both are compared as plain addresses, so an IPv4
 /// address written as IPv6 (`::ffff:a.b.c.d`) is the same address.
 pub fn peer(from: IpAddr, proxy: IpAddr) -> Peer {
+    peer_is(from, from.to_canonical() == proxy.to_canonical())
+}
+
+/// Who `from` is, once it is known whether it is the proxy ([`Proxy`]: an address or a name).
+pub fn peer_is(from: IpAddr, proxy: bool) -> Peer {
     let from = from.to_canonical();
-    if from == proxy.to_canonical() {
+    if proxy {
         Peer::Proxy
     } else if from == IpAddr::V4(Ipv4Addr::LOCALHOST) || from == IpAddr::V6(Ipv6Addr::LOCALHOST) {
         Peer::Health
@@ -142,7 +148,7 @@ const REFUSALS: [(Refusal, &str); 16] = [
 
 /// The listener's own state: whom it answers, what answers, and its counts.
 pub struct Shell {
-    proxy: IpAddr,
+    proxy: Proxy,
     router: Router,
     routes: Vec<Route>,
     /// Who may take a reserved slot (the backend's own; none in a shell without accounts).
@@ -168,19 +174,24 @@ impl Shell {
     /// The backend's own: `hello`, the admin's document, and signing in and everything a
     /// session does (S8), at [`head::ROUTES`]. The page's calls with no session are taken
     /// only from `public_origin` (`NEXUS_PUBLIC_ORIGIN`). The validated data budget caps event intake.
-    pub fn backend(proxy: IpAddr, hello: &Hello, accounts: Arc<crate::accounts::session::Accounts>, public_origin: Option<&str>, data_budget: u64) -> Arc<Self> {
+    pub fn backend(proxy: impl Into<Proxy>, hello: &Hello, accounts: Arc<crate::accounts::session::Accounts>, public_origin: Option<&str>, data_budget: u64) -> Arc<Self> {
         let public_origin = public_origin.map(Arc::<str>::from);
         let router = crate::accounts::routes::router(base_router(hello), accounts.clone(), public_origin.clone());
         let admit = accounts.admission.clone();
         let router = crate::events::router(router, accounts, public_origin, data_budget);
-        let shell = Self::with_routes(proxy, router, head::ROUTES.to_vec());
+        let shell = Self::with_proxy(proxy, router, head::ROUTES.to_vec());
         Arc::new(Shell { admit: Some(admit), ..Arc::into_inner(shell).expect("made just now") })
     }
 
     /// With other routes (the tests add some): `routes` names each path `router` answers, and
     /// the one method it answers there.
     pub fn with_routes(proxy: IpAddr, router: Router, routes: Vec<Route>) -> Arc<Self> {
-        Arc::new(Shell { proxy: proxy.to_canonical(), router, routes, admit: None, open: AtomicUsize::new(0), serving: AtomicUsize::new(0), refused: Default::default() })
+        Self::with_proxy(proxy, router, routes)
+    }
+
+    /// As [`Shell::with_routes`], with the proxy at an address or by a name ([`Proxy`]).
+    pub fn with_proxy(proxy: impl Into<Proxy>, router: Router, routes: Vec<Route>) -> Arc<Self> {
+        Arc::new(Shell { proxy: proxy.into(), router, routes, admit: None, open: AtomicUsize::new(0), serving: AtomicUsize::new(0), refused: Default::default() })
     }
 
     /// How many connections are open now, turned-away ones included.
@@ -331,16 +342,26 @@ pub async fn serve(listener: TcpListener, shell: Arc<Shell>, log: bool) {
         };
         // The head's deadline counts from here, not from when its task first runs.
         let deadline = tokio::time::Instant::now() + HEAD_DEADLINE;
-        let peer = peer(from.ip(), shell.proxy);
-        if peer == Peer::Stranger {
+        // Who it is: at once for a fixed address, and for a name whose answer is fresh;
+        // otherwise on the connection's own task, so that a lookup never holds up the others.
+        let known = shell.proxy.now(from.ip()).map(|is| peer_is(from.ip(), is));
+        if known == Some(Peer::Stranger) {
             shell.count(Refusal::Stranger);
             drop(stream);
             continue;
         }
-        let _ = stream.set_nodelay(true);
         let (shell, slots) = (shell.clone(), slots.clone());
         tokio::spawn(async move {
             let _room = roomed;
+            let peer = match known {
+                Some(peer) => peer,
+                None => peer_is(from.ip(), shell.proxy.is(from.ip()).await),
+            };
+            if peer == Peer::Stranger {
+                shell.count(Refusal::Stranger);
+                return;
+            }
+            let _ = stream.set_nodelay(true);
             let _open = Open::new(&shell);
             connection(Guarded::new(stream, shell.clone()), peer, deadline, shell, slots).await;
         });
@@ -696,6 +717,78 @@ mod tests {
         // A proxy on this machine's loopback is the proxy there, and needs its mark.
         let local: IpAddr = "127.0.0.1".parse().unwrap();
         assert_eq!(peer(local, local), Peer::Proxy);
+    }
+
+    /// The lead's ruling of 28 Nov: a proxy named, over the real listener on loopback. Its
+    /// name's answer is a test's (no real lookup): the peer there is answered, another is
+    /// answered nothing, a new address is followed, and a name not found answers no one.
+    #[test]
+    fn a_proxy_named_is_answered_where_its_name_says_and_nowhere_else() {
+        use std::io::{Read, Write};
+        use std::sync::Mutex;
+        use std::time::Duration;
+
+        let at: Arc<Mutex<Option<IpAddr>>> = Arc::new(Mutex::new(Some("127.0.0.2".parse().unwrap())));
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let resolve: crate::proxy::Resolver = {
+            let (at, lookups) = (at.clone(), lookups.clone());
+            Arc::new(move |name: &str| {
+                assert_eq!(name, "npm");
+                lookups.fetch_add(1, Ordering::SeqCst);
+                let found = *at.lock().unwrap();
+                Box::pin(async move { found.map(|found| vec![found]).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no")) })
+            })
+        };
+        let fresh = Duration::from_millis(300);
+        let proxy = Proxy::named_with("npm".into(), resolve, false, fresh, fresh, Duration::from_secs(2));
+        let hello = Hello::for_accounts(crate::version(), proto::BackendId::from_bytes([7; 16]), proto::SPEAKS);
+        let shell = Shell::with_proxy(proxy, router(&hello), head::ROUTES.iter().copied().filter(|route| route.path == proto::HELLO).collect());
+        let (bound, listening) = std::sync::mpsc::channel();
+        let serving = shell.clone();
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap().block_on(async move {
+                let listener = listen("127.0.0.1:0".parse().unwrap()).unwrap();
+                bound.send(listener.local_addr().unwrap()).unwrap();
+                serve(listener, serving, false).await;
+            });
+        });
+        let to = listening.recv().unwrap();
+        let ask = |from: &str| -> Vec<u8> {
+            let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+            socket.bind(&std::net::SocketAddr::new(from.parse().unwrap(), 0).into()).unwrap();
+            socket.connect(&to.into()).unwrap();
+            let mut stream: std::net::TcpStream = socket.into();
+            stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+            let _ = stream.write_all(format!("GET {} HTTP/1.1\r\nHost: nexus.example.org\r\nX-Nexus-Scheme: https\r\n\r\n", proto::HELLO).as_bytes());
+            let mut written = Vec::new();
+            let _ = stream.read_to_end(&mut written);
+            written
+        };
+        let answered = |written: &[u8]| written.starts_with(b"HTTP/1.1 200 ");
+        assert!(answered(&ask("127.0.0.2")), "the peer at the name");
+        assert_eq!(ask("127.0.0.3"), b"", "another on the network: nothing");
+        assert_eq!(shell.refused(Refusal::Stranger), 1);
+        // The proxy started again elsewhere: followed once the answer is old.
+        *at.lock().unwrap() = Some("127.0.0.3".parse().unwrap());
+        std::thread::sleep(fresh + Duration::from_millis(100));
+        assert!(answered(&ask("127.0.0.3")));
+        assert_eq!(ask("127.0.0.2"), b"");
+        // The name not found: no one is the proxy; back when it is found again.
+        *at.lock().unwrap() = None;
+        std::thread::sleep(fresh + Duration::from_millis(100));
+        assert_eq!(ask("127.0.0.3"), b"");
+        assert_eq!(ask("127.0.0.2"), b"");
+        *at.lock().unwrap() = Some("127.0.0.2".parse().unwrap());
+        std::thread::sleep(fresh + Duration::from_millis(100));
+        assert!(answered(&ask("127.0.0.2")));
+        // A burst within one answer's life: one lookup more at most.
+        let before = lookups.load(Ordering::SeqCst);
+        for _ in 0..20 {
+            assert!(answered(&ask("127.0.0.2")));
+        }
+        assert!(lookups.load(Ordering::SeqCst) - before <= 1);
+        // The health check from this machine is unchanged.
+        assert!(answered(&ask("127.0.0.1")));
     }
 
     #[test]

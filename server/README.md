@@ -25,7 +25,7 @@ against the program itself; `tests/program.rs` is the program's settings, log an
 | `NEXUS_MUSIC_SERVER` | The music server as the container reaches it, for example `http://navidrome:4533` (plain HTTP is fine: it is inside the container's network). **Must be given, and only here**: never set from the page. **The only address the backend ever connects to**: a login typed in is checked here and nowhere else; a login checked at another value of this is "cannot be used now" until it is typed again. |
 | `NEXUS_DATA_BUDGET` | How large the data may grow before new events wait: bytes, or a whole number of MB, GB or TB (`4GB`), at least 1 MB. 4 GB unless given. |
 | `SSL_CERT_FILE` | Optional, and only if `NEXUS_MUSIC_SERVER` is HTTPS: a file of the certificates the backend trusts for it, in place of the container's own. |
-| `NEXUS_PROXY` | The one IP address the proxy connects to this container from, for example `172.18.0.2`. **Must be given.** Nothing else is answered. |
+| `NEXUS_PROXY` | Who the proxy is: the one IP address it connects to this container from, for example `172.18.0.2`, or the name of the proxy's container on a network the two share, for example `Nginx-Proxy-Manager-Official` (see below). **Must be given.** Nothing else is answered. |
 | `NEXUS_DATA` | The data folder: one SQLite file, `nexus.db`, and its nightly copies in `copies/`. `/data` unless given. On a disk of the machine's own, not a network folder. |
 | `NEXUS_STATE` | The folder of the store kept apart: the backend's id (`id`), its restore number, its keys, and what must never go backwards when the data does (`kept`). `/state` unless given. Not the data folder, inside it or around it, through a link or a mount either. **Never copied or put back with the data.** |
 | `NEXUS_LISTEN` | `0.0.0.0:8080` unless given. Not port 0. The health check asks on this machine's loopback, so listen on every address or on loopback. |
@@ -67,8 +67,13 @@ These are what the backend relies on; none of them can it check for itself.
 
 - **Its port is reachable from the proxy alone.** Do not publish the container's port on
   the machine; put the container on a network it shares with the proxy, and nothing else.
-- **The proxy's address on that network is fixed**, and it is `NEXUS_PROXY`: a container's
-  address can change when it is started again, and then nothing is answered.
+- **`NEXUS_PROXY` says who the proxy is, in one of two ways.** If the proxy has a fixed
+  address on that network, give that address. Otherwise give the proxy container's name on
+  that network (for example `Nginx-Proxy-Manager-Official`): the backend looks the name up
+  when connections come (at most every few seconds) and answers only the address it gives
+  now, so a proxy started again at a new address is followed; while the name gives nothing,
+  no one is answered. This relies on only the proxy's container answering to that name on
+  that network, so keep the network to containers you run.
 - **The backend reaches the music server inside, at `NEXUS_MUSIC_SERVER`** (for example
   `http://navidrome:4533` on a network it shares with the music server's container), and
   nowhere else. The address people use for the music server (its own HTTPS name on the proxy)

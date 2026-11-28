@@ -231,7 +231,7 @@ fn run(settings: Settings) -> ExitCode {
             Some(on) => nexus_music_server::hello(id).with_diagnostics_default(on),
             None => nexus_music_server::hello(id),
         };
-        let shell = serve::Shell::backend(settings.proxy, &hello, accounts.clone(), settings.public_origin.as_deref(), settings.data_budget);
+        let shell = serve::Shell::backend(settings.proxy.clone(), &hello, accounts.clone(), settings.public_origin.as_deref(), settings.data_budget);
         serve::serve(listener, shell, true).await;
         ExitCode::SUCCESS
     });
