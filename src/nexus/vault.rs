@@ -280,21 +280,26 @@ mod raw {
         }
         let mut names = Vec::new();
         // SAFETY: `list` holds `count` valid pointers until CredFree.
-        for &credential in unsafe { std::slice::from_raw_parts(list, count as usize) } {
-            // SAFETY: each pointer is a valid CREDENTIALW; only its type and name are read.
-            let credential = unsafe { &*credential };
+        for index in 0..count as usize {
+            // SAFETY: `list` holds `count` pointers to valid CREDENTIALWs until CredFree; only
+            // each one's type and name are read. Read unaligned: Wine packs them without
+            // aligning (Windows aligns them), and both are read the same way.
+            let credential: CREDENTIALW = unsafe { list.add(index).read_unaligned().read_unaligned() };
             if credential.Type != CRED_TYPE_GENERIC || credential.TargetName.is_null() {
                 continue;
             }
-            // SAFETY: TargetName is a NUL-terminated wide string.
-            let wide = unsafe {
-                let mut len = 0;
-                while *credential.TargetName.add(len) != 0 {
-                    len += 1;
+            // SAFETY: TargetName is a NUL-terminated wide string, read a unit at a time.
+            let wide: Vec<u16> = unsafe {
+                let mut units = Vec::new();
+                loop {
+                    let unit = credential.TargetName.add(units.len()).read_unaligned();
+                    if unit == 0 || units.len() > 32 * 1024 {
+                        break units;
+                    }
+                    units.push(unit);
                 }
-                std::slice::from_raw_parts(credential.TargetName, len)
             };
-            if let Ok(name) = String::from_utf16(wide)
+            if let Ok(name) = String::from_utf16(&wide)
                 && name.ends_with(SUFFIX)
             {
                 names.push(name);
