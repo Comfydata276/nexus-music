@@ -284,7 +284,8 @@ fn mock(request: &Question, state: &mut LidarrState) -> Value {
         "monitorNewItems":state.new_releases.as_deref().unwrap_or("all")});
     match (request.method.as_str(), target) {
         ("GET", "system/status") => json!({"version":"2.0.0"}),
-        ("GET", "album/lookup?term=Glass%20Orchard") => json!([album(state.monitored)]),
+        ("GET", "album/lookup?term=Glass%20Orchard" | "album/lookup?term=Glass%20Orchard%20Quillon%20Vane") =>
+            json!([album(state.monitored)]),
         ("GET", "artist") => json!([artist]),
         ("GET", "artist/5") => artist,
         ("GET", "command") => json!([]),
@@ -442,12 +443,16 @@ impl TestServer {
     }
 
     fn done(&self, who: &Person, job: JobId) -> Completed {
+        self.outcome(who, job).expect("job failed")
+    }
+
+    fn outcome(&self, who: &Person, job: JobId) -> Result<Completed, Refusal> {
         let start = Instant::now();
         loop {
             match self.call(who, Call::After { job }) {
-                Answer::Done { result } => return result,
+                Answer::Done { result } => return Ok(result),
                 Answer::Working => {}
-                Answer::Failed { reason } => panic!("job failed: {reason:?}"),
+                Answer::Failed { reason } => return Err(reason),
                 _ => panic!("unexpected job answer"),
             }
             if start.elapsed() >= Duration::from_secs(8) {
@@ -559,6 +564,11 @@ fn authenticated_loopback_requests_keep_order_and_ownership_and_survive_the_clie
         Answer::Pending { albums, .. } if albums.len() == 1 && albums[0].removable && albums[0].progress == Some(73)));
     assert!(matches!(server.call(&other, Call::Pending { after: None }), Answer::Pending { albums, .. } if albums.is_empty()));
     assert!(matches!(server.call(&other, begin(1, cancelled())), Answer::Refused { reason: Refusal::AskedByOthers }));
+    let stale = Change::Cancel { album: LidarrNumber::new(10).unwrap(), release: MusicBrainzId::new(ALBUM).unwrap() };
+    let stale = begun(server.call(&first, begin(4, stale)));
+    assert_eq!(server.outcome(&first, stale), Err(Refusal::NoLongerListed));
+    assert!(lock(&lidarr.state).monitored);
+    assert!(!lidarr.take_calls().iter().any(|call| call.starts_with("PUT ")));
 
     server.offer(&other);
     let coowned = begun(server.call(&other, begin(2, change)));
@@ -803,4 +813,25 @@ fn a_slow_lidarr_read_leaves_sign_in_and_the_writer_available() {
         assert!(matches!(search.join().unwrap(), Answer::Refused { reason: Refusal::LidarrUnavailable }));
     });
     reply.join().unwrap();
+}
+
+#[test]
+fn duplicate_playlist_lines_keep_their_separate_progress_and_make_one_request() {
+    let lidarr = MockLidarr::start();
+    let (server, [_, member, other]) = TestServer::start("batch", endpoint(lidarr.address));
+    let member = server.redeem(member, 2, "");
+    let other = server.redeem(other, 3, "");
+    let source = BatchLine { artist: "Quillon Vane".into(), album: "Glass Orchard".into(), song: "First Light".into() };
+    let lines = vec![source.clone(), source];
+    let job = begun(server.call(&member, begin(1, Change::Batch { singles: false, lines })));
+    assert!(matches!(server.call(&other, Call::BatchLines { job, after: None }),
+        Answer::Refused { reason: Refusal::JobNotFound }));
+    assert_eq!(server.done(&member, job), Completed::Batch);
+    let Answer::BatchLines { lines, next: None } = server.call(&member, Call::BatchLines { job, after: None }) else {
+        panic!("the batch did not return its progress");
+    };
+    assert_eq!(lines.iter().map(|line| line.index).collect::<Vec<_>>(), [0, 1]);
+    assert!(lines.iter().all(|line| matches!(&line.progress,
+        BatchLineProgress::Asked { album } if album.offer.0.as_str() == ALBUM)));
+    assert_eq!(lidarr.take_calls().iter().filter(|&call| call == "POST command").count(), 1);
 }
