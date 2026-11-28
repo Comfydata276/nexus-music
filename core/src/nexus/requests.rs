@@ -13,6 +13,7 @@ use serde_json::value::RawValue;
 
 use super::account::{self, AccountId, Receipt};
 use super::admin;
+use super::events::clean_display_text;
 use super::wire::{self, BadMessage, Fields, Value, WireBody};
 pub use super::account::{RequestHead, RequestId};
 use crate::bulk;
@@ -1515,9 +1516,9 @@ impl TryFrom<Offer> for AlbumView {
         };
         let view = Self {
             album: OfferName(offer.album.try_into()?),
-            title: offer.title,
+            title: clean_display_text(&offer.title),
             artist_id: if offer.artist_id.is_empty() { None } else { Some(offer.artist_id.try_into()?) },
-            artist: offer.artist,
+            artist: clean_display_text(&offer.artist),
             year: offer.year,
             cover: offer.cover,
             requested: offer.requested,
@@ -1553,7 +1554,7 @@ impl TryFrom<ArtistOffer> for ArtistView {
     type Error = WireError;
 
     fn try_from(offer: ArtistOffer) -> Result<Self, WireError> {
-        let view = Self { id: offer.id.try_into()?, name: offer.name, about: offer.about, cover: offer.cover };
+        let view = Self { id: offer.id.try_into()?, name: clean_display_text(&offer.name), about: offer.about, cover: offer.cover };
         require(view.valid())?;
         Ok(view)
     }
@@ -1569,8 +1570,9 @@ impl TryFrom<Single> for SingleView {
     type Error = WireError;
 
     fn try_from(single: Single) -> Result<Self, WireError> {
-        require(safe_text(&single.title, NAME_MAX_BYTES) && single.votes >= 0)?;
-        Ok(Self { title: single.title, artist_id: single.artist_id.try_into()?, votes: single.votes })
+        let title = clean_display_text(&single.title);
+        require(safe_text(&title, NAME_MAX_BYTES) && single.votes >= 0)?;
+        Ok(Self { title, artist_id: single.artist_id.try_into()?, votes: single.votes })
     }
 }
 
@@ -1607,7 +1609,11 @@ impl TryFrom<Pending> for PendingView {
     type Error = WireError;
 
     fn try_from(pending: Pending) -> Result<Self, WireError> {
-        let view = Self { id: pending.id.try_into()?, album: pending.album.try_into()?, title: pending.title, artist: pending.artist, removable: false, progress: pending.progress };
+        let view = Self {
+            id: pending.id.try_into()?, album: pending.album.try_into()?,
+            title: clean_display_text(&pending.title), artist: clean_display_text(&pending.artist),
+            removable: false, progress: pending.progress,
+        };
         require(view.valid())?;
         Ok(view)
     }
