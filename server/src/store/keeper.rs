@@ -688,7 +688,6 @@ impl Keeper {
     /// - **A code's keyed fingerprint** only as the live code the effects decided: its number
     ///   and its deadline; anything else, or a second, refuses the step.
     /// - **A device's description** only for a device that has a fresh session in the update.
-    /// - **Where a music login was checked**, only with that login.
     ///
     /// A verifier, code or description no update calls for at all (a decision refused: its
     /// effects are still kept, whatever it answered) is not kept.
@@ -732,11 +731,6 @@ impl Keeper {
                         })
                     });
                     if fresh {
-                        kept.push(change.clone());
-                    }
-                }
-                Change::MusicChecked { account, .. } => {
-                    if update_of(account).is_some_and(|update| matches!(update.change, DataChange::InstallMusicLogin(_))) {
                         kept.push(change.clone());
                     }
                 }
@@ -788,21 +782,15 @@ impl Keeper {
             numbers.push(number);
         }
         let added = self.selected(effects, &numbers, extra)?;
-        // What a music login cannot be kept without, said before anything is written: its own
-        // account, backend and count, and the internal address it was checked at (S9).
-        for (update, &number) in effects.updates.iter().zip(&numbers) {
-            let given = |found: &dyn Fn(&Change<'_>) -> bool| added.iter().any(found);
-            match &update.change {
-                DataChange::InstallMusicLogin(install) => {
-                    let binding = &install.binding;
-                    if binding.account != update.apart_first.account.id || binding.count != update.data.account.music_login || binding.backend != self.backend {
-                        return Err(Failed("A music login was sealed for another account, backend or count; nothing was kept.".into()));
-                    }
-                    if !given(&|change| matches!(change, Change::MusicChecked { account, .. } if *account == number)) {
-                        return Err(Failed("A music login came with no address it was checked at; nothing was kept.".into()));
-                    }
+        // What a music login cannot be kept without, said before anything is written: sealed
+        // for its own account, this backend and the row's count (its internal address is in
+        // the binding itself, core-fu2).
+        for update in &effects.updates {
+            if let DataChange::InstallMusicLogin(install) = &update.change {
+                let binding = &install.binding;
+                if binding.account != update.apart_first.account.id || binding.count != update.data.account.music_login || binding.backend != self.backend {
+                    return Err(Failed("A music login was sealed for another account, backend or count; nothing was kept.".into()));
                 }
-                _ => {}
             }
         }
         let mut next = self.store.clone();
@@ -851,15 +839,7 @@ impl Keeper {
                 // The account's listening events go in this same step: its life moves on in
                 // `Install`, and the data's trigger deletes them unless they are held (12.5).
                 DataChange::EraseHistory => {}
-                DataChange::InstallMusicLogin(install) => {
-                    let internal = added.iter().find_map(|change| match change {
-                        Change::MusicChecked { account, internal } if *account == number => Some(*internal),
-                        _ => None,
-                    });
-                    if let Some(internal) = internal {
-                        changes.push(Change::MusicLogin { account: number, install, internal });
-                    }
-                }
+                DataChange::InstallMusicLogin(install) => changes.push(Change::MusicLogin { account: number, install }),
                 DataChange::ApplyAdmin { action, target } => match (action, target) {
                     (AdminAction::SetMusicAddress(address), AdminTarget::Backend) => changes.push(Change::MusicPublic { address: address.as_str() }),
                     (AdminAction::SetDiagnosticsDefault(on), AdminTarget::Backend) => changes.push(Change::DiagnosticsDefault { on: *on }),
