@@ -207,6 +207,16 @@ location (a header too large for it, say) is written to the host's own log.
   `Content-Length` alone, at most the call's own ceiling (1 KiB for most calls, 4 KiB for
   one that carries a password, 1 MiB at most; no chunks, no `Expect`: the proxy sends every
   body counted). Each refusal is a bare answer, and the body is not read before it.
+- **Then whose session it is, before a byte of the body is read.** The admin's page has a
+  session of its own kind, and an app's session can do nothing the page does, nor the
+  reverse: every call under `/nexus/api/admin/` (the grant included) is the page's alone;
+  every other call that needs a session is an app's alone (devices, force-out,
+  change-password, the music login, events, Diagnostics, requests); signing in, setting up
+  and `hello` need none; signing out is either's. A call with no session, or one of the
+  other kind, is refused at once ("session ended", 401; "not allowed", 403), the same bytes
+  on every call. After the data has been put back, a session the data does not have is
+  judged from the body instead, so that a device from before is told "the data was put back"
+  and sends its events again.
 - Every answer has `Cache-Control: no-store`, sets no cookie, and nothing about a request
   is written to the log.
 
