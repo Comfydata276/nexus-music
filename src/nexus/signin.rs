@@ -538,8 +538,12 @@ fn run(paths: &config::Paths, batch: Batch) {
     }
     let start = matches!(batch.cause, Cause::Start);
     let epoch = batch.epoch;
-    if !perform(paths, batch) {
-        return not_kept();
+    match perform(paths, batch) {
+        Done::All => {}
+        Done::NotKept => return not_kept(),
+        // A write of the journal's or Diagnostics' that did not finish: told to nobody (the
+        // machine asks again), and nothing after it in the list is done.
+        Done::Stopped => return,
     }
     if start {
         // Who is signed in, for the journal and Diagnostics: what was kept, as the start left
@@ -644,13 +648,81 @@ fn start_machine(paths: &config::Paths) -> Option<Batch> {
     Some(batch)
 }
 
-/// Does each thing, in the order given. Says whether every keep and forget held: if one did
-/// not, nothing after it was done.
-fn perform(paths: &config::Paths, batch: Batch) -> bool {
-    let Batch { epoch, dos, cause } = batch;
+/// How a list went.
+#[derive(Debug, PartialEq, Eq)]
+enum Done {
+    /// Every thing in it was done.
+    All,
+    /// A keep or a forget in Credential Manager or the folder's decision did not hold:
+    /// nothing after it was done (W7c item 2).
+    NotKept,
+    /// The list was left part-way, told to nobody: the list's time had passed, or a write of
+    /// the journal's or Diagnostics' did not finish in time (W7c item 11).
+    Stopped,
+}
+
+/// How long a write of the journal's or Diagnostics' is waited for, off the window's thread.
+const SETTLE_WAIT: Duration = Duration::from_secs(10);
+
+/// Whether a write that says when it is done (`receipt`) was done, and held, within `within`:
+/// **one that has not finished then, or whose writer went, is not done** (W7c item 11).
+fn settled<T>(receipt: &Receiver<T>, within: Duration, held: impl Fn(T) -> bool) -> bool {
+    let until = Instant::now() + within;
+    loop {
+        if QUITTING.load(Ordering::SeqCst) {
+            return false;
+        }
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        match receipt.recv_timeout(left.min(WINDOW_WAIT)) {
+            Ok(said) => return held(said),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return false,
+        }
+    }
+}
+
+/// Whether this list ends the session the journal and Diagnostics publish for (W7c item 11):
+/// it forgets the sign-in, or keeps one for another account or with no session. They stop
+/// publishing for it before anything in the list is done (a credential's slow write too).
+fn ends_session(dos: &[Do], record: &SignedIn) -> bool {
+    let now = record.saved.as_ref().and_then(read_saved).filter(|saved| saved.session.is_some());
+    let Some(now) = now else { return false };
+    dos.iter().any(|thing| match thing {
+        Do::Forget(Forget::Saved) => true,
+        Do::Keep(Keep::Saved(saved)) => saved.session.is_none() || saved.backend_id != now.backend_id || saved.account != now.account || saved.life != now.life,
+        _ => false,
+    })
+}
+
+/// Runs `job` on the window's thread, which hands back how to know when what it began is
+/// done; then waits for that here (W7c item 11).
+fn on_window_settled(epoch: u64, job: impl FnOnce() -> Option<Receiver<bool>> + Send + 'static) -> Done {
+    let (handed, receipt) = mpsc::channel();
+    if !on_window(epoch, move || {
+        let _ = handed.send(job());
+    }) {
+        return Done::Stopped;
+    }
+    match receipt.recv() {
+        Ok(Some(done)) if settled(&done, SETTLE_WAIT, |held| held) => Done::All,
+        _ => Done::Stopped,
+    }
+}
+
+/// Does each thing, in the order given. Says how it went: if a keep or forget did not hold,
+/// or a write it waits for did not finish, nothing after it was done.
+fn perform(paths: &config::Paths, batch: Batch) -> Done {
+    let Batch { epoch, dos, cause, .. } = batch;
+    if ends_session(&dos, &view().record) {
+        // Before any credential is touched: nothing more is recorded or sent for it.
+        on_window(epoch, || crate::journal::publish_account(None));
+    }
     for thing in dos {
         if epoch != epoch_now() || QUITTING.load(Ordering::SeqCst) {
-            return true;
+            return Done::Stopped;
         }
         let held = match thing {
             Do::Keep(Keep::DeviceSecret(key)) => {
@@ -688,13 +760,22 @@ fn perform(paths: &config::Paths, batch: Batch) -> bool {
                     true
                 }
             }
-            Do::Keep(Keep::DiagSchedule(schedule)) => on_window(epoch, move || crate::diagnostics::keep_schedule(Some(schedule))),
-            Do::Forget(Forget::DiagSchedule) => on_window(epoch, || crate::diagnostics::keep_schedule(None)),
-            Do::Forget(Forget::Diagnostics) => on_window(epoch, crate::diagnostics::forget_choice),
-            Do::Journal(journal) => {
-                do_journal(epoch, journal);
-                true
-            }
+            Do::Keep(Keep::DiagSchedule(schedule)) => match on_window_settled(epoch, move || crate::diagnostics::keep_schedule(Some(schedule))) {
+                Done::All => true,
+                stopped => return stopped,
+            },
+            Do::Forget(Forget::DiagSchedule) => match on_window_settled(epoch, || crate::diagnostics::keep_schedule(None)) {
+                Done::All => true,
+                stopped => return stopped,
+            },
+            Do::Forget(Forget::Diagnostics) => match on_window_settled(epoch, crate::diagnostics::forget_choice) {
+                Done::All => true,
+                stopped => return stopped,
+            },
+            Do::Journal(journal) => match do_journal(epoch, journal) {
+                Done::All => true,
+                stopped => return stopped,
+            },
             Do::Ask(ask) => {
                 dispatch(ask);
                 true
@@ -711,10 +792,10 @@ fn perform(paths: &config::Paths, batch: Batch) -> bool {
         };
         if !held {
             note(format_args!("a keep or forget did not hold: nothing after it is done"));
-            return false;
+            return Done::NotKept;
         }
     }
-    true
+    Done::All
 }
 
 /// Runs `job` on the window's thread and waits for it there to be done (or not, if this
@@ -746,29 +827,32 @@ fn window_now(job: impl FnOnce() + Send + 'static) {
 }
 
 /// The journal's part: done by the journal on the window's thread (it lives there); what it
-/// changes on its disk is waited for here before the next thing.
-fn do_journal(epoch: u64, journal: JournalDo) {
+/// changes on its disk is waited for here before the next thing, **for its real result**: a
+/// change not made within the wait, or whose writer went, is not done, and nothing after it
+/// is (W7c item 11). A read is answered by the journal's reader itself.
+fn do_journal(epoch: u64, journal: JournalDo) -> Done {
     let (handed, receipt) = mpsc::channel();
     let ran = on_window(epoch, move || {
         let answered = crate::journal::handle_client(journal, tell);
         let receipt = match answered {
-            Ok(receipt) => receipt,
+            Ok(receipt) => receipt.map(Some),
             Err(JournalDo::ReadDiagnostics { read }) => {
                 crate::diagnostics::read(read, tell);
                 None
             }
-            Err(_) => None,
+            Err(_) => Some(None),
         };
         let _ = handed.send(receipt);
     });
-    if ran && let Ok(Some(receipt)) = receipt.recv() {
-        let until = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < until && !QUITTING.load(Ordering::SeqCst) {
-            match receipt.recv_timeout(WINDOW_WAIT) {
-                Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
-                Err(RecvTimeoutError::Timeout) => {}
-            }
-        }
+    if !ran {
+        return Done::Stopped;
+    }
+    match receipt.recv() {
+        // A read: nothing to wait for here.
+        Ok(None) => Done::All,
+        // The writer says `()` only once the change is on its disk.
+        Ok(Some(Some(change))) if settled(&change, SETTLE_WAIT, |()| true) => Done::All,
+        _ => Done::Stopped,
     }
 }
 
@@ -1023,7 +1107,7 @@ fn hand_over(hand: Hand, cause: &Cause) {
             // touched.
             note(format_args!("no music login, generation {generation}"));
             *HANDED.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-            crate::journal::publish_account(None);
+            // (The player's alone: who is signed in is published from what is kept.)
             crate::controller::with(|ctl| ctl.leave_player(""));
         }
         Hand::Refused { count, generation } => {
@@ -1216,7 +1300,7 @@ mod tests {
         assert_eq!(kept.unreadable, vec![Forget::UnreadableNote { index: 0 }, Forget::UnreadableNote { index: 1 }]);
         *view() = read;
         let epoch = epoch_now();
-        assert!(perform(&paths, Batch::of(epoch, vec![Do::Forget(Forget::UnreadableNote { index: 1 }), Do::Forget(Forget::UnreadableNote { index: 0 })], Cause::Other)));
+        assert_eq!(perform(&paths, Batch::of(epoch, vec![Do::Forget(Forget::UnreadableNote { index: 1 }), Do::Forget(Forget::UnreadableNote { index: 0 })], Cause::Other)), Done::All);
         let (kept, _) = read_kept(&paths).unwrap();
         assert_eq!(kept.notes.len(), 1);
         assert!(kept.unreadable.is_empty());
@@ -1425,9 +1509,47 @@ mod tests {
         let epoch = epoch_now();
         let held = perform(&paths, Batch::of(epoch, vec![Do::Keep(Keep::Note(kept)), Do::Forget(Forget::DeviceSecret)], Cause::Other));
         vault::fail_writes(None);
-        assert!(!held);
+        assert_eq!(held, Done::NotKept);
         // What followed the keep was not done.
         assert!(vault::read(&paths, DEVICE).unwrap().is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// W7c item 11: what the journal and Diagnostics acknowledge waits for the real result of
+    /// their own writes: one that has not finished within the wait, or whose writer went
+    /// without saying, is not done. And a list that ends the session (forgets the sign-in, or
+    /// keeps one with no session or for another account) is known before anything in it.
+    #[test]
+    fn a_write_not_finished_is_never_taken_for_done_and_a_session_end_is_seen_first() {
+        let (_one, dir, _paths) = profile("settled");
+        let (done, receipt) = mpsc::channel::<()>();
+        assert!(!settled(&receipt, Duration::from_millis(200), |()| true), "not finished in time");
+        drop(done);
+        assert!(!settled(&receipt, Duration::from_millis(200), |()| true), "its writer went");
+        let (done, receipt) = mpsc::channel::<bool>();
+        done.send(false).unwrap();
+        assert!(!settled(&receipt, Duration::from_millis(200), |held| held), "done, and failed");
+        done.send(true).unwrap();
+        assert!(settled(&receipt, Duration::from_millis(200), |held| held));
+        let held = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            done.send(true).unwrap();
+        });
+        assert!(settled(&receipt, Duration::from_secs(5), |held| held), "a slow one waited for");
+        held.join().unwrap();
+        let record = SignedIn { saved: Some(serde_json::to_value(saved()).unwrap()), ..SignedIn::default() };
+        assert!(ends_session(&[Do::Hand(Hand::NoLogin { generation: 1 }), Do::Forget(Forget::Saved)], &record));
+        let mut gone = saved();
+        gone.session = None;
+        assert!(ends_session(&[Do::Keep(Keep::Saved(gone))], &record));
+        let mut other = saved();
+        other.account = AccountId::new(8).unwrap();
+        assert!(ends_session(&[Do::Keep(Keep::Saved(other))], &record));
+        let mut seen = saved();
+        seen.notice = None;
+        assert!(!ends_session(&[Do::Keep(Keep::Saved(seen))], &record), "the same session kept again");
+        assert!(!ends_session(&[Do::Hand(Hand::NoLogin { generation: 1 })], &record), "the player's alone");
+        assert!(!ends_session(&[Do::Forget(Forget::Saved)], &SignedIn::default()), "nothing published");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
