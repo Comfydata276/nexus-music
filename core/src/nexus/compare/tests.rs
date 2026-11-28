@@ -162,10 +162,14 @@ fn a_grant_only_in_the_data_is_told_from_one_the_store_ended() {
 #[test]
 fn a_device_or_account_the_data_lacks_is_older_unless_its_making_was_cut() {
     let (mut store, data) = both();
-    kept(&mut store).devices.insert(8, ApartDevice { number: 0, last_session: 0, last_leave: 0, permit: None });
+    kept(&mut store).devices.insert(8, ApartDevice { number: 0, last_session: 1, last_leave: 0, permit: Some(Permit { id: 1, leave: None }) });
     assert_eq!(found(&store, &data), StoreComparison::OlderCopy);
     store.pending = under_way();
     assert_eq!(found(&store, &data), StoreComparison::GrantOnlyInData);
+    // A record with no session, left of a device an older copy lost, is no sign of age.
+    store.pending = None;
+    kept(&mut store).devices.get_mut(&8).unwrap().permit = None;
+    assert_eq!(found(&store, &data), StoreComparison::Matches);
     let (mut store, data) = both();
     store.accounts.insert(2, Apart { account: state(), devices: Default::default() });
     assert_eq!(found(&store, &data), StoreComparison::OlderCopy);

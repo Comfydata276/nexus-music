@@ -143,9 +143,12 @@ pub fn compare(store: &StoreView, data: &DataView) -> Found {
                 }
             }
         }
-        for id in apart.devices.keys() {
-            if !rows.devices.contains_key(id) {
-                // A device made in the store first, its row not yet written; or an older copy.
+        for (id, record) in &apart.devices {
+            // A device the store permits a session for and the data has no row of: made in
+            // the store first and its row not yet written, or an older copy. (A record with no
+            // session is what is left of a device the data lost with an older copy: it keeps
+            // its id from being given again, and says nothing of the data's age.)
+            if record.permit.is_some() && !rows.devices.contains_key(id) {
                 if cut { grant = true } else { older = true }
             }
         }

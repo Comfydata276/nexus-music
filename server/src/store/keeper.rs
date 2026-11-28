@@ -406,7 +406,15 @@ impl Keeper {
         }
         self.changes = self.data.apply(&changes, at).map_err(|error| Refused(data_failed(&error)))?;
         let held = installs.iter().filter(|(_, rows)| rows.account.history_held).count();
+        // Then the store as C3r loads the two now: they agree from here (what loading takes
+        // away is only ever taken away).
         let mut next = self.store.clone();
+        for (number, rows) in &installs {
+            let name = Some(&rows.account.name);
+            if let (Some(record), Some(entry)) = (self.store.apart(*number, name), next.accounts.get_mut(number)) {
+                entry.apart = Decided::load(&record, Some(rows)).apart();
+            }
+        }
         next.pending = None;
         next.mark = self.changes;
         next.mark_at = at;
