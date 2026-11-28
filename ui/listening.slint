@@ -15,7 +15,7 @@ export global Listening {
     in property <bool> can-delete;
     in property <string> summary;
     in property <string> status;
-    in property <string> result;
+    in-out property <string> result;
     in property <[RecentListen]> recent;
 
     callback show-stats();
@@ -138,6 +138,7 @@ export component ListeningOverlay inherits Rectangle {
                     enabled: Listening.can-delete && !Listening.busy;
                     clicked => {
                         sheet.password = "";
+                        Listening.result = "";
                         Listening.page = "delete";
                     }
                 }
@@ -151,6 +152,7 @@ export component ListeningOverlay inherits Rectangle {
                     enabled: !Listening.busy;
                     clicked => {
                         sheet.password = "";
+                        Listening.result = "";
                         Listening.page = "stats";
                     }
                 }
