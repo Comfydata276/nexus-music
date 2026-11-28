@@ -504,7 +504,8 @@ pub struct Controller {
 
 fn note_search_results(ticket: Option<crate::journal::SearchTicket>, page: &PageData) {
     if ticket.is_some() {
-        let library = page.songs.len() + page.shelves.iter().map(|shelf| shelf.cards.len()).sum::<usize>();
+        let cards = page.lead.iter().chain(&page.shelves).map(|shelf| shelf.cards.len()).sum::<usize>();
+        let library = page.songs.len() + cards;
         let outside = page.offers.len() + page.tail.iter().map(|shelf| shelf.cards.len()).sum::<usize>();
         crate::journal::search_results(ticket, library, Some(outside));
     }

@@ -1,6 +1,8 @@
 //! Takes listening observations on the window thread. The journal worker owns the disk.
 
 use std::cell::{Cell, RefCell};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
@@ -70,7 +72,7 @@ thread_local! {
     static GENERATION: Cell<u64> = const { Cell::new(0) };
     static SCOPE: Cell<Option<Scope>> = const { Cell::new(None) };
     static PLAY: RefCell<Play> = const { RefCell::new(Play::new()) };
-    static SEARCH: RefCell<Option<Search>> = const { RefCell::new(None) };
+    static SEARCH: RefCell<Vec<Search>> = const { RefCell::new(Vec::new()) };
 }
 
 pub(crate) fn install(root: PathBuf) {
@@ -116,8 +118,7 @@ fn publish(scope: Option<Scope>) {
         return;
     }
     stop(Stopped::Stopped);
-    let prior = SEARCH.with_borrow_mut(Option::take);
-    if let Some(prior) = prior {
+    for prior in SEARCH.with_borrow_mut(std::mem::take) {
         finish_search(prior, 0, None);
     }
     PLAY.with_borrow_mut(|play| *play = Play::new());
@@ -248,7 +249,7 @@ fn try_observe(
     match line.try_send(Message::Event(scope, observation)) {
         Ok(()) => true,
         Err(TrySendError::Full(_)) => {
-            let _ = counters.dropped.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_add(1)));
+            let _ = counters.dropped.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_add(1)));
             false
         }
         Err(TrySendError::Disconnected(_)) => false,
@@ -267,49 +268,51 @@ fn ms(seconds: f64) -> u32 {
 }
 
 struct Search {
+    key: u64,
     words: String,
-    observation: Observation,
+    id: EventId,
+    at: u64,
     requests: Option<EventId>,
+}
+
+fn search_key(words: &str) -> u64 {
+    let mut key = DefaultHasher::new();
+    words.trim().hash(&mut key);
+    key.finish()
 }
 
 pub(crate) fn begin_search(words: &str, requests: bool) {
     if SCOPE.get().is_none() {
         return;
     }
-    let prior = SEARCH.with_borrow_mut(Option::take);
-    if let Some(prior) = prior {
-        finish_search(prior, 0, None);
-    }
+    let key = search_key(words);
     let words = events::clean_text(words);
     let Some(id) = new_id() else { return };
-    let observation = Observation { id, at: now_ms(), kind: Kind::Search {
-        words: words.clone(), found: 0, where_: events::SearchedIn::Library,
-    }};
+    let search = Search { key, words, id, at: now_ms(), requests: requests.then(new_id).flatten() };
     SEARCH.with_borrow_mut(|pending| {
-        *pending = Some(Search { words, observation, requests: requests.then(new_id).flatten() });
+        if pending.len() == QUEUE_LENGTH {
+            finish_search(pending.remove(0), 0, None);
+        }
+        pending.push(search);
     });
 }
 
 pub(crate) fn search_ticket(words: &str) -> Option<EventId> {
     SCOPE.get()?;
-    SEARCH.with_borrow(|pending| {
-        pending.as_ref().filter(|search| search.words == events::clean_text(words))
-            .map(|search| search.observation.id)
-    })
+    let key = search_key(words);
+    SEARCH.with_borrow(|pending| pending.iter().rev().find(|search| search.key == key).map(|search| search.id))
 }
 
 pub(crate) fn search_results(ticket: Option<EventId>, library: usize, requests: Option<usize>) {
     let Some(ticket) = ticket else { return };
-    let search = SEARCH.with_borrow_mut(|pending| {
-        if pending.as_ref().is_some_and(|search| search.observation.id == ticket) {
-            pending.take()
-        } else {
-            None
+    SEARCH.with_borrow_mut(|pending| {
+        let Some(key) = pending.iter().find(|search| search.id == ticket).map(|search| search.key) else {
+            return;
+        };
+        for search in pending.extract_if(.., |search| search.key == key) {
+            finish_search(search, library, requests);
         }
     });
-    if let Some(search) = search {
-        finish_search(search, library, requests);
-    }
 }
 
 pub(crate) fn search_origin(words: &str) -> Option<PlayedFrom> {
@@ -323,16 +326,17 @@ pub(crate) fn radio_origin(id: &str) -> Option<PlayedFrom> {
     Some(PlayedFrom::Radio { id: journal_id(id)? })
 }
 
-fn finish_search(mut search: Search, library: usize, requests: Option<usize>) {
+fn finish_search(search: Search, library: usize, requests: Option<usize>) {
     let Some(scope) = SCOPE.get() else { return };
-    if let Kind::Search { found, .. } = &mut search.observation.kind {
-        *found = library.try_into().unwrap_or(u32::MAX);
-    }
-    let at = search.observation.at;
-    enqueue(scope, search.observation);
-    if let Some(id) = search.requests {
-        enqueue(scope, Observation { id, at, kind: Kind::Search {
-            words: search.words, found: requests.unwrap_or(0).try_into().unwrap_or(u32::MAX),
+    let found = library.try_into().unwrap_or(u32::MAX);
+    let outside = search.requests.map(|id| (id, search.words.clone()));
+    enqueue(scope, Observation { id: search.id, at: search.at, kind: Kind::Search {
+        words: search.words,
+        found, where_: events::SearchedIn::Library,
+    }});
+    if let Some((id, words)) = outside {
+        enqueue(scope, Observation { id, at: search.at, kind: Kind::Search {
+            words, found: requests.unwrap_or(0).try_into().unwrap_or(u32::MAX),
             where_: events::SearchedIn::Requests,
         }});
     }
