@@ -196,10 +196,10 @@ use std::sync::Condvar;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::accounts::{
+    admit::Admission,
     check::PasswordWorkers,
     desk::Desk,
     music::MusicSide,
-    session::Seen,
     setup::{CodeKey, SetUpCode, dummy_salt_key, make_code},
 };
 use crate::probe;
@@ -334,7 +334,6 @@ fn mock(request: &Question, state: &mut LidarrState) -> Value {
 }
 
 // The production socket listener, the one writer, and real signed-in sessions.
-// Until S3b's form-1 migration lands this fixture installs the agreed tables.
 struct TestServer {
     root: PathBuf,
     address: SocketAddr,
@@ -349,7 +348,7 @@ fn now() -> u64 {
 }
 
 impl TestServer {
-    fn start(name: &str, endpoint: Endpoint) -> (Self, [OneTimeCode; 3]) {
+    fn start(name: &str, endpoint: Option<Endpoint>) -> (Self, [OneTimeCode; 3]) {
         let (root, keeper, codes) = fixture(name);
         let accounts = fixture_accounts(keeper);
         let id = accounts.backend;
@@ -360,7 +359,7 @@ impl TestServer {
             let listener = serve::listen("127.0.0.1:0".parse().unwrap()).unwrap();
             let address = listener.local_addr().unwrap();
             let shell = Shell::backend_with_requests(address.ip(), &crate::hello(id), server,
-                Some(TEST_ORIGIN), crate::settings::DATA_BUDGET_DEFAULT, Some(endpoint));
+                Some(TEST_ORIGIN), crate::settings::DATA_BUDGET_DEFAULT, endpoint);
             ready.send(address).unwrap();
             let serving = tokio::spawn(serve::serve(listener, shell, false));
             let _ = stopped.await;
@@ -371,9 +370,8 @@ impl TestServer {
         (Self { root, address, accounts: Some(accounts), stop: Some(stop), thread: Some(thread), child: None }, codes)
     }
 
-    fn start_child(name: &str, endpoint: SocketAddr, before: impl FnOnce(&mut Keeper)) -> (Self, [OneTimeCode; 3]) {
-        let (root, mut keeper, codes) = fixture(name);
-        before(&mut keeper);
+    fn start_child(name: &str, endpoint: SocketAddr) -> (Self, [OneTimeCode; 3]) {
+        let (root, keeper, codes) = fixture(name);
         keeper.close();
         let address = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
         let mut server = Self { root, address, accounts: None, stop: None, thread: None, child: None };
@@ -496,16 +494,41 @@ impl TestServer {
         }
     }
 
-    fn switch_off_for_test(&self, person: &Person) {
-        let hash = Fingerprint::of(person.signed_in.session.expose_bytes());
-        runtime().block_on(self.accounts.as_ref().unwrap().desk.ask(move |keeper| {
-            let (account, _) = rows::session_by_hash(keeper.data().connection(), hash.as_bytes()).unwrap().unwrap();
-            keeper.write_data(now(), |tx| {
-                tx.execute("INSERT INTO requests_access (account, enabled) VALUES (?1, false)", [events::sql(account)?])?;
-                Ok(((), true))
-            }).unwrap();
-        })).unwrap();
+    fn apply<T: admin::Change>(
+        &self, who: &Person, headers: &str, path: &str, change: T, number: u64,
+        grant: admin::GrantSecret,
+    ) -> admin::Reply<admin::Applied> {
+        let request = admin::encode(&admin::Granted {
+            head: RequestHead { speaks: SPEAKS, restore: who.restore },
+            request_id: wire::RequestId::new(number).unwrap(),
+            grant,
+            change,
+        }).unwrap();
+        let (status, body) = self.post(path, Some(&who.signed_in), headers, request.bytes());
+        admin::read_reply(status, &body).unwrap()
     }
+
+    fn configure(&self, page: &Person) {
+        let admin::Reply::Done(issued) =
+            self.grant(page, TEST_PAGE, admin::Action::SetLidarr(key_change(TEST_KEY)), 100)
+        else {
+            panic!("the admin page could not get a Lidarr grant");
+        };
+        assert!(matches!(self.apply(page, TEST_PAGE, admin::SET_LIDARR,
+            key_change(TEST_KEY), 100, issued.grant), admin::Reply::Done(_)));
+    }
+
+    fn set_switch(&self, page: &Person, person: &Person, enabled: bool) {
+        let change = || admin::RequestsEnabled { account: person.signed_in.person.id, enabled };
+        let admin::Reply::Done(issued) =
+            self.grant(page, TEST_PAGE, admin::Action::SetRequestsEnabled(change()), 101)
+        else {
+            panic!("the admin page could not get a request-switch grant");
+        };
+        assert!(matches!(self.apply(page, TEST_PAGE, admin::SET_REQUESTS_ENABLED,
+            change(), 101, issued.grant), admin::Reply::Done(_)));
+    }
+
 }
 
 impl Drop for TestServer {
@@ -520,6 +543,10 @@ impl Drop for TestServer {
         drop(self.accounts.take());
         let _ = std::fs::remove_dir_all(&self.root);
     }
+}
+
+fn key_change(key: &str) -> admin::LidarrKeyChange {
+    admin::LidarrKeyChange { key: admin::LidarrKey::new(key).unwrap() }
 }
 
 struct Person {
@@ -559,8 +586,9 @@ fn cancelled() -> Change {
 #[test]
 fn authenticated_loopback_requests_keep_order_and_ownership_and_survive_the_client_leaving() {
     let lidarr = MockLidarr::start();
-    let (server, [admin_code, first_code, other_code]) = TestServer::start("walk", endpoint(lidarr.address));
+    let (server, [admin_code, first_code, other_code]) = TestServer::start("walk", Some(endpoint(lidarr.address)));
     let admin = server.redeem(admin_code, 1, TEST_PAGE);
+    server.configure(&admin);
     let first = server.redeem(first_code, 2, "");
     let other = server.redeem(other_code, 3, "");
 
@@ -636,16 +664,60 @@ fn authenticated_loopback_requests_keep_order_and_ownership_and_survive_the_clie
     assert!(matches!(server.call(&first, Call::Pending { after: None }), Answer::Pending { albums, .. } if albums.is_empty()));
     assert!(!lidarr.take_calls().iter().any(|line| line == "POST command"));
 
-    server.switch_off_for_test(&first);
+    server.set_switch(&admin, &first, false);
     assert!(matches!(server.call(&first, Call::Pending { after: None }), Answer::Refused { reason: Refusal::SwitchedOff }));
     assert!(matches!(server.call(&first, begin(3, cancelled())), Answer::Refused { reason: Refusal::SwitchedOff }));
     assert!(matches!(server.call(&first, Call::After { job }), Answer::Refused { reason: Refusal::SwitchedOff }));
 }
 
 #[test]
-fn the_lidarr_address_is_read_only_and_only_the_page_session_can_see_it() {
+fn a_member_can_complete_the_full_walk_using_the_page_configured_key() {
     let lidarr = MockLidarr::start();
-    let (server, [admin_code, member_code, _]) = TestServer::start("page", endpoint(lidarr.address));
+    let (server, [admin, member, other]) = TestServer::start("member-walk", Some(endpoint(lidarr.address)));
+    server.configure(&server.redeem(admin, 1, TEST_PAGE));
+    let member = server.redeem(member, 2, "");
+    let other = server.redeem(other, 3, "");
+    let offer = server.offer(&member);
+    let job = begun(server.call(&member, begin(1, Change::Request { offer })));
+    assert_eq!(server.done(&member, job), Completed::Requested);
+    let Answer::Pending { albums, .. } = server.call(&member, Call::Pending { after: None }) else {
+        panic!("the member could not read pending requests");
+    };
+    assert_eq!(albums.len(), 1);
+    assert_eq!(albums[0].progress, Some(73));
+    assert!(albums[0].removable);
+    assert!(matches!(server.call(&other, Call::Pending { after: None }),
+        Answer::Pending { albums, .. } if albums.is_empty()));
+    let target = &albums[0];
+    let removal = Change::Cancel { album: target.id, release: target.album.clone() };
+    let job = begun(server.call(&member, begin(2, removal)));
+    assert_eq!(server.done(&member, job), Completed::Cancelled);
+    assert!(matches!(server.call(&member, Call::Pending { after: None }),
+        Answer::Pending { albums, .. } if albums.is_empty()));
+}
+
+#[test]
+fn without_a_container_address_neither_the_page_nor_the_app_can_enable_requests() {
+    let (server, [admin, member, _]) = TestServer::start("no-lidarr", None);
+    let page = server.redeem(admin, 1, TEST_PAGE);
+    let app = server.redeem(member, 2, "");
+    for call in [find_artist_call(), Call::AskedHistory { after: None }, begin(1, cancelled())] {
+        assert!(matches!(server.call(&app, call), Answer::Refused { reason: Refusal::LidarrNotSetUp }));
+    }
+    let body = admin::encode(&admin::GetLidarrSetting {
+        head: RequestHead { speaks: SPEAKS, restore: page.restore },
+    }).unwrap();
+    let (status, reply) = server.post(admin::GET_LIDARR_SETTING, Some(&page.signed_in), TEST_PAGE, body.bytes());
+    assert!(matches!(admin::read_reply::<admin::LidarrSetting>(status, &reply).unwrap(),
+        admin::Reply::Done(admin::LidarrSetting { address: None, configured: false })));
+    assert!(matches!(server.grant(&page, TEST_PAGE, admin::Action::SetLidarr(key_change(TEST_KEY)), 1),
+        admin::Reply::Refused(_)));
+}
+
+#[test]
+fn only_the_admin_page_can_configure_a_key_for_the_read_only_address() {
+    let lidarr = MockLidarr::start();
+    let (server, [admin_code, member_code, _]) = TestServer::start("page", Some(endpoint(lidarr.address)));
     let page = server.redeem(admin_code, 1, TEST_PAGE);
     let app = server.redeem(member_code, 2, "");
     let app_admin = server.sign_in(SignInCredential::Password {
@@ -653,25 +725,50 @@ fn the_lidarr_address_is_read_only_and_only_the_page_session_can_see_it() {
         password: Password::presented(PASSWORD).unwrap(),
     }, 4, "");
     let head = RequestHead { speaks: SPEAKS, restore: page.restore };
-    let body = admin::encode(&admin::GetMusicServer { head }).unwrap();
-    let (status, address) = server.post(GET_LIDARR, Some(&page.signed_in), TEST_PAGE, body.bytes());
-    assert_eq!(status, 200);
-    assert_eq!(serde_json::from_slice::<Value>(&address).unwrap(),
-        json!({"done":{"address":format!("http://{}", lidarr.address),"configured":true}}));
+    let body = admin::encode(&admin::GetLidarrSetting { head }).unwrap();
+    let setting = || {
+        let (status, reply) = server.post(admin::GET_LIDARR_SETTING, Some(&page.signed_in), TEST_PAGE, body.bytes());
+        let admin::Reply::Done(setting) = admin::read_reply::<admin::LidarrSetting>(status, &reply).unwrap()
+        else {
+            panic!("the admin page could not read the configured address");
+        };
+        assert_eq!(setting.address, Some(endpoint(lidarr.address).address));
+        setting.configured
+    };
+    assert!(!setting());
+    assert!(matches!(server.call(&app, Call::Pending { after: None }),
+        Answer::Refused { reason: Refusal::LidarrNotSetUp }));
 
     for (who, headers) in [(&page.signed_in, ""), (&app.signed_in, TEST_PAGE), (&app_admin.signed_in, TEST_PAGE)] {
-        let (status, _) = server.post(GET_LIDARR, Some(who), headers, body.bytes());
-        assert_eq!(status, 403);
+        assert_eq!(server.post(admin::GET_LIDARR_SETTING, Some(who), headers, body.bytes()).0, 403);
     }
+    let unrelated = "a-replacement-key";
+    assert!(matches!(server.grant(&app_admin, TEST_PAGE, admin::Action::SetLidarr(key_change(TEST_KEY)), 20),
+        admin::Reply::Refused(admin::Refusal::NotAllowed(admin::Denial::Denied))));
+    let admin::Reply::Done(issued) =
+        server.grant(&page, TEST_PAGE, admin::Action::SetLidarr(key_change(TEST_KEY)), 20)
+    else {
+        panic!("the page could not request a matching grant");
+    };
+    let grant = || admin::GrantSecret::from_bytes(*issued.grant.expose_bytes());
+    assert!(matches!(server.apply(&app_admin, TEST_PAGE, admin::SET_LIDARR,
+        key_change(TEST_KEY), 20, grant()), admin::Reply::Refused(_)));
+    assert!(matches!(server.apply(&page, TEST_PAGE, admin::SET_LIDARR,
+        key_change(unrelated), 20, grant()), admin::Reply::Refused(_)));
+    assert!(!setting());
+    assert!(matches!(server.apply(&page, TEST_PAGE, admin::SET_LIDARR,
+        key_change(TEST_KEY), 20, grant()), admin::Reply::Done(_)));
+    assert!(setting());
+    assert!(matches!(server.apply(&page, TEST_PAGE, admin::SET_LIDARR,
+        key_change(TEST_KEY), 20, grant()), admin::Reply::Refused(_)));
 
-    // A page marker on a native admin's credential conveys no extra authority.
     let toggle = || admin::Action::SetRequestsEnabled(admin::RequestsEnabled {
         account: app.signed_in.person.id,
         enabled: false,
     });
-    assert!(matches!(server.grant(&app_admin, TEST_PAGE, toggle(), 20),
+    assert!(matches!(server.grant(&app_admin, TEST_PAGE, toggle(), 21),
         admin::Reply::Refused(admin::Refusal::NotAllowed(admin::Denial::Denied))));
-    assert!(matches!(server.grant(&page, TEST_PAGE, toggle(), 20), admin::Reply::Done(_)));
+    assert!(matches!(server.grant(&page, TEST_PAGE, toggle(), 21), admin::Reply::Done(_)));
     assert!(lidarr.take_calls().is_empty());
 }
 
@@ -688,34 +785,25 @@ fn fixture(name: &str) -> (PathBuf, Keeper, [OneTimeCode; 3]) {
                 First::Code(&print, now + 600_000), now).unwrap();
             code
         });
-        keeper.write_data(now, |tx| {
-            tx.execute_batch("
-                CREATE TABLE IF NOT EXISTS requests_access (account INTEGER PRIMARY KEY, enabled INTEGER NOT NULL, revision INTEGER NOT NULL DEFAULT 0);
-                CREATE TABLE IF NOT EXISTS requests_jobs (id INTEGER PRIMARY KEY, restore INTEGER NOT NULL, account INTEGER NOT NULL, session INTEGER NOT NULL, request BLOB NOT NULL, change BLOB NOT NULL, work BLOB NOT NULL, stage INTEGER NOT NULL DEFAULT 0, result TEXT, UNIQUE(restore,account,session,request));
-                CREATE TABLE IF NOT EXISTS requests_owners (binding BLOB NOT NULL, account INTEGER NOT NULL, release TEXT NOT NULL, asked_ms INTEGER NOT NULL, metadata BLOB NOT NULL, PRIMARY KEY(binding,account,release));
-                CREATE TABLE IF NOT EXISTS requests_lines (job INTEGER NOT NULL, line INTEGER NOT NULL, progress TEXT NOT NULL, PRIMARY KEY(job,line));
-                CREATE TABLE IF NOT EXISTS requests_way_back (id INTEGER PRIMARY KEY, binding BLOB NOT NULL, artist INTEGER NOT NULL, artist_key TEXT NOT NULL, setting TEXT NOT NULL, UNIQUE(binding,artist));
-            ")?;
-            Ok(((), true))
-        }).unwrap();
         (root, keeper, codes)
 }
 
-fn fixture_accounts(keeper: Keeper) -> Arc<Accounts> {
+fn fixture_accounts(mut keeper: Keeper) -> Arc<Accounts> {
         let now = now();
         let id = keeper.backend();
         let clock: crate::accounts::session::Clock = Arc::new(self::now);
+        let admission = Arc::new(Admission::open(&mut keeper, clock.clone()).unwrap());
         Arc::new(Accounts {
             workers: PasswordWorkers::new(dummy_salt_key(&keeper)).unwrap(),
             set_up_code: SetUpCode::at_start(keeper.set_up(), now).0,
-            seen: Arc::new(Seen::new(rows::device_secrets(keeper.data().connection()).unwrap())),
+            admission,
             desk: Desk::open(keeper, clock.clone()).unwrap(),
             clock,
             backend: id,
-            music: MusicSide {
-                client: crate::music::MusicClient::trusting(RootCertStore::empty()),
-                internal: "http://127.0.0.1:1".into(),
-            },
+            music: MusicSide::new(
+                crate::music::MusicClient::trusting(RootCertStore::empty()),
+                "http://127.0.0.1:1".into(),
+            ),
         })
 }
 
@@ -743,7 +831,8 @@ fn serve_in_a_child_for_the_restart_case() {
 #[test]
 fn restart_sees_the_begun_job_through_without_accepting_it_twice() {
     let lidarr = MockLidarr::start();
-    let (mut server, [_, member, _]) = TestServer::start_child("restart", lidarr.address, |_| {});
+    let (mut server, [admin_code, member, _]) = TestServer::start_child("restart", lidarr.address);
+    server.configure(&server.redeem(admin_code, 1, TEST_PAGE));
     let member = server.redeem(member, 2, "");
     let change = Change::Request { offer: server.offer(&member) };
     lidarr.hold_response(Some(("GET", "/api/v1/artist")));
@@ -762,7 +851,8 @@ fn restart_sees_the_begun_job_through_without_accepting_it_twice() {
 #[test]
 fn restart_after_lidarr_took_the_search_does_not_send_the_command_again() {
     let lidarr = MockLidarr::start();
-    let (mut server, [_, member, _]) = TestServer::start_child("lost-lidarr-reply", lidarr.address, |_| {});
+    let (mut server, [admin_code, member, _]) = TestServer::start_child("lost-lidarr-reply", lidarr.address);
+    server.configure(&server.redeem(admin_code, 1, TEST_PAGE));
     let member = server.redeem(member, 2, "");
     let change = Change::Request { offer: server.offer(&member) };
     lidarr.hold_response(Some(("POST", "/api/v1/command")));
@@ -785,13 +875,17 @@ fn startup_puts_back_a_recorded_artist_setting_for_the_same_lidarr() {
     let lidarr = MockLidarr::start();
     lock(&lidarr.state).new_releases = Some("none".into());
     let binding = binding(&endpoint(lidarr.address));
-    let (server, _) = TestServer::start_child("way-back", lidarr.address, |keeper| {
-        keeper.write_data(now(), |tx| {
-            tx.execute("INSERT INTO requests_way_back (binding,artist,artist_key,setting) VALUES (?1,5,?2,'all')",
-                params![binding.as_slice(), ARTIST])?;
-            Ok(((), true))
-        }).unwrap();
-    });
+    let (mut server, [admin_code, _, _]) = TestServer::start_child("way-back", lidarr.address);
+    server.configure(&server.redeem(admin_code, 1, TEST_PAGE));
+    server.kill_child();
+    let mut keeper = reopen(&server.root);
+    keeper.write_data(now(), |tx| {
+        tx.execute("INSERT INTO requests_way_back (binding,artist,artist_key,setting) VALUES (?1,5,?2,'all')",
+            params![binding.as_slice(), ARTIST])?;
+        Ok(((), true))
+    }).unwrap();
+    keeper.close();
+    server.launch(lidarr.address);
     let db = Connection::open(server.root.join("data/nexus.db")).unwrap();
     let until = Instant::now() + Duration::from_secs(4);
     loop {
@@ -816,7 +910,8 @@ fn the_backend_answers_fixed_refusals_for_hostile_lidarr_responses() {
     let address = dead.local_addr().unwrap();
     drop(dead);
     let assert_refusal = |name, address: SocketAddr, expected| {
-        let (server, [_, member, _]) = TestServer::start(name, endpoint(address));
+        let (server, [admin_code, member, _]) = TestServer::start(name, Some(endpoint(address)));
+        server.configure(&server.redeem(admin_code, 1, TEST_PAGE));
         let member = server.redeem(member, 2, "");
         let sent = body(member.restore, find_artist_call());
         let (status, reply) = server.post(wire::REQUESTS, Some(&member.signed_in), "", &sent);
@@ -859,7 +954,8 @@ fn a_slow_lidarr_read_leaves_sign_in_and_the_writer_available() {
         thread::sleep(UPSTREAM_TIMEOUT + Duration::from_millis(150));
         let _ = response(socket, "200 OK", "", b"[]");
     });
-    let (server, [_, member, other]) = TestServer::start("slow", endpoint(address));
+    let (server, [admin_code, member, other]) = TestServer::start("slow", Some(endpoint(address)));
+    server.configure(&server.redeem(admin_code, 1, TEST_PAGE));
     let member = server.redeem(member, 2, "");
     thread::scope(|scope| {
         let search = scope.spawn(|| server.call(&member, find_artist_call()));
@@ -875,7 +971,8 @@ fn a_slow_lidarr_read_leaves_sign_in_and_the_writer_available() {
 #[test]
 fn batch_keeps_its_original_lines_and_exact_device_resolution_across_restart() {
     let lidarr = MockLidarr::start();
-    let (mut server, [_, member, other]) = TestServer::start_child("batch", lidarr.address, |_| {});
+    let (mut server, [admin_code, member, other]) = TestServer::start_child("batch", lidarr.address);
+    server.configure(&server.redeem(admin_code, 1, TEST_PAGE));
     let member = server.redeem(member, 2, "");
     let other = server.redeem(other, 3, "");
     let source = BatchLine { artist: "Quillon Vane".into(), album: "Glass Orchard".into(), song: "First Light".into() };

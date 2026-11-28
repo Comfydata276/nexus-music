@@ -26,14 +26,14 @@ use axum::Router;
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::header::AUTHORIZATION;
-use axum::http::{HeaderMap, Response, StatusCode};
+use axum::http::{HeaderMap, Response};
 use axum::routing::post;
 use nexus_core::nexus::account::{
     self, AccountId, DeviceId, NotSignedIn, Receipt, RequestHead, SessionId,
 };
 use nexus_core::nexus::admin;
 use nexus_core::nexus::kept::{
-    Access, Account, Bearer, Denied, Fingerprint, GrantUse, LeaveFor, SessionKind,
+    Access, Account, Bearer, Denied, Fingerprint, GrantUse, SessionKind,
 };
 use nexus_core::nexus::requests::{
     self as wire, AlbumView, Answer, ArtistView, AskedRelease, AttributionPage, AttributionRow,
@@ -47,10 +47,9 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicBool, Ordering};
-use zeroize::Zeroizing;
 use tokio::sync::Notify;
 
-use crate::accounts::{desk::Lane, rows, session::Accounts};
+use crate::accounts::{check::Checked, rows, session::Accounts, setup::random};
 use crate::events;
 use crate::store::keeper::Keeper;
 
@@ -59,6 +58,7 @@ const UPSTREAM_HEAD_BYTES: usize = 16 * 1024;
 
 #[derive(Clone)]
 pub struct Endpoint {
+    address: admin::InternalAddress,
     url: Url,
     api: String,
     tls: Option<TlsConnector>,
@@ -100,7 +100,8 @@ impl Endpoint {
             config.alpn_protocols = vec![b"http/1.1".to_vec()];
             TlsConnector::from(Arc::new(config))
         });
-        Some(Self { url, api, tls })
+        let address = admin::InternalAddress::new(url.as_str().trim_end_matches('/'))?;
+        Some(Self { address, url, api, tls })
     }
 
     fn lidarr(&self, runtime: Handle, key: &str, deadline: Option<Instant>) -> Lidarr {
@@ -241,10 +242,6 @@ const MAX_BOOKS: usize = 64;
 const MAX_SNAPSHOTS: usize = 16;
 const ACCOUNT_SLOT_MAX: usize = 24;
 
-// CARRIED until C9's read type lands. The existing GetMusicServer request
-// is the same head-only shape.
-pub(crate) const GET_LIDARR: &str = "/nexus/api/admin/lidarr";
-
 pub(crate) struct Requests {
     accounts: Arc<Accounts>,
     origin: Option<Arc<str>>,
@@ -273,12 +270,14 @@ impl Requests {
         base.merge(Router::new()
             .route(wire::REQUESTS, post(call))
             .route(admin::SET_REQUESTS_ENABLED, post(set_requests_enabled))
-            .route(GET_LIDARR, post(get_lidarr))
+            .route(admin::GET_LIDARR_SETTING, post(get_lidarr))
+            .route(admin::SET_LIDARR, post(set_lidarr))
             .route(wire::ADMIN_ATTRIBUTION, post(attribution))
             .with_state(self.clone()))
+            .layer(axum::middleware::from_fn_with_state(self.clone(), ingress))
     }
 
-    pub(crate) async fn admit(self: &Arc<Self>, path: &str, headers: &HeaderMap) -> Result<Ingress, Response<Body>> {
+    async fn account_place(self: &Arc<Self>, path: &str, headers: &HeaderMap) -> Result<Ingress, Response<Body>> {
         let outcome = async {
             if crate::admin::is_browser(headers)
                 && !crate::admin::browser_origin_allowed(headers, self.origin.as_deref())
@@ -289,7 +288,7 @@ impl Requests {
             let hash = Fingerprint::of(bearer(headers)?.expose_bytes());
             let copied = hash.clone();
             let clock = self.accounts.clock.clone();
-            let who = events::answer(self.accounts.desk.ask_in(Lane::Stranger, move |keeper| {
+            let who = events::answer(self.accounts.desk.ask(move |keeper| {
                 let (number, device) = rows::session_by_hash(keeper.data().connection(), copied.as_bytes())
                     .map_err(events::unavailable)?.ok_or_else(ended)?;
                 let mut account = keeper.load(number).map_err(events::unavailable)?;
@@ -297,7 +296,7 @@ impl Requests {
                 let session = session_id(&account, device)?;
                 Ok((number, session, kind))
             }).await)?;
-            if matches!(path, GET_LIDARR | admin::SET_REQUESTS_ENABLED | wire::ADMIN_ATTRIBUTION) && (!page || who.2 != SessionKind::AdminPage) {
+            if matches!(path, admin::GET_LIDARR_SETTING | admin::SET_LIDARR | admin::SET_REQUESTS_ENABLED | wire::ADMIN_ATTRIBUTION) && (!page || who.2 != SessionKind::AdminPage) {
                 return Err(account::Refusal::NotAllowed(account::NotAllowed::Denied));
             }
             let place = Place::ingress(self.rooms.clone(), who.0).ok_or_else(events::busy)?;
@@ -313,6 +312,7 @@ impl Requests {
         expected: SessionId,
         step: impl FnOnce(&mut Keeper, Actor) -> Result<T, account::Refusal> + Send + 'static,
     ) -> Result<(T, Receipt), account::Refusal> {
+        self.accounts.live(&head, &hash)?;
         let clock = self.accounts.clock.clone();
         events::answer(self.accounts.desk.ask(move |keeper| {
             let now = clock();
@@ -326,6 +326,24 @@ impl Requests {
             Ok((done, events::receipt(keeper, account.state())?))
         }).await)
     }
+}
+
+async fn ingress(
+    State(service): State<Arc<Requests>>,
+    mut request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response<Body> {
+    if guards(request.uri().path()) {
+        match service.account_place(request.uri().path(), request.headers()).await {
+            Ok(ingress) => { request.extensions_mut().insert(Arc::new(ingress)); }
+            Err(response) => return response,
+        }
+    }
+    next.run(request).await
+}
+
+pub(crate) fn session_ended() -> Response<Body> {
+    events::respond(crate::accounts::session::refused(ended()))
 }
 
 fn bearer(headers: &HeaderMap) -> Result<account::Session, account::Refusal> {
@@ -364,9 +382,8 @@ struct Actor {
     now: u64,
 }
 
-fn access(db: &Connection, account: AccountId) -> rusqlite::Result<wire::RequestsAccess> {
-    let on: bool = db.query_row("SELECT enabled FROM requests_access WHERE account = ?1",
-        [events::sql(account.get())?], |row| row.get(0)).optional()?.unwrap_or(true);
+fn access(keeper: &Keeper, account: AccountId) -> Result<wire::RequestsAccess, Refusal> {
+    let on = keeper.requests_switch(account.get()).map_err(|_| Refusal::NotDealtWith)?.enabled;
     Ok(if on { wire::RequestsAccess::On } else { wire::RequestsAccess::Off })
 }
 
@@ -378,12 +395,14 @@ fn lock<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
 struct Rooms {
     ingress: HashSet<u64>,
     upstream: HashSet<u64>,
+    jobs: HashSet<i64>,
 }
 
 struct Place {
     rooms: Arc<Mutex<Rooms>>,
     account: u64,
     upstream: bool,
+    job: Option<i64>,
 }
 
 impl Place {
@@ -393,16 +412,23 @@ impl Place {
             return None;
         }
         drop(held);
-        Some(Self { rooms, account, upstream: false })
+        Some(Self { rooms, account, upstream: false, job: None })
     }
 
     fn upstream(rooms: Arc<Mutex<Rooms>>, account: u64) -> Option<Self> {
+        Self::take_upstream(rooms, account, None)
+    }
+
+    fn take_upstream(rooms: Arc<Mutex<Rooms>>, account: u64, job: Option<i64>) -> Option<Self> {
         let mut held = lock(&rooms);
         if held.upstream.len() == wire::RUNNING_MAX || !held.upstream.insert(account) {
             return None;
         }
+        if let Some(job) = job {
+            held.jobs.insert(job);
+        }
         drop(held);
-        Some(Self { rooms, account, upstream: true })
+        Some(Self { rooms, account, upstream: true, job })
     }
 }
 
@@ -410,6 +436,9 @@ impl Drop for Place {
     fn drop(&mut self) {
         let mut held = lock(&self.rooms);
         if self.upstream { &mut held.upstream } else { &mut held.ingress }.remove(&self.account);
+        if let Some(job) = self.job {
+            held.jobs.remove(&job);
+        }
     }
 }
 
@@ -870,6 +899,7 @@ fn enqueue(
     request: wire::RequestId,
     change: &[u8],
     plan: &Plan,
+    rooms: &Mutex<Rooms>,
 ) -> Result<JobId, Refusal> {
     let plan = encode(plan)?;
     let restore = sql(actor.restore)?;
@@ -879,12 +909,25 @@ fn enqueue(
         "SELECT EXISTS(SELECT 1 FROM requests_jobs WHERE restore = ?1 AND account = ?2 AND stage < ?3)",
         params![restore, account, FINISHED], |row| row.get(0),
     ).map_err(sql_error)?;
-    let waiting: i64 = keeper.data().connection().query_row(
-        "SELECT count(*) FROM requests_jobs WHERE restore = ?1 AND stage < ?2",
-        params![restore, FINISHED], |row| row.get(0),
-    ).map_err(sql_error)?;
-    if occupied || waiting >= (wire::WAITING_MAX + wire::RUNNING_MAX) as i64 {
+    if occupied {
         return Err(Refusal::Busy);
+    }
+    {
+        let mut active = keeper.data().connection().prepare(
+            "SELECT id FROM requests_jobs WHERE restore = ?1 AND stage < ?2",
+        ).map_err(sql_error)?;
+        let active = active.query_map(params![restore, FINISHED], |row| row.get::<_, i64>(0))
+            .map_err(sql_error)?;
+        let rooms = lock(rooms);
+        let mut waiting = 0;
+        for job in active {
+            if !rooms.jobs.contains(&job.map_err(sql_error)?) {
+                waiting += 1;
+                if waiting == wire::WAITING_MAX {
+                    return Err(Refusal::Busy);
+                }
+            }
+        }
     }
     let row = keeper.write_data(actor.now, |tx| {
         tx.execute(
@@ -1134,7 +1177,7 @@ fn binding(endpoint: &Endpoint) -> [u8; 32] {
 
 struct Credential {
     revision: u64,
-    key: Zeroizing<String>,
+    key: admin::LidarrKey,
 }
 
 enum Dispatch {
@@ -1172,14 +1215,14 @@ async fn call(
             let binding = binding(&endpoint);
             let found = tokio::task::spawn_blocking(move || {
                 let _place = place;
-                let lidarr = endpoint.lidarr(runtime, &credential.key, Some(Instant::now() + UPSTREAM_TIMEOUT));
+                let lidarr = endpoint.lidarr(runtime, credential.key.expose(), Some(Instant::now() + UPSTREAM_TIMEOUT));
                 for_read.ask(&lidarr).map_err(|error| wire::refusal_for(&error, None))
             }).await.unwrap_or(Err(Refusal::NotDealtWith));
             let state = service.clone();
             match service.shown(hash, for_finish, session, move |keeper, actor| {
                 Ok((|| {
+                    access(keeper, actor.account)?.check()?;
                     let db = keeper.data().connection();
-                    access(db, actor.account).map_err(sql_error)?.check()?;
                     let mut found = found?;
                     owner_view(db, &binding, actor, &mut found)?;
                     let mut books = lock(&state.books);
@@ -1198,8 +1241,9 @@ async fn call(
 
 impl Requests {
     fn dispatch(&self, keeper: &mut Keeper, actor: Actor, call: Call) -> Result<Dispatch, Refusal> {
+        access(keeper, actor.account)?.check()?;
         let endpoint = self.endpoint.as_ref().ok_or(Refusal::LidarrNotSetUp)?;
-        access(keeper.data().connection(), actor.account).map_err(sql_error)?.check()?;
+        let credential = credential(keeper, endpoint)?.ok_or(Refusal::LidarrNotSetUp)?;
         let binding = binding(endpoint);
         let db = keeper.data().connection();
         let answer = match call {
@@ -1213,9 +1257,8 @@ impl Requests {
                     wire::may_cancel(wire::RequestsAccess::On, actor.account, actor.admin,
                         owners.get(release.as_str()).map(Vec::as_slice).unwrap_or_default())?;
                 }
-                let credential = credential(keeper, endpoint)?.ok_or(Refusal::LidarrNotSetUp)?;
                 let work = Plan::resolve(&change, &lock(&self.books), actor, binding, credential.revision)?;
-                let job = enqueue(keeper, actor, request_id, &change_bytes, &work)?;
+                let job = enqueue(keeper, actor, request_id, &change_bytes, &work, &self.rooms)?;
                 self.wake.notify_one();
                 Answer::Begun { job }
             }
@@ -1250,15 +1293,16 @@ impl Requests {
                     books.remember(actor.session, seconds(actor.now), &ask, &answer);
                     return Ok(Dispatch::Done(answer));
                 }
-                let credential = credential(keeper, endpoint)?.ok_or(Refusal::LidarrNotSetUp)?;
                 return Ok(Dispatch::Read { ask, actor, credential });
             }
         };
         Ok(Dispatch::Done(answer))
     }
 
-    pub(crate) fn start(self: &Arc<Self>) {
-        if self.endpoint.is_none() {
+    pub(crate) async fn start(self: &Arc<Self>) {
+        let address = self.endpoint.as_ref().map(|endpoint| endpoint.address.clone());
+        let observed = self.accounts.desk.ask(move |keeper| keeper.lidarr(address.as_ref()).map(drop)).await;
+        if !matches!(observed, Ok(Ok(()))) || self.endpoint.is_none() {
             return;
         }
         let service = Arc::downgrade(self);
@@ -1311,7 +1355,7 @@ impl Requests {
         let _ = tokio::task::spawn_blocking(move || {
             let _place = place;
             let _turn = lock(&journal.service.mutation);
-            let lidarr = endpoint.lidarr(runtime, &key.key, None);
+            let lidarr = endpoint.lidarr(runtime, key.key.expose(), None);
             journal.restore_pending(&lidarr)
         }).await;
     }
@@ -1336,8 +1380,9 @@ impl Requests {
             loop {
                 let Some(row) = rows.next().map_err(sql_error)? else { return Ok(None) };
                 let account = unsigned(row.get::<_, i64>(1).map_err(sql_error)?)?;
-                let Some(place) = Place::upstream(self.rooms.clone(), account) else { continue };
-                break (row.get::<_, i64>(0).map_err(sql_error)?, account, row.get::<_, i64>(2).map_err(sql_error)?,
+                let id = row.get::<_, i64>(0).map_err(sql_error)?;
+                let Some(place) = Place::take_upstream(self.rooms.clone(), account, Some(id)) else { continue };
+                break (id, account, row.get::<_, i64>(2).map_err(sql_error)?,
                     row.get::<_, Vec<u8>>(3).map_err(sql_error)?, row.get::<_, Vec<u8>>(4).map_err(sql_error)?,
                     row.get::<_, i64>(5).map_err(sql_error)?, place);
             }
@@ -1349,7 +1394,7 @@ impl Requests {
         let live = SessionId::new(unsigned(session)?).ok_or(Refusal::NotDealtWith)?;
         let db = keeper.data().connection();
         let live = rows::session_by_id(db, live).map_err(sql_error)?;
-        let access = access(db, account_id).map_err(sql_error)?.check();
+        let access = access(keeper, account_id)?.check();
         let key = credential(keeper, endpoint)?;
         let allowed = (|| {
             if access.is_err() {
@@ -1416,7 +1461,7 @@ impl Requests {
                 was_kept
             })
         };
-        let lidarr = Lidarr::new(endpoint.url.as_str(), &credential.key, None, Arc::new(Line {
+        let lidarr = Lidarr::new(endpoint.url.as_str(), credential.key.expose(), None, Arc::new(Line {
             endpoint: endpoint.clone(), runtime: runtime.clone(), within: UPSTREAM_TIMEOUT,
             deadline: None, before_write: Some(pre_write),
         }));
@@ -1428,7 +1473,7 @@ impl Requests {
                 Err(reason) => Err(reason),
             }
         } else {
-            let cleaned = journal.restore_pending(&endpoint.lidarr(runtime, &credential.key, None));
+            let cleaned = journal.restore_pending(&endpoint.lidarr(runtime, credential.key.expose(), None));
             cleaned.and_then(|()| {
                 if job.recovering { job.recover(&lidarr) } else { job.run(&journal, &lidarr) }
             })
@@ -1676,7 +1721,7 @@ impl Job {
                 journal.ask(move |keeper, _, _| {
                     let current = keeper.load(account.get()).map_err(|_| Refusal::NotAllowed)?;
                     let db = keeper.data().connection();
-                    let access = access(db, account).map_err(sql_error)?;
+                    let access = access(keeper, account)?;
                     let owners = owners(db, &binding, account, &[target.as_str()])?;
                     wire::may_cancel(access, account, admin && current.state().admin, owners.get(target.as_str()).map(Vec::as_slice).unwrap_or_default())
                 })?;
@@ -2004,20 +2049,15 @@ fn update_work(
     }).map_err(|_| Refusal::NotDealtWith)
 }
 
-// Pending the apart-store adapter. The request path stays closed without a
-// key bound to this endpoint.
-#[cfg(not(test))]
-fn credential(_: &Keeper, _: &Endpoint) -> Result<Option<Credential>, Refusal> {
-    Ok(None)
-}
-
-#[cfg(test)]
-fn credential(_: &Keeper, _: &Endpoint) -> Result<Option<Credential>, Refusal> {
-    Ok(Some(Credential { revision: 1, key: Zeroizing::new(tests::TEST_KEY.to_owned()) }))
+fn credential(keeper: &mut Keeper, endpoint: &Endpoint) -> Result<Option<Credential>, Refusal> {
+    let saved = keeper.lidarr(Some(&endpoint.address)).map_err(|_| Refusal::NotDealtWith)?;
+    let (Some(binding), Some(sealed)) = (saved.binding, saved.sealed) else { return Ok(None) };
+    let sealing = admin::LidarrSealingKey::new(keeper.seal_key());
+    Ok(sealing.open(&binding, &sealed).map(|key| Credential { revision: binding.revision, key }))
 }
 
 pub(crate) fn guards(path: &str) -> bool {
-    matches!(path, wire::REQUESTS | admin::REQUEST_GRANT | admin::SET_REQUESTS_ENABLED | GET_LIDARR | wire::ADMIN_ATTRIBUTION)
+    matches!(path, wire::REQUESTS | admin::REQUEST_GRANT | admin::SET_REQUESTS_ENABLED | admin::GET_LIDARR_SETTING | admin::SET_LIDARR | wire::ADMIN_ATTRIBUTION)
 }
 
 fn admin_reply<T: admin::ResultBody>(answer: Result<T, admin::Refusal>) -> Response<Body> {
@@ -2066,12 +2106,90 @@ async fn admin_grant(
         Ok(grant) => grant,
         Err(reason) => return admin_reply::<admin::Applied>(Err(reason)),
     };
-    if matches!(grant.change.action, admin::Action::SetRequestsEnabled(_))
-        && (!ingress.page || ingress.kind != SessionKind::AdminPage)
-    {
+    if !matches!(&grant.change.action, admin::Action::SetRequestsEnabled(_) | admin::Action::SetLidarr(_)) {
+        return events::respond(service.accounts.admin_grant(session, grant).await);
+    }
+    if !ingress.page || ingress.kind != SessionKind::AdminPage {
         return send_admin_denied();
     }
-    events::respond(service.accounts.admin_grant(session, grant).await)
+    admin_reply(requests_grant(&service, ingress.clone(), grant).await)
+}
+
+async fn requests_grant(
+    service: &Requests,
+    ingress: Arc<Ingress>,
+    request: admin::RequestGrant,
+) -> Result<admin::GrantIssued, admin::Refusal> {
+    use admin::Refusal as Why;
+
+    let account::GrantRequest { head, change, password } = request;
+    let restore = head.restore;
+    service.accounts.live(&head, &ingress.hash).map_err(admin_from_account)?;
+    let address = service.endpoint.as_ref().map(|endpoint| endpoint.address.clone());
+    let clock = service.accounts.clock.clone();
+    let busy = || Why::Busy { retry_after_seconds: account::Wait::new(1) };
+    let (number, device, email, check, stored) = service.accounts.desk.ask(move |keeper| {
+        let now = clock();
+        let (device, mut caller) = admin_actor(keeper, &head, &ingress, now)?;
+        let intent = match &change.action {
+            admin::Action::SetRequestsEnabled(request) => {
+                let target = admin_target(keeper, &caller, request.account)?;
+                let current = keeper.requests_switch(request.account.get()).map_err(|_| Why::NotDealtWith)?;
+                change.requests_grant_intent(target.as_ref().unwrap_or(&caller).state(), current.revision)
+            }
+            admin::Action::SetLidarr(_) => {
+                let binding = current_lidarr(keeper, address.as_ref())?;
+                change.lidarr_grant_intent(&binding)
+            }
+            _ => None,
+        }.ok_or(Why::Malformed)?;
+        let number = caller.state().id.get();
+        let email = caller.state().email.clone();
+        let stored = keeper.data().password(number).map_err(|_| Why::NotDealtWith)?;
+        let expected = Fingerprint::from_bytes(stored.as_ref().map_or([0; 32], |kept| kept.hash));
+        let bearer = Bearer { device, hash: &ingress.hash, grant: None };
+        let check = caller.request(head.restore, keeper.clock(now), |turn| {
+            turn.check_leave(bearer, intent, expected)
+        }).apply(|effects| keeper.persist(effects, &[], now))
+            .map_err(|_| Why::NotDealtWith)?
+            .map_err(admin_said)?;
+        Ok((number, device, email, check, stored))
+    }).await.map_err(|_| busy())??;
+    let checked = service.accounts.workers.check(
+        &email, account::PasswordDoor::KnownDevice, Some(device), password, stored,
+    ).await.map_err(|_| busy())?;
+    let Checked::Match { derived, .. } = checked else {
+        return Err(Why::NotAllowed(admin::Denial::WrongPassword));
+    };
+    let clock = service.accounts.clock.clone();
+    service.accounts.desk.ask(move |keeper| {
+        let now = clock();
+        let receipt = check.check(derived, keeper.clock(now)).map_err(admin_said)?;
+        let mut account = keeper.load(number).map_err(|_| Why::NotDealtWith)?;
+        let grant = admin::GrantSecret::from_bytes(*random::<32>().ok_or(Why::NotDealtWith)?);
+        account.request(restore, keeper.clock(now), |turn| turn.grant_leave(receipt, &grant))
+            .apply(|effects| keeper.persist(effects, &[], now))
+            .map_err(|_| Why::NotDealtWith)?
+            .map_err(admin_said)?;
+        Ok(admin::GrantIssued { grant })
+    }).await.map_err(|_| busy())?
+}
+
+fn admin_target(keeper: &mut Keeper, actor: &Account, target: AccountId) -> Result<Option<Account>, admin::Refusal> {
+    if actor.state().id == target {
+        return Ok(None);
+    }
+    if !rows::account_exists(keeper.data().connection(), target.get()).map_err(|_| admin::Refusal::NotDealtWith)? {
+        return Err(admin::Refusal::NotAllowed(admin::Denial::NoSuchAccount));
+    }
+    keeper.load(target.get()).map(Some).map_err(|_| admin::Refusal::NotDealtWith)
+}
+
+fn current_lidarr(
+    keeper: &mut Keeper, address: Option<&admin::InternalAddress>,
+) -> Result<admin::LidarrBinding, admin::Refusal> {
+    keeper.lidarr(address).map_err(|_| admin::Refusal::NotDealtWith)?.binding
+        .ok_or(admin::Refusal::NotAllowed(admin::Denial::Conflict))
 }
 
 async fn set_requests_enabled(
@@ -2090,28 +2208,16 @@ async fn set_requests_enabled(
     let finished = service.accounts.desk.ask(move |keeper| {
         let now = clock();
         let (device, mut actor) = admin_actor(keeper, &request.head, &ingress, now)?;
-        let target_id = request.change.account;
-        let mut target = if actor.state().id == target_id {
-            None
-        } else {
-            Some(keeper.load(target_id.get()).map_err(|_| admin::Refusal::NotAllowed(admin::Denial::NoSuchAccount))?)
-        };
-        let named = admin::NamedChange::for_request(&request);
-        let intent = named.grant_intent(Some(target.as_ref().unwrap_or(&actor).state()))
-            .ok_or(admin::Refusal::Malformed)?;
-        let LeaveFor::Admin { action, target: named } = intent.change else { return Err(admin::Refusal::Malformed) };
-        let bearer = Bearer { device, hash: &ingress.hash, grant: Some(GrantUse { request_id: intent.request_id, secret: &request.grant }) };
+        let account = request.change.account;
+        let mut target = admin_target(keeper, &actor, account)?;
+        let current = keeper.requests_switch(account.get()).map_err(|_| admin::Refusal::NotDealtWith)?;
+        let grant = GrantUse { request_id: request.request_id, secret: &request.grant };
+        let bearer = Bearer { device, hash: &ingress.hash, grant: Some(grant) };
         actor.request(request.head.restore, keeper.clock(now), |turn| {
-            turn.administer(bearer, action, named, target.as_mut())
+            turn.set_requests_enabled(bearer, account, request.change.enabled, current.revision, target.as_mut())
         }).apply(|effects| keeper.persist(effects, &[], now))
             .map_err(|_| admin::Refusal::NotDealtWith)?
             .map_err(admin_said)?;
-        // The store applies the switch alongside the accepted action. Until
-        // that adapter lands the setter cannot claim a change was kept.
-        let kept = access(keeper.data().connection(), target_id).map_err(|_| admin::Refusal::NotDealtWith)?;
-        if (kept == wire::RequestsAccess::On) != request.change.enabled {
-            return Err(admin::Refusal::NotDealtWith);
-        }
         Ok(admin::Applied {})
     }).await.unwrap_or(Err(admin::Refusal::Busy { retry_after_seconds: account::Wait::new(1) }));
     admin_reply(finished)
@@ -2120,7 +2226,6 @@ async fn set_requests_enabled(
 fn admin_actor(keeper: &mut Keeper, head: &RequestHead, ingress: &Ingress, now: u64) -> Result<(DeviceId, Account), admin::Refusal> {
     let (_, device, mut actor, kind) = events::authenticated(keeper, head, &ingress.hash, Access::Read, now)
         .map_err(admin_from_account)?;
-    // CARRIED until kept supplies a page-only admin decision.
     if session_id(&actor, device).map_err(admin_from_account)? != ingress.session || kind != SessionKind::AdminPage {
         return Err(admin_denied());
     }
@@ -2155,13 +2260,6 @@ fn admin_said(why: Denied) -> admin::Refusal {
     }
 }
 
-fn raw_json(status: StatusCode, body: Vec<u8>) -> Response<Body> {
-    let mut response = Response::new(Body::from(body));
-    *response.status_mut() = status;
-    response.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    response
-}
-
 async fn get_lidarr(
     State(service): State<Arc<Requests>>,
     axum::Extension(ingress): axum::Extension<Arc<Ingress>>,
@@ -2170,30 +2268,60 @@ async fn get_lidarr(
     if !ingress.page || ingress.kind != SessionKind::AdminPage {
         return send_admin_denied();
     }
-    let request = match read_admin(body, admin::read::<admin::GetMusicServer>) {
+    let request = match read_admin(body, admin::read::<admin::GetLidarrSetting>) {
         Ok(request) => request,
-        Err(why) => return admin_reply::<admin::Applied>(Err(why)),
+        Err(why) => return admin_reply::<admin::LidarrSetting>(Err(why)),
     };
     let clock = service.accounts.clock.clone();
     let endpoint = service.endpoint.clone();
-    let address = endpoint.as_ref().map(|endpoint| endpoint.url.as_str().trim_end_matches('/').to_owned());
     let configured = service.accounts.desk.ask(move |keeper| {
         admin_actor(keeper, &request.head, &ingress, clock())?;
-        match endpoint {
-            None => Ok(false),
+        let address = endpoint.as_ref().map(|endpoint| endpoint.address.clone());
+        let configured = match endpoint {
+            None => false,
             Some(endpoint) => credential(keeper, &endpoint).map(|key| key.is_some())
-                .map_err(|_| admin::Refusal::NotDealtWith),
-        }
+                .map_err(|_| admin::Refusal::NotDealtWith)?,
+        };
+        Ok(admin::LidarrSetting { address, configured })
     }).await.unwrap_or(Err(admin::Refusal::Busy { retry_after_seconds: account::Wait::new(1) }));
-    match configured {
-        Ok(configured) => {
-            let body = serde_json::json!({ "done": { "address": address, "configured": configured } });
-            raw_json(StatusCode::OK, body.to_string().into_bytes())
-        }
-        Err(reason) => admin_reply::<admin::Applied>(Err(reason)),
-    }
+    admin_reply(configured)
 }
 
+async fn set_lidarr(
+    State(service): State<Arc<Requests>>,
+    axum::Extension(ingress): axum::Extension<Arc<Ingress>>,
+    body: Bytes,
+) -> Response<Body> {
+    if !ingress.page || ingress.kind != SessionKind::AdminPage {
+        return send_admin_denied();
+    }
+    let request = match read_admin(body, admin::read::<admin::SetLidarr>) {
+        Ok(request) => request,
+        Err(why) => return admin_reply::<admin::Applied>(Err(why)),
+    };
+    let address = service.endpoint.as_ref().map(|endpoint| endpoint.address.clone());
+    let clock = service.accounts.clock.clone();
+    let finished = service.accounts.desk.ask(move |keeper| {
+        let now = clock();
+        let (device, mut actor) = admin_actor(keeper, &request.head, &ingress, now)?;
+        let binding = current_lidarr(keeper, address.as_ref())?;
+        let sealing = admin::LidarrSealingKey::new(keeper.seal_key());
+        let nonce = random::<{ admin::LIDARR_NONCE_BYTES }>()
+            .ok_or(admin::Refusal::NotDealtWith)?;
+        let grant = GrantUse { request_id: request.request_id, secret: &request.grant };
+        let bearer = Bearer { device, hash: &ingress.hash, grant: Some(grant) };
+        actor.request(request.head.restore, keeper.clock(now), |turn| {
+            turn.set_lidarr(bearer, &binding, &request.change.key, &sealing, *nonce)
+        }).apply(|effects| keeper.persist(effects, &[], now))
+            .map_err(|_| admin::Refusal::NotDealtWith)?
+            .map_err(admin_said)?;
+        Ok(admin::Applied {})
+    }).await.unwrap_or(Err(admin::Refusal::Busy { retry_after_seconds: account::Wait::new(1) }));
+    if finished.is_ok() {
+        service.wake.notify_one();
+    }
+    admin_reply(finished)
+}
 
 async fn attribution(
     State(service): State<Arc<Requests>>,

@@ -312,7 +312,7 @@ pub fn listen(address: std::net::SocketAddr) -> io::Result<TcpListener> {
 /// it writes the counts of refusals every [`COUNTS_EVERY`] that there were any.
 pub async fn serve(listener: TcpListener, shell: Arc<Shell>, log: bool) {
     if let Some(requests) = &shell.requests {
-        requests.start();
+        requests.start().await;
     }
     if log {
         let shell = shell.clone();
@@ -426,21 +426,27 @@ async fn connection(mut stream: Guarded, peer: Peer, deadline: tokio::time::Inst
                     admit.listener(&head.target, &authorization, head.body())
                 }
             };
-            let Some(_slot) = slots.take(admitted) else {
-                // The proxy is told so, by the gate's one answer; no one else is told anything.
-                if refused(Refusal::Full) {
-                    answer_bare(stream, GATE, false).await;
-                }
-                return;
+            let needs_session = shell.requests.is_some() && crate::requests::guards(&head.target);
+            let _slot = if needs_session && admitted != Admitted::Reserved {
+                None
+            } else {
+                let Some(slot) = slots.take(admitted) else {
+                    // The proxy is told so, by the gate's one answer; no one else is told anything.
+                    if refused(Refusal::Full) {
+                        answer_bare(stream, GATE, false).await;
+                    }
+                    return;
+                };
+                Some(slot)
             };
-            let _serving = Holding::new(&shell);
+            let _serving = _slot.as_ref().map(|_| Holding::new(&shell));
             let service = {
                 let shell = shell.clone();
                 let admin_path = head.target.starts_with(crate::admin::PAGE);
                 hyper::service::service_fn(move |request| {
                     let shell = shell.clone();
                     async move {
-                        let mut response = answer(request, length, admitted, shell).await?;
+                        let mut response = answer(request, length, admitted, needs_session, shell).await?;
                         if admin_path {
                             for (name, value) in crate::admin::PAGE_HEADERS {
                                 response.headers_mut().insert(name, HeaderValue::from_static(value));
@@ -554,18 +560,13 @@ where
     Ok(bytes)
 }
 
-async fn answer(request: Request<Incoming>, length: usize, admitted: Admitted, shell: Arc<Shell>) -> Result<Response<Body>, Infallible> {
-    let (mut parts, body) = request.into_parts();
-    if let Some(requests) = shell.requests.as_ref().filter(|_| crate::requests::guards(parts.uri.path())) {
-        match tokio::time::timeout(HEAD_DEADLINE, requests.admit(parts.uri.path(), &parts.headers)).await {
-            Ok(Ok(ingress)) => { parts.extensions.insert(Arc::new(ingress)); }
-            Ok(Err(mut response)) => {
-                finish(&mut response);
-                return Ok(response);
-            }
-            Err(_) => return Ok(refusal(StatusCode::SERVICE_UNAVAILABLE)),
-        }
+async fn answer(request: Request<Incoming>, length: usize, admitted: Admitted, needs_session: bool, shell: Arc<Shell>) -> Result<Response<Body>, Infallible> {
+    if needs_session && admitted != Admitted::Reserved {
+        let mut response = crate::requests::session_ended();
+        finish(&mut response);
+        return Ok(response);
     }
+    let (parts, body) = request.into_parts();
     let bytes = match tokio::time::timeout(BODY_DEADLINE, take_body(body, length)).await {
         Err(_) => {
             shell.count(Refusal::SlowBody);
