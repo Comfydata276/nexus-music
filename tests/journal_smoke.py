@@ -78,7 +78,7 @@ class Music(BaseHTTPRequestHandler):
             data = json.dumps({"subsonic-response": {
                 "status": "ok", "version": "1.16.1", "serverVersion": "0.60.2",
                 "artists": {"index": []}, "albumList2": {"album": []}, "song": SONGS[0],
-                "playlists": {"playlist": [playlist]}, "playlist": playlist | {"entry": SONGS},
+                "playlists": {"playlist": [playlist]}, "playlist": playlist | {"entry": list(reversed(SONGS))},
                 "searchResult3": {"artist": [], "album": [], "song": []},
             }}).encode()
             self.send_response(200)
@@ -186,7 +186,11 @@ def event(home, kind, **fields):
 def play(app):
     playlist = app.one(label=PLAYLIST, type="PlaylistItem")
     app.click(playlist["handle"])
-    app.press(f"Play {PLAYLIST}")
+    tracks = until(lambda: app.find(role="ListItem", type="TrackRow"), "the playlist's tracks")
+    assert tracks[0]["accessibleLabel"].startswith(SONGS[0]["title"]), [
+        track["accessibleLabel"] for track in tracks
+    ]
+    app.click(tracks[0]["handle"], action="DoubleClick")
 
 
 def walk(profile, port, temporary):
@@ -223,7 +227,7 @@ def walk(profile, port, temporary):
                 app.press("Pause")
                 until(lambda: any(row["sequence"] > paused["sequence"] and row["event"]["kind"] == "pause"
                                   for row in rows(home)), "the second Pause")
-                app.key("→")
+                app.press("Seek", role="Slider")
                 sought = until(lambda: event(home, "seek", start=second["id"]), "Seek")
                 assert sought["event"]["to_ms"] > sought["event"]["from_ms"]
             else:
@@ -235,7 +239,7 @@ def walk(profile, port, temporary):
             assert raw.startswith(original)
             suffix = raw[len(original):]
             song, at, source = json.loads(suffix)
-            assert suffix == f'["w8-a",{at},"playlist:w8-set"]\n'.encode()
+            assert suffix == f'["w8-a",{at},"playlist:w8-set"]\n'.encode(), (song, source, suffix)
             assert song == "w8-a" and source == "playlist:w8-set"
             outputs.append((home / "audio.pcm").read_bytes())
             if recording:
