@@ -114,7 +114,21 @@
 //!
 //! **The fence.** An event written under one account is never sent under another: a read is
 //! asked for the signed-in account and life, and an [`Happened::EventsRead`] for another
-//! account or life, or from before a stop, a sign-out, Offline or a sign-in, is dropped.
+//! account or life, or from before a stop, a sign-out, Offline or a sign-in, is dropped. An
+//! [`Happened::EventsWaiting`] for any account or life but the signed-in one's is ignored
+//! entirely. **When any answer says the life moved**, everything read, queued or held under
+//! the earlier life is retired at once: its batch fails `waits_for`, its read and its answer
+//! are dropped, and the new life's events go at the next thing that changes. **When the
+//! Diagnostics switch becomes off** (the person's choice, or a `hello` whose default is off
+//! with no choice made), a read out is dropped when it answers and an upload queued fails
+//! `waits_for`. A read answered empty after a summary came in while it was out is read once
+//! more, from the same place.
+//!
+//! **"The data was put back"** (13.3), from whichever answer says it (a call under the
+//! session, or a sign-out note's telling): [`JournalDo::ResendAll`] names the BACKEND. Every
+//! account's journal kept under that backend id is told at once, and each account's events
+//! are sent again under that account only, when it is next signed in. The account signed in
+//! now and its session are not touched by a note's answer.
 
 use super::account::{
     self, AccountId, ChangePassword, Credential, DeviceId, DeviceKind, DevicePage, DeviceSecret, Email, ForceOut, ForcedOut,
@@ -359,8 +373,8 @@ impl Note {
     }
 }
 
-/// Something that happened.
-#[derive(Debug)]
+/// Something that happened. Its debug form shows no Diagnostics text and no event's
+/// content (its events show as `Placed(..)`): lengths and counts only.
 pub enum Happened {
     /// The person pressed something.
     Pressed(Press),
@@ -408,6 +422,39 @@ pub enum Happened {
     DiagnosticsFault { at_ms: u64 },
     /// The app is in use, or no longer (14.4: daily "while in use"). `false` at each start.
     InUse(bool),
+}
+
+impl fmt::Debug for Happened {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Happened::Pressed(press) => f.debug_tuple("Pressed").field(press).finish(),
+            Happened::Answered { ask, status, body } => f.debug_struct("Answered").field("ask", ask).field("status", status).field("body", body).finish(),
+            Happened::Failed { ask, failure } => f.debug_struct("Failed").field("ask", ask).field("failure", failure).finish(),
+            Happened::Network { up } => f.debug_struct("Network").field("up", up).finish(),
+            Happened::Offline(on) => f.debug_tuple("Offline").field(on).finish(),
+            Happened::Tick => f.write_str("Tick"),
+            Happened::MusicRefused { count, generation } => f.debug_struct("MusicRefused").field("count", count).field("generation", generation).finish(),
+            Happened::MusicLooked { look, count, generation } => {
+                f.debug_struct("MusicLooked").field("look", look).field("count", count).field("generation", generation).finish()
+            }
+            Happened::EventsWaiting { account, life, pending, from_sequence } => f
+                .debug_struct("EventsWaiting")
+                .field("account", account)
+                .field("life", life)
+                .field("pending", pending)
+                .field("from_sequence", from_sequence)
+                .finish(),
+            Happened::EventsRead { read, account, life, events } => {
+                f.debug_struct("EventsRead").field("read", read).field("account", account).field("life", life).field("events", &events.len()).finish()
+            }
+            Happened::DiagnosticsRead { read, text } => {
+                f.debug_struct("DiagnosticsRead").field("read", read).field("text_bytes", &text.as_ref().map(String::len)).finish()
+            }
+            Happened::DiagnosticsSwitch(choice) => f.debug_tuple("DiagnosticsSwitch").field(choice).finish(),
+            Happened::DiagnosticsFault { at_ms } => f.debug_struct("DiagnosticsFault").field("at_ms", at_ms).finish(),
+            Happened::InUse(on) => f.debug_tuple("InUse").field(on).finish(),
+        }
+    }
 }
 
 /// On the phone, where an address leads on this network and whether the local-network
@@ -683,6 +730,9 @@ pub enum Forget {
     UnreadableNote { index: usize },
     /// The Diagnostics schedule, when what was kept of it did not read: a new one is kept.
     DiagSchedule,
+    /// The person's Diagnostics choice, when what was kept of it did not read: taken as no
+    /// choice made.
+    Diagnostics,
 }
 
 /// What the player is handed.

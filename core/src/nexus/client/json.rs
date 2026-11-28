@@ -159,8 +159,8 @@ struct KeptIn<'a> {
     notes: Vec<&'a RawValue>,
     #[serde(default)]
     offline: bool,
-    #[serde(default)]
-    diagnostics: Option<bool>,
+    #[serde(default, borrow)]
+    diagnostics: Option<&'a RawValue>,
     #[serde(default, borrow)]
     diag_schedule: Option<&'a RawValue>,
 }
@@ -438,7 +438,16 @@ fn kept(kept: KeptIn<'_>) -> Kept {
         }
         schedule
     });
-    Kept { device_secret, saved, notes, offline: kept.offline, unreadable, diagnostics: kept.diagnostics, diag_schedule }
+    // The person's choice: `true`, `false`, or none made. Anything else is no choice made,
+    // and forgotten (as every kept part is).
+    let diagnostics = kept.diagnostics.and_then(|raw| match serde_json::from_str::<Option<bool>>(raw.get()) {
+        Ok(choice) => choice,
+        Err(_) => {
+            unreadable.push(Forget::Diagnostics);
+            None
+        }
+    });
+    Kept { device_secret, saved, notes, offline: kept.offline, unreadable, diagnostics, diag_schedule }
 }
 
 fn event(event: EventIn) -> Result<Happened, ()> {
