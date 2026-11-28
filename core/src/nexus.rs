@@ -16,3 +16,4 @@ pub mod events;
 pub mod kept;
 pub mod proto;
 pub mod prove;
+pub mod wire;
