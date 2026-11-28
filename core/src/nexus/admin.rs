@@ -1172,8 +1172,16 @@ mod tests {
             }).map(|answer| assert_eq!(answer, Err(Denied::LeaveRequired))).unwrap();
         }
 
-        actor.request(1, kept::Clock::new(3, 3), |turn| {
-            turn.set_lidarr(bearer(request_id), &current, &key, &sealing, [0x68; LIDARR_NONCE_BYTES])
+        let authorized = actor.request(1, kept::Clock::new(3, 3), |mut turn| {
+            turn.authorize_lidarr(bearer(request_id), &current, &key)
+        }).apply(|effects| {
+            let [update] = effects.updates.as_slice() else { panic!("expected a consumed grant") };
+            assert_eq!(update.change, DataChange::Keep);
+            assert!(update.apart_first.devices.get(&device).unwrap().permit.as_ref().unwrap().leave.is_none());
+            Ok::<_, std::convert::Infallible>(())
+        }).unwrap().unwrap();
+        actor.request(1, kept::Clock::new(4, 4), |turn| {
+            turn.install_lidarr(bearer(request_id), authorized, &current, &key, &sealing, [0x68; LIDARR_NONCE_BYTES])
         }).apply(|effects| {
             let [update] = effects.updates.as_slice() else { panic!("expected one update") };
             let DataChange::InstallLidarrKey { binding, sealed } = &update.change else {
@@ -1187,7 +1195,7 @@ mod tests {
             Ok::<_, std::convert::Infallible>(())
         }).unwrap().unwrap();
         assert_eq!(
-            step(&mut actor, 3, |turn| turn.set_lidarr(bearer(request_id), &current, &key, &sealing, [0x69; LIDARR_NONCE_BYTES])),
+            step(&mut actor, 4, |turn| turn.set_lidarr(bearer(request_id), &current, &key, &sealing, [0x69; LIDARR_NONCE_BYTES])),
             Err(Denied::LeaveRequired)
         );
     }
