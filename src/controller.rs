@@ -1470,17 +1470,13 @@ impl Controller {
         (at("queue"), at("queue-place"), at("history"))
     }
 
-    /// Where this person's downloads are: the folder chosen for them under Settings, or else,
-    /// for the folder this PC had before (carried over), where 0.40 kept them; for everyone
-    /// else, a folder of their own inside it (the review's MUST 15: one person's files are
-    /// never another's).
+    /// Where this person's downloads are (`downloads::account_dir`): always a folder of their
+    /// own inside the place chosen for them, or the place chosen for this PC, so that two
+    /// people never share a file name (W7c item 5); the folder this PC had before (carried
+    /// over) keeps 0.40's place.
     pub fn downloads_dir_for(&self, folder: &str, legacy: bool) -> PathBuf {
         let settings = self.settings.borrow();
-        if let Some(chosen) = settings.downloads_dirs.get(folder) {
-            return PathBuf::from(chosen);
-        }
-        let base = if settings.downloads_dir.is_empty() { self.paths.downloads.clone() } else { PathBuf::from(&settings.downloads_dir) };
-        if folder.is_empty() || legacy { base } else { base.join(folder) }
+        crate::downloads::account_dir(&settings, &self.paths.downloads, folder, legacy)
     }
 
     /// Brings in what belongs to the account that has just signed in: its downloads, and

@@ -1034,7 +1034,7 @@ pub const REPLACING: Steps = Steps { place: |from, to| fs::rename(from, to), ..O
 /// `MOVEFILE_WRITE_THROUGH`, which Microsoft documents as not returning until the file is
 /// actually moved on the disk.
 #[cfg(windows)]
-fn place_new(from: &Path, to: &Path) -> std::io::Result<()> {
+pub(crate) fn place_new(from: &Path, to: &Path) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
     let wide = |path: &Path| path.as_os_str().encode_wide().chain(Some(0)).collect::<Vec<u16>>();
@@ -1050,7 +1050,7 @@ fn place_new(from: &Path, to: &Path) -> std::io::Result<()> {
 /// comes with the whole file. (If the removal doesn't happen, the file under its first name
 /// is cleared by the next attempt, and never read.)
 #[cfg(not(windows))]
-fn place_new(from: &Path, to: &Path) -> std::io::Result<()> {
+pub(crate) fn place_new(from: &Path, to: &Path) -> std::io::Result<()> {
     if let Err(error) = fs::hard_link(from, to) {
         // A drive that can't make a second name for a file (FAT, exFAT, some network ones):
         // "not permitted", "not supported", "too many links".
