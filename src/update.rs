@@ -124,8 +124,10 @@ fn get(
     deadline: Option<Instant>,
 ) -> Result<ureq::http::Response<ureq::Body>, CheckError> {
     let mut address = source.start(start).ok_or(CheckError::Refused)?;
+    let trace = matches!(source, Source::Installer { .. }) && std::env::var_os("NEXUS_TRACE").is_some();
     let mut followed = 0;
     loop {
+        let started = Instant::now();
         let mut request = agent.get(address.as_str());
         if matches!(source, Source::Metadata { .. }) {
             request = request.header("Accept", "application/vnd.github+json");
@@ -136,10 +138,22 @@ fn get(
                 .filter(|time| !time.is_zero()).ok_or(CheckError::TimedOut)?;
             config = config.timeout_global(Some(remaining));
         }
-        let response = config.build().call().map_err(|err| match err {
-            ureq::Error::Timeout(_) => CheckError::TimedOut,
-            _ => CheckError::Request,
+        let response = config.build().call().map_err(|err| {
+            let reason = match err {
+                ureq::Error::Timeout(_) => CheckError::TimedOut,
+                _ => CheckError::Request,
+            };
+            if trace {
+                eprintln!("[trace] update download: hop {followed} failed after {:?}: {reason}", started.elapsed());
+            }
+            reason
         })?;
+        if trace {
+            eprintln!("[trace] update download: hop {followed} answered {} in {:?}", response.status(), started.elapsed());
+        }
+        if deadline.is_some_and(|end| Instant::now() >= end) {
+            return Err(CheckError::TimedOut);
+        }
         if !response.status().is_redirection() {
             return Ok(response);
         }

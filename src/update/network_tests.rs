@@ -36,6 +36,13 @@ struct Server {
 
 impl Server {
     fn new(reply: impl Fn(usize) -> String + Send + 'static) -> Self {
+        Self::serve(move |index, stream| {
+            // A deadline can close the client before the response.
+            let _ = stream.write_all(reply(index).as_bytes());
+        })
+    }
+
+    fn serve(reply: impl Fn(usize, &mut native_tls::TlsStream<TcpStream>) + Send + 'static) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let identity = Identity::from_pkcs12(include_bytes!("../../tests/fixtures/update/loopback.p12"), "fixture").unwrap();
@@ -65,8 +72,7 @@ impl Server {
                         log.push(request);
                         log.len() - 1
                     };
-                    // The deadline tests deliberately close the client before the response.
-                    let _ = tls.write_all(reply(index).as_bytes());
+                    reply(index, &mut tls);
                 }
             }
         });
@@ -157,6 +163,23 @@ fn metadata_redirects_share_the_deadline_with_the_final_response() {
     let api = Server::new(|i| {
         thread::sleep(Duration::from_millis(if i == 0 { 400 } else { 900 }));
         redirect("/next")
+    });
+    assert_eq!(api.check(Duration::from_millis(1100)), Err(CheckError::TimedOut));
+    assert_eq!(api.count(), 2);
+}
+
+#[test]
+fn final_metadata_body_only_has_the_remaining_time() {
+    let api = Server::serve(|i, stream| {
+        if i == 0 {
+            thread::sleep(Duration::from_millis(400));
+            let _ = stream.write_all(redirect("/published").as_bytes());
+        } else {
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", RELEASE.len()).unwrap();
+            stream.flush().unwrap();
+            thread::sleep(Duration::from_millis(900));
+            let _ = stream.write_all(RELEASE.as_bytes());
+        }
     });
     assert_eq!(api.check(Duration::from_millis(1100)), Err(CheckError::TimedOut));
     assert_eq!(api.count(), 2);

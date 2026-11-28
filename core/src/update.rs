@@ -19,10 +19,10 @@ impl Source<'_> {
     /// Metadata starts on the API. An installer must start at this project's download link,
     /// even though a later hop may go to the asset store.
     pub fn start(self, address: &str) -> Option<Url> {
-        let url = Url::parse(address).ok()?;
+        let url = read_url(None, address)?;
         if let Self::Installer { repository, .. } = self {
-            if &url[..Position::BeforePath] != repository
-                || !url.path().starts_with(&format!("/{REPO}/releases/download/"))
+            let path = format!("/{REPO}/releases/download/");
+            if !address.starts_with(&format!("{repository}{path}")) || !url.path().starts_with(&path)
             {
                 return None;
             }
@@ -35,7 +35,7 @@ impl Source<'_> {
         if followed >= 5 || location.is_empty() {
             return None;
         }
-        self.checked(current.join(location).ok()?)
+        self.checked(read_url(Some(current), location)?)
     }
 
     fn checked(self, url: Url) -> Option<Url> {
@@ -47,6 +47,26 @@ impl Source<'_> {
         };
         (allowed && url.scheme() == "https" && url.fragment().is_none()).then_some(url)
     }
+}
+
+/// Reject spellings a browser-style parser could silently repair before the origin check.
+fn read_url(base: Option<&Url>, address: &str) -> Option<Url> {
+    let authority_and_path = address.strip_prefix("//").or_else(|| {
+        let (scheme, rest) = address.split_once("://")?;
+        scheme.eq_ignore_ascii_case("https").then_some(rest)
+    });
+    if let Some(rest) = authority_and_path {
+        let authority = rest.split(['/', '?', '#']).next()?;
+        if authority.ends_with(':') || !authority.is_ascii() || authority.contains(['%', '@']) {
+            return None;
+        }
+    }
+    let malformed = std::cell::Cell::new(false);
+    let url = Url::options()
+        .base_url(base)
+        .syntax_violation_callback(Some(&|_| malformed.set(true)))
+        .parse(address).ok()?;
+    (!malformed.get()).then_some(url)
 }
 
 #[cfg(test)]
@@ -62,6 +82,8 @@ mod tests {
             "http://api.github.com/", "https://api.github.com.example/",
             "https://api.github.com:8443/", "//example.org/", "https://user@api.github.com/",
             "https://api.github.com@other.example/", "https://github.com/", "#fragment",
+            "https://@api.github.com/", "https://%61pi.github.com/", "https://api.github.com:/",
+            "https:////api.github.com/", "https://api.github.com/a b",
         ] {
             assert!(DETAILS.redirect(&api, address, 0).is_none(), "{address}");
         }
