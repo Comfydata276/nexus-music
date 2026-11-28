@@ -591,6 +591,23 @@ fn start_again_replays_taken_events_and_never_retries_final_refusals() {
 }
 
 #[test]
+fn display_cleaning_removes_controls_and_preserves_ordinary_scripts() {
+    let bidi = ['\u{061c}', '\u{200e}', '\u{200f}'].into_iter()
+        .chain('\u{202a}'..='\u{202e}').chain('\u{2066}'..='\u{2069}');
+    let controls = ('\u{0}'..='\u{1f}').chain('\u{7f}'..='\u{9f}').chain(bidi);
+    for ch in controls {
+        assert_eq!(clean_text(&format!("A{ch}B")), "AB", "U+{:04X}", ch as u32);
+    }
+    assert_eq!(clean_text("A \u{2028}\u{2029}  \u{202e} B"), "A B");
+    for title in ["تملي معاك", "שיר לשלום", "春よ、来い", "می\u{200c}روم"] {
+        assert_eq!(clean_text(title), title);
+    }
+    let long = "音".repeat(TEXT_CHARS + 1);
+    assert_eq!(clean_display_text(&long), long);
+    assert_eq!(clean_text(&format!("\u{2066}{long}")).chars().count(), TEXT_CHARS);
+}
+
+#[test]
 fn the_player_makes_and_cleans_a_record_before_the_writer_places_it() {
     let event_id = id(2);
     let kind = Kind::Search {
@@ -602,7 +619,7 @@ fn the_player_makes_and_cleans_a_record_before_the_writer_places_it() {
     assert_eq!(record.id(), event_id);
     assert_eq!(record.at_ms(), TIME_MAX_MS);
     assert!(record.kind() == &Kind::Search {
-        words: format!(" {}", "é".repeat(199)),
+        words: "é".repeat(TEXT_CHARS),
         found: 0,
         where_: SearchedIn::Library,
     });
