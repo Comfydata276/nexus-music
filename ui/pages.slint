@@ -2238,6 +2238,7 @@ export component SettingsPage inherits Rectangle {
             Settings.tab = index;
             root.show-report = false;
             scroll.content-y = 0px;
+            if index == 4 { Settings.check-requests-source(); }
         }
     }
 

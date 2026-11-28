@@ -3041,6 +3041,9 @@ impl Controller {
                 view.set_loading(false);
                 view.set_error("".into());
                 self.refresh_cache_size();
+                if self.ui.global::<ui::Settings>().get_tab() == 4 {
+                    crate::requests::refresh();
+                }
                 // Show how the connection to Lidarr stands now, unless a sign-in is under way.
                 if self.ui.global::<ui::Settings>().get_requests_state() != "waiting" {
                     self.check_requests(false);
@@ -4559,6 +4562,7 @@ impl Controller {
         settings.on_check_requests(|| {
             with(|ctl| ctl.check_requests(false));
         });
+        settings.on_check_requests_source(crate::requests::refresh);
         settings.on_sign_in_requests(|| {
             with(|ctl| ctl.sign_in_requests());
         });

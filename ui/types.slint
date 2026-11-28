@@ -708,6 +708,7 @@ export global Settings {
     // Saves the address and key and connects, going on to the sign-in if one is needed.
     callback save-requests(address: string, key: string);
     callback check-requests();
+    callback check-requests-source();
     callback sign-in-requests();
     callback cancel-sign-in();
     callback sign-out-requests();
