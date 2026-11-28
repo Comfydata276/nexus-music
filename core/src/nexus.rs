@@ -10,6 +10,12 @@
 //! the apps do, so both sides read the same words the same way.
 
 pub mod account;
+pub mod admin;
+pub mod diag;
+pub mod events;
 pub mod client;
 pub mod kept;
+pub mod music;
 pub mod proto;
+pub mod requests;
+pub mod wire;

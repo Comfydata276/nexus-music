@@ -1,328 +1,9 @@
 use super::*;
 
-fn hash(n: u8) -> Fingerprint {
-    Fingerprint::of(&[n; SECRET_BYTES])
-}
-fn scope() -> Scope {
-    Scope {
-        backend: BackendId::from_bytes([1; 16]),
-        restore: 1,
-        account: "Alice".into(),
-        life: 1,
-        device: 7,
-        number: 1,
-    }
-}
-fn connect(d: &mut Device, s: &mut Scope, n: u8, at: u64) -> Result<(), Denied> {
-    let t = d.begin(s, Purpose::Connect, at)?;
-    d.finish(s, t, "Alice", Some(hash(n)), at)
-}
-fn connected() -> Result<(Device, Scope), Denied> {
-    let mut s = scope();
-    let mut d = Device::new(&s);
-    connect(&mut d, &mut s, 1, 0)?;
-    Ok((d, s))
-}
-fn again(d: &mut Device, s: &mut Scope, old: u8, new: u8, at: u64) -> Result<(), Denied> {
-    let t = d.begin(s, Purpose::Again(hash(old)), at)?;
-    d.finish(s, t, "Alice", Some(hash(new)), at)
-}
-fn leave(d: &mut Device, s: &mut Scope, n: u8, at: u64) -> Result<(), Denied> {
-    let t = d.begin(s, Purpose::Delete(hash(n)), at)?;
-    d.finish(s, t, "Alice", None, at)
-}
-
-#[test]
-fn a_lost_connect_reply_finds_the_same_device_and_ends_its_previous_sessions() -> Result<(), Denied> {
-    let (mut d, mut s) = connected()?;
-    again(&mut d, &mut s, 1, 2, 1)?;
-    let secret = hash(8);
-    assert!(same_device("Alice", &secret, "Alice", &hash(8)));
-    assert!(!same_device("Alice", &secret, "Alice", &hash(9)));
-    assert!(!same_device("Alice", &secret, "Bob", &hash(8)));
-    let id = s.device;
-    let number = s.number;
-    connect(&mut d, &mut s, 3, 2)?;
-    assert_eq!(s.device, id);
-    assert!(s.number > number);
-    for n in [1, 2] {
-        assert_eq!(
-            d.arrive(&mut s, &hash(n), Access::Read, false, 3).err(),
-            Some(Denied::NotSignedIn)
-        );
-    }
-    d.arrive(&mut s, &hash(3), Access::Read, false, 3)?;
-    Ok(())
-}
-
-#[test]
-fn a_lost_renewal_is_replaced_while_the_old_session_keeps_its_own_times() -> Result<(), Denied> {
-    let (mut d, mut s) = connected()?;
-    again(&mut d, &mut s, 1, 2, READ_MS - 1)?;
-    assert_eq!(
-        d.arrive(&mut s, &hash(1), Access::Read, false, READ_MS).err(),
-        Some(Denied::ProveAgain)
-    );
-    let old_write = d.arrive(&mut s, &hash(1), Access::Send, false, READ_MS)?;
-    again(&mut d, &mut s, 1, 3, READ_MS)?;
-    assert_eq!(
-        d.arrive(&mut s, &hash(2), Access::Send, false, READ_MS).err(),
-        Some(Denied::NotSignedIn)
-    );
-    d.arrive(&mut s, &hash(3), Access::Read, false, READ_MS)?;
-    assert_eq!(
-        d.complete(&mut s, old_write, false, READ_MS),
-        Err(Denied::NotSignedIn)
-    );
-    Ok(())
-}
-
-#[test]
-fn two_proofs_finishing_together_only_grant_the_latest_begin() -> Result<(), Denied> {
-    for newest_first in [false, true] {
-        let (mut d, mut s) = connected()?;
-        let older = d.begin(&mut s, Purpose::Again(hash(1)), 1)?;
-        let latest = d.begin(&mut s, Purpose::Again(hash(1)), 2)?;
-        let finish_old = |d: &mut Device, s: &mut Scope| {
-            assert_eq!(
-                d.finish(s, older, "Alice", Some(hash(2)), 3),
-                Err(Denied::NotSignedIn)
-            );
-        };
-        if newest_first {
-            d.finish(&mut s, latest, "Alice", Some(hash(3)), 3)?;
-            finish_old(&mut d, &mut s);
-        } else {
-            finish_old(&mut d, &mut s);
-            d.finish(&mut s, latest, "Alice", Some(hash(3)), 3)?;
-        }
-        d.arrive(&mut s, &hash(3), Access::Read, false, 4)?;
-        assert_eq!(
-            d.arrive(&mut s, &hash(2), Access::Read, false, 4).err(),
-            Some(Denied::NotSignedIn)
-        );
-    }
-    Ok(())
-}
-
-#[test]
-fn after_send_and_read_expire_only_proving_again_remains() -> Result<(), Denied> {
-    let (mut d, mut s) = connected()?;
-    for (access, limit) in [(Access::Read, READ_MS), (Access::Send, SEND_MS)] {
-        let r = d.arrive(&mut s, &hash(1), access, false, limit - 1)?;
-        assert_eq!(d.complete(&mut s, r, false, limit), Err(Denied::ProveAgain));
-        assert_eq!(
-            d.arrive(&mut s, &hash(1), access, false, limit).err(),
-            Some(Denied::ProveAgain)
-        );
-    }
-    assert_eq!(
-        d.begin(&mut s, Purpose::Delete(hash(1)), SEND_MS).err(),
-        Some(Denied::ProveAgain)
-    );
-    again(&mut d, &mut s, 1, 2, SEND_MS)?;
-    assert_eq!(
-        d.arrive(&mut s, &hash(1), Access::Send, false, SEND_MS).err(),
-        Some(Denied::ProveAgain)
-    );
-    d.arrive(&mut s, &hash(2), Access::Read, false, SEND_MS)?;
-    Ok(())
-}
-
-#[test]
-fn a_write_has_thirty_seconds_and_a_read_rechecks_just_before_answering() -> Result<(), Denied> {
-    let (mut d, mut s) = connected()?;
-    for (finish, expected) in [(WRITE_MS - 1, Ok(())), (WRITE_MS, Err(Denied::Time))] {
-        let r = d.arrive(&mut s, &hash(1), Access::Send, false, 0)?;
-        assert_eq!(d.complete(&mut s, r, false, finish), expected);
-    }
-    let r = d.arrive(&mut s, &hash(1), Access::Read, false, 0)?;
-    d.complete(&mut s, r, false, WRITE_MS)?;
-    let r = d.arrive(&mut s, &hash(1), Access::Read, false, 1)?;
-    assert_eq!(d.complete(&mut s, r, true, 1), Err(Denied::HistoryHeld));
-    Ok(())
-}
-
-#[test]
-fn a_delete_proof_is_once_for_ten_minutes_and_does_not_renew() -> Result<(), Denied> {
-    let (mut d, mut s) = connected()?;
-    leave(&mut d, &mut s, 1, READ_MS - 1)?;
-    assert_eq!(
-        d.arrive(&mut s, &hash(1), Access::Read, false, READ_MS).err(),
-        Some(Denied::ProveAgain)
-    );
-    assert_eq!(
-        d.delete(&mut s, &hash(1), READ_MS - 1 + DELETE_MS),
-        Err(Denied::ProveAgain)
-    );
-    leave(&mut d, &mut s, 1, READ_MS + DELETE_MS)?;
-    let old = s.life;
-    d.delete(&mut s, &hash(1), READ_MS + 2 * DELETE_MS - 1)?;
-    assert_eq!(s.life, old + 1);
-    assert_eq!(
-        d.delete(&mut s, &hash(1), READ_MS + 2 * DELETE_MS - 1),
-        Err(Denied::NotSignedIn)
-    );
-    Ok(())
-}
-
-#[test]
-fn delete_leave_does_not_follow_a_session_when_its_replacement_is_used() -> Result<(), Denied> {
-    let (mut d, mut s) = connected()?;
-    leave(&mut d, &mut s, 1, 1)?;
-    again(&mut d, &mut s, 1, 2, 2)?;
-    assert_eq!(d.delete(&mut s, &hash(2), 2), Err(Denied::ProveAgain));
-    assert_eq!(d.delete(&mut s, &hash(1), 2), Err(Denied::NotSignedIn));
-    Ok(())
-}
-
-#[test]
-fn ending_during_any_proof_beats_the_proof_and_an_inflight_write() -> Result<(), Denied> {
-    for purpose in [
-        Purpose::Connect,
-        Purpose::Again(hash(1)),
-        Purpose::Delete(hash(1)),
-    ] {
-        let (mut d, mut s) = connected()?;
-        again(&mut d, &mut s, 1, 2, 1)?;
-        leave(&mut d, &mut s, 1, 2)?;
-        let old = d.arrive(&mut s, &hash(1), Access::Send, false, 3)?;
-        let t = d.begin(&mut s, purpose, 3)?;
-        d.end(&mut s)?;
-        assert_eq!(
-            d.finish(&mut s, t, "Alice", Some(hash(3)), 4),
-            Err(Denied::NotSignedIn)
-        );
-        assert_eq!(d.complete(&mut s, old, false, 4), Err(Denied::NotSignedIn));
-        for n in [1, 2] {
-            assert_eq!(d.delete(&mut s, &hash(n), 4), Err(Denied::NotSignedIn));
-        }
-    }
-    Ok(())
-}
-
-#[test]
-fn another_authenticated_account_ends_the_device_but_an_obsolete_proof_cannot() -> Result<(), Denied> {
-    let (mut d, mut s) = connected()?;
-    let old = d.begin(&mut s, Purpose::Again(hash(1)), 1)?;
-    let t = d.begin(&mut s, Purpose::Again(hash(1)), 1)?;
-    let before = s.number;
-    assert_eq!(
-        d.finish(&mut s, old, "Bob", Some(hash(2)), 2),
-        Err(Denied::NotSignedIn)
-    );
-    assert_eq!(s.number, before);
-    assert_eq!(
-        d.finish(&mut s, t, "Bob", Some(hash(2)), 2),
-        Err(Denied::NotSignedIn)
-    );
-    assert!(s.number > before);
-    assert_eq!(
-        d.arrive(&mut s, &hash(1), Access::Read, false, 3).err(),
-        Some(Denied::NotSignedIn)
-    );
-    Ok(())
-}
-
-#[test]
-fn ninety_days_ends_the_waiting_session_and_any_unfinished_proof() -> Result<(), Denied> {
-    let (mut d, mut s) = connected()?;
-    again(&mut d, &mut s, 1, 2, SESSION_MS - 2)?;
-    let t = d.begin(&mut s, Purpose::Again(hash(1)), SESSION_MS - 1)?;
-    let before = s.number;
-    assert_eq!(
-        d.finish(&mut s, t, "Alice", Some(hash(3)), SESSION_MS),
-        Err(Denied::NotSignedIn)
-    );
-    assert!(s.number > before);
-    assert_eq!(
-        d.arrive(&mut s, &hash(2), Access::Read, false, SESSION_MS).err(),
-        Some(Denied::NotSignedIn)
-    );
-    Ok(())
-}
-
-#[test]
-fn sleeping_reconnected_new_and_halfway_through_devices_cannot_refill_a_deleted_life() -> Result<(), Denied>
-{
-    let (mut d, mut s) = connected()?;
-    let remembered = s.life;
-    let r = d.arrive(&mut s, &hash(1), Access::Send, false, 0)?;
-    let mut other = s.clone();
-    other.device = 44;
-    let mut sleeping = Device::new(&other);
-    connect(&mut sleeping, &mut other, 4, 0)?;
-    let t = sleeping.begin(&mut other, Purpose::Connect, 1)?;
-    leave(&mut d, &mut s, 1, 1)?;
-    d.delete(&mut s, &hash(1), 2)?;
-    other.life = s.life;
-    assert_eq!(
-        sleeping.finish(&mut other, t, "Alice", Some(hash(2)), 3),
-        Err(Denied::NotSignedIn)
-    );
-    assert_eq!(
-        sleeping
-            .arrive(&mut other, &hash(4), Access::Read, false, 3)
-            .err(),
-        Some(Denied::NotSignedIn)
-    );
-    assert_eq!(d.complete(&mut s, r, false, 3), Err(Denied::NotSignedIn));
-    assert!(!may_refill(Some(remembered), s.life));
-    assert!(!may_refill(None, s.life));
-    assert!(may_refill(Some(s.life), s.life));
-    Ok(())
-}
-
-#[test]
-fn a_restore_between_two_calls_ends_both_sessions_and_invalidates_the_first_call() -> Result<(), Denied> {
-    let (mut d, mut s) = connected()?;
-    again(&mut d, &mut s, 1, 2, 1)?;
-    let r = d.arrive(&mut s, &hash(1), Access::Read, false, 2)?;
-    let t = d.begin(&mut s, Purpose::Connect, 2)?;
-    restore_device(&mut d, &mut s, 2)?;
-    assert_eq!(d.complete(&mut s, r, false, 3), Err(Denied::NotSignedIn));
-    assert_eq!(
-        d.finish(&mut s, t, "Alice", Some(hash(3)), 3),
-        Err(Denied::NotSignedIn)
-    );
-    assert_eq!(
-        d.arrive(&mut s, &hash(2), Access::Read, false, 3).err(),
-        Some(Denied::NotSignedIn)
-    );
-    Ok(())
-}
-
-#[test]
-fn a_write_or_grant_interrupted_between_stores_is_recovered_in_the_safe_direction() {
-    use Where::*;
-    assert_eq!(Change::EndDevice.order(), [Apart, Data]);
-    assert_eq!(Change::DeleteAccount.order(), [Apart, Data]);
-    assert_eq!(Change::GrantSession.order(), [Data, Apart]);
-    assert_eq!(at_start(StoreComparison::Matches, false), Startup::Ready);
-    assert_eq!(
-        at_start(StoreComparison::EndingRecorded, false),
-        Startup::FinishEnding
-    );
-    assert_eq!(
-        at_start(StoreComparison::GrantOnlyInData, false),
-        Startup::EndUnknownSession
-    );
-}
-
-#[test]
-fn a_restored_copy_holds_deleted_accounts_and_a_missing_store_requires_the_owner() {
-    assert_eq!(at_start(StoreComparison::OlderCopy, false), Startup::RestoreData);
-    assert_eq!(restored_account(2, 1, false), Restore::HoldThrough(2));
-    assert_eq!(restored_account(2, 2, false), Restore::Reprove);
-    assert_eq!(restored_account(2, 2, true), Restore::HoldThrough(2));
-    assert_eq!(at_start(StoreComparison::StoreLost, false), Startup::Stop);
-    assert_eq!(at_start(StoreComparison::StoreLost, true), Startup::HoldAll);
-}
-
 fn position() -> Position {
     Position {
-        backend: scope().backend,
-        account: "Alice".into(),
+        backend: state("alice@example.test").backend,
+        account: acct(1),
         restore: 1,
         life: 2,
         change: 5,
@@ -340,14 +21,14 @@ fn only_a_genuine_stamp_ahead_for_this_account_and_restore_shows_a_rollback() {
                 change: 0,
                 ..p.clone()
             },
-            Some(Restore::HoldThrough(3)),
+            Some(Restore::EndSessions),
         ),
         (
             Position {
                 change: 6,
                 ..p.clone()
             },
-            Some(Restore::Reprove),
+            Some(Restore::EndSessions),
         ),
         (p.clone(), None),
         (
@@ -367,7 +48,7 @@ fn only_a_genuine_stamp_ahead_for_this_account_and_restore_shows_a_rollback() {
         ),
         (
             Position {
-                account: "Bob".into(),
+                account: acct(2),
                 change: 6,
                 ..p.clone()
             },
@@ -397,7 +78,10 @@ fn only_a_genuine_stamp_ahead_for_this_account_and_restore_shows_a_rollback() {
         );
     }
     for tampered in [
-        Position { life: 3, ..p.clone() },
+        Position {
+            life: 3,
+            ..p.clone()
+        },
         Position {
             change: 6,
             ..p.clone()
@@ -429,9 +113,12 @@ fn a_late_answer_only_applies_to_the_unchanged_component_backend_restore_account
             restore: 2,
             ..p.clone()
         },
-        Position { life: 3, ..p.clone() },
         Position {
-            account: "Bob".into(),
+            life: 3,
+            ..p.clone()
+        },
+        Position {
+            account: acct(2),
             ..p.clone()
         },
     ] {
@@ -439,46 +126,764 @@ fn a_late_answer_only_applies_to_the_unchanged_component_backend_restore_account
     }
 }
 
-#[test]
-fn the_app_proves_at_twelve_hours_in_use_or_on_a_request_to_prove_again() {
-    assert!(!should_prove(0, RENEW_MS - 1, true, false));
-    assert!(should_prove(0, RENEW_MS, true, false));
-    assert!(!should_prove(0, RENEW_MS, false, false));
-    assert!(should_prove(0, 1, false, true));
+pub(super) fn acct(n: u64) -> AccountId {
+    AccountId::new(n).unwrap()
+}
+
+pub(super) fn dev(n: u64) -> DeviceId {
+    DeviceId::new(n).unwrap()
+}
+
+pub(super) fn fresh(n: u8) -> FreshSession {
+    FreshSession {
+        id: SessionId::new(u64::from(n)).unwrap(),
+        hash: hash(n),
+        sign_out: hash(n ^ 128),
+    }
+}
+
+pub(super) fn state(email: &str) -> AccountState {
+    AccountState {
+        backend: BackendId::from_bytes([4; 16]),
+        restore: 1,
+        id: acct(match email {
+            "alice@example.test" => 1,
+            "bob@example.test" => 2,
+            "admin@example.test" => 3,
+            _ => 4,
+        }),
+        email: Email::new(email).unwrap(),
+        life: 1,
+        status: Status::On,
+        password_changes: 0,
+        password_reset_required: false,
+        code: None,
+        admin: false,
+        music_login: 1,
+        music_managed: false,
+        music_recovery: None,
+        history_held: false,
+        revision: 0,
+    }
+}
+
+pub(super) fn hash(n: u8) -> Fingerprint {
+    Fingerprint::of(&[n; SECRET_BYTES])
+}
+
+pub(super) fn clock(now: u64, high_water: u64) -> Clock {
+    Clock { now, high_water }
+}
+
+pub(super) struct Stored {
+    pub account: Account,
+    pub apart: Apart,
+    pub data: Rows,
+    pub mark: u64,
+}
+
+impl Stored {
+    pub fn new(account: AccountState) -> Self {
+        let apart = Apart {
+            account: account.clone(),
+            devices: Default::default(),
+        };
+        let data = Rows {
+            account,
+            devices: Default::default(),
+        };
+        let account = Account::load(&apart, Some(&data));
+        Self {
+            account,
+            apart,
+            data,
+            mark: 0,
+        }
+    }
+
+    pub fn step<T>(
+        &mut self,
+        now: u64,
+        act: impl FnOnce(Turn<'_>) -> Result<T, Denied>,
+    ) -> Result<T, Denied> {
+        self.account
+            .request(self.apart.account.restore, clock(now, self.mark), act)
+            .apply(|effects| {
+                self.mark = effects.high_water;
+                for update in &effects.updates {
+                    self.apart = update.apart_first.clone();
+                    assert_eq!(self.apart.account.id, update.data.account.id);
+                    self.data = update.data.clone();
+                    self.apart = update.apart_last.clone();
+                }
+                Ok(())
+            })?
+    }
+
+    pub fn bind(&mut self, secret: u8, id: u64, at: u64) -> Result<PasswordReceipt, Denied> {
+        let binding = self.step(at, |turn| {
+            turn.check_sign_in(&DeviceSecret::from_bytes([secret; 32]), dev(id), hash(42))
+        })?;
+        binding.check(hash(42), clock(at, self.mark))
+    }
+
+    pub fn sign_in(&mut self, secret: u8, id: u64, n: u8, at: u64) -> Result<SessionGrant, Denied> {
+        let receipt = self.bind(secret, id, at)?;
+        let next = 1 + self
+            .apart
+            .devices
+            .values()
+            .map(|d| d.last_session)
+            .max()
+            .unwrap_or(0);
+        let fresh = FreshSession {
+            id: SessionId::new(next).unwrap(),
+            hash: hash(n),
+            sign_out: hash(n ^ 128),
+        };
+        self.step(at, |turn| turn.sign_in(receipt, fresh, None))
+    }
+
+    pub fn leave_receipt(
+        &mut self,
+        id: u64,
+        n: u8,
+        purpose: LeaveFor,
+        at: u64,
+    ) -> Result<PasswordReceipt, Denied> {
+        let binding = self.step(at, |turn| {
+            turn.check_leave(bearer(id, &hash(n)), intent(purpose), hash(42))
+        })?;
+        binding.check(hash(42), clock(at, self.mark))
+    }
+
+    pub fn leave(&mut self, id: u64, n: u8, purpose: LeaveFor, at: u64) -> Result<(), Denied> {
+        let receipt = self.leave_receipt(id, n, purpose, at)?;
+        self.step(at, |turn| turn.grant_leave(receipt, grant()))
+    }
+
+    pub fn read(&mut self, id: u64, n: u8, at: u64) -> Result<Request, Denied> {
+        self.step(at, |turn| turn.arrive(bearer(id, &hash(n)), Access::Read))
+    }
+
+    pub fn reload(&mut self) {
+        self.account = Account::load(&self.apart, Some(&self.data));
+    }
+}
+
+pub(super) fn req(number: u64) -> RequestId {
+    RequestId::new(number).unwrap()
+}
+
+pub(super) fn intent(change: LeaveFor) -> GrantIntent {
+    GrantIntent {
+        request_id: req(1),
+        change,
+    }
+}
+
+pub(super) fn grant_use(secret: &GrantSecret) -> GrantUse<'_> {
+    GrantUse {
+        request_id: req(1),
+        secret,
+    }
+}
+
+pub(super) fn grant() -> &'static GrantSecret {
+    static SECRET: std::sync::OnceLock<GrantSecret> = std::sync::OnceLock::new();
+    SECRET.get_or_init(|| GrantSecret::from_bytes([14; SECRET_BYTES]))
+}
+
+pub(super) fn bearer(device: u64, hash: &Fingerprint) -> Bearer<'_> {
+    Bearer {
+        device: dev(device),
+        hash,
+        grant: Some(grant_use(grant())),
+    }
 }
 
 #[test]
-fn clocks_and_numbers_near_their_limits_cannot_extend_leave_or_wrap() -> Result<(), Denied> {
-    assert!(within(u64::MAX - 1, u64::MAX, READ_MS));
-    assert!(!within(5, 4, READ_MS));
-    let mut s = Scope {
-        number: u64::MAX,
-        ..scope()
-    };
-    let mut d = Device::new(&s);
-    assert_eq!(d.end(&mut s), Err(Denied::Exhausted));
-    let (mut d, mut s) = connected()?;
-    assert_eq!(again(&mut d, &mut s, 1, 1, 1), Err(Denied::ReusedSession));
+fn checked_password_receipts_are_single_purpose_scoped_and_short_lived() -> Result<(), Denied> {
+    let mut s = Stored::new(state("alice@example.test"));
+    let secret = DeviceSecret::from_bytes([8; 32]);
+    let wrong = s.step(0, |turn| turn.check_sign_in(&secret, dev(1), hash(42)))?;
+    assert_eq!(
+        wrong.check(hash(41), clock(0, 0)).err(),
+        Some(Denied::WrongPassword)
+    );
+    let receipt = s.bind(8, 1, 0)?;
+    assert_eq!(
+        s.step(0, |turn| turn.grant_leave(receipt, grant())),
+        Err(Denied::NotSignedIn)
+    );
+    let receipt = s.bind(8, 1, 1)?;
+    assert_eq!(
+        s.step(5_001, |turn| turn.sign_in(receipt, fresh(1), None)),
+        Err(Denied::Time)
+    );
+    let receipt = s.bind(8, 1, 5_002)?;
+    let mut other = Stored::new(state("bob@example.test"));
+    assert_eq!(
+        other.step(5_002, |turn| turn.sign_in(receipt, fresh(1), None)),
+        Err(Denied::NotSignedIn)
+    );
+    s.sign_in(8, 1, 1, 5_003)?;
+    let receipt = s.leave_receipt(1, 1, LeaveFor::ChangePassword, 5_004)?;
+    assert_eq!(
+        s.step(5_004, |turn| turn.sign_in(receipt, fresh(2), None)),
+        Err(Denied::WrongPurpose)
+    );
+    assert_eq!(
+        s.step(5_005, |turn| turn.change_password(bearer(1, &hash(1)))),
+        Err(Denied::LeaveRequired)
+    );
     Ok(())
 }
 
 #[test]
-fn stored_secrets_and_the_stamp_key_print_nothing_of_their_contents() {
-    assert_eq!(format!("{:?}", hash(7)), "Fingerprint(..)");
-    assert_eq!(format!("{:?}", StampKey::new([9; SECRET_BYTES])), "StampKey(..)");
+fn sign_in_reuses_a_device_by_secret_and_retires_its_old_session() -> Result<(), Denied> {
+    let mut s = Stored::new(state("alice@example.test"));
+    assert_eq!(s.sign_in(8, 1, 1, 0)?.device, dev(1));
+    let old = s.read(1, 1, 1)?;
+    let old_receipt = s.bind(8, 91, 2)?;
+    assert_eq!(s.sign_in(8, 91, 2, 2)?.device, dev(1));
+    assert_eq!(s.read(1, 1, 3).err(), Some(Denied::NotSignedIn));
+    assert_eq!(
+        s.step(3, |turn| turn.sign_in(old_receipt, fresh(3), None)),
+        Err(Denied::NotSignedIn)
+    );
+    assert_eq!(s.sign_in(9, 2, 1, 4)?.device, dev(2));
+    assert_eq!(
+        s.step(4, |turn| turn.complete(old)),
+        Err(Denied::NotSignedIn)
+    );
+    s.read(1, 2, 4)?;
+    s.read(2, 1, 4)?;
+    assert_eq!(s.data.devices.len(), 2);
+    Ok(())
 }
 
 #[test]
-fn the_stamps_bytes_and_session_deadlines_match_the_protocol() {
-    let key = StampKey::new([3; SECRET_BYTES]);
-    let expected = Fingerprint::from_bytes([
-        0xcd, 0xb2, 0xed, 0xbd, 0x7d, 0x27, 0xf1, 0x94, 0xdd, 0xe9, 0xf7, 0x75, 0xd9, 0xcf, 0xd0, 0x4c,
-        0xcb, 0x9c, 0x8b, 0x2d, 0x94, 0x63, 0x40, 0xf0, 0x25, 0xc2, 0xb1, 0xef, 0x24, 0x40, 0x5b, 0xd1,
-    ]);
-    assert_eq!(key.stamp(&position()), expected);
+fn activity_renews_idle_time_and_expiry_is_a_durable_ending_on_denial() -> Result<(), Denied> {
+    let mut s = Stored::new(state("alice@example.test"));
+    s.sign_in(8, 1, 1, 0)?;
+    for at in [
+        7 * 24 * 60 * 60 * 1_000,
+        SESSION_IDLE_MS - 1,
+        SESSION_IDLE_MS + 2,
+    ] {
+        s.read(1, 1, at)?;
+    }
+    let prior = s.apart.devices.get(&dev(1)).unwrap().number;
+    let old_copy = s.data.clone();
     assert_eq!(
-        (READ_MS, SEND_MS, SESSION_MS),
-        (259_200_000, 604_800_000, 7_776_000_000)
+        s.read(1, 2, 2 * SESSION_IDLE_MS + 2).err(),
+        Some(Denied::NotSignedIn)
     );
-    assert_eq!((WRITE_MS, DELETE_MS, RENEW_MS), (30_000, 600_000, 43_200_000));
+    assert_eq!(s.apart.devices.get(&dev(1)).unwrap().number, prior + 1);
+    s.data = old_copy;
+    s.reload();
+    assert_eq!(s.read(1, 1, 0).err(), Some(Denied::NotSignedIn));
+    assert_eq!(s.mark, 2 * SESSION_IDLE_MS + 2);
+    Ok(())
+}
+
+#[test]
+fn write_completion_checks_session_identity_and_its_own_deadline() -> Result<(), Denied> {
+    let mut s = Stored::new(state("alice@example.test"));
+    s.sign_in(8, 1, 1, 0)?;
+    let write = s.step(1, |turn| turn.arrive(bearer(1, &hash(1)), Access::Write))?;
+    assert_eq!(
+        s.step(WRITE_MS + 1, |turn| turn.complete(write)),
+        Err(Denied::Time)
+    );
+    let write = s.step(WRITE_MS + 2, |turn| {
+        turn.arrive(bearer(1, &hash(1)), Access::Write)
+    })?;
+    s.sign_in(8, 1, 2, WRITE_MS + 3)?;
+    s.sign_in(8, 1, 1, WRITE_MS + 4)?;
+    assert_eq!(
+        s.step(WRITE_MS + 5, |turn| turn.complete(write)),
+        Err(Denied::NotSignedIn)
+    );
+    Ok(())
+}
+
+#[test]
+fn force_out_and_sign_in_in_both_orders_fence_old_sessions_and_receipts() -> Result<(), Denied> {
+    for sign_in_first in [false, true] {
+        let mut s = Stored::new(state("alice@example.test"));
+        s.sign_in(8, 1, 1, 0)?;
+        let signed = s.sign_in(9, 2, 2, 0)?;
+        let target = SessionTarget {
+            device: signed.device,
+            session: signed.session,
+        };
+        let receipt = s.bind(9, 2, 1)?;
+        let old = s.read(2, 2, 1)?;
+        if sign_in_first {
+            s.step(2, |turn| turn.sign_in(receipt, fresh(3), None))?;
+            s.step(2, |turn| turn.force_out(bearer(1, &hash(1)), target))?;
+        } else {
+            s.step(2, |turn| turn.force_out(bearer(1, &hash(1)), target))?;
+            assert_eq!(
+                s.step(2, |turn| turn.sign_in(receipt, fresh(3), None)),
+                Err(Denied::NotSignedIn)
+            );
+        }
+        let number = s.apart.devices.get(&dev(2)).unwrap().number;
+        s.step(2, |turn| turn.force_out(bearer(1, &hash(1)), target))?;
+        assert_eq!(s.apart.devices.get(&dev(2)).unwrap().number, number);
+        s.read(1, 1, 2)?;
+        assert_eq!(s.read(2, 2, 2).err(), Some(Denied::NotSignedIn));
+        if sign_in_first {
+            s.read(2, 3, 2)?;
+        } else {
+            assert_eq!(s.read(2, 3, 2).err(), Some(Denied::NotSignedIn));
+            s.sign_in(9, 2, 3, 2)?;
+            s.step(2, |turn| turn.force_out(bearer(1, &hash(1)), target))?;
+            s.read(2, 3, 2)?;
+        }
+        assert_eq!(
+            s.step(2, |turn| turn.complete(old)),
+            Err(Denied::NotSignedIn)
+        );
+        let leave = s.leave_receipt(1, 1, LeaveFor::DeleteHistory, 2)?;
+        s.step(3, |turn| turn.sign_out(bearer(1, &hash(1))))?;
+        assert_eq!(
+            s.step(3, |turn| turn.grant_leave(leave, grant())),
+            Err(Denied::NotSignedIn)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn password_change_keeps_only_its_session_in_both_orders_with_other_sign_in() -> Result<(), Denied>
+{
+    for sign_in_first in [false, true] {
+        let mut s = Stored::new(state("alice@example.test"));
+        s.sign_in(8, 1, 1, 0)?;
+        s.sign_in(9, 2, 2, 0)?;
+        let receipt = s.bind(9, 2, 1)?;
+        s.leave(1, 1, LeaveFor::ChangePassword, 1)?;
+        let inflight = s.read(2, 2, 1)?;
+        if sign_in_first {
+            s.step(2, |turn| turn.sign_in(receipt, fresh(3), None))?;
+            s.step(2, |turn| turn.change_password(bearer(1, &hash(1))))?;
+        } else {
+            s.step(2, |turn| turn.change_password(bearer(1, &hash(1))))?;
+            assert_eq!(
+                s.step(2, |turn| turn.sign_in(receipt, fresh(3), None)),
+                Err(Denied::NotSignedIn)
+            );
+        }
+        s.reload();
+        assert_eq!(s.apart.account.password_changes, 1);
+        assert_eq!(
+            s.step(2, |turn| turn.complete(inflight)),
+            Err(Denied::NotSignedIn)
+        );
+        assert_eq!(s.read(2, 3, 2).err(), Some(Denied::NotSignedIn));
+        assert_eq!(s.read(2, 2, 2).err(), Some(Denied::NotSignedIn));
+        s.read(1, 1, 2)?;
+        assert_eq!(
+            s.step(2, |turn| turn.change_password(bearer(1, &hash(1)))),
+            Err(Denied::LeaveRequired)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn code_redemption_spends_the_code_sets_password_and_signs_in_once() -> Result<(), Denied> {
+    let mut account = state("alice@example.test");
+    account.password_reset_required = true;
+    account.code = Some(LiveCode::new(1, 0)?);
+    let mut s = Stored::new(account);
+    let bind = |s: &mut Stored, secret: u8, id| {
+        s.step(0, |turn| {
+            turn.check_code(
+                &DeviceSecret::from_bytes([secret; 32]),
+                dev(id),
+                1,
+                hash(43),
+            )
+        })?
+        .check(hash(43), clock(0, 0))
+    };
+    let wrong_purpose = bind(&mut s, 8, 1)?;
+    assert_eq!(
+        s.step(0, |turn| turn.sign_in(wrong_purpose, fresh(1), None)),
+        Err(Denied::WrongPurpose)
+    );
+    let first = bind(&mut s, 8, 1)?;
+    let second = bind(&mut s, 9, 2)?;
+    let old_data = s.data.clone();
+    s.account
+        .sign_in_turn(clock(1, 0), |turn| {
+            turn.redeem_code(first, hash(44), fresh(1), None)
+        })
+        .apply(|effects| {
+            let u = effects.updates.first().unwrap();
+            assert_eq!(
+                u.change,
+                DataChange::RedeemCode {
+                    code: 1,
+                    verifier: hash(44)
+                }
+            );
+            assert!(u.apart_first.account.code.unwrap().used);
+            assert!(u.apart_first.devices.get(&dev(1)).unwrap().permit.is_none());
+            let mut crash = Account::load(&u.apart_first, Some(&old_data));
+            assert_eq!(
+                crash
+                    .sign_in_turn(clock(1, 1), |turn| {
+                        turn.check_code(&DeviceSecret::from_bytes([8; 32]), dev(2), 1, hash(43))
+                    })
+                    .apply(|_| Ok::<_, Denied>(()))?
+                    .err(),
+                Some(Denied::WrongPassword)
+            );
+            sign_in_after_password_commit(&u.apart_first, &u.data, 1)?;
+            Account::restore(
+                &u.apart_last,
+                Some(&old_data),
+                2,
+                RestoreMode::DataOnly,
+                clock(2, 1),
+            )
+            .apply(|effects| {
+                let restored = effects.updates.first().unwrap();
+                assert!(restored.apart_last.account.code.unwrap().used);
+                assert!(restored.apart_last.account.password_reset_required);
+                Ok::<_, Denied>(())
+            })??;
+            s.apart = u.apart_last.clone();
+            s.data = u.data.clone();
+            Ok::<_, Denied>(())
+        })??;
+    assert_eq!(
+        s.step(1, |turn| turn.redeem_code(second, hash(44), fresh(2), None)),
+        Err(Denied::NotSignedIn)
+    );
+    s.reload();
+    s.read(1, 1, 1)?;
+    assert!(!s.apart.account.password_reset_required);
+    assert_eq!(bind(&mut s, 8, 1).err(), Some(Denied::WrongPassword));
+    Ok(())
+}
+
+#[test]
+fn leave_is_one_kind_one_use_and_cannot_reopen_after_ten_minutes() -> Result<(), Denied> {
+    let mut s = Stored::new(state("alice@example.test"));
+    s.sign_in(8, 1, 1, 0)?;
+    s.sign_in(9, 2, 2, 0)?;
+    s.leave(1, 1, LeaveFor::DeleteHistory, 1)?;
+    assert_eq!(
+        s.step(2, |turn| turn.change_password(bearer(1, &hash(1)))),
+        Err(Denied::LeaveRequired)
+    );
+    assert_eq!(
+        s.step(2, |turn| turn.delete_history(bearer(2, &hash(2)))),
+        Err(Denied::LeaveRequired)
+    );
+    assert_eq!(
+        s.step(1 + PASSWORD_LEAVE_MS, |turn| turn
+            .delete_history(bearer(1, &hash(1)))),
+        Err(Denied::LeaveRequired)
+    );
+    s.reload();
+    assert_eq!(
+        s.step(PASSWORD_LEAVE_MS, |turn| turn
+            .delete_history(bearer(1, &hash(1)))),
+        Err(Denied::LeaveRequired)
+    );
+    assert_eq!(s.mark, 1 + PASSWORD_LEAVE_MS);
+    s.leave(1, 1, LeaveFor::DeleteHistory, 2 + PASSWORD_LEAVE_MS)?;
+    let old = s.step(2 + PASSWORD_LEAVE_MS, |turn| {
+        turn.arrive(bearer(2, &hash(2)), Access::WriteHistory)
+    })?;
+    let at = 2 * PASSWORD_LEAVE_MS + 1;
+    s.step(at, |turn| turn.delete_history(bearer(1, &hash(1))))?;
+    assert_eq!(
+        s.step(at, |turn| turn.delete_history(bearer(1, &hash(1)))),
+        Err(Denied::LeaveRequired)
+    );
+    assert_eq!(
+        s.step(at, |turn| turn.complete(old)),
+        Err(Denied::NotSignedIn)
+    );
+    s.read(2, 2, at)?;
+    assert!(!may_refill(Some(1), s.apart.account.life));
+    assert!(may_refill(Some(2), s.apart.account.life));
+    Ok(())
+}
+
+#[test]
+fn stored_secrets_and_stamp_bytes_match_the_protocol() {
+    let p = position();
+    let key = StampKey::new([3; SECRET_BYTES]);
+    let tag = key.stamp(&p);
+    let hex = tag
+        .expose_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    assert_eq!(
+        hex,
+        "e09fda3fd24759238a1a7042f576513cd480634f314a44e3bfc680582f18c00e"
+    );
+    assert_eq!(
+        format!("{tag:?} {key:?} {:?}", DeviceSecret::from_bytes([9; 32])),
+        "StampTag(..) StampKey(..) DeviceSecret(..)"
+    );
+    assert_eq!(PASSWORD_LEAVE_MS, 600_000);
+    assert_eq!(SESSION_IDLE_MS, 7_776_000_000);
+}
+
+#[test]
+fn renaming_keeps_identity_and_recreating_an_email_cannot_use_its_old_stamp() -> Result<(), Denied>
+{
+    let mut s = Stored::new(state("alice@example.test"));
+    let key = StampKey::new([3; SECRET_BYTES]);
+    let before = s.apart.account.position(10);
+    let receipt = s.bind(8, 1, 0)?;
+    let renamed = Email::new("renamed@example.test").unwrap();
+    s.apart.account.email = renamed.clone();
+    s.data.account.email = renamed;
+    s.reload();
+    s.step(1, |turn| turn.sign_in(receipt, fresh(1), None))?;
+    assert_eq!(s.apart.account.position(10), before);
+    let mut recreated = state("alice@example.test");
+    recreated.id = acct(42);
+    let current = recreated.position(0);
+    assert_eq!(key.presented(&current, &before, &key.stamp(&before)), None);
+    Ok(())
+}
+
+#[test]
+fn only_hourly_activity_is_persisted_and_recovery_never_makes_it_older() -> Result<(), Denied> {
+    let mut s = Stored::new(state("alice@example.test"));
+    s.sign_in(8, 1, 1, 0)?;
+    let secret = DeviceSecret::from_bytes([8; 32]);
+    assert!(
+        s.step(1, |turn| turn.check_sign_in(&secret, dev(9), hash(42)))?
+            .known_device()
+    );
+    assert!(
+        !s.step(1, |turn| turn.check_sign_in(
+            &DeviceSecret::from_bytes([9; 32]),
+            dev(9),
+            hash(42)
+        ))?
+        .known_device()
+    );
+    let last = |s: &Stored| {
+        s.data
+            .devices
+            .get(&dev(1))
+            .unwrap()
+            .session
+            .as_ref()
+            .unwrap()
+            .last_used
+    };
+    s.read(1, 1, USE_WRITE_MS - 1)?;
+    assert_eq!(last(&s), 0);
+    s.read(1, 1, USE_WRITE_MS)?;
+    s.read(1, 1, 2 * USE_WRITE_MS - 1)?;
+    assert_eq!(last(&s), USE_WRITE_MS);
+    s.reload();
+    assert_eq!(
+        s.read(1, 2, SESSION_IDLE_MS + USE_WRITE_MS).err(),
+        Some(Denied::NotSignedIn)
+    );
+    assert!(s.data.devices.get(&dev(1)).unwrap().session.is_some());
+    assert_eq!(
+        s.read(1, 1, SESSION_IDLE_MS + 2 * USE_WRITE_MS - 1).err(),
+        Some(Denied::NotSignedIn)
+    );
+    assert!(s.data.devices.get(&dev(1)).unwrap().session.is_none());
+    Ok(())
+}
+
+#[test]
+fn a_grant_secret_cannot_be_omitted_or_spend_its_replacement() -> Result<(), Denied> {
+    let mut s = Stored::new(state("alice@example.test"));
+    s.sign_in(8, 1, 1, 0)?;
+    s.leave(1, 1, LeaveFor::DeleteHistory, 1)?;
+    let replacement = GrantSecret::from_bytes([15; SECRET_BYTES]);
+    let receipt = s.leave_receipt(1, 1, LeaveFor::DeleteHistory, 1)?;
+    s.step(1, |turn| turn.grant_leave(receipt, &replacement))?;
+    for grant in [None, Some(grant_use(grant()))] {
+        assert_eq!(
+            s.step(1, |turn| turn.delete_history(Bearer {
+                device: dev(1),
+                hash: &hash(1),
+                grant
+            })),
+            Err(Denied::LeaveRequired)
+        );
+    }
+    s.reload();
+    s.step(1, |turn| {
+        turn.delete_history(Bearer {
+            device: dev(1),
+            hash: &hash(1),
+            grant: Some(grant_use(&replacement)),
+        })
+    })?;
+    assert_eq!(s.apart.account.life, 2);
+    Ok(())
+}
+
+pub(super) fn sign_in_after_password_commit(
+    apart: &Apart,
+    data: &Rows,
+    at: u64,
+) -> Result<(), Denied> {
+    let mut recovered = Account::load(apart, Some(data));
+    assert!(!recovered.state().password_reset_required);
+    let check = recovered
+        .sign_in_turn(clock(at, at), |turn| {
+            turn.check_sign_in(&DeviceSecret::from_bytes([8; 32]), dev(1), hash(44))
+        })
+        .apply(|_| Ok::<_, Denied>(()))??;
+    let receipt = check.check(hash(44), clock(at, at))?;
+    recovered
+        .sign_in_turn(clock(at, at), |turn| turn.sign_in(receipt, fresh(3), None))
+        .apply(|_| Ok::<_, Denied>(()))??;
+    Ok(())
+}
+
+#[test]
+fn a_note_only_ends_its_session_and_ordinary_sign_out_preserves_the_known_door()
+-> Result<(), Denied> {
+    let mut s = Stored::new(state("alice@example.test"));
+    let signed = s.sign_in(8, 1, 1, 0)?;
+    let target = SessionTarget {
+        device: signed.device,
+        session: signed.session,
+    };
+    let note = hash(1 ^ 128);
+    for access in [Access::Read, Access::Write] {
+        assert_eq!(
+            s.step(1, |t| t.arrive(bearer(1, &note), access)).err(),
+            Some(Denied::NotSignedIn)
+        );
+    }
+    assert_eq!(
+        s.step(1, |t| t.check_leave(
+            bearer(1, &note),
+            intent(LeaveFor::DeleteHistory),
+            hash(42)
+        ))
+        .err(),
+        Some(Denied::NotSignedIn)
+    );
+    assert_eq!(
+        s.step(1, |t| t.sign_out_by_note(target, &hash(1))),
+        Err(Denied::NotSignedIn)
+    );
+    s.account
+        .request(1, clock(1, 1), |t| t.sign_out_by_note(target, &note))
+        .apply(|effects| {
+            let u = effects.updates.first().unwrap();
+            let apart = u.apart_first.devices.get(&dev(1)).unwrap();
+            assert!(apart.permit.is_none());
+            assert!(apart.known);
+            s.apart = u.apart_last.clone();
+            s.data = u.data.clone();
+            Ok::<_, Denied>(())
+        })??;
+    s.reload();
+    assert!(
+        s.step(1, |t| t.check_sign_in(
+            &DeviceSecret::from_bytes([8; 32]),
+            dev(9),
+            hash(42)
+        ))?
+        .known_device()
+    );
+    let replacement = s.sign_in(8, 1, 2, 2)?;
+    s.step(2, |t| t.sign_out_by_note(target, &note))?;
+    assert_eq!(
+        s.step(2, |t| t.sign_out_by_note(
+            SessionTarget {
+                device: replacement.device,
+                session: replacement.session
+            },
+            &note
+        )),
+        Err(Denied::NotSignedIn)
+    );
+    s.read(1, 2, 2)?;
+    Ok(())
+}
+
+#[test]
+fn a_forced_out_row_is_only_known_again_after_a_successful_sign_in() -> Result<(), Denied> {
+    let mut s = Stored::new(state("alice@example.test"));
+    s.sign_in(8, 1, 1, 0)?;
+    let old = s.sign_in(9, 2, 2, 0)?;
+    let before = s.data.clone();
+    let target = SessionTarget {
+        device: old.device,
+        session: old.session,
+    };
+    s.step(1, |t| t.force_out(bearer(1, &hash(1)), target))?;
+    s.data = before;
+    s.reload();
+    let secret = DeviceSecret::from_bytes([9; 32]);
+    let check = s.step(1, |t| t.check_sign_in(&secret, dev(99), hash(42)))?;
+    assert_eq!(check.known_device_id(), None);
+    assert_eq!(
+        check.check(hash(41), clock(1, 1)).err(),
+        Some(Denied::WrongPassword)
+    );
+    assert!(!s.apart.devices.get(&dev(2)).unwrap().known);
+    assert_eq!(s.sign_in(9, 99, 3, 2)?.device, dev(2));
+    assert_eq!(
+        s.step(2, |t| t.check_sign_in(&secret, dev(99), hash(42)))?
+            .known_device_id(),
+        Some(dev(2))
+    );
+    Ok(())
+}
+
+#[test]
+fn a_new_accounts_code_expires_before_both_check_and_redemption() -> Result<(), Denied> {
+    let code = LiveCode::new(9, 10)?;
+    let account = AccountState::new(
+        BackendId::from_bytes([4; 16]),
+        1,
+        acct(1),
+        Email::new("alice@example.test").unwrap(),
+        Some(code),
+    );
+    assert!(account.password_reset_required);
+    assert_eq!(account.status, Status::On);
+    assert_eq!(account.music_login, 0);
+    let mut s = Stored::new(account);
+    let device = DeviceSecret::from_bytes([8; 32]);
+    let at = code.expires - 1;
+    let checked = s
+        .step(at, |t| t.check_code(&device, dev(1), 9, hash(42)))?
+        .check(hash(42), clock(at, at))?;
+    assert_eq!(
+        s.step(code.expires, |t| t.redeem_code(
+            checked,
+            hash(43),
+            fresh(1),
+            None
+        )),
+        Err(Denied::WrongPassword)
+    );
+    assert_eq!(
+        s.step(at, |t| t.check_code(&device, dev(1), 9, hash(42)))
+            .err(),
+        Some(Denied::WrongPassword)
+    );
+    Ok(())
 }

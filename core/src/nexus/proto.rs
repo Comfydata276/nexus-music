@@ -6,7 +6,7 @@
 //!   never ending in the name of a picture, a script or a style sheet (a proxy may send those
 //!   somewhere else and keep the answer).
 //! - **`hello`** (design 12.1): `GET /nexus/api/hello` answers
-//!   `{"nexus":"0.1.0","id":"…","speaks":[1,1],"has":["plays"]}`. [`Hello::read`] reads it,
+//!   `{"nexus":"0.2.0","id":"…","speaks":[1,1],"has":["accounts"]}`. [`Hello::read`] reads it,
 //!   checking every byte and every field before anything is made of it.
 //! - **Known by its status and its body together, never by a header** (design 6.1 and 12.1,
 //!   as the lead has ruled; experiment E1): a music server left to answer under `/nexus/`
@@ -47,6 +47,8 @@ pub const HELLO: &str = "/nexus/api/hello";
 /// Every path the backend has, so that a test can hold each to the rules above.
 pub const PATHS: &[&str] = &[HELLO];
 
+/// What a backend that accepts account sign-in says in [`Hello::has`].
+pub const HAS_ACCOUNTS: &str = "accounts";
 /// What a backend that keeps plays says in [`Hello::has`].
 pub const HAS_PLAYS: &str = "plays";
 
@@ -371,11 +373,13 @@ impl<'de> serde::de::Visitor<'de> for PassOver {
     }
 
     fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+        if self.0 >= HELLO_MAX_DEPTH { return Err(serde::de::Error::custom("nested too deep")); }
         while seq.next_element_seed(PassOver(self.0 + 1))?.is_some() {}
         Ok(())
     }
 
     fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        if self.0 >= HELLO_MAX_DEPTH { return Err(serde::de::Error::custom("nested too deep")); }
         let mut seen = Vec::new();
         while let Some(key) = map.next_key::<String>()? {
             map.next_value_seed(PassOver(self.0 + 1))?;
@@ -408,6 +412,11 @@ fn has_list(has: Vec<String>) -> Option<Vec<String>> {
 }
 
 impl Hello {
+    /// The stage-one answer of a backend with account sign-in enabled.
+    pub fn for_accounts(nexus: Version, id: BackendId, speaks: Speaks) -> Self {
+        Self { nexus, id, speaks, has: vec![HAS_ACCOUNTS.to_owned()] }
+    }
+
     /// A `hello` for the backend to send. `None` if `has` breaks the rules [`Hello::read`]
     /// holds an answer to, so that the backend cannot send what no app would take.
     pub fn new(nexus: Version, id: BackendId, speaks: Speaks, has: &[&str]) -> Option<Self> {
@@ -832,6 +841,17 @@ mod tests {
 
     fn read(bytes: &[u8]) -> Result<Hello, HelloWrong> {
         Hello::read(&Body::read(bytes).expect("a body within the bound"))
+    }
+
+    #[test]
+    fn an_account_backends_hello_identifies_that_capability() {
+        let version = Version::parse("0.2.0").unwrap();
+        let id = BackendId::from_hex(ID).unwrap();
+        let hello = Hello::for_accounts(version, id, SPEAKS);
+        let body = Body::read(hello.to_json().as_bytes()).unwrap();
+        let decoded = Hello::read(&body).unwrap();
+        assert_eq!(decoded.has(), &[HAS_ACCOUNTS]);
+        assert!(decoded.does(HAS_ACCOUNTS));
     }
 
     #[test]
