@@ -43,7 +43,7 @@ fn a_password_and_a_code_each_make_one_sign_in_shape() {
 }
 
 const PASSWORD: &str = "a made-up password";
-const SALT: &str = "AdaMusicSalt2026";
+const SALT: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const ADDRESS: &str = "https://music.example.org:8443/navidrome";
 
 fn email() -> Email {
@@ -51,7 +51,7 @@ fn email() -> Email {
 }
 
 fn person() -> Person {
-    Person { email: email(), name: Name::new("Ada").unwrap(), admin: false }
+    Person { id: AccountId::new(4).unwrap(), revision: 16, email: email(), name: Name::new("Ada").unwrap(), admin: false }
 }
 
 fn session() -> Session {
@@ -73,7 +73,7 @@ fn receipt() -> Receipt {
         stamp: Stamp {
             backend: BackendId::from_bytes([17; 16]),
             restore: 8,
-            account: email(),
+            account: AccountId::new(4).unwrap(),
             life: 3,
             change: 6,
             tag: StampTag::from_bytes([69; SECRET_BYTES]),
@@ -351,6 +351,8 @@ fn each_known_answer_field_is_required_and_typed() {
     bad_fields(&good_sign_in(), &[
         "/done/result/signed_in/session",
         "/done/result/signed_in/person",
+        "/done/result/signed_in/person/id",
+        "/done/result/signed_in/person/revision",
         "/done/result/signed_in/person/email",
         "/done/result/signed_in/person/name",
         "/done/result/signed_in/person/admin",
@@ -484,8 +486,9 @@ fn binary_secrets_have_one_hex_spelling_and_sessions_have_one_header() {
     assert!(MusicToken::from_hex(&"ab".repeat(15)).is_none());
     assert!(MusicToken::from_hex(&"AB".repeat(16)).is_none());
     assert!(MusicSalt::new(SALT).is_some());
-    assert!(MusicSalt::new("AdaMusicSalt202!").is_none());
-    assert!(MusicSalt::new("AdaMusicSalt202").is_none());
+    assert!(MusicSalt::new(&SALT.to_ascii_uppercase()).is_none());
+    assert!(MusicSalt::new(&"ab".repeat(31)).is_none());
+    assert_eq!(MusicSalt::from_random([0xab; SALT_BYTES]).as_str(), "ab".repeat(SALT_BYTES));
 
     let mut last_differs = [0xab; SECRET_BYTES];
     *last_differs.last_mut().unwrap() ^= 1;
@@ -540,7 +543,7 @@ fn a_list_page_is_bounded_sorted_and_has_no_repeated_id() {
 fn a_login_must_agree_with_its_stamp_and_count_in_both_directions() {
     let mut value = good_sign_in();
     if let Reply::Done { receipt, .. } = &mut value {
-        receipt.stamp.account = Email::new("another@example.org").unwrap();
+        receipt.stamp.account = AccountId::new(5).unwrap();
     }
     assert!(matches!(encode(&value), Err(BadMessage::Form)));
     // Deliberately bypass the checked encoder to get the same bad object to the reader.
