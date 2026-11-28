@@ -222,17 +222,19 @@ pub(crate) fn write_data<T>(
     keeper: &mut Keeper,
     heard: Option<DeviceId>,
     now: u64,
-    step: impl FnOnce(&mut Transaction<'_>) -> rusqlite::Result<(T, bool)>,
+    step: impl FnOnce(&Transaction<'_>) -> rusqlite::Result<(T, bool)>,
 ) -> Result<T, Refusal> {
     let at = keeper.clock(now).effective();
     let (value, changed) = {
-        let mut tx = keeper.data().connection().unchecked_transaction().map_err(unavailable)?;
-        let (value, changed) = step(&mut tx).map_err(unavailable)?;
+        let tx = keeper.data().connection().unchecked_transaction().map_err(unavailable)?;
+        let (value, changed) = step(&tx).map_err(unavailable)?;
         if changed {
             tx.execute("UPDATE meta SET changes = changes + 1, written_at = max(written_at, ?1) WHERE one = 1", [sql(at).map_err(unavailable)?])
                 .map_err(unavailable)?;
+            tx.commit().map_err(unavailable)?;
+        } else {
+            tx.rollback().map_err(unavailable)?;
         }
-        tx.commit().map_err(unavailable)?;
         (value, changed)
     };
     if changed && let Some(device) = heard {
@@ -301,20 +303,22 @@ async fn send(State(calls): State<Calls>, headers: HeaderMap, body: Bytes) -> Re
     finish(outcome)
 }
 
+const DATA_BYTES: &str = "SELECT (p.page_count - f.freelist_count) * s.page_size
+    FROM pragma_page_count p, pragma_freelist_count f, pragma_page_size s";
+
 /// Bytes occupied by live SQLite pages. Freed pages can take new events without growing
 /// the file. This also counts data owned by other slices.
 pub fn data_bytes(db: &Connection) -> rusqlite::Result<u64> {
-    let bytes: i64 = db.query_row(
-        "SELECT (p.page_count - f.freelist_count) * s.page_size
-         FROM pragma_page_count p, pragma_freelist_count f, pragma_page_size s",
-        [],
-        |row| row.get(0),
-    )?;
+    measured_bytes(&mut db.prepare(DATA_BYTES)?)
+}
+
+fn measured_bytes(query: &mut rusqlite::Statement<'_>) -> rusqlite::Result<u64> {
+    let bytes: i64 = query.query_row([], |row| row.get(0))?;
     u64::try_from(bytes).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, bytes))
 }
 
 fn insert(
-    tx: &mut Transaction<'_>,
+    tx: &Transaction<'_>,
     account: u64,
     device: DeviceId,
     current_life: u64,
@@ -324,7 +328,13 @@ fn insert(
 ) -> rusqlite::Result<(Vec<Answered>, bool)> {
     let account = sql(account)?;
     let device = sql(device.get())?;
-    let mut room = data_bytes(tx)? < budget;
+    let mut size = tx.prepare(DATA_BYTES)?;
+    let mut room = measured_bytes(&mut size)? < budget;
+    let mut find = tx.prepare("SELECT device FROM listening_events WHERE account = ?1 AND event_id = ?2")?;
+    let mut add = tx.prepare(
+        "INSERT INTO listening_events(account, device, event_id, at_ms, is_start, line)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    )?;
     let mut answers = Vec::with_capacity(rows.len());
     let mut changed = false;
     for Prepared { id, event } in rows {
@@ -332,8 +342,7 @@ fn insert(
             Err(outcome) => outcome,
             Ok(event) => {
                 let event_id = id.to_hex();
-                let owner: Option<i64> = tx.prepare("SELECT device FROM listening_events WHERE account = ?1 AND event_id = ?2")?
-                    .query_row(params![account, event_id], |row| row.get(0)).optional()?;
+                let owner: Option<i64> = find.query_row(params![account, event_id], |row| row.get(0)).optional()?;
                 let existing = match owner {
                     None => events::Existing::None,
                     Some(owner) if owner == device => events::Existing::SameDevice,
@@ -342,18 +351,18 @@ fn insert(
                 match events::intake(current_life, life, existing, room) {
                     events::Intake::Answer(outcome) => outcome,
                     events::Intake::Insert => {
-                        let save = tx.savepoint()?;
-                        save.prepare(
-                            "INSERT INTO listening_events(account, device, event_id, at_ms, is_start, line)
-                             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                        )?.execute(params![account, device, event_id, sql(event.at_ms)?, event.is_start, event.line])?;
-                        if data_bytes(&save)? <= budget {
-                            save.commit()?;
+                        // Keep prior accepted rows if this insert needs a page beyond
+                        // the budget. An SQL error still rolls back the entire batch.
+                        tx.execute_batch("SAVEPOINT listening_event")?;
+                        add.execute(params![account, device, event_id, sql(event.at_ms)?, event.is_start, event.line])?;
+                        let used = measured_bytes(&mut size)?;
+                        room = used < budget;
+                        if used <= budget {
+                            tx.execute_batch("RELEASE listening_event")?;
                             changed = true;
                             Outcome::Taken
                         } else {
-                            save.finish()?;
-                            room = false;
+                            tx.execute_batch("ROLLBACK TO listening_event; RELEASE listening_event")?;
                             Outcome::NotDealtWith
                         }
                     }
@@ -365,11 +374,16 @@ fn insert(
     Ok((answers, changed))
 }
 
-async fn grant(State(calls): State<Calls>, headers: HeaderMap, body: Bytes) -> Response<Body> {
-    let parsed = account::read::<GrantRequest>(&body);
-    if let Ok(mut body) = body.try_into_mut() {
-        body.as_mut().zeroize();
+fn secret_body<T>(body: Bytes, read: impl FnOnce(&[u8]) -> Result<T, account::BadMessage>) -> Result<T, account::BadMessage> {
+    let parsed = read(&body);
+    if let Ok(mut own) = body.try_into_mut() {
+        own.as_mut().zeroize();
     }
+    parsed
+}
+
+async fn grant(State(calls): State<Calls>, headers: HeaderMap, body: Bytes) -> Response<Body> {
+    let parsed = secret_body(body, account::read::<GrantRequest>);
     let outcome = async {
         let hash = bearer(&calls, &headers)?;
         let request = parsed.map_err(|_| Refusal::Malformed)?;
@@ -417,7 +431,7 @@ async fn issue_grant(accounts: &Accounts, hash: Fingerprint, request: GrantReque
 async fn delete(State(calls): State<Calls>, headers: HeaderMap, body: Bytes) -> Response<Body> {
     let outcome = async {
         let hash = bearer(&calls, &headers)?;
-        let request = account::read::<DeleteListeningData>(&body).map_err(|_| Refusal::Malformed)?;
+        let request = secret_body(body, account::read::<DeleteListeningData>).map_err(|_| Refusal::Malformed)?;
         let clock = calls.accounts.clock.clone();
         answer(calls.accounts.desk.ask(move |keeper| {
             let now = clock();

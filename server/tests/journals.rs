@@ -334,15 +334,16 @@ fn report(count: u64, populated: bool) -> Report {
     let mut record = diag::Record::default();
     if populated {
         for index in 0..diag::MAX_ENTRIES as u64 {
-            let note = if index % 2 == 0 { diag::Note::AppMessage } else { diag::Note::DownloadsFolderChanged };
-            record.note(1_767_225_600_000 + index * 1_000, diag::Line::Note(note));
+            let line = diag::Line::DownloadJobStopped(index as u8);
+            record.note(1_767_225_600_000 + index * 1_000, line);
         }
+        assert_eq!(record.entries().len(), diag::MAX_ENTRIES);
     }
     Report {
         about: About {
             version: Version::parse("0.41.0").unwrap(),
             os: Version::parse("10.0.0").unwrap(),
-            device: DeviceKind::Pc,
+            device: if populated { DeviceKind::Phone } else { DeviceKind::Pc },
             signed_in: true,
             https: true,
             offline: false,
@@ -422,6 +423,32 @@ fn restart_keeps_acknowledged_events_and_reports() {
 }
 
 #[test]
+fn startup_expiry_removes_diagnostics_even_when_the_device_is_absent() {
+    let mut fixture = Fixture::new("expiry");
+    let code = fixture.set_up();
+    fixture.start();
+    let (who, stamp) = fixture.sign_in(with_code(code), 1);
+    upload(&fixture, &who, &stamp, 1, &report(1, false));
+    upload(&fixture, &who, &stamp, 2, &report(2, false));
+    fixture.stop();
+    // Age only the oldest report, as if a month passed with the server off.
+    fixture.db().execute(
+        "UPDATE diagnostic_reports SET received_ms = received_ms - ?1 WHERE row_id = 1",
+        [diag::MAX_AGE_MS as i64 + 60_000],
+    ).unwrap();
+    fixture.start();
+    let began = Instant::now();
+    while count(&fixture, "diagnostic_reports") != 1 {
+        assert!(began.elapsed() < Duration::from_secs(3), "expired report still on disk");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let (status, body) = fixture.post(nexus_music_server::diag::LIST_PATH, Some(&who), page(&stamp, None).bytes());
+    assert_eq!(status, 200);
+    assert_eq!(json::<i64>(&body, "$.done.result.reports[0].id"), 2);
+    assert_eq!(json::<Option<i64>>(&body, "$.done.result.reports[1].id"), None);
+}
+
+#[test]
 fn a_full_budget_defers_new_events_without_losing_existing_ones() {
     let mut fixture = Fixture::new("budget");
     let code = fixture.set_up();
@@ -435,6 +462,30 @@ fn a_full_budget_defers_new_events_without_losing_existing_ones() {
     let mixed = batch(&stamp, &[start(1, 100, 0), start(2, 200, 0)]);
     assert_outcomes(send(&fixture, &who, &mixed), &mixed, &[Outcome::Taken, Outcome::NotDealtWith]);
     assert_eq!(count(&fixture, "listening_events"), 1);
+}
+
+#[test]
+fn crossing_the_budget_rolls_back_only_the_rows_that_do_not_fit() {
+    let mut fixture = Fixture::new("budget-crossing");
+    let code = fixture.set_up();
+    fixture.start();
+    let (who, stamp) = fixture.sign_in(with_code(code), 1);
+    fixture.stats(&who, &stamp, None);
+    fixture.stop();
+    let cap = nexus_music_server::events::data_bytes(&fixture.db()).unwrap() + 1;
+    fixture.budget = Some(cap);
+    fixture.start();
+    let rows = (1..=500).map(|n| start(n, n, 0)).collect::<Vec<_>>();
+    let sent = batch(&stamp, &rows);
+    let (status, body) = send(&fixture, &who, &sent);
+    let Reply::Done { result, .. } = events::read_reply(status, &body, &sent).unwrap()
+        else { panic!("batch not done") };
+    let taken = result.answers().iter().filter(|row| row.outcome == Outcome::Taken).count();
+    assert!((1..500).contains(&taken));
+    assert!(result.answers()[taken..].iter().all(|row| row.outcome == Outcome::NotDealtWith));
+    assert_eq!(count(&fixture, "listening_events"), taken as i64);
+    assert_eq!(json::<i64>(&fixture.stats(&who, &stamp, None), "$.done.result.starts"), taken as i64);
+    assert!(nexus_music_server::events::data_bytes(&fixture.db()).unwrap() <= cap);
 }
 
 #[test]
