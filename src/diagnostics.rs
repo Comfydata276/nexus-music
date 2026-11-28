@@ -19,7 +19,7 @@ use crate::{config, pool::Pool, ui};
 
 mod sending;
 #[allow(unused_imports)] // The live client is installed by W7.
-pub(crate) use sending::{attach, detach, forget_choice, keep_schedule, load_kept, on_worker, publish_hello, read};
+pub(crate) use sending::{attach, detach, forget_choice, keep_schedule_for_window as keep_schedule, load_kept, on_worker, publish_hello, read_for_window as read};
 
 thread_local! {
     static STORE: RefCell<ReportStore> = RefCell::default();
@@ -55,11 +55,7 @@ pub fn finish(ctl: &Controller) {
 pub fn install(ctl: &Controller) {
     static PREVIEW: AtomicU64 = AtomicU64::new(0);
     let paths = ctl.paths.clone();
-    worker().spawn(move || {
-        if let Some(folder) = paths.crash_log.parent() {
-            config::clear_leftovers(folder, |name| matches!(name, RECORD_FILE | "diagnostics.txt"), &[]);
-        }
-    });
+    worker().spawn(move || clear_report_leftovers(&paths));
     sending::install(ctl);
     ctl.ui.global::<ui::Settings>().on_preview_diagnostics(|| {
         with(|ctl| {
@@ -67,8 +63,7 @@ pub fn install(ctl: &Controller) {
             let paths = ctl.paths.clone();
             let generation = PREVIEW.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
             worker().spawn(move || {
-                let text = local_text(&paths, session)
-                    .unwrap_or_else(|_| "Diagnostics could not be read.".into());
+                let text = preview_text(&paths, session);
                 post(move |ctl| {
                     if PREVIEW.load(Ordering::Relaxed) == generation {
                         ctl.ui.global::<ui::Settings>().set_diagnostics_preview(text.into());
@@ -102,7 +97,7 @@ pub fn save(ctl: &Controller) {
     let session = Session::capture(ctl);
     let paths = ctl.paths.clone();
     worker().spawn(move || {
-        let saved = local_text(&paths, session).and_then(|text| save_text(&paths, &text));
+        let saved = export_report(&paths, session);
         if saved.is_ok() {
             let program = if cfg!(windows) { "notepad" } else { "xdg-open" };
             let _ = std::process::Command::new(program).arg(&paths.diagnostics).spawn();
@@ -286,6 +281,12 @@ impl ReportStore {
     }
 }
 
+fn clear_report_leftovers(paths: &config::Paths) {
+    if let Some(folder) = paths.crash_log.parent() {
+        config::clear_leftovers(folder, |name| matches!(name, RECORD_FILE | "diagnostics.txt"), &[]);
+    }
+}
+
 fn record_path(paths: &config::Paths) -> std::path::PathBuf {
     paths.crash_log.with_file_name(RECORD_FILE)
 }
@@ -357,7 +358,12 @@ fn render(mut report: diag::Report, crash_path: &Path) -> std::io::Result<String
     report.text().map_err(invalid_report)
 }
 
-fn save_text(paths: &config::Paths, text: &str) -> std::io::Result<()> {
+fn preview_text(paths: &config::Paths, session: Session) -> String {
+    local_text(paths, session).unwrap_or_else(|_| "Diagnostics could not be read.".into())
+}
+
+fn export_report(paths: &config::Paths, session: Session) -> std::io::Result<()> {
+    let text = local_text(paths, session)?;
     config::write_surely(&paths.diagnostics, text.as_bytes())
 }
 

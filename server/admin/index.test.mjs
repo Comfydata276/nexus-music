@@ -9,7 +9,7 @@ const route = readFileSync(new URL("../src/admin.rs", import.meta.url), "utf8");
 const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
 const style = html.match(/<style>([\s\S]*?)<\/style>/)[1];
 
-function loadPage(fetch, { requestsEnabled = false } = {}) {
+function loadPage(fetch, { requestsEnabled = false, origin = "https://owner.example.test:8443" } = {}) {
   const elements = new Map();
   const windowEvents = new Map();
   const documentEvents = new Map();
@@ -55,7 +55,10 @@ function loadPage(fetch, { requestsEnabled = false } = {}) {
         return node(tag);
       },
     },
-    window: { addEventListener(name, handler) { windowEvents.set(name, handler); } },
+    window: {
+      location: { origin },
+      addEventListener(name, handler) { windowEvents.set(name, handler); },
+    },
     crypto: webcrypto,
     setTimeout(fn, delay) { timers.push({ fn, delay, active: true }); return timers.length; },
     clearTimeout(id) {
@@ -362,10 +365,12 @@ test("all changes show a confirmation and spend one grant on the exact wire targ
   await confirm(adminPassword);
   assert.equal(page.from("code-value").textContent, code);
   assert.equal(page.from("code-person").textContent, "Code for <script>sample()</script> (new@example.test)");
+  assert.equal(page.from("code-origin").textContent, "https://owner.example.test:8443");
   assert.equal(page.from("new-code").open, true);
   page.click("code-done");
   assert.equal(page.from("code-value").textContent, "");
   assert.equal(page.from("code-person").textContent, "");
+  assert.equal(page.from("code-origin").textContent, "");
   assert.equal(page.from("new-code").open, false);
   assert.equal(page.from("create-name").value, "");
 
@@ -387,6 +392,7 @@ test("all changes show a confirmation and spend one grant on the exact wire targ
   await confirm();
   assert.equal(page.from("code-value").textContent, "01AB234CDE57");
   assert.equal(page.from("code-person").textContent, "Code for Pat <script>sample()</script> (pat@example.test)");
+  assert.equal(page.from("code-origin").textContent, "https://owner.example.test:8443");
   page.click("code-done");
 
   page.press("devices-list", "Sign this device out");
@@ -577,7 +583,7 @@ test("elapsed inactivity clears the tab, including an open code and cached appro
 
   page.advance(30 * 60 * 1000);
   page.fireIdleTimer();
-  for (const id of ["identity", "code-value", "code-person", "music-internal", "music-public"]) {
+  for (const id of ["identity", "code-value", "code-person", "code-origin", "music-internal", "music-public"]) {
     assert.equal(page.from(id).textContent, "");
   }
   for (const id of ["accounts-list", "devices-list"]) assert.equal(page.from(id).children.length, 0);
@@ -662,4 +668,13 @@ test("a session refused before the request is read clears the page", async () =>
   assert.equal(page.from("identity").textContent, "");
   assert.equal(page.from("reports").open, false);
   assert.match(page.from("status").textContent, /Sign in again/);
+});
+
+test("the code instructions match the app fields and preserve the lifetime", () => {
+  const instructions = html.match(/<p id="code-instructions">([^<]+)<\/p>/)[1];
+  assert.match(instructions, /I have a one-time code/);
+  assert.match(instructions, /Nexus server address and this code/);
+  assert.match(instructions, /15 characters long, twice/);
+  assert.doesNotMatch(instructions, /email/);
+  assert.match(html, /works once and expires in 7 days/);
 });
