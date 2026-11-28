@@ -77,7 +77,7 @@ fn preview_save_and_c6_upload_have_the_same_clean_text() -> std::io::Result<()> 
         b"bad date UTC version 0.40.13 thread main at src/main.rs:76: no message\n",
     ].concat())?;
     let model = session.report(&crash);
-    let preview = model.text().unwrap();
+    let preview = session.text(&crash).unwrap();
     session.write_report(&crash, &saved)?;
     assert_eq!(fs::read(&saved)?, preview.as_bytes());
     assert_eq!(diag::Report::read(&preview).unwrap(), model);

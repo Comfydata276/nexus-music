@@ -45,7 +45,7 @@ pub fn install(window: &ui::MainWindow) {
             let path = ctl.paths.crash_log.clone();
             let generation = PREVIEW.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
             worker().spawn(move || {
-                let text = session.report(&path).text()
+                let text = session.text(&path)
                     .unwrap_or_else(|_| "Diagnostics could not be read.".into());
                 post(move |ctl| {
                     if PREVIEW.load(Ordering::Relaxed) == generation {
@@ -215,8 +215,12 @@ impl Session {
         }
     }
 
+    fn text(&self, crash_path: &Path) -> Result<String, diag::Wrong> {
+        self.report(crash_path).text()
+    }
+
     fn write_report(&self, crash_path: &Path, path: &Path) -> std::io::Result<()> {
-        let text = self.report(crash_path).text()
+        let text = self.text(crash_path)
             .map_err(|_| std::io::Error::other("The diagnostics report could not be built"))?;
         if let Some(folder) = path.parent() {
             fs::create_dir_all(folder)?;
