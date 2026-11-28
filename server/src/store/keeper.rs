@@ -690,6 +690,83 @@ impl Keeper {
         Ok(number)
     }
 
+    /// What of `extra` a decision's effects call for and cannot supply themselves (the review
+    /// of S3b, B), chosen before anything is written:
+    ///
+    /// - **Removals are never taken from a caller**: a password or codes going are derived
+    ///   from the effects alone (a reset, a code no longer live).
+    /// - **Exactly one new verifier** for each password changed or code redeemed (the one
+    ///   C3r was given, for a redemption); a second, or one for an account whose change does
+    ///   not call for one while another's does, refuses the whole step.
+    /// - **A code's keyed fingerprint** only as the live code the effects decided: its number
+    ///   and its deadline; anything else, or a second, refuses the step.
+    /// - **A device's description** only for a device that has a fresh session in the update.
+    /// - **Where a music login was checked**, only with that login.
+    ///
+    /// A verifier, code or description no update calls for at all (a decision refused: its
+    /// effects are still kept, whatever it answered) is not kept.
+    fn selected<'c>(&self, effects: &Effects, numbers: &[u64], extra: &[Change<'c>]) -> Result<Vec<Change<'c>>, Failed> {
+        let refuse = |why: &str| Err(Failed(format!("{why}; nothing was kept.")));
+        let update_of = |account: u64| effects.updates.iter().zip(numbers).find(|(_, number)| **number == account).map(|(update, _)| update);
+        let calls_verifier = |change: &DataChange| matches!(change, DataChange::ChangePassword | DataChange::RedeemCode { .. });
+        let any_verifier = effects.updates.iter().any(|update| calls_verifier(&update.change));
+        let any_code = effects.updates.iter().any(|update| matches!(update.change, DataChange::ResetPassword));
+        let mut kept = Vec::new();
+        let (mut verifiers, mut codes) = (BTreeMap::<u64, usize>::new(), BTreeMap::<u64, usize>::new());
+        for change in extra {
+            match *change {
+                Change::Password { password: None, .. } | Change::Codes { .. } => return refuse("A removal was given with a decision; what goes is the decision's own"),
+                Change::Password { account, password: Some(password) } => match update_of(account).map(|update| &update.change) {
+                    Some(DataChange::RedeemCode { verifier, .. }) if password.hash != *verifier.as_bytes() => return refuse("A code was redeemed with another verifier than the one checked"),
+                    Some(called) if calls_verifier(called) => {
+                        *verifiers.entry(account).or_default() += 1;
+                        kept.push(change.clone());
+                    }
+                    _ if any_verifier => return refuse("A new password was given for an account whose change is not one"),
+                    _ => {}
+                },
+                Change::Code { account, number, until, .. } => match update_of(account) {
+                    Some(update) if matches!(update.change, DataChange::ResetPassword) => {
+                        let live = update.data.account.code;
+                        if live.is_none_or(|live| live.used || live.number != number || live.expires != until) {
+                            return refuse("A code was given that is not the live code the reset decided");
+                        }
+                        *codes.entry(account).or_default() += 1;
+                        kept.push(change.clone());
+                    }
+                    _ if any_code => return refuse("A code was given for an account that was not reset"),
+                    _ => {}
+                },
+                Change::Describe { device, .. } => {
+                    let fresh = DeviceId::new(device).is_some_and(|id| {
+                        effects.updates.iter().zip(numbers).any(|(update, number)| {
+                            let before = self.store.accounts.get(number).and_then(|account| account.apart.devices.get(&id)).and_then(|record| record.permit.as_ref()).map(|permit| permit.id);
+                            update.data.devices.get(&id).and_then(|row| row.session.as_ref()).is_some_and(|session| Some(session.id) != before)
+                        })
+                    });
+                    if fresh {
+                        kept.push(change.clone());
+                    }
+                }
+                Change::MusicChecked { account, .. } => {
+                    if update_of(account).is_some_and(|update| matches!(update.change, DataChange::InstallMusicLogin(_))) {
+                        kept.push(change.clone());
+                    }
+                }
+                _ => return refuse("A change was added to a decision that no decision adds to"),
+            }
+        }
+        if verifiers.values().any(|&n| n > 1) || codes.values().any(|&n| n > 1) {
+            return refuse("More than one new password or code was given for one account");
+        }
+        for (update, &number) in effects.updates.iter().zip(numbers) {
+            if calls_verifier(&update.change) && verifiers.get(&number) != Some(&1) {
+                return refuse("A password was changed or a code redeemed with no new password to keep");
+            }
+        }
+        Ok(kept)
+    }
+
     /// Keeps what a decision says is to be kept (C3r's `Effects`), **whatever it answered**,
     /// and before its answer is given, in 12.3's order. `extra` is what the caller adds to the
     /// data's step for the change (S8: a password's new fingerprint for `ChangePassword`, a
@@ -723,40 +800,12 @@ impl Keeper {
             }
             numbers.push(number);
         }
-        // What the caller adds is kept only with the change it belongs to, as C3r decided it:
-        // a decision refused (a spent grant, a wrong password) still has updates, which are
-        // kept whatever it answered, and a new verifier or code given with it is not.
-        let with = |account: u64, change: fn(&DataChange) -> bool| effects.updates.iter().zip(&numbers).any(|(update, &number)| number == account && change(&update.change));
-        let mut added = Vec::new();
-        for change in extra {
-            let belongs = match *change {
-                Change::Password { password: None, .. } | Change::Codes { .. } => true,
-                Change::Password { account, password: Some(_) } => with(account, |change| matches!(change, DataChange::ChangePassword | DataChange::RedeemCode { .. })),
-                Change::Code { account, .. } => with(account, |change| matches!(change, DataChange::ResetPassword)),
-                Change::Describe { device, .. } => DeviceId::new(device).is_some_and(|device| effects.updates.iter().any(|update| update.data.devices.contains_key(&device))),
-                Change::MusicChecked { account, .. } => with(account, |change| matches!(change, DataChange::InstallMusicLogin(_))),
-                _ => return Err(Failed("A change was added to a decision that no decision adds to; nothing was kept.".into())),
-            };
-            if belongs {
-                added.push(change.clone());
-            }
-        }
-        // What a change cannot be kept without, said before anything is written: a new
-        // verifier with a password changed or a code redeemed; with a music login, its own
-        // account and count, and the internal address it was checked at (S9).
+        let added = self.selected(effects, &numbers, extra)?;
+        // What a music login cannot be kept without, said before anything is written: its own
+        // account, backend and count, and the internal address it was checked at (S9).
         for (update, &number) in effects.updates.iter().zip(&numbers) {
-            let given = |found: &dyn Fn(&Change<'_>) -> bool| extra.iter().any(found);
+            let given = |found: &dyn Fn(&Change<'_>) -> bool| added.iter().any(found);
             match &update.change {
-                DataChange::RedeemCode { verifier, .. } => {
-                    if !given(&|change| matches!(change, Change::Password { account, password: Some(password) } if *account == number && password.hash == *verifier.as_bytes())) {
-                        return Err(Failed("A code was redeemed with no new password to keep; nothing was kept.".into()));
-                    }
-                }
-                DataChange::ChangePassword => {
-                    if !given(&|change| matches!(change, Change::Password { account, password: Some(_) } if *account == number)) {
-                        return Err(Failed("A password was changed with no new password to keep; nothing was kept.".into()));
-                    }
-                }
                 DataChange::InstallMusicLogin(install) => {
                     let binding = &install.binding;
                     if binding.account != update.apart_first.account.id || binding.count != update.data.account.music_login || binding.backend != self.backend {
@@ -800,7 +849,7 @@ impl Keeper {
                 // `Install`, and the data's trigger deletes them unless they are held (12.5).
                 DataChange::EraseHistory => {}
                 DataChange::InstallMusicLogin(install) => {
-                    let internal = extra.iter().find_map(|change| match change {
+                    let internal = added.iter().find_map(|change| match change {
                         Change::MusicChecked { account, internal } if *account == number => Some(*internal),
                         _ => None,
                     });

@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use nexus_core::nexus::account::{AccountId, DeviceId, DeviceSecret, GrantSecret, RequestId, SECRET_BYTES, SESSION_IDLE_MS as SESSION_MS};
+use nexus_core::nexus::account::{AccountId, CODE_LIFETIME_MS, DeviceId, DeviceSecret, GrantSecret, RequestId, SECRET_BYTES, SESSION_IDLE_MS as SESSION_MS};
 use nexus_core::nexus::kept::{Access, Account, AdminAction, AdminTarget, Bearer, Denied, FreshSession, Fingerprint, GrantIntent, GrantUse, LeaveFor, SessionTarget, Status, Turn};
 use nexus_music_server::identity;
 use nexus_music_server::store::data::{self, Change, Data, Migration};
@@ -408,7 +408,7 @@ fn run(scenario: &str, root: &Root) -> Result<(), String> {
         }
         "an account switched off" => administer(&mut keeper(), &ids, AdminAction::SetOn(false), BOB, &[], now).map_err(failed),
         "an account deleted" => administer(&mut keeper(), &ids, AdminAction::DeleteAccount, BOB, &[], now).map_err(failed),
-        "a password reset" => administer(&mut keeper(), &ids, AdminAction::ResetPassword, BOB, &[Change::Code { account: BOB, number: 2, code: &[45; 32], made_at: now, until: now + MINUTE }], now).map_err(failed),
+        "a password reset" => administer(&mut keeper(), &ids, AdminAction::ResetPassword, BOB, &[Change::Code { account: BOB, number: 2, code: &[45; 32], made_at: now, until: now + CODE_LIFETIME_MS }], now).map_err(failed),
         "a device heard from" => keeper().heard(ids.b1, now + 2 * MINUTE).map_err(failed),
         "an event kept" => an_event(&mut keeper(), BOB, ids.b1, 3, now).map(|_| ()).map_err(failed),
         "a large account made" => keeper().make_account("large@example.org", &"L".repeat(40 * 1024), false, None, now).map(|_| ()).map_err(failed),
@@ -1756,5 +1756,77 @@ fn a_music_login_is_kept_only_with_its_own_account_count_and_where_it_was_checke
         keeper.data().connection().query_row("SELECT count, internal FROM music_logins WHERE account = ?1", [ALICE as i64], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
     assert_eq!((count_kept, internal.as_str()), (1, "http://navidrome:4533"));
     assert_eq!(state(&mut keeper, ALICE).unwrap().music_login, 1);
+    keeper.close();
+}
+
+// ---- The write filter (the review of S3b, B) ----
+
+fn description(keeper: &Keeper, device: u64) -> String {
+    keeper.data().connection().query_row("SELECT name FROM devices WHERE id = ?1", [device as i64], |row| row.get(0)).unwrap()
+}
+
+fn verifier(keeper: &Keeper, account: u64) -> Option<[u8; 32]> {
+    keeper.data().password(account).unwrap().map(|password| password.hash)
+}
+
+#[test]
+fn a_refused_decision_that_still_touches_a_session_keeps_no_verifier_code_or_description_given_with_it() {
+    let root = Root::new("filter-touch");
+    let ids = world(&root);
+    // Two hours on, past the hourly write of "last used": the refused change still writes.
+    let now = T0 + 120 * MINUTE;
+    let mut keeper = opened(&root, now);
+    let (old, name, codes) = (verifier(&keeper, ALICE), description(&keeper, ids.a2), count(&keeper, "SELECT count(*) FROM codes WHERE account = ?1", BOB));
+    let (held, chosen) = (fp(1), password(66));
+    let removals = [Change::Password { account: BOB, password: None }, Change::Codes { account: BOB, keep: None }];
+    for removal in &removals {
+        let extra = [Change::Password { account: ALICE, password: Some(&chosen) }, removal.clone()];
+        let answer = decide(&mut keeper, ALICE, now, &extra, |turn| turn.change_password(bearer(ids.a1, &held)));
+        assert!(answer.is_err(), "a removal given by the caller was taken: {answer:?}");
+    }
+    let changes = keeper.data().meta().unwrap().changes;
+    let extra = [
+        Change::Password { account: ALICE, password: Some(&chosen) },
+        Change::Describe { device: ids.a2, name: "renamed by a refused call", kind: "pc", version: "0" },
+    ];
+    let answer = decide(&mut keeper, ALICE, now, &extra, |turn| turn.change_password(bearer(ids.a1, &held))).unwrap();
+    assert!(answer.is_err(), "the change had no grant");
+    assert!(keeper.data().meta().unwrap().changes > changes, "the refused decision wrote nothing: the case does not hold");
+    assert_eq!(verifier(&keeper, ALICE), old);
+    assert_eq!(description(&keeper, ids.a2), name);
+    assert_eq!(count(&keeper, "SELECT count(*) FROM codes WHERE account = ?1", BOB), codes);
+    assert!(verifier(&keeper, BOB).is_some());
+    keeper.close();
+}
+
+#[test]
+fn exactly_one_verifier_for_a_change_and_only_the_live_code_for_a_reset() {
+    let root = Root::new("filter-one");
+    let ids = world(&root);
+    let now = T0 + 4 * MINUTE;
+    let mut keeper = opened(&root, now);
+    leave(&mut keeper, ALICE, ids.a1, 1, 12, LeaveFor::ChangePassword, now).unwrap();
+    let (held, first, second) = (fp(1), password(66), password(67));
+    let old = verifier(&keeper, ALICE);
+    let two = [Change::Password { account: ALICE, password: Some(&first) }, Change::Password { account: ALICE, password: Some(&second) }];
+    assert!(decide(&mut keeper, ALICE, now, &two, |turn| turn.change_password(bearer(ids.a1, &held))).is_err(), "two verifiers were taken");
+    assert_eq!(verifier(&keeper, ALICE), old);
+    let other = [Change::Password { account: ALICE, password: Some(&first) }, Change::Password { account: BOB, password: Some(&second) }];
+    assert!(decide(&mut keeper, ALICE, now, &other, |turn| turn.change_password(bearer(ids.a1, &held))).is_err(), "a verifier for another account was taken");
+    let bob = verifier(&keeper, BOB);
+    assert!(decide(&mut keeper, ALICE, now, &[], |turn| turn.change_password(bearer(ids.a1, &held))).is_err(), "a change with no verifier was kept");
+    decide(&mut keeper, ALICE, now, &two[..1], |turn| turn.change_password(bearer(ids.a1, &held))).unwrap().unwrap();
+    assert_eq!(verifier(&keeper, ALICE), Some(first.hash));
+    assert_eq!(verifier(&keeper, BOB), bob);
+    // A reset: only the live code the decision made, by its number and deadline.
+    let purpose = admin_leave(&mut keeper, AdminAction::ResetPassword, BOB);
+    leave(&mut keeper, ROOT, ids.root, 30, 32, purpose, now).unwrap();
+    let live = |number| [Change::Code { account: BOB, number, code: &[46; 32], made_at: now, until: now + CODE_LIFETIME_MS }];
+    assert!(administer(&mut keeper, &ids, AdminAction::ResetPassword, BOB, &live(99), now).is_err(), "a code under another number was taken");
+    let late = [Change::Code { account: BOB, number: 2, code: &[46; 32], made_at: now, until: now + CODE_LIFETIME_MS + 1 }];
+    assert!(administer(&mut keeper, &ids, AdminAction::ResetPassword, BOB, &late, now).is_err(), "a code with another deadline was taken");
+    assert!(stored_code(&keeper, BOB, 46).is_none());
+    administer(&mut keeper, &ids, AdminAction::ResetPassword, BOB, &live(2), now).unwrap();
+    assert!(stored_code(&keeper, BOB, 46).is_some());
     keeper.close();
 }
