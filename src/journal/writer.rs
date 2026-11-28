@@ -921,7 +921,7 @@ mod tests {
             file.write_all(b"{\"id\":").unwrap();
             eprintln!("{READY}");
             // Keep the file open at the point where a real append could have been cut.
-            let _ = std::io::stdin().read(&mut [0u8; 1]);
+            let _ = std::io::Read::read(&mut std::io::stdin(), &mut [0u8; 1]);
             return;
         }
 
