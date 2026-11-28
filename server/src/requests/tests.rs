@@ -494,17 +494,17 @@ impl TestServer {
         }
     }
 
-    fn apply<T: admin::Change>(
+    fn apply<T: Serialize>(
         &self, who: &Person, headers: &str, path: &str, change: T, number: u64,
         grant: admin::GrantSecret,
     ) -> admin::Reply<admin::Applied> {
-        let request = admin::encode(&admin::Granted {
+        let request = serde_json::to_vec(&admin::Granted {
             head: RequestHead { speaks: SPEAKS, restore: who.restore },
             request_id: wire::RequestId::new(number).unwrap(),
             grant,
             change,
         }).unwrap();
-        let (status, body) = self.post(path, Some(&who.signed_in), headers, request.bytes());
+        let (status, body) = self.post(path, Some(&who.signed_in), headers, &request);
         admin::read_reply(status, &body).unwrap()
     }
 
