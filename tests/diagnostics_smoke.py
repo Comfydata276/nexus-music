@@ -101,6 +101,7 @@ def capture(size, server_url, port, shots):
                 switch = app.one(label="Send diagnostics to your Nexus server", role="Switch")
                 assert 0 <= switch["absolutePosition"]["y"] < int(size.split("x")[1]) - 24
                 app.one(contains="Nothing is sent until you sign in to a Nexus server.")
+                assert not app.find(label="What this server records")
                 screenshot(app, shots, size, "diagnostics-setting")
                 app.press("What is sent")
                 report = app.one(contains="What the player has met")["accessibleLabel"]
