@@ -570,26 +570,16 @@ impl Keeper {
         let number = next.next_account;
         next.next_account = number.checked_add(1).ok_or_else(|| Failed("No more accounts can be made.".into()))?;
         let id = AccountId::new(number).ok_or_else(|| Failed("No more accounts can be made.".into()))?;
-        // CARRIED (asked of C3r): the design does not say what an account's first state is,
-        // and C3r has no constructor. Switched on; with a code: no password, a reset
-        // required, the code live as number 0; with a password: that password, nothing else.
-        let state = AccountState {
-            backend: self.backend,
-            restore: next.restore,
-            id,
-            email: name,
-            life: 0,
-            status: Status::On,
-            password_changes: 0,
-            password_reset_required: !matches!(first, First::Password(_)),
-            code: matches!(first, First::Code(..)).then_some(LiveCode { number: 0, used: false }),
-            admin,
-            music_login: 0,
-            music_managed: false,
-            music_recovery: None,
-            history_held: false,
-            revision: 0,
+        // C3r's first state (`AccountState::new`): switched on, no password, a reset required, a
+        // code live if one is given (as number 0, good until its `until`). The first admin made
+        // at set-up with a password has that password, and no reset waiting.
+        let code = match first {
+            First::Code(_, until) => Some(LiveCode { number: 0, used: false, expires: until }),
+            _ => None,
         };
+        let mut state = AccountState::new(self.backend, next.restore, id, name, code);
+        state.admin = admin;
+        state.password_reset_required = !matches!(first, First::Password(_));
         next.accounts.insert(number, Account { name: apart::name_fingerprint(email), apart: Apart { account: state.clone(), devices: BTreeMap::new() } });
         next.high_water = next.high_water.max(now);
         next.mark = self.changes;
@@ -903,6 +893,9 @@ pub fn take_as_is(state: &Path, folder: &Path, now: u64) -> Result<Said, Refused
                         let session = device.session.as_ref();
                         let record = ApartDevice {
                             number: device.number,
+                            // Nothing says which devices were forced out: none is known until it
+                            // signs in again (the stricter reading).
+                            known: false,
                             last_session: session.map_or(0, |session| session.id.get()),
                             last_leave: session.and_then(|session| session.leave.as_ref()).map_or(0, |leave| leave.fields().5),
                             permit: None,

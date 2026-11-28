@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use nexus_core::nexus::account::{AccountId, DeviceId, DeviceSecret, GrantSecret, SECRET_BYTES, SESSION_IDLE_MS as SESSION_MS};
-use nexus_core::nexus::kept::{Access, Account, AdminAction, AdminTarget, Bearer, Denied, FreshSession, Fingerprint, LeaveFor, SessionTarget, Status, Turn};
+use nexus_core::nexus::account::{AccountId, DeviceId, DeviceSecret, GrantSecret, RequestId, SECRET_BYTES, SESSION_IDLE_MS as SESSION_MS};
+use nexus_core::nexus::kept::{Access, Account, AdminAction, AdminTarget, Bearer, Denied, FreshSession, Fingerprint, GrantIntent, GrantUse, LeaveFor, SessionTarget, Status, Turn};
 use nexus_music_server::identity;
 use nexus_music_server::store::data::{self, Change, Data, Migration};
 use nexus_music_server::store::keeper::{self, Failed, Keeper, Started};
@@ -138,8 +138,13 @@ fn dev(device: u64) -> DeviceId {
     DeviceId::new(device).unwrap_or(DeviceId::new(u64::MAX).unwrap())
 }
 
+/// The one request number these tests' grants are asked and used under (8.8, 12.2).
+fn request() -> RequestId {
+    RequestId::new(9).unwrap()
+}
+
 fn bearer(device: u64, session: &Fingerprint) -> Bearer<'_> {
-    Bearer { device: dev(device), hash: session, grant: Some(&GRANT) }
+    Bearer { device: dev(device), hash: session, grant: Some(GrantUse { request_id: request(), secret: &GRANT }) }
 }
 
 fn secret(n: u8) -> DeviceSecret {
@@ -147,7 +152,7 @@ fn secret(n: u8) -> DeviceSecret {
 }
 
 fn fresh(keeper: &mut Keeper, session: u8) -> FreshSession {
-    FreshSession { id: keeper.fresh_session().unwrap(), hash: fp(session) }
+    FreshSession { id: keeper.fresh_session().unwrap(), hash: fp(session), sign_out: fp(session.wrapping_add(100)) }
 }
 
 /// The session `device` of `account` has now, as the data and the store have it.
@@ -157,8 +162,9 @@ fn session_of(keeper: &mut Keeper, account: u64, device: u64) -> SessionTarget {
     SessionTarget { device: dev(device), session: session.unwrap_or(nexus_core::nexus::account::SessionId::new(u64::MAX).unwrap()) }
 }
 
-fn target(account: u64) -> AdminTarget {
-    AdminTarget::Account(AccountId::new(account).unwrap())
+/// The account as the admin names it: its number and its revision now.
+fn target(keeper: &mut Keeper, account: u64) -> AdminTarget {
+    keeper.load(account).map(|loaded| loaded.state().admin_target()).unwrap_or(AdminTarget::Account { id: AccountId::new(account).unwrap(), revision: 0 })
 }
 
 fn failed(why: Denied) -> Failed {
@@ -195,22 +201,23 @@ fn first_password(keeper: &mut Keeper, account: u64, secret: u8, code: u8, pass:
 /// Leave for one thing (8.8), on a session, by its password typed again.
 fn leave(keeper: &mut Keeper, account: u64, device: u64, session: u8, pass: u8, purpose: LeaveFor, now: u64) -> Result<(), Failed> {
     let held = fp(session);
-    let check = decide(keeper, account, now, &[], |turn| turn.check_leave(bearer(device, &held), purpose, fp(pass)))?.map_err(failed)?;
+    let check = decide(keeper, account, now, &[], |turn| turn.check_leave(bearer(device, &held), GrantIntent { request_id: request(), change: purpose }, fp(pass)))?.map_err(failed)?;
     let receipt = check.check(fp(pass), keeper.clock(now)).map_err(failed)?;
     decide(keeper, account, now, &[], |turn| turn.grant_leave(receipt, &GRANT))?.map_err(failed)
 }
 
-fn admin_leave(action: AdminAction, account: u64) -> LeaveFor {
-    LeaveFor::Admin { action, target: target(account) }
+fn admin_leave(keeper: &mut Keeper, action: AdminAction, account: u64) -> LeaveFor {
+    LeaveFor::Admin { action, target: target(keeper, account) }
 }
 
 /// The admin does `action` to `target`, under leave already granted for it.
 fn administer(keeper: &mut Keeper, ids: &Ids, action: AdminAction, target_number: u64, extra: &[Change<'_>], now: u64) -> Result<(), Failed> {
+    let named = target(keeper, target_number);
     let mut other = keeper.load(target_number)?;
     let held = fp(30);
     let (restore, clock) = (keeper.restore(), keeper.clock(now));
     let mut root = keeper.load(ROOT)?;
-    root.request(restore, clock, |turn| turn.administer(bearer(ids.root, &held), action, target(target_number), Some(&mut other)))
+    root.request(restore, clock, |turn| turn.administer(bearer(ids.root, &held), action, named, Some(&mut other)))
         .apply(|effects| keeper.persist(effects, extra, now))?
         .map_err(failed)
 }
@@ -561,7 +568,8 @@ fn what_the_admin_takes_away_cut_at_any_point_holds_once_the_store_has_it() {
         let prepared = setup.copied(&format!("admin-{}", scenario.replace(' ', "-")));
         {
             let mut keeper = opened(&prepared, T0 + 4 * MINUTE);
-            leave(&mut keeper, ROOT, ids.root, 30, 32, admin_leave(action, BOB), T0 + 4 * MINUTE).unwrap();
+            let purpose = admin_leave(&mut keeper, action.clone(), BOB);
+            leave(&mut keeper, ROOT, ids.root, 30, 32, purpose, T0 + 4 * MINUTE).unwrap();
             keeper.close();
         }
         at_every_point(scenario, &prepared, |root, cut| {
@@ -769,8 +777,9 @@ fn what_was_taken_away_since_a_copy_is_taken_away_again_when_it_is_put_back() {
             "password reset" => Some(AdminAction::ResetPassword),
             _ => None,
         };
-        if let Some(action) = kind {
-            leave(&mut keeper, ROOT, ids.root, 30, 32, admin_leave(action, BOB), T0 + 2 * MINUTE).unwrap();
+        if let Some(action) = kind.clone() {
+            let purpose = admin_leave(&mut keeper, action.clone(), BOB);
+            leave(&mut keeper, ROOT, ids.root, 30, 32, purpose, T0 + 2 * MINUTE).unwrap();
         } else if change == "password changed" {
             leave(&mut keeper, BOB, ids.b1, 5, 22, LeaveFor::ChangePassword, T0 + 2 * MINUTE).unwrap();
         } else if change == "listening data deleted" {

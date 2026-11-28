@@ -49,8 +49,9 @@ pub const FORM: i64 = 1;
 pub const BUSY: Duration = Duration::from_secs(5);
 
 /// Form 1: what the data keeps (design 11): accounts (with C3r's state of each), one-time
-/// codes as keyed fingerprints by the number C3r gives each, devices, and each device's one
-/// session as a fingerprint (with the fingerprint of the secret that can only end it, 11); and the
+/// codes as keyed fingerprints by the number C3r gives each (C3r's `LiveCode` deadline beside
+/// its number), devices, and each device's one session as a fingerprint (with the fingerprint
+/// of the secret that can only end it, 11); and the
 /// restore number, how far its changes have got, and the latest time a step was written at.
 /// **Room is left**, for the slices that bring them, for an account's music login (S9), its
 /// switch for requests (step 4), and the events and Diagnostics kept for it (S12, S7), each a
@@ -82,6 +83,7 @@ CREATE TABLE accounts (
     reset_required INTEGER NOT NULL CHECK (reset_required IN (0, 1)),
     code_number INTEGER CHECK (code_number IS NULL OR code_number >= 0),
     code_used INTEGER NOT NULL CHECK (code_used IN (0, 1)),
+    code_expires INTEGER CHECK ((code_number IS NULL) = (code_expires IS NULL)),
     admin INTEGER NOT NULL CHECK (admin IN (0, 1)),
     music_login INTEGER NOT NULL,
     music_managed INTEGER NOT NULL CHECK (music_managed IN (0, 1)),
@@ -116,7 +118,7 @@ CREATE TABLE sessions (
     id INTEGER NOT NULL CHECK (id > 0),
     hash BLOB NOT NULL UNIQUE CHECK (length(hash) = 32),
     last_used INTEGER NOT NULL,
-    revoke BLOB CHECK (revoke IS NULL OR length(revoke) = 32),
+    sign_out BLOB NOT NULL CHECK (length(sign_out) = 32),
     leave_for TEXT,
     leave_life INTEGER,
     leave_revision INTEGER,
@@ -394,7 +396,7 @@ impl Data {
         let found = self
             .connection
             .query_row(
-                "SELECT email, life, status, password_changes, reset_required, code_number, code_used, admin, music_login, music_managed, music_recovery, history_held, revision FROM accounts WHERE number = ?1",
+                "SELECT email, life, status, password_changes, reset_required, code_number, code_used, admin, music_login, music_managed, music_recovery, history_held, revision, code_expires FROM accounts WHERE number = ?1",
                 [self::number(number)?],
                 |row| {
                     let bad = |at: usize, what: &str| rusqlite::Error::InvalidColumnType(at, what.into(), rusqlite::types::Type::Text);
@@ -412,10 +414,10 @@ impl Data {
                         Some("enter") => Some(MusicRecovery::EnterAgain),
                         Some(_) => return Err(bad(10, "music_recovery")),
                     };
-                    let code = row.get::<_, Option<i64>>(5)?.map(unsigned).transpose()?.map(|code| LiveCode { number: code, used: false });
-                    let code = match (code, flag(6)?) {
-                        (Some(code), used) => Some(LiveCode { used, ..code }),
-                        (None, _) => None,
+                    let code = match (row.get::<_, Option<i64>>(5)?.map(unsigned).transpose()?, row.get::<_, Option<i64>>(13)?.map(unsigned).transpose()?) {
+                        (Some(number), Some(expires)) => Some(LiveCode { number, used: flag(6)?, expires }),
+                        (None, None) => None,
+                        _ => return Err(bad(13, "code_expires")),
                     };
                     Ok(AccountState {
                         backend: meta.backend,
@@ -440,7 +442,7 @@ impl Data {
         let Some(account) = found else { return Ok(None) };
         let mut rows = Rows { account, devices: BTreeMap::new() };
         let mut statement = self.connection.prepare(
-            "SELECT devices.id, devices.number, devices.secret, sessions.id, sessions.hash, sessions.last_used, sessions.leave_for, sessions.leave_life, sessions.leave_revision, sessions.leave_admin, sessions.leave_granted, sessions.leave_serial, sessions.leave_hash
+            "SELECT devices.id, devices.number, devices.secret, sessions.id, sessions.hash, sessions.last_used, sessions.sign_out, sessions.leave_for, sessions.leave_life, sessions.leave_revision, sessions.leave_admin, sessions.leave_granted, sessions.leave_serial, sessions.leave_hash
              FROM devices LEFT JOIN sessions ON sessions.device = devices.id WHERE devices.account = ?1",
         )?;
         let found = statement.query_map([self::number(number)?], |row| {
@@ -451,16 +453,16 @@ impl Data {
             let session = match row.get::<_, Option<i64>>(3)? {
                 None => None,
                 Some(id) => {
-                    let leave = match row.get::<_, Option<String>>(6)? {
+                    let leave = match row.get::<_, Option<String>>(7)? {
                         None => None,
                         Some(purpose) => {
-                            let purpose = crate::store::apart::leave_for(&purpose).ok_or_else(|| rusqlite::Error::InvalidColumnType(6, "leave_for".into(), rusqlite::types::Type::Text))?;
+                            let intent = crate::store::apart::intent(&purpose).ok_or_else(|| rusqlite::Error::InvalidColumnType(7, "leave_for".into(), rusqlite::types::Type::Text))?;
                             let count = |at: usize| -> rusqlite::Result<u64> { unsigned(row.get::<_, Option<i64>>(at)?.unwrap_or(-1)) };
-                            Some(Leave::stored(purpose, count(7)?, count(8)?, count(9)? == 1, count(10)?, count(11)?, Fingerprint::from_bytes(blob(12)?)))
+                            Some(Leave::stored(intent, count(8)?, count(9)?, count(10)? == 1, count(11)?, count(12)?, Fingerprint::from_bytes(blob(13)?)))
                         }
                     };
                     let id = SessionId::new(unsigned(id)?).ok_or_else(|| rusqlite::Error::IntegralValueOutOfRange(3, 0))?;
-                    Some(Session { id, hash: Fingerprint::from_bytes(blob(4)?), last_used: unsigned(row.get(5)?)?, leave })
+                    Some(Session { id, hash: Fingerprint::from_bytes(blob(4)?), last_used: unsigned(row.get(5)?)?, sign_out: Fingerprint::from_bytes(blob(6)?), leave })
                 }
             };
             let id = DeviceId::new(unsigned(row.get(0)?)?).ok_or_else(|| rusqlite::Error::IntegralValueOutOfRange(0, 0))?;
@@ -583,8 +585,6 @@ pub enum Change<'a> {
     /// The live one-time code's keyed fingerprint, by the number C3r gave it, good until
     /// `until` (S8 makes it; 8.5). Any code of the account before it goes.
     Code { account: u64, number: u64, code: &'a [u8; 32], made_at: u64, until: u64 },
-    /// The fingerprint of the secret that can end this session and do nothing else (11).
-    Revoke { device: u64, session: u64, revoke: &'a [u8; 32] },
     /// Every one-time code of an account gone, but the live one (`keep`, by its number).
     Codes { account: u64, keep: Option<u64> },
     /// A new restore number, and when; every session ended (12.4 steps 1 and 2).
@@ -610,7 +610,7 @@ fn recovery_word(recovery: Option<MusicRecovery>) -> Option<&'static str> {
 
 fn set_state(step: &rusqlite::Transaction<'_>, account: u64, state: &AccountState) -> rusqlite::Result<usize> {
     step.execute(
-        "UPDATE accounts SET email = ?2, life = ?3, status = ?4, password_changes = ?5, reset_required = ?6, code_number = ?7, code_used = ?8, admin = ?9, music_login = ?10, music_managed = ?11, music_recovery = ?12, history_held = ?13, revision = ?14 WHERE number = ?1",
+        "UPDATE accounts SET email = ?2, life = ?3, status = ?4, password_changes = ?5, reset_required = ?6, code_number = ?7, code_used = ?8, admin = ?9, music_login = ?10, music_managed = ?11, music_recovery = ?12, history_held = ?13, revision = ?14, code_expires = ?15 WHERE number = ?1",
         params![
             number(account)?,
             state.email.as_str(),
@@ -625,7 +625,8 @@ fn set_state(step: &rusqlite::Transaction<'_>, account: u64, state: &AccountStat
             i64::from(state.music_managed),
             recovery_word(state.music_recovery),
             i64::from(state.history_held),
-            number(state.revision)?
+            number(state.revision)?,
+            state.code.map(|code| number(code.expires)).transpose()?
         ],
     )
 }
@@ -659,20 +660,19 @@ impl Change<'_> {
                         }
                         Some(session) => {
                             let leave = session.leave.as_ref().map(|leave| leave.fields());
-                            // The secret that can only end this session (11) stays with it while
-                            // it is the same session, and goes when another takes its place.
+                            // With the session, the fingerprint of the secret that can only end it (11).
                             step.execute(
-                                "INSERT INTO sessions (device, id, hash, last_used, leave_for, leave_life, leave_revision, leave_admin, leave_granted, leave_serial, leave_hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-                                 ON CONFLICT (device) DO UPDATE SET revoke = CASE WHEN sessions.id = excluded.id THEN sessions.revoke ELSE NULL END,
-                                 id = excluded.id, hash = excluded.hash, last_used = excluded.last_used, leave_for = excluded.leave_for, leave_life = excluded.leave_life,
-                                 leave_revision = excluded.leave_revision, leave_admin = excluded.leave_admin, leave_granted = excluded.leave_granted,
-                                 leave_serial = excluded.leave_serial, leave_hash = excluded.leave_hash",
+                                "INSERT INTO sessions (device, id, hash, last_used, sign_out, leave_for, leave_life, leave_revision, leave_admin, leave_granted, leave_serial, leave_hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                                 ON CONFLICT (device) DO UPDATE SET id = excluded.id, hash = excluded.hash, last_used = excluded.last_used, sign_out = excluded.sign_out,
+                                 leave_for = excluded.leave_for, leave_life = excluded.leave_life, leave_revision = excluded.leave_revision, leave_admin = excluded.leave_admin,
+                                 leave_granted = excluded.leave_granted, leave_serial = excluded.leave_serial, leave_hash = excluded.leave_hash",
                                 params![
                                     number(id)?,
                                     number(session.id.get())?,
                                     session.hash.as_bytes().as_slice(),
                                     number(session.last_used)?,
-                                    leave.map(|(purpose, ..)| crate::store::apart::leave_for_word(purpose)),
+                                    session.sign_out.as_bytes().as_slice(),
+                                    leave.map(|(intent, ..)| crate::store::apart::intent_word(intent)),
                                     leave.map(|(_, life, ..)| number(life)).transpose()?,
                                     leave.map(|(_, _, revision, ..)| number(revision)).transpose()?,
                                     leave.map(|(_, _, _, admin, ..)| i64::from(admin)),
@@ -715,9 +715,6 @@ impl Change<'_> {
                     "INSERT INTO codes (account, number, code, made_at, until) VALUES (?1, ?2, ?3, ?4, ?5)",
                     params![number(account)?, number(code_number)?, code.as_slice(), number(made_at)?, number(until)?],
                 )?;
-            }
-            Change::Revoke { device, session, revoke } => {
-                step.execute("UPDATE sessions SET revoke = ?3 WHERE device = ?1 AND id = ?2", params![number(device)?, number(session)?, revoke.as_slice()])?;
             }
             Change::Codes { account, keep } => {
                 step.execute("DELETE FROM codes WHERE account = ?1 AND (?2 IS NULL OR number != ?2)", params![number(account)?, keep.map(number).transpose()?])?;
