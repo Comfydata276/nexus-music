@@ -60,37 +60,43 @@ fn preview_save_and_c6_upload_have_the_same_clean_text() -> std::io::Result<()> 
         (AT + 5, format!("Couldn't play “{album}” by {artist}")),
         (i64::MAX, format!("Couldn't play {text}")),
     ].into();
-    let session = Session::from_observations(&settings, true, &messages, Vec::new());
+    let observations = [
+        (AT, Line::Fault(Fault::new(FaultPlace::Playback, FaultShape::Decode))),
+        (AT + 2, Line::Note(Note::DownloadsFolderChanged)),
+        (AT + 5, Line::Fault(Fault::new(FaultPlace::Playback, FaultShape::Decode))),
+    ].into_iter().map(|(at, line)| (at as u64 * 1_000, line)).collect();
+    let session = Session::from_observations(&settings, true, &messages, observations);
     let dir = TestFolder::new()?;
     let crash = dir.0.join("crash.log");
     let saved = dir.0.join("data/diagnostics.txt");
     fs::write(&crash, [
         b"Old bytes \xff\n".as_slice(),
-        format!("2023-11-14 22:13:25 UTC version {key} thread {email} at {folder}\\src\\audio\\exclusive.rs:71: index out of bounds: {text}\n").as_bytes(),
+        format!("2023-11-14 22:13:25 UTC version {key} thread {email} at src/audio/exclusive.rs:71: index out of bounds: {text}\n").as_bytes(),
         format!("2023-11-14 22:13:26 UTC version 0.40.13 thread {token} at src/controller.rs:1: already borrowed: {song}\n").as_bytes(),
         format!("2023-11-14 22:13:27 UTC version 0.40.13 thread main at {folder}\\{artist}.rs:222: {album}\n{odd}{playlist}\n").as_bytes(),
         b"bad date UTC version 0.40.13 thread main at src/main.rs:76: no message\n",
     ].concat())?;
     let model = session.report(&crash);
-    let preview = model.text().unwrap();
+    let preview = session.text(&crash).unwrap();
     session.write_report(&crash, &saved)?;
     assert_eq!(fs::read(&saved)?, preview.as_bytes());
     assert_eq!(diag::Report::read(&preview).unwrap(), model);
     let upload = diag::Upload::new(RequestHead { speaks: SPEAKS, restore: 0 }, RequestId::new(1).unwrap(), &model).unwrap();
     assert_eq!(upload.text(), preview);
     assert_eq!(model.about.loss, LossCounts::default());
+    assert!(!preview.contains("Fault in playback: other"));
     for raw in [song, album, artist, playlist, folder, "ExampleLocal", server, email, key, token, "岬", "🪁", "AAAAAAAA", "123487"] {
         assert!(!preview.contains(raw), "included {raw:?}");
     }
     assert!(preview.bytes().all(|b| b == b'\n' || matches!(b, 32..=126)));
     for expected in [
         "HTTPS: yes",
-        "2023-11-14 22:13:24  App message shown  (3 times since 2023-11-14 22:13:21)",
+        "2023-11-14 22:13:25  App message shown  (6 times since 2023-11-14 22:13:20)",
         "2023-11-14 22:13:22  Downloads folder changed",
-        "2023-11-14 22:13:25  Fault in playback: other  (2 times since 2023-11-14 22:13:20)",
-        "2023-11-14 22:13:25  Fault in audio output: out of bounds",
-        "2023-11-14 22:13:26  Fault in app: borrow conflict",
-        "2023-11-14 22:13:27  Fault in app: panic",
+        "2023-11-14 22:13:25  Fault in playback: decode  (2 times since 2023-11-14 22:13:20)",
+        "2023-11-14 22:13:25  Fault in audio output: out of bounds at exclusive.rs:71",
+        "2023-11-14 22:13:26  Fault in app: borrow conflict at controller.rs:1",
+        "2023-11-14 22:13:27  Fault in app: panic at other:222",
     ] {
         assert!(preview.contains(expected), "missing {expected:?} in {preview:?}");
     }
@@ -120,10 +126,10 @@ fn the_hook_writes_no_panic_payload_even_to_the_crash_log() -> std::io::Result<(
     assert_eq!(line.lines().count(), 1);
     let (at, words) = line.trim_end_matches('\n').split_once('\t').unwrap();
     assert!(at.parse::<u64>().is_ok());
-    assert_eq!(words, "Fault in app: borrow conflict");
-    append_fault(&log, AT as u64 * 1_000, r"C:\Users\ExampleLocal\src\audio\engine.rs", PRIVATE)?;
+    assert!(words.starts_with("Fault in app: borrow conflict at tests.rs:"));
+    append_fault(&log, AT as u64 * 1_000, Some(("src/audio/engine.rs", 82)), PRIVATE)?;
     let text = fs::read_to_string(log)?;
-    assert!(text.ends_with("1700000000000\tFault in playback: panic\n"));
+    assert!(text.ends_with("1700000000000\tFault in playback: panic at engine.rs:82\n"));
     assert!(!text.contains("ExampleLocal"));
     Ok(())
 }
@@ -151,7 +157,7 @@ fn typed_window_observations_join_the_clean_record() {
     let expected = [
         Line::Note(Note::MediaButtonStarted),
         Line::Note(Note::MediaButtonNothingToResume),
-        Line::Fault(Fault { place: FaultPlace::Foreground, shape: FaultShape::Refused }),
+        Line::Fault(Fault::new(FaultPlace::Foreground, FaultShape::Refused)),
     ];
     for line in expected {
         observe(line);
@@ -160,4 +166,13 @@ fn typed_window_observations_join_the_clean_record() {
     let session = Session::from_observations(&config::Settings::default(), true, &VecDeque::new(), observations);
     let report = session.report(Path::new(""));
     assert_eq!(report.record.entries().iter().map(|entry| entry.line).collect::<Vec<_>>(), expected);
+}
+
+#[test]
+fn connection_fault_uses_the_error_variant_and_ignores_its_words() {
+    use crate::subsonic::ApiError;
+    let message = "Paper Satellites C:\\Users\\ExampleLocal".to_string();
+    assert_eq!(connection_shape(&ApiError::Network(message.clone())), FaultShape::Connection);
+    assert_eq!(connection_shape(&ApiError::NotSubsonic(message.clone())), FaultShape::UnexpectedAnswer);
+    assert_eq!(connection_shape(&ApiError::Server { code: 40, message }), FaultShape::Refused);
 }

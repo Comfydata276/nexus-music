@@ -2880,6 +2880,13 @@ export component SettingsPage inherits Rectangle {
 
                     if root.show-report: VerticalLayout {
                         padding-top: 16px;
+                        spacing: 12px;
+                        Text {
+                            text: "Nexus Music can send this device report with versions, settings and fault counts, without names, titles or addresses.";
+                            color: Theme.muted;
+                            font-size: 13px;
+                            wrap: word-wrap;
+                        }
                         Text {
                             text: Settings.diagnostics-preview == "" ? "Reading diagnostics…" : Settings.diagnostics-preview;
                             color: Theme.text;

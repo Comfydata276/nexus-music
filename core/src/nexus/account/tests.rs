@@ -1033,3 +1033,25 @@ fn speaks_meets_on_a_shared_endpoint_and_refuses_disjoint_ranges() {
         assert_eq!(b.meets(&a), meets);
     }
 }
+
+#[test]
+fn a_code_typed_in_groups_reads_as_the_twelve() {
+    let twelve = || OneTimeCode::new("ABCDEFGHJKMN");
+    for typed in ["ABCD-EFGH-JKMN", "abcd efgh jkmn", " abcd - efgh - jkmn ", "ABCDEFGHJKMN"] {
+        assert_eq!(OneTimeCode::typed(typed), twelve(), "{typed}");
+    }
+    assert_eq!(OneTimeCode::typed("ABCD-EFGH-JKMN").unwrap().expose(), "ABCDEFGHJKMN", "the wire form is the twelve alone");
+    let too_long = "A".repeat(10_000);
+    for bad in [
+        "ABCD-EFGH-JKM",           // too short
+        "ABCD-EFGH-JKMNP",         // a thirteenth
+        "\u{410}BCD-EFGH-JKMN",    // a Cyrillic look-alike, not tidied
+        "ABCD\u{a0}EFGH\u{a0}JKMN", // a space that is not ASCII
+        "ABCD_EFGH_JKMN",
+        "",
+        "------------",
+        too_long.as_str(),
+    ] {
+        assert!(OneTimeCode::typed(bad).is_none(), "{bad}");
+    }
+}
