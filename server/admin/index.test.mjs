@@ -9,7 +9,7 @@ const route = readFileSync(new URL("../src/admin.rs", import.meta.url), "utf8");
 const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
 const style = html.match(/<style>([\s\S]*?)<\/style>/)[1];
 
-function loadPage(fetch, { requestsEnabled = false, origin = "https://owner.example.test:8443" } = {}) {
+function loadPage(fetch, { requestsEnabled = false, listeningEnabled = false, origin = "https://owner.example.test:8443" } = {}) {
   const elements = new Map();
   const windowEvents = new Map();
   const documentEvents = new Map();
@@ -23,7 +23,7 @@ function loadPage(fetch, { requestsEnabled = false, origin = "https://owner.exam
     tag, id, textContent: "", value: "", disabled: false, hidden: id === "admin", open: false,
     events: new Map(), children: [],
     append(...children) { this.children.push(...children); },
-    replaceChildren() { this.children = []; },
+    replaceChildren(...children) { this.children = children; },
     addEventListener(name, handler) { this.events.set(name, handler); },
     reset() {
       for (const key of fields[id] ?? []) {
@@ -51,7 +51,7 @@ function loadPage(fetch, { requestsEnabled = false, origin = "https://owner.exam
       writeln() { assert.fail("Untrusted text reached document.writeln"); },
       getElementById: from,
       createElement(tag) {
-        assert.ok(["li", "details", "summary", "div", "button", "span", "p"].includes(tag), tag);
+        assert.ok(["li", "details", "summary", "div", "button", "span", "p", "option", "strong", "meter"].includes(tag), tag);
         return node(tag);
       },
     },
@@ -72,7 +72,11 @@ function loadPage(fetch, { requestsEnabled = false, origin = "https://owner.exam
     fetch,
   };
   const instrumentation = "globalThis.forTest = { parseReply, typedCode, hasApproval: () => approval !== null };";
-  const source = requestsEnabled ? script.replace("const enableRequestChanges = false;", "const enableRequestChanges = true;") : script;
+  let source = script;
+  if (requestsEnabled) source = source.replace("const enableRequestChanges = false;", "const enableRequestChanges = true;");
+  if (listeningEnabled) source = source.replace("const enableListening = false;", "const enableListening = true;");
+  from("listening-days").value = "30";
+  from("listening-top").value = "artists";
   runInNewContext(source.replace(/\}\)\(\);\s*$/, instrumentation + "})();"), context);
   const findButton = (node, label) => {
     if (node.tag === "button" && node.textContent === label) return node;
@@ -102,6 +106,10 @@ function loadPage(fetch, { requestsEnabled = false, origin = "https://owner.exam
       return from(id).events.get("submit")({ preventDefault() {} });
     },
     click(id) { return from(id).events.get("click")(); },
+    change(id, value) {
+      from(id).value = value;
+      return from(id).events.get("change")();
+    },
     press(container, label) {
       const button = findButton(from(container), label);
       assert.ok(button, label);
@@ -690,4 +698,93 @@ test("requests shows one container instruction and no key field when Lidarr has 
   assert.equal(page.from("requests-availability").hidden, false);
   assert.match(page.from("requests-availability").textContent, /server owner sets the Lidarr address in the container/);
   assert.ok(page.button("requests-list", "Turn requests off"));
+});
+
+const listeningTime = 1788883200000;
+const examplePlay = {
+  id: 8, account: 7, name: "Jamie <script>example()</script>", at_ms: listeningTime - 1000,
+  title: "Night Walk <b>Live</b>", artist: "The Lanterns", album: "Porch Light",
+};
+const listeningOverview = (starts = 11, days = 30) => ({
+  start_ms: listeningTime - days * 86400000, end_ms: listeningTime, starts,
+  artists: starts ? [{ artist: examplePlay.artist, starts }] : [],
+  albums: starts ? [{ artist: examplePlay.artist, album: examplePlay.album, starts }] : [],
+  songs: starts ? [{ title: examplePlay.title, artist: examplePlay.artist, album: examplePlay.album, starts }] : [],
+  people: { rows: starts ? [{ account: 7, name: examplePlay.name, starts }] : [], next: null },
+  recent: { rows: starts ? [examplePlay] : [], next: starts ? "recent_abc" : null },
+});
+const doneListening = data => new Response(JSON.stringify({ done: data }));
+const textOf = node => node.textContent + node.children.map(textOf).join("");
+
+test("listening reads one period at a time and pages older plays and people", async () => {
+  const mock = adminStandIn();
+  const calls = [];
+  const page = loadPage((path, options) => {
+    if (path !== "/nexus/api/admin/listening") return mock.fetch(path, options);
+    assert.equal(options.headers["X-Nexus-Admin"], "1");
+    assert.equal(options.headers.Authorization, "Bearer " + encodedToken);
+    const body = JSON.parse(options.body);
+    calls.push(body);
+    if (body.page?.recent) {
+      return doneListening({ rows: [{ ...examplePlay, id: 3, title: "Older play", at_ms: listeningTime - 3000 }], next: null });
+    }
+    if (body.page?.people) {
+      return doneListening({ rows: [{ account: 9, name: "Lee", starts: 2 }], next: null });
+    }
+    const overview = listeningOverview(body.days === 7 ? 0 : 11, body.days);
+    if (body.account === null && overview.starts) overview.people.next = "people_abc";
+    return doneListening(overview);
+  }, { listeningEnabled: true });
+  await page.signIn("owner@example.test", adminPassword);
+  await settle();
+  assert.equal(calls.length, 0);
+  page.click("listening-jump");
+  await settle();
+  assert.deepEqual(calls.at(-1), { head: { speaks: [1, 1], restore: 2 }, account: null, days: 30, page: null });
+  assert.equal(page.from("listening-total").textContent, "11 songs started");
+  assert.match(textOf(page.from("listening-ranked")), /The Lanterns/);
+  page.change("listening-top", "albums");
+  assert.match(textOf(page.from("listening-ranked")), /Porch Light/);
+  page.change("listening-top", "songs");
+  assert.match(textOf(page.from("listening-ranked")), /Night Walk <b>Live<\/b>/);
+  assert.match(textOf(page.from("listening-recent")), /Jamie <script>example\(\)<\/script>/);
+  await page.click("listening-recent-more");
+  assert.deepEqual(calls.at(-1).page, { recent: "recent_abc" });
+  assert.equal(page.from("listening-recent").children.length, 2);
+  assert.ok(page.from("listening-recent-more").hidden);
+  await page.click("listening-people-more");
+  assert.deepEqual(calls.at(-1).page, { people: "people_abc" });
+  assert.match(textOf(page.from("listening-people")), /Lee/);
+  page.press("listening-people", examplePlay.name);
+  await settle();
+  assert.equal(calls.at(-1).account, 7);
+  assert.ok(page.from("listening-people-panel").hidden);
+  await page.change("listening-days", "7");
+  assert.deepEqual(calls.at(-1), { head: { speaks: [1, 1], restore: 2 }, account: 7, days: 7, page: null });
+  assert.match(textOf(page.from("listening-ranked")), /No music to rank/);
+  page.windowEvents.get("pagehide")();
+  assert.ok(page.from("listening-panel").hidden);
+  assert.equal(page.from("listening-person").children.length, 1);
+  assert.equal(page.from("listening-total").textContent, "");
+  assert.equal(page.from("listening-recent").children.length, 0);
+});
+
+test("changing the listening period drops a late reply for the old period", async () => {
+  const mock = adminStandIn();
+  let resolveOld;
+  const page = loadPage((path, options) => {
+    if (path !== "/nexus/api/admin/listening") return mock.fetch(path, options);
+    return JSON.parse(options.body).days === 30
+      ? new Promise(resolve => { resolveOld = resolve; })
+      : doneListening(listeningOverview(0, 7));
+  }, { listeningEnabled: true });
+  await page.signIn("owner@example.test", adminPassword);
+  await settle();
+  page.click("listening-jump");
+  await settle();
+  await page.change("listening-days", "7");
+  resolveOld(doneListening(listeningOverview()));
+  await settle();
+  assert.equal(page.from("listening-total").textContent, "0 songs started");
+  assert.equal(page.from("listening-recent").children.length, 0);
 });

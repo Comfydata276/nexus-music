@@ -94,6 +94,49 @@ button:disabled { opacity: .6; cursor: default; }
 article p, dt { color: var(--muted); }
 dd { margin: 0 0 .65rem; }
 dd, li { overflow-wrap: anywhere; }
+.account-links { display: flex; flex-wrap: wrap; gap: .6rem; }
+#listening-panel { grid-column: 1 / -1; }
+.listening-filters, .listening-columns { display: grid; gap: 1rem; }
+.listening-filters { grid-template-columns: repeat(auto-fit, minmax(min(100%, 11rem), 1fr)); }
+.listening-filters select, #listening-top {
+  width: 100%;
+  min-height: 2.75rem;
+  padding: .45rem .6rem;
+  color: inherit;
+  background: #0b0811;
+  border: 1px solid var(--line);
+  border-radius: .4rem;
+  font: inherit;
+}
+#listening-status, #listening-total { margin-top: .8rem; }
+.listening-columns { margin-block: 1rem; }
+.listening-columns > section { min-width: 0; border-top: 1px solid var(--line); padding-top: .85rem; }
+#listening-panel h3 { margin: 0; font-size: 1rem; }
+#listening-people-panel { border-top: 1px solid var(--line); padding-top: .85rem; }
+.listening-list { padding: 0; margin: .4rem 0; list-style: none; }
+.listening-list p { color: var(--muted); font-size: .9rem; }
+.listening-row { display: flex; align-items: baseline; justify-content: space-between; gap: .7rem; }
+.listening-row > :first-child { min-width: 0; overflow-wrap: anywhere; }
+.listening-number { flex: none; font-variant-numeric: tabular-nums; }
+.listening-list meter { width: 100%; height: .55rem; display: block; margin-top: .6rem; }
+.listening-list meter::-webkit-meter-bar { background: #0b0811; border: 0; }
+.listening-list meter::-webkit-meter-optimum-value { background: var(--accent); }
+.listening-list .listening-person {
+  text-align: left;
+  color: #d7c7ff;
+  font-weight: 600;
+  background: transparent;
+  border: 0;
+  text-decoration: underline;
+  padding: .2rem 0;
+  margin: 0;
+}
+@media (min-width: 52rem) {
+  .listening-filters { grid-template-columns: 1fr 14rem; }
+  .listening-columns { grid-template-columns: 1.1fr 1fr; gap: 1.75rem; }
+  #listening-people { display: grid; grid-template-columns: 1fr 1fr; column-gap: 1.75rem; }
+  #listening-people li:nth-child(2) { border-top: 0; }
+}
 </style>
 </head>
 <body>
@@ -124,7 +167,10 @@ dd, li { overflow-wrap: anywhere; }
   <section id="admin" hidden>
     <div class="account-bar">
       <p id="identity"></p>
-      <button id="signout" class="secondary" type="button">Sign out</button>
+      <div class="account-links">
+        <button id="listening-jump" class="secondary" type="button" hidden>Listening</button>
+        <button id="signout" class="secondary" type="button">Sign out</button>
+      </div>
     </div>
     <p id="change-status" role="status" tabindex="-1"></p>
     <div id="sections">
@@ -184,6 +230,51 @@ dd, li { overflow-wrap: anywhere; }
           </form>
         </details>
       </article>
+      <article id="listening-panel" hidden>
+        <h2 id="listening-title" tabindex="-1">Listening</h2>
+        <div class="listening-filters">
+          <label>Who
+            <select id="listening-person" autocomplete="off"><option value="">Everyone</option></select>
+          </label>
+          <label>Period
+            <select id="listening-days" autocomplete="off">
+              <option value="7">Last 7 days</option>
+              <option value="30" selected>Last 30 days</option>
+              <option value="90">Last 90 days</option>
+            </select>
+          </label>
+        </div>
+        <p id="listening-status" role="status"></p>
+        <button id="listening-retry" type="button" class="secondary" hidden>Try again</button>
+        <div id="listening-results" hidden>
+          <p id="listening-total"></p>
+          <div class="listening-columns">
+            <section>
+              <h3>Most played</h3>
+              <label>Show
+                <select id="listening-top" autocomplete="off">
+                  <option value="artists">Artists</option>
+                  <option value="albums">Albums</option>
+                  <option value="songs">Songs</option>
+                </select>
+              </label>
+              <ol id="listening-ranked" class="listening-list"></ol>
+            </section>
+            <section>
+              <h3>Recent plays</h3>
+              <ul id="listening-recent" class="listening-list"></ul>
+              <p id="listening-recent-status" role="status"></p>
+              <button id="listening-recent-more" type="button" class="secondary" hidden>Older plays</button>
+            </section>
+          </div>
+          <section id="listening-people-panel">
+            <h3>Listening by person</h3>
+            <ul id="listening-people" class="listening-list"></ul>
+            <p id="listening-people-status" role="status"></p>
+            <button id="listening-people-more" type="button" class="secondary" hidden>More people</button>
+          </section>
+        </div>
+      </article>
     </div>
     <dialog id="reports" aria-labelledby="reports-title">
       <h2 id="reports-title">Device reports</h2>
@@ -241,6 +332,7 @@ dd, li { overflow-wrap: anywhere; }
   const setupForm = byId("setup-form");
   const setupSubmit = byId("setup-submit");
   const enableRequestChanges = false;
+  const enableListening = false;
   const email = byId("email");
   const password = byId("password");
   const submit = byId("submit");
@@ -555,6 +647,261 @@ dd, li { overflow-wrap: anywhere; }
     }
   }
 
+  const listeningPanel = byId("listening-panel");
+  const listeningPerson = byId("listening-person");
+  const listeningDays = byId("listening-days");
+  const listeningTop = byId("listening-top");
+  const listeningOptions = new Map();
+  const listeningNumbers = new Intl.NumberFormat();
+  const listeningLists = {
+    people: { title: "More people", next: null, last: null },
+    recent: { title: "Older plays", next: null, last: null },
+  };
+  let listening = null;
+
+  function listenPerson(account, name) {
+    const key = account.toString();
+    if (!listeningOptions.has(key)) {
+      const option = document.createElement("option");
+      option.value = key;
+      writeText(option, name);
+      listeningPerson.append(option);
+      listeningOptions.set(key, option);
+    }
+    return key;
+  }
+
+  function resetListening() {
+    listening = null;
+    listeningPanel.hidden = true;
+    const everyone = document.createElement("option");
+    everyone.value = "";
+    writeText(everyone, "Everyone");
+    listeningPerson.replaceChildren(everyone);
+    listeningOptions.clear();
+    listeningPerson.value = "";
+    listeningDays.value = "30";
+    listeningTop.value = "artists";
+    clearListeningResults();
+  }
+
+  function clearListeningResults() {
+    byId("listening-results").hidden = true;
+    writeText(byId("listening-total"), "");
+    writeText(byId("listening-status"), "");
+    byId("listening-ranked").replaceChildren();
+    for (const kind of Object.keys(listeningLists)) {
+      byId("listening-" + kind).replaceChildren();
+      writeText(byId("listening-" + kind + "-status"), "");
+      const more = byId("listening-" + kind + "-more");
+      more.hidden = true;
+      more.disabled = false;
+      listeningLists[kind].next = null;
+      listeningLists[kind].last = null;
+    }
+  }
+
+  function startsLabel(starts) {
+    return listeningNumbers.format(starts) + (starts === 1n ? " start" : " starts");
+  }
+
+  function listeningText(value, maximum) {
+    if (typeof value !== "string" || Array.from(value).length > maximum) throw new Error();
+    return value;
+  }
+
+  function listeningTime(value) {
+    if (!isU64(value) || value > 8640000000000000n) throw new Error();
+    return new Date(Number(value));
+  }
+
+  function listeningTrack(row, names) {
+    if (!isU64(row.starts) || row.starts === 0n) throw new Error();
+    const labels = names.map(name => listeningText(row[name], 200));
+    return { title: labels[0], detail: labels.slice(1).filter(Boolean).join(" · "), starts: row.starts };
+  }
+
+  function listeningRows(result, kind, accountScope) {
+    if (!Array.isArray(result.rows) || result.rows.length > 25 ||
+        (result.next !== null &&
+          (typeof result.next !== "string" || !/^[A-Za-z0-9_-]{1,192}$/.test(result.next) || !result.rows.length))) {
+      throw new Error();
+    }
+    const rows = result.rows.map(row => {
+      const account = id(row.account);
+      if (accountScope !== null && account !== accountScope) throw new Error();
+      const name = listeningText(row.name, 128);
+      if (kind === "people") {
+        if (!isU64(row.starts) || row.starts === 0n) throw new Error();
+        return { account, name, starts: row.starts };
+      }
+      return {
+        account, name, when: listeningTime(row.at_ms), event: id(row.id),
+        title: listeningText(row.title, 200), artist: listeningText(row.artist, 200), album: listeningText(row.album, 200),
+      };
+    });
+    let last = listeningLists[kind].last;
+    for (const row of rows) {
+      if (last) {
+        const advances = kind === "people"
+          ? row.starts < last.starts || (row.starts === last.starts && row.account > last.account)
+          : row.when < last.when || (row.when.getTime() === last.when.getTime() && row.event < last.event);
+        if (!advances) throw new Error();
+      }
+      last = row;
+    }
+    return { rows, next: result.next, last };
+  }
+
+  function listeningLine(list, label, number, detail, action) {
+    const item = document.createElement("li");
+    const line = document.createElement("div");
+    line.className = "listening-row";
+    const title = action ? makeButton(label, action) : document.createElement("span");
+    if (action) title.className = "listening-person";
+    else writeText(title, label);
+    line.append(title);
+    if (number) {
+      const count = document.createElement("strong");
+      count.className = "listening-number";
+      writeText(count, number);
+      line.append(count);
+    }
+    item.append(line);
+    if (detail) {
+      const note = document.createElement("p");
+      writeText(note, detail);
+      item.append(note);
+    }
+    list.append(item);
+    return item;
+  }
+
+  function renderListeningTop() {
+    if (!listening?.top) return;
+    const rows = listening.top[listeningTop.value];
+    if (!rows) return;
+    const list = byId("listening-ranked");
+    list.replaceChildren();
+    for (const row of rows) {
+      const item = listeningLine(list, row.title || "Unknown", startsLabel(row.starts), row.detail);
+      const meter = document.createElement("meter");
+      meter.max = 100;
+      meter.value = Number(row.starts * 100n / rows[0].starts);
+      meter.ariaHidden = "true";
+      item.append(meter);
+    }
+    if (!rows.length) appendRow(list, "No music to rank in this period.");
+  }
+
+  function renderListeningRows(kind, result) {
+    const list = byId("listening-" + kind);
+    const format = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "numeric" });
+    for (const row of result.rows) {
+      if (kind === "people") {
+        listeningLine(list, row.name, startsLabel(row.starts), "", () => {
+          listeningPerson.value = listenPerson(row.account, row.name);
+          void loadListening();
+          listeningPerson.focus();
+        });
+      } else {
+        const detail = [row.artist, row.album, row.name, format.format(row.when)].filter(Boolean).join(" · ");
+        listeningLine(list, row.title || "Unknown song", "", detail);
+      }
+    }
+    listeningLists[kind].next = result.next;
+    listeningLists[kind].last = result.last;
+    const more = byId("listening-" + kind + "-more");
+    more.hidden = result.next === null;
+    writeText(more, listeningLists[kind].title);
+    writeText(byId("listening-" + kind + "-status"), list.children.length ? "" :
+      kind === "recent" ? "No recent plays in this period." : "Nobody has started a song in this period.");
+  }
+
+  async function loadListening() {
+    const current = session;
+    if (!enableListening || !current) return;
+    clearListeningResults();
+    byId("listening-retry").hidden = true;
+    writeText(byId("listening-status"), "Loading listening…");
+    const view = { account: null, days: Number(listeningDays.value), top: null };
+    listening = view;
+    try {
+      if (listeningPerson.value) view.account = id(BigInt(listeningPerson.value));
+      if (![7, 30, 90].includes(view.days)) throw new Error();
+      const reply = await readAdmin(current, "/nexus/api/admin/listening", {
+        account: view.account, days: view.days, page: null,
+      }, 1024 * 1024);
+      if (session !== current || listening !== view) return;
+      if (!isU64(reply.starts) ||
+          listeningTime(reply.end_ms) <= listeningTime(reply.start_ms)) throw new Error();
+      const fields = { artists: ["artist"], albums: ["album", "artist"], songs: ["title", "artist", "album"] };
+      view.top = Object.fromEntries(Object.entries(fields).map(([kind, names]) => {
+        const rows = reply[kind];
+        if (!Array.isArray(rows) || rows.length > 10) throw new Error();
+        const ranked = rows.map(row => listeningTrack(row, names));
+        if (ranked.some((row, index) => row.starts > (index ? ranked[index - 1].starts : reply.starts))) throw new Error();
+        return [kind, ranked];
+      }));
+      const people = listeningRows(reply.people, "people", view.account);
+      const recent = listeningRows(reply.recent, "recent", view.account);
+      renderListeningTop();
+      renderListeningRows("people", people);
+      renderListeningRows("recent", recent);
+      byId("listening-people-panel").hidden = view.account !== null;
+      writeText(byId("listening-total"), listeningNumbers.format(reply.starts) +
+        (reply.starts === 1n ? " song started" : " songs started"));
+      writeText(byId("listening-status"), "");
+      byId("listening-results").hidden = false;
+    } catch {
+      if (session !== current || listening !== view) return;
+      writeText(byId("listening-status"), "Could not load listening for this period.");
+      byId("listening-retry").hidden = false;
+    }
+  }
+
+  async function moreListening(kind) {
+    const current = session;
+    const view = listening;
+    const next = listeningLists[kind].next;
+    const more = byId("listening-" + kind + "-more");
+    const status = byId("listening-" + kind + "-status");
+    if (!current || !view || next === null || more.disabled) return;
+    more.disabled = true;
+    writeText(status, "Loading…");
+    try {
+      const reply = await readAdmin(current, "/nexus/api/admin/listening", {
+        account: view.account, days: view.days, page: { [kind]: next },
+      }, 1024 * 1024);
+      if (session !== current || listening !== view) return;
+      const page = listeningRows(reply, kind, view.account);
+      if (page.next === next) throw new Error();
+      renderListeningRows(kind, page);
+    } catch {
+      if (session !== current || listening !== view) return;
+      writeText(status, "Could not load more. Select Try again.");
+      writeText(more, "Try again");
+    } finally {
+      if (session === current && listening === view) more.disabled = false;
+    }
+  }
+
+  const listeningJump = byId("listening-jump");
+  listeningJump.hidden = !enableListening;
+  listeningJump.addEventListener("click", () => {
+    if (!enableListening || !session) return;
+    listeningPanel.hidden = false;
+    if (!listening) void loadListening();
+    byId("listening-title").focus();
+  });
+  listeningPerson.addEventListener("change", loadListening);
+  listeningDays.addEventListener("change", loadListening);
+  listeningTop.addEventListener("change", renderListeningTop);
+  byId("listening-retry").addEventListener("click", loadListening);
+  for (const kind of Object.keys(listeningLists)) {
+    byId("listening-" + kind + "-more").addEventListener("click", () => moreListening(kind));
+  }
+
   function loadAccounts() {
     return loadPage(accountPage, "/nexus/api/admin/accounts", accountRow, "accounts");
   }
@@ -611,6 +958,7 @@ dd, li { overflow-wrap: anywhere; }
     const account = row.after;
     const person = row.name + " (" + row.email + ")";
     accountNames.set(account, row.name);
+    if (enableListening) listenPerson(account, row.name + " (" + row.email + ")");
     for (const owner of deviceOwners.get(account) ?? []) writeText(owner, " · " + row.name);
     const entry = appendRow(accountPage.list, row.label);
     const menu = document.createElement("details");
@@ -794,6 +1142,14 @@ dd, li { overflow-wrap: anywhere; }
       requests.replaceChildren();
       accountNames.clear();
       void loadAccounts();
+    }
+    if (enableListening && view === "accounts-and-devices") {
+      const listeningOpen = !listeningPanel.hidden;
+      resetListening();
+      if (listeningOpen) {
+        listeningPanel.hidden = false;
+        void loadListening();
+      }
     }
     if (view === "devices" || view === "accounts-and-devices") {
       resetPage(devicePage);
@@ -1008,6 +1364,7 @@ dd, li { overflow-wrap: anywhere; }
     closeLogin();
     clearCode();
     closeReports();
+    if (enableListening) resetListening();
     for (const form of [createForm, addressForm, lidarrForm]) form.reset();
     byId("new-account-details").open = false;
     lidarrDetails.open = false;
