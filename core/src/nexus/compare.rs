@@ -9,8 +9,7 @@
 
 use std::collections::BTreeMap;
 
-use super::account::DeviceId;
-use super::kept::{Apart, ApartDevice, Rows, Startup, Status, StoreComparison, at_start};
+use super::kept::{Apart, Rows, Startup, Status, StoreComparison, at_start};
 
 /// The one change the store has been told of first and the data may not yet have: written
 /// with the store's first half of the change, cleared with its last.
@@ -310,75 +309,6 @@ pub fn needs_taking(store: Option<&StoreView>, data: &DataView) -> bool {
         Some(store) if store.pending.is_some() && !matches!(store.pending, Some(Pending::Change { .. })) => false,
         Some(store) => compare(store, data).contradiction.is_some(),
     }
-}
-
-/// 12.4, the owner's take-as-is: an account's record in the store made again from its rows
-/// in the data as it is.
-///
-/// - **With no authority** (the store lost, unreadable, or another backend's): nothing says
-///   which passwords changed or which codes were used since, so none of them is trusted:
-///   "every account then waits for a new one-time code". Its count of passwords moves one
-///   on, so that the verifier the data holds no longer matches (`kept`'s fence) and is
-///   removed with every code in the step that ends the sessions; it waits for a reset.
-/// - **With `authority`**, a readable record of the same backend's store: what it took away
-///   is kept. A tombstone stays a tombstone; switched off stays off; an admin's role taken
-///   away stays away; each count at the higher of the two (so a password changed since, or a
-///   life moved on, fences the data's as `kept` loads it); a device's numbers at the higher.
-///
-/// Every session ends anyway (the restore that follows): no permit is kept, and no device
-/// is known again until it signs in (a force-out the store took is kept with it).
-///
-/// The restore that follows is `kept::Account::restore(.., RestoreMode::Adopt, ..)`, which
-/// itself makes every account wait for a new code (the final `kept`). What is here is the
-/// baseline it starts from; the count of passwords moved on with no authority is the stricter
-/// fence carried until C3r's follow-up round (`t3/nexus-core-fu`) lands.
-pub fn recovery_baseline(rows: &Rows, authority: Option<&Apart>) -> Apart {
-    let mut account = rows.account.clone();
-    let device = |id: &DeviceId, row: &super::kept::DeviceRow| {
-        let session = row.session.as_ref();
-        let record = ApartDevice {
-            number: row.number,
-            known: false,
-            last_session: session.map_or(0, |session| session.id.get()),
-            last_leave: session.and_then(|session| session.leave.as_ref()).map_or(0, |leave| leave.fields().5),
-            permit: None,
-        };
-        (*id, record)
-    };
-    let mut devices: std::collections::BTreeMap<DeviceId, ApartDevice> = rows.devices.iter().map(|(id, row)| device(id, row)).collect();
-    match authority {
-        None => {
-            account.password_changes = account.password_changes.saturating_add(1);
-            account.password_reset_required = true;
-            account.code = None;
-        }
-        Some(kept) => {
-            let was = &kept.account;
-            if was.status == Status::Deleted {
-                account.status = Status::Deleted;
-            } else if was.status == Status::Off {
-                account.status = Status::Off;
-            }
-            account.admin &= was.admin;
-            account.life = account.life.max(was.life);
-            account.password_changes = account.password_changes.max(was.password_changes);
-            account.revision = account.revision.max(was.revision);
-            account.music_login = account.music_login.max(was.music_login);
-            account.music_recovery = account.music_recovery.or(was.music_recovery);
-            account.password_reset_required |= was.password_reset_required;
-            // A code is live only if the store has it live too, as the same code.
-            account.code = account.code.filter(|code| was.code == Some(*code));
-            account.history_held |= was.history_held;
-            for (id, record) in &kept.devices {
-                let entry = devices.entry(*id).or_insert_with(|| ApartDevice { permit: None, known: false, ..record.clone() });
-                entry.known = record.known && rows.devices.contains_key(id);
-                entry.number = entry.number.max(record.number);
-                entry.last_session = entry.last_session.max(record.last_session);
-                entry.last_leave = entry.last_leave.max(record.last_leave);
-            }
-        }
-    }
-    Apart { account, devices }
 }
 
 #[cfg(test)]

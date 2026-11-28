@@ -32,7 +32,7 @@ use std::collections::BTreeMap;
 use nexus_core::nexus::compare::DataView;
 use nexus_core::nexus::account::{AccountId, DeviceId, Email, SECRET_BYTES, SessionId};
 use nexus_core::nexus::music::MusicInstallation;
-use nexus_core::nexus::kept::{AccountState, DeviceRow, Fingerprint, Leave, LiveCode, MusicRecovery, Rows, Session, Status};
+use nexus_core::nexus::kept::{SessionKind, AccountState, DeviceRow, Fingerprint, Leave, LiveCode, MusicRecovery, Rows, Session, Status};
 use nexus_core::nexus::proto::BackendId;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
@@ -75,7 +75,9 @@ CREATE TABLE meta (
     written_at INTEGER NOT NULL,
     restored_at INTEGER,
     restored_from INTEGER,
-    music_public TEXT
+    music_public TEXT,
+    diagnostics_default INTEGER CHECK (diagnostics_default IN (0, 1)),
+    requests_on INTEGER CHECK (requests_on IN (0, 1))
 ) STRICT;
 CREATE TABLE accounts (
     number INTEGER PRIMARY KEY CHECK (number > 0),
@@ -128,6 +130,7 @@ CREATE TABLE sessions (
     hash BLOB NOT NULL UNIQUE CHECK (length(hash) = 32),
     last_used INTEGER NOT NULL,
     sign_out BLOB NOT NULL CHECK (length(sign_out) = 32),
+    kind TEXT CHECK (kind IN ('app', 'page')),
     leave_for TEXT,
     leave_life INTEGER,
     leave_revision INTEGER,
@@ -599,7 +602,7 @@ pub fn rows_of(connection: &Connection, meta: &Meta, number: u64) -> rusqlite::R
     let Some(account) = found else { return Ok(None) };
     let mut rows = Rows { account, devices: BTreeMap::new() };
     let mut statement = connection.prepare(
-        "SELECT devices.id, devices.number, devices.secret, sessions.id, sessions.hash, sessions.last_used, sessions.sign_out, sessions.leave_for, sessions.leave_life, sessions.leave_revision, sessions.leave_admin, sessions.leave_granted, sessions.leave_serial, sessions.leave_hash
+        "SELECT devices.id, devices.number, devices.secret, sessions.id, sessions.hash, sessions.last_used, sessions.sign_out, sessions.leave_for, sessions.leave_life, sessions.leave_revision, sessions.leave_admin, sessions.leave_granted, sessions.leave_serial, sessions.leave_hash, sessions.kind
          FROM devices LEFT JOIN sessions ON sessions.device = devices.id WHERE devices.account = ?1",
     )?;
     let found = statement.query_map([self::number(number)?], |row| {
@@ -607,9 +610,15 @@ pub fn rows_of(connection: &Connection, meta: &Meta, number: u64) -> rusqlite::R
             let bytes: Vec<u8> = row.get(at)?;
             bytes.try_into().map_err(|_| rusqlite::Error::InvalidColumnType(at, "fingerprint".into(), rusqlite::types::Type::Blob))
         };
-        let session = match row.get::<_, Option<i64>>(3)? {
+        // A session row with no kind (written before the kind was kept) is an ended session:
+        // it never defaults to an app's (the audit of core-fu, M3).
+        let kind = match row.get::<_, Option<String>>(14)?.as_deref() {
             None => None,
-            Some(id) => {
+            Some(word) => Some(unkind(word).ok_or_else(|| rusqlite::Error::InvalidColumnType(14, "kind".into(), rusqlite::types::Type::Text))?),
+        };
+        let session = match (row.get::<_, Option<i64>>(3)?, kind) {
+            (None, _) | (_, None) => None,
+            (Some(id), Some(kind)) => {
                 let leave = match row.get::<_, Option<String>>(7)? {
                     None => None,
                     Some(purpose) => {
@@ -619,7 +628,7 @@ pub fn rows_of(connection: &Connection, meta: &Meta, number: u64) -> rusqlite::R
                     }
                 };
                 let id = SessionId::new(unsigned(id)?).ok_or_else(|| rusqlite::Error::IntegralValueOutOfRange(3, 0))?;
-                Some(Session { id, hash: Fingerprint::from_bytes(blob(4)?), last_used: unsigned(row.get(5)?)?, sign_out: Fingerprint::from_bytes(blob(6)?), leave })
+                Some(Session { id, kind, hash: Fingerprint::from_bytes(blob(4)?), last_used: unsigned(row.get(5)?)?, sign_out: Fingerprint::from_bytes(blob(6)?), leave })
             }
         };
         let id = DeviceId::new(unsigned(row.get(0)?)?).ok_or_else(|| rusqlite::Error::IntegralValueOutOfRange(0, 0))?;
@@ -706,6 +715,10 @@ pub enum Change<'a> {
     MusicLogin { account: u64, install: &'a MusicInstallation, internal: &'a str },
     /// The music server's address people use (9.3), backend-wide. Made by `persist` only.
     MusicPublic { address: &'a str },
+    /// The admin's default for Diagnostics (14), backend-wide (`hello` says it). `persist` only.
+    DiagnosticsDefault { on: bool },
+    /// The admin's switch for requests (step 4), backend-wide. `persist` only.
+    Requests { on: bool },
 }
 
 impl std::fmt::Debug for Change<'_> {
@@ -725,6 +738,8 @@ impl std::fmt::Debug for Change<'_> {
             Change::MusicChecked { account, .. } => f.debug_struct("MusicChecked").field("account", account).finish_non_exhaustive(),
             Change::MusicLogin { account, install, .. } => f.debug_struct("MusicLogin").field("account", account).field("count", &install.binding.count).finish_non_exhaustive(),
             Change::MusicPublic { .. } => f.debug_struct("MusicPublic").finish_non_exhaustive(),
+            Change::DiagnosticsDefault { on } => f.debug_struct("DiagnosticsDefault").field("on", on).finish(),
+            Change::Requests { on } => f.debug_struct("Requests").field("on", on).finish(),
         }
     }
 }
@@ -732,6 +747,21 @@ impl std::fmt::Debug for Change<'_> {
 /// An email as the data keeps it: as C7 tidies one, and nothing else.
 fn canonical(text: &str) -> Option<Email> {
     Email::new(text).filter(|email| email.as_str() == text)
+}
+
+fn kind_word(kind: SessionKind) -> &'static str {
+    match kind {
+        SessionKind::App => "app",
+        SessionKind::AdminPage => "page",
+    }
+}
+
+fn unkind(word: &str) -> Option<SessionKind> {
+    match word {
+        "app" => Some(SessionKind::App),
+        "page" => Some(SessionKind::AdminPage),
+        _ => None,
+    }
 }
 
 fn status_word(status: Status) -> &'static str {
@@ -800,8 +830,8 @@ impl Change<'_> {
                             let leave = session.leave.as_ref().map(|leave| leave.fields());
                             // With the session, the fingerprint of the secret that can only end it (11).
                             step.execute(
-                                "INSERT INTO sessions (device, id, hash, last_used, sign_out, leave_for, leave_life, leave_revision, leave_admin, leave_granted, leave_serial, leave_hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-                                 ON CONFLICT (device) DO UPDATE SET id = excluded.id, hash = excluded.hash, last_used = excluded.last_used, sign_out = excluded.sign_out,
+                                "INSERT INTO sessions (device, id, hash, last_used, sign_out, leave_for, leave_life, leave_revision, leave_admin, leave_granted, leave_serial, leave_hash, kind) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                                 ON CONFLICT (device) DO UPDATE SET id = excluded.id, hash = excluded.hash, last_used = excluded.last_used, sign_out = excluded.sign_out, kind = excluded.kind,
                                  leave_for = excluded.leave_for, leave_life = excluded.leave_life, leave_revision = excluded.leave_revision, leave_admin = excluded.leave_admin,
                                  leave_granted = excluded.leave_granted, leave_serial = excluded.leave_serial, leave_hash = excluded.leave_hash",
                                 params![
@@ -816,7 +846,8 @@ impl Change<'_> {
                                     leave.map(|(_, _, _, admin, ..)| i64::from(admin)),
                                     leave.map(|(_, _, _, _, granted, ..)| number(granted)).transpose()?,
                                     leave.map(|(.., serial, _)| number(serial)).transpose()?,
-                                    leave.map(|(.., hash)| hash.as_bytes().to_vec())
+                                    leave.map(|(.., hash)| hash.as_bytes().to_vec()),
+                                    kind_word(session.kind)
                                 ],
                             )?;
                         }
@@ -869,6 +900,12 @@ impl Change<'_> {
             }
             Change::MusicPublic { address } => {
                 step.execute("UPDATE meta SET music_public = ?1 WHERE one = 1", [address])?;
+            }
+            Change::DiagnosticsDefault { on } => {
+                step.execute("UPDATE meta SET diagnostics_default = ?1 WHERE one = 1", [i64::from(on)])?;
+            }
+            Change::Requests { on } => {
+                step.execute("UPDATE meta SET requests_on = ?1 WHERE one = 1", [i64::from(on)])?;
             }
             Change::Restore { restore, at, from } => {
                 step.execute("DELETE FROM sessions", [])?;
