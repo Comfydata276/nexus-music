@@ -22,9 +22,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use nexus_core::nexus::compare::{self, Contradiction, Pending};
-use nexus_core::nexus::kept::{
-    Account as Decided, AccountName, AccountState, Apart, ApartDevice, Clock, DataChange, Effects, RestoreMode, Rows, SECRET_BYTES, StampKey, Startup, Status,
-};
+use nexus_core::nexus::account::{AccountId, Email, SECRET_BYTES, SessionId};
+use nexus_core::nexus::kept::{Account as Decided, AccountState, Apart, ApartDevice, Clock, DataChange, Effects, LiveCode, RestoreMode, Rows, StampKey, Startup, Status};
 use nexus_core::nexus::proto::BackendId;
 
 use crate::identity;
@@ -36,6 +35,22 @@ use crate::store::lock;
 /// How often, at most, the store hears how far the data's changes have got from a change the
 /// data alone has (12.3).
 pub const MARK_EVERY_MS: u64 = 60_000;
+
+/// What a new account starts with ([`Keeper::make_account`]).
+#[derive(Debug, Clone, Copy)]
+pub enum First<'a> {
+    Nothing,
+    /// A one-time code's keyed fingerprint, and until when it is good.
+    Code(&'a [u8; 32], u64),
+    /// The first admin's password, as kept (set-up, 8.4).
+    Password(&'a data::Password),
+}
+
+impl<'a> From<Option<(&'a [u8; 32], u64)>> for First<'a> {
+    fn from(code: Option<(&'a [u8; 32], u64)>) -> Self {
+        code.map_or(First::Nothing, |(code, until)| First::Code(code, until))
+    }
+}
 
 /// Why the backend does not serve, or a command did nothing: a sentence for the owner.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,7 +139,12 @@ fn contradiction(why: Contradiction) -> &'static str {
     }
 }
 
-const TAKE_AS_IS: &str = "run `nexus-music-server take-as-is` to take the data as it is: every session is ended, and every person signs in again";
+/// The number of an account's live code, if one is live (its fingerprint is kept; any other goes).
+fn live(code: Option<LiveCode>) -> Option<u64> {
+    code.filter(|code| !code.used).map(|code| code.number)
+}
+
+const TAKE_AS_IS: &str = "run `nexus-music-server take-as-is` to take the data as it is: every session is ended, and, since nothing then says which passwords changed, every account waits for a new one-time code (`nexus-music-server recover <email>` makes one)";
 
 struct Found {
     id: Option<BackendId>,
@@ -175,7 +195,7 @@ impl Keeper {
                     Some(id) => id,
                     None => identity::read_or_make(state, random_bytes::<16>).map_err(Refused)?.0,
                 };
-                let store = Store::new(id, random_bytes::<SECRET_BYTES>().map_err(Refused)?, random_bytes::<SECRET_BYTES>().map_err(Refused)?, now);
+                let store = Store::new(id, random_bytes::<{ SECRET_BYTES }>().map_err(Refused)?, random_bytes::<{ SECRET_BYTES }>().map_err(Refused)?, now);
                 apart::write(state, &store).map_err(|error| Refused(store_failed(state, &error)))?;
                 Self::first_data(state, folder, held, store, now)
             }
@@ -237,7 +257,7 @@ impl Keeper {
         Ok((Self::with(state, folder, held, store, data)?, Started::Made))
     }
 
-    fn names(&self) -> Result<BTreeMap<u64, AccountName>, rusqlite::Error> {
+    fn names(&self) -> Result<BTreeMap<u64, Email>, rusqlite::Error> {
         self.data.names()
     }
 
@@ -278,9 +298,7 @@ impl Keeper {
         if state.password_reset_required {
             changes.push(Change::Password { account: number, password: None });
         }
-        if !state.code_available {
-            changes.push(Change::Codes { account: number });
-        }
+        changes.push(Change::Codes { account: number, keep: live(state.code) });
     }
 
     /// 12.3: "the data is brought up to it". Each account under the note (or every account)
@@ -410,7 +428,7 @@ impl Keeper {
         // away is only ever taken away).
         let mut next = self.store.clone();
         for (number, rows) in &installs {
-            let name = Some(&rows.account.name);
+            let name = Some(&rows.account.email);
             if let (Some(record), Some(entry)) = (self.store.apart(*number, name), next.accounts.get_mut(number)) {
                 entry.apart = Decided::load(&record, Some(rows)).apart();
             }
@@ -516,7 +534,7 @@ impl Keeper {
         self.heal()?;
         let meta = self.data.meta().map_err(|error| Failed(data_failed(&error)))?;
         let rows = self.data.rows(&meta, number).map_err(|error| Failed(data_failed(&error)))?;
-        let name = rows.as_ref().map(|rows| rows.account.name.clone());
+        let name = rows.as_ref().map(|rows| rows.account.email.clone());
         let record = self.store.apart(number, name.as_ref()).ok_or_else(|| Failed("There is no such account.".into()))?;
         Ok(Decided::load(&record, rows.as_ref()))
     }
@@ -529,29 +547,42 @@ impl Keeper {
         id
     }
 
-    /// An account made (by the admin, 8.1): in the store first, then the data. It has no
-    /// password; it waits for one to be chosen with the one-time code given (`code`, its
-    /// fingerprint, good until `until`).
-    pub fn make_account(&mut self, email: &str, shown: &str, admin: bool, code: Option<(&[u8; 32], u64)>, now: u64) -> Result<u64, Failed> {
+    /// A session id never given before (C3r's `FreshSession`): made lasting with the store's
+    /// next write, which is the decision's first half, before the data can hold it.
+    pub fn fresh_session(&mut self) -> Option<SessionId> {
+        let id = SessionId::new(self.store.next_session)?;
+        self.store.next_session = self.store.next_session.checked_add(1)?;
+        Some(id)
+    }
+
+    /// An account made, in the store first, then the data: by the admin (8.1), with no
+    /// password, waiting for one chosen with the one-time code given (`First::Code`: its
+    /// keyed fingerprint, good until `until`); or at set-up (8.4), the first admin with the
+    /// password chosen there (`First::Password`). An email the data has already is refused.
+    pub fn make_account<'a>(&mut self, email: &str, shown: &str, admin: bool, first: impl Into<First<'a>>, now: u64) -> Result<u64, Failed> {
+        let first = first.into();
         self.heal()?;
-        let name = AccountName::from_canonical(email.to_string()).ok_or_else(|| Failed("That is not an email as the backend keeps one.".into()))?;
-        if let Some(number) = self.account_named(email)? {
-            return Ok(number);
+        let name = Email::new(email).filter(|tidied| tidied.as_str() == email).ok_or_else(|| Failed("That is not an email as the backend keeps one.".into()))?;
+        if self.account_named(email)?.is_some() {
+            return Err(Failed("There is an account with that email already.".into()));
         }
         let mut next = self.store.clone();
         let number = next.next_account;
         next.next_account = number.checked_add(1).ok_or_else(|| Failed("No more accounts can be made.".into()))?;
-        // The design does not say what an account's first state is; C3r has no constructor.
-        // Switched on, no password, a code live if one was given.
+        let id = AccountId::new(number).ok_or_else(|| Failed("No more accounts can be made.".into()))?;
+        // CARRIED (asked of C3r): the design does not say what an account's first state is,
+        // and C3r has no constructor. Switched on; with a code: no password, a reset
+        // required, the code live as number 0; with a password: that password, nothing else.
         let state = AccountState {
             backend: self.backend,
             restore: next.restore,
-            name,
+            id,
+            email: name,
             life: 0,
             status: Status::On,
             password_changes: 0,
-            password_reset_required: true,
-            code_available: code.is_some(),
+            password_reset_required: !matches!(first, First::Password(_)),
+            code: matches!(first, First::Code(..)).then_some(LiveCode { number: 0, used: false }),
             admin,
             music_login: 0,
             music_managed: false,
@@ -566,8 +597,10 @@ impl Keeper {
         self.write_store(next)?;
         let at = self.store.high_water;
         let mut changes = vec![Change::Account { number, shown, state: &state }];
-        if let Some((code, until)) = code {
-            changes.push(Change::Code { account: number, code, made_at: at, until });
+        match first {
+            First::Nothing => {}
+            First::Code(code, until) => changes.push(Change::Code { account: number, number: 0, code, made_at: at, until }),
+            First::Password(password) => changes.push(Change::Password { account: number, password: Some(password) }),
         }
         match self.data.apply(&changes, at) {
             Ok(changes) => self.changes = changes,
@@ -581,13 +614,6 @@ impl Keeper {
             return self.broke(failed);
         }
         Ok(number)
-    }
-
-    fn number_of(&self, update_name: &AccountName) -> Result<u64, Failed> {
-        if let Some(number) = self.data.account_named(update_name.as_str()).map_err(|error| Failed(data_failed(&error)))? {
-            return Ok(number);
-        }
-        self.store.account_named(update_name.as_str()).ok_or_else(|| Failed("A decision named an account there is not.".into()))
     }
 
     /// Keeps what a decision says is to be kept (C3r's `Effects`), **whatever it answered**,
@@ -613,7 +639,11 @@ impl Keeper {
         }
         let mut numbers = Vec::new();
         for update in &effects.updates {
-            numbers.push(self.number_of(&update.apart_first.account.name)?);
+            let number = update.apart_first.account.id.get();
+            if !self.store.accounts.contains_key(&number) {
+                return Err(Failed("A decision named an account there is not.".into()));
+            }
+            numbers.push(number);
         }
         let mut next = self.store.clone();
         next.high_water = high_water;
@@ -622,7 +652,10 @@ impl Keeper {
             let entry = next.accounts.get_mut(&number).ok_or_else(|| Failed("A decision named an account there is not.".into()))?;
             entry.apart = update.apart_first.clone();
             if let Some(&highest) = update.apart_first.devices.keys().max() {
-                next.next_device = next.next_device.max(highest.saturating_add(1));
+                next.next_device = next.next_device.max(highest.get().saturating_add(1));
+            }
+            if let Some(highest) = update.apart_first.devices.values().map(|device| device.last_session).max() {
+                next.next_session = next.next_session.max(highest.saturating_add(1));
             }
         }
         next.pending = Some(Pending::Change { accounts: numbers.clone() });
@@ -635,16 +668,26 @@ impl Keeper {
                 continue;
             }
             changes.push(Change::Install { number, rows: &update.data, at });
-            match update.change {
+            match &update.change {
                 DataChange::ResetPassword => changes.push(Change::Password { account: number, password: None }),
-                DataChange::SpendCode => changes.push(Change::Codes { account: number }),
+                // The new password is in `extra`, made by S8, and is the verifier C3r was given.
+                DataChange::RedeemCode { verifier, .. } => {
+                    let given = extra.iter().any(|change| matches!(change, Change::Password { account, password: Some(password) } if *account == number && password.hash == *verifier.as_bytes()));
+                    if !given {
+                        return self.broke(Failed("A code was redeemed with no new password to keep.".into()));
+                    }
+                }
+                DataChange::ChangePassword => {
+                    let given = extra.iter().any(|change| matches!(change, Change::Password { account, password: Some(_) } if *account == number));
+                    if !given {
+                        return self.broke(Failed("A password was changed with no new password to keep.".into()));
+                    }
+                }
                 // Its events go here once they are kept (S12).
                 DataChange::EraseHistory => {}
                 _ => {}
             }
-            if !update.data.account.code_available {
-                changes.push(Change::Codes { account: number });
-            }
+            changes.push(Change::Codes { account: number, keep: live(update.data.account.code) });
         }
         changes.extend(extra.iter().cloned());
         match self.data.apply(&changes, at) {
@@ -828,10 +871,10 @@ pub fn take_as_is(state: &Path, folder: &Path, now: u64) -> Result<Said, Refused
             let seal = match &old {
                 Some(old) => old.seal_key(),
                 // Lost with the store: what it sealed is made anew or typed in again (12.4).
-                None => random_bytes::<SECRET_BYTES>().map_err(Refused)?,
+                None => random_bytes::<{ SECRET_BYTES }>().map_err(Refused)?,
             };
             let high_water = now.max(meta.written_at).max(old.as_ref().map_or(0, |old| old.high_water));
-            let mut store = Store::new(meta.backend, random_bytes::<SECRET_BYTES>().map_err(Refused)?, seal, high_water);
+            let mut store = Store::new(meta.backend, random_bytes::<{ SECRET_BYTES }>().map_err(Refused)?, seal, high_water);
             let old_restore = old.as_ref().map_or(0, |old| old.restore);
             let new = meta.restore.max(old_restore).checked_add(1).ok_or_else(|| Refused("The restore number can go no higher.".into()))?;
             store.restore = meta.restore;
@@ -840,7 +883,9 @@ pub fn take_as_is(state: &Path, folder: &Path, now: u64) -> Result<Said, Refused
             store.mark = meta.changes;
             store.next_account = view.accounts.keys().max().map_or(1, |n| n.saturating_add(1)).max(old.as_ref().map_or(1, |old| old.next_account));
             let highest_device = view.accounts.values().flat_map(|rows| rows.devices.keys()).max().copied();
-            store.next_device = highest_device.map_or(1, |n| n.saturating_add(1)).max(old.as_ref().map_or(1, |old| old.next_device));
+            store.next_device = highest_device.map_or(1, |n| n.get().saturating_add(1)).max(old.as_ref().map_or(1, |old| old.next_device));
+            let highest_session = view.accounts.values().flat_map(|rows| rows.devices.values()).filter_map(|device| device.session.as_ref()).map(|session| session.id.get()).max();
+            store.next_session = highest_session.map_or(1, |n| n.saturating_add(1)).max(old.as_ref().map_or(1, |old| old.next_session));
             if let Some(old) = &old {
                 for (&number, account) in &old.accounts {
                     if !view.accounts.contains_key(&number) {
@@ -858,14 +903,14 @@ pub fn take_as_is(state: &Path, folder: &Path, now: u64) -> Result<Said, Refused
                         let session = device.session.as_ref();
                         let record = ApartDevice {
                             number: device.number,
-                            last_session: session.map_or(0, |session| session.id),
-                            last_leave: session.and_then(|session| session.leave).map_or(0, |leave| leave.fields().3),
+                            last_session: session.map_or(0, |session| session.id.get()),
+                            last_leave: session.and_then(|session| session.leave.as_ref()).map_or(0, |leave| leave.fields().5),
                             permit: None,
                         };
                         (id, record)
                     })
                     .collect();
-                store.accounts.insert(number, Account { name: apart::name_fingerprint(rows.account.name.as_str()), apart: Apart { account: rows.account.clone(), devices } });
+                store.accounts.insert(number, Account { name: apart::name_fingerprint(rows.account.email.as_str()), apart: Apart { account: rows.account.clone(), devices } });
             }
             store.pending = Some(Pending::TakeAsIs { restore: new });
             apart::write(state, &store).map_err(|error| Refused(store_failed(state, &error)))?;

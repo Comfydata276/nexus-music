@@ -121,14 +121,14 @@ pub fn compare(store: &StoreView, data: &DataView) -> Found {
             if device.number > record.number {
                 return Found::stop(Contradiction::DeviceAhead);
             }
-            if device.session.as_ref().is_some_and(|session| session.id > record.last_session) {
+            if device.session.as_ref().is_some_and(|session| session.id.get() > record.last_session) {
                 return Found::stop(Contradiction::SessionNeverReserved);
             }
             if device.number < record.number {
                 if cut { ending = true } else { older = true }
                 continue;
             }
-            match (&device.session, record.permit) {
+            match (&device.session, &record.permit) {
                 (None, None) => {}
                 (Some(session), Some(permit)) if session.id == permit.id && session.leave == permit.leave => {}
                 // What the store still permits is never missing from data its own age:
@@ -138,7 +138,7 @@ pub fn compare(store: &StoreView, data: &DataView) -> Found {
                 // A session, or leave, given in the data and not yet recognized in the store;
                 // or one the store has ended and the data not yet.
                 (Some(session), permit) => {
-                    let given = permit.is_none() && session.id == record.last_session || permit.is_some_and(|p| p.id == session.id && session.leave.is_some());
+                    let given = permit.is_none() && session.id.get() == record.last_session || permit.as_ref().is_some_and(|p| p.id == session.id && session.leave.is_some());
                     if given { grant = true } else { ending = true }
                 }
             }
