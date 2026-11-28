@@ -1145,7 +1145,9 @@ fn a_clock_set_back_between_runs_reopens_nothing_and_stops_no_copy() {
     let ids = world(&root);
     // Bob's session, last used at T0, is ended 90 days on (8.7); a start can make it look up to
     // an hour younger than it is (when it was last used is written at most once an hour).
-    let late = T0 + SESSION_MS + 60 * MINUTE;
+    // (The world was made by a backend just started, whose clock is the store's plus a
+    // minute: Bob signed in at T0 and a minute.)
+    let late = T0 + MINUTE + SESSION_MS + 60 * MINUTE;
     {
         // Asked at that time, and what the decision did kept (the ending, and the time).
         let mut keeper = opened(&root, late);
@@ -1157,7 +1159,9 @@ fn a_clock_set_back_between_runs_reopens_nothing_and_stops_no_copy() {
     // The clock set back a day, and the program started again: it is not reopened.
     let back = late - 24 * 60 * MINUTE;
     let mut keeper = opened(&root, back);
-    assert_eq!(keeper.clock(back).effective(), late);
+    // The store's time, plus the minute it may lag by (the ruling of 13:59): never less.
+    let effective = keeper.clock(back).effective();
+    assert!((late..=late + MINUTE).contains(&effective), "{effective}");
     assert!(!reads(&mut keeper, BOB, ids.b1, 5, back), "a time that had passed came back");
     keeper.close();
     copies::nightly(&root.data(), late).unwrap();
@@ -1347,11 +1351,15 @@ fn a_data_only_step_far_on_gives_the_same_clock_before_and_after_a_restart() {
     let mut keeper = opened(&root, T0 + MINUTE);
     keeper.heard(ids.a1, far).unwrap();
     // The clock put right without a restart: Bob's session last used at T0.
-    let before = (keeper.clock(back).effective(), reads(&mut keeper, BOB, ids.b1, 5, back));
+    let (clock, before) = (keeper.clock(back).effective(), reads(&mut keeper, BOB, ids.b1, 5, back));
+    assert!(clock < far, "a step the data alone keeps moved the clock");
     keeper.close();
     let mut keeper = opened(&root, back);
-    let after = (keeper.clock(back).effective(), reads(&mut keeper, BOB, ids.b1, 5, back));
-    assert_eq!(before, after, "the clock before a restart and after it");
+    let (again, after) = (keeper.clock(back).effective(), reads(&mut keeper, BOB, ids.b1, 5, back));
+    assert_eq!(before, after, "the answer before a restart and after it");
+    // After a restart the clock is the store's plus the minute it may lag by: never behind
+    // the running backend's, never the data's far time.
+    assert!(again >= clock && again <= clock + MINUTE && again < far, "{clock} then {again}");
     keeper.close();
 }
 

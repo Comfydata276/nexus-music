@@ -109,6 +109,11 @@ pub struct Keeper {
     data: Data,
     /// How far the data's changes have got, as last committed.
     changes: u64,
+    /// The latest time acted at, as the running backend has it (the lead's ruling of 28 Nov
+    /// 13:59): written to the store with every step that changes a row, and otherwise once it
+    /// is a minute ahead of what the store has; so at a start it is taken as the store's
+    /// plus that minute, and a clock set back across a restart reopens nothing.
+    high_water: u64,
     broken: bool,
 }
 
@@ -257,7 +262,9 @@ fn not_this_backends(state: &Path) -> String {
 impl Keeper {
     fn with(state: &Path, folder: &Path, held: lock::Held, store: Store, data: Data) -> Result<Keeper, Refused> {
         let changes = data.meta().map_err(|error| unreadable(&error))?.changes;
-        Ok(Keeper { state: state.to_path_buf(), folder: folder.to_path_buf(), _lock: held, backend: store.backend, store, data, changes, broken: false })
+        // CARRIED (the load side of the clock's minute is kept's to take: `t3/nexus-core-fu`).
+        let high_water = store.high_water.saturating_add(MARK_EVERY_MS);
+        Ok(Keeper { state: state.to_path_buf(), folder: folder.to_path_buf(), _lock: held, backend: store.backend, store, data, changes, high_water, broken: false })
     }
 
     /// Opens both stores in `state` and `folder` (`NEXUS_STATE`, `NEXUS_DATA`) at `now`, and
@@ -508,12 +515,15 @@ impl Keeper {
         Ok(Started::Restored { restore: new, accounts: installs.len(), held, from: meta.written_at })
     }
 
-    fn write_store(&mut self, next: Store) -> Result<(), Failed> {
+    fn write_store(&mut self, mut next: Store) -> Result<(), Failed> {
+        // Every write of the store carries the latest time acted at.
+        next.high_water = next.high_water.max(self.high_water);
         // Room above the growth limit is kept for revocations, which add no record.
         let limit = if next.records() > self.store.records() { apart::GROWTH_MAX_BYTES } else { apart::FILE_MAX_BYTES };
         match apart::write_within(&self.state, &next, limit) {
             Ok(()) => {
                 self.store = next;
+                self.high_water = self.high_water.max(self.store.high_water);
                 Ok(())
             }
             Err(error) => {
@@ -577,7 +587,7 @@ impl Keeper {
 
     /// The clock for a decision at `now` (C3r's `Clock`).
     pub fn clock(&self, now: u64) -> Clock {
-        Clock { now, high_water: self.store.high_water }
+        Clock { now, high_water: self.high_water }
     }
 
     /// Whether the backend has been set up (8.4).
@@ -683,13 +693,17 @@ impl Keeper {
     /// given and the account is loaded again before it is used.
     pub fn persist(&mut self, effects: &Effects, extra: &[Change<'_>], now: u64) -> Result<(), Failed> {
         self.heal()?;
-        let high_water = self.store.high_water.max(effects.high_water);
+        self.high_water = self.high_water.max(effects.high_water);
+        let high_water = self.high_water;
         if effects.updates.is_empty() {
+            // No row changes: the clock goes to the store once it is a minute ahead of it,
+            // the mark once its minute is out (12.3; the ruling of 13:59).
             let due = now.saturating_sub(self.store.mark_at) >= MARK_EVERY_MS || now < self.store.mark_at;
-            if high_water > self.store.high_water || (self.changes > self.store.mark && due) {
+            let clock_due = high_water >= self.store.high_water.saturating_add(MARK_EVERY_MS);
+            if clock_due || (self.changes > self.store.mark && due) {
                 let mut next = self.store.clone();
                 next.high_water = high_water;
-                if due {
+                if due && self.changes > self.store.mark {
                     next.mark = self.changes;
                     next.mark_at = now;
                 }
