@@ -167,7 +167,12 @@ fn refresh(window: &ui::MainWindow) {
     pane.set_busy(false);
     pane.set_can_delete(context.is_some_and(|context| !context.offline && context.target_revision.is_some()));
     let Some(context) = context else {
-        return show(window, None, "Sign in to Nexus Music to see your stats.");
+        let status = if window.global::<ui::App>().get_nexus_signed_in() {
+            "Your stats are unavailable right now."
+        } else {
+            "Sign in to Nexus Music to see your stats."
+        };
+        return show(window, None, status);
     };
     if context.offline {
         return show(window, cached(context), "You're offline. Turn off Offline mode to refresh your stats.");
