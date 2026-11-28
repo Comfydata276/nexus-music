@@ -2658,8 +2658,8 @@ export component SettingsPage inherits Rectangle {
 
                         SettingRow {
                             title: "Music server";
-                            detail: App.server + ", as " + App.username + (App.server-version != "" ? ", Navidrome " + App.server-version : "") + (Settings.connection != "" ? ". " + Settings.connection : "")
-                                + ". Your Nexus server gave this PC its sign-in there; no music password is kept on this PC.";
+                            detail: "Your Nexus server gave this PC its sign-in at " + App.server + ", as " + App.username + (App.server-version != "" ? ", Navidrome " + App.server-version : "")
+                                + ". No music password is kept on this PC." + (Settings.connection != "" ? " " + Settings.connection : "");
                         }
 
                         SettingRow {

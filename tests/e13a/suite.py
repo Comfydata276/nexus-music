@@ -1104,6 +1104,14 @@ class Run:
         test = "backend"
         if self.hook == "sabotage":
             pass
+        elif self.new:
+            # W7: the shared client asks `hello` at each start, when Offline goes off and the
+            # network comes back, and its account calls as it needs them, besides the W1
+            # look; what W1's fixed counts stood for is the boundary itself: every request
+            # under /nexus/ is one dispatch's, made on the window's thread (none without).
+            dispatched = len([1 for _, word, _ in component_log(os.path.join(A.HOMES, f"run-{self.label}", "nexus.log")) if word == "dispatch"])
+            self.fact(test, "dispatches", dispatched)
+            self.expect(test, "requests_under_nexus (each one dispatch's)", len(seen) <= dispatched, f"{len(seen)} requests, {dispatched} dispatched")
         elif not self.on or self.held:
             # The released app, the component switched off, or its look held before it asks.
             self.expect(test, "requests_under_nexus", count == 0, count)
@@ -1114,9 +1122,11 @@ class Run:
             # One look started at the first tick of each start, held through it.
             self.expect(test, "requests_under_nexus (one held look a start)", 2 <= count <= 4, count)
         else:
-            # One at each start (5 s after the account is published) and one for the guest
-            # (W7: the guest's at the second origin's own backend, not here).
-            want = 2 if self.new else 3
+            # One at each start (5 s after the account is published) and one for the guest.
+            # W7: the guest's are at the second origin's own backend, not here; and each start
+            # has the shared client's own `hello` too, before it sends anything that carries
+            # the session (C10's rule): two at each of the two starts.
+            want = 4 if self.new else 3
             self.expect(test, "requests_under_nexus (one per account published)", count == want, count)
         account_calls = ("signin", "signout", "devices", "force-out", "change-password", "music-login")
         for line in seen:
