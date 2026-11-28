@@ -2391,22 +2391,21 @@ fn a_database_of_the_deployed_form_is_brought_forward_whole_and_works() {
 fn bringing_the_form_forward_cut_at_any_point_leaves_the_old_form_whole_or_the_new() {
     let setup = Root::new("forward");
     a_deployed_world(&setup);
-    let deployed = {
-        let connection = rusqlite::Connection::open(data::place(&setup.data())).unwrap();
-        shape(&connection)
-    };
+    let expected: Vec<_> = data::MIGRATIONS.iter().enumerate().map(|(index, step)| {
+        let model = Root::new(&format!("forward-form-{}", step.form));
+        Data::create_with(&model.data(), &BackendId::from_bytes([1; 16]), T0, &data::MIGRATIONS[..=index])
+            .unwrap().close();
+        let connection = rusqlite::Connection::open(data::place(&model.data())).unwrap();
+        (step.form, shape(&connection))
+    }).collect();
     at_every_point("the form brought forward", &setup, |root, cut| {
         let found = {
             let connection = rusqlite::Connection::open(data::place(&root.data())).unwrap();
             (connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), shape(&connection))
         };
-        match found.0 {
-            1 => assert_eq!(found.1, deployed, "at {}: form 1, not whole", cut.at),
-            form => {
-                assert_eq!(form, data::FORM, "at {}", cut.at);
-                assert!(found.1.iter().any(|line| line.starts_with("  placed")) && found.1.iter().any(|line| line == "trigger requests_owners_placed_stays"), "at {}: form 2, not whole", cut.at);
-            }
-        }
+        let (_, schema) = expected.iter().find(|(form, _)| *form == found.0)
+            .unwrap_or_else(|| panic!("at {}: unknown form {}", cut.at, found.0));
+        assert_eq!(&found.1, schema, "at {}: form {}, not whole", cut.at, found.0);
         let (keeper, _) = settled(root, T0 + 20 * MINUTE);
         assert_eq!(form_of(root), data::FORM, "at {}", cut.at);
         assert_eq!(count(&keeper, "SELECT count(*) FROM requests_owners WHERE account = ?1", BOB), 1, "at {}", cut.at);
