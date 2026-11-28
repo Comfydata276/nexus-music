@@ -170,15 +170,28 @@ impl fmt::Debug for Random {
     }
 }
 
+/// The device's own secret (8.7), and the backend it is this device's secret for. **It is
+/// per backend id**: one made before any sign-in (`backend_id: None`) may go to the first;
+/// after that it goes only to that backend, and a sign-in to another id is made as a new
+/// device, with a new secret kept only if that sign-in succeeds. The old one is never sent
+/// to another id.
+#[derive(Debug, Clone, Serialize)]
+pub struct DeviceKey {
+    pub secret: DeviceSecret,
+    /// The backend's id, 32 lower-case hex digits, once a sign-in with it has succeeded.
+    pub backend_id: Option<String>,
+}
+
 /// What was kept on the device, read back at `start`. Anything missing is `None`.
 #[derive(Debug, Default)]
 pub struct Kept {
-    /// Where secrets are kept: the device's own secret (8.7). Beside [`Saved`], not in it.
-    pub device_secret: Option<DeviceSecret>,
+    /// Where secrets are kept: the device's own secret, and its backend. Beside [`Saved`].
+    pub device_secret: Option<DeviceKey>,
     /// Where secrets are kept, as one thing: what signing in left (11).
     pub saved: Option<Saved>,
     /// Where secrets are kept: sign-outs the backend has not yet taken, at most
-    /// [`NOTES_MAX`], each kept and forgotten by the session it ends.
+    /// [`NOTES_MAX`] (more are trimmed, oldest first), each kept and forgotten by its
+    /// backend and the session it ends.
     pub notes: Vec<Note>,
     /// Whether Offline mode is on (the app's own setting).
     pub offline: bool,
@@ -234,9 +247,19 @@ pub struct Note {
 }
 
 impl Note {
-    /// The session it ends: what it is kept and forgotten by.
+    /// The session it ends.
     pub fn session(&self) -> u64 {
         self.revoke.session.get()
+    }
+
+    /// What it is kept and forgotten by: its backend and the session it ends. Two backends
+    /// may each give out the same session number.
+    pub fn key(&self) -> (&str, u64) {
+        (&self.backend_id, self.session())
+    }
+
+    fn forget(&self) -> Forget {
+        Forget::Note { backend_id: self.backend_id.clone(), session: self.session() }
     }
 }
 
@@ -259,9 +282,6 @@ pub enum Happened {
     /// waiting sign-outs at their pace. (The sending half, C8 and C6, will be driven from
     /// here.)
     Tick,
-    /// The wait the sign-in form was shown ([`SignInShown::wait_s`]) has passed: the app's
-    /// own timer for it fired.
-    WaitPassed,
     /// A part of the app that asks the music server (a stream, a range opened again, the
     /// next song fetched ahead, a download, a cover, a page) was refused "wrong name or
     /// password" with the music login of this number, handed under this `generation`
@@ -299,16 +319,15 @@ impl Look {
 pub enum Press {
     /// Sign in with an email and a password. `look`: on the phone, where the typed address
     /// leads on this network and whether the permission is held, looked at before the press
-    /// (6.4); on a PC, nothing.
-    ///
-    /// `retry`: this press is the one retry the form makes by itself after a wait
-    /// ([`SignInShown::send_again`]), with what it still holds typed. A person's own press
-    /// is `false`.
-    SignIn { address: String, email: String, password: Typed, look: Look, retry: bool },
+    /// (6.4); on a PC, nothing. A press while an earlier one's `hello` is still out
+    /// replaces it (that one's password is dropped, its answer asks nothing); a press while
+    /// the sign-in itself is out does nothing.
+    SignIn { address: String, email: String, password: Typed, look: Look },
     /// Sign in for the first time with the one-time code the admin gave (8.5): the code and
     /// the password chosen, typed twice, redeemed together in one call.
-    SignInWithCode { address: String, code: Typed, password: Typed, again: Typed, look: Look, retry: bool },
-    /// The sign-in form was closed or dismissed: a retry waiting on it is cancelled.
+    SignInWithCode { address: String, code: Typed, password: Typed, again: Typed, look: Look },
+    /// The sign-in form was closed or dismissed: a try still at its `hello` is dropped, with
+    /// what was typed.
     FormClosed,
     /// Sign out on this device.
     SignOut,
@@ -478,24 +497,25 @@ impl Serialize for Hidden {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Keep {
-    /// Where secrets are kept, beside [`Saved`]. Made once; never forgotten.
-    DeviceSecret(DeviceSecret),
+    /// Where secrets are kept, beside [`Saved`], replacing the one before. Never forgotten.
+    DeviceSecret(DeviceKey),
     /// Where secrets are kept, as one thing, replacing the one before.
     Saved(Saved),
-    /// Where secrets are kept, by the session it ends ([`Note::session`]), beside any other.
+    /// Where secrets are kept, by its backend and the session it ends ([`Note::key`]),
+    /// beside any other.
     Note(Note),
 }
 
 /// What to forget: from where it was kept, and from memory.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Forget {
     /// Everything signing in left, the music login **and the player's copy of it**
     /// included. What is on the device (downloads, kept copies) is not touched and goes on
     /// playing.
     Saved,
-    /// The note for this session.
-    Note { session: u64 },
+    /// The note for this backend's session.
+    Note { backend_id: String, session: u64 },
 }
 
 /// What the player is handed.
@@ -510,6 +530,10 @@ pub enum Hand {
     /// (a stream already open goes on). What is on the device plays as usual and the car
     /// shows it; covers go blank, downloads wait. A login of another number is not touched.
     Refused { count: u64, generation: u64 },
+    /// There is no music login now (a different account was signed in with none set, or
+    /// none usable): drop the one the player has and begin no request to the music server.
+    /// What is on the device plays as usual.
+    NoLogin { generation: u64 },
 }
 
 // ---------------------------------------------------------------------------------------
@@ -565,12 +589,10 @@ pub struct SignInShown {
     /// The phone is to show its screen that explains and asks for the local-network
     /// permission (6.4). Never set on a PC.
     pub ask_permission: bool,
-    /// The backend said "busy, come back in this many seconds" (8.3), and the form will try
-    /// once more by itself: the app sets a timer for it and calls [`Happened::WaitPassed`].
+    /// The backend said "busy, come back in this many seconds" (8.3): the exact seconds,
+    /// each time it says so. **The form disables its button and counts these down; the
+    /// person presses again.** Nothing tries again by itself.
     pub wait_s: Option<u64>,
-    /// The wait has passed and the try may be made: the form presses again, as it is, with
-    /// `retry: true`. Only while the form is up; at most once for each press.
-    pub send_again: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -671,7 +693,20 @@ pub struct Client {
     shown: Option<Shown>,
     /// Sign-outs being told when the account changed or Offline went on: still waited for
     /// (the one exception to the fence), and their answers dropped.
-    parting: Vec<u64>,
+    parting: Vec<Parting>,
+    /// The backend id last seen at each origin this run, from every `hello` and every
+    /// stamped answer (7.1, as ruled: the one value). Nothing that carries a session, a
+    /// device secret or a note goes to an origin unless it names the backend expected; a
+    /// sign-out's ask is no longer waited for once its origin names another.
+    seen_at: Vec<(String, BackendId)>,
+}
+
+/// A sign-out told across the fence, with where it goes and for which backend.
+struct Parting {
+    ask: u64,
+    origin: String,
+    backend: BackendId,
+    session: u64,
 }
 
 impl fmt::Debug for Client {
@@ -684,7 +719,7 @@ impl fmt::Debug for Client {
 struct Live {
     app: App,
     offline: bool,
-    device_secret: Option<DeviceSecret>,
+    device_secret: Option<DeviceKey>,
     saved: Option<Saved>,
     notes: Vec<Note>,
     flight: Vec<Flight>,
@@ -695,16 +730,8 @@ struct Live {
     /// The generation the account now signed in was published under: what [`Hand`] carries,
     /// and what reports about the login must carry back.
     account_generation: u64,
-    /// The backends whose `hello` was read at an origin this run: (origin, id). Nothing that
-    /// carries a session, a device secret or a note goes to an origin before its id is here
-    /// and is the one expected (7.1).
-    verified: Vec<(String, BackendId)>,
     /// The backend's address led inside and the permission is not held (6.4).
     backend_blocked: bool,
-    /// The one retry after "come back in N seconds" (8.3).
-    retry: Retry,
-    /// A count of sign-in presses: what a retry belongs to.
-    attempt: u64,
     /// The session's check is due: at a start, the network coming back, Offline off. Never
     /// from a tick.
     check_due: bool,
@@ -728,18 +755,6 @@ struct Live {
     stranger: bool,
 }
 
-/// The one retry after "come back in N seconds" (8.3), tied to one press.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Retry {
-    None,
-    /// Shown with the wait (`seconds`); due at this time.
-    Armed { attempt: u64, due_ms: u64, seconds: u64 },
-    /// The wait passed: the form may press once more.
-    Now { attempt: u64 },
-    /// Used for this press: a second wait leaves it with the person.
-    Spent { attempt: u64 },
-}
-
 struct Flight {
     id: u64,
     what: Purpose,
@@ -749,8 +764,9 @@ struct Flight {
 
 enum Purpose {
     Hello(Pending),
-    /// A try at signing in; its ask's id is the try's number.
-    SignIn { origin: NexusOrigin, backend_id: BackendId },
+    /// A try at signing in; its ask's id is the try's number. `secret`: the device secret
+    /// it carries, kept for this backend if it succeeds.
+    SignIn { origin: NexusOrigin, backend_id: BackendId, secret: DeviceSecret },
     /// `hello` at an origin whose backend is expected, before anything secret goes there.
     Verify { origin: String },
     /// The devices list, page by page. `opened`: the person is looking at it; otherwise it
@@ -759,17 +775,20 @@ enum Purpose {
     /// A renewal of the music login, for this number: `refused`, because the music server
     /// refused the login of that number; otherwise because an answer said the number rose.
     Music { count: u64, refused: bool },
-    ForceOut { device: u64 },
+    /// Forcing out this device's session.
+    ForceOut { device: u64, session: u64 },
     ChangePassword,
-    /// Telling the backend of a sign-out, from the note for this session, with no session (11).
-    Tell { session: u64 },
+    /// Telling a backend of a sign-out, from the note for its session, with no session (11).
+    Tell { backend: BackendId, session: u64, origin: String },
 }
 
 impl Purpose {
     fn same_kind(&self, other: &Purpose) -> bool {
         match (self, other) {
             (Purpose::Hello(_) | Purpose::SignIn { .. }, Purpose::Hello(_) | Purpose::SignIn { .. }) => true,
-            (Purpose::Tell { session }, Purpose::Tell { session: other }) => session == other,
+            (Purpose::Tell { backend, session, .. }, Purpose::Tell { backend: other_backend, session: other, .. }) => {
+                session == other && backend == other_backend
+            }
             (Purpose::Verify { origin }, Purpose::Verify { origin: other }) => origin == other,
             (left, right) => std::mem::discriminant(left) == std::mem::discriminant(right),
         }
@@ -796,6 +815,8 @@ enum Pressed {
 struct Form {
     state: SignInState,
     words: String,
+    /// The exact seconds of the last "come back in", while that is what the form says.
+    wait_s: Option<u64>,
     address: String,
     email: String,
     ask_permission: bool,
@@ -821,6 +842,9 @@ struct Renewal {
     /// A renewal that went unanswered, to be asked again when the backend may be reachable
     /// (never on a timer): its number, and whether it was for a refusal.
     owed: Option<(u64, bool)>,
+    /// The renewal was owed by the answer being dealt with now: that answer's own settling
+    /// does not ask it again (it is asked at the next reachability event).
+    owed_now: bool,
     /// The highest number an answer announced while a renewal was under way: asked for
     /// once that renewal's outcome is in, if it is still above what is held.
     announced: Option<u64>,
@@ -1010,24 +1034,52 @@ impl Client {
 
     /// Whether the machine still waits for the answer to this ask. **The app asks this
     /// immediately before it sends each [`Ask`] and drops the ask unsent if it is no**: after
-    /// `Offline(true)` and `stop` it is no for everything but a sign-out being told.
+    /// `Offline(true)` and `stop` it is no for everything but a sign-out being told, and for
+    /// that it is no once its origin has been seen to name another backend.
     pub fn waits_for(&self, ask: u64) -> bool {
-        self.parting.contains(&ask) || self.live.as_ref().is_some_and(|live| live.flight.iter().any(|flight| flight.id == ask))
+        if let Some(parting) = self.parting.iter().find(|parting| parting.ask == ask) {
+            return self.seen(&parting.origin) == Some(parting.backend);
+        }
+        let Some(flight) = self.live.as_ref().and_then(|live| live.flight.iter().find(|flight| flight.id == ask)) else { return false };
+        match &flight.what {
+            Purpose::Tell { backend, origin, .. } => self.seen(origin) == Some(*backend),
+            _ => true,
+        }
+    }
+
+    /// The backend id last seen at this origin this run.
+    fn seen(&self, origin: &str) -> Option<BackendId> {
+        self.seen_at.iter().find(|(at, _)| at == origin).map(|(_, id)| *id)
+    }
+
+    /// Records the backend id an answer at this origin named.
+    fn saw(&mut self, origin: &str, id: BackendId) {
+        self.seen_at.retain(|(at, _)| at != origin);
+        self.seen_at.push((origin.to_owned(), id));
     }
 
     /// **Start**, after the app is already usable: hand over what was kept. A kept music
-    /// login is handed to the player first, before anything else. Starting again without a
-    /// stop stops first.
+    /// login is handed to the player first, before anything else, unless what was kept says
+    /// it was signed out. Starting again without a stop stops first.
     pub fn start(&mut self, app: App, kept: Kept, given: &Given) -> Vec<Do> {
         self.stop();
         self.generation = self.generation.wrapping_add(1);
         let mut out = Vec::new();
         let Kept { device_secret, saved, notes, offline } = kept;
+        // A sign-out cut between keeping its note and forgetting what signing in left: the
+        // note says it, and it is finished now. That login is not handed over.
+        let mut saved = saved;
+        if let Some(found) = &saved
+            && let Some(revoke) = &found.sign_out
+            && notes.iter().any(|note| note.backend_id == found.backend_id && note.revoke.session == revoke.session)
+        {
+            out.push(Do::Forget(Forget::Saved));
+            saved = None;
+        }
         // R1: the player first, whatever else is wrong with what was kept.
         if let Some(login) = saved.as_ref().and_then(|saved| saved.music.as_ref()) {
             out.push(Do::Hand(Hand::Login { login: copy(login), generation: self.generation }));
         }
-        let mut saved = saved;
         if let Some(found) = &mut saved
             && (NexusOrigin::typed(&found.nexus).is_err() || BackendId::from_hex(&found.backend_id).is_none())
         {
@@ -1039,19 +1091,21 @@ impl Client {
                 out.push(Do::Keep(Keep::Saved(found.copy())));
             }
         }
-        // A note that cannot be told, or is too old to matter, is forgotten where it is kept
-        // too, not only left out of memory.
-        let mut kept_notes = Vec::new();
+        // A note that cannot be told, is too old to matter, or is past the four newest, is
+        // forgotten where it is kept too, not only left out of memory.
+        let mut notes = notes;
+        notes.sort_by(|left, right| right.made_ms.cmp(&left.made_ms));
+        let mut kept_notes: Vec<Note> = Vec::new();
         for note in notes {
             let usable = NexusOrigin::typed(&note.nexus).is_ok()
                 && BackendId::from_hex(&note.backend_id).is_some()
                 && note.request != 0
                 && given.now_ms.checked_sub(note.made_ms).is_none_or(|age| age < NOTE_LIFE_MS)
-                && !kept_notes.iter().any(|kept: &Note| kept.session() == note.session());
+                && !kept_notes.iter().any(|kept| kept.key() == note.key());
             if usable && kept_notes.len() < NOTES_MAX {
                 kept_notes.push(note);
             } else {
-                out.push(Do::Forget(Forget::Note { session: note.session() }));
+                out.push(Do::Forget(note.forget()));
             }
         }
         let mut form = Form::idle();
@@ -1074,10 +1128,7 @@ impl Client {
             reach: Reach::Unknown,
             told_ms: None,
             account_generation: self.generation,
-            verified: Vec::new(),
             backend_blocked: false,
-            retry: Retry::None,
-            attempt: 0,
             check_due: false,
             restored: false,
             renewal: Renewal::default(),
@@ -1095,9 +1146,10 @@ impl Client {
         if live.device_secret.is_none()
             && let Some(random) = &given.random
         {
-            let secret = DeviceSecret::from_bytes(*random.0);
-            out.push(Do::Keep(Keep::DeviceSecret(secret.clone())));
-            live.device_secret = Some(secret);
+            // Made before any sign-in: for whichever backend is signed in to first.
+            let key = DeviceKey { secret: DeviceSecret::from_bytes(*random.0), backend_id: None };
+            out.push(Do::Keep(Keep::DeviceSecret(key.clone())));
+            live.device_secret = Some(key);
         }
         self.live = Some(live);
         self.after_reach(given, &mut out, Reached::Start);
@@ -1106,25 +1158,20 @@ impl Client {
     }
 
     /// **Stop**, at the moment the account changes: nothing asked before is acted on or sent
-    /// (but a sign-out being told), and nothing more is done until the next `start`.
+    /// (but a sign-out being told, to the backend it is for), and nothing more is done until
+    /// the next `start`.
     pub fn stop(&mut self) {
         if let Some(live) = self.live.take() {
             self.generation = self.generation.wrapping_add(1);
-            self.part(live.flight.iter().filter(|flight| flight.what.parting()).map(|flight| flight.id));
+            for flight in live.flight {
+                if let Purpose::Tell { backend, origin, session } = flight.what {
+                    self.parting.push(Parting { ask: flight.id, origin, backend, session });
+                }
+            }
+            let over = self.parting.len().saturating_sub(NOTES_MAX);
+            self.parting.drain(..over);
         }
         self.shown = None;
-    }
-
-    /// Keeps these asks waited for past the fence: sign-outs being told. At most
-    /// [`NOTES_MAX`], the oldest going first.
-    fn part(&mut self, asks: impl Iterator<Item = u64>) {
-        for ask in asks {
-            if !self.parting.contains(&ask) {
-                self.parting.push(ask);
-            }
-        }
-        let over = self.parting.len().saturating_sub(NOTES_MAX);
-        self.parting.drain(..over);
     }
 
     /// **Happened**: tell the machine, and be told what to do. Before `start` and after
@@ -1134,7 +1181,7 @@ impl Client {
         if let Happened::Answered { ask, .. } | Happened::Failed { ask, .. } = &event {
             // A sign-out told across the fence: its answer is dropped (the note it came from
             // is told again from what is kept).
-            if let Some(index) = self.parting.iter().position(|parting| parting == ask) {
+            if let Some(index) = self.parting.iter().position(|parting| parting.ask == *ask) {
                 self.parting.remove(index);
                 return out;
             }
@@ -1153,7 +1200,6 @@ impl Client {
             }
             Happened::Offline(on) => self.offline(on, given, &mut out),
             Happened::Tick => self.tick(given, &mut out),
-            Happened::WaitPassed => self.wait_passed(given),
             Happened::MusicRefused { count, generation } => self.music_refused(count, generation, &mut out),
             Happened::MusicLooked { look, count, generation } => {
                 if let Some(live) = self.live.as_mut()
@@ -1166,6 +1212,12 @@ impl Client {
         }
         self.show(given, &mut out);
         out
+    }
+
+    /// The most the answer to this ask may be, while it is waited for: what the binding
+    /// checks an answer against before handing it in.
+    pub fn max_body_for(&self, ask: u64) -> Option<usize> {
+        self.live.as_ref()?.flight.iter().find(|flight| flight.id == ask).map(|flight| flight.max_body)
     }
 }
 
@@ -1183,7 +1235,7 @@ enum Reached {
 
 impl Form {
     fn idle() -> Form {
-        Form { state: SignInState::Idle, words: String::new(), address: String::new(), email: String::new(), ask_permission: false }
+        Form { state: SignInState::Idle, words: String::new(), wait_s: None, address: String::new(), email: String::new(), ask_permission: false }
     }
 }
 

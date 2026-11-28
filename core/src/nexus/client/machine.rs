@@ -21,13 +21,6 @@ impl Live {
         self.flight.iter().any(|flight| what(&flight.what))
     }
 
-    /// What `hello` said is at this origin this run: `Some(true)` the expected backend,
-    /// `Some(false)` another, `None` not asked yet.
-    fn trusted(&self, origin: &str, expected: &str) -> Option<bool> {
-        let expected = BackendId::from_hex(expected)?;
-        self.verified.iter().find(|(at, _)| at == origin).map(|(_, id)| *id == expected)
-    }
-
     /// Where an ask of this kind goes, and the backend expected there (`None` for one that
     /// carries nothing secret, or whose own `hello` is the check).
     fn origin_for(&self, what: &Purpose) -> Option<(NexusOrigin, Option<(String, String)>)> {
@@ -35,10 +28,7 @@ impl Live {
             Purpose::Hello(pending) => Some((pending.origin.clone(), None)),
             Purpose::SignIn { origin, .. } => Some((origin.clone(), None)),
             Purpose::Verify { origin } => Some((NexusOrigin::typed(origin).ok()?, None)),
-            Purpose::Tell { session } => {
-                let note = self.notes.iter().find(|note| note.session() == *session)?;
-                Some((NexusOrigin::typed(&note.nexus).ok()?, Some((note.nexus.clone(), note.backend_id.clone()))))
-            }
+            Purpose::Tell { origin, backend, .. } => Some((NexusOrigin::typed(origin).ok()?, Some((origin.clone(), backend.to_hex())))),
             _ if self.stranger => None,
             _ => {
                 let saved = self.saved.as_ref()?;
@@ -56,6 +46,26 @@ fn request_id(given: &Given) -> Option<account::RequestId> {
     let mut bytes = [0u8; 8];
     bytes.copy_from_slice(random.0.get(..8)?);
     account::RequestId::new(u64::from_le_bytes(bytes) & ((1 << 53) - 1))
+}
+
+/// Forgets notes too old to matter (the session they would end is gone by itself, 8.7),
+/// and retires their tellings.
+fn prune_expired(live: &mut Live, now_ms: u64, out: &mut Vec<Do>) {
+    let expired: Vec<Forget> =
+        live.notes.iter().filter(|note| now_ms.checked_sub(note.made_ms).is_some_and(|age| age >= NOTE_LIFE_MS)).map(Note::forget).collect();
+    for forget in expired {
+        if let Forget::Note { backend_id, session } = &forget {
+            retire(live, backend_id, *session);
+        }
+        out.push(Do::Forget(forget));
+    }
+}
+
+/// Takes a note out of memory and stops waiting for its telling.
+fn retire(live: &mut Live, backend_id: &str, session: u64) {
+    live.notes.retain(|note| note.key() != (backend_id, session));
+    let backend = BackendId::from_hex(backend_id);
+    live.flight.retain(|flight| !matches!(&flight.what, Purpose::Tell { backend: told, session: number, .. } if Some(*told) == backend && *number == session));
 }
 
 /// A body account encoded, as the text an ask carries.
@@ -87,9 +97,10 @@ impl Client {
             return false;
         }
         if let Some((nexus, backend)) = expected {
-            match live.trusted(&nexus, &backend) {
-                Some(true) => {}
-                Some(false) => return false,
+            let Some(backend) = BackendId::from_hex(&backend) else { return false };
+            match self.seen(&nexus) {
+                Some(seen) if seen == backend => {}
+                Some(_) => return false,
                 None => {
                     self.ask(Purpose::Verify { origin: nexus }, proto::HELLO, None, None, out);
                     return false;
@@ -154,27 +165,22 @@ impl Client {
     /// secret that can end that one session (11), and only to the backend it was made for.
     fn ask_tell(&mut self, given: &Given, out: &mut Vec<Do>) {
         let Some(live) = self.live.as_mut() else { return };
-        let expired: Vec<u64> =
-            live.notes.iter().filter(|note| given.now_ms.checked_sub(note.made_ms).is_some_and(|age| age >= NOTE_LIFE_MS)).map(Note::session).collect();
-        for session in expired {
-            // The session it would end is gone by itself by now (8.7).
-            live.notes.retain(|note| note.session() != session);
-            out.push(Do::Forget(Forget::Note { session }));
-        }
+        prune_expired(live, given.now_ms, out);
         let mut told = false;
-        let bodies: Vec<(u64, Option<Hidden>)> = live
+        let bodies: Vec<(Purpose, Option<Hidden>)> = live
             .notes
             .iter()
-            .map(|note| {
+            .filter_map(|note| {
                 let head = RequestHead { speaks: SPEAKS, restore: note.restore };
                 let body = account::RequestId::new(note.request)
                     .and_then(|request_id| hidden(account::encode(&SignOut { head, request_id, revoke: Some(copy_note(&note.revoke)) })));
-                (note.session(), body)
+                let backend = BackendId::from_hex(&note.backend_id)?;
+                Some((Purpose::Tell { backend, session: note.session(), origin: note.nexus.clone() }, body))
             })
             .collect();
-        for (session, body) in bodies {
+        for (what, body) in bodies {
             if let Some(body) = body {
-                told |= self.ask(Purpose::Tell { session }, account::SIGN_OUT, None, Some(body), out);
+                told |= self.ask(what, account::SIGN_OUT, None, Some(body), out);
             }
         }
         if told && let Some(live) = self.live.as_mut() {
@@ -199,8 +205,9 @@ impl Client {
             live.renewal.owed = live.renewal.refused.map(|count| (count, true));
         }
         let announced = live.renewal.announced;
-        let owed = live.renewal.owed.map(|(count, refused)| (announced.map_or(count, |announced| announced.max(count)), refused));
-        let missing = live.signed_in() && live.held_count().is_none();
+        // A renewal owed by the answer being settled now is not asked by that same answer.
+        let owed = live.renewal.owed.filter(|_| !(why == Reached::Answer && live.renewal.owed_now)).map(|(count, refused)| (announced.map_or(count, |announced| announced.max(count)), refused));
+        let missing = live.signed_in() && live.held_count().is_none() && !(why == Reached::Answer && live.renewal.owed_now);
         let seen = live.music_seen;
         let check = live.check_due && live.signed_in();
         if !live.notes.is_empty() {
@@ -238,6 +245,9 @@ impl Client {
             live.renewal.announced = None;
             self.ask_music(count, false, out);
         }
+        if let Some(live) = self.live.as_mut() {
+            live.renewal.owed_now = false;
+        }
     }
 
     // -----------------------------------------------------------------------------------
@@ -246,13 +256,13 @@ impl Client {
 
     pub(super) fn pressed(&mut self, press: Press, given: &Given, out: &mut Vec<Do>) {
         match press {
-            Press::SignIn { address, email, password, look, retry } => {
-                if self.sign_in_gate(retry) {
+            Press::SignIn { address, email, password, look } => {
+                if self.sign_in_gate() {
                     self.press_sign_in(address, Some(email), password, None, look, given, out);
                 }
             }
-            Press::SignInWithCode { address, code, password, again, look, retry } => {
-                if !self.sign_in_gate(retry) {
+            Press::SignInWithCode { address, code, password, again, look } => {
+                if !self.sign_in_gate() {
                     return;
                 }
                 if password.expose() != again.expose() {
@@ -260,11 +270,7 @@ impl Client {
                 }
                 self.press_sign_in(address, None, code, Some(password), look, given, out)
             }
-            Press::FormClosed => {
-                if let Some(live) = self.live.as_mut() {
-                    live.retry = Retry::None;
-                }
-            }
+            Press::FormClosed => self.drop_pending(),
             Press::SignOut => self.sign_out(given, out),
             Press::OpenDevices => self.open_devices(given, out),
             Press::ForceOut { device } => self.press_force_out(device, given, out),
@@ -281,31 +287,34 @@ impl Client {
     }
 
     /// Whether a sign-in press is taken at all, checked before the form is touched: not while
-    /// signed in, not while a try is under way (two quick presses are one try), and a retry
-    /// only when the form was told it may make one (8.3), once.
-    fn sign_in_gate(&mut self, retry: bool) -> bool {
+    /// signed in, and not while a sign-in request is out (two quick presses are one try). A
+    /// try still at its `hello` is dropped, with what was typed, and this press replaces it.
+    fn sign_in_gate(&mut self) -> bool {
         let Some(live) = self.live.as_mut() else { return false };
-        if (live.signed_in() && !live.stranger) || live.waiting(|what| matches!(what, Purpose::Hello(_) | Purpose::SignIn { .. })) {
+        if (live.signed_in() && !live.stranger) || live.waiting(|what| matches!(what, Purpose::SignIn { .. })) {
             return false;
         }
-        match (retry, live.retry) {
-            (true, Retry::Now { attempt }) if attempt == live.attempt => {
-                live.retry = Retry::Spent { attempt };
-                true
-            }
-            (true, _) => false,
-            (false, _) => {
-                live.attempt = live.attempt.wrapping_add(1);
-                live.retry = Retry::None;
-                true
+        self.drop_pending();
+        true
+    }
+
+    /// Drops a try still at its `hello`, and the password it holds: its answer asks nothing.
+    fn drop_pending(&mut self) {
+        if let Some(live) = self.live.as_mut() {
+            live.flight.retain(|flight| !matches!(flight.what, Purpose::Hello(_)));
+            if live.form.state == SignInState::Working && !live.waiting(|what| matches!(what, Purpose::SignIn { .. })) {
+                live.form.state = SignInState::Idle;
+                live.form.words.clear();
             }
         }
     }
 
-    /// The sign-in form's state and its sentence. `wait_s`: seconds to say, for "busy".
+    /// The sign-in form's state and its sentence. `wait_s`: for "busy", the exact seconds the
+    /// backend said to come back in, shown for the form to count down.
     fn set_form(&mut self, state: SignInState, wait_s: u64) {
         if let Some(live) = self.live.as_mut() {
             live.form.words = words::sign_in(state, live.app.kind, wait_s);
+            live.form.wait_s = (state == SignInState::Busy && wait_s > 0).then_some(wait_s);
             live.form.state = state;
             live.form.ask_permission = state == SignInState::NeedsPermission && live.app.kind == DeviceKind::Phone;
         }
@@ -365,9 +374,9 @@ impl Client {
         if live.device_secret.is_none() {
             match &given.random {
                 Some(random) => {
-                    let secret = DeviceSecret::from_bytes(*random.0);
-                    out.push(Do::Keep(Keep::DeviceSecret(secret.clone())));
-                    live.device_secret = Some(secret);
+                    let key = DeviceKey { secret: DeviceSecret::from_bytes(*random.0), backend_id: None };
+                    out.push(Do::Keep(Keep::DeviceSecret(key.clone())));
+                    live.device_secret = Some(key);
                 }
                 None => return self.set_form(SignInState::NoRandom, 0),
             }
@@ -379,10 +388,17 @@ impl Client {
         }
     }
 
-    /// Asks to sign in, once `hello` has said this is a backend that has accounts.
-    fn ask_sign_in(&mut self, origin: NexusOrigin, backend_id: BackendId, credential: Pressed, out: &mut Vec<Do>) -> bool {
-        let Some(live) = self.live.as_ref() else { return false };
-        let Some(device_secret) = live.device_secret.clone() else { return false };
+    /// Asks to sign in, once `hello` has said this is a backend that has accounts. The device
+    /// secret is the one kept for this backend id (or made before any sign-in); for any other
+    /// id this is a new device, with a new secret from this call's random bytes, kept only if
+    /// the sign-in succeeds (as ruled). Says whether it asked; `None` with no random bytes.
+    fn ask_sign_in(&mut self, origin: NexusOrigin, backend_id: BackendId, credential: Pressed, given: &Given, out: &mut Vec<Do>) -> Option<bool> {
+        let Some(live) = self.live.as_ref() else { return Some(false) };
+        let ours = live.device_secret.as_ref().filter(|key| key.backend_id.as_deref().is_none_or(|id| BackendId::from_hex(id) == Some(backend_id)));
+        let device_secret = match ours {
+            Some(key) => key.secret.clone(),
+            None => DeviceSecret::from_bytes(*given.random.as_ref()?.0),
+        };
         // 12.3: a sign-in names the restore number the device has, only if it has one from
         // this backend at this origin. A different id there is a sign-in to a new backend:
         // it names none, and what is kept changes only if it succeeds.
@@ -397,15 +413,15 @@ impl Client {
         };
         let message = SignIn {
             credential,
-            device_secret,
+            device_secret: device_secret.clone(),
             device_name: live.app.device_name.clone(),
             device_kind: live.app.kind,
             app_version: live.app.version,
             speaks: SPEAKS,
             restore,
         };
-        let Some(body) = hidden(account::encode(&message)) else { return false };
-        self.ask(Purpose::SignIn { origin, backend_id }, account::SIGN_IN, None, Some(body), out)
+        let Some(body) = hidden(account::encode(&message)) else { return Some(false) };
+        Some(self.ask(Purpose::SignIn { origin, backend_id, secret: device_secret }, account::SIGN_IN, None, Some(body), out))
     }
 
     /// Signing out here: lasting on the device at once, whatever the network. The note that
@@ -427,22 +443,22 @@ impl Client {
                 restore: saved.restore,
                 made_ms: given.now_ms,
             };
-            live.notes.retain(|kept| kept.session() != note.session());
-            if live.notes.len() >= NOTES_MAX {
-                // The oldest expired goes first, else the oldest.
-                let now = given.now_ms;
-                let index = live
-                    .notes
-                    .iter()
-                    .position(|kept| now.checked_sub(kept.made_ms).is_some_and(|age| age >= NOTE_LIFE_MS))
-                    .or_else(|| live.notes.iter().enumerate().min_by_key(|(_, kept)| kept.made_ms).map(|(index, _)| index));
-                if let Some(index) = index {
-                    let gone = live.notes.remove(index);
-                    out.push(Do::Forget(Forget::Note { session: gone.session() }));
-                }
-            }
+            // The new note is kept first; only then, past four, the oldest goes, and its
+            // telling is no longer waited for (as ruled). Expired ones go before that.
+            prune_expired(live, given.now_ms, out);
+            let (backend_id, session) = (note.backend_id.clone(), note.session());
+            live.notes.retain(|kept| kept.key() != (backend_id.as_str(), session));
             out.push(Do::Keep(Keep::Note(note.copy())));
             live.notes.push(note);
+            let mut dropped = Vec::new();
+            while live.notes.len() > NOTES_MAX {
+                let Some(index) = live.notes.iter().enumerate().min_by_key(|(_, kept)| kept.made_ms).map(|(index, _)| index) else { break };
+                let gone = live.notes.remove(index);
+                out.push(Do::Forget(gone.forget()));
+                retire(live, &gone.backend_id, gone.session());
+                dropped.push((BackendId::from_hex(&gone.backend_id), gone.session()));
+            }
+            self.parting.retain(|parting| !dropped.contains(&(Some(parting.backend), parting.session)));
         }
         out.push(Do::Forget(Forget::Saved));
         drop(saved);
@@ -523,7 +539,7 @@ impl Client {
             return;
         }
         let Some(body) = hidden(account::encode(&ForceOut { head, device: id, session })) else { return };
-        if self.ask(Purpose::ForceOut { device }, account::FORCE_OUT, Some(&bearer), Some(body), out) {
+        if self.ask(Purpose::ForceOut { device, session: session.get() }, account::FORCE_OUT, Some(&bearer), Some(body), out) {
             if let Some(live) = self.live.as_mut() {
                 live.devices.words.clear();
                 for row in live.devices.rows.iter_mut().filter(|row| row.id == device) {
@@ -608,23 +624,21 @@ impl Client {
     /// else is made of the answer; then the backend was reached and the receipt is taken.
     /// Gives back the outcome for the call's own part, or `None` if it was dealt with here.
     fn common<T>(&mut self, outcome: Outcome<T>, given: &Given, out: &mut Vec<Do>) -> Option<Outcome<T>> {
-        let (expected, account) = {
+        let (expected, account, nexus) = {
             let saved = self.live.as_ref()?.saved.as_ref()?;
-            (BackendId::from_hex(&saved.backend_id), saved.account)
+            (BackendId::from_hex(&saved.backend_id), saved.account, saved.nexus.clone())
         };
         let seen = match &outcome {
             Outcome::Done(_, seen) | Outcome::Refused(_, Some(seen)) => Some(*seen),
             _ => None,
         };
         if let Some(seen) = seen {
+            // The one value: the backend last seen at this address (as ruled).
+            self.saw(&nexus, seen.backend);
             if Some(seen.backend) != expected {
                 // Another backend answers at this origin: it is not ours. Nothing more is
                 // sent to it, and nothing it said is acted on (7.1).
-                if let Some(live) = self.live.as_mut() {
-                    live.stranger = true;
-                    live.flight.retain(|flight| flight.what.parting());
-                }
-                self.set_form(SignInState::StartAgain, 0);
+                self.became_stranger();
                 return None;
             }
             if seen.account != account {
@@ -720,19 +734,19 @@ impl Client {
     }
 
     pub(super) fn answered(&mut self, ask: u64, status: u16, body: &AnswerBody, given: &Given, out: &mut Vec<Do>) {
-        let Some((what, max_body)) = self.take_flight(ask) else { return };
         let bytes: &[u8] = &body.0;
-        if bytes.len() > max_body {
-            // Larger than the ask allowed: as if it were cut.
-            self.failed_purpose(what, Failure { how: How::Cut, inside: None, permission: None }, given);
+        // Larger than the ask allowed is not an answer: it is refused before the ask is
+        // touched, and the driver says what happened ([`How::Cut`]) or hands the right one.
+        if self.max_body_for(ask).is_none_or(|max_body| bytes.len() > max_body) {
             return;
         }
+        let Some((what, _)) = self.take_flight(ask) else { return };
         match what {
-            Purpose::Hello(pending) => self.answered_hello(pending, status, bytes, out),
+            Purpose::Hello(pending) => self.answered_hello(pending, status, bytes, given, out),
             Purpose::Verify { origin } => self.answered_verify(origin, status, bytes, given),
-            Purpose::SignIn { origin, backend_id } => {
+            Purpose::SignIn { origin, backend_id, secret } => {
                 let outcome = outcome(account::read_reply::<SignInAnswer>(status, bytes));
-                self.answered_sign_in(origin, backend_id, outcome, given, out);
+                self.answered_sign_in(origin, backend_id, secret, outcome, given, out);
             }
             Purpose::Devices { page, opened } => {
                 let outcome = outcome(account::read_reply::<DevicePage>(status, bytes));
@@ -742,17 +756,17 @@ impl Client {
                 let outcome = outcome(account::read_reply::<MusicLoginResult>(status, bytes));
                 self.answered_music(count, refused, outcome, given, out);
             }
-            Purpose::ForceOut { device } => {
+            Purpose::ForceOut { device, session } => {
                 let outcome = outcome(account::read_reply::<ForcedOut>(status, bytes));
-                self.answered_force_out(device, outcome, given, out);
+                self.answered_force_out(device, session, outcome, given, out);
             }
             Purpose::ChangePassword => {
                 let outcome = outcome(account::read_reply::<PasswordChanged>(status, bytes));
                 self.answered_change(outcome, given, out);
             }
-            Purpose::Tell { session } => {
+            Purpose::Tell { backend, session, origin } => {
                 let outcome = outcome(account::read_reply::<SignedOut>(status, bytes));
-                self.answered_tell(session, outcome, out);
+                self.answered_tell(backend, session, origin, outcome, out);
             }
         }
         self.settle(given, out);
@@ -762,18 +776,21 @@ impl Client {
     /// account now signed in. Its note goes only on a "done" stamped by the backend it was
     /// made for, or a definite "that session is gone"; busy, not dealt with, a failure or
     /// another backend's answer keeps it, to be told again.
-    fn answered_tell(&mut self, session: u64, outcome: Outcome<SignedOut>, out: &mut Vec<Do>) {
+    fn answered_tell(&mut self, backend: BackendId, session: u64, origin: String, outcome: Outcome<SignedOut>, out: &mut Vec<Do>) {
+        if let Outcome::Done(_, seen) | Outcome::Refused(_, Some(seen)) = &outcome {
+            self.saw(&origin, seen.backend);
+        }
+        let backend_id = backend.to_hex();
         let Some(live) = self.live.as_mut() else { return };
-        let Some(note) = live.notes.iter().find(|note| note.session() == session) else { return };
-        let ours = BackendId::from_hex(&note.backend_id);
+        let Some(note) = live.notes.iter().find(|note| note.key() == (backend_id.as_str(), session)) else { return };
         let settled = match outcome {
-            Outcome::Done(_, seen) => Some(seen.backend) == ours,
+            Outcome::Done(_, seen) => seen.backend == backend,
             Outcome::Refused(Why::SessionEnded | Why::DataPutBack, _) => true,
             _ => false,
         };
         if settled {
-            live.notes.retain(|note| note.session() != session);
-            out.push(Do::Forget(Forget::Note { session }));
+            out.push(Do::Forget(note.forget()));
+            retire(live, &backend_id, session);
         }
     }
 
@@ -783,30 +800,51 @@ impl Client {
     /// sign in again. Nothing that is a backend: as if unreachable, and asked again when it
     /// may be.
     fn answered_verify(&mut self, origin: String, status: u16, body: &[u8], given: &Given) {
-        let Found::Backend(hello) = proto::classify(status, body) else { return self.unreached(given) };
+        let active = self.live.as_ref().and_then(|live| live.saved.as_ref()).is_some_and(|saved| saved.nexus == origin);
+        let Found::Backend(hello) = proto::classify(status, body) else {
+            if active {
+                self.unreached(given);
+            }
+            return;
+        };
+        self.saw(&origin, hello.id);
         let Some(live) = self.live.as_mut() else { return };
-        live.verified.retain(|(at, _)| *at != origin);
-        live.verified.push((origin.clone(), hello.id));
         let ours = live.saved.as_ref().filter(|saved| saved.nexus == origin).map(|saved| BackendId::from_hex(&saved.backend_id) == Some(hello.id));
         if ours == Some(false) && live.signed_in() {
-            live.stranger = true;
-            live.flight.retain(|flight| flight.what.parting());
-            self.set_form(SignInState::StartAgain, 0);
+            self.became_stranger();
             return;
         }
-        // The backend was reached: what was waiting for it is asked now ([`Client::settle`]).
-        if let Some(live) = self.live.as_mut() {
+        // Reached: what was waiting for it is asked now ([`Client::settle`]). Only the
+        // active backend's reachability is what the row shows.
+        if active && let Some(live) = self.live.as_mut() {
             live.reach = Reach::Up;
-            live.restored = true;
             live.backend_blocked = false;
+        }
+        if let Some(live) = self.live.as_mut() {
+            live.restored = true;
         }
     }
 
-    fn answered_hello(&mut self, pending: Pending, status: u16, body: &[u8], out: &mut Vec<Do>) {
+    /// Another backend answers at the active address: nothing more goes to it, nothing is
+    /// forgotten, the music plays on, and the person is asked to sign in again.
+    fn became_stranger(&mut self) {
+        if let Some(live) = self.live.as_mut() {
+            live.stranger = true;
+            live.flight.retain(|flight| flight.what.parting());
+            if live.renewal.refused.is_some() {
+                live.music_words = Some(words::music(words::Music::SignInToRenew));
+            }
+        }
+        self.set_form(SignInState::StartAgain, 0);
+    }
+
+    fn answered_hello(&mut self, pending: Pending, status: u16, body: &[u8], given: &Given, out: &mut Vec<Do>) {
         let hello = match proto::classify(status, body) {
             Found::Backend(hello) => hello,
             Found::NoBackend(_) => return self.set_form(SignInState::NoNexusServer, 0),
         };
+        let at = pending.origin.origin().to_string();
+        self.saw(&at, hello.id);
         let ours: Speaks = SPEAKS;
         if hello.speaks.low() > ours.high() {
             return self.set_form(SignInState::AppTooOld, 0);
@@ -815,42 +853,33 @@ impl Client {
             return self.set_form(SignInState::ServerTooOld, 0);
         }
         let Pending { origin, credential } = pending;
-        if let Some(live) = self.live.as_mut() {
-            let at = origin.origin().to_string();
-            live.verified.retain(|(verified, _)| *verified != at);
-            live.verified.push((at.clone(), hello.id));
-            if live.too_old.as_deref() == Some(at.as_str()) {
-                live.too_old = None;
-            }
+        if let Some(live) = self.live.as_mut()
+            && live.too_old.as_deref() == Some(at.as_str())
+        {
+            live.too_old = None;
         }
-        if !self.ask_sign_in(origin, hello.id, credential, out) {
-            self.set_form(SignInState::CantReach, 0);
+        match self.ask_sign_in(origin, hello.id, credential, given, out) {
+            Some(true) => {}
+            Some(false) => self.set_form(SignInState::CantReach, 0),
+            None => self.set_form(SignInState::NoRandom, 0),
         }
     }
 
-    fn answered_sign_in(&mut self, origin: NexusOrigin, backend_id: BackendId, outcome: Outcome<SignInAnswer>, given: &Given, out: &mut Vec<Do>) {
+    fn answered_sign_in(&mut self, origin: NexusOrigin, backend_id: BackendId, secret: DeviceSecret, outcome: Outcome<SignInAnswer>, _given: &Given, out: &mut Vec<Do>) {
+        if let Outcome::Done(_, seen) | Outcome::Refused(_, Some(seen)) = &outcome {
+            self.saw(&origin.origin().to_string(), seen.backend);
+        }
         let (signed, seen) = match outcome {
             Outcome::Done(signed, seen) if seen.backend == backend_id && seen.account == signed.person.id => (signed, seen),
             // A receipt from another backend than the one whose hello was read: not ours.
             Outcome::Done(..) => return self.set_form(SignInState::NoNexusServer, 0),
             Outcome::Refused(why, _) => {
-                let Some(live) = self.live.as_mut() else { return };
                 let (state, wait) = match why {
                     Why::WrongLogin | Why::Denied => (SignInState::WrongLogin, 0),
                     Why::AccountOff => (SignInState::AccountOff, 0),
-                    Why::Busy { seconds } => {
-                        // 8.3: a right password is never refused; it may wait. One retry by
-                        // itself after the wait, for this press; a second wait is the
-                        // person's.
-                        let attempt = live.attempt;
-                        if let Some(seconds) = seconds
-                            && live.retry != (Retry::Spent { attempt })
-                        {
-                            let due_ms = given.now_ms.saturating_add(seconds.saturating_mul(1000));
-                            live.retry = Retry::Armed { attempt, due_ms, seconds };
-                        }
-                        (SignInState::Busy, seconds.unwrap_or(0))
-                    }
+                    // 8.3: a right password is never refused; it may wait. The exact seconds
+                    // are shown, every time; the form counts down and the person presses.
+                    Why::Busy { seconds } => (SignInState::Busy, seconds.unwrap_or(0)),
                     Why::Incompatible { low, .. } if low > SPEAKS.high() => (SignInState::AppTooOld, 0),
                     Why::Incompatible { .. } => (SignInState::ServerTooOld, 0),
                     Why::PasswordNotAllowed => (SignInState::PasswordNotAllowed, 0),
@@ -872,8 +901,20 @@ impl Client {
         live.stranger = false;
         live.backend_blocked = false;
         live.check_due = false;
-        live.retry = Retry::None;
         live.account_generation = generation;
+        // "Too old" was another backend's, if it was said elsewhere.
+        if live.too_old.as_deref().is_some_and(|said| *said != origin.origin().to_string()) {
+            live.too_old = None;
+        }
+        // The device secret, for this backend from now on (a new one, if this was made as a
+        // new device, kept only now that it succeeded).
+        let key = DeviceKey { secret, backend_id: Some(backend_id.to_hex()) };
+        let same = live.device_secret.as_ref().is_some_and(|kept| kept.secret == key.secret && kept.backend_id == key.backend_id);
+        if !same {
+            out.push(Do::Keep(Keep::DeviceSecret(key.clone())));
+            live.device_secret = Some(key);
+        }
+        let held_before = live.held_count().is_some();
         let (music, none) = match signed.music {
             MusicLoginResult::Login(login) => (Some(login), None),
             MusicLoginResult::NoneSetYet => (None, Some(words::Music::NoneSet)),
@@ -897,10 +938,15 @@ impl Client {
             music,
         };
         live.form.email = saved.email.clone();
-        // One thing, whole, in one step; then the player.
+        // One thing, whole, in one step; then the player. With no login now, the one the
+        // player held (another account's, kept through "start again") is taken from it.
+        // Either way the music server's permission decision was about the old login.
         out.push(Do::Keep(Keep::Saved(saved.copy())));
-        if let Some(login) = &saved.music {
-            out.push(Do::Hand(Hand::Login { login: copy(login), generation }));
+        live.music_blocked = false;
+        match &saved.music {
+            Some(login) => out.push(Do::Hand(Hand::Login { login: copy(login), generation })),
+            None if held_before => out.push(Do::Hand(Hand::NoLogin { generation })),
+            None => {}
         }
         live.saved = Some(saved);
         self.set_form(SignInState::Idle, 0);
@@ -1003,6 +1049,7 @@ impl Client {
                 // Unanswered, a stamped "busy" included: owed, and asked again only when the
                 // backend may be reachable, never from this answer.
                 live.renewal.owed = Some((count, refused));
+                live.renewal.owed_now = true;
                 if live.renewal.refused.is_some() {
                     live.music_words = Some(words::music(words::Music::WhenReachable));
                 }
@@ -1010,11 +1057,13 @@ impl Client {
         }
     }
 
-    fn answered_force_out(&mut self, device: u64, outcome: Outcome<ForcedOut>, given: &Given, out: &mut Vec<Do>) {
+    fn answered_force_out(&mut self, device: u64, session: u64, outcome: Outcome<ForcedOut>, given: &Given, out: &mut Vec<Do>) {
         let Some(outcome) = self.common(outcome, given, out) else { return };
         let Some(live) = self.live.as_mut() else { return };
+        // Only a row still naming the session that was forced out: one listed since with a
+        // newer session is another sign-in, and is left as it is.
         let gone = |live: &mut Live, words: String| {
-            for row in live.devices.rows.iter_mut().filter(|row| row.id == device) {
+            for row in live.devices.rows.iter_mut().filter(|row| row.id == device && row.session == Some(session)) {
                 row.working = false;
                 row.can_force_out = false;
                 row.session = None;
@@ -1059,7 +1108,15 @@ impl Client {
         // is not held. A certificate that is wrong is never this. Whatever asked, it is the
         // one permission decision, shown on whatever screen is up.
         let blocked = !failure.how.connected() && Look { inside: failure.inside, permission: failure.permission }.blocked();
-        if blocked && let Some(live) = self.live.as_mut() {
+        // Only for the active backend's address, or the form's: a note's telling elsewhere
+        // says nothing of the one this device uses.
+        let active_origin = self.live.as_ref().and_then(|live| live.saved.as_ref()).map(|saved| saved.nexus.clone());
+        let here = match &what {
+            Purpose::Tell { .. } => false,
+            Purpose::Verify { origin } => active_origin.as_deref() == Some(origin.as_str()),
+            _ => true,
+        };
+        if blocked && here && let Some(live) = self.live.as_mut() {
             live.backend_blocked = live.app.kind == DeviceKind::Phone;
         }
         let form = if blocked {
@@ -1071,7 +1128,11 @@ impl Client {
         };
         match what {
             Purpose::Hello(_) | Purpose::SignIn { .. } => self.set_form(form, 0),
-            Purpose::Verify { .. } => self.unreached(given),
+            Purpose::Verify { .. } => {
+                if here {
+                    self.unreached(given);
+                }
+            }
             Purpose::Devices { opened, .. } => {
                 self.unreached(given);
                 if let Some(live) = self.live.as_mut() {
@@ -1091,7 +1152,7 @@ impl Client {
                     }
                 }
             }
-            Purpose::ForceOut { device } => {
+            Purpose::ForceOut { device, .. } => {
                 self.unreached(given);
                 if let Some(live) = self.live.as_mut() {
                     for row in live.devices.rows.iter_mut().filter(|row| row.id == device) {
@@ -1120,7 +1181,6 @@ impl Client {
         }
         // Nothing is asked while Offline is on, and nothing that was asked is waited for or
         // sent ([`Client::waits_for`]), but a sign-out being told.
-        live.retry = Retry::None;
         let abandoned: Vec<Flight> = std::mem::take(&mut live.flight);
         let mut form = false;
         for flight in abandoned {
@@ -1134,7 +1194,7 @@ impl Client {
                     }
                 }
                 Purpose::Music { count, refused } => live.renewal.owed = Some((count, refused)),
-                Purpose::ForceOut { device } => {
+                Purpose::ForceOut { device, .. } => {
                     for row in live.devices.rows.iter_mut().filter(|row| row.id == device) {
                         row.working = false;
                     }
@@ -1166,21 +1226,6 @@ impl Client {
             self.ask_tell(given, out);
         }
         // The sending half (C8's events, C6's Diagnostics) is driven from here: owed.
-    }
-
-    /// The form's timer for a wait fired: the one retry may be made now, if the form, the
-    /// press and the conditions are as they were (8.3).
-    pub(super) fn wait_passed(&mut self, given: &Given) {
-        let Some(live) = self.live.as_mut() else { return };
-        if let Retry::Armed { attempt, due_ms, .. } = live.retry
-            && attempt == live.attempt
-            && given.now_ms >= due_ms
-            && !live.offline
-            && !live.signed_in()
-            && live.form.state == SignInState::Busy
-        {
-            live.retry = Retry::Now { attempt };
-        }
     }
 
     /// 6.3, as ruled: the first report for a number sets it aside, at once; one renewal for
@@ -1232,17 +1277,12 @@ impl Client {
         let row = match (live.saved.as_ref().filter(|_| live.signed_in()), live.reach) {
             (None, _) => words::row(Row::SignedOut),
             _ if live.stranger => words::row(Row::Stranger),
-            _ if live.too_old.is_some() => words::row(Row::TooOld),
+            (Some(saved), _) if live.too_old.as_deref() == Some(saved.nexus.as_str()) => words::row(Row::TooOld),
             _ if live.offline => words::row(Row::Offline),
             _ if live.backend_blocked => words::row(Row::NeedsPermission),
             (Some(_), Reach::Up) => words::row(Row::Connected),
             (Some(saved), Reach::Unknown) => words::row(Row::SignedIn(&saved.email)),
             (Some(_), Reach::Down { since_ms }) => words::row(Row::Down { since: words::time_of_day(since_ms, given.local_offset_minutes) }),
-        };
-        let (wait_s, send_again) = match live.retry {
-            Retry::Armed { attempt, seconds, .. } if attempt == live.attempt => (Some(seconds), false),
-            Retry::Now { attempt } if attempt == live.attempt => (None, true),
-            _ => (None, false),
         };
         let shown = Shown {
             screen,
@@ -1252,8 +1292,7 @@ impl Client {
                 address: live.form.address.clone(),
                 email: live.form.email.clone(),
                 ask_permission: live.form.ask_permission,
-                wait_s,
-                send_again,
+                wait_s: live.form.wait_s,
             },
             row,
             who: signed.map(|saved| format!("{} ({})", saved.name, saved.email)),
