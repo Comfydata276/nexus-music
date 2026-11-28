@@ -28,7 +28,8 @@ use nexus_core::nexus::kept::{Account as Decided, AccountState, AdminAction, Adm
 use nexus_core::nexus::proto::BackendId;
 
 use crate::identity;
-use crate::store::apart::{self, Account, Reading, Store};
+use crate::store::apart::{self, Account, LidarrKept, Reading, Store};
+use nexus_core::nexus::admin::{InternalAddress, LidarrBinding, SealedLidarrKey};
 use crate::store::copies;
 use crate::store::crash;
 use crate::store::data::{self, Change, Data, Opened, why};
@@ -57,6 +58,16 @@ impl<'a> From<Option<(&'a [u8; 32], u64)>> for First<'a> {
         code.map_or(First::Nothing, |(code, until)| First::Code(code, until))
     }
 }
+
+/// The Lidarr key as [`Keeper::lidarr`] finds it: its binding now, and its seal if the store
+/// holds one for exactly that binding.
+#[derive(Debug)]
+pub struct Lidarr {
+    pub binding: Option<LidarrBinding>,
+    pub sealed: Option<SealedLidarrKey>,
+}
+
+pub use crate::store::apart::RequestsSwitch;
 
 /// Why the backend does not serve, or a command did nothing: a sentence for the owner.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -785,12 +796,37 @@ impl Keeper {
         // What a music login cannot be kept without, said before anything is written: sealed
         // for its own account, this backend and the row's count (its internal address is in
         // the binding itself, core-fu2).
-        for update in &effects.updates {
-            if let DataChange::InstallMusicLogin(install) = &update.change {
-                let binding = &install.binding;
-                if binding.account != update.apart_first.account.id || binding.count != update.data.account.music_login || binding.backend != self.backend {
-                    return Err(Failed("A music login was sealed for another account, backend or count; nothing was kept.".into()));
+        // A switch for requests, or the Lidarr key, only as the successor of what the store
+        // has now (S13): each is written in the FIRST store write, store first, and nowhere
+        // else.
+        for (update, &number) in effects.updates.iter().zip(&numbers) {
+            match &update.change {
+                DataChange::InstallMusicLogin(install) => {
+                    let binding = &install.binding;
+                    if binding.account != update.apart_first.account.id || binding.count != update.data.account.music_login || binding.backend != self.backend {
+                        return Err(Failed("A music login was sealed for another account, backend or count; nothing was kept.".into()));
+                    }
                 }
+                DataChange::SetRequestsEnabled { revision, .. } => {
+                    if self.store.requests.get(&number).copied().unwrap_or_default().revision.checked_add(1) != Some(*revision) {
+                        return Err(Failed("A switch for requests was set under another revision; nothing was kept.".into()));
+                    }
+                }
+                DataChange::InstallLidarrKey { binding, .. } => {
+                    let kept = &self.store.lidarr;
+                    if binding.backend != self.backend || kept.address.as_deref() != Some(binding.address.as_str()) || kept.revision.checked_add(1) != Some(binding.revision) {
+                        return Err(Failed("A Lidarr key was sealed for another backend, address or revision; nothing was kept.".into()));
+                    }
+                }
+                DataChange::Keep
+                | DataChange::ChangePassword
+                | DataChange::ResetPassword
+                | DataChange::OwnerRecovery { .. }
+                | DataChange::RedeemCode { .. }
+                | DataChange::EraseHistory
+                | DataChange::DiscardCredentials
+                | DataChange::DeleteAccount
+                | DataChange::ApplyAdmin { .. } => {}
             }
         }
         let mut next = self.store.clone();
@@ -804,6 +840,17 @@ impl Keeper {
             }
             if let Some(highest) = update.apart_first.devices.values().map(|device| device.last_session).max() {
                 next.next_session = next.next_session.max(highest.saturating_add(1));
+            }
+        }
+        for (update, &number) in effects.updates.iter().zip(&numbers) {
+            match &update.change {
+                DataChange::SetRequestsEnabled { enabled, revision } => {
+                    next.requests.insert(number, RequestsSwitch { enabled: *enabled, revision: *revision });
+                }
+                DataChange::InstallLidarrKey { binding, sealed } => {
+                    next.lidarr = LidarrKept { revision: binding.revision, address: Some(binding.address.as_str().to_string()), sealed: Some(sealed.as_bytes().to_vec()) };
+                }
+                _ => {}
             }
         }
         next.pending = Some(Pending::Change { accounts: numbers.clone() });
@@ -843,13 +890,14 @@ impl Keeper {
                 DataChange::ApplyAdmin { action, target } => match (action, target) {
                     (AdminAction::SetMusicAddress(address), AdminTarget::Backend) => changes.push(Change::MusicPublic { address: address.as_str() }),
                     (AdminAction::SetDiagnosticsDefault(on), AdminTarget::Backend) => changes.push(Change::DiagnosticsDefault { on: *on }),
-                    (AdminAction::SetRequests(on), AdminTarget::Backend) => changes.push(Change::Requests { on: *on }),
                     // What these change is the account's state, in `Install` (and the store).
                     (AdminAction::SetOn(_) | AdminAction::DeleteAccount | AdminAction::ResetPassword | AdminAction::SetAdmin(_) | AdminAction::ForceOut(_) | AdminAction::MusicLoginChanged | AdminAction::CreateAccount, _) => {}
-                    // Kept by no one yet: the Lidarr settings are S13's (not in this cut).
-                    (AdminAction::SetLidarr, _) => {}
-                    (AdminAction::SetMusicAddress(_) | AdminAction::SetDiagnosticsDefault(_) | AdminAction::SetRequests(_), AdminTarget::Account { .. } | AdminTarget::NewAccount(_)) => {}
+                    // Their own effects (`SetRequestsEnabled`, `InstallLidarrKey`): the store's.
+                    (AdminAction::SetRequests { .. } | AdminAction::SetLidarr { .. }, _) => {}
+                    (AdminAction::SetMusicAddress(_) | AdminAction::SetDiagnosticsDefault(_), AdminTarget::Account { .. } | AdminTarget::NewAccount(_)) => {}
                 },
+                // Written in the store kept apart alone, in its first write (above).
+                DataChange::SetRequestsEnabled { .. } | DataChange::InstallLidarrKey { .. } => {}
             }
             changes.push(Change::Codes { account: number, keep: live(update.data.account.code) });
         }
@@ -912,6 +960,37 @@ impl Keeper {
             }
         }
         Ok(value)
+    }
+
+    /// An account's switch for requests and its revision (S13), as the store kept apart has
+    /// it: the authority a grant to change it is bound to.
+    pub fn requests_switch(&self, account: u64) -> Result<RequestsSwitch, Failed> {
+        if !self.store.accounts.contains_key(&account) {
+            return Err(Failed("There is no such account.".into()));
+        }
+        Ok(self.store.requests.get(&account).copied().unwrap_or_default())
+    }
+
+    /// The Lidarr key's binding for `configured` (`NEXUS_LIDARR`, or none) and the sealed key
+    /// if the store holds one for exactly that binding (S13). If the store last saw another
+    /// address (changed, or removed), the key it holds is retired first, store first: its
+    /// revision moves on and its seal goes, so that setting the address back never revives it.
+    pub fn lidarr(&mut self, configured: Option<&InternalAddress>) -> Result<Lidarr, Failed> {
+        self.heal()?;
+        let seen = configured.map(|address| address.as_str().to_string());
+        if self.store.lidarr.address != seen {
+            let mut next = self.store.clone();
+            next.lidarr = LidarrKept {
+                revision: next.lidarr.revision.checked_add(1).ok_or_else(|| Failed("The Lidarr key's revision can go no higher.".into()))?,
+                address: seen,
+                sealed: None,
+            };
+            self.write_store(next)?;
+        }
+        let kept = &self.store.lidarr;
+        let binding = configured.map(|address| LidarrBinding { backend: self.backend, address: address.clone(), revision: kept.revision });
+        let sealed = kept.sealed.as_deref().filter(|_| binding.is_some()).and_then(SealedLidarrKey::from_bytes);
+        Ok(Lidarr { binding, sealed })
     }
 
     /// The data, to read from (nothing is written through it).
@@ -1267,6 +1346,9 @@ pub fn take_as_is(state: &Path, folder: &Path, now: u64) -> Result<Said, Refused
         .max();
     store.next_session = highest_session.map_or(1, |n| n.saturating_add(1)).max(old.map_or(1, |old| old.next_session));
     if let Some(old) = old {
+        // What only this store knows of requests: each account's switch, and the Lidarr key.
+        store.requests = old.requests.clone();
+        store.lidarr = old.lidarr.clone();
         for (&number, account) in &old.accounts {
             if !view.accounts.contains_key(&number) {
                 let mut tombstone = account.clone();

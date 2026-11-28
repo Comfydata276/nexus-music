@@ -119,6 +119,7 @@ impl Fixture {
                 clock,
                 backend,
                 music: MusicSide::new(MusicClient::from_this_machine().0, "http://navidrome:4533".into()),
+                lidarr: None,
             });
             tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap().block_on(async {
                 let listener = serve::listen(addr).unwrap();
@@ -438,7 +439,10 @@ fn batch_places_belong_to_live_accounts() {
         RequestHead { restore: stamp.restore + 1, ..head(&stamp) },
         stamp.life, &rows, events::BATCH_BYTES,
     ).unwrap().write().unwrap();
-    let mut socket = fixture.request(events::SEND_PATH, Some(&fake), "", stale.bytes().len());
+    // A stale restore number is told "data put back" (a real session: on data never put back,
+    // a session the data does not have is "no one", refused before its body by the common
+    // check; on data put back, it is judged from its body: `admit::Shown::Unproven`).
+    let mut socket = fixture.request(events::SEND_PATH, Some(&who.session), "", stale.bytes().len());
     socket.write_all(stale.bytes()).unwrap();
     let (status, stale_reply) = response(socket);
     assert_eq!(account::read_reply::<SignedOut>(status, &stale_reply).unwrap(),

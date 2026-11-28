@@ -41,6 +41,17 @@ const ADMIN: &str = "admin@example.org";
 const PERSON: &str = "person@example.org";
 const PASSWORD: &str = "a made-up password of the admin's";
 const PERSONS_PASSWORD: &str = "a made-up password of the person's";
+/// The admin's page's own origin (`NEXUS_PUBLIC_ORIGIN`): every admin call is the page's
+/// (core-fu3: only the page's session kind may make one), so it is signed in and called as the
+/// page is, from here and marked.
+const PAGE_ORIGIN: &str = "https://nexus.example.test";
+/// The device the admin's page signs in from, apart from the admin's app's.
+const PAGE_DEVICE: u8 = 0x50;
+
+/// What the admin's page sends with each call: its origin and its mark.
+fn page_headers() -> String {
+    format!("Origin: {PAGE_ORIGIN}\r\nX-Nexus-Admin: 1\r\n")
+}
 
 fn navidrome() -> (String, u16) {
     let address = std::env::var("NEXUS_TEST_NAVIDROME").expect("NEXUS_TEST_NAVIDROME: the test Navidrome's address, e.g. http://127.0.0.1:4690");
@@ -239,6 +250,7 @@ impl Folders {
             ("NEXUS_DATA", self.root.join("data").display().to_string()),
             ("NEXUS_STATE", self.root.join("state").display().to_string()),
             ("NEXUS_LISTEN", format!("127.0.0.1:{port}")),
+            ("NEXUS_PUBLIC_ORIGIN", PAGE_ORIGIN.into()),
         ]
     }
 
@@ -309,6 +321,11 @@ impl Serving {
         self.post_with(path, session, "", body)
     }
 
+    /// As the admin's page posts: from its origin, marked.
+    fn post_page(&self, path: &str, session: Option<&Session>, body: &[u8]) -> (u16, Vec<u8>) {
+        self.post_with(path, session, &page_headers(), body)
+    }
+
     /// The same, with more headers (each line ending in CRLF).
     fn post_with(&self, path: &str, session: Option<&Session>, more: &str, body: &[u8]) -> (u16, Vec<u8>) {
         let mut stream = TcpStream::connect(self.at).unwrap();
@@ -339,6 +356,15 @@ fn head(restore: u64) -> RequestHead {
 }
 
 fn sign_in(backend: &Serving, credential: Credential, device: u8) -> SignedIn {
+    sign_in_with(backend, credential, device, "")
+}
+
+/// Signing in as the admin's page does: its session is the page's kind.
+fn sign_in_at_the_page(backend: &Serving, credential: Credential) -> SignedIn {
+    sign_in_with(backend, credential, PAGE_DEVICE, &page_headers())
+}
+
+fn sign_in_with(backend: &Serving, credential: Credential, device: u8, more: &str) -> SignedIn {
     let request = SignIn {
         credential,
         device_secret: DeviceSecret::from_bytes([device; 32]),
@@ -348,7 +374,7 @@ fn sign_in(backend: &Serving, credential: Credential, device: u8) -> SignedIn {
         speaks: SPEAKS,
         restore: None,
     };
-    let (status, body) = backend.post(account::SIGN_IN, None, account::encode(&request).unwrap().bytes());
+    let (status, body) = backend.post_with(account::SIGN_IN, None, more, account::encode(&request).unwrap().bytes());
     match account::read_reply::<SignedIn>(status, &body).unwrap() {
         Reply::Done { result, .. } => result,
         other => panic!("not signed in: {status} {other:?}"),
@@ -363,19 +389,25 @@ fn with_password(email: &str, password: &str) -> Credential {
     Credential::Password { email: Email::new(email).unwrap(), password: Password::presented(password).unwrap() }
 }
 
-/// The admin's signed-in session, with its restore number, and a counter of request numbers.
+/// The admin at the admin's page: its page session, with its restore number, and a counter of
+/// request numbers. Every call is made as the page makes it.
 struct Admin<'a> {
     backend: &'a Serving,
     signed: SignedIn,
     next: u64,
 }
 
-impl Admin<'_> {
+impl<'a> Admin<'a> {
+    /// The admin signs in at the page, with the password, requests numbered from `next`.
+    fn at_the_page(backend: &'a Serving, next: u64) -> Admin<'a> {
+        Admin { backend, signed: sign_in_at_the_page(backend, with_password(ADMIN, PASSWORD)), next }
+    }
+
     fn grant(&mut self, action: Action) -> (RequestId, account::GrantSecret) {
         self.next += 1;
         let request_id = RequestId::new(self.next).unwrap();
         let request = GrantRequest { head: head(self.signed.restore), change: NamedChange { request_id, action }, password: Password::presented(PASSWORD).unwrap() };
-        let (status, body) = self.backend.post(admin::REQUEST_GRANT, Some(&self.signed.session), admin::encode(&request).unwrap().bytes());
+        let (status, body) = self.backend.post_page(admin::REQUEST_GRANT, Some(&self.signed.session), admin::encode(&request).unwrap().bytes());
         match admin::read_reply::<GrantIssued>(status, &body).unwrap() {
             admin::Reply::Done(GrantIssued { grant }) => (request_id, grant),
             other => panic!("no grant: {status} {other:?}"),
@@ -386,7 +418,7 @@ impl Admin<'_> {
         let address = MusicAddress::new(public).unwrap();
         let (request_id, grant) = self.grant(Action::SetMusicServer(address.clone()));
         let request = GrantedChange { head: head(self.signed.restore), request_id, change: MusicServerAddress { public: address }, grant };
-        let (status, body) = self.backend.post(admin::SET_MUSIC_SERVER, Some(&self.signed.session), admin::encode(&request).unwrap().bytes());
+        let (status, body) = self.backend.post_page(admin::SET_MUSIC_SERVER, Some(&self.signed.session), admin::encode(&request).unwrap().bytes());
         admin::read_reply::<Applied>(status, &body).unwrap()
     }
 
@@ -394,7 +426,7 @@ impl Admin<'_> {
         let (request_id, grant) = self.grant(Action::SetMusicLogin(account));
         let change = TypedMusicLogin { account, name: Name::new(name).unwrap(), password: MusicPassword::new(password).unwrap() };
         let request = GrantedChange { head: head(self.signed.restore), request_id, change, grant };
-        let (status, body) = self.backend.post(admin::SET_MUSIC_LOGIN, Some(&self.signed.session), admin::encode(&request).unwrap().bytes());
+        let (status, body) = self.backend.post_page(admin::SET_MUSIC_LOGIN, Some(&self.signed.session), admin::encode(&request).unwrap().bytes());
         (status, admin::read_reply::<Applied>(status, &body).unwrap())
     }
 }
@@ -455,7 +487,7 @@ fn an_admin_sets_a_music_login_and_the_person_plays_and_no_failure_touches_it() 
     let mut backend = Serving::start(&settings, port);
     let signed = sign_in(&backend, with_code(&admin_code, PASSWORD), 1);
     assert_eq!(signed.music, MusicLoginResult::NoneSetYet);
-    let mut admin = Admin { backend: &backend, signed, next: 0 };
+    let mut admin = Admin::at_the_page(&backend, 0);
     // The person signs in first: none set yet.
     let person = sign_in(&backend, with_code(&person_code, PERSONS_PASSWORD), 2);
     assert_eq!(person.music, MusicLoginResult::NoneSetYet);
@@ -508,15 +540,17 @@ fn an_admin_sets_a_music_login_and_the_person_plays_and_no_failure_touches_it() 
     let (request_id, grant) = admin.grant(Action::SetMusicLogin(admin.signed.person.id));
     let change = TypedMusicLogin { account: person.person.id, name: Name::new(MUSIC_USER).unwrap(), password: MusicPassword::new(MUSIC_PASSWORD).unwrap() };
     let request = GrantedChange { head: head(admin.signed.restore), request_id, change, grant };
-    let (status, _) = backend.post(admin::SET_MUSIC_LOGIN, Some(&admin.signed.session), admin::encode(&request).unwrap().bytes());
+    let (status, _) = backend.post_page(admin::SET_MUSIC_LOGIN, Some(&admin.signed.session), admin::encode(&request).unwrap().bytes());
     assert_eq!(status, 403);
     // And nobody signed in can cause the music server to be asked at all.
     let asked_before = between.taken.load(Ordering::SeqCst);
     let (status, _) = backend.post(admin::SET_MUSIC_LOGIN, None, admin::encode(&request).unwrap().bytes());
     assert_eq!(status, 401);
-    // Nor can a call that is not one.
-    let (status, _) = backend.post(admin::REQUEST_GRANT, Some(&phone.session), b"{}");
+    // Nor can a call that is not one, nor an app's session at an admin call.
+    let (status, _) = backend.post_page(admin::REQUEST_GRANT, Some(&admin.signed.session), b"{}");
     assert_eq!(status, 400);
+    let (status, _) = backend.post(admin::REQUEST_GRANT, Some(&phone.session), b"{}");
+    assert_eq!(status, 403);
     assert_eq!(between.taken.load(Ordering::SeqCst), asked_before);
 
     // Forcing the phone out does not change its login (9.5): the person's other device is
@@ -552,7 +586,8 @@ fn a_sealed_login_tampered_moved_or_put_back_from_an_older_copy_is_not_handed_ou
     let mut backend = Serving::start(&settings, port);
     let signed = sign_in(&backend, with_code(&admin_code, PASSWORD), 1);
     let person = sign_in(&backend, with_code(&person_code, PERSONS_PASSWORD), 2);
-    let mut admin = Admin { backend: &backend, signed, next: 0 };
+    let _ = signed;
+    let mut admin = Admin::at_the_page(&backend, 0);
     assert!(matches!(admin.set_music_server(&between.public()), admin::Reply::Done(_)));
     let admin_id = admin.signed.person.id;
     // Both accounts have the same music user's login (the test Navidrome's one user), each
@@ -586,7 +621,7 @@ fn a_sealed_login_tampered_moved_or_put_back_from_an_older_copy_is_not_handed_ou
     let backend = Serving::start(&settings, port);
     assert_eq!(sign_in(&backend, with_password(PERSON, PERSONS_PASSWORD), 3).music, MusicLoginResult::UnusableNow, "a changed seal opened");
     // The admin types both again: good again, under the next counts.
-    let mut admin = Admin { backend: &backend, signed: sign_in(&backend, with_password(ADMIN, PASSWORD), 1), next: 100 };
+    let mut admin = Admin::at_the_page(&backend, 100);
     assert_eq!(admin.set_music_login(person.person.id, MUSIC_USER, MUSIC_PASSWORD).0, 200);
     let handed = login(sign_in(&backend, with_password(PERSON, PERSONS_PASSWORD), 3).music);
     assert_eq!(handed.count, 2);
@@ -598,7 +633,7 @@ fn a_sealed_login_tampered_moved_or_put_back_from_an_older_copy_is_not_handed_ou
     // the data's login is the older one (count 2), the store's count is 3: not handed out.
     let copy = nexus_music_server::store::copies::nightly(&folders.data(), now_ms()).unwrap();
     let backend = Serving::start(&settings, port);
-    let mut admin = Admin { backend: &backend, signed: sign_in(&backend, with_password(ADMIN, PASSWORD), 1), next: 200 };
+    let mut admin = Admin::at_the_page(&backend, 200);
     assert_eq!(admin.set_music_login(person.person.id, MUSIC_USER, MUSIC_PASSWORD).0, 200);
     assert_eq!(login(sign_in(&backend, with_password(PERSON, PERSONS_PASSWORD), 3).music).count, 3);
     drop(admin);
@@ -609,7 +644,7 @@ fn a_sealed_login_tampered_moved_or_put_back_from_an_older_copy_is_not_handed_ou
     let after = sign_in(&backend, with_password(PERSON, PERSONS_PASSWORD), 3);
     assert_eq!(after.music, MusicLoginResult::UnusableNow, "the older copy's login was handed out");
     // Typed again: handed out again, at a count past every earlier one.
-    let mut admin = Admin { backend: &backend, signed: sign_in(&backend, with_password(ADMIN, PASSWORD), 1), next: 300 };
+    let mut admin = Admin::at_the_page(&backend, 300);
     assert_eq!(admin.set_music_login(person.person.id, MUSIC_USER, MUSIC_PASSWORD).0, 200);
     let handed = login(music_login(&backend, &after));
     assert_eq!(handed.count, 4);
@@ -621,7 +656,7 @@ fn a_sealed_login_tampered_moved_or_put_back_from_an_older_copy_is_not_handed_ou
 /// address people use, and sets the login of the account `NEXUS_S9_PERSON` (the admin's own
 /// if not given). Nothing is kept by this test. Run by hand:
 ///
-/// `NEXUS_S9_BACKEND=127.0.0.1:4684 NEXUS_S9_ADMIN=you@example.org NEXUS_S9_ADMIN_PASSWORD='…' [NEXUS_S9_ADMIN_CODE=XXXXXX-XXXXXX]
+/// `NEXUS_S9_BACKEND=127.0.0.1:4684 NEXUS_S9_ORIGIN=<the backend's NEXUS_PUBLIC_ORIGIN> NEXUS_S9_ADMIN=you@example.org NEXUS_S9_ADMIN_PASSWORD='…' [NEXUS_S9_ADMIN_CODE=XXXXXX-XXXXXX]
 ///  NEXUS_S9_PUBLIC=https://music.example.org:4681 NEXUS_S9_MUSIC_NAME=tester NEXUS_S9_MUSIC_PASSWORD=tester-pass-1
 ///  [NEXUS_S9_PERSON=them@example.org NEXUS_S9_PERSON_PASSWORD='…']
 ///  cargo test --manifest-path server/Cargo.toml --test music -- --ignored --nocapture set_a_music_login_on_a_running_backend`
@@ -639,7 +674,10 @@ fn set_a_music_login_on_a_running_backend() {
         let code = OneTimeCode::typed(&code).expect("a one-time code");
         sign_in(&backend, with_code(&code, &given("NEXUS_S9_ADMIN_PASSWORD")), 0xa9);
     }
-    let signed = request(&admin_email, &given("NEXUS_S9_ADMIN_PASSWORD"), 0xa9);
+    // The admin signs in as the admin's page does (its session's kind is the page's; an app's
+    // session can make no admin call), from the backend's NEXUS_PUBLIC_ORIGIN, marked.
+    let page = format!("Origin: {}\r\nX-Nexus-Admin: 1\r\n", given("NEXUS_S9_ORIGIN"));
+    let signed = sign_in_with(&backend, Credential::Password { email: Email::new(&admin_email).unwrap(), password: Password::presented(&given("NEXUS_S9_ADMIN_PASSWORD")).unwrap() }, 0xa8, &page);
     let person = match std::env::var("NEXUS_S9_PERSON") {
         Ok(email) => request(&email, &given("NEXUS_S9_PERSON_PASSWORD"), 0xaa).person.id,
         Err(_) => signed.person.id,
@@ -651,7 +689,7 @@ fn set_a_music_login_on_a_running_backend() {
         admin.next += 1;
         let request_id = RequestId::new(admin.next).unwrap();
         let request = GrantRequest { head: head(admin.signed.restore), change: NamedChange { request_id, action }, password: Password::presented(&admin_password).unwrap() };
-        let (status, body) = backend.post(admin::REQUEST_GRANT, Some(&admin.signed.session), admin::encode(&request).unwrap().bytes());
+        let (status, body) = backend.post_with(admin::REQUEST_GRANT, Some(&admin.signed.session), &page, admin::encode(&request).unwrap().bytes());
         match admin::read_reply::<GrantIssued>(status, &body).unwrap() {
             admin::Reply::Done(GrantIssued { grant }) => (request_id, grant),
             other => panic!("no grant: {status} {other:?}"),
@@ -660,12 +698,12 @@ fn set_a_music_login_on_a_running_backend() {
     let public = MusicAddress::new(&given("NEXUS_S9_PUBLIC")).expect("the address people use: https://…");
     let (request_id, secret) = grant(&mut admin, Action::SetMusicServer(public.clone()));
     let request = GrantedChange { head: head(admin.signed.restore), request_id, change: MusicServerAddress { public }, grant: secret };
-    let (status, body) = backend.post(admin::SET_MUSIC_SERVER, Some(&admin.signed.session), admin::encode(&request).unwrap().bytes());
+    let (status, body) = backend.post_with(admin::SET_MUSIC_SERVER, Some(&admin.signed.session), &page, admin::encode(&request).unwrap().bytes());
     println!("the address people use: {status} {:?}", admin::read_reply::<Applied>(status, &body));
     let (request_id, secret) = grant(&mut admin, Action::SetMusicLogin(person));
     let change = TypedMusicLogin { account: person, name: Name::new(&given("NEXUS_S9_MUSIC_NAME")).unwrap(), password: MusicPassword::new(&given("NEXUS_S9_MUSIC_PASSWORD")).unwrap() };
     let request = GrantedChange { head: head(admin.signed.restore), request_id, change, grant: secret };
-    let (status, body) = backend.post(admin::SET_MUSIC_LOGIN, Some(&admin.signed.session), admin::encode(&request).unwrap().bytes());
+    let (status, body) = backend.post_with(admin::SET_MUSIC_LOGIN, Some(&admin.signed.session), &page, admin::encode(&request).unwrap().bytes());
     let reply = admin::read_reply::<Applied>(status, &body);
     println!("the music login of account {}: {status} {reply:?}", person.get());
     assert_eq!(status, 200, "403 music_login_refused: the music server said wrong name or password; 503: it could not be reached at one of the two addresses");
@@ -748,7 +786,8 @@ fn the_address_people_use_is_never_connected_to_and_another_container_address_ne
     let mut backend = Serving::start(&settings, port);
     let signed = sign_in(&backend, with_code(&admin_code, PASSWORD), 1);
     let person = sign_in(&backend, with_code(&person_code, PERSONS_PASSWORD), 2);
-    let mut admin = Admin { backend: &backend, signed, next: 0 };
+    let _ = signed;
+    let mut admin = Admin::at_the_page(&backend, 0);
     // The login set first, with no address people use yet: checked, kept, not handed out.
     let (status, reply) = admin.set_music_login(person.person.id, MUSIC_USER, MUSIC_PASSWORD);
     assert_eq!(status, 200, "{reply:?}");
@@ -775,7 +814,7 @@ fn the_address_people_use_is_never_connected_to_and_another_container_address_ne
     assert_eq!(phone.music, MusicLoginResult::UnusableNow, "a login checked at another NEXUS_MUSIC_SERVER was handed out");
     assert_eq!(music_login(&backend, &phone), MusicLoginResult::UnusableNow);
     // Typed again: checked at the new address alone, and handed out again.
-    let mut admin = Admin { backend: &backend, signed: sign_in(&backend, with_password(ADMIN, PASSWORD), 1), next: 100 };
+    let mut admin = Admin::at_the_page(&backend, 100);
     assert_eq!(admin.set_music_login(person.person.id, MUSIC_USER, MUSIC_PASSWORD).0, 200);
     assert_eq!((first_taken.load(Ordering::SeqCst), second_taken.load(Ordering::SeqCst)), (2, 2));
     assert_eq!(login(music_login(&backend, &phone)).count, 2);
@@ -787,54 +826,37 @@ fn now_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64
 }
 
-/// C5's gap (the review of S9): an admin who HAS a music login is handed it on the app, and
-/// never on the admin's page: not in the page's sign-in answer, not when the page asks for it,
-/// and not when the page's session asks without a browser's headers (the session's kind,
-/// core's, is what withholds it).
+/// C5's gap (the review of S9), and the lead's ruling on the two session kinds: an admin who
+/// HAS a music login is handed it on the app, and never on the admin's page: not in the page's
+/// sign-in answer, and the page's session may not ask for it at all (an app's call: refused
+/// before its body, with or without a browser's headers).
 #[test]
 fn an_admin_with_a_music_login_is_not_handed_it_at_the_page() {
-    const PAGE: &str = "https://nexus.example.test";
     let folders = Folders::new("page-login");
     let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
     let (internal, _) = stand_in(&runtime);
     let port = free_port();
-    let mut settings = folders.settings_at(port, &internal);
-    settings.push(("NEXUS_PUBLIC_ORIGIN", PAGE.into()));
+    let settings = folders.settings_at(port, &internal);
     let admin_code = code_from(&settings, &["set-up", ADMIN, "Admin"]);
     let backend = Serving::start(&settings, port);
-    let signed = sign_in(&backend, with_code(&admin_code, PASSWORD), 1);
-    let admin_id = signed.person.id;
-    let mut admin = Admin { backend: &backend, signed, next: 0 };
+    let app = sign_in(&backend, with_code(&admin_code, PASSWORD), 1);
+    let admin_id = app.person.id;
+    let mut admin = Admin::at_the_page(&backend, 0);
+    assert_eq!(admin.signed.music, MusicLoginResult::NoneSetYet, "the page's sign-in was handed a music login");
     assert!(matches!(admin.set_music_server("https://music.example.test"), admin::Reply::Done(_)));
     assert_eq!(admin.set_music_login(admin_id, MUSIC_USER, MUSIC_PASSWORD).0, 200);
     // The admin's app: handed it.
-    assert_eq!(login(music_login(&backend, &admin.signed)).count, 1);
-    // The page's sign-in, from its own origin, marked: not handed it.
-    let page = format!("Origin: {PAGE}\r\nX-Nexus-Admin: 1\r\n");
-    let request = SignIn {
-        credential: with_password(ADMIN, PASSWORD),
-        device_secret: DeviceSecret::from_bytes([7; 32]),
-        device_name: Name::new("Nexus admin browser").unwrap(),
-        device_kind: DeviceKind::Pc,
-        app_version: Version::parse("0.41.0").unwrap(),
-        speaks: SPEAKS,
-        restore: None,
-    };
-    let (status, body) = backend.post_with(account::SIGN_IN, None, &page, account::encode(&request).unwrap().bytes());
-    let at_page = match account::read_reply::<SignedIn>(status, &body).unwrap() {
-        Reply::Done { result, .. } => result,
-        other => panic!("the page did not sign in: {status} {other:?}"),
-    };
+    assert_eq!(login(music_login(&backend, &app)).count, 1);
+    // The page signed in again, now that there is a login: still not handed it.
+    let at_page = sign_in_at_the_page(&backend, with_password(ADMIN, PASSWORD));
     assert_eq!(at_page.music, MusicLoginResult::NoneSetYet, "the page's sign-in was handed a music login");
     let asked = |more: &str| {
         let (status, body) = backend.post_with(account::MUSIC_LOGIN, Some(&at_page.session), more, account::encode(&GetMusicLogin { head: head(at_page.restore) }).unwrap().bytes());
-        match account::read_reply::<MusicLoginResult>(status, &body).unwrap() {
-            Reply::Done { result, .. } => result,
-            other => panic!("no answer: {status} {other:?}"),
-        }
+        (status, account::read_reply::<MusicLoginResult>(status, &body).unwrap())
     };
-    assert_eq!(asked(&page), MusicLoginResult::NoneSetYet, "the page was handed a music login");
-    assert_eq!(asked(""), MusicLoginResult::NoneSetYet, "the page's session was handed a music login without a browser's headers");
+    let denied = (403, Reply::Refused(account::Refusal::NotAllowed(account::NotAllowed::Denied)));
+    assert_eq!(asked(&page_headers()), denied, "the page asked for a music login");
+    assert_eq!(asked(""), denied, "the page's session asked for a music login without a browser's headers");
     // The same admin's app, still.
-    assert_eq!(login(music_login(&backend, &admin.signed)).count, 1);
+    assert_eq!(login(music_login(&backend, &app)).count, 1);
 }

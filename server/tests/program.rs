@@ -120,6 +120,7 @@ fn a_missing_or_wrong_setting_is_named_and_it_stops() {
         ("NEXUS_MUSIC_SERVER", Some("navidrome:4533"), "NEXUS_MUSIC_SERVER is wrong"),
         ("NEXUS_PROXY", Some("npm:81"), "NEXUS_PROXY is wrong"),
         ("NEXUS_LISTEN", Some("everywhere"), "NEXUS_LISTEN is wrong"),
+        ("NEXUS_LIDARR", Some("lidarr:8686"), "NEXUS_LIDARR is wrong"),
         ("NEXUS_STATE", Some(inside.as_str()), "NEXUS_STATE is wrong"),
         ("NEXUS_DATA", Some(missing.as_str()), "NEXUS_DATA is wrong: there is no folder"),
         ("NEXUS_STATE", Some(missing.as_str()), "NEXUS_STATE is wrong: there is no folder"),

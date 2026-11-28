@@ -518,8 +518,12 @@ fn the_admin_page_signs_in_from_its_own_origin_only_and_is_handed_no_music_login
         let (status, _) = backend.post_with(account::SIGN_IN, None, other, &sign_in(with_password(EMAIL, PASSWORD), 7, "Nexus admin browser", DeviceKind::Pc));
         assert_eq!(status, 400, "{other}");
     }
-    // The page's session works for a session's calls from the page too.
-    assert_eq!(backend.post_with(account::LIST_DEVICES, Some(&signed.session), &page, account::encode(&ListDevices { head: speaks(signed.restore), after: None }).unwrap().bytes()).0, 200);
+    // The page's session is the page's alone: an app's call (its own devices) is refused, from
+    // the page or not (the lead's ruling on the two kinds); signing out is either's.
+    for more in [page.as_str(), ""] {
+        let (status, body) = backend.post_with(account::LIST_DEVICES, Some(&signed.session), more, account::encode(&ListDevices { head: speaks(signed.restore), after: None }).unwrap().bytes());
+        assert_eq!(refusal(account::read_reply::<account::DevicePage>(status, &body).unwrap()), Refusal::NotAllowed(NotAllowed::Denied), "{more}");
+    }
     drop(backend);
     // With NEXUS_PUBLIC_ORIGIN unset, the page cannot sign in at all, and the log says so.
     let plain = folders.settings(port);
@@ -833,4 +837,112 @@ fn a_member_at_the_page_with_the_right_password_is_a_wrong_password_over_http() 
     assert_eq!((status, &body), (wrong_status, &wrong), "the right password of a member at the page said something a wrong one does not");
     let (status, _) = backend.post_with(account::SIGN_IN, None, &page, &sign_in(with_password(MEMBER, PASSWORD), 8, "Nexus admin browser", DeviceKind::Pc));
     assert_eq!(status, 429, "the page's refusal of a member was not recorded as a wrong try");
+}
+
+/// The audit of the admin's page, M1 (the lead's ruling: the page has its own session kind; an
+/// app's session can do nothing the page does, nor the reverse), over the real listener:
+/// - an admin's APP session, and a member's, is refused on EVERY admin call (every route under
+///   `/nexus/api/admin/`, the grant included) with the same bytes, whatever its body names (an
+///   account there or not) and with the body withheld: refused before a byte of it is read;
+/// - the admin's PAGE session is refused on every app's call the same way (sending events,
+///   sending Diagnostics, change-password, its own devices and force-out, the music login);
+/// - each is answered where it belongs (the page reads the music server's addresses, the app
+///   lists its devices), and either signs itself out.
+#[test]
+fn an_admin_s_app_session_does_nothing_the_page_does_and_the_page_s_nothing_an_app_does() {
+    use nexus_core::nexus::admin::{self, Action, NamedChange};
+    use nexus_music_server::head::{Callers, ROUTES};
+    const PAGE: &str = "https://nexus.example.test";
+    let folders = Folders::new("kinds");
+    let port = free_port();
+    let mut settings = folders.settings(port);
+    settings.push(("NEXUS_PUBLIC_ORIGIN", PAGE.into()));
+    let code = set_up(&settings, EMAIL);
+    let member_email = "member@example.org";
+    let output = program(&settings, &["recover", member_email]).output().unwrap();
+    let said = String::from_utf8_lossy(&output.stdout).to_string();
+    let at = said.find("one-time code ").expect("a code") + "one-time code ".len();
+    let member_code = OneTimeCode::new(&said[at..at + 13].replace('-', "")).unwrap();
+    let backend = Serving::start(&settings, port);
+    let (status, body) = backend.post(account::SIGN_IN, None, &sign_in(Credential::Code { code, new_password: Password::new(PASSWORD).unwrap() }, 1, "Robin's PC", DeviceKind::Pc));
+    let app = signed_in(status, &body);
+    assert!(app.person.admin);
+    let (status, body) = backend.post(account::SIGN_IN, None, &sign_in(Credential::Code { code: member_code, new_password: Password::new("a made-up password of the member's").unwrap() }, 2, "Sam's phone", DeviceKind::Phone));
+    let member = signed_in(status, &body);
+    let page_headers = format!("Origin: {PAGE}\r\nX-Nexus-Admin: 1\r\n");
+    let (status, body) = backend.post_with(account::SIGN_IN, None, &page_headers, &sign_in(with_password(EMAIL, PASSWORD), 7, "Nexus admin browser", DeviceKind::Pc));
+    let page = signed_in(status, &body);
+
+    // A request whose body is withheld: the answer comes before it.
+    let withheld = |path: &str, session: &account::Session, more: &str| -> (u16, Vec<u8>) {
+        let mut stream = TcpStream::connect(backend.at).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let head = format!(
+            "POST {path} HTTP/1.1\r\nHost: nexus\r\nX-Nexus-Scheme: https\r\nContent-Type: application/json\r\nContent-Length: 200\r\nAuthorization: {}\r\n{more}Connection: close\r\n\r\n",
+            session.authorization().as_str()
+        );
+        stream.write_all(head.as_bytes()).unwrap();
+        let mut from = BufReader::new(stream);
+        let head = nexus_music_server::probe::read_head(&mut from).unwrap().expect("an answer before the body");
+        let mut bytes = Vec::new();
+        nexus_music_server::probe::body(&head, from).unwrap().read_to_end(&mut bytes).unwrap();
+        (head.status, bytes)
+    };
+    let grant_for = |account: u64| {
+        let change = NamedChange { request_id: RequestId::new(1).unwrap(), action: Action::SetMusicLogin(account::AccountId::new(account).unwrap()) };
+        admin::encode(&account::GrantRequest { head: speaks(app.restore), change, password: Password::presented(PASSWORD).unwrap() }).unwrap().bytes().to_vec()
+    };
+    let (there, not_there) = (grant_for(member.person.id.get()), grant_for(9_999));
+    let denied = |status: u16, body: &[u8]| {
+        assert_eq!(status, 403);
+        assert_eq!(refusal(account::read_reply::<account::SignedOut>(status, body).unwrap()), Refusal::NotAllowed(NotAllowed::Denied));
+        assert!(matches!(admin::read_reply::<admin::Applied>(status, body).unwrap(), admin::Reply::Refused(admin::Refusal::NotAllowed(admin::Denial::Denied))));
+        (status, body.to_vec())
+    };
+    let mut answers = std::collections::BTreeSet::new();
+    let page_calls: Vec<_> = ROUTES.iter().filter(|route| route.callers == Callers::Page).map(|route| route.path).collect();
+    let app_calls: Vec<_> = ROUTES.iter().filter(|route| route.callers == Callers::App).map(|route| route.path).collect();
+    assert!(page_calls.contains(&admin::REQUEST_GRANT) && page_calls.len() >= 5, "{page_calls:?}");
+    for path in [account::CHANGE_PASSWORD, account::LIST_DEVICES, account::FORCE_OUT, account::MUSIC_LOGIN, nexus_core::nexus::events::SEND_PATH, nexus_core::nexus::diag::SEND_PATH] {
+        assert!(app_calls.contains(&path), "{path}");
+    }
+    // An app's session, the admin's or a member's, at every admin call.
+    for session in [&app.session, &member.session] {
+        for path in &page_calls {
+            for body in [&there, &not_there] {
+                let (status, bytes) = backend.post(path, Some(session), body);
+                answers.insert(denied(status, &bytes));
+            }
+            let (status, bytes) = withheld(path, session, "");
+            answers.insert(denied(status, &bytes));
+            // The page's headers do not make an app's session the page's.
+            let (status, bytes) = backend.post_with(path, Some(session), &page_headers, &there);
+            answers.insert(denied(status, &bytes));
+        }
+    }
+    // The page's session at every app's call, from the page or not.
+    for path in &app_calls {
+        for more in [page_headers.as_str(), ""] {
+            let (status, bytes) = backend.post_with(path, Some(&page.session), more, &there);
+            answers.insert(denied(status, &bytes));
+            let (status, bytes) = withheld(path, &page.session, more);
+            answers.insert(denied(status, &bytes));
+        }
+    }
+    assert_eq!(answers.len(), 1, "one refusal, the same bytes everywhere");
+    // Each where it belongs.
+    let read = admin::encode(&admin::GetMusicServer { head: speaks(page.restore) }).unwrap();
+    assert_eq!(backend.post_with(admin::GET_MUSIC_SERVER, Some(&page.session), &page_headers, read.bytes()).0, 200);
+    let list = account::encode(&ListDevices { head: speaks(app.restore), after: None }).unwrap();
+    assert_eq!(backend.post(account::LIST_DEVICES, Some(&app.session), list.bytes()).0, 200);
+    // No session at all: "session ended", before the body, on both kinds of call.
+    for path in [admin::REQUEST_GRANT, account::LIST_DEVICES] {
+        let (status, body) = backend.post(path, None, &there);
+        assert_eq!(refusal(account::read_reply::<account::SignedOut>(status, &body).unwrap()), Refusal::NotSignedIn(NotSignedIn::SessionEnded), "{path}");
+    }
+    // Either signs itself out.
+    for (session, restore, more) in [(&page.session, page.restore, page_headers.as_str()), (&app.session, app.restore, "")] {
+        let out = account::encode(&SignOut { head: speaks(restore), request_id: RequestId::new(9).unwrap(), revoke: None }).unwrap();
+        assert_eq!(backend.post_with(account::SIGN_OUT, Some(session), more, out.bytes()).0, 200);
+    }
 }

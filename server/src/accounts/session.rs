@@ -53,6 +53,9 @@ pub struct Accounts {
     pub admission: Arc<Admission>,
     /// The music server as the backend reaches it (S9).
     pub music: super::music::MusicSide,
+    /// Lidarr as the backend reaches it (`NEXUS_LIDARR`; none: requests are not set up). What
+    /// a Lidarr key's grant and seal are bound to, and what the requests' router asks.
+    pub lidarr: Option<nexus_core::nexus::admin::InternalAddress>,
 }
 
 /// An answer: its status, and its body (C7's shapes, encoded).
