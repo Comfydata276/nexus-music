@@ -13,7 +13,8 @@ use nexus_core::nexus::{
 };
 use std::{
     collections::VecDeque,
-    sync::{Arc, Condvar, Mutex},
+    panic::{AssertUnwindSafe, catch_unwind},
+    sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -133,8 +134,9 @@ type Answer = Result<Completed, Refusal>;
 struct Job {
     id: Arc<()>,
     email: Email,
+    door: PasswordDoor,
     device: Option<DeviceId>,
-    password: Box<Password>,
+    password: Password,
     work: Work,
     reply: oneshot::Sender<Answer>,
 }
@@ -191,27 +193,39 @@ impl State {
     }
 }
 
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+struct Reservation<'a>(&'a Lane);
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        lock(&self.0.state).running = None;
+    }
+}
+
 struct Lane {
-    door: PasswordDoor,
     state: Mutex<State>,
     changed: Condvar,
     engine: Arc<Engine>,
 }
 
 impl Lane {
-    fn new(door: PasswordDoor, engine: Arc<Engine>) -> Self {
-        Self { door, state: Mutex::default(), changed: Condvar::new(), engine }
+    fn new(engine: Arc<Engine>) -> Self {
+        Self { state: Mutex::default(), changed: Condvar::new(), engine }
     }
 
     fn submit(
         self: &Arc<Self>,
         email: &Email,
+        door: PasswordDoor,
         device: Option<DeviceId>,
         password: Password,
         work: Work,
     ) -> Result<Pending, Refusal> {
-        let mut state = self.state.lock().unwrap();
-        let mut waits = self.engine.waits.lock().unwrap();
+        let mut state = lock(&self.state);
+        let mut waits = lock(&self.engine.waits);
         let now = (self.engine.clock)();
         waits.expire(now);
         state.expire_waiting(&waits, now);
@@ -220,7 +234,7 @@ impl Lane {
             account_busy: state.account_busy(email),
             waiting: state.waiting.len(),
         };
-        let admission = admit_password_check(self.door, load, &waits, email, device, now);
+        let admission = admit_password_check(door, load, &waits, email, device, now);
         drop(waits);
         let queued_at = match admission {
             PasswordAdmission::Check => None,
@@ -232,9 +246,9 @@ impl Lane {
         let job = Job {
             id: Arc::clone(&id),
             email: email.clone(),
+            door,
             device,
-            // Queue slots hold a pointer, so moving a job leaves no inline password in a slot.
-            password: Box::new(password),
+            password,
             work,
             reply,
         };
@@ -247,47 +261,56 @@ impl Lane {
         Ok(Pending { lane: Arc::clone(self), id, queued_at, receiver })
     }
 
-    fn run(&self) {
-        loop {
-            let mut state = self.state.lock().unwrap();
-            let job = loop {
-                if state.closed {
-                    return;
-                }
-                let next = {
-                    let waits = self.engine.waits.lock().unwrap();
-                    state.take_next(&waits, (self.engine.clock)())
-                };
-                if let Some(job) = next {
-                    break job;
-                }
-                state = self.changed.wait(state).unwrap();
+    fn next_job(&self) -> Option<Job> {
+        let mut state = lock(&self.state);
+        while !state.closed {
+            let next = {
+                let waits = lock(&self.engine.waits);
+                state.take_next(&waits, (self.engine.clock)())
             };
-            drop(state);
+            if next.is_some() {
+                return next;
+            }
+            state = self.changed.wait(state).unwrap_or_else(PoisonError::into_inner);
+        }
+        None
+    }
 
-            let Job { email, device, password, work, reply, .. } = job;
-            let result = match work {
+    fn run(&self) {
+        while let Some(Job { email, door, device, password, work, reply, .. }) = self.next_job() {
+            let reservation = Reservation(self);
+            let result = match catch_unwind(AssertUnwindSafe(|| match work {
                 Work::Check(stored) => self.engine.check(&password, &email, stored).map(Completed::Checked),
                 Work::Fingerprint => self.engine.fresh(&password).map(Completed::Fingerprint),
+            })) {
+                Ok(result) => result,
+                Err(payload) => {
+                    // Even discarding a custom panic payload must not kill this worker.
+                    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(payload))) {
+                        std::mem::forget(payload);
+                    }
+                    Err(Refusal::NotDealtWith)
+                }
             };
             drop(password);
-            let mut state = self.state.lock().unwrap();
+
             let wrong = matches!(result, Ok(Completed::Checked(Checked::Wrong)));
-            if self.door == PasswordDoor::Other || wrong {
-                let mut waits = self.engine.waits.lock().unwrap();
+            if door == PasswordDoor::Other || wrong {
+                let mut state = lock(&self.state);
+                let mut waits = lock(&self.engine.waits);
                 let now = (self.engine.clock)();
                 if wrong {
-                    waits.record_wrong(self.door, &email, device, now);
+                    waits.record_wrong(door, &email, device, now);
                 }
                 state.expire_waiting(&waits, now);
             }
-            state.running = None;
+            drop(reservation);
             let _ = reply.send(result);
         }
     }
 
     fn close(&self) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = lock(&self.state);
         state.closed = true;
         state.ready = None;
         state.waiting.clear();
@@ -311,8 +334,8 @@ impl Pending {
                 if remaining == 0 {
                     // Expire only queued work. Dispatch and expiry share this lock,
                     // so a job already running is left to finish.
-                    let mut state = self.lane.state.lock().unwrap();
-                    let waits = self.lane.engine.waits.lock().unwrap();
+                    let mut state = lock(&self.lane.state);
+                    let waits = lock(&self.lane.engine.waits);
                     state.expire_waiting(&waits, now);
                     break;
                 }
@@ -327,7 +350,7 @@ impl Pending {
 
 impl Drop for Pending {
     fn drop(&mut self) {
-        let mut state = self.lane.state.lock().unwrap();
+        let mut state = lock(&self.lane.state);
         if state.ready.as_ref().is_some_and(|job| Arc::ptr_eq(&job.id, &self.id)) {
             state.ready = None;
         }
@@ -353,8 +376,8 @@ impl PasswordWorkers {
 
     fn with_engine(engine: Engine) -> Result<Self, Refusal> {
         let engine = Arc::new(engine);
-        let known = Arc::new(Lane::new(PasswordDoor::KnownDevice, Arc::clone(&engine)));
-        let other = Arc::new(Lane::new(PasswordDoor::Other, engine));
+        let known = Arc::new(Lane::new(Arc::clone(&engine)));
+        let other = Arc::new(Lane::new(engine));
         let spawn = |name: &str, lane: &Arc<Lane>| {
             let lane = Arc::clone(lane);
             thread::Builder::new().name(name.into()).spawn(move || lane.run())
@@ -374,7 +397,7 @@ impl PasswordWorkers {
 
     fn lane(&self, door: PasswordDoor) -> &Arc<Lane> {
         match door {
-            PasswordDoor::KnownDevice => &self.known,
+            PasswordDoor::KnownDevice | PasswordDoor::RedeemedCode => &self.known,
             PasswordDoor::Other => &self.other,
         }
     }
@@ -389,14 +412,18 @@ impl PasswordWorkers {
         password: Password,
         stored: Option<StoredPassword>,
     ) -> Result<Checked, Refusal> {
-        match self.lane(door).submit(email, device, password, Work::Check(stored))?.finish().await? {
+        if door == PasswordDoor::RedeemedCode {
+            return Err(Refusal::NotDealtWith);
+        }
+        match self.lane(door).submit(email, door, device, password, Work::Check(stored))?.finish().await? {
             Completed::Checked(answer) => Ok(answer),
             Completed::Fingerprint(_) => Err(Refusal::NotDealtWith),
         }
     }
 
-    /// New fingerprints use the supplied door's admission. A known device
-    /// must have an authenticated ID. This work does not record a wrong try.
+    /// For a verified live code, use `RedeemedCode` with no device ID. Other work
+    /// uses the applicable password door and an authenticated ID for `KnownDevice`.
+    /// Creating a fingerprint does not record a wrong try.
     pub async fn fingerprint(
         &self,
         email: &Email,
@@ -404,7 +431,7 @@ impl PasswordWorkers {
         device: Option<DeviceId>,
         password: Password,
     ) -> Result<StoredPassword, Refusal> {
-        match self.lane(door).submit(email, device, password, Work::Fingerprint)?.finish().await? {
+        match self.lane(door).submit(email, door, device, password, Work::Fingerprint)?.finish().await? {
             Completed::Fingerprint(password) => Ok(password),
             Completed::Checked(_) => Err(Refusal::NotDealtWith),
         }
@@ -412,7 +439,7 @@ impl PasswordWorkers {
 
     /// Reserve one attempt before computing and looking up the fast code fingerprint.
     pub fn admit_code(&self) -> Result<(), Refusal> {
-        let mut codes = self.codes.lock().unwrap();
+        let mut codes = lock(&self.codes);
         codes.admit((self.other.engine.clock)())
             .map_err(|wait| Refusal::Busy { retry_after_seconds: Some(wait) })
     }

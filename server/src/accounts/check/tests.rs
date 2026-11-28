@@ -104,7 +104,7 @@ fn submit(
     has_password: bool,
 ) -> Result<Pending, Refusal> {
     let stored = has_password.then(|| stored(CURRENT));
-    workers.lane(door).submit(&email(name), if door == PasswordDoor::KnownDevice { device() } else { None }, password(text), Work::Check(stored))
+    workers.lane(door).submit(&email(name), door, if door == PasswordDoor::KnownDevice { device() } else { None }, password(text), Work::Check(stored))
 }
 
 fn busy(seconds: Option<u64>) -> Refusal {
@@ -199,7 +199,10 @@ fn backoff_doubles_to_one_minute_and_correct_input_can_retry_after_it() {
     for seconds in [1, 2, 4, 8, 16, 32, 60, 60] {
         assert!(matches!(rt.block_on(workers.check(&who, Other, None, password(BAD), Some(stored(CURRENT)))),
             Ok(Checked::Wrong)));
-        assert_eq!(submit(&workers, Other, "owner", GOOD, true).err(), Some(busy(Some(seconds))));
+        let right = submit(&workers, Other, "owner", GOOD, true).err();
+        let wrong = submit(&workers, Other, "owner", BAD, true).err();
+        assert_eq!(right, wrong);
+        assert_eq!(right, Some(busy(Some(seconds))));
         assert!(workers.other.state.lock().unwrap().waiting.is_empty());
         clock.fetch_add(seconds * 1000 - 1, Relaxed);
         assert_eq!(submit(&workers, Other, "owner", GOOD, true).err(), Some(busy(Some(1))));
@@ -293,21 +296,23 @@ fn wait_memory_evicts_the_oldest_after_ten_thousand_and_expires_at_one_hour() {
         assert!(matches!(rt.block_on(pending.finish()), Ok(Completed::Checked(Checked::Wrong))));
     }
 
-    // Re-recording an evicted name starts at one second. Retained names
-    // double even if their original delay has elapsed.
-    let mut waits = workers.other.engine.waits.lock().unwrap();
-    waits.record_wrong(Other, &email("name-1"), None, PASSWORD_WAIT_NAMES as u64);
-    assert_eq!(waits.retry_after(Other, &email("name-1"), None, PASSWORD_WAIT_NAMES as u64).unwrap().seconds(), 2);
-    waits.record_wrong(KnownDevice, &email("name-0"), device(), PASSWORD_WAIT_NAMES as u64);
-    assert_eq!(waits.retry_after(KnownDevice, &email("name-0"), device(), PASSWORD_WAIT_NAMES as u64).unwrap().seconds(), 1);
-    let last = email(&format!("name-{PASSWORD_WAIT_NAMES}"));
+    let wrong_again = |door, name, seconds| {
+        let attempt = submit(&workers, door, name, BAD, false).unwrap();
+        assert!(matches!(rt.block_on(attempt.finish()), Ok(Completed::Checked(Checked::Wrong))));
+        assert_eq!(submit(&workers, door, name, GOOD, true).err(), Some(busy(Some(seconds))));
+    };
+    // An older entry retained in the same table still doubles. The known
+    // device's older entry was evicted by the other door and starts over.
+    wrong_again(Other, "name-1", 2);
+    wrong_again(KnownDevice, "name-0", 1);
+
+    let last = format!("name-{PASSWORD_WAIT_NAMES}");
+    let next_to_last = format!("name-{}", PASSWORD_WAIT_NAMES - 1);
     let after_hour = PASSWORD_WAIT_NAMES as u64 + PASSWORD_WAIT_MEMORY_MS;
-    let next_to_last = email(&format!("name-{}", PASSWORD_WAIT_NAMES - 1));
-    waits.record_wrong(Other, &next_to_last, None, after_hour - 2);
-    assert_eq!(waits.retry_after(Other, &next_to_last, None, after_hour - 2).unwrap().seconds(), 2);
-    waits.expire(after_hour);
-    waits.record_wrong(Other, &last, None, after_hour);
-    assert_eq!(waits.retry_after(Other, &last, None, after_hour).unwrap().seconds(), 1);
+    clock.store(after_hour - 2, Relaxed);
+    wrong_again(Other, &next_to_last, 2);
+    clock.store(after_hour, Relaxed);
+    wrong_again(Other, &last, 1);
 }
 
 #[test]
@@ -354,7 +359,7 @@ fn code_limit_is_independent_and_a_new_fingerprint_uses_the_same_workers() {
     let first_hash = rt.block_on(pending).unwrap();
     assert!(Profile::stored(&first_hash) == CURRENT);
 
-    let next = workers.known.submit(&name, device(), password(GOOD), Work::Fingerprint).unwrap();
+    let next = workers.known.submit(&name, KnownDevice, device(), password(GOOD), Work::Fingerprint).unwrap();
     known.wait();
     known.release();
     let Completed::Fingerprint(second_hash) = rt.block_on(next.finish()).unwrap() else {
@@ -366,13 +371,114 @@ fn code_limit_is_independent_and_a_new_fingerprint_uses_the_same_workers() {
 }
 
 #[test]
+fn a_verified_code_can_redeem_while_the_other_door_is_full_and_waiting_on_its_email() {
+    use PasswordDoor::{KnownDevice, Other, RedeemedCode};
+    let (workers, known, other) = gated_pool(&Arc::new(AtomicU64::new(0)));
+    let rt = runtime();
+    let owner = email("owner");
+    let wrong = submit(&workers, Other, "owner", BAD, true).unwrap();
+    other.wait();
+    other.release();
+    assert!(matches!(rt.block_on(wrong.finish()), Ok(Completed::Checked(Checked::Wrong))));
+
+    let running = submit(&workers, Other, "blocker", GOOD, true).unwrap();
+    other.wait();
+    let waiting: Vec<_> = (0..OTHER_PASSWORDS_WAITING)
+        .map(|n| submit(&workers, Other, &format!("queued{n}"), BAD, false).unwrap())
+        .collect();
+    assert_eq!(submit(&workers, Other, "extra", GOOD, true).err(), Some(busy(None)));
+    assert_eq!(submit(&workers, Other, "owner", GOOD, true).err(), Some(busy(Some(1))));
+
+    assert_eq!(workers.admit_code(), Ok(()));
+    let mut redeemed = Box::pin(workers.fingerprint(&owner, RedeemedCode, None, password(GOOD)));
+    rt.block_on(std::future::poll_fn(|cx| {
+        assert!(redeemed.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    }));
+    known.wait();
+    assert_eq!(rt.block_on(workers.fingerprint(&owner, RedeemedCode, None, password(GOOD))).err(), Some(busy(None)));
+    assert_eq!(submit(&workers, KnownDevice, "owner", GOOD, true).err(), Some(busy(None)));
+    known.release();
+    assert!(rt.block_on(redeemed).is_ok());
+    assert_eq!(submit(&workers, Other, "owner", GOOD, true).err(), Some(busy(Some(1))));
+    assert_eq!(lock(&workers.other.state).waiting.len(), OTHER_PASSWORDS_WAITING);
+
+    drop(waiting);
+    other.release();
+    matched(rt.block_on(running.finish()));
+}
+
+#[test]
+fn a_slow_panic_releases_each_lane_without_recording_a_wrong_try() {
+    use PasswordDoor::{KnownDevice, Other};
+    let workers = pool(&Arc::new(AtomicU64::new(0)), Box::new(|password, salt, profile| {
+        if password.expose() == BAD {
+            panic!("injected slow-work panic");
+        }
+        fake_hash(password, salt, profile)
+    }));
+    let rt = runtime();
+    let owner = email("owner");
+
+    for (door, device) in [(KnownDevice, device()), (Other, None)] {
+        for text in [BAD, GOOD] {
+            let result = rt.block_on(workers.check(&owner, door, device, password(text), Some(stored(CURRENT))));
+            if text == BAD {
+                assert_eq!(result.unwrap_err(), Refusal::NotDealtWith);
+            } else {
+                assert!(matches!(result, Ok(Checked::Match { .. })));
+            }
+        }
+    }
+}
+
+#[test]
+fn poisoned_bookkeeping_locks_do_not_close_the_door() {
+    let workers = pool(&Arc::new(AtomicU64::new(0)), Box::new(fake_hash));
+    assert!(catch_unwind(AssertUnwindSafe(|| {
+        let _state = workers.known.state.lock().unwrap();
+        let _waits = workers.known.engine.waits.lock().unwrap();
+        let _codes = workers.codes.lock().unwrap();
+        panic!("injected bookkeeping panic");
+    })).is_err());
+
+    assert_eq!(workers.admit_code(), Ok(()));
+    let pending = submit(&workers, PasswordDoor::KnownDevice, "owner", GOOD, true).unwrap();
+    matched(runtime().block_on(pending.finish()));
+}
+
+#[test]
+fn pool_shutdown_cancels_the_queue_and_joins_after_active_work_finishes() {
+    use PasswordDoor::{KnownDevice, Other};
+    let (workers, known, other) = gated_pool(&Arc::new(AtomicU64::new(0)));
+    let first_known = submit(&workers, KnownDevice, "owner", GOOD, true).unwrap();
+    known.wait();
+    let first_other = submit(&workers, Other, "active", GOOD, true).unwrap();
+    other.wait();
+    let queued = submit(&workers, Other, "queued", GOOD, true).unwrap();
+    let shutdown = thread::spawn(move || drop(workers));
+
+    let rt = runtime();
+    assert_eq!(rt.block_on(queued.finish()).unwrap_err(), Refusal::NotDealtWith);
+    assert!(!shutdown.is_finished());
+
+    known.release();
+    matched(rt.block_on(first_known.finish()));
+    assert!(!shutdown.is_finished());
+    other.release();
+    matched(rt.block_on(first_other.finish()));
+    shutdown.join().unwrap();
+    assert!(other.started.try_recv().is_err());
+}
+
+#[test]
 fn a_legacy_match_rehashes_sequentially_on_the_reserved_worker() {
     use PasswordDoor::Other;
     let clock = Arc::new(AtomicU64::new(0));
     let (workers, _, other) = gated_pool(&clock);
     let legacy = Profile { passes: 1, ..CURRENT };
     let check = workers.other.submit(
-        &email("owner"), None, password(GOOD), Work::Check(Some(stored(legacy))),
+        &email("owner"), Other, None, password(GOOD), Work::Check(Some(stored(legacy))),
     ).unwrap();
 
     other.wait();
@@ -408,7 +514,7 @@ fn all_wrong_inputs_share_the_wire_answer_and_same_profile() {
     }));
     let rt = runtime();
     let expected = (403, br#"{"refused":{"not_allowed":"wrong_login"}}"#.to_vec());
-    let off = stored(CURRENT);
+    let off = StoredPassword { salt: [6; PASSWORD_SALT_BYTES], ..stored(CURRENT) };
     let unknown = email("unknown");
     let profiles = [("wrong", Some(stored(CURRENT))), ("unknown", None), ("off", Some(off))];
     for (name, verifier) in profiles {
@@ -421,27 +527,25 @@ fn all_wrong_inputs_share_the_wire_answer_and_same_profile() {
     assert!(calls.iter().all(|(_, profile)| *profile == CURRENT));
     assert!(calls[1].0 == *DummySaltKey::from_bytes([27; 32]).salt_for(&unknown));
     assert!(calls[0].0 == stored(CURRENT).salt);
-    assert!(calls[2].0 == stored(CURRENT).salt);
+    assert!(calls[2].0 == [6; PASSWORD_SALT_BYTES]);
 }
 
-// Run optimized with --ignored --nocapture. Balance the three classes across
-// all nine FIFO positions in each set of batches.
+// Run optimized with --ignored --nocapture. Balance interleaved classes across
+// all FIFO positions. Use a fresh salt for every stored verifier in both runs.
 #[test]
 #[ignore = "real Argon2id timing measurement"]
 fn measure_wrong_inputs_with_both_workers_busy() {
-    use PasswordDoor::KnownDevice;
-    const BATCHES: usize = 30;
+    use PasswordDoor::{KnownDevice, Other};
     const CLASSES: usize = 3;
+    const PROBES: usize = 270;
     let rt = runtime();
     let start = Instant::now();
     let running_known = Arc::new(AtomicBool::new(false));
     let overlap = Arc::new(AtomicUsize::new(0));
-    let total = Arc::new(AtomicUsize::new(0));
     let hash_times = Arc::new(Mutex::new(Vec::new()));
-    let times_on_worker = Arc::clone(&hash_times);
     let known_on_worker = Arc::clone(&running_known);
     let overlap_on_worker = Arc::clone(&overlap);
-    let total_on_worker = Arc::clone(&total);
+    let times_on_worker = Arc::clone(&hash_times);
     let workers = PasswordWorkers::with_engine(Engine {
         clock: Arc::new(move || start.elapsed().as_millis().try_into().unwrap_or(u64::MAX)),
         waits: Mutex::default(),
@@ -453,74 +557,83 @@ fn measure_wrong_inputs_with_both_workers_busy() {
                 known_on_worker.store(false, Relaxed);
                 result
             } else {
-                total_on_worker.fetch_add(1, Relaxed);
                 if known_on_worker.load(Relaxed) {
                     overlap_on_worker.fetch_add(1, Relaxed);
                 }
                 let started = Instant::now();
                 let result = argon(password, salt, profile);
-                times_on_worker.lock().unwrap().push(started.elapsed());
+                lock(&times_on_worker).push(started.elapsed());
                 result
             }
         }),
     }).unwrap();
 
-    let real = rt.block_on(workers.fingerprint(&email("real"), KnownDevice, device(), password(GOOD))).unwrap();
-    let off = rt.block_on(workers.fingerprint(&email("off"), KnownDevice, device(), password(GOOD))).unwrap();
-    let mut samples: [Vec<Duration>; CLASSES] = Default::default();
-    thread::scope(|scope| {
-        let (stop_tx, stop_rx) = mpsc::channel();
-        let workers = &workers;
-        scope.spawn(move || {
-            let rt = runtime();
-            let filler = email("filler");
-            while matches!(stop_rx.try_recv(), Err(mpsc::TryRecvError::Empty)) {
-                rt.block_on(workers.fingerprint(&filler, KnownDevice, device(), password(GOOD))).unwrap();
+    for (batch_size, scenario) in [(1 + OTHER_PASSWORDS_WAITING, "queued"), (1, "empty queue")] {
+        let mut probes: Vec<_> = (0..PROBES).map(|index| {
+            let class = (index / batch_size + index % batch_size) % CLASSES;
+            let name = email(&format!("probe-{batch_size}-{index:03}"));
+            // There is no off flag in the worker API. The final class models a
+            // switched-off account by passing its verifier, as S8 must do.
+            let verifier = (class != 1).then(|| {
+                rt.block_on(workers.fingerprint(&name, KnownDevice, device(), password(GOOD))).unwrap()
+            });
+            (class, name, verifier)
+        }).collect();
+
+        lock(&hash_times).clear();
+        overlap.store(0, Relaxed);
+        let mut samples: [Vec<Duration>; CLASSES] = Default::default();
+        let mut queued = 0;
+        thread::scope(|scope| {
+            let (stop_tx, stop_rx) = mpsc::channel();
+            let workers = &workers;
+            scope.spawn(move || {
+                let rt = runtime();
+                let filler = email("filler");
+                while matches!(stop_rx.try_recv(), Err(mpsc::TryRecvError::Empty)) {
+                    rt.block_on(workers.fingerprint(&filler, KnownDevice, device(), password(GOOD))).unwrap();
+                }
+            });
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !running_known.load(Relaxed) {
+                assert!(Instant::now() < deadline, "known load never reached its worker");
+                thread::yield_now();
             }
+
+            for (batch_index, batch) in probes.chunks_mut(batch_size).enumerate() {
+                let mut pending = Vec::new();
+                for (place, (class, name, verifier)) in batch.iter_mut().enumerate() {
+                    let index = batch_index * batch_size + place;
+                    let wrong = password(&format!("{BAD} {index:03}"));
+                    let began = Instant::now();
+                    let attempt = workers.other.submit(name, Other, None, wrong, Work::Check(verifier.take())).unwrap();
+                    queued += usize::from(attempt.queued_at.is_some());
+                    pending.push((*class, began, attempt));
+                }
+                for (class, began, attempt) in pending {
+                    let Completed::Checked(checked) = rt.block_on(attempt.finish()).unwrap() else {
+                        panic!("expected a check");
+                    };
+                    samples[class].push(began.elapsed());
+                    assert_eq!(wrong_reply(checked), (403, br#"{"refused":{"not_allowed":"wrong_login"}}"#.to_vec()));
+                }
+            }
+            stop_tx.send(()).unwrap();
         });
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while !running_known.load(Relaxed) {
-            assert!(Instant::now() < deadline, "known load never reached its worker");
-            thread::yield_now();
-        }
 
-        for batch in 0..BATCHES {
-            let mut pending = Vec::new();
-            for place in 0..=OTHER_PASSWORDS_WAITING {
-                let class = (batch + place) % CLASSES;
-                let verifier = match class {
-                    0 => Some(real.clone()),
-                    1 => None,
-                    2 => Some(off.clone()),
-                    _ => unreachable!(),
-                };
-                let name = email(&format!("name-{batch:03}-{place}"));
-                let began = Instant::now();
-                let attempt = workers.other.submit(&name, None, password(BAD), Work::Check(verifier)).unwrap();
-                pending.push((class, began, attempt));
-            }
-            for (class, began, attempt) in pending {
-                let Completed::Checked(checked) = rt.block_on(attempt.finish()).unwrap() else {
-                    panic!("expected a check");
-                };
-                samples[class].push(began.elapsed());
-                assert_eq!(wrong_reply(checked), (403, br#"{"refused":{"not_allowed":"wrong_login"}}"#.to_vec()));
-            }
+        let mut hash_samples: [Vec<Duration>; CLASSES] = Default::default();
+        let times = lock(&hash_times);
+        assert_eq!(times.len(), PROBES);
+        for ((class, _, _), time) in probes.iter().zip(times.iter()) {
+            hash_samples[*class].push(*time);
         }
-        stop_tx.send(()).unwrap();
-    });
-
-    let mut hash_samples: [Vec<Duration>; CLASSES] = Default::default();
-    let times = hash_times.lock().unwrap();
-    assert_eq!(times.len(), BATCHES * (1 + OTHER_PASSWORDS_WAITING));
-    for (batch, times) in times.chunks_exact(1 + OTHER_PASSWORDS_WAITING).enumerate() {
-        for (place, time) in times.iter().enumerate() {
-            hash_samples[(batch + place) % CLASSES].push(*time);
+        if batch_size == 1 {
+            assert_eq!(queued, 0);
         }
+        println!("{scenario}: queued {queued}/{PROBES}, other hashes starting during known work {}/{PROBES}", overlap.load(Relaxed));
+        report_timings("admission to result", samples);
+        report_timings("Argon2id only", hash_samples);
     }
-    report_timings("queue + check", samples);
-    report_timings("Argon2id only", hash_samples);
-    println!("other hashes starting during known work: {}/{}", overlap.load(Relaxed), total.load(Relaxed));
 }
 
 fn report_timings(label: &str, mut samples: [Vec<Duration>; 3]) {
