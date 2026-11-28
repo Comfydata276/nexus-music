@@ -181,12 +181,12 @@ impl Client {
 
     pub(super) fn pressed(&mut self, press: Press, given: &Given, out: &mut Vec<Do>) {
         match press {
-            Press::SignIn { address, email, password } => self.press_sign_in(address, Some(email), password, None, given, out),
-            Press::SignInWithCode { address, code, password, again } => {
+            Press::SignIn { address, email, password, look } => self.press_sign_in(address, Some(email), password, None, look, given, out),
+            Press::SignInWithCode { address, code, password, again, look } => {
                 if password.expose() != again.expose() {
                     return self.set_form(SignInState::PasswordsDiffer, 0);
                 }
-                self.press_sign_in(address, None, code, Some(password), given, out)
+                self.press_sign_in(address, None, code, Some(password), look, given, out)
             }
             Press::SignOut => self.sign_out(given, out),
             Press::OpenDevices => self.open_devices(given, out),
@@ -211,7 +211,8 @@ impl Client {
         }
     }
 
-    fn press_sign_in(&mut self, address: String, email: Option<String>, secret: Typed, new: Option<Typed>, given: &Given, out: &mut Vec<Do>) {
+    #[allow(clippy::too_many_arguments)]
+    fn press_sign_in(&mut self, address: String, email: Option<String>, secret: Typed, new: Option<Typed>, look: Look, given: &Given, out: &mut Vec<Do>) {
         let Some(live) = self.live.as_mut() else { return };
         // Signed in already, or a sign-in under way: a second press asks nothing (one ask is
         // one request; two quick presses are one try).
@@ -229,6 +230,11 @@ impl Client {
             Ok(origin) => origin,
             Err(state) => return self.set_form(state, 0),
         };
+        // 6.4: judged before connecting. It leads inside and the permission is not held:
+        // nothing is asked (Android would drop it silently); the phone's screen asks.
+        if look.blocked() {
+            return self.set_form(SignInState::NeedsPermission, 0);
+        }
         let credential = match email {
             Some(email) => {
                 let Some(email) = Email::new(&email) else { return self.set_form(SignInState::BadEmail, 0) };
@@ -1045,7 +1051,8 @@ impl Client {
             },
             row,
             who: signed.map(|saved| format!("{} ({})", saved.name, saved.email)),
-            music: live.music_words.clone(),
+            music: if live.music_blocked && live.music_words.is_none() { Some(words::music(words::Music::NeedsPermission)) } else { live.music_words.clone() },
+            music_ask_permission: live.music_blocked,
             car: live.renewal.refused.map(|_| words::car()),
             notice: signed.and_then(|saved| saved.notice.clone()),
             devices: DevicesShown { state: live.devices.state, rows: live.devices.rows.clone(), words: live.devices.words.clone() },

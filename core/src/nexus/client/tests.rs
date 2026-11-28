@@ -173,7 +173,7 @@ impl Rig {
     }
 
     fn sign_in_press(&mut self) -> Vec<Do> {
-        self.press(Press::SignIn { address: "nexus.example.org".to_owned(), email: EMAIL.to_owned(), password: Typed::new(PASSWORD) })
+        self.press(Press::SignIn { address: "nexus.example.org".to_owned(), email: EMAIL.to_owned(), password: Typed::new(PASSWORD), look: Look::default() })
     }
 
     /// A whole sign-in, answered: gives back the last answer's things to do.
@@ -306,7 +306,7 @@ fn with_no_random_bytes_signing_in_waits_and_says_so() {
     let out = rig.client.start(app(DeviceKind::Phone), Kept::default(), &given);
     rig.take(out);
     let out = rig.client.happened(
-        Happened::Pressed(Press::SignIn { address: NEXUS.to_owned(), email: EMAIL.to_owned(), password: Typed::new(PASSWORD) }),
+        Happened::Pressed(Press::SignIn { address: NEXUS.to_owned(), email: EMAIL.to_owned(), password: Typed::new(PASSWORD), look: Look::default() }),
         &given,
     );
     let out = rig.take(out);
@@ -379,14 +379,14 @@ fn what_may_be_typed_as_the_address() {
     ] {
         let mut rig = Rig::new(DeviceKind::Pc);
         rig.start(Kept::default());
-        let out = rig.press(Press::SignIn { address: typed.to_owned(), email: EMAIL.to_owned(), password: Typed::new(PASSWORD) });
+        let out = rig.press(Press::SignIn { address: typed.to_owned(), email: EMAIL.to_owned(), password: Typed::new(PASSWORD), look: Look::default() });
         assert!(asks(&out).is_empty(), "{typed}");
         assert_eq!(rig.shown().sign_in.state, state, "{typed}");
     }
     for typed in ["nexus.example.org", "https://nexus.example.org/", " https://Nexus.Example.org ", "nexus.example.org:8443"] {
         let mut rig = Rig::new(DeviceKind::Pc);
         rig.start(Kept::default());
-        let out = rig.press(Press::SignIn { address: typed.to_owned(), email: EMAIL.to_owned(), password: Typed::new(PASSWORD) });
+        let out = rig.press(Press::SignIn { address: typed.to_owned(), email: EMAIL.to_owned(), password: Typed::new(PASSWORD), look: Look::default() });
         assert!(only_ask(&out).url.starts_with("https://nexus.example.org"), "{typed}");
         assert!(only_ask(&out).url.ends_with("/nexus/api/hello"), "{typed}");
     }
@@ -396,14 +396,14 @@ fn what_may_be_typed_as_the_address() {
 fn an_email_and_a_password_are_held_to_account_rules_before_anything_is_sent() {
     let mut rig = Rig::new(DeviceKind::Pc);
     rig.start(Kept::default());
-    let out = rig.press(Press::SignIn { address: NEXUS.to_owned(), email: "not an email".to_owned(), password: Typed::new(PASSWORD) });
+    let out = rig.press(Press::SignIn { address: NEXUS.to_owned(), email: "not an email".to_owned(), password: Typed::new(PASSWORD), look: Look::default() });
     assert!(asks(&out).is_empty());
     assert_eq!(rig.shown().sign_in.state, SignInState::BadEmail);
-    let out = rig.press(Press::SignIn { address: NEXUS.to_owned(), email: EMAIL.to_owned(), password: Typed::new("") });
+    let out = rig.press(Press::SignIn { address: NEXUS.to_owned(), email: EMAIL.to_owned(), password: Typed::new(""), look: Look::default() });
     assert!(asks(&out).is_empty());
     assert_eq!(rig.shown().sign_in.state, SignInState::NoPassword);
     // Shorter than any password can be: nobody's, so refused here as a wrong one, unsent.
-    let out = rig.press(Press::SignIn { address: NEXUS.to_owned(), email: EMAIL.to_owned(), password: Typed::new("short") });
+    let out = rig.press(Press::SignIn { address: NEXUS.to_owned(), email: EMAIL.to_owned(), password: Typed::new("short"), look: Look::default() });
     assert!(asks(&out).is_empty());
     assert_eq!(rig.shown().sign_in.state, SignInState::WrongLogin);
 }
@@ -542,6 +542,7 @@ fn a_code_is_redeemed_with_its_new_password_and_nothing_is_kept_between() {
         code: Typed::new("CDFH-JKMN-3479"),
         password: Typed::new("my new long password"),
         again: Typed::new("my new long passw0rd"),
+        look: Look::default(),
     });
     assert!(asks(&differ).is_empty());
     assert_eq!(rig.shown().sign_in.state, SignInState::PasswordsDiffer);
@@ -550,6 +551,7 @@ fn a_code_is_redeemed_with_its_new_password_and_nothing_is_kept_between() {
         code: Typed::new("cdfh jkmn 3479"),
         password: Typed::new("my new long password"),
         again: Typed::new("my new long password"),
+        look: Look::default(),
     });
     let hello = only_ask(&out).id;
     let out = rig.answer(hello, 200, hello_body(&["accounts"]));
@@ -827,7 +829,7 @@ fn a_late_sign_out_for_the_first_account_cannot_touch_the_second() {
     let out = rig.press(Press::SignOut);
     let tell = ask_to(&out, account::SIGN_OUT).id;
     // A sign-in to another backend while the telling is under way.
-    let out = rig.press(Press::SignIn { address: "other.example.net".to_owned(), email: "grace@example.org".to_owned(), password: Typed::new(PASSWORD) });
+    let out = rig.press(Press::SignIn { address: "other.example.net".to_owned(), email: "grace@example.org".to_owned(), password: Typed::new(PASSWORD), look: Look::default() });
     let hello = only_ask(&out).id;
     let sign_in = only_ask(&rig.answer(hello, 200, hello_body(&["accounts"]))).id;
     rig.answer(sign_in, 200, signed_in_body(1));
@@ -1062,7 +1064,7 @@ fn no_secret_is_shown_by_debug() {
     let mut rig = Rig::new(DeviceKind::Phone);
     let start = rig.start(kept_signed_in(4));
     let mut debug = format!("{start:?}{:?}", kept_signed_in(4));
-    let press = Press::SignIn { address: NEXUS.to_owned(), email: EMAIL.to_owned(), password: Typed::new(PASSWORD) };
+    let press = Press::SignIn { address: NEXUS.to_owned(), email: EMAIL.to_owned(), password: Typed::new(PASSWORD), look: Look::default() };
     debug.push_str(&format!("{press:?}"));
     rig.press(Press::SignOut);
     let out = rig.sign_in(4);
@@ -1250,3 +1252,104 @@ fn diagnostics_are_sent_at_their_own_pace() {}
 #[test]
 #[ignore = "owed: C8 and C6. Offline sends nothing; an account switch sends nothing of the old account's"]
 fn the_sending_half_keeps_the_fence() {}
+
+// ---------------------------------------------------------------------------------------
+// The phone's asks (P7): the local network judged before connecting; carrying a folder over
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn the_backends_line_is_judged_for_the_local_network_before_connecting() {
+    let blocked = Look { inside: Some(true), permission: Some(false) };
+    let mut rig = Rig::new(DeviceKind::Phone);
+    rig.start(Kept::default());
+    let out = rig.press(Press::SignIn { address: NEXUS.to_owned(), email: EMAIL.to_owned(), password: Typed::new(PASSWORD), look: blocked });
+    assert!(asks(&out).is_empty(), "nothing is asked: it would be dropped silently");
+    assert_eq!(rig.shown().sign_in.state, SignInState::NeedsPermission);
+    assert!(rig.shown().sign_in.ask_permission);
+    // The permission granted, or the address public: hello is asked.
+    for look in [Look { inside: Some(true), permission: Some(true) }, Look { inside: Some(false), permission: Some(false) }, Look::default()] {
+        let mut rig = Rig::new(DeviceKind::Phone);
+        rig.start(Kept::default());
+        let out = rig.press(Press::SignIn { address: NEXUS.to_owned(), email: EMAIL.to_owned(), password: Typed::new(PASSWORD), look });
+        assert_eq!(asks(&out).len(), 1, "{look:?}");
+    }
+}
+
+#[test]
+fn the_music_servers_address_is_judged_apart_from_the_backends() {
+    let mut rig = Rig::new(DeviceKind::Phone);
+    rig.start(kept_signed_in(4));
+    rig.happen(Happened::MusicLooked(Look { inside: Some(true), permission: Some(false) }));
+    assert!(rig.shown().music_ask_permission);
+    assert!(rig.shown().music.as_deref().unwrap().contains("home network"));
+    assert_eq!(rig.shown().screen, Screen::SignedIn);
+    assert_eq!(rig.shown().sign_in.state, SignInState::Idle, "not the backend's refusal");
+    rig.happen(Happened::MusicLooked(Look { inside: Some(true), permission: Some(true) }));
+    assert!(!rig.shown().music_ask_permission && rig.shown().music.is_none());
+    // A PC never asks.
+    let mut rig = Rig::new(DeviceKind::Pc);
+    rig.start(kept_signed_in(4));
+    rig.happen(Happened::MusicLooked(Look { inside: Some(true), permission: Some(false) }));
+    assert!(!rig.shown().music_ask_permission);
+}
+
+#[test]
+fn a_folder_carries_over_only_to_the_same_music_server_and_user() {
+    let handed = login(1);
+    assert!(carries_over("https://music.example.org/navidrome", "ada", &handed));
+    assert!(carries_over("HTTPS://Music.Example.org/navidrome/", "ada", &handed));
+    assert!(!carries_over("https://music.example.org/navidrome", "Ada", &handed));
+    assert!(!carries_over("https://music.example.org/other", "ada", &handed));
+    assert!(!carries_over("https://music.example.org:8443/navidrome", "ada", &handed));
+    assert!(!carries_over("https://other.example.org/navidrome", "ada", &handed));
+    assert!(!carries_over("music.example.org/navidrome", "ada", &handed));
+    assert!(!carries_over("https://ada@music.example.org/navidrome", "ada", &handed));
+}
+
+#[test]
+fn the_entry_point_says_whether_an_ask_is_waited_for() {
+    let mut client = Client::default();
+    let mut saved = serde_json::to_value(saved(4)).unwrap();
+    saved["session"] = serde_json::Value::String(hex(&SESSION));
+    let start = serde_json::json!({"start": {
+        "app": {"version": "0.41.0", "kind": "pc", "device_name": "Ada's PC"},
+        "kept": {"saved": saved},
+        "given": {"now_ms": START_MS}
+    }});
+    let out: serde_json::Value = serde_json::from_slice(&client.call_json(start.to_string().as_bytes())).unwrap();
+    let id = out["do"].as_array().unwrap().iter().find_map(|thing| thing.get("ask")).unwrap()["id"].as_u64().unwrap();
+    let ask = |client: &mut Client, id: u64| -> serde_json::Value {
+        serde_json::from_slice(&client.call_json(serde_json::json!({"waits_for": {"ask": id}}).to_string().as_bytes())).unwrap()
+    };
+    assert_eq!(ask(&mut client, id)["waits"], true);
+    client.stop();
+    assert_eq!(ask(&mut client, id)["waits"], false);
+}
+
+#[test]
+fn what_keep_writes_is_what_start_reads() {
+    // The phone keeps the JSON of each Keep as given and hands it back at start.
+    let mut rig = Rig::new(DeviceKind::Phone);
+    rig.start(Kept::default());
+    let out = rig.sign_in(4);
+    let saved_json = out
+        .iter()
+        .find_map(|thing| match thing {
+            Do::Keep(Keep::Saved(_)) => Some(serde_json::to_value(thing).unwrap()["keep"]["saved"].clone()),
+            _ => None,
+        })
+        .unwrap();
+    let secret_json = serde_json::to_value(Keep::DeviceSecret(DeviceSecret::from_bytes([0x42; 32]))).unwrap()["device_secret"].clone();
+    let mut client = Client::default();
+    let start = serde_json::json!({"start": {
+        "app": {"version": "0.41.0", "kind": "phone", "device_name": "Ada's phone"},
+        "kept": {"device_secret": secret_json, "saved": saved_json},
+        "given": {"now_ms": START_MS}
+    }});
+    let out: serde_json::Value = serde_json::from_slice(&client.call_json(start.to_string().as_bytes())).unwrap();
+    let things = out["do"].as_array().unwrap();
+    assert_eq!(things[0]["hand"]["login"]["count"], 4);
+    let ask = things.iter().find_map(|thing| thing.get("ask")).unwrap();
+    assert_eq!(ask["authorization"], format!("Bearer {}", hex(&SESSION)));
+    assert!(!things.iter().any(|thing| thing.get("keep").is_some_and(|keep| keep.get("device_secret").is_some())));
+}

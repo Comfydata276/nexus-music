@@ -11,14 +11,16 @@
 //!           "given":{"now_ms":…,"local_offset_minutes":600,"random":"<64 hex>"|null}}}
 //! {"happened":{"event":EVENT,"given":{…}}}
 //! {"stop":{}}
+//! {"waits_for":{"ask":7}}          gives {"generation":N,"do":[],"waits":true|false}
 //!
 //! EVENT: {"pressed":PRESS}
 //!        {"answered":{"ask":7,"status":200,"body":"<the body as text>"}}   (or "body_bytes":[…]
 //!                                                                         when it is not UTF-8)
 //!        {"failed":{"ask":7,"failure":{"how":"connect","inside":true,"permission":false}}}
 //!        {"network":{"up":true}}  {"offline":true}  {"tick":{}}  {"music_refused":{"count":3}}
-//! PRESS: {"sign_in":{"address":…,"email":…,"password":…}}
-//!        {"sign_in_with_code":{"address":…,"code":…,"password":…,"again":…}}
+//!        {"music_looked":{"inside":true,"permission":false}}
+//! PRESS: {"sign_in":{"address":…,"email":…,"password":…,"look":{"inside":…,"permission":…}}}
+//!        {"sign_in_with_code":{"address":…,"code":…,"password":…,"again":…,"look":{…}}}
 //!        {"sign_out":{}}  {"open_devices":{}}  {"force_out":{"device":12}}
 //!        {"change_password":{"current":…,"new":…,"again":…}}  {"notice_seen":{}}
 //! ```
@@ -54,6 +56,7 @@ enum Call {
     Start { app: AppIn, kept: KeptIn, given: GivenIn },
     Happened { event: EventIn, given: GivenIn },
     Stop {},
+    WaitsFor { ask: u64 },
 }
 
 #[derive(Deserialize)]
@@ -138,13 +141,27 @@ enum EventIn {
     MusicRefused {
         count: u64,
     },
+    MusicLooked(Look),
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 enum PressIn {
-    SignIn { address: String, email: String, password: Typed },
-    SignInWithCode { address: String, code: Typed, password: Typed, again: Typed },
+    SignIn {
+        address: String,
+        email: String,
+        password: Typed,
+        #[serde(default)]
+        look: Look,
+    },
+    SignInWithCode {
+        address: String,
+        code: Typed,
+        password: Typed,
+        again: Typed,
+        #[serde(default)]
+        look: Look,
+    },
     SignOut {},
     OpenDevices {},
     ForceOut { device: u64 },
@@ -205,8 +222,8 @@ fn kept(kept: KeptIn) -> Kept {
 fn event(event: EventIn) -> Result<Happened, ()> {
     Ok(match event {
         EventIn::Pressed(press) => Happened::Pressed(match press {
-            PressIn::SignIn { address, email, password } => Press::SignIn { address, email, password },
-            PressIn::SignInWithCode { address, code, password, again } => Press::SignInWithCode { address, code, password, again },
+            PressIn::SignIn { address, email, password, look } => Press::SignIn { address, email, password, look },
+            PressIn::SignInWithCode { address, code, password, again, look } => Press::SignInWithCode { address, code, password, again, look },
             PressIn::SignOut {} => Press::SignOut,
             PressIn::OpenDevices {} => Press::OpenDevices,
             PressIn::ForceOut { device } => Press::ForceOut { device },
@@ -227,6 +244,7 @@ fn event(event: EventIn) -> Result<Happened, ()> {
         EventIn::Offline(on) => Happened::Offline(on),
         EventIn::Tick {} => Happened::Tick,
         EventIn::MusicRefused { count } => Happened::MusicRefused { count },
+        EventIn::MusicLooked(look) => Happened::MusicLooked(look),
     })
 }
 
@@ -235,6 +253,8 @@ struct Out<'a> {
     generation: u64,
     #[serde(rename = "do")]
     things: &'a [Do],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    waits: Option<bool>,
 }
 
 fn error() -> Vec<u8> {
@@ -259,7 +279,11 @@ impl Client {
                 self.stop();
                 Vec::new()
             }
+            Call::WaitsFor { ask } => {
+                let waits = Some(self.waits_for(ask));
+                return serde_json::to_vec(&Out { generation: self.generation, things: &[], waits }).unwrap_or_else(|_| error());
+            }
         };
-        serde_json::to_vec(&Out { generation: self.generation, things: &things }).unwrap_or_else(|_| error())
+        serde_json::to_vec(&Out { generation: self.generation, things: &things, waits: None }).unwrap_or_else(|_| error())
     }
 }

@@ -257,16 +257,41 @@ pub enum Happened {
     /// password" with the music login of this number. Only that: a network failure, a proxy
     /// error or a busy server is not this (6.3's table).
     MusicRefused { count: u64 },
+    /// On the phone: where the music server's address that was handed over leads on this
+    /// network, and whether the permission is held (6.4; P7's note: judged apart from the
+    /// backend's address, which may be public while the music server is only inside).
+    MusicLooked(Look),
+}
+
+/// On the phone, where an address leads on this network and whether the local-network
+/// permission is held (6.4). Each `None` where the app did not or cannot look; a PC hands
+/// in `Look::default()`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+pub struct Look {
+    #[serde(default)]
+    pub inside: Option<bool>,
+    #[serde(default)]
+    pub permission: Option<bool>,
+}
+
+impl Look {
+    /// It leads inside the house and the permission is not held: Android would drop the
+    /// connection silently.
+    fn blocked(self) -> bool {
+        self.inside == Some(true) && self.permission == Some(false)
+    }
 }
 
 /// What the person pressed.
 #[derive(Debug)]
 pub enum Press {
-    /// Sign in with an email and a password.
-    SignIn { address: String, email: String, password: Typed },
+    /// Sign in with an email and a password. `look`: on the phone, where the typed address
+    /// leads on this network and whether the permission is held, looked at before the press
+    /// (6.4); on a PC, nothing.
+    SignIn { address: String, email: String, password: Typed, look: Look },
     /// Sign in for the first time with the one-time code the admin gave (8.5): the code and
     /// the password chosen, typed twice, redeemed together.
-    SignInWithCode { address: String, code: Typed, password: Typed, again: Typed },
+    SignInWithCode { address: String, code: Typed, password: Typed, again: Typed, look: Look },
     /// Sign out on this device.
     SignOut,
     /// The list of devices was opened, or "refresh" pressed on it.
@@ -484,6 +509,9 @@ pub struct Shown {
     pub notice: Option<String>,
     pub devices: DevicesShown,
     pub password: PasswordShown,
+    /// The phone is to show its screen that explains and asks for the local-network
+    /// permission, for the music server's address (6.4). Never set on a PC.
+    pub music_ask_permission: bool,
     /// Whether a music login is held, so that the player can reach the music server.
     pub plays: bool,
 }
@@ -630,6 +658,8 @@ struct Live {
     devices: Devices,
     password: PasswordShown,
     music_words: Option<String>,
+    /// The handed music server's address leads inside and the permission is not held.
+    music_blocked: bool,
     /// The backend speaks no number this app does: nothing more is asked until a start.
     too_old: bool,
     /// Once signed in, a backend of another id answered at the Nexus origin: nothing more is
@@ -869,6 +899,36 @@ fn tidy_code(text: &str) -> Option<OneTimeCode> {
     OneTimeCode::new(&tidied)
 }
 
+/// Whether what this device kept under the person it was signed in to before this version
+/// (downloads, settings, the queue) becomes the person's who signs in now (11): only if
+/// the music login handed over names the same music server and the same user. Asked once,
+/// at the first sign-in of this version; afterwards the folder is the person's by
+/// [`Saved::backend_id`] and [`Saved::account`], and another account handed the same user
+/// later starts with nothing.
+///
+/// The address is compared as the music server's base: scheme and host in small letters,
+/// the port as written, the path exactly, a single trailing `/` not counting. The user
+/// exactly.
+// to be origin's: the one tidying of a music server's address is `origin::MusicBase`; until
+// it is used here, this is the narrowest reading that can only say "the same" of the same.
+pub fn carries_over(before_address: &str, before_user: &str, handed: &MusicLogin) -> bool {
+    fn base(address: &str) -> Option<String> {
+        let address = address.trim();
+        let (scheme, rest) = address.split_once("://")?;
+        let end = rest.find('/').unwrap_or(rest.len());
+        let (authority, path) = rest.split_at(end);
+        if authority.is_empty() || authority.contains('@') || rest.contains(['?', '#']) {
+            return None;
+        }
+        let path = path.strip_suffix('/').unwrap_or(path);
+        Some(format!("{}://{}{}", scheme.to_ascii_lowercase(), authority.to_ascii_lowercase(), path))
+    }
+    match (base(before_address), base(handed.address.as_str())) {
+        (Some(before), Some(now)) => before == now && before_user == handed.name.as_str(),
+        _ => false,
+    }
+}
+
 /// The SHA-256 of a session, as 64 lower-case hex digits: what a [`Note`] holds.
 fn session_sha256(session: &Session) -> String {
     let fingerprint = super::kept::Fingerprint::of(session.expose_bytes());
@@ -939,6 +999,7 @@ impl Client {
             devices: Devices::not_asked(),
             password: PasswordShown::idle(),
             music_words: None,
+            music_blocked: false,
             too_old: false,
             stranger: false,
         };
@@ -986,6 +1047,11 @@ impl Client {
             Happened::Offline(on) => self.offline(on, given, &mut out),
             Happened::Tick => self.tick(given, &mut out),
             Happened::MusicRefused { count } => self.music_refused(count, &mut out),
+            Happened::MusicLooked(look) => {
+                if let Some(live) = self.live.as_mut() {
+                    live.music_blocked = look.blocked() && live.app.kind == DeviceKind::Phone;
+                }
+            }
         }
         self.show(given, &mut out);
         out

@@ -128,6 +128,8 @@ pub(super) enum Music {
     SignInToRenew,
     /// The account has no music login set.
     NoneSet,
+    /// The music server is on the home network and the phone lacks the permission (6.4).
+    NeedsPermission,
 }
 
 pub(super) fn music(music: Music) -> String {
@@ -141,6 +143,10 @@ pub(super) fn music(music: Music) -> String {
         }
         Music::SignInToRenew => "Your music sign-in needs renewing. Sign in to your Nexus server to renew it. What's downloaded plays meanwhile.".to_owned(),
         Music::NoneSet => "Your Nexus server has no music sign-in for you yet. Ask whoever runs it.".to_owned(),
+        Music::NeedsPermission => {
+            "Your music server is on your home network. To reach it, allow Nexus Music to find and connect to nearby devices. What's downloaded plays meanwhile."
+                .to_owned()
+        }
     }
 }
 
