@@ -1,4 +1,6 @@
-use super::tests::{Stored, bearer, clock, dev, fresh, grant, hash, state};
+use super::tests::{
+    Stored, bearer, clock, dev, fresh, grant, hash, sign_in_after_password_commit, state,
+};
 use super::*;
 
 impl Stored {
@@ -17,13 +19,13 @@ impl Stored {
         at: u64,
     ) -> Result<(), Denied> {
         self.mark = self.mark.max(target.mark);
-        let named = AdminTarget::Account(target.apart.account.id);
+        let named = target.apart.account.admin_target();
         self.leave(
             1,
             7,
             LeaveFor::Admin {
-                action: change,
-                target: named,
+                action: change.clone(),
+                target: named.clone(),
             },
             at,
         )?;
@@ -31,7 +33,7 @@ impl Stored {
             .request(self.apart.account.restore, clock(at, self.mark), |turn| {
                 turn.administer(
                     bearer(1, &hash(7)),
-                    change,
+                    change.clone(),
                     named,
                     Some(&mut target.account),
                 )
@@ -96,9 +98,9 @@ fn account_off_and_delete_win_both_orders_with_sign_in_and_survive_an_older_copy
             let inflight = person.read(2, 2, 1)?;
             if sign_in_first {
                 person.step(2, |turn| turn.sign_in(receipt, fresh(3), None))?;
-                admin.admin_change(&mut person, action, 2)?;
+                admin.admin_change(&mut person, action.clone(), 2)?;
             } else {
-                admin.admin_change(&mut person, action, 2)?;
+                admin.admin_change(&mut person, action.clone(), 2)?;
                 assert_eq!(
                     person.step(2, |turn| turn.sign_in(receipt, fresh(3), None)),
                     Err(Denied::NotSignedIn)
@@ -214,24 +216,27 @@ fn admin_grants_name_the_action_and_target_and_die_with_the_role() -> Result<(),
     let mut bob = Stored::new(state("bob@example.test"));
     alice.sign_in(8, 1, 1, 0)?;
     bob.sign_in(9, 1, 2, 0)?;
-    let a = AdminTarget::Account(alice.apart.account.id);
-    let b = AdminTarget::Account(bob.apart.account.id);
+    let a = alice.apart.account.admin_target();
+    let b = bob.apart.account.admin_target();
     let reset = AdminAction::ResetPassword;
     let grant = LeaveFor::Admin {
-        action: reset,
-        target: a,
+        action: reset.clone(),
+        target: a.clone(),
     };
     assert_eq!(
         alice.step(1, |turn| turn.admin_read(bearer(1, &hash(1)))),
         Err(Denied::AdminRequired)
     );
-    assert_eq!(alice.leave(1, 1, grant, 1), Err(Denied::AdminRequired));
+    assert_eq!(
+        alice.leave(1, 1, grant.clone(), 1),
+        Err(Denied::AdminRequired)
+    );
     admin.step(1, |turn| turn.admin_read(bearer(1, &hash(7))))?;
     assert_eq!(
         admin.step(1, |turn| turn.administer(
             bearer(1, &hash(7)),
-            reset,
-            a,
+            reset.clone(),
+            a.clone(),
             Some(&mut alice.account)
         )),
         Err(Denied::LeaveRequired)
@@ -240,8 +245,8 @@ fn admin_grants_name_the_action_and_target_and_die_with_the_role() -> Result<(),
     assert_eq!(
         admin.step(1, |turn| turn.administer(
             bearer(1, &hash(7)),
-            reset,
-            b,
+            reset.clone(),
+            b.clone(),
             Some(&mut bob.account)
         )),
         Err(Denied::LeaveRequired)
@@ -249,8 +254,8 @@ fn admin_grants_name_the_action_and_target_and_die_with_the_role() -> Result<(),
     assert_eq!(
         admin.step(1, |turn| turn.administer(
             bearer(1, &hash(7)),
-            reset,
-            a,
+            reset.clone(),
+            a.clone(),
             Some(&mut bob.account)
         )),
         Err(Denied::WrongPurpose)
@@ -262,8 +267,8 @@ fn admin_grants_name_the_action_and_target_and_die_with_the_role() -> Result<(),
         1,
         1,
         LeaveFor::Admin {
-            action: reset,
-            target: b,
+            action: reset.clone(),
+            target: b.clone(),
         },
         2,
     )?;
@@ -280,8 +285,8 @@ fn admin_grants_name_the_action_and_target_and_die_with_the_role() -> Result<(),
     assert_eq!(
         alice.step(3, |turn| turn.administer(
             bearer(1, &hash(1)),
-            reset,
-            b,
+            reset.clone(),
+            b.clone(),
             Some(&mut bob.account)
         )),
         Err(Denied::LeaveRequired)
@@ -412,7 +417,7 @@ fn password_fence_lands_first_and_blocks_an_interrupted_password_write() -> Resu
         .apply(|effects| {
             let update = effects.updates.first().unwrap();
             assert_eq!(update.change, DataChange::ChangePassword);
-            assert!(update.apart_first.account.password_reset_required);
+            assert!(!update.apart_first.account.password_reset_required);
             assert_eq!(update.apart_first.account.password_changes, 1);
             assert!(
                 update
@@ -438,6 +443,7 @@ fn password_fence_lands_first_and_blocks_an_interrupted_password_write() -> Resu
                     .apply(|_| Ok::<_, Denied>(()))?,
                 Err(Denied::WrongPassword)
             );
+            sign_in_after_password_commit(&update.apart_first, &update.data, 2)?;
             Ok(())
         })??;
     Ok(())
@@ -713,19 +719,33 @@ fn adoption_requires_reset_and_a_newer_stamp_cannot_change_the_account_life() ->
 #[test]
 fn provisioning_requires_the_grant_both_exact_logins_and_current_authority() -> Result<(), Denied> {
     use crate::nexus::{
-        account::{MusicAddress, MusicSalt, Name, SALT_BYTES},
+        account::{MusicAddress, MusicLoginResult, MusicSalt, Name, SALT_BYTES},
         music::{
-            Checked, CurrentEndpoints, Outcome, Ping, Provisioning, SealingKey, VerifiedLogin,
+            Checked, CredentialBinding, CurrentEndpoints, MusicInstallation, Outcome, Ping,
+            Provisioning, SaltedToken, SealingKey, VerifiedLogin, hand_out,
         },
     };
     const PRIVATE: &str = "http://navidrome.example.test:4533";
     let public = MusicAddress::new("https://music.example.test").unwrap();
     let key = SealingKey::new([8; 32]);
     let mut admin = Stored::admin()?;
-    let mut alice = Stored::new(state("alice@example.test"));
+    let mut alice_state = state("alice@example.test");
+    alice_state.music_recovery = Some(MusicRecovery::EnterAgain);
+    let mut alice = Stored::new(alice_state);
+    let old_binding = CredentialBinding {
+        backend: alice.apart.account.backend,
+        account: alice.apart.account.id,
+        address: public.clone(),
+        name: Name::new("Alice").unwrap(),
+        count: 1,
+    };
+    let old_login = MusicInstallation {
+        sealed: key.seal(&old_binding, b"Old password", [19; 24]).unwrap(),
+        binding: old_binding,
+    };
     let mut bob = Stored::new(state("bob@example.test"));
     let actor = hash(7);
-    let target = AdminTarget::Account(alice.apart.account.id);
+    let target = alice.apart.account.admin_target();
     let action = AdminAction::MusicLoginChanged;
     assert_eq!(
         admin
@@ -734,7 +754,15 @@ fn provisioning_requires_the_grant_both_exact_logins_and_current_authority() -> 
             .err(),
         Some(Denied::LeaveRequired)
     );
-    admin.leave(1, 7, LeaveFor::Admin { action, target }, 2)?;
+    admin.leave(
+        1,
+        7,
+        LeaveFor::Admin {
+            action: action.clone(),
+            target: target.clone(),
+        },
+        2,
+    )?;
     assert_eq!(
         admin
             .step(2, |t| t
@@ -749,7 +777,15 @@ fn provisioning_requires_the_grant_both_exact_logins_and_current_authority() -> 
                    public_name: &[u8]|
      -> Result<VerifiedLogin, Outcome> {
         admin
-            .leave(1, 7, LeaveFor::Admin { action, target }, u64::from(n))
+            .leave(
+                1,
+                7,
+                LeaveFor::Admin {
+                    action: action.clone(),
+                    target: target.clone(),
+                },
+                u64::from(n),
+            )
             .unwrap();
         let auth = admin
             .step(u64::from(n), |t| {
@@ -760,7 +796,7 @@ fn provisioning_requires_the_grant_both_exact_logins_and_current_authority() -> 
             internal: PRIVATE,
             public: public.clone(),
             name: Name::new("Alice").unwrap(),
-            password: b"Example password",
+            password: Zeroizing::new(b"Example password".to_vec()),
             salt: MusicSalt::from_random([n; SALT_BYTES]),
             nonce: [n; 24],
         };
@@ -789,7 +825,7 @@ fn provisioning_requires_the_grant_both_exact_logins_and_current_authority() -> 
     let exact = br#"{"subsonic-response":{"status":"ok","user":{"username":"Alice"}}}"#;
     assert_eq!(
         checked(&mut admin, &alice, 3, other).err(),
-        Some(Outcome::CouldNotAsk)
+        Some(Outcome::NameDiffers)
     );
     assert_eq!(alice.apart.account.music_login, 1);
 
@@ -847,9 +883,32 @@ fn provisioning_requires_the_grant_both_exact_logins_and_current_authority() -> 
                 panic!("no sealed login effect")
             };
             assert_eq!(login.binding.count, update.data.account.music_login);
+            let needs_recovery = Account::load(&update.apart_first, Some(&alice.data));
+            let salt = || MusicSalt::from_random([20; SALT_BYTES]);
             assert_eq!(
-                &*key.open(&login.binding, &login.sealed).unwrap(),
-                b"Example password"
+                hand_out(
+                    needs_recovery.state(),
+                    Some(&old_login),
+                    &key,
+                    &public,
+                    salt()
+                ),
+                MusicLoginResult::UnusableNow
+            );
+            let recovered = Account::load(&update.apart_first, Some(&update.data));
+            let MusicLoginResult::Login(handed) =
+                hand_out(recovered.state(), Some(login), &key, &public, salt())
+            else {
+                panic!("committed replacement should work before the last apart write");
+            };
+            assert_eq!(
+                handed.token,
+                *SaltedToken::from_password(b"Example password", salt()).token()
+            );
+            let restored = Account::load(&update.apart_last, Some(&alice.data));
+            assert_eq!(
+                hand_out(restored.state(), Some(&old_login), &key, &public, salt()),
+                MusicLoginResult::UnusableNow
             );
             assert_eq!(update.data.account.music_login, 2);
             Ok::<_, Denied>(())
@@ -881,5 +940,176 @@ fn provisioning_requires_the_grant_both_exact_logins_and_current_authority() -> 
         )),
         Err(Denied::NotSignedIn)
     );
+    Ok(())
+}
+
+#[test]
+fn a_create_grant_binds_the_actor_request_action_and_exact_email() -> Result<(), Denied> {
+    use super::tests::req;
+    let mut admin = Stored::admin()?;
+    let mut second = state("other-admin@example.test");
+    second.admin = true;
+    let mut second = Stored::new(second);
+    second.sign_in(6, 1, 6, 0)?;
+    let alice = AdminTarget::NewAccount(Email::new("alice@example.test").unwrap());
+    let bob = AdminTarget::NewAccount(Email::new("bob@example.test").unwrap());
+    let issuer_hash = hash(7);
+    let second_hash = hash(6);
+    let presented = |hash, request_id| Bearer {
+        device: dev(1),
+        hash,
+        grant: Some(GrantUse {
+            request_id: req(request_id),
+            secret: grant(),
+        }),
+    };
+    let check = admin.step(1, |turn| {
+        turn.check_leave(
+            bearer(1, &hash(7)),
+            GrantIntent {
+                request_id: req(41),
+                change: LeaveFor::Admin {
+                    action: AdminAction::CreateAccount,
+                    target: alice.clone(),
+                },
+            },
+            hash(42),
+        )
+    })?;
+    let receipt = check.check(hash(42), clock(1, 1))?;
+    admin.step(1, |turn| turn.grant_leave(receipt, grant()))?;
+    assert_eq!(
+        second.step(1, |turn| turn.administer(
+            presented(&second_hash, 41),
+            AdminAction::CreateAccount,
+            alice.clone(),
+            None
+        )),
+        Err(Denied::LeaveRequired)
+    );
+    for (number, action, target) in [
+        (42, AdminAction::CreateAccount, alice.clone()),
+        (41, AdminAction::CreateAccount, bob),
+        (41, AdminAction::ResetPassword, alice.clone()),
+    ] {
+        assert_eq!(
+            admin.step(1, |turn| turn.administer(
+                presented(&issuer_hash, number),
+                action,
+                target,
+                None
+            )),
+            Err(Denied::LeaveRequired)
+        );
+    }
+    admin
+        .account
+        .request(1, clock(1, 1), |turn| {
+            turn.administer(
+                presented(&issuer_hash, 41),
+                AdminAction::CreateAccount,
+                alice.clone(),
+                None,
+            )
+        })
+        .apply(|effects| {
+            let update = effects.updates.first().unwrap();
+            assert_eq!(
+                update.change,
+                DataChange::ApplyAdmin {
+                    action: AdminAction::CreateAccount,
+                    target: alice.clone()
+                }
+            );
+            Ok::<_, Denied>(())
+        })??;
+    assert_eq!(
+        admin.step(1, |turn| turn.administer(
+            presented(&issuer_hash, 41),
+            AdminAction::CreateAccount,
+            alice,
+            None
+        )),
+        Err(Denied::LeaveRequired)
+    );
+    Ok(())
+}
+
+#[test]
+fn grants_check_the_targets_current_revision_and_the_requested_setting_value() -> Result<(), Denied>
+{
+    let mut admin = Stored::admin()?;
+    let mut other = state("other-admin@example.test");
+    other.admin = true;
+    let mut other = Stored::new(other);
+    other.sign_in(7, 1, 7, 0)?;
+    let mut person = Stored::new(state("alice@example.test"));
+    let target = person.apart.account.admin_target();
+    let action = AdminAction::ResetPassword;
+    admin.leave(
+        1,
+        7,
+        LeaveFor::Admin {
+            action: action.clone(),
+            target: target.clone(),
+        },
+        1,
+    )?;
+    other.admin_change(&mut person, AdminAction::SetAdmin(true), 2)?;
+    let new_target = person.apart.account.admin_target();
+    assert_ne!(target, new_target);
+    assert_eq!(
+        admin.step(2, |turn| turn.administer(
+            bearer(1, &hash(7)),
+            action.clone(),
+            new_target,
+            Some(&mut person.account)
+        )),
+        Err(Denied::LeaveRequired)
+    );
+    assert_eq!(
+        admin.step(2, |turn| turn.administer(
+            bearer(1, &hash(7)),
+            action,
+            target,
+            Some(&mut person.account)
+        )),
+        Err(Denied::WrongPurpose)
+    );
+    assert_eq!(person.apart.account.password_changes, 0);
+    let address = MusicAddress::new("https://music.example.test").unwrap();
+    let unrelated = MusicAddress::new("https://other.example.test").unwrap();
+    for (action, different) in [
+        (
+            AdminAction::SetMusicAddress(address),
+            AdminAction::SetMusicAddress(unrelated),
+        ),
+        (
+            AdminAction::SetDiagnosticsDefault(true),
+            AdminAction::SetDiagnosticsDefault(false),
+        ),
+    ] {
+        admin.leave(
+            1,
+            7,
+            LeaveFor::Admin {
+                action: action.clone(),
+                target: AdminTarget::Backend,
+            },
+            2,
+        )?;
+        assert_eq!(
+            admin.step(2, |turn| turn.administer(
+                bearer(1, &hash(7)),
+                different,
+                AdminTarget::Backend,
+                None
+            )),
+            Err(Denied::LeaveRequired)
+        );
+        admin.step(2, |turn| {
+            turn.administer(bearer(1, &hash(7)), action, AdminTarget::Backend, None)
+        })?;
+    }
     Ok(())
 }

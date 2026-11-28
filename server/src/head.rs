@@ -147,6 +147,7 @@ impl From<(&'static str, &'static str)> for Route {
 /// takes. A call that carries a password takes 4 KiB at most (7.2, the slice notes' S8).
 pub const ROUTES: &[Route] = &[
     Route::new(proto::HELLO, "GET", BODY_MAX_BYTES),
+    Route::new(crate::admin::PAGE, "GET", BODY_MAX_BYTES),
     Route::new(account::SIGN_IN, "POST", account::PASSWORD_REQUEST_MAX_BYTES),
     Route::new(account::CHANGE_PASSWORD, "POST", account::PASSWORD_REQUEST_MAX_BYTES),
     Route::new(account::SIGN_OUT, "POST", account::SMALL_REQUEST_MAX_BYTES),

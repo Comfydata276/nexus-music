@@ -75,7 +75,7 @@ impl SealingKey {
     }
 
     /// The binding must come from current authority, including the apart count.
-    pub fn open(
+    pub(super) fn open(
         &self,
         binding: &CredentialBinding,
         sealed: &SealedCredential,

@@ -1,8 +1,10 @@
 //! The music-server login (§9). S9 supplies configured addresses, fresh random
 //! bytes and the transport. A music-server answer confers no Nexus permissions.
 
-use super::account::{AccountId, MusicAddress, MusicSalt, MusicToken, Name, SALT_LENGTH};
-use super::kept::MusicAuthorization;
+use super::account::{
+    AccountId, MusicAddress, MusicLogin, MusicLoginResult, MusicSalt, MusicToken, Name, SALT_LENGTH,
+};
+use super::kept::{AccountState, MusicAuthorization, Status};
 use super::proto::{self, BackendId};
 use super::wire::{self, BadMessage, Fields, Value};
 use serde_json::value::RawValue;
@@ -50,6 +52,8 @@ impl fmt::Debug for SaltedToken {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum Outcome {
     Refused,
+    NameDiffers,
+    Unusable,
     CouldNotAsk,
 }
 
@@ -89,6 +93,42 @@ pub struct MusicInstallation {
     pub sealed: SealedCredential,
 }
 
+/// Hand out a login using the current account authority from the apart store.
+/// An older data row is never used to supply that authority's count.
+pub fn hand_out(
+    state: &AccountState,
+    install: Option<&MusicInstallation>,
+    key: &SealingKey,
+    public: &MusicAddress,
+    salt: MusicSalt,
+) -> MusicLoginResult {
+    if state.music_login == 0 {
+        return MusicLoginResult::NoneSetYet;
+    }
+    let Some(login) = install.filter(|login| {
+        let binding = &login.binding;
+        state.status == Status::On
+            && state.music_recovery.is_none()
+            && binding.backend == state.backend
+            && binding.account == state.id
+            && binding.count == state.music_login
+            && binding.address == *public
+    }) else {
+        return MusicLoginResult::UnusableNow;
+    };
+    let Some(password) = key.open(&login.binding, &login.sealed) else {
+        return MusicLoginResult::UnusableNow;
+    };
+    let SaltedToken { salt, token } = SaltedToken::from_password(&password, salt);
+    MusicLoginResult::Login(MusicLogin {
+        address: public.clone(),
+        name: login.binding.name.clone(),
+        salt,
+        token,
+        count: state.music_login,
+    })
+}
+
 /// The only input kept accepts to install a typed-in login. Only both configured
 /// endpoints answering correctly for the identical credentials can make one.
 pub struct VerifiedLogin {
@@ -117,7 +157,7 @@ pub struct Provisioning<'a> {
     pub internal: &'a str,
     pub public: MusicAddress,
     pub name: Name,
-    pub password: &'a [u8],
+    pub password: Zeroizing<Vec<u8>>,
     pub salt: MusicSalt,
     pub nonce: [u8; NONCE_BYTES],
 }
@@ -149,7 +189,7 @@ impl Ping {
         input: Provisioning<'_>,
         key: &SealingKey,
     ) -> Result<Self, Outcome> {
-        let internal = internal_address(input.internal).ok_or(Outcome::CouldNotAsk)?;
+        let internal = internal_address(input.internal).ok_or(Outcome::Unusable)?;
         let binding = CredentialBinding {
             backend: authorization.backend(),
             account: authorization.account(),
@@ -158,9 +198,9 @@ impl Ping {
             count: authorization.next_count(),
         };
         let sealed = key
-            .seal(&binding, input.password, input.nonce)
-            .ok_or(Outcome::CouldNotAsk)?;
-        let pair = SaltedToken::from_password(input.password, input.salt);
+            .seal(&binding, &input.password, input.nonce)
+            .ok_or(Outcome::Unusable)?;
+        let pair = SaltedToken::from_password(&input.password, input.salt);
         Ok(Self(Check {
             authorization,
             internal,
@@ -284,6 +324,7 @@ fn ping_answer(reply: Option<(u16, &[u8])>) -> Result<(), Outcome> {
 fn user_answer(reply: Option<(u16, &[u8])>, name: &str) -> Result<(), Outcome> {
     match read_reply(reply) {
         Some(Envelope::Ok(Some(found))) if found.as_str() == name => Ok(()),
+        Some(Envelope::Ok(Some(_))) => Err(Outcome::NameDiffers),
         // E3.4. Wrong credentials and the upstream limiter have the same envelope.
         Some(Envelope::Error(BAD_SIGN_IN)) => Err(Outcome::Refused),
         _ => Err(Outcome::CouldNotAsk),

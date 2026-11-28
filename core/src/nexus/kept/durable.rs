@@ -26,7 +26,8 @@ pub struct DeviceRow {
 }
 
 /// The design does not say how to recognize partial grants. The apart record
-/// remembers which identity and leave the data may grant, without either hash.
+/// remembers which identity and leave the data may grant, including the grant
+/// fingerprint but without the bearer or revoke-note fingerprint.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Permit {
     pub id: SessionId,
@@ -36,6 +37,8 @@ pub struct Permit {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ApartDevice {
     pub number: u64,
+    /// A force-out clears this before the data is updated.
+    pub known: bool,
     pub last_session: u64,
     pub last_leave: u64,
     pub permit: Option<Permit>,
@@ -92,6 +95,9 @@ pub struct Update {
 
 #[derive(Debug)]
 pub struct Effects {
+    /// Persist even when there are no row updates. A denied operation can
+    /// observe grant or code expiry, and a restarted clock must not undo that.
+    /// The hourly write limit is for last_used; the clock is a separate fence.
     pub high_water: u64,
     pub updates: Vec<Update>,
 }
@@ -170,6 +176,7 @@ impl Account {
                 Device {
                     id,
                     number: record.number,
+                    known: record.known,
                     secret: row.map(|row| row.secret.clone()),
                     last_session: record.last_session,
                     last_leave: record.last_leave,
@@ -219,6 +226,7 @@ impl Account {
                     id,
                     ApartDevice {
                         number: device.number,
+                        known: device.known,
                         last_session: device.last_session,
                         last_leave: device.last_leave,
                         permit: device.session.as_ref().map(|session| Permit {
@@ -313,10 +321,21 @@ impl Account {
             first.status = old.status;
         }
         first.admin &= old.admin;
-        first.music_recovery = first.music_recovery.or(old.music_recovery);
+        // A newly installed seal with a matching count clears recovery. If the
+        // data write did not land, load will set it again from the mismatch.
+        if !matches!(change, DataChange::InstallMusicLogin(_)) {
+            first.music_recovery = first.music_recovery.or(old.music_recovery);
+        }
         first.history_held |= old.history_held;
-        first.password_reset_required |=
-            old.password_reset_required || old.password_changes != first.password_changes;
+        // The new verifier is usable once the data transaction has committed.
+        // Before it, load detects the mismatched password_changes and locks it.
+        if !matches!(
+            change,
+            DataChange::ChangePassword | DataChange::RedeemCode { .. }
+        ) {
+            first.password_reset_required |=
+                old.password_reset_required || old.password_changes != first.password_changes;
+        }
         // Changing the live identity retires the previous code at the first cut.
         // A newly issued code still requires its own matching data verifier.
         if change != DataChange::ResetPassword {
@@ -326,6 +345,7 @@ impl Account {
             });
         }
         for (&id, after) in &mut apart_first.devices {
+            after.known &= apart.devices.get(&id).is_some_and(|old| old.known);
             after.permit = after.permit.take().and_then(|new| {
                 let old = apart.devices.get(&id)?.permit.as_ref()?;
                 (old.id == new.id).then_some(Permit {
@@ -382,21 +402,24 @@ impl Account {
         Ok(())
     }
 
-    fn change_password(&mut self, keep: Option<DeviceId>, reset: bool) -> Result<(), Denied> {
+    fn change_password(
+        &mut self,
+        keep: Option<DeviceId>,
+        reset: bool,
+        now: u64,
+    ) -> Result<(), Denied> {
         let changes = next(self.state.password_changes)?;
         let revision = next(self.state.revision)?;
+        let code = if reset {
+            Some(LiveCode::new(changes, now)?)
+        } else {
+            self.state.code.map(|code| LiveCode { used: true, ..code })
+        };
         self.end_others(keep)?;
         self.state.password_changes = changes;
         self.state.revision = revision;
         self.state.password_reset_required = reset;
-        self.state.code = if reset {
-            Some(LiveCode {
-                number: changes,
-                used: false,
-            })
-        } else {
-            self.state.code.map(|code| LiveCode { used: true, ..code })
-        };
+        self.state.code = code;
         Ok(())
     }
 
@@ -521,7 +544,12 @@ pub struct Bearer<'a> {
     pub device: DeviceId,
     pub hash: &'a Fingerprint,
     /// Supplied by a grant-bearing request. Ordinary authenticated calls omit it.
-    pub grant: Option<&'a GrantSecret>,
+    pub grant: Option<GrantUse<'a>>,
+}
+
+pub struct GrantUse<'a> {
+    pub request_id: RequestId,
+    pub secret: &'a GrantSecret,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -537,6 +565,7 @@ pub struct SessionGrant {
 pub struct FreshSession {
     pub id: SessionId,
     pub hash: Fingerprint,
+    pub sign_out: Fingerprint,
 }
 
 /// One consumed admin grant for provisioning a named account's login. Only
@@ -545,6 +574,7 @@ pub struct MusicAuthorization {
     actor: Scope,
     session: SessionId,
     granted: u64,
+    request_id: RequestId,
     target: AccountId,
     target_revision: u64,
     next_count: u64,
@@ -574,9 +604,8 @@ impl Turn<'_> {
         self.check_sign_in_for(device, vacant, expected, None)
     }
 
-    /// S8 supplies the fingerprint and deadline of the authoritative live code.
-    /// S3 rechecks the live verifier and deadline under its lock before writing
-    /// any part of a RedeemCode effect, including its apart-first spent fence.
+    /// S8 supplies the fingerprint of the authoritative code. Kept checks the
+    /// recorded deadline both here and in the serialized redemption.
     pub fn check_code(
         self,
         device: &DeviceSecret,
@@ -584,11 +613,11 @@ impl Turn<'_> {
         code: u64,
         expected: Fingerprint,
     ) -> Result<PasswordCheck, Denied> {
-        if self.account.state.code
-            != Some(LiveCode {
-                number: code,
-                used: false,
-            })
+        if !self
+            .account
+            .state
+            .code
+            .is_some_and(|live| live.allows(code, self.now))
         {
             return Err(Denied::WrongPassword);
         }
@@ -618,7 +647,13 @@ impl Turn<'_> {
         } else {
             Purpose::SignIn { secret, is_new }
         };
-        Ok(PasswordCheck::new(scope, purpose, expected, self.now))
+        Ok(PasswordCheck::new(
+            scope,
+            purpose,
+            expected,
+            self.now,
+            device.known,
+        ))
     }
 
     /// On an account switch S3 passes the other account, found by device-secret
@@ -680,11 +715,11 @@ impl Turn<'_> {
                     Status::Off => return Err(Denied::AccountOff),
                     Status::Deleted => return Err(Denied::WrongPassword),
                 }
-                if self.account.state.code
-                    != Some(LiveCode {
-                        number: code,
-                        used: false,
-                    })
+                if !self
+                    .account
+                    .state
+                    .code
+                    .is_some_and(|live| live.allows(code, self.now))
                 {
                     return Err(Denied::WrongPassword);
                 }
@@ -696,11 +731,16 @@ impl Turn<'_> {
         if is_new != still_new || device.id != id {
             return Err(Denied::NotSignedIn);
         }
-        if fresh.id.get() <= device.last_session
+        if fresh.hash == fresh.sign_out
+            || fresh.id.get() <= device.last_session
             || self.account.devices.values().any(|d| {
-                d.session
-                    .as_ref()
-                    .is_some_and(|s| s.hash == fresh.hash || s.id == fresh.id)
+                d.session.as_ref().is_some_and(|s| {
+                    s.id == fresh.id
+                        || s.hash == fresh.hash
+                        || s.sign_out == fresh.hash
+                        || s.hash == fresh.sign_out
+                        || s.sign_out == fresh.sign_out
+                })
             })
         {
             return Err(Denied::ReusedSession);
@@ -710,14 +750,16 @@ impl Turn<'_> {
         device.session = Some(Session {
             id: fresh.id,
             hash: fresh.hash,
+            sign_out: fresh.sign_out,
             last_used: self.now,
             leave: None,
         });
         device.last_accepted = Some(self.now);
+        device.known = true;
 
         let redeemed = if let Some((code, verifier)) = code {
             let mut account = self.account.clone();
-            account.change_password(Some(id), false)?;
+            account.change_password(Some(id), false, self.now)?;
             Some((account, DataChange::RedeemCode { code, verifier }))
         } else {
             None
@@ -759,21 +801,22 @@ impl Turn<'_> {
     pub fn check_leave(
         self,
         bearer: Bearer<'_>,
-        for_what: LeaveFor,
+        intent: GrantIntent,
         expected: Fingerprint,
     ) -> Result<PasswordCheck, Denied> {
         let session = self
             .account
             .session(bearer.device, bearer.hash, self.now)?
             .id;
-        if matches!(for_what, LeaveFor::Admin { .. }) && !self.account.state.admin {
+        if matches!(&intent.change, LeaveFor::Admin { .. }) && !self.account.state.admin {
             return Err(Denied::AdminRequired);
         }
         Ok(PasswordCheck::new(
             self.account.scope(bearer.device)?,
-            Purpose::Leave { session, for_what },
+            Purpose::Leave { session, intent },
             expected,
             self.now,
+            true,
         ))
     }
 
@@ -792,7 +835,7 @@ impl Turn<'_> {
         device.expire(self.now)?;
         let scope = self.account.state.scope(device);
         let checked = receipt.checked();
-        let Purpose::Leave { session, for_what } = receipt.consume(&scope, self.now)? else {
+        let Purpose::Leave { session, intent } = receipt.consume(&scope, self.now)? else {
             return Err(Denied::WrongPurpose);
         };
         let row = device
@@ -800,14 +843,14 @@ impl Turn<'_> {
             .as_mut()
             .filter(|s| s.id == session)
             .ok_or(Denied::NotSignedIn)?;
-        if matches!(for_what, LeaveFor::Admin { .. }) && !self.account.state.admin {
+        if matches!(&intent.change, LeaveFor::Admin { .. }) && !self.account.state.admin {
             return Err(Denied::AdminRequired);
         }
         device.last_leave = next(device.last_leave)?;
         // The design does not say how simultaneous leave for different operations
         // interacts. Retain just one, and spend it on a single matching change.
         row.leave = Some(Leave::stored(
-            for_what,
+            intent,
             scope.life,
             scope.revision,
             self.account.state.admin,
@@ -879,6 +922,22 @@ impl Turn<'_> {
         Err(Denied::NotSignedIn)
     }
 
+    /// The note can revoke only its named session. An already-ended target
+    /// makes a retry harmless, including after the device signs in again.
+    pub fn sign_out_by_note(self, target: SessionTarget, note: &Fingerprint) -> Result<(), Denied> {
+        let Some(device) = self.account.devices.get_mut(&target.device) else {
+            return Ok(());
+        };
+        device.expire(self.now)?;
+        let Some(session) = device.session.as_ref().filter(|s| s.id == target.session) else {
+            return Ok(());
+        };
+        if session.sign_out != *note {
+            return Err(Denied::NotSignedIn);
+        }
+        device.end()
+    }
+
     pub fn force_out(self, bearer: Bearer<'_>, other: SessionTarget) -> Result<(), Denied> {
         self.account.session(bearer.device, bearer.hash, self.now)?;
         if other.device == bearer.device {
@@ -892,16 +951,15 @@ impl Turn<'_> {
         let revision = self.account.state.revision;
         let admin = self.account.state.admin;
         let session = self.account.session(bearer.device, bearer.hash, self.now)?;
-        let hash = bearer
-            .grant
-            .map(|grant| Fingerprint::of(grant.expose_bytes()))
-            .ok_or(Denied::LeaveRequired)?;
+        let offered = bearer.grant.ok_or(Denied::LeaveRequired)?;
+        let hash = Fingerprint::of(offered.secret.expose_bytes());
         if !session.leave.as_ref().is_some_and(|leave| {
             leave.hash == hash
                 && leave.life == life
                 && leave.revision == revision
                 && leave.admin == admin
-                && leave.purpose == purpose
+                && leave.intent.change == purpose
+                && leave.intent.request_id == offered.request_id
                 && within(leave.granted, self.now, PASSWORD_LEAVE_MS)
         }) {
             return Err(Denied::LeaveRequired);
@@ -912,7 +970,7 @@ impl Turn<'_> {
     pub fn change_password(mut self, bearer: Bearer<'_>) -> Result<(), Denied> {
         let keep = bearer.device;
         self.consume_leave(bearer, LeaveFor::ChangePassword)?;
-        self.account.change_password(Some(keep), false)?;
+        self.account.change_password(Some(keep), false, self.now)?;
         *self.change = DataChange::ChangePassword;
         Ok(())
     }
@@ -957,6 +1015,7 @@ impl Turn<'_> {
         {
             return Err(Denied::WrongPurpose);
         }
+        let named = target_state.admin_target();
         let target = target_state.id;
         let target_revision = target_state.revision;
         let next_count = next(target_state.music_login)?;
@@ -966,7 +1025,7 @@ impl Turn<'_> {
             bearer,
             LeaveFor::Admin {
                 action: AdminAction::MusicLoginChanged,
-                target: AdminTarget::Account(target),
+                target: named,
             },
         )?;
         let session = self.account.session(device, hash, self.now)?.id;
@@ -974,6 +1033,7 @@ impl Turn<'_> {
             actor: self.account.scope(device)?,
             session,
             granted: grant.granted,
+            request_id: grant.intent.request_id,
             target,
             target_revision,
             next_count,
@@ -997,6 +1057,7 @@ impl Turn<'_> {
         if !self.account.state.admin
             || self.account.scope(bearer.device)? != auth.actor
             || session != auth.session
+            || bearer.grant.map(|grant| grant.request_id) != Some(auth.request_id)
             || !within(auth.granted, self.now, PASSWORD_LEAVE_MS)
         {
             return Err(Denied::LeaveRequired);
@@ -1048,12 +1109,12 @@ impl Turn<'_> {
         self.consume_leave(
             bearer,
             LeaveFor::Admin {
-                action,
-                target: named,
+                action: action.clone(),
+                target: named.clone(),
             },
         )?;
-        let selected = target.as_deref().unwrap_or(self.account).state.id;
-        if !action.matches_target(named, selected, target.is_some()) {
+        let selected = &target.as_deref().unwrap_or(self.account).state;
+        if !action.matches_target(&named, selected, target.is_some()) {
             return Err(Denied::WrongPurpose);
         }
         if let Some(target) = target {
@@ -1067,13 +1128,20 @@ impl Turn<'_> {
             let apart = target.apart();
             let mut change = DataChange::Keep;
             let mut music = None;
-            let answer = admin_change(target, action, named, &mut change, &mut music);
+            let answer = admin_change(target, action, named, &mut change, &mut music, self.now);
             if let Some(update) = target.update(&before, &apart, change, music) {
                 self.others.push(update);
             }
             answer
         } else {
-            admin_change(self.account, action, named, self.change, self.music)
+            admin_change(
+                self.account,
+                action,
+                named,
+                self.change,
+                self.music,
+                self.now,
+            )
         }
     }
 }
@@ -1107,6 +1175,7 @@ fn force_out(
             .is_some_and(|session| session.id == target.session)
     {
         device.end()?;
+        device.known = false;
         if account.state.music_managed {
             require_music_rotation(account, music);
         }
@@ -1114,7 +1183,7 @@ fn force_out(
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub enum AdminAction {
     SetOn(bool),
     DeleteAccount,
@@ -1123,20 +1192,20 @@ pub enum AdminAction {
     ForceOut(SessionTarget),
     MusicLoginChanged,
     CreateAccount,
-    SetMusicAddress,
-    SetDiagnosticsDefault,
-    SetRequests,
+    SetMusicAddress(MusicAddress),
+    SetDiagnosticsDefault(bool),
+    SetRequests(bool),
     SetLidarr,
 }
 
 impl AdminAction {
-    fn matches_target(self, target: AdminTarget, selected: AccountId, other: bool) -> bool {
+    fn matches_target(&self, target: &AdminTarget, selected: &AccountState, other: bool) -> bool {
         match self {
             Self::CreateAccount => matches!(target, AdminTarget::NewAccount(_)) && !other,
-            Self::SetMusicAddress | Self::SetDiagnosticsDefault | Self::SetLidarr => {
-                target == AdminTarget::Backend && !other
+            Self::SetMusicAddress(_) | Self::SetDiagnosticsDefault(_) | Self::SetLidarr => {
+                *target == AdminTarget::Backend && !other
             }
-            _ => target == AdminTarget::Account(selected),
+            _ => *target == selected.admin_target(),
         }
     }
 }
@@ -1147,6 +1216,7 @@ fn admin_change(
     target: AdminTarget,
     change: &mut DataChange,
     music: &mut Option<MusicRecovery>,
+    now: u64,
 ) -> Result<(), Denied> {
     if account.state.status == Status::Deleted {
         return Err(Denied::NotSignedIn);
@@ -1188,7 +1258,7 @@ fn admin_change(
             *change = DataChange::DeleteAccount;
         }
         AdminAction::ResetPassword => {
-            account.change_password(None, true)?;
+            account.change_password(None, true, now)?;
             *change = DataChange::ResetPassword;
             if account.state.music_managed {
                 require_music_rotation(account, music);
@@ -1210,9 +1280,9 @@ fn admin_change(
         AdminAction::ForceOut(device) => force_out(account, device, music)?,
         AdminAction::MusicLoginChanged => return Err(Denied::WrongPurpose),
         AdminAction::CreateAccount
-        | AdminAction::SetMusicAddress
-        | AdminAction::SetDiagnosticsDefault
-        | AdminAction::SetRequests
+        | AdminAction::SetMusicAddress(_)
+        | AdminAction::SetDiagnosticsDefault(_)
+        | AdminAction::SetRequests(_)
         | AdminAction::SetLidarr => *change = DataChange::ApplyAdmin { action, target },
     }
     Ok(())
