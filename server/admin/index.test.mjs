@@ -237,6 +237,7 @@ const settle = () => new Promise(setImmediate);
 function adminStandIn() {
   const calls = [];
   let pendingGrant = null;
+  let lidarrConfigured = false;
   let grantCount = 0;
   let nextRefusal;
   let nextCode = code;
@@ -279,7 +280,7 @@ function adminStandIn() {
     }
     if (path === "/nexus/api/admin/music-server") return done({ internal: internalAddress, public: publicAddress });
     if (path === "/nexus/api/admin/diagnostics-default") return done({ enabled: diagnostics });
-    if (path === "/nexus/api/admin/lidarr") return done({ address: lidarrAddress, configured: false });
+    if (path === "/nexus/api/admin/lidarr") return done({ address: lidarrAddress, configured: lidarrConfigured });
     if (path === "/nexus/api/admin/grant") {
       calls.push({ phase: "grant", request_id: data.change.request_id, action: data.change.action });
       if (nextRefusal) {
@@ -310,6 +311,7 @@ function adminStandIn() {
     if (action === "set_account_enabled") enabled = data.change.enabled;
     if (action === "set_requests_enabled") canRequest = data.change.enabled;
     if (action === "set_admin") isAdmin = data.change.admin;
+    if (action === "set_lidarr") lidarrConfigured = true;
     if (action === "set_music_server") publicAddress = data.change.public;
     if (action === "set_diagnostics_default") diagnostics = data.change.enabled;
     if (action === "force_out") hasSession = false;
@@ -390,12 +392,19 @@ test("all changes show a confirmation and spend one grant on the exact wire targ
   await confirm();
   assert.equal(page.from("music-public").textContent, address);
 
-  assert.match(page.from("lidarr-address").textContent, /requests-inside/);
+  assert.match(page.from("lidarr-address").textContent, /requests-inside.*Enter a key/);
+  for (const invalidKey of ["with spaces", "é", "a".repeat(513)]) {
+    page.submit("lidarr-form", { "lidarr-key": invalidKey });
+    assert.equal(page.from("lidarr-key").value, "");
+    assert.equal(page.from("grant").open, false);
+  }
   page.submit("lidarr-form", { "lidarr-key": lidarrKey });
   assert.equal(page.from("lidarr-key").value, "");
 
   assert.equal(page.from("grant-summary").textContent.includes(lidarrKey), false);
   await confirm();
+  assert.match(page.from("lidarr-address").textContent, /A key is saved/);
+  assert.equal(page.from("lidarr-address").textContent.includes(lidarrKey), false);
   page.click("diagnostics-toggle");
   await confirm();
 

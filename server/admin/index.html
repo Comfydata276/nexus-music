@@ -391,7 +391,7 @@ dd, li { overflow-wrap: anywhere; }
     no_such_account: "That account is no longer here. Refresh the accounts and try again.",
     no_such_session: "That device has signed out or signed in again. Refresh the devices first.",
     music_login_refused: "That music server username or password is not right. Check both and try again.",
-    lidarr_login_refused: "Lidarr did not accept those settings. Check the address and key.",
+    lidarr_login_refused: "Lidarr did not accept that key. Check it and try again.",
     conflict: "Someone changed these settings already. Refresh them and try again.",
   };
 
@@ -755,6 +755,7 @@ dd, li { overflow-wrap: anywhere; }
     }
     if (view === "address") void loadMusic(current);
     if (view === "diagnostics") void loadDiagnostics(current);
+    if (view === "lidarr") void loadLidarr(current);
   }
 
   byId("grant-form").addEventListener("submit", async event => {
@@ -889,12 +890,17 @@ dd, li { overflow-wrap: anywhere; }
   async function loadLidarr(current) {
     try {
       const result = await readAdmin(current, "/nexus/api/admin/lidarr", {}, 4096);
-      if (session !== current || (result.address !== null && typeof result.address !== "string")) return;
+      if (session !== current) return;
+      if (typeof result.configured !== "boolean" ||
+          (result.address !== null && typeof result.address !== "string")) throw new Error();
       lidarrAddress = result.address;
-      writeText(byId("lidarr-address"), result.address ? "Address Nexus uses: " + result.address :
+      const keyStatus = result.configured ? " A key is saved." : " Enter a key to set up requests.";
+      writeText(byId("lidarr-address"), result.address ? "Address Nexus uses: " + result.address + "." + keyStatus :
         "Set the Lidarr address in the Nexus container first.");
     } catch {
-      if (session === current) writeText(byId("lidarr-address"), "Could not load the Lidarr address.");
+      if (session !== current) return;
+      lidarrAddress = null;
+      writeText(byId("lidarr-address"), "Could not load Lidarr settings. Sign out and back in to try again.");
     }
   }
 
@@ -906,12 +912,13 @@ dd, li { overflow-wrap: anywhere; }
     const key = field("lidarr-key");
     lidarrForm.reset();
     if (!lidarrAddress) return message("Set the Lidarr address in the Nexus container first.", true);
-    if (!key || bytes(key) > 512 || /\p{Cc}/u.test(key)) {
+    if (!key || key.length > 512 || /[^!-~]/.test(key)) {
       return message("Check the Lidarr key and enter it again.", true);
     }
     const change = { key };
     reviewChange("set-lidarr", change, change, "Save Lidarr key",
-      "Save the key for the Lidarr address Nexus uses, " + lidarrAddress + ".", { saved: "Lidarr key saved." });
+      "Save the key for the Lidarr address Nexus uses, " + lidarrAddress + ".",
+      { saved: "Lidarr key saved.", refresh: "lidarr" });
   });
 
   diagnosticsToggle.addEventListener("click", () => {
