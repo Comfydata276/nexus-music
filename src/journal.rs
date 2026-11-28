@@ -355,6 +355,7 @@ struct Active {
     position_ms: u32,
     duration_ms: u32,
     heard_ms: u32,
+    heard_at_start: f64,
     paused: bool,
 }
 
@@ -392,6 +393,7 @@ pub(crate) fn source(token: u64, sound: Sound, current: bool) {
 
 pub(crate) fn started(
     token: u64, song: &crate::subsonic::Song, route: &str, origin: Option<&PlayedFrom>, position: f64,
+    heard_at_start: f64,
 ) {
     if SCOPE.get().is_none() {
         return;
@@ -419,7 +421,7 @@ pub(crate) fn started(
         position_ms,
     })) {
         PLAY.with_borrow_mut(|play| play.active = Some(Active {
-            start, position_ms, duration_ms: ms(f64::from(song.duration)), heard_ms: 0, paused: false,
+            start, position_ms, duration_ms: ms(f64::from(song.duration)), heard_ms: 0, heard_at_start, paused: false,
         }));
     }
 }
@@ -460,7 +462,7 @@ pub(crate) fn sample(position: f64, heard: f64) {
         PLAY.with_borrow_mut(|play| {
             if let Some(active) = &mut play.active {
                 active.position_ms = ms(position);
-                active.heard_ms = ms(heard);
+                active.heard_ms = ms(heard - active.heard_at_start);
             }
         });
     }

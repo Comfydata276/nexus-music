@@ -1309,7 +1309,7 @@ impl Controller {
                                 && !song.queued && !pb.journal_autoplay.contains(&song.id);
                             let route = if from_source { &pb.source } else { "" };
                             let origin = pb.journal_from.as_ref().filter(|_| from_source);
-                            journal::started(token, song, route, origin, pb.position);
+                            journal::started(token, song, route, origin, pb.position, pb.listened);
                         }
                     }
                 }
