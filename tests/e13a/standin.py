@@ -223,10 +223,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             SESSIONS[session] = {"email": email, "device": device["id"], "id": sid}
             person = PEOPLE[email]
             good = not state().get("bad_token")
-            return done(email, {"session": session, "session_id": sid, "sign_out": {"session": sid, "secret": secrets.token_hex(32)},
-                                "person": {"id": person["id"], "revision": 1, "email": email, "name": person["name"], "admin": False},
-                                "device": device["id"], "restore": 1, "music": {"login": music_login(email, good)},
-                                "notice": "This test server records what is played."})
+            answer = {"session": session, "session_id": sid, "sign_out": {"session": sid, "secret": secrets.token_hex(32)},
+                      "person": {"id": person["id"], "revision": 1, "email": email, "name": person["name"], "admin": False},
+                      "device": device["id"], "restore": 1, "music": {"login": music_login(email, good)}}
+            # (STANDIN_NOTICE: a short one, for an answer short enough for Wine: wine_walk.py.)
+            notice = os.environ.get("STANDIN_NOTICE", "This test server records what is played.")
+            if notice:
+                answer["notice"] = notice
+            return done(email, answer)
         auth = self.headers.get("Authorization", "")
         held = auth[7:] if auth.startswith("Bearer ") else ""
         session = SESSIONS.get(held)
