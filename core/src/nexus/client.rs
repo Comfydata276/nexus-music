@@ -222,6 +222,8 @@ pub struct Saved {
 /// which is what the backend keeps (8.7), never the session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct Note {
+    /// The number of this sign-out (12.2), the same for every telling of it.
+    pub request: u64,
     /// The SHA-256 of the session that was ended here, as 64 lower-case hex digits.
     pub session_sha256: String,
     /// The Nexus origin it is to be told at, and the id expected there.

@@ -28,9 +28,10 @@ pub const PASSWORD_MAX_CHARS: usize = 128;
 const PASSWORD_MAX_BYTES: usize = 4 * PASSWORD_MAX_CHARS;
 pub const SECRET_BYTES: usize = 32;
 pub const CODE_LENGTH: usize = 12;
-// the design does not say which characters look alike. Use upper case alone, and omit
-// I, L, O, S, Z, 0, 1, 2, 5. The 27 remaining symbols are also unambiguous without case.
-pub const CODE_ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRTUVWXY346789";
+// the design does not say which characters look alike. Use upper case alone. Leave
+// out the groups I/L/1, O/0, S/5 and Z/2, and keep only the digit in E/3, A/4, G/6,
+// T/7, B/8 and Q/9.
+pub const CODE_ALPHABET: &[u8] = b"CDFHJKMNPRUVWXY346789";
 // the design does not say the field ceilings. Names are counted as UTF-8 bytes.
 pub const NAME_MAX_BYTES: usize = 128;
 pub const MUSIC_ADDRESS_MAX_BYTES: usize = 2048;
@@ -41,6 +42,7 @@ pub const DEVICES_PER_PAGE: usize = 256;
 pub const CODE_LIFETIME_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 pub const SESSION_IDLE_MS: u64 = 90 * 24 * 60 * 60 * 1000;
 pub const PASSWORD_LEAVE_MS: u64 = 10 * 60 * 1000;
+pub const RETRY_RECEIPT_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 
 /// An email is a name, not a delivery address. the design does not say what to do with
 /// empty halves or internal spaces and controls. Refuse them; leave other non-ASCII
@@ -500,7 +502,24 @@ object! {
     }
 }
 
-object! { SignOut { head: RequestHead } }
+/// §12.2. Make this once when the person acts and reuse it for a retry. The server
+/// keeps the outcome for [`RETRY_RECEIPT_MS`].
+/// the design does not say the type or range; use a nonzero u64, like a device id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct RequestId(u64);
+
+impl RequestId {
+    pub fn new(number: u64) -> Option<Self> {
+        (number > 0).then_some(Self(number))
+    }
+
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+object! { SignOut { head: RequestHead, request_id: RequestId } }
 object! { ListDevices { head: RequestHead, after: Option<DeviceId> } }
 object! { ForceOut { head: RequestHead, device: DeviceId } }
 object! { GetMusicLogin { head: RequestHead } }
@@ -508,6 +527,7 @@ object! { GetMusicLogin { head: RequestHead } }
 object! {
     ChangePassword {
         head: RequestHead,
+        request_id: RequestId,
         // Null only under the password-setup session. For an ordinary session the
         // server requires and checks the current password before taking the new one.
         current_password: Option<Password>,
@@ -766,6 +786,9 @@ impl<'a> JsonWalk<'a> {
             }
             let mut keys = BTreeSet::new();
             loop {
+                if !self.rest().starts_with('"') {
+                    return Err(BadMessage::Form);
+                }
                 let key = json_string(self.raw()?)?;
                 if !keys.insert(key.to_string()) || !self.take(':') {
                     return Err(BadMessage::Form);
@@ -955,6 +978,12 @@ impl wire::Value for DeviceId {
     }
 }
 
+impl wire::Value for RequestId {
+    fn read(raw: &RawValue) -> Result<Self, BadMessage> {
+        Self::new(u64::read(raw)?).ok_or(BadMessage::Form)
+    }
+}
+
 impl wire::Value for Wait {
     fn read(raw: &RawValue) -> Result<Self, BadMessage> {
         Self::new(u64::read(raw)?).ok_or(BadMessage::Form)
@@ -1104,11 +1133,21 @@ pub struct AccountFailures {
 }
 
 impl AccountFailures {
-    /// Check before any proof for this account. A success leaves this state as it is.
+    /// Discard an expired entry when keeping the per-email counts in memory.
+    pub fn is_expired(&self, now: u64) -> bool {
+        self.window.is_none_or(|(first, _)| now.saturating_sub(first) >= WRONG_PASSWORD_WINDOW_MS)
+    }
+
+    /// Check before any proof for this account. Keep the decision and its outcome
+    /// serialized per email, so two parallel checks cannot both use the fifth
+    /// place. A success leaves this state as it is.
     pub fn retry_after(&self, now: u64) -> Option<Wait> {
         let (first, count) = self.window?;
         let remaining = WRONG_PASSWORD_WINDOW_MS.saturating_sub(now.saturating_sub(first));
-        (count >= WRONG_PASSWORDS).then(|| Wait::new(remaining)).flatten()
+        if count < WRONG_PASSWORDS {
+            return None;
+        }
+        Wait::new(remaining)
     }
 
     /// Apply only a wrong password that was actually checked. The first miss opens

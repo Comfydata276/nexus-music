@@ -11,5 +11,8 @@
 
 pub mod account;
 pub mod client;
+pub mod diag;
+pub mod events;
 pub mod kept;
 pub mod proto;
+pub mod prove;

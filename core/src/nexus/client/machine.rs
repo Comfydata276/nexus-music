@@ -26,8 +26,18 @@ impl Live {
 // to be account's (see SIGN_OUT_NOTE).
 fn note_body(note: &Note) -> Option<Hidden> {
     let head = RequestHead { speaks: SPEAKS, restore: note.restore };
-    let text = serde_json::to_string(&serde_json::json!({ "head": head, "note": note.session_sha256 })).ok()?;
+    let text = serde_json::to_string(&serde_json::json!({ "head": head, "request_id": note.request, "note": note.session_sha256 })).ok()?;
     Some(Hidden(Zeroizing::new(text)))
+}
+
+/// A number for one change, made when the person pressed (12.2), from the random bytes
+/// handed in: kept below 2^53 so that it is the same number in a Kotlin `Long` and in JSON
+/// read by anything. `None` with no random bytes, or (once in 2^53) all of them zero.
+fn request_id(given: &Given) -> Option<account::RequestId> {
+    let random = given.random.as_ref()?;
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(random.0.get(..8)?);
+    account::RequestId::new(u64::from_le_bytes(bytes) & ((1 << 53) - 1))
 }
 
 /// A body account encoded, as the text an ask carries.
@@ -181,7 +191,7 @@ impl Client {
             Press::SignOut => self.sign_out(given, out),
             Press::OpenDevices => self.open_devices(given, out),
             Press::ForceOut { device } => self.press_force_out(device, given, out),
-            Press::ChangePassword { current, new, again } => self.press_change(current, new, again, out),
+            Press::ChangePassword { current, new, again } => self.press_change(current, new, again, given, out),
             Press::NoticeSeen => {
                 if let Some(live) = self.live.as_mut()
                     && let Some(saved) = live.saved.as_mut()
@@ -297,7 +307,11 @@ impl Client {
             self.ended(SignInState::SignedOut);
             return;
         };
+        // One number for this sign-out, the same for every telling of it (12.2). With no
+        // random bytes it is 0, and the note is told only by its session's SHA-256.
+        let request = request_id(given).map_or(0, account::RequestId::get);
         let note = Note {
+            request,
             session_sha256: session_sha256(&session),
             nexus: saved.nexus.clone(),
             backend_id: saved.backend_id.clone(),
@@ -311,7 +325,9 @@ impl Client {
         live.flight.retain(|flight| !matches!(flight.what, Purpose::Tell | Purpose::TellNote));
         self.ended(SignInState::SignedOut);
         let head = RequestHead { speaks: SPEAKS, restore: saved.restore };
-        if let Some(body) = hidden(account::encode(&SignOut { head })) {
+        if let Some(request_id) = account::RequestId::new(request)
+            && let Some(body) = hidden(account::encode(&SignOut { head, request_id }))
+        {
             self.ask(Purpose::Tell, account::SIGN_OUT, Some(&session), Some(body), out);
         }
         drop(session);
@@ -406,7 +422,7 @@ impl Client {
         }
     }
 
-    fn press_change(&mut self, current: Typed, new: Typed, again: Typed, out: &mut Vec<Do>) {
+    fn press_change(&mut self, current: Typed, new: Typed, again: Typed, given: &Given, out: &mut Vec<Do>) {
         let (Some(session), Some(head)) = (self.session(), self.head()) else { return };
         let Some(live) = self.live.as_ref() else { return };
         let Some(saved) = &live.saved else { return };
@@ -425,9 +441,8 @@ impl Client {
         if live.offline {
             return self.set_password(PasswordState::CantReach, 0);
         }
-        // to be account's: C7 is to add a non-zero request number to ChangePassword (12.2),
-        // made when the person pressed. It will be made from `Given::random` here.
-        let Some(body) = hidden(account::encode(&ChangePassword { head, current_password: Some(current), new_password: new })) else { return };
+        let Some(request_id) = request_id(given) else { return self.set_password(PasswordState::CantReach, 0) };
+        let Some(body) = hidden(account::encode(&ChangePassword { head, request_id, current_password: Some(current), new_password: new })) else { return };
         if self.ask(Purpose::ChangePassword, account::CHANGE_PASSWORD, Some(&session), Some(body), out) {
             self.set_password(PasswordState::Working, 0);
         } else {
@@ -645,7 +660,8 @@ impl Client {
                     return self.set_form(SignInState::PasswordNotAllowed, 0);
                 };
                 let head = RequestHead { speaks: SPEAKS, restore: seen.restore };
-                let Some(body) = hidden(account::encode(&ChangePassword { head, current_password: None, new_password: password })) else {
+                let Some(request_id) = request_id(given) else { return self.set_form(SignInState::NoRandom, 0) };
+                let Some(body) = hidden(account::encode(&ChangePassword { head, request_id, current_password: None, new_password: password })) else {
                     return self.set_form(SignInState::CantReach, 0);
                 };
                 let what = Purpose::SetPassword { origin, backend_id, email, new };

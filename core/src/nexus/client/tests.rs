@@ -539,7 +539,7 @@ fn a_code_is_redeemed_with_its_new_password_and_nothing_is_kept_between() {
     rig.start(Kept::default());
     let differ = rig.press(Press::SignInWithCode {
         address: NEXUS.to_owned(),
-        code: Typed::new("ABCD-EFGH-3479"),
+        code: Typed::new("CDFH-JKMN-3479"),
         password: Typed::new("my new long password"),
         again: Typed::new("my new long passw0rd"),
     });
@@ -547,7 +547,7 @@ fn a_code_is_redeemed_with_its_new_password_and_nothing_is_kept_between() {
     assert_eq!(rig.shown().sign_in.state, SignInState::PasswordsDiffer);
     let out = rig.press(Press::SignInWithCode {
         address: NEXUS.to_owned(),
-        code: Typed::new("abcd efgh 3479"),
+        code: Typed::new("cdfh jkmn 3479"),
         password: Typed::new("my new long password"),
         again: Typed::new("my new long password"),
     });
@@ -555,7 +555,7 @@ fn a_code_is_redeemed_with_its_new_password_and_nothing_is_kept_between() {
     let out = rig.answer(hello, 200, hello_body(&["accounts"]));
     let sign_in = only_ask(&out);
     let body: serde_json::Value = serde_json::from_str(sign_in.body.as_ref().unwrap().expose()).unwrap();
-    assert_eq!(body["credential"]["code"], "ABCDEFGH3479");
+    assert_eq!(body["credential"]["code"], "CDFHJKMN3479");
     let sign_in = sign_in.id;
     let setup = Session::from_bytes([0x11; 32]);
     let out = rig.answer(
