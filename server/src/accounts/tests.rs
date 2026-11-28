@@ -384,3 +384,62 @@ fn a_device_is_known_to_its_own_account_and_not_once_forced_out() {
     bench::signed_in(&bench.sign_in(bench::with_password(made[0].email, PASSWORD), 2));
     assert!(admission.known_device(&email(0), &secret(2)));
 }
+
+/// The server's side of `admin::Account.music` (S10b's shape): none set, set, or to be typed
+/// again, by the rule a device is handed one by.
+#[test]
+fn the_page_is_told_whether_a_music_login_is_set_or_to_be_typed_again() {
+    use nexus_core::nexus::admin::{self, Action, MusicPassword, MusicServerAddress, NamedChange, TypedMusicLogin};
+    use super::music::{MusicState, music_state};
+    // A stand-in music server: `ping` and `getUser` (for `tester`) as Navidrome answers them.
+    let standing = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let internal = format!("http://{}", standing.local_addr().unwrap());
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        for mut stream in standing.incoming().flatten() {
+            let mut read = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while !read.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(got) => read.extend_from_slice(&chunk[..got]),
+                }
+            }
+            let body = if read.starts_with(b"POST /rest/getUser ") {
+                r#"{"subsonic-response":{"status":"ok","version":"1.16.1","user":{"username":"tester"}}}"#
+            } else {
+                r#"{"subsonic-response":{"status":"ok","version":"1.16.1"}}"#
+            };
+            let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        }
+    });
+    let client = crate::music::MusicClient::trusting(tokio_rustls::rustls::RootCertStore::empty());
+    let (bench, made) = Bench::with_music("music-state", &[("admin@example.test", true), ("person@example.test", false)], super::music::MusicSide::new(client, internal.clone()));
+    let signed = bench::signed_in(&bench.sign_in(bench::with_code(&made[0].code, PASSWORD), 1));
+    let copy = || account::Session::from_bytes(*signed.session.expose_bytes());
+    let grant = |request: u64, action: Action| {
+        let change = NamedChange { request_id: RequestId::new(request).unwrap(), action };
+        let request = account::GrantRequest { head: bench::head(signed.restore), change, password: account::Password::presented(PASSWORD).unwrap() };
+        let answer = bench.runtime.block_on(bench.accounts.admin_grant(copy(), request));
+        match admin::read_reply::<account::GrantIssued>(answer.status, answer.body.bytes()).unwrap() {
+            admin::Reply::Done(account::GrantIssued { grant }) => grant,
+            other => panic!("no grant: {other:?}"),
+        }
+    };
+    let public = account::MusicAddress::new("https://music.example.test").unwrap();
+    let set = account::GrantedChange { head: bench::head(signed.restore), request_id: RequestId::new(1).unwrap(), change: MusicServerAddress { public: public.clone() }, grant: grant(1, Action::SetMusicServer(public)) };
+    assert_eq!(bench.runtime.block_on(bench.accounts.set_music_server(copy(), set)).status, 200);
+    let person = account::AccountId::new(made[1].number).unwrap();
+    let change = TypedMusicLogin { account: person, name: account::Name::new("tester").unwrap(), password: MusicPassword::new("a made-up music password").unwrap() };
+    let login = account::GrantedChange { head: bench::head(signed.restore), request_id: RequestId::new(2).unwrap(), change, grant: grant(2, Action::SetMusicLogin(person)) };
+    assert_eq!(bench.runtime.block_on(bench.accounts.set_music_login(copy(), login)).status, 200);
+    let numbers = [made[0].number, made[1].number];
+    let states = bench.runtime.block_on(bench.accounts.desk.ask(move |keeper| {
+        numbers.map(|number| {
+            let state = keeper.load(number).unwrap().state().clone();
+            (music_state(keeper, number, &state, &internal), music_state(keeper, number, &state, "http://another.example.test"))
+        })
+    })).unwrap();
+    assert_eq!(states[0], (MusicState::NoneSet, MusicState::NoneSet));
+    assert_eq!(states[1], (MusicState::Set, MusicState::TypeAgain), "checked at another NEXUS_MUSIC_SERVER: to be typed again");
+}

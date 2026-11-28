@@ -186,6 +186,26 @@ pub fn hand(keeper: &Keeper, number: u64, state: &AccountState, kind: SessionKin
     music::hand_out(state, kind, install.as_ref(), &key, &public, MusicSalt::from_random(*salt))
 }
 
+/// What the admin's page is told of an account's music login (S10b's `admin::Account.music`,
+/// shape posted at `t3/nexus-s10` 059fbc8: `none_set | set | type_again`), by the very rule a
+/// device is handed one by ([`hand`], as for an app's session): none set yet; one that would
+/// be handed out; or one that cannot be used now and is to be typed again (9.4). Nothing of the
+/// login itself is kept: the salt and token made to decide it are dropped at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MusicState {
+    NoneSet,
+    Set,
+    TypeAgain,
+}
+
+pub fn music_state(keeper: &Keeper, number: u64, state: &AccountState, internal: &str) -> MusicState {
+    match hand(keeper, number, state, SessionKind::App, internal) {
+        MusicLoginResult::NoneSetYet => MusicState::NoneSet,
+        MusicLoginResult::Login(_) => MusicState::Set,
+        MusicLoginResult::UnusableNow => MusicState::TypeAgain,
+    }
+}
+
 impl Accounts {
     /// C1 (the review of S8; the lead's ruling of 15:38): an admin's call has its session looked
     /// up on the cheap read path first; only one found there goes on to the thread that writes.
