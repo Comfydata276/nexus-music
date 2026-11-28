@@ -7,6 +7,7 @@ use std::io::Read;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(test)]
 use md5::{Digest, Md5};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -85,6 +86,10 @@ struct Inner {
     agent: ureq::Agent,
     /// Offline mode: every request fails at once instead of going out.
     offline: std::sync::atomic::AtomicBool,
+    /// The music server has refused this sign-in as a wrong name or password (design 6.3,
+    /// R10): nothing is sent with it again. Set once, by the first refusal; a new pair is a
+    /// new `Client`.
+    refused: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Clone)]
@@ -311,6 +316,19 @@ mod dns {
     }
 }
 
+/// The Subsonic error for a sign-in the music server refuses: "wrong username or password".
+const WRONG_SIGN_IN: i64 = 40;
+
+/// What a request with a refused sign-in fails with, unsent.
+pub const REFUSED: &str = "Your music sign-in needs renewing.";
+
+/// Whether a stream's JSON answer is the music server refusing the sign-in.
+fn stream_refused_sign_in(text: &str) -> bool {
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(text) else { return false };
+    root.get("subsonic-response").and_then(|body| body.get("error")).and_then(|error| error.get("code")).and_then(|code| code.as_i64()) == Some(WRONG_SIGN_IN)
+}
+
+#[cfg(test)]
 fn random_salt() -> String {
     (0..16).map(|_| fastrand::alphanumeric()).collect()
 }
@@ -319,19 +337,56 @@ pub use nexus_core::text::encode;
 pub(crate) use dns::far_away;
 
 impl Client {
-    pub fn new(server: &str, username: &str, password: &str) -> Client {
-        let salt = random_salt();
-        let digest = Md5::digest(format!("{password}{salt}").as_bytes());
-        let token: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    /// The music server's client, from the sign-in a device is handed (design 9.4): the
+    /// server's address, the name, and a salt and token made for this device. No password
+    /// is known to this app, so none is turned into a token here.
+    pub fn from_pair(server: &str, username: &str, salt: &str, token: &str) -> Client {
         Client {
             inner: Arc::new(Inner {
                 base: normalize_server_url(server),
                 username: username.to_string(),
-                salt,
-                token,
+                salt: salt.to_string(),
+                token: token.to_string(),
                 agent: make_agent(),
                 offline: std::sync::atomic::AtomicBool::new(false),
+                refused: std::sync::atomic::AtomicBool::new(false),
             }),
+        }
+    }
+
+    /// For the tests alone: a client whose token is made from a password, as a music server's
+    /// own sign-in makes one. The app itself never holds a music-server password.
+    #[cfg(test)]
+    pub fn new(server: &str, username: &str, password: &str) -> Client {
+        let salt = random_salt();
+        let digest = Md5::digest(format!("{password}{salt}").as_bytes());
+        let token: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+        Client::from_pair(server, username, &salt, &token)
+    }
+
+    /// Whether this is the same sign-in as `other`: the same address, name, salt and token.
+    pub fn same_pair(&self, other: &Client) -> bool {
+        let (a, b) = (&self.inner, &other.inner);
+        a.base == b.base && a.username == b.username && a.salt == b.salt && a.token == b.token
+    }
+
+    /// Whether this is the same client (the same pair, made once) as `other`.
+    pub fn is(&self, other: &Client) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    /// Whether the music server has refused this sign-in: then nothing more is sent with it.
+    pub fn refused(&self) -> bool {
+        self.inner.refused.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The music server said "wrong name or password" to this sign-in. The first time, the
+    /// controller is told (once, on the window's thread), so that the current sign-in can be
+    /// asked for; every request after it is refused here, unsent (design 6.3).
+    fn was_refused(&self) {
+        if !self.inner.refused.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            let refused = self.clone();
+            crate::controller::post(move |ctl| ctl.music_refused(&refused));
         }
     }
 
@@ -343,6 +398,10 @@ impl Client {
     fn check_online(&self) -> ApiResult<()> {
         if self.inner.offline.load(std::sync::atomic::Ordering::Relaxed) {
             Err(ApiError::Network("Offline mode is on.".into()))
+        } else if self.refused() {
+            // Never sent again as it was (design 6.3): treated as the server out of reach,
+            // so that what is on this PC plays.
+            Err(ApiError::Network(REFUSED.into()))
         } else {
             Ok(())
         }
@@ -453,6 +512,10 @@ impl Client {
         };
         if body.get("status").and_then(|s| s.as_str()) != Some("ok") {
             let err = body.get("error");
+            let code = err.and_then(|e| e.get("code")).and_then(|c| c.as_i64()).unwrap_or(0);
+            if code == WRONG_SIGN_IN {
+                self.was_refused();
+            }
             return Err(ApiError::Server {
                 code: err.and_then(|e| e.get("code")).and_then(|c| c.as_i64()).unwrap_or(0),
                 message: err
@@ -536,6 +599,7 @@ impl Client {
                 token: self.inner.token.clone(),
                 agent: make_agent(),
                 offline: std::sync::atomic::AtomicBool::new(false),
+                refused: std::sync::atomic::AtomicBool::new(false),
             }),
         };
         dns::forget();
@@ -1012,7 +1076,14 @@ impl Client {
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.contains("json"));
         if is_json {
-            // Subsonic reports stream errors as a JSON body with HTTP 200.
+            // Subsonic reports stream errors as a JSON body with HTTP 200: among them a
+            // refused sign-in, which is never sent again (design 6.3).
+            let mut response = response;
+            let text = response.body_mut().with_config().limit(16 * 1024).read_to_string().unwrap_or_default();
+            if stream_refused_sign_in(&text) {
+                self.was_refused();
+                return Err(ApiError::Server { code: WRONG_SIGN_IN, message: "wrong name or password".into() });
+            }
             return Err(ApiError::Server { code: 70, message: "stream unavailable".into() });
         }
         let kind = response

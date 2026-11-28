@@ -970,17 +970,24 @@ impl Controller {
             }
         });
 
-        // Come back signed in when a password is on file.
-        if !settings.server.is_empty() && !settings.username.is_empty() {
-            if let Some(password) =
-                config::load_password(&self.paths, &settings.server, &settings.username)
-            {
-                let client = Client::new(&settings.server, &settings.username, &password);
-                self.enter(client, None);
-                // Confirm the saved login still works (if not, go back to the sign-in
-                // screen), and find out whether the server can be reached at all.
-                self.check_connection();
+        // The music-server password that versions before this one kept is removed, unread.
+        config::forget_old_password(&self.paths, &settings.server, &settings.username);
+        // Come back signed in when a music login is kept: what the Nexus server handed this
+        // device at sign-in (design 6.1). It is read from this PC and goes straight to the
+        // music server; the Nexus server is asked nothing first.
+        if let Some(login) = config::load_music_login(&self.paths) {
+            let client = Client::from_pair(&login.server, &login.username, &login.salt, &login.token);
+            if client.server() != settings.server || client.username() != settings.username {
+                // (Kept beside the settings by the sign-in that handed it; a settings file
+                // put back from a copy is brought into line with it.)
+                let mut settings = self.settings.borrow_mut();
+                settings.server = client.server().to_string();
+                settings.username = client.username().to_string();
             }
+            self.enter(client, None);
+            // Find out whether the server can be reached at all, and whether it still takes
+            // the music login (if not, the current one is asked for: `music_refused`).
+            self.check_connection();
         }
 
         let weak = Rc::downgrade(self);
@@ -1335,70 +1342,61 @@ impl Controller {
         });
     }
 
-    fn sign_in(self: &Rc<Self>, server: String, username: String, password: String) {
-        let app = self.ui.global::<ui::App>();
-        if app.get_login_busy() {
+    /// Signs in with a music login the Nexus server has just handed this device (design 9.4):
+    /// kept where secrets are kept, then used as a cold start uses it. Called by the Nexus
+    /// server's component, which does the signing in; never by anything that plays. Says
+    /// whether the login could be kept (if not, the next start begins at the sign-in screen).
+    pub fn signed_in_with(self: &Rc<Self>, login: config::MusicLogin) -> bool {
+        let kept = config::save_music_login(&self.paths, &login);
+        let client = Client::from_pair(&login.server, &login.username, &login.salt, &login.token);
+        if self.client().is_some() {
+            self.leave("");
+        }
+        {
+            let mut settings = self.settings.borrow_mut();
+            settings.server = client.server().to_string();
+            settings.username = client.username().to_string();
+        }
+        self.save_settings_in_passing();
+        self.covers.reset();
+        self.enter(client, None);
+        // The server is plainly worth asking: stop treating it as out of reach, and send
+        // whatever was being held for it.
+        self.check_connection();
+        kept
+    }
+
+    /// The music server refused `client`'s sign-in (`Client::was_refused`): it sends nothing
+    /// more. If it is the one in use, what is on this PC plays, and the window's handler (the
+    /// Nexus server's component) is told, to ask for the current login (design 6.3).
+    pub fn music_refused(self: &Rc<Self>, client: &Client) {
+        if !self.client().is_some_and(|current| current.is(client)) {
             return;
         }
-        app.set_login_busy(true);
-        app.set_login_error("".into());
-        let username = username.trim().to_string();
-        self.api_pool.spawn(move || {
-            // An address typed without "http://" or "https://" is tried the safe way first,
-            // and the unsafe way only when it looks like a home-network one.
-            let mut answer = Err(crate::subsonic::ApiError::Network("No address was given.".into()));
-            let addresses = crate::subsonic::addresses_to_try(&server);
-            for (index, address) in addresses.iter().enumerate() {
-                let client = Client::new(address, &username, &password);
-                // HTTPS was a guess: if nothing answers there soon, go on to plain HTTP
-                // without waiting out the full time a real server is given.
-                if index + 1 < addresses.len() && !client.answers_within(Duration::from_secs(5)) {
-                    continue;
-                }
-                answer = client.ping().map(|info| (client, info));
-                // Signed in, or the server is there and says no: either way that settles it.
-                if answer.as_ref().err().is_none_or(|error| matches!(error, crate::subsonic::ApiError::Server { .. })) {
-                    break;
-                }
-            }
-            post(move |ctl| {
-                let app = ctl.ui.global::<ui::App>();
-                app.set_login_busy(false);
-                match answer {
-                    Ok((client, info)) => {
-                        {
-                            let mut settings = ctl.settings.borrow_mut();
-                            settings.server = client.server().to_string();
-                            settings.username = username.clone();
-                        }
-                        ctl.save_settings_in_passing();
-                        if !config::save_password(&ctl.paths, client.server(), &username, &password) {
-                            ctl.toast("Couldn't save your password; you'll need to sign in next time.");
-                        }
-                        ctl.covers.reset();
-                        let open = crate::subsonic::unencrypted_beyond_home(client.server());
-                        ctl.enter(client, Some(info.version));
-                        // The server is plainly there: stop treating it as out of reach, and
-                        // send whatever was being held for it.
-                        ctl.check_connection();
-                        if open {
-                            ctl.show_toast(
-                                "Signed in without encryption: over plain HTTP your sign-in and your music can be read on the way. If your server has an https:// address, sign in with that.".into(),
-                                "",
-                                Duration::from_secs(12),
-                            );
-                        }
-                    }
-                    // Only HTTPS was tried, because no scheme was typed: say so, and how to
-                    // choose otherwise. Not when the server itself answered (a wrong
-                    // password, say): then HTTPS worked, and the sentence would mislead.
-                    Err(e) if crate::subsonic::https_only(&server) && !matches!(e, crate::subsonic::ApiError::Server { .. }) => app.set_login_error(
-                        format!("{e}\nNexus Music tried HTTPS. If your server has no HTTPS, type http:// in front of the address.").into(),
-                    ),
-                    Err(e) => app.set_login_error(e.to_string().into()),
-                }
-            });
-        });
+        self.set_unreachable(true);
+        self.ui.global::<ui::App>().invoke_music_login_refused();
+    }
+
+    /// A new music login for the account in use (the Nexus server's answer to a refusal, or
+    /// to its count having gone up): kept, and the client replaced by one built from it. The
+    /// same account's (the same address and name: `Settings::account`) keeps everything it
+    /// has; another account's is a change of account. Then the music server is tried once
+    /// (design 6.3). Says whether it was the same account.
+    pub fn music_login_renewed(self: &Rc<Self>, login: config::MusicLogin) -> bool {
+        let client = Client::from_pair(&login.server, &login.username, &login.salt, &login.token);
+        let Some(current) = self.client() else { return false };
+        if client.server() != current.server() || client.username() != current.username() {
+            self.signed_in_with(login);
+            return false;
+        }
+        config::save_music_login(&self.paths, &login);
+        if current.same_pair(&client) && !current.refused() {
+            return true;
+        }
+        client.set_offline(self.settings.borrow().offline);
+        *self.client.borrow_mut() = Some(client);
+        self.check_connection();
+        true
     }
 
     /// Switches from the sign-in screen to the app proper.
@@ -2571,12 +2569,12 @@ impl Controller {
         app.set_signed_in(false);
     }
 
-    fn sign_out(self: &Rc<Self>) {
-        let (server, username) = {
-            let settings = self.settings.borrow();
-            (settings.server.clone(), settings.username.clone())
-        };
-        config::delete_password(&self.paths, &server, &username);
+    /// Signs out on this PC: what the Nexus server handed it at sign-in (the music login) is
+    /// forgotten, with the saved queue and Recently played. Downloads, settings and the play
+    /// log stay, for the next sign-in to the same account. Called by the Nexus server's
+    /// component, which has let go of the session first.
+    pub fn sign_out(self: &Rc<Self>) {
+        config::forget_music_login(&self.paths);
         self.saver.remove(self.paths.queue.clone());
         self.saver.remove(self.paths.queue_place.clone());
         let _ = std::fs::remove_file(&self.paths.history);
@@ -3933,9 +3931,8 @@ impl Controller {
 
     fn wire(self: &Rc<Self>) {
         let app = self.ui.global::<ui::App>();
-        app.on_sign_in(|server, username, password| {
-            with(|ctl| ctl.sign_in(server.into(), username.into(), password.into()));
-        });
+        // (Signing in and out are the Nexus server's component's: it sets `sign-in` and
+        // `sign-out`, and calls `signed_in_with` and `sign_out` here.)
         app.on_set_queue_open(|open| {
             with(|ctl| {
                 ctl.ui.global::<ui::App>().set_queue_open(open);
@@ -3964,9 +3961,6 @@ impl Controller {
             });
             #[cfg(not(windows))]
             let _ = (height, nav_right, search_left, search_right, controls_left);
-        });
-        app.on_sign_out(|| {
-            with(|ctl| ctl.sign_out());
         });
         app.on_navigate(|route| {
             with(|ctl| {

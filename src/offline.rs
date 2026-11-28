@@ -261,10 +261,11 @@ impl Controller {
                     ctl.set_unreachable(false);
                     ctl.came_online();
                 }
-                Err(error) if error.sign_in_refused() => ctl.leave("Your saved sign-in no longer works. Sign in again."),
                 // No answer, an error from the server, or a proxy answering in its place: none
                 // of those is a reason to sign out. Carry on with what's on this PC and keep
-                // trying.
+                // trying. Nor is a sign-in the music server refuses: the client has already
+                // stopped sending it and asked for the current one (`Client::was_refused`,
+                // design 6.3), and what is on this PC plays meanwhile.
                 Err(_) => ctl.set_unreachable(true),
             },
         );
@@ -280,7 +281,6 @@ impl Controller {
             |client| client.ping().map(|_| ()),
             |ctl, answer| match answer {
                 Ok(()) => {}
-                Err(error) if error.sign_in_refused() => ctl.leave("Your saved sign-in no longer works. Sign in again."),
                 Err(_) => ctl.set_unreachable(true),
             },
         );

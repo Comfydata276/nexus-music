@@ -1,4 +1,4 @@
-//! Where things live on disk, saved settings, and the stored password.
+//! Where things live on disk, saved settings, and the music login kept where secrets are kept.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -1065,58 +1065,76 @@ fn sync_folder(_: &Path) -> std::io::Result<()> {
 
 const KEYRING_SERVICE: &str = "Nexus Music";
 
-fn account(server: &str, username: &str) -> String {
+/// How 0.40 and before named the music-server password it kept: removed at the first start of
+/// this version (`forget_old_password`), and never read.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn old_password_entry(server: &str, username: &str) -> String {
     format!("{username}@{server}")
 }
 
-// On Windows the password goes to Credential Manager. Other platforms are only used for
-// development, and keep it in a file readable by the current user.
-
+/// The music-server password that 0.40 and before kept for a sign-in of their own, removed.
+/// Nothing reads it: from this version the app is handed a salt and token instead (design
+/// 9.4) and keeps no music-server password at all.
 #[cfg(windows)]
-pub fn save_password(_paths: &Paths, server: &str, username: &str, password: &str) -> bool {
-    keyring::Entry::new(KEYRING_SERVICE, &account(server, username))
-        .and_then(|entry| entry.set_password(password))
-        .is_ok()
-}
-
-#[cfg(windows)]
-pub fn load_password(_paths: &Paths, server: &str, username: &str) -> Option<String> {
-    keyring::Entry::new(KEYRING_SERVICE, &account(server, username)).ok()?.get_password().ok()
-}
-
-#[cfg(windows)]
-pub fn delete_password(_paths: &Paths, server: &str, username: &str) {
-    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &account(server, username)) {
+pub fn forget_old_password(_paths: &Paths, server: &str, username: &str) {
+    if server.is_empty() || username.is_empty() {
+        return;
+    }
+    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &old_password_entry(server, username)) {
         let _ = entry.delete_credential();
     }
 }
 
+// Other platforms are only used for development, and kept it in a file readable by the
+// current user.
 #[cfg(not(windows))]
-pub fn save_password(paths: &Paths, server: &str, username: &str, password: &str) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    let body = format!("{KEYRING_SERVICE}\n{}\n{password}", account(server, username));
-    if fs::write(&paths.secret, body).is_err() {
-        return false;
-    }
-    let _ = fs::set_permissions(&paths.secret, fs::Permissions::from_mode(0o600));
-    true
-}
-
-#[cfg(not(windows))]
-pub fn load_password(paths: &Paths, server: &str, username: &str) -> Option<String> {
-    let body = fs::read_to_string(&paths.secret).ok()?;
-    let mut lines = body.splitn(3, '\n');
-    let (_, who, password) = (lines.next()?, lines.next()?, lines.next()?);
-    (who == account(server, username)).then(|| password.to_string())
-}
-
-#[cfg(not(windows))]
-pub fn delete_password(paths: &Paths, _server: &str, _username: &str) {
+pub fn forget_old_password(paths: &Paths, _server: &str, _username: &str) {
     let _ = fs::remove_file(&paths.secret);
 }
 
-/// Keeps a secret other than the account password, by name, where that one is kept: the
-/// Windows credential store, or elsewhere a file only this user can read. An empty value
+/// The sign-in to the music server this device was handed by the Nexus server (design 9.4):
+/// the server's address, the name of the person's user there, and a salt and token made for
+/// this device. Kept where secrets are kept, under [`MUSIC_LOGIN`], and read at a cold start
+/// so that the app plays without asking the Nexus server anything first (design 6.1). Never
+/// a password.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MusicLogin {
+    pub server: String,
+    pub username: String,
+    pub salt: String,
+    pub token: String,
+    /// The Nexus server's count of this person's music login when it was handed (design 9.4).
+    pub count: u64,
+}
+
+impl std::fmt::Debug for MusicLogin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MusicLogin {{ server: {:?}, username: {:?}, count: {} }}", self.server, self.username, self.count)
+    }
+}
+
+/// The name the music login is kept under.
+const MUSIC_LOGIN: &str = "nexus-music-login";
+
+/// The music login this device keeps, if it keeps one that can be read.
+pub fn load_music_login(paths: &Paths) -> Option<MusicLogin> {
+    let text = read_kept(paths, MUSIC_LOGIN).ok()??;
+    let login: MusicLogin = serde_json::from_str(&text).ok()?;
+    (!login.server.is_empty() && !login.username.is_empty() && !login.salt.is_empty() && !login.token.is_empty()).then_some(login)
+}
+
+/// Keeps the music login; says whether it was kept.
+pub fn save_music_login(paths: &Paths, login: &MusicLogin) -> bool {
+    serde_json::to_string(login).is_ok_and(|text| write_kept(paths, MUSIC_LOGIN, &text))
+}
+
+/// Forgets the music login (signed out, or forced out and signed out).
+pub fn forget_music_login(paths: &Paths) {
+    write_kept(paths, MUSIC_LOGIN, "");
+}
+
+/// Keeps a secret by name: in the Windows credential store, or elsewhere a file only this
+/// user can read. An empty value
 /// forgets it. Says whether that was done (forgetting one that isn't there is done).
 #[cfg(windows)]
 pub fn save_secret(_paths: &Paths, name: &str, value: &str) -> bool {
