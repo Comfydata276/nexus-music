@@ -22,6 +22,12 @@
 //! The job's rules are here: what it asks Lidarr and MusicBrainz, in what order, how it
 //! waits and when it gives up, and how the batch stands. Where it's written down, the thread
 //! it runs on and the threads it looks albums up on are the app's (see `Desk`).
+//!
+//! In a prepared server batch, each artist group checkpoints its per-line results and
+//! exact placements before giving back the endpoint mutation turn. Between groups nothing
+//! is half-applied: Lidarr may still be learning, but its outstanding work and settings to
+//! restore are journaled. A crash before or at the boundary uses the existing per-line
+//! recovery rule; it never resends a slot whose before-effect record is already durable.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Mutex;
@@ -31,8 +37,9 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::asked::{Asked, Fill};
-use crate::lidarr::{AlbumPlacement, BulkLidarr, PlacementRecovery, Setup};
+use crate::lidarr::{AlbumPlacement, BulkLidarr, Listed, PlacementRecovery, Setup, Turn};
 use crate::musicbrainz::MusicBrainz;
+use crate::nexus::requests::{MusicBrainzId, Refusal};
 use crate::offer::{Offer, VARIOUS};
 use crate::text::{same_artist, undecorated, words};
 
@@ -124,6 +131,74 @@ pub struct IndexedLine {
     pub placed: bool,
 }
 
+/// A server's endpoint turn and durable checkpoint for one prepared batch.
+pub trait PreparedBatch {
+    /// Acquire the endpoint mutation turn and its upstream place. Dropping the guard
+    /// gives both back. Poll delays and the gap between artist groups hold neither.
+    fn turn(&self) -> Result<Box<dyn Turn + '_>, Refusal>;
+    /// Check the account's live access while holding the turn, including a refusal
+    /// latched by the server's per-write gate.
+    fn check_access(&self) -> Result<(), Refusal>;
+    /// Persist the prepared snapshot and publish the group's terminal lines and
+    /// exact placements in the same transaction. This runs before releasing the turn.
+    /// Pending or uncertain lines retain their before-effect evidence. If the effect
+    /// may have applied despite an upstream error, the same per-line recovery can
+    /// be used under this turn before publishing its ownership.
+    fn checkpoint(&self, checkpoint: PreparedCheckpoint) -> Result<(), Refusal>;
+    /// Canonical releases already asked for by other work on this endpoint, including
+    /// accepted work still settling. Read under the turn for the given artist. These
+    /// are kept during the first-artist proof and cannot prove this batch's placement.
+    fn protected_releases(&self, artist: &str) -> Result<HashSet<String>, Refusal>;
+}
+
+pub struct PreparedCheckpoint {
+    /// The whole prepared batch, for restarting from this boundary.
+    pub saved: Vec<u8>,
+    /// The current group's original indices, including aliases of a canonical slot.
+    pub lines: Vec<IndexedLine>,
+}
+
+#[derive(PartialEq)]
+pub enum PreparedError {
+    Refused(Refusal),
+    Lidarr(String),
+}
+
+impl std::fmt::Debug for PreparedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(reason) => f.debug_tuple("Refused").field(reason).finish(),
+            Self::Lidarr(_) => f.write_str("Lidarr(..)"),
+        }
+    }
+}
+
+impl From<Refusal> for PreparedError {
+    fn from(reason: Refusal) -> Self { Self::Refused(reason) }
+}
+
+impl From<String> for PreparedError {
+    fn from(reason: String) -> Self { Self::Lidarr(reason) }
+}
+
+impl PreparedError {
+    fn sentence(self) -> String {
+        match self {
+            Self::Refused(reason) => reason.sentence(None).into_owned(),
+            Self::Lidarr(reason) => reason,
+        }
+    }
+}
+
+/// An exact temporary artist setting to transfer to the server's recovery journal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedWayBack {
+    pub artist: i64,
+    pub artist_id: MusicBrainzId,
+    pub address: String,
+    pub before: String,
+}
+
 pub const INTERRUPTED_EFFECT: &str = "Lidarr's change could not be confirmed after the server restarted.";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -162,12 +237,14 @@ struct Back {
     artist: i64,
     before: String,
     lidarr: Option<String>,
+    artist_id: Option<MusicBrainzId>,
 }
 
-/// A way back as the file has it: `[artist, before, lidarr]`, or 0.40.10's `[artist, before]`.
+/// Prepared batches add the exact artist ID. Direct apps still write the old tuple.
 #[derive(Serialize, Deserialize)]
 #[serde(untagged)]
 enum Written {
+    ForArtist(i64, String, String, MusicBrainzId),
     At(i64, String, String),
     Old(i64, String),
 }
@@ -175,22 +252,34 @@ enum Written {
 impl From<Written> for Back {
     fn from(written: Written) -> Back {
         match written {
-            Written::At(artist, before, lidarr) => Back { artist, before, lidarr: Some(lidarr) },
-            Written::Old(artist, before) => Back { artist, before, lidarr: None },
+            Written::ForArtist(artist, before, lidarr, artist_id) =>
+                Back { artist, before, lidarr: Some(lidarr), artist_id: Some(artist_id) },
+            Written::At(artist, before, lidarr) => Back { artist, before, lidarr: Some(lidarr), artist_id: None },
+            Written::Old(artist, before) => Back { artist, before, lidarr: None, artist_id: None },
         }
     }
 }
 
 impl From<Back> for Written {
     fn from(back: Back) -> Written {
-        match back.lidarr {
-            Some(lidarr) => Written::At(back.artist, back.before, lidarr),
-            None => Written::Old(back.artist, back.before),
+        match (back.lidarr, back.artist_id) {
+            (Some(lidarr), Some(artist_id)) => Written::ForArtist(back.artist, back.before, lidarr, artist_id),
+            (Some(lidarr), None) => Written::At(back.artist, back.before, lidarr),
+            (None, _) => Written::Old(back.artist, back.before),
         }
     }
 }
 
 impl Back {
+    fn saved(&self) -> Option<SavedWayBack> {
+        Some(SavedWayBack {
+            artist: self.artist,
+            artist_id: self.artist_id.clone()?,
+            address: self.lidarr.clone()?,
+            before: self.before.clone(),
+        })
+    }
+
     /// Whether this is to be acted on at the Lidarr at `lidarr`.
     fn for_lidarr(&self, lidarr: &str) -> bool {
         self.lidarr.as_deref().is_none_or(|at| at == lidarr)
@@ -276,16 +365,16 @@ impl crate::lidarr::WayBack for Job {
     /// the turn, so an entry found here was written by a step that finished: it is on the
     /// disk, and is that step's (`Ok(false)`); none is ever seen half made.
     fn keep(&self, lidarr: &str, artist: i64, before: &str) -> Result<bool, String> {
-        if self.with(|batch| batch.restore.iter().any(|known| known.of(lidarr, artist))) {
-            return Ok(false);
-        }
-        let back = Back { artist, before: before.to_string(), lidarr: Some(lidarr.to_string()) };
-        self.with(|batch| batch.restore.push(back.clone()));
-        if self.save_checked() {
-            return Ok(true);
-        }
-        self.with(|batch| batch.restore.retain(|known| *known != back));
-        Err("What Lidarr's settings would have to be put back to couldn't be written down on this PC first, so they weren't changed".into())
+        self.keep_back(Back { artist, before: before.to_string(), lidarr: Some(lidarr.to_string()), artist_id: None })
+    }
+
+    fn keep_for_artist(&self, lidarr: &str, artist: i64, before: &str, artist_id: &str) -> Result<bool, String> {
+        let artist_id = if self.with(|batch| batch.indexed.is_some()) {
+            Some(MusicBrainzId::new(artist_id).ok_or("Lidarr's artist has no canonical identity.")?)
+        } else {
+            None
+        };
+        self.keep_back(Back { artist, before: before.to_string(), lidarr: Some(lidarr.to_string()), artist_id })
     }
 
     fn before_request_album(&self, placement: &AlbumPlacement) -> Result<(), String> {
@@ -294,10 +383,9 @@ impl crate::lidarr::WayBack for Job {
 
     /// Crossed off: only the way back this request wrote, not one the batch had before it.
     fn put_back(&self, lidarr: &str, artist: i64, before: &str) {
-        let back = Back { artist, before: before.to_string(), lidarr: Some(lidarr.to_string()) };
         let crossed = self.with(|batch| {
             let had = batch.restore.len();
-            batch.restore.retain(|known| *known != back);
+            batch.restore.retain(|known| !(known.artist == artist && known.before == before && known.lidarr.as_deref() == Some(lidarr)));
             batch.restore.len() != had
         });
         if crossed {
@@ -501,6 +589,43 @@ impl Job {
                 })
             }).collect()
         })
+    }
+
+    fn keep_back(&self, back: Back) -> Result<bool, String> {
+        let address = back.lidarr.as_deref().unwrap_or_default();
+        if let Some(known) = self.with(|batch| batch.restore.iter().find(|known| known.of(address, back.artist)).cloned()) {
+            if back.artist_id.is_some() && known.artist_id != back.artist_id {
+                return Err("The saved Lidarr setting belongs to a different artist.".into());
+            }
+            return Ok(false);
+        }
+        self.with(|batch| batch.restore.push(back.clone()));
+        if self.save_checked() {
+            return Ok(true);
+        }
+        self.with(|batch| batch.restore.retain(|known| *known != back));
+        Err("What Lidarr's settings would have to be put back to couldn't be written down on this PC first, so they weren't changed".into())
+    }
+
+    /// Take the exact saved settings before finishing or abandoning this batch.
+    /// The design does not say how to recover a number-only server record: take
+    /// its identity from the server's older authoritative journal, never the number alone.
+    pub fn saved_way_backs(&self) -> Result<Vec<SavedWayBack>, Refusal> {
+        self.with(|batch| batch.restore.iter().map(|back| back.saved().ok_or(Refusal::LidarrCouldNotRestore)).collect())
+    }
+
+    /// Clear one exact entry after the caller has durably transferred or restored
+    /// it. The caller serializes this with execution of the batch.
+    pub fn clear_saved_way_back(&self, saved: &SavedWayBack) -> Result<(), Refusal> {
+        let removed = self.with(|batch| {
+            let at = batch.restore.iter().position(|back| back.saved().as_ref() == Some(saved))?;
+            Some((at, batch.restore.remove(at)))
+        });
+        if let Some((at, back)) = removed && !self.save_checked() {
+            self.with(|batch| batch.restore.insert(at.min(batch.restore.len()), back));
+            return Err(Refusal::NotDealtWith);
+        }
+        Ok(())
     }
 
     /// On restart reconcile only observations from the original endpoint and
@@ -904,32 +1029,70 @@ impl Job {
         tell(Event::Ended);
     }
 
-    /// Server execution uses the existing grouped write and settle phases, with
-    /// all lookups already decided. The caller holds the endpoint's mutation turn
-    /// and reconciles uncertain slots from a prior run before calling this.
+    /// Server execution for a caller holding the endpoint turn throughout.
+    /// Reconcile uncertain slots from a prior run before calling this.
     pub fn work_prepared(&self, lidarr: &dyn BulkLidarr, tell: &Tell) -> Result<(), String> {
+        self.run_prepared(lidarr, tell, None).map_err(PreparedError::sentence)
+    }
+
+    /// Server execution that checkpoints and gives back the turn after each group.
+    /// Begin with a reconciled batch and with no endpoint turn held.
+    pub fn work_prepared_in_turns(
+        &self, lidarr: &dyn BulkLidarr, tell: &Tell, control: &dyn PreparedBatch,
+    ) -> Result<(), PreparedError> {
+        self.run_prepared(lidarr, tell, Some(control))
+    }
+
+    fn run_prepared(
+        &self, lidarr: &dyn BulkLidarr, tell: &Tell, control: Option<&dyn PreparedBatch>,
+    ) -> Result<(), PreparedError> {
         let ready = self.with(|batch| batch.indexed.as_ref().is_some_and(|index| {
             !index.before_effect.iter().any(|&slot| {
                 batch.wants.get(slot).is_none_or(|want| matches!(want.state, State::Found | State::Asked))
             })
         }));
         if !ready {
-            return Err("Reconcile the indexed batch before working through it.".into());
+            return Err("Reconcile the indexed batch before working through it.".to_owned().into());
         }
         if !self.begin() {
-            return Err("The indexed batch is already running.".into());
+            return Err("The indexed batch is already running.".to_owned().into());
         }
         tell(Event::Changed);
-        let asked = self.ask_all(lidarr, tell);
-        self.save();
+        let asked = self.ask_all(lidarr, tell, control);
+        if control.is_none() {
+            self.save();
+        }
         if asked.is_ok() {
             tell(Event::Asked);
         }
-        let outcome = asked.and(self.settle(lidarr, tell));
-        self.save();
+        let outcome = asked.and_then(|()| self.settle(lidarr, tell, control));
+        let outcome = match control {
+            None => {
+                self.save();
+                outcome
+            }
+            Some(_) if outcome == Err(PreparedError::Refused(Refusal::SwitchedOff)) => {
+                self.with(|batch| {
+                    for want in batch.wants.iter_mut().filter(|want| matches!(want.state, State::Found | State::Asked)) {
+                        want.state = State::Failed;
+                        want.reason = Refusal::SwitchedOff.sentence(None).into_owned();
+                    }
+                });
+                if self.save_checked() { outcome } else { Err(Refusal::NotDealtWith.into()) }
+            }
+            Some(_) => outcome,
+        };
         self.not_started();
         tell(Event::Ended);
         outcome
+    }
+
+    fn checkpoint(&self, control: &dyn PreparedBatch, artist: &str) -> Result<(), PreparedError> {
+        let saved = self.with(|batch| serde_json::to_vec(batch)).map_err(|_| Refusal::NotDealtWith)?;
+        let mut lines = self.indexed_lines().ok_or(Refusal::NotDealtWith)?;
+        lines.retain(|line| line.offer.as_ref().is_some_and(|offer| offer.artist_id == artist));
+        control.checkpoint(PreparedCheckpoint { saved, lines })?;
+        Ok(())
     }
 
     /// The app couldn't start the thread to work through the batch on.
@@ -942,7 +1105,7 @@ impl Job {
             return Err("An indexed batch must use the prepared worker.".into());
         }
         let found = self.find_all(lidarr, musicbrainz, tell);
-        let asked = found.and_then(|()| self.ask_all(lidarr, tell));
+        let asked = found.and_then(|()| self.ask_all(lidarr, tell, None).map_err(PreparedError::sentence));
         if self.stopping() {
             // What hasn't been asked for won't be.
             self.with(|batch| batch.wants.retain(|want| !matches!(want.state, State::Waiting | State::Found)));
@@ -952,7 +1115,7 @@ impl Job {
             tell(Event::Asked);
         }
         // Whatever became of the asking, Lidarr is seen through the artists it was given.
-        let settled = self.settle(lidarr, tell);
+        let settled = self.settle(lidarr, tell, None).map_err(PreparedError::sentence);
         asked.and(settled)
     }
 
@@ -1057,13 +1220,64 @@ fn not_listed(offer: &Offer) -> String {
     format!("Lidarr has {} but doesn't list “{}” among their releases", offer.artist, offer.title)
 }
 
+fn prepared_turn(control: Option<&dyn PreparedBatch>) -> Result<Option<Box<dyn Turn + '_>>, Refusal> {
+    let Some(control) = control else { return Ok(None) };
+    let turn = control.turn()?;
+    control.check_access()?;
+    Ok(Some(turn))
+}
+
+fn check_prepared_group(known: &HashMap<String, i64>, artist: &str, offers: &[Offer]) -> Result<(), Refusal> {
+    if offers.is_empty() || MusicBrainzId::new(artist).is_none()
+        || offers.iter().any(|offer| offer.artist_id != artist || MusicBrainzId::new(&offer.album).is_none())
+    {
+        return Err(Refusal::SearchAgain);
+    }
+    if let Some(&number) = known.get(artist) {
+        check_artist_number(known, artist, number)?;
+    }
+    Ok(())
+}
+
+fn check_artist_number(known: &HashMap<String, i64>, artist: &str, number: i64) -> Result<(), Refusal> {
+    if number > 0 && known.get(artist) == Some(&number)
+        && !known.iter().any(|(other, &id)| other != artist && id == number)
+    {
+        Ok(())
+    } else {
+        Err(Refusal::SearchAgain)
+    }
+}
+
+fn check_current_artist(lidarr: &dyn BulkLidarr, artist: &str, number: i64) -> Result<(), PreparedError> {
+    check_artist_number(&lidarr.artist_numbers()?, artist, number)?;
+    Ok(())
+}
+
+fn check_unique_row(row: &Listed, listed: &[Listed]) -> Result<(), Refusal> {
+    if row.id > 0 && listed.iter().filter(|other| other.id == row.id || other.album == row.album).count() == 1 {
+        Ok(())
+    } else {
+        Err(Refusal::NoLongerListed)
+    }
+}
+
+fn checked_release(offer: &Offer, listed: &[Listed]) -> Result<(), Refusal> {
+    if let Some(row) = listed.iter().find(|row| row.album == offer.album) {
+        check_unique_row(row, listed)?;
+    }
+    Ok(())
+}
+
 impl Job {
     /// A note of something asked for, to be followed up when it arrives.
     fn note(&self, want: &Want, offer: &Offer) -> Asked {
         Asked { album: offer.album.clone(), title: offer.title.clone(), artist: offer.artist.clone(), at: self.desk.now(), fills: want.fills.clone(), ..Default::default() }
     }
 
-    fn ask_all(&self, lidarr: &dyn BulkLidarr, tell: &Tell) -> Result<(), String> {
+    fn ask_all(
+        &self, lidarr: &dyn BulkLidarr, tell: &Tell, control: Option<&dyn PreparedBatch>,
+    ) -> Result<(), PreparedError> {
         // By artist, in the order they come.
         let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
         self.with(|batch| {
@@ -1078,15 +1292,30 @@ impl Job {
         if groups.is_empty() {
             return Ok(());
         }
-        let mut known = twice(lidarr, || lidarr.artist_numbers())?;
+        let mut known = if control.is_some() { HashMap::new() } else { twice(lidarr, || lidarr.artist_numbers())? };
         let mut setup: Option<Setup> = None;
         let mut errors = 0;
         for (artist, places) in groups {
             if self.stopping() {
                 break;
             }
+            let turn = prepared_turn(control)?;
+            // Endpoint state and root defaults may have changed while another job had the turn.
+            if control.is_some() {
+                known = twice(lidarr, || lidarr.artist_numbers())?;
+                setup = None;
+            }
+            let offers: Vec<Offer> = self.with(|batch| places.iter().filter_map(|&at| batch.wants.get(at)?.offer.clone()).collect());
+            if control.is_some() {
+                check_prepared_group(&known, &artist, &offers)?;
+                if artist == VARIOUS && let Some(&number) = known.get(&artist) {
+                    let listed = lidarr.listed(number)?;
+                    for offer in &offers {
+                        checked_release(offer, &listed)?;
+                    }
+                }
+            }
             self.keep_before_effect(&places)?;
-            let offers: Vec<Offer> = self.with(|batch| places.iter().filter_map(|&at| batch.wants[at].offer.clone()).collect());
             // Whether this is an artist to watch Lidarr with (see `Batch::proof`).
             let mut unproven = false;
             let went = match known.get(&artist) {
@@ -1102,29 +1331,35 @@ impl Job {
                         })
                         .collect(),
                 )),
-                Some(&number) => self.ask_known(lidarr, number, &offers).map(|went| (number, went)),
+                Some(&number) => self.ask_known(lidarr, number, &offers, control.is_some()).map(|went| (number, went)),
                 None => self.ask_new(lidarr, &mut setup, &offers).map(|(number, went, watch)| {
                     known.insert(artist.clone(), number);
                     unproven = watch;
                     (number, went)
-                }),
+                }).map_err(PreparedError::from),
             };
             let number = went.as_ref().map(|(number, _)| *number).unwrap_or_default();
+            let mut failed = None;
             match went {
                 Err(reason) => {
                     errors += 1;
-                    self.with(|batch| places.iter().for_each(|&at| batch.wants[at].reason = reason.trim_end_matches('.').to_string()));
-                    if errors >= GIVE_UP {
-                        self.with(|batch| batch.wants.iter_mut().filter(|want| want.state == State::Found).for_each(|want| want.reason.clear()));
-                        return Err(reason);
-                    }
+                    let text = match &reason {
+                        PreparedError::Lidarr(text) => std::borrow::Cow::Borrowed(text.as_str()),
+                        PreparedError::Refused(reason) => reason.sentence(None),
+                    };
+                    self.with(|batch| places.iter().for_each(|&at| {
+                        if let Some(want) = batch.wants.get_mut(at) {
+                            want.reason = text.trim_end_matches('.').to_string();
+                        }
+                    }));
+                    failed = Some(reason);
                 }
                 Ok((number, went)) => {
                     errors = 0;
                     let notes = self.with(|batch| {
                         let mut notes = Vec::new();
                         for (&at, went) in places.iter().zip(went) {
-                            let want = &mut batch.wants[at];
+                            let Some(want) = batch.wants.get_mut(at) else { continue };
                             want.lidarr_artist = number;
                             want.reason.clear();
                             let counts = match went {
@@ -1155,12 +1390,25 @@ impl Job {
                     }
                 }
             }
+            if let Some(control) = control {
+                self.checkpoint(control, &artist)?;
+                control.check_access()?;
+            }
+            drop(turn);
+            if let Some(reason) = failed {
+                if matches!(reason, PreparedError::Refused(_)) || errors >= GIVE_UP {
+                    self.with(|batch| batch.wants.iter_mut().filter(|want| want.state == State::Found).for_each(|want| want.reason.clear()));
+                    return Err(reason);
+                }
+            }
             if unproven {
                 // Written down first: the artist is with Lidarr whatever happens next.
-                self.save();
+                if control.is_none() {
+                    self.save();
+                }
                 self.watching.store(true, Ordering::SeqCst);
                 tell(Event::Changed);
-                let seen = self.watch(lidarr, number, &offers);
+                let seen = self.watch(lidarr, number, &offers, control);
                 self.watching.store(false, Ordering::SeqCst);
                 match seen {
                     Ok(Some(holds)) => {
@@ -1173,22 +1421,35 @@ impl Job {
                     Err(reason) => return Err(reason),
                 }
             }
-            self.progress(tell);
+            if control.is_none() {
+                self.progress(tell);
+            }
         }
         if !self.stopping() {
-            self.with(|batch| {
+            let failed = self.with(|batch| {
+                let mut failed = false;
                 for want in batch.wants.iter_mut().filter(|want| want.state == State::Found && !want.reason.is_empty()) {
                     want.state = State::Failed;
                     want.again = true;
+                    failed = true;
                 }
+                failed
             });
+            if failed && control.is_some() && !self.save_checked() {
+                return Err(Refusal::NotDealtWith.into());
+            }
         }
         Ok(())
     }
 
     /// Asks for releases of an artist Lidarr already has.
-    fn ask_known(&self, lidarr: &dyn BulkLidarr, artist: i64, offers: &[Offer]) -> Result<Vec<Went>, String> {
+    fn ask_known(&self, lidarr: &dyn BulkLidarr, artist: i64, offers: &[Offer], prepared: bool) -> Result<Vec<Went>, PreparedError> {
         let listed = twice(lidarr, || lidarr.listed(artist))?;
+        if prepared {
+            for offer in offers {
+                checked_release(offer, &listed)?;
+            }
+        }
         // Lidarr may be reading the artist in still: their singles, for an earlier go at this,
         // or all of them, if they were added a moment before the app last closed. Then what
         // isn't listed yet may be soon, and is looked for again when Lidarr has finished.
@@ -1253,7 +1514,8 @@ impl Job {
                     Err(reason) => Went::Failed(reason.trim_end_matches('.').to_string()),
                 })
                 .collect();
-            let number = lidarr.artist_numbers()?.get(&offers[0].artist_id).copied().unwrap_or_default();
+            let first = offers.first().ok_or("Nothing was asked for.")?;
+            let number = lidarr.artist_numbers()?.get(&first.artist_id).copied().unwrap_or_default();
             return Ok((number, went, false));
         }
         let setup = match setup {
@@ -1269,7 +1531,10 @@ impl Job {
     /// it marks those releases and no others. `Some(true)` if it did; `Some(false)` if it marked
     /// more, which are then unmarked; `None` if that can't be told from this artist (they have
     /// nothing else to mark, or asking was stopped). An error if Lidarr never got round to them.
-    fn watch(&self, lidarr: &dyn BulkLidarr, artist: i64, offers: &[Offer]) -> Result<Option<bool>, String> {
+    fn watch(
+        &self, lidarr: &dyn BulkLidarr, artist: i64, offers: &[Offer], control: Option<&dyn PreparedBatch>,
+    ) -> Result<Option<bool>, PreparedError> {
+        let artist_id = offers.first().ok_or(Refusal::SearchAgain)?.artist_id.as_str();
         let mut moved = Instant::now();
         let mut jobs = 0;
         let mut quiet: Option<Instant> = None;
@@ -1279,6 +1544,7 @@ impl Job {
             if self.stopping() {
                 return Ok(None);
             }
+            let _turn = prepared_turn(control)?;
             match lidarr.busy(&only) {
                 Ok((busy, _)) if busy.is_empty() => {
                     if quiet.get_or_insert_with(Instant::now).elapsed() < QUIET {
@@ -1299,23 +1565,47 @@ impl Job {
                     continue;
                 }
             }
+            // The design does not say what a proof should infer from another ask
+            // arriving while Lidarr learns this artist. Keep those releases and
+            // leave them out of the proof.
+            let protected = if let Some(control) = control {
+                check_current_artist(lidarr, artist_id, artist)?;
+                control.protected_releases(artist_id)?
+            } else {
+                HashSet::new()
+            };
             let Ok(listed) = lidarr.listed(artist) else { continue };
             if listed.is_empty() {
                 continue;
             }
-            let more: Vec<i64> = listed.iter().filter(|known| known.wanted && !offers.iter().any(|offer| offer.album == known.album)).map(|known| known.id).collect();
-            if !more.is_empty() {
-                let _ = lidarr.unwant(&more);
+            let more: Vec<_> = listed.iter()
+                .filter(|known| !protected.contains(&known.album) && !offers.iter().any(|offer| offer.album == known.album))
+                .collect();
+            if control.is_some() {
+                for row in &more {
+                    check_unique_row(row, &listed)?;
+                }
+            }
+            let unwanted: Vec<_> = more.iter().filter(|row| row.wanted).map(|row| row.id).collect();
+            if !unwanted.is_empty() {
+                let result = lidarr.unwant(&unwanted);
+                if let Some(control) = control {
+                    control.check_access()?;
+                    result?;
+                }
                 return Ok(Some(false));
             }
-            return Ok((listed.len() > offers.len()).then_some(true));
+            let can_tell = if control.is_some() { !more.is_empty() } else { listed.len() > offers.len() };
+            return Ok(can_tell.then_some(true));
         }
-        Err("Lidarr hasn't read in the first artist it was given. The rest can be asked for once it has.".into())
+        Err("Lidarr hasn't read in the first artist it was given. The rest can be asked for once it has.".to_owned().into())
     }
 
     /// Sees Lidarr through the artists it's reading in: as it finishes with each, checks that
     /// what was asked for is on its list, and puts it there if it isn't.
-    fn settle(&self, lidarr: &dyn BulkLidarr, tell: &Tell) -> Result<(), String> {
+    fn settle(
+        &self, lidarr: &dyn BulkLidarr, tell: &Tell, control: Option<&dyn PreparedBatch>,
+    ) -> Result<(), PreparedError> {
         let mut quiet: HashMap<i64, Instant> = HashMap::new();
         let mut empty: HashMap<i64, Instant> = HashMap::new();
         let mut moved = Instant::now();
@@ -1328,11 +1618,15 @@ impl Job {
             if waiting.is_empty() {
                 return Ok(());
             }
-            match lidarr.busy(&waiting) {
+            let busy = {
+                let _turn = prepared_turn(control)?;
+                lidarr.busy(&waiting)
+            };
+            match busy {
                 Err(reason) => {
                     errors += 1;
                     if errors >= GIVE_UP {
-                        return Err(reason);
+                        return Err(reason.into());
                     }
                 }
                 Ok((busy, stamp)) => {
@@ -1347,7 +1641,21 @@ impl Job {
                             continue;
                         }
                         let given_up = empty.get(&artist).is_some_and(|since| since.elapsed() > NOTHING_LISTED);
-                        match self.finish(lidarr, artist, given_up, tell) {
+                        let finished = if let Some(control) = control {
+                            let _turn = prepared_turn(Some(control))?;
+                            let artist_id = self.settling_artist(artist, &lidarr.way_back_address())?;
+                            check_current_artist(lidarr, artist_id.as_str(), artist)?;
+                            let protected = control.protected_releases(artist_id.as_str())?;
+                            let result = self.finish(lidarr, artist, given_up, tell, Some(&protected));
+                            if !matches!(result, Ok(Finished::Busy | Finished::Empty)) {
+                                self.checkpoint(control, artist_id.as_str())?;
+                            }
+                            control.check_access()?;
+                            result
+                        } else {
+                            self.finish(lidarr, artist, given_up, tell, None)
+                        };
+                        match finished {
                             Ok(Finished::Done) => moved = Instant::now(),
                             Ok(Finished::Empty) => {
                                 empty.entry(artist).or_insert_with(Instant::now);
@@ -1359,7 +1667,7 @@ impl Job {
                             }
                             Err(reason) => {
                                 errors += 1;
-                                if errors >= GIVE_UP {
+                                if matches!(reason, PreparedError::Refused(_)) || errors >= GIVE_UP {
                                     return Err(reason);
                                 }
                             }
@@ -1368,15 +1676,41 @@ impl Job {
                 }
             }
             if moved.elapsed() > STALLED {
-                return Err("Lidarr hasn't finished reading in the artists it was given. What was asked for is with Lidarr.".into());
+                return Err("Lidarr hasn't finished reading in the artists it was given. What was asked for is with Lidarr.".to_owned().into());
             }
-            self.progress(tell);
+            if control.is_none() {
+                self.progress(tell);
+            }
             lidarr.pause(POLL)?;
         }
     }
 
+    fn settling_artist(&self, artist: i64, address: &str) -> Result<MusicBrainzId, Refusal> {
+        self.with(|batch| {
+            let mut exact = None;
+            let mut identify = |id: MusicBrainzId| {
+                if exact.as_ref().is_some_and(|known| known != &id) {
+                    return Err(Refusal::SearchAgain);
+                }
+                exact = Some(id);
+                Ok(())
+            };
+            for want in batch.wants.iter().filter(|want| want.state == State::Asked && want.lidarr_artist == artist) {
+                let id = want.offer.as_ref().and_then(|offer| MusicBrainzId::new(&offer.artist_id)).ok_or(Refusal::SearchAgain)?;
+                identify(id)?;
+            }
+            for back in batch.restore.iter().filter(|back| back.of(address, artist)) {
+                identify(back.artist_id.clone().ok_or(Refusal::LidarrCouldNotRestore)?)?;
+            }
+            exact.ok_or(Refusal::SearchAgain)
+        })
+    }
+
     /// Checks one artist Lidarr has finished reading in.
-    fn finish(&self, lidarr: &dyn BulkLidarr, artist: i64, given_up: bool, tell: &Tell) -> Result<Finished, String> {
+    fn finish(
+        &self, lidarr: &dyn BulkLidarr, artist: i64, given_up: bool, tell: &Tell,
+        protected: Option<&HashSet<String>>,
+    ) -> Result<Finished, PreparedError> {
         // Wanted, put back and crossed off, as one step of the way back (`WayBack::turn`):
         // what Lidarr lists is read once the step is this one's, so that what is decided from
         // it isn't from before another step changed the artist.
@@ -1396,6 +1730,11 @@ impl Job {
         if listed.is_empty() && !places.is_empty() && !given_up {
             return Ok(Finished::Empty);
         }
+        if protected.is_some() {
+            for (_, offer) in &places {
+                checked_release(offer, &listed)?;
+            }
+        }
         let placements: Vec<_> = places.iter().filter_map(|(_, offer)| {
             let row = listed.iter().find(|known| known.album == offer.album)?;
             let placement = AlbumPlacement::from_listed(&offer.artist_id, artist, row);
@@ -1412,14 +1751,15 @@ impl Job {
         let (notes, gone) = self.with(|batch| {
             let (mut notes, mut gone) = (Vec::new(), Vec::new());
             for (at, offer) in &places {
-                let want = &mut batch.wants[*at];
+                let Some(want) = batch.wants.get_mut(*at) else { continue };
                 if let Some(row) = listed.iter().find(|known| known.album == offer.album) {
                     want.placed = placements.iter().any(|placement| placement.release == offer.album)
-                        || batch.indexed.as_ref().and_then(|index| index.placements.get(at)).is_some_and(|placement| {
+                        || (!protected.is_some_and(|other| other.contains(&offer.album))
+                            && batch.indexed.as_ref().and_then(|index| index.placements.get(at)).is_some_and(|placement| {
                             (row.wanted || row.have) && placement.newly_placed()
                                 && placement.artist_number.is_none_or(|number| number == artist)
                                 && placement.album_number.is_none_or(|number| number == row.id)
-                        });
+                            }));
                     want.state = State::Done;
                     if !want.noted {
                         want.noted = true;
@@ -1436,7 +1776,9 @@ impl Job {
             }
             (notes, gone)
         });
-        self.save();
+        if protected.is_none() {
+            self.save();
+        }
         if !notes.is_empty() {
             tell(Event::Noted(notes));
         }
@@ -1538,6 +1880,250 @@ mod tests {
         fn singles(&self) -> bool {
             false
         }
+    }
+
+    fn mbid(number: i64) -> String {
+        format!("00000000-0000-0000-0000-{number:012x}")
+    }
+
+    fn prepared_want(artist: i64) -> Want {
+        Want {
+            state: State::Found,
+            offer: Some(Offer { artist_id: mbid(artist), album: mbid(artist + 100), ..Offer::default() }),
+            ..Want::default()
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct PreparedDisk(Arc<Mutex<Vec<u8>>>);
+
+    impl Desk for PreparedDisk {
+        fn keep(&self, batch: Option<Vec<u8>>, _: bool) {
+            if let Some(batch) = batch {
+                self.keep_checked(batch);
+            }
+        }
+
+        fn keep_checked(&self, batch: Vec<u8>) -> bool {
+            *self.0.lock().unwrap() = batch;
+            true
+        }
+
+        fn now(&self) -> i64 { 0 }
+        fn singles(&self) -> bool { false }
+    }
+
+    struct GroupControl<'a> {
+        turn: &'a Mutex<()>,
+        disk: PreparedDisk,
+        access: &'a dyn Fn() -> Result<(), Refusal>,
+        enter: &'a dyn Fn(),
+        publish: &'a dyn Fn(&[IndexedLine]) -> Result<(), Refusal>,
+    }
+
+    impl PreparedBatch for GroupControl<'_> {
+        fn turn(&self) -> Result<Box<dyn Turn + '_>, Refusal> {
+            (self.enter)();
+            Ok(Box::new(self.turn.lock().unwrap()))
+        }
+
+        fn check_access(&self) -> Result<(), Refusal> { (self.access)() }
+
+        fn checkpoint(&self, checkpoint: PreparedCheckpoint) -> Result<(), Refusal> {
+            assert!(self.turn.try_lock().is_err());
+            (self.publish)(&checkpoint.lines)?;
+            assert!(self.disk.keep_checked(checkpoint.saved));
+            Ok(())
+        }
+
+        fn protected_releases(&self, _: &str) -> Result<HashSet<String>, Refusal> { Ok(HashSet::new()) }
+    }
+
+    #[derive(Default)]
+    struct GroupLine {
+        turn: Mutex<()>,
+        writes: Mutex<Vec<i64>>,
+    }
+
+    impl crate::http::Http for GroupLine {
+        fn send(&self, request: &crate::http::Request) -> Result<crate::http::Response, crate::http::Failure> {
+            use crate::http::{Method, Response};
+            assert!(self.turn.try_lock().is_err(), "upstream calls in the fixture need a turn");
+            let path = request.url.strip_prefix("http://lidarr.test/api/v1/").unwrap();
+            let mut writes = self.writes.lock().unwrap();
+            // Another account can change the current Lidarr number between artist groups.
+            let second = if writes.contains(&30) { 12 } else { 2 };
+            let answer = match (path, request.method) {
+                ("artist", Method::Get) => serde_json::json!((1..=6).map(|artist| {
+                    serde_json::json!({ "id": if artist == 2 { second } else { artist }, "foreignArtistId": mbid(artist) })
+                }).collect::<Vec<_>>()),
+                (path, Method::Get) if path.starts_with("album?artistId=") => {
+                    let artist: i64 = path.strip_prefix("album?artistId=").unwrap().parse().unwrap();
+                    let release = if artist == 12 { 2 } else { artist };
+                    let album = artist * 10;
+                    serde_json::json!([{ "id": album, "foreignAlbumId": mbid(release + 100), "monitored": writes.contains(&album) }])
+                }
+                (path, Method::Get) if path.starts_with("artist/") => serde_json::json!({ "monitored": true }),
+                ("album/monitor", Method::Put(body)) => {
+                    let ids: serde_json::Value = serde_json::from_str(body).unwrap();
+                    writes.extend(ids["albumIds"].as_array().unwrap().iter().map(|id| id.as_i64().unwrap()));
+                    serde_json::json!({})
+                }
+                ("command", Method::Post(_)) => serde_json::json!({}),
+                _ => panic!("unexpected Lidarr call {path}"),
+            };
+            Ok(Response::new(200, Vec::new(), move || Ok(answer.to_string())))
+        }
+    }
+
+    #[test]
+    fn other_accounts_take_the_turn_after_a_batch_group_commits() {
+        let upstream = Arc::new(GroupLine::default());
+        let lidarr = Lidarr::new(HERE, "key", None, upstream.clone());
+        let disk = PreparedDisk::default();
+        let batch = Job::new(disk.clone());
+        let tail = std::iter::repeat_n(6, crate::nexus::requests::BATCH_MAX_LINES - 4);
+        batch.start_indexed([1, 1, 2, 5].into_iter().chain(tail).map(prepared_want).collect()).unwrap();
+        let (first_ready, first_done) = std::sync::mpsc::sync_channel(1);
+        let (others_ready, others_done) = std::sync::mpsc::sync_channel(1);
+        let first = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let (other_upstream, other_lidarr, first_disk) = (&upstream, &lidarr, &disk);
+            scope.spawn(move || {
+                first_done.recv_timeout(Duration::from_secs(5)).unwrap();
+                for artist in [3, 4] {
+                    let other_disk = PreparedDisk::default();
+                    let other = Job::new(other_disk.clone());
+                    other.start_indexed(vec![prepared_want(artist)]).unwrap();
+                    other.work_prepared_in_turns(other_lidarr, &|_| {}, &GroupControl {
+                        turn: &other_upstream.turn, disk: other_disk, access: &|| Ok(()), enter: &|| {}, publish: &|_| Ok(()),
+                    }).unwrap();
+                }
+                // The other accounts only start after the first account gives up the turn.
+                let first_lines = Job::new(Nowhere);
+                assert!(first_lines.load(&first_disk.0.lock().unwrap()));
+                assert!(first_lines.indexed_lines().unwrap().first().unwrap().placed);
+                others_ready.send(()).unwrap();
+            });
+            batch.work_prepared_in_turns(&lidarr, &|_| {}, &GroupControl {
+                turn: &upstream.turn,
+                disk: disk.clone(),
+                access: &|| Ok(()),
+                enter: &|| {
+                    if first.swap(false, Ordering::SeqCst) {
+                        others_done.recv_timeout(Duration::from_secs(5)).unwrap();
+                    }
+                },
+                publish: &|rows| {
+                    if rows.first().is_some_and(|row| row.index == 0) {
+                        assert_eq!(rows.iter().map(|row| (row.index, row.state, row.placed)).collect::<Vec<_>>(),
+                            [(0, State::Done, true), (1, State::Done, true)]);
+                        assert_eq!(rows[0].placement.as_ref().unwrap().album_number, Some(10));
+                        first.store(true, Ordering::SeqCst);
+                        first_ready.send(()).unwrap();
+                    }
+                    Ok(())
+                },
+            }).unwrap();
+        });
+        assert_eq!(*upstream.writes.lock().unwrap(), [10, 30, 40, 120, 50, 60]);
+    }
+
+    #[test]
+    fn switched_off_between_groups_stops_with_the_closed_code() {
+        use crate::nexus::requests::{BatchLineProgress, BatchLineView, RequestsAccess};
+
+        let upstream = Arc::new(GroupLine::default());
+        let lidarr = Lidarr::new(HERE, "key", None, upstream.clone());
+        let disk = PreparedDisk::default();
+        let batch = Job::new(disk.clone());
+        batch.start_indexed([1, 2, 3].into_iter().map(prepared_want).collect()).unwrap();
+        let switch = std::cell::Cell::new(RequestsAccess::On);
+        let committed = std::cell::Cell::new(false);
+        let result = batch.work_prepared_in_turns(&lidarr, &|_| {}, &GroupControl {
+            turn: &upstream.turn, disk: disk.clone(), access: &|| switch.get().check(),
+            enter: &|| { if committed.get() { switch.set(RequestsAccess::Off) } },
+            publish: &|_| { committed.set(true); Ok(()) },
+        });
+        assert_eq!(result, Err(PreparedError::Refused(Refusal::SwitchedOff)));
+        assert_eq!(*upstream.writes.lock().unwrap(), [10]);
+        let recovered = Job::new(Nowhere);
+        assert!(recovered.load(&disk.0.lock().unwrap()));
+        let rows = recovered.indexed_lines().unwrap();
+        assert!(rows[0].placed);
+        for row in &rows[1..] {
+            assert!(matches!(BatchLineView::from_indexed(row).unwrap().progress,
+                BatchLineProgress::Failed { reason: Refusal::SwitchedOff, .. }));
+            assert!(!row.before_effect);
+        }
+    }
+
+    #[test]
+    fn a_cut_at_a_group_checkpoint_does_not_repeat_the_placement() {
+        use crate::nexus::requests::{batch_effect_confirmed, ArtistTarget, LidarrNumber};
+
+        let upstream = Arc::new(GroupLine::default());
+        let lidarr = Lidarr::new(HERE, "key", None, upstream.clone());
+        let disk = PreparedDisk::default();
+        let batch = Job::new(disk.clone());
+        batch.start_indexed([1, 2].into_iter().map(prepared_want).collect()).unwrap();
+        let result = batch.work_prepared_in_turns(&lidarr, &|_| {}, &GroupControl {
+            turn: &upstream.turn, disk: disk.clone(), access: &|| Ok(()), enter: &|| {},
+            publish: &|rows| {
+                assert!(rows[0].placed);
+                // Lidarr has applied the group, but the process cuts before commit.
+                Err(Refusal::NotDealtWith)
+            },
+        });
+        assert_eq!(result, Err(PreparedError::Refused(Refusal::NotDealtWith)));
+        let recovered = Job::new(disk.clone());
+        let bytes = disk.0.lock().unwrap().clone();
+        assert!(recovered.load(&bytes));
+        let rows = recovered.indexed_lines().unwrap();
+        assert_eq!((rows[0].state, rows[0].before_effect, rows[0].placed), (State::Found, true, false));
+        let target = ArtistTarget { artist: MusicBrainzId::new(&mbid(1)).unwrap(), id: LidarrNumber::new(1).unwrap() };
+        {
+            let _turn = upstream.turn.lock().unwrap();
+            let current = lidarr.known_artist(target.artist.as_str()).unwrap().map(|(number, _)| number);
+            let listed = lidarr.listed(1).unwrap();
+            let confirmed = batch_effect_confirmed(rows[0].offer.as_ref().unwrap(), &target, current, &listed, rows[0].placement.as_ref());
+            assert_eq!(confirmed, PlacementRecovery::Listed { placed: true });
+            recovered.reconcile_indexed(rows[0].slot, confirmed).unwrap();
+        }
+        recovered.work_prepared_in_turns(&lidarr, &|_| {}, &GroupControl {
+            turn: &upstream.turn, disk: disk.clone(), access: &|| Ok(()), enter: &|| {},
+            publish: &|rows| { assert_eq!(rows[0].index, 1); Ok(()) },
+        }).unwrap();
+        let after_commit = Job::new(disk.clone());
+        let bytes = disk.0.lock().unwrap().clone();
+        assert!(after_commit.load(&bytes));
+        after_commit.work_prepared_in_turns(&lidarr, &|_| {}, &GroupControl {
+            turn: &upstream.turn, disk, access: &|| Ok(()), enter: &|| panic!("completed groups cannot take a turn"), publish: &|_| Ok(()),
+        }).unwrap();
+        assert_eq!(*upstream.writes.lock().unwrap(), [10, 20]);
+    }
+
+    #[test]
+    fn indexed_way_back_preserves_the_exact_artist_after_a_reload() {
+        use crate::lidarr::WayBack;
+
+        let disk = PreparedDisk::default();
+        let batch = Job::new(disk.clone());
+        batch.start_indexed(vec![prepared_want(1)]).unwrap();
+        assert_eq!(batch.keep_for_artist(HERE, 7, "all", &mbid(1)), Ok(true));
+        assert!(batch.keep_for_artist(HERE, 7, "all", &mbid(2)).is_err());
+        let recovered = Job::new(disk.clone());
+        let bytes = disk.0.lock().unwrap().clone();
+        assert!(recovered.load(&bytes));
+        let original = SavedWayBack { artist: 7, artist_id: MusicBrainzId::new(&mbid(1)).unwrap(), address: HERE.into(), before: "all".into() };
+        assert_eq!(recovered.saved_way_backs(), Ok(vec![original.clone()]));
+        let other = SavedWayBack { artist_id: MusicBrainzId::new(&mbid(2)).unwrap(), ..original.clone() };
+        assert_eq!(recovered.clear_saved_way_back(&other), Ok(()));
+        assert_eq!(recovered.saved_way_backs(), Ok(vec![original.clone()]));
+        assert_eq!(recovered.clear_saved_way_back(&original), Ok(()));
+        let readback = Job::new(Nowhere);
+        assert!(readback.load(&disk.0.lock().unwrap()));
+        assert_eq!(readback.saved_way_backs(), Ok(vec![]));
     }
 
     #[test]
@@ -1866,7 +2452,7 @@ mod tests {
         JOB.set(job).ok().unwrap();
         job.start(HERE, vec![Want { artist: "Someone".into(), album: "A Single".into(), ..Default::default() }]);
         assert!(!noted.lock().unwrap().last().unwrap().1, "with no way back, progress is written in passing");
-        job.with(|batch| batch.restore.push(Back { artist: 5, before: "all".into(), lidarr: Some(HERE.into()) }));
+        job.with(|batch| batch.restore.push(Back { artist: 5, before: "all".into(), lidarr: Some(HERE.into()), artist_id: None }));
         std::thread::scope(|scope| {
             scope.spawn(|| job.save());
             scope.spawn(|| job.save());
@@ -2027,7 +2613,7 @@ mod tests {
         std::thread::scope(|scope| {
             scope.spawn(|| lidarr.request(&crate::lidarr::tests::single(), &job));
         });
-        assert_eq!(job.with(|batch| batch.restore.clone()), [Back { artist: 5, before: "all".into(), lidarr: None }]);
+        assert_eq!(job.with(|batch| batch.restore.clone()), [Back { artist: 5, before: "all".into(), lidarr: None, artist_id: None }]);
     }
 
     #[test]
@@ -2200,13 +2786,13 @@ mod tests {
         type Step = fn(&Job, &Lidarr);
         let steps: [(&str, Step); 4] = [
             ("asking", |job, lidarr| {
-                job.ask_known(lidarr, 5, &[crate::lidarr::tests::single()]).unwrap();
+                job.ask_known(lidarr, 5, &[crate::lidarr::tests::single()], false).unwrap();
             }),
             ("finishing", |job, lidarr| {
                 job.with(|batch| {
                     batch.wants.push(Want { state: State::Asked, lidarr_artist: 5, offer: Some(crate::lidarr::tests::single()), ..Default::default() });
                 });
-                job.finish(lidarr, 5, false, &|_| {}).unwrap();
+                job.finish(lidarr, 5, false, &|_| {}, None).unwrap();
             }),
             ("keeping track of the artist", |job, lidarr| {
                 lidarr.add_artist("ar1", "Someone", job).unwrap();
@@ -2298,7 +2884,7 @@ mod tests {
         let musicbrainz = MusicBrainz::new(sent_b.clone(), crate::listenbrainz::ListenBrainz::new(sent_b.clone()));
         assert!(job.begin());
         job.work_through(&b, &musicbrainz, &|_| {});
-        assert_eq!(job.finish(&b, 5, true, &|_| {}), Ok(Finished::Done));
+        assert_eq!(job.finish(&b, 5, true, &|_| {}, None), Ok(Finished::Done));
         assert_eq!(puts(&sent_b), Vec::<String>::new(), "A's setting was written to B");
         // Left in the file as it was, for A.
         let now: serde_json::Value = serde_json::from_slice(kept.lock().unwrap().as_ref().unwrap()).unwrap();
@@ -2306,7 +2892,7 @@ mod tests {
         // Settings names A again: put back there, and crossed off.
         assert!(job.unfinished(HERE));
         let (a, sent_a) = recording("lidarr.test");
-        assert_eq!(job.finish(&a, 5, true, &|_| {}), Ok(Finished::Done));
+        assert_eq!(job.finish(&a, 5, true, &|_| {}, None), Ok(Finished::Done));
         assert_eq!(puts(&sent_a).len(), 1);
         assert!(puts(&sent_a)[0].contains(r#""monitorNewItems":"all""#), "{:?}", puts(&sent_a));
         assert!(job.with(|batch| batch.restore.is_empty()));
@@ -2321,7 +2907,7 @@ mod tests {
         assert_eq!(written["restore"], serde_json::json!([[5, "all"]]));
         let (b, sent_b) = recording("lidarr-b.test");
         assert!(job.unfinished(&b.way_back_address()));
-        assert_eq!(job.finish(&b, 5, true, &|_| {}), Ok(Finished::Done));
+        assert_eq!(job.finish(&b, 5, true, &|_| {}, None), Ok(Finished::Done));
         assert_eq!(puts(&sent_b).len(), 1);
         assert!(job.with(|batch| batch.restore.is_empty()));
     }
@@ -2331,9 +2917,9 @@ mod tests {
         // Found idle a moment ago; by the time finishing has the turn, Lidarr is reading the
         // artist in again (another step's change). Nothing is wanted or put back yet.
         let job = Job::new(Kept(Arc::new(Mutex::new(None))));
-        job.with(|batch| batch.restore.push(Back { artist: 5, before: "all".into(), lidarr: Some(HERE.into()) }));
+        job.with(|batch| batch.restore.push(Back { artist: 5, before: "all".into(), lidarr: Some(HERE.into()), artist_id: None }));
         let (lidarr, sent) = recording_busy("lidarr.test", true);
-        assert_eq!(job.finish(&lidarr, 5, true, &|_| {}), Ok(Finished::Busy));
+        assert_eq!(job.finish(&lidarr, 5, true, &|_| {}, None), Ok(Finished::Busy));
         assert_eq!(puts(&sent), Vec::<String>::new());
         assert_eq!(job.with(|batch| batch.restore.len()), 1);
     }
@@ -2351,7 +2937,7 @@ mod tests {
         // The password changed since: still that Lidarr's way back, and put back there.
         let (after, sent) = recording("http://walk:new-secret@lidarr.test/base");
         assert!(job.unfinished(&after.way_back_address()));
-        assert_eq!(job.finish(&after, 5, true, &|_| {}), Ok(Finished::Done));
+        assert_eq!(job.finish(&after, 5, true, &|_| {}, None), Ok(Finished::Done));
         assert_eq!(puts(&sent).len(), 1);
         assert!(job.with(|batch| batch.restore.is_empty()));
     }
@@ -2360,13 +2946,13 @@ mod tests {
     fn finishing_is_put_off_for_an_artist_busy_in_the_turn_three_times_and_not_a_fourth() {
         // Found quiet before the turn each time; busy again once finishing has it, four times.
         let job = Job::new(Kept(Arc::new(Mutex::new(None))));
-        job.with(|batch| batch.restore.push(Back { artist: 5, before: "all".into(), lidarr: Some(HERE.into()) }));
+        job.with(|batch| batch.restore.push(Back { artist: 5, before: "all".into(), lidarr: Some(HERE.into()), artist_id: None }));
         let (lidarr, sent) = recording_busy("lidarr.test", true);
         for _ in 0..3 {
-            assert_eq!(job.finish(&lidarr, 5, true, &|_| {}), Ok(Finished::Busy));
+            assert_eq!(job.finish(&lidarr, 5, true, &|_| {}, None), Ok(Finished::Busy));
         }
         assert_eq!(puts(&sent), Vec::<String>::new());
-        assert_eq!(job.finish(&lidarr, 5, true, &|_| {}), Ok(Finished::Done), "finishing was put off for ever");
+        assert_eq!(job.finish(&lidarr, 5, true, &|_| {}, None), Ok(Finished::Done), "finishing was put off for ever");
         assert_eq!(puts(&sent).len(), 1);
         assert!(job.with(|batch| batch.restore.is_empty()));
     }

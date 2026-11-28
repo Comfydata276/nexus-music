@@ -48,7 +48,7 @@ pub const INCOMING: &str = "nexus.db.incoming";
 /// "NXMS": the mark that the file is the Nexus server's data.
 pub const APPLICATION_ID: i64 = 0x4e58_4d53;
 /// The form this program writes and reads.
-pub const FORM: i64 = 2;
+pub const FORM: i64 = MIGRATIONS[MIGRATIONS.len() - 1].form;
 /// How long a step waits for another connection's lock.
 pub const BUSY: Duration = Duration::from_secs(5);
 
@@ -234,7 +234,14 @@ pub struct Migration {
 }
 
 /// Every form this program knows, in order. A later slice adds its own at the end.
-pub const MIGRATIONS: &[Migration] = &[Migration { form: 1, sql: FORM_1 }, Migration { form: 2, sql: FORM_2 }];
+pub const MIGRATIONS: &[Migration] = &[
+    Migration { form: 1, sql: FORM_1 },
+    Migration { form: 2, sql: FORM_2 },
+    Migration {
+        form: 3,
+        sql: "CREATE INDEX listening_by_time ON listening_events(at_ms DESC, row_id DESC) WHERE is_start = 1;",
+    },
+];
 
 /// Form 2 (S13, for the audit's B-M1): the asked history keeps what it shows of each release
 /// (`metadata`) and whether this person's ask put it on the list (`placed`, once set never

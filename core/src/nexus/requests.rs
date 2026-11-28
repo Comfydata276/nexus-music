@@ -546,7 +546,9 @@ pub fn batch_effect_confirmed(
     }
     let mut matching = listed.iter().filter(|row| row.album == offer.album);
     let Some(row) = matching.next() else { return PlacementRecovery::Unconfirmed };
-    if row.id <= 0 || (!row.wanted && !row.have) || matching.next().is_some() {
+    if row.id <= 0 || (!row.wanted && !row.have) || matching.next().is_some()
+        || listed.iter().filter(|other| other.id == row.id).count() != 1
+    {
         return PlacementRecovery::Unconfirmed;
     }
     let placed = placement.is_some_and(|before| {
@@ -707,6 +709,7 @@ pub fn refusal_for(error: &str, wanted: Option<&Offer>) -> Refusal {
     let error = if error.ends_with('.') { Cow::Borrowed(error) } else { Cow::Owned(format!("{error}.")) };
     match error.as_ref() {
         crate::requests::NO_LONGER_LISTED => Refusal::NoLongerListed,
+        error if error == Refusal::SwitchedOff.sentence(None) => Refusal::SwitchedOff,
         lidarr::NO_MUSIC_FOLDER => Refusal::LidarrNotSetUp,
         lidarr::NO_PROFILES => Refusal::LidarrNoProfiles,
         lidarr::SINGLES_PROFILE_NO_NUMBER => Refusal::LidarrSinglesProfileNoNumber,

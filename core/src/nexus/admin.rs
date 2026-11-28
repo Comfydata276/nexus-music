@@ -16,6 +16,7 @@ use serde_json::value::RawValue;
 use zeroize::Zeroizing;
 
 mod lidarr;
+pub mod listening;
 pub use lidarr::{
     LIDARR_KEY_MAX_BYTES, LIDARR_NONCE_BYTES, LidarrBinding, LidarrKey, LidarrSealingKey,
     SealedLidarrKey,
@@ -45,7 +46,7 @@ pub const POST_PATHS: &[&str] = &[
     LIST_ACCOUNTS, CREATE_ACCOUNT, SET_ACCOUNT_ENABLED, SET_ADMIN, DELETE_ACCOUNT,
     RESET_PASSWORD, GET_MUSIC_SERVER, SET_MUSIC_SERVER, SET_MUSIC_LOGIN, LIST_DEVICES,
     FORCE_OUT, GET_DIAGNOSTICS_DEFAULT, SET_DIAGNOSTICS_DEFAULT, SET_REQUESTS_ENABLED,
-    GET_LIDARR_SETTING, SET_LIDARR, REQUEST_GRANT,
+    GET_LIDARR_SETTING, SET_LIDARR, REQUEST_GRANT, listening::PATH,
 ];
 
 // §7.2 bounds password-bearing calls at 4 KiB. Use that ceiling for all admin

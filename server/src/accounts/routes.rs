@@ -79,7 +79,7 @@ fn read<T>(body: Bytes, reader: impl FnOnce(&[u8]) -> Result<T, account::BadMess
 
 /// The session the caller shows, in its `Authorization` header (8.7). None if it shows none,
 /// or one not written as a session is.
-fn bearer(headers: &HeaderMap) -> Option<account::Session> {
+pub(super) fn bearer(headers: &HeaderMap) -> Option<account::Session> {
     let mut values = headers.get_all(AUTHORIZATION).iter();
     let value = values.next()?;
     if values.next().is_some() {

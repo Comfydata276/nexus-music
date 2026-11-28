@@ -15,6 +15,7 @@ pub mod admit;
 pub mod check;
 pub mod desk;
 pub mod music;
+pub(crate) mod listening;
 pub mod routes;
 pub mod rows;
 pub mod session;

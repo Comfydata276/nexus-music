@@ -181,6 +181,7 @@ impl Shell {
         let router = crate::accounts::routes::router(base_router(hello, accounts.desk.diagnostics.clone()), accounts.clone(), public_origin.clone());
         let admit = accounts.admission.clone();
         let requests = crate::requests::Requests::new(accounts.clone(), public_origin.clone());
+        let router = crate::accounts::listening::router(router, accounts.clone(), public_origin.clone());
         let router = crate::events::router(router, accounts, public_origin, data_budget);
         let router = requests.router(router);
         let shell = Self::with_proxy(proxy, router, head::ROUTES.to_vec());
