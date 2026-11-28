@@ -1,0 +1,229 @@
+"""The stand-in proxy at the music server's address, and what it sends /nexus/ to.
+
+The music server's address in these tests is https://music.example.org:4681 (a made-up name:
+the app's container is told it is 127.0.0.1, and trusts only a certificate authority made
+here for the run, so nothing on the internet can be reached over TLS). nginx (the local
+`nginx:alpine` image, host network, loopback only) answers on it:
+
+- every path goes to the test Navidrome (instance "w1", http://127.0.0.1:4680);
+- /nexus/, by the mode:
+    absent     no location for it at all: Navidrome answers (302 to /app/ on GET, 405 else)
+    refused    to a port nothing listens on (the proxy answers 502)
+    blackhole  to a port whose queue of connections is full, so the kernel drops every
+               packet that would open one (the proxy waits 75 s to connect, then 504)
+    found, stalled, saturated, ended, half
+               to standin.py, which answers as its mode says
+
+The location's box carries the design's rule (6.2) as given, so what the app gets is what it
+would get through the owner's proxy."""
+import os, socket, subprocess, sys, time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+HOST, TLS_PORT = "music.example.org", 4681
+# A second origin on the same music server, with nothing under /nexus/: another account's.
+HOST2, TLS_PORT2 = "music2.example.org", 4686
+NAVIDROME = 4680
+STANDIN, BLACKHOLE, REFUSED = 4682, 4683, 4684
+SERVER = f"https://{HOST}:{TLS_PORT}"
+SERVER2 = f"https://{HOST2}:{TLS_PORT2}"
+NGINX = "nexus-w1-front"
+STATE = os.path.expanduser("~/.cache/nexus-music-android/shots/nexus-w1/front")
+CERTS = os.path.join(STATE, "certs")
+MODES = ("absent", "refused", "blackhole", "found", "stalled", "saturated", "ended", "half", "bodystall", "gzip302")
+
+
+def sh(cmd, check=False):
+    out = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    if check and out.returncode != 0:
+        raise RuntimeError(f"{cmd}: {out.stderr}")
+    return out
+
+
+def certs():
+    """A certificate authority for the run, and music.example.org's certificate from it."""
+    os.makedirs(CERTS, exist_ok=True)
+    if os.path.exists(os.path.join(CERTS, "two-names")):
+        return
+    run = lambda cmd: sh(f"cd {CERTS} && {cmd}", check=True)
+    run("openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.pem -days 30 -subj '/CN=Nexus W1 test authority'")
+    run("openssl req -newkey rsa:2048 -nodes -keyout music.key -out music.csr -subj '/CN=music.example.org'")
+    open(os.path.join(CERTS, "ext.cnf"), "w").write("subjectAltName=DNS:music.example.org,DNS:music2.example.org\nbasicConstraints=CA:FALSE\n")
+    run("openssl x509 -req -in music.csr -CA ca.pem -CAkey ca.key -CAcreateserial -out music.pem -days 30 -extfile ext.cnf")
+    os.chmod(os.path.join(CERTS, "music.key"), 0o644)
+    open(os.path.join(CERTS, "two-names"), "w").write("")
+
+
+RULE = """
+            proxy_set_header Cookie "";
+            proxy_set_header X-Nexus-Peer $realip_remote_addr;
+            proxy_set_header X-Nexus-Scheme $scheme;
+            proxy_set_header Remote-User "";
+            proxy_set_header Forwarded "";
+            proxy_set_header True-Client-IP "";
+            proxy_set_header CF-Connecting-IP "";
+            proxy_set_header X-Forwarded-Host "";
+            proxy_no_cache 1;
+            proxy_cache_bypass 1;
+            # (The rule says "access_log off"; here it is logged apart, for the tests.)
+            access_log /state/nexus-access.log timed;
+            client_max_body_size 1m;"""
+
+
+def conf(mode, music=True):
+    nexus = ""
+    if mode != "absent":
+        port = {"refused": REFUSED, "blackhole": BLACKHOLE}.get(mode, STANDIN)
+        nexus = f"""
+        location /nexus/ {{
+            proxy_pass http://127.0.0.1:{port};
+            proxy_http_version 1.1;
+            proxy_buffering off;
+            proxy_connect_timeout 75s;
+            proxy_read_timeout 3600s;
+            proxy_send_timeout 3600s;{RULE}
+        }}"""
+    return f"""
+worker_processes 1;
+pid /tmp/nginx.pid;
+error_log /dev/stderr warn;
+events {{ worker_connections 1024; }}
+http {{
+    log_format timed '$msec $request_time $status "$request" "$http_user_agent"';
+    access_log /state/access.log timed;
+    client_body_temp_path /tmp/client_temp;
+    proxy_temp_path /tmp/proxy_temp;
+    fastcgi_temp_path /tmp/fastcgi_temp;
+    uwsgi_temp_path /tmp/uwsgi_temp;
+    scgi_temp_path /tmp/scgi_temp;
+    upstream navidrome {{ server 127.0.0.1:{NAVIDROME}; keepalive 32; }}
+    server {{
+        listen 127.0.0.1:{TLS_PORT} ssl;
+        server_name {HOST};
+        ssl_certificate /certs/music.pem;
+        ssl_certificate_key /certs/music.key;
+        client_max_body_size 0;
+        location / {{{"" if music else """
+            return 444;"""}
+            proxy_pass http://navidrome;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+            proxy_set_header Host $host;
+            proxy_buffering off;
+            proxy_read_timeout 3600s;
+        }}{nexus}
+    }}
+    server {{
+        listen 127.0.0.1:{TLS_PORT2} ssl;
+        server_name {HOST2};
+        ssl_certificate /certs/music.pem;
+        ssl_certificate_key /certs/music.key;
+        client_max_body_size 0;
+        location / {{{"" if music else """
+            return 444;"""}
+            proxy_pass http://navidrome;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+            proxy_set_header Host $host;
+            proxy_buffering off;
+            proxy_read_timeout 3600s;
+        }}
+    }}
+}}
+"""
+
+
+def blackhole():
+    """A port that takes no connection: its queue is filled, and never emptied."""
+    hole = socket.socket()
+    hole.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    hole.bind(("127.0.0.1", BLACKHOLE))
+    hole.listen(0)
+    fillers = []
+    for _ in range(4):
+        filler = socket.socket()
+        filler.setblocking(False)
+        try:
+            filler.connect(("127.0.0.1", BLACKHOLE))
+        except BlockingIOError:
+            pass
+        fillers.append(filler)
+    time.sleep(0.5)
+    return hole, fillers
+
+
+class Front:
+    def __init__(self, mode, out):
+        assert mode in MODES, mode
+        self.mode, self.out = mode, out
+        os.makedirs(out, exist_ok=True)
+        self.mode_file = os.path.join(out, "standin.mode")
+        self.log = os.path.join(out, "standin.jsonl")
+        self.procs, self.hole = [], None
+
+    def set(self, mode):
+        """Changes what standin.py answers, under a running app."""
+        open(self.mode_file, "w").write(mode)
+
+    def __enter__(self):
+        certs()
+        sh(f"docker rm -f {NGINX}")
+        sh(f"pkill -f 'standin[.]py {STANDIN}'")
+        self.set(self.mode if self.mode in ("found", "stalled", "saturated", "ended", "half", "bodystall", "gzip302") else "found")
+        self.procs.append(subprocess.Popen([sys.executable, "-I", os.path.join(HERE, "standin.py"), str(STANDIN), self.mode_file, self.log],
+                                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+        if self.mode == "blackhole":
+            self.hole = blackhole()
+        open(os.path.join(STATE, "nginx.conf"), "w").write(conf(self.mode))
+        sh(f"docker run -d --name {NGINX} --network host -u {os.getuid()}:{os.getgid()} "
+           f"-v {STATE}/nginx.conf:/etc/nginx/nginx.conf:ro -v {CERTS}:/certs:ro -v {self.out}:/state "
+           f"nginx:alpine nginx -g 'daemon off;'", check=True)
+        for _ in range(50):
+            if sh(f"curl -s --cacert {CERTS}/ca.pem --resolve {HOST}:{TLS_PORT}:127.0.0.1 -o /dev/null -w '%{{http_code}}' {SERVER}/rest/ping").stdout == "200":
+                return self
+            time.sleep(0.2)
+        raise RuntimeError("the stand-in proxy didn't come up: " + sh(f"docker logs {NGINX} 2>&1").stdout[-800:])
+
+    def __exit__(self, *exc):
+        sh(f"docker logs {NGINX} > {self.out}/nginx.log 2>&1")
+        sh(f"docker rm -f {NGINX}")
+        for proc in self.procs:
+            proc.terminate()
+        if self.hole:
+            self.hole[0].close()
+            for filler in self.hole[1]:
+                filler.close()
+
+    def music(self, up):
+        """The music server reachable, or lost as a network is lost: the proxy closes every
+        connection for it without a word. /nexus/ is left as the mode has it."""
+        open(os.path.join(STATE, "nginx.conf"), "w").write(conf(self.mode, up))
+        sh(f"docker exec {NGINX} nginx -s reload", check=True)
+        want = "200" if up else "000"
+        for _ in range(50):
+            if sh(f"curl -s --cacert {CERTS}/ca.pem --resolve {HOST}:{TLS_PORT}:127.0.0.1 -o /dev/null -w '%{{http_code}}' {SERVER}/rest/ping").stdout == want:
+                return
+            time.sleep(0.1)
+        raise RuntimeError("the proxy didn't take the change")
+
+    def asked(self):
+        """What reached the stand-in, as it logged it."""
+        import json
+        if not os.path.exists(self.log):
+            return []
+        return [json.loads(line) for line in open(self.log) if line.strip()]
+
+    def nexus_in_access_log(self):
+        """Every request the proxy saw under /nexus/, whatever it sent them to."""
+        lines = []
+        for name in ("access.log", "nexus-access.log"):
+            path = os.path.join(self.out, name)
+            if os.path.exists(path):
+                lines += [line for line in open(path) if " /nexus" in line]
+        return lines
+
+
+if __name__ == "__main__":
+    # front.py <mode>: up until Enter, for looking at it by hand.
+    with Front(sys.argv[1], os.path.join(STATE, "by-hand")) as front:
+        print(f"{SERVER} with /nexus/ {front.mode}; Enter to stop")
+        input()

@@ -135,6 +135,13 @@ export global App {
     in property <bool> signed-in;
     in property <string> server;
     in property <string> username;
+    // Set by the Nexus server's component when it is switched on (src/nexus.rs): only then
+    // does the window track the account for it.
+    in property <bool> nexus-on;
+    // Called once the account in use has changed (see `account` in app.slint), for what
+    // follows the account without being told by the controller: the Nexus server's
+    // component (src/nexus.rs).
+    callback account-changed();
     in property <string> server-version;
     in property <string> app-version;
     in property <string> login-error;
@@ -623,6 +630,12 @@ export struct QualityOption {
 }
 
 export global Settings {
+    // Whether there is a Nexus server at the music server's address: empty until it has been
+    // looked for, then what was found, for the account in `nexus-for` (the server and the
+    // name, on two lines). Shown only while that account is the one signed in. Set by
+    // src/nexus.rs alone.
+    in property <string> nexus-server;
+    in property <string> nexus-for;
     in property <[QualityOption]> qualities;
     // Their names alone, for the control that chooses between them.
     in property <[string]> quality-names;

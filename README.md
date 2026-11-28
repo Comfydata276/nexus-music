@@ -380,6 +380,44 @@ it is whole).
     punctuation share them.
 
   Signing out clears Recently played, the saved queue and the "Continue here" offer.
+- **The Nexus server's component is switched off for everyone.** It is made only when the
+  app is started with `NEXUS_MUSIC_NEXUS=1`, which no one is told to do; switched off, the
+  app is as released (`--nexus-probe` is not obeyed either). It stays off until someone has
+  run these checks on a real Windows PC, with the **release** build (the installer's), and
+  each has passed. They need a test server set up as `tests/e13a/README.md` describes (a
+  music server at an `https://` address of its own, and a stand-in for the Nexus server
+  under `/nexus/` that can be made to hold every request without answering).
+
+  1. **A held look ends quietly.** Set `NEXUS_MUSIC_NEXUS=1` for your user, start the app,
+     sign in to the test server, and make the stand-in hold every request. Open Task
+     Manager's Details tab. Within five seconds a second `nexus-music.exe` appears. No
+     window, console or error dialog opens. Within ten seconds of appearing it is gone. Do
+     this five times; the app's handle count (add the Handles column) is the same after the
+     fifth as after the first.
+  2. **A look's process that dies ends only that look, quietly.** With the stand-in holding
+     requests and music playing, end the second `nexus-music.exe` with Task Manager's End
+     task (as an abort, the shipped build's panic, would end it). No dialog opens, the music
+     never stops, and the row under Settings, Account says "None found". Then, with a
+     Windows build of the app's development profile (which reads the test hooks), set
+     `NEXUS_TEST_PROBE_CHILD=abort` as well and watch a look abort: no Windows Error
+     Reporting dialog, no console, the app unaffected.
+  3. **The certificate check is held to the deadline.** Give the test server a certificate
+     whose chain names a certificate authority's address that does not answer (the stand-in
+     can be that address), so that Windows tries to fetch it. With music playing, the second
+     `nexus-music.exe` of step 1 is gone within ten seconds, and the music never stops.
+  4. **Quitting ends a look.** With the stand-in holding requests, quit the app from the
+     notification-area icon while the second `nexus-music.exe` is there. Both are gone
+     within two seconds.
+  5. **Media keys, with the window hidden.** With the stand-in holding requests and the app
+     playing, close the window to the notification area. Press the keyboard's Play/Pause,
+     Next and Previous keys: each acts at once. Repeat with the app freshly started (the
+     window not yet shown): Play/Pause starts the saved queue at once.
+  6. **The notification-area icon and the taskbar.** Still holding requests: the icon's
+     menu (Play, Next, Previous, Open) and the taskbar thumbnail's buttons each act at once.
+  7. **Switched off is as released.** Clear `NEXUS_MUSIC_NEXUS` and repeat steps 1, 5 and 6:
+     no second `nexus-music.exe` ever appears, there is no "Nexus server" row under
+     Settings, Account, and `nexus-music.exe --nexus-probe <address>` opens (or brings
+     forward) the app, as an unknown argument always has.
 
 **Your plays.** `plays.log`, in the same folder, holds every play the app has counted, one to
 a line, and is only ever added to. If it can't be read when the app starts (another program

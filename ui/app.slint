@@ -288,6 +288,12 @@ export component MainWindow inherits Window {
         }
     }
     property <bool> queue-usable: (self.wide ? App.queue-open : App.queue-over) && !Devices.open && App.queue-tab == 0 && Player.queue.length > 0;
+    // The account in use, as one value: a change to it is called out after the Rust side has
+    // finished publishing it.
+    // (Only for the Nexus server's component, and only once it is switched on: until then
+    // this reads nothing else and never changes.)
+    property <string> account: App.nexus-on && App.signed-in ? App.server + "\n" + App.username : "";
+    changed account => { App.account-changed(); }
     // The Rust side bumps this after navigating, to take the keyboard back from the search box.
     property <int> focus-request: App.main-focus;
     changed focus-request => { keys.focus(); }

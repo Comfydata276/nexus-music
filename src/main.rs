@@ -28,6 +28,9 @@ mod lyrics;
 mod listenbrainz;
 mod mixes;
 mod musicbrainz;
+// The Nexus server's component: installed here, after the controller, and named by nothing
+// that plays music (see its own notes).
+mod nexus;
 mod offline;
 mod pages;
 #[cfg(test)]
@@ -98,6 +101,10 @@ fn keep_a_crash_log() {
 }
 
 fn main() -> Result<(), slint::PlatformError> {
+    // Started as one look of the Nexus server's component: that, and nothing of the app.
+    if let Some(code) = nexus::probe_mode() {
+        std::process::exit(code);
+    }
     keep_a_crash_log();
     // Opening the app a second time shows the copy that's already running.
     #[cfg(windows)]
@@ -107,6 +114,11 @@ fn main() -> Result<(), slint::PlatformError> {
     apply_interface_size();
     let window = ui::MainWindow::new()?;
     let controller = controller::Controller::install(window);
+    // After the controller is made (and a saved sign-in entered), never by it; and only when
+    // it is switched on (NEXUS_MUSIC_NEXUS=1).
+    if nexus::switched_on() {
+        nexus::install(&controller.ui);
+    }
     controller.ui.show()?;
     // The loop is ended explicitly (see `Controller::quit`): with a tray icon present it
     // would otherwise outlive the window.
@@ -118,5 +130,9 @@ fn main() -> Result<(), slint::PlatformError> {
     controller.downloads.borrow_mut().save_if_due(true);
     // The queue is written by a thread of its own: wait for it to finish.
     controller.saver.flush();
+    // A look of the Nexus server's component still running is ended (at most two seconds).
+    if nexus::switched_on() {
+        nexus::shutdown();
+    }
     Ok(())
 }

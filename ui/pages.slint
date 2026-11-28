@@ -2752,6 +2752,11 @@ export component SettingsPage inherits Rectangle {
                             }
                         }
 
+                        if Settings.nexus-server != "" && Settings.nexus-for == (App.signed-in ? App.server + "\n" + App.username : ""): SettingRow {
+                            title: "Nexus server";
+                            detail: Settings.nexus-server;
+                        }
+
                         SettingRow {
                             title: "Keep my devices in step";
                             detail: "Your queue, Recently played, pinned playlists, each list's shuffle and sort, the dates songs were added and the theme follow you to Nexus Music on other devices. Kept on your server in a playlist named “Nexus Music sync”, which other apps will show; leave it be." + (Settings.sync && Settings.sync-note != "" ? " " + Settings.sync-note : "");

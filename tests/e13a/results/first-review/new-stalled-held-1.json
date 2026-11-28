@@ -1,0 +1,95 @@
+{
+ "run": "new-stalled-held-1",
+ "machine_load_at_start_and_end": [
+  0.35,
+  2.73
+ ],
+ "build": "new",
+ "mode": "stalled",
+ "hook": "held",
+ "at": "2026-11-28 03:57:44",
+ "binary": "6f2a120bab8e39a0",
+ "results": {
+  "cold_start_publishes_the_saved_account": {
+   "launch_to_home_drawn": 0.716
+  },
+  "cold_start_puts_the_queue_back_and_plays": {
+   "launch_to_queue_shown": 0.744,
+   "play_to_sound": 0.086
+  },
+  "a_play_is_counted_as_released": {
+   "play_to_counted": 10.478,
+   "start_up_left_the_log_as_it_was": true,
+   "lines_added": 1,
+   "line_with_time_as_offset": [
+    "[\"3HrMsvEFi99qxWnytxSZkV\",10,\"playlist:0xUBIqKWew6szTtjwWVL0C\"]"
+   ]
+  },
+  "a_like_and_a_play_reach_the_music_server": {
+   "counted_to_server_has_play": 0.308,
+   "like_to_server": 0.111,
+   "server_back_to_play_told_again": 2.8
+  },
+  "downloads_start_and_resume": {
+   "launch_to_list_scheduled_its_own": 11.532,
+   "by_hand_8_songs": 0.218,
+   "server_back_to_downloads_done": 22.846
+  },
+  "the_queue_is_changed_and_kept": {
+   "add_to_kept": 0.146,
+   "move_to_kept": 0.129,
+   "remove_to_kept": 0.128,
+   "queue_before_kill": [
+    [
+     "Glass Orchard",
+     "Runout Groove",
+     "Intro",
+     "Glass Orchard",
+     "Intro"
+    ],
+    1
+   ],
+   "restart_to_queue_shown": 0.719,
+   "queue_after_kill_is_the_queue_before": true,
+   "clear_to_kept": 0.072
+  },
+  "a_direct_play_starts_it_cold": {
+   "space_to_sound": 0.023
+  },
+  "two_songs_join_without_a_gap": {
+   "streamed_play_to_sound": 0.408,
+   "streamed_longest_stall_around_the_join": 0.021,
+   "streamed_silent_frames_at_the_join": 1,
+   "streamed_largest_step_at_the_join": 0.1883,
+   "cached_play_to_sound": 0.187,
+   "cached_longest_stall_around_the_join": 0.022,
+   "cached_silent_frames_at_the_join": 1,
+   "cached_largest_step_at_the_join": 0.031,
+   "downloaded_play_to_sound": 0.197,
+   "downloaded_longest_stall_around_the_join": 0.022,
+   "downloaded_silent_frames_at_the_join": 1,
+   "downloaded_largest_step_at_the_join": 0.0791
+  },
+  "offline_by_hand_and_by_loss": {
+   "by_hand_switch_to_offline": 0.095,
+   "offline_play_downloaded_to_sound": 0.649,
+   "by_hand_switch_back": 0.087,
+   "by_loss_noticed": 0.743,
+   "by_loss_play_downloaded_to_sound": 1.783,
+   "server_back_to_online": 2.838
+  },
+  "settings_row": {
+   "shown": "no row",
+   "shown (account change)": "no row"
+  },
+  "an_account_change_is_not_held_up": {
+   "connect_to_home_drawn": 0.118,
+   "signed_in_as": "guest"
+  },
+  "backend": {
+   "requests_under_nexus_at_the_proxy": 0,
+   "requests_at_the_stand_in": []
+  }
+ },
+ "failures": []
+}
