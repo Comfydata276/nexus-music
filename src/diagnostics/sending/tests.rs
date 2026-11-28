@@ -24,6 +24,19 @@ fn session() -> Session {
     }
 }
 
+fn local_reports(paths: &config::Paths) -> io::Result<String> {
+    let paths = paths.clone();
+    let (sent, received) = mpsc::channel();
+    on_worker(move || {
+        let preview = preview_text(&paths, session());
+        let export = export_report(&paths, session());
+        sent.send((preview, export)).unwrap();
+    });
+    let (preview, export) = received.recv_timeout(Duration::from_secs(10)).unwrap();
+    export?;
+    Ok(preview)
+}
+
 const START: u64 = 1_700_000_000_000;
 const NEXUS: &str = "https://diagnostics.example.invalid";
 
@@ -238,15 +251,15 @@ fn the_worker_requires_a_saved_schedule_before_returning_diagnostics() -> io::Re
     let _worker = WORKER_FIXTURE.lock().unwrap();
     let temp = TestFolder::new()?;
     let paths = temp.paths();
-    let (sent, received) = mpsc::channel();
-    let checkpoint_paths = paths.clone();
-    on_worker(move || sent.send(super::super::checkpoint(&checkpoint_paths, session())).unwrap());
-    received.recv_timeout(Duration::from_secs(10)).unwrap()?;
+    fs::write(&paths.crash_log, "1700000000000\tFault in app: no panic payload\n")?;
+    let preview = local_reports(&paths)?;
+    assert!(preview.contains("Fault in app: no panic payload"));
+    assert_eq!(fs::read(&paths.diagnostics)?, preview.as_bytes());
 
     let schedule = DiagSchedule { started_ms: START, fault_ms: None, attempts: vec![START] };
     let path = schedule_path(&paths);
     keep_schedule(&paths, Some(schedule.clone()));
-    assert!(matches!(queued_read(&paths, 4), Happened::DiagnosticsRead { read: 4, text: Some(_) }));
+    assert!(matches!(queued_read(&paths, 4), Happened::DiagnosticsRead { read: 4, text: Some(text) } if text == preview));
     fs::remove_file(&path)?;
     fs::create_dir(&path)?;
 
@@ -299,15 +312,7 @@ fn e13a_receives_the_same_bytes_as_preview_and_export() -> io::Result<()> {
     let temp = TestFolder::new()?;
     let paths = temp.paths();
     fs::write(&paths.crash_log, "1700000000000\tFault in app: no panic payload\n")?;
-    let local_paths = paths.clone();
-    let (sent, received) = mpsc::channel();
-    on_worker(move || {
-        let preview = preview_text(&local_paths, session());
-        let export = export_report(&local_paths, session());
-        sent.send((preview, export)).unwrap();
-    });
-    let (preview, export) = received.recv_timeout(Duration::from_secs(10)).unwrap();
-    export?;
+    let preview = local_reports(&paths)?;
     assert!(preview.contains("Fault in app: no panic payload"));
 
     let received = paths.settings.with_file_name("received.json");
