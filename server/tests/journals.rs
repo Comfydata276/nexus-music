@@ -952,13 +952,6 @@ mod listening {
         SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
     }
 
-    // Local fixtures while the store's forward migration is pending.
-    fn test_index(fixture: &Fixture) {
-        fixture.db().execute_batch(
-            "CREATE INDEX IF NOT EXISTS listening_by_time ON listening_events(at_ms DESC, row_id DESC) WHERE is_start = 1;",
-        ).unwrap();
-    }
-
     fn query(
         fixture: &Fixture, who: &SignedIn, stamp: &Stamp, account: Option<account::AccountId>,
         days: u64, page: Option<wire::Page>,
@@ -1004,7 +997,6 @@ mod listening {
         let mut fixture = Fixture::new("listening-period");
         let code = fixture.set_up();
         let member_code = fixture.other();
-        test_index(&fixture);
         let clock = fixture.start_with_clock();
         let (owner, owner_stamp) = fixture.sign_in(with_code(code), 1);
         let (member, member_stamp) = fixture.sign_in(with_code(member_code), 2);
@@ -1139,7 +1131,6 @@ mod listening {
         let mut fixture = Fixture::new("listening-pages");
         let code = fixture.set_up();
         let member_code = fixture.other();
-        test_index(&fixture);
         let start = now();
         // These starts age out of a fresh seven-day window when the clock
         // advances after the first page, but stay inside that page's interval.
@@ -1162,6 +1153,10 @@ mod listening {
             Ok(((), true))
         }).unwrap();
         keeper.close();
+        // The store must index existing starts when it upgrades form 2.
+        fixture.db().execute_batch(
+            "DROP INDEX listening_by_time; PRAGMA user_version = 2;",
+        ).unwrap();
         let clock = fixture.start_with_clock();
         let (owner, owner_stamp) = fixture.sign_in(with_code(code), 1);
         let (member, member_stamp) = fixture.sign_in(with_code(member_code), 2);
@@ -1243,7 +1238,6 @@ mod listening {
     fn measure_listening_overview() {
         let mut fixture = Fixture::new("listening-measure");
         let code = fixture.set_up();
-        test_index(&fixture);
         let end = now();
         let mut keeper = open_store(&fixture, end);
         let account = keeper.account_named(EMAIL).unwrap().unwrap() as i64;
