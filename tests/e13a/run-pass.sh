@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One pass of the suite. Every mode of the stand-in, the released app ("old") and the app with
 # the component ("new") one after the other, so that whatever else this machine is doing
-# falls on both alike; then the component's look held, the component switched off, the
+# falls on both alike; then the component's look held (it is no longer behind a switch), the
 # scenarios, the phases, and each deliberate fault, which must be caught FOR ITS REASON.
 #
 #   tests/e13a/run-pass.sh <pass number>        exits 1 if anything is not as it must be
@@ -32,11 +32,16 @@ for mode in absent refused blackhole found stalled saturated ended half; do
 done
 must_pass "new-absent-held" python3 tests/e13a/suite.py run new absent held
 must_pass "new-stalled-held" python3 tests/e13a/suite.py run new stalled held
-must_pass "new-absent-switch-off" python3 tests/e13a/suite.py run new absent switch-off
 must_pass "offline-scenario" python3 tests/e13a/suite.py offline new
 must_pass "sign-out-scenario" python3 tests/e13a/suite.py sign-out new
 must_pass "late-answer-scenario" python3 tests/e13a/suite.py late-answer new
 must_pass "phases" python3 tests/e13a/phases.py new
+# Slice W7: what sign-in left, a refused music login, the session ended and the music
+# login's number risen while offline.
+must_pass "refused-scenario" python3 tests/e13a/suite.py refused found
+must_pass "refused-backend-down-scenario" python3 tests/e13a/suite.py refused absent
+must_pass "ended-offline-scenario" python3 tests/e13a/suite.py ended-offline
+must_pass "count-offline-scenario" python3 tests/e13a/suite.py count-offline
 must_fail "CONTROL-window-thread-held" "FAILED compare: .*over " python3 tests/e13a/suite.py run new absent sabotage
 must_fail "CONTROL-offline-ignored" "looks dispatched after Offline mode was on" env E13A_SABOTAGE=1 python3 tests/e13a/suite.py offline new
 must_fail "CONTROL-sign-out-ignored" "looks dispatched for the account that signed out" env E13A_SABOTAGE=1 python3 tests/e13a/suite.py sign-out new

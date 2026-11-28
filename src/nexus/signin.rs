@@ -164,6 +164,8 @@ pub fn install(ui: &ui::MainWindow) {
     let weak = ui.as_weak();
     app_global.on_music_login_refused(move || {
         let Some(ui) = weak.upgrade() else { return };
+        // A refusal at a cold start, before the core's own start: it is started for it.
+        start(&ui);
         let Some(count) = config::load_sign_in(&paths()).and_then(|record| record.music.map(|music| music.count)) else { return };
         happened(&ui, Happened::MusicRefused { count });
     });

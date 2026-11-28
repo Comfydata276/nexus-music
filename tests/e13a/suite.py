@@ -8,7 +8,7 @@ disk blocked as well.
 
     suite.py populate                       the released app makes the profile every run starts from
     suite.py run <old|new> <mode> [hook]    one run of every test; exits 1 on any failure.
-                                            hook (new only): held, switch-off, sabotage
+                                            hook (new only): held, sabotage
     suite.py offline [build]                Offline mode on from the start, off, on again
     suite.py late-answer [build]            a late answer for one account, another signed in
     suite.py refused [mode]                 slice W7: a refused music login asked for once
@@ -481,8 +481,6 @@ HOOKS = {
     None: "",
     # Its look's thread held in a call that never returns, from the first tick on.
     "held": "",
-    # Not switched on: nothing of it may be made.
-    "switch-off": "",
     # A deliberate fault, which the run must catch and FAIL on: the window's thread held
     # 0.3 s at each look (shorter than the 1 s allowed for timers).
     "sabotage": "",
@@ -1246,6 +1244,8 @@ def scenario_offline(build="new"):
     home = "scenario-offline"
     shutil.rmtree(os.path.join(A.HOMES, home), ignore_errors=True)
     shutil.copytree(KEPT, os.path.join(A.HOMES, home))
+    if build == "new":
+        to_signed_in(home)
     settings = os.path.join(A.HOMES, home, "config", "settings.json")
     s = json.load(open(settings)); s["offline"] = True; json.dump(s, open(settings, "w"))
     inside = f"/work/target/walk/{home}"
@@ -1312,6 +1312,8 @@ def scenario_sign_out(build="new"):
     home = "scenario-sign-out"
     shutil.rmtree(os.path.join(A.HOMES, home), ignore_errors=True)
     shutil.copytree(KEPT, os.path.join(A.HOMES, home))
+    if build == "new":
+        to_signed_in(home)
     inside = f"/work/target/walk/{home}"
     log = os.path.join(A.HOMES, home, "nexus.log")
     # The window's account-changed handler 0.3 s late (a test hook): looks come due between an
@@ -1331,7 +1333,7 @@ def scenario_sign_out(build="new"):
             # (The inspection port answers once the window has handled the press: the account
             # has gone by now.)
             clicked = time.time()
-            until(lambda: a.find(label="Connect"), 20, 0.02, "the sign-in form")
+            until(lambda: sign_in_form(a), 20, 0.02, "the sign-in form")
             form_seen = time.time()
             time.sleep(1)
             lines = component_log(log)
@@ -1376,6 +1378,8 @@ def scenario_late_answer(build="new"):
     home = "scenario-late"
     shutil.rmtree(os.path.join(A.HOMES, home), ignore_errors=True)
     shutil.copytree(KEPT, os.path.join(A.HOMES, home))
+    if build == "new":
+        to_signed_in(home)
     inside = f"/work/target/walk/{home}"
     env = {"NEXUS_MUSIC_NEXUS": "1", "NEXUS_TEST_NEXUS_LOG": f"{inside}/nexus.log", "NEXUS_TEST_HOLD_NEXUS_RESULT": f"{inside}/release"}
     if os.environ.get("E13A_SABOTAGE"):
@@ -1388,7 +1392,7 @@ def scenario_late_answer(build="new"):
         until(lambda: os.path.exists(release + ".waiting"), 30, 0.1, "A's answer found and held")
         settings_tab(a, "Account", "Sign out")
         a.press("Sign out")
-        until(lambda: a.find(label="Connect"), 20, 0.05, "the sign-in form")
+        until(lambda: sign_in_form(a), 20, 0.05, "the sign-in form")
         sign_in(a, "guest", front.SERVER2)
         until(lambda: home_drawn(a), 60, 0.05, "B's first page")
         settings_tab(a, "Account", "Sign out")
@@ -1402,10 +1406,12 @@ def scenario_late_answer(build="new"):
         log = open(copy.path("nexus.log")).read() if os.path.exists(copy.path("nexus.log")) else ""
         open(os.path.join(out, "nexus.log"), "w").write(log)
     shutil.rmtree(os.path.join(A.HOMES, home), ignore_errors=True)
-    if any(l.startswith("Found at") for l in seen):
+    # (W7: B signed in through the second origin's own backend, so B's own row names it.)
+    a_said, b_said = f"Found at {front.SERVER}/nexus/", (f"Found at {front.SERVER2}/nexus/" if build == "new" else "None found")
+    if a_said in seen or (build != "new" and any(l.startswith("Found at") for l in seen)):
         failures.append(f"A's answer was shown under B: {sorted(seen)}")
-    if "None found" not in seen:
-        failures.append(f"B's own row never said None found: {sorted(seen)}")
+    if b_said not in seen:
+        failures.append(f"B's own row never said {b_said}: {sorted(seen)}")
     if " dropped " not in log:
         failures.append("the component did not drop A's late answer")
     print(f"late answer: rows seen under B {sorted(seen)}; failures: {failures or 'none'}")
@@ -1585,7 +1591,7 @@ def table():
             n = len([r for r in runs if r["build"] == build and r["mode"] == mode and not r.get("hook")])
             if n < 2:
                 missing.append(f"{build} {mode}: {n} runs of 2")
-    for mode, hook in (("absent", "held"), ("stalled", "held"), ("absent", "switch-off")):
+    for mode, hook in (("absent", "held"), ("stalled", "held")):
         n = len([r for r in runs if r["mode"] == mode and r.get("hook") == hook])
         if n < 2:
             missing.append(f"new {mode} {hook}: {n} runs of 2")
@@ -1605,6 +1611,221 @@ def table():
     return 0 if within and not failed and old and new else 1
 
 
+# ---- slice W7: what sign-in left, a refused music login, offline -------------------------------
+
+def w7_home(name, token_of="tester-pass-1", count=1, offline=False):
+    """A fresh profile for a W7 scenario, as sign-in left it."""
+    prepare_server()
+    home = f"scenario-{name}"
+    shutil.rmtree(os.path.join(A.HOMES, home), ignore_errors=True)
+    shutil.copytree(KEPT, os.path.join(A.HOMES, home))
+    to_signed_in(home, token_of, count)
+    settings = os.path.join(A.HOMES, home, "config", "settings.json")
+    s = json.load(open(settings)); s["offline"] = offline; json.dump(s, open(settings, "w"))
+    return home
+
+
+def kept_record(copy):
+    """What the app keeps of the sign-in, read from its file (the development build's)."""
+    try:
+        return json.load(open(copy.path("config", "secret-nexus-sign-in")))
+    except (OSError, ValueError):
+        return None
+
+
+def music_requests(out):
+    """Every request the proxy passed to the music server: (began, ended, status, request)."""
+    rows = []
+    path = os.path.join(out, "front", "access.log")
+    for line in open(path) if os.path.exists(path) else []:
+        parts = line.split(" ", 3)
+        if len(parts) > 3 and "/rest/" in parts[3]:
+            ended, took = float(parts[0]), float(parts[1])
+            rows.append((ended - took, ended, parts[2], parts[3]))
+    return rows
+
+
+def token_of(password, salt="e13asaltsalt0001"):
+    return hashlib.md5((password + salt).encode()).hexdigest()
+
+
+def scenario_refused(mode="found"):
+    """`a_refused_music_login_is_asked_for_once` (design 6.3): a cold start with a music
+    login the music server refuses. The first refusal sets it aside at once: no request with
+    it is begun after the first refusal came back. With the backend there ("found"), the
+    current login is asked for once, put in place, and the music server takes it. With the
+    backend down ("absent"), nothing is retried, the person stays signed in, and what is on
+    this PC plays. Never a sign-out. Exits 1 if not."""
+    out = os.path.join(RUNS, f"new-refused-{mode}-scenario")
+    shutil.rmtree(out, ignore_errors=True)
+    os.makedirs(out)
+    failures = []
+    home = w7_home(f"refused-{mode}", token_of="not-the-password", count=1)
+    inside = f"/work/target/walk/{home}"
+    env = {"NEXUS_TEST_NEXUS_LOG": f"{inside}/nexus.log", "NEXUS_TEST_RENEW_MS": "2000"}
+    bad = token_of("not-the-password")
+    with front.Front(mode, os.path.join(out, "front")) as f:
+        f.hold(count=2)
+        copy = A.Copy("new", home, env=env)
+        dump = Dump(copy.dump)
+        a = copy.launch()
+        until(lambda: home_drawn(a), 60, 0.1, "Home")
+        if mode == "found":
+            try:
+                until(lambda: (kept_record(copy) or {}).get("music", {}).get("count") == 2, 40, 0.2, "the new music login kept")
+            except TimeoutError:
+                failures.append(f"the current music login was not put in place: {kept_record(copy)}")
+            time.sleep(5)
+        else:
+            time.sleep(40)
+        # Something on this PC plays, signed in or renewed.
+        pressed = time.time()
+        play_downloaded(a)
+        try:
+            dump.sound_after(pressed, 30)
+        except TimeoutError:
+            failures.append("a downloaded song did not play")
+        time.sleep(3)
+        if sign_in_form(a) and not a.find(type="NavItem"):
+            failures.append("the app went to the sign-in screen: a refusal by the music server signed it out")
+        copy.stop(keep=os.path.join(out, "app-output.txt"))
+        dump.stop()
+        asks = [r for r in f.asked() if r.get("call") == "music-login"]
+    rows = music_requests(out)
+    refused = [r for r in rows if f"t={bad}" in r[3]]
+    renewed = [r for r in rows if f"t={bad}" not in r[3] and "t=" in r[3] and r[2] == "200"]
+    if not refused:
+        failures.append("the music server never saw the refused login: nothing was tested")
+    else:
+        first_back = min(r[1] for r in refused)
+        late = [r for r in refused if r[0] > first_back + 0.05]
+        if late:
+            failures.append(f"{len(late)} requests with the refused login begun after the first refusal came back")
+    if mode == "found":
+        if len(asks) != 1:
+            failures.append(f"the music login was asked for {len(asks)} times, not once")
+        if not renewed:
+            failures.append("the music server never took the new login")
+    elif asks:
+        failures.append(f"with no backend, {len(asks)} music-login calls reached a stand-in")
+    left = no_password_anywhere(home)
+    if left:
+        failures.append(f"a music-server password on disk: {left}")
+    log = copy.path("nexus.log")
+    if os.path.exists(log):
+        shutil.copy(log, os.path.join(out, "nexus.log"))
+    shutil.rmtree(os.path.join(A.HOMES, home), ignore_errors=True)
+    print(f"refused ({mode}): {len(refused)} refused requests, {len(asks)} asked for the login, {len(renewed)} taken after; failures: {failures or 'none'}")
+    return 1 if failures else 0
+
+
+def switch_offline_off(a, copy):
+    settings_tab(a, "Storage", "Offline mode")
+    a.click(a.one(label="Offline mode", role="Switch")["handle"])
+    until(lambda: json.load(open(copy.path("config", "settings.json"))).get("offline") is False, 5, 0.05, "Offline mode off")
+    return time.time()
+
+
+def scenario_ended_offline():
+    """`a_forced_out_device_stops_only_when_told`, with the session ended while the PC is
+    offline: what is on the PC plays, and nothing changes, until the backend itself says the
+    session has ended; then the PC is signed out (design 6.3, 8.7), and its downloads stay.
+    Exits 1 if not."""
+    out = os.path.join(RUNS, "new-ended-offline-scenario")
+    shutil.rmtree(out, ignore_errors=True)
+    os.makedirs(out)
+    failures = []
+    home = w7_home("ended-offline", offline=True)
+    inside = f"/work/target/walk/{home}"
+    with front.Front("found", os.path.join(out, "front")) as f:
+        copy = A.Copy("new", home, env={"NEXUS_TEST_NEXUS_LOG": f"{inside}/nexus.log"})
+        dump = Dump(copy.dump)
+        a = copy.launch()
+        until(lambda: home_drawn(a), 60, 0.1, "Home")
+        f.hold(ended=True)
+        pressed = time.time()
+        play_downloaded(a)
+        try:
+            dump.sound_after(pressed, 30)
+        except TimeoutError:
+            failures.append("a downloaded song did not play while offline")
+        time.sleep(10)
+        if f.asked():
+            failures.append(f"asked while offline: {f.asked()}")
+        if sign_in_form(a) and not a.find(type="NavItem"):
+            failures.append("signed out before the backend said so")
+        if not kept_record(copy):
+            failures.append("what sign-in left was let go of before the backend said so")
+        told = switch_offline_off(a, copy)
+        try:
+            until(lambda: a.find(label="Sign in", role="Button") and not a.find(type="NavItem"), 30, 0.2, "the sign-in screen")
+            print(f"signed out {time.time() - told:.1f} s after Offline mode went off")
+        except TimeoutError:
+            failures.append("the backend said the session had ended, and the PC was not signed out")
+        if (kept_record(copy) or {}).get("session"):
+            failures.append(f"the session is still kept: {kept_record(copy)}")
+        if not downloaded(copy, ACCOUNT_STEM["tester"]):
+            failures.append("the downloads are gone")
+        copy.stop(keep=os.path.join(out, "app-output.txt"))
+        dump.stop()
+    log = copy.path("nexus.log")
+    if os.path.exists(log):
+        shutil.copy(log, os.path.join(out, "nexus.log"))
+    shutil.rmtree(os.path.join(A.HOMES, home), ignore_errors=True)
+    print(f"ended while offline: failures: {failures or 'none'}")
+    return 1 if failures else 0
+
+
+def scenario_count_offline():
+    """The music login's number risen while the PC is offline: what is on the PC plays;
+    when it is back, the backend's answer says the number has moved, the current login is
+    asked for once and put in place, and the music server takes it. Exits 1 if not."""
+    out = os.path.join(RUNS, "new-count-offline-scenario")
+    shutil.rmtree(out, ignore_errors=True)
+    os.makedirs(out)
+    failures = []
+    home = w7_home("count-offline", offline=True)
+    inside = f"/work/target/walk/{home}"
+    with front.Front("found", os.path.join(out, "front")) as f:
+        copy = A.Copy("new", home, env={"NEXUS_TEST_NEXUS_LOG": f"{inside}/nexus.log"})
+        dump = Dump(copy.dump)
+        a = copy.launch()
+        until(lambda: home_drawn(a), 60, 0.1, "Home")
+        f.hold(count=2)
+        pressed = time.time()
+        play_downloaded(a)
+        try:
+            dump.sound_after(pressed, 30)
+        except TimeoutError:
+            failures.append("a downloaded song did not play while offline")
+        time.sleep(5)
+        if f.asked():
+            failures.append(f"asked while offline: {f.asked()}")
+        switch_offline_off(a, copy)
+        try:
+            until(lambda: (kept_record(copy) or {}).get("music", {}).get("count") == 2, 40, 0.2, "the new music login kept")
+        except TimeoutError:
+            failures.append(f"the risen number was not followed: {kept_record(copy)}")
+        time.sleep(5)
+        if sign_in_form(a) and not a.find(type="NavItem"):
+            failures.append("signed out")
+        copy.stop(keep=os.path.join(out, "app-output.txt"))
+        dump.stop()
+        asks = [r for r in f.asked() if r.get("call") == "music-login"]
+    if len(asks) != 1:
+        failures.append(f"the music login was asked for {len(asks)} times, not once")
+    seed = token_of("tester-pass-1")
+    renewed = [r for r in music_requests(out) if "t=" in r[3] and f"t={seed}" not in r[3] and r[2] == "200"]
+    if not renewed:
+        failures.append("the music server never took the new login")
+    log = copy.path("nexus.log")
+    if os.path.exists(log):
+        shutil.copy(log, os.path.join(out, "nexus.log"))
+    shutil.rmtree(os.path.join(A.HOMES, home), ignore_errors=True)
+    print(f"number risen while offline: {len(asks)} asked, {len(renewed)} taken after; failures: {failures or 'none'}")
+    return 1 if failures else 0
+
+
 if __name__ == "__main__":
     what = sys.argv[1]
     if what == "populate":
@@ -1619,5 +1840,11 @@ if __name__ == "__main__":
         sys.exit(scenario_sign_out(sys.argv[2] if len(sys.argv) > 2 else "new"))
     elif what == "late-answer":
         sys.exit(scenario_late_answer(sys.argv[2] if len(sys.argv) > 2 else "new"))
+    elif what == "refused":
+        sys.exit(scenario_refused(sys.argv[2] if len(sys.argv) > 2 else "found"))
+    elif what == "ended-offline":
+        sys.exit(scenario_ended_offline())
+    elif what == "count-offline":
+        sys.exit(scenario_count_offline())
     else:
         raise SystemExit(__doc__)
