@@ -35,6 +35,7 @@ const REFUSED: Line = Line::Note(Note::OtherControllerRefused);
 fn report(record: Record) -> Report {
     Report {
         about: About {
+            pc: None,
             version: Version::parse("0.6.1").unwrap(),
             device: DeviceKind::Phone,
             os: Version::parse("17.0.0").unwrap(),
@@ -304,9 +305,14 @@ fn names_paths_addresses_keys_tokens_and_odd_characters_never_survive() {
     for line in raw {
         record.note_text(AT, line);
     }
-    for &(place, _) in PLACES {
+    let places = [
+        FaultPlace::Playback, FaultPlace::AudioOutput, FaultPlace::Library, FaultPlace::Downloads,
+        FaultPlace::Foreground, FaultPlace::MusicServer, FaultPlace::NexusServer,
+        FaultPlace::Journal, FaultPlace::Updates, FaultPlace::App,
+    ];
+    for place in places {
         for &(shape, _) in SHAPES {
-            let line = Line::Fault(Fault { place, shape });
+            let line = Line::Fault(Fault::new(place, shape));
             assert_eq!(clean_line(&line.to_string()), Some(line));
             if record.entries().len() < MAX_ENTRIES {
                 record.note(AT, line);
@@ -321,7 +327,7 @@ fn names_paths_addresses_keys_tokens_and_odd_characters_never_survive() {
     assert_eq!(uploaded.text(), shown);
     assert_eq!(
         report.record.entries().len(),
-        (1 + PLACES.len() * SHAPES.len()).min(MAX_ENTRIES)
+        (1 + places.len() * SHAPES.len()).min(MAX_ENTRIES)
     );
     for private in &raw[..raw.len() - 1] {
         assert!(!shown.contains(private));
@@ -452,7 +458,7 @@ fn journal_loss_totals_are_separate_and_cannot_age_out() {
 #[test]
 fn repeated_startup_timings_replace_one_line_and_leave_faults_visible() {
     let mut record = Record::default();
-    let fault = Line::Fault(Fault { place: FaultPlace::Foreground, shape: FaultShape::Refused });
+    let fault = Line::Fault(Fault::new(FaultPlace::Foreground, FaultShape::Refused));
     record.note(AT, fault);
     for ms in 0..500 {
         record.note(AT, Line::ForegroundAfterMs(ms));
@@ -502,12 +508,12 @@ fn panic_payloads_only_contribute_a_closed_shape() {
         let payload = format!("{message}: {path} for {name}\nBearer {token}");
         let classified = classify_rust_panic(&payload);
         assert_eq!(classified, shape);
-        record.note(AT, Line::Fault(Fault { place: FaultPlace::App, shape: classified }));
+        record.note(AT, Line::Fault(Fault::new(FaultPlace::App, classified)));
     }
     for empty in ["", " \n", "no message", "no payload"] {
         assert_eq!(classify_rust_panic(empty), NoPayload);
     }
-    record.note(AT, Line::Fault(Fault { place: FaultPlace::App, shape: NoPayload }));
+    record.note(AT, Line::Fault(Fault::new(FaultPlace::App, NoPayload)));
 
     let report = report(record);
     let text = report.text().unwrap();
@@ -547,4 +553,69 @@ fn a_far_future_attempt_cannot_block_diagnostics_after_clock_correction() {
     first_use.note_fault(corrected);
     assert_eq!(first_use.started_ms(), corrected);
     assert_eq!(first_use.due(corrected + FAULT_WAIT_MS, true, true), Some(Due::Fault));
+}
+
+#[test]
+fn a_panic_location_carries_only_the_known_basename_and_line() {
+    let root = r"C:\Users\ExampleLocal\Nexus";
+    let file = SourceFile::from_location(r"C:\Users\ExampleLocal\Nexus\src\controller.rs", root);
+    assert_eq!(file, SourceFile::Controller);
+    assert_eq!(
+        SourceFile::from_location(r"C:\Users\ExampleLocal\.cargo\registry\src\controller.rs", root),
+        SourceFile::Other,
+    );
+    let line = Line::Fault(Fault {
+        place: FaultPlace::App,
+        shape: FaultShape::BorrowConflict,
+        source: Some(Source { file, line: 728 }),
+    });
+    let text = line.to_string();
+    assert_eq!(text, "Fault in app: borrow conflict at controller.rs:728");
+    assert!(!text.contains("ExampleLocal"));
+    assert_eq!(clean_line(&text), Some(line));
+    assert_eq!(clean_line("Fault in app: panic at C:/Users/ExampleLocal/controller.rs:728"), None);
+}
+
+#[test]
+fn pc_report_round_trips_closed_output_and_settings_without_phone_fields() {
+    let mut report = report(Record::default());
+    report.about.device = DeviceKind::Pc;
+    report.about.android_auto = None;
+    report.about.local_permission = None;
+    for output in [
+        SoundOutput::Unknown,
+        SoundOutput::WaitingForExclusive,
+        SoundOutput::Shared { rate_hz: 48_000 },
+        SoundOutput::Exclusive { rate_hz: 44_100, bits: 24 },
+        SoundOutput::ExclusiveRefused { rate_hz: 48_000 },
+        SoundOutput::NoDevice,
+    ] {
+        report.about.pc = Some(PcDetails {
+            music_version: music_version("0.60.2 (C:\\Users\\Example unicode 岬 private@example.invalid)"),
+            unreachable: true,
+            output,
+            exclusive: true,
+            bitrate_kbps: 128,
+            gapless: true,
+            crossfade_ms: 2_500,
+            levelling: Some((Level::Quiet, LevelBy::Album)),
+            equaliser: true,
+            mono: false,
+            cache_limit_mb: 2048,
+            sharing: false,
+            requests: true,
+            library_songs: 500,
+            downloads: 15,
+            pending: 2,
+        });
+        let text = report.text().unwrap();
+        assert_eq!(Report::read(&text).unwrap(), report);
+        assert!(text.contains("Music server version: 0.60.2"));
+        for raw in ["Example", "private@", "Local network permission", "Android Auto"] {
+            assert!(!text.contains(raw), "{text}");
+        }
+        assert!(Report::read(&text.replace("Music server version: 0.60.2", "Music server version: 0.60.2 device-name")).is_err());
+    }
+    assert_eq!(music_version("https://1.2.3.example.invalid"), None);
+    assert_eq!(music_version("1.2.3 token"), None);
 }

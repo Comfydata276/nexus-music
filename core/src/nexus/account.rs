@@ -16,6 +16,8 @@ use crate::origin::{Address, AddressError, HandoverSource, MusicBase, Origin};
 use zeroize::Zeroizing;
 
 pub const SIGN_IN: &str = "/nexus/api/signin";
+// The design does not say how to spell the browser setup path.
+pub const SET_UP: &str = "/nexus/api/set-up";
 // the design does not say the spelling of the other paths. Each takes POST.
 pub const SIGN_OUT: &str = "/nexus/api/signout";
 pub const LIST_DEVICES: &str = "/nexus/api/devices";
@@ -26,7 +28,7 @@ pub const GRANT: &str = "/nexus/api/grant";
 /// Self-service listening-data deletion, implemented by S12.
 pub const DELETE_LISTENING_DATA: &str = "/nexus/api/delete-listening-data";
 pub const PATHS: &[&str] = &[
-    SIGN_IN, SIGN_OUT, LIST_DEVICES, FORCE_OUT, CHANGE_PASSWORD, MUSIC_LOGIN, GRANT, DELETE_LISTENING_DATA,
+    SIGN_IN, SET_UP, SIGN_OUT, LIST_DEVICES, FORCE_OUT, CHANGE_PASSWORD, MUSIC_LOGIN, GRANT, DELETE_LISTENING_DATA,
 ];
 
 pub const EMAIL_MAX_BYTES: usize = 254;
@@ -48,6 +50,7 @@ pub const SMALL_REPLY_MAX_BYTES: usize = 4 * 1024;
 pub const SIGN_IN_REPLY_MAX_BYTES: usize = 8 * 1024;
 pub const LIST_REPLY_MAX_BYTES: usize = BODY_MAX_BYTES;
 pub const PASSWORD_REQUEST_MAX_BYTES: usize = 4 * 1024;
+pub const SET_UP_MAX_BYTES: usize = PASSWORD_REQUEST_MAX_BYTES;
 // the design does not say the bound of a generic grant use. Allow the same 4 KiB
 // here because an admin can send both music addresses or login text in the change.
 pub const GRANTED_CHANGE_MAX_BYTES: usize = PASSWORD_REQUEST_MAX_BYTES;
@@ -74,9 +77,15 @@ pub fn tidy_email(text: &str) -> Option<String> {
     Some(text.to_ascii_lowercase())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct Email(String);
+
+impl fmt::Debug for Email {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Email(..)")
+    }
+}
 
 impl Email {
     pub fn new(text: &str) -> Option<Self> {
@@ -88,9 +97,15 @@ impl Email {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct Name(String);
+
+impl fmt::Debug for Name {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Name(..)")
+    }
+}
 
 impl Name {
     // the design does not say whether blank names or controls are allowed.
@@ -109,16 +124,15 @@ impl Name {
 /// A password for one check. All Unicode scalar values count as characters, including
 /// spaces. The caller drops this value after the check.
 pub struct Password {
-    bytes: Zeroizing<[u8; PASSWORD_MAX_BYTES]>,
+    // Fill the allocation in place so handing off the password moves only a pointer.
+    bytes: Box<Zeroizing<[u8; PASSWORD_MAX_BYTES]>>,
     len: usize,
 }
 
-fn padded(text: &str) -> Zeroizing<[u8; PASSWORD_MAX_BYTES]> {
-    let mut bytes = Zeroizing::new([0u8; PASSWORD_MAX_BYTES]);
+fn write_padded(bytes: &mut [u8; PASSWORD_MAX_BYTES], text: &str) {
     for (out, byte) in bytes.iter_mut().zip(text.bytes()) {
         *out = byte;
     }
-    bytes
 }
 
 // CtOutput compares every byte of a fixed-size RustCrypto array. Here it only
@@ -148,7 +162,9 @@ impl Password {
         if text.is_empty() || text.len() > PASSWORD_MAX_BYTES || text.chars().count() > PASSWORD_MAX_CHARS {
             return None;
         }
-        Some(Self { bytes: padded(text), len: text.len() })
+        let mut bytes = Box::new(Zeroizing::new([0u8; PASSWORD_MAX_BYTES]));
+        write_padded(&mut bytes, text);
+        Some(Self { bytes, len: text.len() })
     }
 
     fn meets_new_minimum(&self) -> bool {
@@ -171,17 +187,19 @@ impl Password {
         }
         // the design does not say how variations are treated. Reject case and outer
         // whitespace variations of the email and list entries. Keep the actual password exact.
-        fn folded(text: &str) -> Zeroizing<[u8; PASSWORD_MAX_BYTES]> {
-            let mut bytes = padded(text);
+        fn fold_into(bytes: &mut [u8; PASSWORD_MAX_BYTES], text: &str) {
+            write_padded(bytes, text);
             bytes.make_ascii_lowercase();
-            bytes
         }
 
         let spelling = self.expose().trim();
-        let candidate = folded(spelling);
+        let mut candidate = Zeroizing::new([0u8; PASSWORD_MAX_BYTES]);
+        fold_into(&mut candidate, spelling);
         let matches = |text: &str| {
             let text = text.trim();
-            same_bytes::<U512>(candidate.as_ref(), folded(text).as_ref())
+            let mut comparison = Zeroizing::new([0u8; PASSWORD_MAX_BYTES]);
+            fold_into(&mut comparison, text);
+            same_bytes::<U512>(candidate.as_ref(), comparison.as_ref())
                 & same_bytes::<U8>(&(spelling.len() as u64).to_be_bytes(), &(text.len() as u64).to_be_bytes())
         };
         let blocked = common_passwords.lines().fold(matches(email.as_str()), |blocked, line| blocked | matches(line));
@@ -191,7 +209,7 @@ impl Password {
 
 impl PartialEq for Password {
     fn eq(&self, other: &Self) -> bool {
-        same_bytes::<U512>(self.bytes.as_ref(), other.bytes.as_ref())
+        same_bytes::<U512>(&self.bytes[..], &other.bytes[..])
             & same_bytes::<U8>(&(self.len as u64).to_be_bytes(), &(other.len as u64).to_be_bytes())
     }
 }
@@ -379,6 +397,24 @@ macro_rules! text_secret {
 }
 
 impl OneTimeCode {
+    /// Read a code as a person types it: in groups, with ASCII spaces or dashes between
+    /// ("ABCD-EFGH-JKMN", "abcd efgh jkmn"). Those are taken out, and what is left is read by
+    /// [`OneTimeCode::new`]: exactly twelve, case and Crockford's I, L and O as there. Nothing
+    /// else is taken out: another kind of space or a look-alike letter is refused. The wire
+    /// form is always the twelve alone.
+    pub fn typed(text: &str) -> Option<Self> {
+        let mut kept = Zeroizing::new([0u8; CODE_LENGTH]);
+        let mut length = 0usize;
+        for byte in text.bytes().filter(|byte| !matches!(byte, b' ' | b'-')) {
+            *kept.get_mut(length)? = byte;
+            length += 1;
+        }
+        if length != CODE_LENGTH {
+            return None;
+        }
+        Self::new(std::str::from_utf8(kept.as_ref()).ok()?)
+    }
+
     /// Read a typed code and normalize Crockford's case and ambiguous spellings.
     pub fn new(text: &str) -> Option<Self> {
         if text.len() != CODE_LENGTH {
@@ -885,6 +921,77 @@ impl RefusedWithReceipt {
     }
 }
 
+/// The page sends this once to set up the first admin. S8 checks the configured
+/// origin, the locally issued code, and the new password against its policy.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct SetUp {
+    pub code: OneTimeCode,
+    pub email: Email,
+    pub name: Name,
+    pub password: Password,
+}
+
+impl wire::Value for SetUp {
+    fn read(raw: &RawValue) -> Result<Self, BadMessage> {
+        let fields = Fields::read(raw)?;
+        Ok(Self {
+            code: fields.get("code")?,
+            email: fields.get("email")?,
+            name: fields.get("name")?,
+            password: read_text(fields.0.get("password").ok_or(BadMessage::Form)?, Password::new)?,
+        })
+    }
+
+    fn check(&self) -> Result<(), BadMessage> {
+        self.password.check_new_length()
+    }
+}
+
+/// Set-up creates a person and does not sign the browser in.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SetUpReply {
+    Done { result: Person },
+    Refused(Refusal),
+}
+
+impl SetUpReply {
+    pub fn status(&self) -> u16 {
+        match self {
+            Self::Done { .. } => DONE_STATUS,
+            Self::Refused(reason) => reason.status(),
+        }
+    }
+
+    pub fn read(status: u16, body: &[u8]) -> Result<Self, BadMessage> {
+        let reply: Self = read(body)?;
+        if reply.status() != status {
+            return Err(BadMessage::Status(status));
+        }
+        Ok(reply)
+    }
+}
+
+impl wire::Value for SetUpReply {
+    fn read(raw: &RawValue) -> Result<Self, BadMessage> {
+        let root = Fields::read(raw)?;
+        if root.0.contains_key("receipt") || root.0.contains_key("refused_with_receipt") {
+            return Err(BadMessage::Form);
+        }
+        match root.select(&["done", "refused"])? {
+            ("done", raw) => {
+                let fields = Fields::read(raw)?;
+                if fields.0.contains_key("receipt") {
+                    return Err(BadMessage::Form);
+                }
+                Ok(Self::Done { result: fields.get("result")? })
+            }
+            ("refused", raw) => Ok(Self::Refused(Refusal::read(raw)?)),
+            _ => Err(BadMessage::Form),
+        }
+    }
+}
+
 pub type SignInReply = Reply<SignInAnswer>;
 pub type SignOutReply = Reply<SignedOut>;
 pub type ListDevicesReply = Reply<DevicePage>;
@@ -1135,6 +1242,8 @@ macro_rules! request_bound {
 }
 
 request_bound!(PASSWORD_REQUEST_MAX_BYTES: SignIn, ChangePassword);
+request_bound!(SET_UP_MAX_BYTES: SetUp);
+request_bound!(SMALL_REPLY_MAX_BYTES: SetUpReply);
 request_bound!(SMALL_REQUEST_MAX_BYTES: SignOut, ListDevices, ForceOut, GetMusicLogin);
 request_bound!(SMALL_REPLY_MAX_BYTES: MusicLogin);
 
@@ -1158,8 +1267,8 @@ impl<T: ReplyResult> wire::Message for Reply<T> {
 }
 
 
-// Password work uses one reserved worker per door. The server owns the worker,
-// queue, and account reservations. No rate state contains a password or a code.
+// Password work uses two workers. Verified codes share the known-device worker.
+// The server owns the workers, queues and account reservations.
 pub const OTHER_PASSWORDS_WAITING: usize = 8;
 pub const PASSWORD_QUEUE_MS: u64 = 10_000;
 pub const FIRST_PASSWORD_WAIT_MS: u64 = 1_000;
@@ -1173,6 +1282,8 @@ const SECOND_MS: u64 = 1_000;
 pub enum PasswordDoor {
     KnownDevice,
     Other,
+    /// Make a new verifier after the caller independently verifies a live code.
+    RedeemedCode,
 }
 
 impl PasswordDoor {
@@ -1230,9 +1341,8 @@ pub fn admit_password_check(
         return PasswordAdmission::ComeBack(wait);
     }
     match door {
-        PasswordDoor::KnownDevice => {
-            // the design does not say how much the known door holds while occupied.
-            // Keep no queue there. Busy is a retry, and the other door has no effect.
+        PasswordDoor::KnownDevice | PasswordDoor::RedeemedCode => {
+            // The reserved worker keeps no queue. The other worker has no effect.
             if load.worker_busy || load.account_busy {
                 PasswordAdmission::Busy
             } else {
@@ -1295,6 +1405,7 @@ impl PasswordWaitKey {
         let device = match door {
             PasswordDoor::KnownDevice => Some(device?),
             PasswordDoor::Other => None,
+            PasswordDoor::RedeemedCode => return None,
         };
         Some(Self { email: email.clone(), device })
     }
@@ -1352,7 +1463,7 @@ impl PasswordWaits {
 }
 
 /// The fast code check has its own rolling window. Issuing the new password
-/// verifier after a valid code still uses the server's fixed password workers.
+/// verifier after a valid code uses the known-device worker without password backoff.
 #[derive(Default)]
 pub struct CodeLimit {
     seen: VecDeque<u64>,

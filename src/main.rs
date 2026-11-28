@@ -10,6 +10,7 @@ mod config;
 mod controller;
 mod corehttp;
 mod covers;
+mod diagnostics;
 mod discover;
 mod downloads;
 mod import;
@@ -75,37 +76,12 @@ fn apply_interface_size() {
     unsafe { std::env::set_var("SLINT_SCALE_FACTOR", format!("{factor:.3}")) };
 }
 
-/// Has anything that brings the app down written down what it was first. A release build has
-/// no window to print to and simply vanishes; this leaves a note of why, which "Save
-/// diagnostics" in Settings includes.
-fn keep_a_crash_log() {
-    let log = config::Paths::new().crash_log;
-    std::panic::set_hook(Box::new(move |panic| {
-        use std::io::Write;
-        let what = panic.payload().downcast_ref::<&str>().map(|text| text.to_string()).or_else(|| panic.payload().downcast_ref::<String>().cloned());
-        let place = panic.location().map(|at| format!("{}:{}", at.file(), at.line())).unwrap_or_default();
-        let thread = std::thread::current().name().unwrap_or("unnamed").to_string();
-        if let Some(folder) = log.parent() {
-            let _ = std::fs::create_dir_all(folder);
-        }
-        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&log) {
-            let _ = writeln!(
-                file,
-                "{} version {} thread {thread} at {place}: {}",
-                chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
-                env!("CARGO_PKG_VERSION"),
-                what.unwrap_or_else(|| "no message".into())
-            );
-        }
-    }));
-}
-
 fn main() -> Result<(), slint::PlatformError> {
     // Started as one look of the Nexus server's component: that, and nothing of the app.
     if let Some(code) = nexus::probe_mode() {
         std::process::exit(code);
     }
-    keep_a_crash_log();
+    diagnostics::install_panic_hook();
     // Opening the app a second time shows the copy that's already running.
     #[cfg(windows)]
     if !instance::claim() {
@@ -114,6 +90,7 @@ fn main() -> Result<(), slint::PlatformError> {
     apply_interface_size();
     let window = ui::MainWindow::new()?;
     let controller = controller::Controller::install(window);
+    diagnostics::install(&controller.ui);
     // After the controller is made (and a saved sign-in entered), never by it; and only when
     // it is switched on (NEXUS_MUSIC_NEXUS=1).
     if nexus::switched_on() {
@@ -130,6 +107,7 @@ fn main() -> Result<(), slint::PlatformError> {
     controller.downloads.borrow_mut().save_if_due(true);
     // The queue is written by a thread of its own: wait for it to finish.
     controller.saver.flush();
+    diagnostics::finish();
     // A look of the Nexus server's component still running is ended (at most two seconds).
     if nexus::switched_on() {
         nexus::shutdown();

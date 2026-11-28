@@ -1,0 +1,190 @@
+//! Clean Diagnostics reports (design 14). The upload reader only yields text that
+//! round-trips through the core's closed Report. No request or transport data is stored.
+
+use std::fmt::Write as _;
+
+use axum::body::{Body, Bytes};
+use axum::extract::State;
+use axum::http::{HeaderMap, Response};
+use nexus_core::nexus::account::{self, DeviceId, ListDevices, Refusal, Reply};
+use nexus_core::nexus::diag::{self, MAX_AGE_MS, MIN_GAP_MS, STORED_REPORTS, Upload, Uploaded};
+use nexus_core::nexus::kept::{Access, SessionKind};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
+
+use crate::accounts::session::refused;
+use crate::store::keeper::Keeper;
+use crate::events::{
+    Calls, UploadLimit, admit_upload, answer, arrive, authenticated, bearer, denied, finish,
+    inspect_session, list_response, receipt, respond, result, signed_in, sql, unavailable,
+};
+
+pub const SEND_PATH: &str = diag::SEND_PATH;
+pub const LIST_PATH: &str = "/nexus/api/diag/list";
+pub const ADMIN_PATH: &str = "/nexus/api/admin/diagnostics";
+pub const LIST_PAGE: usize = 50;
+
+pub(crate) async fn send(State(calls): State<Calls>, headers: HeaderMap, body: Bytes) -> Response<Body> {
+    let outcome = async {
+        let hash = bearer(&calls, &headers)?;
+        let permit = admit_upload(&calls, &hash, UploadLimit::Device, &body).await?;
+        let (permit, upload) = tokio::task::spawn_blocking(move || {
+            let upload = Upload::read(&body).map_err(|_| Refusal::Malformed)?;
+            Ok::<_, Refusal>((permit, upload))
+        }).await.map_err(unavailable)??;
+        let clock = calls.accounts.clock.clone();
+        answer(calls.accounts.desk.ask(move |keeper| {
+            let now = clock();
+            let (number, device, mut account) = signed_in(keeper, &upload.head, &hash)?;
+            permit.check(number, device)?;
+            let at = keeper.clock(now).effective();
+            if let Err(reason) = check_gap(keeper, device, at) {
+                inspect_session(keeper, &mut account, device, &hash, now)?;
+                return Err(reason);
+            }
+            arrive(keeper, &upload.head, &hash, device, &mut account, Access::Write, now)?;
+            let matches = keeper.write_data(now, |tx| keep(tx, number, device, upload, at))
+                .map_err(unavailable)?;
+            if !matches {
+                return Err(Refusal::Malformed);
+            }
+            result(Reply::Done { result: Uploaded {}, receipt: receipt(keeper, account.state())? }, diag::write_reply)
+        }).await)
+    }.await;
+    finish(outcome)
+}
+
+pub(crate) fn check_gap(keeper: &Keeper, device: DeviceId, now: u64) -> Result<(), Refusal> {
+    let device = sql(device.get()).map_err(unavailable)?;
+    let last: Option<i64> = keeper.data().connection().query_row(
+        "SELECT received_ms FROM diagnostic_reports WHERE device = ?1 ORDER BY row_id DESC LIMIT 1",
+        [device],
+        |row| row.get(0),
+    ).optional().map_err(unavailable)?;
+    let wait = last.map_or(0, |received| MIN_GAP_MS.saturating_sub(now.saturating_sub(received as u64)));
+    if wait == 0 {
+        Ok(())
+    } else {
+        Err(Refusal::Busy { retry_after_seconds: account::Wait::new(wait.div_ceil(1000)) })
+    }
+}
+
+fn keep(tx: &Transaction<'_>, account: u64, device: DeviceId, upload: Upload, now: u64) -> rusqlite::Result<(bool, bool)> {
+    let restore = sql(upload.head.restore)?;
+    let device = sql(device.get())?;
+    let request = upload.request_id.get().to_be_bytes();
+    let existing = tx.query_row(
+        "SELECT text = ?4 FROM diagnostic_reports
+         WHERE device = ?1 AND restore = ?2 AND request_id = ?3",
+        params![device, restore, request, upload.text()],
+        |row| row.get::<_, bool>(0),
+    ).optional()?;
+    if let Some(matches) = existing {
+        return Ok((matches, false));
+    }
+    tx.execute(
+        "INSERT INTO diagnostic_reports(account, device, restore, request_id, received_ms, text)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![sql(account)?, device, restore, request, sql(now)?, upload.text()],
+    )?;
+    let mut recent = tx.prepare(
+        "SELECT row_id, received_ms FROM diagnostic_reports WHERE device = ?1
+         ORDER BY row_id DESC LIMIT ?2",
+    )?;
+    let rows = recent.query_map(params![device, (STORED_REPORTS + 1) as i64], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+    })?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let times: Vec<_> = rows.iter().map(|&(_, received)| received as u64).collect();
+    let mut retained = diag::reports_to_keep(&times, now).peekable();
+    let mut remove = tx.prepare("DELETE FROM diagnostic_reports WHERE row_id = ?1")?;
+    for (index, &(id, _)) in rows.iter().enumerate() {
+        if retained.next_if_eq(&index).is_none() {
+            remove.execute([id])?;
+        }
+    }
+    Ok((true, true))
+}
+
+/// Device numbers and server receipt times for the signed-in account.
+/// The text never goes back through an app call (14.5).
+pub(crate) async fn list(State(calls): State<Calls>, headers: HeaderMap, body: Bytes) -> Response<Body> {
+    read_page(calls, headers, body, false).await
+}
+
+/// Admin's browser page, one report at a time. The read has no target account
+/// supplied by the caller, and the authorization comes from the live admin role.
+pub(crate) async fn admin(State(calls): State<Calls>, headers: HeaderMap, body: Bytes) -> Response<Body> {
+    read_page(calls, headers, body, true).await
+}
+
+async fn read_page(calls: Calls, headers: HeaderMap, body: Bytes, admin: bool) -> Response<Body> {
+    let outcome = async {
+        let hash = bearer(&calls, &headers)?;
+        if admin && !crate::admin::is_browser(&headers) {
+            return Err(denied());
+        }
+        let request = account::read::<ListDevices>(&body).map_err(|_| Refusal::Malformed)?;
+        let clock = calls.accounts.clock.clone();
+        let (page, stamp) = answer(calls.accounts.desk.ask(move |keeper| {
+            let now = clock();
+            let (number, _, account, kind) = authenticated(keeper, &request.head, &hash, Access::Read, now)?;
+            if admin && (kind != SessionKind::AdminPage || !account.state().admin) {
+                return Err(denied());
+            }
+            let at = keeper.clock(now).effective();
+            let db = keeper.data().connection();
+            let page = page(db, if admin { None } else { Some(number) }, request.after, at).map_err(unavailable)?;
+            Ok((page, receipt(keeper, account.state())?))
+        }).await)?;
+        list_response(page, stamp)
+    }.await;
+    outcome.unwrap_or_else(|reason| respond(refused(reason)))
+}
+
+fn page(db: &Connection, owner: Option<u64>, after: Option<DeviceId>, now: u64) -> rusqlite::Result<String> {
+    let after = after.map_or(Ok(i64::MAX), |id| sql(id.get()))?;
+    let cutoff = sql(now.saturating_sub(MAX_AGE_MS))?;
+    let now = sql(now)?;
+    let mut page = String::from(r#"{"reports":["#);
+    let mut next = None;
+    if let Some(owner) = owner {
+        let mut query = db.prepare(
+            "SELECT row_id, device, received_ms FROM diagnostic_reports
+             WHERE account = ?1 AND row_id < ?2 AND received_ms BETWEEN ?3 AND ?4
+             ORDER BY row_id DESC LIMIT ?5",
+        )?;
+        let mut rows = query.query(params![sql(owner)?, after, cutoff, now, (LIST_PAGE + 1) as i64])?;
+        for index in 0..LIST_PAGE {
+            let Some(row) = rows.next()? else { break };
+            let id: i64 = row.get(0)?;
+            let device: i64 = row.get(1)?;
+            let time: i64 = row.get(2)?;
+            if index != 0 {
+                page.push(',');
+            }
+            let _ = write!(page, r#"{{"id":{id},"device":{device},"received_ms":{time}}}"#);
+            if index + 1 == LIST_PAGE && rows.next()?.is_some() {
+                next = Some(id);
+            }
+        }
+    } else {
+        let mut query = db.prepare(
+            "SELECT row_id, account, device, received_ms, json_quote(text) FROM diagnostic_reports
+             WHERE row_id < ?1 AND received_ms BETWEEN ?2 AND ?3 ORDER BY row_id DESC LIMIT 2",
+        )?;
+        let mut rows = query.query(params![after, cutoff, now])?;
+        if let Some(row) = rows.next()? {
+            let id: i64 = row.get(0)?;
+            let owner: i64 = row.get(1)?;
+            let device: i64 = row.get(2)?;
+            let time: i64 = row.get(3)?;
+            let text: String = row.get(4)?;
+            let _ = write!(page, r#"{{"id":{id},"account":{owner},"device":{device},"received_ms":{time},"text":{text}}}"#);
+            if rows.next()?.is_some() {
+                next = Some(id);
+            }
+        }
+    }
+    let next = next.map_or_else(|| "null".into(), |id| id.to_string());
+    let _ = write!(page, r#"],"next":{next}}}"#);
+    Ok(page)
+}

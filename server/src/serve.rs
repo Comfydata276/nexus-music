@@ -60,7 +60,7 @@ use tokio::time::Sleep;
 use tower::ServiceExt;
 
 use crate::bounds::*;
-use crate::head::{self, NoHead, Verdict};
+use crate::head::{self, NoHead, Route, Verdict};
 
 /// Who opened a connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,24 +131,37 @@ const REFUSALS: [(Refusal, &str); 16] = [
 pub struct Shell {
     proxy: IpAddr,
     router: Router,
-    routes: Vec<(&'static str, &'static str)>,
+    routes: Vec<Route>,
     open: AtomicUsize,
     refused: [AtomicU64; REFUSALS.len()],
 }
 
 impl Shell {
-    /// The backend's own: [`router`] and [`head::ROUTES`].
+    /// `hello`, the admin's document and the sign-in stub (S1, S10a): [`router`].
     pub fn new(proxy: IpAddr, hello: &Hello) -> Arc<Self> {
         Self::new_with_public_origin(proxy, hello, None)
     }
 
+    /// As [`Shell::new`], with the admin's page's own origin (S10a's tests).
     pub fn new_with_public_origin(proxy: IpAddr, hello: &Hello, public_origin: Option<&str>) -> Arc<Self> {
-        Self::with_routes(proxy, router_with_public_origin(hello, public_origin), head::ROUTES.to_vec())
+        let stub = [proto::HELLO, crate::admin::PAGE, crate::admin::SIGN_IN];
+        let routes = head::ROUTES.iter().copied().filter(|route| stub.contains(&route.path)).collect();
+        Self::with_routes(proxy, router_with_public_origin(hello, public_origin), routes)
+    }
+
+    /// The backend's own: `hello`, the admin's document, and signing in and everything a
+    /// session does (S8), at [`head::ROUTES`]. The page's calls with no session are taken
+    /// only from `public_origin` (`NEXUS_PUBLIC_ORIGIN`). The validated data budget caps event intake.
+    pub fn backend(proxy: IpAddr, hello: &Hello, accounts: Arc<crate::accounts::session::Accounts>, public_origin: Option<&str>, data_budget: u64) -> Arc<Self> {
+        let public_origin = public_origin.map(Arc::<str>::from);
+        let router = crate::accounts::routes::router(base_router(hello), accounts.clone(), public_origin.clone());
+        let router = crate::events::router(router, accounts, public_origin, data_budget);
+        Self::with_routes(proxy, router, head::ROUTES.to_vec())
     }
 
     /// With other routes (the tests add some): `routes` names each path `router` answers, and
     /// the one method it answers there.
-    pub fn with_routes(proxy: IpAddr, router: Router, routes: Vec<(&'static str, &'static str)>) -> Arc<Self> {
+    pub fn with_routes(proxy: IpAddr, router: Router, routes: Vec<Route>) -> Arc<Self> {
         Arc::new(Shell { proxy: proxy.to_canonical(), router, routes, open: AtomicUsize::new(0), refused: Default::default() })
     }
 
@@ -201,6 +214,21 @@ fn router_with_public_origin(hello: &Hello, public_origin: Option<&str>) -> Rout
             let public_origin = public_origin.clone();
             async move { crate::admin::signin(headers, public_origin.as_deref()) }
         }))
+        .fallback(|| async { StatusCode::NOT_FOUND })
+}
+
+/// `hello` and the admin's document, with no sign-in: what S8's calls are added to.
+fn base_router(hello: &Hello) -> Router {
+    let body = Bytes::from(hello.to_json());
+    Router::new()
+        .route(
+            proto::HELLO,
+            get(move || {
+                let body = body.clone();
+                async move { ([(CONTENT_TYPE, "application/json")], body) }
+            }),
+        )
+        .route(crate::admin::PAGE, get(crate::admin::document))
         .fallback(|| async { StatusCode::NOT_FOUND })
 }
 

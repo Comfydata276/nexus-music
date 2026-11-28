@@ -1,0 +1,217 @@
+//! The accounts' own sequences, on the [`bench`](super::bench): a clock the test turns, and
+//! the real keeper, writer and workers. Each test names the finding or rule it pins.
+
+use nexus_core::nexus::account::{self, NotSignedIn, Refusal, RequestId, SESSION_IDLE_MS, SignOut, SignOutNote, SignOutSecret, SignedOut};
+
+use super::bench::{self, Bench};
+
+const PASSWORD: &str = "a made-up password for the bench";
+
+/// B1 (the review of S8): a note naming a session that has passed its idle deadline, with a
+/// secret that is not that session's, is told "that session has ended" with no receipt, and
+/// so is the right note: the same bytes, nothing of the account.
+#[test]
+fn a_note_is_told_nothing_of_the_account_whatever_comes_of_it() {
+    let (bench, made) = Bench::new("note", &[("note@example.test", false), ("other@example.test", false)]);
+    let first = bench::signed_in(&bench.sign_in(bench::with_code(&made[0].code, PASSWORD), 1));
+    bench::signed_in(&bench.sign_in(bench::with_code(&made[1].code, PASSWORD), 2));
+    let note = |note: SignOutNote, request: u64| SignOut { head: bench::head(first.restore), request_id: RequestId::new(request).unwrap(), revoke: Some(note) };
+
+    // The first session goes idle past its deadline; its row is still there. The other
+    // account signs in afresh: its session is live.
+    bench.advance(SESSION_IDLE_MS + 1);
+    let second = bench::signed_in(&bench.sign_in(bench::with_password(made[1].email, PASSWORD), 3));
+    let forged = SignOutNote { session: first.sign_out.session, secret: SignOutSecret::from_bytes([0x5a; 32]) };
+    let wrong = bench.runtime.block_on(bench.accounts.sign_out(None, note(forged, 1)));
+    assert_eq!(wrong.status, 401);
+    let reply = account::read_reply::<SignedOut>(wrong.status, wrong.body.bytes()).unwrap();
+    assert_eq!(bench::refusal(reply), Refusal::NotSignedIn(NotSignedIn::SessionEnded));
+
+    // The right note for the other account's live session: the very same bytes.
+    let right = bench.runtime.block_on(bench.accounts.sign_out(None, note(second.sign_out, 2)));
+    assert_eq!((right.status, right.body.bytes()), (wrong.status, wrong.body.bytes()));
+    let list = account::ListDevices { head: bench::head(first.restore), after: None };
+    assert_eq!(bench.runtime.block_on(bench.accounts.devices(second.session, list)).status, 401, "the right note ended its session");
+    // A note for a session there never was: the same again.
+    let none = SignOutNote { session: account::SessionId::new(9_999).unwrap(), secret: SignOutSecret::from_bytes([1; 32]) };
+    let nothing = bench.runtime.block_on(bench.accounts.sign_out(None, note(none, 3)));
+    assert_eq!((nothing.status, nothing.body.bytes()), (wrong.status, wrong.body.bytes()));
+}
+
+fn change(bench: &Bench, session: &account::Session, restore: u64, request: u64, current: &str, new: &str) -> u16 {
+    let request = account::ChangePassword {
+        head: bench::head(restore),
+        request_id: RequestId::new(request).unwrap(),
+        current_password: account::Password::presented(current).unwrap(),
+        new_password: account::Password::new(new).unwrap(),
+    };
+    let copy = account::Session::from_bytes(*session.expose_bytes());
+    bench.runtime.block_on(bench.accounts.change_password(copy, request)).status
+}
+
+fn lists(bench: &Bench, session: &account::Session, restore: u64) -> u16 {
+    let copy = account::Session::from_bytes(*session.expose_bytes());
+    bench.runtime.block_on(bench.accounts.devices(copy, account::ListDevices { head: bench::head(restore), after: None })).status
+}
+
+/// B2 (the review of S8): a password "changed" to the one already set is refused as malformed,
+/// however often it is sent, and never ends another session; a real change sent again after
+/// another device has signed in with the new password ends nothing.
+#[test]
+fn a_change_to_the_same_password_is_refused_and_a_retried_change_ends_no_new_session() {
+    const NEW: &str = "another made-up password for the bench";
+    let (bench, made) = Bench::new("same-password", &[("same@example.test", false)]);
+    let a = bench::signed_in(&bench.sign_in(bench::with_code(&made[0].code, PASSWORD), 1));
+    let b = bench::signed_in(&bench.sign_in(bench::with_password(made[0].email, PASSWORD), 2));
+    for _ in 0..2 {
+        assert_eq!(change(&bench, &a.session, a.restore, 7, PASSWORD, PASSWORD), 400);
+        assert_eq!(lists(&bench, &b.session, b.restore), 200, "a refused change ends no session");
+    }
+    // A real change: every other session ends. The other device signs in with the new one.
+    assert_eq!(change(&bench, &a.session, a.restore, 8, PASSWORD, NEW), 200);
+    assert_eq!(lists(&bench, &b.session, b.restore), 401);
+    bench.advance(2_000);
+    let c = bench::signed_in(&bench.sign_in(bench::with_password(made[0].email, NEW), 2));
+    // The first call sent again: its present password is no longer the present one.
+    assert_eq!(change(&bench, &a.session, a.restore, 8, PASSWORD, NEW), 403);
+    assert_eq!(lists(&bench, &c.session, c.restore), 200, "the retried change ended a session made after it");
+}
+
+/// C1 (the review of S8): while strangers flood sign-in (new devices, made-up emails), a device
+/// the backend has seen signs in, and a recovery code is redeemed, each at the first try: the
+/// strangers fill only their own lane of the line, and are told "busy, come back in a second".
+#[test]
+fn a_known_device_and_a_recovery_code_get_through_a_flood_of_strangers() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let (bench, made) = Bench::new("flood", &[("known@example.test", false), ("recover@example.test", true)]);
+    bench::signed_in(&bench.sign_in(bench::with_code(&made[0].code, PASSWORD), 1));
+    bench.advance(2_000);
+    let stop = Arc::new(AtomicBool::new(false));
+    let busy = Arc::new(AtomicUsize::new(0));
+    let asked = Arc::new(AtomicUsize::new(0));
+    let mut flood = Vec::new();
+    for n in 0..256u32 {
+        let (accounts, stop, busy, asked) = (bench.accounts.clone(), stop.clone(), busy.clone(), asked.clone());
+        flood.push(bench.runtime.spawn(async move {
+            let mut round = 0u32;
+            while !stop.load(Ordering::SeqCst) {
+                round += 1;
+                let email = format!("stranger{n}-{round}@example.test");
+                let mut request = bench::sign_in(bench::with_password(&email, "not anyone's password at all"), 0);
+                let mut secret = [0x77u8; 32];
+                secret[..4].copy_from_slice(&n.to_be_bytes());
+                secret[4..8].copy_from_slice(&round.to_be_bytes());
+                request.device_secret = account::DeviceSecret::from_bytes(secret);
+                let answer = accounts.sign_in(request, false).await;
+                asked.fetch_add(1, Ordering::SeqCst);
+                if answer.status == 429 {
+                    busy.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            }
+        }));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let known = bench.sign_in(bench::with_password(made[0].email, PASSWORD), 1);
+    let recovered = bench.sign_in(bench::with_code(&made[1].code, PASSWORD), 9);
+    stop.store(true, Ordering::SeqCst);
+    for task in flood {
+        bench.runtime.block_on(task).unwrap();
+    }
+    assert!(busy.load(Ordering::SeqCst) > 0, "the flood never filled its lane ({} asked)", asked.load(Ordering::SeqCst));
+    assert_eq!(known.status, 200, "the known device was not let through: {:?}", account::read_reply::<account::SignedIn>(known.status, known.body.bytes()));
+    assert_eq!(recovered.status, 200, "the recovery code was not let through: {:?}", account::read_reply::<account::SignedIn>(recovered.status, recovered.body.bytes()));
+}
+
+/// A1 (the review of S8): a code seen as expired stays expired when the clock is then set back
+/// across its deadline.
+#[test]
+fn a_code_seen_expired_stays_expired_through_a_clock_set_back() {
+    let (bench, made) = Bench::new("expired", &[("late@example.test", false)]);
+    let until = bench::START + account::CODE_LIFETIME_MS;
+    bench.set(until);
+    assert_eq!(bench.sign_in(bench::with_code(&made[0].code, PASSWORD), 1).status, 403);
+    bench.set(until - 60_000);
+    let again = bench.sign_in(bench::with_code(&made[0].code, PASSWORD), 1);
+    assert_eq!(again.status, 403, "the code was good again after the clock went back");
+}
+
+/// B3 (the review of S8): a redemption whose account changes while the new password's
+/// fingerprint is made (here its revision moves, as a role change moves it) does not sign in;
+/// and of two redemptions of one code at once, at most one does.
+#[test]
+fn a_redemption_is_fenced_by_a_change_made_during_its_slow_work_and_a_code_is_redeemed_once() {
+    use nexus_core::nexus::kept::{DataChange, Effects, Update};
+    let (bench, made) = Bench::new("redeem-fence", &[("fence@example.test", false), ("twice@example.test", false)]);
+    let number = made[0].number;
+    let desk = &bench.accounts.desk;
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let accounts = bench.accounts.clone();
+    let code = account::OneTimeCode::new(made[0].code.expose()).unwrap();
+    bench.runtime.block_on(async {
+        // Hold the thread that writes; the redemption's first step waits behind it, and the
+        // revision's change behind that.
+        let holding = tokio::spawn({
+            let accounts = accounts.clone();
+            async move { accounts.desk.ask(move |_| held.recv().ok()).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let redeeming = tokio::spawn({
+            let accounts = accounts.clone();
+            async move { accounts.sign_in(bench::sign_in(bench::with_code(&code, PASSWORD), 1), false).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let changing = desk.ask(move |keeper| {
+            let account = keeper.load(number).unwrap();
+            let mut moved = account.apart();
+            moved.account.revision += 1;
+            let mut rows = account.rows();
+            rows.account = moved.account.clone();
+            let effects = Effects { high_water: bench::START, updates: vec![Update { apart_first: moved.clone(), data: rows, change: DataChange::Keep, music: None, apart_last: moved }] };
+            keeper.persist(&effects, &[], bench::START).unwrap();
+        });
+        release.send(()).unwrap();
+        changing.await.unwrap();
+        holding.await.unwrap().unwrap();
+        let answer = redeeming.await.unwrap();
+        assert_ne!(answer.status, 200, "signed in under the revision before the change");
+    });
+    // Two at once, from two devices: one at most.
+    let first = account::OneTimeCode::new(made[1].code.expose()).unwrap();
+    let second = account::OneTimeCode::new(made[1].code.expose()).unwrap();
+    let (a, b) = bench.runtime.block_on(async {
+        let one = tokio::spawn({
+            let accounts = accounts.clone();
+            async move { accounts.sign_in(bench::sign_in(bench::with_code(&first, PASSWORD), 2), false).await.status }
+        });
+        let two = tokio::spawn({
+            let accounts = accounts.clone();
+            async move { accounts.sign_in(bench::sign_in(bench::with_code(&second, PASSWORD), 3), false).await.status }
+        });
+        (one.await.unwrap(), two.await.unwrap())
+    });
+    assert_eq!([a, b].iter().filter(|status| **status == 200).count(), 1, "{a} {b}");
+}
+
+/// C5 (the review of S8) and M2 (the lead's ruling of 14:41): an account that is not an
+/// admin's, with its right password, at the admin's page (whose own origin and marker are the
+/// door's, `routes`), gets exactly the answer of a wrong password, and the try is recorded as a
+/// wrong one: the next, at once, is told to come back.
+#[test]
+fn a_correct_password_of_an_account_not_an_admin_s_at_the_page_is_a_wrong_password() {
+    let (bench, made) = Bench::new("page-not-admin", &[("member@example.test", false), ("other@example.test", false)]);
+    bench::signed_in(&bench.sign_in(bench::with_code(&made[0].code, PASSWORD), 1));
+    bench::signed_in(&bench.sign_in(bench::with_code(&made[1].code, PASSWORD), 3));
+    bench.advance(2_000);
+    let page = |email: &str, password: &str| bench.runtime.block_on(bench.accounts.sign_in(bench::sign_in(bench::with_password(email, password), 2), true));
+    // The same answer, byte for byte, as a wrong password at the page (another account's, so
+    // that the two waits are apart).
+    let wrong = page(made[1].email, "not the password at all, a guess");
+    let right = page(made[0].email, PASSWORD);
+    assert_eq!(right.status, 403);
+    assert_eq!((right.status, right.body.bytes()), (wrong.status, wrong.body.bytes()));
+    // Recorded as a wrong try: the next is told to come back, even with the right password.
+    let next = page(made[0].email, PASSWORD);
+    assert_eq!(next.status, 429, "the page's refusal of a non-admin was not recorded as a wrong try");
+}
