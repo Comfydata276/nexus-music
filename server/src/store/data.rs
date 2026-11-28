@@ -65,6 +65,8 @@ pub const BUSY: Duration = Duration::from_secs(5);
 /// step as the account's life moves on (a trigger) unless they are held (12.5); and its
 /// Diagnostics reports (S7, 14); and for requests (S13, written by it through `write_data`):
 /// their jobs and each job's lines, who asked for each release at which Lidarr (`binding`),
+/// with what the history shows of it and whether their ask put it on the list (`placed`, once
+/// set never cleared: only that gives the right to take it off, 16.1),
 /// and what is kept to undo an artist's setting. The switch for requests and the Lidarr key
 /// are authority, and are in the store kept apart alone. No
 /// password, code or session is kept but as a fingerprint; a music login only sealed.
@@ -205,9 +207,15 @@ CREATE TABLE requests_owners (
     account INTEGER NOT NULL REFERENCES accounts (number) ON DELETE CASCADE,
     release TEXT NOT NULL,
     asked_ms INTEGER NOT NULL,
+    metadata BLOB NOT NULL,
+    placed INTEGER NOT NULL DEFAULT 0 CHECK (placed IN (0, 1)),
     PRIMARY KEY (binding, account, release)
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX requests_owners_release ON requests_owners (binding, release, account);
+CREATE TRIGGER requests_owners_placed_stays BEFORE UPDATE OF placed ON requests_owners
+WHEN OLD.placed = 1 AND NEW.placed = 0 BEGIN
+    SELECT RAISE(ABORT, 'a placement once recorded is never cleared');
+END;
 CREATE TABLE requests_lines (
     job INTEGER NOT NULL REFERENCES requests_jobs (id) ON DELETE CASCADE,
     line INTEGER NOT NULL,
