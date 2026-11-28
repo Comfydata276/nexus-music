@@ -101,7 +101,7 @@ pub(crate) fn run(connection: Connection, folder: PathBuf, input: Option<(Vec<Wa
             show(context, last);
         }
         if !connection.still_selected() {
-            crate::controller::post(move |controller| {
+            crate::controller::post(move |_| {
                 if let Some(connection) = super::current() {
                     run(connection, folder, None);
                 }

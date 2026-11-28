@@ -1048,15 +1048,10 @@ fn dispatch(ask: Ask) {
             return;
         }
         let waited = || {
-            if QUITTING.load(Ordering::SeqCst) {
-                return false;
-            }
-            if let Some(request) = app_request
-                && (OFFLINE.load(Ordering::SeqCst) || !app_calls::waiting(request))
-            {
-                return false;
-            }
-            machine().client.waits_for(id)
+            let machine = machine();
+            !QUITTING.load(Ordering::SeqCst)
+                && app_request.is_none_or(|request| !OFFLINE.load(Ordering::SeqCst) && app_calls::waiting(request))
+                && machine.client.waits_for(id)
         };
         let stopped = || {
             if let Some(request) = app_request {
