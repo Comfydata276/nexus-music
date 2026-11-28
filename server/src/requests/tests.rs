@@ -836,7 +836,8 @@ fn a_request_works_after_upgrading_the_deployed_form() {
     keeper.close();
 
     let db = Connection::open(root.join("data/nexus.db")).unwrap();
-    db.execute_batch("DROP TRIGGER requests_owners_placed_stays;
+    db.execute_batch("DROP INDEX listening_by_time;
+        DROP TRIGGER requests_owners_placed_stays;
         ALTER TABLE requests_owners DROP COLUMN placed;
         ALTER TABLE requests_owners DROP COLUMN metadata;
         PRAGMA user_version = 1; PRAGMA journal_mode = DELETE;").unwrap();
