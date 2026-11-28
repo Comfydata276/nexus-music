@@ -2,13 +2,14 @@
 //! Time is in milliseconds and comes from the caller. The caller owns the transport, the
 //! slow password check, the store, and the lifetime of values returned by this module.
 
-use super::proto::{BackendId, HELLO_MAX_DEPTH, Speaks, Version};
+use super::proto::{BackendId, Speaks, Version};
+use super::wire::{self, Fields, object, plain_json, read_text, write_backend, write_speaks, write_version};
+pub use super::wire::{BODY_MAX_BYTES, BadMessage, WireBody, encode, read};
 use serde::{Serialize, Serializer};
 use serde_json::value::RawValue;
 use sha2::digest::{CtOutput, Output, OutputSizeUser, array::ArraySize, consts::{U8, U12, U16, U32, U512}};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::VecDeque;
 use std::fmt;
-use std::io::{self, Write};
 use std::net::Ipv6Addr;
 use zeroize::Zeroizing;
 
@@ -21,7 +22,6 @@ pub const CHANGE_PASSWORD: &str = "/nexus/api/change-password";
 pub const MUSIC_LOGIN: &str = "/nexus/api/music-login";
 pub const PATHS: &[&str] = &[SIGN_IN, SIGN_OUT, LIST_DEVICES, FORCE_OUT, CHANGE_PASSWORD, MUSIC_LOGIN];
 
-pub const BODY_MAX_BYTES: usize = 1024 * 1024;
 pub const EMAIL_MAX_BYTES: usize = 254;
 pub const PASSWORD_MIN_CHARS: usize = 10;
 pub const PASSWORD_MAX_CHARS: usize = 128;
@@ -399,25 +399,6 @@ pub enum DeviceKind {
     Phone,
 }
 
-/// the design does not say the JSON key names or variant tags. The serializers below
-/// fix those spellings, and the readers check the same types in both directions.
-macro_rules! object {
-    ($(#[$doc:meta])* $name:ident { $($(#[$attr:meta])* $field:ident : $kind:ty),* $(,)? }) => {
-        $(#[$doc])*
-        #[derive(Debug, PartialEq, Eq, Serialize)]
-        pub struct $name {
-            $($(#[$attr])* pub $field: $kind,)*
-        }
-
-        impl wire::Value for $name {
-            fn read(raw: &RawValue) -> Result<Self, BadMessage> {
-                let _fields = Fields::read(raw)?;
-                Ok(Self { $($field: _fields.get(stringify!($field))?,)* })
-            }
-        }
-    };
-}
-
 /// Signing in by password checks the named account. §8.4's code takes the place of
 /// both the email and password. A code is only a request for password setup.
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -657,60 +638,6 @@ pub type ForceOutReply = Reply<ForcedOut>;
 pub type ChangePasswordReply = Reply<PasswordChanged>;
 pub type MusicLoginReply = Reply<MusicLogin>;
 
-// ---------------------------------------------------------------------------------------
-// The complete JSON body
-// ---------------------------------------------------------------------------------------
-
-/// No parsing or serialization error contains any part of a body.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BadMessage {
-    TooLarge,
-    Form,
-    Status(u16),
-}
-
-/// The bytes returned by the encoder. Keep them only as long as the transport needs them.
-pub struct WireBody(Zeroizing<Vec<u8>>);
-
-secret_debug!(WireBody);
-
-impl WireBody {
-    pub fn bytes(&self) -> &[u8] {
-        &self.0
-    }
-}
-
-mod wire {
-    use super::{BadMessage, RawValue, Serialize};
-
-    pub trait Value: Sized {
-        fn read(raw: &RawValue) -> Result<Self, BadMessage>;
-
-        fn check(&self) -> Result<(), BadMessage> {
-            Ok(())
-        }
-    }
-
-    pub trait Message: Value + Serialize {}
-}
-
-/// Reads the entire body supplied by the transport. The transport first has to confirm
-/// it received the whole HTTP body, including when the connection closed early.
-pub fn read<T: wire::Message>(body: &[u8]) -> Result<T, BadMessage> {
-    if body.len() > BODY_MAX_BYTES {
-        return Err(BadMessage::TooLarge);
-    }
-    let text = std::str::from_utf8(body).map_err(|_| BadMessage::Form)?;
-    let mut walk = JsonWalk(text);
-    walk.value(0)?;
-    if !walk.rest().is_empty() {
-        return Err(BadMessage::Form);
-    }
-    let value = T::read(plain_json(text)?)?;
-    value.check()?;
-    Ok(value)
-}
-
 pub fn read_reply<T>(status: u16, body: &[u8]) -> Result<Reply<T>, BadMessage>
 where
     Reply<T>: wire::Message,
@@ -719,197 +646,6 @@ where
         return Err(BadMessage::Status(status));
     }
     read(body)
-}
-
-/// Writes JSON with the byte ceiling the reader applies. Count first so a buffer
-/// containing a password or bearer never has to grow and leave an unwiped allocation.
-pub fn encode<T: wire::Message>(value: &T) -> Result<WireBody, BadMessage> {
-    struct Count(usize);
-    impl Write for Count {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            self.0 = self.0.saturating_add(bytes.len());
-            if self.0 > BODY_MAX_BYTES {
-                return Err(io::ErrorKind::FileTooLarge.into());
-            }
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    value.check()?;
-    let mut count = Count(0);
-    serde_json::to_writer(&mut count, value).map_err(|_| {
-        if count.0 > BODY_MAX_BYTES { BadMessage::TooLarge } else { BadMessage::Form }
-    })?;
-    let mut bytes = Zeroizing::new(Vec::with_capacity(count.0));
-    serde_json::to_writer(&mut *bytes, value).map_err(|_| BadMessage::Form)?;
-    Ok(WireBody(bytes))
-}
-
-/// A structural pass checks the whole tree, including fields typed readers skip.
-/// serde_json reads unescaped raw slices; strings are decoded in wiping buffers.
-struct JsonWalk<'a>(&'a str);
-
-impl<'a> JsonWalk<'a> {
-    fn rest(&mut self) -> &'a str {
-        self.0 = self.0.trim_start_matches([' ', '\n', '\r', '\t']);
-        self.0
-    }
-
-    fn take(&mut self, next: char) -> bool {
-        match self.rest().strip_prefix(next) {
-            Some(rest) => {
-                self.0 = rest;
-                true
-            }
-            None => false,
-        }
-    }
-
-    fn raw(&mut self) -> Result<&'a RawValue, BadMessage> {
-        let rest = self.rest();
-        let mut stream = serde_json::Deserializer::from_str(rest).into_iter::<&RawValue>();
-        let raw = stream.next().ok_or(BadMessage::Form)?.map_err(|_| BadMessage::Form)?;
-        self.0 = rest.get(stream.byte_offset()..).ok_or(BadMessage::Form)?;
-        Ok(raw)
-    }
-
-    fn value(&mut self, inside: usize) -> Result<(), BadMessage> {
-        if self.take('{') {
-            if inside == HELLO_MAX_DEPTH {
-                return Err(BadMessage::Form);
-            }
-            if self.take('}') {
-                return Ok(());
-            }
-            let mut keys = BTreeSet::new();
-            loop {
-                if !self.rest().starts_with('"') {
-                    return Err(BadMessage::Form);
-                }
-                let key = json_string(self.raw()?)?;
-                if !keys.insert(key.to_string()) || !self.take(':') {
-                    return Err(BadMessage::Form);
-                }
-                self.value(inside + 1)?;
-                if self.take('}') {
-                    return Ok(());
-                }
-                if !self.take(',') {
-                    return Err(BadMessage::Form);
-                }
-            }
-        }
-        if self.take('[') {
-            if inside == HELLO_MAX_DEPTH {
-                return Err(BadMessage::Form);
-            }
-            if self.take(']') {
-                return Ok(());
-            }
-            loop {
-                self.value(inside + 1)?;
-                if self.take(']') {
-                    return Ok(());
-                }
-                if !self.take(',') {
-                    return Err(BadMessage::Form);
-                }
-            }
-        }
-        let raw = self.raw()?;
-        if raw.get().starts_with('"') {
-            json_string(raw)?;
-        }
-        Ok(())
-    }
-}
-
-fn plain_json<'a, T: serde::Deserialize<'a>>(text: &'a str) -> Result<T, BadMessage> {
-    serde_json::from_str(text).map_err(|_| BadMessage::Form)
-}
-
-// RawValue finds the end of a JSON string. Decode it here so escapes, including
-// UTF-16 pairs, never leave a password in serde_json's string scratch allocation.
-fn json_string(raw: &RawValue) -> Result<Zeroizing<String>, BadMessage> {
-    let inner = raw.get().strip_prefix('"').and_then(|s| s.strip_suffix('"')).ok_or(BadMessage::Form)?;
-    let mut out = Zeroizing::new(String::with_capacity(inner.len()));
-    let mut chars = inner.chars();
-    fn word(chars: &mut std::str::Chars<'_>) -> Result<u16, BadMessage> {
-        let mut word = 0u16;
-        for _ in 0..4 {
-            let digit = chars.next().and_then(|c| c.to_digit(16)).ok_or(BadMessage::Form)?;
-            word = (word << 4) | digit as u16;
-        }
-        Ok(word)
-    }
-    while let Some(ch) = chars.next() {
-        let ch = match ch {
-            '\\' => match chars.next() {
-                Some(escaped @ ('"' | '\\' | '/')) => escaped,
-                Some('b') => '\u{08}',
-                Some('f') => '\u{0c}',
-                Some('n') => '\n',
-                Some('r') => '\r',
-                Some('t') => '\t',
-                Some('u') => {
-                    let hi = word(&mut chars)?;
-                    if (0xd800..=0xdbff).contains(&hi) {
-                        if chars.next() != Some('\\') || chars.next() != Some('u') {
-                            return Err(BadMessage::Form);
-                        }
-                        let lo = word(&mut chars)?;
-                        let mut pair = char::decode_utf16([hi, lo]);
-                        let scalar = pair.next().and_then(Result::ok).ok_or(BadMessage::Form)?;
-                        if pair.next().is_some() {
-                            return Err(BadMessage::Form);
-                        }
-                        scalar
-                    } else {
-                        char::from_u32(u32::from(hi)).ok_or(BadMessage::Form)?
-                    }
-                }
-                _ => return Err(BadMessage::Form),
-            },
-            '"' | '\u{00}'..='\u{1f}' => return Err(BadMessage::Form),
-            _ => ch,
-        };
-        out.push(ch);
-    }
-    Ok(out)
-}
-
-fn read_text<T>(raw: &RawValue, parse: impl FnOnce(&str) -> Option<T>) -> Result<T, BadMessage> {
-    let text = json_string(raw)?;
-    parse(&text).ok_or(BadMessage::Form)
-}
-
-struct Fields<'a>(BTreeMap<String, &'a RawValue>);
-
-impl<'a> Fields<'a> {
-    fn read(raw: &'a RawValue) -> Result<Self, BadMessage> {
-        if !raw.get().starts_with('{') {
-            return Err(BadMessage::Form);
-        }
-        plain_json(raw.get()).map(Self)
-    }
-
-    fn get<T: wire::Value>(&self, key: &str) -> Result<T, BadMessage> {
-        T::read(self.0.get(key).ok_or(BadMessage::Form)?)
-    }
-
-    // An enum is one selected member. Unknown members are skipped, just as in a
-    // struct. Two known members in one enum are conflicting.
-    fn select(&self, keys: &[&'static str]) -> Result<(&'static str, &'a RawValue), BadMessage> {
-        let mut found = keys.iter().filter_map(|&key| self.0.get(key).map(|&raw| (key, raw)));
-        let selected = found.next().ok_or(BadMessage::Form)?;
-        if found.next().is_some() {
-            return Err(BadMessage::Form);
-        }
-        Ok(selected)
-    }
 }
 
 macro_rules! text_value {
@@ -926,51 +662,12 @@ text_value!(Email, Email::new);
 text_value!(Name, Name::new);
 text_value!(Password, Password::new);
 text_value!(MusicAddress, MusicAddress::new);
-text_value!(Version, Version::parse);
-text_value!(BackendId, BackendId::from_hex);
 text_value!(Notice, Notice::new);
 text_value!(DeviceKind, |text| match text {
     "pc" => Some(DeviceKind::Pc),
     "phone" => Some(DeviceKind::Phone),
     _ => None,
 });
-
-impl wire::Value for Speaks {
-    fn read(raw: &RawValue) -> Result<Self, BadMessage> {
-        let [low, high] = plain_json::<[u32; 2]>(raw.get())?;
-        Speaks::new(low, high).ok_or(BadMessage::Form)
-    }
-}
-
-fn write_speaks<S: Serializer>(speaks: &Speaks, serializer: S) -> Result<S::Ok, S::Error> {
-    [speaks.low(), speaks.high()].serialize(serializer)
-}
-
-fn write_version<S: Serializer>(version: &Version, serializer: S) -> Result<S::Ok, S::Error> {
-    serializer.collect_str(version)
-}
-
-fn write_backend<S: Serializer>(backend: &BackendId, serializer: S) -> Result<S::Ok, S::Error> {
-    serializer.serialize_str(&backend.to_hex())
-}
-
-impl wire::Value for u64 {
-    fn read(raw: &RawValue) -> Result<Self, BadMessage> {
-        plain_json(raw.get())
-    }
-}
-
-impl wire::Value for bool {
-    fn read(raw: &RawValue) -> Result<Self, BadMessage> {
-        plain_json(raw.get())
-    }
-}
-
-impl<T: wire::Value> wire::Value for Option<T> {
-    fn read(raw: &RawValue) -> Result<Self, BadMessage> {
-        if raw.get() == "null" { Ok(None) } else { T::read(raw).map(Some) }
-    }
-}
 
 impl wire::Value for DeviceId {
     fn read(raw: &RawValue) -> Result<Self, BadMessage> {
