@@ -214,8 +214,10 @@ impl Keeper {
                         store.backend.to_hex()
                     )));
                 }
+                // The clock is the store's alone (finding 7): every step of the data is
+                // written at a time the store had already recorded, so the data's own time
+                // is never taken for it.
                 let mut keeper = Self::with(state, folder, held, store, data)?;
-                keeper.store.high_water = keeper.store.high_water.max(meta.written_at);
                 if !keeper.store.data_made {
                     let view = keeper.data.view().map_err(|error| unreadable(&error))?;
                     if !view.accounts.is_empty() || view.restore != keeper.store.restore {
@@ -386,8 +388,14 @@ impl Keeper {
             next.pending = Some(if mode == RestoreMode::Adopt { Pending::TakeAsIs { restore: new } } else { Pending::Restore { restore: new } });
             self.write_store(next).map_err(refused)?;
         }
-        // Then the data, in one step.
-        let at = self.store.high_water.max(now);
+        // Begun before and done again: the time it is done at reaches the store first.
+        if now > self.store.high_water {
+            let mut next = self.store.clone();
+            next.high_water = now;
+            self.write_store(next).map_err(refused)?;
+        }
+        // Then the data, in one step, at the time the store has.
+        let at = self.store.high_water;
         let mut installs: Vec<(u64, Rows)> = Vec::new();
         let mut erase = Vec::new();
         for (&number, account) in &self.store.accounts {
@@ -400,7 +408,7 @@ impl Keeper {
             let Some(record) = self.store.apart(number, names.get(&number)) else { continue };
             installs.push((number, Decided::load(&record, Some(&rows)).rows()));
         }
-        let mut changes = vec![Change::Restore { restore: new, at: now, from: (meta.restore != new).then_some(meta.written_at) }];
+        let mut changes = vec![Change::Restore { restore: new, at, from: (meta.restore != new).then_some(meta.written_at) }];
         changes.extend(erase.iter().map(|&account| Change::Erase { account }));
         for (number, rows) in &installs {
             changes.push(Change::Install { number: *number, rows, at });
@@ -674,10 +682,12 @@ impl Keeper {
     }
 
     /// A change the data alone keeps (a device last heard from), in one step; the store
-    /// hears how far the data has got at most once a minute (12.3).
+    /// hears how far the data has got at most once a minute (12.3). It is no decision and
+    /// moves no clock: the step is written at the time the store already has (finding 7),
+    /// so that a restart finds the same clock the running backend had.
     pub fn heard(&mut self, device: u64, now: u64) -> Result<(), Failed> {
         self.heal()?;
-        match self.data.apply(&[Change::Heard { device, at: now }], self.store.high_water.max(now)) {
+        match self.data.apply(&[Change::Heard { device, at: now }], self.store.high_water) {
             Ok(changes) => self.changes = changes,
             Err(error) => return Err(Failed(data_failed(&error))),
         }
