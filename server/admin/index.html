@@ -743,7 +743,7 @@ dd, li { overflow-wrap: anywhere; }
   }
 
   function refreshAfter(current, view) {
-    if (view === "accounts" || view === "accounts-and-devices") {
+    if (view === "accounts" || view === "accounts-and-devices" || view === "address") {
       resetPage(accountPage);
       requests.replaceChildren();
       accountNames.clear();
