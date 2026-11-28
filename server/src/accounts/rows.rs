@@ -79,8 +79,9 @@ pub fn admins(data: &Connection) -> rusqlite::Result<u64> {
     data.query_row("SELECT count(*) FROM accounts WHERE admin = 1 AND status = 'on'", [], |row| unsigned(row.get(0)?))
 }
 
-/// One device of an account, as its person's list shows it (8.7).
-#[derive(Debug, Clone)]
+/// One device of an account, as its person's list shows it (8.7). No `Debug`: its name is
+/// what a person typed.
+#[derive(Clone)]
 pub struct Listed {
     pub id: DeviceId,
     pub name: Name,
