@@ -23,6 +23,21 @@ pub struct StoreAccount {
     pub held: Option<u64>,
     /// Whether the data has the account's row: set as it is made, cleared as it is deleted.
     pub present: bool,
+    /// Deleted by the admin (12.5): its rows never come back from a copy.
+    pub deleted: bool,
+    /// Switched off (8.7): a copy that has it on is switched off again.
+    pub off: bool,
+    /// How many times its password has been changed or reset: a copy with an earlier count
+    /// holds a password that must no longer work (12.4 step 3).
+    pub passwords: u64,
+}
+
+/// One account as the data has it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DataAccount {
+    pub life: u64,
+    pub on: bool,
+    pub passwords: u64,
 }
 
 /// One device as the store kept apart has it: its half of C3's `Apart`, by number.
@@ -52,6 +67,9 @@ impl StoreDevice {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pending {
     MakeAccount { account: u64 },
+    /// A change to a whole account that takes leave away (switched off, deleted, its
+    /// password changed or reset), with its devices' endings.
+    Account { account: u64 },
     MakeDevice { device: u64 },
     /// A device's decision (C3's `Effects`): `family` as its `Update` says.
     Update { device: u64, account: u64, family: Option<Family> },
@@ -87,8 +105,7 @@ pub struct DataDevice {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DataView {
     pub restore: u64,
-    /// Each account's life.
-    pub accounts: BTreeMap<u64, u64>,
+    pub accounts: BTreeMap<u64, DataAccount>,
     pub devices: BTreeMap<u64, DataDevice>,
 }
 
@@ -101,7 +118,7 @@ pub enum Contradiction {
     DataRestoreAhead,
     /// The data has an account the store never made (accounts are made in the store first).
     AccountUnknown,
-    /// The data has an account at a life the store never reached.
+    /// The data has an account at a life, or a count of passwords, the store never reached.
     AccountAhead,
     /// The data has a device the store never made.
     DeviceUnknown,
@@ -154,7 +171,7 @@ pub fn compare(store: &StoreView, data: &DataView) -> Found {
         return Found::stop(Contradiction::DataRestoreAhead);
     }
     let pending_account = |account: u64| match store.pending {
-        Some(Pending::MakeAccount { account: made }) => made == account,
+        Some(Pending::MakeAccount { account: made } | Pending::Account { account: made }) => made == account,
         Some(Pending::Update { account: of, family: Some(Family::Account), .. }) => of == account,
         _ => false,
     };
@@ -166,12 +183,30 @@ pub fn compare(store: &StoreView, data: &DataView) -> Found {
             }
     };
     let (mut older, mut ending, mut grant) = (data.restore < store.restore, false, false);
-    for (&number, &life) in &data.accounts {
+    for (&number, row) in &data.accounts {
         let Some(kept) = store.accounts.get(&number) else {
             return Found::stop(Contradiction::AccountUnknown);
         };
-        if life > kept.life {
+        let life = row.life;
+        if life > kept.life || row.passwords > kept.passwords {
             return Found::stop(Contradiction::AccountAhead);
+        }
+        let cut = pending_account(number);
+        if kept.deleted {
+            if cut { ending = true } else { older = true }
+            continue;
+        }
+        if row.passwords < kept.passwords {
+            if cut && row.passwords.checked_add(1) == Some(kept.passwords) { ending = true } else { older = true }
+        }
+        // Switching off goes to the store first; switching on to the data first, under a note
+        // in the store all the same. Cut either way, the data is on and the store off, and
+        // the data is brought to the store: off.
+        if row.on && kept.off {
+            if cut { ending = true } else { older = true }
+        }
+        if !row.on && !kept.off {
+            older = true;
         }
         if life < kept.life {
             if kept.held.is_some_and(|through| through >= kept.life) {
@@ -258,8 +293,12 @@ pub fn compare(store: &StoreView, data: &DataView) -> Found {
 pub fn holds(store: &StoreView, data: &DataView) -> Vec<(u64, u64)> {
     data.accounts
         .iter()
-        .filter_map(|(&number, &life)| {
+        .filter_map(|(&number, row)| {
+            let life = row.life;
             let kept = store.accounts.get(&number)?;
+            if kept.deleted {
+                return None;
+            }
             let already = kept.held.is_some_and(|through| through >= kept.life);
             match restored_account(kept.life, life, already) {
                 Restore::HoldThrough(through) => Some((number, through)),
@@ -269,10 +308,34 @@ pub fn holds(store: &StoreView, data: &DataView) -> Vec<(u64, u64)> {
         .collect()
 }
 
-/// §11.2 when the store is lost and the owner takes the data as it is: every account the
-/// data has is held, through the life the data gives it (`kept::Startup::HoldAll`).
-pub fn hold_all(data: &DataView) -> Vec<(u64, u64)> {
-    data.accounts.iter().map(|(&number, &life)| (number, life)).collect()
+/// What is taken away again from an account the data has (12.4 step 3), whether for an
+/// older copy or a cut change: what the store says happened to it since.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TakenAgain {
+    pub account: u64,
+    /// Deleted since: everything of it goes again.
+    pub erase: bool,
+    /// Switched off since.
+    pub off: bool,
+    /// Its password changed since: the one the data holds must not work. It waits for the
+    /// admin to reset it (8.4).
+    pub reset_password: bool,
+}
+
+pub fn taken_again(store: &StoreView, data: &DataView) -> Vec<TakenAgain> {
+    data.accounts
+        .iter()
+        .filter_map(|(&account, row)| {
+            let kept = store.accounts.get(&account)?;
+            let again = TakenAgain {
+                account,
+                erase: kept.deleted,
+                off: !kept.deleted && kept.off && row.on,
+                reset_password: !kept.deleted && row.passwords < kept.passwords,
+            };
+            (again.erase || again.off || again.reset_password).then_some(again)
+        })
+        .collect()
 }
 
 /// A device's rows brought up to the store (§9.2: "at the next start the data is brought up

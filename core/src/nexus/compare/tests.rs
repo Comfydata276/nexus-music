@@ -12,13 +12,13 @@ fn permit(id: u64) -> Permit {
 /// One account and one device, a session working and one waiting, the same in both.
 fn both() -> (StoreView, DataView) {
     let mut store = StoreView { restore: 2, ..Default::default() };
-    store.accounts.insert(ACCOUNT, StoreAccount { life: 1, held: None, present: true });
+    store.accounts.insert(ACCOUNT, StoreAccount { life: 1, held: None, present: true, deleted: false, off: false, passwords: 1 });
     store.devices.insert(
         DEVICE,
         StoreDevice { account: ACCOUNT, restore: 2, life: 1, number: 3, last_session: 5, working: Some(permit(4)), waiting: Some(permit(5)), gone: false },
     );
     let mut data = DataView { restore: 2, ..Default::default() };
-    data.accounts.insert(ACCOUNT, 1);
+    data.accounts.insert(ACCOUNT, DataAccount { life: 1, on: true, passwords: 1 });
     data.devices.insert(
         DEVICE,
         DataDevice { account: ACCOUNT, number: 3, sessions: vec![DataSession { id: 4, delete_proven: None }, DataSession { id: 5, delete_proven: None }] },
@@ -30,6 +30,10 @@ fn found(store: &StoreView, data: &DataView) -> StoreComparison {
     let found = compare(store, data);
     assert_eq!(found.contradiction.is_some(), found.comparison == StoreComparison::StoreLost);
     found.comparison
+}
+
+fn account(store: &mut StoreView) -> &mut StoreAccount {
+    store.accounts.get_mut(&ACCOUNT).unwrap()
 }
 
 fn device(store: &mut StoreView) -> &mut StoreDevice {
@@ -160,12 +164,14 @@ fn a_copy_from_before_a_deletion_is_older_and_its_account_is_held() {
 #[test]
 fn only_accounts_behind_are_held_and_all_are_when_the_store_is_lost() {
     let (mut store, mut data) = both();
-    store.accounts.insert(2, StoreAccount { life: 4, held: None, present: true });
-    data.accounts.insert(2, 3);
-    store.accounts.insert(3, StoreAccount { life: 0, held: Some(0), present: true });
-    data.accounts.insert(3, 0);
+    store.accounts.insert(2, StoreAccount { life: 4, held: None, present: true, deleted: false, off: false, passwords: 0 });
+    data.accounts.insert(2, DataAccount { life: 3, on: true, passwords: 0 });
+    store.accounts.insert(3, StoreAccount { life: 0, held: Some(0), present: true, deleted: false, off: false, passwords: 0 });
+    data.accounts.insert(3, DataAccount { life: 0, on: true, passwords: 0 });
     assert_eq!(holds(&store, &data), [(2, 4), (3, 0)]);
-    assert_eq!(hold_all(&data), [(ACCOUNT, 1), (2, 3), (3, 0)]);
+    // A deleted account is not held: it is erased again.
+    store.accounts.get_mut(&2).unwrap().deleted = true;
+    assert_eq!(holds(&store, &data), [(3, 0)]);
 }
 
 #[test]
@@ -185,22 +191,23 @@ fn a_copy_from_before_a_device_or_account_was_made_is_older_unless_that_making_w
     store.pending = Some(Pending::MakeDevice { device: 8 });
     assert_eq!(found(&store, &data), StoreComparison::Matches);
     let (mut store, data) = both();
-    store.accounts.insert(2, StoreAccount { life: 0, held: None, present: true });
+    store.accounts.insert(2, StoreAccount { life: 0, held: None, present: true, deleted: false, off: false, passwords: 0 });
     assert_eq!(found(&store, &data), StoreComparison::OlderCopy);
     store.pending = Some(Pending::MakeAccount { account: 2 });
     assert_eq!(found(&store, &data), StoreComparison::Matches);
     // An account deleted (not present) and not made again is not missed.
-    store.accounts.insert(2, StoreAccount { life: 1, held: None, present: false });
+    store.accounts.insert(2, StoreAccount { life: 1, held: None, present: false, deleted: false, off: false, passwords: 0 });
     store.pending = None;
     assert_eq!(found(&store, &data), StoreComparison::Matches);
 }
 
 #[test]
 fn what_no_cut_and_no_copy_can_make_means_the_store_is_not_this_datas() {
-    let cases: [(&str, fn(&mut StoreView, &mut DataView), Contradiction); 7] = [
+    let cases: [(&str, fn(&mut StoreView, &mut DataView), Contradiction); 8] = [
+        ("passwords ahead", |_, data| { data.accounts.get_mut(&ACCOUNT).unwrap().passwords = 2; }, Contradiction::AccountAhead),
         ("restore ahead", |_, data| data.restore = 3, Contradiction::DataRestoreAhead),
         ("account unknown", |store, _| { store.accounts.clear(); }, Contradiction::AccountUnknown),
-        ("account ahead", |_, data| { data.accounts.insert(ACCOUNT, 2); }, Contradiction::AccountAhead),
+        ("account ahead", |_, data| { data.accounts.get_mut(&ACCOUNT).unwrap().life = 2; }, Contradiction::AccountAhead),
         ("device unknown", |store, _| { store.devices.clear(); }, Contradiction::DeviceUnknown),
         ("device elsewhere", |_, data| row(data).account = 2, Contradiction::DeviceElsewhere),
         ("device ahead", |_, data| row(data).number = 4, Contradiction::DeviceAhead),
@@ -232,6 +239,43 @@ fn a_restore_under_way_is_done_again_from_the_start() {
             assert_eq!(found(&store, &data), StoreComparison::OlderCopy, "{pending:?} {data_restore}");
         }
     }
+}
+
+#[test]
+fn an_account_deleted_switched_off_or_its_password_changed_since_the_copy_is_taken_away_again() {
+    for (name, change, again) in [
+        ("deleted", (|kept: &mut StoreAccount| { kept.deleted = true; kept.present = false; }) as fn(&mut StoreAccount), TakenAgain { account: ACCOUNT, erase: true, off: false, reset_password: false }),
+        ("switched off", |kept| kept.off = true, TakenAgain { account: ACCOUNT, erase: false, off: true, reset_password: false }),
+        ("password changed", |kept| kept.passwords = 2, TakenAgain { account: ACCOUNT, erase: false, off: false, reset_password: true }),
+    ] {
+        let (mut store, data) = both();
+        change(account(&mut store));
+        if name == "deleted" {
+            device(&mut store).gone = true;
+        }
+        assert_eq!(found(&store, &data), StoreComparison::OlderCopy, "{name}");
+        assert_eq!(taken_again(&store, &data), [again], "{name}");
+        // Cut between the store and the data: the change is finished, as an ending.
+        store.pending = Some(Pending::Account { account: ACCOUNT });
+        assert_eq!(found(&store, &data), StoreComparison::EndingRecorded, "{name}");
+        assert_eq!(taken_again(&store, &data), [again], "{name}");
+    }
+    // A copy from before the account was switched on is older; nothing is given back by it.
+    let (mut store, mut data) = both();
+    data.accounts.get_mut(&ACCOUNT).unwrap().on = false;
+    assert_eq!(found(&store, &data), StoreComparison::OlderCopy);
+    assert_eq!(taken_again(&store, &data), []);
+    // Switched on in the data, cut before the store heard: brought back to off.
+    account(&mut store).off = true;
+    data.accounts.get_mut(&ACCOUNT).unwrap().on = true;
+    store.pending = Some(Pending::Account { account: ACCOUNT });
+    assert_eq!(found(&store, &data), StoreComparison::EndingRecorded);
+    assert_eq!(taken_again(&store, &data)[0].off, true);
+    // A password changed twice since: older, not a cut.
+    let (mut store, data) = both();
+    account(&mut store).passwords = 3;
+    store.pending = Some(Pending::Account { account: ACCOUNT });
+    assert_eq!(found(&store, &data), StoreComparison::OlderCopy);
 }
 
 // --- brought_up follows Device::load ---
