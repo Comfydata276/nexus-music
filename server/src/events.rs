@@ -1,8 +1,9 @@
 //! Listening history (design 12.5 and 13). The shared library reads batches and decides
 //! individual intake and grant outcomes. SQLite owns the kept event and its identity together.
 
+use std::collections::HashSet;
 use std::fmt::Write as _;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::Router;
 use axum::body::{Body, Bytes};
@@ -16,10 +17,9 @@ use nexus_core::nexus::account::{
     RequestHead, SignedOut, Stamp,
 };
 use nexus_core::nexus::events::{self, Answered, BatchAnswer, IncomingBatch, Outcome};
-use nexus_core::nexus::kept::{Access, Account, AccountState, Bearer, Denied, Fingerprint, GrantIntent, GrantUse, LeaveFor};
+use nexus_core::nexus::kept::{Access, Account, AccountState, Bearer, Denied, Fingerprint, GrantIntent, GrantUse, LeaveFor, SessionKind};
 use nexus_core::nexus::proto::SPEAKS;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
-use tokio::sync::Semaphore;
 use zeroize::Zeroize;
 
 use crate::accounts::{check::Checked, rows, setup};
@@ -30,42 +30,12 @@ pub const STATS_PATH: &str = "/nexus/api/events/stats";
 pub const STATS_PAGE: usize = 50;
 const DEFAULT_DATA_BUDGET: u64 = 4_000_000_000;
 
-// CARRIED for form-1 data created before the store included these tables.
-// The life transition and deletion share a transaction. Recovery can hold old history.
-const SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS listening_events (
-    row_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    account INTEGER NOT NULL REFERENCES accounts(number) ON DELETE CASCADE,
-    device INTEGER NOT NULL,
-    event_id TEXT NOT NULL CHECK (length(event_id) = 32),
-    at_ms INTEGER NOT NULL,
-    is_start INTEGER NOT NULL CHECK (is_start IN (0, 1)),
-    line TEXT NOT NULL,
-    UNIQUE (account, event_id)
-) STRICT;
-CREATE INDEX IF NOT EXISTS listening_recent ON listening_events(account, at_ms DESC, row_id DESC)
-    WHERE is_start = 1;
-CREATE TABLE IF NOT EXISTS listening_totals (
-    account INTEGER PRIMARY KEY REFERENCES accounts(number) ON DELETE CASCADE,
-    starts INTEGER NOT NULL
-) STRICT;
-CREATE TRIGGER IF NOT EXISTS listening_count_start AFTER INSERT ON listening_events
-WHEN NEW.is_start = 1 BEGIN
-    INSERT INTO listening_totals(account, starts) VALUES (NEW.account, 1)
-    ON CONFLICT(account) DO UPDATE SET starts = starts + 1;
-END;
-CREATE TRIGGER IF NOT EXISTS listening_erase_life AFTER UPDATE OF life ON accounts
-WHEN NEW.life > OLD.life AND NEW.history_held = 0 BEGIN
-    DELETE FROM listening_events WHERE account = NEW.number;
-    DELETE FROM listening_totals WHERE account = NEW.number;
-END;
-";
-
 #[derive(Clone)]
 pub(crate) struct Calls {
     pub accounts: Arc<Accounts>,
     pub public_origin: Option<Arc<str>>,
-    uploads: Arc<Semaphore>,
+    event_slots: Arc<Mutex<HashSet<u64>>>,
+    report_slots: Arc<Mutex<HashSet<u64>>>,
     budget: u64,
 }
 
@@ -77,7 +47,13 @@ pub(crate) fn router(base: Router, accounts: Arc<Accounts>, public_origin: Optio
         Err(std::env::VarError::NotPresent) => DEFAULT_DATA_BUDGET,
         Err(std::env::VarError::NotUnicode(_)) => 0,
     };
-    let calls = Calls { accounts, public_origin, uploads: Arc::new(Semaphore::new(1)), budget };
+    let calls = Calls {
+        accounts,
+        public_origin,
+        event_slots: Arc::default(),
+        report_slots: Arc::default(),
+        budget,
+    };
     crate::diag::start_expiry(&calls.accounts);
     base.merge(
         Router::new()
@@ -148,18 +124,102 @@ pub(crate) fn bearer(calls: &Calls, headers: &HeaderMap) -> Result<Fingerprint, 
 }
 
 // CARRIED until S9 exposes these S8 helpers.
-fn signed_in(keeper: &mut Keeper, head: &RequestHead, hash: &Fingerprint) -> Result<(u64, DeviceId, Account), Refusal> {
-    if head.speaks.low() > SPEAKS.high() || head.speaks.high() < SPEAKS.low() {
+pub(crate) fn signed_in(keeper: &mut Keeper, head: &RequestHead, hash: &Fingerprint) -> Result<(u64, DeviceId, Account), Refusal> {
+    if !head.speaks.meets(&SPEAKS) {
         return Err(Refusal::NotAllowed(NotAllowed::Incompatible { speaks: SPEAKS }));
     }
     if head.restore != keeper.restore() {
         return Err(Refusal::NotSignedIn(NotSignedIn::DataPutBack));
     }
+    account_for(keeper, hash)
+}
+
+fn account_for(keeper: &mut Keeper, hash: &Fingerprint) -> Result<(u64, DeviceId, Account), Refusal> {
     let (number, device) = rows::session_by_hash(keeper.data().connection(), hash.as_bytes())
         .map_err(unavailable)?
         .ok_or_else(ended)?;
     let account = keeper.load(number).map_err(unavailable)?;
     Ok((number, device, account))
+}
+
+pub(crate) fn inspect_session(
+    keeper: &Keeper, account: &mut Account, device: DeviceId, hash: &Fingerprint, now: u64,
+) -> Result<SessionKind, Refusal> {
+    account.request(keeper.restore(), keeper.clock(now), |turn| {
+        turn.session_kind(Bearer { device, hash, grant: None })
+    })
+        // Any activity or expiry here was on a temporary account snapshot. The
+        // writer rechecks the live session and persists its own decision.
+        .apply(|_| Ok::<_, Refusal>(()))?
+        .map_err(said)
+}
+
+pub(crate) enum UploadLimit {
+    Account,
+    Device,
+}
+
+pub(crate) struct UploadPlace {
+    slots: Arc<Mutex<HashSet<u64>>>,
+    key: u64,
+    scope: (u64, DeviceId),
+}
+
+impl UploadPlace {
+    pub(crate) fn check(&self, account: u64, device: DeviceId) -> Result<(), Refusal> {
+        if self.scope == (account, device) { Ok(()) } else { Err(ended()) }
+    }
+}
+
+impl Drop for UploadPlace {
+    fn drop(&mut self) {
+        self.slots.lock().unwrap_or_else(|error| error.into_inner()).remove(&self.key);
+    }
+}
+
+// CARRIED until core exposes a cheap upload-head reader. The app's two
+// encoders put the compact head first. This bounded hint only preserves the
+// restore refusal for already-revoked bearers. Accepted uploads always use
+// the full core decoder and check its head on the writer again.
+fn restore_hint(body: &[u8]) -> Option<u64> {
+    let prefix = &body[..body.len().min(account::SMALL_REQUEST_MAX_BYTES - 1)];
+    prefix.strip_prefix(br#"{"head":{"#)?;
+    let end = prefix.iter().position(|&byte| byte == b'}')?;
+    let mut head = prefix[..=end].to_vec();
+    head.push(b'}');
+    Some(account::read::<account::GetMusicLogin>(&head).ok()?.head.restore)
+}
+
+pub(crate) async fn admit_upload(
+    calls: &Calls, hash: &Fingerprint, limit: UploadLimit, body: &[u8],
+) -> Result<UploadPlace, Refusal> {
+    let slots = match limit {
+        UploadLimit::Account => Arc::clone(&calls.event_slots),
+        UploadLimit::Device => Arc::clone(&calls.report_slots),
+    };
+    let clock = calls.accounts.clock.clone();
+    let hash = hash.clone();
+    let restore = restore_hint(body);
+    answer(calls.accounts.desk.ask(move |keeper| {
+        let (number, device, mut account) = account_for(keeper, &hash).map_err(|reason| {
+            if matches!(reason, Refusal::NotSignedIn(NotSignedIn::SessionEnded))
+                && restore.is_some_and(|restore| restore != keeper.restore())
+            {
+                Refusal::NotSignedIn(NotSignedIn::DataPutBack)
+            } else {
+                reason
+            }
+        })?;
+        inspect_session(keeper, &mut account, device, &hash, clock())?;
+        let key = match limit {
+            UploadLimit::Account => number,
+            UploadLimit::Device => device.get(),
+        };
+        if !slots.lock().unwrap_or_else(|error| error.into_inner()).insert(key) {
+            return Err(busy());
+        }
+        Ok(UploadPlace { slots, key, scope: (number, device) })
+    }).await)
 }
 
 fn said(reason: Denied) -> Refusal {
@@ -183,37 +243,23 @@ pub(crate) fn receipt(keeper: &Keeper, account: &AccountState) -> Result<Receipt
     })
 }
 
-fn arrive(keeper: &mut Keeper, head: &RequestHead, hash: &Fingerprint, device: DeviceId, account: &mut Account, access: Access, now: u64) -> Result<(), Refusal> {
+pub(crate) fn arrive(keeper: &mut Keeper, head: &RequestHead, hash: &Fingerprint, device: DeviceId, account: &mut Account, access: Access, now: u64) -> Result<SessionKind, Refusal> {
     account.request(head.restore, keeper.clock(now), |turn| {
-        turn.arrive(Bearer { device, hash, grant: None }, access).map(|_| ())
+        turn.arrive(Bearer { device, hash, grant: None }, access).map(|request| request.kind())
     })
         .apply(|effects| keeper.persist(effects, &[], now))
         .map_err(unavailable)?
         .map_err(said)
 }
 
-pub(crate) fn authenticated(keeper: &mut Keeper, head: &RequestHead, hash: &Fingerprint, access: Access, now: u64) -> Result<(u64, DeviceId, Account), Refusal> {
+pub(crate) fn authenticated(keeper: &mut Keeper, head: &RequestHead, hash: &Fingerprint, access: Access, now: u64) -> Result<(u64, DeviceId, Account, SessionKind), Refusal> {
     let (number, device, mut account) = signed_in(keeper, head, hash)?;
-    arrive(keeper, head, hash, device, &mut account, access, now)?;
-    Ok((number, device, account))
+    let kind = arrive(keeper, head, hash, device, &mut account, access, now)?;
+    Ok((number, device, account, kind))
 }
 
 pub(crate) fn sql(number: u64) -> rusqlite::Result<i64> {
     i64::try_from(number).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, i64::MAX))
-}
-
-pub(crate) fn schema(db: &Connection, table: &str, migration: &str) -> rusqlite::Result<()> {
-    let present: bool = db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
-        [table],
-        |row| row.get(0),
-    )?;
-    if !present {
-        let tx = db.unchecked_transaction()?;
-        tx.execute_batch(migration)?;
-        tx.commit()?;
-    }
-    Ok(())
 }
 
 struct Prepared {
@@ -245,9 +291,8 @@ fn prepare(batch: IncomingBatch) -> (RequestHead, u64, Vec<Prepared>) {
 async fn send(State(calls): State<Calls>, headers: HeaderMap, body: Bytes) -> Response<Body> {
     let outcome = async {
         let hash = bearer(&calls, &headers)?;
-        // At most one batch can parse, wait for the writer, or occupy it. The body and
-        // its validation are outside the one writer, and parsing is off the async workers.
-        let permit = calls.uploads.clone().try_acquire_owned().map_err(|_| busy())?;
+        // A live session reserves its account's batch place before parsing.
+        let permit = admit_upload(&calls, &hash, UploadLimit::Account, &body).await?;
         let (permit, (head, life, rows)) = tokio::task::spawn_blocking(move || {
             let batch = IncomingBatch::read(&body).map_err(|_| Refusal::Malformed)?;
             Ok::<_, Refusal>((permit, prepare(batch)))
@@ -255,14 +300,13 @@ async fn send(State(calls): State<Calls>, headers: HeaderMap, body: Bytes) -> Re
         let clock = calls.accounts.clock.clone();
         let budget = calls.budget;
         answer(calls.accounts.desk.ask(move |keeper| {
-            let _permit = permit;
             let now = clock();
             let (number, device, mut account) = signed_in(keeper, &head, &hash)?;
+            permit.check(number, device)?;
             let current_life = account.state().life;
             let access = if life == current_life { Access::WriteHistory } else { Access::Read };
             arrive(keeper, &head, &hash, device, &mut account, access, now)?;
             let answers = if life == current_life {
-                schema(keeper.data().connection(), "listening_events", SCHEMA).map_err(unavailable)?;
                 keeper.write_data(now, |tx| insert(tx, number, device, current_life, life, budget, rows))
                     .map_err(unavailable)?
             } else {
@@ -411,7 +455,6 @@ async fn delete(State(calls): State<Calls>, headers: HeaderMap, body: Bytes) -> 
             let now = clock();
             let (_, device, mut account) = signed_in(keeper, &request.head, &hash)?;
             target(account.state(), request.change.account, request.change.target_revision)?;
-            schema(keeper.data().connection(), "listening_events", SCHEMA).map_err(unavailable)?;
             let grant = Some(GrantUse { request_id: request.request_id, secret: &request.grant });
             account.request(request.head.restore, keeper.clock(now), |turn| turn.delete_history(Bearer { device, hash: &hash, grant }))
                 .apply(|effects| keeper.persist(effects, &[], now)).map_err(unavailable)?.map_err(said)?;
@@ -441,9 +484,8 @@ async fn stats(State(calls): State<Calls>, headers: HeaderMap, body: Bytes) -> R
         let request = account::read::<ListDevices>(&body).map_err(|_| Refusal::Malformed)?;
         let clock = calls.accounts.clock.clone();
         let (page, stamp) = answer(calls.accounts.desk.ask(move |keeper| {
-            let (number, _, account) = authenticated(keeper, &request.head, &hash, Access::ReadHistory, clock())?;
+            let (number, _, account, _) = authenticated(keeper, &request.head, &hash, Access::ReadHistory, clock())?;
             let db = keeper.data().connection();
-            schema(db, "listening_events", SCHEMA).map_err(unavailable)?;
             let page = stats_page(db, number, request.after).map_err(unavailable)?;
             Ok((page, receipt(keeper, account.state())?))
         }).await)?;

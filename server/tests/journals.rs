@@ -5,6 +5,8 @@ use std::io::{BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Barrier, atomic::{AtomicU64, Ordering}};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use nexus_core::nexus::account::{
@@ -17,7 +19,11 @@ use nexus_core::nexus::events::{
     self, Batch, Began, EventId, Kind, Outcome, Placed, PlayedFrom, Record, Sound, Stopped,
 };
 use nexus_core::nexus::proto::{SPEAKS, Version};
-use nexus_music_server::accounts::setup::{CodeKey, make_code};
+use nexus_music_server::accounts::{
+    check::PasswordWorkers, desk::Desk, session::Accounts,
+    setup::{CodeKey, SetUpCode, dummy_salt_key, make_code},
+};
+use nexus_music_server::serve::{self, Shell};
 use nexus_music_server::probe;
 use nexus_music_server::store::keeper::{First, Keeper};
 use rusqlite::{Connection, params, types::FromSql};
@@ -33,6 +39,7 @@ struct Fixture {
     root: PathBuf,
     port: u16,
     child: Option<Child>,
+    clock_server: Option<(tokio::sync::oneshot::Sender<()>, JoinHandle<()>)>,
     budget: Option<u64>,
 }
 
@@ -43,7 +50,7 @@ impl Fixture {
         std::fs::create_dir(root.join("data")).unwrap();
         std::fs::create_dir(root.join("state")).unwrap();
         let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-        Self { root, port, child: None, budget: None }
+        Self { root, port, child: None, clock_server: None, budget: None }
     }
 
     fn program(&self) -> Command {
@@ -81,6 +88,47 @@ impl Fixture {
 
     fn start(&mut self) {
         self.child = Some(self.program().stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap());
+        self.wait_until_ready();
+    }
+
+    // The production router and loopback listener with a clock the test can
+    // advance. Report acceptance is exercised over HTTP through the real Desk.
+    fn start_with_clock(&mut self) -> Arc<AtomicU64> {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        // Start past the store's restart allowance so exact gap assertions
+        // measure the injected clock from the first receipt.
+        let now = now + 2 * nexus_core::nexus::kept::CLOCK_MARK_INTERVAL_MS;
+        let clock = Arc::new(AtomicU64::new(now));
+        let clock_for_server = clock.clone();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let addr = ([127, 0, 0, 1], self.port).into();
+        let root = self.root.clone();
+        let thread = std::thread::spawn(move || {
+            let (keeper, _) = Keeper::open(&root.join("state"), &root.join("data"), now)
+                .unwrap_or_else(|why| panic!("{why}"));
+            let backend = keeper.backend();
+            let accounts = Arc::new(Accounts {
+                workers: PasswordWorkers::new(dummy_salt_key(&keeper)).unwrap(),
+                set_up_code: SetUpCode::at_start(keeper.set_up(), now).0,
+                desk: Desk::open(keeper).unwrap(),
+                clock: Arc::new(move || clock_for_server.load(Ordering::SeqCst)),
+                backend,
+            });
+            tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap().block_on(async {
+                let listener = serve::listen(addr).unwrap();
+                let shell = Shell::backend(addr.ip(), &nexus_music_server::hello(backend), accounts, Some("https://nexus.example.org"));
+                let serving = tokio::spawn(serve::serve(listener, shell, false));
+                let _ = stopped.await;
+                serving.abort();
+                let _ = serving.await;
+            });
+        });
+        self.clock_server = Some((stop, thread));
+        self.wait_until_ready();
+        clock
+    }
+
+    fn wait_until_ready(&self) {
         let start = Instant::now();
         loop {
             if TcpStream::connect(("127.0.0.1", self.port)).is_ok() {
@@ -92,6 +140,10 @@ impl Fixture {
     }
 
     fn stop(&mut self) -> String {
+        if let Some((stop, thread)) = self.clock_server.take() {
+            let _ = stop.send(());
+            thread.join().unwrap();
+        }
         let Some(mut child) = self.child.take() else { return String::new() };
         let _ = child.kill();
         let output = child.wait_with_output().unwrap();
@@ -124,6 +176,10 @@ impl Fixture {
     }
 
     fn sign_in(&self, credential: Credential, device: u8) -> (SignedIn, Stamp) {
+        self.sign_in_with(credential, device, "")
+    }
+
+    fn sign_in_with(&self, credential: Credential, device: u8, headers: &str) -> (SignedIn, Stamp) {
         let request = account::encode(&SignIn {
             credential,
             device_secret: DeviceSecret::from_bytes([device; 32]),
@@ -133,7 +189,7 @@ impl Fixture {
             speaks: SPEAKS,
             restore: None,
         }).unwrap();
-        let (status, body) = self.post(account::SIGN_IN, None, request.bytes());
+        let (status, body) = self.post_with(account::SIGN_IN, None, headers, request.bytes());
         match account::read_reply::<SignedIn>(status, &body).unwrap() {
             Reply::Done { result, receipt } => (result, receipt.stamp),
             refusal => panic!("sign-in refused: {refusal:?}"),
@@ -283,13 +339,32 @@ fn a_password_grant_erases_only_its_owners_history_and_fences_old_life() {
     }).unwrap();
     assert_eq!(fixture.post(account::DELETE_LISTENING_DATA, Some(&other), delete.bytes()).0, 403);
     assert_eq!(count(&fixture, "listening_events"), 1);
-    let (status, body) = fixture.post(events::DELETE_PATH, Some(&who), delete.bytes());
+    let racing = batch(&stamp, &[start(2, 200, 0)]);
+    let barrier = Barrier::new(2);
+    let (status, body) = std::thread::scope(|scope| {
+        let racing = scope.spawn(|| {
+            barrier.wait();
+            let (status, body) = send(&fixture, &who, &racing);
+            match events::read_reply(status, &body, &racing) {
+                Ok(Reply::Done { result, .. }) => assert_eq!(result.outcome(racing.events()[0].record().id()), Outcome::Taken),
+                Err(events::Wrong::LifeMoved { life }) => assert_eq!(life, stamp.life + 1),
+                _ => panic!("racing batch did not finish"),
+            }
+        });
+        barrier.wait();
+        let reply = fixture.post(events::DELETE_PATH, Some(&who), delete.bytes());
+        racing.join().unwrap();
+        reply
+    });
     let Reply::Done { receipt, .. } = account::read_reply::<SignedOut>(status, &body).unwrap()
         else { panic!("deletion refused") };
     assert_eq!(receipt.stamp.life, stamp.life + 1);
     assert_eq!(count(&fixture, "listening_events"), 0);
     assert_eq!(fixture.post(account::DELETE_LISTENING_DATA, Some(&who), delete.bytes()).0, 403);
     let (status, body) = send(&fixture, &who, &old);
+    let Reply::Done { result, .. } = account::read_reply::<events::BatchAnswer>(status, &body).unwrap()
+        else { panic!("stale batch did not carry the new receipt") };
+    assert!(result.answers().is_empty());
     assert_eq!(events::read_reply(status, &body, &old), Err(events::Wrong::LifeMoved { life: receipt.stamp.life }));
     assert_eq!(count(&fixture, "listening_events"), 0);
     let new = batch(&receipt.stamp, &[start(1, 300, 0)]);
@@ -330,6 +405,59 @@ fn length_is_refused_from_the_head_and_a_slow_body_does_not_hold_the_writer() {
     assert_eq!(json::<i64>(&second, "$.done.result.recent[0].event.sequence"), 450);
 }
 
+#[test]
+fn batch_places_belong_to_live_accounts() {
+    let mut fixture = Fixture::new("batch-admission");
+    let code = fixture.set_up();
+    let other_code = fixture.other();
+    fixture.start();
+    let (who, stamp) = fixture.sign_in(with_code(code), 1);
+    let (other, other_stamp) = fixture.sign_in(with_code(other_code), 2);
+    let fake = Session::from_bytes([99; 32]);
+    let forged = b"{";
+    let mut socket = fixture.request(events::SEND_PATH, Some(&fake), "", forged.len());
+    socket.write_all(forged).unwrap();
+    // Session admission precedes JSON parsing and does not claim a batch place.
+    assert_eq!(response(socket).0, 401);
+
+    let rows = (1..=500).map(|n| start(n, n, 0)).collect::<Vec<_>>();
+    let first = batch(&stamp, &rows);
+    let second = batch(&other_stamp, &rows);
+    let body = first.write().unwrap();
+    let stale = Batch::prefix(
+        RequestHead { restore: stamp.restore + 1, ..head(&stamp) },
+        stamp.life, &rows, events::BATCH_BYTES,
+    ).unwrap().write().unwrap();
+    let mut socket = fixture.request(events::SEND_PATH, Some(&fake), "", stale.bytes().len());
+    socket.write_all(stale.bytes()).unwrap();
+    let (status, body) = response(socket);
+    assert_eq!(account::read_reply::<SignedOut>(status, &body).unwrap(),
+        Reply::Refused(Refusal::NotSignedIn(account::NotSignedIn::DataPutBack)));
+
+    let barrier = Barrier::new(10);
+    std::thread::scope(|scope| {
+        let first_send = scope.spawn(|| {
+            barrier.wait();
+            assert_outcomes(send(&fixture, &who, &first), &first, &vec![Outcome::Taken; 500]);
+        });
+        let second_send = scope.spawn(|| {
+            barrier.wait();
+            assert_outcomes(send(&fixture, &other, &second), &second, &vec![Outcome::Taken; 500]);
+        });
+        for _ in 0..8 {
+            scope.spawn(|| {
+                barrier.wait();
+                let mut socket = fixture.request(events::SEND_PATH, Some(&fake), "", body.bytes().len());
+                socket.write_all(body.bytes()).unwrap();
+                assert_eq!(response(socket).0, 401);
+            });
+        }
+        first_send.join().unwrap();
+        second_send.join().unwrap();
+    });
+    assert_eq!(count(&fixture, "listening_events"), 1_000);
+}
+
 fn report(count: u64, populated: bool) -> Report {
     let mut record = diag::Record::default();
     if populated {
@@ -364,24 +492,79 @@ fn upload(fixture: &Fixture, who: &SignedIn, stamp: &Stamp, n: u64, report: &Rep
 }
 
 #[test]
-fn diagnostics_refuse_private_text_and_keep_the_newest_per_device() {
-    let mut fixture = Fixture::new("diag");
+fn diagnostics_cooldown_spares_the_writer_and_allows_known_device_sign_in() {
+    let mut fixture = Fixture::new("report-admission");
     let code = fixture.set_up();
-    let other_code = fixture.other();
+    let clock = fixture.start_with_clock();
+    let (who, stamp) = fixture.sign_in(with_code(code), 1);
+    let (other_device, other_stamp) = fixture.sign_in(with_password(), 2);
+    upload(&fixture, &who, &stamp, 1, &report(1, true));
+    // The cooldown is per device, including for devices on the same account.
+    upload(&fixture, &other_device, &other_stamp, 1, &report(1, true));
+    let next = Upload::new(head(&stamp), RequestId::new(2).unwrap(), &report(2, true)).unwrap().write().unwrap();
+    let changes = || fixture.db().query_row("SELECT changes FROM meta", [], |row| row.get::<_, i64>(0)).unwrap();
+    let before = changes();
+    let (status, body) = fixture.post(diag::SEND_PATH, Some(&who), next.bytes());
+    assert!(matches!(diag::read_reply(status, &body).unwrap(), Reply::Refused(Refusal::Busy { .. })));
+    assert_eq!(changes(), before);
+
+    let barrier = Barrier::new(13);
+    std::thread::scope(|scope| {
+        let sign_in = scope.spawn(|| {
+            barrier.wait();
+            fixture.sign_in(with_password(), 2)
+        });
+        for _ in 0..12 {
+            scope.spawn(|| {
+                barrier.wait();
+                let (status, body) = fixture.post(diag::SEND_PATH, Some(&who), next.bytes());
+                assert!(matches!(diag::read_reply(status, &body).unwrap(), Reply::Refused(Refusal::Busy { .. })));
+            });
+        }
+        sign_in.join().unwrap();
+    });
+    assert_eq!(count(&fixture, "diagnostic_reports"), 2);
+
+    clock.fetch_add(diag::MIN_GAP_MS - 1, Ordering::SeqCst);
+    let (status, body) = fixture.post(diag::SEND_PATH, Some(&who), next.bytes());
+    assert_eq!(diag::read_reply(status, &body).unwrap(), Reply::Refused(Refusal::Busy {
+        retry_after_seconds: account::Wait::new(1),
+    }));
+    clock.fetch_add(1, Ordering::SeqCst);
+    upload(&fixture, &who, &stamp, 2, &report(2, true));
+    assert_eq!(count(&fixture, "diagnostic_reports"), 3);
+}
+
+#[test]
+fn diagnostics_refuse_private_text_without_echo() {
+    let mut fixture = Fixture::new("diag-private");
+    let code = fixture.set_up();
     fixture.start();
     let (who, stamp) = fixture.sign_in(with_code(code), 1);
-    let (other, other_stamp) = fixture.sign_in(with_code(other_code), 2);
     let written = Upload::new(head(&stamp), RequestId::new(1).unwrap(), &report(1, false)).unwrap().write().unwrap();
     let dirty = std::str::from_utf8(written.bytes()).unwrap().replace("0.41.0 on PC", "private-title on PC");
     assert_ne!(dirty.as_bytes(), written.bytes());
     let (status, body) = fixture.post(diag::SEND_PATH, Some(&who), dirty.as_bytes());
     assert_eq!(diag::read_reply(status, &body).unwrap(), Reply::Refused(Refusal::Malformed));
     assert!(!String::from_utf8(body).unwrap().contains("private-title"));
-    let first = upload(&fixture, &who, &stamp, 1, &report(1, false));
-    assert_eq!(upload(&fixture, &who, &stamp, 1, &report(1, false)), first);
+    assert!(!fixture.stop().contains("private-title"));
+}
+
+#[test]
+fn diagnostics_keep_the_newest_per_device_and_require_a_page_session_for_text() {
+    let mut fixture = Fixture::new("diag");
+    let code = fixture.set_up();
+    let other_code = fixture.other();
+    let clock = fixture.start_with_clock();
+    let (who, stamp) = fixture.sign_in(with_code(code), 1);
+    let (other, other_stamp) = fixture.sign_in(with_code(other_code), 2);
+    upload(&fixture, &who, &stamp, 1, &report(1, false));
+    clock.fetch_add(diag::MIN_GAP_MS, Ordering::SeqCst);
+    upload(&fixture, &who, &stamp, 1, &report(1, false));
     assert_eq!(count(&fixture, "diagnostic_reports"), 1);
     for n in 2..=diag::STORED_REPORTS as u64 + 1 {
         upload(&fixture, &who, &stamp, n, &report(n, false));
+        clock.fetch_add(diag::MIN_GAP_MS, Ordering::SeqCst);
     }
     assert_eq!(count(&fixture, "diagnostic_reports"), diag::STORED_REPORTS as i64);
     let db = fixture.db();
@@ -397,11 +580,17 @@ fn diagnostics_refuse_private_text_and_keep_the_newest_per_device() {
     let path = nexus_music_server::diag::ADMIN_PATH;
     assert_eq!(fixture.post(path, Some(&who), page(&stamp, None).bytes()).0, 403);
     assert_eq!(fixture.post_with(path, Some(&other), BROWSER, page(&other_stamp, None).bytes()).0, 403);
-    let (status, body) = fixture.post_with(path, Some(&who), BROWSER, page(&stamp, None).bytes());
+    assert_eq!(fixture.post_with(path, Some(&who), BROWSER, page(&stamp, None).bytes()).0, 403);
+    let (admin, admin_stamp) = fixture.sign_in_with(with_password(), 3, BROWSER);
+    let (status, body) = fixture.post_with(path, Some(&admin), BROWSER, page(&admin_stamp, None).bytes());
     assert_eq!(status, 200);
     assert_eq!(json::<String>(&body, "$.done.result.reports[0].text"), report(50, false).text().unwrap());
     assert_eq!(json::<i64>(&body, "$.done.result.reports[0].account"), other.person.id.get() as i64);
-    assert!(!fixture.stop().contains("private-title"));
+    let event = batch(&other_stamp, &[start(1, 100, 0)]);
+    assert_outcomes(send(&fixture, &other, &event), &event, &[Outcome::Taken]);
+    let stats = fixture.stats(&admin, &admin_stamp, DeviceId::new(1));
+    assert_eq!(json::<i64>(&stats, "$.done.result.starts"), 0);
+    assert_eq!(json::<Option<String>>(&stats, "$.done.result.recent[0].event"), None);
 }
 
 #[test]
@@ -417,31 +606,9 @@ fn restart_keeps_acknowledged_events_and_reports() {
     fixture.start();
     assert_eq!(json::<i64>(&fixture.stats(&who, &stamp, None), "$.done.result.starts"), 1);
     assert_outcomes(send(&fixture, &who, &kept), &kept, &[Outcome::Taken]);
-    let (status, body) = fixture.post_with(nexus_music_server::diag::ADMIN_PATH, Some(&who), BROWSER, page(&stamp, None).bytes());
+    let (status, body) = fixture.post(nexus_music_server::diag::LIST_PATH, Some(&who), page(&stamp, None).bytes());
     assert_eq!(status, 200);
-    assert_eq!(json::<String>(&body, "$.done.result.reports[0].text"), report(1, false).text().unwrap());
-    assert_eq!(count(&fixture, "diagnostic_reports"), 1);
-}
-
-#[test]
-fn opening_an_s8_database_without_journal_tables_keeps_its_sessions() {
-    let mut fixture = Fixture::new("s8-form");
-    let code = fixture.set_up();
-    fixture.start();
-    let (who, stamp) = fixture.sign_in(with_code(code), 1);
-    fixture.stop();
-    // Model the form-1 schema from S8, which predates the journal tables.
-    fixture.db().execute_batch(
-        "DROP TRIGGER listening_erase_life;
-         DROP TABLE listening_events;
-         DROP TABLE listening_totals;
-         DROP TABLE diagnostic_reports;",
-    ).unwrap();
-    fixture.start();
-    let sent = batch(&stamp, &[start(1, 100, 0)]);
-    assert_outcomes(send(&fixture, &who, &sent), &sent, &[Outcome::Taken]);
-    upload(&fixture, &who, &stamp, 1, &report(1, false));
-    assert_eq!(count(&fixture, "listening_events"), 1);
+    assert_eq!(json::<i64>(&body, "$.done.result.reports[0].id"), 1);
     assert_eq!(count(&fixture, "diagnostic_reports"), 1);
 }
 
@@ -449,9 +616,10 @@ fn opening_an_s8_database_without_journal_tables_keeps_its_sessions() {
 fn startup_expiry_removes_diagnostics_even_when_the_device_is_absent() {
     let mut fixture = Fixture::new("expiry");
     let code = fixture.set_up();
-    fixture.start();
+    let clock = fixture.start_with_clock();
     let (who, stamp) = fixture.sign_in(with_code(code), 1);
     upload(&fixture, &who, &stamp, 1, &report(1, false));
+    clock.fetch_add(diag::MIN_GAP_MS, Ordering::SeqCst);
     upload(&fixture, &who, &stamp, 2, &report(2, false));
     fixture.stop();
     // Age only the oldest report, as if a month passed with the server off.
@@ -516,7 +684,7 @@ fn crossing_the_budget_rolls_back_only_the_rows_that_do_not_fit() {
 fn measure_storage_for_events_and_reports() {
     let mut fixture = Fixture::new("measure");
     let code = fixture.set_up();
-    fixture.start();
+    let clock = fixture.start_with_clock();
     let (who, stamp) = fixture.sign_in(with_code(code), 1);
     let bytes = || nexus_music_server::events::data_bytes(&fixture.db()).unwrap();
     fixture.stats(&who, &stamp, None);
@@ -545,6 +713,7 @@ fn measure_storage_for_events_and_reports() {
     let after_first = bytes();
     let mut report_bytes = 0;
     for n in 2..=31 {
+        clock.fetch_add(diag::MIN_GAP_MS, Ordering::SeqCst);
         let report = report(n, true);
         report_bytes += report.text().unwrap().len();
         upload(&fixture, &who, &stamp, n, &report);

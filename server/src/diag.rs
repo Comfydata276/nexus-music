@@ -9,14 +9,14 @@ use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{HeaderMap, Response};
 use nexus_core::nexus::account::{self, DeviceId, ListDevices, Refusal, Reply};
-use nexus_core::nexus::diag::{self, MAX_AGE_MS, STORED_REPORTS, Upload, Uploaded};
-use nexus_core::nexus::kept::Access;
+use nexus_core::nexus::diag::{self, MAX_AGE_MS, MIN_GAP_MS, STORED_REPORTS, Upload, Uploaded};
+use nexus_core::nexus::kept::{Access, SessionKind};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::accounts::session::{Accounts, refused};
 use crate::events::{
-    Calls, answer, authenticated, bearer, denied, finish, list_response, receipt, respond, result,
-    schema, sql, unavailable,
+    Calls, UploadLimit, admit_upload, answer, arrive, authenticated, bearer, denied, finish,
+    inspect_session, list_response, receipt, respond, result, signed_in, sql, unavailable,
 };
 
 pub const SEND_PATH: &str = diag::SEND_PATH;
@@ -25,33 +25,27 @@ pub const ADMIN_PATH: &str = "/nexus/api/admin/diagnostics";
 pub const LIST_PAGE: usize = 50;
 const EXPIRY_INTERVAL: Duration = Duration::from_secs(60);
 
-// CARRIED for form-1 data created before the store included the report table.
-const SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS diagnostic_reports (
-    row_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    account INTEGER NOT NULL REFERENCES accounts(number) ON DELETE CASCADE,
-    device INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
-    restore INTEGER NOT NULL,
-    request_id BLOB NOT NULL CHECK (length(request_id) = 8),
-    received_ms INTEGER NOT NULL,
-    text TEXT NOT NULL,
-    UNIQUE (device, restore, request_id)
-) STRICT;
-CREATE INDEX IF NOT EXISTS diagnostics_device ON diagnostic_reports(device, row_id DESC);
-CREATE INDEX IF NOT EXISTS diagnostics_account ON diagnostic_reports(account, row_id DESC);
-CREATE INDEX IF NOT EXISTS diagnostics_expiry ON diagnostic_reports(received_ms, row_id);
-";
-
 pub(crate) async fn send(State(calls): State<Calls>, headers: HeaderMap, body: Bytes) -> Response<Body> {
     let outcome = async {
         let hash = bearer(&calls, &headers)?;
-        let upload = Upload::read(&body).map_err(|_| Refusal::Malformed)?;
+        let permit = admit_upload(&calls, &hash, UploadLimit::Device, &body).await?;
+        let (permit, upload) = tokio::task::spawn_blocking(move || {
+            let upload = Upload::read(&body).map_err(|_| Refusal::Malformed)?;
+            Ok::<_, Refusal>((permit, upload))
+        }).await.map_err(unavailable)??;
         let clock = calls.accounts.clock.clone();
         answer(calls.accounts.desk.ask(move |keeper| {
             let now = clock();
-            let (number, device, account) = authenticated(keeper, &upload.head, &hash, Access::Write, now)?;
+            let (number, device, mut account) = signed_in(keeper, &upload.head, &hash)?;
+            permit.check(number, device)?;
             let at = keeper.clock(now).effective();
-            schema(keeper.data().connection(), "diagnostic_reports", SCHEMA).map_err(unavailable)?;
+            let db = keeper.data().connection();
+            let wait = report_wait(db, device, at).map_err(unavailable)?;
+            if wait != 0 {
+                inspect_session(keeper, &mut account, device, &hash, now)?;
+                return Err(Refusal::Busy { retry_after_seconds: account::Wait::new(wait.div_ceil(1000)) });
+            }
+            arrive(keeper, &upload.head, &hash, device, &mut account, Access::Write, now)?;
             let matches = keeper.write_data(now, |tx| keep(tx, number, device, upload, at))
                 .map_err(unavailable)?;
             if !matches {
@@ -61,6 +55,15 @@ pub(crate) async fn send(State(calls): State<Calls>, headers: HeaderMap, body: B
         }).await)
     }.await;
     finish(outcome)
+}
+
+fn report_wait(db: &Connection, device: DeviceId, now: u64) -> rusqlite::Result<u64> {
+    let last = db.query_row(
+        "SELECT received_ms FROM diagnostic_reports WHERE device = ?1 ORDER BY row_id DESC LIMIT 1",
+        [sql(device.get())?],
+        |row| row.get::<_, i64>(0),
+    ).optional()?;
+    Ok(last.map_or(0, |received| MIN_GAP_MS.saturating_sub(now.saturating_sub(received as u64))))
 }
 
 fn keep(tx: &Transaction<'_>, account: u64, device: DeviceId, upload: Upload, now: u64) -> rusqlite::Result<(bool, bool)> {
@@ -111,10 +114,7 @@ pub(crate) fn start_expiry(accounts: &Arc<Accounts>) {
             interval.tick().await;
             let Some(accounts) = accounts.upgrade() else { break };
             let clock = accounts.clock.clone();
-            let _ = accounts.desk.ask(move |keeper| {
-                schema(keeper.data().connection(), "diagnostic_reports", SCHEMA).map_err(unavailable)?;
-                keeper.idle(clock()).map_err(unavailable)
-            }).await;
+            let _ = accounts.desk.ask(move |keeper| keeper.idle(clock())).await;
         }
     });
 }
@@ -141,13 +141,12 @@ async fn read_page(calls: Calls, headers: HeaderMap, body: Bytes, admin: bool) -
         let clock = calls.accounts.clock.clone();
         let (page, stamp) = answer(calls.accounts.desk.ask(move |keeper| {
             let now = clock();
-            let (number, _, account) = authenticated(keeper, &request.head, &hash, Access::Read, now)?;
-            if admin && !account.state().admin {
+            let (number, _, account, kind) = authenticated(keeper, &request.head, &hash, Access::Read, now)?;
+            if admin && (kind != SessionKind::AdminPage || !account.state().admin) {
                 return Err(denied());
             }
             let at = keeper.clock(now).effective();
             let db = keeper.data().connection();
-            schema(db, "diagnostic_reports", SCHEMA).map_err(unavailable)?;
             let page = page(db, if admin { None } else { Some(number) }, request.after, at).map_err(unavailable)?;
             Ok((page, receipt(keeper, account.state())?))
         }).await)?;
