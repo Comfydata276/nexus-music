@@ -106,7 +106,9 @@ def main(build):
     front.certs()
     subprocess.run(f"cp {front.CERTS}/ca.pem {A.HOMES}/certs/ca.pem", shell=True)
     silent, proxy, hole = silent_listener(SILENT), silent_listener(PROXY), full_listener(HOLE)
-    at = lambda port, host=front.HOST: f"https://{host}:{port}{HELLO}"
+    # (The address as the program makes it: the one reading of an address leaves out the
+    # port when it is HTTPS's own, 443.)
+    at = lambda port, host=front.HOST: f"https://{host}{'' if port == 443 else f':{port}'}{HELLO}"
     on = {"NEXUS_MUSIC_NEXUS": "1"}
     dns_ack = os.path.join(A.HOMES, "certs", "dns-ack")
     fds = os.path.join(A.HOMES, "certs", "fds")
@@ -175,21 +177,8 @@ def main(build):
             lines.append(fd_line)
             if not set(given) <= {"0", "1", "2", "3"}:
                 failures.append(f"descriptors given to the look's process: {given}")
-    # Switched off, --nexus-probe is not obeyed: the app starts (and is still running when it
-    # is stopped), and nothing is asked.
-    for arg in ("--nexus-probe", "--nexus-probe-timed"):
-        with front.Front("found", os.path.join(front.STATE, "phases", "off")) as f:
-            home = "/work/target/walk/phase-switched-off"
-            off_env = {"SLINT_BACKEND": "headless-skia", "NEXUS_MUSIC_HOME": home}
-            _, took, code = in_container(build, f"{arg} {at(front.TLS_PORT)}", off_env, "host") if False else run_off(build, arg, at(front.TLS_PORT), off_env)
-            nothing = len(f.asked()) == 0
-        ok = code == 124 and nothing
-        line = f"| switched off: `{arg} <address>` | {'the app started' if code == 124 else f'exit {code}'}; {'nothing asked' if nothing else 'ASKED'} | the app starts, nothing asked | | {'yes' if ok else '**no**'} | |"
-        print(line, flush=True)
-        lines.append(line)
-        if not ok:
-            failures.append(f"switched off, {arg} was obeyed")
-        subprocess.run(f"rm -rf {A.HOMES}/phase-switched-off", shell=True)
+    # (The switch is gone with slice W7: the component is always made, so the rows for
+    # "switched off" are no longer run.)
     table = "\n".join(["| Phase | The component's look said | Must say | Entered, and how | As it must be | Its process left to itself |", "|---|---|---|---|---|---|"] + lines)
     open(os.path.join(HERE, "PHASES.md"), "w").write(
         "# One look, stalled in each phase\n\nMade by `python3 tests/e13a/phases.py`. The deadline over a look is 10 s. "
@@ -198,16 +187,6 @@ def main(build):
         "that reason.\n\n" + table + "\n")
     print("\nfailed:", failures or "none")
     return 1 if failures else 0
-
-
-def run_off(build, arg, url, env):
-    """The build run with the switch unset, stopped after 6 s: 124 if it was still running."""
-    flags = " ".join(f"-e {k}={v}" for k, v in {"SSL_CERT_FILE": "/work/target/walk/certs/ca.pem", **env}.items())
-    docker = f"--add-host {front.HOST}:127.0.0.1 {flags}"
-    command = f'cd {A.WORK} && DX_DOCKER_ARGS="{docker}" scripts/dx timeout 6 target/walk/nexus-music-{build} {arg} {url}'
-    began = time.time()
-    out = subprocess.run(command, shell=True, capture_output=True, text=True)
-    return out.stdout, time.time() - began, out.returncode
 
 
 if __name__ == "__main__":

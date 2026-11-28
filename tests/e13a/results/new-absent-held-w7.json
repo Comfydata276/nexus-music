@@ -1,0 +1,171 @@
+{
+ "suite": 3,
+ "run": "new-absent-held-w7",
+ "machine_load_at_start_and_end": [
+  25.01,
+  19.31
+ ],
+ "build": "new",
+ "mode": "absent",
+ "hook": "held",
+ "at": "2026-11-28 16:06:30",
+ "binary": "064a8fa2d4dfa8d7",
+ "results": {
+  "a_play_is_counted_as_released": {
+   "the_kept_log_is_not_empty": 148,
+   "start_up_left_the_log_byte_for_byte (first start)": "148 bytes, 148 before",
+   "play_to_counted": 10.765,
+   "the_log_was_only_added_to": true,
+   "the_log_was_only_added_to (first start, at its end)": true,
+   "added_with_times_masked (first start)": "[\"3HrMsvEFi99qxWnytxSZkV\",T,\"playlist:0xUBIqKWew6szTtjwWVL0C\"]\n",
+   "start_up_left_the_log_byte_for_byte (second start)": "220 bytes, 220 before",
+   "the_log_was_only_added_to (second start)": true,
+   "added_with_times_masked (second start)": "[\"1Q81m55CQ431qttIOG7WuD\",T]\n[\"7fzzLozEKEAoYXRQEu33AI\",T]\n[\"0F8gsygwpNvzY9VXUZjJE2\",T]\n[\"3HrMsvEFi99qxWnytxSZkV\",T]\n"
+  },
+  "cold_start_publishes_the_saved_account": {
+   "launch_to_home_drawn": 2.666
+  },
+  "cold_start_puts_the_queue_back_and_plays": {
+   "launch_to_queue_shown": 2.849,
+   "play_to_sound": 0.252
+  },
+  "a_like_and_a_play_reach_the_music_server": {
+   "counted_to_server_has_play": 0.206,
+   "the_play_reached_the_server_once": 1,
+   "like_to_server": 0.302,
+   "server_back_to_play_told_again": 2.047,
+   "the_held_play_reached_the_server_once": 1
+  },
+  "downloads_start_and_resume": {
+   "launch_to_list_scheduled_its_own": 15.119,
+   "by_hand_8_songs": 1.73,
+   "server_back_to_downloads_done": 22.803
+  },
+  "the_queue_is_changed_and_kept": {
+   "add_to_kept": 0.168,
+   "move_to_kept": 0.19,
+   "remove_to_kept": 0.138,
+   "queue_before_kill": [
+    [
+     "Glass Orchard",
+     "Runout Groove",
+     "Intro",
+     "Glass Orchard",
+     "Intro"
+    ],
+    1
+   ],
+   "restart_to_queue_shown": 14.988,
+   "queue_after_kill_is_the_queue_before": [
+    [
+     "Glass Orchard",
+     "Runout Groove",
+     "Intro",
+     "Glass Orchard",
+     "Intro"
+    ],
+    1
+   ],
+   "offered_after_another_device_saved": 12.67,
+   "continue_here_to_kept": 0.054,
+   "clear_to_kept": 0.066
+  },
+  "a_direct_play_starts_it_cold": {
+   "space_to_sound": 0.646
+  },
+  "two_songs_join_without_a_gap": {
+   "streamed_play_to_sound": 0.474,
+   "streamed_longest_stall_around_the_join": 0.062,
+   "streamed_silent_frames_at_the_join": 1,
+   "streamed_largest_step_at_the_join": 0.02,
+   "cached_play_to_sound": 0.247,
+   "cached_longest_stall_around_the_join": 0.107,
+   "cached_silent_frames_at_the_join": 1,
+   "cached_largest_step_at_the_join": 0.029,
+   "downloaded_play_to_sound": 1.205,
+   "downloaded_longest_stall_around_the_join": 0.289,
+   "downloaded_silent_frames_at_the_join": 1,
+   "downloaded_largest_step_at_the_join": 0.0176,
+   "streamed: both songs streamed, the second fetched before the join": [
+    [
+     1795845827.373,
+     "1Q81m55CQ431qttIOG7WuD"
+    ],
+    [
+     1795845827.487,
+     "7fzzLozEKEAoYXRQEu33AI"
+    ],
+    [
+     1795845833.34,
+     "4nnVfrAZeqY1EMbcJJnrjS"
+    ],
+    [
+     1795845833.44,
+     "3lRAwCKLX1yibtRxZ3tR8N"
+    ],
+    [
+     1795845849.356,
+     "3iNRuo3NQeSvdCt5LSmeRi"
+    ]
+   ],
+   "cached: neither song asked of the server": [],
+   "downloaded: nothing streamed": []
+  },
+  "offline_by_hand_and_by_loss": {
+   "by_hand_switch_to_offline": 0.481,
+   "offline_play_downloaded_to_sound": 0.723,
+   "by_hand_switch_back": 1.161,
+   "by_loss_noticed": 0.737,
+   "by_loss_play_downloaded_to_sound": 2.046,
+   "server_back_to_online": 2.118
+  },
+  "settings_row": {
+   "shown for tester": [],
+   "shown for guest": []
+  },
+  "backend": {
+   "threads for tester": {
+    "nexus-probe": 1
+   },
+   "the held look is still held (tester)": 1,
+   "threads for guest": {
+    "nexus-probe": 1
+   },
+   "the held look is still held (guest)": 1,
+   "dispatches": 8,
+   "requests_under_nexus (each one dispatch's)": "4 requests, 8 dispatched",
+   "requests_at_the_stand_in": 0,
+   "the_fault_at_each_action": [
+    "cold_start_publishes_the_saved_account/cold_start: thread 1/task/38",
+    "cold_start_puts_the_queue_back_and_plays/queue_back: thread 1/task/38",
+    "a_play_is_counted_as_released/counted: thread 1/task/38",
+    "a_like_and_a_play_reach_the_music_server/scrobbled: thread 1/task/38",
+    "downloads_start_and_resume/schedule: thread 1/task/38",
+    "a_like_and_a_play_reach_the_music_server/like: thread 1/task/38",
+    "the_queue_is_changed_and_kept/queue_edits: thread 1/task/38",
+    "the_queue_is_changed_and_kept/put_back: thread 1/task/38",
+    "a_direct_play_starts_it_cold/direct: thread 1/task/38",
+    "the_queue_is_changed_and_kept/continue_here: thread 1/task/38",
+    "the_queue_is_changed_and_kept/clear: thread 1/task/38",
+    "two_songs_join_without_a_gap/join_streamed: thread 1/task/38",
+    "two_songs_join_without_a_gap/join_cached: thread 1/task/38",
+    "two_songs_join_without_a_gap/join_downloaded: thread 1/task/38",
+    "downloads_start_and_resume/by_hand: thread 1/task/38",
+    "offline_by_hand_and_by_loss/offline_by_hand: thread 1/task/38",
+    "offline_by_hand_and_by_loss/by_loss_and_retry: thread 1/task/38",
+    "downloads_start_and_resume/resumed: thread 1/task/38",
+    "an_account_change_is_not_held_up/account: thread 1/task/38"
+   ],
+   "every_action_ran_under_the_fault": "19 of 19"
+  },
+  "an_account_change_is_not_held_up": {
+   "connect_to_home_drawn": 0.946,
+   "signed_in_as_guest": true
+  },
+  "music_server": {
+   "slowest_api_answer_during_the_actions": 0.574,
+   "every_api_request_answered_within_1_s": []
+  }
+ },
+ "failures": []
+}
