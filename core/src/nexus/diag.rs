@@ -95,46 +95,35 @@ impl Schedule {
     }
 
     pub fn note_fault(&mut self, at_ms: u64) {
+        self.forget_future(at_ms);
         let latest = self.attempts.back().copied().unwrap_or(self.started_ms);
         if (latest..=TIME_MAX_MS).contains(&at_ms) {
             self.fault_ms = Some(self.fault_ms.map_or(at_ms, |was| was.min(at_ms)));
         }
     }
 
-    /// The design does not say where a day begins. Use a rolling 24-hour cap, and a
-    /// full day from first use or the last attempt for the normal timer. When the
-    /// clock goes backwards or the app is idle, wait.
+    /// Use a rolling 24-hour cap and a full day from first use or the last attempt.
+    /// The design does not say how to handle clock changes. Keep the existing
+    /// wait for small backward steps, but ignore times more than a day ahead.
     pub fn due(&self, now_ms: u64, enabled: bool, in_use: bool) -> Option<Due> {
-        if !enabled
-            || !in_use
-            || now_ms > TIME_MAX_MS
-            || now_ms < self.started_ms
-            || self.fault_ms.is_some_and(|at| at > now_ms)
-            || self
-                .attempts
-                .back()
-                .is_some_and(|&at| !elapsed(at, now_ms, MIN_GAP_MS))
+        if !enabled || !in_use || now_ms > TIME_MAX_MS {
+            return None;
+        }
+        let cutoff = now_ms.saturating_add(DAY_MS);
+        let started = if self.started_ms > cutoff { now_ms } else { self.started_ms };
+        let attempts = self.attempts.iter().copied().take_while(|&at| at <= cutoff);
+        let last = attempts.clone().last();
+        let fault = self.fault_ms.filter(|&at| at <= cutoff);
+        if now_ms < started
+            || fault.is_some_and(|at| at > now_ms)
+            || last.is_some_and(|at| !elapsed(at, now_ms, MIN_GAP_MS))
+            || attempts.filter(|&at| !elapsed(at, now_ms, DAY_MS)).count() == MAX_PER_DAY
         {
             return None;
         }
-        if self.attempts.len() == MAX_PER_DAY
-            && self
-                .attempts
-                .front()
-                .is_some_and(|&at| !elapsed(at, now_ms, DAY_MS))
-        {
-            return None;
-        }
-        if self
-            .fault_ms
-            .is_some_and(|at| elapsed(at, now_ms, FAULT_WAIT_MS))
-        {
+        if fault.is_some_and(|at| elapsed(at, now_ms, FAULT_WAIT_MS)) {
             Some(Due::Fault)
-        } else if elapsed(
-            self.attempts.back().copied().unwrap_or(self.started_ms),
-            now_ms,
-            DAY_MS,
-        ) {
+        } else if elapsed(last.unwrap_or(started), now_ms, DAY_MS) {
             Some(Due::Daily)
         } else {
             None
@@ -143,11 +132,24 @@ impl Schedule {
 
     /// Consume one due attempt. A report sent by either timer covers the notes so far.
     pub fn take_due(&mut self, now_ms: u64, enabled: bool, in_use: bool) -> Option<Due> {
+        self.forget_future(now_ms);
         let due = self.due(now_ms, enabled, in_use)?;
         self.attempts.retain(|&at| !elapsed(at, now_ms, DAY_MS));
         self.attempts.push_back(now_ms);
         self.fault_ms = None;
         Some(due)
+    }
+
+    fn forget_future(&mut self, now_ms: u64) {
+        if now_ms > TIME_MAX_MS {
+            return;
+        }
+        let cutoff = now_ms.saturating_add(DAY_MS);
+        if self.started_ms > cutoff {
+            self.started_ms = now_ms;
+        }
+        self.attempts.retain(|&at| at <= cutoff);
+        self.fault_ms = self.fault_ms.filter(|&at| at <= cutoff);
     }
 }
 

@@ -532,3 +532,19 @@ fn windows_messages_and_download_moves_are_counted_as_fixed_notes() {
     let report = report(record);
     assert_eq!(Report::read(&report.text().unwrap()).unwrap(), report);
 }
+
+#[test]
+fn a_far_future_attempt_cannot_block_diagnostics_after_clock_correction() {
+    let wrong_time = AT + 365 * DAY_MS;
+    let mut schedule = Schedule::restore(AT, Some(wrong_time + MIN_GAP_MS), &[wrong_time]).unwrap();
+    let corrected = AT + DAY_MS;
+    assert_eq!(schedule.due(corrected, true, true), Some(Due::Daily));
+    assert_eq!(schedule.take_due(corrected, true, true), Some(Due::Daily));
+    assert_eq!(schedule.attempts().collect::<Vec<_>>(), vec![corrected]);
+    assert_eq!(schedule.fault_ms(), None);
+
+    let mut first_use = Schedule::new(wrong_time).unwrap();
+    first_use.note_fault(corrected);
+    assert_eq!(first_use.started_ms(), corrected);
+    assert_eq!(first_use.due(corrected + FAULT_WAIT_MS, true, true), Some(Due::Fault));
+}
