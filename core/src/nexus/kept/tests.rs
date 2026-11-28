@@ -257,7 +257,7 @@ impl Stored {
 
     pub fn leave(&mut self, id: u64, n: u8, purpose: LeaveFor, at: u64) -> Result<(), Denied> {
         let receipt = self.leave_receipt(id, n, purpose, at)?;
-        self.step(at, |turn| turn.grant_leave(receipt))
+        self.step(at, |turn| turn.grant_leave(receipt, grant()))
     }
 
     pub fn read(&mut self, id: u64, n: u8, at: u64) -> Result<Request, Denied> {
@@ -269,10 +269,16 @@ impl Stored {
     }
 }
 
+pub(super) fn grant() -> &'static GrantSecret {
+    static SECRET: std::sync::OnceLock<GrantSecret> = std::sync::OnceLock::new();
+    SECRET.get_or_init(|| GrantSecret::from_bytes([14; SECRET_BYTES]))
+}
+
 pub(super) fn bearer(device: u64, hash: &Fingerprint) -> Bearer<'_> {
     Bearer {
         device: dev(device),
         hash,
+        grant: Some(grant()),
     }
 }
 
@@ -287,7 +293,7 @@ fn checked_password_receipts_are_single_purpose_scoped_and_short_lived() -> Resu
     );
     let receipt = s.bind(8, 1, 0)?;
     assert_eq!(
-        s.step(0, |turn| turn.grant_leave(receipt)),
+        s.step(0, |turn| turn.grant_leave(receipt, grant())),
         Err(Denied::NotSignedIn)
     );
     let receipt = s.bind(8, 1, 1)?;
@@ -425,7 +431,7 @@ fn force_out_and_sign_in_in_both_orders_fence_old_sessions_and_receipts() -> Res
         let leave = s.leave_receipt(1, 1, LeaveFor::DeleteHistory, 2)?;
         s.step(3, |turn| turn.sign_out(bearer(1, &hash(1))))?;
         assert_eq!(
-            s.step(3, |turn| turn.grant_leave(leave)),
+            s.step(3, |turn| turn.grant_leave(leave, grant())),
             Err(Denied::NotSignedIn)
         );
     }
@@ -668,5 +674,35 @@ fn only_hourly_activity_is_persisted_and_recovery_never_makes_it_older() -> Resu
         Some(Denied::NotSignedIn)
     );
     assert!(s.data.devices.get(&dev(1)).unwrap().session.is_none());
+    Ok(())
+}
+
+#[test]
+fn a_grant_secret_cannot_be_omitted_or_spend_its_replacement() -> Result<(), Denied> {
+    let mut s = Stored::new(state("alice@example.test"));
+    s.sign_in(8, 1, 1, 0)?;
+    s.leave(1, 1, LeaveFor::DeleteHistory, 1)?;
+    let replacement = GrantSecret::from_bytes([15; SECRET_BYTES]);
+    let receipt = s.leave_receipt(1, 1, LeaveFor::DeleteHistory, 1)?;
+    s.step(1, |turn| turn.grant_leave(receipt, &replacement))?;
+    for grant in [None, Some(grant())] {
+        assert_eq!(
+            s.step(1, |turn| turn.delete_history(Bearer {
+                device: dev(1),
+                hash: &hash(1),
+                grant
+            })),
+            Err(Denied::LeaveRequired)
+        );
+    }
+    s.reload();
+    s.step(1, |turn| {
+        turn.delete_history(Bearer {
+            device: dev(1),
+            hash: &hash(1),
+            grant: Some(&replacement),
+        })
+    })?;
+    assert_eq!(s.apart.account.life, 2);
     Ok(())
 }

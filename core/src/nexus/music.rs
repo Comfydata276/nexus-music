@@ -4,8 +4,7 @@
 use super::account::{AccountId, MusicAddress, MusicSalt, MusicToken, Name, SALT_LENGTH};
 use super::kept::MusicAuthorization;
 use super::proto::{self, BackendId};
-use super::wire::{self, BadMessage, Fields, Message, Value};
-use serde::Serialize;
+use super::wire::{self, BadMessage, Fields, Value};
 use serde_json::value::RawValue;
 use std::fmt;
 use zeroize::Zeroizing;
@@ -284,7 +283,7 @@ fn ping_answer(reply: Option<(u16, &[u8])>) -> Result<(), Outcome> {
 
 fn user_answer(reply: Option<(u16, &[u8])>, name: &str) -> Result<(), Outcome> {
     match read_reply(reply) {
-        Some(Envelope::Ok(Some(found))) if found == name => Ok(()),
+        Some(Envelope::Ok(Some(found))) if found.as_str() == name => Ok(()),
         // E3.4. Wrong credentials and the upstream limiter have the same envelope.
         Some(Envelope::Error(BAD_SIGN_IN)) => Err(Outcome::Refused),
         _ => Err(Outcome::CouldNotAsk),
@@ -318,13 +317,10 @@ pub fn classify_start(status: u16, prefix: &[u8], complete: bool) -> ReplyStart 
     }
 }
 
-#[derive(Serialize)]
 enum Envelope {
-    Ok(Option<String>),
+    Ok(Option<Zeroizing<String>>),
     Error(u64),
 }
-
-impl Message for Envelope {}
 
 impl Value for Envelope {
     fn read(raw: &RawValue) -> Result<Self, BadMessage> {
@@ -357,7 +353,7 @@ impl Value for Envelope {
                     if name.is_empty() {
                         return Err(BadMessage::Form);
                     }
-                    Some(name.to_string())
+                    Some(name)
                 } else {
                     None
                 };
@@ -377,10 +373,10 @@ fn read_reply(reply: Option<(u16, &[u8])>) -> Option<Envelope> {
     let (status, bytes) = reply?;
     // The design does not say what a convincing body at an unmeasured status
     // means. Treat only a complete measured HTTP 200 envelope as authoritative.
-    if status != 200 || bytes.len() > ANSWER_MAX_BYTES {
+    if status != 200 {
         return None;
     }
-    wire::read(bytes).ok()
+    wire::read_value(bytes, ANSWER_MAX_BYTES).ok()
 }
 
 #[cfg(test)]

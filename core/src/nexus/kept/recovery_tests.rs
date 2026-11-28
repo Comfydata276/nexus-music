@@ -1,4 +1,4 @@
-use super::tests::{Stored, bearer, clock, dev, fresh, hash, state};
+use super::tests::{Stored, bearer, clock, dev, fresh, grant, hash, state};
 use super::*;
 
 impl Stored {
@@ -41,6 +41,9 @@ impl Stored {
                 target.mark = effects.high_water;
                 for update in &effects.updates {
                     let store = if update.data.account.id == target.data.account.id {
+                        if change == AdminAction::SetAdmin(false) {
+                            assert!(!update.apart_first.account.admin);
+                        }
                         &mut *target
                     } else {
                         &mut *self
@@ -368,7 +371,9 @@ fn a_crash_cannot_restore_consumed_leave_or_recognize_new_leave_early() -> Resul
     let before = user.data.clone();
     let receipt = user.leave_receipt(1, 1, LeaveFor::DeleteHistory, 1)?;
     user.account
-        .request(1, clock(1, user.mark), |turn| turn.grant_leave(receipt))
+        .request(1, clock(1, user.mark), |turn| {
+            turn.grant_leave(receipt, grant())
+        })
         .apply(|e| {
             let update = e.updates.first().unwrap();
             for rows in [&before, &update.data] {
@@ -611,6 +616,7 @@ fn admin_payload_is_authorized_in_the_effects_only_when_the_change_is_allowed() 
                         .get(&dev(1))
                         .unwrap()
                         .permit
+                        .as_ref()
                         .unwrap()
                         .leave
                         .is_none()

@@ -2,8 +2,8 @@
 //! serialization lock and applies the returned effects before releasing the answer.
 
 use super::account::{
-    AccountId, DeviceId, DeviceSecret, Email, PASSWORD_LEAVE_MS, SECRET_BYTES, SESSION_IDLE_MS,
-    SessionId, StampTag,
+    AccountId, DeviceId, DeviceSecret, Email, GrantSecret, PASSWORD_LEAVE_MS, SECRET_BYTES,
+    SESSION_IDLE_MS, SessionId, StampTag,
 };
 use super::proto::BackendId;
 use hkdf::hmac::{Hmac, Mac};
@@ -117,8 +117,8 @@ impl AccountState {
     fn allows_session(&self) -> Result<(), Denied> {
         match self.status {
             Status::Deleted => Err(Denied::NotSignedIn),
+            _ if self.password_reset_required => Err(Denied::WrongPassword),
             Status::Off => Err(Denied::AccountOff),
-            Status::On if self.password_reset_required => Err(Denied::WrongPassword),
             Status::On => Ok(()),
         }
     }
@@ -155,7 +155,7 @@ pub enum LeaveFor {
     },
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Leave {
     purpose: LeaveFor,
     life: u64,
@@ -163,6 +163,7 @@ pub struct Leave {
     admin: bool,
     granted: u64,
     serial: u64,
+    hash: Fingerprint,
 }
 
 impl Leave {
@@ -173,6 +174,7 @@ impl Leave {
         admin: bool,
         granted: u64,
         serial: u64,
+        hash: Fingerprint,
     ) -> Self {
         Self {
             purpose,
@@ -181,10 +183,11 @@ impl Leave {
             admin,
             granted,
             serial,
+            hash,
         }
     }
 
-    pub fn fields(self) -> (LeaveFor, u64, u64, bool, u64, u64) {
+    pub fn fields(&self) -> (LeaveFor, u64, u64, bool, u64, u64, &Fingerprint) {
         (
             self.purpose,
             self.life,
@@ -192,6 +195,7 @@ impl Leave {
             self.admin,
             self.granted,
             self.serial,
+            &self.hash,
         )
     }
 }

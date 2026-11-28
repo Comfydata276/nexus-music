@@ -27,7 +27,7 @@ pub struct DeviceRow {
 
 /// The design does not say how to recognize partial grants. The apart record
 /// remembers which identity and leave the data may grant, without either hash.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Permit {
     pub id: SessionId,
     pub leave: Option<Leave>,
@@ -144,7 +144,7 @@ impl Account {
                 .and_then(|rows| rows.devices.get(&id));
             let session = row.and_then(|row| {
                 let stored = row.session.as_ref()?;
-                let permit = record.permit?;
+                let permit = record.permit.as_ref()?;
                 let same_restore = data.is_some_and(|rows| rows.account.restore == state.restore);
                 if !same_restore
                     || state.status != Status::On
@@ -157,7 +157,7 @@ impl Account {
                 }
                 let mut session = stored.clone();
                 session.leave = session.leave.filter(|leave| {
-                    Some(*leave) == permit.leave
+                    Some(leave) == permit.leave.as_ref()
                         && leave.serial <= record.last_leave
                         && leave.revision == state.revision
                         && leave.admin == state.admin
@@ -223,7 +223,7 @@ impl Account {
                         last_leave: device.last_leave,
                         permit: device.session.as_ref().map(|session| Permit {
                             id: session.id,
-                            leave: session.leave,
+                            leave: session.leave.clone(),
                         }),
                     },
                 )
@@ -326,11 +326,15 @@ impl Account {
             });
         }
         for (&id, after) in &mut apart_first.devices {
-            after.permit = after.permit.and_then(|new| {
-                let old = apart.devices.get(&id)?.permit?;
+            after.permit = after.permit.take().and_then(|new| {
+                let old = apart.devices.get(&id)?.permit.as_ref()?;
                 (old.id == new.id).then_some(Permit {
                     id: old.id,
-                    leave: old.leave.filter(|leave| Some(*leave) == new.leave),
+                    leave: old
+                        .leave
+                        .as_ref()
+                        .filter(|leave| Some(*leave) == new.leave.as_ref())
+                        .cloned(),
                 })
             });
         }
@@ -516,6 +520,8 @@ pub struct Turn<'a> {
 pub struct Bearer<'a> {
     pub device: DeviceId,
     pub hash: &'a Fingerprint,
+    /// Supplied by a grant-bearing request. Ordinary authenticated calls omit it.
+    pub grant: Option<&'a GrantSecret>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -569,7 +575,8 @@ impl Turn<'_> {
     }
 
     /// S8 supplies the fingerprint and deadline of the authoritative live code.
-    /// S3 rechecks the same data verifier and expiry when applying RedeemCode.
+    /// S3 rechecks the live verifier and deadline under its lock before writing
+    /// any part of a RedeemCode effect, including its apart-first spent fence.
     pub fn check_code(
         self,
         device: &DeviceSecret,
@@ -770,7 +777,8 @@ impl Turn<'_> {
         ))
     }
 
-    pub fn grant_leave(self, receipt: PasswordReceipt) -> Result<(), Denied> {
+    /// S8 generates a fresh grant secret. Only the fingerprint persists.
+    pub fn grant_leave(self, receipt: PasswordReceipt, grant: &GrantSecret) -> Result<(), Denied> {
         let id = receipt.scope().device;
         self.account
             .state
@@ -805,6 +813,7 @@ impl Turn<'_> {
             self.account.state.admin,
             checked,
             device.last_leave,
+            Fingerprint::of(grant.expose_bytes()),
         ));
         device.touch(self.now)?;
         Ok(())
@@ -883,8 +892,13 @@ impl Turn<'_> {
         let revision = self.account.state.revision;
         let admin = self.account.state.admin;
         let session = self.account.session(bearer.device, bearer.hash, self.now)?;
-        if !session.leave.is_some_and(|leave| {
-            leave.life == life
+        let hash = bearer
+            .grant
+            .map(|grant| Fingerprint::of(grant.expose_bytes()))
+            .ok_or(Denied::LeaveRequired)?;
+        if !session.leave.as_ref().is_some_and(|leave| {
+            leave.hash == hash
+                && leave.life == life
                 && leave.revision == revision
                 && leave.admin == admin
                 && leave.purpose == purpose
@@ -1086,14 +1100,11 @@ fn force_out(
     target: SessionTarget,
     music: &mut Option<MusicRecovery>,
 ) -> Result<(), Denied> {
-    let device = account
-        .devices
-        .get_mut(&target.device)
-        .ok_or(Denied::NotSignedIn)?;
-    if device
-        .session
-        .as_ref()
-        .is_some_and(|session| session.id == target.session)
+    if let Some(device) = account.devices.get_mut(&target.device)
+        && device
+            .session
+            .as_ref()
+            .is_some_and(|session| session.id == target.session)
     {
         device.end()?;
         if account.state.music_managed {
