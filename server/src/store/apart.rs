@@ -21,7 +21,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-use nexus_core::nexus::compare::{Pending, StoreView};
+use nexus_core::nexus::compare::{CopyIdentity, Pending, StoreView};
 use nexus_core::nexus::account::{AccountId, DeviceId, Email, MusicAddress, RequestId, SECRET_BYTES, SessionId};
 use nexus_core::nexus::kept::{AccountState, AdminAction, GrantIntent, AdminTarget, Apart, ApartDevice, Fingerprint, Leave, LeaveFor, LiveCode, MusicRecovery, Permit, SessionTarget, StampKey, Status};
 use nexus_core::nexus::proto::BackendId;
@@ -220,7 +220,7 @@ impl Store {
                 format!("pending change{}", accounts.iter().map(|account| format!(" {account}")).collect::<String>())
             }
             Some(Pending::Restore { restore }) => format!("pending restore {restore}"),
-            Some(Pending::PutBack { restore }) => format!("pending put-back {restore}"),
+            Some(Pending::PutBack { restore, copy }) => format!("pending put-back {restore} {} {} {}", hex(&copy.hash), copy.changes, copy.written_at),
             Some(Pending::TakeAsIs { restore }) => format!("pending take-as-is {restore}"),
         });
         let sum = hex(Sha256::digest(text.as_bytes()).as_slice());
@@ -315,7 +315,9 @@ impl Store {
             ["pending", "none"] => None,
             ["pending", "change", accounts @ ..] => Some(Pending::Change { accounts: accounts.iter().map(|account| number(account)).collect::<Option<Vec<u64>>>()? }),
             ["pending", "restore", restore] => Some(Pending::Restore { restore: number(restore)? }),
-            ["pending", "put-back", restore] => Some(Pending::PutBack { restore: number(restore)? }),
+            ["pending", "put-back", restore, hash, changes, written_at] => {
+                Some(Pending::PutBack { restore: number(restore)?, copy: CopyIdentity { hash: unhex(hash)?, changes: number(changes)?, written_at: number(written_at)? } })
+            }
             ["pending", "take-as-is", restore] => Some(Pending::TakeAsIs { restore: number(restore)? }),
             _ => return None,
         };
@@ -718,7 +720,7 @@ mod tests {
     fn what_is_written_is_read_back_the_same() {
         let state = folder("round");
         assert!(matches!(read(&state), Reading::Missing));
-        for pending in [None, Some(Pending::Change { accounts: vec![] }), Some(Pending::Change { accounts: vec![1, 2] }), Some(Pending::Restore { restore: 4 }), Some(Pending::PutBack { restore: 4 }), Some(Pending::TakeAsIs { restore: 4 })] {
+        for pending in [None, Some(Pending::Change { accounts: vec![] }), Some(Pending::Change { accounts: vec![1, 2] }), Some(Pending::Restore { restore: 4 }), Some(Pending::PutBack { restore: 4, copy: CopyIdentity { hash: [3; 32], changes: 9, written_at: 10 } }), Some(Pending::TakeAsIs { restore: 4 })] {
             let store = Store { pending: pending.clone(), ..full() };
             write(&state, &store).unwrap();
             let Reading::Found(back) = read(&state) else { panic!("not read back") };

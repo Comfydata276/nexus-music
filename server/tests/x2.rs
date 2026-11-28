@@ -15,6 +15,7 @@ use nexus_core::nexus::kept::{Access, Account, AdminAction, AdminTarget, Bearer,
 use nexus_music_server::identity;
 use nexus_music_server::store::data::{self, Change, Data, Migration};
 use nexus_music_server::store::keeper::{self, Failed, Keeper, Started};
+use nexus_core::nexus::compare;
 use nexus_music_server::store::{apart, copies, crash};
 
 /// A made-up time, in milliseconds.
@@ -1529,13 +1530,17 @@ fn a_put_back_cut_and_run_again_moves_the_numbers_once() {
     let device = store_of(&setup).accounts[&ALICE].apart.devices[&dev(ids.a1)].number;
     at_every_point("put-back", &setup, |root, cut| {
         let now = T0 + 20 * MINUTE;
+        // Done, killed only before it said so: run again, it is a second put-back (the
+        // re-review: only a restore still under way is resumed).
+        let done = store_of(root).pending.is_none() && store_of(root).restore == 1;
         if !cut.whole() {
             unlocked(|| keeper::put_back(&root.state(), &root.data(), &the_copy(root), now)).unwrap_or_else(|why| panic!("at {}: {why}", cut.at));
         }
         let (keeper, _) = settled(root, now);
-        assert_eq!(keeper.restore(), 1, "at {}", cut.at);
+        let times = if done && !cut.whole() { 2 } else { 1 };
+        assert_eq!(keeper.restore(), times, "at {}", cut.at);
         keeper.close();
-        assert_eq!(store_of(root).accounts[&ALICE].apart.devices[&dev(ids.a1)].number, device + 1, "at {}", cut.at);
+        assert_eq!(store_of(root).accounts[&ALICE].apart.devices[&dev(ids.a1)].number, device + times, "at {}", cut.at);
     });
 }
 
@@ -1548,7 +1553,9 @@ fn the_data_a_put_back_replaces_is_kept_whole_at_any_cut() {
     copies::nightly(&setup.data(), T0 + 2 * MINUTE).unwrap();
     at_every_point("put-back with a reader", &setup, |root, cut| {
         let now = T0 + 20 * MINUTE;
-        if !cut.whole() {
+        // Done and killed only before it said so: running it again would be a second put-back.
+        let done = store_of(root).pending.is_none() && store_of(root).restore == 1;
+        if !cut.whole() && !done {
             unlocked(|| keeper::put_back(&root.state(), &root.data(), &the_copy(root), now)).unwrap_or_else(|why| panic!("at {}: {why}", cut.at));
         }
         settled(root, now).0.close();
@@ -1584,11 +1591,24 @@ fn another_backends_copy_at_the_datas_place_is_refused_with_nothing_changed() {
         names.sort();
         names
     };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(data::place(&one.data()), fs::Permissions::from_mode(0o644)).unwrap();
+    }
     let (bytes, before) = (fs::read(data::place(&one.data())).unwrap(), names(&one));
-    let why = unlocked(|| Keeper::open(&one.state(), &one.data(), T0 + 6 * MINUTE)).err().unwrap();
-    assert!(why.0.contains("another backend's"), "{why}");
-    assert_eq!(fs::read(data::place(&one.data())).unwrap(), bytes, "the foreign file was changed");
-    assert_eq!(names(&one), before);
+    for attempt in ["start", "put-back", "take-as-is"] {
+        let why = match attempt {
+            "start" => unlocked(|| Keeper::open(&one.state(), &one.data(), T0 + 6 * MINUTE)).err().unwrap(),
+            "put-back" => unlocked(|| keeper::put_back(&one.state(), &one.data(), &copy.path, T0 + 6 * MINUTE)).err().unwrap(),
+            _ => unlocked(|| keeper::take_as_is(&one.state(), &one.data(), T0 + 6 * MINUTE)).err().unwrap(),
+        };
+        assert!(why.0.contains("another backend's"), "{attempt}: {why}");
+        assert_eq!(fs::read(data::place(&one.data())).unwrap(), bytes, "{attempt}: the foreign file was changed");
+        assert_eq!(names(&one), before, "{attempt}");
+        #[cfg(unix)]
+        assert_eq!(mode(&data::place(&one.data())), 0o644, "{attempt}: the foreign file was narrowed");
+    }
 }
 
 // ---- Other slices' rows through the one writer (S12/S7, S9) ----

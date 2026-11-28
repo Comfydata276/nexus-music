@@ -69,6 +69,29 @@ pub fn file(path: &Path) -> io::Result<()> {
     narrow(path, 0o077)
 }
 
+/// Before anything else is read: the data's own files, the copies and the store kept apart
+/// are files, not links (the re-review's 8): a link is refused, never followed, and what it
+/// points at is never narrowed.
+pub fn no_links(state: &Path, data: &Path) -> Result<(), String> {
+    let mut names: Vec<std::path::PathBuf> = ["", "-wal", "-shm", "-journal"].iter().map(|suffix| data.join(format!("{}{suffix}", crate::store::data::FILE))).collect();
+    names.push(crate::store::data::incoming(data));
+    names.push(crate::store::copies::folder(data));
+    names.push(crate::store::apart::place(state));
+    names.push(state.join(crate::identity::FILE));
+    if let Ok(entries) = fs::read_dir(crate::store::copies::folder(data)) {
+        names.extend(entries.flatten().map(|entry| entry.path()));
+    }
+    for path in names {
+        if fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            return Err(format!(
+                "{} is a link. The backend keeps its data, its copies and its store kept apart as files of their own, and follows no link to them: nothing is served and nothing was changed. Put the file itself there.",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Before anything is read for use: every file the backend keeps in `state` and `data`, and
 /// its copies, narrowed to the owner's alone; the two folders closed to others' writing.
 /// What cannot be narrowed is said, and stops the program: a file others can read is not

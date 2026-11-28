@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 
 use nexus_core::nexus::account::{AccountId, DeviceId, Email, SECRET_BYTES, SessionId};
 use nexus_core::nexus::diag;
-use nexus_core::nexus::compare::{self, Contradiction, Halt, NotPutBack, Pending, Resume};
+use nexus_core::nexus::compare::{self, Contradiction, CopyIdentity, Halt, InPlace, NotPutBack, Pending, Resume};
 use nexus_core::nexus::kept::{Account as Decided, AccountState, AdminAction, AdminTarget, Apart, Clock, DataChange, Effects, LiveCode, RestoreMode, Rows, StampKey, Startup, Status};
 use nexus_core::nexus::proto::BackendId;
 
@@ -188,6 +188,10 @@ fn halted(halt: Halt, folder: &Path) -> Refused {
             "A restore of the data was under way, and there is no data in {}. Nothing is served. Put a copy back with `nexus-music-server put-back`, or {TAKE_AS_IS}.",
             folder.display()
         ),
+        Halt::NotTheCopy => format!(
+            "A put-back was cut off, and the copy waiting beside the data, or the data now in {}, is not the copy it planned. Nothing is served and nothing was changed. If NEXUS_DATA names the wrong folder, set it right; otherwise put the copy back again.",
+            folder.display()
+        ),
         Halt::DataRestoreAhead => format!("The store kept apart does not belong with this data: {}. Nothing is served, and nothing was changed. {TAKE_AS_IS}.", contradiction(Contradiction::DataRestoreAhead)),
     })
 }
@@ -275,9 +279,7 @@ impl Keeper {
     /// compares them, **before anything is served** (12.3, 12.4).
     pub fn open(state: &Path, folder: &Path, now: u64) -> Result<(Keeper, Started), Refused> {
         let held = lock::hold(state, folder).map_err(Refused)?;
-        private::at_start(state, folder).map_err(Refused)?;
-        apart::tidy(state);
-        data::tidy(folder);
+        private::no_links(state, folder).map_err(Refused)?;
         let id = identity::read(state).map_err(Refused)?;
         let store = match apart::read(state) {
             Reading::Unreadable(what) => {
@@ -293,6 +295,7 @@ impl Keeper {
                         apart::place(state).display()
                     )));
                 }
+                prepare(state, folder)?;
                 let id = match id {
                     Some(id) => id,
                     None => identity::read_or_make(state, random_bytes::<16>).map_err(Refused)?.0,
@@ -306,26 +309,20 @@ impl Keeper {
         if id != Some(store.backend) {
             return Err(Refused(not_this_backends(state)));
         }
-        // Whose the data is, before anything of it is changed.
-        // A put-back whose plan is in the store is finished first, the same way the command
-        // run again would (12.4): its copy, checked when staged, takes the data's place.
-        let staged = data::incoming(folder).exists();
-        if let Resume::PutInPlace { .. } = compare::resume(store.pending.as_ref(), staged, None) {
-            put_in_place(folder)?;
-        } else if staged {
-            // Staged by a put-back cut off before its plan was in the store: never used.
-            let _ = fs::remove_file(data::incoming(folder));
-        }
+        // Whose the data is, before anything of it is changed (finding 9).
         if let Some(theirs) = whose(folder)?.filter(|&theirs| theirs != store.backend) {
             return Err(another_backends(folder, theirs, store.backend));
         }
+        prepare(state, folder)?;
+        // What was under way is finished first, the same way a command run again would (12.4).
+        let held = match resumed(state, folder, held, store.clone(), now)? {
+            Ok(done) => return Ok(done),
+            Err(held) => held,
+        };
         copies::prune(folder);
         let data = match Data::open(folder, now).map_err(Refused)? {
             Opened::Open(data) => data,
             Opened::Absent => {
-                if let Resume::Stop(halt) = compare::resume(store.pending.as_ref(), false, None) {
-                    return Err(halted(halt, folder));
-                }
                 if !store.data_made {
                     return Self::first_data(state, folder, held, store, now);
                 }
@@ -336,16 +333,7 @@ impl Keeper {
                 )));
             }
         };
-        let meta = data.meta().map_err(|error| unreadable(&error))?;
         let mut keeper = Self::with(state, folder, held, store, data)?;
-        match compare::resume(keeper.store.pending.as_ref(), false, Some(meta.restore)) {
-            Resume::Stop(halt) => return Err(halted(halt, folder)),
-            Resume::Restore { adopt, .. } => {
-                let started = keeper.restore_data(now, if adopt { RestoreMode::Adopt } else { RestoreMode::DataOnly })?;
-                return Ok((keeper, started));
-            }
-            Resume::PutInPlace { .. } | Resume::Nothing => {}
-        }
         if !keeper.store.data_made {
             let view = keeper.data.view().map_err(|error| unreadable(&error))?;
             if !view.accounts.is_empty() || view.restore != keeper.store.restore {
@@ -467,7 +455,7 @@ impl Keeper {
         let meta = self.data.meta().map_err(|error| unreadable(&error))?;
         // One restore number for one restore: the one under way, if one is (findings 3, 4).
         let new = match self.store.pending {
-            Some(Pending::Restore { restore } | Pending::PutBack { restore } | Pending::TakeAsIs { restore }) => restore,
+            Some(Pending::Restore { restore } | Pending::PutBack { restore, .. } | Pending::TakeAsIs { restore }) => restore,
             _ => self.store.restore.checked_add(1).ok_or_else(|| Refused("The restore number can go no higher. Nothing is served.".into()))?,
         };
         if self.store.restore != new {
@@ -1006,39 +994,73 @@ impl Keeper {
 
 pub type Said = Vec<String>;
 
-/// What was under way when a command is run, finished first, as a start would (12.4; the
-/// review's finding 4: one resume decision, `compare::resume`, for the start and both
-/// commands). `None` if nothing was; otherwise what was said.
-fn finish_first(state: &Path, folder: &Path, held: lock::Held, store: Store, now: u64) -> Result<Result<Said, lock::Held>, Refused> {
-    let staged = data::incoming(folder).exists();
-    match compare::resume(store.pending.as_ref(), staged, None) {
-        Resume::Nothing => return Ok(Err(held)),
-        Resume::PutInPlace { .. } => put_in_place(folder)?,
-        Resume::Stop(_) | Resume::Restore { .. } => {}
-    }
-    let data = match Data::open(folder, now).map_err(Refused)? {
-        Opened::Open(data) => data,
-        Opened::Absent => {
-            return Err(match compare::resume(store.pending.as_ref(), false, None) {
-                Resume::Stop(halt) => halted(halt, folder),
-                _ => halted(Halt::NoData, folder),
-            });
+/// Once whose the data is has been read (finding 9): what this program left half-done is
+/// tidied, and its files narrowed to the owner's alone (finding 8).
+fn prepare(state: &Path, folder: &Path) -> Result<(), Refused> {
+    private::at_start(state, folder).map_err(Refused)?;
+    apart::tidy(state);
+    data::tidy(folder);
+    Ok(())
+}
+
+/// What was under way, finished first, by a start and by either command alike (12.4; the
+/// review's finding 4 and the re-review's C: one decision, `compare::resume`, made from what
+/// is only READ: the hash of a copy waiting beside the data, and the data in place as it is,
+/// whose backend is checked before it is opened to write). `Err(held)` if nothing was.
+fn resumed(state: &Path, folder: &Path, held: lock::Held, store: Store, now: u64) -> Result<Result<(Keeper, Started), lock::Held>, Refused> {
+    let staged = match copies::hash(&data::incoming(folder)) {
+        Ok(hash) => Some(hash),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(Refused(format!("The copy waiting beside the data can't be read ({}). Nothing was changed.", error.kind()))),
+    };
+    let in_place = match data::identity_of(&data::place(folder)).map_err(Refused)? {
+        Some(found) if found.backend != store.backend => return Err(another_backends(folder, found.backend, store.backend)),
+        Some(found) => Some(InPlace { restore: found.restore, changes: found.changes, written_at: found.written_at }),
+        None => None,
+    };
+    let adopt = match compare::resume(store.pending.as_ref(), staged.as_ref(), in_place) {
+        Resume::Nothing => {
+            if staged.is_some() {
+                // Staged by a put-back cut off before its plan was in the store: never used.
+                let _ = fs::remove_file(data::incoming(folder));
+            }
+            return Ok(Err(held));
+        }
+        Resume::Stop(halt) => return Err(halted(halt, folder)),
+        Resume::PutInPlace { .. } => {
+            put_in_place(folder)?;
+            false
+        }
+        Resume::Restore { adopt, .. } => {
+            // Its name in place may not have been made lasting before the cut.
+            fs::File::open(folder).and_then(|folder| folder.sync_all()).map_err(|error| Refused(format!("The data folder couldn't be made lasting ({}).", error.kind())))?;
+            adopt
         }
     };
-    let meta = data.meta().map_err(|error| unreadable(&error))?;
-    let (adopt, restore) = match compare::resume(store.pending.as_ref(), false, Some(meta.restore)) {
-        Resume::Restore { restore, adopt } => (adopt, restore),
-        Resume::Stop(halt) => return Err(halted(halt, folder)),
-        Resume::Nothing | Resume::PutInPlace { .. } => return Err(Refused("What was under way can't be told. Nothing was changed.".into())),
+    let data = match Data::open(folder, now).map_err(Refused)? {
+        Opened::Open(data) => data,
+        Opened::Absent => return Err(halted(Halt::CopyLost, folder)),
     };
     let mut keeper = Keeper::with(state, folder, held, store, data)?;
     let started = keeper.restore_data(now, if adopt { RestoreMode::Adopt } else { RestoreMode::DataOnly })?;
-    keeper.close();
-    Ok(Ok(vec![
-        format!("A {} begun earlier was cut off; it was finished first, under restore number {restore}, and nothing else was done.", if adopt { "take-as-is" } else { "restore of the data" }),
-        started.said(),
-        "Run the command again if there is more to do; otherwise start the backend again. Every person signs in again.".into(),
-    ]))
+    Ok(Ok((keeper, started)))
+}
+
+/// [`resumed`], for a command: what it said, or the locks back if nothing was under way.
+fn finish_first(state: &Path, folder: &Path, held: lock::Held, store: Store, now: u64) -> Result<Result<Said, lock::Held>, Refused> {
+    let adopt = matches!(store.pending, Some(Pending::TakeAsIs { .. }));
+    match resumed(state, folder, held, store, now)? {
+        Err(held) => Ok(Err(held)),
+        Ok((keeper, started)) => {
+            let restore = keeper.restore();
+            keeper.close();
+            Ok(Ok(vec![
+                format!("A {} begun earlier was cut off; it was finished first, under restore number {restore}, and nothing else was done.", if adopt { "take-as-is" } else { "restore of the data" }),
+                started.said(),
+                "Run the command again if there is more to do; otherwise start the backend again. Every person signs in again.".into(),
+            ]))
+        }
+    }
 }
 
 /// `put-back <copy>`: puts a copy of the data back by the supported way (12.4). Refused while
@@ -1056,9 +1078,7 @@ fn finish_first(state: &Path, folder: &Path, held: lock::Held, store: Store, now
 /// 5. The staged copy takes the data's place; then 12.4's steps in the data.
 pub fn put_back(state: &Path, folder: &Path, copy: &Path, now: u64) -> Result<Said, Refused> {
     let held = lock::hold(state, folder).map_err(Refused)?;
-    private::at_start(state, folder).map_err(Refused)?;
-    apart::tidy(state);
-    data::tidy(folder);
+    private::no_links(state, folder).map_err(Refused)?;
     let store = match apart::read(state) {
         Reading::Found(store) => store,
         Reading::Missing => {
@@ -1073,6 +1093,11 @@ pub fn put_back(state: &Path, folder: &Path, copy: &Path, now: u64) -> Result<Sa
     if identity::read(state).map_err(Refused)? != Some(store.backend) {
         return Err(Refused(not_this_backends(state)));
     }
+    // The data in place is this backend's, or there is none: read before anything changes.
+    if let Some(theirs) = whose(folder)?.filter(|&theirs| theirs != store.backend) {
+        return Err(another_backends(folder, theirs, store.backend));
+    }
+    prepare(state, folder)?;
     let held = match finish_first(state, folder, held, store.clone(), now)? {
         Ok(said) => return Ok(said),
         Err(held) => held,
@@ -1084,20 +1109,6 @@ pub fn put_back(state: &Path, folder: &Path, copy: &Path, now: u64) -> Result<Sa
     if backend != store.backend {
         return Err(nothing(format!("The copy is another backend's data (its id is {}; this one's is {}).", backend.to_hex(), store.backend.to_hex())));
     }
-    // Put back already, and nothing written since: done (the command killed after its last
-    // step and run again).
-    if let Ok(live) = data::open_to_read(&data::place(folder), "The data") {
-        let (view, meta) = (data::view_of(&live), data::meta_of(&live));
-        if let (Ok(view), Ok(meta)) = (view, meta)
-            && compare::already_put_back(&store.view(&data::names_of(&live).unwrap_or_default()), &view, meta.restored_from, written_at)
-        {
-            return Ok(vec![format!(
-                "{} is already in place: it was put back under restore number {}, and nothing has been written since. Nothing was changed. Start the backend.",
-                copy.display(),
-                store.restore
-            )]);
-        }
-    }
     let staged = copies::stage(&source, folder).map_err(|why| nothing(format!("The copy couldn't be staged beside the data: {why}.")))?;
     drop(source);
     let unstage = |refused: Refused| {
@@ -1106,7 +1117,15 @@ pub fn put_back(state: &Path, folder: &Path, copy: &Path, now: u64) -> Result<Sa
     };
     // 2. The staged file itself, checked and planned by core before anything is recorded.
     let plan = (|| -> Result<Store, Refused> {
+        // The very file staged: its hash, and its own backend id (read from it, not from the
+        // copy it was made from).
+        let hash = copies::hash(&staged).map_err(|error| nothing(format!("The staged copy can't be read ({}).", error.kind())))?;
         let staged_data = data::open_to_read(&staged, "The staged copy").map_err(nothing)?;
+        let (backend, _) = data::identify(&staged_data).map_err(|error| nothing(format!("The copy can't be read: {}.", why(&error))))?;
+        if backend != store.backend {
+            return Err(nothing("The staged copy is another backend's data.".into()));
+        }
+        let meta = data::meta_of(&staged_data).map_err(|error| nothing(format!("The copy can't be read: {}.", why(&error))))?;
         let view = data::view_of(&staged_data).map_err(|error| nothing(format!("The copy can't be read: {}.", why(&error))))?;
         let names = data::names_of(&staged_data).map_err(|error| nothing(format!("The copy can't be read: {}.", why(&error))))?;
         let new = compare::put_back(&store.view(&names), &view).map_err(|refusal| {
@@ -1116,18 +1135,18 @@ pub fn put_back(state: &Path, folder: &Path, copy: &Path, now: u64) -> Result<Sa
                 NotPutBack::UnderWay => "A restore is under way.".into(),
             })
         })?;
-        planned(&store, &staged_data, new, RestoreMode::DataOnly, Pending::PutBack { restore: new }, now)
+        let copy = CopyIdentity { hash, changes: meta.changes, written_at: meta.written_at };
+        planned(&store, &staged_data, new, RestoreMode::DataOnly, Pending::PutBack { restore: new, copy }, now)
     })()
     .map_err(unstage)?;
     let new = plan.restore;
     let mut said = vec![format!("Put back {} (its data's last step was at {written_at} ms).", copy.display())];
-    // 3. The data in use, kept whole before anything of it is replaced.
+    // 3. The data in use, kept whole, as one checked file, before anything of it is replaced;
+    // if that can't be made, nothing is replaced (the re-review's 5).
     if data::place(folder).exists() {
-        let kept = match data::open_to_read(&data::place(folder), "The data") {
-            Ok(live) => copies::keep_replaced(&live, folder, new, now),
-            Err(_) => copies::keep_raw(folder, new, now),
-        }
-        .map_err(|why| unstage(nothing(format!("The data being replaced couldn't be kept: {why}."))))?;
+        let kept = data::open_to_read(&data::place(folder), "The data in place")
+            .and_then(|live| copies::keep_replaced(&live, folder, new, now))
+            .map_err(|why| unstage(nothing(format!("The data being replaced couldn't be kept whole ({why}); if it is damaged, move it out of NEXUS_DATA yourself and put the copy back again."))))?;
         said.push(format!("The data it replaced is kept as {}.", kept.display()));
     }
     // 4. The plan in the store, whole.
@@ -1156,9 +1175,7 @@ pub fn put_back(state: &Path, folder: &Path, copy: &Path, now: u64) -> Result<Sa
 /// stays in place until the new one is renamed over it whole (finding 2).
 pub fn take_as_is(state: &Path, folder: &Path, now: u64) -> Result<Said, Refused> {
     let held = lock::hold(state, folder).map_err(Refused)?;
-    private::at_start(state, folder).map_err(Refused)?;
-    apart::tidy(state);
-    data::tidy(folder);
+    private::no_links(state, folder).map_err(Refused)?;
     let id = identity::read(state).map_err(Refused)?;
     let read = apart::read(state);
     let theirs = whose(folder)?;
@@ -1173,6 +1190,7 @@ pub fn take_as_is(state: &Path, folder: &Path, now: u64) -> Result<Said, Refused
             id.to_hex()
         )));
     }
+    prepare(state, folder)?;
     let Some(theirs) = theirs else {
         return match read {
             Reading::Missing => Err(Refused("There is neither data nor a store kept apart: there is nothing to take. Start the backend, and it makes both.".into())),
