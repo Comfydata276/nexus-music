@@ -196,9 +196,9 @@ fn an_account_gets_only_one_upstream_place() {
 fn claimed_jobs_wait_without_taking_upstream_places() {
     let rooms = Arc::<Mutex<Rooms>>::default();
     let jobs: Vec<_> = (1..=wire::RUNNING_MAX as u64)
-        .map(|account| JobReservation::take(rooms.clone(), account as i64, account).unwrap())
+        .map(|account| JobReservation::take(rooms.clone(), account as i64, account, false).unwrap())
         .collect();
-    assert!(JobReservation::take(rooms.clone(), 20, 20).is_none());
+    assert!(JobReservation::take(rooms.clone(), 20, 20, false).is_err());
     let upstream: Vec<_> = (1..=wire::RUNNING_MAX as u64)
         .map(|account| Place::upstream(rooms.clone(), account).unwrap())
         .collect();
@@ -786,7 +786,7 @@ fn a_finished_job_releases_its_worker_before_reporting_completion() {
         &mut keeper, actor, wire::RequestId::new(1).unwrap(), &encode(&change).unwrap(), &plan, false, &rooms,
     ).unwrap();
     let row = row_id(job).unwrap();
-    let reservation = JobReservation::take(rooms.clone(), row, actor.account.get()).unwrap();
+    let reservation = JobReservation::take(rooms.clone(), row, actor.account.get(), false).unwrap();
     let place = Place::take_upstream(rooms.clone(), actor.account.get(), Some(row)).unwrap();
     finish_job(&mut keeper, actor.now, row, &JobResult::Done(Completed::Cancelled), &[], None).unwrap();
     assert!(matches!(after_job(keeper.data().connection(), actor, job, &rooms), Ok(Answer::Working)));
