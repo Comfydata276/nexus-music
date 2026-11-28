@@ -44,13 +44,23 @@ mod typed {
         }
     }
 
-    pub trait Message: Value + Serialize {}
+    pub trait Message: Value + Serialize {
+        const MAX_BYTES: usize = super::BODY_MAX_BYTES;
+
+        fn max_bytes(&self) -> usize {
+            Self::MAX_BYTES
+        }
+    }
 }
 
 /// Reads the entire body supplied by the transport. The transport first has to confirm
 /// it received the whole HTTP body, including when the connection closed early.
 pub fn read<T: Message>(body: &[u8]) -> Result<T, BadMessage> {
-    if body.len() > BODY_MAX_BYTES {
+    read_bounded(body, T::MAX_BYTES)
+}
+
+pub(crate) fn read_bounded<T: Message>(body: &[u8], maximum: usize) -> Result<T, BadMessage> {
+    if body.len() > maximum.min(T::MAX_BYTES) {
         return Err(BadMessage::TooLarge);
     }
     let text = std::str::from_utf8(body).map_err(|_| BadMessage::Form)?;
@@ -60,6 +70,9 @@ pub fn read<T: Message>(body: &[u8]) -> Result<T, BadMessage> {
         return Err(BadMessage::Form);
     }
     let value = T::read(plain_json(text)?)?;
+    if body.len() > value.max_bytes() {
+        return Err(BadMessage::TooLarge);
+    }
     value.check()?;
     Ok(value)
 }
@@ -69,11 +82,14 @@ pub(crate) use typed::{Message, Value};
 /// Writes JSON with the byte ceiling the reader applies. Count first so a buffer
 /// containing a password or bearer never has to grow and leave an unwiped allocation.
 pub fn encode<T: Message>(value: &T) -> Result<WireBody, BadMessage> {
-    struct Count(usize);
+    struct Count {
+        size: usize,
+        maximum: usize,
+    }
     impl Write for Count {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            self.0 = self.0.saturating_add(bytes.len());
-            if self.0 > BODY_MAX_BYTES {
+            self.size = self.size.saturating_add(bytes.len());
+            if self.size > self.maximum {
                 return Err(io::ErrorKind::FileTooLarge.into());
             }
             Ok(bytes.len())
@@ -84,11 +100,11 @@ pub fn encode<T: Message>(value: &T) -> Result<WireBody, BadMessage> {
     }
 
     value.check()?;
-    let mut count = Count(0);
+    let mut count = Count { size: 0, maximum: value.max_bytes().min(T::MAX_BYTES) };
     serde_json::to_writer(&mut count, value).map_err(|_| {
-        if count.0 > BODY_MAX_BYTES { BadMessage::TooLarge } else { BadMessage::Form }
+        if count.size > count.maximum { BadMessage::TooLarge } else { BadMessage::Form }
     })?;
-    let mut bytes = Zeroizing::new(Vec::with_capacity(count.0));
+    let mut bytes = Zeroizing::new(Vec::with_capacity(count.size));
     serde_json::to_writer(&mut *bytes, value).map_err(|_| BadMessage::Form)?;
     Ok(WireBody(bytes))
 }
