@@ -981,6 +981,8 @@ struct SavedLine {
     progress: Option<BatchLineProgress>,
     #[serde(default)]
     offer: Option<AlbumView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    confirmed_placement: Option<bool>,
     #[serde(default)]
     resolution: Option<Resolution>,
     #[serde(default)]
@@ -1014,7 +1016,7 @@ fn batch_lines(db: &Connection, actor: Actor, job: JobId) -> Result<Answer, Refu
         let (index, encoded) = row.map_err(sql_error)?;
         let line: SavedLine = decode(encoded.as_bytes())?;
         if let Some(progress) = line.progress {
-            stored.insert(index, progress);
+            stored.insert(index, (progress, line.confirmed_placement));
         }
     }
     let saved = if let Some(payload) = plan.prepared_batch {
@@ -1023,16 +1025,20 @@ fn batch_lines(db: &Connection, actor: Actor, job: JobId) -> Result<Answer, Refu
         let mut rows = Vec::with_capacity(indexed.len());
         for line in &indexed {
             let mut projected = BatchLineView::from_indexed(line).map_err(|_| Refusal::NotDealtWith)?;
-            if let Some(progress @ BatchLineProgress::Failed { .. }) = stored.remove(&projected.index) {
-                projected.progress = progress;
-                projected.placed = false;
+            if let Some((progress, placed)) = stored.remove(&projected.index) {
+                if placed.is_some() || matches!(progress, BatchLineProgress::Failed { .. }) {
+                    projected.progress = progress;
+                    projected.placed = placed.unwrap_or_default();
+                }
             }
             rows.push(projected);
         }
         rows
     } else {
         (0..input.len() as u16).map(|index| BatchLineView {
-            index, placed: false, progress: stored.remove(&index).unwrap_or(BatchLineProgress::Waiting),
+            index,
+            placed: false,
+            progress: stored.remove(&index).map(|(progress, _)| progress).unwrap_or(BatchLineProgress::Waiting),
         }).collect()
     };
     Ok(Answer::BatchLines { lines: saved, next: None })
@@ -2163,7 +2169,9 @@ impl Requests {
         };
 
         let _turn = self.mutation_turn(job, &journal.runtime);
-        journal.restore_pending(lidarr)?;
+        let endpoint = self.endpoint.as_ref().ok_or(Refusal::LidarrNotSetUp)?;
+        let recovery = endpoint.lidarr(journal.runtime.clone(), lidarr_key, None);
+        journal.restore_pending(&recovery)?;
         if job.plan.prepared_batch.is_some() {
             let indexed = batch.indexed_lines().ok_or(Refusal::NotDealtWith)?;
             let mut reconciled = HashSet::new();
@@ -2178,18 +2186,31 @@ impl Requests {
             }
         }
 
-        let upstream = BatchUpstream { lidarr, journal };
+        let upstream = BatchUpstream { lidarr, journal, batch: &batch, stopped };
         let worked = lidarr_result(batch.work_prepared(&upstream, &|_| {}), None);
         let switched_off = stopped.load(Ordering::Relaxed);
         let rows = batch.indexed_lines().ok_or(Refusal::NotDealtWith)?;
         let mut asked = Vec::new();
-        let mut stopped_lines = Vec::new();
+        let mut resolved_lines = Vec::new();
+        let mut uncertain = HashMap::new();
         for line in rows {
-            if switched_off && matches!(line.state, bulk::State::Found | bulk::State::Asked | bulk::State::Failed) {
-                stopped_lines.push(line.index as u16);
-                continue;
-            }
-            if matches!(line.state, bulk::State::Asked | bulk::State::Done) {
+            let remaining = matches!(line.state, bulk::State::Found | bulk::State::Asked | bulk::State::Failed);
+            let recovered = if remaining && (worked.is_err() || switched_off || line.state == bulk::State::Failed) {
+                if let (Some(offer), Some(placement)) = (&line.offer, &line.placement) {
+                    *uncertain.entry(line.slot).or_insert_with(|| confirmed_placement(lidarr, offer, Some(placement)).ok())
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(PlacementRecovery::Listed { placed }) = recovered {
+                let Some(view) = lidarr_items::<AlbumView, _>(line.offer).pop() else { continue };
+                resolved_lines.push((line.index as u16, LineEnding::Confirmed { album: batch_album(&view), placed }));
+                asked.push(RecordedAsk { asked: asked_release(&view)?, placed });
+            } else if switched_off && remaining {
+                resolved_lines.push((line.index as u16, LineEnding::SwitchedOff));
+            } else if matches!(line.state, bulk::State::Asked | bulk::State::Done) {
                 let Some(view) = lidarr_items::<AlbumView, _>(line.offer).pop() else { continue };
                 asked.push(RecordedAsk { asked: asked_release(&view)?, placed: line.placed });
             }
@@ -2202,26 +2223,40 @@ impl Requests {
         let account = job.account;
         let binding = job.plan.binding;
         journal.ask(move |keeper, now, row| {
-            stop_batch_lines(keeper, now, row, &stopped_lines)?;
+            finish_batch_lines(keeper, now, row, resolved_lines)?;
             finish_job(keeper, now, row, &result, &asked, Some((binding, account, None)))
         })
     }
 }
 
-fn stop_batch_lines(keeper: &mut Keeper, now: u64, row: i64, indices: &[u16]) -> Result<(), Refusal> {
-    if indices.is_empty() {
+enum LineEnding {
+    Confirmed { album: BatchAlbum, placed: bool },
+    SwitchedOff,
+}
+
+fn finish_batch_lines(
+    keeper: &mut Keeper, now: u64, row: i64, results: Vec<(u16, LineEnding)>,
+) -> Result<(), Refusal> {
+    if results.is_empty() {
         return Ok(());
     }
     let mut updates = Vec::new();
-    for &index in indices {
+    for (index, ending) in results {
         let mut line = saved_line(keeper.data().connection(), row, index)?;
-        if !matches!(line.progress, Some(BatchLineProgress::NotFound | BatchLineProgress::Failed { .. })) {
-            line.progress = Some(BatchLineProgress::Failed {
-                reason: Refusal::SwitchedOff,
-                album: line.offer.as_ref().map(batch_album),
-            });
-            updates.push((index, serde_json::to_string(&line).map_err(|_| Refusal::NotDealtWith)?));
+        match ending {
+            LineEnding::Confirmed { album, placed } => {
+                line.progress = Some(BatchLineProgress::Done { album });
+                line.confirmed_placement = Some(placed);
+            }
+            LineEnding::SwitchedOff if matches!(line.progress, Some(BatchLineProgress::NotFound | BatchLineProgress::Failed { .. })) => continue,
+            LineEnding::SwitchedOff => {
+                line.progress = Some(BatchLineProgress::Failed {
+                    reason: Refusal::SwitchedOff,
+                    album: line.offer.as_ref().map(batch_album),
+                });
+            }
         }
+        updates.push((index, serde_json::to_string(&line).map_err(|_| Refusal::NotDealtWith)?));
     }
     keeper.write_data(now, |tx| {
         for (index, text) in &updates {
@@ -2336,9 +2371,18 @@ fn find_line(lidarr: &Lidarr, line: &BatchLine, singles: bool) -> Result<Option<
 struct BatchUpstream<'a> {
     lidarr: &'a Lidarr,
     journal: &'a Journal,
+    batch: &'a bulk::Job,
+    stopped: &'a AtomicBool,
 }
 
 impl BatchUpstream<'_> {
+    fn after_write<T>(&self, result: T) -> T {
+        if self.stopped.load(Ordering::Relaxed) {
+            self.batch.stop();
+        }
+        result
+    }
+
     fn recovery<'a>(&self, offer: &Offer, batch: &'a dyn lidarr::WayBack) -> BatchWayBack<'a> {
         BatchWayBack {
             batch,
@@ -2412,7 +2456,7 @@ impl lidarr::RequestLidarr for BatchUpstream<'_> {
     }
 
     fn add_artist(&self, artist: &str, name: &str, way_back: &dyn lidarr::WayBack) -> Result<usize, String> {
-        lidarr::RequestLidarr::add_artist(self.lidarr, artist, name, way_back)
+        self.after_write(lidarr::RequestLidarr::add_artist(self.lidarr, artist, name, way_back))
     }
 
     fn request(&self, wanted: &Offer, way_back: &dyn lidarr::WayBack) -> Result<(), String> {
@@ -2420,7 +2464,7 @@ impl lidarr::RequestLidarr for BatchUpstream<'_> {
     }
 
     fn request_placement(&self, wanted: &Offer, way_back: &dyn lidarr::WayBack) -> Result<bool, String> {
-        self.lidarr.request_placement(wanted, &self.recovery(wanted, way_back))
+        self.after_write(self.lidarr.request_placement(wanted, &self.recovery(wanted, way_back)))
     }
 
     fn pending(&self) -> Result<Vec<lidarr::Pending>, String> {
@@ -2428,12 +2472,15 @@ impl lidarr::RequestLidarr for BatchUpstream<'_> {
     }
 
     fn cancel(&self, id: i64) -> Result<(), String> {
-        self.lidarr.cancel(id)
+        self.after_write(self.lidarr.cancel(id))
     }
 }
 
 impl lidarr::BulkLidarr for BatchUpstream<'_> {
     fn pause(&self, wait: Duration) -> Result<(), String> {
+        if self.stopped.load(Ordering::Relaxed) {
+            return Err(Refusal::SwitchedOff.sentence(None).to_string());
+        }
         self.lidarr.pause(wait)
     }
 
@@ -2464,15 +2511,15 @@ impl lidarr::BulkLidarr for BatchUpstream<'_> {
     fn start_listing_singles_kept(
         &self, artist: i64, wanted: &Offer, way_back: &dyn lidarr::WayBack,
     ) -> Result<Option<(String, bool)>, String> {
-        self.lidarr.start_listing_singles_kept(artist, wanted, &self.recovery(wanted, way_back))
+        self.after_write(self.lidarr.start_listing_singles_kept(artist, wanted, &self.recovery(wanted, way_back)))
     }
 
     fn want(&self, artist: i64, albums: &[i64]) -> Result<(), String> {
-        self.lidarr.want(artist, albums)
+        self.after_write(self.lidarr.want(artist, albums))
     }
 
     fn want_before(&self, artist: i64, albums: &[i64], before: &dyn Fn() -> Result<(), String>) -> Result<(), String> {
-        self.lidarr.want_before(artist, albums, before)
+        self.after_write(self.lidarr.want_before(artist, albums, before))
     }
 
     fn setup(&self) -> Result<lidarr::Setup, String> {
@@ -2480,21 +2527,21 @@ impl lidarr::BulkLidarr for BatchUpstream<'_> {
     }
 
     fn add_wanting(&self, setup: &mut lidarr::Setup, wanted: &[Offer]) -> Result<i64, String> {
-        self.lidarr.add_wanting(setup, wanted)
+        self.after_write(self.lidarr.add_wanting(setup, wanted))
     }
 
     fn add_wanting_before(
         &self, setup: &mut lidarr::Setup, wanted: &[Offer], before: &dyn Fn() -> Result<(), String>,
     ) -> Result<i64, String> {
-        self.lidarr.add_wanting_before(setup, wanted, before)
+        self.after_write(self.lidarr.add_wanting_before(setup, wanted, before))
     }
 
     fn unwant(&self, albums: &[i64]) -> Result<(), String> {
-        self.lidarr.unwant(albums)
+        self.after_write(self.lidarr.unwant(albums))
     }
 
     fn set_new_releases(&self, artist: i64, setting: &str) -> Result<(), String> {
-        self.journal.restore_saved_artist(self.lidarr, artist, setting)
+        self.after_write(self.journal.restore_saved_artist(self.lidarr, artist, setting))
             .map_err(|reason| reason.sentence(None).to_string())
     }
 }

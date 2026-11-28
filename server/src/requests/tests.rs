@@ -240,6 +240,7 @@ struct LidarrState {
     ambiguous_pending_number: bool,
     new_releases: Option<String>,
     single_mode: bool,
+    second_artist: bool,
     calls: Vec<String>,
 }
 
@@ -323,14 +324,26 @@ fn mock(request: &Question, state: &mut LidarrState) -> Value {
     if state.single_mode {
         offer["albumType"] = json!("Single");
     }
+    let other_artist = json!({"id":6,"artistName":"Paper Tides",
+        "foreignArtistId":"20000000-0000-0000-0000-000000000222"});
+    let mut other_album = album(false);
+    other_album["id"] = json!(10);
+    other_album["artistId"] = json!(6);
+    other_album["title"] = json!("Quiet Coast");
+    other_album["artist"] = other_artist.clone();
+    other_album["foreignAlbumId"] = json!("10000000-0000-0000-0000-000000000222");
     match (request.method.as_str(), target) {
         ("GET", "system/status") => json!({"version":"2.0.0"}),
         ("GET", "album/lookup?term=Glass%20Orchard" | "album/lookup?term=Glass%20Orchard%20Quillon%20Vane") =>
             json!([offer]),
         ("GET", lookup) if lookup == format!("album/lookup?term=lidarr%3A{ALBUM}") =>
             json!([album(state.monitored)]),
+        ("GET", "album/lookup?term=Quiet%20Coast%20Paper%20Tides") if state.second_artist => json!([other_album]),
+        ("GET", "artist") if state.second_artist => json!([artist, other_artist]),
+        ("GET", "album?artistId=6") if state.second_artist => json!([other_album]),
         ("GET", "artist") => json!([artist]),
         ("GET", "artist/5") => artist,
+        ("GET", "artist/6") if state.second_artist => other_artist,
         ("GET", "command") => json!([]),
         ("GET", "metadataprofile") if state.single_mode => {
             let profile = |id, name, list: &[&str]| {
@@ -1221,13 +1234,15 @@ fn a_slow_lidarr_read_leaves_sign_in_and_the_writer_available() {
 #[test]
 fn switching_off_a_running_batch_blocks_its_next_lidarr_write() {
     let lidarr = MockLidarr::start();
+    lock(&lidarr.state).second_artist = true;
     let (server, [admin, member, _]) = TestServer::start("stop-batch", Some(endpoint(lidarr.address)));
     let page = server.redeem(admin, 1, TEST_PAGE);
     server.configure(&page);
     let member = server.redeem(member, 2, "");
     lidarr.hold_response(Some(("PUT", "/api/v1/album/monitor")));
     let line = BatchLine { artist: "Quillon Vane".into(), album: "Glass Orchard".into(), song: "First Light".into() };
-    let job = begun(server.call(&member, begin(1, Change::Batch { singles: false, lines: vec![line] })));
+    let other = BatchLine { artist: "Paper Tides".into(), album: "Quiet Coast".into(), song: "Still Water".into() };
+    let job = begun(server.call(&member, begin(1, Change::Batch { singles: false, lines: vec![line, other] })));
     lidarr.wait_for_call("PUT album/monitor");
     server.set_switch(&page, &member, false);
     lidarr.hold_response(None);
@@ -1248,7 +1263,13 @@ fn switching_off_a_running_batch_blocks_its_next_lidarr_write() {
         thread::sleep(Duration::from_millis(20));
     }
     let line = saved_line(&db, row_id(job).unwrap(), 0).unwrap();
-    assert!(matches!(line.progress, Some(BatchLineProgress::Failed { reason: Refusal::SwitchedOff, .. })));
+    assert!(matches!(line.progress, Some(BatchLineProgress::Done { .. })));
+    assert_eq!(line.confirmed_placement, Some(true));
+    let remaining = saved_line(&db, row_id(job).unwrap(), 1).unwrap();
+    assert!(matches!(remaining.progress, Some(BatchLineProgress::Failed { reason: Refusal::SwitchedOff, .. })));
+    server.set_switch(&page, &member, true);
+    assert!(matches!(server.call(&member, Call::AskedHistory { after: None }),
+        Answer::AskedHistory { rows, .. } if rows.len() == 1 && rows[0].release.as_str() == ALBUM));
     let calls = lidarr.take_calls();
     assert_eq!(calls.iter().filter(|&call| call == "PUT album/monitor").count(), 1);
     assert!(!calls.iter().any(|call| call == "POST command"));
