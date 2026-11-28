@@ -20,7 +20,7 @@ use nexus_core::nexus::events::{
 };
 use nexus_core::nexus::proto::{SPEAKS, Version};
 use nexus_music_server::accounts::{
-    check::PasswordWorkers, desk::Desk, music::MusicSide, rows, session::{Accounts, Seen},
+    admit::Admission, check::PasswordWorkers, desk::Desk, music::MusicSide, session::Accounts,
     setup::{CodeKey, SetUpCode, dummy_salt_key, make_code},
 };
 use nexus_music_server::music::MusicClient;
@@ -106,7 +106,7 @@ impl Fixture {
         let addr = ([127, 0, 0, 1], self.port).into();
         let root = self.root.clone();
         let thread = std::thread::spawn(move || {
-            let (keeper, _) = Keeper::open(&root.join("state"), &root.join("data"), now)
+            let (mut keeper, _) = Keeper::open(&root.join("state"), &root.join("data"), now)
                 .unwrap_or_else(|why| panic!("{why}"));
             let backend = keeper.backend();
             let clock: nexus_music_server::accounts::session::Clock =
@@ -114,14 +114,11 @@ impl Fixture {
             let accounts = Arc::new(Accounts {
                 workers: PasswordWorkers::new(dummy_salt_key(&keeper)).unwrap(),
                 set_up_code: SetUpCode::at_start(keeper.set_up(), now).0,
-                seen: Arc::new(Seen::new(rows::device_secrets(keeper.data().connection()).unwrap())),
+                admission: Arc::new(Admission::open(&mut keeper, clock.clone()).unwrap()),
                 desk: Desk::open(keeper, clock.clone()).unwrap(),
                 clock,
                 backend,
-                music: MusicSide {
-                    client: MusicClient::from_this_machine().0,
-                    internal: "http://navidrome:4533".into(),
-                },
+                music: MusicSide::new(MusicClient::from_this_machine().0, "http://navidrome:4533".into()),
             });
             tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap().block_on(async {
                 let listener = serve::listen(addr).unwrap();

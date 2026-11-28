@@ -683,3 +683,154 @@ fn the_page_sets_up_once_with_the_code_in_the_log_and_from_its_own_origin_only()
     let (status, body) = backend.post_with(account::SIGN_IN, None, &page, &sign_in(with_password(EMAIL, PASSWORD), 7, "Nexus admin browser", DeviceKind::Pc));
     assert!(signed_in(status, &body).person.admin);
 }
+
+/// A stranger's request that holds a general work slot: its head in (a call that needs no
+/// session, so it is no one's), its body withheld; held until the body's deadline.
+fn holding_a_slot(at: SocketAddr) -> TcpStream {
+    let stream = TcpStream::connect(at).unwrap();
+    let head = format!("POST {} HTTP/1.1\r\nHost: nexus\r\nX-Nexus-Scheme: https\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n", account::SIGN_OUT);
+    (&stream).write_all(head.as_bytes()).unwrap();
+    stream
+}
+
+/// C1 (the review of S8; the lead's ruling of 28 Nov 15:38), **through the real listener**:
+/// with strangers holding every general work slot and more flooding sign-in, a signed-in
+/// device's call completes, a known device signs in, and a one-time code is redeemed: each
+/// takes a slot of the reserve. A session that does not resolve, a device its account does not
+/// know, and a request that is no one's are each turned away meanwhile.
+#[test]
+fn with_strangers_holding_every_general_slot_people_already_known_still_get_in() {
+    use nexus_music_server::bounds::{BODY_DEADLINE, CONNECTIONS_MAX, RESERVED_SLOTS};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let folders = Folders::new("flood");
+    let port = free_port();
+    let settings = folders.settings(port);
+    let code = set_up(&settings, EMAIL);
+    // A second person's one-time code, by the owner's command, redeemed during the flood.
+    let output = program(&settings, &["recover", "sam@example.org"]).output().unwrap();
+    let said = String::from_utf8_lossy(&output.stdout).to_string();
+    let at = said.find("one-time code ").unwrap() + "one-time code ".len();
+    let sams = OneTimeCode::new(&said[at..at + 13].replace('-', "")).unwrap();
+    let backend = Serving::start(&settings, port);
+    let (status, body) = backend.post(account::SIGN_IN, None, &sign_in(Credential::Code { code, new_password: Password::new(PASSWORD).unwrap() }, 1, "Robin's PC", DeviceKind::Pc));
+    let pc = signed_in(status, &body);
+
+    // Strangers hold every general slot, kept held: each one let go at its body's deadline is
+    // taken again at once.
+    let general = CONNECTIONS_MAX - RESERVED_SLOTS;
+    let stop = Arc::new(AtomicBool::new(false));
+    let at = backend.at;
+    let holders: Vec<_> = (0..general)
+        .map(|_| {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    let mut held = holding_a_slot(at);
+                    held.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+                    let mut sink = [0u8; 256];
+                    while !stop.load(Ordering::SeqCst) {
+                        match held.read(&mut sink) {
+                            Ok(0) => break,
+                            Ok(_) => {}
+                            Err(why) if matches!(why.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+                            Err(_) => break,
+                        }
+                    }
+                }
+            })
+        })
+        .collect();
+    let hello = || {
+        let mut stream = TcpStream::connect(at).unwrap();
+        stream.write_all(format!("GET {} HTTP/1.1\r\nHost: nexus\r\nX-Nexus-Scheme: https\r\n\r\n", nexus_core::nexus::proto::HELLO).as_bytes()).unwrap();
+        let mut from = BufReader::new(stream);
+        nexus_music_server::probe::read_head(&mut from).unwrap().expect("an answer").status
+    };
+    let full = Instant::now();
+    while hello() != 400 {
+        assert!(full.elapsed() < Duration::from_secs(10), "the general slots were never all held");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let held_since = Instant::now();
+    // A flood of strangers signing in meanwhile: new devices, emails of no account.
+    let turned = Arc::new(AtomicUsize::new(0));
+    let flood: Vec<_> = (0..8u8)
+        .map(|n| {
+            let (stop, turned, at) = (stop.clone(), turned.clone(), at);
+            std::thread::spawn(move || {
+                let backend = Serving { child: None, at, written: String::new() };
+                let mut tries = 0u32;
+                while !stop.load(Ordering::SeqCst) {
+                    tries += 1;
+                    let email = format!("stranger-{n}-{tries}@example.org");
+                    let (status, _) = backend.post(account::SIGN_IN, None, &sign_in(with_password(&email, "a guess of a stranger's"), 100 + n, "A stranger", DeviceKind::Pc));
+                    if status == 400 {
+                        turned.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            })
+        })
+        .collect();
+
+    // Turned away, as no one's: a session that does not resolve, and Robin's known device signing
+    // in to an account that does not know it (with that account's right email, a wrong guess).
+    let nobody = account::Session::from_bytes([0x42; 32]);
+    assert_eq!(list_of(&backend, &nobody, pc.restore), 400, "a session that does not resolve took a reserved slot");
+    let (status, _) = backend.post(account::SIGN_IN, None, &sign_in(with_password("sam@example.org", "a guess"), 1, "Robin's PC", DeviceKind::Pc));
+    assert_eq!(status, 400, "a device known to another account took a reserved slot");
+
+    // Through the reserve: a signed-in device's call, a known device's sign-in, a code redeemed.
+    assert_eq!(list_of(&backend, &pc.session, pc.restore), 200, "a signed-in device's call did not get through");
+    let (status, body) = backend.post(account::SIGN_IN, None, &sign_in(with_password(EMAIL, PASSWORD), 1, "Robin's PC", DeviceKind::Pc));
+    let again = signed_in(status, &body);
+    assert_eq!(again.device, pc.device);
+    let (status, body) = backend.post(account::SIGN_IN, None, &sign_in(Credential::Code { code: sams, new_password: Password::new("a made-up password of sam's").unwrap() }, 2, "Sam's phone", DeviceKind::Phone));
+    assert_eq!(signed_in(status, &body).person.email.as_str(), "sam@example.org");
+    // All of it while the strangers held the general slots (they hold each up to its deadline).
+    assert!(held_since.elapsed() < BODY_DEADLINE, "{:?}: the general slots may have been let go meanwhile", held_since.elapsed());
+    assert_eq!(hello(), 400, "the general slots were let go meanwhile");
+    stop.store(true, Ordering::SeqCst);
+    for thread in holders.into_iter().chain(flood) {
+        thread.join().unwrap();
+    }
+    assert!(turned.load(Ordering::SeqCst) > 0, "the flood was never turned away");
+}
+
+/// C5's gap (the review of S9): over HTTP, from the page's own origin and marked as the page,
+/// an account that is NOT an admin's, with its right password, is answered exactly as a wrong
+/// password and the try is recorded as one (M2): the route hands the page's sign-in to the
+/// accounts as the page's. From the app, the same account signs in.
+#[test]
+fn a_member_at_the_page_with_the_right_password_is_a_wrong_password_over_http() {
+    use nexus_music_server::accounts::setup::{CodeKey, make_code};
+    use nexus_music_server::store::keeper::{First, Keeper};
+    const PAGE: &str = "https://nexus.example.test";
+    const MEMBER: &str = "member@example.org";
+    let folders = Folders::new("page-member");
+    let port = free_port();
+    let mut settings = folders.settings(port);
+    settings.push(("NEXUS_PUBLIC_ORIGIN", PAGE.into()));
+    set_up(&settings, EMAIL);
+    // An account that is not an admin's, made in the data with a code of its own (the page's
+    // call that makes one is the admin page's slice).
+    let code = {
+        let now = now_ms();
+        let (mut keeper, _) = Keeper::open(&folders.root.join("state"), &folders.root.join("data"), now).unwrap();
+        let (code, print) = make_code(&CodeKey::of(&keeper)).unwrap();
+        keeper.make_account(MEMBER, "Sam", false, First::Code(&print, now + 15 * 60 * 1000), now).unwrap();
+        keeper.close();
+        code
+    };
+    let backend = Serving::start(&settings, port);
+    let (status, body) = backend.post(account::SIGN_IN, None, &sign_in(Credential::Code { code, new_password: Password::new(PASSWORD).unwrap() }, 1, "Sam's phone", DeviceKind::Phone));
+    assert!(!signed_in(status, &body).person.admin);
+    let page = format!("Origin: {PAGE}\r\nX-Nexus-Admin: 1\r\n");
+    std::thread::sleep(Duration::from_millis(1_100));
+    let (wrong_status, wrong) = backend.post_with(account::SIGN_IN, None, &page, &sign_in(with_password(EMAIL, "not robin's password, a guess"), 7, "Nexus admin browser", DeviceKind::Pc));
+    let (status, body) = backend.post_with(account::SIGN_IN, None, &page, &sign_in(with_password(MEMBER, PASSWORD), 8, "Nexus admin browser", DeviceKind::Pc));
+    assert_eq!(status, 403);
+    assert_eq!((status, &body), (wrong_status, &wrong), "the right password of a member at the page said something a wrong one does not");
+    let (status, _) = backend.post_with(account::SIGN_IN, None, &page, &sign_in(with_password(MEMBER, PASSWORD), 8, "Nexus admin browser", DeviceKind::Pc));
+    assert_eq!(status, 429, "the page's refusal of a member was not recorded as a wrong try");
+}

@@ -38,7 +38,7 @@ impl Bench {
     /// A backend set up, with `accounts` made (email, admin), each with a live code.
     pub fn new(name: &str, accounts: &[(&'static str, bool)]) -> (Bench, Vec<Made>) {
         let client = crate::music::MusicClient::trusting(tokio_rustls::rustls::RootCertStore::empty());
-        Bench::with_music(name, accounts, super::music::MusicSide { client, internal: "http://127.0.0.1:9".into() })
+        Bench::with_music(name, accounts, super::music::MusicSide::new(client, "http://127.0.0.1:9".into()))
     }
 
     /// The same, reaching the music server with `music`.
@@ -63,6 +63,8 @@ impl Bench {
         let now = Arc::new(AtomicU64::new(START));
         let read = now.clone();
         let for_desk = now.clone();
+        let for_admission = now.clone();
+        let admission = Arc::new(super::admit::Admission::open(&mut keeper, Arc::new(move || for_admission.load(Ordering::SeqCst))).unwrap());
         let desk = Desk::open(keeper, Arc::new(move || for_desk.load(Ordering::SeqCst))).unwrap();
         let accounts = Arc::new(Accounts {
             desk,
@@ -70,7 +72,7 @@ impl Bench {
             set_up_code: SetUpCode::at_start(true, START).0,
             clock: Arc::new(move || read.load(Ordering::SeqCst)),
             backend,
-            seen: Arc::default(),
+            admission,
             music,
         });
         let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();

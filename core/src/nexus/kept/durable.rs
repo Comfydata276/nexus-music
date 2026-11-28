@@ -3,7 +3,7 @@
 
 use super::receipt::Purpose;
 use super::*;
-use crate::nexus::music::{CurrentEndpoints, MusicInstallation, VerifiedLogin};
+use crate::nexus::music::{MusicInstallation, VerifiedLogin};
 use std::collections::BTreeMap;
 
 pub const CLOCK_MARK_INTERVAL_MS: u64 = 60_000;
@@ -50,6 +50,15 @@ impl Clock {
 
     pub fn effective(self) -> u64 {
         self.mark().max(self.floor)
+    }
+
+    /// Keep the time of a clock-only decision, such as rejecting a code before
+    /// its account is loaded. Judge at `effective()` and persist these effects.
+    pub fn observation_effects(self) -> Effects {
+        Effects {
+            high_water: self.mark(),
+            updates: Vec::new(),
+        }
     }
 }
 
@@ -365,10 +374,7 @@ impl Account {
         operation: impl FnOnce(Turn<'_>) -> Result<T, Denied>,
     ) -> Decision<Result<T, Denied>> {
         let now = clock.effective();
-        let mut effects = Effects {
-            high_water: clock.mark(),
-            updates: Vec::new(),
-        };
+        let mut effects = clock.observation_effects();
         let answer = if restore != self.state.restore {
             Err(Denied::StartAgain)
         } else {
@@ -602,10 +608,7 @@ impl Account {
         mode: RestoreMode,
         clock: Clock,
     ) -> Decision<Result<(), Denied>> {
-        let mut effects = Effects {
-            high_water: clock.mark(),
-            updates: Vec::new(),
-        };
+        let mut effects = clock.observation_effects();
         let answer = Self::restore_update(apart, data, new_restore, mode)
             .map(|update| effects.updates.extend(update));
         Decision { effects, answer }
@@ -1275,16 +1278,16 @@ impl Turn<'_> {
         })
     }
 
-    /// Install the verified login only while the same authorization and endpoints
-    /// are current. S3 commits the count and sealed bytes under the same lock.
+    /// Install the verified login only while the same authorization and internal
+    /// address are current. S3 commits the count and sealed bytes under the same lock.
     pub fn install_music(
         self,
         bearer: Bearer<'_>,
         verified: VerifiedLogin,
-        endpoints: CurrentEndpoints<'_>,
+        internal: &str,
         target: Option<&mut Account>,
     ) -> Result<u64, Denied> {
-        let (auth, login) = verified.into_parts(endpoints).ok_or(Denied::WrongPurpose)?;
+        let (auth, login) = verified.into_parts(internal).ok_or(Denied::WrongPurpose)?;
         let session = self
             .account
             .session(bearer.device, bearer.hash, self.now)?

@@ -153,11 +153,37 @@ async fn tls_stand_in() -> (String, RootCertStore) {
 }
 
 #[test]
-fn the_address_people_use_is_asked_by_https_with_a_certificate_this_machine_trusts_only() {
+fn a_container_address_given_as_https_is_asked_with_a_certificate_this_machine_trusts_only() {
     runtime().block_on(async {
         let (at, roots) = tls_stand_in().await;
         let trusted = MusicClient::trusting(roots).within(Duration::from_secs(2));
         assert_eq!(trusted.ask_at(&at, "/rest/ping", "f=json").await.map(|(status, _)| status), Some(200));
         assert_eq!(client().ask_at(&at, "/rest/ping", "f=json").await, None, "a certificate not trusted was taken");
+    });
+}
+
+/// S9-3 (the review of S9): a music server that sends part of an answer and then holds the
+/// connection open gives no answer within the client's time, and the connection is closed
+/// from this side as soon as the question is given up: nothing of it is left running.
+#[test]
+fn a_peer_that_sends_part_of_an_answer_and_holds_on_is_let_go_at_the_deadline() {
+    runtime().block_on(async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let at = listener.local_addr().unwrap();
+        let (closed, closing) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            request(&mut stream).await;
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{\"subsonic").await.unwrap();
+            // Held open: told only when the other side has gone.
+            let mut rest = [0u8; 64];
+            let gone = matches!(stream.read(&mut rest).await, Ok(0) | Err(_));
+            let _ = closed.send(gone);
+        });
+        let started = std::time::Instant::now();
+        assert_eq!(client().ask_at(&format!("http://{at}"), "/rest/ping", "f=json").await, None);
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        let gone = tokio::time::timeout(Duration::from_millis(500), closing).await;
+        assert!(matches!(gone, Ok(Ok(true))), "the connection was left open after the question was given up");
     });
 }

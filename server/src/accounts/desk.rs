@@ -6,10 +6,12 @@
 //! nothing of the step is done.
 //!
 //! **The line has two lanes** (the review of S8, C1). A stranger's sign-in, before any door has
-//! been chosen for it (the account looked up, kept's check made), waits in a lane of its own,
-//! [`STRANGER_WAITING_MAX`] long. Everything else waits in the other: a sign-in from a device
-//! this backend has seen, a one-time code (already held to its own door of ten a second), and
-//! every call made with a session, including the last step of one begun. The thread takes from
+//! been chosen for it (the account looked up, kept's check made), and any work of a request
+//! that shows a session that does not resolve ([`Admitted::Unresolved`]), wait in a lane of
+//! their own, [`STRANGER_WAITING_MAX`] long. Everything else waits in the other: a sign-in from
+//! a device its account knows, a one-time code (already held to its own door of ten a second),
+//! and every call made with a session found live on the cheap read path first
+//! ([`super::admit`]), including the last step of one begun. The thread takes from
 //! the second lane first, so a flood of strangers' sign-ins can fill only its own lane, and
 //! never keeps a known device, a recovery code or a signed-in person's call waiting for more
 //! than the one step under way.
@@ -51,6 +53,24 @@ pub const IDLE_EVERY: Duration = Duration::from_secs(60);
 
 /// The clock the thread does its idle work by: milliseconds, as the backend's decisions have it.
 pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
+
+/// What the listener found of a request before it took a work slot (the review of S8, C1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admitted {
+    /// Nothing that makes it anyone's: no session shown, no known device, no live code.
+    Plain,
+    /// A session that resolves, a known device signing in, or a live code: it may take a slot
+    /// of the listener's reserve.
+    Reserved,
+    /// It shows a session that does not resolve.
+    Unresolved,
+}
+
+tokio::task_local! {
+    /// The admission of the request whose work this is, set by the listener around what
+    /// answers it ([`crate::serve`]).
+    pub static ADMITTED: Admitted;
+}
 
 /// Which lane a piece of work waits in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,6 +174,10 @@ impl Desk {
 
     /// The same, in `lane`.
     pub async fn ask_in<T: Send + 'static>(&self, lane: Lane, step: impl FnOnce(&mut Keeper) -> T + Send + 'static) -> Result<T, Busy> {
+        // A request that shows a session that does not resolve never waits in the protected
+        // lane, whichever route hands in its work (C1: the routes of events and Diagnostics
+        // included, which look a session up on the thread that writes).
+        let lane = if lane == Lane::Kept && ADMITTED.try_with(|admitted| *admitted == Admitted::Unresolved).unwrap_or(false) { Lane::Stranger } else { lane };
         let (answer, answered) = oneshot::channel();
         let work: Work = Box::new(move |keeper| {
             // Not begun, and nobody waits for it: nothing of it is done.
@@ -267,6 +291,9 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             assert_eq!(desk.ask_in(Lane::Stranger, |_| ()).await, Err(Busy), "the strangers' lane is full");
+            // C1: the work of a request whose session did not resolve waits with the strangers,
+            // whichever lane its route asked for.
+            assert_eq!(ADMITTED.scope(Admitted::Unresolved, desk.ask(|_| ())).await, Err(Busy), "it waited in the protected lane");
             let kept = {
                 let (desk, order) = (desk.clone(), order.clone());
                 tokio::spawn(async move { desk.ask(move |_| order.lock().unwrap().push("kept".into())).await })
