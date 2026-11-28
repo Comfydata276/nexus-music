@@ -420,8 +420,16 @@ dd, li { overflow-wrap: anywhere; }
       head: { speaks: [1, 1], restore: current.restore }, ...fields,
     }), current.controller.signal, current.bearer);
     if (session !== current || !checkIdle()) throw new Error();
-    const reply = response.body && await readReply(response, response.status === 200 ? max : 4096);
+    const reply = response.body && await readReply(response, response.status === 200 ? max : 4096).catch(error => {
+      if (response.status === 401) return null;
+      throw error;
+    });
     if (session !== current || !checkIdle()) throw new Error();
+    if (response.status === 401) {
+      endSession(reply?.refused?.not_signed_in === "data_put_back" ?
+        "The server’s data was put back. Sign in again." : "Your session has ended. Sign in again.");
+      throw new Error();
+    }
     if (response.status === 200 && reply?.done && typeof reply.done === "object" &&
         !Array.isArray(reply.done) && reply.refused === undefined) {
       current.lastUse = Math.max(current.lastUse, started);
@@ -429,13 +437,6 @@ dd, li { overflow-wrap: anywhere; }
       return reply.done;
     }
     if (!reply || reply.done !== undefined) throw new Error();
-    if (response.status === 401) {
-      const ended = reply.refused?.not_signed_in;
-      if (ended === "data_put_back" || ended === "session_ended") {
-        endSession(ended === "data_put_back" ?
-          "The server’s data was put back. Sign in again." : "Your session has ended. Sign in again.");
-      }
-    }
     if (response.status === 403) {
       const reason = reply.refused?.not_allowed;
       if (typeof reason === "string" && Object.hasOwn(refusalMessages, reason)) {

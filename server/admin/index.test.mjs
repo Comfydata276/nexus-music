@@ -650,3 +650,16 @@ test("the own row hides lockout controls and the current tab stays signed in", a
   assert.equal(page.button("devices-list", "Sign this admin page out"), undefined);
   assert.equal(page.from("identity").textContent, account.email);
 });
+
+test("a session refused before the request is read clears the page", async () => {
+  const mock = adminStandIn();
+  const page = loadPage((path, options) => path === "/nexus/api/admin/diagnostics"
+    ? new Response(null, { status: 401 }) : mock.fetch(path, options));
+  await page.signIn("owner@example.test", adminPassword);
+  await settle();
+  page.click("reports-open");
+  await settle();
+  assert.equal(page.from("identity").textContent, "");
+  assert.equal(page.from("reports").open, false);
+  assert.match(page.from("status").textContent, /Sign in again/);
+});
