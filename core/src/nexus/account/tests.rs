@@ -110,7 +110,7 @@ fn good_sign_in() -> SignInReply {
         sign_out: sign_out_note(),
         restore: 8,
         music: MusicLoginResult::Login(music()),
-        notice: Notice::new("What this server records\nWhat you play.").unwrap(),
+        notice: Notice::recording(),
     })
 }
 
@@ -489,6 +489,8 @@ fn names_notices_and_music_addresses_obey_their_byte_bounds() {
     assert!(Notice::new("Ada\nMusic").is_some());
     assert!(Notice::new("Ada\rMusic").is_none());
     assert!(Notice::new("").is_none());
+    let recording = Notice::recording();
+    assert_eq!(Notice::new(recording.as_str()), Some(recording));
 
     let base = "https://music.example.org/";
     let exact = format!("{base}{}", "a".repeat(MUSIC_ADDRESS_MAX_BYTES - base.len()));
