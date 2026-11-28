@@ -1,4 +1,32 @@
 use super::*;
+use crate::nexus::account::{AccountId, Receipt, Refusal, Stamp, StampTag};
+use crate::nexus::proto::{BackendId, SPEAKS};
+use serde_json::{Value, json};
+
+fn head() -> RequestHead {
+    RequestHead {
+        speaks: SPEAKS,
+        restore: 8,
+    }
+}
+
+fn upload(report: &Report) -> Upload {
+    Upload::new(head(), RequestId::new(4).unwrap(), report).unwrap()
+}
+
+fn receipt() -> Receipt {
+    Receipt {
+        stamp: Stamp {
+            backend: BackendId::from_bytes([5; 16]),
+            restore: head().restore,
+            account: AccountId::new(3).unwrap(),
+            life: 5,
+            change: 12,
+            tag: StampTag::from_bytes([6; 32]),
+        },
+        music_login_count: 0,
+    }
+}
 
 const AT: u64 = 1_800_000_000_000;
 const STARTED: Line = Line::Note(Note::PlayerStarted);
@@ -15,6 +43,7 @@ fn report(record: Record) -> Report {
             offline: false,
             local_permission: Some(false),
             android_auto: Some(true),
+            loss: LossCounts::default(),
         },
         record,
     }
@@ -187,8 +216,8 @@ fn last_attempt_and_last_failure_replace_separately_across_restart() {
 fn the_record_keeps_200_bounded_lines_and_reserves_its_latest_traces() {
     let mut record = Record::default();
     record.note_attempt(AT, trace(Reach::None), true);
-    for n in 0..500 {
-        record.note(AT + u64::from(n), Line::ForegroundAfterMs(n));
+    for n in 0..=255u8 {
+        record.note(AT + u64::from(n) * 1000, Line::DownloadJobStopped(n));
     }
     record.note(AT, Line::ForegroundAfterMs(MAX_FOREGROUND_MS + 1));
     record.note(AT, Line::ForegroundAfterMs(MAX_FOREGROUND_MS));
@@ -203,7 +232,7 @@ fn the_record_keeps_200_bounded_lines_and_reserves_its_latest_traces() {
     );
     assert_eq!(
         record.entries().get(2).unwrap().line,
-        Line::ForegroundAfterMs(303)
+        Line::DownloadJobStopped(59)
     );
     assert_eq!(
         record.entries().back().unwrap().line,
@@ -216,14 +245,7 @@ fn the_record_keeps_200_bounded_lines_and_reserves_its_latest_traces() {
             .all(|line| line.chars().count() <= MAX_LINE_CHARS)
     );
     assert_eq!(Report::read(&text).unwrap(), report);
-    assert!(
-        Upload::new(&report)
-            .unwrap()
-            .write(CALL_BYTES)
-            .unwrap()
-            .len()
-            < CALL_BYTES
-    );
+    assert!(upload(&report).write().unwrap().bytes().len() < CALL_BYTES);
     assert_eq!(clean_line(&" ".repeat(MAX_LINE_CHARS + 1)), None);
 }
 
@@ -234,29 +256,25 @@ fn the_report_says_when_and_how_often_and_is_the_only_text_uploaded() {
     record.note(AT + 61_000, STARTED);
     let report = report(record);
     let shown = report.text().unwrap();
-    assert!(shown.ends_with(
-        "  2027-01-15 08:01:01.000  Player started  (2 times since 2027-01-15 08:00:00.000)"
-    ));
+    assert!(
+        shown.ends_with(
+            "  2027-01-15 08:01:01  Player started  (2 times since 2027-01-15 08:00:00)"
+        )
+    );
     assert!(!shown.contains('\t'));
-    let upload = Upload::new(&report).unwrap();
-    let wire = upload.write(CALL_BYTES).unwrap();
-    assert_eq!(upload.write(wire.len()).unwrap(), wire);
-    assert_eq!(upload.write(wire.len() - 1), Err(Wrong::Size));
-    assert_eq!(Upload::read(&wire).unwrap().text(), shown);
-    let value: serde_json::Value = serde_json::from_slice(&wire).unwrap();
-    assert_eq!(value, serde_json::json!({"text":shown}));
-    let empty = report::empty();
+    let request = upload(&report);
+    let wire = request.write().unwrap();
+    let incoming = Upload::read(wire.bytes()).unwrap();
+    assert_eq!(incoming.text(), shown);
+    assert_eq!(incoming.head, head());
+    assert_eq!(incoming.request_id, RequestId::new(4).unwrap());
+    let value: Value = serde_json::from_slice(wire.bytes()).unwrap();
+    assert_eq!(value, json!({"head":head(), "request_id":4, "text":shown}));
+    let empty = self::report(Record::default());
     assert!(empty.text().unwrap().ends_with(EMPTY));
     assert_eq!(Report::read(&empty.text().unwrap()).unwrap(), empty);
 }
 
-mod report {
-    use super::*;
-
-    pub fn empty() -> Report {
-        super::report(Record::default())
-    }
-}
 
 #[test]
 fn names_paths_addresses_keys_tokens_and_odd_characters_never_survive() {
@@ -268,6 +286,11 @@ fn names_paths_addresses_keys_tokens_and_odd_characters_never_survive() {
         "https://music.example.test/api",
         "mira@example.test",
         "192.0.2.1",
+        "2001:db8::1",
+        "https://music.example.test/api?q=made-up-secret",
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "Mira’s Playlist",
+        "L’été à Québec 音楽",
         "secret_api_key=1a2b3c",
         "Bearer made-up-token",
         "Player started\nMira Bell",
@@ -285,17 +308,20 @@ fn names_paths_addresses_keys_tokens_and_odd_characters_never_survive() {
         for &(shape, _) in SHAPES {
             let line = Line::Fault(Fault { place, shape });
             assert_eq!(clean_line(&line.to_string()), Some(line));
-            record.note(AT, line);
+            if record.entries().len() < MAX_ENTRIES {
+                record.note(AT, line);
+            }
         }
     }
     let report = report(record);
     let shown = report.text().unwrap();
-    let wire = Upload::new(&report).unwrap().write(CALL_BYTES).unwrap();
-    let uploaded = Upload::read(&wire).unwrap();
+    let body = upload(&report).write().unwrap();
+    let wire = body.bytes();
+    let uploaded = Upload::read(wire).unwrap();
     assert_eq!(uploaded.text(), shown);
     assert_eq!(
         report.record.entries().len(),
-        1 + PLACES.len() * SHAPES.len()
+        (1 + PLACES.len() * SHAPES.len()).min(MAX_ENTRIES)
     );
     for private in &raw[..raw.len() - 1] {
         assert!(!shown.contains(private));
@@ -306,18 +332,17 @@ fn names_paths_addresses_keys_tokens_and_odd_characters_never_survive() {
         shown.replace("Player started", "Player started: Mira Bell"),
         shown.replace("OS 17.0.0", "OS Ari's phone"),
     ] {
-        let wire = serde_json::to_vec(&serde_json::json!({"text":forged})).unwrap();
+        let wire =
+            serde_json::to_vec(&json!({"head":head(), "request_id":4, "text":forged})).unwrap();
         assert_eq!(Upload::read(&wire).err(), Some(Wrong::Form));
     }
 }
 
 #[test]
 fn the_upload_requires_whole_utf8_bounded_unique_json_and_known_types() {
-    let wire = Upload::new(&report::empty())
-        .unwrap()
-        .write(CALL_BYTES)
-        .unwrap();
-    let json = std::str::from_utf8(&wire).unwrap();
+    let body = upload(&self::report(Record::default())).write().unwrap();
+    let wire = body.bytes();
+    let json = std::str::from_utf8(wire).unwrap();
     let with = |fields: &str| format!("{{{fields},{}", json.strip_prefix('{').unwrap());
     assert!(Upload::read(with(r#""later":{"field":1}"#).as_bytes()).is_ok());
     for bad in [
@@ -334,7 +359,7 @@ fn the_upload_requires_whole_utf8_bounded_unique_json_and_known_types() {
     let mut invalid = with(r#""later":"X""#).into_bytes();
     *invalid.iter_mut().find(|x| **x == b'X').unwrap() = 0xff;
     assert_eq!(Upload::read(&invalid).err(), Some(Wrong::Form));
-    let mut at_limit = wire.clone();
+    let mut at_limit = wire.to_vec();
     at_limit.resize(CALL_BYTES, b' ');
     assert!(Upload::read(&at_limit).is_ok());
     at_limit.push(b' ');
@@ -346,19 +371,52 @@ fn the_upload_requires_whole_utf8_bounded_unique_json_and_known_types() {
 }
 
 #[test]
-fn done_checks_status_and_carries_no_report() {
-    assert_eq!(read_done(200, DONE), Ok(()));
-    assert_eq!(read_done(200, br#"{"done":true,"later":1}"#), Ok(()));
-    assert_eq!(read_done(201, DONE), Err(Wrong::Status));
+fn an_upload_reply_checks_status_and_stamp_and_carries_no_report() {
+    let done = Reply::Done {
+        result: Uploaded {},
+        receipt: receipt(),
+    };
+    let body = write_reply(&done).unwrap();
+    assert_eq!(read_reply(200, body.bytes()), Ok(done));
+    assert_eq!(read_reply(201, body.bytes()), Err(Wrong::Status));
+    let mut too_large = body.bytes().to_vec();
+    too_large.resize(account::SMALL_REPLY_MAX_BYTES + 1, b' ');
+    assert_eq!(read_reply(200, &too_large), Err(Wrong::Size));
+    let value: Value = serde_json::from_slice(body.bytes()).unwrap();
+    assert_eq!(value["done"]["result"], json!({}));
+    assert_eq!(value["done"]["receipt"]["stamp"]["restore"], json!(8));
     for wrong in [
-        br#"{"done":false}"#.as_slice(),
-        br#"{"done":"true"}"#,
-        br#"{"done":true,"done":true}"#,
+        br#"{"done":true}"#.as_slice(),
+        br#"{"done":{"result":{}}}"#,
         b"{",
         b"{}",
     ] {
-        assert_eq!(read_done(200, wrong), Err(Wrong::Form));
+        assert_eq!(read_reply(200, wrong), Err(Wrong::Form));
     }
+    let refusal = Reply::Refused(Refusal::Malformed);
+    let refused = write_reply(&refusal).unwrap();
+    assert_eq!(read_reply(400, refused.bytes()), Ok(refusal));
+    assert_eq!(read_reply(200, refused.bytes()), Err(Wrong::Status));
+}
+
+#[test]
+fn upload_refuses_a_missing_head_or_invalid_operation_number() {
+    let body = upload(&self::report(Record::default())).write().unwrap();
+    let valid: Value = serde_json::from_slice(body.bytes()).unwrap();
+    for bad_number in [json!(0), json!("4"), json!(null)] {
+        let mut invalid = valid.clone();
+        invalid["request_id"] = bad_number;
+        assert_eq!(
+            Upload::read(&serde_json::to_vec(&invalid).unwrap()).err(),
+            Some(Wrong::Form)
+        );
+    }
+    let mut missing = valid;
+    missing.as_object_mut().unwrap().remove("head");
+    assert_eq!(
+        Upload::read(&serde_json::to_vec(&missing).unwrap()).err(),
+        Some(Wrong::Form)
+    );
 }
 
 #[test]
@@ -373,4 +431,120 @@ fn the_server_keeps_at_most_31_reports_and_none_older_than_30_days() {
             .collect::<Vec<_>>(),
         vec![1, 2]
     );
+}
+
+#[test]
+fn journal_loss_totals_are_separate_and_cannot_age_out() {
+    let mut report = report(Record::default());
+    report.about.loss = LossCounts { line_full: 2, files_full: 3, refused: u64::MAX };
+    for n in 0..=255 {
+        report.record.note(AT, Line::DownloadJobStopped(n));
+    }
+    let text = report.text().unwrap();
+    assert!(text.lines().any(|line| line == format!("{LINE_FULL}2")));
+    assert!(text.lines().any(|line| line == format!("{FILES_FULL}3")));
+    assert!(text.lines().any(|line| line == format!("{REFUSED_FOR_GOOD}{}", u64::MAX)));
+    assert_eq!(Report::read(&text).unwrap().about.loss, report.about.loss);
+    report.record.clear();
+    assert_eq!(Report::read(&report.text().unwrap()).unwrap().about.loss, report.about.loss);
+}
+
+#[test]
+fn repeated_startup_timings_replace_one_line_and_leave_faults_visible() {
+    let mut record = Record::default();
+    let fault = Line::Fault(Fault { place: FaultPlace::Foreground, shape: FaultShape::Refused });
+    record.note(AT, fault);
+    for ms in 0..500 {
+        record.note(AT, Line::ForegroundAfterMs(ms));
+    }
+    assert_eq!(record.entries().len(), 2);
+    assert_eq!(record.entries().front().unwrap().line, fault);
+    assert_eq!(record.entries().back().unwrap().line, Line::ForegroundAfterMs(499));
+    assert_eq!(record.entries().back().unwrap().count, 1);
+}
+
+#[test]
+fn phone_notifications_and_new_session_endings_have_fixed_wording() {
+    for line in [
+        Line::DownloadJobStopped(4),
+        Line::Note(Note::MediaButtonStarted),
+        Line::Note(Note::MediaButtonNothingToResume),
+        Line::Note(Note::MediaButtonStartRefused),
+        Line::Note(Note::SharedLibraryUnavailable),
+        Line::SessionEnded(SessionEnded::PasswordReset),
+        Line::SessionEnded(SessionEnded::DataPutBack),
+    ] {
+        assert_eq!(clean_line(&line.to_string()), Some(line));
+    }
+    assert_eq!(clean_line("Android stopped the download job (reason 256)"), None);
+    assert_eq!(clean_line("Shared library could not be loaded: /private/path"), None);
+}
+
+#[test]
+fn panic_payloads_only_contribute_a_closed_shape() {
+    use FaultShape::*;
+
+    let path = "/home/mira/secret/music.flac";
+    let name = "Mira Bell";
+    let token = "1a2b3c4d5e6f78900123456789abcdef0123456789abcdef0123456789abcdef";
+    let mut record = Record::default();
+    for (message, shape) in [
+        ("already borrowed: BorrowMutError", BorrowConflict),
+        ("already mutably borrowed: BorrowError", BorrowConflict),
+        ("called `Result::unwrap()` on an `Err` value: PoisonError { .. }", PoisonedLock),
+        ("called `Option::unwrap()` on a `None` value", MissingValue),
+        ("called `Result::unwrap()` on an `Err` value", UnexpectedResultError),
+        ("index out of bounds: the len is 1 but the index is 2", Bounds),
+        ("assertion `left == right` failed", Assertion),
+        ("attempt to add with overflow", Overflow),
+        ("unexpected custom panic", Panic),
+    ] {
+        let payload = format!("{message}: {path} for {name}\nBearer {token}");
+        let classified = classify_rust_panic(&payload);
+        assert_eq!(classified, shape);
+        record.note(AT, Line::Fault(Fault { place: FaultPlace::App, shape: classified }));
+    }
+    for empty in ["", " \n", "no message", "no payload"] {
+        assert_eq!(classify_rust_panic(empty), NoPayload);
+    }
+    record.note(AT, Line::Fault(Fault { place: FaultPlace::App, shape: NoPayload }));
+
+    let report = report(record);
+    let text = report.text().unwrap();
+    assert_eq!(Report::read(&text).unwrap(), report);
+    let body = upload(&report).write().unwrap();
+    for private in [path, name, token] {
+        assert!(!text.as_bytes().windows(private.len()).any(|bytes| bytes == private.as_bytes()));
+        assert!(!body.bytes().windows(private.len()).any(|bytes| bytes == private.as_bytes()));
+    }
+}
+
+#[test]
+fn windows_messages_and_download_moves_are_counted_as_fixed_notes() {
+    let mut record = Record::default();
+    for note in [Note::AppMessage, Note::DownloadsFolderChanged] {
+        let line = Line::Note(note);
+        assert_eq!(clean_line(&line.to_string()), Some(line));
+        record.note(AT, line);
+        record.note(AT, line);
+    }
+    assert!(record.entries().iter().all(|entry| entry.count == 2));
+    let report = report(record);
+    assert_eq!(Report::read(&report.text().unwrap()).unwrap(), report);
+}
+
+#[test]
+fn a_far_future_attempt_cannot_block_diagnostics_after_clock_correction() {
+    let wrong_time = AT + 365 * DAY_MS;
+    let mut schedule = Schedule::restore(AT, Some(wrong_time + MIN_GAP_MS), &[wrong_time]).unwrap();
+    let corrected = AT + DAY_MS;
+    assert_eq!(schedule.due(corrected, true, true), Some(Due::Daily));
+    assert_eq!(schedule.take_due(corrected, true, true), Some(Due::Daily));
+    assert_eq!(schedule.attempts().collect::<Vec<_>>(), vec![corrected]);
+    assert_eq!(schedule.fault_ms(), None);
+
+    let mut first_use = Schedule::new(wrong_time).unwrap();
+    first_use.note_fault(corrected);
+    assert_eq!(first_use.started_ms(), corrected);
+    assert_eq!(first_use.due(corrected + FAULT_WAIT_MS, true, true), Some(Due::Fault));
 }
