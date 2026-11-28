@@ -191,6 +191,13 @@ shapes (`nexus_core::nexus::account`): `signin`, `signout`, `devices`, `force-ou
 `change-password`, `music-login`. Each answers 200 (done), 400 (malformed), 401 (not signed in:
 this session has ended, or the data was put back), 403 (not allowed: a wrong email or password
 is one answer, whichever it was), 429 (busy, come back) or 503 (not dealt with).
+
+**Asked twice (12.2), in this build:** the record of request numbers is not kept yet, so
+every call that changes something is safe to repeat by its own nature: a sign-out, or a note,
+for a session already ended ends nothing more; a force-out names the session it ends, so sent
+again after that device has signed in afresh it ends nothing; a password change sent again is
+refused, because the password it proves is no longer the present one; a sign-in is never
+answered twice, and a lost answer is a new sign-in.
 The id is made at random at first start and kept for as long as `NEXUS_STATE/id` is: a
 device asks its person again if it ever changes. Two copies started at once on the same
 store end with one id, which both serve.
