@@ -69,10 +69,12 @@ export component ListeningOverlay inherits Rectangle {
 
                 VerticalLayout {
                     width: scroll.visible-width;
+                    alignment: start;
                     padding-right: 10px;
                     spacing: 10px;
 
                     if Listening.page == "recording": VerticalLayout {
+                        alignment: start;
                         spacing: 12px;
                         ListeningText { text: "Your Nexus server records the songs you start, with their titles, artists and albums. It records when you played them, what you played them from, which device played them, how long you listened, and when you skipped, paused or moved within a song."; }
                         ListeningText { text: "It also records the words you type into search, including searches that find nothing, when you open the app, and kinds of errors."; }
@@ -81,6 +83,7 @@ export component ListeningOverlay inherits Rectangle {
                     }
 
                     if Listening.page == "stats": VerticalLayout {
+                        alignment: start;
                         spacing: 10px;
                         if Listening.result != "": ListeningText { text: Listening.result; }
                         if Listening.summary != "": Text {
@@ -98,6 +101,7 @@ export component ListeningOverlay inherits Rectangle {
                             font-weight: 600;
                         }
                         for play in Listening.recent: VerticalLayout {
+                            alignment: start;
                             spacing: 3px;
                             Text {
                                 text: play.title;
@@ -113,6 +117,7 @@ export component ListeningOverlay inherits Rectangle {
                     }
 
                     if Listening.page == "delete": VerticalLayout {
+                        alignment: start;
                         spacing: 12px;
                         ListeningText { text: "This deletes the listening and app activity your Nexus server recorded for this account across all your devices, including search words. You can't undo it."; }
                         ListeningText { text: "Nightly backups can retain this history for seven nights. Your server's admin may also have an earlier copy."; }
