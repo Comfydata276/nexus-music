@@ -5,29 +5,47 @@ use super::*;
 
 impl Live {
     /// The session, when one is held.
-    fn session(&self) -> Option<&Session> {
+    pub(super) fn session(&self) -> Option<&Session> {
         self.saved.as_ref()?.session.as_ref()
     }
 
-    fn signed_in(&self) -> bool {
+    pub(super) fn signed_in(&self) -> bool {
         self.session().is_some()
     }
 
-    fn held_count(&self) -> Option<u64> {
+    pub(super) fn held_count(&self) -> Option<u64> {
         self.saved.as_ref()?.music.as_ref().map(|login| login.count)
     }
 
     fn waiting(&self, what: impl Fn(&Purpose) -> bool) -> bool {
         self.flight.iter().any(|flight| what(&flight.what))
     }
-}
 
-/// The JSON body of a note's telling.
-// to be account's (see SIGN_OUT_NOTE).
-fn note_body(note: &Note) -> Option<Hidden> {
-    let head = RequestHead { speaks: SPEAKS, restore: note.restore };
-    let text = serde_json::to_string(&serde_json::json!({ "head": head, "request_id": note.request, "note": note.session_sha256 })).ok()?;
-    Some(Hidden(Zeroizing::new(text)))
+    /// What `hello` said is at this origin this run: `Some(true)` the expected backend,
+    /// `Some(false)` another, `None` not asked yet.
+    fn trusted(&self, origin: &str, expected: &str) -> Option<bool> {
+        let expected = BackendId::from_hex(expected)?;
+        self.verified.iter().find(|(at, _)| at == origin).map(|(_, id)| *id == expected)
+    }
+
+    /// Where an ask of this kind goes, and the backend expected there (`None` for one that
+    /// carries nothing secret, or whose own `hello` is the check).
+    fn origin_for(&self, what: &Purpose) -> Option<(NexusOrigin, Option<(String, String)>)> {
+        match what {
+            Purpose::Hello(pending) => Some((pending.origin.clone(), None)),
+            Purpose::SignIn { origin, .. } => Some((origin.clone(), None)),
+            Purpose::Verify { origin } => Some((NexusOrigin::typed(origin).ok()?, None)),
+            Purpose::Tell { session } => {
+                let note = self.notes.iter().find(|note| note.session() == *session)?;
+                Some((NexusOrigin::typed(&note.nexus).ok()?, Some((note.nexus.clone(), note.backend_id.clone()))))
+            }
+            _ if self.stranger => None,
+            _ => {
+                let saved = self.saved.as_ref()?;
+                Some((NexusOrigin::typed(&saved.nexus).ok()?, Some((saved.nexus.clone(), saved.backend_id.clone()))))
+            }
+        }
+    }
 }
 
 /// A number for one change, made when the person pressed (12.2), from the random bytes
@@ -52,45 +70,48 @@ impl Client {
     // Asking
     // -----------------------------------------------------------------------------------
 
-    /// Asks, if asking is allowed now: never while Offline is on, never when the backend
-    /// speaks no number this app does or another backend answers at the origin, and never
-    /// two of one kind at once. Says whether it asked.
-    fn ask(&mut self, what: Purpose, path: &str, credential: Option<&Session>, body: Option<Hidden>, out: &mut Vec<Do>) -> bool {
+    /// Asks, if asking is allowed now: never while Offline is on; never to a backend that
+    /// said it speaks no number of ours; never two of one kind at once; and **never anything
+    /// carrying a session, a device secret or a note to an origin before its `hello` has
+    /// been read this run and named the backend expected** (7.1): until then a `hello` is
+    /// asked there in its place. Says whether it asked. The address is made by account's
+    /// [`NexusOrigin::call`] from a path constant, never from text handed in.
+    fn ask(&mut self, what: Purpose, path: &'static str, credential: Option<&Session>, body: Option<Hidden>, out: &mut Vec<Do>) -> bool {
         let Some(live) = self.live.as_mut() else { return false };
-        if live.offline || live.too_old || live.flight.len() >= FLIGHT_MAX || live.waiting(|other| other.same_kind(&what)) {
+        if live.offline || live.flight.len() >= FLIGHT_MAX || live.waiting(|other| other.same_kind(&what)) {
             return false;
         }
-        let origin = match &what {
-            Purpose::Hello(pending) => pending.origin.as_str(),
-            Purpose::SignIn { origin, .. } | Purpose::SetPassword { origin, .. } => origin.as_str(),
-            Purpose::TellNote => match &live.note {
-                Some(note) => note.nexus.as_str(),
-                None => return false,
-            },
-            Purpose::Tell => match &live.note {
-                Some(note) => note.nexus.as_str(),
-                None => return false,
-            },
-            _ if live.stranger => return false,
-            _ => match &live.saved {
-                Some(saved) => saved.nexus.as_str(),
-                None => return false,
-            },
-        };
+        let Some((origin, expected)) = live.origin_for(&what) else { return false };
+        let at = origin.origin().to_string();
+        if !matches!(what, Purpose::Hello(_) | Purpose::Verify { .. }) && live.too_old.as_deref() == Some(at.as_str()) {
+            return false;
+        }
+        if let Some((nexus, backend)) = expected {
+            match live.trusted(&nexus, &backend) {
+                Some(true) => {}
+                Some(false) => return false,
+                None => {
+                    self.ask(Purpose::Verify { origin: nexus }, proto::HELLO, None, None, out);
+                    return false;
+                }
+            }
+        }
+        let Ok(address) = origin.call(path) else { return false };
         let (method, within_ms, max_body) = match &what {
-            Purpose::Hello(_) => (Method::Get, HELLO_WITHIN_MS, HELLO_MAX_BYTES),
-            Purpose::SignIn { .. } => (Method::Post, SIGN_IN_WITHIN_MS, ANSWER_MAX_BYTES),
-            _ => (Method::Post, CALL_WITHIN_MS, ANSWER_MAX_BYTES),
+            Purpose::Hello(_) | Purpose::Verify { .. } => (Method::Get, HELLO_WITHIN_MS, HELLO_MAX_BYTES),
+            Purpose::SignIn { .. } => (Method::Post, SIGN_IN_WITHIN_MS, account::SIGN_IN_REPLY_MAX_BYTES),
+            Purpose::Devices { .. } => (Method::Post, CALL_WITHIN_MS, account::LIST_REPLY_MAX_BYTES),
+            _ => (Method::Post, CALL_WITHIN_MS, account::SMALL_REPLY_MAX_BYTES),
         };
         if (method == Method::Post) != body.is_some() {
             return false;
         }
+        let Some(live) = self.live.as_mut() else { return false };
         self.next_ask = self.next_ask.wrapping_add(1);
         let id = self.next_ask;
-        let url = format!("{origin}{path}");
         let authorization = credential.map(|session| Hidden(session.authorization()));
-        live.flight.push(Flight { id, what });
-        out.push(Do::Ask(Ask { id, generation: self.generation, method, url, authorization, body, within_ms, max_body }));
+        live.flight.push(Flight { id, what, max_body });
+        out.push(Do::Ask(Ask { id, generation: self.generation, method, url: address.wire(), authorization, body, within_ms, max_body }));
         true
     }
 
@@ -103,17 +124,18 @@ impl Client {
         self.live.as_ref()?.session().cloned()
     }
 
-    fn ask_devices(&mut self, page: usize, after: Option<DeviceId>, opened: bool, given: &Given, out: &mut Vec<Do>) -> bool {
+    fn ask_devices(&mut self, page: usize, after: Option<DeviceId>, opened: bool, out: &mut Vec<Do>) -> bool {
         let (Some(session), Some(head)) = (self.session(), self.head()) else { return false };
         let Some(body) = hidden(account::encode(&ListDevices { head, after })) else { return false };
         let asked = self.ask(Purpose::Devices { page, opened }, account::LIST_DEVICES, Some(&session), Some(body), out);
         if asked && let Some(live) = self.live.as_mut() {
-            live.checked_ms = Some(given.now_ms);
+            live.check_due = false;
         }
         asked
     }
 
-    /// One renewal of the music login for this number, if the rule allows one now.
+    /// One renewal of the music login for this number, if the rule allows one now. One that
+    /// cannot be asked now is owed, and asked when the backend may be reachable.
     fn ask_music(&mut self, count: u64, refused: bool, out: &mut Vec<Do>) {
         let Some(live) = self.live.as_mut() else { return };
         let answered = if refused { live.renewal.refreshed } else { live.renewal.rose };
@@ -128,30 +150,47 @@ impl Client {
         }
     }
 
-    fn ask_note(&mut self, given: &Given, out: &mut Vec<Do>) {
-        let Some(note) = self.live.as_ref().and_then(|live| live.note.clone()) else { return };
-        if given.now_ms.checked_sub(note.made_ms).is_some_and(|age| age >= NOTE_LIFE_MS) {
+    /// Tells the backend of each waiting sign-out, from its note: no session, only the
+    /// secret that can end that one session (11), and only to the backend it was made for.
+    fn ask_tell(&mut self, given: &Given, out: &mut Vec<Do>) {
+        let Some(live) = self.live.as_mut() else { return };
+        let expired: Vec<u64> =
+            live.notes.iter().filter(|note| given.now_ms.checked_sub(note.made_ms).is_some_and(|age| age >= NOTE_LIFE_MS)).map(Note::session).collect();
+        for session in expired {
             // The session it would end is gone by itself by now (8.7).
-            if let Some(live) = self.live.as_mut() {
-                live.note = None;
-            }
-            out.push(Do::Forget(Forget::Note));
-            return;
+            live.notes.retain(|note| note.session() != session);
+            out.push(Do::Forget(Forget::Note { session }));
         }
-        let Some(body) = note_body(&note) else { return };
-        if self.ask(Purpose::TellNote, SIGN_OUT_NOTE, None, Some(body), out)
-            && let Some(live) = self.live.as_mut()
-        {
+        let mut told = false;
+        let bodies: Vec<(u64, Option<Hidden>)> = live
+            .notes
+            .iter()
+            .map(|note| {
+                let head = RequestHead { speaks: SPEAKS, restore: note.restore };
+                let body = account::RequestId::new(note.request)
+                    .and_then(|request_id| hidden(account::encode(&SignOut { head, request_id, revoke: Some(copy_note(&note.revoke)) })));
+                (note.session(), body)
+            })
+            .collect();
+        for (session, body) in bodies {
+            if let Some(body) = body {
+                told |= self.ask(Purpose::Tell { session }, account::SIGN_OUT, None, Some(body), out);
+            }
+        }
+        if told && let Some(live) = self.live.as_mut() {
             live.told_ms = Some(given.now_ms);
         }
     }
 
-    /// Something says the backend may be reachable now: ask what is owed, and, but for an
-    /// answer that just came, whether the session stands.
+    /// Something says the backend may be reachable now: ask what is owed (a renewal, the
+    /// session's check if one is due, the waiting sign-outs).
     pub(super) fn after_reach(&mut self, given: &Given, out: &mut Vec<Do>, why: Reached) {
         let Some(live) = self.live.as_mut() else { return };
-        if live.offline || live.too_old {
+        if live.offline {
             return;
+        }
+        if matches!(why, Reached::Start | Reached::Network | Reached::OfflineOff) {
+            live.check_due = true;
         }
         // 6.3, step 5: the network coming back renews a login the backend had nothing
         // newer for, once more.
@@ -159,19 +198,45 @@ impl Client {
             live.renewal.refreshed = None;
             live.renewal.owed = live.renewal.refused.map(|count| (count, true));
         }
-        let owed = live.renewal.owed;
+        let announced = live.renewal.announced;
+        let owed = live.renewal.owed.map(|(count, refused)| (announced.map_or(count, |announced| announced.max(count)), refused));
         let missing = live.signed_in() && live.held_count().is_none();
-        if live.note.is_some() {
-            self.ask_note(given, out);
+        let seen = live.music_seen;
+        let check = live.check_due && live.signed_in();
+        if !live.notes.is_empty() {
+            self.ask_tell(given, out);
         }
         if let Some((count, refused)) = owed {
             self.ask_music(count, refused, out);
         } else if missing {
-            // Signed in with no music login: ask for one (its number is not known: any).
-            self.ask_music(0, false, out);
+            // Signed in with no music login: ask for one, once for the number last told.
+            self.ask_music(seen, false, out);
         }
-        if why != Reached::Answer {
-            self.ask_devices(0, None, false, given, out);
+        if check {
+            self.ask_devices(0, None, false, out);
+        }
+    }
+
+    /// After an answer's own part is done: what the backend being reachable again, or a
+    /// number announced, makes due. Decided only now, so that an answer never asks again for
+    /// what it has itself just settled.
+    fn settle(&mut self, given: &Given, out: &mut Vec<Do>) {
+        let Some(live) = self.live.as_mut() else { return };
+        if std::mem::take(&mut live.restored) {
+            self.after_reach(given, out, Reached::Answer);
+        }
+        let Some(live) = self.live.as_mut() else { return };
+        let due = live.renewal.announced.filter(|announced| *announced > live.music_seen);
+        if live.renewal.announced.is_some_and(|announced| announced <= live.music_seen) {
+            live.renewal.announced = None;
+        }
+        if let Some(count) = due
+            && live.renewal.owed.is_none()
+            && live.signed_in()
+            && !live.waiting(|what| matches!(what, Purpose::Music { .. }))
+        {
+            live.renewal.announced = None;
+            self.ask_music(count, false, out);
         }
     }
 
@@ -181,12 +246,24 @@ impl Client {
 
     pub(super) fn pressed(&mut self, press: Press, given: &Given, out: &mut Vec<Do>) {
         match press {
-            Press::SignIn { address, email, password, look } => self.press_sign_in(address, Some(email), password, None, look, given, out),
-            Press::SignInWithCode { address, code, password, again, look } => {
+            Press::SignIn { address, email, password, look, retry } => {
+                if self.sign_in_gate(retry) {
+                    self.press_sign_in(address, Some(email), password, None, look, given, out);
+                }
+            }
+            Press::SignInWithCode { address, code, password, again, look, retry } => {
+                if !self.sign_in_gate(retry) {
+                    return;
+                }
                 if password.expose() != again.expose() {
                     return self.set_form(SignInState::PasswordsDiffer, 0);
                 }
                 self.press_sign_in(address, None, code, Some(password), look, given, out)
+            }
+            Press::FormClosed => {
+                if let Some(live) = self.live.as_mut() {
+                    live.retry = Retry::None;
+                }
             }
             Press::SignOut => self.sign_out(given, out),
             Press::OpenDevices => self.open_devices(given, out),
@@ -203,9 +280,32 @@ impl Client {
         }
     }
 
-    fn set_form(&mut self, state: SignInState, wait_ms: u64) {
+    /// Whether a sign-in press is taken at all, checked before the form is touched: not while
+    /// signed in, not while a try is under way (two quick presses are one try), and a retry
+    /// only when the form was told it may make one (8.3), once.
+    fn sign_in_gate(&mut self, retry: bool) -> bool {
+        let Some(live) = self.live.as_mut() else { return false };
+        if (live.signed_in() && !live.stranger) || live.waiting(|what| matches!(what, Purpose::Hello(_) | Purpose::SignIn { .. })) {
+            return false;
+        }
+        match (retry, live.retry) {
+            (true, Retry::Now { attempt }) if attempt == live.attempt => {
+                live.retry = Retry::Spent { attempt };
+                true
+            }
+            (true, _) => false,
+            (false, _) => {
+                live.attempt = live.attempt.wrapping_add(1);
+                live.retry = Retry::None;
+                true
+            }
+        }
+    }
+
+    /// The sign-in form's state and its sentence. `wait_s`: seconds to say, for "busy".
+    fn set_form(&mut self, state: SignInState, wait_s: u64) {
         if let Some(live) = self.live.as_mut() {
-            live.form.words = words::sign_in(state, live.app.kind, wait_ms);
+            live.form.words = words::sign_in(state, live.app.kind, wait_s);
             live.form.state = state;
             live.form.ask_permission = state == SignInState::NeedsPermission && live.app.kind == DeviceKind::Phone;
         }
@@ -214,10 +314,12 @@ impl Client {
     #[allow(clippy::too_many_arguments)]
     fn press_sign_in(&mut self, address: String, email: Option<String>, secret: Typed, new: Option<Typed>, look: Look, given: &Given, out: &mut Vec<Do>) {
         let Some(live) = self.live.as_mut() else { return };
-        // Signed in already, or a sign-in under way: a second press asks nothing (one ask is
-        // one request; two quick presses are one try).
-        if live.signed_in() || live.waiting(|what| matches!(what, Purpose::Hello(_) | Purpose::SignIn { .. } | Purpose::SetPassword { .. })) {
-            return;
+        // Bounded before anything of it is kept or shown.
+        if address.len() > TYPED_MAX_BYTES {
+            return self.set_form(SignInState::BadAddress, 0);
+        }
+        if email.as_ref().is_some_and(|email| email.len() > TYPED_MAX_BYTES) {
+            return self.set_form(SignInState::BadEmail, 0);
         }
         live.form.address = address.trim().to_owned();
         if let Some(email) = &email {
@@ -235,8 +337,8 @@ impl Client {
         if look.blocked() {
             return self.set_form(SignInState::NeedsPermission, 0);
         }
-        let credential = match email {
-            Some(email) => {
+        let credential = match (email, new) {
+            (Some(email), _) => {
                 let Some(email) = Email::new(&email) else { return self.set_form(SignInState::BadEmail, 0) };
                 if secret.expose().is_empty() {
                     return self.set_form(SignInState::NoPassword, 0);
@@ -245,17 +347,16 @@ impl Client {
                 let Some(password) = Password::new(secret.expose()) else { return self.set_form(SignInState::WrongLogin, 0) };
                 Pressed::Password { email, password }
             }
-            None => {
-                if secret.expose().trim().is_empty() || new.as_ref().is_some_and(|new| new.expose().is_empty()) {
+            (None, new) => {
+                let Some(new) = new.filter(|new| !new.expose().is_empty()) else { return self.set_form(SignInState::NoPassword, 0) };
+                if secret.expose().trim().is_empty() {
                     return self.set_form(SignInState::NoPassword, 0);
                 }
                 // The password chosen is held to the rule before the code is spent on it. The
-                // email is not known yet: "not the email" is the backend's to check here.
-                if new.as_ref().is_some_and(|new| Password::new(new.expose()).is_none()) {
-                    return self.set_form(SignInState::PasswordNotAllowed, 0);
-                }
+                // email is not known here: "not the email" is the backend's to check.
+                let Some(new_password) = Password::new(new.expose()) else { return self.set_form(SignInState::PasswordNotAllowed, 0) };
                 match tidy_code(secret.expose()) {
-                    Some(code) => Pressed::Code(code),
+                    Some(code) => Pressed::Code { code, new_password },
                     None => return self.set_form(SignInState::WrongLogin, 0),
                 }
             }
@@ -270,7 +371,7 @@ impl Client {
                 None => return self.set_form(SignInState::NoRandom, 0),
             }
         }
-        if self.ask(Purpose::Hello(Pending { origin, credential, new }), proto::HELLO, None, None, out) {
+        if self.ask(Purpose::Hello(Pending { origin, credential }), proto::HELLO, None, None, out) {
             self.set_form(SignInState::Working, 0);
         } else {
             self.set_form(SignInState::CantReach, 0);
@@ -278,15 +379,20 @@ impl Client {
     }
 
     /// Asks to sign in, once `hello` has said this is a backend that has accounts.
-    fn ask_sign_in(&mut self, origin: String, backend_id: BackendId, credential: Pressed, then: Option<Then>, out: &mut Vec<Do>) -> bool {
+    fn ask_sign_in(&mut self, origin: NexusOrigin, backend_id: BackendId, credential: Pressed, out: &mut Vec<Do>) -> bool {
         let Some(live) = self.live.as_ref() else { return false };
         let Some(device_secret) = live.device_secret.clone() else { return false };
-        // 12.3: a sign-in names the restore number the device has, if it has one from this
-        // backend.
-        let restore = live.saved.as_ref().filter(|saved| saved.nexus == origin && BackendId::from_hex(&saved.backend_id) == Some(backend_id)).map(|saved| saved.restore);
+        // 12.3: a sign-in names the restore number the device has, only if it has one from
+        // this backend at this origin. A different id there is a sign-in to a new backend:
+        // it names none, and what is kept changes only if it succeeds.
+        let restore = live
+            .saved
+            .as_ref()
+            .filter(|saved| NexusOrigin::typed(&saved.nexus).ok().as_ref() == Some(&origin) && BackendId::from_hex(&saved.backend_id) == Some(backend_id))
+            .map(|saved| saved.restore);
         let credential = match credential {
             Pressed::Password { email, password } => Credential::Password { email, password },
-            Pressed::Code(code) => Credential::Code(code),
+            Pressed::Code { code, new_password } => Credential::Code { code, new_password },
         };
         let message = SignIn {
             credential,
@@ -298,45 +404,49 @@ impl Client {
             restore,
         };
         let Some(body) = hidden(account::encode(&message)) else { return false };
-        self.ask(Purpose::SignIn { origin, backend_id, then }, account::SIGN_IN, None, Some(body), out)
+        self.ask(Purpose::SignIn { origin, backend_id }, account::SIGN_IN, None, Some(body), out)
     }
 
-    /// Signing out here: lasting on the device at once, whatever the network. The backend
-    /// is told now under the session if it can be, and otherwise later from the note,
-    /// which can end that one session and nothing else (11, as ruled).
+    /// Signing out here: lasting on the device at once, whatever the network. The note that
+    /// can end the session is kept **before** what signing in left is forgotten, so that a
+    /// death between the two leaves the session endable; then the backend is told from it
+    /// (11, as ruled).
     fn sign_out(&mut self, given: &Given, out: &mut Vec<Do>) {
         let Some(live) = self.live.as_mut() else { return };
         let Some(saved) = live.saved.take() else { return };
-        let Some(session) = saved.session.clone() else {
-            // Nothing signed in (the server's data was put back): forget what is left.
-            out.push(Do::Forget(Forget::Saved));
-            self.ended(SignInState::SignedOut);
-            return;
-        };
-        // One number for this sign-out, the same for every telling of it (12.2). With no
-        // random bytes it is 0, and the note is told only by its session's SHA-256.
-        let request = request_id(given).map_or(0, account::RequestId::get);
-        let note = Note {
-            request,
-            session_sha256: session_sha256(&session),
-            nexus: saved.nexus.clone(),
-            backend_id: saved.backend_id.clone(),
-            restore: saved.restore,
-            made_ms: given.now_ms,
-        };
-        out.push(Do::Forget(Forget::Saved));
-        out.push(Do::Keep(Keep::Note(note.clone())));
-        live.note = Some(note);
-        // An older note's telling is no longer waited for: this one replaces it.
-        live.flight.retain(|flight| !matches!(flight.what, Purpose::Tell | Purpose::TellNote));
-        self.ended(SignInState::SignedOut);
-        let head = RequestHead { speaks: SPEAKS, restore: saved.restore };
-        if let Some(request_id) = account::RequestId::new(request)
-            && let Some(body) = hidden(account::encode(&SignOut { head, request_id }))
-        {
-            self.ask(Purpose::Tell, account::SIGN_OUT, Some(&session), Some(body), out);
+        if let (Some(_), Some(revoke)) = (&saved.session, saved.sign_out.as_ref()) {
+            // One number for this sign-out, the same for every telling of it (12.2). With
+            // no random bytes, the session's own number, which is never given again.
+            let request = request_id(given).map_or(revoke.session.get(), account::RequestId::get);
+            let note = Note {
+                request,
+                revoke: copy_note(revoke),
+                nexus: saved.nexus.clone(),
+                backend_id: saved.backend_id.clone(),
+                restore: saved.restore,
+                made_ms: given.now_ms,
+            };
+            live.notes.retain(|kept| kept.session() != note.session());
+            if live.notes.len() >= NOTES_MAX {
+                // The oldest expired goes first, else the oldest.
+                let now = given.now_ms;
+                let index = live
+                    .notes
+                    .iter()
+                    .position(|kept| now.checked_sub(kept.made_ms).is_some_and(|age| age >= NOTE_LIFE_MS))
+                    .or_else(|| live.notes.iter().enumerate().min_by_key(|(_, kept)| kept.made_ms).map(|(index, _)| index));
+                if let Some(index) = index {
+                    let gone = live.notes.remove(index);
+                    out.push(Do::Forget(Forget::Note { session: gone.session() }));
+                }
+            }
+            out.push(Do::Keep(Keep::Note(note.copy())));
+            live.notes.push(note);
         }
-        drop(session);
+        out.push(Do::Forget(Forget::Saved));
+        drop(saved);
+        self.ended(SignInState::SignedOut);
+        self.ask_tell(given, out);
     }
 
     /// The account signed in is gone (signed out, forced out, the data put back): fence
@@ -345,21 +455,23 @@ impl Client {
     fn ended(&mut self, state: SignInState) {
         self.generation = self.generation.wrapping_add(1);
         if let Some(live) = self.live.as_mut() {
-            live.flight.retain(|flight| matches!(flight.what, Purpose::Tell | Purpose::TellNote));
+            live.flight.retain(|flight| flight.what.parting());
             live.renewal = Renewal::default();
             live.devices = Devices::not_asked();
             live.password = PasswordShown::idle();
             live.music_words = None;
             live.reach = Reach::Unknown;
-            live.checked_ms = None;
+            live.check_due = false;
             live.stranger = false;
+            live.backend_blocked = false;
         }
         self.set_form(state, 0);
     }
 
     fn open_devices(&mut self, given: &Given, out: &mut Vec<Do>) {
+        let _ = given;
         let Some(live) = self.live.as_mut() else { return };
-        if !live.signed_in() {
+        if !live.signed_in() || live.stranger {
             return;
         }
         if live.offline {
@@ -375,7 +487,7 @@ impl Client {
                 return;
             }
         }
-        if self.ask_devices(0, None, true, given, out) {
+        if self.ask_devices(0, None, true, out) {
             if let Some(live) = self.live.as_mut() {
                 live.devices.state = ListState::Working;
                 live.devices.words.clear();
@@ -390,41 +502,41 @@ impl Client {
     fn press_force_out(&mut self, device: u64, given: &Given, out: &mut Vec<Do>) {
         let Some(live) = self.live.as_ref() else { return };
         let Some(saved) = &live.saved else { return };
-        if !live.signed_in() {
+        if !live.signed_in() || live.stranger {
             return;
         }
-        if device == saved.device {
+        let row = live.devices.rows.iter().find(|row| row.id == device);
+        if device == saved.device || row.is_some_and(|row| row.this_one) {
             // Forcing out this device is signing out here.
             return self.sign_out(given, out);
         }
-        let known = live.devices.rows.iter().any(|row| row.id == device && row.can_force_out && !row.working);
+        // 8.7: forcing out names the session it ends, as the list showed it; one that is
+        // signed out, unknown, or being forced out already asks nothing.
+        let Some(session) = row.filter(|row| row.can_force_out && !row.working).and_then(|row| row.session).and_then(SessionId::new) else { return };
         let offline = live.offline;
-        let (Some(session), Some(head), Some(id)) = (self.session(), self.head(), DeviceId::new(device)) else { return };
-        if !known {
-            return;
-        }
+        let (Some(bearer), Some(head), Some(id)) = (self.session(), self.head(), DeviceId::new(device)) else { return };
         if offline {
             if let Some(live) = self.live.as_mut() {
                 live.devices.words = words::devices(words::Devices::Offline);
             }
             return;
         }
-        // to be account's: 8.7 has forcing out name the session it ends, not only the
-        // device. account's `ForceOut` names the device; the list does not carry sessions.
-        let Some(body) = hidden(account::encode(&ForceOut { head, device: id })) else { return };
-        if self.ask(Purpose::ForceOut { device }, account::FORCE_OUT, Some(&session), Some(body), out)
-            && let Some(live) = self.live.as_mut()
-        {
-            live.devices.words.clear();
-            for row in live.devices.rows.iter_mut().filter(|row| row.id == device) {
-                row.working = true;
+        let Some(body) = hidden(account::encode(&ForceOut { head, device: id, session })) else { return };
+        if self.ask(Purpose::ForceOut { device }, account::FORCE_OUT, Some(&bearer), Some(body), out) {
+            if let Some(live) = self.live.as_mut() {
+                live.devices.words.clear();
+                for row in live.devices.rows.iter_mut().filter(|row| row.id == device) {
+                    row.working = true;
+                }
             }
+        } else if let Some(live) = self.live.as_mut() {
+            live.devices.words = words::devices(words::Devices::CantReach);
         }
     }
 
-    fn set_password(&mut self, state: PasswordState, wait_ms: u64) {
+    fn set_password(&mut self, state: PasswordState, wait_s: u64) {
         if let Some(live) = self.live.as_mut() {
-            live.password = PasswordShown { state, words: words::password(state, wait_ms, live.offline) };
+            live.password = PasswordShown { state, words: words::password(state, wait_s, live.offline) };
         }
     }
 
@@ -432,14 +544,16 @@ impl Client {
         let (Some(session), Some(head)) = (self.session(), self.head()) else { return };
         let Some(live) = self.live.as_ref() else { return };
         let Some(saved) = &live.saved else { return };
-        if live.waiting(|what| matches!(what, Purpose::ChangePassword)) {
+        if live.stranger || live.waiting(|what| matches!(what, Purpose::ChangePassword)) {
             return;
         }
         if new.expose() != again.expose() {
             return self.set_password(PasswordState::Differ, 0);
         }
         let Some(email) = Email::new(&saved.email) else { return self.set_password(PasswordState::NotAllowed, 0) };
-        let Some(new) = Password::new(new.expose()).filter(|new| new.allowed_for(&email)) else {
+        // "Not on the list of the commonest" is the backend's (it holds the list, 8.2); the
+        // app checks "not the email".
+        let Some(new) = Password::new(new.expose()).filter(|new| new.allowed_for(&email, "")) else {
             return self.set_password(PasswordState::NotAllowed, 0);
         };
         // A present password outside the rule is nobody's: refused here, unsent.
@@ -448,7 +562,7 @@ impl Client {
             return self.set_password(PasswordState::CantReach, 0);
         }
         let Some(request_id) = request_id(given) else { return self.set_password(PasswordState::CantReach, 0) };
-        let Some(body) = hidden(account::encode(&ChangePassword { head, request_id, current_password: Some(current), new_password: new })) else { return };
+        let Some(body) = hidden(account::encode(&ChangePassword { head, request_id, current_password: current, new_password: new })) else { return };
         if self.ask(Purpose::ChangePassword, account::CHANGE_PASSWORD, Some(&session), Some(body), out) {
             self.set_password(PasswordState::Working, 0);
         } else {
@@ -460,21 +574,23 @@ impl Client {
     // Answers
     // -----------------------------------------------------------------------------------
 
-    fn take_flight(&mut self, ask: u64) -> Option<Purpose> {
+    fn take_flight(&mut self, ask: u64) -> Option<(Purpose, usize)> {
         let live = self.live.as_mut()?;
         let index = live.flight.iter().position(|flight| flight.id == ask)?;
-        Some(live.flight.remove(index).what)
+        let flight = live.flight.remove(index);
+        Some((flight.what, flight.max_body))
     }
 
-    /// The backend answered as the backend: it can be reached. If it could not before, ask
-    /// what was owed.
-    fn reached(&mut self, given: &Given, out: &mut Vec<Do>) {
+    /// The backend answered as the backend: it can be reached, and it is not one the phone
+    /// lacks the permission for. If it could not be reached before, what was owed is asked
+    /// when the answer's own part is done ([`Client::settle`]).
+    fn reached(&mut self) {
         let Some(live) = self.live.as_mut() else { return };
-        let was_down = matches!(live.reach, Reach::Down { .. });
-        live.reach = Reach::Up;
-        if was_down {
-            self.after_reach(given, out, Reached::Answer);
+        if matches!(live.reach, Reach::Down { .. }) {
+            live.restored = true;
         }
+        live.reach = Reach::Up;
+        live.backend_blocked = false;
     }
 
     fn unreached(&mut self, given: &Given) {
@@ -485,69 +601,88 @@ impl Client {
         }
     }
 
-    /// What every answer to a call under the session shares (7.1): the backend's id is
-    /// checked; the backend was reached; its receipt is taken; "this session has ended"
-    /// and "the server's data was put back" end the account here; "too old" stops asking.
+    /// What every answer to a call under the session shares (7.1), in this order: a receipt
+    /// from another backend or for another account is not acted on; "this session has
+    /// ended", "the server's data was put back" and "too old" are dealt with before anything
+    /// else is made of the answer; then the backend was reached and the receipt is taken.
     /// Gives back the outcome for the call's own part, or `None` if it was dealt with here.
     fn common<T>(&mut self, outcome: Outcome<T>, given: &Given, out: &mut Vec<Do>) -> Option<Outcome<T>> {
-        let expected = self.live.as_ref().and_then(|live| live.saved.as_ref()).and_then(|saved| BackendId::from_hex(&saved.backend_id));
+        let (expected, account) = {
+            let saved = self.live.as_ref()?.saved.as_ref()?;
+            (BackendId::from_hex(&saved.backend_id), saved.account)
+        };
         let seen = match &outcome {
             Outcome::Done(_, seen) | Outcome::Refused(_, Some(seen)) => Some(*seen),
             _ => None,
         };
-        if let Some(seen) = seen
-            && Some(seen.backend) != expected
-        {
-            // Another backend answers at this origin: it is not ours. Nothing more is sent
-            // to it, and nothing it said is acted on (7.1).
-            if let Some(live) = self.live.as_mut() {
-                live.stranger = true;
-                live.flight.retain(|flight| matches!(flight.what, Purpose::Tell | Purpose::TellNote));
+        if let Some(seen) = seen {
+            if Some(seen.backend) != expected {
+                // Another backend answers at this origin: it is not ours. Nothing more is
+                // sent to it, and nothing it said is acted on (7.1).
+                if let Some(live) = self.live.as_mut() {
+                    live.stranger = true;
+                    live.flight.retain(|flight| flight.what.parting());
+                }
+                self.set_form(SignInState::StartAgain, 0);
+                return None;
             }
-            return None;
+            if seen.account != account {
+                // Stamped for another account: none of it is this account's.
+                return None;
+            }
         }
         match &outcome {
-            Outcome::Nothing => self.unreached(given),
-            _ => self.reached(given, out),
-        }
-        if let Some(seen) = seen {
-            self.absorb(seen, out);
-        }
-        match outcome {
-            Outcome::Refused(Why::NotSignedIn, _) => {
+            Outcome::Refused(Why::SessionEnded, _) => {
                 self.forced_out(out);
-                None
+                return None;
             }
-            Outcome::Refused(Why::StartAgain, _) => {
+            Outcome::Refused(Why::DataPutBack, _) => {
                 self.start_again(out);
-                None
+                return None;
             }
             Outcome::Refused(Why::Incompatible { .. }, _) => {
                 if let Some(live) = self.live.as_mut() {
-                    live.too_old = true;
-                    live.flight.clear();
+                    live.too_old = live.saved.as_ref().map(|saved| saved.nexus.clone());
+                    live.flight.retain(|flight| flight.what.parting());
                 }
-                None
+                return None;
             }
-            other => Some(other),
+            Outcome::Nothing | Outcome::Refused(Why::NotDealtWith | Why::Malformed, None) => self.unreached(given),
+            _ => self.reached(),
         }
+        if let Some(seen) = seen
+            && !self.absorb(seen, out)
+        {
+            return None;
+        }
+        Some(outcome)
     }
 
-    /// The numbers an answer's receipt carries: kept, and the music login's number having
-    /// moved means asking for the new one (9.4).
-    fn absorb(&mut self, seen: Seen, out: &mut Vec<Do>) {
-        let Some(live) = self.live.as_mut() else { return };
-        let held = live.held_count();
-        let Some(saved) = live.saved.as_mut() else { return };
-        if (saved.restore, saved.life, saved.change) != (seen.restore, seen.life, seen.change) {
-            saved.restore = seen.restore;
-            saved.life = seen.life;
-            saved.change = seen.change;
+    /// The numbers a receipt carries, kept, never going back: life and change only rise; a
+    /// receipt of an earlier restore number is not this backend's present and is not taken,
+    /// and a later one means the data was put back. A music login's number above what is
+    /// known is remembered, to be asked for once the answer's own part is done. Says
+    /// whether the answer may be acted on.
+    fn absorb(&mut self, seen: Seen, out: &mut Vec<Do>) -> bool {
+        let Some(live) = self.live.as_mut() else { return false };
+        let Some(saved) = live.saved.as_mut() else { return false };
+        if seen.restore < saved.restore {
+            return false;
+        }
+        if seen.restore > saved.restore {
+            self.start_again(out);
+            return false;
+        }
+        let (life, change) = (saved.life.max(seen.life), saved.change.max(seen.change));
+        if (saved.life, saved.change) != (life, change) {
+            saved.life = life;
+            saved.change = change;
             out.push(Do::Keep(Keep::Saved(saved.copy())));
         }
-        if held.is_some_and(|held| seen.music_count > held) {
-            self.ask_music(seen.music_count, false, out);
+        if seen.music_count > live.music_seen {
+            live.renewal.announced = Some(live.renewal.announced.map_or(seen.music_count, |announced| announced.max(seen.music_count)));
         }
+        true
     }
 
     /// The backend said, to this session, that this session has ended (8.7): the one
@@ -561,38 +696,49 @@ impl Client {
     }
 
     /// "The server's data was put back, sign in again" (12.3, 12.4): the session goes, and
-    /// how far it had fetched; the music login stays, and plays.
+    /// how far it had fetched; the music login stays, and plays. A login set aside stays
+    /// set aside, and the person is told signing in renews it.
     fn start_again(&mut self, out: &mut Vec<Do>) {
         let Some(live) = self.live.as_mut() else { return };
+        let refused = live.renewal.refused;
         if let Some(saved) = live.saved.as_mut() {
             saved.session = None;
+            saved.sign_out = None;
             saved.notice = None;
             out.push(Do::Keep(Keep::Saved(saved.copy())));
         }
         self.ended(SignInState::StartAgain);
+        if let Some(live) = self.live.as_mut()
+            && refused.is_some()
+        {
+            live.renewal.refused = refused;
+            live.music_words = Some(words::music(words::Music::SignInToRenew));
+        }
         // From step 2 the device also sends again every event it still holds (13.3): owed
         // with the sending half.
     }
 
     pub(super) fn answered(&mut self, ask: u64, status: u16, body: &AnswerBody, given: &Given, out: &mut Vec<Do>) {
-        let Some(what) = self.take_flight(ask) else { return };
+        let Some((what, max_body)) = self.take_flight(ask) else { return };
         let bytes: &[u8] = &body.0;
+        if bytes.len() > max_body {
+            // Larger than the ask allowed: as if it were cut.
+            self.failed_purpose(what, Failure { how: How::Cut, inside: None, permission: None }, given);
+            return;
+        }
         match what {
             Purpose::Hello(pending) => self.answered_hello(pending, status, bytes, out),
-            Purpose::SignIn { origin, backend_id, then } => {
+            Purpose::Verify { origin } => self.answered_verify(origin, status, bytes, given),
+            Purpose::SignIn { origin, backend_id } => {
                 let outcome = outcome(account::read_reply::<SignInAnswer>(status, bytes));
-                self.answered_sign_in(origin, backend_id, then, outcome, given, out);
-            }
-            Purpose::SetPassword { origin, backend_id, email, new } => {
-                let outcome = outcome(account::read_reply::<PasswordChanged>(status, bytes));
-                self.answered_set_password(origin, backend_id, email, new, outcome, out);
+                self.answered_sign_in(origin, backend_id, outcome, given, out);
             }
             Purpose::Devices { page, opened } => {
                 let outcome = outcome(account::read_reply::<DevicePage>(status, bytes));
                 self.answered_devices(page, opened, outcome, given, out);
             }
             Purpose::Music { count, refused } => {
-                let outcome = outcome(account::read_reply::<MusicLogin>(status, bytes));
+                let outcome = outcome(account::read_reply::<MusicLoginResult>(status, bytes));
                 self.answered_music(count, refused, outcome, given, out);
             }
             Purpose::ForceOut { device } => {
@@ -603,16 +749,55 @@ impl Client {
                 let outcome = outcome(account::read_reply::<PasswordChanged>(status, bytes));
                 self.answered_change(outcome, given, out);
             }
-            Purpose::Tell | Purpose::TellNote => {
-                // The device's, not the account's: nothing in it touches the account now
-                // signed in. Any whole answer of the backend's settles it, done or refused.
-                if !matches!(outcome(account::read_reply::<SignedOut>(status, bytes)), Outcome::Nothing)
-                    && let Some(live) = self.live.as_mut()
-                    && live.note.take().is_some()
-                {
-                    out.push(Do::Forget(Forget::Note));
-                }
+            Purpose::Tell { session } => {
+                let outcome = outcome(account::read_reply::<SignedOut>(status, bytes));
+                self.answered_tell(session, outcome, out);
             }
+        }
+        self.settle(given, out);
+    }
+
+    /// A sign-out told: the device's, not the account's, and nothing in it touches the
+    /// account now signed in. Its note goes only on a "done" stamped by the backend it was
+    /// made for, or a definite "that session is gone"; busy, not dealt with, a failure or
+    /// another backend's answer keeps it, to be told again.
+    fn answered_tell(&mut self, session: u64, outcome: Outcome<SignedOut>, out: &mut Vec<Do>) {
+        let Some(live) = self.live.as_mut() else { return };
+        let Some(note) = live.notes.iter().find(|note| note.session() == session) else { return };
+        let ours = BackendId::from_hex(&note.backend_id);
+        let settled = match outcome {
+            Outcome::Done(_, seen) => Some(seen.backend) == ours,
+            Outcome::Refused(Why::SessionEnded | Why::DataPutBack, _) => true,
+            _ => false,
+        };
+        if settled {
+            live.notes.retain(|note| note.session() != session);
+            out.push(Do::Forget(Forget::Note { session }));
+        }
+    }
+
+    /// A `hello` read before anything secret goes to an origin (7.1). The expected backend:
+    /// what was waiting is asked. Another: nothing carrying the session or the device secret
+    /// goes there, nothing is forgotten, the music login plays on, and the person is asked to
+    /// sign in again. Nothing that is a backend: as if unreachable, and asked again when it
+    /// may be.
+    fn answered_verify(&mut self, origin: String, status: u16, body: &[u8], given: &Given) {
+        let Found::Backend(hello) = proto::classify(status, body) else { return self.unreached(given) };
+        let Some(live) = self.live.as_mut() else { return };
+        live.verified.retain(|(at, _)| *at != origin);
+        live.verified.push((origin.clone(), hello.id));
+        let ours = live.saved.as_ref().filter(|saved| saved.nexus == origin).map(|saved| BackendId::from_hex(&saved.backend_id) == Some(hello.id));
+        if ours == Some(false) && live.signed_in() {
+            live.stranger = true;
+            live.flight.retain(|flight| flight.what.parting());
+            self.set_form(SignInState::StartAgain, 0);
+            return;
+        }
+        // The backend was reached: what was waiting for it is asked now ([`Client::settle`]).
+        if let Some(live) = self.live.as_mut() {
+            live.reach = Reach::Up;
+            live.restored = true;
+            live.backend_blocked = false;
         }
     }
 
@@ -628,24 +813,43 @@ impl Client {
         if hello.speaks.high() < ours.low() || !hello.does(HAS_ACCOUNTS) {
             return self.set_form(SignInState::ServerTooOld, 0);
         }
-        let Pending { origin, credential, new } = pending;
-        let then = new.map(|new| Then { new });
-        if !self.ask_sign_in(origin, hello.id, credential, then, out) {
+        let Pending { origin, credential } = pending;
+        if let Some(live) = self.live.as_mut() {
+            let at = origin.origin().to_string();
+            live.verified.retain(|(verified, _)| *verified != at);
+            live.verified.push((at.clone(), hello.id));
+            if live.too_old.as_deref() == Some(at.as_str()) {
+                live.too_old = None;
+            }
+        }
+        if !self.ask_sign_in(origin, hello.id, credential, out) {
             self.set_form(SignInState::CantReach, 0);
         }
     }
 
-    fn answered_sign_in(&mut self, origin: String, backend_id: BackendId, then: Option<Then>, outcome: Outcome<SignInAnswer>, given: &Given, out: &mut Vec<Do>) {
-        let (answer, seen) = match outcome {
-            Outcome::Done(answer, seen) if seen.backend == backend_id => (answer, seen),
+    fn answered_sign_in(&mut self, origin: NexusOrigin, backend_id: BackendId, outcome: Outcome<SignInAnswer>, given: &Given, out: &mut Vec<Do>) {
+        let (signed, seen) = match outcome {
+            Outcome::Done(signed, seen) if seen.backend == backend_id && seen.account == signed.person.id => (signed, seen),
             // A receipt from another backend than the one whose hello was read: not ours.
             Outcome::Done(..) => return self.set_form(SignInState::NoNexusServer, 0),
             Outcome::Refused(why, _) => {
+                let Some(live) = self.live.as_mut() else { return };
                 let (state, wait) = match why {
-                    Why::WrongLogin => (SignInState::WrongLogin, 0),
-                    Why::TooManyTries { wait_ms } => (SignInState::TooManyTries, wait_ms),
+                    Why::WrongLogin | Why::Denied => (SignInState::WrongLogin, 0),
                     Why::AccountOff => (SignInState::AccountOff, 0),
-                    Why::Busy => (SignInState::Busy, 0),
+                    Why::Busy { seconds } => {
+                        // 8.3: a right password is never refused; it may wait. One retry by
+                        // itself after the wait, for this press; a second wait is the
+                        // person's.
+                        let attempt = live.attempt;
+                        if let Some(seconds) = seconds
+                            && live.retry != (Retry::Spent { attempt })
+                        {
+                            let due_ms = given.now_ms.saturating_add(seconds.saturating_mul(1000));
+                            live.retry = Retry::Armed { attempt, due_ms, seconds };
+                        }
+                        (SignInState::Busy, seconds.unwrap_or(0))
+                    }
                     Why::Incompatible { low, .. } if low > SPEAKS.high() => (SignInState::AppTooOld, 0),
                     Why::Incompatible { .. } => (SignInState::ServerTooOld, 0),
                     Why::PasswordNotAllowed => (SignInState::PasswordNotAllowed, 0),
@@ -655,115 +859,77 @@ impl Client {
             }
             Outcome::Nothing => return self.set_form(SignInState::CantReach, 0),
         };
-        let signed = match answer {
-            SignInAnswer::SignedIn(signed) => signed,
-            SignInAnswer::PasswordSetup(setup) => {
-                // A code was redeemed: choose the password at once, under the session that
-                // gives leave for that alone. Nothing is kept between.
-                let Some(Then { new }) = then else { return self.set_form(SignInState::CantReach, 0) };
-                let email = setup.person.email.clone();
-                let Some(password) = Password::new(new.expose()).filter(|password| password.allowed_for(&email)) else {
-                    return self.set_form(SignInState::PasswordNotAllowed, 0);
-                };
-                let head = RequestHead { speaks: SPEAKS, restore: seen.restore };
-                let Some(request_id) = request_id(given) else { return self.set_form(SignInState::NoRandom, 0) };
-                let Some(body) = hidden(account::encode(&ChangePassword { head, request_id, current_password: None, new_password: password })) else {
-                    return self.set_form(SignInState::CantReach, 0);
-                };
-                let what = Purpose::SetPassword { origin, backend_id, email, new };
-                if !self.ask(what, account::CHANGE_PASSWORD, Some(&setup.session), Some(body), out) {
-                    self.set_form(SignInState::CantReach, 0);
-                }
-                return;
-            }
-        };
         // A new account is published: the fence moves, and nothing asked before is acted on.
         self.generation = self.generation.wrapping_add(1);
+        let generation = self.generation;
         let Some(live) = self.live.as_mut() else { return };
-        live.flight.retain(|flight| matches!(flight.what, Purpose::Tell | Purpose::TellNote));
+        live.flight.retain(|flight| flight.what.parting());
         live.renewal = Renewal::default();
         live.devices = Devices::not_asked();
         live.password = PasswordShown::idle();
-        live.music_words = None;
         live.reach = Reach::Up;
         live.stranger = false;
-        live.checked_ms = Some(given.now_ms);
+        live.backend_blocked = false;
+        live.check_due = false;
+        live.retry = Retry::None;
+        live.account_generation = generation;
+        let (music, none) = match signed.music {
+            MusicLoginResult::Login(login) => (Some(login), None),
+            MusicLoginResult::NoneSetYet => (None, Some(words::Music::NoneSet)),
+            MusicLoginResult::UnusableNow => (None, Some(words::Music::UnusableNow)),
+        };
+        live.music_words = none.map(words::music);
+        live.music_seen = music.as_ref().map_or(seen.music_count, |login| login.count);
         let saved = Saved {
-            nexus: origin.clone(),
+            nexus: origin.origin().to_string(),
             backend_id: backend_id.to_hex(),
-            account: signed.person.email.as_str().to_owned(),
+            account: signed.person.id,
             email: signed.person.email.as_str().to_owned(),
             name: signed.person.name.as_str().to_owned(),
             device: signed.device.get(),
-            restore: seen.restore,
+            restore: signed.restore,
             life: seen.life,
             change: seen.change,
             notice: Some(signed.notice.as_str().to_owned()),
             session: Some(signed.session),
-            music: Some(signed.music),
+            sign_out: Some(signed.sign_out),
+            music,
         };
         live.form.email = saved.email.clone();
         // One thing, whole, in one step; then the player.
         out.push(Do::Keep(Keep::Saved(saved.copy())));
         if let Some(login) = &saved.music {
-            out.push(Do::Hand(Hand::Login(copy(login))));
+            out.push(Do::Hand(Hand::Login { login: copy(login), generation }));
         }
-        let count = saved.music.as_ref().map(|login| login.count);
         live.saved = Some(saved);
-        // Signing in from this device ended whatever session it had at that backend (8.6),
-        // so a note for it there is settled.
-        if live.note.as_ref().is_some_and(|note| note.nexus == origin && BackendId::from_hex(&note.backend_id) == Some(backend_id)) {
-            live.note = None;
-            live.flight.retain(|flight| !matches!(flight.what, Purpose::Tell | Purpose::TellNote));
-            out.push(Do::Forget(Forget::Note));
-        }
         self.set_form(SignInState::Idle, 0);
-        if count.is_some_and(|count| seen.music_count > count) {
-            self.ask_music(seen.music_count, false, out);
-        }
-    }
-
-    fn answered_set_password(&mut self, origin: String, backend_id: BackendId, email: Email, new: Typed, outcome: Outcome<PasswordChanged>, out: &mut Vec<Do>) {
-        match outcome {
-            Outcome::Done(PasswordChanged {}, seen) if seen.backend == backend_id => {
-                // The password is chosen: sign in with it, as the person would next.
-                let Some(password) = Password::new(new.expose()) else { return self.set_form(SignInState::CantReach, 0) };
-                if !self.ask_sign_in(origin, backend_id, Pressed::Password { email, password }, None, out) {
-                    self.set_form(SignInState::CantReach, 0);
-                }
-            }
-            Outcome::Refused(Why::PasswordNotAllowed, _) => self.set_form(SignInState::PasswordNotAllowed, 0),
-            Outcome::Refused(Why::TooManyTries { wait_ms }, _) => self.set_form(SignInState::TooManyTries, wait_ms),
-            Outcome::Refused(Why::Busy, _) => self.set_form(SignInState::Busy, 0),
-            Outcome::Refused(Why::NotSignedIn, _) => self.set_form(SignInState::WrongLogin, 0),
-            _ => self.set_form(SignInState::CantReach, 0),
-        }
     }
 
     fn answered_devices(&mut self, page: usize, opened: bool, outcome: Outcome<DevicePage>, given: &Given, out: &mut Vec<Do>) {
         let Some(outcome) = self.common(outcome, given, out) else { return };
         let Some(live) = self.live.as_mut() else { return };
-        let this = live.saved.as_ref().map(|saved| saved.device);
         match outcome {
             Outcome::Done(list, _) => {
                 if page == 0 {
                     live.devices.reading.clear();
                 }
                 for device in list.devices() {
-                    let this_one = Some(device.id.get()) == this;
+                    let this_one = device.this_device;
+                    let session = device.session.map(SessionId::get);
                     live.devices.reading.push(DeviceRow {
                         id: device.id.get(),
                         name: device.name.as_str().to_owned(),
                         kind: device.kind,
                         this_one,
-                        seen: words::seen(this_one, device.signed_in, device.last_seen_ms, given.now_ms),
-                        can_force_out: device.signed_in && !this_one,
+                        session,
+                        seen: words::seen(this_one, session.is_some(), device.last_seen_ms, given.now_ms),
+                        can_force_out: session.is_some() && !this_one,
                         working: false,
                     });
                 }
                 let next = page.checked_add(1).filter(|next| *next < DEVICE_PAGES_MAX);
                 if let (Some(after), Some(next)) = (list.next(), next)
-                    && self.ask_devices(next, Some(after), opened, given, out)
+                    && self.ask_devices(next, Some(after), opened, out)
                 {
                     return;
                 }
@@ -787,8 +953,11 @@ impl Client {
         }
     }
 
-    fn answered_music(&mut self, count: u64, refused: bool, outcome: Outcome<MusicLogin>, given: &Given, out: &mut Vec<Do>) {
+    /// A renewal's answer: its outcome is put in place first; what is still due is decided
+    /// after ([`Client::settle`]).
+    fn answered_music(&mut self, count: u64, refused: bool, outcome: Outcome<MusicLoginResult>, given: &Given, out: &mut Vec<Do>) {
         let Some(outcome) = self.common(outcome, given, out) else { return };
+        let generation = self.live.as_ref().map_or(0, |live| live.account_generation);
         let Some(live) = self.live.as_mut() else { return };
         let answered = |renewal: &mut Renewal| {
             if refused {
@@ -796,9 +965,13 @@ impl Client {
             } else {
                 renewal.rose = Some(count);
             }
+            // A renewal answered while a number is set aside counts as that number's one.
+            if renewal.refused.is_some() {
+                renewal.refreshed = renewal.refused;
+            }
         };
         match outcome {
-            Outcome::Done(login, _) => {
+            Outcome::Done(MusicLoginResult::Login(login), _) => {
                 answered(&mut live.renewal);
                 let held = live.held_count();
                 if held.is_none_or(|held| login.count > held) {
@@ -806,29 +979,28 @@ impl Client {
                     // car goes back to the music server and what waited is tried once more.
                     live.renewal.refused = None;
                     live.music_words = None;
+                    live.music_seen = login.count;
                     if let Some(saved) = live.saved.as_mut() {
                         saved.music = Some(copy(&login));
                         out.push(Do::Keep(Keep::Saved(saved.copy())));
                     }
-                    out.push(Do::Hand(Hand::Login(login)));
-                } else if let Some(refused) = live.renewal.refused {
+                    out.push(Do::Hand(Hand::Login { login, generation }));
+                } else if live.renewal.refused.is_some() {
                     // Nothing newer than the refused one: it stays set aside, and is renewed
                     // again only when the network comes back or the number moves.
-                    live.renewal.refreshed = Some(refused);
                     live.music_words = Some(words::music(words::Music::NoNewer));
                 }
             }
-            Outcome::Refused(Why::NoMusicLogin, _) => {
+            Outcome::Done(none, seen) => {
                 answered(&mut live.renewal);
-                if let Some(refused) = live.renewal.refused {
-                    live.renewal.refreshed = Some(refused);
-                }
-                // to be account's: 9.4 has two reasons there is none ("none has been set for
-                // you yet", "it cannot be used just now"); account has one.
-                live.music_words = Some(words::music(words::Music::NoneSet));
+                // 9.4: none to hand: the person stays signed in, and is told which.
+                live.music_seen = live.music_seen.max(seen.music_count);
+                let which = if matches!(none, MusicLoginResult::UnusableNow) { words::Music::UnusableNow } else { words::Music::NoneSet };
+                live.music_words = Some(words::music(which));
             }
             Outcome::Refused(..) | Outcome::Nothing => {
-                // Unanswered: owed, and asked again only when the backend may be reachable.
+                // Unanswered, a stamped "busy" included: owed, and asked again only when the
+                // backend may be reachable, never from this answer.
                 live.renewal.owed = Some((count, refused));
                 if live.renewal.refused.is_some() {
                     live.music_words = Some(words::music(words::Music::WhenReachable));
@@ -844,6 +1016,7 @@ impl Client {
             for row in live.devices.rows.iter_mut().filter(|row| row.id == device) {
                 row.working = false;
                 row.can_force_out = false;
+                row.session = None;
                 row.seen = super::words::seen(false, false, 0, 0);
             }
             live.devices.words = words;
@@ -864,23 +1037,30 @@ impl Client {
         let Some(outcome) = self.common(outcome, given, out) else { return };
         match outcome {
             Outcome::Done(PasswordChanged {}, _) => self.set_password(PasswordState::Changed, 0),
-            Outcome::Refused(Why::WrongLogin, _) => self.set_password(PasswordState::WrongCurrent, 0),
+            Outcome::Refused(Why::WrongLogin | Why::Denied, _) => self.set_password(PasswordState::WrongCurrent, 0),
             Outcome::Refused(Why::PasswordNotAllowed, _) => self.set_password(PasswordState::NotAllowed, 0),
-            Outcome::Refused(Why::TooManyTries { wait_ms }, _) => self.set_password(PasswordState::TooManyTries, wait_ms),
-            Outcome::Refused(Why::Busy, _) => self.set_password(PasswordState::Busy, 0),
+            Outcome::Refused(Why::Busy { seconds }, _) => self.set_password(PasswordState::Busy, seconds.unwrap_or(0)),
             Outcome::Refused(..) | Outcome::Nothing => self.set_password(PasswordState::CantReach, 0),
         }
     }
 
     // -----------------------------------------------------------------------------------
-    // Failures, the network, Offline, ticks, the music server
+    // Failures, the network, Offline, ticks, waits, the music server
     // -----------------------------------------------------------------------------------
 
     pub(super) fn failed(&mut self, ask: u64, failure: Failure, given: &Given) {
-        let Some(what) = self.take_flight(ask) else { return };
+        let Some((what, _)) = self.take_flight(ask) else { return };
+        self.failed_purpose(what, failure, given);
+    }
+
+    fn failed_purpose(&mut self, what: Purpose, failure: Failure, given: &Given) {
         // 6.4: no connection was ever opened, the address leads inside, and the permission
-        // is not held. A certificate that is wrong is never this.
+        // is not held. A certificate that is wrong is never this. Whatever asked, it is the
+        // one permission decision, shown on whatever screen is up.
         let blocked = !failure.how.connected() && Look { inside: failure.inside, permission: failure.permission }.blocked();
+        if blocked && let Some(live) = self.live.as_mut() {
+            live.backend_blocked = live.app.kind == DeviceKind::Phone;
+        }
         let form = if blocked {
             SignInState::NeedsPermission
         } else if failure.how == How::Secure {
@@ -889,12 +1069,16 @@ impl Client {
             SignInState::CantReach
         };
         match what {
-            Purpose::Hello(_) | Purpose::SignIn { .. } | Purpose::SetPassword { .. } => self.set_form(form, 0),
+            Purpose::Hello(_) | Purpose::SignIn { .. } => self.set_form(form, 0),
+            Purpose::Verify { .. } => self.unreached(given),
             Purpose::Devices { opened, .. } => {
                 self.unreached(given);
-                if opened && let Some(live) = self.live.as_mut() {
-                    live.devices.state = ListState::Failed;
-                    live.devices.words = words::devices(words::Devices::CantReach);
+                if let Some(live) = self.live.as_mut() {
+                    live.check_due = true;
+                    if opened {
+                        live.devices.state = ListState::Failed;
+                        live.devices.words = words::devices(words::Devices::CantReach);
+                    }
                 }
             }
             Purpose::Music { count, refused } => {
@@ -920,7 +1104,7 @@ impl Client {
                 self.set_password(PasswordState::CantReach, 0);
             }
             // The note stays kept, and is told later.
-            Purpose::Tell | Purpose::TellNote => {}
+            Purpose::Tell { .. } => {}
         }
     }
 
@@ -933,15 +1117,20 @@ impl Client {
         if !on {
             return self.after_reach(given, out, Reached::OfflineOff);
         }
-        // Nothing is asked while Offline is on, and nothing that was asked is waited for.
+        // Nothing is asked while Offline is on, and nothing that was asked is waited for or
+        // sent ([`Client::waits_for`]), but a sign-out being told.
+        live.retry = Retry::None;
         let abandoned: Vec<Flight> = std::mem::take(&mut live.flight);
         let mut form = false;
         for flight in abandoned {
             match flight.what {
-                Purpose::Hello(_) | Purpose::SignIn { .. } | Purpose::SetPassword { .. } => form = true,
-                Purpose::Devices { opened: true, .. } => {
-                    live.devices.state = ListState::Failed;
-                    live.devices.words = words::devices(words::Devices::Offline);
+                Purpose::Hello(_) | Purpose::SignIn { .. } => form = true,
+                Purpose::Devices { opened, .. } => {
+                    live.check_due = true;
+                    if opened {
+                        live.devices.state = ListState::Failed;
+                        live.devices.words = words::devices(words::Devices::Offline);
+                    }
                 }
                 Purpose::Music { count, refused } => live.renewal.owed = Some((count, refused)),
                 Purpose::ForceOut { device } => {
@@ -953,7 +1142,8 @@ impl Client {
                 Purpose::ChangePassword => {
                     live.password = PasswordShown { state: PasswordState::CantReach, words: words::password(PasswordState::CantReach, 0, true) };
                 }
-                Purpose::Devices { opened: false, .. } | Purpose::Tell | Purpose::TellNote => {}
+                Purpose::Tell { .. } => live.flight.push(flight),
+                Purpose::Verify { .. } => {}
             }
         }
         if live.renewal.refused.is_some() && live.renewal.owed.is_some() {
@@ -964,43 +1154,49 @@ impl Client {
         }
     }
 
+    /// A tick asks nothing of the session. It tells waiting sign-outs at their pace (11).
     pub(super) fn tick(&mut self, given: &Given, out: &mut Vec<Do>) {
         let Some(live) = self.live.as_ref() else { return };
-        if live.offline || live.too_old {
+        if live.offline || live.notes.is_empty() {
             return;
         }
-        let due = |last: Option<u64>, every: u64| last.is_none_or(|last| given.now_ms.checked_sub(last).is_none_or(|age| age >= every));
-        if live.note.is_some() && due(live.told_ms, TELL_EVERY_MS) {
-            self.ask_note(given, out);
-        }
-        let Some(live) = self.live.as_ref() else { return };
-        if live.signed_in() && due(live.checked_ms, CHECK_EVERY_MS) {
-            self.ask_devices(0, None, false, given, out);
+        let due = live.told_ms.is_none_or(|last| given.now_ms.checked_sub(last).is_none_or(|age| age >= TELL_EVERY_MS));
+        if due {
+            self.ask_tell(given, out);
         }
         // The sending half (C8's events, C6's Diagnostics) is driven from here: owed.
     }
 
-    /// 6.3, as ruled: the first report for a number sets it aside, at once; one renewal for
-    /// that number, in the background; never a sign-out.
-    pub(super) fn music_refused(&mut self, count: u64, out: &mut Vec<Do>) {
+    /// The form's timer for a wait fired: the one retry may be made now, if the form, the
+    /// press and the conditions are as they were (8.3).
+    pub(super) fn wait_passed(&mut self, given: &Given) {
         let Some(live) = self.live.as_mut() else { return };
-        let Some(held) = live.saved.as_ref().and_then(|saved| saved.music.as_ref()) else { return };
-        if count < held.count {
-            // A caller still held an older one than is held: it is handed the one held.
-            out.push(Do::Hand(Hand::Login(copy(held))));
-            return;
+        if let Retry::Armed { attempt, due_ms, .. } = live.retry
+            && attempt == live.attempt
+            && given.now_ms >= due_ms
+            && !live.offline
+            && !live.signed_in()
+            && live.form.state == SignInState::Busy
+        {
+            live.retry = Retry::Now { attempt };
         }
-        if count > held.count || live.renewal.refused == Some(count) {
-            // A number never handed out, or one already set aside: nothing more.
+    }
+
+    /// 6.3, as ruled: the first report for a number sets it aside, at once; one renewal for
+    /// that number, in the background; never a sign-out. A report about a login no longer
+    /// held, or handed under another generation, does nothing.
+    pub(super) fn music_refused(&mut self, count: u64, generation: u64, out: &mut Vec<Do>) {
+        let Some(live) = self.live.as_mut() else { return };
+        if generation != live.account_generation || live.held_count() != Some(count) || live.renewal.refused == Some(count) {
             return;
         }
         live.renewal.refused = Some(count);
-        out.push(Do::Hand(Hand::Refused { count }));
+        out.push(Do::Hand(Hand::Refused { count, generation }));
         if live.renewal.refreshed == Some(count) {
             live.music_words = Some(words::music(words::Music::NoNewer));
             return;
         }
-        if !live.signed_in() {
+        if !live.signed_in() || live.stranger {
             live.music_words = Some(words::music(words::Music::SignInToRenew));
             return;
         }
@@ -1017,6 +1213,7 @@ impl Client {
         self.ask_music(count, true, out);
         if let Some(live) = self.live.as_mut()
             && live.renewal.owed.is_some()
+            && !live.waiting(|what| matches!(what, Purpose::Verify { .. }))
         {
             live.music_words = Some(words::music(words::Music::WhenReachable));
         }
@@ -1028,16 +1225,23 @@ impl Client {
 
     pub(super) fn show(&mut self, given: &Given, out: &mut Vec<Do>) {
         let Some(live) = self.live.as_ref() else { return };
-        let screen = if live.signed_in() { Screen::SignedIn } else { Screen::SignIn };
-        let signed = live.saved.as_ref().filter(|_| live.signed_in());
-        let row = match (signed, live.reach) {
-            _ if live.too_old => words::row(Row::TooOld),
+        let signed_in = live.signed_in() && !live.stranger;
+        let screen = if signed_in { Screen::SignedIn } else { Screen::SignIn };
+        let signed = live.saved.as_ref().filter(|_| signed_in);
+        let row = match (live.saved.as_ref().filter(|_| live.signed_in()), live.reach) {
             (None, _) => words::row(Row::SignedOut),
             _ if live.stranger => words::row(Row::Stranger),
+            _ if live.too_old.is_some() => words::row(Row::TooOld),
             _ if live.offline => words::row(Row::Offline),
+            _ if live.backend_blocked => words::row(Row::NeedsPermission),
             (Some(_), Reach::Up) => words::row(Row::Connected),
             (Some(saved), Reach::Unknown) => words::row(Row::SignedIn(&saved.email)),
             (Some(_), Reach::Down { since_ms }) => words::row(Row::Down { since: words::time_of_day(since_ms, given.local_offset_minutes) }),
+        };
+        let (wait_s, send_again) = match live.retry {
+            Retry::Armed { attempt, seconds, .. } if attempt == live.attempt => (Some(seconds), false),
+            Retry::Now { attempt } if attempt == live.attempt => (None, true),
+            _ => (None, false),
         };
         let shown = Shown {
             screen,
@@ -1047,11 +1251,14 @@ impl Client {
                 address: live.form.address.clone(),
                 email: live.form.email.clone(),
                 ask_permission: live.form.ask_permission,
+                wait_s,
+                send_again,
             },
             row,
             who: signed.map(|saved| format!("{} ({})", saved.name, saved.email)),
             music: if live.music_blocked && live.music_words.is_none() { Some(words::music(words::Music::NeedsPermission)) } else { live.music_words.clone() },
             music_ask_permission: live.music_blocked,
+            ask_permission: live.backend_blocked,
             car: live.renewal.refused.map(|_| words::car()),
             notice: signed.and_then(|saved| saved.notice.clone()),
             devices: DevicesShown { state: live.devices.state, rows: live.devices.rows.clone(), words: live.devices.words.clone() },
