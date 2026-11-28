@@ -379,6 +379,24 @@ macro_rules! text_secret {
 }
 
 impl OneTimeCode {
+    /// Read a code as a person types it: in groups, with ASCII spaces or dashes between
+    /// ("ABCD-EFGH-JKMN", "abcd efgh jkmn"). Those are taken out, and what is left is read by
+    /// [`OneTimeCode::new`]: exactly twelve, case and Crockford's I, L and O as there. Nothing
+    /// else is taken out: another kind of space or a look-alike letter is refused. The wire
+    /// form is always the twelve alone.
+    pub fn typed(text: &str) -> Option<Self> {
+        let mut kept = Zeroizing::new([0u8; CODE_LENGTH]);
+        let mut length = 0usize;
+        for byte in text.bytes().filter(|byte| !matches!(byte, b' ' | b'-')) {
+            *kept.get_mut(length)? = byte;
+            length += 1;
+        }
+        if length != CODE_LENGTH {
+            return None;
+        }
+        Self::new(std::str::from_utf8(kept.as_ref()).ok()?)
+    }
+
     /// Read a typed code and normalize Crockford's case and ambiguous spellings.
     pub fn new(text: &str) -> Option<Self> {
         if text.len() != CODE_LENGTH {
