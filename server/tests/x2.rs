@@ -1747,8 +1747,8 @@ fn diagnostics_past_their_age_go_in_idle_time_a_bounded_number_at_a_time() {
 }
 
 #[test]
-fn a_music_login_is_kept_only_with_its_own_account_count_and_where_it_was_checked() {
-    use nexus_core::nexus::account::{MusicAddress, Name};
+fn a_music_login_is_kept_only_with_its_own_account_and_count_and_its_internal_address() {
+    use nexus_core::nexus::account::Name;
     use nexus_core::nexus::kept::{DataChange, Effects, Update};
     use nexus_core::nexus::music::{CredentialBinding, MusicInstallation, SealedCredential};
     let root = Root::new("music-login");
@@ -1762,7 +1762,7 @@ fn a_music_login_is_kept_only_with_its_own_account_count_and_where_it_was_checke
         binding: CredentialBinding {
             backend: keeper.backend(),
             account: AccountId::new(account).unwrap(),
-            address: MusicAddress::new("https://music.example.org").unwrap(),
+            internal: "http://navidrome:4533".into(),
             name: Name::new("alice").unwrap(),
             count,
         },
@@ -1772,15 +1772,13 @@ fn a_music_login_is_kept_only_with_its_own_account_count_and_where_it_was_checke
         high_water: keeper.clock(T0 + 2 * MINUTE).effective(),
         updates: vec![Update { apart_first: apart.clone(), data: rows.clone(), change: DataChange::InstallMusicLogin(install), music: None, apart_last: apart.clone() }],
     };
-    let checked = [Change::MusicChecked { account: ALICE, internal: "http://navidrome:4533" }];
     let logins = |keeper: &Keeper| count(keeper, "SELECT count(*) FROM music_logins WHERE account = ?1", ALICE);
     let (wrong_account, wrong_count, right) = (effects(install(BOB, 1)), effects(install(ALICE, 2)), effects(install(ALICE, 1)));
-    assert!(keeper.persist(&wrong_account, &checked, T0 + 2 * MINUTE).is_err(), "sealed for another account");
-    assert!(keeper.persist(&wrong_count, &checked, T0 + 2 * MINUTE).is_err(), "sealed under another count");
-    assert!(keeper.persist(&right, &[], T0 + 2 * MINUTE).is_err(), "with no address it was checked at");
+    assert!(keeper.persist(&wrong_account, &[], T0 + 2 * MINUTE).is_err(), "sealed for another account");
+    assert!(keeper.persist(&wrong_count, &[], T0 + 2 * MINUTE).is_err(), "sealed under another count");
     assert_eq!(logins(&keeper), 0, "nothing was kept by a refused one");
     assert_eq!(state(&mut keeper, ALICE).unwrap().music_login, 0);
-    keeper.persist(&right, &checked, T0 + 2 * MINUTE).unwrap();
+    keeper.persist(&right, &[], T0 + 2 * MINUTE).unwrap();
     assert_eq!(logins(&keeper), 1);
     let (count_kept, internal): (i64, String) =
         keeper.data().connection().query_row("SELECT count, internal FROM music_logins WHERE account = ?1", [ALICE as i64], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();

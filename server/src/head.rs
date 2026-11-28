@@ -26,8 +26,11 @@ use crate::serve::{Peer, Refusal};
 #[derive(Clone)]
 pub struct Head {
     /// Every byte read from the connection so far: the head, and whatever of the body the
-    /// last read happened to bring with it (never more than [`HEAD_MAX_BYTES`] in all).
+    /// last read happened to bring with it (never more than [`HEAD_MAX_BYTES`] in all), and a
+    /// sign-in's whole body when it is read before a work slot ([`read_body_by`]).
     pub read: Vec<u8>,
+    /// How many of `read` are the head.
+    pub head_bytes: usize,
     pub method: String,
     /// The request target exactly as it came.
     pub target: String,
@@ -40,6 +43,7 @@ impl std::fmt::Debug for Head {
         let names: Vec<&str> = self.headers.iter().map(|(name, _)| name.as_str()).collect();
         f.debug_struct("Head")
             .field("read_bytes", &self.read.len())
+            .field("head_bytes", &self.head_bytes)
             .field("method", &self.method)
             .field("target_bytes", &self.target.len())
             .field("header_names", &names)
@@ -48,8 +52,13 @@ impl std::fmt::Debug for Head {
 }
 
 impl Head {
-    fn all(&self, name: &str) -> impl Iterator<Item = &[u8]> {
+    pub fn all(&self, name: &str) -> impl Iterator<Item = &[u8]> {
         self.headers.iter().filter(move |(have, _)| have == name).map(|(_, value)| value.as_slice())
+    }
+
+    /// What of the body has been read with the head.
+    pub fn body(&self) -> &[u8] {
+        &self.read[self.head_bytes.min(self.read.len())..]
     }
 }
 
@@ -77,8 +86,9 @@ fn parse(bytes: &[u8]) -> Result<Option<Head>, NoHead> {
     let mut request = httparse::Request::new(&mut headers);
     match request.parse(bytes) {
         Ok(httparse::Status::Partial) => Ok(None),
-        Ok(httparse::Status::Complete(_)) => Ok(Some(Head {
+        Ok(httparse::Status::Complete(head_bytes)) => Ok(Some(Head {
             read: Vec::new(),
+            head_bytes,
             method: request.method.unwrap_or_default().to_string(),
             target: request.path.unwrap_or_default().to_string(),
             headers: request.headers.iter().map(|header| (header.name.to_ascii_lowercase(), header.value.to_vec())).collect(),
@@ -118,6 +128,28 @@ pub async fn read_by(deadline: tokio::time::Instant, from: &mut (impl AsyncRead 
         // The timer and the read may be ready together, and the read is looked at first: the
         // deadline wins.
         Ok(Ok(_)) if tokio::time::Instant::now() >= deadline => Err(NoHead::Late),
+        Ok(done) => done,
+        Err(_) => Err(NoHead::Late),
+    }
+}
+
+/// Reads the rest of `head`'s body, `length` bytes in all, into `head.read`, whole by
+/// `deadline` (the head's own) or not at all: for a sign-in, whose body says whether it may take
+/// a reserved slot (the review of S8, C1). Nothing past the body is read.
+pub async fn read_body_by(deadline: tokio::time::Instant, from: &mut (impl AsyncRead + Unpin), head: &mut Head, length: usize) -> Result<(), NoHead> {
+    let want = head.head_bytes + length;
+    let reading = async {
+        let mut chunk = [0u8; 4096];
+        while head.read.len() < want {
+            let room = (want - head.read.len()).min(chunk.len());
+            match from.read(&mut chunk[..room]).await {
+                Ok(0) | Err(_) => return Err(NoHead::Cut),
+                Ok(got) => head.read.extend_from_slice(&chunk[..got]),
+            }
+        }
+        Ok(())
+    };
+    match tokio::time::timeout_at(deadline, reading).await {
         Ok(done) => done,
         Err(_) => Err(NoHead::Late),
     }

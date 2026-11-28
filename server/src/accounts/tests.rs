@@ -215,3 +215,231 @@ fn a_correct_password_of_an_account_not_an_admin_s_at_the_page_is_a_wrong_passwo
     let next = page(made[0].email, PASSWORD);
     assert_eq!(next.status, 429, "the page's refusal of a non-admin was not recorded as a wrong try");
 }
+
+/// S9-2 (the review of S9): an account that is not an admin's, signed in, learns nothing from
+/// an admin's call of which accounts there are, or of whether the address people use is set:
+/// the caller is found not to be an admin before anything of the target is looked at.
+#[test]
+fn an_account_not_an_admin_s_learns_nothing_of_accounts_or_settings_from_an_admin_s_call() {
+    use nexus_core::nexus::admin::{self, Action, Applied, Denial, MusicPassword, NamedChange, TypedMusicLogin};
+    let (bench, made) = Bench::new("not-admin-calls", &[("member@example.test", false), ("other@example.test", false)]);
+    let member = bench::signed_in(&bench.sign_in(bench::with_code(&made[0].code, PASSWORD), 1));
+    let copy = || account::Session::from_bytes(*member.session.expose_bytes());
+    let id = |number: u64| account::AccountId::new(number).unwrap();
+    let refused = |answer: &super::session::Answer| match admin::read_reply::<Applied>(answer.status, answer.body.bytes()).unwrap() {
+        admin::Reply::Refused(refusal) => refusal,
+        other => panic!("not refused: {other:?}"),
+    };
+    let grant = |target: u64, request: u64| {
+        let change = NamedChange { request_id: RequestId::new(request).unwrap(), action: Action::SetMusicLogin(id(target)) };
+        let request = account::GrantRequest { head: bench::head(member.restore), change, password: account::Password::presented(PASSWORD).unwrap() };
+        bench.runtime.block_on(bench.accounts.admin_grant(copy(), request))
+    };
+    let there = grant(made[1].number, 1);
+    let not_there = grant(9_999, 2);
+    assert_eq!(refused(&there), admin::Refusal::NotAllowed(Denial::Denied));
+    assert_eq!((there.status, there.body.bytes()), (not_there.status, not_there.body.bytes()));
+    // Setting a login, with no address people use set: the same, whatever the target.
+    let set = |target: u64, request: u64| {
+        let change = TypedMusicLogin { account: id(target), name: account::Name::new("tester").unwrap(), password: MusicPassword::new("a made-up music password").unwrap() };
+        let request = account::GrantedChange { head: bench::head(member.restore), request_id: RequestId::new(request).unwrap(), change, grant: account::GrantSecret::from_bytes([7; 32]) };
+        bench.runtime.block_on(bench.accounts.set_music_login(copy(), request))
+    };
+    let there = set(made[1].number, 3);
+    let not_there = set(9_999, 4);
+    assert_eq!(refused(&there), admin::Refusal::NotAllowed(Denial::Denied), "the address people use was looked at first");
+    assert_eq!((there.status, there.body.bytes()), (not_there.status, not_there.body.bytes()));
+}
+
+/// S9-3 (the review of S9): with a music server that takes every connection and never answers,
+/// at most `CHECKS_AT_ONCE` logins are being checked at once: one more is told "busy" at once,
+/// a sign-in goes through meanwhile, and each check ends, "not dealt with", within its time.
+#[test]
+fn a_music_server_that_never_answers_holds_two_checks_at_most_and_sign_in_goes_on() {
+    use nexus_core::nexus::admin::{self, Action, Applied, MusicPassword, MusicServerAddress, NamedChange, TypedMusicLogin};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+    let held = std::sync::Arc::new(AtomicUsize::new(0));
+    let holding = held.clone();
+    let hold = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let internal = format!("http://{}", hold.local_addr().unwrap());
+    std::thread::spawn(move || {
+        let mut kept = Vec::new();
+        for stream in hold.incoming().flatten() {
+            holding.fetch_add(1, Ordering::SeqCst);
+            kept.push(stream);
+        }
+    });
+    let client = crate::music::MusicClient::trusting(tokio_rustls::rustls::RootCertStore::empty());
+    let music = super::music::MusicSide::new(client, internal).within(Duration::from_millis(1_500));
+    let (bench, made) = Bench::with_music("checks-at-once", &[("admin@example.test", true), ("person@example.test", false)], music);
+    bench::signed_in(&bench.sign_in(bench::with_code(&made[0].code, PASSWORD), 1));
+    let admins: Vec<_> = (1..=3).map(|device| bench::signed_in(&bench.sign_in(bench::with_password(made[0].email, PASSWORD), device))).collect();
+    let copy = |n: usize| account::Session::from_bytes(*admins[n].session.expose_bytes());
+    let restore = admins[0].restore;
+    let grant = |n: usize, request: u64, action: Action| {
+        let change = NamedChange { request_id: RequestId::new(request).unwrap(), action };
+        let request = account::GrantRequest { head: bench::head(restore), change, password: account::Password::presented(PASSWORD).unwrap() };
+        let answer = bench.runtime.block_on(bench.accounts.admin_grant(copy(n), request));
+        match admin::read_reply::<account::GrantIssued>(answer.status, answer.body.bytes()).unwrap() {
+            admin::Reply::Done(account::GrantIssued { grant }) => grant,
+            other => panic!("no grant: {other:?}"),
+        }
+    };
+    let public = account::MusicAddress::new("https://music.example.test").unwrap();
+    let secret = grant(0, 1, Action::SetMusicServer(public.clone()));
+    let set = account::GrantedChange { head: bench::head(restore), request_id: RequestId::new(1).unwrap(), change: MusicServerAddress { public }, grant: secret };
+    assert_eq!(bench.runtime.block_on(bench.accounts.set_music_server(copy(0), set)).status, 200);
+    let person = account::AccountId::new(made[1].number).unwrap();
+    let login = |n: usize| {
+        let request = 10 + n as u64;
+        let secret = grant(n, request, Action::SetMusicLogin(person));
+        let change = TypedMusicLogin { account: person, name: account::Name::new("tester").unwrap(), password: MusicPassword::new("a made-up music password").unwrap() };
+        (copy(n), account::GrantedChange { head: bench::head(restore), request_id: RequestId::new(request).unwrap(), change, grant: secret })
+    };
+    let (third, third_request) = login(2);
+    let started = Instant::now();
+    let checking: Vec<_> = (0..2)
+        .map(|n| {
+            let (session, request) = login(n);
+            let accounts = bench.accounts.clone();
+            bench.runtime.spawn(async move { accounts.set_music_login(session, request).await.status })
+        })
+        .collect();
+    let waited = Instant::now();
+    while held.load(Ordering::SeqCst) < 2 {
+        assert!(waited.elapsed() < Duration::from_secs(5), "the two checks never reached the music server");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // One more: "busy" at once, without asking the music server.
+    let at = Instant::now();
+    let busy = bench.runtime.block_on(bench.accounts.set_music_login(third, third_request));
+    assert_eq!(busy.status, 429, "{:?}", admin::read_reply::<Applied>(busy.status, busy.body.bytes()));
+    assert!(at.elapsed() < Duration::from_millis(200), "{:?}", at.elapsed());
+    assert_eq!(held.load(Ordering::SeqCst), 2);
+    // A sign-in meanwhile.
+    bench::signed_in(&bench.sign_in(bench::with_code(&made[1].code, PASSWORD), 9));
+    for check in checking {
+        assert_eq!(bench.runtime.block_on(check).unwrap(), 503);
+    }
+    assert!(started.elapsed() < Duration::from_secs(6), "{:?}", started.elapsed());
+}
+
+/// C1 (the review of S8; the lead's ruling of 15:38), (a) and (b): a sign-out with neither a
+/// session nor a note, a call with a session that does not resolve, and a note whose secret is
+/// not its session's are each answered without waiting for the thread that writes (held busy
+/// here), with the bytes it would have said.
+#[test]
+fn calls_that_are_no_one_s_are_answered_without_the_thread_that_writes() {
+    use std::time::Duration;
+    let (bench, made) = Bench::new("no-one-s", &[("someone@example.test", false)]);
+    let signed = bench::signed_in(&bench.sign_in(bench::with_code(&made[0].code, PASSWORD), 1));
+    let at_once = |answer: super::session::Answer| (answer.status, answer.body.bytes().to_vec());
+    // The answers with the thread free, to compare.
+    let nobody = account::Session::from_bytes([0x42; 32]);
+    let list = |session: account::Session| bench.accounts.devices(session, account::ListDevices { head: bench::head(signed.restore), after: None });
+    let neither = || bench.accounts.sign_out(None, SignOut { head: bench::head(signed.restore), request_id: RequestId::new(1).unwrap(), revoke: None });
+    let forged = SignOutNote { session: signed.sign_out.session, secret: SignOutSecret::from_bytes([0x5a; 32]) };
+    let note = |note: SignOutNote| bench.accounts.sign_out(None, SignOut { head: bench::head(signed.restore), request_id: RequestId::new(2).unwrap(), revoke: Some(note) });
+    let expected = at_once(bench.runtime.block_on(list(account::Session::from_bytes([0x42; 32]))));
+    assert_eq!(expected.0, 401);
+    // The thread that writes, held.
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let accounts = bench.accounts.clone();
+    let holding = bench.runtime.spawn(async move { accounts.desk.ask(move |_| held.recv().ok()).await });
+    std::thread::sleep(Duration::from_millis(50));
+    bench.runtime.block_on(async {
+        let within = Duration::from_millis(500);
+        let gone = tokio::time::timeout(within, list(nobody)).await.expect("a session that does not resolve waited for the thread that writes");
+        assert_eq!(at_once(gone), expected);
+        let none = tokio::time::timeout(within, neither()).await.expect("a sign-out with neither waited for the thread that writes");
+        assert_eq!(at_once(none), expected);
+        let forged = tokio::time::timeout(within, note(forged)).await.expect("a forged note waited for the thread that writes");
+        assert_eq!(at_once(forged), expected);
+    });
+    release.send(()).unwrap();
+    bench.runtime.block_on(holding).unwrap().unwrap();
+    // The live session, and its right note, still work.
+    assert_eq!(bench.runtime.block_on(list(account::Session::from_bytes(*signed.session.expose_bytes()))).status, 200);
+    assert_eq!(at_once(bench.runtime.block_on(note(signed.sign_out))), expected);
+    assert_eq!(bench.runtime.block_on(list(signed.session)).status, 401, "the right note did not end its session");
+}
+
+/// C1 (d): a device is "known" (the protected lane, a reserved slot) only to the account it
+/// signed in to, and no longer once it is forced out; it is known again when it signs in.
+#[test]
+fn a_device_is_known_to_its_own_account_and_not_once_forced_out() {
+    let (bench, made) = Bench::new("known", &[("first@example.test", false), ("second@example.test", false)]);
+    let one = bench::signed_in(&bench.sign_in(bench::with_code(&made[0].code, PASSWORD), 1));
+    let two = bench::signed_in(&bench.sign_in(bench::with_password(made[0].email, PASSWORD), 2));
+    let email = |n: usize| account::Email::new(made[n].email).unwrap();
+    let secret = |device: u8| account::DeviceSecret::from_bytes([device; 32]);
+    let admission = &bench.accounts.admission;
+    assert!(admission.known_device(&email(0), &secret(1)) && admission.known_device(&email(0), &secret(2)));
+    assert!(!admission.known_device(&email(1), &secret(1)), "a device known to one account was known to another");
+    let force = account::ForceOut { head: bench::head(one.restore), device: two.device, session: two.session_id };
+    assert_eq!(bench.runtime.block_on(bench.accounts.force_out(one.session, force)).status, 200);
+    assert!(!admission.known_device(&email(0), &secret(2)), "a device forced out was still known");
+    assert!(admission.known_device(&email(0), &secret(1)));
+    bench::signed_in(&bench.sign_in(bench::with_password(made[0].email, PASSWORD), 2));
+    assert!(admission.known_device(&email(0), &secret(2)));
+}
+
+/// The server's side of `admin::Account.music` (S10b's shape): none set, set, or to be typed
+/// again, by the rule a device is handed one by.
+#[test]
+fn the_page_is_told_whether_a_music_login_is_set_or_to_be_typed_again() {
+    use nexus_core::nexus::admin::{self, Action, MusicPassword, MusicServerAddress, NamedChange, TypedMusicLogin};
+    use super::music::{MusicState, music_state};
+    // A stand-in music server: `ping` and `getUser` (for `tester`) as Navidrome answers them.
+    let standing = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let internal = format!("http://{}", standing.local_addr().unwrap());
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        for mut stream in standing.incoming().flatten() {
+            let mut read = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while !read.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(got) => read.extend_from_slice(&chunk[..got]),
+                }
+            }
+            let body = if read.starts_with(b"POST /rest/getUser ") {
+                r#"{"subsonic-response":{"status":"ok","version":"1.16.1","user":{"username":"tester"}}}"#
+            } else {
+                r#"{"subsonic-response":{"status":"ok","version":"1.16.1"}}"#
+            };
+            let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        }
+    });
+    let client = crate::music::MusicClient::trusting(tokio_rustls::rustls::RootCertStore::empty());
+    let (bench, made) = Bench::with_music("music-state", &[("admin@example.test", true), ("person@example.test", false)], super::music::MusicSide::new(client, internal.clone()));
+    let signed = bench::signed_in(&bench.sign_in(bench::with_code(&made[0].code, PASSWORD), 1));
+    let copy = || account::Session::from_bytes(*signed.session.expose_bytes());
+    let grant = |request: u64, action: Action| {
+        let change = NamedChange { request_id: RequestId::new(request).unwrap(), action };
+        let request = account::GrantRequest { head: bench::head(signed.restore), change, password: account::Password::presented(PASSWORD).unwrap() };
+        let answer = bench.runtime.block_on(bench.accounts.admin_grant(copy(), request));
+        match admin::read_reply::<account::GrantIssued>(answer.status, answer.body.bytes()).unwrap() {
+            admin::Reply::Done(account::GrantIssued { grant }) => grant,
+            other => panic!("no grant: {other:?}"),
+        }
+    };
+    let public = account::MusicAddress::new("https://music.example.test").unwrap();
+    let set = account::GrantedChange { head: bench::head(signed.restore), request_id: RequestId::new(1).unwrap(), change: MusicServerAddress { public: public.clone() }, grant: grant(1, Action::SetMusicServer(public)) };
+    assert_eq!(bench.runtime.block_on(bench.accounts.set_music_server(copy(), set)).status, 200);
+    let person = account::AccountId::new(made[1].number).unwrap();
+    let change = TypedMusicLogin { account: person, name: account::Name::new("tester").unwrap(), password: MusicPassword::new("a made-up music password").unwrap() };
+    let login = account::GrantedChange { head: bench::head(signed.restore), request_id: RequestId::new(2).unwrap(), change, grant: grant(2, Action::SetMusicLogin(person)) };
+    assert_eq!(bench.runtime.block_on(bench.accounts.set_music_login(copy(), login)).status, 200);
+    let numbers = [made[0].number, made[1].number];
+    let states = bench.runtime.block_on(bench.accounts.desk.ask(move |keeper| {
+        numbers.map(|number| {
+            let state = keeper.load(number).unwrap().state().clone();
+            (music_state(keeper, number, &state, &internal), music_state(keeper, number, &state, "http://another.example.test"))
+        })
+    })).unwrap();
+    assert_eq!(states[0], (MusicState::NoneSet, MusicState::NoneSet));
+    assert_eq!(states[1], (MusicState::Set, MusicState::TypeAgain), "checked at another NEXUS_MUSIC_SERVER: to be typed again");
+}
