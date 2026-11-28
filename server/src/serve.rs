@@ -60,7 +60,7 @@ use tokio::time::Sleep;
 use tower::ServiceExt;
 
 use crate::bounds::*;
-use crate::head::{self, NoHead, Verdict};
+use crate::head::{self, NoHead, Route, Verdict};
 
 /// Who opened a connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,20 +131,26 @@ const REFUSALS: [(Refusal, &str); 16] = [
 pub struct Shell {
     proxy: IpAddr,
     router: Router,
-    routes: Vec<(&'static str, &'static str)>,
+    routes: Vec<Route>,
     open: AtomicUsize,
     refused: [AtomicU64; REFUSALS.len()],
 }
 
 impl Shell {
-    /// The backend's own: [`router`] and [`head::ROUTES`].
+    /// `hello` alone, as the first slice was: [`router`], and of [`head::ROUTES`] its own.
     pub fn new(proxy: IpAddr, hello: &Hello) -> Arc<Self> {
-        Self::with_routes(proxy, router(hello), head::ROUTES.to_vec())
+        Self::with_routes(proxy, router(hello), head::ROUTES.iter().copied().filter(|route| route.path == proto::HELLO).collect())
+    }
+
+    /// The backend's own: `hello`, and signing in and everything a session does (S8), at
+    /// [`head::ROUTES`].
+    pub fn backend(proxy: IpAddr, hello: &Hello, accounts: Arc<crate::accounts::session::Accounts>) -> Arc<Self> {
+        Self::with_routes(proxy, crate::accounts::routes::router(router(hello), accounts), head::ROUTES.to_vec())
     }
 
     /// With other routes (the tests add some): `routes` names each path `router` answers, and
     /// the one method it answers there.
-    pub fn with_routes(proxy: IpAddr, router: Router, routes: Vec<(&'static str, &'static str)>) -> Arc<Self> {
+    pub fn with_routes(proxy: IpAddr, router: Router, routes: Vec<Route>) -> Arc<Self> {
         Arc::new(Shell { proxy: proxy.to_canonical(), router, routes, open: AtomicUsize::new(0), refused: Default::default() })
     }
 

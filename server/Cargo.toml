@@ -51,6 +51,14 @@ hmac = "0.13"
 # stranger), which the standard library cannot bind a client to. The relay uses it already.
 socket2 = "0.6"
 
+# Argon2id is the slow work it is meant to be, and no slower: 19 MiB and two passes take
+# seconds unoptimised, past the answer's deadline, so its crates are optimised in tests too.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
+
 [profile.release]
 opt-level = 3
 lto = true

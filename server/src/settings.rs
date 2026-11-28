@@ -16,6 +16,11 @@ pub struct Settings {
     pub data: PathBuf,
     pub state: PathBuf,
     pub listen: SocketAddr,
+    /// The admin's page's own origin, exactly as a browser sends it in `Origin`
+    /// (`NEXUS_PUBLIC_ORIGIN`, the lead's ruling of 13:46; design 7.3, 19.2): `https://` and a
+    /// name, and a port if not 443, nothing else. The page's two calls with no session (its
+    /// sign-in and setting up) are taken only from it. Unset, they are refused.
+    pub public_origin: Option<String>,
 }
 
 pub const DATA_DEFAULT: &str = "/data";
@@ -66,7 +71,13 @@ impl Settings {
             Ok(listen) if listen.port() != 0 => listen,
             _ => return Err(format!("NEXUS_LISTEN is wrong: give an address and a port other than 0, for example {LISTEN_DEFAULT}")),
         };
-        Ok(Settings { music_server, proxy, data, state, listen })
+        let public_origin = match setting("NEXUS_PUBLIC_ORIGIN") {
+            None => None,
+            Some(value) => Some(public_origin(&value).ok_or_else(|| {
+                "NEXUS_PUBLIC_ORIGIN is wrong: give the admin's page's address as a browser has it, https:// and the name (and :port if it is not 443), with nothing after it, for example https://nexus.example.org".to_string()
+            })?),
+        };
+        Ok(Settings { music_server, proxy, data, state, listen, public_origin })
     }
 
     /// Whether both folders are there, and apart on the disk as well as in their names: not
@@ -86,6 +97,19 @@ impl Settings {
         }
         Ok(())
     }
+}
+
+/// An origin as a browser writes it in `Origin`: `https://`, a host in its one plain form (as
+/// the shared reading of an address gives it, 7.1), and a port only if not 443. Anything else,
+/// or anything not already in that form, is not one.
+fn public_origin(value: &str) -> Option<String> {
+    let rest = value.strip_prefix("https://")?;
+    if rest.is_empty() || rest.contains(['/', '?', '#', '@']) {
+        return None;
+    }
+    let origin = nexus_core::nexus::account::NexusOrigin::typed(value).ok()?;
+    let plain = origin.origin().to_string();
+    (plain == value).then_some(plain)
 }
 
 /// Whether two paths are one folder on the disk (two mounts of it, say).
@@ -138,6 +162,16 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn the_public_origin_is_taken_only_as_a_browser_writes_one() {
+        for good in ["https://nexus.example.org", "https://nexus.example.org:8443"] {
+            assert_eq!(public_origin(good).as_deref(), Some(good), "{good}");
+        }
+        for bad in ["http://nexus.example.org", "nexus.example.org", "https://nexus.example.org/", "https://nexus.example.org/nexus/", "https://Nexus.example.org", "https://nexus.example.org:443", "https://a@nexus.example.org", "https://nexus.example.org?x", "https://"] {
+            assert_eq!(public_origin(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
     fn folders_apart_in_name_but_not_on_the_disk_are_refused() {
         let root = std::env::temp_dir().join(format!("nexus-server-settings-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -152,6 +186,7 @@ mod tests {
             data: root.join("data"),
             state: root.join(state),
             listen: "0.0.0.0:8080".parse().unwrap(),
+            public_origin: None,
         };
         assert_eq!(settings("state").check_folders(), Ok(()));
         for state in ["state-link", "inner-link"] {

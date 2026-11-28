@@ -14,7 +14,7 @@
 //! request and closes the connection.
 
 use axum::http::StatusCode;
-use nexus_core::nexus::proto;
+use nexus_core::nexus::{account, proto};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::bounds::{BODY_MAX_BYTES, HEAD_MAX_BYTES, HEAD_MAX_HEADERS};
@@ -121,8 +121,39 @@ pub enum Verdict {
     Serve(usize),
 }
 
-/// Every path the backend answers, and the one method each answers.
-pub const ROUTES: &[(&str, &str)] = &[(proto::HELLO, "GET")];
+/// A path the backend answers: the one method it answers there, and the largest body that
+/// call takes (design 7.2, 12.1), checked from the head before a byte of the body is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Route {
+    pub path: &'static str,
+    pub method: &'static str,
+    pub body_max: usize,
+}
+
+impl Route {
+    pub const fn new(path: &'static str, method: &'static str, body_max: usize) -> Self {
+        Route { path, method, body_max }
+    }
+}
+
+/// A path and its method, with a body of up to the backend's largest.
+impl From<(&'static str, &'static str)> for Route {
+    fn from((path, method): (&'static str, &'static str)) -> Self {
+        Route::new(path, method, BODY_MAX_BYTES)
+    }
+}
+
+/// Every path the backend answers, the one method each answers, and the largest body each
+/// takes. A call that carries a password takes 4 KiB at most (7.2, the slice notes' S8).
+pub const ROUTES: &[Route] = &[
+    Route::new(proto::HELLO, "GET", BODY_MAX_BYTES),
+    Route::new(account::SIGN_IN, "POST", account::PASSWORD_REQUEST_MAX_BYTES),
+    Route::new(account::CHANGE_PASSWORD, "POST", account::PASSWORD_REQUEST_MAX_BYTES),
+    Route::new(account::SIGN_OUT, "POST", account::SMALL_REQUEST_MAX_BYTES),
+    Route::new(account::LIST_DEVICES, "POST", account::SMALL_REQUEST_MAX_BYTES),
+    Route::new(account::FORCE_OUT, "POST", account::SMALL_REQUEST_MAX_BYTES),
+    Route::new(account::MUSIC_LOGIN, "POST", account::SMALL_REQUEST_MAX_BYTES),
+];
 
 /// Whether the proxy marked the request as having come to it by HTTPS (design 6.2:
 /// `proxy_set_header X-Nexus-Scheme $scheme;`): the header exactly once, exactly `https`.
@@ -134,7 +165,7 @@ pub fn marked_https(head: &Head) -> bool {
 /// What is done with the request whose head is `head`, from a connection opened by `peer`. In
 /// order: the gate (who, and the proxy's mark); then the target exactly as it came; the
 /// method; and the body's framing and size.
-pub fn judge(peer: Peer, head: &Head, routes: &[(&str, &str)]) -> Verdict {
+pub fn judge(peer: Peer, head: &Head, routes: &[Route]) -> Verdict {
     // The gate. Until it has passed, nothing is written.
     match peer {
         Peer::Stranger => return Verdict::Unanswered(Refusal::Stranger),
@@ -146,7 +177,7 @@ pub fn judge(peer: Peer, head: &Head, routes: &[(&str, &str)]) -> Verdict {
     if proto::plain(&head.target).is_err() {
         return Verdict::Refused(StatusCode::BAD_REQUEST, Refusal::NotPlain);
     }
-    let Some(&(_, method)) = routes.iter().find(|(path, _)| *path == head.target) else {
+    let Some(&Route { method, body_max, .. }) = routes.iter().find(|route| route.path == head.target) else {
         return Verdict::Refused(if head.method == "GET" { StatusCode::NOT_FOUND } else { StatusCode::METHOD_NOT_ALLOWED }, Refusal::NoSuchPath);
     };
     if head.method != method {
@@ -164,7 +195,7 @@ pub fn judge(peer: Peer, head: &Head, routes: &[(&str, &str)]) -> Verdict {
         // Digits alone; a number too large to read is too large.
         (Some(length), None) if !length.is_empty() && length.iter().all(u8::is_ascii_digit) => {
             match std::str::from_utf8(length).ok().and_then(|length| length.parse::<u64>().ok()) {
-                Some(length) if length <= BODY_MAX_BYTES as u64 => length as usize,
+                Some(length) if length <= body_max.min(BODY_MAX_BYTES) as u64 => length as usize,
                 _ => return Verdict::Refused(StatusCode::PAYLOAD_TOO_LARGE, Refusal::TooLarge),
             }
         }
