@@ -153,7 +153,9 @@ impl Shell {
     /// session does (S8), at [`head::ROUTES`]. The page's calls with no session are taken
     /// only from `public_origin` (`NEXUS_PUBLIC_ORIGIN`).
     pub fn backend(proxy: IpAddr, hello: &Hello, accounts: Arc<crate::accounts::session::Accounts>, public_origin: Option<&str>) -> Arc<Self> {
-        let router = crate::accounts::routes::router(base_router(hello), accounts, public_origin.map(Arc::<str>::from));
+        let public_origin = public_origin.map(Arc::<str>::from);
+        let router = crate::accounts::routes::router(base_router(hello), accounts.clone(), public_origin.clone());
+        let router = crate::events::router(router, accounts, public_origin);
         Self::with_routes(proxy, router, head::ROUTES.to_vec())
     }
 
