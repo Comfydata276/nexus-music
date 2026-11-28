@@ -24,8 +24,9 @@ against the program itself; `tests/program.rs` is the program's settings, log an
 |---|---|
 | `NEXUS_MUSIC_SERVER` | The music server as the container reaches it, for example `http://navidrome:4533` (plain HTTP is fine: it is inside the container's network). **Must be given, and only here**: never set from the page. **The only address the backend ever connects to**: a login typed in is checked here and nowhere else; a login checked at another value of this is "cannot be used now" until it is typed again. |
 | `NEXUS_DATA_BUDGET` | How large the data may grow before new events wait: bytes, or a whole number of MB, GB or TB (`4GB`), at least 1 MB. 4 GB unless given. |
+| `NEXUS_LIDARR` | Lidarr as this container reaches it, for requests through the backend, for example `http://lidarr:8686` (plain HTTP is fine inside the container's network; no name, password, query or `#`). Not given: requests through the backend are not set up. It is set here only, never from the admin's page; the key is typed on the page and sealed to this address. |
 | `SSL_CERT_FILE` | Optional, and only if `NEXUS_MUSIC_SERVER` is HTTPS: a file of the certificates the backend trusts for it, in place of the container's own. |
-| `NEXUS_PROXY` | The one IP address the proxy connects to this container from, for example `172.18.0.2`. **Must be given.** Nothing else is answered. |
+| `NEXUS_PROXY` | Who the proxy is: the one IP address it connects to this container from, for example `172.18.0.2`, or the name of the proxy's container on a network the two share, for example `Nginx-Proxy-Manager-Official` (see below). **Must be given.** Nothing else is answered. |
 | `NEXUS_DATA` | The data folder: one SQLite file, `nexus.db`, and its nightly copies in `copies/`. `/data` unless given. On a disk of the machine's own, not a network folder. |
 | `NEXUS_STATE` | The folder of the store kept apart: the backend's id (`id`), its restore number, its keys, and what must never go backwards when the data does (`kept`). `/state` unless given. Not the data folder, inside it or around it, through a link or a mount either. **Never copied or put back with the data.** |
 | `NEXUS_LISTEN` | `0.0.0.0:8080` unless given. Not port 0. The health check asks on this machine's loopback, so listen on every address or on loopback. |
@@ -67,8 +68,13 @@ These are what the backend relies on; none of them can it check for itself.
 
 - **Its port is reachable from the proxy alone.** Do not publish the container's port on
   the machine; put the container on a network it shares with the proxy, and nothing else.
-- **The proxy's address on that network is fixed**, and it is `NEXUS_PROXY`: a container's
-  address can change when it is started again, and then nothing is answered.
+- **`NEXUS_PROXY` says who the proxy is, in one of two ways.** If the proxy has a fixed
+  address on that network, give that address. Otherwise give the proxy container's name on
+  that network (for example `Nginx-Proxy-Manager-Official`): the backend looks the name up
+  when connections come (at most every few seconds) and answers only the address it gives
+  now, so a proxy started again at a new address is followed; while the name gives nothing,
+  no one is answered. This relies on only the proxy's container answering to that name on
+  that network, so keep the network to containers you run.
 - **The backend reaches the music server inside, at `NEXUS_MUSIC_SERVER`** (for example
   `http://navidrome:4533` on a network it shares with the music server's container), and
   nowhere else. The address people use for the music server (its own HTTPS name on the proxy)
@@ -207,6 +213,16 @@ location (a header too large for it, say) is written to the host's own log.
   `Content-Length` alone, at most the call's own ceiling (1 KiB for most calls, 4 KiB for
   one that carries a password, 1 MiB at most; no chunks, no `Expect`: the proxy sends every
   body counted). Each refusal is a bare answer, and the body is not read before it.
+- **Then whose session it is, before a byte of the body is read.** The admin's page has a
+  session of its own kind, and an app's session can do nothing the page does, nor the
+  reverse: every call under `/nexus/api/admin/` (the grant included) is the page's alone;
+  every other call that needs a session is an app's alone (devices, force-out,
+  change-password, the music login, events, Diagnostics, requests); signing in, setting up
+  and `hello` need none; signing out is either's. A call with no session, or one of the
+  other kind, is refused at once ("session ended", 401; "not allowed", 403), the same bytes
+  on every call. After the data has been put back, a session the data does not have is
+  judged from the body instead, so that a device from before is told "the data was put back"
+  and sends its events again.
 - Every answer has `Cache-Control: no-store`, sets no cookie, and nothing about a request
   is written to the log.
 

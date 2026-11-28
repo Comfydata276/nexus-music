@@ -71,6 +71,10 @@ impl Choices {
         WayIn { ways: &self.0 }
     }
 
+    pub(crate) fn whose(&self) -> Option<Who> {
+        self.0.borrow().whose()
+    }
+
     /// Whether the choice under way has taken any way in: whether carrying it out has
     /// changed anything.
     pub fn taken(&self) -> bool {

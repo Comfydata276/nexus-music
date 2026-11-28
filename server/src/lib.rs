@@ -17,6 +17,7 @@ pub mod health;
 pub mod identity;
 pub mod music;
 pub mod probe;
+pub mod proxy;
 pub mod requests;
 pub mod serve;
 pub mod settings;

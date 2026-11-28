@@ -141,13 +141,6 @@ fn list(data: &Path) -> Vec<String> {
 }
 
 fn run(settings: Settings) -> ExitCode {
-    let lidarr = match nexus_music_server::requests::Endpoint::read(std::env::var("NEXUS_LIDARR").ok()) {
-        Ok(endpoint) => endpoint,
-        Err(why) => {
-            eprintln!("{why}");
-            return ExitCode::from(2);
-        }
-    };
     if let Err(why) = settings.check_folders() {
         eprintln!("{why}");
         return ExitCode::from(2);
@@ -179,7 +172,6 @@ fn run(settings: Settings) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let diagnostics_default = rows::diagnostics_default(keeper.data().connection()).ok().flatten();
     // The cheap read path and the devices each account knows (the review of S8, C1).
     let admission = match Admission::open(&mut keeper, Arc::new(now)) {
         Ok(admission) => Arc::new(admission),
@@ -203,7 +195,7 @@ fn run(settings: Settings) -> ExitCode {
         println!("No trusted certificates were found on this machine: NEXUS_MUSIC_SERVER is HTTPS, so the music server cannot be asked and no music login can be set.");
     }
     let music = MusicSide::new(client, settings.music_server.clone());
-    let accounts = Arc::new(Accounts { desk, workers, set_up_code, clock: Arc::new(now), backend: id, admission, music });
+    let accounts = Arc::new(Accounts { desk, workers, set_up_code, clock: Arc::new(now), backend: id, admission, music, lidarr: settings.lidarr.clone() });
     nightly(settings.data.clone());
     let runtime = match tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build() {
         Ok(runtime) => runtime,
@@ -223,24 +215,19 @@ fn run(settings: Settings) -> ExitCode {
         // The settings, none of them secret, and the id, which is not. What the owner typed is
         // written quoted and escaped, so that nothing in it can pass for another line.
         println!(
-            "Nexus server {} started, with id {} ({}). Listening on {}; answering the proxy at {}; music server {:?}; data {:?}; store kept apart {:?}.",
+            "Nexus server {} started, with id {} ({}). Listening on {}; answering the proxy at {}; music server {:?}; Lidarr {}; data {:?}; store kept apart {:?}.",
             nexus_music_server::version(),
             id.to_hex(),
             if started == keeper::Started::Made { "made now" } else { "kept" },
             settings.listen,
             settings.proxy,
             settings.music_server,
+            settings.lidarr.as_ref().map_or_else(|| "not set up (no NEXUS_LIDARR)".to_string(), |address| format!("{:?}", address.as_str())),
             settings.data,
             settings.state,
         );
-        // `hello` says the admin's Diagnostics default when one is set (14.3; C10s's shape).
-        let hello = match diagnostics_default {
-            Some(on) => nexus_music_server::hello(id).with_diagnostics_default(on),
-            None => nexus_music_server::hello(id),
-        };
-        let shell = serve::Shell::backend_with_requests(
-            settings.proxy, &hello, accounts.clone(), settings.public_origin.as_deref(), settings.data_budget, lidarr,
-        );
+        let hello = nexus_music_server::hello(id);
+        let shell = serve::Shell::backend(settings.proxy.clone(), &hello, accounts.clone(), settings.public_origin.as_deref(), settings.data_budget);
         serve::serve(listener, shell, true).await;
         ExitCode::SUCCESS
     });

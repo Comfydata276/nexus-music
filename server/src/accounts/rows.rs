@@ -91,16 +91,24 @@ pub struct Listed {
     pub session: Option<SessionId>,
 }
 
+// A native app version is always three numbers. The server adds this prefix
+// only for page sign-ins, so the row stays distinguishable when its session ends.
+pub(super) const PAGE_VERSION_PREFIX: &str = "admin-page:";
+
 /// An account's devices in id order, after `after`, at most `limit`, and whether there are more.
 pub fn devices(data: &Connection, account: u64, after: Option<DeviceId>, limit: usize) -> rusqlite::Result<(Vec<Listed>, bool)> {
     let mut statement = data.prepare(
         "SELECT devices.id, devices.name, devices.kind, devices.version, max(devices.first_signed_in, coalesce(devices.last_heard, 0)), sessions.id
-         FROM devices LEFT JOIN sessions ON sessions.device = devices.id WHERE devices.account = ?1 AND devices.id > ?2 ORDER BY devices.id LIMIT ?3",
+         FROM devices LEFT JOIN sessions ON sessions.device = devices.id
+         WHERE devices.account = ?1 AND devices.id > ?2
+           AND coalesce(sessions.kind, '') != 'page'
+           AND substr(devices.version, 1, length(?4)) != ?4
+         ORDER BY devices.id LIMIT ?3",
     )?;
     let after = signed(after.map_or(0, DeviceId::get))?;
     let take = signed(limit as u64 + 1)?;
     let mut listed = Vec::new();
-    let rows = statement.query_map(params![signed(account)?, after, take], |row| {
+    let rows = statement.query_map(params![signed(account)?, after, take, PAGE_VERSION_PREFIX], |row| {
         Ok((
             unsigned(row.get(0)?)?,
             row.get::<_, String>(1)?,
