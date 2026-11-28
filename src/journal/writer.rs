@@ -352,6 +352,7 @@ impl Writer {
             return Err(invalid(()));
         }
         if prior_life != Some(scope.life) {
+            remove(&directory.checkpoint())?;
             write_json(&directory.life(), &scope.life)?;
         }
         let mut current = Current {
@@ -398,6 +399,7 @@ impl Writer {
         for start in open {
             let id = new_id().ok_or_else(|| io::Error::other("journal id unavailable"))?;
             self.append(&mut current, events::end_open_start(start, position, id, now_ms()).map_err(invalid)?)?;
+            self.prune(&mut current)?;
         }
         self.recovered.insert(scope);
         self.current = Some(current);
@@ -439,7 +441,7 @@ impl Writer {
             file.pending += 1;
             file.final_at_ms = Some(at);
         }
-        self.prune(current)
+        Ok(())
     }
 
     fn prune(&mut self, current: &mut Current) -> io::Result<()> {
@@ -477,7 +479,7 @@ impl Writer {
                 let record = Record::new(observation.id, observation.at, observation.kind).map_err(invalid);
                 let result = record.and_then(|record| self.append(&mut current, record));
                 // On an uncertain write, rescan rather than append after a torn line.
-                if result.is_ok() {
+                if result.is_ok() && self.prune(&mut current).is_ok() {
                     self.current = Some(current);
                 }
                 result
@@ -894,6 +896,25 @@ mod tests {
         assert_eq!(again.state.loss.refused, 1);
         let rows = read(&folder.0, scope, 0, 3, usize::MAX);
         assert_eq!(rows.iter().map(|row| row.record().id()).collect::<Vec<_>>(), [ids[0], ids[2]]);
+    }
+
+    #[test]
+    fn oversized_display_fields_still_keep_the_start() {
+        let folder = Folder::new();
+        let scope = scope(7, 1, 1);
+        let mut writer = Writer::open(folder.0.clone()).unwrap();
+        let mut observation = start(1);
+        let Kind::Start { title, artist, album, .. } = &mut observation.kind else {
+            panic!("expected a start");
+        };
+        for field in [title, artist, album] {
+            *field = "🎷".repeat(events::TEXT_CHARS * 2);
+        }
+        let id = observation.id;
+        writer.handle(Message::Event(scope, observation)).unwrap();
+        let rows = read(&folder.0, scope, 0, 1, usize::MAX);
+        assert_eq!(rows[0].record().id(), id);
+        assert!(rows[0].line().unwrap().len() <= events::EVENT_BYTES + 1);
     }
 
     #[test]
