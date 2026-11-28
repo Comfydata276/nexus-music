@@ -668,29 +668,24 @@ impl Controller {
         };
         match (id, &target) {
             ("play", _) => self.play_target(target, name),
-            // (Until the songs have been looked up, this PC is busy to other devices: see `link`.)
             ("play-next", _) => {
-                let waiting = self.looking_up();
                 self.with_songs_or(
                     target,
                     move |ctl, songs| {
-                        ctl.looked_up(waiting);
                         ctl.enqueue(songs, true);
                         ctl.toast("Playing next");
                     },
-                    move |ctl| ctl.looked_up(waiting),
+                    |_| {},
                 )
             }
             ("add-queue", _) => {
-                let waiting = self.looking_up();
                 self.with_songs_or(
                     target,
                     move |ctl, songs| {
-                        ctl.looked_up(waiting);
                         ctl.enqueue(songs, false);
                         ctl.toast("Added to queue");
                     },
-                    move |ctl| ctl.looked_up(waiting),
+                    |_| {},
                 )
             }
             ("pl-new", _) => self.with_songs(target, |ctl, songs| ctl.prompt_new_playlist(songs)),
@@ -1368,13 +1363,10 @@ impl Controller {
 
     fn start_radio(self: &Rc<Self>, seed: Song) {
         let id = seed.id.clone();
-        // Until the songs have been looked up, this PC is busy to other devices (see `link`).
-        let waiting = self.looking_up();
         self.request(
             move |client| client.similar_songs(&id, 60),
             move |ctl, result| {
                 let similar = result.unwrap_or_default();
-                ctl.looked_up(waiting);
                 if similar.is_empty() {
                     ctl.toast("No similar songs found. Radio needs Last.fm set up in Navidrome.");
                     return;
@@ -1428,12 +1420,9 @@ impl Controller {
             Target::Playlist { id, .. } => Some(id.clone()),
             _ => None,
         };
-        // Until the songs have been looked up, this PC is busy to other devices (see `link`).
-        let waiting = self.looking_up();
         self.with_songs_or(
             target,
             move |ctl, all| {
-                ctl.looked_up(waiting);
                 // A playlist plays in the order its page shows it in.
                 let rows: Vec<usize> = match &playlist {
                     Some(id) => ctl.playlist_order(id, &all),
@@ -1444,7 +1433,7 @@ impl Controller {
                 ctl.play_from.replace(source.map(|key| crate::playback::PlayFrom { key, rows, list }));
                 ctl.play_songs(songs, 0, &name, true)
             },
-            move |ctl| ctl.looked_up(waiting),
+            |_| {},
         );
     }
 
