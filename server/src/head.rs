@@ -122,7 +122,7 @@ pub enum Verdict {
 }
 
 /// Every path the backend answers, and the one method each answers.
-pub const ROUTES: &[(&str, &str)] = &[(proto::HELLO, "GET")];
+pub const ROUTES: &[(&str, &str)] = &[(proto::HELLO, "GET"), (crate::admin::PAGE, "GET"), (crate::admin::SIGN_IN, "POST")];
 
 /// Whether the proxy marked the request as having come to it by HTTPS (design 6.2:
 /// `proxy_set_header X-Nexus-Scheme $scheme;`): the header exactly once, exactly `https`.
@@ -158,13 +158,14 @@ pub fn judge(peer: Peer, head: &Head, routes: &[(&str, &str)]) -> Verdict {
     if head.all("transfer-encoding").next().is_some() || head.all("expect").next().is_some() {
         return Verdict::Refused(StatusCode::BAD_REQUEST, Refusal::Framing);
     }
+    let body_max = if head.target == crate::admin::SIGN_IN { crate::admin::SIGN_IN_MAX_BYTES } else { BODY_MAX_BYTES };
     let mut lengths = head.all("content-length");
     let length = match (lengths.next(), lengths.next()) {
         (None, _) => 0,
         // Digits alone; a number too large to read is too large.
         (Some(length), None) if !length.is_empty() && length.iter().all(u8::is_ascii_digit) => {
             match std::str::from_utf8(length).ok().and_then(|length| length.parse::<u64>().ok()) {
-                Some(length) if length <= BODY_MAX_BYTES as u64 => length as usize,
+                Some(length) if length <= body_max as u64 => length as usize,
                 _ => return Verdict::Refused(StatusCode::PAYLOAD_TOO_LARGE, Refusal::TooLarge),
             }
         }

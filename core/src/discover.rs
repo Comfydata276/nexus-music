@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::lidarr::{ArtistOffer, Lidarr};
+use crate::lidarr::{ArtistOffer, RequestLidarr};
 use crate::requests::{Library, Stopped, unless_stopped};
 use crate::model::Song;
 use crate::text::{fold, same_words};
@@ -136,7 +136,7 @@ pub fn meant(found: Vec<ArtistOffer>, name: &str) -> Option<ArtistOffer> {
 /// who each name is, a few at a time, and anyone it keeps track of already, or the library
 /// has, is left out. What comes of it is for the app to keep. Slow: a question to Lidarr for
 /// each suggestion. A stopped look gives `Err(Stopped)`, and is not to be kept as an answer.
-pub fn look(lidarr: &Lidarr, similar: &[(String, Vec<String>)], library: &dyn Library, now: i64) -> Result<Kept, Stopped> {
+pub fn look(lidarr: &dyn RequestLidarr, similar: &[(String, Vec<String>)], library: &dyn Library, now: i64) -> Result<Kept, Stopped> {
     let have: HashSet<String> = library.artist_names();
     // Anyone Lidarr is already keeping track of is on their way, not news.
     let tracked = unless_stopped(lidarr.tracked())?.unwrap_or_default();
@@ -165,6 +165,7 @@ pub fn look(lidarr: &Lidarr, similar: &[(String, Vec<String>)], library: &dyn Li
 
 #[cfg(test)]
 mod tests {
+    use crate::lidarr::Lidarr;
     use super::*;
 
     #[test]

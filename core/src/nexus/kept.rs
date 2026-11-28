@@ -1,15 +1,17 @@
 //! The Nexus server's account and session decisions. S3 loads the rows under its
 //! serialization lock and applies the returned effects before releasing the answer.
 
+use super::account::{
+    AccountId, CODE_LIFETIME_MS, DeviceId, DeviceSecret, Email, GrantSecret, MusicAddress,
+    PASSWORD_LEAVE_MS, RequestId, SECRET_BYTES, SESSION_IDLE_MS, SessionId, StampTag,
+};
 use super::proto::BackendId;
 use hkdf::hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256, digest::CtOutput};
 use std::fmt;
 use zeroize::Zeroizing;
 
-pub const SESSION_MS: u64 = 90 * 24 * 60 * 60 * 1000;
-pub const LEAVE_MS: u64 = 10 * 60 * 1000;
-pub const SECRET_BYTES: usize = 32;
+const USE_WRITE_MS: u64 = 60 * 60 * 1000;
 
 // The design does not say whether the old in-flight write bound survives §8.6.
 // Keep the 30-second commit bound. It belongs to a request, which cannot renew it.
@@ -46,51 +48,6 @@ impl fmt::Debug for Fingerprint {
     }
 }
 
-/// A canonical account name supplied by the account layer, to be C7's.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AccountName(String);
-
-impl AccountName {
-    pub fn from_canonical(name: String) -> Option<Self> {
-        if name.len() > 254 {
-            return None;
-        }
-        let mut parts = name.split('@');
-        let local = parts.next()?;
-        let domain = parts.next()?;
-        // The design does not say whether to accept an empty side of the @.
-        (!local.is_empty()
-            && !domain.is_empty()
-            && parts.next().is_none()
-            && name.trim() == name
-            && !name.bytes().any(|byte| byte.is_ascii_uppercase()))
-        .then_some(Self(name))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-/// A device's raw secret, to be C7's. Decisions retain only its SHA-256.
-pub struct DeviceSecret(Zeroizing<[u8; SECRET_BYTES]>);
-
-impl DeviceSecret {
-    pub fn new(bytes: [u8; SECRET_BYTES]) -> Self {
-        Self(Zeroizing::new(bytes))
-    }
-
-    pub fn fingerprint(&self) -> Fingerprint {
-        Fingerprint::of(&self.0)
-    }
-}
-
-impl fmt::Debug for DeviceSecret {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("DeviceSecret(..)")
-    }
-}
-
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum Status {
     On,
@@ -102,12 +59,13 @@ pub enum Status {
 pub struct AccountState {
     pub backend: BackendId,
     pub restore: u64,
-    pub name: AccountName,
+    pub id: AccountId,
+    pub email: Email,
     pub life: u64,
     pub status: Status,
     pub password_changes: u64,
     pub password_reset_required: bool,
-    pub code_available: bool,
+    pub code: Option<LiveCode>,
     pub admin: bool,
     pub music_login: u64,
     pub music_managed: bool,
@@ -122,19 +80,47 @@ pub struct AccountState {
 struct Scope {
     backend: BackendId,
     restore: u64,
-    account: AccountName,
+    account: AccountId,
     life: u64,
     revision: u64,
-    device: u64,
+    device: DeviceId,
     number: u64,
 }
 
 impl AccountState {
+    /// The initial data and apart state. The caller supplies the reserved ID and
+    /// stores the verifier for any supplied live code, but no password verifier.
+    pub fn new(
+        backend: BackendId,
+        restore: u64,
+        id: AccountId,
+        email: Email,
+        code: Option<LiveCode>,
+    ) -> Self {
+        Self {
+            backend,
+            restore,
+            id,
+            email,
+            code,
+            life: 0,
+            status: Status::On,
+            password_changes: 0,
+            password_reset_required: true,
+            admin: false,
+            music_login: 0,
+            music_managed: false,
+            music_recovery: None,
+            history_held: false,
+            revision: 0,
+        }
+    }
+
     fn scope(&self, device: &Device) -> Scope {
         Scope {
             backend: self.backend,
             restore: self.restore,
-            account: self.name.clone(),
+            account: self.id,
             life: self.life,
             revision: self.revision,
             device: device.id,
@@ -143,14 +129,21 @@ impl AccountState {
     }
 
     fn same_account(&self, other: &Self) -> bool {
-        self.backend == other.backend && self.name == other.name
+        self.backend == other.backend && self.id == other.id
+    }
+
+    pub fn admin_target(&self) -> AdminTarget {
+        AdminTarget::Account {
+            id: self.id,
+            revision: self.revision,
+        }
     }
 
     pub fn position(&self, change: u64) -> Position {
         Position {
             backend: self.backend,
             restore: self.restore,
-            account: self.name.clone(),
+            account: self.id,
             life: self.life,
             change,
         }
@@ -159,86 +152,144 @@ impl AccountState {
     fn allows_session(&self) -> Result<(), Denied> {
         match self.status {
             Status::Deleted => Err(Denied::NotSignedIn),
+            _ if self.password_reset_required => Err(Denied::WrongPassword),
             Status::Off => Err(Denied::AccountOff),
-            Status::On if self.password_reset_required => Err(Denied::PasswordResetRequired),
             Status::On => Ok(()),
         }
     }
 }
 
+/// The authoritative code identity and deadline are recorded apart. S8 stores
+/// and checks the fingerprint belonging to that number.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum AdminKind {
-    CreateAccount,
-    ChangeAccountStatus,
-    DeleteAccount,
-    ResetPassword,
-    MakeAdmin,
-    ForceOut,
-    ChangeMusicLogin,
-    SetMusicAddress,
-    SetDiagnosticsDefault,
-    SetRequests,
-    SetLidarr,
+pub struct LiveCode {
+    pub number: u64,
+    pub used: bool,
+    pub expires: u64,
+}
+
+impl LiveCode {
+    pub fn new(number: u64, now: u64) -> Result<Self, Denied> {
+        let expires = now.checked_add(CODE_LIFETIME_MS).ok_or(Denied::Exhausted)?;
+        Ok(Self {
+            number,
+            used: false,
+            expires,
+        })
+    }
+
+    fn allows(self, number: u64, now: u64) -> bool {
+        self.number == number && !self.used && now < self.expires
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct SessionTarget {
+    pub device: DeviceId,
+    pub session: SessionId,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum AdminTarget {
+    Account { id: AccountId, revision: u64 },
+    NewAccount(Email),
+    Backend,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub enum LeaveFor {
     ChangePassword,
     DeleteHistory,
-    Admin(AdminKind),
+    Admin {
+        action: AdminAction,
+        target: AdminTarget,
+    },
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+/// The mutation and request number the password check authorizes.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct GrantIntent {
+    pub request_id: RequestId,
+    pub change: LeaveFor,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Leave {
-    purpose: LeaveFor,
+    intent: GrantIntent,
     life: u64,
+    revision: u64,
+    admin: bool,
     granted: u64,
     serial: u64,
+    hash: Fingerprint,
 }
 
 impl Leave {
-    pub fn stored(purpose: LeaveFor, life: u64, granted: u64, serial: u64) -> Self {
+    pub fn stored(
+        intent: GrantIntent,
+        life: u64,
+        revision: u64,
+        admin: bool,
+        granted: u64,
+        serial: u64,
+        hash: Fingerprint,
+    ) -> Self {
         Self {
-            purpose,
+            intent,
             life,
+            revision,
+            admin,
             granted,
             serial,
+            hash,
         }
     }
 
-    pub fn fields(self) -> (LeaveFor, u64, u64, u64) {
-        (self.purpose, self.life, self.granted, self.serial)
+    pub fn fields(&self) -> (&GrantIntent, u64, u64, bool, u64, u64, &Fingerprint) {
+        (
+            &self.intent,
+            self.life,
+            self.revision,
+            self.admin,
+            self.granted,
+            self.serial,
+            &self.hash,
+        )
     }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Session {
-    pub id: u64,
+    pub id: SessionId,
     pub hash: Fingerprint,
+    pub sign_out: Fingerprint,
     pub last_used: u64,
-    pub restricted: bool,
     pub leave: Option<Leave>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Device {
-    id: u64,
+    id: DeviceId,
     number: u64,
     secret: Option<Fingerprint>,
+    known: bool,
     last_session: u64,
     last_leave: u64,
     session: Option<Session>,
+    last_accepted: Option<u64>,
 }
 
 impl Device {
-    fn new(id: u64, secret: Fingerprint) -> Self {
+    fn new(id: DeviceId, secret: Fingerprint) -> Self {
         Self {
             id,
             number: 0,
             secret: Some(secret),
+            known: false,
             last_session: 0,
             last_leave: 0,
             session: None,
+            last_accepted: None,
         }
     }
 
@@ -246,32 +297,40 @@ impl Device {
         if self.session.is_some() {
             self.number = next(self.number)?;
             self.session = None;
+            self.last_accepted = None;
         }
         Ok(())
     }
 
     fn expire(&mut self, now: u64) -> Result<(), Denied> {
         if self
-            .session
-            .as_ref()
-            .is_some_and(|s| !within(s.last_used, now, SESSION_MS))
+            .last_accepted
+            .is_some_and(|last| now.saturating_sub(last) >= SESSION_IDLE_MS)
         {
             self.end()?;
         }
         Ok(())
     }
 
-    fn authenticate(&mut self, bearer: &Fingerprint, now: u64) -> Result<&mut Session, Denied> {
-        self.expire(now)?;
-        let session = self
-            .session
-            .as_mut()
-            .filter(|s| s.hash == *bearer)
-            .ok_or(Denied::NotSignedIn)?;
-        if !session.restricted {
+    fn touch(&mut self, now: u64) -> Result<&mut Session, Denied> {
+        let session = self.session.as_mut().ok_or(Denied::NotSignedIn)?;
+        self.last_accepted = Some(self.last_accepted.unwrap_or(now).max(now));
+        if now.saturating_sub(session.last_used) >= USE_WRITE_MS {
             session.last_used = now;
         }
         Ok(session)
+    }
+
+    fn authenticate(&mut self, bearer: &Fingerprint, now: u64) -> Result<&mut Session, Denied> {
+        self.expire(now)?;
+        if !self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.hash == *bearer)
+        {
+            return Err(Denied::NotSignedIn);
+        }
+        self.touch(now)
     }
 }
 
@@ -279,7 +338,6 @@ impl Device {
 pub enum Denied {
     NotSignedIn,
     AccountOff,
-    PasswordResetRequired,
     WrongPassword,
     HistoryHeld,
     Time,
@@ -322,7 +380,7 @@ impl Access {
 #[derive(Debug)]
 pub struct Request {
     scope: Scope,
-    session_id: u64,
+    session_id: SessionId,
     access: Access,
     arrived: u64,
 }
@@ -330,7 +388,7 @@ pub struct Request {
 /// §8.8. A password receipt has one purpose; a leave receipt is also bound to the
 /// session that requested it. §8.5 resolves devices by secret before password work.
 mod receipt;
-pub use receipt::{PasswordCheck, Receipt};
+pub use receipt::{PasswordCheck, PasswordReceipt};
 
 /// §12.5. Retain the last consented life through disconnect. Only a new choice enables a
 /// new install, or enables sending again after deletion.
@@ -348,7 +406,7 @@ pub fn may_apply(component: u64, sent_under: u64, expected: &Position, answer: &
 pub struct Position {
     pub backend: BackendId,
     pub restore: u64,
-    pub account: AccountName,
+    pub account: AccountId,
     pub life: u64,
     pub change: u64,
 }
@@ -362,9 +420,9 @@ impl Position {
     }
 }
 
-/// §12.3 fixes the stamp encoding. Use HMAC-SHA-256 with a
-/// 32-byte random key. After a fixed domain, encode id, restore, life and change at fixed
-/// widths (big endian numbers), followed by all bytes of the exact UTF-8 account name.
+/// §12.3. The design does not say how to distinguish the numbered encoding
+/// from the old email encoding. Use a new HMAC domain, then the backend id,
+/// restore, life, change and account number. Numbers are big-endian u64s.
 pub struct StampKey(Zeroizing<[u8; SECRET_BYTES]>);
 
 impl fmt::Debug for StampKey {
@@ -380,17 +438,17 @@ impl StampKey {
 
     fn mac(&self, p: &Position) -> Hmac<Sha256> {
         let mut mac: Hmac<Sha256> = hkdf::HmacImpl::new_from_slice(self.0.as_slice());
-        mac.update(b"Nexus Music stamp v1\0");
+        mac.update(b"Nexus Music stamp v2\0");
         mac.update(p.backend.as_bytes());
         mac.update(&p.restore.to_be_bytes());
         mac.update(&p.life.to_be_bytes());
         mac.update(&p.change.to_be_bytes());
-        mac.update(p.account.as_str().as_bytes());
+        mac.update(&p.account.get().to_be_bytes());
         mac
     }
 
-    pub fn stamp(&self, p: &Position) -> Fingerprint {
-        Fingerprint::from_bytes(self.mac(p).finalize().into_bytes().into())
+    pub fn stamp(&self, p: &Position) -> StampTag {
+        StampTag::from_bytes(self.mac(p).finalize().into_bytes().into())
     }
 
     /// Authenticate before inspecting the fields. Changes restart at deletion, so a lower
@@ -399,18 +457,16 @@ impl StampKey {
         &self,
         current: &Position,
         shown: &Position,
-        tag: &Fingerprint,
+        tag: &StampTag,
     ) -> Option<Restore> {
-        if self.mac(shown).verify_slice(tag.as_bytes()).is_err()
+        if self.mac(shown).verify_slice(tag.expose_bytes()).is_err()
             || current.backend != shown.backend
             || current.restore != shown.restore
             || current.account != shown.account
         {
             return None;
         }
-        if shown.life > current.life {
-            Some(Restore::HoldThrough(shown.life))
-        } else if shown.life == current.life && shown.change > current.change {
+        if (shown.life, shown.change) > (current.life, current.change) {
             Some(Restore::EndSessions)
         } else {
             None
@@ -421,7 +477,6 @@ impl StampKey {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum Restore {
     EndSessions,
-    HoldThrough(u64),
 }
 
 mod durable;

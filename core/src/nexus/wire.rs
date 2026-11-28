@@ -70,6 +70,13 @@ pub(crate) fn read_bounded<T: Message>(body: &[u8], maximum: usize) -> Result<T,
 /// Check a whole body using a read-only shape. This is also for readers that
 /// record a bad entry within an otherwise well-formed batch.
 pub(crate) fn read_value<T: Value>(body: &[u8], maximum: usize) -> Result<T, BadMessage> {
+    let value = T::read(read_raw(body, maximum)?)?;
+    value.check()?;
+    Ok(value)
+}
+
+/// A complete, structurally checked JSON value, borrowed from the original body.
+pub(crate) fn read_raw(body: &[u8], maximum: usize) -> Result<&RawValue, BadMessage> {
     if body.len() > maximum.min(BODY_MAX_BYTES) {
         return Err(BadMessage::TooLarge);
     }
@@ -79,9 +86,7 @@ pub(crate) fn read_value<T: Value>(body: &[u8], maximum: usize) -> Result<T, Bad
     if !walk.rest().is_empty() {
         return Err(BadMessage::Form);
     }
-    let value = T::read(plain_json(text)?)?;
-    value.check()?;
-    Ok(value)
+    plain_json(text)
 }
 
 pub(crate) use typed::{Message, Value};
@@ -331,7 +336,8 @@ impl Value for BackendId {
 
 /// A typed JSON object with every declared field required.
 macro_rules! object {
-    ($(#[$doc:meta])* $name:ident { $($(#[$attr:meta])* $field:ident : $kind:ty),* $(,)? }) => {
+    ($(#[$doc:meta])* $name:ident { $($(#[$attr:meta])* $field:ident : $kind:ty),* $(,)? }
+        $(check($value:ident) $check:block)?) => {
         $(#[$doc])*
         #[derive(Debug, PartialEq, Eq, Serialize)]
         pub struct $name {
@@ -343,6 +349,11 @@ macro_rules! object {
                 let _fields = $crate::nexus::wire::Fields::read(raw)?;
                 Ok(Self { $($field: _fields.get(stringify!($field))?,)* })
             }
+
+            $(fn check(&self) -> Result<(), $crate::nexus::wire::BadMessage> {
+                let $value = self;
+                $check
+            })?
         }
     };
 }

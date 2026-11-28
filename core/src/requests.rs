@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::asked::Asked;
 use crate::http::STOPPED;
-use crate::lidarr::{ArtistOffer, Lidarr, Offers, Pending};
+use crate::lidarr::{ArtistOffer, Offers, Pending, RequestLidarr};
 use crate::listenbrainz::{ListenBrainz, TopSong};
 use crate::musicbrainz::{MusicBrainz, SongOffer, TrackName};
 use crate::offer::Offer;
@@ -28,7 +28,7 @@ use crate::text::{base, fold, same_artist, same_words, words};
 /// `MusicBrainz::over`) and makes the others as it likes.
 #[derive(Clone, Copy)]
 pub struct Services<'a> {
-    pub lidarr: &'a Lidarr,
+    pub lidarr: &'a dyn RequestLidarr,
     pub musicbrainz: &'a MusicBrainz,
     pub listenbrainz: &'a ListenBrainz,
 }
@@ -760,7 +760,7 @@ pub const NO_LONGER_LISTED: &str = "Lidarr no longer lists that one.";
 /// page drawn in an earlier session). Gives who it's by, or why it couldn't be asked for.
 /// Once Lidarr has begun changing anything it runs to its end, or puts back what it changed
 /// (see `Lidarr::request`); a stop before then gives `Err(Stopped)`.
-pub fn request(lidarr: &Lidarr, offers: &Offers, album: &str, way_back: &dyn crate::lidarr::WayBack) -> Result<Result<String, String>, Stopped> {
+pub fn request(lidarr: &dyn RequestLidarr, offers: &Offers, album: &str, way_back: &dyn crate::lidarr::WayBack) -> Result<Result<String, String>, Stopped> {
     // Offered in this session, or (from a page drawn in an earlier one) looked up afresh.
     let offer = match offers.offered(album) {
         Some(offer) => Ok(offer),
@@ -863,7 +863,7 @@ pub struct Waiting {
 
 /// The albums that have been asked for: those that have arrived lately, then those still on
 /// their way. `asked` is the app's list of what it asked for.
-pub fn on_their_way(lidarr: &Lidarr, asked: &[Asked]) -> Result<Waiting, Stopped> {
+pub fn on_their_way(lidarr: &dyn RequestLidarr, asked: &[Asked]) -> Result<Waiting, Stopped> {
     // What this app asked for that has since turned up, newest first.
     let mut arrived: Vec<Asked> = asked.iter().filter(|asked| asked.arrived != 0 && !asked.library_album.is_empty()).cloned().collect();
     arrived.sort_by_key(|asked| std::cmp::Reverse(asked.arrived));
@@ -928,6 +928,8 @@ pub fn count(n: usize, noun: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::lidarr::Lidarr;
+
     #[test]
     fn a_request_by_itself_writes_its_way_back_down_before_lidarr_is_changed() {
         use crate::lidarr::tests::{KilledAfterChange, Noted, Stopping, single};
