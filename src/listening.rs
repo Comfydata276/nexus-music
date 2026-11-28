@@ -2,10 +2,10 @@
 //! while the app runs. The sign-in driver owns transport and receipt decisions.
 
 use std::cell::{Cell, RefCell};
-use std::time::Duration;
 
-use nexus_core::nexus::account::{self, DeleteListeningData, DeleteListeningDataTarget, GrantChange, GrantIssued, GrantRequest, NotAllowed, Password, Reply, SignedOut};
-use nexus_core::nexus::requests::{TransportError, TransportReply};
+use nexus_core::nexus::account::{self, NotAllowed, Password, Reply, Stamp};
+use nexus_core::nexus::events::{self, HistoryDeleteError, HistoryDeletion, Kind, StatsPage, StatsRequest};
+use nexus_core::nexus::requests::TransportError;
 use slint::{ComponentHandle, ModelRc, VecModel};
 
 use crate::app_nexus_calls::{self as calls, Context};
@@ -39,6 +39,16 @@ impl From<TransportError> for Error {
     }
 }
 
+impl From<HistoryDeleteError> for Error {
+    fn from(error: HistoryDeleteError) -> Self {
+        match error {
+            HistoryDeleteError::MissingRevision => Self::MissingRevision,
+            HistoryDeleteError::Invalid => Self::Invalid,
+            HistoryDeleteError::Refused(reason) => Self::Refused(reason),
+        }
+    }
+}
+
 impl Error {
     fn words(&self) -> String {
         match self {
@@ -50,7 +60,7 @@ impl Error {
                 "Sign in again or turn off Offline mode to continue.".into()
             }
             Self::Transport(TransportError::Unreachable) => "Couldn't reach your Nexus server.".into(),
-            Self::MissingRevision => "Couldn't check your account. Refresh Your stats and try again.".into(),
+            Self::MissingRevision => "This Nexus server didn't provide the account revision needed to delete history.".into(),
             Self::Invalid | Self::Refused(_) => "Your Nexus server couldn't complete this action. Try again.".into(),
         }
     }
@@ -151,7 +161,7 @@ fn refresh(window: &ui::MainWindow) {
     let turn = new_turn();
     let context = calls::current();
     pane.set_busy(false);
-    pane.set_can_delete(context.is_some_and(|context| !context.offline && context.target_revision.is_some()));
+    pane.set_can_delete(false);
     let Some(context) = context else {
         let status = if window.global::<ui::App>().get_nexus_signed_in() {
             "Your stats are unavailable right now."
@@ -162,6 +172,9 @@ fn refresh(window: &ui::MainWindow) {
     };
     if context.offline {
         return show(window, cached(context), "You're offline. Turn off Offline mode to refresh your stats.");
+    }
+    if !context.verified {
+        return show(window, cached(context), "Waiting to check your Nexus server…");
     }
     pane.set_busy(true);
     show(window, cached(context), "Getting your stats…");
@@ -178,7 +191,9 @@ fn refresh(window: &ui::MainWindow) {
                 return;
             };
             match result {
-                Ok((life, stats)) if life == now.life => {
+                Ok((stamp, page)) if stamp.life == now.life => {
+                    pane.set_can_delete(page.account_revision.is_some());
+                    let stats = project(page);
                     let status = if stats.recent.is_empty() { "No recent plays yet." } else { "" };
                     save_stats(now, stats.clone());
                     show(&ctl.ui, Some(stats), status);
@@ -190,10 +205,29 @@ fn refresh(window: &ui::MainWindow) {
     });
 }
 
-/// C8 owns the strict decoder for the server's stats result. Until it lands,
-/// the screen reports that the read is unavailable.
-fn read_stats(_context: Context) -> Result<(u64, Stats), Error> {
-    Err(Error::Invalid)
+fn read_stats(context: Context) -> Result<(Stamp, StatsPage), Error> {
+    let ask = account::encode(&StatsRequest { head: context.head(), after: None }).map_err(|_| Error::Invalid)?;
+    let answer = calls::post(context, events::STATS_PATH, ask.bytes())?;
+    match events::read_stats_reply(answer.status, &answer.body).map_err(|_| Error::Invalid)? {
+        Reply::Done { result, receipt } if receipt.stamp.account == context.account
+            && receipt.stamp.backend == context.backend && receipt.stamp.restore == context.restore => {
+            Ok((receipt.stamp, result))
+        }
+        Reply::Refused(why) => Err(Error::Refused(why)),
+        _ => Err(Error::Invalid),
+    }
+}
+
+fn project(page: StatsPage) -> Stats {
+    let recent = page.recent.into_iter().filter_map(|play| {
+        let record = play.event.record();
+        let Kind::Start { title, artist, album, .. } = record.kind() else { return None };
+        let when = chrono::DateTime::from_timestamp_millis(record.at_ms() as i64)
+            .map(|date| date.with_timezone(&chrono::Local).format("%-d %b %Y, %-I:%M %p").to_string()).unwrap_or_default();
+        Some(Play { title: events::clean_display_text(title), artist: events::clean_display_text(artist),
+            album: events::clean_display_text(album), when })
+    }).collect();
+    Stats { starts: page.starts, recent }
 }
 
 fn start_delete(window: &ui::MainWindow, password: Password) {
@@ -210,8 +244,6 @@ fn start_delete(window: &ui::MainWindow, password: Password) {
     pane.set_busy(true);
     std::thread::spawn(move || {
         let result = delete(context, password);
-        let ambiguous = matches!(result, Err(Error::Transport(TransportError::Unreachable) | Error::Refused(account::Refusal::NotAllowed(NotAllowed::Denied))));
-        let confirmed = result.is_ok() || (ambiguous && read_stats(context).is_ok_and(|(life, _)| life > context.life));
         crate::controller::post(move |ctl| {
             if !current_turn(turn) {
                 return;
@@ -219,13 +251,16 @@ fn start_delete(window: &ui::MainWindow, password: Password) {
             let pane = ctl.ui.global::<ui::Listening>();
             pane.set_busy(false);
             let now = calls::current().filter(|now| now.same_session(context));
-            if confirmed && let Some(now) = now {
+            if let (Ok(life), Some(now)) = (&result, now)
+                && now.life == *life
+            {
                 let empty = Stats::default();
                 save_stats(now, empty.clone());
+                pane.set_can_delete(!now.offline && now.verified);
                 pane.set_page("stats".into());
                 pane.set_result("Your listening history was deleted.".into());
                 show(&ctl.ui, Some(empty), "No recent plays yet.");
-            } else if now.is_none() {
+            } else if now.is_none() || result.is_ok() {
                 pane.set_page("stats".into());
                 refresh(&ctl.ui);
             } else if let Err(error) = result {
@@ -235,55 +270,26 @@ fn start_delete(window: &ui::MainWindow, password: Password) {
     });
 }
 
-fn delete(context: Context, password: Password) -> Result<(), Error> {
-    delete_using(context, password, |path, body| {
-        if path == account::DELETE_LISTENING_DATA && !calls::current().is_some_and(|now| now.life == context.life) {
-            return Err(TransportError::Stopped);
-        }
-        calls::post(context, path, body, account::SMALL_REPLY_MAX_BYTES, Duration::from_secs(12))
-    })
-}
-
-fn delete_using(
-    context: Context,
-    password: Password,
-    mut post: impl FnMut(&str, &[u8]) -> Result<TransportReply, TransportError>,
-) -> Result<(), Error> {
-    let target_revision = context.target_revision.ok_or(Error::MissingRevision)?;
-    let request_id = calls::new_id()?;
-    let grant = account::encode(&GrantRequest {
-        head: context.head(),
-        change: GrantChange::DeleteListeningData { account: context.account, target_revision, request_id },
-        password,
-    }).map_err(|_| Error::Invalid)?;
-    let answer = post(account::GRANT, grant.bytes())?;
-    drop(grant);
-    let grant_body = zeroize::Zeroizing::new(answer.body);
-    let grant = match account::read_reply::<GrantIssued>(answer.status, &grant_body).map_err(|_| Error::Invalid)? {
-        Reply::Done { result, receipt } if receipt.stamp.account == context.account && receipt.stamp.backend == context.backend
-            && receipt.stamp.restore == context.restore && receipt.stamp.life == context.life => result.grant,
-        Reply::Refused(why) => return Err(Error::Refused(why)),
-        _ => return Err(Error::Invalid),
-    };
-    let command = account::encode(&DeleteListeningData {
-        head: context.head(),
-        request_id,
-        grant,
-        change: DeleteListeningDataTarget { account: context.account, target_revision },
-    }).map_err(|_| Error::Invalid)?;
-    let answer = post(account::DELETE_LISTENING_DATA, command.bytes())?;
-    match account::read_reply::<SignedOut>(answer.status, &answer.body).map_err(|_| Error::Invalid)? {
-        Reply::Done { receipt, .. } if receipt.stamp.account == context.account && receipt.stamp.backend == context.backend
-            && receipt.stamp.restore == context.restore && receipt.stamp.life > context.life => Ok(()),
-        Reply::Refused(why) => Err(Error::Refused(why)),
-        _ => Err(Error::Invalid),
+fn delete(context: Context, password: Password) -> Result<u64, Error> {
+    let (stamp, latest) = read_stats(context)?;
+    if stamp.life != context.life {
+        return Err(Error::Transport(TransportError::Stopped));
     }
+    let deletion = HistoryDeletion::new(context.head(), &stamp, &latest, calls::new_id()?)?;
+    let grant_request = deletion.grant(password)?;
+    let grant = calls::post(context, account::GRANT, grant_request.bytes())?;
+    drop(grant_request);
+    let body = zeroize::Zeroizing::new(grant.body);
+    let command = deletion.spend(grant.status, &body)?;
+    drop(body);
+    let answer = calls::post(context, account::DELETE_LISTENING_DATA, command.bytes())?;
+    Ok(deletion.confirmed_life(answer.status, &answer.body)?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nexus_core::nexus::{account::{GrantSecret, Receipt, Stamp, StampTag}, proto::{BackendId, Speaks}};
+    use nexus_core::nexus::proto::BackendId;
 
     fn context() -> Context {
         Context {
@@ -291,63 +297,11 @@ mod tests {
             account: account::AccountId::new(1).unwrap(),
             session: account::SessionId::new(2).unwrap(),
             backend: BackendId::from_bytes([7; 16]),
-            speaks: Speaks::new(1, 1).unwrap(),
             restore: 0,
             life: 5,
-            target_revision: Some(9),
             offline: false,
+            verified: true,
         }
-    }
-
-    fn receipt(context: Context, life: u64) -> Receipt {
-        Receipt {
-            stamp: Stamp {
-                backend: context.backend, account: context.account, restore: context.restore,
-                life, change: 17, tag: StampTag::from_bytes([8; 32]),
-            },
-            music_login_count: 1,
-        }
-    }
-
-    #[test]
-    fn deletion_uses_a_new_grant_and_never_spends_it_for_a_wrong_password() {
-        let session = context();
-        let mut wrong_calls = 0;
-        let error = delete_using(session, Password::presented("wrong").unwrap(), |path, body| {
-            wrong_calls += 1;
-            assert_eq!(path, account::GRANT);
-            assert!(account::read::<GrantRequest>(body).is_ok());
-            let reply = Reply::<GrantIssued>::Refused(account::Refusal::NotAllowed(NotAllowed::WrongLogin));
-            Ok(TransportReply { status: reply.status(), body: account::encode(&reply).unwrap().bytes().to_vec() })
-        }).unwrap_err();
-        assert_eq!(error.words(), "That password didn't match. Try again.");
-        assert_eq!(wrong_calls, 1);
-
-        let mut grant_request = None;
-        delete_using(session, Password::presented("the correct fixture password").unwrap(), |path, body| {
-            let (status, body) = match path {
-                account::GRANT => {
-                    let request = account::read::<GrantRequest>(body).unwrap();
-                    let GrantChange::DeleteListeningData { request_id, account, target_revision } = request.change;
-                    assert_eq!(account, session.account);
-                    assert_eq!(Some(target_revision), session.target_revision);
-                    grant_request = Some(request_id);
-                    let reply = Reply::Done { result: GrantIssued { grant: GrantSecret::from_bytes([1; 32]) }, receipt: receipt(session, session.life) };
-                    (reply.status(), account::encode(&reply).unwrap())
-                }
-                account::DELETE_LISTENING_DATA => {
-                    let request = account::read::<DeleteListeningData>(body).unwrap();
-                    assert_eq!(Some(request.request_id), grant_request.take());
-                    assert_eq!(request.change.account, session.account);
-                    assert_eq!(Some(request.change.target_revision), session.target_revision);
-                    let reply = Reply::Done { result: SignedOut {}, receipt: receipt(session, session.life + 1) };
-                    (reply.status(), account::encode(&reply).unwrap())
-                }
-                other => panic!("unexpected call {other}"),
-            };
-            Ok(TransportReply { status, body: body.bytes().to_vec() })
-        }).unwrap();
-        assert!(grant_request.is_none());
     }
 
     #[test]

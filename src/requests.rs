@@ -2,10 +2,9 @@
 //! status answer can make the released direct connection available.
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use nexus_core::lidarr::{Offers, RequestLidarr};
-use nexus_core::nexus::requests::{Availability, BackendLidarr, LIST_REPLY_MAX_BYTES, LidarrNumber, MusicBrainzId, PendingView, Refusal, RequestError, TransportError};
+use nexus_core::nexus::requests::{Availability, BackendLidarr, LidarrNumber, MusicBrainzId, PendingView, Refusal, RequestError, TransportError};
 
 use crate::app_nexus_calls::{self as calls, Context};
 
@@ -98,7 +97,7 @@ pub(crate) fn cancel(client: &BackendLidarr<'_>, id: i64, album: &str) -> Result
 pub(crate) fn backend(context: Context) -> BackendLidarr<'static> {
     BackendLidarr::new(
         context.head(),
-        move |path, body, _| calls::post(context, path, body, LIST_REPLY_MAX_BYTES, Duration::from_secs(35)),
+        move |path, body, _| calls::post(context, path, body),
         move |receipt| {
             // The driver has already processed the typed receipt. Keep the
             // operation's account fence even between successful pages.
@@ -141,7 +140,7 @@ fn selected() -> Option<Selection> {
 }
 
 fn usable(choice: &Selection, session: Option<Context>) -> bool {
-    session.is_some_and(|session| !session.offline && choice.session.same_session(session))
+    session.is_some_and(|session| !session.offline && session.verified && choice.session.same_session(session))
 }
 
 pub(crate) fn direct_selected() -> bool {
@@ -190,7 +189,7 @@ pub(crate) fn settings_text() -> String {
 /// Call at account changes and when the Requests page is opened. The pin on the
 /// queued probe rules out an older answer after a second open or account switch.
 pub(crate) fn refresh() {
-    let Some(session) = calls::current().filter(|session| !session.offline) else {
+    let Some(session) = calls::current().filter(|session| !session.offline && session.verified) else {
         if let Ok(mut state) = SELECTED.lock() {
             state.0 = None;
         }
@@ -240,11 +239,11 @@ mod tests {
 
     #[test]
     fn signed_out_offline_and_a_replaced_session_cannot_reuse_a_route() {
-        use nexus_core::nexus::{account::{AccountId, SessionId}, proto::{BackendId, Speaks}};
+        use nexus_core::nexus::{account::{AccountId, SessionId}, proto::BackendId};
         let session = Context {
             generation: 3, backend: BackendId::from_bytes([1; 16]), account: AccountId::new(1).unwrap(),
-            session: SessionId::new(8).unwrap(), speaks: Speaks::new(1, 1).unwrap(),
-            restore: 0, life: 8, target_revision: None, offline: false,
+            session: SessionId::new(8).unwrap(),
+            restore: 0, life: 8, offline: false, verified: true,
         };
         let choice = Selection { session, route: Route::Direct, number: 5, offers: Arc::new(Offers::new()) };
         assert!(usable(&choice, Some(session)));
