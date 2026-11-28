@@ -25,5 +25,3 @@ zeroize = "1.8"
 # The check sent ahead of the secret in a browser sign-in (see src/gate.rs), and the key
 # for linking devices. The app carries the same version already.
 sha2 = "0.11"
-# Resolve update redirects and send the same canonical address the origin rule checked.
-url = "2"

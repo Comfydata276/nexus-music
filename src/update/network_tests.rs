@@ -94,7 +94,7 @@ impl Server {
     }
 
     fn download(&self, assets: &Server, installer: &Installer, timeout: Duration) -> Result<PathBuf, String> {
-        let source = Source::Installer { repository: &self.origin, assets: &assets.origin };
+        let source = Source::Installer { repository: &self.origin, assets: &[&assets.origin] };
         let agent = client(timeout);
         let mut calls = 0;
         let result = download_with(installer, |_| {}, || {

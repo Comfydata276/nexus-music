@@ -128,7 +128,7 @@ fn get(
     let mut followed = 0;
     loop {
         let started = Instant::now();
-        let mut request = agent.get(address.as_str());
+        let mut request = agent.get(address.wire());
         if matches!(source, Source::Metadata { .. }) {
             request = request.header("Accept", "application/vnd.github+json");
         }
