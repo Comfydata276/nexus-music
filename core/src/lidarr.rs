@@ -367,6 +367,9 @@ pub struct AddedArtist {
     /// Lidarr accepted a new artist and will learn its discography asynchronously.
     /// Its response named no releases, so there is nothing to attribute yet.
     pub learning: bool,
+    /// The number of rows selected for the monitor write, as reported to the
+    /// released apps. Ownership uses the distinct releases below.
+    pub monitored_count: usize,
     /// One row for each distinct release selected in the explicit monitor write.
     pub newly_marked: Vec<NewlyMarked>,
 }
@@ -880,11 +883,16 @@ impl Lidarr {
         Ok(albums)
     }
 
-    /// Has Lidarr keep track of an artist: every album of theirs goes on its list, and new
-    /// ones will as they come out. Returns the exact releases explicitly marked.
-    /// Seen through once it has changed anything, as `request` is, and one step at a time with every other
-    /// change to an artist's record (`WayBack::turn`): it reads the record and writes it back.
-    pub fn add_artist(&self, artist: &str, name: &str, way_back: &dyn WayBack) -> Result<AddedArtist, String> {
+    /// Has Lidarr keep track of an artist, returning the number of rows selected
+    /// for the monitor write. A new artist is counted as zero while Lidarr learns
+    /// their albums.
+    pub fn add_artist(&self, artist: &str, name: &str, way_back: &dyn WayBack) -> Result<usize, String> {
+        self.add_artist_exact(artist, name, way_back).map(|added| added.monitored_count)
+    }
+
+    /// Run the same request and return the exact releases explicitly marked.
+    /// The change is seen through under `WayBack::turn` once it has begun.
+    pub fn add_artist_exact(&self, artist: &str, name: &str, way_back: &dyn WayBack) -> Result<AddedArtist, String> {
         self.seeing_through().adding_artist(artist, name, way_back)
     }
 
@@ -908,7 +916,7 @@ impl Lidarr {
                 })),
             )?;
             // Lidarr learns their albums in its own time; how many isn't known yet.
-            return Ok(AddedArtist { number: added.id, artist: artist.to_owned(), learning: true, newly_marked: Vec::new() });
+            return Ok(AddedArtist { number: added.id, artist: artist.to_owned(), learning: true, monitored_count: 0, newly_marked: Vec::new() });
         };
         let mut record: serde_json::Value = self.get(&format!("artist/{known}"))?;
         record["monitored"] = true.into();
@@ -936,7 +944,7 @@ impl Lidarr {
             offer.artist = name.to_owned();
             Some(NewlyMarked { number, offer })
         }).collect();
-        let added = AddedArtist { number: known, artist: artist.to_owned(), learning: false, newly_marked };
+        let added = AddedArtist { number: known, artist: artist.to_owned(), learning: false, monitored_count: wanted.len(), newly_marked };
         if !wanted.is_empty() {
             way_back.before_artist_albums(&added)?;
             let _: serde_json::Value =
@@ -1451,7 +1459,7 @@ impl RequestLidarr for Lidarr {
     }
 
     fn add_artist(&self, artist: &str, name: &str, way_back: &dyn WayBack) -> Result<usize, String> {
-        Lidarr::add_artist(self, artist, name, way_back).map(|added| added.newly_marked.len())
+        Lidarr::add_artist(self, artist, name, way_back)
     }
 
     fn request(&self, wanted: &Offer, way_back: &dyn WayBack) -> Result<(), String> {
@@ -1591,9 +1599,10 @@ pub(crate) mod tests {
         let journal = Arc::new(Journal::default());
         let http = Arc::new(Direct { journal: journal.clone(), paths: Mutex::default() });
         let lidarr = Lidarr::new("http://lidarr.test", "key", None, http.clone());
-        let result = lidarr.add_artist("artist1", "Marrow Lake", journal.as_ref()).unwrap();
+        let result = lidarr.add_artist_exact("artist1", "Marrow Lake", journal.as_ref()).unwrap();
         assert_eq!(Some(&result), journal.0.lock().unwrap().as_ref());
         assert!(!result.learning);
+        assert_eq!(result.monitored_count, 3);
         let [row] = result.newly_marked.as_slice() else { panic!("expected one release") };
         assert_eq!((row.number, row.offer.artist_id.as_str(), row.offer.artist.as_str()), (7, "artist1", "Marrow Lake"));
         assert_eq!(*http.paths.lock().unwrap(), ["artist", "artist/1", "artist/1", "album?artistId=1", "album/monitor", "command"]);
