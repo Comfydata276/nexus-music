@@ -1333,9 +1333,13 @@ impl Requests {
                     return Ok(Dispatch::Done(Answer::Begun { job }));
                 }
                 if let Change::Cancel { release, .. } = &change {
-                    let owners = owners(db, &binding, actor.account, &[release.as_str()])?;
+                    let known = if actor.admin {
+                        HashMap::new()
+                    } else {
+                        owners(db, &binding, actor.account, &[release.as_str()])?
+                    };
                     wire::may_cancel(wire::RequestsAccess::On, actor.account, actor.admin,
-                        owners.get(release.as_str()).map(Vec::as_slice).unwrap_or_default())?;
+                        known.get(release.as_str()).map(Vec::as_slice).unwrap_or_default())?;
                 }
                 let work = Plan::resolve(&change, &lock(&self.books), actor, binding, credential.revision)?;
                 let job = enqueue(keeper, actor, request_id, &change_bytes, &work, matches!(&change, Change::Batch { .. }), &self.rooms)?;
