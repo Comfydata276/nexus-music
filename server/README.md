@@ -27,7 +27,7 @@ against the program itself; `tests/program.rs` is the program's settings, log an
 | `NEXUS_DATA` | The data folder: one SQLite file, `nexus.db`, and its nightly copies in `copies/`. `/data` unless given. On a disk of the machine's own, not a network folder. |
 | `NEXUS_STATE` | The folder of the store kept apart: the backend's id (`id`), its restore number, its keys, and what must never go backwards when the data does (`kept`). `/state` unless given. Not the data folder, inside it or around it, through a link or a mount either. **Never copied or put back with the data.** |
 | `NEXUS_LISTEN` | `0.0.0.0:8080` unless given. Not port 0. The health check asks on this machine's loopback, so listen on every address or on loopback. |
-| `NEXUS_PUBLIC_ORIGIN` | The admin's page's address as a browser has it: `https://` and the name, and `:port` only if it is not 443, nothing after it, for example `https://nexus.example.org`. The page's sign-in and set-up are taken only from it. Unset, they are refused, and the log says so once at the start. |
+| `NEXUS_PUBLIC_ORIGIN` | The backend's own HTTPS name, which nothing else shares (below), as a browser has it: `https://` and the name, and `:port` only if it is not 443, nothing after it, for example `https://nexus.example.org`. The admin's page's sign-in and set-up are taken only from it. Unset, they are refused, and the log says so once at the start. |
 
 A setting that is wrong or missing is said by name as it starts, and it stops.
 
@@ -52,6 +52,15 @@ instead. Once the backend is set up, no code is written.
 
 ## Setting it up beside the proxy
 
+**The backend has an HTTPS name of its own**, for example `nexus.example.org`, and nothing
+else is served at that name: not the music server, not its web page, not any other service.
+That name is what a person types into the app (design 7.1), and it is `NEXUS_PUBLIC_ORIGIN`
+(`https://nexus.example.org`). **Never put the backend under the music server's name** (a
+path such as `/nexus/` on the music server's host): a browser treats one name as one site, so
+a page served there by anything else (the music server's own web app, say) could act in the
+admin's page as the admin. The admin's page checks that a call comes from
+`NEXUS_PUBLIC_ORIGIN`; that check protects nothing if another service shares it.
+
 These are what the backend relies on; none of them can it check for itself.
 
 - **Its port is reachable from the proxy alone.** Do not publish the container's port on
@@ -64,27 +73,43 @@ These are what the backend relies on; none of them can it check for itself.
   proxy; behind a content network it is how the network reached it, which is still to be
   proven (the design's experiment E2b).
 
-## The proxy's rule
+## The proxy's host (Nginx Proxy Manager)
 
-**Not as a Custom Location.** Measured on Nginx Proxy Manager 2.17.1: a custom location
-forwarded to a container's name is written so that the name must be found when the proxy
-loads its configuration. While that container is stopped, the proxy refuses every change to
-every host, and if the proxy starts then (a reboot, say), it does not start at all, and no
-host it serves answers, the music server's included. So the rule is written in the music
-server's host's own **Advanced** box, where the name is looked up for each request instead:
-a stopped backend is then a 502 for `/nexus/` and nothing more.
+A **new Proxy Host** for the backend's own name. Its whole path goes to the backend through
+one `location /` written in the host's **Advanced** box; when that box has a `location /`, the
+proxy leaves out the one it would make itself, so only these lines decide what reaches the
+backend.
 
-In Nginx Proxy Manager: **Hosts, Proxy Hosts**, the music server's host, **Edit**.
+**Not as a Custom Location, and the container's name only in a variable.** Measured on Nginx
+Proxy Manager 2.17.1: a custom location forwarded to a container's name is written so that
+the name must be found when the proxy loads its configuration. While that container is
+stopped, the proxy refuses every change to every host, and if the proxy starts then (a
+reboot, say), it does not start at all, and no host it serves answers. Below, the name is in
+a variable with a `resolver` line, so it is looked up for each request instead: a stopped
+backend is then a 502 for this host and nothing more. **And nothing of the proxy's own
+templates is named in the block** (no `$hsts_header`, no `include conf.d/include/...`): the
+proxy renames them between versions, and a host naming one goes offline at its next
+rewrite. The block writes its own HSTS header instead.
 
-1. On **Details**: **Cache Assets** off.
-2. On **Custom Locations**: if there is a `/nexus/` location, delete it. There must be only
-   this one.
-3. On **Advanced**, add exactly these lines below anything already there, with the backend
-   container's name in place of `nexus-server` and its port in place of `8080`:
+In Nginx Proxy Manager: **Hosts, Proxy Hosts, Add Proxy Host**.
 
-       location /nexus/ {
+1. On **Details**: **Domain Names** the backend's own name (`nexus.example.org`); **Scheme**
+   `http`; **Forward Hostname / IP** the backend container's name (`nexus-server`) and
+   **Forward Port** its port (`8080`), which the block below uses instead; **Cache Assets**
+   off; **Block Common Exploits** off; **Websockets Support** off (the block passes one
+   itself). **No Access List**: the backend has its own sign-in, and a list would refuse the
+   apps (and no sign-in of another service in front of it, for the same reason).
+2. On **SSL**: a certificate for that name; **Force SSL** on (plain HTTP is then only ever a
+   redirect to HTTPS, and nothing reaches the backend by it); **HTTP/2 Support** as you like;
+   **HSTS Enabled** off (the block writes its own, which a `location` with headers of its own
+   needs).
+3. On **Advanced**, exactly these lines, with the backend container's name in place of
+   `nexus-server` and its port in place of `8080`:
+
+       location / {
            resolver 127.0.0.11 valid=10s;
            set $nexus_up nexus-server;
+           add_header Strict-Transport-Security "max-age=63072000; preload" always;
            proxy_set_header X-Nexus-Peer $realip_remote_addr;
            proxy_set_header X-Nexus-Scheme $scheme;
            proxy_set_header Cookie "";
@@ -119,18 +144,20 @@ In Nginx Proxy Manager: **Hosts, Proxy Hosts**, the music server's host, **Edit*
            proxy_pass http://$nexus_up:8080;
        }
 
-4. **Save.**
+4. **Save.** Then check that `https://nexus.example.org/nexus/api/hello` answers (the
+   backend's id), and that the music server's own name does not.
 
 What the lines do: `127.0.0.11` is Docker's own name service, so the proxy and the backend
 must share a network Docker made (not the default bridge); `proxy_pass` has no path, so the
-backend sees the address exactly as the caller wrote it and can refuse it. **The only
-headers that say who and how are the rule's own two**, `X-Nexus-Peer` and `X-Nexus-Scheme`,
-which replace whatever a caller sent under those names; every other header by which a
-caller could claim an address, a scheme, a host or a name (`X-Real-IP`, `X-Forwarded-For`
-and the rest above), and its cookies, are emptied and never reach the backend (measured:
-without these lines the caller's own values arrive). The three lines after them keep the
-proxy from caching, or from putting answers of its own in place of the backend's, whatever
-the host is set to. The last three before `proxy_pass` pass a WebSocket (stage 2).
+backend sees the address exactly as the caller wrote it and can refuse it (anything not
+under `/nexus/` is refused by the backend). **The only headers that say who and how are the
+rule's own two**, `X-Nexus-Peer` and `X-Nexus-Scheme`, which replace whatever a caller sent
+under those names; every other header by which a caller could claim an address, a scheme, a
+host or a name (`X-Real-IP`, `X-Forwarded-For` and the rest above), and its cookies, are
+emptied and never reach the backend (measured: without these lines the caller's own values
+arrive). The three lines after them keep the proxy from caching, or from putting answers of
+its own in place of the backend's. The last three before `proxy_pass` pass a WebSocket
+(stage 2). The HSTS line tells browsers to come to this name by HTTPS only.
 
 **`client_body_buffer_size 1m;` and `client_body_in_file_only off;` are required** (design 7.2):
 the proxy takes a body whole before the backend sees it, and with a body allowed to be larger
@@ -143,26 +170,14 @@ that carries a password**, refused from its `Content-Length` before a byte of th
 read. Where the TLS is ended (the proxy, or a content network in front of it) everything can
 be read, passwords included: have that edge refuse plain HTTP outright.
 
-**An Access List on the host does not cover `/nexus/`** (measured: with one, the music
-server's own paths asked for the password and `/nexus/` did not). The backend has its own
-gate, and at a later stage its own sign-in, so it does not need one. To have the list apply
-here too, copy into this block, above `resolver`, the lines the proxy writes for it in the
-host's own `location /` (in `/data/nginx/proxy_host/<the host's number>.conf`): for a list
-with a user, `auth_basic "Authorization required";`, `auth_basic_user_file
-/data/access/<the list's number>;` and `satisfy all;` (or `any`, as the list says), and for
-a list with addresses, its `allow` lines and `deny all;` (measured: with them, `/nexus/` asks
-for the password too). The apps are then refused here as they are on the rest of the host,
-unless the list lets them by.
-
 **`error_log /dev/null crit;` is required.** A backend that is down, restarting or too slow
 otherwise has the proxy write, for every request, a line to its error log holding the
 caller's address (as the caller claims it) and the whole request line with its query
-(measured). **What is given up:** that location's own errors are no longer in the proxy's
-log; the backend's health check and its own log say whether it is up.
+(measured). **What is given up:** that host's own errors are no longer in the proxy's log;
+the backend's health check and its own log say whether it is up.
 
 One thing the rule cannot stop: a request the proxy refuses itself before it chooses a
-location (a header too large for it, say) is written to the host's own logs, as for any
-other path of the music server.
+location (a header too large for it, say) is written to the host's own log.
 
 ## What reaches it, and what it answers
 
