@@ -1038,18 +1038,16 @@ impl Turn<'_> {
     }
 
     pub fn check_leave(
-        self,
+        mut self,
         bearer: Bearer<'_>,
         intent: GrantIntent,
         expected: Fingerprint,
     ) -> Result<PasswordCheck, Denied> {
-        let session = self
-            .account
-            .session(bearer.device, bearer.hash, self.now)?
-            .id;
-        if matches!(&intent.change, LeaveFor::Admin { .. }) && !self.account.state.admin {
-            return Err(Denied::AdminRequired);
-        }
+        let session = if matches!(&intent.change, LeaveFor::Admin { .. }) {
+            self.admin_session(&bearer)?
+        } else {
+            self.account.session(bearer.device, bearer.hash, self.now)?.id
+        };
         Ok(PasswordCheck::new(
             self.account.scope(bearer.device)?,
             Purpose::Leave { session, intent },
@@ -1082,7 +1080,9 @@ impl Turn<'_> {
             .as_mut()
             .filter(|s| s.id == session)
             .ok_or(Denied::NotSignedIn)?;
-        if matches!(&intent.change, LeaveFor::Admin { .. }) && !self.account.state.admin {
+        if matches!(&intent.change, LeaveFor::Admin { .. })
+            && (!self.account.state.admin || row.kind != SessionKind::AdminPage)
+        {
             return Err(Denied::AdminRequired);
         }
         device.last_leave = next(device.last_leave)?;
@@ -1243,9 +1243,7 @@ impl Turn<'_> {
         bearer: Bearer<'_>,
         target: Option<&Account>,
     ) -> Result<MusicAuthorization, Denied> {
-        if !self.account.state.admin {
-            return Err(Denied::AdminRequired);
-        }
+        let session = self.admin_session(&bearer)?;
         let target_state = &target.unwrap_or(self.account).state;
         if target_state.backend != self.account.state.backend
             || target_state.restore != self.account.state.restore
@@ -1258,7 +1256,6 @@ impl Turn<'_> {
         let target_revision = target_state.revision;
         let next_count = next(target_state.music_login)?;
         let device = bearer.device;
-        let hash = bearer.hash;
         let grant = self.consume_leave(
             bearer,
             LeaveFor::Admin {
@@ -1266,7 +1263,6 @@ impl Turn<'_> {
                 target: named,
             },
         )?;
-        let session = self.account.session(device, hash, self.now)?.id;
         Ok(MusicAuthorization {
             actor: self.account.scope(device)?,
             session,
@@ -1281,19 +1277,15 @@ impl Turn<'_> {
     /// Install the verified login only while the same authorization and internal
     /// address are current. S3 commits the count and sealed bytes under the same lock.
     pub fn install_music(
-        self,
+        mut self,
         bearer: Bearer<'_>,
         verified: VerifiedLogin,
         internal: &str,
         target: Option<&mut Account>,
     ) -> Result<u64, Denied> {
         let (auth, login) = verified.into_parts(internal).ok_or(Denied::WrongPurpose)?;
-        let session = self
-            .account
-            .session(bearer.device, bearer.hash, self.now)?
-            .id;
-        if !self.account.state.admin
-            || self.account.scope(bearer.device)? != auth.actor
+        let session = self.admin_session(&bearer)?;
+        if self.account.scope(bearer.device)? != auth.actor
             || session != auth.session
             || bearer.grant.map(|grant| grant.request_id) != Some(auth.request_id)
             || !within(auth.granted, self.now, PASSWORD_LEAVE_MS)
@@ -1319,10 +1311,17 @@ impl Turn<'_> {
         Ok(auth.next_count)
     }
 
-    pub fn admin_read(self, bearer: Bearer<'_>) -> Result<(), Denied> {
-        self.account.session(bearer.device, bearer.hash, self.now)?;
-        if self.account.state.admin {
-            Ok(())
+    /// Require a live admin page session for an admin route. The server also
+    /// checks the page marker and browser Origin before calling this.
+    pub fn admin_read(mut self, bearer: Bearer<'_>) -> Result<(), Denied> {
+        self.admin_session(&bearer).map(|_| ())
+    }
+
+    fn admin_session(&mut self, bearer: &Bearer<'_>) -> Result<SessionId, Denied> {
+        let admin = self.account.state.admin;
+        let session = self.account.session(bearer.device, bearer.hash, self.now)?;
+        if admin && session.kind == SessionKind::AdminPage {
+            Ok(session.id)
         } else {
             Err(Denied::AdminRequired)
         }
@@ -1338,9 +1337,7 @@ impl Turn<'_> {
         named: AdminTarget,
         target: Option<&mut Account>,
     ) -> Result<(), Denied> {
-        if !self.account.state.admin {
-            return Err(Denied::AdminRequired);
-        }
+        self.admin_session(&bearer)?;
         if action == AdminAction::MusicLoginChanged {
             return Err(Denied::WrongPurpose);
         }

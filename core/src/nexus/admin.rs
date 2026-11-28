@@ -875,7 +875,7 @@ mod tests {
         let bearer = kept::Fingerprint::of(&[0x63; account::SECRET_BYTES]);
         let proof = step(&mut actor, 1, |turn| turn.check_sign_in(&secret, device, verifier.clone()))
             .unwrap().check(verifier, kept::Clock::new(1, 1)).unwrap();
-        step(&mut actor, 1, |turn| turn.sign_in(proof, kept::FreshSession {
+        step(&mut actor, 1, |turn| turn.sign_in_as(kept::SessionKind::AdminPage, proof, kept::FreshSession {
             id: SessionId::new(1).unwrap(),
             hash: bearer.clone(),
             sign_out: kept::Fingerprint::of(&[0x64; account::SECRET_BYTES]),
