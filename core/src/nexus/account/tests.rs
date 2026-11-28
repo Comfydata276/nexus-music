@@ -24,7 +24,7 @@ fn round_trip<T: wire::Message + fmt::Debug + PartialEq>(value: T) {
 #[test]
 fn every_account_path_is_plain_and_has_its_own_name() {
     assert_eq!(SIGN_IN, "/nexus/api/signin");
-    assert_eq!(PATHS.len(), 8);
+    assert_eq!(PATHS.len(), 9);
     let mut seen = BTreeSet::new();
     for path in PATHS {
         assert!(path.starts_with(API));
@@ -983,4 +983,53 @@ fn body_limits_win_before_parsing_and_read_only_callers_cannot_raise_the_global_
     assert_eq!(read::<SignIn>(&vec![0xff; PASSWORD_REQUEST_MAX_BYTES + 1]), Err(BadMessage::TooLarge));
     assert_eq!(read_reply::<DevicePage>(429, &vec![0xff; SMALL_REPLY_MAX_BYTES + 1]), Err(BadMessage::TooLarge));
     assert_eq!(wire::read_value::<u64>(&vec![0xff; BODY_MAX_BYTES + 1], usize::MAX), Err(BadMessage::TooLarge));
+}
+
+#[test]
+fn set_up_uses_the_code_and_new_password_rules_and_a_four_kibibyte_body() {
+    assert_eq!(SET_UP, "/nexus/api/set-up");
+    let raw = br#"{"code":"iOdhjkmn3479","email":"  ADA@example.org ","name":"Ada","password":"a made-up password"}"#;
+    let call = read::<SetUp>(raw).unwrap();
+    assert_eq!(call.code.expose(), "10DHJKMN3479");
+    assert_eq!(call.email, email());
+    round_trip(call);
+    for raw in [
+        br#"{"code":"CDFHJKMN347","email":"ada@example.org","name":"Ada","password":"a made-up password"}"#.as_slice(),
+        br#"{"code":"CDFHJK-MN3479","email":"ada@example.org","name":"Ada","password":"a made-up password"}"#,
+        br#"{"code":"CDFHJKMN3479","email":"ada@example.org","name":"Ada","password":"short"}"#,
+        br#"{"code":"CDFHJKMN3479","email":"ada@example.org","name":"Ada"}"#,
+    ] {
+        assert_eq!(read::<SetUp>(raw), Err(BadMessage::Form));
+    }
+    let mut exact = raw.to_vec();
+    exact.resize(SET_UP_MAX_BYTES, b' ');
+    assert!(read::<SetUp>(&exact).is_ok());
+    exact.push(b' ');
+    assert_eq!(read::<SetUp>(&exact), Err(BadMessage::TooLarge));
+}
+
+#[test]
+fn set_up_done_returns_the_person_without_a_stamp_or_session() {
+    let mut first = person();
+    first.admin = true;
+    let done = SetUpReply::Done { result: first };
+    let bytes = encode(&done).unwrap();
+    assert_eq!(SetUpReply::read(200, bytes.bytes()), Ok(done));
+    assert_eq!(SetUpReply::read(403, bytes.bytes()), Err(BadMessage::Status(403)));
+    let body: serde_json::Value = serde_json::from_slice(bytes.bytes()).unwrap();
+    assert!(body.get("done").unwrap().get("receipt").is_none());
+    let stamped = encode(&Reply::Done { result: SignedOut {}, receipt: receipt() }).unwrap();
+    assert_eq!(SetUpReply::read(200, stamped.bytes()), Err(BadMessage::Form));
+    let refused = SetUpReply::Refused(Refusal::NotAllowed(NotAllowed::WrongLogin));
+    assert_eq!(SetUpReply::read(403, encode(&refused).unwrap().bytes()), Ok(refused));
+}
+
+#[test]
+fn speaks_meets_on_a_shared_endpoint_and_refuses_disjoint_ranges() {
+    let a = Speaks::new(2, 5).unwrap();
+    for (low, high, meets) in [(1, 1, false), (1, 2, true), (3, 4, true), (5, 5, true), (6, u32::MAX, false)] {
+        let b = Speaks::new(low, high).unwrap();
+        assert_eq!(a.meets(&b), meets);
+        assert_eq!(b.meets(&a), meets);
+    }
 }
