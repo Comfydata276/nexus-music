@@ -43,6 +43,8 @@ sha2 = "0.11"
 argon2 = { version = "0.6", default-features = false, features = ["alloc", "zeroize"] }
 zeroize = "1.8"
 subtle = { version = "2", default-features = false }
+# The keyed fingerprint a one-time code is kept by (8.5), the version the shared library uses.
+hmac = "0.13"
 
 [dev-dependencies]
 # Tests connect from a chosen loopback address (127.0.0.2 as the proxy, 127.0.0.3 as a
