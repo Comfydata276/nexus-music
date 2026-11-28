@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use diag::{Fault, FaultPlace, FaultShape, Line, Note};
-use nexus_core::nexus::{account::{RequestHead, RequestId}, proto::SPEAKS};
+use nexus_core::nexus::{account::{RequestHead, RequestId}, events::LossCounts, proto::SPEAKS};
 
 const AT: i64 = 1_700_000_000;
 
