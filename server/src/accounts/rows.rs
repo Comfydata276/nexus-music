@@ -79,8 +79,9 @@ pub fn admins(data: &Connection) -> rusqlite::Result<u64> {
     data.query_row("SELECT count(*) FROM accounts WHERE admin = 1 AND status = 'on'", [], |row| unsigned(row.get(0)?))
 }
 
-/// One device of an account, as its person's list shows it (8.7).
-#[derive(Debug, Clone)]
+/// One device of an account, as its person's list shows it (8.7). No `Debug`: its name is
+/// what a person typed.
+#[derive(Clone)]
 pub struct Listed {
     pub id: DeviceId,
     pub name: Name,
@@ -126,4 +127,12 @@ pub fn devices(data: &Connection, account: u64, after: Option<DeviceId>, limit: 
     let more = listed.len() > limit;
     listed.truncate(limit);
     Ok((listed, more))
+}
+
+/// The fingerprint of every device secret the data has a device for (which lane a sign-in waits
+/// in: `session::Seen`).
+pub fn device_secrets(data: &Connection) -> rusqlite::Result<Vec<[u8; 32]>> {
+    let mut statement = data.prepare("SELECT secret FROM devices")?;
+    let found = statement.query_map([], |row| bytes32(row, 0))?.collect();
+    found
 }

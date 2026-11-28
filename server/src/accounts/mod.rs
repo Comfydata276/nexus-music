@@ -14,3 +14,8 @@ pub mod routes;
 pub mod rows;
 pub mod session;
 pub mod setup;
+
+#[cfg(test)]
+mod bench;
+#[cfg(test)]
+mod tests;

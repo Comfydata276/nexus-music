@@ -96,11 +96,16 @@ impl Serving {
 
     /// One POST, as the proxy sends it, and its status and body.
     fn post(&self, path: &str, session: Option<&account::Session>, body: &[u8]) -> (u16, Vec<u8>) {
+        self.post_with(path, session, "", body)
+    }
+
+    /// The same, with more headers (each line ending in CRLF).
+    fn post_with(&self, path: &str, session: Option<&account::Session>, more: &str, body: &[u8]) -> (u16, Vec<u8>) {
         let mut stream = TcpStream::connect(self.at).unwrap();
         stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
         let authorization = session.map_or_else(String::new, |session| format!("Authorization: {}\r\n", session.authorization().as_str()));
         let head = format!(
-            "POST {path} HTTP/1.1\r\nHost: nexus\r\nX-Nexus-Scheme: https\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{authorization}Connection: close\r\n\r\n",
+            "POST {path} HTTP/1.1\r\nHost: nexus\r\nX-Nexus-Scheme: https\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{authorization}{more}Connection: close\r\n\r\n",
             body.len()
         );
         stream.write_all(head.as_bytes()).unwrap();
@@ -268,10 +273,21 @@ fn a_wrong_password_an_unknown_email_and_a_note_all_answer_as_the_design_says() 
     let (status, _) = backend.post(account::LIST_DEVICES, Some(&again.session), list.bytes());
     assert_eq!(status, 200);
 
-    // Signing out with the note alone, no session shown (section 11): it ends that session only.
+    // A note with the wrong secret for a live session: "that session has ended", with no
+    // receipt, and the session is not ended (the review of S8, B1).
+    let forged = account::SignOutNote { session: again.sign_out.session, secret: account::SignOutSecret::from_bytes([0x5a; 32]) };
+    let out = account::encode(&SignOut { head: speaks(pc.restore), request_id: RequestId::new(2).unwrap(), revoke: Some(forged) }).unwrap();
+    let (forged_status, forged_body) = backend.post(account::SIGN_OUT, None, out.bytes());
+    assert_eq!(forged_status, 401);
+    assert_eq!(refusal(account::read_reply::<account::SignedOut>(forged_status, &forged_body).unwrap()), Refusal::NotSignedIn(NotSignedIn::SessionEnded));
+    let (status, _) = backend.post(account::LIST_DEVICES, Some(&again.session), list.bytes());
+    assert_eq!(status, 200);
+
+    // Signing out with the note alone, no session shown (section 11): it ends that session only,
+    // and the answer is the very same bytes as the forged note's: nothing of the account.
     let out = account::encode(&SignOut { head: speaks(pc.restore), request_id: RequestId::new(2).unwrap(), revoke: Some(again.sign_out) }).unwrap();
     let (status, body) = backend.post(account::SIGN_OUT, None, out.bytes());
-    assert!(matches!(account::read_reply::<account::SignedOut>(status, &body).unwrap(), Reply::Done { .. }), "{status}");
+    assert_eq!((status, &body), (forged_status, &forged_body));
     let (status, _) = backend.post(account::LIST_DEVICES, Some(&again.session), list.bytes());
     assert_eq!(status, 401);
     let (status, _) = backend.post(account::LIST_DEVICES, Some(&pc.session), list.bytes());
@@ -451,4 +467,152 @@ fn a_guess_inside_the_wait_is_told_to_come_back_and_a_changed_password_ends_the_
     };
     let (status, body) = backend.post(account::CHANGE_PASSWORD, Some(&pc_again.session), account::encode(&change).unwrap().bytes());
     assert_eq!(refusal(account::read_reply::<account::PasswordChanged>(status, &body).unwrap()), Refusal::NotAllowed(NotAllowed::PasswordNotAllowed));
+}
+
+#[test]
+fn the_admin_page_signs_in_from_its_own_origin_only_and_is_handed_no_music_login() {
+    const PAGE: &str = "https://nexus.example.test";
+    let folders = Folders::new("page");
+    let port = free_port();
+    let mut settings = folders.settings(port);
+    settings.push(("NEXUS_PUBLIC_ORIGIN", PAGE.into()));
+    let code = set_up(&settings, EMAIL);
+    let backend = Serving::start(&settings, port);
+    let (status, body) = backend.post(account::SIGN_IN, None, &sign_in(Credential::Code { code, new_password: Password::new(PASSWORD).unwrap() }, 1, "Robin's PC", DeviceKind::Pc));
+    signed_in(status, &body);
+    // 7.3: the page's sign-in, from its own origin, marked, as JSON.
+    let page = format!("Origin: {PAGE}\r\nX-Nexus-Admin: 1\r\n");
+    let (status, body) = backend.post_with(account::SIGN_IN, None, &page, &sign_in(with_password(EMAIL, PASSWORD), 7, "Nexus admin browser", DeviceKind::Pc));
+    let signed = signed_in(status, &body);
+    assert!(signed.person.admin);
+    assert_eq!(signed.music, MusicLoginResult::NoneSetYet);
+    // From anywhere else, or unmarked, or doubled: refused before anything is checked.
+    for other in [
+        "Origin: https://other.example.test\r\nX-Nexus-Admin: 1\r\n",
+        "Origin: https://nexus.example.test:8443\r\nX-Nexus-Admin: 1\r\n",
+        "Origin: http://nexus.example.test\r\nX-Nexus-Admin: 1\r\n",
+        "Origin: https://nexus.example.test\r\n",
+        "X-Nexus-Admin: 1\r\n",
+        "Origin: https://nexus.example.test\r\nX-Nexus-Admin: 1\r\nX-Nexus-Admin: 1\r\n",
+    ] {
+        let (status, _) = backend.post_with(account::SIGN_IN, None, other, &sign_in(with_password(EMAIL, PASSWORD), 7, "Nexus admin browser", DeviceKind::Pc));
+        assert_eq!(status, 400, "{other}");
+    }
+    // The page's session works for a session's calls from the page too.
+    assert_eq!(backend.post_with(account::LIST_DEVICES, Some(&signed.session), &page, account::encode(&ListDevices { head: speaks(signed.restore), after: None }).unwrap().bytes()).0, 200);
+    drop(backend);
+    // With NEXUS_PUBLIC_ORIGIN unset, the page cannot sign in at all, and the log says so.
+    let plain = folders.settings(port);
+    let mut backend = Serving::start(&plain, port);
+    let (status, _) = backend.post_with(account::SIGN_IN, None, &page, &sign_in(with_password(EMAIL, PASSWORD), 7, "Nexus admin browser", DeviceKind::Pc));
+    assert_eq!(status, 400);
+    assert!(backend.stop().contains("NEXUS_PUBLIC_ORIGIN is not given"));
+}
+
+/// What S8b asked of S8 (bulletin 14:10): 8.3's "one answer, the same work" over HTTP, for a
+/// wrong password on an account switched on, an email with no account, and a wrong password
+/// on an account switched off, interleaved, each account with its own salt. Run by hand:
+/// `cargo test --manifest-path server/Cargo.toml --test signin -- --ignored --nocapture three`.
+#[test]
+#[ignore]
+fn three_kinds_of_wrong_login_take_about_the_same_time_and_say_the_same_bytes() {
+    use nexus_core::nexus::account::{GrantSecret, RequestId};
+    use nexus_core::nexus::kept::{AdminAction, Bearer, Fingerprint, GrantIntent, GrantUse, LeaveFor};
+    use nexus_music_server::store::keeper::Keeper;
+    const ON: usize = 6;
+    const OFF: usize = 6;
+    const ROUNDS: usize = 3;
+    let folders = Folders::new("a1-three");
+    let port = free_port();
+    let settings = folders.settings(port);
+    let mut codes = Vec::new();
+    for n in 0..ON + OFF + 1 {
+        let email = format!("listener-{n}@example.org");
+        let output = program(&settings, &["recover", &email]).output().unwrap();
+        let said = String::from_utf8_lossy(&output.stdout).to_string();
+        let at = said.find("one-time code ").unwrap() + "one-time code ".len();
+        codes.push((email, said[at..at + 13].replace('-', "")));
+    }
+    let mut backend = Serving::start(&settings, port);
+    let mut signed = Vec::new();
+    for (n, (_, code)) in codes.iter().enumerate() {
+        let password = format!("{PASSWORD} number {n}");
+        // The code's door takes ten a second in all (8.3).
+        std::thread::sleep(Duration::from_millis(150));
+        let (status, body) = backend.post(account::SIGN_IN, None, &sign_in(Credential::Code { code: OneTimeCode::new(code).unwrap(), new_password: Password::new(&password).unwrap() }, n as u8 + 10, "A PC", DeviceKind::Pc));
+        signed.push(signed_in(status, &body));
+    }
+    backend.stop();
+    // The last account, an admin's, switches OFF of the others off, through kept's own
+    // decisions (the admin's calls are not routed yet): a grant for each change, then the change.
+    {
+        let state = folders.root.join("state");
+        let data = folders.root.join("data");
+        let (mut keeper, _) = Keeper::open(&state, &data, now_ms()).unwrap();
+        let admin = signed.last().unwrap();
+        let number = admin.person.id.get();
+        let hash = Fingerprint::of(admin.session.expose_bytes());
+        for (n, target) in signed.iter().enumerate().skip(ON).take(OFF) {
+            let now = now_ms();
+            let request_id = RequestId::new(100 + n as u64).unwrap();
+            let stored = keeper.data().password(number).unwrap().unwrap();
+            let expected = Fingerprint::from_bytes(stored.hash);
+            let named = keeper.load(target.person.id.get()).unwrap().state().admin_target();
+            let intent = GrantIntent { request_id, change: LeaveFor::Admin { action: AdminAction::SetOn(false), target: named.clone() } };
+            let mut actor = keeper.load(number).unwrap();
+            let (restore, clock) = (keeper.restore(), keeper.clock(now));
+            let check = actor
+                .request(restore, clock, |turn| turn.check_leave(Bearer { device: admin.device, hash: &hash, grant: None }, intent, expected.clone()))
+                .apply(|effects| keeper.persist(effects, &[], now))
+                .unwrap()
+                .unwrap();
+            // The check proper is Argon2id's; here the stored output stands for it.
+            let receipt = check.check(expected, keeper.clock(now)).unwrap();
+            let grant = GrantSecret::from_bytes([n as u8; 32]);
+            actor.request(restore, keeper.clock(now), |turn| turn.grant_leave(receipt, &grant)).apply(|effects| keeper.persist(effects, &[], now)).unwrap().unwrap();
+            let mut other = keeper.load(target.person.id.get()).unwrap();
+            actor
+                .request(restore, keeper.clock(now), |turn| {
+                    turn.administer(Bearer { device: admin.device, hash: &hash, grant: Some(GrantUse { request_id, secret: &grant }) }, AdminAction::SetOn(false), named, Some(&mut other))
+                })
+                .apply(|effects| keeper.persist(effects, &[], now))
+                .unwrap()
+                .unwrap();
+        }
+        keeper.close();
+    }
+    let backend = Serving::start(&settings, port);
+    let (mut on, mut unknown, mut off) = (Vec::new(), Vec::new(), Vec::new());
+    let mut answers = std::collections::BTreeSet::new();
+    let mut stranger = 0;
+    let mut timed = |email: &str, into: &mut Vec<f64>, answers: &mut std::collections::BTreeSet<Vec<u8>>| {
+        let started = Instant::now();
+        let (status, body) = backend.post(account::SIGN_IN, None, &sign_in(with_password(email, "a guess that is not it"), 200, "A stranger", DeviceKind::Pc));
+        into.push(started.elapsed().as_secs_f64() * 1000.0);
+        assert_eq!(status, 403);
+        answers.insert(body);
+    };
+    for round in 0..ROUNDS {
+        for n in 0..ON {
+            timed(&codes[n].0, &mut on, &mut answers);
+            stranger += 1;
+            timed(&format!("stranger-{stranger}@example.org"), &mut unknown, &mut answers);
+            timed(&codes[ON + n].0, &mut off, &mut answers);
+        }
+        std::thread::sleep(Duration::from_millis(1100 << round));
+    }
+    assert_eq!(answers.len(), 1, "the three are not one answer");
+    let summary = |name: &str, samples: &mut Vec<f64>| {
+        samples.sort_by(f64::total_cmp);
+        let median = samples[samples.len() / 2];
+        println!("{name}: n {} median {median:.1} ms mean {:.1} ms min {:.1} max {:.1}", samples.len(), samples.iter().sum::<f64>() / samples.len() as f64, samples[0], samples[samples.len() - 1]);
+        median
+    };
+    let medians = [summary("wrong password, switched on", &mut on), summary("unknown email", &mut unknown), summary("wrong password, switched off", &mut off)];
+    let (low, high) = (medians.iter().copied().fold(f64::MAX, f64::min), medians.iter().copied().fold(0.0, f64::max));
+    assert!(high - low < high * 0.5, "{medians:?}");
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64
 }
