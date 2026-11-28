@@ -303,15 +303,98 @@ impl Value for Call {
 pub enum Change {
     Request { offer: OfferName },
     AddArtist { artist: MusicBrainzId },
-    AddWanting { offers: Vec<OfferName> },
-    Want { artist: LidarrNumber, albums: Vec<LidarrNumber> },
-    ListSingles { artist: LidarrNumber, offer: OfferName },
+    AddWanting { artist: MusicBrainzId, offers: Vec<OfferName> },
+    Want {
+        #[serde(deserialize_with = "object")]
+        artist: ArtistTarget,
+        #[serde(deserialize_with = "objects")]
+        albums: Vec<AlbumTarget>,
+    },
+    ListSingles {
+        #[serde(deserialize_with = "object")]
+        artist: ArtistTarget,
+        offer: OfferName,
+    },
     Cancel { album: LidarrNumber, release: MusicBrainzId },
     Batch {
         singles: bool,
         #[serde(deserialize_with = "objects")]
         lines: Vec<BatchLine>,
     },
+}
+
+/// The artist the person saw, by its two independent identities.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtistTarget {
+    pub id: LidarrNumber,
+    pub artist: MusicBrainzId,
+}
+
+impl ArtistTarget {
+    /// Pass the live number returned by `known_artist(self.artist.as_str())`.
+    /// Do this again at execution, under the same mutation turn as the effect.
+    pub fn check_current(&self, current: Option<i64>) -> Result<(), Refusal> {
+        if current == Some(self.id.get()) { Ok(()) } else { Err(Refusal::SearchAgain) }
+    }
+}
+
+/// An album from the selected artist's list, with the release-group ID the
+/// person saw beside Lidarr's number.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlbumTarget {
+    pub id: LidarrNumber,
+    pub release: MusicBrainzId,
+}
+
+impl AlbumTarget {
+    /// `rows` must come from the confirmed artist's list or the same artist's
+    /// saved, session-owned offers. Two rows claiming the number are ambiguous.
+    pub fn check_current<T: ListedTarget>(&self, rows: &[T]) -> Result<(), Refusal> {
+        let mut numbered = rows.iter().filter(|row| row.number() == self.id.get());
+        if numbered.next().is_some_and(|row| row.release_id() == self.release.as_str()) && numbered.next().is_none() {
+            Ok(())
+        } else {
+            Err(Refusal::NoLongerListed)
+        }
+    }
+}
+
+/// Allows the same check against a session's displayed rows and Lidarr's live rows.
+pub trait ListedTarget {
+    fn number(&self) -> i64;
+    fn release_id(&self) -> &str;
+}
+
+impl ListedTarget for ListedView {
+    fn number(&self) -> i64 { self.id.get() }
+    fn release_id(&self) -> &str { self.album.as_str() }
+}
+
+impl ListedTarget for Listed {
+    fn number(&self) -> i64 { self.id }
+    fn release_id(&self) -> &str { &self.album }
+}
+
+/// All selected names must be resolved in the requesting session's offer book,
+/// in input order. Run this again against the durable plan before adding.
+pub fn check_add_wanting(artist: &MusicBrainzId, selected: &[OfferName], offers: &[AlbumView]) -> Result<(), Refusal> {
+    if !selected.is_empty() && selected.len() == offers.len()
+        && selected.iter().zip(offers).all(|(name, offer)| *name == offer.album && offer.artist_id.as_ref() == Some(artist))
+    {
+        Ok(())
+    } else {
+        Err(Refusal::SearchAgain)
+    }
+}
+
+pub fn check_list_singles(
+    artist: &ArtistTarget,
+    selected: &OfferName,
+    offer: &AlbumView,
+    current: Option<i64>,
+) -> Result<(), Refusal> {
+    check_add_wanting(&artist.artist, std::slice::from_ref(selected), std::slice::from_ref(offer))?;
+    artist.check_current(current)
 }
 
 /// A playlist line is deliberately just three names. It goes through bulk's lookup
@@ -378,13 +461,15 @@ impl Change {
         // the design does not say whether to accept an empty change or repeated selections.
         // Refuse both. The batch preserves repeated lines, which can name the same song.
         match self {
-            Self::AddWanting { offers } => {
+            Self::AddWanting { offers, .. } => {
                 within(offers.len(), CHANGE_MAX_RELEASES)?;
                 require(!offers.is_empty() && unique(offers))
             }
             Self::Want { albums, .. } => {
                 within(albums.len(), CHANGE_MAX_RELEASES)?;
-                require(!albums.is_empty() && unique(albums))
+                require(!albums.is_empty()
+                    && unique(&albums.iter().map(|album| album.id).collect::<Vec<_>>())
+                    && unique(&albums.iter().map(|album| &album.release).collect::<Vec<_>>()))
             }
             Self::Batch { lines, .. } => {
                 within(lines.len(), BATCH_MAX_LINES)?;
@@ -1843,6 +1928,26 @@ mod tests {
         assert!(read_reply(200, body.bytes()).is_err());
     }
 
+    fn artist_target() -> ArtistTarget { ArtistTarget { id: one(), artist: id(1) } }
+    fn album_target() -> AlbumTarget { AlbumTarget { id: one(), release: id(2) } }
+
+    #[test]
+    fn changing_lidarr_checks_the_offered_release_and_the_live_artist() {
+        let offer = album(2);
+        let selected = [OfferName(id(2))];
+        assert_eq!(check_add_wanting(&id(1), &selected, std::slice::from_ref(&offer)), Ok(()));
+        assert_eq!(check_add_wanting(&id(3), &selected, std::slice::from_ref(&offer)), Err(Refusal::SearchAgain));
+        assert_eq!(check_add_wanting(&id(1), &[OfferName(id(7))], std::slice::from_ref(&offer)), Err(Refusal::SearchAgain));
+        assert_eq!(check_list_singles(&artist_target(), &selected[0], &offer, Some(1)), Ok(()));
+        assert_eq!(check_list_singles(&artist_target(), &selected[0], &offer, Some(9)), Err(Refusal::SearchAgain));
+
+        let current = Listed { id: 1, album: id(2).into(), ..Listed::default() };
+        assert_eq!(album_target().check_current(std::slice::from_ref(&current)), Ok(()));
+        let stale = Listed { album: id(7).into(), ..current.clone() };
+        assert_eq!(album_target().check_current(std::slice::from_ref(&stale)), Err(Refusal::NoLongerListed));
+        assert_eq!(album_target().check_current(&[current, stale]), Err(Refusal::NoLongerListed));
+    }
+
     #[test]
     fn every_call_round_trips_in_the_account_head() {
         let search = Search::new("Étoiles et Poussière").unwrap();
@@ -1851,9 +1956,9 @@ mod tests {
         let changes = [
             Change::Request { offer: offer.clone() },
             Change::AddArtist { artist: id(1) },
-            Change::AddWanting { offers: vec![offer.clone()] },
-            Change::Want { artist: one(), albums: vec![one()] },
-            Change::ListSingles { artist: one(), offer },
+            Change::AddWanting { artist: id(1), offers: vec![offer.clone()] },
+            Change::Want { artist: artist_target(), albums: vec![album_target()] },
+            Change::ListSingles { artist: artist_target(), offer },
             Change::Cancel { album: one(), release: id(2) },
             Change::Batch { singles: true, lines: vec![line] },
         ];
@@ -2033,8 +2138,8 @@ mod tests {
         assert_eq!(change(Change::Batch { singles: true, lines: vec![BatchLine { album: "a".repeat(SEARCH_MAX_CHARS + 1), ..line.clone() }] }), Err(WireError::Bounds));
         assert_eq!(change(Change::Batch { singles: true, lines: vec![BatchLine { album: "(mix) lidarr:7".into(), ..line.clone() }] }), Err(WireError::Bounds));
         assert_eq!(change(Change::Batch { singles: true, lines: vec![BatchLine { artist: "a".repeat(SEARCH_MAX_CHARS + 1), ..line }] }), Err(WireError::Bounds));
-        assert_eq!(change(Change::Want { artist: one(), albums: vec![one(); 2] }), Err(WireError::Bounds));
-        assert_eq!(change(Change::AddWanting { offers: vec![] }), Err(WireError::Bounds));
+        assert_eq!(change(Change::Want { artist: artist_target(), albums: vec![album_target(); 2] }), Err(WireError::Bounds));
+        assert_eq!(change(Change::AddWanting { artist: id(1), offers: vec![] }), Err(WireError::Bounds));
         assert_eq!(cursor(LIST_MAX_ITEMS as u32), None);
     }
 

@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde::de::DeserializeOwned;
 
 use crate::http::{Failure, Http, Method, Request, STOPPED};
@@ -223,6 +223,12 @@ pub trait WayBack {
     /// acted on at the Lidarr it was written for: an artist's number on another means another
     /// artist.
     fn keep(&self, lidarr: &str, artist: i64, before: &str) -> Result<bool, String>;
+    /// Journal the exact releases selected for an existing artist, immediately
+    /// before the album monitor write. If this fails, that write and its search
+    /// are withheld. The artist settings may already have been updated.
+    fn before_artist_albums(&self, _added: &AddedArtist) -> Result<(), String> {
+        Ok(())
+    }
     /// `artist`'s setting on the Lidarr at `lidarr` has gone back to `before`: the way back
     /// this step wrote is crossed off.
     fn put_back(&self, lidarr: &str, artist: i64, before: &str);
@@ -277,6 +283,25 @@ pub struct Pending {
     /// How far along, from 0 to 100, if it's being downloaded; `None` while it's still
     /// being looked for.
     pub progress: Option<u8>,
+}
+
+/// The explicit monitor write selected these releases. The offer uses the artist
+/// ID from the artist lookup, even when Lidarr omitted its nested artist record.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NewlyMarked {
+    pub number: i64,
+    pub offer: Offer,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AddedArtist {
+    pub number: i64,
+    pub artist: String,
+    /// Lidarr accepted a new artist and will learn its discography asynchronously.
+    /// Its response named no releases, so there is nothing to attribute yet.
+    pub learning: bool,
+    /// One row for each distinct release selected in the explicit monitor write.
+    pub newly_marked: Vec<NewlyMarked>,
 }
 
 #[derive(Deserialize, Default)]
@@ -789,19 +814,19 @@ impl Lidarr {
     }
 
     /// Has Lidarr keep track of an artist: every album of theirs goes on its list, and new
-    /// ones will as they come out. Returns how many albums that put on the list. Seen through
-    /// once it has changed anything, as `request` is, and one step at a time with every other
+    /// ones will as they come out. Returns the exact releases explicitly marked.
+    /// Seen through once it has changed anything, as `request` is, and one step at a time with every other
     /// change to an artist's record (`WayBack::turn`): it reads the record and writes it back.
-    pub fn add_artist(&self, artist: &str, name: &str, way_back: &dyn WayBack) -> Result<usize, String> {
+    pub fn add_artist(&self, artist: &str, name: &str, way_back: &dyn WayBack) -> Result<AddedArtist, String> {
         self.seeing_through().adding_artist(artist, name, way_back)
     }
 
-    fn adding_artist(&self, artist: &str, name: &str, way_back: &dyn WayBack) -> Result<usize, String> {
+    fn adding_artist(&self, artist: &str, name: &str, way_back: &dyn WayBack) -> Result<AddedArtist, String> {
         let _turn = way_back.turn();
         let Some((known, _)) = self.known_artist(artist)? else {
             let folders: Vec<RootFolder> = self.get("rootfolder")?;
             let folder = folders.first().ok_or(NO_MUSIC_FOLDER)?;
-            let _: ArtistRes = self.send(
+            let added: ArtistRes = self.send(
                 "POST",
                 "artist",
                 Some(serde_json::json!({
@@ -816,21 +841,36 @@ impl Lidarr {
                 })),
             )?;
             // Lidarr learns their albums in its own time; how many isn't known yet.
-            return Ok(0);
+            return Ok(AddedArtist { number: added.id, artist: artist.to_owned(), learning: true, newly_marked: Vec::new() });
         };
         let mut record: serde_json::Value = self.get(&format!("artist/{known}"))?;
         record["monitored"] = true.into();
         record["monitorNewItems"] = "all".into();
         let _: serde_json::Value = self.send("PUT", &format!("artist/{known}"), Some(record))?;
         let albums: Vec<AlbumRes> = self.get(&format!("album?artistId={known}"))?;
-        let wanted: Vec<i64> =
-            albums.iter().filter(|album| !album.monitored && album.statistics.track_file_count == 0).map(|album| album.id).collect();
+        let selected: Vec<_> = albums.into_iter()
+            .filter(|album| !album.monitored && album.statistics.track_file_count == 0)
+            .collect();
+        let wanted: Vec<_> = selected.iter().map(|album| album.id).collect();
+        let mut seen = HashSet::new();
+        let newly_marked = selected.into_iter().filter_map(|album| {
+            if album.id <= 0 || album.foreign_album_id.is_empty() || !seen.insert(album.foreign_album_id.clone()) {
+                return None;
+            }
+            let number = album.id;
+            let mut offer = offer(album);
+            offer.artist_id = artist.to_owned();
+            offer.artist = name.to_owned();
+            Some(NewlyMarked { number, offer })
+        }).collect();
+        let added = AddedArtist { number: known, artist: artist.to_owned(), learning: false, newly_marked };
         if !wanted.is_empty() {
+            way_back.before_artist_albums(&added)?;
             let _: serde_json::Value =
                 self.send("PUT", "album/monitor", Some(serde_json::json!({ "albumIds": wanted, "monitored": true })))?;
         }
         let _: serde_json::Value = self.send("POST", "command", Some(serde_json::json!({ "name": "ArtistSearch", "artistId": known })))?;
-        Ok(wanted.len())
+        Ok(added)
     }
 
     /// Puts an album (or an EP, or a single) on Lidarr's list and has Lidarr start looking
@@ -1308,7 +1348,7 @@ impl RequestLidarr for Lidarr {
     }
 
     fn add_artist(&self, artist: &str, name: &str, way_back: &dyn WayBack) -> Result<usize, String> {
-        Lidarr::add_artist(self, artist, name, way_back)
+        Lidarr::add_artist(self, artist, name, way_back).map(|added| added.newly_marked.len())
     }
 
     fn request(&self, wanted: &Offer, way_back: &dyn WayBack) -> Result<(), String> {
