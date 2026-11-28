@@ -1,0 +1,129 @@
+//! What signing in reads from the data, and nothing else: read-only SQL over the data's one
+//! connection, on the thread that writes, between steps (19.3: a read is short, and never
+//! held open while anything is written to a socket). The form is S3's (`store::data`).
+
+use nexus_core::nexus::account::{DeviceId, DeviceKind, Name, SessionId};
+use nexus_core::nexus::proto::Version;
+use rusqlite::{Connection, OptionalExtension, params};
+
+fn signed(value: u64) -> rusqlite::Result<i64> {
+    i64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, i64::MAX))
+}
+
+fn unsigned(value: i64) -> rusqlite::Result<u64> {
+    u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, value))
+}
+
+fn bytes32(row: &rusqlite::Row<'_>, at: usize) -> rusqlite::Result<[u8; 32]> {
+    let bytes: Vec<u8> = row.get(at)?;
+    bytes.try_into().map_err(|_| rusqlite::Error::InvalidColumnType(at, "fingerprint".into(), rusqlite::types::Type::Blob))
+}
+
+/// Whose a session is, found by its fingerprint: (account, device).
+pub fn session_by_hash(data: &Connection, hash: &[u8; 32]) -> rusqlite::Result<Option<(u64, DeviceId)>> {
+    data.query_row(
+        "SELECT devices.account, devices.id FROM sessions JOIN devices ON devices.id = sessions.device WHERE sessions.hash = ?1",
+        [hash.as_slice()],
+        |row| Ok((unsigned(row.get(0)?)?, unsigned(row.get(1)?)?)),
+    )
+    .optional()
+    .map(|found| found.and_then(|(account, device)| Some((account, DeviceId::new(device)?))))
+}
+
+/// A session found by its id: (account, device, its fingerprint, the fingerprint of the
+/// secret that can only end it, if one was given).
+pub type ById = (u64, DeviceId, [u8; 32], Option<[u8; 32]>);
+
+pub fn session_by_id(data: &Connection, id: SessionId) -> rusqlite::Result<Option<ById>> {
+    data.query_row(
+        "SELECT devices.account, devices.id, sessions.hash, sessions.revoke FROM sessions JOIN devices ON devices.id = sessions.device WHERE sessions.id = ?1",
+        [signed(id.get())?],
+        |row| {
+            let revoke: Option<Vec<u8>> = row.get(3)?;
+            let revoke = match revoke {
+                None => None,
+                Some(bytes) => Some(bytes.try_into().map_err(|_| rusqlite::Error::InvalidColumnType(3, "revoke".into(), rusqlite::types::Type::Blob))?),
+            };
+            Ok((unsigned(row.get(0)?)?, unsigned(row.get(1)?)?, bytes32(row, 2)?, revoke))
+        },
+    )
+    .optional()
+    .map(|found| found.and_then(|(account, device, hash, revoke)| Some((account, DeviceId::new(device)?, hash, revoke))))
+}
+
+/// The other accounts on which a device with this secret's fingerprint has a session now
+/// (8.6: a sign-in to one account ends the session the device had on another).
+pub fn other_accounts_signed_in(data: &Connection, secret: &[u8; 32], account: u64) -> rusqlite::Result<Vec<u64>> {
+    let mut statement = data.prepare(
+        "SELECT DISTINCT devices.account FROM devices JOIN sessions ON sessions.device = devices.id WHERE devices.secret = ?1 AND devices.account != ?2",
+    )?;
+    let found = statement.query_map(params![secret.as_slice(), signed(account)?], |row| unsigned(row.get(0)?))?;
+    found.collect()
+}
+
+/// A one-time code, found by its keyed fingerprint: (account, the code's number, until when).
+pub fn code(data: &Connection, print: &[u8; 32]) -> rusqlite::Result<Option<(u64, u64, u64)>> {
+    data.query_row("SELECT account, number, until FROM codes WHERE code = ?1", [print.as_slice()], |row| {
+        Ok((unsigned(row.get(0)?)?, unsigned(row.get(1)?)?, unsigned(row.get(2)?)?))
+    })
+    .optional()
+}
+
+/// The name an account is shown by.
+pub fn shown(data: &Connection, account: u64) -> rusqlite::Result<Option<String>> {
+    data.query_row("SELECT shown FROM accounts WHERE number = ?1", [signed(account)?], |row| row.get(0)).optional()
+}
+
+/// The accounts that are an admin's and switched on.
+pub fn admins(data: &Connection) -> rusqlite::Result<u64> {
+    data.query_row("SELECT count(*) FROM accounts WHERE admin = 1 AND status = 'on'", [], |row| unsigned(row.get(0)?))
+}
+
+/// One device of an account, as its person's list shows it (8.7).
+#[derive(Debug, Clone)]
+pub struct Listed {
+    pub id: DeviceId,
+    pub name: Name,
+    pub kind: DeviceKind,
+    pub version: Version,
+    pub last_seen: u64,
+    pub session: Option<SessionId>,
+}
+
+/// An account's devices in id order, after `after`, at most `limit`, and whether there are more.
+pub fn devices(data: &Connection, account: u64, after: Option<DeviceId>, limit: usize) -> rusqlite::Result<(Vec<Listed>, bool)> {
+    let mut statement = data.prepare(
+        "SELECT devices.id, devices.name, devices.kind, devices.version, max(devices.first_signed_in, coalesce(devices.last_heard, 0)), sessions.id
+         FROM devices LEFT JOIN sessions ON sessions.device = devices.id WHERE devices.account = ?1 AND devices.id > ?2 ORDER BY devices.id LIMIT ?3",
+    )?;
+    let after = signed(after.map_or(0, DeviceId::get))?;
+    let take = signed(limit as u64 + 1)?;
+    let mut listed = Vec::new();
+    let rows = statement.query_map(params![signed(account)?, after, take], |row| {
+        Ok((
+            unsigned(row.get(0)?)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            unsigned(row.get(4)?)?,
+            row.get::<_, Option<i64>>(5)?.map(unsigned).transpose()?,
+        ))
+    })?;
+    for row in rows {
+        let (id, name, kind, version, last_seen, session) = row?;
+        // A row whose description is not one the backend would have written is shown with a
+        // stand-in rather than dropped, so that it can still be forced out.
+        let Some(id) = DeviceId::new(id) else { continue };
+        listed.push(Listed {
+            id,
+            name: Name::new(&name).unwrap_or_else(|| Name::new("A device").expect("a fixed name is a name")),
+            kind: if kind == "phone" { DeviceKind::Phone } else { DeviceKind::Pc },
+            version: Version::parse(&version).unwrap_or_else(|| Version::parse("0.0.0").expect("a fixed version is a version")),
+            last_seen,
+            session: session.and_then(SessionId::new),
+        });
+    }
+    let more = listed.len() > limit;
+    listed.truncate(limit);
+    Ok((listed, more))
+}
