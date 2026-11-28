@@ -51,6 +51,15 @@ impl Clock {
     pub fn effective(self) -> u64 {
         self.mark().max(self.floor)
     }
+
+    /// Keep the time of a clock-only decision, such as rejecting a code before
+    /// its account is loaded. Judge at `effective()` and persist these effects.
+    pub fn observation_effects(self) -> Effects {
+        Effects {
+            high_water: self.mark(),
+            updates: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -365,10 +374,7 @@ impl Account {
         operation: impl FnOnce(Turn<'_>) -> Result<T, Denied>,
     ) -> Decision<Result<T, Denied>> {
         let now = clock.effective();
-        let mut effects = Effects {
-            high_water: clock.mark(),
-            updates: Vec::new(),
-        };
+        let mut effects = clock.observation_effects();
         let answer = if restore != self.state.restore {
             Err(Denied::StartAgain)
         } else {
@@ -602,10 +608,7 @@ impl Account {
         mode: RestoreMode,
         clock: Clock,
     ) -> Decision<Result<(), Denied>> {
-        let mut effects = Effects {
-            high_water: clock.mark(),
-            updates: Vec::new(),
-        };
+        let mut effects = clock.observation_effects();
         let answer = Self::restore_update(apart, data, new_restore, mode)
             .map(|update| effects.updates.extend(update));
         Decision { effects, answer }

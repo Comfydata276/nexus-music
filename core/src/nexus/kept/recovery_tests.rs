@@ -1408,6 +1408,21 @@ fn reload_does_not_reopen_a_grant_that_expired_between_clock_writes() -> Result<
 }
 
 #[test]
+fn a_clock_only_code_judgement_keeps_the_observation_without_the_load_floor() {
+    let saved = 100_000;
+    let clock = Clock::after_load(saved + 1, saved);
+    assert_eq!(clock.effective(), saved + CLOCK_MARK_INTERVAL_MS);
+    let effects = clock.observation_effects();
+    assert!(effects.updates.is_empty());
+    assert_eq!(effects.high_water, saved + 1);
+    assert!(!effects.clock_mark_due(saved));
+
+    let next = clock.observe(saved + CLOCK_MARK_INTERVAL_MS);
+    assert!(next.observation_effects().clock_mark_due(saved));
+    assert_eq!(next.observe(0).effective(), next.effective());
+}
+
+#[test]
 fn ten_restarts_do_not_advance_the_saved_mark_even_with_row_writes() -> Result<(), Denied> {
     let mut s = Stored::new(state("alice@example.test"));
     let mut saved = 100_000;
