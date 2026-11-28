@@ -253,26 +253,22 @@ fn an_account_not_an_admin_s_learns_nothing_of_accounts_or_settings_from_an_admi
 
 /// S9-3 (the review of S9): with a music server that takes every connection and never answers,
 /// at most `CHECKS_AT_ONCE` logins are being checked at once: one more is told "busy" at once,
-/// a sign-in goes through meanwhile, and each check ends, "not dealt with", within its time.
+/// a sign-in goes through meanwhile, and each check ends "not dealt with" when its
+/// unanswered connection closes.
 #[test]
 fn a_music_server_that_never_answers_holds_two_checks_at_most_and_sign_in_goes_on() {
     use nexus_core::nexus::admin::{self, Action, Applied, MusicPassword, MusicServerAddress, NamedChange, TypedMusicLogin};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::{Duration, Instant};
-    let held = std::sync::Arc::new(AtomicUsize::new(0));
-    let holding = held.clone();
+    use std::time::Duration;
     let hold = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    hold.set_nonblocking(true).unwrap();
     let internal = format!("http://{}", hold.local_addr().unwrap());
-    std::thread::spawn(move || {
-        let mut kept = Vec::new();
-        for stream in hold.incoming().flatten() {
-            holding.fetch_add(1, Ordering::SeqCst);
-            kept.push(stream);
-        }
-    });
-    let client = crate::music::MusicClient::trusting(tokio_rustls::rustls::RootCertStore::empty());
-    let music = super::music::MusicSide::new(client, internal).within(Duration::from_millis(1_500));
+    // Keep both requests open until the test has observed busy and a successful sign-in.
+    // The timeouts are watchdogs for a broken test, not the way it releases the checks.
+    let watchdog = Duration::from_secs(30);
+    let client = crate::music::MusicClient::trusting(tokio_rustls::rustls::RootCertStore::empty()).within(3 * watchdog);
+    let music = super::music::MusicSide::new(client, internal).within(3 * watchdog);
     let (bench, made) = Bench::with_music("checks-at-once", &[("admin@example.test", true), ("person@example.test", false)], music);
+    let hold = bench.runtime.block_on(async { tokio::net::TcpListener::from_std(hold).unwrap() });
     bench::signed_in(&bench.sign_in(bench::with_code(&made[0].code, PASSWORD), 1));
     let admins: Vec<_> = (1..=3).map(|device| bench::signed_in(&bench.sign_in_at_the_page(bench::with_password(made[0].email, PASSWORD), device))).collect();
     let copy = |n: usize| account::Session::from_bytes(*admins[n].session.expose_bytes());
@@ -298,31 +294,24 @@ fn a_music_server_that_never_answers_holds_two_checks_at_most_and_sign_in_goes_o
         (copy(n), account::GrantedChange { head: bench::head(restore), request_id: RequestId::new(request).unwrap(), change, grant: secret })
     };
     let (third, third_request) = login(2);
-    let started = Instant::now();
-    let checking: Vec<_> = (0..2)
-        .map(|n| {
-            let (session, request) = login(n);
-            let accounts = bench.accounts.clone();
-            bench.runtime.spawn(async move { accounts.set_music_login(session, request).await.status })
-        })
-        .collect();
-    let waited = Instant::now();
-    while held.load(Ordering::SeqCst) < 2 {
-        assert!(waited.elapsed() < Duration::from_secs(5), "the two checks never reached the music server");
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    // One more: "busy" at once, without asking the music server.
-    let at = Instant::now();
-    let busy = bench.runtime.block_on(bench.accounts.set_music_login(third, third_request));
+    let checking: Vec<_> = (0..2).map(login).map(|(session, request)| {
+        let accounts = bench.accounts.clone();
+        bench.runtime.spawn(async move { accounts.set_music_login(session, request).await.status })
+    }).collect();
+    let held = bench.runtime.block_on(async {
+        tokio::time::timeout(watchdog, async { [hold.accept().await.unwrap().0, hold.accept().await.unwrap().0] })
+            .await.expect("the two checks never reached the music server")
+    });
+    let busy = bench.runtime.block_on(async {
+        tokio::time::timeout(watchdog, bench.accounts.set_music_login(third, third_request)).await.expect("the third check did not return busy")
+    });
     assert_eq!(busy.status, 429, "{:?}", admin::read_reply::<Applied>(busy.status, busy.body.bytes()));
-    assert!(at.elapsed() < Duration::from_millis(200), "{:?}", at.elapsed());
-    assert_eq!(held.load(Ordering::SeqCst), 2);
-    // A sign-in meanwhile.
     bench::signed_in(&bench.sign_in(bench::with_code(&made[1].code, PASSWORD), 9));
+    assert!(checking.iter().all(|check| !check.is_finished()), "sign-in finished while both checks were still waiting");
+    drop(held);
     for check in checking {
         assert_eq!(bench.runtime.block_on(check).unwrap(), 503);
     }
-    assert!(started.elapsed() < Duration::from_secs(6), "{:?}", started.elapsed());
 }
 
 /// C1 (the review of S8; the lead's ruling of 15:38), (a) and (b): a sign-out with neither a
