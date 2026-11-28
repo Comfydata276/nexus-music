@@ -12,34 +12,34 @@ fn this(kind: DeviceKind) -> &'static str {
     }
 }
 
-/// Whole minutes, rounded up, at least one.
-fn minutes(ms: u64) -> u64 {
-    (ms.saturating_add(59_999) / 60_000).max(1)
-}
-
-fn wait(ms: u64) -> String {
-    match minutes(ms) {
-        1 => "Too many tries. Wait a minute, then try again.".to_owned(),
-        n => format!("Too many tries. Wait {n} minutes, then try again."),
+/// "Busy, come back", with the seconds the backend said, if it said (8.3: a password may
+/// wait its turn; it is never refused for wrong ones before it).
+fn busy(seconds: u64) -> String {
+    match seconds {
+        0 => "Your Nexus server is busy. Try again in a moment.".to_owned(),
+        1 => "Your Nexus server is busy. Try again in a second.".to_owned(),
+        n => format!("Your Nexus server is busy. Try again in {n} seconds."),
     }
 }
 
-pub(super) fn sign_in(state: SignInState, kind: DeviceKind, wait_ms: u64) -> String {
+pub(super) fn sign_in(state: SignInState, kind: DeviceKind, wait_s: u64) -> String {
     match state {
-        SignInState::Idle | SignInState::Working => String::new(),
+        SignInState::Idle => String::new(),
+        // 8.3: a password may wait its turn, up to a minute after a wrong one.
+        SignInState::Working => "Signing in. When your Nexus server is busy this can take up to a minute.".to_owned(),
         SignInState::WrongLogin => "Wrong email or password.".to_owned(),
-        SignInState::TooManyTries => wait(wait_ms),
         SignInState::NeedsHttps => "Your Nexus server's address must start with https://.".to_owned(),
         SignInState::BadAddress => "That doesn't look like a server's address. Check it and try again.".to_owned(),
         SignInState::BadEmail => "That doesn't look like an email address.".to_owned(),
         SignInState::NoPassword => "Type your password.".to_owned(),
         SignInState::NoNexusServer => "There's no Nexus server at this address. Check it with whoever runs your server.".to_owned(),
         SignInState::CantReach => "Your Nexus server can't be reached. Check the address and your connection, then try again.".to_owned(),
+        SignInState::NotSecure => "A secure connection to this server couldn't be made. Check the address with whoever runs your server.".to_owned(),
         SignInState::NeedsPermission => {
             "Your Nexus server is on your home network. To reach it, allow Nexus Music to find and connect to nearby devices.".to_owned()
         }
         SignInState::AccountOff => "This account is switched off. Ask whoever runs your Nexus server.".to_owned(),
-        SignInState::Busy => "Your Nexus server is busy. Try again in a moment.".to_owned(),
+        SignInState::Busy => busy(wait_s),
         SignInState::AppTooOld => "This copy of Nexus Music is too old for your Nexus server. Update it. Your music plays as usual.".to_owned(),
         SignInState::ServerTooOld => "Your Nexus server is too old for this copy of Nexus Music. Ask whoever runs it to update it.".to_owned(),
         SignInState::Offline => "Offline mode is on. Turn it off to sign in.".to_owned(),
@@ -48,7 +48,9 @@ pub(super) fn sign_in(state: SignInState, kind: DeviceKind, wait_ms: u64) -> Str
         SignInState::PasswordNotAllowed => password_rule(),
         SignInState::SignedOut => format!("You're signed out on {}. Your downloads are still here.", this(kind)),
         SignInState::ForcedOut => format!("{} was signed out of Nexus Music. Sign in again to carry on. Your downloads are still here.", capital(this(kind))),
-        SignInState::StartAgain => "Your Nexus server was put back from a copy. Sign in again. Your music plays as usual.".to_owned(),
+        // Said both when the server's data was put back and when another server now answers
+        // at this address (7.1): either way, signing in again is what carries on.
+        SignInState::StartAgain => "Your Nexus server needs you to sign in again. Your music plays as usual.".to_owned(),
     }
 }
 
@@ -68,14 +70,14 @@ fn password_rule() -> String {
     )
 }
 
-pub(super) fn password(state: PasswordState, wait_ms: u64, offline: bool) -> String {
+pub(super) fn password(state: PasswordState, wait_s: u64, offline: bool) -> String {
     match state {
         PasswordState::Idle | PasswordState::Working => String::new(),
         PasswordState::Changed => "Your password is changed. Your other devices are signed out.".to_owned(),
         PasswordState::WrongCurrent => "That isn't your present password.".to_owned(),
         PasswordState::NotAllowed => password_rule(),
         PasswordState::Differ => "The two new passwords are not the same.".to_owned(),
-        PasswordState::TooManyTries => wait(wait_ms),
+        PasswordState::Busy => busy(wait_s),
         PasswordState::CantReach if offline => "Offline mode is on. Turn it off to change your password.".to_owned(),
         PasswordState::CantReach => "Your Nexus server can't be reached. Try again when it can.".to_owned(),
     }
@@ -87,6 +89,8 @@ pub(super) enum Row<'a> {
     Offline,
     TooOld,
     Connected,
+    Stranger,
+    NeedsPermission,
     SignedIn(&'a str),
     Down { since: String },
 }
@@ -97,6 +101,10 @@ pub(super) fn row(row: Row<'_>) -> String {
         Row::Offline => "Nexus server: not asked while Offline mode is on. Your music plays as usual.".to_owned(),
         Row::TooOld => "This copy of Nexus Music is too old for your Nexus server. Update it. Your music plays as usual.".to_owned(),
         Row::Connected => "Nexus server: connected".to_owned(),
+        Row::NeedsPermission => {
+            "Nexus server: on your home network. Allow Nexus Music to find and connect to nearby devices to reach it. Your music plays as usual.".to_owned()
+        }
+        Row::Stranger => "Nexus server: a different server answers at this address, so nothing is sent to it. Your music plays as usual.".to_owned(),
         Row::SignedIn(email) => format!("Nexus server: signed in as {email}"),
         Row::Down { since } => format!("Nexus server: not reachable since {since}. Your music plays as usual."),
     }
@@ -120,8 +128,12 @@ pub(super) enum Music {
     NoNewer,
     /// Refused, and nobody is signed in to renew it.
     SignInToRenew,
-    /// The account has no music login set.
+    /// The account has no music login set (9.4).
     NoneSet,
+    /// The backend has one and cannot use it just now (9.4).
+    UnusableNow,
+    /// The music server is on the home network and the phone lacks the permission (6.4).
+    NeedsPermission,
 }
 
 pub(super) fn music(music: Music) -> String {
@@ -135,7 +147,17 @@ pub(super) fn music(music: Music) -> String {
         }
         Music::SignInToRenew => "Your music sign-in needs renewing. Sign in to your Nexus server to renew it. What's downloaded plays meanwhile.".to_owned(),
         Music::NoneSet => "Your Nexus server has no music sign-in for you yet. Ask whoever runs it.".to_owned(),
+        Music::UnusableNow => "Your music sign-in can't be used just now. What's downloaded plays meanwhile.".to_owned(),
+        Music::NeedsPermission => {
+            "Your music server is on your home network. To reach it, allow Nexus Music to find and connect to nearby devices. What's downloaded plays meanwhile."
+                .to_owned()
+        }
     }
+}
+
+/// The car's short line while a login is set aside (6.3, in the design's words).
+pub(super) fn car() -> String {
+    "Online music is unavailable until your sign-in is renewed".to_owned()
 }
 
 /// How recently a device in the list was used.

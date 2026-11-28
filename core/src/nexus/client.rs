@@ -1,7 +1,7 @@
 //! One device's dealings with the Nexus server, as state and things to do (design 5.4, 5.5,
-//! section 6 and 22.3: slice C10). **No file is opened here**, and nothing here has a
-//! socket, a clock, a thread or a source of randomness: the app hands in the time and
-//! random bytes with each call, and is told what to do.
+//! section 6 and 22: slice C10; `backend-slice-notes.md`, "C10"). **No file is opened
+//! here**, and nothing here has a socket, a clock, a thread or a source of randomness: the
+//! app hands in the time and random bytes with each call, and is told what to do.
 //!
 //! **Each app drives it by the same four calls, in the same order** (5.5):
 //!
@@ -11,10 +11,10 @@
 //! 2. [`Client::happened`], whenever something does ([`Happened`]): a press, an answer, a
 //!    failure, the network, Offline, a tick, the music server refusing the login.
 //! 3. For each thing given back, **do** it. Each is one of a closed set ([`Do`]): **ask**
-//!    the backend this, **keep** this, **forget** this, **show** this, **hand** the player
-//!    this music login. Nothing else.
+//!    the backend this, **keep** this (whole), **forget** this, **show** this, **hand**
+//!    the player this. Nothing else.
 //! 4. [`Client::stop`], at the moment the account changes: nothing asked for the old one is
-//!    acted on afterwards (ruled: the fence on an account switch).
+//!    acted on afterwards (ruled: an account switch fences the old account's work).
 //!
 //! The phone reaches the same four calls through one entry point taking and giving JSON,
 //! [`Client::call_json`], as it reaches the rest of this library.
@@ -22,43 +22,59 @@
 //! **The rules of section 6 are held here, so that neither app can get one wrong:**
 //!
 //! - **Playing never waits.** There is no "hold the player" among the things to do. A kept
-//!   music login is handed over at `start` before any ask. A backend that is down, stalled
-//!   or saying "not signed in" never takes the login away, except when the backend says
-//!   this device was signed out (6.3: "it is meant to stop") or the person signs out here.
-//! - **A refused music login (6.3, as ruled):** the requests made with it stop at once
-//!   ([`Hand::Refused`]), what is on the device plays, and **one** refresh is asked for that
-//!   login's count, in the background. A refresh that is answered is never asked again for
-//!   the same count. One that went unanswered is asked again only when something says the
-//!   backend may be reachable now (the network back, Offline off, another answer arriving),
-//!   never on a timer and never in a loop. A new login, when it comes, is handed over at once,
-//!   so the car is never left on what is on the phone.
+//!   music login is handed over at `start` before any ask. A backend that is down, stalled,
+//!   saying something malformed or out of date never takes the login away. Only the
+//!   backend saying, to this session, that this session has ended does (6.3's table), and
+//!   the person signing out here.
+//! - **A refused music login (6.3, as ruled), one rule:** every part of the app that asks
+//!   the music server reports a refusal with the login's number; the first report for a
+//!   number sets it aside ([`Hand::Refused`]: begin no new request with it); **one renewal
+//!   for each number**, asked of the backend in the background; a login with a higher
+//!   number is handed over in one step, and what waited is tried once more under it;
+//!   nothing newer, and it stays set aside, renewed again only when the network comes back
+//!   or an answer says the number has moved. Never in a loop, never on a timer, and **it
+//!   never signs anyone out.**
 //! - **The session goes to the backend alone, the music login to the player alone.** Every
-//!   [`Ask`] is to the address the person typed, under `/nexus/api/`; the music login is in
-//!   no ask.
-//! - **The backend's address is the one a person typed**, never one made from the music
-//!   server's address (as ruled).
+//!   [`Ask`] is to the Nexus origin the person typed, under `/nexus/api/`; the music login is
+//!   in no ask.
+//! - **The Nexus origin is the one a person typed** (7.1), never one made from the music
+//!   server's address; **the backend's id is expected there**, and once signed in an answer
+//!   from another id is not the backend's: nothing more is sent, and the row says so.
 //! - **A redirect is never followed**, and is never an answer of the backend's.
-//! - **One ask is one request**, and an answer is taken once.
+//! - **One ask is one request**, and an answer is taken once. **Each try at signing in is
+//!   numbered** (its ask's id): only the latest try's answer is used (8.6).
 //! - **An answer for an ask no longer waited for is thrown away**: after `stop`, after a
-//!   sign-out or a sign-in, after Offline was switched on.
-//! - **Offline means nothing is asked.**
-//! - **Signing out is lasting on the device at once**, even with no network: the session is
-//!   forgotten, and the backend is told later from a separate thing kept ([`ToTell`]) (as
-//!   ruled). Being signed out by the backend forgets the session and the music login and
-//!   keeps everything a person keeps (downloads, settings: none of which this touches).
-//! - **"Start again"** (12.3, 12.4): the session is forgotten and the person signs in again;
-//!   the music login is kept, and plays.
+//!   sign-out or a sign-in, after Offline was switched on. A late answer for the first
+//!   account cannot touch the second (11).
+//! - **Offline means nothing is asked**, and nothing queued is sent: **THE APP CALLS
+//!   [`Client::waits_for`] IMMEDIATELY BEFORE IT SENDS EACH [`Ask`] AND DROPS IT IF THE
+//!   ANSWER IS NO.** `Offline(true)` and `stop` make it no for everything but a sign-out
+//!   being told.
+//! - **One `hello` each run before anything secret goes to an origin** (7.1): a session, a
+//!   device secret or a note goes only to the backend id expected there. Another id is sent
+//!   nothing, nothing is forgotten, the music plays on, and the person is asked to sign in.
+//! - **A tick alone asks nothing of the session.** A device learns it was signed out at its
+//!   next call carrying the session: at a start, the network coming back, Offline off, a
+//!   press (and from step 2, what it sends).
+//! - **What is kept is one thing, put in place in one step** (11): [`Keep::Saved`], whole.
+//! - **Signing out is lasting on the device at once**, with or without the backend: the
+//!   note that can end that one session is kept first ([`Note`], C7's revoke-only secret),
+//!   then the session and the music login are forgotten; the backend is told from the note
+//!   now if it can be, and again until its own backend says done or that the session is
+//!   gone, or it is 90 days old (11, as ruled). Notes are kept by the session they end.
+//! - **"The server's data was put back"** (12.3, 12.4): the session goes and the person
+//!   signs in again; the music login is kept, and plays.
 //!
 //! **What a person sees is decided here too** ([`Shown`]), in words this module owns, so the
 //! two apps say the same.
 //!
 //! The half that sends what was listened to (C8) and Diagnostics (C6) is a seam here: see
-//! [`Client::happened`] on [`Happened::Tick`]. Its tests are marked as owed.
+//! [`Happened::Tick`]. Its tests are marked as owed.
 
 use super::account::{
-    self, ChangePassword, Credential, DeviceId, DeviceKind, DevicePage, DeviceSecret, Email, ForceOut, ForcedOut, GetMusicLogin,
-    ListDevices, MusicLogin, Name, OneTimeCode, Password, PasswordChanged, Receipt, Refusal, Reply, RequestHead, Session, SignIn,
-    SignInAnswer, SignOut, SignedOut,
+    self, AccountId, ChangePassword, Credential, DeviceId, DeviceKind, DevicePage, DeviceSecret, Email, ForceOut, ForcedOut,
+    GetMusicLogin, ListDevices, MusicLogin, MusicLoginResult, Name, NexusOrigin, NotAllowed, NotSignedIn, OneTimeCode, Password,
+    PasswordChanged, Receipt, Refusal, Reply, RequestHead, Session, SessionId, SignIn, SignInAnswer, SignOut, SignOutNote, SignedOut,
 };
 use super::proto::{self, BackendId, Found, SPEAKS, Speaks, Version};
 use serde::Serialize;
@@ -66,6 +82,7 @@ use std::fmt;
 use zeroize::Zeroizing;
 
 mod json;
+mod machine;
 mod words;
 
 #[cfg(test)]
@@ -79,29 +96,30 @@ mod tests;
 // the design does not say. Chosen: a server that has not answered in this long is not one a
 // person is waiting for.
 pub const HELLO_WITHIN_MS: u64 = 10_000;
-/// How long signing in may take: the backend works passwords out two at a time with eight
-/// waiting (8.2), each a fraction of a second.
-// the design does not say. Chosen to cover a full queue on a slow machine.
-pub const SIGN_IN_WITHIN_MS: u64 = 30_000;
+/// How long signing in may take. A password may wait its turn at the backend (8.3): ten
+/// seconds in the queue, and up to a minute after a wrong password at its door.
+// the design does not say. Chosen to cover both, with room.
+pub const SIGN_IN_WITHIN_MS: u64 = 90_000;
 /// How long any other call may take.
 // the design does not say.
 pub const CALL_WITHIN_MS: u64 = 15_000;
-/// How often a signed-in device asks the backend whether its session still stands, while
-/// the app is running and Offline is off. The answer also carries the music login's count.
-// the design does not say how often a device asks in step 1, when nothing is being sent.
-// Chosen: rarely; every start, the network coming back and Offline going off ask too.
-pub const CHECK_EVERY_MS: u64 = 6 * 60 * 60 * 1000;
-/// How often the backend is told again of a sign-out it has not heard of yet, besides every
+/// How often the backend is told again of a sign-out it has not taken, besides every
 /// start, the network coming back and Offline going off.
 // the design does not say.
 pub const TELL_EVERY_MS: u64 = 60 * 60 * 1000;
+/// How long a [`Note`] is tried: the session it would end is gone by then anyway (8.7).
+pub const NOTE_LIFE_MS: u64 = account::SESSION_IDLE_MS;
+/// The most sign-outs waiting to be told at once, each keyed by the session it ends. When
+/// a fifth comes, the oldest expired goes first, else the oldest.
+pub const NOTES_MAX: usize = 4;
+/// The most a typed address or email is taken to be: longer is refused before anything is
+/// kept or shown of it.
+pub const TYPED_MAX_BYTES: usize = 1024;
 /// How often the app is to call `happened` with [`Happened::Tick`]. A tick sooner or later
 /// costs nothing: the machine keeps its own times.
 pub const TICK_MS: u64 = 60 * 1000;
 /// The most a `hello` answer may be (proto's own bound).
 pub const HELLO_MAX_BYTES: usize = proto::HELLO_MAX_BYTES;
-/// The most any other answer may be: account's bound for every body.
-pub const ANSWER_MAX_BYTES: usize = account::BODY_MAX_BYTES;
 /// What a backend must name in its `hello` for an app to sign in to it (design 18:
 /// `"has":["accounts"]`).
 // to be proto's: proto still names only stage 1's "plays".
@@ -159,27 +177,29 @@ impl fmt::Debug for Random {
 /// What was kept on the device, read back at `start`. Anything missing is `None`.
 #[derive(Debug, Default)]
 pub struct Kept {
-    /// Where secrets are kept: the device's own secret (8.6).
+    /// Where secrets are kept: the device's own secret (8.7). Beside [`Saved`], not in it.
     pub device_secret: Option<DeviceSecret>,
-    /// Where secrets are kept: the session.
-    pub session: Option<Session>,
-    /// Where secrets are kept: the music login (9.4).
-    pub music: Option<MusicLogin>,
-    /// In a file of the app's: which backend, as whom, and the numbers last seen (11).
-    pub account: Option<AccountFile>,
-    /// Where secrets are kept: a sign-out the backend has not yet been told of.
-    pub to_tell: Option<ToTell>,
+    /// Where secrets are kept, as one thing: what signing in left (11).
+    pub saved: Option<Saved>,
+    /// Where secrets are kept: sign-outs the backend has not yet taken, at most
+    /// [`NOTES_MAX`], each kept and forgotten by the session it ends.
+    pub notes: Vec<Note>,
     /// Whether Offline mode is on (the app's own setting).
     pub offline: bool,
 }
 
-/// What is kept in a file about the account signed in to (design 11). Nothing secret.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
-pub struct AccountFile {
-    /// The address the person typed, as `https://host` or `https://host:port`.
-    pub backend: String,
-    /// The backend's id, from its `hello`: 32 lower-case hex digits.
+/// What signing in leaves on a device: **one thing, put in place in one step** (11). A
+/// write that is cut short must leave the one before whole. What a device keeps for the
+/// person (its folder) is kept under `backend_id` and `account`, never under the music
+/// server's name and a user's name.
+#[derive(Debug, Serialize)]
+pub struct Saved {
+    /// The Nexus origin the person typed, as `https://host` or `https://host:port`.
+    pub nexus: String,
+    /// The backend's id, from its `hello`, expected at that origin: 32 lower-case hex digits.
     pub backend_id: String,
+    /// Who the person is to the backend: the account's number, never given again (8.1).
+    pub account: AccountId,
     pub email: String,
     pub name: String,
     /// This device's number at the backend.
@@ -188,22 +208,40 @@ pub struct AccountFile {
     pub restore: u64,
     pub life: u64,
     pub change: u64,
-    /// The music login's count as last seen (9.4).
-    pub music_count: u64,
     /// What this server records (13.6), until the person has seen it.
     pub notice: Option<String>,
-    /// Signed in with a one-time code: the session gives leave only to choose a password.
-    pub password_setup: bool,
+    /// The session. `None` after "the server's data was put back": the music login stays,
+    /// and plays, until the person signs in again.
+    pub session: Option<Session>,
+    /// What can end this session and nothing else, for signing out without it (11).
+    pub sign_out: Option<SignOutNote>,
+    /// The music login, with its number (9.4).
+    pub music: Option<MusicLogin>,
 }
 
-/// A sign-out the backend is still to be told of. Kept where secrets are kept, because it
-/// holds the session that was ended here.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ToTell {
-    pub session: Session,
-    /// The address the person typed.
-    pub backend: String,
+/// A sign-out the backend has not yet taken (11): it can end that one session and do
+/// nothing else, and nothing in it can sign anyone in. It holds the revoke-only secret the
+/// sign-in answer gave ([`SignOutNote`]), never the session.
+#[derive(Debug, Serialize)]
+pub struct Note {
+    /// The number of this sign-out (12.2), the same for every telling of it. Never 0.
+    pub request: u64,
+    /// The session it ends, and the secret that ends it.
+    pub revoke: SignOutNote,
+    /// The Nexus origin it is to be told at, and the id of the backend it was made for:
+    /// it is sent nowhere else (7.1).
+    pub nexus: String,
+    pub backend_id: String,
     pub restore: u64,
+    /// When the person signed out: the note is given up [`NOTE_LIFE_MS`] after.
+    pub made_ms: u64,
+}
+
+impl Note {
+    /// The session it ends: what it is kept and forgotten by.
+    pub fn session(&self) -> u64 {
+        self.revoke.session.get()
+    }
 }
 
 /// Something that happened.
@@ -221,23 +259,61 @@ pub enum Happened {
     Network { up: bool },
     /// Offline mode was switched on or off.
     Offline(bool),
-    /// A tick: about every [`TICK_MS`].
+    /// A tick: about every [`TICK_MS`]. A tick alone asks nothing of the session; it tells
+    /// waiting sign-outs at their pace. (The sending half, C8 and C6, will be driven from
+    /// here.)
     Tick,
-    /// The music server refused the music login of this count as "wrong name or password"
-    /// (Subsonic error 40). Only that: a server out of reach is not this.
-    MusicRefused { count: u64 },
+    /// The wait the sign-in form was shown ([`SignInShown::wait_s`]) has passed: the app's
+    /// own timer for it fired.
+    WaitPassed,
+    /// A part of the app that asks the music server (a stream, a range opened again, the
+    /// next song fetched ahead, a download, a cover, a page) was refused "wrong name or
+    /// password" with the music login of this number, handed under this `generation`
+    /// ([`Hand`]). Only that: a network failure, a proxy error or a busy server is not this
+    /// (6.3's table). A report under another generation is dropped.
+    MusicRefused { count: u64, generation: u64 },
+    /// On the phone: where the address of the music login of this number, handed under this
+    /// generation, leads on this network, and whether the permission is held (6.4; P7's
+    /// note: judged apart from the backend's address). A look at another login is dropped.
+    MusicLooked { look: Look, count: u64, generation: u64 },
+}
+
+/// On the phone, where an address leads on this network and whether the local-network
+/// permission is held (6.4). Each `None` where the app did not or cannot look; a PC hands
+/// in `Look::default()`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Look {
+    #[serde(default)]
+    pub inside: Option<bool>,
+    #[serde(default)]
+    pub permission: Option<bool>,
+}
+
+impl Look {
+    /// It leads inside the house and the permission is not held: Android would drop the
+    /// connection silently.
+    fn blocked(self) -> bool {
+        self.inside == Some(true) && self.permission == Some(false)
+    }
 }
 
 /// What the person pressed.
 #[derive(Debug)]
 pub enum Press {
-    /// Sign in with an email and a password.
-    SignIn { address: String, email: String, password: Typed },
-    /// Sign in with the one-time code the admin gave (8.4). The code takes the place of both
-    /// the email and the password.
-    SignInWithCode { address: String, code: Typed },
-    /// After a code: the password chosen, typed twice.
-    ChoosePassword { password: Typed, again: Typed },
+    /// Sign in with an email and a password. `look`: on the phone, where the typed address
+    /// leads on this network and whether the permission is held, looked at before the press
+    /// (6.4); on a PC, nothing.
+    ///
+    /// `retry`: this press is the one retry the form makes by itself after a wait
+    /// ([`SignInShown::send_again`]), with what it still holds typed. A person's own press
+    /// is `false`.
+    SignIn { address: String, email: String, password: Typed, look: Look, retry: bool },
+    /// Sign in for the first time with the one-time code the admin gave (8.5): the code and
+    /// the password chosen, typed twice, redeemed together in one call.
+    SignInWithCode { address: String, code: Typed, password: Typed, again: Typed, look: Look, retry: bool },
+    /// The sign-in form was closed or dismissed: a retry waiting on it is cancelled.
+    FormClosed,
     /// Sign out on this device.
     SignOut,
     /// The list of devices was opened, or "refresh" pressed on it.
@@ -286,6 +362,7 @@ impl fmt::Debug for AnswerBody {
 
 /// Why an ask had no answer: how far it got, and on the phone where the address led.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Failure {
     pub how: How,
     /// Whether the address led inside the house on this network, if the app looked (6.4).
@@ -304,7 +381,8 @@ pub enum How {
     Name,
     /// No connection was opened (refused, timed out, or dropped by the system).
     Connect,
-    /// A connection was opened and could not be made secure.
+    /// A connection was opened and could not be made secure: a certificate that is wrong.
+    /// Never mistaken for a permission that is missing (P7's note).
     Secure,
     /// Secure, and no whole answer came in time.
     Timeout,
@@ -325,14 +403,14 @@ impl How {
 // ---------------------------------------------------------------------------------------
 
 /// The closed set of things to do. **There is no other**, and none of these holds the
-/// player back.
+/// player back from what is on the device.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Do {
     /// Send this one request, once, and answer with [`Happened::Answered`] or
     /// [`Happened::Failed`] under its id.
     Ask(Ask),
-    /// Keep this where it says, replacing what was there.
+    /// Keep this where it says, whole, replacing what was there, in one step.
     Keep(Keep),
     /// Forget this.
     Forget(Forget),
@@ -344,19 +422,23 @@ pub enum Do {
 
 /// One request to the backend.
 ///
-/// The app sends it **exactly once**, to exactly this address, with exactly these headers
-/// and body; **follows no redirect** (a 3xx is handed back as an answer); reads the body
-/// whole, up to `max_body` bytes, and no further (larger is [`How::Cut`]); and gives up
-/// after `within_ms`. An ask is sent even if, by the time it goes, the account has changed:
-/// only its answer is then thrown away. The app may cancel one the machine no longer waits
-/// for ([`Client::waits_for`]).
+/// The app sends it **exactly once**, to exactly this address (checked at dispatch against
+/// what is about to be sent), with exactly these headers and body; **follows no redirect**
+/// (a 3xx is handed back as an answer); reads the body whole, up to `max_body` bytes, and no
+/// further (larger is [`How::Cut`]); and gives up after `within_ms`.
+///
+/// **THE APP CALLS [`Client::waits_for`] IMMEDIATELY BEFORE IT SENDS AN ASK, ON THE SAME
+/// THREAD AS EVERY OTHER CALL, AND DROPS THE ASK UNSENT IF THE ANSWER IS NO.** `Offline(true)`
+/// and `stop` make it no for every ask but a sign-out being told; so do a sign-out and a
+/// new sign-in for what was asked before them. That is how nothing queued goes out after
+/// Offline was switched on, or with a former account's credentials.
 #[derive(Debug, Serialize)]
 pub struct Ask {
     pub id: u64,
     /// The generation it was asked under ([`Client::generation`]).
     pub generation: u64,
     pub method: Method,
-    /// Always `https://` and the address the person typed, then a path under `/nexus/api/`.
+    /// The Nexus origin the person typed, then one of `proto`'s and `account`'s paths.
     pub url: String,
     /// The `Authorization` header's value, when there is one: the session, as
     /// `Bearer …`. Never anything else, and never in the address.
@@ -396,44 +478,42 @@ impl Serialize for Hidden {
     }
 }
 
-/// What to keep, and where.
+/// What to keep, and where: each whole, in one step.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Keep {
-    /// Where secrets are kept. Made once; never forgotten.
+    /// Where secrets are kept, beside [`Saved`]. Made once; never forgotten.
     DeviceSecret(DeviceSecret),
-    /// Where secrets are kept.
-    Session(Session),
-    /// Where secrets are kept.
-    Music(MusicLogin),
-    /// In the app's file for it.
-    Account(AccountFile),
-    /// Where secrets are kept.
-    ToTell(ToTell),
+    /// Where secrets are kept, as one thing, replacing the one before.
+    Saved(Saved),
+    /// Where secrets are kept, by the session it ends ([`Note::session`]), beside any other.
+    Note(Note),
 }
 
 /// What to forget: from where it was kept, and from memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Forget {
-    Session,
-    /// From where secrets are kept **and from the player**. What is on the device
-    /// (downloads, kept copies) is not touched and goes on playing.
-    Music,
-    Account,
-    ToTell,
+    /// Everything signing in left, the music login **and the player's copy of it**
+    /// included. What is on the device (downloads, kept copies) is not touched and goes on
+    /// playing.
+    Saved,
+    /// The note for this session.
+    Note { session: u64 },
 }
 
 /// What the player is handed.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Hand {
-    /// Use this music login from now on.
-    Login(MusicLogin),
-    /// The login of this count was refused: send nothing more with it, now. What is on the
-    /// device plays as usual, the car included; a new login is handed over as soon as there
-    /// is one. (A login of another count is not touched.)
-    Refused { count: u64 },
+    /// Use this music login from now on, in place of any other, in one step; and try once
+    /// more, under it, what waited. Reports about it ([`Happened::MusicRefused`],
+    /// [`Happened::MusicLooked`]) carry this `generation` back.
+    Login { login: MusicLogin, generation: u64 },
+    /// The login of this number is set aside: **begin no new request with it**, anywhere
+    /// (a stream already open goes on). What is on the device plays as usual and the car
+    /// shows it; covers go blank, downloads wait. A login of another number is not touched.
+    Refused { count: u64, generation: u64 },
 }
 
 // ---------------------------------------------------------------------------------------
@@ -449,12 +529,22 @@ pub struct Shown {
     pub row: String,
     /// Who is signed in, when someone is: "Ada (ada@example.org)".
     pub who: Option<String>,
-    /// A sentence about the music login, when there is something to say (6.3).
+    /// A sentence about the music login, when there is something to say (6.3, 9.4).
     pub music: Option<String>,
+    /// The car's short line while a login is set aside (6.3): "Online music is unavailable
+    /// until your sign-in is renewed".
+    pub car: Option<String>,
     /// What this server records (13.6), to be shown until seen.
     pub notice: Option<String>,
     pub devices: DevicesShown,
     pub password: PasswordShown,
+    /// The phone is to show its screen that explains and asks for the local-network
+    /// permission, for the music server's address (6.4). Never set on a PC.
+    pub music_ask_permission: bool,
+    /// The same, for the backend's address, whatever asked and whatever screen is up: a
+    /// session's call, a renewal or a note failed before a connection opened, with the
+    /// address inside and the permission not held (6.4). Never set on a PC.
+    pub ask_permission: bool,
     /// Whether a music login is held, so that the player can reach the music server.
     pub plays: bool,
 }
@@ -464,8 +554,6 @@ pub struct Shown {
 pub enum Screen {
     /// The sign-in form. (Music that is held still plays: see [`Shown::plays`].)
     SignIn,
-    /// Signed in with a code: choose a password.
-    ChoosePassword,
     /// Signed in.
     SignedIn,
 }
@@ -481,6 +569,12 @@ pub struct SignInShown {
     /// The phone is to show its screen that explains and asks for the local-network
     /// permission (6.4). Never set on a PC.
     pub ask_permission: bool,
+    /// The backend said "busy, come back in this many seconds" (8.3), and the form will try
+    /// once more by itself: the app sets a timer for it and calls [`Happened::WaitPassed`].
+    pub wait_s: Option<u64>,
+    /// The wait has passed and the try may be made: the form presses again, as it is, with
+    /// `retry: true`. Only while the form is up; at most once for each press.
+    pub send_again: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -489,13 +583,13 @@ pub enum SignInState {
     Idle,
     Working,
     WrongLogin,
-    TooManyTries,
     NeedsHttps,
     BadAddress,
     BadEmail,
     NoPassword,
     NoNexusServer,
     CantReach,
+    NotSecure,
     NeedsPermission,
     AccountOff,
     Busy,
@@ -507,10 +601,10 @@ pub enum SignInState {
     PasswordNotAllowed,
     /// Signed out on this device.
     SignedOut,
-    /// Signed out by the backend: forced out, the password changed elsewhere, the account
-    /// switched off.
+    /// The backend said this session has ended: forced out, the password changed
+    /// elsewhere, the account switched off, 90 days unused.
     ForcedOut,
-    /// The backend was put back from a copy (12.4).
+    /// The backend's data was put back from a copy (12.4).
     StartAgain,
 }
 
@@ -536,6 +630,9 @@ pub struct DeviceRow {
     pub name: String,
     pub kind: DeviceKind,
     pub this_one: bool,
+    /// The session signed in on it, which forcing it out ends (8.7); `None` when it is
+    /// signed out.
+    pub session: Option<u64>,
     /// "This device", "Used yesterday", "Signed out".
     pub seen: String,
     pub can_force_out: bool,
@@ -558,7 +655,7 @@ pub enum PasswordState {
     WrongCurrent,
     NotAllowed,
     Differ,
-    TooManyTries,
+    Busy,
     CantReach,
 }
 
@@ -570,12 +667,15 @@ pub enum PasswordState {
 /// [`Client::start`], [`Client::happened`] and [`Client::stop`].
 #[derive(Default)]
 pub struct Client {
-    /// Bumped by every start, stop, sign-in and ending: the fence.
+    /// Moved by every start, stop, sign-in and ending: the fence.
     generation: u64,
     next_ask: u64,
     live: Option<Live>,
     /// The last thing shown, so that `Show` is given only when it changes.
     shown: Option<Shown>,
+    /// Sign-outs being told when the account changed or Offline went on: still waited for
+    /// (the one exception to the fence), and their answers dropped.
+    parting: Vec<u64>,
 }
 
 impl fmt::Debug for Client {
@@ -589,60 +689,112 @@ struct Live {
     app: App,
     offline: bool,
     device_secret: Option<DeviceSecret>,
-    session: Option<Session>,
-    account: Option<AccountFile>,
-    music: Option<MusicLogin>,
-    to_tell: Option<ToTell>,
+    saved: Option<Saved>,
+    notes: Vec<Note>,
     flight: Vec<Flight>,
     form: Form,
     reach: Reach,
-    /// When the session was last asked about.
-    checked_ms: Option<u64>,
+    /// When the waiting sign-outs were last told.
     told_ms: Option<u64>,
+    /// The generation the account now signed in was published under: what [`Hand`] carries,
+    /// and what reports about the login must carry back.
+    account_generation: u64,
+    /// The backends whose `hello` was read at an origin this run: (origin, id). Nothing that
+    /// carries a session, a device secret or a note goes to an origin before its id is here
+    /// and is the one expected (7.1).
+    verified: Vec<(String, BackendId)>,
+    /// The backend's address led inside and the permission is not held (6.4).
+    backend_blocked: bool,
+    /// The one retry after "come back in N seconds" (8.3).
+    retry: Retry,
+    /// A count of sign-in presses: what a retry belongs to.
+    attempt: u64,
+    /// The session's check is due: at a start, the network coming back, Offline off. Never
+    /// from a tick.
+    check_due: bool,
+    /// An answer came after the backend could not be reached: what was owed is asked once
+    /// that answer's own part is done.
+    restored: bool,
     renewal: Renewal,
     devices: Devices,
     password: PasswordShown,
     music_words: Option<String>,
-    /// The backend speaks no number this app does: nothing more is asked until a start.
-    too_old: bool,
+    /// The handed music server's address leads inside and the permission is not held.
+    music_blocked: bool,
+    /// The music login's number this device knows of: the one held, or the one an answer
+    /// carried when it said there was none to hand. A receipt above it means a new one.
+    music_seen: u64,
+    /// The backend at this origin speaks no number this app does: nothing more is asked of
+    /// it until a start or a sign-in elsewhere.
+    too_old: Option<String>,
+    /// Once signed in, a backend of another id answered at the Nexus origin: nothing more is
+    /// sent to it (7.1), and the person is asked to sign in again.
+    stranger: bool,
+}
+
+/// The one retry after "come back in N seconds" (8.3), tied to one press.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Retry {
+    None,
+    /// Shown with the wait (`seconds`); due at this time.
+    Armed { attempt: u64, due_ms: u64, seconds: u64 },
+    /// The wait passed: the form may press once more.
+    Now { attempt: u64 },
+    /// Used for this press: a second wait leaves it with the person.
+    Spent { attempt: u64 },
 }
 
 struct Flight {
     id: u64,
     what: Purpose,
+    /// The most its answer may be: a larger one is taken as cut.
+    max_body: usize,
 }
 
 enum Purpose {
     Hello(Pending),
-    SignIn { origin: String, backend_id: BackendId, email_typed: String },
-    ChoosePassword { new: Typed },
+    /// A try at signing in; its ask's id is the try's number.
+    SignIn { origin: NexusOrigin, backend_id: BackendId },
+    /// `hello` at an origin whose backend is expected, before anything secret goes there.
+    Verify { origin: String },
     /// The devices list, page by page. `opened`: the person is looking at it; otherwise it
-    /// is the check on the session ([`CHECK_EVERY_MS`]).
+    /// is the check on the session made at a start, the network coming back or Offline off.
     Devices { page: usize, opened: bool },
-    /// A refresh of the music login, for this count: `refused`, because the music server
-    /// refused the login of that count; otherwise because an answer said the count rose.
+    /// A renewal of the music login, for this number: `refused`, because the music server
+    /// refused the login of that number; otherwise because an answer said the number rose.
     Music { count: u64, refused: bool },
     ForceOut { device: u64 },
     ChangePassword,
-    Tell,
+    /// Telling the backend of a sign-out, from the note for this session, with no session (11).
+    Tell { session: u64 },
 }
 
 impl Purpose {
     fn same_kind(&self, other: &Purpose) -> bool {
-        std::mem::discriminant(self) == std::mem::discriminant(other)
+        match (self, other) {
+            (Purpose::Hello(_) | Purpose::SignIn { .. }, Purpose::Hello(_) | Purpose::SignIn { .. }) => true,
+            (Purpose::Tell { session }, Purpose::Tell { session: other }) => session == other,
+            (Purpose::Verify { origin }, Purpose::Verify { origin: other }) => origin == other,
+            (left, right) => std::mem::discriminant(left) == std::mem::discriminant(right),
+        }
+    }
+
+    /// A sign-out being told: the one ask the fence does not reach.
+    fn parting(&self) -> bool {
+        matches!(self, Purpose::Tell { .. })
     }
 }
 
 /// What a sign-in press holds while `hello` is asked.
 struct Pending {
-    origin: String,
+    origin: NexusOrigin,
     credential: Pressed,
-    email_typed: String,
 }
 
 enum Pressed {
     Password { email: Email, password: Password },
-    Code(OneTimeCode),
+    /// A code and the password chosen, redeemed together in one call (8.5).
+    Code { code: OneTimeCode, new_password: Password },
 }
 
 struct Form {
@@ -660,18 +812,22 @@ enum Reach {
     Down { since_ms: u64 },
 }
 
-/// The rule for a refused music login (6.3, as ruled): one refresh for each count.
+/// The one rule for a refused music login (6.3, as ruled): one renewal for each number.
 #[derive(Default)]
 struct Renewal {
-    /// The count of a login the music server refused, until a newer one is held.
+    /// The number of a login the music server refused: set aside until a newer one is held.
     refused: Option<u64>,
-    /// The refused count the backend has answered a refresh for: never asked again.
+    /// The refused number the backend has answered a renewal for: not asked again, but for
+    /// the network coming back.
     refreshed: Option<u64>,
-    /// The risen count the backend has answered a refresh for: never asked again.
+    /// The risen number the backend has answered a renewal for: never asked again.
     rose: Option<u64>,
-    /// A refresh that went unanswered, to be asked again when the backend may be
-    /// reachable (never on a timer): its count, and whether it was for a refusal.
+    /// A renewal that went unanswered, to be asked again when the backend may be reachable
+    /// (never on a timer): its number, and whether it was for a refusal.
     owed: Option<(u64, bool)>,
+    /// The highest number an answer announced while a renewal was under way: asked for
+    /// once that renewal's outcome is in, if it is still above what is held.
+    announced: Option<u64>,
 }
 
 struct Devices {
@@ -682,7 +838,7 @@ struct Devices {
     reading: Vec<DeviceRow>,
 }
 
-/// What an answer to a session's call came to (12.1): done, refused (final), or nothing.
+/// What an answer to a call came to (7.1, 12.1): done, refused (final), or nothing.
 enum Outcome<T> {
     Done(T, Seen),
     Refused(Why, Option<Seen>),
@@ -693,6 +849,7 @@ enum Outcome<T> {
 #[derive(Clone, Copy)]
 struct Seen {
     backend: BackendId,
+    account: AccountId,
     restore: u64,
     life: u64,
     change: u64,
@@ -703,6 +860,7 @@ impl Seen {
     fn of(receipt: &Receipt) -> Seen {
         Seen {
             backend: receipt.stamp.backend,
+            account: receipt.stamp.account,
             restore: receipt.stamp.restore,
             life: receipt.stamp.life,
             change: receipt.stamp.change,
@@ -714,35 +872,37 @@ impl Seen {
 /// A refusal, as this side acts on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Why {
+    /// "This session has ended, sign in again" (8.7).
+    SessionEnded,
+    /// "The server's data was put back, sign in again" (12.3).
+    DataPutBack,
+    Denied,
     WrongLogin,
-    TooManyTries { wait_ms: u64 },
     AccountOff,
-    Busy,
-    StartAgain,
-    NotSignedIn,
     NoSuchDevice,
     PasswordNotAllowed,
-    PasswordSetupOnly,
-    NoMusicLogin,
     Incompatible { low: u32, high: u32 },
-    BadRequest,
+    /// "Busy, come back", in this many seconds if it said.
+    Busy { seconds: Option<u64> },
+    Malformed,
+    /// "Not dealt with": nothing was done, and it may be asked again.
+    NotDealtWith,
 }
 
 impl Why {
     fn of(refusal: &Refusal) -> Why {
         match refusal {
-            Refusal::WrongLogin => Why::WrongLogin,
-            Refusal::TooManyTries { wait } => Why::TooManyTries { wait_ms: wait.ms() },
-            Refusal::AccountOff => Why::AccountOff,
-            Refusal::Busy => Why::Busy,
-            Refusal::StartAgain => Why::StartAgain,
-            Refusal::NotSignedIn => Why::NotSignedIn,
-            Refusal::NoSuchDevice => Why::NoSuchDevice,
-            Refusal::PasswordNotAllowed => Why::PasswordNotAllowed,
-            Refusal::PasswordSetupOnly => Why::PasswordSetupOnly,
-            Refusal::BadRequest => Why::BadRequest,
-            Refusal::NoMusicLogin => Why::NoMusicLogin,
-            Refusal::Incompatible { speaks } => Why::Incompatible { low: speaks.low(), high: speaks.high() },
+            Refusal::Malformed => Why::Malformed,
+            Refusal::NotSignedIn(NotSignedIn::SessionEnded) => Why::SessionEnded,
+            Refusal::NotSignedIn(NotSignedIn::DataPutBack) => Why::DataPutBack,
+            Refusal::NotAllowed(NotAllowed::Denied) => Why::Denied,
+            Refusal::NotAllowed(NotAllowed::WrongLogin) => Why::WrongLogin,
+            Refusal::NotAllowed(NotAllowed::AccountOff) => Why::AccountOff,
+            Refusal::NotAllowed(NotAllowed::NoSuchDevice) => Why::NoSuchDevice,
+            Refusal::NotAllowed(NotAllowed::PasswordNotAllowed) => Why::PasswordNotAllowed,
+            Refusal::NotAllowed(NotAllowed::Incompatible { speaks }) => Why::Incompatible { low: speaks.low(), high: speaks.high() },
+            Refusal::Busy { retry_after_seconds } => Why::Busy { seconds: retry_after_seconds.map(account::Wait::seconds) },
+            Refusal::NotDealtWith => Why::NotDealtWith,
         }
     }
 }
@@ -762,30 +922,96 @@ fn copy(login: &MusicLogin) -> MusicLogin {
     MusicLogin { address: login.address.clone(), name: login.name.clone(), salt: login.salt.clone(), token: login.token.clone(), count: login.count }
 }
 
-/// The address a person typed, as the origin every ask is made to: `https://host[:port]`.
-// to be origin's: `origin::Address::typed` is the one reading of a typed address. Until it
-// lands, proto's `hello_url` is the reading of the host and port, and this adds only what
-// a person types: no scheme means `https://`; `http://` is refused as needing HTTPS.
-fn typed_origin(text: &str) -> Result<String, SignInState> {
+/// A copy of a sign-out note (account's type is not `Clone`).
+fn copy_note(note: &SignOutNote) -> SignOutNote {
+    SignOutNote { session: note.session, secret: note.secret.clone() }
+}
+
+impl Note {
+    fn copy(&self) -> Note {
+        Note {
+            request: self.request,
+            revoke: copy_note(&self.revoke),
+            nexus: self.nexus.clone(),
+            backend_id: self.backend_id.clone(),
+            restore: self.restore,
+            made_ms: self.made_ms,
+        }
+    }
+}
+
+impl Saved {
+    /// A copy, to be kept whole.
+    fn copy(&self) -> Saved {
+        Saved {
+            nexus: self.nexus.clone(),
+            backend_id: self.backend_id.clone(),
+            account: self.account,
+            email: self.email.clone(),
+            name: self.name.clone(),
+            device: self.device,
+            restore: self.restore,
+            life: self.life,
+            change: self.change,
+            notice: self.notice.clone(),
+            session: self.session.clone(),
+            sign_out: self.sign_out.as_ref().map(copy_note),
+            music: self.music.as_ref().map(copy),
+        }
+    }
+}
+
+/// The address a person typed, as the Nexus origin every ask is made to (7.1): read by
+/// account's [`NexusOrigin::typed`], on origin's one reading of an address. `http://` (or any
+/// scheme but https) is "needs HTTPS"; anything else it refuses is "not an address".
+fn typed_origin(text: &str) -> Result<NexusOrigin, SignInState> {
     let text = text.trim();
     if text.is_empty() {
         return Err(SignInState::BadAddress);
     }
-    let lower = text.get(..7).map(|start| start.to_ascii_lowercase());
-    if lower.as_deref() == Some("http://") {
-        return Err(SignInState::NeedsHttps);
-    }
-    let full = if text.contains("://") { text.to_owned() } else { format!("https://{text}") };
-    let hello = proto::hello_url(&full).ok_or(SignInState::BadAddress)?;
-    hello.strip_suffix(proto::HELLO).map(str::to_owned).ok_or(SignInState::BadAddress)
+    NexusOrigin::typed(text).map_err(|wrong| match wrong {
+        crate::origin::AddressError::Scheme => SignInState::NeedsHttps,
+        _ => SignInState::BadAddress,
+    })
 }
 
-/// The tidying of a typed one-time code.
-// to be account's: a person may type it in small letters, or with spaces or dashes between
-// groups. the design does not say; account takes only the exact twelve.
+/// The tidying of a typed one-time code: account's reading (case, and Crockford's I, L and
+/// O), after the spaces and dashes a person may type between groups are taken out.
+// to be account's: `OneTimeCode::new` takes exactly twelve characters; the groups a person
+// types it in are not yet its to take apart.
 fn tidy_code(text: &str) -> Option<OneTimeCode> {
-    let tidied: Zeroizing<String> = Zeroizing::new(text.chars().filter(|c| !matches!(c, ' ' | '-')).map(|c| c.to_ascii_uppercase()).collect());
+    let tidied: Zeroizing<String> = Zeroizing::new(text.chars().filter(|c| !matches!(c, ' ' | '-')).collect());
     OneTimeCode::new(&tidied)
+}
+
+/// Whether what this device kept under the person it was signed in to before this version
+/// (downloads, settings, the queue) becomes the person's who signs in now (11): only if
+/// the music login handed over names the same music server and the same user. Asked once,
+/// at the first sign-in of this version; afterwards the folder is the person's by
+/// [`Saved::backend_id`] and [`Saved::account`], and another account handed the same user
+/// later starts with nothing.
+///
+/// The address is compared as the music server's base: scheme and host in small letters,
+/// the port as written, the path exactly, a single trailing `/` not counting. The user
+/// exactly.
+// to be origin's: the one tidying of a music server's address is `origin::MusicBase`; until
+// it is used here, this is the narrowest reading that can only say "the same" of the same.
+pub fn carries_over(before_address: &str, before_user: &str, handed: &MusicLogin) -> bool {
+    fn base(address: &str) -> Option<String> {
+        let address = address.trim();
+        let (scheme, rest) = address.split_once("://")?;
+        let end = rest.find('/').unwrap_or(rest.len());
+        let (authority, path) = rest.split_at(end);
+        if authority.is_empty() || authority.contains('@') || rest.contains(['?', '#']) {
+            return None;
+        }
+        let path = path.strip_suffix('/').unwrap_or(path);
+        Some(format!("{}://{}{}", scheme.to_ascii_lowercase(), authority.to_ascii_lowercase(), path))
+    }
+    match (base(before_address), base(handed.address.as_str())) {
+        (Some(before), Some(now)) => before == now && before_user == handed.name.as_str(),
+        _ => false,
+    }
 }
 
 impl Client {
@@ -795,10 +1021,11 @@ impl Client {
         self.generation
     }
 
-    /// Whether the machine still waits for the answer to this ask. One it no longer waits
-    /// for may be cancelled; its answer would be thrown away.
+    /// Whether the machine still waits for the answer to this ask. **The app asks this
+    /// immediately before it sends each [`Ask`] and drops the ask unsent if it is no**: after
+    /// `Offline(true)` and `stop` it is no for everything but a sign-out being told.
     pub fn waits_for(&self, ask: u64) -> bool {
-        self.live.as_ref().is_some_and(|live| live.flight.iter().any(|flight| flight.id == ask))
+        self.parting.contains(&ask) || self.live.as_ref().is_some_and(|live| live.flight.iter().any(|flight| flight.id == ask))
     }
 
     /// **Start**, after the app is already usable: hand over what was kept. A kept music
@@ -808,44 +1035,75 @@ impl Client {
         self.stop();
         self.generation = self.generation.wrapping_add(1);
         let mut out = Vec::new();
-        let Kept { device_secret, session, music, account, to_tell, offline } = kept;
-        // R1: the player first.
-        if let Some(login) = &music {
-            out.push(Do::Hand(Hand::Login(copy(login))));
+        let Kept { device_secret, saved, notes, offline } = kept;
+        // R1: the player first, whatever else is wrong with what was kept.
+        if let Some(login) = saved.as_ref().and_then(|saved| saved.music.as_ref()) {
+            out.push(Do::Hand(Hand::Login { login: copy(login), generation: self.generation }));
         }
-        let account = account.filter(|file| typed_origin(&file.backend).is_ok() && BackendId::from_hex(&file.backend_id).is_some());
+        let mut saved = saved;
+        if let Some(found) = &mut saved
+            && (NexusOrigin::typed(&found.nexus).is_err() || BackendId::from_hex(&found.backend_id).is_none())
+        {
+            // A session with no backend to say where it is from cannot be used; the music
+            // login still plays.
+            if found.session.take().is_some() {
+                found.sign_out = None;
+                found.notice = None;
+                out.push(Do::Keep(Keep::Saved(found.copy())));
+            }
+        }
+        // A note that cannot be told, or is too old to matter, is forgotten where it is kept
+        // too, not only left out of memory.
+        let mut kept_notes = Vec::new();
+        for note in notes {
+            let usable = NexusOrigin::typed(&note.nexus).is_ok()
+                && BackendId::from_hex(&note.backend_id).is_some()
+                && note.request != 0
+                && given.now_ms.checked_sub(note.made_ms).is_none_or(|age| age < NOTE_LIFE_MS)
+                && !kept_notes.iter().any(|kept: &Note| kept.session() == note.session());
+            if usable && kept_notes.len() < NOTES_MAX {
+                kept_notes.push(note);
+            } else {
+                out.push(Do::Forget(Forget::Note { session: note.session() }));
+            }
+        }
+        let mut form = Form::idle();
+        if let Some(found) = &saved {
+            form.email = found.email.clone();
+            form.address = found.nexus.clone();
+            if found.session.is_none() {
+                form.state = SignInState::StartAgain;
+            }
+        }
+        let music_seen = saved.as_ref().and_then(|saved| saved.music.as_ref()).map_or(0, |login| login.count);
         let mut live = Live {
             app,
             offline,
             device_secret,
-            session: None,
-            account: None,
-            music,
-            to_tell: to_tell.filter(|tell| typed_origin(&tell.backend).is_ok()),
+            saved,
+            notes: kept_notes,
             flight: Vec::new(),
-            form: Form::idle(),
+            form,
             reach: Reach::Unknown,
-            checked_ms: None,
             told_ms: None,
+            account_generation: self.generation,
+            verified: Vec::new(),
+            backend_blocked: false,
+            retry: Retry::None,
+            attempt: 0,
+            check_due: false,
+            restored: false,
             renewal: Renewal::default(),
             devices: Devices::not_asked(),
             password: PasswordShown::idle(),
             music_words: None,
-            too_old: false,
+            music_blocked: false,
+            music_seen,
+            too_old: None,
+            stranger: false,
         };
-        match (session, account) {
-            (Some(session), Some(account)) => {
-                live.form.email = account.email.clone();
-                live.form.address = account.backend.clone();
-                live.session = Some(session);
-                live.account = Some(account);
-            }
-            (Some(_), None) => {
-                // A session with no account to say where it is from cannot be used.
-                out.push(Do::Forget(Forget::Session));
-            }
-            (None, Some(_)) => out.push(Do::Forget(Forget::Account)),
-            (None, None) => {}
+        if live.form.state != SignInState::Idle {
+            live.form.words = words::sign_in(live.form.state, live.app.kind, 0);
         }
         if live.device_secret.is_none()
             && let Some(random) = &given.random
@@ -855,42 +1113,85 @@ impl Client {
             live.device_secret = Some(secret);
         }
         self.live = Some(live);
-        self.after_reach(given, &mut out, true);
+        self.after_reach(given, &mut out, Reached::Start);
         self.show(given, &mut out);
         out
     }
 
-    /// **Stop**, at the moment the account changes: nothing asked before is acted on, and
-    /// nothing more is done until the next `start`.
+    /// **Stop**, at the moment the account changes: nothing asked before is acted on or sent
+    /// (but a sign-out being told), and nothing more is done until the next `start`.
     pub fn stop(&mut self) {
-        if self.live.take().is_some() {
+        if let Some(live) = self.live.take() {
             self.generation = self.generation.wrapping_add(1);
+            self.part(live.flight.iter().filter(|flight| flight.what.parting()).map(|flight| flight.id));
         }
         self.shown = None;
     }
 
-    /// **Happened**: tell the machine, and be told what to do.
+    /// Keeps these asks waited for past the fence: sign-outs being told. At most
+    /// [`NOTES_MAX`], the oldest going first.
+    fn part(&mut self, asks: impl Iterator<Item = u64>) {
+        for ask in asks {
+            if !self.parting.contains(&ask) {
+                self.parting.push(ask);
+            }
+        }
+        let over = self.parting.len().saturating_sub(NOTES_MAX);
+        self.parting.drain(..over);
+    }
+
+    /// **Happened**: tell the machine, and be told what to do. Before `start` and after
+    /// `stop`, nothing.
     pub fn happened(&mut self, event: Happened, given: &Given) -> Vec<Do> {
         let mut out = Vec::new();
+        if let Happened::Answered { ask, .. } | Happened::Failed { ask, .. } = &event {
+            // A sign-out told across the fence: its answer is dropped (the note it came from
+            // is told again from what is kept).
+            if let Some(index) = self.parting.iter().position(|parting| parting == ask) {
+                self.parting.remove(index);
+                return out;
+            }
+        }
         if self.live.is_none() {
             return out;
         }
         match event {
             Happened::Pressed(press) => self.pressed(press, given, &mut out),
             Happened::Answered { ask, status, body } => self.answered(ask, status, &body, given, &mut out),
-            Happened::Failed { ask, failure } => self.failed(ask, failure, given, &mut out),
+            Happened::Failed { ask, failure } => self.failed(ask, failure, given),
             Happened::Network { up } => {
                 if up {
-                    self.after_reach(given, &mut out, true);
+                    self.after_reach(given, &mut out, Reached::Network);
                 }
             }
             Happened::Offline(on) => self.offline(on, given, &mut out),
             Happened::Tick => self.tick(given, &mut out),
-            Happened::MusicRefused { count } => self.music_refused(count, given, &mut out),
+            Happened::WaitPassed => self.wait_passed(given),
+            Happened::MusicRefused { count, generation } => self.music_refused(count, generation, &mut out),
+            Happened::MusicLooked { look, count, generation } => {
+                if let Some(live) = self.live.as_mut()
+                    && generation == live.account_generation
+                    && live.held_count() == Some(count)
+                {
+                    live.music_blocked = look.blocked() && live.app.kind == DeviceKind::Phone;
+                }
+            }
         }
         self.show(given, &mut out);
         out
     }
+}
+
+/// Why the backend may be reachable now.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reached {
+    Start,
+    /// The network came back: the one thing besides a moved number that renews a login
+    /// the backend had nothing newer for (6.3).
+    Network,
+    OfflineOff,
+    /// An answer came after the backend could not be reached.
+    Answer,
 }
 
 impl Form {
@@ -910,5 +1211,3 @@ impl PasswordShown {
         PasswordShown { state: PasswordState::Idle, words: String::new() }
     }
 }
-
-mod machine;
