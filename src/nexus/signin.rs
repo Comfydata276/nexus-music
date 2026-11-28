@@ -131,7 +131,8 @@ struct Batch {
     epoch: u64,
     dos: Vec<Do>,
     cause: Cause,
-    /// The step's number: the worker is given the lists in this order.
+    /// The step's number: the worker is given the lists in this order (read by its test).
+    #[cfg_attr(not(test), allow(dead_code))]
     made: u64,
 }
 

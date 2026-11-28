@@ -474,6 +474,7 @@ pub fn plan_for(dir: &Path, account: &str) -> Result<Plan, String> {
 }
 
 /// Everything of the app's in `dir`, every account's (the move's own tests).
+#[cfg(test)]
 pub fn plan(dir: &Path) -> Plan {
     plan_of(dir, None)
 }
