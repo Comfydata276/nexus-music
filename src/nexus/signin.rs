@@ -971,6 +971,11 @@ fn legacy_now() -> MutexGuard<'static, Option<config::Legacy>> {
     LEGACY.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// The player follows the decision for this run while its write is being retried.
+fn uses_released_folder(folder: &str) -> bool {
+    legacy_now().as_ref().is_some_and(|legacy| legacy.carried_to.is_some() && legacy.stem() == folder)
+}
+
 /// The first matching music login kept here gives its account the released folder.
 /// Return the decision for recording after the sign-in is kept. Other accounts use the
 /// folder named by their backend and account number. `None` if the decision cannot be read.
@@ -1164,7 +1169,7 @@ fn hand_over(hand: Hand, cause: &Cause) {
             *HANDED.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((login.count, generation));
             let music = kept_music(&login);
             let folder = record.folder.clone();
-            let legacy = paths().and_then(|paths| config::load_legacy(&paths).ok()).is_some_and(|legacy| legacy.stem() == folder && legacy.carried_to.is_some());
+            let legacy = uses_released_folder(&folder);
             note(format_args!("music login handed, number {}", music.count));
             crate::controller::with(|ctl| {
                 if ctl.client().is_some() && ctl.account() == folder {
@@ -1486,7 +1491,9 @@ mod tests {
         std::fs::remove_file(&file).unwrap();
         std::fs::create_dir_all(&file).unwrap();
         assert!(keep_saved(&paths, epoch_now(), saved(), &Cause::Other));
-        assert!(legacy_now().as_ref().unwrap().carried_to.is_some());
+        assert!(config::load_legacy(&paths).is_err());
+        assert!(uses_released_folder(&view().record.folder), "the player uses the released folder even while its decision cannot be written");
+        assert!(!uses_released_folder(&config::person_folder(&ada.backend_id, 8)));
         std::fs::remove_dir_all(&file).unwrap();
         config::keep_legacy(&paths, &legacy).unwrap();
         *legacy_now() = Some(config::load_legacy(&paths).unwrap());
