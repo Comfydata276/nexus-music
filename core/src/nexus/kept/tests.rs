@@ -172,7 +172,7 @@ pub(super) fn hash(n: u8) -> Fingerprint {
 }
 
 pub(super) fn clock(now: u64, high_water: u64) -> Clock {
-    Clock { now, high_water }
+    Clock::new(now, high_water)
 }
 
 pub(super) struct Stored {
@@ -900,10 +900,7 @@ fn admin_page_idle_is_thirty_minutes_from_last_use_even_after_reload() -> Result
     assert_eq!(browser.kind, SessionKind::AdminPage);
     s.sign_in(9, 2, 2, 0)?;
     let last = ADMIN_PAGE_IDLE_MS - 1;
-    assert_eq!(
-        s.step(last, |turn| turn.session_kind(bearer(1, &hash(1))))?,
-        SessionKind::AdminPage
-    );
+    assert_eq!(s.read(1, 1, last)?.kind(), SessionKind::AdminPage);
     assert_eq!(
         s.data
             .devices
@@ -915,6 +912,14 @@ fn admin_page_idle_is_thirty_minutes_from_last_use_even_after_reload() -> Result
             .last_used,
         last
     );
+    let mut before_deadline = Account::load(&s.apart, Some(&s.data));
+    let before = last + ADMIN_PAGE_IDLE_MS - 1;
+    let request = before_deadline
+        .request(1, clock(before, before), |turn| {
+            turn.arrive(bearer(1, &hash(1)), Access::Read)
+        })
+        .apply(|_| Ok::<_, Denied>(()))??;
+    assert_eq!(request.kind(), SessionKind::AdminPage);
     s.reload();
     assert_eq!(
         s.read(1, 1, last + ADMIN_PAGE_IDLE_MS).err(),
@@ -949,6 +954,7 @@ fn a_correct_non_admin_page_sign_in_has_the_same_refusal_as_a_wrong_password() -
         })
         .map(|answer| assert_eq!(answer.err(), wrong))?;
     assert_eq!(wrong, Some(Denied::WrongPassword));
+    assert!(wrong.is_some_and(Denied::counts_as_wrong_password));
     s.sign_in(8, 1, 1, 0)?;
     Ok(())
 }

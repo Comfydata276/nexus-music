@@ -10,22 +10,46 @@ pub const CLOCK_MARK_INTERVAL_MS: u64 = 60_000;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Clock {
-    pub now: u64,
-    pub high_water: u64,
+    now: u64,
+    high_water: u64,
+    floor: u64,
 }
 
 impl Clock {
-    /// Take the full interval that could have elapsed without a durable mark.
-    /// Use at process load only. Subsequent turns carry the in-memory high water.
-    pub fn after_load(now: u64, persisted: u64) -> Self {
+    /// A live clock with no restart allowance.
+    pub fn new(now: u64, high_water: u64) -> Self {
         Self {
             now,
-            high_water: persisted.saturating_add(CLOCK_MARK_INTERVAL_MS),
+            high_water,
+            floor: 0,
         }
     }
 
-    pub fn effective(self) -> u64 {
+    /// Take the full interval that could have elapsed without a durable mark.
+    /// The floor is local to this process and never goes in Effects.
+    pub fn after_load(now: u64, persisted: u64) -> Self {
+        Self {
+            now,
+            high_water: persisted,
+            floor: persisted.saturating_add(CLOCK_MARK_INTERVAL_MS),
+        }
+    }
+
+    /// Retain the load floor and the latest actual observation for a new turn.
+    pub fn observe(self, now: u64) -> Self {
+        Self {
+            now,
+            high_water: self.mark(),
+            floor: self.floor,
+        }
+    }
+
+    fn mark(self) -> u64 {
         self.now.max(self.high_water)
+    }
+
+    pub fn effective(self) -> u64 {
+        self.mark().max(self.floor)
     }
 }
 
@@ -67,6 +91,8 @@ pub struct Apart {
     pub devices: BTreeMap<DeviceId, ApartDevice>,
 }
 
+/// The keeper matches every variant explicitly. A new data effect requires
+/// an implementation at its application site.
 #[derive(Clone, Eq, PartialEq)]
 pub enum DataChange {
     Keep,
@@ -129,8 +155,8 @@ pub struct Update {
 
 #[derive(Debug)]
 pub struct Effects {
-    /// Retain on every turn even when no rows changed. Persist with every row
-    /// change and otherwise when the mark interval is due.
+    /// The actual observed mark, excluding any process-local restart allowance.
+    /// Retain on every turn and persist with row changes or at the mark interval.
     pub high_water: u64,
     pub updates: Vec<Update>,
 }
@@ -340,7 +366,7 @@ impl Account {
     ) -> Decision<Result<T, Denied>> {
         let now = clock.effective();
         let mut effects = Effects {
-            high_water: now,
+            high_water: clock.mark(),
             updates: Vec::new(),
         };
         let answer = if restore != self.state.restore {
@@ -576,9 +602,8 @@ impl Account {
         mode: RestoreMode,
         clock: Clock,
     ) -> Decision<Result<(), Denied>> {
-        let high_water = clock.effective();
         let mut effects = Effects {
-            high_water,
+            high_water: clock.mark(),
             updates: Vec::new(),
         };
         let answer = Self::restore_update(apart, data, new_restore, mode)
@@ -835,6 +860,10 @@ impl Turn<'_> {
 
     /// The backend selects AdminPage only on its configured browser sign-in
     /// path. It is never selected by a field in the app request.
+    ///
+    /// Map WrongPassword to the same refusal as a wrong password check and
+    /// record it as wrong at the selected password door. A non-admin who
+    /// supplied the right password returns that exact same Denied variant.
     pub fn sign_in_as(
         self,
         kind: SessionKind,
@@ -857,6 +886,8 @@ impl Turn<'_> {
         self.redeem_code_as(SessionKind::App, receipt, verifier, fresh, previous)
     }
 
+    /// The AdminPage wrong-password refusal and door rule are the same as in
+    /// sign_in_as. No code is spent on that refusal.
     pub fn redeem_code_as(
         self,
         kind: SessionKind,
@@ -1068,14 +1099,13 @@ impl Turn<'_> {
     }
 
     pub fn arrive(self, bearer: Bearer<'_>, access: Access) -> Result<Request, Denied> {
-        let session_id = self
-            .account
-            .session(bearer.device, bearer.hash, self.now)?
-            .id;
+        let session = self.account.session(bearer.device, bearer.hash, self.now)?;
+        let (session_id, kind) = (session.id, session.kind);
         access.check(&self.account.state)?;
         Ok(Request {
             scope: self.account.scope(bearer.device)?,
             session_id,
+            kind,
             access,
             arrived: self.now,
         })

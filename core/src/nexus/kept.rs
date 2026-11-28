@@ -309,6 +309,7 @@ impl SessionKind {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Session {
     pub id: SessionId,
+    /// Persist explicitly. A row with no kind is an ended session.
     pub kind: SessionKind,
     pub hash: Fingerprint,
     pub sign_out: Fingerprint,
@@ -405,6 +406,14 @@ pub enum Denied {
     StartAgain,
 }
 
+impl Denied {
+    /// Use the ordinary wrong-login body and count this at the password door,
+    /// including when a page sign-in has checked a non-admin's password.
+    pub fn counts_as_wrong_password(self) -> bool {
+        matches!(self, Self::WrongPassword)
+    }
+}
+
 // The design does not say how counters exhaust. Exhaustion refuses the operation
 // and the store must fail closed if a required ending cannot be recorded.
 fn next(value: u64) -> Result<u64, Denied> {
@@ -436,8 +445,16 @@ impl Access {
 pub struct Request {
     scope: Scope,
     session_id: SessionId,
+    kind: SessionKind,
     access: Access,
     arrived: u64,
+}
+
+impl Request {
+    /// The kind selected by the authenticated session on arrival.
+    pub fn kind(&self) -> SessionKind {
+        self.kind
+    }
 }
 
 /// §8.8. A password receipt has one purpose; a leave receipt is also bound to the
