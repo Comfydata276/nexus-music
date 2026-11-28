@@ -55,7 +55,7 @@ pub enum Status {
     Deleted,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct AccountState {
     pub backend: BackendId,
     pub restore: u64,
@@ -85,6 +85,16 @@ struct Scope {
     revision: u64,
     device: DeviceId,
     number: u64,
+}
+
+impl fmt::Debug for AccountState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AccountState")
+            .field("id", &self.id)
+            .field("status", &self.status)
+            .field("revision", &self.revision)
+            .finish_non_exhaustive()
+    }
 }
 
 impl AccountState {
@@ -189,11 +199,25 @@ pub struct SessionTarget {
     pub session: SessionId,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub enum AdminTarget {
     Account { id: AccountId, revision: u64 },
     NewAccount(Email),
     Backend,
+}
+
+impl fmt::Debug for AdminTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Account { id, revision } => f
+                .debug_struct("Account")
+                .field("id", id)
+                .field("revision", revision)
+                .finish(),
+            Self::NewAccount(_) => f.write_str("NewAccount(..)"),
+            Self::Backend => f.write_str("Backend"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -258,9 +282,35 @@ impl Leave {
     }
 }
 
+pub const ADMIN_PAGE_IDLE_MS: u64 = 30 * 60 * 1000;
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum SessionKind {
+    App,
+    AdminPage,
+}
+
+impl SessionKind {
+    pub fn idle_ms(self) -> u64 {
+        match self {
+            Self::App => SESSION_IDLE_MS,
+            Self::AdminPage => ADMIN_PAGE_IDLE_MS,
+        }
+    }
+
+    fn reload_activity(self, last_used: u64) -> u64 {
+        match self {
+            Self::App => last_used.saturating_add(USE_WRITE_MS - 1),
+            Self::AdminPage => last_used,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Session {
     pub id: SessionId,
+    /// Persist explicitly. A row with no kind is an ended session.
+    pub kind: SessionKind,
     pub hash: Fingerprint,
     pub sign_out: Fingerprint,
     pub last_used: u64,
@@ -304,8 +354,10 @@ impl Device {
 
     fn expire(&mut self, now: u64) -> Result<(), Denied> {
         if self
-            .last_accepted
-            .is_some_and(|last| now.saturating_sub(last) >= SESSION_IDLE_MS)
+            .session
+            .as_ref()
+            .zip(self.last_accepted)
+            .is_some_and(|(session, last)| now.saturating_sub(last) >= session.kind.idle_ms())
         {
             self.end()?;
         }
@@ -315,7 +367,11 @@ impl Device {
     fn touch(&mut self, now: u64) -> Result<&mut Session, Denied> {
         let session = self.session.as_mut().ok_or(Denied::NotSignedIn)?;
         self.last_accepted = Some(self.last_accepted.unwrap_or(now).max(now));
-        if now.saturating_sub(session.last_used) >= USE_WRITE_MS {
+        // The design does not say how hourly persistence applies to a page's
+        // shorter idle. Persist its exact activity, with no hour of reload grace.
+        if session.kind == SessionKind::AdminPage
+            || now.saturating_sub(session.last_used) >= USE_WRITE_MS
+        {
             session.last_used = now;
         }
         Ok(session)
@@ -350,6 +406,14 @@ pub enum Denied {
     StartAgain,
 }
 
+impl Denied {
+    /// Use the ordinary wrong-login body and count this at the password door,
+    /// including when a page sign-in has checked a non-admin's password.
+    pub fn counts_as_wrong_password(self) -> bool {
+        matches!(self, Self::WrongPassword)
+    }
+}
+
 // The design does not say how counters exhaust. Exhaustion refuses the operation
 // and the store must fail closed if a required ending cannot be recorded.
 fn next(value: u64) -> Result<u64, Denied> {
@@ -381,8 +445,16 @@ impl Access {
 pub struct Request {
     scope: Scope,
     session_id: SessionId,
+    kind: SessionKind,
     access: Access,
     arrived: u64,
+}
+
+impl Request {
+    /// The kind selected by the authenticated session on arrival.
+    pub fn kind(&self) -> SessionKind {
+        self.kind
+    }
 }
 
 /// §8.8. A password receipt has one purpose; a leave receipt is also bound to the
