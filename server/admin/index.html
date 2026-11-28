@@ -95,6 +95,7 @@ article p, dt { color: var(--muted); }
 dd { margin: 0 0 .65rem; }
 dd, li { overflow-wrap: anywhere; }
 .account-links { display: flex; flex-wrap: wrap; gap: .6rem; }
+#requests-panel { grid-column: 1 / -1; }
 #requests-panel h3 { margin: .85rem 0 0; font-size: 1rem; }
 #request-history { border-top: 1px solid var(--line); margin-top: .85rem; }
 #listening-panel { grid-column: 1 / -1; }
@@ -135,6 +136,9 @@ dd, li { overflow-wrap: anywhere; }
   margin: 0;
 }
 @media (min-width: 52rem) {
+  .requests-columns { display: grid; grid-template-columns: 1fr 1fr; gap: 1.75rem; }
+  .requests-columns > * { min-width: 0; }
+  #request-history { margin-top: 0; border-top: 0; border-left: 1px solid var(--line); padding-left: 1.75rem; }
   .listening-filters { grid-template-columns: 1fr 14rem; }
   .listening-columns { grid-template-columns: 1.1fr 1fr; gap: 1.75rem; }
   #listening-people { display: grid; grid-template-columns: 1fr 1fr; column-gap: 1.75rem; }
@@ -221,26 +225,32 @@ dd, li { overflow-wrap: anywhere; }
       </article>
       <article id="requests-panel">
         <h2>Requests</h2>
-        <p id="requests-availability" role="status"></p>
-        <details id="lidarr-details" hidden>
-          <summary>Set up Lidarr</summary>
-          <dl><dt>Lidarr address</dt><dd id="lidarr-address"></dd></dl>
-          <p id="lidarr-key-status"></p>
-          <form id="lidarr-form" method="post" autocomplete="off">
-            <label>Lidarr key <input id="lidarr-key" type="password" autocomplete="new-password" maxlength="512" required></label>
-            <button type="submit">Review Lidarr key</button>
-          </form>
-        </details>
-        <h3>Who may request music</h3>
-        <p id="requests-status" role="status"></p>
-        <ul id="requests-list"></ul>
-        <button id="requests-more" class="secondary" type="button" hidden>Load more people</button>
-        <details id="request-history">
-          <summary>Who asked for what</summary>
-          <ul id="request-history-list"></ul>
-          <p id="request-history-status" role="status"></p>
-          <button id="request-history-more" class="secondary" type="button" hidden>Older requests</button>
-        </details>
+        <div class="requests-columns">
+          <div>
+            <p id="requests-availability" role="status"></p>
+            <div id="lidarr-settings" hidden>
+              <dl><dt>Lidarr address</dt><dd id="lidarr-address"></dd></dl>
+              <p id="lidarr-key-status"></p>
+              <details id="lidarr-details">
+                <summary>Set up Lidarr</summary>
+                <form id="lidarr-form" method="post" autocomplete="off">
+                  <label>Lidarr key <input id="lidarr-key" type="password" autocomplete="new-password" maxlength="512" required></label>
+                  <button type="submit">Review Lidarr key</button>
+                </form>
+              </details>
+            </div>
+            <h3>Who may request music</h3>
+            <p id="requests-status" role="status"></p>
+            <ul id="requests-list"></ul>
+            <button id="requests-more" class="secondary" type="button" hidden>Load more people</button>
+          </div>
+          <details id="request-history">
+            <summary>Who asked for what</summary>
+            <ul id="request-history-list"></ul>
+            <p id="request-history-status" role="status"></p>
+            <button id="request-history-more" class="secondary" type="button" hidden>Older requests</button>
+          </details>
+        </div>
       </article>
       <article id="listening-panel" hidden>
         <h2 id="listening-title" tabindex="-1">Listening</h2>
@@ -386,6 +396,7 @@ dd, li { overflow-wrap: anywhere; }
   const addressForm = byId("address-form");
   const lidarrForm = byId("lidarr-form");
   const lidarrDetails = byId("lidarr-details");
+  const lidarrSettings = byId("lidarr-settings");
   const requestsAvailability = byId("requests-availability");
   const loginForm = byId("music-login-form");
   const accountNames = new Map();
@@ -1341,19 +1352,21 @@ dd, li { overflow-wrap: anywhere; }
       if (typeof result.configured !== "boolean" ||
           (result.address !== null && typeof result.address !== "string")) throw new Error();
       lidarrAddress = result.address;
-      lidarrDetails.hidden = !lidarrAddress;
+      lidarrSettings.hidden = !lidarrAddress;
       requestsAvailability.hidden = Boolean(lidarrAddress);
       writeText(byId("lidarr-address"), lidarrAddress ?? "");
       writeText(byId("lidarr-key-status"), !lidarrAddress ? "" :
         result.configured ? "Lidarr key is set." : "Lidarr key is not set.");
       if (!lidarrAddress) {
+        lidarrDetails.open = false;
         lidarrForm.reset();
         writeText(requestsAvailability, "Music requests aren't set up on this server. The server's owner sets Lidarr's address on the container.");
       }
     } catch {
       if (session !== current) return;
       lidarrAddress = null;
-      lidarrDetails.hidden = true;
+      lidarrSettings.hidden = true;
+      lidarrDetails.open = false;
       lidarrForm.reset();
       requestsAvailability.hidden = false;
       writeText(byId("lidarr-address"), "");
@@ -1481,7 +1494,7 @@ dd, li { overflow-wrap: anywhere; }
     for (const form of [createForm, addressForm, lidarrForm]) form.reset();
     byId("new-account-details").open = false;
     lidarrDetails.open = false;
-    lidarrDetails.hidden = true;
+    lidarrSettings.hidden = true;
     requestHistory.open = false;
     for (const pager of [accountPage, devicePage, requestHistoryPage]) resetPage(pager);
     accountNames.clear();

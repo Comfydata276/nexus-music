@@ -694,7 +694,7 @@ test("requests shows one container instruction and no key field when Lidarr has 
     ? new Response('{"done":{"address":null,"configured":false}}') : mock.fetch(path, options));
   await page.signIn("owner@example.test", adminPassword);
   await settle();
-  assert.equal(page.from("lidarr-details").hidden, true);
+  assert.equal(page.from("lidarr-settings").hidden, true);
   assert.equal(page.from("requests-availability").hidden, false);
   assert.equal(page.from("requests-availability").textContent,
     "Music requests aren't set up on this server. The server's owner sets Lidarr's address on the container.");
