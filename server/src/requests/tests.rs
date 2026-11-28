@@ -241,6 +241,7 @@ struct LidarrState {
     new_releases: Option<String>,
     single_mode: bool,
     second_artist: bool,
+    other_monitored: bool,
     calls: Vec<String>,
 }
 
@@ -324,9 +325,9 @@ fn mock(request: &Question, state: &mut LidarrState) -> Value {
     if state.single_mode {
         offer["albumType"] = json!("Single");
     }
-    let other_artist = json!({"id":6,"artistName":"Paper Tides",
+    let other_artist = json!({"id":6,"artistName":"Paper Tides","monitored":true,
         "foreignArtistId":"20000000-0000-0000-0000-000000000222"});
-    let mut other_album = album(false);
+    let mut other_album = album(state.other_monitored);
     other_album["id"] = json!(10);
     other_album["artistId"] = json!(6);
     other_album["title"] = json!("Quiet Coast");
@@ -380,13 +381,21 @@ fn mock(request: &Question, state: &mut LidarrState) -> Value {
         }
         ("PUT", "album/monitor") => {
             let input: Value = serde_json::from_slice(&request.body).unwrap();
-            assert_eq!(input["albumIds"], json!([9]));
-            state.monitored = input["monitored"].as_bool().unwrap();
+            let monitored = input["monitored"].as_bool().unwrap();
+            if state.second_artist && input["albumIds"] == json!([10]) {
+                state.other_monitored = monitored;
+            } else {
+                assert_eq!(input["albumIds"], json!([9]));
+                state.monitored = monitored;
+            }
             json!({})
         }
         ("POST", "command") => {
             let input: Value = serde_json::from_slice(&request.body).unwrap();
-            assert_eq!(input, json!({"name":"AlbumSearch","albumIds":[9]}));
+            if !state.second_artist || input["albumIds"] != json!([10]) {
+                assert_eq!(input["albumIds"], json!([9]));
+            }
+            assert_eq!(input["name"], "AlbumSearch");
             json!({"id":100})
         }
         _ => panic!("unexpected stand-in call {} {target}", request.method),
@@ -1274,6 +1283,78 @@ fn switching_off_a_running_batch_blocks_its_next_lidarr_write() {
     let calls = lidarr.take_calls();
     assert_eq!(calls.iter().filter(|&call| call == "PUT album/monitor").count(), 1);
     assert!(!calls.iter().any(|call| call == "POST command"));
+}
+
+// A loopback test can wait for the Tokio mutex to queue a job while the
+// stand-in Lidarr is holding the preceding group. No scheduling sleeps.
+type MutationWaits = std::sync::mpsc::Sender<i64>;
+type WaitingTests = Mutex<HashMap<nexus_core::nexus::proto::BackendId, MutationWaits>>;
+static MUTATION_WAITS: std::sync::LazyLock<WaitingTests> = std::sync::LazyLock::new(Default::default);
+
+pub(super) async fn observe_mutation_wait<F: std::future::Future>(
+    future: F, backend: nexus_core::nexus::proto::BackendId, row: i64,
+) -> F::Output {
+    let sender = lock(&MUTATION_WAITS).get(&backend).cloned();
+    tokio::pin!(future);
+    std::future::poll_fn(|cx| {
+        let polled = future.as_mut().poll(cx);
+        if polled.is_pending() && let Some(sender) = &sender {
+            let _ = sender.send(row);
+        }
+        polled
+    }).await
+}
+
+struct MutationsObserved(nexus_core::nexus::proto::BackendId);
+
+impl Drop for MutationsObserved {
+    fn drop(&mut self) {
+        lock(&MUTATION_WAITS).remove(&self.0);
+    }
+}
+
+#[test]
+fn a_second_account_completes_its_request_between_two_batch_artist_groups() {
+    let lidarr = MockLidarr::start();
+    lock(&lidarr.state).second_artist = true;
+    let (server, [admin, first, other]) = TestServer::start("batch-turns", Some(endpoint(lidarr.address)));
+    server.configure(&server.redeem(admin, 1, TEST_PAGE));
+    let first = server.redeem(first, 2, "");
+    let other = server.redeem(other, 3, "");
+    let offer = server.offer(&other);
+    let backend = server.accounts.as_ref().unwrap().backend;
+    let (waiting, waited) = std::sync::mpsc::channel();
+    lock(&MUTATION_WAITS).insert(backend, waiting);
+    let _watch = MutationsObserved(backend);
+
+    let glass = BatchLine { artist: "Quillon Vane".into(), album: "Glass Orchard".into(), song: "First Light".into() };
+    let coast = BatchLine { artist: "Paper Tides".into(), album: "Quiet Coast".into(), song: "Still Water".into() };
+    lidarr.hold_response(Some(("PUT", "/api/v1/album/monitor")));
+    let batch = begun(server.call(&first, begin(1, Change::Batch { singles: false, lines: vec![glass, coast] })));
+    lidarr.wait_for_call("PUT album/monitor");
+    let single = begun(server.call(&other, begin(1, Change::Request { offer })));
+    assert_eq!(waited.recv_timeout(Duration::from_secs(4)).unwrap(), row_id(single).unwrap());
+
+    lidarr.hold_response(Some(("GET", "/api/v1/album?artistId=6")));
+    lidarr.wait_for_call("GET album?artistId=6");
+    assert_eq!(server.done(&other, single), Completed::Requested { placed: false });
+    assert!(matches!(server.call(&first, Call::After { job: batch }), Answer::Working));
+    assert!(matches!(server.call(&first, Call::AskedHistory { after: None }),
+        Answer::AskedHistory { rows, .. } if rows.len() == 1 && rows[0].release.as_str() == ALBUM));
+    assert!(matches!(server.call(&other, Call::AskedHistory { after: None }),
+        Answer::AskedHistory { rows, .. } if rows.len() == 1 && rows[0].release.as_str() == ALBUM));
+    assert!(matches!(server.call(&first, Call::BatchLines { job: batch, after: None }),
+        Answer::BatchLines { lines, .. } if lines[0].placed && matches!(lines[0].progress, BatchLineProgress::Done { .. })
+            && !lines[1].placed && matches!(lines[1].progress, BatchLineProgress::Found { .. })));
+
+    lidarr.hold_response(None);
+    assert_eq!(server.done(&first, batch), Completed::Batch);
+    assert!(matches!(server.call(&first, Call::BatchLines { job: batch, after: None }),
+        Answer::BatchLines { lines, .. } if lines.len() == 2 && lines.iter().enumerate()
+            .all(|(index, line)| usize::from(line.index) == index && line.placed
+                && matches!(line.progress, BatchLineProgress::Done { .. }))));
+    assert_eq!(lidarr.take_calls().iter().filter(|call| call.as_str() == "POST command").count(), 2);
+    assert!(matches!(server.call(&first, begin(2, cancelled())), Answer::Refused { reason: Refusal::AskedByOthers }));
 }
 
 #[test]
