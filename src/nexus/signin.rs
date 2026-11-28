@@ -15,11 +15,13 @@
 //!   folder decision) is done there, off the window's thread. What needs the window (the
 //!   player, the screens, the journal and Diagnostics, which live on the window's thread)
 //!   is run there and **waited for** before the next thing in the list.
-//! - **A keep or a forget that is not durable stops what follows it.** Nothing later in that
-//!   list is done; the lists the machine gave after it are dropped; the machine is stopped
-//!   and started again from what is actually kept, so that it never believes something is
-//!   kept that is not. The person is told. It is tried again, with a growing pause, until it
-//!   holds.
+//! - **A keep or a forget that is not durable stops what follows it, and this run is not
+//!   signed in** (W7c item 2, the lead's simple rule). Nothing later in that list is done;
+//!   the machine is stopped, and stays stopped until the app ends: nothing authenticated is
+//!   sent, the journal and Diagnostics stop publishing for the account at once, the player
+//!   sends nothing more with its music login (what is downloaded still plays), and the person
+//!   is told plainly ([`NOT_KEPT_WORDS`]). Nothing tries again by itself; the next start reads
+//!   what the store really holds.
 //! - **`start` comes first, and the player is fed only by `Hand`.** Nothing reads a music
 //!   login for the player anywhere else; a cold start is the machine's start, done the moment
 //!   the window exists. Until its first screen the window shows neither the sign-in form nor
@@ -60,8 +62,8 @@ const SIGNED_IN: &str = "nexus-sign-in";
 /// Where the sign-outs not yet taken are kept: one slot each, a stable name for each, one
 /// more than the core keeps (it keeps the new one before it drops the oldest).
 const NOTE_SLOTS: usize = core::NOTES_MAX + 1;
-/// What the first build of W7 kept its notes in, as one list: read once, moved into slots.
-const OLD_NOTES: &str = "nexus-sign-out-notes";
+/// What the person is told when a keep or a forget did not hold (W7c item 2).
+pub const NOT_KEPT_WORDS: &str = "Couldn't save your sign-in on this PC. Sign in again.";
 /// The first asks of a start go this long after it, so that nothing asked is on the way to
 /// the first page (as the component's look was).
 const START_AFTER: Duration = Duration::from_secs(5);
@@ -88,14 +90,12 @@ struct Machine {
     asks: HashMap<u64, String>,
     /// When this machine's start was: its first asks wait [`START_AFTER`] from it.
     started_at: Option<Instant>,
-    /// Starts in a row that ended in a keep that did not hold.
-    failures: u32,
     /// How many steps have given a list: each list's number ([`Batch::made`]).
     made: u64,
 }
 
 static MACHINE: LazyLock<Mutex<Machine>> =
-    LazyLock::new(|| Mutex::new(Machine { client: Client::default(), epoch: 0, started: false, app: None, asks: HashMap::new(), started_at: None, failures: 0, made: 0 }));
+    LazyLock::new(|| Mutex::new(Machine { client: Client::default(), epoch: 0, started: false, app: None, asks: HashMap::new(), started_at: None, made: 0 }));
 
 fn machine() -> MutexGuard<'static, Machine> {
     MACHINE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -109,6 +109,8 @@ fn epoch_now() -> u64 {
 static OFFLINE: AtomicBool = AtomicBool::new(false);
 /// The app is ending: nothing more is done, sent, or waited for.
 static QUITTING: AtomicBool = AtomicBool::new(false);
+/// A keep or a forget did not hold this run: the machine is stopped until the app ends.
+static NOT_KEPT: AtomicBool = AtomicBool::new(false);
 /// The music login the player holds: its number and the generation it was handed under.
 /// A refusal carries back the pair of the login refused (`music_refused`), not this.
 static HANDED: Mutex<Option<(u64, u64)>> = Mutex::new(None);
@@ -303,7 +305,7 @@ fn read_device(text: &str) -> Option<DeviceKey> {
 /// one**: then nothing is started, and it is tried again (`Err`).
 fn read_kept(paths: &config::Paths) -> Result<(Kept, View), vault::Trouble> {
     use vault::Trouble;
-    vault::sweep(paths, &[DEVICE, SIGNED_IN, OLD_NOTES, &note_slot(0), &note_slot(1), &note_slot(2), &note_slot(3), &note_slot(4)]);
+    vault::sweep(paths, &[DEVICE, SIGNED_IN, &note_slot(0), &note_slot(1), &note_slot(2), &note_slot(3), &note_slot(4)]);
     let mut unreadable = Vec::new();
     let device_secret = match vault::read(paths, DEVICE) {
         Ok(Some(text)) => read_device(&text).or_else(|| {
@@ -355,27 +357,6 @@ fn read_kept(paths: &config::Paths) -> Result<(Kept, View), vault::Trouble> {
                 unreadable.push(Forget::UnreadableNote { index: slot });
             }
             Err(Trouble::Unreachable) => return Err(Trouble::Unreachable),
-        }
-    }
-    // What the first build of W7 kept as one list: moved into slots, then forgotten.
-    if let Ok(Some(text)) = vault::read(paths, OLD_NOTES) {
-        let values: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap_or_default();
-        let mut moved = true;
-        for value in values {
-            let Some(old) = read_note(&value) else { continue };
-            if view.slots.iter().flatten().any(|(backend, session)| *backend == old.backend_id && *session == old.session()) {
-                continue;
-            }
-            let Some(slot) = (0..NOTE_SLOTS).find(|slot| view.slots[*slot].is_none() && !view.unreadable.contains(slot)) else { break };
-            if vault::write(paths, &note_slot(slot), &value.to_string()) {
-                view.slots[slot] = Some((old.backend_id.clone(), old.session()));
-                notes.push(old);
-            } else {
-                moved = false;
-            }
-        }
-        if moved {
-            vault::forget(paths, OLD_NOTES);
         }
     }
     let mut kept = Kept { device_secret, saved, notes, offline: OFFLINE.load(Ordering::SeqCst), unreadable, ..Kept::default() };
@@ -487,6 +468,10 @@ pub fn stop() {
 }
 
 fn press_on(_weak: &slint::Weak<ui::MainWindow>, press: Press) {
+    if NOT_KEPT.load(Ordering::SeqCst) {
+        // Not signed in for the rest of this run: the press is answered with the same words.
+        return not_kept_shown();
+    }
     let app = app();
     machine().app = Some(app);
     tell(Happened::Pressed(press));
@@ -513,15 +498,7 @@ pub fn music_refused(count: u64, generation: u64) {
 // ---- the worker: doing what the machine says, in order -----------------------------------------
 
 fn worker(paths: config::Paths, jobs: Receiver<Job>) {
-    let mut pending: Vec<Job> = Vec::new();
-    loop {
-        let job = match pending.pop() {
-            Some(job) => job,
-            None => match jobs.recv() {
-                Ok(job) => job,
-                Err(_) => return,
-            },
-        };
+    while let Ok(job) = jobs.recv() {
         if QUITTING.load(Ordering::SeqCst) {
             return;
         }
@@ -532,57 +509,77 @@ fn worker(paths: config::Paths, jobs: Receiver<Job>) {
                 }
             }
             Job::Start => {
+                // The start's own list, before any list given after it.
                 if let Some(batch) = start_machine(&paths) {
-                    pending.push(Job::Batch(batch));
+                    run(&paths, batch);
                 }
             }
-            Job::Batch(batch) => {
-                if batch.epoch != epoch_now() {
-                    continue;
-                }
-                let start = matches!(batch.cause, Cause::Start);
-                let epoch = batch.epoch;
-                if perform(&paths, batch) {
-                    if start {
-                        machine().failures = 0;
-                        // Who is signed in, for the journal and Diagnostics: what was kept, as
-                        // the start left it (a sign-in it forgot publishes nothing).
-                        let saved = view().record.saved.clone();
-                        on_window(epoch, move || {
-                            let saved = saved.as_ref().and_then(read_saved);
-                            crate::journal::publish_account(saved.as_ref());
-                        });
-                    }
-                } else {
-                    // A keep did not hold: every list the machine gave since is from a state
-                    // that is not kept. They go; the machine starts again from what is.
-                    while let Ok(job) = jobs.try_recv() {
-                        if let Job::Legacy(_) = job {
-                            pending.insert(0, job);
-                        }
-                    }
-                    let failures = {
-                        let mut machine = machine();
-                        machine.client.stop();
-                        machine.started = false;
-                        machine.epoch += 1;
-                        machine.failures += 1;
-                        machine.failures
-                    };
-                    window_now(|| {
-                        crate::diagnostics::detach();
-                        crate::controller::with(|ctl| ctl.toast("Windows couldn't keep your sign-in (Credential Manager). Nexus Music will try again shortly."));
-                    });
-                    let pause = Duration::from_secs(1u64 << failures.min(8)).min(Duration::from_secs(300));
-                    note(format_args!("keep failed; start again in {}s", pause.as_secs()));
-                    if wait_or_quit(pause) {
-                        return;
-                    }
-                    pending.push(Job::Start);
-                }
-            }
+            Job::Batch(batch) => run(&paths, batch),
         }
     }
+}
+
+/// Does one list. A keep or a forget in it that did not hold: this run is not signed in.
+fn run(paths: &config::Paths, batch: Batch) {
+    if batch.epoch != epoch_now() {
+        return;
+    }
+    let start = matches!(batch.cause, Cause::Start);
+    let epoch = batch.epoch;
+    if !perform(paths, batch) {
+        return not_kept();
+    }
+    if start {
+        // Who is signed in, for the journal and Diagnostics: what was kept, as the start left
+        // it (a sign-in it forgot publishes nothing).
+        let saved = view().record.saved.clone();
+        on_window(epoch, move || {
+            let saved = saved.as_ref().and_then(read_saved);
+            crate::journal::publish_account(saved.as_ref());
+        });
+    }
+}
+
+/// A keep or a forget did not hold (W7c item 2): the machine stops for the rest of this run,
+/// so that nothing it would ask or keep follows from a state that is not kept, and nothing
+/// starts it again by itself. Nothing authenticated is sent from now on.
+fn not_kept() {
+    NOT_KEPT.store(true, Ordering::SeqCst);
+    {
+        let mut machine = machine();
+        machine.client.stop();
+        machine.started = false;
+        machine.epoch += 1;
+    }
+    note(format_args!("a keep or forget did not hold: not signed in for the rest of this run"));
+    window_now(not_kept_shown);
+}
+
+/// What the window shows of it (on the window's thread): the journal and Diagnostics stop
+/// publishing for the account at once; the player sends nothing more with its music login,
+/// and what is on this PC plays on; the sign-in form says so.
+fn not_kept_shown() {
+    *HANDED.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    crate::journal::publish_account(None);
+    crate::diagnostics::detach();
+    let Some(ui) = crate::controller::with(|ctl| ctl.ui.as_weak()).and_then(|weak| weak.upgrade()) else { return };
+    let plays = crate::controller::with(|ctl| {
+        let client = ctl.client();
+        if let Some(client) = &client {
+            client.set_aside();
+        }
+        client.is_some()
+    })
+    .unwrap_or(false);
+    let app = ui.global::<ui::App>();
+    app.set_nexus_starting(false);
+    app.set_nexus_signed_in(false);
+    app.set_nexus_plays(plays);
+    app.set_nexus_sign_in_wanted(plays);
+    app.set_login_busy(false);
+    app.set_login_error(NOT_KEPT_WORDS.into());
+    ui.global::<ui::Settings>().set_nexus_row(NOT_KEPT_WORDS.into());
+    crate::controller::with(|ctl| ctl.toast(NOT_KEPT_WORDS));
 }
 
 /// Sleeps, unless the app ends first (then says so).
@@ -1075,10 +1072,11 @@ mod tests {
         static ONE: Mutex<()> = Mutex::new(());
         let one = ONE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         *view() = View { slots: vec![None; NOTE_SLOTS], ..View::default() };
+        NOT_KEPT.store(false, Ordering::SeqCst);
         let dir = std::env::temp_dir().join(format!("nexus-signin-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let paths = config::Paths::in_dir(&dir);
-        for kept in [DEVICE, SIGNED_IN, OLD_NOTES].into_iter().map(str::to_string).chain((0..NOTE_SLOTS).map(note_slot)) {
+        for kept in [DEVICE, SIGNED_IN].into_iter().map(str::to_string).chain((0..NOTE_SLOTS).map(note_slot)) {
             assert!(vault::forget(&paths, &kept));
         }
         (one, dir, paths)
@@ -1249,6 +1247,40 @@ mod tests {
         assert!(!held);
         // What followed the keep was not done.
         assert!(vault::read(&paths, DEVICE).unwrap().is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// W7c item 2: a keep that does not hold leaves this run not signed in. The machine is
+    /// stopped and is not started again by itself; nothing it is told does anything; the next
+    /// start reads what the store holds.
+    #[test]
+    fn a_keep_that_does_not_hold_leaves_this_run_signed_out_and_nothing_tries_again() {
+        let (_one, dir, paths) = profile("not-kept");
+        let epoch = {
+            let mut machine = machine();
+            machine.started = true;
+            machine.epoch += 1;
+            machine.epoch
+        };
+        let mut record = saved();
+        record.notice = None;
+        // The folder's decision reads; the sign-in's own write is what fails.
+        config::keep_legacy(&paths, &config::Legacy::default()).unwrap();
+        vault::fail_writes(Some(SIGNED_IN));
+        run(&paths, Batch::of(epoch, vec![Do::Keep(Keep::Saved(record)), Do::Forget(Forget::DeviceSecret)], Cause::Other));
+        vault::fail_writes(None);
+        assert!(NOT_KEPT.load(Ordering::SeqCst));
+        assert!(!machine().started, "the machine is stopped for the rest of the run");
+        assert_ne!(epoch_now(), epoch, "nothing given before is done");
+        // Told something now, it says nothing: there is no step, and no list.
+        let made = machine().made;
+        tell(Happened::Tick);
+        tell(Happened::Pressed(Press::SignOut));
+        assert_eq!(machine().made, made);
+        // What the store holds is what the next start reads: nothing was kept.
+        let (kept, _) = read_kept(&paths).unwrap();
+        assert!(kept.saved.is_none());
+        NOT_KEPT.store(false, Ordering::SeqCst);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
