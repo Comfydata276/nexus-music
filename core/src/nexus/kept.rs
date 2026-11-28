@@ -174,6 +174,7 @@ impl Device {
 
     /// §7.7. Persist the changed number before applying the cleared rows. An exhausted
     /// number stops the transaction and serving that device; never wrap it.
+    /// the design does not say how counters exhaust; refuse instead of reusing identities.
     fn end(&mut self, scope: &mut Scope) -> Result<(), Denied> {
         if &self.recorded != scope {
             return Err(Denied::NotSignedIn);
@@ -181,11 +182,15 @@ impl Device {
         let number = scope.number.checked_add(1).ok_or(Denied::Exhausted)?;
         scope.number = number;
         self.recorded.number = number;
+        self.clear_family();
+        Ok(())
+    }
+
+    fn clear_family(&mut self) {
         self.interrupted_promotion = None;
         self.working = None;
         self.waiting = None;
         self.pending = None;
-        Ok(())
     }
 
     /// §7.7. Expiry of the working session ends the whole device, even if a newer one waits.
@@ -360,7 +365,7 @@ impl Device {
             return Err(Denied::ProveAgain);
         }
         let life = scope.life.checked_add(1).ok_or(Denied::Exhausted)?;
-        self.end(scope)?;
+        self.clear_family();
         scope.life = life;
         self.recorded.life = life;
         Ok(())

@@ -40,7 +40,11 @@ fn a_lost_connect_reply_finds_the_same_device_and_ends_its_previous_sessions() -
     assert!(same_device("Alice", &secret, "Alice", &hash(8)));
     assert!(!same_device("Alice", &secret, "Alice", &hash(9)));
     assert!(!same_device("Alice", &secret, "Bob", &hash(8)));
-    let id = s.device;
+    let candidate = Some((&s, &secret));
+    let id = crate::nexus::prove::known_device(candidate, &hash(8))
+        .ok_or(Denied::NotSignedIn)?
+        .device;
+    assert!(crate::nexus::prove::known_device(candidate, &hash(9)).is_none());
     let number = s.number;
     connect(&mut d, &mut s, 3, 2)?;
     assert_eq!(s.device, id);
@@ -267,6 +271,19 @@ fn sleeping_reconnected_new_and_halfway_through_devices_cannot_refill_a_deleted_
     assert!(!may_refill(Some(remembered), s.life));
     assert!(!may_refill(None, s.life));
     assert!(may_refill(Some(s.life), s.life));
+    let mut reconnected = Device::new(&other);
+    connect(&mut reconnected, &mut other, 7, 4)?;
+    let mut send = |consent| {
+        if !may_refill(consent, other.life) {
+            return Err(Denied::ProveAgain);
+        }
+        reconnected
+            .arrive(&mut other, &hash(7), Access::Send, false, 5)
+            .map(|_| ())
+    };
+    assert_eq!(send(Some(remembered)), Err(Denied::ProveAgain));
+    assert_eq!(send(None), Err(Denied::ProveAgain));
+    send(Some(s.life))?;
     Ok(())
 }
 
@@ -278,6 +295,10 @@ fn a_restore_between_two_calls_ends_both_sessions_and_invalidates_the_first_call
     let t = d.begin(&mut s, Purpose::Connect, 2)?;
     restore_device(&mut d, &mut s, 2)?;
     assert_eq!(d.complete(&mut s, r, false, 3), Err(Denied::NotSignedIn));
+    assert_eq!(
+        d.arrive(&mut s, &hash(1), Access::Read, false, 3).err(),
+        Some(Denied::NotSignedIn)
+    );
     assert_eq!(
         d.finish(&mut s, t, "Alice", Some(hash(3)), 3),
         Err(Denied::NotSignedIn)
@@ -456,6 +477,17 @@ fn clocks_and_numbers_near_their_limits_cannot_extend_leave_or_wrap() -> Result<
     assert_eq!(d.end(&mut s), Err(Denied::Exhausted));
     let (mut d, mut s) = connected()?;
     assert_eq!(again(&mut d, &mut s, 1, 1, 1), Err(Denied::ReusedSession));
+    let mut near = Scope {
+        life: u64::MAX,
+        number: u64::MAX - 1,
+        ..scope()
+    };
+    let mut live = Device::new(&near);
+    connect(&mut live, &mut near, 7, u64::MAX - 2)?;
+    leave(&mut live, &mut near, 7, u64::MAX - 1)?;
+    assert_eq!(live.delete(&mut near, &hash(7), u64::MAX), Err(Denied::Exhausted));
+    assert_eq!(near.life, u64::MAX);
+    assert_eq!(near.number, u64::MAX);
     Ok(())
 }
 

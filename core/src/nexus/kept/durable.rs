@@ -27,6 +27,7 @@ pub struct Rows {
     pub waiting: Option<Session>,
 }
 
+/// §9.2: the design does not say how to recognize session revocations and partial grants.
 /// The apart store keeps at most two permitted session numbers and their delete leave.
 /// It never needs the bearer or even its hash.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -79,7 +80,7 @@ impl Apart {
 pub enum Family {
     /// End this device's working, waiting, try and leave.
     Device,
-    /// In the apart transaction, end and advance *every* device of this account. In
+    /// In the apart transaction, advance the account life, ending every device. In
     /// the data transaction erase the account's history and its devices (§11.1).
     Account,
     /// In the apart transaction advance restore and end every device on this backend.
@@ -359,13 +360,15 @@ impl Family {
         }
         let mut scope = other.clone();
         match self {
-            Family::Backend => scope.restore = next.restore,
+            Family::Backend => {
+                scope.restore = next.restore;
+                scope.number = scope.number.checked_add(1).ok_or(Denied::Exhausted)?;
+            }
             Family::Account if source.account == other.account && source.life == other.life => {
                 scope.life = next.life
             }
             _ => return Ok(None),
         }
-        scope.number = scope.number.checked_add(1).ok_or(Denied::Exhausted)?;
         Ok(Some(scope))
     }
 }

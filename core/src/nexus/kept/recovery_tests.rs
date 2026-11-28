@@ -248,7 +248,7 @@ fn delete_proof_and_ending_in_either_order_cannot_leave_power_to_delete() -> Res
 }
 
 #[test]
-fn deleting_on_one_device_also_advances_the_sleeping_devices_number() -> Result<(), Denied> {
+fn deleting_on_one_device_ends_a_sleeping_device_by_life_alone() -> Result<(), Denied> {
     let mut s = Stored::new();
     s.proof(Purpose::Connect, Some(1), 0)?;
     s.proof(Purpose::Delete(hash(1)), None, 1)?;
@@ -270,7 +270,7 @@ fn deleting_on_one_device_also_advances_the_sleeping_devices_number() -> Result<
         let next = Family::Account
             .end_other(update, &other)?
             .ok_or(Denied::NotSignedIn)?;
-        assert_eq!((next.life, next.number), (other.life + 1, other.number + 1));
+        assert_eq!((next.life, next.number), (other.life + 1, other.number));
         assert!(!may_refill(Some(other.life), next.life));
         Ok(())
     })?
