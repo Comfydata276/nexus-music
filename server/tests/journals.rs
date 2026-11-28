@@ -941,3 +941,326 @@ fn a_page_cannot_spend_a_grant_that_locks_out_its_own_administrator() {
     assert_eq!(again.person.id, admin.person.id);
     assert!(again.person.admin);
 }
+
+mod listening {
+    use super::*;
+    use nexus_core::nexus::admin::{self, listening as wire};
+
+    const DAY: u64 = 86_400_000;
+
+    fn now() -> u64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
+    }
+
+    // Local fixtures while the store's forward migration is pending.
+    fn test_index(fixture: &Fixture) {
+        fixture.db().execute_batch(
+            "CREATE INDEX IF NOT EXISTS listening_by_time ON listening_events(at_ms DESC, row_id DESC) WHERE is_start = 1;",
+        ).unwrap();
+    }
+
+    fn query(
+        fixture: &Fixture, who: &SignedIn, stamp: &Stamp, account: Option<account::AccountId>,
+        days: u64, page: Option<wire::Page>,
+    ) -> (u16, Vec<u8>) {
+        let body = admin::encode(&wire::Request {
+            head: head(stamp), account, days: wire::Days::new(days).unwrap(), page,
+        }).unwrap();
+        let mut socket = fixture.request(wire::PATH, Some(&who.session), BROWSER, body.bytes().len());
+        socket.write_all(body.bytes()).unwrap();
+        let mut from = BufReader::new(socket);
+        let head = probe::read_head(&mut from).unwrap().unwrap();
+        assert_eq!(head.one("cache-control"), Some("no-store"));
+        let mut bytes = Vec::new();
+        probe::body(&head, from).unwrap().read_to_end(&mut bytes).unwrap();
+        (head.status, bytes)
+    }
+
+    fn overview(
+        fixture: &Fixture, who: &SignedIn, stamp: &Stamp, account: Option<account::AccountId>, days: u64,
+    ) -> wire::Overview {
+        let (status, body) = query(fixture, who, stamp, account, days, None);
+        assert_eq!(status, 200);
+        let admin::Reply::Done(result) = admin::read_reply(status, &body).unwrap()
+            else { panic!("overview refused") };
+        result
+    }
+
+    fn song(n: u64, when: u64, title: &str, artist: &str) -> Placed {
+        Record::new(id(n), when, Kind::Start {
+            song_id: format!("library-id-{n}"),
+            title: title.into(),
+            artist: artist.into(),
+            album: "Same album title".into(),
+            from: PlayedFrom::Queue,
+            began: Began::PressedHere,
+            sound: Sound::Streamed,
+            position_ms: 0,
+        }).unwrap().place(n).unwrap()
+    }
+
+    #[test]
+    fn listening_uses_the_requested_utc_period_and_grouping_and_requires_the_browser_session() {
+        let mut fixture = Fixture::new("listening-period");
+        let code = fixture.set_up();
+        let member_code = fixture.other();
+        test_index(&fixture);
+        let clock = fixture.start_with_clock();
+        let (owner, owner_stamp) = fixture.sign_in(with_code(code), 1);
+        let (member, member_stamp) = fixture.sign_in(with_code(member_code), 2);
+        let (page_session, stamp) = fixture.sign_in_with(with_password(), 3, BROWSER);
+        let end = clock.load(Ordering::SeqCst);
+
+        let empty = overview(&fixture, &page_session, &stamp, None, 90);
+        assert_eq!((empty.start_ms, empty.end_ms, empty.starts), (end - 90 * DAY, end, 0));
+        assert!(empty.artists.as_slice().is_empty() && empty.albums.as_slice().is_empty());
+        assert!(empty.songs.as_slice().is_empty());
+        assert!(empty.people.rows.as_slice().is_empty() && empty.people.next.is_none());
+        assert!(empty.recent.rows.as_slice().is_empty() && empty.recent.next.is_none());
+
+        // No request body is sent. The S9c gate gives the same refusal as on
+        // the other admin routes before it asks for the declared body.
+        let app = fixture.request(wire::PATH, Some(&owner.session), BROWSER, 100);
+        let other_admin = fixture.request(admin::LIST_ACCOUNTS, Some(&owner.session), BROWSER, 100);
+        let refused = response(app);
+        assert_eq!(refused.0, 403);
+        assert_eq!(refused, response(other_admin));
+        let ask = admin::encode(&wire::Request {
+            head: head(&stamp), account: None, days: wire::Days::new(7).unwrap(), page: None,
+        }).unwrap();
+        let bad_origin = "Origin: https://other.example.org\r\nX-Nexus-Admin: 1\r\n";
+        assert_eq!(fixture.post_with(wire::PATH, Some(&page_session), bad_origin, ask.bytes()).0, 400);
+
+        let open = Record::new(id(7), end - 1, Kind::Open {
+            version: Version::parse("0.41.0").unwrap(), device: DeviceKind::Pc,
+        }).unwrap().place(7).unwrap();
+        let sent = batch(&owner_stamp, &[
+            song(1, end - 1, "A song", "A artist"),
+            song(2, end - 7 * DAY, "A song", "A artist"),
+            song(3, end - 7 * DAY - 1, "Earlier", "A artist"),
+            song(4, end - 90 * DAY, "Old", "A artist"),
+            song(5, end, "At end", "A artist"),
+            song(6, end - 90 * DAY - 1, "Outside", "A artist"),
+            open,
+        ]);
+        let first = send(&fixture, &owner, &sent);
+        assert_outcomes(first, &sent, &[Outcome::Taken; 7]);
+        assert_outcomes(send(&fixture, &owner, &sent), &sent, &[Outcome::Taken; 7]);
+        let sent = batch(&member_stamp, &[
+            song(1, end - 2, "B song", "Z artist"),
+            song(2, end - 3, "B song", "Z artist"),
+            song(3, end - 30 * DAY, "At 30 days", "Z artist"),
+        ]);
+        assert_outcomes(send(&fixture, &member, &sent), &sent, &[Outcome::Taken; 3]);
+
+        let (_, result) = query(&fixture, &page_session, &stamp, None, 7, None);
+        assert_eq!(json::<i64>(&result, "$.done.starts"), 4);
+        assert_eq!(json::<String>(&result, "$.done.artists[0].artist"), "A artist");
+        assert_eq!(json::<String>(&result, "$.done.artists[1].artist"), "Z artist");
+        assert_eq!(json::<i64>(&result, "$.done.albums[0].starts"), 2);
+        assert_eq!(json::<i64>(&result, "$.done.albums[1].starts"), 2);
+        assert_eq!(json::<i64>(&result, "$.done.songs[0].starts"), 2);
+        assert_eq!(json::<String>(&result, "$.done.songs[0].title"), "A song");
+        assert_eq!(json::<String>(&result, "$.done.songs[1].title"), "B song");
+
+        for (days, count) in [(7, 4), (30, 6), (90, 7)] {
+            let result = overview(&fixture, &page_session, &stamp, None, days);
+            assert_eq!((result.start_ms, result.end_ms, result.starts), (end - days * DAY, end, count));
+        }
+        let scoped = overview(&fixture, &page_session, &stamp, Some(member.person.id), 30);
+        assert_eq!(scoped.starts, 3);
+        assert_eq!(scoped.people.rows.as_slice().len(), 1);
+        assert_eq!(scoped.people.rows.as_slice()[0].account, member.person.id);
+    }
+
+    fn open_store(fixture: &Fixture, now: u64) -> Keeper {
+        Keeper::open(&fixture.root.join("state"), &fixture.root.join("data"), now)
+            .unwrap_or_else(|why| panic!("{why}")).0
+    }
+
+    fn insert_seed<const N: usize>(
+        insert: &mut rusqlite::Statement<'_>, account: i64, events: [Placed; N],
+    ) -> rusqlite::Result<()> {
+        for event in events {
+            let line = event.line().unwrap();
+            insert.execute(params![
+                account, event.record().id().to_hex(), event.record().at_ms() as i64,
+                std::str::from_utf8(&line).unwrap(),
+            ])?;
+        }
+        Ok(())
+    }
+
+    const SEED: &str = "INSERT INTO listening_events(account,device,event_id,at_ms,is_start,line)
+                        VALUES (?1,1,?2,?3,1,?4)";
+
+    fn delete_history(fixture: &Fixture, who: &SignedIn, stamp: &Stamp) {
+        let request_id = RequestId::new(20).unwrap();
+        let request = account::encode(&GrantRequest {
+            head: head(stamp), password: Password::presented(PASSWORD).unwrap(),
+            change: GrantChange::DeleteListeningData {
+                account: who.person.id, target_revision: who.person.revision, request_id,
+            },
+        }).unwrap();
+        let (status, body) = fixture.post(account::GRANT, Some(who), request.bytes());
+        let Reply::Done { result: GrantIssued { grant }, .. } = account::read_reply(status, &body).unwrap()
+            else { panic!("history grant refused") };
+        let delete = account::encode(&DeleteListeningData {
+            head: head(stamp), request_id, grant,
+            change: DeleteListeningDataTarget { account: who.person.id, target_revision: who.person.revision },
+        }).unwrap();
+        assert_eq!(fixture.post(events::DELETE_PATH, Some(who), delete.bytes()).0, 200);
+    }
+
+    fn delete_account(fixture: &Fixture, who: &SignedIn, stamp: &Stamp, target: account::AccountId) {
+        let request_id = RequestId::new(21).unwrap();
+        let body = admin::encode(&admin::RequestGrant {
+            head: head(stamp),
+            password: Password::presented(PASSWORD).unwrap(),
+            change: admin::NamedChange { request_id, action: admin::Action::DeleteAccount(target) },
+        }).unwrap();
+        let (status, body) = fixture.post_with(admin::REQUEST_GRANT, Some(who), BROWSER, body.bytes());
+        let admin::Reply::Done(GrantIssued { grant }) = admin::read_reply(status, &body).unwrap()
+            else { panic!("account deletion grant refused") };
+        let body = admin::encode(&admin::DeleteAccount {
+            head: head(stamp), request_id, grant, change: admin::DeleteTarget { account: target },
+        }).unwrap();
+        assert_eq!(fixture.post_with(admin::DELETE_ACCOUNT, Some(who), BROWSER, body.bytes()).0, 200);
+    }
+
+    #[test]
+    fn listening_continuations_follow_stable_keys_hide_deleted_history_and_exclude_late_uploads() {
+        let mut fixture = Fixture::new("listening-pages");
+        let code = fixture.set_up();
+        let member_code = fixture.other();
+        test_index(&fixture);
+        let start = now();
+        // These starts age out of a fresh seven-day window when the clock
+        // advances after the first page, but stay inside that page's interval.
+        let played_when = start - 7 * DAY + 4 * 60_000;
+        let mut keeper = open_store(&fixture, start);
+        let mut accounts = Vec::new();
+        for n in 0..26 {
+            let email = format!("listener-{n}@example.org");
+            let name = format!("Listener {n}");
+            accounts.push(keeper.make_account(&email, &name, false, First::Nothing, start).unwrap());
+        }
+        keeper.write_data(start, |db| {
+            let mut row = db.prepare(SEED)?;
+            for &account in &accounts {
+                insert_seed(&mut row, account as i64, [
+                    song(1, played_when, "Seed one", "Artist"),
+                    song(2, played_when, "Seed two", "Artist"),
+                ])?;
+            }
+            Ok(((), true))
+        }).unwrap();
+        keeper.close();
+        let clock = fixture.start_with_clock();
+        let (owner, owner_stamp) = fixture.sign_in(with_code(code), 1);
+        let (member, member_stamp) = fixture.sign_in(with_code(member_code), 2);
+        let (page_session, stamp) = fixture.sign_in_with(with_password(), 3, BROWSER);
+        let sent = batch(&member_stamp, &[song(7, played_when - 1, "Will be removed", "Artist")]);
+        assert_outcomes(send(&fixture, &member, &sent), &sent, &[Outcome::Taken]);
+
+        let initial = overview(&fixture, &page_session, &stamp, None, 7);
+        assert_eq!(initial.starts, 53);
+        let token = initial.recent.next.as_ref().unwrap().as_str();
+        let cursor = || wire::Cursor::new(token.into()).unwrap();
+        for (days, account, wrong) in [
+            (30, None, wire::Page::Recent(cursor())),
+            (7, Some(owner.person.id), wire::Page::Recent(cursor())),
+            (7, None, wire::Page::People(cursor())),
+        ] {
+            assert_eq!(query(&fixture, &page_session, &stamp, account, days, Some(wrong)).0, 400);
+        }
+        let mut tampered = token.to_owned();
+        let replacement = if tampered.starts_with('A') { "B" } else { "A" };
+        tampered.replace_range(..1, replacement);
+        assert_eq!(query(&fixture, &page_session, &stamp, None, 7, Some(wire::Page::Recent(
+            wire::Cursor::new(tampered).unwrap(),
+        ))).0, 400);
+
+        let late = batch(&owner_stamp, &[song(9, played_when - 2, "Sent late", "Artist")]);
+        assert_outcomes(send(&fixture, &owner, &late), &late, &[Outcome::Taken]);
+        delete_history(&fixture, &member, &member_stamp);
+        let (status, body) = send(&fixture, &member, &sent);
+        assert!(matches!(events::read_reply(status, &body, &sent), Err(events::Wrong::LifeMoved { .. })));
+
+        assert_eq!(overview(&fixture, &page_session, &stamp, Some(owner.person.id), 7).starts, 1);
+        clock.fetch_add(5 * 60_000, Ordering::SeqCst);
+        assert_eq!(overview(&fixture, &page_session, &stamp, None, 7).starts, 0);
+
+        let mut recent = initial.recent;
+        let mut last = (u64::MAX, u64::MAX);
+        let mut plays = 0;
+        for _ in 0..3 {
+            for play in recent.rows.as_slice() {
+                let key = (play.at_ms, play.id);
+                assert!(key < last);
+                last = key;
+                assert_eq!(play.at_ms, played_when);
+                plays += 1;
+            }
+            let Some(next) = recent.next.take() else { break };
+            let (status, body) = query(&fixture, &page_session, &stamp, None, 7, Some(wire::Page::Recent(next)));
+            let admin::Reply::Done(result) = admin::read_reply(status, &body).unwrap()
+                else { panic!("recent page refused") };
+            recent = result;
+        }
+        assert_eq!(plays, 52);
+        assert!(recent.next.is_none());
+        assert_eq!(recent.rows.as_slice().len(), 2);
+
+        let first_people = initial.people;
+        let expected_first = accounts[..25].iter().copied();
+        assert!(first_people.rows.as_slice().iter().map(|person| person.account.get()).eq(expected_first));
+        let (status, body) = query(
+            &fixture, &page_session, &stamp, None, 7,
+            Some(wire::Page::People(first_people.next.unwrap())),
+        );
+        let admin::Reply::Done(people) = admin::read_reply::<wire::PeoplePage>(status, &body).unwrap()
+            else { panic!("people page refused") };
+        assert!(people.next.is_none());
+        assert_eq!(people.rows.as_slice().len(), 1);
+        assert_eq!(people.rows.as_slice()[0].account.get(), accounts[25]);
+        assert_eq!(overview(&fixture, &page_session, &stamp, Some(member.person.id), 30).starts, 0);
+
+        let removed = account::AccountId::new(accounts[25]).unwrap();
+        delete_account(&fixture, &page_session, &stamp, removed);
+        assert_eq!(overview(&fixture, &page_session, &stamp, Some(removed), 30).starts, 0);
+        assert_eq!(overview(&fixture, &page_session, &stamp, None, 30).starts, 51);
+    }
+
+    #[test]
+    #[ignore = "measure an overview over one heavy listener's year"]
+    fn measure_listening_overview() {
+        let mut fixture = Fixture::new("listening-measure");
+        let code = fixture.set_up();
+        test_index(&fixture);
+        let end = now();
+        let mut keeper = open_store(&fixture, end);
+        let account = keeper.account_named(EMAIL).unwrap().unwrap() as i64;
+        keeper.write_data(end, |db| {
+            let mut row = db.prepare(SEED)?;
+            for n in 0..109_500 {
+                let when = end - (n / 300) * DAY - (n % 300) * 1000 - 180_000;
+                insert_seed(&mut row, account, [song(
+                    n + 1, when, &format!("Song {}", n % 2000), &format!("Artist {}", n % 200),
+                )])?;
+            }
+            Ok(((), true))
+        }).unwrap();
+        keeper.close();
+        fixture.start_with_clock();
+        let (page_session, stamp) = fixture.sign_in_with(with_code(code), 1, BROWSER);
+        for scope in [None, Some(page_session.person.id)] {
+            let start = Instant::now();
+            let answer = overview(&fixture, &page_session, &stamp, scope, 90);
+            let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+            assert_eq!(answer.starts, 27_000);
+            eprintln!("90 days, {} scope: {:.1} ms for {} starts in a year of 109500",
+                if scope.is_some() { "one account" } else { "all accounts" }, elapsed, answer.starts);
+        }
+    }
+}
