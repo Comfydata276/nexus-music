@@ -2,10 +2,10 @@
 //! keeps the receipt fences, and owns the code lookup and account transaction.
 
 use crate::store::data::Password as StoredPassword;
-use argon2::{Algorithm, Argon2, Params, Version};
+use argon2::{Algorithm, Argon2, Block, Params, Version};
 use nexus_core::nexus::{
     account::{
-        CodeLimit, DummySaltKey, Email, PASSWORD_QUEUE_MS, PASSWORD_SALT_BYTES, Password,
+        CodeLimit, DeviceId, DummySaltKey, Email, PASSWORD_QUEUE_MS, PASSWORD_SALT_BYTES, Password,
         PasswordAdmission, PasswordDoor, PasswordLoad, PasswordWaits, Refusal,
         admit_password_check, resume_password_check,
     },
@@ -36,7 +36,7 @@ impl Profile {
     }
 
     fn params(self) -> Result<Params, Refusal> {
-        // Pending C7's historical-profile policy, retain the current resource ceilings.
+        // The design gives no historical profiles. Keep the current resource ceiling.
         if self.memory > CURRENT.memory || self.passes > CURRENT.passes || self.lanes > CURRENT.lanes {
             return Err(Refusal::NotDealtWith);
         }
@@ -51,9 +51,16 @@ type Slow = dyn Fn(&Password, &Salt, Profile) -> Result<Hash, Refusal> + Send + 
 type Clock = dyn Fn() -> u64 + Send + Sync;
 
 fn argon(password: &Password, salt: &Salt, profile: Profile) -> Result<Hash, Refusal> {
+    let params = profile.params()?;
+    let blocks = params.block_count();
+    // The crate's convenience allocator does not wipe its working blocks.
+    let mut memory = Zeroizing::new(Vec::<Block>::new());
+    memory.try_reserve_exact(blocks).map_err(|_| Refusal::NotDealtWith)?;
+    memory.resize(blocks, Block::default());
+
     let mut hash = Zeroizing::new([0; HASH_BYTES]);
-    Argon2::new(Algorithm::Argon2id, Version::V0x13, profile.params()?)
-        .hash_password_into(password.expose().as_bytes(), salt, hash.as_mut())
+    Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+        .hash_password_into_with_memory(password.expose().as_bytes(), salt, hash.as_mut(), memory.as_mut_slice())
         .map_err(|_| Refusal::NotDealtWith)?;
     Ok(hash)
 }
@@ -69,6 +76,7 @@ enum Work {
     Fingerprint,
 }
 
+#[derive(Debug)]
 enum Completed {
     Checked(Checked),
     Fingerprint(StoredPassword),
@@ -76,6 +84,7 @@ enum Completed {
 
 struct Engine {
     clock: Arc<Clock>,
+    waits: Mutex<PasswordWaits>,
     dummy_key: DummySaltKey,
     slow: Box<Slow>,
 }
@@ -124,7 +133,8 @@ type Answer = Result<Completed, Refusal>;
 struct Job {
     id: Arc<()>,
     email: Email,
-    password: Password,
+    device: Option<DeviceId>,
+    password: Box<Password>,
     work: Work,
     reply: oneshot::Sender<Answer>,
 }
@@ -136,7 +146,6 @@ struct Waiting {
 
 #[derive(Default)]
 struct State {
-    waits: PasswordWaits,
     waiting: VecDeque<Waiting>,
     ready: Option<Job>,
     running: Option<Email>,
@@ -149,13 +158,12 @@ impl State {
             || self.ready.as_ref().is_some_and(|job| &job.email == email)
     }
 
-    fn expire_waiting(&mut self, now: u64) {
-        self.waits.expire(now);
+    fn expire_waiting(&mut self, waits: &PasswordWaits, now: u64) {
         for _ in 0..self.waiting.len() {
             let Some(waiting) = self.waiting.pop_front() else { break };
             let admission = resume_password_check(
                 waiting.queued_at, true, self.account_busy(&waiting.job.email),
-                &self.waits, &waiting.job.email, now,
+                waits, &waiting.job.email, now,
             );
             if let Some(refusal) = admission.refusal() {
                 drop(waiting.job.password);
@@ -166,10 +174,10 @@ impl State {
         }
     }
 
-    fn take_next(&mut self, now: u64) -> Option<Job> {
+    fn take_next(&mut self, waits: &PasswordWaits, now: u64) -> Option<Job> {
         let job = self.ready.take().or_else(|| {
             while let Some(Waiting { queued_at, job }) = self.waiting.pop_front() {
-                let admission = resume_password_check(queued_at, false, false, &self.waits, &job.email, now);
+                let admission = resume_password_check(queued_at, false, false, waits, &job.email, now);
                 if admission == PasswordAdmission::Check {
                     return Some(job);
                 }
@@ -198,36 +206,43 @@ impl Lane {
     fn submit(
         self: &Arc<Self>,
         email: &Email,
+        device: Option<DeviceId>,
         password: Password,
         work: Work,
     ) -> Result<Pending, Refusal> {
         let mut state = self.state.lock().unwrap();
+        let mut waits = self.engine.waits.lock().unwrap();
         let now = (self.engine.clock)();
-        state.expire_waiting(now);
+        waits.expire(now);
+        state.expire_waiting(&waits, now);
         let load = PasswordLoad {
             worker_busy: state.running.is_some() || state.ready.is_some(),
             account_busy: state.account_busy(email),
             waiting: state.waiting.len(),
         };
-        let admission = admit_password_check(self.door, load, &state.waits, email, now);
-        if let Some(refusal) = admission.refusal() {
-            return Err(refusal);
-        }
-
-        let (reply, receiver) = oneshot::channel();
-        let id = Arc::new(());
-        let job = Job { id: Arc::clone(&id), email: email.clone(), password, work, reply };
+        let admission = admit_password_check(self.door, load, &waits, email, device, now);
+        drop(waits);
         let queued_at = match admission {
-            PasswordAdmission::Check => {
-                state.ready = Some(job);
-                None
-            }
-            PasswordAdmission::WaitForWorker => {
-                state.waiting.push_back(Waiting { queued_at: now, job });
-                Some(now)
-            }
+            PasswordAdmission::Check => None,
+            PasswordAdmission::WaitForWorker => Some(now),
             denied => return Err(denied.refusal().unwrap_or(Refusal::NotDealtWith)),
         };
+        let (reply, receiver) = oneshot::channel();
+        let id = Arc::new(());
+        let job = Job {
+            id: Arc::clone(&id),
+            email: email.clone(),
+            device,
+            // Queue slots hold a pointer, so moving a job leaves no inline password in a slot.
+            password: Box::new(password),
+            work,
+            reply,
+        };
+        if let Some(queued_at) = queued_at {
+            state.waiting.push_back(Waiting { queued_at, job });
+        } else {
+            state.ready = Some(job);
+        }
         self.changed.notify_one();
         Ok(Pending { lane: Arc::clone(self), id, queued_at, receiver })
     }
@@ -239,25 +254,33 @@ impl Lane {
                 if state.closed {
                     return;
                 }
-                if let Some(job) = state.take_next((self.engine.clock)()) {
+                let next = {
+                    let waits = self.engine.waits.lock().unwrap();
+                    state.take_next(&waits, (self.engine.clock)())
+                };
+                if let Some(job) = next {
                     break job;
                 }
                 state = self.changed.wait(state).unwrap();
             };
             drop(state);
 
-            let Job { email, password, work, reply, .. } = job;
+            let Job { email, device, password, work, reply, .. } = job;
             let result = match work {
                 Work::Check(stored) => self.engine.check(&password, &email, stored).map(Completed::Checked),
                 Work::Fingerprint => self.engine.fresh(&password).map(Completed::Fingerprint),
             };
             drop(password);
             let mut state = self.state.lock().unwrap();
-            let now = (self.engine.clock)();
-            if matches!(result, Ok(Completed::Checked(Checked::Wrong))) {
-                state.waits.record_wrong(self.door, &email, now);
+            let wrong = matches!(result, Ok(Completed::Checked(Checked::Wrong)));
+            if self.door == PasswordDoor::Other || wrong {
+                let mut waits = self.engine.waits.lock().unwrap();
+                let now = (self.engine.clock)();
+                if wrong {
+                    waits.record_wrong(self.door, &email, device, now);
+                }
+                state.expire_waiting(&waits, now);
             }
-            state.expire_waiting(now);
             state.running = None;
             let _ = reply.send(result);
         }
@@ -288,7 +311,9 @@ impl Pending {
                 if remaining == 0 {
                     // Expire only queued work. Dispatch and expiry share this lock,
                     // so a job already running is left to finish.
-                    self.lane.state.lock().unwrap().expire_waiting(now);
+                    let mut state = self.lane.state.lock().unwrap();
+                    let waits = self.lane.engine.waits.lock().unwrap();
+                    state.expire_waiting(&waits, now);
                     break;
                 }
                 if let Ok(answer) = tokio::time::timeout(Duration::from_millis(remaining), &mut self.receiver).await {
@@ -323,7 +348,7 @@ impl PasswordWorkers {
     pub fn new(dummy_key: DummySaltKey) -> Result<Self, Refusal> {
         let start = Instant::now();
         let clock = Arc::new(move || start.elapsed().as_millis().try_into().unwrap_or(u64::MAX));
-        Self::with_engine(Engine { clock, dummy_key, slow: Box::new(argon) })
+        Self::with_engine(Engine { clock, waits: Mutex::default(), dummy_key, slow: Box::new(argon) })
     }
 
     fn with_engine(engine: Engine) -> Result<Self, Refusal> {
@@ -360,24 +385,26 @@ impl PasswordWorkers {
         &self,
         email: &Email,
         door: PasswordDoor,
+        device: Option<DeviceId>,
         password: Password,
         stored: Option<StoredPassword>,
     ) -> Result<Checked, Refusal> {
-        match self.lane(door).submit(email, password, Work::Check(stored))?.finish().await? {
+        match self.lane(door).submit(email, device, password, Work::Check(stored))?.finish().await? {
             Completed::Checked(answer) => Ok(answer),
             Completed::Fingerprint(_) => Err(Refusal::NotDealtWith),
         }
     }
 
-    /// New passwords use the given door's admission while separate admission
-    /// for authorized fingerprint work is pending in core.
+    /// New fingerprints use the supplied door's admission. A known device
+    /// must have an authenticated ID. This work does not record a wrong try.
     pub async fn fingerprint(
         &self,
         email: &Email,
         door: PasswordDoor,
+        device: Option<DeviceId>,
         password: Password,
     ) -> Result<StoredPassword, Refusal> {
-        match self.lane(door).submit(email, password, Work::Fingerprint)?.finish().await? {
+        match self.lane(door).submit(email, device, password, Work::Fingerprint)?.finish().await? {
             Completed::Fingerprint(password) => Ok(password),
             Completed::Checked(_) => Err(Refusal::NotDealtWith),
         }
@@ -405,4 +432,5 @@ impl Drop for PasswordWorkers {
 }
 
 #[cfg(test)]
+#[path = "check/tests.rs"]
 mod tests;
