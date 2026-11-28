@@ -228,6 +228,7 @@ def pcm_at_least(home, size):
 
 def flushes(log):
     lines = [line for line in log.read_text().splitlines() if "flushed on the window's thread" in line]
+    assert any("plays.log" in line for line in lines), "the trace must include the legacy play-log flush"
     durations = [float(line.split(" in ", 1)[1].split(" ms:", 1)[0]) for line in lines]
     return len(lines), max(durations, default=0)
 
@@ -341,7 +342,7 @@ def walk(profile, port, temporary, baseline, candidate):
     settings_path = recorded / "config/settings.json"
     settings = json.loads(settings_path.read_bytes())
     settings_path.write_text(json.dumps(settings | {"offline": True}))
-    with Player(recorded, 29486, True, candidate, clock):
+    with Player(recorded, 29486, True, candidate, clock) as app:
         recovered = until(lambda: event(recorded, "stop", start=second["id"], why={"kind": "unknown"}), "restart Stop")
         assert recovered["event"]["position_ms"] is not None
         assert file.read_bytes() == flushed
@@ -351,6 +352,12 @@ def walk(profile, port, temporary, baseline, candidate):
         until(lambda: any(row["event"]["kind"] == "open" for row in rows(recorded)[len(old_rows):]),
               "the new Open recorded while offline")
         assert json.loads(settings_path.read_bytes())["repeat"] == 1
+        settings_tab(app, "About", "What is sent")
+        app.press("What is sent")
+        report = app.one(contains="What the player has met")["accessibleLabel"]
+        assert any(line in report.splitlines() for line in (
+            "Events dropped because the journal queue was full: 1", "Events not written: 1",
+        )), report
     print("Full play-log bytes, PCM through the gapless join and after a seek, Start/Stop, "
           "pause/resume, zero-result search, Diagnostics privacy, zero journal window flushes, "
           "Repeat across SIGKILL and torn-tail recovery verified.")
@@ -362,6 +369,9 @@ if __name__ == "__main__":
     parser.add_argument("--baseline", type=Path, default=Path("target/nexus-music-v0.40.13"))
     parser.add_argument("--candidate", type=Path, default=Path("target/nexus-music-w8-audit"))
     options = parser.parse_args()
+    for binary in (options.baseline, options.candidate):
+        if not binary.is_file():
+            parser.error(f"missing headless binary {binary}")
     with tempfile.TemporaryDirectory(prefix="nexus-w8-") as location, ThreadingHTTPServer(("127.0.0.1", 0), Music) as server:
         run = threading.Thread(target=server.serve_forever)
         run.start()
