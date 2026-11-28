@@ -123,6 +123,15 @@ pub enum FaultShape {
     NoSound,
     QueueFull,
     JournalFull,
+    BorrowConflict,
+    PoisonedLock,
+    MissingValue,
+    UnexpectedResultError,
+    Bounds,
+    Assertion,
+    Overflow,
+    NoPayload,
+    Panic,
     Other,
 }
 

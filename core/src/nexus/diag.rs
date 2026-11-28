@@ -232,6 +232,8 @@ words!(Note {
     StartAgain => "Nexus asked to start again",
     EventsSent => "Events sent",
     EventsRefused => "Events refused",
+    AppMessage => "App message shown",
+    DownloadsFolderChanged => "Downloads folder changed",
     MediaButtonStarted => "Media button started the player",
     MediaButtonNothingToResume => "Media button had nothing to resume",
     MediaButtonStartRefused => "Android refused to start the player from a media button",
@@ -326,8 +328,51 @@ const SHAPES: &[(FaultShape, &str)] = &[
     (FaultShape::NoSound, "no sound"),
     (FaultShape::QueueFull, "queue full"),
     (FaultShape::JournalFull, "journal full"),
+    (FaultShape::BorrowConflict, "borrow conflict"),
+    (FaultShape::PoisonedLock, "poisoned lock"),
+    (FaultShape::MissingValue, "missing value"),
+    (FaultShape::UnexpectedResultError, "unexpected result error"),
+    (FaultShape::Bounds, "out of bounds"),
+    (FaultShape::Assertion, "assertion failed"),
+    (FaultShape::Overflow, "overflow"),
+    (FaultShape::NoPayload, "no panic payload"),
+    (FaultShape::Panic, "panic"),
     (FaultShape::Other, "other"),
 ];
+
+/// Classify the Rust panic payload using fixed markers. The result has no text field.
+/// The design does not say how to recognize panic kinds. Unknown wording is a panic
+/// without a more specific shape. The Windows hook writes "no message" for a
+/// non-text payload.
+pub fn classify_rust_panic(message: &str) -> FaultShape {
+    if matches!(message, "no message" | "no payload") || message.chars().all(char::is_whitespace) {
+        FaultShape::NoPayload
+    } else if ["BorrowMutError", "BorrowError", "already borrowed", "already mutably borrowed"]
+        .iter()
+        .any(|marker| message.contains(marker))
+    {
+        FaultShape::BorrowConflict
+    } else if message.contains("PoisonError") {
+        FaultShape::PoisonedLock
+    } else if message.contains("called `Option::unwrap()` on a `None` value") {
+        FaultShape::MissingValue
+    } else if message.contains("called `Result::unwrap()` on an `Err` value") {
+        FaultShape::UnexpectedResultError
+    } else if ["index out of bounds", "out of range for slice", "is not a char boundary", "slice index starts at"]
+        .iter()
+        .any(|marker| message.contains(marker))
+    {
+        FaultShape::Bounds
+    } else if message.contains("assertion failed")
+        || (message.contains("assertion `") && message.contains("` failed"))
+    {
+        FaultShape::Assertion
+    } else if message.contains("with overflow") || message.contains("capacity overflow") {
+        FaultShape::Overflow
+    } else {
+        FaultShape::Panic
+    }
+}
 
 fn label<T: PartialEq>(table: &[(T, &'static str)], what: T) -> &'static str {
     table

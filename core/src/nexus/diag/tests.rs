@@ -308,7 +308,9 @@ fn names_paths_addresses_keys_tokens_and_odd_characters_never_survive() {
         for &(shape, _) in SHAPES {
             let line = Line::Fault(Fault { place, shape });
             assert_eq!(clean_line(&line.to_string()), Some(line));
-            record.note(AT, line);
+            if record.entries().len() < MAX_ENTRIES {
+                record.note(AT, line);
+            }
         }
     }
     let report = report(record);
@@ -319,7 +321,7 @@ fn names_paths_addresses_keys_tokens_and_odd_characters_never_survive() {
     assert_eq!(uploaded.text(), shown);
     assert_eq!(
         report.record.entries().len(),
-        1 + PLACES.len() * SHAPES.len()
+        (1 + PLACES.len() * SHAPES.len()).min(MAX_ENTRIES)
     );
     for private in &raw[..raw.len() - 1] {
         assert!(!shown.contains(private));
@@ -476,4 +478,57 @@ fn phone_notifications_and_new_session_endings_have_fixed_wording() {
     }
     assert_eq!(clean_line("Android stopped the download job (reason 256)"), None);
     assert_eq!(clean_line("Shared library could not be loaded: /private/path"), None);
+}
+
+#[test]
+fn panic_payloads_only_contribute_a_closed_shape() {
+    use FaultShape::*;
+
+    let path = "/home/mira/secret/music.flac";
+    let name = "Mira Bell";
+    let token = "1a2b3c4d5e6f78900123456789abcdef0123456789abcdef0123456789abcdef";
+    let mut record = Record::default();
+    for (message, shape) in [
+        ("already borrowed: BorrowMutError", BorrowConflict),
+        ("already mutably borrowed: BorrowError", BorrowConflict),
+        ("called `Result::unwrap()` on an `Err` value: PoisonError { .. }", PoisonedLock),
+        ("called `Option::unwrap()` on a `None` value", MissingValue),
+        ("called `Result::unwrap()` on an `Err` value", UnexpectedResultError),
+        ("index out of bounds: the len is 1 but the index is 2", Bounds),
+        ("assertion `left == right` failed", Assertion),
+        ("attempt to add with overflow", Overflow),
+        ("unexpected custom panic", Panic),
+    ] {
+        let payload = format!("{message}: {path} for {name}\nBearer {token}");
+        let classified = classify_rust_panic(&payload);
+        assert_eq!(classified, shape);
+        record.note(AT, Line::Fault(Fault { place: FaultPlace::App, shape: classified }));
+    }
+    for empty in ["", " \n", "no message", "no payload"] {
+        assert_eq!(classify_rust_panic(empty), NoPayload);
+    }
+    record.note(AT, Line::Fault(Fault { place: FaultPlace::App, shape: NoPayload }));
+
+    let report = report(record);
+    let text = report.text().unwrap();
+    assert_eq!(Report::read(&text).unwrap(), report);
+    let body = upload(&report).write().unwrap();
+    for private in [path, name, token] {
+        assert!(!text.as_bytes().windows(private.len()).any(|bytes| bytes == private.as_bytes()));
+        assert!(!body.bytes().windows(private.len()).any(|bytes| bytes == private.as_bytes()));
+    }
+}
+
+#[test]
+fn windows_messages_and_download_moves_are_counted_as_fixed_notes() {
+    let mut record = Record::default();
+    for note in [Note::AppMessage, Note::DownloadsFolderChanged] {
+        let line = Line::Note(note);
+        assert_eq!(clean_line(&line.to_string()), Some(line));
+        record.note(AT, line);
+        record.note(AT, line);
+    }
+    assert!(record.entries().iter().all(|entry| entry.count == 2));
+    let report = report(record);
+    assert_eq!(Report::read(&report.text().unwrap()).unwrap(), report);
 }
