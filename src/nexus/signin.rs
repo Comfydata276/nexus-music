@@ -939,7 +939,7 @@ fn hand_over(hand: Hand, cause: &Cause) {
                 note(format_args!("music address not used: {}", why.as_ref().map_or("no request recorded", |why| why.reason())));
                 *HANDED.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
                 crate::controller::with(|ctl| {
-                    ctl.sign_out("");
+                    ctl.leave_player("");
                     ctl.toast(why.map_or_else(|| "The music server's address this account was given can't be used.".to_string(), |why| why.handover_words().to_string()));
                 });
                 return;
@@ -963,7 +963,7 @@ fn hand_over(hand: Hand, cause: &Cause) {
             note(format_args!("no music login, generation {generation}"));
             *HANDED.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
             crate::journal::publish_account(None);
-            crate::controller::with(|ctl| ctl.sign_out(""));
+            crate::controller::with(|ctl| ctl.leave_player(""));
         }
         Hand::Refused { count, generation } => {
             note(format_args!("music login set aside, number {count}"));

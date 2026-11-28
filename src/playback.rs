@@ -2030,7 +2030,9 @@ impl Controller {
             }
             history.insert(0, crate::config::Played { song, at: chrono::Utc::now().timestamp() });
             history.truncate(HISTORY_LENGTH);
-            crate::config::save_history(&self.queue_files().2, &history);
+            if let Some((_, _, path)) = self.queue_files() {
+                crate::config::save_history(&path, &history);
+            }
         }
         self.sync_history();
         self.share_soon();
@@ -2087,12 +2089,16 @@ impl Controller {
             // device's save: see `nexus_core::handover`.)
             self.queue_moved_on();
         }
+        // Nobody's (nobody signed in yet, or the sign-in's owner not known): nothing is
+        // written or cleared, and 0.40's queue stays as it was until an account owns it (W7c
+        // item 6).
+        let Some((queue_file, place_file, _)) = self.queue_files() else { return };
         if pb.queue.is_empty() {
             // Nothing to come back to, unless the saved copy is being held on to (see `leave`).
             if !self.keep_saved_queue.get() {
                 self.queue_saved.set(0);
-                self.saver.remove(self.queue_files().0);
-                self.saver.remove(self.queue_files().1);
+                self.saver.remove(queue_file);
+                self.saver.remove(place_file);
             }
             return;
         }
@@ -2114,21 +2120,22 @@ impl Controller {
                 stamp,
                 source_list: pb.source_list.clone(),
             };
-            self.saver.write(self.queue_files().0, move || serde_json::to_vec(&saved).ok());
+            self.saver.write(queue_file, move || serde_json::to_vec(&saved).ok());
         }
         let place = crate::config::QueuePlace { shape, cursor: pb.cursor, position: pb.position, stamp, taken: self.queue_owner.taken() };
-        self.saver.write(self.queue_files().1, move || serde_json::to_vec(&place).ok());
+        self.saver.write(place_file, move || serde_json::to_vec(&place).ok());
     }
 
     /// Brings back the queue from the last run, paused where it stopped.
     pub fn restore_queue(self: &Rc<Self>) {
         // Anything still on its way to disk gets there first.
         self.saver.flush();
-        let Some(mut saved) = SavedQueue::load(&self.queue_files().0) else { return };
+        let Some((queue_file, place_file, _)) = self.queue_files() else { return };
+        let Some(mut saved) = SavedQueue::load(&queue_file) else { return };
         let shape =
             crate::config::queue_shape(&saved.songs, &saved.order, &saved.context, &saved.source, &saved.origins, &saved.source_list);
         // Where playback had got to, if that was noted for this same queue.
-        let place = crate::config::QueuePlace::load(&self.queue_files().1);
+        let place = crate::config::QueuePlace::load(&place_file);
         if let Some(place) = place.filter(|place| place.shape == shape && place.cursor < saved.order.len()) {
             saved.cursor = place.cursor;
             saved.position = place.position;
@@ -2164,7 +2171,7 @@ impl Controller {
         let stamp = if saved.stamp > 0 {
             saved.stamp
         } else {
-            std::fs::metadata(&self.queue_files().0)
+            std::fs::metadata(&queue_file)
                 .and_then(|meta| meta.modified())
                 .ok()
                 .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
