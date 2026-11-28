@@ -1646,6 +1646,47 @@ impl From<WireError> for RequestError {
     fn from(error: WireError) -> Self { Self::Wire(error) }
 }
 
+/// Whether an app may use its released direct connection after checking Nexus status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppRoute {
+    Direct,
+    Server,
+    Unavailable,
+}
+
+pub fn app_route(status: &Result<Availability, RequestError>) -> AppRoute {
+    match status {
+        Ok(Availability::Ready | Availability::Unavailable) => AppRoute::Server,
+        Ok(Availability::Unconfigured) | Err(RequestError::Refused(Refusal::LidarrNotSetUp)) => AppRoute::Direct,
+        Err(_) => AppRoute::Unavailable,
+    }
+}
+
+/// What the app has durably recorded for one songs-only batch lookup.
+#[derive(Serialize, Deserialize)]
+pub enum AppBatchResolution {
+    Started,
+    Ready { release: Option<MusicBrainzId>, sends: u8 },
+    Accepted,
+}
+
+pub enum AppBatchStep {
+    Lookup,
+    Send { release: Option<MusicBrainzId>, sends: u8 },
+    Wait,
+}
+
+pub fn app_batch_step(kept: Option<&AppBatchResolution>) -> AppBatchStep {
+    match kept {
+        None => AppBatchStep::Lookup,
+        Some(AppBatchResolution::Started) => AppBatchStep::Send { release: None, sends: 1 },
+        Some(AppBatchResolution::Ready { release, sends }) if *sends < 2 => {
+            AppBatchStep::Send { release: release.clone(), sends: sends + 1 }
+        }
+        Some(AppBatchResolution::Ready { .. } | AppBatchResolution::Accepted) => AppBatchStep::Wait,
+    }
+}
+
 impl From<TransportError> for RequestError {
     fn from(error: TransportError) -> Self { Self::Transport(error) }
 }
@@ -3133,5 +3174,35 @@ mod tests {
             assert_eq!(url.query_pairs().collect::<Vec<_>>(), vec![("term".into(), text.into())]);
         }
         assert!(client.find_any("lidarr:bad").is_err());
+    }
+}
+
+#[cfg(test)]
+mod app_policy_tests {
+    use super::*;
+
+    #[test]
+    fn only_explicitly_unconfigured_requests_allow_the_direct_route() {
+        use AppRoute::*;
+        assert_eq!(app_route(&Ok(Availability::Ready)), Server);
+        assert_eq!(app_route(&Ok(Availability::Unavailable)), Server);
+        assert_eq!(app_route(&Ok(Availability::Unconfigured)), Direct);
+        assert_eq!(app_route(&Err(RequestError::Refused(Refusal::LidarrNotSetUp))), Direct);
+        for reason in [Refusal::SwitchedOff, Refusal::NotSignedIn, Refusal::StartAgain, Refusal::Busy] {
+            assert_eq!(app_route(&Err(RequestError::Refused(reason))), Unavailable);
+        }
+        assert_eq!(app_route(&Err(TransportError::Unreachable.into())), Unavailable);
+    }
+
+    #[test]
+    fn a_durable_batch_result_replays_at_most_once_without_another_lookup() {
+        assert!(matches!(app_batch_step(None), AppBatchStep::Lookup));
+        assert!(matches!(app_batch_step(Some(&AppBatchResolution::Started)), AppBatchStep::Send { release: None, sends: 1 }));
+        let mbid = MusicBrainzId::new("5e1f0000-0000-4000-8000-000000000101").unwrap();
+        let sent = AppBatchResolution::Ready { release: Some(mbid.clone()), sends: 1 };
+        assert!(matches!(app_batch_step(Some(&sent)), AppBatchStep::Send { release: Some(release), sends: 2 } if release == mbid));
+        let twice = AppBatchResolution::Ready { release: Some(mbid), sends: 2 };
+        assert!(matches!(app_batch_step(Some(&twice)), AppBatchStep::Wait));
+        assert!(matches!(app_batch_step(Some(&AppBatchResolution::Accepted)), AppBatchStep::Wait));
     }
 }

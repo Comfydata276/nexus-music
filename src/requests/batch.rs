@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use nexus_core::bulk::Want;
 use nexus_core::nexus::account::RequestId;
 use nexus_core::nexus::requests::{
-    BATCH_MAX_LINES, BackendLidarr, BatchLine, BatchLineProgress, BatchLineView, Change, JobId, MusicBrainzId, POLL_INTERVAL,
+    app_batch_step, AppBatchStep, AppBatchResolution as Resolution, BATCH_MAX_LINES, BackendLidarr, BatchLine, BatchLineProgress, BatchLineView, Change, JobId, MusicBrainzId, POLL_INTERVAL,
     Progress, Refusal, RequestError,
 };
 use serde::{Deserialize, Serialize};
@@ -28,13 +28,6 @@ struct Saved {
     fills: Vec<Vec<crate::asked::Fill>>,
     #[serde(default)]
     exported_fills: BTreeSet<u16>,
-}
-
-#[derive(Serialize, Deserialize)]
-enum Resolution {
-    Started,
-    Ready { release: Option<MusicBrainzId>, sends: u8 },
-    Accepted,
 }
 
 #[derive(Clone)]
@@ -106,6 +99,13 @@ pub(crate) fn run(connection: Connection, folder: PathBuf, input: Option<(Vec<Wa
             let mut last = view(context);
             last.notice = notice;
             show(context, last);
+        }
+        if !connection.still_selected() {
+            crate::controller::post(move |controller| {
+                if let Some(connection) = super::current() {
+                    run(connection, folder, None);
+                }
+            });
         }
     });
 }
@@ -252,23 +252,15 @@ fn settle(
     lookup: impl FnOnce(&BatchLine, bool) -> Option<MusicBrainzId>,
     send: impl FnOnce(Option<MusicBrainzId>) -> Result<(), RequestError>,
 ) -> Result<(), String> {
-    if matches!(saved.resolution.get(&index), Some(Resolution::Accepted | Resolution::Ready { sends: 2.., .. })) {
-        return Ok(());
-    }
-    let line = saved.lines.get(usize::from(index)).ok_or_else(|| RequestError::UnexpectedAnswer.to_string())?;
-    let release = match saved.resolution.get(&index) {
-        Some(Resolution::Ready { release, .. }) => release.clone(),
-        Some(Resolution::Started) => None,
-        None => {
+    let (release, sends) = match app_batch_step(saved.resolution.get(&index)) {
+        AppBatchStep::Wait => return Ok(()),
+        AppBatchStep::Send { release, sends } => (release, sends),
+        AppBatchStep::Lookup => {
             saved.resolution.insert(index, Resolution::Started);
             record(file, saved)?;
-            lookup(line, saved.singles)
+            let line = saved.lines.get(usize::from(index)).ok_or_else(|| RequestError::UnexpectedAnswer.to_string())?;
+            (lookup(line, saved.singles), 1)
         }
-        Some(Resolution::Accepted) => unreachable!(),
-    };
-    let sends = match saved.resolution.get(&index) {
-        Some(Resolution::Ready { sends, .. }) => sends + 1,
-        _ => 1,
     };
     saved.resolution.insert(index, Resolution::Ready { release: release.clone(), sends });
     record(file, saved)?;

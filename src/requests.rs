@@ -4,7 +4,7 @@
 use std::sync::{Arc, Mutex};
 
 use nexus_core::lidarr::{Offers, RequestLidarr};
-use nexus_core::nexus::requests::{Availability, BackendLidarr, LidarrNumber, MusicBrainzId, PendingView, Refusal, RequestError, TransportError};
+use nexus_core::nexus::requests::{self as wire, AppRoute, Availability, BackendLidarr, LidarrNumber, MusicBrainzId, PendingView, Refusal, RequestError, TransportError};
 
 use crate::app_nexus_calls::{self as calls, Context};
 
@@ -20,10 +20,10 @@ enum Route {
 }
 
 fn choose(status: Result<Availability, RequestError>) -> Route {
-    match status {
-        Ok(Availability::Ready | Availability::Unavailable) => Route::Server,
-        Ok(Availability::Unconfigured) | Err(RequestError::Refused(Refusal::LidarrNotSetUp)) => Route::Direct,
-        Err(error) => Route::Unavailable(error.to_string()),
+    match wire::app_route(&status) {
+        AppRoute::Server => Route::Server,
+        AppRoute::Direct => Route::Direct,
+        AppRoute::Unavailable => Route::Unavailable(status.unwrap_err().to_string()),
     }
 }
 
