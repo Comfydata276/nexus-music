@@ -8,9 +8,8 @@ pub use super::wire::{BODY_MAX_BYTES, BadMessage, WireBody, encode, read};
 use serde::{Serialize, Serializer};
 use serde_json::value::RawValue;
 use sha2::digest::{CtOutput, Output, OutputSizeUser, array::ArraySize, consts::{U8, U12, U16, U32, U64, U512}};
-use std::collections::VecDeque;
 use std::fmt;
-use std::net::Ipv6Addr;
+use crate::origin::{Address, AddressError, HandoverSource, MusicBase, Origin};
 use zeroize::Zeroizing;
 
 pub const SIGN_IN: &str = "/nexus/api/signin";
@@ -20,25 +19,30 @@ pub const LIST_DEVICES: &str = "/nexus/api/devices";
 pub const FORCE_OUT: &str = "/nexus/api/force-out";
 pub const CHANGE_PASSWORD: &str = "/nexus/api/change-password";
 pub const MUSIC_LOGIN: &str = "/nexus/api/music-login";
-pub const PATHS: &[&str] = &[SIGN_IN, SIGN_OUT, LIST_DEVICES, FORCE_OUT, CHANGE_PASSWORD, MUSIC_LOGIN];
+pub const GRANT: &str = "/nexus/api/grant";
+pub const PATHS: &[&str] = &[SIGN_IN, SIGN_OUT, LIST_DEVICES, FORCE_OUT, CHANGE_PASSWORD, MUSIC_LOGIN, GRANT];
 
 pub const EMAIL_MAX_BYTES: usize = 254;
-pub const PASSWORD_MIN_CHARS: usize = 10;
+pub const PASSWORD_MIN_CHARS: usize = 15;
 pub const PASSWORD_MAX_CHARS: usize = 128;
 const PASSWORD_MAX_BYTES: usize = 4 * PASSWORD_MAX_CHARS;
 pub const SECRET_BYTES: usize = 32;
 pub const CODE_LENGTH: usize = 12;
-// the design does not say which characters look alike. Use upper case alone. Leave
-// out the groups I/L/1, O/0, S/5 and Z/2, and keep only the digit in E/3, A/4, G/6,
-// T/7, B/8 and Q/9.
-pub const CODE_ALPHABET: &[u8] = b"CDFHJKMNPRUVWXY346789";
+// the design does not say which 32-symbol alphabet. Use Crockford base32.
+pub const CODE_ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 // the design does not say the field ceilings. Names are counted as UTF-8 bytes.
 pub const NAME_MAX_BYTES: usize = 128;
 pub const MUSIC_ADDRESS_MAX_BYTES: usize = 2048;
 pub const SALT_BYTES: usize = 32;
 pub const SALT_LENGTH: usize = 2 * SALT_BYTES;
 pub const TOKEN_BYTES: usize = 16;
-pub const DEVICES_PER_PAGE: usize = 256;
+pub const DEVICES_PER_PAGE: usize = 500;
+pub const SMALL_REPLY_MAX_BYTES: usize = 4 * 1024;
+pub const SIGN_IN_REPLY_MAX_BYTES: usize = 8 * 1024;
+pub const LIST_REPLY_MAX_BYTES: usize = BODY_MAX_BYTES;
+pub const PASSWORD_REQUEST_MAX_BYTES: usize = 4 * 1024;
+// the design does not say the size of calls without passwords; their fixed fields fit in 1 KiB.
+pub const SMALL_REQUEST_MAX_BYTES: usize = 1024;
 
 pub const CODE_LIFETIME_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 pub const SESSION_IDLE_MS: u64 = 90 * 24 * 60 * 60 * 1000;
@@ -134,18 +138,26 @@ impl Password {
         self.bytes.get(..self.len).and_then(|bytes| std::str::from_utf8(bytes).ok()).unwrap_or_default()
     }
 
-    /// Check before accepting a new password, against the email from the account.
-    pub fn allowed_for(&self, email: &Email) -> bool {
-        // the design does not say if "not the email" includes a spelling that tidies to it.
-        // Reject that spelling too, without making a second ordinary String of the password.
-        let spelling = self.expose().trim();
-        let mut folded = Zeroizing::new([0u8; PASSWORD_MAX_BYTES]);
-        for (out, byte) in folded.iter_mut().zip(spelling.bytes()) {
-            *out = byte.to_ascii_lowercase();
+    /// The backend hands in its common-password list, one UTF-8 password per line.
+    /// Check with the account's own email before accepting a new password.
+    pub fn allowed_for(&self, email: &Email, common_passwords: &str) -> bool {
+        // the design does not say how variations are treated. Reject case and outer
+        // whitespace variations of the email and list entries. Keep the actual password exact.
+        fn folded(text: &str) -> Zeroizing<[u8; PASSWORD_MAX_BYTES]> {
+            let mut bytes = padded(text);
+            bytes.make_ascii_lowercase();
+            bytes
         }
-        let canonical = padded(email.as_str());
-        !(same_bytes::<U512>(folded.as_ref(), canonical.as_ref())
-            & same_bytes::<U8>(&(spelling.len() as u64).to_be_bytes(), &(email.as_str().len() as u64).to_be_bytes()))
+
+        let spelling = self.expose().trim();
+        let candidate = folded(spelling);
+        let matches = |text: &str| {
+            let text = text.trim();
+            same_bytes::<U512>(candidate.as_ref(), folded(text).as_ref())
+                & same_bytes::<U8>(&(spelling.len() as u64).to_be_bytes(), &(text.len() as u64).to_be_bytes())
+        };
+        let blocked = common_passwords.lines().fold(matches(email.as_str()), |blocked, line| blocked | matches(line));
+        !blocked
     }
 }
 
@@ -257,6 +269,8 @@ macro_rules! hex_secret {
 
 hex_secret!(DeviceSecret, SECRET_BYTES, U32);
 hex_secret!(Session, SECRET_BYTES, U32);
+hex_secret!(SignOutSecret, SECRET_BYTES, U32);
+hex_secret!(GrantSecret, SECRET_BYTES, U32);
 hex_secret!(MusicToken, TOKEN_BYTES, U16);
 hex_secret!(StampTag, SECRET_BYTES, U32);
 
@@ -336,7 +350,62 @@ macro_rules! text_secret {
     };
 }
 
-text_secret!(OneTimeCode, CODE_LENGTH, U12, |byte| CODE_ALPHABET.contains(byte));
+impl OneTimeCode {
+    /// Read a typed code and normalize Crockford's case and ambiguous spellings.
+    pub fn new(text: &str) -> Option<Self> {
+        if text.len() != CODE_LENGTH {
+            return None;
+        }
+        let mut canonical = Zeroizing::new([0; CODE_LENGTH]);
+        for (out, byte) in canonical.iter_mut().zip(text.bytes()) {
+            let byte = match byte.to_ascii_uppercase() {
+                b'I' | b'L' => b'1',
+                b'O' => b'0',
+                byte => byte,
+            };
+            if !CODE_ALPHABET.contains(&byte) {
+                return None;
+            }
+            *out = byte;
+        }
+        Some(Self(canonical))
+    }
+
+    /// Encode 60 caller-supplied random bits, most significant group first.
+    pub fn from_random(random: u64) -> Self {
+        let mut remaining = random;
+        let mut code = Zeroizing::new([b'0'; CODE_LENGTH]);
+        for out in code.iter_mut().rev() {
+            *out = CODE_ALPHABET.get((remaining & 31) as usize).copied().unwrap_or(b'0');
+            remaining >>= 5;
+        }
+        Self(code)
+    }
+
+    pub fn expose_bytes(&self) -> &[u8; CODE_LENGTH] {
+        &self.0
+    }
+
+    pub fn expose(&self) -> &str {
+        std::str::from_utf8(self.expose_bytes()).unwrap_or_default()
+    }
+}
+
+secret_debug!(OneTimeCode);
+
+impl PartialEq for OneTimeCode {
+    fn eq(&self, other: &Self) -> bool {
+        same_bytes::<U12>(self.expose_bytes(), other.expose_bytes())
+    }
+}
+
+impl Eq for OneTimeCode {}
+
+impl Serialize for OneTimeCode {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.expose())
+    }
+}
 text_secret!(MusicSalt, SALT_LENGTH, U64, |byte| lower_hex(*byte).is_some());
 
 impl MusicSalt {
@@ -355,38 +424,57 @@ impl MusicSalt {
     }
 }
 
+/// The origin the person typed for Nexus (§7.1), independent of their music server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NexusOrigin(Origin);
+
+impl NexusOrigin {
+    pub fn typed(text: &str) -> Result<Self, AddressError> {
+        let address = Address::typed(text)?;
+        if address.path() != "/" {
+            return Err(AddressError::Path);
+        }
+        if address.query().is_some() {
+            return Err(AddressError::BaseQuery);
+        }
+        if text.contains('#') {
+            return Err(AddressError::Fragment);
+        }
+        Ok(Self(address.origin().clone()))
+    }
+
+    pub fn origin(&self) -> &Origin {
+        &self.0
+    }
+
+    /// Supply a Nexus call's path constant.
+    pub fn call(&self, path: &'static str) -> Result<Address, AddressError> {
+        super::proto::plain(path).map_err(|_| AddressError::Path)?;
+        Address::parse(&format!("{}{path}", self.0))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct MusicAddress(String);
 
 impl MusicAddress {
     pub fn new(text: &str) -> Option<Self> {
-        // the design does not say if the music address (as distinct from the Nexus
-        // address) may be cleartext. Require HTTPS and an unambiguous base URL.
-        if text.len() > MUSIC_ADDRESS_MAX_BYTES || !text.is_ascii() || text.contains(['?', '#', '\\']) {
+        // the design does not say the base URL's size. Bound it before the common
+        // origin parser and keep queries, fragments and credentials out of it.
+        if text.len() > MUSIC_ADDRESS_MAX_BYTES || text.contains('#') {
             return None;
         }
-        let tail = text.strip_prefix("https://")?;
-        let (authority, path) = tail.split_once('/').unwrap_or((tail, ""));
-        if authority.trim() != authority {
+        let address = Address::parse(text).ok()?;
+        if address.query().is_some() {
             return None;
-        }
-        super::proto::hello_url(&format!("https://{authority}"))?;
-        if let Some(literal) = authority.strip_prefix('[') {
-            literal.split_once(']')?.0.parse::<Ipv6Addr>().ok()?;
-        }
-        // Use an ordinary URI path. Validate percent-escapes before the app can join to it.
-        let mut bytes = path.bytes();
-        while let Some(byte) = bytes.next() {
-            if byte == b'%' {
-                if !bytes.next()?.is_ascii_hexdigit() || !bytes.next()?.is_ascii_hexdigit() {
-                    return None;
-                }
-            } else if !(byte.is_ascii_alphanumeric() || b"/-._~!$&'()*+,;=:@".contains(&byte)) {
-                return None;
-            }
         }
         Some(Self(text.to_owned()))
+    }
+
+    /// Check which Nexus origin and request actually handed over the music address.
+    pub fn handed_over(&self, nexus: &NexusOrigin, source: HandoverSource<'_>) -> Result<MusicBase, AddressError> {
+        MusicBase::handed_over(nexus.origin(), source, self.as_str())
     }
 
     pub fn as_str(&self) -> &str {
@@ -441,13 +529,13 @@ pub enum DeviceKind {
     Phone,
 }
 
-/// Signing in by password checks the named account. §8.4's code takes the place of
-/// both the email and password. A code is only a request for password setup.
+/// A code replaces the email and current password. Redeem it while setting the
+/// new password, then issue the normal sign-in answer (§8.5).
 #[derive(Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Credential {
     Password { email: Email, password: Password },
-    Code(OneTimeCode),
+    Code { code: OneTimeCode, new_password: Password },
 }
 
 object! {
@@ -487,21 +575,34 @@ impl Notice {
     }
 }
 
-object! {
-    SignedIn { session: Session, person: Person, device: DeviceId, music: MusicLogin, notice: Notice }
-}
-
-object! {
-    /// The server grants this session leave only for choosing a password (§8.4).
-    PasswordSetup { session: Session, person: Person, device: DeviceId }
-}
-
+/// §9.4. An account stays signed in in all three cases.
 #[derive(Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum SignInAnswer {
-    SignedIn(SignedIn),
-    PasswordSetup(PasswordSetup),
+pub enum MusicLoginResult {
+    Login(MusicLogin),
+    NoneSetYet,
+    UnusableNow,
 }
+
+object! {
+    /// Store this note on sign-out if the backend was unreachable. The server binds
+    /// its separate secret to just this session and checks it only at sign-out.
+    SignOutNote { session: SessionId, secret: SignOutSecret }
+}
+
+object! {
+    SignedIn {
+        session: Session,
+        session_id: SessionId,
+        sign_out: SignOutNote,
+        person: Person,
+        device: DeviceId,
+        restore: u64,
+        music: MusicLoginResult,
+        notice: Notice,
+    }
+}
+pub type SignInAnswer = SignedIn;
 
 object! {
     Stamp {
@@ -542,18 +643,26 @@ impl RequestId {
     }
 }
 
-object! { SignOut { head: RequestHead, request_id: RequestId } }
+object! {
+    SignOut {
+        head: RequestHead,
+        request_id: RequestId,
+        // the design does not say how a note is offered. Null requires normal bearer
+        // authentication. A note is a separate credential and is valid on this path only.
+        revoke: Option<SignOutNote>,
+    }
+}
 object! { ListDevices { head: RequestHead, after: Option<DeviceId> } }
-object! { ForceOut { head: RequestHead, device: DeviceId } }
+object! { ForceOut { head: RequestHead, device: DeviceId, session: SessionId } }
 object! { GetMusicLogin { head: RequestHead } }
 
 object! {
     ChangePassword {
         head: RequestHead,
         request_id: RequestId,
-        // Null only under the password-setup session. For an ordinary session the
-        // server requires and checks the current password before taking the new one.
-        current_password: Option<Password>,
+        // §8.9 keeps this one call. The server proves the current password and
+        // consumes its exact change grant when accepting the new one.
+        current_password: Password,
         new_password: Password,
     }
 }
@@ -564,7 +673,8 @@ object! {
         #[serde(serialize_with = "write_version")]
         app_version: Version,
         last_seen_ms: u64,
-        signed_in: bool,
+        session: Option<SessionId>,
+        this_device: bool,
     }
 }
 
@@ -584,6 +694,10 @@ impl DevicePage {
         if !devices.iter().zip(devices.iter().skip(1)).all(|(left, right)| left.id < right.id) {
             return None;
         }
+        let mut own = devices.iter().filter(|device| device.this_device);
+        if own.next().is_some_and(|device| device.session.is_none()) || own.next().is_some() {
+            return None;
+        }
         Some(Self { devices, more })
     }
 
@@ -600,26 +714,76 @@ object! { SignedOut {} }
 object! { ForcedOut { music_cut_off: bool } }
 object! { PasswordChanged {} }
 
-/// All refusals use fixed tags. A wrong password, absent account, or invalid, used or
-/// expired one-time code all use WrongLogin, without an account or a receipt.
+/// §8.8. C7 names the self-service changes. C9 can put its admin-specific
+/// targets in the same generic request and grant-use shapes.
 #[derive(Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Refusal {
+pub enum GrantChange {
+    ChangePassword { account: AccountId },
+    DeleteListeningData { account: AccountId },
+}
+
+// the design does not say how grants travel. Return a separate opaque secret,
+// then send it with the exact named change. Its session and revision are checked by kept.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct GrantRequest<T = GrantChange> {
+    pub head: RequestHead,
+    pub change: T,
+    pub password: Password,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct GrantedChange<T = GrantChange> {
+    pub head: RequestHead,
+    pub request_id: RequestId,
+    pub change: T,
+    pub grant: GrantSecret,
+}
+
+object! { GrantIssued { grant: GrantSecret } }
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotSignedIn {
+    SessionEnded,
+    DataPutBack,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotAllowed {
+    Denied,
     WrongLogin,
-    TooManyTries { wait: Wait },
     AccountOff,
-    Busy,
-    StartAgain,
-    NotSignedIn,
     NoSuchDevice,
     PasswordNotAllowed,
-    PasswordSetupOnly,
-    BadRequest,
-    NoMusicLogin,
     Incompatible {
         #[serde(serialize_with = "write_speaks")]
         speaks: Speaks,
     },
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Refusal {
+    Malformed,
+    NotSignedIn(NotSignedIn),
+    NotAllowed(NotAllowed),
+    Busy { retry_after_seconds: Option<Wait> },
+    NotDealtWith,
+}
+
+impl Refusal {
+    /// the design does not say the status numbers. Use one status per answer kind.
+    pub fn status(&self) -> u16 {
+        match self {
+            Self::Malformed => 400,
+            Self::NotSignedIn(_) => 401,
+            Self::NotAllowed(_) => 403,
+            Self::Busy { .. } => 429,
+            Self::NotDealtWith => 503,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -627,18 +791,16 @@ pub enum Refusal {
 pub struct Wait(u64);
 
 impl Wait {
-    pub fn new(ms: u64) -> Option<Self> {
-        (1..=WRONG_PASSWORD_WINDOW_MS).contains(&ms).then_some(Self(ms))
+    pub fn new(seconds: u64) -> Option<Self> {
+        (1..=60).contains(&seconds).then_some(Self(seconds))
     }
 
-    pub fn ms(self) -> u64 {
+    pub fn seconds(self) -> u64 {
         self.0
     }
 }
 
-/// the design does not say which status carries a typed refusal. Like hello, only 200
-/// with a whole and valid body counts. A network failure supplies no body to parse.
-pub const REPLY_STATUS: u16 = 200;
+pub const DONE_STATUS: u16 = 200;
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -650,6 +812,16 @@ pub enum Reply<T> {
     RefusedWithReceipt(RefusedWithReceipt),
 }
 
+impl<T> Reply<T> {
+    pub fn status(&self) -> u16 {
+        match self {
+            Self::Done { .. } => DONE_STATUS,
+            Self::Refused(reason) => reason.status(),
+            Self::RefusedWithReceipt(context) => context.reason.status(),
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Serialize)]
 pub struct RefusedWithReceipt {
     reason: Refusal,
@@ -658,7 +830,7 @@ pub struct RefusedWithReceipt {
 
 impl RefusedWithReceipt {
     pub fn new(reason: Refusal, receipt: Receipt) -> Option<Self> {
-        if matches!(reason, Refusal::WrongLogin | Refusal::NotSignedIn) {
+        if matches!(reason, Refusal::NotAllowed(NotAllowed::WrongLogin) | Refusal::NotSignedIn(_)) {
             return None;
         }
         Some(Self { reason, receipt })
@@ -678,16 +850,22 @@ pub type SignOutReply = Reply<SignedOut>;
 pub type ListDevicesReply = Reply<DevicePage>;
 pub type ForceOutReply = Reply<ForcedOut>;
 pub type ChangePasswordReply = Reply<PasswordChanged>;
-pub type MusicLoginReply = Reply<MusicLogin>;
+pub type MusicLoginReply = Reply<MusicLoginResult>;
+pub type GrantReply = Reply<GrantIssued>;
 
 pub fn read_reply<T>(status: u16, body: &[u8]) -> Result<Reply<T>, BadMessage>
 where
     Reply<T>: wire::Message,
 {
-    if status != REPLY_STATUS {
+    let reply: Reply<T> = match status {
+        DONE_STATUS => read(body)?,
+        400 | 401 | 403 | 429 | 503 => wire::read_bounded(body, SMALL_REPLY_MAX_BYTES)?,
+        _ => return Err(BadMessage::Status(status)),
+    };
+    if reply.status() != status {
         return Err(BadMessage::Status(status));
     }
-    read(body)
+    Ok(reply)
 }
 
 macro_rules! text_value {
@@ -703,6 +881,7 @@ macro_rules! text_value {
 text_value!(Email, Email::new);
 text_value!(Name, Name::new);
 text_value!(Password, Password::new);
+text_value!(OneTimeCode, OneTimeCode::new);
 text_value!(MusicAddress, MusicAddress::new);
 text_value!(Notice, Notice::new);
 text_value!(DeviceKind, |text| match text {
@@ -731,19 +910,53 @@ impl wire::Value for Credential {
                 let fields = Fields::read(raw)?;
                 Ok(Self::Password { email: fields.get("email")?, password: fields.get("password")? })
             }
-            ("code", raw) => Ok(Self::Code(OneTimeCode::read(raw)?)),
+            ("code", raw) => {
+                let fields = Fields::read(raw)?;
+                Ok(Self::Code { code: fields.get("code")?, new_password: fields.get("new_password")? })
+            }
             _ => Err(BadMessage::Form),
         }
     }
 }
 
-impl wire::Value for SignInAnswer {
+impl wire::Value for MusicLoginResult {
     fn read(raw: &RawValue) -> Result<Self, BadMessage> {
-        match Fields::read(raw)?.select(&["signed_in", "password_setup"])? {
-            ("signed_in", raw) => Ok(Self::SignedIn(SignedIn::read(raw)?)),
-            ("password_setup", raw) => Ok(Self::PasswordSetup(PasswordSetup::read(raw)?)),
+        if raw.get().starts_with('"') {
+            return read_text(raw, |text| match text {
+                "none_set_yet" => Some(Self::NoneSetYet),
+                "unusable_now" => Some(Self::UnusableNow),
+                _ => None,
+            });
+        }
+        let (_, raw) = Fields::read(raw)?.select(&["login"])?;
+        Ok(Self::Login(MusicLogin::read(raw)?))
+    }
+}
+
+impl wire::Value for GrantChange {
+    fn read(raw: &RawValue) -> Result<Self, BadMessage> {
+        match Fields::read(raw)?.select(&["change_password", "delete_listening_data"])? {
+            ("change_password", raw) => Ok(Self::ChangePassword { account: Fields::read(raw)?.get("account")? }),
+            ("delete_listening_data", raw) => Ok(Self::DeleteListeningData { account: Fields::read(raw)?.get("account")? }),
             _ => Err(BadMessage::Form),
         }
+    }
+}
+
+impl<T: wire::Value> wire::Value for GrantRequest<T> {
+    fn read(raw: &RawValue) -> Result<Self, BadMessage> {
+        let fields = Fields::read(raw)?;
+        Ok(Self { head: fields.get("head")?, change: fields.get("change")?, password: fields.get("password")? })
+    }
+}
+
+impl<T: wire::Value> wire::Value for GrantedChange<T> {
+    fn read(raw: &RawValue) -> Result<Self, BadMessage> {
+        let fields = Fields::read(raw)?;
+        Ok(Self {
+            head: fields.get("head")?, request_id: fields.get("request_id")?,
+            change: fields.get("change")?, grant: fields.get("grant")?,
+        })
     }
 }
 
@@ -760,55 +973,86 @@ impl wire::Value for DevicePage {
     }
 }
 
+impl wire::Value for NotSignedIn {
+    fn read(raw: &RawValue) -> Result<Self, BadMessage> {
+        read_text(raw, |text| match text {
+            "session_ended" => Some(Self::SessionEnded),
+            "data_put_back" => Some(Self::DataPutBack),
+            _ => None,
+        })
+    }
+}
+
+impl wire::Value for NotAllowed {
+    fn read(raw: &RawValue) -> Result<Self, BadMessage> {
+        if raw.get().starts_with('"') {
+            return read_text(raw, |text| match text {
+                "denied" => Some(Self::Denied),
+                "wrong_login" => Some(Self::WrongLogin),
+                "account_off" => Some(Self::AccountOff),
+                "no_such_device" => Some(Self::NoSuchDevice),
+                "password_not_allowed" => Some(Self::PasswordNotAllowed),
+                _ => None,
+            });
+        }
+        let (_, raw) = Fields::read(raw)?.select(&["incompatible"])?;
+        Ok(Self::Incompatible { speaks: Fields::read(raw)?.get("speaks")? })
+    }
+}
+
 impl wire::Value for Refusal {
     fn read(raw: &RawValue) -> Result<Self, BadMessage> {
         if raw.get().starts_with('"') {
             return read_text(raw, |text| match text {
-                "wrong_login" => Some(Self::WrongLogin),
-                "account_off" => Some(Self::AccountOff),
-                "busy" => Some(Self::Busy),
-                "start_again" => Some(Self::StartAgain),
-                "not_signed_in" => Some(Self::NotSignedIn),
-                "no_such_device" => Some(Self::NoSuchDevice),
-                "password_not_allowed" => Some(Self::PasswordNotAllowed),
-                "password_setup_only" => Some(Self::PasswordSetupOnly),
-                "bad_request" => Some(Self::BadRequest),
-                "no_music_login" => Some(Self::NoMusicLogin),
+                "malformed" => Some(Self::Malformed),
+                "not_dealt_with" => Some(Self::NotDealtWith),
                 _ => None,
             });
         }
-        let fields = Fields::read(raw)?;
-        match fields.select(&["too_many_tries", "incompatible"])? {
-            ("too_many_tries", raw) => Ok(Self::TooManyTries { wait: Fields::read(raw)?.get("wait")? }),
-            ("incompatible", raw) => Ok(Self::Incompatible { speaks: Fields::read(raw)?.get("speaks")? }),
+        match Fields::read(raw)?.select(&["not_signed_in", "not_allowed", "busy"])? {
+            ("not_signed_in", raw) => Ok(Self::NotSignedIn(NotSignedIn::read(raw)?)),
+            ("not_allowed", raw) => Ok(Self::NotAllowed(NotAllowed::read(raw)?)),
+            ("busy", raw) => Ok(Self::Busy { retry_after_seconds: Fields::read(raw)?.get("retry_after_seconds")? }),
             _ => Err(BadMessage::Form),
         }
     }
 }
 
-trait ReplyResult: wire::Value + Serialize {
+pub(crate) trait ReplyResult: wire::Value + Serialize {
+    const MAX_DONE_BYTES: usize = SMALL_REPLY_MAX_BYTES;
+
     fn agrees(&self, _: &Receipt) -> bool {
         true
     }
 }
 
 impl ReplyResult for SignedOut {}
-impl ReplyResult for DevicePage {}
 impl ReplyResult for ForcedOut {}
 impl ReplyResult for PasswordChanged {}
+impl ReplyResult for GrantIssued {}
 
-impl ReplyResult for MusicLogin {
+impl ReplyResult for DevicePage {
+    const MAX_DONE_BYTES: usize = LIST_REPLY_MAX_BYTES;
+}
+
+impl ReplyResult for MusicLoginResult {
     fn agrees(&self, receipt: &Receipt) -> bool {
-        self.count == receipt.music_login_count
+        match self {
+            Self::Login(login) => login.count == receipt.music_login_count,
+            Self::NoneSetYet | Self::UnusableNow => true,
+        }
     }
 }
 
-impl ReplyResult for SignInAnswer {
+impl ReplyResult for SignedIn {
+    const MAX_DONE_BYTES: usize = SIGN_IN_REPLY_MAX_BYTES;
+
     fn agrees(&self, receipt: &Receipt) -> bool {
-        match self {
-            Self::SignedIn(reply) => reply.person.id == receipt.stamp.account && reply.music.agrees(receipt),
-            Self::PasswordSetup(reply) => reply.person.id == receipt.stamp.account,
-        }
+        self.person.id == receipt.stamp.account
+            && self.restore == receipt.stamp.restore
+            && self.session_id == self.sign_out.session
+            && !same_bytes::<U32>(self.session.expose_bytes(), self.sign_out.secret.expose_bytes())
+            && self.music.agrees(receipt)
     }
 }
 
@@ -839,119 +1083,34 @@ impl<T: ReplyResult> wire::Value for Reply<T> {
     }
 }
 
-impl wire::Message for SignIn {}
-impl wire::Message for SignOut {}
-impl wire::Message for ListDevices {}
-impl wire::Message for ForceOut {}
-impl wire::Message for GetMusicLogin {}
-impl wire::Message for ChangePassword {}
-impl wire::Message for MusicLogin {}
-impl<T: ReplyResult> wire::Message for Reply<T> {}
-
-// ---------------------------------------------------------------------------------------
-// Limits. These states contain only counts and times.
-// ---------------------------------------------------------------------------------------
-
-pub const WRONG_PASSWORDS: u8 = 5;
-pub const WRONG_PASSWORD_WINDOW_MS: u64 = 15 * 60 * 1000;
-pub const SIGN_INS_PER_MINUTE: usize = 30;
-pub const SIGN_IN_WINDOW_MS: u64 = 60 * 1000;
-pub const STARTUP_QUIET_MS: u64 = 20 * 1000;
-pub const PASSWORD_CHECKS_AT_ONCE: usize = 2;
-pub const PASSWORD_CHECKS_WAITING: usize = 8;
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct AccountFailures {
-    window: Option<(u64, u8)>,
+macro_rules! request_bound {
+    ($bytes:ident: $($kind:ty),+ $(,)?) => {
+        $(impl wire::Message for $kind {
+            const MAX_BYTES: usize = $bytes;
+        })+
+    };
 }
 
-impl AccountFailures {
-    /// Discard an expired entry when keeping the per-email counts in memory.
-    pub fn is_expired(&self, now: u64) -> bool {
-        self.window.is_none_or(|(first, _)| now.saturating_sub(first) >= WRONG_PASSWORD_WINDOW_MS)
-    }
+request_bound!(PASSWORD_REQUEST_MAX_BYTES: SignIn, ChangePassword);
+request_bound!(SMALL_REQUEST_MAX_BYTES: SignOut, ListDevices, ForceOut, GetMusicLogin);
+request_bound!(SMALL_REPLY_MAX_BYTES: MusicLogin);
 
-    /// Check before any proof for this account. Keep the decision and its outcome
-    /// serialized per email, so two parallel checks cannot both use the fifth
-    /// place. A success leaves this state as it is.
-    pub fn retry_after(&self, now: u64) -> Option<Wait> {
-        let (first, count) = self.window?;
-        let remaining = WRONG_PASSWORD_WINDOW_MS.saturating_sub(now.saturating_sub(first));
-        if count < WRONG_PASSWORDS {
-            return None;
+impl<T: wire::Value + Serialize> wire::Message for GrantRequest<T> {
+    const MAX_BYTES: usize = PASSWORD_REQUEST_MAX_BYTES;
+}
+
+impl<T: wire::Value + Serialize> wire::Message for GrantedChange<T> {
+    const MAX_BYTES: usize = SMALL_REQUEST_MAX_BYTES;
+}
+
+impl<T: ReplyResult> wire::Message for Reply<T> {
+    const MAX_BYTES: usize = T::MAX_DONE_BYTES;
+
+    fn max_bytes(&self) -> usize {
+        match self {
+            Self::Done { .. } => T::MAX_DONE_BYTES,
+            _ => SMALL_REPLY_MAX_BYTES,
         }
-        Wait::new(remaining)
-    }
-
-    /// Apply only a wrong password that was actually checked. The first miss opens
-    /// the window; the fifth can finish its check, and the next is refused unchecked.
-    pub fn record_wrong(&mut self, now: u64) {
-        self.window = match self.window {
-            // the design does not say how to handle an earlier timestamp in this
-            // function. Treat age as zero, so a backward clock never clears a count.
-            Some((first, count)) if now.saturating_sub(first) < WRONG_PASSWORD_WINDOW_MS => {
-                Some((first, count.saturating_add(1).min(WRONG_PASSWORDS)))
-            }
-            _ => Some((now, 1)),
-        };
-    }
-}
-
-/// One instance for the whole server, recreated on start. Serialize each admission
-/// with other admissions. Call before looking at the account or checking a password.
-#[derive(Debug)]
-pub struct SignInLimit {
-    started: u64,
-    seen_at: u64,
-    admitted: VecDeque<u64>,
-}
-
-impl SignInLimit {
-    pub fn new(started: u64) -> Self {
-        Self { started, seen_at: started, admitted: VecDeque::with_capacity(SIGN_INS_PER_MINUTE) }
-    }
-
-    pub fn admit(&mut self, now: u64) -> Result<(), Refusal> {
-        let now = self.seen_at.max(now);
-        self.seen_at = now;
-        let startup_left = STARTUP_QUIET_MS.saturating_sub(now.saturating_sub(self.started));
-        if let Some(wait) = Wait::new(startup_left) {
-            return Err(Refusal::TooManyTries { wait });
-        }
-
-        // the design does not say whether the minute is a fixed or rolling bucket.
-        // Enforce every rolling minute. An admission exactly 60 seconds ago is out.
-        while self.admitted.front().is_some_and(|first| now.saturating_sub(*first) >= SIGN_IN_WINDOW_MS) {
-            self.admitted.pop_front();
-        }
-        if self.admitted.len() >= SIGN_INS_PER_MINUTE {
-            if let Some(wait) = self.admitted.front().and_then(|first| Wait::new(SIGN_IN_WINDOW_MS.saturating_sub(now.saturating_sub(*first)))) {
-                return Err(Refusal::TooManyTries { wait });
-            }
-            return Err(Refusal::Busy);
-        }
-        self.admitted.push_back(now);
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PasswordAdmission {
-    Check,
-    Wait,
-    Busy,
-}
-
-/// The caller owns the queue and applies the decision with its own admission lock.
-pub fn admit_password_check(checking: usize, waiting: usize) -> PasswordAdmission {
-    // the design does not say whether a newcomer can jump the queue. Give already
-    // waiting checks first use of any newly free place.
-    if checking < PASSWORD_CHECKS_AT_ONCE && waiting == 0 {
-        PasswordAdmission::Check
-    } else if waiting < PASSWORD_CHECKS_WAITING {
-        PasswordAdmission::Wait
-    } else {
-        PasswordAdmission::Busy
     }
 }
 
