@@ -9,7 +9,7 @@ const route = readFileSync(new URL("../src/admin.rs", import.meta.url), "utf8");
 const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
 const style = html.match(/<style>([\s\S]*?)<\/style>/)[1];
 
-function loadPage(fetch, { requestsEnabled = false, listeningEnabled = false, origin = "https://owner.example.test:8443" } = {}) {
+function loadPage(fetch, { requestsEnabled = false, origin = "https://owner.example.test:8443" } = {}) {
   const elements = new Map();
   const windowEvents = new Map();
   const documentEvents = new Map();
@@ -74,7 +74,6 @@ function loadPage(fetch, { requestsEnabled = false, listeningEnabled = false, or
   const instrumentation = "globalThis.forTest = { parseReply, typedCode, hasApproval: () => approval !== null };";
   let source = script;
   if (requestsEnabled) source = source.replace("const enableRequestChanges = false;", "const enableRequestChanges = true;");
-  if (listeningEnabled) source = source.replace("const enableListening = false;", "const enableListening = true;");
   from("listening-days").value = "30";
   from("listening-top").value = "artists";
   runInNewContext(source.replace(/\}\)\(\);\s*$/, instrumentation + "})();"), context);
@@ -735,7 +734,7 @@ test("listening reads one period at a time and pages older plays and people", as
     const overview = listeningOverview(body.days === 7 ? 0 : 11, body.days);
     if (body.account === null && overview.starts) overview.people.next = "people_abc";
     return doneListening(overview);
-  }, { listeningEnabled: true });
+  });
   await page.signIn("owner@example.test", adminPassword);
   await settle();
   assert.equal(calls.length, 0);
@@ -778,7 +777,7 @@ test("changing the listening period drops a late reply for the old period", asyn
     return JSON.parse(options.body).days === 30
       ? new Promise(resolve => { resolveOld = resolve; })
       : doneListening(listeningOverview(0, 7));
-  }, { listeningEnabled: true });
+  });
   await page.signIn("owner@example.test", adminPassword);
   await settle();
   page.click("listening-jump");
@@ -788,4 +787,36 @@ test("changing the listening period drops a late reply for the old period", asyn
   await settle();
   assert.equal(page.from("listening-total").textContent, "0 songs started");
   assert.equal(page.from("listening-recent").children.length, 0);
+});
+
+test("busy listening reads wait for a manual retry and preserve already loaded plays", async () => {
+  const mock = adminStandIn();
+  const busy = () => new Response('{"refused":{"busy":{"retry_after_seconds":null}}}', { status: 429 });
+  let calls = 0;
+  const page = loadPage((path, options) => {
+    if (path !== "/nexus/api/admin/listening") return mock.fetch(path, options);
+    calls++;
+    if (calls === 1 || calls === 3) return busy();
+    if (calls === 2) return doneListening(listeningOverview());
+    return doneListening({ rows: [{ ...examplePlay, title: "Older play", at_ms: listeningTime - 2000 }], next: null });
+  });
+  await page.signIn("owner@example.test", adminPassword);
+  await settle();
+  page.click("listening-jump");
+  await settle();
+  assert.equal(calls, 1);
+  assert.match(page.from("listening-status").textContent, /Try again in a moment/);
+  assert.equal(page.from("listening-retry").hidden, false);
+  await page.click("listening-retry");
+  assert.equal(calls, 2);
+  assert.equal(page.from("listening-total").textContent, "11 songs started");
+  await page.click("listening-recent-more");
+  await settle();
+  assert.equal(calls, 3);
+  assert.match(page.from("listening-recent-status").textContent, /Try again in a moment/);
+  assert.equal(page.from("listening-recent").children.length, 1);
+  await page.click("listening-recent-more");
+  assert.equal(calls, 4);
+  assert.equal(page.from("listening-recent").children.length, 2);
+  assert.ok(page.from("listening-recent-more").hidden);
 });

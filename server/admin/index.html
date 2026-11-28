@@ -168,7 +168,7 @@ dd, li { overflow-wrap: anywhere; }
     <div class="account-bar">
       <p id="identity"></p>
       <div class="account-links">
-        <button id="listening-jump" class="secondary" type="button" hidden>Listening</button>
+        <button id="listening-jump" class="secondary" type="button">Listening</button>
         <button id="signout" class="secondary" type="button">Sign out</button>
       </div>
     </div>
@@ -333,7 +333,6 @@ dd, li { overflow-wrap: anywhere; }
   const setupForm = byId("setup-form");
   const setupSubmit = byId("setup-submit");
   const enableRequestChanges = false;
-  const enableListening = false;
   const email = byId("email");
   const password = byId("password");
   const submit = byId("submit");
@@ -821,7 +820,7 @@ dd, li { overflow-wrap: anywhere; }
 
   async function loadListening() {
     const current = session;
-    if (!enableListening || !current) return;
+    if (!current) return;
     clearListeningResults();
     byId("listening-retry").hidden = true;
     writeText(byId("listening-status"), "Loading listening…");
@@ -854,9 +853,10 @@ dd, li { overflow-wrap: anywhere; }
         (reply.starts === 1n ? " song started" : " songs started"));
       writeText(byId("listening-status"), "");
       byId("listening-results").hidden = false;
-    } catch {
+    } catch (error) {
       if (session !== current || listening !== view) return;
-      writeText(byId("listening-status"), "Could not load listening for this period.");
+      writeText(byId("listening-status"), error?.reason === "busy" ?
+        "Listening is busy. Try again in a moment." : "Could not load listening for this period.");
       byId("listening-retry").hidden = false;
     }
   }
@@ -878,9 +878,10 @@ dd, li { overflow-wrap: anywhere; }
       const page = listeningRows(reply, kind, view.account);
       if (page.next === next) throw new Error();
       renderListeningRows(kind, page);
-    } catch {
+    } catch (error) {
       if (session !== current || listening !== view) return;
-      writeText(status, "Could not load more. Select Try again.");
+      writeText(status, error?.reason === "busy" ?
+        "Listening is busy. Try again in a moment." : "Could not load more. Select Try again.");
       writeText(more, "Try again");
     } finally {
       if (session === current && listening === view) more.disabled = false;
@@ -888,9 +889,8 @@ dd, li { overflow-wrap: anywhere; }
   }
 
   const listeningJump = byId("listening-jump");
-  listeningJump.hidden = !enableListening;
   listeningJump.addEventListener("click", () => {
-    if (!enableListening || !session) return;
+    if (!session) return;
     listeningPanel.hidden = false;
     if (!listening) void loadListening();
     byId("listening-title").focus();
@@ -959,7 +959,7 @@ dd, li { overflow-wrap: anywhere; }
     const account = row.after;
     const person = row.name + " (" + row.email + ")";
     accountNames.set(account, row.name);
-    if (enableListening) listenPerson(account, row.name + " (" + row.email + ")");
+    listenPerson(account, row.name + " (" + row.email + ")");
     for (const owner of deviceOwners.get(account) ?? []) writeText(owner, " · " + row.name);
     const entry = appendRow(accountPage.list, row.label);
     const menu = document.createElement("details");
@@ -1144,7 +1144,7 @@ dd, li { overflow-wrap: anywhere; }
       accountNames.clear();
       void loadAccounts();
     }
-    if (enableListening && view === "accounts-and-devices") {
+    if (view === "accounts-and-devices") {
       const listeningOpen = !listeningPanel.hidden;
       resetListening();
       if (listeningOpen) {
@@ -1365,7 +1365,7 @@ dd, li { overflow-wrap: anywhere; }
     closeLogin();
     clearCode();
     closeReports();
-    if (enableListening) resetListening();
+    resetListening();
     for (const form of [createForm, addressForm, lidarrForm]) form.reset();
     byId("new-account-details").open = false;
     lidarrDetails.open = false;
