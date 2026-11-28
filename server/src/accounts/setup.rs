@@ -52,7 +52,7 @@ impl std::fmt::Debug for CodeKey {
     }
 }
 
-fn derive(from: &[u8; SECRET_BYTES], name: &[u8]) -> Zeroizing<[u8; SECRET_BYTES]> {
+pub(super) fn derive(from: &[u8; SECRET_BYTES], name: &[u8]) -> Zeroizing<[u8; SECRET_BYTES]> {
     let from = Zeroizing::new(*from);
     let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(from.as_slice()).expect("HMAC takes a key of any length");
     mac.update(name);

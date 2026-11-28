@@ -15,14 +15,21 @@ const DAY_MS: u64 = 86_400_000;
 
 // The result contains private listening and account data. Its wire types omit Debug.
 macro_rules! object {
-    ($name:ident { $($field:ident: $kind:ty),+ $(,)? }) => {
+    ($name:ident { $($field:ident: $kind:ty),+ $(,)? $(; $optional:ident: $optional_kind:ty)? }) => {
         #[derive(Serialize)]
-        pub struct $name { $(pub $field: $kind,)+ }
+        pub struct $name {
+            $(pub $field: $kind,)+
+            $(pub $optional: Option<$optional_kind>,)?
+        }
 
         impl wire::Value for $name {
             fn read(raw: &RawValue) -> Result<Self, BadMessage> {
                 let fields = Fields::read(raw)?;
-                Ok(Self { $($field: fields.get(stringify!($field))?,)+ })
+                Ok(Self {
+                    $($field: fields.get(stringify!($field))?,)+
+                    $($optional: fields.0.get(stringify!($optional))
+                        .map(|raw| Option::<$optional_kind>::read(raw)).transpose()?.flatten(),)?
+                })
             }
         }
     };
@@ -149,13 +156,34 @@ object! { Album { artist: Text, album: Text, starts: u64 } }
 object! { Song { artist: Text, album: Text, title: Text, starts: u64 } }
 object! { Person { account: AccountId, name: Name, starts: u64 } }
 object! { Play { id: u64, account: AccountId, name: Name, at_ms: u64, title: Text, artist: Text, album: Text } }
-object! { PeoplePage { rows: Rows<Person, PAGE_SIZE>, next: Option<Cursor> } }
-object! { RecentPage { rows: Rows<Play, PAGE_SIZE>, next: Option<Cursor> } }
+
+/// A completed read with a permanent work limit to show on the page.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Limit {
+    /// The overview and its cursors cover only the newest part of the period.
+    NewestStarts,
+    /// This continuation stopped at its work limit and has no next cursor.
+    ContinuationWork,
+}
+
+impl wire::Value for Limit {
+    fn read(raw: &RawValue) -> Result<Self, BadMessage> {
+        match wire::plain_json::<String>(raw.get())?.as_str() {
+            "newest_starts" => Ok(Self::NewestStarts),
+            "continuation_work" => Ok(Self::ContinuationWork),
+            _ => Err(BadMessage::Form),
+        }
+    }
+}
+
+object! { PeoplePage { rows: Rows<Person, PAGE_SIZE>, next: Option<Cursor>; limit: Limit } }
+object! { RecentPage { rows: Rows<Play, PAGE_SIZE>, next: Option<Cursor>; limit: Limit } }
 object! {
     Overview {
         start_ms: u64, end_ms: u64, starts: u64,
         artists: Rows<Artist, TOP_SIZE>, albums: Rows<Album, TOP_SIZE>, songs: Rows<Song, TOP_SIZE>,
-        people: PeoplePage, recent: RecentPage,
+        people: PeoplePage, recent: RecentPage; limit: Limit
     }
 }
 
