@@ -55,11 +55,7 @@ pub fn finish(ctl: &Controller) {
 pub fn install(ctl: &Controller) {
     static PREVIEW: AtomicU64 = AtomicU64::new(0);
     let paths = ctl.paths.clone();
-    worker().spawn(move || {
-        if let Some(folder) = paths.crash_log.parent() {
-            config::clear_leftovers(folder, |name| matches!(name, RECORD_FILE | "diagnostics.txt"), &[]);
-        }
-    });
+    worker().spawn(move || clear_report_leftovers(&paths));
     sending::install(ctl);
     ctl.ui.global::<ui::Settings>().on_preview_diagnostics(|| {
         with(|ctl| {
@@ -282,6 +278,12 @@ impl ReportStore {
         config::write_surely(path, text.as_bytes())?;
         self.pending.clear();
         Ok(())
+    }
+}
+
+fn clear_report_leftovers(paths: &config::Paths) {
+    if let Some(folder) = paths.crash_log.parent() {
+        config::clear_leftovers(folder, |name| matches!(name, RECORD_FILE | "diagnostics.txt"), &[]);
     }
 }
 

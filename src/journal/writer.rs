@@ -1173,11 +1173,9 @@ mod tests {
         assert_eq!(rows[0].record().id(), id);
     }
 
-    #[cfg(unix)]
     #[test]
-    fn sigkill_keeps_flushed_events_and_discards_a_torn_append() {
+    fn a_kill_keeps_flushed_events_and_discards_a_torn_append() {
         use std::io::{BufRead, BufReader};
-        use std::os::unix::process::ExitStatusExt;
         use std::process::{Command, Stdio};
 
         const CHILD_HOME: &str = "NEXUS_W8_CRASH_TEST_CHILD_HOME";
@@ -1200,7 +1198,7 @@ mod tests {
 
         let folder = Folder::new();
         let mut child = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "journal::writer::tests::sigkill_keeps_flushed_events_and_discards_a_torn_append", "--nocapture"])
+            .args(["--exact", "journal::writer::tests::a_kill_keeps_flushed_events_and_discards_a_torn_append", "--nocapture"])
             .env(CHILD_HOME, &folder.0)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
@@ -1212,7 +1210,7 @@ mod tests {
         let status = child.wait().unwrap();
         assert!(ready);
         killed.unwrap();
-        assert_eq!(status.signal(), Some(9));
+        assert!(!status.success());
 
         let mut writer = Writer::open(folder.0.clone()).unwrap();
         writer.activate(scope).unwrap();

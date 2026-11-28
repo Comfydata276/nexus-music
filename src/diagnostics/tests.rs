@@ -206,3 +206,67 @@ fn a_failed_checkpoint_still_shows_the_local_report() -> std::io::Result<()> {
     assert!(report_text(&paths).is_err());
     Ok(())
 }
+
+#[cfg(windows)]
+#[test]
+fn windows_record_survives_a_blocked_replace_and_killed_write() -> std::io::Result<()> {
+    use std::io::{BufRead, BufReader};
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::process::Stdio;
+    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+    const CHILD_HOME: &str = "NEXUS_W6T_CUT_RECORD";
+    const READY: &str = "partially written Diagnostics checkpoint";
+    if let Some(path) = std::env::var_os(CHILD_HOME) {
+        let steps = config::Steps {
+            flush: |temp| {
+                // Cut the temporary file between the write and its durable placement.
+                temp.set_len(5)?;
+                temp.sync_all()?;
+                eprintln!("{READY}");
+                let _ = std::io::stdin().read(&mut [0; 1]);
+                Err(std::io::Error::other("the parent should have killed this process"))
+            },
+            ..config::REPLACING
+        };
+        return config::write_whole(Path::new(&path), b"incomplete fixture", config::Durable::Flushed, &steps).map(drop);
+    }
+
+    let temp = TestFolder::new()?;
+    let paths = temp.paths();
+    let path = record_path(&paths);
+    let about = Session::about(&config::Settings::default(), false);
+    let mut observations = diag::Record::default();
+    observations.note(AT as u64 * 1_000, Line::Note(Note::DownloadsFolderChanged));
+    let mut store = ReportStore::default();
+    store.checkpoint(&path, Session { about, observations: observations.clone() })?;
+    let old = fs::read(&path)?;
+
+    // Windows denies replacement while this handle withholds delete sharing.
+    let reader = fs::OpenOptions::new().read(true).share_mode(FILE_SHARE_READ).open(&path)?;
+    assert!(store.checkpoint(&path, Session { about, observations }).is_err());
+    assert_eq!(fs::read(&path)?, old);
+    drop(reader);
+    store.checkpoint(&path, Session { about, observations: diag::Record::default() })?;
+    let whole = fs::read(&path)?;
+    assert_ne!(whole, old);
+    let mut child = Command::new(std::env::current_exe()?)
+        .args(["--exact", "diagnostics::tests::windows_record_survives_a_blocked_replace_and_killed_write", "--nocapture"])
+        .env(CHILD_HOME, &path)
+        .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn()?;
+    let ready = BufReader::new(child.stderr.take().unwrap()).lines()
+        .map_while(Result::ok).any(|line| line == READY);
+    child.kill()?;
+    assert!(!child.wait()?.success());
+    assert!(ready);
+    assert_eq!(fs::read(&path)?, whole);
+    assert!(fs::read_dir(path.parent().unwrap())?.flatten()
+        .any(|entry| entry.path().extension().is_some_and(|extension| extension == "tmp")));
+
+    clear_report_leftovers(&paths);
+    assert!(!fs::read_dir(path.parent().unwrap())?.flatten()
+        .any(|entry| entry.path().extension().is_some_and(|extension| extension == "tmp")));
+    assert_eq!(fs::read(&path)?, whole);
+    assert!(report_text(&paths)?.contains("Downloads folder changed  (2 times since"));
+    Ok(())
+}
