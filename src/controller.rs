@@ -725,65 +725,10 @@ impl Controller {
         }
     }
 
-    /// Writes a file describing the app and how it's set up, for working out what's wrong,
-    /// and opens it. It names no server address or account; the messages in it are the ones
-    /// the app showed, which can mention a song or playlist.
+    /// Takes a copy of this session for the local export. The diagnostics worker builds,
+    /// writes and opens the file.
     pub fn save_diagnostics(&self) {
-        let settings = self.settings.borrow();
-        let page = self.ui.global::<ui::Settings>();
-        let app = self.ui.global::<ui::App>();
-        let yes = |on: bool| if on { "on" } else { "off" };
-        let mut lines = vec![
-            format!("Nexus Music {} on {} ({})", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH),
-            format!("Written {}", chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")),
-            String::new(),
-            format!("Signed in: {}", if self.client().is_some() { "yes" } else { "no" }),
-            format!("Server version: {}", app.get_server_version()),
-            format!("Server address uses HTTPS: {}", if settings.server.starts_with("https://") { "yes" } else { "no" }),
-            format!("Offline mode: {}; server out of reach: {}", yes(settings.offline), yes(self.unreachable.get())),
-            format!("Sound output: {}", page.get_output_status()),
-            format!("Exclusive mode: {}; streaming limit: {} kbps (0 is none)", yes(settings.exclusive), settings.max_bitrate()),
-            format!("Gapless: {}; crossfade: {} s; levelling: {}; equaliser: {}", yes(settings.gapless), settings.crossfade, yes(settings.normalize), yes(settings.equalizer)),
-            format!("Library on this PC: {} songs", crate::search::current().map_or(0, |index| index.library.songs.len())),
-            format!("Downloads: {}", self.downloads.borrow().summary()),
-            format!("Kept songs limit: {} MB; cache: {}", settings.cache_limit_mb, page.get_cache_size()),
-            format!("Sharing between devices: {}; requests through Lidarr: {}", yes(settings.sync), yes(settings.requests)),
-            format!("Changes waiting to be sent: {}", self.pending.borrow().len() + self.sending.borrow().len()),
-            String::new(),
-            "Recent messages:".to_string(),
-        ];
-        let said = self.said.borrow();
-        if said.is_empty() {
-            lines.push("  (none this session)".into());
-        }
-        for (at, text) in said.iter() {
-            let when = chrono::DateTime::from_timestamp(*at, 0).map(|at| at.format("%H:%M:%S").to_string()).unwrap_or_default();
-            lines.push(format!("  {when} UTC  {text}"));
-        }
-        lines.push(String::new());
-        lines.push("Times the app stopped by itself:".to_string());
-        match std::fs::read_to_string(&self.paths.crash_log) {
-            Ok(log) if !log.trim().is_empty() => {
-                let all: Vec<&str> = log.lines().collect();
-                lines.extend(all[all.len().saturating_sub(40)..].iter().map(|line| format!("  {line}")));
-            }
-            _ => lines.push("  (none noted)".into()),
-        }
-        drop(said);
-        drop(settings);
-        let path = self.paths.diagnostics.clone();
-        if let Some(folder) = path.parent() {
-            let _ = std::fs::create_dir_all(folder);
-        }
-        match std::fs::write(&path, lines.join("\r\n")) {
-            Ok(()) => {
-                // Opened in whatever shows text files, to be read or copied from.
-                let program = if cfg!(windows) { "notepad" } else { "xdg-open" };
-                let _ = std::process::Command::new(program).arg(&path).spawn();
-                self.toast(format!("Saved to {}", path.display()));
-            }
-            Err(e) => self.toast(format!("Couldn't write {}. {e}", path.display())),
-        }
+        crate::diagnostics::save(self);
     }
 
     pub fn client(&self) -> Option<Client> {

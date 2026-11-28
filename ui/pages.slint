@@ -2028,7 +2028,9 @@ export component SettingsPage inherits Rectangle {
     // The title and the section chips stay put above the settings. In a short window the
     // title makes way, so the settings keep most of the height.
     property <bool> short: self.height < 480px;
-    property <length> head: sections.y + sections.height + 18px;
+    property <bool> show-report;
+    property <length> sections-end: sections.y + sections.height + 18px;
+    property <length> head: self.sections-end + (self.show-report ? 54px : 0px);
 
     Text {
         x: root.edge;
@@ -2050,7 +2052,33 @@ export component SettingsPage inherits Rectangle {
         selected: Settings.tab;
         chosen(index) => {
             Settings.tab = index;
+            root.show-report = false;
             scroll.content-y = 0px;
+        }
+    }
+
+    if root.show-report: HorizontalLayout {
+        x: root.edge;
+        y: root.sections-end;
+        width: root.column;
+        height: 46px;
+        spacing: 12px;
+
+        Text {
+            text: "What is sent";
+            color: Theme.text;
+            font-family: Theme.display;
+            font-size: 23px;
+            font-weight: 700;
+            vertical-alignment: center;
+        }
+
+        TextButton {
+            text: "Back to About";
+            clicked => {
+                root.show-report = false;
+                scroll.content-y = 0px;
+            }
         }
     }
 
@@ -2778,7 +2806,7 @@ export component SettingsPage inherits Rectangle {
                     }
 
                     // ---- About ----
-                    if Settings.tab == 7: VerticalLayout {
+                    if Settings.tab == 7 && !root.show-report: VerticalLayout {
                         SettingRow {
                             title: "Nexus Music " + App.app-version;
                             detail: Settings.update-status;
@@ -2806,10 +2834,24 @@ export component SettingsPage inherits Rectangle {
 
                         SettingRow {
                             title: "Diagnostics";
-                            detail: "Writes a text file about the app and how it's set up, with its recent messages and a note of any time it stopped by itself, and opens it. Useful when something isn't working. It names no server address or account (its messages can mention songs by name), and it stays on this PC unless you send it somewhere.";
+                            detail: "Writes and opens a local text file with app settings, recent messages and crash details. It can include names and paths.";
                             TextButton {
                                 text: "Save diagnostics";
                                 clicked => { Settings.save-diagnostics(); }
+                            }
+                        }
+
+                        SettingRow {
+                            title: "Diagnostics report";
+                            detail: "See the report that would be sent to the Nexus server.";
+                            TextButton {
+                                text: "What is sent";
+                                clicked => {
+                                    Settings.diagnostics-preview = "";
+                                    root.show-report = true;
+                                    scroll.content-y = 0px;
+                                    Settings.preview-diagnostics();
+                                }
                             }
                         }
 
@@ -2830,6 +2872,17 @@ export component SettingsPage inherits Rectangle {
                                     width: 180px;
                                 }
                             }
+                        }
+                    }
+
+                    if root.show-report: VerticalLayout {
+                        padding-top: 16px;
+                        Text {
+                            text: Settings.diagnostics-preview == "" ? "Reading diagnostics…" : Settings.diagnostics-preview;
+                            color: Theme.text;
+                            font-family: "monospace";
+                            font-size: 13px;
+                            wrap: word-wrap;
                         }
                     }
                 }
