@@ -281,3 +281,57 @@ fn a_wrong_password_an_unknown_email_and_a_note_all_answer_as_the_design_says() 
     let (status, _) = backend.post(account::SIGN_IN, None, &vec![b' '; account::PASSWORD_REQUEST_MAX_BYTES + 1]);
     assert_eq!(status, 413);
 }
+
+/// A1 (8.3), as far as S8 can take it: a wrong password for an account and an email with no
+/// account, interleaved over HTTP, each answered in about the same time. Run by hand:
+/// `cargo test --manifest-path server/Cargo.toml --test signin -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn a_wrong_password_and_an_unknown_email_take_about_the_same_time() {
+    const ACCOUNTS: usize = 8;
+    const ROUNDS: usize = 3;
+    let folders = Folders::new("a1");
+    let port = free_port();
+    let settings = folders.settings(port);
+    let mut codes = Vec::new();
+    for n in 0..ACCOUNTS {
+        let email = format!("listener-{n}@example.org");
+        let output = program(&settings, &["recover", &email]).output().unwrap();
+        let said = String::from_utf8_lossy(&output.stdout).to_string();
+        let at = said.find("one-time code ").unwrap() + "one-time code ".len();
+        codes.push((email, said[at..at + 13].replace('-', "")));
+    }
+    let backend = Serving::start(&settings, port);
+    for (n, (_, code)) in codes.iter().enumerate() {
+        let password = format!("{PASSWORD} number {n}");
+        let (status, _) = backend.post(account::SIGN_IN, None, &sign_in(Credential::Code { code: OneTimeCode::new(code).unwrap(), new_password: Password::new(&password).unwrap() }, n as u8 + 10, "A PC", DeviceKind::Pc));
+        assert_eq!(status, 200);
+    }
+    let (mut wrong, mut unknown) = (Vec::new(), Vec::new());
+    let mut stranger = 0;
+    for round in 0..ROUNDS {
+        for (email, _) in &codes {
+            let started = Instant::now();
+            let (status, _) = backend.post(account::SIGN_IN, None, &sign_in(with_password(email, "a guess that is not it"), 200, "A stranger", DeviceKind::Pc));
+            assert_eq!(status, 403, "round {round}");
+            wrong.push(started.elapsed().as_secs_f64() * 1000.0);
+            stranger += 1;
+            let started = Instant::now();
+            let (status, _) = backend.post(account::SIGN_IN, None, &sign_in(with_password(&format!("stranger-{stranger}@example.org"), "a guess that is not it"), 200, "A stranger", DeviceKind::Pc));
+            assert_eq!(status, 403, "round {round}");
+            unknown.push(started.elapsed().as_secs_f64() * 1000.0);
+        }
+        // Past every account's wait at the other door (1 s, 2 s, 4 s).
+        std::thread::sleep(Duration::from_millis(1100 << round));
+    }
+    let summary = |name: &str, samples: &mut Vec<f64>| {
+        samples.sort_by(f64::total_cmp);
+        let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+        println!("{name}: n {} median {:.1} ms mean {mean:.1} ms min {:.1} max {:.1}", samples.len(), samples[samples.len() / 2], samples[0], samples[samples.len() - 1]);
+        mean
+    };
+    let a = summary("wrong password", &mut wrong);
+    let b = summary("unknown email", &mut unknown);
+    // A loose bound: the same slow work; what is not the same is the look-up of an account.
+    assert!((a - b).abs() < a.max(b) * 0.5, "{a} against {b}");
+}

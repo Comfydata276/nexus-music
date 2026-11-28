@@ -22,7 +22,7 @@ use nexus_core::nexus::account::{
     Name, NotAllowed, NotSignedIn, Notice, Password, PasswordChanged, PasswordDoor, Person, Receipt, Refusal, Reply, RequestHead, SignIn, SignOut, SignOutNote, SignOutSecret,
     SignedIn, SignedOut, Stamp,
 };
-use nexus_core::nexus::kept::{Access, Account, AccountState, Bearer, Denied, Fingerprint, FreshSession, LeaveFor, PasswordCheck, SessionTarget};
+use nexus_core::nexus::kept::{Access, Account, AccountState, Bearer, Denied, Effects, Fingerprint, FreshSession, LeaveFor, PasswordCheck, SessionTarget};
 use nexus_core::nexus::proto::{BackendId, SPEAKS, Speaks};
 
 use super::check::{Checked, PasswordWorkers};
@@ -215,7 +215,16 @@ impl Accounts {
             .desk
             .ask(move |keeper| -> Result<Option<Prepared>, Refusal> {
                 let now = clock();
-                let Some(number) = keeper.account_named(asked.as_str()).map_err(not_dealt_with)? else { return Ok(None) };
+                let Some(number) = keeper.account_named(asked.as_str()).map_err(not_dealt_with)? else {
+                    // 8.3: an email with no account does the same work here as one with an
+                    // account: kept's decision keeps the clock (the store kept apart written as
+                    // for any decision), so this keeps it too. Measured without it: 19 ms
+                    // against 42 ms, which told the two apart (A1).
+                    let effects = Effects { high_water: keeper.clock(now).effective(), updates: Vec::new() };
+                    let _ = keeper.data().password(0);
+                    keeper.persist(&effects, &[], now).map_err(not_dealt_with)?;
+                    return Ok(None);
+                };
                 let mut account = keeper.load(number).map_err(not_dealt_with)?;
                 let stored = keeper.data().password(number).map_err(not_dealt_with)?;
                 // With no password kept, nothing can match: the same slow work is done (S8b).
