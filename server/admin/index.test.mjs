@@ -9,7 +9,7 @@ const route = readFileSync(new URL("../src/admin.rs", import.meta.url), "utf8");
 const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
 const style = html.match(/<style>([\s\S]*?)<\/style>/)[1];
 
-function loadPage(fetch, { requestsEnabled = false, origin = "https://owner.example.test:8443" } = {}) {
+function loadPage(fetch, { origin = "https://owner.example.test:8443" } = {}) {
   const elements = new Map();
   const windowEvents = new Map();
   const documentEvents = new Map();
@@ -72,11 +72,9 @@ function loadPage(fetch, { requestsEnabled = false, origin = "https://owner.exam
     fetch,
   };
   const instrumentation = "globalThis.forTest = { parseReply, typedCode, hasApproval: () => approval !== null };";
-  let source = script;
-  if (requestsEnabled) source = source.replace("const enableRequestChanges = false;", "const enableRequestChanges = true;");
   from("listening-days").value = "30";
   from("listening-top").value = "artists";
-  runInNewContext(source.replace(/\}\)\(\);\s*$/, instrumentation + "})();"), context);
+  runInNewContext(script.replace(/\}\)\(\);\s*$/, instrumentation + "})();"), context);
   const findButton = (node, label) => {
     if (node.tag === "button" && node.textContent === label) return node;
     for (const child of node.children) {
@@ -220,12 +218,13 @@ test("authorized reads render text and paginate losslessly", async () => {
     }
     if (path === "/nexus/api/admin/music-server") return done({ internal: injected, public: injected });
     if (path === "/nexus/api/admin/diagnostics-default") return done({ enabled: true });
+    if (path === "/nexus/api/admin/lidarr") return done({ address: null, configured: false });
     throw new Error("Unexpected request " + path);
   });
 
   await page.signIn("owner@example.test", "example admin password");
   await new Promise(setImmediate);
-  assert.equal(requests.length, 4);
+  assert.equal(requests.length, 5);
   for (const [, options] of requests) {
     assert.equal(options.headers.Authorization, "Bearer " + token);
     assert.deepEqual(JSON.parse(options.body).head, { speaks: [1, 1], restore: 2 });
@@ -235,11 +234,12 @@ test("authorized reads render text and paginate losslessly", async () => {
   assert.equal(page.from("music-internal").textContent, injected);
   assert.equal(page.from("music-public").textContent, injected);
   assert.equal(page.from("diagnostics-status").textContent, "New devices send diagnostics by default.");
-  assert.equal(page.from("requests-list").children.length, 0);
+  assert.equal(page.from("requests-list").children.length, 1);
   assert.equal(page.from("accounts-more").hidden, false);
-  await page.from("accounts-more").events.get("click")();
+  await page.click("requests-more");
   assert.match(requests.at(-1)[1].body, /"after":18446744073709551614/);
   assert.equal(page.from("accounts-list").children.length, 2);
+  assert.equal(page.from("requests-list").children.length, 2);
   assert.equal(page.from("accounts-more").hidden, true);
   page.windowEvents.get("pagehide")();
   assert.equal(page.from("admin").hidden, true);
@@ -357,7 +357,7 @@ function adminStandIn() {
 
 test("all changes show a confirmation and spend one grant on the exact wire target", async () => {
   const mock = adminStandIn();
-  const page = loadPage(mock.fetch, { requestsEnabled: true });
+  const page = loadPage(mock.fetch);
   await page.signIn("owner@example.test", "example sign-in password");
   await settle();
   const confirm = async (password) => {
@@ -425,7 +425,7 @@ test("all changes show a confirmation and spend one grant on the exact wire targ
   assert.equal(page.from("music-public").textContent, address);
 
   assert.equal(page.from("lidarr-address").textContent, lidarrAddress);
-  assert.match(page.from("lidarr-key-status").textContent, /Enter a key/);
+  assert.equal(page.from("lidarr-key-status").textContent, "Lidarr key is not set.");
   for (const invalidKey of ["with spaces", "é", "a".repeat(513)]) {
     page.submit("lidarr-form", { "lidarr-key": invalidKey });
     assert.equal(page.from("lidarr-key").value, "");
@@ -436,7 +436,7 @@ test("all changes show a confirmation and spend one grant on the exact wire targ
 
   assert.equal(page.from("grant-summary").textContent.includes(lidarrKey), false);
   await confirm();
-  assert.match(page.from("lidarr-key-status").textContent, /A key is saved/);
+  assert.equal(page.from("lidarr-key-status").textContent, "Lidarr key is set.");
   assert.equal(page.from("lidarr-address").textContent.includes(lidarrKey), false);
   page.click("diagnostics-toggle");
   await confirm();
@@ -691,13 +691,13 @@ test("the code instructions match the app fields and preserve the lifetime", () 
 test("requests shows one container instruction and no key field when Lidarr has no address", async () => {
   const mock = adminStandIn();
   const page = loadPage((path, options) => path === "/nexus/api/admin/lidarr"
-    ? new Response('{"done":{"address":null,"configured":false}}') : mock.fetch(path, options),
-    { requestsEnabled: true });
+    ? new Response('{"done":{"address":null,"configured":false}}') : mock.fetch(path, options));
   await page.signIn("owner@example.test", adminPassword);
   await settle();
   assert.equal(page.from("lidarr-details").hidden, true);
   assert.equal(page.from("requests-availability").hidden, false);
-  assert.match(page.from("requests-availability").textContent, /server owner sets the Lidarr address in the container/);
+  assert.equal(page.from("requests-availability").textContent,
+    "Music requests aren't set up on this server. The server's owner sets Lidarr's address on the container.");
   assert.ok(page.button("requests-list", "Turn requests off"));
 });
 
@@ -716,6 +716,72 @@ const listeningOverview = (starts = 11, days = 30) => ({
 });
 const doneListening = data => new Response(JSON.stringify({ done: data }));
 const textOf = node => node.textContent + node.children.map(textOf).join("");
+
+test("request history displays text and uses the exact snapshot cursor", async () => {
+  const mock = adminStandIn();
+  const calls = [];
+  const row = {
+    account: 7, name: "Jamie <b>Chen</b>",
+    asked: { title: "Night Walk <script>example()</script>", artist: "The Lanterns", asked_ms: listeningTime },
+  };
+  const page = loadPage((path, options) => {
+    if (path !== "/nexus/api/admin/request-attribution") return mock.fetch(path, options);
+    assert.equal(options.headers["X-Nexus-Admin"], "1");
+    assert.equal(options.headers.Authorization, "Bearer " + encodedToken);
+    assert.equal(options.credentials, "omit");
+    calls.push(options.body);
+    if (calls.length === 1) {
+      return new Response('{"done":{"rows":' + JSON.stringify([row, { ...row, arrived: true }]) +
+        ',"next":[18446744073709551614,2]}}');
+    }
+    return new Response(JSON.stringify({ done: { rows: [{ ...row, arrived: false }], next: null } }));
+  });
+  await page.signIn("owner@example.test", adminPassword);
+  assert.equal(calls.length, 0);
+  const details = page.from("request-history");
+  details.open = true;
+  details.events.get("toggle")();
+  await settle();
+  assert.deepEqual(JSON.parse(calls[0]), { head: { speaks: [1, 1], restore: 2 }, after: null });
+  const list = page.from("request-history-list");
+  assert.match(textOf(list), /Night Walk <script>example\(\)<\/script>/);
+  assert.match(textOf(list), /Requested by Jamie <b>Chen<\/b> on/);
+  assert.match(textOf(list.children[0]), /Arrival unknown/);
+  assert.match(textOf(list.children[1]), /Arrived/);
+  await page.click("request-history-more");
+  assert.match(calls[1], /"after":\[18446744073709551614,2\]/);
+  assert.match(textOf(list.children[2]), /Not here yet/);
+  assert.ok(page.from("request-history-more").hidden);
+  page.windowEvents.get("pagehide")();
+  assert.equal(list.children.length, 0);
+  assert.equal(details.open, false);
+});
+
+test("an expired request list starts a fresh snapshot when reloaded", async () => {
+  const mock = adminStandIn();
+  const calls = [];
+  const page = loadPage((path, options) => {
+    if (path !== "/nexus/api/admin/request-attribution") return mock.fetch(path, options);
+    const { after } = JSON.parse(options.body);
+    calls.push(after);
+    if (after) return new Response('{"refused":{"not_allowed":"conflict"}}', { status: 403 });
+    const result = calls.length === 1 ?
+      { rows: [{ name: "Jamie", asked: { title: "Night Walk", artist: "The Lanterns", asked_ms: listeningTime } }], next: [5, 1] } :
+      { rows: [], next: null };
+    return new Response(JSON.stringify({ done: result }));
+  });
+  await page.signIn("owner@example.test", adminPassword);
+  const details = page.from("request-history");
+  details.open = true;
+  details.events.get("toggle")();
+  await settle();
+  await page.click("request-history-more");
+  assert.equal(page.from("request-history-more").textContent, "Reload requests");
+  await page.click("request-history-more");
+  assert.deepEqual(calls, [null, [5, 1], null]);
+  assert.equal(page.from("request-history-list").children.length, 0);
+  assert.equal(page.from("request-history-status").textContent, "No music requests yet.");
+});
 
 test("listening reads one period at a time and pages older plays and people", async () => {
   const mock = adminStandIn();

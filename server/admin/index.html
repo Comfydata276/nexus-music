@@ -95,6 +95,8 @@ article p, dt { color: var(--muted); }
 dd { margin: 0 0 .65rem; }
 dd, li { overflow-wrap: anywhere; }
 .account-links { display: flex; flex-wrap: wrap; gap: .6rem; }
+#requests-panel h3 { margin: .85rem 0 0; font-size: 1rem; }
+#request-history { border-top: 1px solid var(--line); margin-top: .85rem; }
 #listening-panel { grid-column: 1 / -1; }
 .listening-filters, .listening-columns { display: grid; gap: 1rem; }
 .listening-filters { grid-template-columns: repeat(auto-fit, minmax(min(100%, 11rem), 1fr)); }
@@ -217,19 +219,27 @@ dd, li { overflow-wrap: anywhere; }
         <button id="diagnostics-toggle" type="button" hidden></button>
         <button id="reports-open" type="button" class="secondary">Read device reports</button>
       </article>
-      <article>
+      <article id="requests-panel">
         <h2>Requests</h2>
-        <p id="requests-status" role="status"></p>
-        <ul id="requests-list"></ul>
-        <p id="requests-availability">Settings for requests will be available when music requests are turned on for this server.</p>
+        <p id="requests-availability" role="status"></p>
         <details id="lidarr-details" hidden>
           <summary>Set up Lidarr</summary>
+          <dl><dt>Lidarr address</dt><dd id="lidarr-address"></dd></dl>
+          <p id="lidarr-key-status"></p>
           <form id="lidarr-form" method="post" autocomplete="off">
-            <dl><dt>Lidarr address</dt><dd id="lidarr-address"></dd></dl>
-            <p id="lidarr-key-status"></p>
             <label>Lidarr key <input id="lidarr-key" type="password" autocomplete="new-password" maxlength="512" required></label>
             <button type="submit">Review Lidarr key</button>
           </form>
+        </details>
+        <h3>Who may request music</h3>
+        <p id="requests-status" role="status"></p>
+        <ul id="requests-list"></ul>
+        <button id="requests-more" class="secondary" type="button" hidden>Load more people</button>
+        <details id="request-history">
+          <summary>Who asked for what</summary>
+          <ul id="request-history-list"></ul>
+          <p id="request-history-status" role="status"></p>
+          <button id="request-history-more" class="secondary" type="button" hidden>Older requests</button>
         </details>
       </article>
       <article id="listening-panel" hidden>
@@ -334,7 +344,6 @@ dd, li { overflow-wrap: anywhere; }
   const setupDetails = byId("setup-details");
   const setupForm = byId("setup-form");
   const setupSubmit = byId("setup-submit");
-  const enableRequestChanges = false;
   const email = byId("email");
   const password = byId("password");
   const submit = byId("submit");
@@ -350,6 +359,10 @@ dd, li { overflow-wrap: anywhere; }
   const devicePage = page("devices");
   const requests = byId("requests-list");
   const requestsStatus = byId("requests-status");
+  const requestsMore = byId("requests-more");
+  const requestHistory = byId("request-history");
+  const requestHistoryPage = page("request-history");
+  const requestDate = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" });
   const musicStatus = byId("music-status");
   const internalAddress = byId("music-internal");
   const publicAddress = byId("music-public");
@@ -610,6 +623,7 @@ dd, li { overflow-wrap: anywhere; }
     const current = session;
     if (!current || pager.more.disabled) return;
     pager.more.disabled = true;
+    if (pager === accountPage) requestsMore.disabled = true;
     const generation = pager.generation;
     const currentPage = () => session === current && pager.generation === generation;
     writeText(pager.status, "Loading…");
@@ -645,7 +659,14 @@ dd, li { overflow-wrap: anywhere; }
       pager.more.hidden = false;
       writeText(pager.more, "Retry");
     } finally {
-      if (currentPage()) pager.more.disabled = false;
+      if (currentPage()) {
+        pager.more.disabled = false;
+        if (pager === accountPage) {
+          requestsMore.disabled = false;
+          requestsMore.hidden = pager.more.hidden;
+          writeText(requestsMore, pager.more.textContent === "Retry" ? "Retry" : "Load more people");
+        }
+      }
     }
   }
 
@@ -956,6 +977,7 @@ dd, li { overflow-wrap: anywhere; }
   }
 
   accountPage.more.addEventListener("click", loadAccounts);
+  requestsMore.addEventListener("click", loadAccounts);
   devicePage.more.addEventListener("click", loadDevices);
 
   function makeButton(label, click, danger = false) {
@@ -1021,8 +1043,7 @@ dd, li { overflow-wrap: anywhere; }
     menu.append(summary, buttons);
     entry.append(menu);
 
-    if (!enableRequestChanges) return;
-    const requestRow = appendRow(requests, row.name + " · " + (row.requestsEnabled ? "On" : "Off"));
+    const requestRow = appendRow(requests, row.name + (row.requestsEnabled ? " can request music." : " can’t request music."));
     const requestButtons = document.createElement("div");
     requestButtons.className = "row-actions";
     const mayRequest = !row.requestsEnabled;
@@ -1219,6 +1240,13 @@ dd, li { overflow-wrap: anywhere; }
     } catch (error) {
       if (session !== current) return;
       if (!sentChange || error.reason === "grant_required") clearApproval();
+      if (proposed.path === "set-requests-enabled" && sentChange) {
+        refreshAfter(current, "accounts");
+        if (error.reason === "grant_required" || error.reason === "conflict") {
+          message("The setting may have changed in another tab. Check the current setting under Requests.", true);
+          return;
+        }
+      }
       const fallback = sentChange
         ? "Could not confirm the change. Check the current settings before trying again."
         : "Could not confirm your password. Check your connection and try again.";
@@ -1313,10 +1341,10 @@ dd, li { overflow-wrap: anywhere; }
       requestsAvailability.hidden = Boolean(lidarrAddress);
       writeText(byId("lidarr-address"), lidarrAddress ?? "");
       writeText(byId("lidarr-key-status"), !lidarrAddress ? "" :
-        result.configured ? "A key is saved." : "Enter a key to set up requests.");
+        result.configured ? "Lidarr key is set." : "Lidarr key is not set.");
       if (!lidarrAddress) {
         lidarrForm.reset();
-        writeText(requestsAvailability, "Requests are not set up on this server. The server owner sets the Lidarr address in the container.");
+        writeText(requestsAvailability, "Music requests aren't set up on this server. The server's owner sets Lidarr's address on the container.");
       }
     } catch {
       if (session !== current) return;
@@ -1330,9 +1358,73 @@ dd, li { overflow-wrap: anywhere; }
     }
   }
 
+  function requestHistoryRow(row) {
+    const asked = row?.asked;
+    if (typeof row?.name !== "string" || Array.from(row.name).length > 128 ||
+        typeof asked?.title !== "string" || bytes(asked.title) > 1024 ||
+        typeof asked.artist !== "string" || bytes(asked.artist) > 1024 ||
+        !isU64(asked.asked_ms) || asked.asked_ms > 8640000000000000n ||
+        (row.arrived != null && typeof row.arrived !== "boolean")) throw new Error();
+    const item = document.createElement("li");
+    const title = document.createElement("strong");
+    writeText(title, (asked.title || "Unknown title") + (asked.artist ? " — " + asked.artist : ""));
+    const by = document.createElement("p");
+    writeText(by, "Requested by " + row.name + " on " + requestDate.format(Number(asked.asked_ms)));
+    const arrival = document.createElement("p");
+    writeText(arrival, row.arrived === true ? "Arrived" : row.arrived === false ? "Not here yet" : "Arrival unknown");
+    item.append(title, by, arrival);
+    return item;
+  }
+
+  async function loadRequestHistory() {
+    const current = session;
+    const pager = requestHistoryPage;
+    if (!current || !requestHistory.open || pager.more.disabled) return;
+    const generation = pager.generation;
+    const active = () => current === session && generation === pager.generation;
+    const after = pager.after;
+    pager.more.disabled = true;
+    writeText(pager.status, "Loading…");
+    try {
+      const result = await readAdmin(current, "/nexus/api/admin/request-attribution", { after }, 1024 * 1024);
+      if (!active()) return;
+      if (!Array.isArray(result.rows) || result.rows.length > 500) throw new Error();
+      const next = result.next;
+      if (next !== null &&
+          (!Array.isArray(next) || next.length !== 2 || !isU64(next[0]) || next[0] === 0n || !result.rows.length ||
+          next[1] !== (after?.[1] ?? 0n) + BigInt(result.rows.length) || next[1] >= 50_000n ||
+          (after && next[0] !== after[0]))) throw new Error();
+      const rows = result.rows.map(requestHistoryRow);
+      pager.list.append(...rows);
+      pager.after = next;
+      pager.more.hidden = next === null;
+      writeText(pager.more, "Older requests");
+      writeText(pager.status, pager.list.children.length ? "" : "No music requests yet.");
+    } catch (error) {
+      if (!active()) return;
+      if (error.reason === "conflict") {
+        pager.list.replaceChildren();
+        pager.after = null;
+        writeText(pager.status, "This list has expired. Load it again.");
+        writeText(pager.more, "Reload requests");
+      } else {
+        writeText(pager.status, error.reason === "busy" ? error.message : "Could not load requests. Select Retry.");
+        writeText(pager.more, "Retry");
+      }
+      pager.more.hidden = false;
+    } finally {
+      if (active()) pager.more.disabled = false;
+    }
+  }
+
+  requestHistory.addEventListener("toggle", () => {
+    resetPage(requestHistoryPage);
+    if (requestHistory.open) void loadRequestHistory();
+  });
+  requestHistoryPage.more.addEventListener("click", loadRequestHistory);
+
   lidarrForm.addEventListener("submit", event => {
     event.preventDefault();
-    if (!enableRequestChanges) return;
     const key = field("lidarr-key");
     lidarrForm.reset();
     if (!lidarrAddress) return message("Set the Lidarr address in the Nexus container first.", true);
@@ -1356,6 +1448,10 @@ dd, li { overflow-wrap: anywhere; }
   });
 
   function resetPage(pager) {
+    if (pager === accountPage) {
+      requestsMore.hidden = true;
+      requestsMore.disabled = false;
+    }
     if (pager === devicePage) {
       deviceOwners.clear();
       deviceNames.clear();
@@ -1382,11 +1478,13 @@ dd, li { overflow-wrap: anywhere; }
     byId("new-account-details").open = false;
     lidarrDetails.open = false;
     lidarrDetails.hidden = true;
-    for (const pager of [accountPage, devicePage]) resetPage(pager);
+    requestHistory.open = false;
+    for (const pager of [accountPage, devicePage, requestHistoryPage]) resetPage(pager);
     accountNames.clear();
     musicAddress = null;
     diagnosticsEnabled = null;
     lidarrAddress = null;
+    writeText(requestsAvailability, "");
     writeText(byId("lidarr-address"), "");
     writeText(byId("lidarr-key-status"), "");
     addressForm.hidden = true;
@@ -1580,11 +1678,9 @@ dd, li { overflow-wrap: anywhere; }
       void loadDevices();
       void loadMusic(session);
       void loadDiagnostics(session);
-      if (enableRequestChanges) {
-        requestsAvailability.hidden = false;
-        writeText(requestsAvailability, "Checking request settings…");
-        void loadLidarr(session);
-      }
+      requestsAvailability.hidden = false;
+      writeText(requestsAvailability, "Checking request settings…");
+      void loadLidarr(session);
       form.reset();
       form.hidden = true;
       admin.hidden = document.hidden;
