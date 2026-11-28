@@ -888,6 +888,7 @@ fn provisioning_requires_the_grant_both_exact_logins_and_current_authority() -> 
             assert_eq!(
                 hand_out(
                     needs_recovery.state(),
+                    SessionKind::App,
                     Some(&old_login),
                     &key,
                     &public,
@@ -896,9 +897,14 @@ fn provisioning_requires_the_grant_both_exact_logins_and_current_authority() -> 
                 MusicLoginResult::UnusableNow
             );
             let recovered = Account::load(&update.apart_first, Some(&update.data));
-            let MusicLoginResult::Login(handed) =
-                hand_out(recovered.state(), Some(login), &key, &public, salt())
-            else {
+            let MusicLoginResult::Login(handed) = hand_out(
+                recovered.state(),
+                SessionKind::App,
+                Some(login),
+                &key,
+                &public,
+                salt(),
+            ) else {
                 panic!("committed replacement should work before the last apart write");
             };
             assert_eq!(
@@ -907,7 +913,14 @@ fn provisioning_requires_the_grant_both_exact_logins_and_current_authority() -> 
             );
             let restored = Account::load(&update.apart_last, Some(&alice.data));
             assert_eq!(
-                hand_out(restored.state(), Some(&old_login), &key, &public, salt()),
+                hand_out(
+                    restored.state(),
+                    SessionKind::App,
+                    Some(&old_login),
+                    &key,
+                    &public,
+                    salt()
+                ),
                 MusicLoginResult::UnusableNow
             );
             assert_eq!(update.data.account.music_login, 2);
@@ -1111,5 +1124,422 @@ fn grants_check_the_targets_current_revision_and_the_requested_setting_value() -
             turn.administer(bearer(1, &hash(7)), action, AdminTarget::Backend, None)
         })?;
     }
+    Ok(())
+}
+
+#[test]
+fn owner_recovery_ends_sessions_and_fences_the_old_password_before_data() -> Result<(), Denied> {
+    let mut authority = state("alice@example.test");
+    authority.password_changes = 2;
+    authority.code = Some(LiveCode::new(2, 0)?);
+    let mut s = Stored::new(authority);
+    s.sign_in(8, 1, 1, 0)?;
+    s.sign_in(9, 2, 2, 0)?;
+    s.leave(1, 1, LeaveFor::DeleteHistory, 0)?;
+    let old = s.data.clone();
+    let verifier = hash(59);
+    s.account
+        .owner_recover(clock(1, 0), verifier.clone())
+        .apply(|e| {
+            let u = e.updates.first().unwrap();
+            assert_eq!(
+                u.change,
+                DataChange::OwnerRecovery {
+                    code_verifier: verifier.clone()
+                }
+            );
+            assert!(u.apart_first.account.password_reset_required);
+            assert_eq!(u.apart_first.account.password_changes, 3);
+            assert_eq!(u.apart_first.account.code, Some(LiveCode::new(3, 1)?));
+            assert!(
+                u.apart_first
+                    .devices
+                    .values()
+                    .all(|d| d.permit.is_none() && d.number == 1)
+            );
+            for data in [&old, &u.data] {
+                let mut cut = Account::load(&u.apart_first, Some(data));
+                for (device, bearer_byte) in [(1, 1), (2, 2)] {
+                    assert_eq!(
+                        cut.request(1, clock(1, 1), |t| t
+                            .arrive(bearer(device, &hash(bearer_byte)), Access::Read))
+                            .apply(|_| Ok::<_, Denied>(()))?
+                            .err(),
+                        Some(Denied::NotSignedIn)
+                    );
+                }
+                let secret = DeviceSecret::from_bytes([8; 32]);
+                assert_eq!(
+                    cut.sign_in_turn(clock(1, 1), |t| t.check_code(&secret, dev(1), 2, hash(22)))
+                        .apply(|_| Ok::<_, Denied>(()))?
+                        .err(),
+                    Some(Denied::WrongPassword)
+                );
+                assert!(cut.state().password_reset_required);
+            }
+            assert!(!Account::load(&u.apart_first, Some(&u.data)).state().admin);
+            assert!(Account::load(&u.apart_last, Some(&u.data)).state().admin);
+            assert_eq!(u.data.account.code, u.apart_last.account.code);
+            Ok::<_, Denied>(())
+        })??;
+    Ok(())
+}
+
+#[test]
+fn owner_recovery_grants_on_and_admin_only_at_the_last_cut_and_refuses_tombstones()
+-> Result<(), Denied> {
+    let mut off = state("alice@example.test");
+    off.status = Status::Off;
+    let mut s = Stored::new(off);
+    let old = s.data.clone();
+    let issued = s.account.owner_recover(clock(3, 3), hash(55)).apply(|e| {
+        let u = e.updates.first().unwrap();
+        assert_eq!(u.apart_first.account.status, Status::Off);
+        assert!(!u.apart_first.account.admin);
+        for data in [&old, &u.data] {
+            let cut = Account::load(&u.apart_first, Some(data));
+            assert!(!cut.state().admin);
+            assert_eq!(cut.state().status, Status::Off);
+        }
+        let final_state = Account::load(&u.apart_last, Some(&u.data));
+        assert!(final_state.state().admin);
+        assert_eq!(final_state.state().status, Status::On);
+        assert!(final_state.state().password_reset_required);
+        Ok::<_, Denied>(())
+    })??;
+    assert_eq!(issued, LiveCode::new(1, 3)?);
+    let mut deleted = state("bob@example.test");
+    deleted.status = Status::Deleted;
+    let mut s = Stored::new(deleted);
+    assert_eq!(
+        s.account.owner_recover(clock(3, 3), hash(55)).apply(|e| {
+            assert!(e.updates.is_empty());
+            Ok::<_, Denied>(())
+        })?,
+        Err(Denied::NotSignedIn)
+    );
+    Ok(())
+}
+
+#[test]
+fn persisted_effects_debug_omits_identity_text_and_verifier_bytes() -> Result<(), Denied> {
+    let mut s = Stored::new(state("alice@example.test"));
+    s.account
+        .owner_recover(clock(1, 1), Fingerprint::from_bytes([42; 32]))
+        .apply(|effects| {
+            let printed = format!("{effects:?}");
+            assert!(printed.contains("AccountId(1)"));
+            assert!(printed.contains("OwnerRecovery"));
+            assert!(!printed.contains("alice@example.test"));
+            assert!(!printed.contains("42, 42"));
+            Ok::<_, Denied>(())
+        })??;
+    let change = DataChange::ApplyAdmin {
+        action: AdminAction::CreateAccount,
+        target: AdminTarget::NewAccount(Email::new("private@example.test").unwrap()),
+    };
+    assert_eq!(format!("{change:?}"), "ApplyAdmin");
+    assert_eq!(
+        format!(
+            "{:?}",
+            AdminTarget::NewAccount(Email::new("private@example.test").unwrap())
+        ),
+        "NewAccount(..)"
+    );
+    Ok(())
+}
+
+#[test]
+fn lost_store_recovery_discards_verifier_and_codes_at_both_cuts_and_is_repeatable()
+-> Result<(), Denied> {
+    let mut account = state("alice@example.test");
+    account.code = Some(LiveCode::new(8, 0)?);
+    account.password_changes = 8;
+    let mut s = Stored::new(account);
+    s.sign_in(8, 1, 1, 0)?;
+    let copy = s.data.clone();
+    Account::recover_from_lost_store(&copy, None, 2, clock(2, 2)).apply(|e| {
+        let update = e.updates.first().unwrap();
+        assert_eq!(update.change, DataChange::DiscardCredentials);
+        assert_eq!(update.apart_first.account.password_changes, 9);
+        assert!(update.apart_first.account.password_reset_required);
+        assert!(update.apart_first.account.code.is_none());
+        assert_eq!(update.apart_first.devices.get(&dev(1)).unwrap().number, 1);
+        assert!(
+            update
+                .apart_first
+                .devices
+                .get(&dev(1))
+                .unwrap()
+                .permit
+                .is_none()
+        );
+        assert!(update.data.devices.get(&dev(1)).unwrap().session.is_none());
+        let secret = DeviceSecret::from_bytes([8; 32]);
+        for data in [&copy, &update.data] {
+            let mut loaded = Account::load(&update.apart_first, Some(data));
+            let checked = loaded
+                .sign_in_turn(clock(2, 2), |t| t.check_sign_in(&secret, dev(2), hash(42)))
+                .apply(|_| Ok::<_, Denied>(()))??;
+            let old = checked.check(hash(42), clock(2, 2))?;
+            assert_eq!(
+                loaded
+                    .sign_in_turn(clock(2, 2), |t| t.sign_in(old, fresh(2), None))
+                    .apply(|_| Ok::<_, Denied>(()))?,
+                Err(Denied::WrongPassword)
+            );
+            assert_eq!(
+                loaded
+                    .sign_in_turn(clock(2, 2), |t| t.check_code(&secret, dev(2), 8, hash(43)))
+                    .apply(|_| Ok::<_, Denied>(()))?
+                    .err(),
+                Some(Denied::WrongPassword)
+            );
+            Account::recover_from_lost_store(data, Some(&update.apart_first), 2, clock(2, 2))
+                .apply(|resumed| {
+                    let same = resumed.updates.first().unwrap();
+                    assert_eq!(same.change, DataChange::DiscardCredentials);
+                    assert_eq!(same.data, update.data);
+                    assert_eq!(same.apart_last, update.apart_last);
+                    Ok::<_, Denied>(())
+                })??;
+        }
+        Ok::<_, Denied>(())
+    })??;
+    Ok(())
+}
+
+#[test]
+fn lost_store_recovery_preserves_partial_authority_and_takes_the_higher_counters()
+-> Result<(), Denied> {
+    let mut account = state("alice@example.test");
+    account.admin = true;
+    account.password_changes = 9;
+    let mut s = Stored::new(account);
+    s.sign_in(8, 1, 1, 0)?;
+    s.sign_in(9, 2, 2, 0)?;
+    let copy = s.data.clone();
+    let mut partial = s.apart.clone();
+    partial.account.status = Status::Off;
+    partial.account.admin = false;
+    partial.account.revision = 23;
+    partial.account.password_changes = 7;
+    partial.account.life = 4;
+    partial.account.music_login = 5;
+    partial.devices.remove(&dev(2));
+    let retained = partial.devices.get_mut(&dev(1)).unwrap();
+    retained.number = 13;
+    retained.last_session = 99;
+    retained.known = false;
+    for (status, change) in [
+        (Status::Off, DataChange::DiscardCredentials),
+        (Status::Deleted, DataChange::DeleteAccount),
+    ] {
+        partial.account.status = status;
+        Account::recover_from_lost_store(&copy, Some(&partial), 2, clock(2, 2)).apply(|e| {
+            let u = e.updates.first().unwrap();
+            let locked = &u.apart_first.account;
+            assert_eq!(locked.status, status);
+            assert!(!locked.admin);
+            assert_eq!(locked.life, 4);
+            assert_eq!(locked.music_login, 5);
+            assert_eq!(u.change, change);
+            assert_eq!(u.apart_first.devices.get(&dev(1)).unwrap().number, 14);
+            assert_eq!(u.apart_first.devices.get(&dev(1)).unwrap().last_session, 99);
+            if status == Status::Off {
+                assert_eq!(locked.revision, 24);
+                assert_eq!(locked.password_changes, 10);
+                assert!(u.data.devices.get(&dev(2)).unwrap().session.is_none());
+                assert!(!u.apart_first.devices.get(&dev(2)).unwrap().known);
+            } else {
+                assert!(u.data.devices.is_empty());
+            }
+            Ok::<_, Denied>(())
+        })??;
+    }
+    partial.account.backend = BackendId::from_bytes([18; 16]);
+    assert_eq!(
+        Account::recover_from_lost_store(&copy, Some(&partial), 2, clock(2, 2)).apply(|e| {
+            assert!(e.updates.is_empty());
+            Ok::<_, Denied>(())
+        })?,
+        Err(Denied::WrongPurpose)
+    );
+    Ok(())
+}
+
+#[test]
+fn the_clock_recovers_one_mark_interval_and_marks_row_writes_immediately() -> Result<(), Denied> {
+    let persisted = 100_000;
+    let interval = CLOCK_MARK_INTERVAL_MS;
+    assert_eq!(
+        Clock::after_load(1, persisted).effective(),
+        persisted + interval
+    );
+    assert_eq!(Clock::after_load(200_000, persisted).effective(), 200_000);
+    assert_eq!(Clock::after_load(1, u64::MAX - 1).effective(), u64::MAX);
+    let mut s = Stored::new(state("alice@example.test"));
+    for (now, due) in [
+        (persisted + interval - 1, false),
+        (persisted + interval, true),
+    ] {
+        let denial = s
+            .account
+            .sign_in_turn(clock(now, persisted), |_| {
+                Err::<(), _>(Denied::WrongPassword)
+            })
+            .apply(|effects| {
+                assert!(effects.updates.is_empty());
+                assert_eq!(effects.high_water, now);
+                assert_eq!(effects.clock_mark_due(persisted), due);
+                Ok::<_, Denied>(())
+            })?;
+        assert_eq!(denial, Err(Denied::WrongPassword));
+    }
+    s.account
+        .owner_recover(clock(persisted + 1, persisted), hash(41))
+        .apply(|effects| {
+            assert!(effects.clock_mark_due(persisted));
+            Ok::<_, Denied>(())
+        })??;
+    Ok(())
+}
+
+#[test]
+fn reload_does_not_reopen_a_grant_that_expired_between_clock_writes() -> Result<(), Denied> {
+    let mut s = Stored::new(state("alice@example.test"));
+    s.sign_in(8, 1, 1, 0)?;
+    s.leave(1, 1, LeaveFor::DeleteHistory, 1)?;
+    let expired = 1 + PASSWORD_LEAVE_MS;
+    let persisted = expired - 1;
+    let decision = |account: &mut Account, clock| {
+        account
+            .request(1, clock, |t| t.delete_history(bearer(1, &hash(1))))
+            .apply(|effects| {
+                assert!(effects.updates.is_empty());
+                Ok::<_, Denied>(())
+            })
+    };
+    assert_eq!(
+        decision(&mut s.account, clock(expired, persisted))?,
+        Err(Denied::LeaveRequired)
+    );
+    s.reload();
+    assert_eq!(
+        decision(&mut s.account, Clock::after_load(expired - 10, persisted))?,
+        Err(Denied::LeaveRequired)
+    );
+    Ok(())
+}
+
+#[test]
+fn ten_restarts_do_not_advance_the_saved_mark_even_with_row_writes() -> Result<(), Denied> {
+    let mut s = Stored::new(state("alice@example.test"));
+    let mut saved = 100_000;
+    for _ in 0..10 {
+        let clock = Clock::after_load(1, saved).observe(2);
+        assert_eq!(clock.effective(), 160_000);
+        s.account.request(1, clock, |_| Ok(())).apply(|effects| {
+            assert!(!effects.clock_mark_due(saved));
+            assert_eq!(effects.high_water, saved);
+            Ok::<_, Denied>(())
+        })??;
+        s.account.owner_recover(clock, hash(50)).apply(|effects| {
+            assert!(effects.clock_mark_due(saved));
+            saved = effects.high_water;
+            let update = effects.updates.first().unwrap();
+            s.apart = update.apart_last.clone();
+            s.data = update.data.clone();
+            Ok::<_, Denied>(())
+        })??;
+        assert_eq!(saved, 100_000);
+        s.reload();
+    }
+    Ok(())
+}
+
+fn ten_restarts_until(store: &Stored, deadline: u64) -> Result<(Account, u64), Denied> {
+    let cadence = CLOCK_MARK_INTERVAL_MS / 4;
+    let start = deadline - 10 * cadence;
+    let mut saved = start;
+    for restart in 1..=10 {
+        let now = start + restart * cadence;
+        let mut loaded = Account::load(&store.apart, Some(&store.data));
+        loaded
+            .request(1, Clock::after_load(now, saved), |_| Ok(()))
+            .apply(|effects| {
+                assert!(effects.high_water <= now);
+                if effects.clock_mark_due(saved) {
+                    saved = effects.high_water;
+                }
+                Ok::<_, Denied>(())
+            })??;
+    }
+    assert_eq!(saved, deadline - 2 * cadence);
+    Ok((Account::load(&store.apart, Some(&store.data)), saved))
+}
+
+#[test]
+fn grants_codes_and_page_sessions_age_across_restarts_and_cannot_reopen() -> Result<(), Denied> {
+    let state = state("alice@example.test");
+    let mut s = Stored::new(state.clone());
+    s.sign_in(8, 1, 1, 0)?;
+    s.leave(1, 1, LeaveFor::DeleteHistory, 0)?;
+    let (mut loaded, grant_mark) = ten_restarts_until(&s, PASSWORD_LEAVE_MS)?;
+    for now in [PASSWORD_LEAVE_MS, 0] {
+        assert_eq!(
+            loaded
+                .request(1, Clock::after_load(now, grant_mark), |t| {
+                    t.delete_history(bearer(1, &hash(1)))
+                })
+                .apply(|_| Ok::<_, Denied>(()))?,
+            Err(Denied::LeaveRequired)
+        );
+    }
+
+    let mut with_code = state.clone();
+    with_code.code = Some(LiveCode::new(1, 0)?);
+    let s = Stored::new(with_code);
+    let (mut loaded, code_mark) = ten_restarts_until(&s, CODE_LIFETIME_MS)?;
+    let secret = DeviceSecret::from_bytes([8; 32]);
+    for now in [CODE_LIFETIME_MS, 0] {
+        assert_eq!(
+            loaded
+                .sign_in_turn(Clock::after_load(now, code_mark), |t| {
+                    t.check_code(&secret, dev(1), 1, hash(43))
+                })
+                .apply(|_| Ok::<_, Denied>(()))?
+                .err(),
+            Some(Denied::WrongPassword)
+        );
+    }
+
+    let mut admin = state;
+    admin.admin = true;
+    let mut s = Stored::new(admin);
+    let checked = s.bind(8, 1, 0)?;
+    s.step(0, |t| {
+        t.sign_in_as(SessionKind::AdminPage, checked, fresh(1), None)
+    })?;
+    let (mut loaded, page_mark) = ten_restarts_until(&s, ADMIN_PAGE_IDLE_MS)?;
+    assert_eq!(
+        loaded
+            .request(1, Clock::after_load(ADMIN_PAGE_IDLE_MS, page_mark), |t| {
+                t.arrive(bearer(1, &hash(1)), Access::Read)
+            })
+            .apply(|_| Ok::<_, Denied>(()))?
+            .err(),
+        Some(Denied::NotSignedIn)
+    );
+    let mut rolled_back = Account::load(&s.apart, Some(&s.data));
+    assert_eq!(
+        rolled_back
+            .request(1, Clock::after_load(0, page_mark), |t| {
+                t.arrive(bearer(1, &hash(1)), Access::Read)
+            })
+            .apply(|_| Ok::<_, Denied>(()))?
+            .err(),
+        Some(Denied::NotSignedIn)
+    );
     Ok(())
 }

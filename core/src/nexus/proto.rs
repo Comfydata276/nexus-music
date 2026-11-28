@@ -241,6 +241,11 @@ impl Speaks {
         self.high
     }
 
+    /// Whether there is at least one protocol number both sides understand.
+    pub fn meets(&self, other: &Self) -> bool {
+        self.low <= other.high && other.low <= self.high
+    }
+
     /// Whether this side understands `number`.
     pub fn understands(&self, number: u32) -> bool {
         self.low <= number && number <= self.high

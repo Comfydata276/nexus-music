@@ -172,7 +172,7 @@ pub(super) fn hash(n: u8) -> Fingerprint {
 }
 
 pub(super) fn clock(now: u64, high_water: u64) -> Clock {
-    Clock { now, high_water }
+    Clock::new(now, high_water)
 }
 
 pub(super) struct Stored {
@@ -885,5 +885,76 @@ fn a_new_accounts_code_expires_before_both_check_and_redemption() -> Result<(), 
             .err(),
         Some(Denied::WrongPassword)
     );
+    Ok(())
+}
+
+#[test]
+fn admin_page_idle_is_thirty_minutes_from_last_use_even_after_reload() -> Result<(), Denied> {
+    let mut authority = state("alice@example.test");
+    authority.admin = true;
+    let mut s = Stored::new(authority);
+    let receipt = s.bind(8, 1, 0)?;
+    let browser = s.step(0, |turn| {
+        turn.sign_in_as(SessionKind::AdminPage, receipt, fresh(1), None)
+    })?;
+    assert_eq!(browser.kind, SessionKind::AdminPage);
+    s.sign_in(9, 2, 2, 0)?;
+    let last = ADMIN_PAGE_IDLE_MS - 1;
+    assert_eq!(s.read(1, 1, last)?.kind(), SessionKind::AdminPage);
+    assert_eq!(
+        s.data
+            .devices
+            .get(&dev(1))
+            .unwrap()
+            .session
+            .as_ref()
+            .unwrap()
+            .last_used,
+        last
+    );
+    let mut before_deadline = Account::load(&s.apart, Some(&s.data));
+    let before = last + ADMIN_PAGE_IDLE_MS - 1;
+    let request = before_deadline
+        .request(1, clock(before, before), |turn| {
+            turn.arrive(bearer(1, &hash(1)), Access::Read)
+        })
+        .apply(|_| Ok::<_, Denied>(()))??;
+    assert_eq!(request.kind(), SessionKind::AdminPage);
+    s.reload();
+    assert_eq!(
+        s.read(1, 1, last + ADMIN_PAGE_IDLE_MS).err(),
+        Some(Denied::NotSignedIn)
+    );
+    assert!(s.apart.devices.get(&dev(1)).unwrap().permit.is_none());
+    assert_eq!(
+        s.step(last + ADMIN_PAGE_IDLE_MS, |turn| turn
+            .session_kind(bearer(2, &hash(2))))?,
+        SessionKind::App
+    );
+    Ok(())
+}
+
+#[test]
+fn a_correct_non_admin_page_sign_in_has_the_same_refusal_as_a_wrong_password() -> Result<(), Denied>
+{
+    let mut s = Stored::new(state("alice@example.test"));
+    let secret = DeviceSecret::from_bytes([8; 32]);
+    let wrong = s
+        .step(0, |turn| turn.check_sign_in(&secret, dev(1), hash(42)))?
+        .check(hash(41), clock(0, 0))
+        .err();
+    let checked = s.bind(8, 1, 0)?;
+    s.account
+        .sign_in_turn(clock(0, 0), |turn| {
+            turn.sign_in_as(SessionKind::AdminPage, checked, fresh(1), None)
+        })
+        .apply(|effects| {
+            assert!(effects.updates.is_empty());
+            Ok::<_, Denied>(())
+        })
+        .map(|answer| assert_eq!(answer.err(), wrong))?;
+    assert_eq!(wrong, Some(Denied::WrongPassword));
+    assert!(wrong.is_some_and(Denied::counts_as_wrong_password));
+    s.sign_in(8, 1, 1, 0)?;
     Ok(())
 }

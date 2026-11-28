@@ -863,7 +863,7 @@ mod tests {
         now: u64,
         operation: impl FnOnce(kept::Turn<'_>) -> Result<T, kept::Denied>,
     ) -> Result<T, kept::Denied> {
-        account.request(1, kept::Clock { now, high_water: now }, operation)
+        account.request(1, kept::Clock::new(now, now), operation)
             .apply(|_| Ok::<(), std::convert::Infallible>(())).unwrap()
     }
 
@@ -874,7 +874,7 @@ mod tests {
         let verifier = kept::Fingerprint::of(&[0x62; account::SECRET_BYTES]);
         let bearer = kept::Fingerprint::of(&[0x63; account::SECRET_BYTES]);
         let proof = step(&mut actor, 1, |turn| turn.check_sign_in(&secret, device, verifier.clone()))
-            .unwrap().check(verifier, kept::Clock { now: 1, high_water: 1 }).unwrap();
+            .unwrap().check(verifier, kept::Clock::new(1, 1)).unwrap();
         step(&mut actor, 1, |turn| turn.sign_in(proof, kept::FreshSession {
             id: SessionId::new(1).unwrap(),
             hash: bearer.clone(),
@@ -893,7 +893,7 @@ mod tests {
         let verifier = kept::Fingerprint::of(&[0x62; account::SECRET_BYTES]);
         let proof = step(actor, 2, |turn| {
             turn.check_leave(kept::Bearer { device, hash: bearer, grant: None }, intent, verifier.clone())
-        }).unwrap().check(verifier, kept::Clock { now: 2, high_water: 2 }).unwrap();
+        }).unwrap().check(verifier, kept::Clock::new(2, 2)).unwrap();
         step(actor, 2, |turn| turn.grant_leave(proof, secret)).unwrap();
     }
 
