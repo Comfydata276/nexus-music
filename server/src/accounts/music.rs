@@ -27,8 +27,8 @@
 //! it, and is in no log line, error or `Debug`.
 
 use nexus_core::nexus::account::{self, AccountId, MusicLoginResult, MusicSalt, PasswordDoor, RequestHead, SALT_BYTES};
-use nexus_core::nexus::admin::{self, Applied, Denial, GetMusicServer, InternalAddress, MusicServer, NamedChange, Refusal, Reply, RequestGrant, SetMusicLogin, SetMusicServer};
-use nexus_core::nexus::kept::{AccountState, AdminAction, AdminTarget, Bearer, Denied, Fingerprint, GrantUse, PasswordCheck, SessionKind};
+use nexus_core::nexus::admin::{self, Action, Applied, Denial, GetMusicServer, InternalAddress, MusicServer, NamedChange, Refusal, Reply, RequestGrant, SetMusicLogin, SetMusicServer};
+use nexus_core::nexus::kept::{Account, AccountState, AdminAction, AdminTarget, Bearer, Denied, Fingerprint, GrantIntent, GrantUse, PasswordCheck, SessionKind};
 use nexus_core::nexus::music::{self, NONCE_BYTES, Outcome, Ping, Provisioning, SealingKey};
 use zeroize::Zeroizing;
 
@@ -156,6 +156,45 @@ fn live_admin(keeper: &mut Keeper, account: &mut nexus_core::nexus::kept::Accoun
         .map_err(said)
 }
 
+/// What an admin's grant is bound to (8.8; core-fu3 for the two of requests), on the thread
+/// that writes, after the caller is known to be a live admin at the page:
+/// - most actions: the account it names (at its revision) or the backend, by
+///   `NamedChange::grant_intent`;
+/// - **`SetLidarr`**: the key's fingerprint, the configured address (`NEXUS_LIDARR`) and the
+///   key's revision in the store kept apart (`Keeper::lidarr`, which retires a key sealed to an
+///   address no longer configured), by `lidarr_grant_intent`; with no `NEXUS_LIDARR`, refused;
+/// - **`SetRequestsEnabled`**: the account it names (at its revision) and that account's switch
+///   revision in the store kept apart (`Keeper::requests_switch`), by `requests_grant_intent`.
+///
+/// kept binds the request's number too, and checks all of it again when the grant is spent.
+pub fn grant_intent(keeper: &mut Keeper, caller: &Account, change: &NamedChange, lidarr: Option<&InternalAddress>) -> Result<GrantIntent, Refusal> {
+    let number = caller.state().id.get();
+    match &change.action {
+        Action::SetLidarr(_) => {
+            // Requests are not set up here: there is nothing to bind a key to.
+            let configured = lidarr.ok_or(Refusal::NotAllowed(Denial::Denied))?;
+            let binding = keeper.lidarr(Some(configured)).map_err(not_dealt_with)?.binding.ok_or(Refusal::NotDealtWith)?;
+            change.lidarr_grant_intent(&binding).ok_or(Refusal::Malformed)
+        }
+        Action::SetRequestsEnabled(asked) => {
+            let other = target(keeper, number, asked.account)?;
+            let selected = other.as_ref().map_or_else(|| caller.state(), |other| other.state());
+            let switch = keeper.requests_switch(asked.account.get()).map_err(not_dealt_with)?;
+            change.requests_grant_intent(selected, switch.revision).ok_or(Refusal::Malformed)
+        }
+        _ => {
+            let selected = match change.action.target_account() {
+                Some(id) => match target(keeper, number, id)? {
+                    Some(other) => Some(other.state().clone()),
+                    None => Some(caller.state().clone()),
+                },
+                None => None,
+            };
+            NamedChange::grant_intent(change, selected.as_ref()).ok_or(Refusal::Malformed)
+        }
+    }
+}
+
 /// The account `id` names, loaded, if it is not the caller's own; `Ok(None)` for the caller's.
 fn target(keeper: &mut Keeper, caller: u64, id: AccountId) -> Result<Option<nexus_core::nexus::kept::Account>, Refusal> {
     if id.get() == caller {
@@ -219,14 +258,34 @@ impl Accounts {
     /// device's own door, under its waits, as a password change's is. `kept` gives it, bound to
     /// who asked, the change, the exact thing it is done to, that thing's revision and the
     /// request's number.
+    ///
+    /// Every admin action, the two of requests included: [`grant_intent`] makes what kept binds
+    /// the grant to.
     pub async fn admin_grant(&self, bearer: account::Session, request: RequestGrant) -> Answer {
-        match self.granting(bearer, request).await {
+        let lidarr = self.lidarr.clone();
+        self.admin_grant_with(bearer, request, move |keeper, caller, change| grant_intent(keeper, caller, change, lidarr.as_ref())).await
+    }
+
+    /// The same, with what the grant is bound to made by `resolve` (S13's ask of 16:07): on the
+    /// thread that writes, in the same turn as kept's check and only once the caller is known to
+    /// be a live admin at the page (kept's `admin_read`), from the caller's account (loaded
+    /// there) and the change asked for. The grant is then asked for, checked against the
+    /// password on a worker, and issued and kept as every grant is. A refusal of `resolve`'s is
+    /// the answer, and nothing is kept.
+    pub async fn admin_grant_with<R>(&self, bearer: account::Session, request: RequestGrant, resolve: R) -> Answer
+    where
+        R: FnOnce(&mut Keeper, &Account, &NamedChange) -> Result<GrantIntent, Refusal> + Send + 'static,
+    {
+        match self.granting(bearer, request, resolve).await {
             Ok(answer) => answer,
             Err(refusal) => refused(refusal),
         }
     }
 
-    async fn granting(&self, bearer: account::Session, request: RequestGrant) -> Result<Answer, Refusal> {
+    async fn granting<R>(&self, bearer: account::Session, request: RequestGrant, resolve: R) -> Result<Answer, Refusal>
+    where
+        R: FnOnce(&mut Keeper, &Account, &NamedChange) -> Result<GrantIntent, Refusal> + Send + 'static,
+    {
         let account::GrantRequest { head, change, password } = request;
         let hash = Fingerprint::of(bearer.expose_bytes());
         self.admin_live(&head.speaks, head.restore, &hash)?;
@@ -239,14 +298,7 @@ impl Accounts {
                     let now = clock();
                     let (number, device, mut account) = caller(keeper, &head, &hash)?;
                     live_admin(keeper, &mut account, head.restore, device, &hash, now)?;
-                    let selected = match change.action.target_account() {
-                        Some(id) => match target(keeper, number, id)? {
-                            Some(other) => Some(other.state().clone()),
-                            None => Some(account.state().clone()),
-                        },
-                        None => None,
-                    };
-                    let intent = NamedChange::grant_intent(&change, selected.as_ref()).ok_or(Refusal::Malformed)?;
+                    let intent = resolve(keeper, &account, &change)?;
                     let stored = keeper.data().password(number).map_err(not_dealt_with)?;
                     let expected = stored.as_ref().map_or_else(|| Fingerprint::from_bytes([0; 32]), |kept| Fingerprint::from_bytes(kept.hash));
                     let email = account.state().email.clone();

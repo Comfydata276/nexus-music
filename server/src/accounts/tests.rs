@@ -485,3 +485,163 @@ fn an_admin_s_app_session_is_refused_every_admin_call_by_kept_whatever_it_names(
     assert_eq!(grant(&page, made[1].number, 5).status, 200);
     assert_eq!(read(&page).status, 200);
 }
+
+/// S9c item 3 (S13's ask; core-fu3): the grant for each of requests' two admin actions carries
+/// what kept binds it to, made on the thread that writes, and is spent through kept as S13's
+/// setters spend it.
+mod requests_grants {
+    use super::*;
+    use crate::accounts::rows;
+    use nexus_core::nexus::account::{AccountId, GrantIssued, GrantSecret, Session, SignedIn};
+    use nexus_core::nexus::admin::{self, Action, Denial, LidarrKey, LidarrKeyChange, LidarrSealingKey, NamedChange, RequestsEnabled};
+    use nexus_core::nexus::kept::{Bearer, Denied, Fingerprint, GrantUse};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const LIDARR: &str = "http://lidarr:8686";
+
+    fn copy(signed: &SignedIn) -> Session {
+        Session::from_bytes(*signed.session.expose_bytes())
+    }
+
+    /// The admin's page session, and the person's account number.
+    fn page(bench: &Bench, made: &[bench::Made]) -> SignedIn {
+        bench::signed_in(&bench.sign_in(bench::with_code(&made[0].code, PASSWORD), 1));
+        bench::signed_in(&bench.sign_in_at_the_page(bench::with_password(made[0].email, PASSWORD), 2))
+    }
+
+    fn grant(bench: &Bench, signed: &SignedIn, request: u64, action: Action) -> Result<GrantSecret, admin::Refusal> {
+        let change = NamedChange { request_id: RequestId::new(request).unwrap(), action };
+        let request = account::GrantRequest { head: bench::head(signed.restore), change, password: account::Password::presented(PASSWORD).unwrap() };
+        let answer = bench.runtime.block_on(bench.accounts.admin_grant(copy(signed), request));
+        match admin::read_reply::<GrantIssued>(answer.status, answer.body.bytes()).unwrap() {
+            admin::Reply::Done(GrantIssued { grant }) => Ok(grant),
+            admin::Reply::Refused(refusal) => Err(refusal),
+        }
+    }
+
+    /// Spends a switch grant as S13's setter does: the switch's revision read and the change
+    /// made in one turn of the thread that writes.
+    fn switch(bench: &Bench, signed: &SignedIn, request: u64, grant: GrantSecret, account: u64, enabled: bool) -> Result<(), Denied> {
+        let (session, restore, now) = (copy(signed), signed.restore, bench.now.load(Ordering::SeqCst));
+        bench.runtime.block_on(bench.accounts.desk.ask(move |keeper| {
+            let hash = Fingerprint::of(session.expose_bytes());
+            let (number, device) = rows::session_by_hash(keeper.data().connection(), hash.as_bytes()).unwrap().unwrap();
+            let mut caller = keeper.load(number).unwrap();
+            let current = keeper.requests_switch(account).unwrap();
+            let mut other = (account != number).then(|| keeper.load(account).unwrap());
+            let bearer = Bearer { device, hash: &hash, grant: Some(GrantUse { request_id: RequestId::new(request).unwrap(), secret: &grant }) };
+            caller
+                .request(restore, keeper.clock(now), |turn| turn.set_requests_enabled(bearer, AccountId::new(account).unwrap(), enabled, current.revision, other.as_mut()))
+                .apply(|effects| keeper.persist(effects, &[], now))
+                .unwrap()
+        })).unwrap()
+    }
+
+    /// Spends a Lidarr key grant as S13's setter does.
+    fn set_lidarr(bench: &Bench, signed: &SignedIn, request: u64, grant: GrantSecret, key: &str) -> Result<(), Denied> {
+        let (session, restore, now, key) = (copy(signed), signed.restore, bench.now.load(Ordering::SeqCst), LidarrKey::new(key).unwrap());
+        let address = admin::InternalAddress::new(LIDARR).unwrap();
+        bench.runtime.block_on(bench.accounts.desk.ask(move |keeper| {
+            let hash = Fingerprint::of(session.expose_bytes());
+            let (number, device) = rows::session_by_hash(keeper.data().connection(), hash.as_bytes()).unwrap().unwrap();
+            let mut caller = keeper.load(number).unwrap();
+            let binding = keeper.lidarr(Some(&address)).unwrap().binding.unwrap();
+            let sealing = LidarrSealingKey::new(keeper.seal_key());
+            let bearer = Bearer { device, hash: &hash, grant: Some(GrantUse { request_id: RequestId::new(request).unwrap(), secret: &grant }) };
+            caller
+                .request(restore, keeper.clock(now), |turn| turn.set_lidarr(bearer, &binding, &key, &sealing, [request as u8; 24]))
+                .apply(|effects| keeper.persist(effects, &[], now))
+                .unwrap()
+        })).unwrap()
+    }
+
+    #[test]
+    fn a_switch_grant_is_bound_to_the_switch_s_revision() {
+        let (bench, made) = Bench::new("switch-grant", &[("admin@example.test", true), ("person@example.test", false)]);
+        let signed = page(&bench, &made);
+        let person = made[1].number;
+        let off = |enabled| Action::SetRequestsEnabled(RequestsEnabled { account: AccountId::new(person).unwrap(), enabled });
+        // Granted and spent: the switch is off, at revision 1.
+        let first = grant(&bench, &signed, 1, off(false)).unwrap();
+        assert_eq!(switch(&bench, &signed, 1, first, person, false), Ok(()));
+        let now = bench.runtime.block_on(bench.accounts.desk.ask(move |keeper| keeper.requests_switch(person).unwrap())).unwrap();
+        assert_eq!((now.enabled, now.revision), (false, 1));
+        // A grant made at revision 1, the switch moved meanwhile by another: refused when spent.
+        let stale = grant(&bench, &signed, 2, off(true)).unwrap();
+        let other = grant(&bench, &signed, 3, off(true)).unwrap();
+        assert_eq!(switch(&bench, &signed, 3, other, person, true), Ok(()));
+        assert!(switch(&bench, &signed, 2, stale, person, true).is_err(), "a grant for a revision gone by was spent");
+        // For the admin's own account too; and an account there is not: refused at the grant.
+        let own = Action::SetRequestsEnabled(RequestsEnabled { account: AccountId::new(made[0].number).unwrap(), enabled: false });
+        let mine = grant(&bench, &signed, 4, own).unwrap();
+        assert_eq!(switch(&bench, &signed, 4, mine, made[0].number, false), Ok(()));
+        let nobody = Action::SetRequestsEnabled(RequestsEnabled { account: AccountId::new(9_999).unwrap(), enabled: false });
+        assert_eq!(grant(&bench, &signed, 5, nobody), Err(admin::Refusal::NotAllowed(Denial::NoSuchAccount)));
+    }
+
+    #[test]
+    fn a_lidarr_grant_is_bound_to_the_key_the_address_and_the_revision() {
+        let (bench, made) = Bench::with_lidarr("lidarr-grant", &[("admin@example.test", true)], LIDARR);
+        let signed = page(&bench, &made);
+        let key = |text: &str| Action::SetLidarr(LidarrKeyChange { key: LidarrKey::new(text).unwrap() });
+        let first = grant(&bench, &signed, 1, key("made-up-lidarr-key-1")).unwrap();
+        // Another key than the one granted: refused.
+        assert!(set_lidarr(&bench, &signed, 1, first, "made-up-lidarr-key-2").is_err());
+        let first = grant(&bench, &signed, 2, key("made-up-lidarr-key-1")).unwrap();
+        assert_eq!(set_lidarr(&bench, &signed, 2, GrantSecret::from_bytes(*first.expose_bytes()), "made-up-lidarr-key-1"), Ok(()));
+        // Spent once only; and a grant made before the key's revision moved is refused.
+        assert!(set_lidarr(&bench, &signed, 2, first, "made-up-lidarr-key-1").is_err());
+        let stale = grant(&bench, &signed, 3, key("made-up-lidarr-key-3")).unwrap();
+        let other = grant(&bench, &signed, 4, key("made-up-lidarr-key-4")).unwrap();
+        assert_eq!(set_lidarr(&bench, &signed, 4, other, "made-up-lidarr-key-4"), Ok(()));
+        assert!(set_lidarr(&bench, &signed, 3, stale, "made-up-lidarr-key-3").is_err());
+        // The key kept opens at the configured address, and is the last one set.
+        let address = admin::InternalAddress::new(LIDARR).unwrap();
+        let opened = bench.runtime.block_on(bench.accounts.desk.ask(move |keeper| {
+            let kept = keeper.lidarr(Some(&address)).unwrap();
+            LidarrSealingKey::new(keeper.seal_key()).open(&kept.binding.unwrap(), &kept.sealed.unwrap()).map(|key| key.expose().to_string())
+        })).unwrap();
+        assert_eq!(opened.as_deref(), Some("made-up-lidarr-key-4"));
+    }
+
+    #[test]
+    fn with_no_lidarr_set_up_a_key_is_not_granted() {
+        let (bench, made) = Bench::new("no-lidarr", &[("admin@example.test", true)]);
+        let signed = page(&bench, &made);
+        let action = Action::SetLidarr(LidarrKeyChange { key: LidarrKey::new("made-up-lidarr-key").unwrap() });
+        assert_eq!(grant(&bench, &signed, 1, action), Err(admin::Refusal::NotAllowed(Denial::Denied)));
+    }
+
+    /// `admin_grant_with`: what binds the grant is made only once the caller is known to be a
+    /// live admin at the page; its refusal is the answer; its intent is issued as every grant.
+    #[test]
+    fn a_grant_with_its_own_binding_is_made_only_for_a_live_admin_at_the_page() {
+        let (bench, made) = Bench::new("grant-with", &[("admin@example.test", true), ("person@example.test", false)]);
+        let signed = page(&bench, &made);
+        let app = bench::signed_in(&bench.sign_in(bench::with_password(made[0].email, PASSWORD), 3));
+        let person = AccountId::new(made[1].number).unwrap();
+        let admin_number = made[0].number;
+        let change = |request| NamedChange { request_id: RequestId::new(request).unwrap(), action: Action::SetMusicLogin(person) };
+        let ask = |signed: &SignedIn, request: u64, refuse: bool, called: Arc<AtomicBool>| {
+            let request = account::GrantRequest { head: bench::head(signed.restore), change: change(request), password: account::Password::presented(PASSWORD).unwrap() };
+            bench.runtime.block_on(bench.accounts.admin_grant_with(copy(signed), request, move |keeper, caller, change| {
+                called.store(true, Ordering::SeqCst);
+                assert_eq!(caller.state().id.get(), admin_number);
+                if refuse {
+                    return Err(admin::Refusal::NotAllowed(Denial::Conflict));
+                }
+                let other = keeper.load(person.get()).unwrap();
+                NamedChange::grant_intent(change, Some(other.state())).ok_or(admin::Refusal::Malformed)
+            }))
+        };
+        let called = Arc::new(AtomicBool::new(false));
+        assert_eq!(ask(&app, 1, false, called.clone()).status, 403);
+        assert!(!called.load(Ordering::SeqCst), "made for an app's session");
+        let refused = ask(&signed, 2, true, called.clone());
+        assert!(called.load(Ordering::SeqCst));
+        assert!(matches!(admin::read_reply::<GrantIssued>(refused.status, refused.body.bytes()).unwrap(), admin::Reply::Refused(admin::Refusal::NotAllowed(Denial::Conflict))));
+        let issued = ask(&signed, 3, false, Arc::new(AtomicBool::new(false)));
+        assert!(matches!(admin::read_reply::<GrantIssued>(issued.status, issued.body.bytes()).unwrap(), admin::Reply::Done(_)));
+    }
+}
