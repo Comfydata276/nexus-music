@@ -44,6 +44,9 @@ pub const SMALL_REPLY_MAX_BYTES: usize = 4 * 1024;
 pub const SIGN_IN_REPLY_MAX_BYTES: usize = 8 * 1024;
 pub const LIST_REPLY_MAX_BYTES: usize = BODY_MAX_BYTES;
 pub const PASSWORD_REQUEST_MAX_BYTES: usize = 4 * 1024;
+// the design does not say the bound of a generic grant use. Allow the same 4 KiB
+// here because an admin can send both music addresses or login text in the change.
+pub const GRANTED_CHANGE_MAX_BYTES: usize = PASSWORD_REQUEST_MAX_BYTES;
 // the design does not say the size of calls without passwords; their fixed fields fit in 1 KiB.
 pub const SMALL_REQUEST_MAX_BYTES: usize = 1024;
 
@@ -1103,7 +1106,7 @@ impl<T: wire::Value + Serialize> wire::Message for GrantRequest<T> {
 }
 
 impl<T: wire::Value + Serialize> wire::Message for GrantedChange<T> {
-    const MAX_BYTES: usize = SMALL_REQUEST_MAX_BYTES;
+    const MAX_BYTES: usize = GRANTED_CHANGE_MAX_BYTES;
 }
 
 impl<T: ReplyResult> wire::Message for Reply<T> {

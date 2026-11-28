@@ -60,7 +60,17 @@ pub fn read<T: Message>(body: &[u8]) -> Result<T, BadMessage> {
 }
 
 pub(crate) fn read_bounded<T: Message>(body: &[u8], maximum: usize) -> Result<T, BadMessage> {
-    if body.len() > maximum.min(T::MAX_BYTES) {
+    let value: T = read_value(body, maximum.min(T::MAX_BYTES))?;
+    if body.len() > value.max_bytes() {
+        return Err(BadMessage::TooLarge);
+    }
+    Ok(value)
+}
+
+/// Check a whole body using a read-only shape. This is also for readers that
+/// record a bad entry within an otherwise well-formed batch.
+pub(crate) fn read_value<T: Value>(body: &[u8], maximum: usize) -> Result<T, BadMessage> {
+    if body.len() > maximum.min(BODY_MAX_BYTES) {
         return Err(BadMessage::TooLarge);
     }
     let text = std::str::from_utf8(body).map_err(|_| BadMessage::Form)?;
@@ -70,9 +80,6 @@ pub(crate) fn read_bounded<T: Message>(body: &[u8], maximum: usize) -> Result<T,
         return Err(BadMessage::Form);
     }
     let value = T::read(plain_json(text)?)?;
-    if body.len() > value.max_bytes() {
-        return Err(BadMessage::TooLarge);
-    }
     value.check()?;
     Ok(value)
 }
