@@ -1,10 +1,11 @@
 //! Keeps Nexus Music to one running copy: opening it again brings the first to the front.
 
+use nexus_core::nexus::diag::{Fault, FaultPlace, FaultShape, Line};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use slint::ComponentHandle;
 use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HANDLE};
 use windows_sys::Win32::System::Threading::{CreateEventW, INFINITE, SetEvent, WaitForSingleObject};
-use windows_sys::Win32::UI::WindowsAndMessaging::{ASFW_ANY, AllowSetForegroundWindow, SetForegroundWindow};
+use windows_sys::Win32::UI::WindowsAndMessaging::{ASFW_ANY, AllowSetForegroundWindow, GetForegroundWindow, SetForegroundWindow};
 
 /// A named event that the first copy creates and later copies find.
 const NAME: &str = "Local\\NexusMusic.Running";
@@ -82,10 +83,15 @@ pub fn tint_title_bar(window: &slint::Window, background: u32, text: u32) {
 /// Brings the window in front of other apps.
 pub fn focus(ui: &crate::ui::MainWindow) {
     let window = ui.window().window_handle();
-    let Ok(handle) = window.window_handle() else { return };
-    if let RawWindowHandle::Win32(win32) = handle.as_raw() {
-        unsafe {
-            SetForegroundWindow(win32.hwnd.get() as *mut std::ffi::c_void);
+    let shape = match window.window_handle().ok().map(|handle| handle.as_raw()) {
+        Some(RawWindowHandle::Win32(win32)) => {
+            let hwnd = win32.hwnd.get() as *mut std::ffi::c_void;
+            if unsafe { SetForegroundWindow(hwnd) != 0 || GetForegroundWindow() == hwnd } {
+                return;
+            }
+            FaultShape::Refused
         }
-    }
+        _ => FaultShape::Unavailable,
+    };
+    crate::diagnostics::observe(Line::Fault(Fault { place: FaultPlace::Foreground, shape }));
 }
