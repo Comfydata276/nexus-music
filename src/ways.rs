@@ -15,10 +15,8 @@
 //!   song that failed being passed over, similar songs arriving, the sleep timer's pause,
 //!   the sound device going, a queue another device saved being put in the player, the
 //!   last run's queue being put back, a followed playlist changing, the stop at sign-out;
-//! - whoever carries out somebody else's choice says whose it is first
-//!   ([`Controller::for_another`]): a command from another of the person's devices
-//!   ([`Who::Elsewhere`]), or what a guest in a jam asked for ([`Who::Guest`]). The
-//!   functions it then runs are the ones a press runs, and the choice is still theirs.
+//! - (somebody else's choice carried out here, a command from another of the person's
+//!   devices or a jam's guest, went with the relay's linking and jams in slice W7.)
 //!
 //! And **what is under way is one choice**: what a way in does on its way is part of it,
 //! counted once and claimed once, and is whoever's the outermost is. The sleep timer
@@ -64,7 +62,6 @@ impl Choices {
         let owed = ways.enter(who, what);
         (WayIn { ways: &self.0 }, owed, ways.whose())
     }
-
 }
 
 impl Controller {
@@ -145,45 +142,4 @@ mod tests {
         assert_eq!(enter(&choices, Who::Here, What::Playing), (BOTH, Some(Who::Here)));
     }
 
-    /// A command from another of the person's devices, and what a guest asked for, run the
-    /// functions a press runs: the choice is theirs, and whether it changed anything is
-    /// whether any of those functions took its way in.
-    #[test]
-    fn somebody_else_s_choice_is_theirs_and_is_known_to_have_changed_something_or_not() {
-        let choices = Choices::default();
-        // A command the rule let through: counted by the rule, so not here; the queue is
-        // the person's by it.
-        let carrying = choices.begin(Who::Elsewhere, true);
-        assert!(!choices.taken());
-        assert_eq!(enter(&choices, Who::Here, What::Playing), (CLAIM, Some(Who::Elsewhere)));
-        assert!(choices.taken());
-        drop(carrying);
-        assert!(!choices.taken());
-        // One that found nothing to do (Play, and it was playing): no way in was taken.
-        let carrying = choices.begin(Who::Elsewhere, true);
-        drop(carrying);
-        assert!(!choices.taken());
-        // The volume from another device: counted by the rule, and claims nothing.
-        let carrying = choices.begin(Who::Elsewhere, true);
-        assert_eq!(enter(&choices, Who::Here, What::Manner), (NOTHING, Some(Who::Elsewhere)));
-        assert!(choices.taken());
-        drop(carrying);
-        // The stop that ends a move of music to the device that asks: nobody's.
-        let carrying = choices.begin(Who::Nobody, true);
-        assert_eq!(enter(&choices, Who::Here, What::Playing), (NOTHING, Some(Who::Nobody)));
-        drop(carrying);
-        // What a guest asked for, and a device linked the old way: counted as it is
-        // carried out, and the queue is the person's by it. An ask that changes nothing
-        // (a search) owes nothing at all.
-        for who in [Who::Guest, Who::Elsewhere] {
-            let asked = choices.begin(who, false);
-            assert_eq!(enter(&choices, Who::Here, What::Playing), (BOTH, Some(who)));
-            // (A song queued, and then played because the queue was empty: one choice.)
-            assert_eq!(enter(&choices, Who::Here, What::Playing), (NOTHING, Some(who)));
-            drop(asked);
-            let asked = choices.begin(who, false);
-            drop(asked);
-        }
-        assert_eq!(enter(&choices, Who::Here, What::Playing), (BOTH, Some(Who::Here)));
-    }
 }

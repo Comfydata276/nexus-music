@@ -1098,14 +1098,14 @@ impl std::fmt::Debug for MusicLogin {
 /// What a sign-in to the Nexus server leaves on this PC (design 11): **one thing, kept where
 /// secrets are kept and put in place in one step**, so that a write cut short leaves the one
 /// before it whole. Its parts are what the shared library's client says to keep
-/// (`nexus_core::nexus::client::Keep`): the session, the music login, and the account (the
+/// (its `client::Keep`): the session, the music login, and the account (the
 /// Nexus address, the backend's id, who the person is to it, the numbers last seen), kept
 /// here as the library wrote it; and the folder this person's things are under. A cold start
 /// reads it and plays from its music login without asking the Nexus server anything
 /// (design 6.1). The device's own secret is kept beside it; the password typed, nowhere.
 #[derive(Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct SignedIn {
-    /// What the shared library's client said to keep, whole (`nexus_core::nexus::client::Saved`,
+    /// What the shared library's client said to keep, whole (its `client::Saved`,
     /// as it serialises it): the Nexus origin, the backend's id, who the person is to it,
     /// the session and the note that can end it, and the music login with its number.
     #[serde(default)]
@@ -1156,7 +1156,7 @@ pub fn save_sign_in(paths: &Paths, kept: &SignedIn) -> bool {
 /// (design 11). **What is carried over, exactly:** the folder of the sign-in this PC had
 /// before the Nexus server (named by the music server and user, `account_stem`) becomes
 /// the person's, **once**, when the shared library says the music login they are handed
-/// names that same music server and user (`nexus_core::nexus::client::carries_over`, which
+/// names that same music server and user (its `client::carries_over`, which
 /// the caller asks and passes as `same`). Every other person, and anyone handed that music
 /// user later, gets a folder named by who they are to the backend: its id and their
 /// account's number. Whoever calls this writes the carry-over down
