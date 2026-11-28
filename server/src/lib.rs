@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+mod admin;
 pub mod bounds;
 pub mod head;
 pub mod health;
