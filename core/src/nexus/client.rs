@@ -46,12 +46,22 @@
 //! - **An answer for an ask no longer waited for is thrown away**: after `stop`, after a
 //!   sign-out or a sign-in, after Offline was switched on. A late answer for the first
 //!   account cannot touch the second (11).
-//! - **Offline means nothing is asked.**
+//! - **Offline means nothing is asked**, and nothing queued is sent: **THE APP CALLS
+//!   [`Client::waits_for`] IMMEDIATELY BEFORE IT SENDS EACH [`Ask`] AND DROPS IT IF THE
+//!   ANSWER IS NO.** `Offline(true)` and `stop` make it no for everything but a sign-out
+//!   being told.
+//! - **One `hello` each run before anything secret goes to an origin** (7.1): a session, a
+//!   device secret or a note goes only to the backend id expected there. Another id is sent
+//!   nothing, nothing is forgotten, the music plays on, and the person is asked to sign in.
+//! - **A tick alone asks nothing of the session.** A device learns it was signed out at its
+//!   next call carrying the session: at a start, the network coming back, Offline off, a
+//!   press (and from step 2, what it sends).
 //! - **What is kept is one thing, put in place in one step** (11): [`Keep::Saved`], whole.
 //! - **Signing out is lasting on the device at once**, with or without the backend: the
-//!   session and the music login are forgotten; the backend is told now if it can be, and
-//!   otherwise from a small [`Note`] that can end that one session and nothing else, tried
-//!   again until it is taken or 90 days old (11, as ruled).
+//!   note that can end that one session is kept first ([`Note`], C7's revoke-only secret),
+//!   then the session and the music login are forgotten; the backend is told from the note
+//!   now if it can be, and again until its own backend says done or that the session is
+//!   gone, or it is 90 days old (11, as ruled). Notes are kept by the session they end.
 //! - **"The server's data was put back"** (12.3, 12.4): the session goes and the person
 //!   signs in again; the music login is kept, and plays.
 //!
@@ -965,11 +975,12 @@ fn typed_origin(text: &str) -> Result<NexusOrigin, SignInState> {
     })
 }
 
-/// The tidying of a typed one-time code.
-// to be account's: a person may type it in small letters, or with spaces or dashes between
-// groups. the design does not say; account takes only the exact twelve.
+/// The tidying of a typed one-time code: account's reading (case, and Crockford's I, L and
+/// O), after the spaces and dashes a person may type between groups are taken out.
+// to be account's: `OneTimeCode::new` takes exactly twelve characters; the groups a person
+// types it in are not yet its to take apart.
 fn tidy_code(text: &str) -> Option<OneTimeCode> {
-    let tidied: Zeroizing<String> = Zeroizing::new(text.chars().filter(|c| !matches!(c, ' ' | '-')).map(|c| c.to_ascii_uppercase()).collect());
+    let tidied: Zeroizing<String> = Zeroizing::new(text.chars().filter(|c| !matches!(c, ' ' | '-')).collect());
     OneTimeCode::new(&tidied)
 }
 
