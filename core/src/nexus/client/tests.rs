@@ -550,9 +550,12 @@ fn an_email_and_a_password_are_held_to_account_rules_before_anything_is_sent() {
     let out = rig.press(Press::SignIn { address: NEXUS.to_owned(), email: EMAIL.to_owned(), password: Typed::new(""), look: Look::default(), retry: false });
     assert!(asks(&out).is_empty());
     assert_eq!(rig.shown().sign_in.state, SignInState::NoPassword);
+    // A password typed to sign in is presented as it is, of any length: the backend judges it.
     let out = rig.press(Press::SignIn { address: NEXUS.to_owned(), email: EMAIL.to_owned(), password: Typed::new("short"), look: Look::default(), retry: false });
-    assert!(asks(&out).is_empty());
-    assert_eq!(rig.shown().sign_in.state, SignInState::WrongLogin);
+    assert_eq!(asks_to(&out, proto::HELLO), 1);
+    rig.press(Press::FormClosed);
+    let mut rig = Rig::new(DeviceKind::Pc);
+    rig.start(Kept::default());
     let long = "a".repeat(TYPED_MAX_BYTES + 1);
     assert!(asks(&rig.press(sign_in(&long, EMAIL))).is_empty());
     assert!(rig.shown().sign_in.address.len() <= TYPED_MAX_BYTES);

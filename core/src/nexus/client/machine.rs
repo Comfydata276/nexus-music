@@ -343,8 +343,9 @@ impl Client {
                 if secret.expose().is_empty() {
                     return self.set_form(SignInState::NoPassword, 0);
                 }
-                // A password outside account's rule is nobody's: refused here, unsent.
-                let Some(password) = Password::new(secret.expose()) else { return self.set_form(SignInState::WrongLogin, 0) };
+                // A password typed to sign in is presented as typed, of any length (account's
+                // rule for a new password is not this one's). Longer than any can be: nobody's.
+                let Some(password) = Password::presented(secret.expose()) else { return self.set_form(SignInState::WrongLogin, 0) };
                 Pressed::Password { email, password }
             }
             (None, new) => {
@@ -556,8 +557,8 @@ impl Client {
         let Some(new) = Password::new(new.expose()).filter(|new| new.allowed_for(&email, "")) else {
             return self.set_password(PasswordState::NotAllowed, 0);
         };
-        // A present password outside the rule is nobody's: refused here, unsent.
-        let Some(current) = Password::new(current.expose()) else { return self.set_password(PasswordState::WrongCurrent, 0) };
+        // The present password is presented as typed, of any length.
+        let Some(current) = Password::presented(current.expose()) else { return self.set_password(PasswordState::WrongCurrent, 0) };
         if live.offline {
             return self.set_password(PasswordState::CantReach, 0);
         }
@@ -810,7 +811,7 @@ impl Client {
         if hello.speaks.low() > ours.high() {
             return self.set_form(SignInState::AppTooOld, 0);
         }
-        if hello.speaks.high() < ours.low() || !hello.does(HAS_ACCOUNTS) {
+        if hello.speaks.high() < ours.low() || !hello.does(proto::HAS_ACCOUNTS) {
             return self.set_form(SignInState::ServerTooOld, 0);
         }
         let Pending { origin, credential } = pending;

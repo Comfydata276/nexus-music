@@ -120,10 +120,6 @@ pub const TYPED_MAX_BYTES: usize = 1024;
 pub const TICK_MS: u64 = 60 * 1000;
 /// The most a `hello` answer may be (proto's own bound).
 pub const HELLO_MAX_BYTES: usize = proto::HELLO_MAX_BYTES;
-/// What a backend must name in its `hello` for an app to sign in to it (design 18:
-/// `"has":["accounts"]`).
-// to be proto's: proto still names only stage 1's "plays".
-pub const HAS_ACCOUNTS: &str = "accounts";
 /// The most asks waited for at once. Each kind of ask is one at a time, so this is never
 /// reached; it is the bound that makes that certain.
 const FLIGHT_MAX: usize = 8;
