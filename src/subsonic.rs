@@ -237,6 +237,8 @@ pub use nexus_core::address::normalize_server_url;
 /// Longest an API call may take from start to finish. Audio downloads have no such limit.
 const API_TIMEOUT: Duration = Duration::from_secs(45);
 
+/// An agent held to no login's gate (the tests' stand-ins; a music login's is `gated_agent`).
+#[cfg(test)]
 pub(crate) fn make_agent() -> ureq::Agent {
     agent_following(10, Duration::from_secs(300))
 }
@@ -496,7 +498,11 @@ impl Client {
         let salt = random_salt();
         let digest = Md5::digest(format!("{password}{salt}").as_bytes());
         let token: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
-        Client::from_pair(server, username, &salt, &token)
+        let client = Client::from_pair(server, username, &salt, &token);
+        // The tests' stand-in servers answer what each test asks, not a ping: their logins
+        // are taken as proven. (The proof itself is tested with `from_pair`.)
+        client.inner.gate.proof.state.lock().unwrap().proven = true;
+        client
     }
 
     /// Whether this is the same sign-in as `other`: the same address, name, salt and token.

@@ -756,7 +756,23 @@ mod tests {
             ("audio/dsp.rs", include_str!("../audio/dsp.rs")),
             ("audio/exclusive.rs", include_str!("../audio/exclusive.rs")),
         ];
+        // The controller's seams to it, each of which returns at once and waits for nothing
+        // (W7b): the legacy passwords' removal (on a thread of its own), a trace line, the
+        // machine stopped at quitting, a refusal told, Offline noted.
+        let seams = [
+            "crate::nexus::vault::forget_legacy_passwords",
+            "crate::nexus::trace",
+            "crate::nexus::quitting",
+            "crate::nexus::music_refused",
+            "crate::nexus::offline_is",
+        ];
         for (name, text) in paths {
+            let mut text = text.to_string();
+            if *name == "controller.rs" {
+                for seam in seams {
+                    text = text.replace(seam, "");
+                }
+            }
             for word in ["nexus::", "crate::nexus", "super::nexus", "nexus_server", "nexus-server", "nexus_for", "nexus-for", "nexus_on", "nexus-on", "NEXUS_TEST_HOLD_NEXUS", "NEXUS_TEST_NEXUS", "NEXUS_TEST_PROBE", "NEXUS_TEST_SABOTAGE", "NEXUS_TEST_TRIGGER", "NEXUS_TEST_DEADLINE", "NEXUS_MUSIC_NEXUS"] {
                 assert!(!text.contains(word), "{name} names the Nexus server's component ({word})");
             }
