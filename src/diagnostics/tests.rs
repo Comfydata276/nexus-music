@@ -77,7 +77,7 @@ fn preview_save_and_c6_upload_have_the_same_clean_text() -> std::io::Result<()> 
         observations.note(at as u64 * 1_000, line);
     }
     count_notices(&mut observations, messages);
-    let session = Session { about: Session::about(&settings, true), observations };
+    let about = Session::about(&settings, true);
     let dir = TestFolder::new()?;
     let paths = dir.paths();
     let crash = &paths.crash_log;
@@ -88,8 +88,8 @@ fn preview_save_and_c6_upload_have_the_same_clean_text() -> std::io::Result<()> 
         format!("2023-11-14 22:13:27 UTC version 0.40.13 thread main at {folder}\\{artist}.rs:222: {album}\n{odd}{playlist}\n").as_bytes(),
         b"bad date UTC version 0.40.13 thread main at src/main.rs:76: no message\n",
     ].concat())?;
-    let preview = local_text(&paths, session)?;
-    save_text(&paths, &preview)?;
+    let preview = preview_text(&paths, Session { about, observations });
+    export_report(&paths, Session { about, observations: diag::Record::default() })?;
     assert_eq!(fs::read(&paths.diagnostics)?, preview.as_bytes());
     let model = diag::Report::read(&preview).unwrap();
     let upload = diag::Upload::new(RequestHead { speaks: SPEAKS, restore: 0 }, RequestId::new(1).unwrap(), &model).unwrap();
