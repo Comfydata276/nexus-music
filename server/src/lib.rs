@@ -13,6 +13,7 @@ pub mod bounds;
 pub mod head;
 pub mod health;
 pub mod identity;
+pub mod music;
 pub mod probe;
 pub mod serve;
 pub mod settings;

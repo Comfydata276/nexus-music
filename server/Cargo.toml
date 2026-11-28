@@ -16,7 +16,7 @@ nexus-core = { path = "../core" }
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "time", "sync", "io-util"] }
 # The HTTP/1 connection itself, served one connection at a time with its bounds set by hand:
 # the deadline for a request's head, the size of a head, the number of its headers.
-hyper = { version = "1", default-features = false, features = ["server", "http1"] }
+hyper = { version = "1", default-features = false, features = ["server", "client", "http1"] }
 # Reading and judging a request's head before hyper sees a byte of it, so that nothing is
 # written before the gate has passed. The parser hyper itself uses (already in the lock).
 httparse = "1"
@@ -45,11 +45,20 @@ zeroize = "1.8"
 subtle = { version = "2", default-features = false }
 # The keyed fingerprint a one-time code is kept by (8.5), the version the shared library uses.
 hmac = "0.13"
+# Asking the music server whether a typed-in login works (9.3, S9): its address read as the
+# shared library reads it (already in the lock); HTTPS to the address people use, by rustls with
+# ring (no C toolchain beyond ring's own), trusting this machine's certificates
+# (`rustls-native-certs`, which also takes `SSL_CERT_FILE`).
+url = "2"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls-native-certs = "0.8"
 
 [dev-dependencies]
 # Tests connect from a chosen loopback address (127.0.0.2 as the proxy, 127.0.0.3 as a
 # stranger), which the standard library cannot bind a client to. The relay uses it already.
 socket2 = "0.6"
+# A certificate made for a test's own HTTPS stand-in (the music server's client, S9).
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 
 # Argon2id is the slow work it is meant to be, and no slower: 19 MiB and two passes take
 # seconds unoptimised, past the answer's deadline, so its crates are optimised in tests too.
