@@ -58,8 +58,8 @@ pub const BUSY: Duration = Duration::from_secs(5);
 /// of the secret that can only end it, 11); and the
 /// restore number, how far its changes have got, and the latest time a step was written at.
 /// For the slices that bring them, each `REFERENCES accounts (number) ON DELETE CASCADE`, so
-/// that deleting an account takes them in the same step: an account's sealed music login with
-/// the internal address it was checked at (S9; 9.4: its count is the store's, so an older one
+/// that deleting an account takes them in the same step: an account's sealed music login,
+/// bound to the internal address it was checked at (S9; 9.4: its count is the store's, so an older one
 /// a put-back brings does not open), and the backend's music address people use
 /// (`meta.music_public`); its listening events and their count (S12, 13), deleted in the same
 /// step as the account's life moves on (a trigger) unless they are held (12.5); and its
@@ -143,7 +143,6 @@ CREATE TABLE sessions (
 CREATE TABLE music_logins (
     account INTEGER PRIMARY KEY REFERENCES accounts (number) ON DELETE CASCADE,
     count INTEGER NOT NULL CHECK (count > 0),
-    address TEXT NOT NULL,
     name TEXT NOT NULL,
     sealed BLOB NOT NULL,
     internal TEXT NOT NULL
@@ -707,12 +706,11 @@ pub enum Change<'a> {
     Codes { account: u64, keep: Option<u64> },
     /// A new restore number, and when; every session ended (12.4 steps 1 and 2).
     Restore { restore: u64, at: u64, from: Option<u64> },
-    /// The internal address (`NEXUS_MUSIC_SERVER`) a music login being installed was checked
-    /// at (S9): given in `extra` with `DataChange::InstallMusicLogin`, which it must come with.
-    MusicChecked { account: u64, internal: &'a str },
-    /// An account's sealed music login, as kept decided it, with where it was checked. Made
-    /// by [`crate::store::keeper::Keeper::persist`] only.
-    MusicLogin { account: u64, install: &'a MusicInstallation, internal: &'a str },
+    /// An account's sealed music login, as kept decided it: its count, its name, the sealed
+    /// bytes and the internal address (`NEXUS_MUSIC_SERVER`) it was checked at and sealed to
+    /// (core-fu2: the public address is in no binding). Made by
+    /// [`crate::store::keeper::Keeper::persist`] only.
+    MusicLogin { account: u64, install: &'a MusicInstallation },
     /// The music server's address people use (9.3), backend-wide. Made by `persist` only.
     MusicPublic { address: &'a str },
     /// The admin's default for Diagnostics (14), backend-wide (`hello` says it). `persist` only.
@@ -735,7 +733,6 @@ impl std::fmt::Debug for Change<'_> {
             Change::Code { account, number, made_at, until, .. } => f.debug_struct("Code").field("account", account).field("number", number).field("made_at", made_at).field("until", until).finish_non_exhaustive(),
             Change::Codes { account, keep } => f.debug_struct("Codes").field("account", account).field("keep", keep).finish(),
             Change::Restore { restore, at, from } => f.debug_struct("Restore").field("restore", restore).field("at", at).field("from", from).finish(),
-            Change::MusicChecked { account, .. } => f.debug_struct("MusicChecked").field("account", account).finish_non_exhaustive(),
             Change::MusicLogin { account, install, .. } => f.debug_struct("MusicLogin").field("account", account).field("count", &install.binding.count).finish_non_exhaustive(),
             Change::MusicPublic { .. } => f.debug_struct("MusicPublic").finish_non_exhaustive(),
             Change::DiagnosticsDefault { on } => f.debug_struct("DiagnosticsDefault").field("on", on).finish(),
@@ -888,14 +885,12 @@ impl Change<'_> {
             Change::Codes { account, keep } => {
                 step.execute("DELETE FROM codes WHERE account = ?1 AND (?2 IS NULL OR number != ?2)", params![number(account)?, keep.map(number).transpose()?])?;
             }
-            // Only a marker for `persist`, which turns it into `MusicLogin`.
-            Change::MusicChecked { .. } => {}
-            Change::MusicLogin { account, install, internal } => {
+            Change::MusicLogin { account, install } => {
                 let binding = &install.binding;
                 step.execute(
-                    "INSERT INTO music_logins (account, count, address, name, sealed, internal) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                     ON CONFLICT (account) DO UPDATE SET count = excluded.count, address = excluded.address, name = excluded.name, sealed = excluded.sealed, internal = excluded.internal",
-                    params![number(account)?, number(binding.count)?, binding.address.as_str(), binding.name.as_str(), install.sealed.as_bytes(), internal],
+                    "INSERT INTO music_logins (account, count, name, sealed, internal) VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT (account) DO UPDATE SET count = excluded.count, name = excluded.name, sealed = excluded.sealed, internal = excluded.internal",
+                    params![number(account)?, number(binding.count)?, binding.name.as_str(), install.sealed.as_bytes(), binding.internal.as_str()],
                 )?;
             }
             Change::MusicPublic { address } => {

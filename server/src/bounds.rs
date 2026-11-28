@@ -8,10 +8,11 @@
 
 use std::time::Duration;
 
-/// The whole head of a request (its line and every header) must arrive within this, counted
-/// from when the connection is taken. A connection carries one request, so this is also how
-/// long one may stay open saying nothing.
-pub const HEAD_DEADLINE: Duration = Duration::from_secs(10);
+/// The whole head of a request (its line and every header), and a sign-in's body, must arrive
+/// within this, counted from when the connection is taken, before it may take a work slot (the
+/// review of S8, C1: short, as the proxy sends a request whole at once). A connection carries
+/// one request, so this is also how long one may stay open saying nothing.
+pub const HEAD_DEADLINE: Duration = Duration::from_secs(3);
 
 /// The most a request's head may be, in bytes, and the most read before its end is found.
 /// Past it, the proxy is given the gate's one answer and anyone else nothing.
@@ -28,9 +29,14 @@ pub const BODY_DEADLINE: Duration = Duration::from_secs(10);
 /// refused at the first byte past this.
 pub const BODY_MAX_BYTES: usize = 1024 * 1024;
 
-/// The most connections open at once. One more is closed as soon as it is accepted, without
-/// a byte read or written.
+/// The most requests served at once (work slots), once their heads are read.
 pub const CONNECTIONS_MAX: usize = 64;
+
+/// Of [`CONNECTIONS_MAX`], the slots only a request that is someone's may take (the review of
+/// S8, C1; the lead's ruling of 28 Nov 15:38): one whose session resolves, a known device
+/// signing in to its own account, or a live one-time code. A flood of strangers can take the
+/// other slots, never these.
+pub const RESERVED_SLOTS: usize = 16;
 
 /// How long a write may make no progress (the caller not reading) before the connection is
 /// closed.
@@ -44,8 +50,9 @@ pub const ANSWER_DEADLINE: Duration = Duration::from_secs(10);
 pub const LINGER_DEADLINE: Duration = Duration::from_secs(2);
 pub const LINGER_MAX_BYTES: usize = BODY_MAX_BYTES + HEAD_MAX_BYTES;
 
-/// How many connections past [`CONNECTIONS_MAX`] may be open at once only to be given the
-/// gate's answer. Past these, no more is taken: one waits in the kernel's backlog.
+/// How many connections past [`CONNECTIONS_MAX`] may be open at once: having their heads read,
+/// or only being given the gate's answer. Past these, no more is taken: one waits in the
+/// kernel's backlog.
 pub const TURNED_AWAY_MAX: usize = 16;
 
 /// How many connections the kernel holds, ready, before they are taken. With every one of
@@ -67,8 +74,8 @@ mod tests {
         assert!(HEAD_MAX_BYTES >= 8192);
         // The largest call is a batch of plays (design 9.1); the proxy's own limit is the same.
         assert_eq!(BODY_MAX_BYTES, 1 << 20);
-        // A write that makes no progress is told apart from a head that never comes.
-        assert!(WRITE_DEADLINE < HEAD_DEADLINE);
-        assert!(CONNECTIONS_MAX > 0);
+        // A head comes whole at once from the proxy: its deadline is short (C1).
+        assert!(HEAD_DEADLINE <= Duration::from_secs(5));
+        assert!(CONNECTIONS_MAX > RESERVED_SLOTS && RESERVED_SLOTS > 0);
     }
 }

@@ -65,8 +65,10 @@ struct Between {
     /// Connections the forwarder took, and the trap a redirect points at.
     taken: Arc<AtomicUsize>,
     trapped: Arc<AtomicUsize>,
-    /// The TLS front: the address people use.
+    /// The TLS front: the address people use, and the connections it took (a device's only:
+    /// the backend never connects there).
     public_port: u16,
+    fronted: Arc<AtomicUsize>,
     roots: RootCertStore,
     cert_file: PathBuf,
 }
@@ -83,6 +85,7 @@ impl Between {
         let to = navidrome();
         let mode = Arc::new(AtomicU8::new(FORWARD));
         let (taken, trapped) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let fronted = Arc::new(AtomicUsize::new(0));
         let (internal, public_port, roots, cert_file) = runtime.block_on(async {
             let trap = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let trap_at = trap.local_addr().unwrap();
@@ -130,8 +133,10 @@ impl Between {
             let acceptor = TlsAcceptor::from(Arc::new(config));
             let front = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let public_port = front.local_addr().unwrap().port();
+            let fronting = fronted.clone();
             tokio::spawn(async move {
                 while let Ok((stream, _)) = front.accept().await {
+                    fronting.fetch_add(1, Ordering::SeqCst);
                     let (acceptor, to) = (acceptor.clone(), navidrome());
                     tokio::spawn(async move {
                         if let Ok(tls) = acceptor.accept(stream).await {
@@ -142,7 +147,7 @@ impl Between {
             });
             (internal, public_port, roots, cert_file)
         });
-        Between { runtime, internal, mode, taken, trapped, public_port, roots, cert_file }
+        Between { runtime, internal, mode, taken, trapped, public_port, fronted, roots, cert_file }
     }
 
     fn internal(&self) -> String {
@@ -221,13 +226,19 @@ impl Folders {
     }
 
     fn settings(&self, port: u16, between: &Between) -> Vec<(&'static str, String)> {
+        let mut settings = self.settings_at(port, &between.internal());
+        settings.push(("SSL_CERT_FILE", between.cert_file.display().to_string()));
+        settings
+    }
+
+    /// With `internal` as the container's address of the music server.
+    fn settings_at(&self, port: u16, internal: &str) -> Vec<(&'static str, String)> {
         vec![
-            ("NEXUS_MUSIC_SERVER", between.internal()),
+            ("NEXUS_MUSIC_SERVER", internal.to_string()),
             ("NEXUS_PROXY", "127.0.0.1".into()),
             ("NEXUS_DATA", self.root.join("data").display().to_string()),
             ("NEXUS_STATE", self.root.join("state").display().to_string()),
             ("NEXUS_LISTEN", format!("127.0.0.1:{port}")),
-            ("SSL_CERT_FILE", between.cert_file.display().to_string()),
         ]
     }
 
@@ -295,11 +306,16 @@ impl Serving {
     }
 
     fn post(&self, path: &str, session: Option<&Session>, body: &[u8]) -> (u16, Vec<u8>) {
+        self.post_with(path, session, "", body)
+    }
+
+    /// The same, with more headers (each line ending in CRLF).
+    fn post_with(&self, path: &str, session: Option<&Session>, more: &str, body: &[u8]) -> (u16, Vec<u8>) {
         let mut stream = TcpStream::connect(self.at).unwrap();
         stream.set_read_timeout(Some(Duration::from_secs(40))).unwrap();
         let authorization = session.map_or_else(String::new, |session| format!("Authorization: {}\r\n", session.authorization().as_str()));
         let head = format!(
-            "POST {path} HTTP/1.1\r\nHost: nexus\r\nX-Nexus-Scheme: https\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{authorization}Connection: close\r\n\r\n",
+            "POST {path} HTTP/1.1\r\nHost: nexus\r\nX-Nexus-Scheme: https\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{authorization}{more}Connection: close\r\n\r\n",
             body.len()
         );
         stream.write_all(head.as_bytes()).unwrap();
@@ -444,16 +460,15 @@ fn an_admin_sets_a_music_login_and_the_person_plays_and_no_failure_touches_it() 
     let person = sign_in(&backend, with_code(&person_code, PERSONS_PASSWORD), 2);
     assert_eq!(person.music, MusicLoginResult::NoneSetYet);
 
-    // No address people use yet: a login cannot be set (nothing to check it at).
-    let (status, reply) = admin.set_music_login(person.person.id, MUSIC_USER, MUSIC_PASSWORD);
-    assert_eq!((status, refused(reply)), (403, admin::Refusal::NotAllowed(Denial::Conflict)));
     assert!(matches!(admin.set_music_server(&between.public()), admin::Reply::Done(_)));
 
-    // The login set: both addresses asked, two questions each.
+    // The login set: the container's address asked, two questions; the address people use
+    // never connected to (the lead's ruling of 15:38).
     let asked_before = between.taken.load(Ordering::SeqCst);
     let (status, reply) = admin.set_music_login(person.person.id, MUSIC_USER, MUSIC_PASSWORD);
     assert_eq!(status, 200, "{reply:?}");
     assert_eq!(between.taken.load(Ordering::SeqCst) - asked_before, 2, "ping and getUser at the container's address");
+    assert_eq!(between.fronted.load(Ordering::SeqCst), 0, "the backend connected to the address people use");
 
     // The person signs in from a second device: a salt and token in the answer, and it plays.
     let mut phone = sign_in(&backend, with_password(PERSON, PERSONS_PASSWORD), 3);
@@ -511,6 +526,10 @@ fn an_admin_sets_a_music_login_and_the_person_plays_and_no_failure_touches_it() 
     assert_eq!(status, 200);
     assert!(matches!(account::read_reply::<account::ForcedOut>(status, &body).unwrap(), Reply::Done { result: account::ForcedOut { music_cut_off: false }, .. }));
     assert_eq!(login(music_login(&backend, &person)).count, 1);
+
+    // Every connection the address people use took was a device's playing (three questions
+    // each time it played), none the backend's.
+    assert_eq!(between.fronted.load(Ordering::SeqCst), 3 * 3, "the backend connected to the address people use");
 
     // The log holds no music password, token or salt.
     let written = backend.stop();
@@ -652,6 +671,170 @@ fn set_a_music_login_on_a_running_backend() {
     assert_eq!(status, 200, "403 music_login_refused: the music server said wrong name or password; 503: it could not be reached at one of the two addresses");
 }
 
+// ---------------------------------------------------------------------------------------------
+// Without the test Navidrome: a stand-in music server, and a trap at the address people use
+// ---------------------------------------------------------------------------------------------
+
+/// A stand-in for the music server at the container's address (plain HTTP on loopback): it
+/// answers `ping` and `getUser` (for `tester`) as Navidrome does, and counts its connections.
+fn stand_in(runtime: &tokio::runtime::Runtime) -> (String, Arc<AtomicUsize>) {
+    const PING: &str = r#"{"subsonic-response":{"status":"ok","version":"1.16.1"}}"#;
+    const USER: &str = r#"{"subsonic-response":{"status":"ok","version":"1.16.1","user":{"username":"tester"}}}"#;
+    let taken = Arc::new(AtomicUsize::new(0));
+    let counting = taken.clone();
+    let at = runtime.block_on(async move {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let at = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                counting.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut read = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    while !read.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match stream.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(got) => read.extend_from_slice(&chunk[..got]),
+                        }
+                    }
+                    let body = if read.starts_with(b"POST /rest/getUser ") { USER } else { PING };
+                    let answer = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    let _ = stream.write_all(answer.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        at
+    });
+    (format!("http://{at}"), taken)
+}
+
+/// A listener that counts every connection made to it and answers nothing.
+fn trap(runtime: &tokio::runtime::Runtime) -> (u16, Arc<AtomicUsize>) {
+    let trapped = Arc::new(AtomicUsize::new(0));
+    let counting = trapped.clone();
+    let port = runtime.block_on(async move {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((_stream, _)) = listener.accept().await {
+                counting.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        port
+    });
+    (port, trapped)
+}
+
+/// S9-1 (the review of S9; the lead's ruling of 15:38): **the backend never connects to the
+/// address people use**: setting it, setting a login and handing the login out open no
+/// connection to it (a listener there fails the test if it is touched), and the login is
+/// handed out with that address as it was set. A login can be set before that address is, and
+/// is "cannot be used now" until it is; correcting the address changes no login. A login
+/// checked at one `NEXUS_MUSIC_SERVER` is "cannot be used now" once the backend starts with
+/// another, until it is typed again there.
+#[test]
+fn the_address_people_use_is_never_connected_to_and_another_container_address_needs_the_login_again() {
+    let folders = Folders::new("never-connected");
+    let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+    let (first, first_taken) = stand_in(&runtime);
+    let (second, second_taken) = stand_in(&runtime);
+    let (trap_port, trapped) = trap(&runtime);
+    let public = format!("https://127.0.0.1:{trap_port}");
+    let port = free_port();
+    let settings = folders.settings_at(port, &first);
+    let admin_code = code_from(&settings, &["set-up", ADMIN, "Admin"]);
+    let person_code = code_from(&settings, &["recover", PERSON]);
+    let mut backend = Serving::start(&settings, port);
+    let signed = sign_in(&backend, with_code(&admin_code, PASSWORD), 1);
+    let person = sign_in(&backend, with_code(&person_code, PERSONS_PASSWORD), 2);
+    let mut admin = Admin { backend: &backend, signed, next: 0 };
+    // The login set first, with no address people use yet: checked, kept, not handed out.
+    let (status, reply) = admin.set_music_login(person.person.id, MUSIC_USER, MUSIC_PASSWORD);
+    assert_eq!(status, 200, "{reply:?}");
+    assert_eq!(first_taken.load(Ordering::SeqCst), 2, "ping and getUser at the container's address");
+    let phone = sign_in(&backend, with_password(PERSON, PERSONS_PASSWORD), 3);
+    assert_eq!(phone.music, MusicLoginResult::UnusableNow, "handed out with no address people use");
+    // A wrong address people use, then corrected: the same login, handed with each.
+    let wrong = format!("https://localhost:{trap_port}");
+    assert!(matches!(admin.set_music_server(&wrong), admin::Reply::Done(_)));
+    assert_eq!(login(music_login(&backend, &phone)).address.as_str(), wrong.as_str());
+    assert!(matches!(admin.set_music_server(&public), admin::Reply::Done(_)));
+    let handed = login(music_login(&backend, &phone));
+    assert_eq!((handed.address.as_str(), handed.count), (public.as_str(), 1), "correcting the address people use changed the login");
+    assert_eq!(first_taken.load(Ordering::SeqCst), 2, "the music server was asked again");
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(trapped.load(Ordering::SeqCst), 0, "the backend connected to the address people use");
+    drop(admin);
+    backend.stop();
+
+    // Started again with another container's address: the login is not handed out.
+    let settings = folders.settings_at(port, &second);
+    let backend = Serving::start(&settings, port);
+    let phone = sign_in(&backend, with_password(PERSON, PERSONS_PASSWORD), 3);
+    assert_eq!(phone.music, MusicLoginResult::UnusableNow, "a login checked at another NEXUS_MUSIC_SERVER was handed out");
+    assert_eq!(music_login(&backend, &phone), MusicLoginResult::UnusableNow);
+    // Typed again: checked at the new address alone, and handed out again.
+    let mut admin = Admin { backend: &backend, signed: sign_in(&backend, with_password(ADMIN, PASSWORD), 1), next: 100 };
+    assert_eq!(admin.set_music_login(person.person.id, MUSIC_USER, MUSIC_PASSWORD).0, 200);
+    assert_eq!((first_taken.load(Ordering::SeqCst), second_taken.load(Ordering::SeqCst)), (2, 2));
+    assert_eq!(login(music_login(&backend, &phone)).count, 2);
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(trapped.load(Ordering::SeqCst), 0, "the backend connected to the address people use");
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64
+}
+
+/// C5's gap (the review of S9): an admin who HAS a music login is handed it on the app, and
+/// never on the admin's page: not in the page's sign-in answer, not when the page asks for it,
+/// and not when the page's session asks without a browser's headers (the session's kind,
+/// core's, is what withholds it).
+#[test]
+fn an_admin_with_a_music_login_is_not_handed_it_at_the_page() {
+    const PAGE: &str = "https://nexus.example.test";
+    let folders = Folders::new("page-login");
+    let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+    let (internal, _) = stand_in(&runtime);
+    let port = free_port();
+    let mut settings = folders.settings_at(port, &internal);
+    settings.push(("NEXUS_PUBLIC_ORIGIN", PAGE.into()));
+    let admin_code = code_from(&settings, &["set-up", ADMIN, "Admin"]);
+    let backend = Serving::start(&settings, port);
+    let signed = sign_in(&backend, with_code(&admin_code, PASSWORD), 1);
+    let admin_id = signed.person.id;
+    let mut admin = Admin { backend: &backend, signed, next: 0 };
+    assert!(matches!(admin.set_music_server("https://music.example.test"), admin::Reply::Done(_)));
+    assert_eq!(admin.set_music_login(admin_id, MUSIC_USER, MUSIC_PASSWORD).0, 200);
+    // The admin's app: handed it.
+    assert_eq!(login(music_login(&backend, &admin.signed)).count, 1);
+    // The page's sign-in, from its own origin, marked: not handed it.
+    let page = format!("Origin: {PAGE}\r\nX-Nexus-Admin: 1\r\n");
+    let request = SignIn {
+        credential: with_password(ADMIN, PASSWORD),
+        device_secret: DeviceSecret::from_bytes([7; 32]),
+        device_name: Name::new("Nexus admin browser").unwrap(),
+        device_kind: DeviceKind::Pc,
+        app_version: Version::parse("0.41.0").unwrap(),
+        speaks: SPEAKS,
+        restore: None,
+    };
+    let (status, body) = backend.post_with(account::SIGN_IN, None, &page, account::encode(&request).unwrap().bytes());
+    let at_page = match account::read_reply::<SignedIn>(status, &body).unwrap() {
+        Reply::Done { result, .. } => result,
+        other => panic!("the page did not sign in: {status} {other:?}"),
+    };
+    assert_eq!(at_page.music, MusicLoginResult::NoneSetYet, "the page's sign-in was handed a music login");
+    let asked = |more: &str| {
+        let (status, body) = backend.post_with(account::MUSIC_LOGIN, Some(&at_page.session), more, account::encode(&GetMusicLogin { head: head(at_page.restore) }).unwrap().bytes());
+        match account::read_reply::<MusicLoginResult>(status, &body).unwrap() {
+            Reply::Done { result, .. } => result,
+            other => panic!("no answer: {status} {other:?}"),
+        }
+    };
+    assert_eq!(asked(&page), MusicLoginResult::NoneSetYet, "the page was handed a music login");
+    assert_eq!(asked(""), MusicLoginResult::NoneSetYet, "the page's session was handed a music login without a browser's headers");
+    // The same admin's app, still.
+    assert_eq!(login(music_login(&backend, &admin.signed)).count, 1);
 }

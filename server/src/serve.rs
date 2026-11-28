@@ -5,13 +5,15 @@
 //!    it is accepted, without a byte read or written; except that this machine's own loopback
 //!    address may ask `GET /nexus/api/hello`, and nothing else, for the container's health
 //!    check.
-//! 2. **How many are open:** past [`CONNECTIONS_MAX`], one more from the proxy is given the
-//!    gate's answer; past [`TURNED_AWAY_MAX`] more, none is taken until there is room, and it
-//!    waits in the kernel's backlog ([`LISTEN_BACKLOG`]).
+//! 2. **How many are open:** at most [`CONNECTIONS_MAX`] + [`TURNED_AWAY_MAX`] connections are
+//!    taken at once (having their heads read, served, or given the gate's answer); past that,
+//!    none is taken until there is room, and it waits in the kernel's backlog
+//!    ([`LISTEN_BACKLOG`]).
 //!
 //!    Every connection's head deadline counts from when it is taken.
-//! 3. **Its head**, read here and not by hyper ([`crate::head`]): all of it within
-//!    [`HEAD_DEADLINE`], in at most [`HEAD_MAX_BYTES`] and [`HEAD_MAX_HEADERS`] headers.
+//! 3. **Its head**, read here and not by hyper ([`crate::head`]): all of it within the short
+//!    [`HEAD_DEADLINE`], in at most [`HEAD_MAX_BYTES`] and [`HEAD_MAX_HEADERS`] headers, **before
+//!    it takes a work slot** (the review of S8, C1).
 //! 4. **The gate:** a request from the proxy must carry exactly one `X-Nexus-Scheme: https`.
 //!
 //!    Whatever fails before or at the gate is answered by **one fixed bare refusal when the
@@ -21,10 +23,19 @@
 //!    as measured), and **with nothing at all when it is not**.
 //! 5. **The target exactly as it came**, the method, and the body's framing and declared size,
 //!    each refused with a bare answer before a byte of the body is read.
-//! 6. **The body**, read by hyper within [`BODY_DEADLINE`] into one buffer of the size it
+//! 6. **A work slot** (C1; the lead's ruling of 28 Nov 15:38): one of [`CONNECTIONS_MAX`],
+//!    of which [`RESERVED_SLOTS`] are kept for a request that is someone's ([`Admitted`], asked
+//!    of the accounts' cheap read path, [`crate::accounts::admit`]): its session resolves, or it
+//!    is a known device signing in, or a live one-time code (a sign-in's body is read for this
+//!    before the slot, by the head's deadline). Every other request takes one of the rest; none
+//!    left, the proxy is given the gate's answer. So a flood of strangers cannot take every
+//!    slot from people already signed in.
+//! 7. **The body**, read by hyper within [`BODY_DEADLINE`] into one buffer of the size it
 //!    declared.
-//! 7. **What answers it**, in a task of its own, within [`ANSWER_DEADLINE`] or 503; a fault
-//!    there is that request's 500 and nothing else's.
+//! 8. **What answers it**, in a task of its own, within [`ANSWER_DEADLINE`] or 503; a fault
+//!    there is that request's 500 and nothing else's. The work it hands the thread that writes
+//!    knows the request's admission ([`ADMITTED`]): a session that did not resolve never waits
+//!    in the protected lane.
 //!
 //! After a bare answer, whatever more the caller sends is discarded, for a moment and up to a
 //! bound ([`LINGER_DEADLINE`], [`LINGER_MAX_BYTES`]), so that closing does not reset the
@@ -59,6 +70,8 @@ use tokio::sync::Semaphore;
 use tokio::time::Sleep;
 use tower::ServiceExt;
 
+use crate::accounts::admit::Admission;
+use crate::accounts::desk::{ADMITTED, Admitted};
 use crate::bounds::*;
 use crate::head::{self, NoHead, Route, Verdict};
 
@@ -133,7 +146,10 @@ pub struct Shell {
     router: Router,
     routes: Vec<Route>,
     requests: Option<Arc<crate::requests::Requests>>,
+    /// Who may take a reserved slot (the backend's own; none in a shell without accounts).
+    admit: Option<Arc<Admission>>,
     open: AtomicUsize,
+    serving: AtomicUsize,
     refused: [AtomicU64; REFUSALS.len()],
 }
 
@@ -168,24 +184,27 @@ impl Shell {
         let public_origin = public_origin.map(Arc::<str>::from);
         let requests = crate::requests::Requests::new(accounts.clone(), public_origin.clone(), endpoint);
         let router = crate::accounts::routes::router(base_router(hello), accounts.clone(), public_origin.clone());
+        let admit = accounts.admission.clone();
         let router = crate::events::router(router, accounts, public_origin, data_budget);
         let router = requests.router(router);
-        Self::with_requests(proxy, router, head::ROUTES.to_vec(), Some(requests))
+        let shell = Self::with_routes(proxy, router, head::ROUTES.to_vec());
+        Arc::new(Shell { admit: Some(admit), requests: Some(requests), ..Arc::into_inner(shell).expect("made just now") })
     }
 
     /// With other routes (the tests add some): `routes` names each path `router` answers, and
     /// the one method it answers there.
     pub fn with_routes(proxy: IpAddr, router: Router, routes: Vec<Route>) -> Arc<Self> {
-        Self::with_requests(proxy, router, routes, None)
-    }
-
-    fn with_requests(proxy: IpAddr, router: Router, routes: Vec<Route>, requests: Option<Arc<crate::requests::Requests>>) -> Arc<Self> {
-        Arc::new(Shell { proxy: proxy.to_canonical(), router, routes, requests, open: AtomicUsize::new(0), refused: Default::default() })
+        Arc::new(Shell { proxy: proxy.to_canonical(), router, routes, admit: None, requests: None, open: AtomicUsize::new(0), serving: AtomicUsize::new(0), refused: Default::default() })
     }
 
     /// How many connections are open now, turned-away ones included.
     pub fn open(&self) -> usize {
         self.open.load(Ordering::SeqCst)
+    }
+
+    /// How many requests hold a work slot now.
+    pub fn serving(&self) -> usize {
+        self.serving.load(Ordering::SeqCst)
     }
 
     /// How many of `kind` have been refused since the counts were last written.
@@ -308,13 +327,14 @@ pub async fn serve(listener: TcpListener, shell: Arc<Shell>, log: bool) {
             }
         });
     }
-    // Room for every connection taken: those served, and those only given the gate's answer.
-    // A connection is taken only when there is room at least to answer it, so that one from
-    // the proxy is never taken and then closed with nothing (which the proxy would log, and
-    // answer with a 502). Past that, it waits in the kernel's backlog ([`LISTEN_BACKLOG`])
-    // until there is room.
+    // Room for every connection taken: those having their heads read, those served, and those
+    // only given the gate's answer. A connection is taken only when there is room at least to
+    // answer it, so that one from the proxy is never taken and then closed with nothing (which
+    // the proxy would log, and answer with a 502). Past that, it waits in the kernel's backlog
+    // ([`LISTEN_BACKLOG`]) until there is room. The work slots are taken only once a head is
+    // read: the general ones, and the reserve (C1).
     let room = Arc::new(Semaphore::new(CONNECTIONS_MAX + TURNED_AWAY_MAX));
-    let slots = Arc::new(Semaphore::new(CONNECTIONS_MAX));
+    let slots = Slots { general: Arc::new(Semaphore::new(CONNECTIONS_MAX - RESERVED_SLOTS)), reserve: Arc::new(Semaphore::new(RESERVED_SLOTS)) };
     loop {
         let Ok(roomed) = room.clone().acquire_owned().await else { return };
         let (stream, from) = match listener.accept().await {
@@ -335,40 +355,35 @@ pub async fn serve(listener: TcpListener, shell: Arc<Shell>, log: bool) {
             continue;
         }
         let _ = stream.set_nodelay(true);
-        let shell = shell.clone();
-        match slots.clone().try_acquire_owned() {
-            Ok(slot) => {
-                tokio::spawn(async move {
-                    let _room = roomed;
-                    let _slot = slot;
-                    let _open = Open::new(&shell);
-                    connection(Guarded::new(stream, shell.clone()), peer, deadline, shell).await;
-                });
-            }
-            Err(_) => {
-                shell.count(Refusal::Full);
-                // The proxy is told so, by the gate's one answer, for which there is always room
-                // here; no one else is told anything.
-                if peer != Peer::Proxy {
-                    continue;
-                }
-                tokio::spawn(async move {
-                    let _room = roomed;
-                    let _open = Open::new(&shell);
-                    answer_bare(Guarded::new(stream, shell.clone()), GATE, false).await;
-                });
-            }
-        }
+        let (shell, slots) = (shell.clone(), slots.clone());
+        tokio::spawn(async move {
+            let _room = roomed;
+            let _open = Open::new(&shell);
+            connection(Guarded::new(stream, shell.clone()), peer, deadline, shell, slots).await;
+        });
+    }
+}
+
+/// The work slots: the general ones, and the reserve only a request that is someone's may take.
+#[derive(Clone)]
+struct Slots {
+    general: Arc<Semaphore>,
+    reserve: Arc<Semaphore>,
+}
+
+impl Slots {
+    fn take(&self, admitted: Admitted) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.general.clone().try_acquire_owned().ok().or_else(|| (admitted == Admitted::Reserved).then(|| self.reserve.clone().try_acquire_owned().ok()).flatten())
     }
 }
 
 /// One connection: its head read and judged, then refused or served.
-async fn connection(mut stream: Guarded, peer: Peer, deadline: tokio::time::Instant, shell: Arc<Shell>) {
+async fn connection(mut stream: Guarded, peer: Peer, deadline: tokio::time::Instant, shell: Arc<Shell>, slots: Slots) {
     let refused = |kind| {
         shell.count(kind);
         peer == Peer::Proxy
     };
-    let head = match head::read_by(deadline, &mut stream).await {
+    let mut head = match head::read_by(deadline, &mut stream).await {
         Ok(head) => head,
         // Opened and closed with nothing said: there is no one to answer.
         Err(NoHead::Closed) => return,
@@ -390,13 +405,42 @@ async fn connection(mut stream: Guarded, peer: Peer, deadline: tokio::time::Inst
             answer_bare(stream, status, head.target.starts_with(crate::admin::PAGE)).await;
         }
         Verdict::Serve(length) => {
+            // C1: who it is, before a work slot. A sign-in's body is read first, by the head's
+            // deadline (the proxy sends it with the head), as only it can say whether this is
+            // a known device or a live code.
+            let admitted = match &shell.admit {
+                None => Admitted::Plain,
+                Some(admit) => {
+                    if head.target == nexus_core::nexus::account::SIGN_IN && length > 0 {
+                        match head::read_body_by(deadline, &mut stream, &mut head, length).await {
+                            Ok(()) => {}
+                            Err(why) => {
+                                let late = why == NoHead::Late;
+                                shell.count(if late { Refusal::SlowBody } else { Refusal::BadBody });
+                                answer_bare(stream, if late { StatusCode::REQUEST_TIMEOUT } else { StatusCode::BAD_REQUEST }, false).await;
+                                return;
+                            }
+                        }
+                    }
+                    let authorization: Vec<&[u8]> = head.all("authorization").collect();
+                    admit.listener(&head.target, &authorization, head.body())
+                }
+            };
+            let Some(_slot) = slots.take(admitted) else {
+                // The proxy is told so, by the gate's one answer; no one else is told anything.
+                if refused(Refusal::Full) {
+                    answer_bare(stream, GATE, false).await;
+                }
+                return;
+            };
+            let _serving = Holding::new(&shell);
             let service = {
                 let shell = shell.clone();
                 let admin_path = head.target.starts_with(crate::admin::PAGE);
                 hyper::service::service_fn(move |request| {
                     let shell = shell.clone();
                     async move {
-                        let mut response = answer(request, length, shell).await?;
+                        let mut response = answer(request, length, admitted, shell).await?;
                         if admin_path {
                             for (name, value) in crate::admin::PAGE_HEADERS {
                                 response.headers_mut().insert(name, HeaderValue::from_static(value));
@@ -439,6 +483,22 @@ async fn answer_bare(mut stream: Guarded, status: StatusCode, admin_path: bool) 
         }
     })
     .await;
+}
+
+/// Counts a work slot as held for as long as it lives.
+struct Holding(Arc<Shell>);
+
+impl Holding {
+    fn new(shell: &Arc<Shell>) -> Self {
+        shell.serving.fetch_add(1, Ordering::SeqCst);
+        Holding(shell.clone())
+    }
+}
+
+impl Drop for Holding {
+    fn drop(&mut self) {
+        self.0.serving.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Counts a connection as open for as long as it lives.
@@ -494,7 +554,7 @@ where
     Ok(bytes)
 }
 
-async fn answer(request: Request<Incoming>, length: usize, shell: Arc<Shell>) -> Result<Response<Body>, Infallible> {
+async fn answer(request: Request<Incoming>, length: usize, admitted: Admitted, shell: Arc<Shell>) -> Result<Response<Body>, Infallible> {
     let (mut parts, body) = request.into_parts();
     if let Some(requests) = shell.requests.as_ref().filter(|_| crate::requests::guards(parts.uri.path())) {
         match tokio::time::timeout(HEAD_DEADLINE, requests.admit(parts.uri.path(), &parts.headers)).await {
@@ -518,7 +578,7 @@ async fn answer(request: Request<Incoming>, length: usize, shell: Arc<Shell>) ->
         Ok(Ok(bytes)) => Bytes::from(bytes),
     };
     let request = Request::from_parts(parts, Body::from(bytes));
-    let mut task = tokio::spawn(shell.router.clone().oneshot(request));
+    let mut task = tokio::spawn(ADMITTED.scope(admitted, shell.router.clone().oneshot(request)));
     let mut response = match tokio::time::timeout(ANSWER_DEADLINE, &mut task).await {
         Err(_) => {
             task.abort();
