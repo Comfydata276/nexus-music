@@ -685,6 +685,23 @@ impl Keeper {
         for update in &effects.updates {
             numbers.push(self.number_of(&update.apart_first.account.name)?);
         }
+        // What the caller adds is kept only with the change it belongs to, as C3r decided it:
+        // a decision refused (a spent grant, a wrong password) still has updates, which are
+        // kept whatever it answered, and a new verifier or code given with it is not.
+        let with = |account: u64, change: DataChange| effects.updates.iter().zip(&numbers).any(|(update, &number)| number == account && update.change == change);
+        let mut added = Vec::new();
+        for change in extra {
+            let belongs = match *change {
+                Change::Password { password: None, .. } | Change::Codes { .. } => true,
+                Change::Password { account, password: Some(_) } => with(account, DataChange::ChangePassword),
+                Change::Code { account, .. } => with(account, DataChange::ResetPassword),
+                Change::Describe { device, .. } => effects.updates.iter().any(|update| update.data.devices.contains_key(&device)),
+                _ => return Err(Failed("A change was added to a decision that no decision adds to; nothing was kept.".into())),
+            };
+            if belongs {
+                added.push(change.clone());
+            }
+        }
         let mut next = self.store.clone();
         next.high_water = high_water;
         next.mark = self.changes;
@@ -716,7 +733,7 @@ impl Keeper {
                 changes.push(Change::Codes { account: number });
             }
         }
-        changes.extend(extra.iter().cloned());
+        changes.extend(added);
         match self.data.apply(&changes, at) {
             Ok(changes) => self.changes = changes,
             Err(error) => return self.broke(Failed(data_failed(&error))),
