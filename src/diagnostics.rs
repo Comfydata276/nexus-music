@@ -1,6 +1,6 @@
 //! The same clean report for "What is sent" and "Save diagnostics".
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -12,6 +12,8 @@ use std::time::Duration;
 use chrono::Utc;
 use nexus_core::nexus::{account::DeviceKind, diag, events::LossCounts, proto::Version};
 use slint::ComponentHandle;
+
+pub(crate) use diag::SoundOutput;
 
 use crate::controller::{Controller, post, with};
 use crate::{config, pool::Pool, ui};
@@ -77,6 +79,7 @@ type Observation = (u64, diag::Line);
 
 thread_local! {
     // Called by the native window and media callbacks on the window's thread.
+    static SOUND_OUTPUT: Cell<SoundOutput> = const { Cell::new(SoundOutput::Unknown) };
     static OBSERVED: RefCell<VecDeque<Observation>> = const { RefCell::new(VecDeque::new()) };
 }
 
@@ -92,10 +95,15 @@ pub fn observe(line: diag::Line) {
     }
 }
 
+pub(crate) fn note_sound_output(kind: SoundOutput) {
+    SOUND_OUTPUT.set(kind);
+}
+
 struct Session {
     https: bool,
     offline: bool,
     signed_in: bool,
+    pc: diag::PcDetails,
     observations: Vec<Observation>,
 }
 
@@ -107,7 +115,18 @@ impl Session {
         let observations = OBSERVED.with_borrow(|observed| {
             observed.iter().copied().collect::<Vec<_>>()
         });
-        Self::from_observations(&settings, ctl.client().is_some(), &said, observations)
+        let mut session = Self::from_observations(&settings, ctl.client().is_some(), &said, observations);
+        session.pc.music_version = if session.signed_in {
+            diag::music_version(&ctl.ui.global::<ui::App>().get_server_version())
+        } else {
+            None
+        };
+        session.pc.unreachable = ctl.unreachable.get();
+        session.pc.output = SOUND_OUTPUT.get();
+        session.pc.library_songs = crate::search::current().map_or(0, |index| index.library.songs.len() as u64);
+        session.pc.downloads = ctl.downloads.borrow().downloaded_count() as u64;
+        session.pc.pending = (ctl.pending.borrow().len() as u64).saturating_add(ctl.sending.borrow().len() as u64);
+        session
     }
 
     fn from_observations(
@@ -124,6 +143,31 @@ impl Session {
             https: settings.server.starts_with("https://"),
             offline: settings.offline,
             signed_in,
+            pc: diag::PcDetails {
+                exclusive: settings.exclusive,
+                bitrate_kbps: settings.max_bitrate(),
+                gapless: settings.gapless,
+                crossfade_ms: (settings.crossfade * 1_000.0).round() as u32,
+                levelling: settings.normalize.then(|| {
+                    let level = match settings.volume_level {
+                        0 => diag::Level::Quiet,
+                        2 => diag::Level::Loud,
+                        _ => diag::Level::Normal,
+                    };
+                    let mode = match settings.level_mode {
+                        1 => diag::LevelBy::Song,
+                        2 => diag::LevelBy::Album,
+                        _ => diag::LevelBy::Automatic,
+                    };
+                    (level, mode)
+                }),
+                equaliser: settings.equalizer,
+                mono: settings.mono,
+                cache_limit_mb: settings.cache_limit_mb,
+                sharing: settings.sync,
+                requests: settings.requests,
+                ..diag::PcDetails::default()
+            },
             observations,
         }
     }
@@ -153,6 +197,7 @@ impl Session {
                 android_auto: None,
                 // The Windows journal will supply its totals when W8 exists.
                 loss: LossCounts::default(),
+                pc: Some(self.pc),
             },
             record,
         }

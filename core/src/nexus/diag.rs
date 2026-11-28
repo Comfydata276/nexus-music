@@ -185,6 +185,7 @@ pub struct About {
     pub local_permission: Option<bool>,
     pub android_auto: Option<bool>,
     pub loss: LossCounts,
+    pub pc: Option<PcDetails>,
 }
 
 macro_rules! words {
@@ -318,6 +319,158 @@ impl Fault {
     pub const fn new(place: FaultPlace, shape: FaultShape) -> Self {
         Self { place, shape, source: None }
     }
+}
+
+/// The output the audio engine actually obtained. Device names and error text
+/// are never part of this type.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SoundOutput {
+    #[default]
+    Unknown,
+    WaitingForExclusive,
+    Shared { rate_hz: u32 },
+    Exclusive { rate_hz: u32, bits: u32 },
+    ExclusiveRefused { rate_hz: u32 },
+    NoDevice,
+}
+
+impl fmt::Display for SoundOutput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::Unknown => f.write_str("unknown"),
+            Self::WaitingForExclusive => f.write_str("waiting for exclusive playback"),
+            Self::Shared { rate_hz } => write!(f, "shared at {rate_hz} Hz"),
+            Self::Exclusive { rate_hz, bits } => write!(f, "exclusive at {rate_hz} Hz, {bits} bit"),
+            Self::ExclusiveRefused { rate_hz } => write!(f, "exclusive refused, shared at {rate_hz} Hz"),
+            Self::NoDevice => f.write_str("no device"),
+        }
+    }
+}
+
+impl SoundOutput {
+    fn read(text: &str) -> Option<Self> {
+        if let Some(rate) = text.strip_prefix("shared at ") {
+            return Some(Self::Shared { rate_hz: number(rate.strip_suffix(" Hz")?)? });
+        }
+        if let Some(exclusive) = text.strip_prefix("exclusive at ") {
+            let (rate, bits) = exclusive.split_once(" Hz, ")?;
+            return Some(Self::Exclusive { rate_hz: number(rate)?, bits: number(bits.strip_suffix(" bit")?)? });
+        }
+        if let Some(rate) = text.strip_prefix("exclusive refused, shared at ") {
+            return Some(Self::ExclusiveRefused { rate_hz: number(rate.strip_suffix(" Hz")?)? });
+        }
+        match text {
+            "unknown" => Some(Self::Unknown),
+            "waiting for exclusive playback" => Some(Self::WaitingForExclusive),
+            "no device" => Some(Self::NoDevice),
+            _ => None,
+        }
+    }
+}
+
+words!(Level { Quiet => "quiet", Normal => "normal", Loud => "loud" });
+words!(LevelBy { Automatic => "automatic", Song => "song", Album => "album" });
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PcDetails {
+    pub music_version: Option<Version>,
+    pub unreachable: bool,
+    pub output: SoundOutput,
+    pub exclusive: bool,
+    pub bitrate_kbps: u32,
+    pub gapless: bool,
+    pub crossfade_ms: u32,
+    pub levelling: Option<(Level, LevelBy)>,
+    pub equaliser: bool,
+    pub mono: bool,
+    pub cache_limit_mb: u32,
+    pub sharing: bool,
+    pub requests: bool,
+    pub library_songs: u64,
+    pub downloads: u64,
+    pub pending: u64,
+}
+
+fn on_off(on: bool) -> &'static str {
+    if on { "on" } else { "off" }
+}
+
+fn read_on_off(value: &str) -> Option<bool> {
+    match value { "on" => Some(true), "off" => Some(false), _ => None }
+}
+
+const MUSIC_VERSION: &str = "Music server version: ";
+
+impl PcDetails {
+    fn write(self, text: &mut String) -> fmt::Result {
+        write!(text, "\n{MUSIC_VERSION}")?;
+        match self.music_version {
+            Some(version) => write!(text, "{version}")?,
+            None => text.push_str("unknown"),
+        }
+        let level = self.levelling.map(|(level, mode)| (level.text(), mode.text()));
+        write!(text,
+            "\nMusic server out of reach: {}\nSound output: {}\nExclusive mode: {}, streaming limit: {} kbps\nGapless: {}, crossfade: {} ms\nLevelling: {}",
+            yes(self.unreachable), self.output, on_off(self.exclusive), self.bitrate_kbps,
+            on_off(self.gapless), self.crossfade_ms, level.map_or("off", |(level, _)| level),
+        )?;
+        if let Some((_, mode)) = level {
+            write!(text, " by {mode}")?;
+        }
+        write!(text,
+            "\nEqualiser: {}, mono: {}\nCache limit: {} MB\nDevice sharing: {}, requests: {}\nLibrary songs: {}, downloaded songs: {}, changes waiting: {}",
+            on_off(self.equaliser), on_off(self.mono), self.cache_limit_mb, on_off(self.sharing),
+            on_off(self.requests), self.library_songs, self.downloads, self.pending,
+        )
+    }
+
+    fn read<'a>(lines: &mut impl Iterator<Item = &'a str>) -> Option<Self> {
+        let mut field = |prefix| lines.next()?.strip_prefix(prefix);
+        let music_version = match field(MUSIC_VERSION)? {
+            "unknown" => None,
+            value => Some(Version::parse(value)?),
+        };
+        let unreachable = read_yes(field("Music server out of reach: ")?)?;
+        let output = SoundOutput::read(field("Sound output: ")?)?;
+        let (exclusive, bitrate) = field("Exclusive mode: ")?.split_once(", streaming limit: ")?;
+        let (gapless, crossfade) = field("Gapless: ")?.split_once(", crossfade: ")?;
+        let levelling = match field("Levelling: ")? {
+            "off" => None,
+            value => {
+                let (level, mode) = value.split_once(" by ")?;
+                Some((Level::read(level)?, LevelBy::read(mode)?))
+            }
+        };
+        let (equaliser, mono) = field("Equaliser: ")?.split_once(", mono: ")?;
+        let cache = field("Cache limit: ")?.strip_suffix(" MB")?;
+        let (sharing, requests) = field("Device sharing: ")?.split_once(", requests: ")?;
+        let (songs, remaining) = field("Library songs: ")?.split_once(", downloaded songs: ")?;
+        let (downloads, pending) = remaining.split_once(", changes waiting: ")?;
+        Some(Self {
+            music_version, unreachable, output, levelling,
+            exclusive: read_on_off(exclusive)?,
+            bitrate_kbps: number(bitrate.strip_suffix(" kbps")?)?,
+            gapless: read_on_off(gapless)?,
+            crossfade_ms: number(crossfade.strip_suffix(" ms")?)?,
+            equaliser: read_on_off(equaliser)?,
+            mono: read_on_off(mono)?,
+            cache_limit_mb: number(cache)?,
+            sharing: read_on_off(sharing)?,
+            requests: read_on_off(requests)?,
+            library_songs: decimal(songs)?,
+            downloads: decimal(downloads)?,
+            pending: decimal(pending)?,
+        })
+    }
+}
+
+/// A numeric triplet, optionally followed by Navidrome's parenthesized build label.
+/// The label is discarded, including when it was filled with private text.
+pub fn music_version(value: &str) -> Option<Version> {
+    let version = value.strip_suffix(')')
+        .and_then(|value| value.split_once(" ("))
+        .map_or(value, |(version, _)| version);
+    Version::parse(version)
 }
 
 words!(Reach {
@@ -776,10 +929,20 @@ impl Report {
         {
             return Err(Wrong::Field);
         }
-        write!(text,
-            "Nexus Music {} on {device} (OS {})\nSigned in: {}\nHTTPS: {}\nOffline: {}\nLocal network permission: {}\nAndroid Auto: {}\n{LINE_FULL}{}\n{FILES_FULL}{}\n{REFUSED_FOR_GOOD}{}\n\n{HEADING}",
-            a.version, a.os, yes(a.signed_in), yes(a.https), yes(a.offline), maybe(a.local_permission), maybe(a.android_auto), a.loss.line_full, a.loss.files_full, a.loss.refused,
-        ).map_err(|_| Wrong::Form)?;
+        if a.device == DeviceKind::Phone && a.pc.is_some() {
+            return Err(Wrong::Field);
+        }
+        write!(text, "Nexus Music {} on {device} (OS {})\nSigned in: {}\nHTTPS: {}\nOffline: {}",
+            a.version, a.os, yes(a.signed_in), yes(a.https), yes(a.offline)).map_err(|_| Wrong::Form)?;
+        if a.device == DeviceKind::Phone {
+            write!(text, "\nLocal network permission: {}\nAndroid Auto: {}",
+                maybe(a.local_permission), maybe(a.android_auto)).map_err(|_| Wrong::Form)?;
+        }
+        if let Some(pc) = a.pc {
+            pc.write(&mut text).map_err(|_| Wrong::Form)?;
+        }
+        write!(text, "\n{LINE_FULL}{}\n{FILES_FULL}{}\n{REFUSED_FOR_GOOD}{}\n\n{HEADING}",
+            a.loss.line_full, a.loss.files_full, a.loss.refused).map_err(|_| Wrong::Form)?;
         if self.record.entries.is_empty() {
             write!(text, "\n{EMPTY}").map_err(|_| Wrong::Form)?;
         }
@@ -819,27 +982,35 @@ impl Report {
     }
 
     fn parse(text: &str) -> Option<Self> {
-        let mut lines = text.split('\n');
-        let (version, rest) = lines
-            .next()?
-            .strip_prefix("Nexus Music ")?
-            .split_once(" on ")?;
+        let mut lines = text.split('\n').peekable();
+        let (version, rest) = lines.next()?.strip_prefix("Nexus Music ")?.split_once(" on ")?;
         let (device, os) = rest.strip_suffix(')')?.split_once(" (OS ")?;
+        let device = match device {
+            "PC" => DeviceKind::Pc,
+            "phone" => DeviceKind::Phone,
+            _ => return None,
+        };
+        let signed_in = read_yes(lines.next()?.strip_prefix("Signed in: ")?)?;
+        let https = read_yes(lines.next()?.strip_prefix("HTTPS: ")?)?;
+        let offline = read_yes(lines.next()?.strip_prefix("Offline: ")?)?;
+        let (local_permission, android_auto) = if device == DeviceKind::Phone {
+            (
+                read_maybe(lines.next()?.strip_prefix("Local network permission: ")?)?,
+                read_maybe(lines.next()?.strip_prefix("Android Auto: ")?)?,
+            )
+        } else {
+            (None, None)
+        };
+        let pc = if device == DeviceKind::Pc && lines.peek()?.starts_with(MUSIC_VERSION) {
+            Some(PcDetails::read(&mut lines)?)
+        } else {
+            None
+        };
         let about = About {
             version: Version::parse(version)?,
-            device: match device {
-                "PC" => DeviceKind::Pc,
-                "phone" => DeviceKind::Phone,
-                _ => return None,
-            },
+            device,
             os: Version::parse(os)?,
-            signed_in: read_yes(lines.next()?.strip_prefix("Signed in: ")?)?,
-            https: read_yes(lines.next()?.strip_prefix("HTTPS: ")?)?,
-            offline: read_yes(lines.next()?.strip_prefix("Offline: ")?)?,
-            local_permission: read_maybe(
-                lines.next()?.strip_prefix("Local network permission: ")?,
-            )?,
-            android_auto: read_maybe(lines.next()?.strip_prefix("Android Auto: ")?)?,
+            signed_in, https, offline, local_permission, android_auto, pc,
             loss: LossCounts {
                 line_full: decimal(lines.next()?.strip_prefix(LINE_FULL)?)?,
                 files_full: decimal(lines.next()?.strip_prefix(FILES_FULL)?)?,

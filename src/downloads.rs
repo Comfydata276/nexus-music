@@ -304,6 +304,10 @@ impl Downloads {
         self.jobs.iter().map(|job| job.song.clone()).chain(self.entries.iter().rev().map(|e| e.song.clone())).collect()
     }
 
+    pub fn downloaded_count(&self) -> usize {
+        self.entries.len()
+    }
+
     fn total_bytes(&self) -> u64 {
         self.entries.iter().map(|e| e.bytes).sum()
     }

@@ -35,6 +35,7 @@ const REFUSED: Line = Line::Note(Note::OtherControllerRefused);
 fn report(record: Record) -> Report {
     Report {
         about: About {
+            pc: None,
             version: Version::parse("0.6.1").unwrap(),
             device: DeviceKind::Phone,
             os: Version::parse("17.0.0").unwrap(),
@@ -568,4 +569,48 @@ fn a_panic_location_carries_only_the_known_basename_and_line() {
     assert!(!text.contains("ExampleLocal"));
     assert_eq!(clean_line(&text), Some(line));
     assert_eq!(clean_line("Fault in app: panic at C:/Users/ExampleLocal/controller.rs:728"), None);
+}
+
+#[test]
+fn pc_report_round_trips_closed_output_and_settings_without_phone_fields() {
+    let mut report = report(Record::default());
+    report.about.device = DeviceKind::Pc;
+    report.about.android_auto = None;
+    report.about.local_permission = None;
+    for output in [
+        SoundOutput::Unknown,
+        SoundOutput::WaitingForExclusive,
+        SoundOutput::Shared { rate_hz: 48_000 },
+        SoundOutput::Exclusive { rate_hz: 44_100, bits: 24 },
+        SoundOutput::ExclusiveRefused { rate_hz: 48_000 },
+        SoundOutput::NoDevice,
+    ] {
+        report.about.pc = Some(PcDetails {
+            music_version: music_version("0.60.2 (C:\\Users\\Example unicode 岬 private@example.invalid)"),
+            unreachable: true,
+            output,
+            exclusive: true,
+            bitrate_kbps: 128,
+            gapless: true,
+            crossfade_ms: 2_500,
+            levelling: Some((Level::Quiet, LevelBy::Album)),
+            equaliser: true,
+            mono: false,
+            cache_limit_mb: 2048,
+            sharing: false,
+            requests: true,
+            library_songs: 500,
+            downloads: 15,
+            pending: 2,
+        });
+        let text = report.text().unwrap();
+        assert_eq!(Report::read(&text).unwrap(), report);
+        assert!(text.contains("Music server version: 0.60.2"));
+        for raw in ["Example", "private@", "Local network permission", "Android Auto"] {
+            assert!(!text.contains(raw), "{text}");
+        }
+        assert!(Report::read(&text.replace("Music server version: 0.60.2", "Music server version: 0.60.2 device-name")).is_err());
+    }
+    assert_eq!(music_version("https://1.2.3.example.invalid"), None);
+    assert_eq!(music_version("1.2.3 token"), None);
 }

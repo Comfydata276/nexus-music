@@ -1359,9 +1359,7 @@ impl Controller {
         let app = self.ui.global::<ui::App>();
         app.set_server(client.server().into());
         app.set_username(client.username().into());
-        if let Some(version) = version {
-            app.set_server_version(version.into());
-        }
+        app.set_server_version(version.unwrap_or_default().into());
         // Offline mode holds for whichever way this sign-in came: restored at start-up, or
         // typed in after signing out with it on. (Before the warm-up: nothing is sent.)
         client.set_offline(self.settings.borrow().offline);

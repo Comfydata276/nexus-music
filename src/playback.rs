@@ -1312,7 +1312,8 @@ impl Controller {
                     player.set_track(track);
                 }
             }
-            Event::Output { status, exclusive } => {
+            Event::Output { status, exclusive, kind } => {
+                crate::diagnostics::note_sound_output(kind);
                 self.ui.global::<ui::Settings>().set_output_status(status.into());
                 self.output_exclusive.set(exclusive);
                 self.show_format();
