@@ -131,6 +131,13 @@ pub fn devices(data: &Connection, account: u64, after: Option<DeviceId>, limit: 
 
 /// The fingerprint of every device secret the data has a device for (which lane a sign-in waits
 /// in: `session::Seen`).
+/// Every account's number.
+pub fn account_numbers(data: &Connection) -> rusqlite::Result<Vec<u64>> {
+    let mut statement = data.prepare("SELECT number FROM accounts ORDER BY number")?;
+    let found = statement.query_map([], |row| unsigned(row.get(0)?))?.collect();
+    found
+}
+
 pub fn device_secrets(data: &Connection) -> rusqlite::Result<Vec<[u8; 32]>> {
     let mut statement = data.prepare("SELECT secret FROM devices")?;
     let found = statement.query_map([], |row| bytes32(row, 0))?.collect();

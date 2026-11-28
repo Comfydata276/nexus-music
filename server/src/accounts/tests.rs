@@ -324,3 +324,63 @@ fn a_music_server_that_never_answers_holds_two_checks_at_most_and_sign_in_goes_o
     }
     assert!(started.elapsed() < Duration::from_secs(6), "{:?}", started.elapsed());
 }
+
+/// C1 (the review of S8; the lead's ruling of 15:38), (a) and (b): a sign-out with neither a
+/// session nor a note, a call with a session that does not resolve, and a note whose secret is
+/// not its session's are each answered without waiting for the thread that writes (held busy
+/// here), with the bytes it would have said.
+#[test]
+fn calls_that_are_no_one_s_are_answered_without_the_thread_that_writes() {
+    use std::time::Duration;
+    let (bench, made) = Bench::new("no-one-s", &[("someone@example.test", false)]);
+    let signed = bench::signed_in(&bench.sign_in(bench::with_code(&made[0].code, PASSWORD), 1));
+    let at_once = |answer: super::session::Answer| (answer.status, answer.body.bytes().to_vec());
+    // The answers with the thread free, to compare.
+    let nobody = account::Session::from_bytes([0x42; 32]);
+    let list = |session: account::Session| bench.accounts.devices(session, account::ListDevices { head: bench::head(signed.restore), after: None });
+    let neither = || bench.accounts.sign_out(None, SignOut { head: bench::head(signed.restore), request_id: RequestId::new(1).unwrap(), revoke: None });
+    let forged = SignOutNote { session: signed.sign_out.session, secret: SignOutSecret::from_bytes([0x5a; 32]) };
+    let note = |note: SignOutNote| bench.accounts.sign_out(None, SignOut { head: bench::head(signed.restore), request_id: RequestId::new(2).unwrap(), revoke: Some(note) });
+    let expected = at_once(bench.runtime.block_on(list(account::Session::from_bytes([0x42; 32]))));
+    assert_eq!(expected.0, 401);
+    // The thread that writes, held.
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let accounts = bench.accounts.clone();
+    let holding = bench.runtime.spawn(async move { accounts.desk.ask(move |_| held.recv().ok()).await });
+    std::thread::sleep(Duration::from_millis(50));
+    bench.runtime.block_on(async {
+        let within = Duration::from_millis(500);
+        let gone = tokio::time::timeout(within, list(nobody)).await.expect("a session that does not resolve waited for the thread that writes");
+        assert_eq!(at_once(gone), expected);
+        let none = tokio::time::timeout(within, neither()).await.expect("a sign-out with neither waited for the thread that writes");
+        assert_eq!(at_once(none), expected);
+        let forged = tokio::time::timeout(within, note(forged)).await.expect("a forged note waited for the thread that writes");
+        assert_eq!(at_once(forged), expected);
+    });
+    release.send(()).unwrap();
+    bench.runtime.block_on(holding).unwrap().unwrap();
+    // The live session, and its right note, still work.
+    assert_eq!(bench.runtime.block_on(list(account::Session::from_bytes(*signed.session.expose_bytes()))).status, 200);
+    assert_eq!(at_once(bench.runtime.block_on(note(signed.sign_out))), expected);
+    assert_eq!(bench.runtime.block_on(list(signed.session)).status, 401, "the right note did not end its session");
+}
+
+/// C1 (d): a device is "known" (the protected lane, a reserved slot) only to the account it
+/// signed in to, and no longer once it is forced out; it is known again when it signs in.
+#[test]
+fn a_device_is_known_to_its_own_account_and_not_once_forced_out() {
+    let (bench, made) = Bench::new("known", &[("first@example.test", false), ("second@example.test", false)]);
+    let one = bench::signed_in(&bench.sign_in(bench::with_code(&made[0].code, PASSWORD), 1));
+    let two = bench::signed_in(&bench.sign_in(bench::with_password(made[0].email, PASSWORD), 2));
+    let email = |n: usize| account::Email::new(made[n].email).unwrap();
+    let secret = |device: u8| account::DeviceSecret::from_bytes([device; 32]);
+    let admission = &bench.accounts.admission;
+    assert!(admission.known_device(&email(0), &secret(1)) && admission.known_device(&email(0), &secret(2)));
+    assert!(!admission.known_device(&email(1), &secret(1)), "a device known to one account was known to another");
+    let force = account::ForceOut { head: bench::head(one.restore), device: two.device, session: two.session_id };
+    assert_eq!(bench.runtime.block_on(bench.accounts.force_out(one.session, force)).status, 200);
+    assert!(!admission.known_device(&email(0), &secret(2)), "a device forced out was still known");
+    assert!(admission.known_device(&email(0), &secret(1)));
+    bench::signed_in(&bench.sign_in(bench::with_password(made[0].email, PASSWORD), 2));
+    assert!(admission.known_device(&email(0), &secret(2)));
+}

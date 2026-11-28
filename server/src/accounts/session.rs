@@ -25,6 +25,7 @@ use nexus_core::nexus::account::{
 use nexus_core::nexus::kept::{Access, Account, AccountState, Bearer, Denied, Effects, Fingerprint, FreshSession, GrantIntent, GrantUse, LeaveFor, PasswordCheck, SessionKind, SessionTarget};
 use nexus_core::nexus::proto::{BackendId, SPEAKS, Speaks};
 
+use super::admit::{Admission, Live};
 use super::check::{Checked, PasswordWorkers};
 use super::desk::{Busy, Desk, Lane};
 use super::rows;
@@ -50,33 +51,11 @@ pub struct Accounts {
     pub set_up_code: SetUpCode,
     pub clock: Clock,
     pub backend: BackendId,
-    /// The devices this backend has seen, by their secret's fingerprint: which lane of the line
-    /// a sign-in's first step waits in (the review of S8, C1).
-    pub seen: Arc<Seen>,
+    /// The cheap read path and the devices each account knows: where a request may wait, looked
+    /// up before any slow work (the review of S8, C1; [`super::admit`]).
+    pub admission: Arc<Admission>,
     /// The music server as the backend reaches it (S9).
     pub music: super::music::MusicSide,
-}
-
-/// The fingerprints of every device secret the data has had a device for, read at the start and
-/// added to at each sign-in. Only which lane a sign-in waits in is chosen by it; kept still says
-/// which door it goes through. A device secret is 32 random bytes, so a stranger cannot be in it.
-#[derive(Default)]
-pub struct Seen(std::sync::RwLock<std::collections::HashSet<[u8; 32]>>);
-
-impl Seen {
-    pub fn new(prints: impl IntoIterator<Item = [u8; 32]>) -> Self {
-        Seen(std::sync::RwLock::new(prints.into_iter().collect()))
-    }
-
-    fn has(&self, print: &[u8; 32]) -> bool {
-        self.0.read().is_ok_and(|seen| seen.contains(print))
-    }
-
-    fn add(&self, print: [u8; 32]) {
-        if let Ok(mut seen) = self.0.write() {
-            seen.insert(print);
-        }
-    }
 }
 
 /// An answer: its status, and its body (C7's shapes, encoded).
@@ -250,8 +229,8 @@ impl Accounts {
     async fn with_password(&self, email: Email, password: Password, secret: DeviceSecret, described: Described) -> Result<Answer, Refusal> {
         let clock = self.clock.clone();
         let (asked, secret_for_check) = (email.clone(), secret.clone());
-        // A device this backend has never seen waits in the strangers' lane (C1).
-        let lane = if self.seen.has(Fingerprint::of(secret.expose_bytes()).as_bytes()) { Lane::Kept } else { Lane::Stranger };
+        // A device the named account does not know now waits in the strangers' lane (C1).
+        let lane = if self.admission.known_device(&email, &secret) { Lane::Kept } else { Lane::Stranger };
         // (1) On the thread that writes: kept's check, bound to the account and device as they are.
         let prepared = self
             .desk
@@ -320,7 +299,7 @@ impl Accounts {
         }
         // (3) On the thread that writes: the sign-in, made in the one step that looks again.
         let clock = self.clock.clone();
-        let seen = self.seen.clone();
+        let admission = self.admission.clone();
         let internal = self.music.internal.clone();
         self.desk
             .ask(move |keeper| {
@@ -331,7 +310,7 @@ impl Accounts {
                     extra_passwords.push(replacement);
                 }
                 let kind = described.kind_of_session();
-                finish_sign_in(keeper, &seen, &internal, prepared.number, prepared.device, &secret, &described, &extra_passwords, now, |turn, fresh, previous| turn.sign_in_as(kind, receipt, fresh, previous))
+                finish_sign_in(keeper, &admission, &internal, prepared.number, prepared.device, &secret, &described, &extra_passwords, now, |turn, fresh, previous| turn.sign_in_as(kind, receipt, fresh, previous))
             })
             .await?
     }
@@ -384,7 +363,7 @@ impl Accounts {
         // lead's ruling of 14:06; a stranger at the other door cannot stop it).
         let stored = self.workers.fingerprint(&email, PasswordDoor::RedeemedCode, None, new_password).await?;
         let clock = self.clock.clone();
-        let seen = self.seen.clone();
+        let admission = self.admission.clone();
         let internal = self.music.internal.clone();
         // (3) On the thread that writes: the receipt taken at (1) consumed against the account
         // loaded afresh, and the code spent, in the one step.
@@ -393,7 +372,7 @@ impl Accounts {
                 let now = clock();
                 let receipt = check.check(print, keeper.clock(now)).map_err(said)?;
                 let verifier = Fingerprint::from_bytes(stored.hash);
-                finish_sign_in(keeper, &seen, &internal, number, device, &secret, &described, std::slice::from_ref(&stored), now, |turn, fresh, previous| {
+                finish_sign_in(keeper, &admission, &internal, number, device, &secret, &described, std::slice::from_ref(&stored), now, |turn, fresh, previous| {
                     turn.redeem_code_as(described.kind_of_session(), receipt, verifier, fresh, previous)
                 })
             })
@@ -446,8 +425,27 @@ impl Accounts {
     }
 
     /// Section 11, 8.7: signing out on this session, or with the note that can end it and do
-    /// nothing else (and needs no session).
+    /// nothing else (and needs no session). **Before the thread that writes** (the review of S8,
+    /// C1): with neither, refused at once; a session not found live on the cheap read path is
+    /// told so at once; a note whose secret is not its session's is "that session has ended" at
+    /// once, the same bytes as when the thread finds it so.
     pub async fn sign_out(&self, bearer: Option<account::Session>, request: SignOut) -> Answer {
+        match (&request.revoke, &bearer) {
+            (None, None) => return refused(ended()),
+            (Some(note), _) => {
+                if !speaks_with(&request.head.speaks) {
+                    return refused(incompatible());
+                }
+                if !self.admission.note_matches(note) {
+                    return refused(ended());
+                }
+            }
+            (None, Some(session)) => {
+                if let Err(refusal) = self.live(&request.head, &Fingerprint::of(session.expose_bytes())) {
+                    return refused(refusal);
+                }
+            }
+        }
         let clock = self.clock.clone();
         let done = self
             .desk
@@ -457,13 +455,12 @@ impl Accounts {
                     (Some(note), _) => by_note(keeper, &request.head, note, now),
                     (None, Some(session)) => {
                         let hash = Fingerprint::of(session.expose_bytes());
-                        let (number, device, mut account) = signed_in(keeper, &request.head, &hash)?;
+                        let (_, device, mut account) = signed_in(keeper, &request.head, &hash)?;
                         account
                             .request(request.head.restore, keeper.clock(now), |turn| turn.sign_out(Bearer { device, hash: &hash, grant: None }))
                             .apply(|effects| keeper.persist(effects, &[], now))
                             .map_err(not_dealt_with)?
                             .map_err(said)?;
-                        let _ = number;
                         let receipt = receipt(keeper, account.state())?;
                         Ok(answer!(Reply::Done { result: SignedOut {}, receipt }))
                     }
@@ -474,8 +471,26 @@ impl Accounts {
         flatten(done)
     }
 
+    /// C1 (the review of S8; the lead's ruling of 15:38): a session shown is looked up on the
+    /// cheap read path first, and only one found there goes on to the thread that writes (which
+    /// judges it as before). In the order the thread would say it: a version in common, the
+    /// restore number, the session.
+    pub(crate) fn live(&self, head: &RequestHead, hash: &Fingerprint) -> Result<(), Refusal> {
+        if !speaks_with(&head.speaks) {
+            return Err(incompatible());
+        }
+        match self.admission.live(head.restore, hash) {
+            Live::Yes => Ok(()),
+            Live::PutBack => Err(Refusal::NotSignedIn(NotSignedIn::DataPutBack)),
+            Live::Ended => Err(ended()),
+        }
+    }
+
     /// 8.7: the list of a person's devices, each with the id of its session.
     pub async fn devices(&self, bearer: account::Session, request: ListDevices) -> Answer {
+        if let Err(refusal) = self.live(&request.head, &Fingerprint::of(bearer.expose_bytes())) {
+            return refused(refusal);
+        }
         let clock = self.clock.clone();
         let done = self
             .desk
@@ -508,19 +523,30 @@ impl Accounts {
     /// 8.7: forcing one of one's own other devices out, by the session it names. Sent again
     /// after that device has signed in afresh, it ends nothing. Needs no grant (8.8).
     pub async fn force_out(&self, bearer: account::Session, request: ForceOut) -> Answer {
+        if let Err(refusal) = self.live(&request.head, &Fingerprint::of(bearer.expose_bytes())) {
+            return refused(refusal);
+        }
         let clock = self.clock.clone();
+        let admission = self.admission.clone();
         let done = self
             .desk
             .ask(move |keeper| -> Result<Answer, Refusal> {
                 let now = clock();
                 let hash = Fingerprint::of(bearer.expose_bytes());
-                let (_, device, mut account) = signed_in(keeper, &request.head, &hash)?;
+                let (number, device, mut account) = signed_in(keeper, &request.head, &hash)?;
                 let target = SessionTarget { device: request.device, session: request.session };
                 account
                     .request(request.head.restore, keeper.clock(now), |turn| turn.force_out(Bearer { device, hash: &hash, grant: None }, target))
                     .apply(|effects| keeper.persist(effects, &[], now))
                     .map_err(not_dealt_with)?
                     .map_err(said)?;
+                // A device forced out is not known to its account until it signs in again (kept's
+                // `known`): nor is it here (C1).
+                if account.apart().devices.get(&target.device).is_some_and(|forced| !forced.known)
+                    && let Some(row) = account.rows().devices.get(&target.device)
+                {
+                    admission.seen.remove(number, row.secret.as_bytes());
+                }
                 heard(keeper, device, now);
                 let receipt = receipt(keeper, account.state())?;
                 // Forcing a device out does not change its music login (9.5).
@@ -533,6 +559,9 @@ impl Accounts {
     /// 9.4: the music login for this device, a salt made now and its token, or why there is
     /// none. `page`: the call came from the admin's page, which is never handed one (7.3).
     pub async fn music_login(&self, bearer: account::Session, head: RequestHead, page: bool) -> Answer {
+        if let Err(refusal) = self.live(&head, &Fingerprint::of(bearer.expose_bytes())) {
+            return refused(refusal);
+        }
         let clock = self.clock.clone();
         let internal = self.music.internal.clone();
         let done = self
@@ -571,8 +600,9 @@ impl Accounts {
         if current_password == new_password {
             return Err(Refusal::Malformed);
         }
-        let clock = self.clock.clone();
         let hash = Fingerprint::of(bearer.expose_bytes());
+        self.live(&head, &hash)?;
+        let clock = self.clock.clone();
         let (number, device, email, check, stored) = {
             let hash = hash.clone();
             let head = RequestHead { speaks: head.speaks, restore: head.restore };
@@ -702,7 +732,7 @@ fn by_note(keeper: &mut Keeper, head: &RequestHead, note: SignOutNote, now: u64)
 #[allow(clippy::too_many_arguments)]
 fn finish_sign_in(
     keeper: &mut Keeper,
-    seen: &Seen,
+    admission: &Admission,
     internal: &str,
     number: u64,
     device: DeviceId,
@@ -737,7 +767,7 @@ fn finish_sign_in(
         return Err(Refusal::NotDealtWith);
     }
     heard(keeper, device, now);
-    seen.add(*print.as_bytes());
+    admission.seen.add(number, *print.as_bytes());
     let state = account.state().clone();
     let shown = rows::shown(keeper.data().connection(), number).map_err(not_dealt_with)?.and_then(|shown| Name::new(&shown));
     let name = shown.unwrap_or_else(|| Name::new("You").expect("a fixed name is a name"));

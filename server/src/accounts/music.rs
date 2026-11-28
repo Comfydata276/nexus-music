@@ -187,6 +187,19 @@ pub fn hand(keeper: &Keeper, number: u64, state: &AccountState, kind: SessionKin
 }
 
 impl Accounts {
+    /// C1 (the review of S8; the lead's ruling of 15:38): an admin's call has its session looked
+    /// up on the cheap read path first; only one found there goes on to the thread that writes.
+    fn admin_live(&self, speaks: &nexus_core::nexus::proto::Speaks, restore: u64, hash: &Fingerprint) -> Result<(), Refusal> {
+        if !speaks_with(speaks) {
+            return Err(Refusal::Malformed);
+        }
+        match self.admission.live(restore, hash) {
+            super::admit::Live::Yes => Ok(()),
+            super::admit::Live::PutBack => Err(Refusal::NotSignedIn(account::NotSignedIn::DataPutBack)),
+            super::admit::Live::Ended => Err(Refusal::NotSignedIn(account::NotSignedIn::SessionEnded)),
+        }
+    }
+
     /// 8.8: a grant for one named admin change, for the password typed again: checked at this
     /// device's own door, under its waits, as a password change's is. `kept` gives it, bound to
     /// who asked, the change, the exact thing it is done to, that thing's revision and the
@@ -201,6 +214,7 @@ impl Accounts {
     async fn granting(&self, bearer: account::Session, request: RequestGrant) -> Result<Answer, Refusal> {
         let account::GrantRequest { head, change, password } = request;
         let hash = Fingerprint::of(bearer.expose_bytes());
+        self.admin_live(&head.speaks, head.restore, &hash)?;
         let clock = self.clock.clone();
         let (number, device, email, check, stored) = {
             let hash = hash.clone();
@@ -265,9 +279,10 @@ impl Accounts {
 
     async fn setting_music_login(&self, bearer: account::Session, request: SetMusicLogin) -> Result<Answer, Refusal> {
         let account::GrantedChange { head, request_id, change, grant } = request;
+        let hash = Fingerprint::of(bearer.expose_bytes());
+        self.admin_live(&head.speaks, head.restore, &hash)?;
         // S9-3: at most CHECKS_AT_ONCE under way; one more is "busy" at once, its grant unspent.
         let _checking = self.music.checks.clone().try_acquire_owned().map_err(|_| busy())?;
-        let hash = Fingerprint::of(bearer.expose_bytes());
         let again = RequestHead { speaks: head.speaks, restore: head.restore };
         let clock = self.clock.clone();
         let target_id = change.account;
@@ -378,6 +393,9 @@ impl Accounts {
     pub async fn set_music_server(&self, bearer: account::Session, request: SetMusicServer) -> Answer {
         let account::GrantedChange { head, request_id, change, grant } = request;
         let hash = Fingerprint::of(bearer.expose_bytes());
+        if let Err(refusal) = self.admin_live(&head.speaks, head.restore, &hash) {
+            return refused(refusal);
+        }
         let clock = self.clock.clone();
         let done = self
             .desk
@@ -400,6 +418,9 @@ impl Accounts {
     /// the container's (`NEXUS_MUSIC_SERVER`) and the one people use, if set. An admin's read.
     pub async fn get_music_server(&self, bearer: account::Session, request: GetMusicServer) -> Answer {
         let hash = Fingerprint::of(bearer.expose_bytes());
+        if let Err(refusal) = self.admin_live(&request.head.speaks, request.head.restore, &hash) {
+            return refused(refusal);
+        }
         let clock = self.clock.clone();
         let internal = self.music.internal.clone();
         let done = self
