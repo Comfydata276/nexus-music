@@ -623,7 +623,7 @@ fn authenticated_loopback_requests_keep_order_and_ownership_and_survive_the_clie
 
     // The connection that received Begun is closed. The work and its poll
     // receipt belong to the server and finish without that connection.
-    assert_eq!(server.done(&first, job), Completed::Requested);
+    assert_eq!(server.done(&first, job), Completed::Requested { placed: true });
     assert_eq!(begun(server.call(&first, begin(1, change.clone()))), job);
     assert_eq!(lidarr.take_calls(), [
         "GET album/lookup?term=Glass%20Orchard",
@@ -662,7 +662,7 @@ fn authenticated_loopback_requests_keep_order_and_ownership_and_survive_the_clie
 
     server.offer(&other);
     let coowned = begun(server.call(&other, begin(2, change)));
-    assert_eq!(server.done(&other, coowned), Completed::Requested);
+    assert_eq!(server.done(&other, coowned), Completed::Requested { placed: false });
     let read = wire::write_attribution(&wire::AttributionRead {
         head: RequestHead { speaks: SPEAKS, restore: admin.restore }, after: None,
     }).unwrap();
@@ -697,7 +697,7 @@ fn a_member_can_complete_the_full_walk_using_the_page_configured_key() {
     let other = server.redeem(other, 3, "");
     let offer = server.offer(&member);
     let job = begun(server.call(&member, begin(1, Change::Request { offer })));
-    assert_eq!(server.done(&member, job), Completed::Requested);
+    assert_eq!(server.done(&member, job), Completed::Requested { placed: true });
     let Answer::Pending { albums, .. } = server.call(&member, Call::Pending { after: None }) else {
         panic!("the member could not read pending requests");
     };
@@ -712,6 +712,29 @@ fn a_member_can_complete_the_full_walk_using_the_page_configured_key() {
     assert_eq!(server.done(&member, job), Completed::Cancelled);
     assert!(matches!(server.call(&member, Call::Pending { after: None }),
         Answer::Pending { albums, .. } if albums.is_empty()));
+}
+
+#[test]
+fn asking_for_an_already_monitored_album_does_not_grant_removal() {
+    let lidarr = MockLidarr::start();
+    lock(&lidarr.state).monitored = true;
+    let (server, [admin, member, _]) = TestServer::start("existing-album", Some(endpoint(lidarr.address)));
+    let admin = server.redeem(admin, 1, TEST_PAGE);
+    server.configure(&admin);
+    let member = server.redeem(member, 2, "");
+    let offer = server.offer(&member);
+    let job = begun(server.call(&member, begin(1, Change::Request { offer })));
+    assert_eq!(server.done(&member, job), Completed::Requested { placed: false });
+    assert!(matches!(server.call(&member, Call::AskedHistory { after: None }),
+        Answer::AskedHistory { rows, .. } if rows.len() == 1 && rows[0].release.as_str() == ALBUM));
+    assert!(matches!(server.call(&member, Call::Pending { after: None }),
+        Answer::Pending { albums, .. } if albums.len() == 1 && !albums[0].removable));
+    assert!(matches!(server.call(&member, begin(2, cancelled())),
+        Answer::Refused { reason: Refusal::NotAllowed }));
+    assert!(lock(&lidarr.state).monitored);
+    assert!(!lidarr.take_calls().iter().any(|call| call.starts_with("PUT ") || call.starts_with("POST ")));
+    let job = begun(server.call(&admin, begin(1, cancelled())));
+    assert_eq!(server.done(&admin, job), Completed::Cancelled);
 }
 
 #[test]
@@ -885,7 +908,7 @@ fn restart_sees_the_begun_job_through_without_accepting_it_twice() {
     server.kill_child();
     lidarr.hold_response(None);
     server.launch(lidarr.address);
-    assert_eq!(server.done(&member, job), Completed::Requested);
+    assert_eq!(server.done(&member, job), Completed::Requested { placed: true });
     assert_eq!(begun(server.call(&member, begin(1, change))), job);
     let calls = lidarr.take_calls();
     assert_eq!(calls.iter().filter(|&line| line == "PUT album/monitor").count(), 1);
@@ -907,7 +930,7 @@ fn restart_after_lidarr_took_the_search_does_not_send_the_command_again() {
     server.kill_child();
     lidarr.hold_response(None);
     server.launch(lidarr.address);
-    assert_eq!(server.done(&member, job), Completed::Requested);
+    assert_eq!(server.done(&member, job), Completed::Requested { placed: true });
     assert_eq!(begun(server.call(&member, begin(1, change))), job);
     let calls = lidarr.take_calls();
     assert_eq!(calls.iter().filter(|&line| line == "PUT album/monitor").count(), 1);
@@ -1048,7 +1071,8 @@ fn a_batch_waiting_for_its_device_releases_the_account_and_expires() {
         }
     };
     assert_eq!(server.outcome(&admin, second), Err(Refusal::NoLongerListed));
-    offset.store((wire::RESOLUTION_WAIT_SECONDS + 1) * 1000, Ordering::Relaxed);
+    // Include the keeper's one-minute clock allowance after opening the store.
+    offset.store((wire::RESOLUTION_WAIT_SECONDS + 61) * 1000, Ordering::Relaxed);
     assert!(matches!(server.call(&admin, Call::ResolveBatchLine { job, index: 0, release: MusicBrainzId::new(ALBUM) }),
         Answer::Refused { reason: Refusal::NotAllowed }));
     assert_eq!(server.done(&admin, job), Completed::Batch);

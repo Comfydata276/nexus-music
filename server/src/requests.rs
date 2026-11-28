@@ -10,7 +10,7 @@ use axum::http::{HeaderValue, Method, Request};
 use http_body_util::{BodyExt, Full, Limited};
 use hyper_util::rt::TokioIo;
 use nexus_core::{bulk, http};
-use nexus_core::lidarr::{self, Lidarr};
+use nexus_core::lidarr::{self, AlbumPlacement, Lidarr, PlacementRecovery};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::runtime::Handle;
@@ -773,6 +773,8 @@ struct Plan {
     #[serde(default)]
     added_artist: Option<lidarr::AddedArtist>,
     #[serde(default)]
+    placements: Vec<AlbumPlacement>,
+    #[serde(default)]
     prepared_batch: Option<Vec<u8>>,
 }
 
@@ -789,7 +791,7 @@ impl Plan {
         let now = seconds(actor.now);
         let mut plan = Self {
             binding, revision, artist: None, offers: Vec::new(), listed: Vec::new(), added_artist: None,
-            prepared_batch: None,
+            placements: Vec::new(), prepared_batch: None,
         };
         match change {
             Change::Request { offer } | Change::ListSingles { offer, .. } => {
@@ -1004,13 +1006,14 @@ fn batch_lines(db: &Connection, actor: Actor, job: JobId) -> Result<Answer, Refu
             let mut projected = BatchLineView::from_indexed(line).map_err(|_| Refusal::NotDealtWith)?;
             if let Some(progress @ BatchLineProgress::Failed { .. }) = stored.remove(&projected.index) {
                 projected.progress = progress;
+                projected.placed = false;
             }
             rows.push(projected);
         }
         rows
     } else {
         (0..input.len() as u16).map(|index| BatchLineView {
-            index, progress: stored.remove(&index).unwrap_or(BatchLineProgress::Waiting),
+            index, placed: false, progress: stored.remove(&index).unwrap_or(BatchLineProgress::Waiting),
         }).collect()
     };
     Ok(Answer::BatchLines { lines: saved, next: None })
@@ -1178,25 +1181,28 @@ fn owners(
     binding: &[u8; 32],
     account: AccountId,
     releases: &[&str],
-) -> Result<HashMap<String, Vec<AccountId>>, Refusal> {
+) -> Result<HashMap<String, Vec<(AccountId, bool)>>, Refusal> {
     if releases.is_empty() {
         return Ok(HashMap::new());
     }
     let releases = serde_json::to_string(releases).map_err(|_| Refusal::NotDealtWith)?;
     let mut select = db.prepare(
         "SELECT DISTINCT value,
-            (SELECT account FROM requests_owners WHERE binding = ?2 AND release = value AND account = ?3),
+            (SELECT COALESCE(json_extract(CAST(metadata AS TEXT), '$.placed'), 0)
+             FROM requests_owners WHERE binding = ?2 AND release = value AND account = ?3),
             (SELECT account FROM requests_owners WHERE binding = ?2 AND release = value AND account <> ?3 LIMIT 1)
          FROM json_each(?1)",
     ).map_err(sql_error)?;
     let rows = select.query_map(params![releases, binding.as_slice(), sql(account.get())?], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?, row.get::<_, Option<i64>>(2)?))
+        Ok((row.get::<_, String>(0)?, row.get::<_, Option<bool>>(1)?, row.get::<_, Option<i64>>(2)?))
     }).map_err(sql_error)?;
     let mut found = HashMap::new();
     for row in rows {
         let (release, mine, other) = row.map_err(sql_error)?;
-        let requesters: Vec<_> = [mine, other].into_iter().flatten()
-            .filter_map(|number| u64::try_from(number).ok().and_then(AccountId::new)).collect();
+        // The shared rule needs our placement and whether any other account asked.
+        let other = other.and_then(|number| u64::try_from(number).ok().and_then(AccountId::new));
+        let requesters: Vec<_> = mine.map(|placed| (account, placed)).into_iter()
+            .chain(other.map(|id| (id, false))).collect();
         if !requesters.is_empty() {
             found.insert(release, requesters);
         }
@@ -1210,8 +1216,8 @@ fn owner_view(
     actor: Actor,
     found: &mut Answer,
 ) -> Result<(), Refusal> {
-    let mine = |known: &HashMap<String, Vec<AccountId>>, release: &MusicBrainzId| {
-        known.get(release.as_str()).is_some_and(|requesters| requesters.contains(&actor.account))
+    let mine = |known: &HashMap<String, Vec<(AccountId, bool)>>, release: &MusicBrainzId| {
+        known.get(release.as_str()).is_some_and(|requesters| requesters.iter().any(|&(id, _)| id == actor.account))
     };
     match found {
         Answer::Pending { albums, .. } => {
@@ -1219,7 +1225,7 @@ fn owner_view(
             albums.retain_mut(|album| {
                 let requesters = known.get(album.album.as_str()).map(Vec::as_slice).unwrap_or_default();
                 album.removable = wire::may_cancel(wire::RequestsAccess::On, actor.account, actor.admin, requesters).is_ok();
-                actor.admin || requesters.contains(&actor.account)
+                actor.admin || requesters.iter().any(|&(id, _)| id == actor.account)
             });
         }
         Answer::FoundReleases { albums, .. } | Answer::FoundAny { albums, .. } if !actor.admin => {
@@ -1568,7 +1574,7 @@ fn finish_job(
     now: u64,
     row: i64,
     result: &JobResult,
-    adds: &[AskedRelease],
+    adds: &[RecordedAsk],
     ownership: Option<([u8; 32], AccountId, Option<MusicBrainzId>)>,
 ) -> Result<(), Refusal> {
     let text = serde_json::to_string(result).map_err(|_| Refusal::NotDealtWith)?;
@@ -1591,15 +1597,35 @@ fn finish_job(
     }).map_err(|_| Refusal::NotDealtWith)
 }
 
-fn keep_owner(db: &Connection, binding: &[u8; 32], account: AccountId, asked: &AskedRelease, now: u64) -> rusqlite::Result<()> {
-    let mut row = asked.clone();
-    row.asked_ms = now;
+#[derive(Clone, Serialize)]
+struct RecordedAsk {
+    #[serde(flatten)]
+    asked: AskedRelease,
+    placed: bool,
+}
+
+fn keep_owner(db: &Connection, binding: &[u8; 32], account: AccountId, ask: &RecordedAsk, now: u64) -> rusqlite::Result<()> {
+    let mut row = ask.clone();
+    row.asked.asked_ms = now;
     let metadata = serde_json::to_vec(&row).map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
     db.execute(
-        "INSERT OR IGNORE INTO requests_owners (binding, account, release, asked_ms, metadata)
-         SELECT ?1, number, ?2, ?3, ?4 FROM accounts WHERE number = ?5",
-        params![binding.as_slice(), row.release.as_str(), events::sql(now)?, metadata, events::sql(account.get())?],
+        "INSERT INTO requests_owners (binding, account, release, asked_ms, metadata)
+         SELECT ?1, number, ?2, ?3, ?4 FROM accounts WHERE number = ?5
+         ON CONFLICT(binding, account, release) DO UPDATE SET
+            metadata = CAST(json_set(CAST(requests_owners.metadata AS TEXT), '$.placed', json('true')) AS BLOB)
+         WHERE ?6 AND NOT COALESCE(json_extract(CAST(requests_owners.metadata AS TEXT), '$.placed'), 0)",
+        params![binding.as_slice(), row.asked.release.as_str(), events::sql(now)?, metadata,
+            events::sql(account.get())?, row.placed],
     ).map(drop)
+}
+
+fn record_asks(asked: Vec<AskedRelease>, placements: &[AlbumPlacement]) -> Vec<RecordedAsk> {
+    asked.into_iter().map(|asked| {
+        let placed = placements.iter().any(|known| {
+            known.release == asked.release.as_str() && known.artist == asked.artist_id.as_str() && known.newly_placed()
+        });
+        RecordedAsk { asked, placed }
+    }).collect()
 }
 
 fn asked_release(view: &AlbumView) -> Result<AskedRelease, Refusal> {
@@ -1637,6 +1663,17 @@ impl Journal {
             }
             step(keeper, clock(), row)
         })).map_err(|_| Refusal::Busy)?
+    }
+
+    fn keep_placements(&self, observed: &[AlbumPlacement]) -> Result<(), String> {
+        let observed = observed.to_vec();
+        self.ask(move |keeper, now, row| {
+            update_work(keeper, now, row, |plan| {
+                if plan.placements.is_empty() {
+                    plan.placements = observed;
+                }
+            })
+        }).map_err(|_| "Couldn't keep the selected releases before placing them.".to_owned())
     }
 
     fn restore_pending(&self, lidarr: &Lidarr) -> Result<(), Refusal> {
@@ -1697,6 +1734,10 @@ impl lidarr::WayBack for Journal {
         if kept { Ok(true) } else { Err(fail()) }
     }
 
+    fn before_request_album(&self, placement: &AlbumPlacement) -> Result<(), String> {
+        self.keep_placements(std::slice::from_ref(placement))
+    }
+
     fn before_artist_albums(&self, added: &lidarr::AddedArtist) -> Result<(), String> {
         let added = added.clone();
         self.ask(move |keeper, now, row| {
@@ -1715,7 +1756,7 @@ fn endpoint_binding(address: &str) -> [u8; 32] {
     Sha256::digest(address.trim_end_matches('/')).into()
 }
 
-type Changed = (Completed, Vec<AskedRelease>, Option<MusicBrainzId>);
+type Changed = (Completed, Vec<RecordedAsk>, Option<MusicBrainzId>);
 
 fn lidarr_result<T>(value: Result<T, String>, wanted: Option<&Offer>) -> Result<T, Refusal> {
     value.map_err(|why| wire::refusal_for(&why, wanted))
@@ -1725,11 +1766,12 @@ impl Job {
     fn run(&self, journal: &Journal, lidarr: &Lidarr) -> Result<Changed, Refusal> {
         let done = |result| Ok((result, Vec::new(), None));
         match &self.change {
-            Change::Request { offer } => {
+            Change::Request { .. } => {
                 let view = self.plan.offers.first().ok_or(Refusal::SearchAgain)?;
                 let asked = asked_release(view)?;
-                self.request_album(journal, lidarr, &offer.0, &view.clone().into())?;
-                Ok((Completed::Requested, vec![asked], None))
+                let wanted: Offer = view.clone().into();
+                let placed = lidarr_result(lidarr.request_placement(&wanted, journal), Some(&wanted))?;
+                Ok((Completed::Requested { placed }, vec![RecordedAsk { asked, placed }], None))
             }
             Change::AddArtist { artist } => {
                 let name = &self.plan.artist.as_ref().ok_or(Refusal::SearchAgain)?.name;
@@ -1740,21 +1782,28 @@ impl Job {
                 wire::check_add_wanting(artist, selected, &self.plan.offers)?;
                 let offers: Vec<Offer> = self.plan.offers.iter().cloned().map(Offer::from).collect();
                 let asked = self.plan.offers.iter().map(asked_release).collect::<Result<_, _>>()?;
+                if lidarr_result(lidarr.known_artist(artist.as_str()), None)?.is_some() {
+                    return Err(Refusal::SearchAgain);
+                }
+                let placements: Vec<_> = offers.iter().map(|offer| AlbumPlacement {
+                    artist: offer.artist_id.clone(), release: offer.album.clone(),
+                    artist_number: None, album_number: None, previously_wanted: false, previously_held: false,
+                }).collect();
                 let mut setup = lidarr_result(lidarr.setup(), None)?;
-                let artist = lidarr_result(lidarr.add_wanting(&mut setup, &offers), None)?;
+                let artist = lidarr_result(lidarr.add_wanting_before(&mut setup, &offers, || journal.keep_placements(&placements)), None)?;
                 let artist = LidarrNumber::new(artist).ok_or(Refusal::LidarrUnrecognized)?;
-                Ok((Completed::AddedWanting { artist }, asked, None))
+                Ok((Completed::AddedWanting { artist }, record_asks(asked, &placements), None))
             }
             Change::Want { artist, albums } => {
                 let current = artist_listed(lidarr, artist)?;
                 for album in albums {
                     album.check_current(&self.plan.listed)?;
-                    album.check_current(&current)?;
                 }
+                let placements = wire::placements_for_want(artist, albums, Some(artist.id.into()), &current)?;
                 let asked = listed_metadata(lidarr, artist, albums)?;
-                let numbers: Vec<_> = albums.iter().map(|album| i64::from(album.id)).collect();
-                lidarr_result(lidarr.want(artist.id.into(), &numbers), None)?;
-                Ok((Completed::Wanted, asked, None))
+                let numbers: Vec<_> = placements.iter().filter_map(|placement| placement.album_number).collect();
+                lidarr_result(lidarr.want_before(artist.id.into(), &numbers, || journal.keep_placements(&placements)), None)?;
+                Ok((Completed::Wanted, record_asks(asked, &placements), None))
             }
             Change::ListSingles { artist, offer } => {
                 let view = self.plan.offers.first().ok_or(Refusal::SearchAgain)?;
@@ -1805,23 +1854,6 @@ impl Job {
         }
     }
 
-    fn request_album(&self, journal: &Journal, lidarr: &Lidarr, release: &MusicBrainzId, wanted: &Offer) -> Result<(), Refusal> {
-        let binding = self.plan.binding;
-        let release = release.clone();
-        let owned = journal.ask(move |keeper, _, _| {
-            keeper.data().connection().query_row(
-                "SELECT EXISTS(SELECT 1 FROM requests_owners WHERE binding = ?1 AND release = ?2)",
-                params![binding.as_slice(), release.as_str()], |row| row.get::<_, bool>(0),
-            ).map_err(sql_error)
-        })?;
-        // Someone has already had this exact group placed. Associate the new
-        // request with it without issuing another AlbumSearch.
-        if owned {
-            return Ok(());
-        }
-        lidarr_result(lidarr.request(wanted, journal), Some(wanted))
-    }
-
     /// CARRIED while core supplies interrupted-operation decisions. A restart
     /// can run a job which made no writes, or verify a remote effect which may
     /// already have happened. It must never replay an uncertain mutation.
@@ -1829,10 +1861,13 @@ impl Job {
         match &self.change {
             Change::Request { .. } => {
                 let view = self.plan.offers.first().ok_or(Refusal::SearchAgain)?;
-                if album_is_wanted(lidarr, &view.clone().into())? {
-                    Ok((Completed::Requested, vec![asked_release(view)?], None))
-                } else {
-                    Err(Refusal::NotDealtWith)
+                let wanted = view.clone().into();
+                match confirmed_placement(lidarr, &wanted, self.plan.placements.first())? {
+                    PlacementRecovery::Listed { placed } => {
+                        let asked = asked_release(view)?;
+                        Ok((Completed::Requested { placed }, vec![RecordedAsk { asked, placed }], None))
+                    }
+                    PlacementRecovery::Unconfirmed => Err(Refusal::NotDealtWith),
                 }
             }
             Change::Want { artist, albums } => {
@@ -1841,7 +1876,9 @@ impl Job {
                     album.check_current(&self.plan.listed)?;
                     already_marked(album, &current)?;
                 }
-                Ok((Completed::Wanted, listed_metadata(lidarr, artist, albums)?, None))
+                let asked = listed_metadata(lidarr, artist, albums)?;
+                let records = recovered_asks(asked, artist, &current, &self.plan.placements)?;
+                Ok((Completed::Wanted, records, None))
             }
             Change::AddArtist { artist } => {
                 let added = self.plan.added_artist.as_ref().ok_or(Refusal::NotDealtWith)?;
@@ -1868,7 +1905,9 @@ impl Job {
                 }
                 let artist = LidarrNumber::new(number).ok_or(Refusal::LidarrUnrecognized)?;
                 let asked = self.plan.offers.iter().map(asked_release).collect::<Result<_, _>>()?;
-                Ok((Completed::AddedWanting { artist }, asked, None))
+                let id = MusicBrainzId::new(&wanted.artist_id).ok_or(Refusal::LidarrUnrecognized)?;
+                let records = recovered_asks(asked, &wire::ArtistTarget { id: artist, artist: id }, &current, &self.plan.placements)?;
+                Ok((Completed::AddedWanting { artist }, records, None))
             }
             _ => Err(Refusal::NotDealtWith),
         }
@@ -1911,16 +1950,22 @@ fn already_marked(album: &wire::AlbumTarget, current: &[lidarr::Listed]) -> Resu
 fn added_artist(added: &lidarr::AddedArtist) -> Result<Changed, Refusal> {
     let count = u32::try_from(added.newly_marked.len()).map_err(|_| Refusal::TooLarge)?;
     let views: Vec<AlbumView> = lidarr_items(added.newly_marked.iter().map(|marked| marked.offer.clone()));
-    let asked = views.iter().map(asked_release).collect::<Result<Vec<_>, _>>()?;
+    let asked = views.iter().map(|view| Ok(RecordedAsk { asked: asked_release(view)?, placed: true }))
+        .collect::<Result<_, _>>()?;
     Ok((Completed::ArtistAdded { count }, asked, None))
 }
 
-fn album_is_wanted(lidarr: &Lidarr, wanted: &Offer) -> Result<bool, Refusal> {
-    let Some((artist, _)) = lidarr_result(lidarr.known_artist(&wanted.artist_id), Some(wanted))? else {
-        return Ok(false);
-    };
-    let listed = lidarr_result(lidarr.listed(artist), Some(wanted))?;
-    Ok(listed.iter().any(|known| known.album == wanted.album && (known.wanted || known.have)))
+fn recovered_asks(
+    asks: Vec<AskedRelease>, artist: &wire::ArtistTarget, current: &[lidarr::Listed], placements: &[AlbumPlacement],
+) -> Result<Vec<RecordedAsk>, Refusal> {
+    asks.into_iter().map(|asked| {
+        let offer = Offer { album: asked.release.as_str().into(), artist_id: asked.artist_id.as_str().into(), ..Default::default() };
+        let placement = placements.iter().find(|known| known.release == offer.album && known.artist == offer.artist_id);
+        match wire::batch_effect_confirmed(&offer, artist, Some(artist.id.into()), current, placement) {
+            PlacementRecovery::Listed { placed } => Ok(RecordedAsk { asked, placed }),
+            PlacementRecovery::Unconfirmed => Err(Refusal::NotDealtWith),
+        }
+    }).collect()
 }
 
 fn pending_target(lidarr: &Lidarr, album: LidarrNumber, release: &MusicBrainzId) -> Result<PendingView, Refusal> {
@@ -1942,7 +1987,7 @@ impl Requests {
                 let index = index as u16;
                 match prepare_line(journal, lidarr, index, line, singles)? {
                     Some(want) => wants.push(want),
-                    None => waiting.push(BatchLineView { index, progress: BatchLineProgress::NeedsResolution }),
+                    None => waiting.push(BatchLineView { index, placed: false, progress: BatchLineProgress::NeedsResolution }),
                 }
             }
             if wire::batch_parked_on_app(&waiting) {
@@ -1967,8 +2012,8 @@ impl Requests {
                 line.before_effect && matches!(line.state, bulk::State::Found | bulk::State::Asked)
             }) {
                 if reconciled.insert(line.slot) {
-                    let confirmed = line.offer.as_ref().map(|offer| confirmed_batch_offer(lidarr, offer))
-                        .transpose()?.unwrap_or(false);
+                    let confirmed = line.offer.as_ref().map(|offer| confirmed_placement(lidarr, offer, line.placement.as_ref()))
+                        .transpose()?.unwrap_or(PlacementRecovery::Unconfirmed);
                     lidarr_result(batch.reconcile_indexed(line.slot, confirmed), line.offer.as_ref())?;
                 }
             }
@@ -1976,10 +2021,11 @@ impl Requests {
 
         let worked = lidarr_result(batch.work_prepared(lidarr, &|_| {}), None);
         let rows = batch.indexed_lines().ok_or(Refusal::NotDealtWith)?;
-        let views: Vec<AlbumView> = lidarr_items(rows.into_iter().filter_map(|line| {
-            matches!(line.state, bulk::State::Asked | bulk::State::Done).then_some(line.offer).flatten()
-        }));
-        let asked = views.iter().map(asked_release).collect::<Result<Vec<_>, _>>()?;
+        let mut asked = Vec::new();
+        for line in rows.into_iter().filter(|line| matches!(line.state, bulk::State::Asked | bulk::State::Done)) {
+            let Some(view) = lidarr_items::<AlbumView, _>(line.offer).pop() else { continue };
+            asked.push(RecordedAsk { asked: asked_release(&view)?, placed: line.placed });
+        }
         let result = match worked {
             Ok(()) => JobResult::Done(Completed::Batch),
             Err(reason) => JobResult::Failed(reason),
@@ -1992,14 +2038,16 @@ impl Requests {
     }
 }
 
-fn confirmed_batch_offer(lidarr: &Lidarr, offer: &Offer) -> Result<bool, Refusal> {
+fn confirmed_placement(
+    lidarr: &Lidarr, offer: &Offer, placement: Option<&AlbumPlacement>,
+) -> Result<PlacementRecovery, Refusal> {
     let artist = MusicBrainzId::new(&offer.artist_id).ok_or(Refusal::LidarrUnrecognized)?;
     let Some((number, _)) = lidarr_result(lidarr.known_artist(artist.as_str()), Some(offer))? else {
-        return Ok(false);
+        return Ok(PlacementRecovery::Unconfirmed);
     };
-    let Some(id) = LidarrNumber::new(number) else { return Ok(false) };
+    let Some(id) = LidarrNumber::new(number) else { return Ok(PlacementRecovery::Unconfirmed) };
     let listed = lidarr_result(lidarr.listed(number), Some(offer))?;
-    Ok(wire::batch_effect_confirmed(offer, &wire::ArtistTarget { id, artist }, Some(number), &listed))
+    Ok(wire::batch_effect_confirmed(offer, &wire::ArtistTarget { id, artist }, Some(number), &listed, placement))
 }
 
 fn prepare_line(
