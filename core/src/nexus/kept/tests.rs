@@ -476,6 +476,9 @@ fn the_stamps_bytes_and_session_deadlines_match_the_protocol() {
         0xcb, 0x9c, 0x8b, 0x2d, 0x94, 0x63, 0x40, 0xf0, 0x25, 0xc2, 0xb1, 0xef, 0x24, 0x40, 0x5b, 0xd1,
     ]);
     assert_eq!(key.stamp(&position()), expected);
-    assert_eq!((READ_MS, SEND_MS, SESSION_MS), (259_200_000, 604_800_000, 7_776_000_000));
+    assert_eq!(
+        (READ_MS, SEND_MS, SESSION_MS),
+        (259_200_000, 604_800_000, 7_776_000_000)
+    );
     assert_eq!((WRITE_MS, DELETE_MS, RENEW_MS), (30_000, 600_000, 43_200_000));
 }

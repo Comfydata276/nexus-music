@@ -100,16 +100,18 @@ impl Try {
     }
 }
 
-#[derive(Debug)]
-struct Session {
-    hash: Fingerprint,
-    proven: u64,
-    delete_proven: Option<u64>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Session {
+    pub id: u64,
+    pub hash: Fingerprint,
+    pub proven: u64,
+    pub delete_proven: Option<u64>,
 }
 
 impl Session {
-    fn new(hash: Fingerprint, proven: u64) -> Self {
+    fn new(id: u64, hash: Fingerprint, proven: u64) -> Self {
         Self {
+            id,
             hash,
             proven,
             delete_proven: None,
@@ -122,6 +124,7 @@ impl Session {
 #[derive(Debug)]
 pub struct Device {
     recorded: Scope,
+    last_session: u64,
     working: Option<Session>,
     waiting: Option<Session>,
     serial: u64,
@@ -149,6 +152,7 @@ pub enum Access {
 pub struct Request {
     scope: Scope,
     session: Fingerprint,
+    session_id: u64,
     action: Access,
     arrived: u64,
 }
@@ -157,6 +161,7 @@ impl Device {
     pub fn new(scope: &Scope) -> Self {
         Self {
             recorded: scope.clone(),
+            last_session: 0,
             working: None,
             waiting: None,
             serial: 0,
@@ -166,7 +171,7 @@ impl Device {
 
     /// §7.7. Persist the changed number before applying the cleared rows. An exhausted
     /// number stops the transaction and serving that device; never wrap it.
-    pub fn end(&mut self, scope: &mut Scope) -> Result<(), Denied> {
+    fn end(&mut self, scope: &mut Scope) -> Result<(), Denied> {
         if &self.recorded != scope {
             return Err(Denied::NotSignedIn);
         }
@@ -181,7 +186,7 @@ impl Device {
 
     /// §7.7. Expiry of the working session ends the whole device, even if a newer one waits.
     /// the design does not say which clock governs this overlap; use the older deadline.
-    pub fn expire(&mut self, scope: &mut Scope, now: u64) -> Result<(), Denied> {
+    fn expire(&mut self, scope: &mut Scope, now: u64) -> Result<(), Denied> {
         if &self.recorded != scope {
             return Err(Denied::NotSignedIn);
         }
@@ -213,13 +218,14 @@ impl Device {
 
     /// §7.2 and §7.7. Start (and supersede) under the same lock used by finish. Keep the
     /// ticket with the challenge; retrieve and spend the challenge before the first upstream call.
-    pub fn begin(&mut self, scope: &mut Scope, purpose: Purpose, now: u64) -> Result<Try, Denied> {
+    fn begin(&mut self, scope: &mut Scope, purpose: Purpose, now: u64) -> Result<Try, Denied> {
         self.expire(scope, now)?;
         if let Purpose::Again(hash) | Purpose::Delete(hash) = &purpose {
             let session = self.use_session(hash, now)?;
             if matches!(purpose, Purpose::Delete(_)) && !within(session.proven, now, SEND_MS) {
                 // §7.5: the design does not say if delete survives both ordinary powers.
-                // Such a session can only prove again, even if delete leave has time left.
+                // Once both ordinary powers end, only renewal may BEGIN. Leave already
+                // granted (or a delete proof already begun) has its own deadline.
                 return Err(Denied::ProveAgain);
             }
         }
@@ -233,10 +239,15 @@ impl Device {
         })
     }
 
+    /// Is this spent challenge still current before an upstream request or a grant?
+    fn current_try(&self, scope: &Scope, ticket: &Try) -> bool {
+        self.recorded == *scope && ticket.scope == *scope && self.pending == Some(ticket.serial)
+    }
+
     /// Called after a bound proof, in the step granting power. A newer begin also invalidates
     /// a spend already waiting on Navidrome. Supply a fresh random session's hash only for
     /// Connect/Again. A different authenticated name ends this device's sessions (§7.7).
-    pub fn finish(
+    fn finish(
         &mut self,
         scope: &mut Scope,
         ticket: Try,
@@ -253,10 +264,7 @@ impl Device {
             return Err(Denied::Time);
         }
         if let Purpose::Again(hash) | Purpose::Delete(hash) = &ticket.purpose {
-            let s = self.use_session(hash, now)?;
-            if matches!(ticket.purpose, Purpose::Delete(_)) && !within(s.proven, now, SEND_MS) {
-                return Err(Denied::ProveAgain);
-            }
+            self.use_session(hash, now)?;
         }
         if authenticated != scope.account {
             self.end(scope)?;
@@ -267,19 +275,25 @@ impl Device {
                 return Err(Denied::ReusedSession);
             }
         }
+        let new_id = if fresh.is_some() {
+            self.last_session.checked_add(1).ok_or(Denied::Exhausted)?
+        } else {
+            self.last_session
+        };
         match (ticket.purpose, fresh) {
             (Purpose::Connect, Some(hash)) => {
                 self.end(scope)?;
-                self.working = Some(Session::new(hash, now));
+                self.working = Some(Session::new(new_id, hash, now));
             }
-            (Purpose::Again(_), Some(hash)) => self.waiting = Some(Session::new(hash, now)),
+            (Purpose::Again(_), Some(hash)) => self.waiting = Some(Session::new(new_id, hash, now)),
             (Purpose::Delete(hash), None) => self.use_session(&hash, now)?.delete_proven = Some(now),
             _ => return Err(Denied::WrongPurpose),
         }
+        self.last_session = new_id;
         Ok(())
     }
 
-    pub fn arrive(
+    fn arrive(
         &mut self,
         scope: &mut Scope,
         session: &Fingerprint,
@@ -293,13 +307,14 @@ impl Device {
         Ok(Request {
             scope: scope.clone(),
             session: session.clone(),
+            session_id: s.id,
             action,
             arrived: now,
         })
     }
 
     /// Check in the step keeping a write or immediately before writing a read's answer.
-    pub fn complete(
+    fn complete(
         &mut self,
         scope: &mut Scope,
         request: Request,
@@ -311,6 +326,9 @@ impl Device {
             return Err(Denied::NotSignedIn);
         }
         let s = self.use_session(&request.session, now)?;
+        if s.id != request.session_id {
+            return Err(Denied::NotSignedIn);
+        }
         if now < request.arrived
             || (request.action == Access::Send && !within(request.arrived, now, WRITE_MS))
         {
@@ -321,12 +339,10 @@ impl Device {
 
     /// §11.1. First persist the next life, then erase the account's data in one transaction.
     /// All devices and their tries belong to the old life. This device ends too.
-    pub fn delete(&mut self, scope: &mut Scope, hash: &Fingerprint, now: u64) -> Result<(), Denied> {
+    fn delete(&mut self, scope: &mut Scope, hash: &Fingerprint, now: u64) -> Result<(), Denied> {
         self.expire(scope, now)?;
         let session = self.use_session(hash, now)?;
-        if !within(session.proven, now, SEND_MS)
-            || !session.delete_proven.is_some_and(|at| within(at, now, DELETE_MS))
-        {
+        if !session.delete_proven.is_some_and(|at| within(at, now, DELETE_MS)) {
             return Err(Denied::ProveAgain);
         }
         let life = scope.life.checked_add(1).ok_or(Denied::Exhausted)?;
@@ -506,7 +522,7 @@ pub fn restored_account(store_life: u64, data_life: u64, already_held: bool) -> 
 }
 
 /// §11.2. Restore number and device numbers advance before answering again.
-pub fn restore_device(device: &mut Device, scope: &mut Scope, new_restore: u64) -> Result<(), Denied> {
+fn restore_device(device: &mut Device, scope: &mut Scope, new_restore: u64) -> Result<(), Denied> {
     if new_restore <= scope.restore {
         return Err(Denied::Exhausted);
     }
@@ -516,5 +532,11 @@ pub fn restore_device(device: &mut Device, scope: &mut Scope, new_restore: u64) 
     Ok(())
 }
 
+mod durable;
+pub use durable::*;
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod recovery_tests;
