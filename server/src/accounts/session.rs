@@ -308,14 +308,16 @@ impl Accounts {
         let door = PasswordDoor::for_device(prepared.known.is_some());
         let device = prepared.known;
         // M2 (the lead's ruling of 14:41): at the admin's page, an account that is not an
-        // admin's is answered as a wrong password, after the same door and the same slow work,
-        // and the wrong try is recorded there as any is: it is checked against no verifier (the
-        // workers' same dummy work, which never matches and records the try). CARRIED until the
-        // workers can record a wrong try kept says (asked of S8b); kept's `sign_in_as` below
+        // admin's is checked for real, at the same door, and a correct password is answered as
+        // a wrong one AND recorded as a wrong try (`record_wrong`); kept's `sign_in_as` below
         // still refuses it if the role changes meanwhile.
-        let stored = if described.page && !prepared.admin { None } else { prepared.stored };
-        let checked = self.workers.check(&prepared.email, door, device, password, stored).await?;
+        let not_for_the_page = described.page && !prepared.admin;
+        let checked = self.workers.check(&prepared.email, door, device, password, prepared.stored).await?;
         let Checked::Match { derived, replacement } = checked else { return Err(wrong()) };
+        if not_for_the_page {
+            self.workers.record_wrong(door, &prepared.email, device);
+            return Err(wrong());
+        }
         // (3) On the thread that writes: the sign-in, made in the one step that looks again.
         let clock = self.clock.clone();
         let seen = self.seen.clone();
