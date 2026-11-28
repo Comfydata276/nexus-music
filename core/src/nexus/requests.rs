@@ -39,6 +39,8 @@ pub const SNAPSHOT_IDLE_SECONDS: u64 = 5 * 60;
 pub const SEARCH_MAX_CHARS: usize = 200;
 pub const BUSY_MAX_ARTISTS: usize = 500;
 pub const BATCH_MAX_LINES: usize = 2000;
+/// Time given to the submitting session to resolve a line on the device.
+pub const RESOLUTION_WAIT_SECONDS: u64 = 5 * 60;
 pub const RUNNING_PER_ACCOUNT: usize = 1;
 pub const RUNNING_MAX: usize = 4;
 pub const WAITING_MAX: usize = 16;
@@ -443,8 +445,9 @@ impl BatchLine {
 /// The persisted fallback for one original line, after account, session and job checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BatchResolutionState<'a> {
-    Awaiting,
+    Awaiting { since_ms: u64 },
     Saved(Option<&'a MusicBrainzId>),
+    /// A missing result expired or its submitting session ended.
     Closed,
 }
 
@@ -454,6 +457,28 @@ pub enum BatchResolutionWrite {
     Replay,
 }
 
+/// Project an unresolved line using the first persisted time it awaited the
+/// app and the same effective clock used to check the submitting session.
+/// Persist NotFound on closure, then allow the accepted batch to finish even
+/// if that original session is gone. This changes no authority for API reads.
+pub fn batch_resolution_progress(since_ms: u64, now_ms: u64, submitting_session_live: bool) -> BatchLineProgress {
+    if submitting_session_live && now_ms.saturating_sub(since_ms) < RESOLUTION_WAIT_SECONDS * 1000 {
+        BatchLineProgress::NeedsResolution
+    } else {
+        BatchLineProgress::NotFound
+    }
+}
+
+/// Apply the expiry rule to every unresolved row before testing whether to
+/// park the batch. Once all name lookups have finished, NeedsResolution is
+/// the only work blocking the prepared batch, even with Found rows ready.
+/// A parked batch releases its account worker place. Once all resolutions
+/// close, it can enter the same queue again with its accepted work intact.
+pub fn batch_parked_on_app(rows: &[BatchLineView]) -> bool {
+    rows.iter().any(|row| matches!(row.progress, BatchLineProgress::NeedsResolution))
+        && !rows.iter().any(|row| matches!(row.progress, BatchLineProgress::Waiting | BatchLineProgress::Asked { .. }))
+}
+
 /// Save a first answer durably before retrying the exact Lidarr lookup.
 /// Keep the saved answer even after the line becomes terminal. Check the
 /// submitting session before accepting it. Record that the retry has started
@@ -461,10 +486,16 @@ pub enum BatchResolutionWrite {
 pub fn check_batch_resolution(
     state: BatchResolutionState<'_>,
     release: Option<&MusicBrainzId>,
+    now_ms: u64,
+    submitting_session_live: bool,
 ) -> Result<BatchResolutionWrite, Refusal> {
     match state {
-        BatchResolutionState::Awaiting => Ok(BatchResolutionWrite::Save),
-        BatchResolutionState::Saved(known) if known == release => Ok(BatchResolutionWrite::Replay),
+        BatchResolutionState::Awaiting { since_ms }
+            if batch_resolution_progress(since_ms, now_ms, submitting_session_live) == BatchLineProgress::NeedsResolution =>
+        {
+            Ok(BatchResolutionWrite::Save)
+        }
+        BatchResolutionState::Saved(known) if submitting_session_live && known == release => Ok(BatchResolutionWrite::Replay),
         _ => Err(Refusal::NotAllowed),
     }
 }
@@ -2727,18 +2758,52 @@ mod tests {
         let release = id(2);
         use BatchResolutionState::{Awaiting, Closed, Saved};
         use BatchResolutionWrite::{Replay, Save};
-        assert_eq!(check_batch_resolution(Awaiting, Some(&release)), Ok(Save));
-        assert_eq!(check_batch_resolution(Saved(Some(&release)), Some(&release)), Ok(Replay));
-        assert_eq!(check_batch_resolution(Saved(Some(&release)), Some(&id(3))), Err(Refusal::NotAllowed));
-        assert_eq!(check_batch_resolution(Saved(None), None), Ok(Replay));
-        assert_eq!(check_batch_resolution(Saved(None), Some(&release)), Err(Refusal::NotAllowed));
-        assert_eq!(check_batch_resolution(Closed, None), Err(Refusal::NotAllowed));
+        assert_eq!(check_batch_resolution(Awaiting { since_ms: 0 }, Some(&release), 0, true), Ok(Save));
+        assert_eq!(check_batch_resolution(Saved(Some(&release)), Some(&release), 0, true), Ok(Replay));
+        assert_eq!(check_batch_resolution(Saved(Some(&release)), Some(&id(3)), 0, true), Err(Refusal::NotAllowed));
+        assert_eq!(check_batch_resolution(Saved(None), None, 0, true), Ok(Replay));
+        assert_eq!(check_batch_resolution(Saved(None), Some(&release), 0, true), Err(Refusal::NotAllowed));
+        assert_eq!(check_batch_resolution(Closed, None, 0, true), Err(Refusal::NotAllowed));
         assert_eq!(write_call(&message(Call::ResolveBatchLine { job: job(), index: 2_000, release: None })).map(drop), Err(WireError::Bounds));
 
         let mismatched: Offer = album(3).into();
         let matching: Offer = AlbumView { kind: Kind::Ep, ..album(2) }.into();
         assert!(batch_fallback_offer(&release, false, &[mismatched.clone(), matching.clone()]).is_none());
         assert_eq!(batch_fallback_offer(&release, true, &[mismatched, matching.clone()]), Some(&matching));
+    }
+
+    #[test]
+    fn parked_batches_release_the_place_and_close_on_expiry_or_session_end() {
+        struct Disk;
+        impl bulk::Desk for Disk {
+            fn keep(&self, _: Option<Vec<u8>>, _: bool) {}
+            fn keep_checked(&self, _: Vec<u8>) -> bool { true }
+            fn now(&self) -> i64 { 0 }
+            fn singles(&self) -> bool { false }
+        }
+        let since_ms = 12;
+        let expires_ms = since_ms + RESOLUTION_WAIT_SECONDS * 1000;
+        assert_eq!(batch_resolution_progress(since_ms, expires_ms - 1, true), BatchLineProgress::NeedsResolution);
+        for (now_ms, live) in [(expires_ms, true), (since_ms, false)] {
+            let mut rows = [
+                BatchLineView { index: 0, progress: BatchLineProgress::NeedsResolution },
+                BatchLineView { index: 1, progress: BatchLineProgress::Found { album: batch_album() } },
+            ];
+            assert!(batch_parked_on_app(&rows));
+            rows[0].progress = batch_resolution_progress(since_ms, now_ms, live);
+            assert_eq!(rows[0].progress, BatchLineProgress::NotFound);
+            assert!(!batch_parked_on_app(&rows));
+            let job = bulk::Job::new(Disk);
+            job.start_indexed(vec![
+                bulk::Want { state: bulk::State::Unknown, ..bulk::Want::default() },
+                bulk::Want { state: bulk::State::Found, offer: Some(album(2).into()), ..bulk::Want::default() },
+            ]).unwrap();
+            let first = job.indexed_lines().unwrap().into_iter().next().unwrap();
+            assert_eq!(BatchLineView::from_indexed(&first).unwrap(), rows[0]);
+            assert_eq!(check_batch_resolution(
+                BatchResolutionState::Awaiting { since_ms }, Some(&id(2)), now_ms, live,
+            ), Err(Refusal::NotAllowed));
+        }
     }
 
     #[test]
