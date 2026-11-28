@@ -90,6 +90,12 @@ impl Bench {
     pub fn sign_in(&self, credential: Credential, device: u8) -> Answer {
         self.runtime.block_on(self.accounts.sign_in(sign_in(credential, device), false))
     }
+
+    /// Signing in as the admin's page does (its session's kind is the page's: core-fu3, every
+    /// admin call needs it).
+    pub fn sign_in_at_the_page(&self, credential: Credential, device: u8) -> Answer {
+        self.runtime.block_on(self.accounts.sign_in(sign_in(credential, device), true))
+    }
 }
 
 impl Drop for Bench {

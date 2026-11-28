@@ -274,7 +274,7 @@ fn a_music_server_that_never_answers_holds_two_checks_at_most_and_sign_in_goes_o
     let music = super::music::MusicSide::new(client, internal).within(Duration::from_millis(1_500));
     let (bench, made) = Bench::with_music("checks-at-once", &[("admin@example.test", true), ("person@example.test", false)], music);
     bench::signed_in(&bench.sign_in(bench::with_code(&made[0].code, PASSWORD), 1));
-    let admins: Vec<_> = (1..=3).map(|device| bench::signed_in(&bench.sign_in(bench::with_password(made[0].email, PASSWORD), device))).collect();
+    let admins: Vec<_> = (1..=3).map(|device| bench::signed_in(&bench.sign_in_at_the_page(bench::with_password(made[0].email, PASSWORD), device))).collect();
     let copy = |n: usize| account::Session::from_bytes(*admins[n].session.expose_bytes());
     let restore = admins[0].restore;
     let grant = |n: usize, request: u64, action: Action| {
@@ -415,7 +415,8 @@ fn the_page_is_told_whether_a_music_login_is_set_or_to_be_typed_again() {
     });
     let client = crate::music::MusicClient::trusting(tokio_rustls::rustls::RootCertStore::empty());
     let (bench, made) = Bench::with_music("music-state", &[("admin@example.test", true), ("person@example.test", false)], super::music::MusicSide::new(client, internal.clone()));
-    let signed = bench::signed_in(&bench.sign_in(bench::with_code(&made[0].code, PASSWORD), 1));
+    bench::signed_in(&bench.sign_in(bench::with_code(&made[0].code, PASSWORD), 1));
+    let signed = bench::signed_in(&bench.sign_in_at_the_page(bench::with_password(made[0].email, PASSWORD), 2));
     let copy = || account::Session::from_bytes(*signed.session.expose_bytes());
     let grant = |request: u64, action: Action| {
         let change = NamedChange { request_id: RequestId::new(request).unwrap(), action };
@@ -442,4 +443,45 @@ fn the_page_is_told_whether_a_music_login_is_set_or_to_be_typed_again() {
     })).unwrap();
     assert_eq!(states[0], (MusicState::NoneSet, MusicState::NoneSet));
     assert_eq!(states[1], (MusicState::Set, MusicState::TypeAgain), "checked at another NEXUS_MUSIC_SERVER: to be typed again");
+}
+
+/// core-fu3 (the audit of the admin's page, M1), on the thread that writes, with no listener in
+/// front: an admin's APP session is refused every admin call by kept, the same bytes whether the
+/// account it names is there or not; the same admin at the page is answered.
+#[test]
+fn an_admin_s_app_session_is_refused_every_admin_call_by_kept_whatever_it_names() {
+    use nexus_core::nexus::admin::{self, Action, Applied, Denial, MusicPassword, MusicServerAddress, NamedChange, TypedMusicLogin};
+    let (bench, made) = Bench::new("app-not-page", &[("admin@example.test", true), ("person@example.test", false)]);
+    let app = bench::signed_in(&bench.sign_in(bench::with_code(&made[0].code, PASSWORD), 1));
+    let page = bench::signed_in(&bench.sign_in_at_the_page(bench::with_password(made[0].email, PASSWORD), 2));
+    let copy = |signed: &account::SignedIn| account::Session::from_bytes(*signed.session.expose_bytes());
+    let id = |number: u64| account::AccountId::new(number).unwrap();
+    let refused = |answer: &super::session::Answer| match admin::read_reply::<Applied>(answer.status, answer.body.bytes()).unwrap() {
+        admin::Reply::Refused(refusal) => refusal,
+        other => panic!("not refused: {other:?}"),
+    };
+    let grant = |signed: &account::SignedIn, target: u64, request: u64| {
+        let change = NamedChange { request_id: RequestId::new(request).unwrap(), action: Action::SetMusicLogin(id(target)) };
+        let request = account::GrantRequest { head: bench::head(signed.restore), change, password: account::Password::presented(PASSWORD).unwrap() };
+        bench.runtime.block_on(bench.accounts.admin_grant(copy(signed), request))
+    };
+    let set = |signed: &account::SignedIn, target: u64, request: u64| {
+        let change = TypedMusicLogin { account: id(target), name: account::Name::new("tester").unwrap(), password: MusicPassword::new("a made-up music password").unwrap() };
+        let request = account::GrantedChange { head: bench::head(signed.restore), request_id: RequestId::new(request).unwrap(), change, grant: account::GrantSecret::from_bytes([7; 32]) };
+        bench.runtime.block_on(bench.accounts.set_music_login(copy(signed), request))
+    };
+    let address = |signed: &account::SignedIn| {
+        let public = account::MusicAddress::new("https://music.example.test").unwrap();
+        let request = account::GrantedChange { head: bench::head(signed.restore), request_id: RequestId::new(9).unwrap(), change: MusicServerAddress { public }, grant: account::GrantSecret::from_bytes([7; 32]) };
+        bench.runtime.block_on(bench.accounts.set_music_server(copy(signed), request))
+    };
+    let read = |signed: &account::SignedIn| bench.runtime.block_on(bench.accounts.get_music_server(copy(signed), admin::GetMusicServer { head: bench::head(signed.restore) }));
+    let answers = [grant(&app, made[1].number, 1), grant(&app, 9_999, 2), set(&app, made[1].number, 3), set(&app, 9_999, 4), address(&app), read(&app)];
+    for answer in &answers {
+        assert_eq!(refused(answer), admin::Refusal::NotAllowed(Denial::Denied));
+        assert_eq!((answer.status, answer.body.bytes()), (answers[0].status, answers[0].body.bytes()));
+    }
+    // The same admin, at the page: a grant, and the read.
+    assert_eq!(grant(&page, made[1].number, 5).status, 200);
+    assert_eq!(read(&page).status, 200);
 }
