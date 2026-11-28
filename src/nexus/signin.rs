@@ -1051,6 +1051,18 @@ fn show(shown: Shown) {
 mod tests {
     use super::*;
 
+    /// A profile of its own, and nothing kept under the names a test reads (on Windows the
+    /// store is the user's own: the tests are run one at a time there).
+    fn profile(name: &str) -> (std::path::PathBuf, config::Paths) {
+        let dir = std::env::temp_dir().join(format!("nexus-signin-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let paths = config::Paths::in_dir(&dir);
+        for kept in [DEVICE, SIGNED_IN, OLD_NOTES].into_iter().map(str::to_string).chain((0..NOTE_SLOTS).map(note_slot)) {
+            assert!(vault::forget(&paths, &kept));
+        }
+        (dir, paths)
+    }
+
     fn saved() -> Saved {
         let music = account::read::<MusicLogin>(
             br#"{"address":"https://music.example.org","name":"ada","salt":"0101010101010101010101010101010101010101010101010101010101010101","token":"0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f","count":3}"#,
@@ -1077,9 +1089,7 @@ mod tests {
     /// at its largest valid size; and its debug form shows none of the secret parts.
     #[test]
     fn what_is_kept_reads_back_as_the_core_gave_it_through_the_store() {
-        let dir = std::env::temp_dir().join(format!("nexus-signin-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let paths = config::Paths::in_dir(&dir);
+        let (dir, paths) = profile("kept");
         let saved = saved();
         let value = serde_json::to_value(&saved).unwrap();
         let record = SignedIn { saved: Some(value.clone()), folder: "nexus-7-ab".into(), handed_at: "https://nexus.example.org/nexus/api/signin".into() };
@@ -1111,9 +1121,7 @@ mod tests {
     /// whichever order they are forgotten in.
     #[test]
     fn an_unreadable_note_is_forgotten_by_its_slot_and_the_others_stay() {
-        let dir = std::env::temp_dir().join(format!("nexus-signin-slots-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let paths = config::Paths::in_dir(&dir);
+        let (dir, paths) = profile("slots");
         assert!(vault::write(&paths, &note_slot(0), "not a note"));
         assert!(vault::write(&paths, &note_slot(1), "{\"also\":\"not\"}"));
         let good = Note {
@@ -1136,12 +1144,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// MUST 14: the folder this PC had before is carried over once, at the first music login
+    /// kept here, and the decision is never made again: not after a sign-out, not for a
+    /// later account, whatever the settings name by then.
+    #[test]
+    fn the_folder_before_is_decided_once_and_survives_sign_out() {
+        let (dir, paths) = profile("legacy");
+        let legacy = config::Legacy { server: "https://music.example.org".into(), username: "ada".into(), decided: false, carried_to: None };
+        config::keep_legacy(&paths, &legacy).unwrap();
+        // Kept once: a later start's settings (another music user by then) change nothing.
+        config::keep_legacy(&paths, &config::Legacy { server: "https://music.example.org".into(), username: "bob".into(), ..legacy.clone() }).unwrap();
+        let mut bob = saved();
+        bob.account = AccountId::new(8).unwrap();
+        bob.music = Some(account::read::<MusicLogin>(
+            br#"{"address":"https://music.example.org","name":"bob","salt":"0101010101010101010101010101010101010101010101010101010101010101","token":"0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f","count":1}"#,
+        ).unwrap());
+        // Bob first: not Ada's music user, so the folder before goes to nobody, for good.
+        let first = folder_for(&paths, &bob, bob.music.as_ref().unwrap()).unwrap();
+        assert_eq!(first, config::person_folder(&bob.backend_id, 8));
+        let ada = saved();
+        let later = folder_for(&paths, &ada, ada.music.as_ref().unwrap()).unwrap();
+        assert_eq!(later, config::person_folder(&ada.backend_id, 7), "decided once: never carried over later");
+        // And Bob's again after a sign-out (nothing of the sign-in kept): the same folder.
+        assert_eq!(folder_for(&paths, &bob, bob.music.as_ref().unwrap()).unwrap(), first);
+        // Had Ada come first, it would have been hers, and hers alone, at every sign-in.
+        let _ = std::fs::remove_dir_all(&dir);
+        let paths = config::Paths::in_dir(&dir);
+        config::keep_legacy(&paths, &legacy).unwrap();
+        let carried = folder_for(&paths, &ada, ada.music.as_ref().unwrap()).unwrap();
+        assert_eq!(carried, legacy.stem());
+        assert_eq!(folder_for(&paths, &ada, ada.music.as_ref().unwrap()).unwrap(), carried);
+        assert_eq!(folder_for(&paths, &bob, bob.music.as_ref().unwrap()).unwrap(), config::person_folder(&bob.backend_id, 8));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A keep that does not hold stops what follows it in the same list.
     #[test]
     fn a_keep_that_does_not_hold_stops_what_follows() {
-        let dir = std::env::temp_dir().join(format!("nexus-signin-stop-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let paths = config::Paths::in_dir(&dir);
+        let (dir, paths) = profile("stop");
         *view() = View { slots: vec![None; NOTE_SLOTS], ..View::default() };
         let kept = Note {
             request: 9,

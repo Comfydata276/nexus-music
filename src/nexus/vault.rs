@@ -258,11 +258,11 @@ mod raw {
     }
 
     pub fn put(_paths: &Paths, name: &str, bytes: &[u8]) -> bool {
-        bytes.len() <= super::BLOB_MAX && entry(name).is_ok_and(|entry| entry.set_secret(bytes).is_ok())
+        bytes.len() <= super::BLOB_MAX && !bytes.is_empty() && !super::test_fails(name) && entry(name).is_ok_and(|entry| entry.set_secret(bytes).is_ok())
     }
 
     pub fn delete(_paths: &Paths, name: &str) -> bool {
-        entry(name).is_ok_and(|entry| matches!(entry.delete_credential(), Ok(()) | Err(keyring::Error::NoEntry)))
+        !super::test_fails(name) && entry(name).is_ok_and(|entry| matches!(entry.delete_credential(), Ok(()) | Err(keyring::Error::NoEntry)))
     }
 
     /// The names of every generic credential under the app's service, by the store's own
@@ -352,7 +352,7 @@ mod raw {
     }
 
     pub fn put(paths: &Paths, name: &str, bytes: &[u8]) -> bool {
-        if bytes.len() > super::BLOB_MAX || bytes.is_empty() || test_fails(name) {
+        if bytes.len() > super::BLOB_MAX || bytes.is_empty() || super::test_fails(name) {
             return false;
         }
         let file = file(paths, name);
@@ -365,7 +365,7 @@ mod raw {
     }
 
     pub fn delete(paths: &Paths, name: &str) -> bool {
-        if test_fails(name) {
+        if super::test_fails(name) {
             return false;
         }
         match fs::remove_file(file(paths, name)) {
@@ -392,35 +392,32 @@ mod raw {
             Err(_) => (0, 1),
         }
     }
+}
 
-    /// For the tests and walks: writes and deletes of names starting with this fail, as a
-    /// full or locked store would (`NEXUS_TEST_VAULT_FAIL=nexus-note`).
-    fn test_fails(name: &str) -> bool {
-        crate::nexus::test_var("NEXUS_TEST_VAULT_FAIL").is_some_and(|prefix| !prefix.is_empty() && name.starts_with(prefix.as_str()))
-            || tests_fail(name)
-    }
+/// For the tests and walks: writes and deletes of names starting with this fail, as a full
+/// or locked store would (`NEXUS_TEST_VAULT_FAIL=nexus-note`, a development build only).
+fn test_fails(name: &str) -> bool {
+    crate::nexus::test_var("NEXUS_TEST_VAULT_FAIL").is_some_and(|prefix| !prefix.is_empty() && name.starts_with(prefix.as_str())) || tests_fail(name)
+}
 
-    #[cfg(test)]
-    thread_local! {
-        pub static FAIL: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
-    }
+#[cfg(test)]
+thread_local! {
+    static FAIL: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
 
-    #[cfg(test)]
-    fn tests_fail(name: &str) -> bool {
-        FAIL.with(|fail| fail.borrow().as_deref().is_some_and(|prefix| name.starts_with(prefix)))
-    }
+#[cfg(test)]
+fn tests_fail(name: &str) -> bool {
+    FAIL.with(|fail| fail.borrow().as_deref().is_some_and(|prefix| name.starts_with(prefix)))
+}
 
-    #[cfg(not(test))]
-    fn tests_fail(_: &str) -> bool {
-        false
-    }
+#[cfg(not(test))]
+fn tests_fail(_: &str) -> bool {
+    false
 }
 
 #[cfg(test)]
 pub fn fail_writes(prefix: Option<&str>) {
-    #[cfg(not(windows))]
-    raw::FAIL.with(|fail| *fail.borrow_mut() = prefix.map(str::to_string));
-    let _ = prefix;
+    FAIL.with(|fail| *fail.borrow_mut() = prefix.map(str::to_string));
 }
 
 #[cfg(test)]
@@ -431,6 +428,12 @@ mod tests {
         let dir = tempdir::Dir::new();
         let paths = Paths::in_dir(dir.path());
         (dir, paths)
+    }
+
+    /// The names this test kept (on Windows the store is the user's own, shared by every test:
+    /// each test keeps names of its own, and the tests are run one at a time there).
+    fn mine(paths: &Paths, prefix: &str) -> Vec<String> {
+        raw::names(paths).unwrap().into_iter().filter(|name| name.starts_with(prefix)).collect()
     }
 
     mod tempdir {
@@ -462,21 +465,21 @@ mod tests {
             // Two bytes to a character, so that a part's end falls inside one.
             let value = format!("{}{}", "é".repeat(size / 2), "x".repeat(size % 2));
             assert_eq!(value.len(), size);
-            assert!(write(&paths, "nexus-sign-in", &value), "{size}");
-            assert_eq!(read(&paths, "nexus-sign-in").unwrap().as_deref().map(String::as_str), Some(value.as_str()), "{size}");
-            let head = raw::get(&paths, "nexus-sign-in").unwrap().unwrap();
+            assert!(write(&paths, "t1-sign-in", &value), "{size}");
+            assert_eq!(read(&paths, "t1-sign-in").unwrap().as_deref().map(String::as_str), Some(value.as_str()), "{size}");
+            let head = raw::get(&paths, "t1-sign-in").unwrap().unwrap();
             assert!(head.starts_with(MARK) && head.len() <= BLOB_MAX, "{size}");
-            for name in raw::names(&paths).unwrap() {
+            for name in mine(&paths, "t1-") {
                 assert!(raw::get(&paths, &name).unwrap().unwrap().len() <= BLOB_MAX);
             }
         }
         // Each write leaves only its own parts.
-        let parts = raw::names(&paths).unwrap().into_iter().filter(|name| name.contains(PART)).count();
+        let parts = mine(&paths, "t1-").into_iter().filter(|name| name.contains(PART)).count();
         assert_eq!(parts, RECORD_MAX.div_ceil(BLOB_MAX));
-        assert!(!write(&paths, "nexus-sign-in", &"x".repeat(RECORD_MAX + 1)));
-        assert!(forget(&paths, "nexus-sign-in"));
-        assert_eq!(read(&paths, "nexus-sign-in"), Ok(None));
-        assert!(raw::names(&paths).unwrap().is_empty());
+        assert!(!write(&paths, "t1-sign-in", &"x".repeat(RECORD_MAX + 1)));
+        assert!(forget(&paths, "t1-sign-in"));
+        assert_eq!(read(&paths, "t1-sign-in"), Ok(None));
+        assert!(mine(&paths, "t1-").is_empty());
     }
 
     /// What 0.40.10 wrote (UTF-16) and what `keep` binds are not read as records; bytes with
@@ -485,19 +488,19 @@ mod tests {
     fn what_does_not_read_is_garbled_never_absent() {
         let (_dir, paths) = paths();
         let utf16: Vec<u8> = "{\"a\":1}".encode_utf16().flat_map(u16::to_le_bytes).collect();
-        assert!(raw::put(&paths, "nexus-device", &utf16));
-        assert_eq!(read(&paths, "nexus-device"), Err(Trouble::Garbled));
-        assert!(raw::put(&paths, "nexus-device", b"{\"bare\":\"utf-8\"}"));
-        assert_eq!(read(&paths, "nexus-device"), Err(Trouble::Garbled));
-        assert!(raw::put(&paths, "nexus-device", b"nexus-bound-1\nhttps://x\nt"));
-        assert_eq!(read(&paths, "nexus-device"), Err(Trouble::Garbled));
+        assert!(raw::put(&paths, "t2-device", &utf16));
+        assert_eq!(read(&paths, "t2-device"), Err(Trouble::Garbled));
+        assert!(raw::put(&paths, "t2-device", b"{\"bare\":\"utf-8\"}"));
+        assert_eq!(read(&paths, "t2-device"), Err(Trouble::Garbled));
+        assert!(raw::put(&paths, "t2-device", b"nexus-bound-1\nhttps://x\nt"));
+        assert_eq!(read(&paths, "t2-device"), Err(Trouble::Garbled));
         let big = "y".repeat(3 * BLOB_MAX);
-        assert!(write(&paths, "nexus-sign-in", &big));
-        let part = raw::names(&paths).unwrap().into_iter().find(|name| name.ends_with("~1")).unwrap();
+        assert!(write(&paths, "t2-sign-in", &big));
+        let part = mine(&paths, "t2-").into_iter().find(|name| name.ends_with("~1")).unwrap();
         assert!(raw::put(&paths, &part, b"z"));
-        assert_eq!(read(&paths, "nexus-sign-in"), Err(Trouble::Garbled));
+        assert_eq!(read(&paths, "t2-sign-in"), Err(Trouble::Garbled));
         assert!(raw::delete(&paths, &part));
-        assert_eq!(read(&paths, "nexus-sign-in"), Err(Trouble::Garbled));
+        assert_eq!(read(&paths, "t2-sign-in"), Err(Trouble::Garbled));
     }
 
     /// A write cut short leaves the record before, whole; its stray parts go at the sweep.
@@ -505,18 +508,18 @@ mod tests {
     fn a_write_that_fails_leaves_what_was_there_and_its_parts_are_swept() {
         let (_dir, paths) = paths();
         let before = "b".repeat(2 * BLOB_MAX);
-        assert!(write(&paths, "nexus-sign-in", &before));
+        assert!(write(&paths, "t3-sign-in", &before));
         // The head's write fails (the store full): the parts written go, the record stays.
         let after = "a".repeat(5 * BLOB_MAX);
-        fail_writes(Some("nexus-sign-in"));
-        assert!(!write(&paths, "nexus-sign-in", &after));
-        assert!(!forget(&paths, "nexus-sign-in"));
+        fail_writes(Some("t3-sign-in"));
+        assert!(!write(&paths, "t3-sign-in", &after));
+        assert!(!forget(&paths, "t3-sign-in"));
         fail_writes(None);
-        assert_eq!(read(&paths, "nexus-sign-in").unwrap().as_deref().map(String::as_str), Some(before.as_str()));
+        assert_eq!(read(&paths, "t3-sign-in").unwrap().as_deref().map(String::as_str), Some(before.as_str()));
         // Parts of a write killed before its head: swept, the record's own kept.
-        assert!(raw::put(&paths, "nexus-sign-in~00000000000000aa~0", b"stray"));
-        sweep(&paths, &["nexus-sign-in"]);
-        assert!(raw::get(&paths, "nexus-sign-in~00000000000000aa~0").unwrap().is_none());
-        assert_eq!(read(&paths, "nexus-sign-in").unwrap().as_deref().map(String::as_str), Some(before.as_str()));
+        assert!(raw::put(&paths, "t3-sign-in~00000000000000aa~0", b"stray"));
+        sweep(&paths, &["t3-sign-in"]);
+        assert!(raw::get(&paths, "t3-sign-in~00000000000000aa~0").unwrap().is_none());
+        assert_eq!(read(&paths, "t3-sign-in").unwrap().as_deref().map(String::as_str), Some(before.as_str()));
     }
 }
