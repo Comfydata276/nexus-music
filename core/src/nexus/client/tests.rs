@@ -261,9 +261,6 @@ fn a_cold_start_with_the_backend_down_keeps_everything_and_says_since_when() {
     let mut rig = Rig::new(DeviceKind::Pc);
     let out = rig.start(kept_signed_in(4));
     let check = only_ask(&out).id;
-    for how in [How::Connect, How::Timeout] {
-        let _ = how;
-    }
     let out = rig.fail(check, How::Timeout);
     assert!(forgets(&out).is_empty());
     assert!(handed(&out).is_empty());

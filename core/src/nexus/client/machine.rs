@@ -876,12 +876,11 @@ impl Client {
     // Failures, the network, Offline, ticks, the music server
     // -----------------------------------------------------------------------------------
 
-    pub(super) fn failed(&mut self, ask: u64, failure: Failure, given: &Given, out: &mut Vec<Do>) {
+    pub(super) fn failed(&mut self, ask: u64, failure: Failure, given: &Given) {
         let Some(what) = self.take_flight(ask) else { return };
-        let _ = out;
         // 6.4: no connection was ever opened, the address leads inside, and the permission
         // is not held. A certificate that is wrong is never this.
-        let blocked = !failure.how.connected() && failure.inside == Some(true) && failure.permission == Some(false);
+        let blocked = !failure.how.connected() && Look { inside: failure.inside, permission: failure.permission }.blocked();
         let form = if blocked {
             SignInState::NeedsPermission
         } else if failure.how == How::Secure {

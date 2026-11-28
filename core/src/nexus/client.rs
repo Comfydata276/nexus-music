@@ -1038,7 +1038,7 @@ impl Client {
         match event {
             Happened::Pressed(press) => self.pressed(press, given, &mut out),
             Happened::Answered { ask, status, body } => self.answered(ask, status, &body, given, &mut out),
-            Happened::Failed { ask, failure } => self.failed(ask, failure, given, &mut out),
+            Happened::Failed { ask, failure } => self.failed(ask, failure, given),
             Happened::Network { up } => {
                 if up {
                     self.after_reach(given, &mut out, Reached::Network);
