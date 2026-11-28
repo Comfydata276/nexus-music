@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize, de};
 use serde_json::value::RawValue;
 
 use super::account::{self, AccountId, Receipt};
+use super::admin;
 use super::wire::{self, BadMessage, Fields, Value, WireBody};
 pub use super::account::{RequestHead, RequestId};
 use crate::lidarr::{self, ArtistOffer, Listed, Pending, RequestLidarr, Single, WayBack};
@@ -20,6 +21,8 @@ use crate::offer::Offer;
 // the design does not say how to spell the path and JSON tags. One POST with a closed call tag.
 pub const REQUESTS: &str = "/nexus/api/requests";
 pub const PATHS: &[&str] = &[REQUESTS];
+/// The admin page sends this to the shared page ingress, not the app route.
+pub const ADMIN_ATTRIBUTION: &str = "/nexus/api/admin/request-attribution";
 pub const CALL_MAX_BYTES: usize = wire::BODY_MAX_BYTES;
 pub const SMALL_REPLY_MAX_BYTES: usize = account::SMALL_REPLY_MAX_BYTES;
 // The lead's ruling on §7.1 and §16.1: keep the small ceiling for status, jobs and
@@ -257,6 +260,8 @@ pub enum Call {
     Listed { artist: LidarrNumber, after: Option<PageCursor> },
     Busy { artists: Vec<LidarrNumber> },
     Pending { after: Option<PageCursor> },
+    /// The authenticated account owns the history. There is no account selector.
+    AskedHistory { after: Option<PageCursor> },
     BatchLines { job: JobId, after: Option<PageCursor> },
     Begin { request_id: RequestId, change: Change },
     After { job: JobId },
@@ -282,6 +287,7 @@ impl Value for Call {
             "listed" => Self::Listed { artist: number()?, after: after()? },
             "busy" => Self::Busy { artists: member(&fields, "artists")? },
             "pending" => Self::Pending { after: after()? },
+            "asked_history" => Self::AskedHistory { after: after()? },
             "batch_lines" => Self::BatchLines { job: member(&fields, "job")?, after: after()? },
             "begin" => Self::Begin { request_id: fields.get("request_id")?, change: object_json(raw_member(&fields, "change")?)? },
             "after" => Self::After { job: member(&fields, "job")? },
@@ -577,6 +583,12 @@ pub enum Answer {
         #[serde(deserialize_with = "Deserialize::deserialize")]
         next: Option<PageCursor>,
     },
+    AskedHistory {
+        #[serde(deserialize_with = "objects")]
+        rows: Vec<AskedRelease>,
+        #[serde(deserialize_with = "Deserialize::deserialize")]
+        next: Option<PageCursor>,
+    },
     BatchLines {
         #[serde(deserialize_with = "objects")]
         lines: Vec<BatchLineView>,
@@ -661,6 +673,122 @@ pub struct PendingView {
     pub progress: Option<u8>,
 }
 
+/// A durable request, including one that has already arrived. Build this from
+/// the ownership record, independent of Lidarr's current pending list.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AskedRelease {
+    pub release: MusicBrainzId,
+    pub artist_id: MusicBrainzId,
+    pub title: String,
+    pub artist: String,
+    pub cover: String,
+    pub asked_ms: u64,
+}
+
+impl AskedRelease {
+    fn valid(&self) -> bool {
+        safe_text(&self.title, NAME_MAX_BYTES)
+            && safe_text(&self.artist, NAME_MAX_BYTES)
+            && safe_text(&self.cover, COVER_MAX_BYTES)
+    }
+}
+
+/// POST to [`ADMIN_ATTRIBUTION`] only after the browser marker, exact Origin,
+/// live AdminPage session and current admin authority pass the shared admin gate.
+/// The snapshot is bound to that page session, including on continuations.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct AttributionRead {
+    pub head: RequestHead,
+    pub after: Option<PageCursor>,
+}
+
+impl Value for AttributionRead {
+    fn read(raw: &RawValue) -> Result<Self, BadMessage> {
+        let fields = Fields::read(raw)?;
+        Ok(Self { head: fields.get("head")?, after: member(&fields, "after")? })
+    }
+}
+
+impl wire::Message for AttributionRead {
+    const MAX_BYTES: usize = account::SMALL_REQUEST_MAX_BYTES;
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct AttributionRow {
+    pub account: AccountId,
+    pub name: account::Name,
+    pub asked: AskedRelease,
+}
+
+impl Value for AttributionRow {
+    fn read(raw: &RawValue) -> Result<Self, BadMessage> {
+        let fields = Fields::read(raw)?;
+        Ok(Self {
+            account: fields.get("account")?,
+            name: fields.get("name")?,
+            asked: object_json(raw_member(&fields, "asked")?)?,
+        })
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct AttributionPage {
+    /// One row per recorded requesting account and release, including arrivals.
+    pub rows: Vec<AttributionRow>,
+    pub next: Option<PageCursor>,
+}
+
+impl Value for AttributionPage {
+    fn read(raw: &RawValue) -> Result<Self, BadMessage> {
+        let fields = Fields::read(raw)?;
+        let rows: Vec<&RawValue> = wire::plain_json(raw_member(&fields, "rows")?.get())?;
+        within(rows.len(), PAGE_MAX_ITEMS).map_err(BadMessage::from)?;
+        if rows.iter().any(|row| row.get().len() > ITEM_MAX_BYTES) {
+            return Err(BadMessage::TooLarge);
+        }
+        let next = member(&fields, "next")?;
+        let rows = rows.into_iter().map(AttributionRow::read).collect::<Result<_, _>>()?;
+        let page = Self { rows, next };
+        page.validate().map_err(BadMessage::from)?;
+        Ok(page)
+    }
+}
+
+impl AttributionPage {
+    fn validate(&self) -> Result<(), WireError> {
+        check_page(self.rows.len(), PAGE_MAX_ITEMS, self.next)?;
+        require(self.rows.iter().all(|row| row.asked.valid()))?;
+        check_items(&self.rows)
+    }
+}
+
+// Validate the payload on both read and write; the generic admin envelope's
+// default check does not recursively call Value::check on the payload.
+impl admin::ResultBody for AttributionPage {
+    const MAX_BYTES: usize = LIST_REPLY_MAX_BYTES;
+}
+
+pub type AttributionReply = admin::Reply<AttributionPage>;
+
+pub fn read_attribution(body: &[u8]) -> Result<AttributionRead, WireError> {
+    wire::read(body).map_err(Into::into)
+}
+
+pub fn write_attribution(read: &AttributionRead) -> Result<WireBody, WireError> {
+    wire::encode(read).map_err(Into::into)
+}
+
+pub fn read_attribution_reply(status: u16, body: &[u8]) -> Result<AttributionReply, WireError> {
+    admin::read_reply(status, body).map_err(Into::into)
+}
+
+pub fn write_attribution_reply(reply: &AttributionReply) -> Result<WireBody, WireError> {
+    if let admin::Reply::Done(page) = reply {
+        page.validate()?;
+    }
+    wire::encode(reply).map_err(Into::into)
+}
+
 /// The backend reports progress against the original zero-based submitted index.
 /// The app keeps its local playlist associations by that index.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -711,7 +839,7 @@ macro_rules! redact_debug {
     };
 }
 
-redact_debug!(Search, BatchLine, Answer, AlbumView, ArtistView, SingleView, PendingView, BatchAlbum);
+redact_debug!(Search, BatchLine, Answer, AlbumView, ArtistView, SingleView, PendingView, BatchAlbum, AskedRelease);
 
 fn safe_text(text: &str, max_bytes: usize) -> bool {
     text.len() <= max_bytes && !text.chars().any(char::is_control)
@@ -821,6 +949,11 @@ impl Answer {
                 require(albums.iter().all(PendingView::valid))?;
                 check_items(albums)
             }
+            Self::AskedHistory { rows, next } => {
+                check_page(rows.len(), PAGE_MAX_ITEMS, *next)?;
+                require(rows.iter().all(AskedRelease::valid))?;
+                check_items(rows)
+            }
             Self::BatchLines { lines, next } => {
                 check_page(lines.len(), PAGE_MAX_ITEMS, *next)?;
                 require(lines.iter().all(BatchLineView::valid)
@@ -841,6 +974,7 @@ impl Answer {
             Self::FoundArtists { .. } | Self::Tracked { .. } | Self::ArtistNumbers { .. } => &["artists"],
             Self::ReleasesOf { .. } | Self::Listed { .. } => &["releases"],
             Self::BatchLines { .. } => &["lines"],
+            Self::AskedHistory { .. } => &["rows"],
             _ => &[],
         }
     }
@@ -1402,6 +1536,14 @@ impl<'a> BackendLidarr<'a> {
         Ok(lines)
     }
 
+    /// The same durable history on every device signed in to this account.
+    pub fn asked_history(&self) -> Result<Vec<AskedRelease>, RequestError> {
+        self.pages(|after| Call::AskedHistory { after }, |answer| match answer {
+            Answer::AskedHistory { rows, next } => Some((rows, next)),
+            _ => None,
+        })
+    }
+
     pub fn pending_rows(&self) -> Result<Vec<PendingView>, RequestError> {
         self.pages(|after| Call::Pending { after }, |answer| match answer {
             Answer::Pending { albums, next } => Some((albums, next)),
@@ -1674,6 +1816,31 @@ mod tests {
     fn batch_album() -> BatchAlbum {
         let album = album(2);
         BatchAlbum { offer: album.album, title: album.title, artist: album.artist }
+    }
+
+    #[test]
+    fn history_and_page_attribution_have_distinct_envelopes() {
+        let asked = AskedRelease {
+            release: id(2), artist_id: id(1), title: "At Dawn".into(),
+            artist: "Marrow Lake".into(), cover: String::new(), asked_ms: 1_700_000_000_001,
+        };
+        let request = message(Call::AskedHistory { after: cursor(1) });
+        assert_eq!(read_call(write_call(&request).unwrap().bytes()), Ok(request));
+        let history = reply(Answer::AskedHistory { rows: vec![asked.clone()], next: None });
+        assert_eq!(read_reply(200, write_reply(&history).unwrap().bytes()), Ok(history));
+
+        let read = AttributionRead { head: message(Call::Status).head, after: None };
+        let body = write_attribution(&read).unwrap();
+        assert_eq!(read_attribution(body.bytes()), Ok(read));
+        assert!(read_call(body.bytes()).is_err());
+
+        let page = admin::Reply::Done(AttributionPage {
+            rows: vec![AttributionRow { account: AccountId::new(7).unwrap(), name: account::Name::new("Avery").unwrap(), asked }],
+            next: None,
+        });
+        let body = write_attribution_reply(&page).unwrap();
+        assert_eq!(read_attribution_reply(200, body.bytes()), Ok(page));
+        assert!(read_reply(200, body.bytes()).is_err());
     }
 
     #[test]
