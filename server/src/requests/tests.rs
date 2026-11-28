@@ -265,6 +265,7 @@ struct LidarrState {
     fail_batch_settle: bool,
     second_artist: bool,
     other_monitored: bool,
+    dirty_names: bool,
     calls: Vec<String>,
 }
 
@@ -370,9 +371,19 @@ impl Drop for MockLidarr {
 fn mock(request: &Question, state: &mut LidarrState) -> Value {
     let target = request.target.strip_prefix("/api/v1/").unwrap();
     state.calls.push(format!("{} {target}", request.method));
-    let artist = json!({"id":5,"monitored":true,"artistName":"Quillon Vane","foreignArtistId":ARTIST,
+    let dirty = state.dirty_names;
+    let name = if dirty { "فرقة\u{200f}\u{2029}  الوادي\u{0085}" } else { "Quillon Vane" };
+    let artist = json!({"id":5,"monitored":true,"artistName":name,"foreignArtistId":ARTIST,
         "monitorNewItems":state.new_releases.as_deref().unwrap_or("all"),"metadataProfileId":1});
-    let mut offer = album(state.monitored);
+    let release = |monitored| {
+        let mut record = album(monitored);
+        if dirty {
+            record["title"] = json!("שיר\u{202e}\u{2028}  לשלום\t");
+            record["artist"]["artistName"] = json!(name);
+        }
+        record
+    };
+    let mut offer = release(state.monitored);
     if state.single_mode {
         offer["albumType"] = json!("Single");
     }
@@ -387,7 +398,7 @@ fn mock(request: &Question, state: &mut LidarrState) -> Value {
     match (request.method.as_str(), target) {
         ("GET", "system/status") => json!({"version":"2.0.0"}),
         ("GET", "album") => {
-            let mut current = album(state.monitored);
+            let mut current = release(state.monitored);
             current["statistics"]["trackFileCount"] = json!(u8::from(state.arrived));
             if state.mismatched_arrival_artist {
                 current["artist"] = other_artist;
@@ -397,7 +408,7 @@ fn mock(request: &Question, state: &mut LidarrState) -> Value {
         ("GET", "album/lookup?term=Glass%20Orchard" | "album/lookup?term=Glass%20Orchard%20Quillon%20Vane") =>
             json!([offer]),
         ("GET", lookup) if lookup == format!("album/lookup?term=lidarr%3A{ALBUM}") =>
-            json!([album(state.monitored)]),
+            json!([release(state.monitored)]),
         ("GET", "album/lookup?term=Quiet%20Coast%20Paper%20Tides") if state.second_artist => json!([other_album]),
         ("GET", "artist") if state.fail_batch_settle && state.new_releases.as_deref() == Some("none") =>
             json!({"fixture":"artist lookup failed during settling"}),
@@ -422,10 +433,10 @@ fn mock(request: &Question, state: &mut LidarrState) -> Value {
             }
             json!([offer])
         }
-        ("GET", "album?artistId=5") => json!([album(state.monitored)]),
-        ("GET", "album/9") => album(state.monitored),
+        ("GET", "album?artistId=5") => json!([release(state.monitored)]),
+        ("GET", "album/9") => release(state.monitored),
         ("GET", "wanted/missing?includeArtist=true&page=1&pageSize=500") => {
-            let mut found: Vec<_> = (state.monitored && !state.arrived).then(|| album(true)).into_iter().collect();
+            let mut found: Vec<_> = (state.monitored && !state.arrived).then(|| release(true)).into_iter().collect();
             if state.ambiguous_pending_number {
                 let mut competing = album(true);
                 competing["foreignAlbumId"] = json!("10000000-0000-0000-0000-000000000999");
@@ -1125,6 +1136,47 @@ fn an_unreachable_key_check_saves_the_key_as_unchecked_and_spends_the_grant() {
     lock(&lidarr.state).status_down = false;
     let member = server.redeem(member, 2, "");
     assert!(matches!(server.call(&member, Call::Status), Answer::Status { lidarr: Availability::Ready }));
+}
+
+#[test]
+fn upstream_display_names_are_clean_in_offers_storage_and_attribution() {
+    let lidarr = MockLidarr::start();
+    lock(&lidarr.state).dirty_names = true;
+    let (server, [admin, member, _]) = TestServer::start("clean-requests", Some(endpoint(lidarr.address)));
+    let page = server.redeem(admin, 1, TEST_PAGE);
+    assert_eq!(server.configure(&page), admin::LidarrKeyCheck::Works);
+    let member = server.redeem(member, 2, "");
+
+    let Answer::FoundAny { albums, .. } = server.call(&member, Call::FindAny {
+        search: Search::new("Glass Orchard").unwrap(), after: None,
+    }) else { panic!("expected the cleaned offer") };
+    let [album] = albums.as_slice() else { panic!("expected one offer") };
+    assert_eq!(album.title, "שיר לשלום");
+    assert_eq!(album.artist, "فرقة الوادي");
+    let job = begun(server.call(&member, begin(1, Change::Request { offer: album.album.clone() })));
+    assert_eq!(server.done(&member, job), Completed::Requested { placed: true });
+
+    let db = Connection::open(server.root.join("data/nexus.db")).unwrap();
+    let metadata: Vec<u8> = db.query_row(
+        "SELECT metadata FROM requests_owners WHERE release = ?1",
+        [ALBUM], |row| row.get(0),
+    ).unwrap();
+    let kept: AskedRelease = serde_json::from_slice(&metadata).unwrap();
+    assert_eq!(kept.title, album.title);
+    assert_eq!(kept.artist, album.artist);
+    let Answer::AskedHistory { rows, .. } = server.call(&member, Call::AskedHistory { after: None })
+        else { panic!("expected asked history") };
+    assert_eq!(rows, [kept.clone()]);
+
+    let read = wire::write_attribution(&wire::AttributionRead {
+        head: RequestHead { speaks: SPEAKS, restore: page.restore }, after: None,
+    }).unwrap();
+    let (status, reply) = server.post(wire::ADMIN_ATTRIBUTION, Some(&page.signed_in), TEST_PAGE, read.bytes());
+    let admin::Reply::Done(found) = wire::read_attribution_reply(status, &reply).unwrap() else {
+        panic!("expected request attribution");
+    };
+    let [row] = found.rows.as_slice() else { panic!("expected one attributed request") };
+    assert_eq!(row.asked, kept);
 }
 
 #[test]

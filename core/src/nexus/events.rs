@@ -412,13 +412,60 @@ fn nonempty(text: &str) -> bool {
     text_ok(text) && !text.trim().is_empty()
 }
 
-/// The design does not say how to handle display text beyond the bounds. Keep its
-/// first 200 Unicode scalar values, with controls replaced by spaces. Leave opaque
-/// music IDs exact so truncation cannot point to a different song or source.
+pub(super) fn disallowed_display_char(ch: char) -> bool {
+    ch.is_control() || matches!(ch,
+        '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{2028}' | '\u{2029}'
+        | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+fn display_chars(text: &str) -> impl Iterator<Item = char> + '_ {
+    let mut space = false;
+    text.chars().filter_map(move |ch| {
+        let ch = match ch {
+            '\u{2028}' | '\u{2029}' => ' ',
+            ch if disallowed_display_char(ch) => return None,
+            ch => ch,
+        };
+        let repeated_space = std::mem::replace(&mut space, ch == ' ') && ch == ' ';
+        (!repeated_space).then_some(ch)
+    })
+}
+
+/// Clean display text under the caller's own length ceiling.
+pub fn clean_display_text(text: &str) -> String {
+    display_chars(text).collect()
+}
+
+/// The first 200 cleaned Unicode scalar values of a journal display field.
+/// Opaque song and source IDs do not pass through this function.
 pub fn clean_text(text: &str) -> String {
-    text.chars().take(TEXT_CHARS)
-        .map(|ch| if ch.is_control() { ' ' } else { ch })
-        .collect()
+    display_chars(text).take(TEXT_CHARS).collect()
+}
+
+impl Kind {
+    fn clean_display(&mut self, clean: impl Fn(&str) -> String) {
+        let clean_words = |words: &mut String| {
+            let cleaned = clean(words);
+            // Keep the search and its outcome when all its text was removed.
+            *words = if cleaned.trim().is_empty() && words.chars().any(disallowed_display_char) {
+                String::new()
+            } else {
+                cleaned
+            };
+        };
+        match self {
+            Self::Start { title, artist, album, from, .. } => {
+                for text in [title, artist, album] {
+                    *text = clean(text);
+                }
+                if let PlayedFrom::Search { words } = from {
+                    clean_words(words);
+                }
+            }
+            Self::Search { words, .. } => clean_words(words),
+            _ => {}
+        }
+    }
 }
 
 // Only quotes and backslashes are escaped in cleaned strings. Count them while
@@ -428,10 +475,10 @@ fn trim_start(kind: &mut Kind, mut over: usize) -> Result<(), Wrong> {
         return Err(Wrong::Size);
     };
     let search = if let PlayedFrom::Search { words } = from {
-        // The remaining search prefix must still contain a non-whitespace character.
-        let (offset, ch) = words.char_indices().find(|(_, ch)| !ch.is_whitespace())
-            .ok_or(Wrong::Field)?;
-        Some((words, offset + ch.len_utf8()))
+        // Retain a non-whitespace character when the query has one.
+        let minimum = words.char_indices().find(|(_, ch)| !ch.is_whitespace())
+            .map_or(0, |(offset, ch)| offset + ch.len_utf8());
+        Some((words, minimum))
     } else {
         None
     };
@@ -450,24 +497,13 @@ fn trim_start(kind: &mut Kind, mut over: usize) -> Result<(), Wrong> {
 
 impl Record {
     pub fn new(id: EventId, at_ms: u64, mut kind: Kind) -> Result<Self, Wrong> {
-        match &mut kind {
-            Kind::Start { title, artist, album, from, .. } => {
-                for text in [title, artist, album] {
-                    *text = clean_text(text);
-                }
-                if let PlayedFrom::Search { words } = from {
-                    *words = clean_text(words);
-                }
-            }
-            Kind::Search { words, .. } => *words = clean_text(words),
-            Kind::Stop { position_ms: Some(position), duration_ms: Some(duration), .. }
-                if *position <= PLAY_MAX_MS && *duration <= PLAY_MAX_MS =>
-            {
-                // An estimated duration can be short even after allowing for the
-                // fractional second. Keep the stop reason and heard time.
-                *position = (*position).min(duration.saturating_add(STOP_TOLERANCE_MS));
-            }
-            _ => {}
+        kind.clean_display(clean_text);
+        if let Kind::Stop { position_ms: Some(position), duration_ms: Some(duration), .. } = &mut kind
+            && *position <= PLAY_MAX_MS && *duration <= PLAY_MAX_MS
+        {
+            // An estimated duration can be short even after allowing for the
+            // fractional second. Keep the stop reason and heard time.
+            *position = (*position).min(duration.saturating_add(STOP_TOLERANCE_MS));
         }
         let record = Self { id, at_ms, kind };
         record.check()?;
@@ -504,6 +540,7 @@ impl Record {
     fn check(&self) -> Result<(), Wrong> {
         let amount = |ms| ms <= PLAY_MAX_MS;
         let other = |id| id != self.id;
+        let words_ok = |words: &str| words.is_empty() || nonempty(words);
         let valid = match &self.kind {
             Kind::Start {
                 song_id,
@@ -520,7 +557,7 @@ impl Record {
                     | PlayedFrom::Artist { id }
                     | PlayedFrom::Radio { id }
                     | PlayedFrom::Mix { id } => nonempty(id),
-                    PlayedFrom::Search { words } => nonempty(words),
+                    PlayedFrom::Search { words } => words_ok(words),
                     PlayedFrom::Queue | PlayedFrom::LikedSongs => true,
                 };
                 nonempty(song_id)
@@ -555,7 +592,7 @@ impl Record {
                 from_ms,
                 to_ms,
             } => other(*start) && amount(*from_ms) && amount(*to_ms),
-            Kind::Search { words, .. } => nonempty(words),
+            Kind::Search { words, .. } => words_ok(words),
             Kind::Open { .. } => true,
             Kind::Fault { count, .. } => *count > 0,
         };
@@ -594,19 +631,30 @@ impl Placed {
         self.check_size()
     }
 
-    fn from_raw(raw: &RawValue) -> Result<Self, Wrong> {
+    fn parse_raw(raw: &RawValue) -> Result<Self, Wrong> {
         if raw.get().len() > EVENT_BYTES {
             return Err(Wrong::Size);
         }
         let fields = Fields::read(raw)?;
-        let event = Self {
+        Ok(Self {
             record: Record {
                 id: fields.get("id")?,
                 at_ms: fields.get("at_ms")?,
                 kind: fields.get("event")?,
             },
             sequence: fields.get("sequence")?,
-        };
+        })
+    }
+
+    fn from_raw(raw: &RawValue) -> Result<Self, Wrong> {
+        let event = Self::parse_raw(raw)?;
+        event.check()?;
+        Ok(event)
+    }
+
+    fn from_upload(raw: &RawValue) -> Result<Self, Wrong> {
+        let mut event = Self::parse_raw(raw)?;
+        event.record.kind.clean_display(clean_display_text);
         event.check()?;
         Ok(event)
     }
@@ -990,7 +1038,8 @@ pub struct IncomingBatch {
 impl IncomingBatch {
     /// The design does not say how to answer a malformed entry with no usable id.
     /// Refuse that batch. An entry with a usable id and bad fields can be refused on
-    /// its own. Bad JSON, including a duplicate key anywhere, refuses the whole body.
+    /// its own. Clean display fields before validating each upload for storage.
+    /// Bad JSON, including a duplicate key anywhere, refuses the whole body.
     pub fn read(bytes: &[u8]) -> Result<Self, Wrong> {
         wire::read_value(bytes, BATCH_BYTES).map_err(Into::into)
     }
@@ -1010,7 +1059,7 @@ impl IncomingBatch {
             if !seen.insert(id) {
                 return Err(Wrong::RepeatedId);
             }
-            events.push((id, Placed::from_raw(raw)));
+            events.push((id, Placed::from_upload(raw)));
         }
         Ok(Self { head, life, events })
     }

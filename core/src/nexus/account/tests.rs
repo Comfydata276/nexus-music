@@ -481,9 +481,10 @@ fn codes_use_twelve_crockford_symbols_and_normalize_typed_aliases() {
 fn names_notices_and_music_addresses_obey_their_byte_bounds() {
     assert!(Name::new(&"é".repeat(NAME_MAX_BYTES / 2)).is_some());
     assert!(Name::new(&"é".repeat(NAME_MAX_BYTES / 2 + 1)).is_none());
-    for bad in ["", "  ", "Ada\nPC", "Ada\0PC"] {
+    for bad in ["", "  ", "Ada\nPC", "Ada\0PC", "Ada\u{061c}", "Ada\u{200f}", "Ada\u{202e}", "Ada\u{2069}", "Ada\u{2028}", "Ada\u{2029}"] {
         assert!(Name::new(bad).is_none());
     }
+    assert_eq!(Name::new("أمل לוי").unwrap().as_str(), "أمل לוי");
     assert!(Notice::new(&"x".repeat(NOTICE_MAX_BYTES)).is_some());
     assert!(Notice::new(&"x".repeat(NOTICE_MAX_BYTES + 1)).is_none());
     assert!(Notice::new("Ada\nMusic").is_some());
@@ -510,6 +511,28 @@ fn names_notices_and_music_addresses_obey_their_byte_bounds() {
     ] {
         assert!(MusicAddress::new(bad).is_none());
     }
+}
+
+#[test]
+fn sign_in_cleans_device_labels_but_setup_and_admin_names_are_strict() {
+    let sign_in = signin(Credential::Password {
+        email: email(), password: Password::presented("a long password").unwrap(),
+    });
+    let mut request = serde_json::to_value(sign_in).unwrap();
+    let dirty = "هاتف\u{061c}\u{2028}  לוי\u{2067}\t";
+    request["device_name"] = dirty.into();
+    let read = |request: &serde_json::Value| read::<SignIn>(&serde_json::to_vec(request).unwrap());
+    assert_eq!(read(&request).unwrap().device_name.as_str(), "هاتف לוי");
+
+    request["device_name"] = "\u{202e}\u{2029}".into();
+    assert_eq!(read(&request), Err(BadMessage::Form));
+    request["device_name"] = format!("{}\u{202e}", "x".repeat(NAME_MAX_BYTES + 1)).into();
+    assert_eq!(read(&request), Err(BadMessage::Form));
+
+    let person = serde_json::json!({
+        "code": CODE, "email": email(), "name": dirty, "password": "a long enough password"
+    });
+    assert_eq!(super::read::<SetUp>(&serde_json::to_vec(&person).unwrap()), Err(BadMessage::Form));
 }
 
 #[test]
