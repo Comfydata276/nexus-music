@@ -801,6 +801,16 @@ impl MusicAuthorization {
     }
 }
 
+/// A consumed page grant for one exact key and current endpoint revision.
+pub struct LidarrAuthorization {
+    actor: Scope,
+    session: SessionId,
+    granted: u64,
+    request_id: RequestId,
+    binding: LidarrBinding,
+    fingerprint: Fingerprint,
+}
+
 impl Turn<'_> {
     pub fn check_sign_in(
         self,
@@ -1340,8 +1350,65 @@ impl Turn<'_> {
         }
     }
 
-    /// Under the writer lock, use the current container address and apart-store
-    /// revision. Persist the sealed key and successor revision apart first.
+    /// Consume the exact grant before a credential-bearing connection is made.
+    pub fn authorize_lidarr(
+        &mut self,
+        bearer: Bearer<'_>,
+        current: &LidarrBinding,
+        key: &LidarrKey,
+    ) -> Result<LidarrAuthorization, Denied> {
+        let session = self.admin_session(&bearer)?;
+        if current.backend != self.account.state.backend {
+            return Err(Denied::WrongPurpose);
+        }
+        let actor = self.account.scope(bearer.device)?;
+        let grant = self.consume_leave(
+            bearer,
+            LeaveFor::Admin {
+                action: AdminAction::lidarr(key, current),
+                target: AdminTarget::Backend,
+            },
+        )?;
+        Ok(LidarrAuthorization {
+            actor,
+            session,
+            granted: grant.granted,
+            request_id: grant.intent.request_id,
+            binding: current.clone(),
+            fingerprint: key.fingerprint().clone(),
+        })
+    }
+
+    /// Install the key only while the consumed grant's authority and endpoint
+    /// revision are still current.
+    pub fn install_lidarr(
+        mut self,
+        bearer: Bearer<'_>,
+        authorized: LidarrAuthorization,
+        current: &LidarrBinding,
+        key: &LidarrKey,
+        sealing: &LidarrSealingKey,
+        nonce: [u8; LIDARR_NONCE_BYTES],
+    ) -> Result<(), Denied> {
+        let session = self.admin_session(&bearer)?;
+        if self.account.scope(bearer.device)? != authorized.actor
+            || session != authorized.session
+            || bearer.grant.map(|grant| grant.request_id) != Some(authorized.request_id)
+            || !within(authorized.granted, self.now, PASSWORD_LEAVE_MS)
+        {
+            return Err(Denied::LeaveRequired);
+        }
+        if *current != authorized.binding || *key.fingerprint() != authorized.fingerprint {
+            return Err(Denied::WrongPurpose);
+        }
+        let binding = LidarrBinding { revision: next(current.revision)?, ..current.clone() };
+        let sealed = sealing.seal(&binding, key, nonce).ok_or(Denied::WrongPurpose)?;
+        *self.change = DataChange::InstallLidarrKey { binding, sealed };
+        Ok(())
+    }
+
+    /// Apply a local key installation within one writer turn. The HTTP setter
+    /// uses separate authorization and installation around its upstream check.
     pub fn set_lidarr(
         mut self,
         bearer: Bearer<'_>,
@@ -1350,21 +1417,11 @@ impl Turn<'_> {
         sealing: &LidarrSealingKey,
         nonce: [u8; LIDARR_NONCE_BYTES],
     ) -> Result<(), Denied> {
-        self.admin_session(&bearer)?;
-        if current.backend != self.account.state.backend {
-            return Err(Denied::WrongPurpose);
-        }
-        self.consume_leave(
-            bearer,
-            LeaveFor::Admin {
-                action: AdminAction::lidarr(key, current),
-                target: AdminTarget::Backend,
-            },
-        )?;
-        let binding = LidarrBinding { revision: next(current.revision)?, ..current.clone() };
-        let sealed = sealing.seal(&binding, key, nonce).ok_or(Denied::WrongPurpose)?;
-        *self.change = DataChange::InstallLidarrKey { binding, sealed };
-        Ok(())
+        let authorized = self.authorize_lidarr(Bearer {
+            device: bearer.device, hash: bearer.hash,
+            grant: bearer.grant.as_ref().map(|grant| GrantUse { request_id: grant.request_id, secret: grant.secret }),
+        }, current, key)?;
+        self.install_lidarr(bearer, authorized, current, key, sealing, nonce)
     }
 
     /// Load the target and its current switch revision under the same writer

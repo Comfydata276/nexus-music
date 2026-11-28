@@ -8,6 +8,7 @@ use nexus_core::http::Http;
 use serde_json::{Value, json};
 
 pub(super) const TEST_KEY: &str = "standinkeystandinkeystandinkey12";
+const REFUSED_KEY: &str = "rejected-standin-key";
 const ARTIST: &str = "10000000-0000-0000-0000-000000000001";
 const ALBUM: &str = "10000000-0000-0000-0000-000000000101";
 
@@ -50,12 +51,31 @@ fn response(socket: &mut Socket, status: &str, headers: &str, body: &[u8]) -> st
 }
 
 fn once(reply: impl FnOnce(&mut Socket, Question) + Send + 'static) -> (SocketAddr, thread::JoinHandle<()>) {
+    listen_for_test_call(false, reply)
+}
+
+fn once_after_check(reply: impl FnOnce(&mut Socket, Question) + Send + 'static) -> (SocketAddr, thread::JoinHandle<()>) {
+    listen_for_test_call(true, reply)
+}
+
+fn listen_for_test_call(
+    check_first: bool, reply: impl FnOnce(&mut Socket, Question) + Send + 'static,
+) -> (SocketAddr, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let running = thread::spawn(move || {
-        let (mut socket, _) = listener.accept().unwrap();
-        let ask = question(&mut socket).expect("the transport sent no request");
-        assert!(ask.headers.get("x-api-key").is_some_and(|key| key == TEST_KEY));
+        let receive = || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let ask = question(&mut socket).expect("the transport sent no request");
+            assert!(ask.headers.get("x-api-key").is_some_and(|key| key == TEST_KEY));
+            (socket, ask)
+        };
+        if check_first {
+            let (mut socket, check) = receive();
+            assert_eq!((check.method.as_str(), check.target.as_str()), ("GET", "/api/v1/system/status"));
+            response(&mut socket, "200 OK", "", br#"{"version":"2.0.0"}"#).unwrap();
+        }
+        let (mut socket, ask) = receive();
         reply(&mut socket, ask);
     });
     (address, running)
@@ -237,6 +257,8 @@ const PASSWORD: &str = "a long password for the Requests walk";
 struct LidarrState {
     monitored: bool,
     arrived: bool,
+    status_down: bool,
+    mismatched_arrival_artist: bool,
     ambiguous_pending_number: bool,
     new_releases: Option<String>,
     single_mode: bool,
@@ -273,6 +295,18 @@ impl MockLidarr {
                 match listener.accept() {
                     Ok((mut socket, _)) => {
                         let Some(incoming) = question(&mut socket) else { continue };
+                        if incoming.target == "/api/v1/system/status" {
+                            let mut state = lock(&available);
+                            if incoming.headers.get("x-api-key").is_some_and(|key| key == REFUSED_KEY) {
+                                state.calls.push("GET system/status".into());
+                                let _ = response(&mut socket, "403 Forbidden", "", REFUSED_KEY.as_bytes());
+                                continue;
+                            }
+                            if state.status_down {
+                                state.calls.push("GET system/status".into());
+                                continue;
+                            }
+                        }
                         assert!(incoming.headers.get("x-api-key").is_some_and(|key| key == TEST_KEY));
                         let body = mock(&incoming, &mut lock(&available));
                         let matches = |held| held == Some((incoming.method.as_str(), incoming.target.as_str()));
@@ -352,6 +386,14 @@ fn mock(request: &Question, state: &mut LidarrState) -> Value {
     other_album["foreignAlbumId"] = json!("10000000-0000-0000-0000-000000000222");
     match (request.method.as_str(), target) {
         ("GET", "system/status") => json!({"version":"2.0.0"}),
+        ("GET", "album") => {
+            let mut current = album(state.monitored);
+            current["statistics"]["trackFileCount"] = json!(u8::from(state.arrived));
+            if state.mismatched_arrival_artist {
+                current["artist"] = other_artist;
+            }
+            json!([current])
+        }
         ("GET", "album/lookup?term=Glass%20Orchard" | "album/lookup?term=Glass%20Orchard%20Quillon%20Vane") =>
             json!([offer]),
         ("GET", lookup) if lookup == format!("album/lookup?term=lidarr%3A{ALBUM}") =>
@@ -517,7 +559,9 @@ impl TestServer {
         let mut socket = self.socket(path, who, headers, body.len());
         socket.write_all(body).unwrap();
         let answer = read_http(socket);
-        assert!(!answer.1.windows(TEST_KEY.len()).any(|window| window == TEST_KEY.as_bytes()));
+        for key in [TEST_KEY, REFUSED_KEY] {
+            assert!(!answer.1.windows(key.len()).any(|window| window == key.as_bytes()));
+        }
         assert!(!answer.1.windows(self.address.to_string().len()).any(|window| window == self.address.to_string().as_bytes()));
         answer
     }
@@ -600,10 +644,10 @@ impl TestServer {
         }
     }
 
-    fn apply<T: Serialize>(
+    fn apply<T: Serialize, R: admin::ResultBody>(
         &self, who: &Person, headers: &str, path: &str, change: T, number: u64,
         grant: admin::GrantSecret,
-    ) -> admin::Reply<admin::Applied> {
+    ) -> admin::Reply<R> {
         let request = serde_json::to_vec(&admin::Granted {
             head: RequestHead { speaks: SPEAKS, restore: who.restore },
             request_id: wire::RequestId::new(number).unwrap(),
@@ -614,14 +658,17 @@ impl TestServer {
         admin::read_reply(status, &body).unwrap()
     }
 
-    fn configure(&self, page: &Person) {
+    fn configure(&self, page: &Person) -> admin::LidarrKeyCheck {
         let admin::Reply::Done(issued) =
             self.grant(page, TEST_PAGE, admin::Action::SetLidarr(key_change(TEST_KEY)), 100)
         else {
             panic!("the admin page could not get a Lidarr grant");
         };
-        assert!(matches!(self.apply(page, TEST_PAGE, admin::SET_LIDARR,
-            key_change(TEST_KEY), 100, issued.grant), admin::Reply::Done(_)));
+        let admin::Reply::Done(saved) = self.apply::<_, admin::LidarrKeySaved>(page, TEST_PAGE, admin::SET_LIDARR,
+            key_change(TEST_KEY), 100, issued.grant) else {
+            panic!("the Lidarr key could not be saved");
+        };
+        saved.check
     }
 
     fn set_switch(&self, page: &Person, person: &Person, enabled: bool) {
@@ -631,7 +678,7 @@ impl TestServer {
         else {
             panic!("the admin page could not get a request-switch grant");
         };
-        assert!(matches!(self.apply(page, TEST_PAGE, admin::SET_REQUESTS_ENABLED,
+        assert!(matches!(self.apply::<_, admin::Applied>(page, TEST_PAGE, admin::SET_REQUESTS_ENABLED,
             change(), 101, issued.grant), admin::Reply::Done(_)));
     }
 
@@ -695,6 +742,7 @@ fn authenticated_loopback_requests_keep_order_and_ownership_and_survive_the_clie
     let (server, [admin_code, first_code, other_code]) = TestServer::start("walk", Some(endpoint(lidarr.address)));
     let admin = server.redeem(admin_code, 1, TEST_PAGE);
     server.configure(&admin);
+    assert_eq!(lidarr.take_calls(), ["GET system/status"]);
     let first = server.redeem(first_code, 2, "");
     let other = server.redeem(other_code, 3, "");
 
@@ -933,6 +981,7 @@ fn the_page_can_switch_off_every_requests_call_for_a_signed_in_member() {
     let (server, [admin, member, _]) = TestServer::start("switch", Some(endpoint(lidarr.address)));
     let admin = server.redeem(admin, 1, TEST_PAGE);
     server.configure(&admin);
+    assert_eq!(lidarr.take_calls(), ["GET system/status"]);
     let member = server.redeem(member, 2, "");
     server.set_switch(&admin, &member, false);
 
@@ -1007,17 +1056,25 @@ fn only_the_admin_page_can_configure_a_key_for_the_read_only_address() {
         panic!("the page could not request a matching grant");
     };
     let grant = || admin::GrantSecret::from_bytes(*issued.grant.expose_bytes());
-    assert!(matches!(server.apply(&app_admin, TEST_PAGE, admin::SET_LIDARR,
+    assert!(matches!(server.apply::<_, admin::LidarrKeySaved>(&app_admin, TEST_PAGE, admin::SET_LIDARR,
         key_change(TEST_KEY), 20, grant()), admin::Reply::Refused(_)));
-    assert!(matches!(server.apply(&page, TEST_PAGE, admin::SET_LIDARR,
+    assert!(matches!(server.apply::<_, admin::LidarrKeySaved>(&page, TEST_PAGE, admin::SET_LIDARR,
         key_change(unrelated), 20, grant()), admin::Reply::Refused(_)));
-    assert!(matches!(server.apply(&page, TEST_PAGE, admin::SET_LIDARR,
+    assert!(matches!(server.apply::<_, admin::LidarrKeySaved>(&page, TEST_PAGE, admin::SET_LIDARR,
         key_change(TEST_KEY), 21, grant()), admin::Reply::Refused(_)));
     assert!(!setting());
-    assert!(matches!(server.apply(&page, TEST_PAGE, admin::SET_LIDARR,
-        key_change(TEST_KEY), 20, grant()), admin::Reply::Done(_)));
+    lidarr.hold_response(Some(("GET", "/api/v1/system/status")));
+    thread::scope(|scope| {
+        let probe = scope.spawn(|| server.apply::<_, admin::LidarrKeySaved>(&page, TEST_PAGE, admin::SET_LIDARR,
+            key_change(TEST_KEY), 20, grant()));
+        lidarr.wait_for_call("GET system/status");
+        let while_waiting = server.call(&app, Call::AskedHistory { after: None });
+        lidarr.hold_response(None);
+        assert!(matches!(while_waiting, Answer::Refused { reason: Refusal::LidarrNotSetUp }));
+        assert_eq!(probe.join().unwrap(), admin::Reply::Done(admin::LidarrKeySaved { check: admin::LidarrKeyCheck::Works }));
+    });
     assert!(setting());
-    assert!(matches!(server.apply(&page, TEST_PAGE, admin::SET_LIDARR,
+    assert!(matches!(server.apply::<_, admin::LidarrKeySaved>(&page, TEST_PAGE, admin::SET_LIDARR,
         key_change(TEST_KEY), 20, grant()), admin::Reply::Refused(_)));
 
     let toggle = || admin::Action::SetRequestsEnabled(admin::RequestsEnabled {
@@ -1027,7 +1084,85 @@ fn only_the_admin_page_can_configure_a_key_for_the_read_only_address() {
     assert!(matches!(server.grant(&app_admin, TEST_PAGE, toggle(), 21),
         admin::Reply::Refused(admin::Refusal::NotAllowed(admin::Denial::Denied))));
     assert!(matches!(server.grant(&page, TEST_PAGE, toggle(), 21), admin::Reply::Done(_)));
-    assert!(lidarr.take_calls().is_empty());
+    assert_eq!(lidarr.take_calls(), ["GET system/status"]);
+}
+
+#[test]
+fn a_refused_key_spends_the_grant_and_leaves_the_working_key_untouched() {
+    let lidarr = MockLidarr::start();
+    let (server, [admin, member, _]) = TestServer::start("refused-key", Some(endpoint(lidarr.address)));
+    let page = server.redeem(admin, 1, TEST_PAGE);
+    assert_eq!(server.configure(&page), admin::LidarrKeyCheck::Works);
+    assert_eq!(lidarr.take_calls(), ["GET system/status"]);
+
+    let admin::Reply::Done(issued) =
+        server.grant(&page, TEST_PAGE, admin::Action::SetLidarr(key_change(REFUSED_KEY)), 102)
+    else { panic!("the page could not get a Lidarr grant") };
+    let submit = || server.apply::<_, admin::LidarrKeySaved>(&page, TEST_PAGE, admin::SET_LIDARR,
+        key_change(REFUSED_KEY), 102, admin::GrantSecret::from_bytes(*issued.grant.expose_bytes()));
+    assert_eq!(submit(), admin::Reply::Refused(admin::Refusal::NotAllowed(admin::Denial::LidarrLoginRefused)));
+    assert_eq!(submit(), admin::Reply::Refused(admin::Refusal::NotAllowed(admin::Denial::GrantRequired)));
+    assert_eq!(lidarr.take_calls(), ["GET system/status"]);
+    let member = server.redeem(member, 2, "");
+    assert!(matches!(server.call(&member, Call::Status), Answer::Status { lidarr: Availability::Ready }));
+}
+
+#[test]
+fn an_unreachable_key_check_saves_the_key_as_unchecked_and_spends_the_grant() {
+    let lidarr = MockLidarr::start();
+    lock(&lidarr.state).status_down = true;
+    let (server, [admin, member, _]) = TestServer::start("unchecked-key", Some(endpoint(lidarr.address)));
+    let page = server.redeem(admin, 1, TEST_PAGE);
+    let admin::Reply::Done(issued) =
+        server.grant(&page, TEST_PAGE, admin::Action::SetLidarr(key_change(TEST_KEY)), 102)
+    else { panic!("the page could not get a Lidarr grant") };
+    let submit = || server.apply::<_, admin::LidarrKeySaved>(&page, TEST_PAGE, admin::SET_LIDARR,
+        key_change(TEST_KEY), 102, admin::GrantSecret::from_bytes(*issued.grant.expose_bytes()));
+    assert_eq!(submit(), admin::Reply::Done(admin::LidarrKeySaved { check: admin::LidarrKeyCheck::Unreachable }));
+    assert_eq!(submit(), admin::Reply::Refused(admin::Refusal::NotAllowed(admin::Denial::GrantRequired)));
+    assert_eq!(lidarr.take_calls(), ["GET system/status"]);
+
+    lock(&lidarr.state).status_down = false;
+    let member = server.redeem(member, 2, "");
+    assert!(matches!(server.call(&member, Call::Status), Answer::Status { lidarr: Availability::Ready }));
+}
+
+#[test]
+fn attribution_marks_the_exact_release_arrived_only_after_positive_lidarr_evidence() {
+    let lidarr = MockLidarr::start();
+    let (server, [admin, member, _]) = TestServer::start("attribution-arrival", Some(endpoint(lidarr.address)));
+    let page = server.redeem(admin, 1, TEST_PAGE);
+    assert_eq!(server.configure(&page), admin::LidarrKeyCheck::Works);
+    let member = server.redeem(member, 2, "");
+    let offer = server.offer(&member);
+    let job = begun(server.call(&member, begin(1, Change::Request { offer })));
+    assert_eq!(server.done(&member, job), Completed::Requested { placed: true });
+
+    let read = wire::write_attribution(&wire::AttributionRead {
+        head: RequestHead { speaks: SPEAKS, restore: page.restore }, after: None,
+    }).unwrap();
+    let check = |arrived| {
+        let (status, body) = server.post(wire::ADMIN_ATTRIBUTION, Some(&page.signed_in), TEST_PAGE, read.bytes());
+        let admin::Reply::Done(found) = wire::read_attribution_reply(status, &body).unwrap() else {
+            panic!("the admin page could not read attribution");
+        };
+        assert_eq!(found.rows.len(), 1);
+        let row = &found.rows[0];
+        assert_eq!(row.account, member.signed_in.person.id);
+        assert_eq!(row.asked.release.as_str(), ALBUM);
+        assert_eq!(row.arrived, arrived);
+        let wire: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(wire["done"]["rows"][0].get("arrived"), arrived.map(Value::Bool).as_ref());
+    };
+    check(None);
+    {
+        let mut state = lock(&lidarr.state);
+        state.arrived = true;
+        state.mismatched_arrival_artist = true;
+    }
+    check(None);
+    lock(&lidarr.state).mismatched_arrival_artist = false;
+    check(Some(true));
 }
 
 fn fixture<const N: usize>(name: &str) -> (PathBuf, Keeper, [OneTimeCode; N]) {
@@ -1168,6 +1303,7 @@ fn startup_puts_back_a_recorded_artist_setting_for_the_same_lidarr() {
     let binding = binding(&endpoint(lidarr.address));
     let (mut server, [admin_code, _, _]) = TestServer::start_child("way-back", lidarr.address);
     server.configure(&server.redeem(admin_code, 1, TEST_PAGE));
+    assert_eq!(lidarr.take_calls(), ["GET system/status"]);
     server.kill_child();
     let mut keeper = reopen(&server.root);
     keeper.write_data(now(), |tx| {
@@ -1198,6 +1334,7 @@ fn startup_discards_a_gone_artist_and_a_later_request_can_place_an_album() {
     let lidarr = MockLidarr::start();
     let (mut server, [admin, member, _]) = TestServer::start_child("gone-artist", lidarr.address);
     server.configure(&server.redeem(admin, 1, TEST_PAGE));
+    assert_eq!(lidarr.take_calls(), ["GET system/status"]);
     server.kill_child();
     let binding = binding(&endpoint(lidarr.address));
     let mut keeper = reopen(&server.root);
@@ -1249,14 +1386,14 @@ fn the_backend_answers_fixed_refusals_for_hostile_lidarr_responses() {
     let trap = TcpListener::bind("127.0.0.1:0").unwrap();
     trap.set_nonblocking(true).unwrap();
     let trap_address = trap.local_addr().unwrap();
-    let (address, reply) = once(move |socket, _| {
+    let (address, reply) = once_after_check(move |socket, _| {
         response(socket, "302 Found", &format!("Location: http://{trap_address}/\r\n"), TEST_KEY.as_bytes()).unwrap();
     });
     assert_refusal("redirect", address, Refusal::LidarrBehindSignIn);
     reply.join().unwrap();
     assert_eq!(trap.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
 
-    let (address, reply) = once(|socket, _| {
+    let (address, reply) = once_after_check(|socket, _| {
         let mut too_large = vec![b' '; http::BODY_LIMIT as usize + 1];
         too_large[..2].copy_from_slice(b"[]");
         let _ = response(socket, "200 OK", "", &too_large);
@@ -1264,7 +1401,7 @@ fn the_backend_answers_fixed_refusals_for_hostile_lidarr_responses() {
     assert_refusal("large", address, Refusal::LidarrUnavailable);
     reply.join().unwrap();
 
-    let (address, reply) = once(|socket, _| {
+    let (address, reply) = once_after_check(|socket, _| {
         response(socket, "200 OK", "", format!("<garbage>{TEST_KEY}</garbage>").as_bytes()).unwrap();
     });
     assert_refusal("garbage", address, Refusal::LidarrUnrecognized);
@@ -1274,7 +1411,7 @@ fn the_backend_answers_fixed_refusals_for_hostile_lidarr_responses() {
 #[test]
 fn a_slow_lidarr_read_leaves_sign_in_and_the_writer_available() {
     let (arrived, read) = std::sync::mpsc::channel();
-    let (address, reply) = once(move |socket, _| {
+    let (address, reply) = once_after_check(move |socket, _| {
         arrived.send(()).unwrap();
         thread::sleep(UPSTREAM_TIMEOUT + Duration::from_millis(150));
         let _ = response(socket, "200 OK", "", b"[]");
@@ -1300,6 +1437,7 @@ fn the_listener_accepts_only_eight_requests_answers_at_once() {
         "answer-cap", Some(endpoint(lidarr.address)), Arc::new(now),
     );
     server.configure(&server.redeem(admin, 1, TEST_PAGE));
+    assert_eq!(lidarr.take_calls(), ["GET system/status"]);
     let members: Vec<_> = members.into_iter().enumerate()
         .map(|(index, code)| server.redeem(code, index as u8 + 2, "")).collect();
     let shell = server.shell.as_ref().unwrap().upgrade().unwrap();
