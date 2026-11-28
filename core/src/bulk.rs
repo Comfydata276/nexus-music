@@ -355,7 +355,9 @@ impl Job {
     pub fn load(&self, written: &[u8]) -> bool {
         let Ok(batch) = serde_json::from_slice::<Batch>(written) else { return false };
         if batch.indexed.as_ref().is_some_and(|index| {
-            index.slots.is_empty() || index.slots.iter().chain(&index.before_effect).any(|&slot| slot >= batch.wants.len())
+            let slots = index.slots.iter().copied().collect::<BTreeSet<_>>();
+            slots.is_empty() || slots.iter().any(|&slot| slot >= batch.wants.len())
+                || slots.len() != batch.wants.len() || !index.before_effect.is_subset(&slots)
         }) {
             return false;
         }
@@ -579,6 +581,7 @@ impl Job {
         }
         self.with(|batch| {
             batch.wants.clear();
+            batch.indexed = None;
             batch.stopped.clear();
         });
         self.save();
@@ -868,6 +871,9 @@ impl Job {
     }
 
     fn work(&self, lidarr: &dyn BulkLidarr, musicbrainz: &MusicBrainz, tell: &Tell) -> Result<(), String> {
+        if self.with(|batch| batch.indexed.is_some()) {
+            return Err("An indexed batch must use the prepared worker.".into());
+        }
         let found = self.find_all(lidarr, musicbrainz, tell);
         let asked = found.and_then(|()| self.ask_all(lidarr, tell));
         if self.stopping() {
