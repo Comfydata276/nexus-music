@@ -98,6 +98,7 @@ function loadPage(fetch, { requestsEnabled = false, origin = "https://owner.exam
       timer.active = false;
       timer.fn();
     },
+    pendingTimers() { return timers.filter(timer => timer.active).map(timer => timer.delay); },
     button(container, label) { return findButton(from(container), label); },
     advance(ms) { currentTime += ms; },
     submit(id, values = {}) {
@@ -807,6 +808,7 @@ test("busy listening reads wait for a manual retry and preserve already loaded p
   assert.equal(calls, 1);
   assert.match(page.from("listening-status").textContent, /Try again in a moment/);
   assert.equal(page.from("listening-retry").hidden, false);
+  assert.deepEqual(page.pendingTimers(), [30_000]);
   await page.click("listening-retry");
   assert.equal(calls, 2);
   assert.equal(page.from("listening-total").textContent, "11 songs started");
@@ -815,8 +817,43 @@ test("busy listening reads wait for a manual retry and preserve already loaded p
   assert.equal(calls, 3);
   assert.match(page.from("listening-recent-status").textContent, /Try again in a moment/);
   assert.equal(page.from("listening-recent").children.length, 1);
+  assert.deepEqual(page.pendingTimers(), [30_000]);
   await page.click("listening-recent-more");
   assert.equal(calls, 4);
   assert.equal(page.from("listening-recent").children.length, 2);
   assert.ok(page.from("listening-recent-more").hidden);
+});
+
+test("listening explains sampled totals and a closed paging limit", async () => {
+  const mock = adminStandIn();
+  let calls = 0;
+  const page = loadPage((path, options) => {
+    if (path !== "/nexus/api/admin/listening") return mock.fetch(path, options);
+    calls++;
+    const request = JSON.parse(options.body);
+    if (request.page) {
+      return doneListening({ rows: [], next: null, limit: "continuation_work" });
+    }
+    if (request.days === 7) return doneListening({ ...listeningOverview(0, 7), limit: null });
+    return doneListening({ ...listeningOverview(), limit: "newest_starts" });
+  });
+  await page.signIn("owner@example.test", adminPassword);
+  await settle();
+  page.click("listening-jump");
+  await settle();
+  assert.equal(page.from("listening-total").textContent, "11 songs started");
+  const notice = page.from("listening-limit").textContent;
+  assert.match(notice, /Totals cover only the newest plays/);
+  await page.click("listening-recent-more");
+  await settle();
+  assert.equal(calls, 2);
+  assert.equal(page.from("listening-limit").textContent, notice);
+  assert.match(page.from("listening-recent-status").textContent, /Choose a shorter period or one person/);
+  assert.match(textOf(page.from("listening-recent")), /Night Walk/);
+  assert.ok(page.from("listening-recent-more").hidden);
+  assert.ok(page.from("listening-retry").hidden);
+  assert.deepEqual(page.pendingTimers(), [30_000]);
+  await page.change("listening-days", "7");
+  assert.equal(page.from("listening-limit").textContent, "");
+  assert.equal(page.from("listening-recent-status").textContent, "No recent plays in this period.");
 });

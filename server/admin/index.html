@@ -109,6 +109,7 @@ dd, li { overflow-wrap: anywhere; }
   font: inherit;
 }
 #listening-status, #listening-total { margin-top: .8rem; }
+#listening-limit:not(:empty) { margin-top: .45rem; }
 .listening-columns { margin-block: 1rem; }
 .listening-columns > section { min-width: 0; border-top: 1px solid var(--line); padding-top: .85rem; }
 #listening-panel h3 { margin: 0; font-size: 1rem; }
@@ -249,6 +250,7 @@ dd, li { overflow-wrap: anywhere; }
         <button id="listening-retry" type="button" class="secondary" hidden>Try again</button>
         <div id="listening-results" hidden>
           <p id="listening-total"></p>
+          <p id="listening-limit" role="status"></p>
           <div class="listening-columns">
             <section>
               <h3>Most played</h3>
@@ -687,7 +689,9 @@ dd, li { overflow-wrap: anywhere; }
 
   function clearListeningResults() {
     byId("listening-results").hidden = true;
+    byId("listening-retry").hidden = true;
     writeText(byId("listening-total"), "");
+    writeText(byId("listening-limit"), "");
     writeText(byId("listening-status"), "");
     byId("listening-ranked").replaceChildren();
     for (const kind of Object.keys(listeningLists)) {
@@ -822,7 +826,6 @@ dd, li { overflow-wrap: anywhere; }
     const current = session;
     if (!current) return;
     clearListeningResults();
-    byId("listening-retry").hidden = true;
     writeText(byId("listening-status"), "Loading listening…");
     const view = { account: null, days: Number(listeningDays.value), top: null };
     listening = view;
@@ -834,6 +837,7 @@ dd, li { overflow-wrap: anywhere; }
       }, 1024 * 1024);
       if (session !== current || listening !== view) return;
       if (!isU64(reply.starts) ||
+          (reply.limit != null && reply.limit !== "newest_starts") ||
           listeningTime(reply.end_ms) <= listeningTime(reply.start_ms)) throw new Error();
       const fields = { artists: ["artist"], albums: ["album", "artist"], songs: ["title", "artist", "album"] };
       view.top = Object.fromEntries(Object.entries(fields).map(([kind, names]) => {
@@ -851,6 +855,10 @@ dd, li { overflow-wrap: anywhere; }
       byId("listening-people-panel").hidden = view.account !== null;
       writeText(byId("listening-total"), listeningNumbers.format(reply.starts) +
         (reply.starts === 1n ? " song started" : " songs started"));
+      if (reply.limit === "newest_starts") {
+        writeText(byId("listening-limit"),
+          "Totals cover only the newest plays. Choose a shorter period or one person to see more.");
+      }
       writeText(byId("listening-status"), "");
       byId("listening-results").hidden = false;
     } catch (error) {
@@ -876,8 +884,12 @@ dd, li { overflow-wrap: anywhere; }
       }, 1024 * 1024);
       if (session !== current || listening !== view) return;
       const page = listeningRows(reply, kind, view.account);
-      if (page.next === next) throw new Error();
+      const reachedLimit = reply.limit === "continuation_work" && !page.rows.length && page.next === null;
+      if (page.next === next || (reply.limit != null && !reachedLimit)) throw new Error();
       renderListeningRows(kind, page);
+      if (reachedLimit) {
+        writeText(status, "This list has reached its limit. Choose a shorter period or one person to see more.");
+      }
     } catch (error) {
       if (session !== current || listening !== view) return;
       writeText(status, error?.reason === "busy" ?
@@ -959,7 +971,7 @@ dd, li { overflow-wrap: anywhere; }
     const account = row.after;
     const person = row.name + " (" + row.email + ")";
     accountNames.set(account, row.name);
-    listenPerson(account, row.name + " (" + row.email + ")");
+    listenPerson(account, person);
     for (const owner of deviceOwners.get(account) ?? []) writeText(owner, " · " + row.name);
     const entry = appendRow(accountPage.list, row.label);
     const menu = document.createElement("details");
