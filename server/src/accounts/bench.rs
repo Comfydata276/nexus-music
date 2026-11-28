@@ -63,6 +63,7 @@ impl Bench {
             set_up_code: SetUpCode::at_start(true, START).0,
             clock: Arc::new(move || read.load(Ordering::SeqCst)),
             backend,
+            seen: Arc::default(),
         });
         let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
         (Bench { accounts, now, runtime, root }, made)

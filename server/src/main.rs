@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use nexus_music_server::accounts::check::PasswordWorkers;
 use nexus_music_server::accounts::desk::Desk;
-use nexus_music_server::accounts::session::Accounts;
+use nexus_music_server::accounts::session::{Accounts, Seen};
 use nexus_music_server::accounts::{rows, setup};
 use nexus_music_server::store::keeper::{self, Keeper};
 use nexus_music_server::store::copies;
@@ -169,6 +169,13 @@ fn run(settings: Settings) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let seen = match rows::device_secrets(keeper.data().connection()) {
+        Ok(prints) => Arc::new(Seen::new(prints)),
+        Err(_) => {
+            eprintln!("The devices couldn't be read from the data.");
+            return ExitCode::FAILURE;
+        }
+    };
     let desk = match Desk::open(keeper) {
         Ok(desk) => desk,
         Err(why) => {
@@ -176,7 +183,7 @@ fn run(settings: Settings) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let accounts = Arc::new(Accounts { desk, workers, set_up_code, clock: Arc::new(now), backend: id });
+    let accounts = Arc::new(Accounts { desk, workers, set_up_code, clock: Arc::new(now), backend: id, seen });
     nightly(settings.data.clone());
     let runtime = match tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build() {
         Ok(runtime) => runtime,

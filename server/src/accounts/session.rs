@@ -26,7 +26,7 @@ use nexus_core::nexus::kept::{Access, Account, AccountState, Bearer, Denied, Eff
 use nexus_core::nexus::proto::{BackendId, SPEAKS, Speaks};
 
 use super::check::{Checked, PasswordWorkers};
-use super::desk::{Busy, Desk};
+use super::desk::{Busy, Desk, Lane};
 use super::rows;
 use super::setup::{CodeKey, SetUpCode, random};
 use crate::store::data::{self, Change};
@@ -50,6 +50,31 @@ pub struct Accounts {
     pub set_up_code: SetUpCode,
     pub clock: Clock,
     pub backend: BackendId,
+    /// The devices this backend has seen, by their secret's fingerprint: which lane of the line
+    /// a sign-in's first step waits in (the review of S8, C1).
+    pub seen: Arc<Seen>,
+}
+
+/// The fingerprints of every device secret the data has had a device for, read at the start and
+/// added to at each sign-in. Only which lane a sign-in waits in is chosen by it; kept still says
+/// which door it goes through. A device secret is 32 random bytes, so a stranger cannot be in it.
+#[derive(Default)]
+pub struct Seen(std::sync::RwLock<std::collections::HashSet<[u8; 32]>>);
+
+impl Seen {
+    pub fn new(prints: impl IntoIterator<Item = [u8; 32]>) -> Self {
+        Seen(std::sync::RwLock::new(prints.into_iter().collect()))
+    }
+
+    fn has(&self, print: &[u8; 32]) -> bool {
+        self.0.read().is_ok_and(|seen| seen.contains(print))
+    }
+
+    fn add(&self, print: [u8; 32]) {
+        if let Ok(mut seen) = self.0.write() {
+            seen.insert(print);
+        }
+    }
 }
 
 /// An answer: its status, and its body (C7's shapes, encoded).
@@ -79,8 +104,9 @@ pub fn refused(refusal: Refusal) -> Answer {
     Answer { status, body }
 }
 
+/// The line is full: come back in a second (the line empties in steps of milliseconds).
 fn busy() -> Refusal {
-    Refusal::Busy { retry_after_seconds: None }
+    Refusal::Busy { retry_after_seconds: account::Wait::new(1) }
 }
 
 impl From<Busy> for Refusal {
@@ -215,10 +241,12 @@ impl Accounts {
     async fn with_password(&self, email: Email, password: Password, secret: DeviceSecret, described: Described) -> Result<Answer, Refusal> {
         let clock = self.clock.clone();
         let (asked, secret_for_check) = (email.clone(), secret.clone());
+        // A device this backend has never seen waits in the strangers' lane (C1).
+        let lane = if self.seen.has(Fingerprint::of(secret.expose_bytes()).as_bytes()) { Lane::Kept } else { Lane::Stranger };
         // (1) On the thread that writes: kept's check, bound to the account and device as they are.
         let prepared = self
             .desk
-            .ask(move |keeper| -> Result<Option<Prepared>, Refusal> {
+            .ask_in(lane, move |keeper| -> Result<Option<Prepared>, Refusal> {
                 let now = clock();
                 let Some(number) = keeper.account_named(asked.as_str()).map_err(not_dealt_with)? else {
                     // 8.3: an email with no account does the same work here as one with an
@@ -258,6 +286,7 @@ impl Accounts {
         let Checked::Match { derived, replacement } = checked else { return Err(wrong()) };
         // (3) On the thread that writes: the sign-in, made in the one step that looks again.
         let clock = self.clock.clone();
+        let seen = self.seen.clone();
         self.desk
             .ask(move |keeper| {
                 let now = clock();
@@ -266,7 +295,7 @@ impl Accounts {
                 if let Some(replacement) = replacement {
                     extra_passwords.push(replacement);
                 }
-                finish_sign_in(keeper, prepared.number, prepared.device, &secret, &described, &extra_passwords, now, |turn, fresh, previous| turn.sign_in(receipt, fresh, previous))
+                finish_sign_in(keeper, &seen, prepared.number, prepared.device, &secret, &described, &extra_passwords, now, |turn, fresh, previous| turn.sign_in(receipt, fresh, previous))
             })
             .await?
     }
@@ -298,6 +327,7 @@ impl Accounts {
         // lead's ruling of 14:06; a stranger at the other door cannot stop it).
         let stored = self.workers.fingerprint(&email, PasswordDoor::RedeemedCode, None, new_password).await?;
         let clock = self.clock.clone();
+        let seen = self.seen.clone();
         self.desk
             .ask(move |keeper| {
                 let now = clock();
@@ -312,7 +342,7 @@ impl Accounts {
                     .map_err(said)?;
                 let receipt = check.check(print, keeper.clock(now)).map_err(said)?;
                 let verifier = Fingerprint::from_bytes(stored.hash);
-                finish_sign_in(keeper, number, device, &secret, &described, std::slice::from_ref(&stored), now, |turn, fresh, previous| {
+                finish_sign_in(keeper, &seen, number, device, &secret, &described, std::slice::from_ref(&stored), now, |turn, fresh, previous| {
                     turn.redeem_code(receipt, verifier, fresh, previous)
                 })
             })
@@ -571,6 +601,7 @@ fn by_note(keeper: &mut Keeper, head: &RequestHead, note: SignOutNote, now: u64)
 #[allow(clippy::too_many_arguments)]
 fn finish_sign_in(
     keeper: &mut Keeper,
+    seen: &Seen,
     number: u64,
     device: DeviceId,
     secret: &DeviceSecret,
@@ -609,6 +640,7 @@ fn finish_sign_in(
         return Err(Refusal::NotDealtWith);
     }
     heard(keeper, device, now);
+    seen.add(*print.as_bytes());
     let state = account.state().clone();
     let shown = rows::shown(keeper.data().connection(), number).map_err(not_dealt_with)?.and_then(|shown| Name::new(&shown));
     let name = shown.unwrap_or_else(|| Name::new("You").expect("a fixed name is a name"));

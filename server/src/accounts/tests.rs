@@ -76,3 +76,50 @@ fn a_change_to_the_same_password_is_refused_and_a_retried_change_ends_no_new_ses
     assert_eq!(change(&bench, &a.session, a.restore, 8, PASSWORD, NEW), 403);
     assert_eq!(lists(&bench, &c.session, c.restore), 200, "the retried change ended a session made after it");
 }
+
+/// C1 (the review of S8): while strangers flood sign-in (new devices, made-up emails), a device
+/// the backend has seen signs in, and a recovery code is redeemed, each at the first try: the
+/// strangers fill only their own lane of the line, and are told "busy, come back in a second".
+#[test]
+fn a_known_device_and_a_recovery_code_get_through_a_flood_of_strangers() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let (bench, made) = Bench::new("flood", &[("known@example.test", false), ("recover@example.test", true)]);
+    bench::signed_in(&bench.sign_in(bench::with_code(&made[0].code, PASSWORD), 1));
+    bench.advance(2_000);
+    let stop = Arc::new(AtomicBool::new(false));
+    let busy = Arc::new(AtomicUsize::new(0));
+    let asked = Arc::new(AtomicUsize::new(0));
+    let mut flood = Vec::new();
+    for n in 0..256u32 {
+        let (accounts, stop, busy, asked) = (bench.accounts.clone(), stop.clone(), busy.clone(), asked.clone());
+        flood.push(bench.runtime.spawn(async move {
+            let mut round = 0u32;
+            while !stop.load(Ordering::SeqCst) {
+                round += 1;
+                let email = format!("stranger{n}-{round}@example.test");
+                let mut request = bench::sign_in(bench::with_password(&email, "not anyone's password at all"), 0);
+                let mut secret = [0x77u8; 32];
+                secret[..4].copy_from_slice(&n.to_be_bytes());
+                secret[4..8].copy_from_slice(&round.to_be_bytes());
+                request.device_secret = account::DeviceSecret::from_bytes(secret);
+                let answer = accounts.sign_in(request, false).await;
+                asked.fetch_add(1, Ordering::SeqCst);
+                if answer.status == 429 {
+                    busy.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            }
+        }));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let known = bench.sign_in(bench::with_password(made[0].email, PASSWORD), 1);
+    let recovered = bench.sign_in(bench::with_code(&made[1].code, PASSWORD), 9);
+    stop.store(true, Ordering::SeqCst);
+    for task in flood {
+        bench.runtime.block_on(task).unwrap();
+    }
+    assert!(busy.load(Ordering::SeqCst) > 0, "the flood never filled its lane ({} asked)", asked.load(Ordering::SeqCst));
+    assert_eq!(known.status, 200, "the known device was not let through: {:?}", account::read_reply::<account::SignedIn>(known.status, known.body.bytes()));
+    assert_eq!(recovered.status, 200, "the recovery code was not let through: {:?}", account::read_reply::<account::SignedIn>(recovered.status, recovered.body.bytes()));
+}
