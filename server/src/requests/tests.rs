@@ -205,7 +205,10 @@ use crate::accounts::{
 use crate::probe;
 use crate::serve::{self, Shell};
 use crate::store::keeper::First;
-use account::{DeviceKind, DeviceSecret, Name, OneTimeCode, Password, SignIn, SignedIn};
+use account::{
+    Credential as SignInCredential, DeviceKind, DeviceSecret, GrantIssued, Name, OneTimeCode,
+    Password, SignIn, SignedIn,
+};
 use nexus_core::nexus::proto::{SPEAKS, Version};
 
 const TEST_ORIGIN: &str = "https://nexus.example.org";
@@ -219,11 +222,13 @@ struct LidarrState {
     calls: Vec<String>,
 }
 
+type HeldResponse = (Mutex<Option<(&'static str, &'static str)>>, Condvar);
+
 struct MockLidarr {
     address: SocketAddr,
     state: Arc<Mutex<LidarrState>>,
     stop: Arc<AtomicBool>,
-    hold: Arc<(Mutex<bool>, Condvar)>,
+    hold: Arc<HeldResponse>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -236,7 +241,7 @@ impl MockLidarr {
         let available = state.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = stop.clone();
-        let hold = Arc::new((Mutex::new(false), Condvar::new()));
+        let hold: Arc<HeldResponse> = Arc::default();
         let blocked = hold.clone();
         let thread = thread::spawn(move || {
             while !stopped.load(Ordering::Relaxed) {
@@ -245,10 +250,10 @@ impl MockLidarr {
                         let incoming = question(&mut socket);
                         assert!(incoming.headers.get("x-api-key").is_some_and(|key| key == TEST_KEY));
                         let body = mock(&incoming, &mut lock(&available));
-                        if incoming.target == "/api/v1/artist" {
-                            let stop = lock(&blocked.0);
-                            drop(blocked.1.wait_while(stop, |held| *held).unwrap());
-                        }
+                        let stop = lock(&blocked.0);
+                        drop(blocked.1.wait_while(stop, |held| {
+                            *held == Some((incoming.method.as_str(), incoming.target.as_str()))
+                        }).unwrap());
                         let _ = response(&mut socket, "200 OK", "Content-Type: application/json\r\n", body.to_string().as_bytes());
                     }
                     Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => thread::sleep(Duration::from_millis(2)),
@@ -259,9 +264,17 @@ impl MockLidarr {
         Self { address, state, stop, hold, thread: Some(thread) }
     }
 
-    fn hold_artist_read(&self, held: bool) {
-        *lock(&self.hold.0) = held;
+    fn hold_response(&self, exchange: Option<(&'static str, &'static str)>) {
+        *lock(&self.hold.0) = exchange;
         self.hold.1.notify_all();
+    }
+
+    fn wait_for_call(&self, expected: &str) {
+        let until = Instant::now() + Duration::from_secs(8);
+        while !lock(&self.state).calls.iter().any(|call| call == expected) {
+            assert!(Instant::now() < until, "Lidarr did not receive {expected}");
+            thread::sleep(Duration::from_millis(15));
+        }
     }
 
     fn take_calls(&self) -> Vec<String> {
@@ -272,7 +285,7 @@ impl MockLidarr {
 impl Drop for MockLidarr {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        self.hold_artist_read(false);
+        self.hold_response(None);
         self.thread.take().unwrap().join().unwrap();
     }
 }
@@ -410,8 +423,13 @@ impl TestServer {
     }
 
     fn redeem(&self, code: OneTimeCode, device: u8, headers: &str) -> Person {
+        let credential = SignInCredential::Code { code, new_password: Password::new(PASSWORD).unwrap() };
+        self.sign_in(credential, device, headers)
+    }
+
+    fn sign_in(&self, credential: SignInCredential, device: u8, headers: &str) -> Person {
         let body = account::encode(&SignIn {
-            credential: account::Credential::Code { code, new_password: Password::new(PASSWORD).unwrap() },
+            credential,
             device_secret: DeviceSecret::from_bytes([device; 32]),
             device_name: Name::new("Requests test").unwrap(),
             device_kind: DeviceKind::Pc,
@@ -424,6 +442,16 @@ impl TestServer {
             account::Reply::Done { result, receipt } => Person { signed_in: result, restore: receipt.stamp.restore, headers: headers.to_owned() },
             refusal => panic!("sign-in failed: {refusal:?}"),
         }
+    }
+
+    fn grant(&self, who: &Person, headers: &str, action: admin::Action, number: u64) -> admin::Reply<GrantIssued> {
+        let request = admin::encode(&admin::RequestGrant {
+            head: RequestHead { speaks: SPEAKS, restore: who.restore },
+            change: admin::NamedChange { request_id: wire::RequestId::new(number).unwrap(), action },
+            password: Password::presented(PASSWORD).unwrap(),
+        }).unwrap();
+        let (status, body) = self.post(admin::REQUEST_GRANT, Some(&who.signed_in), headers, request.bytes());
+        admin::read_reply(status, &body).unwrap()
     }
 
     fn call(&self, who: &Person, call: Call) -> Answer {
@@ -591,25 +619,10 @@ fn the_lidarr_address_is_read_only_and_only_the_page_session_can_see_it() {
     let (server, [admin_code, member_code, _]) = TestServer::start("page", endpoint(lidarr.address));
     let page = server.redeem(admin_code, 1, TEST_PAGE);
     let app = server.redeem(member_code, 2, "");
-    let app_admin = {
-        let body = account::encode(&SignIn {
-            credential: account::Credential::Password {
-                email: account::Email::new("person0@example.org").unwrap(),
-                password: Password::presented(PASSWORD).unwrap(),
-            },
-            device_secret: DeviceSecret::from_bytes([4; 32]),
-            device_name: Name::new("Requests test app").unwrap(),
-            device_kind: DeviceKind::Pc,
-            app_version: Version::parse("0.41.0").unwrap(),
-            speaks: SPEAKS,
-            restore: None,
-        }).unwrap();
-        let (status, body) = server.post(account::SIGN_IN, None, "", body.bytes());
-        let account::Reply::Done { result, .. } = account::read_reply::<SignedIn>(status, &body).unwrap() else {
-            panic!("admin's app sign-in failed");
-        };
-        result
-    };
+    let app_admin = server.sign_in(SignInCredential::Password {
+        email: page.signed_in.person.email.clone(),
+        password: Password::presented(PASSWORD).unwrap(),
+    }, 4, "");
     let head = RequestHead { speaks: SPEAKS, restore: page.restore };
     let body = admin::encode(&admin::GetMusicServer { head }).unwrap();
     let (status, address) = server.post(GET_LIDARR, Some(&page.signed_in), TEST_PAGE, body.bytes());
@@ -617,21 +630,19 @@ fn the_lidarr_address_is_read_only_and_only_the_page_session_can_see_it() {
     assert_eq!(serde_json::from_slice::<Value>(&address).unwrap(),
         json!({"done":{"address":format!("http://{}", lidarr.address),"configured":true}}));
 
-    for (who, headers) in [(&page.signed_in, ""), (&app.signed_in, TEST_PAGE), (&app_admin, TEST_PAGE)] {
+    for (who, headers) in [(&page.signed_in, ""), (&app.signed_in, TEST_PAGE), (&app_admin.signed_in, TEST_PAGE)] {
         let (status, _) = server.post(GET_LIDARR, Some(who), headers, body.bytes());
         assert_eq!(status, 403);
     }
 
     // A page marker on a native admin's credential conveys no extra authority.
-    let request = admin::RequestGrant {
-        head: RequestHead { speaks: SPEAKS, restore: page.restore },
-        change: admin::NamedChange { request_id: wire::RequestId::new(20).unwrap(),
-            action: admin::Action::SetRequestsEnabled(admin::RequestsEnabled { account: AccountId::new(2).unwrap(), enabled: false }) },
-        password: Password::presented(PASSWORD).unwrap(),
-    };
-    let request = admin::encode(&request).unwrap();
-    assert_eq!(server.post(admin::REQUEST_GRANT, Some(&app_admin), TEST_PAGE, request.bytes()).0, 403);
-    assert_eq!(server.post(admin::REQUEST_GRANT, Some(&page.signed_in), TEST_PAGE, request.bytes()).0, 200);
+    let toggle = || admin::Action::SetRequestsEnabled(admin::RequestsEnabled {
+        account: app.signed_in.person.id,
+        enabled: false,
+    });
+    assert!(matches!(server.grant(&app_admin, TEST_PAGE, toggle(), 20),
+        admin::Reply::Refused(admin::Refusal::NotAllowed(admin::Denial::Denied))));
+    assert!(matches!(server.grant(&page, TEST_PAGE, toggle(), 20), admin::Reply::Done(_)));
     assert!(lidarr.take_calls().is_empty());
 }
 
@@ -706,15 +717,32 @@ fn restart_sees_the_begun_job_through_without_accepting_it_twice() {
     let (mut server, [_, member, _]) = TestServer::start_child("restart", lidarr.address, |_| {});
     let member = server.redeem(member, 2, "");
     let change = Change::Request { offer: server.offer(&member) };
-    lidarr.hold_artist_read(true);
+    lidarr.hold_response(Some(("GET", "/api/v1/artist")));
     let job = begun(server.call(&member, begin(1, change.clone())));
-    let until = Instant::now() + Duration::from_secs(4);
-    while !lock(&lidarr.state).calls.iter().any(|call| call == "GET artist") {
-        assert!(Instant::now() < until, "the worker never reached its first read");
-        thread::sleep(Duration::from_millis(15));
-    }
+    lidarr.wait_for_call("GET artist");
     server.kill_child();
-    lidarr.hold_artist_read(false);
+    lidarr.hold_response(None);
+    server.launch(lidarr.address);
+    assert_eq!(server.done(&member, job), Completed::Requested);
+    assert_eq!(begun(server.call(&member, begin(1, change))), job);
+    let calls = lidarr.take_calls();
+    assert_eq!(calls.iter().filter(|&line| line == "PUT album/monitor").count(), 1);
+    assert_eq!(calls.iter().filter(|&line| line == "POST command").count(), 1);
+}
+
+#[test]
+fn restart_after_lidarr_took_the_search_does_not_send_the_command_again() {
+    let lidarr = MockLidarr::start();
+    let (mut server, [_, member, _]) = TestServer::start_child("lost-lidarr-reply", lidarr.address, |_| {});
+    let member = server.redeem(member, 2, "");
+    let change = Change::Request { offer: server.offer(&member) };
+    lidarr.hold_response(Some(("POST", "/api/v1/command")));
+    let job = begun(server.call(&member, begin(1, change.clone())));
+    lidarr.wait_for_call("POST command");
+    assert!(matches!(server.call(&member, Call::After { job }), Answer::Working));
+
+    server.kill_child();
+    lidarr.hold_response(None);
     server.launch(lidarr.address);
     assert_eq!(server.done(&member, job), Completed::Requested);
     assert_eq!(begun(server.call(&member, begin(1, change))), job);
