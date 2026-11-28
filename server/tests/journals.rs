@@ -772,6 +772,17 @@ fn admin_accounts_require_authority_and_a_live_page_session() {
     }).unwrap();
 
     assert_eq!(fixture.post(admin::LIST_ACCOUNTS, Some(&other), list(&other_stamp).bytes()).0, 403);
+    let change = |number| account::encode(&admin::SetAccountEnabled {
+        head: head(&other_stamp),
+        request_id: RequestId::new(1).unwrap(),
+        grant: account::GrantSecret::from_bytes([0; 32]),
+        change: admin::AccountEnabled { account: account::AccountId::new(number).unwrap(), enabled: false },
+    }).unwrap();
+    let post = |number| fixture.post(admin::SET_ACCOUNT_ENABLED, Some(&other), change(number).bytes());
+    let denied = post(other.person.id.get());
+    assert_eq!(denied.0, 403);
+    assert_eq!(denied, post(9001));
+
     let (admin, stamp) = fixture.sign_in_with(with_password(), 3, BROWSER);
     let body = list(&stamp);
     let (status, rows) = fixture.post_with(admin::LIST_ACCOUNTS, Some(&admin), BROWSER, body.bytes());

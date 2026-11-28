@@ -7,7 +7,7 @@ use nexus_core::nexus::admin::{
     Devices, DiagnosticsDefault, ListAccounts, ListDevices, MusicState, NamedChange, PasswordReset,
     Refusal, Reply,
 };
-use nexus_core::nexus::kept::{Bearer, DataChange, Fingerprint, GrantUse, LeaveFor, SessionKind, Status};
+use nexus_core::nexus::kept::{Account, Bearer, DataChange, Fingerprint, GrantUse, LeaveFor, SessionKind, Status};
 use nexus_core::nexus::proto::Version;
 use rusqlite::params;
 
@@ -16,8 +16,10 @@ use super::session::{Accounts, Answer};
 use super::{rows, setup};
 use crate::store::{data::Change, keeper::{First, Keeper}};
 
-fn read_authority(keeper: &mut Keeper, head: &RequestHead, hash: &Fingerprint, now: u64) -> Result<(), Refusal> {
-    let (_, device, mut actor) = caller(keeper, head, hash)?;
+fn check_admin(
+    keeper: &mut Keeper, actor: &mut Account, head: &RequestHead, device: DeviceId,
+    hash: &Fingerprint, now: u64,
+) -> Result<(), Refusal> {
     actor
         .request(head.restore, keeper.clock(now), |turn| turn.admin_read(Bearer { device, hash, grant: None }))
         .apply(|effects| keeper.persist(effects, &[], now))
@@ -77,7 +79,10 @@ fn list_devices(keeper: &Keeper, after: Option<admin::DeviceCursor>) -> Result<D
          ORDER BY devices.account, devices.id LIMIT ?3",
     ).map_err(not_dealt_with)?;
     let (account, device) = after.map_or((0, 0), |after| (after.account.get(), after.device.get()));
-    let rows = query.query_map(params![cursor(account), cursor(device), (admin::DEVICES_PER_PAGE + 1) as i64], |row| {
+    let Ok(account) = i64::try_from(account) else {
+        return Devices::new(Vec::new(), false).ok_or(Refusal::NotDealtWith);
+    };
+    let rows = query.query_map(params![account, cursor(device), (admin::DEVICES_PER_PAGE + 1) as i64], |row| {
         Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?,
             row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, i64>(5)?,
             row.get::<_, Option<i64>>(6)?))
@@ -107,6 +112,7 @@ fn spend<T: admin::Change>(
     reset_print: Option<&[u8; 32]>,
 ) -> Result<(), Refusal> {
     let (number, device, mut actor) = caller(keeper, &request.head, hash)?;
+    check_admin(keeper, &mut actor, &request.head, device, hash, now)?;
     let change = NamedChange::for_request(request);
     let mut other = change.action.target_account()
         .map(|id| target(keeper, number, id)).transpose()?.flatten();
@@ -137,7 +143,9 @@ impl Accounts {
     ) -> Answer {
         let clock = self.clock.clone();
         flatten(self.desk.ask(move |keeper| {
-            read_authority(keeper, &head, &Fingerprint::of(session.expose_bytes()), clock())?;
+            let hash = Fingerprint::of(session.expose_bytes());
+            let (_, device, mut actor) = caller(keeper, &head, &hash)?;
+            check_admin(keeper, &mut actor, &head, device, &hash, clock())?;
             read(keeper).map(|page| answer(Reply::Done(page)))
         }).await)
     }
