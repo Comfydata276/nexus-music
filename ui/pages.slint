@@ -2974,9 +2974,12 @@ export component LoginPage inherits Rectangle {
                     }
 
                     Text {
+                        // (Shorter in a small window, so that the form and its button fit.)
                         text: root.code
-                            ? "Type your Nexus server's address, the one-time code its admin gave you, and the password you'll sign in with from now on: at least 15 characters."
-                            : "Type your Nexus server's address, and the email and password of your account there.";
+                            ? (root.short ? "Your one-time code, and the password you'll use from now on: at least 15 characters."
+                                : "Type your Nexus server's address, the one-time code its admin gave you, and the password you'll sign in with from now on: at least 15 characters.")
+                            : (root.short ? "Your Nexus server's address, and your account's email and password."
+                                : "Type your Nexus server's address, and the email and password of your account there.");
                         color: Theme.muted;
                         font-size: 14px;
                         wrap: word-wrap;
@@ -3058,7 +3061,7 @@ export component LoginPage inherits Rectangle {
                         wrap: word-wrap;
                     }
 
-                    Rectangle {
+                    if !root.short: Rectangle {
                         height: 2px;
                     }
 
@@ -3066,7 +3069,7 @@ export component LoginPage inherits Rectangle {
                         text: App.login-busy ? "Signing in…" : App.login-wait > 0 ? "Try again in " + App.login-wait + " s" : "Sign in";
                         primary: true;
                         enabled: !App.login-busy && App.login-wait <= 0;
-                        height: 46px;
+                        height: root.short ? 42px : 46px;
                         clicked => { root.go(); }
                     }
 
@@ -3096,7 +3099,8 @@ export component LoginPage inherits Rectangle {
                     }
 
                     Text {
-                        text: "Your password goes only to your Nexus server, and is never kept on this PC. What this PC keeps of your sign-in is in Windows Credential Manager.";
+                        text: root.short ? "Your password goes only to your Nexus server, and is never kept on this PC."
+                            : "Your password goes only to your Nexus server, and is never kept on this PC. What this PC keeps of your sign-in is in Windows Credential Manager.";
                         color: Theme.faint;
                         font-size: 12px;
                         wrap: word-wrap;
