@@ -7,7 +7,7 @@ use nexus_core::nexus::admin::{
     Devices, DiagnosticsDefault, ListAccounts, ListDevices, NamedChange, PasswordReset,
     Refusal, Reply,
 };
-use nexus_core::nexus::kept::{AdminAction, Bearer, DataChange, Fingerprint, GrantUse, LeaveFor, Status};
+use nexus_core::nexus::kept::{ADMIN_PAGE_IDLE_MS, AdminAction, Bearer, DataChange, Fingerprint, GrantUse, LeaveFor, Status};
 use nexus_core::nexus::proto::Version;
 use rusqlite::params;
 
@@ -54,34 +54,41 @@ fn list_accounts(keeper: &mut Keeper, after: Option<AccountId>, internal: &str) 
     AccountPage::new(rows, more).ok_or(Refusal::NotDealtWith)
 }
 
-fn list_devices(keeper: &Keeper, after: Option<admin::DeviceCursor>) -> Result<Devices, Refusal> {
+fn list_devices(keeper: &Keeper, after: Option<admin::DeviceCursor>, now: u64) -> Result<Devices, Refusal> {
     let mut query = keeper.data().connection().prepare(
         "SELECT devices.account, devices.id, devices.name, devices.kind, devices.version,
-                max(devices.first_signed_in, coalesce(devices.last_heard, 0)), sessions.id
+                CASE sessions.kind WHEN 'page' THEN sessions.last_used
+                     ELSE max(devices.first_signed_in, coalesce(devices.last_heard, 0)) END,
+                sessions.id, coalesce(sessions.kind, '') = 'page'
          FROM devices LEFT JOIN sessions ON sessions.device = devices.id
          WHERE (devices.account, devices.id) > (?1, ?2)
-           AND (sessions.kind IS NULL OR sessions.kind = 'app')
+           AND CASE sessions.kind WHEN 'page' THEN sessions.last_used > ?4
+                    ELSE substr(devices.version, 1, length(?5)) != ?5 END
          ORDER BY devices.account, devices.id LIMIT ?3",
     ).map_err(not_dealt_with)?;
     let (account, device) = after.map_or((0, 0), |after| (after.account.get(), after.device.get()));
     let Ok(account) = i64::try_from(account) else {
         return Devices::new(Vec::new(), false).ok_or(Refusal::NotDealtWith);
     };
-    let rows = query.query_map(params![account, cursor(device), (admin::DEVICES_PER_PAGE + 1) as i64], |row| {
+    let idle_cutoff = cursor(now).saturating_sub(cursor(ADMIN_PAGE_IDLE_MS));
+    let rows = query.query_map(params![account, cursor(device), (admin::DEVICES_PER_PAGE + 1) as i64,
+        idle_cutoff, rows::PAGE_VERSION_PREFIX], |row| {
         Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?,
             row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, i64>(5)?,
-            row.get::<_, Option<i64>>(6)?))
+            row.get::<_, Option<i64>>(6)?, row.get::<_, bool>(7)?))
     }).map_err(not_dealt_with)?;
     let mut rows = rows.map(|row| {
-        let (account, device, name, kind, version, heard, session) = row.map_err(not_dealt_with)?;
+        let (account, device, name, kind, version, heard, session, page) = row.map_err(not_dealt_with)?;
         Ok(AdminDevice {
             account: AccountId::new(unsigned(account)?).ok_or(Refusal::NotDealtWith)?,
             device: DeviceId::new(unsigned(device)?).ok_or(Refusal::NotDealtWith)?,
-            name: Name::new(&name).ok_or(Refusal::NotDealtWith)?,
+            name: Name::new(if page { "Admin page" } else { &name }).ok_or(Refusal::NotDealtWith)?,
             kind: if kind == "phone" { DeviceKind::Phone } else { DeviceKind::Pc },
-            app_version: Version::parse(&version).ok_or(Refusal::NotDealtWith)?,
+            app_version: Version::parse(version.strip_prefix(rows::PAGE_VERSION_PREFIX).unwrap_or(&version))
+                .ok_or(Refusal::NotDealtWith)?,
             last_seen_ms: unsigned(heard)?,
             session: session.map(unsigned).transpose()?.and_then(SessionId::new),
+            page,
         })
     }).collect::<Result<Vec<_>, _>>()?;
     let more = rows.len() > admin::DEVICES_PER_PAGE;
@@ -164,7 +171,10 @@ impl Accounts {
     }
 
     pub async fn admin_devices(&self, session: account::Session, request: ListDevices) -> Answer {
-        self.read_admin(session, request.head, move |keeper| list_devices(keeper, request.after)).await
+        let clock = self.clock.clone();
+        self.read_admin(session, request.head, move |keeper| {
+            list_devices(keeper, request.after, keeper.clock(clock()).effective())
+        }).await
     }
 
     pub async fn get_diagnostics_default(&self, session: account::Session, request: admin::GetDiagnosticsDefault) -> Answer {

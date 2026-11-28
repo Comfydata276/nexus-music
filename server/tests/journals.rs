@@ -839,3 +839,64 @@ fn the_diagnostics_default_needs_a_matching_grant_and_reaches_hello() {
     assert_eq!(status, 200);
     assert_eq!(json::<bool>(&hello, "$.diagnostics"), false);
 }
+
+#[test]
+fn admin_devices_show_live_page_sessions_and_omit_forced_out_or_idle_pages() {
+    use nexus_core::nexus::admin;
+
+    let mut fixture = Fixture::new("admin-page-devices");
+    let code = fixture.set_up();
+    let clock = fixture.start_with_clock();
+    let (admin, stamp) = fixture.sign_in_with(with_code(code), 1, BROWSER);
+    let (other, _) = fixture.sign_in_with(with_password(), 2, BROWSER);
+    // This App session exercises only the native device list.
+    let (app, app_stamp) = fixture.sign_in(with_password(), 3);
+
+    let devices = |admin, stamp: &Stamp| {
+        let request = admin::encode(&admin::ListDevices { head: head(stamp), after: None }).unwrap();
+        let (status, body) = fixture.post_with(admin::LIST_DEVICES, Some(admin), BROWSER, request.bytes());
+        match admin::read_reply::<admin::Devices>(status, &body).unwrap() {
+            admin::Reply::Done(devices) => devices,
+            _ => panic!("admin devices were refused"),
+        }
+    };
+    let live = devices(&admin, &stamp);
+    let is_other = |row: &admin::AdminDevice| row.device == other.device;
+    assert_eq!(live.rows().len(), 3);
+    let browser_row = live.rows().iter().find(|row| is_other(row)).unwrap();
+    assert!(browser_row.page);
+    assert_eq!(browser_row.session, Some(other.session_id));
+    assert_eq!(browser_row.name.as_str(), "Admin page");
+    assert!(browser_row.last_seen_ms > 0);
+    let (status, native) = fixture.post(account::LIST_DEVICES, Some(&app), page(&app_stamp, None).bytes());
+    assert_eq!(status, 200);
+    assert_eq!(json::<i64>(&native, "$.done.result.devices[0].id"), app.device.get() as i64);
+    assert_eq!(json::<Option<i64>>(&native, "$.done.result.devices[1].id"), None);
+
+    let request_id = RequestId::new(41).unwrap();
+    let target = || admin::SessionTarget {
+        account: other.person.id, device: other.device, session: other.session_id,
+    };
+    let request = admin::encode(&admin::RequestGrant {
+        head: head(&stamp),
+        change: admin::NamedChange { request_id, action: admin::Action::ForceOut(target()) },
+        password: Password::presented(PASSWORD).unwrap(),
+    }).unwrap();
+    let (status, body) = fixture.post_with(admin::REQUEST_GRANT, Some(&admin), BROWSER, request.bytes());
+    let grant = match admin::read_reply::<GrantIssued>(status, &body).unwrap() {
+        admin::Reply::Done(issued) => issued.grant,
+        _ => panic!("no grant was issued"),
+    };
+    let force = admin::encode(&admin::ForceOut { head: head(&stamp), request_id, grant, change: target() }).unwrap();
+    assert_eq!(fixture.post_with(admin::FORCE_OUT, Some(&admin), BROWSER, force.bytes()).0, 200);
+    assert_eq!(devices(&admin, &stamp).rows().len(), 2);
+    let list = admin::encode(&admin::ListDevices { head: head(&stamp), after: None }).unwrap();
+    assert_eq!(fixture.post_with(admin::LIST_DEVICES, Some(&other), BROWSER, list.bytes()).0, 401);
+
+    clock.fetch_add(admin::PAGE_SESSION_IDLE_MS, Ordering::SeqCst);
+    let (fresh, fresh_stamp) = fixture.sign_in_with(with_password(), 4, BROWSER);
+    let remaining = devices(&fresh, &fresh_stamp);
+    assert_eq!(remaining.rows().len(), 2);
+    assert_eq!(remaining.rows().iter().find(|row| row.page).unwrap().session, Some(fresh.session_id));
+    assert!(remaining.rows().iter().any(|row| row.device == app.device && !row.page));
+}

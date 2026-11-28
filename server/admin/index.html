@@ -490,16 +490,20 @@ dd, li { overflow-wrap: anywhere; }
 
   function deviceRow(row) {
     if (typeof row.name !== "string" || typeof row.app_version !== "string" ||
-        !["pc", "phone"].includes(row.kind)) throw new Error();
-    if (row.session !== null) id(row.session);
+        !["pc", "phone"].includes(row.kind) || typeof row.page !== "boolean") throw new Error();
+    if (row.session !== null || row.page) id(row.session);
     if (!isU64(row.last_seen_ms)) throw new Error();
-    const heard = row.last_seen_ms === 0n ? "Never heard from" :
-      row.last_seen_ms <= 8640000000000000n ? "Last heard " + new Date(Number(row.last_seen_ms)).toLocaleString() :
-      "Last-heard time unavailable";
+    const lastSeen = row.last_seen_ms <= 8640000000000000n && row.last_seen_ms > 0n ?
+      new Date(Number(row.last_seen_ms)).toLocaleString() : null;
+    const heard = lastSeen ? "Last heard " + lastSeen : "Last-heard time unavailable";
+    const name = row.page ? "Admin page" : row.name;
+    const label = row.page
+      ? name + (row.session === session.id ? " · This tab" : " · Signed in") +
+        (lastSeen ? " · Last used " + lastSeen : "")
+      : name + " · " + (row.kind === "pc" ? "PC" : "Phone") + " · " + row.app_version +
+        " · " + (row.last_seen_ms === 0n ? "Never heard from" : heard) + (row.session === null ? " · Signed out" : "");
     return {
-      after: { account: id(row.account), device: id(row.device) }, name: row.name, session: row.session,
-      label: row.name + " · " + (row.kind === "pc" ? "PC" : "Phone") + " · " + row.app_version +
-        " · " + heard + (row.session === null ? " · Signed out" : ""),
+      after: { account: id(row.account), device: id(row.device) }, name, session: row.session, page: row.page, label,
     };
   }
 
@@ -676,16 +680,20 @@ dd, li { overflow-wrap: anywhere; }
     entry.append(owner);
     if (!deviceOwners.has(account)) deviceOwners.set(account, []);
     deviceOwners.get(account).push(owner);
-    if (row.session === null) return;
+    if (row.session === null || row.session === session.id) return;
     const buttons = document.createElement("div");
     buttons.className = "row-actions";
-    buttons.append(makeButton("Sign this device out", () => {
+    const label = row.page ? "Sign this admin page out" : "Sign this device out";
+    buttons.append(makeButton(label, () => {
       const body = { ...row.after, session: row.session };
       const owner = accountNames.get(row.after.account);
-      reviewChange("force-out", body, body, "Sign this device out",
-        "Sign out " + row.name + (owner ? " (" + owner + ")" : "") + " from Nexus Music.",
-        { note: "It can still reach your music server until you change that person’s music server password. Downloaded music stays on the device.",
-          saved: "Device signed out of Nexus Music.", refresh: "devices" });
+      const person = owner ? " (" + owner + ")" : "";
+      const summary = row.page ? "End the other admin page session" + person + "." :
+        "Sign out " + row.name + person + " from Nexus Music.";
+      const note = row.page ? "This tab will stay signed in." :
+        "It can still reach your music server until you change that person’s music server password. Downloaded music stays on the device.";
+      reviewChange("force-out", body, body, label, summary,
+        { note, saved: row.page ? "Other admin page signed out." : "Device signed out of Nexus Music.", refresh: "devices" });
     }));
     entry.append(buttons);
   }
@@ -1165,13 +1173,14 @@ dd, li { overflow-wrap: anywhere; }
           signedIn?.person?.admin !== true ||
           typeof signedIn.person.email !== "string" ||
           (!isU64(signedIn.person.id) || signedIn.person.id === 0n || signedIn.person.id !== stamp?.account) ||
+          !isU64(signedIn.session_id) || signedIn.session_id === 0n ||
           typeof signedIn.session !== "string" || !/^[0-9a-f]{64}$/.test(signedIn.session) ||
           signedIn.music !== "none_set_yet" ||
           !isU64(restore) || restore !== stamp?.restore) {
         writeText(status, "Use an administrator account to sign in here.");
         return;
       }
-      session = { bearer: signedIn.session, account: signedIn.person.id, restore,
+      session = { bearer: signedIn.session, id: signedIn.session_id, account: signedIn.person.id, restore,
         lastUse: started, controller: new AbortController() };
       if (!checkIdle()) return;
       setupDetails.open = false;

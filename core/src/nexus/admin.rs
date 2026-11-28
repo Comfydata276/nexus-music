@@ -184,6 +184,7 @@ object! {
         app_version: Version,
         last_seen_ms: u64,
         session: Option<SessionId>,
+        page: bool,
     }
 }
 
@@ -759,6 +760,7 @@ mod tests {
             app_version: Version { major: u32::MAX, minor: u32::MAX, patch: u32::MAX },
             last_seen_ms: u64::MAX,
             session: signed_in.then(|| SessionId::new(u64::MAX).unwrap()),
+            page: signed_in,
         }
     }
 
