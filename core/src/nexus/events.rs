@@ -475,7 +475,7 @@ fn trim_start(kind: &mut Kind, mut over: usize) -> Result<(), Wrong> {
         return Err(Wrong::Size);
     };
     let search = if let PlayedFrom::Search { words } = from {
-        // The remaining search prefix must still contain a non-whitespace character.
+        // Retain a non-whitespace character when the query has one.
         let minimum = words.char_indices().find(|(_, ch)| !ch.is_whitespace())
             .map_or(0, |(offset, ch)| offset + ch.len_utf8());
         Some((words, minimum))
@@ -631,19 +631,30 @@ impl Placed {
         self.check_size()
     }
 
-    fn from_raw(raw: &RawValue) -> Result<Self, Wrong> {
+    fn parse_raw(raw: &RawValue) -> Result<Self, Wrong> {
         if raw.get().len() > EVENT_BYTES {
             return Err(Wrong::Size);
         }
         let fields = Fields::read(raw)?;
-        let event = Self {
+        Ok(Self {
             record: Record {
                 id: fields.get("id")?,
                 at_ms: fields.get("at_ms")?,
                 kind: fields.get("event")?,
             },
             sequence: fields.get("sequence")?,
-        };
+        })
+    }
+
+    fn from_raw(raw: &RawValue) -> Result<Self, Wrong> {
+        let event = Self::parse_raw(raw)?;
+        event.check()?;
+        Ok(event)
+    }
+
+    fn from_upload(raw: &RawValue) -> Result<Self, Wrong> {
+        let mut event = Self::parse_raw(raw)?;
+        event.record.kind.clean_display(clean_display_text);
         event.check()?;
         Ok(event)
     }
@@ -1027,7 +1038,8 @@ pub struct IncomingBatch {
 impl IncomingBatch {
     /// The design does not say how to answer a malformed entry with no usable id.
     /// Refuse that batch. An entry with a usable id and bad fields can be refused on
-    /// its own. Bad JSON, including a duplicate key anywhere, refuses the whole body.
+    /// its own. Clean display fields before validating each upload for storage.
+    /// Bad JSON, including a duplicate key anywhere, refuses the whole body.
     pub fn read(bytes: &[u8]) -> Result<Self, Wrong> {
         wire::read_value(bytes, BATCH_BYTES).map_err(Into::into)
     }
@@ -1047,7 +1059,7 @@ impl IncomingBatch {
             if !seen.insert(id) {
                 return Err(Wrong::RepeatedId);
             }
-            events.push((id, Placed::from_raw(raw)));
+            events.push((id, Placed::from_upload(raw)));
         }
         Ok(Self { head, life, events })
     }

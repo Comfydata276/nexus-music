@@ -293,6 +293,8 @@ async fn send(State(calls): State<Calls>, headers: HeaderMap, body: Bytes) -> Re
         // A live session reserves its account's batch place before parsing.
         let permit = admit_upload(&calls, &hash, UploadLimit::Account, &body).await?;
         let (permit, (head, life, rows)) = tokio::task::spawn_blocking(move || {
+            // Core checks the raw byte ceilings, then cleans and validates
+            // each event's display fields before this worker serializes it.
             let batch = IncomingBatch::read(&body).map_err(|_| Refusal::Malformed)?;
             Ok::<_, Refusal>((permit, prepare(batch)))
         }).await.map_err(unavailable)??;
