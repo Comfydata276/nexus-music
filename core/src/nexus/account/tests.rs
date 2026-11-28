@@ -785,6 +785,28 @@ fn the_other_door_waits_for_its_worker_for_ten_seconds_and_holds_eight() {
 }
 
 #[test]
+fn a_verified_code_uses_the_reserved_worker_without_password_backoff() {
+    use PasswordDoor::{KnownDevice, Other, RedeemedCode};
+    let email = Email::new("owner@example.test").unwrap();
+    let device = Some(id(1));
+    let mut waits = PasswordWaits::default();
+    waits.record_wrong(Other, &email, None, 0);
+    waits.record_wrong(KnownDevice, &email, device, 0);
+
+    let free = load(false, false, 0);
+    assert_eq!(admit_password_check(RedeemedCode, free, &waits, &email, None, 0), PasswordAdmission::Check);
+    for busy in [load(true, false, 0), load(false, true, 0)] {
+        assert_eq!(admit_password_check(RedeemedCode, busy, &waits, &email, None, 0), PasswordAdmission::Busy);
+    }
+
+    waits.record_wrong(RedeemedCode, &email, None, 0);
+    waits.record_wrong(RedeemedCode, &email, device, 0);
+    assert_eq!(waits.retry_after(RedeemedCode, &email, None, 0), None);
+    assert_eq!(waits.retry_after(Other, &email, None, 0), Wait::new(1));
+    assert_eq!(waits.retry_after(KnownDevice, &email, device, 0), Wait::new(1));
+}
+
+#[test]
 fn wrong_password_waits_double_to_a_minute_without_preventing_the_next_check() {
     let email = email();
     let mut waits = PasswordWaits::default();

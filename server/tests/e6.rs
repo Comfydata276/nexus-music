@@ -59,9 +59,9 @@ fn start(proxy: &str) -> Running {
         )
         .route("/nexus/api/test/cookie", get(|| async { ([(SET_COOKIE, "session=x"), (CACHE_CONTROL, "public, max-age=600")], "kept?") }))
         .route("/nexus/api/test/large", get(|| async { vec![b'a'; LARGE] }));
-    let mut routes = nexus_music_server::head::ROUTES.to_vec();
+    let mut routes: Vec<nexus_music_server::head::Route> = nexus_music_server::head::ROUTES.iter().copied().filter(|route| route.path == nexus_core::nexus::proto::HELLO).collect();
     for path in ["/nexus/api/test/fault", "/nexus/api/test/stall", "/nexus/api/test/cookie", "/nexus/api/test/large"] {
-        routes.push((path, "GET"));
+        routes.push((path, "GET").into());
     }
     let proxy: IpAddr = proxy.parse().unwrap();
     let shell = Shell::with_routes(proxy, router, routes);

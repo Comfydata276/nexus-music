@@ -12,6 +12,7 @@
 pub mod account;
 pub mod admin;
 pub mod client;
+pub mod compare;
 pub mod diag;
 pub mod events;
 pub mod kept;
