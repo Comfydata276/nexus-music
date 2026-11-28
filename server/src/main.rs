@@ -17,7 +17,8 @@ use std::sync::Arc;
 use nexus_music_server::accounts::check::PasswordWorkers;
 use nexus_music_server::accounts::desk::Desk;
 use nexus_music_server::accounts::music::MusicSide;
-use nexus_music_server::accounts::session::{Accounts, Seen};
+use nexus_music_server::accounts::admit::Admission;
+use nexus_music_server::accounts::session::Accounts;
 use nexus_music_server::music::MusicClient;
 use nexus_music_server::accounts::{rows, setup};
 use nexus_music_server::store::keeper::{self, Keeper};
@@ -145,7 +146,7 @@ fn run(settings: Settings) -> ExitCode {
         return ExitCode::from(2);
     }
     // The data and the store kept apart, compared before anything is served (design 9.2, 11.2).
-    let (keeper, started) = match Keeper::open(&settings.state, &settings.data, now()) {
+    let (mut keeper, started) = match Keeper::open(&settings.state, &settings.data, now()) {
         Ok(opened) => opened,
         Err(why) => {
             eprintln!("{why}");
@@ -172,10 +173,11 @@ fn run(settings: Settings) -> ExitCode {
         }
     };
     let diagnostics_default = rows::diagnostics_default(keeper.data().connection()).ok().flatten();
-    let seen = match rows::device_secrets(keeper.data().connection()) {
-        Ok(prints) => Arc::new(Seen::new(prints)),
-        Err(_) => {
-            eprintln!("The devices couldn't be read from the data.");
+    // The cheap read path and the devices each account knows (the review of S8, C1).
+    let admission = match Admission::open(&mut keeper, Arc::new(now)) {
+        Ok(admission) => Arc::new(admission),
+        Err(why) => {
+            eprintln!("{why}");
             return ExitCode::FAILURE;
         }
     };
@@ -186,14 +188,15 @@ fn run(settings: Settings) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    // 9.3: the music server's client, trusting this machine's certificates for the address
-    // people use (by HTTPS); the container's own address is the setting alone.
+    // 9.3: the music server's client, for the container's own address alone (the setting); it
+    // trusts this machine's certificates if that address is HTTPS. The address people use is
+    // never connected to.
     let (client, roots) = MusicClient::from_this_machine();
-    if roots == 0 {
-        println!("No trusted certificates were found on this machine: the address people use for the music server cannot be checked by HTTPS, so no music login can be set.");
+    if roots == 0 && settings.music_server.starts_with("https:") {
+        println!("No trusted certificates were found on this machine: NEXUS_MUSIC_SERVER is HTTPS, so the music server cannot be asked and no music login can be set.");
     }
-    let music = MusicSide { client, internal: settings.music_server.clone() };
-    let accounts = Arc::new(Accounts { desk, workers, set_up_code, clock: Arc::new(now), backend: id, seen, music });
+    let music = MusicSide::new(client, settings.music_server.clone());
+    let accounts = Arc::new(Accounts { desk, workers, set_up_code, clock: Arc::new(now), backend: id, admission, music });
     nightly(settings.data.clone());
     let runtime = match tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build() {
         Ok(runtime) => runtime,

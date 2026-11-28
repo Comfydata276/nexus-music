@@ -131,6 +131,13 @@ pub fn devices(data: &Connection, account: u64, after: Option<DeviceId>, limit: 
 
 /// The fingerprint of every device secret the data has a device for (which lane a sign-in waits
 /// in: `session::Seen`).
+/// Every account's number.
+pub fn account_numbers(data: &Connection) -> rusqlite::Result<Vec<u64>> {
+    let mut statement = data.prepare("SELECT number FROM accounts ORDER BY number")?;
+    let found = statement.query_map([], |row| unsigned(row.get(0)?))?.collect();
+    found
+}
+
 pub fn device_secrets(data: &Connection) -> rusqlite::Result<Vec<[u8; 32]>> {
     let mut statement = data.prepare("SELECT secret FROM devices")?;
     let found = statement.query_map([], |row| bytes32(row, 0))?.collect();
@@ -138,19 +145,19 @@ pub fn device_secrets(data: &Connection) -> rusqlite::Result<Vec<[u8; 32]>> {
 }
 
 /// An account's music login as the data keeps it (S9; the form is S3b's `music_logins`): the
-/// sealed password with what it was sealed for, and the internal address it was checked at.
+/// sealed password with what it was sealed for, the internal address it was checked at among it.
 /// `None` when the data has none, or what it has is not a login's shape (then nothing opens).
-pub fn music_login(data: &Connection, backend: nexus_core::nexus::proto::BackendId, account: u64) -> rusqlite::Result<Option<(nexus_core::nexus::music::MusicInstallation, String)>> {
-    use nexus_core::nexus::account::{AccountId, MusicAddress};
+pub fn music_login(data: &Connection, backend: nexus_core::nexus::proto::BackendId, account: u64) -> rusqlite::Result<Option<nexus_core::nexus::music::MusicInstallation>> {
+    use nexus_core::nexus::account::AccountId;
     use nexus_core::nexus::music::{CredentialBinding, MusicInstallation, SealedCredential};
     let found = data
-        .query_row("SELECT count, address, name, sealed, internal FROM music_logins WHERE account = ?1", [signed(account)?], |row| {
-            Ok((unsigned(row.get(0)?)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Vec<u8>>(3)?, row.get::<_, String>(4)?))
+        .query_row("SELECT count, name, sealed, internal FROM music_logins WHERE account = ?1", [signed(account)?], |row| {
+            Ok((unsigned(row.get(0)?)?, row.get::<_, String>(1)?, row.get::<_, Vec<u8>>(2)?, row.get::<_, String>(3)?))
         })
         .optional()?;
-    Ok(found.and_then(|(count, address, name, sealed, internal)| {
-        let binding = CredentialBinding { backend, account: AccountId::new(account)?, address: MusicAddress::new(&address)?, name: Name::new(&name)?, count };
-        Some((MusicInstallation { binding, sealed: SealedCredential::from_bytes(&sealed)? }, internal))
+    Ok(found.and_then(|(count, name, sealed, internal)| {
+        let binding = CredentialBinding { backend, account: AccountId::new(account)?, internal, name: Name::new(&name)?, count };
+        Some(MusicInstallation { binding, sealed: SealedCredential::from_bytes(&sealed)? })
     }))
 }
 

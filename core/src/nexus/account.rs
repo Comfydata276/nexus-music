@@ -635,6 +635,22 @@ pub const NOTICE_MAX_BYTES: usize = 2048;
 pub struct Notice(String);
 
 impl Notice {
+    /// The §13.6 sign-in notice for a backend that records listening events.
+    pub fn recording() -> Self {
+        Self(concat!(
+            "What this server records\n\n",
+            "Every song you start, when, from which device, and what you were playing it from. ",
+            "How long you listened, and whether you skipped, paused or moved within it. ",
+            "The words you type into search, including searches that find nothing. ",
+            "When you open the app, and when it goes wrong.\n\n",
+            "Whoever runs this server can see all of it and can keep a copy. You can delete ",
+            "yours under Settings. That does not reach a copy already taken, or the server's ",
+            "own backups for the seven nights it keeps them.\n\n",
+            "This device also sends its Diagnostics page, unless you turn that off there. ",
+            "That is a separate thing. The Diagnostics page says nothing of what you play.",
+        ).into())
+    }
+
     pub fn new(text: &str) -> Option<Self> {
         (!text.trim().is_empty() && text.len() <= NOTICE_MAX_BYTES && !text.chars().any(|c| c.is_control() && c != '\n'))
             .then(|| Self(text.to_owned()))
@@ -736,6 +752,17 @@ object! {
         new_password: Password,
     }
     check(value) { value.new_password.check_new_length() }
+}
+
+impl ChangePassword {
+    /// Apply the worker's comparison of the candidate with the current verifier
+    /// before creating or consuming leave for this change.
+    pub fn check_replacement(matches_current: bool) -> Result<(), Refusal> {
+        if matches_current {
+            return Err(Refusal::Malformed);
+        }
+        Ok(())
+    }
 }
 
 object! {

@@ -14,23 +14,26 @@ const PASSWORD_MAX_BYTES: usize = 4096;
 pub struct CredentialBinding {
     pub backend: BackendId,
     pub account: AccountId,
-    pub address: MusicAddress,
+    /// The exact NEXUS_MUSIC_SERVER setting at the time of the check.
+    pub internal: String,
     pub name: Name,
     pub count: u64,
 }
 
 impl CredentialBinding {
     fn associated_data(&self) -> Vec<u8> {
-        let address = self.address.as_str().as_bytes();
+        let internal = self.internal.as_bytes();
         let name = self.name.as_str().as_bytes();
-        let mut bytes = b"Nexus Music credential v1\0".to_vec();
+        // V1 authenticated the device address. Keep v2 separate even if the
+        // two addresses happen to have the same spelling.
+        let mut bytes = b"Nexus Music credential v2\0".to_vec();
         bytes.extend_from_slice(self.backend.as_bytes());
         bytes.extend_from_slice(&self.account.get().to_be_bytes());
         bytes.extend_from_slice(&self.count.to_be_bytes());
         // The design does not say how to encode consecutive variable fields.
         // Widths and lengths keep every binding byte unambiguous.
-        bytes.extend_from_slice(&(address.len() as u64).to_be_bytes());
-        bytes.extend_from_slice(address);
+        bytes.extend_from_slice(&(internal.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(internal);
         bytes.extend_from_slice(&(name.len() as u64).to_be_bytes());
         bytes.extend_from_slice(name);
         bytes

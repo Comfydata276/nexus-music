@@ -437,6 +437,18 @@ impl PasswordWorkers {
         }
     }
 
+    /// Records a wrong try at `door` after a real check that matched but that kept (or the
+    /// caller's rule) refuses as a wrong password: the next try waits as after any wrong one.
+    /// For M2 (the lead's ruling of 14:41): a non-admin's correct password at the admin's page.
+    pub fn record_wrong(&self, door: PasswordDoor, email: &Email, device: Option<DeviceId>) {
+        let lane = self.lane(door);
+        let mut state = lock(&lane.state);
+        let mut waits = lock(&lane.engine.waits);
+        let now = (lane.engine.clock)();
+        waits.record_wrong(door, email, device, now);
+        state.expire_waiting(&waits, now);
+    }
+
     /// Reserve one attempt before computing and looking up the fast code fingerprint.
     pub fn admit_code(&self) -> Result<(), Refusal> {
         let mut codes = lock(&self.codes);

@@ -2,9 +2,10 @@
 //! of a typed-in login's check (`ping`, then `getUser`), each a request **built whole by the
 //! shared library** (`nexus_core::nexus::music::Post`) and only carried here.
 //!
-//! What this carries, and nothing more: one connection to the address the request names (the
-//! container's `NEXUS_MUSIC_SERVER`, plain HTTP allowed there; or the address people use, by
-//! HTTPS, checked against this machine's trusted certificates), one POST of the request's own
+//! What this carries, and nothing more: one connection to the address the request names, which
+//! is only ever the container's `NEXUS_MUSIC_SERVER` (plain HTTP, or HTTPS checked against this
+//! machine's trusted certificates); **never the address people use**, which the backend does not
+//! connect to (the lead's ruling of 28 Nov 15:38). One POST of the request's own
 //! form with no header but the four any request needs (`Host`, `Content-Type`,
 //! `Content-Length`, `Connection: close`), and the answer's status and body. **No redirect is
 //! followed**: a redirect is an answer like any other, which the library does not take as a
@@ -36,7 +37,8 @@ pub const ASK_WITHIN: Duration = Duration::from_secs(10);
 /// The largest head of an answer read (hyper's least).
 const ANSWER_HEAD_MAX_BYTES: usize = 16 * 1024;
 
-/// What the backend asks the music server with: the certificates it trusts for HTTPS.
+/// What the backend asks the music server with: the certificates it trusts, for a
+/// `NEXUS_MUSIC_SERVER` given as HTTPS.
 #[derive(Clone)]
 pub struct MusicClient {
     tls: Arc<ClientConfig>,
@@ -115,9 +117,11 @@ impl MusicClient {
 /// One request on its own connection, and its answer.
 async fn exchange(io: impl AsyncRead + AsyncWrite + Unpin + Send + 'static, authority: &str, target: &str, form: Bytes) -> Answered {
     let (mut sender, connection) = hyper::client::conn::http1::Builder::new().max_buf_size(ANSWER_HEAD_MAX_BYTES).handshake(TokioIo::new(io)).await.ok()?;
-    let driving = tokio::spawn(async move {
+    // The connection's driver ends with this exchange however it ends: answered, failed, or
+    // dropped part-way by a deadline (the review of S9, S9-3), so no socket outlives it.
+    let driving = Driving(tokio::spawn(async move {
         let _ = connection.await;
-    });
+    }));
     let request = Request::builder()
         .method(Method::POST)
         .uri(target)
@@ -135,9 +139,17 @@ async fn exchange(io: impl AsyncRead + AsyncWrite + Unpin + Send + 'static, auth
     }
     .await;
     drop(sender);
-    driving.abort();
-    let _ = driving.await;
+    drop(driving);
     answered
+}
+
+/// A connection's driver, stopped when this is dropped.
+struct Driving(tokio::task::JoinHandle<()>);
+
+impl Drop for Driving {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 #[cfg(test)]
