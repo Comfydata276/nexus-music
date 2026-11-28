@@ -6,14 +6,13 @@ use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::fmt;
 
-use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Number, Value};
+use serde_json::value::RawValue;
 
 pub use super::account::DeviceKind;
-use super::account::AccountId;
+use super::account::{self, AccountId, Reply, ReplyResult, RequestHead};
 use super::proto::{BackendId, Version};
-use super::wire;
+use super::wire::{self, BadMessage, Fields, WireBody};
 
 pub const FILE_BYTES: usize = 1024 * 1024;
 pub const WAITING_BYTES: u64 = 64 * 1024 * 1024;
@@ -22,6 +21,7 @@ pub const EVENT_BYTES: usize = 2 * 1024;
 pub const TEXT_CHARS: usize = 200;
 pub const BATCH_BYTES: usize = 512 * 1024;
 pub const BATCH_EVENTS: usize = 500;
+pub const BATCH_REPLY_BYTES: usize = account::LIST_REPLY_MAX_BYTES;
 pub const KEEP_MS: u64 = 8 * 24 * 60 * 60 * 1000;
 
 // The design does not say the field limits or time encoding. Use UTC Unix milliseconds
@@ -183,7 +183,7 @@ pub enum SearchedIn {
     Requests,
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Kind {
     Start {
@@ -203,29 +203,131 @@ pub enum Kind {
         heard_ms: Option<u32>,
         why: Stopped,
     },
-    Pause { start: EventId, position_ms: u32 },
-    Resume { start: EventId, position_ms: u32 },
-    Seek { start: EventId, from_ms: u32, to_ms: u32 },
-    Search { words: String, found: u32, #[serde(rename = "where")] where_: SearchedIn },
+    Pause {
+        start: EventId,
+        position_ms: u32,
+    },
+    Resume {
+        start: EventId,
+        position_ms: u32,
+    },
+    Seek {
+        start: EventId,
+        from_ms: u32,
+        to_ms: u32,
+    },
+    Search {
+        words: String,
+        found: u32,
+        #[serde(rename = "where")]
+        where_: SearchedIn,
+    },
     Open {
-        #[serde(serialize_with = "wire::write_version", deserialize_with = "read_version")]
+        #[serde(serialize_with = "wire::write_version")]
         version: Version,
-        #[serde(deserialize_with = "read_device_kind")]
         device: DeviceKind,
     },
-    Fault { fault: Fault, count: u32 },
+    Fault {
+        fault: Fault,
+        count: u32,
+    },
 }
 
-fn read_version<'de, D: serde::Deserializer<'de>>(input: D) -> Result<Version, D::Error> {
-    Version::parse(&String::deserialize(input)?)
-        .ok_or_else(|| de::Error::custom("invalid app version"))
+fn raw_field<'a>(fields: &Fields<'a>, key: &str) -> Result<&'a RawValue, BadMessage> {
+    fields.0.get(key).copied().ok_or(BadMessage::Form)
 }
 
-fn read_device_kind<'de, D: serde::Deserializer<'de>>(input: D) -> Result<DeviceKind, D::Error> {
-    match String::deserialize(input)?.as_str() {
-        "pc" => Ok(DeviceKind::Pc),
-        "phone" => Ok(DeviceKind::Phone),
-        _ => Err(de::Error::custom("invalid device kind")),
+fn typed<T: serde::de::DeserializeOwned>(fields: &Fields<'_>, key: &str) -> Result<T, BadMessage> {
+    wire::plain_json(raw_field(fields, key)?.get())
+}
+
+fn text(fields: &Fields<'_>, key: &str) -> Result<String, BadMessage> {
+    wire::json_string(raw_field(fields, key)?).map(|value| value.to_string())
+}
+
+impl wire::Value for EventId {
+    fn read(raw: &RawValue) -> Result<Self, BadMessage> {
+        wire::read_text(raw, Self::from_hex)
+    }
+}
+
+impl wire::Value for Fault {
+    fn read(raw: &RawValue) -> Result<Self, BadMessage> {
+        let fields = Fields::read(raw)?;
+        Ok(Self {
+            place: typed(&fields, "place")?,
+            shape: typed(&fields, "shape")?,
+        })
+    }
+}
+
+impl wire::Value for Stopped {
+    fn read(raw: &RawValue) -> Result<Self, BadMessage> {
+        let fields = Fields::read(raw)?;
+        if wire::json_string(raw_field(&fields, "kind")?)?.as_str() == "error" {
+            return Ok(Self::Error {
+                fault: fields.get("fault")?,
+            });
+        }
+        wire::plain_json(raw.get())
+    }
+}
+
+impl wire::Value for Kind {
+    fn read(raw: &RawValue) -> Result<Self, BadMessage> {
+        let fields = Fields::read(raw)?;
+        let tag = wire::json_string(raw_field(&fields, "kind")?)?;
+        match tag.as_str() {
+            "start" => {
+                let from = raw_field(&fields, "from")?;
+                Fields::read(from)?;
+                Ok(Self::Start {
+                    song_id: text(&fields, "song_id")?,
+                    title: text(&fields, "title")?,
+                    artist: text(&fields, "artist")?,
+                    album: text(&fields, "album")?,
+                    from: wire::plain_json(from.get())?,
+                    began: typed(&fields, "began")?,
+                    sound: typed(&fields, "sound")?,
+                    position_ms: typed(&fields, "position_ms")?,
+                })
+            }
+            "stop" => Ok(Self::Stop {
+                start: fields.get("start")?,
+                // Require all three keys, with null only for recovered stops.
+                position_ms: typed(&fields, "position_ms")?,
+                duration_ms: typed(&fields, "duration_ms")?,
+                heard_ms: typed(&fields, "heard_ms")?,
+                why: fields.get("why")?,
+            }),
+            "pause" => Ok(Self::Pause {
+                start: fields.get("start")?,
+                position_ms: typed(&fields, "position_ms")?,
+            }),
+            "resume" => Ok(Self::Resume {
+                start: fields.get("start")?,
+                position_ms: typed(&fields, "position_ms")?,
+            }),
+            "seek" => Ok(Self::Seek {
+                start: fields.get("start")?,
+                from_ms: typed(&fields, "from_ms")?,
+                to_ms: typed(&fields, "to_ms")?,
+            }),
+            "search" => Ok(Self::Search {
+                words: text(&fields, "words")?,
+                found: typed(&fields, "found")?,
+                where_: typed(&fields, "where")?,
+            }),
+            "open" => Ok(Self::Open {
+                version: fields.get("version")?,
+                device: fields.get("device")?,
+            }),
+            "fault" => Ok(Self::Fault {
+                fault: fields.get("fault")?,
+                count: typed(&fields, "count")?,
+            }),
+            _ => Err(BadMessage::Form),
+        }
     }
 }
 
@@ -269,6 +371,24 @@ pub enum Wrong {
     RepeatedId,
     UnaskedId,
     Status,
+}
+
+impl From<BadMessage> for Wrong {
+    fn from(error: BadMessage) -> Self {
+        match error {
+            BadMessage::TooLarge => Self::Size,
+            BadMessage::Status(_) => Self::Status,
+            BadMessage::Form => Self::Form,
+        }
+    }
+}
+
+fn bad_message(error: Wrong) -> BadMessage {
+    if error == Wrong::Size {
+        BadMessage::TooLarge
+    } else {
+        BadMessage::Form
+    }
 }
 
 fn text_ok(text: &str) -> bool {
@@ -336,28 +456,56 @@ impl Record {
         let amount = |ms| ms <= PLAY_MAX_MS;
         let other = |id| id != self.id;
         let valid = match &self.kind {
-            Kind::Start { song_id, title, artist, album, from, position_ms, .. } => {
+            Kind::Start {
+                song_id,
+                title,
+                artist,
+                album,
+                from,
+                position_ms,
+                ..
+            } => {
                 let from_ok = match from {
-                    PlayedFrom::Album { id } | PlayedFrom::Playlist { id }
-                    | PlayedFrom::Artist { id } | PlayedFrom::Radio { id } | PlayedFrom::Mix { id } =>
-                        nonempty(id),
+                    PlayedFrom::Album { id }
+                    | PlayedFrom::Playlist { id }
+                    | PlayedFrom::Artist { id }
+                    | PlayedFrom::Radio { id }
+                    | PlayedFrom::Mix { id } => nonempty(id),
                     PlayedFrom::Search { words } => nonempty(words),
                     PlayedFrom::Queue | PlayedFrom::LikedSongs => true,
                 };
                 nonempty(song_id)
                     && [title, artist, album].iter().all(|s| text_ok(s))
-                    && from_ok && amount(*position_ms)
+                    && from_ok
+                    && amount(*position_ms)
             }
-            Kind::Stop { start, position_ms, duration_ms, heard_ms, why } => {
+            Kind::Stop {
+                start,
+                position_ms,
+                duration_ms,
+                heard_ms,
+                why,
+            } => {
                 other(*start)
-                    && [position_ms, duration_ms, heard_ms].iter().all(|ms| ms.is_none_or(amount))
+                    && [position_ms, duration_ms, heard_ms]
+                        .iter()
+                        .all(|ms| ms.is_none_or(amount))
                     && (matches!(why, Stopped::Unknown)
                         || (position_ms.is_some() && duration_ms.is_some() && heard_ms.is_some()))
-                    && position_ms.zip(*duration_ms).is_none_or(|(position, duration)| position <= duration + STOP_TOLERANCE_MS)
+                    && position_ms
+                        .zip(*duration_ms)
+                        .is_none_or(|(position, duration)| {
+                            position.saturating_sub(duration) <= STOP_TOLERANCE_MS
+                        })
             }
-            Kind::Pause { start, position_ms } | Kind::Resume { start, position_ms } =>
-                other(*start) && amount(*position_ms),
-            Kind::Seek { start, from_ms, to_ms } => other(*start) && amount(*from_ms) && amount(*to_ms),
+            Kind::Pause { start, position_ms } | Kind::Resume { start, position_ms } => {
+                other(*start) && amount(*position_ms)
+            }
+            Kind::Seek {
+                start,
+                from_ms,
+                to_ms,
+            } => other(*start) && amount(*from_ms) && amount(*to_ms),
             Kind::Search { words, .. } => nonempty(words),
             Kind::Open { .. } => true,
             Kind::Fault { count, .. } => *count > 0,
@@ -367,7 +515,6 @@ impl Record {
         }
         Ok(())
     }
-
 }
 
 impl Placed {
@@ -394,38 +541,28 @@ impl Placed {
         self.check_size()
     }
 
-    fn from_value(value: Value) -> Result<Self, Wrong> {
-        let event = value.get("event").and_then(Value::as_object).ok_or(Wrong::Form)?;
-        // The design does not say what to do with missing stop measurements. Require
-        // their keys, with explicit null allowed only for a recovered stop. Serde would
-        // otherwise treat a missing key the same as null.
-        if event.get("kind").and_then(Value::as_str) == Some("stop")
-            && ["position_ms", "duration_ms", "heard_ms"].iter().any(|key| !event.contains_key(*key))
-        {
-            return Err(Wrong::Form);
+    fn from_raw(raw: &RawValue) -> Result<Self, Wrong> {
+        if raw.get().len() > EVENT_BYTES {
+            return Err(Wrong::Size);
         }
-        // These are JSON objects even where a serde struct could also read a sequence.
-        if event.get("fault").is_some_and(|v| {
-            event.get("kind").and_then(Value::as_str) == Some("fault") && !v.is_object()
-        }) || event.get("why").and_then(|v| v.get("fault")).is_some_and(|v| {
-            event.get("kind").and_then(Value::as_str) == Some("stop")
-                && event.get("why").and_then(|why| why.get("kind")).and_then(Value::as_str) == Some("error")
-                && !v.is_object()
-        }) {
-            return Err(Wrong::Form);
-        }
-        let object = value.as_object().ok_or(Wrong::Form)?;
-        let id = object.get("id").and_then(Value::as_str).and_then(EventId::from_hex).ok_or(Wrong::Form)?;
-        let at_ms = object.get("at_ms").and_then(Value::as_u64).ok_or(Wrong::Form)?;
-        let sequence = object.get("sequence").and_then(Value::as_u64).ok_or(Wrong::Form)?;
-        let kind = serde_json::from_value(Value::Object(event.clone())).map_err(|_| Wrong::Form)?;
-        let event = Self { record: Record { id, at_ms, kind }, sequence };
+        let fields = Fields::read(raw)?;
+        let event = Self {
+            record: Record {
+                id: fields.get("id")?,
+                at_ms: fields.get("at_ms")?,
+                kind: fields.get("event")?,
+            },
+            sequence: fields.get("sequence")?,
+        };
         event.check()?;
         Ok(event)
     }
 
     pub fn read(bytes: &[u8]) -> Result<Self, Wrong> {
-        Self::from_value(read_json(bytes, EVENT_BYTES)?)
+        if bytes.len() > EVENT_BYTES {
+            return Err(Wrong::Size);
+        }
+        wire::read(bytes).map_err(Into::into)
     }
 
     /// A JSON object followed by LF. A file can hold whole lines only.
@@ -435,6 +572,16 @@ impl Placed {
         bytes.push(b'\n');
         Ok(bytes)
     }
+}
+
+impl wire::Value for Placed {
+    fn read(raw: &RawValue) -> Result<Self, BadMessage> {
+        Self::from_raw(raw).map_err(bad_message)
+    }
+}
+
+impl wire::Message for Placed {
+    const MAX_BYTES: usize = EVENT_BYTES;
 }
 
 /// The next device order number after the last one assigned. The caller keeps the last
@@ -480,11 +627,8 @@ pub fn end_open_start(
 // life, and each subsequent LF-terminated JSON line gives one event. A torn tail is
 // abandoned by rolling to a new file, so even an apparently complete tail lacking its
 // LF can never become a committed line after a kill.
-#[derive(Serialize, Deserialize)]
-struct Header {
-    format: u64,
-    life: u64,
-}
+wire::object! { Header { format: u64, life: u64 } }
+impl wire::Message for Header {}
 
 // The design does not say how to recognize later file layouts. Number this layout.
 pub const FILE_FORMAT: u64 = 1;
@@ -513,14 +657,24 @@ pub fn read_file(bytes: &[u8]) -> Result<JournalFile, Wrong> {
         return Err(Wrong::Size);
     }
     let mut lines = bytes.split_inclusive(|b| *b == b'\n');
-    let header = lines.next().and_then(|line| line.strip_suffix(b"\n")).ok_or(Wrong::Form)?;
-    let header: Header = serde_json::from_value(read_json(header, FILE_BYTES)?).map_err(|_| Wrong::Form)?;
+    let header = lines
+        .next()
+        .and_then(|line| line.strip_suffix(b"\n"))
+        .ok_or(Wrong::Form)?;
+    let header: Header = wire::read(header)?;
     if header.format != FILE_FORMAT {
         return Err(Wrong::Form);
     }
-    let mut file = JournalFile { life: header.life, events: Vec::new(), skipped_lines: 0 };
+    let mut file = JournalFile {
+        life: header.life,
+        events: Vec::new(),
+        skipped_lines: 0,
+    };
     for line in lines {
-        match line.strip_suffix(b"\n").and_then(|line| Placed::read(line).ok()) {
+        match line
+            .strip_suffix(b"\n")
+            .and_then(|line| Placed::read(line).ok())
+        {
             Some(event) => file.events.push(event),
             None => file.skipped_lines += 1,
         }
@@ -686,14 +840,21 @@ pub fn intake(life: u64, sent_life: u64, existing: Existing, room: bool) -> Inta
     }
 }
 
-/// A nonempty batch of events of one account life. Make using the size of the wire
-/// envelope available to the caller, so adding authentication cannot exceed 1 MiB.
+/// A nonempty batch of events under one account life. Authentication is in the
+/// request header. C7's shared head carries the protocol and restore numbers.
+/// §12.2 identifies changes here by each event's ID.
+#[derive(Serialize)]
 pub struct Batch {
+    head: RequestHead,
     life: u64,
     events: Vec<Placed>,
 }
 
 impl Batch {
+    pub fn head(&self) -> &RequestHead {
+        &self.head
+    }
+
     pub fn life(&self) -> u64 {
         self.life
     }
@@ -702,41 +863,70 @@ impl Batch {
         &self.events
     }
 
-    /// Take the longest prefix that fits. The byte limit includes this JSON object.
-    pub fn prefix(life: u64, events: &[Placed], max_bytes: usize) -> Result<Self, Wrong> {
+    /// Take the longest prefix that fits the complete request body, head included.
+    pub fn prefix(
+        head: RequestHead,
+        life: u64,
+        events: &[Placed],
+        max_bytes: usize,
+    ) -> Result<Self, Wrong> {
         let limit = max_bytes.min(BATCH_BYTES);
-        let mut bytes = format!(r#"{{"life":{life},"events":[]}}"#).len();
-        let mut taken = Vec::new();
+        let mut batch = Self {
+            head,
+            life,
+            events: Vec::new(),
+        };
+        let mut bytes = serde_json::to_vec(&batch).map_err(|_| Wrong::Form)?.len();
         let mut seen = BTreeSet::new();
         for event in events.iter().take(BATCH_EVENTS) {
             event.check()?;
             let event_bytes = serde_json::to_vec(event).map_err(|_| Wrong::Form)?.len();
-            bytes += event_bytes + usize::from(!taken.is_empty());
+            bytes += event_bytes + usize::from(!batch.events.is_empty());
             if bytes > limit {
                 break;
             }
             if !seen.insert(event.record.id) {
                 return Err(Wrong::RepeatedId);
             }
-            taken.push(event.clone());
+            batch.events.push(event.clone());
         }
-        if taken.is_empty() {
-            return Err(if events.is_empty() { Wrong::Count } else { Wrong::Size });
+        if batch.events.is_empty() {
+            return Err(if events.is_empty() {
+                Wrong::Count
+            } else {
+                Wrong::Size
+            });
         }
-        Ok(Self { life, events: taken })
+        Ok(batch)
     }
 
-    pub fn write(&self) -> Result<Vec<u8>, Wrong> {
-        #[derive(Serialize)]
-        struct Wire<'a> {
-            life: u64,
-            events: &'a [Placed],
-        }
-        serde_json::to_vec(&Wire { life: self.life, events: &self.events }).map_err(|_| Wrong::Form)
+    pub fn write(&self) -> Result<WireBody, Wrong> {
+        wire::encode(self).map_err(Into::into)
     }
 }
 
+impl wire::Value for Batch {
+    fn read(raw: &RawValue) -> Result<Self, BadMessage> {
+        let incoming = IncomingBatch::read_raw(raw).map_err(bad_message)?;
+        let events = incoming
+            .events
+            .into_iter()
+            .map(|(_, event)| event.map_err(bad_message))
+            .collect::<Result<_, _>>()?;
+        Ok(Self {
+            head: incoming.head,
+            life: incoming.life,
+            events,
+        })
+    }
+}
+
+impl wire::Message for Batch {
+    const MAX_BYTES: usize = BATCH_BYTES;
+}
+
 pub struct IncomingBatch {
+    pub head: RequestHead,
     pub life: u64,
     pub events: Vec<(EventId, Result<Placed, Wrong>)>,
 }
@@ -746,24 +936,33 @@ impl IncomingBatch {
     /// Refuse that batch. An entry with a usable id and bad fields can be refused on
     /// its own. Bad JSON, including a duplicate key anywhere, refuses the whole body.
     pub fn read(bytes: &[u8]) -> Result<Self, Wrong> {
-        let mut object = read_json(bytes, BATCH_BYTES)?;
-        let life = object.get("life").and_then(Value::as_u64).ok_or(Wrong::Form)?;
-        let Some(Value::Array(values)) = object.as_object_mut().and_then(|o| o.remove("events")) else {
-            return Err(Wrong::Form);
-        };
-        if values.is_empty() || values.len() > BATCH_EVENTS {
+        wire::read_value(bytes, BATCH_BYTES).map_err(Into::into)
+    }
+
+    fn read_raw(raw: &RawValue) -> Result<Self, Wrong> {
+        let fields = Fields::read(raw)?;
+        let head = fields.get("head")?;
+        let life = fields.get("life")?;
+        let rows: Vec<&RawValue> = wire::plain_json(raw_field(&fields, "events")?.get())?;
+        if rows.is_empty() || rows.len() > BATCH_EVENTS {
             return Err(Wrong::Count);
         }
-        let mut events = Vec::with_capacity(values.len());
+        let mut events = Vec::with_capacity(rows.len());
         let mut seen = BTreeSet::new();
-        for value in values {
-            let id = value.get("id").and_then(Value::as_str).and_then(EventId::from_hex).ok_or(Wrong::Form)?;
+        for raw in rows {
+            let id = Fields::read(raw)?.get("id")?;
             if !seen.insert(id) {
                 return Err(Wrong::RepeatedId);
             }
-            events.push((id, Placed::from_value(value)));
+            events.push((id, Placed::from_raw(raw)));
         }
-        Ok(Self { life, events })
+        Ok(Self { head, life, events })
+    }
+}
+
+impl wire::Value for IncomingBatch {
+    fn read(raw: &RawValue) -> Result<Self, BadMessage> {
+        Self::read_raw(raw).map_err(bad_message)
     }
 }
 
@@ -789,14 +988,21 @@ impl Outcome {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Answered {
-    pub id: EventId,
-    pub outcome: Outcome,
+impl wire::Value for Outcome {
+    fn read(raw: &RawValue) -> Result<Self, BadMessage> {
+        wire::plain_json(raw.get())
+    }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub struct BatchAnswer(Vec<Answered>);
+wire::object! {
+    #[derive(Clone, Copy)]
+    Answered { id: EventId, outcome: Outcome }
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct BatchAnswer {
+    answers: Vec<Answered>,
+}
 
 impl BatchAnswer {
     pub fn new(answers: Vec<Answered>) -> Result<Self, Wrong> {
@@ -807,131 +1013,65 @@ impl BatchAnswer {
         if answers.iter().any(|answer| !seen.insert(answer.id)) {
             return Err(Wrong::RepeatedId);
         }
-        Ok(Self(answers))
+        Ok(Self { answers })
     }
 
-    pub fn read(status: u16, whole_body: &[u8], sent: &Batch) -> Result<Self, Wrong> {
-        // The design does not say this call's exact success status. Only a fully
-        // read 200 with this shape can acknowledge anything.
-        if status != 200 {
-            return Err(Wrong::Status);
-        }
-        let value = read_json(whole_body, BATCH_BYTES)?;
-        let answers = value.get("answers").and_then(Value::as_array).ok_or(Wrong::Form)?;
-        if answers.len() > BATCH_EVENTS {
-            return Err(Wrong::Count);
-        }
-        let wanted: BTreeSet<_> = sent.events().iter().map(|event| event.record.id).collect();
-        let mut decoded = Vec::with_capacity(answers.len());
-        for answer in answers {
-            if !answer.is_object() {
-                return Err(Wrong::Form);
-            }
-            let answer: Answered = serde_json::from_value(answer.clone()).map_err(|_| Wrong::Form)?;
-            if !wanted.contains(&answer.id) {
-                return Err(Wrong::UnaskedId);
-            }
-            decoded.push(answer);
-        }
-        Self::new(decoded)
-    }
-
-    pub fn write(&self) -> Result<Vec<u8>, Wrong> {
-        #[derive(Serialize)]
-        struct Wire<'a> {
-            answers: &'a [Answered],
-        }
-        serde_json::to_vec(&Wire { answers: &self.0 }).map_err(|_| Wrong::Form)
+    pub fn answers(&self) -> &[Answered] {
+        &self.answers
     }
 
     /// A reply can be sparse and in any order. An absent id has no final answer.
     pub fn outcome(&self, id: EventId) -> Outcome {
-        self.0.iter().find(|answer| answer.id == id).map_or(Outcome::NotDealtWith, |a| a.outcome)
+        self.answers
+            .iter()
+            .find(|answer| answer.id == id)
+            .map_or(Outcome::NotDealtWith, |a| a.outcome)
     }
 }
 
-/// Read one complete JSON object. The first pass checks every key and the depth even
-/// in unknown fields, which the typed readers then ignore. Never return a serde error
-/// to a caller: it can quote a field value.
-pub(crate) fn read_json(bytes: &[u8], limit: usize) -> Result<Value, Wrong> {
-    if bytes.len() > limit {
+impl wire::Value for BatchAnswer {
+    fn read(raw: &RawValue) -> Result<Self, BadMessage> {
+        let fields = Fields::read(raw)?;
+        let rows: Vec<&RawValue> = wire::plain_json(raw_field(&fields, "answers")?.get())?;
+        if rows.len() > BATCH_EVENTS {
+            return Err(BadMessage::Form);
+        }
+        let answers = rows
+            .into_iter()
+            .map(Answered::read)
+            .collect::<Result<_, _>>()?;
+        Self::new(answers).map_err(bad_message)
+    }
+}
+
+impl ReplyResult for BatchAnswer {
+    const MAX_DONE_BYTES: usize = BATCH_REPLY_BYTES;
+}
+
+pub type BatchReply = Reply<BatchAnswer>;
+
+/// Use C7's envelope and stamp. Before the client applies the reply to its
+/// journal, it also checks the receipt against its account, life and generation.
+pub fn read_reply(status: u16, whole_body: &[u8], sent: &Batch) -> Result<BatchReply, Wrong> {
+    if whole_body.len() > BATCH_REPLY_BYTES {
         return Err(Wrong::Size);
     }
-    let text = std::str::from_utf8(bytes).map_err(|_| Wrong::Form)?;
-    let mut json = serde_json::Deserializer::from_str(text);
-    let value = Json(0).deserialize(&mut json).map_err(|_| Wrong::Form)?;
-    json.end().map_err(|_| Wrong::Form)?;
-    if !value.is_object() {
-        return Err(Wrong::Form);
+    let reply = account::read_reply::<BatchAnswer>(status, whole_body)?;
+    if let Reply::Done { result, .. } = &reply {
+        let wanted: BTreeSet<_> = sent.events().iter().map(|event| event.record.id).collect();
+        if result
+            .answers
+            .iter()
+            .any(|answer| !wanted.contains(&answer.id))
+        {
+            return Err(Wrong::UnaskedId);
+        }
     }
-    Ok(value)
+    Ok(reply)
 }
 
-struct Json(usize);
-
-impl<'de> DeserializeSeed<'de> for Json {
-    type Value = Value;
-
-    fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<Value, D::Error> {
-        deserializer.deserialize_any(self)
-    }
-}
-
-impl<'de> Visitor<'de> for Json {
-    type Value = Value;
-
-    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("a JSON value")
-    }
-
-    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
-        if self.0 >= super::proto::HELLO_MAX_DEPTH {
-            return Err(de::Error::custom("nested too deep"));
-        }
-        let mut object = Map::new();
-        while let Some(key) = map.next_key::<String>()? {
-            let entry = map.next_value_seed(Json(self.0 + 1))?;
-            if object.insert(key, entry).is_some() {
-                return Err(de::Error::custom("a key given twice"));
-            }
-        }
-        Ok(Value::Object(object))
-    }
-
-    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
-        if self.0 >= super::proto::HELLO_MAX_DEPTH {
-            return Err(de::Error::custom("nested too deep"));
-        }
-        let mut array = Vec::new();
-        while let Some(entry) = seq.next_element_seed(Json(self.0 + 1))? {
-            array.push(entry);
-        }
-        Ok(Value::Array(array))
-    }
-
-    fn visit_str<E: de::Error>(self, text: &str) -> Result<Value, E> {
-        Ok(Value::String(text.to_owned()))
-    }
-
-    fn visit_bool<E: de::Error>(self, value: bool) -> Result<Value, E> {
-        Ok(Value::Bool(value))
-    }
-
-    fn visit_i64<E: de::Error>(self, value: i64) -> Result<Value, E> {
-        Ok(Value::Number(value.into()))
-    }
-
-    fn visit_u64<E: de::Error>(self, value: u64) -> Result<Value, E> {
-        Ok(Value::Number(value.into()))
-    }
-
-    fn visit_f64<E: de::Error>(self, value: f64) -> Result<Value, E> {
-        Number::from_f64(value).map(Value::Number).ok_or_else(|| de::Error::custom("not a JSON number"))
-    }
-
-    fn visit_unit<E: de::Error>(self) -> Result<Value, E> {
-        Ok(Value::Null)
-    }
+pub fn write_reply(reply: &BatchReply) -> Result<WireBody, Wrong> {
+    wire::encode(reply).map_err(Into::into)
 }
 
 #[cfg(test)]

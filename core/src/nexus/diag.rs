@@ -7,10 +7,12 @@ use std::fmt::{self, Write};
 
 use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::Serialize;
+use serde_json::value::RawValue;
 
-use super::account::DeviceKind;
-use super::events::{LossCounts, TIME_MAX_MS, read_json};
+use super::account::{self, DeviceKind, Reply, ReplyResult, RequestHead, RequestId};
+use super::events::{LossCounts, TIME_MAX_MS};
 use super::proto::Version;
+use super::wire::{self, BadMessage, Fields, WireBody};
 
 pub use super::events::{Fault, FaultPlace, FaultShape, Wrong};
 
@@ -288,6 +290,7 @@ pub enum Line {
     Fault(Fault),
     SessionEnded(SessionEnded),
     ForegroundAfterMs(u32),
+    // The design does not say how to carry the platform's reason. Keep only its code.
     DownloadJobStopped(u8),
     LastAttempt(Trace),
     LastFailure(Trace),
@@ -351,7 +354,9 @@ impl fmt::Display for Line {
             ),
             Self::SessionEnded(why) => write!(f, "Nexus session ended: {}", why.text()),
             Self::ForegroundAfterMs(ms) => write!(f, "Foreground entered after {ms} ms"),
-            Self::DownloadJobStopped(reason) => write!(f, "Android stopped the download job (reason {reason})"),
+            Self::DownloadJobStopped(reason) => {
+                write!(f, "Android stopped the download job (reason {reason})")
+            }
             Self::LastAttempt(trace) => write!(f, "Nexus last attempt: {trace}"),
             Self::LastFailure(trace) => write!(f, "Nexus last failure: {trace}"),
         }
@@ -395,6 +400,7 @@ impl Line {
         match self {
             Self::LastAttempt(_) => Some(LatestSlot::Attempt),
             Self::LastFailure(_) => Some(LatestSlot::Failure),
+            // The design does not say how to group timing values. Keep only the latest.
             Self::ForegroundAfterMs(_) => Some(LatestSlot::Foreground),
             _ => None,
         }
@@ -519,11 +525,12 @@ impl Record {
         if self.entries.len() > MAX_ENTRIES {
             // The design does not say how to keep both required traces when the record
             // fills. Reserve their places and age out the oldest other observation.
-            if let Some(index) = self
-                .entries
-                .iter()
-                .position(|entry| !matches!(entry.line.latest_slot(), Some(LatestSlot::Attempt | LatestSlot::Failure)))
-            {
+            if let Some(index) = self.entries.iter().position(|entry| {
+                !matches!(
+                    entry.line.latest_slot(),
+                    Some(LatestSlot::Attempt | LatestSlot::Failure)
+                )
+            }) {
                 self.entries.remove(index);
             }
         }
@@ -717,55 +724,67 @@ impl Report {
     }
 }
 
-/// The one upload. No caller can construct it from unchecked report text.
-pub struct Upload(String);
+/// The one upload. The shared request head carries the protocol and restore
+/// numbers. The request id identifies this write under §12.2.
+#[derive(Serialize)]
+pub struct Upload {
+    pub head: RequestHead,
+    pub request_id: RequestId,
+    text: String,
+}
 
 impl Upload {
-    pub fn new(report: &Report) -> Result<Self, Wrong> {
-        Ok(Self(report.text()?))
+    pub fn new(head: RequestHead, request_id: RequestId, report: &Report) -> Result<Self, Wrong> {
+        Ok(Self {
+            head,
+            request_id,
+            text: report.text()?,
+        })
     }
 
     pub fn text(&self) -> &str {
-        &self.0
+        &self.text
     }
 
-    /// Budget for the surrounding authenticated request when asking for these bytes.
-    pub fn write(&self, max_bytes: usize) -> Result<Vec<u8>, Wrong> {
-        #[derive(Serialize)]
-        struct Wire<'a> {
-            text: &'a str,
-        }
-        let bytes = serde_json::to_vec(&Wire { text: self.text() }).map_err(|_| Wrong::Form)?;
-        if bytes.len() > max_bytes.min(CALL_BYTES) {
-            return Err(Wrong::Size);
-        }
-        Ok(bytes)
+    pub fn write(&self) -> Result<WireBody, Wrong> {
+        wire::encode(self).map_err(Into::into)
     }
 
     pub fn read(whole_body: &[u8]) -> Result<Self, Wrong> {
-        let object = read_json(whole_body, CALL_BYTES)?;
-        let text = object
-            .get("text")
-            .and_then(serde_json::Value::as_str)
-            .ok_or(Wrong::Form)?;
-        Report::read(text)?;
-        Ok(Self(text.to_owned()))
+        wire::read(whole_body).map_err(Into::into)
     }
 }
 
-// The design does not say the success status or body for the upload. Require a
-// whole 200 with a true acknowledgement, and send no Diagnostics text back.
-pub const DONE: &[u8] = br#"{"done":true}"#;
+impl wire::Value for Upload {
+    fn read(raw: &RawValue) -> Result<Self, BadMessage> {
+        let fields = Fields::read(raw)?;
+        let text = wire::json_string(fields.0.get("text").ok_or(BadMessage::Form)?)?;
+        Report::read(&text).map_err(|_| BadMessage::Form)?;
+        Ok(Self {
+            head: fields.get("head")?,
+            request_id: fields.get("request_id")?,
+            text: text.to_string(),
+        })
+    }
+}
 
-pub fn read_done(status: u16, whole_body: &[u8]) -> Result<(), Wrong> {
-    if status != 200 {
-        return Err(Wrong::Status);
-    }
-    let body = read_json(whole_body, CALL_BYTES)?;
-    if body.get("done").and_then(serde_json::Value::as_bool) != Some(true) {
-        return Err(Wrong::Form);
-    }
-    Ok(())
+impl wire::Message for Upload {
+    const MAX_BYTES: usize = CALL_BYTES;
+}
+
+// The design does not say what goes in the successful result beyond the shared
+// receipt. Use an empty object so the upload answer never returns a report.
+wire::object! { Uploaded {} }
+impl ReplyResult for Uploaded {}
+
+pub type UploadReply = Reply<Uploaded>;
+
+pub fn read_reply(status: u16, whole_body: &[u8]) -> Result<UploadReply, Wrong> {
+    account::read_reply(status, whole_body).map_err(Into::into)
+}
+
+pub fn write_reply(reply: &UploadReply) -> Result<WireBody, Wrong> {
+    wire::encode(reply).map_err(Into::into)
 }
 
 #[cfg(test)]

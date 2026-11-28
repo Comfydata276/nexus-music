@@ -1,4 +1,32 @@
 use super::*;
+use crate::nexus::account::{Receipt, Refusal, Stamp, StampTag};
+use crate::nexus::proto::SPEAKS;
+use serde_json::{Value, json};
+
+fn head() -> RequestHead {
+    RequestHead {
+        speaks: SPEAKS,
+        restore: 9,
+    }
+}
+
+fn receipt(life: u64) -> Receipt {
+    Receipt {
+        stamp: Stamp {
+            backend: BackendId::from_bytes([5; 16]),
+            restore: 9,
+            account: AccountId::new(3).unwrap(),
+            life,
+            change: 12,
+            tag: StampTag::from_bytes([6; 32]),
+        },
+        music_login_count: 0,
+    }
+}
+
+fn read_value(value: Value) -> Result<Placed, Wrong> {
+    Placed::read(&serde_json::to_vec(&value).unwrap())
+}
 
 fn id(n: u8) -> EventId {
     EventId::from_bytes([n; 16])
@@ -58,8 +86,11 @@ fn id_has_one_spelling_and_retry_keeps_it() {
     assert_eq!(EventId::from_hex("abcd"), None);
     let original = start(1);
     let from_file = Placed::read(&original.line().unwrap()).unwrap();
-    let sent = Batch::prefix(2, &[from_file], BATCH_BYTES).unwrap().write().unwrap();
-    let incoming = IncomingBatch::read(&sent).unwrap();
+    let sent = Batch::prefix(head(), 2, &[from_file], BATCH_BYTES)
+        .unwrap()
+        .write()
+        .unwrap();
+    let incoming = IncomingBatch::read(sent.bytes()).unwrap();
     assert_eq!(incoming.events, vec![(original.record.id, Ok(original))]);
 }
 
@@ -76,7 +107,13 @@ fn bounds_cover_names_ids_search_and_version() {
     }
 
     use serde_json::json;
-    edit(&[("title", json!("é".repeat(TEXT_CHARS))), ("album", json!(""))], true);
+    edit(
+        &[
+            ("title", json!("é".repeat(TEXT_CHARS))),
+            ("album", json!("")),
+        ],
+        true,
+    );
     for name in ["title", "album", "artist"] {
         edit(&[(name, json!("a".repeat(TEXT_CHARS + 1)))], false);
         edit(&[(name, json!("a\tb"))], false);
@@ -84,19 +121,52 @@ fn bounds_cover_names_ids_search_and_version() {
     edit(&[("song_id", json!("a".repeat(TEXT_CHARS)))], true);
     edit(&[("song_id", json!("a".repeat(TEXT_CHARS + 1)))], false);
     edit(&[("song_id", json!(" "))], false);
-    edit(&[("from", json!({"kind":"playlist", "id":"a".repeat(TEXT_CHARS + 1)}))], false);
-    edit(&[("from", json!({"kind":"search", "words":"a".repeat(TEXT_CHARS + 1)}))], false);
+    edit(
+        &[(
+            "from",
+            json!({"kind":"playlist", "id":"a".repeat(TEXT_CHARS + 1)}),
+        )],
+        false,
+    );
+    edit(
+        &[(
+            "from",
+            json!({"kind":"search", "words":"a".repeat(TEXT_CHARS + 1)}),
+        )],
+        false,
+    );
     edit(&[("from", json!({"kind":"radio"}))], false);
-    for (words, ok) in [("a".repeat(TEXT_CHARS), true), ("a".repeat(TEXT_CHARS + 1), false), (" ".into(), false)] {
-        assert_eq!(event(1, Kind::Search { words, found: u32::MAX, where_: SearchedIn::Requests }).check().is_ok(), ok);
+    for (words, ok) in [
+        ("a".repeat(TEXT_CHARS), true),
+        ("a".repeat(TEXT_CHARS + 1), false),
+        (" ".into(), false),
+    ] {
+        assert_eq!(
+            event(
+                1,
+                Kind::Search {
+                    words,
+                    found: u32::MAX,
+                    where_: SearchedIn::Requests
+                }
+            )
+            .check()
+            .is_ok(),
+            ok
+        );
     }
-    let value = serde_json::to_value(event(1, Kind::Open {
-        version: Version::parse("1.2.3").unwrap(), device: DeviceKind::Phone,
-    })).unwrap();
+    let value = serde_json::to_value(event(
+        1,
+        Kind::Open {
+            version: Version::parse("1.2.3").unwrap(),
+            device: DeviceKind::Phone,
+        },
+    ))
+    .unwrap();
     for version in ["1.2", "1.2.3-rc1", "a/b"] {
         let mut bad = value.clone();
         bad["event"]["version"] = json!(version);
-        assert_eq!(Placed::from_value(bad), Err(Wrong::Form));
+        assert_eq!(read_value(bad), Err(Wrong::Form));
     }
 }
 
@@ -167,15 +237,25 @@ fn json_is_whole_utf8_unique_and_bounded_even_in_unknown_fields() {
 #[test]
 fn faults_and_stop_fields_are_objects_and_use_fixed_words() {
     use serde_json::json;
-    let mut bad = serde_json::to_value(event(1, Kind::Fault { fault: fault(), count: 1 })).unwrap();
+    let mut bad = serde_json::to_value(event(
+        1,
+        Kind::Fault {
+            fault: fault(),
+            count: 1,
+        },
+    ))
+    .unwrap();
     bad["event"]["fault"] = json!(["playback", "decode"]);
-    assert_eq!(Placed::from_value(bad.clone()), Err(Wrong::Form));
+    assert_eq!(read_value(bad.clone()), Err(Wrong::Form));
     bad["event"]["fault"] = json!({"place":"playback","shape":"Secret words"});
-    assert_eq!(Placed::from_value(bad), Err(Wrong::Form));
-    let stop = end_open_start(id(1), None, id(2), 4).unwrap().place(2).unwrap();
+    assert_eq!(read_value(bad), Err(Wrong::Form));
+    let stop = end_open_start(id(1), None, id(2), 4)
+        .unwrap()
+        .place(2)
+        .unwrap();
     let mut value = serde_json::to_value(stop).unwrap();
     value["event"].as_object_mut().unwrap().remove("heard_ms");
-    assert_eq!(Placed::from_value(value), Err(Wrong::Form));
+    assert_eq!(read_value(value), Err(Wrong::Form));
 }
 
 #[test]
@@ -272,57 +352,226 @@ fn account_life_is_checked_before_idempotence_and_deletion_is_account_wide() {
     assert_eq!(ids_to_delete(mira, &keys).collect::<Vec<_>>(), vec![id(1), id(2)]);
 }
 
+fn numbered_event(n: u64) -> Placed {
+    let mut event = start(1);
+    let mut bytes = [0; 16];
+    bytes[..8].copy_from_slice(&n.to_be_bytes());
+    event.record.id = EventId::from_bytes(bytes);
+    event.sequence = n;
+    event
+}
+
 #[test]
 fn a_batch_fits_count_and_bytes_and_refuses_only_the_bad_identified_event() {
-    let events: Vec<_> = (1u64..=501).map(|n| {
-        let mut event = start(1);
-        let mut bytes = [0; 16];
-        bytes[..8].copy_from_slice(&n.to_be_bytes());
-        event.record.id = EventId::from_bytes(bytes);
-        event.sequence = n;
-        event
-    }).collect();
-    let batch = Batch::prefix(5, &events, BATCH_BYTES).unwrap();
+    let events: Vec<_> = (1..=501).map(numbered_event).collect();
+    let batch = Batch::prefix(head(), 5, &events, BATCH_BYTES).unwrap();
     assert_eq!(batch.events().len(), BATCH_EVENTS);
-    let first_size = Batch::prefix(5, &events[..1], BATCH_BYTES).unwrap().write().unwrap().len();
-    assert_eq!(Batch::prefix(5, &events, first_size).unwrap().events(), &events[..1]);
-    assert_eq!(Batch::prefix(5, &events, first_size - 1).err(), Some(Wrong::Size));
-    assert_eq!(Batch::prefix(5, &[start(1), start(1)], BATCH_BYTES).err(), Some(Wrong::RepeatedId));
+    let first_size = Batch::prefix(head(), 5, &events[..1], BATCH_BYTES)
+        .unwrap()
+        .write()
+        .unwrap()
+        .bytes()
+        .len();
+    assert_eq!(
+        Batch::prefix(head(), 5, &events, first_size)
+            .unwrap()
+            .events(),
+        &events[..1]
+    );
+    assert_eq!(
+        Batch::prefix(head(), 5, &events, first_size - 1).err(),
+        Some(Wrong::Size)
+    );
+    assert_eq!(
+        Batch::prefix(head(), 5, &[start(1), start(1)], BATCH_BYTES).err(),
+        Some(Wrong::RepeatedId)
+    );
 
-    let pair = Batch::prefix(5, &events[..2], BATCH_BYTES).unwrap().write().unwrap();
-    let mut value: Value = serde_json::from_slice(&pair).unwrap();
+    let pair = Batch::prefix(head(), 5, &events[..2], BATCH_BYTES)
+        .unwrap()
+        .write()
+        .unwrap();
+    let mut value: Value = serde_json::from_slice(pair.bytes()).unwrap();
     value["events"][1]["event"]["position_ms"] = Value::Bool(false);
     let wire = serde_json::to_vec(&value).unwrap();
     let batch = IncomingBatch::read(&wire).unwrap();
-    assert_eq!(batch.events, vec![(events[0].record.id, Ok(events[0].clone())), (events[1].record.id, Err(Wrong::Form))]);
+    assert_eq!(
+        batch.events,
+        vec![
+            (events[0].record.id, Ok(events[0].clone())),
+            (events[1].record.id, Err(Wrong::Form))
+        ]
+    );
     value["events"][1]["id"] = value["events"][0]["id"].clone();
-    assert_eq!(IncomingBatch::read(&serde_json::to_vec(&value).unwrap()).err(), Some(Wrong::RepeatedId));
+    assert_eq!(
+        IncomingBatch::read(&serde_json::to_vec(&value).unwrap()).err(),
+        Some(Wrong::Form)
+    );
     value["events"][1]["id"] = Value::Null;
-    assert_eq!(IncomingBatch::read(&serde_json::to_vec(&value).unwrap()).err(), Some(Wrong::Form));
-    let too_many = serde_json::to_vec(&serde_json::json!({"life":5, "events":events})).unwrap();
-    assert_eq!(IncomingBatch::read(&too_many).err(), Some(Wrong::Count));
-    let mut too_big = pair;
+    assert_eq!(
+        IncomingBatch::read(&serde_json::to_vec(&value).unwrap()).err(),
+        Some(Wrong::Form)
+    );
+    let too_many = serde_json::to_vec(&json!({"head":head(), "life":5, "events":events})).unwrap();
+    assert_eq!(IncomingBatch::read(&too_many).err(), Some(Wrong::Form));
+    let mut too_big = pair.bytes().to_vec();
     too_big.resize(BATCH_BYTES + 1, b' ');
     assert_eq!(IncomingBatch::read(&too_big).err(), Some(Wrong::Size));
 }
 
 #[test]
-fn a_batch_answer_uses_only_asked_ids_and_cannot_acknowledge_a_prefix() {
+fn oversized_event_is_refused_without_losing_other_batch_entries() {
+    let pair = Batch::prefix(head(), 5, &[start(1), start(2)], BATCH_BYTES)
+        .unwrap()
+        .write()
+        .unwrap();
+    let mut value: Value = serde_json::from_slice(pair.bytes()).unwrap();
+    value["events"][1]["future"] = json!("x".repeat(EVENT_BYTES));
+    let bytes = serde_json::to_vec(&value).unwrap();
+    let batch = IncomingBatch::read(&bytes).unwrap();
+    assert_eq!(
+        batch.events,
+        vec![(id(1), Ok(start(1))), (id(2), Err(Wrong::Size))]
+    );
+}
+
+#[test]
+fn a_batch_answer_uses_the_shared_stamp_and_only_asked_ids() {
     use Outcome::*;
-    let sent = Batch::prefix(5, &[start(1), start(2), start(3), start(4)], BATCH_BYTES).unwrap();
-    let rows = vec![Answered { id: id(3), outcome: Taken }, Answered { id: id(1), outcome: Refused }, Answered { id: id(4), outcome: NotDealtWith }];
-    let wire = BatchAnswer::new(rows).unwrap().write().unwrap();
-    let answer = BatchAnswer::read(200, &wire, &sent).unwrap();
+    let sent = Batch::prefix(
+        head(),
+        5,
+        &[start(1), start(2), start(3), start(4)],
+        BATCH_BYTES,
+    )
+    .unwrap();
+    let rows = vec![
+        Answered {
+            id: id(3),
+            outcome: Taken,
+        },
+        Answered {
+            id: id(1),
+            outcome: Refused,
+        },
+        Answered {
+            id: id(4),
+            outcome: NotDealtWith,
+        },
+    ];
+    let done = Reply::Done {
+        result: BatchAnswer::new(rows).unwrap(),
+        receipt: receipt(5),
+    };
+    let body = write_reply(&done).unwrap();
+    let wire = body.bytes();
+    let Reply::Done {
+        result: answer,
+        receipt: stamp,
+    } = read_reply(200, wire, &sent).unwrap()
+    else {
+        panic!("expected a stamped success");
+    };
+    assert_eq!(stamp, receipt(5));
     assert_eq!(answer.outcome(id(1)), Refused);
     assert_eq!(answer.outcome(id(2)), NotDealtWith);
     assert_eq!(answer.outcome(id(3)), Taken);
     assert_eq!(answer.outcome(id(4)), NotDealtWith);
-    assert_eq!(BatchAnswer::read(201, &wire, &sent), Err(Wrong::Status));
-    assert_eq!(BatchAnswer::read(200, &wire[..wire.len() - 1], &sent), Err(Wrong::Form));
-    let unknown = format!(r#"{{"answers":[{{"id":"{}","outcome":"taken"}}]}}"#, id(9).to_hex());
-    assert_eq!(BatchAnswer::read(200, unknown.as_bytes(), &sent), Err(Wrong::UnaskedId));
-    let duplicate = format!(r#"{{"answers":[{{"id":"{0}","outcome":"taken"}},{{"id":"{0}","outcome":"refused"}}]}}"#, id(1).to_hex());
-    assert_eq!(BatchAnswer::read(200, duplicate.as_bytes(), &sent), Err(Wrong::RepeatedId));
+    assert_eq!(read_reply(201, wire, &sent), Err(Wrong::Status));
+    assert_eq!(
+        read_reply(200, &wire[..wire.len() - 1], &sent),
+        Err(Wrong::Form)
+    );
+    let mut value: Value = serde_json::from_slice(wire).unwrap();
+    value["done"]["result"]["answers"][0]["id"] = json!(id(9).to_hex());
+    assert_eq!(
+        read_reply(200, &serde_json::to_vec(&value).unwrap(), &sent),
+        Err(Wrong::UnaskedId)
+    );
+    value["done"]["result"]["answers"][0]["id"] =
+        value["done"]["result"]["answers"][1]["id"].clone();
+    assert_eq!(
+        read_reply(200, &serde_json::to_vec(&value).unwrap(), &sent),
+        Err(Wrong::Form)
+    );
+    value["done"].as_object_mut().unwrap().remove("receipt");
+    assert_eq!(
+        read_reply(200, &serde_json::to_vec(&value).unwrap(), &sent),
+        Err(Wrong::Form)
+    );
+}
+
+#[test]
+fn envelope_head_is_required_and_counted_in_the_request_limit() {
+    let sent = Batch::prefix(head(), 5, &[start(1)], BATCH_BYTES).unwrap();
+    assert_eq!(sent.head(), &head());
+    let encoded = sent.write().unwrap();
+    let incoming = IncomingBatch::read(encoded.bytes()).unwrap();
+    assert_eq!(incoming.head, head());
+    let mut at_limit = encoded.bytes().to_vec();
+    at_limit.resize(BATCH_BYTES, b' ');
+    assert!(IncomingBatch::read(&at_limit).is_ok());
+    at_limit.push(b' ');
+    assert_eq!(IncomingBatch::read(&at_limit).err(), Some(Wrong::Size));
+
+    let mut malformed: Value = serde_json::from_slice(encoded.bytes()).unwrap();
+    malformed["head"]["restore"] = json!("9");
+    assert_eq!(
+        IncomingBatch::read(&serde_json::to_vec(&malformed).unwrap()).err(),
+        Some(Wrong::Form)
+    );
+    malformed.as_object_mut().unwrap().remove("head");
+    assert_eq!(
+        IncomingBatch::read(&serde_json::to_vec(&malformed).unwrap()).err(),
+        Some(Wrong::Form)
+    );
+}
+
+#[test]
+fn a_batch_reply_uses_the_list_ceiling_but_a_refusal_stays_small() {
+    let events: Vec<_> = (1..=BATCH_EVENTS as u64).map(numbered_event).collect();
+    let sent = Batch::prefix(head(), 5, &events, BATCH_BYTES).unwrap();
+    let rows: Vec<_> = events
+        .iter()
+        .map(|event| Answered {
+            id: event.record.id,
+            outcome: Outcome::Taken,
+        })
+        .collect();
+    let answer = Reply::Done {
+        result: BatchAnswer::new(rows).unwrap(),
+        receipt: receipt(5),
+    };
+    let mut wide = write_reply(&answer).unwrap().bytes().to_vec();
+    assert!(wide.len() > account::SMALL_REPLY_MAX_BYTES);
+    assert_eq!(
+        read_reply(200, &wide, &sent),
+        Ok(Reply::Done {
+            result: BatchAnswer::new(
+                events
+                    .iter()
+                    .map(|event| Answered {
+                        id: event.record.id,
+                        outcome: Outcome::Taken
+                    })
+                    .collect()
+            )
+            .unwrap(),
+            receipt: receipt(5),
+        })
+    );
+    wide.resize(BATCH_REPLY_BYTES, b' ');
+    assert_eq!(read_reply(200, &wide, &sent), Ok(answer));
+    wide.push(b' ');
+    assert_eq!(read_reply(200, &wide, &sent), Err(Wrong::Size));
+
+    let refusal = Reply::Refused(Refusal::NotDealtWith);
+    let mut small = write_reply(&refusal).unwrap().bytes().to_vec();
+    small.resize(account::SMALL_REPLY_MAX_BYTES, b' ');
+    assert_eq!(read_reply(503, &small, &sent), Ok(refusal));
+    assert_eq!(read_reply(200, &small, &sent), Err(Wrong::Status));
+    small.push(b' ');
+    assert_eq!(read_reply(503, &small, &sent), Err(Wrong::Size));
 }
 
 #[test]
@@ -382,18 +631,27 @@ fn overall_event_bytes_are_bounded_even_with_individually_valid_text() {
     assert_eq!(Record::new(id(1), 1, kind.clone()), Err(Wrong::Size));
     let oversized = event(1, kind);
     assert_eq!(oversized.line(), Err(Wrong::Size));
-    assert_eq!(Batch::prefix(1, &[oversized], BATCH_BYTES).err(), Some(Wrong::Size));
+    assert_eq!(
+        Batch::prefix(head(), 1, &[oversized], BATCH_BYTES).err(),
+        Some(Wrong::Size)
+    );
 }
 
 #[test]
 fn a_finished_song_may_run_through_the_fraction_truncated_from_its_duration() {
-    let finished = |position_ms| Record::new(id(2), 3, Kind::Stop {
-        start: id(1),
-        position_ms: Some(position_ms),
-        duration_ms: Some(215_000),
-        heard_ms: Some(position_ms),
-        why: Stopped::Finished,
-    });
+    let finished = |position_ms| {
+        Record::new(
+            id(2),
+            3,
+            Kind::Stop {
+                start: id(1),
+                position_ms: Some(position_ms),
+                duration_ms: Some(215_000),
+                heard_ms: Some(position_ms),
+                why: Stopped::Finished,
+            },
+        )
+    };
     let end = finished(215_480).unwrap().place(2).unwrap();
     assert_eq!(Placed::read(&end.line().unwrap()).unwrap(), end);
     assert!(finished(215_999).is_ok());
