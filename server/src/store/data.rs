@@ -549,8 +549,10 @@ impl std::fmt::Debug for Password {
     }
 }
 
-/// One change to the data, done in a step with others by [`Data::apply`].
-#[derive(Debug, Clone)]
+/// One change to the data, done in a step with others by [`Data::apply`]. Its `Debug` names
+/// accounts and devices by number only: no email, name to show, device's name, code or
+/// verifier (design 19.4; the review's finding 12).
+#[derive(Clone)]
 pub enum Change<'a> {
     /// A new account, with its first state (C3r's), its email and its name to show.
     Account { number: u64, shown: &'a str, state: &'a AccountState },
@@ -572,6 +574,24 @@ pub enum Change<'a> {
     Codes { account: u64 },
     /// A new restore number, and when; every session ended (12.4 steps 1 and 2).
     Restore { restore: u64, at: u64, from: Option<u64> },
+}
+
+impl std::fmt::Debug for Change<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Change::Account { number, .. } => f.debug_struct("Account").field("number", number).finish_non_exhaustive(),
+            Change::Install { number, rows, at } => {
+                f.debug_struct("Install").field("number", number).field("devices", &rows.devices.keys().collect::<Vec<_>>()).field("at", at).finish_non_exhaustive()
+            }
+            Change::Describe { device, .. } => f.debug_struct("Describe").field("device", device).finish_non_exhaustive(),
+            Change::Heard { device, at } => f.debug_struct("Heard").field("device", device).field("at", at).finish(),
+            Change::Erase { account } => f.debug_struct("Erase").field("account", account).finish(),
+            Change::Password { account, password } => f.debug_struct("Password").field("account", account).field("set", &password.is_some()).finish(),
+            Change::Code { account, made_at, until, .. } => f.debug_struct("Code").field("account", account).field("made_at", made_at).field("until", until).finish_non_exhaustive(),
+            Change::Codes { account } => f.debug_struct("Codes").field("account", account).finish(),
+            Change::Restore { restore, at, from } => f.debug_struct("Restore").field("restore", restore).field("at", at).field("from", from).finish(),
+        }
+    }
 }
 
 fn status_word(status: Status) -> &'static str {

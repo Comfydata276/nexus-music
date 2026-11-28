@@ -24,7 +24,8 @@ pub enum Pending {
     TakeAsIs { restore: u64 },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// Its `Debug`, and [`DataView`]'s, count accounts: an account's state holds its email.
+#[derive(Clone, PartialEq, Eq, Default)]
 pub struct StoreView {
     pub restore: u64,
     /// How far the data's changes had got when the store last heard (12.3): written at most
@@ -34,12 +35,33 @@ pub struct StoreView {
     pub pending: Option<Pending>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Clone, PartialEq, Eq, Default)]
 pub struct DataView {
     pub restore: u64,
     /// How far the data's changes have got: one more for every step written.
     pub changes: u64,
     pub accounts: BTreeMap<u64, Rows>,
+}
+
+impl std::fmt::Debug for StoreView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoreView")
+            .field("restore", &self.restore)
+            .field("mark", &self.mark)
+            .field("accounts", &self.accounts.keys().collect::<Vec<_>>())
+            .field("pending", &self.pending)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for DataView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DataView")
+            .field("restore", &self.restore)
+            .field("changes", &self.changes)
+            .field("accounts", &self.accounts.keys().collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 /// Something no cut between the two stores, and no older copy of the data, can make: the
