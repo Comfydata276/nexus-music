@@ -51,6 +51,8 @@ impl AddressError {
     }
 
     pub fn typed_words(self) -> String {
+        // Sections 2 and 5.4 give two sentences for HTTP; the design does not say
+        // which takes precedence. Use the owner's explicit HTTPS requirement.
         if self == Self::Scheme {
             return "Nexus Music needs an https:// address.".into();
         }
@@ -264,13 +266,17 @@ impl Address {
     fn from_parts(origin: Origin, path: &str, query: Option<&str>) -> Result<Self, AddressError> {
         let path = if path.is_empty() { "/" } else { path };
         check_path(path)?;
-        let address = Self {
+        // All input components are bounded before concatenation. Check the final
+        // spelling without making a temporary copy of a signed query.
+        let wire_len = origin.to_string().len() + path.len() + query.map_or(0, |q| 1 + q.len());
+        if wire_len > MAX_ADDRESS_BYTES {
+            return Err(AddressError::TooLong);
+        }
+        Ok(Self {
             origin,
             path: path.into(),
             query: query.map(str::to_owned),
-        };
-        check_length(&address.wire())?;
-        Ok(address)
+        })
     }
 
     pub fn origin(&self) -> &Origin {
@@ -321,8 +327,9 @@ impl Address {
         Ok(target)
     }
 
-    /// RFC 3986 section 5 on the allowed grammar. Reject a raw dot segment before
-    /// merging: resolving it away could make a forbidden path appear to be the request.
+    /// Sections 5.3 and 5.4 differ on normalization: the design does not say which
+    /// takes precedence. Follow RFC 3986 section 5 on the allowed grammar. Refuse a
+    /// raw dot segment before merging so a forbidden path cannot be repaired into the request.
     /// HTTP is representable here solely so the judge can report a valid downgrade.
     pub(crate) fn location(&self, text: &str) -> Result<Self, AddressError> {
         let (hier, query) = components(text)?;
@@ -365,6 +372,7 @@ pub struct MusicBase(Address);
 
 impl MusicBase {
     pub fn typed(text: &str) -> Result<Self, AddressError> {
+        // Before hand-over the probe's Nexus origin is the music server's origin.
         Self::checked(Address::typed(text)?, true)
     }
 
@@ -372,13 +380,11 @@ impl MusicBase {
     /// the credential in this very answer, and rotating the generation belong to the app.
     pub fn handed_over(nexus: &Origin, source: HandoverSource<'_>, text: &str) -> Result<Self, AddressError> {
         use crate::nexus::proto::plain;
-        match source {
-            HandoverSource::DeviceTokenAnswer(sent)
-                if sent.origin() == nexus && sent.query().is_none() && plain(sent.path()).is_ok() =>
-            {
-                ()
-            }
-            _ => return Err(AddressError::HandoverSource),
+        let HandoverSource::DeviceTokenAnswer(sent) = source else {
+            return Err(AddressError::HandoverSource);
+        };
+        if sent.origin() != nexus || sent.query().is_some() || plain(sent.path()).is_err() {
+            return Err(AddressError::HandoverSource);
         }
         let addr = Address::parse(text)?;
         let same_origin = addr.origin() == nexus;
@@ -423,6 +429,14 @@ impl MusicBase {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MusicRequest(Address);
 
+#[derive(Clone, Copy)]
+pub(crate) enum Difference {
+    Downgrade,
+    Elsewhere,
+    Path,
+    Query,
+}
+
 impl MusicRequest {
     pub fn address(&self) -> &Address {
         &self.0
@@ -433,11 +447,20 @@ impl MusicRequest {
 
     /// Section 5.3 checks the path before the query. Only this constructor can turn a
     /// redirect target back into a music request.
-    pub(crate) fn with_added_slash(&self, target: Address) -> Option<Self> {
-        (self.0.origin == target.origin
-            && target.path.strip_suffix('/') == Some(self.0.path())
-            && self.0.query == target.query)
-            .then_some(Self(target))
+    pub(crate) fn with_added_slash(&self, target: &Address) -> Result<Self, Difference> {
+        if target.origin.scheme != "https" {
+            return Err(Difference::Downgrade);
+        }
+        if target.origin != self.0.origin {
+            return Err(Difference::Elsewhere);
+        }
+        if target.path.strip_suffix('/') != Some(self.0.path()) {
+            return Err(Difference::Path);
+        }
+        if target.query != self.0.query {
+            return Err(Difference::Query);
+        }
+        Ok(Self(target.clone()))
     }
 }
 
@@ -522,7 +545,18 @@ mod tests {
             ("m#%", Fragment),
         ] {
             assert_eq!(Address::typed(text), Err(why), "{text:?}");
+            for message in [why.typed_words(), why.handover_words()] {
+                assert!(!message.contains('?') && !message.contains("token=private"));
+            }
         }
+    }
+
+    #[test]
+    fn numeric_names_are_compared_as_text_even_if_a_stack_reinterprets_one() {
+        let a = Address::typed("192.000.2.10/rest/ping").unwrap();
+        let b = Address::typed("192.0.2.10/rest/ping").unwrap();
+        assert_ne!(a.origin(), b.origin());
+        assert!(!a.matches_request("https", b.origin().host(), 443, a.path(), None));
     }
 
     #[test]

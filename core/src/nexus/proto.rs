@@ -583,6 +583,7 @@ mod tests {
         assert_eq!(asked("https://music.example.org/navidrome/"), at("https://music.example.org"));
         assert_eq!(asked("https://music.example.org/a/b?x=1#y"), at("https://music.example.org"));
         assert_eq!(asked("https://music.example.org?x=1"), at("https://music.example.org"));
+        // The old probe trimmed here; the design does not say to keep that exception.
         // The common reader refuses a space anywhere, including around a saved address.
         assert_eq!(asked("  https://music.example.org  "), None);
         // A port; an IPv4 and an IPv6 literal; case.

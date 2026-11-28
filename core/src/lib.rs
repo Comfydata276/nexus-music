@@ -28,6 +28,7 @@ pub mod origin;
 pub mod playlists;
 pub mod queue;
 pub mod record;
+pub mod redirect;
 pub mod requests;
 pub mod search;
 pub mod step;
