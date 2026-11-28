@@ -60,7 +60,19 @@ class Music(BaseHTTPRequestHandler):
             data = AUDIO.get(query.get("id", [""])[0], b"")
             if not data:
                 return self.send_error(404)
-            self.send_response(200)
+            match = self.headers.get("Range", "").removeprefix("bytes=").split("-", 1)
+            if len(match) == 2 and match[0].isdigit():
+                length = len(data)
+                start = int(match[0])
+                end = min(length - 1, int(match[1])) if match[1].isdigit() else length - 1
+                if start > end:
+                    return self.send_error(416)
+                data = data[start:end + 1]
+                self.send_response(206)
+                self.send_header("Content-Range", f"bytes {start}-{end}/{length}")
+            else:
+                self.send_response(200)
+            self.send_header("Accept-Ranges", "bytes")
             self.send_header("Content-Type", "audio/wav")
         else:
             data = json.dumps({"subsonic-response": {
@@ -95,7 +107,7 @@ def prepare(source, target, port):
     settings = json.loads(path.read_text()) | {
         "server": server, "username": "fictional-listener", "check_updates": False,
         "requests": False, "sync": False, "autoplay": False, "cache_limit_mb": 0,
-        "gapless": True, "crossfade": 0.0, "quality": 0, "repeat": 0, "shuffle": False,
+        "gapless": True, "crossfade": 0.0, "bitrate": 0, "repeat": 0, "shuffle": False,
         "scrobble": False, "said_no_links": True, "offline": False,
     }
     path.write_text(json.dumps(settings))
@@ -257,6 +269,9 @@ def walk(profile, port, temporary):
     old_rows = rows(recorded)
     with file.open("ab") as tail:
         tail.write(b'{"id":"torn-test')
+    settings_path = recorded / "config/settings.json"
+    settings = json.loads(settings_path.read_bytes())
+    settings_path.write_text(json.dumps(settings | {"offline": True}))
     with Player(recorded, 29486, True):
         recovered = until(lambda: event(recorded, "stop", start=second["id"], why={"kind": "unknown"}), "restart Stop")
         assert recovered["event"]["position_ms"] is not None
@@ -264,7 +279,8 @@ def walk(profile, port, temporary):
         assert rows(recorded)[:len(old_rows)] == old_rows
         state = json.loads((recorded / "data/listening-journal/state.json").read_bytes())
         assert state["damaged"] == 1
-        assert json.loads((recorded / "config/settings.json").read_bytes())["repeat"] == 1
+        assert any(row["event"]["kind"] == "open" for row in rows(recorded)[len(old_rows):])
+        assert json.loads(settings_path.read_bytes())["repeat"] == 1
     print("Kept log prefix and exact appended line, PCM parity, gapless Start/Stop, pause/resume, "
           "seek, zero-result search, Diagnostics privacy, no journal window flushes, Repeat across SIGKILL, "
           "and torn-tail recovery verified.")
