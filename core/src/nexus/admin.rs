@@ -15,6 +15,12 @@ use serde::{Serialize, Serializer};
 use serde_json::value::RawValue;
 use zeroize::Zeroizing;
 
+mod lidarr;
+pub use lidarr::{
+    LIDARR_KEY_MAX_BYTES, LIDARR_NONCE_BYTES, LidarrBinding, LidarrKey, LidarrSealingKey,
+    SealedLidarrKey,
+};
+
 pub const PAGE: &str = "/nexus/admin/";
 pub const LIST_ACCOUNTS: &str = "/nexus/api/admin/accounts";
 pub const CREATE_ACCOUNT: &str = "/nexus/api/admin/create-account";
@@ -29,6 +35,7 @@ pub const LIST_DEVICES: &str = "/nexus/api/admin/devices";
 pub const FORCE_OUT: &str = "/nexus/api/admin/force-out";
 pub const GET_DIAGNOSTICS_DEFAULT: &str = "/nexus/api/admin/diagnostics-default";
 pub const SET_DIAGNOSTICS_DEFAULT: &str = "/nexus/api/admin/set-diagnostics-default";
+pub const SET_LIDARR: &str = "/nexus/api/admin/set-lidarr";
 pub const GET_LIDARR_SETTING: &str = "/nexus/api/admin/lidarr";
 pub const SET_REQUESTS_ENABLED: &str = "/nexus/api/admin/set-requests-enabled";
 pub const REQUEST_GRANT: &str = "/nexus/api/admin/grant";
@@ -38,7 +45,7 @@ pub const POST_PATHS: &[&str] = &[
     LIST_ACCOUNTS, CREATE_ACCOUNT, SET_ACCOUNT_ENABLED, SET_ADMIN, DELETE_ACCOUNT,
     RESET_PASSWORD, GET_MUSIC_SERVER, SET_MUSIC_SERVER, SET_MUSIC_LOGIN, LIST_DEVICES,
     FORCE_OUT, GET_DIAGNOSTICS_DEFAULT, SET_DIAGNOSTICS_DEFAULT, SET_REQUESTS_ENABLED,
-    GET_LIDARR_SETTING, REQUEST_GRANT,
+    GET_LIDARR_SETTING, SET_LIDARR, REQUEST_GRANT,
 ];
 
 // §7.2 bounds password-bearing calls at 4 KiB. Use that ceiling for all admin
@@ -101,7 +108,7 @@ impl wire::Value for MusicPassword {
 // container's route, with the same credential-free syntax as the public address.
 pub const INTERNAL_ADDRESS_MAX_BYTES: usize = 1024;
 
-#[derive(Debug, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct InternalAddress(String);
 
@@ -280,6 +287,23 @@ object! {
 object! { TypedMusicLogin { account: AccountId, name: Name, password: MusicPassword } }
 object! { SessionTarget { account: AccountId, device: DeviceId, session: SessionId } }
 object! { RequestsEnabled { account: AccountId, enabled: bool } }
+/// Only the key comes from the page. The server supplies the endpoint and
+/// revision from its container settings and the store kept apart.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct LidarrKeyChange {
+    pub key: LidarrKey,
+}
+
+impl wire::Value for LidarrKeyChange {
+    fn read(raw: &RawValue) -> Result<Self, BadMessage> {
+        let fields = Fields::read(raw)?;
+        if fields.0.len() != 1 {
+            return Err(BadMessage::Form);
+        }
+        Ok(Self { key: fields.get("key")? })
+    }
+}
+
 object! { Applied {} }
 
 /// the design does not say how a code-bearing reply is retried without showing
@@ -328,6 +352,7 @@ pub enum Action {
     ForceOut(SessionTarget),
     SetDiagnosticsDefault(DiagnosticsDefault),
     SetRequestsEnabled(RequestsEnabled),
+    SetLidarr(LidarrKeyChange),
 }
 
 impl Action {
@@ -340,12 +365,13 @@ impl Action {
             Self::SetMusicLogin(account) => Some(*account),
             Self::ForceOut(change) => Some(change.account),
             Self::SetRequestsEnabled(change) => Some(change.account),
-            Self::CreateAccount(_) | Self::SetMusicServer(_) | Self::SetDiagnosticsDefault(_) => None,
+            Self::CreateAccount(_) | Self::SetMusicServer(_) | Self::SetDiagnosticsDefault(_) |
+            Self::SetLidarr(_) => None,
         }
     }
 
-    fn kept_action(&self) -> AdminAction {
-        match self {
+    fn kept_action(&self) -> Option<AdminAction> {
+        Some(match self {
             Self::CreateAccount(_) => AdminAction::CreateAccount,
             Self::SetAccountEnabled(change) => AdminAction::SetOn(change.enabled),
             Self::SetAdmin(change) => AdminAction::SetAdmin(change.admin),
@@ -358,7 +384,8 @@ impl Action {
             }),
             Self::SetDiagnosticsDefault(change) => AdminAction::SetDiagnosticsDefault(change.enabled),
             Self::SetRequestsEnabled(change) => AdminAction::SetRequests(change.enabled),
-        }
+            Self::SetLidarr(_) => return None,
+        })
     }
 }
 
@@ -367,7 +394,7 @@ impl wire::Value for Action {
         let (action, value) = Fields::read(raw)?.select(&[
             "create_account", "set_account_enabled", "set_admin", "delete_account",
             "reset_password", "set_music_server", "set_music_login", "force_out",
-            "set_diagnostics_default", "set_requests_enabled",
+            "set_diagnostics_default", "set_requests_enabled", "set_lidarr",
         ])?;
         match action {
             "create_account" => Email::read(value).map(Self::CreateAccount),
@@ -380,6 +407,7 @@ impl wire::Value for Action {
             "force_out" => SessionTarget::read(value).map(Self::ForceOut),
             "set_diagnostics_default" => DiagnosticsDefault::read(value).map(Self::SetDiagnosticsDefault),
             "set_requests_enabled" => RequestsEnabled::read(value).map(Self::SetRequestsEnabled),
+            "set_lidarr" => LidarrKeyChange::read(value).map(Self::SetLidarr),
             _ => Err(BadMessage::Form),
         }
     }
@@ -407,7 +435,22 @@ impl NamedChange {
         };
         Some(GrantIntent {
             request_id: self.request_id,
-            change: LeaveFor::Admin { action: self.action.kept_action(), target },
+            change: LeaveFor::Admin { action: self.action.kept_action()?, target },
+        })
+    }
+
+    /// Use the configured NEXUS_LIDARR address and current revision from the
+    /// apart store. The password check and grant are then issued by kept.
+    pub fn lidarr_grant_intent(&self, current: &LidarrBinding) -> Option<GrantIntent> {
+        let Action::SetLidarr(change) = &self.action else {
+            return None;
+        };
+        Some(GrantIntent {
+            request_id: self.request_id,
+            change: LeaveFor::Admin {
+                action: AdminAction::lidarr(&change.key, current),
+                target: AdminTarget::Backend,
+            },
         })
     }
 }
@@ -459,6 +502,7 @@ pub type SetMusicLogin = Granted<TypedMusicLogin>;
 pub type ForceOut = Granted<SessionTarget>;
 pub type SetDiagnosticsDefault = Granted<DiagnosticsDefault>;
 pub type SetRequestsEnabled = Granted<RequestsEnabled>;
+pub type SetLidarr = Granted<LidarrKeyChange>;
 
 /// the design does not say each admin denial's tag. Use fixed reasons and
 /// C7's response status classes.
@@ -958,6 +1002,99 @@ mod tests {
             }
             turn.administer(bearer, action, named, target)
         })
+    }
+
+    #[test]
+    fn lidarr_key_requests_are_bounded_key_only_and_redacted() {
+        let request = granted(LidarrKeyChange { key: LidarrKey::new("made-up-key").unwrap() });
+        let body = encode(&request).unwrap();
+        assert_eq!(read::<SetLidarr>(body.bytes()).as_ref(), Ok(&request));
+        assert!(!format!("{request:?}").contains("made-up-key"));
+
+        let grant = RequestGrant {
+            head: head(),
+            password: Password::presented(&"\0".repeat(account::PASSWORD_MAX_CHARS)).unwrap(),
+            change: NamedChange {
+                request_id: RequestId::new(9).unwrap(),
+                action: Action::SetLidarr(LidarrKeyChange {
+                    key: LidarrKey::new(&"\"".repeat(LIDARR_KEY_MAX_BYTES)).unwrap(),
+                }),
+            },
+        };
+        round_trip(grant);
+
+        let mut extra = serde_json::to_value(&request).unwrap();
+        extra["change"]["address"] = serde_json::json!("http://unexpected.example.test:8686");
+        assert_eq!(read::<SetLidarr>(extra.to_string().as_bytes()), Err(BadMessage::Form));
+        for invalid in ["", "has space", "line\r\nbreak", "é", &"a".repeat(LIDARR_KEY_MAX_BYTES + 1)] {
+            assert!(LidarrKey::new(invalid).is_none());
+        }
+    }
+
+    #[test]
+    fn lidarr_grants_bind_the_key_endpoint_revision_and_request_number() {
+        use kept::{Bearer, DataChange, Denied, GrantUse};
+        let (mut actor, device, hash) = signed_in_admin();
+        let current = LidarrBinding {
+            backend: actor.state().backend,
+            address: InternalAddress::new("http://lidarr.example.test:8686").unwrap(),
+            revision: 1,
+        };
+        let request_id = RequestId::new(8).unwrap();
+        let key_text = "made-up-key";
+        let key = LidarrKey::new(key_text).unwrap();
+        let named = NamedChange {
+            request_id,
+            action: Action::SetLidarr(LidarrKeyChange { key: LidarrKey::new(key_text).unwrap() }),
+        };
+        assert!(named.grant_intent(None).is_none());
+        let secret = GrantSecret::from_bytes([0x65; account::SECRET_BYTES]);
+        let intent = named.lidarr_grant_intent(&current).unwrap();
+        assert!(!format!("{intent:?} {named:?}").contains(key_text));
+        authorize(&mut actor, device, &hash, intent, &secret);
+
+        let sealing = LidarrSealingKey::new([0x66; 32]);
+        let bearer = |request_id| Bearer {
+            device, hash: &hash, grant: Some(GrantUse { request_id, secret: &secret }),
+        };
+        let other_key = LidarrKey::new("another-made-up-key").unwrap();
+        let other_address = LidarrBinding {
+            address: InternalAddress::new("http://next.example.test:8686").unwrap(),
+            ..current.clone()
+        };
+        let other_revision = LidarrBinding { revision: 2, ..current.clone() };
+        for (binding, candidate, request) in [
+            (&current, &other_key, request_id),
+            (&other_address, &key, request_id),
+            (&other_revision, &key, request_id),
+            (&current, &key, RequestId::new(9).unwrap()),
+        ] {
+            actor.request(1, kept::Clock::new(3, 3), |turn| {
+                turn.set_lidarr(bearer(request), binding, candidate, &sealing, [0x67; LIDARR_NONCE_BYTES])
+            }).apply(|effects| {
+                assert!(effects.updates.iter().all(|update| update.change == DataChange::Keep));
+                Ok::<_, std::convert::Infallible>(())
+            }).map(|answer| assert_eq!(answer, Err(Denied::LeaveRequired))).unwrap();
+        }
+
+        actor.request(1, kept::Clock::new(3, 3), |turn| {
+            turn.set_lidarr(bearer(request_id), &current, &key, &sealing, [0x68; LIDARR_NONCE_BYTES])
+        }).apply(|effects| {
+            let [update] = effects.updates.as_slice() else { panic!("expected one update") };
+            let DataChange::InstallLidarrKey { binding, sealed } = &update.change else {
+                panic!("expected the sealed key effect");
+            };
+            assert_eq!(binding, &other_revision);
+            assert!(sealing.open(&current, sealed).is_none());
+            assert_eq!(sealing.open(binding, sealed).as_ref(), Some(&key));
+            assert!(update.apart_first.devices.get(&device).unwrap().permit.as_ref().unwrap().leave.is_none());
+            assert_eq!(format!("{:?}", update.change), "InstallLidarrKey");
+            Ok::<_, std::convert::Infallible>(())
+        }).unwrap().unwrap();
+        assert_eq!(
+            step(&mut actor, 3, |turn| turn.set_lidarr(bearer(request_id), &current, &key, &sealing, [0x69; LIDARR_NONCE_BYTES])),
+            Err(Denied::LeaveRequired)
+        );
     }
 
     #[test]

@@ -3,6 +3,9 @@
 
 use super::receipt::Purpose;
 use super::*;
+use crate::nexus::admin::{
+    InternalAddress, LIDARR_NONCE_BYTES, LidarrBinding, LidarrKey, LidarrSealingKey, SealedLidarrKey,
+};
 use crate::nexus::music::{MusicInstallation, VerifiedLogin};
 use std::collections::BTreeMap;
 
@@ -124,6 +127,12 @@ pub enum DataChange {
         target: AdminTarget,
     },
     InstallMusicLogin(MusicInstallation),
+    /// Write the new revision and seal to the apart store with the spent grant.
+    /// The data transaction must never store the seal.
+    InstallLidarrKey {
+        binding: LidarrBinding,
+        sealed: SealedLidarrKey,
+    },
 }
 
 impl fmt::Debug for DataChange {
@@ -139,6 +148,7 @@ impl fmt::Debug for DataChange {
             Self::DeleteAccount => "DeleteAccount",
             Self::ApplyAdmin { .. } => "ApplyAdmin",
             Self::InstallMusicLogin(_) => "InstallMusicLogin",
+            Self::InstallLidarrKey { .. } => "InstallLidarrKey",
         })
     }
 }
@@ -1327,6 +1337,33 @@ impl Turn<'_> {
         }
     }
 
+    /// Under the writer lock, use the current container address and apart-store
+    /// revision. Persist the sealed key and successor revision apart first.
+    pub fn set_lidarr(
+        mut self,
+        bearer: Bearer<'_>,
+        current: &LidarrBinding,
+        key: &LidarrKey,
+        sealing: &LidarrSealingKey,
+        nonce: [u8; LIDARR_NONCE_BYTES],
+    ) -> Result<(), Denied> {
+        self.admin_session(&bearer)?;
+        if current.backend != self.account.state.backend {
+            return Err(Denied::WrongPurpose);
+        }
+        self.consume_leave(
+            bearer,
+            LeaveFor::Admin {
+                action: AdminAction::lidarr(key, current),
+                target: AdminTarget::Backend,
+            },
+        )?;
+        let binding = LidarrBinding { revision: next(current.revision)?, ..current.clone() };
+        let sealed = sealing.seal(&binding, key, nonce).ok_or(Denied::WrongPurpose)?;
+        *self.change = DataChange::InstallLidarrKey { binding, sealed };
+        Ok(())
+    }
+
     /// Other account, or None for a change to the actor's own account or a global
     /// setting. ApplyAdmin/InstallMusicLogin tell S3 to include the action's
     /// payload in the data write. A denied change may still consume leave.
@@ -1338,7 +1375,7 @@ impl Turn<'_> {
         target: Option<&mut Account>,
     ) -> Result<(), Denied> {
         self.admin_session(&bearer)?;
-        if action == AdminAction::MusicLoginChanged {
+        if matches!(action, AdminAction::MusicLoginChanged | AdminAction::SetLidarr { .. }) {
             return Err(Denied::WrongPurpose);
         }
         self.consume_leave(
@@ -1430,14 +1467,26 @@ pub enum AdminAction {
     SetMusicAddress(MusicAddress),
     SetDiagnosticsDefault(bool),
     SetRequests(bool),
-    SetLidarr,
+    SetLidarr {
+        fingerprint: Fingerprint,
+        address: InternalAddress,
+        revision: u64,
+    },
 }
 
 impl AdminAction {
+    pub(in crate::nexus) fn lidarr(key: &LidarrKey, current: &LidarrBinding) -> Self {
+        Self::SetLidarr {
+            fingerprint: key.fingerprint().clone(),
+            address: current.address.clone(),
+            revision: current.revision,
+        }
+    }
+
     fn matches_target(&self, target: &AdminTarget, selected: &AccountState, other: bool) -> bool {
         match self {
             Self::CreateAccount => matches!(target, AdminTarget::NewAccount(_)) && !other,
-            Self::SetMusicAddress(_) | Self::SetDiagnosticsDefault(_) | Self::SetLidarr => {
+            Self::SetMusicAddress(_) | Self::SetDiagnosticsDefault(_) | Self::SetLidarr { .. } => {
                 *target == AdminTarget::Backend && !other
             }
             _ => *target == selected.admin_target(),
@@ -1513,12 +1562,13 @@ fn admin_change(
             }
         }
         AdminAction::ForceOut(device) => force_out(account, device, music)?,
-        AdminAction::MusicLoginChanged => return Err(Denied::WrongPurpose),
+        AdminAction::MusicLoginChanged | AdminAction::SetLidarr { .. } => {
+            return Err(Denied::WrongPurpose);
+        }
         AdminAction::CreateAccount
         | AdminAction::SetMusicAddress(_)
         | AdminAction::SetDiagnosticsDefault(_)
-        | AdminAction::SetRequests(_)
-        | AdminAction::SetLidarr => *change = DataChange::ApplyAdmin { action, target },
+        | AdminAction::SetRequests(_) => *change = DataChange::ApplyAdmin { action, target },
     }
     Ok(())
 }

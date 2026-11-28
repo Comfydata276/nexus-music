@@ -595,7 +595,7 @@ fn admin_payload_is_authorized_in_the_effects_only_when_the_change_is_allowed() 
             1,
             7,
             LeaveFor::Admin {
-                action: AdminAction::SetLidarr,
+                action: AdminAction::SetDiagnosticsDefault(false),
                 target: AdminTarget::Backend,
             },
             2,
@@ -606,7 +606,7 @@ fn admin_payload_is_authorized_in_the_effects_only_when_the_change_is_allowed() 
             .request(1, clock(2, admin.mark), |turn| {
                 turn.administer(
                     bearer(1, &hash(7)),
-                    AdminAction::SetLidarr,
+                    AdminAction::SetDiagnosticsDefault(false),
                     AdminTarget::Backend,
                     target,
                 )
@@ -619,7 +619,7 @@ fn admin_payload_is_authorized_in_the_effects_only_when_the_change_is_allowed() 
                         DataChange::Keep
                     } else {
                         DataChange::ApplyAdmin {
-                            action: AdminAction::SetLidarr,
+                            action: AdminAction::SetDiagnosticsDefault(false),
                             target: AdminTarget::Backend,
                         }
                     }
