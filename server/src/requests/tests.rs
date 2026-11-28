@@ -221,6 +221,7 @@ const PASSWORD: &str = "a long password for the Requests walk";
 struct LidarrState {
     monitored: bool,
     arrived: bool,
+    ambiguous_pending_number: bool,
     new_releases: Option<String>,
     calls: Vec<String>,
 }
@@ -313,7 +314,12 @@ fn mock(request: &Question, state: &mut LidarrState) -> Value {
         ("GET", "album?artistId=5") => json!([album(state.monitored)]),
         ("GET", "album/9") => album(state.monitored),
         ("GET", "wanted/missing?includeArtist=true&page=1&pageSize=500") => {
-            let found: Vec<_> = (state.monitored && !state.arrived).then(|| album(true)).into_iter().collect();
+            let mut found: Vec<_> = (state.monitored && !state.arrived).then(|| album(true)).into_iter().collect();
+            if state.ambiguous_pending_number {
+                let mut competing = album(true);
+                competing["foreignAlbumId"] = json!("10000000-0000-0000-0000-000000000999");
+                found.push(competing);
+            }
             json!({"records":found,"totalRecords":found.len()})
         }
         ("GET", "queue?page=1&pageSize=500") => json!({"records":[{"albumId":9,"size":100,"sizeleft":27}],"totalRecords":1}),
@@ -664,6 +670,11 @@ fn authenticated_loopback_requests_keep_order_and_ownership_and_survive_the_clie
     let stale = Change::Cancel { album: LidarrNumber::new(10).unwrap(), release: MusicBrainzId::new(ALBUM).unwrap() };
     let stale = begun(server.call(&first, begin(4, stale)));
     assert_eq!(server.outcome(&first, stale), Err(Refusal::NoLongerListed));
+
+    lock(&lidarr.state).ambiguous_pending_number = true;
+    let ambiguous = begun(server.call(&first, begin(5, cancelled())));
+    assert_eq!(server.outcome(&first, ambiguous), Err(Refusal::NoLongerListed));
+    lock(&lidarr.state).ambiguous_pending_number = false;
     assert!(lock(&lidarr.state).monitored);
     assert!(!lidarr.take_calls().iter().any(|call| call.starts_with("PUT ")));
 

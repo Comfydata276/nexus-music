@@ -39,7 +39,7 @@ use nexus_core::nexus::requests::{
     self as wire, AlbumView, Answer, ArtistView, AskedRelease, AttributionPage, AttributionRow,
     Availability, BatchAlbum, BatchLine,
     BatchLineProgress, BatchLineView, Call, Change, Completed, JobId, LidarrNumber,
-    ListedView, MusicBrainzId, PageCursor, PendingView, Refusal, Search, SessionOffers,
+    ListedView, MusicBrainzId, PageCursor, Refusal, Search, SessionOffers,
     lidarr_items,
 };
 use nexus_core::offer::Offer;
@@ -1813,8 +1813,7 @@ impl Job {
                 done(Completed::ListedSingles)
             }
             Change::Cancel { album, release } => {
-                let pending = pending_target(lidarr, *album, release)?;
-                pending.check_cancel_target(*album, release)?;
+                check_pending_target(lidarr, *album, release)?;
                 let binding = self.plan.binding;
                 let account = self.account;
                 let admin = self.admin;
@@ -1946,9 +1945,12 @@ fn recovered_asks(
     }).collect()
 }
 
-fn pending_target(lidarr: &Lidarr, album: LidarrNumber, release: &MusicBrainzId) -> Result<PendingView, Refusal> {
-    let rows: Vec<PendingView> = lidarr_items(lidarr_result(lidarr.pending(), None)?);
-    rows.into_iter().find(|row| row.check_cancel_target(album, release).is_ok()).ok_or(Refusal::NoLongerListed)
+fn check_pending_target(lidarr: &Lidarr, album: LidarrNumber, release: &MusicBrainzId) -> Result<(), Refusal> {
+    let rows: Vec<_> = lidarr_result(lidarr.pending(), None)?.into_iter()
+        .filter(|row| row.id == album.get())
+        .map(|row| lidarr::Listed { id: row.id, album: row.album, wanted: true, have: false })
+        .collect();
+    wire::AlbumTarget { id: album, release: release.clone() }.check_current(&rows)
 }
 
 impl Requests {
