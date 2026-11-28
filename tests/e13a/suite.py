@@ -11,6 +11,16 @@ disk blocked as well.
                                             hook (new only): held, switch-off, sabotage
     suite.py offline [build]                Offline mode on from the start, off, on again
     suite.py late-answer [build]            a late answer for one account, another signed in
+    suite.py refused [mode]                 slice W7: a refused music login asked for once
+                                            (mode "found", or "absent" for the backend down)
+    suite.py ended-offline                  slice W7: the session ended while offline
+    suite.py count-offline                  slice W7: the music login's number risen while offline
+
+For the "new" build (slice W7: the app signs in to the Nexus server alone), every run starts
+from the kept profile as a sign-in to the Nexus server would have left it (`to_signed_in`):
+the released app's saved music password removed, and in its place what the Nexus server
+hands over (a session the first origin's stand-in knows, and a music login: a salt and the
+token for it), with the folder of downloads carried over as design 11 says.
     suite.py table                          every run's numbers (NUMBERS.md); exits 1 if any
                                             W1 time is over its bar, or any run failed
 
@@ -31,6 +41,8 @@ RUNS = os.path.join(KIT, "runs")
 RESULTS = os.path.join(HERE, "results")
 NAV = "http://127.0.0.1:4680"
 ACCOUNTS = {"tester": "tester-pass-1", "guest": "guest-pass-1"}
+# Slice W7: the accounts at the stand-in backend (standin.py), made up.
+NEXUS = {"tester": ("tester@example.org", "nexus-pass-tester"), "guest": ("guest@example.org", "nexus-pass-guest")}
 
 
 # ---- the test server, asked directly ------------------------------------------------------
@@ -343,11 +355,64 @@ def close_settings(a):
 
 
 def sign_in(a, user, server=None):
+    """Signs in from the sign-in screen: the released app's (to the music server), or the new
+    one's (to the Nexus server, at `server`'s origin), whichever is showing."""
+    if a.find(label="Nexus server", role="TextInput"):
+        email, password = NEXUS[user]
+        for label, text in (("Nexus server", server or front.SERVER), ("Email", email), ("Password", password)):
+            a.set(a.one(label=label, role="TextInput")["handle"], text)
+        pressed = time.time()
+        a.press("Sign in")
+        return pressed
     for label, text in (("Server address", server or front.SERVER), ("Username", user), ("Password", ACCOUNTS[user])):
         a.set(a.one(label=label, role="TextInput")["handle"], text)
     pressed = time.time()
     a.press("Connect")
     return pressed
+
+
+def sign_in_form(a):
+    """The sign-in screen is showing: the released app's or the new one's."""
+    return a.find(label="Connect") or a.find(label="Sign in", role="Button")
+
+
+def to_signed_in(home, token_of="tester-pass-1", count=1):
+    """Slice W7: the profile at `home` as a sign-in to the Nexus server would have left it.
+    The released app's saved music password is removed (nothing may read it); in its place,
+    one kept item (as `config::SignedIn`, in the file the development build keeps secrets in):
+    the session the stand-in was seeded with, a music login (a salt, and the token for it made
+    from `token_of`, which a test may make wrong), the account, and the folder carried over."""
+    config = os.path.join(A.HOMES, home, "config")
+    if os.path.exists(os.path.join(config, "credential")):
+        os.remove(os.path.join(config, "credential"))
+    salt = "e13asaltsalt0001"
+    music = {"server": front.SERVER, "username": "tester", "salt": salt, "token": hashlib.md5((token_of + salt).encode()).hexdigest(), "count": count}
+    account = {"backend": front.SERVER, "backend_id": front.BACKEND_A, "email": "tester@example.org", "name": "Tester", "device": 1,
+               "restore": 1, "life": 1, "change": 1, "music_count": count, "notice": None, "password_setup": False}
+    folder = ACCOUNT_STEM["tester"]
+    record = {"session": front.SEED_SESSION, "music": music, "account": account, "folder": folder}
+    path = os.path.join(config, "secret-nexus-sign-in")
+    open(path, "w").write(json.dumps(record))
+    os.chmod(path, 0o600)
+    settings = os.path.join(config, "settings.json")
+    s = json.load(open(settings))
+    s["carried_over"] = [f"{front.BACKEND_A}\ntester@example.org", folder]
+    s["sign_in_address"], s["sign_in_email"] = front.SERVER, "tester@example.org"
+    json.dump(s, open(settings, "w"))
+
+
+def no_password_anywhere(home):
+    """Every file of the profile, read for the music server's password: none may hold it."""
+    found = []
+    for root, _, files in os.walk(os.path.join(A.HOMES, home)):
+        for name in files:
+            path = os.path.join(root, name)
+            try:
+                if os.path.getsize(path) < 64 << 20 and any(p.encode() in open(path, "rb").read() for p in ACCOUNTS.values()):
+                    found.append(os.path.relpath(path, A.HOMES))
+            except OSError:
+                pass
+    return found
 
 
 ACCOUNT_STEM = {"tester": "https___music_example_org_4681_tester", "guest": "https___music_example_org_4681_guest"}
@@ -630,6 +695,8 @@ class Run:
         home = f"run-{self.label}"
         shutil.rmtree(os.path.join(A.HOMES, home), ignore_errors=True)
         shutil.copytree(KEPT, os.path.join(A.HOMES, home))
+        if self.new:
+            to_signed_in(home)
         inside = f"/work/target/walk/{home}"
         env = {}
         if self.on:
@@ -977,9 +1044,10 @@ class Run:
             test = "an_account_change_is_not_held_up"
             settings_tab(a, "Account", "Sign out")
             a.press("Sign out")
-            until(lambda: a.find(label="Connect"), 20, 0.05, "the sign-in form")
-            # Another account, at another origin of the same music server (nothing under
-            # /nexus/ there).
+            until(lambda: sign_in_form(a), 20, 0.05, "the sign-in form")
+            # Another account, at another origin of the same music server (for the released
+            # app, nothing under /nexus/ there; for W7, a backend of its own there, always
+            # answering, which hands the guest a music login at that origin).
             pressed = sign_in(a, "guest", front.SERVER2)
             until(lambda: home_drawn(a), 60, 0.02, "the new account's first page")
             self.time(test, "connect_to_home_drawn", time.time() - pressed)
@@ -1000,7 +1068,7 @@ class Run:
             except TimeoutError:
                 pass
         shown = [l for l in labels(a) if l.startswith("Found at") or l == "None found"]
-        heading = "Nexus server" in labels(a)
+        heading = ("Looked for" if self.new else "Nexus server") in labels(a)
         if not self.on:
             want = []
         elif self.faulted:
@@ -1008,6 +1076,9 @@ class Run:
             want = []
         elif who == "tester" and self.mode == "found":
             want = [f"Found at {front.SERVER}/nexus/"]
+        elif who == "guest" and self.new:
+            # (W7: the guest signed in through the second origin's own backend.)
+            want = [f"Found at {front.SERVER2}/nexus/"]
         else:
             want = ["None found"]
         if self.stuck and self.mode in FRESH_FOR and who == "tester" and shown == ["None found"]:
@@ -1027,7 +1098,9 @@ class Run:
         asked = self.front.asked()
         with open(os.path.join(self.out, "nexus-requests.txt"), "w") as f:
             f.writelines(seen)
-        count = len(seen)
+        # The component's looks (GETs of hello): the W1 rules count these. W7's account calls
+        # (POSTs) are checked one by one below.
+        count = len([line for line in seen if '"GET /nexus/api/hello' in line])
         test = "backend"
         if self.hook == "sabotage":
             pass
@@ -1041,12 +1114,17 @@ class Run:
             # One look started at the first tick of each start, held through it.
             self.expect(test, "requests_under_nexus (one held look a start)", 2 <= count <= 4, count)
         else:
-            # One at each start (5 s after the account is published) and one for the guest.
-            self.expect(test, "requests_under_nexus (one per account published)", count == 3, count)
+            # One at each start (5 s after the account is published) and one for the guest
+            # (W7: the guest's at the second origin's own backend, not here).
+            want = 2 if self.new else 3
+            self.expect(test, "requests_under_nexus (one per account published)", count == want, count)
+        account_calls = ("signin", "signout", "devices", "force-out", "change-password", "music-login")
         for line in seen:
             ok = '"GET /nexus/api/hello HTTP/1.1"' in line and "NexusMusic/" in line
+            # W7: the shared client's own asks, each a POST to one of the account calls.
+            ok = ok or (self.new and "NexusMusic/" in line and any(f'"POST /nexus/api/{call} HTTP/1.1"' in line for call in account_calls))
             if not ok:
-                self.fail(test, f"a request that is not a plain GET of hello: {line.strip()}")
+                self.fail(test, f"a request that is neither a plain GET of hello nor an account call: {line.strip()}")
         self.fact(test, "requests_at_the_stand_in", len(asked))
 
     def gapless_sources(self):

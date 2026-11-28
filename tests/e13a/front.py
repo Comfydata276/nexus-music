@@ -24,6 +24,13 @@ HOST, TLS_PORT = "music.example.org", 4681
 HOST2, TLS_PORT2 = "music2.example.org", 4686
 NAVIDROME = 4680
 STANDIN, BLACKHOLE, REFUSED = 4682, 4683, 4684
+# The second origin's own backend (slice W7): always answering, so that signing in as
+# another person works whatever the first origin's backend is doing.
+STANDIN2 = 4687
+BACKEND_A, BACKEND_B = "5c0ffee05c0ffee05c0ffee05c0ffee0", "b0ffee11b0ffee11b0ffee11b0ffee11"
+# A session the profile was signed in with before the run (`suite.to_signed_in`): the
+# first origin's backend knows it from the start.
+SEED_SESSION = "5e" * 32
 SERVER = f"https://{HOST}:{TLS_PORT}"
 SERVER2 = f"https://{HOST2}:{TLS_PORT2}"
 NGINX = "nexus-w1-front"
@@ -127,6 +134,11 @@ http {{
             proxy_buffering off;
             proxy_read_timeout 3600s;
         }}
+        location /nexus/ {{
+            proxy_pass http://127.0.0.1:{STANDIN2};
+            proxy_http_version 1.1;
+            proxy_buffering off;{RULE.replace("nexus-access.log", "nexus2-access.log")}
+        }}
     }}
 }}
 """
@@ -158,19 +170,42 @@ class Front:
         os.makedirs(out, exist_ok=True)
         self.mode_file = os.path.join(out, "standin.mode")
         self.log = os.path.join(out, "standin.jsonl")
+        self.mode_file2 = os.path.join(out, "standin2.mode")
+        self.log2 = os.path.join(out, "standin2.jsonl")
         self.procs, self.hole = [], None
 
     def set(self, mode):
         """Changes what standin.py answers, under a running app."""
         open(self.mode_file, "w").write(mode)
 
+    def hold(self, **state):
+        """Changes what the first origin's backend holds, under a running app (standin.py's
+        state file): `ended`, `count`, `bad_token`. The seeded session is always kept."""
+        import json
+        now = {}
+        try:
+            now = json.load(open(self.mode_file + ".state"))
+        except (OSError, ValueError):
+            pass
+        now.update(state)
+        now.setdefault("sessions", {SEED_SESSION: {"email": "tester@example.org", "device": 1}})
+        json.dump(now, open(self.mode_file + ".state", "w"))
+
     def __enter__(self):
         certs()
         sh(f"docker rm -f {NGINX}")
         sh(f"pkill -f 'standin[.]py {STANDIN}'")
         self.set(self.mode if self.mode in ("found", "stalled", "saturated", "ended", "half", "bodystall", "gzip302") else "found")
+        sh(f"pkill -f 'standin[.]py {STANDIN2}'")
+        for name in (self.mode_file + ".state", self.mode_file2 + ".state"):
+            if os.path.exists(name):
+                os.remove(name)
+        self.hold()
+        open(self.mode_file2, "w").write("found")
         self.procs.append(subprocess.Popen([sys.executable, "-I", os.path.join(HERE, "standin.py"), str(STANDIN), self.mode_file, self.log],
-                                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+                                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env={**os.environ, "STANDIN_ID": BACKEND_A, "STANDIN_MUSIC": SERVER}))
+        self.procs.append(subprocess.Popen([sys.executable, "-I", os.path.join(HERE, "standin.py"), str(STANDIN2), self.mode_file2, self.log2],
+                                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env={**os.environ, "STANDIN_ID": BACKEND_B, "STANDIN_MUSIC": SERVER2}))
         if self.mode == "blackhole":
             self.hole = blackhole()
         open(os.path.join(STATE, "nginx.conf"), "w").write(conf(self.mode))
@@ -205,12 +240,13 @@ class Front:
             time.sleep(0.1)
         raise RuntimeError("the proxy didn't take the change")
 
-    def asked(self):
-        """What reached the stand-in, as it logged it."""
+    def asked(self, second=False):
+        """What reached the stand-in (or the second origin's), as it logged it."""
         import json
-        if not os.path.exists(self.log):
+        log = self.log2 if second else self.log
+        if not os.path.exists(log):
             return []
-        return [json.loads(line) for line in open(self.log) if line.strip()]
+        return [json.loads(line) for line in open(log) if line.strip()]
 
     def nexus_in_access_log(self):
         """Every request the proxy saw under /nexus/, whatever it sent them to."""

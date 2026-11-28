@@ -212,7 +212,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.answer(200, done(email, {"signed_in": {"session": session, "person": person, "device": device["id"],
                                                                "music": music_login(email, good), "notice": "This test server records what is played."}}))
         auth = self.headers.get("Authorization", "")
-        session = SESSIONS.get(auth[7:]) if auth.startswith("Bearer ") else None
+        held = auth[7:] if auth.startswith("Bearer ") else ""
+        session = SESSIONS.get(held)
+        if session is None and held in state().get("sessions", {}):
+            # A session the profile was signed in with before the run (the suite seeds it).
+            seeded = state()["sessions"][held]
+            session = SESSIONS[held] = {"email": seeded["email"], "device": seeded["device"], "setup": False}
+            DEVICES.setdefault("seeded-" + held, {"id": seeded["device"], "email": seeded["email"], "name": "Seeded PC", "kind": "pc",
+                                                   "version": "0.40.13", "seen": int(time.time() * 1000), "session": held})
         self.note("found", call=call, email=(session or {}).get("email"))
         if not session or state().get("ended"):
             return self.answer(200, refused("not_signed_in"))
