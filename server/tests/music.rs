@@ -460,9 +460,6 @@ fn an_admin_sets_a_music_login_and_the_person_plays_and_no_failure_touches_it() 
     let person = sign_in(&backend, with_code(&person_code, PERSONS_PASSWORD), 2);
     assert_eq!(person.music, MusicLoginResult::NoneSetYet);
 
-    // No address people use yet: a login cannot be set (nothing to check it at).
-    let (status, reply) = admin.set_music_login(person.person.id, MUSIC_USER, MUSIC_PASSWORD);
-    assert_eq!((status, refused(reply)), (403, admin::Refusal::NotAllowed(Denial::Conflict)));
     assert!(matches!(admin.set_music_server(&between.public()), admin::Reply::Done(_)));
 
     // The login set: the container's address asked, two questions; the address people use
@@ -732,8 +729,10 @@ fn trap(runtime: &tokio::runtime::Runtime) -> (u16, Arc<AtomicUsize>) {
 /// S9-1 (the review of S9; the lead's ruling of 15:38): **the backend never connects to the
 /// address people use**: setting it, setting a login and handing the login out open no
 /// connection to it (a listener there fails the test if it is touched), and the login is
-/// handed out with that address as it was set. A login checked at one `NEXUS_MUSIC_SERVER` is
-/// "cannot be used now" once the backend starts with another, until it is typed again there.
+/// handed out with that address as it was set. A login can be set before that address is, and
+/// is "cannot be used now" until it is; correcting the address changes no login. A login
+/// checked at one `NEXUS_MUSIC_SERVER` is "cannot be used now" once the backend starts with
+/// another, until it is typed again there.
 #[test]
 fn the_address_people_use_is_never_connected_to_and_another_container_address_needs_the_login_again() {
     let folders = Folders::new("never-connected");
@@ -750,14 +749,20 @@ fn the_address_people_use_is_never_connected_to_and_another_container_address_ne
     let signed = sign_in(&backend, with_code(&admin_code, PASSWORD), 1);
     let person = sign_in(&backend, with_code(&person_code, PERSONS_PASSWORD), 2);
     let mut admin = Admin { backend: &backend, signed, next: 0 };
-    assert!(matches!(admin.set_music_server(&public), admin::Reply::Done(_)));
+    // The login set first, with no address people use yet: checked, kept, not handed out.
     let (status, reply) = admin.set_music_login(person.person.id, MUSIC_USER, MUSIC_PASSWORD);
     assert_eq!(status, 200, "{reply:?}");
     assert_eq!(first_taken.load(Ordering::SeqCst), 2, "ping and getUser at the container's address");
-    let mut phone = sign_in(&backend, with_password(PERSON, PERSONS_PASSWORD), 3);
-    let handed = login(std::mem::replace(&mut phone.music, MusicLoginResult::NoneSetYet));
-    assert_eq!((handed.address.as_str(), handed.count), (public.as_str(), 1));
-    assert_eq!(login(music_login(&backend, &phone)).count, 1);
+    let phone = sign_in(&backend, with_password(PERSON, PERSONS_PASSWORD), 3);
+    assert_eq!(phone.music, MusicLoginResult::UnusableNow, "handed out with no address people use");
+    // A wrong address people use, then corrected: the same login, handed with each.
+    let wrong = format!("https://localhost:{trap_port}");
+    assert!(matches!(admin.set_music_server(&wrong), admin::Reply::Done(_)));
+    assert_eq!(login(music_login(&backend, &phone)).address.as_str(), wrong.as_str());
+    assert!(matches!(admin.set_music_server(&public), admin::Reply::Done(_)));
+    let handed = login(music_login(&backend, &phone));
+    assert_eq!((handed.address.as_str(), handed.count), (public.as_str(), 1), "correcting the address people use changed the login");
+    assert_eq!(first_taken.load(Ordering::SeqCst), 2, "the music server was asked again");
     std::thread::sleep(Duration::from_millis(200));
     assert_eq!(trapped.load(Ordering::SeqCst), 0, "the backend connected to the address people use");
     drop(admin);

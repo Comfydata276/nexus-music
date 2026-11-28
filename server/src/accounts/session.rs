@@ -40,9 +40,6 @@ pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
 /// The common passwords a new one may not be (8.2), one to a line.
 pub const COMMON_PASSWORDS: &str = include_str!("common-passwords.txt");
 
-/// What the backend says, in every sign-in's answer, it records (13.6).
-/// CARRIED (the sentence is `nexus::words`', which does not exist yet).
-pub const RECORDED: &str = "Your Nexus server keeps your devices, their names and when each was last used. It keeps no password, only a fingerprint of it.";
 
 /// Everything signing in needs, shared by every request.
 pub struct Accounts {
@@ -328,13 +325,13 @@ impl Accounts {
             .desk
             .ask(move |keeper| -> Result<Option<(u64, Email, DeviceId, PasswordCheck, Fingerprint)>, Refusal> {
                 let now = clock();
-                let effective = keeper.clock(now).effective();
                 // A1 (the review of S8): the time a code was judged at is kept as the backend's
                 // latest, whatever the judgement, so a clock set back afterwards cannot make an
-                // expired code good again. (At most ten a second: the code's door.)
-                // CARRIED until the keeper keeps the clock's observations in memory (core's
-                // `Clock::observe`, with the store's port to it): until then each is written.
-                keeper.persist(&Effects { high_water: effective, updates: Vec::new() }, &[], now).map_err(not_dealt_with)?;
+                // expired code good again: core's observation, carried into the keeper's mark at
+                // its own cadence (C3r's 377f112), and the deadline judged by `effective`.
+                let clock = keeper.clock(now);
+                let effective = clock.effective();
+                keeper.persist(&clock.observation_effects(), &[], now).map_err(not_dealt_with)?;
                 let print = CodeKey::of(keeper).print(&code);
                 let Some((number, code_number, until)) = rows::code(keeper.data().connection(), &print).map_err(not_dealt_with)? else { return Ok(None) };
                 if effective >= until {
@@ -592,14 +589,13 @@ impl Accounts {
 
     async fn changing_password(&self, bearer: account::Session, request: ChangePassword) -> Result<Answer, Refusal> {
         let ChangePassword { head, request_id, current_password, new_password } = request;
-        // CARRIED (asked of core: `ChangePassword`'s own check): a "change" to the password
+        // B2 (the review of S8; core's `check_replacement`, ea3c641): a "change" to the password
         // already set is refused as a malformed request, before anything is looked at, so that
         // a retry of it can never prove a still-current password again and end sessions made
-        // since (the review of S8, B2; the lead's ruling). The comparison takes the same time
-        // whatever the two are (`Password`'s equality).
-        if current_password == new_password {
-            return Err(Refusal::Malformed);
-        }
+        // since. Asked here of the two typed (`Password`'s equality, the same time whatever the
+        // two are): the present one is proved against the stored verifier below, so a new one
+        // equal to it is the one the verifier holds.
+        ChangePassword::check_replacement(current_password == new_password)?;
         let hash = Fingerprint::of(bearer.expose_bytes());
         self.live(&head, &hash)?;
         let clock = self.clock.clone();
@@ -781,7 +777,8 @@ fn finish_sign_in(
         // 9.4: a salt made now and its token, or why not; never to the admin's page (core's
         // `hand_out` by the session's kind; 7.3).
         music: super::music::hand(keeper, number, &state, granted.kind, internal),
-        notice: Notice::new(RECORDED).ok_or(Refusal::NotDealtWith)?,
+        // 13.6: what this backend records, in core's words.
+        notice: Notice::recording(),
     };
     let receipt = receipt(keeper, &state)?;
     Ok(answer!(Reply::Done { result: answer, receipt }))

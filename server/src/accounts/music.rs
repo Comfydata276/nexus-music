@@ -16,7 +16,9 @@
 //!   A refusal is told apart from "could not reach it", and neither touches the login the
 //!   account had.
 //! - **A change of `NEXUS_MUSIC_SERVER`** between starts makes every login "cannot be used
-//!   now" until it is checked again (typed again) at the new address ([`hand`]).
+//!   now" until it is checked again (typed again) at the new address ([`hand`]; core's seal is
+//!   bound to it). A change of the address people use changes no login: devices are handed the
+//!   new one.
 //! - **Handed out** ([`hand`]): to a device, at sign-in and when it asks, a salt made now and
 //!   its token, or why not ("none set yet", "cannot be used now"). Never to the admin's page.
 //! - **Forcing a device out does not change this login** (9.5): nothing here is called by it.
@@ -27,7 +29,7 @@
 use nexus_core::nexus::account::{self, AccountId, MusicLoginResult, MusicSalt, PasswordDoor, RequestHead, SALT_BYTES};
 use nexus_core::nexus::admin::{self, Applied, Denial, GetMusicServer, InternalAddress, MusicServer, NamedChange, Refusal, Reply, RequestGrant, SetMusicLogin, SetMusicServer};
 use nexus_core::nexus::kept::{AccountState, AdminAction, AdminTarget, Bearer, Denied, Fingerprint, GrantUse, PasswordCheck, SessionKind};
-use nexus_core::nexus::music::{self, Checked, CurrentEndpoints, NONCE_BYTES, Outcome, Ping, Provisioning, SealingKey};
+use nexus_core::nexus::music::{self, NONCE_BYTES, Outcome, Ping, Provisioning, SealingKey};
 use zeroize::Zeroizing;
 
 use super::check::Checked as Password;
@@ -35,7 +37,6 @@ use super::rows;
 use super::session::{Accounts, Answer, speaks_with};
 use super::setup::random;
 use crate::music::MusicClient;
-use crate::store::data::Change;
 use crate::store::keeper::Keeper;
 
 /// How many logins may be being checked at the music server at once. Each holds a listener
@@ -167,23 +168,17 @@ fn target(keeper: &mut Keeper, caller: u64, id: AccountId) -> Result<Option<nexu
 }
 
 /// 9.4: the music login for a device of the account `state` is, or why there is none: a salt
-/// made now and its token, by `music::hand_out`, under the store's count. Called on the thread
+/// made now and its token, by `music::hand_out`, under the store's count, with the address
+/// people use (none set: "cannot be used now" for a login there is). A login checked at another
+/// `NEXUS_MUSIC_SERVER` than `internal` is not handed out (core's binding). Called on the thread
 /// that writes, with the account loaded from the store.
 pub fn hand(keeper: &Keeper, number: u64, state: &AccountState, kind: SessionKind, internal: &str) -> MusicLoginResult {
     let connection = keeper.data().connection();
     let Ok(public) = rows::music_public(connection) else { return MusicLoginResult::UnusableNow };
-    let Some(public) = public else {
-        // No address people use: there can be no login that was checked at it.
-        return if kind == SessionKind::AdminPage || state.music_login == 0 { MusicLoginResult::NoneSetYet } else { MusicLoginResult::UnusableNow };
-    };
-    let Ok(kept) = rows::music_login(connection, keeper.backend(), number) else { return MusicLoginResult::UnusableNow };
-    // CARRIED (asked of core: the internal address in the binding, or given to `hand_out`): a
-    // login checked at another `NEXUS_MUSIC_SERVER` than this start's is not handed out (9.3,
-    // "a change to either address has every login checked again before it is handed out").
-    let install = kept.filter(|(_, checked_at)| checked_at == internal).map(|(install, _)| install);
+    let Ok(install) = rows::music_login(connection, keeper.backend(), number) else { return MusicLoginResult::UnusableNow };
     let Some(salt) = random::<SALT_BYTES>() else { return MusicLoginResult::UnusableNow };
     let key = SealingKey::new(keeper.seal_key());
-    music::hand_out(state, kind, install.as_ref(), &key, &public, MusicSalt::from_random(*salt))
+    music::hand_out(state, kind, install.as_ref(), &key, internal, public.as_ref(), MusicSalt::from_random(*salt))
 }
 
 /// What the admin's page is told of an account's music login (S10b's `admin::Account.music`,
@@ -306,11 +301,9 @@ impl Accounts {
         let again = RequestHead { speaks: head.speaks, restore: head.restore };
         let clock = self.clock.clone();
         let target_id = change.account;
-        // (1) On the thread that writes: the grant spent (kept's `authorize_music`), the address
-        // people use as it is now, and the sealing key. CARRIED (core's seal still names the
-        // address people use, `t3/nexus-core-fu2` changes it): without one set, no login can be
-        // sealed, and it is refused before the grant is spent. It is never connected to.
-        let (authorized, public, key) = {
+        // (1) On the thread that writes: the caller a live admin, the grant spent (kept's
+        // `authorize_music`), and the sealing key.
+        let (authorized, key) = {
             let hash = hash.clone();
             let grant = account::GrantSecret::from_bytes(*grant.expose_bytes());
             self.desk
@@ -318,7 +311,6 @@ impl Accounts {
                     let now = clock();
                     let (number, device, mut account) = caller(keeper, &head, &hash)?;
                     live_admin(keeper, &mut account, head.restore, device, &hash, now)?;
-                    let public = rows::music_public(keeper.data().connection()).map_err(not_dealt_with)?.ok_or(Refusal::NotAllowed(Denial::Conflict))?;
                     let other = target(keeper, number, target_id)?;
                     let bearer = Bearer { device, hash: &hash, grant: Some(GrantUse { request_id, secret: &grant }) };
                     let authorized = account
@@ -326,7 +318,7 @@ impl Accounts {
                         .apply(|effects| keeper.persist(effects, &[], now))
                         .map_err(not_dealt_with)?
                         .map_err(said)?;
-                    Ok((authorized, public, Zeroizing::new(keeper.seal_key())))
+                    Ok((authorized, Zeroizing::new(keeper.seal_key())))
                 })
                 .await
                 .map_err(|_| busy())??
@@ -337,7 +329,6 @@ impl Accounts {
         let nonce = random::<NONCE_BYTES>().ok_or(Refusal::NotDealtWith)?;
         let typed = Provisioning {
             internal: &self.music.internal,
-            public,
             name: change.name,
             password: Zeroizing::new(change.password.expose().as_bytes().to_vec()),
             salt: MusicSalt::from_random(*salt),
@@ -348,7 +339,7 @@ impl Accounts {
         let ping = Ping::provision(authorized, typed, &sealing).map_err(asked)?;
         // Both questions within CHECK_WITHIN (S9-3); past it, "could not reach it".
         let client = &self.music.client;
-        let (pinged, user, named) = tokio::time::timeout(self.music.within, async move {
+        let verified = tokio::time::timeout(self.music.within, async move {
             let pinged = {
                 let post = ping.post();
                 client.ask(&post).await
@@ -358,28 +349,13 @@ impl Accounts {
                 let post = user.post();
                 client.ask(&post).await
             };
-            Ok::<_, Refusal>((pinged, user, named))
+            user.answer(reply(&named)).map_err(asked)
         })
         .await
         .map_err(|_| asked(Outcome::CouldNotAsk))??;
-        let verified = match user.answer(reply(&named)).map_err(asked)? {
-            Checked::Verified(verified) => verified,
-            // CARRIED until core's change on `t3/nexus-core-fu2` (the check at the address people
-            // use removed, the seal bound to the internal address): core still names the address
-            // people use as a second place to ask. **The backend never connects to it** (the
-            // lead's ruling of 15:38): core's two questions for it are answered with the
-            // container's own answers, already read; nothing is sent anywhere.
-            Checked::Public(again) => {
-                let user = again.answer(reply(&pinged)).map_err(asked)?;
-                match user.answer(reply(&named)).map_err(asked)? {
-                    Checked::Verified(verified) => verified,
-                    Checked::Public(_) => return Err(Refusal::NotDealtWith),
-                }
-            }
-        };
         // (3) On the thread that writes: installed only while the same grant's authority, the
-        // same account at the same revision and count, the same container's address and (CARRIED,
-        // core's seal) the same address people use are current.
+        // same account at the same revision and count, and the same container's address are
+        // current.
         let clock = self.clock.clone();
         let internal = self.music.internal.clone();
         let grant = account::GrantSecret::from_bytes(*grant.expose_bytes());
@@ -389,13 +365,11 @@ impl Accounts {
                     let now = clock();
                     let (number, device, mut account) = caller(keeper, &again, &hash)?;
                     live_admin(keeper, &mut account, again.restore, device, &hash, now)?;
-                    let public = rows::music_public(keeper.data().connection()).map_err(not_dealt_with)?.ok_or(Refusal::NotAllowed(Denial::Conflict))?;
                     let mut other = target(keeper, number, target_id)?;
                     let bearer = Bearer { device, hash: &hash, grant: Some(GrantUse { request_id, secret: &grant }) };
-                    let endpoints = CurrentEndpoints { internal: &internal, public: &public };
                     account
-                        .request(again.restore, keeper.clock(now), |turn| turn.install_music(bearer, verified, endpoints, other.as_mut()))
-                        .apply(|effects| keeper.persist(effects, &[Change::MusicChecked { account: target_id.get(), internal: &internal }], now))
+                        .request(again.restore, keeper.clock(now), |turn| turn.install_music(bearer, verified, &internal, other.as_mut()))
+                        .apply(|effects| keeper.persist(effects, &[], now))
                         .map_err(not_dealt_with)?
                         .map_err(said)?;
                     Ok(answer(Reply::Done(Applied {})))
@@ -406,10 +380,8 @@ impl Accounts {
 
     /// 9.3, 19.2: the admin sets the address people reach the music server at (HTTPS; its form
     /// checked by core's `MusicAddress`), with a grant bound to exactly that address. **Nothing
-    /// connects to it**: it is handed to devices as it is. The backend's own address is the
-    /// container's and is never set here. CARRIED (core's seal names the address people use
-    /// until `t3/nexus-core-fu2`): every login sealed under another address people use is not
-    /// handed out from now on (`hand_out`), and is to be typed again.
+    /// connects to it**: it is handed to devices as it is, and no login changes with it. The
+    /// backend's own address is the container's and is never set here.
     pub async fn set_music_server(&self, bearer: account::Session, request: SetMusicServer) -> Answer {
         let account::GrantedChange { head, request_id, change, grant } = request;
         let hash = Fingerprint::of(bearer.expose_bytes());
