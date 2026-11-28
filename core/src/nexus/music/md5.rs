@@ -1,10 +1,10 @@
 //! RFC 1321 for Subsonic's legacy password-plus-salt wire formula (§9.1).
 //! The core has no MD5 dependency and this implementation has no unsalted entry.
 
-use super::{SALT_DIGITS, Salt};
+use super::{MusicSalt, SALT_LENGTH};
 use zeroize::{Zeroize, Zeroizing};
 
-pub(super) fn with_salt(password: &[u8], salt: &Salt) -> Zeroizing<[u8; 16]> {
+pub(super) fn with_salt(password: &[u8], salt: &MusicSalt) -> Zeroizing<[u8; 16]> {
     let mut state = Zeroizing::new([0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476]);
     let (blocks, rem) = password.as_chunks::<64>();
     for block in blocks {
@@ -24,7 +24,7 @@ pub(super) fn with_salt(password: &[u8], salt: &Salt) -> Zeroizing<[u8; 16]> {
         *out = byte;
     }
     let bits = (password.len() as u64)
-        .wrapping_add(SALT_DIGITS as u64)
+        .wrapping_add(SALT_LENGTH as u64)
         .wrapping_mul(8);
     for (out, byte) in tail
         .iter_mut()
