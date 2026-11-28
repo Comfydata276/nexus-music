@@ -1150,6 +1150,42 @@ fn a_slow_lidarr_read_leaves_sign_in_and_the_writer_available() {
 }
 
 #[test]
+fn switching_off_a_running_batch_blocks_its_next_lidarr_write() {
+    let lidarr = MockLidarr::start();
+    let (server, [admin, member, _]) = TestServer::start("stop-batch", Some(endpoint(lidarr.address)));
+    let page = server.redeem(admin, 1, TEST_PAGE);
+    server.configure(&page);
+    let member = server.redeem(member, 2, "");
+    lidarr.hold_response(Some(("PUT", "/api/v1/album/monitor")));
+    let line = BatchLine { artist: "Quillon Vane".into(), album: "Glass Orchard".into(), song: "First Light".into() };
+    let job = begun(server.call(&member, begin(1, Change::Batch { singles: false, lines: vec![line] })));
+    lidarr.wait_for_call("PUT album/monitor");
+    server.set_switch(&page, &member, false);
+    lidarr.hold_response(None);
+
+    let db = Connection::open(server.root.join("data/nexus.db")).unwrap();
+    let until = Instant::now() + Duration::from_secs(6);
+    loop {
+        let (stage, result): (i64, Option<String>) = db.query_row(
+            "SELECT stage, result FROM requests_jobs WHERE id = ?1", [row_id(job).unwrap()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        if stage == FINISHED {
+            assert!(matches!(decode::<JobResult>(result.unwrap().as_bytes()).unwrap(),
+                JobResult::Failed(Refusal::SwitchedOff)));
+            break;
+        }
+        assert!(Instant::now() < until, "the stopped job did not finish");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let line = saved_line(&db, row_id(job).unwrap(), 0).unwrap();
+    assert!(matches!(line.progress, Some(BatchLineProgress::Failed { reason: Refusal::SwitchedOff, .. })));
+    let calls = lidarr.take_calls();
+    assert_eq!(calls.iter().filter(|&call| call == "PUT album/monitor").count(), 1);
+    assert!(!calls.iter().any(|call| call == "POST command"));
+}
+
+#[test]
 fn a_batch_waiting_for_its_device_releases_the_account_and_expires() {
     let lidarr = MockLidarr::start();
     let offset = Arc::new(AtomicU64::new(0));

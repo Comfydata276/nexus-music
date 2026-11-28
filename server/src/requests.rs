@@ -1506,21 +1506,41 @@ impl Requests {
             artist: job.plan.offers.first().and_then(|offer| offer.artist_id.clone()),
         };
         let ready = Arc::new(AtomicBool::new(job.recovering));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let batch = matches!(&job.change, Change::Batch { .. });
+        let account = job.account;
         let pre_write = {
             let journal = journal.clone();
             let ready = ready.clone();
+            let stopped = stopped.clone();
             Arc::new(move || {
-                if ready.load(Ordering::Relaxed) {
+                if stopped.load(Ordering::Relaxed) {
+                    return false;
+                }
+                let marked = ready.load(Ordering::Relaxed);
+                if marked && !batch {
                     return true;
                 }
-                let was_kept = journal.ask(|keeper, now, row| {
+                let accepted = journal.ask(move |keeper, now, row| {
+                    if batch {
+                        access(keeper, account)?.check()?;
+                    }
+                    if marked {
+                        return Ok(true);
+                    }
                     keeper.write_data(now, |tx| tx.execute(
                         "UPDATE requests_jobs SET stage = ?1 WHERE id = ?2 AND stage = ?3",
                         params![MAY_HAVE_CHANGED, row, STARTED],
                     ).map(|count| (count != 0, count != 0))).map_err(|_| Refusal::NotDealtWith)
-                }).unwrap_or(false);
-                ready.store(was_kept, Ordering::Relaxed);
-                was_kept
+                });
+                if accepted == Err(Refusal::SwitchedOff) {
+                    stopped.store(true, Ordering::Relaxed);
+                }
+                let allowed = accepted.unwrap_or(false);
+                if allowed {
+                    ready.store(true, Ordering::Relaxed);
+                }
+                allowed
             })
         };
         let lidarr = Lidarr::new(endpoint.url.as_str(), credential.key.expose(), None, Arc::new(Line {
@@ -1528,7 +1548,7 @@ impl Requests {
             deadline: None, before_write: Some(pre_write),
         }));
         if let Change::Batch { singles, lines } = &job.change {
-            if let Err(reason) = self.run_batch(&job, &journal, &lidarr, *singles, lines) {
+            if let Err(reason) = self.run_batch(&job, &journal, &lidarr, *singles, lines, &stopped) {
                 let _ = journal.ask(move |keeper, now, row| {
                     finish_job(keeper, now, row, &JobResult::Failed(reason), &[], None)
                 });
@@ -2006,7 +2026,7 @@ fn check_pending_target(lidarr: &Lidarr, album: LidarrNumber, release: &MusicBra
 
 impl Requests {
     fn run_batch(
-        &self, job: &Job, journal: &Journal, lidarr: &Lidarr, singles: bool, lines: &[BatchLine],
+        &self, job: &Job, journal: &Journal, lidarr: &Lidarr, singles: bool, lines: &[BatchLine], stopped: &AtomicBool,
     ) -> Result<(), Refusal> {
         let desk = BatchDesk { journal: journal.clone(), singles };
         let batch = if let Some(payload) = &job.plan.prepared_batch {
@@ -2050,22 +2070,55 @@ impl Requests {
         }
 
         let worked = lidarr_result(batch.work_prepared(lidarr, &|_| {}), None);
+        let switched_off = stopped.load(Ordering::Relaxed);
         let rows = batch.indexed_lines().ok_or(Refusal::NotDealtWith)?;
         let mut asked = Vec::new();
-        for line in rows.into_iter().filter(|line| matches!(line.state, bulk::State::Asked | bulk::State::Done)) {
-            let Some(view) = lidarr_items::<AlbumView, _>(line.offer).pop() else { continue };
-            asked.push(RecordedAsk { asked: asked_release(&view)?, placed: line.placed });
+        let mut stopped_lines = Vec::new();
+        for line in rows {
+            if switched_off && matches!(line.state, bulk::State::Found | bulk::State::Asked | bulk::State::Failed) {
+                stopped_lines.push(line.index as u16);
+                continue;
+            }
+            if matches!(line.state, bulk::State::Asked | bulk::State::Done) {
+                let Some(view) = lidarr_items::<AlbumView, _>(line.offer).pop() else { continue };
+                asked.push(RecordedAsk { asked: asked_release(&view)?, placed: line.placed });
+            }
         }
-        let result = match worked {
-            Ok(()) => JobResult::Done(Completed::Batch),
-            Err(reason) => JobResult::Failed(reason),
+        let result = match (switched_off, worked) {
+            (true, _) => JobResult::Failed(Refusal::SwitchedOff),
+            (false, Ok(())) => JobResult::Done(Completed::Batch),
+            (false, Err(reason)) => JobResult::Failed(reason),
         };
         let account = job.account;
         let binding = job.plan.binding;
         journal.ask(move |keeper, now, row| {
+            stop_batch_lines(keeper, now, row, &stopped_lines)?;
             finish_job(keeper, now, row, &result, &asked, Some((binding, account, None)))
         })
     }
+}
+
+fn stop_batch_lines(keeper: &mut Keeper, now: u64, row: i64, indices: &[u16]) -> Result<(), Refusal> {
+    if indices.is_empty() {
+        return Ok(());
+    }
+    let mut updates = Vec::new();
+    for &index in indices {
+        let mut line = saved_line(keeper.data().connection(), row, index)?;
+        if !matches!(line.progress, Some(BatchLineProgress::NotFound | BatchLineProgress::Failed { .. })) {
+            line.progress = Some(BatchLineProgress::Failed {
+                reason: Refusal::SwitchedOff,
+                album: line.offer.as_ref().map(batch_album),
+            });
+            updates.push((index, serde_json::to_string(&line).map_err(|_| Refusal::NotDealtWith)?));
+        }
+    }
+    keeper.write_data(now, |tx| {
+        for (index, text) in &updates {
+            keep_line(tx, row, *index, text)?;
+        }
+        Ok(((), !updates.is_empty()))
+    }).map_err(|_| Refusal::NotDealtWith)
 }
 
 fn confirmed_placement(
