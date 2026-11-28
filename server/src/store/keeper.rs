@@ -433,7 +433,9 @@ impl Keeper {
     }
 
     fn write_store(&mut self, next: Store) -> Result<(), Failed> {
-        match apart::write(&self.state, &next) {
+        // Room above the growth limit is kept for revocations, which add no record.
+        let limit = if next.records() > self.store.records() { apart::GROWTH_MAX_BYTES } else { apart::FILE_MAX_BYTES };
+        match apart::write_within(&self.state, &next, limit) {
             Ok(()) => {
                 self.store = next;
                 Ok(())

@@ -32,7 +32,12 @@ use crate::store::crash;
 pub const FILE: &str = "kept";
 const STAGING: &str = "kept.new-";
 const HEAD: &str = "nexus-music-server store kept apart 3";
-const FILE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+/// The most a store may be: what [`read`] reads, and so what [`write`] ever publishes.
+pub const FILE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+/// The most a store may be after a write that adds an account or a device. The room above it
+/// is kept for what takes leave away (an ending, a switch off, a deletion's tombstone), which
+/// adds no record, so that nothing a capacity rule refuses is ever a revocation.
+pub const GROWTH_MAX_BYTES: u64 = FILE_MAX_BYTES - 1024 * 1024;
 
 /// One account: the fingerprint of its email, and C3r's record. The record's `name` is not
 /// kept: it is filled from the data when the two are used together ([`Store::apart`]).
@@ -109,6 +114,11 @@ impl Store {
             accounts: BTreeMap::new(),
             pending: None,
         }
+    }
+
+    /// How many records it holds: its accounts (tombstones included) and their devices.
+    pub fn records(&self) -> usize {
+        self.accounts.values().map(|account| 1 + account.apart.devices.len()).sum()
     }
 
     pub fn stamp_key(&self) -> StampKey {
@@ -329,9 +339,19 @@ pub fn read(state: &Path) -> Reading {
 
 /// Writes `store` into `state`, lasting on the disk before this returns. The points it
 /// passes, in order: `store: staged` (its own file written and lasting), `store: renamed`
-/// (in place), `store: lasting` (the folder too).
+/// (in place), `store: lasting` (the folder too). A store larger than [`read`] reads is
+/// refused before anything is written, and the last one stays (the review's finding 10).
 pub fn write(state: &Path, store: &Store) -> io::Result<()> {
+    write_within(state, store, FILE_MAX_BYTES)
+}
+
+/// [`write`], refused if the store would be larger than `limit` (at most [`FILE_MAX_BYTES`]).
+pub fn write_within(state: &Path, store: &Store, limit: u64) -> io::Result<()> {
     crash::point("store: before")?;
+    let text = store.to_text();
+    if text.len() as u64 > limit.min(FILE_MAX_BYTES) {
+        return Err(io::Error::new(io::ErrorKind::StorageFull, "the store kept apart would be larger than it may be"));
+    }
     let staging = state.join(format!("{STAGING}{}", std::process::id()));
     let mut options = fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
@@ -339,7 +359,7 @@ pub fn write(state: &Path, store: &Store) -> io::Result<()> {
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
     let written = (|| {
         let mut file = options.open(&staging)?;
-        file.write_all(store.to_text().as_bytes())?;
+        file.write_all(text.as_bytes())?;
         file.sync_all()?;
         drop(file);
         crash::point("store: staged")?;
@@ -605,6 +625,42 @@ mod tests {
             fs::write(place(&state), store.to_text()).unwrap();
             assert!(matches!(read(&state), Reading::Unreadable(_)), "{name}");
         }
+        fs::remove_dir_all(&state).unwrap();
+    }
+
+    #[test]
+    fn a_store_larger_than_its_reader_reads_is_never_written_and_room_is_kept_for_revocations() {
+        let state = folder("bound");
+        write(&state, &full()).unwrap();
+        let mut big = full();
+        let template = big.accounts[&2].clone();
+        let mut number = 10;
+        while (big.to_text().len() as u64) < GROWTH_MAX_BYTES + 1024 {
+            for _ in 0..10_000 {
+                big.accounts.insert(number, template.clone());
+                number += 1;
+            }
+        }
+        big.next_account = number;
+        // Past the room left for growth: an account more is refused, the store as it was kept.
+        let before = fs::read(place(&state)).unwrap();
+        assert_eq!(write_within(&state, &big, GROWTH_MAX_BYTES).unwrap_err().kind(), io::ErrorKind::StorageFull);
+        assert_eq!(fs::read(place(&state)).unwrap(), before);
+        // What takes leave away, at the same size, is still written and read back.
+        write(&state, &big).unwrap();
+        assert!(matches!(read(&state), Reading::Found(_)));
+        // Past what can be read: never published.
+        while (big.to_text().len() as u64) <= FILE_MAX_BYTES {
+            for _ in 0..10_000 {
+                big.accounts.insert(number, template.clone());
+                number += 1;
+            }
+        }
+        big.next_account = number;
+        let before = fs::read(place(&state)).unwrap();
+        assert!(write(&state, &big).is_err());
+        assert_eq!(fs::read(place(&state)).unwrap(), before);
+        assert!(matches!(read(&state), Reading::Found(_)));
         fs::remove_dir_all(&state).unwrap();
     }
 
