@@ -353,7 +353,7 @@ fn lock<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
 struct Rooms {
     ingress: HashSet<u64>,
     upstream: HashSet<u64>,
-    jobs: HashMap<i64, u64>,
+    jobs: HashMap<i64, ClaimedJob>,
     working_jobs: HashSet<i64>,
     recovery_jobs: HashMap<([u8; 32], i64), i64>,
     available: Arc<Notify>,
@@ -366,15 +366,34 @@ struct JobReservation {
     row: i64,
 }
 
+struct ClaimedJob {
+    account: u64,
+    batch: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ClaimBlocked {
+    Waiting,
+    BatchesFull,
+}
+
 impl JobReservation {
-    fn take(rooms: Arc<Mutex<Rooms>>, row: i64, account: u64) -> Option<Self> {
+    fn take(rooms: Arc<Mutex<Rooms>>, row: i64, account: u64, batch: bool) -> Result<Self, ClaimBlocked> {
         let mut held = lock(&rooms);
-        if held.jobs.len() == wire::RUNNING_MAX || held.jobs.values().any(|known| *known == account) {
-            return None;
+        if held.jobs.values().any(|job| job.account == account) {
+            return Err(ClaimBlocked::Waiting);
         }
-        held.jobs.insert(row, account);
+        // Batches keep their reservation even when a group gives back its
+        // mutation turn. Leave a worker for a single change during those gaps.
+        if batch && held.jobs.values().filter(|job| job.batch).count() >= wire::RUNNING_MAX - 1 {
+            return Err(ClaimBlocked::BatchesFull);
+        }
+        if held.jobs.len() >= wire::RUNNING_MAX {
+            return Err(ClaimBlocked::Waiting);
+        }
+        held.jobs.insert(row, ClaimedJob { account, batch });
         drop(held);
-        Some(Self { rooms, row })
+        Ok(Self { rooms, row })
     }
 }
 
@@ -1487,9 +1506,7 @@ impl Requests {
         let Some(endpoint) = &self.endpoint else { return Ok(None) };
         close_parked_lines(keeper, now)?;
         let db = keeper.data().connection();
-        let (
-            row, account, session, change, plan, stage, reservation,
-        ) = {
+        let selected = {
             let mut query = db.prepare(
                 "SELECT id, account, session, change, work, stage FROM requests_jobs
                  WHERE restore = ?1 AND stage < ?2 AND (stage <> ?3 OR NOT EXISTS (
@@ -1505,14 +1522,26 @@ impl Requests {
                 let Some(row) = rows.next().map_err(sql_error)? else { return Ok(None) };
                 let account = unsigned(row.get::<_, i64>(1).map_err(sql_error)?)?;
                 let id = row.get::<_, i64>(0).map_err(sql_error)?;
-                let Some(reservation) = JobReservation::take(self.rooms.clone(), id, account) else { continue };
-                break (id, account, row.get::<_, i64>(2).map_err(sql_error)?,
-                    row.get::<_, Vec<u8>>(3).map_err(sql_error)?, row.get::<_, Vec<u8>>(4).map_err(sql_error)?,
-                    row.get::<_, i64>(5).map_err(sql_error)?, reservation);
+                let change: Change = decode(&row.get::<_, Vec<u8>>(3).map_err(sql_error)?)?;
+                let stage: i64 = row.get(5).map_err(sql_error)?;
+                let reservation = match JobReservation::take(self.rooms.clone(), id, account, matches!(&change, Change::Batch { .. })) {
+                    Ok(reservation) => reservation,
+                    Err(ClaimBlocked::BatchesFull) if stage == QUEUED => break Err(id),
+                    Err(_) => continue,
+                };
+                break Ok((id, account, row.get::<_, i64>(2).map_err(sql_error)?, change,
+                    row.get::<_, Vec<u8>>(4).map_err(sql_error)?, stage, reservation));
+            }
+        };
+        let (row, account, session, change, plan, stage, reservation) = match selected {
+            Ok(job) => job,
+            Err(row) => {
+                finish_job(keeper, now, row, &JobResult::Failed(Refusal::Busy), &[], None)?;
+                self.wake.notify_one();
+                return Ok(None);
             }
         };
         let plan: Plan = decode(&plan)?;
-        let change: Change = decode(&change)?;
         let restore = keeper.restore();
         if !rows::account_exists(keeper.data().connection(), account).map_err(sql_error)? {
             finish_job(keeper, now, row, &JobResult::Failed(Refusal::NotSignedIn), &[], None)?;
