@@ -29,7 +29,7 @@ use nexus_core::nexus::proto::BackendId;
 
 use crate::identity;
 use crate::store::apart::{self, Account, LidarrKept, Reading, Store};
-use nexus_core::nexus::admin::{InternalAddress, LidarrBinding, SealedLidarrKey};
+use nexus_core::nexus::admin::{InternalAddress, LidarrBinding, LidarrKeyCheck, SealedLidarrKey};
 use crate::store::copies;
 use crate::store::crash;
 use crate::store::data::{self, Change, Data, Opened, why};
@@ -798,7 +798,7 @@ impl Keeper {
         // the binding itself, core-fu2).
         // A switch for requests, or the Lidarr key, only as the successor of what the store
         // has now (S13): each is written in the FIRST store write, store first, and nowhere
-        // else.
+        // else. The data carries only non-authoritative evidence of a check.
         for (update, &number) in effects.updates.iter().zip(&numbers) {
             match &update.change {
                 DataChange::InstallMusicLogin(install) => {
@@ -847,7 +847,7 @@ impl Keeper {
                 DataChange::SetRequestsEnabled { enabled, revision } => {
                     next.requests.insert(number, RequestsSwitch { enabled: *enabled, revision: *revision });
                 }
-                DataChange::InstallLidarrKey { binding, sealed } => {
+                DataChange::InstallLidarrKey { binding, sealed, .. } => {
                     next.lidarr = LidarrKept { revision: binding.revision, address: Some(binding.address.as_str().to_string()), sealed: Some(sealed.as_bytes().to_vec()) };
                 }
                 _ => {}
@@ -896,8 +896,12 @@ impl Keeper {
                     (AdminAction::SetRequests { .. } | AdminAction::SetLidarr { .. }, _) => {}
                     (AdminAction::SetMusicAddress(_) | AdminAction::SetDiagnosticsDefault(_), AdminTarget::Account { .. } | AdminTarget::NewAccount(_)) => {}
                 },
-                // Written in the store kept apart alone, in its first write (above).
-                DataChange::SetRequestsEnabled { .. } | DataChange::InstallLidarrKey { .. } => {}
+                // The switch and sealed key remain in the store kept apart.
+                DataChange::SetRequestsEnabled { .. } => {}
+                DataChange::InstallLidarrKey { sealed, check, .. } => {
+                    let stamp = (*check == LidarrKeyCheck::Works).then(|| sealed.check_stamp());
+                    changes.push(Change::LidarrChecked { stamp });
+                }
             }
             changes.push(Change::Codes { account: number, keep: live(update.data.account.code) });
         }

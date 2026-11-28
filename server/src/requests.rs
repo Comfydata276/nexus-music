@@ -33,6 +33,7 @@ use nexus_core::nexus::account::{
     self, AccountId, DeviceId, NotSignedIn, Receipt, RequestHead, SessionId,
 };
 use nexus_core::nexus::admin;
+use nexus_core::nexus::events::clean_display_text;
 use nexus_core::nexus::kept::{
     Access, Account, Bearer, Denied, Fingerprint, GrantUse, SessionKind, Status,
 };
@@ -525,8 +526,8 @@ impl Read {
             }
             Self::KnownArtist(artist) => {
                 let artist = lidarr.known_artist(artist.as_str())?.and_then(|(number, name)| {
-                    (name.len() <= wire::NAME_MAX_BYTES && !name.chars().any(char::is_control))
-                        .then_some((LidarrNumber::new(number)?, name))
+                    let name = clean_display_text(&name);
+                    (name.len() <= wire::NAME_MAX_BYTES).then_some((LidarrNumber::new(number)?, name))
                 });
                 Answer::KnownArtist { artist }
             }
@@ -1203,7 +1204,7 @@ fn asked_history(db: &Connection, binding: &[u8; 32], account: AccountId) -> Res
     ).map_err(sql_error)?;
     let rows = query.query_map(params![binding.as_slice(), sql(account.get())?, wire::LIST_MAX_ITEMS as i64],
         |row| row.get::<_, Vec<u8>>(0)).map_err(sql_error)?;
-    rows.map(|row| decode(&row.map_err(sql_error)?)).collect()
+    rows.map(|row| decode(&row.map_err(sql_error)?).map(clean_asked)).collect()
 }
 
 fn attributed_requests(db: &Connection, binding: &[u8; 32]) -> Result<Vec<AttributionRow>, Refusal> {
@@ -1221,7 +1222,7 @@ fn attributed_requests(db: &Connection, binding: &[u8; 32]) -> Result<Vec<Attrib
         let (id, name, payload) = row.map_err(sql_error)?;
         let account = AccountId::new(unsigned(id)?).ok_or(Refusal::NotDealtWith)?;
         let name = account::Name::new(&name).ok_or(Refusal::NotDealtWith)?;
-        found.push(AttributionRow { account, name, asked: decode(&payload)?, arrived: None });
+        found.push(AttributionRow { account, name, asked: clean_asked(decode(&payload)?), arrived: None });
     }
     Ok(lidarr_items(found))
 }
@@ -1307,6 +1308,7 @@ fn binding(endpoint: &Endpoint) -> [u8; 32] {
 struct Credential {
     revision: u64,
     key: admin::LidarrKey,
+    check_stamp: [u8; 32],
 }
 
 enum Dispatch {
@@ -1752,10 +1754,16 @@ struct RecordedAsk {
     placed: bool,
 }
 
+fn clean_asked(mut asked: AskedRelease) -> AskedRelease {
+    asked.title = clean_display_text(&asked.title);
+    asked.artist = clean_display_text(&asked.artist);
+    asked
+}
+
 fn keep_owner(db: &Connection, binding: &[u8; 32], account: AccountId, ask: &RecordedAsk, now: u64) -> rusqlite::Result<()> {
-    let mut row = ask.clone();
-    row.asked.asked_ms = now;
-    let metadata = serde_json::to_vec(&row.asked)
+    let mut asked = clean_asked(ask.asked.clone());
+    asked.asked_ms = now;
+    let metadata = serde_json::to_vec(&asked)
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
     db.execute(
         "INSERT INTO requests_owners (binding, account, release, asked_ms, metadata, placed)
@@ -1765,8 +1773,8 @@ fn keep_owner(db: &Connection, binding: &[u8; 32], account: AccountId, ask: &Rec
             metadata = CASE WHEN length(requests_owners.metadata) = 0 THEN excluded.metadata ELSE requests_owners.metadata END,
             asked_ms = CASE WHEN length(requests_owners.metadata) = 0 THEN excluded.asked_ms ELSE requests_owners.asked_ms END
          WHERE length(requests_owners.metadata) = 0 OR excluded.placed > requests_owners.placed",
-        params![binding.as_slice(), row.asked.release.as_str(), events::sql(now)?, metadata,
-            events::sql(account.get())?, row.placed],
+        params![binding.as_slice(), asked.release.as_str(), events::sql(now)?, metadata,
+            events::sql(account.get())?, ask.placed],
     ).map(drop)
 }
 
@@ -2765,7 +2773,9 @@ fn credential(keeper: &mut Keeper, endpoint: &Endpoint) -> Result<Option<Credent
     let saved = keeper.lidarr(Some(&endpoint.address)).map_err(|_| Refusal::NotDealtWith)?;
     let (Some(binding), Some(sealed)) = (saved.binding, saved.sealed) else { return Ok(None) };
     let sealing = admin::LidarrSealingKey::new(keeper.seal_key());
-    Ok(sealing.open(&binding, &sealed).map(|key| Credential { revision: binding.revision, key }))
+    Ok(sealing.open(&binding, &sealed).map(|key| Credential {
+        revision: binding.revision, key, check_stamp: sealed.check_stamp(),
+    }))
 }
 
 fn admin_reply<T: admin::ResultBody>(answer: Result<T, admin::Refusal>) -> Response<Body> {
@@ -2894,12 +2904,15 @@ async fn get_lidarr(
     let address = service.accounts.lidarr.clone();
     let configured = service.accounts.desk.ask(move |keeper| {
         admin_actor(keeper, &request.head, &ingress, clock())?;
-        let configured = match endpoint {
-            None => false,
-            Some(endpoint) => credential(keeper, &endpoint).map(|key| key.is_some())
-                .map_err(|_| admin::Refusal::NotDealtWith)?,
+        let key = match endpoint {
+            None => None,
+            Some(endpoint) => credential(keeper, &endpoint).map_err(|_| admin::Refusal::NotDealtWith)?,
         };
-        Ok(admin::LidarrSetting { address, configured })
+        let checked = match &key {
+            Some(key) => keeper.data().lidarr_checked(&key.check_stamp).map_err(|_| admin::Refusal::NotDealtWith)?,
+            None => false,
+        };
+        Ok(admin::LidarrSetting { address, configured: key.is_some(), checked })
     }).await.unwrap_or(Err(admin::Refusal::Busy { retry_after_seconds: account::Wait::new(1) }));
     admin_reply(configured)
 }
@@ -2963,7 +2976,7 @@ async fn save_lidarr_key(
         let grant = GrantUse { request_id: request.request_id, secret: &request.grant };
         let bearer = Bearer { device, hash: &ingress.hash, grant: Some(grant) };
         actor.request(request.head.restore, keeper.clock(now), |turn| {
-            turn.install_lidarr(bearer, authorized, &binding, &request.change.key, &sealing, *nonce)
+            turn.install_lidarr(bearer, authorized, &binding, &request.change.key, check, &sealing, *nonce)
         }).apply(|effects| keeper.persist(effects, &[], now))
             .map_err(|_| admin::Refusal::NotDealtWith)?
             .map_err(admin_said)?;

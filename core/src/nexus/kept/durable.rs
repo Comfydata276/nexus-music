@@ -4,7 +4,7 @@
 use super::receipt::Purpose;
 use super::*;
 use crate::nexus::admin::{
-    InternalAddress, LIDARR_NONCE_BYTES, LidarrBinding, LidarrKey, LidarrSealingKey, SealedLidarrKey,
+    InternalAddress, LIDARR_NONCE_BYTES, LidarrBinding, LidarrKey, LidarrKeyCheck, LidarrSealingKey, SealedLidarrKey,
 };
 use crate::nexus::music::{MusicInstallation, VerifiedLogin};
 use std::collections::BTreeMap;
@@ -130,10 +130,11 @@ pub enum DataChange {
     /// The target account's switch and its successor revision for the data write.
     SetRequestsEnabled { enabled: bool, revision: u64 },
     /// Write the new revision and seal to the apart store with the spent grant.
-    /// The data transaction must never store the seal.
+    /// The data transaction may record the check for this revision.
     InstallLidarrKey {
         binding: LidarrBinding,
         sealed: SealedLidarrKey,
+        check: LidarrKeyCheck,
     },
 }
 
@@ -1387,6 +1388,7 @@ impl Turn<'_> {
         authorized: LidarrAuthorization,
         current: &LidarrBinding,
         key: &LidarrKey,
+        check: LidarrKeyCheck,
         sealing: &LidarrSealingKey,
         nonce: [u8; LIDARR_NONCE_BYTES],
     ) -> Result<(), Denied> {
@@ -1403,7 +1405,7 @@ impl Turn<'_> {
         }
         let binding = LidarrBinding { revision: next(current.revision)?, ..current.clone() };
         let sealed = sealing.seal(&binding, key, nonce).ok_or(Denied::WrongPurpose)?;
-        *self.change = DataChange::InstallLidarrKey { binding, sealed };
+        *self.change = DataChange::InstallLidarrKey { binding, sealed, check };
         Ok(())
     }
 
@@ -1421,7 +1423,7 @@ impl Turn<'_> {
             device: bearer.device, hash: bearer.hash,
             grant: bearer.grant.as_ref().map(|grant| GrantUse { request_id: grant.request_id, secret: grant.secret }),
         }, current, key)?;
-        self.install_lidarr(bearer, authorized, current, key, sealing, nonce)
+        self.install_lidarr(bearer, authorized, current, key, LidarrKeyCheck::Unreachable, sealing, nonce)
     }
 
     /// Load the target and its current switch revision under the same writer

@@ -322,7 +322,22 @@ def downloaded(copy, account):
         return set()
 
 
+def see_notice(a, wait=0):
+    """W7c item 10: what the server records is shown over the window until the person presses
+    OK on it, as a person would here."""
+    end = time.time() + wait
+    while True:
+        if a.find(label="What your Nexus server records", role="Text"):
+            a.press("OK")
+            time.sleep(0.5)
+            return True
+        if time.time() >= end:
+            return False
+        time.sleep(0.3)
+
+
 def settings_tab(a, tab, shows):
+    see_notice(a, wait=1)
     if not a.find(label="Close settings", role="Button"):
         a.press("Settings")
         time.sleep(1.5)
@@ -1174,7 +1189,9 @@ class Run:
             # the session (C10's rule): two at each of the two starts.
             want = 4 if self.new else 3
             self.expect(test, "requests_under_nexus (one per account published)", count == want, count)
-        account_calls = ("signin", "signout", "devices", "force-out", "change-password", "music-login")
+        # (And, since W7b wired them to the signed-in account, the sending half's own: what was
+        # listened to, and the Diagnostics report: the stand-in answers them 400.)
+        account_calls = ("signin", "signout", "devices", "force-out", "change-password", "music-login", "events/send", "diag/send")
         for line in seen:
             ok = '"GET /nexus/api/hello HTTP/1.1"' in line and "NexusMusic/" in line
             # W7: the shared client's own asks, each a POST to one of the account calls.

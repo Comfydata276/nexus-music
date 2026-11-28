@@ -110,10 +110,18 @@ impl fmt::Debug for Name {
 impl Name {
     // the design does not say whether blank names or controls are allowed.
     pub fn new(text: &str) -> Option<Self> {
-        if text.len() > NAME_MAX_BYTES || text.trim().is_empty() || text.chars().any(char::is_control) {
+        if text.len() > NAME_MAX_BYTES || text.trim().is_empty()
+            || text.chars().any(super::events::disallowed_display_char)
+        {
             return None;
         }
         Some(Self(text.to_owned()))
+    }
+
+    /// An app can take its device name from the system. Clean that label
+    /// before applying the normal name rules and byte ceiling.
+    pub fn for_device(text: &str) -> Option<Self> {
+        Self::new(&super::events::clean_display_text(text))
     }
 
     pub fn as_str(&self) -> &str {
@@ -602,22 +610,36 @@ pub enum Credential {
     Code { code: OneTimeCode, new_password: Password },
 }
 
-object! {
-    SignIn {
-        credential: Credential,
-        device_secret: DeviceSecret,
-        device_name: Name,
-        device_kind: DeviceKind,
-        #[serde(serialize_with = "write_version")]
-        app_version: Version,
-        #[serde(serialize_with = "write_speaks")]
-        speaks: Speaks,
-        // the design does not say how the first sign-in supplies a restore number.
-        // Null means the app has none. A number is checked by the server.
-        restore: Option<u64>,
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct SignIn {
+    pub credential: Credential,
+    pub device_secret: DeviceSecret,
+    pub device_name: Name,
+    pub device_kind: DeviceKind,
+    #[serde(serialize_with = "write_version")]
+    pub app_version: Version,
+    #[serde(serialize_with = "write_speaks")]
+    pub speaks: Speaks,
+    // Null means the app has no restore number yet.
+    pub restore: Option<u64>,
+}
+
+impl wire::Value for SignIn {
+    fn read(raw: &RawValue) -> Result<Self, BadMessage> {
+        let fields = Fields::read(raw)?;
+        Ok(Self {
+            credential: fields.get("credential")?,
+            device_secret: fields.get("device_secret")?,
+            device_name: read_text(fields.0.get("device_name").ok_or(BadMessage::Form)?, Name::for_device)?,
+            device_kind: fields.get("device_kind")?,
+            app_version: fields.get("app_version")?,
+            speaks: fields.get("speaks")?,
+            restore: fields.get("restore")?,
+        })
     }
-    check(value) {
-        match &value.credential {
+
+    fn check(&self) -> Result<(), BadMessage> {
+        match &self.credential {
             Credential::Code { new_password, .. } => new_password.check_new_length(),
             Credential::Password { .. } => Ok(()),
         }

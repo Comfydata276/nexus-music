@@ -9,7 +9,7 @@ const route = readFileSync(new URL("../src/admin.rs", import.meta.url), "utf8");
 const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
 const style = html.match(/<style>([\s\S]*?)<\/style>/)[1];
 
-function loadPage(fetch, { requestsEnabled = false, origin = "https://owner.example.test:8443" } = {}) {
+function loadPage(fetch, { origin = "https://owner.example.test:8443" } = {}) {
   const elements = new Map();
   const windowEvents = new Map();
   const documentEvents = new Map();
@@ -20,10 +20,13 @@ function loadPage(fetch, { requestsEnabled = false, origin = "https://owner.exam
     "lidarr-form": ["lidarr-key"], "setup-form": ["setup-code", "setup-name", "setup-email", "setup-password"], "music-login-form": ["music-user", "music-password"],
   };
   const node = (tag, id) => ({
-    tag, id, textContent: "", value: "", disabled: false, hidden: id === "admin", open: false,
-    events: new Map(), children: [],
-    append(...children) { this.children.push(...children); },
-    replaceChildren(...children) { this.children = children; },
+    tag, id, value: "", disabled: false, hidden: id === "admin", open: false,
+    events: new Map(), childNodes: [],
+    get children() { return this.childNodes.filter(child => typeof child !== "string"); },
+    get textContent() { return this.childNodes.map(child => typeof child === "string" ? child : child.textContent).join(""); },
+    set textContent(text) { this.childNodes = [text]; },
+    append(...children) { this.childNodes.push(...children); },
+    replaceChildren(...children) { this.childNodes = children; },
     addEventListener(name, handler) { this.events.set(name, handler); },
     reset() {
       for (const key of fields[id] ?? []) {
@@ -51,7 +54,7 @@ function loadPage(fetch, { requestsEnabled = false, origin = "https://owner.exam
       writeln() { assert.fail("Untrusted text reached document.writeln"); },
       getElementById: from,
       createElement(tag) {
-        assert.ok(["li", "details", "summary", "div", "button", "span", "p", "option", "strong", "meter"].includes(tag), tag);
+        assert.ok(["li", "details", "summary", "div", "button", "span", "p", "option", "strong", "meter", "bdi"].includes(tag), tag);
         return node(tag);
       },
     },
@@ -71,12 +74,10 @@ function loadPage(fetch, { requestsEnabled = false, origin = "https://owner.exam
     AbortController,
     fetch,
   };
-  const instrumentation = "globalThis.forTest = { parseReply, typedCode, hasApproval: () => approval !== null };";
-  let source = script;
-  if (requestsEnabled) source = source.replace("const enableRequestChanges = false;", "const enableRequestChanges = true;");
+  const instrumentation = "globalThis.forTest = { parseReply, typedCode, hasApproval: () => approval !== null, hasDraft: () => draft !== null };";
   from("listening-days").value = "30";
   from("listening-top").value = "artists";
-  runInNewContext(source.replace(/\}\)\(\);\s*$/, instrumentation + "})();"), context);
+  runInNewContext(script.replace(/\}\)\(\);\s*$/, instrumentation + "})();"), context);
   const findButton = (node, label) => {
     if (node.tag === "button" && node.textContent === label) return node;
     for (const child of node.children) {
@@ -86,6 +87,9 @@ function loadPage(fetch, { requestsEnabled = false, origin = "https://owner.exam
   };
   return {
     from,
+    containsInDom(text) {
+      return Array.from(elements.values()).some(element => element.textContent.includes(text) || element.value.includes(text));
+    },
     windowEvents,
     documentEvents,
     setHidden(hidden) {
@@ -220,12 +224,13 @@ test("authorized reads render text and paginate losslessly", async () => {
     }
     if (path === "/nexus/api/admin/music-server") return done({ internal: injected, public: injected });
     if (path === "/nexus/api/admin/diagnostics-default") return done({ enabled: true });
+    if (path === "/nexus/api/admin/lidarr") return done({ address: null, configured: false });
     throw new Error("Unexpected request " + path);
   });
 
   await page.signIn("owner@example.test", "example admin password");
   await new Promise(setImmediate);
-  assert.equal(requests.length, 4);
+  assert.equal(requests.length, 5);
   for (const [, options] of requests) {
     assert.equal(options.headers.Authorization, "Bearer " + token);
     assert.deepEqual(JSON.parse(options.body).head, { speaks: [1, 1], restore: 2 });
@@ -235,11 +240,12 @@ test("authorized reads render text and paginate losslessly", async () => {
   assert.equal(page.from("music-internal").textContent, injected);
   assert.equal(page.from("music-public").textContent, injected);
   assert.equal(page.from("diagnostics-status").textContent, "New devices send diagnostics by default.");
-  assert.equal(page.from("requests-list").children.length, 0);
+  assert.equal(page.from("requests-list").children.length, 1);
   assert.equal(page.from("accounts-more").hidden, false);
-  await page.from("accounts-more").events.get("click")();
+  await page.click("requests-more");
   assert.match(requests.at(-1)[1].body, /"after":18446744073709551614/);
   assert.equal(page.from("accounts-list").children.length, 2);
+  assert.equal(page.from("requests-list").children.length, 2);
   assert.equal(page.from("accounts-more").hidden, true);
   page.windowEvents.get("pagehide")();
   assert.equal(page.from("admin").hidden, true);
@@ -337,7 +343,10 @@ function adminStandIn() {
     if (action === "set_account_enabled") enabled = data.change.enabled;
     if (action === "set_requests_enabled") canRequest = data.change.enabled;
     if (action === "set_admin") isAdmin = data.change.admin;
-    if (action === "set_lidarr") lidarrConfigured = true;
+    if (action === "set_lidarr") {
+      lidarrConfigured = true;
+      return done({ check: "works" });
+    }
     if (action === "set_music_server") publicAddress = data.change.public;
     if (action === "set_diagnostics_default") diagnostics = data.change.enabled;
     if (action === "force_out") hasSession = false;
@@ -357,7 +366,7 @@ function adminStandIn() {
 
 test("all changes show a confirmation and spend one grant on the exact wire target", async () => {
   const mock = adminStandIn();
-  const page = loadPage(mock.fetch, { requestsEnabled: true });
+  const page = loadPage(mock.fetch);
   await page.signIn("owner@example.test", "example sign-in password");
   await settle();
   const confirm = async (password) => {
@@ -388,8 +397,10 @@ test("all changes show a confirmation and spend one grant on the exact wire targ
   page.press("accounts-list", "Switch account on");
   await confirm();
   page.press("requests-list", "Turn requests off");
+  assert.equal(page.from("grant-summary").textContent, "Stop Pat <script>sample()</script> (pat@example.test) from requesting music.");
   await confirm();
   page.press("requests-list", "Allow requests");
+  assert.equal(page.from("grant-summary").textContent, "Let Pat <script>sample()</script> (pat@example.test) request music.");
   await confirm();
   page.press("accounts-list", "Make administrator");
   await confirm();
@@ -425,7 +436,7 @@ test("all changes show a confirmation and spend one grant on the exact wire targ
   assert.equal(page.from("music-public").textContent, address);
 
   assert.equal(page.from("lidarr-address").textContent, lidarrAddress);
-  assert.match(page.from("lidarr-key-status").textContent, /Enter a key/);
+  assert.equal(page.from("lidarr-key-status").textContent, "Lidarr key is not set.");
   for (const invalidKey of ["with spaces", "é", "a".repeat(513)]) {
     page.submit("lidarr-form", { "lidarr-key": invalidKey });
     assert.equal(page.from("lidarr-key").value, "");
@@ -436,7 +447,7 @@ test("all changes show a confirmation and spend one grant on the exact wire targ
 
   assert.equal(page.from("grant-summary").textContent.includes(lidarrKey), false);
   await confirm();
-  assert.match(page.from("lidarr-key-status").textContent, /A key is saved/);
+  assert.equal(page.from("lidarr-key-status").textContent, "Lidarr key is saved.");
   assert.equal(page.from("lidarr-address").textContent.includes(lidarrKey), false);
   page.click("diagnostics-toggle");
   await confirm();
@@ -569,10 +580,12 @@ test("authentication fields have explicit autocomplete purposes", () => {
   assert.ok(inputs.every(input => input.includes('autocomplete="')));
   for (const [id, purpose] of Object.entries({
     email: "username", password: "current-password", "setup-code": "one-time-code",
-    "music-user": "off", "music-password": "new-password", "lidarr-key": "new-password",
+    "music-user": "off", "music-password": "new-password", "lidarr-key": "off",
   })) {
     assert.ok(inputs.find(input => input.includes('id="' + id + '"')).includes('autocomplete="' + purpose + '"'));
   }
+  assert.match(inputs.find(input => input.includes('id="lidarr-key"')), /type="text".*spellcheck="false"/);
+  assert.match(style, /#lidarr-key\s*\{\s*-webkit-text-security:\s*disc/);
 });
 
 test("elapsed inactivity clears the tab, including an open code and cached approval", async () => {
@@ -649,7 +662,7 @@ test("the own row hides lockout controls and the current tab stays signed in", a
   await page.signIn(account.email, adminPassword);
   await settle();
   const [own] = page.from("accounts-list").children;
-  assert.match(own.children[0].textContent, /the account you’re signed in with/);
+  assert.match(own.textContent, /the account you’re signed in with/);
   for (const control of ["Switch account off", "Remove account", "Remove administrator access"]) {
     assert.equal(page.button("accounts-list", control), undefined);
   }
@@ -691,14 +704,104 @@ test("the code instructions match the app fields and preserve the lifetime", () 
 test("requests shows one container instruction and no key field when Lidarr has no address", async () => {
   const mock = adminStandIn();
   const page = loadPage((path, options) => path === "/nexus/api/admin/lidarr"
-    ? new Response('{"done":{"address":null,"configured":false}}') : mock.fetch(path, options),
-    { requestsEnabled: true });
+    ? new Response('{"done":{"address":null,"configured":false}}') : mock.fetch(path, options));
   await page.signIn("owner@example.test", adminPassword);
   await settle();
-  assert.equal(page.from("lidarr-details").hidden, true);
+  assert.equal(page.from("lidarr-settings").hidden, true);
   assert.equal(page.from("requests-availability").hidden, false);
-  assert.match(page.from("requests-availability").textContent, /server owner sets the Lidarr address in the container/);
+  assert.equal(page.from("requests-availability").textContent,
+    "Music requests aren't set up on this server. The server's owner sets Lidarr's address on the container.");
   assert.ok(page.button("requests-list", "Turn requests off"));
+});
+
+test("Lidarr key setup distinguishes a refusal from both successful saves", async () => {
+  const mock = adminStandIn();
+  const requests = [];
+  let settingsReads = 0;
+  let check;
+  const page = loadPage(async (path, options) => {
+    requests.push({ path, body: options.body });
+    if (path === "/nexus/api/admin/lidarr") settingsReads++;
+    if (path !== "/nexus/api/admin/set-lidarr") return mock.fetch(path, options);
+    if (check === "refused") {
+      return new Response('{"refused":{"not_allowed":"lidarr_login_refused"}}', { status: 403 });
+    }
+    const saved = await mock.fetch(path, options);
+    assert.equal(saved.status, 200);
+    return new Response(JSON.stringify({ done: { check } }));
+  });
+  await page.signIn("owner@example.test", adminPassword);
+  await settle();
+  page.submit("lidarr-form", { "lidarr-key": lidarrKey });
+  assert.ok(page.hasDraft());
+  page.click("grant-cancel");
+  await page.submit("grant-form", { "grant-password": adminPassword });
+  assert.equal(page.hasDraft(), false);
+  assert.equal(page.containsInDom(lidarrKey), false);
+  assert.ok(requests.every(request => !request.body.includes(lidarrKey)));
+  for (const [outcome, message, rowStatus] of [
+    ["works", "The Lidarr key works and is set.", "Lidarr key is saved."],
+    ["refused", "Lidarr refused that key, so it wasn’t saved. Any previous key is still in use.", "Lidarr key is saved."],
+    ["unreachable", "Lidarr could not be reached, so Nexus saved the key unchecked. Check that Lidarr is running, then set the key again to check it.",
+      "Lidarr key is saved but hasn’t been checked."],
+    ["works", "The Lidarr key works and is set.", "Lidarr key is saved."],
+  ]) {
+    check = outcome;
+    const offset = requests.length;
+    const before = settingsReads;
+    page.submit("lidarr-form", { "lidarr-key": lidarrKey });
+    await page.submit("grant-form", { "grant-password": adminPassword });
+    await settle();
+    assert.equal(settingsReads, before + 1);
+    assert.equal(page.from("lidarr-key").value, "");
+    assert.equal(page.hasDraft(), false);
+    assert.equal(page.containsInDom(lidarrKey), false);
+    assert.deepEqual(requests.slice(offset).filter(request => request.body.includes(lidarrKey)).map(request => request.path),
+      ["/nexus/api/admin/grant", "/nexus/api/admin/set-lidarr"]);
+    assert.equal(page.from("lidarr-key-status").textContent, rowStatus);
+    assert.equal(page.from("lidarr-setup-label").textContent, outcome === "unreachable" ?
+      "Set the Lidarr key again to check it" : "Set up Lidarr");
+    assert.equal(page.from("change-status").textContent, message);
+  }
+});
+
+test("a stale Requests grant re-reads the winner's switch value", async () => {
+  const mock = adminStandIn();
+  let reads = 0;
+  const page = loadPage(async (path, options) => {
+    if (path === "/nexus/api/admin/accounts") {
+      reads++;
+      const response = await mock.fetch(path, options);
+      const body = await response.text();
+      return new Response(reads === 1 ? body : body.replace('"requests_enabled":true', '"requests_enabled":false'));
+    }
+    if (path === "/nexus/api/admin/set-requests-enabled") {
+      return new Response('{"refused":{"not_allowed":"grant_required"}}', { status: 403 });
+    }
+    return mock.fetch(path, options);
+  });
+  await page.signIn("owner@example.test", adminPassword);
+  await settle();
+  page.press("requests-list", "Turn requests off");
+  await page.submit("grant-form", { "grant-password": adminPassword });
+  await settle();
+  assert.equal(reads, 2);
+  assert.match(page.from("requests-list").textContent, /can’t request music/);
+  assert.ok(page.button("requests-list", "Allow requests"));
+  assert.match(page.from("change-status").textContent, /may have changed in another tab/);
+});
+
+test("a new browser tab reads whether the saved Lidarr key has been checked", async () => {
+  const mock = adminStandIn();
+  const fetch = (path, options) => path === "/nexus/api/admin/lidarr"
+    ? new Response(JSON.stringify({ done: { address: lidarrAddress, configured: true, checked: false } }))
+    : mock.fetch(path, options);
+  for (const page of [loadPage(fetch), loadPage(fetch)]) {
+    await page.signIn("owner@example.test", adminPassword);
+    await settle();
+    assert.equal(page.from("lidarr-key-status").textContent, "Lidarr key is saved but hasn’t been checked.");
+    assert.equal(page.from("lidarr-setup-label").textContent, "Set the Lidarr key again to check it");
+  }
 });
 
 const listeningTime = 1788883200000;
@@ -715,7 +818,73 @@ const listeningOverview = (starts = 11, days = 30) => ({
   recent: { rows: starts ? [examplePlay] : [], next: starts ? "recent_abc" : null },
 });
 const doneListening = data => new Response(JSON.stringify({ done: data }));
-const textOf = node => node.textContent + node.children.map(textOf).join("");
+const textOf = node => node.textContent;
+
+test("request history displays text and uses the exact snapshot cursor", async () => {
+  const mock = adminStandIn();
+  const calls = [];
+  const row = {
+    account: 7, name: "Jamie <b>Chen</b>",
+    asked: { title: "Night Walk <script>example()</script>", artist: "The Lanterns", asked_ms: listeningTime },
+  };
+  const page = loadPage((path, options) => {
+    if (path !== "/nexus/api/admin/request-attribution") return mock.fetch(path, options);
+    assert.equal(options.headers["X-Nexus-Admin"], "1");
+    assert.equal(options.headers.Authorization, "Bearer " + encodedToken);
+    assert.equal(options.credentials, "omit");
+    calls.push(options.body);
+    if (calls.length === 1) {
+      return new Response('{"done":{"rows":' + JSON.stringify([row, { ...row, arrived: true }]) +
+        ',"next":[18446744073709551614,2]}}');
+    }
+    return new Response(JSON.stringify({ done: { rows: [{ ...row, arrived: false }], next: null } }));
+  });
+  await page.signIn("owner@example.test", adminPassword);
+  assert.equal(calls.length, 0);
+  const details = page.from("request-history");
+  details.open = true;
+  details.events.get("toggle")();
+  await settle();
+  assert.deepEqual(JSON.parse(calls[0]), { head: { speaks: [1, 1], restore: 2 }, after: null });
+  const list = page.from("request-history-list");
+  assert.match(textOf(list), /Night Walk <script>example\(\)<\/script>/);
+  assert.match(textOf(list), /Requested by Jamie <b>Chen<\/b> on/);
+  assert.equal(list.children[0].children.at(-1).textContent, "Asked");
+  assert.match(textOf(list.children[1]), /Arrived/);
+  await page.click("request-history-more");
+  assert.match(calls[1], /"after":\[18446744073709551614,2\]/);
+  assert.equal(list.children[2].children.at(-1).textContent, "Asked");
+  assert.ok(page.from("request-history-more").hidden);
+  page.windowEvents.get("pagehide")();
+  assert.equal(list.children.length, 0);
+  assert.equal(details.open, false);
+});
+
+test("an expired request list starts a fresh snapshot when reloaded", async () => {
+  const mock = adminStandIn();
+  const calls = [];
+  const page = loadPage((path, options) => {
+    if (path !== "/nexus/api/admin/request-attribution") return mock.fetch(path, options);
+    const { after } = JSON.parse(options.body);
+    calls.push(after);
+    if (after) return new Response('{"refused":{"not_allowed":"conflict"}}', { status: 403 });
+    const result = calls.length === 1 ?
+      { rows: [{ name: "Jamie", asked: { title: "Night Walk", artist: "The Lanterns", asked_ms: listeningTime } }], next: [5, 1] } :
+      { rows: [], next: null };
+    return new Response(JSON.stringify({ done: result }));
+  });
+  await page.signIn("owner@example.test", adminPassword);
+  const details = page.from("request-history");
+  details.open = true;
+  details.events.get("toggle")();
+  await settle();
+  await page.click("request-history-more");
+  assert.equal(page.from("request-history-more").textContent, "Reload requests");
+  await page.click("request-history-more");
+  assert.deepEqual(calls, [null, [5, 1], null]);
+  assert.equal(page.from("request-history-list").children.length, 0);
+  assert.equal(page.from("request-history-status").textContent, "No music requests yet.");
+});
 
 test("listening reads one period at a time and pages older plays and people", async () => {
   const mock = adminStandIn();
@@ -744,6 +913,8 @@ test("listening reads one period at a time and pages older plays and people", as
   assert.deepEqual(calls.at(-1), { head: { speaks: [1, 1], restore: 2 }, account: null, days: 30, page: null });
   assert.equal(page.from("listening-total").textContent, "11 songs started");
   assert.match(textOf(page.from("listening-ranked")), /The Lanterns/);
+  assert.ok(page.from("listening-ranked").children.every(item =>
+    item.children.some(meter => meter.tag === "meter" && meter.value >= 0 && meter.value <= 100)));
   page.change("listening-top", "albums");
   assert.match(textOf(page.from("listening-ranked")), /Porch Light/);
   page.change("listening-top", "songs");
@@ -768,6 +939,43 @@ test("listening reads one period at a time and pages older plays and people", as
   assert.equal(page.from("listening-person").children.length, 1);
   assert.equal(page.from("listening-total").textContent, "");
   assert.equal(page.from("listening-recent").children.length, 0);
+});
+
+test("recent plays isolate direction in the title, album, listener and time", async () => {
+  const mock = adminStandIn();
+  const reply = listeningOverview();
+  reply.recent.rows[0] = {
+    ...examplePlay, title: "Night Walk\u202e\u2028ending", album: "Porch\u2029Light",
+  };
+  const page = loadPage((path, options) => path === "/nexus/api/admin/listening" ?
+    doneListening(reply) : mock.fetch(path, options));
+  await page.signIn("owner@example.test", adminPassword);
+  await settle();
+  page.click("listening-jump");
+  await settle();
+  const [line, detail] = page.from("listening-recent").children[0].children;
+  const title = line.children[0].children[0];
+  assert.equal(title.tag, "bdi");
+  assert.equal(title.textContent, "Night Walk\u202e ending");
+  assert.deepEqual(detail.children.map(node => node.tag), ["bdi", "bdi", "bdi", "bdi"]);
+  assert.equal(detail.children[1].textContent, "Porch Light");
+  assert.equal(detail.children[2].textContent, examplePlay.name);
+  assert.match(detail.children[3].textContent, /\d/);
+});
+
+test("listening refuses out-of-order rankings before drawing meters", async () => {
+  const mock = adminStandIn();
+  const reply = listeningOverview();
+  reply.artists = [{ artist: "First", starts: 1 }, { artist: "Second", starts: 2 }];
+  const page = loadPage((path, options) => path === "/nexus/api/admin/listening" ?
+    doneListening(reply) : mock.fetch(path, options));
+  await page.signIn("owner@example.test", adminPassword);
+  await settle();
+  page.click("listening-jump");
+  await settle();
+  assert.ok(page.from("listening-results").hidden);
+  assert.equal(page.from("listening-ranked").children.length, 0);
+  assert.match(page.from("listening-status").textContent, /Could not load listening/);
 });
 
 test("changing the listening period drops a late reply for the old period", async () => {

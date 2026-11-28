@@ -316,6 +316,39 @@ fn retries_keep_one_copy_and_a_bad_event_does_not_stop_good_events() {
 }
 
 #[test]
+fn older_clients_events_are_cleaned_without_losing_the_plays() {
+    let mut fixture = Fixture::new("clean-upload");
+    let code = fixture.set_up();
+    fixture.start_with_clock();
+    let (who, stamp) = fixture.sign_in(with_code(code), 1);
+    let search = Record::new(id(2), 2, Kind::Search {
+        words: "search".into(), found: 3, where_: events::SearchedIn::Library,
+    }).unwrap().place(2).unwrap();
+    let sent = batch(&stamp, &[start(1, 1, 0), search]);
+    let mut value: serde_json::Value = serde_json::from_slice(sent.write().unwrap().bytes()).unwrap();
+    let play = &mut value["events"][0]["event"];
+    play["title"] = serde_json::json!("שיר\u{202e} לשלום");
+    play["artist"] = serde_json::json!("فنا\u{061c}ن\u{7f}\u{0085}");
+    play["album"] = serde_json::json!("A \u{2028}\u{2029}  B\n\u{2069}");
+    play["from"] = serde_json::json!({"kind":"search", "words":"\u{2066}\u{2029}"});
+    value["events"][1]["event"]["words"] = serde_json::json!("تملي\u{2028}  معاك\u{200f}");
+    let raw = serde_json::to_vec(&value).unwrap();
+    assert_outcomes(fixture.post(events::SEND_PATH, Some(&who), &raw), &sent, &[Outcome::Taken; 2]);
+
+    let stored = |n| fixture.db().query_row(
+        "SELECT line FROM listening_events WHERE event_id = ?1",
+        [id(n).to_hex()], |row| row.get::<_, String>(0),
+    ).unwrap();
+    let play = stored(1);
+    assert_eq!(json::<String>(play.as_bytes(), "$.event.title"), "שיר לשלום");
+    assert_eq!(json::<String>(play.as_bytes(), "$.event.artist"), "فنان");
+    assert_eq!(json::<String>(play.as_bytes(), "$.event.album"), "A B");
+    assert_eq!(json::<String>(play.as_bytes(), "$.event.from.words"), "");
+    assert_eq!(json::<String>(stored(2).as_bytes(), "$.event.words"), "تملي معاك");
+    assert_eq!(json::<i64>(&fixture.stats(&who, &stamp, None), "$.done.result.starts"), 1);
+}
+
+#[test]
 fn a_password_grant_erases_only_its_owners_history_and_fences_old_life() {
     let mut fixture = Fixture::new("life");
     let code = fixture.set_up();
@@ -1299,7 +1332,9 @@ mod listening {
         keeper.close();
         // The store must index existing starts when it upgrades form 2.
         fixture.db().execute_batch(
-            "DROP INDEX listening_by_time; PRAGMA user_version = 2;",
+            "ALTER TABLE meta DROP COLUMN lidarr_checked_seal;
+             DROP INDEX listening_by_time;
+             PRAGMA user_version = 2;",
         ).unwrap();
         let clock = fixture.start_with_clock();
         let (owner, owner_stamp) = fixture.sign_in(with_code(code), 1);

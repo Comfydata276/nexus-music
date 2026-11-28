@@ -340,7 +340,7 @@ fn app(app: AppIn) -> Result<App, ()> {
             KindIn::Pc => DeviceKind::Pc,
             KindIn::Phone => DeviceKind::Phone,
         },
-        device_name: Name::new(&app.device_name).ok_or(())?,
+        device_name: Name::for_device(&app.device_name).ok_or(())?,
     })
 }
 

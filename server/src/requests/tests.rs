@@ -265,6 +265,7 @@ struct LidarrState {
     fail_batch_settle: bool,
     second_artist: bool,
     other_monitored: bool,
+    dirty_names: bool,
     calls: Vec<String>,
 }
 
@@ -370,9 +371,19 @@ impl Drop for MockLidarr {
 fn mock(request: &Question, state: &mut LidarrState) -> Value {
     let target = request.target.strip_prefix("/api/v1/").unwrap();
     state.calls.push(format!("{} {target}", request.method));
-    let artist = json!({"id":5,"monitored":true,"artistName":"Quillon Vane","foreignArtistId":ARTIST,
+    let dirty = state.dirty_names;
+    let name = if dirty { "فرقة\u{200f}\u{2029}  الوادي\u{0085}" } else { "Quillon Vane" };
+    let artist = json!({"id":5,"monitored":true,"artistName":name,"foreignArtistId":ARTIST,
         "monitorNewItems":state.new_releases.as_deref().unwrap_or("all"),"metadataProfileId":1});
-    let mut offer = album(state.monitored);
+    let release = |monitored| {
+        let mut record = album(monitored);
+        if dirty {
+            record["title"] = json!("שיר\u{202e}\u{2028}  לשלום\t");
+            record["artist"]["artistName"] = json!(name);
+        }
+        record
+    };
+    let mut offer = release(state.monitored);
     if state.single_mode {
         offer["albumType"] = json!("Single");
     }
@@ -387,7 +398,7 @@ fn mock(request: &Question, state: &mut LidarrState) -> Value {
     match (request.method.as_str(), target) {
         ("GET", "system/status") => json!({"version":"2.0.0"}),
         ("GET", "album") => {
-            let mut current = album(state.monitored);
+            let mut current = release(state.monitored);
             current["statistics"]["trackFileCount"] = json!(u8::from(state.arrived));
             if state.mismatched_arrival_artist {
                 current["artist"] = other_artist;
@@ -397,7 +408,7 @@ fn mock(request: &Question, state: &mut LidarrState) -> Value {
         ("GET", "album/lookup?term=Glass%20Orchard" | "album/lookup?term=Glass%20Orchard%20Quillon%20Vane") =>
             json!([offer]),
         ("GET", lookup) if lookup == format!("album/lookup?term=lidarr%3A{ALBUM}") =>
-            json!([album(state.monitored)]),
+            json!([release(state.monitored)]),
         ("GET", "album/lookup?term=Quiet%20Coast%20Paper%20Tides") if state.second_artist => json!([other_album]),
         ("GET", "artist") if state.fail_batch_settle && state.new_releases.as_deref() == Some("none") =>
             json!({"fixture":"artist lookup failed during settling"}),
@@ -422,10 +433,10 @@ fn mock(request: &Question, state: &mut LidarrState) -> Value {
             }
             json!([offer])
         }
-        ("GET", "album?artistId=5") => json!([album(state.monitored)]),
-        ("GET", "album/9") => album(state.monitored),
+        ("GET", "album?artistId=5") => json!([release(state.monitored)]),
+        ("GET", "album/9") => release(state.monitored),
         ("GET", "wanted/missing?includeArtist=true&page=1&pageSize=500") => {
-            let mut found: Vec<_> = (state.monitored && !state.arrived).then(|| album(true)).into_iter().collect();
+            let mut found: Vec<_> = (state.monitored && !state.arrived).then(|| release(true)).into_iter().collect();
             if state.ambiguous_pending_number {
                 let mut competing = album(true);
                 competing["foreignAlbumId"] = json!("10000000-0000-0000-0000-000000000999");
@@ -656,6 +667,17 @@ impl TestServer {
         }).unwrap();
         let (status, body) = self.post(path, Some(&who.signed_in), headers, &request);
         admin::read_reply(status, &body).unwrap()
+    }
+
+    fn lidarr_setting(&self, page: &Person) -> admin::LidarrSetting {
+        let body = admin::encode(&admin::GetLidarrSetting {
+            head: RequestHead { speaks: SPEAKS, restore: page.restore },
+        }).unwrap();
+        let (status, response) = self.post(admin::GET_LIDARR_SETTING, Some(&page.signed_in), TEST_PAGE, body.bytes());
+        let admin::Reply::Done(setting) = admin::read_reply(status, &response).unwrap() else {
+            panic!("the page could not read Lidarr's setting");
+        };
+        setting
     }
 
     fn configure(&self, page: &Person) -> admin::LidarrKeyCheck {
@@ -913,7 +935,8 @@ fn a_request_works_after_upgrading_the_deployed_form() {
     keeper.close();
 
     let db = Connection::open(root.join("data/nexus.db")).unwrap();
-    db.execute_batch("DROP INDEX listening_by_time;
+    db.execute_batch("ALTER TABLE meta DROP COLUMN lidarr_checked_seal;
+        DROP INDEX listening_by_time;
         DROP TRIGGER requests_owners_placed_stays;
         ALTER TABLE requests_owners DROP COLUMN placed;
         ALTER TABLE requests_owners DROP COLUMN metadata;
@@ -1014,7 +1037,7 @@ fn without_a_container_address_neither_the_page_nor_the_app_can_enable_requests(
     }).unwrap();
     let (status, reply) = server.post(admin::GET_LIDARR_SETTING, Some(&page.signed_in), TEST_PAGE, body.bytes());
     assert!(matches!(admin::read_reply::<admin::LidarrSetting>(status, &reply).unwrap(),
-        admin::Reply::Done(admin::LidarrSetting { address: None, configured: false })));
+        admin::Reply::Done(admin::LidarrSetting { address: None, configured: false, checked: false })));
     assert!(matches!(server.grant(&page, TEST_PAGE, admin::Action::SetLidarr(key_change(TEST_KEY)), 1),
         admin::Reply::Refused(_)));
 }
@@ -1094,6 +1117,8 @@ fn a_refused_key_spends_the_grant_and_leaves_the_working_key_untouched() {
     let page = server.redeem(admin, 1, TEST_PAGE);
     assert_eq!(server.configure(&page), admin::LidarrKeyCheck::Works);
     assert_eq!(lidarr.take_calls(), ["GET system/status"]);
+    let checked = server.lidarr_setting(&page);
+    assert!(checked.configured && checked.checked);
 
     let admin::Reply::Done(issued) =
         server.grant(&page, TEST_PAGE, admin::Action::SetLidarr(key_change(REFUSED_KEY)), 102)
@@ -1103,6 +1128,7 @@ fn a_refused_key_spends_the_grant_and_leaves_the_working_key_untouched() {
     assert_eq!(submit(), admin::Reply::Refused(admin::Refusal::NotAllowed(admin::Denial::LidarrLoginRefused)));
     assert_eq!(submit(), admin::Reply::Refused(admin::Refusal::NotAllowed(admin::Denial::GrantRequired)));
     assert_eq!(lidarr.take_calls(), ["GET system/status"]);
+    assert_eq!(server.lidarr_setting(&page), checked);
     let member = server.redeem(member, 2, "");
     assert!(matches!(server.call(&member, Call::Status), Answer::Status { lidarr: Availability::Ready }));
 }
@@ -1125,6 +1151,79 @@ fn an_unreachable_key_check_saves_the_key_as_unchecked_and_spends_the_grant() {
     lock(&lidarr.state).status_down = false;
     let member = server.redeem(member, 2, "");
     assert!(matches!(server.call(&member, Call::Status), Answer::Status { lidarr: Availability::Ready }));
+}
+
+#[test]
+fn upstream_display_names_are_clean_in_offers_storage_and_attribution() {
+    let lidarr = MockLidarr::start();
+    lock(&lidarr.state).dirty_names = true;
+    let (server, [admin, member, _]) = TestServer::start("clean-requests", Some(endpoint(lidarr.address)));
+    let page = server.redeem(admin, 1, TEST_PAGE);
+    assert_eq!(server.configure(&page), admin::LidarrKeyCheck::Works);
+    let member = server.redeem(member, 2, "");
+
+    let Answer::FoundAny { albums, .. } = server.call(&member, Call::FindAny {
+        search: Search::new("Glass Orchard").unwrap(), after: None,
+    }) else { panic!("expected the cleaned offer") };
+    let [album] = albums.as_slice() else { panic!("expected one offer") };
+    assert_eq!(album.title, "שיר לשלום");
+    assert_eq!(album.artist, "فرقة الوادي");
+    let job = begun(server.call(&member, begin(1, Change::Request { offer: album.album.clone() })));
+    assert_eq!(server.done(&member, job), Completed::Requested { placed: true });
+
+    let db = Connection::open(server.root.join("data/nexus.db")).unwrap();
+    let metadata: Vec<u8> = db.query_row(
+        "SELECT metadata FROM requests_owners WHERE release = ?1",
+        [ALBUM], |row| row.get(0),
+    ).unwrap();
+    let kept: AskedRelease = serde_json::from_slice(&metadata).unwrap();
+    assert_eq!(kept.title, album.title);
+    assert_eq!(kept.artist, album.artist);
+    let Answer::AskedHistory { rows, .. } = server.call(&member, Call::AskedHistory { after: None })
+        else { panic!("expected asked history") };
+    assert_eq!(rows, [kept.clone()]);
+
+    let read = wire::write_attribution(&wire::AttributionRead {
+        head: RequestHead { speaks: SPEAKS, restore: page.restore }, after: None,
+    }).unwrap();
+    let (status, reply) = server.post(wire::ADMIN_ATTRIBUTION, Some(&page.signed_in), TEST_PAGE, read.bytes());
+    let admin::Reply::Done(found) = wire::read_attribution_reply(status, &reply).unwrap() else {
+        panic!("expected request attribution");
+    };
+    let [row] = found.rows.as_slice() else { panic!("expected one attributed request") };
+    assert_eq!(row.asked, kept);
+}
+
+#[test]
+fn lidarr_check_status_survives_restart_and_updates_when_the_same_key_is_checked() {
+    let lidarr = MockLidarr::start();
+    lock(&lidarr.state).status_down = true;
+    let (mut server, [admin, _, _]) = TestServer::start_child("durable-key-check", lidarr.address);
+    let first = server.redeem(admin, 1, TEST_PAGE);
+    assert_eq!(server.configure(&first), admin::LidarrKeyCheck::Unreachable);
+    let unchecked = admin::LidarrSetting {
+        address: Some(endpoint(lidarr.address).address), configured: true, checked: false,
+    };
+    assert_eq!(server.lidarr_setting(&first), unchecked);
+
+    server.kill_child();
+    server.launch(lidarr.address);
+    let second = server.sign_in(SignInCredential::Password {
+        email: first.signed_in.person.email.clone(),
+        password: Password::presented(PASSWORD).unwrap(),
+    }, 2, TEST_PAGE);
+    assert_eq!(server.lidarr_setting(&second), unchecked);
+    assert_eq!(lidarr.take_calls(), ["GET system/status"]);
+
+    lock(&lidarr.state).status_down = false;
+    assert_eq!(server.configure(&second), admin::LidarrKeyCheck::Works);
+    let checked = admin::LidarrSetting { checked: true, ..unchecked };
+    assert_eq!(server.lidarr_setting(&first), checked);
+    assert_eq!(server.lidarr_setting(&second), checked);
+    server.kill_child();
+    server.launch(lidarr.address);
+    assert_eq!(server.lidarr_setting(&second), checked);
+    assert_eq!(lidarr.take_calls(), ["GET system/status"]);
 }
 
 #[test]
