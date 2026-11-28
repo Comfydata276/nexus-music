@@ -31,7 +31,6 @@ pub struct Installer {
 #[derive(Deserialize)]
 struct ApiRelease {
     tag_name: String,
-    html_url: String,
     #[serde(default)]
     assets: Vec<ApiAsset>,
 }
@@ -76,7 +75,10 @@ pub fn is_newer(candidate: &str, current: &str) -> bool {
     }
 }
 
-fn release_from(api: ApiRelease) -> Release {
+fn release_from(api: ApiRelease) -> Option<Release> {
+    let (major, minor, patch) = parse_version(&api.tag_name)?;
+    let version = format!("{major}.{minor}.{patch}");
+    let page = format!("https://github.com/{REPO}/releases/tag/v{version}");
     let installer = api
         .assets
         .into_iter()
@@ -90,7 +92,7 @@ fn release_from(api: ApiRelease) -> Release {
             name: asset.name,
             size: asset.size,
         });
-    Release { version: api.tag_name.trim_start_matches('v').to_string(), page: api.html_url, installer }
+    Some(Release { version, page, installer })
 }
 
 #[derive(Debug, PartialEq)]
@@ -188,7 +190,7 @@ fn check_at(agent: &ureq::Agent, source: Source<'_>, start: &str, budget: Durati
         return Err(CheckError::TimedOut);
     }
     let release = release_from(api.map_err(|_| CheckError::InvalidRelease)?);
-    Ok(is_newer(&release.version, env!("CARGO_PKG_VERSION")).then_some(release))
+    Ok(release.filter(|release| is_newer(&release.version, env!("CARGO_PKG_VERSION"))))
 }
 
 const NO_CHECKSUM: &str =
@@ -310,7 +312,7 @@ mod tests {
                  "digest":"sha256:ABCDEF"}]}"#,
         )
         .unwrap();
-        let release = release_from(api);
+        let release = release_from(api).unwrap();
         assert_eq!(release.version, "0.4.0");
         let installer = release.installer.unwrap();
         assert_eq!(installer.name, "NexusMusic-Setup-0.4.0.exe");

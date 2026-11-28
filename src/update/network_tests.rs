@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
-const RELEASE: &str = r#"{"tag_name":"v99.0.0","html_url":"https://releases.example/v99"}"#;
+const RELEASE: &str = r#"{"tag_name":"v99.0.0","html_url":"https://anything.example/"}"#;
 const BYTES: &str = "example installer";
 
 fn client(header_timeout: Duration) -> ureq::Agent {
@@ -125,7 +125,10 @@ fn api_same_origin_redirect_returns_the_release() {
         0 => redirect("/published"),
         _ => answer("200 OK", "", RELEASE),
     });
-    assert_eq!(api.check(Duration::from_secs(4)).unwrap().unwrap().version, "99.0.0");
+    let release = api.check(Duration::from_secs(4)).unwrap().unwrap();
+    assert_eq!(release.version, "99.0.0");
+    // This is the destination used by all three browser actions, even with a foreign html_url.
+    assert_eq!(release.page, format!("https://github.com/{REPO}/releases/tag/v99.0.0"));
     let log = api.requests.lock().unwrap();
     assert_eq!(log.len(), 2);
     for (request, path) in log.iter().zip(["/latest", "/published"]) {
