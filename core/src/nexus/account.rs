@@ -77,9 +77,15 @@ pub fn tidy_email(text: &str) -> Option<String> {
     Some(text.to_ascii_lowercase())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct Email(String);
+
+impl fmt::Debug for Email {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Email(..)")
+    }
+}
 
 impl Email {
     pub fn new(text: &str) -> Option<Self> {
@@ -91,9 +97,15 @@ impl Email {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct Name(String);
+
+impl fmt::Debug for Name {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Name(..)")
+    }
+}
 
 impl Name {
     // the design does not say whether blank names or controls are allowed.

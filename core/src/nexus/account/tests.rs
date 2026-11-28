@@ -1055,3 +1055,23 @@ fn a_code_typed_in_groups_reads_as_the_twelve() {
         assert!(OneTimeCode::typed(bad).is_none(), "{bad}");
     }
 }
+
+#[test]
+fn account_messages_redact_email_and_names_in_debug() {
+    let sign_in = signin(Credential::Password {
+        email: email(),
+        password: Password::new(PASSWORD).unwrap(),
+    });
+    let set_up = SetUp {
+        code: OneTimeCode::new(CODE).unwrap(),
+        email: email(),
+        name: Name::new("Example Person").unwrap(),
+        password: Password::new(PASSWORD).unwrap(),
+    };
+    let printed = format!("{sign_in:?} {set_up:?} {:?}", person());
+    for private in ["ada@example.org", "Ada's phone", "Example Person", "Ada", PASSWORD, CODE] {
+        assert!(!printed.contains(private));
+    }
+    assert!(printed.contains("Email(..)"));
+    assert!(printed.contains("Name(..)"));
+}
