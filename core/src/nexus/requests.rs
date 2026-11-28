@@ -25,6 +25,7 @@ use crate::offer::Offer;
 pub const REQUESTS: &str = "/nexus/api/requests";
 pub const PATHS: &[&str] = &[REQUESTS];
 /// The admin page sends this to the shared page ingress, not the app route.
+pub const ADMIN_REQUESTS: &str = "/nexus/api/admin/requests";
 pub const ADMIN_ATTRIBUTION: &str = "/nexus/api/admin/request-attribution";
 pub const CALL_MAX_BYTES: usize = wire::BODY_MAX_BYTES;
 pub const SMALL_REPLY_MAX_BYTES: usize = account::SMALL_REPLY_MAX_BYTES;

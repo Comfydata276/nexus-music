@@ -273,6 +273,7 @@ pub const ROUTES: &[Route] = &[
     // envelope's own ceiling, the read small.
     Route::new(admin::REQUEST_GRANT, "POST", account::PASSWORD_REQUEST_MAX_BYTES),
     Route::new(admin::SET_MUSIC_LOGIN, "POST", account::PASSWORD_REQUEST_MAX_BYTES),
+    Route::new(nexus_core::nexus::requests::ADMIN_REQUESTS, "POST", account::SMALL_REQUEST_MAX_BYTES),
     Route::new(nexus_core::nexus::requests::ADMIN_ATTRIBUTION, "POST", account::SMALL_REQUEST_MAX_BYTES),
     Route::new(admin::GET_LIDARR_SETTING, "POST", account::SMALL_REQUEST_MAX_BYTES),
     Route::new(admin::SET_LIDARR, "POST", account::PASSWORD_REQUEST_MAX_BYTES),

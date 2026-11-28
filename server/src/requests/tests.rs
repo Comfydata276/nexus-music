@@ -618,7 +618,8 @@ impl TestServer {
 
     fn call(&self, who: &Person, call: Call) -> Answer {
         let body = body(who.restore, call);
-        let (status, reply) = self.post(wire::REQUESTS, Some(&who.signed_in), &who.headers, &body);
+        let path = if who.headers.is_empty() { wire::REQUESTS } else { wire::ADMIN_REQUESTS };
+        let (status, reply) = self.post(path, Some(&who.signed_in), &who.headers, &body);
         match wire::read_reply(status, &reply).unwrap() {
             account::Reply::Done { result, .. } => result,
             refusal => panic!("requests not answered: {refusal:?}"),
@@ -1976,6 +1977,10 @@ fn only_an_admin_page_can_remove_another_accounts_placement() {
     server.configure(&page);
     let admin = server.admin_app(&page);
     let member = server.redeem(member, 2, "");
+    let pending = body(page.restore, Call::Pending { after: None });
+    assert_eq!(server.post(wire::REQUESTS, Some(&page.signed_in), TEST_PAGE, &pending).0, 403);
+    assert_eq!(server.post(wire::ADMIN_REQUESTS, Some(&admin.signed_in), TEST_PAGE, &pending).0, 403);
+    assert_eq!(server.post(wire::ADMIN_REQUESTS, Some(&page.signed_in), "", &pending).0, 400);
 
     let offer = server.offer(&member);
     let job = begun(server.call(&member, begin(1, Change::Request { offer })));

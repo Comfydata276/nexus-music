@@ -613,7 +613,8 @@ async fn answer(request: Request<Incoming>, length: usize, admitted: Admitted, c
     };
     // Requests may wait longer for an upstream search. Bound those answers
     // independently so a slow Lidarr cannot fill the listener's sign-in reserve.
-    let requests = shell.requests.is_some() && parts.uri.path() == nexus_core::nexus::requests::REQUESTS;
+    let requests = shell.requests.is_some() && matches!(parts.uri.path(),
+        nexus_core::nexus::requests::REQUESTS | nexus_core::nexus::requests::ADMIN_REQUESTS);
     let _place = if requests {
         match shell.request_answers.try_acquire() {
             Ok(place) => Some(place),

@@ -25,7 +25,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use axum::{Extension, Router};
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{OriginalUri, State};
 use axum::http::header::AUTHORIZATION;
 use axum::http::{HeaderMap, Response};
 use axum::routing::post;
@@ -260,6 +260,7 @@ impl Requests {
     pub(crate) fn router(self: &Arc<Self>, base: Router) -> Router {
         base.merge(Router::new()
             .route(wire::REQUESTS, post(call))
+            .route(wire::ADMIN_REQUESTS, post(call))
             .route(admin::SET_REQUESTS_ENABLED, post(set_requests_enabled))
             .route(admin::GET_LIDARR_SETTING, post(get_lidarr))
             .route(admin::SET_LIDARR, post(set_lidarr))
@@ -1318,11 +1319,15 @@ enum Dispatch {
 
 async fn call(
     State(service): State<Arc<Requests>>,
+    OriginalUri(uri): OriginalUri,
     caller: Option<Extension<Caller>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response<Body> {
-    if crate::admin::is_browser(&headers) && !crate::admin::browser_origin_allowed(&headers, service.origin.as_deref()) {
+    let page = uri.path() == wire::ADMIN_REQUESTS;
+    if (page || crate::admin::is_browser(&headers))
+        && !crate::admin::browser_origin_allowed(&headers, service.origin.as_deref())
+    {
         return events::respond(crate::accounts::session::refused(account::Refusal::Malformed));
     }
     let message = match wire::read_call(&body) {
@@ -1340,6 +1345,11 @@ async fn call(
     let for_finish = RequestHead { speaks: head.speaks, restore: head.restore };
     let state = service.clone();
     let result = service.shown(ingress.clone(), head, move |keeper, actor| {
+        if page && (!actor.admin_page || !matches!(message.call,
+            Call::Pending { .. } | Call::After { .. } | Call::Begin { change: Change::Cancel { .. }, .. }))
+        {
+            return Err(events::denied());
+        }
         Ok(state.dispatch(keeper, actor, message.call))
     }).await;
     match result {
