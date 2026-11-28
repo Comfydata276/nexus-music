@@ -13,8 +13,9 @@ import { PageStatus, IconButton } from "widgets.slint";
 import { Sidebar, TopBar, QueuePanel, PlayerBar, SearchOverlay } from "chrome.slint";
 import { StackPage, TrackListPage, GridPage, LyricsPage, NowPlayingPage, SettingsPage, LoginPage, NoMusicPage } from "pages.slint";
 import { MenuOverlay, PromptOverlay, ToastOverlay } from "overlays.slint";
+import { Listening, ListeningOverlay, RecentListen } from "listening.slint";
 
-export { Theme, App, View, Player, Menu, Prompt, Toast, Lyrics, Settings, Covers, Icons, Page, Track, Card, CardKind, Shelf, Offer, CardRow, PlaylistRef, MenuEntry, LyricLine, QualityOption, ThemeOption, Search, Suggestion, DeviceRow, BatchRequestLine }
+export { Theme, App, View, Player, Menu, Prompt, Toast, Lyrics, Settings, Covers, Icons, Page, Track, Card, CardKind, Shelf, Offer, CardRow, PlaylistRef, MenuEntry, LyricLine, QualityOption, ThemeOption, Search, Suggestion, DeviceRow, BatchRequestLine, Listening, RecentListen }
 
 // The icon in the notification area, shown while closing the window keeps the app running.
 export component Tray inherits SystemTrayIcon {
@@ -300,7 +301,7 @@ export component MainWindow inherits Window {
 
     keys := FocusScope {
         key-pressed(event) => {
-            if Prompt.open || !App.signed-in || App.show-sign-in {
+            if Listening.page != "" || Prompt.open || !App.signed-in || App.show-sign-in {
                 return reject;
             }
             // A menu that's open takes the arrow keys and Enter.
@@ -619,5 +620,7 @@ export component MainWindow inherits Window {
         if Prompt.open: prompt := PromptOverlay {
             init => { self.focus-input(); }
         }
+
+        if Listening.page != "": ListeningOverlay { }
     }
 }

@@ -2,6 +2,7 @@
 
 import { ScrollView, ListView, AboutSlint } from "std-widgets.slint";
 import { Theme } from "theme.slint";
+import { Listening } from "listening.slint";
 import { Icons } from "icons.slint";
 import { App, View, Player, Lyrics, Settings, Covers, Card, CardKind, Shelf, Offer, Page, QualityOption, ThemeOption, Track, DeviceRow } from "types.slint";
 import { Icon, IconButton, PlayButton, TextButton, LinkText, Cover, Field, Toggle, ChipRow, Segmented, Select, Slider, MediaCard, TrackRow, PageStatus, HoverIntent, SkeletonRows, ScrollThumb } from "widgets.slint";
@@ -1830,6 +1831,15 @@ component NexusAccount inherits VerticalLayout {
         }
     }
 
+    if App.nexus-signed-in: SettingRow {
+        title: "Your stats";
+        detail: "Recent plays and listening counts from your Nexus account on every device.";
+        TextButton {
+            text: "Show stats";
+            clicked => { Listening.show-stats(); }
+        }
+    }
+
     SettingRow {
         title: "Your devices";
         detail: Settings.devices-note != "" ? Settings.devices-note : "The PCs and phones signed in to your account. Signing one out ends its sign-in at once.";
@@ -2882,6 +2892,15 @@ export component SettingsPage inherits Rectangle {
                                 on: Settings.check-updates;
                                 label: "Check for updates automatically";
                                 toggled(on) => { Settings.set-check-updates(on); }
+                            }
+                        }
+
+                        if App.nexus-signed-in: SettingRow {
+                            title: "What this server records";
+                            detail: "See what the server keeps about listening, searches and app activity.";
+                            TextButton {
+                                text: "Read";
+                                clicked => { Listening.show-recording(); }
                             }
                         }
 
