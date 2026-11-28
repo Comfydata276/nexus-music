@@ -184,11 +184,23 @@ fn sign_in(keeper: &mut Keeper, account: u64, secret: u8, pass: u8, session: u8,
     Ok(signed.device.get())
 }
 
+/// The fingerprint of a one-time code as the data keeps it, found as S8 finds it: by the
+/// code typed, among the account's codes. None if the data has no such code (finding 11).
+fn stored_code(keeper: &Keeper, account: u64, code: u8) -> Option<Fingerprint> {
+    let typed = [code; SECRET_BYTES];
+    let found: Option<Vec<u8>> = keeper
+        .data()
+        .connection()
+        .query_row("SELECT code FROM codes WHERE account = ?1 AND code = ?2", rusqlite::params![account as i64, typed.as_slice()], |row| row.get(0))
+        .ok();
+    found.map(|bytes| Fingerprint::from_bytes(bytes.try_into().unwrap()))
+}
+
 /// A new account's person redeems the code they were given with the password they choose,
 /// in one step (8.5), and is signed in by it.
 fn first_password(keeper: &mut Keeper, account: u64, secret: u8, code: u8, pass: u8, session: u8, now: u64) -> Result<u64, Failed> {
     let vacant = keeper.vacant_device();
-    let code_fp = Fingerprint::from_bytes([code; SECRET_BYTES]);
+    let code_fp = stored_code(keeper, account, code).ok_or_else(|| Failed("no such code in the data".into()))?;
     let live = keeper.load(account)?.state().code.map_or(0, |code| code.number);
     let check = decide(keeper, account, now, &[], |turn| turn.check_code(&self::secret(secret), dev(vacant), live, code_fp.clone()))?.map_err(failed)?;
     let receipt = check.check(code_fp, keeper.clock(now)).map_err(failed)?;
@@ -275,6 +287,11 @@ fn reads(keeper: &mut Keeper, account: u64, device: u64, session: u8, now: u64) 
     matches!(loaded.request(restore, clock, |turn| turn.arrive(bearer(device, &held), Access::Read).map(|_| ())).apply(|_| Ok::<_, ()>(())), Ok(Ok(())))
 }
 
+/// When the data says a device was last heard from.
+fn last_heard(keeper: &Keeper, device: u64) -> Option<u64> {
+    keeper.data().connection().query_row("SELECT last_heard FROM devices WHERE id = ?1", [device as i64], |row| row.get::<_, Option<i64>>(0)).unwrap().map(|at| at as u64)
+}
+
 fn readers(keeper: &mut Keeper, ids: &Ids, now: u64) -> Vec<u8> {
     ids.sessions().into_iter().filter(|&(account, device, session)| reads(keeper, account, device, session, now)).map(|(_, _, session)| session).collect()
 }
@@ -298,7 +315,25 @@ fn settled(root: &Root, now: u64) -> (Keeper, Started) {
             match view.accounts.get(n) {
                 None => eprintln!("{n}: store only, {:?}", a.account.status),
                 Some(r) => {
-                    if r.account != a.account { eprintln!("{n}: state differs\n  store {:?}\n  data  {:?}", a.account, r.account); }
+                    // By number, and which of its parts differ: never the states themselves,
+                    // which hold the account's email (finding 12).
+                    if r.account != a.account {
+                        let (s, d) = (&a.account, &r.account);
+                        let differ: Vec<&str> = [
+                            ("life", s.life != d.life),
+                            ("status", s.status != d.status),
+                            ("passwords", s.password_changes != d.password_changes),
+                            ("reset", s.password_reset_required != d.password_reset_required),
+                            ("code", s.code != d.code),
+                            ("admin", s.admin != d.admin),
+                            ("music", s.music_login != d.music_login || s.music_recovery != d.music_recovery),
+                            ("revision", s.revision != d.revision),
+                        ]
+                        .into_iter()
+                        .filter_map(|(name, differs)| differs.then_some(name))
+                        .collect();
+                        eprintln!("{n}: state differs in {differ:?}");
+                    }
                     eprintln!("{n}: devices store {:?} data {:?}", a.devices.keys().collect::<Vec<_>>(), r.devices.keys().collect::<Vec<_>>());
                 }
             }
@@ -313,6 +348,8 @@ fn settled(root: &Root, now: u64) -> (Keeper, Started) {
 // ---- The child: one scenario, stopped or failed at the n-th point ----
 
 static POINTS: AtomicUsize = AtomicUsize::new(0);
+/// Points are counted only while this is set: a scenario may make its world first, uncut.
+static ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// Runs in a child process only (`X2_CHILD` names the scenario).
 #[test]
@@ -323,6 +360,9 @@ fn x2_child() {
     let (kill_at, fail_at) = (number("X2_KILL_AT"), number("X2_FAIL_AT"));
     let log = PathBuf::from(std::env::var("X2_POINTS").unwrap());
     crash::set(Box::new(move |name| {
+        if !ARMED.load(Ordering::SeqCst) {
+            return false;
+        }
         let n = POINTS.fetch_add(1, Ordering::SeqCst) + 1;
         use std::io::Write;
         let mut file = fs::OpenOptions::new().create(true).append(true).open(&log).unwrap();
@@ -370,8 +410,25 @@ fn run(scenario: &str, root: &Root) -> Result<(), String> {
         "an account deleted" => administer(&mut keeper(), &ids, AdminAction::DeleteAccount, BOB, &[], now).map_err(failed),
         "a password reset" => administer(&mut keeper(), &ids, AdminAction::ResetPassword, BOB, &[Change::Code { account: BOB, number: 2, code: &[45; 32], made_at: now, until: now + MINUTE }], now).map_err(failed),
         "a device heard from" => keeper().heard(ids.b1, now + 2 * MINUTE).map_err(failed),
+        "an event kept" => an_event(&mut keeper(), BOB, ids.b1, 3, now).map(|_| ()).map_err(failed),
+        "a large account made" => keeper().make_account("large@example.org", &"L".repeat(40 * 1024), false, None, now).map(|_| ()).map_err(failed),
         "an older copy found at a start" => Keeper::open(&root.state(), &root.data(), now).map(|(keeper, _)| keeper.close()).map_err(|why| why.0),
         "put-back" => keeper::put_back(&root.state(), &root.data(), &the_copy(root), now).map(|_| ()).map_err(|why| why.0),
+        "put-back with a reader" => {
+            // Erin made while another reader holds an older moment of the data: her step
+            // stays in the file SQLite writes ahead in, and the program stops with it there.
+            ARMED.store(false, Ordering::SeqCst);
+            let reader = rusqlite::Connection::open(data::place(&root.data())).unwrap();
+            reader.execute_batch("BEGIN").unwrap();
+            let _: i64 = reader.query_row("SELECT count(*) FROM accounts", [], |row| row.get(0)).unwrap();
+            let mut writer = keeper();
+            writer.make_account("erin@example.org", "Erin", false, None, now).unwrap();
+            drop(writer);
+            ARMED.store(true, Ordering::SeqCst);
+            let done = keeper::put_back(&root.state(), &root.data(), &the_copy(root), now).map(|_| ()).map_err(|why| why.0);
+            drop(reader);
+            done
+        }
         "take-as-is" => keeper::take_as_is(&root.state(), &root.data(), now).map(|_| ()).map_err(|why| why.0),
         "the nightly copy" => copies::nightly(&root.data(), now).map(|_| ()),
         "a change of form" => Data::open_with(&root.data(), now, &[data::MIGRATIONS[0], FORM_2]).map(|_| ()),
@@ -445,12 +502,14 @@ impl Cut {
 /// For every point `scenario` passes on a copy of `setup`: a child stopped there, then a start;
 /// `check` is given the start and where the cut fell. Then the run that is not cut.
 fn at_every_point(scenario: &str, setup: &Root, check: impl Fn(&Root, &Cut)) -> usize {
-    let dry = setup.copied(&format!("{}-dry", scenario.replace(' ', "-")));
+    // Named for the setup too: two tests may cut the same scenario at once.
+    let name = format!("{}-{}", setup.path.file_name().unwrap().to_string_lossy(), scenario.replace(' ', "-"));
+    let dry = setup.copied(&format!("{name}-dry"));
     let (points, ended) = child(scenario, &dry, 0, 0, None);
     assert!(ended, "{scenario}: the run that is not cut did not end by itself");
     assert!(!points.is_empty(), "{scenario}: passed no point");
     for at in 1..=points.len() {
-        let root = setup.copied(&format!("{}-{at}", scenario.replace(' ', "-")));
+        let root = setup.copied(&format!("{name}-{at}"));
         let (_, ended) = child(scenario, &root, at, 0, None);
         assert!(!ended, "{scenario}: not stopped at point {at} ({})", points[at - 1]);
         check(&root, &Cut { at, points: points.clone() });
@@ -536,20 +595,25 @@ fn a_change_under_leave_cut_at_any_point_holds_once_the_store_has_it() {
     };
     let changing = with_leave("leave-password", LeaveFor::ChangePassword);
     at_every_point("a password changed", &changing, |root, cut| {
-        let (mut keeper, _) = settled(root, T0 + 20 * MINUTE);
-        let read = readers(&mut keeper, &ids, T0 + 21 * MINUTE);
+        // Within the grant's life (granted at T0 + 4 minutes, for LEAVE_MS).
+        let (mut keeper, _) = settled(root, T0 + 6 * MINUTE);
+        let read = readers(&mut keeper, &ids, T0 + 6 * MINUTE);
         let alice = state(&mut keeper, ALICE).unwrap();
         if cut.took() || cut.whole() {
             // Her other device is signed out, and the old password never works again.
             assert!(!read.contains(&3), "{read:?} at {}", cut.at);
             assert_eq!(alice.password_changes, 2, "at {}", cut.at);
-            assert!(sign_in(&mut keeper, ALICE, 13, 12, 8, T0 + 21 * MINUTE).is_err(), "the old password signed in at {}", cut.at);
+            assert!(sign_in(&mut keeper, ALICE, 13, 12, 8, T0 + 6 * MINUTE).is_err(), "the old password signed in at {}", cut.at);
+            // The grant was spent: tried again while it would still be live, it is refused.
+            let (held, chosen) = (fp(1), password(15));
+            let again = decide(&mut keeper, ALICE, T0 + 6 * MINUTE, &[Change::Password { account: ALICE, password: Some(&chosen) }], |turn| turn.change_password(bearer(ids.a1, &held)));
+            assert!(!matches!(again, Ok(Ok(()))), "at {}: a spent grant changed the password again", cut.at);
         } else {
             assert_eq!((alice.password_changes, read.contains(&3)), (1, true), "at {}", cut.at);
         }
         if cut.whole() {
             assert!(read.contains(&1));
-            sign_in(&mut keeper, ALICE, 13, 14, 8, T0 + 21 * MINUTE).unwrap();
+            sign_in(&mut keeper, ALICE, 13, 14, 8, T0 + 6 * MINUTE).unwrap();
         }
     });
     let deleting = with_leave("leave-history", LeaveFor::DeleteHistory);
@@ -580,6 +644,10 @@ fn what_the_admin_takes_away_cut_at_any_point_holds_once_the_store_has_it() {
             assert_eq!(read.contains(&5), !done, "{scenario}: {read:?} at {}", cut.at);
             assert!(read.contains(&1) && read.contains(&3), "{scenario}: {read:?}");
             if done {
+                // The grant was spent: the same action again, while it would still be live,
+                // is refused (finding 11).
+                let again = administer(&mut keeper, &ids, action.clone(), BOB, &[], T0 + 6 * MINUTE);
+                assert!(again.is_err(), "{scenario} at {}: a spent grant was used again", cut.at);
                 match scenario {
                     "an account switched off" => assert_eq!(bob.map(|bob| bob.status), Some(Status::Off)),
                     "an account deleted" => assert_eq!(keeper.account_named(email(BOB)).unwrap(), None, "at {}", cut.at),
@@ -597,9 +665,15 @@ fn what_the_admin_takes_away_cut_at_any_point_holds_once_the_store_has_it() {
 fn a_change_the_data_alone_has_cut_at_any_point_leaves_both_agreeing() {
     let setup = Root::new("heard");
     let ids = world(&setup);
-    at_every_point("a device heard from", &setup, |root, _| {
+    at_every_point("a device heard from", &setup, |root, cut| {
         let (mut keeper, _) = settled(root, T0 + 20 * MINUTE);
         assert_eq!(readers(&mut keeper, &ids, T0 + 21 * MINUTE), [30, 1, 3, 5]);
+        // The step itself, in the data: all of it or none (finding 11).
+        let heard = last_heard(&keeper, ids.b1);
+        assert!(heard.is_none() || heard == Some(T0 + 7 * MINUTE), "at {}: {heard:?}", cut.at);
+        if cut.whole() || cut.points[..cut.at].iter().any(|point| point == "data: committed") {
+            assert_eq!(heard, Some(T0 + 7 * MINUTE), "at {}", cut.at);
+        }
     });
 }
 
@@ -623,7 +697,7 @@ fn an_older_copy_found_at_a_start_cut_at_any_point_is_restored_once_under_one_nu
 }
 
 #[test]
-fn a_put_back_cut_at_any_point_is_refused_until_run_again_and_then_done_once() {
+fn a_put_back_cut_at_any_point_is_finished_by_the_next_start_or_begun_again_and_done_once() {
     let setup = Root::new("putback");
     let ids = world(&setup);
     copies::nightly(&setup.data(), T0 + 2 * MINUTE).unwrap();
@@ -635,16 +709,15 @@ fn a_put_back_cut_at_any_point_is_refused_until_run_again_and_then_done_once() {
     }
     at_every_point("put-back", &setup, |root, cut| {
         let now = T0 + 20 * MINUTE;
+        // 12.4: the next start finishes a put-back whose plan reached the store; one cut
+        // before that changed nothing, and the owner runs it again.
         match unlocked(|| Keeper::open(&root.state(), &root.data(), now)) {
             Ok((keeper, _)) if keeper.restore() == 0 => {
                 keeper.close();
                 unlocked(|| keeper::put_back(&root.state(), &root.data(), &the_copy(root), now)).unwrap();
             }
             Ok((keeper, _)) => keeper.close(),
-            Err(why) => {
-                assert!(why.0.contains("put-back was cut off"), "at {}: {why}", cut.at);
-                unlocked(|| keeper::put_back(&root.state(), &root.data(), &the_copy(root), now)).unwrap();
-            }
+            Err(why) => panic!("at {}: {why}", cut.at),
         }
         let (mut keeper, _) = settled(root, now);
         assert_eq!(keeper.restore(), 1, "at {}", cut.at);
@@ -666,9 +739,10 @@ fn taking_the_data_as_it_is_cut_at_any_point_ends_up_taken_once() {
         let (mut keeper, _) = settled(root, now);
         assert_eq!(keeper.restore(), 1, "at {}", cut.at);
         assert_eq!(readers(&mut keeper, &ids, now), Vec::<u8>::new(), "at {}", cut.at);
-        // 12.4: without the store nothing says which passwords changed since, so every account
-        // waits for a new one-time code (C3r's `RestoreMode::Adopt`); the old one never works.
-        assert!(sign_in(&mut keeper, ALICE, 11, 12, 8, now).is_err(), "at {}", cut.at);
+        // With the store lost nothing says which passwords changed since: every account
+        // waits for a new one-time code (12.4), and no verifier of the data's is left.
+        assert!(sign_in(&mut keeper, ALICE, 11, 12, 8, now).is_err(), "at {}: the old password signed in", cut.at);
+        assert_eq!(count(&keeper, "SELECT count(*) FROM accounts WHERE number >= ?1 AND password IS NOT NULL", 1), 0, "at {}", cut.at);
         assert!(state(&mut keeper, ALICE).unwrap().password_reset_required, "at {}", cut.at);
     });
 }
@@ -821,6 +895,9 @@ fn what_was_taken_away_since_a_copy_is_taken_away_again_when_it_is_put_back() {
                 let code = Fingerprint::from_bytes([44; SECRET_BYTES]);
                 let answer = decide(&mut keeper, carol, now, &[], |turn| turn.check_code(&secret(51), dev(vacant), 0, code.clone())).unwrap();
                 assert!(answer.is_err(), "a used code was taken again");
+                // And the copy's code itself is gone from the data (finding 11).
+                assert!(stored_code(&keeper, carol, 44).is_none(), "the used code's fingerprint is back in the data");
+                assert!(first_password(&mut keeper, carol, 51, 44, 52, 53, now).is_err());
             }
             _ => assert!(bob.unwrap().history_held, "listening data deleted since is held"),
         }
@@ -838,10 +915,12 @@ fn a_change_the_data_alone_has_is_seen_once_the_store_has_its_mark() {
     let copy = snapshot(&root, &["nexus.db"]);
     let mut keeper = opened(&root, T0 + 2 * MINUTE);
     keeper.heard(ids.b1, T0 + 2 * MINUTE).unwrap();
+    assert_eq!(last_heard(&keeper, ids.b1), Some(T0 + 2 * MINUTE), "the step was not written");
     keeper.close();
     put_by_hand(&root, &copy);
     let (keeper, started) = settled(&root, T0 + 3 * MINUTE);
     assert!(matches!(started, Started::Restored { .. }), "{started:?}");
+    assert_eq!(last_heard(&keeper, ids.b1), None, "the copy is from before it");
     keeper.close();
     // Within the minute, the store has not heard: the same age to the comparison. The design
     // gives that case to a device's stamp (12.4).
@@ -853,9 +932,33 @@ fn a_change_the_data_alone_has_is_seen_once_the_store_has_its_mark() {
     let copy = snapshot(&root, &["nexus.db"]);
     let mut keeper = opened(&root, T0 + 2 * MINUTE + 10_000);
     keeper.heard(ids.b1, T0 + 2 * MINUTE + 10_000).unwrap();
-    keeper.close();
+    // Stopped as a kill would, before the minute was out: the store has not heard.
+    drop(keeper);
     put_by_hand(&root, &copy);
     assert_eq!(settled(&root, T0 + 3 * MINUTE).1, Started::Ready);
+}
+
+/// Finding 6: in idle time the one thread that writes gives the store the mark once its
+/// minute is out, though nothing else is asked; a kill after that cannot hide the change.
+#[test]
+fn the_last_change_the_data_alone_has_is_marked_in_idle_time() {
+    let root = Root::new("mark-idle");
+    let ids = world(&root);
+    let mut keeper = opened(&root, T0 + 2 * MINUTE);
+    keeper.heard(ids.b1, T0 + 2 * MINUTE).unwrap();
+    keeper.close();
+    let copy = snapshot(&root, &["nexus.db"]);
+    let mut keeper = opened(&root, T0 + 2 * MINUTE + 10_000);
+    keeper.heard(ids.b1, T0 + 2 * MINUTE + 10_000).unwrap();
+    let due = keeper.mark_due().expect("a mark is due");
+    keeper.idle(due - 1).unwrap();
+    assert_eq!(keeper.mark_due(), Some(due), "written before its minute was out");
+    keeper.idle(due).unwrap();
+    assert_eq!(keeper.mark_due(), None);
+    drop(keeper);
+    put_by_hand(&root, &copy);
+    let (_, started) = settled(&root, T0 + 7 * 24 * 60 * MINUTE);
+    assert!(matches!(started, Started::Restored { .. }), "{started:?}");
 }
 
 #[test]
@@ -1043,7 +1146,9 @@ fn a_clock_set_back_between_runs_reopens_nothing_and_stops_no_copy() {
     let ids = world(&root);
     // Bob's session, last used at T0, is ended 90 days on (8.7); a start can make it look up to
     // an hour younger than it is (when it was last used is written at most once an hour).
-    let late = T0 + SESSION_MS + 60 * MINUTE;
+    // (The world was made by a backend just started, whose clock is the store's plus a
+    // minute: Bob signed in at T0 and a minute.)
+    let late = T0 + MINUTE + SESSION_MS + 60 * MINUTE;
     {
         // Asked at that time, and what the decision did kept (the ending, and the time).
         let mut keeper = opened(&root, late);
@@ -1055,7 +1160,9 @@ fn a_clock_set_back_between_runs_reopens_nothing_and_stops_no_copy() {
     // The clock set back a day, and the program started again: it is not reopened.
     let back = late - 24 * 60 * MINUTE;
     let mut keeper = opened(&root, back);
-    assert_eq!(keeper.clock(back).effective(), late);
+    // The store's time, plus the minute it may lag by (the ruling of 13:59): never less.
+    let effective = keeper.clock(back).effective();
+    assert!((late..=late + MINUTE).contains(&effective), "{effective}");
     assert!(!reads(&mut keeper, BOB, ids.b1, 5, back), "a time that had passed came back");
     keeper.close();
     copies::nightly(&root.data(), late).unwrap();
@@ -1089,8 +1196,35 @@ fn a_full_store_folder_at_each_write_fails_that_step_and_leaves_both_agreeing() 
             let (mut keeper, _) = settled(&root, T0 + 20 * MINUTE);
             let read = readers(&mut keeper, &ids, T0 + 21 * MINUTE);
             assert!(read.contains(&5) && read.contains(&30), "{scenario} at {at}: {read:?}");
+            // What the step was for (finding 11): a failed step never gives; what it takes
+            // away is taken once the store's first write of it was in place.
+            let cut = Cut { at, points: points.clone() };
+            match *scenario {
+                // Given only once the store's last write of it is in place (its answer, not
+                // given, never reaches the device).
+                "signing in" => assert_eq!(read.contains(&7), cut.gave(), "{scenario} failing at {at}: {read:?}"),
+                "signing out" => assert_eq!(read.contains(&1), !cut.took(), "{scenario} failing at {at}: {read:?}"),
+                "forcing out" => assert_eq!(read.contains(&3), !cut.took(), "{scenario} failing at {at}: {read:?}"),
+                _ => {}
+            }
         }
     }
+}
+
+#[test]
+fn a_full_data_disk_fails_a_real_transaction_and_leaves_nothing_half_done() {
+    // Room for the file SQLite shares between connections (32 KiB) and no more: the step that
+    // makes an account with a 40 KiB name to show cannot be written ahead, and fails as on a
+    // full disk; the backend says so, and nothing of it is kept (finding 11).
+    let setup = Root::new("full-data-real");
+    let ids = world(&setup);
+    let (_, _) = child("a large account made", &setup, 0, 0, Some(64));
+    let outcome = fs::read_to_string(setup.path.join("outcome")).unwrap_or_else(|_| "(no outcome)".into());
+    assert!(outcome.starts_with("Err") && outcome.contains("The data couldn't be written"), "{outcome}");
+    let (mut keeper, _) = settled(&setup, T0 + 20 * MINUTE);
+    assert_eq!(keeper.account_named("large@example.org").unwrap(), None);
+    assert_eq!(readers(&mut keeper, &ids, T0 + 21 * MINUTE), [30, 1, 3, 5]);
+    keeper.close();
 }
 
 #[test]
@@ -1113,8 +1247,8 @@ fn a_full_data_disk_fails_writes_and_leaves_nothing_half_done() {
 }
 
 #[test]
-fn opening_and_reading_the_data_writes_nothing() {
-    let root = Root::new("read-only");
+fn opening_and_reading_writes_neither_store() {
+    let root = Root::new("reading");
     let ids = world(&root);
     let mut keeper = opened(&root, T0 + 5 * MINUTE);
     let _ = readers(&mut keeper, &ids, T0 + 5 * MINUTE);
@@ -1124,4 +1258,503 @@ fn opening_and_reading_the_data_writes_nothing() {
     opened(&root, T0 + 5 * MINUTE).close();
     assert_eq!(fs::read(apart::place(&root.state())).unwrap(), store);
     assert_eq!(fs::read(data::place(&root.data())).unwrap(), data_bytes);
+}
+
+// ---- The review of S3 (S3b): each finding as a case that fails without its fix ----
+
+fn store_of(root: &Root) -> apart::Store {
+    match apart::read(&root.state()) {
+        apart::Reading::Found(store) => store,
+        other => panic!("the store can't be read: {other:?}"),
+    }
+}
+
+fn count(keeper: &Keeper, sql: &str, account: u64) -> i64 {
+    keeper.data().connection().query_row(sql, [account as i64], |row| row.get(0)).unwrap()
+}
+
+#[cfg(unix)]
+fn mode(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path).unwrap_or_else(|why| panic!("{}: {why}", path.display())).permissions().mode() & 0o777
+}
+
+/// Finding 8: the data, its copies and the files SQLite writes beside it are the owner's
+/// alone from the moment they are made, whatever the umask; files made wider before are
+/// tightened at the start.
+#[cfg(unix)]
+#[test]
+fn the_data_and_its_copies_are_the_owners_alone_from_creation() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = Root::new("private");
+    let ids = world(&root);
+    let keeper = opened(&root, T0 + MINUTE);
+    for file in [data::FILE, "nexus.db-wal", "nexus.db-shm", "lock"] {
+        assert_eq!(mode(&root.data().join(file)), 0o600, "{file} while serving");
+    }
+    for file in [apart::FILE, "lock"] {
+        assert_eq!(mode(&root.state().join(file)), 0o600, "{file}");
+    }
+    keeper.close();
+    let copy = copies::nightly(&root.data(), T0 + 2 * MINUTE).unwrap();
+    assert_eq!(mode(&copy.path), 0o600, "the nightly copy");
+    assert_eq!(mode(&copies::folder(&root.data())), 0o700, "the copies' folder");
+    // Made wider by an older program, or by hand: tightened before anything is served.
+    fs::set_permissions(data::place(&root.data()), fs::Permissions::from_mode(0o644)).unwrap();
+    fs::set_permissions(&copy.path, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::set_permissions(copies::folder(&root.data()), fs::Permissions::from_mode(0o755)).unwrap();
+    let mut keeper = opened(&root, T0 + 3 * MINUTE);
+    assert_eq!(mode(&data::place(&root.data())), 0o600);
+    assert_eq!(mode(&copy.path), 0o600);
+    assert_eq!(mode(&copies::folder(&root.data())), 0o700);
+    assert_eq!(readers(&mut keeper, &ids, T0 + 3 * MINUTE), [30, 1, 3, 5]);
+    keeper.close();
+    // A put-back's copy of the data it replaced, too.
+    unlocked(|| keeper::put_back(&root.state(), &root.data(), &copy.path, T0 + 4 * MINUTE)).unwrap();
+    for entry in fs::read_dir(copies::folder(&root.data())).unwrap().flatten() {
+        assert_eq!(mode(&entry.path()), 0o600, "{:?}", entry.file_name());
+    }
+    assert_eq!(mode(&data::place(&root.data())), 0o600, "the data put back");
+}
+
+/// Finding 12: what the design keeps out of logs is not in a change's `Debug`.
+#[test]
+fn a_changes_debug_holds_no_code_name_or_email() {
+    let root = Root::new("debug");
+    world(&root);
+    let mut keeper = opened(&root, T0 + MINUTE);
+    let rows = keeper.load(ALICE).unwrap().rows();
+    let state = rows.account.clone();
+    let code = [0xab; 32];
+    let pass = password(0xcd);
+    let changes = [
+        Change::Account { number: ALICE, shown: "Alice Made-Up", state: &state },
+        Change::Install { number: ALICE, rows: &rows, at: T0 },
+        Change::Describe { device: 7, name: "Alice's made-up phone", kind: "phone", version: "9.9" },
+        Change::Code { account: ALICE, number: 0, code: &code, made_at: T0, until: T0 + 1 },
+        Change::Password { account: ALICE, password: Some(&pass) },
+    ];
+    let shown = format!("{changes:?}");
+    for secret in ["alice", "Alice", "171", "ab, ab", "abab", "205", "cdcd"] {
+        assert!(!shown.contains(secret), "{secret} in {shown}");
+    }
+    keeper.close();
+}
+
+/// Finding 7: one clock. A step the data alone keeps, at a time far on, does not leave the
+/// running backend at one time and a restarted one at another.
+#[test]
+fn a_data_only_step_far_on_gives_the_same_clock_before_and_after_a_restart() {
+    let root = Root::new("one-clock");
+    let ids = world(&root);
+    let far = T0 + SESSION_MS + MINUTE;
+    let back = T0 + 2 * MINUTE;
+    let mut keeper = opened(&root, T0 + MINUTE);
+    keeper.heard(ids.a1, far).unwrap();
+    // The clock put right without a restart: Bob's session last used at T0.
+    let (clock, before) = (keeper.clock(back).effective(), reads(&mut keeper, BOB, ids.b1, 5, back));
+    assert!(clock < far, "a step the data alone keeps moved the clock");
+    keeper.close();
+    let mut keeper = opened(&root, back);
+    let (again, after) = (keeper.clock(back).effective(), reads(&mut keeper, BOB, ids.b1, 5, back));
+    assert_eq!(before, after, "the answer before a restart and after it");
+    // After a restart the clock is the store's plus the minute it may lag by: never behind
+    // the running backend's, never the data's far time.
+    assert!(again >= clock && again <= clock + MINUTE && again < far, "{clock} then {again}");
+    keeper.close();
+}
+
+/// Finding 6: the data-change mark reaches the store in idle time, and when the backend
+/// stops, not only when something else is written a minute later.
+#[test]
+fn the_last_change_the_data_alone_has_is_marked_when_the_backend_stops() {
+    let root = Root::new("mark-stop");
+    let ids = world(&root);
+    let mut keeper = opened(&root, T0 + 2 * MINUTE);
+    keeper.heard(ids.b1, T0 + 2 * MINUTE).unwrap();
+    keeper.close();
+    let copy = snapshot(&root, &["nexus.db"]);
+    let mut keeper = opened(&root, T0 + 2 * MINUTE + 10_000);
+    keeper.heard(ids.b1, T0 + 2 * MINUTE + 10_000).unwrap();
+    // Nothing more is asked; a week later the backend is stopped.
+    keeper.close();
+    put_by_hand(&root, &copy);
+    let (_, started) = settled(&root, T0 + 7 * 24 * 60 * MINUTE);
+    assert!(matches!(started, Started::Restored { .. }), "{started:?}");
+}
+
+/// Finding 10: the store is never published at a size its reader refuses.
+#[test]
+fn the_store_is_never_written_larger_than_it_can_be_read() {
+    let root = Root::new("store-bound");
+    world(&root);
+    let mut big = store_of(&root);
+    let template = big.accounts[&ALICE].clone();
+    let before = fs::read(apart::place(&root.state())).unwrap();
+    for number in 10..80_000 {
+        let mut tombstone = template.clone();
+        tombstone.apart.account.status = Status::Deleted;
+        big.accounts.insert(number, tombstone);
+    }
+    big.next_account = 80_000;
+    assert!(apart::write(&root.state(), &big).is_err(), "a store too large to read back was written");
+    assert_eq!(fs::read(apart::place(&root.state())).unwrap(), before);
+    assert!(matches!(apart::read(&root.state()), apart::Reading::Found(_)));
+}
+
+/// Finding 1, 12.4: with the store lost, taking the data as it is leaves every account
+/// waiting for a new one-time code: no password and no code the data held still works.
+#[test]
+fn with_the_store_lost_no_old_password_or_code_works_after_taking_the_data() {
+    let root = Root::new("recovery-fence");
+    let ids = world(&root);
+    let mut keeper = opened(&root, T0 + MINUTE);
+    let carol = keeper.make_account("carol@example.org", "Carol", false, Some((&[44; 32], T0 + 60 * MINUTE)), T0 + MINUTE).unwrap();
+    keeper.close();
+    fs::remove_file(apart::place(&root.state())).unwrap();
+    unlocked(|| keeper::take_as_is(&root.state(), &root.data(), T0 + 2 * MINUTE)).unwrap();
+    let (mut keeper, _) = settled(&root, T0 + 3 * MINUTE);
+    let now = T0 + 3 * MINUTE;
+    assert!(sign_in(&mut keeper, ALICE, 11, 12, 8, now).is_err(), "the old password signed in");
+    assert!(sign_in(&mut keeper, ROOT, 31, 32, 8, now).is_err(), "the admin's old password signed in");
+    let vacant = keeper.vacant_device();
+    let code = Fingerprint::from_bytes([44; SECRET_BYTES]);
+    assert!(decide(&mut keeper, carol, now, &[], |turn| turn.check_code(&secret(51), dev(vacant), 0, code.clone())).unwrap().is_err(), "the old code was taken");
+    for account in [ROOT, ALICE, BOB, carol] {
+        assert_eq!(count(&keeper, "SELECT count(*) FROM codes WHERE account = ?1", account), 0, "{account}'s codes");
+        assert_eq!(count(&keeper, "SELECT count(*) FROM accounts WHERE number = ?1 AND password IS NOT NULL", account), 0, "{account}'s verifier");
+        assert!(state(&mut keeper, account).unwrap().password_reset_required);
+    }
+    assert_eq!(readers(&mut keeper, &ids, now), Vec::<u8>::new());
+}
+
+/// Finding 1: when a readable store of this backend remains, what it says was taken away is
+/// kept when the data is taken as it is (here: the id file lost, and a copy from before an
+/// account was deleted put back by hand).
+#[test]
+fn a_readable_store_of_this_backend_keeps_what_it_took_away_when_the_data_is_taken() {
+    let root = Root::new("recovery-keeps");
+    let ids = world(&root);
+    let copy = snapshot(&root, &["nexus.db"]);
+    let seal = store_of(&root).seal_key();
+    {
+        let mut keeper = opened(&root, T0 + 4 * MINUTE);
+        let purpose = admin_leave(&mut keeper, AdminAction::DeleteAccount, BOB);
+        leave(&mut keeper, ROOT, ids.root, 30, 32, purpose, T0 + 4 * MINUTE).unwrap();
+        administer(&mut keeper, &ids, AdminAction::DeleteAccount, BOB, &[], T0 + 4 * MINUTE).unwrap();
+        keeper.close();
+    }
+    fs::remove_file(root.state().join(identity::FILE)).unwrap();
+    put_by_hand(&root, &copy);
+    unlocked(|| keeper::take_as_is(&root.state(), &root.data(), T0 + 5 * MINUTE)).unwrap();
+    let (mut keeper, _) = settled(&root, T0 + 6 * MINUTE);
+    assert_eq!(keeper.account_named(email(BOB)).unwrap(), None, "the deleted account came back");
+    assert_eq!(keeper.seal_key(), seal);
+    // And the final kept's adoption makes every account wait for a new one-time code even
+    // so (the stricter reading: a readable store does not say the data's verifiers are its).
+    assert!(sign_in(&mut keeper, ALICE, 11, 12, 8, T0 + 6 * MINUTE).is_err());
+    assert!(state(&mut keeper, ALICE).unwrap().password_reset_required);
+}
+
+/// Finding 2: taking the data as it is, cut at any point, never loses a readable store's
+/// authority (its sealing key, its tombstones).
+#[test]
+fn taking_the_data_with_a_readable_store_cut_at_any_point_keeps_that_store() {
+    let setup = Root::new("take-readable");
+    let ids = world(&setup);
+    let seal = store_of(&setup).seal_key();
+    {
+        let mut keeper = opened(&setup, T0 + 4 * MINUTE);
+        let purpose = admin_leave(&mut keeper, AdminAction::DeleteAccount, BOB);
+        leave(&mut keeper, ROOT, ids.root, 30, 32, purpose, T0 + 4 * MINUTE).unwrap();
+        administer(&mut keeper, &ids, AdminAction::DeleteAccount, BOB, &[], T0 + 4 * MINUTE).unwrap();
+        keeper.close();
+    }
+    fs::remove_file(setup.state().join(identity::FILE)).unwrap();
+    at_every_point("take-as-is", &setup, |root, cut| {
+        let now = T0 + 20 * MINUTE;
+        if unlocked(|| Keeper::open(&root.state(), &root.data(), now)).map(|(keeper, _)| keeper.close()).is_err() {
+            unlocked(|| keeper::take_as_is(&root.state(), &root.data(), now)).unwrap_or_else(|why| panic!("at {}: {why}", cut.at));
+        }
+        let (keeper, _) = settled(root, now);
+        assert_eq!(keeper.seal_key(), seal, "at {}: the readable store's key was lost", cut.at);
+        assert_eq!(keeper.account_named(email(BOB)).unwrap(), None, "at {}", cut.at);
+        keeper.close();
+    });
+}
+
+/// Finding 3: a copy put back is checked, and its restore planned, before anything is
+/// changed: one the store cannot take is refused with nothing changed.
+#[test]
+fn a_copy_that_cannot_be_put_back_is_refused_before_anything_is_changed() {
+    let root = Root::new("put-back-checked");
+    world(&root);
+    // A copy at a restore number this store never gave.
+    let ahead = root.copied("put-back-checked-ahead");
+    let nightly = copies::nightly(&ahead.data(), T0 + MINUTE).unwrap();
+    unlocked(|| keeper::put_back(&ahead.state(), &ahead.data(), &nightly.path, T0 + 2 * MINUTE)).unwrap();
+    let ahead_copy = copies::nightly(&ahead.data(), T0 + 3 * MINUTE).unwrap();
+    // A copy with an account this store never made.
+    let other = root.copied("put-back-checked-unknown");
+    opened(&other, T0 + MINUTE).make_account("dave@example.org", "Dave", false, None, T0 + MINUTE).unwrap();
+    let unknown_copy = copies::nightly(&other.data(), T0 + 2 * MINUTE).unwrap();
+    for copy in [&ahead_copy.path, &unknown_copy.path] {
+        let store = fs::read(apart::place(&root.state())).unwrap();
+        let live = fs::read(data::place(&root.data())).unwrap();
+        let why = unlocked(|| keeper::put_back(&root.state(), &root.data(), copy, T0 + 4 * MINUTE)).err().expect("put back");
+        assert!(why.0.contains("Nothing was changed"), "{why}");
+        assert_eq!(fs::read(apart::place(&root.state())).unwrap(), store);
+        assert_eq!(fs::read(data::place(&root.data())).unwrap(), live);
+        assert_eq!(settled(&root, T0 + 5 * MINUTE).1, Started::Ready);
+    }
+}
+
+/// Finding 4: a put-back cut at any point and run again moves the restore number and each
+/// device's number once.
+#[test]
+fn a_put_back_cut_and_run_again_moves_the_numbers_once() {
+    let setup = Root::new("putback-again");
+    let ids = world(&setup);
+    copies::nightly(&setup.data(), T0 + 2 * MINUTE).unwrap();
+    let device = store_of(&setup).accounts[&ALICE].apart.devices[&dev(ids.a1)].number;
+    at_every_point("put-back", &setup, |root, cut| {
+        let now = T0 + 20 * MINUTE;
+        if !cut.whole() {
+            unlocked(|| keeper::put_back(&root.state(), &root.data(), &the_copy(root), now)).unwrap_or_else(|why| panic!("at {}: {why}", cut.at));
+        }
+        let (keeper, _) = settled(root, now);
+        assert_eq!(keeper.restore(), 1, "at {}", cut.at);
+        keeper.close();
+        assert_eq!(store_of(root).accounts[&ALICE].apart.devices[&dev(ids.a1)].number, device + 1, "at {}", cut.at);
+    });
+}
+
+/// Finding 5: the data a put-back replaces is kept whole, as one checked file, even with
+/// committed steps SQLite could not fold back (another reader held them) and a cut anywhere.
+#[test]
+fn the_data_a_put_back_replaces_is_kept_whole_at_any_cut() {
+    let setup = Root::new("putback-keeps");
+    world(&setup);
+    copies::nightly(&setup.data(), T0 + 2 * MINUTE).unwrap();
+    at_every_point("put-back with a reader", &setup, |root, cut| {
+        let now = T0 + 20 * MINUTE;
+        if !cut.whole() {
+            unlocked(|| keeper::put_back(&root.state(), &root.data(), &the_copy(root), now)).unwrap_or_else(|why| panic!("at {}: {why}", cut.at));
+        }
+        settled(root, now).0.close();
+        let kept: Vec<PathBuf> = fs::read_dir(copies::folder(&root.data()))
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.file_name().unwrap().to_string_lossy().starts_with("replaced-") && path.extension().is_some_and(|e| e == "db"))
+            .collect();
+        assert!(!kept.is_empty(), "at {}: nothing kept", cut.at);
+        for path in kept {
+            let connection = data::open_to_read(&path, "the data replaced").unwrap_or_else(|why| panic!("at {}: {why}", cut.at));
+            let erin: i64 = connection.query_row("SELECT count(*) FROM accounts WHERE email = 'erin@example.org'", [], |row| row.get(0)).unwrap();
+            assert_eq!(erin, 1, "at {}: {} lacks the last step", cut.at, path.display());
+        }
+    });
+}
+
+/// Finding 9: a start refuses another backend's data before changing a byte of it.
+#[test]
+fn another_backends_copy_at_the_datas_place_is_refused_with_nothing_changed() {
+    let one = Root::new("foreign-one");
+    let other = Root::new("foreign-other");
+    world(&one);
+    world(&other);
+    let copy = copies::nightly(&other.data(), T0 + 5 * MINUTE).unwrap();
+    for file in [data::FILE, "nexus.db-wal", "nexus.db-shm"] {
+        let _ = fs::remove_file(one.data().join(file));
+    }
+    fs::copy(&copy.path, data::place(&one.data())).unwrap();
+    let names = |root: &Root| {
+        let mut names: Vec<String> = fs::read_dir(root.data()).unwrap().flatten().map(|entry| entry.file_name().into_string().unwrap()).collect();
+        names.sort();
+        names
+    };
+    let (bytes, before) = (fs::read(data::place(&one.data())).unwrap(), names(&one));
+    let why = unlocked(|| Keeper::open(&one.state(), &one.data(), T0 + 6 * MINUTE)).err().unwrap();
+    assert!(why.0.contains("another backend's"), "{why}");
+    assert_eq!(fs::read(data::place(&one.data())).unwrap(), bytes, "the foreign file was changed");
+    assert_eq!(names(&one), before);
+}
+
+// ---- Other slices' rows through the one writer (S12/S7, S9) ----
+
+/// A listening event for `account` on `device`, as S12 keeps one, through the one writer.
+fn an_event(keeper: &mut Keeper, account: u64, device: u64, n: u8, now: u64) -> Result<bool, Failed> {
+    keeper.write_data(now, |tx| {
+        let id = format!("{n:032x}");
+        let added = tx.execute(
+            "INSERT OR IGNORE INTO listening_events (account, device, event_id, at_ms, is_start, line) VALUES (?1, ?2, ?3, ?4, 1, 'a made-up track')",
+            rusqlite::params![account as i64, device as i64, id, now as i64],
+        )?;
+        Ok((added > 0, added > 0))
+    })
+}
+
+fn events(keeper: &Keeper, account: u64) -> i64 {
+    count(keeper, "SELECT count(*) FROM listening_events WHERE account = ?1", account)
+}
+
+#[test]
+fn another_slices_step_through_the_one_writer_is_counted_or_kept_not_at_all() {
+    let root = Root::new("write-data");
+    let ids = world(&root);
+    let mut keeper = opened(&root, T0 + 2 * MINUTE);
+    let before = keeper.data().meta().unwrap();
+    // Changed: counted, written at the store's time (a far clock moves nothing), all of it.
+    let far = T0 + 400 * 24 * 60 * MINUTE;
+    assert!(an_event(&mut keeper, BOB, ids.b1, 1, far).unwrap());
+    let after = keeper.data().meta().unwrap();
+    assert_eq!(after.changes, before.changes + 1);
+    assert!(after.written_at < far, "a data-only step moved the data's time");
+    assert!(keeper.clock(T0 + 2 * MINUTE).effective() < far, "a data-only step moved the clock");
+    // Not changed: nothing kept, nothing counted.
+    assert!(!an_event(&mut keeper, BOB, ids.b1, 1, T0 + 3 * MINUTE).unwrap());
+    assert_eq!(keeper.data().meta().unwrap().changes, after.changes);
+    // A step that fails part-way keeps none of it.
+    let failed = keeper.write_data(T0 + 3 * MINUTE, |tx| {
+        tx.execute("INSERT INTO listening_events (account, device, event_id, at_ms, is_start, line) VALUES (?1, 1, ?2, 1, 1, 'x')", rusqlite::params![BOB as i64, format!("{:032x}", 2)])?;
+        tx.execute("INSERT INTO listening_events (account, device, event_id, at_ms, is_start, line) VALUES (999, 1, 'too short', 1, 1, 'x')", [])?;
+        Ok(((), true))
+    });
+    assert!(failed.is_err());
+    assert_eq!(events(&keeper, BOB), 1);
+    assert_eq!(count(&keeper, "SELECT starts FROM listening_totals WHERE account = ?1", BOB), 1);
+    keeper.close();
+}
+
+#[test]
+fn an_event_kept_after_a_copy_shows_the_copy_older_once_idle_time_gives_the_mark() {
+    // Findings 6 and 7, for another slice's rows.
+    let root = Root::new("write-data-mark");
+    let ids = world(&root);
+    let mut keeper = opened(&root, T0 + 2 * MINUTE);
+    keeper.heard(ids.b1, T0 + 2 * MINUTE).unwrap();
+    keeper.close();
+    let copy = snapshot(&root, &["nexus.db"]);
+    let mut keeper = opened(&root, T0 + 2 * MINUTE + 10_000);
+    an_event(&mut keeper, BOB, ids.b1, 7, T0 + 2 * MINUTE + 10_000).unwrap();
+    let due = keeper.mark_due().expect("the step is not yet marked");
+    keeper.idle(due).unwrap();
+    drop(keeper);
+    put_by_hand(&root, &copy);
+    let (keeper, started) = settled(&root, T0 + 9 * MINUTE);
+    assert!(matches!(started, Started::Restored { .. }), "{started:?}");
+    assert_eq!(events(&keeper, BOB), 0);
+}
+
+#[test]
+fn an_events_step_cut_at_any_point_is_kept_whole_or_not_at_all() {
+    let setup = Root::new("event-cut");
+    let ids = world(&setup);
+    at_every_point("an event kept", &setup, |root, cut| {
+        let (keeper, _) = settled(root, T0 + 20 * MINUTE);
+        let (kept, totals) = (events(&keeper, BOB), count(&keeper, "SELECT coalesce(sum(starts), 0) FROM listening_totals WHERE account = ?1", BOB));
+        assert_eq!(kept, totals, "at {}: the count and the events disagree", cut.at);
+        if cut.whole() || cut.points[..cut.at].iter().any(|point| point == "data: committed") {
+            assert_eq!(kept, 1, "at {}", cut.at);
+        }
+        let _ = ids;
+    });
+}
+
+#[test]
+fn deleting_listening_data_takes_the_events_in_its_own_step_and_a_put_back_holds_them() {
+    let root = Root::new("events-life");
+    let ids = world(&root);
+    let mut keeper = opened(&root, T0 + 2 * MINUTE);
+    for n in 0..3 {
+        an_event(&mut keeper, BOB, ids.b1, n, T0 + 2 * MINUTE).unwrap();
+    }
+    an_event(&mut keeper, ALICE, ids.a1, 9, T0 + 2 * MINUTE).unwrap();
+    keeper.close();
+    let copy = snapshot(&root, &["nexus.db"]);
+    let mut keeper = opened(&root, T0 + 3 * MINUTE);
+    leave(&mut keeper, BOB, ids.b1, 5, 22, LeaveFor::DeleteHistory, T0 + 3 * MINUTE).unwrap();
+    let held = fp(5);
+    decide(&mut keeper, BOB, T0 + 3 * MINUTE, &[], |turn| turn.delete_history(bearer(ids.b1, &held))).unwrap().unwrap();
+    assert_eq!((events(&keeper, BOB), events(&keeper, ALICE)), (0, 1), "the events and the life moved in one step");
+    assert_eq!(count(&keeper, "SELECT count(*) FROM listening_totals WHERE account = ?1", BOB), 0);
+    keeper.close();
+    // The copy from before holds them again: held, not served, until Bob answers (12.5).
+    put_by_hand(&root, &copy);
+    let (mut keeper, _) = settled(&root, T0 + 4 * MINUTE);
+    assert!(state(&mut keeper, BOB).unwrap().history_held);
+    assert_eq!(events(&keeper, BOB), 3, "held, not deleted, by the restore");
+}
+
+#[test]
+fn diagnostics_past_their_age_go_in_idle_time_a_bounded_number_at_a_time() {
+    let root = Root::new("diag-age");
+    let ids = world(&root);
+    let mut keeper = opened(&root, T0 + 2 * MINUTE);
+    let now = T0 + 2 * MINUTE;
+    keeper
+        .write_data(now, |tx| {
+            for n in 0..(keeper::EXPIRED_PER_IDLE + 3) {
+                tx.execute(
+                    "INSERT INTO diagnostic_reports (account, device, restore, request_id, received_ms, text) VALUES (?1, ?2, 0, ?3, ?4, 'a made-up report')",
+                    rusqlite::params![BOB as i64, ids.b1 as i64, n.to_be_bytes().as_slice(), n],
+                )?;
+            }
+            tx.execute(
+                "INSERT INTO diagnostic_reports (account, device, restore, request_id, received_ms, text) VALUES (?1, ?2, 0, ?3, ?4, 'a recent one')",
+                rusqlite::params![BOB as i64, ids.b1 as i64, (-1i64).to_be_bytes().as_slice(), now as i64],
+            )?;
+            Ok(((), true))
+        })
+        .unwrap();
+    let reports = |keeper: &Keeper| count(keeper, "SELECT count(*) FROM diagnostic_reports WHERE account = ?1", BOB);
+    keeper.idle(now).unwrap();
+    assert_eq!(reports(&keeper), 4, "at most EXPIRED_PER_IDLE go at once");
+    keeper.idle(now).unwrap();
+    assert_eq!(reports(&keeper), 1, "the recent one stays");
+    keeper.close();
+}
+
+#[test]
+fn a_music_login_is_kept_only_with_its_own_account_count_and_where_it_was_checked() {
+    use nexus_core::nexus::account::{MusicAddress, Name};
+    use nexus_core::nexus::kept::{DataChange, Effects, Update};
+    use nexus_core::nexus::music::{CredentialBinding, MusicInstallation, SealedCredential};
+    let root = Root::new("music-login");
+    world(&root);
+    let mut keeper = opened(&root, T0 + 2 * MINUTE);
+    let loaded = keeper.load(ALICE).unwrap();
+    let (mut rows, mut apart) = (loaded.rows(), loaded.apart());
+    rows.account.music_login = 1;
+    apart.account.music_login = 1;
+    let install = |account: u64, count: u64| MusicInstallation {
+        binding: CredentialBinding {
+            backend: keeper.backend(),
+            account: AccountId::new(account).unwrap(),
+            address: MusicAddress::new("https://music.example.org").unwrap(),
+            name: Name::new("alice").unwrap(),
+            count,
+        },
+        sealed: SealedCredential::from_bytes(&[7; 64]).unwrap(),
+    };
+    let effects = |install: MusicInstallation| Effects {
+        high_water: keeper.clock(T0 + 2 * MINUTE).effective(),
+        updates: vec![Update { apart_first: apart.clone(), data: rows.clone(), change: DataChange::InstallMusicLogin(install), music: None, apart_last: apart.clone() }],
+    };
+    let checked = [Change::MusicChecked { account: ALICE, internal: "http://navidrome:4533" }];
+    let logins = |keeper: &Keeper| count(keeper, "SELECT count(*) FROM music_logins WHERE account = ?1", ALICE);
+    let (wrong_account, wrong_count, right) = (effects(install(BOB, 1)), effects(install(ALICE, 2)), effects(install(ALICE, 1)));
+    assert!(keeper.persist(&wrong_account, &checked, T0 + 2 * MINUTE).is_err(), "sealed for another account");
+    assert!(keeper.persist(&wrong_count, &checked, T0 + 2 * MINUTE).is_err(), "sealed under another count");
+    assert!(keeper.persist(&right, &[], T0 + 2 * MINUTE).is_err(), "with no address it was checked at");
+    assert_eq!(logins(&keeper), 0, "nothing was kept by a refused one");
+    assert_eq!(state(&mut keeper, ALICE).unwrap().music_login, 0);
+    keeper.persist(&right, &checked, T0 + 2 * MINUTE).unwrap();
+    assert_eq!(logins(&keeper), 1);
+    let (count_kept, internal): (i64, String) =
+        keeper.data().connection().query_row("SELECT count, internal FROM music_logins WHERE account = ?1", [ALICE as i64], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+    assert_eq!((count_kept, internal.as_str()), (1, "http://navidrome:4533"));
+    assert_eq!(state(&mut keeper, ALICE).unwrap().music_login, 1);
+    keeper.close();
 }

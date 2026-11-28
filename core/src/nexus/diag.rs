@@ -14,7 +14,7 @@ use super::events::{LossCounts, TIME_MAX_MS};
 use super::proto::Version;
 use super::wire::{self, BadMessage, Fields, WireBody};
 
-pub use super::events::{Fault, FaultPlace, FaultShape, Wrong};
+pub use super::events::{FaultShape, Wrong};
 
 pub const MAX_ENTRIES: usize = 200;
 pub const MAX_LINE_CHARS: usize = 300;
@@ -185,6 +185,7 @@ pub struct About {
     pub local_permission: Option<bool>,
     pub android_auto: Option<bool>,
     pub loss: LossCounts,
+    pub pc: Option<PcDetails>,
 }
 
 macro_rules! words {
@@ -202,6 +203,274 @@ macro_rules! words {
             }
         }
     };
+}
+
+/// Known app source files. The display spelling is a basename, never an input path.
+macro_rules! source_files {
+    ($($kind:ident => $relative:literal, $basename:literal;)+) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum SourceFile {
+            $($kind,)+
+            Other,
+        }
+
+        impl SourceFile {
+            /// Rust can supply a relative app path or an absolute path under the app's
+            /// compile-time project root. A dependency is outside that root.
+            pub fn from_location(path: &str, app_root: &str) -> Self {
+                let path = path.replace('\\', "/");
+                let root = app_root.replace('\\', "/");
+                let relative = path.strip_prefix(root.trim_end_matches('/'))
+                    .and_then(|suffix| suffix.strip_prefix('/'))
+                    .unwrap_or(&path);
+                match relative {
+                    $($relative => Self::$kind,)+
+                    _ => Self::Other,
+                }
+            }
+
+            fn text(self) -> &'static str {
+                match self {
+                    $(Self::$kind => $basename,)+
+                    Self::Other => "other",
+                }
+            }
+
+            fn read(text: &str) -> Option<Self> {
+                match text {
+                    $($basename => Some(Self::$kind),)+
+                    "other" => Some(Self::Other),
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
+source_files! {
+    Actions => "src/actions.rs", "actions.rs";
+    Added => "src/added.rs", "added.rs";
+    Asked => "src/asked.rs", "asked.rs";
+    Dsp => "src/audio/dsp.rs", "dsp.rs";
+    Engine => "src/audio/engine.rs", "engine.rs";
+    Exclusive => "src/audio/exclusive.rs", "exclusive.rs";
+    Mod => "src/audio/mod.rs", "mod.rs";
+    Source => "src/audio/source.rs", "source.rs";
+    Bulk => "src/bulk.rs", "bulk.rs";
+    Config => "src/config.rs", "config.rs";
+    Controller => "src/controller.rs", "controller.rs";
+    Corehttp => "src/corehttp.rs", "corehttp.rs";
+    Covers => "src/covers.rs", "covers.rs";
+    Tests => "src/diagnostics/tests.rs", "tests.rs";
+    Diagnostics => "src/diagnostics.rs", "diagnostics.rs";
+    Discover => "src/discover.rs", "discover.rs";
+    Downloads => "src/downloads.rs", "downloads.rs";
+    Frame => "src/frame.rs", "frame.rs";
+    Gate => "src/gate.rs", "gate.rs";
+    Import => "src/import.rs", "import.rs";
+    Instance => "src/instance.rs", "instance.rs";
+    Jam => "src/jam.rs", "jam.rs";
+    Keep => "src/keep.rs", "keep.rs";
+    Lidarr => "src/lidarr.rs", "lidarr.rs";
+    Link => "src/link.rs", "link.rs";
+    Listenbrainz => "src/listenbrainz.rs", "listenbrainz.rs";
+    Lyrics => "src/lyrics.rs", "lyrics.rs";
+    Main => "src/main.rs", "main.rs";
+    Media => "src/media.rs", "media.rs";
+    Mixes => "src/mixes.rs", "mixes.rs";
+    Musicbrainz => "src/musicbrainz.rs", "musicbrainz.rs";
+    Nexus => "src/nexus.rs", "nexus.rs";
+    Offline => "src/offline.rs", "offline.rs";
+    Pages => "src/pages.rs", "pages.rs";
+    Picker => "src/picker.rs", "picker.rs";
+    Meanwhile => "src/pins/meanwhile.rs", "meanwhile.rs";
+    Pins => "src/pins.rs", "pins.rs";
+    Playback => "src/playback.rs", "playback.rs";
+    Playlists => "src/playlists.rs", "playlists.rs";
+    Plays => "src/plays.rs", "plays.rs";
+    Pool => "src/pool.rs", "pool.rs";
+    Saver => "src/saver.rs", "saver.rs";
+    Search => "src/search.rs", "search.rs";
+    Songcache => "src/songcache.rs", "songcache.rs";
+    Subsonic => "src/subsonic.rs", "subsonic.rs";
+    Sync => "src/sync.rs", "sync.rs";
+    Taskbar => "src/taskbar.rs", "taskbar.rs";
+    NetworkTests => "src/update/network_tests.rs", "network_tests.rs";
+    Update => "src/update.rs", "update.rs";
+    Ways => "src/ways.rs", "ways.rs";
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Source {
+    pub file: SourceFile,
+    pub line: u32,
+}
+
+/// Diagnostics can locate a panic within the app. Journal faults keep their original
+/// shape and wire format in the events module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fault {
+    pub place: FaultPlace,
+    pub shape: FaultShape,
+    pub source: Option<Source>,
+}
+
+impl Fault {
+    pub const fn new(place: FaultPlace, shape: FaultShape) -> Self {
+        Self { place, shape, source: None }
+    }
+}
+
+/// The output the audio engine actually obtained. Device names and error text
+/// are never part of this type.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SoundOutput {
+    #[default]
+    Unknown,
+    WaitingForExclusive,
+    Shared { rate_hz: u32 },
+    Exclusive { rate_hz: u32, bits: u32 },
+    ExclusiveRefused { rate_hz: u32 },
+    NoDevice,
+}
+
+impl fmt::Display for SoundOutput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::Unknown => f.write_str("unknown"),
+            Self::WaitingForExclusive => f.write_str("waiting for exclusive playback"),
+            Self::Shared { rate_hz } => write!(f, "shared at {rate_hz} Hz"),
+            Self::Exclusive { rate_hz, bits } => write!(f, "exclusive at {rate_hz} Hz, {bits} bit"),
+            Self::ExclusiveRefused { rate_hz } => write!(f, "exclusive refused, shared at {rate_hz} Hz"),
+            Self::NoDevice => f.write_str("no device"),
+        }
+    }
+}
+
+impl SoundOutput {
+    fn read(text: &str) -> Option<Self> {
+        if let Some(rate) = text.strip_prefix("shared at ") {
+            return Some(Self::Shared { rate_hz: number(rate.strip_suffix(" Hz")?)? });
+        }
+        if let Some(exclusive) = text.strip_prefix("exclusive at ") {
+            let (rate, bits) = exclusive.split_once(" Hz, ")?;
+            return Some(Self::Exclusive { rate_hz: number(rate)?, bits: number(bits.strip_suffix(" bit")?)? });
+        }
+        if let Some(rate) = text.strip_prefix("exclusive refused, shared at ") {
+            return Some(Self::ExclusiveRefused { rate_hz: number(rate.strip_suffix(" Hz")?)? });
+        }
+        match text {
+            "unknown" => Some(Self::Unknown),
+            "waiting for exclusive playback" => Some(Self::WaitingForExclusive),
+            "no device" => Some(Self::NoDevice),
+            _ => None,
+        }
+    }
+}
+
+words!(Level { Quiet => "quiet", Normal => "normal", Loud => "loud" });
+words!(LevelBy { Automatic => "automatic", Song => "song", Album => "album" });
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PcDetails {
+    pub music_version: Option<Version>,
+    pub unreachable: bool,
+    pub output: SoundOutput,
+    pub exclusive: bool,
+    pub bitrate_kbps: u32,
+    pub gapless: bool,
+    pub crossfade_ms: u32,
+    pub levelling: Option<(Level, LevelBy)>,
+    pub equaliser: bool,
+    pub mono: bool,
+    pub cache_limit_mb: u32,
+    pub sharing: bool,
+    pub requests: bool,
+    pub library_songs: u64,
+    pub downloads: u64,
+    pub pending: u64,
+}
+
+fn on_off(on: bool) -> &'static str {
+    if on { "on" } else { "off" }
+}
+
+fn read_on_off(value: &str) -> Option<bool> {
+    match value { "on" => Some(true), "off" => Some(false), _ => None }
+}
+
+const MUSIC_VERSION: &str = "Music server version: ";
+
+impl PcDetails {
+    fn write(self, text: &mut String) -> fmt::Result {
+        write!(text, "\n{MUSIC_VERSION}")?;
+        match self.music_version {
+            Some(version) => write!(text, "{version}")?,
+            None => text.push_str("unknown"),
+        }
+        let level = self.levelling.map(|(level, mode)| (level.text(), mode.text()));
+        write!(text,
+            "\nMusic server out of reach: {}\nSound output: {}\nExclusive mode: {}, streaming limit: {} kbps\nGapless: {}, crossfade: {} ms\nLevelling: {}",
+            yes(self.unreachable), self.output, on_off(self.exclusive), self.bitrate_kbps,
+            on_off(self.gapless), self.crossfade_ms, level.map_or("off", |(level, _)| level),
+        )?;
+        if let Some((_, mode)) = level {
+            write!(text, " by {mode}")?;
+        }
+        write!(text,
+            "\nEqualiser: {}, mono: {}\nCache limit: {} MB\nDevice sharing: {}, requests: {}\nLibrary songs: {}, downloaded songs: {}, changes waiting: {}",
+            on_off(self.equaliser), on_off(self.mono), self.cache_limit_mb, on_off(self.sharing),
+            on_off(self.requests), self.library_songs, self.downloads, self.pending,
+        )
+    }
+
+    fn read<'a>(lines: &mut impl Iterator<Item = &'a str>) -> Option<Self> {
+        let mut field = |prefix| lines.next()?.strip_prefix(prefix);
+        let music_version = match field(MUSIC_VERSION)? {
+            "unknown" => None,
+            value => Some(Version::parse(value)?),
+        };
+        let unreachable = read_yes(field("Music server out of reach: ")?)?;
+        let output = SoundOutput::read(field("Sound output: ")?)?;
+        let (exclusive, bitrate) = field("Exclusive mode: ")?.split_once(", streaming limit: ")?;
+        let (gapless, crossfade) = field("Gapless: ")?.split_once(", crossfade: ")?;
+        let levelling = match field("Levelling: ")? {
+            "off" => None,
+            value => {
+                let (level, mode) = value.split_once(" by ")?;
+                Some((Level::read(level)?, LevelBy::read(mode)?))
+            }
+        };
+        let (equaliser, mono) = field("Equaliser: ")?.split_once(", mono: ")?;
+        let cache = field("Cache limit: ")?.strip_suffix(" MB")?;
+        let (sharing, requests) = field("Device sharing: ")?.split_once(", requests: ")?;
+        let (songs, remaining) = field("Library songs: ")?.split_once(", downloaded songs: ")?;
+        let (downloads, pending) = remaining.split_once(", changes waiting: ")?;
+        Some(Self {
+            music_version, unreachable, output, levelling,
+            exclusive: read_on_off(exclusive)?,
+            bitrate_kbps: number(bitrate.strip_suffix(" kbps")?)?,
+            gapless: read_on_off(gapless)?,
+            crossfade_ms: number(crossfade.strip_suffix(" ms")?)?,
+            equaliser: read_on_off(equaliser)?,
+            mono: read_on_off(mono)?,
+            cache_limit_mb: number(cache)?,
+            sharing: read_on_off(sharing)?,
+            requests: read_on_off(requests)?,
+            library_songs: decimal(songs)?,
+            downloads: decimal(downloads)?,
+            pending: decimal(pending)?,
+        })
+    }
+}
+
+/// A numeric triplet, optionally followed by Navidrome's parenthesized build label.
+/// The label is discarded, including when it was filled with private text.
+pub fn music_version(value: &str) -> Option<Version> {
+    let version = value.strip_suffix(')')
+        .and_then(|value| value.split_once(" ("))
+        .map_or(value, |(version, _)| version);
+    Version::parse(version)
 }
 
 words!(Reach {
@@ -303,17 +572,18 @@ pub enum Line {
 // The design does not say a timing observation's range. Cap it at one hour.
 pub const MAX_FOREGROUND_MS: u32 = 60 * 60 * 1000;
 
-const PLACES: &[(FaultPlace, &str)] = &[
-    (FaultPlace::Playback, "playback"),
-    (FaultPlace::AudioOutput, "audio output"),
-    (FaultPlace::Library, "library"),
-    (FaultPlace::Downloads, "downloads"),
-    (FaultPlace::Foreground, "foreground"),
-    (FaultPlace::MusicServer, "music server"),
-    (FaultPlace::NexusServer, "Nexus server"),
-    (FaultPlace::Journal, "journal"),
-    (FaultPlace::App, "app"),
-];
+words!(FaultPlace {
+    Playback => "playback",
+    AudioOutput => "audio output",
+    Library => "library",
+    Downloads => "downloads",
+    Foreground => "foreground",
+    MusicServer => "music server",
+    NexusServer => "Nexus server",
+    Journal => "journal",
+    Updates => "updates",
+    App => "app",
+});
 
 const SHAPES: &[(FaultShape, &str)] = &[
     (FaultShape::NameLookup, "name lookup"),
@@ -393,12 +663,13 @@ impl fmt::Display for Line {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Note(note) => f.write_str(note.text()),
-            Self::Fault(fault) => write!(
-                f,
-                "Fault in {}: {}",
-                label(PLACES, fault.place),
-                label(SHAPES, fault.shape)
-            ),
+            Self::Fault(fault) => {
+                write!(f, "Fault in {}: {}", fault.place.text(), label(SHAPES, fault.shape))?;
+                if let Some(source) = fault.source {
+                    write!(f, " at {}:{}", source.file.text(), source.line)?;
+                }
+                Ok(())
+            }
             Self::SessionEnded(why) => write!(f, "Nexus session ended: {}", why.text()),
             Self::ForegroundAfterMs(ms) => write!(f, "Foreground entered after {ms} ms"),
             Self::DownloadJobStopped(reason) => {
@@ -417,9 +688,17 @@ impl Line {
         }
         if let Some(fault) = text.strip_prefix("Fault in ") {
             let (place, shape) = fault.split_once(": ")?;
+            let (shape, source) = match shape.split_once(" at ") {
+                Some((shape, source)) => {
+                    let (file, line) = source.split_once(':')?;
+                    (shape, Some(Source { file: SourceFile::read(file)?, line: number(line)? }))
+                }
+                None => (shape, None),
+            };
             return Some(Self::Fault(Fault {
-                place: word(PLACES, place)?,
+                place: FaultPlace::read(place)?,
                 shape: word(SHAPES, shape)?,
+                source,
             }));
         }
         if let Some(why) = text.strip_prefix("Nexus session ended: ") {
@@ -651,10 +930,20 @@ impl Report {
         {
             return Err(Wrong::Field);
         }
-        write!(text,
-            "Nexus Music {} on {device} (OS {})\nSigned in: {}\nHTTPS: {}\nOffline: {}\nLocal network permission: {}\nAndroid Auto: {}\n{LINE_FULL}{}\n{FILES_FULL}{}\n{REFUSED_FOR_GOOD}{}\n\n{HEADING}",
-            a.version, a.os, yes(a.signed_in), yes(a.https), yes(a.offline), maybe(a.local_permission), maybe(a.android_auto), a.loss.line_full, a.loss.files_full, a.loss.refused,
-        ).map_err(|_| Wrong::Form)?;
+        if a.device == DeviceKind::Phone && a.pc.is_some() {
+            return Err(Wrong::Field);
+        }
+        write!(text, "Nexus Music {} on {device} (OS {})\nSigned in: {}\nHTTPS: {}\nOffline: {}",
+            a.version, a.os, yes(a.signed_in), yes(a.https), yes(a.offline)).map_err(|_| Wrong::Form)?;
+        if a.device == DeviceKind::Phone {
+            write!(text, "\nLocal network permission: {}\nAndroid Auto: {}",
+                maybe(a.local_permission), maybe(a.android_auto)).map_err(|_| Wrong::Form)?;
+        }
+        if let Some(pc) = a.pc {
+            pc.write(&mut text).map_err(|_| Wrong::Form)?;
+        }
+        write!(text, "\n{LINE_FULL}{}\n{FILES_FULL}{}\n{REFUSED_FOR_GOOD}{}\n\n{HEADING}",
+            a.loss.line_full, a.loss.files_full, a.loss.refused).map_err(|_| Wrong::Form)?;
         if self.record.entries.is_empty() {
             write!(text, "\n{EMPTY}").map_err(|_| Wrong::Form)?;
         }
@@ -694,27 +983,35 @@ impl Report {
     }
 
     fn parse(text: &str) -> Option<Self> {
-        let mut lines = text.split('\n');
-        let (version, rest) = lines
-            .next()?
-            .strip_prefix("Nexus Music ")?
-            .split_once(" on ")?;
+        let mut lines = text.split('\n').peekable();
+        let (version, rest) = lines.next()?.strip_prefix("Nexus Music ")?.split_once(" on ")?;
         let (device, os) = rest.strip_suffix(')')?.split_once(" (OS ")?;
+        let device = match device {
+            "PC" => DeviceKind::Pc,
+            "phone" => DeviceKind::Phone,
+            _ => return None,
+        };
+        let signed_in = read_yes(lines.next()?.strip_prefix("Signed in: ")?)?;
+        let https = read_yes(lines.next()?.strip_prefix("HTTPS: ")?)?;
+        let offline = read_yes(lines.next()?.strip_prefix("Offline: ")?)?;
+        let (local_permission, android_auto) = if device == DeviceKind::Phone {
+            (
+                read_maybe(lines.next()?.strip_prefix("Local network permission: ")?)?,
+                read_maybe(lines.next()?.strip_prefix("Android Auto: ")?)?,
+            )
+        } else {
+            (None, None)
+        };
+        let pc = if device == DeviceKind::Pc && lines.peek()?.starts_with(MUSIC_VERSION) {
+            Some(PcDetails::read(&mut lines)?)
+        } else {
+            None
+        };
         let about = About {
             version: Version::parse(version)?,
-            device: match device {
-                "PC" => DeviceKind::Pc,
-                "phone" => DeviceKind::Phone,
-                _ => return None,
-            },
+            device,
             os: Version::parse(os)?,
-            signed_in: read_yes(lines.next()?.strip_prefix("Signed in: ")?)?,
-            https: read_yes(lines.next()?.strip_prefix("HTTPS: ")?)?,
-            offline: read_yes(lines.next()?.strip_prefix("Offline: ")?)?,
-            local_permission: read_maybe(
-                lines.next()?.strip_prefix("Local network permission: ")?,
-            )?,
-            android_auto: read_maybe(lines.next()?.strip_prefix("Android Auto: ")?)?,
+            signed_in, https, offline, local_permission, android_auto, pc,
             loss: LossCounts {
                 line_full: decimal(lines.next()?.strip_prefix(LINE_FULL)?)?,
                 files_full: decimal(lines.next()?.strip_prefix(FILES_FULL)?)?,
