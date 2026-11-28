@@ -199,7 +199,7 @@ mod tests {
         let login = account::SignIn {
             credential: account::Credential::Password {
                 email: account::Email::new("sample@example.test").unwrap(),
-                password: account::Password::new("example administrator password").unwrap(),
+                password: account::Password::presented("example administrator password").unwrap(),
             },
             device_secret: account::DeviceSecret::from_bytes([0x42; account::SECRET_BYTES]),
             device_name: account::Name::new("Nexus admin browser").unwrap(),
