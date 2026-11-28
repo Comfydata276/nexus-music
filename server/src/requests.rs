@@ -1307,6 +1307,7 @@ fn binding(endpoint: &Endpoint) -> [u8; 32] {
 struct Credential {
     revision: u64,
     key: admin::LidarrKey,
+    check_stamp: [u8; 32],
 }
 
 enum Dispatch {
@@ -2765,7 +2766,9 @@ fn credential(keeper: &mut Keeper, endpoint: &Endpoint) -> Result<Option<Credent
     let saved = keeper.lidarr(Some(&endpoint.address)).map_err(|_| Refusal::NotDealtWith)?;
     let (Some(binding), Some(sealed)) = (saved.binding, saved.sealed) else { return Ok(None) };
     let sealing = admin::LidarrSealingKey::new(keeper.seal_key());
-    Ok(sealing.open(&binding, &sealed).map(|key| Credential { revision: binding.revision, key }))
+    Ok(sealing.open(&binding, &sealed).map(|key| Credential {
+        revision: binding.revision, key, check_stamp: sealed.check_stamp(),
+    }))
 }
 
 fn admin_reply<T: admin::ResultBody>(answer: Result<T, admin::Refusal>) -> Response<Body> {
@@ -2894,12 +2897,15 @@ async fn get_lidarr(
     let address = service.accounts.lidarr.clone();
     let configured = service.accounts.desk.ask(move |keeper| {
         admin_actor(keeper, &request.head, &ingress, clock())?;
-        let configured = match endpoint {
-            None => false,
-            Some(endpoint) => credential(keeper, &endpoint).map(|key| key.is_some())
-                .map_err(|_| admin::Refusal::NotDealtWith)?,
+        let key = match endpoint {
+            None => None,
+            Some(endpoint) => credential(keeper, &endpoint).map_err(|_| admin::Refusal::NotDealtWith)?,
         };
-        Ok(admin::LidarrSetting { address, configured })
+        let checked = match &key {
+            Some(key) => keeper.data().lidarr_checked(&key.check_stamp).map_err(|_| admin::Refusal::NotDealtWith)?,
+            None => false,
+        };
+        Ok(admin::LidarrSetting { address, configured: key.is_some(), checked })
     }).await.unwrap_or(Err(admin::Refusal::Busy { retry_after_seconds: account::Wait::new(1) }));
     admin_reply(configured)
 }
@@ -2963,7 +2969,7 @@ async fn save_lidarr_key(
         let grant = GrantUse { request_id: request.request_id, secret: &request.grant };
         let bearer = Bearer { device, hash: &ingress.hash, grant: Some(grant) };
         actor.request(request.head.restore, keeper.clock(now), |turn| {
-            turn.install_lidarr(bearer, authorized, &binding, &request.change.key, &sealing, *nonce)
+            turn.install_lidarr(bearer, authorized, &binding, &request.change.key, check, &sealing, *nonce)
         }).apply(|effects| keeper.persist(effects, &[], now))
             .map_err(|_| admin::Refusal::NotDealtWith)?
             .map_err(admin_said)?;

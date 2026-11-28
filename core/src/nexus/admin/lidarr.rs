@@ -164,6 +164,12 @@ impl SealedLidarrKey {
             .then(|| Self(bytes.to_vec()))
     }
 
+    /// An identifier for this exact seal, which already binds the address and
+    /// revision. A new seal at a reused revision has a different identifier.
+    pub fn check_stamp(&self) -> [u8; 32] {
+        Sha256::digest(&self.0).into()
+    }
+
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }

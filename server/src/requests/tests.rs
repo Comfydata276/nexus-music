@@ -658,6 +658,17 @@ impl TestServer {
         admin::read_reply(status, &body).unwrap()
     }
 
+    fn lidarr_setting(&self, page: &Person) -> admin::LidarrSetting {
+        let body = admin::encode(&admin::GetLidarrSetting {
+            head: RequestHead { speaks: SPEAKS, restore: page.restore },
+        }).unwrap();
+        let (status, response) = self.post(admin::GET_LIDARR_SETTING, Some(&page.signed_in), TEST_PAGE, body.bytes());
+        let admin::Reply::Done(setting) = admin::read_reply(status, &response).unwrap() else {
+            panic!("the page could not read Lidarr's setting");
+        };
+        setting
+    }
+
     fn configure(&self, page: &Person) -> admin::LidarrKeyCheck {
         let admin::Reply::Done(issued) =
             self.grant(page, TEST_PAGE, admin::Action::SetLidarr(key_change(TEST_KEY)), 100)
@@ -913,7 +924,8 @@ fn a_request_works_after_upgrading_the_deployed_form() {
     keeper.close();
 
     let db = Connection::open(root.join("data/nexus.db")).unwrap();
-    db.execute_batch("DROP INDEX listening_by_time;
+    db.execute_batch("ALTER TABLE meta DROP COLUMN lidarr_checked_seal;
+        DROP INDEX listening_by_time;
         DROP TRIGGER requests_owners_placed_stays;
         ALTER TABLE requests_owners DROP COLUMN placed;
         ALTER TABLE requests_owners DROP COLUMN metadata;
@@ -1014,7 +1026,7 @@ fn without_a_container_address_neither_the_page_nor_the_app_can_enable_requests(
     }).unwrap();
     let (status, reply) = server.post(admin::GET_LIDARR_SETTING, Some(&page.signed_in), TEST_PAGE, body.bytes());
     assert!(matches!(admin::read_reply::<admin::LidarrSetting>(status, &reply).unwrap(),
-        admin::Reply::Done(admin::LidarrSetting { address: None, configured: false })));
+        admin::Reply::Done(admin::LidarrSetting { address: None, configured: false, checked: false })));
     assert!(matches!(server.grant(&page, TEST_PAGE, admin::Action::SetLidarr(key_change(TEST_KEY)), 1),
         admin::Reply::Refused(_)));
 }
@@ -1094,6 +1106,8 @@ fn a_refused_key_spends_the_grant_and_leaves_the_working_key_untouched() {
     let page = server.redeem(admin, 1, TEST_PAGE);
     assert_eq!(server.configure(&page), admin::LidarrKeyCheck::Works);
     assert_eq!(lidarr.take_calls(), ["GET system/status"]);
+    let checked = server.lidarr_setting(&page);
+    assert!(checked.configured && checked.checked);
 
     let admin::Reply::Done(issued) =
         server.grant(&page, TEST_PAGE, admin::Action::SetLidarr(key_change(REFUSED_KEY)), 102)
@@ -1103,6 +1117,7 @@ fn a_refused_key_spends_the_grant_and_leaves_the_working_key_untouched() {
     assert_eq!(submit(), admin::Reply::Refused(admin::Refusal::NotAllowed(admin::Denial::LidarrLoginRefused)));
     assert_eq!(submit(), admin::Reply::Refused(admin::Refusal::NotAllowed(admin::Denial::GrantRequired)));
     assert_eq!(lidarr.take_calls(), ["GET system/status"]);
+    assert_eq!(server.lidarr_setting(&page), checked);
     let member = server.redeem(member, 2, "");
     assert!(matches!(server.call(&member, Call::Status), Answer::Status { lidarr: Availability::Ready }));
 }
@@ -1125,6 +1140,38 @@ fn an_unreachable_key_check_saves_the_key_as_unchecked_and_spends_the_grant() {
     lock(&lidarr.state).status_down = false;
     let member = server.redeem(member, 2, "");
     assert!(matches!(server.call(&member, Call::Status), Answer::Status { lidarr: Availability::Ready }));
+}
+
+#[test]
+fn lidarr_check_status_survives_restart_and_updates_when_the_same_key_is_checked() {
+    let lidarr = MockLidarr::start();
+    lock(&lidarr.state).status_down = true;
+    let (mut server, [admin, _, _]) = TestServer::start_child("durable-key-check", lidarr.address);
+    let first = server.redeem(admin, 1, TEST_PAGE);
+    assert_eq!(server.configure(&first), admin::LidarrKeyCheck::Unreachable);
+    let unchecked = admin::LidarrSetting {
+        address: Some(endpoint(lidarr.address).address), configured: true, checked: false,
+    };
+    assert_eq!(server.lidarr_setting(&first), unchecked);
+
+    server.kill_child();
+    server.launch(lidarr.address);
+    let second = server.sign_in(SignInCredential::Password {
+        email: first.signed_in.person.email.clone(),
+        password: Password::presented(PASSWORD).unwrap(),
+    }, 2, TEST_PAGE);
+    assert_eq!(server.lidarr_setting(&second), unchecked);
+    assert_eq!(lidarr.take_calls(), ["GET system/status"]);
+
+    lock(&lidarr.state).status_down = false;
+    assert_eq!(server.configure(&second), admin::LidarrKeyCheck::Works);
+    let checked = admin::LidarrSetting { checked: true, ..unchecked };
+    assert_eq!(server.lidarr_setting(&first), checked);
+    assert_eq!(server.lidarr_setting(&second), checked);
+    server.kill_child();
+    server.launch(lidarr.address);
+    assert_eq!(server.lidarr_setting(&second), checked);
+    assert_eq!(lidarr.take_calls(), ["GET system/status"]);
 }
 
 #[test]
