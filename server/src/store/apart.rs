@@ -791,13 +791,20 @@ mod tests {
         let mut big = full();
         let template = big.accounts[&2].clone();
         let mut number = 10;
-        while (big.to_text().len() as u64) < GROWTH_MAX_BYTES + 1024 {
-            for _ in 0..10_000 {
+        // Grown to just past the room left for growth, in steps no larger than what is left.
+        let mut grow = |big: &mut Store, past: u64| loop {
+            let length = big.to_text().len() as u64;
+            if length > past {
+                break;
+            }
+            let each = (length / (big.accounts.len() as u64).max(1)).max(1);
+            for _ in 0..((past - length) / each / 2).max(1) {
                 big.accounts.insert(number, template.clone());
                 number += 1;
             }
-        }
-        big.next_account = number;
+            big.next_account = number;
+        };
+        grow(&mut big, GROWTH_MAX_BYTES + 1024);
         // Past the room left for growth: an account more is refused, the store as it was kept.
         let before = fs::read(place(&state)).unwrap();
         assert_eq!(write_within(&state, &big, GROWTH_MAX_BYTES).unwrap_err().kind(), io::ErrorKind::StorageFull);
@@ -806,13 +813,7 @@ mod tests {
         write(&state, &big).unwrap();
         assert!(matches!(read(&state), Reading::Found(_)));
         // Past what can be read: never published.
-        while (big.to_text().len() as u64) <= FILE_MAX_BYTES {
-            for _ in 0..10_000 {
-                big.accounts.insert(number, template.clone());
-                number += 1;
-            }
-        }
-        big.next_account = number;
+        grow(&mut big, FILE_MAX_BYTES);
         let before = fs::read(place(&state)).unwrap();
         assert!(write(&state, &big).is_err());
         assert_eq!(fs::read(place(&state)).unwrap(), before);

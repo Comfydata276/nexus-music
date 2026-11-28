@@ -324,7 +324,7 @@ fn settled(root: &Root, now: u64) -> (Keeper, Started) {
                             ("status", s.status != d.status),
                             ("passwords", s.password_changes != d.password_changes),
                             ("reset", s.password_reset_required != d.password_reset_required),
-                            ("code", s.code_available != d.code_available),
+                            ("code", s.code != d.code),
                             ("admin", s.admin != d.admin),
                             ("music", s.music_login != d.music_login || s.music_recovery != d.music_recovery),
                             ("revision", s.revision != d.revision),
@@ -645,7 +645,7 @@ fn what_the_admin_takes_away_cut_at_any_point_holds_once_the_store_has_it() {
             if done {
                 // The grant was spent: the same action again, while it would still be live,
                 // is refused (finding 11).
-                let again = administer(&mut keeper, &ids, action, ALICE, &[], T0 + 6 * MINUTE);
+                let again = administer(&mut keeper, &ids, action.clone(), BOB, &[], T0 + 6 * MINUTE);
                 assert!(again.is_err(), "{scenario} at {}: a spent grant was used again", cut.at);
                 match scenario {
                     "an account switched off" => assert_eq!(bob.map(|bob| bob.status), Some(Status::Off)),
@@ -1326,7 +1326,7 @@ fn a_changes_debug_holds_no_code_name_or_email() {
         Change::Account { number: ALICE, shown: "Alice Made-Up", state: &state },
         Change::Install { number: ALICE, rows: &rows, at: T0 },
         Change::Describe { device: 7, name: "Alice's made-up phone", kind: "phone", version: "9.9" },
-        Change::Code { account: ALICE, code: &code, made_at: T0, until: T0 + 1 },
+        Change::Code { account: ALICE, number: 0, code: &code, made_at: T0, until: T0 + 1 },
         Change::Password { account: ALICE, password: Some(&pass) },
     ];
     let shown = format!("{changes:?}");
@@ -1410,7 +1410,7 @@ fn with_the_store_lost_no_old_password_or_code_works_after_taking_the_data() {
     assert!(sign_in(&mut keeper, ROOT, 31, 32, 8, now).is_err(), "the admin's old password signed in");
     let vacant = keeper.vacant_device();
     let code = Fingerprint::from_bytes([44; SECRET_BYTES]);
-    assert!(decide(&mut keeper, carol, now, &[], |turn| turn.check_code(&DeviceSecret::new([51; SECRET_BYTES]), vacant, code.clone())).unwrap().is_err(), "the old code was taken");
+    assert!(decide(&mut keeper, carol, now, &[], |turn| turn.check_code(&secret(51), dev(vacant), 0, code.clone())).unwrap().is_err(), "the old code was taken");
     for account in [ROOT, ALICE, BOB, carol] {
         assert_eq!(count(&keeper, "SELECT count(*) FROM codes WHERE account = ?1", account), 0, "{account}'s codes");
         assert_eq!(count(&keeper, "SELECT count(*) FROM accounts WHERE number = ?1 AND password IS NOT NULL", account), 0, "{account}'s verifier");
@@ -1430,7 +1430,8 @@ fn a_readable_store_of_this_backend_keeps_what_it_took_away_when_the_data_is_tak
     let seal = store_of(&root).seal_key();
     {
         let mut keeper = opened(&root, T0 + 4 * MINUTE);
-        leave(&mut keeper, ROOT, ids.root, 30, 32, LeaveFor::Admin(AdminKind::DeleteAccount), T0 + 4 * MINUTE).unwrap();
+        let purpose = admin_leave(&mut keeper, AdminAction::DeleteAccount, BOB);
+        leave(&mut keeper, ROOT, ids.root, 30, 32, purpose, T0 + 4 * MINUTE).unwrap();
         administer(&mut keeper, &ids, AdminAction::DeleteAccount, BOB, &[], T0 + 4 * MINUTE).unwrap();
         keeper.close();
     }
@@ -1440,7 +1441,10 @@ fn a_readable_store_of_this_backend_keeps_what_it_took_away_when_the_data_is_tak
     let (mut keeper, _) = settled(&root, T0 + 6 * MINUTE);
     assert_eq!(keeper.account_named(email(BOB)).unwrap(), None, "the deleted account came back");
     assert_eq!(keeper.seal_key(), seal);
-    sign_in(&mut keeper, ALICE, 11, 12, 8, T0 + 6 * MINUTE).unwrap();
+    // And the final kept's adoption makes every account wait for a new one-time code even
+    // so (the stricter reading: a readable store does not say the data's verifiers are its).
+    assert!(sign_in(&mut keeper, ALICE, 11, 12, 8, T0 + 6 * MINUTE).is_err());
+    assert!(state(&mut keeper, ALICE).unwrap().password_reset_required);
 }
 
 /// Finding 2: taking the data as it is, cut at any point, never loses a readable store's
@@ -1452,7 +1456,8 @@ fn taking_the_data_with_a_readable_store_cut_at_any_point_keeps_that_store() {
     let seal = store_of(&setup).seal_key();
     {
         let mut keeper = opened(&setup, T0 + 4 * MINUTE);
-        leave(&mut keeper, ROOT, ids.root, 30, 32, LeaveFor::Admin(AdminKind::DeleteAccount), T0 + 4 * MINUTE).unwrap();
+        let purpose = admin_leave(&mut keeper, AdminAction::DeleteAccount, BOB);
+        leave(&mut keeper, ROOT, ids.root, 30, 32, purpose, T0 + 4 * MINUTE).unwrap();
         administer(&mut keeper, &ids, AdminAction::DeleteAccount, BOB, &[], T0 + 4 * MINUTE).unwrap();
         keeper.close();
     }
@@ -1502,7 +1507,7 @@ fn a_put_back_cut_and_run_again_moves_the_numbers_once() {
     let setup = Root::new("putback-again");
     let ids = world(&setup);
     copies::nightly(&setup.data(), T0 + 2 * MINUTE).unwrap();
-    let device = store_of(&setup).accounts[&ALICE].apart.devices[&ids.a1].number;
+    let device = store_of(&setup).accounts[&ALICE].apart.devices[&dev(ids.a1)].number;
     at_every_point("put-back", &setup, |root, cut| {
         let now = T0 + 20 * MINUTE;
         if !cut.whole() {
@@ -1511,7 +1516,7 @@ fn a_put_back_cut_and_run_again_moves_the_numbers_once() {
         let (keeper, _) = settled(root, now);
         assert_eq!(keeper.restore(), 1, "at {}", cut.at);
         keeper.close();
-        assert_eq!(store_of(root).accounts[&ALICE].apart.devices[&ids.a1].number, device + 1, "at {}", cut.at);
+        assert_eq!(store_of(root).accounts[&ALICE].apart.devices[&dev(ids.a1)].number, device + 1, "at {}", cut.at);
     });
 }
 
