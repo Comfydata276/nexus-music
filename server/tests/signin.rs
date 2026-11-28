@@ -215,7 +215,7 @@ fn a_person_signs_in_end_to_end_and_is_refused_once_signed_out() {
     // Nothing worth protecting was written to the log: no code, no session, no password, no email.
     let written = backend.stop().to_string();
     assert!(written.contains("Nexus server 0.1.0 started"), "{written}");
-    for secret in [typed.clone(), format!("{}-{}", &typed[..6], &typed[6..]), PASSWORD.to_string(), EMAIL.to_string(), first.session.expose_hex().to_string(), phone.session.expose_hex().to_string()] {
+    for secret in [typed.clone(), format!("{}-{}", &typed[..6], &typed[6..]), PASSWORD.to_string(), EMAIL.to_string(), "Robin's PC".to_string(), "Robin's phone".to_string(), first.session.expose_hex().to_string(), phone.session.expose_hex().to_string(), first.sign_out.secret.expose_hex().to_string()] {
         assert!(!written.contains(&secret), "the log holds {secret:?}");
     }
 
