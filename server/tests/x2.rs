@@ -454,12 +454,14 @@ impl Cut {
 /// For every point `scenario` passes on a copy of `setup`: a child stopped there, then a start;
 /// `check` is given the start and where the cut fell. Then the run that is not cut.
 fn at_every_point(scenario: &str, setup: &Root, check: impl Fn(&Root, &Cut)) -> usize {
-    let dry = setup.copied(&format!("{}-dry", scenario.replace(' ', "-")));
+    // Named for the setup too: two tests may cut the same scenario at once.
+    let name = format!("{}-{}", setup.path.file_name().unwrap().to_string_lossy(), scenario.replace(' ', "-"));
+    let dry = setup.copied(&format!("{name}-dry"));
     let (points, ended) = child(scenario, &dry, 0, 0, None);
     assert!(ended, "{scenario}: the run that is not cut did not end by itself");
     assert!(!points.is_empty(), "{scenario}: passed no point");
     for at in 1..=points.len() {
-        let root = setup.copied(&format!("{}-{at}", scenario.replace(' ', "-")));
+        let root = setup.copied(&format!("{name}-{at}"));
         let (_, ended) = child(scenario, &root, at, 0, None);
         assert!(!ended, "{scenario}: not stopped at point {at} ({})", points[at - 1]);
         check(&root, &Cut { at, points: points.clone() });
@@ -624,7 +626,7 @@ fn an_older_copy_found_at_a_start_cut_at_any_point_is_restored_once_under_one_nu
 }
 
 #[test]
-fn a_put_back_cut_at_any_point_is_refused_until_run_again_and_then_done_once() {
+fn a_put_back_cut_at_any_point_is_finished_by_the_next_start_or_begun_again_and_done_once() {
     let setup = Root::new("putback");
     let ids = world(&setup);
     copies::nightly(&setup.data(), T0 + 2 * MINUTE).unwrap();
@@ -636,16 +638,15 @@ fn a_put_back_cut_at_any_point_is_refused_until_run_again_and_then_done_once() {
     }
     at_every_point("put-back", &setup, |root, cut| {
         let now = T0 + 20 * MINUTE;
+        // 12.4: the next start finishes a put-back whose plan reached the store; one cut
+        // before that changed nothing, and the owner runs it again.
         match unlocked(|| Keeper::open(&root.state(), &root.data(), now)) {
             Ok((keeper, _)) if keeper.restore() == 0 => {
                 keeper.close();
                 unlocked(|| keeper::put_back(&root.state(), &root.data(), &the_copy(root), now)).unwrap();
             }
             Ok((keeper, _)) => keeper.close(),
-            Err(why) => {
-                assert!(why.0.contains("put-back was cut off"), "at {}: {why}", cut.at);
-                unlocked(|| keeper::put_back(&root.state(), &root.data(), &the_copy(root), now)).unwrap();
-            }
+            Err(why) => panic!("at {}: {why}", cut.at),
         }
         let (mut keeper, _) = settled(root, now);
         assert_eq!(keeper.restore(), 1, "at {}", cut.at);
@@ -667,8 +668,10 @@ fn taking_the_data_as_it_is_cut_at_any_point_ends_up_taken_once() {
         let (mut keeper, _) = settled(root, now);
         assert_eq!(keeper.restore(), 1, "at {}", cut.at);
         assert_eq!(readers(&mut keeper, &ids, now), Vec::<u8>::new(), "at {}", cut.at);
-        // Nothing it cannot know of is reset: each signs in again with their password.
-        sign_in(&mut keeper, ALICE, 11, 12, 8, now).unwrap();
+        // With the store lost nothing says which passwords changed since: every account
+        // waits for a new one-time code (12.4), and no verifier of the data's is left.
+        assert!(sign_in(&mut keeper, ALICE, 11, 12, 8, now).is_err(), "at {}: the old password signed in", cut.at);
+        assert_eq!(count(&keeper, "SELECT count(*) FROM accounts WHERE number >= ?1 AND password IS NOT NULL", 1), 0, "at {}", cut.at);
     });
 }
 
@@ -1457,3 +1460,4 @@ fn another_backends_copy_at_the_datas_place_is_refused_with_nothing_changed() {
     assert_eq!(fs::read(data::place(&one.data())).unwrap(), bytes, "the foreign file was changed");
     assert_eq!(names(&one), before);
 }
+

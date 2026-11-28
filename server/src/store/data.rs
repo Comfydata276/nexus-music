@@ -40,6 +40,9 @@ use crate::store::crash;
 pub const FILE: &str = "nexus.db";
 /// Where a new data file is made before it is renamed into place.
 const MAKING: &str = "nexus.db.making-";
+/// Where the owner's put-back stages the copy beside the data, checked, before it takes the
+/// data's place (and where it waits, if the put-back is cut off, until it is finished).
+pub const INCOMING: &str = "nexus.db.incoming";
 /// "NXMS": the mark that the file is the Nexus server's data.
 pub const APPLICATION_ID: i64 = 0x4e58_4d53;
 /// The form this program writes and reads.
@@ -161,6 +164,11 @@ pub fn why(error: &rusqlite::Error) -> String {
 
 pub fn place(folder: &Path) -> PathBuf {
     folder.join(FILE)
+}
+
+/// Where a put-back's copy is staged: [`INCOMING`].
+pub fn incoming(folder: &Path) -> PathBuf {
+    folder.join(INCOMING)
 }
 
 fn number(value: u64) -> Result<i64, rusqlite::Error> {
@@ -337,126 +345,27 @@ impl Data {
 
     /// What the data says of itself.
     pub fn meta(&self) -> rusqlite::Result<Meta> {
-        self.connection.query_row("SELECT backend, restore, changes, made_at, written_at, restored_at, restored_from FROM meta WHERE one = 1", [], |row| {
-            let backend: Vec<u8> = row.get(0)?;
-            let backend: [u8; 16] = backend.try_into().map_err(|_| rusqlite::Error::InvalidColumnType(0, "backend".into(), rusqlite::types::Type::Blob))?;
-            let optional = |at: usize| -> rusqlite::Result<Option<u64>> { row.get::<_, Option<i64>>(at)?.map(unsigned).transpose() };
-            Ok(Meta {
-                backend: BackendId::from_bytes(backend),
-                restore: unsigned(row.get(1)?)?,
-                changes: unsigned(row.get(2)?)?,
-                made_at: unsigned(row.get(3)?)?,
-                written_at: unsigned(row.get(4)?)?,
-                restored_at: optional(5)?,
-                restored_from: optional(6)?,
-            })
-        })
+        meta_of(&self.connection)
     }
 
     /// Every account's email, by number.
     pub fn names(&self) -> rusqlite::Result<BTreeMap<u64, AccountName>> {
-        let mut statement = self.connection.prepare("SELECT number, email FROM accounts")?;
-        let found = statement.query_map([], |row| Ok((unsigned(row.get(0)?)?, row.get::<_, String>(1)?)))?;
-        let mut names = BTreeMap::new();
-        for found in found {
-            let (number, email) = found?;
-            let name = AccountName::from_canonical(email).ok_or_else(|| rusqlite::Error::InvalidColumnType(1, "email".into(), rusqlite::types::Type::Text))?;
-            names.insert(number, name);
-        }
-        Ok(names)
+        names_of(&self.connection)
     }
 
     /// What `compare` reads: every account's rows.
     pub fn view(&self) -> rusqlite::Result<DataView> {
-        let meta = self.meta()?;
-        let mut view = DataView { restore: meta.restore, changes: meta.changes, ..Default::default() };
-        let numbers: Vec<u64> = self.names()?.into_keys().collect();
-        for number in numbers {
-            if let Some(rows) = self.rows(&meta, number)? {
-                view.accounts.insert(number, rows);
-            }
-        }
-        Ok(view)
+        view_of(&self.connection)
     }
 
     /// An account's number, by its email (as tidied: C7's).
     pub fn account_named(&self, email: &str) -> rusqlite::Result<Option<u64>> {
-        self.connection.query_row("SELECT number FROM accounts WHERE email = ?1", [email], |row| unsigned(row.get(0)?)).optional()
+        account_named_of(&self.connection, email)
     }
 
     /// An account's rows (C3r's `Rows`), as the data has them.
     pub fn rows(&self, meta: &Meta, number: u64) -> rusqlite::Result<Option<Rows>> {
-        let found = self
-            .connection
-            .query_row(
-                "SELECT email, life, status, password_changes, reset_required, code_available, admin, music_login, music_managed, music_recovery, history_held, revision FROM accounts WHERE number = ?1",
-                [self::number(number)?],
-                |row| {
-                    let bad = |at: usize, what: &str| rusqlite::Error::InvalidColumnType(at, what.into(), rusqlite::types::Type::Text);
-                    let flag = |at: usize| -> rusqlite::Result<bool> { Ok(row.get::<_, i64>(at)? == 1) };
-                    let name = AccountName::from_canonical(row.get(0)?).ok_or_else(|| bad(0, "email"))?;
-                    let status = match row.get::<_, String>(2)?.as_str() {
-                        "on" => Status::On,
-                        "off" => Status::Off,
-                        _ => return Err(bad(2, "status")),
-                    };
-                    let music_recovery = match row.get::<_, Option<String>>(9)?.as_deref() {
-                        None => None,
-                        Some("rotate") => Some(MusicRecovery::RotateManaged),
-                        Some("enter") => Some(MusicRecovery::EnterAgain),
-                        Some(_) => return Err(bad(9, "music_recovery")),
-                    };
-                    Ok(AccountState {
-                        backend: meta.backend,
-                        restore: meta.restore,
-                        name,
-                        life: unsigned(row.get(1)?)?,
-                        status,
-                        password_changes: unsigned(row.get(3)?)?,
-                        password_reset_required: flag(4)?,
-                        code_available: flag(5)?,
-                        admin: flag(6)?,
-                        music_login: unsigned(row.get(7)?)?,
-                        music_managed: flag(8)?,
-                        music_recovery,
-                        history_held: flag(10)?,
-                        revision: unsigned(row.get(11)?)?,
-                    })
-                },
-            )
-            .optional()?;
-        let Some(account) = found else { return Ok(None) };
-        let mut rows = Rows { account, devices: BTreeMap::new() };
-        let mut statement = self.connection.prepare(
-            "SELECT devices.id, devices.number, devices.secret, sessions.id, sessions.hash, sessions.last_used, sessions.restricted, sessions.leave_for, sessions.leave_life, sessions.leave_granted, sessions.leave_serial
-             FROM devices LEFT JOIN sessions ON sessions.device = devices.id WHERE devices.account = ?1",
-        )?;
-        let found = statement.query_map([self::number(number)?], |row| {
-            let blob = |at: usize| -> rusqlite::Result<[u8; SECRET_BYTES]> {
-                let bytes: Vec<u8> = row.get(at)?;
-                bytes.try_into().map_err(|_| rusqlite::Error::InvalidColumnType(at, "fingerprint".into(), rusqlite::types::Type::Blob))
-            };
-            let session = match row.get::<_, Option<i64>>(3)? {
-                None => None,
-                Some(id) => {
-                    let leave = match row.get::<_, Option<String>>(7)? {
-                        None => None,
-                        Some(purpose) => {
-                            let purpose = crate::store::apart::leave_for(&purpose).ok_or_else(|| rusqlite::Error::InvalidColumnType(7, "leave_for".into(), rusqlite::types::Type::Text))?;
-                            let count = |at: usize| -> rusqlite::Result<u64> { unsigned(row.get::<_, Option<i64>>(at)?.unwrap_or(-1)) };
-                            Some(Leave::stored(purpose, count(8)?, count(9)?, count(10)?))
-                        }
-                    };
-                    Some(Session { id: unsigned(id)?, hash: Fingerprint::from_bytes(blob(4)?), last_used: unsigned(row.get(5)?)?, restricted: row.get::<_, i64>(6)? == 1, leave })
-                }
-            };
-            Ok((unsigned(row.get(0)?)?, DeviceRow { number: unsigned(row.get(1)?)?, secret: Fingerprint::from_bytes(blob(2)?), session }))
-        })?;
-        for found in found {
-            let (id, device) = found?;
-            rows.devices.insert(id, device);
-        }
-        Ok(Some(rows))
+        rows_of(&self.connection, meta, number)
     }
 
     /// An account's password, as kept, or `None` when it has none yet.
@@ -507,6 +416,131 @@ impl Data {
         let _ = self.fold();
         let _ = self.connection.close();
     }
+}
+
+// ---- Reading the data, on any connection to it (the data in use, or a copy to be put back) ----
+
+/// What the data says of itself.
+pub fn meta_of(connection: &Connection) -> rusqlite::Result<Meta> {
+    connection.query_row("SELECT backend, restore, changes, made_at, written_at, restored_at, restored_from FROM meta WHERE one = 1", [], |row| {
+        let backend: Vec<u8> = row.get(0)?;
+        let backend: [u8; 16] = backend.try_into().map_err(|_| rusqlite::Error::InvalidColumnType(0, "backend".into(), rusqlite::types::Type::Blob))?;
+        let optional = |at: usize| -> rusqlite::Result<Option<u64>> { row.get::<_, Option<i64>>(at)?.map(unsigned).transpose() };
+        Ok(Meta {
+            backend: BackendId::from_bytes(backend),
+            restore: unsigned(row.get(1)?)?,
+            changes: unsigned(row.get(2)?)?,
+            made_at: unsigned(row.get(3)?)?,
+            written_at: unsigned(row.get(4)?)?,
+            restored_at: optional(5)?,
+            restored_from: optional(6)?,
+        })
+    })
+}
+
+/// Every account's email, by number.
+pub fn names_of(connection: &Connection) -> rusqlite::Result<BTreeMap<u64, AccountName>> {
+    let mut statement = connection.prepare("SELECT number, email FROM accounts")?;
+    let found = statement.query_map([], |row| Ok((unsigned(row.get(0)?)?, row.get::<_, String>(1)?)))?;
+    let mut names = BTreeMap::new();
+    for found in found {
+        let (number, email) = found?;
+        let name = AccountName::from_canonical(email).ok_or_else(|| rusqlite::Error::InvalidColumnType(1, "email".into(), rusqlite::types::Type::Text))?;
+        names.insert(number, name);
+    }
+    Ok(names)
+}
+
+/// What `compare` reads: every account's rows.
+pub fn view_of(connection: &Connection) -> rusqlite::Result<DataView> {
+    let meta = meta_of(connection)?;
+    let mut view = DataView { restore: meta.restore, changes: meta.changes, ..Default::default() };
+    let numbers: Vec<u64> = names_of(connection)?.into_keys().collect();
+    for number in numbers {
+        if let Some(rows) = rows_of(connection, &meta, number)? {
+            view.accounts.insert(number, rows);
+        }
+    }
+    Ok(view)
+}
+
+/// An account's number, by its email (as tidied: C7's).
+pub fn account_named_of(connection: &Connection, email: &str) -> rusqlite::Result<Option<u64>> {
+    connection.query_row("SELECT number FROM accounts WHERE email = ?1", [email], |row| unsigned(row.get(0)?)).optional()
+}
+
+/// An account's rows (C3r's `Rows`), as the data has them.
+pub fn rows_of(connection: &Connection, meta: &Meta, number: u64) -> rusqlite::Result<Option<Rows>> {
+    let found = connection
+        .query_row(
+            "SELECT email, life, status, password_changes, reset_required, code_available, admin, music_login, music_managed, music_recovery, history_held, revision FROM accounts WHERE number = ?1",
+            [self::number(number)?],
+            |row| {
+                let bad = |at: usize, what: &str| rusqlite::Error::InvalidColumnType(at, what.into(), rusqlite::types::Type::Text);
+                let flag = |at: usize| -> rusqlite::Result<bool> { Ok(row.get::<_, i64>(at)? == 1) };
+                let name = AccountName::from_canonical(row.get(0)?).ok_or_else(|| bad(0, "email"))?;
+                let status = match row.get::<_, String>(2)?.as_str() {
+                    "on" => Status::On,
+                    "off" => Status::Off,
+                    _ => return Err(bad(2, "status")),
+                };
+                let music_recovery = match row.get::<_, Option<String>>(9)?.as_deref() {
+                    None => None,
+                    Some("rotate") => Some(MusicRecovery::RotateManaged),
+                    Some("enter") => Some(MusicRecovery::EnterAgain),
+                    Some(_) => return Err(bad(9, "music_recovery")),
+                };
+                Ok(AccountState {
+                    backend: meta.backend,
+                    restore: meta.restore,
+                    name,
+                    life: unsigned(row.get(1)?)?,
+                    status,
+                    password_changes: unsigned(row.get(3)?)?,
+                    password_reset_required: flag(4)?,
+                    code_available: flag(5)?,
+                    admin: flag(6)?,
+                    music_login: unsigned(row.get(7)?)?,
+                    music_managed: flag(8)?,
+                    music_recovery,
+                    history_held: flag(10)?,
+                    revision: unsigned(row.get(11)?)?,
+                })
+            },
+        )
+        .optional()?;
+    let Some(account) = found else { return Ok(None) };
+    let mut rows = Rows { account, devices: BTreeMap::new() };
+    let mut statement = connection.prepare(
+        "SELECT devices.id, devices.number, devices.secret, sessions.id, sessions.hash, sessions.last_used, sessions.restricted, sessions.leave_for, sessions.leave_life, sessions.leave_granted, sessions.leave_serial
+         FROM devices LEFT JOIN sessions ON sessions.device = devices.id WHERE devices.account = ?1",
+    )?;
+    let found = statement.query_map([self::number(number)?], |row| {
+        let blob = |at: usize| -> rusqlite::Result<[u8; SECRET_BYTES]> {
+            let bytes: Vec<u8> = row.get(at)?;
+            bytes.try_into().map_err(|_| rusqlite::Error::InvalidColumnType(at, "fingerprint".into(), rusqlite::types::Type::Blob))
+        };
+        let session = match row.get::<_, Option<i64>>(3)? {
+            None => None,
+            Some(id) => {
+                let leave = match row.get::<_, Option<String>>(7)? {
+                    None => None,
+                    Some(purpose) => {
+                        let purpose = crate::store::apart::leave_for(&purpose).ok_or_else(|| rusqlite::Error::InvalidColumnType(7, "leave_for".into(), rusqlite::types::Type::Text))?;
+                        let count = |at: usize| -> rusqlite::Result<u64> { unsigned(row.get::<_, Option<i64>>(at)?.unwrap_or(-1)) };
+                        Some(Leave::stored(purpose, count(8)?, count(9)?, count(10)?))
+                    }
+                };
+                Some(Session { id: unsigned(id)?, hash: Fingerprint::from_bytes(blob(4)?), last_used: unsigned(row.get(5)?)?, restricted: row.get::<_, i64>(6)? == 1, leave })
+            }
+        };
+        Ok((unsigned(row.get(0)?)?, DeviceRow { number: unsigned(row.get(1)?)?, secret: Fingerprint::from_bytes(blob(2)?), session }))
+    })?;
+    for found in found {
+        let (id, device) = found?;
+        rows.devices.insert(id, device);
+    }
+    Ok(Some(rows))
 }
 
 fn io_error(error: std::io::Error) -> rusqlite::Error {
@@ -718,7 +752,8 @@ impl Change<'_> {
 pub fn tidy(folder: &Path) {
     if let Ok(entries) = fs::read_dir(folder) {
         for entry in entries.flatten() {
-            if entry.file_name().to_str().is_some_and(|name| name.starts_with(MAKING)) {
+            // A data file being made, or a copy being staged (`copies`' own making name).
+            if entry.file_name().to_str().is_some_and(|name| name.starts_with(MAKING) || name.starts_with(".making-")) {
                 let _ = fs::remove_file(entry.path());
             }
         }
@@ -734,6 +769,20 @@ pub fn open_to_read(path: &Path, what: &str) -> Result<Connection, String> {
     check_form(&connection, what, MIGRATIONS)?;
     quick_check(&connection, what)?;
     Ok(connection)
+}
+
+/// Whose data the file at `path` is, read before anything of it is changed (the review's
+/// finding 9): opened only to read, its mark and form checked, its backend id read. Nothing
+/// is set and nothing migrated.
+pub fn backend_of(path: &Path) -> Result<BackendId, String> {
+    let what = format!("The data at {}", path.display());
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_URI;
+    let connection = Connection::open_with_flags(path, flags).map_err(|error| format!("{what} can't be opened: {}.", why(&error)))?;
+    connection.busy_timeout(BUSY).map_err(|error| format!("{what} can't be opened: {}.", why(&error)))?;
+    check_form(&connection, &what, MIGRATIONS)?;
+    let (backend, _) = identify(&connection).map_err(|error| format!("{what} can't be read: {}.", why(&error)))?;
+    connection.close().map_err(|(_, error)| format!("{what} can't be read: {}.", why(&error)))?;
+    Ok(backend)
 }
 
 /// The backend id and the time of the last step of a data file opened to read.

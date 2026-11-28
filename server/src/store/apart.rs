@@ -204,6 +204,7 @@ impl Store {
                 format!("pending change{}", accounts.iter().map(|account| format!(" {account}")).collect::<String>())
             }
             Some(Pending::Restore { restore }) => format!("pending restore {restore}"),
+            Some(Pending::PutBack { restore }) => format!("pending put-back {restore}"),
             Some(Pending::TakeAsIs { restore }) => format!("pending take-as-is {restore}"),
         });
         let sum = hex(Sha256::digest(text.as_bytes()).as_slice());
@@ -292,6 +293,7 @@ impl Store {
             ["pending", "none"] => None,
             ["pending", "change", accounts @ ..] => Some(Pending::Change { accounts: accounts.iter().map(|account| number(account)).collect::<Option<Vec<u64>>>()? }),
             ["pending", "restore", restore] => Some(Pending::Restore { restore: number(restore)? }),
+            ["pending", "put-back", restore] => Some(Pending::PutBack { restore: number(restore)? }),
             ["pending", "take-as-is", restore] => Some(Pending::TakeAsIs { restore: number(restore)? }),
             _ => return None,
         };
@@ -386,13 +388,25 @@ pub fn tidy(state: &Path) {
     }
 }
 
-/// Puts an unreadable store aside, under a name that says so, so that a new one can be
-/// made and the old is kept for whoever wants to look at it. Where it went.
-pub fn set_aside(state: &Path, now: u64) -> io::Result<PathBuf> {
-    let aside = state.join(format!("{FILE}.set-aside-{now}"));
-    fs::rename(place(state), &aside)?;
-    fs::File::open(state)?.sync_all()?;
-    Ok(aside)
+/// Keeps a copy of the store as it is (readable or not), under a name of its own that says
+/// so, for whoever wants to look at it; lasting, with the folder that names it. **The store
+/// itself stays where it is** until a new one is renamed over it whole (the review's finding
+/// 2): a cut anywhere leaves the old store in place, or the new. Where the copy is.
+pub fn keep_aside(state: &Path, now: u64) -> io::Result<PathBuf> {
+    let mut source = fs::File::open(place(state))?;
+    for attempt in 0u32.. {
+        let aside = state.join(format!("{FILE}.set-aside-{now}-{}{}", std::process::id(), if attempt == 0 { String::new() } else { format!("-{attempt}") }));
+        let mut file = match crate::store::private::create(&aside) {
+            Err(why) if why.kind() == io::ErrorKind::AlreadyExists => continue,
+            other => other?,
+        };
+        io::copy(&mut source, &mut file)?;
+        file.sync_all()?;
+        drop(file);
+        fs::File::open(state)?.sync_all()?;
+        return Ok(aside);
+    }
+    unreachable!("a name is always found")
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -577,7 +591,7 @@ mod tests {
     fn what_is_written_is_read_back_the_same() {
         let state = folder("round");
         assert!(matches!(read(&state), Reading::Missing));
-        for pending in [None, Some(Pending::Change { accounts: vec![] }), Some(Pending::Change { accounts: vec![1, 2] }), Some(Pending::Restore { restore: 4 }), Some(Pending::TakeAsIs { restore: 4 })] {
+        for pending in [None, Some(Pending::Change { accounts: vec![] }), Some(Pending::Change { accounts: vec![1, 2] }), Some(Pending::Restore { restore: 4 }), Some(Pending::PutBack { restore: 4 }), Some(Pending::TakeAsIs { restore: 4 })] {
             let store = Store { pending: pending.clone(), ..full() };
             write(&state, &store).unwrap();
             let Reading::Found(back) = read(&state) else { panic!("not read back") };

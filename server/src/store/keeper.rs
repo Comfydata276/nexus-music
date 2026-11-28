@@ -21,15 +21,16 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use nexus_core::nexus::compare::{self, Contradiction, Pending};
+use nexus_core::nexus::compare::{self, Contradiction, Halt, NotPutBack, Pending, Resume};
 use nexus_core::nexus::kept::{
-    Account as Decided, AccountName, AccountState, Apart, ApartDevice, Clock, DataChange, Effects, RestoreMode, Rows, SECRET_BYTES, StampKey, Startup, Status,
+    Account as Decided, AccountName, AccountState, Apart, Clock, DataChange, Effects, RestoreMode, Rows, SECRET_BYTES, StampKey, Startup, Status,
 };
 use nexus_core::nexus::proto::BackendId;
 
 use crate::identity;
 use crate::store::apart::{self, Account, Reading, Store};
 use crate::store::copies;
+use crate::store::crash;
 use crate::store::data::{self, Change, Data, Opened, why};
 use crate::store::lock;
 use crate::store::private;
@@ -127,20 +128,102 @@ fn contradiction(why: Contradiction) -> &'static str {
 
 const TAKE_AS_IS: &str = "run `nexus-music-server take-as-is` to take the data as it is: every session is ended, and every person signs in again";
 
-struct Found {
-    id: Option<BackendId>,
-    store: Reading,
-    data: Opened,
+/// Whose data is in `folder`, if there is a data file: read before anything of it is
+/// changed (the review's finding 9).
+fn whose(folder: &Path) -> Result<Option<BackendId>, Refused> {
+    let place = data::place(folder);
+    match fs::symlink_metadata(&place) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(Refused(format!("The data at {} can't be read ({}).", place.display(), error.kind()))),
+        Ok(_) => data::backend_of(&place).map(Some).map_err(Refused),
+    }
 }
 
-fn find(state: &Path, folder: &Path, now: u64) -> Result<Found, Refused> {
-    apart::tidy(state);
-    data::tidy(folder);
-    copies::prune(folder);
-    let id = identity::read(state).map_err(Refused)?;
-    let store = apart::read(state);
-    let data = Data::open(folder, now).map_err(Refused)?;
-    Ok(Found { id, store, data })
+fn another_backends(folder: &Path, theirs: BackendId, ours: BackendId) -> Refused {
+    Refused(format!(
+        "The data in {} is another backend's (its id is {}; this one's is {}). Nothing is served, and nothing was changed. Set NEXUS_DATA to this backend's data, or put back a copy of it.",
+        folder.display(),
+        theirs.to_hex(),
+        ours.to_hex()
+    ))
+}
+
+fn halted(halt: Halt, folder: &Path) -> Refused {
+    Refused(match halt {
+        Halt::CopyLost => format!(
+            "A put-back was cut off, and the copy it was putting back is neither waiting beside the data nor in its place in {}. Nothing is served. Run `nexus-music-server put-back` with the copy again. (The data it was replacing is kept in {}.)",
+            folder.display(),
+            copies::folder(folder).display()
+        ),
+        Halt::NoData => format!(
+            "A restore of the data was under way, and there is no data in {}. Nothing is served. Put a copy back with `nexus-music-server put-back`, or {TAKE_AS_IS}.",
+            folder.display()
+        ),
+        Halt::DataRestoreAhead => format!("The store kept apart does not belong with this data: {}. Nothing is served, and nothing was changed. {TAKE_AS_IS}.", contradiction(Contradiction::DataRestoreAhead)),
+    })
+}
+
+/// A put-back's staged copy takes the data's place (12.4; the review's findings 2 to 5).
+/// Only ever done once the data it replaces is kept and the put-back's plan is in the store.
+/// First what SQLite wrote beside the data being replaced goes (so that none of it is ever
+/// read as part of the copy), then the copy is renamed into place; each made lasting. Safe to
+/// do again from any point: the copy waits staged until the rename.
+fn put_in_place(folder: &Path) -> Result<(), Refused> {
+    let failed = |error: std::io::Error| Refused(format!("The copy couldn't be put in place of the data ({}). Nothing is served; start again, or run the put-back again, and it is finished.", error.kind()));
+    let place = data::place(folder);
+    crash::point("put-back: begun").map_err(failed)?;
+    for suffix in ["-wal", "-shm", "-journal"] {
+        match fs::remove_file(PathBuf::from(format!("{}{suffix}", place.display()))) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(failed(error)),
+            _ => {}
+        }
+    }
+    fs::File::open(folder).and_then(|folder| folder.sync_all()).map_err(failed)?;
+    crash::point("put-back: beside gone").map_err(failed)?;
+    fs::rename(data::incoming(folder), &place).map_err(failed)?;
+    crash::point("put-back: in place").map_err(failed)?;
+    fs::File::open(folder).and_then(|folder| folder.sync_all()).map_err(failed)
+}
+
+/// What a restore makes of the store (12.4 steps 1 to 4, in the store first): the new
+/// restore number, and each account as `kept::Account::restore` decides it from the rows on
+/// `rows` (the data in place, or the exact copy staged to take its place). Nothing written.
+fn planned(store: &Store, rows: &rusqlite::Connection, new: u64, mode: RestoreMode, pending: Pending, now: u64) -> Result<Store, Refused> {
+    let names = data::names_of(rows).map_err(|error| unreadable(&error))?;
+    let meta = data::meta_of(rows).map_err(|error| unreadable(&error))?;
+    let mut next = store.clone();
+    next.high_water = next.high_water.max(now);
+    let clock = Clock { now, high_water: next.high_water };
+    for number in store.accounts.keys().copied().collect::<Vec<_>>() {
+        let rows = data::rows_of(rows, &meta, number).map_err(|error| unreadable(&error))?;
+        let Some(record) = store.apart(number, names.get(&number)) else { continue };
+        if record.account.status == Status::Deleted {
+            continue;
+        }
+        if rows.is_none() {
+            // Not in the data: the account is lost with it, and its number not used again.
+            if let Some(entry) = next.accounts.get_mut(&number) {
+                entry.apart.account.status = Status::Deleted;
+            }
+            continue;
+        }
+        let mut first = None;
+        let answer = Decided::restore(&record, rows.as_ref(), new, mode, clock).apply(|effects| {
+            first = effects.updates.first().map(|update| update.apart_first.clone());
+            Ok::<_, ()>(())
+        });
+        match (answer, first) {
+            (Ok(Ok(())), Some(first)) => {
+                if let Some(entry) = next.accounts.get_mut(&number) {
+                    entry.apart = first;
+                }
+            }
+            _ => return Err(Refused(format!("Account {number} could not be brought to the new restore number (a number can go no higher). Nothing was changed."))),
+        }
+    }
+    next.restore = new;
+    next.pending = Some(pending);
+    Ok(next)
 }
 
 fn not_this_backends(state: &Path) -> String {
@@ -162,76 +245,88 @@ impl Keeper {
     pub fn open(state: &Path, folder: &Path, now: u64) -> Result<(Keeper, Started), Refused> {
         let held = lock::hold(state, folder).map_err(Refused)?;
         private::at_start(state, folder).map_err(Refused)?;
-        let found = find(state, folder, now)?;
-        match (found.id, found.store, found.data) {
-            (_, Reading::Unreadable(what), _) => Err(Refused(format!(
-                "The store kept apart, {}, can't be read: {what}. Nothing is served, and it is left as it is. If it is lost, {TAKE_AS_IS}.",
-                apart::place(state).display()
-            ))),
-            (_, Reading::Missing, Opened::Open(_)) => Err(Refused(format!(
-                "The store kept apart, {}, is missing, and there is data. Nothing is served: without the store nothing says which sessions were ended, which accounts switched off or deleted, or which passwords changed. If NEXUS_STATE names the wrong folder, set it right. If the store is lost, {TAKE_AS_IS}.",
-                apart::place(state).display()
-            ))),
-            (id, Reading::Missing, Opened::Absent) => {
+        apart::tidy(state);
+        data::tidy(folder);
+        let id = identity::read(state).map_err(Refused)?;
+        let store = match apart::read(state) {
+            Reading::Unreadable(what) => {
+                return Err(Refused(format!(
+                    "The store kept apart, {}, can't be read: {what}. Nothing is served, and it is left as it is. If it is lost, {TAKE_AS_IS}.",
+                    apart::place(state).display()
+                )));
+            }
+            Reading::Missing => {
+                if whose(folder)?.is_some() {
+                    return Err(Refused(format!(
+                        "The store kept apart, {}, is missing, and there is data. Nothing is served: without the store nothing says which sessions were ended, which accounts switched off or deleted, or which passwords changed. If NEXUS_STATE names the wrong folder, set it right. If the store is lost, {TAKE_AS_IS}.",
+                        apart::place(state).display()
+                    )));
+                }
                 let id = match id {
                     Some(id) => id,
                     None => identity::read_or_make(state, random_bytes::<16>).map_err(Refused)?.0,
                 };
                 let store = Store::new(id, random_bytes::<SECRET_BYTES>().map_err(Refused)?, random_bytes::<SECRET_BYTES>().map_err(Refused)?, now);
                 apart::write(state, &store).map_err(|error| Refused(store_failed(state, &error)))?;
-                Self::first_data(state, folder, held, store, now)
+                return Self::first_data(state, folder, held, store, now);
             }
-            (id, Reading::Found(store), Opened::Absent) => {
-                if id != Some(store.backend) {
-                    return Err(Refused(not_this_backends(state)));
+            Reading::Found(store) => store,
+        };
+        if id != Some(store.backend) {
+            return Err(Refused(not_this_backends(state)));
+        }
+        // Whose the data is, before anything of it is changed.
+        // A put-back whose plan is in the store is finished first, the same way the command
+        // run again would (12.4): its copy, checked when staged, takes the data's place.
+        let staged = data::incoming(folder).exists();
+        if let Resume::PutInPlace { .. } = compare::resume(store.pending.as_ref(), staged, None) {
+            put_in_place(folder)?;
+        } else if staged {
+            // Staged by a put-back cut off before its plan was in the store: never used.
+            let _ = fs::remove_file(data::incoming(folder));
+        }
+        if let Some(theirs) = whose(folder)?.filter(|&theirs| theirs != store.backend) {
+            return Err(another_backends(folder, theirs, store.backend));
+        }
+        copies::prune(folder);
+        let data = match Data::open(folder, now).map_err(Refused)? {
+            Opened::Open(data) => data,
+            Opened::Absent => {
+                if let Resume::Stop(halt) = compare::resume(store.pending.as_ref(), false, None) {
+                    return Err(halted(halt, folder));
                 }
                 if !store.data_made {
                     return Self::first_data(state, folder, held, store, now);
                 }
-                if matches!(store.pending, Some(Pending::Restore { .. })) {
-                    return Err(Refused(format!(
-                        "A put-back was cut off before the copy was in place: there is no data in {}. Run `nexus-music-server put-back` with the copy again. (The data it was replacing is in {}.)",
-                        folder.display(),
-                        copies::folder(folder).display()
-                    )));
-                }
                 // 12.4, and the review: an emptied data folder with a store is never a first start.
-                Err(Refused(format!(
+                return Err(Refused(format!(
                     "There is no data in {}, but the store kept apart says there was. Nothing is served. If NEXUS_DATA names the wrong folder, set it right. If the data is lost, put a copy back with `nexus-music-server put-back`, or {TAKE_AS_IS} (here: none, and every account is made again by the admin).",
                     folder.display()
-                )))
+                )));
             }
-            (id, Reading::Found(store), Opened::Open(data)) => {
-                let meta = data.meta().map_err(|error| unreadable(&error))?;
-                if id != Some(store.backend) {
-                    return Err(Refused(not_this_backends(state)));
-                }
-                if meta.backend != store.backend {
-                    return Err(Refused(format!(
-                        "The data in {} is another backend's (its id is {}; this one's is {}). Nothing is served, and nothing was changed. Set NEXUS_DATA to this backend's data, or put back a copy of it.",
-                        folder.display(),
-                        meta.backend.to_hex(),
-                        store.backend.to_hex()
-                    )));
-                }
-                // The clock is the store's alone (finding 7): every step of the data is
-                // written at a time the store had already recorded, so the data's own time
-                // is never taken for it.
-                let mut keeper = Self::with(state, folder, held, store, data)?;
-                if !keeper.store.data_made {
-                    let view = keeper.data.view().map_err(|error| unreadable(&error))?;
-                    if !view.accounts.is_empty() || view.restore != keeper.store.restore {
-                        return Err(Refused(format!("The store kept apart says this backend's data was never made, and there is data. Nothing is served. {TAKE_AS_IS}.")));
-                    }
-                    let mut next = keeper.store.clone();
-                    next.data_made = true;
-                    keeper.write_store(next).map_err(|failed| Refused(failed.0))?;
-                    return Ok((keeper, Started::Made));
-                }
-                let started = keeper.compare_and_bring_together(now)?;
-                Ok((keeper, started))
+        };
+        let meta = data.meta().map_err(|error| unreadable(&error))?;
+        let mut keeper = Self::with(state, folder, held, store, data)?;
+        match compare::resume(keeper.store.pending.as_ref(), false, Some(meta.restore)) {
+            Resume::Stop(halt) => return Err(halted(halt, folder)),
+            Resume::Restore { adopt, .. } => {
+                let started = keeper.restore_data(now, if adopt { RestoreMode::Adopt } else { RestoreMode::DataOnly })?;
+                return Ok((keeper, started));
             }
+            Resume::PutInPlace { .. } | Resume::Nothing => {}
         }
+        if !keeper.store.data_made {
+            let view = keeper.data.view().map_err(|error| unreadable(&error))?;
+            if !view.accounts.is_empty() || view.restore != keeper.store.restore {
+                return Err(Refused(format!("The store kept apart says this backend's data was never made, and there is data. Nothing is served. {TAKE_AS_IS}.")));
+            }
+            let mut next = keeper.store.clone();
+            next.data_made = true;
+            keeper.write_store(next).map_err(|failed| Refused(failed.0))?;
+            return Ok((keeper, Started::Made));
+        }
+        let started = keeper.compare_and_bring_together(now)?;
+        Ok((keeper, started))
     }
 
     fn first_data(state: &Path, folder: &Path, held: lock::Held, mut store: Store, now: u64) -> Result<(Keeper, Started), Refused> {
@@ -260,20 +355,12 @@ impl Keeper {
                 self.bring_up(now).map_err(|failed| Refused(failed.0))?;
                 Ok(Started::Finished(plan))
             }
-            Startup::RestoreData if self.put_back_cut() => Err(Refused(format!(
-                "A put-back was cut off before it was done, and the copy may or may not be in place. Nothing is served. Run `nexus-music-server put-back` with the copy again. (Any data it was replacing is kept in {}.)",
-                copies::folder(&self.folder).display()
-            ))),
             Startup::RestoreData => self.restore_data(now, RestoreMode::DataOnly),
             Startup::Stop | Startup::AdoptData => Err(Refused(format!(
                 "The store kept apart does not belong with this data: {}. Nothing is served, and nothing was changed. If NEXUS_DATA or NEXUS_STATE names the wrong folder, set it right; otherwise {TAKE_AS_IS}.",
                 found.contradiction.map_or("they disagree", contradiction)
             ))),
         }
-    }
-
-    fn put_back_cut(&self) -> bool {
-        matches!(self.store.pending, Some(Pending::Restore { restore }) if self.store.restore.checked_add(1) == Some(restore))
     }
 
     /// What must also go from the data with an account's state (C3r's): a password that may no
@@ -349,43 +436,14 @@ impl Keeper {
         let mode = if matches!(self.store.pending, Some(Pending::TakeAsIs { .. })) { RestoreMode::Adopt } else { mode };
         let names = self.names().map_err(|error| unreadable(&error))?;
         let meta = self.data.meta().map_err(|error| unreadable(&error))?;
+        // One restore number for one restore: the one under way, if one is (findings 3, 4).
         let new = match self.store.pending {
-            Some(Pending::Restore { restore } | Pending::TakeAsIs { restore }) => restore,
+            Some(Pending::Restore { restore } | Pending::PutBack { restore } | Pending::TakeAsIs { restore }) => restore,
             _ => self.store.restore.checked_add(1).ok_or_else(|| Refused("The restore number can go no higher. Nothing is served.".into()))?,
         };
         if self.store.restore != new {
-            let mut next = self.store.clone();
-            next.high_water = next.high_water.max(now);
-            let clock = Clock { now, high_water: next.high_water };
-            for number in self.store.accounts.keys().copied().collect::<Vec<_>>() {
-                let rows = self.data.rows(&meta, number).map_err(|error| unreadable(&error))?;
-                let Some(record) = self.store.apart(number, names.get(&number)) else { continue };
-                if record.account.status == Status::Deleted {
-                    continue;
-                }
-                if rows.is_none() {
-                    // Not in the copy: the account is lost with it, and its number not used again.
-                    if let Some(entry) = next.accounts.get_mut(&number) {
-                        entry.apart.account.status = Status::Deleted;
-                    }
-                    continue;
-                }
-                let mut first = None;
-                let answer = Decided::restore(&record, rows.as_ref(), new, mode, clock).apply(|effects| {
-                    first = effects.updates.first().map(|update| update.apart_first.clone());
-                    Ok::<_, ()>(())
-                });
-                match (answer, first) {
-                    (Ok(Ok(())), Some(first)) => {
-                        if let Some(entry) = next.accounts.get_mut(&number) {
-                            entry.apart = first;
-                        }
-                    }
-                    _ => return Err(Refused("An account could not be brought to the new restore number (a number can go no higher). Nothing is served.".into())),
-                }
-            }
-            next.restore = new;
-            next.pending = Some(if mode == RestoreMode::Adopt { Pending::TakeAsIs { restore: new } } else { Pending::Restore { restore: new } });
+            let pending = if mode == RestoreMode::Adopt { Pending::TakeAsIs { restore: new } } else { Pending::Restore { restore: new } };
+            let next = planned(&self.store, self.data.connection(), new, mode, pending, now)?;
             self.write_store(next).map_err(refused)?;
         }
         // Begun before and done again: the time it is done at reaches the store first.
@@ -750,15 +808,60 @@ impl Keeper {
 
 pub type Said = Vec<String>;
 
-/// `put-back <copy>`: puts a copy of the data back by the supported way (12.4). The copy is
-/// checked first; the data it replaces is kept in `copies`; then, before anything is served,
-/// 12.4's steps. Refused while the backend serves.
+/// What was under way when a command is run, finished first, as a start would (12.4; the
+/// review's finding 4: one resume decision, `compare::resume`, for the start and both
+/// commands). `None` if nothing was; otherwise what was said.
+fn finish_first(state: &Path, folder: &Path, held: lock::Held, store: Store, now: u64) -> Result<Result<Said, lock::Held>, Refused> {
+    let staged = data::incoming(folder).exists();
+    match compare::resume(store.pending.as_ref(), staged, None) {
+        Resume::Nothing => return Ok(Err(held)),
+        Resume::PutInPlace { .. } => put_in_place(folder)?,
+        Resume::Stop(_) | Resume::Restore { .. } => {}
+    }
+    let data = match Data::open(folder, now).map_err(Refused)? {
+        Opened::Open(data) => data,
+        Opened::Absent => {
+            return Err(match compare::resume(store.pending.as_ref(), false, None) {
+                Resume::Stop(halt) => halted(halt, folder),
+                _ => halted(Halt::NoData, folder),
+            });
+        }
+    };
+    let meta = data.meta().map_err(|error| unreadable(&error))?;
+    let (adopt, restore) = match compare::resume(store.pending.as_ref(), false, Some(meta.restore)) {
+        Resume::Restore { restore, adopt } => (adopt, restore),
+        Resume::Stop(halt) => return Err(halted(halt, folder)),
+        Resume::Nothing | Resume::PutInPlace { .. } => return Err(Refused("What was under way can't be told. Nothing was changed.".into())),
+    };
+    let mut keeper = Keeper::with(state, folder, held, store, data)?;
+    let started = keeper.restore_data(now, if adopt { RestoreMode::Adopt } else { RestoreMode::DataOnly })?;
+    keeper.close();
+    Ok(Ok(vec![
+        format!("A {} begun earlier was cut off; it was finished first, under restore number {restore}, and nothing else was done.", if adopt { "take-as-is" } else { "restore of the data" }),
+        started.said(),
+        "Run the command again if there is more to do; otherwise start the backend again. Every person signs in again.".into(),
+    ]))
+}
+
+/// `put-back <copy>`: puts a copy of the data back by the supported way (12.4). Refused while
+/// the backend serves. In this order, each step lasting before the next (the review's
+/// findings 3 to 5):
+///
+/// 1. The copy is staged beside the data (SQLite's own copy, checked, the owner's alone).
+/// 2. That exact staged file is read, and core says whether this store can take it and
+///    under which restore number; each account's restore is planned by `kept`. **Any refusal
+///    here, or before, changes nothing.**
+/// 3. The data in use is kept, whole, as one checked file (or byte for byte if SQLite can't
+///    read it).
+/// 4. The plan goes to the store, whole: the new restore number and each device's number
+///    moved. From here a start, or the command run again, finishes it (`compare::resume`).
+/// 5. The staged copy takes the data's place; then 12.4's steps in the data.
 pub fn put_back(state: &Path, folder: &Path, copy: &Path, now: u64) -> Result<Said, Refused> {
     let held = lock::hold(state, folder).map_err(Refused)?;
     private::at_start(state, folder).map_err(Refused)?;
     apart::tidy(state);
     data::tidy(folder);
-    let mut store = match apart::read(state) {
+    let store = match apart::read(state) {
         Reading::Found(store) => store,
         Reading::Missing => {
             return Err(Refused(format!(
@@ -772,160 +875,206 @@ pub fn put_back(state: &Path, folder: &Path, copy: &Path, now: u64) -> Result<Sa
     if identity::read(state).map_err(Refused)? != Some(store.backend) {
         return Err(Refused(not_this_backends(state)));
     }
-    let source = data::open_to_read(copy, "The copy").map_err(Refused)?;
-    let (backend, written_at) = data::identify(&source).map_err(|error| Refused(format!("The copy can't be read: {}.", why(&error))))?;
-    if backend != store.backend {
-        return Err(Refused(format!("The copy is another backend's data (its id is {}; this one's is {}). Nothing was changed.", backend.to_hex(), store.backend.to_hex())));
-    }
-    let new = match store.pending {
-        Some(Pending::Restore { restore }) if store.restore.checked_add(1) == Some(restore) => restore,
-        _ => store.restore.checked_add(1).ok_or_else(|| Refused("The restore number can go no higher. Nothing was changed.".into()))?,
+    let held = match finish_first(state, folder, held, store.clone(), now)? {
+        Ok(said) => return Ok(said),
+        Err(held) => held,
     };
-    store.pending = Some(Pending::Restore { restore: new });
-    apart::write(state, &store).map_err(|error| Refused(store_failed(state, &error)))?;
-    let mut said = Vec::new();
-    let place = data::place(folder);
-    if place.exists() {
-        if let Ok(Opened::Open(current)) = Data::open(folder, now) {
-            current.close();
-        }
-        let copies_folder = copies::folder(folder);
-        fs::create_dir_all(&copies_folder).map_err(|error| Refused(format!("The folder for copies can't be made ({}).", error.kind())))?;
-        let aside = copies_folder.join(format!("replaced-{now}.db"));
-        for suffix in ["", "-wal", "-shm"] {
-            let from = PathBuf::from(format!("{}{suffix}", place.display()));
-            if from.exists() {
-                fs::rename(&from, PathBuf::from(format!("{}{suffix}", aside.display())))
-                    .map_err(|error| Refused(format!("The data being replaced couldn't be moved aside ({}). The put-back is not done: run it again.", error.kind())))?;
-            }
-        }
-        fs::File::open(folder).and_then(|folder| folder.sync_all()).map_err(|error| Refused(format!("The data folder couldn't be made lasting ({}).", error.kind())))?;
-        said.push(format!("The data it replaced is kept as {}.", aside.display()));
+    let nothing = |why: String| Refused(format!("{why} Nothing was changed."));
+    // 1. Staged, from the copy named.
+    let source = data::open_to_read(copy, "The copy").map_err(nothing)?;
+    let (backend, written_at) = data::identify(&source).map_err(|error| nothing(format!("The copy can't be read: {}.", why(&error))))?;
+    if backend != store.backend {
+        return Err(nothing(format!("The copy is another backend's data (its id is {}; this one's is {}).", backend.to_hex(), store.backend.to_hex())));
     }
-    copies::put(&source, &place).map_err(|why| Refused(format!("The copy couldn't be put in place: {why}. Run the put-back again.")))?;
+    // Put back already, and nothing written since: done (the command killed after its last
+    // step and run again).
+    if let Ok(live) = data::open_to_read(&data::place(folder), "The data") {
+        let (view, meta) = (data::view_of(&live), data::meta_of(&live));
+        if let (Ok(view), Ok(meta)) = (view, meta)
+            && compare::already_put_back(&store.view(&data::names_of(&live).unwrap_or_default()), &view, meta.restored_from, written_at)
+        {
+            return Ok(vec![format!(
+                "{} is already in place: it was put back under restore number {}, and nothing has been written since. Nothing was changed. Start the backend.",
+                copy.display(),
+                store.restore
+            )]);
+        }
+    }
+    let staged = copies::stage(&source, folder).map_err(|why| nothing(format!("The copy couldn't be staged beside the data: {why}.")))?;
     drop(source);
+    let unstage = |refused: Refused| {
+        let _ = fs::remove_file(&staged);
+        refused
+    };
+    // 2. The staged file itself, checked and planned by core before anything is recorded.
+    let plan = (|| -> Result<Store, Refused> {
+        let staged_data = data::open_to_read(&staged, "The staged copy").map_err(nothing)?;
+        let view = data::view_of(&staged_data).map_err(|error| nothing(format!("The copy can't be read: {}.", why(&error))))?;
+        let names = data::names_of(&staged_data).map_err(|error| nothing(format!("The copy can't be read: {}.", why(&error))))?;
+        let new = compare::put_back(&store.view(&names), &view).map_err(|refusal| {
+            nothing(match refusal {
+                NotPutBack::Contradiction(why) => format!("The copy can't be put back under this store kept apart: {}.", contradiction(why)),
+                NotPutBack::Spent => "The restore number can go no higher.".into(),
+                NotPutBack::UnderWay => "A restore is under way.".into(),
+            })
+        })?;
+        planned(&store, &staged_data, new, RestoreMode::DataOnly, Pending::PutBack { restore: new }, now)
+    })()
+    .map_err(unstage)?;
+    let new = plan.restore;
+    let mut said = vec![format!("Put back {} (its data's last step was at {written_at} ms).", copy.display())];
+    // 3. The data in use, kept whole before anything of it is replaced.
+    if data::place(folder).exists() {
+        let kept = match data::open_to_read(&data::place(folder), "The data") {
+            Ok(live) => copies::keep_replaced(&live, folder, new, now),
+            Err(_) => copies::keep_raw(folder, new, now),
+        }
+        .map_err(|why| unstage(nothing(format!("The data being replaced couldn't be kept: {why}."))))?;
+        said.push(format!("The data it replaced is kept as {}.", kept.display()));
+    }
+    // 4. The plan in the store, whole.
+    apart::write(state, &plan).map_err(|error| Refused(format!("{} Run the put-back again: it begins again, or finishes what was begun.", store_failed(state, &error))))?;
+    // 5. In place, then 12.4's steps in the data.
+    put_in_place(folder)?;
     let data = match Data::open(folder, now).map_err(Refused)? {
         Opened::Open(data) => data,
-        Opened::Absent => return Err(Refused("The copy was not in place once put there. Run the put-back again.".into())),
+        Opened::Absent => return Err(halted(Halt::CopyLost, folder)),
     };
-    let mut keeper = Keeper::with(state, folder, held, store, data)?;
+    let mut keeper = Keeper::with(state, folder, held, plan, data)?;
     let started = keeper.restore_data(now, RestoreMode::DataOnly)?;
     keeper.close();
-    said.insert(0, format!("Put back {} (its data's last step was at {written_at} ms).", copy.display()));
     said.push(started.said());
     said.push("Start the backend again. Every person signs in again.".into());
     Ok(said)
 }
 
 /// `take-as-is`: takes the data as it is when the store kept apart is lost, cannot be read,
-/// or does not belong with the data (12.4): a new restore number, every session ended, and
-/// nothing reset that it cannot know of. With no data, it starts again with none (every
-/// account made again by the admin), keeping what the store has. Refused while the backend
-/// serves, and when the store and the data agree.
+/// or does not belong with the data (12.4): a new restore number, every session ended. With
+/// no store of this backend that can be read, nothing says which passwords changed or which
+/// codes were used since, so **every account waits for a new one-time code** (12.4; the
+/// review's finding 1). With one, what it took away is kept. With no data, it starts again
+/// with none (every account made again by the admin), keeping what the store has. Refused
+/// while the backend serves, and when the store and the data agree. A readable old store
+/// stays in place until the new one is renamed over it whole (finding 2).
 pub fn take_as_is(state: &Path, folder: &Path, now: u64) -> Result<Said, Refused> {
     let held = lock::hold(state, folder).map_err(Refused)?;
     private::at_start(state, folder).map_err(Refused)?;
-    let found = find(state, folder, now)?;
-    match (found.id, found.store, found.data) {
-        (_, Reading::Missing, Opened::Absent) => Err(Refused("There is neither data nor a store kept apart: there is nothing to take. Start the backend, and it makes both.".into())),
-        (_, Reading::Unreadable(_), Opened::Absent) => {
-            Err(Refused("There is no data, and the store kept apart can't be read: there is nothing to take. Put a copy of the data back by hand into NEXUS_DATA and run this again.".into()))
-        }
-        (id, Reading::Found(mut store), Opened::Absent) => {
-            if id != Some(store.backend) {
-                return Err(Refused(not_this_backends(state)));
-            }
-            let data = Data::create(folder, &store.backend, now).map_err(Refused)?;
-            store.data_made = true;
-            let restore = store.restore.checked_add(1).ok_or_else(|| Refused("The restore number can go no higher.".into()))?;
-            store.pending = Some(Pending::Restore { restore });
-            apart::write(state, &store).map_err(|error| Refused(store_failed(state, &error)))?;
-            let mut keeper = Keeper::with(state, folder, held, store, data)?;
-            let started = keeper.restore_data(now, RestoreMode::DataOnly)?;
-            keeper.close();
-            Ok(vec![format!("There was no data: the backend starts again with none, under restore number {restore}. The admin makes each account again."), started.said()])
-        }
-        (id, store, Opened::Open(data)) => {
-            let meta = data.meta().map_err(|error| unreadable(&error))?;
-            let names = data.names().map_err(|error| unreadable(&error))?;
-            let view = data.view().map_err(|error| unreadable(&error))?;
-            let old = match store {
-                Reading::Found(store) => {
-                    if id == Some(store.backend) && meta.backend == store.backend && store.data_made && compare::compare(&store.view(&names), &view).contradiction.is_none() {
-                        return Err(Refused("The store kept apart is there and belongs with the data: there is nothing to take. Start the backend; it compares the two itself.".into()));
-                    }
-                    Some(store)
+    apart::tidy(state);
+    data::tidy(folder);
+    let id = identity::read(state).map_err(Refused)?;
+    let read = apart::read(state);
+    let theirs = whose(folder)?;
+    // Whose the data is, before anything of it is changed (finding 9).
+    if let (Some(id), Some(theirs)) = (id, theirs)
+        && id != theirs
+    {
+        return Err(Refused(format!(
+            "The data is another backend's: its id is {}, and {} says {}. Nothing was changed. Set NEXUS_DATA and NEXUS_STATE to one backend's folders; if this data is the one to serve, remove that file first.",
+            theirs.to_hex(),
+            state.join(identity::FILE).display(),
+            id.to_hex()
+        )));
+    }
+    let Some(theirs) = theirs else {
+        return match read {
+            Reading::Missing => Err(Refused("There is neither data nor a store kept apart: there is nothing to take. Start the backend, and it makes both.".into())),
+            Reading::Unreadable(_) => Err(Refused("There is no data, and the store kept apart can't be read: there is nothing to take. Put a copy of the data back by hand into NEXUS_DATA and run this again.".into())),
+            Reading::Found(store) => {
+                if id != Some(store.backend) {
+                    return Err(Refused(not_this_backends(state)));
                 }
-                _ => None,
-            };
-            if id.is_some_and(|id| id != meta.backend) {
-                return Err(Refused(format!(
-                    "The data is another backend's: its id is {}, and {} says {}. Nothing was changed. Set NEXUS_DATA and NEXUS_STATE to one backend's folders; if this data is the one to serve, remove that file first.",
-                    meta.backend.to_hex(),
-                    state.join(identity::FILE).display(),
-                    id.map_or_else(String::new, |id| id.to_hex())
-                )));
+                let held = match finish_first(state, folder, held, store.clone(), now)? {
+                    Ok(said) => return Ok(said),
+                    Err(held) => held,
+                };
+                let mut store = store;
+                let data = Data::create(folder, &store.backend, now).map_err(Refused)?;
+                store.data_made = true;
+                let restore = store.restore.checked_add(1).ok_or_else(|| Refused("The restore number can go no higher.".into()))?;
+                store.pending = Some(Pending::Restore { restore });
+                apart::write(state, &store).map_err(|error| Refused(store_failed(state, &error)))?;
+                let mut keeper = Keeper::with(state, folder, held, store, data)?;
+                let started = keeper.restore_data(now, RestoreMode::DataOnly)?;
+                keeper.close();
+                Ok(vec![format!("There was no data: the backend starts again with none, under restore number {restore}. The admin makes each account again."), started.said()])
             }
-            if id.is_none() {
-                identity::read_or_make(state, || Ok(*meta.backend.as_bytes())).map_err(Refused)?;
-            }
-            let mut said = vec!["Took the data as it is.".to_string()];
-            if apart::place(state).exists() {
-                let aside = apart::set_aside(state, now).map_err(|error| Refused(format!("The old store couldn't be put aside ({}). Nothing was changed.", error.kind())))?;
-                said.push(format!("The old store kept apart is kept as {}.", aside.display()));
-            }
-            // A new store from the data as it is ("an apart baseline rebuilt by S3 from data",
-            // C3r): what a readable old one knew that only goes up is kept.
-            let seal = match &old {
-                Some(old) => old.seal_key(),
-                // Lost with the store: what it sealed is made anew or typed in again (12.4).
-                None => random_bytes::<SECRET_BYTES>().map_err(Refused)?,
-            };
-            let high_water = now.max(meta.written_at).max(old.as_ref().map_or(0, |old| old.high_water));
-            let mut store = Store::new(meta.backend, random_bytes::<SECRET_BYTES>().map_err(Refused)?, seal, high_water);
-            let old_restore = old.as_ref().map_or(0, |old| old.restore);
-            let new = meta.restore.max(old_restore).checked_add(1).ok_or_else(|| Refused("The restore number can go no higher.".into()))?;
-            store.restore = meta.restore;
-            store.data_made = true;
-            store.set_up = old.as_ref().is_some_and(|old| old.set_up) || view.accounts.values().any(|rows| rows.account.admin);
-            store.mark = meta.changes;
-            store.next_account = view.accounts.keys().max().map_or(1, |n| n.saturating_add(1)).max(old.as_ref().map_or(1, |old| old.next_account));
-            let highest_device = view.accounts.values().flat_map(|rows| rows.devices.keys()).max().copied();
-            store.next_device = highest_device.map_or(1, |n| n.saturating_add(1)).max(old.as_ref().map_or(1, |old| old.next_device));
-            if let Some(old) = &old {
-                for (&number, account) in &old.accounts {
-                    if !view.accounts.contains_key(&number) {
-                        let mut tombstone = account.clone();
-                        tombstone.apart.account.status = Status::Deleted;
-                        store.accounts.insert(number, tombstone);
-                    }
+        };
+    };
+    // The authority there still is: a readable store of this data's backend.
+    let authority = match read {
+        Reading::Found(store) if store.backend == theirs => Some(store),
+        _ => None,
+    };
+    let held = match &authority {
+        Some(store) if id == Some(theirs) && store.data_made => match finish_first(state, folder, held, store.clone(), now)? {
+            Ok(said) => return Ok(said),
+            Err(held) => held,
+        },
+        _ => held,
+    };
+    let data = match Data::open(folder, now).map_err(Refused)? {
+        Opened::Open(data) => data,
+        Opened::Absent => return Err(Refused("The data was not there once opened. Nothing was changed.".into())),
+    };
+    let meta = data.meta().map_err(|error| unreadable(&error))?;
+    let names = data.names().map_err(|error| unreadable(&error))?;
+    let view = data.view().map_err(|error| unreadable(&error))?;
+    if id.is_some() && !compare::needs_taking(authority.as_ref().filter(|store| store.data_made).map(|store| store.view(&names)).as_ref(), &view) {
+        return Err(Refused("The store kept apart is there and belongs with the data: there is nothing to take. Start the backend; it compares the two itself.".into()));
+    }
+    // A new store from the data as it is, planned whole before anything is written.
+    let old = authority.as_ref();
+    let seal = match old {
+        Some(old) => old.seal_key(),
+        // Lost with the store: what it sealed is made anew or typed in again (12.4).
+        None => random_bytes::<SECRET_BYTES>().map_err(Refused)?,
+    };
+    let key = random_bytes::<SECRET_BYTES>().map_err(Refused)?;
+    let high_water = now.max(meta.written_at).max(old.map_or(0, |old| old.high_water));
+    let mut store = Store::new(meta.backend, key, seal, high_water);
+    let new = meta.restore.max(old.map_or(0, |old| old.restore)).checked_add(1).ok_or_else(|| Refused("The restore number can go no higher. Nothing was changed.".into()))?;
+    store.restore = meta.restore;
+    store.data_made = true;
+    store.set_up = old.is_some_and(|old| old.set_up) || view.accounts.values().any(|rows| rows.account.admin);
+    store.mark = meta.changes;
+    store.next_account = view.accounts.keys().max().map_or(1, |n| n.saturating_add(1)).max(old.map_or(1, |old| old.next_account));
+    let highest_device = view.accounts.values().flat_map(|rows| rows.devices.keys()).chain(old.into_iter().flat_map(|old| old.accounts.values().flat_map(|account| account.apart.devices.keys()))).max().copied();
+    store.next_device = highest_device.map_or(1, |n| n.saturating_add(1)).max(old.map_or(1, |old| old.next_device));
+    if let Some(old) = old {
+        for (&number, account) in &old.accounts {
+            if !view.accounts.contains_key(&number) {
+                let mut tombstone = account.clone();
+                tombstone.apart.account.status = Status::Deleted;
+                for device in tombstone.apart.devices.values_mut() {
+                    device.permit = None;
                 }
+                store.accounts.insert(number, tombstone);
             }
-            for (&number, rows) in &view.accounts {
-                let devices = rows
-                    .devices
-                    .iter()
-                    .map(|(&id, device)| {
-                        let session = device.session.as_ref();
-                        let record = ApartDevice {
-                            number: device.number,
-                            last_session: session.map_or(0, |session| session.id),
-                            last_leave: session.and_then(|session| session.leave).map_or(0, |leave| leave.fields().3),
-                            permit: None,
-                        };
-                        (id, record)
-                    })
-                    .collect();
-                store.accounts.insert(number, Account { name: apart::name_fingerprint(rows.account.name.as_str()), apart: Apart { account: rows.account.clone(), devices } });
-            }
-            store.pending = Some(Pending::TakeAsIs { restore: new });
-            apart::write(state, &store).map_err(|error| Refused(store_failed(state, &error)))?;
-            let mut keeper = Keeper::with(state, folder, held, store, data)?;
-            let started = keeper.restore_data(now, RestoreMode::Adopt)?;
-            keeper.close();
-            said.push(started.said());
-            said.push("Start the backend again.".into());
-            Ok(said)
         }
     }
+    for (&number, rows) in &view.accounts {
+        let was = old.and_then(|old| old.apart(number, Some(&rows.account.name)));
+        let apart = compare::recovery_baseline(rows, was.as_ref());
+        store.accounts.insert(number, Account { name: apart::name_fingerprint(rows.account.name.as_str()), apart });
+    }
+    let plan = planned(&store, data.connection(), new, RestoreMode::Adopt, Pending::TakeAsIs { restore: new }, now)?;
+    let mut said = vec!["Took the data as it is.".to_string()];
+    if old.is_none() {
+        said.push("Nothing says which passwords changed or which one-time codes were used since the store kept apart was lost: every account waits for a new one-time code (the admin's first, by the recovery command).".into());
+    }
+    // The old store, kept as it is beside the new; the new is renamed over it whole.
+    if apart::place(state).exists() {
+        let aside = apart::keep_aside(state, now).map_err(|error| Refused(format!("The old store couldn't be kept aside ({}). Nothing was changed.", error.kind())))?;
+        said.push(format!("The old store kept apart is kept as {}.", aside.display()));
+    }
+    if id.is_none() {
+        identity::read_or_make(state, || Ok(*meta.backend.as_bytes())).map_err(Refused)?;
+    }
+    apart::write(state, &plan).map_err(|error| Refused(format!("{} Run take-as-is again.", store_failed(state, &error))))?;
+    let mut keeper = Keeper::with(state, folder, held, plan, data)?;
+    let started = keeper.restore_data(now, RestoreMode::Adopt)?;
+    keeper.close();
+    said.push(started.said());
+    said.push("Start the backend again.".into());
+    Ok(said)
 }
