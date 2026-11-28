@@ -66,7 +66,7 @@ fn preview_save_and_c6_upload_have_the_same_clean_text() -> std::io::Result<()> 
     let saved = dir.0.join("data/diagnostics.txt");
     fs::write(&crash, [
         b"Old bytes \xff\n".as_slice(),
-        format!("2023-11-14 22:13:25 UTC version {key} thread {email} at {folder}\\src\\audio\\exclusive.rs:71: index out of bounds: {text}\n").as_bytes(),
+        format!("2023-11-14 22:13:25 UTC version {key} thread {email} at src/audio/exclusive.rs:71: index out of bounds: {text}\n").as_bytes(),
         format!("2023-11-14 22:13:26 UTC version 0.40.13 thread {token} at src/controller.rs:1: already borrowed: {song}\n").as_bytes(),
         format!("2023-11-14 22:13:27 UTC version 0.40.13 thread main at {folder}\\{artist}.rs:222: {album}\n{odd}{playlist}\n").as_bytes(),
         b"bad date UTC version 0.40.13 thread main at src/main.rs:76: no message\n",
@@ -88,9 +88,9 @@ fn preview_save_and_c6_upload_have_the_same_clean_text() -> std::io::Result<()> 
         "2023-11-14 22:13:24  App message shown  (3 times since 2023-11-14 22:13:21)",
         "2023-11-14 22:13:22  Downloads folder changed",
         "2023-11-14 22:13:25  Fault in playback: other  (2 times since 2023-11-14 22:13:20)",
-        "2023-11-14 22:13:25  Fault in audio output: out of bounds",
-        "2023-11-14 22:13:26  Fault in app: borrow conflict",
-        "2023-11-14 22:13:27  Fault in app: panic",
+        "2023-11-14 22:13:25  Fault in audio output: out of bounds at exclusive.rs:71",
+        "2023-11-14 22:13:26  Fault in app: borrow conflict at controller.rs:1",
+        "2023-11-14 22:13:27  Fault in app: panic at other:222",
     ] {
         assert!(preview.contains(expected), "missing {expected:?} in {preview:?}");
     }
@@ -120,10 +120,10 @@ fn the_hook_writes_no_panic_payload_even_to_the_crash_log() -> std::io::Result<(
     assert_eq!(line.lines().count(), 1);
     let (at, words) = line.trim_end_matches('\n').split_once('\t').unwrap();
     assert!(at.parse::<u64>().is_ok());
-    assert_eq!(words, "Fault in app: borrow conflict");
-    append_fault(&log, AT as u64 * 1_000, r"C:\Users\ExampleLocal\src\audio\engine.rs", PRIVATE)?;
+    assert!(words.starts_with("Fault in app: borrow conflict at tests.rs:"));
+    append_fault(&log, AT as u64 * 1_000, Some(("src/audio/engine.rs", 82)), PRIVATE)?;
     let text = fs::read_to_string(log)?;
-    assert!(text.ends_with("1700000000000\tFault in playback: panic\n"));
+    assert!(text.ends_with("1700000000000\tFault in playback: panic at engine.rs:82\n"));
     assert!(!text.contains("ExampleLocal"));
     Ok(())
 }
@@ -151,7 +151,7 @@ fn typed_window_observations_join_the_clean_record() {
     let expected = [
         Line::Note(Note::MediaButtonStarted),
         Line::Note(Note::MediaButtonNothingToResume),
-        Line::Fault(Fault { place: FaultPlace::Foreground, shape: FaultShape::Refused }),
+        Line::Fault(Fault::new(FaultPlace::Foreground, FaultShape::Refused)),
     ];
     for line in expected {
         observe(line);

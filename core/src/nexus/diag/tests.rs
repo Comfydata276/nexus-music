@@ -306,7 +306,7 @@ fn names_paths_addresses_keys_tokens_and_odd_characters_never_survive() {
     }
     for &(place, _) in PLACES {
         for &(shape, _) in SHAPES {
-            let line = Line::Fault(Fault { place, shape });
+            let line = Line::Fault(Fault::new(place, shape));
             assert_eq!(clean_line(&line.to_string()), Some(line));
             if record.entries().len() < MAX_ENTRIES {
                 record.note(AT, line);
@@ -452,7 +452,7 @@ fn journal_loss_totals_are_separate_and_cannot_age_out() {
 #[test]
 fn repeated_startup_timings_replace_one_line_and_leave_faults_visible() {
     let mut record = Record::default();
-    let fault = Line::Fault(Fault { place: FaultPlace::Foreground, shape: FaultShape::Refused });
+    let fault = Line::Fault(Fault::new(FaultPlace::Foreground, FaultShape::Refused));
     record.note(AT, fault);
     for ms in 0..500 {
         record.note(AT, Line::ForegroundAfterMs(ms));
@@ -502,12 +502,12 @@ fn panic_payloads_only_contribute_a_closed_shape() {
         let payload = format!("{message}: {path} for {name}\nBearer {token}");
         let classified = classify_rust_panic(&payload);
         assert_eq!(classified, shape);
-        record.note(AT, Line::Fault(Fault { place: FaultPlace::App, shape: classified }));
+        record.note(AT, Line::Fault(Fault::new(FaultPlace::App, classified)));
     }
     for empty in ["", " \n", "no message", "no payload"] {
         assert_eq!(classify_rust_panic(empty), NoPayload);
     }
-    record.note(AT, Line::Fault(Fault { place: FaultPlace::App, shape: NoPayload }));
+    record.note(AT, Line::Fault(Fault::new(FaultPlace::App, NoPayload)));
 
     let report = report(record);
     let text = report.text().unwrap();
@@ -547,4 +547,25 @@ fn a_far_future_attempt_cannot_block_diagnostics_after_clock_correction() {
     first_use.note_fault(corrected);
     assert_eq!(first_use.started_ms(), corrected);
     assert_eq!(first_use.due(corrected + FAULT_WAIT_MS, true, true), Some(Due::Fault));
+}
+
+#[test]
+fn a_panic_location_carries_only_the_known_basename_and_line() {
+    let root = r"C:\Users\ExampleLocal\Nexus";
+    let file = SourceFile::from_location(r"C:\Users\ExampleLocal\Nexus\src\controller.rs", root);
+    assert_eq!(file, SourceFile::Controller);
+    assert_eq!(
+        SourceFile::from_location(r"C:\Users\ExampleLocal\.cargo\registry\src\controller.rs", root),
+        SourceFile::Other,
+    );
+    let line = Line::Fault(Fault {
+        place: FaultPlace::App,
+        shape: FaultShape::BorrowConflict,
+        source: Some(Source { file, line: 728 }),
+    });
+    let text = line.to_string();
+    assert_eq!(text, "Fault in app: borrow conflict at controller.rs:728");
+    assert!(!text.contains("ExampleLocal"));
+    assert_eq!(clean_line(&text), Some(line));
+    assert_eq!(clean_line("Fault in app: panic at C:/Users/ExampleLocal/controller.rs:728"), None);
 }

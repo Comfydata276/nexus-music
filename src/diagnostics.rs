@@ -175,17 +175,14 @@ pub fn install_panic_hook() {
         let message = panic.payload().downcast_ref::<&str>().copied()
             .or_else(|| panic.payload().downcast_ref::<String>().map(String::as_str))
             .unwrap_or("no payload");
-        let path = panic.location().map(|at| at.file()).unwrap_or_default();
+        let location = panic.location().map(|at| (at.file(), at.line()));
         let at = Utc::now().timestamp_millis().try_into().unwrap_or_default();
-        let _ = append_fault(&log, at, path, message);
+        let _ = append_fault(&log, at, location, message);
     }));
 }
 
-fn append_fault(log: &Path, at: u64, path: &str, message: &str) -> std::io::Result<()> {
-    let fault = diag::Line::Fault(diag::Fault {
-        place: windows_observations::place(path),
-        shape: diag::classify_rust_panic(message),
-    });
+fn append_fault(log: &Path, at: u64, location: Option<(&str, u32)>, message: &str) -> std::io::Result<()> {
+    let fault = windows_observations::panic(location, message);
     let line = format!("{at}\t{fault}\n");
     if let Some(folder) = log.parent() {
         fs::create_dir_all(folder)?;
@@ -241,7 +238,7 @@ fn recent_crash_text(path: &Path) -> std::io::Result<String> {
 // from older versions. Only the time, a fixed place and C6's classified shape leave here.
 mod windows_observations {
     use chrono::NaiveDateTime;
-    use nexus_core::nexus::diag::{self, Fault, FaultPlace, FaultShape, Line, Note};
+    use nexus_core::nexus::diag::{self, Fault, FaultPlace, FaultShape, Line, Note, Source, SourceFile};
 
     use super::Observation;
 
@@ -265,7 +262,7 @@ mod windows_observations {
             ("Not enough room there: the downloads come to ", Downloads, Write),
         ];
         FAULTS.iter().find_map(|&(prefix, place, shape)| {
-            text.starts_with(prefix).then_some(Line::Fault(Fault { place, shape }))
+            text.starts_with(prefix).then_some(Line::Fault(Fault::new(place, shape)))
         }).unwrap_or(Line::Note(Note::AppMessage))
     }
 
@@ -288,26 +285,26 @@ mod windows_observations {
         let (_, rest) = rest.split_once(" thread ")?;
         let (_, rest) = rest.split_once(" at ")?;
         let (location, message) = rest.split_once(": ")?;
-        let path = location.rsplit_once(':')
-            .filter(|(_, line)| line.parse::<u32>().is_ok())
-            .map_or("", |(file, _)| file);
-        Some((at, Line::Fault(Fault {
-            place: place(path),
-            shape: diag::classify_rust_panic(message),
-        })))
+        let location = location.rsplit_once(':')
+            .and_then(|(file, line)| Some((file, line.parse().ok()?)));
+        Some((at, panic(location, message)))
     }
 
-    pub(super) fn place(path: &str) -> FaultPlace {
-        match path.rsplit(['/', '\\']).next() {
-            Some("playback.rs" | "engine.rs" | "source.rs" | "dsp.rs") => FaultPlace::Playback,
-            Some("exclusive.rs" | "media.rs") => FaultPlace::AudioOutput,
-            Some("downloads.rs" | "songcache.rs") => FaultPlace::Downloads,
-            Some("subsonic.rs" | "offline.rs") => FaultPlace::MusicServer,
-            Some("nexus.rs" | "signin.rs") => FaultPlace::NexusServer,
-            Some("actions.rs" | "pages.rs" | "search.rs" | "playlists.rs" | "covers.rs") => FaultPlace::Library,
-            Some("journal.rs") => FaultPlace::Journal,
+    pub(super) fn panic(location: Option<(&str, u32)>, message: &str) -> Line {
+        let source = location.map(|(path, line)| Source {
+            file: SourceFile::from_location(path, env!("CARGO_MANIFEST_DIR")),
+            line,
+        });
+        let place = match source.map(|source| source.file) {
+            Some(SourceFile::Playback | SourceFile::Engine | SourceFile::Source | SourceFile::Dsp) => FaultPlace::Playback,
+            Some(SourceFile::Exclusive) => FaultPlace::AudioOutput,
+            Some(SourceFile::Downloads | SourceFile::Songcache) => FaultPlace::Downloads,
+            Some(SourceFile::Subsonic | SourceFile::Offline) => FaultPlace::MusicServer,
+            Some(SourceFile::Nexus) => FaultPlace::NexusServer,
+            Some(SourceFile::Actions | SourceFile::Pages | SourceFile::Search | SourceFile::Playlists | SourceFile::Covers) => FaultPlace::Library,
             _ => FaultPlace::App,
-        }
+        };
+        Line::Fault(Fault { place, shape: diag::classify_rust_panic(message), source })
     }
 }
 

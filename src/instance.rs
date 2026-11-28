@@ -93,5 +93,5 @@ pub fn focus(ui: &crate::ui::MainWindow) {
         }
         _ => FaultShape::Unavailable,
     };
-    crate::diagnostics::observe(Line::Fault(Fault { place: FaultPlace::Foreground, shape }));
+    crate::diagnostics::observe(Line::Fault(Fault::new(FaultPlace::Foreground, shape)));
 }

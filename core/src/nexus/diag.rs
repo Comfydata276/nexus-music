@@ -14,7 +14,7 @@ use super::events::{LossCounts, TIME_MAX_MS};
 use super::proto::Version;
 use super::wire::{self, BadMessage, Fields, WireBody};
 
-pub use super::events::{Fault, FaultPlace, FaultShape, Wrong};
+pub use super::events::{FaultPlace, FaultShape, Wrong};
 
 pub const MAX_ENTRIES: usize = 200;
 pub const MAX_LINE_CHARS: usize = 300;
@@ -202,6 +202,122 @@ macro_rules! words {
             }
         }
     };
+}
+
+/// Known app source files. The display spelling is a basename, never an input path.
+macro_rules! source_files {
+    ($($kind:ident => $relative:literal, $basename:literal;)+) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum SourceFile {
+            $($kind,)+
+            Other,
+        }
+
+        impl SourceFile {
+            /// Rust can supply a relative app path or an absolute path under the app's
+            /// compile-time project root. A dependency is outside that root.
+            pub fn from_location(path: &str, app_root: &str) -> Self {
+                let path = path.replace('\\', "/");
+                let root = app_root.replace('\\', "/");
+                let relative = path.strip_prefix(root.trim_end_matches('/'))
+                    .and_then(|suffix| suffix.strip_prefix('/'))
+                    .unwrap_or(&path);
+                match relative {
+                    $($relative => Self::$kind,)+
+                    _ => Self::Other,
+                }
+            }
+
+            fn text(self) -> &'static str {
+                match self {
+                    $(Self::$kind => $basename,)+
+                    Self::Other => "other",
+                }
+            }
+
+            fn read(text: &str) -> Option<Self> {
+                match text {
+                    $($basename => Some(Self::$kind),)+
+                    "other" => Some(Self::Other),
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
+source_files! {
+    Actions => "src/actions.rs", "actions.rs";
+    Added => "src/added.rs", "added.rs";
+    Asked => "src/asked.rs", "asked.rs";
+    Dsp => "src/audio/dsp.rs", "dsp.rs";
+    Engine => "src/audio/engine.rs", "engine.rs";
+    Exclusive => "src/audio/exclusive.rs", "exclusive.rs";
+    Mod => "src/audio/mod.rs", "mod.rs";
+    Source => "src/audio/source.rs", "source.rs";
+    Bulk => "src/bulk.rs", "bulk.rs";
+    Config => "src/config.rs", "config.rs";
+    Controller => "src/controller.rs", "controller.rs";
+    Corehttp => "src/corehttp.rs", "corehttp.rs";
+    Covers => "src/covers.rs", "covers.rs";
+    Tests => "src/diagnostics/tests.rs", "tests.rs";
+    Diagnostics => "src/diagnostics.rs", "diagnostics.rs";
+    Discover => "src/discover.rs", "discover.rs";
+    Downloads => "src/downloads.rs", "downloads.rs";
+    Frame => "src/frame.rs", "frame.rs";
+    Gate => "src/gate.rs", "gate.rs";
+    Import => "src/import.rs", "import.rs";
+    Instance => "src/instance.rs", "instance.rs";
+    Jam => "src/jam.rs", "jam.rs";
+    Keep => "src/keep.rs", "keep.rs";
+    Lidarr => "src/lidarr.rs", "lidarr.rs";
+    Link => "src/link.rs", "link.rs";
+    Listenbrainz => "src/listenbrainz.rs", "listenbrainz.rs";
+    Lyrics => "src/lyrics.rs", "lyrics.rs";
+    Main => "src/main.rs", "main.rs";
+    Media => "src/media.rs", "media.rs";
+    Mixes => "src/mixes.rs", "mixes.rs";
+    Musicbrainz => "src/musicbrainz.rs", "musicbrainz.rs";
+    Nexus => "src/nexus.rs", "nexus.rs";
+    Offline => "src/offline.rs", "offline.rs";
+    Pages => "src/pages.rs", "pages.rs";
+    Picker => "src/picker.rs", "picker.rs";
+    Meanwhile => "src/pins/meanwhile.rs", "meanwhile.rs";
+    Pins => "src/pins.rs", "pins.rs";
+    Playback => "src/playback.rs", "playback.rs";
+    Playlists => "src/playlists.rs", "playlists.rs";
+    Plays => "src/plays.rs", "plays.rs";
+    Pool => "src/pool.rs", "pool.rs";
+    Saver => "src/saver.rs", "saver.rs";
+    Search => "src/search.rs", "search.rs";
+    Songcache => "src/songcache.rs", "songcache.rs";
+    Subsonic => "src/subsonic.rs", "subsonic.rs";
+    Sync => "src/sync.rs", "sync.rs";
+    Taskbar => "src/taskbar.rs", "taskbar.rs";
+    NetworkTests => "src/update/network_tests.rs", "network_tests.rs";
+    Update => "src/update.rs", "update.rs";
+    Ways => "src/ways.rs", "ways.rs";
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Source {
+    pub file: SourceFile,
+    pub line: u32,
+}
+
+/// Diagnostics can locate a panic within the app. Journal faults keep their original
+/// shape and wire format in the events module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fault {
+    pub place: FaultPlace,
+    pub shape: FaultShape,
+    pub source: Option<Source>,
+}
+
+impl Fault {
+    pub const fn new(place: FaultPlace, shape: FaultShape) -> Self {
+        Self { place, shape, source: None }
+    }
 }
 
 words!(Reach {
@@ -393,12 +509,13 @@ impl fmt::Display for Line {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Note(note) => f.write_str(note.text()),
-            Self::Fault(fault) => write!(
-                f,
-                "Fault in {}: {}",
-                label(PLACES, fault.place),
-                label(SHAPES, fault.shape)
-            ),
+            Self::Fault(fault) => {
+                write!(f, "Fault in {}: {}", label(PLACES, fault.place), label(SHAPES, fault.shape))?;
+                if let Some(source) = fault.source {
+                    write!(f, " at {}:{}", source.file.text(), source.line)?;
+                }
+                Ok(())
+            }
             Self::SessionEnded(why) => write!(f, "Nexus session ended: {}", why.text()),
             Self::ForegroundAfterMs(ms) => write!(f, "Foreground entered after {ms} ms"),
             Self::DownloadJobStopped(reason) => {
@@ -417,9 +534,17 @@ impl Line {
         }
         if let Some(fault) = text.strip_prefix("Fault in ") {
             let (place, shape) = fault.split_once(": ")?;
+            let (shape, source) = match shape.split_once(" at ") {
+                Some((shape, source)) => {
+                    let (file, line) = source.split_once(':')?;
+                    (shape, Some(Source { file: SourceFile::read(file)?, line: number(line)? }))
+                }
+                None => (shape, None),
+            };
             return Some(Self::Fault(Fault {
                 place: word(PLACES, place)?,
                 shape: word(SHAPES, shape)?,
+                source,
             }));
         }
         if let Some(why) = text.strip_prefix("Nexus session ended: ") {
