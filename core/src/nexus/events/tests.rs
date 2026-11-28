@@ -770,6 +770,7 @@ fn stats_reads_only_bounded_pages_of_starts() {
         starts: 1,
         recent: vec![RecentPlay { device: DeviceId::new(32).unwrap(), event: start(1) }],
         next: None,
+        account_revision: None,
     };
     let reply = Reply::Done { result: page, receipt: receipt(5) };
     let bytes = account::encode(&reply).unwrap();
@@ -777,6 +778,12 @@ fn stats_reads_only_bounded_pages_of_starts() {
     let original: Value = serde_json::from_slice(bytes.bytes()).unwrap();
     let read = |value: &Value| read_stats_reply(200, &serde_json::to_vec(value).unwrap());
     let path = "/done/result";
+    let mut revised = original.clone();
+    revised.pointer_mut(path).unwrap()["account_revision"] = json!(12);
+    assert!(matches!(read(&revised), Ok(Reply::Done { result: StatsPage { account_revision: Some(12), .. }, .. })));
+    revised.pointer_mut(path).unwrap()["account_revision"] = json!(null);
+    assert_eq!(read(&revised), Err(BadMessage::Form));
+
     let mut invalid = original.clone();
     invalid.pointer_mut(path).unwrap()["recent"][0]["event"] = json!(event(2, Kind::Fault { fault: fault(), count: 1 }));
     assert_eq!(read(&invalid), Err(BadMessage::Form));

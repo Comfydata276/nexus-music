@@ -79,6 +79,9 @@ pub struct StatsPage {
     pub starts: u64,
     pub recent: Vec<RecentPlay>,
     pub next: Option<StatsCursor>,
+    /// The current revision of this session's account. Older servers omit it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_revision: Option<u64>,
 }
 
 impl wire::Value for StatsPage {
@@ -89,7 +92,12 @@ impl wire::Value for StatsPage {
             return Err(BadMessage::Form);
         }
         let recent = rows.into_iter().map(RecentPlay::read).collect::<Result<Vec<_>, _>>()?;
-        let page = Self { starts: fields.get("starts")?, recent, next: fields.get("next")? };
+        let page = Self {
+            starts: fields.get("starts")?,
+            recent,
+            next: fields.get("next")?,
+            account_revision: fields.0.get("account_revision").map(|raw| u64::read(raw)).transpose()?,
+        };
         page.check()?;
         Ok(page)
     }

@@ -359,13 +359,21 @@ fn a_password_grant_erases_only_its_owners_history_and_fences_old_life() {
     let old = batch(&stamp, &[start(1, 100, 0)]);
     assert_outcomes(send(&fixture, &who, &old), &old, &[Outcome::Taken]);
     assert_eq!(json::<i64>(&fixture.stats(&other, &other_stamp, None), "$.done.result.starts"), 0);
+    let body = fixture.stats(&who, &stamp, None);
+    let Reply::Done { result, receipt } = events::read_stats_reply(200, &body).unwrap() else {
+        panic!("stats refused");
+    };
+    assert_eq!(receipt.stamp.account, who.person.id);
+    assert_eq!(result.starts, 1);
+    let revision = result.account_revision.unwrap();
+    assert_eq!(revision, who.person.revision);
     let id = RequestId::new(19).unwrap();
     let grant = account::encode(&GrantRequest {
         head: head(&stamp),
         password: Password::presented(PASSWORD).unwrap(),
         change: GrantChange::DeleteListeningData {
             account: who.person.id,
-            target_revision: who.person.revision,
+            target_revision: revision,
             request_id: id,
         },
     }).unwrap();
@@ -377,7 +385,7 @@ fn a_password_grant_erases_only_its_owners_history_and_fences_old_life() {
     let delete = account::encode(&DeleteListeningData {
         head: head(&stamp),
         request_id: id,
-        change: DeleteListeningDataTarget { account: who.person.id, target_revision: who.person.revision },
+        change: DeleteListeningDataTarget { account: who.person.id, target_revision: revision },
         grant,
     }).unwrap();
     assert_eq!(fixture.post(account::DELETE_LISTENING_DATA, Some(&other), delete.bytes()).0, 403);
