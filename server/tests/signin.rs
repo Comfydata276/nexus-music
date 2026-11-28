@@ -96,11 +96,16 @@ impl Serving {
 
     /// One POST, as the proxy sends it, and its status and body.
     fn post(&self, path: &str, session: Option<&account::Session>, body: &[u8]) -> (u16, Vec<u8>) {
+        self.post_with(path, session, "", body)
+    }
+
+    /// The same, with more headers (each line ending in CRLF).
+    fn post_with(&self, path: &str, session: Option<&account::Session>, more: &str, body: &[u8]) -> (u16, Vec<u8>) {
         let mut stream = TcpStream::connect(self.at).unwrap();
         stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
         let authorization = session.map_or_else(String::new, |session| format!("Authorization: {}\r\n", session.authorization().as_str()));
         let head = format!(
-            "POST {path} HTTP/1.1\r\nHost: nexus\r\nX-Nexus-Scheme: https\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{authorization}Connection: close\r\n\r\n",
+            "POST {path} HTTP/1.1\r\nHost: nexus\r\nX-Nexus-Scheme: https\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{authorization}{more}Connection: close\r\n\r\n",
             body.len()
         );
         stream.write_all(head.as_bytes()).unwrap();
@@ -451,4 +456,44 @@ fn a_guess_inside_the_wait_is_told_to_come_back_and_a_changed_password_ends_the_
     };
     let (status, body) = backend.post(account::CHANGE_PASSWORD, Some(&pc_again.session), account::encode(&change).unwrap().bytes());
     assert_eq!(refusal(account::read_reply::<account::PasswordChanged>(status, &body).unwrap()), Refusal::NotAllowed(NotAllowed::PasswordNotAllowed));
+}
+
+#[test]
+fn the_admin_page_signs_in_from_its_own_origin_only_and_is_handed_no_music_login() {
+    const PAGE: &str = "https://nexus.example.test";
+    let folders = Folders::new("page");
+    let port = free_port();
+    let mut settings = folders.settings(port);
+    settings.push(("NEXUS_PUBLIC_ORIGIN", PAGE.into()));
+    let code = set_up(&settings, EMAIL);
+    let backend = Serving::start(&settings, port);
+    let (status, body) = backend.post(account::SIGN_IN, None, &sign_in(Credential::Code { code, new_password: Password::new(PASSWORD).unwrap() }, 1, "Robin's PC", DeviceKind::Pc));
+    signed_in(status, &body);
+    // 7.3: the page's sign-in, from its own origin, marked, as JSON.
+    let page = format!("Origin: {PAGE}\r\nX-Nexus-Admin: 1\r\n");
+    let (status, body) = backend.post_with(account::SIGN_IN, None, &page, &sign_in(with_password(EMAIL, PASSWORD), 7, "Nexus admin browser", DeviceKind::Pc));
+    let signed = signed_in(status, &body);
+    assert!(signed.person.admin);
+    assert_eq!(signed.music, MusicLoginResult::NoneSetYet);
+    // From anywhere else, or unmarked, or doubled: refused before anything is checked.
+    for other in [
+        "Origin: https://other.example.test\r\nX-Nexus-Admin: 1\r\n",
+        "Origin: https://nexus.example.test:8443\r\nX-Nexus-Admin: 1\r\n",
+        "Origin: http://nexus.example.test\r\nX-Nexus-Admin: 1\r\n",
+        "Origin: https://nexus.example.test\r\n",
+        "X-Nexus-Admin: 1\r\n",
+        "Origin: https://nexus.example.test\r\nX-Nexus-Admin: 1\r\nX-Nexus-Admin: 1\r\n",
+    ] {
+        let (status, _) = backend.post_with(account::SIGN_IN, None, other, &sign_in(with_password(EMAIL, PASSWORD), 7, "Nexus admin browser", DeviceKind::Pc));
+        assert_eq!(status, 400, "{other}");
+    }
+    // The page's session works for a session's calls from the page too.
+    assert_eq!(backend.post_with(account::LIST_DEVICES, Some(&signed.session), &page, account::encode(&ListDevices { head: speaks(signed.restore), after: None }).unwrap().bytes()).0, 200);
+    drop(backend);
+    // With NEXUS_PUBLIC_ORIGIN unset, the page cannot sign in at all, and the log says so.
+    let plain = folders.settings(port);
+    let mut backend = Serving::start(&plain, port);
+    let (status, _) = backend.post_with(account::SIGN_IN, None, &page, &sign_in(with_password(EMAIL, PASSWORD), 7, "Nexus admin browser", DeviceKind::Pc));
+    assert_eq!(status, 400);
+    assert!(backend.stop().contains("NEXUS_PUBLIC_ORIGIN is not given"));
 }
