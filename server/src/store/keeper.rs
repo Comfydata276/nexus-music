@@ -115,9 +115,11 @@ pub struct Keeper {
     changes: u64,
     /// The latest time acted at, as the running backend has it (the lead's ruling of 28 Nov
     /// 13:59): written to the store with every step that changes a row, and otherwise once it
-    /// is a minute ahead of what the store has; so at a start it is taken as the store's
-    /// plus that minute, and a clock set back across a restart reopens nothing.
+    /// is a minute ahead of what the store has (`Effects::clock_mark_due`).
     high_water: u64,
+    /// The clock as loaded (`kept::Clock::after_load`): the store's time plus the minute it
+    /// may lag by, a floor kept in this process alone and never written back (core-fu's M1).
+    loaded: Clock,
     broken: bool,
 }
 
@@ -221,12 +223,10 @@ fn put_in_place(folder: &Path) -> Result<(), Refused> {
 /// What a restore makes of the store (12.4 steps 1 to 4, in the store first): the new
 /// restore number, and each account as `kept::Account::restore` decides it from the rows on
 /// `rows` (the data in place, or the exact copy staged to take its place). Nothing written.
-fn planned(store: &Store, rows: &rusqlite::Connection, new: u64, mode: RestoreMode, pending: Pending, now: u64) -> Result<Store, Refused> {
+fn planned(store: &Store, rows: &rusqlite::Connection, new: u64, mode: RestoreMode, pending: Pending, clock: Clock) -> Result<Store, Refused> {
     let names = data::names_of(rows).map_err(|error| unreadable(&error))?;
     let meta = data::meta_of(rows).map_err(|error| unreadable(&error))?;
     let mut next = store.clone();
-    next.high_water = next.high_water.max(now);
-    let clock = Clock { now, high_water: next.high_water };
     for number in store.accounts.keys().copied().collect::<Vec<_>>() {
         let rows = data::rows_of(rows, &meta, number).map_err(|error| unreadable(&error))?;
         let Some(record) = store.apart(number, names.get(&number)) else { continue };
@@ -270,9 +270,8 @@ fn not_this_backends(state: &Path) -> String {
 impl Keeper {
     fn with(state: &Path, folder: &Path, held: lock::Held, store: Store, data: Data) -> Result<Keeper, Refused> {
         let changes = data.meta().map_err(|error| unreadable(&error))?.changes;
-        // CARRIED (the load side of the clock's minute is kept's to take: `t3/nexus-core-fu`).
-        let high_water = store.high_water.saturating_add(MARK_EVERY_MS);
-        Ok(Keeper { state: state.to_path_buf(), folder: folder.to_path_buf(), _lock: held, backend: store.backend, store, data, changes, high_water, broken: false })
+        let (high_water, loaded) = (store.high_water, Clock::after_load(store.high_water, store.high_water));
+        Ok(Keeper { state: state.to_path_buf(), folder: folder.to_path_buf(), _lock: held, backend: store.backend, store, data, changes, high_water, loaded, broken: false })
     }
 
     /// Opens both stores in `state` and `folder` (`NEXUS_STATE`, `NEXUS_DATA`) at `now`, and
@@ -460,7 +459,7 @@ impl Keeper {
         };
         if self.store.restore != new {
             let pending = if mode == RestoreMode::Adopt { Pending::TakeAsIs { restore: new } } else { Pending::Restore { restore: new } };
-            let next = planned(&self.store, self.data.connection(), new, mode, pending, now)?;
+            let next = planned(&self.store, self.data.connection(), new, mode, pending, self.clock(now))?;
             self.write_store(next).map_err(refused)?;
         }
         // Begun before and done again: the time it is done at reaches the store first.
@@ -579,7 +578,7 @@ impl Keeper {
 
     /// The clock for a decision at `now` (C3r's `Clock`).
     pub fn clock(&self, now: u64) -> Clock {
-        Clock { now, high_water: self.high_water }
+        self.loaded.observe(self.high_water).observe(now)
     }
 
     /// Whether the backend has been set up (8.4).
@@ -768,7 +767,7 @@ impl Keeper {
             // No row changes: the clock goes to the store once it is a minute ahead of it,
             // the mark once its minute is out (12.3; the ruling of 13:59).
             let due = now.saturating_sub(self.store.mark_at) >= MARK_EVERY_MS || now < self.store.mark_at;
-            let clock_due = high_water >= self.store.high_water.saturating_add(MARK_EVERY_MS);
+            let clock_due = effects.clock_mark_due(self.store.high_water);
             if clock_due || (self.changes > self.store.mark && due) {
                 let mut next = self.store.clone();
                 next.high_water = high_water;
@@ -829,10 +828,26 @@ impl Keeper {
                 continue;
             }
             changes.push(Change::Install { number, rows: &update.data, at });
+            // Every effect has its arm: one the keeper does not know fails to compile (M3).
             match &update.change {
+                DataChange::Keep | DataChange::DeleteAccount => {}
                 DataChange::ResetPassword => changes.push(Change::Password { account: number, password: None }),
                 // The new password is in `extra` (checked above): the verifier C3r was given.
                 DataChange::RedeemCode { .. } | DataChange::ChangePassword => {}
+                // The owner's recovery (8.4): no password, no old code, the new code's verifier
+                // under the number kept gave it, the sessions gone (in `Install`), in one step.
+                DataChange::OwnerRecovery { code_verifier } => {
+                    changes.push(Change::Password { account: number, password: None });
+                    changes.push(Change::Codes { account: number, keep: None });
+                    if let Some(code) = update.data.account.code.filter(|code| !code.used) {
+                        changes.push(Change::Code { account: number, number: code.number, code: code_verifier.as_bytes(), made_at: at, until: code.expires });
+                    }
+                }
+                // A store lost (12.4): the verifier and every code go with the sessions.
+                DataChange::DiscardCredentials => {
+                    changes.push(Change::Password { account: number, password: None });
+                    changes.push(Change::Codes { account: number, keep: None });
+                }
                 // The account's listening events go in this same step: its life moves on in
                 // `Install`, and the data's trigger deletes them unless they are held (12.5).
                 DataChange::EraseHistory => {}
@@ -845,10 +860,16 @@ impl Keeper {
                         changes.push(Change::MusicLogin { account: number, install, internal });
                     }
                 }
-                DataChange::ApplyAdmin { action: AdminAction::SetMusicAddress(address), target: AdminTarget::Backend } => {
-                    changes.push(Change::MusicPublic { address: address.as_str() });
-                }
-                _ => {}
+                DataChange::ApplyAdmin { action, target } => match (action, target) {
+                    (AdminAction::SetMusicAddress(address), AdminTarget::Backend) => changes.push(Change::MusicPublic { address: address.as_str() }),
+                    (AdminAction::SetDiagnosticsDefault(on), AdminTarget::Backend) => changes.push(Change::DiagnosticsDefault { on: *on }),
+                    (AdminAction::SetRequests(on), AdminTarget::Backend) => changes.push(Change::Requests { on: *on }),
+                    // What these change is the account's state, in `Install` (and the store).
+                    (AdminAction::SetOn(_) | AdminAction::DeleteAccount | AdminAction::ResetPassword | AdminAction::SetAdmin(_) | AdminAction::ForceOut(_) | AdminAction::MusicLoginChanged | AdminAction::CreateAccount, _) => {}
+                    // Kept by no one yet: the Lidarr settings are S13's (not in this cut).
+                    (AdminAction::SetLidarr, _) => {}
+                    (AdminAction::SetMusicAddress(_) | AdminAction::SetDiagnosticsDefault(_) | AdminAction::SetRequests(_), AdminTarget::Account { .. } | AdminTarget::NewAccount(_)) => {}
+                },
             }
             changes.push(Change::Codes { account: number, keep: live(update.data.account.code) });
         }
@@ -1136,7 +1157,7 @@ pub fn put_back(state: &Path, folder: &Path, copy: &Path, now: u64) -> Result<Sa
             })
         })?;
         let copy = CopyIdentity { hash, changes: meta.changes, written_at: meta.written_at };
-        planned(&store, &staged_data, new, RestoreMode::DataOnly, Pending::PutBack { restore: new, copy }, now)
+        planned(&store, &staged_data, new, RestoreMode::DataOnly, Pending::PutBack { restore: new, copy }, Clock::after_load(now, store.high_water))
     })()
     .map_err(unstage)?;
     let new = plan.restore;
@@ -1277,12 +1298,25 @@ pub fn take_as_is(state: &Path, folder: &Path, now: u64) -> Result<Said, Refused
             }
         }
     }
+    // Each account as kept recovers it from its rows and what a readable store of this
+    // backend still says (`kept::Account::recover_from_lost_store`: its tombstones, switches
+    // and counts kept; every verifier and code discarded; no device known until it signs in).
+    let clock = Clock::after_load(now, store.high_water);
     for (&number, rows) in &view.accounts {
         let was = old.and_then(|old| old.apart(number, Some(&rows.account.email)));
-        let apart = compare::recovery_baseline(rows, was.as_ref());
+        let mut first = None;
+        let answer = Decided::recover_from_lost_store(rows, was.as_ref(), new, clock).apply(|effects| {
+            first = effects.updates.first().map(|update| update.apart_first.clone());
+            Ok::<_, ()>(())
+        });
+        let Some((Ok(()), apart)) = answer.ok().zip(first) else {
+            return Err(Refused(format!("Account {number} could not be taken as it is (a number can go no higher, or its rows are not its own). Nothing was changed.")));
+        };
         store.accounts.insert(number, Account { name: apart::name_fingerprint(rows.account.email.as_str()), apart });
     }
-    let plan = planned(&store, data.connection(), new, RestoreMode::Adopt, Pending::TakeAsIs { restore: new }, now)?;
+    store.restore = new;
+    store.pending = Some(Pending::TakeAsIs { restore: new });
+    let plan = store;
     let mut said = vec!["Took the data as it is.".to_string()];
     if old.is_none() {
         said.push("Nothing says which passwords changed or which one-time codes were used since the store kept apart was lost: every account waits for a new one-time code (the admin's first, by the recovery command).".into());

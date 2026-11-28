@@ -1868,24 +1868,26 @@ fn a_row_written_carries_the_running_clock_to_the_store_first() {
     let root = Root::new("row-clock");
     let ids = world(&root);
     let mut keeper = opened(&root, T0 + 2 * MINUTE);
-    // (A start's clock is the store's plus a minute: a first row written brings them level.)
     keeper.heard(ids.a1, T0 + 2 * MINUTE).unwrap();
     let stored = store_of(&root).high_water;
-    assert_eq!(stored, keeper.clock(0).effective());
-    // A decision with no row to change, half a minute on from the store's clock: not written.
-    let at = keeper.clock(0).effective() + MINUTE / 2;
+    // A decision with no row to change, half a minute on from the store's clock: not written
+    // (the minute's allowance a start adds is kept's, in this process alone, never written).
+    let at = stored + MINUTE / 2;
     let held = fp(5);
     let _ = decide(&mut keeper, BOB, at, &[], |turn| turn.arrive(bearer(ids.b1, &held), Access::Read).map(|_| ())).unwrap();
     assert_eq!(store_of(&root).high_water, stored, "a decision with no row wrote the clock before its minute");
-    let running = keeper.clock(0).effective();
-    assert!(running >= at);
     // A device heard from at a time of its own: the running clock reaches the store first.
     keeper.heard(ids.b1, T0 + 3 * MINUTE).unwrap();
-    assert_eq!(store_of(&root).high_water, running);
+    assert_eq!(store_of(&root).high_water, at);
     let written = keeper.data().meta().unwrap().written_at;
-    assert!(written <= running, "{written} > {running}");
+    assert!(written <= at, "{written} > {at}");
     assert_eq!(last_heard(&keeper, ids.b1), Some(T0 + 3 * MINUTE), "the observation's own time is kept");
     keeper.close();
+    // Ten starts in a row do not move the stored clock (core-fu's M1).
+    for _ in 0..10 {
+        opened(&root, T0).close();
+    }
+    assert_eq!(store_of(&root).high_water, at);
 }
 
 /// The re-review's 8: a link at the data's place is refused, never followed, and what it
@@ -2009,5 +2011,45 @@ fn at_the_stores_edge_a_reset_is_written_and_a_sign_in_is_refused() {
     administer(&mut keeper, &ids, AdminAction::ResetPassword, BOB, &[Change::Code { account: BOB, number: 2, code: &[47; 32], made_at: now, until }], now).unwrap();
     assert!(!reads(&mut keeper, BOB, ids.b1, 5, now), "the reset did not take Bob's session away");
     assert!(state(&mut keeper, BOB).unwrap().password_reset_required);
+    keeper.close();
+}
+
+/// The audit of core-fu, M3: a session's kind is kept in its own column; a row without one
+/// (written before the column) is an ended session, never an app's by default.
+#[test]
+fn a_session_row_without_its_kind_is_ended() {
+    let root = Root::new("kind");
+    let ids = world(&root);
+    {
+        let keeper = opened(&root, T0 + MINUTE);
+        let kind: String = keeper.data().connection().query_row("SELECT kind FROM sessions WHERE device = ?1", [ids.a1 as i64], |row| row.get(0)).unwrap();
+        assert_eq!(kind, "app");
+        keeper.close();
+    }
+    let connection = rusqlite::Connection::open(data::place(&root.data())).unwrap();
+    connection.execute("UPDATE sessions SET kind = NULL WHERE device = ?1", [ids.a1 as i64]).unwrap();
+    drop(connection);
+    let (mut keeper, _) = settled(&root, T0 + 2 * MINUTE);
+    assert!(!reads(&mut keeper, ALICE, ids.a1, 1, T0 + 2 * MINUTE), "a session with no kind was taken for an app's");
+}
+
+/// The audit of core-fu, M3: the owner's recovery is an arm of its own: the old verifier and
+/// every old code really go, and the new code's verifier is really kept, under kept's number.
+#[test]
+fn the_owners_recovery_keeps_only_the_new_code_and_no_password() {
+    let root = Root::new("owner-recovery");
+    let ids = world(&root);
+    let now = T0 + 2 * MINUTE;
+    let mut keeper = opened(&root, now);
+    let mut account = keeper.load(ALICE).unwrap();
+    let verifier = Fingerprint::from_bytes([48; SECRET_BYTES]);
+    let code = account.owner_recover(keeper.clock(now), verifier).apply(|effects| keeper.persist(effects, &[], now)).unwrap().unwrap();
+    assert_eq!(keeper.data().password(ALICE).unwrap(), None, "the old verifier is still kept");
+    let kept: Vec<(i64, Vec<u8>)> = {
+        let mut statement = keeper.data().connection().prepare("SELECT number, code FROM codes WHERE account = ?1").unwrap();
+        statement.query_map([ALICE as i64], |row| Ok((row.get(0)?, row.get(1)?))).unwrap().map(Result::unwrap).collect()
+    };
+    assert_eq!(kept, vec![(code.number as i64, vec![48; 32])]);
+    assert_eq!(readers(&mut keeper, &ids, now).iter().filter(|&&session| session == 1 || session == 3).count(), 0, "her sessions are still kept");
     keeper.close();
 }
