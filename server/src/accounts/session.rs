@@ -279,8 +279,10 @@ impl Accounts {
         if !new_password.allowed_for(&email, COMMON_PASSWORDS) {
             return Err(Refusal::NotAllowed(NotAllowed::PasswordNotAllowed));
         }
-        // The new password's fingerprint, on a worker, before the code is spent.
-        let stored = self.workers.fingerprint(&email, PasswordDoor::Other, None, new_password).await?;
+        // The new password's fingerprint, before the code is spent: the code is a live one, so
+        // this is the known-device worker's, one at a time for an account, with no wait (the
+        // lead's ruling of 14:06; a stranger at the other door cannot stop it).
+        let stored = self.workers.fingerprint(&email, PasswordDoor::RedeemedCode, None, new_password).await?;
         let clock = self.clock.clone();
         self.desk
             .ask(move |keeper| {
