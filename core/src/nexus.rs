@@ -14,6 +14,6 @@ pub mod diag;
 pub mod events;
 pub mod kept;
 pub mod proto;
-pub mod prove;
+pub mod music;
 pub mod requests;
 pub mod wire;
