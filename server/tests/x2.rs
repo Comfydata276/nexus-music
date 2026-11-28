@@ -271,7 +271,25 @@ fn settled(root: &Root, now: u64) -> (Keeper, Started) {
             match view.accounts.get(n) {
                 None => eprintln!("{n}: store only, {:?}", a.account.status),
                 Some(r) => {
-                    if r.account != a.account { eprintln!("{n}: state differs\n  store {:?}\n  data  {:?}", a.account, r.account); }
+                    // By number, and which of its parts differ: never the states themselves,
+                    // which hold the account's email (finding 12).
+                    if r.account != a.account {
+                        let (s, d) = (&a.account, &r.account);
+                        let differ: Vec<&str> = [
+                            ("life", s.life != d.life),
+                            ("status", s.status != d.status),
+                            ("passwords", s.password_changes != d.password_changes),
+                            ("reset", s.password_reset_required != d.password_reset_required),
+                            ("code", s.code_available != d.code_available),
+                            ("admin", s.admin != d.admin),
+                            ("music", s.music_login != d.music_login || s.music_recovery != d.music_recovery),
+                            ("revision", s.revision != d.revision),
+                        ]
+                        .into_iter()
+                        .filter_map(|(name, differs)| differs.then_some(name))
+                        .collect();
+                        eprintln!("{n}: state differs in {differ:?}");
+                    }
                     eprintln!("{n}: devices store {:?} data {:?}", a.devices.keys().collect::<Vec<_>>(), r.devices.keys().collect::<Vec<_>>());
                 }
             }
@@ -286,6 +304,8 @@ fn settled(root: &Root, now: u64) -> (Keeper, Started) {
 // ---- The child: one scenario, stopped or failed at the n-th point ----
 
 static POINTS: AtomicUsize = AtomicUsize::new(0);
+/// Points are counted only while this is set: a scenario may make its world first, uncut.
+static ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// Runs in a child process only (`X2_CHILD` names the scenario).
 #[test]
@@ -296,6 +316,9 @@ fn x2_child() {
     let (kill_at, fail_at) = (number("X2_KILL_AT"), number("X2_FAIL_AT"));
     let log = PathBuf::from(std::env::var("X2_POINTS").unwrap());
     crash::set(Box::new(move |name| {
+        if !ARMED.load(Ordering::SeqCst) {
+            return false;
+        }
         let n = POINTS.fetch_add(1, Ordering::SeqCst) + 1;
         use std::io::Write;
         let mut file = fs::OpenOptions::new().create(true).append(true).open(&log).unwrap();
@@ -343,6 +366,21 @@ fn run(scenario: &str, root: &Root) -> Result<(), String> {
         "a device heard from" => keeper().heard(ids.b1, now + 2 * MINUTE).map_err(failed),
         "an older copy found at a start" => Keeper::open(&root.state(), &root.data(), now).map(|(keeper, _)| keeper.close()).map_err(|why| why.0),
         "put-back" => keeper::put_back(&root.state(), &root.data(), &the_copy(root), now).map(|_| ()).map_err(|why| why.0),
+        "put-back with a reader" => {
+            // Erin made while another reader holds an older moment of the data: her step
+            // stays in the file SQLite writes ahead in, and the program stops with it there.
+            ARMED.store(false, Ordering::SeqCst);
+            let reader = rusqlite::Connection::open(data::place(&root.data())).unwrap();
+            reader.execute_batch("BEGIN").unwrap();
+            let _: i64 = reader.query_row("SELECT count(*) FROM accounts", [], |row| row.get(0)).unwrap();
+            let mut writer = keeper();
+            writer.make_account("erin@example.org", "Erin", false, None, now).unwrap();
+            drop(writer);
+            ARMED.store(true, Ordering::SeqCst);
+            let done = keeper::put_back(&root.state(), &root.data(), &the_copy(root), now).map(|_| ()).map_err(|why| why.0);
+            drop(reader);
+            done
+        }
         "take-as-is" => keeper::take_as_is(&root.state(), &root.data(), now).map(|_| ()).map_err(|why| why.0),
         "the nightly copy" => copies::nightly(&root.data(), now).map(|_| ()),
         "a change of form" => Data::open_with(&root.data(), now, &[data::MIGRATIONS[0], FORM_2]).map(|_| ()),
@@ -1082,4 +1120,316 @@ fn opening_and_reading_the_data_writes_nothing() {
     opened(&root, T0 + 5 * MINUTE).close();
     assert_eq!(fs::read(apart::place(&root.state())).unwrap(), store);
     assert_eq!(fs::read(data::place(&root.data())).unwrap(), data_bytes);
+}
+
+// ---- The review of S3 (S3b): each finding as a case that fails without its fix ----
+
+fn store_of(root: &Root) -> apart::Store {
+    match apart::read(&root.state()) {
+        apart::Reading::Found(store) => store,
+        other => panic!("the store can't be read: {other:?}"),
+    }
+}
+
+fn count(keeper: &Keeper, sql: &str, account: u64) -> i64 {
+    keeper.data().connection().query_row(sql, [account as i64], |row| row.get(0)).unwrap()
+}
+
+#[cfg(unix)]
+fn mode(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path).unwrap_or_else(|why| panic!("{}: {why}", path.display())).permissions().mode() & 0o777
+}
+
+/// Finding 8: the data, its copies and the files SQLite writes beside it are the owner's
+/// alone from the moment they are made, whatever the umask; files made wider before are
+/// tightened at the start.
+#[cfg(unix)]
+#[test]
+fn the_data_and_its_copies_are_the_owners_alone_from_creation() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = Root::new("private");
+    let ids = world(&root);
+    let keeper = opened(&root, T0 + MINUTE);
+    for file in [data::FILE, "nexus.db-wal", "nexus.db-shm", "lock"] {
+        assert_eq!(mode(&root.data().join(file)), 0o600, "{file} while serving");
+    }
+    for file in [apart::FILE, "lock"] {
+        assert_eq!(mode(&root.state().join(file)), 0o600, "{file}");
+    }
+    keeper.close();
+    let copy = copies::nightly(&root.data(), T0 + 2 * MINUTE).unwrap();
+    assert_eq!(mode(&copy.path), 0o600, "the nightly copy");
+    assert_eq!(mode(&copies::folder(&root.data())), 0o700, "the copies' folder");
+    // Made wider by an older program, or by hand: tightened before anything is served.
+    fs::set_permissions(data::place(&root.data()), fs::Permissions::from_mode(0o644)).unwrap();
+    fs::set_permissions(&copy.path, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::set_permissions(copies::folder(&root.data()), fs::Permissions::from_mode(0o755)).unwrap();
+    let mut keeper = opened(&root, T0 + 3 * MINUTE);
+    assert_eq!(mode(&data::place(&root.data())), 0o600);
+    assert_eq!(mode(&copy.path), 0o600);
+    assert_eq!(mode(&copies::folder(&root.data())), 0o700);
+    assert_eq!(readers(&mut keeper, &ids, T0 + 3 * MINUTE), [30, 1, 3, 5]);
+    keeper.close();
+    // A put-back's copy of the data it replaced, too.
+    unlocked(|| keeper::put_back(&root.state(), &root.data(), &copy.path, T0 + 4 * MINUTE)).unwrap();
+    for entry in fs::read_dir(copies::folder(&root.data())).unwrap().flatten() {
+        assert_eq!(mode(&entry.path()), 0o600, "{:?}", entry.file_name());
+    }
+    assert_eq!(mode(&data::place(&root.data())), 0o600, "the data put back");
+}
+
+/// Finding 12: what the design keeps out of logs is not in a change's `Debug`.
+#[test]
+fn a_changes_debug_holds_no_code_name_or_email() {
+    let root = Root::new("debug");
+    world(&root);
+    let mut keeper = opened(&root, T0 + MINUTE);
+    let rows = keeper.load(ALICE).unwrap().rows();
+    let state = rows.account.clone();
+    let code = [0xab; 32];
+    let pass = password(0xcd);
+    let changes = [
+        Change::Account { number: ALICE, shown: "Alice Made-Up", state: &state },
+        Change::Install { number: ALICE, rows: &rows, at: T0 },
+        Change::Describe { device: 7, name: "Alice's made-up phone", kind: "phone", version: "9.9" },
+        Change::Code { account: ALICE, code: &code, made_at: T0, until: T0 + 1 },
+        Change::Password { account: ALICE, password: Some(&pass) },
+    ];
+    let shown = format!("{changes:?}");
+    for secret in ["alice", "Alice", "171", "ab, ab", "abab", "205", "cdcd"] {
+        assert!(!shown.contains(secret), "{secret} in {shown}");
+    }
+    keeper.close();
+}
+
+/// Finding 7: one clock. A step the data alone keeps, at a time far on, does not leave the
+/// running backend at one time and a restarted one at another.
+#[test]
+fn a_data_only_step_far_on_gives_the_same_clock_before_and_after_a_restart() {
+    let root = Root::new("one-clock");
+    let ids = world(&root);
+    let far = T0 + SESSION_MS + MINUTE;
+    let back = T0 + 2 * MINUTE;
+    let mut keeper = opened(&root, T0 + MINUTE);
+    keeper.heard(ids.a1, far).unwrap();
+    // The clock put right without a restart: Bob's session last used at T0.
+    let before = (keeper.clock(back).effective(), reads(&mut keeper, BOB, ids.b1, 5, back));
+    keeper.close();
+    let mut keeper = opened(&root, back);
+    let after = (keeper.clock(back).effective(), reads(&mut keeper, BOB, ids.b1, 5, back));
+    assert_eq!(before, after, "the clock before a restart and after it");
+    keeper.close();
+}
+
+/// Finding 6: the data-change mark reaches the store in idle time, and when the backend
+/// stops, not only when something else is written a minute later.
+#[test]
+fn the_last_change_the_data_alone_has_is_marked_when_the_backend_stops() {
+    let root = Root::new("mark-stop");
+    let ids = world(&root);
+    let mut keeper = opened(&root, T0 + 2 * MINUTE);
+    keeper.heard(ids.b1, T0 + 2 * MINUTE).unwrap();
+    keeper.close();
+    let copy = snapshot(&root, &["nexus.db"]);
+    let mut keeper = opened(&root, T0 + 2 * MINUTE + 10_000);
+    keeper.heard(ids.b1, T0 + 2 * MINUTE + 10_000).unwrap();
+    // Nothing more is asked; a week later the backend is stopped.
+    keeper.close();
+    put_by_hand(&root, &copy);
+    let (_, started) = settled(&root, T0 + 7 * 24 * 60 * MINUTE);
+    assert!(matches!(started, Started::Restored { .. }), "{started:?}");
+}
+
+/// Finding 10: the store is never published at a size its reader refuses.
+#[test]
+fn the_store_is_never_written_larger_than_it_can_be_read() {
+    let root = Root::new("store-bound");
+    world(&root);
+    let mut big = store_of(&root);
+    let template = big.accounts[&ALICE].clone();
+    let before = fs::read(apart::place(&root.state())).unwrap();
+    for number in 10..80_000 {
+        let mut tombstone = template.clone();
+        tombstone.apart.account.status = Status::Deleted;
+        big.accounts.insert(number, tombstone);
+    }
+    big.next_account = 80_000;
+    assert!(apart::write(&root.state(), &big).is_err(), "a store too large to read back was written");
+    assert_eq!(fs::read(apart::place(&root.state())).unwrap(), before);
+    assert!(matches!(apart::read(&root.state()), apart::Reading::Found(_)));
+}
+
+/// Finding 1, 12.4: with the store lost, taking the data as it is leaves every account
+/// waiting for a new one-time code: no password and no code the data held still works.
+#[test]
+fn with_the_store_lost_no_old_password_or_code_works_after_taking_the_data() {
+    let root = Root::new("recovery-fence");
+    let ids = world(&root);
+    let mut keeper = opened(&root, T0 + MINUTE);
+    let carol = keeper.make_account("carol@example.org", "Carol", false, Some((&[44; 32], T0 + 60 * MINUTE)), T0 + MINUTE).unwrap();
+    keeper.close();
+    fs::remove_file(apart::place(&root.state())).unwrap();
+    unlocked(|| keeper::take_as_is(&root.state(), &root.data(), T0 + 2 * MINUTE)).unwrap();
+    let (mut keeper, _) = settled(&root, T0 + 3 * MINUTE);
+    let now = T0 + 3 * MINUTE;
+    assert!(sign_in(&mut keeper, ALICE, 11, 12, 8, now).is_err(), "the old password signed in");
+    assert!(sign_in(&mut keeper, ROOT, 31, 32, 8, now).is_err(), "the admin's old password signed in");
+    let vacant = keeper.vacant_device();
+    let code = Fingerprint::from_bytes([44; SECRET_BYTES]);
+    assert!(decide(&mut keeper, carol, now, &[], |turn| turn.check_code(&DeviceSecret::new([51; SECRET_BYTES]), vacant, code.clone())).unwrap().is_err(), "the old code was taken");
+    for account in [ROOT, ALICE, BOB, carol] {
+        assert_eq!(count(&keeper, "SELECT count(*) FROM codes WHERE account = ?1", account), 0, "{account}'s codes");
+        assert_eq!(count(&keeper, "SELECT count(*) FROM accounts WHERE number = ?1 AND password IS NOT NULL", account), 0, "{account}'s verifier");
+        assert!(state(&mut keeper, account).unwrap().password_reset_required);
+    }
+    assert_eq!(readers(&mut keeper, &ids, now), Vec::<u8>::new());
+}
+
+/// Finding 1: when a readable store of this backend remains, what it says was taken away is
+/// kept when the data is taken as it is (here: the id file lost, and a copy from before an
+/// account was deleted put back by hand).
+#[test]
+fn a_readable_store_of_this_backend_keeps_what_it_took_away_when_the_data_is_taken() {
+    let root = Root::new("recovery-keeps");
+    let ids = world(&root);
+    let copy = snapshot(&root, &["nexus.db"]);
+    let seal = store_of(&root).seal_key();
+    {
+        let mut keeper = opened(&root, T0 + 4 * MINUTE);
+        leave(&mut keeper, ROOT, ids.root, 30, 32, LeaveFor::Admin(AdminKind::DeleteAccount), T0 + 4 * MINUTE).unwrap();
+        administer(&mut keeper, &ids, AdminAction::DeleteAccount, BOB, &[], T0 + 4 * MINUTE).unwrap();
+        keeper.close();
+    }
+    fs::remove_file(root.state().join(identity::FILE)).unwrap();
+    put_by_hand(&root, &copy);
+    unlocked(|| keeper::take_as_is(&root.state(), &root.data(), T0 + 5 * MINUTE)).unwrap();
+    let (mut keeper, _) = settled(&root, T0 + 6 * MINUTE);
+    assert_eq!(keeper.account_named(email(BOB)).unwrap(), None, "the deleted account came back");
+    assert_eq!(keeper.seal_key(), seal);
+    sign_in(&mut keeper, ALICE, 11, 12, 8, T0 + 6 * MINUTE).unwrap();
+}
+
+/// Finding 2: taking the data as it is, cut at any point, never loses a readable store's
+/// authority (its sealing key, its tombstones).
+#[test]
+fn taking_the_data_with_a_readable_store_cut_at_any_point_keeps_that_store() {
+    let setup = Root::new("take-readable");
+    let ids = world(&setup);
+    let seal = store_of(&setup).seal_key();
+    {
+        let mut keeper = opened(&setup, T0 + 4 * MINUTE);
+        leave(&mut keeper, ROOT, ids.root, 30, 32, LeaveFor::Admin(AdminKind::DeleteAccount), T0 + 4 * MINUTE).unwrap();
+        administer(&mut keeper, &ids, AdminAction::DeleteAccount, BOB, &[], T0 + 4 * MINUTE).unwrap();
+        keeper.close();
+    }
+    fs::remove_file(setup.state().join(identity::FILE)).unwrap();
+    at_every_point("take-as-is", &setup, |root, cut| {
+        let now = T0 + 20 * MINUTE;
+        if unlocked(|| Keeper::open(&root.state(), &root.data(), now)).map(|(keeper, _)| keeper.close()).is_err() {
+            unlocked(|| keeper::take_as_is(&root.state(), &root.data(), now)).unwrap_or_else(|why| panic!("at {}: {why}", cut.at));
+        }
+        let (keeper, _) = settled(root, now);
+        assert_eq!(keeper.seal_key(), seal, "at {}: the readable store's key was lost", cut.at);
+        assert_eq!(keeper.account_named(email(BOB)).unwrap(), None, "at {}", cut.at);
+        keeper.close();
+    });
+}
+
+/// Finding 3: a copy put back is checked, and its restore planned, before anything is
+/// changed: one the store cannot take is refused with nothing changed.
+#[test]
+fn a_copy_that_cannot_be_put_back_is_refused_before_anything_is_changed() {
+    let root = Root::new("put-back-checked");
+    world(&root);
+    // A copy at a restore number this store never gave.
+    let ahead = root.copied("put-back-checked-ahead");
+    let nightly = copies::nightly(&ahead.data(), T0 + MINUTE).unwrap();
+    unlocked(|| keeper::put_back(&ahead.state(), &ahead.data(), &nightly.path, T0 + 2 * MINUTE)).unwrap();
+    let ahead_copy = copies::nightly(&ahead.data(), T0 + 3 * MINUTE).unwrap();
+    // A copy with an account this store never made.
+    let other = root.copied("put-back-checked-unknown");
+    opened(&other, T0 + MINUTE).make_account("dave@example.org", "Dave", false, None, T0 + MINUTE).unwrap();
+    let unknown_copy = copies::nightly(&other.data(), T0 + 2 * MINUTE).unwrap();
+    for copy in [&ahead_copy.path, &unknown_copy.path] {
+        let store = fs::read(apart::place(&root.state())).unwrap();
+        let live = fs::read(data::place(&root.data())).unwrap();
+        let why = unlocked(|| keeper::put_back(&root.state(), &root.data(), copy, T0 + 4 * MINUTE)).err().expect("put back");
+        assert!(why.0.contains("Nothing was changed"), "{why}");
+        assert_eq!(fs::read(apart::place(&root.state())).unwrap(), store);
+        assert_eq!(fs::read(data::place(&root.data())).unwrap(), live);
+        assert_eq!(settled(&root, T0 + 5 * MINUTE).1, Started::Ready);
+    }
+}
+
+/// Finding 4: a put-back cut at any point and run again moves the restore number and each
+/// device's number once.
+#[test]
+fn a_put_back_cut_and_run_again_moves_the_numbers_once() {
+    let setup = Root::new("putback-again");
+    let ids = world(&setup);
+    copies::nightly(&setup.data(), T0 + 2 * MINUTE).unwrap();
+    let device = store_of(&setup).accounts[&ALICE].apart.devices[&ids.a1].number;
+    at_every_point("put-back", &setup, |root, cut| {
+        let now = T0 + 20 * MINUTE;
+        if !cut.whole() {
+            unlocked(|| keeper::put_back(&root.state(), &root.data(), &the_copy(root), now)).unwrap_or_else(|why| panic!("at {}: {why}", cut.at));
+        }
+        let (keeper, _) = settled(root, now);
+        assert_eq!(keeper.restore(), 1, "at {}", cut.at);
+        keeper.close();
+        assert_eq!(store_of(root).accounts[&ALICE].apart.devices[&ids.a1].number, device + 1, "at {}", cut.at);
+    });
+}
+
+/// Finding 5: the data a put-back replaces is kept whole, as one checked file, even with
+/// committed steps SQLite could not fold back (another reader held them) and a cut anywhere.
+#[test]
+fn the_data_a_put_back_replaces_is_kept_whole_at_any_cut() {
+    let setup = Root::new("putback-keeps");
+    world(&setup);
+    copies::nightly(&setup.data(), T0 + 2 * MINUTE).unwrap();
+    at_every_point("put-back with a reader", &setup, |root, cut| {
+        let now = T0 + 20 * MINUTE;
+        if !cut.whole() {
+            unlocked(|| keeper::put_back(&root.state(), &root.data(), &the_copy(root), now)).unwrap_or_else(|why| panic!("at {}: {why}", cut.at));
+        }
+        settled(root, now).0.close();
+        let kept: Vec<PathBuf> = fs::read_dir(copies::folder(&root.data()))
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.file_name().unwrap().to_string_lossy().starts_with("replaced-") && path.extension().is_some_and(|e| e == "db"))
+            .collect();
+        assert!(!kept.is_empty(), "at {}: nothing kept", cut.at);
+        for path in kept {
+            let connection = data::open_to_read(&path, "the data replaced").unwrap_or_else(|why| panic!("at {}: {why}", cut.at));
+            let erin: i64 = connection.query_row("SELECT count(*) FROM accounts WHERE email = 'erin@example.org'", [], |row| row.get(0)).unwrap();
+            assert_eq!(erin, 1, "at {}: {} lacks the last step", cut.at, path.display());
+        }
+    });
+}
+
+/// Finding 9: a start refuses another backend's data before changing a byte of it.
+#[test]
+fn another_backends_copy_at_the_datas_place_is_refused_with_nothing_changed() {
+    let one = Root::new("foreign-one");
+    let other = Root::new("foreign-other");
+    world(&one);
+    world(&other);
+    let copy = copies::nightly(&other.data(), T0 + 5 * MINUTE).unwrap();
+    for file in [data::FILE, "nexus.db-wal", "nexus.db-shm"] {
+        let _ = fs::remove_file(one.data().join(file));
+    }
+    fs::copy(&copy.path, data::place(&one.data())).unwrap();
+    let names = |root: &Root| {
+        let mut names: Vec<String> = fs::read_dir(root.data()).unwrap().flatten().map(|entry| entry.file_name().into_string().unwrap()).collect();
+        names.sort();
+        names
+    };
+    let (bytes, before) = (fs::read(data::place(&one.data())).unwrap(), names(&one));
+    let why = unlocked(|| Keeper::open(&one.state(), &one.data(), T0 + 6 * MINUTE)).err().unwrap();
+    assert!(why.0.contains("another backend's"), "{why}");
+    assert_eq!(fs::read(data::place(&one.data())).unwrap(), bytes, "the foreign file was changed");
+    assert_eq!(names(&one), before);
 }
