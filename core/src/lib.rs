@@ -24,6 +24,7 @@ pub mod musicbrainz;
 pub mod nexus;
 pub mod notes;
 pub mod offer;
+pub mod origin;
 pub mod playlists;
 pub mod queue;
 pub mod record;
