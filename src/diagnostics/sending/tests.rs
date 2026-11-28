@@ -192,7 +192,7 @@ fn a_fault_does_not_send_without_a_signed_in_account() {
     assert!(asking(&actions, diag::SEND_PATH).is_none());
 }
 
-fn due_read(client: &mut Client, paths: &config::Paths) -> io::Result<(u64, Given)> {
+fn due_read(client: &mut Client) -> (u64, Given, DiagSchedule) {
     client.happened(Happened::DiagnosticsFault { at_ms: START }, &given(START));
     let early = client.happened(Happened::Tick, &given(START + diag::FAULT_WAIT_MS - 1));
     assert!(read_number(&early).is_none());
@@ -203,8 +203,7 @@ fn due_read(client: &mut Client, paths: &config::Paths) -> io::Result<(u64, Give
         panic!("the schedule must be kept before the read: {actions:?}");
     };
     assert_eq!(schedule.attempts, [due.now_ms]);
-    save_schedule(&schedule_path(paths), Some(schedule))?;
-    Ok((*read, due))
+    (*read, due, schedule.clone())
 }
 
 #[test]
@@ -216,7 +215,8 @@ fn the_profiles_choice_and_attempt_survive_a_client_restart() -> io::Result<()> 
     load_kept(&paths, &mut kept);
     assert_eq!(kept.diagnostics, Some(true));
     let mut client = start(Some(false), kept, START);
-    let (_, due) = due_read(&mut client, &paths)?;
+    let (_, due, schedule) = due_read(&mut client);
+    save_schedule(&schedule_path(&paths), Some(&schedule))?;
 
     let mut kept = Kept { saved: Some(saved()), ..Kept::default() };
     load_kept(&paths, &mut kept);
@@ -251,15 +251,10 @@ fn the_worker_requires_a_saved_schedule_before_returning_diagnostics() -> io::Re
     fs::create_dir(&path)?;
 
     let mut client = start(Some(true), Kept { saved: Some(saved()), ..Kept::default() }, START);
-    client.happened(Happened::DiagnosticsFault { at_ms: START }, &given(START));
-    let due = given(START + diag::FAULT_WAIT_MS);
-    let actions = client.happened(Happened::Tick, &due);
-    let [Do::Keep(Keep::DiagSchedule(attempt)), Do::Journal(JournalDo::ReadDiagnostics { read }), ..] = &actions[..] else {
-        panic!("the schedule must be kept before the read: {actions:?}");
-    };
-    keep_schedule(&paths, Some(attempt.clone()));
-    let answer = queued_read(&paths, *read);
-    assert!(matches!(&answer, Happened::DiagnosticsRead { read: number, text: None } if number == read));
+    let (read, due, attempt) = due_read(&mut client);
+    keep_schedule(&paths, Some(attempt));
+    let answer = queued_read(&paths, read);
+    assert!(matches!(&answer, Happened::DiagnosticsRead { read: number, text: None } if *number == read));
     assert!(asking(&client.happened(answer, &due), diag::SEND_PATH).is_none());
 
     fs::remove_dir(&path)?;
@@ -332,10 +327,8 @@ fn e13a_receives_the_same_bytes_as_preview_and_export() -> io::Result<()> {
     let body = agent.get(format!("{origin}{}", proto::HELLO)).call().unwrap()
         .body_mut().read_to_vec().unwrap();
     accept_hello(&mut client, hello, body, START);
-    let (read, due) = due_read(&mut client, &paths)?;
-    let mut kept = Kept::default();
-    load_kept(&paths, &mut kept);
-    keep_schedule(&paths, kept.diag_schedule);
+    let (read, due, schedule) = due_read(&mut client);
+    keep_schedule(&paths, Some(schedule));
     let answer = queued_read(&paths, read);
     assert!(matches!(&answer, Happened::DiagnosticsRead { text: Some(text), .. } if text == &preview));
     let actions = client.happened(answer, &due);

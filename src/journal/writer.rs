@@ -1211,6 +1211,11 @@ mod tests {
         assert!(ready);
         killed.unwrap();
         assert!(!status.success());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(status.signal(), Some(9));
+        }
 
         let mut writer = Writer::open(folder.0.clone()).unwrap();
         writer.activate(scope).unwrap();
