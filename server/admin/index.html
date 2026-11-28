@@ -239,6 +239,7 @@ dd, li { overflow-wrap: anywhere; }
   const lidarrForm = byId("lidarr-form");
   const loginForm = byId("music-login-form");
   const accountNames = new Map();
+  const deviceOwners = new Map();
   let musicAddress = null;
   let diagnosticsEnabled = null;
   let loginAccount = null;
@@ -545,6 +546,7 @@ dd, li { overflow-wrap: anywhere; }
     const account = row.after;
     const person = row.name + " (" + row.email + ")";
     accountNames.set(account, row.name);
+    for (const owner of deviceOwners.get(account) ?? []) writeText(owner, " · " + row.name);
     const entry = appendRow(accountPage.list, row.label);
     const menu = document.createElement("details");
     const summary = document.createElement("summary");
@@ -560,7 +562,7 @@ dd, li { overflow-wrap: anywhere; }
       makeButton(switchLabel, () => {
         const body = { account, enabled };
         reviewChange("set-account-enabled", body, body, switchLabel,
-          (enabled ? "Let " : "Stop ") + person + (enabled ? " sign in again." : " from signing in on every device."),
+          enabled ? "Let " + person + " sign in again." : "Sign out " + person + " on all devices and stop them signing in.",
           { saved: enabled ? "Account switched on. They can sign in again." : "Account switched off.", refresh: "accounts" });
       }),
       makeButton("Set music sign-in", () => openLogin(account, person)),
@@ -575,7 +577,7 @@ dd, li { overflow-wrap: anywhere; }
       }),
       makeButton("Remove account", () => reviewChange("delete-account", { account }, account, "Remove account",
         "Remove " + person + " and their listening history from Nexus.",
-        { note: "Any copy someone already saved will stay on their device. You can’t undo this here.",
+        { note: "Any copy already downloaded stays where it was saved. You can’t undo this here.",
           saved: "Account removed.", refresh: "accounts-and-devices" }), true),
     );
     menu.append(summary, buttons);
@@ -596,8 +598,14 @@ dd, li { overflow-wrap: anywhere; }
   }
 
   function renderDevice(row) {
-    const owner = accountNames.get(row.after.account);
-    const entry = appendRow(devicePage.list, row.label + (owner ? " · " + owner : ""));
+    const account = row.after.account;
+    const entry = appendRow(devicePage.list, row.label);
+    const owner = document.createElement("span");
+    const known = accountNames.get(account);
+    if (known) writeText(owner, " · " + known);
+    entry.append(owner);
+    if (!deviceOwners.has(account)) deviceOwners.set(account, []);
+    deviceOwners.get(account).push(owner);
     if (row.session === null) return;
     const buttons = document.createElement("div");
     buttons.className = "row-actions";
@@ -715,14 +723,16 @@ dd, li { overflow-wrap: anywhere; }
     grantPassword.value = "";
     if (!current || !proposed || changing) return;
 
-    if (!approvedPassword()) {
+    let confirmed = approvedPassword();
+    if (!confirmed) {
       if (!typed || Array.from(typed).length > 128) {
         togglePasswordPrompt(true);
         grantPassword.focus();
         writeText(byId("grant-note"), "Enter your Nexus password to confirm this change.");
         return;
       }
-      approval = { password: typed, typed: Date.now() };
+      confirmed = typed;
+      approval = { password: confirmed, typed: Date.now() };
       approvalTimer = setTimeout(clearApproval, 10 * 60 * 1000);
     }
 
@@ -732,9 +742,11 @@ dd, li { overflow-wrap: anywhere; }
     let sentChange = false;
     try {
       const request_id = crypto.getRandomValues(new BigUint64Array(1))[0] || 1n;
-      const issued = await readAdmin(current, "/nexus/api/admin/grant", {
-        change: { request_id, action: proposed.action }, password: approvedPassword(),
+      const request = readAdmin(current, "/nexus/api/admin/grant", {
+        change: { request_id, action: proposed.action }, password: confirmed,
       }, 4096);
+      confirmed = null;
+      const issued = await request;
       if (session !== current) return;
       if (typeof issued.grant !== "string" || !/^[0-9a-f]{64}$/.test(issued.grant)) throw new Error();
       sentChange = true;
@@ -794,7 +806,9 @@ dd, li { overflow-wrap: anywhere; }
     const text = value.trim();
     try {
       const address = new URL(text);
-      if (address.protocol !== "https:" && (httpsOnly || address.protocol !== "http:")) return null;
+      const scheme = address.protocol;
+      if (scheme !== "https:" && (httpsOnly || scheme !== "http:")) return null;
+      if (!text.startsWith(scheme + "/" + "/")) return null;
       if (!address.hostname || address.username || address.password || /[?#\s\\]/u.test(text) ||
           bytes(text) > 2048) return null;
       return text;
@@ -853,6 +867,7 @@ dd, li { overflow-wrap: anywhere; }
   });
 
   function resetPage(pager) {
+    if (pager === devicePage) deviceOwners.clear();
     pager.generation++;
     pager.list.replaceChildren();
     pager.after = null;

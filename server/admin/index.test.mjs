@@ -45,7 +45,7 @@ function loadPage(fetch) {
     document: {
       getElementById: from,
       createElement(tag) {
-        assert.ok(["li", "details", "summary", "div", "button"].includes(tag), tag);
+        assert.ok(["li", "details", "summary", "div", "button", "span"].includes(tag), tag);
         return node(tag);
       },
     },
@@ -378,6 +378,9 @@ test("all changes show a confirmation and spend one grant on the exact wire targ
   await confirm();
   assert.equal(page.from("change-status").textContent, "The music sign-in works.");
 
+  page.submit("address-form", { "new-address": "https:miswritten.example.test" });
+  assert.equal(page.from("grant").open, false);
+  assert.match(page.from("change-status").textContent, /full secure address/);
   const address = testAddress + "/library";
   page.submit("address-form", { "new-address": address });
   assert.ok(page.from("grant-summary").textContent.includes(internalAddress));
