@@ -1,0 +1,154 @@
+{
+ "suite": 3,
+ "run": "new-ended-2",
+ "machine_load_at_start_and_end": [
+  0.09,
+  0.1
+ ],
+ "build": "new",
+ "mode": "ended",
+ "hook": null,
+ "at": "2026-11-28 11:51:15",
+ "binary": "902c6581b1e4dc53",
+ "results": {
+  "a_play_is_counted_as_released": {
+   "the_kept_log_is_not_empty": 148,
+   "start_up_left_the_log_byte_for_byte (first start)": "148 bytes, 148 before",
+   "play_to_counted": 10.52,
+   "the_log_was_only_added_to": true,
+   "the_log_was_only_added_to (first start, at its end)": true,
+   "added_with_times_masked (first start)": "[\"3HrMsvEFi99qxWnytxSZkV\",T,\"playlist:0xUBIqKWew6szTtjwWVL0C\"]\n",
+   "start_up_left_the_log_byte_for_byte (second start)": "220 bytes, 220 before",
+   "the_log_was_only_added_to (second start)": true,
+   "added_with_times_masked (second start)": "[\"1Q81m55CQ431qttIOG7WuD\",T]\n[\"7fzzLozEKEAoYXRQEu33AI\",T]\n[\"0F8gsygwpNvzY9VXUZjJE2\",T]\n[\"3HrMsvEFi99qxWnytxSZkV\",T]\n"
+  },
+  "cold_start_publishes_the_saved_account": {
+   "launch_to_home_drawn": 0.712
+  },
+  "cold_start_puts_the_queue_back_and_plays": {
+   "launch_to_queue_shown": 0.732,
+   "play_to_sound": 0.082
+  },
+  "ordering": {
+   "first_look_after_home_and_queue (first start)": "1795830498.635 > 1795830494.169",
+   "first_look_after_home_and_queue (second start)": "1795830513.914 > 1795830509.434"
+  },
+  "a_like_and_a_play_reach_the_music_server": {
+   "counted_to_server_has_play": 0.002,
+   "the_play_reached_the_server_once": 1,
+   "like_to_server": 0.056,
+   "server_back_to_play_told_again": 3.069,
+   "the_held_play_reached_the_server_once": 1
+  },
+  "downloads_start_and_resume": {
+   "launch_to_list_scheduled_its_own": 12.259,
+   "by_hand_8_songs": 0.213,
+   "server_back_to_downloads_done": 22.758
+  },
+  "the_queue_is_changed_and_kept": {
+   "add_to_kept": 0.146,
+   "move_to_kept": 0.127,
+   "remove_to_kept": 0.125,
+   "queue_before_kill": [
+    [
+     "Glass Orchard",
+     "Runout Groove",
+     "Intro",
+     "Glass Orchard",
+     "Intro"
+    ],
+    1
+   ],
+   "restart_to_queue_shown": 0.685,
+   "queue_after_kill_is_the_queue_before": [
+    [
+     "Glass Orchard",
+     "Runout Groove",
+     "Intro",
+     "Glass Orchard",
+     "Intro"
+    ],
+    1
+   ],
+   "offered_after_another_device_saved": 10.164,
+   "continue_here_to_kept": 0.052,
+   "clear_to_kept": 0.065
+  },
+  "a_direct_play_starts_it_cold": {
+   "space_to_sound": 0.023
+  },
+  "two_songs_join_without_a_gap": {
+   "streamed_play_to_sound": 0.376,
+   "streamed_longest_stall_around_the_join": 0.021,
+   "streamed_silent_frames_at_the_join": 1,
+   "streamed_largest_step_at_the_join": 0.1883,
+   "cached_play_to_sound": 0.175,
+   "cached_longest_stall_around_the_join": 0.022,
+   "cached_silent_frames_at_the_join": 1,
+   "cached_largest_step_at_the_join": 0.0311,
+   "downloaded_play_to_sound": 0.174,
+   "downloaded_longest_stall_around_the_join": 0.022,
+   "downloaded_silent_frames_at_the_join": 1,
+   "downloaded_largest_step_at_the_join": 0.0791,
+   "streamed: both songs streamed, the second fetched before the join": [
+    [
+     1795830524.714,
+     "1Q81m55CQ431qttIOG7WuD"
+    ],
+    [
+     1795830524.931,
+     "7fzzLozEKEAoYXRQEu33AI"
+    ],
+    [
+     1795830524.931,
+     "7fzzLozEKEAoYXRQEu33AI"
+    ],
+    [
+     1795830525.031,
+     "4nnVfrAZeqY1EMbcJJnrjS"
+    ],
+    [
+     1795830525.1309998,
+     "3lRAwCKLX1yibtRxZ3tR8N"
+    ]
+   ],
+   "cached: neither song asked of the server": [],
+   "downloaded: nothing streamed": []
+  },
+  "offline_by_hand_and_by_loss": {
+   "by_hand_switch_to_offline": 0.079,
+   "offline_play_downloaded_to_sound": 0.641,
+   "by_hand_switch_back": 0.081,
+   "by_loss_noticed": 0.667,
+   "by_loss_play_downloaded_to_sound": 1.716,
+   "server_back_to_online": 3.098
+  },
+  "settings_row": {
+   "shown for tester": [
+    "None found"
+   ],
+   "shown for guest": [
+    "None found"
+   ]
+  },
+  "backend": {
+   "threads for tester": {
+    "nexus-probe": 0
+   },
+   "threads for guest": {
+    "nexus-probe": 0
+   },
+   "requests_under_nexus (one per account published)": 3,
+   "requests_at_the_stand_in": 2
+  },
+  "an_account_change_is_not_held_up": {
+   "connect_to_home_drawn": 0.113,
+   "signed_in_as_guest": true
+  },
+  "music_server": {
+   "slowest_api_answer_during_the_actions": 0.014,
+   "every_api_request_answered_within_1_s": []
+  }
+ },
+ "failures": []
+}

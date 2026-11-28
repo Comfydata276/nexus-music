@@ -406,7 +406,8 @@ SUITE = 3   # results of an earlier form of the suite are not compared with
 # the stand-in holds it (the component's deadline made an hour long, a test hook), a look is
 # started just before an action when none is running (another), and the same look's process
 # must still be running, unanswered, when the action has completed.
-STUCK = ("stalled", "blackhole", "saturated")
+# ("saturated" is not one: its "busy" status, after 10 s, is an answer, read before the body.)
+STUCK = ("stalled", "blackhole")
 # The proxy ends a connection it is still trying to make after 75 s: in the black-hole mode a
 # look older than this is let end before an action, and a new one started.
 FRESH_FOR = {"blackhole": 35.0}
