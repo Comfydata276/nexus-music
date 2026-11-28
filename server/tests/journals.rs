@@ -435,15 +435,16 @@ fn batch_places_belong_to_live_accounts() {
     let rows = (1..=500).map(|n| start(n, n, 0)).collect::<Vec<_>>();
     let first = batch(&stamp, &rows);
     let second = batch(&other_stamp, &rows);
-    let body = first.write().unwrap();
+    let written = first.write().unwrap();
+    let body = written.bytes();
     let stale = Batch::prefix(
         RequestHead { restore: stamp.restore + 1, ..head(&stamp) },
         stamp.life, &rows, events::BATCH_BYTES,
     ).unwrap().write().unwrap();
     let mut socket = fixture.request(events::SEND_PATH, Some(&fake), "", stale.bytes().len());
     socket.write_all(stale.bytes()).unwrap();
-    let (status, body) = response(socket);
-    assert_eq!(account::read_reply::<SignedOut>(status, &body).unwrap(),
+    let (status, stale_reply) = response(socket);
+    assert_eq!(account::read_reply::<SignedOut>(status, &stale_reply).unwrap(),
         Reply::Refused(Refusal::NotSignedIn(account::NotSignedIn::DataPutBack)));
 
     let barrier = Barrier::new(10);
@@ -459,8 +460,8 @@ fn batch_places_belong_to_live_accounts() {
         for _ in 0..8 {
             scope.spawn(|| {
                 barrier.wait();
-                let mut socket = fixture.request(events::SEND_PATH, Some(&fake), "", body.bytes().len());
-                socket.write_all(body.bytes()).unwrap();
+                let mut socket = fixture.request(events::SEND_PATH, Some(&fake), "", body.len());
+                socket.write_all(body).unwrap();
                 assert_eq!(response(socket).0, 401);
             });
         }
