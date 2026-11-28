@@ -119,6 +119,7 @@ impl Fixture {
                 clock,
                 backend,
                 music: MusicSide::new(MusicClient::from_this_machine().0, "http://navidrome:4533".into()),
+                lidarr: None,
             });
             tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap().block_on(async {
                 let listener = serve::listen(addr).unwrap();
@@ -438,7 +439,10 @@ fn batch_places_belong_to_live_accounts() {
         RequestHead { restore: stamp.restore + 1, ..head(&stamp) },
         stamp.life, &rows, events::BATCH_BYTES,
     ).unwrap().write().unwrap();
-    let mut socket = fixture.request(events::SEND_PATH, Some(&fake), "", stale.bytes().len());
+    // A stale restore number is told "data put back" (a real session: on data never put back,
+    // a session the data does not have is "no one", refused before its body by the common
+    // check; on data put back, it is judged from its body: `admit::Shown::Unproven`).
+    let mut socket = fixture.request(events::SEND_PATH, Some(&who.session), "", stale.bytes().len());
     socket.write_all(stale.bytes()).unwrap();
     let (status, stale_reply) = response(socket);
     assert_eq!(account::read_reply::<SignedOut>(status, &stale_reply).unwrap(),
@@ -751,4 +755,189 @@ fn measure_storage_for_events_and_reports() {
     milliseconds.sort_by(f64::total_cmp);
     eprintln!("5000 events: {wire_bytes} bytes JSON, {event_use} allocated bytes. 500-event HTTP median {:.1} ms and max {:.1} ms (includes reply verification). 30 reports: {report_bytes} text bytes, {report_use} allocated bytes.",
         milliseconds[5], milliseconds[9]);
+}
+
+#[test]
+fn admin_accounts_require_authority_and_a_live_page_session() {
+    use nexus_core::nexus::admin;
+
+    let mut fixture = Fixture::new("admin-accounts-idle");
+    let admin_code = fixture.set_up();
+    let other_code = fixture.other();
+    let clock = fixture.start_with_clock();
+    fixture.sign_in_with(with_code(admin_code), 1, BROWSER);
+    let (other, other_stamp) = fixture.sign_in(with_code(other_code), 2);
+    let list = |stamp: &Stamp| account::encode(&admin::ListAccounts {
+        head: head(stamp),
+        after: None,
+    }).unwrap();
+
+    assert_eq!(fixture.post(admin::LIST_ACCOUNTS, Some(&other), list(&other_stamp).bytes()).0, 403);
+    let change = |number| account::encode(&admin::SetAccountEnabled {
+        head: head(&other_stamp),
+        request_id: RequestId::new(1).unwrap(),
+        grant: account::GrantSecret::from_bytes([0; 32]),
+        change: admin::AccountEnabled { account: account::AccountId::new(number).unwrap(), enabled: false },
+    }).unwrap();
+    let post = |number| fixture.post(admin::SET_ACCOUNT_ENABLED, Some(&other), change(number).bytes());
+    let denied = post(other.person.id.get());
+    assert_eq!(denied.0, 403);
+    assert_eq!(denied, post(9001));
+
+    let (admin, stamp) = fixture.sign_in_with(with_password(), 3, BROWSER);
+    let body = list(&stamp);
+    let (status, rows) = fixture.post_with(admin::LIST_ACCOUNTS, Some(&admin), BROWSER, body.bytes());
+    assert_eq!(status, 200);
+    assert_eq!(json::<i64>(&rows, "$.done.rows[0].id"), admin.person.id.get() as i64);
+    assert_eq!(json::<String>(&rows, "$.done.rows[0].music"), "none_set");
+    assert_eq!(json::<Option<String>>(&rows, "$.done.rows[0].password"), None);
+
+    clock.fetch_add(admin::PAGE_SESSION_IDLE_MS + 1, Ordering::SeqCst);
+    let (status, refusal) = fixture.post_with(admin::LIST_ACCOUNTS, Some(&admin), BROWSER, body.bytes());
+    assert_eq!(status, 401);
+    assert_eq!(json::<String>(&refusal, "$.refused.not_signed_in"), "session_ended");
+}
+
+#[test]
+fn the_diagnostics_default_needs_a_matching_grant_and_reaches_hello() {
+    use nexus_core::nexus::admin;
+
+    let mut fixture = Fixture::new("admin-diagnostics");
+    let code = fixture.set_up();
+    fixture.start_with_clock();
+    fixture.sign_in_with(with_code(code), 1, BROWSER);
+    let (admin, stamp) = fixture.sign_in_with(with_password(), 2, BROWSER);
+    let request_id = RequestId::new(41).unwrap();
+    let request = account::encode(&admin::RequestGrant {
+        head: head(&stamp),
+        change: admin::NamedChange {
+            request_id,
+            action: admin::Action::SetDiagnosticsDefault(admin::DiagnosticsDefault { enabled: false }),
+        },
+        password: Password::presented(PASSWORD).unwrap(),
+    }).unwrap();
+    let (status, body) = fixture.post_with(admin::REQUEST_GRANT, Some(&admin), BROWSER, request.bytes());
+    let grant = match admin::read_reply::<GrantIssued>(status, &body).unwrap() {
+        admin::Reply::Done(issued) => issued.grant,
+        _ => panic!("no grant issued"),
+    };
+    let change = |enabled| account::encode(&admin::SetDiagnosticsDefault {
+        head: head(&stamp),
+        request_id,
+        grant: account::GrantSecret::from_bytes(*grant.expose_bytes()),
+        change: admin::DiagnosticsDefault { enabled },
+    }).unwrap();
+    let wrong = change(true);
+    let (status, body) = fixture.post_with(admin::SET_DIAGNOSTICS_DEFAULT, Some(&admin), BROWSER, wrong.bytes());
+    assert_eq!(status, 403);
+    assert_eq!(json::<String>(&body, "$.refused.not_allowed"), "grant_required");
+    let change = change(false);
+    let post = || fixture.post_with(admin::SET_DIAGNOSTICS_DEFAULT, Some(&admin), BROWSER, change.bytes());
+    assert_eq!(post().0, 200);
+    assert_eq!(post().0, 403);
+
+    let mut socket = TcpStream::connect(("127.0.0.1", fixture.port)).unwrap();
+    socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    socket.write_all(b"GET /nexus/api/hello HTTP/1.1\r\nHost: nexus\r\nX-Nexus-Scheme: https\r\nConnection: close\r\n\r\n").unwrap();
+    let (status, hello) = response(socket);
+    assert_eq!(status, 200);
+    assert_eq!(json::<bool>(&hello, "$.diagnostics"), false);
+}
+
+#[test]
+fn admin_devices_show_live_page_sessions_and_omit_forced_out_or_idle_pages() {
+    use nexus_core::nexus::admin;
+
+    let mut fixture = Fixture::new("admin-page-devices");
+    let code = fixture.set_up();
+    let clock = fixture.start_with_clock();
+    let (admin, stamp) = fixture.sign_in_with(with_code(code), 1, BROWSER);
+    let (other, _) = fixture.sign_in_with(with_password(), 2, BROWSER);
+    // This App session exercises only the native device list.
+    let (app, app_stamp) = fixture.sign_in(with_password(), 3);
+
+    let devices = |admin, stamp: &Stamp| {
+        let request = admin::encode(&admin::ListDevices { head: head(stamp), after: None }).unwrap();
+        let (status, body) = fixture.post_with(admin::LIST_DEVICES, Some(admin), BROWSER, request.bytes());
+        match admin::read_reply::<admin::Devices>(status, &body).unwrap() {
+            admin::Reply::Done(devices) => devices,
+            _ => panic!("admin devices were refused"),
+        }
+    };
+    let live = devices(&admin, &stamp);
+    let is_other = |row: &admin::AdminDevice| row.device == other.device;
+    assert_eq!(live.rows().len(), 3);
+    let browser_row = live.rows().iter().find(|row| is_other(row)).unwrap();
+    assert!(browser_row.page);
+    assert_eq!(browser_row.session, Some(other.session_id));
+    assert_eq!(browser_row.name.as_str(), "Admin page");
+    assert!(browser_row.last_seen_ms > 0);
+    let (status, native) = fixture.post(account::LIST_DEVICES, Some(&app), page(&app_stamp, None).bytes());
+    assert_eq!(status, 200);
+    assert_eq!(json::<i64>(&native, "$.done.result.devices[0].id"), app.device.get() as i64);
+    assert_eq!(json::<Option<i64>>(&native, "$.done.result.devices[1].id"), None);
+
+    let request_id = RequestId::new(41).unwrap();
+    let target = || admin::SessionTarget {
+        account: other.person.id, device: other.device, session: other.session_id,
+    };
+    let request = admin::encode(&admin::RequestGrant {
+        head: head(&stamp),
+        change: admin::NamedChange { request_id, action: admin::Action::ForceOut(target()) },
+        password: Password::presented(PASSWORD).unwrap(),
+    }).unwrap();
+    let (status, body) = fixture.post_with(admin::REQUEST_GRANT, Some(&admin), BROWSER, request.bytes());
+    let grant = match admin::read_reply::<GrantIssued>(status, &body).unwrap() {
+        admin::Reply::Done(issued) => issued.grant,
+        _ => panic!("no grant was issued"),
+    };
+    let force = admin::encode(&admin::ForceOut { head: head(&stamp), request_id, grant, change: target() }).unwrap();
+    assert_eq!(fixture.post_with(admin::FORCE_OUT, Some(&admin), BROWSER, force.bytes()).0, 200);
+    assert_eq!(devices(&admin, &stamp).rows().len(), 2);
+    let list = admin::encode(&admin::ListDevices { head: head(&stamp), after: None }).unwrap();
+    assert_eq!(fixture.post_with(admin::LIST_DEVICES, Some(&other), BROWSER, list.bytes()).0, 401);
+
+    clock.fetch_add(admin::PAGE_SESSION_IDLE_MS, Ordering::SeqCst);
+    let (fresh, fresh_stamp) = fixture.sign_in_with(with_password(), 4, BROWSER);
+    let remaining = devices(&fresh, &fresh_stamp);
+    assert_eq!(remaining.rows().len(), 2);
+    assert_eq!(remaining.rows().iter().find(|row| row.page).unwrap().session, Some(fresh.session_id));
+    assert!(remaining.rows().iter().any(|row| row.device == app.device && !row.page));
+}
+
+#[test]
+fn a_page_cannot_spend_a_grant_that_locks_out_its_own_administrator() {
+    let mut fixture = Fixture::new("protect-own-admin");
+    let code = fixture.set_up();
+    fixture.start_with_clock();
+    let (admin, stamp) = fixture.sign_in_with(with_code(code), 1, BROWSER);
+    let account = admin.person.id.get();
+    let restore = stamp.restore;
+    let off = format!(r#"{{"account":{account},"enabled":false}}"#);
+    let demote = format!(r#"{{"account":{account},"admin":false}}"#);
+    let remove = format!(r#"{{"account":{account}}}"#);
+    let remove_target = account.to_string();
+    for (id, (action, target, change)) in [
+        ("set_account_enabled", off.as_str(), off.as_str()),
+        ("delete_account", remove_target.as_str(), remove.as_str()),
+        ("set_admin", demote.as_str(), demote.as_str()),
+    ].into_iter().enumerate() {
+        let request_id = id + 1;
+        let request = format!(
+            r#"{{"head":{{"speaks":[1,1],"restore":{restore}}},"change":{{"request_id":{request_id},"action":{{"{action}":{target}}}}},"password":"{PASSWORD}"}}"#,
+        );
+        let (status, grant) = fixture.post_with(nexus_core::nexus::admin::REQUEST_GRANT, Some(&admin), BROWSER, request.as_bytes());
+        assert_eq!(status, 200, "grant issued for the spend test");
+        let grant = json::<String>(&grant, "$.done.grant");
+        let path = format!("/nexus/api/admin/{}", action.replace('_', "-"));
+        let request = format!(
+            r#"{{"head":{{"speaks":[1,1],"restore":{restore}}},"request_id":{request_id},"grant":"{grant}","change":{change}}}"#,
+        );
+        let (status, refusal) = fixture.post_with(&path, Some(&admin), BROWSER, request.as_bytes());
+        assert_eq!(status, 403);
+        assert_eq!(json::<String>(&refusal, "$.refused.not_allowed"), "denied");
+    }
+    let (again, _) = fixture.sign_in_with(with_password(), 2, BROWSER);
+    assert_eq!(again.person.id, admin.person.id);
+    assert!(again.person.admin);
 }

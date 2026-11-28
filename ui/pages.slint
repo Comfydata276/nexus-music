@@ -2836,6 +2836,28 @@ export component SettingsPage inherits Rectangle {
                         }
 
                         SettingRow {
+                            title: "Send diagnostics to your Nexus server";
+                            detail: Settings.diagnostics-detail;
+                            HorizontalLayout {
+                                spacing: 12px;
+                                TextButton {
+                                    text: "What is sent";
+                                    clicked => {
+                                        Settings.diagnostics-preview = "";
+                                        root.show-report = true;
+                                        scroll.content-y = 0px;
+                                        Settings.preview-diagnostics();
+                                    }
+                                }
+                                Toggle {
+                                    on: Settings.send-diagnostics;
+                                    label: "Send diagnostics to your Nexus server";
+                                    toggled(on) => { Settings.set-send-diagnostics(on); }
+                                }
+                            }
+                        }
+
+                        SettingRow {
                             title: "Diagnostics";
                             detail: "Writes and opens a local copy of the diagnostics report.";
                             TextButton {
@@ -2844,17 +2866,31 @@ export component SettingsPage inherits Rectangle {
                             }
                         }
 
-                        SettingRow {
-                            title: "Diagnostics report";
-                            detail: "See the report that would be sent to the Nexus server.";
-                            TextButton {
-                                text: "What is sent";
-                                clicked => {
-                                    Settings.diagnostics-preview = "";
-                                    root.show-report = true;
-                                    scroll.content-y = 0px;
-                                    Settings.preview-diagnostics();
-                                }
+                        if Settings.nexus-records-listening: VerticalLayout {
+                            padding-top: 20px;
+                            spacing: 6px;
+                            Text {
+                                text: "What this server records";
+                                color: Theme.text;
+                                font-size: 16px;
+                            }
+                            Text {
+                                text: "Every song you start, when, from which device, and what you were playing it from. How long you listened, and whether you skipped, paused or moved within it. The words you type into search, including searches that find nothing. When you open the app, and when it goes wrong.";
+                                color: Theme.muted;
+                                font-size: 13px;
+                                wrap: word-wrap;
+                            }
+                            Text {
+                                text: "Whoever runs this server can see all of it and can keep a copy. Deleting your listening history leaves any copies already taken and the server's own backups for the seven nights it keeps them.";
+                                color: Theme.muted;
+                                font-size: 13px;
+                                wrap: word-wrap;
+                            }
+                            Text {
+                                text: "This device also sends its Diagnostics report, unless you turn that off here. The report contains no listening history.";
+                                color: Theme.muted;
+                                font-size: 13px;
+                                wrap: word-wrap;
                             }
                         }
 

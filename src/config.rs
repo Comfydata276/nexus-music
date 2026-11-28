@@ -845,7 +845,8 @@ pub fn set_aside(path: &Path) -> Option<PathBuf> {
 fn set_aside_by(path: &Path, place: fn(&Path, &Path) -> std::io::Result<()>) -> Option<PathBuf> {
     let stem = path.file_stem()?.to_string_lossy().into_owned();
     let extension = path.extension().map(|extension| format!(".{}", extension.to_string_lossy())).unwrap_or_default();
-    let when = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    // Corrupt state still has to be recoverable if Windows cannot resolve its local time zone.
+    let when = chrono::Utc::now().format("%Y%m%d-%H%M%S");
     for count in 1..100 {
         let more = if count == 1 { String::new() } else { format!("-{count}") };
         let aside = path.with_file_name(format!("{stem}.damaged-{when}{more}{extension}"));
@@ -928,7 +929,7 @@ fn made_for(name: &str) -> Option<&str> {
 /// 0.40.10 could leave (`old`). Never by a pattern over a folder the person also uses.
 /// **Only when the app starts, once, before the first write**: later it could take a write's
 /// file from under it.
-fn clear_leftovers(dir: &Path, own: impl Fn(&str) -> bool, old: &[String]) {
+pub(crate) fn clear_leftovers(dir: &Path, own: impl Fn(&str) -> bool, old: &[String]) {
     let Ok(entries) = fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();

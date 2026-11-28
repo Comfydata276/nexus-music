@@ -43,6 +43,17 @@ impl Bench {
 
     /// The same, reaching the music server with `music`.
     pub fn with_music(name: &str, accounts: &[(&'static str, bool)], music: super::music::MusicSide) -> (Bench, Vec<Made>) {
+        Bench::with_all(name, accounts, music, None)
+    }
+
+    /// The same, with `NEXUS_LIDARR` set to `lidarr`.
+    pub fn with_lidarr(name: &str, accounts: &[(&'static str, bool)], lidarr: &str) -> (Bench, Vec<Made>) {
+        let client = crate::music::MusicClient::trusting(tokio_rustls::rustls::RootCertStore::empty());
+        let music = super::music::MusicSide::new(client, "http://127.0.0.1:9".into());
+        Bench::with_all(name, accounts, music, Some(nexus_core::nexus::admin::InternalAddress::new(lidarr).unwrap()))
+    }
+
+    fn with_all(name: &str, accounts: &[(&'static str, bool)], music: super::music::MusicSide, lidarr: Option<nexus_core::nexus::admin::InternalAddress>) -> (Bench, Vec<Made>) {
         let root = std::env::temp_dir().join(format!("nexus-bench-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("data")).unwrap();
@@ -74,6 +85,7 @@ impl Bench {
             backend,
             admission,
             music,
+            lidarr,
         });
         let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
         (Bench { accounts, now, runtime, root }, made)
@@ -89,6 +101,12 @@ impl Bench {
 
     pub fn sign_in(&self, credential: Credential, device: u8) -> Answer {
         self.runtime.block_on(self.accounts.sign_in(sign_in(credential, device), false))
+    }
+
+    /// Signing in as the admin's page does (its session's kind is the page's: core-fu3, every
+    /// admin call needs it).
+    pub fn sign_in_at_the_page(&self, credential: Credential, device: u8) -> Answer {
+        self.runtime.block_on(self.accounts.sign_in(sign_in(credential, device), true))
     }
 }
 
