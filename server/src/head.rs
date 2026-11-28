@@ -14,7 +14,7 @@
 //! request and closes the connection.
 
 use axum::http::StatusCode;
-use nexus_core::nexus::{account, admin, proto};
+use nexus_core::nexus::{account, admin, diag, events, proto};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::bounds::{BODY_MAX_BYTES, HEAD_MAX_BYTES, HEAD_MAX_HEADERS};
@@ -169,6 +169,14 @@ pub const ROUTES: &[Route] = &[
     Route::new(account::LIST_DEVICES, "POST", account::SMALL_REQUEST_MAX_BYTES),
     Route::new(account::FORCE_OUT, "POST", account::SMALL_REQUEST_MAX_BYTES),
     Route::new(account::MUSIC_LOGIN, "POST", account::SMALL_REQUEST_MAX_BYTES),
+    Route::new(events::SEND_PATH, "POST", events::BATCH_BYTES),
+    Route::new(events::DELETE_PATH, "POST", account::GRANTED_CHANGE_MAX_BYTES),
+    Route::new(account::DELETE_LISTENING_DATA, "POST", account::GRANTED_CHANGE_MAX_BYTES),
+    Route::new(account::GRANT, "POST", account::PASSWORD_REQUEST_MAX_BYTES),
+    Route::new(crate::events::STATS_PATH, "POST", account::SMALL_REQUEST_MAX_BYTES),
+    Route::new(diag::SEND_PATH, "POST", diag::CALL_BYTES),
+    Route::new(crate::diag::LIST_PATH, "POST", account::SMALL_REQUEST_MAX_BYTES),
+    Route::new(crate::diag::ADMIN_PATH, "POST", account::SMALL_REQUEST_MAX_BYTES),
     // The admin's calls of S9: the two that carry a password at 4 KiB, the address at the grant
     // envelope's own ceiling, the read small.
     Route::new(admin::REQUEST_GRANT, "POST", account::PASSWORD_REQUEST_MAX_BYTES),

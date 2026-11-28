@@ -151,11 +151,11 @@ impl Shell {
 
     /// The backend's own: `hello`, the admin's document, and signing in and everything a
     /// session does (S8), at [`head::ROUTES`]. The page's calls with no session are taken
-    /// only from `public_origin` (`NEXUS_PUBLIC_ORIGIN`). `data_budget` (`NEXUS_DATA_BUDGET`) is
-    /// for the events' intake (S12), which takes it when it is merged; until then it is unused.
+    /// only from `public_origin` (`NEXUS_PUBLIC_ORIGIN`). The validated data budget caps event intake.
     pub fn backend(proxy: IpAddr, hello: &Hello, accounts: Arc<crate::accounts::session::Accounts>, public_origin: Option<&str>, data_budget: u64) -> Arc<Self> {
-        let _ = data_budget;
-        let router = crate::accounts::routes::router(base_router(hello), accounts, public_origin.map(Arc::<str>::from));
+        let public_origin = public_origin.map(Arc::<str>::from);
+        let router = crate::accounts::routes::router(base_router(hello), accounts.clone(), public_origin.clone());
+        let router = crate::events::router(router, accounts, public_origin, data_budget);
         Self::with_routes(proxy, router, head::ROUTES.to_vec())
     }
 

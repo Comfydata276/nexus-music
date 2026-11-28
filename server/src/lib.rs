@@ -10,6 +10,8 @@
 pub mod accounts;
 mod admin;
 pub mod bounds;
+pub mod diag;
+pub mod events;
 pub mod head;
 pub mod health;
 pub mod identity;
