@@ -1332,23 +1332,35 @@ impl Controller {
     /// it, if it is the one in use.
     pub fn music_set_aside(&self, count: u64, generation: u64) {
         if let Some(client) = self.client()
-            && client.handed().0 == count
+            && client.handed() == (count, generation)
         {
-            let _ = generation;
             client.set_aside();
         }
     }
 
     /// The music server refused `client`'s sign-in (`Client::was_refused`): it sends nothing
-    /// more. If it is the one in use, what is on this PC plays, and the machine is told, with
-    /// the number and generation **that** login was handed under.
-    pub fn music_refused(self: &Rc<Self>, client: &Client) {
+    /// more. If it is the login in use (the same gate, whichever agent saw the refusal: the
+    /// connection measurement's too), what is on this PC plays, and the machine is told, with
+    /// the number and generation **that** login was handed under when the refusal was seen.
+    pub fn music_refused(self: &Rc<Self>, client: &Client, handed: (u64, u64)) {
         if !self.client().is_some_and(|current| current.is(client)) {
             return;
         }
         self.set_unreachable(true);
-        let (count, generation) = client.handed();
+        let (count, generation) = handed;
         crate::nexus::music_refused(count, generation);
+    }
+
+    /// The music login in use is replaced by `client` (or by none): the one before sends
+    /// nothing more, whoever still holds it (W7c item 3).
+    fn replace_client(&self, client: Option<Client>) {
+        let before = std::mem::replace(&mut *self.client.borrow_mut(), client);
+        if let Some(before) = before {
+            let current = self.client.borrow();
+            if !current.as_ref().is_some_and(|current| current.is(&before)) {
+                before.retire();
+            }
+        }
     }
 
     /// A new music login for the person signed in (the machine's answer to a refusal, or to
@@ -1383,7 +1395,7 @@ impl Controller {
             self.enter(client, None);
         } else {
             client.set_offline(self.settings.borrow().offline);
-            *self.client.borrow_mut() = Some(client);
+            self.replace_client(Some(client));
             self.covers.reset();
         }
         self.check_connection();
@@ -1402,7 +1414,7 @@ impl Controller {
         // Have connections open before the first clicks need them.
         let warm = client.clone();
         self.art_pool.spawn(move || warm.warm_up(6));
-        *self.client.borrow_mut() = Some(client);
+        self.replace_client(Some(client));
         // A new account's turn: what was begun for the one before is not taken for this one.
         self.turn.set(self.turn.get().wrapping_add(1));
         // The songs kept from streaming are this person's and this music server's alone.
@@ -2614,7 +2626,7 @@ impl Controller {
         self.library_timer.stop();
         self.close_preview();
         crate::search::set_current(None);
-        *self.client.borrow_mut() = None;
+        self.replace_client(None);
         self.cache.borrow_mut().clear();
         self.playlists.borrow_mut().clear();
         self.stars.borrow_mut().clear();

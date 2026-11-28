@@ -100,6 +100,9 @@ struct Gate {
     /// R10), or the machine set it aside: nothing is sent with it again. A new pair is a new
     /// `Client`.
     refused: std::sync::atomic::AtomicBool,
+    /// The login was replaced (another login, another account, signed out): **this client and
+    /// every clone of it send nothing more**, checked where each send is granted (W7c item 3).
+    retired: std::sync::atomic::AtomicBool,
     /// The login's number and the generation it was handed under: what a refusal of it
     /// carries back to the machine (the review's MUST 5).
     handed: std::sync::Mutex<(u64, u64)>,
@@ -140,6 +143,11 @@ const PROOF_TIMEOUT: Duration = Duration::from_secs(20);
 /// Logins accepted this run: they never wait again (a client made again for one, the
 /// measurement's included, starts proven).
 static PROVEN: std::sync::Mutex<Vec<[u8; 32]>> = std::sync::Mutex::new(Vec::new());
+
+/// For the tests: every refusal as it is told to the controller (the client, and the number
+/// and generation taken with it).
+#[cfg(test)]
+static TOLD: std::sync::Mutex<Vec<(Client, (u64, u64))>> = std::sync::Mutex::new(Vec::new());
 
 fn pair_key(base: &str, username: &str, salt: &str, token: &str) -> [u8; 32] {
     Sha256::digest(format!("{base}\n{username}\n{salt}\n{token}").as_bytes()).into()
@@ -216,7 +224,8 @@ fn gated_agent(gate: &Arc<Gate>) -> ureq::Agent {
 
 impl Gate {
     fn open(&self) -> bool {
-        !self.offline.load(std::sync::atomic::Ordering::SeqCst) && !self.refused.load(std::sync::atomic::Ordering::SeqCst)
+        use std::sync::atomic::Ordering::SeqCst;
+        !self.offline.load(SeqCst) && !self.refused.load(SeqCst) && !self.retired.load(SeqCst)
     }
 
     fn wake(&self) {
@@ -475,6 +484,7 @@ impl Client {
         let gate = Arc::new(Gate {
             offline: std::sync::atomic::AtomicBool::new(false),
             refused: std::sync::atomic::AtomicBool::new(false),
+            retired: std::sync::atomic::AtomicBool::new(false),
             handed: std::sync::Mutex::new((0, 0)),
             proof,
             key,
@@ -511,9 +521,23 @@ impl Client {
         a.base == b.base && a.username == b.username && a.salt == b.salt && a.token == b.token
     }
 
-    /// Whether this is the same client (the same pair, made once) as `other`.
+    /// Whether this is the same login as `other`: the same gate, made once for it, shared by
+    /// every clone and by the connection measurement's own agent (W7c item 3: one identity
+    /// for a refusal, whichever path saw it first).
     pub fn is(&self, other: &Client) -> bool {
-        Arc::ptr_eq(&self.inner, &other.inner)
+        Arc::ptr_eq(&self.inner.gate, &other.inner.gate)
+    }
+
+    /// The login was replaced: this client, its clones and anything still holding one send
+    /// nothing more, from this moment (W7c item 3). What waited wakes, and fails unsent.
+    pub fn retire(&self) {
+        self.inner.gate.retired.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.inner.gate.wake();
+    }
+
+    /// Whether this login was replaced (`retire`).
+    pub fn retired(&self) -> bool {
+        self.inner.gate.retired.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Whether the music server has refused this sign-in: then nothing more is sent with it.
@@ -533,8 +557,12 @@ impl Client {
     /// asked for; every request after it is refused here, unsent (design 6.3).
     fn was_refused(&self) {
         if !self.inner.gate.refused.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            let refused = self.clone();
-            crate::controller::post(move |ctl| ctl.music_refused(&refused));
+            // The number and generation are taken now, on this thread, as the refusal is
+            // seen: a same-pair hand-over before the window reads them is not taken for it.
+            let (refused, handed) = (self.clone(), self.handed());
+            #[cfg(test)]
+            TOLD.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push((refused.clone(), handed));
+            crate::controller::post(move |ctl| ctl.music_refused(&refused, handed));
         }
         // Whoever waited for the first answer learns it now.
         self.inner.gate.wake();
@@ -622,9 +650,9 @@ impl Client {
     fn check_online(&self) -> ApiResult<()> {
         if self.inner.gate.offline.load(std::sync::atomic::Ordering::SeqCst) {
             Err(ApiError::Network("Offline mode is on.".into()))
-        } else if self.refused() {
-            // Never sent again as it was (design 6.3): treated as the server out of reach,
-            // so that what is on this PC plays.
+        } else if self.refused() || self.retired() {
+            // Never sent again as it was (design 6.3), nor once replaced: treated as the
+            // server out of reach, so that what is on this PC plays.
             Err(ApiError::Network(REFUSED.into()))
         } else {
             Ok(())
@@ -1618,6 +1646,41 @@ mod tests {
         let all: Vec<_> = (0..4).map(|_| { let client = client.clone(); std::thread::spawn(move || client.ping().is_ok()) }).collect();
         assert!(all.into_iter().all(|one| one.join().unwrap()));
         assert!(at_once.load(Ordering::SeqCst) > 1, "answered, requests should go side by side");
+    }
+
+    /// W7c item 3: a refusal seen first by the connection measurement is the login's own:
+    /// the controller is told of a client that `is` the one in use, with the number and
+    /// generation taken when it was seen (a same-pair hand-over after it changes neither).
+    /// And a login replaced sends nothing more, from any clone of it.
+    #[test]
+    fn one_identity_for_a_refusal_and_a_replaced_login_sends_nothing() {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counted = asked.clone();
+        let address = fake::server(move |_, _, stream| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            let body = r#"{"subsonic-response":{"status":"failed","error":{"code":40,"message":"Wrong username or password"}}}"#;
+            let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        });
+        let client = Client::from_pair(&address, "measured", "salt", "token");
+        client.handed_as((4, 9));
+        assert!(client.measure().is_err());
+        client.handed_as((5, 9));
+        let told: Vec<_> = TOLD.lock().unwrap().iter().filter(|(told, _)| told.username() == "measured").cloned().collect();
+        assert_eq!(told.len(), 1);
+        assert!(told[0].0.is(&client), "the measurement's refusal is the login's own");
+        assert_eq!(told[0].1, (4, 9), "taken when the refusal was seen");
+        assert!(client.refused());
+        // A login replaced: neither it nor a clone of it sends anything more.
+        let sent = asked.load(Ordering::SeqCst);
+        let other = Client::from_pair(&address, "replaced", "salt", "token");
+        let clone = other.clone();
+        other.retire();
+        assert!(clone.ping().is_err());
+        assert!(clone.open_stream(&clone.stream_url("1", 0, 0), None).is_err());
+        assert_eq!(asked.load(Ordering::SeqCst), sent, "a replaced login sent a request");
+        assert!(!other.is(&client));
     }
 
     /// The review of W7, MUST 6: the first refusal held far past the old three seconds, and
