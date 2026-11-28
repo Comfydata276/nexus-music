@@ -165,7 +165,7 @@ fn note_forget(session: u64) -> Forget {
 }
 
 fn kept_signed_in(count: u64) -> Kept {
-    Kept { device_secret: Some(our_key()), saved: Some(saved(count)), notes: Vec::new(), offline: false, unreadable: Vec::new() }
+    Kept { device_secret: Some(our_key()), saved: Some(saved(count)), notes: Vec::new(), offline: false, unreadable: Vec::new(), diagnostics: None, diag_schedule: None }
 }
 
 /// A device under test: the machine, the clock, and every thing it was told to do.
@@ -1430,7 +1430,11 @@ fn the_machine_never_holds_the_player_back() {
     for line in &rig.log {
         let thing: serde_json::Value = serde_json::from_str(line).unwrap();
         let kind = thing.as_object().and_then(|object| object.keys().next().cloned()).unwrap();
-        assert!(["ask", "keep", "forget", "show", "hand"].contains(&kind.as_str()), "{line}");
+        assert!(["ask", "keep", "forget", "show", "hand", "journal"].contains(&kind.as_str()), "{line}");
+        if let Some(journal) = thing.get("journal") {
+            let what = journal.as_object().and_then(|object| object.keys().next().cloned()).unwrap();
+            assert!(["read_events", "read_diagnostics", "taken", "refused", "life_moved", "resend_all"].contains(&what.as_str()), "{line}");
+        }
         if let Some(hand) = thing.get("hand") {
             assert!(hand.get("login").is_some() || hand.get("refused").is_some(), "{line}");
         }
@@ -2129,25 +2133,589 @@ fn b10_after_a_mismatch_the_music_line_says_sign_in_and_a_notes_address_is_not_t
 }
 
 // ---------------------------------------------------------------------------------------
-// The sending half: owed (C8's events, C6's Diagnostics)
+// The sending half (13.3, 14.4): events and Diagnostics, by the same rules as every ask
 // ---------------------------------------------------------------------------------------
 
-#[test]
-#[ignore = "owed: C8. Events waiting are sent from the tick, 500 to a request, each answered by itself (13.3)"]
-fn events_waiting_are_sent_in_batches_answered_one_by_one() {}
+use crate::nexus::events::{self as ev, Kind, SearchedIn};
+
+fn ours() -> JournalAccount {
+    JournalAccount { backend_id: backend(), account: account() }
+}
+
+fn event_id(n: u64) -> EventId {
+    let mut bytes = [0xe0; 16];
+    bytes[..8].copy_from_slice(&n.to_le_bytes());
+    EventId::from_bytes(bytes)
+}
+
+/// A small event, numbered in the device's order.
+fn placed(n: u64) -> Placed {
+    ev::Record::new(event_id(n), START_MS, Kind::Search { words: format!("words {n}"), found: 1, where_: SearchedIn::Library }).unwrap().place(n).unwrap()
+}
+
+/// A large one: three texts of 200 two-byte characters.
+fn big(n: u64) -> Placed {
+    let text = "é".repeat(200);
+    let kind = Kind::Start {
+        song_id: format!("song-{n}"),
+        title: text.clone(),
+        artist: text.clone(),
+        album: text,
+        from: ev::PlayedFrom::Queue,
+        began: ev::Began::NextInQueue,
+        sound: ev::Sound::Streamed,
+        position_ms: 0,
+    };
+    ev::Record::new(event_id(n), START_MS, kind).unwrap().place(n).unwrap()
+}
+
+fn journal(out: &[Do]) -> Vec<&JournalDo> {
+    out.iter()
+        .filter_map(|thing| match thing {
+            Do::Journal(journal) => Some(journal),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The read of events asked in `out`: its number, where it starts, and its life.
+fn read_asked(out: &[Do]) -> Option<(u64, u64, u64)> {
+    journal(out).into_iter().find_map(|journal| match journal {
+        JournalDo::ReadEvents { read, from_sequence, life, account, max_events, max_bytes } => {
+            assert_eq!((*account, *max_events, *max_bytes), (ours(), ev::BATCH_EVENTS, ev::BATCH_BYTES));
+            Some((*read, *from_sequence, *life))
+        }
+        _ => None,
+    })
+}
+
+fn diag_read_asked(out: &[Do]) -> Option<u64> {
+    journal(out).into_iter().find_map(|journal| match journal {
+        JournalDo::ReadDiagnostics { read } => Some(*read),
+        _ => None,
+    })
+}
+
+fn index_of(out: &[Do], what: impl Fn(&Do) -> bool) -> usize {
+    out.iter().position(what).unwrap_or_else(|| panic!("not in {out:?}"))
+}
+
+impl Rig {
+    fn waiting(&mut self, life: u64, pending: u64, from_sequence: u64) -> Vec<Do> {
+        self.happen(Happened::EventsWaiting { account: ours(), life, pending, from_sequence })
+    }
+
+    fn events_read(&mut self, read: u64, life: u64, events: Vec<Placed>) -> Vec<Do> {
+        self.happen(Happened::EventsRead { read, account: ours(), life, events })
+    }
+
+    /// Events waiting, read, and sent: the batch's ask.
+    fn send(&mut self, events: Vec<Placed>) -> u64 {
+        let out = self.waiting(1, events.len() as u64, events[0].sequence());
+        let (read, _, life) = read_asked(&out).expect("a read");
+        let out = self.events_read(read, life, events);
+        ask_to(&out, ev::SEND_PATH).id
+    }
+}
+
+fn batch_done(answers: &[(u64, ev::Outcome)], life: u64) -> (u16, Vec<u8>) {
+    let answers = answers.iter().map(|(n, outcome)| ev::Answered { id: event_id(*n), outcome: *outcome }).collect();
+    done(ev::BatchAnswer::new(answers).unwrap(), receipt_full(backend(), account(), 1, life, 4))
+}
+
+fn report_text() -> String {
+    let about = diag::About {
+        version: Version { major: 0, minor: 41, patch: 0 },
+        device: DeviceKind::Phone,
+        os: Version { major: 14, minor: 0, patch: 0 },
+        signed_in: true,
+        https: true,
+        offline: false,
+        local_permission: Some(true),
+        android_auto: Some(false),
+        loss: ev::LossCounts::default(),
+        pc: None,
+    };
+    diag::Report { about, record: diag::Record::default() }.text().unwrap()
+}
 
 #[test]
-#[ignore = "owed: C8. On \"the server's data was put back\" every event still held is sent again (13.3)"]
-fn start_again_sends_every_event_still_held() {}
+fn events_waiting_are_sent_in_batches_answered_one_by_one() {
+    let mut rig = running(4);
+    let out = rig.waiting(1, 3, 1);
+    // Read by the journal's reader, the signed-in account's, in its life, from the oldest.
+    let (read, from, life) = read_asked(&out).unwrap();
+    assert_eq!((from, life), (1, 1));
+    assert!(asks(&out).is_empty(), "nothing is sent before it is read");
+    let out = rig.events_read(read, 1, vec![placed(1), placed(2), placed(3)]);
+    let ask = ask_to(&out, ev::SEND_PATH);
+    assert_eq!(ask.url, format!("{NEXUS}{}", ev::SEND_PATH));
+    assert_eq!(ask.authorization.as_ref().unwrap().expose(), format!("Bearer {}", hex(&SESSION)));
+    assert_eq!(ask.max_body, ev::BATCH_REPLY_BYTES);
+    let body = body_of(ask);
+    assert_eq!(body["life"], 1);
+    assert_eq!(body["events"].as_array().unwrap().len(), 3);
+    let id = ask.id;
+    assert!(rig.client.waits_for(id));
+    // Each answered by itself: taken, refused (final), not dealt with (later).
+    let out = rig.reply(id, batch_done(&[(1, ev::Outcome::Taken), (2, ev::Outcome::Refused)], 1));
+    let changed = journal(&out);
+    assert!(matches!(changed[0], JournalDo::Taken { ids, life: 1, at_ms, .. } if ids == &vec![event_id(1)] && *at_ms == rig.now), "{out:?}");
+    assert!(matches!(changed[1], JournalDo::Refused { ids, life: 1, .. } if ids == &vec![event_id(2)]), "{out:?}");
+    // More may wait: read on from after what was sent, in this same round.
+    let (read, from, _) = read_asked(&out).unwrap();
+    assert_eq!(from, 4);
+    // Nothing more: the round is over, and nothing is read or asked again by itself.
+    let out = rig.events_read(read, 1, Vec::new());
+    assert!(journal(&out).is_empty() && asks(&out).is_empty(), "{out:?}");
+    rig.now += 2 * TICK_MS;
+    let out = rig.happen(Happened::Tick);
+    assert!(read_asked(&out).is_none() && asks_to(&out, ev::SEND_PATH) == 0, "{out:?}");
+}
 
 #[test]
-#[ignore = "owed: C8. Nothing written under an earlier life of the account is sent (12.5)"]
-fn events_of_an_earlier_life_are_not_sent() {}
+fn a_bare_tick_never_sends_events() {
+    let mut rig = Rig::new(DeviceKind::Pc);
+    let out = rig.start(kept_signed_in(4));
+    // Events wait before the hello is read: nothing is read or sent yet.
+    let verify = ask_to(&out, proto::HELLO).id;
+    let out = rig.waiting(1, 5, 1);
+    assert!(read_asked(&out).is_none(), "{out:?}");
+    for _ in 0..3 {
+        rig.now += TICK_MS;
+        assert!(read_asked(&rig.happen(Happened::Tick)).is_none());
+    }
+    // The hello read, the backend expected: now they go, from that answer.
+    let out = rig.reply(verify, hello());
+    assert!(read_asked(&out).is_some(), "{out:?}");
+}
 
 #[test]
-#[ignore = "owed: C6. Diagnostics: a few minutes after a fault, else daily; never within ten minutes; thirty a day; 64 KiB (14.4)"]
-fn diagnostics_are_sent_at_their_own_pace() {}
+fn an_event_written_while_a_batch_is_out_is_not_lost_and_is_sent_next() {
+    let mut rig = running(4);
+    let batch = rig.send(vec![placed(1), placed(2)]);
+    // A flush meanwhile: noted, and nothing more is read while the batch is out.
+    let out = rig.waiting(1, 3, 1);
+    assert!(read_asked(&out).is_none() && asks(&out).is_empty(), "{out:?}");
+    let out = rig.reply(batch, batch_done(&[(1, ev::Outcome::Taken), (2, ev::Outcome::Taken)], 1));
+    let (read, from, _) = read_asked(&out).unwrap();
+    assert_eq!(from, 3);
+    let out = rig.events_read(read, 1, vec![placed(3)]);
+    let ask = ask_to(&out, ev::SEND_PATH);
+    assert_eq!(body_of(ask)["events"][0]["id"], event_id(3).to_hex());
+}
 
 #[test]
-#[ignore = "owed: C8 and C6. Offline sends nothing; an account switch sends nothing of the old account's"]
-fn the_sending_half_keeps_the_fence() {}
+fn a_batch_is_500_events_and_512_kib_at_most() {
+    let mut rig = running(4);
+    let many: Vec<Placed> = (1..=600).map(placed).collect();
+    let out = rig.waiting(1, 600, 1);
+    let (read, _, _) = read_asked(&out).unwrap();
+    let out = rig.events_read(read, 1, many);
+    let ask = ask_to(&out, ev::SEND_PATH);
+    assert_eq!(body_of(ask)["events"].as_array().unwrap().len(), ev::BATCH_EVENTS);
+    let ask = ask.id;
+    // All taken: the next read starts after the 500th.
+    let answers: Vec<(u64, ev::Outcome)> = (1..=500).map(|n| (n, ev::Outcome::Taken)).collect();
+    let out = rig.reply(ask, batch_done(&answers, 1));
+    assert_eq!(read_asked(&out).unwrap().1, 501);
+
+    let mut rig = running(4);
+    let large: Vec<Placed> = (1..=500).map(big).collect();
+    let out = rig.waiting(1, 500, 1);
+    let (read, _, _) = read_asked(&out).unwrap();
+    let out = rig.events_read(read, 1, large);
+    let ask = ask_to(&out, ev::SEND_PATH);
+    let bytes = ask.body.as_ref().unwrap().expose().len();
+    let sent = body_of(ask)["events"].as_array().unwrap().len();
+    assert!(bytes <= ev::BATCH_BYTES && sent < 500 && sent > 100, "{bytes} bytes, {sent} events");
+}
+
+#[test]
+fn start_again_sends_every_event_still_held() {
+    let mut rig = running(4);
+    let batch = rig.send(vec![placed(1)]);
+    let out = rig.reply(batch, refused(Refusal::NotSignedIn(NotSignedIn::DataPutBack)));
+    // Every event held for this backend is to be sent again, told before the session goes.
+    let resend = index_of(&out, |thing| matches!(thing, Do::Journal(JournalDo::ResendAll { backend_id }) if *backend_id == backend()));
+    let dropped = index_of(&out, |thing| matches!(thing, Do::Keep(Keep::Saved(saved)) if saved.session.is_none()));
+    assert!(resend < dropped, "{out:?}");
+    // Not signed in: nothing goes, whatever waits.
+    assert!(read_asked(&rig.waiting(1, 1, 1)).is_none());
+    // Signed in again: the journal is told the life, after it is kept; then what waits goes,
+    // from that answer.
+    let out = rig.sign_in(4);
+    let kept = index_of(&out, |thing| matches!(thing, Do::Keep(Keep::Saved(saved)) if saved.session.is_some()));
+    let life = index_of(&out, |thing| matches!(thing, Do::Journal(JournalDo::LifeMoved { life: 1, .. })));
+    let read = index_of(&out, |thing| matches!(thing, Do::Journal(JournalDo::ReadEvents { life: 1, .. })));
+    assert!(kept < life && life < read, "{out:?}");
+}
+
+#[test]
+fn events_of_an_earlier_life_are_not_sent() {
+    let mut rig = running(4);
+    let batch = rig.send(vec![placed(1), placed(2)]);
+    // The answer's stamp shows a new life: "the life has moved", not refusals.
+    let out = rig.reply(batch, batch_done(&[(1, ev::Outcome::Refused), (2, ev::Outcome::Refused)], 2));
+    let kept = index_of(&out, |thing| matches!(thing, Do::Keep(Keep::Saved(saved)) if saved.life == 2));
+    let moved = index_of(&out, |thing| matches!(thing, Do::Journal(JournalDo::LifeMoved { life: 2, account }) if *account == ours()));
+    assert!(kept < moved, "nothing is removed before the new life is kept: {out:?}");
+    assert!(!journal(&out).iter().any(|journal| matches!(journal, JournalDo::Taken { .. } | JournalDo::Refused { .. })), "{out:?}");
+    // What the journal still says of the earlier life is not read or sent.
+    assert!(read_asked(&rig.waiting(1, 2, 1)).is_none());
+    // The new life's events are, read under it.
+    let out = rig.waiting(2, 1, 9);
+    let (read, from, life) = read_asked(&out).unwrap();
+    assert_eq!((from, life), (9, 2));
+    // A read handed back under the earlier life is dropped.
+    let out = rig.happen(Happened::EventsRead { read, account: ours(), life: 1, events: vec![placed(9)] });
+    assert_eq!(asks_to(&out, ev::SEND_PATH), 0, "{out:?}");
+}
+
+#[test]
+fn an_events_read_for_another_account_or_after_a_stop_is_dropped() {
+    let mut rig = running(4);
+    let out = rig.waiting(1, 1, 1);
+    let (read, _, _) = read_asked(&out).unwrap();
+    // Another account's read under the same number: dropped.
+    let other = JournalAccount { backend_id: backend(), account: AccountId::new(ACCOUNT + 1).unwrap() };
+    let out = rig.happen(Happened::EventsRead { read, account: other, life: 1, events: vec![placed(1)] });
+    assert_eq!(asks_to(&out, ev::SEND_PATH), 0);
+    // And the read is over: the right one now is not waited for either.
+    let out = rig.events_read(read, 1, vec![placed(1)]);
+    assert_eq!(asks_to(&out, ev::SEND_PATH), 0);
+
+    let mut rig = running(4);
+    let out = rig.waiting(1, 1, 1);
+    let (read, _, _) = read_asked(&out).unwrap();
+    rig.client.stop();
+    // The backend at this address was read this run: no second hello (as built).
+    rig.start(kept_signed_in(4));
+    let out = rig.events_read(read, 1, vec![placed(1)]);
+    assert_eq!(asks_to(&out, ev::SEND_PATH), 0, "a read asked before the stop: {out:?}");
+    // A summary for an account not signed in is not acted on.
+    let out = rig.happen(Happened::EventsWaiting { account: other, life: 1, pending: 4, from_sequence: 1 });
+    assert!(read_asked(&out).is_none());
+}
+
+#[test]
+fn the_sending_half_keeps_the_fence() {
+    // Offline: nothing read, nothing asked, and a queued batch fails waits_for.
+    let mut rig = running(4);
+    let batch = rig.send(vec![placed(1)]);
+    rig.happen(Happened::Offline(true));
+    assert!(!rig.client.waits_for(batch));
+    let out = rig.waiting(1, 2, 1);
+    assert!(read_asked(&out).is_none() && asks(&out).is_empty(), "{out:?}");
+    // Offline off: what waits goes again.
+    let out = rig.happen(Happened::Offline(false));
+    assert!(read_asked(&out).is_some(), "{out:?}");
+
+    // A read answered after Offline went on asks nothing.
+    let mut rig = running(4);
+    let (read, _, _) = read_asked(&rig.waiting(1, 1, 1)).unwrap();
+    rig.happen(Happened::Offline(true));
+    assert!(asks(&rig.events_read(read, 1, vec![placed(1)])).is_empty());
+
+    // A sign-out: a batch out is no longer waited for, and nothing more is read.
+    let mut rig = running(4);
+    let batch = rig.send(vec![placed(1)]);
+    rig.press(Press::SignOut);
+    assert!(!rig.client.waits_for(batch));
+    assert!(read_asked(&rig.waiting(1, 2, 1)).is_none());
+
+    // An account switch: Diagnostics read before it is not sent after it.
+    let mut rig = running(4);
+    rig.happen(Happened::InUse(true));
+    rig.happen(Happened::DiagnosticsFault { at_ms: rig.now });
+    rig.now += diag::FAULT_WAIT_MS;
+    let read = diag_read_asked(&rig.happen(Happened::Tick)).unwrap();
+    rig.client.stop();
+    rig.start(kept_signed_in(4));
+    let out = rig.happen(Happened::DiagnosticsRead { read, text: Some(report_text()) });
+    assert_eq!(asks_to(&out, diag::SEND_PATH), 0, "{out:?}");
+}
+
+#[test]
+fn a_busy_events_answer_with_a_failed_check_asks_nothing_from_its_own_answer() {
+    let mut rig = running(4);
+    // The backend could not be reached a moment ago.
+    let devices = only_ask(&rig.press(Press::OpenDevices)).id;
+    rig.fail(devices, How::Connect);
+    let batch = rig.send(vec![placed(1)]);
+    let busy = refused_stamped(Refusal::Busy { retry_after_seconds: None }, receipt(4));
+    let out = rig.reply(batch, busy);
+    assert!(read_asked(&out).is_none() && asks_to(&out, ev::SEND_PATH) == 0, "not from its own answer: {out:?}");
+    // The same number of events waiting is no change.
+    assert!(read_asked(&rig.waiting(1, 1, 1)).is_none());
+    // The network coming back is: it is read and sent again, once.
+    let out = rig.happen(Happened::Network { up: true });
+    assert!(read_asked(&out).is_some(), "{out:?}");
+}
+
+#[test]
+fn a_held_batch_waits_for_more_events_and_for_the_wait_the_backend_asked() {
+    let mut rig = running(4);
+    let batch = rig.send(vec![placed(1)]);
+    let busy = refused_stamped(Refusal::Busy { retry_after_seconds: Wait::new(30) }, receipt(4));
+    assert!(read_asked(&rig.reply(batch, busy)).is_none());
+    assert!(read_asked(&rig.waiting(1, 1, 1)).is_none(), "nothing changed");
+    rig.now += 10_000;
+    assert!(read_asked(&rig.waiting(1, 2, 1)).is_none(), "more, but before the 30 seconds");
+    rig.now += 25_000;
+    assert!(read_asked(&rig.happen(Happened::Tick)).is_none(), "a tick is not a change");
+    assert!(read_asked(&rig.waiting(1, 3, 1)).is_some(), "more, after the 30 seconds");
+
+    // All "not dealt with" (the backend is full, 13.4): held the same way.
+    let mut rig = running(4);
+    let batch = rig.send(vec![placed(1), placed(2)]);
+    let out = rig.reply(batch, batch_done(&[(1, ev::Outcome::NotDealtWith)], 1));
+    assert!(journal(&out).is_empty(), "{out:?}");
+    assert!(read_asked(&rig.waiting(1, 2, 1)).is_none());
+    assert!(read_asked(&rig.waiting(1, 3, 1)).is_some());
+
+    // A failure: held until the backend may be reachable, more events or not.
+    let mut rig = running(4);
+    let batch = rig.send(vec![placed(1)]);
+    rig.fail(batch, How::Timeout);
+    assert!(read_asked(&rig.waiting(1, 5, 1)).is_none());
+    assert!(read_asked(&rig.happen(Happened::Network { up: true })).is_some());
+
+    // An answer that does not read: held.
+    let mut rig = running(4);
+    let batch = rig.send(vec![placed(1)]);
+    rig.reply(batch, (200, b"{\"result\":".to_vec()));
+    assert!(read_asked(&rig.waiting(1, 1, 1)).is_none());
+}
+
+#[test]
+fn a_hold_is_lifted_only_by_more_of_the_signed_in_accounts_events() {
+    let mut rig = running(4);
+    let batch = rig.send(vec![placed(1)]);
+    rig.reply(batch, batch_done(&[(1, ev::Outcome::NotDealtWith)], 1));
+    let other = JournalAccount { backend_id: backend(), account: AccountId::new(ACCOUNT + 1).unwrap() };
+    rig.happen(Happened::EventsWaiting { account: other, life: 1, pending: 50, from_sequence: 1 });
+    // Our own summary, the same as when it held: still held.
+    assert!(read_asked(&rig.waiting(1, 1, 1)).is_none());
+
+    // A stamp naming an earlier life than the batch's is not "the life moved on": held.
+    let mut rig = running(4);
+    let batch = rig.send(vec![placed(1)]);
+    let older = done(ev::BatchAnswer::new(Vec::new()).unwrap(), receipt_full(backend(), account(), 1, 0, 4));
+    rig.reply(batch, older);
+    assert!(read_asked(&rig.waiting(1, 1, 1)).is_none());
+}
+
+#[test]
+fn diagnostics_are_sent_at_their_own_pace() {
+    let mut rig = running(4);
+    rig.happen(Happened::InUse(true));
+    // Nothing is due yet: the day since first use has not passed, and no fault.
+    rig.now += TICK_MS;
+    assert!(diag_read_asked(&rig.happen(Happened::Tick)).is_none());
+    // A fault: a few minutes after it, not before.
+    let fault = rig.happen(Happened::DiagnosticsFault { at_ms: rig.now });
+    assert!(matches!(&fault[..], [Do::Keep(Keep::DiagSchedule(schedule))] if schedule.fault_ms == Some(rig.now)), "{fault:?}");
+    rig.now += diag::FAULT_WAIT_MS - 1;
+    assert!(diag_read_asked(&rig.happen(Happened::Tick)).is_none());
+    rig.now += 1;
+    let out = rig.happen(Happened::Tick);
+    // The attempt is kept before anything is read or sent (C6).
+    let kept = index_of(&out, |thing| matches!(thing, Do::Keep(Keep::DiagSchedule(schedule)) if schedule.attempts == vec![rig.now]));
+    let read_at = index_of(&out, |thing| matches!(thing, Do::Journal(JournalDo::ReadDiagnostics { .. })));
+    assert!(kept < read_at);
+    assert!(asks(&out).is_empty());
+    let read = diag_read_asked(&out).unwrap();
+    // The text read: one request, under the session, what was read and nothing more.
+    let text = report_text();
+    let out = rig.happen(Happened::DiagnosticsRead { read, text: Some(text.clone()) });
+    let ask = ask_to(&out, diag::SEND_PATH);
+    assert_eq!(ask.authorization.as_ref().unwrap().expose(), format!("Bearer {}", hex(&SESSION)));
+    assert!(ask.body.as_ref().unwrap().expose().len() <= diag::CALL_BYTES);
+    assert_eq!(body_of(ask)["text"], text);
+    let id = ask.id;
+    rig.reply(id, done(diag::Uploaded {}, receipt(4)));
+    // Never sooner than ten minutes after, whatever went wrong meanwhile.
+    rig.happen(Happened::DiagnosticsFault { at_ms: rig.now });
+    rig.now += diag::MIN_GAP_MS - 1;
+    assert!(diag_read_asked(&rig.happen(Happened::Tick)).is_none());
+    rig.now += 1;
+    assert!(diag_read_asked(&rig.happen(Happened::Tick)).is_some());
+}
+
+#[test]
+fn diagnostics_are_thirty_a_day_at_most_and_not_tried_again_outside_the_schedule() {
+    let mut rig = running(4);
+    rig.happen(Happened::InUse(true));
+    let mut sent = 0;
+    for _ in 0..40 {
+        rig.happen(Happened::DiagnosticsFault { at_ms: rig.now });
+        rig.now += diag::MIN_GAP_MS;
+        let out = rig.happen(Happened::Tick);
+        if let Some(read) = diag_read_asked(&out) {
+            sent += 1;
+            let out = rig.happen(Happened::DiagnosticsRead { read, text: Some(report_text()) });
+            // Each attempt fails: none is tried again by itself.
+            let id = ask_to(&out, diag::SEND_PATH).id;
+            rig.fail(id, How::Timeout);
+            assert!(diag_read_asked(&rig.happen(Happened::Tick)).is_none());
+            rig.happen(Happened::Network { up: true });
+        }
+    }
+    // 40 tries ten minutes apart are within a day: thirty went.
+    assert_eq!(sent, diag::MAX_PER_DAY);
+}
+
+#[test]
+fn whether_diagnostics_are_sent_is_the_devices_choice_then_the_servers_default() {
+    fn attempt(server: Option<bool>, device: Option<bool>) -> bool {
+        let mut rig = Rig::new(DeviceKind::Phone);
+        let out = rig.start(Kept { diagnostics: device, ..kept_signed_in(4) });
+        let verify = ask_to(&out, proto::HELLO).id;
+        let hello = Hello::for_accounts(Version { major: 0, minor: 2, patch: 0 }, backend(), SPEAKS);
+        let hello = match server {
+            Some(on) => hello.with_diagnostics_default(on),
+            None => hello,
+        };
+        rig.reply(verify, (200, hello.to_json().into_bytes()));
+        rig.happen(Happened::InUse(true));
+        rig.happen(Happened::DiagnosticsFault { at_ms: rig.now });
+        rig.now += diag::FAULT_WAIT_MS;
+        diag_read_asked(&rig.happen(Happened::Tick)).is_some()
+    }
+    assert!(attempt(None, None), "on unless turned off");
+    assert!(attempt(Some(true), None));
+    assert!(!attempt(Some(false), None), "the server's default, while the person has not chosen");
+    assert!(attempt(Some(false), Some(true)), "the person's choice wins");
+    assert!(!attempt(Some(true), Some(false)), "the person's choice wins");
+    assert!(!attempt(None, Some(false)));
+
+    // The switch turned off while running: nothing; back on: the fault waiting is sent.
+    let mut rig = running(4);
+    rig.happen(Happened::InUse(true));
+    rig.happen(Happened::DiagnosticsSwitch(Some(false)));
+    rig.happen(Happened::DiagnosticsFault { at_ms: rig.now });
+    rig.now += diag::FAULT_WAIT_MS;
+    assert!(diag_read_asked(&rig.happen(Happened::Tick)).is_none());
+    rig.happen(Happened::DiagnosticsSwitch(Some(true)));
+    rig.now += TICK_MS;
+    assert!(diag_read_asked(&rig.happen(Happened::Tick)).is_some());
+    // Not in use: nothing, whatever is due.
+    let mut rig = running(4);
+    rig.happen(Happened::DiagnosticsFault { at_ms: rig.now });
+    rig.now += diag::FAULT_WAIT_MS;
+    assert!(diag_read_asked(&rig.happen(Happened::Tick)).is_none());
+}
+
+#[test]
+fn diagnostics_wait_for_the_hello_and_send_only_a_report() {
+    // Before the hello is read: nothing is due, and the schedule is not spent.
+    let mut rig = Rig::new(DeviceKind::Phone);
+    let out = rig.start(kept_signed_in(4));
+    let verify = ask_to(&out, proto::HELLO).id;
+    rig.happen(Happened::InUse(true));
+    rig.happen(Happened::DiagnosticsFault { at_ms: rig.now });
+    rig.now += diag::FAULT_WAIT_MS;
+    let out = rig.happen(Happened::Tick);
+    assert!(diag_read_asked(&out).is_none() && !out.iter().any(|thing| matches!(thing, Do::Keep(Keep::DiagSchedule(_)))), "{out:?}");
+    rig.reply(verify, hello());
+    let read = diag_read_asked(&rig.happen(Happened::Tick)).unwrap();
+    // A text that is not a report, or none: that attempt is spent, nothing is asked.
+    let out = rig.happen(Happened::DiagnosticsRead { read, text: Some("Song: Secret Title by Someone".to_owned()) });
+    assert!(asks(&out).is_empty(), "{out:?}");
+    // Offline: nothing at all.
+    let mut rig = running(4);
+    rig.happen(Happened::InUse(true));
+    rig.happen(Happened::Offline(true));
+    rig.happen(Happened::DiagnosticsFault { at_ms: rig.now });
+    rig.now += diag::FAULT_WAIT_MS;
+    assert!(diag_read_asked(&rig.happen(Happened::Tick)).is_none());
+}
+
+#[test]
+fn the_diagnostics_schedule_is_kept_per_device_and_read_back() {
+    // None kept: one is made and kept at once.
+    let mut rig = Rig::new(DeviceKind::Phone);
+    let out = rig.start(kept_signed_in(4));
+    assert!(out.iter().any(|thing| matches!(thing, Do::Keep(Keep::DiagSchedule(schedule)) if schedule.started_ms == START_MS)));
+    // Kept with an attempt a minute ago: the next waits its ten minutes, across the restart.
+    let kept = DiagSchedule { started_ms: START_MS - DAY, fault_ms: None, attempts: vec![START_MS - 60_000] };
+    let mut rig = Rig::new(DeviceKind::Phone);
+    rig.start_verified(Kept { diag_schedule: Some(kept), ..kept_signed_in(4) });
+    rig.happen(Happened::InUse(true));
+    rig.happen(Happened::DiagnosticsFault { at_ms: rig.now });
+    rig.now += diag::FAULT_WAIT_MS;
+    assert!(diag_read_asked(&rig.happen(Happened::Tick)).is_none());
+    rig.now += diag::MIN_GAP_MS;
+    assert!(diag_read_asked(&rig.happen(Happened::Tick)).is_some());
+    // One that does not hold together (attempts closer than ten minutes): forgotten, a new one.
+    let bad = DiagSchedule { started_ms: START_MS, fault_ms: None, attempts: vec![START_MS, START_MS + 1] };
+    let mut rig = Rig::new(DeviceKind::Phone);
+    let out = rig.start(Kept { diag_schedule: Some(bad), ..kept_signed_in(4) });
+    assert!(forgets(&out).contains(&Forget::DiagSchedule), "{out:?}");
+}
+
+#[test]
+fn the_sending_half_in_json_is_the_same_calls() {
+    let mut client = Client::default();
+    let mut start = start_json(serde_json::to_value(saved(4)).unwrap());
+    start["start"]["kept"]["diagnostics"] = serde_json::json!(true);
+    start["start"]["kept"]["diag_schedule"] = serde_json::json!({"started_ms": START_MS, "fault_ms": null, "attempts": []});
+    let out = call(&mut client, &start);
+    assert!(!out["do"].as_array().unwrap().iter().any(|thing| thing.get("forget").is_some() || thing.get("keep").is_some_and(|keep| keep.get("diag_schedule").is_some())), "{out}");
+    let verify = first_ask(&out);
+    let out = call(&mut client, &answer_json(verify, hello()));
+    let check = first_ask(&out);
+    call(&mut client, &answer_json(check, devices_body(4, vec![this_device()])));
+    let given = serde_json::json!({"now_ms": START_MS + 2000, "random": hex(&[0x42; 32])});
+    let account = serde_json::json!({"backend_id": backend().to_hex(), "account": ACCOUNT});
+    let out = call(&mut client, &serde_json::json!({"happened": {"event": {"events_waiting": {"account": account, "life": 1, "pending": 2, "from_sequence": 1}}, "given": given}}));
+    let read = &out["do"][0]["journal"]["read_events"];
+    assert_eq!(read["account"], account);
+    assert_eq!((read["life"].as_u64(), read["from_sequence"].as_u64(), read["max_events"].as_u64()), (Some(1), Some(1), Some(500)));
+    // The journal's lines as written, and one that does not read (left out).
+    let line = |n: u64| -> serde_json::Value {
+        let bytes = placed(n).line().unwrap();
+        serde_json::from_slice(&bytes[..bytes.len() - 1]).unwrap()
+    };
+    let out = call(
+        &mut client,
+        &serde_json::json!({"happened": {"event": {"events_read": {"read": read["read"], "account": account, "life": 1, "events": [line(1), {"id": "nonsense"}, line(2)]}}, "given": given}}),
+    );
+    let ask = out["do"].as_array().unwrap().iter().find_map(|thing| thing.get("ask")).unwrap();
+    assert!(ask["url"].as_str().unwrap().ends_with(ev::SEND_PATH));
+    let body: serde_json::Value = serde_json::from_str(ask["body"].as_str().unwrap()).unwrap();
+    assert_eq!(body["events"].as_array().unwrap().len(), 2);
+    let id = ask["id"].as_u64().unwrap();
+    let out = call(&mut client, &answer_json(id, batch_done(&[(1, ev::Outcome::Taken), (2, ev::Outcome::Refused)], 1)));
+    let things = out["do"].as_array().unwrap();
+    assert_eq!(things[0]["journal"]["taken"]["ids"], serde_json::json!([event_id(1).to_hex()]));
+    assert_eq!(things[0]["journal"]["taken"]["account"], account);
+    assert_eq!(things[1]["journal"]["refused"]["ids"], serde_json::json!([event_id(2).to_hex()]));
+    // The other events, each in its form.
+    for event in [
+        serde_json::json!({"diagnostics_switch": null}),
+        serde_json::json!({"diagnostics_switch": false}),
+        serde_json::json!({"diagnostics_fault": {"at_ms": START_MS}}),
+        serde_json::json!({"in_use": true}),
+        serde_json::json!({"diagnostics_read": {"read": 99, "text": null}}),
+    ] {
+        let out = call(&mut client, &serde_json::json!({"happened": {"event": event, "given": given}}));
+        assert!(out.get("error").is_none(), "{event}: {out}");
+    }
+    // A bad account is a malformed envelope: nothing changes.
+    let out = call(&mut client, &serde_json::json!({"happened": {"event": {"events_waiting": {"account": {"backend_id": "x", "account": 1}, "life": 1, "pending": 1, "from_sequence": 1}}, "given": given}}));
+    assert_eq!(out, serde_json::json!({"error": "input"}));
+    // What Keep wrote of the schedule is what start reads; one that does not read is forgotten.
+    let mut start = start_json(serde_json::to_value(saved(4)).unwrap());
+    start["start"]["kept"]["diag_schedule"] = serde_json::json!({"started_ms": START_MS, "unknown": 1});
+    let out = call(&mut Client::default(), &start);
+    let things = out["do"].as_array().unwrap();
+    assert!(things.iter().any(|thing| thing["forget"] == "diag_schedule"), "{out}");
+    assert!(things.iter().any(|thing| thing["keep"]["diag_schedule"]["started_ms"] == START_MS), "{out}");
+    // ResendAll and LifeMoved, as the phone reads them.
+    let resend = serde_json::to_value(Do::Journal(JournalDo::ResendAll { backend_id: backend() })).unwrap();
+    assert_eq!(resend, serde_json::json!({"journal": {"resend_all": {"backend_id": backend().to_hex()}}}));
+    let moved = serde_json::to_value(Do::Journal(JournalDo::LifeMoved { account: ours(), life: 2 })).unwrap();
+    assert_eq!(moved, serde_json::json!({"journal": {"life_moved": {"account": account, "life": 2}}}));
+}

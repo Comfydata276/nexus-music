@@ -259,6 +259,9 @@ pub struct Hello {
     /// What this backend does, by name. A name this version doesn't know is kept, and simply
     /// never offered (design 12.1: an app offers only what the backend has).
     has: Vec<String>,
+    /// What Diagnostics starts as for a device whose person has not chosen (14.3): the
+    /// admin's default for the whole server. Not secret. `None`: not said, which is "on".
+    diagnostics: Option<bool>,
 }
 
 /// Why a body is not a valid `hello`. Each is "no backend here".
@@ -287,6 +290,7 @@ struct Fields {
     id: Option<String>,
     speaks: Option<Vec<u32>>,
     has: Option<Vec<String>>,
+    diagnostics: Option<bool>,
 }
 
 /// Reads one object's keys, refusing any key given twice. Keys are compared as JSON reads
@@ -318,6 +322,7 @@ impl<'de> serde::de::Visitor<'de> for Top {
                 "id" => fields.id = Some(map.next_value()?),
                 "speaks" => fields.speaks = Some(map.next_value()?),
                 "has" => fields.has = Some(map.next_value()?),
+                "diagnostics" => fields.diagnostics = Some(map.next_value()?),
                 _ => map.next_value_seed(PassOver(1))?,
             }
             first_time(&mut seen, key)?;
@@ -414,14 +419,26 @@ fn has_list(has: Vec<String>) -> Option<Vec<String>> {
 impl Hello {
     /// The stage-one answer of a backend with account sign-in enabled.
     pub fn for_accounts(nexus: Version, id: BackendId, speaks: Speaks) -> Self {
-        Self { nexus, id, speaks, has: vec![HAS_ACCOUNTS.to_owned()] }
+        Self { nexus, id, speaks, has: vec![HAS_ACCOUNTS.to_owned()], diagnostics: None }
     }
 
     /// A `hello` for the backend to send. `None` if `has` breaks the rules [`Hello::read`]
     /// holds an answer to, so that the backend cannot send what no app would take.
     pub fn new(nexus: Version, id: BackendId, speaks: Speaks, has: &[&str]) -> Option<Self> {
         let has = has_list(has.iter().map(|name| name.to_string()).collect())?;
-        Some(Hello { nexus, id, speaks, has })
+        Some(Hello { nexus, id, speaks, has, diagnostics: None })
+    }
+
+    /// The same `hello`, saying what Diagnostics starts as on a device whose person has not
+    /// chosen (14.3: the admin's default for the whole server).
+    pub fn with_diagnostics_default(self, on: bool) -> Self {
+        Hello { diagnostics: Some(on), ..self }
+    }
+
+    /// What Diagnostics starts as on a device whose person has not chosen, if this backend
+    /// said; `None` is "on" (`diag::enabled`). The device's own choice always wins.
+    pub fn diagnostics_default(&self) -> Option<bool> {
+        self.diagnostics
     }
 
     /// Reads a complete body as a `hello`: every byte of it UTF-8, one JSON object, no key
@@ -441,18 +458,21 @@ impl Hello {
             _ => return Err(HelloWrong::Speaks),
         };
         let has = has_list(has).ok_or(HelloWrong::Has)?;
-        Ok(Hello { nexus, id, speaks, has })
+        Ok(Hello { nexus, id, speaks, has, diagnostics: fields.diagnostics })
     }
 
     /// The body the backend sends: what [`Hello::read`] reads back as this same `hello`.
     pub fn to_json(&self) -> String {
-        serde_json::json!({
+        let mut hello = serde_json::json!({
             "nexus": self.nexus.to_string(),
             "id": self.id.to_hex(),
             "speaks": [self.speaks.low, self.speaks.high],
             "has": self.has,
-        })
-        .to_string()
+        });
+        if let (Some(on), Some(object)) = (self.diagnostics, hello.as_object_mut()) {
+            object.insert("diagnostics".to_owned(), serde_json::Value::Bool(on));
+        }
+        hello.to_string()
     }
 
     /// What this backend does, by name, as it said.
@@ -852,6 +872,26 @@ mod tests {
         let decoded = Hello::read(&body).unwrap();
         assert_eq!(decoded.has(), &[HAS_ACCOUNTS]);
         assert!(decoded.does(HAS_ACCOUNTS));
+    }
+
+    #[test]
+    fn the_diagnostics_default_is_said_in_hello_and_absent_is_not_said() {
+        let version = Version::parse("0.2.0").unwrap();
+        let id = BackendId::from_hex(ID).unwrap();
+        let plain = Hello::for_accounts(version, id, SPEAKS);
+        assert_eq!(plain.diagnostics_default(), None);
+        assert!(!plain.to_json().contains("diagnostics"));
+        assert_eq!(read(plain.to_json().as_bytes()).unwrap().diagnostics_default(), None);
+        for on in [true, false] {
+            let said = Hello::for_accounts(version, id, SPEAKS).with_diagnostics_default(on);
+            let back = read(said.to_json().as_bytes()).unwrap();
+            assert_eq!(back.diagnostics_default(), Some(on));
+            assert_eq!(back, said);
+        }
+        assert_eq!(read(&good_with(br#","diagnostics":false"#)).unwrap().diagnostics_default(), Some(false));
+        // Not a yes or no, or said twice: not a hello.
+        assert_eq!(read(&good_with(br#","diagnostics":"off""#)), Err(HelloWrong::Form));
+        assert_eq!(read(&good_with(br#","diagnostics":true,"diagnostics":false"#)), Err(HelloWrong::Form));
     }
 
     #[test]
