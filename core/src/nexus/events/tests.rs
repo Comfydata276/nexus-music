@@ -228,18 +228,19 @@ fn recovered_stops_use_only_matching_saved_progress_and_close_once() {
 
 #[test]
 fn waiting_files_drop_oldest_and_answered_files_age_for_eight_days() {
-    let file = |life, bytes, pending, final_at_ms| KeptFile { life, bytes, pending, final_at_ms };
+    let file = |life, bytes, events, pending, final_at_ms| KeptFile { life, bytes, events, pending, final_at_ms };
     let files = [
-        file(4, 1, 1, None),
-        file(5, 2, 2, None),
-        file(5, 3, 3, None),
-        file(5, WAITING_BYTES - 1, 4, None),
-        file(5, FILE_BYTES as u64, 0, Some(10)),
-        file(5, FILE_BYTES as u64, 0, Some(11)),
-        file(5, FILE_BYTES as u64, 0, Some(KEEP_MS + 11)),
+        file(4, 1, 1, 1, None),
+        file(5, 2, 3, 2, None),
+        file(5, 3, 4, 3, None),
+        file(5, WAITING_BYTES - 1, 4, 4, None),
+        file(5, FILE_BYTES as u64, 1, 0, Some(10)),
+        file(5, FILE_BYTES as u64, 1, 0, Some(11)),
+        file(5, FILE_BYTES as u64, 1, 0, Some(KEEP_MS + 11)),
+        file(5, 11, 0, 0, None),
     ];
-    assert_eq!(remove_files(&files, 5, KEEP_MS + 10), RemoveFiles { remove: vec![0, 1, 2, 4], dropped: 5 });
-    let exactly = [file(5, WAITING_BYTES, 1, None)];
+    assert_eq!(remove_files(&files, 5, KEEP_MS + 10), RemoveFiles { remove: vec![0, 1, 2, 4, 7], dropped: 7 });
+    let exactly = [file(5, WAITING_BYTES, 1, 1, None)];
     assert_eq!(remove_files(&exactly, 5, 0), RemoveFiles { remove: vec![], dropped: 0 });
 }
 
@@ -321,4 +322,14 @@ fn debug_does_not_print_event_words_or_ids() {
     for private in ["L'été", "Mira", "First Flight", "song-1", &event.id.to_hex()] {
         assert!(!shown.contains(private));
     }
+}
+
+#[test]
+fn start_again_replays_taken_events_and_never_retries_final_refusals() {
+    assert!(Outcome::NotDealtWith.should_send(false));
+    assert!(Outcome::NotDealtWith.should_send(true));
+    assert!(!Outcome::Taken.should_send(false));
+    assert!(Outcome::Taken.should_send(true));
+    assert!(!Outcome::Refused.should_send(false));
+    assert!(!Outcome::Refused.should_send(true));
 }

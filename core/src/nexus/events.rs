@@ -436,6 +436,8 @@ pub struct Append {
 pub struct KeptFile {
     pub life: u64,
     pub bytes: u64,
+    /// Valid event lines in the file, including events already answered.
+    pub events: u64,
     pub pending: u64,
     pub final_at_ms: Option<u64>,
 }
@@ -444,20 +446,21 @@ pub struct KeptFile {
 pub struct RemoveFiles {
     /// Positions in the caller's oldest-first list.
     pub remove: Vec<usize>,
-    /// Pending events lost to the waiting cap, to be reported as a fault.
+    /// Event lines in files lost to the waiting cap, to be reported as a fault.
     pub dropped: u64,
 }
 
 /// The design does not say how terminal refusals affect retention. They do not count as
 /// waiting; retain a fully answered file for eight days after its last terminal answer.
 /// The 64 MiB cap applies to waiting files, including a file partly taken. On restore
-/// the caller marks taken events waiting again, leaving final refusals final.
+/// use [`Outcome::should_send`] to mark taken events waiting again. The design does
+/// not say what to do with an empty file. An empty closed file can go immediately.
 pub fn remove_files(files: &[KeptFile], life: u64, now_ms: u64) -> RemoveFiles {
-    let mut waiting: u128 = files.iter().filter(|file| file.life == life && file.pending > 0)
+    let mut waiting: u128 = files.iter().filter(|file| file.life == life && file.events > 0 && file.pending > 0)
         .map(|file| u128::from(file.bytes)).sum();
     let mut plan = RemoveFiles { remove: Vec::new(), dropped: 0 };
     for (index, file) in files.iter().enumerate() {
-        if file.life != life {
+        if file.life != life || file.events == 0 {
             plan.remove.push(index);
         } else if file.pending == 0 {
             if file.final_at_ms.and_then(|at| now_ms.checked_sub(at)).is_some_and(|age| age >= KEEP_MS) {
@@ -466,7 +469,7 @@ pub fn remove_files(files: &[KeptFile], life: u64, now_ms: u64) -> RemoveFiles {
         } else if waiting > u128::from(WAITING_BYTES) {
             waiting -= u128::from(file.bytes);
             plan.remove.push(index);
-            plan.dropped = plan.dropped.saturating_add(file.pending);
+            plan.dropped = plan.dropped.saturating_add(file.events);
         }
     }
     plan
@@ -606,6 +609,20 @@ pub enum Outcome {
     Taken,
     Refused,
     NotDealtWith,
+}
+
+impl Outcome {
+    /// Ordinary sending retries only unfinished events. "Start again" also replays
+    /// taken events with their original ids. The design does not say which of "every
+    /// event it still holds" and "refused, which is final" wins on restore. A refusal
+    /// stays final.
+    pub fn should_send(self, start_again: bool) -> bool {
+        match self {
+            Self::Taken => start_again,
+            Self::Refused => false,
+            Self::NotDealtWith => true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
