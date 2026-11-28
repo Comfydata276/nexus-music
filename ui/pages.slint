@@ -2784,7 +2784,8 @@ export component SettingsPage inherits Rectangle {
                             if Settings.update-version != "": TextButton {
                                 primary: true;
                                 enabled: !Settings.update-busy;
-                                text: Settings.can-self-update ? "Update to " + Settings.update-version : "Get " + Settings.update-version;
+                                text: Settings.update-download-failed ? "Open release page"
+                                    : Settings.can-self-update ? "Update to " + Settings.update-version : "Get " + Settings.update-version;
                                 clicked => { Settings.install-update(); }
                             }
                         }
