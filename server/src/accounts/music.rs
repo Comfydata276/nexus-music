@@ -120,6 +120,17 @@ fn caller(keeper: &mut Keeper, head: &RequestHead, hash: &Fingerprint) -> Result
     Ok((number, device, account))
 }
 
+/// S9-2 (the review of S9): the caller is a live admin, by kept's `admin_read`, **before**
+/// anything of the target or of the backend's settings is looked at, so that a refusal says
+/// nothing of which accounts there are or what is set.
+fn live_admin(keeper: &mut Keeper, account: &mut nexus_core::nexus::kept::Account, restore: u64, device: account::DeviceId, hash: &Fingerprint, now: u64) -> Result<(), Refusal> {
+    account
+        .request(restore, keeper.clock(now), |turn| turn.admin_read(Bearer { device, hash, grant: None }))
+        .apply(|effects| keeper.persist(effects, &[], now))
+        .map_err(not_dealt_with)?
+        .map_err(said)
+}
+
 /// The account `id` names, loaded, if it is not the caller's own; `Ok(None)` for the caller's.
 fn target(keeper: &mut Keeper, caller: u64, id: AccountId) -> Result<Option<nexus_core::nexus::kept::Account>, Refusal> {
     if id.get() == caller {
@@ -174,6 +185,7 @@ impl Accounts {
                 .ask(move |keeper| -> Result<(u64, account::DeviceId, account::Email, PasswordCheck, _), Refusal> {
                     let now = clock();
                     let (number, device, mut account) = caller(keeper, &head, &hash)?;
+                    live_admin(keeper, &mut account, head.restore, device, &hash, now)?;
                     let selected = match change.action.target_account() {
                         Some(id) => match target(keeper, number, id)? {
                             Some(other) => Some(other.state().clone()),
@@ -244,6 +256,7 @@ impl Accounts {
                 .ask(move |keeper| -> Result<_, Refusal> {
                     let now = clock();
                     let (number, device, mut account) = caller(keeper, &head, &hash)?;
+                    live_admin(keeper, &mut account, head.restore, device, &hash, now)?;
                     let public = rows::music_public(keeper.data().connection()).map_err(not_dealt_with)?.ok_or(Refusal::NotAllowed(Denial::Conflict))?;
                     let other = target(keeper, number, target_id)?;
                     let bearer = Bearer { device, hash: &hash, grant: Some(GrantUse { request_id, secret: &grant }) };
@@ -307,6 +320,7 @@ impl Accounts {
                 .ask(move |keeper| -> Result<Answer, Refusal> {
                     let now = clock();
                     let (number, device, mut account) = caller(keeper, &again, &hash)?;
+                    live_admin(keeper, &mut account, again.restore, device, &hash, now)?;
                     let public = rows::music_public(keeper.data().connection()).map_err(not_dealt_with)?.ok_or(Refusal::NotAllowed(Denial::Conflict))?;
                     let mut other = target(keeper, number, target_id)?;
                     let bearer = Bearer { device, hash: &hash, grant: Some(GrantUse { request_id, secret: &grant }) };

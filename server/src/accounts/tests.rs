@@ -215,3 +215,38 @@ fn a_correct_password_of_an_account_not_an_admin_s_at_the_page_is_a_wrong_passwo
     let next = page(made[0].email, PASSWORD);
     assert_eq!(next.status, 429, "the page's refusal of a non-admin was not recorded as a wrong try");
 }
+
+/// S9-2 (the review of S9): an account that is not an admin's, signed in, learns nothing from
+/// an admin's call of which accounts there are, or of whether the address people use is set:
+/// the caller is found not to be an admin before anything of the target is looked at.
+#[test]
+fn an_account_not_an_admin_s_learns_nothing_of_accounts_or_settings_from_an_admin_s_call() {
+    use nexus_core::nexus::admin::{self, Action, Applied, Denial, MusicPassword, NamedChange, TypedMusicLogin};
+    let (bench, made) = Bench::new("not-admin-calls", &[("member@example.test", false), ("other@example.test", false)]);
+    let member = bench::signed_in(&bench.sign_in(bench::with_code(&made[0].code, PASSWORD), 1));
+    let copy = || account::Session::from_bytes(*member.session.expose_bytes());
+    let id = |number: u64| account::AccountId::new(number).unwrap();
+    let refused = |answer: &super::session::Answer| match admin::read_reply::<Applied>(answer.status, answer.body.bytes()).unwrap() {
+        admin::Reply::Refused(refusal) => refusal,
+        other => panic!("not refused: {other:?}"),
+    };
+    let grant = |target: u64, request: u64| {
+        let change = NamedChange { request_id: RequestId::new(request).unwrap(), action: Action::SetMusicLogin(id(target)) };
+        let request = account::GrantRequest { head: bench::head(member.restore), change, password: account::Password::presented(PASSWORD).unwrap() };
+        bench.runtime.block_on(bench.accounts.admin_grant(copy(), request))
+    };
+    let there = grant(made[1].number, 1);
+    let not_there = grant(9_999, 2);
+    assert_eq!(refused(&there), admin::Refusal::NotAllowed(Denial::Denied));
+    assert_eq!((there.status, there.body.bytes()), (not_there.status, not_there.body.bytes()));
+    // Setting a login, with no address people use set: the same, whatever the target.
+    let set = |target: u64, request: u64| {
+        let change = TypedMusicLogin { account: id(target), name: account::Name::new("tester").unwrap(), password: MusicPassword::new("a made-up music password").unwrap() };
+        let request = account::GrantedChange { head: bench::head(member.restore), request_id: RequestId::new(request).unwrap(), change, grant: account::GrantSecret::from_bytes([7; 32]) };
+        bench.runtime.block_on(bench.accounts.set_music_login(copy(), request))
+    };
+    let there = set(made[1].number, 3);
+    let not_there = set(9_999, 4);
+    assert_eq!(refused(&there), admin::Refusal::NotAllowed(Denial::Denied), "the address people use was looked at first");
+    assert_eq!((there.status, there.body.bytes()), (not_there.status, not_there.body.bytes()));
+}
