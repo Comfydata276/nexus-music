@@ -375,6 +375,9 @@ impl Job {
                     !index.before_effect.contains(slot) || batch.wants.get(*slot).and_then(|want| want.offer.as_ref())
                         .is_none_or(|offer| offer.artist_id != placement.artist || offer.album != placement.release)
                 })
+                || batch.wants.iter().enumerate().any(|(slot, want)| {
+                    want.placed && !index.placements.get(&slot).is_some_and(AlbumPlacement::newly_placed)
+                })
         }) {
             return false;
         }
@@ -494,7 +497,7 @@ impl Job {
                     reason: want.reason.clone(),
                     before_effect: indexed.before_effect.contains(&slot),
                     placement: indexed.placements.get(&slot).cloned(),
-                    placed: want.placed,
+                    placed: want.placed && indexed.placements.get(&slot).is_some_and(AlbumPlacement::newly_placed),
                 })
             }).collect()
         })
@@ -1535,6 +1538,42 @@ mod tests {
         fn singles(&self) -> bool {
             false
         }
+    }
+
+    #[test]
+    fn indexed_jobs_keep_distinct_wants_and_reject_corrupt_saved_slots() {
+        let found = |name: &str| Want {
+            state: State::Found,
+            offer: Some(Offer { album: name.into(), artist_id: "ar1".into(), ..Offer::default() }),
+            ..Want::default()
+        };
+        let job = Job::new(Nowhere);
+        job.start_indexed(vec![
+            found("al1"), found("al1"), found("al2"),
+            Want { state: State::Unknown, ..Want::default() },
+            Want { state: State::Failed, ..Want::default() },
+        ]).unwrap();
+        let rows = job.indexed_lines().unwrap();
+        assert_eq!(rows.iter().map(|row| row.slot).collect::<Vec<_>>(), [0, 0, 1, 2, 3]);
+        assert_eq!(rows.iter().map(|row| row.state).collect::<Vec<_>>(),
+            [State::Found, State::Found, State::Found, State::Unknown, State::Failed]);
+
+        let saved = job.with(|batch| serde_json::to_value(batch).unwrap());
+        let recovered = Job::new(Nowhere);
+        assert!(recovered.load(&serde_json::to_vec(&saved).unwrap()));
+        for bad in [
+            serde_json::json!({ "slots": [0, 0, 1, 2, 4], "before_effect": [] }),
+            serde_json::json!({ "slots": [0, 0, 0, 2, 3], "before_effect": [] }),
+            serde_json::json!({ "slots": [0, 0, 1, 2, 3], "before_effect": [4] }),
+        ] {
+            let mut corrupted = saved.clone();
+            corrupted["indexed"] = bad;
+            assert!(!recovered.load(&serde_json::to_vec(&corrupted).unwrap()));
+        }
+        let mut unproven = saved;
+        unproven["wants"][0]["placed"] = serde_json::json!(true);
+        assert!(!recovered.load(&serde_json::to_vec(&unproven).unwrap()));
+        assert_eq!(recovered.indexed_lines().unwrap(), rows);
     }
 
     #[test]
