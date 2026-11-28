@@ -13,13 +13,10 @@ use chrono::Utc;
 use nexus_core::nexus::{account::DeviceKind, diag, events::LossCounts, proto::Version};
 use slint::ComponentHandle;
 
-pub(crate) use diag::SoundOutput;
+pub(crate) use diag::{FaultPlace, FaultShape, Line, Note, SoundOutput};
 
 use crate::controller::{Controller, post, with};
 use crate::{config, pool::Pool, ui};
-
-#[cfg(windows)]
-pub(crate) use diag::{Line, Note};
 
 // Keep report building and file I/O off the window thread. One worker keeps repeated
 // exports and previews in the order they were requested.
@@ -83,7 +80,6 @@ thread_local! {
     static OBSERVED: RefCell<VecDeque<Observation>> = const { RefCell::new(VecDeque::new()) };
 }
 
-#[cfg(any(windows, test))]
 pub fn observe(line: diag::Line) {
     if let Ok(at) = u64::try_from(Utc::now().timestamp_millis()) {
         OBSERVED.with_borrow_mut(|observed| {
@@ -93,6 +89,22 @@ pub fn observe(line: diag::Line) {
             observed.push_back((at, line));
         });
     }
+}
+
+pub(crate) fn fault(place: FaultPlace, shape: FaultShape) {
+    observe(Line::Fault(diag::Fault::new(place, shape)));
+}
+
+pub(crate) fn connection_shape(error: &crate::subsonic::ApiError) -> FaultShape {
+    match error {
+        crate::subsonic::ApiError::Network(_) => FaultShape::Connection,
+        crate::subsonic::ApiError::NotSubsonic(_) => FaultShape::UnexpectedAnswer,
+        crate::subsonic::ApiError::Server { .. } => FaultShape::Refused,
+    }
+}
+
+pub(crate) fn music_connection_failed(error: &crate::subsonic::ApiError) {
+    fault(FaultPlace::MusicServer, connection_shape(error));
 }
 
 pub(crate) fn note_sound_output(kind: SoundOutput) {
@@ -135,9 +147,9 @@ impl Session {
         said: &VecDeque<(i64, String)>,
         mut observations: Vec<Observation>,
     ) -> Self {
-        observations.extend(said.iter().filter_map(|(at, text)| {
+        observations.extend(said.iter().filter_map(|(at, _)| {
             let at = u64::try_from(*at).ok()?.checked_mul(1_000)?;
-            Some((at, windows_observations::message(text)))
+            Some((at, Line::Note(Note::AppMessage)))
         }));
         Self {
             https: settings.server.starts_with("https://"),
@@ -283,33 +295,9 @@ fn recent_crash_text(path: &Path) -> std::io::Result<String> {
 // from older versions. Only the time, a fixed place and C6's classified shape leave here.
 mod windows_observations {
     use chrono::NaiveDateTime;
-    use nexus_core::nexus::diag::{self, Fault, FaultPlace, FaultShape, Line, Note, Source, SourceFile};
+    use nexus_core::nexus::diag::{self, Fault, FaultPlace, Line, Source, SourceFile};
 
     use super::Observation;
-
-    pub(super) fn message(text: &str) -> Line {
-        use FaultPlace::*;
-        use FaultShape::*;
-
-        if text.starts_with("Your downloads are now in ") {
-            return Line::Note(Note::DownloadsFolderChanged);
-        }
-
-        const FAULTS: &[(&str, FaultPlace, FaultShape)] = &[
-            ("Lost the connection to the server.", MusicServer, Connection),
-            ("Can't reach your server.", MusicServer, Unavailable),
-            ("Can't reach the server.", MusicServer, Unavailable),
-            ("Couldn't play ", Playback, Other),
-            ("No sound device found,", AudioOutput, NoSound),
-            ("That isn't downloaded,", Playback, Unavailable),
-            ("Couldn't write ", App, Write),
-            ("Your downloads have moved to ", Downloads, Write),
-            ("Not enough room there: the downloads come to ", Downloads, Write),
-        ];
-        FAULTS.iter().find_map(|&(prefix, place, shape)| {
-            text.starts_with(prefix).then_some(Line::Fault(Fault::new(place, shape)))
-        }).unwrap_or(Line::Note(Note::AppMessage))
-    }
 
     pub(super) fn fault(line: &str) -> Option<Observation> {
         if let Some((at, text)) = line.split_once('\t') {

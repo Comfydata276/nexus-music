@@ -60,7 +60,12 @@ fn preview_save_and_c6_upload_have_the_same_clean_text() -> std::io::Result<()> 
         (AT + 5, format!("Couldn't play “{album}” by {artist}")),
         (i64::MAX, format!("Couldn't play {text}")),
     ].into();
-    let session = Session::from_observations(&settings, true, &messages, Vec::new());
+    let observations = [
+        (AT, Line::Fault(Fault::new(FaultPlace::Playback, FaultShape::Decode))),
+        (AT + 2, Line::Note(Note::DownloadsFolderChanged)),
+        (AT + 5, Line::Fault(Fault::new(FaultPlace::Playback, FaultShape::Decode))),
+    ].into_iter().map(|(at, line)| (at as u64 * 1_000, line)).collect();
+    let session = Session::from_observations(&settings, true, &messages, observations);
     let dir = TestFolder::new()?;
     let crash = dir.0.join("crash.log");
     let saved = dir.0.join("data/diagnostics.txt");
@@ -79,15 +84,16 @@ fn preview_save_and_c6_upload_have_the_same_clean_text() -> std::io::Result<()> 
     let upload = diag::Upload::new(RequestHead { speaks: SPEAKS, restore: 0 }, RequestId::new(1).unwrap(), &model).unwrap();
     assert_eq!(upload.text(), preview);
     assert_eq!(model.about.loss, LossCounts::default());
+    assert!(!preview.contains("Fault in playback: other"));
     for raw in [song, album, artist, playlist, folder, "ExampleLocal", server, email, key, token, "岬", "🪁", "AAAAAAAA", "123487"] {
         assert!(!preview.contains(raw), "included {raw:?}");
     }
     assert!(preview.bytes().all(|b| b == b'\n' || matches!(b, 32..=126)));
     for expected in [
         "HTTPS: yes",
-        "2023-11-14 22:13:24  App message shown  (3 times since 2023-11-14 22:13:21)",
+        "2023-11-14 22:13:25  App message shown  (6 times since 2023-11-14 22:13:20)",
         "2023-11-14 22:13:22  Downloads folder changed",
-        "2023-11-14 22:13:25  Fault in playback: other  (2 times since 2023-11-14 22:13:20)",
+        "2023-11-14 22:13:25  Fault in playback: decode  (2 times since 2023-11-14 22:13:20)",
         "2023-11-14 22:13:25  Fault in audio output: out of bounds at exclusive.rs:71",
         "2023-11-14 22:13:26  Fault in app: borrow conflict at controller.rs:1",
         "2023-11-14 22:13:27  Fault in app: panic at other:222",
@@ -160,4 +166,13 @@ fn typed_window_observations_join_the_clean_record() {
     let session = Session::from_observations(&config::Settings::default(), true, &VecDeque::new(), observations);
     let report = session.report(Path::new(""));
     assert_eq!(report.record.entries().iter().map(|entry| entry.line).collect::<Vec<_>>(), expected);
+}
+
+#[test]
+fn connection_fault_uses_the_error_variant_and_ignores_its_words() {
+    use crate::subsonic::ApiError;
+    let message = "Paper Satellites C:\\Users\\ExampleLocal".to_string();
+    assert_eq!(connection_shape(&ApiError::Network(message.clone())), FaultShape::Connection);
+    assert_eq!(connection_shape(&ApiError::NotSubsonic(message.clone())), FaultShape::UnexpectedAnswer);
+    assert_eq!(connection_shape(&ApiError::Server { code: 40, message }), FaultShape::Refused);
 }

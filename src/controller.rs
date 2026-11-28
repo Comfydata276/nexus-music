@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 
+use crate::diagnostics::{self, FaultPlace, FaultShape};
 use crate::audio::engine::Engine;
 use crate::audio::dsp::{EQ_BANDS, EQ_RANGE};
 use crate::config::{self, EQ_PRESETS, Paths, QUALITIES, Settings, VOLUME_LEVELS};
@@ -1196,6 +1197,16 @@ impl Controller {
             let result = crate::update::check();
             post(move |ctl| {
                 let page = ctl.ui.global::<ui::Settings>();
+                if let Err(reason) = &result {
+                    use crate::update::CheckError;
+                    let shape = match reason {
+                        CheckError::Refused | CheckError::Status(_) => FaultShape::Refused,
+                        CheckError::TimedOut => FaultShape::Timeout,
+                        CheckError::Request => FaultShape::Connection,
+                        CheckError::InvalidRelease => FaultShape::UnexpectedAnswer,
+                    };
+                    diagnostics::fault(FaultPlace::Updates, shape);
+                }
                 match result {
                     Ok(Some(release)) => {
                         page.set_update_download_failed(false);
@@ -1262,6 +1273,7 @@ impl Controller {
             post(move |ctl| {
                 let page = ctl.ui.global::<ui::Settings>();
                 let Ok(path) = result else {
+                    diagnostics::fault(FaultPlace::Updates, FaultShape::Other);
                     ctl.update_busy.set(false);
                     page.set_update_busy(false);
                     page.set_update_download_failed(true);
@@ -1275,6 +1287,7 @@ impl Controller {
                     // The installer replaces the program and opens the new version.
                     Ok(()) => ctl.quit(),
                     Err(reason) => {
+                        diagnostics::fault(FaultPlace::Updates, FaultShape::Unavailable);
                         ctl.update_busy.set(false);
                         page.set_update_busy(false);
                         // Don't leave the user stuck: the same file is one click away in a browser.
@@ -1317,6 +1330,9 @@ impl Controller {
             post(move |ctl| {
                 let app = ctl.ui.global::<ui::App>();
                 app.set_login_busy(false);
+                if let Err(error) = &answer {
+                    diagnostics::music_connection_failed(error);
+                }
                 match answer {
                     Ok((client, info)) => {
                         {
@@ -2839,6 +2855,7 @@ impl Controller {
                             view.set_error(e.to_string().into());
                             // With the server out of reach, open on what can still be played.
                             if offline_home && !ctl.downloads.borrow().is_empty() {
+                                diagnostics::music_connection_failed(&e);
                                 ctl.navigate(Route::Downloads);
                                 ctl.toast("Can't reach your server. Here are your downloads.");
                             }

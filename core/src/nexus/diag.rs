@@ -14,7 +14,7 @@ use super::events::{LossCounts, TIME_MAX_MS};
 use super::proto::Version;
 use super::wire::{self, BadMessage, Fields, WireBody};
 
-pub use super::events::{FaultPlace, FaultShape, Wrong};
+pub use super::events::{FaultShape, Wrong};
 
 pub const MAX_ENTRIES: usize = 200;
 pub const MAX_LINE_CHARS: usize = 300;
@@ -572,17 +572,18 @@ pub enum Line {
 // The design does not say a timing observation's range. Cap it at one hour.
 pub const MAX_FOREGROUND_MS: u32 = 60 * 60 * 1000;
 
-const PLACES: &[(FaultPlace, &str)] = &[
-    (FaultPlace::Playback, "playback"),
-    (FaultPlace::AudioOutput, "audio output"),
-    (FaultPlace::Library, "library"),
-    (FaultPlace::Downloads, "downloads"),
-    (FaultPlace::Foreground, "foreground"),
-    (FaultPlace::MusicServer, "music server"),
-    (FaultPlace::NexusServer, "Nexus server"),
-    (FaultPlace::Journal, "journal"),
-    (FaultPlace::App, "app"),
-];
+words!(FaultPlace {
+    Playback => "playback",
+    AudioOutput => "audio output",
+    Library => "library",
+    Downloads => "downloads",
+    Foreground => "foreground",
+    MusicServer => "music server",
+    NexusServer => "Nexus server",
+    Journal => "journal",
+    Updates => "updates",
+    App => "app",
+});
 
 const SHAPES: &[(FaultShape, &str)] = &[
     (FaultShape::NameLookup, "name lookup"),
@@ -663,7 +664,7 @@ impl fmt::Display for Line {
         match self {
             Self::Note(note) => f.write_str(note.text()),
             Self::Fault(fault) => {
-                write!(f, "Fault in {}: {}", label(PLACES, fault.place), label(SHAPES, fault.shape))?;
+                write!(f, "Fault in {}: {}", fault.place.text(), label(SHAPES, fault.shape))?;
                 if let Some(source) = fault.source {
                     write!(f, " at {}:{}", source.file.text(), source.line)?;
                 }
@@ -695,7 +696,7 @@ impl Line {
                 None => (shape, None),
             };
             return Some(Self::Fault(Fault {
-                place: word(PLACES, place)?,
+                place: FaultPlace::read(place)?,
                 shape: word(SHAPES, shape)?,
                 source,
             }));

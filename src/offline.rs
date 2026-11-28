@@ -261,11 +261,17 @@ impl Controller {
                     ctl.set_unreachable(false);
                     ctl.came_online();
                 }
-                Err(error) if error.sign_in_refused() => ctl.leave("Your saved sign-in no longer works. Sign in again."),
+                Err(error) if error.sign_in_refused() => {
+                    crate::diagnostics::music_connection_failed(&error);
+                    ctl.leave("Your saved sign-in no longer works. Sign in again.");
+                }
                 // No answer, an error from the server, or a proxy answering in its place: none
                 // of those is a reason to sign out. Carry on with what's on this PC and keep
                 // trying.
-                Err(_) => ctl.set_unreachable(true),
+                Err(error) => {
+                    crate::diagnostics::music_connection_failed(&error);
+                    ctl.set_unreachable(true);
+                }
             },
         );
     }
@@ -280,8 +286,14 @@ impl Controller {
             |client| client.ping().map(|_| ()),
             |ctl, answer| match answer {
                 Ok(()) => {}
-                Err(error) if error.sign_in_refused() => ctl.leave("Your saved sign-in no longer works. Sign in again."),
-                Err(_) => ctl.set_unreachable(true),
+                Err(error) if error.sign_in_refused() => {
+                    crate::diagnostics::music_connection_failed(&error);
+                    ctl.leave("Your saved sign-in no longer works. Sign in again.");
+                }
+                Err(error) => {
+                    crate::diagnostics::music_connection_failed(&error);
+                    ctl.set_unreachable(true);
+                }
             },
         );
     }

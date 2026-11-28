@@ -305,7 +305,12 @@ fn names_paths_addresses_keys_tokens_and_odd_characters_never_survive() {
     for line in raw {
         record.note_text(AT, line);
     }
-    for &(place, _) in PLACES {
+    let places = [
+        FaultPlace::Playback, FaultPlace::AudioOutput, FaultPlace::Library, FaultPlace::Downloads,
+        FaultPlace::Foreground, FaultPlace::MusicServer, FaultPlace::NexusServer,
+        FaultPlace::Journal, FaultPlace::Updates, FaultPlace::App,
+    ];
+    for place in places {
         for &(shape, _) in SHAPES {
             let line = Line::Fault(Fault::new(place, shape));
             assert_eq!(clean_line(&line.to_string()), Some(line));
@@ -322,7 +327,7 @@ fn names_paths_addresses_keys_tokens_and_odd_characters_never_survive() {
     assert_eq!(uploaded.text(), shown);
     assert_eq!(
         report.record.entries().len(),
-        (1 + PLACES.len() * SHAPES.len()).min(MAX_ENTRIES)
+        (1 + places.len() * SHAPES.len()).min(MAX_ENTRIES)
     );
     for private in &raw[..raw.len() - 1] {
         assert!(!shown.contains(private));

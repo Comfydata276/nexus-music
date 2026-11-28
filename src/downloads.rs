@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use serde::{Deserialize, Serialize};
 use slint::ComponentHandle;
 
+use crate::diagnostics::{self, FaultPlace, FaultShape, Line, Note};
 use crate::controller::{Controller, Route, post};
 use crate::pages::{PageData, PlaySource};
 use crate::playback::NATIVE_SUFFIXES;
@@ -563,6 +564,18 @@ pub fn same_drive(from: &Path, to: &Path) -> bool {
 
 /// Fetches one song's audio into the downloads folder. Runs on a worker thread. `quality`
 /// is a bitrate cap in kbps, or 0 to keep the file as it is on the server.
+#[derive(Debug)]
+enum FetchFailure {
+    Cancelled,
+    Failed { shape: FaultShape, reason: String },
+}
+
+impl FetchFailure {
+    fn failed(shape: FaultShape, reason: impl ToString) -> Self {
+        Self::Failed { shape, reason: reason.to_string() }
+    }
+}
+
 fn fetch(
     client: &Client,
     dir: &Path,
@@ -571,7 +584,7 @@ fn fetch(
     attempt: u64,
     progress: &AtomicU32,
     cancel: &AtomicBool,
-) -> Result<Entry, String> {
+) -> Result<Entry, FetchFailure> {
     let suffix = song.suffix.to_lowercase();
     let playable = NATIVE_SUFFIXES.contains(&suffix.as_str());
     // The original is kept when lossless is asked for, or when it's already an MP3 within the
@@ -586,46 +599,46 @@ fn fetch(
     };
     let stem: String = song.id.chars().filter(|c| c.is_ascii_alphanumeric() || "-_".contains(*c)).collect();
     if stem.is_empty() {
-        return Err("unexpected song id".into());
+        return Err(FetchFailure::failed(FaultShape::UnexpectedAnswer, "unexpected song id"));
     }
     let file = format!("{stem}.{extension}");
     // Each go has a file of its own to arrive in, so two goes at one song can't trip over
     // each other.
     let temp = dir.join(format!("{file}.{attempt}.part"));
-    let (mut body, length) = client.open_stream(&url, None).map_err(|e| e.to_string())?;
+    let (mut body, length) = client.open_stream(&url, None).map_err(|e| FetchFailure::failed(diagnostics::connection_shape(&e), e))?;
     let expected = length.filter(|n| *n > 0).unwrap_or(expected).max(1);
-    let mut out = fs::File::create(&temp).map_err(|e| e.to_string())?;
+    let mut out = fs::File::create(&temp).map_err(|e| FetchFailure::failed(FaultShape::Write, e))?;
     let mut buf = vec![0u8; 128 * 1024];
     let mut bytes = 0u64;
     let copied = loop {
         if cancel.load(Ordering::Relaxed) {
-            break Err("cancelled".to_string());
+            break Err(FetchFailure::Cancelled);
         }
         match body.read(&mut buf) {
             Ok(0) => break Ok(()),
             Ok(n) => {
                 if let Err(e) = out.write_all(&buf[..n]) {
-                    break Err(e.to_string());
+                    break Err(FetchFailure::failed(FaultShape::Write, e));
                 }
                 bytes += n as u64;
                 // Held just short of full until the file is in place.
                 progress.store((bytes * 1000 / expected).min(990) as u32, Ordering::Relaxed);
             }
-            Err(e) => break Err(e.to_string()),
+            Err(e) => break Err(FetchFailure::failed(FaultShape::Read, e)),
         }
     };
     drop(out);
     let copied = copied.and_then(|()| match bytes {
-        0 => Err("The server sent nothing.".to_string()),
+        0 => Err(FetchFailure::failed(FaultShape::UnexpectedAnswer, "The server sent nothing.")),
         // Cancelled as the last of it arrived: it isn't wanted, whole or not.
-        _ if cancel.load(Ordering::Relaxed) => Err("cancelled".to_string()),
+        _ if cancel.load(Ordering::Relaxed) => Err(FetchFailure::Cancelled),
         _ => Ok(()),
     });
     if let Err(reason) = copied {
         let _ = fs::remove_file(&temp);
         return Err(reason);
     }
-    fs::rename(&temp, dir.join(&file)).map_err(|e| e.to_string())?;
+    fs::rename(&temp, dir.join(&file)).map_err(|e| FetchFailure::failed(FaultShape::Write, e))?;
     Ok(Entry { song: song.clone(), file, bytes, at: chrono::Utc::now().timestamp() })
 }
 
@@ -694,6 +707,7 @@ impl Controller {
             let needed: u64 = wanted.iter().map(|song| expected_bytes(song, quality)).sum();
             if let Some(free) = free_space(&downloads.dir).filter(|free| needed + SPARE > *free) {
                 drop(downloads);
+                diagnostics::fault(FaultPlace::Downloads, FaultShape::Write);
                 if !quiet {
                     self.toast(format!(
                         "Not enough room: that needs about {}, and the drive your downloads are on has {} free. (Half a gigabyte is always left spare.)",
@@ -747,7 +761,7 @@ impl Controller {
             let (client, dir, covers) = (client.clone(), dir.clone(), covers.clone());
             self.download_pool.spawn(move || {
                 let result = if cancel.load(Ordering::Relaxed) {
-                    Err("cancelled".to_string())
+                    Err(FetchFailure::Cancelled)
                 } else {
                     fetch(&client, &dir, &song, quality, attempt, &progress, &cancel)
                 };
@@ -762,7 +776,7 @@ impl Controller {
         self.sync_downloads();
     }
 
-    fn download_finished(self: &Rc<Self>, id: &str, attempt: u64, result: Result<Entry, String>) {
+    fn download_finished(self: &Rc<Self>, id: &str, attempt: u64, result: Result<Entry, FetchFailure>) {
         let finished = {
             let mut downloads = self.downloads.borrow_mut();
             // No longer listed means this go was cancelled while it was fetching. (The song
@@ -783,7 +797,14 @@ impl Controller {
                         let _ = fs::remove_file(downloads.dir.join(entry.file));
                     }
                 }
-                (Err(reason), Some(job)) => {
+                (Err(failure), Some(job)) => {
+                    let reason = match failure {
+                        FetchFailure::Cancelled => "cancelled".into(),
+                        FetchFailure::Failed { shape, reason } => {
+                            diagnostics::fault(FaultPlace::Downloads, shape);
+                            reason
+                        }
+                    };
                     downloads.batch_failed += 1;
                     downloads.failed.retain(|(failed, _)| failed.id != job.song.id);
                     downloads.failed.push((job.song, reason));
@@ -854,19 +875,25 @@ impl Controller {
             return self.toast("Wait for the downloads under way to finish, then choose the folder again.");
         }
         if fs::create_dir_all(&folder).is_err() || !folder.is_dir() {
+            diagnostics::fault(FaultPlace::Downloads, FaultShape::Write);
             return self.toast(format!("{} can't be used as a folder.", folder.display()));
         }
         // The list as it stands, on the disk, before anything is decided from it.
         if let Err(said) = self.downloads.borrow_mut().ready_to_move() {
+            diagnostics::fault(FaultPlace::Downloads, FaultShape::Write);
             return self.toast(said);
         }
         let account = self.downloads.borrow().account.clone();
         let plan = match plan_for(&from, &account) {
             Ok(plan) => plan,
-            Err(said) => return self.toast(said),
+            Err(said) => {
+                diagnostics::fault(FaultPlace::Downloads, FaultShape::Read);
+                return self.toast(said);
+            }
         };
         // Room for what moves, unless it's the same drive (when nothing is copied).
         if let Some(free) = free_space(&folder).filter(|free| !same_drive(&from, &folder) && plan.bytes + SPARE > *free) {
+            diagnostics::fault(FaultPlace::Downloads, FaultShape::Write);
             return self.toast(format!(
                 "Not enough room there: the downloads come to {}, and that drive has {} free. (Half a gigabyte is always left spare.)",
                 size_label(plan.bytes),
@@ -882,28 +909,35 @@ impl Controller {
                 let account = ctl.account();
                 match moved {
                     Moved::All(_) => {
+                        diagnostics::observe(Line::Note(Note::DownloadsFolderChanged));
                         ctl.settings.borrow_mut().downloads_dir =
                             if folder == ctl.paths.downloads { String::new() } else { folder.display().to_string() };
                         *ctl.downloads.borrow_mut() = Downloads::load(folder.clone(), &account);
                         if ctl.settings.borrow().save_surely(&ctl.paths.settings) {
                             ctl.toast(format!("Your downloads are now in {}", folder.display()));
                         } else {
+                            diagnostics::fault(FaultPlace::Downloads, FaultShape::Write);
                             ctl.toast(format!(
                                 "Your downloads have moved to {}, but the setting that says so couldn't be saved. If they aren't shown after the app next starts, choose that folder again under Settings, Storage.",
                                 folder.display()
                             ));
                         }
                     }
-                    Moved::Taken(taken) => ctl.toast(if taken == 1 {
-                        format!("A file with the same name as one of your downloads is already in {}, so nothing was moved. Choose an empty folder, or move it out of that one first.", folder.display())
-                    } else {
-                        format!("{taken} files with the same names as your downloads are already in {}, so nothing was moved. Choose an empty folder, or move those out of it first.", folder.display())
-                    }),
+                    Moved::Taken(taken) => {
+                        diagnostics::fault(FaultPlace::Downloads, FaultShape::Write);
+                        ctl.toast(if taken == 1 {
+                            format!("A file with the same name as one of your downloads is already in {}, so nothing was moved. Choose an empty folder, or move it out of that one first.", folder.display())
+                        } else {
+                            format!("{taken} files with the same names as your downloads are already in {}, so nothing was moved. Choose an empty folder, or move those out of it first.", folder.display())
+                        });
+                    }
                     Moved::Back { stuck, of } => {
+                        diagnostics::fault(FaultPlace::Downloads, FaultShape::Write);
                         *ctl.downloads.borrow_mut() = Downloads::load(from, &account);
                         ctl.toast(format!("{stuck} of {of} files couldn't be moved, so the downloads are staying where they were."));
                     }
                     Moved::Split { left } => {
+                        diagnostics::fault(FaultPlace::Downloads, FaultShape::Write);
                         *ctl.downloads.borrow_mut() = Downloads::load(from.clone(), &account);
                         ctl.toast(format!(
                             "Some files couldn't be moved, and {left} of those that had been couldn't be brought back: they are in {}. The rest are still in {}, where the app goes on keeping your downloads.",

@@ -11,6 +11,7 @@ use slint::{ComponentHandle, Model, ModelRc, VecModel};
 use nexus_core::levelling::in_album_order;
 use nexus_core::queue::{Lineup, compare_lists, follow_list};
 
+use crate::diagnostics::{self, FaultPlace, FaultShape, SoundOutput};
 use crate::audio::engine::{Event, TrackRequest};
 use crate::config::{Durable, SavedQueue, Settings, VOLUME_LEVELS};
 use crate::controller::{Controller, Route, with};
@@ -360,6 +361,7 @@ impl Controller {
         };
         if songs.is_empty() {
             if self.is_offline() {
+                diagnostics::fault(FaultPlace::Playback, FaultShape::Unavailable);
                 self.toast("That isn't downloaded, so it can't play while you're offline");
             }
             return;
@@ -1313,7 +1315,12 @@ impl Controller {
                 }
             }
             Event::Output { status, exclusive, kind } => {
-                crate::diagnostics::note_sound_output(kind);
+                diagnostics::note_sound_output(kind);
+                match kind {
+                    SoundOutput::ExclusiveRefused { .. } => diagnostics::fault(FaultPlace::AudioOutput, FaultShape::Refused),
+                    SoundOutput::NoDevice => diagnostics::fault(FaultPlace::AudioOutput, FaultShape::NoSound),
+                    _ => {}
+                }
                 self.ui.global::<ui::Settings>().set_output_status(status.into());
                 self.output_exclusive.set(exclusive);
                 self.show_format();
@@ -1328,13 +1335,14 @@ impl Controller {
                     self.toast("No sound device found, so playback is paused.");
                 }
             }
-            Event::Failed { token, message, unsupported, network } => {
+            Event::Failed { token, message, unsupported, network, shape } => {
                 let (retry, title, position) = {
                     let mut pb = self.playback.borrow_mut();
                     if token != pb.current_token {
                         return;
                     }
                     let Some(song) = pb.current().cloned() else { return };
+                    diagnostics::fault(FaultPlace::Playback, shape);
                     if network {
                         // The stream stopped arriving. That's the connection, not the song.
                         let attempt = pb.reconnects;
@@ -1422,7 +1430,8 @@ impl Controller {
                 }
                 match answer {
                     Ok(()) | Err(ApiError::Server { .. }) => ctl.pass_over(&title, &message),
-                    Err(_) => {
+                    Err(error) => {
+                        diagnostics::music_connection_failed(&error);
                         ctl.playback.borrow_mut().waiting_for_server = true;
                         ctl.set_unreachable(true);
                         ctl.toast("Lost the connection to the server. The music will carry on when it's back.");
