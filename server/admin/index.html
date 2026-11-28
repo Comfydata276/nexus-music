@@ -224,9 +224,10 @@ dd, li { overflow-wrap: anywhere; }
         <details id="lidarr-details" hidden>
           <summary>Set up Lidarr</summary>
           <form id="lidarr-form" method="post" autocomplete="off">
-            <p id="lidarr-address"></p>
+            <dl><dt>Lidarr address</dt><dd id="lidarr-address"></dd></dl>
+            <p id="lidarr-key-status"></p>
             <label>Lidarr key <input id="lidarr-key" type="password" autocomplete="new-password" maxlength="512" required></label>
-            <button type="submit">Review Lidarr settings</button>
+            <button type="submit">Review Lidarr key</button>
           </form>
         </details>
       </article>
@@ -1298,12 +1299,11 @@ dd, li { overflow-wrap: anywhere; }
       lidarrAddress = result.address;
       lidarrDetails.hidden = !lidarrAddress;
       requestsAvailability.hidden = Boolean(lidarrAddress);
-      if (lidarrAddress) {
-        const keyStatus = result.configured ? " A key is saved." : " Enter a key to set up requests.";
-        writeText(byId("lidarr-address"), "Address Nexus uses: " + lidarrAddress + "." + keyStatus);
-      } else {
+      writeText(byId("lidarr-address"), lidarrAddress ?? "");
+      writeText(byId("lidarr-key-status"), !lidarrAddress ? "" :
+        result.configured ? "A key is saved." : "Enter a key to set up requests.");
+      if (!lidarrAddress) {
         lidarrForm.reset();
-        writeText(byId("lidarr-address"), "");
         writeText(requestsAvailability, "Requests are not set up on this server. The server owner sets the Lidarr address in the container.");
       }
     } catch {
@@ -1313,6 +1313,7 @@ dd, li { overflow-wrap: anywhere; }
       lidarrForm.reset();
       requestsAvailability.hidden = false;
       writeText(byId("lidarr-address"), "");
+      writeText(byId("lidarr-key-status"), "");
       writeText(requestsAvailability, "Could not load Lidarr settings. Sign out and back in to try again.");
     }
   }
@@ -1375,6 +1376,7 @@ dd, li { overflow-wrap: anywhere; }
     diagnosticsEnabled = null;
     lidarrAddress = null;
     writeText(byId("lidarr-address"), "");
+    writeText(byId("lidarr-key-status"), "");
     addressForm.hidden = true;
     diagnosticsToggle.hidden = true;
     requests.replaceChildren();

@@ -424,7 +424,8 @@ test("all changes show a confirmation and spend one grant on the exact wire targ
   await confirm();
   assert.equal(page.from("music-public").textContent, address);
 
-  assert.match(page.from("lidarr-address").textContent, /requests-inside.*Enter a key/);
+  assert.equal(page.from("lidarr-address").textContent, lidarrAddress);
+  assert.match(page.from("lidarr-key-status").textContent, /Enter a key/);
   for (const invalidKey of ["with spaces", "é", "a".repeat(513)]) {
     page.submit("lidarr-form", { "lidarr-key": invalidKey });
     assert.equal(page.from("lidarr-key").value, "");
@@ -435,7 +436,7 @@ test("all changes show a confirmation and spend one grant on the exact wire targ
 
   assert.equal(page.from("grant-summary").textContent.includes(lidarrKey), false);
   await confirm();
-  assert.match(page.from("lidarr-address").textContent, /A key is saved/);
+  assert.match(page.from("lidarr-key-status").textContent, /A key is saved/);
   assert.equal(page.from("lidarr-address").textContent.includes(lidarrKey), false);
   page.click("diagnostics-toggle");
   await confirm();
