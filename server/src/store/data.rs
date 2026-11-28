@@ -48,7 +48,7 @@ pub const INCOMING: &str = "nexus.db.incoming";
 /// "NXMS": the mark that the file is the Nexus server's data.
 pub const APPLICATION_ID: i64 = 0x4e58_4d53;
 /// The form this program writes and reads.
-pub const FORM: i64 = 2;
+pub const FORM: i64 = MIGRATIONS[MIGRATIONS.len() - 1].form;
 /// How long a step waits for another connection's lock.
 pub const BUSY: Duration = Duration::from_secs(5);
 
