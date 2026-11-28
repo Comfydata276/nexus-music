@@ -900,6 +900,56 @@ mod tests {
         assert_eq!(rows.iter().map(|row| row.record().id()).collect::<Vec<_>>(), [ids[0], ids[2]]);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn sigkill_keeps_flushed_events_and_discards_a_torn_append() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::{Command, Stdio};
+
+        const CHILD_HOME: &str = "NEXUS_W8_CRASH_TEST_CHILD_HOME";
+        const READY: &str = "journal crash fixture ready";
+        let scope = scope(7, 1, 1);
+        let start_id = EventId::from_bytes([1; 16]);
+        if let Some(root) = std::env::var_os(CHILD_HOME) {
+            let root = PathBuf::from(root);
+            let mut writer = Writer::open(root.clone()).unwrap();
+            writer.handle(Message::Event(scope, start(1))).unwrap();
+            writer.handle(Message::Checkpoint(scope, start_id, 1_250)).unwrap();
+            let directory = JournalDirectory::new(&root, scope.account);
+            let mut file = OpenOptions::new().append(true).open(directory.journal(1)).unwrap();
+            file.write_all(b"{\"id\":").unwrap();
+            eprintln!("{READY}");
+            // Keep the file open at the point where a real append could have been cut.
+            let _ = std::io::stdin().read(&mut [0u8; 1]);
+            return;
+        }
+
+        let folder = Folder::new();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "journal::writer::tests::sigkill_keeps_flushed_events_and_discards_a_torn_append", "--nocapture"])
+            .env(CHILD_HOME, &folder.0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn().unwrap();
+        let ready = BufReader::new(child.stderr.take().unwrap()).lines()
+            .map_while(Result::ok).any(|line| line == READY);
+        let killed = child.kill();
+        let status = child.wait().unwrap();
+        assert!(ready);
+        killed.unwrap();
+        assert_eq!(status.signal(), Some(9));
+
+        let mut writer = Writer::open(folder.0.clone()).unwrap();
+        writer.activate(scope).unwrap();
+        let events = read(&folder.0, scope, 0, 5, usize::MAX);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].record().id(), start_id);
+        assert!(matches!(events[1].record().kind(), Kind::Stop { start, position_ms: Some(1_250), why: Stopped::Unknown, .. } if *start == start_id));
+        assert_eq!(writer.state.damaged, 1);
+    }
+
     #[test]
     fn oversized_display_fields_still_keep_the_start() {
         let folder = Folder::new();
