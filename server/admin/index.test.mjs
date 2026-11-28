@@ -430,6 +430,12 @@ test("refusals give a next step, cancel does not spend, and expired password ask
   assert.match(page.from("change-status").textContent, /^That password is not right\./);
   assert.equal(mock.calls.filter(call => call.phase === "change").length, 0);
 
+  mock.refuseNext("grant_required");
+  page.click("diagnostics-toggle");
+  await page.submit("grant-form", { "grant-password": adminPassword });
+  assert.match(page.from("change-status").textContent, /^Your confirmation has expired\./);
+  assert.equal(mock.calls.filter(call => call.phase === "change").length, 0);
+
   page.click("diagnostics-toggle");
   await page.submit("grant-form", { "grant-password": adminPassword });
   await settle();
@@ -448,7 +454,13 @@ test("refusals give a next step, cancel does not spend, and expired password ask
   page.submit("music-login-form", { "music-user": "Pat", "music-password": "wrong music password" });
   await page.submit("grant-form");
   assert.match(page.from("change-status").textContent, /did not accept that sign-in/);
+  mock.code(code);
+  page.submit("create-form", { "create-name": "Example", "create-email": "one@example.test" });
+  await page.submit("grant-form");
+  assert.equal(page.from("code-value").textContent, code);
   page.windowEvents.get("pagehide")();
+  assert.equal(page.from("code-value").textContent, "");
+  assert.equal(page.from("new-code").open, false);
   assert.equal(page.from("music-password").value, "");
   assert.equal(page.from("grant-password").value, "");
   assert.equal(page.from("change-status").textContent, "");
