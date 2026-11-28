@@ -287,6 +287,14 @@ fn reads(keeper: &mut Keeper, account: u64, device: u64, session: u8, now: u64) 
     matches!(loaded.request(restore, clock, |turn| turn.arrive(bearer(device, &held), Access::Read).map(|_| ())).apply(|_| Ok::<_, ()>(())), Ok(Ok(())))
 }
 
+/// Whether a grant is still kept on `device`'s session: in the data, and in the store kept
+/// apart (the re-review's 11: a spent grant is removed from both).
+fn grant_kept(keeper: &Keeper, root: &Root, account: u64, device: u64) -> (bool, bool) {
+    let in_data: i64 = keeper.data().connection().query_row("SELECT count(*) FROM sessions WHERE device = ?1 AND leave_for IS NOT NULL", [device as i64], |row| row.get(0)).unwrap();
+    let in_store = store_of(root).accounts[&account].apart.devices.get(&dev(device)).and_then(|record| record.permit.as_ref()).is_some_and(|permit| permit.leave.is_some());
+    (in_data > 0, in_store)
+}
+
 /// When the data says a device was last heard from.
 fn last_heard(keeper: &Keeper, device: u64) -> Option<u64> {
     keeper.data().connection().query_row("SELECT last_heard FROM devices WHERE id = ?1", [device as i64], |row| row.get::<_, Option<i64>>(0)).unwrap().map(|at| at as u64)
@@ -608,6 +616,7 @@ fn a_change_under_leave_cut_at_any_point_holds_once_the_store_has_it() {
             let (held, chosen) = (fp(1), password(15));
             let again = decide(&mut keeper, ALICE, T0 + 6 * MINUTE, &[Change::Password { account: ALICE, password: Some(&chosen) }], |turn| turn.change_password(bearer(ids.a1, &held)));
             assert!(!matches!(again, Ok(Ok(()))), "at {}: a spent grant changed the password again", cut.at);
+            assert_eq!(grant_kept(&keeper, root, ALICE, ids.a1), (false, false), "at {}: the spent grant is still kept", cut.at);
         } else {
             assert_eq!((alice.password_changes, read.contains(&3)), (1, true), "at {}", cut.at);
         }
@@ -646,6 +655,7 @@ fn what_the_admin_takes_away_cut_at_any_point_holds_once_the_store_has_it() {
             if done {
                 // The grant was spent: the same action again, while it would still be live,
                 // is refused (finding 11).
+                assert_eq!(grant_kept(&keeper, root, ROOT, ids.root), (false, false), "{scenario} at {}: the spent grant is still kept", cut.at);
                 let again = administer(&mut keeper, &ids, action.clone(), BOB, &[], T0 + 6 * MINUTE);
                 assert!(again.is_err(), "{scenario} at {}: a spent grant was used again", cut.at);
                 match scenario {
@@ -1250,12 +1260,12 @@ fn a_full_data_disk_fails_writes_and_leaves_nothing_half_done() {
 fn opening_and_reading_writes_neither_store() {
     let root = Root::new("reading");
     let ids = world(&root);
-    let mut keeper = opened(&root, T0 + 5 * MINUTE);
-    let _ = readers(&mut keeper, &ids, T0 + 5 * MINUTE);
-    keeper.close();
+    // The baseline first; then a start, every session read, and a stop, inside it.
     let store = fs::read(apart::place(&root.state())).unwrap();
     let data_bytes = fs::read(data::place(&root.data())).unwrap();
-    opened(&root, T0 + 5 * MINUTE).close();
+    let mut keeper = opened(&root, T0 + 5 * MINUTE);
+    assert_eq!(readers(&mut keeper, &ids, T0 + 5 * MINUTE), [30, 1, 3, 5]);
+    keeper.close();
     assert_eq!(fs::read(apart::place(&root.state())).unwrap(), store);
     assert_eq!(fs::read(data::place(&root.data())).unwrap(), data_bytes);
 }
