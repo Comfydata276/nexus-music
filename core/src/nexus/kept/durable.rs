@@ -321,7 +321,11 @@ impl Account {
             first.status = old.status;
         }
         first.admin &= old.admin;
-        first.music_recovery = first.music_recovery.or(old.music_recovery);
+        // A newly installed seal with a matching count clears recovery. If the
+        // data write did not land, load will set it again from the mismatch.
+        if !matches!(change, DataChange::InstallMusicLogin(_)) {
+            first.music_recovery = first.music_recovery.or(old.music_recovery);
+        }
         first.history_held |= old.history_held;
         // The new verifier is usable once the data transaction has committed.
         // Before it, load detects the mismatched password_changes and locks it.

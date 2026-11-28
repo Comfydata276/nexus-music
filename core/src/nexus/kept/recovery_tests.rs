@@ -716,16 +716,30 @@ fn adoption_requires_reset_and_a_newer_stamp_cannot_change_the_account_life() ->
 #[test]
 fn provisioning_requires_the_grant_both_exact_logins_and_current_authority() -> Result<(), Denied> {
     use crate::nexus::{
-        account::{MusicAddress, MusicSalt, Name, SALT_BYTES},
+        account::{MusicAddress, MusicLoginResult, MusicSalt, Name, SALT_BYTES},
         music::{
-            Checked, CurrentEndpoints, Outcome, Ping, Provisioning, SealingKey, VerifiedLogin,
+            Checked, CredentialBinding, CurrentEndpoints, MusicInstallation, Outcome, Ping,
+            Provisioning, SaltedToken, SealingKey, VerifiedLogin, hand_out,
         },
     };
     const PRIVATE: &str = "http://navidrome.example.test:4533";
     let public = MusicAddress::new("https://music.example.test").unwrap();
     let key = SealingKey::new([8; 32]);
     let mut admin = Stored::admin()?;
-    let mut alice = Stored::new(state("alice@example.test"));
+    let mut alice_state = state("alice@example.test");
+    alice_state.music_recovery = Some(MusicRecovery::EnterAgain);
+    let mut alice = Stored::new(alice_state);
+    let old_binding = CredentialBinding {
+        backend: alice.apart.account.backend,
+        account: alice.apart.account.id,
+        address: public.clone(),
+        name: Name::new("Alice").unwrap(),
+        count: 1,
+    };
+    let old_login = MusicInstallation {
+        sealed: key.seal(&old_binding, b"Old password", [19; 24]).unwrap(),
+        binding: old_binding,
+    };
     let mut bob = Stored::new(state("bob@example.test"));
     let actor = hash(7);
     let target = AdminTarget::Account(alice.apart.account.id);
@@ -763,7 +777,7 @@ fn provisioning_requires_the_grant_both_exact_logins_and_current_authority() -> 
             internal: PRIVATE,
             public: public.clone(),
             name: Name::new("Alice").unwrap(),
-            password: b"Example password",
+            password: Zeroizing::new(b"Example password".to_vec()),
             salt: MusicSalt::from_random([n; SALT_BYTES]),
             nonce: [n; 24],
         };
@@ -792,7 +806,7 @@ fn provisioning_requires_the_grant_both_exact_logins_and_current_authority() -> 
     let exact = br#"{"subsonic-response":{"status":"ok","user":{"username":"Alice"}}}"#;
     assert_eq!(
         checked(&mut admin, &alice, 3, other).err(),
-        Some(Outcome::CouldNotAsk)
+        Some(Outcome::NameDiffers)
     );
     assert_eq!(alice.apart.account.music_login, 1);
 
@@ -850,9 +864,32 @@ fn provisioning_requires_the_grant_both_exact_logins_and_current_authority() -> 
                 panic!("no sealed login effect")
             };
             assert_eq!(login.binding.count, update.data.account.music_login);
+            let needs_recovery = Account::load(&update.apart_first, Some(&alice.data));
+            let salt = || MusicSalt::from_random([20; SALT_BYTES]);
             assert_eq!(
-                &*key.open(&login.binding, &login.sealed).unwrap(),
-                b"Example password"
+                hand_out(
+                    needs_recovery.state(),
+                    Some(&old_login),
+                    &key,
+                    &public,
+                    salt()
+                ),
+                MusicLoginResult::UnusableNow
+            );
+            let recovered = Account::load(&update.apart_first, Some(&update.data));
+            let MusicLoginResult::Login(handed) =
+                hand_out(recovered.state(), Some(login), &key, &public, salt())
+            else {
+                panic!("committed replacement should work before the last apart write");
+            };
+            assert_eq!(
+                handed.token,
+                *SaltedToken::from_password(b"Example password", salt()).token()
+            );
+            let restored = Account::load(&update.apart_last, Some(&alice.data));
+            assert_eq!(
+                hand_out(restored.state(), Some(&old_login), &key, &public, salt()),
+                MusicLoginResult::UnusableNow
             );
             assert_eq!(update.data.account.music_login, 2);
             Ok::<_, Denied>(())

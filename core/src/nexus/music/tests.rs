@@ -134,8 +134,8 @@ fn all_measured_e3_replies_are_classified_in_their_request_context() {
         Err(Outcome::CouldNotAsk)
     );
     for name in ["alice", "ALICE", "Alice ", "Bob Smith", "bob  smith"] {
-        assert_eq!(outcome(OK, ALICE, name), Err(Outcome::CouldNotAsk));
-        assert_eq!(outcome(OK, BOB, name), Err(Outcome::CouldNotAsk));
+        assert_eq!(outcome(OK, ALICE, name), Err(Outcome::NameDiffers));
+        assert_eq!(outcome(OK, BOB, name), Err(Outcome::NameDiffers));
     }
 }
 
@@ -246,5 +246,69 @@ fn a_sealed_password_opens_only_under_every_part_of_its_current_binding() {
     assert_eq!(
         format!("{key:?} {sealed:?}"),
         "SealingKey(..) SealedCredential(..)"
+    );
+}
+
+#[test]
+fn hand_out_uses_only_the_current_account_and_seal_and_takes_a_fresh_salt() {
+    let backend = BackendId::from_bytes([5; 16]);
+    let account = AccountId::new(1).unwrap();
+    let address = MusicAddress::new("https://music.example.test").unwrap();
+    let binding = CredentialBinding {
+        backend,
+        account,
+        address: address.clone(),
+        name: Name::new("Alice").unwrap(),
+        count: 1,
+    };
+    let key = SealingKey::new([6; 32]);
+    let login = MusicInstallation {
+        sealed: key.seal(&binding, b"Example password", [7; 24]).unwrap(),
+        binding,
+    };
+    let mut state = AccountState::new(
+        backend,
+        1,
+        account,
+        crate::nexus::account::Email::new("alice@example.test").unwrap(),
+        None,
+    );
+    let salt = |n| MusicSalt::from_random([n; SALT_BYTES]);
+    assert_eq!(
+        hand_out(&state, None, &key, &address, salt(1)),
+        MusicLoginResult::NoneSetYet
+    );
+    state.music_login = 1;
+    for n in [2, 3] {
+        let MusicLoginResult::Login(handed) =
+            hand_out(&state, Some(&login), &key, &address, salt(n))
+        else {
+            panic!("current credential was not handed out");
+        };
+        assert_eq!(handed.salt, salt(n));
+        assert_eq!(
+            &handed.token,
+            SaltedToken::from_password(b"Example password", salt(n)).token()
+        );
+    }
+    let other = MusicAddress::new("https://different.example.test").unwrap();
+    assert_eq!(
+        hand_out(&state, Some(&login), &key, &other, salt(4)),
+        MusicLoginResult::UnusableNow
+    );
+    assert_eq!(
+        hand_out(
+            &state,
+            Some(&login),
+            &SealingKey::new([8; 32]),
+            &address,
+            salt(5)
+        ),
+        MusicLoginResult::UnusableNow
+    );
+    state.music_login += 1;
+    assert_eq!(
+        hand_out(&state, Some(&login), &key, &address, salt(6)),
+        MusicLoginResult::UnusableNow
     );
 }
