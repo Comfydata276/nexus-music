@@ -38,7 +38,7 @@ impl Bench {
     /// A backend set up, with `accounts` made (email, admin), each with a live code.
     pub fn new(name: &str, accounts: &[(&'static str, bool)]) -> (Bench, Vec<Made>) {
         let client = crate::music::MusicClient::trusting(tokio_rustls::rustls::RootCertStore::empty());
-        Bench::with_music(name, accounts, super::music::MusicSide { client, internal: "http://127.0.0.1:9".into() })
+        Bench::with_music(name, accounts, super::music::MusicSide::new(client, "http://127.0.0.1:9".into()))
     }
 
     /// The same, reaching the music server with `music`.

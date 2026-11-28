@@ -117,9 +117,11 @@ impl MusicClient {
 /// One request on its own connection, and its answer.
 async fn exchange(io: impl AsyncRead + AsyncWrite + Unpin + Send + 'static, authority: &str, target: &str, form: Bytes) -> Answered {
     let (mut sender, connection) = hyper::client::conn::http1::Builder::new().max_buf_size(ANSWER_HEAD_MAX_BYTES).handshake(TokioIo::new(io)).await.ok()?;
-    let driving = tokio::spawn(async move {
+    // The connection's driver ends with this exchange however it ends: answered, failed, or
+    // dropped part-way by a deadline (the review of S9, S9-3), so no socket outlives it.
+    let driving = Driving(tokio::spawn(async move {
         let _ = connection.await;
-    });
+    }));
     let request = Request::builder()
         .method(Method::POST)
         .uri(target)
@@ -137,9 +139,17 @@ async fn exchange(io: impl AsyncRead + AsyncWrite + Unpin + Send + 'static, auth
     }
     .await;
     drop(sender);
-    driving.abort();
-    let _ = driving.await;
+    drop(driving);
     answered
+}
+
+/// A connection's driver, stopped when this is dropped.
+struct Driving(tokio::task::JoinHandle<()>);
+
+impl Drop for Driving {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 #[cfg(test)]

@@ -193,7 +193,7 @@ fn run(settings: Settings) -> ExitCode {
     if roots == 0 && settings.music_server.starts_with("https:") {
         println!("No trusted certificates were found on this machine: NEXUS_MUSIC_SERVER is HTTPS, so the music server cannot be asked and no music login can be set.");
     }
-    let music = MusicSide { client, internal: settings.music_server.clone() };
+    let music = MusicSide::new(client, settings.music_server.clone());
     let accounts = Arc::new(Accounts { desk, workers, set_up_code, clock: Arc::new(now), backend: id, seen, music });
     nightly(settings.data.clone());
     let runtime = match tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build() {

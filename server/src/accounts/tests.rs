@@ -250,3 +250,77 @@ fn an_account_not_an_admin_s_learns_nothing_of_accounts_or_settings_from_an_admi
     assert_eq!(refused(&there), admin::Refusal::NotAllowed(Denial::Denied), "the address people use was looked at first");
     assert_eq!((there.status, there.body.bytes()), (not_there.status, not_there.body.bytes()));
 }
+
+/// S9-3 (the review of S9): with a music server that takes every connection and never answers,
+/// at most `CHECKS_AT_ONCE` logins are being checked at once: one more is told "busy" at once,
+/// a sign-in goes through meanwhile, and each check ends, "not dealt with", within its time.
+#[test]
+fn a_music_server_that_never_answers_holds_two_checks_at_most_and_sign_in_goes_on() {
+    use nexus_core::nexus::admin::{self, Action, Applied, MusicPassword, MusicServerAddress, NamedChange, TypedMusicLogin};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+    let held = std::sync::Arc::new(AtomicUsize::new(0));
+    let holding = held.clone();
+    let hold = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let internal = format!("http://{}", hold.local_addr().unwrap());
+    std::thread::spawn(move || {
+        let mut kept = Vec::new();
+        for stream in hold.incoming().flatten() {
+            holding.fetch_add(1, Ordering::SeqCst);
+            kept.push(stream);
+        }
+    });
+    let client = crate::music::MusicClient::trusting(tokio_rustls::rustls::RootCertStore::empty());
+    let music = super::music::MusicSide::new(client, internal).within(Duration::from_millis(1_500));
+    let (bench, made) = Bench::with_music("checks-at-once", &[("admin@example.test", true), ("person@example.test", false)], music);
+    bench::signed_in(&bench.sign_in(bench::with_code(&made[0].code, PASSWORD), 1));
+    let admins: Vec<_> = (1..=3).map(|device| bench::signed_in(&bench.sign_in(bench::with_password(made[0].email, PASSWORD), device))).collect();
+    let copy = |n: usize| account::Session::from_bytes(*admins[n].session.expose_bytes());
+    let restore = admins[0].restore;
+    let grant = |n: usize, request: u64, action: Action| {
+        let change = NamedChange { request_id: RequestId::new(request).unwrap(), action };
+        let request = account::GrantRequest { head: bench::head(restore), change, password: account::Password::presented(PASSWORD).unwrap() };
+        let answer = bench.runtime.block_on(bench.accounts.admin_grant(copy(n), request));
+        match admin::read_reply::<account::GrantIssued>(answer.status, answer.body.bytes()).unwrap() {
+            admin::Reply::Done(account::GrantIssued { grant }) => grant,
+            other => panic!("no grant: {other:?}"),
+        }
+    };
+    let public = account::MusicAddress::new("https://music.example.test").unwrap();
+    let secret = grant(0, 1, Action::SetMusicServer(public.clone()));
+    let set = account::GrantedChange { head: bench::head(restore), request_id: RequestId::new(1).unwrap(), change: MusicServerAddress { public }, grant: secret };
+    assert_eq!(bench.runtime.block_on(bench.accounts.set_music_server(copy(0), set)).status, 200);
+    let person = account::AccountId::new(made[1].number).unwrap();
+    let login = |n: usize| {
+        let request = 10 + n as u64;
+        let secret = grant(n, request, Action::SetMusicLogin(person));
+        let change = TypedMusicLogin { account: person, name: account::Name::new("tester").unwrap(), password: MusicPassword::new("a made-up music password").unwrap() };
+        (copy(n), account::GrantedChange { head: bench::head(restore), request_id: RequestId::new(request).unwrap(), change, grant: secret })
+    };
+    let (third, third_request) = login(2);
+    let started = Instant::now();
+    let checking: Vec<_> = (0..2)
+        .map(|n| {
+            let (session, request) = login(n);
+            let accounts = bench.accounts.clone();
+            bench.runtime.spawn(async move { accounts.set_music_login(session, request).await.status })
+        })
+        .collect();
+    let waited = Instant::now();
+    while held.load(Ordering::SeqCst) < 2 {
+        assert!(waited.elapsed() < Duration::from_secs(5), "the two checks never reached the music server");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // One more: "busy" at once, without asking the music server.
+    let at = Instant::now();
+    let busy = bench.runtime.block_on(bench.accounts.set_music_login(third, third_request));
+    assert_eq!(busy.status, 429, "{:?}", admin::read_reply::<Applied>(busy.status, busy.body.bytes()));
+    assert!(at.elapsed() < Duration::from_millis(200), "{:?}", at.elapsed());
+    assert_eq!(held.load(Ordering::SeqCst), 2);
+    // A sign-in meanwhile.
+    bench::signed_in(&bench.sign_in(bench::with_code(&made[1].code, PASSWORD), 9));
+    for check in checking {
+        assert_eq!(bench.runtime.block_on(check).unwrap(), 503);
+    }
+    assert!(started.elapsed() < Duration::from_secs(6), "{:?}", started.elapsed());
+}

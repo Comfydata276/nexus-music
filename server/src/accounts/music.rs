@@ -38,11 +38,35 @@ use crate::music::MusicClient;
 use crate::store::data::Change;
 use crate::store::keeper::Keeper;
 
+/// How many logins may be being checked at the music server at once. Each holds a listener
+/// slot while it waits; this keeps them well below the listener's (S9-3): more are told "busy"
+/// at once, before their grant is spent.
+pub const CHECKS_AT_ONCE: usize = 2;
+
+/// The longest a login's check may take, both questions together: within the listener's own
+/// deadline for an answer ([`crate::bounds::ANSWER_DEADLINE`]), so that the admin is told "not
+/// dealt with" and the slot is let go before it (S9-3).
+pub const CHECK_WITHIN: std::time::Duration = std::time::Duration::from_secs(8);
+
 /// What the backend reaches the music server with: its client, and the address the container
 /// was given (`NEXUS_MUSIC_SERVER`, never set from the page).
 pub struct MusicSide {
     pub client: MusicClient,
     pub internal: String,
+    checks: std::sync::Arc<tokio::sync::Semaphore>,
+    within: std::time::Duration,
+}
+
+impl MusicSide {
+    pub fn new(client: MusicClient, internal: String) -> MusicSide {
+        MusicSide { client, internal, checks: std::sync::Arc::new(tokio::sync::Semaphore::new(CHECKS_AT_ONCE)), within: CHECK_WITHIN }
+    }
+
+    /// The same, with its own time for a check (the tests').
+    pub fn within(mut self, within: std::time::Duration) -> MusicSide {
+        self.within = within;
+        self
+    }
 }
 
 /// An admin call's answer, of `nexus::admin`'s shapes. A reply that cannot be encoded is "not
@@ -241,6 +265,8 @@ impl Accounts {
 
     async fn setting_music_login(&self, bearer: account::Session, request: SetMusicLogin) -> Result<Answer, Refusal> {
         let account::GrantedChange { head, request_id, change, grant } = request;
+        // S9-3: at most CHECKS_AT_ONCE under way; one more is "busy" at once, its grant unspent.
+        let _checking = self.music.checks.clone().try_acquire_owned().map_err(|_| busy())?;
         let hash = Fingerprint::of(bearer.expose_bytes());
         let again = RequestHead { speaks: head.speaks, restore: head.restore };
         let clock = self.clock.clone();
@@ -285,15 +311,22 @@ impl Accounts {
         drop(change.password);
         let sealing = SealingKey::new(*key);
         let ping = Ping::provision(authorized, typed, &sealing).map_err(asked)?;
-        let pinged = {
-            let post = ping.post();
-            self.music.client.ask(&post).await
-        };
-        let user = ping.answer(reply(&pinged)).map_err(asked)?;
-        let named = {
-            let post = user.post();
-            self.music.client.ask(&post).await
-        };
+        // Both questions within CHECK_WITHIN (S9-3); past it, "could not reach it".
+        let client = &self.music.client;
+        let (pinged, user, named) = tokio::time::timeout(self.music.within, async move {
+            let pinged = {
+                let post = ping.post();
+                client.ask(&post).await
+            };
+            let user = ping.answer(reply(&pinged)).map_err(asked)?;
+            let named = {
+                let post = user.post();
+                client.ask(&post).await
+            };
+            Ok::<_, Refusal>((pinged, user, named))
+        })
+        .await
+        .map_err(|_| asked(Outcome::CouldNotAsk))??;
         let verified = match user.answer(reply(&named)).map_err(asked)? {
             Checked::Verified(verified) => verified,
             // CARRIED until core's change on `t3/nexus-core-fu2` (the check at the address people

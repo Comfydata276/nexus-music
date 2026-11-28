@@ -118,10 +118,7 @@ impl Fixture {
                 desk: Desk::open(keeper, clock.clone()).unwrap(),
                 clock,
                 backend,
-                music: MusicSide {
-                    client: MusicClient::from_this_machine().0,
-                    internal: "http://navidrome:4533".into(),
-                },
+                music: MusicSide::new(MusicClient::from_this_machine().0, "http://navidrome:4533".into()),
             });
             tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap().block_on(async {
                 let listener = serve::listen(addr).unwrap();
