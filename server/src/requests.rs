@@ -33,7 +33,7 @@ use nexus_core::nexus::account::{
 };
 use nexus_core::nexus::admin;
 use nexus_core::nexus::kept::{
-    Access, Account, Bearer, Denied, Fingerprint, GrantUse, SessionKind,
+    Access, Account, Bearer, Denied, Fingerprint, GrantUse, SessionKind, Status,
 };
 use nexus_core::nexus::requests::{
     self as wire, AlbumView, Answer, ArtistView, AskedRelease, AttributionPage, AttributionRow,
@@ -822,6 +822,7 @@ impl Plan {
     }
 }
 
+const PARKED: i64 = -1;
 const QUEUED: i64 = 0;
 const STARTED: i64 = 1;
 const MAY_HAVE_CHANGED: i64 = 2;
@@ -899,6 +900,7 @@ fn enqueue(
     request: wire::RequestId,
     change: &[u8],
     plan: &Plan,
+    batch: bool,
     rooms: &Mutex<Rooms>,
 ) -> Result<JobId, Refusal> {
     let plan = encode(plan)?;
@@ -906,8 +908,9 @@ fn enqueue(
     let account = sql(actor.account.get())?;
     let session = sql(actor.session.get())?;
     let occupied: bool = keeper.data().connection().query_row(
-        "SELECT EXISTS(SELECT 1 FROM requests_jobs WHERE restore = ?1 AND account = ?2 AND stage < ?3)",
-        params![restore, account, FINISHED], |row| row.get(0),
+        "SELECT EXISTS(SELECT 1 FROM requests_jobs WHERE restore = ?1 AND account = ?2 AND stage < ?3
+                       AND (stage <> ?4 OR ?5))",
+        params![restore, account, FINISHED, PARKED, batch], |row| row.get(0),
     ).map_err(sql_error)?;
     if occupied {
         return Err(Refusal::Busy);
@@ -959,6 +962,8 @@ struct SavedLine {
     offer: Option<AlbumView>,
     #[serde(default)]
     resolution: Option<Resolution>,
+    #[serde(default)]
+    awaiting_ms: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1021,13 +1026,80 @@ fn saved_line(db: &Connection, row: i64, index: u16) -> Result<SavedLine, Refusa
 
 fn save_line(keeper: &mut Keeper, now: u64, row: i64, index: u16, line: &SavedLine) -> Result<(), Refusal> {
     let text = serde_json::to_string(line).map_err(|_| Refusal::NotDealtWith)?;
-    keeper.write_data(now, |tx| {
-        tx.execute(
-            "INSERT INTO requests_lines (job, line, progress) VALUES (?1, ?2, ?3)
-             ON CONFLICT(job, line) DO UPDATE SET progress = excluded.progress",
-            params![row, index, text],
-        ).map(|count| ((), count != 0))
-    }).map_err(|_| Refusal::NotDealtWith)
+    keeper.write_data(now, |tx| keep_line(tx, row, index, &text).map(|count| ((), count != 0)))
+        .map_err(|_| Refusal::NotDealtWith)
+}
+
+fn keep_line(db: &Connection, row: i64, index: u16, text: &str) -> rusqlite::Result<usize> {
+    db.execute(
+        "INSERT INTO requests_lines (job, line, progress) VALUES (?1, ?2, ?3)
+         ON CONFLICT(job, line) DO UPDATE SET progress = excluded.progress",
+        params![row, index, text],
+    )
+}
+
+fn submitting_session_live(
+    keeper: &Keeper, actor: &mut Account, session: i64, now: u64,
+) -> Result<bool, Refusal> {
+    let session = SessionId::new(unsigned(session)?).ok_or(Refusal::NotDealtWith)?;
+    let live = rows::session_by_id(keeper.data().connection(), session).map_err(sql_error)?;
+    Ok(live.is_some_and(|(number, device, hash, _)| {
+        number == actor.state().id.get() &&
+        events::inspect_session(keeper, actor, device, &Fingerprint::from_bytes(hash), now).is_ok()
+    }))
+}
+
+fn close_parked_lines(keeper: &mut Keeper, now: u64) -> Result<(), Refusal> {
+    let restore = sql(keeper.restore())?;
+    let effective = keeper.clock(now).effective();
+    let cutoff = sql(effective.saturating_sub(wire::RESOLUTION_WAIT_SECONDS * 1000))?;
+    let parked: Vec<(i64, i64, i64)> = {
+        let mut read = keeper.data().connection().prepare(
+            "SELECT id, account, session FROM requests_jobs WHERE restore = ?1 AND stage = ?2",
+        ).map_err(sql_error)?;
+        let rows = read.query_map(params![restore, PARKED], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .map_err(sql_error)?;
+        rows.collect::<Result<_, _>>().map_err(sql_error)?
+    };
+    let mut expired = Vec::new();
+    for (row, account, session) in parked {
+        let account = unsigned(account)?;
+        let session_live = if rows::account_exists(keeper.data().connection(), account).map_err(sql_error)? {
+            let mut actor = keeper.load(account).map_err(|_| Refusal::NotDealtWith)?;
+            submitting_session_live(keeper, &mut actor, session, now)?
+        } else {
+            false
+        };
+        let mut read = keeper.data().connection().prepare(
+            "SELECT line, progress FROM requests_lines
+             WHERE job = ?1 AND json_extract(progress, '$.progress.state') = 'needs_resolution'
+               AND json_type(progress, '$.resolution') = 'null'
+               AND (NOT ?2 OR COALESCE(json_extract(progress, '$.awaiting_ms'), 0) <= ?3)",
+        ).map_err(sql_error)?;
+        let lines = read.query_map(params![row, session_live, cutoff], |record| {
+            Ok((record.get::<_, u16>(0)?, record.get::<_, String>(1)?))
+        }).map_err(sql_error)?;
+        for line in lines {
+            let (index, text) = line.map_err(sql_error)?;
+            let mut saved: SavedLine = decode(text.as_bytes())?;
+            let live = session_live && saved.awaiting_ms.is_some();
+            let progress = wire::batch_resolution_progress(saved.awaiting_ms.unwrap_or(0), effective, live);
+            if progress == BatchLineProgress::NotFound {
+                saved.progress = Some(progress);
+                let contents = serde_json::to_string(&saved).map_err(|_| Refusal::NotDealtWith)?;
+                expired.push((row, index, contents));
+            }
+        }
+    }
+    if !expired.is_empty() {
+        keeper.write_data(now, |tx| {
+            for (row, index, text) in &expired {
+                keep_line(tx, *row, *index, text)?;
+            }
+            Ok(((), true))
+        }).map_err(|_| Refusal::NotDealtWith)?;
+    }
+    Ok(())
 }
 
 fn resolve_batch_line(
@@ -1043,10 +1115,12 @@ fn resolve_batch_line(
     let state = match &line.resolution {
         Some(resolution) => wire::BatchResolutionState::Saved(resolution.release.as_ref()),
         None if stage != FINISHED && matches!(line.progress, Some(BatchLineProgress::NeedsResolution)) =>
-            wire::BatchResolutionState::Awaiting,
+            line.awaiting_ms.map_or(wire::BatchResolutionState::Closed, |since_ms| {
+                wire::BatchResolutionState::Awaiting { since_ms }
+            }),
         None => wire::BatchResolutionState::Closed,
     };
-    if wire::check_batch_resolution(state, release.as_ref())? == wire::BatchResolutionWrite::Save {
+    if wire::check_batch_resolution(state, release.as_ref(), actor.now, true)? == wire::BatchResolutionWrite::Save {
         line.resolution = Some(Resolution { release, lookup_started: false });
         save_line(keeper, actor.now, row, index, &line)?;
     }
@@ -1258,7 +1332,7 @@ impl Requests {
                         owners.get(release.as_str()).map(Vec::as_slice).unwrap_or_default())?;
                 }
                 let work = Plan::resolve(&change, &lock(&self.books), actor, binding, credential.revision)?;
-                let job = enqueue(keeper, actor, request_id, &change_bytes, &work, &self.rooms)?;
+                let job = enqueue(keeper, actor, request_id, &change_bytes, &work, matches!(&change, Change::Batch { .. }), &self.rooms)?;
                 self.wake.notify_one();
                 Answer::Begun { job }
             }
@@ -1362,20 +1436,21 @@ impl Requests {
 
     fn claim(&self, keeper: &mut Keeper, now: u64) -> Result<Option<(Job, Place, Credential)>, Refusal> {
         let Some(endpoint) = &self.endpoint else { return Ok(None) };
+        close_parked_lines(keeper, now)?;
         let db = keeper.data().connection();
         let (
             row, account, session, change, plan, stage, place,
         ) = {
             let mut query = db.prepare(
                 "SELECT id, account, session, change, work, stage FROM requests_jobs
-                 WHERE restore = ?1 AND stage < ?2 AND NOT EXISTS (
+                 WHERE restore = ?1 AND stage < ?2 AND (stage <> ?3 OR NOT EXISTS (
                     SELECT 1 FROM requests_lines
                     WHERE job = requests_jobs.id
                      AND json_extract(progress, '$.progress.state') = 'needs_resolution'
                      AND json_type(progress, '$.resolution') = 'null'
-                 ) ORDER BY id LIMIT ?3",
+                 )) ORDER BY id LIMIT ?4",
             ).map_err(sql_error)?;
-            let mut rows = query.query(params![sql(keeper.restore())?, FINISHED, (wire::WAITING_MAX + wire::RUNNING_MAX) as i64])
+            let mut rows = query.query(params![sql(keeper.restore())?, FINISHED, PARKED, (wire::WAITING_MAX + wire::RUNNING_MAX) as i64])
                 .map_err(sql_error)?;
             loop {
                 let Some(row) = rows.next().map_err(sql_error)? else { return Ok(None) };
@@ -1388,25 +1463,23 @@ impl Requests {
             }
         };
         let plan: Plan = decode(&plan)?;
+        let change: Change = decode(&change)?;
+        let restore = keeper.restore();
+        if !rows::account_exists(keeper.data().connection(), account).map_err(sql_error)? {
+            finish_job(keeper, now, row, &JobResult::Failed(Refusal::NotSignedIn), &[], None)?;
+            self.wake.notify_one();
+            return Ok(None);
+        }
         let mut actor = keeper.load(account).map_err(|_| Refusal::NotDealtWith)?;
         let account_id = actor.state().id;
-        let restore = keeper.restore();
-        let live = SessionId::new(unsigned(session)?).ok_or(Refusal::NotDealtWith)?;
-        let db = keeper.data().connection();
-        let live = rows::session_by_id(db, live).map_err(sql_error)?;
-        let access = access(keeper, account_id)?.check();
-        let key = credential(keeper, endpoint)?;
         let allowed = (|| {
-            if access.is_err() {
-                return Err(Refusal::SwitchedOff);
-            }
-            let (number, device, hash, _) = live.ok_or(Refusal::NotSignedIn)?;
-            if number != account {
+            access(keeper, account_id)?.check()?;
+            if actor.state().status != Status::On ||
+                (!matches!(&change, Change::Batch { .. }) && !submitting_session_live(keeper, &mut actor, session, now)?)
+            {
                 return Err(Refusal::NotSignedIn);
             }
-            events::inspect_session(keeper, &mut actor, device, &Fingerprint::from_bytes(hash), now)
-                .map_err(|_| Refusal::NotSignedIn)?;
-            let key = key.ok_or(Refusal::LidarrNotSetUp)?;
+            let key = credential(keeper, endpoint)?.ok_or(Refusal::LidarrNotSetUp)?;
             if plan.binding != binding(endpoint) || plan.revision != key.revision {
                 return Err(Refusal::LidarrNotSetUp);
             }
@@ -1420,9 +1493,9 @@ impl Requests {
                 return Ok(None);
             }
         };
-        if stage == QUEUED {
+        if matches!(stage, QUEUED | PARKED) {
             keeper.write_data(now, |tx| {
-                tx.execute("UPDATE requests_jobs SET stage = ?1 WHERE id = ?2 AND stage = ?3", params![STARTED, row, QUEUED])
+                tx.execute("UPDATE requests_jobs SET stage = ?1 WHERE id = ?2 AND stage = ?3", params![STARTED, row, stage])
                     .map(|count| ((), count != 0))
             }).map_err(|_| Refusal::NotDealtWith)?;
         }
@@ -1431,7 +1504,7 @@ impl Requests {
             account: account_id,
             restore,
             admin: actor.state().admin,
-            change: decode(&change)?,
+            change,
             plan,
             recovering: stage == MAY_HAVE_CHANGED,
         }, place, key)))
@@ -1864,15 +1937,21 @@ impl Requests {
             loaded_bulk(payload, desk)?
         } else {
             let mut wants = Vec::with_capacity(lines.len());
-            let mut waiting = false;
+            let mut waiting = Vec::new();
             for (index, line) in lines.iter().enumerate() {
-                match prepare_line(journal, lidarr, index as u16, line, singles)? {
+                let index = index as u16;
+                match prepare_line(journal, lidarr, index, line, singles)? {
                     Some(want) => wants.push(want),
-                    None => waiting = true,
+                    None => waiting.push(BatchLineView { index, progress: BatchLineProgress::NeedsResolution }),
                 }
             }
-            if waiting {
-                return Ok(());
+            if wire::batch_parked_on_app(&waiting) {
+                return journal.ask(move |keeper, now, row| {
+                    keeper.write_data(now, |tx| {
+                        tx.execute("UPDATE requests_jobs SET stage = ?1 WHERE id = ?2 AND stage = ?3",
+                            params![PARKED, row, STARTED]).map(|count| ((), count != 0))
+                    }).map_err(|_| Refusal::NotDealtWith)
+                });
             }
             let batch = bulk::Job::new(desk);
             lidarr_result(batch.start_indexed(wants), None)?;
@@ -1979,7 +2058,12 @@ fn prepare_line(
         _ => None,
     };
     if updated {
-        journal.ask(move |keeper, now, row| save_line(keeper, now, row, index, &saved))?;
+        journal.ask(move |keeper, now, row| {
+            if matches!(saved.progress, Some(BatchLineProgress::NeedsResolution)) && saved.awaiting_ms.is_none() {
+                saved.awaiting_ms = Some(keeper.clock(now).effective());
+            }
+            save_line(keeper, now, row, index, &saved)
+        })?;
     }
     Ok(want)
 }

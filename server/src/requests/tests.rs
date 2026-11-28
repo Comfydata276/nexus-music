@@ -194,7 +194,7 @@ fn an_account_gets_only_one_upstream_place() {
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Condvar;
+use std::sync::{Condvar, atomic::AtomicU64};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::accounts::{
@@ -354,8 +354,14 @@ fn now() -> u64 {
 
 impl TestServer {
     fn start(name: &str, endpoint: Option<Endpoint>) -> (Self, [OneTimeCode; 3]) {
+        Self::start_with_clock(name, endpoint, Arc::new(now))
+    }
+
+    fn start_with_clock(
+        name: &str, endpoint: Option<Endpoint>, clock: crate::accounts::session::Clock,
+    ) -> (Self, [OneTimeCode; 3]) {
         let (root, keeper, codes) = fixture(name);
-        let accounts = fixture_accounts(keeper);
+        let accounts = fixture_accounts(keeper, clock);
         let id = accounts.backend;
         let server = accounts.clone();
         let (stop, stopped) = tokio::sync::oneshot::channel();
@@ -827,10 +833,9 @@ fn fixture(name: &str) -> (PathBuf, Keeper, [OneTimeCode; 3]) {
         (root, keeper, codes)
 }
 
-fn fixture_accounts(mut keeper: Keeper) -> Arc<Accounts> {
-        let now = now();
+fn fixture_accounts(mut keeper: Keeper, clock: crate::accounts::session::Clock) -> Arc<Accounts> {
+        let now = clock();
         let id = keeper.backend();
-        let clock: crate::accounts::session::Clock = Arc::new(self::now);
         let admission = Arc::new(Admission::open(&mut keeper, clock.clone()).unwrap());
         Arc::new(Accounts {
             workers: PasswordWorkers::new(dummy_salt_key(&keeper)).unwrap(),
@@ -857,7 +862,7 @@ fn serve_in_a_child_for_the_restart_case() {
     let address: SocketAddr = std::env::var("NEXUS_REQUESTS_TEST_LISTEN").unwrap().parse().unwrap();
     let lidarr: SocketAddr = std::env::var("NEXUS_REQUESTS_TEST_LIDARR").unwrap().parse().unwrap();
     assert!(address.ip().is_loopback() && lidarr.ip().is_loopback());
-    let accounts = fixture_accounts(reopen(&root));
+    let accounts = fixture_accounts(reopen(&root), Arc::new(now));
     let id = accounts.backend;
     runtime().block_on(async {
         let listener = serve::listen(address).unwrap();
@@ -1005,6 +1010,51 @@ fn a_slow_lidarr_read_leaves_sign_in_and_the_writer_available() {
         assert!(matches!(search.join().unwrap(), Answer::Refused { reason: Refusal::LidarrUnavailable }));
     });
     reply.join().unwrap();
+}
+
+#[test]
+fn a_batch_waiting_for_its_device_releases_the_account_and_expires() {
+    let lidarr = MockLidarr::start();
+    let offset = Arc::new(AtomicU64::new(0));
+    let clock = {
+        let offset = offset.clone();
+        Arc::new(move || now() + offset.load(Ordering::Relaxed))
+    };
+    let (server, [admin, _, _]) =
+        TestServer::start_with_clock("fallback-expiry", Some(endpoint(lidarr.address)), clock);
+    let admin = server.redeem(admin, 1, TEST_PAGE);
+    server.configure(&admin);
+    let job = begun(server.call(&admin, begin(1, Change::Batch {
+        singles: false,
+        lines: vec![BatchLine { artist: "Quillon Vane".into(), album: String::new(), song: "First Light".into() }],
+    })));
+    let until = Instant::now() + Duration::from_secs(6);
+    loop {
+        if matches!(server.call(&admin, Call::BatchLines { job, after: None }), Answer::BatchLines { lines, .. }
+            if lines[0].progress == BatchLineProgress::NeedsResolution)
+        {
+            break;
+        }
+        assert!(Instant::now() < until, "the batch did not wait for the submitting device");
+        thread::sleep(Duration::from_millis(30));
+    }
+    let second = loop {
+        match server.call(&admin, begin(2, cancelled())) {
+            Answer::Begun { job } => break job,
+            Answer::Refused { reason: Refusal::Busy } if Instant::now() < until => {
+                thread::sleep(Duration::from_millis(30));
+            }
+            _ => panic!("the parked batch held the account's place"),
+        }
+    };
+    assert_eq!(server.outcome(&admin, second), Err(Refusal::NoLongerListed));
+    offset.store((wire::RESOLUTION_WAIT_SECONDS + 1) * 1000, Ordering::Relaxed);
+    assert!(matches!(server.call(&admin, Call::ResolveBatchLine { job, index: 0, release: MusicBrainzId::new(ALBUM) }),
+        Answer::Refused { reason: Refusal::NotAllowed }));
+    assert_eq!(server.done(&admin, job), Completed::Batch);
+    assert!(matches!(server.call(&admin, Call::BatchLines { job, after: None }), Answer::BatchLines { lines, .. }
+        if lines.len() == 1 && lines[0].progress == BatchLineProgress::NotFound));
+    assert!(!lidarr.take_calls().iter().any(|call| call.starts_with("PUT ") || call.starts_with("POST ")));
 }
 
 #[test]
