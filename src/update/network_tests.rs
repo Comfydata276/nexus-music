@@ -103,7 +103,7 @@ impl Server {
         });
         // The fetch function is the only downloader and consumes its single call.
         assert_eq!(calls, 1);
-        result
+        result.map_err(|error| error.to_string())
     }
 
     fn count(&self) -> usize {
