@@ -23,7 +23,7 @@
 //! waits and when it gives up, and how the batch stands. Where it's written down, the thread
 //! it runs on and the threads it looks albums up on are the app's (see `Desk`).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -104,10 +104,33 @@ pub struct Want {
     pub again: bool,
 }
 
+/// A projected row for each original server batch line, including aliases of
+/// the same canonical want. Slot numbers are stable within its saved batch.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndexedLine {
+    pub index: usize,
+    pub slot: usize,
+    pub state: State,
+    pub offer: Option<Offer>,
+    pub reason: String,
+    /// This group's intent was flushed before an upstream write could start.
+    pub before_effect: bool,
+}
+
+pub const INTERRUPTED_EFFECT: &str = "Lidarr's change could not be confirmed after the server restarted.";
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct Indexed {
+    slots: Vec<usize>,
+    before_effect: BTreeSet<usize>,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 struct Batch {
     wants: Vec<Want>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    indexed: Option<Indexed>,
     /// Artists whose "new releases" setting was turned off while their singles were read
     /// in: Lidarr's number for each, what to put back, and on which Lidarr.
     restore: Vec<Back>,
@@ -331,6 +354,11 @@ impl Job {
     /// alone: what to do with it, and what to tell the person, is the app's.
     pub fn load(&self, written: &[u8]) -> bool {
         let Ok(batch) = serde_json::from_slice::<Batch>(written) else { return false };
+        if batch.indexed.as_ref().is_some_and(|index| {
+            index.slots.is_empty() || index.slots.iter().chain(&index.before_effect).any(|&slot| slot >= batch.wants.len())
+        }) {
+            return false;
+        }
         self.with(|now| *now = batch);
         true
     }
@@ -388,6 +416,120 @@ impl Job {
             }
         });
         self.save();
+    }
+
+    /// Keep a single server batch after every original line's lookup has ended.
+    /// The caller serializes this job's lifecycle and prepares Found, Unknown or
+    /// Failed rows in submission order. Found rows with an identical canonical
+    /// release share a slot. An unresolved or failed lookup keeps its own slot.
+    pub fn start_indexed(&self, wants: Vec<Want>) -> Result<(), String> {
+        if self.running() || self.with(|batch| batch.indexed.is_some() || !batch.wants.is_empty() || !batch.restore.is_empty()) {
+            return Err("The indexed batch has already been started.".into());
+        }
+        if wants.is_empty() {
+            return Err("The indexed batch has no lines.".into());
+        }
+        let mut saved = Batch::default();
+        let mut index = Indexed::default();
+        let mut by_release = HashMap::<(String, String), usize>::new();
+        for want in wants {
+            let slot = match (want.state, &want.offer) {
+                (State::Found, Some(offer)) if !offer.artist_id.is_empty() && !offer.album.is_empty() => {
+                    *by_release.entry((offer.artist_id.clone(), offer.album.clone())).or_insert(saved.wants.len())
+                }
+                (State::Unknown | State::Failed, _) => saved.wants.len(),
+                _ => return Err("The indexed batch still has an unresolved lookup.".into()),
+            };
+            index.slots.push(slot);
+            if let Some(known) = saved.wants.get_mut(slot) {
+                for fill in want.fills {
+                    if !known.fills.contains(&fill) {
+                        known.fills.push(fill);
+                    }
+                }
+            } else {
+                saved.wants.push(want);
+            }
+        }
+        saved.indexed = Some(index);
+        let _writing = self.writing.lock().unwrap_or_else(|stuck| stuck.into_inner());
+        if !serde_json::to_vec(&saved).ok().is_some_and(|json| self.desk.keep_checked(json)) {
+            return Err("The indexed batch could not be saved.".into());
+        }
+        self.with(|batch| *batch = saved);
+        Ok(())
+    }
+
+    pub fn indexed_lines(&self) -> Option<Vec<IndexedLine>> {
+        self.with(|batch| {
+            let indexed = batch.indexed.as_ref()?;
+            indexed.slots.iter().enumerate().map(|(index, &slot)| {
+                let want = batch.wants.get(slot)?;
+                Some(IndexedLine {
+                    index,
+                    slot,
+                    state: want.state,
+                    offer: want.offer.clone(),
+                    reason: want.reason.clone(),
+                    before_effect: indexed.before_effect.contains(&slot),
+                })
+            }).collect()
+        })
+    }
+
+    /// On restart, resolve each uncertain slot before running more work. Supply
+    /// true only after checking the same Lidarr binding and exact artist/release
+    /// and observing that the release is wanted or has arrived. A false result
+    /// cannot authorize replay of an uncertain write.
+    pub fn reconcile_indexed(&self, slot: usize, placed: bool) -> Result<(), String> {
+        if self.running() {
+            return Err("The indexed batch is running.".into());
+        }
+        let previous = self.with(|batch| {
+            if !batch.indexed.as_ref()?.before_effect.contains(&slot) {
+                return None;
+            }
+            let want = batch.wants.get_mut(slot)?;
+            if !matches!(want.state, State::Found | State::Asked) {
+                return None;
+            }
+            let previous = want.clone();
+            want.state = if placed { State::Done } else { State::Failed };
+            want.reason = if placed { String::new() } else { INTERRUPTED_EFFECT.into() };
+            want.again = false;
+            Some(previous)
+        }).ok_or("This batch slot has no uncertain effect.")?;
+        if self.save_checked() {
+            return Ok(());
+        }
+        self.with(|batch| {
+            if let Some(want) = batch.wants.get_mut(slot) {
+                *want = previous;
+            }
+        });
+        Err("The recovered batch result could not be saved.".into())
+    }
+
+    fn keep_before_effect(&self, places: &[usize]) -> Result<(), String> {
+        let indexed = self.with(|batch| {
+            let Some(index) = &mut batch.indexed else { return Ok(false) };
+            if places.iter().any(|slot| index.before_effect.contains(slot)) {
+                return Err("This batch effect has already been attempted.");
+            }
+            index.before_effect.extend(places.iter().copied());
+            Ok(true)
+        })?;
+        if !indexed || self.save_checked() {
+            return Ok(());
+        }
+        self.with(|batch| {
+            if let Some(index) = &mut batch.indexed {
+                for slot in places {
+                    index.before_effect.remove(slot);
+                }
+            }
+        });
+        Err("The changes to Lidarr could not be saved before they were sent.".into())
     }
 
     /// Whether there's a batch with something still to do with the Lidarr at `lidarr` (its
@@ -692,6 +834,34 @@ impl Job {
         tell(Event::Ended);
     }
 
+    /// Server execution uses the existing grouped write and settle phases, with
+    /// all lookups already decided. The caller holds the endpoint's mutation turn
+    /// and reconciles uncertain slots from a prior run before calling this.
+    pub fn work_prepared(&self, lidarr: &dyn BulkLidarr, tell: &Tell) -> Result<(), String> {
+        let ready = self.with(|batch| batch.indexed.as_ref().is_some_and(|index| {
+            !index.before_effect.iter().any(|&slot| {
+                batch.wants.get(slot).is_none_or(|want| matches!(want.state, State::Found | State::Asked))
+            })
+        }));
+        if !ready {
+            return Err("Reconcile the indexed batch before working through it.".into());
+        }
+        if !self.begin() {
+            return Err("The indexed batch is already running.".into());
+        }
+        tell(Event::Changed);
+        let asked = self.ask_all(lidarr, tell);
+        self.save();
+        if asked.is_ok() {
+            tell(Event::Asked);
+        }
+        let outcome = asked.and(self.settle(lidarr, tell));
+        self.save();
+        self.not_started();
+        tell(Event::Ended);
+        outcome
+    }
+
     /// The app couldn't start the thread to work through the batch on.
     pub fn not_started(&self) {
         self.running.store(false, Ordering::SeqCst);
@@ -842,6 +1012,7 @@ impl Job {
             if self.stopping() {
                 break;
             }
+            self.keep_before_effect(&places)?;
             let offers: Vec<Offer> = self.with(|batch| places.iter().filter_map(|&at| batch.wants[at].offer.clone()).collect());
             // Whether this is an artist to watch Lidarr with (see `Batch::proof`).
             let mut unproven = false;

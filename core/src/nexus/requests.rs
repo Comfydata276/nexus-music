@@ -15,7 +15,9 @@ use super::account::{self, AccountId, Receipt};
 use super::admin;
 use super::wire::{self, BadMessage, Fields, Value, WireBody};
 pub use super::account::{RequestHead, RequestId};
+use crate::bulk;
 use crate::lidarr::{self, ArtistOffer, Listed, Pending, RequestLidarr, Single, WayBack};
+use crate::musicbrainz::MusicBrainz;
 use crate::offer::Offer;
 
 // the design does not say how to spell the path and JSON tags. One POST with a closed call tag.
@@ -263,6 +265,9 @@ pub enum Call {
     /// The authenticated account owns the history. There is no account selector.
     AskedHistory { after: Option<PageCursor> },
     BatchLines { job: JobId, after: Option<PageCursor> },
+    /// Reply to NeedsResolution for the original batch. Null ends the lookup
+    /// without a release. An identical resend acknowledges the saved answer.
+    ResolveBatchLine { job: JobId, index: u16, release: Option<MusicBrainzId> },
     Begin { request_id: RequestId, change: Change },
     After { job: JobId },
 }
@@ -289,6 +294,11 @@ impl Value for Call {
             "pending" => Self::Pending { after: after()? },
             "asked_history" => Self::AskedHistory { after: after()? },
             "batch_lines" => Self::BatchLines { job: member(&fields, "job")?, after: after()? },
+            "resolve_batch_line" => Self::ResolveBatchLine {
+                job: member(&fields, "job")?,
+                index: member(&fields, "index")?,
+                release: member(&fields, "release")?,
+            },
             "begin" => Self::Begin { request_id: fields.get("request_id")?, change: object_json(raw_member(&fields, "change")?)? },
             "after" => Self::After { job: member(&fields, "job")? },
             _ => return Err(BadMessage::Form),
@@ -407,6 +417,14 @@ pub struct BatchLine {
 }
 
 impl BatchLine {
+    /// Call once on the submitting device for NeedsResolution. Record the
+    /// result by job and original line before sending it. On a lost response,
+    /// resend that result instead of asking MusicBrainz again.
+    pub fn resolve_on_device(&self, musicbrainz: &MusicBrainz, singles: bool) -> Result<Option<MusicBrainzId>, String> {
+        musicbrainz.release_with(&self.artist, &self.song, &self.album, singles)?
+            .map(|release| MusicBrainzId::try_from(release).map_err(|error| error.to_string())).transpose()
+    }
+
     fn valid(&self) -> bool {
         // An imported playlist can omit the album. The released bulk lookup then
         // finds it via the song. Keep the field present and use an empty string.
@@ -419,6 +437,57 @@ impl BatchLine {
                 && !reserved_lookup(&self.album)
                 && !reserved_lookup(&crate::text::undecorated(&self.album))))
     }
+}
+
+/// The persisted fallback for one original line, after account, session and job checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchResolutionState<'a> {
+    Awaiting,
+    Saved(Option<&'a MusicBrainzId>),
+    Closed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchResolutionWrite {
+    Save,
+    Replay,
+}
+
+/// Save a first answer durably before retrying the exact Lidarr lookup.
+/// Keep the saved answer even after the line becomes terminal.
+pub fn check_batch_resolution(
+    state: BatchResolutionState<'_>,
+    release: Option<&MusicBrainzId>,
+) -> Result<BatchResolutionWrite, Refusal> {
+    match state {
+        BatchResolutionState::Awaiting => Ok(BatchResolutionWrite::Save),
+        BatchResolutionState::Saved(known) if known == release => Ok(BatchResolutionWrite::Replay),
+        _ => Err(Refusal::NotAllowed),
+    }
+}
+
+/// S13 performs one Lidarr lookup for this exact release ID and uses this
+/// selection rule. The device's input supplies only the MusicBrainz ID.
+/// This is the same ID and release-kind test as the released song fallback.
+pub fn batch_fallback_offer<'a>(release: &MusicBrainzId, singles: bool, found: &'a [Offer]) -> Option<&'a Offer> {
+    found.iter().find(|offer| offer.album == release.as_str() && (singles || offer.kind() == "Album"))
+}
+
+/// Reconcile an ambiguous prepared-batch write using the verified artist's
+/// list from the original Lidarr binding. The current artist number must be
+/// the one observed when looking up `artist.artist` by MusicBrainz ID.
+pub fn batch_effect_confirmed(
+    offer: &Offer,
+    artist: &ArtistTarget,
+    current_number: Option<i64>,
+    listed: &[Listed],
+) -> bool {
+    if offer.artist_id != artist.artist.as_str() || artist.check_current(current_number).is_err() {
+        return false;
+    }
+    let mut matching = listed.iter().filter(|row| row.album == offer.album);
+    matching.next().is_some_and(|row| row.id > 0 && (row.wanted || row.have))
+        && matching.next().is_none()
 }
 
 fn within(count: usize, max: usize) -> Result<(), WireError> {
@@ -448,6 +517,7 @@ impl Call {
             Self::BatchLines { after, .. } => {
                 require(after.is_none_or(|cursor| batch_offset(cursor).is_some()))
             }
+            Self::ResolveBatchLine { index, .. } => require(usize::from(*index) < BATCH_MAX_LINES),
             Self::Begin { change, .. } => change.check(),
             _ => Ok(()),
         }
@@ -680,6 +750,7 @@ pub enum Answer {
         #[serde(deserialize_with = "Deserialize::deserialize")]
         next: Option<PageCursor>,
     },
+    BatchResolutionAccepted,
     Begun { job: JobId },
     Working,
     Done {
@@ -887,11 +958,18 @@ pub struct BatchLineView {
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum BatchLineProgress {
     Waiting,
+    /// Only the original submitting live session supplies this line's resolution.
+    /// The device uses its saved input line and the batch's original preference.
+    NeedsResolution,
     Found { #[serde(deserialize_with = "object")] album: BatchAlbum },
     Asked { #[serde(deserialize_with = "object")] album: BatchAlbum },
     Done { #[serde(deserialize_with = "object")] album: BatchAlbum },
     NotFound,
-    Failed { reason: Refusal },
+    Failed {
+        reason: Refusal,
+        #[serde(deserialize_with = "optional_object")]
+        album: Option<BatchAlbum>,
+    },
 }
 
 /// The release found for the line, including what the app needs to match an arrival.
@@ -902,11 +980,55 @@ pub struct BatchAlbum {
     pub artist: String,
 }
 
+impl BatchAlbum {
+    fn from_offer(offer: &Offer) -> Option<Self> {
+        Some(Self {
+            offer: OfferName(MusicBrainzId::new(&offer.album)?),
+            title: offer.title.clone(),
+            artist: offer.artist.clone(),
+        })
+    }
+
+    fn valid(&self) -> bool {
+        safe_text(&self.title, NAME_MAX_BYTES) && safe_text(&self.artist, NAME_MAX_BYTES)
+    }
+}
+
 impl BatchLineView {
+    /// Project every original index, including aliases of a canonical want.
+    /// An unconfirmed recovered effect is failed with a closed code.
+    pub fn from_indexed(line: &bulk::IndexedLine) -> Result<Self, WireError> {
+        let index = u16::try_from(line.index).map_err(|_| WireError::Bounds)?;
+        require(usize::from(index) < BATCH_MAX_LINES)?;
+        let album = line.offer.as_ref().and_then(BatchAlbum::from_offer).filter(BatchAlbum::valid);
+        let progress = match (line.state, album) {
+            (bulk::State::Waiting, _) => BatchLineProgress::Waiting,
+            (bulk::State::Found, Some(album)) => BatchLineProgress::Found { album },
+            (bulk::State::Asked, Some(album)) => BatchLineProgress::Asked { album },
+            (bulk::State::Done, Some(album)) => BatchLineProgress::Done { album },
+            (bulk::State::Unknown, _) => BatchLineProgress::NotFound,
+            (bulk::State::Failed, album) => {
+                let reason = if line.reason == bulk::INTERRUPTED_EFFECT {
+                    Refusal::NotDealtWith
+                } else {
+                    refusal_for(&line.reason, line.offer.as_ref())
+                };
+                BatchLineProgress::Failed { reason, album }
+            }
+            _ => BatchLineProgress::Failed { reason: Refusal::LidarrUnrecognized, album: None },
+        };
+        let row = Self { index, progress };
+        if check_item(&row).is_err() {
+            return Ok(Self { index, progress: BatchLineProgress::Failed { reason: Refusal::TooLarge, album: None } });
+        }
+        Ok(row)
+    }
+
     fn valid(&self) -> bool {
         usize::from(self.index) < BATCH_MAX_LINES && match &self.progress {
             BatchLineProgress::Found { album } | BatchLineProgress::Asked { album }
-            | BatchLineProgress::Done { album } => safe_text(&album.title, NAME_MAX_BYTES) && safe_text(&album.artist, NAME_MAX_BYTES),
+            | BatchLineProgress::Done { album } => album.valid(),
+            BatchLineProgress::Failed { album, .. } => album.as_ref().is_none_or(BatchAlbum::valid),
             _ => true,
         }
     }
@@ -1189,12 +1311,16 @@ fn object<'de, D: de::Deserializer<'de>, T: Deserialize<'de>>(input: D) -> Resul
     input.deserialize_map(ObjectVisitor(std::marker::PhantomData))
 }
 
-fn objects<'de, D: de::Deserializer<'de>, T: Deserialize<'de>>(input: D) -> Result<Vec<T>, D::Error> {
-    #[derive(Deserialize)]
-    #[serde(transparent, bound(deserialize = "T: Deserialize<'de>"))]
-    struct Object<T>(#[serde(deserialize_with = "object")] T);
+#[derive(Deserialize)]
+#[serde(transparent, bound(deserialize = "T: Deserialize<'de>"))]
+struct WireObject<T>(#[serde(deserialize_with = "object")] T);
 
-    Vec::<Object<T>>::deserialize(input).map(|items| items.into_iter().map(|item| item.0).collect())
+fn objects<'de, D: de::Deserializer<'de>, T: Deserialize<'de>>(input: D) -> Result<Vec<T>, D::Error> {
+    Vec::<WireObject<T>>::deserialize(input).map(|items| items.into_iter().map(|item| item.0).collect())
+}
+
+fn optional_object<'de, D: de::Deserializer<'de>, T: Deserialize<'de>>(input: D) -> Result<Option<T>, D::Error> {
+    Option::<WireObject<T>>::deserialize(input).map(|item| item.map(|item| item.0))
 }
 
 // --- Server rules --------------------------------------------------------------------------
@@ -1621,6 +1747,14 @@ impl<'a> BackendLidarr<'a> {
         Ok(lines)
     }
 
+    /// Submit a durably saved app lookup result for one original line. A stored
+    /// null means no match. The server acknowledges identical retransmissions.
+    pub fn resolve_batch_line(&self, job: JobId, index: u16, release: Option<MusicBrainzId>) -> Result<(), RequestError> {
+        self.ask(Call::ResolveBatchLine { job, index, release }, |answer| {
+            matches!(answer, Answer::BatchResolutionAccepted).then_some(())
+        })
+    }
+
     /// The same durable history on every device signed in to this account.
     pub fn asked_history(&self) -> Result<Vec<AskedRelease>, RequestError> {
         self.pages(|after| Call::AskedHistory { after }, |answer| match answer {
@@ -1968,6 +2102,8 @@ mod tests {
             Call::KnownArtist { artist: id(1) }, Call::AlbumsOf { artist: one(), after: cursor(4) }, Call::ReleasesOf { artist: one(), after: cursor(5) },
             Call::Listed { artist: one(), after: cursor(6) }, Call::Busy { artists: vec![one()] }, Call::Pending { after: cursor(7) }, Call::After { job: job() },
             Call::BatchLines { job: job(), after: cursor(8) },
+            Call::ResolveBatchLine { job: job(), index: 1, release: Some(id(8)) },
+            Call::ResolveBatchLine { job: job(), index: 2, release: None },
         ];
         for call in calls.into_iter().chain(changes.into_iter().map(|change| Call::Begin { request_id: request_id(), change })) {
             let sent = message(call);
@@ -2001,15 +2137,16 @@ mod tests {
             Answer::BatchLines {
                 lines: [
                     BatchLineProgress::Waiting,
+                    BatchLineProgress::NeedsResolution,
                     BatchLineProgress::Found { album: batch_album() },
                     BatchLineProgress::Asked { album: batch_album() },
                     BatchLineProgress::Done { album: batch_album() },
                     BatchLineProgress::NotFound,
-                    BatchLineProgress::Failed { reason: Refusal::WouldNotKeep },
+                    BatchLineProgress::Failed { reason: Refusal::WouldNotKeep, album: None },
                 ].into_iter().enumerate().map(|(index, progress)| BatchLineView { index: index as u16, progress }).collect(),
                 next: None,
             },
-            Answer::Begun { job: job() }, Answer::Working,
+            Answer::BatchResolutionAccepted, Answer::Begun { job: job() }, Answer::Working,
             Answer::Failed { reason: Refusal::LidarrRefused }, Answer::Refused { reason: Refusal::SwitchedOff },
         ];
         let replies = answers.into_iter().chain(done.into_iter().map(|result| Answer::Done { result })).map(reply)
@@ -2537,7 +2674,7 @@ mod tests {
                         next: cursor(1),
                     },
                     Call::BatchLines { job: got, after } if got == job() && after == cursor(1) => Answer::BatchLines {
-                        lines: vec![BatchLineView { index: 1, progress: BatchLineProgress::Failed { reason: Refusal::NoLongerListed } }],
+                        lines: vec![BatchLineView { index: 1, progress: BatchLineProgress::Failed { reason: Refusal::NoLongerListed, album: None } }],
                         next: None,
                     },
                     call => panic!("unexpected call {call:?}"),
@@ -2552,7 +2689,7 @@ mod tests {
         let got = client.begin(request_id(), Change::Batch { singles: false, lines }).unwrap();
         assert_eq!(client.batch_lines(got).unwrap(), [
             BatchLineView { index: 0, progress: BatchLineProgress::Asked { album: batch_album() } },
-            BatchLineView { index: 1, progress: BatchLineProgress::Failed { reason: Refusal::NoLongerListed } },
+            BatchLineView { index: 1, progress: BatchLineProgress::Failed { reason: Refusal::NoLongerListed, album: None } },
         ]);
         assert_eq!(write_call(&message(Call::BatchLines { job: got, after: cursor(2_000) })).map(drop), Err(WireError::Bounds));
         let bad = reply(Answer::BatchLines {
@@ -2580,6 +2717,90 @@ mod tests {
         assert_eq!(client.find_artists("\r"), Ok(Vec::new()));
         assert_eq!(client.find_any(&format!("É\t🎵{}", "x".repeat(300))), Ok(Vec::new()));
         assert_eq!(*calls.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn batch_song_resolution_accepts_one_choice_and_requires_the_exact_retry_result() {
+        let release = id(2);
+        use BatchResolutionState::{Awaiting, Closed, Saved};
+        use BatchResolutionWrite::{Replay, Save};
+        assert_eq!(check_batch_resolution(Awaiting, Some(&release)), Ok(Save));
+        assert_eq!(check_batch_resolution(Saved(Some(&release)), Some(&release)), Ok(Replay));
+        assert_eq!(check_batch_resolution(Saved(Some(&release)), Some(&id(3))), Err(Refusal::NotAllowed));
+        assert_eq!(check_batch_resolution(Saved(None), None), Ok(Replay));
+        assert_eq!(check_batch_resolution(Saved(None), Some(&release)), Err(Refusal::NotAllowed));
+        assert_eq!(check_batch_resolution(Closed, None), Err(Refusal::NotAllowed));
+        assert_eq!(write_call(&message(Call::ResolveBatchLine { job: job(), index: 2_000, release: None })).map(drop), Err(WireError::Bounds));
+
+        let mismatched: Offer = album(3).into();
+        let matching: Offer = AlbumView { kind: Kind::Ep, ..album(2) }.into();
+        assert!(batch_fallback_offer(&release, false, &[mismatched.clone(), matching.clone()]).is_none());
+        assert_eq!(batch_fallback_offer(&release, true, &[mismatched, matching.clone()]), Some(&matching));
+    }
+
+    #[test]
+    fn prepared_batch_persists_aliases_before_writes_and_reconciles_after_a_cut() {
+        use crate::http::{Failure, Http, Method, Request, Response};
+
+        #[derive(Clone, Default)]
+        struct Disk(Arc<Mutex<Vec<u8>>>);
+        impl bulk::Desk for Disk {
+            fn keep(&self, batch: Option<Vec<u8>>, _: bool) {
+                *self.0.lock().unwrap() = batch.unwrap_or_default();
+            }
+            fn keep_checked(&self, batch: Vec<u8>) -> bool {
+                *self.0.lock().unwrap() = batch;
+                true
+            }
+            fn now(&self) -> i64 { 1 }
+            fn singles(&self) -> bool { false }
+        }
+        struct Cut(Disk);
+        impl Http for Cut {
+            fn send(&self, request: &Request) -> Result<Response, Failure> {
+                let path = request.url.strip_prefix("http://lidarr.test/api/v1/").unwrap();
+                let answer = match (path, request.method) {
+                    ("artist", Method::Get) => serde_json::json!([{ "id": 1, "foreignArtistId": id(1) }]),
+                    ("album?artistId=1", Method::Get) => serde_json::json!([{ "id": 7, "foreignAlbumId": id(2) }]),
+                    ("artist/1", Method::Get) => serde_json::json!({ "monitored": true }),
+                    ("album/monitor", Method::Put(_)) => {
+                        let copy = bulk::Job::new(self.0.clone());
+                        assert!(copy.load(&self.0.0.lock().unwrap()));
+                        let rows = copy.indexed_lines().unwrap();
+                        assert_eq!(rows.iter().map(|row| (row.index, row.slot, row.before_effect)).collect::<Vec<_>>(),
+                            [(0, 0, true), (1, 0, true)]);
+                        panic!("cut during the effect");
+                    }
+                    _ => panic!("unexpected Lidarr call"),
+                };
+                Ok(Response::new(200, Vec::new(), move || Ok(answer.to_string())))
+            }
+        }
+        let disk = Disk::default();
+        let original = bulk::Job::new(disk.clone());
+        let offer: Offer = album(2).into();
+        let prepared = bulk::Want { state: bulk::State::Found, offer: Some(offer.clone()), ..bulk::Want::default() };
+        original.start_indexed(vec![prepared.clone(), prepared]).unwrap();
+        let lidarr = lidarr::Lidarr::new("http://lidarr.test", "key", None, Arc::new(Cut(disk.clone())));
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| original.work_prepared(&lidarr, &|_| {}))).is_err());
+
+        let bytes = disk.0.lock().unwrap().clone();
+        let recovered = bulk::Job::new(disk.clone());
+        assert!(recovered.load(&bytes));
+        assert!(recovered.work_prepared(&lidarr, &|_| {}).is_err());
+        let current = Listed { id: 7, album: id(2).into(), wanted: true, have: false };
+        assert!(batch_effect_confirmed(&offer, &artist_target(), Some(1), std::slice::from_ref(&current)));
+        assert!(!batch_effect_confirmed(&offer, &artist_target(), Some(3), std::slice::from_ref(&current)));
+        assert!(!batch_effect_confirmed(&offer, &artist_target(), Some(1), &[current.clone(), current]));
+        recovered.reconcile_indexed(0, false).unwrap();
+        let readback = bulk::Job::new(disk.clone());
+        assert!(readback.load(&disk.0.lock().unwrap()));
+        let projected = readback.indexed_lines().unwrap().iter().map(BatchLineView::from_indexed).collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(projected, [0, 1].map(|index| BatchLineView {
+            index,
+            progress: BatchLineProgress::Failed { reason: Refusal::NotDealtWith, album: Some(batch_album()) },
+        }));
+        assert_eq!(readback.work_prepared(&lidarr, &|_| {}), Ok(()));
     }
 
     #[test]
