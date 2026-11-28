@@ -371,11 +371,13 @@ impl<'de> serde::de::Visitor<'de> for PassOver {
     }
 
     fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+        if self.0 >= HELLO_MAX_DEPTH { return Err(serde::de::Error::custom("nested too deep")); }
         while seq.next_element_seed(PassOver(self.0 + 1))?.is_some() {}
         Ok(())
     }
 
     fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        if self.0 >= HELLO_MAX_DEPTH { return Err(serde::de::Error::custom("nested too deep")); }
         let mut seen = Vec::new();
         while let Some(key) = map.next_key::<String>()? {
             map.next_value_seed(PassOver(self.0 + 1))?;
@@ -383,6 +385,14 @@ impl<'de> serde::de::Visitor<'de> for PassOver {
         }
         Ok(())
     }
+}
+
+/// Check the whole UTF-8 JSON tree before interpreting a music-server envelope (§7.2).
+pub(super) fn complete_json(bytes: &[u8]) -> bool {
+    use serde::de::DeserializeSeed;
+    let Ok(text) = std::str::from_utf8(bytes) else { return false; };
+    let mut de = serde_json::Deserializer::from_str(text);
+    PassOver(0).deserialize(&mut de).is_ok() && de.end().is_ok()
 }
 
 fn has_name(name: &str) -> bool {

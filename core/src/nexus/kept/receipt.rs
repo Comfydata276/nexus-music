@@ -1,0 +1,88 @@
+//! The handoff from the server's bounded Argon2id work to the serialized decision.
+
+use super::*;
+
+// The design does not say how long a checked sign-in may remain in flight.
+// Retain the five-second receipt lifetime, measured at the backend's effective time.
+pub const RECEIPT_MS: u64 = 5_000;
+
+pub(super) enum Purpose {
+    SignIn { secret: Fingerprint, is_new: bool },
+    Leave { session: u64, for_what: LeaveFor },
+    ChoosePassword { secret: Fingerprint, is_new: bool },
+}
+
+/// Bound to the authoritative account/device and verifier before S8 starts the
+/// slow password check. S8 supplies the stored Argon2id output, then the derived
+/// output for the submitted password. An unknown account takes the dummy path in S8.
+pub struct PasswordCheck {
+    scope: Scope,
+    purpose: Purpose,
+    expected: Fingerprint,
+    started: u64,
+}
+
+pub struct Receipt {
+    scope: Scope,
+    purpose: Purpose,
+    checked: u64,
+}
+
+impl PasswordCheck {
+    pub(super) fn new(scope: Scope, purpose: Purpose, expected: Fingerprint, started: u64) -> Self {
+        Self {
+            scope,
+            purpose,
+            expected,
+            started,
+        }
+    }
+
+    /// S8 passes its effective backend time and the Argon2id output, never the password.
+    pub fn check(self, derived: Fingerprint, clock: Clock) -> Result<Receipt, Denied> {
+        if self.expected != derived {
+            return Err(Denied::WrongPassword);
+        }
+        let checked = clock.effective();
+        if checked < self.started {
+            return Err(Denied::Time);
+        }
+        Ok(Receipt {
+            scope: self.scope,
+            purpose: self.purpose,
+            checked,
+        })
+    }
+}
+
+impl Receipt {
+    pub(super) fn checked(&self) -> u64 {
+        self.checked
+    }
+
+    pub(super) fn scope(&self) -> &Scope {
+        &self.scope
+    }
+
+    pub(super) fn consume(self, current: &Scope, now: u64) -> Result<Purpose, Denied> {
+        if &self.scope != current {
+            return Err(Denied::NotSignedIn);
+        }
+        if !within(self.checked, now, RECEIPT_MS) {
+            return Err(Denied::Time);
+        }
+        Ok(self.purpose)
+    }
+}
+
+impl fmt::Debug for PasswordCheck {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PasswordCheck(..)")
+    }
+}
+
+impl fmt::Debug for Receipt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Receipt(..)")
+    }
+}
