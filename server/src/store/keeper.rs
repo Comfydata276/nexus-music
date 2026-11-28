@@ -25,11 +25,11 @@ use nexus_core::nexus::compare::{self, Contradiction, Pending, StoreAccount, Sto
 use nexus_core::nexus::kept::{Apart, Clock, Denied, Device, Effects, Family, Fingerprint, Rows, SECRET_BYTES, StampKey, Scope, Startup, StoreComparison, at_start};
 use nexus_core::nexus::proto::BackendId;
 
-use crate::apart::{self, Account, Reading, Store};
-use crate::copies;
-use crate::data::{self, Change, Data, Opened, why};
+use crate::store::apart::{self, Account, Reading, Store};
+use crate::store::copies;
+use crate::store::data::{self, Change, Data, Opened, why};
 use crate::identity;
-use crate::lock;
+use crate::store::lock;
 
 /// Why the backend does not serve, or a command did nothing: a sentence for the owner.
 #[derive(Debug, Clone, PartialEq, Eq)]

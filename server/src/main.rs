@@ -10,8 +10,9 @@ use std::process::ExitCode;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use nexus_music_server::keeper::{self, Keeper};
-use nexus_music_server::{copies, health, serve, settings::Settings};
+use nexus_music_server::store::keeper::{self, Keeper};
+use nexus_music_server::store::copies;
+use nexus_music_server::{health, serve, settings::Settings};
 
 /// Milliseconds on this machine's clock. (Before 1970 is 0: every decision is made at the later
 /// of this and the latest time the backend has acted at.)

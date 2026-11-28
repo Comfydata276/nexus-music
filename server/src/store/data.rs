@@ -32,7 +32,7 @@ use nexus_core::nexus::kept::{Fingerprint, Rows, SECRET_BYTES, Scope, Session};
 use nexus_core::nexus::proto::BackendId;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
-use crate::crash;
+use crate::store::crash;
 
 /// The file's name inside `NEXUS_DATA`.
 pub const FILE: &str = "nexus.db";
@@ -275,7 +275,7 @@ impl Data {
 
     /// Copies the data first (11.2), then changes its form in one step.
     fn migrate(&mut self, folder: &Path, form: i64, known: &[Migration], now: u64) -> Result<(), String> {
-        let copy = crate::copies::before_form(folder, &self.connection, form, now)?;
+        let copy = crate::store::copies::before_form(folder, &self.connection, form, now)?;
         let what = format!("The data at {}", self.path.display());
         let changed = (|| -> rusqlite::Result<()> {
             let step = self.connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;

@@ -10,9 +10,10 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use nexus_core::nexus::kept::{Access, Denied, Device, Fingerprint, Purpose, SECRET_BYTES, Turn};
-use nexus_music_server::data::{self, Data, Migration, Opened};
-use nexus_music_server::keeper::{self, Failed, Keeper, Started};
-use nexus_music_server::{apart, copies, crash, identity};
+use nexus_music_server::identity;
+use nexus_music_server::store::data::{self, Data, Migration, Opened};
+use nexus_music_server::store::keeper::{self, Failed, Keeper, Started};
+use nexus_music_server::store::{apart, copies, crash};
 
 /// A made-up time, in milliseconds.
 const T0: u64 = 1_800_000_000_000;

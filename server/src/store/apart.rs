@@ -24,7 +24,7 @@ use nexus_core::nexus::kept::{Family, Permit, SECRET_BYTES, StampKey};
 use nexus_core::nexus::proto::BackendId;
 use sha2::{Digest, Sha256};
 
-use crate::crash;
+use crate::store::crash;
 
 /// The file's name inside `NEXUS_STATE`.
 pub const FILE: &str = "kept";

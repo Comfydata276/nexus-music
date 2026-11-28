@@ -19,8 +19,8 @@ use std::time::Duration;
 use rusqlite::Connection;
 use rusqlite::backup::{Backup, StepResult};
 
-use crate::crash;
-use crate::data::{self, why};
+use crate::store::crash;
+use crate::store::data::{self, why};
 
 /// The folder's name inside `NEXUS_DATA`.
 pub const FOLDER: &str = "copies";
