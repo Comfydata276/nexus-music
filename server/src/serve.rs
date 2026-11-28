@@ -175,7 +175,7 @@ impl Shell {
     }
 }
 
-/// What answers, once a request is through every bound: `hello` alone. Every other path and
+/// What answers, once a request is through every bound. Every other path and
 /// method was refused before this ([`head::ROUTES`]).
 pub fn router(hello: &Hello) -> Router {
     let body = Bytes::from(hello.to_json());
@@ -187,6 +187,8 @@ pub fn router(hello: &Hello) -> Router {
                 async move { ([(CONTENT_TYPE, "application/json")], body) }
             }),
         )
+        .route(crate::admin::PAGE, get(crate::admin::document))
+        .route(crate::admin::SIGN_IN, axum::routing::post(crate::admin::signin))
         .fallback(|| async { StatusCode::NOT_FOUND })
 }
 
