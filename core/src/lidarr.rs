@@ -848,13 +848,19 @@ impl Lidarr {
         record["monitorNewItems"] = "all".into();
         let _: serde_json::Value = self.send("PUT", &format!("artist/{known}"), Some(record))?;
         let albums: Vec<AlbumRes> = self.get(&format!("album?artistId={known}"))?;
+        let already_on_list: HashSet<_> = albums.iter()
+            .filter(|album| album.monitored || album.statistics.track_file_count != 0)
+            .map(|album| album.foreign_album_id.clone())
+            .collect();
         let selected: Vec<_> = albums.into_iter()
             .filter(|album| !album.monitored && album.statistics.track_file_count == 0)
             .collect();
         let wanted: Vec<_> = selected.iter().map(|album| album.id).collect();
         let mut seen = HashSet::new();
         let newly_marked = selected.into_iter().filter_map(|album| {
-            if album.id <= 0 || album.foreign_album_id.is_empty() || !seen.insert(album.foreign_album_id.clone()) {
+            if album.id <= 0 || album.foreign_album_id.is_empty() || already_on_list.contains(&album.foreign_album_id)
+                || !seen.insert(album.foreign_album_id.clone())
+            {
                 return None;
             }
             let number = album.id;
@@ -1421,6 +1427,68 @@ impl BulkLidarr for Lidarr {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn add_artist_journals_only_the_exact_new_releases_before_the_album_write() {
+        use crate::http::Response;
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct Journal(Mutex<Option<AddedArtist>>);
+        impl WayBack for Journal {
+            fn turn(&self) -> Box<dyn Turn + '_> { Box::new(()) }
+            fn keep(&self, _: &str, _: i64, _: &str) -> Result<bool, String> { Ok(true) }
+            fn put_back(&self, _: &str, _: i64, _: &str) {}
+            fn before_artist_albums(&self, added: &AddedArtist) -> Result<(), String> {
+                *self.0.lock().unwrap() = Some(added.clone());
+                Ok(())
+            }
+        }
+
+        struct Direct {
+            journal: Arc<Journal>,
+            paths: Mutex<Vec<String>>,
+        }
+
+        impl Http for Direct {
+            fn send(&self, request: &Request) -> Result<Response, Failure> {
+                let path = request.url.strip_prefix("http://lidarr.test/api/v1/").unwrap();
+                self.paths.lock().unwrap().push(path.into());
+                let response = match (path, request.method) {
+                    ("artist", Method::Get) => r#"[{"id":1,"foreignArtistId":"artist1"}]"#,
+                    ("artist/1", Method::Get | Method::Put(_)) => "{}",
+                    ("album?artistId=1", Method::Get) => r#"[
+                        {"id":5,"foreignAlbumId":"release-old","monitored":true},
+                        {"id":6,"foreignAlbumId":"release-held","statistics":{"trackFileCount":2}},
+                        {"id":7,"foreignAlbumId":"release-new","title":"At Dawn","albumType":"Album"},
+                        {"id":8,"foreignAlbumId":"release-old"},
+                        {"id":9,"foreignAlbumId":"release-new"}
+                    ]"#,
+                    ("album/monitor", Method::Put(body)) => {
+                        let saved = self.journal.0.lock().unwrap();
+                        let marked = &saved.as_ref().unwrap().newly_marked;
+                        assert_eq!(marked.iter().map(|row| row.offer.album.as_str()).collect::<Vec<_>>(), ["release-new"]);
+                        assert_eq!(serde_json::from_str::<serde_json::Value>(body).unwrap(),
+                            serde_json::json!({ "albumIds": [7, 8, 9], "monitored": true }));
+                        "{}"
+                    }
+                    ("command", Method::Post(_)) => "{}",
+                    _ => panic!("unexpected Lidarr call"),
+                };
+                Ok(Response::new(200, Vec::new(), move || Ok(response.into())))
+            }
+        }
+
+        let journal = Arc::new(Journal::default());
+        let http = Arc::new(Direct { journal: journal.clone(), paths: Mutex::default() });
+        let lidarr = Lidarr::new("http://lidarr.test", "key", None, http.clone());
+        let result = lidarr.add_artist("artist1", "Marrow Lake", journal.as_ref()).unwrap();
+        assert_eq!(Some(&result), journal.0.lock().unwrap().as_ref());
+        assert!(!result.learning);
+        let [row] = result.newly_marked.as_slice() else { panic!("expected one release") };
+        assert_eq!((row.number, row.offer.artist_id.as_str(), row.offer.artist.as_str()), (7, "artist1", "Marrow Lake"));
+        assert_eq!(*http.paths.lock().unwrap(), ["artist", "artist/1", "artist/1", "album?artistId=1", "album/monitor", "command"]);
+    }
 
     #[test]
     fn an_address_submitted_unchanged_is_judged_as_saved() {

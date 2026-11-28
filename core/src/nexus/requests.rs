@@ -417,9 +417,10 @@ pub struct BatchLine {
 }
 
 impl BatchLine {
-    /// Call once on the submitting device for NeedsResolution. Record the
-    /// result by job and original line before sending it. On a lost response,
-    /// resend that result instead of asking MusicBrainz again.
+    /// For NeedsResolution, the submitting device records that the lookup
+    /// started under this job and line before calling once. Save its result
+    /// before sending. If interrupted before the result was saved, submit None.
+    /// On a lost response resend the saved result without another lookup.
     pub fn resolve_on_device(&self, musicbrainz: &MusicBrainz, singles: bool) -> Result<Option<MusicBrainzId>, String> {
         musicbrainz.release_with(&self.artist, &self.song, &self.album, singles)?
             .map(|release| MusicBrainzId::try_from(release).map_err(|error| error.to_string())).transpose()
@@ -454,7 +455,9 @@ pub enum BatchResolutionWrite {
 }
 
 /// Save a first answer durably before retrying the exact Lidarr lookup.
-/// Keep the saved answer even after the line becomes terminal.
+/// Keep the saved answer even after the line becomes terminal. Check the
+/// submitting session before accepting it. Record that the retry has started
+/// before calling Lidarr. After a cut with no verdict, fail the line closed.
 pub fn check_batch_resolution(
     state: BatchResolutionState<'_>,
     release: Option<&MusicBrainzId>,
@@ -2801,6 +2804,16 @@ mod tests {
             progress: BatchLineProgress::Failed { reason: Refusal::NotDealtWith, album: Some(batch_album()) },
         }));
         assert_eq!(readback.work_prepared(&lidarr, &|_| {}), Ok(()));
+
+        let confirmed = bulk::Job::new(Disk::default());
+        assert!(confirmed.load(&bytes));
+        confirmed.reconcile_indexed(0, true).unwrap();
+        let projected = confirmed.indexed_lines().unwrap().iter().map(BatchLineView::from_indexed).collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(projected, [0, 1].map(|index| BatchLineView {
+            index,
+            progress: BatchLineProgress::Done { album: batch_album() },
+        }));
+        assert_eq!(confirmed.work_prepared(&lidarr, &|_| {}), Ok(()));
     }
 
     #[test]
