@@ -23,7 +23,11 @@ pub const FORCE_OUT: &str = "/nexus/api/force-out";
 pub const CHANGE_PASSWORD: &str = "/nexus/api/change-password";
 pub const MUSIC_LOGIN: &str = "/nexus/api/music-login";
 pub const GRANT: &str = "/nexus/api/grant";
-pub const PATHS: &[&str] = &[SIGN_IN, SIGN_OUT, LIST_DEVICES, FORCE_OUT, CHANGE_PASSWORD, MUSIC_LOGIN, GRANT];
+/// Self-service listening-data deletion, implemented by S12.
+pub const DELETE_LISTENING_DATA: &str = "/nexus/api/delete-listening-data";
+pub const PATHS: &[&str] = &[
+    SIGN_IN, SIGN_OUT, LIST_DEVICES, FORCE_OUT, CHANGE_PASSWORD, MUSIC_LOGIN, GRANT, DELETE_LISTENING_DATA,
+];
 
 pub const EMAIL_MAX_BYTES: usize = 254;
 pub const PASSWORD_MIN_CHARS: usize = 15;
@@ -133,11 +137,26 @@ fn same_bytes<N: ArraySize>(left: &[u8], right: &[u8]) -> bool {
 }
 
 impl Password {
+    /// Construct a new password to be set. The server also checks allowed_for.
     pub fn new(text: &str) -> Option<Self> {
-        if text.len() > PASSWORD_MAX_BYTES || !(PASSWORD_MIN_CHARS..=PASSWORD_MAX_CHARS).contains(&text.chars().count()) {
+        let password = Self::presented(text)?;
+        password.meets_new_minimum().then_some(password)
+    }
+
+    /// A password offered for a check may be short, including one UTF-8 byte.
+    pub fn presented(text: &str) -> Option<Self> {
+        if text.is_empty() || text.len() > PASSWORD_MAX_BYTES || text.chars().count() > PASSWORD_MAX_CHARS {
             return None;
         }
         Some(Self { bytes: padded(text), len: text.len() })
+    }
+
+    fn meets_new_minimum(&self) -> bool {
+        self.expose().chars().count() >= PASSWORD_MIN_CHARS
+    }
+
+    fn check_new_length(&self) -> Result<(), BadMessage> {
+        self.meets_new_minimum().then_some(()).ok_or(BadMessage::Form)
     }
 
     pub fn expose(&self) -> &str {
@@ -147,6 +166,9 @@ impl Password {
     /// The backend hands in its common-password list, one UTF-8 password per line.
     /// Check with the account's own email before accepting a new password.
     pub fn allowed_for(&self, email: &Email, common_passwords: &str) -> bool {
+        if !self.meets_new_minimum() {
+            return false;
+        }
         // the design does not say how variations are treated. Reject case and outer
         // whitespace variations of the email and list entries. Keep the actual password exact.
         fn folded(text: &str) -> Zeroizing<[u8; PASSWORD_MAX_BYTES]> {
@@ -558,6 +580,12 @@ object! {
         // Null means the app has none. A number is checked by the server.
         restore: Option<u64>,
     }
+    check(value) {
+        match &value.credential {
+            Credential::Code { new_password, .. } => new_password.check_new_length(),
+            Credential::Password { .. } => Ok(()),
+        }
+    }
 }
 
 object! { Person { id: AccountId, revision: u64, email: Email, name: Name, admin: bool } }
@@ -663,14 +691,15 @@ object! { ForceOut { head: RequestHead, device: DeviceId, session: SessionId } }
 object! { GetMusicLogin { head: RequestHead } }
 
 object! {
+    /// §8.9. Proving the present password is the grant for this call. The server
+    /// issues and consumes it within the change; there is no separately issued grant.
     ChangePassword {
         head: RequestHead,
         request_id: RequestId,
-        // §8.9 keeps this one call. The server proves the current password and
-        // consumes its exact change grant when accepting the new one.
         current_password: Password,
         new_password: Password,
     }
+    check(value) { value.new_password.check_new_length() }
 }
 
 object! {
@@ -725,9 +754,14 @@ object! { PasswordChanged {} }
 #[derive(Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GrantChange {
-    ChangePassword { account: AccountId },
-    DeleteListeningData { account: AccountId },
+    DeleteListeningData { account: AccountId, target_revision: u64, request_id: RequestId },
 }
+
+object! { DeleteListeningDataTarget { account: AccountId, target_revision: u64 } }
+
+/// S12 consumes this grant at DELETE_LISTENING_DATA. The outer request number
+/// is the same number sent in the named grant request.
+pub type DeleteListeningData = GrantedChange<DeleteListeningDataTarget>;
 
 // the design does not say how grants travel. Return a separate opaque secret,
 // then send it with the exact named change. Its session and revision are checked by kept.
@@ -886,7 +920,7 @@ macro_rules! text_value {
 
 text_value!(Email, Email::new);
 text_value!(Name, Name::new);
-text_value!(Password, Password::new);
+text_value!(Password, Password::presented);
 text_value!(OneTimeCode, OneTimeCode::new);
 text_value!(MusicAddress, MusicAddress::new);
 text_value!(Notice, Notice::new);
@@ -941,11 +975,13 @@ impl wire::Value for MusicLoginResult {
 
 impl wire::Value for GrantChange {
     fn read(raw: &RawValue) -> Result<Self, BadMessage> {
-        match Fields::read(raw)?.select(&["change_password", "delete_listening_data"])? {
-            ("change_password", raw) => Ok(Self::ChangePassword { account: Fields::read(raw)?.get("account")? }),
-            ("delete_listening_data", raw) => Ok(Self::DeleteListeningData { account: Fields::read(raw)?.get("account")? }),
-            _ => Err(BadMessage::Form),
-        }
+        let (_, raw) = Fields::read(raw)?.select(&["delete_listening_data"])?;
+        let fields = Fields::read(raw)?;
+        Ok(Self::DeleteListeningData {
+            account: fields.get("account")?,
+            target_revision: fields.get("target_revision")?,
+            request_id: fields.get("request_id")?,
+        })
     }
 }
 
@@ -1026,6 +1062,7 @@ impl wire::Value for Refusal {
 
 pub(crate) trait ReplyResult: wire::Value + Serialize {
     const MAX_DONE_BYTES: usize = SMALL_REPLY_MAX_BYTES;
+    const REFUSAL_RECEIPT: bool = true;
 
     fn agrees(&self, _: &Receipt) -> bool {
         true
@@ -1052,6 +1089,7 @@ impl ReplyResult for MusicLoginResult {
 
 impl ReplyResult for SignedIn {
     const MAX_DONE_BYTES: usize = SIGN_IN_REPLY_MAX_BYTES;
+    const REFUSAL_RECEIPT: bool = false;
 
     fn agrees(&self, receipt: &Receipt) -> bool {
         self.person.id == receipt.stamp.account
@@ -1070,7 +1108,7 @@ impl<T: ReplyResult> wire::Value for Reply<T> {
                 Ok(Self::Done { result: fields.get("result")?, receipt: fields.get("receipt")? })
             }
             ("refused", raw) => Ok(Self::Refused(Refusal::read(raw)?)),
-            ("refused_with_receipt", raw) => {
+            ("refused_with_receipt", raw) if T::REFUSAL_RECEIPT => {
                 let fields = Fields::read(raw)?;
                 RefusedWithReceipt::new(fields.get("reason")?, fields.get("receipt")?)
                     .map(Self::RefusedWithReceipt).ok_or(BadMessage::Form)
@@ -1080,12 +1118,11 @@ impl<T: ReplyResult> wire::Value for Reply<T> {
     }
 
     fn check(&self) -> Result<(), BadMessage> {
-        if let Self::Done { result, receipt } = self {
-            if !result.agrees(receipt) {
-                return Err(BadMessage::Form);
-            }
+        match self {
+            Self::Done { result, receipt } if !result.agrees(receipt) => Err(BadMessage::Form),
+            Self::RefusedWithReceipt(_) if !T::REFUSAL_RECEIPT => Err(BadMessage::Form),
+            _ => Ok(()),
         }
-        Ok(())
     }
 }
 
