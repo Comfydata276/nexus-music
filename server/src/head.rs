@@ -14,7 +14,7 @@
 //! request and closes the connection.
 
 use axum::http::StatusCode;
-use nexus_core::nexus::{account, proto};
+use nexus_core::nexus::{account, admin, proto};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::bounds::{BODY_MAX_BYTES, HEAD_MAX_BYTES, HEAD_MAX_HEADERS};
@@ -168,6 +168,12 @@ pub const ROUTES: &[Route] = &[
     Route::new(account::LIST_DEVICES, "POST", account::SMALL_REQUEST_MAX_BYTES),
     Route::new(account::FORCE_OUT, "POST", account::SMALL_REQUEST_MAX_BYTES),
     Route::new(account::MUSIC_LOGIN, "POST", account::SMALL_REQUEST_MAX_BYTES),
+    // The admin's calls of S9: the two that carry a password at 4 KiB, the address at the grant
+    // envelope's own ceiling, the read small.
+    Route::new(admin::REQUEST_GRANT, "POST", account::PASSWORD_REQUEST_MAX_BYTES),
+    Route::new(admin::SET_MUSIC_LOGIN, "POST", account::PASSWORD_REQUEST_MAX_BYTES),
+    Route::new(admin::SET_MUSIC_SERVER, "POST", account::GRANTED_CHANGE_MAX_BYTES),
+    Route::new(admin::GET_MUSIC_SERVER, "POST", account::SMALL_REQUEST_MAX_BYTES),
 ];
 
 /// Whether the proxy marked the request as having come to it by HTTPS (design 6.2:

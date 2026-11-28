@@ -37,6 +37,12 @@ pub struct Made {
 impl Bench {
     /// A backend set up, with `accounts` made (email, admin), each with a live code.
     pub fn new(name: &str, accounts: &[(&'static str, bool)]) -> (Bench, Vec<Made>) {
+        let client = crate::music::MusicClient::trusting(tokio_rustls::rustls::RootCertStore::empty());
+        Bench::with_music(name, accounts, super::music::MusicSide { client, internal: "http://127.0.0.1:9".into() })
+    }
+
+    /// The same, reaching the music server with `music`.
+    pub fn with_music(name: &str, accounts: &[(&'static str, bool)], music: super::music::MusicSide) -> (Bench, Vec<Made>) {
         let root = std::env::temp_dir().join(format!("nexus-bench-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("data")).unwrap();
@@ -64,6 +70,7 @@ impl Bench {
             clock: Arc::new(move || read.load(Ordering::SeqCst)),
             backend,
             seen: Arc::default(),
+            music,
         });
         let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
         (Bench { accounts, now, runtime, root }, made)

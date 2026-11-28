@@ -14,6 +14,7 @@ use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, Response, StatusCode};
 use axum::routing::post;
 use nexus_core::nexus::account::{self, ChangePassword, ForceOut, GetMusicLogin, ListDevices, NotSignedIn, Refusal, SignIn, SignOut};
+use nexus_core::nexus::admin::{self, GetMusicServer, RequestGrant, SetMusicLogin, SetMusicServer};
 use zeroize::Zeroize;
 
 use super::session::{Accounts, Answer, refused};
@@ -41,6 +42,10 @@ pub fn router(base: Router, accounts: Arc<Accounts>, public_origin: Option<Arc<s
         .route(account::FORCE_OUT, post(force_out))
         .route(account::CHANGE_PASSWORD, post(change_password))
         .route(account::MUSIC_LOGIN, post(music_login))
+        .route(admin::REQUEST_GRANT, post(admin_grant))
+        .route(admin::SET_MUSIC_LOGIN, post(set_music_login))
+        .route(admin::SET_MUSIC_SERVER, post(set_music_server))
+        .route(admin::GET_MUSIC_SERVER, post(get_music_server))
         .with_state(Calls { accounts, public_origin });
     base.merge(calls)
 }
@@ -146,8 +151,36 @@ async fn music_login(State(calls): State<Calls>, headers: HeaderMap, body: Bytes
     }
     let accounts = &calls.accounts;
     let Some(session) = bearer(&headers) else { return ended() };
+    let page = crate::admin::is_browser(&headers);
     match read(body, account::read::<GetMusicLogin>) {
-        Ok(request) => respond(accounts.music_login(session, request.head).await),
+        Ok(request) => respond(accounts.music_login(session, request.head, page).await),
         Err(answer) => respond(answer),
     }
 }
+
+/// The admin's calls of S9 (9.3, 8.8): a grant for one change; a person's music login set; the
+/// address people use set; the two addresses read. Each with a session, from the page or not:
+/// the grant is what makes a change allowed, not the page. Refusals are `nexus::admin`'s.
+macro_rules! admin_call {
+    ($name:ident, $shape:ty, $method:ident) => {
+        async fn $name(State(calls): State<Calls>, headers: HeaderMap, body: Bytes) -> Response<Body> {
+            if from_a_browser_not_the_page(&calls, &headers) {
+                let _ = read(body, |_| Ok(()));
+                return respond(super::music::refused(admin::Refusal::Malformed));
+            }
+            let Some(session) = bearer(&headers) else {
+                let _ = read(body, |_| Ok(()));
+                return respond(super::music::refused(admin::Refusal::NotSignedIn(NotSignedIn::SessionEnded)));
+            };
+            match read(body, admin::read::<$shape>) {
+                Ok(request) => respond(calls.accounts.$method(session, request).await),
+                Err(_) => respond(super::music::refused(admin::Refusal::Malformed)),
+            }
+        }
+    };
+}
+
+admin_call!(admin_grant, RequestGrant, admin_grant);
+admin_call!(set_music_login, SetMusicLogin, set_music_login);
+admin_call!(set_music_server, SetMusicServer, set_music_server);
+admin_call!(get_music_server, GetMusicServer, get_music_server);

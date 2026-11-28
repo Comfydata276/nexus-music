@@ -16,7 +16,9 @@ use std::sync::Arc;
 
 use nexus_music_server::accounts::check::PasswordWorkers;
 use nexus_music_server::accounts::desk::Desk;
+use nexus_music_server::accounts::music::MusicSide;
 use nexus_music_server::accounts::session::{Accounts, Seen};
+use nexus_music_server::music::MusicClient;
 use nexus_music_server::accounts::{rows, setup};
 use nexus_music_server::store::keeper::{self, Keeper};
 use nexus_music_server::store::copies;
@@ -183,7 +185,14 @@ fn run(settings: Settings) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let accounts = Arc::new(Accounts { desk, workers, set_up_code, clock: Arc::new(now), backend: id, seen });
+    // 9.3: the music server's client, trusting this machine's certificates for the address
+    // people use (by HTTPS); the container's own address is the setting alone.
+    let (client, roots) = MusicClient::from_this_machine();
+    if roots == 0 {
+        println!("No trusted certificates were found on this machine: the address people use for the music server cannot be checked by HTTPS, so no music login can be set.");
+    }
+    let music = MusicSide { client, internal: settings.music_server.clone() };
+    let accounts = Arc::new(Accounts { desk, workers, set_up_code, clock: Arc::new(now), backend: id, seen, music });
     nightly(settings.data.clone());
     let runtime = match tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build() {
         Ok(runtime) => runtime,

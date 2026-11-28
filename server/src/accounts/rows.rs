@@ -136,3 +136,31 @@ pub fn device_secrets(data: &Connection) -> rusqlite::Result<Vec<[u8; 32]>> {
     let found = statement.query_map([], |row| bytes32(row, 0))?.collect();
     found
 }
+
+/// An account's music login as the data keeps it (S9; the form is S3b's `music_logins`): the
+/// sealed password with what it was sealed for, and the internal address it was checked at.
+/// `None` when the data has none, or what it has is not a login's shape (then nothing opens).
+pub fn music_login(data: &Connection, backend: nexus_core::nexus::proto::BackendId, account: u64) -> rusqlite::Result<Option<(nexus_core::nexus::music::MusicInstallation, String)>> {
+    use nexus_core::nexus::account::{AccountId, MusicAddress};
+    use nexus_core::nexus::music::{CredentialBinding, MusicInstallation, SealedCredential};
+    let found = data
+        .query_row("SELECT count, address, name, sealed, internal FROM music_logins WHERE account = ?1", [signed(account)?], |row| {
+            Ok((unsigned(row.get(0)?)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Vec<u8>>(3)?, row.get::<_, String>(4)?))
+        })
+        .optional()?;
+    Ok(found.and_then(|(count, address, name, sealed, internal)| {
+        let binding = CredentialBinding { backend, account: AccountId::new(account)?, address: MusicAddress::new(&address)?, name: Name::new(&name)?, count };
+        Some((MusicInstallation { binding, sealed: SealedCredential::from_bytes(&sealed)? }, internal))
+    }))
+}
+
+/// The address people reach the music server at, as the admin set it (`meta.music_public`).
+pub fn music_public(data: &Connection) -> rusqlite::Result<Option<nexus_core::nexus::account::MusicAddress>> {
+    let text: Option<String> = data.query_row("SELECT music_public FROM meta WHERE one = 1", [], |row| row.get(0))?;
+    Ok(text.and_then(|text| nexus_core::nexus::account::MusicAddress::new(&text)))
+}
+
+/// Whether the data has an account numbered `account`.
+pub fn account_exists(data: &Connection, account: u64) -> rusqlite::Result<bool> {
+    data.query_row("SELECT count(*) FROM accounts WHERE number = ?1", [signed(account)?], |row| row.get::<_, i64>(0)).map(|n| n > 0)
+}

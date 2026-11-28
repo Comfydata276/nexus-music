@@ -53,6 +53,8 @@ pub struct Accounts {
     /// The devices this backend has seen, by their secret's fingerprint: which lane of the line
     /// a sign-in's first step waits in (the review of S8, C1).
     pub seen: Arc<Seen>,
+    /// The music server as the backend reaches it (S9).
+    pub music: super::music::MusicSide,
 }
 
 /// The fingerprints of every device secret the data has had a device for, read at the start and
@@ -142,7 +144,7 @@ fn said(denied: Denied) -> Refusal {
 
 /// CARRIED (asked of C7: a `Speaks` that says whether two meet). The caller and this backend
 /// meet when they have a number in common.
-fn speaks_with(caller: &Speaks) -> bool {
+pub(crate) fn speaks_with(caller: &Speaks) -> bool {
     caller.low() <= SPEAKS.high() && SPEAKS.low() <= caller.high()
 }
 
@@ -287,6 +289,7 @@ impl Accounts {
         // (3) On the thread that writes: the sign-in, made in the one step that looks again.
         let clock = self.clock.clone();
         let seen = self.seen.clone();
+        let internal = self.music.internal.clone();
         self.desk
             .ask(move |keeper| {
                 let now = clock();
@@ -295,7 +298,7 @@ impl Accounts {
                 if let Some(replacement) = replacement {
                     extra_passwords.push(replacement);
                 }
-                finish_sign_in(keeper, &seen, prepared.number, prepared.device, &secret, &described, &extra_passwords, now, |turn, fresh, previous| turn.sign_in(receipt, fresh, previous))
+                finish_sign_in(keeper, &seen, &internal, prepared.number, prepared.device, &secret, &described, &extra_passwords, now, |turn, fresh, previous| turn.sign_in(receipt, fresh, previous))
             })
             .await?
     }
@@ -349,6 +352,7 @@ impl Accounts {
         let stored = self.workers.fingerprint(&email, PasswordDoor::RedeemedCode, None, new_password).await?;
         let clock = self.clock.clone();
         let seen = self.seen.clone();
+        let internal = self.music.internal.clone();
         // (3) On the thread that writes: the receipt taken at (1) consumed against the account
         // loaded afresh, and the code spent, in the one step.
         self.desk
@@ -356,7 +360,7 @@ impl Accounts {
                 let now = clock();
                 let receipt = check.check(print, keeper.clock(now)).map_err(said)?;
                 let verifier = Fingerprint::from_bytes(stored.hash);
-                finish_sign_in(keeper, &seen, number, device, &secret, &described, std::slice::from_ref(&stored), now, |turn, fresh, previous| {
+                finish_sign_in(keeper, &seen, &internal, number, device, &secret, &described, std::slice::from_ref(&stored), now, |turn, fresh, previous| {
                     turn.redeem_code(receipt, verifier, fresh, previous)
                 })
             })
@@ -448,17 +452,20 @@ impl Accounts {
         flatten(done)
     }
 
-    /// 9.4: the music login for this device, or why there is none. Until S9, there is none.
-    pub async fn music_login(&self, bearer: account::Session, head: RequestHead) -> Answer {
+    /// 9.4: the music login for this device, a salt made now and its token, or why there is
+    /// none. `page`: the call came from the admin's page, which is never handed one (7.3).
+    pub async fn music_login(&self, bearer: account::Session, head: RequestHead, page: bool) -> Answer {
         let clock = self.clock.clone();
+        let internal = self.music.internal.clone();
         let done = self
             .desk
             .ask(move |keeper| -> Result<Answer, Refusal> {
                 let now = clock();
                 let hash = Fingerprint::of(bearer.expose_bytes());
-                let (_, _, account) = arrived(keeper, &head, &hash, Access::Read, now)?;
+                let (number, _, account) = arrived(keeper, &head, &hash, Access::Read, now)?;
+                let result = if page { MusicLoginResult::NoneSetYet } else { super::music::hand(keeper, number, account.state(), &internal) };
                 let receipt = receipt(keeper, account.state())?;
-                Ok(answer!(Reply::Done { result: MusicLoginResult::NoneSetYet, receipt }))
+                Ok(answer!(Reply::Done { result, receipt }))
             })
             .await;
         flatten(done)
@@ -616,6 +623,7 @@ fn by_note(keeper: &mut Keeper, head: &RequestHead, note: SignOutNote, now: u64)
 fn finish_sign_in(
     keeper: &mut Keeper,
     seen: &Seen,
+    internal: &str,
     number: u64,
     device: DeviceId,
     secret: &DeviceSecret,
@@ -665,9 +673,9 @@ fn finish_sign_in(
         person: Person { id: AccountId::new(number).ok_or(Refusal::NotDealtWith)?, revision: state.revision, email: state.email.clone(), name, admin: state.admin },
         device,
         restore: keeper.restore(),
-        // Until S9 there is never a music login to hand out (the slice notes, S8); and the
-        // admin's page is never handed one (S10a's ask; 7.3, no secret in the page).
-        music: MusicLoginResult::NoneSetYet,
+        // 9.4: a salt made now and its token, or why not. The admin's page is never handed one
+        // (7.3: no secret in the page).
+        music: if described.page { MusicLoginResult::NoneSetYet } else { super::music::hand(keeper, number, &state, internal) },
         notice: Notice::new(RECORDED).ok_or(Refusal::NotDealtWith)?,
     };
     let receipt = receipt(keeper, &state)?;
