@@ -164,3 +164,17 @@ pub fn music_public(data: &Connection) -> rusqlite::Result<Option<nexus_core::ne
 pub fn account_exists(data: &Connection, account: u64) -> rusqlite::Result<bool> {
     data.query_row("SELECT count(*) FROM accounts WHERE number = ?1", [signed(account)?], |row| row.get::<_, i64>(0)).map(|n| n > 0)
 }
+
+/// The account with the lowest number, if there is one (the decoy an unknown email's sign-in
+/// does its preparatory work on, 8.3).
+pub fn first_account(data: &Connection) -> rusqlite::Result<Option<u64>> {
+    let first: Option<i64> = data.query_row("SELECT min(number) FROM accounts", [], |row| row.get(0))?;
+    first.map(unsigned).transpose()
+}
+
+/// The admin's Diagnostics default (`meta.diagnostics_default`), if one was set: what `hello`
+/// says a new device does unless told otherwise (design 14.3).
+pub fn diagnostics_default(data: &Connection) -> rusqlite::Result<Option<bool>> {
+    let set: Option<i64> = data.query_row("SELECT diagnostics_default FROM meta WHERE one = 1", [], |row| row.get(0))?;
+    Ok(set.map(|on| on == 1))
+}

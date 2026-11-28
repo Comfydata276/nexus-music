@@ -22,7 +22,7 @@ use nexus_core::nexus::account::{
     Name, NotAllowed, NotSignedIn, Notice, Password, PasswordChanged, PasswordDoor, Person, Receipt, Refusal, Reply, RequestHead, SignIn, SignOut, SignOutNote, SignOutSecret,
     SignedIn, SignedOut, Stamp,
 };
-use nexus_core::nexus::kept::{Access, Account, AccountState, Bearer, Denied, Effects, Fingerprint, FreshSession, GrantIntent, GrantUse, LeaveFor, PasswordCheck, SessionTarget};
+use nexus_core::nexus::kept::{Access, Account, AccountState, Bearer, Denied, Effects, Fingerprint, FreshSession, GrantIntent, GrantUse, LeaveFor, PasswordCheck, SessionKind, SessionTarget};
 use nexus_core::nexus::proto::{BackendId, SPEAKS, Speaks};
 
 use super::check::{Checked, PasswordWorkers};
@@ -142,10 +142,9 @@ fn said(denied: Denied) -> Refusal {
     }
 }
 
-/// CARRIED (asked of C7: a `Speaks` that says whether two meet). The caller and this backend
-/// meet when they have a number in common.
+/// The caller and this backend meet when they have a version in common (section 18; core's).
 pub(crate) fn speaks_with(caller: &Speaks) -> bool {
-    caller.low() <= SPEAKS.high() && SPEAKS.low() <= caller.high()
+    SPEAKS.meets(caller)
 }
 
 fn incompatible() -> Refusal {
@@ -179,6 +178,8 @@ struct Prepared {
     /// The device, if kept says the account knows it (a forced-out one is not, until it signs
     /// in again): the door and its wait are this device's.
     known: Option<DeviceId>,
+    /// Whether the account is an admin's, as it was at this step.
+    admin: bool,
 }
 
 /// What a sign-in leaves to be made and kept, once the password (or code) has been checked.
@@ -207,6 +208,12 @@ struct Described {
 }
 
 impl Described {
+    /// The kind of session a sign-in makes: the admin's page's only on the page's own browser
+    /// sign-in (7.3), never from anything in the request's body.
+    fn kind_of_session(&self) -> SessionKind {
+        if self.page { SessionKind::AdminPage } else { SessionKind::App }
+    }
+
     fn of(sign_in: &SignIn) -> Self {
         let kind = match sign_in.device_kind {
             account::DeviceKind::Pc => "pc",
@@ -250,13 +257,18 @@ impl Accounts {
             .desk
             .ask_in(lane, move |keeper| -> Result<Option<Prepared>, Refusal> {
                 let now = clock();
-                let Some(number) = keeper.account_named(asked.as_str()).map_err(not_dealt_with)? else {
-                    // 8.3: an email with no account does the same work here as one with an
-                    // account: kept's decision keeps the clock (the store kept apart written as
-                    // for any decision), so this keeps it too. Measured without it: 19 ms
-                    // against 42 ms, which told the two apart (A1).
+                // 8.3 (the review of S8, C4): an email with no account does the very same work
+                // here as one with an account, by one path: a real account is loaded in its place
+                // (the first, as a decoy), with its password, its devices and kept's check, and
+                // what kept says to keep is kept but for its rows (the decoy is not changed: only
+                // the clock is, as for any decision). Measured before (S8): an unknown email
+                // about 2.5 ms quicker, the account's load.
+                let named = keeper.account_named(asked.as_str()).map_err(not_dealt_with)?;
+                // Looked up whichever it is, so that both do the same queries.
+                let decoy = rows::first_account(keeper.data().connection()).map_err(not_dealt_with)?;
+                let Some(number) = named.or(decoy) else {
+                    // No account at all (not set up): nothing to tell apart.
                     let effects = Effects { high_water: keeper.clock(now).effective(), updates: Vec::new() };
-                    let _ = keeper.data().password(0);
                     keeper.persist(&effects, &[], now).map_err(not_dealt_with)?;
                     return Ok(None);
                 };
@@ -267,13 +279,24 @@ impl Accounts {
                 let vacant = DeviceId::new(keeper.vacant_device()).ok_or(Refusal::NotDealtWith)?;
                 let print = Fingerprint::of(secret_for_check.expose_bytes());
                 let found = account.rows().devices.iter().find(|(_, row)| row.secret == print).map(|(id, _)| *id);
+                let real = named.is_some();
                 let check = account
                     .sign_in_turn(keeper.clock(now), |turn| turn.check_sign_in(&secret_for_check, vacant, expected))
-                    .apply(|effects| keeper.persist(effects, &[], now))
-                    .map_err(not_dealt_with)?
-                    .map_err(said)?;
+                    .apply(|effects| {
+                        if real {
+                            keeper.persist(effects, &[], now)
+                        } else {
+                            keeper.persist(&Effects { high_water: effects.high_water, updates: Vec::new() }, &[], now)
+                        }
+                    })
+                    .map_err(not_dealt_with)?;
+                if !real {
+                    return Ok(None);
+                }
+                let check = check.map_err(said)?;
                 let device = found.unwrap_or(vacant);
-                Ok(Some(Prepared { number, email: asked, known: check.known_device_id(), check, stored, device }))
+                let admin = account.state().admin;
+                Ok(Some(Prepared { number, email: asked, known: check.known_device_id(), check, stored, device, admin }))
             })
             .await??;
         // (2) On a worker: the slow check, through the door kept's check says (8.3). An email
@@ -284,7 +307,14 @@ impl Accounts {
         };
         let door = PasswordDoor::for_device(prepared.known.is_some());
         let device = prepared.known;
-        let checked = self.workers.check(&prepared.email, door, device, password, prepared.stored).await?;
+        // M2 (the lead's ruling of 14:41): at the admin's page, an account that is not an
+        // admin's is answered as a wrong password, after the same door and the same slow work,
+        // and the wrong try is recorded there as any is: it is checked against no verifier (the
+        // workers' same dummy work, which never matches and records the try). CARRIED until the
+        // workers can record a wrong try kept says (asked of S8b); kept's `sign_in_as` below
+        // still refuses it if the role changes meanwhile.
+        let stored = if described.page && !prepared.admin { None } else { prepared.stored };
+        let checked = self.workers.check(&prepared.email, door, device, password, stored).await?;
         let Checked::Match { derived, replacement } = checked else { return Err(wrong()) };
         // (3) On the thread that writes: the sign-in, made in the one step that looks again.
         let clock = self.clock.clone();
@@ -298,7 +328,8 @@ impl Accounts {
                 if let Some(replacement) = replacement {
                     extra_passwords.push(replacement);
                 }
-                finish_sign_in(keeper, &seen, &internal, prepared.number, prepared.device, &secret, &described, &extra_passwords, now, |turn, fresh, previous| turn.sign_in(receipt, fresh, previous))
+                let kind = described.kind_of_session();
+                finish_sign_in(keeper, &seen, &internal, prepared.number, prepared.device, &secret, &described, &extra_passwords, now, |turn, fresh, previous| turn.sign_in_as(kind, receipt, fresh, previous))
             })
             .await?
     }
@@ -361,7 +392,7 @@ impl Accounts {
                 let receipt = check.check(print, keeper.clock(now)).map_err(said)?;
                 let verifier = Fingerprint::from_bytes(stored.hash);
                 finish_sign_in(keeper, &seen, &internal, number, device, &secret, &described, std::slice::from_ref(&stored), now, |turn, fresh, previous| {
-                    turn.redeem_code(receipt, verifier, fresh, previous)
+                    turn.redeem_code_as(described.kind_of_session(), receipt, verifier, fresh, previous)
                 })
             })
             .await?
@@ -404,7 +435,7 @@ impl Accounts {
             .ask(move |keeper| -> Result<Answer, Refusal> {
                 let now = clock();
                 let hash = Fingerprint::of(bearer.expose_bytes());
-                let (number, device, mut account) = arrived(keeper, &request.head, &hash, Access::Read, now)?;
+                let (number, device, mut account, _) = arrived(keeper, &request.head, &hash, Access::Read, now)?;
                 let (listed, more) = rows::devices(keeper.data().connection(), number, request.after, DEVICES_PER_PAGE).map_err(not_dealt_with)?;
                 let devices = listed
                     .into_iter()
@@ -462,8 +493,10 @@ impl Accounts {
             .ask(move |keeper| -> Result<Answer, Refusal> {
                 let now = clock();
                 let hash = Fingerprint::of(bearer.expose_bytes());
-                let (number, _, account) = arrived(keeper, &head, &hash, Access::Read, now)?;
-                let result = if page { MusicLoginResult::NoneSetYet } else { super::music::hand(keeper, number, account.state(), &internal) };
+                let (number, _, account, kind) = arrived(keeper, &head, &hash, Access::Read, now)?;
+                // Never to the admin's page: by the session's kind (core's), and, stricter, never
+                // to a call that came from a browser at all.
+                let result = if page { MusicLoginResult::NoneSetYet } else { super::music::hand(keeper, number, account.state(), kind, &internal) };
                 let receipt = receipt(keeper, account.state())?;
                 Ok(answer!(Reply::Done { result, receipt }))
             })
@@ -574,15 +607,15 @@ fn signed_in(keeper: &mut Keeper, head: &RequestHead, hash: &Fingerprint) -> Res
 }
 
 /// A call accepted from a session (kept's `arrive`), and what that keeps.
-fn arrived(keeper: &mut Keeper, head: &RequestHead, hash: &Fingerprint, access: Access, now: u64) -> Result<(u64, DeviceId, Account), Refusal> {
+fn arrived(keeper: &mut Keeper, head: &RequestHead, hash: &Fingerprint, access: Access, now: u64) -> Result<(u64, DeviceId, Account, SessionKind), Refusal> {
     let (number, device, mut account) = signed_in(keeper, head, hash)?;
-    account
-        .request(head.restore, keeper.clock(now), |turn| turn.arrive(Bearer { device, hash, grant: None }, access).map(|_| ()))
+    let kind = account
+        .request(head.restore, keeper.clock(now), |turn| turn.arrive(Bearer { device, hash, grant: None }, access).map(|request| request.kind()))
         .apply(|effects| keeper.persist(effects, &[], now))
         .map_err(not_dealt_with)?
         .map_err(said)?;
     heard(keeper, device, now);
-    Ok((number, device, account))
+    Ok((number, device, account, kind))
 }
 
 /// Section 11: the note ends its one session and nothing else, and needs no session (kept's
@@ -633,11 +666,6 @@ fn finish_sign_in(
     step: impl FnOnce(nexus_core::nexus::kept::Turn<'_>, FreshSession, Option<&mut Account>) -> Result<nexus_core::nexus::kept::SessionGrant, Denied>,
 ) -> Result<Answer, Refusal> {
     let mut account = keeper.load(number).map_err(not_dealt_with)?;
-    // CARRIED (asked of C3r): the admin's page signs in an admin's account only (S10a's ask,
-    // 7.3). Said only after the right password, as "switched off" is.
-    if described.page && !account.state().admin {
-        return Err(Refusal::NotAllowed(NotAllowed::Denied));
-    }
     let made = made()?;
     let id = keeper.fresh_session().ok_or(Refusal::NotDealtWith)?;
     let fresh = FreshSession { id, hash: made.hash.clone(), sign_out: Fingerprint::from_bytes(made.revoke) };
@@ -673,9 +701,9 @@ fn finish_sign_in(
         person: Person { id: AccountId::new(number).ok_or(Refusal::NotDealtWith)?, revision: state.revision, email: state.email.clone(), name, admin: state.admin },
         device,
         restore: keeper.restore(),
-        // 9.4: a salt made now and its token, or why not. The admin's page is never handed one
-        // (7.3: no secret in the page).
-        music: if described.page { MusicLoginResult::NoneSetYet } else { super::music::hand(keeper, number, &state, internal) },
+        // 9.4: a salt made now and its token, or why not; never to the admin's page (core's
+        // `hand_out` by the session's kind; 7.3).
+        music: super::music::hand(keeper, number, &state, granted.kind, internal),
         notice: Notice::new(RECORDED).ok_or(Refusal::NotDealtWith)?,
     };
     let receipt = receipt(keeper, &state)?;

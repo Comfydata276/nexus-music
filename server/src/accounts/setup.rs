@@ -20,11 +20,10 @@ use std::sync::Mutex;
 
 use hmac::{Hmac, KeyInit, Mac};
 use nexus_core::nexus::account::{CODE_LIFETIME_MS, Email, OneTimeCode, SECRET_BYTES};
-use nexus_core::nexus::kept::{DataChange, Effects, Fingerprint, LiveCode, Status, Update};
+use nexus_core::nexus::kept::{Fingerprint, Status};
 use sha2::Sha256;
 use zeroize::Zeroizing;
 
-use crate::store::data::Change;
 use crate::store::keeper::{First, Keeper};
 
 /// How long the set-up code is good for, from the start that made it (8.4).
@@ -205,51 +204,26 @@ pub fn recover(keeper: &mut Keeper, email: &str, now: u64) -> Result<Vec<String>
         keeper.make_account(email.as_str(), &default_name(&email), true, First::Code(&print, until), now).map_err(|failed| failed.0)?;
         return Ok(vec!["There was no account with that email: an admin's is made.".into(), said]);
     };
-    owner_reset(keeper, number, &print, until, now)?;
+    owner_reset(keeper, number, &print, now)?;
     Ok(vec!["Every session of that account is ended, its password no longer works, and it is an admin's and switched on.".into(), said])
 }
 
-/// CARRIED (asked of C3r: an owner's recovery decision in `kept`, with no actor). Until it
-/// lands this applies 8.7's row for a reset, the stricter reading, in its order: in the store
-/// first, the revision and the count of passwords move, the new code is the live one and every
-/// device that had a session moves on; then the data: every session goes, the password goes,
-/// the new code's fingerprint is kept; and only then, as the giving it is, the account is
-/// switched on and made an admin's (in the data first, then the store).
-fn owner_reset(keeper: &mut Keeper, number: u64, print: &[u8; 32], until: u64, now: u64) -> Result<(), String> {
-    let account = keeper.load(number).map_err(|failed| failed.0)?;
-    let before = account.apart();
-    if before.account.status == Status::Deleted {
+/// 8.4, 8.7: the owner's recovery, with no actor: kept's `owner_recover` decides it (the
+/// password reset with this new code live, every session ended, the account switched on and an
+/// admin's) and the keeper keeps it in kept's order, the old verifier and every old code going
+/// in the same data step as the sessions. The code's deadline is kept's.
+fn owner_reset(keeper: &mut Keeper, number: u64, print: &[u8; 32], now: u64) -> Result<(), String> {
+    let mut account = keeper.load(number).map_err(|failed| failed.0)?;
+    if account.state().status == Status::Deleted {
         return Err("That account was deleted.".into());
     }
-    let next = |n: u64| n.checked_add(1).ok_or("A count of that account can go no higher.".to_string());
-    let mut first = before.clone();
-    first.account.revision = next(first.account.revision)?;
-    first.account.password_changes = next(first.account.password_changes)?;
-    first.account.password_reset_required = true;
-    first.account.code = Some(LiveCode { number: first.account.password_changes, used: false, expires: until });
-    for device in first.devices.values_mut() {
-        if device.permit.take().is_some() {
-            device.number = next(device.number)?;
-        }
-    }
-    let mut rows = account.rows();
-    rows.account = first.account.clone();
-    rows.account.status = Status::On;
-    rows.account.admin = true;
-    for (id, row) in rows.devices.iter_mut() {
-        if let Some(device) = first.devices.get(id) {
-            row.number = device.number;
-        }
-        row.session = None;
-    }
-    let mut last = first.clone();
-    last.account.status = Status::On;
-    last.account.admin = true;
-    let effects = Effects { high_water: now, updates: vec![Update { apart_first: first, data: rows, change: DataChange::ResetPassword, music: None, apart_last: last }] };
-    let code_number = effects.updates[0].apart_last.account.password_changes;
-    keeper
-        .persist(&effects, &[Change::Code { account: number, number: code_number, code: print, made_at: now, until }], now)
-        .map_err(|failed| failed.0)
+    let clock = keeper.clock(now);
+    account
+        .owner_recover(clock, Fingerprint::from_bytes(*print))
+        .apply(|effects| keeper.persist(effects, &[], now))
+        .map_err(|failed| failed.0)?
+        .map(|_| ())
+        .map_err(|_| "That account cannot be recovered: a count of it can go no higher.".to_string())
 }
 
 /// What the log says at a start while there is no admin (19.4): the set-up code, once.

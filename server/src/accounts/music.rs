@@ -22,7 +22,7 @@
 
 use nexus_core::nexus::account::{self, AccountId, MusicLoginResult, MusicSalt, PasswordDoor, RequestHead, SALT_BYTES};
 use nexus_core::nexus::admin::{self, Applied, Denial, GetMusicServer, InternalAddress, MusicServer, NamedChange, Refusal, Reply, RequestGrant, SetMusicLogin, SetMusicServer};
-use nexus_core::nexus::kept::{AccountState, AdminAction, AdminTarget, Bearer, Denied, Fingerprint, GrantUse, PasswordCheck};
+use nexus_core::nexus::kept::{AccountState, AdminAction, AdminTarget, Bearer, Denied, Fingerprint, GrantUse, PasswordCheck, SessionKind};
 use nexus_core::nexus::music::{self, Checked, CurrentEndpoints, NONCE_BYTES, Outcome, Ping, Provisioning, SealingKey};
 use zeroize::Zeroizing;
 
@@ -130,12 +130,12 @@ fn target(keeper: &mut Keeper, caller: u64, id: AccountId) -> Result<Option<nexu
 /// 9.4: the music login for a device of the account `state` is, or why there is none: a salt
 /// made now and its token, by `music::hand_out`, under the store's count. Called on the thread
 /// that writes, with the account loaded from the store.
-pub fn hand(keeper: &Keeper, number: u64, state: &AccountState, internal: &str) -> MusicLoginResult {
+pub fn hand(keeper: &Keeper, number: u64, state: &AccountState, kind: SessionKind, internal: &str) -> MusicLoginResult {
     let connection = keeper.data().connection();
     let Ok(public) = rows::music_public(connection) else { return MusicLoginResult::UnusableNow };
     let Some(public) = public else {
         // No address people use: there can be no login that was checked at it.
-        return if state.music_login == 0 { MusicLoginResult::NoneSetYet } else { MusicLoginResult::UnusableNow };
+        return if kind == SessionKind::AdminPage || state.music_login == 0 { MusicLoginResult::NoneSetYet } else { MusicLoginResult::UnusableNow };
     };
     let Ok(kept) = rows::music_login(connection, keeper.backend(), number) else { return MusicLoginResult::UnusableNow };
     // CARRIED (asked of core: the internal address in the binding, or given to `hand_out`): a
@@ -144,7 +144,7 @@ pub fn hand(keeper: &Keeper, number: u64, state: &AccountState, internal: &str) 
     let install = kept.filter(|(_, checked_at)| checked_at == internal).map(|(install, _)| install);
     let Some(salt) = random::<SALT_BYTES>() else { return MusicLoginResult::UnusableNow };
     let key = SealingKey::new(keeper.seal_key());
-    music::hand_out(state, install.as_ref(), &key, &public, MusicSalt::from_random(*salt))
+    music::hand_out(state, kind, install.as_ref(), &key, &public, MusicSalt::from_random(*salt))
 }
 
 impl Accounts {

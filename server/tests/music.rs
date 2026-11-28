@@ -597,6 +597,61 @@ fn a_sealed_login_tampered_moved_or_put_back_from_an_older_copy_is_not_handed_ou
     plays(&between, &handed);
 }
 
+/// For the app engineers (W7, P7): gives an account on a RUNNING backend a music login, as the
+/// admin's page will: the admin signs in (a device of its own, "the admin's tool"), sets the
+/// address people use, and sets the login of the account `NEXUS_S9_PERSON` (the admin's own
+/// if not given). Nothing is kept by this test. Run by hand:
+///
+/// `NEXUS_S9_BACKEND=127.0.0.1:4684 NEXUS_S9_ADMIN=you@example.org NEXUS_S9_ADMIN_PASSWORD='…' [NEXUS_S9_ADMIN_CODE=XXXXXX-XXXXXX]
+///  NEXUS_S9_PUBLIC=https://music.example.org:4681 NEXUS_S9_MUSIC_NAME=tester NEXUS_S9_MUSIC_PASSWORD=tester-pass-1
+///  [NEXUS_S9_PERSON=them@example.org NEXUS_S9_PERSON_PASSWORD='…']
+///  cargo test --manifest-path server/Cargo.toml --test music -- --ignored --nocapture set_a_music_login_on_a_running_backend`
+#[test]
+#[ignore = "a tool for a running backend; see its comment"]
+fn set_a_music_login_on_a_running_backend() {
+    let given = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} is not given"));
+    let at: SocketAddr = given("NEXUS_S9_BACKEND").parse().unwrap();
+    assert!(at.ip().is_loopback(), "a backend on this machine only");
+    let backend = Serving { child: None, at, written: String::new() };
+    let admin_email = given("NEXUS_S9_ADMIN");
+    let request = |email: &str, password: &str, device: u8| sign_in(&backend, Credential::Password { email: Email::new(email).unwrap(), password: Password::presented(password).unwrap() }, device);
+    // A code just made by `set-up` or `recover` is redeemed with the password first, if given.
+    if let Ok(code) = std::env::var("NEXUS_S9_ADMIN_CODE") {
+        let code = OneTimeCode::typed(&code).expect("a one-time code");
+        sign_in(&backend, with_code(&code, &given("NEXUS_S9_ADMIN_PASSWORD")), 0xa9);
+    }
+    let signed = request(&admin_email, &given("NEXUS_S9_ADMIN_PASSWORD"), 0xa9);
+    let person = match std::env::var("NEXUS_S9_PERSON") {
+        Ok(email) => request(&email, &given("NEXUS_S9_PERSON_PASSWORD"), 0xaa).person.id,
+        Err(_) => signed.person.id,
+    };
+    // The admin's own password is what the grant asks for again.
+    let admin_password = given("NEXUS_S9_ADMIN_PASSWORD");
+    let mut admin = Admin { backend: &backend, signed, next: now_ms() };
+    let grant = |admin: &mut Admin<'_>, action: Action| {
+        admin.next += 1;
+        let request_id = RequestId::new(admin.next).unwrap();
+        let request = GrantRequest { head: head(admin.signed.restore), change: NamedChange { request_id, action }, password: Password::presented(&admin_password).unwrap() };
+        let (status, body) = backend.post(admin::REQUEST_GRANT, Some(&admin.signed.session), admin::encode(&request).unwrap().bytes());
+        match admin::read_reply::<GrantIssued>(status, &body).unwrap() {
+            admin::Reply::Done(GrantIssued { grant }) => (request_id, grant),
+            other => panic!("no grant: {status} {other:?}"),
+        }
+    };
+    let public = MusicAddress::new(&given("NEXUS_S9_PUBLIC")).expect("the address people use: https://…");
+    let (request_id, secret) = grant(&mut admin, Action::SetMusicServer(public.clone()));
+    let request = GrantedChange { head: head(admin.signed.restore), request_id, change: MusicServerAddress { public }, grant: secret };
+    let (status, body) = backend.post(admin::SET_MUSIC_SERVER, Some(&admin.signed.session), admin::encode(&request).unwrap().bytes());
+    println!("the address people use: {status} {:?}", admin::read_reply::<Applied>(status, &body));
+    let (request_id, secret) = grant(&mut admin, Action::SetMusicLogin(person));
+    let change = TypedMusicLogin { account: person, name: Name::new(&given("NEXUS_S9_MUSIC_NAME")).unwrap(), password: MusicPassword::new(&given("NEXUS_S9_MUSIC_PASSWORD")).unwrap() };
+    let request = GrantedChange { head: head(admin.signed.restore), request_id, change, grant: secret };
+    let (status, body) = backend.post(admin::SET_MUSIC_LOGIN, Some(&admin.signed.session), admin::encode(&request).unwrap().bytes());
+    let reply = admin::read_reply::<Applied>(status, &body);
+    println!("the music login of account {}: {status} {reply:?}", person.get());
+    assert_eq!(status, 200, "403 music_login_refused: the music server said wrong name or password; 503: it could not be reached at one of the two addresses");
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64
 }
