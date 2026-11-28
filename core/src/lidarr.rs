@@ -8,7 +8,7 @@
 //! The rules are here; the connection is the app's (see `http`), and so is what it keeps of
 //! what was offered and which Lidarr is in use.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,6 +27,36 @@ pub struct Lidarr {
     /// The sign-in that sits in front of Lidarr, if there is one and it's been signed in to.
     gate: Option<Arc<dyn SignIn>>,
     http: Arc<dyn Http>,
+}
+
+/// What request pages and discovery ask of Lidarr, either directly or through Nexus.
+pub trait RequestLidarr: Send + Sync {
+    fn find_releases(&self, term: &str) -> Result<(Vec<Offer>, Vec<Single>), String>;
+    fn find_any(&self, term: &str) -> Result<Vec<Offer>, String>;
+    fn find_artists(&self, term: &str) -> Result<Vec<ArtistOffer>, String>;
+    fn tracked(&self) -> Result<HashSet<String>, String>;
+    fn known_artist(&self, artist: &str) -> Result<Option<(i64, String)>, String>;
+    fn releases_of(&self, artist: i64, name: &str) -> Result<Vec<(Offer, bool)>, String>;
+    fn request(&self, wanted: &Offer, way_back: &dyn WayBack) -> Result<(), String>;
+    fn pending(&self) -> Result<Vec<Pending>, String>;
+}
+
+/// What the bulk worker needs in addition to the interactive requests.
+/// The backend owns bulk execution, Lidarr setup and recovery of interrupted changes.
+pub trait BulkLidarr: RequestLidarr {
+    fn pause(&self, wait: Duration) -> Result<(), String>;
+    fn address(&self) -> &str;
+    fn way_back_address(&self) -> String;
+    fn artist_numbers(&self) -> Result<HashMap<String, i64>, String>;
+    fn listed(&self, artist: i64) -> Result<Vec<Listed>, String>;
+    fn busy(&self, artists: &HashSet<i64>) -> Result<(HashSet<i64>, u64), String>;
+    fn busy_with(&self, artists: &HashSet<i64>) -> Result<HashSet<i64>, String>;
+    fn start_listing_singles_kept(&self, artist: i64, wanted: &Offer, way_back: &dyn WayBack) -> Result<Option<(String, bool)>, String>;
+    fn want(&self, artist: i64, albums: &[i64]) -> Result<(), String>;
+    fn setup(&self) -> Result<Setup, String>;
+    fn add_wanting(&self, setup: &mut Setup, wanted: &[Offer]) -> Result<i64, String>;
+    fn unwant(&self, albums: &[i64]) -> Result<(), String>;
+    fn set_new_releases(&self, artist: i64, setting: &str) -> Result<(), String>;
 }
 
 /// The sign-in that can sit in front of Lidarr: it hands out passes to send with requests.
@@ -1222,6 +1252,94 @@ impl Lidarr {
     pub fn cancel(&self, id: i64) -> Result<(), String> {
         self.send::<serde_json::Value>("PUT", "album/monitor", Some(serde_json::json!({ "albumIds": [id], "monitored": false })))
             .map(drop)
+    }
+}
+
+impl RequestLidarr for Lidarr {
+    fn find_releases(&self, term: &str) -> Result<(Vec<Offer>, Vec<Single>), String> {
+        Lidarr::find_releases(self, term)
+    }
+
+    fn find_any(&self, term: &str) -> Result<Vec<Offer>, String> {
+        Lidarr::find_any(self, term)
+    }
+
+    fn find_artists(&self, term: &str) -> Result<Vec<ArtistOffer>, String> {
+        Lidarr::find_artists(self, term)
+    }
+
+    fn tracked(&self) -> Result<HashSet<String>, String> {
+        Lidarr::tracked(self)
+    }
+
+    fn known_artist(&self, artist: &str) -> Result<Option<(i64, String)>, String> {
+        Lidarr::known_artist(self, artist)
+    }
+
+    fn releases_of(&self, artist: i64, name: &str) -> Result<Vec<(Offer, bool)>, String> {
+        Lidarr::releases_of(self, artist, name)
+    }
+
+    fn request(&self, wanted: &Offer, way_back: &dyn WayBack) -> Result<(), String> {
+        Lidarr::request(self, wanted, way_back)
+    }
+
+    fn pending(&self) -> Result<Vec<Pending>, String> {
+        Lidarr::pending(self)
+    }
+}
+
+impl BulkLidarr for Lidarr {
+    fn pause(&self, wait: Duration) -> Result<(), String> {
+        Lidarr::pause(self, wait)
+    }
+
+    fn address(&self) -> &str {
+        Lidarr::address(self)
+    }
+
+    fn way_back_address(&self) -> String {
+        Lidarr::way_back_address(self)
+    }
+
+    fn artist_numbers(&self) -> Result<HashMap<String, i64>, String> {
+        Lidarr::artist_numbers(self)
+    }
+
+    fn listed(&self, artist: i64) -> Result<Vec<Listed>, String> {
+        Lidarr::listed(self, artist)
+    }
+
+    fn busy(&self, artists: &HashSet<i64>) -> Result<(HashSet<i64>, u64), String> {
+        Lidarr::busy(self, artists)
+    }
+
+    fn busy_with(&self, artists: &HashSet<i64>) -> Result<HashSet<i64>, String> {
+        Lidarr::busy_with(self, artists)
+    }
+
+    fn start_listing_singles_kept(&self, artist: i64, wanted: &Offer, way_back: &dyn WayBack) -> Result<Option<(String, bool)>, String> {
+        Lidarr::start_listing_singles_kept(self, artist, wanted, way_back)
+    }
+
+    fn want(&self, artist: i64, albums: &[i64]) -> Result<(), String> {
+        Lidarr::want(self, artist, albums)
+    }
+
+    fn setup(&self) -> Result<Setup, String> {
+        Lidarr::setup(self)
+    }
+
+    fn add_wanting(&self, setup: &mut Setup, wanted: &[Offer]) -> Result<i64, String> {
+        Lidarr::add_wanting(self, setup, wanted)
+    }
+
+    fn unwant(&self, albums: &[i64]) -> Result<(), String> {
+        Lidarr::unwant(self, albums)
+    }
+
+    fn set_new_releases(&self, artist: i64, setting: &str) -> Result<(), String> {
+        Lidarr::set_new_releases(self, artist, setting)
     }
 }
 

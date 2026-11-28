@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::asked::{Asked, Fill};
-use crate::lidarr::{Lidarr, Setup};
+use crate::lidarr::{BulkLidarr, Setup};
 use crate::musicbrainz::MusicBrainz;
 use crate::offer::{Offer, VARIOUS};
 use crate::text::{same_artist, undecorated, words};
@@ -560,7 +560,7 @@ pub fn choose(found: &[Offer], artist: &str, album: &str, singles: bool) -> Opti
 }
 
 /// One question to Lidarr, asked again after a moment if it couldn't be answered.
-fn twice<T>(lidarr: &Lidarr, ask: impl Fn() -> Result<T, String>) -> Result<T, String> {
+fn twice<T>(lidarr: &dyn BulkLidarr, ask: impl Fn() -> Result<T, String>) -> Result<T, String> {
     ask().or_else(|_| {
         lidarr.pause(Duration::from_secs(2))?;
         ask()
@@ -580,7 +580,7 @@ impl Job {
     /// A search of Lidarr's, which it passes on to a service of its own that now and then is
     /// too busy to answer. Lidarr then answers with an error, and is asked again a few times,
     /// further apart. A Lidarr that can't be reached at all isn't waited on like that.
-    fn search(&self, lidarr: &Lidarr, term: &str) -> Result<Vec<Offer>, String> {
+    fn search(&self, lidarr: &dyn BulkLidarr, term: &str) -> Result<Vec<Offer>, String> {
         let mut waits = [2, 6, 15].iter();
         loop {
             match lidarr.find_any(term) {
@@ -596,7 +596,7 @@ impl Job {
 
     /// What a song came out on, according to MusicBrainz, which is asked again after a while if
     /// it's too busy to say. An error if it stayed that way.
-    fn release_of(&self, lidarr: &Lidarr, musicbrainz: &MusicBrainz, want: &Want, song: &str, singles: bool) -> Result<Option<String>, String> {
+    fn release_of(&self, lidarr: &dyn BulkLidarr, musicbrainz: &MusicBrainz, want: &Want, song: &str, singles: bool) -> Result<Option<String>, String> {
         let mut waits = ASK_AGAIN.iter();
         loop {
             match musicbrainz.release_with(&want.artist, song, &want.album, singles) {
@@ -610,7 +610,7 @@ impl Job {
     }
 
     /// Finds an album by the name a playlist gives it, as Lidarr's search answers.
-    fn by_name(&self, lidarr: &Lidarr, want: &Want, singles: bool) -> Result<Option<Offer>, String> {
+    fn by_name(&self, lidarr: &dyn BulkLidarr, want: &Want, singles: bool) -> Result<Option<Offer>, String> {
         let found = self.search(lidarr, &format!("{} {}", want.album, want.artist))?;
         if let Some(offer) = choose(&found, &want.artist, &want.album, singles) {
             return Ok(Some(offer));
@@ -625,7 +625,7 @@ impl Job {
     }
 
     /// Finds what Lidarr calls an album. An error only if Lidarr couldn't be asked.
-    fn find(&self, lidarr: &Lidarr, musicbrainz: &MusicBrainz, want: &Want, singles: bool) -> Result<Lookup, String> {
+    fn find(&self, lidarr: &dyn BulkLidarr, musicbrainz: &MusicBrainz, want: &Want, singles: bool) -> Result<Lookup, String> {
         // Lidarr's search fails outright for some words ("Thriller" is one), whatever else is
         // asked with them. That isn't the end of it: the album can still be found by its songs,
         // and looked up by the name that gives, which is a different question to Lidarr.
@@ -679,7 +679,7 @@ impl Job {
 
     /// Works through the batch, start to end. Takes minutes: Lidarr is seen through every
     /// artist it was given.
-    pub fn work_through(&self, lidarr: &Lidarr, musicbrainz: &MusicBrainz, tell: &Tell) {
+    pub fn work_through(&self, lidarr: &dyn BulkLidarr, musicbrainz: &MusicBrainz, tell: &Tell) {
         tell(Event::Changed);
         let outcome = self.work(lidarr, musicbrainz, tell);
         self.with(|batch| {
@@ -697,7 +697,7 @@ impl Job {
         self.running.store(false, Ordering::SeqCst);
     }
 
-    fn work(&self, lidarr: &Lidarr, musicbrainz: &MusicBrainz, tell: &Tell) -> Result<(), String> {
+    fn work(&self, lidarr: &dyn BulkLidarr, musicbrainz: &MusicBrainz, tell: &Tell) -> Result<(), String> {
         let found = self.find_all(lidarr, musicbrainz, tell);
         let asked = found.and_then(|()| self.ask_all(lidarr, tell));
         if self.stopping() {
@@ -737,7 +737,7 @@ impl Job {
         }
     }
 
-    fn find_all(&self, lidarr: &Lidarr, musicbrainz: &MusicBrainz, tell: &Tell) -> Result<(), String> {
+    fn find_all(&self, lidarr: &dyn BulkLidarr, musicbrainz: &MusicBrainz, tell: &Tell) -> Result<(), String> {
         let todo: Vec<usize> = self.with(|batch| batch.wants.iter().enumerate().filter(|(_, want)| want.state == State::Waiting).map(|(at, _)| at).collect());
         if todo.is_empty() {
             return Ok(());
@@ -820,7 +820,7 @@ impl Job {
         Asked { album: offer.album.clone(), title: offer.title.clone(), artist: offer.artist.clone(), at: self.desk.now(), fills: want.fills.clone(), ..Default::default() }
     }
 
-    fn ask_all(&self, lidarr: &Lidarr, tell: &Tell) -> Result<(), String> {
+    fn ask_all(&self, lidarr: &dyn BulkLidarr, tell: &Tell) -> Result<(), String> {
         // By artist, in the order they come.
         let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
         self.with(|batch| {
@@ -942,7 +942,7 @@ impl Job {
     }
 
     /// Asks for releases of an artist Lidarr already has.
-    fn ask_known(&self, lidarr: &Lidarr, artist: i64, offers: &[Offer]) -> Result<Vec<Went>, String> {
+    fn ask_known(&self, lidarr: &dyn BulkLidarr, artist: i64, offers: &[Offer]) -> Result<Vec<Went>, String> {
         let listed = twice(lidarr, || lidarr.listed(artist))?;
         // Lidarr may be reading the artist in still: their singles, for an earlier go at this,
         // or all of them, if they were added a moment before the app last closed. Then what
@@ -993,7 +993,7 @@ impl Job {
 
     /// Asks for releases of an artist Lidarr doesn't have yet. Returns Lidarr's number for
     /// them, how asking for each release went, and whether Lidarr is to be watched with them.
-    fn ask_new(&self, lidarr: &Lidarr, setup: &mut Option<Setup>, offers: &[Offer]) -> Result<(i64, Vec<Went>, bool), String> {
+    fn ask_new(&self, lidarr: &dyn BulkLidarr, setup: &mut Option<Setup>, offers: &[Offer]) -> Result<(i64, Vec<Went>, bool), String> {
         let proof = self.with(|batch| batch.proof.clone()).filter(|(address, _)| address == lidarr.address()).map(|(_, holds)| holds);
         if proof == Some(false) {
             // The long way: one release at a time, each seen onto the list before the next.
@@ -1019,7 +1019,7 @@ impl Job {
     /// it marks those releases and no others. `Some(true)` if it did; `Some(false)` if it marked
     /// more, which are then unmarked; `None` if that can't be told from this artist (they have
     /// nothing else to mark, or asking was stopped). An error if Lidarr never got round to them.
-    fn watch(&self, lidarr: &Lidarr, artist: i64, offers: &[Offer]) -> Result<Option<bool>, String> {
+    fn watch(&self, lidarr: &dyn BulkLidarr, artist: i64, offers: &[Offer]) -> Result<Option<bool>, String> {
         let mut moved = Instant::now();
         let mut jobs = 0;
         let mut quiet: Option<Instant> = None;
@@ -1065,7 +1065,7 @@ impl Job {
 
     /// Sees Lidarr through the artists it's reading in: as it finishes with each, checks that
     /// what was asked for is on its list, and puts it there if it isn't.
-    fn settle(&self, lidarr: &Lidarr, tell: &Tell) -> Result<(), String> {
+    fn settle(&self, lidarr: &dyn BulkLidarr, tell: &Tell) -> Result<(), String> {
         let mut quiet: HashMap<i64, Instant> = HashMap::new();
         let mut empty: HashMap<i64, Instant> = HashMap::new();
         let mut moved = Instant::now();
@@ -1126,7 +1126,7 @@ impl Job {
     }
 
     /// Checks one artist Lidarr has finished reading in.
-    fn finish(&self, lidarr: &Lidarr, artist: i64, given_up: bool, tell: &Tell) -> Result<Finished, String> {
+    fn finish(&self, lidarr: &dyn BulkLidarr, artist: i64, given_up: bool, tell: &Tell) -> Result<Finished, String> {
         // Wanted, put back and crossed off, as one step of the way back (`WayBack::turn`):
         // what Lidarr lists is read once the step is this one's, so that what is decided from
         // it isn't from before another step changed the artist.
@@ -1189,6 +1189,7 @@ impl Job {
 
 #[cfg(test)]
 mod tests {
+    use crate::lidarr::Lidarr;
     use std::sync::Arc;
 
     use super::*;
