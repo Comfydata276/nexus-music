@@ -186,11 +186,12 @@ fn run(settings: Settings) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    // 9.3: the music server's client, trusting this machine's certificates for the address
-    // people use (by HTTPS); the container's own address is the setting alone.
+    // 9.3: the music server's client, for the container's own address alone (the setting); it
+    // trusts this machine's certificates if that address is HTTPS. The address people use is
+    // never connected to.
     let (client, roots) = MusicClient::from_this_machine();
-    if roots == 0 {
-        println!("No trusted certificates were found on this machine: the address people use for the music server cannot be checked by HTTPS, so no music login can be set.");
+    if roots == 0 && settings.music_server.starts_with("https:") {
+        println!("No trusted certificates were found on this machine: NEXUS_MUSIC_SERVER is HTTPS, so the music server cannot be asked and no music login can be set.");
     }
     let music = MusicSide { client, internal: settings.music_server.clone() };
     let accounts = Arc::new(Accounts { desk, workers, set_up_code, clock: Arc::new(now), backend: id, seen, music });

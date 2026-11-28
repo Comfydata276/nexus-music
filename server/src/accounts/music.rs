@@ -1,18 +1,22 @@
 //! The music login, typed in by an admin (design 9; slice S9). **Every decision is the shared
 //! library's**: `kept` gives and spends the admin's grant and installs the login under the
 //! store's count; `music` builds the music server's two questions whole, reads their answers,
-//! seals the password bound to this backend, the account, the address people use, the name
-//! and the count, and opens it only to hand out a fresh salt and token (`hand_out`). This
+//! seals the password bound to this backend, the account, the address it was checked at, the
+//! name and the count, and opens it only to hand out a fresh salt and token (`hand_out`). This
 //! carries them out: the store, the thread that writes, the clock, random bytes, and the
 //! music server's client ([`crate::music`]).
 //!
 //! - **Only an admin setting a login, with a grant, causes the music server to be asked**
 //!   ([`Accounts::set_music_login`]): there is no other way to it, and it needs a session.
-//! - **Two addresses**: the backend asks the container's `NEXUS_MUSIC_SERVER` (plain HTTP
-//!   allowed: it is inside the container's network), then the address people use, set by the
-//!   admin ([`Accounts::set_music_server`]); both must answer, with the same name. The login is
-//!   kept only then, as belonging to that address and that name. A refusal is told apart from
-//!   "could not reach it", and neither touches the login the account had.
+//! - **One address is ever asked** (the lead's ruling of 28 Nov 15:38): the container's
+//!   `NEXUS_MUSIC_SERVER` (plain HTTP allowed: it is inside the container's network). A login
+//!   is checked there and nowhere else. **The address people use** is a plain HTTPS address
+//!   the admin sets with a grant ([`Accounts::set_music_server`]; its form is core's
+//!   `MusicAddress`): the backend **never connects to it**; it is handed to devices as it is.
+//!   A refusal is told apart from "could not reach it", and neither touches the login the
+//!   account had.
+//! - **A change of `NEXUS_MUSIC_SERVER`** between starts makes every login "cannot be used
+//!   now" until it is checked again (typed again) at the new address ([`hand`]).
 //! - **Handed out** ([`hand`]): to a device, at sign-in and when it asks, a salt made now and
 //!   its token, or why not ("none set yet", "cannot be used now"). Never to the admin's page.
 //! - **Forcing a device out does not change this login** (9.5): nothing here is called by it.
@@ -213,8 +217,9 @@ impl Accounts {
     }
 
     /// 9.3: the admin sets a person's music login, with a grant for exactly that account at its
-    /// revision: the music server is asked, at both addresses, and only if both say yes with the
-    /// same name is it sealed and kept, under the next count.
+    /// revision: the music server is asked at the container's address (`NEXUS_MUSIC_SERVER`)
+    /// and nowhere else, and only if it says yes, with the same name, is the login sealed and
+    /// kept, under the next count.
     pub async fn set_music_login(&self, bearer: account::Session, request: SetMusicLogin) -> Answer {
         match self.setting_music_login(bearer, request).await {
             Ok(answer) => answer,
@@ -229,8 +234,9 @@ impl Accounts {
         let clock = self.clock.clone();
         let target_id = change.account;
         // (1) On the thread that writes: the grant spent (kept's `authorize_music`), the address
-        // people use as it is now, and the sealing key. Without an address people use there is
-        // nothing to check a login at: refused before the grant is spent.
+        // people use as it is now, and the sealing key. CARRIED (core's seal still names the
+        // address people use, `t3/nexus-core-fu2` changes it): without one set, no login can be
+        // sealed, and it is refused before the grant is spent. It is never connected to.
         let (authorized, public, key) = {
             let hash = hash.clone();
             let grant = account::GrantSecret::from_bytes(*grant.expose_bytes());
@@ -251,7 +257,8 @@ impl Accounts {
                 .await
                 .map_err(|_| busy())??
         };
-        // (2) Here, off the thread that writes: the two questions at each address.
+        // (2) Here, off the thread that writes: the two questions, at the container's address
+        // alone.
         let salt = random::<SALT_BYTES>().ok_or(Refusal::NotDealtWith)?;
         let nonce = random::<NONCE_BYTES>().ok_or(Refusal::NotDealtWith)?;
         let typed = Provisioning {
@@ -264,24 +271,34 @@ impl Accounts {
         };
         drop(change.password);
         let sealing = SealingKey::new(*key);
-        let mut ping = Ping::provision(authorized, typed, &sealing).map_err(asked)?;
-        let verified = loop {
-            let answered = {
-                let post = ping.post();
-                self.music.client.ask(&post).await
-            };
-            let user = ping.answer(answered.as_ref().map(|(status, body)| (*status, body.as_slice()))).map_err(asked)?;
-            let answered = {
-                let post = user.post();
-                self.music.client.ask(&post).await
-            };
-            match user.answer(answered.as_ref().map(|(status, body)| (*status, body.as_slice()))).map_err(asked)? {
-                Checked::Public(next) => ping = next,
-                Checked::Verified(verified) => break verified,
+        let ping = Ping::provision(authorized, typed, &sealing).map_err(asked)?;
+        let pinged = {
+            let post = ping.post();
+            self.music.client.ask(&post).await
+        };
+        let user = ping.answer(reply(&pinged)).map_err(asked)?;
+        let named = {
+            let post = user.post();
+            self.music.client.ask(&post).await
+        };
+        let verified = match user.answer(reply(&named)).map_err(asked)? {
+            Checked::Verified(verified) => verified,
+            // CARRIED until core's change on `t3/nexus-core-fu2` (the check at the address people
+            // use removed, the seal bound to the internal address): core still names the address
+            // people use as a second place to ask. **The backend never connects to it** (the
+            // lead's ruling of 15:38): core's two questions for it are answered with the
+            // container's own answers, already read; nothing is sent anywhere.
+            Checked::Public(again) => {
+                let user = again.answer(reply(&pinged)).map_err(asked)?;
+                match user.answer(reply(&named)).map_err(asked)? {
+                    Checked::Verified(verified) => verified,
+                    Checked::Public(_) => return Err(Refusal::NotDealtWith),
+                }
             }
         };
         // (3) On the thread that writes: installed only while the same grant's authority, the
-        // same account at the same revision and count, and the same two addresses are current.
+        // same account at the same revision and count, the same container's address and (CARRIED,
+        // core's seal) the same address people use are current.
         let clock = self.clock.clone();
         let internal = self.music.internal.clone();
         let grant = account::GrantSecret::from_bytes(*grant.expose_bytes());
@@ -305,10 +322,12 @@ impl Accounts {
         )
     }
 
-    /// 9.3, 19.2: the admin sets the address people reach the music server at (HTTPS), with a
-    /// grant bound to exactly that address. The backend's own address is the container's and is
-    /// never set here. Every login checked at another address is not handed out from now on
-    /// (`hand_out`); the page asks for each to be typed again.
+    /// 9.3, 19.2: the admin sets the address people reach the music server at (HTTPS; its form
+    /// checked by core's `MusicAddress`), with a grant bound to exactly that address. **Nothing
+    /// connects to it**: it is handed to devices as it is. The backend's own address is the
+    /// container's and is never set here. CARRIED (core's seal names the address people use
+    /// until `t3/nexus-core-fu2`): every login sealed under another address people use is not
+    /// handed out from now on (`hand_out`), and is to be typed again.
     pub async fn set_music_server(&self, bearer: account::Session, request: SetMusicServer) -> Answer {
         let account::GrantedChange { head, request_id, change, grant } = request;
         let hash = Fingerprint::of(bearer.expose_bytes());
@@ -353,6 +372,11 @@ impl Accounts {
             .await;
         flatten(done)
     }
+}
+
+/// An answer as core reads it.
+fn reply(answered: &crate::music::Answered) -> Option<(u16, &[u8])> {
+    answered.as_ref().map(|(status, body)| (*status, body.as_slice()))
 }
 
 fn flatten_into(done: Result<Result<Answer, Refusal>, super::desk::Busy>) -> Result<Answer, Refusal> {

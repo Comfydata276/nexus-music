@@ -153,7 +153,7 @@ async fn tls_stand_in() -> (String, RootCertStore) {
 }
 
 #[test]
-fn the_address_people_use_is_asked_by_https_with_a_certificate_this_machine_trusts_only() {
+fn a_container_address_given_as_https_is_asked_with_a_certificate_this_machine_trusts_only() {
     runtime().block_on(async {
         let (at, roots) = tls_stand_in().await;
         let trusted = MusicClient::trusting(roots).within(Duration::from_secs(2));
