@@ -2309,13 +2309,50 @@ fn a_deployed_world(root: &Root) -> Ids {
         .unwrap();
     keeper.close();
     let connection = rusqlite::Connection::open(data::place(&root.data())).unwrap();
-    connection
-        .execute_batch("DROP TRIGGER requests_owners_placed_stays; ALTER TABLE requests_owners DROP COLUMN placed; ALTER TABLE requests_owners DROP COLUMN metadata; PRAGMA user_version = 1; PRAGMA journal_mode = DELETE;")
-        .unwrap();
-    // Exactly the deployed form: what a fresh database of form 1 is.
     let fresh = Root::new(&format!("{}-fresh", root.path.file_name().unwrap().to_string_lossy()));
     Data::create_with(&fresh.data(), &BackendId::from_bytes([1; 16]), T0, &data::MIGRATIONS[..1]).unwrap().close();
-    let made = rusqlite::Connection::open(data::place(&fresh.data())).unwrap();
+    let deployed = data::place(&fresh.data());
+    connection.execute("ATTACH DATABASE ?1 AS deployed", [deployed.to_str().unwrap()]).unwrap();
+
+    // Undo additions by comparing the seeded database with form 1, rather
+    // than maintaining a second list of the changes made by each migration.
+    connection.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+    let additions: Vec<(String, String)> = {
+        let mut query = connection.prepare(
+            "SELECT actual.type, actual.name FROM main.sqlite_schema AS actual
+             WHERE actual.name NOT LIKE 'sqlite_%'
+               AND actual.type IN ('trigger', 'view', 'index', 'table')
+               AND NOT EXISTS (SELECT 1 FROM deployed.sqlite_schema AS original
+                               WHERE original.type = actual.type AND original.name = actual.name)
+             ORDER BY CASE actual.type WHEN 'trigger' THEN 0 WHEN 'view' THEN 1 WHEN 'index' THEN 2 ELSE 3 END",
+        ).unwrap();
+        query.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap().map(Result::unwrap).collect()
+    };
+    let quote = |name: &str| format!(r#""{}""#, name.replace('"', r#""""#));
+    let undo = |sql: &str| connection.execute_batch(sql)
+        .unwrap_or_else(|error| panic!("the deployed fixture cannot undo a later form: {sql}: {error}"));
+    for (kind, name) in additions {
+        undo(&format!("DROP {kind} main.{}", quote(&name)));
+    }
+
+    let columns: Vec<(String, String)> = {
+        let mut query = connection.prepare(
+            "SELECT original.name, added.name FROM deployed.sqlite_schema AS original
+             JOIN pragma_table_xinfo(original.name, 'main') AS added
+             WHERE original.type = 'table' AND original.name NOT LIKE 'sqlite_%'
+               AND NOT EXISTS (SELECT 1 FROM pragma_table_xinfo(original.name, 'deployed') AS prior
+                               WHERE prior.name = added.name)
+             ORDER BY original.name, added.cid DESC",
+        ).unwrap();
+        query.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap().map(Result::unwrap).collect()
+    };
+    for (table, column) in columns {
+        undo(&format!("ALTER TABLE main.{} DROP COLUMN {}", quote(&table), quote(&column)));
+    }
+    connection.execute_batch("DETACH DATABASE deployed; PRAGMA user_version = 1; PRAGMA journal_mode = DELETE;").unwrap();
+    let made = rusqlite::Connection::open(deployed).unwrap();
     assert_eq!(shape(&connection), shape(&made), "the fixture is not form 1's shape");
     ids
 }
