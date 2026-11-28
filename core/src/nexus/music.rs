@@ -4,7 +4,7 @@
 use super::account::{
     AccountId, MusicAddress, MusicLogin, MusicLoginResult, MusicSalt, MusicToken, Name, SALT_LENGTH,
 };
-use super::kept::{AccountState, MusicAuthorization, Status};
+use super::kept::{AccountState, MusicAuthorization, SessionKind, Status};
 use super::proto::{self, BackendId};
 use super::wire::{self, BadMessage, Fields, Value};
 use serde_json::value::RawValue;
@@ -94,15 +94,17 @@ pub struct MusicInstallation {
 }
 
 /// Hand out a login using the current account authority from the apart store.
-/// An older data row is never used to supply that authority's count.
+/// The authority supplies the count. Use the kind from sign-in or from
+/// an authenticated session lookup, and never from the request body.
 pub fn hand_out(
     state: &AccountState,
+    kind: SessionKind,
     install: Option<&MusicInstallation>,
     key: &SealingKey,
     public: &MusicAddress,
     salt: MusicSalt,
 ) -> MusicLoginResult {
-    if state.music_login == 0 {
+    if kind == SessionKind::AdminPage || state.music_login == 0 {
         return MusicLoginResult::NoneSetYet;
     }
     let Some(login) = install.filter(|login| {

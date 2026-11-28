@@ -17,7 +17,7 @@ impl Live {
         self.saved.as_ref()?.music.as_ref().map(|login| login.count)
     }
 
-    fn waiting(&self, what: impl Fn(&Purpose) -> bool) -> bool {
+    pub(super) fn waiting(&self, what: impl Fn(&Purpose) -> bool) -> bool {
         self.flight.iter().any(|flight| what(&flight.what))
     }
 
@@ -41,7 +41,7 @@ impl Live {
 /// A number for one change, made when the person pressed (12.2), from the random bytes
 /// handed in: kept below 2^53 so that it is the same number in a Kotlin `Long` and in JSON
 /// read by anything. `None` with no random bytes, or (once in 2^53) all of them zero.
-fn request_id(given: &Given) -> Option<account::RequestId> {
+pub(super) fn request_id(given: &Given) -> Option<account::RequestId> {
     let random = given.random.as_ref()?;
     let mut bytes = [0u8; 8];
     bytes.copy_from_slice(random.0.get(..8)?);
@@ -69,7 +69,7 @@ fn retire(live: &mut Live, backend_id: &str, session: u64) {
 }
 
 /// A body account encoded, as the text an ask carries.
-fn hidden(body: Result<account::WireBody, account::BadMessage>) -> Option<Hidden> {
+pub(super) fn hidden(body: Result<account::WireBody, account::BadMessage>) -> Option<Hidden> {
     let body = body.ok()?;
     let text = std::str::from_utf8(body.bytes()).ok()?;
     Some(Hidden(Zeroizing::new(text.to_owned())))
@@ -86,7 +86,7 @@ impl Client {
     /// been read this run and named the backend expected** (7.1): until then a `hello` is
     /// asked there in its place. Says whether it asked. The address is made by account's
     /// [`NexusOrigin::call`] from a path constant, never from text handed in.
-    fn ask(&mut self, what: Purpose, path: &'static str, credential: Option<&Session>, body: Option<Hidden>, out: &mut Vec<Do>) -> bool {
+    pub(super) fn ask(&mut self, what: Purpose, path: &'static str, credential: Option<&Session>, body: Option<Hidden>, out: &mut Vec<Do>) -> bool {
         let Some(live) = self.live.as_mut() else { return false };
         if live.offline || live.flight.len() >= FLIGHT_MAX || live.waiting(|other| other.same_kind(&what)) {
             return false;
@@ -112,6 +112,7 @@ impl Client {
             Purpose::Hello(_) | Purpose::Verify { .. } => (Method::Get, HELLO_WITHIN_MS, HELLO_MAX_BYTES),
             Purpose::SignIn { .. } => (Method::Post, SIGN_IN_WITHIN_MS, account::SIGN_IN_REPLY_MAX_BYTES),
             Purpose::Devices { .. } => (Method::Post, CALL_WITHIN_MS, account::LIST_REPLY_MAX_BYTES),
+            Purpose::Events { .. } => (Method::Post, CALL_WITHIN_MS, events::BATCH_REPLY_BYTES),
             _ => (Method::Post, CALL_WITHIN_MS, account::SMALL_REPLY_MAX_BYTES),
         };
         if (method == Method::Post) != body.is_some() {
@@ -126,12 +127,12 @@ impl Client {
         true
     }
 
-    fn head(&self) -> Option<RequestHead> {
+    pub(super) fn head(&self) -> Option<RequestHead> {
         let saved = self.live.as_ref()?.saved.as_ref()?;
         Some(RequestHead { speaks: SPEAKS, restore: saved.restore })
     }
 
-    fn session(&self) -> Option<Session> {
+    pub(super) fn session(&self) -> Option<Session> {
         self.live.as_ref()?.session().cloned()
     }
 
@@ -222,6 +223,10 @@ impl Client {
         if check {
             self.ask_devices(0, None, false, out);
         }
+        // The sending half: a hold is lifted by the backend being reachable again, never by
+        // the answer that made it.
+        self.lift_hold(Some(why), given);
+        self.events_due(out);
     }
 
     /// After an answer's own part is done: what the backend being reachable again, or a
@@ -245,8 +250,12 @@ impl Client {
             live.renewal.announced = None;
             self.ask_music(count, false, out);
         }
+        // Whatever kept the sending half from beginning (a `hello` not yet read, no one
+        // signed in) may be gone now. A hold is not lifted here.
+        self.events_due(out);
         if let Some(live) = self.live.as_mut() {
             live.renewal.owed_now = false;
+            live.sending.clear_held_now();
         }
     }
 
@@ -483,6 +492,8 @@ impl Client {
             live.check_due = false;
             live.stranger = false;
             live.backend_blocked = false;
+            live.sending.reset();
+            live.diagnostics.drop_read();
         }
         self.set_form(state, 0);
     }
@@ -603,7 +614,7 @@ impl Client {
     /// The backend answered as the backend: it can be reached, and it is not one the phone
     /// lacks the permission for. If it could not be reached before, what was owed is asked
     /// when the answer's own part is done ([`Client::settle`]).
-    fn reached(&mut self) {
+    pub(super) fn reached(&mut self) {
         let Some(live) = self.live.as_mut() else { return };
         if matches!(live.reach, Reach::Down { .. }) {
             live.restored = true;
@@ -612,7 +623,7 @@ impl Client {
         live.backend_blocked = false;
     }
 
-    fn unreached(&mut self, given: &Given) {
+    pub(super) fn unreached(&mut self, given: &Given) {
         if let Some(live) = self.live.as_mut()
             && !matches!(live.reach, Reach::Down { .. })
         {
@@ -625,7 +636,7 @@ impl Client {
     /// ended", "the server's data was put back" and "too old" are dealt with before anything
     /// else is made of the answer; then the backend was reached and the receipt is taken.
     /// Gives back the outcome for the call's own part, or `None` if it was dealt with here.
-    fn common<T>(&mut self, outcome: Outcome<T>, given: &Given, out: &mut Vec<Do>) -> Option<Outcome<T>> {
+    pub(super) fn common<T>(&mut self, outcome: Outcome<T>, given: &Given, out: &mut Vec<Do>) -> Option<Outcome<T>> {
         let (expected, account, nexus) = {
             let saved = self.live.as_ref()?.saved.as_ref()?;
             (BackendId::from_hex(&saved.backend_id), saved.account, saved.nexus.clone())
@@ -661,6 +672,8 @@ impl Client {
                 if let Some(live) = self.live.as_mut() {
                     live.too_old = live.saved.as_ref().map(|saved| saved.nexus.clone());
                     live.flight.retain(|flight| flight.what.parting());
+                    live.sending.reset();
+                    live.diagnostics.drop_read();
                 }
                 return None;
             }
@@ -691,13 +704,25 @@ impl Client {
             return false;
         }
         let (life, change) = (saved.life.max(seen.life), saved.change.max(seen.change));
+        let moved = life > saved.life;
         if (saved.life, saved.change) != (life, change) {
             saved.life = life;
             saved.change = change;
             out.push(Do::Keep(Keep::Saved(saved.copy())));
         }
+        // The account has a new life (12.5): the journal is told only now that the new life
+        // is kept, so that nothing is removed before what replaces it is in place.
+        if moved && let Some(backend_id) = BackendId::from_hex(&saved.backend_id) {
+            out.push(Do::Journal(JournalDo::LifeMoved { account: JournalAccount { backend_id, account: saved.account }, life }));
+        }
+
         if seen.music_count > live.music_seen {
             live.renewal.announced = Some(live.renewal.announced.map_or(seen.music_count, |announced| announced.max(seen.music_count)));
+        }
+        // Everything read, queued or held under the earlier life is retired at once: nothing
+        // of a deleted life is posted once the machine knows the life moved.
+        if moved {
+            self.retire_life(life);
         }
         true
     }
@@ -718,6 +743,12 @@ impl Client {
     fn start_again(&mut self, out: &mut Vec<Do>) {
         let Some(live) = self.live.as_mut() else { return };
         let refused = live.renewal.refused;
+        // 13.3: every event still held for this backend is sent again, each under its own
+        // account once that account is signed in. Told before the session is dropped, so
+        // that a death between the two leaves the next answer to say it again.
+        if let Some(backend_id) = live.saved.as_ref().and_then(|saved| BackendId::from_hex(&saved.backend_id)) {
+            out.push(Do::Journal(JournalDo::ResendAll { backend_id }));
+        }
         if let Some(saved) = live.saved.as_mut() {
             saved.session = None;
             saved.sign_out = None;
@@ -731,8 +762,6 @@ impl Client {
             live.renewal.refused = refused;
             live.music_words = Some(words::music(words::Music::SignInToRenew));
         }
-        // From step 2 the device also sends again every event it still holds (13.3): owed
-        // with the sending half.
     }
 
     pub(super) fn answered(&mut self, ask: u64, status: u16, body: &AnswerBody, given: &Given, out: &mut Vec<Do>) {
@@ -770,6 +799,8 @@ impl Client {
                 let outcome = outcome(account::read_reply::<SignedOut>(status, bytes));
                 self.answered_tell(backend, session, origin, outcome, out);
             }
+            Purpose::Events { account, batch } => self.answered_events(account, batch, status, bytes, given, out),
+            Purpose::Diagnostics => self.answered_diagnostics(status, bytes, given, out),
         }
         self.settle(given, out);
     }
@@ -785,11 +816,18 @@ impl Client {
         let backend_id = backend.to_hex();
         let Some(live) = self.live.as_mut() else { return };
         let Some(note) = live.notes.iter().find(|note| note.key() == (backend_id.as_str(), session)) else { return };
+        let put_back = matches!(outcome, Outcome::Refused(Why::DataPutBack, _));
         let settled = match outcome {
             Outcome::Done(_, seen) => seen.backend == backend,
             Outcome::Refused(Why::SessionEnded | Why::DataPutBack, _) => true,
             _ => false,
         };
+        // 13.3: the note's answer may be the only one to say the data was put back. Every
+        // event held for that backend is to be sent again, each under its own account; the
+        // account signed in now, and its session, are not touched.
+        if put_back {
+            out.push(Do::Journal(JournalDo::ResendAll { backend_id: backend }));
+        }
         if settled {
             out.push(Do::Forget(note.forget()));
             retire(live, &backend_id, session);
@@ -810,6 +848,8 @@ impl Client {
             return;
         };
         self.saw(&origin, hello.id);
+        self.heard_default(&origin, hello.diagnostics_default());
+        self.fence_diagnostics();
         let Some(live) = self.live.as_mut() else { return };
         let ours = live.saved.as_ref().filter(|saved| saved.nexus == origin).map(|saved| BackendId::from_hex(&saved.backend_id) == Some(hello.id));
         if ours == Some(false) && live.signed_in() {
@@ -833,6 +873,8 @@ impl Client {
         if let Some(live) = self.live.as_mut() {
             live.stranger = true;
             live.flight.retain(|flight| flight.what.parting());
+            live.sending.reset();
+            live.diagnostics.drop_read();
             if live.renewal.refused.is_some() {
                 live.music_words = Some(words::music(words::Music::SignInToRenew));
             }
@@ -847,6 +889,8 @@ impl Client {
         };
         let at = pending.origin.origin().to_string();
         self.saw(&at, hello.id);
+        self.heard_default(&at, hello.diagnostics_default());
+        self.fence_diagnostics();
         let ours: Speaks = SPEAKS;
         if hello.speaks.low() > ours.high() {
             return self.set_form(SignInState::AppTooOld, 0);
@@ -904,6 +948,8 @@ impl Client {
         live.backend_blocked = false;
         live.check_due = false;
         live.account_generation = generation;
+        live.sending.reset();
+        live.diagnostics.drop_read();
         // "Too old" was another backend's, if it was said elsewhere.
         if live.too_old.as_deref().is_some_and(|said| *said != origin.origin().to_string()) {
             live.too_old = None;
@@ -944,6 +990,9 @@ impl Client {
         // player held (another account's, kept through "start again") is taken from it.
         // Either way the music server's permission decision was about the old login.
         out.push(Do::Keep(Keep::Saved(saved.copy())));
+        // The journal of this account writes under the life the backend has now, and what it
+        // wrote under an earlier one is removed unsent (12.5), only now that it is kept.
+        out.push(Do::Journal(JournalDo::LifeMoved { account: JournalAccount { backend_id, account: saved.account }, life: saved.life }));
         live.music_blocked = false;
         match &saved.music {
             Some(login) => out.push(Do::Hand(Hand::Login { login: copy(login), generation })),
@@ -1169,6 +1218,9 @@ impl Client {
             }
             // The note stays kept, and is told later.
             Purpose::Tell { .. } => {}
+            Purpose::Events { account, batch } => self.failed_events((account, batch.life()), given),
+            // That attempt is spent; the next is the schedule's.
+            Purpose::Diagnostics => self.unreached(given),
         }
     }
 
@@ -1206,9 +1258,11 @@ impl Client {
                     live.password = PasswordShown { state: PasswordState::CantReach, words: words::password(PasswordState::CantReach, 0, true) };
                 }
                 Purpose::Tell { .. } => live.flight.push(flight),
-                Purpose::Verify { .. } => {}
+                Purpose::Verify { .. } | Purpose::Events { .. } | Purpose::Diagnostics => {}
             }
         }
+        live.sending.reset();
+        live.diagnostics.drop_read();
         if live.renewal.refused.is_some() && live.renewal.owed.is_some() {
             live.music_words = Some(words::music(words::Music::WhenOnline));
         }
@@ -1220,14 +1274,15 @@ impl Client {
     /// A tick asks nothing of the session. It tells waiting sign-outs at their pace (11).
     pub(super) fn tick(&mut self, given: &Given, out: &mut Vec<Do>) {
         let Some(live) = self.live.as_ref() else { return };
-        if live.offline || live.notes.is_empty() {
+        if live.offline {
             return;
         }
-        let due = live.told_ms.is_none_or(|last| given.now_ms.checked_sub(last).is_none_or(|age| age >= TELL_EVERY_MS));
+        let due = !live.notes.is_empty() && live.told_ms.is_none_or(|last| given.now_ms.checked_sub(last).is_none_or(|age| age >= TELL_EVERY_MS));
         if due {
             self.ask_tell(given, out);
         }
-        // The sending half (C8's events, C6's Diagnostics) is driven from here: owed.
+        // Diagnostics alone, at the pace 14.4 names. Events are never sent from a tick.
+        self.diagnostics_due(given, out);
     }
 
     /// 6.3, as ruled: the first report for a number sets it aside, at once; one renewal for

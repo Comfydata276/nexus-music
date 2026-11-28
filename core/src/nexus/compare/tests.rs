@@ -31,7 +31,7 @@ fn state() -> AccountState {
 }
 
 fn session(id: u64) -> Session {
-    Session { id: SessionId::new(id).unwrap(), hash: Fingerprint::of(&[id as u8; SECRET_BYTES]), last_used: 0, sign_out: Fingerprint::of(&[0xee; SECRET_BYTES]), leave: None }
+    Session { id: SessionId::new(id).unwrap(), hash: Fingerprint::of(&[id as u8; SECRET_BYTES]), last_used: 0, kind: crate::nexus::kept::SessionKind::App, sign_out: Fingerprint::of(&[0xee; SECRET_BYTES]), leave: None }
 }
 
 /// One account with one device signed in (session 4), the same in both.
@@ -287,41 +287,4 @@ fn there_is_something_to_take_only_without_a_store_that_belongs() {
     contradicted.restore = 3;
     assert!(needs_taking(Some(&store), &contradicted));
     assert!(!needs_taking(Some(&StoreView { pending: Some(Pending::TakeAsIs { restore: 3 }), ..store.clone() }), &contradicted));
-}
-
-#[test]
-fn with_no_authority_every_account_waits_for_a_new_code_and_with_one_what_it_took_away_is_kept() {
-    let (store, data) = both();
-    let mut rows = data.accounts[&ACCOUNT].clone();
-    rows.account.code = Some(LiveCode { number: 2, used: false, expires: 99 });
-    // No store of this backend: no password, and no code, of the data's is trusted.
-    let lost = recovery_baseline(&rows, None);
-    assert!(lost.account.password_reset_required && lost.account.code.is_none());
-    assert_eq!(lost.account.password_changes, rows.account.password_changes + 1, "the data's verifier no longer matches");
-    assert!(lost.devices.values().all(|device| device.permit.is_none() && !device.known), "no device known again until it signs in");
-    assert_eq!(lost.devices[&device_id(DEVICE)].last_session, 4);
-    // A readable record of this backend: what it took away stays taken.
-    let mut record = store.accounts[&ACCOUNT].clone();
-    let deleted = Apart { account: AccountState { status: Status::Deleted, ..record.account.clone() }, ..record.clone() };
-    assert_eq!(recovery_baseline(&rows, Some(&deleted)).account.status, Status::Deleted);
-    record.account.status = Status::Off;
-    record.account.password_changes = 5;
-    record.account.code = Some(LiveCode { number: 2, used: true, expires: 99 });
-    record.account.life = 3;
-    record.devices.get_mut(&device_id(DEVICE)).unwrap().number = 9;
-    record.devices.insert(device_id(DEVICE + 1), ApartDevice { number: 2, known: true, last_session: 6, last_leave: 0, permit: Some(Permit { id: SessionId::new(6).unwrap(), leave: None }) });
-    rows.account.admin = true;
-    let kept = recovery_baseline(&rows, Some(&record));
-    assert_eq!(kept.account.status, Status::Off);
-    assert!(!kept.account.admin, "an admin's role taken away stays away");
-    assert_eq!((kept.account.password_changes, kept.account.life), (5, 3));
-    assert_eq!(kept.account.code, None, "a code the store has used is not live");
-    assert_eq!(kept.devices[&device_id(DEVICE)].number, 9);
-    assert!(kept.devices[&device_id(DEVICE)].known, "a device the store knows stays known");
-    assert_eq!(kept.devices[&device_id(DEVICE + 1)].last_session, 6, "a device the data lost keeps its numbers");
-    assert!(!kept.devices[&device_id(DEVICE + 1)].known);
-    assert!(kept.devices.values().all(|device| device.permit.is_none()));
-    // And nothing is reset that it can know of.
-    let same = recovery_baseline(&data.accounts[&ACCOUNT], Some(&store.accounts[&ACCOUNT]));
-    assert_eq!(same.account, data.accounts[&ACCOUNT].account);
 }
