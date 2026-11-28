@@ -900,6 +900,45 @@ export component StackPage inherits Rectangle {
                 }
             }
 
+            if App.route == "requests" && View.server-batch-notice != "": VerticalLayout {
+                padding-left: Theme.page-pad;
+                padding-right: Theme.page-pad;
+                padding-bottom: 10px;
+                spacing: 8px;
+
+                Text {
+                    text: "Batch progress";
+                    color: Theme.text;
+                    font-family: Theme.display;
+                    font-size: 21px;
+                    font-weight: 700;
+                }
+
+                Text {
+                    text: View.server-batch-notice;
+                    color: Theme.muted;
+                    font-size: 14px;
+                    wrap: word-wrap;
+                }
+
+                for line in View.server-batch-lines: VerticalLayout {
+                    spacing: 2px;
+                    Text {
+                        text: line.title;
+                        color: Theme.text;
+                        font-size: 14px;
+                        font-weight: 600;
+                        wrap: word-wrap;
+                    }
+                    Text {
+                        text: line.detail;
+                        color: Theme.muted;
+                        font-size: 13px;
+                        wrap: word-wrap;
+                    }
+                }
+            }
+
             // How something long-running on this page stands, and what can be done about it.
             if !root.hero && View.notice != "": HorizontalLayout {
                 padding-left: Theme.page-pad;
@@ -2591,7 +2630,12 @@ export component SettingsPage inherits Rectangle {
 
                     // ---- Requests ----
                     if Settings.tab == 4: VerticalLayout {
-                        SettingRow {
+                        if !Settings.direct-requests: SettingRow {
+                            title: "Requests on your Nexus server";
+                            detail: Settings.nexus-requests-detail;
+                        }
+
+                        if Settings.direct-requests: SettingRow {
                             title: "Ask for music that isn't in your library";
                             detail: "For people who run Lidarr beside their music server. Search gains a “Not in your library” section; asking for something there puts it on Lidarr's list, and the Requests page shows what's on its way. Songs and track lists are looked up at MusicBrainz, which is sent what you search for. How much each is played comes from ListenBrainz, which is told which artists and songs came up.";
                             Toggle {
@@ -2601,8 +2645,8 @@ export component SettingsPage inherits Rectangle {
                             }
                         }
 
-                        if Settings.requests: SettingRow {
-                            nested: true;
+                        if Settings.requests || !Settings.direct-requests: SettingRow {
+                            nested: Settings.direct-requests;
                             title: "Singles and EPs too";
                             detail: "A song that never came out on an album is offered on its single or EP, and artists' pages list those as well. Asking for one has Lidarr list that artist's singles and EPs alongside their albums; only what you ask for is fetched.";
                             Toggle {
@@ -2612,7 +2656,7 @@ export component SettingsPage inherits Rectangle {
                             }
                         }
 
-                        if Settings.requests: SettingNest {
+                        if Settings.direct-requests && Settings.requests: SettingNest {
                             lidarr-box := VerticalLayout {
                                 // Something typed that hasn't been saved.
                                 property <bool> edited: lidarr-address.text != Settings.lidarr-address || lidarr-key.text != "";

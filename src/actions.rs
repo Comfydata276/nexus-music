@@ -31,7 +31,7 @@ pub enum Target {
     Playlist { id: String, name: String },
     /// An album on the Requests page: the Lidarr connection it was drawn under, Lidarr's
     /// number for it, its MusicBrainz id, its title and its artist.
-    Request { connection: u64, id: i64, album: String, title: String, artist: String },
+    Request { connection: u64, via_server: bool, id: i64, album: String, title: String, artist: String },
 }
 
 impl Target {
@@ -70,9 +70,9 @@ pub enum PromptAction {
     /// The folder for songs kept as they play was typed in.
     SongsFolder,
     /// Ask Lidarr for an album (by its name for it), or for everything an import didn't find.
-    RequestAlbum { album: String, title: String, song: String },
-    AddArtist { artist: String, name: String },
-    RequestMissing,
+    RequestAlbum { connection: crate::requests::Connection, album: String, title: String, song: String },
+    AddArtist { connection: crate::requests::Connection, artist: String, name: String },
+    RequestMissing(crate::requests::Connection),
     RenamePlaylist(String),
     DeletePlaylist(String),
 }
@@ -258,13 +258,16 @@ impl Controller {
             self.song_index(row).and_then(|index| {
                 let (album, artist) = page.request_albums.get(index).cloned().unwrap_or_default();
                 let title = page.songs.get(index)?.title.clone();
-                Some((Target::Request { connection: page.request_connection, id: *page.request_ids.get(index)?, album, title: title.clone(), artist }, title))
+                let id = *page.request_ids.get(index)?;
+                if page.request_server && id == 0 { return None; }
+                Some((Target::Request { connection: page.request_connection, via_server: page.request_server, id, album, title: title.clone(), artist }, title))
             })
         };
         if let Some((target, title)) = request {
             let entries = vec![self.entry("cancel-request", "Take off the list", self.ui.global::<ui::Icons>().get_x())];
             return self.open_menu(target, &title, entries, x, y);
         }
+        if self.page.borrow().request_server { return; }
         // Right-clicking inside a selection acts on all of it.
         let rows = self.rows_for(row);
         if rows.len() > 1 {
@@ -658,9 +661,9 @@ impl Controller {
             Target::Songs { songs, .. } => format!("{} songs", songs.len()),
             Target::Album { title, .. } => title.clone(),
             Target::Artist { name, .. } | Target::Playlist { name, .. } => name.clone(),
-            Target::Request { connection, id: number, album, title, artist } => {
+            Target::Request { connection, via_server, id: number, album, title, artist } => {
                 if id == "cancel-request" {
-                    self.cancel_request(*connection, *number, album.clone(), title.clone(), artist.clone());
+                    self.cancel_request(*connection, *number, album.clone(), title.clone(), artist.clone(), *via_server);
                 }
                 return;
             }
@@ -1111,9 +1114,9 @@ impl Controller {
                     self.add_songs_to_playlist(playlist_id, fresh);
                 }
             }
-            PromptAction::RequestAlbum { album, title, song } => self.request_album(album, title, song),
-            PromptAction::AddArtist { artist, name } => self.add_artist(artist, name),
-            PromptAction::RequestMissing => self.request_missing(),
+            PromptAction::RequestAlbum { connection, album, title, song } => self.request_album(connection, album, title, song),
+            PromptAction::AddArtist { connection, artist, name } => self.add_artist(connection, artist, name),
+            PromptAction::RequestMissing(connection) => self.request_missing(connection),
             PromptAction::ImportPath => {
                 if !name.is_empty() {
                     self.run_import(vec![std::path::PathBuf::from(name.trim_matches('"'))]);

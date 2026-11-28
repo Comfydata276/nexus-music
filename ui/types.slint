@@ -243,7 +243,11 @@ export global Search {
 }
 
 // The page currently shown in the main panel.
+export struct BatchRequestLine { title: string, detail: string }
+
 export global View {
+    in property <string> server-batch-notice;
+    in property <[BatchRequestLine]> server-batch-lines;
     in property <bool> loading;
     in property <string> error;
     // The header is drawn from what was clicked; the rest of the page is still loading.
@@ -532,6 +536,8 @@ export struct QualityOption {
 }
 
 export global Settings {
+    in property <bool> direct-requests;
+    in property <string> nexus-requests-detail;
     // Whether there is a Nexus server at the music server's address: empty until it has been
     // looked for, then what was found, for the account in `nexus-for` (the server and the
     // name, on two lines). Shown only while that account is the one signed in. Set by

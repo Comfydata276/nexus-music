@@ -217,6 +217,8 @@ pub struct PageData {
     /// `lidarr::for_connection`).
     #[serde(skip)]
     pub request_connection: u64,
+    #[serde(skip)]
+    pub request_server: bool,
     /// Music that isn't in the library: the section's heading, songs that could be asked
     /// for, and the shelves beneath them.
     pub offers_title: String,
@@ -441,7 +443,7 @@ fn with_outside(page: &PageData, found: &nexus_core::requests::Outside) -> PageD
 }
 
 /// The services the requests pages ask, as the app has them.
-fn services(lidarr: &crate::lidarr::Lidarr) -> nexus_core::requests::Services<'_> {
+fn services(lidarr: &dyn nexus_core::lidarr::RequestLidarr) -> nexus_core::requests::Services<'_> {
     nexus_core::requests::Services { lidarr, musicbrainz: crate::musicbrainz::service(), listenbrainz: crate::listenbrainz::service() }
 }
 
@@ -458,17 +460,29 @@ fn library() -> std::sync::Arc<dyn nexus_core::requests::Library> {
 /// switched on (see `nexus_core::requests::search`). `publish` is handed the page each time
 /// more of it is known, so what's found shows as it arrives; the finished page is returned.
 fn search_extras(query: &str, page: &PageData, publish: &mut dyn FnMut(PageData)) -> Option<PageData> {
-    let lidarr = crate::lidarr::current()?;
+    let connection = crate::requests::current()?;
+    let history = std::cell::OnceCell::new();
+    let asked = || if connection.server() {
+        history.get_or_init(|| connection.asked()).clone()
+    } else {
+        crate::asked::shared()
+    };
+    let mut base = page.clone();
+    base.local |= connection.server();
     let found = nexus_core::requests::search(
-        services(&lidarr),
+        services(connection.lidarr()),
         &library,
-        crate::lidarr::offers(),
+        connection.offers(),
         &crate::lidarr::singles,
-        &crate::asked::shared,
+        &asked,
         query,
-        &mut |found| publish(with_outside(page, &found)),
+        &mut |found| {
+            if connection.still_selected() {
+                publish(with_outside(&base, &found));
+            }
+        },
     );
-    found.ok().map(|found| with_outside(page, &found))
+    found.ok().filter(|_| connection.still_selected()).map(|found| with_outside(&base, &found))
 }
 
 fn outside_artist_card(artist: &crate::lidarr::ArtistOffer) -> CardData {
@@ -482,20 +496,20 @@ fn outside_artist_card(artist: &crate::lidarr::ArtistOffer) -> CardData {
 }
 
 fn requests_off(title: &str) -> PageData {
-    PageData { title: title.into(), empty: "Requests are switched off. Turn them on in Settings.".into(), ..Default::default() }
+    PageData { title: title.into(), empty: crate::requests::status_text(), ..Default::default() }
 }
 
 /// An artist as the wider world knows them: every studio album they've made, with the ones
 /// in the library opening as usual and the rest there to be asked for (see
 /// `nexus_core::requests::artist`).
 fn outside_artist(id: &str) -> PageData {
-    let Some(lidarr) = crate::lidarr::current() else { return requests_off("Artist") };
+    let Some(connection) = crate::requests::current() else { return requests_off("Artist") };
     // (Nothing on Windows stops a request, so "stopped" can't come of it.)
-    let Ok(found) = nexus_core::requests::artist(services(&lidarr), &library, crate::lidarr::offers(), &crate::lidarr::singles, id) else {
+    let Ok(found) = nexus_core::requests::artist(services(connection.lidarr()), &library, connection.offers(), &crate::lidarr::singles, id) else {
         return PageData { label: "Artist".into(), cover_round: true, ..Default::default() };
     };
     if found.failed {
-        return PageData { label: "Artist".into(), title: found.name, cover_round: true, empty: found.empty, ..Default::default() };
+        return PageData { label: "Artist".into(), title: found.name, cover_round: true, empty: found.empty, local: connection.server(), ..Default::default() };
     }
     let card = |release: &nexus_core::requests::Release| -> CardData {
         match &release.library {
@@ -521,6 +535,7 @@ fn outside_artist(id: &str) -> PageData {
             .map(|(title, cards)| ShelfData { title: title.into(), route: String::new(), wrap: true, cards })
             .collect(),
         artist_id: id.to_string(),
+        local: connection.server(),
         ..Default::default()
     }
 }
@@ -528,21 +543,22 @@ fn outside_artist(id: &str) -> PageData {
 /// The songs an artist is most played for, for the top of their page. Found after the page
 /// itself, since it takes a few more questions.
 fn outside_artist_extras(id: &str, page: &PageData) -> Option<PageData> {
-    let lidarr = crate::lidarr::current()?;
+    let connection = crate::requests::current()?;
     if page.title.is_empty() || !page.offers.is_empty() {
         return None;
     }
     let popular = nexus_core::requests::artist_popular(
-        services(&lidarr),
+        services(connection.lidarr()),
         &library,
-        crate::lidarr::offers(),
+        connection.offers(),
         &crate::lidarr::singles,
-        &crate::asked::shared,
+        &|| connection.asked(),
         id,
         &page.title,
     )
     .ok()??;
     let mut page = page.clone();
+    page.local |= connection.server();
     page.offers_heading = popular.heading;
     page.offers = popular.songs.iter().map(|(song, requested)| offer_data(song, *requested)).collect();
     Some(page)
@@ -551,9 +567,9 @@ fn outside_artist_extras(id: &str, page: &PageData) -> Option<PageData> {
 /// An album that isn't in the library: what's on it, and a button to ask for it (see
 /// `nexus_core::requests::album`).
 fn outside_album(id: &str) -> PageData {
-    let Some(lidarr) = crate::lidarr::current() else { return requests_off("Album") };
+    let Some(connection) = crate::requests::current() else { return requests_off("Album") };
     // (Nothing on Windows stops a request, so "stopped" can't come of it.)
-    let found = match nexus_core::requests::album(services(&lidarr), crate::lidarr::offers(), id) {
+    let found = match nexus_core::requests::album(services(connection.lidarr()), connection.offers(), id) {
         Ok(nexus_core::requests::AlbumPage::Found(found)) => found,
         Ok(nexus_core::requests::AlbumPage::Unavailable(reason)) => return PageData { label: "Album".into(), empty: reason, ..Default::default() },
         Err(_) => return PageData { label: "Album".into(), ..Default::default() },
@@ -585,6 +601,7 @@ fn outside_album(id: &str) -> PageData {
         disc_sections: discs > 1,
         empty: found.tracks_failed,
         artist_id: offer.artist_id,
+        local: connection.server(),
         ..Default::default()
     }
 }
@@ -613,6 +630,12 @@ pub fn requests_notice(batch: &str) -> String {
 /// The albums that have been asked for: those that have arrived lately, then those still on
 /// their way (see `nexus_core::requests::on_their_way`).
 fn requests() -> PageData {
+    if let Some(crate::requests::Connection::Server { client, number, .. }) = crate::requests::current() {
+        return server_requests(&client, number);
+    }
+    if !crate::requests::direct_selected() {
+        return requests_off("Requests");
+    }
     let title = "Requests".to_string();
     let (lidarr, connection) = crate::lidarr::current_numbered();
     let Some(lidarr) = lidarr else {
@@ -673,6 +696,60 @@ fn requests() -> PageData {
                 }
             })
             .collect();
+    }
+    page
+}
+
+/// History is authoritative on the server. Pending adds progress and removal
+/// authority, and library matches let an arrived album open in the player.
+fn server_requests(client: &nexus_core::nexus::requests::BackendLidarr<'_>, connection: u64) -> PageData {
+    let mut page = PageData {
+        title: "Requests".into(),
+        request_connection: connection,
+        request_server: true,
+        local: true,
+        ..Default::default()
+    };
+    let history = match client.asked_history() {
+        Ok(rows) => crate::requests::project_history(rows),
+        Err(reason) => {
+            page.empty = reason.to_string();
+            return page;
+        }
+    };
+    let pending = match client.pending_rows() {
+        Ok(rows) => rows,
+        Err(reason) => {
+            page.empty = reason.to_string();
+            Vec::new()
+        }
+    };
+    let pending_ids: std::collections::HashSet<_> = pending.iter().map(|row| row.album.as_str()).collect();
+    let arrived = history.iter().filter(|row| row.arrived != 0 && !pending_ids.contains(row.album.as_str())).map(|row| CardData {
+        kind: Kind::Album,
+        id: row.library_album.clone(),
+        title: row.title.clone(),
+        subtitle: row.artist.clone(),
+        cover: row.cover.clone(),
+    }).collect::<Vec<_>>();
+    if !arrived.is_empty() {
+        page.lead.push(ShelfData { title: "Arrived".into(), cards: arrived, wrap: true, ..Default::default() });
+    }
+    for row in history.iter().filter(|row| row.arrived == 0 && !pending_ids.contains(row.album.as_str())) {
+        page.songs.push(Song { title: row.title.clone(), artist: format!("{} • Asked", row.artist), ..Default::default() });
+        page.request_ids.push(0);
+        page.request_albums.push((row.album.clone(), row.artist.clone()));
+    }
+    for row in pending {
+        page.request_ids.push(crate::requests::removal_id(&row));
+        let progress = row.progress.map_or_else(|| "Being looked for".to_string(), |percent| format!("Downloading, {percent}%"));
+        page.songs.push(Song { title: row.title, artist: format!("{} • {progress}", row.artist), ..Default::default() });
+        page.request_albums.push((row.album.into(), row.artist));
+    }
+    if !page.songs.is_empty() {
+        page.tracks_title = "Asked for".into();
+    } else if page.lead.is_empty() && page.empty.is_empty() {
+        page.empty = "You haven't asked for any music yet. Search for something that isn't in your library to make a request.".into();
     }
     page
 }
@@ -1000,7 +1077,8 @@ fn home(client: &Client) -> ApiResult<PageData> {
         .collect();
     let made = (!mixes.is_empty()).then(|| ShelfData { title: "Made for you".into(), route: String::new(), wrap: false, cards: mixes });
     // Artists that aren't here but might be wanted, if there's a way to ask for them.
-    let discover = crate::lidarr::current().and(crate::search::current()).and_then(|index| discover_shelf(&crate::discover::shown(&index)));
+    let discover = crate::requests::current().zip(crate::search::current())
+        .and_then(|(connection, index)| discover_shelf(&crate::discover::shown(&index), connection.offers()));
     // Albums played a lot, but not for a while.
     let now = chrono::Utc::now().timestamp();
     let neglected: Vec<Album> = frequent
@@ -1036,7 +1114,7 @@ fn home(client: &Client) -> ApiResult<PageData> {
 const DISCOVER: &str = "Artists you might like";
 
 /// The row of artists that aren't in the library but are like the ones played most.
-fn discover_shelf(artists: &[crate::discover::Suggestion]) -> Option<ShelfData> {
+fn discover_shelf(artists: &[crate::discover::Suggestion], remembered: &crate::lidarr::Offers) -> Option<ShelfData> {
     if artists.is_empty() {
         return None;
     }
@@ -1045,7 +1123,7 @@ fn discover_shelf(artists: &[crate::discover::Suggestion]) -> Option<ShelfData> 
         .iter()
         .map(|artist| crate::lidarr::ArtistOffer { id: artist.id.clone(), name: artist.name.clone(), cover: artist.cover.clone(), ..Default::default() })
         .collect();
-    crate::lidarr::remember_artists(&offers);
+    remembered.remember_artists(&offers);
     Some(ShelfData {
         title: DISCOVER.into(),
         route: String::new(),
@@ -1060,14 +1138,14 @@ fn discover_shelf(artists: &[crate::discover::Suggestion]) -> Option<ShelfData> 
 /// Looks for artists worth suggesting, when that's due. It takes a while, so Home is
 /// on screen long before; the row joins it when it's ready.
 fn home_extras(client: &Client, page: &PageData) -> Option<PageData> {
-    let lidarr = crate::lidarr::current()?;
+    let connection = crate::requests::current()?;
     let index = crate::search::current()?;
     let now = chrono::Utc::now().timestamp();
     if crate::discover::fresh(now) || index.library.songs.is_empty() {
         return None;
     }
-    crate::discover::find(client, &index, &lidarr, now);
-    let shelf = discover_shelf(&crate::discover::shown(&index))?;
+    crate::discover::find(client, &index, connection.lidarr(), now);
+    let shelf = discover_shelf(&crate::discover::shown(&index), connection.offers())?;
     let mut page = page.clone();
     page.shelves.retain(|shelf| shelf.title != DISCOVER);
     // After what's been played lately, as on the page when it's loaded with them known.
@@ -1128,7 +1206,7 @@ fn search(client: &Client, query: &str) -> ApiResult<PageData> {
         String::new()
     };
     // With requests switched on, more is on its way from beyond the library.
-    let (offers_title, offers_note) = match crate::lidarr::current() {
+    let (offers_title, offers_note) = match crate::requests::current() {
         Some(_) => ("Not in your library".to_string(), "Looking for songs, artists and albums beyond your library…".to_string()),
         None => Default::default(),
     };
@@ -1443,7 +1521,8 @@ fn artist(client: &Client, id: &str) -> ApiResult<PageData> {
 /// from. `mbid` is MusicBrainz's name for the artist if the server knows it; otherwise Lidarr
 /// is asked who goes by `name`.
 fn missing_albums(name: &str, mbid: &str, page: &PageData) -> Option<ShelfData> {
-    let lidarr = crate::lidarr::current()?;
+    let connection = crate::requests::current()?;
+    let lidarr = connection.lidarr();
     let artist = if mbid.is_empty() {
         let found = lidarr.find_artists(name).ok()?;
         let mut same = found.into_iter().filter(|artist| crate::musicbrainz::same_words(&artist.name, name));
@@ -1453,7 +1532,7 @@ fn missing_albums(name: &str, mbid: &str, page: &PageData) -> Option<ShelfData> 
     } else {
         crate::lidarr::ArtistOffer { id: mbid.to_string(), name: name.to_string(), ..Default::default() }
     };
-    crate::lidarr::remember_artists(std::slice::from_ref(&artist));
+    connection.offers().remember_artists(std::slice::from_ref(&artist));
     let albums: Vec<(crate::lidarr::Offer, bool)> = match lidarr.known_artist(&artist.id).ok().flatten() {
         Some((number, known)) => lidarr.albums_of(number, &known).ok()?,
         None => crate::musicbrainz::artist_albums(&artist.id).ok()?.1.into_iter().map(|album| (album, false)).collect(),
@@ -1468,7 +1547,7 @@ fn missing_albums(name: &str, mbid: &str, page: &PageData) -> Option<ShelfData> 
     if missing.is_empty() {
         return None;
     }
-    crate::lidarr::remember(&missing);
+    connection.offers().remember(&missing);
     Some(ShelfData {
         title: "Not in your library".into(),
         route: format!("outside-artist:{}", artist.id),
@@ -1521,7 +1600,7 @@ fn artist_extras(client: &Client, id: &str, page: &PageData, publish: &mut dyn F
     let similar: Vec<CardData> =
         info.similar.iter().filter(|a| !a.id.is_empty()).map(CardData::artist).collect();
     let about = plain_text(&info.biography);
-    let asking = crate::lidarr::current().is_some();
+    let asking = crate::requests::current().is_some();
     // The server can only say what's popular if it has somewhere to ask. With requests
     // switched on there's ListenBrainz, whose list is matched to the songs that are here.
     let top = if top.is_empty() && asking && !info.music_brainz_id.is_empty() { library_top(&name, &info.music_brainz_id) } else { top };

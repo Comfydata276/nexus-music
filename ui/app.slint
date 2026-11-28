@@ -8,13 +8,13 @@ import "fonts/BricolageGrotesque-ExtraBold.ttf";
 
 import { Theme } from "theme.slint";
 import { Icons } from "icons.slint";
-import { Drag, App, View, Player, Menu, Prompt, Toast, Lyrics, Settings, Covers, Page, Track, Card, CardKind, Shelf, Offer, CardRow, PlaylistRef, MenuEntry, LyricLine, QualityOption, ThemeOption, Search, Suggestion, DeviceRow } from "types.slint";
+import { Drag, App, View, Player, Menu, Prompt, Toast, Lyrics, Settings, Covers, Page, Track, Card, CardKind, Shelf, Offer, CardRow, PlaylistRef, MenuEntry, LyricLine, QualityOption, ThemeOption, Search, Suggestion, DeviceRow, BatchRequestLine } from "types.slint";
 import { PageStatus, IconButton } from "widgets.slint";
 import { Sidebar, TopBar, QueuePanel, PlayerBar, SearchOverlay } from "chrome.slint";
 import { StackPage, TrackListPage, GridPage, LyricsPage, NowPlayingPage, SettingsPage, LoginPage, NoMusicPage } from "pages.slint";
 import { MenuOverlay, PromptOverlay, ToastOverlay } from "overlays.slint";
 
-export { Theme, App, View, Player, Menu, Prompt, Toast, Lyrics, Settings, Covers, Icons, Page, Track, Card, CardKind, Shelf, Offer, CardRow, PlaylistRef, MenuEntry, LyricLine, QualityOption, ThemeOption, Search, Suggestion, DeviceRow }
+export { Theme, App, View, Player, Menu, Prompt, Toast, Lyrics, Settings, Covers, Icons, Page, Track, Card, CardKind, Shelf, Offer, CardRow, PlaylistRef, MenuEntry, LyricLine, QualityOption, ThemeOption, Search, Suggestion, DeviceRow, BatchRequestLine }
 
 // The icon in the notification area, shown while closing the window keeps the app running.
 export component Tray inherits SystemTrayIcon {

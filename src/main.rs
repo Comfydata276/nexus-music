@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod actions;
+mod app_nexus_calls;
 mod asked;
 mod added;
 mod audio;
@@ -38,6 +39,7 @@ mod pins;
 #[cfg(windows)]
 mod picker;
 mod playback;
+mod requests;
 mod playlists;
 mod plays;
 mod pool;

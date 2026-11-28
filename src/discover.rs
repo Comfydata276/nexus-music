@@ -18,7 +18,7 @@ use std::sync::{OnceLock, RwLock};
 
 use nexus_core::discover::{Kept, favourites};
 
-use crate::lidarr::Lidarr;
+use nexus_core::lidarr::RequestLidarr;
 use crate::search::{Index, fold};
 use crate::subsonic::Client;
 
@@ -83,7 +83,7 @@ pub fn forget(id: &str) {
 
 /// Looks for suggestions afresh and keeps them. Slow: a question to the server for each
 /// favourite and one to Lidarr for each suggestion.
-pub fn find(client: &Client, index: &Index, lidarr: &Lidarr, now: i64) -> Vec<Suggestion> {
+pub fn find(client: &Client, index: &Index, lidarr: &dyn RequestLidarr, now: i64) -> Vec<Suggestion> {
     // One search at a time: Home can be opened again while the first is still under way.
     if LOOKING.swap(true, Ordering::SeqCst) {
         return kept().artists;
@@ -95,7 +95,7 @@ pub fn find(client: &Client, index: &Index, lidarr: &Lidarr, now: i64) -> Vec<Su
 
 static LOOKING: AtomicBool = AtomicBool::new(false);
 
-fn look(client: &Client, index: &Index, lidarr: &Lidarr, now: i64) -> Vec<Suggestion> {
+fn look(client: &Client, index: &Index, lidarr: &dyn RequestLidarr, now: i64) -> Vec<Suggestion> {
     let favourites = favourites(&index.library.songs);
     // Four questions at a time, so neither the server nor Lidarr is leaned on.
     let mut similar: Vec<(String, Vec<String>)> = Vec::new();
