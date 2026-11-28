@@ -109,16 +109,15 @@ impl Name {
 /// A password for one check. All Unicode scalar values count as characters, including
 /// spaces. The caller drops this value after the check.
 pub struct Password {
-    bytes: Zeroizing<[u8; PASSWORD_MAX_BYTES]>,
+    // Fill the allocation in place so handing off the password moves only a pointer.
+    bytes: Box<Zeroizing<[u8; PASSWORD_MAX_BYTES]>>,
     len: usize,
 }
 
-fn padded(text: &str) -> Zeroizing<[u8; PASSWORD_MAX_BYTES]> {
-    let mut bytes = Zeroizing::new([0u8; PASSWORD_MAX_BYTES]);
+fn write_padded(bytes: &mut [u8; PASSWORD_MAX_BYTES], text: &str) {
     for (out, byte) in bytes.iter_mut().zip(text.bytes()) {
         *out = byte;
     }
-    bytes
 }
 
 // CtOutput compares every byte of a fixed-size RustCrypto array. Here it only
@@ -148,7 +147,9 @@ impl Password {
         if text.is_empty() || text.len() > PASSWORD_MAX_BYTES || text.chars().count() > PASSWORD_MAX_CHARS {
             return None;
         }
-        Some(Self { bytes: padded(text), len: text.len() })
+        let mut bytes = Box::new(Zeroizing::new([0u8; PASSWORD_MAX_BYTES]));
+        write_padded(&mut bytes, text);
+        Some(Self { bytes, len: text.len() })
     }
 
     fn meets_new_minimum(&self) -> bool {
@@ -171,17 +172,19 @@ impl Password {
         }
         // the design does not say how variations are treated. Reject case and outer
         // whitespace variations of the email and list entries. Keep the actual password exact.
-        fn folded(text: &str) -> Zeroizing<[u8; PASSWORD_MAX_BYTES]> {
-            let mut bytes = padded(text);
+        fn fold_into(bytes: &mut [u8; PASSWORD_MAX_BYTES], text: &str) {
+            write_padded(bytes, text);
             bytes.make_ascii_lowercase();
-            bytes
         }
 
         let spelling = self.expose().trim();
-        let candidate = folded(spelling);
+        let mut candidate = Zeroizing::new([0u8; PASSWORD_MAX_BYTES]);
+        fold_into(&mut candidate, spelling);
         let matches = |text: &str| {
             let text = text.trim();
-            same_bytes::<U512>(candidate.as_ref(), folded(text).as_ref())
+            let mut comparison = Zeroizing::new([0u8; PASSWORD_MAX_BYTES]);
+            fold_into(&mut comparison, text);
+            same_bytes::<U512>(candidate.as_ref(), comparison.as_ref())
                 & same_bytes::<U8>(&(spelling.len() as u64).to_be_bytes(), &(text.len() as u64).to_be_bytes())
         };
         let blocked = common_passwords.lines().fold(matches(email.as_str()), |blocked, line| blocked | matches(line));
@@ -191,7 +194,7 @@ impl Password {
 
 impl PartialEq for Password {
     fn eq(&self, other: &Self) -> bool {
-        same_bytes::<U512>(self.bytes.as_ref(), other.bytes.as_ref())
+        same_bytes::<U512>(&self.bytes[..], &other.bytes[..])
             & same_bytes::<U8>(&(self.len as u64).to_be_bytes(), &(other.len as u64).to_be_bytes())
     }
 }
@@ -1158,8 +1161,8 @@ impl<T: ReplyResult> wire::Message for Reply<T> {
 }
 
 
-// Password work uses one reserved worker per door. The server owns the worker,
-// queue, and account reservations. No rate state contains a password or a code.
+// Password work uses two workers. Verified codes share the known-device worker.
+// The server owns the workers, queues and account reservations.
 pub const OTHER_PASSWORDS_WAITING: usize = 8;
 pub const PASSWORD_QUEUE_MS: u64 = 10_000;
 pub const FIRST_PASSWORD_WAIT_MS: u64 = 1_000;
@@ -1173,6 +1176,8 @@ const SECOND_MS: u64 = 1_000;
 pub enum PasswordDoor {
     KnownDevice,
     Other,
+    /// Make a new verifier after the caller independently verifies a live code.
+    RedeemedCode,
 }
 
 impl PasswordDoor {
@@ -1230,9 +1235,8 @@ pub fn admit_password_check(
         return PasswordAdmission::ComeBack(wait);
     }
     match door {
-        PasswordDoor::KnownDevice => {
-            // the design does not say how much the known door holds while occupied.
-            // Keep no queue there. Busy is a retry, and the other door has no effect.
+        PasswordDoor::KnownDevice | PasswordDoor::RedeemedCode => {
+            // The reserved worker keeps no queue. The other worker has no effect.
             if load.worker_busy || load.account_busy {
                 PasswordAdmission::Busy
             } else {
@@ -1295,6 +1299,7 @@ impl PasswordWaitKey {
         let device = match door {
             PasswordDoor::KnownDevice => Some(device?),
             PasswordDoor::Other => None,
+            PasswordDoor::RedeemedCode => return None,
         };
         Some(Self { email: email.clone(), device })
     }
@@ -1352,7 +1357,7 @@ impl PasswordWaits {
 }
 
 /// The fast code check has its own rolling window. Issuing the new password
-/// verifier after a valid code still uses the server's fixed password workers.
+/// verifier after a valid code uses the known-device worker without password backoff.
 #[derive(Default)]
 pub struct CodeLimit {
     seen: VecDeque<u64>,
