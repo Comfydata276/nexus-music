@@ -2,14 +2,17 @@
 //! The app supplies observations and time. Storage, transport and the device switch
 //! itself belong to the caller.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 use std::fmt::{self, Write};
 
 use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::Serialize;
+use serde_json::value::RawValue;
 
-use super::events::{DeviceKind, TIME_MAX_MS, read_json};
+use super::account::{self, DeviceKind, Reply, ReplyResult, RequestHead, RequestId};
+use super::events::{LossCounts, TIME_MAX_MS};
 use super::proto::Version;
+use super::wire::{self, BadMessage, Fields, WireBody};
 
 pub use super::events::{Fault, FaultPlace, FaultShape, Wrong};
 
@@ -92,46 +95,35 @@ impl Schedule {
     }
 
     pub fn note_fault(&mut self, at_ms: u64) {
+        self.forget_future(at_ms);
         let latest = self.attempts.back().copied().unwrap_or(self.started_ms);
         if (latest..=TIME_MAX_MS).contains(&at_ms) {
             self.fault_ms = Some(self.fault_ms.map_or(at_ms, |was| was.min(at_ms)));
         }
     }
 
-    /// The design does not say where a day begins. Use a rolling 24-hour cap, and a
-    /// full day from first use or the last attempt for the normal timer. When the
-    /// clock goes backwards or the app is idle, wait.
+    /// Use a rolling 24-hour cap and a full day from first use or the last attempt.
+    /// The design does not say how to handle clock changes. Keep the existing
+    /// wait for small backward steps, but ignore times more than a day ahead.
     pub fn due(&self, now_ms: u64, enabled: bool, in_use: bool) -> Option<Due> {
-        if !enabled
-            || !in_use
-            || now_ms > TIME_MAX_MS
-            || now_ms < self.started_ms
-            || self.fault_ms.is_some_and(|at| at > now_ms)
-            || self
-                .attempts
-                .back()
-                .is_some_and(|&at| !elapsed(at, now_ms, MIN_GAP_MS))
+        if !enabled || !in_use || now_ms > TIME_MAX_MS {
+            return None;
+        }
+        let cutoff = now_ms.saturating_add(DAY_MS);
+        let started = if self.started_ms > cutoff { now_ms } else { self.started_ms };
+        let attempts = self.attempts.iter().copied().take_while(|&at| at <= cutoff);
+        let last = attempts.clone().last();
+        let fault = self.fault_ms.filter(|&at| at <= cutoff);
+        if now_ms < started
+            || fault.is_some_and(|at| at > now_ms)
+            || last.is_some_and(|at| !elapsed(at, now_ms, MIN_GAP_MS))
+            || attempts.filter(|&at| !elapsed(at, now_ms, DAY_MS)).count() == MAX_PER_DAY
         {
             return None;
         }
-        if self.attempts.len() == MAX_PER_DAY
-            && self
-                .attempts
-                .front()
-                .is_some_and(|&at| !elapsed(at, now_ms, DAY_MS))
-        {
-            return None;
-        }
-        if self
-            .fault_ms
-            .is_some_and(|at| elapsed(at, now_ms, FAULT_WAIT_MS))
-        {
+        if fault.is_some_and(|at| elapsed(at, now_ms, FAULT_WAIT_MS)) {
             Some(Due::Fault)
-        } else if elapsed(
-            self.attempts.back().copied().unwrap_or(self.started_ms),
-            now_ms,
-            DAY_MS,
-        ) {
+        } else if elapsed(last.unwrap_or(started), now_ms, DAY_MS) {
             Some(Due::Daily)
         } else {
             None
@@ -140,11 +132,24 @@ impl Schedule {
 
     /// Consume one due attempt. A report sent by either timer covers the notes so far.
     pub fn take_due(&mut self, now_ms: u64, enabled: bool, in_use: bool) -> Option<Due> {
+        self.forget_future(now_ms);
         let due = self.due(now_ms, enabled, in_use)?;
         self.attempts.retain(|&at| !elapsed(at, now_ms, DAY_MS));
         self.attempts.push_back(now_ms);
         self.fault_ms = None;
         Some(due)
+    }
+
+    fn forget_future(&mut self, now_ms: u64) {
+        if now_ms > TIME_MAX_MS {
+            return;
+        }
+        let cutoff = now_ms.saturating_add(DAY_MS);
+        if self.started_ms > cutoff {
+            self.started_ms = now_ms;
+        }
+        self.attempts.retain(|&at| at <= cutoff);
+        self.fault_ms = self.fault_ms.filter(|&at| at <= cutoff);
     }
 }
 
@@ -171,6 +176,7 @@ pub fn reports_to_keep(received: &[u64], now_ms: u64) -> impl Iterator<Item = us
 pub struct About {
     pub version: Version,
     pub device: DeviceKind,
+    /// Use zero for a component the OS omits. Android 14 is written as 14.0.0.
     pub os: Version,
     pub signed_in: bool,
     pub https: bool,
@@ -178,6 +184,7 @@ pub struct About {
     /// Whether local network permission is held. PCs have no such setting.
     pub local_permission: Option<bool>,
     pub android_auto: Option<bool>,
+    pub loss: LossCounts,
 }
 
 macro_rules! words {
@@ -227,13 +234,20 @@ words!(Note {
     StartAgain => "Nexus asked to start again",
     EventsSent => "Events sent",
     EventsRefused => "Events refused",
-    EventsDropped => "Events dropped",
+    AppMessage => "App message shown",
+    DownloadsFolderChanged => "Downloads folder changed",
+    MediaButtonStarted => "Media button started the player",
+    MediaButtonNothingToResume => "Media button had nothing to resume",
+    MediaButtonStartRefused => "Android refused to start the player from a media button",
+    SharedLibraryUnavailable => "Shared library could not be loaded",
 });
 words!(SessionEnded {
     SignedOut => "signed out",
     ForcedOut => "forced out",
     Expired => "expired",
     PasswordChanged => "password changed",
+    PasswordReset => "password reset",
+    DataPutBack => "data put back",
     AccountSwitchedOff => "account switched off",
     AccountDeleted => "account deleted",
     Other => "other",
@@ -280,6 +294,8 @@ pub enum Line {
     Fault(Fault),
     SessionEnded(SessionEnded),
     ForegroundAfterMs(u32),
+    // The design does not say how to carry the platform's reason. Keep only its code.
+    DownloadJobStopped(u8),
     LastAttempt(Trace),
     LastFailure(Trace),
 }
@@ -314,8 +330,51 @@ const SHAPES: &[(FaultShape, &str)] = &[
     (FaultShape::NoSound, "no sound"),
     (FaultShape::QueueFull, "queue full"),
     (FaultShape::JournalFull, "journal full"),
+    (FaultShape::BorrowConflict, "borrow conflict"),
+    (FaultShape::PoisonedLock, "poisoned lock"),
+    (FaultShape::MissingValue, "missing value"),
+    (FaultShape::UnexpectedResultError, "unexpected result error"),
+    (FaultShape::Bounds, "out of bounds"),
+    (FaultShape::Assertion, "assertion failed"),
+    (FaultShape::Overflow, "overflow"),
+    (FaultShape::NoPayload, "no panic payload"),
+    (FaultShape::Panic, "panic"),
     (FaultShape::Other, "other"),
 ];
+
+/// Classify the Rust panic payload using fixed markers. The result has no text field.
+/// The design does not say how to recognize panic kinds. Unknown wording is a panic
+/// without a more specific shape. The Windows hook writes "no message" for a
+/// non-text payload.
+pub fn classify_rust_panic(message: &str) -> FaultShape {
+    if matches!(message, "no message" | "no payload") || message.chars().all(char::is_whitespace) {
+        FaultShape::NoPayload
+    } else if ["BorrowMutError", "BorrowError", "already borrowed", "already mutably borrowed"]
+        .iter()
+        .any(|marker| message.contains(marker))
+    {
+        FaultShape::BorrowConflict
+    } else if message.contains("PoisonError") {
+        FaultShape::PoisonedLock
+    } else if message.contains("called `Option::unwrap()` on a `None` value") {
+        FaultShape::MissingValue
+    } else if message.contains("called `Result::unwrap()` on an `Err` value") {
+        FaultShape::UnexpectedResultError
+    } else if ["index out of bounds", "out of range for slice", "is not a char boundary", "slice index starts at"]
+        .iter()
+        .any(|marker| message.contains(marker))
+    {
+        FaultShape::Bounds
+    } else if message.contains("assertion failed")
+        || (message.contains("assertion `") && message.contains("` failed"))
+    {
+        FaultShape::Assertion
+    } else if message.contains("with overflow") || message.contains("capacity overflow") {
+        FaultShape::Overflow
+    } else {
+        FaultShape::Panic
+    }
+}
 
 fn label<T: PartialEq>(table: &[(T, &'static str)], what: T) -> &'static str {
     table
@@ -342,6 +401,9 @@ impl fmt::Display for Line {
             ),
             Self::SessionEnded(why) => write!(f, "Nexus session ended: {}", why.text()),
             Self::ForegroundAfterMs(ms) => write!(f, "Foreground entered after {ms} ms"),
+            Self::DownloadJobStopped(reason) => {
+                write!(f, "Android stopped the download job (reason {reason})")
+            }
             Self::LastAttempt(trace) => write!(f, "Nexus last attempt: {trace}"),
             Self::LastFailure(trace) => write!(f, "Nexus last failure: {trace}"),
         }
@@ -370,6 +432,9 @@ impl Line {
             let ms = number(ms)?;
             return (ms <= MAX_FOREGROUND_MS).then_some(Self::ForegroundAfterMs(ms));
         }
+        if let Some(reason) = text.strip_prefix("Android stopped the download job (reason ").and_then(|reason| reason.strip_suffix(')')) {
+            return Some(Self::DownloadJobStopped(u8::try_from(number(reason)?).ok()?));
+        }
         if let Some(trace) = text.strip_prefix("Nexus last attempt: ") {
             return Trace::read(trace).map(Self::LastAttempt);
         }
@@ -378,19 +443,30 @@ impl Line {
             .map(Self::LastFailure)
     }
 
-    fn trace_slot(self) -> Option<bool> {
+    fn latest_slot(self) -> Option<LatestSlot> {
         match self {
-            Self::LastAttempt(_) => Some(false),
-            Self::LastFailure(_) => Some(true),
+            Self::LastAttempt(_) => Some(LatestSlot::Attempt),
+            Self::LastFailure(_) => Some(LatestSlot::Failure),
+            // The design does not say how to group timing values. Keep only the latest.
+            Self::ForegroundAfterMs(_) => Some(LatestSlot::Foreground),
             _ => None,
         }
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum LatestSlot {
+    Attempt,
+    Failure,
+    Foreground,
+}
+
 fn number(text: &str) -> Option<u32> {
-    if text.is_empty()
-        || text.len() > 10
-        || !text.bytes().all(|b| b.is_ascii_digit())
+    u32::try_from(decimal(text)?).ok()
+}
+
+fn decimal(text: &str) -> Option<u64> {
+    if text.is_empty() || text.len() > 20 || !text.bytes().all(|b| b.is_ascii_digit())
         || (text.len() > 1 && text.starts_with('0'))
     {
         return None;
@@ -438,7 +514,7 @@ impl Record {
         {
             return;
         }
-        let count = if line.trace_slot().is_some() {
+        let count = if line.latest_slot().is_some() {
             1
         } else {
             count
@@ -476,10 +552,10 @@ impl Record {
     }
 
     fn add(&mut self, mut entry: Entry) {
-        let slot = entry.line.trace_slot();
+        let slot = entry.line.latest_slot();
         let index = self.entries.iter().position(|old| {
             if slot.is_some() {
-                old.line.trace_slot() == slot
+                old.line.latest_slot() == slot
             } else {
                 old.line == entry.line
             }
@@ -496,11 +572,12 @@ impl Record {
         if self.entries.len() > MAX_ENTRIES {
             // The design does not say how to keep both required traces when the record
             // fills. Reserve their places and age out the oldest other observation.
-            if let Some(index) = self
-                .entries
-                .iter()
-                .position(|entry| entry.line.trace_slot().is_none())
-            {
+            if let Some(index) = self.entries.iter().position(|entry| {
+                !matches!(
+                    entry.line.latest_slot(),
+                    Some(LatestSlot::Attempt | LatestSlot::Failure)
+                )
+            }) {
                 self.entries.remove(index);
             }
         }
@@ -509,7 +586,12 @@ impl Record {
 
 const HEADING: &str = "What the player has met (times in UTC):";
 const EMPTY: &str = "  (nothing yet)";
-const DATE: &str = "%Y-%m-%d %H:%M:%S%.3f";
+// Use the phone's whole-second display. The file/report can only restore this
+// precision. In-memory observations keep the supplied millisecond times.
+const DATE: &str = "%Y-%m-%d %H:%M:%S";
+const LINE_FULL: &str = "Events dropped because the journal queue was full: ";
+const FILES_FULL: &str = "Events lost because the waiting files were full: ";
+const REFUSED_FOR_GOOD: &str = "Events refused for good: ";
 
 fn yes(on: bool) -> &'static str {
     if on { "yes" } else { "no" }
@@ -570,8 +652,8 @@ impl Report {
             return Err(Wrong::Field);
         }
         write!(text,
-            "Nexus Music {} on {device} (OS {})\nSigned in: {}\nHTTPS: {}\nOffline: {}\nLocal network permission: {}\nAndroid Auto: {}\n\n{HEADING}",
-            a.version, a.os, yes(a.signed_in), yes(a.https), yes(a.offline), maybe(a.local_permission), maybe(a.android_auto),
+            "Nexus Music {} on {device} (OS {})\nSigned in: {}\nHTTPS: {}\nOffline: {}\nLocal network permission: {}\nAndroid Auto: {}\n{LINE_FULL}{}\n{FILES_FULL}{}\n{REFUSED_FOR_GOOD}{}\n\n{HEADING}",
+            a.version, a.os, yes(a.signed_in), yes(a.https), yes(a.offline), maybe(a.local_permission), maybe(a.android_auto), a.loss.line_full, a.loss.files_full, a.loss.refused,
         ).map_err(|_| Wrong::Form)?;
         if self.record.entries.is_empty() {
             write!(text, "\n{EMPTY}").map_err(|_| Wrong::Form)?;
@@ -633,6 +715,11 @@ impl Report {
                 lines.next()?.strip_prefix("Local network permission: ")?,
             )?,
             android_auto: read_maybe(lines.next()?.strip_prefix("Android Auto: ")?)?,
+            loss: LossCounts {
+                line_full: decimal(lines.next()?.strip_prefix(LINE_FULL)?)?,
+                files_full: decimal(lines.next()?.strip_prefix(FILES_FULL)?)?,
+                refused: decimal(lines.next()?.strip_prefix(REFUSED_FOR_GOOD)?)?,
+            },
         };
         if lines.next()? != "" || lines.next()? != HEADING {
             return None;
@@ -642,8 +729,8 @@ impl Report {
         if first == EMPTY {
             return lines.next().is_none().then_some(Self { about, record });
         }
-        let mut seen = HashSet::new();
-        let mut slots = [false; 2];
+        let mut seen = BTreeSet::new();
+        let mut slots = BTreeSet::new();
         for line in std::iter::once(first).chain(lines) {
             if record.entries.len() == MAX_ENTRIES || line.len() > MAX_LINE_CHARS {
                 return None;
@@ -663,12 +750,10 @@ impl Report {
             if first_ms > last_ms || count == 0 || (count == 1 && first_ms != last_ms) {
                 return None;
             }
-            if let Some(slot) = line.trace_slot() {
-                let exists = slots.get_mut(usize::from(slot))?;
-                if *exists || count != 1 {
+            if let Some(slot) = line.latest_slot() {
+                if !slots.insert(slot) || count != 1 {
                     return None;
                 }
-                *exists = true;
             }
             // Line's text is entirely fixed or a bounded number, and is the identity
             // used by the phone to count repeated observations.
@@ -686,55 +771,67 @@ impl Report {
     }
 }
 
-/// The one upload. No caller can construct it from unchecked report text.
-pub struct Upload(String);
+/// The one upload. The shared request head carries the protocol and restore
+/// numbers. The request id identifies this write under §12.2.
+#[derive(Serialize)]
+pub struct Upload {
+    pub head: RequestHead,
+    pub request_id: RequestId,
+    text: String,
+}
 
 impl Upload {
-    pub fn new(report: &Report) -> Result<Self, Wrong> {
-        Ok(Self(report.text()?))
+    pub fn new(head: RequestHead, request_id: RequestId, report: &Report) -> Result<Self, Wrong> {
+        Ok(Self {
+            head,
+            request_id,
+            text: report.text()?,
+        })
     }
 
     pub fn text(&self) -> &str {
-        &self.0
+        &self.text
     }
 
-    /// Budget for the surrounding authenticated request when asking for these bytes.
-    pub fn write(&self, max_bytes: usize) -> Result<Vec<u8>, Wrong> {
-        #[derive(Serialize)]
-        struct Wire<'a> {
-            text: &'a str,
-        }
-        let bytes = serde_json::to_vec(&Wire { text: self.text() }).map_err(|_| Wrong::Form)?;
-        if bytes.len() > max_bytes.min(CALL_BYTES) {
-            return Err(Wrong::Size);
-        }
-        Ok(bytes)
+    pub fn write(&self) -> Result<WireBody, Wrong> {
+        wire::encode(self).map_err(Into::into)
     }
 
     pub fn read(whole_body: &[u8]) -> Result<Self, Wrong> {
-        let object = read_json(whole_body, CALL_BYTES)?;
-        let text = object
-            .get("text")
-            .and_then(serde_json::Value::as_str)
-            .ok_or(Wrong::Form)?;
-        Report::read(text)?;
-        Ok(Self(text.to_owned()))
+        wire::read(whole_body).map_err(Into::into)
     }
 }
 
-// The design does not say the success status or body for the upload. Require a
-// whole 200 with a true acknowledgement, and send no Diagnostics text back.
-pub const DONE: &[u8] = br#"{"done":true}"#;
+impl wire::Value for Upload {
+    fn read(raw: &RawValue) -> Result<Self, BadMessage> {
+        let fields = Fields::read(raw)?;
+        let text = wire::json_string(fields.0.get("text").ok_or(BadMessage::Form)?)?;
+        Report::read(&text).map_err(|_| BadMessage::Form)?;
+        Ok(Self {
+            head: fields.get("head")?,
+            request_id: fields.get("request_id")?,
+            text: text.to_string(),
+        })
+    }
+}
 
-pub fn read_done(status: u16, whole_body: &[u8]) -> Result<(), Wrong> {
-    if status != 200 {
-        return Err(Wrong::Status);
-    }
-    let body = read_json(whole_body, CALL_BYTES)?;
-    if body.get("done").and_then(serde_json::Value::as_bool) != Some(true) {
-        return Err(Wrong::Form);
-    }
-    Ok(())
+impl wire::Message for Upload {
+    const MAX_BYTES: usize = CALL_BYTES;
+}
+
+// The design does not say what goes in the successful result beyond the shared
+// receipt. Use an empty object so the upload answer never returns a report.
+wire::object! { Uploaded {} }
+impl ReplyResult for Uploaded {}
+
+pub type UploadReply = Reply<Uploaded>;
+
+pub fn read_reply(status: u16, whole_body: &[u8]) -> Result<UploadReply, Wrong> {
+    account::read_reply(status, whole_body).map_err(Into::into)
+}
+
+pub fn write_reply(reply: &UploadReply) -> Result<WireBody, Wrong> {
+    wire::encode(reply).map_err(Into::into)
 }
 
 #[cfg(test)]
