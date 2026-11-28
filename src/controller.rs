@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 
+use crate::diagnostics::{self, FaultPlace, FaultShape};
 use crate::audio::engine::Engine;
 use crate::audio::dsp::{EQ_BANDS, EQ_RANGE};
 use crate::config::{self, EQ_PRESETS, Paths, QUALITIES, Settings, VOLUME_LEVELS};
@@ -1196,6 +1197,9 @@ impl Controller {
             let result = crate::update::check();
             post(move |ctl| {
                 let page = ctl.ui.global::<ui::Settings>();
+                if let Err(reason) = &result {
+                    diagnostics::fault(FaultPlace::Updates, reason.fault_shape());
+                }
                 match result {
                     Ok(Some(release)) => {
                         page.set_update_download_failed(false);
@@ -1261,12 +1265,16 @@ impl Controller {
             });
             post(move |ctl| {
                 let page = ctl.ui.global::<ui::Settings>();
-                let Ok(path) = result else {
-                    ctl.update_busy.set(false);
-                    page.set_update_busy(false);
-                    page.set_update_download_failed(true);
-                    page.set_update_status("The update couldn't be downloaded. Get it from the release page.".into());
-                    return;
+                let path = match result {
+                    Ok(path) => path,
+                    Err(error) => {
+                        diagnostics::fault(FaultPlace::Updates, error.shape);
+                        ctl.update_busy.set(false);
+                        page.set_update_busy(false);
+                        page.set_update_download_failed(true);
+                        page.set_update_status("The update couldn't be downloaded. Get it from the release page.".into());
+                        return;
+                    }
                 };
                 // The installer closes the app as it starts, maybe before the save at the
                 // end of `main`: the settings are on the disk first, as 0.40.10 had them.
@@ -1275,6 +1283,7 @@ impl Controller {
                     // The installer replaces the program and opens the new version.
                     Ok(()) => ctl.quit(),
                     Err(reason) => {
+                        diagnostics::fault(FaultPlace::Updates, FaultShape::Unavailable);
                         ctl.update_busy.set(false);
                         page.set_update_busy(false);
                         // Don't leave the user stuck: the same file is one click away in a browser.
@@ -1317,6 +1326,9 @@ impl Controller {
             post(move |ctl| {
                 let app = ctl.ui.global::<ui::App>();
                 app.set_login_busy(false);
+                if let Err(error) = &answer {
+                    diagnostics::music_connection_failed(error);
+                }
                 match answer {
                     Ok((client, info)) => {
                         {
@@ -1326,6 +1338,7 @@ impl Controller {
                         }
                         ctl.save_settings_in_passing();
                         if !config::save_password(&ctl.paths, client.server(), &username, &password) {
+                            diagnostics::fault(FaultPlace::App, FaultShape::Write);
                             ctl.toast("Couldn't save your password; you'll need to sign in next time.");
                         }
                         ctl.covers.reset();
@@ -1359,9 +1372,7 @@ impl Controller {
         let app = self.ui.global::<ui::App>();
         app.set_server(client.server().into());
         app.set_username(client.username().into());
-        if let Some(version) = version {
-            app.set_server_version(version.into());
-        }
+        app.set_server_version(version.unwrap_or_default().into());
         // Offline mode holds for whichever way this sign-in came: restored at start-up, or
         // typed in after signing out with it on. (Before the warm-up: nothing is sent.)
         client.set_offline(self.settings.borrow().offline);
@@ -2841,6 +2852,7 @@ impl Controller {
                             view.set_error(e.to_string().into());
                             // With the server out of reach, open on what can still be played.
                             if offline_home && !ctl.downloads.borrow().is_empty() {
+                                diagnostics::music_connection_failed(&e);
                                 ctl.navigate(Route::Downloads);
                                 ctl.toast("Can't reach your server. Here are your downloads.");
                             }

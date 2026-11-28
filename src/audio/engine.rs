@@ -25,6 +25,7 @@ use symphonia::core::units::{Time, TimeBase};
 
 use super::dsp::{Controls, EQ_BANDS, Effects, soft_clip};
 use super::source::{Download, Interrupt};
+use crate::diagnostics::{FaultShape, SoundOutput};
 use crate::subsonic::Client;
 
 /// How long after pausing an exclusive device is handed back for other apps to use.
@@ -75,11 +76,11 @@ pub enum Event {
     /// Everything queued in the engine has finished playing.
     Finished,
     /// `network` is whether fetching the track is what went wrong, as against playing it.
-    Failed { token: u64, message: String, unsupported: bool, network: bool },
+    Failed { token: u64, message: String, unsupported: bool, network: bool, shape: FaultShape },
     /// A radio station announced what it's playing.
     StreamTitle { token: u64, title: String },
     /// The output device was (re)opened: how it's being driven, in words.
-    Output { status: String, exclusive: bool },
+    Output { status: String, exclusive: bool, kind: SoundOutput },
     /// There is nothing to play through.
     NoDevice,
 }
@@ -264,6 +265,7 @@ struct OpenError {
     message: String,
     unsupported: bool,
     network: bool,
+    shape: FaultShape,
 }
 
 /// An opened track: its download, demuxer and decoder.
@@ -650,6 +652,7 @@ impl Worker {
                         message: e.message,
                         unsupported: e.unsupported,
                         network: e.network,
+                        shape: e.shape,
                     }),
                 }
             }
@@ -723,6 +726,7 @@ impl Worker {
                 message: "Couldn't start a thread to open the track.".into(),
                 unsupported: false,
                 network: false,
+                shape: FaultShape::Unavailable,
             });
         }
     }
@@ -766,6 +770,7 @@ impl Worker {
                 self.emit(Event::Output {
                     status: "Exclusive mode is on. The device is taken while a song plays.".into(),
                     exclusive: false,
+                    kind: SoundOutput::WaitingForExclusive,
                 });
             } else {
                 self.open_output_for(format);
@@ -900,6 +905,7 @@ impl Worker {
                     message: if network { format!("{e}") } else { format!("Playback stopped: {e}") },
                     unsupported: false,
                     network,
+                    shape: if network { FaultShape::Connection } else { FaultShape::Read },
                 });
                 self.failed = true;
                 if network {
@@ -935,6 +941,7 @@ impl Worker {
                     message: format!("Playback stopped: {e}"),
                     unsupported: false,
                     network: false,
+                    shape: FaultShape::Decode,
                 });
                 self.failed = true;
                 return self.end_of_deck();
@@ -1166,6 +1173,8 @@ impl Worker {
         self.bits_given = 0;
         #[cfg_attr(not(windows), allow(unused_mut))]
         let mut note = String::new();
+        #[cfg_attr(not(windows), allow(unused_mut))]
+        let mut exclusive_refused = false;
         #[cfg(windows)]
         if choice.exclusive {
             let device = choice.device.strip_prefix("wasapi:").unwrap_or("").to_string();
@@ -1177,23 +1186,30 @@ impl Worker {
                     if std::env::var_os("NEXUS_TRACE").is_some() {
                         eprintln!("[trace] output: {status} (asked for {rate} Hz, {bits}-bit)");
                     }
+                    let kind = SoundOutput::Exclusive { rate_hz: stream.rate, bits: stream.bits };
                     self.output = Some(Output::Exclusive(stream));
-                    self.emit(Event::Output { status, exclusive: true });
+                    self.emit(Event::Output { status, exclusive: true, kind });
                     return;
                 }
                 Err(reason) => {
                     if std::env::var_os("NEXUS_TRACE").is_some() {
                         eprintln!("[trace] exclusive output at {rate} Hz, {bits}-bit: {reason}");
                     }
+                    exclusive_refused = true;
                     note = format!(" Exclusive mode wasn't available ({reason}).");
                 }
             }
         }
         let _ = bits;
-        let (output, status) = match open_device(&self.shared, &choice.device) {
+        let (output, status, kind) = match open_device(&self.shared, &choice.device) {
             Ok((stream, rate)) => {
                 self.set_rate(rate);
-                (Output::Device(stream), format!("Shared with other apps, {}.{note}", khz(rate)))
+                let kind = if exclusive_refused {
+                    SoundOutput::ExclusiveRefused { rate_hz: rate }
+                } else {
+                    SoundOutput::Shared { rate_hz: rate }
+                };
+                (Output::Device(stream), format!("Shared with other apps, {}.{note}", khz(rate)), kind)
             }
             Err(_) => {
                 self.set_rate(48_000);
@@ -1202,16 +1218,16 @@ impl Worker {
                     // queue and count songs nobody heard, so say so and let the player pause;
                     // the device is looked for again when play is pressed.
                     self.no_device = true;
-                    self.emit(Event::Output { status: "No sound device found.".into(), exclusive: false });
+                    self.emit(Event::Output { status: "No sound device found.".into(), exclusive: false, kind: SoundOutput::NoDevice });
                     self.emit(Event::NoDevice);
                     return;
                 };
                 // For checking output without a sound card: play to the file named instead.
-                (Output::Null(spawn_null_output(self.shared.clone(), record_to)), "No sound device found.".to_string())
+                (Output::Null(spawn_null_output(self.shared.clone(), record_to)), "No sound device found.".to_string(), SoundOutput::NoDevice)
             }
         };
         self.output = Some(output);
-        self.emit(Event::Output { status, exclusive: false });
+        self.emit(Event::Output { status, exclusive: false, kind });
     }
 
     fn set_rate(&self, rate: u32) {
@@ -1282,11 +1298,11 @@ fn run_resampler(rs: &mut ResamplerState, out: &mut Vec<f32>) {
 }
 
 fn open_deck(client: Client, mut request: TrackRequest, dir: &std::path::Path, interrupt: Arc<Interrupt>) -> Result<Deck, OpenError> {
-    let fail = |message: String, unsupported: bool| OpenError { message, unsupported, network: false };
+    let fail = |message: String, unsupported: bool, shape| OpenError { message, unsupported, network: false, shape };
     let (source, download): (Box<dyn symphonia::core::io::MediaSource>, Option<Download>) = match &request.local {
         Some(path) => {
             let file = std::fs::File::open(path)
-                .map_err(|e| fail(format!("The downloaded copy couldn't be opened: {e}"), false))?;
+                .map_err(|e| fail(format!("The downloaded copy couldn't be opened: {e}"), false, FaultShape::Read))?;
             (Box::new(file), None)
         }
         None => {
@@ -1299,7 +1315,7 @@ fn open_deck(client: Client, mut request: TrackRequest, dir: &std::path::Path, i
                 download.hold_seeking();
             }
             // The download never got going: the server couldn't be reached, or said no.
-            let reader = download.reader().map_err(|e| OpenError { message: e.to_string(), unsupported: false, network: true })?;
+            let reader = download.reader().map_err(|e| OpenError { message: e.to_string(), unsupported: false, network: true, shape: FaultShape::Connection })?;
             (Box::new(reader), Some(download))
         }
     };
@@ -1321,26 +1337,27 @@ fn open_deck(client: Client, mut request: TrackRequest, dir: &std::path::Path, i
             // doing, and it isn't a format to ask the server to convert.
             let network = download.as_ref().is_some_and(|download| download.troubled());
             let unsupported = matches!(e, SymError::Unsupported(_)) && !network;
-            OpenError { message: format!("This file couldn't be read: {e}"), unsupported, network }
+            let shape = if network { FaultShape::Connection } else { FaultShape::Decode };
+            OpenError { message: format!("This file couldn't be read: {e}"), unsupported, network, shape }
         })?;
     if let Some(download) = &download {
         download.allow_seeking();
     }
     let track = format
         .default_track(TrackType::Audio)
-        .ok_or_else(|| fail("This file has no audio track.".into(), true))?;
+        .ok_or_else(|| fail("This file has no audio track.".into(), true, FaultShape::Decode))?;
     let track_id = track.id;
     let time_base = track.time_base;
     let params = track
         .codec_params
         .as_ref()
         .and_then(|p| p.audio())
-        .ok_or_else(|| fail("This file's audio format isn't recognised.".into(), true))?;
+        .ok_or_else(|| fail("This file's audio format isn't recognised.".into(), true, FaultShape::Decode))?;
     let rate = params.sample_rate.unwrap_or(0);
     let bits = params.bits_per_sample.unwrap_or(0);
     let decoder = symphonia::default::get_codecs()
         .make_audio_decoder(params, &AudioDecoderOptions::default())
-        .map_err(|e| fail(format!("This audio format isn't supported: {e}"), true))?;
+        .map_err(|e| fail(format!("This audio format isn't supported: {e}"), true, FaultShape::Decode))?;
 
     let mut start = 0.0;
     if request.start_secs > 0.5 {

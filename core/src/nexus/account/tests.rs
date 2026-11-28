@@ -1006,3 +1006,25 @@ fn body_limits_win_before_parsing_and_read_only_callers_cannot_raise_the_global_
     assert_eq!(read_reply::<DevicePage>(429, &vec![0xff; SMALL_REPLY_MAX_BYTES + 1]), Err(BadMessage::TooLarge));
     assert_eq!(wire::read_value::<u64>(&vec![0xff; BODY_MAX_BYTES + 1], usize::MAX), Err(BadMessage::TooLarge));
 }
+
+#[test]
+fn a_code_typed_in_groups_reads_as_the_twelve() {
+    let twelve = || OneTimeCode::new("ABCDEFGHJKMN");
+    for typed in ["ABCD-EFGH-JKMN", "abcd efgh jkmn", " abcd - efgh - jkmn ", "ABCDEFGHJKMN"] {
+        assert_eq!(OneTimeCode::typed(typed), twelve(), "{typed}");
+    }
+    assert_eq!(OneTimeCode::typed("ABCD-EFGH-JKMN").unwrap().expose(), "ABCDEFGHJKMN", "the wire form is the twelve alone");
+    let too_long = "A".repeat(10_000);
+    for bad in [
+        "ABCD-EFGH-JKM",           // too short
+        "ABCD-EFGH-JKMNP",         // a thirteenth
+        "\u{410}BCD-EFGH-JKMN",    // a Cyrillic look-alike, not tidied
+        "ABCD\u{a0}EFGH\u{a0}JKMN", // a space that is not ASCII
+        "ABCD_EFGH_JKMN",
+        "",
+        "------------",
+        too_long.as_str(),
+    ] {
+        assert!(OneTimeCode::typed(bad).is_none(), "{bad}");
+    }
+}

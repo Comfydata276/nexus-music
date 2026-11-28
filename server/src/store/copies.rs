@@ -86,6 +86,8 @@ fn copy(source: &Connection, into: &Path) -> Result<(), String> {
     let making = into.with_file_name(format!("{MAKING}{}-{}", std::process::id(), into.file_name().and_then(|name| name.to_str()).unwrap_or("copy")));
     let _ = fs::remove_file(&making);
     let made = (|| -> Result<(), String> {
+        // Made empty and the owner's alone before SQLite writes a byte to it.
+        crate::store::private::create(&making).map_err(|error| format!("{}", error.kind()))?;
         let mut target = Connection::open(&making).map_err(|error| why(&error))?;
         {
             let backup = Backup::new(source, &mut target).map_err(|error| why(&error))?;
@@ -122,7 +124,12 @@ fn copy(source: &Connection, into: &Path) -> Result<(), String> {
 
 fn make_folder(data: &Path) -> Result<PathBuf, String> {
     let copies = folder(data);
-    fs::create_dir_all(&copies).map_err(|error| format!("The folder for copies, {}, can't be made ({}).", copies.display(), error.kind()))?;
+    let fresh = !copies.exists();
+    crate::store::private::folder(&copies).map_err(|error| format!("The folder for copies, {}, can't be made ({}).", copies.display(), error.kind()))?;
+    if fresh {
+        // The folder's name in the data folder is lasting before anything is kept in it.
+        fs::File::open(data).and_then(|folder| folder.sync_all()).map_err(|error| format!("The data folder couldn't be made lasting ({}).", error.kind()))?;
+    }
     Ok(copies)
 }
 
@@ -163,8 +170,45 @@ pub fn before_form(data: &Path, source: &Connection, form: i64, now: u64) -> Res
     Ok(path)
 }
 
-/// Copies `source` (a copy to be put back) to `into` (the data's own place, renamed into it
-/// last): whole, checked and lasting.
-pub fn put(source: &Connection, into: &Path) -> Result<(), String> {
-    copy(source, into)
+/// Stages `source` (a copy to be put back) beside the data, at [`data::incoming`]: whole,
+/// checked, the owner's alone and lasting, so that the exact file checked is the one put in
+/// place.
+pub fn stage(source: &Connection, data: &Path) -> Result<PathBuf, String> {
+    let into = data::incoming(data);
+    copy(source, &into)?;
+    Ok(into)
+}
+
+/// Keeps the data a put-back is about to replace (the review's finding 5): one file, made
+/// by SQLite's own copy from a read of the data as it is (what is written ahead in its
+/// `-wal` included), checked, and lasting with the folder that names it. Under a name of its
+/// own, with the restore number it is replaced under and the time.
+pub fn keep_replaced(source: &Connection, data: &Path, restore: u64, now: u64) -> Result<PathBuf, String> {
+    let copies = make_folder(data)?;
+    let path = copies.join(format!("replaced-{restore}-{now}.db"));
+    copy(source, &path)?;
+    Ok(path)
+}
+
+/// Keeps, byte for byte, data a put-back is about to replace that SQLite cannot read (it is
+/// damaged, or not this program's): each of its files beside the others, lasting. Where the
+/// main file went.
+pub fn keep_raw(data: &Path, restore: u64, now: u64) -> Result<PathBuf, String> {
+    let copies = make_folder(data)?;
+    let main = copies.join(format!("replaced-{restore}-{now}.raw"));
+    let kind = |error: std::io::Error| format!("{}", error.kind());
+    for suffix in ["", "-wal", "-shm"] {
+        let from = PathBuf::from(format!("{}{suffix}", data::place(data).display()));
+        let into = PathBuf::from(format!("{}{suffix}", main.display()));
+        let mut source = match fs::File::open(&from) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            other => other.map_err(kind)?,
+        };
+        let _ = fs::remove_file(&into);
+        let mut file = crate::store::private::create(&into).map_err(kind)?;
+        std::io::copy(&mut source, &mut file).map_err(kind)?;
+        file.sync_all().map_err(kind)?;
+    }
+    fs::File::open(&copies).and_then(|folder| folder.sync_all()).map_err(kind)?;
+    Ok(main)
 }
