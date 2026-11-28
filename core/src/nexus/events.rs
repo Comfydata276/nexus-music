@@ -2,18 +2,25 @@
 //! The caller owns the clock, random bytes, files, the authenticated account and device,
 //! and the transaction that keeps an event or deletes all of a person's events.
 
-use std::collections::HashSet;
+use std::cmp::Ordering;
+use std::collections::BTreeSet;
 use std::fmt;
 
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value};
 
-use super::proto::BackendId;
+pub use super::account::DeviceKind;
+use super::account::AccountId;
+use super::proto::{BackendId, Version};
+use super::wire;
 
 pub const FILE_BYTES: usize = 1024 * 1024;
 pub const WAITING_BYTES: u64 = 64 * 1024 * 1024;
-pub const BATCH_BYTES: usize = 1024 * 1024;
+pub const TAKEN_BYTES: u64 = 16 * 1024 * 1024;
+pub const EVENT_BYTES: usize = 2 * 1024;
+pub const TEXT_CHARS: usize = 200;
+pub const BATCH_BYTES: usize = 512 * 1024;
 pub const BATCH_EVENTS: usize = 500;
 pub const KEEP_MS: u64 = 8 * 24 * 60 * 60 * 1000;
 
@@ -22,10 +29,9 @@ pub const KEEP_MS: u64 = 8 * 24 * 60 * 60 * 1000;
 // to seven days in a position or duration, also the bound on how much sound a start heard.
 pub const TIME_MAX_MS: u64 = 253_402_300_799_999;
 pub const PLAY_MAX_MS: u32 = 7 * 24 * 60 * 60 * 1000;
-pub const MUSIC_ID_BYTES: usize = 256;
-pub const NAME_BYTES: usize = 512;
-pub const SEARCH_BYTES: usize = 512;
-pub const VERSION_BYTES: usize = 64;
+// The design does not say how to compare millisecond progress with a duration
+// truncated to seconds by the music server. Its remaining fraction is at most 999 ms.
+pub const STOP_TOLERANCE_MS: u32 = 999;
 
 // The design does not say the JSON spelling or call paths. The caller wraps each payload
 // in its authenticated request. Stats and deletion are separate calls.
@@ -49,6 +55,18 @@ impl EventId {
 
     pub fn to_hex(self) -> String {
         self.0.to_hex()
+    }
+}
+
+impl PartialOrd for EventId {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for EventId {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0.as_bytes().cmp(other.0.as_bytes())
     }
 }
 
@@ -112,13 +130,6 @@ pub enum FaultShape {
 pub struct Fault {
     pub place: FaultPlace,
     pub shape: FaultShape,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DeviceKind {
-    Pc,
-    Phone,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -196,23 +207,56 @@ pub enum Kind {
     Resume { start: EventId, position_ms: u32 },
     Seek { start: EventId, from_ms: u32, to_ms: u32 },
     Search { words: String, found: u32, #[serde(rename = "where")] where_: SearchedIn },
-    Open { version: String, device: DeviceKind },
+    Open {
+        #[serde(serialize_with = "wire::write_version", deserialize_with = "read_version")]
+        version: Version,
+        #[serde(deserialize_with = "read_device_kind")]
+        device: DeviceKind,
+    },
     Fault { fault: Fault, count: u32 },
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Event {
-    pub id: EventId,
-    pub at_ms: u64,
-    pub sequence: u64,
-    pub event: Kind,
+fn read_version<'de, D: serde::Deserializer<'de>>(input: D) -> Result<Version, D::Error> {
+    Version::parse(&String::deserialize(input)?)
+        .ok_or_else(|| de::Error::custom("invalid app version"))
 }
 
-// Listening events deliberately carry names and search words. Format callers can safely
-// log only the result of validation, never the body or these fields.
-impl fmt::Debug for Event {
+fn read_device_kind<'de, D: serde::Deserializer<'de>>(input: D) -> Result<DeviceKind, D::Error> {
+    match String::deserialize(input)?.as_str() {
+        "pc" => Ok(DeviceKind::Pc),
+        "phone" => Ok(DeviceKind::Phone),
+        _ => Err(de::Error::custom("invalid device kind")),
+    }
+}
+
+/// What the app hands over at the moment an event happens. The writer has not
+/// placed it in the device's order yet.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub struct Record {
+    id: EventId,
+    at_ms: u64,
+    #[serde(rename = "event")]
+    kind: Kind,
+}
+
+/// An event with its device order number, assigned by the journal's writer.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub struct Placed {
+    #[serde(flatten)]
+    record: Record,
+    sequence: u64,
+}
+
+// These values carry names and search words. Neither Debug nor errors print them.
+impl fmt::Debug for Record {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("Event(..)")
+        f.write_str("Record(..)")
+    }
+}
+
+impl fmt::Debug for Placed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Placed(..)")
     }
 }
 
@@ -227,34 +271,81 @@ pub enum Wrong {
     Status,
 }
 
-fn text_ok(text: &str, max: usize) -> bool {
-    text.len() <= max && !text.chars().any(char::is_control)
+fn text_ok(text: &str) -> bool {
+    text.chars().take(TEXT_CHARS + 1).count() <= TEXT_CHARS
+        && !text.chars().any(char::is_control)
 }
 
-fn nonempty(text: &str, max: usize) -> bool {
-    text_ok(text, max) && !text.trim().is_empty()
+fn nonempty(text: &str) -> bool {
+    text_ok(text) && !text.trim().is_empty()
 }
 
-fn version_ok(version: &str) -> bool {
-    nonempty(version, VERSION_BYTES)
-        && version.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+'))
+/// The design does not say how to handle display text beyond the bounds. Keep its
+/// first 200 Unicode scalar values, with controls replaced by spaces. Leave opaque
+/// music IDs exact so truncation cannot point to a different song or source.
+pub fn clean_text(text: &str) -> String {
+    text.chars().take(TEXT_CHARS)
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect()
 }
 
-impl Event {
-    pub fn check(&self) -> Result<(), Wrong> {
+impl Record {
+    pub fn new(id: EventId, at_ms: u64, mut kind: Kind) -> Result<Self, Wrong> {
+        match &mut kind {
+            Kind::Start { title, artist, album, from, .. } => {
+                for text in [title, artist, album] {
+                    *text = clean_text(text);
+                }
+                if let PlayedFrom::Search { words } = from {
+                    *words = clean_text(words);
+                }
+            }
+            Kind::Search { words, .. } => *words = clean_text(words),
+            _ => {}
+        }
+        let record = Self { id, at_ms, kind };
+        record.check()?;
+        // The design does not say which field to discard if individually bounded
+        // text still exceeds 2 KiB together. Refuse rather than silently changing it.
+        // Reserve room for the biggest sequence so placing this record always fits.
+        let largest = Placed { record, sequence: u64::MAX };
+        largest.check_size()?;
+        Ok(largest.record)
+    }
+
+    pub fn id(&self) -> EventId {
+        self.id
+    }
+
+    pub fn at_ms(&self) -> u64 {
+        self.at_ms
+    }
+
+    pub fn kind(&self) -> &Kind {
+        &self.kind
+    }
+
+    pub fn place(self, sequence: u64) -> Result<Placed, Wrong> {
+        if sequence == 0 {
+            return Err(Wrong::Field);
+        }
+        Ok(Placed { record: self, sequence })
+    }
+
+    fn check(&self) -> Result<(), Wrong> {
         let amount = |ms| ms <= PLAY_MAX_MS;
         let other = |id| id != self.id;
-        let valid = match &self.event {
+        let valid = match &self.kind {
             Kind::Start { song_id, title, artist, album, from, position_ms, .. } => {
                 let from_ok = match from {
                     PlayedFrom::Album { id } | PlayedFrom::Playlist { id }
                     | PlayedFrom::Artist { id } | PlayedFrom::Radio { id } | PlayedFrom::Mix { id } =>
-                        nonempty(id, MUSIC_ID_BYTES),
-                    PlayedFrom::Search { words } => nonempty(words, SEARCH_BYTES),
+                        nonempty(id),
+                    PlayedFrom::Search { words } => nonempty(words),
                     PlayedFrom::Queue | PlayedFrom::LikedSongs => true,
                 };
-                nonempty(song_id, MUSIC_ID_BYTES)
-                    && [title, artist, album].iter().all(|s| text_ok(s, NAME_BYTES))
+                nonempty(song_id)
+                    && [title, artist, album].iter().all(|s| text_ok(s))
                     && from_ok && amount(*position_ms)
             }
             Kind::Stop { start, position_ms, duration_ms, heard_ms, why } => {
@@ -262,19 +353,45 @@ impl Event {
                     && [position_ms, duration_ms, heard_ms].iter().all(|ms| ms.is_none_or(amount))
                     && (matches!(why, Stopped::Unknown)
                         || (position_ms.is_some() && duration_ms.is_some() && heard_ms.is_some()))
-                    && position_ms.zip(*duration_ms).is_none_or(|(position, duration)| position <= duration)
+                    && position_ms.zip(*duration_ms).is_none_or(|(position, duration)| position <= duration + STOP_TOLERANCE_MS)
             }
             Kind::Pause { start, position_ms } | Kind::Resume { start, position_ms } =>
                 other(*start) && amount(*position_ms),
             Kind::Seek { start, from_ms, to_ms } => other(*start) && amount(*from_ms) && amount(*to_ms),
-            Kind::Search { words, .. } => nonempty(words, SEARCH_BYTES),
-            Kind::Open { version, .. } => version_ok(version),
+            Kind::Search { words, .. } => nonempty(words),
+            Kind::Open { .. } => true,
             Kind::Fault { count, .. } => *count > 0,
         };
-        if self.at_ms > TIME_MAX_MS || self.sequence == 0 || !valid {
+        if self.at_ms > TIME_MAX_MS || !valid {
             return Err(Wrong::Field);
         }
         Ok(())
+    }
+
+}
+
+impl Placed {
+    pub fn record(&self) -> &Record {
+        &self.record
+    }
+
+    pub fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    fn check_size(&self) -> Result<(), Wrong> {
+        if serde_json::to_vec(self).map_err(|_| Wrong::Form)?.len() > EVENT_BYTES {
+            return Err(Wrong::Size);
+        }
+        Ok(())
+    }
+
+    fn check(&self) -> Result<(), Wrong> {
+        if self.sequence == 0 {
+            return Err(Wrong::Field);
+        }
+        self.record.check()?;
+        self.check_size()
     }
 
     fn from_value(value: Value) -> Result<Self, Wrong> {
@@ -297,19 +414,26 @@ impl Event {
         }) {
             return Err(Wrong::Form);
         }
-        let event: Self = serde_json::from_value(value).map_err(|_| Wrong::Form)?;
+        let object = value.as_object().ok_or(Wrong::Form)?;
+        let id = object.get("id").and_then(Value::as_str).and_then(EventId::from_hex).ok_or(Wrong::Form)?;
+        let at_ms = object.get("at_ms").and_then(Value::as_u64).ok_or(Wrong::Form)?;
+        let sequence = object.get("sequence").and_then(Value::as_u64).ok_or(Wrong::Form)?;
+        let kind = serde_json::from_value(Value::Object(event.clone())).map_err(|_| Wrong::Form)?;
+        let event = Self { record: Record { id, at_ms, kind }, sequence };
         event.check()?;
         Ok(event)
     }
 
     pub fn read(bytes: &[u8]) -> Result<Self, Wrong> {
-        Self::from_value(read_json(bytes, FILE_BYTES)?)
+        Self::from_value(read_json(bytes, EVENT_BYTES)?)
     }
 
     /// A JSON object followed by LF. A file can hold whole lines only.
     pub fn line(&self) -> Result<Vec<u8>, Wrong> {
         self.check()?;
-        json_line(self)
+        let mut bytes = serde_json::to_vec(self).map_err(|_| Wrong::Form)?;
+        bytes.push(b'\n');
+        Ok(bytes)
     }
 }
 
@@ -321,12 +445,12 @@ pub fn next_sequence(last: u64) -> Option<u64> {
 
 /// Start ids left open in this device and life, in device order. Every event is read
 /// first, so a stop written earlier in a different file also closes its start.
-pub fn open_starts<'a>(events: impl IntoIterator<Item = &'a Event>) -> Vec<EventId> {
+pub fn open_starts<'a>(events: impl IntoIterator<Item = &'a Placed>) -> Vec<EventId> {
     let mut starts = Vec::new();
-    let mut stopped = HashSet::new();
+    let mut stopped = BTreeSet::new();
     for event in events {
-        match &event.event {
-            Kind::Start { .. } => starts.push((event.sequence, event.id)),
+        match event.record.kind() {
+            Kind::Start { .. } => starts.push((event.sequence, event.record.id)),
             Kind::Stop { start, .. } => { stopped.insert(*start); }
             _ => {}
         }
@@ -342,20 +466,14 @@ pub fn end_open_start(
     saved_position: Option<(EventId, u32)>,
     id: EventId,
     at_ms: u64,
-    sequence: u64,
-) -> Result<Event, Wrong> {
-    let event = Event {
-        id, at_ms, sequence,
-        event: Kind::Stop {
-            start,
-            position_ms: saved_position.filter(|(saved, _)| *saved == start).map(|(_, ms)| ms),
-            duration_ms: None,
-            heard_ms: None,
-            why: Stopped::Unknown,
-        },
-    };
-    event.check()?;
-    Ok(event)
+) -> Result<Record, Wrong> {
+    Record::new(id, at_ms, Kind::Stop {
+        start,
+        position_ms: saved_position.filter(|(saved, _)| *saved == start).map(|(_, ms)| ms),
+        duration_ms: None,
+        heard_ms: None,
+        why: Stopped::Unknown,
+    })
 }
 
 // The design does not say the journal's byte format. One JSON header gives the account
@@ -364,11 +482,15 @@ pub fn end_open_start(
 // LF can never become a committed line after a kill.
 #[derive(Serialize, Deserialize)]
 struct Header {
+    format: u64,
     life: u64,
 }
 
+// The design does not say how to recognize later file layouts. Number this layout.
+pub const FILE_FORMAT: u64 = 1;
+
 pub fn file_header(life: u64) -> Result<Vec<u8>, Wrong> {
-    json_line(&Header { life })
+    json_line(&Header { format: FILE_FORMAT, life })
 }
 
 fn json_line(value: &impl Serialize) -> Result<Vec<u8>, Wrong> {
@@ -382,7 +504,7 @@ fn json_line(value: &impl Serialize) -> Result<Vec<u8>, Wrong> {
 
 pub struct JournalFile {
     pub life: u64,
-    pub events: Vec<Event>,
+    pub events: Vec<Placed>,
     pub skipped_lines: usize,
 }
 
@@ -393,9 +515,12 @@ pub fn read_file(bytes: &[u8]) -> Result<JournalFile, Wrong> {
     let mut lines = bytes.split_inclusive(|b| *b == b'\n');
     let header = lines.next().and_then(|line| line.strip_suffix(b"\n")).ok_or(Wrong::Form)?;
     let header: Header = serde_json::from_value(read_json(header, FILE_BYTES)?).map_err(|_| Wrong::Form)?;
+    if header.format != FILE_FORMAT {
+        return Err(Wrong::Form);
+    }
     let mut file = JournalFile { life: header.life, events: Vec::new(), skipped_lines: 0 };
     for line in lines {
-        match line.strip_suffix(b"\n").and_then(|line| Event::read(line).ok()) {
+        match line.strip_suffix(b"\n").and_then(|line| Placed::read(line).ok()) {
             Some(event) => file.events.push(event),
             None => file.skipped_lines += 1,
         }
@@ -406,7 +531,7 @@ pub fn read_file(bytes: &[u8]) -> Result<JournalFile, Wrong> {
 /// The writer supplies the trailing byte and byte length of a known journal file under
 /// its own lock. If absent, torn, too full, or in another life, start a fresh file.
 /// The bytes returned include the header only for a fresh file.
-pub fn append(life: u64, tail: Option<FileTail>, event: &Event) -> Result<Append, Wrong> {
+pub fn append(life: u64, tail: Option<FileTail>, event: &Placed) -> Result<Append, Wrong> {
     let line = event.line()?;
     if tail.is_some_and(|tail| {
         tail.life == life && tail.last_byte == b'\n' && tail.bytes > 0
@@ -446,49 +571,88 @@ pub struct KeptFile {
 pub struct RemoveFiles {
     /// Positions in the caller's oldest-first list.
     pub remove: Vec<usize>,
-    /// Event lines in files lost to the waiting cap, to be reported as a fault.
+    /// Pending event lines lost to the waiting cap. Taken and refused lines are settled.
     pub dropped: u64,
 }
 
-/// The design does not say how terminal refusals affect retention. They do not count as
-/// waiting; retain a fully answered file for eight days after its last terminal answer.
-/// The 64 MiB cap applies to waiting files, including a file partly taken. On restore
-/// use [`Outcome::should_send`] to mark taken events waiting again. The design does
-/// not say what to do with an empty file. An empty closed file can go immediately.
+/// The design does not say how terminal refusals affect retention. Treat a fully
+/// answered file as settled, with the same age and byte limits as files all taken.
+/// On restore use [`Outcome::should_send`] to mark taken events waiting again.
 pub fn remove_files(files: &[KeptFile], life: u64, now_ms: u64) -> RemoveFiles {
-    let mut waiting: u128 = files.iter().filter(|file| file.life == life && file.events > 0 && file.pending > 0)
-        .map(|file| u128::from(file.bytes)).sum();
+    let mut waiting = 0u128;
+    let mut taken = 0u128;
+    for file in files.iter().filter(|file| file.life == life && file.events > 0) {
+        if file.pending > 0 {
+            waiting += u128::from(file.bytes);
+        } else if !expired(file, now_ms) {
+            taken += u128::from(file.bytes);
+        }
+    }
     let mut plan = RemoveFiles { remove: Vec::new(), dropped: 0 };
     for (index, file) in files.iter().enumerate() {
         if file.life != life || file.events == 0 {
             plan.remove.push(index);
         } else if file.pending == 0 {
-            if file.final_at_ms.and_then(|at| now_ms.checked_sub(at)).is_some_and(|age| age >= KEEP_MS) {
+            if expired(file, now_ms) {
+                plan.remove.push(index);
+            } else if taken > u128::from(TAKEN_BYTES) {
+                taken -= u128::from(file.bytes);
                 plan.remove.push(index);
             }
         } else if waiting > u128::from(WAITING_BYTES) {
             waiting -= u128::from(file.bytes);
             plan.remove.push(index);
-            plan.dropped = plan.dropped.saturating_add(file.events);
+            plan.dropped = plan.dropped.saturating_add(file.pending);
         }
     }
     plan
 }
 
+fn expired(file: &KeptFile, now_ms: u64) -> bool {
+    file.final_at_ms.and_then(|at| now_ms.checked_sub(at)).is_some_and(|age| age >= KEEP_MS)
+}
+
+/// Device totals. Persist increments with the resulting journal or reply state,
+/// so reading a refusal or removing a file twice does not add the loss twice.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LossCounts {
+    pub line_full: u64,
+    pub files_full: u64,
+    pub refused: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Loss {
+    LineFull,
+    FilesFull,
+    Refused,
+}
+
+impl LossCounts {
+    pub fn add(&mut self, loss: Loss, count: u64) {
+        let total = match loss {
+            Loss::LineFull => &mut self.line_full,
+            Loss::FilesFull => &mut self.files_full,
+            Loss::Refused => &mut self.refused,
+        };
+        *total = total.saturating_add(count);
+    }
+}
+
 /// The scope comes from the authenticated account, never from the event body.
 #[derive(Clone, PartialEq, Eq, Hash)]
-pub struct EventKey<Account> {
-    pub account: Account,
+pub struct EventKey {
+    pub account: AccountId,
     pub id: EventId,
 }
 
 /// Delete every id owned by the signed-in account, across devices, in one transaction
 /// after advancing its life in the store kept apart. No caller-supplied list limits it.
-pub fn ids_to_delete<'a, Account: PartialEq + 'a>(
-    account: &Account,
-    keys: impl IntoIterator<Item = &'a EventKey<Account>>,
+pub fn ids_to_delete<'a>(
+    account: AccountId,
+    keys: impl IntoIterator<Item = &'a EventKey>,
 ) -> impl Iterator<Item = EventId> {
-    keys.into_iter().filter(move |key| &key.account == account).map(|key| key.id)
+    keys.into_iter().filter(move |key| key.account == account).map(|key| key.id)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -526,7 +690,7 @@ pub fn intake(life: u64, sent_life: u64, existing: Existing, room: bool) -> Inta
 /// envelope available to the caller, so adding authentication cannot exceed 1 MiB.
 pub struct Batch {
     life: u64,
-    events: Vec<Event>,
+    events: Vec<Placed>,
 }
 
 impl Batch {
@@ -534,16 +698,16 @@ impl Batch {
         self.life
     }
 
-    pub fn events(&self) -> &[Event] {
+    pub fn events(&self) -> &[Placed] {
         &self.events
     }
 
     /// Take the longest prefix that fits. The byte limit includes this JSON object.
-    pub fn prefix(life: u64, events: &[Event], max_bytes: usize) -> Result<Self, Wrong> {
+    pub fn prefix(life: u64, events: &[Placed], max_bytes: usize) -> Result<Self, Wrong> {
         let limit = max_bytes.min(BATCH_BYTES);
         let mut bytes = format!(r#"{{"life":{life},"events":[]}}"#).len();
         let mut taken = Vec::new();
-        let mut seen = HashSet::new();
+        let mut seen = BTreeSet::new();
         for event in events.iter().take(BATCH_EVENTS) {
             event.check()?;
             let event_bytes = serde_json::to_vec(event).map_err(|_| Wrong::Form)?.len();
@@ -551,7 +715,7 @@ impl Batch {
             if bytes > limit {
                 break;
             }
-            if !seen.insert(event.id) {
+            if !seen.insert(event.record.id) {
                 return Err(Wrong::RepeatedId);
             }
             taken.push(event.clone());
@@ -566,7 +730,7 @@ impl Batch {
         #[derive(Serialize)]
         struct Wire<'a> {
             life: u64,
-            events: &'a [Event],
+            events: &'a [Placed],
         }
         serde_json::to_vec(&Wire { life: self.life, events: &self.events }).map_err(|_| Wrong::Form)
     }
@@ -574,7 +738,7 @@ impl Batch {
 
 pub struct IncomingBatch {
     pub life: u64,
-    pub events: Vec<(EventId, Result<Event, Wrong>)>,
+    pub events: Vec<(EventId, Result<Placed, Wrong>)>,
 }
 
 impl IncomingBatch {
@@ -591,13 +755,13 @@ impl IncomingBatch {
             return Err(Wrong::Count);
         }
         let mut events = Vec::with_capacity(values.len());
-        let mut seen = HashSet::new();
+        let mut seen = BTreeSet::new();
         for value in values {
             let id = value.get("id").and_then(Value::as_str).and_then(EventId::from_hex).ok_or(Wrong::Form)?;
             if !seen.insert(id) {
                 return Err(Wrong::RepeatedId);
             }
-            events.push((id, Event::from_value(value)));
+            events.push((id, Placed::from_value(value)));
         }
         Ok(Self { life, events })
     }
@@ -639,7 +803,7 @@ impl BatchAnswer {
         if answers.len() > BATCH_EVENTS {
             return Err(Wrong::Count);
         }
-        let mut seen = HashSet::new();
+        let mut seen = BTreeSet::new();
         if answers.iter().any(|answer| !seen.insert(answer.id)) {
             return Err(Wrong::RepeatedId);
         }
@@ -657,7 +821,7 @@ impl BatchAnswer {
         if answers.len() > BATCH_EVENTS {
             return Err(Wrong::Count);
         }
-        let wanted: HashSet<_> = sent.events().iter().map(|event| event.id).collect();
+        let wanted: BTreeSet<_> = sent.events().iter().map(|event| event.record.id).collect();
         let mut decoded = Vec::with_capacity(answers.len());
         for answer in answers {
             if !answer.is_object() {
