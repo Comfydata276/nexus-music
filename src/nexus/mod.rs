@@ -736,10 +736,11 @@ mod tests {
                 assert!(!text.contains(word), "{name} names the Nexus server's component ({word})");
             }
         }
-        // `main` makes it, and ends its look at the app's end, only when it is switched on;
-        // and the window tracks the account for it only once it is made.
+        // `main` makes it after the controller (and a kept sign-in entered), and before the
+        // window is shown; and the window tracks the account for it only once it is made.
         let main = include_str!("../main.rs");
-        assert!(main.contains("let controller = controller::Controller::install(window);\n    // After the controller is made (and a kept sign-in entered), never by it.\n    nexus::install(&controller.ui);"));
+        let (made, installed, shown) = (main.find("controller::Controller::install(window);"), main.find("nexus::install(&controller.ui);"), main.find("controller.ui.show()?;"));
+        assert!(made.is_some() && installed > made && shown > installed, "main makes the component after the controller");
         assert!(include_str!("../../ui/app.slint").contains("property <string> account: App.nexus-on && App.signed-in ?"));
     }
 }
