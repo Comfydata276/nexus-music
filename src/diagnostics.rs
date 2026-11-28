@@ -1,11 +1,10 @@
-//! The same clean report for "What is sent" and "Save diagnostics".
+//! The same clean report for Settings, local export, and the Nexus client.
 
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{OnceLock, mpsc};
 use std::time::Duration;
 
@@ -18,6 +17,18 @@ pub(crate) use diag::{FaultPlace, FaultShape, Line, Note, SoundOutput};
 use crate::controller::{Controller, post, with};
 use crate::{config, pool::Pool, ui};
 
+mod sending;
+#[allow(unused_imports)] // The live client is installed by W7.
+pub(crate) use sending::{attach, detach, forget_choice, keep_schedule, load_kept, on_worker, publish_hello, read};
+
+thread_local! {
+    static STORE: RefCell<ReportStore> = RefCell::default();
+    static REFRESH: slint::Timer = slint::Timer::default();
+}
+
+static CHECKPOINT_PENDING: AtomicBool = AtomicBool::new(false);
+const RECORD_FILE: &str = "diagnostics-record.txt";
+
 // Keep report building and file I/O off the window thread. One worker keeps repeated
 // exports and previews in the order they were requested.
 static WORKER: OnceLock<Pool> = OnceLock::new();
@@ -26,26 +37,37 @@ fn worker() -> &'static Pool {
     WORKER.get_or_init(|| Pool::new("diagnostics", 1, false))
 }
 
-/// Let an export finish if the person quits as soon as they have asked for it.
-pub fn finish() {
-    if let Some(worker) = WORKER.get() {
-        let (done, wait) = mpsc::channel();
-        worker.spawn(move || {
-            let _ = done.send(());
-        });
-        let _ = wait.recv_timeout(Duration::from_secs(5));
-    }
+/// Finish the last checkpoint and any requested export after the window loop ends.
+pub fn finish(ctl: &Controller) {
+    REFRESH.with(slint::Timer::stop);
+    sending::in_use(false);
+    sending::detach();
+    let paths = ctl.paths.clone();
+    let session = Session::capture(ctl);
+    let (done, wait) = mpsc::channel();
+    worker().spawn(move || {
+        let _ = checkpoint(&paths, session);
+        let _ = done.send(());
+    });
+    let _ = wait.recv_timeout(Duration::from_secs(5));
 }
 
-pub fn install(window: &ui::MainWindow) {
+pub fn install(ctl: &Controller) {
     static PREVIEW: AtomicU64 = AtomicU64::new(0);
-    window.global::<ui::Settings>().on_preview_diagnostics(|| {
+    let paths = ctl.paths.clone();
+    worker().spawn(move || {
+        if let Some(folder) = paths.crash_log.parent() {
+            config::clear_leftovers(folder, |name| matches!(name, RECORD_FILE | "diagnostics.txt"), &[]);
+        }
+    });
+    sending::install(ctl);
+    ctl.ui.global::<ui::Settings>().on_preview_diagnostics(|| {
         with(|ctl| {
             let session = Session::capture(ctl);
-            let path = ctl.paths.crash_log.clone();
+            let paths = ctl.paths.clone();
             let generation = PREVIEW.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
             worker().spawn(move || {
-                let text = session.text(&path)
+                let text = local_text(&paths, session)
                     .unwrap_or_else(|_| "Diagnostics could not be read.".into());
                 post(move |ctl| {
                     if PREVIEW.load(Ordering::Relaxed) == generation {
@@ -55,16 +77,35 @@ pub fn install(window: &ui::MainWindow) {
             });
         });
     });
+    refresh(ctl);
+    REFRESH.with(|timer| timer.start(slint::TimerMode::Repeated, Duration::from_secs(2), || {
+        with(|ctl| refresh(ctl));
+    }));
+}
+
+fn refresh(ctl: &Controller) {
+    // Bound the periodic work to one outstanding snapshot, even if the disk stalls.
+    if !CHECKPOINT_PENDING.swap(true, Ordering::Relaxed) {
+        let paths = ctl.paths.clone();
+        let session = Session::capture(ctl);
+        worker().spawn(move || {
+            let _ = checkpoint(&paths, session);
+            CHECKPOINT_PENDING.store(false, Ordering::Relaxed);
+        });
+    }
+    let player = ctl.ui.global::<ui::Player>();
+    sending::in_use(ctl.diagnostics_window_visible() || player.get_playing() || player.get_buffering());
+    sending::report_fault();
 }
 
 pub fn save(ctl: &Controller) {
     let session = Session::capture(ctl);
-    let crash_path = ctl.paths.crash_log.clone();
-    let path = ctl.paths.diagnostics.clone();
+    let paths = ctl.paths.clone();
     worker().spawn(move || {
-        if session.write_report(&crash_path, &path).is_ok() {
+        let saved = local_text(&paths, session).and_then(|text| save_text(&paths, &text));
+        if saved.is_ok() {
             let program = if cfg!(windows) { "notepad" } else { "xdg-open" };
-            let _ = std::process::Command::new(program).arg(&path).spawn();
+            let _ = std::process::Command::new(program).arg(&paths.diagnostics).spawn();
             post(|ctl| ctl.toast("Diagnostics saved."));
         } else {
             post(|ctl| {
@@ -78,21 +119,30 @@ pub fn save(ctl: &Controller) {
 type Observation = (u64, diag::Line);
 
 thread_local! {
-    // Called by the native window and media callbacks on the window's thread.
+    // Window and native media callbacks add closed kinds without touching a worker or a file.
     static SOUND_OUTPUT: Cell<SoundOutput> = const { Cell::new(SoundOutput::Unknown) };
-    static OBSERVED: RefCell<VecDeque<Observation>> = const { RefCell::new(VecDeque::new()) };
+    static OBSERVED: RefCell<diag::Record> = RefCell::default();
 }
 
 pub fn observe(line: diag::Line) {
     if let Ok(at) = u64::try_from(Utc::now().timestamp_millis()) {
-        OBSERVED.with_borrow_mut(|observed| {
-            if observed.len() == diag::MAX_ENTRIES {
-                observed.pop_front();
-            }
-            observed.push_back((at, line));
-        });
+        OBSERVED.with_borrow_mut(|observed| observed.note(at, line));
+        if matches!(line, Line::Fault(_)) {
+            sending::note_fault(at);
+        }
     }
 }
+
+/// The crash log can contain old free text. Read the timestamp through its typed projection.
+pub(crate) fn prior_crash(path: &Path) {
+    let path = path.to_owned();
+    worker().spawn(move || {
+        let Some(at) = crash_observations(&path).map(|(at, _)| at).max() else { return };
+        post(move |_| sending::note_fault(at));
+    });
+}
+
+pub(crate) use sending::{offline_changed, publish_account};
 
 pub(crate) fn fault(place: FaultPlace, shape: FaultShape) {
     use crate::journal::FaultPlace as JournalPlace;
@@ -128,50 +178,49 @@ pub(crate) fn note_sound_output(kind: SoundOutput) {
 }
 
 struct Session {
-    https: bool,
-    offline: bool,
-    signed_in: bool,
-    pc: diag::PcDetails,
-    observations: Vec<Observation>,
+    about: diag::About,
+    observations: diag::Record,
 }
 
 impl Session {
-    /// Take the small in-memory snapshot on the window thread. No raw message leaves it.
+    /// Copy only settings and counts on the window thread. The reader uses the
+    /// checkpoint and does not call the controller or player.
     fn capture(ctl: &Controller) -> Self {
         let settings = ctl.settings.borrow();
-        let said = ctl.said.borrow();
-        let observations = OBSERVED.with_borrow(|observed| {
-            observed.iter().copied().collect::<Vec<_>>()
-        });
-        let mut session = Self::from_observations(&settings, ctl.client().is_some(), &said, observations);
-        session.pc.music_version = if session.signed_in {
+        let signed_in = ctl.client().is_some();
+        let mut about = Self::about(&settings, signed_in);
+        let pc = about.pc.as_mut().expect("PC report");
+        pc.music_version = if signed_in {
             diag::music_version(&ctl.ui.global::<ui::App>().get_server_version())
         } else {
             None
         };
-        session.pc.unreachable = ctl.unreachable.get();
-        session.pc.output = SOUND_OUTPUT.get();
-        session.pc.library_songs = crate::search::current().map_or(0, |index| index.library.songs.len() as u64);
-        session.pc.downloads = ctl.downloads.borrow().downloaded_count() as u64;
-        session.pc.pending = (ctl.pending.borrow().len() as u64).saturating_add(ctl.sending.borrow().len() as u64);
-        session
+        pc.unreachable = ctl.unreachable.get();
+        pc.output = SOUND_OUTPUT.get();
+        pc.library_songs = crate::search::current().map_or(0, |index| index.library.songs.len() as u64);
+        pc.downloads = ctl.downloads.borrow().downloaded_count() as u64;
+        pc.pending = (ctl.pending.borrow().len() as u64).saturating_add(ctl.sending.borrow().len() as u64);
+        let mut observations = OBSERVED.take();
+        count_notices(&mut observations, ctl.said.borrow_mut().drain(..));
+        Self { about, observations }
     }
 
-    fn from_observations(
-        settings: &config::Settings,
-        signed_in: bool,
-        said: &VecDeque<(i64, String)>,
-        mut observations: Vec<Observation>,
-    ) -> Self {
-        observations.extend(said.iter().filter_map(|(at, _)| {
-            let at = u64::try_from(*at).ok()?.checked_mul(1_000)?;
-            Some((at, Line::Note(Note::AppMessage)))
-        }));
-        Self {
+    fn about(settings: &config::Settings, signed_in: bool) -> diag::About {
+        diag::About {
+            version: Version {
+                major: env!("CARGO_PKG_VERSION_MAJOR").parse().unwrap_or_default(),
+                minor: env!("CARGO_PKG_VERSION_MINOR").parse().unwrap_or_default(),
+                patch: env!("CARGO_PKG_VERSION_PATCH").parse().unwrap_or_default(),
+            },
+            device: DeviceKind::Pc,
+            os: os_version(),
+            signed_in,
             https: settings.server.starts_with("https://"),
             offline: settings.offline,
-            signed_in,
-            pc: diag::PcDetails {
+            local_permission: None,
+            android_auto: None,
+            loss: Default::default(),
+            pc: Some(diag::PcDetails {
                 exclusive: settings.exclusive,
                 bitrate_kbps: settings.max_bitrate(),
                 gapless: settings.gapless,
@@ -195,53 +244,121 @@ impl Session {
                 sharing: settings.sync,
                 requests: settings.requests,
                 ..diag::PcDetails::default()
-            },
-            observations,
+            }),
         }
     }
+}
 
-    fn report(&self, crash_path: &Path) -> diag::Report {
-        let crash = recent_crash_text(crash_path).unwrap_or_default();
-        let mut observations: Vec<_> = crash.lines().filter_map(windows_observations::fault).collect();
-        observations.extend_from_slice(&self.observations);
-        observations.sort_by_key(|(at, _)| *at);
-        let mut record = diag::Record::default();
-        for (at, line) in observations {
-            record.note(at, line);
-        }
-        diag::Report {
-            about: diag::About {
-                version: Version {
-                    major: env!("CARGO_PKG_VERSION_MAJOR").parse().unwrap_or_default(),
-                    minor: env!("CARGO_PKG_VERSION_MINOR").parse().unwrap_or_default(),
-                    patch: env!("CARGO_PKG_VERSION_PATCH").parse().unwrap_or_default(),
-                },
-                device: DeviceKind::Pc,
-                os: os_version(),
-                signed_in: self.signed_in,
-                https: self.https,
-                offline: self.offline,
-                local_permission: None,
-                android_auto: None,
-                loss: crate::journal::losses(),
-                pc: Some(self.pc),
-            },
-            record,
+fn count_notices(record: &mut diag::Record, notices: impl IntoIterator<Item = (i64, String)>) {
+    for (at, _) in notices {
+        if let Some(at) = u64::try_from(at).ok().and_then(|at| at.checked_mul(1_000)) {
+            record.note(at, Line::Note(Note::AppMessage));
         }
     }
+}
 
-    fn text(&self, crash_path: &Path) -> Result<String, diag::Wrong> {
-        self.report(crash_path).text()
-    }
+#[derive(Default)]
+struct ReportStore {
+    pending: diag::Record,
+    current: bool,
+}
 
-    fn write_report(&self, crash_path: &Path, path: &Path) -> std::io::Result<()> {
-        let text = self.text(crash_path)
-            .map_err(|_| std::io::Error::other("The diagnostics report could not be built"))?;
+impl ReportStore {
+    fn checkpoint(&mut self, path: &Path, session: Session) -> std::io::Result<()> {
+        self.pending.merge_later(session.observations);
+        let previous = match read_record(path) {
+            Ok(report) => Some(report),
+            Err(error) if matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidData) => None,
+            Err(error) => return Err(error),
+        };
+        if self.pending.entries().is_empty() && previous.as_ref().is_some_and(|report| report.about == session.about) {
+            return Ok(());
+        }
+        let mut record = previous.map_or_else(diag::Record::default, |report| report.record);
+        record.merge_later(self.pending.clone());
+        let text = diag::Report { about: session.about, record }.text().map_err(invalid_report)?;
         if let Some(folder) = path.parent() {
             fs::create_dir_all(folder)?;
         }
-        fs::write(path, text)
+        config::write_surely(path, text.as_bytes())?;
+        self.pending.clear();
+        Ok(())
     }
+}
+
+fn record_path(paths: &config::Paths) -> std::path::PathBuf {
+    paths.crash_log.with_file_name(RECORD_FILE)
+}
+
+fn checkpoint(paths: &config::Paths, session: Session) -> std::io::Result<()> {
+    STORE.with_borrow_mut(|store| {
+        let result = store.checkpoint(&record_path(paths), session);
+        store.current = result.is_ok();
+        result
+    })
+}
+
+fn read_limited(path: &Path, limit: usize) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    fs::File::open(path)?.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        return Err(std::io::ErrorKind::InvalidData.into());
+    }
+    Ok(bytes)
+}
+
+fn invalid_report(_: diag::Wrong) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, "The diagnostics report could not be read")
+}
+
+fn read_record(path: &Path) -> std::io::Result<diag::Report> {
+    let bytes = read_limited(path, diag::CALL_BYTES)?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| std::io::ErrorKind::InvalidData)?;
+    diag::Report::read(text).map_err(invalid_report)
+}
+
+fn crash_observations(path: &Path) -> impl Iterator<Item = Observation> {
+    recent_crash_text(path).unwrap_or_default().lines()
+        .filter_map(windows_observations::fault).collect::<Vec<_>>().into_iter()
+}
+
+fn report_text(paths: &config::Paths) -> std::io::Result<String> {
+    render(read_record(&record_path(paths))?, &paths.crash_log)
+}
+
+// Keep the loss totals visible even when the profile cannot write its checkpoint.
+// Only the local commands can use the in-memory observations in this case.
+fn local_text(paths: &config::Paths, session: Session) -> std::io::Result<String> {
+    let about = session.about;
+    if checkpoint(paths, session).is_ok() {
+        return report_text(paths);
+    }
+    let mut record = read_record(&record_path(paths)).map_or_else(|_| diag::Record::default(), |report| report.record);
+    STORE.with_borrow(|store| record.merge_later(store.pending.clone()));
+    render(diag::Report { about, record }, &paths.crash_log)
+}
+
+fn render(mut report: diag::Report, crash_path: &Path) -> std::io::Result<String> {
+    report.about.loss = crate::journal::losses();
+
+    // Keep the latest observations in order across the record and the separate crash tail.
+    let mut entries = report.record.entries().iter().copied().collect::<Vec<_>>();
+    entries.extend(crash_observations(crash_path).map(|(at, line)| diag::Entry {
+        first_ms: at, last_ms: at, count: 1, line,
+    }));
+    entries.sort_by_key(|entry| entry.last_ms);
+    report.record.clear();
+    for entry in entries {
+        report.record.note(entry.first_ms, entry.line);
+        if entry.count > 1 {
+            report.record.note_times(entry.last_ms, entry.line, entry.count - 1);
+        }
+    }
+    report.text().map_err(invalid_report)
+}
+
+fn save_text(paths: &config::Paths, text: &str) -> std::io::Result<()> {
+    config::write_surely(&paths.diagnostics, text.as_bytes())
 }
 
 /// Record the time, C6's shape, and the app area before opening the crash log.

@@ -132,13 +132,14 @@ pub(crate) fn install(root: PathBuf) {
 /// C10 removes the pending notice when the person has seen it.
 #[allow(dead_code)] // The live publisher belongs to W7.
 pub(crate) fn publish_account(saved: Option<&Saved>) {
-    let scope = saved
+    let signed_in = saved
         .filter(|saved| saved.session.is_some() && saved.notice.is_none())
-        .and_then(|saved| Some(Scope::new(JournalAccount {
-            backend_id: BackendId::from_hex(&saved.backend_id)?,
-            account: saved.account,
-        }, saved.life)));
-    publish(scope);
+        .and_then(|saved| Some((saved, BackendId::from_hex(&saved.backend_id)?)));
+    crate::diagnostics::publish_account(signed_in.map(|(saved, backend)| (saved.nexus.as_str(), backend)));
+    publish(signed_in.map(|(saved, backend_id)| Scope::new(JournalAccount {
+        backend_id,
+        account: saved.account,
+    }, saved.life)));
 }
 
 fn publish(scope: Option<Scope>) {
