@@ -594,7 +594,7 @@ class Run:
 
     def step(self, test, body, cold=False):
         """One action, under the fault: the fault made sure of and named before it (for the
-        first action of a start, the fault from the first tick, checked after), the action,
+        first action of a start, the first look after publication, checked after), the action,
         and the SAME fault found still in force when the action has completed."""
         self.say(f"\n{test}")
         self.music_down = False
@@ -605,7 +605,7 @@ class Run:
             body()
             ended = time.time()
             self.windows.append((test, name, began, ended))
-            after = self.still(test, before, cold, ended)
+            after = self.still(before, cold)
             if self.faulted:
                 self.holds.append((test, name, after))
         except Exception as error:  # A test that fails says so, and the run goes on.
@@ -665,14 +665,14 @@ class Run:
     def held_thread(self):
         marker = self.copy.path("held")
         if not os.path.exists(marker):
-            return None, None
+            return None
         thread = open(marker).read().strip()
-        return (thread, os.path.getmtime(marker)) if thread and self.alive(thread) else (None, None)
+        return thread if thread and self.alive(thread) else None
 
     def arm(self, test):
         """Before an action: the fault in force now, and which it is."""
         if self.held:
-            thread, _ = self.held_thread()
+            thread = self.held_thread()
             if not thread:
                 raise Failed("before: no held look")
             return ("thread", thread)
@@ -689,29 +689,50 @@ class Run:
             return ("look", pid)
         return None
 
-    def still(self, test, before, cold, ended):
-        """After an action: the same fault still in force."""
+    def first_published_look(self):
+        """The first W1 dispatch of this start belongs to its first published account."""
+        generation = None
+        for at, word, rest in self.nexus_log():
+            if at < self.copy.started:
+                continue
+            number, _, detail = rest.partition(" ")
+            if generation is None and word == "published" and number != "0" and detail != "-":
+                generation = number
+            if word == "dispatch" and detail == "offline=false":
+                if number != generation:
+                    raise Failed("the first look was not for the first published account")
+                return at
+        return None
+
+    def still(self, before, cold):
+        """After an action: the same fault is still in force, including across publication."""
         if not self.faulted:
             return None
+        first = until(self.first_published_look, 20, 0.05, "the first look after publication") if cold else None
         if self.held:
-            thread, since = self.held_thread()
+            thread = until(self.held_thread, 20, 0.05, "the first look held") if cold else self.held_thread()
             if not thread:
                 raise Failed("after: the held look's thread is gone")
-            if cold and since > self.home_at:
-                raise Failed(f"after: the hold began {since - self.home_at:.2f} s after the first page was drawn")
+            if cold:
+                # Each start removes the old marker. Only a W1 dispatch can write its new
+                # marker, so the live thread belongs to the first look if it dispatched once.
+                dispatches = sum(t >= first and word == "dispatch" and rest.endswith(" offline=false")
+                                 for t, word, rest in self.nexus_log())
+                if dispatches != 1:
+                    raise Failed("after: more than one look was dispatched before the hold")
             if before and before[1] != thread:
                 raise Failed(f"after: held thread {thread}, not {before[1]}")
             return ("thread", thread)
-        pid, spawned = self.live_look()
-        if before:
+        if cold:
+            pid = until(lambda: next(iter(self.looks()), None), 20, 0.05, "the first look's process")
+            spawned, gone = self.looks()[pid]
+            if spawned < first or gone is not None or not self.alive(pid):
+                raise Failed("after: the first look is no longer in flight")
+        else:
             pid = before[1]
-            spawned, gone = self.looks().get(pid, (None, True))
+            _, gone = self.looks().get(pid, (None, True))
             if gone is not None or not self.alive(pid):
                 raise Failed(f"after: look {pid} ended during the action")
-        elif not pid:
-            raise Failed("after: no look in flight")
-        elif cold and spawned > self.home_at:
-            raise Failed(f"after: the look began {spawned - self.home_at:.2f} s after the first page was drawn")
         return ("look", pid)
 
     def first_look_after_home(self, launched):
@@ -769,8 +790,7 @@ class Run:
         if self.stuck:
             env.update({"NEXUS_TEST_DEADLINE_MS": "3600000", "NEXUS_TEST_PROBE_WHOLE_MS": "3600000"})
         if self.faulted:
-            # A look at the first tick of each start (and on demand), so that the fault is in
-            # force from the first page on.
+            # A look when each start publishes its account, and on demand after that.
             env["NEXUS_TEST_TRIGGER"] = f"{inside}/trigger"
         if self.held:
             env["NEXUS_TEST_HOLD_NEXUS"] = f"{inside}/held"
@@ -824,7 +844,6 @@ class Run:
 
         def cold_start():
             until(lambda: home_drawn(a), 60, 0.02, "the first page")
-            self.home_at = time.time()
             self.time("cold_start_publishes_the_saved_account", "launch_to_home_drawn", time.time() - t0)
         self.step("cold_start_publishes_the_saved_account", cold_start, cold=True)
 
@@ -934,7 +953,7 @@ class Run:
             test = "the_queue_is_changed_and_kept"
             until(lambda: a.find(label="Play") and a.find(type="QueueRow"), 60, 0.02, "the queue after kill -9")
             self.time(test, "restart_to_queue_shown", time.time() - t0)
-            self.usable_at = self.home_at = time.time()
+            self.usable_at = time.time()
             self.log_unchanged("second start")
             self.expect(test, "queue_after_kill_is_the_queue_before", saved_queue(c) == getattr(self, "kept_queue", None), saved_queue(c))
         self.step("the_queue_is_changed_and_kept", put_back, cold=True)
@@ -1180,7 +1199,7 @@ class Run:
             # The proxy ends each held look at 75 s; another is started before the next action.
             self.expect(test, "requests_under_nexus (a held look at a time)", 2 <= count <= 15, count)
         elif self.stuck:
-            # One look started at the first tick of each start, held through it.
+            # One look started on account publication, held through that run.
             self.expect(test, "requests_under_nexus (one held look a start)", 2 <= count <= 4, count)
         else:
             # One at each start (5 s after the account is published) and one for the guest.

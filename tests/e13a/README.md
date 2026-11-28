@@ -47,8 +47,7 @@ Everything runs on this machine, under made-up names; nothing of anyone's is use
   one: its "busy" status, after 10 s, is an answer, classified before the body is read.)
   - its deadline is made an hour long (`NEXUS_TEST_DEADLINE_MS`, `NEXUS_TEST_PROBE_WHOLE_MS`),
     so that one look is held for as long as the stand-in holds it;
-  - a look is started in the first turn of the event loop of each start, before the first
-    frame;
+  - the startup trigger waits for the account to be published, then starts its first look;
   - the suite can start one on demand (`NEXUS_TEST_TRIGGER`).
 
   In `blackhole` the proxy itself ends a held look at 75 s. A look older than 35 s is let end
@@ -56,7 +55,7 @@ Everything runs on this machine, under made-up names; nothing of anyone's is use
 
 | Hook | |
 |---|---|
-| `held` | Its look's thread is held in a call that never returns (`NEXUS_TEST_HOLD_NEXUS`), from the first turn of each start |
+| `held` | Its look's thread is held in a call that never returns (`NEXUS_TEST_HOLD_NEXUS`), from the first look after account publication |
 | `switch-off` | The switch is not set: nothing of the component may be made |
 | `sabotage` | A deliberate fault, which the run must catch: the window's thread held 0.3 s at each look |
 
@@ -69,7 +68,8 @@ The test hooks are read only by a development build.
 - **Before it:** the fault in force, by name: the held thread's id, or the held look's
   process id (one is started if none is).
 - **After it:** the same thread or the same process still alive, its look not ended.
-- **The first action of a start:** the fault began before the first page was drawn.
+- **The first action of a start:** the first look for the published account is held before
+  the suite goes on to the next action.
 - **Every action ran under the fault:** "19 of 19".
 
 **The music server through every action.** Each API request the app made was answered 200
