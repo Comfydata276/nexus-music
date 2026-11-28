@@ -7,9 +7,19 @@ use super::*;
 pub const RECEIPT_MS: u64 = 5_000;
 
 pub(super) enum Purpose {
-    SignIn { secret: Fingerprint, is_new: bool },
-    Leave { session: u64, for_what: LeaveFor },
-    ChoosePassword { secret: Fingerprint, is_new: bool },
+    SignIn {
+        secret: Fingerprint,
+        is_new: bool,
+    },
+    Leave {
+        session: SessionId,
+        for_what: LeaveFor,
+    },
+    RedeemCode {
+        secret: Fingerprint,
+        is_new: bool,
+        code: u64,
+    },
 }
 
 /// Bound to the authoritative account/device and verifier before S8 starts the
@@ -22,7 +32,7 @@ pub struct PasswordCheck {
     started: u64,
 }
 
-pub struct Receipt {
+pub struct PasswordReceipt {
     scope: Scope,
     purpose: Purpose,
     checked: u64,
@@ -38,8 +48,16 @@ impl PasswordCheck {
         }
     }
 
+    /// Select S8's known-device worker before doing password work.
+    pub fn known_device(&self) -> bool {
+        match self.purpose {
+            Purpose::SignIn { is_new, .. } | Purpose::RedeemCode { is_new, .. } => !is_new,
+            Purpose::Leave { .. } => true,
+        }
+    }
+
     /// S8 passes its effective backend time and the Argon2id output, never the password.
-    pub fn check(self, derived: Fingerprint, clock: Clock) -> Result<Receipt, Denied> {
+    pub fn check(self, derived: Fingerprint, clock: Clock) -> Result<PasswordReceipt, Denied> {
         if self.expected != derived {
             return Err(Denied::WrongPassword);
         }
@@ -47,7 +65,7 @@ impl PasswordCheck {
         if checked < self.started {
             return Err(Denied::Time);
         }
-        Ok(Receipt {
+        Ok(PasswordReceipt {
             scope: self.scope,
             purpose: self.purpose,
             checked,
@@ -55,7 +73,7 @@ impl PasswordCheck {
     }
 }
 
-impl Receipt {
+impl PasswordReceipt {
     pub(super) fn checked(&self) -> u64 {
         self.checked
     }
@@ -81,8 +99,8 @@ impl fmt::Debug for PasswordCheck {
     }
 }
 
-impl fmt::Debug for Receipt {
+impl fmt::Debug for PasswordReceipt {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("Receipt(..)")
+        f.write_str("PasswordReceipt(..)")
     }
 }
