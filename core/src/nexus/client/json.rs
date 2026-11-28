@@ -8,7 +8,9 @@
 //! ```text
 //! {"start":{"app":{"version":"0.41.0","kind":"phone","device_name":"…"},
 //!           "kept":{"device_secret":{"secret":"<64 hex>","backend_id":"<32 hex>"|null}|null,
-//!                   "saved":{…}|null,"notes":[{…}…],"offline":false},
+//!                   "saved":{…}|null,"notes":[{…}…],"offline":false,
+//!                   "diagnostics":true|false|null,
+//!                   "diag_schedule":{"started_ms":…,"fault_ms":…|null,"attempts":[…]}|null},
 //!           "given":{"now_ms":…,"local_offset_minutes":600,"random":"<64 hex>"|null}}}
 //! {"happened":{"event":EVENT,"given":{…}}}
 //! {"stop":{}}
@@ -21,14 +23,29 @@
 //!        {"network":{"up":true}}  {"offline":true}  {"tick":{}}
 //!        {"music_refused":{"count":3,"generation":5}}
 //!        {"music_looked":{"look":{"inside":true,"permission":false},"count":3,"generation":5}}
+//!        {"events_waiting":{"account":ACCOUNT,"life":1,"pending":12,"from_sequence":40}}
+//!        {"events_read":{"read":4,"account":ACCOUNT,"life":1,"events":[LINE…]}}
+//!        {"diagnostics_read":{"read":5,"text":"Nexus Music 0.41.0 on phone …"|null}}
+//!        {"diagnostics_switch":true|false|null}  {"diagnostics_fault":{"at_ms":…}}
+//!        {"in_use":true|false}
+//! ACCOUNT: {"backend_id":"<32 hex>","account":21}
+//! LINE:    one journal line's JSON object, exactly as `events::Placed::line` wrote it (without
+//!          its LF); a line that does not read is left out of the batch
 //! PRESS: {"sign_in":{"address":…,"email":…,"password":…,"look":{…}}}
 //!        {"sign_in_with_code":{"address":…,"code":…,"password":…,"again":…,"look":{…}}}
 //!        {"form_closed":{}}  {"sign_out":{}}  {"open_devices":{}}  {"force_out":{"device":12}}
 //!        {"change_password":{"current":…,"new":…,"again":…}}  {"notice_seen":{}}
 //! ```
 //!
-//! `saved` and each of `notes` are what [`Do::Keep`] gave as `{"saved":{…}}` and
-//! `{"note":{…}}`, written back as they were given.
+//! `saved`, each of `notes` and `diag_schedule` are what [`Do::Keep`] gave as
+//! `{"saved":{…}}`, `{"note":{…}}` and `{"diag_schedule":{…}}`, written back as they were
+//! given. `diagnostics` is the app's own setting (the person's choice, `null` until made).
+//!
+//! The sending half's things to do come as `{"journal":{"read_events":{…}}}`,
+//! `{"journal":{"read_diagnostics":{"read":5}}}`, `{"journal":{"taken":{…}}}`,
+//! `{"journal":{"refused":{…}}}`, `{"journal":{"life_moved":{…}}}` and
+//! `{"journal":{"resend_all":{"backend_id":"<32 hex>"}}}` ([`JournalDo`]), event ids as 32
+//! lower-case hex digits.
 //!
 //! Out: `{"generation":N,"do":[…]}`, each thing to do as [`Do`] serialises it; or
 //! `{"error":"input"}` for input this cannot read, which names no part of it and changes
@@ -142,6 +159,17 @@ struct KeptIn<'a> {
     notes: Vec<&'a RawValue>,
     #[serde(default)]
     offline: bool,
+    #[serde(default, borrow)]
+    diagnostics: Option<&'a RawValue>,
+    #[serde(default, borrow)]
+    diag_schedule: Option<&'a RawValue>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AccountIn {
+    backend_id: String,
+    account: u64,
 }
 
 #[derive(Deserialize)]
@@ -239,6 +267,28 @@ enum EventIn {
         count: u64,
         generation: u64,
     },
+    EventsWaiting {
+        account: AccountIn,
+        life: u64,
+        pending: u64,
+        from_sequence: u64,
+    },
+    EventsRead {
+        read: u64,
+        account: AccountIn,
+        life: u64,
+        events: Vec<Box<RawValue>>,
+    },
+    DiagnosticsRead {
+        read: u64,
+        #[serde(default)]
+        text: Option<String>,
+    },
+    DiagnosticsSwitch(Option<bool>),
+    DiagnosticsFault {
+        at_ms: u64,
+    },
+    InUse(bool),
 }
 
 #[derive(Deserialize)]
@@ -292,6 +342,10 @@ fn app(app: AppIn) -> Result<App, ()> {
         },
         device_name: Name::new(&app.device_name).ok_or(())?,
     })
+}
+
+fn journal_account(account: AccountIn) -> Result<JournalAccount, ()> {
+    Ok(JournalAccount { backend_id: BackendId::from_hex(&account.backend_id).ok_or(())?, account: AccountId::new(account.account).ok_or(())? })
 }
 
 fn revoke(revoke: RevokeIn) -> Option<SignOutNote> {
@@ -377,7 +431,23 @@ fn kept(kept: KeptIn<'_>) -> Kept {
             None => unreadable.push(Forget::UnreadableNote { index }),
         }
     }
-    Kept { device_secret, saved, notes, offline: kept.offline, unreadable }
+    let diag_schedule = kept.diag_schedule.filter(|raw| raw.get() != "null").and_then(|raw| {
+        let schedule = serde_json::from_str::<DiagSchedule>(raw.get()).ok();
+        if schedule.is_none() {
+            unreadable.push(Forget::DiagSchedule);
+        }
+        schedule
+    });
+    // The person's choice: `true`, `false`, or none made. Anything else is no choice made,
+    // and forgotten (as every kept part is).
+    let diagnostics = kept.diagnostics.and_then(|raw| match serde_json::from_str::<Option<bool>>(raw.get()) {
+        Ok(choice) => choice,
+        Err(_) => {
+            unreadable.push(Forget::Diagnostics);
+            None
+        }
+    });
+    Kept { device_secret, saved, notes, offline: kept.offline, unreadable, diagnostics, diag_schedule }
 }
 
 fn event(event: EventIn) -> Result<Happened, ()> {
@@ -408,6 +478,19 @@ fn event(event: EventIn) -> Result<Happened, ()> {
         EventIn::Tick {} => Happened::Tick,
         EventIn::MusicRefused { count, generation } => Happened::MusicRefused { count, generation },
         EventIn::MusicLooked { look, count, generation } => Happened::MusicLooked { look, count, generation },
+        EventIn::EventsWaiting { account, life, pending, from_sequence } => {
+            Happened::EventsWaiting { account: journal_account(account)?, life, pending, from_sequence }
+        }
+        EventIn::EventsRead { read, account, life, events } => Happened::EventsRead {
+            read,
+            account: journal_account(account)?,
+            life,
+            events: events.iter().filter_map(|line| Placed::read(line.get().as_bytes()).ok()).collect(),
+        },
+        EventIn::DiagnosticsRead { read, text } => Happened::DiagnosticsRead { read, text },
+        EventIn::DiagnosticsSwitch(choice) => Happened::DiagnosticsSwitch(choice),
+        EventIn::DiagnosticsFault { at_ms } => Happened::DiagnosticsFault { at_ms },
+        EventIn::InUse(on) => Happened::InUse(on),
     })
 }
 
