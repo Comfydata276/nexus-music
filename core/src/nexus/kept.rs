@@ -2,8 +2,8 @@
 //! serialization lock and applies the returned effects before releasing the answer.
 
 use super::account::{
-    AccountId, DeviceId, DeviceSecret, Email, GrantSecret, PASSWORD_LEAVE_MS, SECRET_BYTES,
-    SESSION_IDLE_MS, SessionId, StampTag,
+    AccountId, CODE_LIFETIME_MS, DeviceId, DeviceSecret, Email, GrantSecret, PASSWORD_LEAVE_MS,
+    SECRET_BYTES, SESSION_IDLE_MS, SessionId, StampTag,
 };
 use super::proto::BackendId;
 use hkdf::hmac::{Hmac, Mac};
@@ -88,6 +88,34 @@ struct Scope {
 }
 
 impl AccountState {
+    /// The initial data and apart state. The caller supplies the reserved ID and
+    /// stores the verifier for any supplied live code, but no password verifier.
+    pub fn new(
+        backend: BackendId,
+        restore: u64,
+        id: AccountId,
+        email: Email,
+        code: Option<LiveCode>,
+    ) -> Self {
+        Self {
+            backend,
+            restore,
+            id,
+            email,
+            code,
+            life: 0,
+            status: Status::On,
+            password_changes: 0,
+            password_reset_required: true,
+            admin: false,
+            music_login: 0,
+            music_managed: false,
+            music_recovery: None,
+            history_held: false,
+            revision: 0,
+        }
+    }
+
     fn scope(&self, device: &Device) -> Scope {
         Scope {
             backend: self.backend,
@@ -124,12 +152,28 @@ impl AccountState {
     }
 }
 
-/// The authoritative code identity is recorded apart. S8 stores and checks the
-/// fingerprint and deadline belonging to that number.
+/// The authoritative code identity and deadline are recorded apart. S8 stores
+/// and checks the fingerprint belonging to that number.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct LiveCode {
     pub number: u64,
     pub used: bool,
+    pub expires: u64,
+}
+
+impl LiveCode {
+    pub fn new(number: u64, now: u64) -> Result<Self, Denied> {
+        let expires = now.checked_add(CODE_LIFETIME_MS).ok_or(Denied::Exhausted)?;
+        Ok(Self {
+            number,
+            used: false,
+            expires,
+        })
+    }
+
+    fn allows(self, number: u64, now: u64) -> bool {
+        self.number == number && !self.used && now < self.expires
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -204,6 +248,7 @@ impl Leave {
 pub struct Session {
     pub id: SessionId,
     pub hash: Fingerprint,
+    pub sign_out: Fingerprint,
     pub last_used: u64,
     pub leave: Option<Leave>,
 }
@@ -213,6 +258,7 @@ pub struct Device {
     id: DeviceId,
     number: u64,
     secret: Option<Fingerprint>,
+    known: bool,
     last_session: u64,
     last_leave: u64,
     session: Option<Session>,
@@ -225,6 +271,7 @@ impl Device {
             id,
             number: 0,
             secret: Some(secret),
+            known: false,
             last_session: 0,
             last_leave: 0,
             session: None,

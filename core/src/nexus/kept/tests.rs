@@ -138,6 +138,7 @@ pub(super) fn fresh(n: u8) -> FreshSession {
     FreshSession {
         id: SessionId::new(u64::from(n)).unwrap(),
         hash: hash(n),
+        sign_out: hash(n ^ 128),
     }
 }
 
@@ -238,6 +239,7 @@ impl Stored {
         let fresh = FreshSession {
             id: SessionId::new(next).unwrap(),
             hash: hash(n),
+            sign_out: hash(n ^ 128),
         };
         self.step(at, |turn| turn.sign_in(receipt, fresh, None))
     }
@@ -479,10 +481,7 @@ fn password_change_keeps_only_its_session_in_both_orders_with_other_sign_in() ->
 fn code_redemption_spends_the_code_sets_password_and_signs_in_once() -> Result<(), Denied> {
     let mut account = state("alice@example.test");
     account.password_reset_required = true;
-    account.code = Some(LiveCode {
-        number: 1,
-        used: false,
-    });
+    account.code = Some(LiveCode::new(1, 0)?);
     let mut s = Stored::new(account);
     let bind = |s: &mut Stored, secret: u8, id| {
         s.step(0, |turn| {
@@ -528,6 +527,20 @@ fn code_redemption_spends_the_code_sets_password_and_signs_in_once() -> Result<(
                     .err(),
                 Some(Denied::WrongPassword)
             );
+            sign_in_after_password_commit(&u.apart_first, &u.data, 1)?;
+            Account::restore(
+                &u.apart_last,
+                Some(&old_data),
+                2,
+                RestoreMode::DataOnly,
+                clock(2, 1),
+            )
+            .apply(|effects| {
+                let restored = effects.updates.first().unwrap();
+                assert!(restored.apart_last.account.code.unwrap().used);
+                assert!(restored.apart_last.account.password_reset_required);
+                Ok::<_, Denied>(())
+            })??;
             s.apart = u.apart_last.clone();
             s.data = u.data.clone();
             Ok::<_, Denied>(())
@@ -704,5 +717,155 @@ fn a_grant_secret_cannot_be_omitted_or_spend_its_replacement() -> Result<(), Den
         })
     })?;
     assert_eq!(s.apart.account.life, 2);
+    Ok(())
+}
+
+pub(super) fn sign_in_after_password_commit(
+    apart: &Apart,
+    data: &Rows,
+    at: u64,
+) -> Result<(), Denied> {
+    let mut recovered = Account::load(apart, Some(data));
+    assert!(!recovered.state().password_reset_required);
+    let check = recovered
+        .sign_in_turn(clock(at, at), |turn| {
+            turn.check_sign_in(&DeviceSecret::from_bytes([8; 32]), dev(1), hash(44))
+        })
+        .apply(|_| Ok::<_, Denied>(()))??;
+    let receipt = check.check(hash(44), clock(at, at))?;
+    recovered
+        .sign_in_turn(clock(at, at), |turn| turn.sign_in(receipt, fresh(3), None))
+        .apply(|_| Ok::<_, Denied>(()))??;
+    Ok(())
+}
+
+#[test]
+fn a_note_only_ends_its_session_and_ordinary_sign_out_preserves_the_known_door()
+-> Result<(), Denied> {
+    let mut s = Stored::new(state("alice@example.test"));
+    let signed = s.sign_in(8, 1, 1, 0)?;
+    let target = SessionTarget {
+        device: signed.device,
+        session: signed.session,
+    };
+    let note = hash(1 ^ 128);
+    for access in [Access::Read, Access::Write] {
+        assert_eq!(
+            s.step(1, |t| t.arrive(bearer(1, &note), access)).err(),
+            Some(Denied::NotSignedIn)
+        );
+    }
+    assert_eq!(
+        s.step(1, |t| t.check_leave(
+            bearer(1, &note),
+            LeaveFor::DeleteHistory,
+            hash(42)
+        ))
+        .err(),
+        Some(Denied::NotSignedIn)
+    );
+    assert_eq!(
+        s.step(1, |t| t.sign_out_by_note(target, &hash(1))),
+        Err(Denied::NotSignedIn)
+    );
+    s.account
+        .request(1, clock(1, 1), |t| t.sign_out_by_note(target, &note))
+        .apply(|effects| {
+            let u = effects.updates.first().unwrap();
+            let apart = u.apart_first.devices.get(&dev(1)).unwrap();
+            assert!(apart.permit.is_none());
+            assert!(apart.known);
+            s.apart = u.apart_last.clone();
+            s.data = u.data.clone();
+            Ok::<_, Denied>(())
+        })??;
+    s.reload();
+    assert!(
+        s.step(1, |t| t.check_sign_in(
+            &DeviceSecret::from_bytes([8; 32]),
+            dev(9),
+            hash(42)
+        ))?
+        .known_device()
+    );
+    let replacement = s.sign_in(8, 1, 2, 2)?;
+    s.step(2, |t| t.sign_out_by_note(target, &note))?;
+    assert_eq!(
+        s.step(2, |t| t.sign_out_by_note(
+            SessionTarget {
+                device: replacement.device,
+                session: replacement.session
+            },
+            &note
+        )),
+        Err(Denied::NotSignedIn)
+    );
+    s.read(1, 2, 2)?;
+    Ok(())
+}
+
+#[test]
+fn a_forced_out_row_is_only_known_again_after_a_successful_sign_in() -> Result<(), Denied> {
+    let mut s = Stored::new(state("alice@example.test"));
+    s.sign_in(8, 1, 1, 0)?;
+    let old = s.sign_in(9, 2, 2, 0)?;
+    let before = s.data.clone();
+    let target = SessionTarget {
+        device: old.device,
+        session: old.session,
+    };
+    s.step(1, |t| t.force_out(bearer(1, &hash(1)), target))?;
+    s.data = before;
+    s.reload();
+    let secret = DeviceSecret::from_bytes([9; 32]);
+    let check = s.step(1, |t| t.check_sign_in(&secret, dev(99), hash(42)))?;
+    assert_eq!(check.known_device_id(), None);
+    assert_eq!(
+        check.check(hash(41), clock(1, 1)).err(),
+        Some(Denied::WrongPassword)
+    );
+    assert!(!s.apart.devices.get(&dev(2)).unwrap().known);
+    assert_eq!(s.sign_in(9, 99, 3, 2)?.device, dev(2));
+    assert_eq!(
+        s.step(2, |t| t.check_sign_in(&secret, dev(99), hash(42)))?
+            .known_device_id(),
+        Some(dev(2))
+    );
+    Ok(())
+}
+
+#[test]
+fn a_new_accounts_code_expires_before_both_check_and_redemption() -> Result<(), Denied> {
+    let code = LiveCode::new(9, 10)?;
+    let account = AccountState::new(
+        BackendId::from_bytes([4; 16]),
+        1,
+        acct(1),
+        Email::new("alice@example.test").unwrap(),
+        Some(code),
+    );
+    assert!(account.password_reset_required);
+    assert_eq!(account.status, Status::On);
+    assert_eq!(account.music_login, 0);
+    let mut s = Stored::new(account);
+    let device = DeviceSecret::from_bytes([8; 32]);
+    let at = code.expires - 1;
+    let checked = s
+        .step(at, |t| t.check_code(&device, dev(1), 9, hash(42)))?
+        .check(hash(42), clock(at, at))?;
+    assert_eq!(
+        s.step(code.expires, |t| t.redeem_code(
+            checked,
+            hash(43),
+            fresh(1),
+            None
+        )),
+        Err(Denied::WrongPassword)
+    );
+    assert_eq!(
+        s.step(at, |t| t.check_code(&device, dev(1), 9, hash(42)))
+            .err(),
+        Some(Denied::WrongPassword)
+    );
     Ok(())
 }

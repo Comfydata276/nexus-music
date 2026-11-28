@@ -30,6 +30,7 @@ pub struct PasswordCheck {
     purpose: Purpose,
     expected: Fingerprint,
     started: u64,
+    known: bool,
 }
 
 pub struct PasswordReceipt {
@@ -39,21 +40,31 @@ pub struct PasswordReceipt {
 }
 
 impl PasswordCheck {
-    pub(super) fn new(scope: Scope, purpose: Purpose, expected: Fingerprint, started: u64) -> Self {
+    pub(super) fn new(
+        scope: Scope,
+        purpose: Purpose,
+        expected: Fingerprint,
+        started: u64,
+        known: bool,
+    ) -> Self {
         Self {
             scope,
             purpose,
             expected,
             started,
+            known,
         }
     }
 
     /// Select S8's known-device worker before doing password work.
     pub fn known_device(&self) -> bool {
-        match self.purpose {
-            Purpose::SignIn { is_new, .. } | Purpose::RedeemCode { is_new, .. } => !is_new,
-            Purpose::Leave { .. } => true,
-        }
+        self.known
+    }
+
+    /// The ID for the known-device wait is resolved from the secret, never
+    /// from an ID claimed in the request.
+    pub fn known_device_id(&self) -> Option<DeviceId> {
+        self.known.then_some(self.scope.device)
     }
 
     /// S8 passes its effective backend time and the Argon2id output, never the password.

@@ -1,4 +1,6 @@
-use super::tests::{Stored, bearer, clock, dev, fresh, grant, hash, state};
+use super::tests::{
+    Stored, bearer, clock, dev, fresh, grant, hash, sign_in_after_password_commit, state,
+};
 use super::*;
 
 impl Stored {
@@ -412,7 +414,7 @@ fn password_fence_lands_first_and_blocks_an_interrupted_password_write() -> Resu
         .apply(|effects| {
             let update = effects.updates.first().unwrap();
             assert_eq!(update.change, DataChange::ChangePassword);
-            assert!(update.apart_first.account.password_reset_required);
+            assert!(!update.apart_first.account.password_reset_required);
             assert_eq!(update.apart_first.account.password_changes, 1);
             assert!(
                 update
@@ -438,6 +440,7 @@ fn password_fence_lands_first_and_blocks_an_interrupted_password_write() -> Resu
                     .apply(|_| Ok::<_, Denied>(()))?,
                 Err(Denied::WrongPassword)
             );
+            sign_in_after_password_commit(&update.apart_first, &update.data, 2)?;
             Ok(())
         })??;
     Ok(())
