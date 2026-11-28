@@ -226,7 +226,7 @@ fn owner_reset(keeper: &mut Keeper, number: u64, print: &[u8; 32], until: u64, n
     first.account.revision = next(first.account.revision)?;
     first.account.password_changes = next(first.account.password_changes)?;
     first.account.password_reset_required = true;
-    first.account.code = Some(LiveCode { number: first.account.password_changes, used: false });
+    first.account.code = Some(LiveCode { number: first.account.password_changes, used: false, expires: until });
     for device in first.devices.values_mut() {
         if device.permit.take().is_some() {
             device.number = next(device.number)?;
