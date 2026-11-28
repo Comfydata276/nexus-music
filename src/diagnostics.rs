@@ -1,19 +1,23 @@
-//! The report in "What is sent" and the fuller file in "Save diagnostics".
+//! The same clean report for "What is sent" and "Save diagnostics".
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::fs;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{OnceLock, mpsc};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
-use nexus_core::nexus::{diag, events::DeviceKind, proto::Version};
+use chrono::Utc;
+use nexus_core::nexus::{account::DeviceKind, diag, events::LossCounts, proto::Version};
 use slint::ComponentHandle;
 
 use crate::controller::{Controller, post, with};
 use crate::{config, pool::Pool, ui};
+
+#[cfg(windows)]
+pub(crate) use diag::{Line, Note};
 
 // Keep report building and file I/O off the window thread. One worker keeps repeated
 // exports and previews in the order they were requested.
@@ -55,89 +59,84 @@ pub fn install(window: &ui::MainWindow) {
 }
 
 pub fn save(ctl: &Controller) {
-    let written = Utc::now();
     let session = Session::capture(ctl);
-    let page = ctl.ui.global::<ui::Settings>();
-    let local = LocalDetails {
-        written,
-        server_version: ctl.ui.global::<ui::App>().get_server_version().into(),
-        output_status: page.get_output_status().into(),
-        downloads: ctl.downloads.borrow().summary(),
-        cache_size: page.get_cache_size().into(),
-    };
     let crash_path = ctl.paths.crash_log.clone();
     let path = ctl.paths.diagnostics.clone();
     worker().spawn(move || {
-        let result = local.write(&session, &crash_path, &path);
-        match result {
-            Ok(()) => {
-                let program = if cfg!(windows) { "notepad" } else { "xdg-open" };
-                let _ = std::process::Command::new(program).arg(&path).spawn();
-                post(move |ctl| ctl.toast(format!("Saved to {}", path.display())));
-            }
-            Err(e) => post(move |ctl| ctl.toast(format!("Couldn't write {}. {e}", path.display()))),
+        if session.write_report(&crash_path, &path).is_ok() {
+            let program = if cfg!(windows) { "notepad" } else { "xdg-open" };
+            let _ = std::process::Command::new(program).arg(&path).spawn();
+            post(|ctl| ctl.toast("Diagnostics saved."));
+        } else {
+            post(|ctl| ctl.toast("Couldn't save diagnostics."));
         }
     });
 }
 
-struct Options {
-    https: bool,
-    offline: bool,
-    exclusive: bool,
-    bitrate: u32,
-    gapless: bool,
-    crossfade: f32,
-    normalize: bool,
-    equalizer: bool,
-    cache_limit_mb: u32,
-    sync: bool,
-    requests: bool,
+type Observation = (u64, diag::Line);
+
+thread_local! {
+    // Called by the native window and media callbacks on the window's thread.
+    static OBSERVED: RefCell<VecDeque<Observation>> = const { RefCell::new(VecDeque::new()) };
 }
 
-impl From<&config::Settings> for Options {
-    fn from(settings: &config::Settings) -> Self {
-        Self {
-            https: settings.server.starts_with("https://"),
-            offline: settings.offline,
-            exclusive: settings.exclusive,
-            bitrate: settings.max_bitrate(),
-            gapless: settings.gapless,
-            crossfade: settings.crossfade,
-            normalize: settings.normalize,
-            equalizer: settings.equalizer,
-            cache_limit_mb: settings.cache_limit_mb,
-            sync: settings.sync,
-            requests: settings.requests,
-        }
+#[cfg(any(windows, test))]
+pub fn observe(line: diag::Line) {
+    if let Ok(at) = u64::try_from(Utc::now().timestamp_millis()) {
+        OBSERVED.with_borrow_mut(|observed| {
+            if observed.len() == diag::MAX_ENTRIES {
+                observed.pop_front();
+            }
+            observed.push_back((at, line));
+        });
     }
 }
 
-/// An in-memory copy taken on the window's thread. Only the messages carry free text.
 struct Session {
-    options: Options,
+    https: bool,
+    offline: bool,
     signed_in: bool,
-    unreachable: bool,
-    songs: usize,
-    pending: usize,
-    said: VecDeque<(i64, String)>,
+    observations: Vec<Observation>,
 }
 
 impl Session {
+    /// Take the small in-memory snapshot on the window thread. No raw message leaves it.
     fn capture(ctl: &Controller) -> Self {
+        let settings = ctl.settings.borrow();
+        let said = ctl.said.borrow();
+        let observations = OBSERVED.with_borrow(|observed| {
+            observed.iter().copied().collect::<Vec<_>>()
+        });
+        Self::from_observations(&settings, ctl.client().is_some(), &said, observations)
+    }
+
+    fn from_observations(
+        settings: &config::Settings,
+        signed_in: bool,
+        said: &VecDeque<(i64, String)>,
+        mut observations: Vec<Observation>,
+    ) -> Self {
+        observations.extend(said.iter().filter_map(|(at, text)| {
+            let at = u64::try_from(*at).ok()?.checked_mul(1_000)?;
+            Some((at, windows_observations::message(text)))
+        }));
         Self {
-            options: Options::from(&*ctl.settings.borrow()),
-            signed_in: ctl.client().is_some(),
-            unreachable: ctl.unreachable.get(),
-            songs: crate::search::current().map_or(0, |index| index.library.songs.len()),
-            pending: ctl.pending.borrow().len() + ctl.sending.borrow().len(),
-            said: ctl.said.borrow().clone(),
+            https: settings.server.starts_with("https://"),
+            offline: settings.offline,
+            signed_in,
+            observations,
         }
     }
 
-    /// Settings renders this shared report. W6 can pair it with the backend's
-    /// observations and pass the same report to C6's upload constructor.
     fn report(&self, crash_path: &Path) -> diag::Report {
         let crash = recent_crash_text(crash_path).unwrap_or_default();
+        let mut observations: Vec<_> = crash.lines().filter_map(windows_observations::fault).collect();
+        observations.extend_from_slice(&self.observations);
+        observations.sort_by_key(|(at, _)| *at);
+        let mut record = diag::Record::default();
+        for (at, line) in observations {
+            record.note(at, line);
+        }
         diag::Report {
             about: diag::About {
                 version: Version {
@@ -148,14 +147,50 @@ impl Session {
                 device: DeviceKind::Pc,
                 os: os_version(),
                 signed_in: self.signed_in,
-                https: self.options.https,
-                offline: self.options.offline,
+                https: self.https,
+                offline: self.offline,
                 local_permission: None,
                 android_auto: None,
+                // The Windows journal will supply its totals when W8 exists.
+                loss: LossCounts::default(),
             },
-            record: windows_observations::record(&self.said, &crash),
+            record,
         }
     }
+
+    fn write_report(&self, crash_path: &Path, path: &Path) -> std::io::Result<()> {
+        let text = self.report(crash_path).text()
+            .map_err(|_| std::io::Error::other("The diagnostics report could not be built"))?;
+        if let Some(folder) = path.parent() {
+            fs::create_dir_all(folder)?;
+        }
+        fs::write(path, text)
+    }
+}
+
+/// Record the time, C6's shape, and the app area before opening the crash log.
+pub fn install_panic_hook() {
+    let log = config::Paths::new().crash_log;
+    std::panic::set_hook(Box::new(move |panic| {
+        let message = panic.payload().downcast_ref::<&str>().copied()
+            .or_else(|| panic.payload().downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("no payload");
+        let path = panic.location().map(|at| at.file()).unwrap_or_default();
+        let at = Utc::now().timestamp_millis().try_into().unwrap_or_default();
+        let _ = append_fault(&log, at, path, message);
+    }));
+}
+
+fn append_fault(log: &Path, at: u64, path: &str, message: &str) -> std::io::Result<()> {
+    let fault = diag::Line::Fault(diag::Fault {
+        place: windows_observations::place(path),
+        shape: diag::classify_rust_panic(message),
+    });
+    let line = format!("{at}\t{fault}\n");
+    if let Some(folder) = log.parent() {
+        fs::create_dir_all(folder)?;
+    }
+    fs::OpenOptions::new().create(true).append(true).open(log)?.write_all(line.as_bytes())
 }
 
 const UNKNOWN_OS: Version = Version { major: 0, minor: 0, patch: 0 };
@@ -202,31 +237,21 @@ fn recent_crash_text(path: &Path) -> std::io::Result<String> {
     Ok(text.to_owned())
 }
 
-// Adapt the old Windows toast and crash formats to C6's typed record. C6 owns the
-// vocabulary, counting, limits and rendering. Only recognized observations enter it.
+// Decode Windows' observations into C6's vocabulary. The log can still contain records
+// from older versions. Only the time, a fixed place and C6's classified shape leave here.
 mod windows_observations {
-    use std::collections::VecDeque;
-
     use chrono::NaiveDateTime;
-    use nexus_core::nexus::diag::{Fault, FaultPlace, FaultShape, Line, Record};
+    use nexus_core::nexus::diag::{self, Fault, FaultPlace, FaultShape, Line, Note};
 
-    pub(super) fn record(said: &VecDeque<(i64, String)>, crash: &str) -> Record {
-        let messages = said.iter().filter_map(|(at, text)| {
-            let at = u64::try_from(*at).ok()?.checked_mul(1_000)?;
-            Some((at, message(text)?))
-        });
-        let mut observations: Vec<_> = crash.lines().filter_map(fault).chain(messages).collect();
-        observations.sort_by_key(|(at, _)| *at);
-        let mut record = Record::default();
-        for (at, line) in observations {
-            record.note(at, line);
-        }
-        record
-    }
+    use super::Observation;
 
-    fn message(text: &str) -> Option<Line> {
+    pub(super) fn message(text: &str) -> Line {
         use FaultPlace::*;
         use FaultShape::*;
+
+        if text.starts_with("Your downloads are now in ") {
+            return Line::Note(Note::DownloadsFolderChanged);
+        }
 
         const FAULTS: &[(&str, FaultPlace, FaultShape)] = &[
             ("Lost the connection to the server.", MusicServer, Connection),
@@ -241,12 +266,19 @@ mod windows_observations {
         ];
         FAULTS.iter().find_map(|&(prefix, place, shape)| {
             text.starts_with(prefix).then_some(Line::Fault(Fault { place, shape }))
-        })
+        }).unwrap_or(Line::Note(Note::AppMessage))
     }
 
-    fn fault(line: &str) -> Option<(u64, Line)> {
-        // The panic hook writes this header before a free-form payload, which may span
-        // multiple lines. Take the time and a known source area from the header.
+    pub(super) fn fault(line: &str) -> Option<Observation> {
+        if let Some((at, text)) = line.split_once('\t') {
+            if let (Ok(at), Some(line @ Line::Fault(_))) = (at.parse(), diag::clean_line(text)) {
+                return Some((at, line));
+            }
+        }
+        legacy_fault(line)
+    }
+
+    fn legacy_fault(line: &str) -> Option<Observation> {
         let (date, rest) = line.split_once(" UTC version ")?;
         if date.len() != 19 {
             return None;
@@ -255,11 +287,18 @@ mod windows_observations {
         let at = u64::try_from(at.timestamp_millis()).ok()?;
         let (_, rest) = rest.split_once(" thread ")?;
         let (_, rest) = rest.split_once(" at ")?;
-        let (location, _) = rest.split_once(": ")?;
-        let file = location.rsplit_once(':')
+        let (location, message) = rest.split_once(": ")?;
+        let path = location.rsplit_once(':')
             .filter(|(_, line)| line.parse::<u32>().is_ok())
-            .and_then(|(file, _)| file.rsplit(['/', '\\']).next());
-        let place = match file {
+            .map_or("", |(file, _)| file);
+        Some((at, Line::Fault(Fault {
+            place: place(path),
+            shape: diag::classify_rust_panic(message),
+        })))
+    }
+
+    pub(super) fn place(path: &str) -> FaultPlace {
+        match path.rsplit(['/', '\\']).next() {
             Some("playback.rs" | "engine.rs" | "source.rs" | "dsp.rs") => FaultPlace::Playback,
             Some("exclusive.rs" | "media.rs") => FaultPlace::AudioOutput,
             Some("downloads.rs" | "songcache.rs") => FaultPlace::Downloads,
@@ -268,91 +307,8 @@ mod windows_observations {
             Some("actions.rs" | "pages.rs" | "search.rs" | "playlists.rs" | "covers.rs") => FaultPlace::Library,
             Some("journal.rs") => FaultPlace::Journal,
             _ => FaultPlace::App,
-        };
-        // C6 does not have a shape for a Rust panic or its subtypes.
-        Some((at, Line::Fault(Fault { place, shape: FaultShape::Other })))
+        }
     }
-}
-
-/// Strings only used in the local file. A server or device is free to choose these words.
-struct LocalDetails {
-    written: DateTime<Utc>,
-    server_version: String,
-    output_status: String,
-    downloads: String,
-    cache_size: String,
-}
-
-impl LocalDetails {
-    fn write(&self, session: &Session, crash_path: &Path, path: &Path) -> std::io::Result<()> {
-        let crash = fs::read_to_string(crash_path).ok();
-        let text = self.text(session, crash.as_deref());
-        if let Some(folder) = path.parent() {
-            let _ = fs::create_dir_all(folder);
-        }
-        fs::write(path, text)
-    }
-
-    fn text(&self, session: &Session, crash: Option<&str>) -> String {
-        let s = &session.options;
-        let mut lines = vec![
-            app_description(),
-            format!("Written {}", self.written.format("%Y-%m-%d %H:%M:%S UTC")),
-            String::new(),
-            format!("Signed in: {}", yes(session.signed_in)),
-            format!("Server version: {}", self.server_version),
-            format!("Server address uses HTTPS: {}", yes(s.https)),
-            format!("Offline mode: {}; server out of reach: {}", on(s.offline), on(session.unreachable)),
-            format!("Sound output: {}", self.output_status),
-            format!("Exclusive mode: {}; streaming limit: {} kbps (0 is none)", on(s.exclusive), s.bitrate),
-            playback_options(s),
-            format!("Library on this PC: {} songs", session.songs),
-            format!("Downloads: {}", self.downloads),
-            format!("Kept songs limit: {} MB; cache: {}", s.cache_limit_mb, self.cache_size),
-            sharing_options(s),
-            format!("Changes waiting to be sent: {}", session.pending),
-            String::new(),
-            "Recent messages:".into(),
-        ];
-        if session.said.is_empty() {
-            lines.push("  (none this session)".into());
-        }
-        for (at, text) in &session.said {
-            let when = DateTime::from_timestamp(*at, 0)
-                .map(|at| at.format("%H:%M:%S").to_string())
-                .unwrap_or_default();
-            lines.push(format!("  {when} UTC  {text}"));
-        }
-        lines.push(String::new());
-        lines.push("Times the app stopped by itself:".into());
-        if let Some(log) = crash.filter(|log| !log.trim().is_empty()) {
-            let all: Vec<_> = log.lines().collect();
-            lines.extend(all[all.len().saturating_sub(40)..].iter().map(|line| format!("  {line}")));
-        } else {
-            lines.push("  (none noted)".into());
-        }
-        lines.join("\r\n")
-    }
-}
-
-fn app_description() -> String {
-    format!("Nexus Music {} on {} ({})", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH)
-}
-
-fn yes(value: bool) -> &'static str {
-    if value { "yes" } else { "no" }
-}
-
-fn on(value: bool) -> &'static str {
-    if value { "on" } else { "off" }
-}
-
-fn playback_options(s: &Options) -> String {
-    format!("Gapless: {}; crossfade: {} s; levelling: {}; equaliser: {}", on(s.gapless), s.crossfade, on(s.normalize), on(s.equalizer))
-}
-
-fn sharing_options(s: &Options) -> String {
-    format!("Sharing between devices: {}; requests through Lidarr: {}", on(s.sync), on(s.requests))
 }
 
 #[cfg(test)]

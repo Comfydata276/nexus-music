@@ -725,8 +725,8 @@ impl Controller {
         }
     }
 
-    /// Takes a copy of this session for the local export. The diagnostics worker builds,
-    /// writes and opens the file.
+    /// Takes a copy of this session for export. The diagnostics worker builds the clean
+    /// report, writes it and opens the file.
     pub fn save_diagnostics(&self) {
         crate::diagnostics::save(self);
     }

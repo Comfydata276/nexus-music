@@ -2071,10 +2071,12 @@ export component SettingsPage inherits Rectangle {
             font-size: 23px;
             font-weight: 700;
             vertical-alignment: center;
+            horizontal-stretch: 1;
         }
 
         TextButton {
             text: "Back to About";
+            horizontal-stretch: 0;
             clicked => {
                 root.show-report = false;
                 scroll.content-y = 0px;
@@ -2835,7 +2837,7 @@ export component SettingsPage inherits Rectangle {
 
                         SettingRow {
                             title: "Diagnostics";
-                            detail: "Writes and opens a local text file with app settings, recent messages and crash details. It can include names and paths.";
+                            detail: "Writes and opens a local copy of the diagnostics report.";
                             TextButton {
                                 text: "Save diagnostics";
                                 clicked => { Settings.save-diagnostics(); }

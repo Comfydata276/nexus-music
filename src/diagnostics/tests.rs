@@ -1,5 +1,9 @@
 use super::*;
 use std::path::PathBuf;
+use std::process::Command;
+
+use diag::{Fault, FaultPlace, FaultShape, Line, Note};
+use nexus_core::nexus::{account::{RequestHead, RequestId}, proto::SPEAKS};
 
 const AT: i64 = 1_700_000_000;
 
@@ -19,77 +23,8 @@ impl Drop for TestFolder {
     }
 }
 
-fn session(settings: &config::Settings, said: VecDeque<(i64, String)>) -> Session {
-    Session {
-        options: settings.into(),
-        signed_in: true,
-        unreachable: true,
-        songs: 7,
-        pending: 3,
-        said,
-    }
-}
-
 #[test]
-fn local_file_matches_the_legacy_bytes_for_the_same_session() -> std::io::Result<()> {
-    let settings = config::Settings {
-        server: "https://music.example.invalid".into(),
-        bitrate: 192,
-        crossfade: 2.5,
-        offline: true,
-        normalize: true,
-        ..config::Settings::default()
-    };
-    let session = session(&settings, [
-        (AT, "Couldn't play “Paper Satellites”.\nA second line.".into()),
-        (AT + 1, r"Saved to C:\Users\ExampleLocal\diagnostics.txt".into()),
-        (i64::MAX, "Time could not be read".into()),
-    ].into());
-    let local = LocalDetails {
-        written: DateTime::from_timestamp(AT, 0).unwrap(),
-        server_version: "server-supplied version".into(),
-        output_status: "Shared with other apps, 48 kHz.".into(),
-        downloads: "1 song, 5 MB".into(),
-        cache_size: "Under 1 MB".into(),
-    };
-    let dir = TestFolder::new()?;
-    let crash = dir.0.join("crash.log");
-    let saved = dir.0.join("local/diagnostics.txt");
-    let recent: Vec<_> = (0..40).map(|i| format!("Raw crash line {i}: Paper Satellites")).collect();
-    fs::write(&crash, format!("Old crash line\n{}\r\n", recent.join("\r\n")))?;
-    local.write(&session, &crash, &saved)?;
-
-    let mut expected = format!("Nexus Music {} on {} ({})\r\n",
-        env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH);
-    expected.push_str(concat!(
-        "Written 2023-11-14 22:13:20 UTC\r\n\r\n",
-        "Signed in: yes\r\n",
-        "Server version: server-supplied version\r\n",
-        "Server address uses HTTPS: yes\r\n",
-        "Offline mode: on; server out of reach: on\r\n",
-        "Sound output: Shared with other apps, 48 kHz.\r\n",
-        "Exclusive mode: off; streaming limit: 192 kbps (0 is none)\r\n",
-        "Gapless: on; crossfade: 2.5 s; levelling: on; equaliser: off\r\n",
-        "Library on this PC: 7 songs\r\n",
-        "Downloads: 1 song, 5 MB\r\n",
-        "Kept songs limit: 2048 MB; cache: Under 1 MB\r\n",
-        "Sharing between devices: on; requests through Lidarr: off\r\n",
-        "Changes waiting to be sent: 3\r\n\r\n",
-        "Recent messages:\r\n",
-        "  22:13:20 UTC  Couldn't play “Paper Satellites”.\nA second line.\r\n",
-        "  22:13:21 UTC  Saved to C:\\Users\\ExampleLocal\\diagnostics.txt\r\n",
-        "   UTC  Time could not be read\r\n\r\n",
-        "Times the app stopped by itself:",
-    ));
-    for line in recent {
-        expected.push_str(&format!("\r\n  {line}"));
-    }
-    assert_eq!(fs::read(&saved)?, expected.as_bytes());
-    Ok(())
-}
-
-#[test]
-fn clean_preview_uses_fixed_words_even_with_private_or_malformed_input() -> std::io::Result<()> {
+fn preview_save_and_c6_upload_have_the_same_clean_text() -> std::io::Result<()> {
     let song = "Paper Satellites";
     let album = "Cardboard Orbit";
     let artist = "The Folded Stars";
@@ -116,18 +51,19 @@ fn clean_preview_uses_fixed_words_even_with_private_or_malformed_input() -> std:
         lidarr_signed_in: email.into(),
         ..config::Settings::default()
     };
-    let session = session(&settings, [
-        (AT, format!("Couldn't play “{text}”.")),
-        (AT + 1, format!("Saved to {folder}\\diagnostics.txt")),
-        (AT + 2, format!("Your downloads have moved to {folder}, but the setting could not be saved.")),
-        (AT + 3, format!("Added to “{playlist}”")),
-        (AT + 4, format!("In step: {text}\nAnother line: {token}")),
+    let messages = [
+        (AT, format!("Couldn't play “{song}”.")),
+        (AT + 1, format!("Added to “{playlist}”")),
+        (AT + 2, format!("Your downloads are now in {folder}")),
+        (AT + 3, format!("In step: {text}\nAnother line: {token}")),
+        (AT + 4, "Foreground entered after 123487 ms".into()),
         (AT + 5, format!("Couldn't play “{album}” by {artist}")),
-        (AT + 6, "Foreground entered after 123487 ms".into()),
         (i64::MAX, format!("Couldn't play {text}")),
-    ].into());
+    ].into();
+    let session = Session::from_observations(&settings, true, &messages, Vec::new());
     let dir = TestFolder::new()?;
     let crash = dir.0.join("crash.log");
+    let saved = dir.0.join("data/diagnostics.txt");
     fs::write(&crash, [
         b"Old bytes \xff\n".as_slice(),
         format!("2023-11-14 22:13:25 UTC version {key} thread {email} at {folder}\\src\\audio\\exclusive.rs:71: index out of bounds: {text}\n").as_bytes(),
@@ -136,22 +72,59 @@ fn clean_preview_uses_fixed_words_even_with_private_or_malformed_input() -> std:
         b"bad date UTC version 0.40.13 thread main at src/main.rs:76: no message\n",
     ].concat())?;
     let model = session.report(&crash);
-    let report = model.text().unwrap();
-    assert_eq!(diag::Report::read(&report).unwrap(), model);
-    assert_eq!(diag::Upload::new(&model).unwrap().text(), report);
+    let preview = model.text().unwrap();
+    session.write_report(&crash, &saved)?;
+    assert_eq!(fs::read(&saved)?, preview.as_bytes());
+    assert_eq!(diag::Report::read(&preview).unwrap(), model);
+    let upload = diag::Upload::new(RequestHead { speaks: SPEAKS, restore: 0 }, RequestId::new(1).unwrap(), &model).unwrap();
+    assert_eq!(upload.text(), preview);
+    assert_eq!(model.about.loss, LossCounts::default());
     for raw in [song, album, artist, playlist, folder, "ExampleLocal", server, email, key, token, "岬", "🪁", "AAAAAAAA", "123487"] {
-        assert!(!report.contains(raw), "included {raw:?}");
+        assert!(!preview.contains(raw), "included {raw:?}");
     }
-    assert!(report.bytes().all(|b| b == b'\n' || matches!(b, 32..=126)));
+    assert!(preview.bytes().all(|b| b == b'\n' || matches!(b, 32..=126)));
     for expected in [
         "HTTPS: yes",
-        "2023-11-14 22:13:22.000  Fault in downloads: write",
-        "2023-11-14 22:13:25.000  Fault in playback: other  (2 times since 2023-11-14 22:13:20.000)",
-        "2023-11-14 22:13:25.000  Fault in audio output: other",
-        "2023-11-14 22:13:27.000  Fault in app: other  (2 times since 2023-11-14 22:13:26.000)",
+        "2023-11-14 22:13:24  App message shown  (3 times since 2023-11-14 22:13:21)",
+        "2023-11-14 22:13:22  Downloads folder changed",
+        "2023-11-14 22:13:25  Fault in playback: other  (2 times since 2023-11-14 22:13:20)",
+        "2023-11-14 22:13:25  Fault in audio output: out of bounds",
+        "2023-11-14 22:13:26  Fault in app: borrow conflict",
+        "2023-11-14 22:13:27  Fault in app: panic",
     ] {
-        assert!(report.contains(expected), "missing {expected:?} in {report:?}");
+        assert!(preview.contains(expected), "missing {expected:?} in {preview:?}");
     }
+    Ok(())
+}
+
+#[test]
+fn the_hook_writes_no_panic_payload_even_to_the_crash_log() -> std::io::Result<()> {
+    const CHILD: &str = "NEXUS_W6A_PANIC_TEST_CHILD";
+    const PRIVATE: &str = "Paper Satellites C:\\Users\\ExampleLocal\t岬\nprivate@example.invalid nxs_fake_0123456789";
+    if std::env::var_os(CHILD).is_some() {
+        install_panic_hook();
+        assert!(std::panic::catch_unwind(|| panic!("already borrowed: {PRIVATE}")).is_err());
+        return Ok(());
+    }
+
+    let dir = TestFolder::new()?;
+    let child = Command::new(std::env::current_exe()?)
+        .args(["--exact", "diagnostics::tests::the_hook_writes_no_panic_payload_even_to_the_crash_log"])
+        .env(CHILD, "1")
+        .env("NEXUS_MUSIC_HOME", &dir.0)
+        .output()?;
+    assert!(child.status.success(), "hook child exited {}", child.status);
+    assert!(!String::from_utf8_lossy(&child.stderr).contains("Paper Satellites"));
+    let log = dir.0.join("data/crash.log");
+    let line = fs::read_to_string(&log)?;
+    assert_eq!(line.lines().count(), 1);
+    let (at, words) = line.trim_end_matches('\n').split_once('\t').unwrap();
+    assert!(at.parse::<u64>().is_ok());
+    assert_eq!(words, "Fault in app: borrow conflict");
+    append_fault(&log, AT as u64 * 1_000, r"C:\Users\ExampleLocal\src\audio\engine.rs", PRIVATE)?;
+    let text = fs::read_to_string(log)?;
+    assert!(text.ends_with("1700000000000\tFault in playback: panic\n"));
+    assert!(!text.contains("ExampleLocal"));
     Ok(())
 }
 
@@ -159,16 +132,32 @@ fn clean_preview_uses_fixed_words_even_with_private_or_malformed_input() -> std:
 fn crash_tail_and_rendered_entries_are_bounded() -> std::io::Result<()> {
     let dir = TestFolder::new()?;
     let log = dir.0.join("crash.log");
-    let crash_line = "2023-11-14 22:13:20 UTC version 0.40.13 thread main at src/main.rs:83: no message\n";
+    let crash_line = "1700000000000\tFault in app: no panic payload\n";
     fs::write(&log, format!("old{}\n{}", "x".repeat(CRASH_WINDOW as usize), crash_line.repeat(250)))?;
-    let tail = recent_crash_text(&log)?;
-    assert_eq!(tail, crash_line.repeat(250));
-    let session = session(&config::Settings::default(), VecDeque::new());
+    assert_eq!(recent_crash_text(&log)?, crash_line.repeat(250));
+
+    let session = Session::from_observations(&config::Settings::default(), false, &VecDeque::new(), Vec::new());
     let report = session.report(&log).text().unwrap();
-    assert!(report.contains("Fault in app: other  (250 times since 2023-11-14 22:13:20.000)"));
+    assert!(report.contains("Fault in app: no panic payload  (250 times since 2023-11-14 22:13:20)"));
     assert!(report.split_once("times in UTC):\n").unwrap().1.lines().count() <= diag::MAX_ENTRIES);
     assert!(report.lines().all(|line| line.len() <= diag::MAX_LINE_CHARS));
     assert!(report.len() < diag::CALL_BYTES);
     assert!(session.report(&dir.0.join("absent.log")).text().unwrap().ends_with("  (nothing yet)"));
     Ok(())
+}
+
+#[test]
+fn typed_window_observations_join_the_clean_record() {
+    let expected = [
+        Line::Note(Note::MediaButtonStarted),
+        Line::Note(Note::MediaButtonNothingToResume),
+        Line::Fault(Fault { place: FaultPlace::Foreground, shape: FaultShape::Refused }),
+    ];
+    for line in expected {
+        observe(line);
+    }
+    let observations = OBSERVED.with_borrow(|observed| observed.iter().copied().collect());
+    let session = Session::from_observations(&config::Settings::default(), true, &VecDeque::new(), observations);
+    let report = session.report(Path::new(""));
+    assert_eq!(report.record.entries().iter().map(|entry| entry.line).collect::<Vec<_>>(), expected);
 }
