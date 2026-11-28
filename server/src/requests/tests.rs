@@ -218,6 +218,7 @@ const PASSWORD: &str = "a long password for the Requests walk";
 #[derive(Default)]
 struct LidarrState {
     monitored: bool,
+    arrived: bool,
     new_releases: Option<String>,
     calls: Vec<String>,
 }
@@ -299,13 +300,15 @@ fn mock(request: &Question, state: &mut LidarrState) -> Value {
         ("GET", "system/status") => json!({"version":"2.0.0"}),
         ("GET", "album/lookup?term=Glass%20Orchard" | "album/lookup?term=Glass%20Orchard%20Quillon%20Vane") =>
             json!([album(state.monitored)]),
+        ("GET", lookup) if lookup == format!("album/lookup?term=lidarr%3A{ALBUM}") =>
+            json!([album(state.monitored)]),
         ("GET", "artist") => json!([artist]),
         ("GET", "artist/5") => artist,
         ("GET", "command") => json!([]),
         ("GET", "album?artistId=5") => json!([album(state.monitored)]),
         ("GET", "album/9") => album(state.monitored),
         ("GET", "wanted/missing?includeArtist=true&page=1&pageSize=500") => {
-            let found: Vec<_> = state.monitored.then(|| album(true)).into_iter().collect();
+            let found: Vec<_> = (state.monitored && !state.arrived).then(|| album(true)).into_iter().collect();
             json!({"records":found,"totalRecords":found.len()})
         }
         ("GET", "queue?page=1&pageSize=500") => json!({"records":[{"albumId":9,"size":100,"sizeleft":27}],"totalRecords":1}),
@@ -591,6 +594,19 @@ fn authenticated_loopback_requests_keep_order_and_ownership_and_survive_the_clie
     assert!(matches!(server.call(&first, Call::Pending { after: None }),
         Answer::Pending { albums, .. } if albums.len() == 1 && albums[0].removable && albums[0].progress == Some(73)));
     assert!(matches!(server.call(&other, Call::Pending { after: None }), Answer::Pending { albums, .. } if albums.is_empty()));
+
+    lock(&lidarr.state).arrived = true;
+    assert!(matches!(server.call(&first, Call::Pending { after: None }), Answer::Pending { albums, .. } if albums.is_empty()));
+    let same_account = server.sign_in(SignInCredential::Password {
+        email: first.signed_in.person.email.clone(),
+        password: Password::presented(PASSWORD).unwrap(),
+    }, 4, "");
+    assert!(matches!(server.call(&same_account, Call::AskedHistory { after: None }),
+        Answer::AskedHistory { rows, next: None } if rows.len() == 1 && rows[0].release.as_str() == ALBUM));
+    assert!(matches!(server.call(&other, Call::AskedHistory { after: None }),
+        Answer::AskedHistory { rows, next: None } if rows.is_empty()));
+    lock(&lidarr.state).arrived = false;
+
     assert!(matches!(server.call(&other, begin(1, cancelled())), Answer::Refused { reason: Refusal::AskedByOthers }));
     let stale = Change::Cancel { album: LidarrNumber::new(10).unwrap(), release: MusicBrainzId::new(ALBUM).unwrap() };
     let stale = begun(server.call(&first, begin(4, stale)));
@@ -601,6 +617,19 @@ fn authenticated_loopback_requests_keep_order_and_ownership_and_survive_the_clie
     server.offer(&other);
     let coowned = begun(server.call(&other, begin(2, change)));
     assert_eq!(server.done(&other, coowned), Completed::Requested);
+    let read = wire::write_attribution(&wire::AttributionRead {
+        head: RequestHead { speaks: SPEAKS, restore: admin.restore }, after: None,
+    }).unwrap();
+    let (code, reply) = server.post(wire::ADMIN_ATTRIBUTION, Some(&admin.signed_in), TEST_PAGE, read.bytes());
+    let admin::Reply::Done(page) = wire::read_attribution_reply(code, &reply).unwrap() else {
+        panic!("the admin page could not read attribution");
+    };
+    let accounts: HashSet<_> = page.rows.into_iter().map(|row| (row.account, row.asked.release)).collect();
+    let release = MusicBrainzId::new(ALBUM).unwrap();
+    assert_eq!(accounts, HashSet::from([
+        (first.signed_in.person.id, release.clone()), (other.signed_in.person.id, release),
+    ]));
+    assert_eq!(server.post(wire::ADMIN_ATTRIBUTION, Some(&first.signed_in), TEST_PAGE, read.bytes()).0, 403);
     assert!(matches!(server.call(&first, begin(2, cancelled())), Answer::Refused { reason: Refusal::AskedByOthers }));
     let cancel = begun(server.call(&admin, begin(1, cancelled())));
     assert_eq!(server.done(&admin, cancel), Completed::Cancelled);
@@ -663,7 +692,7 @@ fn fixture(name: &str) -> (PathBuf, Keeper, [OneTimeCode; 3]) {
             tx.execute_batch("
                 CREATE TABLE IF NOT EXISTS requests_access (account INTEGER PRIMARY KEY, enabled INTEGER NOT NULL, revision INTEGER NOT NULL DEFAULT 0);
                 CREATE TABLE IF NOT EXISTS requests_jobs (id INTEGER PRIMARY KEY, restore INTEGER NOT NULL, account INTEGER NOT NULL, session INTEGER NOT NULL, request BLOB NOT NULL, change BLOB NOT NULL, work BLOB NOT NULL, stage INTEGER NOT NULL DEFAULT 0, result TEXT, UNIQUE(restore,account,session,request));
-                CREATE TABLE IF NOT EXISTS requests_owners (binding BLOB NOT NULL, account INTEGER NOT NULL, release TEXT NOT NULL, asked_ms INTEGER NOT NULL, PRIMARY KEY(binding,account,release));
+                CREATE TABLE IF NOT EXISTS requests_owners (binding BLOB NOT NULL, account INTEGER NOT NULL, release TEXT NOT NULL, asked_ms INTEGER NOT NULL, metadata BLOB NOT NULL, PRIMARY KEY(binding,account,release));
                 CREATE TABLE IF NOT EXISTS requests_lines (job INTEGER NOT NULL, line INTEGER NOT NULL, progress TEXT NOT NULL, PRIMARY KEY(job,line));
                 CREATE TABLE IF NOT EXISTS requests_way_back (id INTEGER PRIMARY KEY, binding BLOB NOT NULL, artist INTEGER NOT NULL, artist_key TEXT NOT NULL, setting TEXT NOT NULL, UNIQUE(binding,artist));
             ")?;
@@ -844,22 +873,46 @@ fn a_slow_lidarr_read_leaves_sign_in_and_the_writer_available() {
 }
 
 #[test]
-fn duplicate_playlist_lines_keep_their_separate_progress_and_make_one_request() {
+fn batch_keeps_its_original_lines_and_exact_device_resolution_across_restart() {
     let lidarr = MockLidarr::start();
-    let (server, [_, member, other]) = TestServer::start("batch", endpoint(lidarr.address));
+    let (mut server, [_, member, other]) = TestServer::start_child("batch", lidarr.address, |_| {});
     let member = server.redeem(member, 2, "");
     let other = server.redeem(other, 3, "");
     let source = BatchLine { artist: "Quillon Vane".into(), album: "Glass Orchard".into(), song: "First Light".into() };
-    let lines = vec![source.clone(), source];
+    let lines = vec![source.clone(), BatchLine { album: String::new(), ..source }];
     let job = begun(server.call(&member, begin(1, Change::Batch { singles: false, lines })));
     assert!(matches!(server.call(&other, Call::BatchLines { job, after: None }),
         Answer::Refused { reason: Refusal::JobNotFound }));
+    let until = Instant::now() + Duration::from_secs(7);
+    loop {
+        if matches!(server.call(&member, Call::BatchLines { job, after: None }), Answer::BatchLines { lines, .. }
+            if lines.iter().any(|line| line.index == 1 && line.progress == BatchLineProgress::NeedsResolution))
+        {
+            break;
+        }
+        assert!(Instant::now() < until, "the batch did not ask its device for resolution");
+        thread::sleep(Duration::from_millis(30));
+    }
+    let resolution = || Call::ResolveBatchLine { job, index: 1, release: MusicBrainzId::new(ALBUM) };
+    assert!(matches!(server.call(&other, resolution()), Answer::Refused { reason: Refusal::JobNotFound }));
+    lidarr.hold_response(Some(("POST", "/api/v1/command")));
+    assert!(matches!(server.call(&member, resolution()), Answer::BatchResolutionAccepted));
+    lidarr.wait_for_call("POST command");
+    server.kill_child();
+    lidarr.hold_response(None);
+    server.launch(lidarr.address);
     assert_eq!(server.done(&member, job), Completed::Batch);
+    assert!(matches!(server.call(&member, resolution()), Answer::BatchResolutionAccepted));
+    assert!(matches!(server.call(&member, Call::ResolveBatchLine { job, index: 1, release: None }),
+        Answer::Refused { reason: Refusal::NotAllowed }));
+
     let Answer::BatchLines { lines, next: None } = server.call(&member, Call::BatchLines { job, after: None }) else {
         panic!("the batch did not return its progress");
     };
     assert_eq!(lines.iter().map(|line| line.index).collect::<Vec<_>>(), [0, 1]);
     assert!(lines.iter().all(|line| matches!(&line.progress,
-        BatchLineProgress::Asked { album } if album.offer.0.as_str() == ALBUM)));
-    assert_eq!(lidarr.take_calls().iter().filter(|&call| call == "POST command").count(), 1);
+        BatchLineProgress::Done { album } if album.offer.0.as_str() == ALBUM)));
+    let calls = lidarr.take_calls();
+    assert_eq!(calls.iter().filter(|&call| call == "POST command").count(), 1);
+    assert_eq!(calls.iter().filter(|&call| call == &format!("GET album/lookup?term=lidarr%3A{ALBUM}")).count(), 1);
 }

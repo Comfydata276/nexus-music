@@ -9,7 +9,7 @@ use axum::http::header::{CONNECTION, CONTENT_TYPE, HOST};
 use axum::http::{HeaderValue, Method, Request};
 use http_body_util::{BodyExt, Full, Limited};
 use hyper_util::rt::TokioIo;
-use nexus_core::http;
+use nexus_core::{bulk, http};
 use nexus_core::lidarr::{self, Lidarr};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
@@ -36,7 +36,8 @@ use nexus_core::nexus::kept::{
     Access, Account, Bearer, Denied, Fingerprint, GrantUse, LeaveFor, SessionKind,
 };
 use nexus_core::nexus::requests::{
-    self as wire, AlbumView, Answer, ArtistView, Availability, BatchAlbum, BatchLine,
+    self as wire, AlbumView, Answer, ArtistView, AskedRelease, AttributionPage, AttributionRow,
+    Availability, BatchAlbum, BatchLine,
     BatchLineProgress, BatchLineView, Call, Change, Completed, JobId, LidarrNumber,
     ListedView, MusicBrainzId, PageCursor, PendingView, Refusal, Search, SessionOffers,
     lidarr_items,
@@ -273,6 +274,7 @@ impl Requests {
             .route(wire::REQUESTS, post(call))
             .route(admin::SET_REQUESTS_ENABLED, post(set_requests_enabled))
             .route(GET_LIDARR, post(get_lidarr))
+            .route(wire::ADMIN_ATTRIBUTION, post(attribution))
             .with_state(self.clone()))
     }
 
@@ -295,7 +297,7 @@ impl Requests {
                 let session = session_id(&account, device)?;
                 Ok((number, session, kind))
             }).await)?;
-            if matches!(path, GET_LIDARR | admin::SET_REQUESTS_ENABLED) && (!page || who.2 != SessionKind::AdminPage) {
+            if matches!(path, GET_LIDARR | admin::SET_REQUESTS_ENABLED | wire::ADMIN_ATTRIBUTION) && (!page || who.2 != SessionKind::AdminPage) {
                 return Err(account::Refusal::NotAllowed(account::NotAllowed::Denied));
             }
             let place = Place::ingress(self.rooms.clone(), who.0).ok_or_else(events::busy)?;
@@ -425,6 +427,7 @@ enum Read {
     Listed(LidarrNumber),
     Busy(Vec<LidarrNumber>),
     Pending,
+    AskedHistory,
     Batch(JobId),
 }
 
@@ -510,7 +513,7 @@ impl Read {
                 Answer::Busy { positions, stamp }
             }
             Self::Pending => Answer::Pending { albums: lidarr_items(lidarr.pending()?), next },
-            Self::Batch(_) => unreachable!("batch progress is loaded from the data"),
+            Self::AskedHistory | Self::Batch(_) => unreachable!("this page is loaded from the data"),
         })
     }
 }
@@ -526,8 +529,12 @@ struct Snapshot {
     id: NonZeroU64,
     session: SessionId,
     last_seen: Instant,
-    read: Read,
-    found: Answer,
+    content: SnapshotContent,
+}
+
+enum SnapshotContent {
+    App { read: Read, found: Answer },
+    Attribution(Vec<AttributionRow>),
 }
 
 impl Books {
@@ -535,36 +542,72 @@ impl Books {
         self.snapshots.retain(|snapshot| snapshot.last_seen.elapsed() < Duration::from_secs(wire::SNAPSHOT_IDLE_SECONDS));
     }
 
-    fn peek(&mut self, session: SessionId, read: &Read, after: PageCursor) -> Result<Answer, Refusal> {
+    fn take(
+        &mut self,
+        session: SessionId,
+        after: PageCursor,
+        matches: impl Fn(&SnapshotContent) -> bool,
+    ) -> Result<Snapshot, Refusal> {
         self.expire();
-        let index = self.snapshots.iter().position(|known|
-            known.id == after.snapshot() && known.session == session && &known.read == read)
-            .ok_or(Refusal::SearchAgain)?;
+        let index = self.snapshots.iter().position(|known| {
+            known.id == after.snapshot() && known.session == session && matches(&known.content)
+        }).ok_or(Refusal::SearchAgain)?;
         let mut snapshot = self.snapshots.remove(index).ok_or(Refusal::SearchAgain)?;
-        let answer = page(&snapshot.found, snapshot.id, after.offset() as usize)?;
         snapshot.last_seen = Instant::now();
+        Ok(snapshot)
+    }
+
+    fn next_id(&mut self) -> Result<NonZeroU64, Refusal> {
+        self.last_snapshot = self.last_snapshot.checked_add(1).ok_or(Refusal::NotDealtWith)?;
+        NonZeroU64::new(self.last_snapshot).ok_or(Refusal::NotDealtWith)
+    }
+
+    fn keep_snapshot(&mut self, id: NonZeroU64, session: SessionId, content: SnapshotContent) {
+        self.expire();
+        let matching = self.snapshots.iter().enumerate().filter(|(_, known)| known.session == session);
+        if let Some((index, _)) = matching.clone().next().filter(|_| matching.count() >= wire::SNAPSHOTS_PER_SESSION) {
+            self.snapshots.remove(index);
+        }
+        if self.snapshots.len() == MAX_SNAPSHOTS {
+            self.snapshots.pop_front();
+        }
+        self.snapshots.push_back(Snapshot { id, session, last_seen: Instant::now(), content });
+    }
+
+    fn peek(&mut self, session: SessionId, read: &Read, after: PageCursor) -> Result<Answer, Refusal> {
+        let snapshot = self.take(session, after, |content| {
+            matches!(content, SnapshotContent::App { read: known, .. } if known == read)
+        })?;
+        let SnapshotContent::App { found, .. } = &snapshot.content else { return Err(Refusal::SearchAgain) };
+        let answer = page(found, snapshot.id, after.offset() as usize)?;
         self.snapshots.push_back(snapshot);
         Ok(answer)
     }
 
     fn first(&mut self, session: SessionId, read: &Read, found: Answer) -> Result<Answer, Refusal> {
-        if page_size(&found).is_none() {
-            return Ok(found);
-        }
-        self.expire();
-        self.last_snapshot = self.last_snapshot.checked_add(1).ok_or(Refusal::NotDealtWith)?;
-        let id = NonZeroU64::new(self.last_snapshot).ok_or(Refusal::NotDealtWith)?;
+        let Some((count, limit)) = page_size(&found) else { return Ok(found) };
+        let id = self.next_id()?;
         let answer = page(&found, id, 0)?;
-        if page_size(&found).is_some_and(|(count, limit)| count > limit) {
-            let matching = self.snapshots.iter().enumerate().filter(|(_, known)| known.session == session);
-            if let Some((index, _)) = matching.clone().next().filter(|_| matching.count() >= wire::SNAPSHOTS_PER_SESSION) {
-                self.snapshots.remove(index);
-            }
-            if self.snapshots.len() == MAX_SNAPSHOTS {
-                self.snapshots.pop_front();
-            }
-            self.snapshots.push_back(Snapshot { id, session, last_seen: Instant::now(), read: read.clone(), found });
+        if count > limit {
+            self.keep_snapshot(id, session, SnapshotContent::App { read: read.clone(), found });
         }
+        Ok(answer)
+    }
+
+    fn attribution_first(&mut self, session: SessionId, rows: Vec<AttributionRow>) -> Result<AttributionPage, Refusal> {
+        let id = self.next_id()?;
+        let answer = attribution_page(&rows, id, 0)?;
+        if answer.next.is_some() {
+            self.keep_snapshot(id, session, SnapshotContent::Attribution(rows));
+        }
+        Ok(answer)
+    }
+
+    fn attribution_next(&mut self, session: SessionId, after: PageCursor) -> Result<AttributionPage, Refusal> {
+        let snapshot = self.take(session, after, |content| matches!(content, SnapshotContent::Attribution(_)))?;
+        let SnapshotContent::Attribution(rows) = &snapshot.content else { return Err(Refusal::SearchAgain) };
+        let answer = attribution_page(rows, snapshot.id, after.offset() as usize)?;
+        self.snapshots.push_back(snapshot);
         Ok(answer)
     }
 
@@ -614,6 +657,7 @@ fn page_size(found: &Answer) -> Option<(usize, usize)> {
         Answer::ReleasesOf { releases, .. } => releases.len(),
         Answer::Listed { releases, .. } => releases.len(),
         Answer::Pending { albums, .. } => albums.len(),
+        Answer::AskedHistory { rows, .. } => rows.len(),
         Answer::BatchLines { lines, .. } => lines.len(),
         _ => return None,
     }, wire::PAGE_MAX_ITEMS))
@@ -621,14 +665,7 @@ fn page_size(found: &Answer) -> Option<(usize, usize)> {
 
 fn page(found: &Answer, id: NonZeroU64, from: usize) -> Result<Answer, Refusal> {
     let (len, limit) = page_size(found).ok_or(Refusal::SearchAgain)?;
-    if len > wire::LIST_MAX_ITEMS {
-        return Err(Refusal::TooLarge);
-    }
-    if from >= len && from != 0 {
-        return Err(Refusal::SearchAgain);
-    }
-    let to = (from + limit).min(len);
-    let next = if to < len { PageCursor::new(id, to as u32) } else { None };
+    let (to, next) = page_end(len, limit, id, from)?;
     Ok(match found {
         Answer::FoundReleases { albums, singles, .. } => {
             let last_album = albums.len();
@@ -646,9 +683,32 @@ fn page(found: &Answer, id: NonZeroU64, from: usize) -> Result<Answer, Refusal> 
         Answer::ReleasesOf { releases, .. } => Answer::ReleasesOf { releases: releases[from..to].to_vec(), next },
         Answer::Listed { releases, .. } => Answer::Listed { releases: releases[from..to].to_vec(), next },
         Answer::Pending { albums, .. } => Answer::Pending { albums: albums[from..to].to_vec(), next },
+        Answer::AskedHistory { rows, .. } => Answer::AskedHistory { rows: rows[from..to].to_vec(), next },
         Answer::BatchLines { lines, .. } => Answer::BatchLines { lines: lines[from..to].to_vec(), next },
         _ => return Err(Refusal::SearchAgain),
     })
+}
+
+fn page_end(len: usize, limit: usize, id: NonZeroU64, from: usize) -> Result<(usize, Option<PageCursor>), Refusal> {
+    if len > wire::LIST_MAX_ITEMS {
+        return Err(Refusal::TooLarge);
+    }
+    if from >= len && from != 0 {
+        return Err(Refusal::SearchAgain);
+    }
+    let to = (from + limit).min(len);
+    let next = if to < len { PageCursor::new(id, to as u32) } else { None };
+    Ok((to, next))
+}
+
+fn attribution_page(rows: &[AttributionRow], id: NonZeroU64, from: usize) -> Result<AttributionPage, Refusal> {
+    let (to, next) = page_end(rows.len(), wire::PAGE_MAX_ITEMS, id, from)?;
+    let rows = rows[from..to].iter().map(|row| AttributionRow {
+        account: row.account,
+        name: row.name.clone(),
+        asked: row.asked.clone(),
+    }).collect();
+    Ok(AttributionPage { rows, next })
 }
 
 fn send(answer: Result<Answer, Refusal>, receipt: Receipt) -> Response<Body> {
@@ -681,6 +741,10 @@ struct Plan {
     artist: Option<ArtistView>,
     offers: Vec<AlbumView>,
     listed: Vec<ListedView>,
+    #[serde(default)]
+    added_artist: Option<lidarr::AddedArtist>,
+    #[serde(default)]
+    prepared_batch: Option<Vec<u8>>,
 }
 
 impl Plan {
@@ -694,7 +758,10 @@ impl Plan {
         let book = || books.sessions.iter().find(|(id, _)| *id == actor.session)
             .map(|(_, book)| book).ok_or(Refusal::SearchAgain);
         let now = seconds(actor.now);
-        let mut plan = Self { binding, revision, artist: None, offers: Vec::new(), listed: Vec::new() };
+        let mut plan = Self {
+            binding, revision, artist: None, offers: Vec::new(), listed: Vec::new(), added_artist: None,
+            prepared_batch: None,
+        };
         match change {
             Change::Request { offer } | Change::ListSingles { offer, .. } => {
                 plan.offers.push(book()?.offers.album(offer, now)?.clone());
@@ -702,23 +769,21 @@ impl Plan {
             Change::AddArtist { artist } => {
                 plan.artist = Some(book()?.offers.artist(artist, now)?.clone());
             }
-            Change::AddWanting { offers } => {
+            Change::AddWanting { artist, offers } => {
                 let book = book()?;
                 for offer in offers {
                     plan.offers.push(book.offers.album(offer, now)?.clone());
                 }
-                // CARRIED from C11's integration rules while the shared check is pending.
-                let first = plan.offers.first().ok_or(Refusal::SearchAgain)?;
-                if plan.offers.iter().any(|offer| offer.artist_id != first.artist_id) {
-                    return Err(Refusal::SearchAgain);
-                }
+                wire::check_add_wanting(artist, offers, &plan.offers)?;
             }
             Change::Want { artist, albums } => {
                 let book = book()?;
+                let shown: Vec<_> = book.listed.iter()
+                    .filter(|(known, _, seen)| *known == artist.id && recent(*seen, now))
+                    .map(|(_, row, _)| row.clone()).collect();
                 for album in albums {
-                    let (_, row, _) = book.listed.iter().find(|(known, row, seen)|
-                        known == artist && &row.id == album && recent(*seen, now))
-                        .ok_or(Refusal::SearchAgain)?;
+                    album.check_current(&shown)?;
+                    let row = shown.iter().find(|row| row.id == album.id).ok_or(Refusal::SearchAgain)?;
                     plan.listed.push(row.clone());
                 }
             }
@@ -815,10 +880,10 @@ fn enqueue(
         params![restore, account, FINISHED], |row| row.get(0),
     ).map_err(sql_error)?;
     let waiting: i64 = keeper.data().connection().query_row(
-        "SELECT count(*) FROM requests_jobs WHERE restore = ?1 AND stage = ?2",
-        params![restore, QUEUED], |row| row.get(0),
+        "SELECT count(*) FROM requests_jobs WHERE restore = ?1 AND stage < ?2",
+        params![restore, FINISHED], |row| row.get(0),
     ).map_err(sql_error)?;
-    if occupied || waiting >= wire::WAITING_MAX as i64 {
+    if occupied || waiting >= (wire::WAITING_MAX + wire::RUNNING_MAX) as i64 {
         return Err(Refusal::Busy);
     }
     let row = keeper.write_data(actor.now, |tx| {
@@ -843,25 +908,152 @@ fn after_job(db: &Connection, actor: Actor, job: JobId) -> Result<Answer, Refusa
     result.ok_or(Refusal::NotDealtWith).and_then(|text| decode::<JobResult>(text.as_bytes())).map(JobResult::answer)
 }
 
-fn batch_lines(db: &Connection, actor: Actor, job: JobId) -> Result<Answer, Refusal> {
-    let change: Vec<u8> = db.query_row(
-        "SELECT change FROM requests_jobs WHERE id = ?1 AND restore = ?2 AND account = ?3 AND session = ?4",
+#[derive(Serialize, Deserialize, Default)]
+struct SavedLine {
+    #[serde(default)]
+    progress: Option<BatchLineProgress>,
+    #[serde(default)]
+    offer: Option<AlbumView>,
+    #[serde(default)]
+    resolution: Option<Resolution>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Resolution {
+    release: Option<MusicBrainzId>,
+    #[serde(default)]
+    lookup_started: bool,
+}
+
+fn owned_batch(db: &Connection, actor: Actor, job: JobId) -> Result<(Vec<BatchLine>, Plan, i64), Refusal> {
+    let (change, work, stage): (Vec<u8>, Vec<u8>, i64) = db.query_row(
+        "SELECT change, work, stage FROM requests_jobs WHERE id = ?1 AND restore = ?2 AND account = ?3 AND session = ?4",
         params![row_id(job)?, sql(actor.restore)?, sql(actor.account.get())?, sql(actor.session.get())?],
-        |row| row.get(0),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     ).optional().map_err(sql_error)?.ok_or(Refusal::JobNotFound)?;
     let Change::Batch { lines, .. } = decode(&change)? else { return Err(Refusal::JobNotFound) };
-    let mut select = db.prepare("SELECT line, progress FROM requests_lines WHERE job = ?1").map_err(sql_error)?;
-    let mut progress = HashMap::new();
-    let saved = select.query_map([row_id(job)?], |row| Ok((row.get::<_, u16>(0)?, row.get::<_, String>(1)?))).map_err(sql_error)?;
-    for item in saved {
-        let (line, text) = item.map_err(sql_error)?;
-        progress.insert(line, decode(text.as_bytes())?);
+    Ok((lines, decode(&work)?, stage))
+}
+
+fn batch_lines(db: &Connection, actor: Actor, job: JobId) -> Result<Answer, Refusal> {
+    let (input, plan, _) = owned_batch(db, actor, job)?;
+    let mut stored = HashMap::new();
+    let mut query = db.prepare("SELECT line, progress FROM requests_lines WHERE job = ?1").map_err(sql_error)?;
+    let rows = query.query_map([row_id(job)?], |row| Ok((row.get::<_, u16>(0)?, row.get::<_, String>(1)?)))
+        .map_err(sql_error)?;
+    for row in rows {
+        let (index, encoded) = row.map_err(sql_error)?;
+        let line: SavedLine = decode(encoded.as_bytes())?;
+        if let Some(progress) = line.progress {
+            stored.insert(index, progress);
+        }
     }
-    let lines = (0..lines.len() as u16).map(|index| BatchLineView {
-        index,
-        progress: progress.remove(&index).unwrap_or(BatchLineProgress::Waiting),
-    }).collect();
-    Ok(Answer::BatchLines { lines, next: None })
+    let saved = if let Some(payload) = plan.prepared_batch {
+        let batch = loaded_bulk(&payload, ReadOnlyBatch)?;
+        let indexed = batch.indexed_lines().ok_or(Refusal::NotDealtWith)?;
+        let mut rows = Vec::with_capacity(indexed.len());
+        for line in &indexed {
+            let mut projected = BatchLineView::from_indexed(line).map_err(|_| Refusal::NotDealtWith)?;
+            if let Some(progress @ BatchLineProgress::Failed { .. }) = stored.remove(&projected.index) {
+                projected.progress = progress;
+            }
+            rows.push(projected);
+        }
+        rows
+    } else {
+        (0..input.len() as u16).map(|index| BatchLineView {
+            index, progress: stored.remove(&index).unwrap_or(BatchLineProgress::Waiting),
+        }).collect()
+    };
+    Ok(Answer::BatchLines { lines: saved, next: None })
+}
+
+fn saved_line(db: &Connection, row: i64, index: u16) -> Result<SavedLine, Refusal> {
+    let text: Option<String> = db.query_row(
+        "SELECT progress FROM requests_lines WHERE job = ?1 AND line = ?2",
+        params![row, index], |row| row.get(0),
+    ).optional().map_err(sql_error)?;
+    text.map(|text| decode(text.as_bytes())).transpose().map(Option::unwrap_or_default)
+}
+
+fn save_line(keeper: &mut Keeper, now: u64, row: i64, index: u16, line: &SavedLine) -> Result<(), Refusal> {
+    let text = serde_json::to_string(line).map_err(|_| Refusal::NotDealtWith)?;
+    keeper.write_data(now, |tx| {
+        tx.execute(
+            "INSERT INTO requests_lines (job, line, progress) VALUES (?1, ?2, ?3)
+             ON CONFLICT(job, line) DO UPDATE SET progress = excluded.progress",
+            params![row, index, text],
+        ).map(|count| ((), count != 0))
+    }).map_err(|_| Refusal::NotDealtWith)
+}
+
+fn resolve_batch_line(
+    keeper: &mut Keeper, actor: Actor, job: JobId, index: u16, release: Option<MusicBrainzId>,
+) -> Result<(), Refusal> {
+    let db = keeper.data().connection();
+    let (input, _, stage) = owned_batch(db, actor, job)?;
+    if usize::from(index) >= input.len() {
+        return Err(Refusal::NotAllowed);
+    }
+    let row = row_id(job)?;
+    let mut line = saved_line(db, row, index)?;
+    let state = match &line.resolution {
+        Some(resolution) => wire::BatchResolutionState::Saved(resolution.release.as_ref()),
+        None if stage != FINISHED && matches!(line.progress, Some(BatchLineProgress::NeedsResolution)) =>
+            wire::BatchResolutionState::Awaiting,
+        None => wire::BatchResolutionState::Closed,
+    };
+    if wire::check_batch_resolution(state, release.as_ref())? == wire::BatchResolutionWrite::Save {
+        line.resolution = Some(Resolution { release, lookup_started: false });
+        save_line(keeper, actor.now, row, index, &line)?;
+    }
+    Ok(())
+}
+
+struct ReadOnlyBatch;
+
+impl bulk::Desk for ReadOnlyBatch {
+    fn keep(&self, _: Option<Vec<u8>>, _: bool) {}
+    fn keep_checked(&self, _: Vec<u8>) -> bool { false }
+    fn now(&self) -> i64 { 0 }
+    fn singles(&self) -> bool { false }
+}
+
+fn loaded_bulk(payload: &[u8], desk: impl bulk::Desk + 'static) -> Result<bulk::Job, Refusal> {
+    let batch = bulk::Job::new(desk);
+    if !batch.load(payload) {
+        return Err(Refusal::NotDealtWith);
+    }
+    Ok(batch)
+}
+
+fn asked_history(db: &Connection, binding: &[u8; 32], account: AccountId) -> Result<Vec<AskedRelease>, Refusal> {
+    let mut query = db.prepare(
+        "SELECT metadata FROM requests_owners WHERE binding = ?1 AND account = ?2
+         ORDER BY asked_ms DESC, release LIMIT ?3",
+    ).map_err(sql_error)?;
+    let rows = query.query_map(params![binding.as_slice(), sql(account.get())?, wire::LIST_MAX_ITEMS as i64 + 1],
+        |row| row.get::<_, Vec<u8>>(0)).map_err(sql_error)?;
+    rows.map(|row| decode(&row.map_err(sql_error)?)).collect()
+}
+
+fn attributed_requests(db: &Connection, binding: &[u8; 32]) -> Result<Vec<AttributionRow>, Refusal> {
+    let mut query = db.prepare(
+        "SELECT owners.account, accounts.shown, owners.metadata FROM requests_owners AS owners
+         JOIN accounts ON accounts.number = owners.account
+         WHERE owners.binding = ?1 ORDER BY owners.asked_ms DESC, owners.account, owners.release LIMIT ?2",
+    ).map_err(sql_error)?;
+    let rows = query.query_map(params![binding.as_slice(), wire::LIST_MAX_ITEMS as i64 + 1], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, Vec<u8>>(2)?))
+    }).map_err(sql_error)?;
+    let mut found = Vec::new();
+    for row in rows {
+        let (id, name, payload) = row.map_err(sql_error)?;
+        let account = AccountId::new(unsigned(id)?).ok_or(Refusal::NotDealtWith)?;
+        let name = account::Name::new(&name).ok_or(Refusal::NotDealtWith)?;
+        found.push(AttributionRow { account, name, asked: decode(&payload)? });
+    }
+    Ok(lidarr_items(found))
 }
 
 fn owners(
@@ -1028,14 +1220,26 @@ impl Requests {
                 Answer::Begun { job }
             }
             Call::After { job } => after_job(db, actor, job)?,
+            Call::ResolveBatchLine { job, index, release } => {
+                resolve_batch_line(keeper, actor, job, index, release)?;
+                self.wake.notify_one();
+                Answer::BatchResolutionAccepted
+            }
+            Call::AskedHistory { after } => {
+                if let Some(after) = after {
+                    lock(&self.books).peek(actor.session, &Read::AskedHistory, after)?
+                } else {
+                    let found = Answer::AskedHistory { rows: asked_history(db, &binding, actor.account)?, next: None };
+                    lock(&self.books).first(actor.session, &Read::AskedHistory, found)?
+                }
+            }
             Call::BatchLines { job, after } => {
-                let found = batch_lines(db, actor, job)?;
-                let mut books = lock(&self.books);
                 let key = Read::Batch(job);
                 if let Some(after) = after {
-                    books.peek(actor.session, &key, after)?
+                    lock(&self.books).peek(actor.session, &key, after)?
                 } else {
-                    books.first(actor.session, &key, found)?
+                    let found = batch_lines(db, actor, job)?;
+                    lock(&self.books).first(actor.session, &key, found)?
                 }
             }
             call => {
@@ -1120,7 +1324,12 @@ impl Requests {
         ) = {
             let mut query = db.prepare(
                 "SELECT id, account, session, change, work, stage FROM requests_jobs
-                 WHERE restore = ?1 AND stage < ?2 ORDER BY id LIMIT ?3",
+                 WHERE restore = ?1 AND stage < ?2 AND NOT EXISTS (
+                    SELECT 1 FROM requests_lines
+                    WHERE job = requests_jobs.id
+                     AND json_extract(progress, '$.progress.state') = 'needs_resolution'
+                     AND json_type(progress, '$.resolution') = 'null'
+                 ) ORDER BY id LIMIT ?3",
             ).map_err(sql_error)?;
             let mut rows = query.query(params![sql(keeper.restore())?, FINISHED, (wire::WAITING_MAX + wire::RUNNING_MAX) as i64])
                 .map_err(sql_error)?;
@@ -1213,8 +1422,11 @@ impl Requests {
         }));
         let _mutation = (!matches!(job.change, Change::Batch { .. })).then(|| lock(&self.mutation));
         let result = if let Change::Batch { singles, lines } = &job.change {
-            self.run_batch(&job, &journal, &lidarr, *singles, lines)
-                .map(|()| (Completed::Batch, Vec::new(), None))
+            match self.run_batch(&job, &journal, &lidarr, *singles, lines) {
+                Ok(Some(asked)) => Ok((Completed::Batch, asked, None)),
+                Ok(None) => return,
+                Err(reason) => Err(reason),
+            }
         } else {
             let cleaned = journal.restore_pending(&endpoint.lidarr(runtime, &credential.key, None));
             cleaned.and_then(|()| {
@@ -1238,7 +1450,7 @@ fn finish_job(
     now: u64,
     row: i64,
     result: &JobResult,
-    adds: &[MusicBrainzId],
+    adds: &[AskedRelease],
     ownership: Option<([u8; 32], AccountId, Option<MusicBrainzId>)>,
 ) -> Result<(), Refusal> {
     let text = serde_json::to_string(result).map_err(|_| Refusal::NotDealtWith)?;
@@ -1261,12 +1473,26 @@ fn finish_job(
     }).map_err(|_| Refusal::NotDealtWith)
 }
 
-fn keep_owner(db: &Connection, binding: &[u8; 32], account: AccountId, release: &MusicBrainzId, now: u64) -> rusqlite::Result<()> {
+fn keep_owner(db: &Connection, binding: &[u8; 32], account: AccountId, asked: &AskedRelease, now: u64) -> rusqlite::Result<()> {
+    let mut row = asked.clone();
+    row.asked_ms = now;
+    let metadata = serde_json::to_vec(&row).map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
     db.execute(
-        "INSERT OR IGNORE INTO requests_owners (binding, account, release, asked_ms)
-         SELECT ?1, number, ?2, ?3 FROM accounts WHERE number = ?4",
-        params![binding.as_slice(), release.as_str(), events::sql(now)?, events::sql(account.get())?],
+        "INSERT OR IGNORE INTO requests_owners (binding, account, release, asked_ms, metadata)
+         SELECT ?1, number, ?2, ?3, ?4 FROM accounts WHERE number = ?5",
+        params![binding.as_slice(), row.release.as_str(), events::sql(now)?, metadata, events::sql(account.get())?],
     ).map(drop)
+}
+
+fn asked_release(view: &AlbumView) -> Result<AskedRelease, Refusal> {
+    Ok(AskedRelease {
+        release: view.album.0.clone(),
+        artist_id: view.artist_id.clone().ok_or(Refusal::LidarrUnrecognized)?,
+        title: view.title.clone(),
+        artist: view.artist.clone(),
+        cover: view.cover.clone(),
+        asked_ms: 0,
+    })
 }
 
 #[derive(Clone)]
@@ -1353,6 +1579,13 @@ impl lidarr::WayBack for Journal {
         if kept { Ok(true) } else { Err(fail()) }
     }
 
+    fn before_artist_albums(&self, added: &lidarr::AddedArtist) -> Result<(), String> {
+        let added = added.clone();
+        self.ask(move |keeper, now, row| {
+            update_work(keeper, now, row, |plan| plan.added_artist = Some(added))
+        }).map_err(|_| "Couldn't keep the artist's selected releases.".to_owned())
+    }
+
     fn put_back(&self, address: &str, artist: i64, before: &str) {
         if self.binding == endpoint_binding(address) {
             let _ = self.cross_off(artist, before.to_owned());
@@ -1364,7 +1597,7 @@ fn endpoint_binding(address: &str) -> [u8; 32] {
     Sha256::digest(address.trim_end_matches('/')).into()
 }
 
-type Changed = (Completed, Vec<MusicBrainzId>, Option<MusicBrainzId>);
+type Changed = (Completed, Vec<AskedRelease>, Option<MusicBrainzId>);
 
 fn lidarr_result<T>(value: Result<T, String>, wanted: Option<&Offer>) -> Result<T, Refusal> {
     value.map_err(|why| wire::refusal_for(&why, wanted))
@@ -1375,39 +1608,44 @@ impl Job {
         let done = |result| Ok((result, Vec::new(), None));
         match &self.change {
             Change::Request { offer } => {
-                let wanted = self.plan.offers.first().ok_or(Refusal::SearchAgain)?.clone().into();
-                self.request_album(journal, lidarr, &offer.0, &wanted)?;
-                Ok((Completed::Requested, vec![offer.0.clone()], None))
+                let view = self.plan.offers.first().ok_or(Refusal::SearchAgain)?;
+                let asked = asked_release(view)?;
+                self.request_album(journal, lidarr, &offer.0, &view.clone().into())?;
+                Ok((Completed::Requested, vec![asked], None))
             }
             Change::AddArtist { artist } => {
                 let name = &self.plan.artist.as_ref().ok_or(Refusal::SearchAgain)?.name;
-                let count = lidarr_result(lidarr.add_artist(artist.as_str(), name, journal), None)?;
-                let count = u32::try_from(count).map_err(|_| Refusal::TooLarge)?;
-                done(Completed::ArtistAdded { count })
+                let added = lidarr_result(lidarr.add_artist(artist.as_str(), name, journal), None)?;
+                added_artist(&added)
             }
-            Change::AddWanting { .. } => {
+            Change::AddWanting { artist, offers: selected } => {
+                wire::check_add_wanting(artist, selected, &self.plan.offers)?;
                 let offers: Vec<Offer> = self.plan.offers.iter().cloned().map(Offer::from).collect();
+                let asked = self.plan.offers.iter().map(asked_release).collect::<Result<_, _>>()?;
                 let mut setup = lidarr_result(lidarr.setup(), None)?;
                 let artist = lidarr_result(lidarr.add_wanting(&mut setup, &offers), None)?;
                 let artist = LidarrNumber::new(artist).ok_or(Refusal::LidarrUnrecognized)?;
-                Ok((Completed::AddedWanting { artist }, self.plan.offers.iter().map(|offer| offer.album.0.clone()).collect(), None))
+                Ok((Completed::AddedWanting { artist }, asked, None))
             }
             Change::Want { artist, albums } => {
-                let current = lidarr_result(lidarr.listed((*artist).into()), None)?;
-                self.check_listed(&current)?;
-                let albums: Vec<_> = albums.iter().map(|album| i64::from(*album)).collect();
-                lidarr_result(lidarr.want((*artist).into(), &albums), None)?;
-                Ok((Completed::Wanted, self.plan.listed.iter().map(|row| row.album.clone()).collect(), None))
-            }
-            Change::ListSingles { artist, .. } => {
-                let wanted: Offer = self.plan.offers.first().ok_or(Refusal::SearchAgain)?.clone().into();
-                let current = lidarr_result(lidarr.known_artist(&wanted.artist_id), Some(&wanted))?;
-                if current.is_none_or(|(number, _)| number != i64::from(*artist)) {
-                    return Err(Refusal::SearchAgain);
+                let current = artist_listed(lidarr, artist)?;
+                for album in albums {
+                    album.check_current(&self.plan.listed)?;
+                    album.check_current(&current)?;
                 }
-                let started = lidarr_result(lidarr.start_listing_singles_kept((*artist).into(), &wanted, journal), Some(&wanted))?;
+                let asked = listed_metadata(lidarr, artist, albums)?;
+                let numbers: Vec<_> = albums.iter().map(|album| i64::from(album.id)).collect();
+                lidarr_result(lidarr.want(artist.id.into(), &numbers), None)?;
+                Ok((Completed::Wanted, asked, None))
+            }
+            Change::ListSingles { artist, offer } => {
+                let view = self.plan.offers.first().ok_or(Refusal::SearchAgain)?;
+                let wanted: Offer = view.clone().into();
+                let current = lidarr_result(lidarr.known_artist(artist.artist.as_str()), Some(&wanted))?;
+                wire::check_list_singles(artist, offer, view, current.map(|(number, _)| number))?;
+                let started = lidarr_result(lidarr.start_listing_singles_kept(artist.id.into(), &wanted, journal), Some(&wanted))?;
                 if let Some((before, wrote)) = started {
-                    let artist = i64::from(*artist);
+                    let artist = i64::from(artist.id);
                     let started = Instant::now();
                     let watched = HashSet::from([artist]);
                     let wait = (|| {
@@ -1466,41 +1704,40 @@ impl Job {
         lidarr_result(lidarr.request(wanted, journal), Some(wanted))
     }
 
-    fn check_listed(&self, current: &[lidarr::Listed]) -> Result<(), Refusal> {
-        if self.plan.listed.iter().all(|selected| current.iter().any(|row|
-            row.id == i64::from(selected.id) && row.album == selected.album.as_str()))
-        {
-            Ok(())
-        } else {
-            Err(Refusal::NoLongerListed)
-        }
-    }
-
     /// CARRIED while core supplies interrupted-operation decisions. A restart
     /// can run a job which made no writes, or verify a remote effect which may
     /// already have happened. It must never replay an uncertain mutation.
     fn recover(&self, lidarr: &Lidarr) -> Result<Changed, Refusal> {
         match &self.change {
-            Change::Request { offer } => {
-                let wanted: Offer = self.plan.offers.first().ok_or(Refusal::SearchAgain)?.clone().into();
-                if album_is_wanted(lidarr, &wanted)? {
-                    Ok((Completed::Requested, vec![offer.0.clone()], None))
+            Change::Request { .. } => {
+                let view = self.plan.offers.first().ok_or(Refusal::SearchAgain)?;
+                if album_is_wanted(lidarr, &view.clone().into())? {
+                    Ok((Completed::Requested, vec![asked_release(view)?], None))
                 } else {
                     Err(Refusal::NotDealtWith)
                 }
             }
-            Change::Want { artist, .. } => {
-                let current = lidarr_result(lidarr.listed((*artist).into()), None)?;
-                self.check_listed(&current)?;
-                let requested = self.plan.listed.iter().all(|wanted| current.iter().any(|row|
-                    row.id == i64::from(wanted.id) && (row.wanted || row.have)));
-                if requested {
-                    Ok((Completed::Wanted, self.plan.listed.iter().map(|row| row.album.clone()).collect(), None))
-                } else {
-                    Err(Refusal::NotDealtWith)
+            Change::Want { artist, albums } => {
+                let current = artist_listed(lidarr, artist)?;
+                for album in albums {
+                    album.check_current(&self.plan.listed)?;
+                    already_marked(album, &current)?;
                 }
+                Ok((Completed::Wanted, listed_metadata(lidarr, artist, albums)?, None))
             }
-            Change::AddWanting { .. } => {
+            Change::AddArtist { artist } => {
+                let added = self.plan.added_artist.as_ref().ok_or(Refusal::NotDealtWith)?;
+                let id = LidarrNumber::new(added.number).ok_or(Refusal::NotDealtWith)?;
+                let current = artist_listed(lidarr, &wire::ArtistTarget { id, artist: artist.clone() })?;
+                for marked in &added.newly_marked {
+                    let id = LidarrNumber::new(marked.number).ok_or(Refusal::NotDealtWith)?;
+                    let release = MusicBrainzId::new(&marked.offer.album).ok_or(Refusal::NotDealtWith)?;
+                    already_marked(&wire::AlbumTarget { id, release }, &current)?;
+                }
+                added_artist(added)
+            }
+            Change::AddWanting { artist, offers: selected } => {
+                wire::check_add_wanting(artist, selected, &self.plan.offers)?;
                 let wanted: Offer = self.plan.offers.first().ok_or(Refusal::SearchAgain)?.clone().into();
                 let Some((number, _)) = lidarr_result(lidarr.known_artist(&wanted.artist_id), Some(&wanted))? else {
                     return Err(Refusal::NotDealtWith);
@@ -1512,11 +1749,52 @@ impl Job {
                     return Err(Refusal::NotDealtWith);
                 }
                 let artist = LidarrNumber::new(number).ok_or(Refusal::LidarrUnrecognized)?;
-                Ok((Completed::AddedWanting { artist }, self.plan.offers.iter().map(|offer| offer.album.0.clone()).collect(), None))
+                let asked = self.plan.offers.iter().map(asked_release).collect::<Result<_, _>>()?;
+                Ok((Completed::AddedWanting { artist }, asked, None))
             }
             _ => Err(Refusal::NotDealtWith),
         }
     }
+}
+
+fn artist_listed(lidarr: &Lidarr, artist: &wire::ArtistTarget) -> Result<Vec<lidarr::Listed>, Refusal> {
+    let current = lidarr_result(lidarr.known_artist(artist.artist.as_str()), None)?;
+    artist.check_current(current.map(|(number, _)| number))?;
+    lidarr_result(lidarr.listed(artist.id.into()), None)
+}
+
+fn listed_metadata(lidarr: &Lidarr, artist: &wire::ArtistTarget, albums: &[wire::AlbumTarget]) -> Result<Vec<AskedRelease>, Refusal> {
+    let current = lidarr_result(lidarr.known_artist(artist.artist.as_str()), None)?;
+    artist.check_current(current.as_ref().map(|(number, _)| *number))?;
+    let (_, name) = current.ok_or(Refusal::SearchAgain)?;
+    let releases = lidarr_result(lidarr.releases_of(artist.id.into(), &name), None)?;
+    let views: Vec<AlbumView> = lidarr_items(releases.into_iter().map(|(mut offer, _)| {
+        if offer.artist_id.is_empty() {
+            offer.artist_id = artist.artist.as_str().to_owned();
+        }
+        offer
+    }));
+    albums.iter().map(|album| {
+        let view = views.iter().find(|view| view.album.0 == album.release
+            && view.artist_id.as_ref() == Some(&artist.artist)).ok_or(Refusal::NoLongerListed)?;
+        asked_release(view)
+    }).collect()
+}
+
+fn already_marked(album: &wire::AlbumTarget, current: &[lidarr::Listed]) -> Result<(), Refusal> {
+    album.check_current(current)?;
+    if current.iter().any(|row| row.id == i64::from(album.id) && (row.wanted || row.have)) {
+        Ok(())
+    } else {
+        Err(Refusal::NotDealtWith)
+    }
+}
+
+fn added_artist(added: &lidarr::AddedArtist) -> Result<Changed, Refusal> {
+    let count = u32::try_from(added.newly_marked.len()).map_err(|_| Refusal::TooLarge)?;
+    let views: Vec<AlbumView> = lidarr_items(added.newly_marked.iter().map(|marked| marked.offer.clone()));
+    let asked = views.iter().map(asked_release).collect::<Result<Vec<_>, _>>()?;
+    Ok((Completed::ArtistAdded { count }, asked, None))
 }
 
 fn album_is_wanted(lidarr: &Lidarr, wanted: &Offer) -> Result<bool, Refusal> {
@@ -1533,75 +1811,147 @@ fn pending_target(lidarr: &Lidarr, album: LidarrNumber, release: &MusicBrainzId)
 }
 
 impl Requests {
-    fn run_batch(&self, job: &Job, journal: &Journal, lidarr: &Lidarr, singles: bool, lines: &[BatchLine]) -> Result<(), Refusal> {
-        for (index, line) in lines.iter().enumerate() {
-            let index = index as u16;
-            let saved = journal.progress(index)?;
-            let (view, resume) = match saved {
-                Some(BatchLineProgress::Found { album }) => {
-                    let text = format!("lidarr:{}", album.offer.0.as_str());
-                    let found = lidarr_result(lidarr.find_any(&text), None)?;
-                    let found: Vec<AlbumView> = lidarr_items(found);
-                    let Some(view) = found.into_iter().find(|view| view.album == album.offer) else {
-                        journal.save_line(index, BatchLineProgress::Failed { reason: Refusal::NoLongerListed }, None)?;
-                        continue;
-                    };
-                    (view, true)
+    fn run_batch(
+        &self, job: &Job, journal: &Journal, lidarr: &Lidarr, singles: bool, lines: &[BatchLine],
+    ) -> Result<Option<Vec<AskedRelease>>, Refusal> {
+        let desk = BatchDesk { journal: journal.clone(), singles };
+        let batch = if let Some(payload) = &job.plan.prepared_batch {
+            loaded_bulk(payload, desk)?
+        } else {
+            let mut wants = Vec::with_capacity(lines.len());
+            let mut waiting = false;
+            for (index, line) in lines.iter().enumerate() {
+                match prepare_line(journal, lidarr, index as u16, line, singles)? {
+                    Some(want) => wants.push(want),
+                    None => waiting = true,
                 }
-                Some(_) => continue,
-                None => {
-                    match find_line(lidarr, line, singles) {
-                        Ok(Some(view)) => {
-                            journal.save_line(index, BatchLineProgress::Found { album: batch_album(&view) }, None)?;
-                            (view, false)
-                        }
-                        Ok(None) => {
-                            journal.save_line(index, BatchLineProgress::NotFound, None)?;
-                            continue;
-                        }
-                        Err(reason) => {
-                            journal.save_line(index, BatchLineProgress::Failed { reason }, None)?;
-                            continue;
-                        }
-                    }
+            }
+            if waiting {
+                return Ok(None);
+            }
+            let batch = bulk::Job::new(desk);
+            lidarr_result(batch.start_indexed(wants), None)?;
+            batch
+        };
+
+        let _turn = lock(&self.mutation);
+        journal.restore_pending(lidarr)?;
+        if job.plan.prepared_batch.is_some() {
+            let indexed = batch.indexed_lines().ok_or(Refusal::NotDealtWith)?;
+            let mut reconciled = HashSet::new();
+            for line in indexed.iter().filter(|line| {
+                line.before_effect && matches!(line.state, bulk::State::Found | bulk::State::Asked)
+            }) {
+                if reconciled.insert(line.slot) {
+                    let confirmed = line.offer.as_ref().map(|offer| confirmed_batch_offer(lidarr, offer))
+                        .transpose()?.unwrap_or(false);
+                    lidarr_result(batch.reconcile_indexed(line.slot, confirmed), line.offer.as_ref())?;
                 }
-            };
-            let _turn = lock(&self.mutation);
-            let line_journal = Journal { artist: view.artist_id.clone(), ..journal.clone() };
-            let result = line_journal.restore_pending(lidarr).and_then(|()| {
-                if resume {
-                    if album_is_wanted(lidarr, &view.clone().into())? {
-                        Ok(())
-                    } else {
-                        Err(Refusal::NotDealtWith)
-                    }
-                } else {
-                    job.request_album(&line_journal, lidarr, &view.album.0, &view.clone().into())
-                }
-            });
-            let (progress, owner) = match result {
-                Ok(()) => (BatchLineProgress::Asked { album: batch_album(&view) }, Some((job.account, view.album.0))),
-                Err(reason) => (BatchLineProgress::Failed { reason }, None),
-            };
-            journal.save_line(index, progress, owner)?;
+            }
         }
-        Ok(())
+
+        let worked = lidarr_result(batch.work_prepared(lidarr, &|_| {}), None);
+        let rows = batch.indexed_lines().ok_or(Refusal::NotDealtWith)?;
+        let views: Vec<AlbumView> = lidarr_items(rows.into_iter().filter_map(|line| {
+            matches!(line.state, bulk::State::Asked | bulk::State::Done).then_some(line.offer).flatten()
+        }));
+        let asked = views.iter().map(asked_release).collect::<Result<Vec<_>, _>>()?;
+        if let Err(reason) = worked {
+            let account = job.account;
+            let binding = job.plan.binding;
+            journal.ask(move |keeper, now, row| {
+                finish_job(keeper, now, row, &JobResult::Failed(reason), &asked, Some((binding, account, None)))
+            })?;
+            return Err(reason);
+        }
+        Ok(Some(asked))
     }
+}
+
+fn confirmed_batch_offer(lidarr: &Lidarr, offer: &Offer) -> Result<bool, Refusal> {
+    let artist = MusicBrainzId::new(&offer.artist_id).ok_or(Refusal::LidarrUnrecognized)?;
+    let Some((number, _)) = lidarr_result(lidarr.known_artist(artist.as_str()), Some(offer))? else {
+        return Ok(false);
+    };
+    let Some(id) = LidarrNumber::new(number) else { return Ok(false) };
+    let listed = lidarr_result(lidarr.listed(number), Some(offer))?;
+    Ok(wire::batch_effect_confirmed(offer, &wire::ArtistTarget { id, artist }, Some(number), &listed))
+}
+
+fn prepare_line(
+    journal: &Journal, lidarr: &Lidarr, index: u16, line: &BatchLine, singles: bool,
+) -> Result<Option<bulk::Want>, Refusal> {
+    let mut saved = journal.ask(move |keeper, _, row| saved_line(keeper.data().connection(), row, index))?;
+    let mut updated = false;
+    if saved.progress.is_none() {
+        updated = true;
+        saved.progress = Some(match find_line(lidarr, line, singles) {
+            Ok(Some(view)) => {
+                let album = batch_album(&view);
+                saved.offer = Some(view);
+                BatchLineProgress::Found { album }
+            }
+            Ok(None) => BatchLineProgress::NeedsResolution,
+            Err(reason) => BatchLineProgress::Failed { reason, album: None },
+        });
+    }
+    if matches!(saved.progress, Some(BatchLineProgress::NeedsResolution)) {
+        if let Some(resolution) = &mut saved.resolution {
+            let selected = if resolution.lookup_started {
+                Err(Refusal::NotDealtWith)
+            } else if let Some(release) = resolution.release.clone() {
+                resolution.lookup_started = true;
+                let started = encode(&saved)?;
+                journal.ask(move |keeper, now, row| save_line(keeper, now, row, index, &decode(&started)?))?;
+                let search = format!("lidarr:{}", release.as_str());
+                lidarr_result(lidarr.find_any(&search), None)
+                    .map(|found| wire::batch_fallback_offer(&release, singles, &found).cloned())
+            } else {
+                Ok(None)
+            };
+            saved.progress = Some(match selected {
+                Ok(found) => {
+                    saved.offer = lidarr_items::<AlbumView, _>(found).pop().filter(|view| view.artist_id.is_some());
+                    match &saved.offer {
+                        Some(view) => BatchLineProgress::Found { album: batch_album(view) },
+                        None => BatchLineProgress::NotFound,
+                    }
+                }
+                Err(reason) => BatchLineProgress::Failed { reason, album: None },
+            });
+            updated = true;
+        }
+    }
+    let want = match &saved.progress {
+        Some(BatchLineProgress::Found { .. }) => Some(bulk::Want {
+            artist: line.artist.clone(), album: line.album.clone(), songs: vec![line.song.clone()],
+            state: bulk::State::Found, offer: saved.offer.clone().map(Offer::from), ..Default::default()
+        }),
+        Some(BatchLineProgress::NotFound) => Some(bulk::Want { state: bulk::State::Unknown, ..Default::default() }),
+        Some(BatchLineProgress::Failed { reason, .. }) => Some(bulk::Want {
+            state: bulk::State::Failed, reason: reason.sentence(None).to_string(), ..Default::default()
+        }),
+        _ => None,
+    };
+    if updated {
+        journal.ask(move |keeper, now, row| save_line(keeper, now, row, index, &saved))?;
+    }
+    Ok(want)
 }
 
 fn batch_album(view: &AlbumView) -> BatchAlbum {
     BatchAlbum { offer: view.album.clone(), title: view.title.clone(), artist: view.artist.clone() }
 }
 
-// CARRIED while bulk provides a projection for indexed server jobs and a
-// songs-only fallback that preserves the apps' MusicBrainz boundary.
+// Name-based lookup ends at Lidarr. An unresolved line asks the original
+// device for its MusicBrainz lookup and stores that answer before using it.
 fn find_line(lidarr: &Lidarr, line: &BatchLine, singles: bool) -> Result<Option<AlbumView>, Refusal> {
     if line.album.is_empty() {
         return Ok(None);
     }
     let find = |name: &str| {
         lidarr_result(lidarr.find_any(&format!("{name} {}", line.artist)), None)
-            .map(|found| nexus_core::bulk::choose(&found, &line.artist, &line.album, singles))
+            .map(|found| bulk::choose(&found, &line.artist, &line.album, singles))
     };
     let mut found = find(&line.album)?;
     let bare = nexus_core::text::undecorated(&line.album);
@@ -1611,37 +1961,48 @@ fn find_line(lidarr: &Lidarr, line: &BatchLine, singles: bool) -> Result<Option<
     Ok(lidarr_items::<AlbumView, _>(found).pop().filter(|view| view.artist_id.is_some()))
 }
 
-impl Journal {
-    fn progress(&self, index: u16) -> Result<Option<BatchLineProgress>, Refusal> {
-        self.ask(move |keeper, _, row| {
-            let text: Option<String> = keeper.data().connection().query_row(
-                "SELECT progress FROM requests_lines WHERE job = ?1 AND line = ?2",
-                params![row, index], |row| row.get(0),
-            ).optional().map_err(sql_error)?;
-            text.map(|text| decode(text.as_bytes())).transpose()
-        })
+struct BatchDesk {
+    journal: Journal,
+    singles: bool,
+}
+
+impl bulk::Desk for BatchDesk {
+    fn keep(&self, batch: Option<Vec<u8>>, _: bool) {
+        if let Some(batch) = batch {
+            let _ = self.keep_checked(batch);
+        }
     }
 
-    fn save_line(&self, index: u16, progress: BatchLineProgress, owner: Option<(AccountId, MusicBrainzId)>) -> Result<(), Refusal> {
-        let text = serde_json::to_string(&progress).map_err(|_| Refusal::NotDealtWith)?;
-        let binding = self.binding;
-        self.ask(move |keeper, now, row| {
-            let at = keeper.clock(now).effective();
-            keeper.write_data(now, |tx| {
-                tx.execute(
-                    "INSERT INTO requests_lines (job, line, progress) VALUES (?1, ?2, ?3)
-                     ON CONFLICT(job, line) DO UPDATE SET progress = excluded.progress",
-                    params![row, index, text],
-                )?;
-                if let Some((account, release)) = owner {
-                    keep_owner(tx, &binding, account, &release, at)?;
-                }
-                Ok(((), true))
-            }).map_err(|_| Refusal::NotDealtWith)
-        })
+    fn keep_checked(&self, batch: Vec<u8>) -> bool {
+        self.journal.ask(move |keeper, now, row| {
+            update_work(keeper, now, row, |plan| plan.prepared_batch = Some(batch))
+        }).is_ok()
+    }
+
+    fn now(&self) -> i64 {
+        seconds((self.journal.service.accounts.clock)())
+    }
+
+    fn singles(&self) -> bool {
+        self.singles
     }
 }
 
+fn update_work(
+    keeper: &mut Keeper, now: u64, row: i64, change: impl FnOnce(&mut Plan),
+) -> Result<(), Refusal> {
+    let work: Vec<u8> = keeper.data().connection().query_row(
+        "SELECT work FROM requests_jobs WHERE id = ?1",
+        [row], |record| record.get(0),
+    ).map_err(sql_error)?;
+    let mut plan: Plan = decode(&work)?;
+    change(&mut plan);
+    let work = encode(&plan)?;
+    keeper.write_data(now, |tx| {
+        tx.execute("UPDATE requests_jobs SET work = ?1 WHERE id = ?2", params![work, row])
+            .map(|count| ((), count != 0))
+    }).map_err(|_| Refusal::NotDealtWith)
+}
 
 // Pending the apart-store adapter. The request path stays closed without a
 // key bound to this endpoint.
@@ -1656,7 +2017,7 @@ fn credential(_: &Keeper, _: &Endpoint) -> Result<Option<Credential>, Refusal> {
 }
 
 pub(crate) fn guards(path: &str) -> bool {
-    matches!(path, wire::REQUESTS | admin::REQUEST_GRANT | admin::SET_REQUESTS_ENABLED | GET_LIDARR)
+    matches!(path, wire::REQUESTS | admin::REQUEST_GRANT | admin::SET_REQUESTS_ENABLED | GET_LIDARR | wire::ADMIN_ATTRIBUTION)
 }
 
 fn admin_reply<T: admin::ResultBody>(answer: Result<T, admin::Refusal>) -> Response<Body> {
@@ -1830,5 +2191,45 @@ async fn get_lidarr(
             raw_json(StatusCode::OK, body.to_string().into_bytes())
         }
         Err(reason) => admin_reply::<admin::Applied>(Err(reason)),
+    }
+}
+
+
+async fn attribution(
+    State(service): State<Arc<Requests>>,
+    axum::Extension(ingress): axum::Extension<Arc<Ingress>>,
+    body: Bytes,
+) -> Response<Body> {
+    if !ingress.page || ingress.kind != SessionKind::AdminPage {
+        return send_admin_denied();
+    }
+    let request = match wire::read_attribution(&body) {
+        Ok(request) => request,
+        Err(_) => return admin_reply::<AttributionPage>(Err(admin::Refusal::Malformed)),
+    };
+    let clock = service.accounts.clock.clone();
+    let state = service.clone();
+    let finished = service.accounts.desk.ask(move |keeper| {
+        admin_actor(keeper, &request.head, &ingress, clock())?;
+        let answer = if let Some(after) = request.after {
+            lock(&state.books).attribution_next(ingress.session, after)
+        } else {
+            let rows = state.endpoint.as_ref().map(|endpoint| {
+                attributed_requests(keeper.data().connection(), &binding(endpoint))
+            }).transpose().map_err(|_| admin::Refusal::NotDealtWith)?.unwrap_or_default();
+            lock(&state.books).attribution_first(ingress.session, rows)
+        };
+        answer.map_err(|why| match why {
+            Refusal::SearchAgain => admin::Refusal::NotAllowed(admin::Denial::Conflict),
+            _ => admin::Refusal::NotDealtWith,
+        })
+    }).await.unwrap_or(Err(admin::Refusal::Busy { retry_after_seconds: account::Wait::new(1) }));
+    let reply = match finished {
+        Ok(page) => admin::Reply::Done(page),
+        Err(why) => admin::Reply::Refused(why),
+    };
+    match wire::write_attribution_reply(&reply) {
+        Ok(body) => events::respond(crate::accounts::session::Answer { status: reply.status(), body }),
+        Err(_) => admin_reply::<AttributionPage>(Err(admin::Refusal::NotDealtWith)),
     }
 }
