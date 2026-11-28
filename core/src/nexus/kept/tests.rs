@@ -228,6 +228,17 @@ impl Stored {
     }
 
     pub fn sign_in(&mut self, secret: u8, id: u64, n: u8, at: u64) -> Result<SessionGrant, Denied> {
+        self.sign_in_as(SessionKind::App, secret, id, n, at)
+    }
+
+    pub fn sign_in_as(
+        &mut self,
+        kind: SessionKind,
+        secret: u8,
+        id: u64,
+        n: u8,
+        at: u64,
+    ) -> Result<SessionGrant, Denied> {
         let receipt = self.bind(secret, id, at)?;
         let next = 1 + self
             .apart
@@ -241,7 +252,7 @@ impl Stored {
             hash: hash(n),
             sign_out: hash(n ^ 128),
         };
-        self.step(at, |turn| turn.sign_in(receipt, fresh, None))
+        self.step(at, |turn| turn.sign_in_as(kind, receipt, fresh, None))
     }
 
     pub fn leave_receipt(
