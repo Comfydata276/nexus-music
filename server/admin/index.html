@@ -16,7 +16,7 @@
   --accent: #a98bfb;
 }
 * { box-sizing: border-box; }
-[hidden] { display: none !important; }
+[hidden], #admin[hidden] dialog { display: none !important; }
 body { margin: 0; }
 main { width: min(100% - 2rem, 68rem); margin: clamp(2rem, 8vw, 5rem) auto; }
 h1 { margin: 0 0 1.25rem; font-size: clamp(1.65rem, 5vw, 2.3rem); }
@@ -250,6 +250,7 @@ dd, li { overflow-wrap: anywhere; }
   let session = null;
   let pending = null;
   let idleTimer;
+  const idleLimit = 30 * 60 * 1000;
   const accountPage = page("accounts");
   const devicePage = page("devices");
   const requests = byId("requests-list");
@@ -376,9 +377,19 @@ dd, li { overflow-wrap: anywhere; }
       JSON.stringify(key) + ":" + json(item)).join(",") + "}";
   }
 
+  function checkIdle() {
+    if (!session) return false;
+    const elapsed = Date.now() - session.lastUse;
+    if (elapsed >= 0 && elapsed < idleLimit) return true;
+    endSession("Your session has ended. Sign in again.");
+    return false;
+  }
+
   function armIdleTimer() {
     clearTimeout(idleTimer);
-    idleTimer = setTimeout(() => endSession("Your session has ended. Sign in again."), 30 * 60 * 1000);
+    if (!checkIdle()) return;
+    const remaining = idleLimit - (Date.now() - session.lastUse);
+    idleTimer = setTimeout(armIdleTimer, Math.min(30_000, remaining));
   }
 
   function endSession(message) {
@@ -403,14 +414,17 @@ dd, li { overflow-wrap: anywhere; }
   }
 
   async function readAdmin(current, path, fields, max) {
+    if (session !== current || !checkIdle()) throw new Error();
+    const started = Date.now();
     const response = await post(path, json({
       head: { speaks: [1, 1], restore: current.restore }, ...fields,
     }), current.controller.signal, current.bearer);
-    if (session !== current) throw new Error();
+    if (session !== current || !checkIdle()) throw new Error();
     const reply = response.body && await readReply(response, response.status === 200 ? max : 4096);
-    if (session !== current) throw new Error();
+    if (session !== current || !checkIdle()) throw new Error();
     if (response.status === 200 && reply?.done && typeof reply.done === "object" &&
         !Array.isArray(reply.done) && reply.refused === undefined) {
+      current.lastUse = Math.max(current.lastUse, started);
       armIdleTimer();
       return reply.done;
     }
@@ -1126,11 +1140,8 @@ dd, li { overflow-wrap: anywhere; }
         app_version: "0.1.0", speaks: [1, 1], restore: null,
       });
       password.value = "";
+      const started = Date.now();
       const response = await post("/nexus/api/signin", body, request.signal);
-      if (response.status === 501) {
-        writeText(status, "Sign-in has not been built yet.");
-        return;
-      }
       if (response.status === 403) {
         const reply = await readReply(response, 4096);
         if (request.signal.aborted) return;
@@ -1160,7 +1171,9 @@ dd, li { overflow-wrap: anywhere; }
         writeText(status, "Use an administrator account to sign in here.");
         return;
       }
-      session = { bearer: signedIn.session, account: signedIn.person.id, restore, controller: new AbortController() };
+      session = { bearer: signedIn.session, account: signedIn.person.id, restore,
+        lastUse: started, controller: new AbortController() };
+      if (!checkIdle()) return;
       setupDetails.open = false;
       setupDetails.hidden = true;
       setupForm.reset();
@@ -1172,7 +1185,7 @@ dd, li { overflow-wrap: anywhere; }
       if (enableRequestChanges) void loadLidarr(session);
       form.reset();
       form.hidden = true;
-      admin.hidden = false;
+      admin.hidden = document.hidden;
       writeText(identity, signedIn.person.email);
       writeText(status, "");
       signout.focus();
@@ -1209,6 +1222,20 @@ dd, li { overflow-wrap: anywhere; }
       submit.disabled = false;
     }
   });
+
+  document.addEventListener("visibilitychange", () => {
+    if (checkIdle()) admin.hidden = document.hidden;
+  });
+  window.addEventListener("focus", checkIdle);
+  window.addEventListener("pageshow", checkIdle);
+  for (const name of ["pointerdown", "keydown", "click", "submit", "input"]) {
+    document.addEventListener(name, event => {
+      if (session && !checkIdle()) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+      }
+    }, true);
+  }
 
   window.addEventListener("pagehide", () => {
     pending?.abort();

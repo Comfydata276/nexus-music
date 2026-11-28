@@ -11,8 +11,8 @@ pub(crate) use nexus_core::nexus::{
 const DOCUMENT: &str = include_str!("../admin/index.html");
 const CSP: &str = concat!(
     "default-src 'none'; ",
-    "script-src 'sha256-xqYOjaxGRf65QwlX1M9KcEx6yMbiNvIpw5EzonjveuY='; ",
-    "style-src 'sha256-mDUAygI6pgnsu+vQP4oii9VfT0IptMZqSbQUrkfLNOI='; ",
+    "script-src 'sha256-wTZZyhtjiPIT7lI01OAYv2kmFp4pHCcf2duUQ87t60Y='; ",
+    "style-src 'sha256-VMSfc+YGxB56qFr29cBKeyMXMjjPO5V4iYQguxxco4I='; ",
     "connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; ",
     "require-trusted-types-for 'script'; trusted-types 'none'",
 );
