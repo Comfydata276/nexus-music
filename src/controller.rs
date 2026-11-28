@@ -349,8 +349,6 @@ pub struct Controller {
     pub moving_downloads: Cell<bool>,
     /// The mix made to rules whose menu is open.
     pub menu_rule: Cell<Option<u64>>,
-    /// The last messages shown at the bottom of the window and when, for "Save diagnostics".
-    pub said: RefCell<std::collections::VecDeque<(i64, String)>>,
     /// Something to say once the window is up (the settings file was damaged, say).
     startup_note: RefCell<Option<String>>,
     /// What another device was playing more recently than anything was done here.
@@ -583,7 +581,6 @@ impl Controller {
             track_places: RefCell::default(),
             moving_downloads: Cell::new(false),
             menu_rule: Cell::new(None),
-            said: RefCell::default(),
             startup_note: RefCell::new(startup_note),
             elsewhere: RefCell::default(),
             play_log: RefCell::new(play_log),
@@ -703,6 +700,7 @@ impl Controller {
         let seen: u64 = std::fs::read_to_string(&seen_file).ok().and_then(|text| text.trim().parse().ok()).unwrap_or(0);
         let crashed = size > seen;
         if crashed {
+            diagnostics::prior_crash(&self.paths.crash_log);
             // Whole or not at all: a number cut short would be taken for one that was seen.
             let _ = config::write_in_passing(&seen_file, size.to_string().as_bytes());
         }
@@ -773,13 +771,7 @@ impl Controller {
     }
 
     fn show_toast(&self, text: SharedString, action: &str, shown_for: Duration) {
-        {
-            let mut said = self.said.borrow_mut();
-            said.push_back((chrono::Utc::now().timestamp(), text.to_string()));
-            if said.len() > 40 {
-                said.pop_front();
-            }
-        }
+        diagnostics::observe(diagnostics::Line::Note(diagnostics::Note::AppMessage));
         let toast = self.ui.global::<ui::Toast>();
         toast.set_text(text);
         toast.set_action(action.into());
@@ -1159,6 +1151,11 @@ impl Controller {
                     .into(),
             );
         }
+    }
+
+    pub(crate) fn diagnostics_window_visible(&self) -> bool {
+        let window = self.ui.window();
+        (window.is_visible() && !window.is_minimized()) || self.mini_open.get()
     }
 
     /// Brings the window back from the tray or from behind other apps.
@@ -4405,7 +4402,16 @@ impl Controller {
             });
         });
         settings.on_set_offline(|on| {
-            with(|ctl| ctl.set_offline_mode(on));
+            with(|ctl| {
+                let changed = ctl.settings.borrow().offline != on;
+                if changed && on {
+                    diagnostics::offline_changed(true);
+                }
+                ctl.set_offline_mode(on);
+                if changed && !on {
+                    diagnostics::offline_changed(false);
+                }
+            });
         });
         settings.on_change_songs_folder(|| {
             with(|ctl| ctl.change_songs_folder());

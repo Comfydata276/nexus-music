@@ -52,6 +52,14 @@ def until(predicate, seconds=15):
         time.sleep(0.2)
     raise RuntimeError("condition timed out")
 
+def screenshot(app, shots, size, name):
+    if shots:
+        image = shots / f"{name}-{size}.png"
+        app.shot(image)
+        png = image.read_bytes()
+        dimensions = tuple(int.from_bytes(png[offset:offset+4], "big") for offset in (16, 20))
+        assert dimensions == tuple(map(int, size.split("x"))), dimensions
+
 def capture(size, server_url, port, shots):
     with tempfile.TemporaryDirectory(prefix=f"nexus-diagnostics-{local_name}-") as location:
         home = Path(location)
@@ -89,10 +97,11 @@ def capture(size, server_url, port, shots):
             try:
                 app = App(port).wait_up(30)
                 app.wait_for(label="Settings", role="Button")
-                settings_tab(app, "About", "Save diagnostics")
-                if not app.find(label="What is sent", role="Button"):
-                    scroller = app.one(type="ScrollView")
-                    app.tool("scroll_element", elementHandle=scroller["handle"], deltaY=-260)
+                settings_tab(app, "About", "Send diagnostics to your Nexus server")
+                switch = app.one(label="Send diagnostics to your Nexus server", role="Switch")
+                assert 0 <= switch["absolutePosition"]["y"] < int(size.split("x")[1]) - 24
+                app.one(contains="Nothing is sent until you sign in to a Nexus server.")
+                screenshot(app, shots, size, "diagnostics-setting")
                 app.press("What is sent")
                 report = app.one(contains="What the player has met")["accessibleLabel"]
                 for raw in [song, crash_name, key, local_name, server_url, "/profile", "melody@example.invalid", "Android Auto", "Local network permission"]:
@@ -100,18 +109,17 @@ def capture(size, server_url, port, shots):
                 for want in ["Music server version: 0.60.2", "Fault in playback: out of bounds at engine.rs:837  (2 times since", "Fault in app: borrow conflict at controller.rs:87", "Events refused for good: 0"]:
                     assert want in report, report
                 app.one(contains="Nexus Music can send this device report")
-                if shots:
-                    image = shots / f"what-is-sent-{size}.png"
-                    app.shot(image)
-                    png = image.read_bytes()
-                    dimensions = tuple(int.from_bytes(png[offset:offset+4], "big") for offset in (16, 20))
-                    assert dimensions == tuple(map(int, size.split("x"))), dimensions
+                screenshot(app, shots, size, "what-is-sent")
                 app.press("Back to About")
                 app.press("Save diagnostics")
                 until(lambda: app.find(label="Diagnostics saved."))
                 saved = (home / "data/diagnostics.txt").read_bytes()
                 assert saved == report.encode(), (saved, report)
-                print(f"{size}: local export, clean preview and Back to About verified", flush=True)
+                app.press("Send diagnostics to your Nexus server", role="Switch")
+                choice = home / "config/diagnostics-choice.json"
+                until(choice.is_file)
+                assert choice.read_bytes() == b"false", choice.read_bytes()
+                print(f"{size}: unsigned switch, persisted choice and byte-identical preview/export verified", flush=True)
             except BaseException:
                 print((home / "app.log").read_text()[-4000:], file=sys.stderr)
                 raise

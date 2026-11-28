@@ -91,7 +91,7 @@ fn main() -> Result<(), slint::PlatformError> {
     apply_interface_size();
     let window = ui::MainWindow::new()?;
     let controller = controller::Controller::install(window);
-    diagnostics::install(&controller.ui);
+    diagnostics::install(&controller);
     journal::install(controller.paths.crash_log.with_file_name("listening-journal"));
     #[cfg(debug_assertions)]
     journal::test_account();
@@ -112,7 +112,7 @@ fn main() -> Result<(), slint::PlatformError> {
     // The queue is written by a thread of its own: wait for it to finish.
     controller.saver.flush();
     journal::finish();
-    diagnostics::finish();
+    diagnostics::finish(&controller);
     // A look of the Nexus server's component still running is ended (at most two seconds).
     if nexus::switched_on() {
         nexus::shutdown();

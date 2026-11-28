@@ -2836,25 +2836,33 @@ export component SettingsPage inherits Rectangle {
                         }
 
                         SettingRow {
+                            title: "Send diagnostics to your Nexus server";
+                            detail: Settings.diagnostics-detail;
+                            HorizontalLayout {
+                                spacing: 12px;
+                                TextButton {
+                                    text: "What is sent";
+                                    clicked => {
+                                        Settings.diagnostics-preview = "";
+                                        root.show-report = true;
+                                        scroll.content-y = 0px;
+                                        Settings.preview-diagnostics();
+                                    }
+                                }
+                                Toggle {
+                                    on: Settings.send-diagnostics;
+                                    label: "Send diagnostics to your Nexus server";
+                                    toggled(on) => { Settings.set-send-diagnostics(on); }
+                                }
+                            }
+                        }
+
+                        SettingRow {
                             title: "Diagnostics";
                             detail: "Writes and opens a local copy of the diagnostics report.";
                             TextButton {
                                 text: "Save diagnostics";
                                 clicked => { Settings.save-diagnostics(); }
-                            }
-                        }
-
-                        SettingRow {
-                            title: "Diagnostics report";
-                            detail: "See the report that would be sent to the Nexus server.";
-                            TextButton {
-                                text: "What is sent";
-                                clicked => {
-                                    Settings.diagnostics-preview = "";
-                                    root.show-report = true;
-                                    scroll.content-y = 0px;
-                                    Settings.preview-diagnostics();
-                                }
                             }
                         }
 
