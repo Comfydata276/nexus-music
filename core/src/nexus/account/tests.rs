@@ -24,7 +24,7 @@ fn round_trip<T: wire::Message + fmt::Debug + PartialEq>(value: T) {
 #[test]
 fn every_account_path_is_plain_and_has_its_own_name() {
     assert_eq!(SIGN_IN, "/nexus/api/signin");
-    assert_eq!(PATHS.len(), 7);
+    assert_eq!(PATHS.len(), 8);
     let mut seen = BTreeSet::new();
     for path in PATHS {
         assert!(path.starts_with(API));
@@ -173,13 +173,13 @@ fn every_call_and_success_reply_round_trips() {
     round_trip(music());
     round_trip(GrantRequest {
         head: head(),
-        change: GrantChange::ChangePassword { account: person().id },
+        change: GrantChange::DeleteListeningData { account: person().id, target_revision: person().revision, request_id: request_id() },
         password: Password::new(PASSWORD).unwrap(),
     });
-    round_trip(GrantedChange {
+    round_trip(DeleteListeningData {
         head: head(),
         request_id: request_id(),
-        change: GrantChange::DeleteListeningData { account: person().id },
+        change: DeleteListeningDataTarget { account: person().id, target_revision: person().revision },
         grant: GrantSecret::from_bytes([21; SECRET_BYTES]),
     });
     round_trip(done(GrantIssued { grant: GrantSecret::from_bytes([21; SECRET_BYTES]) }));
@@ -717,7 +717,7 @@ fn sign_out_can_only_revoke_the_session_named_by_its_separate_secret() {
 }
 
 #[test]
-fn a_force_out_retry_keeps_the_old_session_number() {
+fn force_out_encoding_preserves_the_named_session_identity() {
     let force = ForceOut { head: head(), device: id(7), session: sid(11) };
     let encoded = encode(&force).unwrap();
     let live = Device { session: Some(sid(12)), ..device(7) };
@@ -731,22 +731,39 @@ fn load(worker_busy: bool, account_busy: bool, waiting: usize) -> PasswordLoad {
 }
 
 #[test]
-fn the_known_device_worker_is_isolated_and_has_no_startup_closure() {
+fn a_stolen_known_device_slows_only_itself() {
     let email = email();
     let mut waits = PasswordWaits::default();
-    assert_eq!(PasswordDoor::for_device(true), PasswordDoor::KnownDevice);
-    assert_eq!(PasswordDoor::for_device(false), PasswordDoor::Other);
-    assert_eq!(admit_password_check(PasswordDoor::KnownDevice, load(false, false, 0), &waits, &email, 0), PasswordAdmission::Check);
-    waits.record_wrong(PasswordDoor::KnownDevice, &email, 0);
-    assert_eq!(waits.retry_after(&email, 0), None);
+    let known = PasswordDoor::KnownDevice;
+    let other = PasswordDoor::Other;
+    let stolen = Some(id(1));
+    let owner = Some(id(2));
+    let available = load(false, false, 0);
+    assert_eq!(PasswordDoor::for_device(true), known);
+    assert_eq!(PasswordDoor::for_device(false), other);
+    assert_eq!(admit_password_check(known, available, &waits, &email, stolen, 0), PasswordAdmission::Check);
+    assert_eq!(admit_password_check(known, available, &waits, &email, None, 0), PasswordAdmission::Busy);
 
-    waits.record_wrong(PasswordDoor::Other, &email, 0);
-    assert_eq!(admit_password_check(PasswordDoor::Other, load(true, true, usize::MAX), &waits, &email, 0),
-        PasswordAdmission::ComeBack(Wait::new(1).unwrap()));
-    assert_eq!(admit_password_check(PasswordDoor::KnownDevice, load(false, false, usize::MAX), &waits, &email, 0),
-        PasswordAdmission::Check);
+    let mut now = 0;
+    for seconds in [1, 2, 4, 8, 16, 32, 60, 60] {
+        waits.record_wrong(known, &email, stolen, now);
+        let decision = admit_password_check(known, available, &waits, &email, stolen, now);
+        assert_eq!(decision.refusal(), Some(Refusal::Busy { retry_after_seconds: Wait::new(seconds) }));
+        assert_eq!(admit_password_check(known, load(false, false, usize::MAX), &waits, &email, owner, now), PasswordAdmission::Check);
+        assert_eq!(admit_password_check(other, available, &waits, &email, stolen, now), PasswordAdmission::Check);
+        let another_account = Email::new("other@example.org").unwrap();
+        assert_eq!(admit_password_check(known, available, &waits, &another_account, stolen, now), PasswordAdmission::Check);
+
+        now += seconds * 1000;
+        assert_eq!(waits.retry_after(known, &email, stolen, now - 1), Wait::new(1));
+        assert_eq!(admit_password_check(known, available, &waits, &email, stolen, now), PasswordAdmission::Check);
+    }
+
+    waits.record_wrong(other, &email, None, now);
+    assert_eq!(admit_password_check(other, available, &waits, &email, stolen, now), PasswordAdmission::ComeBack(Wait::new(1).unwrap()));
+    assert_eq!(admit_password_check(known, available, &waits, &email, owner, now), PasswordAdmission::Check);
     for busy in [load(true, false, 0), load(false, true, 0)] {
-        assert_eq!(admit_password_check(PasswordDoor::KnownDevice, busy, &waits, &email, 0), PasswordAdmission::Busy);
+        assert_eq!(admit_password_check(known, busy, &waits, &email, owner, now), PasswordAdmission::Busy);
     }
 }
 
@@ -755,13 +772,13 @@ fn the_other_door_waits_for_its_worker_for_ten_seconds_and_holds_eight() {
     let email = email();
     let waits = PasswordWaits::default();
     let door = PasswordDoor::Other;
-    assert_eq!(admit_password_check(door, load(false, false, 0), &waits, &email, 0), PasswordAdmission::Check);
+    assert_eq!(admit_password_check(door, load(false, false, 0), &waits, &email, None, 0), PasswordAdmission::Check);
     for waiting in 0..OTHER_PASSWORDS_WAITING {
-        assert_eq!(admit_password_check(door, load(true, false, waiting), &waits, &email, 0), PasswordAdmission::WaitForWorker);
-        assert_eq!(admit_password_check(door, load(false, true, waiting), &waits, &email, 0), PasswordAdmission::WaitForWorker);
+        assert_eq!(admit_password_check(door, load(true, false, waiting), &waits, &email, None, 0), PasswordAdmission::WaitForWorker);
+        assert_eq!(admit_password_check(door, load(false, true, waiting), &waits, &email, None, 0), PasswordAdmission::WaitForWorker);
     }
-    assert_eq!(admit_password_check(door, load(true, false, OTHER_PASSWORDS_WAITING), &waits, &email, 0), PasswordAdmission::Busy);
-    assert_eq!(admit_password_check(door, load(false, false, 1), &waits, &email, 0), PasswordAdmission::WaitForWorker);
+    assert_eq!(admit_password_check(door, load(true, false, OTHER_PASSWORDS_WAITING), &waits, &email, None, 0), PasswordAdmission::Busy);
+    assert_eq!(admit_password_check(door, load(false, false, 1), &waits, &email, None, 0), PasswordAdmission::WaitForWorker);
     assert_eq!(resume_password_check(0, true, false, &waits, &email, 9_999), PasswordAdmission::WaitForWorker);
     assert_eq!(resume_password_check(0, false, false, &waits, &email, 9_999), PasswordAdmission::Check);
     assert_eq!(resume_password_check(0, false, false, &waits, &email, 10_000), PasswordAdmission::Busy);
@@ -775,41 +792,55 @@ fn wrong_password_waits_double_to_a_minute_without_preventing_the_next_check() {
     let available = load(false, false, 0);
     let mut now = 100;
     for seconds in [1, 2, 4, 8, 16, 32, 60, 60, 60] {
-        assert_eq!(admit_password_check(door, available, &waits, &email, now), PasswordAdmission::Check);
-        waits.record_wrong(door, &email, now);
-        let outcome = admit_password_check(door, load(true, false, 8), &waits, &email, now);
+        assert_eq!(admit_password_check(door, available, &waits, &email, None, now), PasswordAdmission::Check);
+        waits.record_wrong(door, &email, None, now);
+        let outcome = admit_password_check(door, load(true, false, 8), &waits, &email, None, now);
         assert_eq!(outcome.refusal(), Some(Refusal::Busy { retry_after_seconds: Wait::new(seconds) }));
         assert_eq!(resume_password_check(now, false, false, &waits, &email, now), outcome);
         let until = now + seconds * 1000;
-        assert_eq!(waits.retry_after(&email, until - 1).map(Wait::seconds), Some(1));
-        assert_eq!(waits.retry_after(&email, until), None);
+        assert_eq!(waits.retry_after(door, &email, None, until - 1).map(Wait::seconds), Some(1));
+        assert_eq!(waits.retry_after(door, &email, None, until), None);
         now = until;
     }
-    assert_eq!(admit_password_check(door, available, &waits, &email, now), PasswordAdmission::Check);
+    assert_eq!(admit_password_check(door, available, &waits, &email, None, now), PasswordAdmission::Check);
 }
 
 #[test]
-fn wait_records_forget_at_an_hour_and_evict_the_oldest_name_at_the_cap() {
-    let first = email();
+fn wait_records_forget_at_an_hour_and_evict_the_oldest_device_key_at_the_cap() {
+    let email = email();
     let mut waits = PasswordWaits::default();
-    let door = PasswordDoor::Other;
-    waits.record_wrong(door, &first, 0);
-    for i in 1..=PASSWORD_WAIT_NAMES {
-        let other = Email::new(&format!("ada-{i}@example.org")).unwrap();
-        waits.record_wrong(door, &other, i as u64);
+    let known = PasswordDoor::KnownDevice;
+    let other = PasswordDoor::Other;
+    waits.record_wrong(other, &email, None, 0);
+    for i in 1..=PASSWORD_WAIT_NAMES as u64 {
+        waits.record_wrong(known, &email, Some(id(i)), i);
     }
-    assert!(!waits.by_email.contains_key(&first));
-    assert_eq!(waits.by_email.len(), PASSWORD_WAIT_NAMES);
+    assert_eq!(waits.by_key.len(), PASSWORD_WAIT_NAMES);
     assert_eq!(waits.oldest.len(), PASSWORD_WAIT_NAMES);
+    assert!(!waits.by_key.contains_key(&PasswordWaitKey::new(other, &email, None).unwrap()));
 
-    let last = Email::new(&format!("ada-{PASSWORD_WAIT_NAMES}@example.org")).unwrap();
+    let last = Some(id(PASSWORD_WAIT_NAMES as u64));
+    assert!(waits.by_key.contains_key(&PasswordWaitKey::new(known, &email, last).unwrap()));
     let end = PASSWORD_WAIT_NAMES as u64 + PASSWORD_WAIT_MEMORY_MS;
     waits.expire(end - 1);
-    assert!(waits.by_email.contains_key(&last));
+    assert_eq!(waits.by_key.len(), 1);
     waits.expire(end);
-    assert!(waits.by_email.is_empty());
-    waits.record_wrong(door, &last, end);
-    assert_eq!(waits.retry_after(&last, end).map(Wait::seconds), Some(1));
+    assert!(waits.by_key.is_empty());
+    waits.record_wrong(known, &email, last, end);
+    assert_eq!(waits.retry_after(known, &email, last, end), Wait::new(1));
+}
+
+#[test]
+fn a_clock_going_back_does_not_shorten_either_doors_wait() {
+    let email = email();
+    let mut waits = PasswordWaits::default();
+    for (door, device) in [(PasswordDoor::Other, None), (PasswordDoor::KnownDevice, Some(id(1)))] {
+        waits.record_wrong(door, &email, device, 10_000);
+        waits.record_wrong(door, &email, device, 9_000);
+        assert_eq!(waits.retry_after(door, &email, device, 9_000), Wait::new(2));
+        assert_eq!(waits.retry_after(door, &email, device, 11_999), Wait::new(1));
+        assert_eq!(waits.retry_after(door, &email, device, 12_000), None);
+    }
 }
 
 #[test]
@@ -858,15 +889,98 @@ fn wire_can_read_a_type_that_cannot_be_written() {
 
 #[test]
 fn a_granted_change_can_hold_four_kibibytes() {
-    let change = GrantedChange {
+    let change = DeleteListeningData {
         head: head(), request_id: request_id(),
-        change: GrantChange::DeleteListeningData { account: person().id },
+        change: DeleteListeningDataTarget { account: person().id, target_revision: person().revision },
         grant: GrantSecret::from_bytes([72; SECRET_BYTES]),
     };
     let wire = encode(&change).unwrap();
     let mut bytes = wire.bytes().to_vec();
     bytes.resize(4 * 1024, b' ');
-    assert_eq!(read::<GrantedChange>(&bytes), Ok(change));
+    assert_eq!(read::<DeleteListeningData>(&bytes), Ok(change));
     bytes.push(b' ');
-    assert_eq!(read::<GrantedChange>(&bytes), Err(BadMessage::TooLarge));
+    assert_eq!(read::<DeleteListeningData>(&bytes), Err(BadMessage::TooLarge));
+}
+
+#[test]
+fn a_sign_in_refusal_never_accepts_or_emits_a_stamp() {
+    for reason in [
+        Refusal::Busy { retry_after_seconds: Wait::new(30) },
+        Refusal::NotAllowed(NotAllowed::AccountOff),
+        Refusal::Malformed,
+        Refusal::NotDealtWith,
+    ] {
+        let reply = SignInReply::RefusedWithReceipt(RefusedWithReceipt::new(reason, receipt()).unwrap());
+        assert!(matches!(encode(&reply), Err(BadMessage::Form)));
+        let body = serde_json::to_vec(&reply).unwrap();
+        assert_eq!(read_reply::<SignInAnswer>(reply.status(), &body), Err(BadMessage::Form));
+    }
+}
+
+fn data_deletion_grant(password: Password) -> GrantRequest {
+    GrantRequest {
+        head: head(),
+        change: GrantChange::DeleteListeningData {
+            account: person().id,
+            target_revision: person().revision,
+            request_id: request_id(),
+        },
+        password,
+    }
+}
+
+#[test]
+fn a_short_presented_password_is_checked_but_a_short_new_password_is_malformed() {
+    assert!(Password::presented("").is_none());
+    assert!(Password::presented(&"🔑".repeat(PASSWORD_MAX_CHARS)).is_some());
+    assert!(Password::presented(&"a".repeat(PASSWORD_MAX_CHARS + 1)).is_none());
+    assert!(Password::presented(&"🔑".repeat(PASSWORD_MAX_CHARS + 1)).is_none());
+    assert!(Password::new("x").is_none());
+    let short = || Password::presented("x").unwrap();
+    assert!(!short().allowed_for(&email(), ""));
+    round_trip(signin(Credential::Password { email: email(), password: short() }));
+    round_trip(data_deletion_grant(short()));
+    round_trip(ChangePassword {
+        head: head(), request_id: request_id(), current_password: short(),
+        new_password: Password::new(PASSWORD).unwrap(),
+    });
+
+    let code = signin(Credential::Code { code: OneTimeCode::new(CODE).unwrap(), new_password: short() });
+    assert!(matches!(encode(&code), Err(BadMessage::Form)));
+    assert_eq!(read::<SignIn>(&serde_json::to_vec(&code).unwrap()), Err(BadMessage::Form));
+    let change = ChangePassword {
+        head: head(), request_id: request_id(), current_password: short(), new_password: short(),
+    };
+    assert!(matches!(encode(&change), Err(BadMessage::Form)));
+    assert_eq!(read::<ChangePassword>(&serde_json::to_vec(&change).unwrap()), Err(BadMessage::Form));
+}
+
+#[test]
+fn a_grant_request_requires_an_exact_valid_change_and_has_its_own_body_ceiling() {
+    let grant = data_deletion_grant(Password::presented("x").unwrap());
+    bad_fields(&grant, &[
+        "/head", "/change", "/change/delete_listening_data",
+        "/change/delete_listening_data/account", "/change/delete_listening_data/target_revision",
+        "/change/delete_listening_data/request_id", "/password",
+    ]);
+    for malformed in [
+        br#"{"head":{"speaks":[1,1],"restore":0},"change":{"change_password":{"account":1}},"password":"x"}"#.as_slice(),
+        br#"{"head":{"speaks":[1,1],"restore":0},"change":{"unknown":{"account":1}},"password":"x"}"#,
+        br#"{"head":{"speaks":[1,1],"restore":0},"change":{"delete_listening_data":{"account":1,"target_revision":0,"request_id":1},"delete_listening_data":{"account":2,"target_revision":0,"request_id":1}},"password":"x"}"#,
+    ] {
+        assert_eq!(read::<GrantRequest>(malformed), Err(BadMessage::Form));
+    }
+    let mut body = encode(&grant).unwrap().bytes().to_vec();
+    body.resize(PASSWORD_REQUEST_MAX_BYTES, b' ');
+    assert_eq!(read::<GrantRequest>(&body), Ok(grant));
+    // Invalid JSON too. The limit must win before the reader examines any of it.
+    body.push(b'{');
+    assert_eq!(read::<GrantRequest>(&body), Err(BadMessage::TooLarge));
+}
+
+#[test]
+fn body_limits_win_before_parsing_and_read_only_callers_cannot_raise_the_global_ceiling() {
+    assert_eq!(read::<SignIn>(&vec![0xff; PASSWORD_REQUEST_MAX_BYTES + 1]), Err(BadMessage::TooLarge));
+    assert_eq!(read_reply::<DevicePage>(429, &vec![0xff; SMALL_REPLY_MAX_BYTES + 1]), Err(BadMessage::TooLarge));
+    assert_eq!(wire::read_value::<u64>(&vec![0xff; BODY_MAX_BYTES + 1], usize::MAX), Err(BadMessage::TooLarge));
 }
