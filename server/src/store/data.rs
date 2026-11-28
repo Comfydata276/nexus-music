@@ -31,6 +31,7 @@ use std::collections::BTreeMap;
 
 use nexus_core::nexus::compare::DataView;
 use nexus_core::nexus::account::{AccountId, DeviceId, Email, SECRET_BYTES, SessionId};
+use nexus_core::nexus::music::MusicInstallation;
 use nexus_core::nexus::kept::{AccountState, DeviceRow, Fingerprint, Leave, LiveCode, MusicRecovery, Rows, Session, Status};
 use nexus_core::nexus::proto::BackendId;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
@@ -56,10 +57,14 @@ pub const BUSY: Duration = Duration::from_secs(5);
 /// its number), devices, and each device's one session as a fingerprint (with the fingerprint
 /// of the secret that can only end it, 11); and the
 /// restore number, how far its changes have got, and the latest time a step was written at.
-/// **Room is left**, for the slices that bring them, for an account's music login (S9), its
-/// switch for requests (step 4), and the events and Diagnostics kept for it (S12, S7), each a
-/// table `REFERENCES accounts (number) ON DELETE CASCADE`, so that deleting an account takes
-/// them in the same step. No password, code or session is kept but as a fingerprint.
+/// For the slices that bring them, each `REFERENCES accounts (number) ON DELETE CASCADE`, so
+/// that deleting an account takes them in the same step: an account's sealed music login with
+/// the internal address it was checked at (S9; 9.4: its count is the store's, so an older one
+/// a put-back brings does not open), and the backend's music address people use
+/// (`meta.music_public`); its listening events and their count (S12, 13), deleted in the same
+/// step as the account's life moves on (a trigger) unless they are held (12.5); and its
+/// Diagnostics reports (S7, 14). **Room is left** for its switch for requests (step 4). No
+/// password, code or session is kept but as a fingerprint; a music login only sealed.
 const FORM_1: &str = "
 CREATE TABLE meta (
     one INTEGER PRIMARY KEY CHECK (one = 1),
@@ -69,7 +74,8 @@ CREATE TABLE meta (
     made_at INTEGER NOT NULL,
     written_at INTEGER NOT NULL,
     restored_at INTEGER,
-    restored_from INTEGER
+    restored_from INTEGER,
+    music_public TEXT
 ) STRICT;
 CREATE TABLE accounts (
     number INTEGER PRIMARY KEY CHECK (number > 0),
@@ -131,6 +137,52 @@ CREATE TABLE sessions (
     leave_hash BLOB CHECK (leave_hash IS NULL OR length(leave_hash) = 32),
     CHECK ((leave_for IS NULL) = (leave_hash IS NULL))
 ) STRICT;
+CREATE TABLE music_logins (
+    account INTEGER PRIMARY KEY REFERENCES accounts (number) ON DELETE CASCADE,
+    count INTEGER NOT NULL CHECK (count > 0),
+    address TEXT NOT NULL,
+    name TEXT NOT NULL,
+    sealed BLOB NOT NULL,
+    internal TEXT NOT NULL
+) STRICT;
+CREATE TABLE listening_events (
+    row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account INTEGER NOT NULL REFERENCES accounts (number) ON DELETE CASCADE,
+    device INTEGER NOT NULL,
+    event_id TEXT NOT NULL CHECK (length(event_id) = 32),
+    at_ms INTEGER NOT NULL,
+    is_start INTEGER NOT NULL CHECK (is_start IN (0, 1)),
+    line TEXT NOT NULL,
+    UNIQUE (account, event_id)
+) STRICT;
+CREATE INDEX listening_recent ON listening_events (account, at_ms DESC, row_id DESC) WHERE is_start = 1;
+CREATE TABLE listening_totals (
+    account INTEGER PRIMARY KEY REFERENCES accounts (number) ON DELETE CASCADE,
+    starts INTEGER NOT NULL
+) STRICT;
+CREATE TRIGGER listening_count_start AFTER INSERT ON listening_events
+WHEN NEW.is_start = 1 BEGIN
+    INSERT INTO listening_totals (account, starts) VALUES (NEW.account, 1)
+    ON CONFLICT (account) DO UPDATE SET starts = starts + 1;
+END;
+CREATE TRIGGER listening_erase_life AFTER UPDATE OF life ON accounts
+WHEN NEW.life > OLD.life AND NEW.history_held = 0 BEGIN
+    DELETE FROM listening_events WHERE account = NEW.number;
+    DELETE FROM listening_totals WHERE account = NEW.number;
+END;
+CREATE TABLE diagnostic_reports (
+    row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account INTEGER NOT NULL REFERENCES accounts (number) ON DELETE CASCADE,
+    device INTEGER NOT NULL REFERENCES devices (id) ON DELETE CASCADE,
+    restore INTEGER NOT NULL,
+    request_id BLOB NOT NULL CHECK (length(request_id) = 8),
+    received_ms INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    UNIQUE (device, restore, request_id)
+) STRICT;
+CREATE INDEX diagnostics_device ON diagnostic_reports (device, row_id DESC);
+CREATE INDEX diagnostics_account ON diagnostic_reports (account, row_id DESC);
+CREATE INDEX diagnostics_expiry ON diagnostic_reports (received_ms, row_id);
 ";
 
 /// One change of form: from `form - 1` to `form`, as SQL run in one step.
@@ -413,6 +465,25 @@ impl Data {
         unsigned(changes)
     }
 
+    /// Does `step` as one step of its own (another slice's rows: events, Diagnostics). If it
+    /// says it changed something, the step is counted (12.3's mark) and committed at
+    /// `written_at`; if not, nothing of it is kept. The points: `data: before commit`, `data:
+    /// committed`. What it gave, and how far the data's changes have got if it changed any.
+    pub fn apply_with<T>(&mut self, written_at: u64, step: impl FnOnce(&rusqlite::Transaction<'_>) -> rusqlite::Result<(T, bool)>) -> rusqlite::Result<(T, Option<u64>)> {
+        let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (value, changed) = step(&tx)?;
+        if !changed {
+            tx.rollback()?;
+            return Ok((value, None));
+        }
+        tx.execute("UPDATE meta SET written_at = max(written_at, ?1), changes = changes + 1 WHERE one = 1", [number(written_at)?])?;
+        let changes: i64 = tx.query_row("SELECT changes FROM meta WHERE one = 1", [], |row| row.get(0))?;
+        crash::point("data: before commit").map_err(io_error)?;
+        tx.commit()?;
+        crash::point("data: committed").map_err(io_error)?;
+        Ok((value, Some(unsigned(changes)?)))
+    }
+
     /// Folds the file SQLite writes ahead in back into the data, so that the data is one file
     /// again. Done at a deletion and as the program stops; it fails harmlessly if a read is
     /// under way.
@@ -627,6 +698,14 @@ pub enum Change<'a> {
     Codes { account: u64, keep: Option<u64> },
     /// A new restore number, and when; every session ended (12.4 steps 1 and 2).
     Restore { restore: u64, at: u64, from: Option<u64> },
+    /// The internal address (`NEXUS_MUSIC_SERVER`) a music login being installed was checked
+    /// at (S9): given in `extra` with `DataChange::InstallMusicLogin`, which it must come with.
+    MusicChecked { account: u64, internal: &'a str },
+    /// An account's sealed music login, as kept decided it, with where it was checked. Made
+    /// by [`crate::store::keeper::Keeper::persist`] only.
+    MusicLogin { account: u64, install: &'a MusicInstallation, internal: &'a str },
+    /// The music server's address people use (9.3), backend-wide. Made by `persist` only.
+    MusicPublic { address: &'a str },
 }
 
 impl std::fmt::Debug for Change<'_> {
@@ -643,6 +722,9 @@ impl std::fmt::Debug for Change<'_> {
             Change::Code { account, number, made_at, until, .. } => f.debug_struct("Code").field("account", account).field("number", number).field("made_at", made_at).field("until", until).finish_non_exhaustive(),
             Change::Codes { account, keep } => f.debug_struct("Codes").field("account", account).field("keep", keep).finish(),
             Change::Restore { restore, at, from } => f.debug_struct("Restore").field("restore", restore).field("at", at).field("from", from).finish(),
+            Change::MusicChecked { account, .. } => f.debug_struct("MusicChecked").field("account", account).finish_non_exhaustive(),
+            Change::MusicLogin { account, install, .. } => f.debug_struct("MusicLogin").field("account", account).field("count", &install.binding.count).finish_non_exhaustive(),
+            Change::MusicPublic { .. } => f.debug_struct("MusicPublic").finish_non_exhaustive(),
         }
     }
 }
@@ -774,6 +856,19 @@ impl Change<'_> {
             }
             Change::Codes { account, keep } => {
                 step.execute("DELETE FROM codes WHERE account = ?1 AND (?2 IS NULL OR number != ?2)", params![number(account)?, keep.map(number).transpose()?])?;
+            }
+            // Only a marker for `persist`, which turns it into `MusicLogin`.
+            Change::MusicChecked { .. } => {}
+            Change::MusicLogin { account, install, internal } => {
+                let binding = &install.binding;
+                step.execute(
+                    "INSERT INTO music_logins (account, count, address, name, sealed, internal) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                     ON CONFLICT (account) DO UPDATE SET count = excluded.count, address = excluded.address, name = excluded.name, sealed = excluded.sealed, internal = excluded.internal",
+                    params![number(account)?, number(binding.count)?, binding.address.as_str(), binding.name.as_str(), install.sealed.as_bytes(), internal],
+                )?;
+            }
+            Change::MusicPublic { address } => {
+                step.execute("UPDATE meta SET music_public = ?1 WHERE one = 1", [address])?;
             }
             Change::Restore { restore, at, from } => {
                 step.execute("DELETE FROM sessions", [])?;

@@ -22,8 +22,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use nexus_core::nexus::account::{AccountId, DeviceId, Email, SECRET_BYTES, SessionId};
+use nexus_core::nexus::diag;
 use nexus_core::nexus::compare::{self, Contradiction, Halt, NotPutBack, Pending, Resume};
-use nexus_core::nexus::kept::{Account as Decided, AccountState, Apart, Clock, DataChange, Effects, LiveCode, RestoreMode, Rows, StampKey, Startup, Status};
+use nexus_core::nexus::kept::{Account as Decided, AccountState, AdminAction, AdminTarget, Apart, Clock, DataChange, Effects, LiveCode, RestoreMode, Rows, StampKey, Startup, Status};
 use nexus_core::nexus::proto::BackendId;
 
 use crate::identity;
@@ -37,6 +38,9 @@ use crate::store::private;
 /// How often, at most, the store hears how far the data's changes have got from a change the
 /// data alone has (12.3).
 pub const MARK_EVERY_MS: u64 = 60_000;
+
+/// How many Diagnostics reports past their age one idle call removes, at most.
+pub const EXPIRED_PER_IDLE: i64 = 500;
 
 /// What a new account starts with ([`Keeper::make_account`]).
 #[derive(Debug, Clone, Copy)]
@@ -730,10 +734,39 @@ impl Keeper {
                 Change::Password { account, password: Some(_) } => with(account, |change| matches!(change, DataChange::ChangePassword | DataChange::RedeemCode { .. })),
                 Change::Code { account, .. } => with(account, |change| matches!(change, DataChange::ResetPassword)),
                 Change::Describe { device, .. } => DeviceId::new(device).is_some_and(|device| effects.updates.iter().any(|update| update.data.devices.contains_key(&device))),
+                Change::MusicChecked { account, .. } => with(account, |change| matches!(change, DataChange::InstallMusicLogin(_))),
                 _ => return Err(Failed("A change was added to a decision that no decision adds to; nothing was kept.".into())),
             };
             if belongs {
                 added.push(change.clone());
+            }
+        }
+        // What a change cannot be kept without, said before anything is written: a new
+        // verifier with a password changed or a code redeemed; with a music login, its own
+        // account and count, and the internal address it was checked at (S9).
+        for (update, &number) in effects.updates.iter().zip(&numbers) {
+            let given = |found: &dyn Fn(&Change<'_>) -> bool| extra.iter().any(found);
+            match &update.change {
+                DataChange::RedeemCode { verifier, .. } => {
+                    if !given(&|change| matches!(change, Change::Password { account, password: Some(password) } if *account == number && password.hash == *verifier.as_bytes())) {
+                        return Err(Failed("A code was redeemed with no new password to keep; nothing was kept.".into()));
+                    }
+                }
+                DataChange::ChangePassword => {
+                    if !given(&|change| matches!(change, Change::Password { account, password: Some(_) } if *account == number)) {
+                        return Err(Failed("A password was changed with no new password to keep; nothing was kept.".into()));
+                    }
+                }
+                DataChange::InstallMusicLogin(install) => {
+                    let binding = &install.binding;
+                    if binding.account != update.apart_first.account.id || binding.count != update.data.account.music_login || binding.backend != self.backend {
+                        return Err(Failed("A music login was sealed for another account, backend or count; nothing was kept.".into()));
+                    }
+                    if !given(&|change| matches!(change, Change::MusicChecked { account, .. } if *account == number)) {
+                        return Err(Failed("A music login came with no address it was checked at; nothing was kept.".into()));
+                    }
+                }
+                _ => {}
             }
         }
         let mut next = self.store.clone();
@@ -761,21 +794,23 @@ impl Keeper {
             changes.push(Change::Install { number, rows: &update.data, at });
             match &update.change {
                 DataChange::ResetPassword => changes.push(Change::Password { account: number, password: None }),
-                // The new password is in `extra`, made by S8, and is the verifier C3r was given.
-                DataChange::RedeemCode { verifier, .. } => {
-                    let given = extra.iter().any(|change| matches!(change, Change::Password { account, password: Some(password) } if *account == number && password.hash == *verifier.as_bytes()));
-                    if !given {
-                        return self.broke(Failed("A code was redeemed with no new password to keep.".into()));
-                    }
-                }
-                DataChange::ChangePassword => {
-                    let given = extra.iter().any(|change| matches!(change, Change::Password { account, password: Some(_) } if *account == number));
-                    if !given {
-                        return self.broke(Failed("A password was changed with no new password to keep.".into()));
-                    }
-                }
-                // Its events go here once they are kept (S12).
+                // The new password is in `extra` (checked above): the verifier C3r was given.
+                DataChange::RedeemCode { .. } | DataChange::ChangePassword => {}
+                // The account's listening events go in this same step: its life moves on in
+                // `Install`, and the data's trigger deletes them unless they are held (12.5).
                 DataChange::EraseHistory => {}
+                DataChange::InstallMusicLogin(install) => {
+                    let internal = extra.iter().find_map(|change| match change {
+                        Change::MusicChecked { account, internal } if *account == number => Some(*internal),
+                        _ => None,
+                    });
+                    if let Some(internal) = internal {
+                        changes.push(Change::MusicLogin { account: number, install, internal });
+                    }
+                }
+                DataChange::ApplyAdmin { action: AdminAction::SetMusicAddress(address), target: AdminTarget::Backend } => {
+                    changes.push(Change::MusicPublic { address: address.as_str() });
+                }
                 _ => {}
             }
             changes.push(Change::Codes { account: number, keep: live(update.data.account.code) });
@@ -819,6 +854,26 @@ impl Keeper {
         self.persist(&effects, &[], now)
     }
 
+    /// A step of another slice's rows (listening events, Diagnostics reports: data, never
+    /// authority), through the one writer (S12/S7). `step` runs in one transaction; it says
+    /// whether it changed anything. If it did, the step is counted (12.3's mark: the store
+    /// hears of it within the minute, by `idle` if nothing else) and written at the time the
+    /// store already has (finding 7: no step of data alone moves the clock); if not, nothing
+    /// of it is kept. All of it or none. Nothing that takes leave away or gives it may be done
+    /// here: that is `persist`'s, store first.
+    pub fn write_data<T>(&mut self, now: u64, step: impl FnOnce(&rusqlite::Transaction<'_>) -> rusqlite::Result<(T, bool)>) -> Result<T, Failed> {
+        self.heal()?;
+        let (value, changed) = self.data.apply_with(self.store.high_water, step).map_err(|error| Failed(data_failed(&error)))?;
+        if let Some(changes) = changed {
+            self.changes = changes;
+            let due = now.saturating_sub(self.store.mark_at) >= MARK_EVERY_MS || now < self.store.mark_at;
+            if due {
+                self.write_mark(now)?;
+            }
+        }
+        Ok(value)
+    }
+
     /// The data, to read from (nothing is written through it).
     pub fn data(&self) -> &Data {
         &self.data
@@ -840,6 +895,21 @@ impl Keeper {
     /// moves no clock.
     pub fn idle(&mut self, now: u64) -> Result<(), Failed> {
         self.heal()?;
+        // Diagnostics reports past their age go, a bounded number at a time (14; S7's ask).
+        let cutoff = self.clock(now).effective().saturating_sub(diag::MAX_AGE_MS);
+        let (_, changed) = self
+            .data
+            .apply_with(self.store.high_water, |step| {
+                let gone = step.execute(
+                    "DELETE FROM diagnostic_reports WHERE row_id IN (SELECT row_id FROM diagnostic_reports WHERE received_ms < ?1 ORDER BY received_ms, row_id LIMIT ?2)",
+                    rusqlite::params![i64::try_from(cutoff).unwrap_or(i64::MAX), EXPIRED_PER_IDLE],
+                )?;
+                Ok(((), gone > 0))
+            })
+            .map_err(|error| Failed(data_failed(&error)))?;
+        if let Some(changes) = changed {
+            self.changes = changes;
+        }
         let due = now.saturating_sub(self.store.mark_at) >= MARK_EVERY_MS || now < self.store.mark_at;
         if self.changes > self.store.mark && due {
             self.write_mark(now)?;

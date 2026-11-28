@@ -410,6 +410,7 @@ fn run(scenario: &str, root: &Root) -> Result<(), String> {
         "an account deleted" => administer(&mut keeper(), &ids, AdminAction::DeleteAccount, BOB, &[], now).map_err(failed),
         "a password reset" => administer(&mut keeper(), &ids, AdminAction::ResetPassword, BOB, &[Change::Code { account: BOB, number: 2, code: &[45; 32], made_at: now, until: now + MINUTE }], now).map_err(failed),
         "a device heard from" => keeper().heard(ids.b1, now + 2 * MINUTE).map_err(failed),
+        "an event kept" => an_event(&mut keeper(), BOB, ids.b1, 3, now).map(|_| ()).map_err(failed),
         "a large account made" => keeper().make_account("large@example.org", &"L".repeat(40 * 1024), false, None, now).map(|_| ()).map_err(failed),
         "an older copy found at a start" => Keeper::open(&root.state(), &root.data(), now).map(|(keeper, _)| keeper.close()).map_err(|why| why.0),
         "put-back" => keeper::put_back(&root.state(), &root.data(), &the_copy(root), now).map(|_| ()).map_err(|why| why.0),
@@ -1578,4 +1579,182 @@ fn another_backends_copy_at_the_datas_place_is_refused_with_nothing_changed() {
     assert!(why.0.contains("another backend's"), "{why}");
     assert_eq!(fs::read(data::place(&one.data())).unwrap(), bytes, "the foreign file was changed");
     assert_eq!(names(&one), before);
+}
+
+// ---- Other slices' rows through the one writer (S12/S7, S9) ----
+
+/// A listening event for `account` on `device`, as S12 keeps one, through the one writer.
+fn an_event(keeper: &mut Keeper, account: u64, device: u64, n: u8, now: u64) -> Result<bool, Failed> {
+    keeper.write_data(now, |tx| {
+        let id = format!("{n:032x}");
+        let added = tx.execute(
+            "INSERT OR IGNORE INTO listening_events (account, device, event_id, at_ms, is_start, line) VALUES (?1, ?2, ?3, ?4, 1, 'a made-up track')",
+            rusqlite::params![account as i64, device as i64, id, now as i64],
+        )?;
+        Ok((added > 0, added > 0))
+    })
+}
+
+fn events(keeper: &Keeper, account: u64) -> i64 {
+    count(keeper, "SELECT count(*) FROM listening_events WHERE account = ?1", account)
+}
+
+#[test]
+fn another_slices_step_through_the_one_writer_is_counted_or_kept_not_at_all() {
+    let root = Root::new("write-data");
+    let ids = world(&root);
+    let mut keeper = opened(&root, T0 + 2 * MINUTE);
+    let before = keeper.data().meta().unwrap();
+    // Changed: counted, written at the store's time (a far clock moves nothing), all of it.
+    let far = T0 + 400 * 24 * 60 * MINUTE;
+    assert!(an_event(&mut keeper, BOB, ids.b1, 1, far).unwrap());
+    let after = keeper.data().meta().unwrap();
+    assert_eq!(after.changes, before.changes + 1);
+    assert!(after.written_at < far, "a data-only step moved the data's time");
+    assert!(keeper.clock(T0 + 2 * MINUTE).effective() < far, "a data-only step moved the clock");
+    // Not changed: nothing kept, nothing counted.
+    assert!(!an_event(&mut keeper, BOB, ids.b1, 1, T0 + 3 * MINUTE).unwrap());
+    assert_eq!(keeper.data().meta().unwrap().changes, after.changes);
+    // A step that fails part-way keeps none of it.
+    let failed = keeper.write_data(T0 + 3 * MINUTE, |tx| {
+        tx.execute("INSERT INTO listening_events (account, device, event_id, at_ms, is_start, line) VALUES (?1, 1, ?2, 1, 1, 'x')", rusqlite::params![BOB as i64, format!("{:032x}", 2)])?;
+        tx.execute("INSERT INTO listening_events (account, device, event_id, at_ms, is_start, line) VALUES (999, 1, 'too short', 1, 1, 'x')", [])?;
+        Ok(((), true))
+    });
+    assert!(failed.is_err());
+    assert_eq!(events(&keeper, BOB), 1);
+    assert_eq!(count(&keeper, "SELECT starts FROM listening_totals WHERE account = ?1", BOB), 1);
+    keeper.close();
+}
+
+#[test]
+fn an_event_kept_after_a_copy_shows_the_copy_older_once_idle_time_gives_the_mark() {
+    // Findings 6 and 7, for another slice's rows.
+    let root = Root::new("write-data-mark");
+    let ids = world(&root);
+    let mut keeper = opened(&root, T0 + 2 * MINUTE);
+    keeper.heard(ids.b1, T0 + 2 * MINUTE).unwrap();
+    keeper.close();
+    let copy = snapshot(&root, &["nexus.db"]);
+    let mut keeper = opened(&root, T0 + 2 * MINUTE + 10_000);
+    an_event(&mut keeper, BOB, ids.b1, 7, T0 + 2 * MINUTE + 10_000).unwrap();
+    let due = keeper.mark_due().expect("the step is not yet marked");
+    keeper.idle(due).unwrap();
+    drop(keeper);
+    put_by_hand(&root, &copy);
+    let (keeper, started) = settled(&root, T0 + 9 * MINUTE);
+    assert!(matches!(started, Started::Restored { .. }), "{started:?}");
+    assert_eq!(events(&keeper, BOB), 0);
+}
+
+#[test]
+fn an_events_step_cut_at_any_point_is_kept_whole_or_not_at_all() {
+    let setup = Root::new("event-cut");
+    let ids = world(&setup);
+    at_every_point("an event kept", &setup, |root, cut| {
+        let (keeper, _) = settled(root, T0 + 20 * MINUTE);
+        let (kept, totals) = (events(&keeper, BOB), count(&keeper, "SELECT coalesce(sum(starts), 0) FROM listening_totals WHERE account = ?1", BOB));
+        assert_eq!(kept, totals, "at {}: the count and the events disagree", cut.at);
+        if cut.whole() || cut.points[..cut.at].iter().any(|point| point == "data: committed") {
+            assert_eq!(kept, 1, "at {}", cut.at);
+        }
+        let _ = ids;
+    });
+}
+
+#[test]
+fn deleting_listening_data_takes_the_events_in_its_own_step_and_a_put_back_holds_them() {
+    let root = Root::new("events-life");
+    let ids = world(&root);
+    let mut keeper = opened(&root, T0 + 2 * MINUTE);
+    for n in 0..3 {
+        an_event(&mut keeper, BOB, ids.b1, n, T0 + 2 * MINUTE).unwrap();
+    }
+    an_event(&mut keeper, ALICE, ids.a1, 9, T0 + 2 * MINUTE).unwrap();
+    keeper.close();
+    let copy = snapshot(&root, &["nexus.db"]);
+    let mut keeper = opened(&root, T0 + 3 * MINUTE);
+    leave(&mut keeper, BOB, ids.b1, 5, 22, LeaveFor::DeleteHistory, T0 + 3 * MINUTE).unwrap();
+    let held = fp(5);
+    decide(&mut keeper, BOB, T0 + 3 * MINUTE, &[], |turn| turn.delete_history(bearer(ids.b1, &held))).unwrap().unwrap();
+    assert_eq!((events(&keeper, BOB), events(&keeper, ALICE)), (0, 1), "the events and the life moved in one step");
+    assert_eq!(count(&keeper, "SELECT count(*) FROM listening_totals WHERE account = ?1", BOB), 0);
+    keeper.close();
+    // The copy from before holds them again: held, not served, until Bob answers (12.5).
+    put_by_hand(&root, &copy);
+    let (mut keeper, _) = settled(&root, T0 + 4 * MINUTE);
+    assert!(state(&mut keeper, BOB).unwrap().history_held);
+    assert_eq!(events(&keeper, BOB), 3, "held, not deleted, by the restore");
+}
+
+#[test]
+fn diagnostics_past_their_age_go_in_idle_time_a_bounded_number_at_a_time() {
+    let root = Root::new("diag-age");
+    let ids = world(&root);
+    let mut keeper = opened(&root, T0 + 2 * MINUTE);
+    let now = T0 + 2 * MINUTE;
+    keeper
+        .write_data(now, |tx| {
+            for n in 0..(keeper::EXPIRED_PER_IDLE + 3) {
+                tx.execute(
+                    "INSERT INTO diagnostic_reports (account, device, restore, request_id, received_ms, text) VALUES (?1, ?2, 0, ?3, ?4, 'a made-up report')",
+                    rusqlite::params![BOB as i64, ids.b1 as i64, n.to_be_bytes().as_slice(), n],
+                )?;
+            }
+            tx.execute(
+                "INSERT INTO diagnostic_reports (account, device, restore, request_id, received_ms, text) VALUES (?1, ?2, 0, ?3, ?4, 'a recent one')",
+                rusqlite::params![BOB as i64, ids.b1 as i64, (-1i64).to_be_bytes().as_slice(), now as i64],
+            )?;
+            Ok(((), true))
+        })
+        .unwrap();
+    let reports = |keeper: &Keeper| count(keeper, "SELECT count(*) FROM diagnostic_reports WHERE account = ?1", BOB);
+    keeper.idle(now).unwrap();
+    assert_eq!(reports(&keeper), 4, "at most EXPIRED_PER_IDLE go at once");
+    keeper.idle(now).unwrap();
+    assert_eq!(reports(&keeper), 1, "the recent one stays");
+    keeper.close();
+}
+
+#[test]
+fn a_music_login_is_kept_only_with_its_own_account_count_and_where_it_was_checked() {
+    use nexus_core::nexus::account::{MusicAddress, Name};
+    use nexus_core::nexus::kept::{DataChange, Effects, Update};
+    use nexus_core::nexus::music::{CredentialBinding, MusicInstallation, SealedCredential};
+    let root = Root::new("music-login");
+    world(&root);
+    let mut keeper = opened(&root, T0 + 2 * MINUTE);
+    let loaded = keeper.load(ALICE).unwrap();
+    let (mut rows, mut apart) = (loaded.rows(), loaded.apart());
+    rows.account.music_login = 1;
+    apart.account.music_login = 1;
+    let install = |account: u64, count: u64| MusicInstallation {
+        binding: CredentialBinding {
+            backend: keeper.backend(),
+            account: AccountId::new(account).unwrap(),
+            address: MusicAddress::new("https://music.example.org").unwrap(),
+            name: Name::new("alice").unwrap(),
+            count,
+        },
+        sealed: SealedCredential::from_bytes(&[7; 64]).unwrap(),
+    };
+    let effects = |install: MusicInstallation| Effects {
+        high_water: keeper.clock(T0 + 2 * MINUTE).effective(),
+        updates: vec![Update { apart_first: apart.clone(), data: rows.clone(), change: DataChange::InstallMusicLogin(install), music: None, apart_last: apart.clone() }],
+    };
+    let checked = [Change::MusicChecked { account: ALICE, internal: "http://navidrome:4533" }];
+    let logins = |keeper: &Keeper| count(keeper, "SELECT count(*) FROM music_logins WHERE account = ?1", ALICE);
+    let (wrong_account, wrong_count, right) = (effects(install(BOB, 1)), effects(install(ALICE, 2)), effects(install(ALICE, 1)));
+    assert!(keeper.persist(&wrong_account, &checked, T0 + 2 * MINUTE).is_err(), "sealed for another account");
+    assert!(keeper.persist(&wrong_count, &checked, T0 + 2 * MINUTE).is_err(), "sealed under another count");
+    assert!(keeper.persist(&right, &[], T0 + 2 * MINUTE).is_err(), "with no address it was checked at");
+    assert_eq!(logins(&keeper), 0, "nothing was kept by a refused one");
+    assert_eq!(state(&mut keeper, ALICE).unwrap().music_login, 0);
+    keeper.persist(&right, &checked, T0 + 2 * MINUTE).unwrap();
+    assert_eq!(logins(&keeper), 1);
+    let (count_kept, internal): (i64, String) =
+        keeper.data().connection().query_row("SELECT count, internal FROM music_logins WHERE account = ?1", [ALICE as i64], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+    assert_eq!((count_kept, internal.as_str()), (1, "http://navidrome:4533"));
+    assert_eq!(state(&mut keeper, ALICE).unwrap().music_login, 1);
+    keeper.close();
 }
