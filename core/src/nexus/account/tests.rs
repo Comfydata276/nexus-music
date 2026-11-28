@@ -838,3 +838,35 @@ fn a_dummy_salt_is_stable_for_a_canonical_name_and_is_keyed() {
     assert_ne!(first.as_ref(), DummySaltKey::from_bytes([8; SECRET_BYTES]).salt_for(&email()).as_ref());
     assert_eq!(format!("{key:?}"), "DummySaltKey(..)");
 }
+
+#[test]
+fn wire_can_read_a_type_that_cannot_be_written() {
+    #[derive(Debug, PartialEq, Eq)]
+    struct OnlyRead(u64);
+
+    impl wire::Value for OnlyRead {
+        fn read(raw: &RawValue) -> Result<Self, BadMessage> {
+            Fields::read(raw)?.get("known").map(Self)
+        }
+    }
+
+    let body = br#"{"known":4,"future":[true]}"#;
+    assert_eq!(wire::read_value(body, body.len()), Ok(OnlyRead(4)));
+    assert_eq!(wire::read_value::<OnlyRead>(body, body.len() - 1), Err(BadMessage::TooLarge));
+    assert_eq!(wire::read_value::<OnlyRead>(br#"{"known":4,"future":{"x":1,"x":2}}"#, 64), Err(BadMessage::Form));
+}
+
+#[test]
+fn a_granted_change_can_hold_four_kibibytes() {
+    let change = GrantedChange {
+        head: head(), request_id: request_id(),
+        change: GrantChange::DeleteListeningData { account: person().id },
+        grant: GrantSecret::from_bytes([72; SECRET_BYTES]),
+    };
+    let wire = encode(&change).unwrap();
+    let mut bytes = wire.bytes().to_vec();
+    bytes.resize(4 * 1024, b' ');
+    assert_eq!(read::<GrantedChange>(&bytes), Ok(change));
+    bytes.push(b' ');
+    assert_eq!(read::<GrantedChange>(&bytes), Err(BadMessage::TooLarge));
+}
