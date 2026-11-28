@@ -1184,6 +1184,10 @@ dd, li { overflow-wrap: anywhere; }
         listeningPanel.hidden = false;
         void loadListening();
       }
+      if (requestHistory.open) {
+        resetPage(requestHistoryPage);
+        void loadRequestHistory();
+      }
     }
     if (view === "devices" || view === "accounts-and-devices") {
       resetPage(devicePage);
@@ -1360,7 +1364,7 @@ dd, li { overflow-wrap: anywhere; }
 
   function requestHistoryRow(row) {
     const asked = row?.asked;
-    if (typeof row?.name !== "string" || Array.from(row.name).length > 128 ||
+    if (typeof row?.name !== "string" || bytes(row.name) > 128 ||
         typeof asked?.title !== "string" || bytes(asked.title) > 1024 ||
         typeof asked.artist !== "string" || bytes(asked.artist) > 1024 ||
         !isU64(asked.asked_ms) || asked.asked_ms > 8640000000000000n ||
