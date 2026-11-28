@@ -1,11 +1,29 @@
 # The Nexus server
 
-One small service of our own, in one container, beside the music server. The design is
-`docs/backend-design.md` on its own branch. It answers `hello` (S1), keeps its data and a
-store kept apart (S3), signs people in with an email and a password (S8), and hands each of a
-person's devices a music login made for it from the one an admin typed in (S9). The admin's
-page manages accounts, devices, music logins and Diagnostics (S10b). The backend also handles
-music requests through the Lidarr configured by the operator (S13).
+The Nexus server runs alongside your music server. It signs people into the Nexus Music
+apps, gives each device a music login, and keeps listening history and Diagnostics.
+It can also send music requests to Lidarr.
+
+On Unraid, give the Nexus container a network it shares with Nginx Proxy Manager. In
+Nginx Proxy Manager, give it its own HTTPS name and use the proxy configuration below to
+forward to port 8080. Leave that port unpublished on Unraid. Set these values on the
+Nexus container:
+
+- `NEXUS_PROXY` is Nginx Proxy Manager's container name or fixed IP on the shared network.
+- `NEXUS_PUBLIC_ORIGIN` is the HTTPS address people use, such as `https://nexus.example.org`.
+- `NEXUS_MUSIC_SERVER` is the music server's address from the Nexus container, such as
+  `http://navidrome:4533`.
+- `NEXUS_LIDARR` is Lidarr's address from the Nexus container, such as `http://lidarr:8686`,
+  if you want music requests.
+- Mount two separate persistent folders on Unraid at `/data` (`NEXUS_DATA`) and `/state`
+  (`NEXUS_STATE`). The data folder holds the database and its copies. The state folder
+  holds the server's identity and keys and stays separate when you restore the database.
+
+On the first start, find the one-time setup code in the Nexus server's container log. Open
+`https://nexus.example.org/nexus/admin/` using your own HTTPS name and use the code under
+**Set up this server for the first time** to create the first admin. The code lasts 15 minutes.
+
+The design is `docs/backend-design.md` on its own branch.
 
 ## Building and testing
 
