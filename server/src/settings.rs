@@ -4,6 +4,8 @@
 //! None of them is secret, so the log may say what they are.
 
 use std::net::{IpAddr, SocketAddr};
+
+use nexus_core::nexus::admin::InternalAddress;
 use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,6 +26,11 @@ pub struct Settings {
     /// How large the data may grow, in bytes, before new events wait (`NEXUS_DATA_BUDGET`,
     /// design 19.2; S12's intake). 4 GB unless given.
     pub data_budget: u64,
+    /// Lidarr as this container reaches it (`NEXUS_LIDARR`, design 16; step 3), e.g.
+    /// `http://lidarr:8686`: plain HTTP is allowed, as it is inside the container's network.
+    /// Unset, requests through the backend are not set up. Never set from the admin's page:
+    /// the backend connects to this and to no address the page gives.
+    pub lidarr: Option<InternalAddress>,
 }
 
 pub const DATA_DEFAULT: &str = "/data";
@@ -89,7 +96,13 @@ impl Settings {
                 format!("NEXUS_DATA_BUDGET is wrong: give how large the data may grow, as a whole number of bytes or with MB, GB or TB after it, at least 1 MB, for example 4GB (the default is {DATA_BUDGET_DEFAULT} bytes)")
             })?,
         };
-        Ok(Settings { music_server, proxy, data, state, listen, public_origin, data_budget })
+        let lidarr = match setting("NEXUS_LIDARR") {
+            None => None,
+            Some(value) => Some(lidarr(&value).ok_or_else(|| {
+                "NEXUS_LIDARR is wrong: give Lidarr as this container reaches it, http:// or https://, a host, and if need be a port and a path, with nothing else (no name, password, query or #), for example http://lidarr:8686".to_string()
+            })?),
+        };
+        Ok(Settings { music_server, proxy, data, state, listen, public_origin, data_budget, lidarr })
     }
 
     /// Whether both folders are there, and apart on the disk as well as in their names: not
@@ -109,6 +122,14 @@ impl Settings {
         }
         Ok(())
     }
+}
+
+/// Lidarr's address as the container reaches it: core's own reading of an internal address
+/// (what a Lidarr key is sealed to), and written as it is read, so that the address the key is
+/// bound to is the one given.
+fn lidarr(value: &str) -> Option<InternalAddress> {
+    let address = InternalAddress::new(value)?;
+    (address.as_str() == value && (value.starts_with("http://") || value.starts_with("https://"))).then_some(address)
 }
 
 /// An origin as a browser writes it in `Origin`: `https://`, a host in its one plain form (as
@@ -216,6 +237,7 @@ mod tests {
             listen: "0.0.0.0:8080".parse().unwrap(),
             public_origin: None,
             data_budget: DATA_BUDGET_DEFAULT,
+            lidarr: None,
         };
         assert_eq!(settings("state").check_folders(), Ok(()));
         for state in ["state-link", "inner-link"] {
@@ -327,6 +349,23 @@ mod tests {
         // Folders that only begin alike are apart.
         let pairs = with(&[("NEXUS_DATA", "/srv/data"), ("NEXUS_STATE", "/srv/data-state")]);
         assert!(read(&pairs).is_ok());
+    }
+
+    /// Step 3: Lidarr as the container reaches it; absent, requests are not set up; a wrong one
+    /// stops the start by name.
+    #[test]
+    fn lidarr_is_an_inside_address_or_not_set_up() {
+        assert_eq!(read(BOTH).unwrap().lidarr, None);
+        for value in ["http://lidarr:8686", "https://lidarr.lan", "http://192.0.2.30:8686/lidarr", "http://[fd00::30]:8686"] {
+            let pairs = with(&[("NEXUS_LIDARR", value)]);
+            assert_eq!(read(&pairs).unwrap().lidarr.as_ref().map(InternalAddress::as_str), Some(value), "{value}");
+        }
+        for value in ["lidarr:8686", "ftp://lidarr", "http://", "http://user:secret@lidarr:8686", "http://lidarr:8686/?apikey=x", "http://lidarr:8686/#x", "http://lidarr:port", "http://lid arr"] {
+            let pairs = with(&[("NEXUS_LIDARR", value)]);
+            let why = read(&pairs).unwrap_err();
+            assert!(why.starts_with("NEXUS_LIDARR is wrong"), "{value}: {why}");
+            assert!(!why.contains("secret") && !why.contains("apikey"), "the value is not repeated: {why}");
+        }
     }
 
     /// S12's audit, S1: a data budget mistyped stops the start, by name; a right one is taken.
