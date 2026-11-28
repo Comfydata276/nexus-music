@@ -1,7 +1,7 @@
 //! The music-server login (§9). The server supplies fresh random bytes and performs
 //! the fixed POSTs. Music-server answers confer no Nexus account permissions.
 
-use super::proto;
+use super::{proto, wire};
 use serde_json::Value;
 use std::fmt::{self, Write};
 use zeroize::Zeroizing;
@@ -249,10 +249,10 @@ enum Envelope {
 fn read(status: u16, bytes: &[u8]) -> Option<Envelope> {
     // the design does not say how to treat a valid body at an unmeasured status.
     // A transport failure is never authentication; only a measured 200 is eligible.
-    if status != 200 || bytes.len() > ANSWER_MAX_BYTES || !proto::complete_json(bytes) {
+    if status != 200 {
         return None;
     }
-    let root: Value = serde_json::from_slice(bytes).ok()?;
+    let root: Value = wire::plain_json(wire::read_raw(bytes, ANSWER_MAX_BYTES).ok()?.get()).ok()?;
     let root = root.as_object()?;
     if root.len() != 1 {
         return None;
