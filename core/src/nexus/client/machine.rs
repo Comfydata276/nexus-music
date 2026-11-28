@@ -449,15 +449,17 @@ impl Client {
             let (backend_id, session) = (note.backend_id.clone(), note.session());
             live.notes.retain(|kept| kept.key() != (backend_id.as_str(), session));
             out.push(Do::Keep(Keep::Note(note.copy())));
-            live.notes.push(note);
+            // Room is made among the notes there before this one, never by the new one, even
+            // if the clock was set back behind them all (as ruled).
             let mut dropped = Vec::new();
-            while live.notes.len() > NOTES_MAX {
+            while live.notes.len() >= NOTES_MAX {
                 let Some(index) = live.notes.iter().enumerate().min_by_key(|(_, kept)| kept.made_ms).map(|(index, _)| index) else { break };
                 let gone = live.notes.remove(index);
                 out.push(Do::Forget(gone.forget()));
                 retire(live, &gone.backend_id, gone.session());
                 dropped.push((BackendId::from_hex(&gone.backend_id), gone.session()));
             }
+            live.notes.push(note);
             self.parting.retain(|parting| !dropped.contains(&(Some(parting.backend), parting.session)));
         }
         out.push(Do::Forget(Forget::Saved));

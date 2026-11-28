@@ -195,6 +195,9 @@ pub struct Kept {
     pub notes: Vec<Note>,
     /// Whether Offline mode is on (the app's own setting).
     pub offline: bool,
+    /// What was kept but did not read (an unknown member, a wrong or older form): treated as
+    /// absent, and forgotten where it is kept (as ruled). What is kept can never stop a start.
+    pub unreadable: Vec<Forget>,
 }
 
 /// What signing in leaves on a device: **one thing, put in place in one step** (11). A
@@ -497,7 +500,8 @@ impl Serialize for Hidden {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Keep {
-    /// Where secrets are kept, beside [`Saved`], replacing the one before. Never forgotten.
+    /// Where secrets are kept, beside [`Saved`], replacing the one before. Forgotten only if
+    /// what was kept of it does not read.
     DeviceSecret(DeviceKey),
     /// Where secrets are kept, as one thing, replacing the one before.
     Saved(Saved),
@@ -516,6 +520,11 @@ pub enum Forget {
     Saved,
     /// The note for this backend's session.
     Note { backend_id: String, session: u64 },
+    /// The device's secret: only when what was kept of it did not read. A new one is made
+    /// when it is next needed.
+    DeviceSecret,
+    /// A note that did not read, by its place in the `notes` handed to `start`.
+    UnreadableNote { index: usize },
 }
 
 /// What the player is handed.
@@ -981,6 +990,13 @@ impl Saved {
     }
 }
 
+/// An address in its one spelling: account's [`NexusOrigin`] as it writes itself, so that
+/// `https://name/` and `https://name` are one address (as ruled). Text that is not an
+/// address is left as it is (it matches nothing that is).
+fn canonical(text: &str) -> String {
+    NexusOrigin::typed(text).map(|origin| origin.origin().to_string()).unwrap_or_else(|_| text.to_owned())
+}
+
 /// The address a person typed, as the Nexus origin every ask is made to (7.1): read by
 /// account's [`NexusOrigin::typed`], on origin's one reading of an address. `http://` (or any
 /// scheme but https) is "needs HTTPS"; anything else it refuses is "not an address".
@@ -1049,13 +1065,15 @@ impl Client {
 
     /// The backend id last seen at this origin this run.
     fn seen(&self, origin: &str) -> Option<BackendId> {
-        self.seen_at.iter().find(|(at, _)| at == origin).map(|(_, id)| *id)
+        let origin = canonical(origin);
+        self.seen_at.iter().find(|(at, _)| *at == origin).map(|(_, id)| *id)
     }
 
     /// Records the backend id an answer at this origin named.
     fn saw(&mut self, origin: &str, id: BackendId) {
-        self.seen_at.retain(|(at, _)| at != origin);
-        self.seen_at.push((origin.to_owned(), id));
+        let origin = canonical(origin);
+        self.seen_at.retain(|(at, _)| *at != origin);
+        self.seen_at.push((origin, id));
     }
 
     /// **Start**, after the app is already usable: hand over what was kept. A kept music
@@ -1065,10 +1083,16 @@ impl Client {
         self.stop();
         self.generation = self.generation.wrapping_add(1);
         let mut out = Vec::new();
-        let Kept { device_secret, saved, notes, offline } = kept;
+        let Kept { device_secret, mut saved, mut notes, offline, unreadable } = kept;
+        // Every address in its one spelling from here on (as ruled).
+        if let Some(found) = saved.as_mut() {
+            found.nexus = canonical(&found.nexus);
+        }
+        for note in &mut notes {
+            note.nexus = canonical(&note.nexus);
+        }
         // A sign-out cut between keeping its note and forgetting what signing in left: the
         // note says it, and it is finished now. That login is not handed over.
-        let mut saved = saved;
         if let Some(found) = &saved
             && let Some(revoke) = &found.sign_out
             && notes.iter().any(|note| note.backend_id == found.backend_id && note.revoke.session == revoke.session)
@@ -1080,6 +1104,8 @@ impl Client {
         if let Some(login) = saved.as_ref().and_then(|saved| saved.music.as_ref()) {
             out.push(Do::Hand(Hand::Login { login: copy(login), generation: self.generation }));
         }
+        // What did not read is forgotten where it is kept, after the player has its login.
+        out.extend(unreadable.into_iter().map(Do::Forget));
         if let Some(found) = &mut saved
             && (NexusOrigin::typed(&found.nexus).is_err() || BackendId::from_hex(&found.backend_id).is_none())
         {

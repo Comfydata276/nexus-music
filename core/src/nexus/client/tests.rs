@@ -165,7 +165,7 @@ fn note_forget(session: u64) -> Forget {
 }
 
 fn kept_signed_in(count: u64) -> Kept {
-    Kept { device_secret: Some(our_key()), saved: Some(saved(count)), notes: Vec::new(), offline: false }
+    Kept { device_secret: Some(our_key()), saved: Some(saved(count)), notes: Vec::new(), offline: false, unreadable: Vec::new() }
 }
 
 /// A device under test: the machine, the clock, and every thing it was told to do.
@@ -1942,16 +1942,109 @@ fn b3_past_four_the_new_note_is_kept_first_and_the_oldest_retired() {
     assert_eq!(forgets(&out), vec![note_forget(205), note_forget(206)]);
 }
 
-#[test]
-fn b4_a_kept_music_login_with_a_member_it_does_not_know_refuses_the_start() {
+fn json_start(kept: serde_json::Value) -> (Client, serde_json::Value) {
     let mut client = Client::default();
+    let start = serde_json::json!({"start": {
+        "app": {"version": "0.41.0", "kind": "phone", "device_name": "Ada's phone"},
+        "kept": kept,
+        "given": {"now_ms": START_MS, "local_offset_minutes": 600, "random": hex(&[0x42; 32])}
+    }});
+    let out = call(&mut client, &start);
+    (client, out)
+}
+
+fn has_forget(out: &serde_json::Value, forget: serde_json::Value) -> bool {
+    out["do"].as_array().unwrap().iter().any(|thing| thing.get("forget") == Some(&forget))
+}
+
+fn hands_a_login(out: &serde_json::Value) -> bool {
+    out["do"].as_array().unwrap().iter().any(|thing| thing["hand"].get("login").is_some())
+}
+
+#[test]
+fn take3_an_unknown_member_in_the_kept_music_login_forgets_what_was_saved() {
     let mut saved_json = serde_json::to_value(saved(4)).unwrap();
     saved_json["music"]["unexpected"] = serde_json::json!(1);
-    assert_eq!(client.call_json(start_json(saved_json).to_string().as_bytes()), br#"{"error":"input"}"#.to_vec());
-    assert!(client.max_body_for(1).is_none(), "nothing was started");
+    let (_, out) = json_start(serde_json::json!({"saved": saved_json}));
+    assert!(out.get("error").is_none(), "the start is never refused for what was kept: {out}");
+    assert!(has_forget(&out, serde_json::json!("saved")));
+    assert!(!hands_a_login(&out), "nothing is handed");
+    let shown = out["do"].as_array().unwrap().iter().find_map(|thing| thing.get("show")).unwrap();
+    assert_eq!(shown["screen"], "sign_in");
+    // An older form of it, likewise.
     let mut saved_json = serde_json::to_value(saved(4)).unwrap();
     saved_json["music"]["token"] = serde_json::json!("not hex");
-    assert_eq!(client.call_json(start_json(saved_json).to_string().as_bytes()), br#"{"error":"input"}"#.to_vec());
+    let (_, out) = json_start(serde_json::json!({"saved": saved_json}));
+    assert!(has_forget(&out, serde_json::json!("saved")) && !hands_a_login(&out));
+}
+
+#[test]
+fn take3_an_unreadable_device_key_beside_a_good_saved_is_forgotten_and_the_music_handed() {
+    let saved_json = serde_json::to_value(saved(4)).unwrap();
+    // The form of 763325d: the key as a bare hex string.
+    let (_, out) = json_start(serde_json::json!({"device_secret": hex(&[0xd5; 32]), "saved": saved_json}));
+    assert!(out.get("error").is_none(), "{out}");
+    assert_eq!(out["do"][0]["hand"]["login"]["login"]["count"], 4, "the player first");
+    assert!(has_forget(&out, serde_json::json!("device_secret")));
+    // A new one is made, for whichever backend is signed in to next.
+    assert!(out["do"].as_array().unwrap().iter().any(|thing| thing["keep"].get("device_secret").is_some()));
+}
+
+#[test]
+fn take3_an_unreadable_note_beside_a_good_saved_is_forgotten_by_its_place() {
+    let saved_json = serde_json::to_value(saved(4)).unwrap();
+    let good = serde_json::to_value(Note { request: 5, revoke: SignOutNote { session: SessionId::new(99).unwrap(), secret: SignOutSecret::from_bytes([3; 32]) }, nexus: NEXUS.to_owned(), backend_id: backend().to_hex(), restore: 1, made_ms: START_MS }).unwrap();
+    let (_, out) = json_start(serde_json::json!({"saved": saved_json, "notes": [good, {"older": "form"}]}));
+    assert!(out.get("error").is_none(), "{out}");
+    assert_eq!(out["do"][0]["hand"]["login"]["login"]["count"], 4);
+    assert!(has_forget(&out, serde_json::json!({"unreadable_note": {"index": 1}})));
+    assert!(!has_forget(&out, serde_json::json!({"note": {"backend_id": backend().to_hex(), "session": 99}})), "the good one is kept");
+}
+
+#[test]
+fn take1_two_spellings_of_an_address_are_one_address() {
+    // Saved with the trailing slash; the note without: one hello, and both trusted from it.
+    let mut kept = kept_signed_in(4);
+    if let Some(saved) = kept.saved.as_mut() {
+        saved.nexus = format!("{NEXUS}/");
+    }
+    kept.notes = vec![Note { request: 5, revoke: SignOutNote { session: SessionId::new(99).unwrap(), secret: SignOutSecret::from_bytes([3; 32]) }, nexus: NEXUS.to_owned(), backend_id: backend().to_hex(), restore: 1, made_ms: START_MS }];
+    let mut rig = Rig::new(DeviceKind::Pc);
+    let out = rig.start(kept);
+    assert_eq!(asks_to(&out, proto::HELLO), 1, "{out:?}");
+    let verify = ask_to(&out, proto::HELLO).id;
+    let out = rig.reply(verify, hello());
+    assert_eq!(asks_to(&out, account::LIST_DEVICES), 1);
+    let tell = ask_to(&out, account::SIGN_OUT).id;
+    // A sign-in hello typed the other way that names another backend refuses the note too.
+    rig.press(Press::SignOut);
+    let hello_ask = ask_to(&rig.press(sign_in("nexus.example.org", EMAIL)), proto::HELLO).id;
+    rig.reply(hello_ask, hello_from(stranger(), &["accounts"]));
+    assert!(!rig.client.waits_for(tell));
+}
+
+#[test]
+fn take2_a_clock_set_back_does_not_make_a_sign_out_drop_its_own_note() {
+    let notes: Vec<Note> = (1..=4)
+        .map(|n| Note {
+            request: n,
+            revoke: SignOutNote { session: SessionId::new(100 + n).unwrap(), secret: SignOutSecret::from_bytes([n as u8; 32]) },
+            nexus: NEXUS.to_owned(),
+            backend_id: backend().to_hex(),
+            restore: 1,
+            made_ms: START_MS + 1000 * n,
+        })
+        .collect();
+    let mut rig = Rig::new(DeviceKind::Pc);
+    let mut kept = kept_signed_in(4);
+    kept.notes = notes;
+    rig.start(kept);
+    // The clock is now before all four.
+    let out = rig.press(Press::SignOut);
+    let new = kept_note(&out).unwrap();
+    assert_eq!(new.session(), SESSION_ID);
+    assert!(!forgets(&out).contains(&note_forget(SESSION_ID)), "its own note is kept: {out:?}");
+    assert!(forgets(&out).contains(&note_forget(101)), "the oldest of the four before it goes");
 }
 
 #[test]
