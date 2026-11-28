@@ -338,3 +338,6 @@ mod checksum_tests {
         assert_eq!(download(&installer(b"", None), |_| {}).unwrap_err(), NO_CHECKSUM);
     }
 }
+
+#[cfg(test)]
+mod network_tests;
