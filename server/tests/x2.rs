@@ -2250,16 +2250,22 @@ fn form_1_is_exactly_what_the_deployed_build_creates() {
     assert_eq!(format!("{}\n", data::MIGRATIONS[0].sql.trim_start_matches('\n').trim_end_matches('\n')), deployed, "form 1 was edited: add a step instead");
 }
 
-/// Every table's columns, every index, trigger and table by name: what a form is.
+/// The form's table columns and its named objects, with index and trigger definitions.
 fn shape(connection: &rusqlite::Connection) -> Vec<String> {
-    let mut objects: Vec<(String, String)> = {
-        let mut statement = connection.prepare("SELECT type, name FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name").unwrap();
-        statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?))).unwrap().map(Result::unwrap).collect()
+    let objects: Vec<(String, String, Option<String>)> = {
+        let mut statement = connection.prepare(
+            "SELECT type, name, CASE WHEN type IN ('index', 'trigger') THEN sql END
+             FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+        ).unwrap();
+        statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap().map(Result::unwrap).collect()
     };
-    objects.sort();
     let mut out = Vec::new();
-    for (kind, name) in objects {
+    for (kind, name, definition) in objects {
         out.push(format!("{kind} {name}"));
+        if let Some(definition) = definition {
+            out.push(definition);
+        }
         if kind == "table" {
             let mut statement = connection.prepare(&format!("PRAGMA table_xinfo({name})")).unwrap();
             let columns: Vec<String> = statement
@@ -2271,6 +2277,22 @@ fn shape(connection: &rusqlite::Connection) -> Vec<String> {
         }
     }
     out
+}
+
+#[test]
+fn schema_shape_detects_redefined_indexes_and_triggers() {
+    let connection = rusqlite::Connection::open_in_memory().unwrap();
+    connection.execute_batch(
+        "CREATE TABLE rows (number INTEGER);
+         CREATE INDEX by_number ON rows(number);
+         CREATE TRIGGER keep_row AFTER INSERT ON rows BEGIN SELECT 1; END;",
+    ).unwrap();
+    let original = shape(&connection);
+    connection.execute_batch("DROP INDEX by_number; CREATE INDEX by_number ON rows(number) WHERE number > 0;").unwrap();
+    let new_index = shape(&connection);
+    assert_ne!(new_index, original);
+    connection.execute_batch("DROP TRIGGER keep_row; CREATE TRIGGER keep_row AFTER INSERT ON rows BEGIN SELECT 2; END;").unwrap();
+    assert_ne!(shape(&connection), new_index);
 }
 
 fn form_of(root: &Root) -> i64 {

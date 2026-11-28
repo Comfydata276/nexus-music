@@ -24,13 +24,18 @@ use zeroize::Zeroizing;
 
 use super::music::{answer, caller, live_admin, not_dealt_with, refused};
 use super::session::{Accounts, Answer};
+use super::setup::derive;
 use crate::events::respond;
 use crate::store::{data, keeper::Keeper};
 
-const MAX_CANDIDATES: usize = 100_000;
-const MAX_RANKING_TEXT: usize = 12 * 1024 * 1024;
+// The ranking owns at most one set of display strings per candidate, each
+// already bounded by the journal's event size. Input text cannot exhaust a
+// separate budget before this many starts have been considered.
+const MAX_OVERVIEW_CANDIDATES: usize = 32_000;
+// Leave room to skip backdated starts above the cursor's watermark.
+const MAX_PAGE_CANDIDATES: usize = 40_000;
 const MAX_READ_TIME: Duration = Duration::from_secs(2);
-const CURSOR_PAYLOAD: usize = 32;
+const CURSOR_PAYLOAD: usize = 48;
 const CURSOR_BYTES: usize = CURSOR_PAYLOAD + 32;
 
 #[derive(Clone)]
@@ -61,8 +66,6 @@ async fn listening(State(calls): State<Calls>, headers: HeaderMap, body: Bytes) 
         let request = admin::read::<Request>(&body).map_err(|_| Refusal::Malformed)?;
         calls.accounts.admin_live(&request.head.speaks, request.head.restore, &hash)?;
 
-        // Hold this through the blocking work even if the HTTP caller goes away.
-        let place = calls.readers.try_acquire_owned().map_err(|_| busy())?;
         let clock = calls.accounts.clock.clone();
         let head = RequestHead { speaks: request.head.speaks, restore: request.head.restore };
         let lookup = hash.clone();
@@ -74,10 +77,12 @@ async fn listening(State(calls): State<Calls>, headers: HeaderMap, body: Bytes) 
                 backend: keeper.backend(),
                 restore: keeper.restore(),
                 now: keeper.clock(now).effective(),
-                key: Zeroizing::new(keeper.seal_key()),
+                key: derive(&keeper.seal_key(), b"Nexus Music listening cursor key v1\0"),
             })
         }).await.map_err(|_| busy())??;
 
+        // Check authority first, then hold the slot through the blocking read.
+        let place = calls.readers.try_acquire_owned().map_err(|_| busy())?;
         let head = RequestHead { speaks: request.head.speaks, restore: request.head.restore };
         let (changes, reply) = tokio::task::spawn_blocking(move || {
             let _place = place;
@@ -134,6 +139,7 @@ impl Mode {
 struct Window {
     end: u64,
     watermark: u64,
+    floor: (u64, u64),
     after: (u64, u64),
 }
 
@@ -146,7 +152,7 @@ struct Scope<'a> {
 impl Scope<'_> {
     fn mac(&self, mode: Mode, fields: &[u8]) -> Result<Hmac<Sha256>, Refusal> {
         let mut mac = Hmac::<Sha256>::new_from_slice(self.reader.key.as_ref()).map_err(not_dealt_with)?;
-        mac.update(b"Nexus listening cursor v1\0");
+        mac.update(b"Nexus listening cursor v2\0");
         mac.update(self.reader.backend.as_bytes());
         mac.update(&self.reader.restore.to_be_bytes());
         mac.update(&self.account.map_or(0, AccountId::get).to_be_bytes());
@@ -159,7 +165,7 @@ impl Scope<'_> {
     fn cursor(&self, mode: Mode, window: Window, after: (u64, u64)) -> Result<Cursor, Refusal> {
         let mut raw = [0; CURSOR_BYTES];
         for (chunk, value) in raw[..CURSOR_PAYLOAD].chunks_exact_mut(8)
-            .zip([window.end, window.watermark, after.0, after.1])
+            .zip([window.end, window.watermark, window.floor.0, window.floor.1, after.0, after.1])
         {
             chunk.copy_from_slice(&value.to_be_bytes());
         }
@@ -175,7 +181,10 @@ impl Scope<'_> {
         self.mac(mode, fields)?.verify_slice(tag).map_err(|_| Refusal::Malformed)?;
         let word = |at: usize| fields[at..at + 8].try_into().map(u64::from_be_bytes)
             .map_err(|_| Refusal::Malformed);
-        Ok(Window { end: word(0)?, watermark: word(8)?, after: (word(16)?, word(24)?) })
+        Ok(Window {
+            end: word(0)?, watermark: word(8)?,
+            floor: (word(16)?, word(24)?), after: (word(32)?, word(40)?),
+        })
     }
 }
 
@@ -205,7 +214,10 @@ impl Reader {
                     "SELECT row_id FROM listening_events ORDER BY row_id DESC LIMIT 1",
                     [], |row| row.get::<_, i64>(0),
                 ).optional().map_err(not_dealt_with)?.unwrap_or(0) as u64;
-                (Mode::Overview, Window { end: self.now, watermark, after: (self.now, i64::MAX as u64) })
+                (Mode::Overview, Window {
+                    end: self.now, watermark, floor: (scope.days.start_ms(self.now), 0),
+                    after: (self.now, i64::MAX as u64),
+                })
             }
         };
         let result = scan(&snapshot, &scope, mode, window)?;
@@ -217,9 +229,9 @@ impl Reader {
 #[derive(Default)]
 struct Results {
     people: HashMap<AccountId, Option<Counter>>,
-    artists: HashMap<Text, u64>,
-    albums: HashMap<(Text, Text), u64>,
-    songs: HashMap<(Text, Text, Text), u64>,
+    artists: HashMap<Arc<Text>, u64>,
+    albums: HashMap<(Arc<Text>, Arc<Text>), u64>,
+    songs: HashMap<(Arc<Text>, Arc<Text>, Arc<Text>), u64>,
     recent: Vec<Play>,
     starts: u64,
 }
@@ -233,18 +245,21 @@ fn count<K: Eq + std::hash::Hash>(map: &mut HashMap<K, u64>, key: K) {
     *map.entry(key).or_default() += 1;
 }
 
-fn scan(db: &Connection, scope: &Scope<'_>, mode: Mode, window: Window) -> Result<Answer, Refusal> {
+fn scan(db: &Connection, scope: &Scope<'_>, mode: Mode, mut window: Window) -> Result<Answer, Refusal> {
     let started = Instant::now();
     let mut found = Results::default();
-    let start = scope.days.start_ms(window.end);
-    let (seek_ms, seek_id) = if mode == Mode::Recent {
-        window.after
+    if window.end == 0 {
+        return found.reply(scope, mode, window, None);
+    }
+    let capacity = if mode == Mode::Overview { MAX_OVERVIEW_CANDIDATES } else { MAX_PAGE_CANDIDATES };
+    let (through_ms, through_id) = if mode == Mode::Recent {
+        (window.after.0, window.after.1 - 1)
     } else {
-        (window.end, i64::MAX as u64)
+        (window.end - 1, i64::MAX as u64)
     };
-    let mut params = vec![start, window.end, seek_ms, seek_id, MAX_CANDIDATES as u64 + 1];
+    let mut params = vec![window.floor.0, window.floor.1, through_ms, through_id, capacity as u64 + 1];
     let (index, filter) = match scope.account {
-        Some(account) if account.get() > i64::MAX as u64 => return found.reply(scope, mode, window),
+        Some(account) if account.get() > i64::MAX as u64 => return found.reply(scope, mode, window, None),
         Some(account) => {
             params.push(account.get());
             ("listening_recent", "AND account = ?6")
@@ -257,20 +272,29 @@ fn scan(db: &Connection, scope: &Scope<'_>, mode: Mode, window: Window) -> Resul
     };
     let mut query = db.prepare(&format!(
         "SELECT row_id, account, at_ms {track} FROM listening_events INDEXED BY {index}
-         WHERE is_start = 1 {filter} AND at_ms >= ?1 AND at_ms < ?2 AND (at_ms, row_id) < (?3, ?4)
+         WHERE is_start = 1 {filter}
+           AND (at_ms, row_id) >= (?1, ?2) AND (at_ms, row_id) <= (?3, ?4)
          ORDER BY at_ms DESC, row_id DESC LIMIT ?5",
     )).map_err(not_dealt_with)?;
     let mut rows = query.query(params_from_iter(params)).map_err(not_dealt_with)?;
     let mut people = db.prepare("SELECT shown FROM accounts WHERE number = ?1 AND history_held = 0")
         .map_err(not_dealt_with)?;
     let mut seen = 0;
-    let mut text_bytes = 0;
+    let mut last = (window.end, 0);
     while let Some(row) = rows.next().map_err(not_dealt_with)? {
-        seen += 1;
-        if seen > MAX_CANDIDATES || started.elapsed() >= MAX_READ_TIME {
-            return Err(busy());
+        if seen >= capacity || started.elapsed() >= MAX_READ_TIME {
+            if mode == Mode::Overview {
+                // Both cursors must use the same inclusive lower edge as the
+                // displayed totals, even after deletion or a backdated send.
+                window.floor = last;
+                return found.reply(scope, mode, window, Some(Limit::NewestStarts));
+            }
+            return Results::default().reply(scope, mode, window, Some(Limit::ContinuationWork));
         }
+        seen += 1;
         let row_id = number(row, 0)?;
+        let at_ms = number(row, 2)?;
+        last = (at_ms, row_id);
         if row_id > window.watermark {
             continue;
         }
@@ -297,20 +321,16 @@ fn scan(db: &Connection, scope: &Scope<'_>, mode: Mode, window: Window) -> Resul
             let title: String = row.get(3).map_err(not_dealt_with)?;
             let artist: String = row.get(4).map_err(not_dealt_with)?;
             let album: String = row.get(5).map_err(not_dealt_with)?;
-            text_bytes += title.len() + artist.len() + album.len();
-            if text_bytes > MAX_RANKING_TEXT {
-                return Err(busy());
-            }
-
             let text = |value| Text::new(value).ok_or(Refusal::NotDealtWith);
             let (title, artist, album) = (text(title)?, text(artist)?, text(album)?);
             if take_recent {
                 found.recent.push(Play {
-                    id: row_id, at_ms: number(row, 2)?, account, name: person.name.clone(),
+                    id: row_id, at_ms, account, name: person.name.clone(),
                     title: title.clone(), artist: artist.clone(), album: album.clone(),
                 });
             }
             if mode == Mode::Overview {
+                let (title, artist, album) = (Arc::new(title), Arc::new(artist), Arc::new(album));
                 count(&mut found.artists, artist.clone());
                 count(&mut found.albums, (artist.clone(), album.clone()));
                 count(&mut found.songs, (artist, album, title));
@@ -321,11 +341,7 @@ fn scan(db: &Connection, scope: &Scope<'_>, mode: Mode, window: Window) -> Resul
         }
     }
 
-    let reply = found.reply(scope, mode, window)?;
-    if started.elapsed() >= MAX_READ_TIME {
-        return Err(busy());
-    }
-    Ok(reply)
+    found.reply(scope, mode, window, None)
 }
 
 fn number(row: &rusqlite::Row<'_>, column: usize) -> Result<u64, Refusal> {
@@ -351,7 +367,8 @@ fn bounded<T, const N: usize>(rows: Vec<T>) -> Result<Rows<T, N>, Refusal> {
 }
 
 impl Results {
-    fn reply(mut self, scope: &Scope<'_>, mode: Mode, window: Window) -> Result<Answer, Refusal> {
+    fn reply(mut self, scope: &Scope<'_>, mode: Mode, window: Window, limit: Option<Limit>) -> Result<Answer, Refusal> {
+        let page_limit = limit.filter(|_| mode != Mode::Overview);
         let recent = if mode == Mode::People {
             None
         } else {
@@ -360,7 +377,7 @@ impl Results {
             let next = self.recent.last().filter(|_| more).map(|last| {
                 scope.cursor(Mode::Recent, window, (last.at_ms, last.id))
             }).transpose()?;
-            Some(RecentPage { rows: bounded(self.recent)?, next })
+            Some(RecentPage { rows: bounded(self.recent)?, next, limit: page_limit })
         };
         if mode == Mode::Recent {
             return Ok(answer(Reply::Done(recent.ok_or(Refusal::NotDealtWith)?)));
@@ -377,7 +394,7 @@ impl Results {
         let next = people.last().filter(|_| more).map(|last| {
             scope.cursor(Mode::People, window, (last.starts, last.account.get()))
         }).transpose()?;
-        let people = PeoplePage { rows: bounded(people)?, next };
+        let people = PeoplePage { rows: bounded(people)?, next, limit: page_limit };
         if mode == Mode::People {
             return Ok(answer(Reply::Done(people)));
         }
@@ -386,9 +403,16 @@ impl Results {
             start_ms: scope.days.start_ms(window.end),
             end_ms: window.end,
             starts: self.starts,
-            artists: bounded(top(self.artists).into_iter().map(|(artist, starts)| Artist { artist, starts }).collect())?,
-            albums: bounded(top(self.albums).into_iter().map(|((artist, album), starts)| Album { artist, album, starts }).collect())?,
-            songs: bounded(top(self.songs).into_iter().map(|((artist, album, title), starts)| Song { artist, album, title, starts }).collect())?,
+            limit,
+            artists: bounded(top(self.artists).into_iter().map(|(artist, starts)| Artist {
+                artist: Arc::unwrap_or_clone(artist), starts,
+            }).collect())?,
+            albums: bounded(top(self.albums).into_iter().map(|((artist, album), starts)| Album {
+                artist: Arc::unwrap_or_clone(artist), album: Arc::unwrap_or_clone(album), starts,
+            }).collect())?,
+            songs: bounded(top(self.songs).into_iter().map(|((artist, album, title), starts)| Song {
+                artist: Arc::unwrap_or_clone(artist), album: Arc::unwrap_or_clone(album), title: Arc::unwrap_or_clone(title), starts,
+            }).collect())?,
             people,
             recent: recent.ok_or(Refusal::NotDealtWith)?,
         })))

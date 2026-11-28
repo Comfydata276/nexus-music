@@ -1012,6 +1012,9 @@ mod listening {
 
         // No request body is sent. The S9c gate gives the same refusal as on
         // the other admin routes before it asks for the declared body.
+        let missing = response(fixture.request(wire::PATH, None, BROWSER, 100));
+        assert_eq!(missing.0, 401);
+        assert_eq!(missing, response(fixture.request(admin::LIST_ACCOUNTS, None, BROWSER, 100)));
         let app = fixture.request(wire::PATH, Some(&owner.session), BROWSER, 100);
         let other_admin = fixture.request(admin::LIST_ACCOUNTS, Some(&owner.session), BROWSER, 100);
         let refused = response(app);
@@ -1064,6 +1067,7 @@ mod listening {
         for (days, count) in [(7, 4), (30, 6), (90, 7)] {
             let result = overview(&fixture, &page_session, &stamp, None, days);
             assert_eq!((result.start_ms, result.end_ms, result.starts), (end - days * DAY, end, count));
+            assert!(result.limit.is_none());
         }
         let scoped = overview(&fixture, &page_session, &stamp, Some(member.person.id), 30);
         assert_eq!(scoped.starts, 3);
@@ -1091,6 +1095,103 @@ mod listening {
 
     const SEED: &str = "INSERT INTO listening_events(account,device,event_id,at_ms,is_start,line)
                         VALUES (?1,1,?2,?3,1,?4)";
+
+    #[test]
+    fn one_member_with_long_display_text_keeps_every_overview_available_and_exact() {
+        let mut fixture = Fixture::new("listening-long-text");
+        let code = fixture.set_up();
+        let member_code = fixture.other();
+        let clock = fixture.start_with_clock();
+        let (member, stamp) = fixture.sign_in(with_code(member_code), 1);
+        let (page, page_stamp) = fixture.sign_in_with(with_code(code), 2, BROWSER);
+        assert!(!member.person.admin);
+        let at = clock.load(Ordering::SeqCst) - 1;
+        let long = "🦊".repeat(200);
+        for first in (1..=8_000).step_by(200) {
+            let rows: Vec<_> = (first..first + 200).map(|n| {
+                Record::new(id(n), at, Kind::Start {
+                    song_id: n.to_string(), title: format!("{n:05}{long}"),
+                    artist: long.clone(), album: long.clone(), from: PlayedFrom::Queue,
+                    began: Began::PressedHere, sound: Sound::Streamed, position_ms: 0,
+                }).unwrap().place(n).unwrap()
+            }).collect();
+            let sent = batch(&stamp, &rows);
+            assert_outcomes(send(&fixture, &member, &sent), &sent, &[Outcome::Taken; 200]);
+        }
+        let former_budget: i64 = fixture.db().query_row(
+            "SELECT sum(length(cast(json_extract(line,'$.event.title') AS BLOB))
+                + length(cast(json_extract(line,'$.event.artist') AS BLOB))
+                + length(cast(json_extract(line,'$.event.album') AS BLOB)))
+             FROM listening_events",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert!(former_budget > 12 * 1024 * 1024);
+        for days in [7, 30, 90] {
+            let result = overview(&fixture, &page, &page_stamp, None, days);
+            assert_eq!(result.starts, 8_000);
+            assert!(result.limit.is_none());
+            assert_eq!(result.people.rows.as_slice()[0].account, member.person.id);
+        }
+    }
+
+    #[test]
+    fn a_sample_and_an_exhausted_continuation_return_closed_limits() {
+        let mut fixture = Fixture::new("listening-limits");
+        let code = fixture.set_up();
+        let start = now();
+        let at = start - 60_000;
+        let mut keeper = open_store(&fixture, start);
+        let owner = keeper.account_named(EMAIL).unwrap().unwrap();
+        let others: Vec<_> = (0..26).map(|n| {
+            keeper.make_account(&format!("sample-{n}@example.org"), "Listener", false, First::Nothing, start).unwrap()
+        }).collect();
+        keeper.write_data(start, |db| {
+            let mut row = db.prepare(SEED)?;
+            for n in 1..=32_000 {
+                insert_seed(&mut row, owner as i64, [song(n, at, "In sample", "Artist")])?;
+            }
+            for &account in &others[..25] {
+                insert_seed(&mut row, account as i64, [song(1, at + 1, "In sample", "Artist")])?;
+            }
+            insert_seed(&mut row, others[25] as i64, [song(1, at - 1, "Outside sample", "Artist")])?;
+            Ok(((), true))
+        }).unwrap();
+        keeper.close();
+        fixture.start_with_clock();
+        let (page, stamp) = fixture.sign_in_with(with_code(code), 1, BROWSER);
+
+        let first = overview(&fixture, &page, &stamp, None, 7);
+        assert_eq!(first.starts, 32_000);
+        assert!(matches!(first.limit, Some(wire::Limit::NewestStarts)));
+        assert_eq!(first.songs.as_slice()[0].starts, 32_000);
+        let token = first.people.next.as_ref().unwrap();
+        let next_people = || wire::Page::People(wire::Cursor::new(token.as_str().to_owned()).unwrap());
+        let (status, body) = query(&fixture, &page, &stamp, None, 7, Some(next_people()));
+        let admin::Reply::Done(next) = admin::read_reply::<wire::PeoplePage>(status, &body).unwrap()
+            else { panic!("people page refused") };
+        assert!(next.limit.is_none() && next.next.is_none());
+        assert_eq!(next.rows.as_slice().len(), 1);
+        assert_eq!(next.rows.as_slice()[0].account.get(), others[24]);
+
+        // Backdated starts above the cursor's watermark consume the page's
+        // scan budget without becoming part of the frozen sample.
+        fixture.stop();
+        let mut keeper = open_store(&fixture, now());
+        keeper.write_data(now(), |db| {
+            let mut row = db.prepare(SEED)?;
+            for n in 32_001..=40_001 {
+                insert_seed(&mut row, owner as i64, [song(n, at + 2, "Sent later", "Artist")])?;
+            }
+            Ok(((), true))
+        }).unwrap();
+        keeper.close();
+        fixture.start_with_clock();
+        let (status, body) = query(&fixture, &page, &stamp, None, 7, Some(next_people()));
+        let admin::Reply::Done(stopped) = admin::read_reply::<wire::PeoplePage>(status, &body).unwrap()
+            else { panic!("limited people page refused") };
+        assert!(matches!(stopped.limit, Some(wire::Limit::ContinuationWork)));
+        assert!(stopped.rows.as_slice().is_empty() && stopped.next.is_none());
+    }
 
     fn delete_history(fixture: &Fixture, who: &SignedIn, stamp: &Stamp) {
         let request_id = RequestId::new(20).unwrap();
@@ -1124,6 +1225,49 @@ mod listening {
             head: head(stamp), request_id, grant, change: admin::DeleteTarget { account: target },
         }).unwrap();
         assert_eq!(fixture.post_with(admin::DELETE_ACCOUNT, Some(who), BROWSER, body.bytes()).0, 200);
+    }
+
+    #[test]
+    fn a_demoted_administrator_cannot_continue_listening_pages() {
+        let mut fixture = Fixture::new("listening-demotion");
+        let code = fixture.set_up();
+        let start = now();
+        let mut keeper = open_store(&fixture, start);
+        let owner = keeper.account_named(EMAIL).unwrap().unwrap();
+        let (second_code, print) = make_code(&CodeKey::of(&keeper)).unwrap();
+        keeper.make_account(OTHER, "Other admin", true, First::Code(&print, start + 600_000), start).unwrap();
+        keeper.write_data(start, |db| {
+            let mut row = db.prepare(SEED)?;
+            for n in 1..=26 {
+                insert_seed(&mut row, owner as i64, [song(n, start - 1, "Song", "Artist")])?;
+            }
+            Ok(((), true))
+        }).unwrap();
+        keeper.close();
+        fixture.start_with_clock();
+        let (owner, owner_stamp) = fixture.sign_in_with(with_code(code), 1, BROWSER);
+        let (second, stamp) = fixture.sign_in_with(with_code(second_code), 2, BROWSER);
+        let first = overview(&fixture, &second, &stamp, None, 7);
+        let cursor = first.recent.next.unwrap();
+
+        let request_id = RequestId::new(22).unwrap();
+        let demote = || admin::AdminRole { account: second.person.id, admin: false };
+        let grant_request = admin::encode(&admin::RequestGrant {
+            head: head(&owner_stamp), password: Password::presented(PASSWORD).unwrap(),
+            change: admin::NamedChange { request_id, action: admin::Action::SetAdmin(demote()) },
+        }).unwrap();
+        let (status, body) = fixture.post_with(admin::REQUEST_GRANT, Some(&owner), BROWSER, grant_request.bytes());
+        let admin::Reply::Done(GrantIssued { grant }) = admin::read_reply(status, &body).unwrap()
+            else { panic!("demotion grant refused") };
+        let apply = admin::encode(&admin::SetAdmin {
+            head: head(&owner_stamp), request_id, grant, change: demote(),
+        }).unwrap();
+        assert_eq!(fixture.post_with(admin::SET_ADMIN, Some(&owner), BROWSER, apply.bytes()).0, 200);
+
+        let refused = query(&fixture, &second, &stamp, None, 7, Some(wire::Page::Recent(cursor)));
+        assert!(matches!(refused.0, 401 | 403));
+        let list = admin::encode(&admin::ListAccounts { head: head(&stamp), after: None }).unwrap();
+        assert_eq!(refused, fixture.post_with(admin::LIST_ACCOUNTS, Some(&second), BROWSER, list.bytes()));
     }
 
     #[test]
