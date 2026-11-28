@@ -594,7 +594,7 @@ export component MainWindow inherits Window {
             }
         }
 
-        if !App.signed-in: LoginPage { }
+        if !App.signed-in || App.show-sign-in || App.choosing-password: LoginPage { }
 
         // Above everything else, including the sign-in screen: it's how the window is moved
         // and closed.

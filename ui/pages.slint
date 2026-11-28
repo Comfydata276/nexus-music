@@ -2743,18 +2743,129 @@ export component SettingsPage inherits Rectangle {
 
                     // ---- Account ----
                     if Settings.tab == 6: VerticalLayout {
+                        // The Nexus server: who is signed in, and how it stands (src/nexus/).
                         SettingRow {
-                            title: App.server;
-                            detail: "Signed in as " + App.username + (App.server-version != "" ? ", Navidrome " + App.server-version : "") + (Settings.connection != "" ? ". " + Settings.connection : "");
-                            TextButton {
+                            title: "Nexus server";
+                            detail: (Settings.nexus-who != "" ? "Signed in as " + Settings.nexus-who + (App.nexus-address != "" ? " at " + App.nexus-address : "") : App.nexus-address)
+                                + (Settings.nexus-row != "" ? ". " + Settings.nexus-row : "")
+                                + (Settings.nexus-music != "" ? "\n" + Settings.nexus-music : "");
+                            if !App.nexus-sign-in-wanted: TextButton {
                                 text: "Sign out";
                                 clicked => { App.sign-out(); }
+                            }
+                            if App.nexus-sign-in-wanted: TextButton {
+                                primary: true;
+                                text: "Sign in";
+                                clicked => { App.show-sign-in = true; }
                             }
                         }
 
                         if Settings.nexus-server != "" && Settings.nexus-for == (App.signed-in ? App.server + "\n" + App.username : ""): SettingRow {
-                            title: "Nexus server";
+                            nested: true;
+                            title: "Looked for";
                             detail: Settings.nexus-server;
+                        }
+
+                        SettingRow {
+                            title: "Music server";
+                            detail: App.server + ", as " + App.username + (App.server-version != "" ? ", Navidrome " + App.server-version : "") + (Settings.connection != "" ? ". " + Settings.connection : "")
+                                + ". Your Nexus server gave this PC its sign-in there; no music password is kept on this PC.";
+                        }
+
+                        SettingRow {
+                            title: "Your devices";
+                            detail: Settings.devices-note != "" ? Settings.devices-note : "The PCs and phones signed in to your account. Signing one out ends its sign-in at once.";
+                            TextButton {
+                                text: Settings.devices-busy ? "Looking…" : (Settings.devices.length > 0 ? "Refresh" : "Show");
+                                enabled: !Settings.devices-busy;
+                                clicked => { Settings.load-devices(); }
+                            }
+                        }
+
+                        for device in Settings.devices: SettingRow {
+                            nested: true;
+                            title: device.name + (device.here ? " (this PC)" : "");
+                            detail: device.detail;
+                            if device.can-force-out: TextButton {
+                                text: "Sign out";
+                                enabled: !Settings.devices-busy;
+                                clicked => { Settings.force-out(device.id); }
+                            }
+                        }
+
+                        password-row := SettingRow {
+                            in-out property <bool> open;
+                            title: "Change password";
+                            detail: Settings.password-note != "" ? Settings.password-note : "Your other devices are signed out when you change it.";
+                            TextButton {
+                                text: password-row.open && !Settings.password-changed ? "Cancel" : "Change";
+                                clicked => {
+                                    // (The form is made afresh, empty, each time it opens.)
+                                    password-row.open = !password-row.open || Settings.password-changed;
+                                }
+                            }
+                        }
+
+                        if password-row.open && !Settings.password-changed: SettingNest {
+                            password-form := VerticalLayout {
+                                in-out property <string> current;
+                                in-out property <string> new;
+                                in-out property <string> again;
+                                function save() {
+                                    Settings.change-password(self.current, self.new, self.again);
+                                    self.current = "";
+                                    self.new = "";
+                                    self.again = "";
+                                }
+                                spacing: 6px;
+                                max-width: 420px;
+
+                                Text {
+                                    text: "Present password";
+                                    color: Theme.text;
+                                    font-size: 13px;
+                                    font-weight: 600;
+                                }
+                                Field {
+                                    text <=> password-form.current;
+                                    input-type: InputType.password;
+                                    label: "Present password";
+                                }
+                                Text {
+                                    text: "New password";
+                                    color: Theme.text;
+                                    font-size: 13px;
+                                    font-weight: 600;
+                                }
+                                Field {
+                                    text <=> password-form.new;
+                                    input-type: InputType.password;
+                                    label: "New password";
+                                }
+                                Text {
+                                    text: "The new one again";
+                                    color: Theme.text;
+                                    font-size: 13px;
+                                    font-weight: 600;
+                                }
+                                Field {
+                                    text <=> password-form.again;
+                                    input-type: InputType.password;
+                                    label: "The new one again";
+                                    accepted => { password-form.save(); }
+                                }
+                                HorizontalLayout {
+                                    alignment: start;
+                                    padding-top: 6px;
+                                    TextButton {
+                                        primary: true;
+                                        height: 36px;
+                                        text: Settings.password-busy ? "Saving…" : "Save password";
+                                        enabled: !Settings.password-busy;
+                                        clicked => { password-form.save(); }
+                                    }
+                                }
+                            }
                         }
 
                         SettingRow {
@@ -3144,8 +3255,22 @@ export component JamPage inherits Rectangle {
     }
 }
 
+// The sign-in screen: the Nexus server's address, and an email and password, or the one-time
+// code the admin gave; then, after a code, choosing a password. Signing in is to the Nexus
+// server alone, which hands this PC what it needs to play. What is typed as a password goes
+// once, and the field is emptied when it is sent.
 export component LoginPage inherits Rectangle {
     background: Theme.base;
+    property <bool> code: false;
+    // What is typed, held here so that the button can read it whichever fields are showing.
+    property <string> address-in: App.nexus-address;
+    property <string> email-in: App.nexus-email;
+    property <string> password-in;
+    property <string> code-in;
+    property <string> new-in;
+    property <string> again-in;
+    // Small windows: less space around the form, and a smaller heading.
+    property <bool> short: self.height < 640px;
 
     // A wash of the brand colour behind the form.
     Rectangle {
@@ -3155,117 +3280,212 @@ export component LoginPage inherits Rectangle {
         y: -420px;
     }
 
-    VerticalLayout {
-        alignment: center;
+    // (Taken by the page so that a click outside the form does nothing behind it.)
+    TouchArea { }
 
-        HorizontalLayout {
+    form-scroll := ScrollView {
+        y: 32px;
+        height: parent.height - 32px;
+        vertical-scrollbar-policy: always-off;
+        horizontal-scrollbar-policy: always-off;
+
+        VerticalLayout {
             alignment: center;
+            min-height: form-scroll.visible-height;
+            padding-top: root.short ? 8px : 24px;
+            padding-bottom: root.short ? 8px : 24px;
 
-            VerticalLayout {
-                width: 380px;
-                spacing: 12px;
+            HorizontalLayout {
+                alignment: center;
 
-                HorizontalLayout {
-                    alignment: start;
-                    Rectangle {
-                        width: 48px;
-                        height: 48px;
-                        border-radius: 14px;
-                        background: Theme.accent;
-                        Icon {
-                            source: Icons.bars;
-                            size: 26px;
-                            tint: white;
+                VerticalLayout {
+                    width: min(380px, form-scroll.visible-width - 32px);
+                    spacing: root.short ? 8px : 12px;
+
+                    HorizontalLayout {
+                        alignment: start;
+                        visible: !root.short;
+                        height: root.short ? 0px : 48px;
+                        Rectangle {
+                            width: 48px;
+                            height: 48px;
+                            border-radius: 14px;
+                            background: Theme.accent;
+                            Icon {
+                                source: Icons.bars;
+                                size: 26px;
+                                tint: white;
+                            }
                         }
                     }
-                }
 
-                Text {
-                    text: "Connect to your Navidrome server";
-                    color: Theme.text;
-                    font-family: Theme.display;
-                    font-size: 34px;
-                    font-weight: 800;
-                    wrap: word-wrap;
-                }
+                    Text {
+                        text: App.choosing-password ? "Choose your password" : "Sign in to Nexus Music";
+                        color: Theme.text;
+                        font-family: Theme.display;
+                        font-size: root.short ? 26px : 34px;
+                        font-weight: 800;
+                        wrap: word-wrap;
+                    }
 
-                Text {
-                    text: "Nexus Music streams straight from the music library you host.";
-                    color: Theme.muted;
-                    font-size: 14px;
-                    wrap: word-wrap;
-                }
+                    Text {
+                        text: App.choosing-password
+                            ? "You signed in with a one-time code. Choose the password you'll sign in with from now on: at least 10 characters."
+                            : root.code ? "Type the address of your Nexus server, and the one-time code its admin gave you."
+                            : "Type the address of your Nexus server, and the email and password of your account there.";
+                        color: Theme.muted;
+                        font-size: 14px;
+                        wrap: word-wrap;
+                    }
 
-                Rectangle {
-                    height: 8px;
-                }
+                    if !App.choosing-password: Text {
+                        text: "Nexus server";
+                        color: Theme.text;
+                        font-size: 13px;
+                        font-weight: 600;
+                    }
 
-                Text {
-                    text: "Server address";
-                    color: Theme.text;
-                    font-size: 13px;
-                    font-weight: 600;
-                }
+                    if !App.choosing-password: Field {
+                        text <=> root.address-in;
+                        placeholder: "nexus.example.org";
+                        label: "Nexus server";
+                        accepted => { root.go(); }
+                    }
 
-                server := Field {
-                    text: App.server;
-                    placeholder: "http://192.168.1.10:4533";
-                    label: "Server address";
-                    accepted => { user.focus(); }
-                }
+                    if !App.choosing-password && !root.code: Text {
+                        text: "Email";
+                        color: Theme.text;
+                        font-size: 13px;
+                        font-weight: 600;
+                    }
 
-                Text {
-                    text: "Username";
-                    color: Theme.text;
-                    font-size: 13px;
-                    font-weight: 600;
-                }
+                    if !App.choosing-password && !root.code: Field {
+                        text <=> root.email-in;
+                        label: "Email";
+                        accepted => { root.go(); }
+                    }
 
-                user := Field {
-                    text: App.username;
-                    label: "Username";
-                    accepted => { password.focus(); }
-                }
+                    if !App.choosing-password && !root.code: Text {
+                        text: "Password";
+                        color: Theme.text;
+                        font-size: 13px;
+                        font-weight: 600;
+                    }
 
-                Text {
-                    text: "Password";
-                    color: Theme.text;
-                    font-size: 13px;
-                    font-weight: 600;
-                }
+                    if !App.choosing-password && !root.code: Field {
+                        text <=> root.password-in;
+                        input-type: InputType.password;
+                        label: "Password";
+                        accepted => { root.go(); }
+                    }
 
-                password := Field {
-                    input-type: InputType.password;
-                    label: "Password";
-                    accepted => { App.sign-in(server.text, user.text, password.text); }
-                }
+                    if !App.choosing-password && root.code: Text {
+                        text: "One-time code";
+                        color: Theme.text;
+                        font-size: 13px;
+                        font-weight: 600;
+                    }
 
-                if App.login-error != "": Text {
-                    text: App.login-error;
-                    color: Theme.danger;
-                    font-size: 13px;
-                    wrap: word-wrap;
-                }
+                    if !App.choosing-password && root.code: Field {
+                        text <=> root.code-in;
+                        label: "One-time code";
+                        placeholder: "ABCD EFGH 3479";
+                        accepted => { root.go(); }
+                    }
 
-                Rectangle {
-                    height: 4px;
-                }
+                    if App.choosing-password: Text {
+                        text: "New password";
+                        color: Theme.text;
+                        font-size: 13px;
+                        font-weight: 600;
+                    }
 
-                TextButton {
-                    text: App.login-busy ? "Connecting…" : "Connect";
-                    primary: true;
-                    enabled: !App.login-busy && server.text != "" && user.text != "" && password.text != "";
-                    height: 46px;
-                    clicked => { App.sign-in(server.text, user.text, password.text); }
-                }
+                    if App.choosing-password: Field {
+                        text <=> root.new-in;
+                        input-type: InputType.password;
+                        label: "New password";
+                        accepted => { root.go(); }
+                    }
 
-                Text {
-                    text: "Your password is kept in Windows Credential Manager on this PC.";
-                    color: Theme.faint;
-                    font-size: 12px;
-                    wrap: word-wrap;
+                    if App.choosing-password: Text {
+                        text: "The same again";
+                        color: Theme.text;
+                        font-size: 13px;
+                        font-weight: 600;
+                    }
+
+                    if App.choosing-password: Field {
+                        text <=> root.again-in;
+                        input-type: InputType.password;
+                        label: "The same again";
+                        accepted => { root.go(); }
+                    }
+
+                    if App.login-error != "": Text {
+                        text: App.login-error;
+                        color: Theme.danger;
+                        font-size: 13px;
+                        wrap: word-wrap;
+                    }
+
+                    Rectangle {
+                        height: 4px;
+                    }
+
+                    TextButton {
+                        text: App.login-busy ? (App.choosing-password ? "Saving…" : "Signing in…") : (App.choosing-password ? "Save password" : "Sign in");
+                        primary: true;
+                        enabled: !App.login-busy;
+                        height: 46px;
+                        clicked => { root.go(); }
+                    }
+
+                    HorizontalLayout {
+                        spacing: 16px;
+                        alignment: start;
+
+                        if !App.choosing-password: LinkText {
+                            text: root.code ? "Sign in with a password instead" : "I have a one-time code";
+                            enabled: !App.login-busy;
+                            clicked => {
+                                root.code = !root.code;
+                                App.login-error = "";
+                            }
+                        }
+                        if App.choosing-password: LinkText {
+                            text: "Cancel";
+                            clicked => { App.cancel-choose(); }
+                        }
+                        if !App.choosing-password && App.signed-in: LinkText {
+                            text: "Back";
+                            clicked => { App.show-sign-in = false; }
+                        }
+                    }
+
+                    Text {
+                        text: "Your password is sent once to your Nexus server, and kept nowhere on this PC. What this PC keeps of your sign-in is in Windows Credential Manager.";
+                        color: Theme.faint;
+                        font-size: 12px;
+                        wrap: word-wrap;
+                    }
                 }
             }
         }
+    }
+
+    // What the button does. The secret fields are emptied as they are sent.
+    function go() {
+        if App.login-busy { return; }
+        if App.choosing-password {
+            App.choose-password(root.new-in, root.again-in);
+        } else if root.code {
+            App.sign-in-code(root.address-in, root.code-in);
+        } else {
+            App.sign-in(root.address-in, root.email-in, root.password-in);
+        }
+        root.password-in = "";
+        root.code-in = "";
+        root.new-in = "";
+        root.again-in = "";
     }
 }

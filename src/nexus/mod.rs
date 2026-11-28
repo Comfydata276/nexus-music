@@ -185,6 +185,7 @@ pub fn install(ui: &ui::MainWindow) {
 /// At the app's end: a look still running is killed, and reaped without blocking for more
 /// than [`REAP`]. Called by `main` after the window has closed.
 pub fn shutdown() {
+    signin::stop();
     call::shutdown();
     let child = CHILD.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
     if let Some(mut child) = child {
@@ -742,7 +743,7 @@ mod tests {
         // `main` makes it, and ends its look at the app's end, only when it is switched on;
         // and the window tracks the account for it only once it is made.
         let main = include_str!("../main.rs");
-        assert!(main.contains("if nexus::switched_on() {\n        nexus::install(&controller.ui);"));
+        assert!(main.contains("let controller = controller::Controller::install(window);\n    // After the controller is made (and a kept sign-in entered), never by it.\n    nexus::install(&controller.ui);"));
         assert!(include_str!("../../ui/app.slint").contains("property <string> account: App.nexus-on && App.signed-in ?"));
     }
 }

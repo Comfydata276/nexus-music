@@ -978,8 +978,9 @@ impl Controller {
         // Come back signed in when a sign-in is kept: what the Nexus server handed this
         // device (design 6.1). It is read from this PC and its music login goes straight to
         // the music server; the Nexus server is asked nothing first.
-        if let Some(kept) = config::load_sign_in(&self.paths) {
-            let music = &kept.music;
+        if let Some(kept) = config::load_sign_in(&self.paths)
+            && let Some(music) = kept.plays()
+        {
             let client = Client::from_pair(&music.server, &music.username, &music.salt, &music.token);
             {
                 // (The settings name the music account the kept sign-in is for; a settings
@@ -1355,13 +1356,11 @@ impl Controller {
         });
     }
 
-    /// Signs in with what the Nexus server has just handed this device (design 9.4, 11): put
-    /// in place whole, in one step, then used as a cold start uses it. Called by the Nexus
-    /// server's component, which does the signing in; never by anything that plays. Says
-    /// whether it could be kept (if not, the next start begins at the sign-in screen).
-    pub fn signed_in_with(self: &Rc<Self>, kept: config::SignedIn) -> bool {
-        let saved = config::save_sign_in(&self.paths, &kept);
-        let music = &kept.music;
+    /// Signs in with a music login the Nexus server has just handed this device (design 9.4),
+    /// for the person whose things are under `folder`: used as a cold start uses it. Called
+    /// by the Nexus server's component, which does the signing in and has already kept it
+    /// (`config::save_sign_in`); never by anything that plays.
+    pub fn signed_in_with(self: &Rc<Self>, music: &config::MusicLogin, folder: &str, nexus: &str, email: &str) {
         let client = Client::from_pair(&music.server, &music.username, &music.salt, &music.token);
         if self.client().is_some() {
             self.leave("");
@@ -1370,17 +1369,24 @@ impl Controller {
             let mut settings = self.settings.borrow_mut();
             settings.server = client.server().to_string();
             settings.username = client.username().to_string();
-            settings.sign_in_address = kept.nexus.clone();
-            settings.sign_in_email = kept.account.clone();
+            settings.sign_in_address = nexus.to_string();
+            settings.sign_in_email = email.to_string();
         }
         self.save_settings();
-        *self.folder.borrow_mut() = kept.folder.clone();
+        *self.folder.borrow_mut() = folder.to_string();
         self.covers.reset();
         self.enter(client, None);
         // The server is plainly worth asking: stop treating it as out of reach, and send
         // whatever was being held for it.
         self.check_connection();
-        saved
+    }
+
+    /// The music login of this number was refused (the shared library's rule, design 6.3):
+    /// nothing more is sent with it, if it is the one in use.
+    pub fn music_set_aside(&self) {
+        if let Some(client) = self.client() {
+            client.set_aside();
+        }
     }
 
     /// The music server refused `client`'s sign-in (`Client::was_refused`): it sends nothing
@@ -1395,27 +1401,27 @@ impl Controller {
     }
 
     /// A new music login for the person signed in (the Nexus server's answer to a refusal,
-    /// or to its count having gone up): the kept sign-in put in place with it, whole, and the
-    /// client replaced by one built from it. The person's folder does not change with it.
-    /// Then the music server is tried once (design 6.3).
-    pub fn music_login_renewed(self: &Rc<Self>, kept: config::SignedIn) {
+    /// or to its number having gone up), already kept: the client replaced by one built from
+    /// it. The person's folder does not change with it. Then the music server is tried once
+    /// (design 6.3).
+    pub fn music_login_renewed(self: &Rc<Self>, music: &config::MusicLogin) {
         let Some(current) = self.client() else { return };
-        config::save_sign_in(&self.paths, &kept);
-        let music = &kept.music;
         let client = Client::from_pair(&music.server, &music.username, &music.salt, &music.token);
         if current.same_pair(&client) && !current.refused() {
             return;
         }
         if client.server() != current.server() || client.username() != current.username() {
-            // Another music server or user for the same person: the same folder, the music
-            // that is shown changes with it.
+            // Another music server or user for the same person: the same folder, and the
+            // music that is shown changes with it.
             {
                 let mut settings = self.settings.borrow_mut();
                 settings.server = client.server().to_string();
                 settings.username = client.username().to_string();
             }
             self.save_settings();
+            let folder = self.folder.borrow().clone();
             self.leave("");
+            *self.folder.borrow_mut() = folder;
             self.covers.reset();
             self.enter(client, None);
         } else {
@@ -2600,17 +2606,18 @@ impl Controller {
         app.set_signed_in(false);
     }
 
-    /// Signs out on this PC: what the Nexus server handed it at sign-in (the music login) is
-    /// forgotten, with the saved queue and Recently played. Downloads, settings and the play
-    /// log stay, for the next sign-in to the same account. Called by the Nexus server's
-    /// component, which has let go of the session first.
-    pub fn sign_out(self: &Rc<Self>) {
-        config::forget_sign_in(&self.paths);
+    /// Signs out on this PC: the music login is let go of, with the saved queue and Recently
+    /// played. Downloads, settings and the play log stay, for the next sign-in of the same
+    /// person. Called by the Nexus server's component, which has already forgotten what the
+    /// sign-in left (`config::save_sign_in`), when the person signs out or the Nexus server
+    /// says this PC's session has ended (design 11). `message` is said on the sign-in screen.
+    pub fn sign_out(self: &Rc<Self>, message: &str) {
         self.saver.remove(self.paths.queue.clone());
         self.saver.remove(self.paths.queue_place.clone());
         let _ = std::fs::remove_file(&self.paths.history);
         self.history.borrow_mut().clear();
-        self.leave("");
+        self.leave(message);
+        self.folder.borrow_mut().clear();
         // Signing in again starts from whatever the server has.
         self.queue_stamp.set(0);
         self.settings.borrow_mut().sync_playlist.clear();

@@ -135,19 +135,35 @@ export global App {
     in property <bool> signed-in;
     in property <string> server;
     in property <string> username;
-    // Set by the Nexus server's component when it is switched on (src/nexus.rs): only then
-    // does the window track the account for it.
+    // Set by the Nexus server's component when it is installed (src/nexus/): only then does
+    // the window track the account for it.
     in property <bool> nexus-on;
     // Called once the account in use has changed (see `account` in app.slint), for what
     // follows the account without being told by the controller: the Nexus server's
-    // component (src/nexus.rs).
+    // component (src/nexus/).
     callback account-changed();
     in property <string> server-version;
     in property <string> app-version;
-    in property <string> login-error;
+    // The sign-in screen (src/nexus/signin.rs): signing in is to the Nexus server, which
+    // hands this PC its music sign-in. The address and email last used are put back in it.
+    in property <string> nexus-address;
+    in property <string> nexus-email;
+    in-out property <string> login-error;
     in property <bool> login-busy;
-    callback sign-in(server: string, username: string, password: string);
+    callback sign-in(address: string, email: string, password: string);
+    callback sign-in-code(address: string, code: string);
+    // Signed in with a one-time code: a password is chosen, typed twice.
+    in property <bool> choosing-password;
+    callback choose-password(password: string, again: string);
+    callback cancel-choose();
     callback sign-out();
+    // Signed out of the Nexus server with the music still playing (its data was put back):
+    // the Account tab offers the sign-in screen, which is then shown over the app.
+    in property <bool> nexus-sign-in-wanted;
+    in-out property <bool> show-sign-in;
+    // The music server refused the music sign-in (src/subsonic.rs): the component asks the
+    // Nexus server for the current one.
+    callback music-login-refused();
 
     in property <Page> page: Page.home;
     // The current route, e.g. "home" or "playlist:abc"; the sidebar highlights from it.
@@ -624,6 +640,15 @@ export global Lyrics {
     in property <string> note;
 }
 
+// One of the person's devices, in the list under Settings, Account.
+export struct DeviceRow {
+    id: string,
+    name: string,
+    detail: string,
+    here: bool,
+    can-force-out: bool,
+}
+
 export struct QualityOption {
     title: string,
     detail: string,
@@ -636,6 +661,23 @@ export global Settings {
     // src/nexus.rs alone.
     in property <string> nexus-server;
     in property <string> nexus-for;
+    // The Nexus server, as its client says (src/nexus/signin.rs): the row ("Connected",
+    // "Not reachable since 14:02. Your music plays as usual"), who is signed in, and a
+    // sentence about the music sign-in when there is one.
+    in property <string> nexus-row;
+    in property <string> nexus-who;
+    in property <string> nexus-music;
+    // The person's devices, and forcing one out.
+    in property <[DeviceRow]> devices;
+    in property <bool> devices-busy;
+    in property <string> devices-note;
+    callback load-devices();
+    callback force-out(id: string);
+    // Changing the password.
+    in property <bool> password-busy;
+    in property <bool> password-changed;
+    in property <string> password-note;
+    callback change-password(current: string, new: string, again: string);
     in property <[QualityOption]> qualities;
     // Their names alone, for the control that chooses between them.
     in property <[string]> quality-names;

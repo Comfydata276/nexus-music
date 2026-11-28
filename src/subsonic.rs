@@ -380,6 +380,11 @@ impl Client {
         self.inner.refused.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Sends nothing more with this sign-in (the shared library's rule set it aside).
+    pub fn set_aside(&self) {
+        self.inner.refused.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// The music server said "wrong name or password" to this sign-in. The first time, the
     /// controller is told (once, on the window's thread), so that the current sign-in can be
     /// asked for; every request after it is refused here, unsent (design 6.3).
@@ -988,11 +993,22 @@ impl Client {
         Ok(all.into_iter().find(|l| !l.line.is_empty()))
     }
 
-    /// Fetches a small binary resource such as cover art.
+    /// Fetches a small binary resource such as cover art. A refused sign-in, which comes as
+    /// a success with a small JSON body, is told apart before anything is used as a picture
+    /// (design 6.3).
     pub fn fetch_bytes(&self, url: &str, limit: u64) -> ApiResult<Vec<u8>> {
         let mut response = self.get(url, Some(API_TIMEOUT))?;
         if !response.status().is_success() {
             return Err(ApiError::Network(format!("HTTP status {}.", response.status().as_u16())));
+        }
+        let is_json = response.headers().get("content-type").and_then(|v| v.to_str().ok()).is_some_and(|v| v.contains("json"));
+        if is_json && url.starts_with(&self.inner.base) {
+            let text = response.body_mut().with_config().limit(16 * 1024).read_to_string().unwrap_or_default();
+            if stream_refused_sign_in(&text) {
+                self.was_refused();
+                return Err(ApiError::Server { code: WRONG_SIGN_IN, message: "wrong name or password".into() });
+            }
+            return Err(ApiError::Server { code: 70, message: "not a picture".into() });
         }
         response
             .body_mut()
