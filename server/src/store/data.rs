@@ -63,7 +63,10 @@ pub const BUSY: Duration = Duration::from_secs(5);
 /// a put-back brings does not open), and the backend's music address people use
 /// (`meta.music_public`); its listening events and their count (S12, 13), deleted in the same
 /// step as the account's life moves on (a trigger) unless they are held (12.5); and its
-/// Diagnostics reports (S7, 14). **Room is left** for its switch for requests (step 4). No
+/// Diagnostics reports (S7, 14); and for requests (S13, written by it through `write_data`):
+/// their jobs and each job's lines, who asked for each release at which Lidarr (`binding`),
+/// and what is kept to undo an artist's setting. The switch for requests and the Lidarr key
+/// are authority, and are in the store kept apart alone. No
 /// password, code or session is kept but as a fingerprint; a music login only sealed.
 const FORM_1: &str = "
 CREATE TABLE meta (
@@ -76,8 +79,7 @@ CREATE TABLE meta (
     restored_at INTEGER,
     restored_from INTEGER,
     music_public TEXT,
-    diagnostics_default INTEGER CHECK (diagnostics_default IN (0, 1)),
-    requests_on INTEGER CHECK (requests_on IN (0, 1))
+    diagnostics_default INTEGER CHECK (diagnostics_default IN (0, 1))
 ) STRICT;
 CREATE TABLE accounts (
     number INTEGER PRIMARY KEY CHECK (number > 0),
@@ -185,6 +187,41 @@ CREATE TABLE diagnostic_reports (
 CREATE INDEX diagnostics_device ON diagnostic_reports (device, row_id DESC);
 CREATE INDEX diagnostics_account ON diagnostic_reports (account, row_id DESC);
 CREATE INDEX diagnostics_expiry ON diagnostic_reports (received_ms, row_id);
+CREATE TABLE requests_jobs (
+    id INTEGER PRIMARY KEY,
+    restore INTEGER NOT NULL,
+    account INTEGER NOT NULL,
+    session INTEGER NOT NULL,
+    request BLOB NOT NULL,
+    change BLOB NOT NULL,
+    work BLOB NOT NULL,
+    stage INTEGER NOT NULL DEFAULT 0,
+    result TEXT,
+    UNIQUE (restore, account, session, request)
+) STRICT;
+CREATE INDEX requests_jobs_stage ON requests_jobs (restore, stage, id);
+CREATE TABLE requests_owners (
+    binding BLOB NOT NULL,
+    account INTEGER NOT NULL REFERENCES accounts (number) ON DELETE CASCADE,
+    release TEXT NOT NULL,
+    asked_ms INTEGER NOT NULL,
+    PRIMARY KEY (binding, account, release)
+) STRICT, WITHOUT ROWID;
+CREATE INDEX requests_owners_release ON requests_owners (binding, release, account);
+CREATE TABLE requests_lines (
+    job INTEGER NOT NULL REFERENCES requests_jobs (id) ON DELETE CASCADE,
+    line INTEGER NOT NULL,
+    progress TEXT NOT NULL,
+    PRIMARY KEY (job, line)
+) STRICT, WITHOUT ROWID;
+CREATE TABLE requests_way_back (
+    id INTEGER PRIMARY KEY,
+    binding BLOB NOT NULL,
+    artist INTEGER NOT NULL,
+    artist_key TEXT NOT NULL,
+    setting TEXT NOT NULL,
+    UNIQUE (binding, artist)
+) STRICT;
 ";
 
 /// One change of form: from `form - 1` to `form`, as SQL run in one step.
@@ -715,8 +752,6 @@ pub enum Change<'a> {
     MusicPublic { address: &'a str },
     /// The admin's default for Diagnostics (14), backend-wide (`hello` says it). `persist` only.
     DiagnosticsDefault { on: bool },
-    /// The admin's switch for requests (step 4), backend-wide. `persist` only.
-    Requests { on: bool },
 }
 
 impl std::fmt::Debug for Change<'_> {
@@ -736,7 +771,6 @@ impl std::fmt::Debug for Change<'_> {
             Change::MusicLogin { account, install, .. } => f.debug_struct("MusicLogin").field("account", account).field("count", &install.binding.count).finish_non_exhaustive(),
             Change::MusicPublic { .. } => f.debug_struct("MusicPublic").finish_non_exhaustive(),
             Change::DiagnosticsDefault { on } => f.debug_struct("DiagnosticsDefault").field("on", on).finish(),
-            Change::Requests { on } => f.debug_struct("Requests").field("on", on).finish(),
         }
     }
 }
@@ -898,9 +932,6 @@ impl Change<'_> {
             }
             Change::DiagnosticsDefault { on } => {
                 step.execute("UPDATE meta SET diagnostics_default = ?1 WHERE one = 1", [i64::from(on)])?;
-            }
-            Change::Requests { on } => {
-                step.execute("UPDATE meta SET requests_on = ?1 WHERE one = 1", [i64::from(on)])?;
             }
             Change::Restore { restore, at, from } => {
                 step.execute("DELETE FROM sessions", [])?;
