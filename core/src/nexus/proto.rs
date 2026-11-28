@@ -559,76 +559,15 @@ pub fn classify(status: u16, body: impl Read) -> Found {
 // Where hello is asked
 // ---------------------------------------------------------------------------------------
 
-/// The address an app asks `hello` at, made from the music server's address as the app
-/// signed in with it (design 6.1): `https://` and the music server's host and port, then
-/// [`HELLO`], whatever path the music server itself is under. `None` (nothing is asked) for:
-///
-/// - anything but `https://` (the backend's line is HTTPS only, R5), plain `http://` included;
-/// - an address with a name or password in it (`user@host`), a backslash, a space or a
-///   control character, or an empty host;
-/// - a host name that is not ASCII letters, digits, dots and dashes in labels of 1 to 63
-///   (an internationalised name is accepted in its ASCII form, `xn--…`, only: both apps'
-///   HTTP stacks refuse it otherwise), or a bracketed IPv6 literal that is not hex digits and
-///   colons;
-/// - a port that is not 1 to 65535 in digits, or a bracketed IPv6 host that is not closed;
-/// - a music server that is itself under `/nexus` (design 6.1: it cannot have a backend).
-///
-/// A query or fragment on the music server's address, and a trailing slash, are dropped with
-/// its path. The scheme and host are compared and written in lower case.
+/// Ask at the root of the signed-in music server's canonical HTTPS origin. A base
+/// in the backend's namespace cannot have a backend probe of its own. Neither the
+/// music query nor its fragment travels to the backend.
 pub fn hello_url(music_server: &str) -> Option<String> {
-    let text = music_server.trim();
-    let (scheme, rest) = text.split_once("://")?;
-    if !scheme.eq_ignore_ascii_case("https") {
+    let address = crate::origin::Address::parse(music_server).ok()?;
+    if address.under_nexus() {
         return None;
     }
-    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let (authority, after) = rest.split_at(end);
-    if authority.is_empty() || authority.bytes().any(|byte| byte <= b' ' || matches!(byte, b'@' | b'\\' | b'%' | 0x7f)) {
-        return None;
-    }
-    // The host, and the port if there is one.
-    let (host, port) = match authority.strip_prefix('[') {
-        Some(bracketed) => {
-            let (inside, tail) = bracketed.split_once(']')?;
-            if !inside.contains(':') || !inside.bytes().all(|byte| byte.is_ascii_hexdigit() || byte == b':' || byte == b'.') {
-                return None;
-            }
-            let port = match tail.strip_prefix(':') {
-                Some(port) => Some(port),
-                None if tail.is_empty() => None,
-                None => return None,
-            };
-            (&authority[..inside.len() + 2], port)
-        }
-        None => match authority.rsplit_once(':') {
-            Some((host, port)) => (host, Some(port)),
-            None => (authority, None),
-        },
-    };
-    // A name is ASCII letters, digits, dots and dashes: an internationalised name is given in
-    // its ASCII form (`xn--…`), as the HTTP stacks of both apps require. No empty label, and
-    // none that begins or ends with a dash.
-    let name_ok = |name: &str| {
-        name.split('.').all(|label| {
-            !label.is_empty() && label.len() <= 63 && !label.starts_with('-') && !label.ends_with('-') && label.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        })
-    };
-    if host.is_empty() || (!host.starts_with('[') && (host.len() > 253 || !name_ok(host))) {
-        return None;
-    }
-    if let Some(port) = port {
-        let number: u32 = if !port.is_empty() && port.len() <= 5 && port.bytes().all(|byte| byte.is_ascii_digit()) { port.parse().ok()? } else { return None };
-        if !(1..=65535).contains(&number) {
-            return None;
-        }
-    }
-    // The music server's own path: under /nexus it cannot have a backend.
-    let path = after.split(['?', '#']).next().unwrap_or("");
-    let first = path.trim_start_matches('/').split('/').next().unwrap_or("");
-    if first.eq_ignore_ascii_case("nexus") {
-        return None;
-    }
-    Some(format!("https://{}{HELLO}", authority.to_ascii_lowercase()))
+    Some(format!("{}{HELLO}", address.origin()))
 }
 
 #[cfg(test)]
@@ -644,7 +583,9 @@ mod tests {
         assert_eq!(asked("https://music.example.org/navidrome/"), at("https://music.example.org"));
         assert_eq!(asked("https://music.example.org/a/b?x=1#y"), at("https://music.example.org"));
         assert_eq!(asked("https://music.example.org?x=1"), at("https://music.example.org"));
-        assert_eq!(asked("  https://music.example.org  "), at("https://music.example.org"));
+        // The old probe trimmed here; the design does not say to keep that exception.
+        // The common reader refuses a space anywhere, including around a saved address.
+        assert_eq!(asked("  https://music.example.org  "), None);
         // A port; an IPv4 and an IPv6 literal; case.
         assert_eq!(asked("https://music.example.org:4443/navidrome"), at("https://music.example.org:4443"));
         assert_eq!(asked("https://192.0.2.7:4443"), at("https://192.0.2.7:4443"));
@@ -683,8 +624,10 @@ mod tests {
         }
         // An internationalised name in its ASCII form; not as typed. A malformed literal.
         assert_eq!(asked("https://xn--bcher-kva.example/music"), at("https://xn--bcher-kva.example"));
+        assert_eq!(asked("https://mu_sic.example.org"), at("https://mu_sic.example.org"));
+        assert_eq!(asked("https://[2001:0DB8::1]:443"), at("https://[2001:db8::1]"));
         for server in ["https://bücher.example/music", "https://[abc]", "https://[::g]", "https://music..example.org",
-                       "https://-music.example.org", "https://music-.example.org", "https://music.example.org.", "https://mu_sic.example.org"] {
+                       "https://-music.example.org", "https://music-.example.org", "https://music.example.org.", "https://[::ffff:192.0.2.10]", "https://[::ffff:c000:20a]"] {
             assert_eq!(asked(server), None, "{server:?}");
         }
         // Under a path that merely begins with the letters, it can.
