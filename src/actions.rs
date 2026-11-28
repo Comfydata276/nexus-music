@@ -1374,7 +1374,8 @@ impl Controller {
                 let context = format!("{} radio", seed.title);
                 let mut songs = vec![seed.clone()];
                 songs.extend(similar.into_iter().filter(|s| s.id != seed.id));
-                ctl.play_songs(songs, 0, &context, false);
+                let origin = crate::journal::radio_origin(&seed.id);
+                ctl.play_songs_from_origin(songs, 0, &context, false, origin);
             },
         );
     }

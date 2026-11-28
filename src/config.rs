@@ -925,7 +925,7 @@ fn made_for(name: &str) -> Option<&str> {
 /// 0.40.10 could leave (`old`). Never by a pattern over a folder the person also uses.
 /// **Only when the app starts, once, before the first write**: later it could take a write's
 /// file from under it.
-fn clear_leftovers(dir: &Path, own: impl Fn(&str) -> bool, old: &[String]) {
+pub(crate) fn clear_leftovers(dir: &Path, own: impl Fn(&str) -> bool, old: &[String]) {
     let Ok(entries) = fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();

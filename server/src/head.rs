@@ -14,18 +14,23 @@
 //! request and closes the connection.
 
 use axum::http::StatusCode;
-use nexus_core::nexus::proto;
+use nexus_core::nexus::{account, admin, diag, events, proto};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::bounds::{BODY_MAX_BYTES, HEAD_MAX_BYTES, HEAD_MAX_HEADERS};
 use crate::serve::{Peer, Refusal};
 
-/// A request's head as it came, and the bytes read with it.
-#[derive(Debug, Clone)]
+/// A request's head as it came, and the bytes read with it. Its `Debug` says how large each
+/// part is and which headers came, never a header's value or a byte read: a session, a note, a
+/// password or a code can be in them (the review of S8, C2).
+#[derive(Clone)]
 pub struct Head {
     /// Every byte read from the connection so far: the head, and whatever of the body the
-    /// last read happened to bring with it (never more than [`HEAD_MAX_BYTES`] in all).
+    /// last read happened to bring with it (never more than [`HEAD_MAX_BYTES`] in all), and a
+    /// sign-in's whole body when it is read before a work slot ([`read_body_by`]).
     pub read: Vec<u8>,
+    /// How many of `read` are the head.
+    pub head_bytes: usize,
     pub method: String,
     /// The request target exactly as it came.
     pub target: String,
@@ -33,9 +38,27 @@ pub struct Head {
     pub headers: Vec<(String, Vec<u8>)>,
 }
 
+impl std::fmt::Debug for Head {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let names: Vec<&str> = self.headers.iter().map(|(name, _)| name.as_str()).collect();
+        f.debug_struct("Head")
+            .field("read_bytes", &self.read.len())
+            .field("head_bytes", &self.head_bytes)
+            .field("method", &self.method)
+            .field("target_bytes", &self.target.len())
+            .field("header_names", &names)
+            .finish()
+    }
+}
+
 impl Head {
-    fn all(&self, name: &str) -> impl Iterator<Item = &[u8]> {
+    pub fn all(&self, name: &str) -> impl Iterator<Item = &[u8]> {
         self.headers.iter().filter(move |(have, _)| have == name).map(|(_, value)| value.as_slice())
+    }
+
+    /// What of the body has been read with the head.
+    pub fn body(&self) -> &[u8] {
+        &self.read[self.head_bytes.min(self.read.len())..]
     }
 }
 
@@ -63,8 +86,9 @@ fn parse(bytes: &[u8]) -> Result<Option<Head>, NoHead> {
     let mut request = httparse::Request::new(&mut headers);
     match request.parse(bytes) {
         Ok(httparse::Status::Partial) => Ok(None),
-        Ok(httparse::Status::Complete(_)) => Ok(Some(Head {
+        Ok(httparse::Status::Complete(head_bytes)) => Ok(Some(Head {
             read: Vec::new(),
+            head_bytes,
             method: request.method.unwrap_or_default().to_string(),
             target: request.path.unwrap_or_default().to_string(),
             headers: request.headers.iter().map(|header| (header.name.to_ascii_lowercase(), header.value.to_vec())).collect(),
@@ -109,6 +133,28 @@ pub async fn read_by(deadline: tokio::time::Instant, from: &mut (impl AsyncRead 
     }
 }
 
+/// Reads the rest of `head`'s body, `length` bytes in all, into `head.read`, whole by
+/// `deadline` (the head's own) or not at all: for a sign-in, whose body says whether it may take
+/// a reserved slot (the review of S8, C1). Nothing past the body is read.
+pub async fn read_body_by(deadline: tokio::time::Instant, from: &mut (impl AsyncRead + Unpin), head: &mut Head, length: usize) -> Result<(), NoHead> {
+    let want = head.head_bytes + length;
+    let reading = async {
+        let mut chunk = [0u8; 4096];
+        while head.read.len() < want {
+            let room = (want - head.read.len()).min(chunk.len());
+            match from.read(&mut chunk[..room]).await {
+                Ok(0) | Err(_) => return Err(NoHead::Cut),
+                Ok(got) => head.read.extend_from_slice(&chunk[..got]),
+            }
+        }
+        Ok(())
+    };
+    match tokio::time::timeout_at(deadline, reading).await {
+        Ok(done) => done,
+        Err(_) => Err(NoHead::Late),
+    }
+}
+
 /// What is done with a request, decided from its head alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
@@ -121,8 +167,123 @@ pub enum Verdict {
     Serve(usize),
 }
 
-/// Every path the backend answers, and the one method each answers.
-pub const ROUTES: &[(&str, &str)] = &[(proto::HELLO, "GET"), (crate::admin::PAGE, "GET"), (crate::admin::SIGN_IN, "POST")];
+/// A path the backend answers: the one method it answers there, and the largest body that
+/// call takes (design 7.2, 12.1), checked from the head before a byte of the body is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Route {
+    pub path: &'static str,
+    pub method: &'static str,
+    pub body_max: usize,
+    /// Whose session may call it, judged before its body is read
+    /// ([`crate::accounts::admit::before_body`]): by its path, [`Callers::of`].
+    pub callers: Callers,
+}
+
+impl Route {
+    pub const fn new(path: &'static str, method: &'static str, body_max: usize) -> Self {
+        Route { path, method, body_max, callers: Callers::of(path) }
+    }
+}
+
+/// Who may call a route (the lead's ruling: the admin's page has its own session kind, and an
+/// app's session can do nothing the page does, nor the reverse).
+///
+/// | Route | Callers |
+/// |---|---|
+/// | `hello`, the page's document, `signin`, `set-up` | anyone (no session) |
+/// | `signout` | a session of either kind, or none (a note alone can end its session) |
+/// | every `/nexus/api/admin/…` (the grant included) | the admin's page's session only |
+/// | every other `/nexus/api/…` (devices, force-out, change-password, music-login, grant, delete-listening-data, events, Diagnostics, and requests) | an app's session only |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Callers {
+    Anyone,
+    EitherOrNone,
+    Page,
+    App,
+}
+
+impl Callers {
+    /// By the path alone, so that a route added later is the page's if it is under
+    /// `/nexus/api/admin/` and an app's otherwise, unless it is one of the few without a session.
+    pub const fn of(path: &str) -> Callers {
+        if same(path, proto::HELLO) || same(path, crate::admin::PAGE) || same(path, account::SIGN_IN) || same(path, account::SET_UP) {
+            Callers::Anyone
+        } else if same(path, account::SIGN_OUT) {
+            Callers::EitherOrNone
+        } else if starts(path, ADMIN_CALLS) {
+            Callers::Page
+        } else {
+            Callers::App
+        }
+    }
+}
+
+/// Every call of the admin's page that needs its session is under this.
+pub const ADMIN_CALLS: &str = "/nexus/api/admin/";
+
+const fn same(one: &str, other: &str) -> bool {
+    one.len() == other.len() && starts(one, other)
+}
+
+const fn starts(text: &str, prefix: &str) -> bool {
+    let (text, prefix) = (text.as_bytes(), prefix.as_bytes());
+    if text.len() < prefix.len() {
+        return false;
+    }
+    let mut at = 0;
+    while at < prefix.len() {
+        if text[at] != prefix[at] {
+            return false;
+        }
+        at += 1;
+    }
+    true
+}
+
+/// A path and its method, with a body of up to the backend's largest.
+impl From<(&'static str, &'static str)> for Route {
+    fn from((path, method): (&'static str, &'static str)) -> Self {
+        Route::new(path, method, BODY_MAX_BYTES)
+    }
+}
+
+/// Every path the backend answers, the one method each answers, and the largest body each
+/// takes. A call that carries a password takes 4 KiB at most (7.2, the slice notes' S8).
+pub const ROUTES: &[Route] = &[
+    Route::new(proto::HELLO, "GET", BODY_MAX_BYTES),
+    Route::new(crate::admin::PAGE, "GET", BODY_MAX_BYTES),
+    Route::new(account::SIGN_IN, "POST", account::PASSWORD_REQUEST_MAX_BYTES),
+    Route::new(account::SET_UP, "POST", account::SET_UP_MAX_BYTES),
+    Route::new(account::CHANGE_PASSWORD, "POST", account::PASSWORD_REQUEST_MAX_BYTES),
+    Route::new(account::SIGN_OUT, "POST", account::SMALL_REQUEST_MAX_BYTES),
+    Route::new(account::LIST_DEVICES, "POST", account::SMALL_REQUEST_MAX_BYTES),
+    Route::new(account::FORCE_OUT, "POST", account::SMALL_REQUEST_MAX_BYTES),
+    Route::new(account::MUSIC_LOGIN, "POST", account::SMALL_REQUEST_MAX_BYTES),
+    Route::new(events::SEND_PATH, "POST", events::BATCH_BYTES),
+    Route::new(events::DELETE_PATH, "POST", account::GRANTED_CHANGE_MAX_BYTES),
+    Route::new(account::DELETE_LISTENING_DATA, "POST", account::GRANTED_CHANGE_MAX_BYTES),
+    Route::new(account::GRANT, "POST", account::PASSWORD_REQUEST_MAX_BYTES),
+    Route::new(crate::events::STATS_PATH, "POST", account::SMALL_REQUEST_MAX_BYTES),
+    Route::new(diag::SEND_PATH, "POST", diag::CALL_BYTES),
+    Route::new(crate::diag::LIST_PATH, "POST", account::SMALL_REQUEST_MAX_BYTES),
+    Route::new(crate::diag::ADMIN_PATH, "POST", account::SMALL_REQUEST_MAX_BYTES),
+    // The admin's calls of S9: the two that carry a password at 4 KiB, the address at the grant
+    // envelope's own ceiling, the read small.
+    Route::new(admin::REQUEST_GRANT, "POST", account::PASSWORD_REQUEST_MAX_BYTES),
+    Route::new(admin::SET_MUSIC_LOGIN, "POST", account::PASSWORD_REQUEST_MAX_BYTES),
+    Route::new(admin::SET_MUSIC_SERVER, "POST", account::GRANTED_CHANGE_MAX_BYTES),
+    Route::new(admin::GET_MUSIC_SERVER, "POST", account::SMALL_REQUEST_MAX_BYTES),
+    Route::new(admin::LIST_ACCOUNTS, "POST", account::SMALL_REQUEST_MAX_BYTES),
+    Route::new(admin::LIST_DEVICES, "POST", account::SMALL_REQUEST_MAX_BYTES),
+    Route::new(admin::GET_DIAGNOSTICS_DEFAULT, "POST", account::SMALL_REQUEST_MAX_BYTES),
+    Route::new(admin::CREATE_ACCOUNT, "POST", account::GRANTED_CHANGE_MAX_BYTES),
+    Route::new(admin::SET_ACCOUNT_ENABLED, "POST", account::GRANTED_CHANGE_MAX_BYTES),
+    Route::new(admin::FORCE_OUT, "POST", account::GRANTED_CHANGE_MAX_BYTES),
+    Route::new(admin::SET_DIAGNOSTICS_DEFAULT, "POST", account::GRANTED_CHANGE_MAX_BYTES),
+    Route::new(admin::DELETE_ACCOUNT, "POST", account::GRANTED_CHANGE_MAX_BYTES),
+    Route::new(admin::SET_ADMIN, "POST", account::GRANTED_CHANGE_MAX_BYTES),
+    Route::new(admin::RESET_PASSWORD, "POST", account::GRANTED_CHANGE_MAX_BYTES),
+];
 
 /// Whether the proxy marked the request as having come to it by HTTPS (design 6.2:
 /// `proxy_set_header X-Nexus-Scheme $scheme;`): the header exactly once, exactly `https`.
@@ -134,7 +295,7 @@ pub fn marked_https(head: &Head) -> bool {
 /// What is done with the request whose head is `head`, from a connection opened by `peer`. In
 /// order: the gate (who, and the proxy's mark); then the target exactly as it came; the
 /// method; and the body's framing and size.
-pub fn judge(peer: Peer, head: &Head, routes: &[(&str, &str)]) -> Verdict {
+pub fn judge(peer: Peer, head: &Head, routes: &[Route]) -> Verdict {
     // The gate. Until it has passed, nothing is written.
     match peer {
         Peer::Stranger => return Verdict::Unanswered(Refusal::Stranger),
@@ -146,7 +307,7 @@ pub fn judge(peer: Peer, head: &Head, routes: &[(&str, &str)]) -> Verdict {
     if proto::plain(&head.target).is_err() {
         return Verdict::Refused(StatusCode::BAD_REQUEST, Refusal::NotPlain);
     }
-    let Some(&(_, method)) = routes.iter().find(|(path, _)| *path == head.target) else {
+    let Some(&Route { method, body_max, .. }) = routes.iter().find(|route| route.path == head.target) else {
         return Verdict::Refused(if head.method == "GET" { StatusCode::NOT_FOUND } else { StatusCode::METHOD_NOT_ALLOWED }, Refusal::NoSuchPath);
     };
     if head.method != method {
@@ -158,14 +319,13 @@ pub fn judge(peer: Peer, head: &Head, routes: &[(&str, &str)]) -> Verdict {
     if head.all("transfer-encoding").next().is_some() || head.all("expect").next().is_some() {
         return Verdict::Refused(StatusCode::BAD_REQUEST, Refusal::Framing);
     }
-    let body_max = if head.target == crate::admin::SIGN_IN { crate::admin::SIGN_IN_MAX_BYTES } else { BODY_MAX_BYTES };
     let mut lengths = head.all("content-length");
     let length = match (lengths.next(), lengths.next()) {
         (None, _) => 0,
         // Digits alone; a number too large to read is too large.
         (Some(length), None) if !length.is_empty() && length.iter().all(u8::is_ascii_digit) => {
             match std::str::from_utf8(length).ok().and_then(|length| length.parse::<u64>().ok()) {
-                Some(length) if length <= body_max as u64 => length as usize,
+                Some(length) if length <= body_max.min(BODY_MAX_BYTES) as u64 => length as usize,
                 _ => return Verdict::Refused(StatusCode::PAYLOAD_TOO_LARGE, Refusal::TooLarge),
             }
         }
@@ -190,6 +350,28 @@ mod tests {
 
     fn get(target: &str, extra: &str) -> Head {
         head(&format!("GET {target} HTTP/1.1\r\nHost: x\r\nX-Nexus-Scheme: https\r\n{extra}\r\n"))
+    }
+
+    /// C2 (the review of S8): a head read with its body's first bytes shows neither the
+    /// session in its `Authorization` nor anything of the body.
+    #[test]
+    fn a_head_s_debug_shows_no_header_value_and_no_byte_read() {
+        let session = "Bearer sess-0123456789abcdef0123456789abcdef";
+        let body = r#"{"credential":{"password":{"email":"someone@example.test","password":"hunter2-hunter2-hunter2"}},"code":"ABCDEF-GHJKMN","revoke":{"secret":"note-secret-77"}}"#;
+        let request = format!(
+            "POST {} HTTP/1.1\r\nHost: x\r\nX-Nexus-Scheme: https\r\nAuthorization: {session}\r\nContent-Length: {}\r\n\r\n{body}",
+            account::SIGN_IN,
+            body.len()
+        );
+        let mut from = request.as_bytes();
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let read = runtime.block_on(read(&mut from)).unwrap();
+        assert!(read.read.len() > body.len(), "the body came with the head");
+        let shown = format!("{read:?} {read:#?}");
+        for secret in ["sess-0123", "hunter2", "someone@", "ABCDEF", "note-secret", "Bearer", "credential"] {
+            assert!(!shown.contains(secret), "Debug showed {secret:?}: {shown}");
+        }
+        assert!(shown.contains("authorization"), "the header's name is shown: {shown}");
     }
 
     #[test]

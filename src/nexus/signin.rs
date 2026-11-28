@@ -184,7 +184,7 @@ fn read_kept(paths: &config::Paths) -> Kept {
             })
         })
         .collect();
-    Kept { device_secret, saved, notes, offline: offline_now(), unreadable }
+    Kept { device_secret, saved, notes, offline: offline_now(), unreadable, ..Kept::default() }
 }
 
 /// The Nexus origin that the account published now was signed in through: where the
@@ -372,6 +372,8 @@ fn run(ui: &ui::MainWindow, dos: Vec<Do>) {
                 note(format_args!("sign-in forgotten"));
                 crate::controller::with(|ctl| ctl.sign_out(""));
             }
+            // The sending half (the journal and Diagnostics): wired to them in W7b's driver.
+            Do::Journal(_) | Do::Keep(Keep::DiagSchedule(_)) | Do::Forget(Forget::DiagSchedule | Forget::Diagnostics) => {}
             Do::Ask(ask) => dispatch(ui, ask),
             Do::Hand(hand) => hand_over(hand),
             Do::Show(shown) => show(ui, shown),

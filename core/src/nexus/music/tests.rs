@@ -202,7 +202,7 @@ fn a_sealed_password_opens_only_under_every_part_of_its_current_binding() {
     let bind = CredentialBinding {
         backend: BackendId::from_bytes([1; 16]),
         account: AccountId::new(2).unwrap(),
-        address: MusicAddress::new("https://music.example.test").unwrap(),
+        internal: "http://navidrome.example.test:4533".into(),
         name: Name::new("Alice").unwrap(),
         count: 4,
     };
@@ -221,7 +221,7 @@ fn a_sealed_password_opens_only_under_every_part_of_its_current_binding() {
             ..bind.clone()
         },
         CredentialBinding {
-            address: MusicAddress::new("https://other.example.test").unwrap(),
+            internal: "http://other.example.test:4533".into(),
             ..bind.clone()
         },
         CredentialBinding {
@@ -253,11 +253,13 @@ fn a_sealed_password_opens_only_under_every_part_of_its_current_binding() {
 fn hand_out_uses_only_the_current_account_and_seal_and_takes_a_fresh_salt() {
     let backend = BackendId::from_bytes([5; 16]);
     let account = AccountId::new(1).unwrap();
-    let address = MusicAddress::new("https://music.example.test").unwrap();
+    let internal = "http://navidrome.example.test:4533";
+    let public = MusicAddress::new("https://music.example.test").unwrap();
+    let new_public = MusicAddress::new("https://Music2.example.test/subsonic/").unwrap();
     let binding = CredentialBinding {
         backend,
         account,
-        address: address.clone(),
+        internal: internal.into(),
         name: Name::new("Alice").unwrap(),
         count: 1,
     };
@@ -275,40 +277,131 @@ fn hand_out_uses_only_the_current_account_and_seal_and_takes_a_fresh_salt() {
     );
     let salt = |n| MusicSalt::from_random([n; SALT_BYTES]);
     assert_eq!(
-        hand_out(&state, None, &key, &address, salt(1)),
+        hand_out(&state, SessionKind::App, None, &key, internal, None, salt(1)),
         MusicLoginResult::NoneSetYet
     );
     state.music_login = 1;
-    for n in [2, 3] {
-        let MusicLoginResult::Login(handed) =
-            hand_out(&state, Some(&login), &key, &address, salt(n))
-        else {
+    for (n, address) in [(2, &public), (3, &new_public)] {
+        let MusicLoginResult::Login(handed) = hand_out(
+            &state,
+            SessionKind::App,
+            Some(&login),
+            &key,
+            internal,
+            Some(address),
+            salt(n),
+        ) else {
             panic!("current credential was not handed out");
         };
+        assert_eq!(handed.address.as_str(), address.as_str());
+        assert_eq!(handed.count, 1);
         assert_eq!(handed.salt, salt(n));
         assert_eq!(
             &handed.token,
             SaltedToken::from_password(b"Example password", salt(n)).token()
         );
     }
-    let other = MusicAddress::new("https://different.example.test").unwrap();
     assert_eq!(
-        hand_out(&state, Some(&login), &key, &other, salt(4)),
+        hand_out(
+            &state,
+            SessionKind::App,
+            Some(&login),
+            &key,
+            "http://other.example.test:4533",
+            Some(&public),
+            salt(4)
+        ),
         MusicLoginResult::UnusableNow
     );
     assert_eq!(
         hand_out(
             &state,
+            SessionKind::App,
             Some(&login),
             &SealingKey::new([8; 32]),
-            &address,
+            internal,
+            Some(&public),
             salt(5)
+        ),
+        MusicLoginResult::UnusableNow
+    );
+    assert_eq!(
+        hand_out(
+            &state,
+            SessionKind::App,
+            Some(&login),
+            &key,
+            internal,
+            None,
+            salt(6),
         ),
         MusicLoginResult::UnusableNow
     );
     state.music_login += 1;
     assert_eq!(
-        hand_out(&state, Some(&login), &key, &address, salt(6)),
+        hand_out(
+            &state,
+            SessionKind::App,
+            Some(&login),
+            &key,
+            internal,
+            Some(&public),
+            salt(7)
+        ),
         MusicLoginResult::UnusableNow
     );
+}
+
+#[test]
+fn the_admin_page_gets_no_music_login_even_with_a_current_valid_seal() {
+    let backend = BackendId::from_bytes([5; 16]);
+    let account = AccountId::new(1).unwrap();
+    let internal = "http://navidrome.example.test:4533";
+    let public = MusicAddress::new("https://music.example.test").unwrap();
+    let binding = CredentialBinding {
+        backend,
+        account,
+        internal: internal.into(),
+        name: Name::new("Alice").unwrap(),
+        count: 1,
+    };
+    let key = SealingKey::new([6; 32]);
+    let install = MusicInstallation {
+        sealed: key.seal(&binding, b"Example password", [7; 24]).unwrap(),
+        binding,
+    };
+    let mut state = AccountState::new(
+        backend,
+        1,
+        account,
+        crate::nexus::account::Email::new("alice@example.test").unwrap(),
+        None,
+    );
+    state.admin = true;
+    state.music_login = 1;
+    let salt = || MusicSalt::from_random([8; SALT_BYTES]);
+    assert_eq!(
+        hand_out(
+            &state,
+            SessionKind::AdminPage,
+            Some(&install),
+            &key,
+            internal,
+            Some(&public),
+            salt()
+        ),
+        MusicLoginResult::NoneSetYet
+    );
+    assert!(matches!(
+        hand_out(
+            &state,
+            SessionKind::App,
+            Some(&install),
+            &key,
+            internal,
+            Some(&public),
+            salt()
+        ),
+        MusicLoginResult::Login(_)
+    ));
 }

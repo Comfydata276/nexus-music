@@ -5,13 +5,15 @@
 //!    it is accepted, without a byte read or written; except that this machine's own loopback
 //!    address may ask `GET /nexus/api/hello`, and nothing else, for the container's health
 //!    check.
-//! 2. **How many are open:** past [`CONNECTIONS_MAX`], one more from the proxy is given the
-//!    gate's answer; past [`TURNED_AWAY_MAX`] more, none is taken until there is room, and it
-//!    waits in the kernel's backlog ([`LISTEN_BACKLOG`]).
+//! 2. **How many are open:** at most [`CONNECTIONS_MAX`] + [`TURNED_AWAY_MAX`] connections are
+//!    taken at once (having their heads read, served, or given the gate's answer); past that,
+//!    none is taken until there is room, and it waits in the kernel's backlog
+//!    ([`LISTEN_BACKLOG`]).
 //!
 //!    Every connection's head deadline counts from when it is taken.
-//! 3. **Its head**, read here and not by hyper ([`crate::head`]): all of it within
-//!    [`HEAD_DEADLINE`], in at most [`HEAD_MAX_BYTES`] and [`HEAD_MAX_HEADERS`] headers.
+//! 3. **Its head**, read here and not by hyper ([`crate::head`]): all of it within the short
+//!    [`HEAD_DEADLINE`], in at most [`HEAD_MAX_BYTES`] and [`HEAD_MAX_HEADERS`] headers, **before
+//!    it takes a work slot** (the review of S8, C1).
 //! 4. **The gate:** a request from the proxy must carry exactly one `X-Nexus-Scheme: https`.
 //!
 //!    Whatever fails before or at the gate is answered by **one fixed bare refusal when the
@@ -21,10 +23,19 @@
 //!    as measured), and **with nothing at all when it is not**.
 //! 5. **The target exactly as it came**, the method, and the body's framing and declared size,
 //!    each refused with a bare answer before a byte of the body is read.
-//! 6. **The body**, read by hyper within [`BODY_DEADLINE`] into one buffer of the size it
+//! 6. **A work slot** (C1; the lead's ruling of 28 Nov 15:38): one of [`CONNECTIONS_MAX`],
+//!    of which [`RESERVED_SLOTS`] are kept for a request that is someone's ([`Admitted`], asked
+//!    of the accounts' cheap read path, [`crate::accounts::admit`]): its session resolves, or it
+//!    is a known device signing in, or a live one-time code (a sign-in's body is read for this
+//!    before the slot, by the head's deadline). Every other request takes one of the rest; none
+//!    left, the proxy is given the gate's answer. So a flood of strangers cannot take every
+//!    slot from people already signed in.
+//! 7. **The body**, read by hyper within [`BODY_DEADLINE`] into one buffer of the size it
 //!    declared.
-//! 7. **What answers it**, in a task of its own, within [`ANSWER_DEADLINE`] or 503; a fault
-//!    there is that request's 500 and nothing else's.
+//! 8. **What answers it**, in a task of its own, within [`ANSWER_DEADLINE`] or 503; a fault
+//!    there is that request's 500 and nothing else's. The work it hands the thread that writes
+//!    knows the request's admission ([`ADMITTED`]): a session that did not resolve never waits
+//!    in the protected lane.
 //!
 //! After a bare answer, whatever more the caller sends is discarded, for a moment and up to a
 //! bound ([`LINGER_DEADLINE`], [`LINGER_MAX_BYTES`]), so that closing does not reset the
@@ -59,8 +70,11 @@ use tokio::sync::Semaphore;
 use tokio::time::Sleep;
 use tower::ServiceExt;
 
+use crate::accounts::admit::{Admission, Shown};
+use crate::accounts::desk::{ADMITTED, Admitted};
 use crate::bounds::*;
-use crate::head::{self, NoHead, Verdict};
+use crate::head::{self, Callers, NoHead, Route, Verdict};
+use crate::proxy::Proxy;
 
 /// Who opened a connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,8 +91,13 @@ pub enum Peer {
 /// Who `from` is, for a proxy at `proxy`. Both are compared as plain addresses, so an IPv4
 /// address written as IPv6 (`::ffff:a.b.c.d`) is the same address.
 pub fn peer(from: IpAddr, proxy: IpAddr) -> Peer {
+    peer_is(from, from.to_canonical() == proxy.to_canonical())
+}
+
+/// Who `from` is, once it is known whether it is the proxy ([`Proxy`]: an address or a name).
+pub fn peer_is(from: IpAddr, proxy: bool) -> Peer {
     let from = from.to_canonical();
-    if from == proxy.to_canonical() {
+    if proxy {
         Peer::Proxy
     } else if from == IpAddr::V4(Ipv4Addr::LOCALHOST) || from == IpAddr::V6(Ipv6Addr::LOCALHOST) {
         Peer::Health
@@ -129,32 +148,60 @@ const REFUSALS: [(Refusal, &str); 16] = [
 
 /// The listener's own state: whom it answers, what answers, and its counts.
 pub struct Shell {
-    proxy: IpAddr,
+    proxy: Proxy,
     router: Router,
-    routes: Vec<(&'static str, &'static str)>,
+    routes: Vec<Route>,
+    /// Who may take a reserved slot (the backend's own; none in a shell without accounts).
+    admit: Option<Arc<Admission>>,
     open: AtomicUsize,
+    serving: AtomicUsize,
     refused: [AtomicU64; REFUSALS.len()],
 }
 
 impl Shell {
-    /// The backend's own: [`router`] and [`head::ROUTES`].
+    /// `hello`, the admin's document and the sign-in stub (S1, S10a): [`router`].
     pub fn new(proxy: IpAddr, hello: &Hello) -> Arc<Self> {
         Self::new_with_public_origin(proxy, hello, None)
     }
 
+    /// As [`Shell::new`], with the admin's page's own origin (S10a's tests).
     pub fn new_with_public_origin(proxy: IpAddr, hello: &Hello, public_origin: Option<&str>) -> Arc<Self> {
-        Self::with_routes(proxy, router_with_public_origin(hello, public_origin), head::ROUTES.to_vec())
+        let stub = [proto::HELLO, crate::admin::PAGE, crate::admin::SIGN_IN];
+        let routes = head::ROUTES.iter().copied().filter(|route| stub.contains(&route.path)).collect();
+        Self::with_routes(proxy, router_with_public_origin(hello, public_origin), routes)
+    }
+
+    /// The backend's own: `hello`, the admin's document, and signing in and everything a
+    /// session does (S8), at [`head::ROUTES`]. The page's calls with no session are taken
+    /// only from `public_origin` (`NEXUS_PUBLIC_ORIGIN`). The validated data budget caps event intake.
+    pub fn backend(proxy: impl Into<Proxy>, hello: &Hello, accounts: Arc<crate::accounts::session::Accounts>, public_origin: Option<&str>, data_budget: u64) -> Arc<Self> {
+        let public_origin = public_origin.map(Arc::<str>::from);
+        let router = crate::accounts::routes::router(base_router(hello, accounts.desk.diagnostics.clone()), accounts.clone(), public_origin.clone());
+        let admit = accounts.admission.clone();
+        let router = crate::events::router(router, accounts, public_origin, data_budget);
+        let shell = Self::with_proxy(proxy, router, head::ROUTES.to_vec());
+        Arc::new(Shell { admit: Some(admit), ..Arc::into_inner(shell).expect("made just now") })
     }
 
     /// With other routes (the tests add some): `routes` names each path `router` answers, and
     /// the one method it answers there.
-    pub fn with_routes(proxy: IpAddr, router: Router, routes: Vec<(&'static str, &'static str)>) -> Arc<Self> {
-        Arc::new(Shell { proxy: proxy.to_canonical(), router, routes, open: AtomicUsize::new(0), refused: Default::default() })
+    pub fn with_routes(proxy: IpAddr, router: Router, routes: Vec<Route>) -> Arc<Self> {
+        Self::with_proxy(proxy, router, routes)
+    }
+
+    /// As [`Shell::with_routes`], with the proxy at an address or by a name ([`Proxy`]).
+    pub fn with_proxy(proxy: impl Into<Proxy>, router: Router, routes: Vec<Route>) -> Arc<Self> {
+        Arc::new(Shell { proxy: proxy.into(), router, routes, admit: None, open: AtomicUsize::new(0), serving: AtomicUsize::new(0), refused: Default::default() })
     }
 
     /// How many connections are open now, turned-away ones included.
     pub fn open(&self) -> usize {
         self.open.load(Ordering::SeqCst)
+    }
+
+    /// How many requests hold a work slot now.
+    pub fn serving(&self) -> usize {
+        self.serving.load(Ordering::SeqCst)
     }
 
     /// How many of `kind` have been refused since the counts were last written.
@@ -201,6 +248,27 @@ fn router_with_public_origin(hello: &Hello, public_origin: Option<&str>) -> Rout
             let public_origin = public_origin.clone();
             async move { crate::admin::signin(headers, public_origin.as_deref()) }
         }))
+        .fallback(|| async { StatusCode::NOT_FOUND })
+}
+
+/// `hello` and the admin's document, with no sign-in: what S8's calls are added to.
+fn base_router(hello: &Hello, diagnostics: Arc<crate::accounts::desk::DiagnosticsSetting>) -> Router {
+    let on = Bytes::from(hello.clone().with_diagnostics_default(true).to_json());
+    let off = Bytes::from(hello.clone().with_diagnostics_default(false).to_json());
+    let body = Bytes::from(hello.to_json());
+    Router::new()
+        .route(
+            proto::HELLO,
+            get(move || {
+                let body = match diagnostics.get() {
+                    Some(true) => on.clone(),
+                    Some(false) => off.clone(),
+                    None => body.clone(),
+                };
+                async move { ([(CONTENT_TYPE, "application/json")], body) }
+            }),
+        )
+        .route(crate::admin::PAGE, get(crate::admin::document))
         .fallback(|| async { StatusCode::NOT_FOUND })
 }
 
@@ -259,13 +327,14 @@ pub async fn serve(listener: TcpListener, shell: Arc<Shell>, log: bool) {
             }
         });
     }
-    // Room for every connection taken: those served, and those only given the gate's answer.
-    // A connection is taken only when there is room at least to answer it, so that one from
-    // the proxy is never taken and then closed with nothing (which the proxy would log, and
-    // answer with a 502). Past that, it waits in the kernel's backlog ([`LISTEN_BACKLOG`])
-    // until there is room.
+    // Room for every connection taken: those having their heads read, those served, and those
+    // only given the gate's answer. A connection is taken only when there is room at least to
+    // answer it, so that one from the proxy is never taken and then closed with nothing (which
+    // the proxy would log, and answer with a 502). Past that, it waits in the kernel's backlog
+    // ([`LISTEN_BACKLOG`]) until there is room. The work slots are taken only once a head is
+    // read: the general ones, and the reserve (C1).
     let room = Arc::new(Semaphore::new(CONNECTIONS_MAX + TURNED_AWAY_MAX));
-    let slots = Arc::new(Semaphore::new(CONNECTIONS_MAX));
+    let slots = Slots { general: Arc::new(Semaphore::new(CONNECTIONS_MAX - RESERVED_SLOTS)), reserve: Arc::new(Semaphore::new(RESERVED_SLOTS)) };
     loop {
         let Ok(roomed) = room.clone().acquire_owned().await else { return };
         let (stream, from) = match listener.accept().await {
@@ -279,47 +348,52 @@ pub async fn serve(listener: TcpListener, shell: Arc<Shell>, log: bool) {
         };
         // The head's deadline counts from here, not from when its task first runs.
         let deadline = tokio::time::Instant::now() + HEAD_DEADLINE;
-        let peer = peer(from.ip(), shell.proxy);
-        if peer == Peer::Stranger {
+        // Who it is: at once for a fixed address, and for a name whose answer is fresh;
+        // otherwise on the connection's own task, so that a lookup never holds up the others.
+        let known = shell.proxy.now(from.ip()).map(|is| peer_is(from.ip(), is));
+        if known == Some(Peer::Stranger) {
             shell.count(Refusal::Stranger);
             drop(stream);
             continue;
         }
-        let _ = stream.set_nodelay(true);
-        let shell = shell.clone();
-        match slots.clone().try_acquire_owned() {
-            Ok(slot) => {
-                tokio::spawn(async move {
-                    let _room = roomed;
-                    let _slot = slot;
-                    let _open = Open::new(&shell);
-                    connection(Guarded::new(stream, shell.clone()), peer, deadline, shell).await;
-                });
+        let (shell, slots) = (shell.clone(), slots.clone());
+        tokio::spawn(async move {
+            let _room = roomed;
+            let peer = match known {
+                Some(peer) => peer,
+                None => peer_is(from.ip(), shell.proxy.is(from.ip()).await),
+            };
+            if peer == Peer::Stranger {
+                shell.count(Refusal::Stranger);
+                return;
             }
-            Err(_) => {
-                shell.count(Refusal::Full);
-                // The proxy is told so, by the gate's one answer, for which there is always room
-                // here; no one else is told anything.
-                if peer != Peer::Proxy {
-                    continue;
-                }
-                tokio::spawn(async move {
-                    let _room = roomed;
-                    let _open = Open::new(&shell);
-                    answer_bare(Guarded::new(stream, shell.clone()), GATE, false).await;
-                });
-            }
-        }
+            let _ = stream.set_nodelay(true);
+            let _open = Open::new(&shell);
+            connection(Guarded::new(stream, shell.clone()), peer, deadline, shell, slots).await;
+        });
+    }
+}
+
+/// The work slots: the general ones, and the reserve only a request that is someone's may take.
+#[derive(Clone)]
+struct Slots {
+    general: Arc<Semaphore>,
+    reserve: Arc<Semaphore>,
+}
+
+impl Slots {
+    fn take(&self, admitted: Admitted) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.general.clone().try_acquire_owned().ok().or_else(|| (admitted == Admitted::Reserved).then(|| self.reserve.clone().try_acquire_owned().ok()).flatten())
     }
 }
 
 /// One connection: its head read and judged, then refused or served.
-async fn connection(mut stream: Guarded, peer: Peer, deadline: tokio::time::Instant, shell: Arc<Shell>) {
+async fn connection(mut stream: Guarded, peer: Peer, deadline: tokio::time::Instant, shell: Arc<Shell>, slots: Slots) {
     let refused = |kind| {
         shell.count(kind);
         peer == Peer::Proxy
     };
-    let head = match head::read_by(deadline, &mut stream).await {
+    let mut head = match head::read_by(deadline, &mut stream).await {
         Ok(head) => head,
         // Opened and closed with nothing said: there is no one to answer.
         Err(NoHead::Closed) => return,
@@ -341,13 +415,45 @@ async fn connection(mut stream: Guarded, peer: Peer, deadline: tokio::time::Inst
             answer_bare(stream, status, head.target.starts_with(crate::admin::PAGE)).await;
         }
         Verdict::Serve(length) => {
+            // C1: who it is, before a work slot. A sign-in's body is read first, by the head's
+            // deadline (the proxy sends it with the head), as only it can say whether this is
+            // a known device or a live code.
+            let (admitted, shown) = match &shell.admit {
+                None => (Admitted::Plain, None),
+                Some(admit) => {
+                    if head.target == nexus_core::nexus::account::SIGN_IN && length > 0 {
+                        match head::read_body_by(deadline, &mut stream, &mut head, length).await {
+                            Ok(()) => {}
+                            Err(why) => {
+                                let late = why == NoHead::Late;
+                                shell.count(if late { Refusal::SlowBody } else { Refusal::BadBody });
+                                answer_bare(stream, if late { StatusCode::REQUEST_TIMEOUT } else { StatusCode::BAD_REQUEST }, false).await;
+                                return;
+                            }
+                        }
+                    }
+                    let authorization: Vec<&[u8]> = head.all("authorization").collect();
+                    let (admitted, shown) = admit.listener(&head.target, &authorization, head.body());
+                    (admitted, Some(shown))
+                }
+            };
+            // Whose session the route takes, for the check before its body ([`answer`]).
+            let check = shown.and_then(|shown| shell.routes.iter().find(|route| route.path == head.target).map(|route| (route.callers, shown)));
+            let Some(_slot) = slots.take(admitted) else {
+                // The proxy is told so, by the gate's one answer; no one else is told anything.
+                if refused(Refusal::Full) {
+                    answer_bare(stream, GATE, false).await;
+                }
+                return;
+            };
+            let _serving = Holding::new(&shell);
             let service = {
                 let shell = shell.clone();
                 let admin_path = head.target.starts_with(crate::admin::PAGE);
                 hyper::service::service_fn(move |request| {
                     let shell = shell.clone();
                     async move {
-                        let mut response = answer(request, length, shell).await?;
+                        let mut response = answer(request, length, admitted, check, shell).await?;
                         if admin_path {
                             for (name, value) in crate::admin::PAGE_HEADERS {
                                 response.headers_mut().insert(name, HeaderValue::from_static(value));
@@ -390,6 +496,22 @@ async fn answer_bare(mut stream: Guarded, status: StatusCode, admin_path: bool) 
         }
     })
     .await;
+}
+
+/// Counts a work slot as held for as long as it lives.
+struct Holding(Arc<Shell>);
+
+impl Holding {
+    fn new(shell: &Arc<Shell>) -> Self {
+        shell.serving.fetch_add(1, Ordering::SeqCst);
+        Holding(shell.clone())
+    }
+}
+
+impl Drop for Holding {
+    fn drop(&mut self) {
+        self.0.serving.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Counts a connection as open for as long as it lives.
@@ -445,8 +567,26 @@ where
     Ok(bytes)
 }
 
-async fn answer(request: Request<Incoming>, length: usize, shell: Arc<Shell>) -> Result<Response<Body>, Infallible> {
-    let (parts, body) = request.into_parts();
+async fn answer(request: Request<Incoming>, length: usize, admitted: Admitted, check: Option<(Callers, Shown)>, shell: Arc<Shell>) -> Result<Response<Body>, Infallible> {
+    let (mut parts, body) = request.into_parts();
+    // The session, before a byte of the body is read (one check for every route, the
+    // backend's): a route that needs one is refused at once without it, or with one of the
+    // other kind; one that has it is handed who is calling.
+    if let Some((callers, shown)) = check {
+        match crate::accounts::admit::before_body(callers, shown) {
+            Ok(Some(caller)) => {
+                parts.extensions.insert(caller);
+            }
+            Ok(None) => {}
+            Err(refused) => {
+                let mut response = Response::new(Body::from(refused.body.bytes().to_vec()));
+                *response.status_mut() = StatusCode::from_u16(refused.status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
+                response.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                finish(&mut response);
+                return Ok(response);
+            }
+        }
+    }
     let bytes = match tokio::time::timeout(BODY_DEADLINE, take_body(body, length)).await {
         Err(_) => {
             shell.count(Refusal::SlowBody);
@@ -459,7 +599,7 @@ async fn answer(request: Request<Incoming>, length: usize, shell: Arc<Shell>) ->
         Ok(Ok(bytes)) => Bytes::from(bytes),
     };
     let request = Request::from_parts(parts, Body::from(bytes));
-    let mut task = tokio::spawn(shell.router.clone().oneshot(request));
+    let mut task = tokio::spawn(ADMITTED.scope(admitted, shell.router.clone().oneshot(request)));
     let mut response = match tokio::time::timeout(ANSWER_DEADLINE, &mut task).await {
         Err(_) => {
             task.abort();
@@ -604,6 +744,78 @@ mod tests {
         // A proxy on this machine's loopback is the proxy there, and needs its mark.
         let local: IpAddr = "127.0.0.1".parse().unwrap();
         assert_eq!(peer(local, local), Peer::Proxy);
+    }
+
+    /// The lead's ruling of 28 Nov: a proxy named, over the real listener on loopback. Its
+    /// name's answer is a test's (no real lookup): the peer there is answered, another is
+    /// answered nothing, a new address is followed, and a name not found answers no one.
+    #[test]
+    fn a_proxy_named_is_answered_where_its_name_says_and_nowhere_else() {
+        use std::io::{Read, Write};
+        use std::sync::Mutex;
+        use std::time::Duration;
+
+        let at: Arc<Mutex<Option<IpAddr>>> = Arc::new(Mutex::new(Some("127.0.0.2".parse().unwrap())));
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let resolve: crate::proxy::Resolver = {
+            let (at, lookups) = (at.clone(), lookups.clone());
+            Arc::new(move |name: &str| {
+                assert_eq!(name, "npm");
+                lookups.fetch_add(1, Ordering::SeqCst);
+                let found = *at.lock().unwrap();
+                Box::pin(async move { found.map(|found| vec![found]).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no")) })
+            })
+        };
+        let fresh = Duration::from_millis(300);
+        let proxy = Proxy::named_with("npm".into(), resolve, false, fresh, fresh, Duration::from_secs(2));
+        let hello = Hello::for_accounts(crate::version(), proto::BackendId::from_bytes([7; 16]), proto::SPEAKS);
+        let shell = Shell::with_proxy(proxy, router(&hello), head::ROUTES.iter().copied().filter(|route| route.path == proto::HELLO).collect());
+        let (bound, listening) = std::sync::mpsc::channel();
+        let serving = shell.clone();
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap().block_on(async move {
+                let listener = listen("127.0.0.1:0".parse().unwrap()).unwrap();
+                bound.send(listener.local_addr().unwrap()).unwrap();
+                serve(listener, serving, false).await;
+            });
+        });
+        let to = listening.recv().unwrap();
+        let ask = |from: &str| -> Vec<u8> {
+            let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+            socket.bind(&std::net::SocketAddr::new(from.parse().unwrap(), 0).into()).unwrap();
+            socket.connect(&to.into()).unwrap();
+            let mut stream: std::net::TcpStream = socket.into();
+            stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+            let _ = stream.write_all(format!("GET {} HTTP/1.1\r\nHost: nexus.example.org\r\nX-Nexus-Scheme: https\r\n\r\n", proto::HELLO).as_bytes());
+            let mut written = Vec::new();
+            let _ = stream.read_to_end(&mut written);
+            written
+        };
+        let answered = |written: &[u8]| written.starts_with(b"HTTP/1.1 200 ");
+        assert!(answered(&ask("127.0.0.2")), "the peer at the name");
+        assert_eq!(ask("127.0.0.3"), b"", "another on the network: nothing");
+        assert_eq!(shell.refused(Refusal::Stranger), 1);
+        // The proxy started again elsewhere: followed once the answer is old.
+        *at.lock().unwrap() = Some("127.0.0.3".parse().unwrap());
+        std::thread::sleep(fresh + Duration::from_millis(100));
+        assert!(answered(&ask("127.0.0.3")));
+        assert_eq!(ask("127.0.0.2"), b"");
+        // The name not found: no one is the proxy; back when it is found again.
+        *at.lock().unwrap() = None;
+        std::thread::sleep(fresh + Duration::from_millis(100));
+        assert_eq!(ask("127.0.0.3"), b"");
+        assert_eq!(ask("127.0.0.2"), b"");
+        *at.lock().unwrap() = Some("127.0.0.2".parse().unwrap());
+        std::thread::sleep(fresh + Duration::from_millis(100));
+        assert!(answered(&ask("127.0.0.2")));
+        // A burst within one answer's life: one lookup more at most.
+        let before = lookups.load(Ordering::SeqCst);
+        for _ in 0..20 {
+            assert!(answered(&ask("127.0.0.2")));
+        }
+        assert!(lookups.load(Ordering::SeqCst) - before <= 1);
+        // The health check from this machine is unchanged.
+        assert!(answered(&ask("127.0.0.1")));
     }
 
     #[test]

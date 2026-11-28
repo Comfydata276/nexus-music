@@ -333,7 +333,7 @@ pub struct Controller {
     pub moving_downloads: Cell<bool>,
     /// The mix made to rules whose menu is open.
     pub menu_rule: Cell<Option<u64>>,
-    /// The last messages shown at the bottom of the window and when, for "Save diagnostics".
+    /// Legacy device-sync notices. Diagnostics drains these as typed counts on the window.
     pub said: RefCell<std::collections::VecDeque<(i64, String)>>,
     /// Something to say once the window is up (the settings file was damaged, say).
     startup_note: RefCell<Option<String>>,
@@ -486,6 +486,15 @@ pub struct Controller {
     /// The small player's window, once it's been opened, and whether it's showing.
     mini: RefCell<Option<ui::MiniPlayer>>,
     pub mini_open: Cell<bool>,
+}
+
+fn note_search_results(ticket: Option<crate::journal::SearchTicket>, page: &PageData) {
+    if ticket.is_some() {
+        let cards = page.lead.iter().chain(&page.shelves).map(|shelf| shelf.cards.len()).sum::<usize>();
+        let library = page.songs.len() + cards;
+        let outside = page.offers.len() + page.tail.iter().map(|shelf| shelf.cards.len()).sum::<usize>();
+        crate::journal::search_results(ticket, library, Some(outside));
+    }
 }
 
 impl Controller {
@@ -676,6 +685,7 @@ impl Controller {
         let seen: u64 = std::fs::read_to_string(&seen_file).ok().and_then(|text| text.trim().parse().ok()).unwrap_or(0);
         let crashed = size > seen;
         if crashed {
+            diagnostics::prior_crash(&self.paths.crash_log);
             // Whole or not at all: a number cut short would be taken for one that was seen.
             let _ = config::write_in_passing(&seen_file, size.to_string().as_bytes());
         }
@@ -746,13 +756,7 @@ impl Controller {
     }
 
     fn show_toast(&self, text: SharedString, action: &str, shown_for: Duration) {
-        {
-            let mut said = self.said.borrow_mut();
-            said.push_back((chrono::Utc::now().timestamp(), text.to_string()));
-            if said.len() > 40 {
-                said.pop_front();
-            }
-        }
+        diagnostics::observe(diagnostics::Line::Note(diagnostics::Note::AppMessage));
         let toast = self.ui.global::<ui::Toast>();
         toast.set_text(text);
         toast.set_action(action.into());
@@ -1150,6 +1154,11 @@ impl Controller {
                     .into(),
             );
         }
+    }
+
+    pub(crate) fn diagnostics_window_visible(&self) -> bool {
+        let window = self.ui.window();
+        (window.is_visible() && !window.is_minimized()) || self.mini_open.get()
     }
 
     /// Brings the window back from the tray or from behind other apps.
@@ -2498,10 +2507,17 @@ impl Controller {
         // The keyboard goes back to the player's shortcuts.
         let app = self.ui.global::<ui::App>();
         app.set_main_focus(app.get_main_focus().wrapping_add(1));
+        let query = app.get_search_text();
+        if !query.trim().is_empty() {
+            crate::journal::begin_search(&query, false);
+            crate::journal::search_results(
+                crate::journal::search_ticket(&query), self.suggestions.borrow().len(), None,
+            );
+        }
         match suggestion {
             Suggestion::Card(card) => self.open_card(&card.to_ui()),
             // A song picked from a search starts its radio: the song, then ones like it.
-            Suggestion::Song(song) => self.play_radio(song),
+            Suggestion::Song(song) => self.play_radio(song, &query),
         }
     }
 
@@ -2804,10 +2820,15 @@ impl Controller {
             }
             return;
         }
+        let search_ticket = match &route {
+            Route::Search(query) => crate::journal::search_ticket(query),
+            _ => None,
+        };
         let cached = if force { None } else { self.cached_page(&key) };
         // Something to draw immediately: a stored copy, or failing that the hint.
         let shown = match cached {
             Some((age, data)) => {
+                note_search_results(search_ticket, &data);
                 self.apply_page(data, scroll);
                 if age < FRESH_FOR {
                     return;
@@ -2828,7 +2849,10 @@ impl Controller {
             }
         };
         view.set_error("".into());
-        let (Some(client), Some(dir)) = (self.client(), self.pages_dir()) else { return };
+        let (Some(client), Some(dir)) = (self.client(), self.pages_dir()) else {
+            crate::journal::search_results(search_ticket, 0, None);
+            return;
+        };
         let file = dir.join(file_name(&key));
         self.api_pool.spawn(move || {
             let first = pages::load(&client, &route);
@@ -2838,6 +2862,7 @@ impl Controller {
                     let network = matches!(e, crate::subsonic::ApiError::Network(_));
                     let offline_home = matches!(route, Route::Home) && network;
                     return post(move |ctl| {
+                        crate::journal::search_results(search_ticket, 0, None);
                         if network && !ctl.settings.borrow().offline {
                             ctl.set_unreachable(true);
                         }
@@ -2880,6 +2905,7 @@ impl Controller {
             let whole = pages::enrich(&client, &route, &page, &mut publish).unwrap_or(page);
             store_page(&file, &whole);
             post(move |ctl| {
+                note_search_results(search_ticket, &whole);
                 ctl.remember(&key, Instant::now(), whole.clone());
                 ctl.observe_playlist(&whole);
                 ctl.source_list_now(&key, &whole.songs);
@@ -3975,6 +4001,16 @@ impl Controller {
                 let query = text.trim().to_string();
                 // Clearing the box while browsing elsewhere shouldn't yank you to Search.
                 let on_search = matches!(ctl.current_route(), Some(Route::Search(_)));
+                if !query.is_empty() {
+                    if crate::journal::recording() {
+                        crate::journal::begin_search(&query, crate::lidarr::current().is_some());
+                    }
+                    if matches!(ctl.current_route(), Some(Route::Search(ref current)) if *current == query) {
+                        if let Some(data) = ctl.search_whole.borrow().as_ref() {
+                            note_search_results(crate::journal::search_ticket(&query), data);
+                        }
+                    }
+                }
                 if !query.is_empty() || on_search {
                     ctl.navigate(Route::Search(query));
                 }
@@ -4363,7 +4399,16 @@ impl Controller {
             });
         });
         settings.on_set_offline(|on| {
-            with(|ctl| ctl.set_offline_mode(on));
+            with(|ctl| {
+                let changed = ctl.settings.borrow().offline != on;
+                if changed && on {
+                    diagnostics::offline_changed(true);
+                }
+                ctl.set_offline_mode(on);
+                if changed && !on {
+                    diagnostics::offline_changed(false);
+                }
+            });
         });
         settings.on_change_songs_folder(|| {
             with(|ctl| ctl.change_songs_folder());

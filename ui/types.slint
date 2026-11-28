@@ -694,6 +694,10 @@ export global Settings {
     in property <string> device-name;
     callback set-device-name(name: string);
     callback check-updates-now();
+    in property <bool> nexus-records-listening;
+    in property <bool> send-diagnostics: true;
+    in property <string> diagnostics-detail;
+    callback set-send-diagnostics(on: bool);
     callback save-diagnostics();
     callback preview-diagnostics();
     in-out property <string> diagnostics-preview;

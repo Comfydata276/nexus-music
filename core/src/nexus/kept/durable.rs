@@ -3,18 +3,65 @@
 
 use super::receipt::Purpose;
 use super::*;
-use crate::nexus::music::{CurrentEndpoints, MusicInstallation, VerifiedLogin};
+use crate::nexus::admin::{
+    InternalAddress, LIDARR_NONCE_BYTES, LidarrBinding, LidarrKey, LidarrSealingKey, SealedLidarrKey,
+};
+use crate::nexus::music::{MusicInstallation, VerifiedLogin};
 use std::collections::BTreeMap;
+
+pub const CLOCK_MARK_INTERVAL_MS: u64 = 60_000;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Clock {
-    pub now: u64,
-    pub high_water: u64,
+    now: u64,
+    high_water: u64,
+    floor: u64,
 }
 
 impl Clock {
-    pub fn effective(self) -> u64 {
+    /// A live clock with no restart allowance.
+    pub fn new(now: u64, high_water: u64) -> Self {
+        Self {
+            now,
+            high_water,
+            floor: 0,
+        }
+    }
+
+    /// Take the full interval that could have elapsed without a durable mark.
+    /// The floor is local to this process and never goes in Effects.
+    pub fn after_load(now: u64, persisted: u64) -> Self {
+        Self {
+            now,
+            high_water: persisted,
+            floor: persisted.saturating_add(CLOCK_MARK_INTERVAL_MS),
+        }
+    }
+
+    /// Retain the load floor and the latest actual observation for a new turn.
+    pub fn observe(self, now: u64) -> Self {
+        Self {
+            now,
+            high_water: self.mark(),
+            floor: self.floor,
+        }
+    }
+
+    fn mark(self) -> u64 {
         self.now.max(self.high_water)
+    }
+
+    pub fn effective(self) -> u64 {
+        self.mark().max(self.floor)
+    }
+
+    /// Keep the time of a clock-only decision, such as rejecting a code before
+    /// its account is loaded. Judge at `effective()` and persist these effects.
+    pub fn observation_effects(self) -> Effects {
+        Effects {
+            high_water: self.mark(),
+            updates: Vec::new(),
+        }
     }
 }
 
@@ -56,22 +103,57 @@ pub struct Apart {
     pub devices: BTreeMap<DeviceId, ApartDevice>,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+/// The keeper matches every variant explicitly. A new data effect requires
+/// an implementation at its application site.
+#[derive(Clone, Eq, PartialEq)]
 pub enum DataChange {
     Keep,
     ChangePassword,
     ResetPassword,
+    OwnerRecovery {
+        code_verifier: Fingerprint,
+    },
     RedeemCode {
         code: u64,
         verifier: Fingerprint,
     },
     EraseHistory,
+    /// Delete the password verifier and every code in the same transaction as
+    /// the data rows that drop the sessions.
+    DiscardCredentials,
     DeleteAccount,
     ApplyAdmin {
         action: AdminAction,
         target: AdminTarget,
     },
     InstallMusicLogin(MusicInstallation),
+    /// The target account's switch and its successor revision for the data write.
+    SetRequestsEnabled { enabled: bool, revision: u64 },
+    /// Write the new revision and seal to the apart store with the spent grant.
+    /// The data transaction must never store the seal.
+    InstallLidarrKey {
+        binding: LidarrBinding,
+        sealed: SealedLidarrKey,
+    },
+}
+
+impl fmt::Debug for DataChange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Keep => "Keep",
+            Self::ChangePassword => "ChangePassword",
+            Self::ResetPassword => "ResetPassword",
+            Self::OwnerRecovery { .. } => "OwnerRecovery",
+            Self::RedeemCode { .. } => "RedeemCode",
+            Self::EraseHistory => "EraseHistory",
+            Self::DiscardCredentials => "DiscardCredentials",
+            Self::DeleteAccount => "DeleteAccount",
+            Self::ApplyAdmin { .. } => "ApplyAdmin",
+            Self::InstallMusicLogin(_) => "InstallMusicLogin",
+            Self::SetRequestsEnabled { .. } => "SetRequestsEnabled",
+            Self::InstallLidarrKey { .. } => "InstallLidarrKey",
+        })
+    }
 }
 
 /// When credentials must be renewed, S3/S9 apply this alongside the data changes.
@@ -95,11 +177,18 @@ pub struct Update {
 
 #[derive(Debug)]
 pub struct Effects {
-    /// Persist even when there are no row updates. A denied operation can
-    /// observe grant or code expiry, and a restarted clock must not undo that.
-    /// The hourly write limit is for last_used; the clock is a separate fence.
+    /// The actual observed mark, excluding any process-local restart allowance.
+    /// Retain on every turn and persist with row changes or at the mark interval.
     pub high_water: u64,
     pub updates: Vec<Update>,
+}
+
+impl Effects {
+    /// The server also marks a write for changes it adds to this step's rows.
+    pub fn clock_mark_due(&self, last_persisted: u64) -> bool {
+        !self.updates.is_empty()
+            || self.high_water.saturating_sub(last_persisted) >= CLOCK_MARK_INTERVAL_MS
+    }
 }
 
 #[must_use = "apply the durable effects even when the request was refused"]
@@ -184,7 +273,7 @@ impl Account {
                     // Only a reload allows the maximum unrecorded interval.
                     last_accepted: session
                         .as_ref()
-                        .map(|s| s.last_used.saturating_add(USE_WRITE_MS - 1)),
+                        .map(|s| s.kind.reload_activity(s.last_used)),
                     session,
                 },
             );
@@ -268,6 +357,29 @@ impl Account {
         self.request(self.state.restore, clock, operation)
     }
 
+    /// Only the owner's container command calls this, under the store's write
+    /// lock. The code is offered to the owner only after its effects are applied.
+    pub fn owner_recover(
+        &mut self,
+        clock: Clock,
+        code_verifier: Fingerprint,
+    ) -> Decision<Result<LiveCode, Denied>> {
+        self.sign_in_turn(clock, |turn| {
+            let account = turn.account;
+            if account.state.status == Status::Deleted {
+                return Err(Denied::NotSignedIn);
+            }
+            let code = account.reset_password(turn.now)?;
+            account.state.status = Status::On;
+            account.state.admin = true;
+            *turn.change = DataChange::OwnerRecovery { code_verifier };
+            if account.state.music_managed {
+                require_music_rotation(account, turn.music);
+            }
+            Ok(code)
+        })
+    }
+
     pub fn request<T>(
         &mut self,
         restore: u64,
@@ -275,10 +387,7 @@ impl Account {
         operation: impl FnOnce(Turn<'_>) -> Result<T, Denied>,
     ) -> Decision<Result<T, Denied>> {
         let now = clock.effective();
-        let mut effects = Effects {
-            high_water: now,
-            updates: Vec::new(),
-        };
+        let mut effects = clock.observation_effects();
         let answer = if restore != self.state.restore {
             Err(Denied::StartAgain)
         } else {
@@ -338,7 +447,10 @@ impl Account {
         }
         // Changing the live identity retires the previous code at the first cut.
         // A newly issued code still requires its own matching data verifier.
-        if change != DataChange::ResetPassword {
+        if !matches!(
+            change,
+            DataChange::ResetPassword | DataChange::OwnerRecovery { .. }
+        ) {
             first.code = first.code.map(|code| LiveCode {
                 used: code.used || old.code != Some(code),
                 ..code
@@ -402,25 +514,102 @@ impl Account {
         Ok(())
     }
 
-    fn change_password(
+    fn change_password(&mut self, keep: Option<DeviceId>) -> Result<(), Denied> {
+        let changes = next(self.state.password_changes)?;
+        let code = self.state.code.map(|code| LiveCode { used: true, ..code });
+        self.password_transition(keep, changes, code, false)
+    }
+
+    fn reset_password(&mut self, now: u64) -> Result<LiveCode, Denied> {
+        let changes = next(self.state.password_changes)?;
+        let code = LiveCode::new(changes, now)?;
+        self.password_transition(None, changes, Some(code), true)?;
+        Ok(code)
+    }
+
+    fn password_transition(
         &mut self,
         keep: Option<DeviceId>,
+        changes: u64,
+        code: Option<LiveCode>,
         reset: bool,
-        now: u64,
     ) -> Result<(), Denied> {
-        let changes = next(self.state.password_changes)?;
         let revision = next(self.state.revision)?;
-        let code = if reset {
-            Some(LiveCode::new(changes, now)?)
-        } else {
-            self.state.code.map(|code| LiveCode { used: true, ..code })
-        };
         self.end_others(keep)?;
         self.state.password_changes = changes;
         self.state.revision = revision;
         self.state.password_reset_required = reset;
         self.state.code = code;
         Ok(())
+    }
+
+    /// Recovery works from the data when the store is unavailable, and from
+    /// both when a matching apart record can still be read. S3/S8 use the
+    /// returned fences and discard the stored password verifier and codes.
+    pub fn recover_from_lost_store(
+        rows: &Rows,
+        readable: Option<&Apart>,
+        new_restore: u64,
+        clock: Clock,
+    ) -> Decision<Result<(), Denied>> {
+        let baseline;
+        let authority = match readable {
+            Some(apart) => apart,
+            None => {
+                baseline = Apart {
+                    account: rows.account.clone(),
+                    devices: BTreeMap::new(),
+                };
+                &baseline
+            }
+        };
+        Self::restore(
+            authority,
+            Some(rows),
+            new_restore,
+            RestoreMode::Adopt,
+            clock,
+        )
+    }
+
+    fn merge_adoption_baseline(&mut self, rows: &Rows) {
+        let data = &rows.account;
+        let state = &mut self.state;
+        state.status = match (state.status, data.status) {
+            (Status::Deleted, _) | (_, Status::Deleted) => Status::Deleted,
+            (Status::Off, _) | (_, Status::Off) => Status::Off,
+            _ => Status::On,
+        };
+        state.admin &= data.admin && state.status != Status::Deleted;
+        state.history_held |= data.history_held;
+        state.life = state.life.max(data.life);
+        state.revision = state.revision.max(data.revision);
+        state.password_changes = state.password_changes.max(data.password_changes);
+        state.music_login = state.music_login.max(data.music_login);
+        state.music_recovery = state.music_recovery.or(data.music_recovery);
+        for (&id, row) in &rows.devices {
+            let device = self
+                .devices
+                .entry(id)
+                .or_insert_with(|| Device::new(id, row.secret.clone()));
+            // A data row ahead of a partial store does not establish that the
+            // device escaped force-out. It may become known after signing in.
+            if row.number > device.number {
+                device.known = false;
+                device.number = row.number;
+            }
+            if let Some(session) = &row.session {
+                device.last_session = device.last_session.max(session.id.get());
+                if let Some(leave) = &session.leave {
+                    device.last_leave = device.last_leave.max(leave.serial);
+                }
+            }
+        }
+        if state.status == Status::Deleted {
+            for device in self.devices.values_mut() {
+                device.secret = None;
+            }
+        }
     }
 
     /// S3 calls once per account before serving any request, all under one new
@@ -432,11 +621,7 @@ impl Account {
         mode: RestoreMode,
         clock: Clock,
     ) -> Decision<Result<(), Denied>> {
-        let high_water = clock.effective();
-        let mut effects = Effects {
-            high_water,
-            updates: Vec::new(),
-        };
+        let mut effects = clock.observation_effects();
         let answer = Self::restore_update(apart, data, new_restore, mode)
             .map(|update| effects.updates.extend(update));
         Decision { effects, answer }
@@ -448,6 +633,9 @@ impl Account {
         new_restore: u64,
         mode: RestoreMode,
     ) -> Result<Option<Update>, Denied> {
+        if data.is_some_and(|rows| !apart.account.same_account(&rows.account)) {
+            return Err(Denied::WrongPurpose);
+        }
         let mut account = Self::load(apart, data);
         if new_restore < account.state.restore
             || data.is_some_and(|data| new_restore < data.account.restore)
@@ -456,20 +644,37 @@ impl Account {
         }
         let advancing = new_restore > account.state.restore;
         if advancing {
+            if mode == RestoreMode::Adopt {
+                if let Some(rows) = data {
+                    account.merge_adoption_baseline(rows);
+                }
+                account.state.password_reset_required = true;
+                account.state.code = None;
+                if account.state.status != Status::Deleted {
+                    account.state.password_changes = next(account.state.password_changes)?;
+                    account.state.revision = next(account.state.revision)?;
+                }
+            }
             for device in account.devices.values_mut() {
                 device.number = next(device.number)?;
                 device.session = None;
                 device.last_accepted = None;
             }
             account.state.restore = new_restore;
-            if mode == RestoreMode::Adopt && account.state.status != Status::Deleted {
-                account.state.password_reset_required = true;
-                account.state.code = None;
-                account.state.revision = next(account.state.revision)?;
-            }
         }
         let change = if account.state.status == Status::Deleted {
             DataChange::DeleteAccount
+        } else if mode == RestoreMode::Adopt {
+            // Repeating the same plan must have the apart credential fence
+            // from its first write. Repeat the data purge without moving it.
+            if !advancing
+                && (!apart.account.password_reset_required
+                    || apart.account.code.is_some()
+                    || apart.devices.values().any(|device| device.permit.is_some()))
+            {
+                return Err(Denied::StartAgain);
+            }
+            DataChange::DiscardCredentials
         } else {
             DataChange::Keep
         };
@@ -494,7 +699,8 @@ impl Account {
     }
 }
 
-/// Adoption uses an apart baseline rebuilt by S3 from data, including the new keys.
+/// Adopt is the operator's recovery with lost authority. WholeMachine is the
+/// session-only response to an ahead stamp, not the operator's recovery command.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum RestoreMode {
     DataOnly,
@@ -557,6 +763,7 @@ pub struct SessionGrant {
     pub account: AccountId,
     pub device: DeviceId,
     pub session: SessionId,
+    pub kind: SessionKind,
     pub music_login: u64,
 }
 
@@ -664,7 +871,23 @@ impl Turn<'_> {
         fresh: FreshSession,
         previous: Option<&mut Account>,
     ) -> Result<SessionGrant, Denied> {
-        self.sign_in_checked(receipt, fresh, previous, None)
+        self.sign_in_as(SessionKind::App, receipt, fresh, previous)
+    }
+
+    /// The backend selects AdminPage only on its configured browser sign-in
+    /// path. It is never selected by a field in the app request.
+    ///
+    /// Map WrongPassword to the same refusal as a wrong password check and
+    /// record it as wrong at the selected password door. A non-admin who
+    /// supplied the right password returns that exact same Denied variant.
+    pub fn sign_in_as(
+        self,
+        kind: SessionKind,
+        receipt: PasswordReceipt,
+        fresh: FreshSession,
+        previous: Option<&mut Account>,
+    ) -> Result<SessionGrant, Denied> {
+        self.sign_in_checked(kind, receipt, fresh, previous, None)
     }
 
     /// Spend the code apart first, then write the new verifier and the session in
@@ -676,11 +899,25 @@ impl Turn<'_> {
         fresh: FreshSession,
         previous: Option<&mut Account>,
     ) -> Result<SessionGrant, Denied> {
-        self.sign_in_checked(receipt, fresh, previous, Some(verifier))
+        self.redeem_code_as(SessionKind::App, receipt, verifier, fresh, previous)
+    }
+
+    /// The AdminPage wrong-password refusal and door rule are the same as in
+    /// sign_in_as. No code is spent on that refusal.
+    pub fn redeem_code_as(
+        self,
+        kind: SessionKind,
+        receipt: PasswordReceipt,
+        verifier: Fingerprint,
+        fresh: FreshSession,
+        previous: Option<&mut Account>,
+    ) -> Result<SessionGrant, Denied> {
+        self.sign_in_checked(kind, receipt, fresh, previous, Some(verifier))
     }
 
     fn sign_in_checked(
         self,
+        kind: SessionKind,
         receipt: PasswordReceipt,
         fresh: FreshSession,
         previous: Option<&mut Account>,
@@ -697,7 +934,11 @@ impl Turn<'_> {
                 .state
                 .scope(&Device::new(id, fresh.hash.clone())),
         };
-        let (secret, is_new, code) = match (receipt.consume(&scope, self.now)?, verifier) {
+        let purpose = receipt.consume(&scope, self.now)?;
+        if kind == SessionKind::AdminPage && !self.account.state.admin {
+            return Err(Denied::WrongPassword);
+        }
+        let (secret, is_new, code) = match (purpose, verifier) {
             (Purpose::SignIn { secret, is_new }, None) => {
                 self.account.state.allows_session()?;
                 (secret, is_new, None)
@@ -749,6 +990,7 @@ impl Turn<'_> {
         device.end()?;
         device.session = Some(Session {
             id: fresh.id,
+            kind,
             hash: fresh.hash,
             sign_out: fresh.sign_out,
             last_used: self.now,
@@ -759,7 +1001,7 @@ impl Turn<'_> {
 
         let redeemed = if let Some((code, verifier)) = code {
             let mut account = self.account.clone();
-            account.change_password(Some(id), false, self.now)?;
+            account.change_password(Some(id))?;
             Some((account, DataChange::RedeemCode { code, verifier }))
         } else {
             None
@@ -794,23 +1036,31 @@ impl Turn<'_> {
             account: self.account.state.id,
             device: id,
             session: fresh.id,
+            kind,
             music_login: self.account.state.music_login,
         })
     }
 
+    /// Use this when an authenticated caller asks for a music login. The
+    /// returned kind comes from the live session, never the request.
+    pub fn session_kind(self, bearer: Bearer<'_>) -> Result<SessionKind, Denied> {
+        Ok(self
+            .account
+            .session(bearer.device, bearer.hash, self.now)?
+            .kind)
+    }
+
     pub fn check_leave(
-        self,
+        mut self,
         bearer: Bearer<'_>,
         intent: GrantIntent,
         expected: Fingerprint,
     ) -> Result<PasswordCheck, Denied> {
-        let session = self
-            .account
-            .session(bearer.device, bearer.hash, self.now)?
-            .id;
-        if matches!(&intent.change, LeaveFor::Admin { .. }) && !self.account.state.admin {
-            return Err(Denied::AdminRequired);
-        }
+        let session = if matches!(&intent.change, LeaveFor::Admin { .. }) {
+            self.admin_session(&bearer)?
+        } else {
+            self.account.session(bearer.device, bearer.hash, self.now)?.id
+        };
         Ok(PasswordCheck::new(
             self.account.scope(bearer.device)?,
             Purpose::Leave { session, intent },
@@ -843,7 +1093,9 @@ impl Turn<'_> {
             .as_mut()
             .filter(|s| s.id == session)
             .ok_or(Denied::NotSignedIn)?;
-        if matches!(&intent.change, LeaveFor::Admin { .. }) && !self.account.state.admin {
+        if matches!(&intent.change, LeaveFor::Admin { .. })
+            && (!self.account.state.admin || row.kind != SessionKind::AdminPage)
+        {
             return Err(Denied::AdminRequired);
         }
         device.last_leave = next(device.last_leave)?;
@@ -863,14 +1115,13 @@ impl Turn<'_> {
     }
 
     pub fn arrive(self, bearer: Bearer<'_>, access: Access) -> Result<Request, Denied> {
-        let session_id = self
-            .account
-            .session(bearer.device, bearer.hash, self.now)?
-            .id;
+        let session = self.account.session(bearer.device, bearer.hash, self.now)?;
+        let (session_id, kind) = (session.id, session.kind);
         access.check(&self.account.state)?;
         Ok(Request {
             scope: self.account.scope(bearer.device)?,
             session_id,
+            kind,
             access,
             arrived: self.now,
         })
@@ -970,7 +1221,7 @@ impl Turn<'_> {
     pub fn change_password(mut self, bearer: Bearer<'_>) -> Result<(), Denied> {
         let keep = bearer.device;
         self.consume_leave(bearer, LeaveFor::ChangePassword)?;
-        self.account.change_password(Some(keep), false, self.now)?;
+        self.account.change_password(Some(keep))?;
         *self.change = DataChange::ChangePassword;
         Ok(())
     }
@@ -1005,9 +1256,7 @@ impl Turn<'_> {
         bearer: Bearer<'_>,
         target: Option<&Account>,
     ) -> Result<MusicAuthorization, Denied> {
-        if !self.account.state.admin {
-            return Err(Denied::AdminRequired);
-        }
+        let session = self.admin_session(&bearer)?;
         let target_state = &target.unwrap_or(self.account).state;
         if target_state.backend != self.account.state.backend
             || target_state.restore != self.account.state.restore
@@ -1020,7 +1269,6 @@ impl Turn<'_> {
         let target_revision = target_state.revision;
         let next_count = next(target_state.music_login)?;
         let device = bearer.device;
-        let hash = bearer.hash;
         let grant = self.consume_leave(
             bearer,
             LeaveFor::Admin {
@@ -1028,7 +1276,6 @@ impl Turn<'_> {
                 target: named,
             },
         )?;
-        let session = self.account.session(device, hash, self.now)?.id;
         Ok(MusicAuthorization {
             actor: self.account.scope(device)?,
             session,
@@ -1040,22 +1287,18 @@ impl Turn<'_> {
         })
     }
 
-    /// Install the verified login only while the same authorization and endpoints
-    /// are current. S3 commits the count and sealed bytes under the same lock.
+    /// Install the verified login only while the same authorization and internal
+    /// address are current. S3 commits the count and sealed bytes under the same lock.
     pub fn install_music(
-        self,
+        mut self,
         bearer: Bearer<'_>,
         verified: VerifiedLogin,
-        endpoints: CurrentEndpoints<'_>,
+        internal: &str,
         target: Option<&mut Account>,
     ) -> Result<u64, Denied> {
-        let (auth, login) = verified.into_parts(endpoints).ok_or(Denied::WrongPurpose)?;
-        let session = self
-            .account
-            .session(bearer.device, bearer.hash, self.now)?
-            .id;
-        if !self.account.state.admin
-            || self.account.scope(bearer.device)? != auth.actor
+        let session = self.admin_session(&bearer)?;
+        let (auth, login) = verified.into_parts(internal).ok_or(Denied::WrongPurpose)?;
+        if self.account.scope(bearer.device)? != auth.actor
             || session != auth.session
             || bearer.grant.map(|grant| grant.request_id) != Some(auth.request_id)
             || !within(auth.granted, self.now, PASSWORD_LEAVE_MS)
@@ -1081,13 +1324,68 @@ impl Turn<'_> {
         Ok(auth.next_count)
     }
 
-    pub fn admin_read(self, bearer: Bearer<'_>) -> Result<(), Denied> {
-        self.account.session(bearer.device, bearer.hash, self.now)?;
-        if self.account.state.admin {
-            Ok(())
+    /// Require a live admin page session for an admin route. The server also
+    /// checks the page marker and browser Origin before calling this.
+    pub fn admin_read(mut self, bearer: Bearer<'_>) -> Result<(), Denied> {
+        self.admin_session(&bearer).map(|_| ())
+    }
+
+    fn admin_session(&mut self, bearer: &Bearer<'_>) -> Result<SessionId, Denied> {
+        let admin = self.account.state.admin;
+        let session = self.account.session(bearer.device, bearer.hash, self.now)?;
+        if admin && session.kind == SessionKind::AdminPage {
+            Ok(session.id)
         } else {
             Err(Denied::AdminRequired)
         }
+    }
+
+    /// Under the writer lock, use the current container address and apart-store
+    /// revision. Persist the sealed key and successor revision apart first.
+    pub fn set_lidarr(
+        mut self,
+        bearer: Bearer<'_>,
+        current: &LidarrBinding,
+        key: &LidarrKey,
+        sealing: &LidarrSealingKey,
+        nonce: [u8; LIDARR_NONCE_BYTES],
+    ) -> Result<(), Denied> {
+        self.admin_session(&bearer)?;
+        if current.backend != self.account.state.backend {
+            return Err(Denied::WrongPurpose);
+        }
+        self.consume_leave(
+            bearer,
+            LeaveFor::Admin {
+                action: AdminAction::lidarr(key, current),
+                target: AdminTarget::Backend,
+            },
+        )?;
+        let binding = LidarrBinding { revision: next(current.revision)?, ..current.clone() };
+        let sealed = sealing.seal(&binding, key, nonce).ok_or(Denied::WrongPurpose)?;
+        *self.change = DataChange::InstallLidarrKey { binding, sealed };
+        Ok(())
+    }
+
+    /// Load the target and its current switch revision under the same writer
+    /// lock used to apply the effects. A stale switch grant cannot be spent.
+    pub fn set_requests_enabled(
+        mut self,
+        bearer: Bearer<'_>,
+        account: AccountId,
+        enabled: bool,
+        switch_revision: u64,
+        target: Option<&mut Account>,
+    ) -> Result<(), Denied> {
+        self.admin_session(&bearer)?;
+        let selected = &target.as_deref().unwrap_or(self.account).state;
+        if selected.id != account {
+            return Err(Denied::WrongPurpose);
+        }
+        let named = selected.admin_target();
+        self.administer_to(
+            bearer, AdminAction::SetRequests { enabled, revision: switch_revision }, named, target,
+        )
     }
 
     /// Other account, or None for a change to the actor's own account or a global
@@ -1100,12 +1398,23 @@ impl Turn<'_> {
         named: AdminTarget,
         target: Option<&mut Account>,
     ) -> Result<(), Denied> {
-        if !self.account.state.admin {
-            return Err(Denied::AdminRequired);
-        }
-        if action == AdminAction::MusicLoginChanged {
+        self.admin_session(&bearer)?;
+        if matches!(
+            action,
+            AdminAction::MusicLoginChanged | AdminAction::SetLidarr { .. } | AdminAction::SetRequests { .. }
+        ) {
             return Err(Denied::WrongPurpose);
         }
+        self.administer_to(bearer, action, named, target)
+    }
+
+    fn administer_to(
+        mut self,
+        bearer: Bearer<'_>,
+        action: AdminAction,
+        named: AdminTarget,
+        target: Option<&mut Account>,
+    ) -> Result<(), Denied> {
         self.consume_leave(
             bearer,
             LeaveFor::Admin {
@@ -1194,15 +1503,27 @@ pub enum AdminAction {
     CreateAccount,
     SetMusicAddress(MusicAddress),
     SetDiagnosticsDefault(bool),
-    SetRequests(bool),
-    SetLidarr,
+    SetRequests { enabled: bool, revision: u64 },
+    SetLidarr {
+        fingerprint: Fingerprint,
+        address: InternalAddress,
+        revision: u64,
+    },
 }
 
 impl AdminAction {
+    pub(in crate::nexus) fn lidarr(key: &LidarrKey, current: &LidarrBinding) -> Self {
+        Self::SetLidarr {
+            fingerprint: key.fingerprint().clone(),
+            address: current.address.clone(),
+            revision: current.revision,
+        }
+    }
+
     fn matches_target(&self, target: &AdminTarget, selected: &AccountState, other: bool) -> bool {
         match self {
             Self::CreateAccount => matches!(target, AdminTarget::NewAccount(_)) && !other,
-            Self::SetMusicAddress(_) | Self::SetDiagnosticsDefault(_) | Self::SetLidarr => {
+            Self::SetMusicAddress(_) | Self::SetDiagnosticsDefault(_) | Self::SetLidarr { .. } => {
                 *target == AdminTarget::Backend && !other
             }
             _ => *target == selected.admin_target(),
@@ -1258,7 +1579,7 @@ fn admin_change(
             *change = DataChange::DeleteAccount;
         }
         AdminAction::ResetPassword => {
-            account.change_password(None, true, now)?;
+            account.reset_password(now)?;
             *change = DataChange::ResetPassword;
             if account.state.music_managed {
                 require_music_rotation(account, music);
@@ -1278,12 +1599,17 @@ fn admin_change(
             }
         }
         AdminAction::ForceOut(device) => force_out(account, device, music)?,
-        AdminAction::MusicLoginChanged => return Err(Denied::WrongPurpose),
+        AdminAction::MusicLoginChanged | AdminAction::SetLidarr { .. } => {
+            return Err(Denied::WrongPurpose);
+        }
+        AdminAction::SetRequests { enabled, revision } => {
+            // The design does not say whether setting the existing value advances
+            // the revision. Advance it on every accepted write to fence other grants.
+            *change = DataChange::SetRequestsEnabled { enabled, revision: next(revision)? };
+        }
         AdminAction::CreateAccount
         | AdminAction::SetMusicAddress(_)
-        | AdminAction::SetDiagnosticsDefault(_)
-        | AdminAction::SetRequests(_)
-        | AdminAction::SetLidarr => *change = DataChange::ApplyAdmin { action, target },
+        | AdminAction::SetDiagnosticsDefault(_) => *change = DataChange::ApplyAdmin { action, target },
     }
     Ok(())
 }

@@ -3,7 +3,10 @@
 //!
 //! None of them is secret, so the log may say what they are.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
+
+pub use crate::proxy::ProxySetting;
+use nexus_core::nexus::admin::InternalAddress;
 use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -11,16 +14,33 @@ pub struct Settings {
     /// The music server as the container reaches it, e.g. `http://navidrome:4533`. Not used
     /// at stage 1's first slice; checked all the same, so that a wrong one is said now.
     pub music_server: String,
-    /// The one address the proxy connects to this container from.
-    pub proxy: IpAddr,
+    /// Who the proxy is: the one address it connects to this container from, or the name of
+    /// its container on a network they share, looked up as connections come ([`crate::proxy`]).
+    pub proxy: ProxySetting,
     pub data: PathBuf,
     pub state: PathBuf,
     pub listen: SocketAddr,
+    /// The admin's page's own origin, exactly as a browser sends it in `Origin`
+    /// (`NEXUS_PUBLIC_ORIGIN`, the lead's ruling of 13:46; design 7.3, 19.2): `https://` and a
+    /// name, and a port if not 443, nothing else. The page's two calls with no session (its
+    /// sign-in and setting up) are taken only from it. Unset, they are refused.
+    pub public_origin: Option<String>,
+    /// How large the data may grow, in bytes, before new events wait (`NEXUS_DATA_BUDGET`,
+    /// design 19.2; S12's intake). 4 GB unless given.
+    pub data_budget: u64,
+    /// Lidarr as this container reaches it (`NEXUS_LIDARR`, design 16; step 3), e.g.
+    /// `http://lidarr:8686`: plain HTTP is allowed, as it is inside the container's network.
+    /// Unset, requests through the backend are not set up. Never set from the admin's page:
+    /// the backend connects to this and to no address the page gives.
+    pub lidarr: Option<InternalAddress>,
 }
 
 pub const DATA_DEFAULT: &str = "/data";
 pub const STATE_DEFAULT: &str = "/state";
 pub const LISTEN_DEFAULT: &str = "0.0.0.0:8080";
+pub const DATA_BUDGET_DEFAULT: u64 = 4_000_000_000;
+/// Less than this is surely a slip (a number of gigabytes written without its unit, say).
+pub const DATA_BUDGET_LEAST: u64 = 1_000_000;
 
 impl Settings {
     /// Reads the settings through `get` (the environment, or a test's table). A value that is
@@ -35,11 +55,10 @@ impl Settings {
             })?,
         };
         let proxy = match setting("NEXUS_PROXY") {
-            None => return Err("NEXUS_PROXY is missing: give the one address the proxy connects to this container from, for example 172.18.0.2".into()),
-            Some(value) => match value.parse::<IpAddr>() {
-                Ok(address) if !address.to_canonical().is_unspecified() && !address.to_canonical().is_multicast() => address.to_canonical(),
-                _ => return Err("NEXUS_PROXY is wrong: give one IP address (not a name, a range or a port), the one the proxy connects to this container from, for example 172.18.0.2".into()),
-            },
+            None => return Err("NEXUS_PROXY is missing: give the one address the proxy connects to this container from, for example 172.18.0.2, or the name of the proxy's container on a network it shares with this one, for example Nginx-Proxy-Manager-Official".into()),
+            Some(value) => value.parse::<ProxySetting>().map_err(|_| {
+                "NEXUS_PROXY is wrong: give one IP address (not a range or a port), the one the proxy connects to this container from, for example 172.18.0.2, or the plain name of the proxy's container (no scheme, port, path or space), for example Nginx-Proxy-Manager-Official".to_string()
+            })?,
         };
         let folder = |name: &str, default: &str| -> Result<PathBuf, String> {
             let value = setting(name).unwrap_or_else(|| default.to_string());
@@ -66,7 +85,25 @@ impl Settings {
             Ok(listen) if listen.port() != 0 => listen,
             _ => return Err(format!("NEXUS_LISTEN is wrong: give an address and a port other than 0, for example {LISTEN_DEFAULT}")),
         };
-        Ok(Settings { music_server, proxy, data, state, listen })
+        let public_origin = match setting("NEXUS_PUBLIC_ORIGIN") {
+            None => None,
+            Some(value) => Some(public_origin(&value).ok_or_else(|| {
+                "NEXUS_PUBLIC_ORIGIN is wrong: give the admin's page's address as a browser has it, https:// and the name (and :port if it is not 443), with nothing after it, for example https://nexus.example.org".to_string()
+            })?),
+        };
+        let data_budget = match setting("NEXUS_DATA_BUDGET") {
+            None => DATA_BUDGET_DEFAULT,
+            Some(value) => data_budget(&value).ok_or_else(|| {
+                format!("NEXUS_DATA_BUDGET is wrong: give how large the data may grow, as a whole number of bytes or with MB, GB or TB after it, at least 1 MB, for example 4GB (the default is {DATA_BUDGET_DEFAULT} bytes)")
+            })?,
+        };
+        let lidarr = match setting("NEXUS_LIDARR") {
+            None => None,
+            Some(value) => Some(lidarr(&value).ok_or_else(|| {
+                "NEXUS_LIDARR is wrong: give Lidarr as this container reaches it, http:// or https://, a host, and if need be a port and a path, with nothing else (no name, password, query or #), for example http://lidarr:8686".to_string()
+            })?),
+        };
+        Ok(Settings { music_server, proxy, data, state, listen, public_origin, data_budget, lidarr })
     }
 
     /// Whether both folders are there, and apart on the disk as well as in their names: not
@@ -86,6 +123,43 @@ impl Settings {
         }
         Ok(())
     }
+}
+
+/// Lidarr's address as the container reaches it: core's own reading of an internal address
+/// (what a Lidarr key is sealed to), and written as it is read, so that the address the key is
+/// bound to is the one given.
+fn lidarr(value: &str) -> Option<InternalAddress> {
+    let address = InternalAddress::new(value)?;
+    (address.as_str() == value && (value.starts_with("http://") || value.starts_with("https://"))).then_some(address)
+}
+
+/// An origin as a browser writes it in `Origin`: `https://`, a host in its one plain form (as
+/// the shared reading of an address gives it, 7.1), and a port only if not 443. Anything else,
+/// or anything not already in that form, is not one.
+fn public_origin(value: &str) -> Option<String> {
+    let rest = value.strip_prefix("https://")?;
+    if rest.is_empty() || rest.contains(['/', '?', '#', '@']) {
+        return None;
+    }
+    let origin = nexus_core::nexus::account::NexusOrigin::typed(value).ok()?;
+    let plain = origin.origin().to_string();
+    (plain == value).then_some(plain)
+}
+
+/// A size: a whole number of bytes, or of MB, GB or TB (a thousand to the next; the unit in any
+/// case, a space before it or not), at least [`DATA_BUDGET_LEAST`].
+fn data_budget(value: &str) -> Option<u64> {
+    let digits = value.find(|c: char| !c.is_ascii_digit()).unwrap_or(value.len());
+    let (number, unit) = value.split_at(digits);
+    let number: u64 = number.parse().ok()?;
+    let times: u64 = match unit.trim_start().to_ascii_uppercase().as_str() {
+        "" => 1,
+        "MB" => 1_000_000,
+        "GB" => 1_000_000_000,
+        "TB" => 1_000_000_000_000,
+        _ => return None,
+    };
+    number.checked_mul(times).filter(|bytes| *bytes >= DATA_BUDGET_LEAST)
 }
 
 /// Whether two paths are one folder on the disk (two mounts of it, say).
@@ -135,8 +209,19 @@ fn music_server(value: &str) -> Option<String> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::net::IpAddr;
 
     #[cfg(unix)]
+    #[test]
+    fn the_public_origin_is_taken_only_as_a_browser_writes_one() {
+        for good in ["https://nexus.example.org", "https://nexus.example.org:8443"] {
+            assert_eq!(public_origin(good).as_deref(), Some(good), "{good}");
+        }
+        for bad in ["http://nexus.example.org", "nexus.example.org", "https://nexus.example.org/", "https://nexus.example.org/nexus/", "https://Nexus.example.org", "https://nexus.example.org:443", "https://a@nexus.example.org", "https://nexus.example.org?x", "https://"] {
+            assert_eq!(public_origin(bad), None, "{bad}");
+        }
+    }
+
     #[test]
     fn folders_apart_in_name_but_not_on_the_disk_are_refused() {
         let root = std::env::temp_dir().join(format!("nexus-server-settings-{}", std::process::id()));
@@ -152,6 +237,9 @@ mod tests {
             data: root.join("data"),
             state: root.join(state),
             listen: "0.0.0.0:8080".parse().unwrap(),
+            public_origin: None,
+            data_budget: DATA_BUDGET_DEFAULT,
+            lidarr: None,
         };
         assert_eq!(settings("state").check_folders(), Ok(()));
         for state in ["state-link", "inner-link"] {
@@ -215,8 +303,12 @@ mod tests {
             ("NEXUS_MUSIC_SERVER", "http://[::1]x"),
             ("NEXUS_MUSIC_SERVER", "http://navidrome/../rest"),
             ("NEXUS_MUSIC_SERVER", "http://navidrome//music"),
-            ("NEXUS_PROXY", "npm"),
             ("NEXUS_PROXY", "172.18.0.0/16"),
+            ("NEXUS_PROXY", "http://npm"),
+            ("NEXUS_PROXY", "npm:81"),
+            ("NEXUS_PROXY", "npm/"),
+            ("NEXUS_PROXY", "npm proxy"),
+            ("NEXUS_PROXY", "172.18.0"),
             ("NEXUS_PROXY", "172.18.0.2:80"),
             ("NEXUS_PROXY", "0.0.0.0"),
             ("NEXUS_PROXY", "::"),
@@ -263,5 +355,51 @@ mod tests {
         // Folders that only begin alike are apart.
         let pairs = with(&[("NEXUS_DATA", "/srv/data"), ("NEXUS_STATE", "/srv/data-state")]);
         assert!(read(&pairs).is_ok());
+    }
+
+    /// The lead's ruling of 28 Nov: the proxy by its container's name, when its address is not fixed.
+    #[test]
+    fn the_proxy_may_be_named_by_its_containers_name() {
+        for name in ["Nginx-Proxy-Manager-Official", "npm", "proxy_1.lan"] {
+            let pairs = with(&[("NEXUS_PROXY", name)]);
+            assert_eq!(read(&pairs).unwrap().proxy, ProxySetting::Name(name.into()), "{name}");
+        }
+        let pairs = with(&[("NEXUS_PROXY", "fd00::2")]);
+        assert_eq!(read(&pairs).unwrap().proxy, ProxySetting::Address("fd00::2".parse().unwrap()));
+    }
+
+    /// Step 3: Lidarr as the container reaches it; absent, requests are not set up; a wrong one
+    /// stops the start by name.
+    #[test]
+    fn lidarr_is_an_inside_address_or_not_set_up() {
+        assert_eq!(read(BOTH).unwrap().lidarr, None);
+        for value in ["http://lidarr:8686", "https://lidarr.lan", "http://192.0.2.30:8686/lidarr", "http://[fd00::30]:8686"] {
+            let pairs = with(&[("NEXUS_LIDARR", value)]);
+            assert_eq!(read(&pairs).unwrap().lidarr.as_ref().map(InternalAddress::as_str), Some(value), "{value}");
+        }
+        for value in ["lidarr:8686", "ftp://lidarr", "http://", "http://user:secret@lidarr:8686", "http://lidarr:8686/?apikey=x", "http://lidarr:8686/#x", "http://lidarr:port", "http://lid arr"] {
+            let pairs = with(&[("NEXUS_LIDARR", value)]);
+            let why = read(&pairs).unwrap_err();
+            assert!(why.starts_with("NEXUS_LIDARR is wrong"), "{value}: {why}");
+            assert!(!why.contains("secret") && !why.contains("apikey"), "the value is not repeated: {why}");
+        }
+    }
+
+    /// S12's audit, S1: a data budget mistyped stops the start, by name; a right one is taken.
+    #[test]
+    fn the_data_budget_is_a_size_or_the_start_stops() {
+        let base = [("NEXUS_MUSIC_SERVER", "http://navidrome:4533"), ("NEXUS_PROXY", "172.18.0.2")];
+        let with_budget = |value: &'static str| {
+            let mut pairs = base.to_vec();
+            pairs.push(("NEXUS_DATA_BUDGET", value));
+            read(&pairs)
+        };
+        assert_eq!(read(&base).unwrap().data_budget, 4_000_000_000);
+        for (given, bytes) in [("4GB", 4_000_000_000), ("4 gb", 4_000_000_000), ("500MB", 500_000_000), ("2000000000", 2_000_000_000), ("1TB", 1_000_000_000_000)] {
+            assert_eq!(with_budget(given).unwrap().data_budget, bytes, "{given}");
+        }
+        for wrong in ["4G", "4.5GB", "-1", "4", "0", "lots", "4GiB", "99999999999999999999"] {
+            assert!(with_budget(wrong).unwrap_err().starts_with("NEXUS_DATA_BUDGET is wrong"), "{wrong}");
+        }
     }
 }

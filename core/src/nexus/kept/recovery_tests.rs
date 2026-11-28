@@ -8,7 +8,7 @@ impl Stored {
         let mut account = state("admin@example.test");
         account.admin = true;
         let mut admin = Self::new(account);
-        admin.sign_in(7, 1, 7, 0)?;
+        admin.sign_in_as(SessionKind::AdminPage, 7, 1, 7, 0)?;
         Ok(admin)
     }
 
@@ -129,7 +129,7 @@ fn account_off_and_delete_win_both_orders_with_sign_in_and_survive_an_older_copy
                 // Ordinary startup would restore the admin too. Use a newly signed-in
                 // administrator under the new restore number here.
                 let mut admin = Stored::new(admin.data.account.clone());
-                admin.sign_in(7, 1, 7, 3)?;
+                admin.sign_in_as(SessionKind::AdminPage, 7, 1, 7, 3)?;
                 admin.admin_change(&mut person, AdminAction::SetOn(true), 4)?;
                 assert_eq!(person.read(1, 1, 4).err(), Some(Denied::NotSignedIn));
                 person.sign_in(8, 1, 4, 4)?;
@@ -262,10 +262,19 @@ fn admin_grants_name_the_action_and_target_and_die_with_the_role() -> Result<(),
     );
     bob.read(1, 2, 1)?;
     admin.admin_change(&mut alice, AdminAction::SetAdmin(true), 2)?;
-    alice.step(2, |turn| turn.admin_read(bearer(1, &hash(1))))?;
+    assert_eq!(
+        alice.step(2, |turn| turn.admin_read(bearer(1, &hash(1)))),
+        Err(Denied::AdminRequired)
+    );
+    assert_eq!(
+        alice.leave(1, 1, LeaveFor::Admin { action: reset.clone(), target: b.clone() }, 2),
+        Err(Denied::AdminRequired)
+    );
+    alice.sign_in_as(SessionKind::AdminPage, 8, 1, 3, 2)?;
+    alice.step(2, |turn| turn.admin_read(bearer(1, &hash(3))))?;
     alice.leave(
         1,
-        1,
+        3,
         LeaveFor::Admin {
             action: reset.clone(),
             target: b.clone(),
@@ -277,14 +286,14 @@ fn admin_grants_name_the_action_and_target_and_die_with_the_role() -> Result<(),
     let mut reverted = Account::load(&alice.apart, Some(&old));
     assert_eq!(
         reverted
-            .request(1, clock(3, 3), |turn| turn.admin_read(bearer(1, &hash(1))))
+            .request(1, clock(3, 3), |turn| turn.admin_read(bearer(1, &hash(3))))
             .apply(|_| Ok::<_, Denied>(()))?,
         Err(Denied::AdminRequired)
     );
     admin.admin_change(&mut alice, AdminAction::SetAdmin(true), 3)?;
     assert_eq!(
         alice.step(3, |turn| turn.administer(
-            bearer(1, &hash(1)),
+            bearer(1, &hash(3)),
             reset.clone(),
             b.clone(),
             Some(&mut bob.account)
@@ -586,7 +595,7 @@ fn admin_payload_is_authorized_in_the_effects_only_when_the_change_is_allowed() 
             1,
             7,
             LeaveFor::Admin {
-                action: AdminAction::SetLidarr,
+                action: AdminAction::SetDiagnosticsDefault(false),
                 target: AdminTarget::Backend,
             },
             2,
@@ -597,7 +606,7 @@ fn admin_payload_is_authorized_in_the_effects_only_when_the_change_is_allowed() 
             .request(1, clock(2, admin.mark), |turn| {
                 turn.administer(
                     bearer(1, &hash(7)),
-                    AdminAction::SetLidarr,
+                    AdminAction::SetDiagnosticsDefault(false),
                     AdminTarget::Backend,
                     target,
                 )
@@ -610,7 +619,7 @@ fn admin_payload_is_authorized_in_the_effects_only_when_the_change_is_allowed() 
                         DataChange::Keep
                     } else {
                         DataChange::ApplyAdmin {
-                            action: AdminAction::SetLidarr,
+                            action: AdminAction::SetDiagnosticsDefault(false),
                             target: AdminTarget::Backend,
                         }
                     }
@@ -717,15 +726,15 @@ fn adoption_requires_reset_and_a_newer_stamp_cannot_change_the_account_life() ->
 }
 
 #[test]
-fn provisioning_requires_the_grant_both_exact_logins_and_current_authority() -> Result<(), Denied> {
+fn provisioning_requires_the_grant_the_exact_internal_login_and_current_authority() -> Result<(), Denied> {
     use crate::nexus::{
         account::{MusicAddress, MusicLoginResult, MusicSalt, Name, SALT_BYTES},
         music::{
-            Checked, CredentialBinding, CurrentEndpoints, MusicInstallation, Outcome, Ping,
+            CredentialBinding, MusicInstallation, Outcome, Ping,
             Provisioning, SaltedToken, SealingKey, VerifiedLogin, hand_out,
         },
     };
-    const PRIVATE: &str = "http://navidrome.example.test:4533";
+    const INTERNAL: &str = "http://navidrome.example.test:4533";
     let public = MusicAddress::new("https://music.example.test").unwrap();
     let key = SealingKey::new([8; 32]);
     let mut admin = Stored::admin()?;
@@ -735,7 +744,7 @@ fn provisioning_requires_the_grant_both_exact_logins_and_current_authority() -> 
     let old_binding = CredentialBinding {
         backend: alice.apart.account.backend,
         account: alice.apart.account.id,
-        address: public.clone(),
+        internal: INTERNAL.into(),
         name: Name::new("Alice").unwrap(),
         count: 1,
     };
@@ -774,7 +783,7 @@ fn provisioning_requires_the_grant_both_exact_logins_and_current_authority() -> 
     let checked = |admin: &mut Stored,
                    alice: &Stored,
                    n: u8,
-                   public_name: &[u8]|
+                   reported_name: &[u8]|
      -> Result<VerifiedLogin, Outcome> {
         admin
             .leave(
@@ -793,32 +802,20 @@ fn provisioning_requires_the_grant_both_exact_logins_and_current_authority() -> 
             })
             .unwrap();
         let input = Provisioning {
-            internal: PRIVATE,
-            public: public.clone(),
+            internal: INTERNAL,
             name: Name::new("Alice").unwrap(),
             password: Zeroizing::new(b"Example password".to_vec()),
             salt: MusicSalt::from_random([n; SALT_BYTES]),
             nonce: [n; 24],
         };
         let ping = Ping::provision(auth, input, &key)?;
-        assert_eq!(ping.post().address(), PRIVATE);
-        let first_form = ping.post().form().to_owned();
+        assert_eq!(ping.post().address(), INTERNAL);
+        assert_eq!(ping.post().path(), "/rest/ping");
         let ok = br#"{"subsonic-response":{"status":"ok"}}"#;
-        let person = br#"{"subsonic-response":{"status":"ok","user":{"username":"Alice"}}}"#;
         let user = ping.answer(Some((200, ok)))?;
+        assert_eq!(user.post().address(), INTERNAL);
         assert_eq!(user.post().path(), "/rest/getUser");
-        let Checked::Public(ping) = user.answer(Some((200, person)))? else {
-            panic!("public login wasn't checked")
-        };
-        assert_eq!(ping.post().address(), public.as_str());
-        assert_eq!(ping.post().form(), first_form);
-        let Checked::Verified(result) = ping
-            .answer(Some((200, ok)))?
-            .answer(Some((200, public_name)))?
-        else {
-            panic!("public login wasn't verified")
-        };
-        Ok(result)
+        user.answer(Some((200, reported_name)))
     };
 
     let other = br#"{"subsonic-response":{"status":"ok","user":{"username":"Bob"}}}"#;
@@ -834,25 +831,18 @@ fn provisioning_requires_the_grant_both_exact_logins_and_current_authority() -> 
         admin.step(4, |t| t.install_music(
             bearer(1, &actor),
             replaced,
-            CurrentEndpoints {
-                internal: PRIVATE,
-                public: &public
-            },
+            INTERNAL,
             Some(&mut bob.account)
         )),
         Err(Denied::WrongPurpose)
     );
 
-    let wrong_address = MusicAddress::new("https://changed.example.test").unwrap();
     let replaced = checked(&mut admin, &alice, 5, exact).ok().unwrap();
     assert_eq!(
         admin.step(5, |t| t.install_music(
             bearer(1, &actor),
             replaced,
-            CurrentEndpoints {
-                internal: PRIVATE,
-                public: &wrong_address
-            },
+            "http://changed.example.test:4533",
             Some(&mut alice.account)
         )),
         Err(Denied::WrongPurpose)
@@ -866,10 +856,7 @@ fn provisioning_requires_the_grant_both_exact_logins_and_current_authority() -> 
             t.install_music(
                 bearer(1, &actor),
                 replaced,
-                CurrentEndpoints {
-                    internal: PRIVATE,
-                    public: &public,
-                },
+                INTERNAL,
                 Some(&mut alice.account),
             )
         })
@@ -888,17 +875,25 @@ fn provisioning_requires_the_grant_both_exact_logins_and_current_authority() -> 
             assert_eq!(
                 hand_out(
                     needs_recovery.state(),
+                    SessionKind::App,
                     Some(&old_login),
                     &key,
-                    &public,
+                    INTERNAL,
+                    Some(&public),
                     salt()
                 ),
                 MusicLoginResult::UnusableNow
             );
             let recovered = Account::load(&update.apart_first, Some(&update.data));
-            let MusicLoginResult::Login(handed) =
-                hand_out(recovered.state(), Some(login), &key, &public, salt())
-            else {
+            let MusicLoginResult::Login(handed) = hand_out(
+                recovered.state(),
+                SessionKind::App,
+                Some(login),
+                &key,
+                INTERNAL,
+                Some(&public),
+                salt(),
+            ) else {
                 panic!("committed replacement should work before the last apart write");
             };
             assert_eq!(
@@ -907,7 +902,15 @@ fn provisioning_requires_the_grant_both_exact_logins_and_current_authority() -> 
             );
             let restored = Account::load(&update.apart_last, Some(&alice.data));
             assert_eq!(
-                hand_out(restored.state(), Some(&old_login), &key, &public, salt()),
+                hand_out(
+                    restored.state(),
+                    SessionKind::App,
+                    Some(&old_login),
+                    &key,
+                    INTERNAL,
+                    Some(&public),
+                    salt()
+                ),
                 MusicLoginResult::UnusableNow
             );
             assert_eq!(update.data.account.music_login, 2);
@@ -917,10 +920,7 @@ fn provisioning_requires_the_grant_both_exact_logins_and_current_authority() -> 
         admin.step(7, |t| t.install_music(
             bearer(1, &actor),
             stale_count,
-            CurrentEndpoints {
-                internal: PRIVATE,
-                public: &public
-            },
+            INTERNAL,
             Some(&mut alice.account)
         )),
         Err(Denied::WrongPurpose)
@@ -932,10 +932,7 @@ fn provisioning_requires_the_grant_both_exact_logins_and_current_authority() -> 
         admin.step(8, |t| t.install_music(
             bearer(1, &actor),
             replaced,
-            CurrentEndpoints {
-                internal: PRIVATE,
-                public: &public
-            },
+            INTERNAL,
             Some(&mut alice.account)
         )),
         Err(Denied::NotSignedIn)
@@ -950,7 +947,7 @@ fn a_create_grant_binds_the_actor_request_action_and_exact_email() -> Result<(),
     let mut second = state("other-admin@example.test");
     second.admin = true;
     let mut second = Stored::new(second);
-    second.sign_in(6, 1, 6, 0)?;
+    second.sign_in_as(SessionKind::AdminPage, 6, 1, 6, 0)?;
     let alice = AdminTarget::NewAccount(Email::new("alice@example.test").unwrap());
     let bob = AdminTarget::NewAccount(Email::new("bob@example.test").unwrap());
     let issuer_hash = hash(7);
@@ -1042,7 +1039,7 @@ fn grants_check_the_targets_current_revision_and_the_requested_setting_value() -
     let mut other = state("other-admin@example.test");
     other.admin = true;
     let mut other = Stored::new(other);
-    other.sign_in(7, 1, 7, 0)?;
+    other.sign_in_as(SessionKind::AdminPage, 7, 1, 7, 0)?;
     let mut person = Stored::new(state("alice@example.test"));
     let target = person.apart.account.admin_target();
     let action = AdminAction::ResetPassword;
@@ -1111,5 +1108,437 @@ fn grants_check_the_targets_current_revision_and_the_requested_setting_value() -
             turn.administer(bearer(1, &hash(7)), action, AdminTarget::Backend, None)
         })?;
     }
+    Ok(())
+}
+
+#[test]
+fn owner_recovery_ends_sessions_and_fences_the_old_password_before_data() -> Result<(), Denied> {
+    let mut authority = state("alice@example.test");
+    authority.password_changes = 2;
+    authority.code = Some(LiveCode::new(2, 0)?);
+    let mut s = Stored::new(authority);
+    s.sign_in(8, 1, 1, 0)?;
+    s.sign_in(9, 2, 2, 0)?;
+    s.leave(1, 1, LeaveFor::DeleteHistory, 0)?;
+    let old = s.data.clone();
+    let verifier = hash(59);
+    s.account
+        .owner_recover(clock(1, 0), verifier.clone())
+        .apply(|e| {
+            let u = e.updates.first().unwrap();
+            assert_eq!(
+                u.change,
+                DataChange::OwnerRecovery {
+                    code_verifier: verifier.clone()
+                }
+            );
+            assert!(u.apart_first.account.password_reset_required);
+            assert_eq!(u.apart_first.account.password_changes, 3);
+            assert_eq!(u.apart_first.account.code, Some(LiveCode::new(3, 1)?));
+            assert!(
+                u.apart_first
+                    .devices
+                    .values()
+                    .all(|d| d.permit.is_none() && d.number == 1)
+            );
+            for data in [&old, &u.data] {
+                let mut cut = Account::load(&u.apart_first, Some(data));
+                for (device, bearer_byte) in [(1, 1), (2, 2)] {
+                    assert_eq!(
+                        cut.request(1, clock(1, 1), |t| t
+                            .arrive(bearer(device, &hash(bearer_byte)), Access::Read))
+                            .apply(|_| Ok::<_, Denied>(()))?
+                            .err(),
+                        Some(Denied::NotSignedIn)
+                    );
+                }
+                let secret = DeviceSecret::from_bytes([8; 32]);
+                assert_eq!(
+                    cut.sign_in_turn(clock(1, 1), |t| t.check_code(&secret, dev(1), 2, hash(22)))
+                        .apply(|_| Ok::<_, Denied>(()))?
+                        .err(),
+                    Some(Denied::WrongPassword)
+                );
+                assert!(cut.state().password_reset_required);
+            }
+            assert!(!Account::load(&u.apart_first, Some(&u.data)).state().admin);
+            assert!(Account::load(&u.apart_last, Some(&u.data)).state().admin);
+            assert_eq!(u.data.account.code, u.apart_last.account.code);
+            Ok::<_, Denied>(())
+        })??;
+    Ok(())
+}
+
+#[test]
+fn owner_recovery_grants_on_and_admin_only_at_the_last_cut_and_refuses_tombstones()
+-> Result<(), Denied> {
+    let mut off = state("alice@example.test");
+    off.status = Status::Off;
+    let mut s = Stored::new(off);
+    let old = s.data.clone();
+    let issued = s.account.owner_recover(clock(3, 3), hash(55)).apply(|e| {
+        let u = e.updates.first().unwrap();
+        assert_eq!(u.apart_first.account.status, Status::Off);
+        assert!(!u.apart_first.account.admin);
+        for data in [&old, &u.data] {
+            let cut = Account::load(&u.apart_first, Some(data));
+            assert!(!cut.state().admin);
+            assert_eq!(cut.state().status, Status::Off);
+        }
+        let final_state = Account::load(&u.apart_last, Some(&u.data));
+        assert!(final_state.state().admin);
+        assert_eq!(final_state.state().status, Status::On);
+        assert!(final_state.state().password_reset_required);
+        Ok::<_, Denied>(())
+    })??;
+    assert_eq!(issued, LiveCode::new(1, 3)?);
+    let mut deleted = state("bob@example.test");
+    deleted.status = Status::Deleted;
+    let mut s = Stored::new(deleted);
+    assert_eq!(
+        s.account.owner_recover(clock(3, 3), hash(55)).apply(|e| {
+            assert!(e.updates.is_empty());
+            Ok::<_, Denied>(())
+        })?,
+        Err(Denied::NotSignedIn)
+    );
+    Ok(())
+}
+
+#[test]
+fn persisted_effects_debug_omits_identity_text_and_verifier_bytes() -> Result<(), Denied> {
+    let mut s = Stored::new(state("alice@example.test"));
+    s.account
+        .owner_recover(clock(1, 1), Fingerprint::from_bytes([42; 32]))
+        .apply(|effects| {
+            let printed = format!("{effects:?}");
+            assert!(printed.contains("AccountId(1)"));
+            assert!(printed.contains("OwnerRecovery"));
+            assert!(!printed.contains("alice@example.test"));
+            assert!(!printed.contains("42, 42"));
+            Ok::<_, Denied>(())
+        })??;
+    let change = DataChange::ApplyAdmin {
+        action: AdminAction::CreateAccount,
+        target: AdminTarget::NewAccount(Email::new("private@example.test").unwrap()),
+    };
+    assert_eq!(format!("{change:?}"), "ApplyAdmin");
+    assert_eq!(
+        format!(
+            "{:?}",
+            AdminTarget::NewAccount(Email::new("private@example.test").unwrap())
+        ),
+        "NewAccount(..)"
+    );
+    Ok(())
+}
+
+#[test]
+fn lost_store_recovery_discards_verifier_and_codes_at_both_cuts_and_is_repeatable()
+-> Result<(), Denied> {
+    let mut account = state("alice@example.test");
+    account.code = Some(LiveCode::new(8, 0)?);
+    account.password_changes = 8;
+    let mut s = Stored::new(account);
+    s.sign_in(8, 1, 1, 0)?;
+    let copy = s.data.clone();
+    Account::recover_from_lost_store(&copy, None, 2, clock(2, 2)).apply(|e| {
+        let update = e.updates.first().unwrap();
+        assert_eq!(update.change, DataChange::DiscardCredentials);
+        assert_eq!(update.apart_first.account.password_changes, 9);
+        assert!(update.apart_first.account.password_reset_required);
+        assert!(update.apart_first.account.code.is_none());
+        assert_eq!(update.apart_first.devices.get(&dev(1)).unwrap().number, 1);
+        assert!(
+            update
+                .apart_first
+                .devices
+                .get(&dev(1))
+                .unwrap()
+                .permit
+                .is_none()
+        );
+        assert!(update.data.devices.get(&dev(1)).unwrap().session.is_none());
+        let secret = DeviceSecret::from_bytes([8; 32]);
+        for data in [&copy, &update.data] {
+            let mut loaded = Account::load(&update.apart_first, Some(data));
+            let checked = loaded
+                .sign_in_turn(clock(2, 2), |t| t.check_sign_in(&secret, dev(2), hash(42)))
+                .apply(|_| Ok::<_, Denied>(()))??;
+            let old = checked.check(hash(42), clock(2, 2))?;
+            assert_eq!(
+                loaded
+                    .sign_in_turn(clock(2, 2), |t| t.sign_in(old, fresh(2), None))
+                    .apply(|_| Ok::<_, Denied>(()))?,
+                Err(Denied::WrongPassword)
+            );
+            assert_eq!(
+                loaded
+                    .sign_in_turn(clock(2, 2), |t| t.check_code(&secret, dev(2), 8, hash(43)))
+                    .apply(|_| Ok::<_, Denied>(()))?
+                    .err(),
+                Some(Denied::WrongPassword)
+            );
+            Account::recover_from_lost_store(data, Some(&update.apart_first), 2, clock(2, 2))
+                .apply(|resumed| {
+                    let same = resumed.updates.first().unwrap();
+                    assert_eq!(same.change, DataChange::DiscardCredentials);
+                    assert_eq!(same.data, update.data);
+                    assert_eq!(same.apart_last, update.apart_last);
+                    Ok::<_, Denied>(())
+                })??;
+        }
+        Ok::<_, Denied>(())
+    })??;
+    Ok(())
+}
+
+#[test]
+fn lost_store_recovery_preserves_partial_authority_and_takes_the_higher_counters()
+-> Result<(), Denied> {
+    let mut account = state("alice@example.test");
+    account.admin = true;
+    account.password_changes = 9;
+    let mut s = Stored::new(account);
+    s.sign_in(8, 1, 1, 0)?;
+    s.sign_in(9, 2, 2, 0)?;
+    let copy = s.data.clone();
+    let mut partial = s.apart.clone();
+    partial.account.status = Status::Off;
+    partial.account.admin = false;
+    partial.account.revision = 23;
+    partial.account.password_changes = 7;
+    partial.account.life = 4;
+    partial.account.music_login = 5;
+    partial.devices.remove(&dev(2));
+    let retained = partial.devices.get_mut(&dev(1)).unwrap();
+    retained.number = 13;
+    retained.last_session = 99;
+    retained.known = false;
+    for (status, change) in [
+        (Status::Off, DataChange::DiscardCredentials),
+        (Status::Deleted, DataChange::DeleteAccount),
+    ] {
+        partial.account.status = status;
+        Account::recover_from_lost_store(&copy, Some(&partial), 2, clock(2, 2)).apply(|e| {
+            let u = e.updates.first().unwrap();
+            let locked = &u.apart_first.account;
+            assert_eq!(locked.status, status);
+            assert!(!locked.admin);
+            assert_eq!(locked.life, 4);
+            assert_eq!(locked.music_login, 5);
+            assert_eq!(u.change, change);
+            assert_eq!(u.apart_first.devices.get(&dev(1)).unwrap().number, 14);
+            assert_eq!(u.apart_first.devices.get(&dev(1)).unwrap().last_session, 99);
+            if status == Status::Off {
+                assert_eq!(locked.revision, 24);
+                assert_eq!(locked.password_changes, 10);
+                assert!(u.data.devices.get(&dev(2)).unwrap().session.is_none());
+                assert!(!u.apart_first.devices.get(&dev(2)).unwrap().known);
+            } else {
+                assert!(u.data.devices.is_empty());
+            }
+            Ok::<_, Denied>(())
+        })??;
+    }
+    partial.account.backend = BackendId::from_bytes([18; 16]);
+    assert_eq!(
+        Account::recover_from_lost_store(&copy, Some(&partial), 2, clock(2, 2)).apply(|e| {
+            assert!(e.updates.is_empty());
+            Ok::<_, Denied>(())
+        })?,
+        Err(Denied::WrongPurpose)
+    );
+    Ok(())
+}
+
+#[test]
+fn the_clock_recovers_one_mark_interval_and_marks_row_writes_immediately() -> Result<(), Denied> {
+    let persisted = 100_000;
+    let interval = CLOCK_MARK_INTERVAL_MS;
+    assert_eq!(
+        Clock::after_load(1, persisted).effective(),
+        persisted + interval
+    );
+    assert_eq!(Clock::after_load(200_000, persisted).effective(), 200_000);
+    assert_eq!(Clock::after_load(1, u64::MAX - 1).effective(), u64::MAX);
+    let mut s = Stored::new(state("alice@example.test"));
+    for (now, due) in [
+        (persisted + interval - 1, false),
+        (persisted + interval, true),
+    ] {
+        let denial = s
+            .account
+            .sign_in_turn(clock(now, persisted), |_| {
+                Err::<(), _>(Denied::WrongPassword)
+            })
+            .apply(|effects| {
+                assert!(effects.updates.is_empty());
+                assert_eq!(effects.high_water, now);
+                assert_eq!(effects.clock_mark_due(persisted), due);
+                Ok::<_, Denied>(())
+            })?;
+        assert_eq!(denial, Err(Denied::WrongPassword));
+    }
+    s.account
+        .owner_recover(clock(persisted + 1, persisted), hash(41))
+        .apply(|effects| {
+            assert!(effects.clock_mark_due(persisted));
+            Ok::<_, Denied>(())
+        })??;
+    Ok(())
+}
+
+#[test]
+fn reload_does_not_reopen_a_grant_that_expired_between_clock_writes() -> Result<(), Denied> {
+    let mut s = Stored::new(state("alice@example.test"));
+    s.sign_in(8, 1, 1, 0)?;
+    s.leave(1, 1, LeaveFor::DeleteHistory, 1)?;
+    let expired = 1 + PASSWORD_LEAVE_MS;
+    let persisted = expired - 1;
+    let decision = |account: &mut Account, clock| {
+        account
+            .request(1, clock, |t| t.delete_history(bearer(1, &hash(1))))
+            .apply(|effects| {
+                assert!(effects.updates.is_empty());
+                Ok::<_, Denied>(())
+            })
+    };
+    assert_eq!(
+        decision(&mut s.account, clock(expired, persisted))?,
+        Err(Denied::LeaveRequired)
+    );
+    s.reload();
+    assert_eq!(
+        decision(&mut s.account, Clock::after_load(expired - 10, persisted))?,
+        Err(Denied::LeaveRequired)
+    );
+    Ok(())
+}
+
+#[test]
+fn a_clock_only_code_judgement_keeps_the_observation_without_the_load_floor() {
+    let saved = 100_000;
+    let clock = Clock::after_load(saved + 1, saved);
+    assert_eq!(clock.effective(), saved + CLOCK_MARK_INTERVAL_MS);
+    let effects = clock.observation_effects();
+    assert!(effects.updates.is_empty());
+    assert_eq!(effects.high_water, saved + 1);
+    assert!(!effects.clock_mark_due(saved));
+
+    let next = clock.observe(saved + CLOCK_MARK_INTERVAL_MS);
+    assert!(next.observation_effects().clock_mark_due(saved));
+    assert_eq!(next.observe(0).effective(), next.effective());
+}
+
+#[test]
+fn ten_restarts_do_not_advance_the_saved_mark_even_with_row_writes() -> Result<(), Denied> {
+    let mut s = Stored::new(state("alice@example.test"));
+    let mut saved = 100_000;
+    for _ in 0..10 {
+        let clock = Clock::after_load(1, saved).observe(2);
+        assert_eq!(clock.effective(), 160_000);
+        s.account.request(1, clock, |_| Ok(())).apply(|effects| {
+            assert!(!effects.clock_mark_due(saved));
+            assert_eq!(effects.high_water, saved);
+            Ok::<_, Denied>(())
+        })??;
+        s.account.owner_recover(clock, hash(50)).apply(|effects| {
+            assert!(effects.clock_mark_due(saved));
+            saved = effects.high_water;
+            let update = effects.updates.first().unwrap();
+            s.apart = update.apart_last.clone();
+            s.data = update.data.clone();
+            Ok::<_, Denied>(())
+        })??;
+        assert_eq!(saved, 100_000);
+        s.reload();
+    }
+    Ok(())
+}
+
+fn ten_restarts_until(store: &Stored, deadline: u64) -> Result<(Account, u64), Denied> {
+    let cadence = CLOCK_MARK_INTERVAL_MS / 4;
+    let start = deadline - 10 * cadence;
+    let mut saved = start;
+    for restart in 1..=10 {
+        let now = start + restart * cadence;
+        let mut loaded = Account::load(&store.apart, Some(&store.data));
+        loaded
+            .request(1, Clock::after_load(now, saved), |_| Ok(()))
+            .apply(|effects| {
+                assert!(effects.high_water <= now);
+                if effects.clock_mark_due(saved) {
+                    saved = effects.high_water;
+                }
+                Ok::<_, Denied>(())
+            })??;
+    }
+    assert_eq!(saved, deadline - 2 * cadence);
+    Ok((Account::load(&store.apart, Some(&store.data)), saved))
+}
+
+#[test]
+fn grants_codes_and_page_sessions_age_across_restarts_and_cannot_reopen() -> Result<(), Denied> {
+    let state = state("alice@example.test");
+    let mut s = Stored::new(state.clone());
+    s.sign_in(8, 1, 1, 0)?;
+    s.leave(1, 1, LeaveFor::DeleteHistory, 0)?;
+    let (mut loaded, grant_mark) = ten_restarts_until(&s, PASSWORD_LEAVE_MS)?;
+    for now in [PASSWORD_LEAVE_MS, 0] {
+        assert_eq!(
+            loaded
+                .request(1, Clock::after_load(now, grant_mark), |t| {
+                    t.delete_history(bearer(1, &hash(1)))
+                })
+                .apply(|_| Ok::<_, Denied>(()))?,
+            Err(Denied::LeaveRequired)
+        );
+    }
+
+    let mut with_code = state.clone();
+    with_code.code = Some(LiveCode::new(1, 0)?);
+    let s = Stored::new(with_code);
+    let (mut loaded, code_mark) = ten_restarts_until(&s, CODE_LIFETIME_MS)?;
+    let secret = DeviceSecret::from_bytes([8; 32]);
+    for now in [CODE_LIFETIME_MS, 0] {
+        assert_eq!(
+            loaded
+                .sign_in_turn(Clock::after_load(now, code_mark), |t| {
+                    t.check_code(&secret, dev(1), 1, hash(43))
+                })
+                .apply(|_| Ok::<_, Denied>(()))?
+                .err(),
+            Some(Denied::WrongPassword)
+        );
+    }
+
+    let mut admin = state;
+    admin.admin = true;
+    let mut s = Stored::new(admin);
+    let checked = s.bind(8, 1, 0)?;
+    s.step(0, |t| {
+        t.sign_in_as(SessionKind::AdminPage, checked, fresh(1), None)
+    })?;
+    let (mut loaded, page_mark) = ten_restarts_until(&s, ADMIN_PAGE_IDLE_MS)?;
+    assert_eq!(
+        loaded
+            .request(1, Clock::after_load(ADMIN_PAGE_IDLE_MS, page_mark), |t| {
+                t.arrive(bearer(1, &hash(1)), Access::Read)
+            })
+            .apply(|_| Ok::<_, Denied>(()))?
+            .err(),
+        Some(Denied::NotSignedIn)
+    );
+    let mut rolled_back = Account::load(&s.apart, Some(&s.data));
+    assert_eq!(
+        rolled_back
+            .request(1, Clock::after_load(0, page_mark), |t| {
+                t.arrive(bearer(1, &hash(1)), Access::Read)
+            })
+            .apply(|_| Ok::<_, Denied>(()))?
+            .err(),
+        Some(Denied::NotSignedIn)
+    );
     Ok(())
 }

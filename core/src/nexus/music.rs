@@ -1,10 +1,10 @@
-//! The music-server login (§9). S9 supplies configured addresses, fresh random
-//! bytes and the transport. A music-server answer confers no Nexus permissions.
+//! The music-server login (§9). S9 supplies the configured internal address,
+//! fresh random bytes and the transport. The public address goes to devices.
 
 use super::account::{
     AccountId, MusicAddress, MusicLogin, MusicLoginResult, MusicSalt, MusicToken, Name, SALT_LENGTH,
 };
-use super::kept::{AccountState, MusicAuthorization, Status};
+use super::kept::{AccountState, MusicAuthorization, SessionKind, Status};
 use super::proto::{self, BackendId};
 use super::wire::{self, BadMessage, Fields, Value};
 use serde_json::value::RawValue;
@@ -57,7 +57,7 @@ pub enum Outcome {
     CouldNotAsk,
 }
 
-/// A POST to the shown configured endpoint. The transport must disable redirects,
+/// A POST to the backend's configured internal endpoint. The transport must disable redirects,
 /// cookies and caller-supplied headers and use application/x-www-form-urlencoded.
 pub struct Post<'a> {
     address: &'a str,
@@ -94,17 +94,26 @@ pub struct MusicInstallation {
 }
 
 /// Hand out a login using the current account authority from the apart store.
-/// An older data row is never used to supply that authority's count.
+/// The authority supplies the count. Use the kind from sign-in or from
+/// an authenticated session lookup, and never from the request body. Take
+/// `internal` from NEXUS_MUSIC_SERVER. The public address is only for the device.
 pub fn hand_out(
     state: &AccountState,
+    kind: SessionKind,
     install: Option<&MusicInstallation>,
     key: &SealingKey,
-    public: &MusicAddress,
+    internal: &str,
+    public: Option<&MusicAddress>,
     salt: MusicSalt,
 ) -> MusicLoginResult {
-    if state.music_login == 0 {
+    if kind == SessionKind::AdminPage || state.music_login == 0 {
         return MusicLoginResult::NoneSetYet;
     }
+    // The design does not say what to return when a login exists but the
+    // device address is unset. Withhold it until the device has an address.
+    let Some(public) = public else {
+        return MusicLoginResult::UnusableNow;
+    };
     let Some(login) = install.filter(|login| {
         let binding = &login.binding;
         state.status == Status::On
@@ -112,7 +121,7 @@ pub fn hand_out(
             && binding.backend == state.backend
             && binding.account == state.id
             && binding.count == state.music_login
-            && binding.address == *public
+            && binding.internal == internal
     }) else {
         return MusicLoginResult::UnusableNow;
     };
@@ -129,33 +138,25 @@ pub fn hand_out(
     })
 }
 
-/// The only input kept accepts to install a typed-in login. Only both configured
-/// endpoints answering correctly for the identical credentials can make one.
+/// The only input kept accepts to install a typed-in login. It requires a
+/// successful ping and an exact user reply from the configured internal address.
 pub struct VerifiedLogin {
     authorization: MusicAuthorization,
     install: MusicInstallation,
-    internal: String,
-}
-
-pub struct CurrentEndpoints<'a> {
-    pub internal: &'a str,
-    pub public: &'a MusicAddress,
 }
 
 impl VerifiedLogin {
     pub(in crate::nexus) fn into_parts(
         self,
-        endpoints: CurrentEndpoints<'_>,
+        internal: &str,
     ) -> Option<(MusicAuthorization, MusicInstallation)> {
-        (self.internal == endpoints.internal && self.install.binding.address == *endpoints.public)
-            .then_some((self.authorization, self.install))
+        (self.install.binding.internal == internal).then_some((self.authorization, self.install))
     }
 }
 
 pub struct Provisioning<'a> {
     /// The trusted address from backend configuration. Private HTTP is allowed.
     pub internal: &'a str,
-    pub public: MusicAddress,
     pub name: Name,
     pub password: Zeroizing<Vec<u8>>,
     pub salt: MusicSalt,
@@ -164,20 +165,8 @@ pub struct Provisioning<'a> {
 
 struct Check {
     authorization: MusicAuthorization,
-    internal: String,
     install: MusicInstallation,
     pair: SaltedToken,
-    public: bool,
-}
-
-impl Check {
-    fn address(&self) -> &str {
-        if self.public {
-            self.install.binding.address.as_str()
-        } else {
-            &self.internal
-        }
-    }
 }
 
 /// The check starts only after a grant has been consumed for this account.
@@ -193,7 +182,7 @@ impl Ping {
         let binding = CredentialBinding {
             backend: authorization.backend(),
             account: authorization.account(),
-            address: input.public,
+            internal,
             name: input.name,
             count: authorization.next_count(),
         };
@@ -203,16 +192,14 @@ impl Ping {
         let pair = SaltedToken::from_password(&input.password, input.salt);
         Ok(Self(Check {
             authorization,
-            internal,
             install: MusicInstallation { binding, sealed },
             pair,
-            public: false,
         }))
     }
 
     pub fn post(&self) -> Post<'_> {
         login_post(
-            self.0.address(),
+            &self.0.install.binding.internal,
             self.0.install.binding.name.as_str(),
             &self.0.pair,
             false,
@@ -227,35 +214,23 @@ impl Ping {
 
 pub struct GetUser(Check);
 
-pub enum Checked {
-    Public(Ping),
-    Verified(VerifiedLogin),
-}
-
 impl GetUser {
     pub fn post(&self) -> Post<'_> {
         login_post(
-            self.0.address(),
+            &self.0.install.binding.internal,
             self.0.install.binding.name.as_str(),
             &self.0.pair,
             true,
         )
     }
 
-    pub fn answer(self, reply: Option<(u16, &[u8])>) -> Result<Checked, Outcome> {
-        let mut check = self.0;
+    pub fn answer(self, reply: Option<(u16, &[u8])>) -> Result<VerifiedLogin, Outcome> {
+        let check = self.0;
         user_answer(reply, check.install.binding.name.as_str())?;
-        // The design does not say whether to ask one configured address twice.
-        // Always check both unless the exact endpoint text is already the same.
-        if !check.public && check.internal != check.install.binding.address.as_str() {
-            check.public = true;
-            return Ok(Checked::Public(Ping(check)));
-        }
-        Ok(Checked::Verified(VerifiedLogin {
+        Ok(VerifiedLogin {
             authorization: check.authorization,
             install: check.install,
-            internal: check.internal,
-        }))
+        })
     }
 }
 

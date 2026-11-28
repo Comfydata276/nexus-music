@@ -24,7 +24,7 @@ fn round_trip<T: wire::Message + fmt::Debug + PartialEq>(value: T) {
 #[test]
 fn every_account_path_is_plain_and_has_its_own_name() {
     assert_eq!(SIGN_IN, "/nexus/api/signin");
-    assert_eq!(PATHS.len(), 8);
+    assert_eq!(PATHS.len(), 9);
     let mut seen = BTreeSet::new();
     for path in PATHS {
         assert!(path.starts_with(API));
@@ -110,7 +110,7 @@ fn good_sign_in() -> SignInReply {
         sign_out: sign_out_note(),
         restore: 8,
         music: MusicLoginResult::Login(music()),
-        notice: Notice::new("What this server records\nWhat you play.").unwrap(),
+        notice: Notice::recording(),
     })
 }
 
@@ -489,6 +489,8 @@ fn names_notices_and_music_addresses_obey_their_byte_bounds() {
     assert!(Notice::new("Ada\nMusic").is_some());
     assert!(Notice::new("Ada\rMusic").is_none());
     assert!(Notice::new("").is_none());
+    let recording = Notice::recording();
+    assert_eq!(Notice::new(recording.as_str()), Some(recording));
 
     let base = "https://music.example.org/";
     let exact = format!("{base}{}", "a".repeat(MUSIC_ADDRESS_MAX_BYTES - base.len()));
@@ -785,6 +787,28 @@ fn the_other_door_waits_for_its_worker_for_ten_seconds_and_holds_eight() {
 }
 
 #[test]
+fn a_verified_code_uses_the_reserved_worker_without_password_backoff() {
+    use PasswordDoor::{KnownDevice, Other, RedeemedCode};
+    let email = Email::new("owner@example.test").unwrap();
+    let device = Some(id(1));
+    let mut waits = PasswordWaits::default();
+    waits.record_wrong(Other, &email, None, 0);
+    waits.record_wrong(KnownDevice, &email, device, 0);
+
+    let free = load(false, false, 0);
+    assert_eq!(admit_password_check(RedeemedCode, free, &waits, &email, None, 0), PasswordAdmission::Check);
+    for busy in [load(true, false, 0), load(false, true, 0)] {
+        assert_eq!(admit_password_check(RedeemedCode, busy, &waits, &email, None, 0), PasswordAdmission::Busy);
+    }
+
+    waits.record_wrong(RedeemedCode, &email, None, 0);
+    waits.record_wrong(RedeemedCode, &email, device, 0);
+    assert_eq!(waits.retry_after(RedeemedCode, &email, None, 0), None);
+    assert_eq!(waits.retry_after(Other, &email, None, 0), Wait::new(1));
+    assert_eq!(waits.retry_after(KnownDevice, &email, device, 0), Wait::new(1));
+}
+
+#[test]
 fn wrong_password_waits_double_to_a_minute_without_preventing_the_next_check() {
     let email = email();
     let mut waits = PasswordWaits::default();
@@ -956,6 +980,15 @@ fn a_short_presented_password_is_checked_but_a_short_new_password_is_malformed()
 }
 
 #[test]
+fn a_replacement_matching_the_current_verifier_is_malformed() {
+    let refusal = ChangePassword::check_replacement(true).unwrap_err();
+    assert_eq!(refusal, Refusal::Malformed);
+    assert_eq!(refusal.status(), 400);
+    round_trip(ChangePasswordReply::Refused(refusal));
+    assert_eq!(ChangePassword::check_replacement(false), Ok(()));
+}
+
+#[test]
 fn a_grant_request_requires_an_exact_valid_change_and_has_its_own_body_ceiling() {
     let grant = data_deletion_grant(Password::presented("x").unwrap());
     bad_fields(&grant, &[
@@ -986,6 +1019,55 @@ fn body_limits_win_before_parsing_and_read_only_callers_cannot_raise_the_global_
 }
 
 #[test]
+fn set_up_uses_the_code_and_new_password_rules_and_a_four_kibibyte_body() {
+    assert_eq!(SET_UP, "/nexus/api/set-up");
+    let raw = br#"{"code":"iOdhjkmn3479","email":"  ADA@example.org ","name":"Ada","password":"a made-up password"}"#;
+    let call = read::<SetUp>(raw).unwrap();
+    assert_eq!(call.code.expose(), "10DHJKMN3479");
+    assert_eq!(call.email, email());
+    round_trip(call);
+    for raw in [
+        br#"{"code":"CDFHJKMN347","email":"ada@example.org","name":"Ada","password":"a made-up password"}"#.as_slice(),
+        br#"{"code":"CDFHJK-MN3479","email":"ada@example.org","name":"Ada","password":"a made-up password"}"#,
+        br#"{"code":"CDFHJKMN3479","email":"ada@example.org","name":"Ada","password":"short"}"#,
+        br#"{"code":"CDFHJKMN3479","email":"ada@example.org","name":"Ada"}"#,
+    ] {
+        assert_eq!(read::<SetUp>(raw), Err(BadMessage::Form));
+    }
+    let mut exact = raw.to_vec();
+    exact.resize(SET_UP_MAX_BYTES, b' ');
+    assert!(read::<SetUp>(&exact).is_ok());
+    exact.push(b' ');
+    assert_eq!(read::<SetUp>(&exact), Err(BadMessage::TooLarge));
+}
+
+#[test]
+fn set_up_done_returns_the_person_without_a_stamp_or_session() {
+    let mut first = person();
+    first.admin = true;
+    let done = SetUpReply::Done { result: first };
+    let bytes = encode(&done).unwrap();
+    assert_eq!(SetUpReply::read(200, bytes.bytes()), Ok(done));
+    assert_eq!(SetUpReply::read(403, bytes.bytes()), Err(BadMessage::Status(403)));
+    let body: serde_json::Value = serde_json::from_slice(bytes.bytes()).unwrap();
+    assert!(body.get("done").unwrap().get("receipt").is_none());
+    let stamped = encode(&Reply::Done { result: SignedOut {}, receipt: receipt() }).unwrap();
+    assert_eq!(SetUpReply::read(200, stamped.bytes()), Err(BadMessage::Form));
+    let refused = SetUpReply::Refused(Refusal::NotAllowed(NotAllowed::WrongLogin));
+    assert_eq!(SetUpReply::read(403, encode(&refused).unwrap().bytes()), Ok(refused));
+}
+
+#[test]
+fn speaks_meets_on_a_shared_endpoint_and_refuses_disjoint_ranges() {
+    let a = Speaks::new(2, 5).unwrap();
+    for (low, high, meets) in [(1, 1, false), (1, 2, true), (3, 4, true), (5, 5, true), (6, u32::MAX, false)] {
+        let b = Speaks::new(low, high).unwrap();
+        assert_eq!(a.meets(&b), meets);
+        assert_eq!(b.meets(&a), meets);
+    }
+}
+
+#[test]
 fn a_code_typed_in_groups_reads_as_the_twelve() {
     let twelve = || OneTimeCode::new("ABCDEFGHJKMN");
     for typed in ["ABCD-EFGH-JKMN", "abcd efgh jkmn", " abcd - efgh - jkmn ", "ABCDEFGHJKMN"] {
@@ -1005,4 +1087,24 @@ fn a_code_typed_in_groups_reads_as_the_twelve() {
     ] {
         assert!(OneTimeCode::typed(bad).is_none(), "{bad}");
     }
+}
+
+#[test]
+fn account_messages_redact_email_and_names_in_debug() {
+    let sign_in = signin(Credential::Password {
+        email: email(),
+        password: Password::new(PASSWORD).unwrap(),
+    });
+    let set_up = SetUp {
+        code: OneTimeCode::new(CODE).unwrap(),
+        email: email(),
+        name: Name::new("Example Person").unwrap(),
+        password: Password::new(PASSWORD).unwrap(),
+    };
+    let printed = format!("{sign_in:?} {set_up:?} {:?}", person());
+    for private in ["ada@example.org", "Ada's phone", "Example Person", "Ada", PASSWORD, CODE] {
+        assert!(!printed.contains(private));
+    }
+    assert!(printed.contains("Email(..)"));
+    assert!(printed.contains("Name(..)"));
 }

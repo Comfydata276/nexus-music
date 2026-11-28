@@ -59,9 +59,9 @@ fn start(proxy: &str) -> Running {
         )
         .route("/nexus/api/test/cookie", get(|| async { ([(SET_COOKIE, "session=x"), (CACHE_CONTROL, "public, max-age=600")], "kept?") }))
         .route("/nexus/api/test/large", get(|| async { vec![b'a'; LARGE] }));
-    let mut routes = nexus_music_server::head::ROUTES.to_vec();
+    let mut routes: Vec<nexus_music_server::head::Route> = nexus_music_server::head::ROUTES.iter().copied().filter(|route| route.path == nexus_core::nexus::proto::HELLO).collect();
     for path in ["/nexus/api/test/fault", "/nexus/api/test/stall", "/nexus/api/test/cookie", "/nexus/api/test/large"] {
-        routes.push((path, "GET"));
+        routes.push((path, "GET").into());
     }
     let proxy: IpAddr = proxy.parse().unwrap();
     let shell = Shell::with_routes(proxy, router, routes);
@@ -428,72 +428,53 @@ fn a_slow_body_is_cut_off_at_its_deadline_and_not_before() {
 
 // ---- connections -------------------------------------------------------------------------
 
+/// A request whose head is in and whose one-byte body is withheld: it holds a work slot
+/// (its body is read within the slot) for as long as it waits.
+fn holding(at: SocketAddr) -> TcpStream {
+    let mut stream = connect(PROXY, at);
+    stream.write_all(format!("GET {} HTTP/1.1\r\nHost: music.example.org\r\nX-Nexus-Scheme: https\r\nContent-Length: 1\r\n\r\n", proto::HELLO).as_bytes()).unwrap();
+    stream
+}
+
+/// Every general work slot held (the review of S8, C1: a shell without accounts has nothing
+/// that may take the reserve): one more from the proxy is given the gate's answer, one from
+/// anyone else nothing, and those holding slots are served.
 #[test]
-fn one_connection_more_than_the_cap_is_turned_away_and_the_rest_are_served() {
+fn one_request_more_than_the_slots_is_turned_away_and_the_rest_are_served() {
     let backend = start(PROXY);
-    let mut held: Vec<TcpStream> = (0..CONNECTIONS_MAX).map(|_| connect(PROXY, backend.at)).collect();
-    wait_until("every connection taken", || backend.shell.open() == CONNECTIONS_MAX);
+    let general = CONNECTIONS_MAX - RESERVED_SLOTS;
+    let mut held: Vec<TcpStream> = (0..general).map(|_| holding(backend.at)).collect();
+    wait_until("every general slot taken", || backend.shell.serving() == general);
     // The proxy is given the gate's answer; anyone else, nothing.
     assert_bare(&exchange(PROXY, backend.at, hello_request().as_bytes()), GATE);
     assert!(exchange(HEALTH, backend.at, get_request(proto::HELLO, None).as_bytes()).is_empty());
     assert_eq!(backend.shell.refused(Refusal::Full), 2);
-    // Those already open are served.
-    held[0].write_all(hello_request().as_bytes()).unwrap();
+    assert_eq!(backend.shell.serving(), general, "the reserve was taken by a request that is no one's");
+    // Those holding slots are served.
+    held[0].write_all(b"x").unwrap();
     assert_is_the_backend(&everything(&mut held[0]));
     // That one done, the next is taken.
     drop(held.remove(0));
-    wait_until("one let go", || backend.shell.open() == CONNECTIONS_MAX - 1);
+    wait_until("one let go", || backend.shell.serving() == general - 1);
     assert_is_the_backend(&exchange(PROXY, backend.at, hello_request().as_bytes()));
 }
 
-/// Whether `done` comes true within `within`, looking every few milliseconds.
-fn comes_true(within: Duration, mut done: impl FnMut() -> bool) -> bool {
-    let start = Instant::now();
-    while start.elapsed() < within {
-        if done() {
-            return true;
-        }
-        thread::sleep(Duration::from_millis(5));
-    }
-    done()
-}
-
-/// With every connection taken, those served and those being given the gate's answer, one
-/// more from the proxy is not taken and closed with nothing (which the proxy would log, and
-/// answer with a 502): it waits in the backlog and is answered when there is room.
-///
-/// Whether the room was all taken when it came depends on how quickly this runs (the gate's
-/// answers let go within LINGER_DEADLINE); a run where it was not proves nothing either way,
-/// and is tried again. However slow the machine, what is asserted holds.
+/// With every connection taken by callers that have said nothing (a head not yet read holds no
+/// work slot), one more from the proxy is not taken and closed with nothing (which the proxy
+/// would log, and answer with a 502): it waits in the backlog, and is served once the silent
+/// ones have reached their head's deadline and been let go.
 #[test]
 fn with_every_room_taken_one_more_from_the_proxy_waits_and_is_answered() {
     let all = CONNECTIONS_MAX + TURNED_AWAY_MAX;
-    for _ in 0..5 {
-        let backend = start(PROXY);
-        // Every service slot, held by callers that have said nothing yet.
-        let _held: Vec<TcpStream> = (0..CONNECTIONS_MAX).map(|_| connect(PROXY, backend.at)).collect();
-        if !comes_true(Duration::from_secs(5), || backend.shell.open() == CONNECTIONS_MAX) {
-            continue;
-        }
-        // Every room for the gate's answer, by callers that keep their connection open after it.
-        let started = Instant::now();
-        let _turned: Vec<TcpStream> = (0..TURNED_AWAY_MAX).map(|_| connect(PROXY, backend.at)).collect();
-        if !comes_true(LINGER_DEADLINE / 4, || backend.shell.open() == all) || started.elapsed() > LINGER_DEADLINE / 2 {
-            continue;
-        }
-        // One more.
-        let mut more = connect(PROXY, backend.at);
-        more.write_all(hello_request().as_bytes()).unwrap();
-        if started.elapsed() > LINGER_DEADLINE / 2 || backend.shell.open() != all {
-            continue;
-        }
-        let written = everything(&mut more);
-        assert!(!written.is_empty(), "taken and closed with nothing");
-        let answered = written == serve::bare(GATE) || one_answer(&written).0.status == 200;
-        assert!(answered, "{}", String::from_utf8_lossy(&written));
-        return;
-    }
-    panic!("in five tries, the room was never all taken in time to try one more");
+    let backend = start(PROXY);
+    let _held: Vec<TcpStream> = (0..all).map(|_| connect(PROXY, backend.at)).collect();
+    wait_until("every room taken", || backend.shell.open() == all);
+    assert_eq!(backend.shell.serving(), 0, "a head not read took a work slot");
+    let mut more = connect(PROXY, backend.at);
+    more.write_all(hello_request().as_bytes()).unwrap();
+    let written = everything(&mut more);
+    assert!(!written.is_empty(), "taken and closed with nothing");
+    assert_is_the_backend(&written);
 }
 
 #[test]

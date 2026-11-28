@@ -15,6 +15,7 @@ use crate::diagnostics::{self, FaultPlace, FaultShape, SoundOutput};
 use crate::audio::engine::{Event, TrackRequest};
 use crate::config::{Durable, SavedQueue, Settings, VOLUME_LEVELS};
 use crate::controller::{Controller, Route, with};
+use crate::journal::{self, Began, Sound, Stopped};
 use crate::subsonic::{ApiError, Lyrics, Song};
 use crate::ui;
 
@@ -88,6 +89,10 @@ pub struct Playback {
     autoplay_resume: bool,
     /// The track that last triggered an early autoplay lookup, so each track asks only once.
     autoplay_asked: u64,
+    /// Song IDs that entered this queue through autoplay.
+    journal_autoplay: HashSet<String>,
+    journal_from: Option<journal::PlayedFrom>,
+    journal_generation: u64,
 }
 
 impl Playback {
@@ -127,6 +132,17 @@ impl Playback {
             autoplay_seed: String::new(),
             autoplay_resume: false,
             autoplay_asked: 0,
+            journal_autoplay: HashSet::new(),
+            journal_from: None,
+            journal_generation: journal::generation(),
+        }
+    }
+
+    fn journal_next(&self) -> Began {
+        if self.current().is_some_and(|song| !song.queued && self.journal_autoplay.contains(&song.id)) {
+            Began::AddedByItself
+        } else {
+            Began::NextInQueue
         }
     }
 
@@ -323,6 +339,13 @@ impl Controller {
     /// Replaces the queue and starts playing from `start`. `any_start` says no particular
     /// song was asked for, so a shuffled list may open with any of them.
     pub fn play_songs(self: &Rc<Self>, songs: Vec<Song>, start: usize, context: &str, any_start: bool) {
+        self.play_songs_from_origin(songs, start, context, any_start, None);
+    }
+
+    pub(crate) fn play_songs_from_origin(
+        self: &Rc<Self>, songs: Vec<Song>, start: usize, context: &str, any_start: bool,
+        from: Option<journal::PlayedFrom>,
+    ) {
         // Where these songs came from, if the caller said (see `play_from`).
         let (source, origins, source_list) = match self.play_from.take() {
             Some(from) if from.rows.len() == songs.len() => {
@@ -359,6 +382,8 @@ impl Controller {
             return;
         }
         let _way = self.way_in(Who::Here, What::Playing);
+        journal::stop(Stopped::AnotherChoice);
+        journal::beginning(self.journal_choice());
         // Each list remembers whether it plays shuffled. Songs that aren't from a list (a
         // search result, say) leave shuffle as it is.
         let listed = (!source.is_empty()).then(|| self.list_prefs(&source).shuffle);
@@ -374,6 +399,9 @@ impl Controller {
             pb.origins = origins;
             pb.source = source;
             pb.source_list = source_list;
+            pb.journal_autoplay.clear();
+            pb.journal_from = from;
+            pb.journal_generation = journal::generation();
             pb.context = context.to_string();
             // A new queue: nothing in it was queued by hand.
             for song in pb.queue.iter_mut() {
@@ -392,6 +420,15 @@ impl Controller {
         self.start_current(0.0);
         self.sync_transport();
         self.sync_page_shuffle();
+    }
+
+    fn journal_choice(&self) -> Began {
+        match self.ways.whose() {
+            Some(Who::Elsewhere) => Began::AnotherDevice,
+            Some(Who::Guest) => Began::Jam,
+            Some(Who::Nobody) => Began::NextInQueue,
+            _ => Began::PressedHere,
+        }
     }
 
     /// Loads the track at the cursor into the engine.
@@ -448,6 +485,7 @@ impl Controller {
         let gain = level_gain(&settings, song, album_run);
         let duration_secs = song.duration as f64;
         if !song.radio_url.is_empty() {
+            journal::source(token, Sound::Streamed, token == pb.current_token);
             // A live stream: no length, no seeking, and nothing to normalise against.
             let address = song.radio_url.to_lowercase();
             let suffix = ["aac", "ogg", "flac"].into_iter().find(|ext| address.contains(ext)).unwrap_or("mp3");
@@ -468,6 +506,7 @@ impl Controller {
             };
         }
         if let Some(path) = self.downloads.borrow().path_of(&song.id).filter(|_| !pb.bad_downloads.contains(&song.id)) {
+            journal::source(token, Sound::Download, token == pb.current_token);
             // A downloaded copy plays from disk, whatever the streaming quality is set to.
             let suffix = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
             return TrackRequest {
@@ -490,6 +529,7 @@ impl Controller {
         let (bitrate, kept_as) = stream_form(native, cap, &suffix);
         let kept = (settings.cache_limit_mb > 0).then(|| self.song_cache.file(&song.id, bitrate, kept_as));
         if let Some(path) = kept.as_ref().filter(|path| crate::songcache::ready(path)) {
+            journal::source(token, Sound::KeptCopy, token == pb.current_token);
             crate::songcache::touch(path);
             return TrackRequest {
                 token,
@@ -507,6 +547,7 @@ impl Controller {
                 continues: false,
             };
         }
+        journal::source(token, Sound::Streamed, token == pb.current_token);
         if native && cap == 0 {
             TrackRequest {
                 token,
@@ -674,6 +715,10 @@ impl Controller {
     /// comes straight here, so that it is carried out exactly as the press would be and
     /// never goes on to anywhere else.
     pub fn toggle_play_here(self: &Rc<Self>) {
+        self.toggle_play_here_from(None);
+    }
+
+    fn toggle_play_here_from(self: &Rc<Self>, began: Option<Began>) {
         // (With nothing in the player the press changes nothing, and takes no place.)
         if self.playback.borrow().current().is_none() {
             return;
@@ -685,6 +730,10 @@ impl Controller {
                 return;
             }
             pb.playing = !pb.playing;
+            journal::pause(!pb.playing);
+            if pb.playing && pb.current_token == 0 {
+                journal::beginning(began.unwrap_or_else(|| self.journal_choice()));
+            }
             (pb.current_token != 0, pb.resume_at)
         };
         let rejoin = {
@@ -740,6 +789,8 @@ impl Controller {
             if pb.order.is_empty() {
                 return;
             }
+            journal::stop(Stopped::Next);
+            journal::beginning(self.journal_choice());
             if pb.cursor + 1 < pb.order.len() {
                 pb.cursor += 1;
             } else {
@@ -775,6 +826,8 @@ impl Controller {
         let _way = self.way_in(Who::Here, What::Playing);
         {
             let mut pb = self.playback.borrow_mut();
+            journal::stop(Stopped::Previous);
+            journal::beginning(self.journal_choice());
             pb.cursor = pb.cursor.saturating_sub(1);
         }
         self.start_current(0.0);
@@ -794,6 +847,7 @@ impl Controller {
             }
             let seconds = seconds.clamp(0.0, (duration - 1.0).max(0.0));
             self.came_in(Who::Here, What::Playing);
+            journal::seek(pb.position, seconds);
             pb.position = seconds;
             pb.last_tick = seconds;
             pb.resume_at = seconds;
@@ -814,6 +868,7 @@ impl Controller {
     }
 
     pub fn stop_playback(self: &Rc<Self>) {
+        journal::stop(Stopped::Stopped);
         let _way = self.way_in(Who::Nobody, What::Playing);
         {
             let mut pb = self.playback.borrow_mut();
@@ -831,6 +886,8 @@ impl Controller {
             // queue now: an answer still on its way must not add them to whatever is in
             // the player by then (the next sign-in's queue, put back).
             pb.autoplay_seed.clear();
+            pb.journal_autoplay.clear();
+            pb.journal_from = None;
             pb.autoplay_loading = false;
             pb.autoplay_resume = false;
         }
@@ -1060,6 +1117,8 @@ impl Controller {
             pb.playing = true;
         }
         let _way = self.way_in(Who::Here, What::Playing);
+        journal::stop(Stopped::AnotherChoice);
+        journal::beginning(self.journal_choice());
         self.start_current(0.0);
     }
 
@@ -1074,6 +1133,7 @@ impl Controller {
                     pb.reconnects = 0;
                     if token != 0 && token == pb.next_token {
                         // The engine rolled into the next track by itself.
+                        journal::stop(Stopped::Finished);
                         self.came_in(Who::Nobody, What::Playing);
                         pb.cursor = pb.next_cursor;
                         pb.current_token = token;
@@ -1089,6 +1149,21 @@ impl Controller {
                         return;
                     }
                 };
+                if journal::recording() {
+                    let pb = self.playback.borrow();
+                    if pb.playing {
+                        if let Some(song) = pb.current() {
+                            if advanced {
+                                journal::beginning(pb.journal_next());
+                            }
+                            let from_source = pb.journal_generation == journal::generation()
+                                && !song.queued && !pb.journal_autoplay.contains(&song.id);
+                            let route = if from_source { &pb.source } else { "" };
+                            let origin = pb.journal_from.as_ref().filter(|_| from_source);
+                            journal::started(token, song, route, origin, pb.position, pb.listened);
+                        }
+                    }
+                }
                 let player = self.ui.global::<ui::Player>();
                 player.set_buffering(false);
                 player.set_reconnecting(false);
@@ -1104,6 +1179,7 @@ impl Controller {
                     if pb.current_token == 0 {
                         return;
                     }
+                    journal::stop(Stopped::Finished);
                     // The song is over: whatever comes of that, what a command from another
                     // device would act on has changed (see `link`).
                     self.came_in(Who::Nobody, What::Playing);
@@ -1120,6 +1196,7 @@ impl Controller {
                     match pb.following() {
                         Some(cursor) => {
                             pb.cursor = cursor;
+                            journal::beginning(pb.journal_next());
                             true
                         }
                         None if self.settings.borrow().autoplay && !radio => {
@@ -1176,6 +1253,7 @@ impl Controller {
                 // Playing on with nothing to play through would count songs nobody heard.
                 let was_playing = std::mem::replace(&mut self.playback.borrow_mut().playing, false);
                 if was_playing {
+                    journal::pause(true);
                     self.came_in(Who::Nobody, What::Playing);
                     self.engine.set_playing(false);
                     self.sync_transport();
@@ -1195,7 +1273,7 @@ impl Controller {
                         let attempt = pb.reconnects;
                         pb.reconnects += 1;
                         drop(pb);
-                        return self.reconnect(token, attempt, &song, message);
+                        return self.reconnect(token, attempt, &song, message, shape);
                     }
                     // A downloaded copy that won't play is left where it is (one failure may be
                     // nothing to do with the file), and the song is streamed for now.
@@ -1225,7 +1303,7 @@ impl Controller {
                     self.restart_current(position);
                     return;
                 }
-                self.pass_over(&title, &message);
+                self.pass_over(&title, &message, shape);
             }
         }
     }
@@ -1254,7 +1332,7 @@ impl Controller {
     /// got to, a few times and a little further apart each time. If that doesn't bring it
     /// back and the server can't be reached, the song waits where it is and carries on when
     /// the server returns; if the server is there, the song is what's wrong and is passed over.
-    fn reconnect(self: &Rc<Self>, token: u64, attempt: u32, song: &Song, message: String) {
+    fn reconnect(self: &Rc<Self>, token: u64, attempt: u32, song: &Song, message: String, shape: FaultShape) {
         const WAITS: [u64; 4] = [1, 2, 4, 8];
         let player = self.ui.global::<ui::Player>();
         player.set_reconnecting(true);
@@ -1267,7 +1345,7 @@ impl Controller {
         let title = song.title.clone();
         if !song.radio_url.is_empty() {
             // A radio station is somewhere else on the internet, not the music server.
-            return self.pass_over(&title, &message);
+            return self.pass_over(&title, &message, shape);
         }
         self.request(
             |client| client.ping().map(|_| ()),
@@ -1276,7 +1354,7 @@ impl Controller {
                     return;
                 }
                 match answer {
-                    Ok(()) | Err(ApiError::Server { .. }) => ctl.pass_over(&title, &message),
+                    Ok(()) | Err(ApiError::Server { .. }) => ctl.pass_over(&title, &message, shape),
                     Err(error) => {
                         diagnostics::music_connection_failed(&error);
                         ctl.playback.borrow_mut().waiting_for_server = true;
@@ -1317,7 +1395,8 @@ impl Controller {
 
     /// Gives up on the current song: says so, and moves to the next unless too many in a row
     /// have failed or there is no next.
-    fn pass_over(self: &Rc<Self>, title: &str, message: &str) {
+    fn pass_over(self: &Rc<Self>, title: &str, message: &str, shape: FaultShape) {
+        journal::stop(Stopped::Error { fault: journal::Fault { place: journal::FaultPlace::Playback, shape } });
         let _way = self.way_in(Who::Nobody, What::Playing);
         self.ui.global::<ui::Player>().set_reconnecting(false);
         let give_up = {
@@ -1422,7 +1501,11 @@ impl Controller {
             }
             (arm, submit, checkpoint)
         };
-        let position = self.playback.borrow().position;
+        let position = {
+            let pb = self.playback.borrow();
+            journal::sample(pb.position, pb.listened);
+            pb.position
+        };
         self.ui.global::<ui::Player>().set_position(position as f32);
         if arm {
             self.arm_next();
@@ -1433,6 +1516,7 @@ impl Controller {
         }
         if checkpoint {
             self.save_queue();
+            journal::checkpoint();
         }
         if let Some((id, from)) = submit {
             self.play_log.borrow_mut().add(&id, chrono::Utc::now().timestamp(), &from);
@@ -1467,9 +1551,10 @@ impl Controller {
 
     /// Plays a song straight away and lines up songs like it to follow: its radio. The song
     /// doesn't wait for the others to be found.
-    pub fn play_radio(self: &Rc<Self>, song: Song) {
+    pub fn play_radio(self: &Rc<Self>, song: Song, search: &str) {
         let context = format!("{} radio", song.title);
-        self.play_songs(vec![song], 0, &context, false);
+        let from = journal::search_origin(search);
+        self.play_songs_from_origin(vec![song], 0, &context, false, from);
         self.load_autoplay();
     }
 
@@ -1527,6 +1612,9 @@ impl Controller {
                 && pb.order.last().and_then(|&i| pb.queue.get(i)).is_some_and(|last| last.id == seed);
             if !songs.is_empty() && still_at_end {
                 for song in songs {
+                    if journal::recording() {
+                        pb.journal_autoplay.insert(song.id.clone());
+                    }
                     pb.queue.push(song);
                     let index = pb.queue.len() - 1;
                     pb.order.push(index);
@@ -1549,6 +1637,7 @@ impl Controller {
             self.sync_queue();
             if resume {
                 self.playback.borrow_mut().cursor += 1;
+                journal::beginning(Began::AddedByItself);
                 self.start_current(0.0);
             }
         } else if resume {
@@ -2059,9 +2148,12 @@ impl Controller {
         if songs.is_empty() {
             return;
         }
+        journal::stop(Stopped::AnotherChoice);
         let _way = self.way_in(Who::Nobody, What::Playing);
         {
             let mut pb = self.playback.borrow_mut();
+            pb.journal_autoplay.clear();
+            pb.journal_from = None;
             pb.origins = vec![None; songs.len()];
             pb.source.clear();
             pb.source_list.clear();
@@ -2371,9 +2463,9 @@ impl Controller {
         }
         // From a search, what's wanted is that song and then more like it, not whatever else
         // happened to match the words.
-        if matches!(self.current_route(), Some(Route::Search(_))) {
+        if let Some(Route::Search(query)) = self.current_route() {
             if let Some(song) = songs.get(index).cloned() {
-                return self.play_radio(song);
+                return self.play_radio(song, &query);
             }
         }
         let context = self.page.borrow().context.clone();

@@ -23,7 +23,7 @@
 //! waits and when it gives up, and how the batch stands. Where it's written down, the thread
 //! it runs on and the threads it looks albums up on are the app's (see `Desk`).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::asked::{Asked, Fill};
-use crate::lidarr::{BulkLidarr, Setup};
+use crate::lidarr::{AlbumPlacement, BulkLidarr, PlacementRecovery, Setup};
 use crate::musicbrainz::MusicBrainz;
 use crate::offer::{Offer, VARIOUS};
 use crate::text::{same_artist, undecorated, words};
@@ -100,14 +100,46 @@ pub struct Want {
     pub lidarr_artist: i64,
     /// It's been noted as asked for (see `asked`).
     pub noted: bool,
+    /// A confirmed placement by this batch, separate from its note.
+    #[serde(skip_serializing_if = "is_false")]
+    pub placed: bool,
     /// It couldn't be asked for, for a reason that may have passed: worth another go.
     pub again: bool,
+}
+
+fn is_false(value: &bool) -> bool { !value }
+
+/// A projected row for each original server batch line, including aliases of
+/// the same canonical want. Slot numbers are stable within its saved batch.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndexedLine {
+    pub index: usize,
+    pub slot: usize,
+    pub state: State,
+    pub offer: Option<Offer>,
+    pub reason: String,
+    /// This group's intent was flushed before an upstream write could start.
+    pub before_effect: bool,
+    pub placement: Option<AlbumPlacement>,
+    pub placed: bool,
+}
+
+pub const INTERRUPTED_EFFECT: &str = "Lidarr's change could not be confirmed after the server restarted.";
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct Indexed {
+    slots: Vec<usize>,
+    before_effect: BTreeSet<usize>,
+    #[serde(default)]
+    placements: BTreeMap<usize, AlbumPlacement>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 struct Batch {
     wants: Vec<Want>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    indexed: Option<Indexed>,
     /// Artists whose "new releases" setting was turned off while their singles were read
     /// in: Lidarr's number for each, what to put back, and on which Lidarr.
     restore: Vec<Back>,
@@ -256,6 +288,10 @@ impl crate::lidarr::WayBack for Job {
         Err("What Lidarr's settings would have to be put back to couldn't be written down on this PC first, so they weren't changed".into())
     }
 
+    fn before_request_album(&self, placement: &AlbumPlacement) -> Result<(), String> {
+        self.keep_placements(std::slice::from_ref(placement))
+    }
+
     /// Crossed off: only the way back this request wrote, not one the batch had before it.
     fn put_back(&self, lidarr: &str, artist: i64, before: &str) {
         let back = Back { artist, before: before.to_string(), lidarr: Some(lidarr.to_string()) };
@@ -331,6 +367,20 @@ impl Job {
     /// alone: what to do with it, and what to tell the person, is the app's.
     pub fn load(&self, written: &[u8]) -> bool {
         let Ok(batch) = serde_json::from_slice::<Batch>(written) else { return false };
+        if batch.indexed.as_ref().is_some_and(|index| {
+            let slots = index.slots.iter().copied().collect::<BTreeSet<_>>();
+            slots.is_empty() || slots.iter().any(|&slot| slot >= batch.wants.len())
+                || slots.len() != batch.wants.len() || !index.before_effect.is_subset(&slots)
+                || index.placements.iter().any(|(slot, placement)| {
+                    !index.before_effect.contains(slot) || batch.wants.get(*slot).and_then(|want| want.offer.as_ref())
+                        .is_none_or(|offer| offer.artist_id != placement.artist || offer.album != placement.release)
+                })
+                || batch.wants.iter().enumerate().any(|(slot, want)| {
+                    want.placed && !index.placements.get(&slot).is_some_and(AlbumPlacement::newly_placed)
+                })
+        }) {
+            return false;
+        }
         self.with(|now| *now = batch);
         true
     }
@@ -390,6 +440,167 @@ impl Job {
         self.save();
     }
 
+    /// Keep a single server batch after every original line's lookup has ended.
+    /// The caller serializes this job's lifecycle and prepares Found, Unknown or
+    /// Failed rows in submission order. Found rows with an identical canonical
+    /// release share a slot. An unresolved or failed lookup keeps its own slot.
+    pub fn start_indexed(&self, wants: Vec<Want>) -> Result<(), String> {
+        if self.running() || self.with(|batch| batch.indexed.is_some() || !batch.wants.is_empty() || !batch.restore.is_empty()) {
+            return Err("The indexed batch has already been started.".into());
+        }
+        if wants.is_empty() {
+            return Err("The indexed batch has no lines.".into());
+        }
+        let mut saved = Batch::default();
+        let mut index = Indexed::default();
+        let mut by_release = HashMap::<(String, String), usize>::new();
+        for mut want in wants {
+            // Placement evidence belongs to the effect this job is about to perform.
+            want.placed = false;
+            let slot = match (want.state, &want.offer) {
+                (State::Found, Some(offer)) if !offer.artist_id.is_empty() && !offer.album.is_empty() => {
+                    *by_release.entry((offer.artist_id.clone(), offer.album.clone())).or_insert(saved.wants.len())
+                }
+                (State::Unknown | State::Failed, _) => saved.wants.len(),
+                _ => return Err("The indexed batch still has an unresolved lookup.".into()),
+            };
+            index.slots.push(slot);
+            if let Some(known) = saved.wants.get_mut(slot) {
+                for fill in want.fills {
+                    if !known.fills.contains(&fill) {
+                        known.fills.push(fill);
+                    }
+                }
+            } else {
+                saved.wants.push(want);
+            }
+        }
+        saved.indexed = Some(index);
+        let _writing = self.writing.lock().unwrap_or_else(|stuck| stuck.into_inner());
+        if !serde_json::to_vec(&saved).ok().is_some_and(|json| self.desk.keep_checked(json)) {
+            return Err("The indexed batch could not be saved.".into());
+        }
+        self.with(|batch| *batch = saved);
+        Ok(())
+    }
+
+    pub fn indexed_lines(&self) -> Option<Vec<IndexedLine>> {
+        self.with(|batch| {
+            let indexed = batch.indexed.as_ref()?;
+            indexed.slots.iter().enumerate().map(|(index, &slot)| {
+                let want = batch.wants.get(slot)?;
+                Some(IndexedLine {
+                    index,
+                    slot,
+                    state: want.state,
+                    offer: want.offer.clone(),
+                    reason: want.reason.clone(),
+                    before_effect: indexed.before_effect.contains(&slot),
+                    placement: indexed.placements.get(&slot).cloned(),
+                    placed: want.placed && indexed.placements.get(&slot).is_some_and(AlbumPlacement::newly_placed),
+                })
+            }).collect()
+        })
+    }
+
+    /// On restart reconcile only observations from the original endpoint and
+    /// exact artist/release. A listed release can be recorded in history even
+    /// when this batch has no evidence of having placed it.
+    pub fn reconcile_indexed(&self, slot: usize, outcome: PlacementRecovery) -> Result<(), String> {
+        if self.running() {
+            return Err("The indexed batch is running.".into());
+        }
+        let previous = self.with(|batch| {
+            let indexed = batch.indexed.as_ref()?;
+            if !indexed.before_effect.contains(&slot) {
+                return None;
+            }
+            let want = batch.wants.get_mut(slot)?;
+            if !matches!(want.state, State::Found | State::Asked) {
+                return None;
+            }
+            let previous = want.clone();
+            match outcome {
+                PlacementRecovery::Unconfirmed => {
+                    want.state = State::Failed;
+                    want.reason = INTERRUPTED_EFFECT.into();
+                    want.placed = false;
+                }
+                PlacementRecovery::Listed { placed } => {
+                    want.state = State::Done;
+                    want.reason.clear();
+                    want.placed = placed && indexed.placements.get(&slot).is_some_and(AlbumPlacement::newly_placed);
+                }
+            }
+            want.again = false;
+            Some(previous)
+        }).ok_or("This batch slot has no uncertain effect.")?;
+        if self.save_checked() {
+            return Ok(());
+        }
+        self.with(|batch| {
+            if let Some(want) = batch.wants.get_mut(slot) {
+                *want = previous;
+            }
+        });
+        Err("The recovered batch result could not be saved.".into())
+    }
+
+    fn keep_before_effect(&self, places: &[usize]) -> Result<(), String> {
+        let indexed = self.with(|batch| {
+            let Some(index) = &mut batch.indexed else { return Ok(false) };
+            if places.iter().any(|slot| index.before_effect.contains(slot)) {
+                return Err("This batch effect has already been attempted.");
+            }
+            index.before_effect.extend(places.iter().copied());
+            Ok(true)
+        })?;
+        if !indexed || self.save_checked() {
+            return Ok(());
+        }
+        self.with(|batch| {
+            if let Some(index) = &mut batch.indexed {
+                for slot in places {
+                    index.before_effect.remove(slot);
+                }
+            }
+        });
+        Err("The changes to Lidarr could not be saved before they were sent.".into())
+    }
+
+    /// Commit the first album-level observation at the actual placement write.
+    /// The earlier group marker alone never proves that this request placed it.
+    fn keep_placements(&self, placements: &[AlbumPlacement]) -> Result<(), String> {
+        if placements.is_empty() {
+            return Ok(());
+        }
+        let added = self.with(|batch| {
+            let Some(index) = &mut batch.indexed else { return Vec::new() };
+            let mut added = Vec::new();
+            for placement in placements {
+                let Some(slot) = batch.wants.iter().position(|want| want.offer.as_ref().is_some_and(|offer| {
+                    offer.album == placement.release && offer.artist_id == placement.artist
+                })) else { continue };
+                if index.before_effect.contains(&slot) && let std::collections::btree_map::Entry::Vacant(entry) = index.placements.entry(slot) {
+                    entry.insert(placement.clone());
+                    added.push(slot);
+                }
+            }
+            added
+        });
+        if added.is_empty() || self.save_checked() {
+            return Ok(());
+        }
+        self.with(|batch| {
+            if let Some(index) = &mut batch.indexed {
+                for slot in added {
+                    index.placements.remove(&slot);
+                }
+            }
+        });
+        Err("The exact albums could not be journaled before they were sent to Lidarr.".into())
+    }
+
     /// Whether there's a batch with something still to do with the Lidarr at `lidarr` (its
     /// address, as `Lidarr::address` has it).
     pub fn unfinished(&self, lidarr: &str) -> bool {
@@ -437,6 +648,7 @@ impl Job {
         }
         self.with(|batch| {
             batch.wants.clear();
+            batch.indexed = None;
             batch.stopped.clear();
         });
         self.save();
@@ -692,12 +904,43 @@ impl Job {
         tell(Event::Ended);
     }
 
+    /// Server execution uses the existing grouped write and settle phases, with
+    /// all lookups already decided. The caller holds the endpoint's mutation turn
+    /// and reconciles uncertain slots from a prior run before calling this.
+    pub fn work_prepared(&self, lidarr: &dyn BulkLidarr, tell: &Tell) -> Result<(), String> {
+        let ready = self.with(|batch| batch.indexed.as_ref().is_some_and(|index| {
+            !index.before_effect.iter().any(|&slot| {
+                batch.wants.get(slot).is_none_or(|want| matches!(want.state, State::Found | State::Asked))
+            })
+        }));
+        if !ready {
+            return Err("Reconcile the indexed batch before working through it.".into());
+        }
+        if !self.begin() {
+            return Err("The indexed batch is already running.".into());
+        }
+        tell(Event::Changed);
+        let asked = self.ask_all(lidarr, tell);
+        self.save();
+        if asked.is_ok() {
+            tell(Event::Asked);
+        }
+        let outcome = asked.and(self.settle(lidarr, tell));
+        self.save();
+        self.not_started();
+        tell(Event::Ended);
+        outcome
+    }
+
     /// The app couldn't start the thread to work through the batch on.
     pub fn not_started(&self) {
         self.running.store(false, Ordering::SeqCst);
     }
 
     fn work(&self, lidarr: &dyn BulkLidarr, musicbrainz: &MusicBrainz, tell: &Tell) -> Result<(), String> {
+        if self.with(|batch| batch.indexed.is_some()) {
+            return Err("An indexed batch must use the prepared worker.".into());
+        }
         let found = self.find_all(lidarr, musicbrainz, tell);
         let asked = found.and_then(|()| self.ask_all(lidarr, tell));
         if self.stopping() {
@@ -803,7 +1046,7 @@ impl Job {
 /// How asking for one album went.
 enum Went {
     /// It's on Lidarr's list.
-    Listed,
+    Listed { placed: bool },
     /// Lidarr has been asked and is reading the artist in; to be checked when it's done.
     /// With whether it can be counted as asked for already.
     Sent(bool),
@@ -842,6 +1085,7 @@ impl Job {
             if self.stopping() {
                 break;
             }
+            self.keep_before_effect(&places)?;
             let offers: Vec<Offer> = self.with(|batch| places.iter().filter_map(|&at| batch.wants[at].offer.clone()).collect());
             // Whether this is an artist to watch Lidarr with (see `Batch::proof`).
             let mut unproven = false;
@@ -852,8 +1096,8 @@ impl Job {
                     0,
                     offers
                         .iter()
-                        .map(|offer| match lidarr.request(offer, self) {
-                            Ok(()) => Went::Listed,
+                        .map(|offer| match lidarr.request_placement(offer, self) {
+                            Ok(placed) => Went::Listed { placed },
                             Err(reason) => Went::Failed(reason.trim_end_matches('.').to_string()),
                         })
                         .collect(),
@@ -884,8 +1128,9 @@ impl Job {
                             want.lidarr_artist = number;
                             want.reason.clear();
                             let counts = match went {
-                                Went::Listed => {
+                                Went::Listed { placed } => {
                                     want.state = State::Done;
+                                    want.placed = placed;
                                     true
                                 }
                                 Went::Sent(counts) => {
@@ -952,14 +1197,18 @@ impl Job {
             reading = listed.is_empty() || twice(lidarr, || lidarr.busy_with(&HashSet::from([artist])))?.contains(&artist);
         }
         let mut wanted = Vec::new();
+        let mut placements = Vec::new();
         let mut went = Vec::new();
         for offer in offers {
             went.push(match listed.iter().find(|known| known.album == offer.album) {
                 Some(known) => {
-                    if !known.wanted && !known.have {
+                    let placement = AlbumPlacement::from_listed(&offer.artist_id, artist, known);
+                    let placed = placement.newly_placed();
+                    if placed {
                         wanted.push(known.id);
+                        placements.push(placement);
                     }
-                    Went::Listed
+                    Went::Listed { placed }
                 }
                 None if reading => Went::Sent(false),
                 // Lidarr only lists the kinds of release an artist's profile names. A single, an
@@ -986,7 +1235,7 @@ impl Job {
         // changing the same record meanwhile would be written over (`WayBack::turn`).
         {
             let _turn = crate::lidarr::WayBack::turn(self);
-            lidarr.want(artist, &wanted)?;
+            lidarr.want_before(artist, &wanted, &|| self.keep_placements(&placements))?;
         }
         Ok(went)
     }
@@ -999,8 +1248,8 @@ impl Job {
             // The long way: one release at a time, each seen onto the list before the next.
             let went: Vec<Went> = offers
                 .iter()
-                .map(|offer| match lidarr.request(offer, self) {
-                    Ok(()) => Went::Listed,
+                .map(|offer| match lidarr.request_placement(offer, self) {
+                    Ok(placed) => Went::Listed { placed },
                     Err(reason) => Went::Failed(reason.trim_end_matches('.').to_string()),
                 })
                 .collect();
@@ -1011,7 +1260,8 @@ impl Job {
             Some(setup) => setup,
             None => setup.insert(twice(lidarr, || lidarr.setup())?),
         };
-        let number = lidarr.add_wanting(setup, offers)?;
+        let placements: Vec<_> = offers.iter().map(|offer| AlbumPlacement::unlisted(offer, None)).collect();
+        let number = lidarr.add_wanting_before(setup, offers, &|| self.keep_placements(&placements))?;
         Ok((number, offers.iter().map(|_| Went::Sent(true)).collect(), proof.is_none()))
     }
 
@@ -1146,9 +1396,13 @@ impl Job {
         if listed.is_empty() && !places.is_empty() && !given_up {
             return Ok(Finished::Empty);
         }
-        let wanted: Vec<i64> =
-            places.iter().filter_map(|(_, offer)| listed.iter().find(|known| known.album == offer.album)).filter(|known| !known.wanted && !known.have).map(|known| known.id).collect();
-        lidarr.want(artist, &wanted)?;
+        let placements: Vec<_> = places.iter().filter_map(|(_, offer)| {
+            let row = listed.iter().find(|known| known.album == offer.album)?;
+            let placement = AlbumPlacement::from_listed(&offer.artist_id, artist, row);
+            placement.newly_placed().then_some(placement)
+        }).collect();
+        let wanted: Vec<_> = placements.iter().filter_map(|placement| placement.album_number).collect();
+        lidarr.want_before(artist, &wanted, &|| self.keep_placements(&placements))?;
         if let Some(before) = self.with(|batch| batch.restore.iter().find(|known| known.of(&lidarr.way_back_address(), artist)).map(|known| known.before.clone())) {
             lidarr.set_new_releases(artist, &before)?;
             self.with(|batch| batch.restore.retain(|known| !known.of(&lidarr.way_back_address(), artist)));
@@ -1159,7 +1413,13 @@ impl Job {
             let (mut notes, mut gone) = (Vec::new(), Vec::new());
             for (at, offer) in &places {
                 let want = &mut batch.wants[*at];
-                if listed.iter().any(|known| known.album == offer.album) {
+                if let Some(row) = listed.iter().find(|known| known.album == offer.album) {
+                    want.placed = placements.iter().any(|placement| placement.release == offer.album)
+                        || batch.indexed.as_ref().and_then(|index| index.placements.get(at)).is_some_and(|placement| {
+                            (row.wanted || row.have) && placement.newly_placed()
+                                && placement.artist_number.is_none_or(|number| number == artist)
+                                && placement.album_number.is_none_or(|number| number == row.id)
+                        });
                     want.state = State::Done;
                     if !want.noted {
                         want.noted = true;
@@ -1278,6 +1538,42 @@ mod tests {
         fn singles(&self) -> bool {
             false
         }
+    }
+
+    #[test]
+    fn indexed_jobs_keep_distinct_wants_and_reject_corrupt_saved_slots() {
+        let found = |name: &str| Want {
+            state: State::Found,
+            offer: Some(Offer { album: name.into(), artist_id: "ar1".into(), ..Offer::default() }),
+            ..Want::default()
+        };
+        let job = Job::new(Nowhere);
+        job.start_indexed(vec![
+            found("al1"), found("al1"), found("al2"),
+            Want { state: State::Unknown, ..Want::default() },
+            Want { state: State::Failed, ..Want::default() },
+        ]).unwrap();
+        let rows = job.indexed_lines().unwrap();
+        assert_eq!(rows.iter().map(|row| row.slot).collect::<Vec<_>>(), [0, 0, 1, 2, 3]);
+        assert_eq!(rows.iter().map(|row| row.state).collect::<Vec<_>>(),
+            [State::Found, State::Found, State::Found, State::Unknown, State::Failed]);
+
+        let saved = job.with(|batch| serde_json::to_value(batch).unwrap());
+        let recovered = Job::new(Nowhere);
+        assert!(recovered.load(&serde_json::to_vec(&saved).unwrap()));
+        for bad in [
+            serde_json::json!({ "slots": [0, 0, 1, 2, 4], "before_effect": [] }),
+            serde_json::json!({ "slots": [0, 0, 0, 2, 3], "before_effect": [] }),
+            serde_json::json!({ "slots": [0, 0, 1, 2, 3], "before_effect": [4] }),
+        ] {
+            let mut corrupted = saved.clone();
+            corrupted["indexed"] = bad;
+            assert!(!recovered.load(&serde_json::to_vec(&corrupted).unwrap()));
+        }
+        let mut unproven = saved;
+        unproven["wants"][0]["placed"] = serde_json::json!(true);
+        assert!(!recovered.load(&serde_json::to_vec(&unproven).unwrap()));
+        assert_eq!(recovered.indexed_lines().unwrap(), rows);
     }
 
     #[test]

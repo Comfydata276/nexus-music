@@ -16,18 +16,52 @@
   --accent: #a98bfb;
 }
 * { box-sizing: border-box; }
+[hidden], #admin[hidden] dialog { display: none !important; }
 body { margin: 0; }
-main { width: min(100% - 2rem, 46rem); margin: clamp(2rem, 8vw, 5rem) auto; }
+main { width: min(100% - 2rem, 68rem); margin: clamp(2rem, 8vw, 5rem) auto; }
 h1 { margin: 0 0 1.25rem; font-size: clamp(1.65rem, 5vw, 2.3rem); }
 h2 { margin: 0 0 .35rem; font-size: 1.15rem; }
 p { margin: 0; overflow-wrap: anywhere; }
-form, article, aside {
+#signin, #setup-details, article, dialog {
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: .75rem;
   padding: 1.25rem;
 }
-form { max-width: 26rem; }
+#signin, #setup-details { max-width: 26rem; }
+#setup-details { margin-top: .85rem; }
+#report-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+article { min-width: 0; }
+.dialog-actions, .account-bar, .row-actions {
+  display: flex;
+  gap: .6rem;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.account-bar { justify-content: space-between; margin-bottom: 1rem; }
+.account-bar button { margin-top: 0; }
+dialog { width: min(100% - 2rem, 32rem); max-height: calc(100% - 2rem); overflow: auto; color: inherit; }
+dialog::backdrop { background: #080611d9; }
+dialog p + p { margin-top: .65rem; }
+.secondary, .row-actions button {
+  color: #f3effa;
+  background: transparent;
+  border-color: #695583;
+}
+.row-actions button { margin-top: .6rem; }
+.row-actions .danger { color: #ffd2d5; border-color: #a95564; }
+summary { cursor: pointer; min-height: 2.75rem; display: list-item; align-content: center; }
+summary:focus-visible { border-radius: .25rem; }
+ul { margin: .5rem 0; padding: 0; list-style: none; }
+li { padding: .75rem 0; border-top: 1px solid var(--line); }
+li:first-child { border-top: 0; }
+#code-value { font-size: 1.45rem; letter-spacing: .12em; user-select: all; padding: .6rem 0; }
+#status:empty, #change-status:empty { display: none; }
+#change-status, #status { color: var(--accent); }
+@media (min-width: 52rem) {
+  #accounts-panel { grid-column: span 2; }
+}
+
 label { display: block; margin-top: .8rem; }
 input, button { font: inherit; min-height: 2.75rem; border-radius: .4rem; }
 input {
@@ -52,11 +86,12 @@ button:disabled { opacity: .6; cursor: default; }
 #status { color: var(--accent); margin-top: 1rem; }
 #sections {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 17rem), 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 20rem), 1fr));
+  align-items: start;
   gap: .75rem;
   margin-block: 1rem;
 }
-article p, aside p, dt { color: var(--muted); }
+article p, dt { color: var(--muted); }
 dd { margin: 0 0 .65rem; }
 dd, li { overflow-wrap: anywhere; }
 </style>
@@ -64,23 +99,46 @@ dd, li { overflow-wrap: anywhere; }
 <body>
 <main>
   <h1>Nexus Music administration</h1>
-  <form id="signin" method="post" autocomplete="off">
+  <form id="signin" method="post">
     <h2>Sign in</h2>
     <label>Email
-      <input id="email" type="text" inputmode="email" autocapitalize="none" spellcheck="false" maxlength="254" required>
+      <input id="email" name="username" autocomplete="username" type="text" inputmode="email" autocapitalize="none" spellcheck="false" maxlength="254" required>
     </label>
     <label>Password
-      <input id="password" type="password" maxlength="256" required>
+      <input id="password" name="password" autocomplete="current-password" type="password" maxlength="256" required>
     </label>
     <button id="submit" type="submit" disabled>Sign in</button>
     <noscript><p>Enable JavaScript to sign in.</p></noscript>
   </form>
+  <details id="setup-details">
+    <summary>Set up this server for the first time</summary>
+    <p>Use the one-time setup code from the Nexus server’s log.</p>
+    <form id="setup-form" method="post" autocomplete="off">
+      <label>Setup code <input id="setup-code" inputmode="text" autocomplete="one-time-code" spellcheck="false" required></label>
+      <label>Your name <input id="setup-name" autocomplete="off" maxlength="128" required></label>
+      <label>Email <input id="setup-email" autocomplete="off" inputmode="email" autocapitalize="none" spellcheck="false" maxlength="254" required></label>
+      <label>New password <input id="setup-password" type="password" autocomplete="new-password" minlength="15" maxlength="256" required></label>
+      <button id="setup-submit" type="submit">Create my administrator account</button>
+    </form>
+  </details>
   <section id="admin" hidden>
-    <p id="identity"></p>
-    <button id="signout" type="button">Sign out</button>
+    <div class="account-bar">
+      <p id="identity"></p>
+      <button id="signout" class="secondary" type="button">Sign out</button>
+    </div>
+    <p id="change-status" role="status" tabindex="-1"></p>
     <div id="sections">
-      <article>
+      <article id="accounts-panel">
         <h2>Accounts</h2>
+        <details id="new-account-details">
+          <summary>Add an account</summary>
+          <form id="create-form" method="post" autocomplete="off">
+            <label>Name <input id="create-name" autocomplete="off" maxlength="128" required></label>
+            <label>Email <input id="create-email" autocomplete="off" type="text" inputmode="email" autocapitalize="none"
+              spellcheck="false" maxlength="254" required></label>
+            <button type="submit">Add account</button>
+          </form>
+        </details>
         <p id="accounts-status" role="status"></p>
         <ul id="accounts-list"></ul>
         <button id="accounts-more" type="button" hidden>Load more accounts</button>
@@ -89,9 +147,16 @@ dd, li { overflow-wrap: anywhere; }
         <h2>Music server</h2>
         <p id="music-status" role="status"></p>
         <dl>
-          <dt>Backend address</dt><dd id="music-internal"></dd>
-          <dt>Public address</dt><dd id="music-public"></dd>
+          <dt>Address Nexus uses</dt><dd id="music-internal"></dd>
+          <dt>Address people use</dt><dd id="music-public"></dd>
         </dl>
+        <form id="address-form" method="post" autocomplete="off" hidden>
+          <label>New address people will use
+            <input id="new-address" autocomplete="off" type="url" inputmode="url" maxlength="2048" required>
+          </label>
+          <p>Nexus doesn’t test this address. Check it by signing in on a phone or PC.</p>
+          <button type="submit">Review new address</button>
+        </form>
       </article>
       <article>
         <h2>Devices</h2>
@@ -102,17 +167,68 @@ dd, li { overflow-wrap: anywhere; }
       <article>
         <h2>Diagnostics</h2>
         <p id="diagnostics-status" role="status"></p>
+        <button id="diagnostics-toggle" type="button" hidden></button>
+        <button id="reports-open" type="button" class="secondary">Read device reports</button>
       </article>
       <article>
         <h2>Requests</h2>
         <p id="requests-status" role="status"></p>
         <ul id="requests-list"></ul>
+        <p id="requests-availability">Settings for requests will be available when music requests are turned on for this server.</p>
+        <details id="lidarr-details" hidden>
+          <summary>Set up Lidarr</summary>
+          <form id="lidarr-form" method="post" autocomplete="off">
+            <p id="lidarr-address"></p>
+            <label>Lidarr key <input id="lidarr-key" type="password" autocomplete="new-password" maxlength="512" required></label>
+            <button type="submit">Review Lidarr settings</button>
+          </form>
+        </details>
       </article>
     </div>
-    <aside id="grant">
-      <h2>Authorize a change</h2>
-      <p>When changes are available, this is where you’ll enter your password again.</p>
-    </aside>
+    <dialog id="reports" aria-labelledby="reports-title">
+      <h2 id="reports-title">Device reports</h2>
+      <p id="reports-status" role="status"></p>
+      <pre id="report-text"></pre>
+      <div class="dialog-actions">
+        <button id="reports-more" type="button" hidden>Older report</button>
+        <button id="reports-close" type="button" class="secondary">Close</button>
+      </div>
+    </dialog>
+    <dialog id="music-login" aria-labelledby="music-login-title">
+      <h2 id="music-login-title">Set music sign-in</h2>
+      <p id="music-login-account"></p>
+      <form id="music-login-form" method="post" autocomplete="off">
+        <label>Music server username <input id="music-user" name="music-service-value" autocomplete="off" maxlength="128" required></label>
+        <label>Music server password <input id="music-password" type="password" autocomplete="new-password" maxlength="512" required></label>
+        <div class="dialog-actions">
+          <button type="submit">Review music sign-in</button>
+          <button id="music-login-cancel" type="button" class="secondary">Cancel</button>
+        </div>
+      </form>
+    </dialog>
+    <dialog id="grant" aria-labelledby="grant-title" aria-describedby="grant-summary grant-note">
+      <h2 id="grant-title">Confirm change</h2>
+      <p id="grant-summary"></p>
+      <p id="grant-note"></p>
+      <form id="grant-form" method="post" autocomplete="off">
+        <label id="grant-label">Your Nexus password
+          <input id="grant-password" type="password" autocomplete="off" maxlength="256" required>
+        </label>
+        <div class="dialog-actions">
+          <button id="grant-commit" type="submit">Confirm change</button>
+          <button id="grant-cancel" type="button" class="secondary">Cancel</button>
+        </div>
+      </form>
+    </dialog>
+    <dialog id="new-code" aria-labelledby="code-title" aria-describedby="code-person code-server code-instructions code-expiry">
+      <h2 id="code-title">One-time sign-in code</h2>
+      <p id="code-person"></p>
+      <p id="code-server">Nexus server <strong id="code-origin"></strong></p>
+      <p id="code-instructions">Pass the address and code to them privately. In Nexus Music, they choose “I have a one-time code” on the sign-in screen, enter the Nexus server address and this code, then enter a password of their own at least 15 characters long, twice.</p>
+      <p id="code-expiry">The code works once and expires in 7 days. You can see it here just once.</p>
+      <p id="code-value"></p>
+      <button id="code-done" type="button">Done</button>
+    </dialog>
   </section>
   <p id="status" role="status"></p>
 </main>
@@ -121,6 +237,10 @@ dd, li { overflow-wrap: anywhere; }
   "use strict";
   const byId = id => document.getElementById(id);
   const form = byId("signin");
+  const setupDetails = byId("setup-details");
+  const setupForm = byId("setup-form");
+  const setupSubmit = byId("setup-submit");
+  const enableRequestChanges = false;
   const email = byId("email");
   const password = byId("password");
   const submit = byId("submit");
@@ -131,6 +251,7 @@ dd, li { overflow-wrap: anywhere; }
   let session = null;
   let pending = null;
   let idleTimer;
+  const idleLimit = 30 * 60 * 1000;
   const accountPage = page("accounts");
   const devicePage = page("devices");
   const requests = byId("requests-list");
@@ -139,6 +260,35 @@ dd, li { overflow-wrap: anywhere; }
   const internalAddress = byId("music-internal");
   const publicAddress = byId("music-public");
   const diagnostics = byId("diagnostics-status");
+  const diagnosticsToggle = byId("diagnostics-toggle");
+  const reportsDialog = byId("reports");
+  const reportsMore = byId("reports-more");
+  let reportCursor = null;
+  let reportGeneration = 0;
+  const deviceNames = new Map();
+  const changeStatus = byId("change-status");
+  const grantDialog = byId("grant");
+  const grantPassword = byId("grant-password");
+  const grantLabel = byId("grant-label");
+  const codeDialog = byId("new-code");
+  const codeValue = byId("code-value");
+  const codePerson = byId("code-person");
+  const codeOrigin = byId("code-origin");
+  const loginDialog = byId("music-login");
+  const createForm = byId("create-form");
+  const addressForm = byId("address-form");
+  const lidarrForm = byId("lidarr-form");
+  const loginForm = byId("music-login-form");
+  const accountNames = new Map();
+  const deviceOwners = new Map();
+  let musicAddress = null;
+  let diagnosticsEnabled = null;
+  let lidarrAddress = null;
+  let loginAccount = null;
+  let draft = null;
+  let changing = false;
+  let approval = null;
+  let approvalTimer;
 
   function writeText(element, value) {
     element.textContent = value;
@@ -229,9 +379,19 @@ dd, li { overflow-wrap: anywhere; }
       JSON.stringify(key) + ":" + json(item)).join(",") + "}";
   }
 
+  function checkIdle() {
+    if (!session) return false;
+    const elapsed = Date.now() - session.lastUse;
+    if (elapsed >= 0 && elapsed < idleLimit) return true;
+    endSession("Your session has ended. Sign in again.");
+    return false;
+  }
+
   function armIdleTimer() {
     clearTimeout(idleTimer);
-    idleTimer = setTimeout(() => endSession("Your session has ended. Sign in again."), 30 * 60 * 1000);
+    if (!checkIdle()) return;
+    const remaining = idleLimit - (Date.now() - session.lastUse);
+    idleTimer = setTimeout(armIdleTimer, Math.min(30_000, remaining));
   }
 
   function endSession(message) {
@@ -240,33 +400,67 @@ dd, li { overflow-wrap: anywhere; }
     email.focus();
   }
 
+  const refusalMessages = {
+    wrong_password: "That password is not right. Try the change again.",
+    denied: "You don’t have permission for this change. Sign in as an administrator.",
+    grant_required: "Your confirmation has expired. Review the change and try again.",
+    no_such_account: "That account is no longer here. Refresh the accounts and try again.",
+    no_such_session: "That device has signed out or signed in again. Refresh the devices first.",
+    music_login_refused: "That music server username or password is not right. Check both and try again.",
+    lidarr_login_refused: "Lidarr did not accept that key. Check it and try again.",
+    conflict: "Someone changed these settings already. Refresh them and try again.",
+  };
+
+  class AdminProblem extends Error {
+    constructor(message, reason) { super(message); this.reason = reason; }
+  }
+
   async function readAdmin(current, path, fields, max) {
+    if (session !== current || !checkIdle()) throw new Error();
+    const started = Date.now();
     const response = await post(path, json({
       head: { speaks: [1, 1], restore: current.restore }, ...fields,
     }), current.controller.signal, current.bearer);
-    if (session !== current) throw new Error();
+    if (session !== current || !checkIdle()) throw new Error();
+    const reply = response.body && await readReply(response, response.status === 200 ? max : 4096).catch(error => {
+      if (response.status === 401) return null;
+      throw error;
+    });
+    if (session !== current || !checkIdle()) throw new Error();
     if (response.status === 401) {
-      const reply = await readReply(response, 4096);
-      if (session === current) {
-        const ended = reply.refused?.not_signed_in;
-        if (ended === "data_put_back" || ended === "session_ended") {
-          endSession(ended === "data_put_back" ?
-            "The server’s data was put back. Sign in again." : "Your session has ended. Sign in again.");
-        }
-      }
+      endSession(reply?.refused?.not_signed_in === "data_put_back" ?
+        "The server’s data was put back. Sign in again." : "Your session has ended. Sign in again.");
       throw new Error();
     }
-    if (response.status !== 200) throw new Error();
-    const reply = await readReply(response, max);
-    if (session !== current || !reply.done || reply.refused !== undefined) throw new Error();
-    armIdleTimer();
-    return reply.done;
+    if (response.status === 200 && reply?.done && typeof reply.done === "object" &&
+        !Array.isArray(reply.done) && reply.refused === undefined) {
+      current.lastUse = Math.max(current.lastUse, started);
+      armIdleTimer();
+      return reply.done;
+    }
+    if (!reply || reply.done !== undefined) throw new Error();
+    if (response.status === 403) {
+      const reason = reply.refused?.not_allowed;
+      if (typeof reason === "string" && Object.hasOwn(refusalMessages, reason)) {
+        throw new AdminProblem(refusalMessages[reason], reason);
+      }
+    }
+    if (response.status === 429 && reply.refused?.busy) {
+      throw new AdminProblem("Nexus is busy. Wait a moment and try again.", "busy");
+    }
+    if (response.status === 400 && reply.refused === "malformed") {
+      throw new AdminProblem("Nexus did not accept those details. Check them and try again.", "malformed");
+    }
+    if (response.status === 503 && reply.refused === "not_dealt_with") {
+      throw new AdminProblem("Nexus could not make that change. Check the current settings before trying again.", "unavailable");
+    }
+    throw new Error();
   }
 
   function page(section) {
     return {
       list: byId(section + "-list"), status: byId(section + "-status"),
-      more: byId(section + "-more"), after: null,
+      more: byId(section + "-more"), after: null, generation: 0,
     };
   }
 
@@ -274,6 +468,7 @@ dd, li { overflow-wrap: anywhere; }
     const row = document.createElement("li");
     writeText(row, value);
     list.append(row);
+    return row;
   }
 
   function id(value) {
@@ -284,27 +479,34 @@ dd, li { overflow-wrap: anywhere; }
   function accountRow(row) {
     if (typeof row.name !== "string" || typeof row.email !== "string" ||
         typeof row.enabled !== "boolean" || typeof row.admin !== "boolean" ||
-        typeof row.requests_enabled !== "boolean") throw new Error();
+        typeof row.requests_enabled !== "boolean" ||
+        !["none_set", "set", "type_again"].includes(row.music)) throw new Error();
     return {
-      after: id(row.id),
+      after: id(row.id), name: row.name, email: row.email, enabled: row.enabled,
+      admin: row.admin, requestsEnabled: row.requests_enabled,
       label: row.name + " · " + row.email + (row.admin ? " · Administrator" : "") +
-        (row.enabled ? "" : " · Switched off"),
-      requests: row.name + " · " + (row.requests_enabled ? "On" : "Off"),
+        (row.enabled ? "" : " · Switched off") +
+        (row.music === "type_again" ? " · Enter their music sign-in again" :
+          row.music === "none_set" ? " · Music sign-in not set" : " · Music sign-in set"),
     };
   }
 
   function deviceRow(row) {
     if (typeof row.name !== "string" || typeof row.app_version !== "string" ||
-        !["pc", "phone"].includes(row.kind)) throw new Error();
-    if (row.session !== null) id(row.session);
+        !["pc", "phone"].includes(row.kind) || typeof row.page !== "boolean") throw new Error();
+    if (row.session !== null || row.page) id(row.session);
     if (!isU64(row.last_seen_ms)) throw new Error();
-    const heard = row.last_seen_ms === 0n ? "Never heard from" :
-      row.last_seen_ms <= 8640000000000000n ? "Last heard " + new Date(Number(row.last_seen_ms)).toLocaleString() :
-      "Last-heard time unavailable";
+    const lastSeen = row.last_seen_ms <= 8640000000000000n && row.last_seen_ms > 0n ?
+      new Date(Number(row.last_seen_ms)).toLocaleString() : null;
+    const heard = lastSeen ? "Last heard " + lastSeen : "Last-heard time unavailable";
+    const name = row.page ? "Admin page" : row.name;
+    const label = row.page
+      ? name + (row.session === session.id ? " · This tab" : " · Signed in") +
+        (lastSeen ? " · Last used " + lastSeen : "")
+      : name + " · " + (row.kind === "pc" ? "PC" : "Phone") + " · " + row.app_version +
+        " · " + (row.last_seen_ms === 0n ? "Never heard from" : heard) + (row.session === null ? " · Signed out" : "");
     return {
-      after: { account: id(row.account), device: id(row.device) },
-      label: row.name + " · " + (row.kind === "pc" ? "PC" : "Phone") + " · " + row.app_version +
-        " · Account " + row.account + " · " + heard + (row.session === null ? " · Signed out" : ""),
+      after: { account: id(row.account), device: id(row.device) }, name, session: row.session, page: row.page, label,
     };
   }
 
@@ -312,10 +514,12 @@ dd, li { overflow-wrap: anywhere; }
     const current = session;
     if (!current || pager.more.disabled) return;
     pager.more.disabled = true;
+    const generation = pager.generation;
+    const currentPage = () => session === current && pager.generation === generation;
     writeText(pager.status, "Loading…");
     try {
       const result = await readAdmin(current, path, { after: pager.after }, 1024 * 1024);
-      if (session !== current) return;
+      if (!currentPage()) return;
       if (!Array.isArray(result.rows) || result.rows.length > 500 ||
           typeof result.more !== "boolean" || (result.more && result.rows.length === 0)) throw new Error();
       const rows = result.rows.map(decode);
@@ -330,8 +534,8 @@ dd, li { overflow-wrap: anywhere; }
         after = next;
       }
       for (const row of rows) {
-        appendRow(pager.list, row.label);
-        if (row.requests !== undefined) appendRow(requests, row.requests);
+        if (pager === accountPage) renderAccount(row);
+        else renderDevice(row);
       }
       pager.after = after;
       pager.more.hidden = !result.more;
@@ -339,13 +543,13 @@ dd, li { overflow-wrap: anywhere; }
       writeText(pager.status, after === null ? "No " + section + "." : "");
       if (pager === accountPage) writeText(requestsStatus, after === null ? "No accounts." : "");
     } catch {
-      if (session !== current) return;
-      writeText(pager.status, "Could not load " + section + ".");
+      if (!currentPage()) return;
+      writeText(pager.status, "Could not load " + section + ". Select Retry.");
       if (pager === accountPage && pager.after === null) writeText(requestsStatus, "Could not load accounts.");
       pager.more.hidden = false;
       writeText(pager.more, "Retry");
     } finally {
-      if (session === current) pager.more.disabled = false;
+      if (currentPage()) pager.more.disabled = false;
     }
   }
 
@@ -364,11 +568,13 @@ dd, li { overflow-wrap: anywhere; }
       if (session !== current) return;
       if (typeof result.internal !== "string" ||
           (result.public !== null && typeof result.public !== "string")) throw new Error();
+      musicAddress = result;
+      addressForm.hidden = false;
       writeText(internalAddress, result.internal);
       writeText(publicAddress, result.public ?? "Unset");
       writeText(musicStatus, "");
     } catch {
-      if (session === current) writeText(musicStatus, "Could not load music server addresses.");
+      if (session === current) writeText(musicStatus, "Could not load the addresses. Sign out and back in to try again.");
     }
   }
 
@@ -378,35 +584,561 @@ dd, li { overflow-wrap: anywhere; }
       const result = await readAdmin(current, "/nexus/api/admin/diagnostics-default", {}, 4096);
       if (session !== current) return;
       if (typeof result.enabled !== "boolean") throw new Error();
-      writeText(diagnostics, result.enabled ? "Default is on." : "Default is off.");
+      diagnosticsEnabled = result.enabled;
+      diagnosticsToggle.hidden = false;
+      writeText(diagnostics, result.enabled ? "New devices send diagnostics by default." : "New devices start with diagnostics off.");
+      writeText(diagnosticsToggle, result.enabled ? "Turn the default off" : "Turn the default on");
     } catch {
-      if (session === current) writeText(diagnostics, "Could not load the Diagnostics default.");
+      if (session === current) writeText(diagnostics, "Could not load the default. Sign out and back in to try again.");
     }
   }
 
   accountPage.more.addEventListener("click", loadAccounts);
   devicePage.more.addEventListener("click", loadDevices);
 
+  function makeButton(label, click, danger = false) {
+    const button = document.createElement("button");
+    button.type = "button";
+    if (danger) button.className = "danger";
+    writeText(button, label);
+    button.addEventListener("click", click);
+    return button;
+  }
+
+  function renderAccount(row) {
+    const account = row.after;
+    const person = row.name + " (" + row.email + ")";
+    accountNames.set(account, row.name);
+    for (const owner of deviceOwners.get(account) ?? []) writeText(owner, " · " + row.name);
+    const entry = appendRow(accountPage.list, row.label);
+    const menu = document.createElement("details");
+    const summary = document.createElement("summary");
+    writeText(summary, "Manage account");
+    const buttons = document.createElement("div");
+    buttons.className = "row-actions";
+
+    const own = account === session.account;
+    if (own) {
+      const note = document.createElement("p");
+      writeText(note, "You can’t switch off, remove or take away administrator access from the account you’re signed in with.");
+      entry.append(note);
+    } else {
+      const enabled = !row.enabled;
+      const switchLabel = enabled ? "Switch account on" : "Switch account off";
+      buttons.append(makeButton(switchLabel, () => {
+        const body = { account, enabled };
+        reviewChange("set-account-enabled", body, body, switchLabel,
+          enabled ? "Let " + person + " sign in again." : "Sign out " + person + " on all devices and stop them signing in.",
+          { saved: enabled ? "Account switched on. They can sign in again." : "Account switched off.",
+            refresh: "accounts-and-devices" });
+      }));
+    }
+    buttons.append(
+      makeButton("Set music sign-in", () => openLogin(account, person)),
+      makeButton("Reset password", () => reviewChange("reset-password", { account }, account, "Reset password",
+        "Reset the password for " + person + ". They’ll need the new code to sign in again.",
+        { codeFor: person, saved: "Password reset.", refresh: "accounts" })),
+    );
+    if (!own) {
+      const admin = !row.admin;
+      const roleLabel = admin ? "Make administrator" : "Remove administrator access";
+      buttons.append(
+        makeButton(roleLabel, () => {
+          const body = { account, admin };
+          reviewChange("set-admin", body, body, roleLabel,
+            (admin ? "Let " : "Stop ") + person + (admin ? " manage this server." : " from managing this server."),
+            { saved: admin ? "Administrator access added." : "Administrator access removed.", refresh: "accounts" });
+        }),
+        makeButton("Remove account", () => reviewChange("delete-account", { account }, account, "Remove account",
+          "Remove " + person + " and their listening history from Nexus.",
+          { note: "Any copy already downloaded stays where it was saved. You can’t undo this here.",
+            saved: "Account removed.", refresh: "accounts-and-devices" }), true),
+      );
+    }
+    menu.append(summary, buttons);
+    entry.append(menu);
+
+    if (!enableRequestChanges) return;
+    const requestRow = appendRow(requests, row.name + " · " + (row.requestsEnabled ? "On" : "Off"));
+    const requestButtons = document.createElement("div");
+    requestButtons.className = "row-actions";
+    const mayRequest = !row.requestsEnabled;
+    const requestLabel = mayRequest ? "Allow requests" : "Turn requests off";
+    requestButtons.append(makeButton(requestLabel, () => {
+      const body = { account, enabled: mayRequest };
+      reviewChange("set-requests-enabled", body, body, requestLabel,
+        (mayRequest ? "Let " : "Stop ") + person + (mayRequest ? " request music." : " from requesting music."),
+        { saved: mayRequest ? "Requests turned on." : "Requests turned off.", refresh: "accounts" });
+    }));
+    requestRow.append(requestButtons);
+  }
+
+  function renderDevice(row) {
+    const account = row.after.account;
+    deviceNames.set(row.after.device, row.name);
+    const entry = appendRow(devicePage.list, row.label);
+    const owner = document.createElement("span");
+    const known = accountNames.get(account);
+    if (known) writeText(owner, " · " + known);
+    entry.append(owner);
+    if (!deviceOwners.has(account)) deviceOwners.set(account, []);
+    deviceOwners.get(account).push(owner);
+    if (row.session === null || row.session === session.id) return;
+    const buttons = document.createElement("div");
+    buttons.className = "row-actions";
+    const label = row.page ? "Sign this admin page out" : "Sign this device out";
+    buttons.append(makeButton(label, () => {
+      const body = { ...row.after, session: row.session };
+      const owner = accountNames.get(row.after.account);
+      const person = owner ? " (" + owner + ")" : "";
+      const summary = row.page ? "End the other admin page session" + person + "." :
+        "Sign out " + row.name + person + " from Nexus Music.";
+      const note = row.page ? "This tab will stay signed in." :
+        "It can still reach your music server until you change that person’s music server password. Downloaded music stays on the device.";
+      reviewChange("force-out", body, body, label, summary,
+        { note, saved: row.page ? "Other admin page signed out." : "Device signed out of Nexus Music.", refresh: "devices" });
+    }));
+    entry.append(buttons);
+  }
+
+  function closeLogin() {
+    loginAccount = null;
+    loginForm.reset();
+    writeText(byId("music-login-account"), "");
+    if (loginDialog.open) loginDialog.close();
+  }
+
+  function openLogin(account, person) {
+    if (!session || changing || draft || codeDialog.open) return;
+    loginForm.reset();
+    loginAccount = { account, person };
+    writeText(byId("music-login-account"), person);
+    loginDialog.showModal();
+    byId("music-user").focus();
+  }
+
+  function message(text, focus = false) {
+    writeText(changeStatus, text);
+    if (focus) changeStatus.focus();
+  }
+
+  function clearApproval() {
+    clearTimeout(approvalTimer);
+    approval = null;
+  }
+
+  function approvedPassword() {
+    if (approval) {
+      const age = Date.now() - approval.typed;
+      if (age >= 0 && age < 10 * 60 * 1000) return approval.password;
+      clearApproval();
+    }
+    return null;
+  }
+
+  function togglePasswordPrompt(show) {
+    grantLabel.hidden = !show;
+    grantPassword.disabled = !show;
+  }
+
+  function cancelChange() {
+    draft = null;
+    grantPassword.value = "";
+    writeText(byId("grant-summary"), "");
+    writeText(byId("grant-note"), "");
+    if (grantDialog.open) grantDialog.close();
+  }
+
+  function reviewChange(path, change, target, label, summary, options) {
+    if (!session || changing || draft || codeDialog.open) return;
+    draft = { path, change, action: { [path.replaceAll("-", "_")]: target }, options };
+    writeText(byId("grant-title"), label);
+    writeText(byId("grant-commit"), label);
+    writeText(byId("grant-summary"), summary);
+    writeText(byId("grant-note"), options.note ?? "");
+    message("");
+    const ask = !approvedPassword();
+    togglePasswordPrompt(ask);
+    grantDialog.showModal();
+    (ask ? grantPassword : byId("grant-commit")).focus();
+  }
+
+  function clearCode() {
+    writeText(codeValue, "");
+    writeText(codePerson, "");
+    writeText(codeOrigin, "");
+    if (codeDialog.open) codeDialog.close();
+  }
+
+  function showCode(code, person) {
+    if (code === "already_shown") {
+      message("That code was already shown. Reset the password if the person needs a new code.", true);
+      return;
+    }
+    if (typeof code?.issued !== "string" || !/^[0-9A-HJKMNP-TV-Z]{12}$/.test(code.issued)) {
+      throw new Error();
+    }
+    writeText(codePerson, "Code for " + person);
+    /* Sign-in accepted this exact browser origin as NEXUS_PUBLIC_ORIGIN. */
+    writeText(codeOrigin, window.location.origin);
+    writeText(codeValue, code.issued);
+    codeDialog.showModal();
+    byId("code-done").focus();
+  }
+
+  function refreshAfter(current, view) {
+    if (view === "accounts" || view === "accounts-and-devices" || view === "address") {
+      resetPage(accountPage);
+      requests.replaceChildren();
+      accountNames.clear();
+      void loadAccounts();
+    }
+    if (view === "devices" || view === "accounts-and-devices") {
+      resetPage(devicePage);
+      void loadDevices();
+    }
+    if (view === "address") void loadMusic(current);
+    if (view === "diagnostics") void loadDiagnostics(current);
+    if (view === "lidarr") void loadLidarr(current);
+  }
+
+  byId("grant-form").addEventListener("submit", async event => {
+    event.preventDefault();
+    const current = session;
+    const proposed = draft;
+    const typed = grantPassword.value;
+    grantPassword.value = "";
+    if (!current || !proposed || changing) return;
+
+    let confirmed = approvedPassword();
+    if (!confirmed) {
+      if (!typed || Array.from(typed).length > 128) {
+        togglePasswordPrompt(true);
+        grantPassword.focus();
+        writeText(byId("grant-note"), "Enter your Nexus password to confirm this change.");
+        return;
+      }
+      confirmed = typed;
+      approval = { password: confirmed, typed: Date.now() };
+      approvalTimer = setTimeout(clearApproval, 10 * 60 * 1000);
+    }
+
+    changing = true;
+    cancelChange();
+    message("Saving…");
+    let sentChange = false;
+    try {
+      const request_id = crypto.getRandomValues(new BigUint64Array(1))[0] || 1n;
+      const request = readAdmin(current, "/nexus/api/admin/grant", {
+        change: { request_id, action: proposed.action }, password: confirmed,
+      }, 4096);
+      confirmed = null;
+      const issued = await request;
+      if (session !== current) return;
+      if (typeof issued.grant !== "string" || !/^[0-9a-f]{64}$/.test(issued.grant)) throw new Error();
+      sentChange = true;
+      const saved = await readAdmin(current, "/nexus/api/admin/" + proposed.path, {
+        request_id, change: proposed.change, grant: issued.grant,
+      }, 4096);
+      if (session !== current) return;
+      message(proposed.options.saved, !proposed.options.codeFor);
+      if (proposed.options.codeFor) showCode(saved.code, proposed.options.codeFor);
+      if (proposed.options.done) proposed.options.done();
+      refreshAfter(current, proposed.options.refresh);
+    } catch (error) {
+      if (session !== current) return;
+      if (!sentChange || error.reason === "grant_required") clearApproval();
+      const fallback = sentChange
+        ? "Could not confirm the change. Check the current settings before trying again."
+        : "Could not confirm your password. Check your connection and try again.";
+      const musicUnreachable = proposed.path === "set-music-login" && sentChange && error.reason === "unavailable";
+      message(musicUnreachable ? "The music server could not be reached. Check it is running, then try again." :
+        error instanceof AdminProblem ? error.message : fallback, true);
+    } finally {
+      if (session === current) changing = false;
+    }
+  });
+
+  for (const [dialog, button, close] of [
+    [grantDialog, "grant-cancel", cancelChange],
+    [codeDialog, "code-done", clearCode],
+    [loginDialog, "music-login-cancel", closeLogin],
+  ]) {
+    byId(button).addEventListener("click", close);
+    dialog.addEventListener("cancel", event => {
+      event.preventDefault();
+      close();
+    });
+  }
+
+  const field = id => byId(id).value;
+  const bytes = text => new TextEncoder().encode(text).length;
+  const validName = value => value.trim() && bytes(value) <= 128 && !/\p{Cc}/u.test(value);
+
+  createForm.addEventListener("submit", event => {
+    event.preventDefault();
+    const name = field("create-name");
+    const rawEmail = field("create-email").trim();
+    const email = rawEmail.replace(/[A-Z]/g, letter => letter.toLowerCase());
+    if (!validName(name)) return message("Enter a shorter name for this account.", true);
+    if (bytes(email) > 254 || !/^[^\s@\p{Cc}]+@[^\s@\p{Cc}]+$/u.test(email)) {
+      return message("Check the email address and try again.", true);
+    }
+    reviewChange("create-account", { name, email }, email, "Add account",
+      "Add " + name + " (" + email + "). They’ll be able to request music.",
+      { codeFor: name + " (" + email + ")", saved: "Account added.", refresh: "accounts", done: () => createForm.reset() });
+  });
+
+  function addressInput(value) {
+    const text = value.trim();
+    try {
+      const address = new URL(text);
+      const scheme = address.protocol;
+      if (scheme !== "https:") return null;
+      if (!text.startsWith(scheme + "/" + "/")) return null;
+      if (!address.hostname || address.username || address.password || /[?#\s\\]/u.test(text) ||
+          bytes(text) > 2048) return null;
+      return text;
+    } catch {
+      return null;
+    }
+  }
+
+  addressForm.addEventListener("submit", event => {
+    event.preventDefault();
+    if (!musicAddress) return;
+    const address = addressInput(field("new-address"));
+    if (!address) return message("Enter the full secure address people will use, then try again.", true);
+    reviewChange("set-music-server", { public: address }, address, "Save music server address",
+      "Check both addresses. Nexus uses " + musicAddress.internal + ". People will use " + address + ".",
+      { saved: "Music server address saved.", refresh: "address", done: () => addressForm.reset() });
+  });
+
+  loginForm.addEventListener("submit", event => {
+    event.preventDefault();
+    const selected = loginAccount;
+    const name = field("music-user");
+    const password = field("music-password");
+    loginForm.reset();
+    if (!selected) return;
+    if (!validName(name) || !password || bytes(password) > 512 || /\p{Cc}/u.test(password)) {
+      closeLogin();
+      return message("Check the music server username and password, then enter both again.", true);
+    }
+    closeLogin();
+    reviewChange("set-music-login", { account: selected.account, name, password }, selected.account,
+      "Check music sign-in", "Check and save the music sign-in you entered for " + selected.person + ".",
+      { saved: "The music sign-in works.", refresh: "accounts" });
+  });
+
+  async function loadLidarr(current) {
+    try {
+      const result = await readAdmin(current, "/nexus/api/admin/lidarr", {}, 4096);
+      if (session !== current) return;
+      if (typeof result.configured !== "boolean" ||
+          (result.address !== null && typeof result.address !== "string")) throw new Error();
+      lidarrAddress = result.address;
+      const keyStatus = result.configured ? " A key is saved." : " Enter a key to set up requests.";
+      writeText(byId("lidarr-address"), result.address ? "Address Nexus uses: " + result.address + "." + keyStatus :
+        "Set the Lidarr address in the Nexus container first.");
+    } catch {
+      if (session !== current) return;
+      lidarrAddress = null;
+      writeText(byId("lidarr-address"), "Could not load Lidarr settings. Sign out and back in to try again.");
+    }
+  }
+
+  byId("lidarr-details").hidden = !enableRequestChanges;
+  byId("requests-availability").hidden = enableRequestChanges;
+  lidarrForm.addEventListener("submit", event => {
+    event.preventDefault();
+    if (!enableRequestChanges) return;
+    const key = field("lidarr-key");
+    lidarrForm.reset();
+    if (!lidarrAddress) return message("Set the Lidarr address in the Nexus container first.", true);
+    if (!key || key.length > 512 || /[^!-~]/.test(key)) {
+      return message("Check the Lidarr key and enter it again.", true);
+    }
+    const change = { key };
+    reviewChange("set-lidarr", change, change, "Save Lidarr key",
+      "Save the key for the Lidarr address Nexus uses, " + lidarrAddress + ".",
+      { saved: "Lidarr key saved.", refresh: "lidarr" });
+  });
+
+  diagnosticsToggle.addEventListener("click", () => {
+    if (diagnosticsEnabled === null) return;
+    const enabled = !diagnosticsEnabled;
+    const body = { enabled };
+    reviewChange("set-diagnostics-default", body, body,
+      enabled ? "Turn the diagnostics default on" : "Turn the diagnostics default off",
+      enabled ? "New devices will send diagnostics unless someone switches them off." : "New devices will start with diagnostics switched off.",
+      { saved: "Diagnostics default saved.", refresh: "diagnostics" });
+  });
+
+  function resetPage(pager) {
+    if (pager === devicePage) {
+      deviceOwners.clear();
+      deviceNames.clear();
+    }
+    pager.generation++;
+    pager.list.replaceChildren();
+    pager.after = null;
+    pager.more.hidden = true;
+    pager.more.disabled = false;
+    writeText(pager.status, "");
+  }
+
   function forgetSession() {
     session?.controller.abort();
     session = null;
-    for (const pager of [accountPage, devicePage]) {
-      pager.list.replaceChildren();
-      pager.after = null;
-      pager.more.hidden = true;
-      pager.more.disabled = false;
-      writeText(pager.status, "");
-    }
+    changing = false;
+    clearApproval();
+    cancelChange();
+    closeLogin();
+    clearCode();
+    closeReports();
+    for (const form of [createForm, addressForm, lidarrForm]) form.reset();
+    byId("new-account-details").open = false;
+    byId("lidarr-details").open = false;
+    for (const pager of [accountPage, devicePage]) resetPage(pager);
+    accountNames.clear();
+    musicAddress = null;
+    diagnosticsEnabled = null;
+    lidarrAddress = null;
+    writeText(byId("lidarr-address"), "");
+    addressForm.hidden = true;
+    diagnosticsToggle.hidden = true;
     requests.replaceChildren();
-    for (const element of [requestsStatus, internalAddress, publicAddress, musicStatus, diagnostics]) {
+    for (const element of [requestsStatus, internalAddress, publicAddress, musicStatus, diagnostics, changeStatus]) {
       writeText(element, "");
     }
     clearTimeout(idleTimer);
     form.hidden = false;
+    setupDetails.hidden = false;
     admin.hidden = true;
     writeText(identity, "");
     password.value = "";
   }
+
+  function typedCode(input) {
+    const code = input.replace(/[ -]/g, "");
+    if (!/^[A-Za-z0-9]{12}$/.test(code)) return null;
+    const canonical = code.toUpperCase().replace(/[IL]/g, "1").replace(/O/g, "0");
+    return /^[0-9A-HJKMNP-TV-Z]{12}$/.test(canonical) ? canonical : null;
+  }
+
+  setupForm.addEventListener("submit", async event => {
+    event.preventDefault();
+    if (pending || session) return;
+    const code = typedCode(field("setup-code"));
+    const name = field("setup-name");
+    const address = field("setup-email").trim().replace(/[A-Z]/g, letter => letter.toLowerCase());
+    const password = field("setup-password");
+    byId("setup-password").value = "";
+    byId("setup-code").value = "";
+    if (!code || !validName(name) || bytes(address) > 254 ||
+        !/^[^\s@\p{Cc}]+@[^\s@\p{Cc}]+$/u.test(address) ||
+        Array.from(password).length < 15 || Array.from(password).length > 128) {
+      writeText(status, "Check the setup code, name and email. Choose a password of at least 15 characters.");
+      return;
+    }
+    const request = new AbortController();
+    pending = request;
+    submit.disabled = true;
+    setupSubmit.disabled = true;
+    writeText(status, "Creating the first account…");
+    try {
+      const response = await post("/nexus/api/set-up", json({ code, email: address, name, password }), request.signal);
+      const reply = response.body && await readReply(response, 4096);
+      if (request.signal.aborted) return;
+      if (response.status === 200 && reply?.done?.result?.admin === true &&
+          reply.done.receipt === undefined && reply.refused === undefined) {
+        setupForm.reset();
+        setupDetails.open = false;
+        email.value = address;
+        writeText(status, "Your account is ready. Sign in with the password you just chose.");
+        byId("password").focus();
+        return;
+      }
+      const reason = reply?.refused?.not_allowed;
+      writeText(status, reason === "wrong_login" ? "That setup code isn’t right or has expired. Check the current code in the server log." :
+        reason === "password_not_allowed" ? "Choose a less common password and enter the setup code again." :
+        response.status === 429 ? "Nexus is busy. Wait a moment and try setup again." :
+        "Setup didn’t go through. If an account already exists, sign in below the Nexus heading.");
+    } catch {
+      if (!request.signal.aborted) writeText(status, "Could not set up Nexus. Check the connection and try again.");
+    } finally {
+      pending = null;
+      submit.disabled = false;
+      setupSubmit.disabled = false;
+    }
+  });
+
+  function closeReports() {
+    reportGeneration++;
+    reportCursor = null;
+    reportsMore.hidden = true;
+    reportsMore.disabled = false;
+    writeText(byId("reports-status"), "");
+    writeText(byId("report-text"), "");
+    if (reportsDialog.open) reportsDialog.close();
+  }
+
+  async function loadReport() {
+    const current = session;
+    if (!current || reportsMore.disabled) return;
+    const generation = reportGeneration;
+    reportsMore.disabled = true;
+    writeText(byId("reports-status"), "Loading…");
+    try {
+      const answer = await readAdmin(current, "/nexus/api/admin/diagnostics", { after: reportCursor }, 1024 * 1024);
+      if (session !== current || generation !== reportGeneration) return;
+      const stamp = answer.receipt?.stamp;
+      const result = answer.result;
+      if (stamp?.account !== current.account || stamp?.restore !== current.restore ||
+          !Array.isArray(result?.reports) || result.reports.length > 1 ||
+          (result.next !== null && (!isU64(result.next) || result.next === 0n ||
+            (reportCursor !== null && result.next >= reportCursor)))) throw new Error();
+      const report = result.reports[0];
+      if (!report) {
+        if (result.next !== null) throw new Error();
+        writeText(byId("reports-status"), "No device reports to show.");
+        writeText(byId("report-text"), "");
+      } else {
+        const device = id(report.device);
+        const owner = id(report.account);
+        const reportId = id(report.id);
+        if (typeof report.text !== "string" || !isU64(report.received_ms) ||
+            (result.next !== null && result.next !== reportId)) throw new Error();
+        const time = new Date(Number(report.received_ms));
+        const who = [deviceNames.get(device) ?? "Device " + device, accountNames.get(owner)].filter(Boolean).join(" · ");
+        writeText(byId("reports-status"), who + " · " + time.toLocaleString());
+        writeText(byId("report-text"), report.text);
+      }
+      reportCursor = result.next;
+      reportsMore.hidden = reportCursor === null;
+      writeText(reportsMore, "Older report");
+    } catch {
+      if (session !== current || generation !== reportGeneration) return;
+      writeText(byId("reports-status"), "Could not load the report. Select Retry.");
+      writeText(reportsMore, "Retry");
+      reportsMore.hidden = false;
+    } finally {
+      if (session === current && generation === reportGeneration) reportsMore.disabled = false;
+    }
+  }
+
+  byId("reports-open").addEventListener("click", () => {
+    if (!session || reportsDialog.open) return;
+    reportsDialog.showModal();
+    void loadReport();
+  });
+  reportsMore.addEventListener("click", loadReport);
+  byId("reports-close").addEventListener("click", closeReports);
+  reportsDialog.addEventListener("cancel", event => {
+    event.preventDefault();
+    closeReports();
+  });
 
   form.addEventListener("submit", async event => {
     event.preventDefault();
@@ -422,23 +1154,20 @@ dd, li { overflow-wrap: anywhere; }
         app_version: "0.1.0", speaks: [1, 1], restore: null,
       });
       password.value = "";
+      const started = Date.now();
       const response = await post("/nexus/api/signin", body, request.signal);
-      if (response.status === 501) {
-        writeText(status, "Sign-in has not been built yet.");
-        return;
-      }
       if (response.status === 403) {
         const reply = await readReply(response, 4096);
         if (request.signal.aborted) return;
         const reason = reply.refused?.not_allowed;
-        writeText(status, reason === "wrong_login" ? "Wrong email or password." :
-          reason === "account_off" ? "This account is switched off." :
-          "An administrator sign-in is required.");
+        writeText(status, reason === "wrong_login" ? "That email or password is not right. Check both and try again." :
+          reason === "account_off" ? "This account is switched off. Ask an administrator to switch it on." :
+          "Use an administrator account to sign in here.");
         return;
       }
       if (response.status !== 200) {
-        writeText(status, response.status === 429 ? "The server is busy. Try again." :
-          "The Nexus server could not sign you in.");
+        writeText(status, response.status === 429 ? "Nexus is busy. Wait a moment and try again." :
+          "Could not sign in. Check your connection and try again.");
         return;
       }
       const reply = await readReply(response, 8192);
@@ -450,26 +1179,33 @@ dd, li { overflow-wrap: anywhere; }
           signedIn?.person?.admin !== true ||
           typeof signedIn.person.email !== "string" ||
           (!isU64(signedIn.person.id) || signedIn.person.id === 0n || signedIn.person.id !== stamp?.account) ||
+          !isU64(signedIn.session_id) || signedIn.session_id === 0n ||
           typeof signedIn.session !== "string" || !/^[0-9a-f]{64}$/.test(signedIn.session) ||
           signedIn.music !== "none_set_yet" ||
           !isU64(restore) || restore !== stamp?.restore) {
-        writeText(status, "An administrator sign-in is required.");
+        writeText(status, "Use an administrator account to sign in here.");
         return;
       }
-      session = { bearer: signedIn.session, restore, controller: new AbortController() };
+      session = { bearer: signedIn.session, id: signedIn.session_id, account: signedIn.person.id, restore,
+        lastUse: started, controller: new AbortController() };
+      if (!checkIdle()) return;
+      setupDetails.open = false;
+      setupDetails.hidden = true;
+      setupForm.reset();
       armIdleTimer();
       void loadAccounts();
       void loadDevices();
       void loadMusic(session);
       void loadDiagnostics(session);
+      if (enableRequestChanges) void loadLidarr(session);
       form.reset();
       form.hidden = true;
-      admin.hidden = false;
+      admin.hidden = document.hidden;
       writeText(identity, signedIn.person.email);
       writeText(status, "");
       signout.focus();
     } catch {
-      if (!request.signal.aborted) writeText(status, "The Nexus server could not sign you in.");
+      if (!request.signal.aborted) writeText(status, "Could not sign in. Check your connection and try again.");
     } finally {
       form.reset();
       pending = null;
@@ -492,19 +1228,35 @@ dd, li { overflow-wrap: anywhere; }
       const response = await post("/nexus/api/signout", body, request.signal, current.bearer);
       const reply = response.status === 200 ? await readReply(response, 4096) : null;
       if (!request.signal.aborted) {
-        writeText(status, reply?.done ? "Signed out." : "The server could not confirm sign-out.");
+        writeText(status, reply?.done ? "Signed out." : "You’ve left this page. If you shared this device, close the tab.");
       }
     } catch {
-      if (!request.signal.aborted) writeText(status, "The server could not confirm sign-out.");
+      if (!request.signal.aborted) writeText(status, "You’ve left this page. If you shared this device, close the tab.");
     } finally {
       pending = null;
       submit.disabled = false;
     }
   });
 
+  document.addEventListener("visibilitychange", () => {
+    if (checkIdle()) admin.hidden = document.hidden;
+  });
+  window.addEventListener("focus", checkIdle);
+  window.addEventListener("pageshow", checkIdle);
+  for (const name of ["pointerdown", "keydown", "click", "submit", "input"]) {
+    document.addEventListener(name, event => {
+      if (session && !checkIdle()) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+      }
+    }, true);
+  }
+
   window.addEventListener("pagehide", () => {
     pending?.abort();
     form.reset();
+    setupForm.reset();
+    setupDetails.open = false;
     forgetSession();
     writeText(status, "");
   });

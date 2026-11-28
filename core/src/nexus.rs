@@ -11,9 +11,10 @@
 
 pub mod account;
 pub mod admin;
+pub mod client;
+pub mod compare;
 pub mod diag;
 pub mod events;
-pub mod client;
 pub mod kept;
 pub mod music;
 pub mod proto;

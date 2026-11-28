@@ -62,6 +62,10 @@ impl Choices {
         let owed = ways.enter(who, what);
         (WayIn { ways: &self.0 }, owed, ways.whose())
     }
+
+    pub(crate) fn whose(&self) -> Option<Who> {
+        self.0.borrow().whose()
+    }
 }
 
 impl Controller {
