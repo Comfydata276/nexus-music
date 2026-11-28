@@ -1800,14 +1800,33 @@ impl Journal {
             rows.collect::<Result<Vec<_>, _>>().map_err(sql_error)
         })?;
         for (artist, artist_key, setting) in pending {
-            let known = lidarr_result(lidarr.known_artist(&artist_key), None)?;
-            if known.is_some_and(|(number, _)| number == artist) {
-                lidarr.set_new_releases(artist, &setting).map_err(|_| Refusal::LidarrCouldNotRestore)?;
-            } else {
-                // A successful lookup with a different number cannot restore this row.
-                eprintln!("An obsolete Lidarr setting recovery entry was discarded.");
-            }
-            self.cross_off(artist, setting)?;
+            self.restore_artist(lidarr, artist, &artist_key, setting)?;
+        }
+        Ok(())
+    }
+
+    fn restore_artist(&self, lidarr: &Lidarr, artist: i64, artist_key: &str, setting: String) -> Result<(), Refusal> {
+        let known = lidarr_result(lidarr.known_artist(artist_key), None)?;
+        if known.is_some_and(|(number, _)| number == artist) {
+            lidarr.set_new_releases(artist, &setting).map_err(|_| Refusal::LidarrCouldNotRestore)?;
+        } else {
+            eprintln!("An obsolete Lidarr setting recovery entry was discarded.");
+        }
+        self.cross_off(artist, setting)
+    }
+
+    fn restore_saved_artist(&self, lidarr: &Lidarr, artist: i64, setting: &str) -> Result<(), Refusal> {
+        let binding = self.binding;
+        let setting = setting.to_owned();
+        let lookup = setting.clone();
+        let artist_key: Option<String> = self.ask(move |keeper, _, _| {
+            keeper.data().connection().query_row(
+                "SELECT artist_key FROM requests_way_back WHERE binding = ?1 AND artist = ?2 AND setting = ?3",
+                params![binding.as_slice(), artist, lookup], |record| record.get(0),
+            ).optional().map_err(sql_error)
+        })?;
+        if let Some(artist_key) = artist_key {
+            self.restore_artist(lidarr, artist, &artist_key, setting)?;
         }
         Ok(())
     }
@@ -2159,7 +2178,8 @@ impl Requests {
             }
         }
 
-        let worked = lidarr_result(batch.work_prepared(lidarr, &|_| {}), None);
+        let upstream = BatchUpstream { lidarr, journal };
+        let worked = lidarr_result(batch.work_prepared(&upstream, &|_| {}), None);
         let switched_off = stopped.load(Ordering::Relaxed);
         let rows = batch.indexed_lines().ok_or(Refusal::NotDealtWith)?;
         let mut asked = Vec::new();
@@ -2309,6 +2329,174 @@ fn find_line(lidarr: &Lidarr, line: &BatchLine, singles: bool) -> Result<Option<
         found = find(&bare)?;
     }
     Ok(lidarr_items::<AlbumView, _>(found).pop().filter(|view| view.artist_id.is_some()))
+}
+
+// Preserve the core batch's own work checkpoints and mirror every temporary
+// artist setting to the same recovery journal used by single jobs.
+struct BatchUpstream<'a> {
+    lidarr: &'a Lidarr,
+    journal: &'a Journal,
+}
+
+impl BatchUpstream<'_> {
+    fn recovery<'a>(&self, offer: &Offer, batch: &'a dyn lidarr::WayBack) -> BatchWayBack<'a> {
+        BatchWayBack {
+            batch,
+            journal: Journal {
+                artist: MusicBrainzId::new(&offer.artist_id),
+                ..self.journal.clone()
+            },
+        }
+    }
+}
+
+struct BatchWayBack<'a> {
+    batch: &'a dyn lidarr::WayBack,
+    journal: Journal,
+}
+
+impl lidarr::WayBack for BatchWayBack<'_> {
+    fn turn(&self) -> Box<dyn lidarr::Turn + '_> {
+        self.batch.turn()
+    }
+
+    fn keep(&self, address: &str, artist: i64, before: &str) -> Result<bool, String> {
+        let kept = self.batch.keep(address, artist, before)?;
+        if !kept {
+            return Ok(false);
+        }
+        if let Err(reason) = self.journal.keep(address, artist, before) {
+            self.batch.put_back(address, artist, before);
+            return Err(reason);
+        }
+        Ok(true)
+    }
+
+    fn before_request_album(&self, placement: &AlbumPlacement) -> Result<(), String> {
+        self.batch.before_request_album(placement)
+    }
+
+    fn put_back(&self, address: &str, artist: i64, before: &str) {
+        self.journal.put_back(address, artist, before);
+        self.batch.put_back(address, artist, before);
+    }
+}
+
+impl lidarr::RequestLidarr for BatchUpstream<'_> {
+    fn find_releases(&self, term: &str) -> Result<(Vec<Offer>, Vec<lidarr::Single>), String> {
+        self.lidarr.find_releases(term)
+    }
+
+    fn find_any(&self, term: &str) -> Result<Vec<Offer>, String> {
+        self.lidarr.find_any(term)
+    }
+
+    fn find_artists(&self, term: &str) -> Result<Vec<lidarr::ArtistOffer>, String> {
+        self.lidarr.find_artists(term)
+    }
+
+    fn tracked(&self) -> Result<HashSet<String>, String> {
+        self.lidarr.tracked()
+    }
+
+    fn known_artist(&self, artist: &str) -> Result<Option<(i64, String)>, String> {
+        self.lidarr.known_artist(artist)
+    }
+
+    fn albums_of(&self, artist: i64, name: &str) -> Result<Vec<(Offer, bool)>, String> {
+        self.lidarr.albums_of(artist, name)
+    }
+
+    fn releases_of(&self, artist: i64, name: &str) -> Result<Vec<(Offer, bool)>, String> {
+        self.lidarr.releases_of(artist, name)
+    }
+
+    fn add_artist(&self, artist: &str, name: &str, way_back: &dyn lidarr::WayBack) -> Result<usize, String> {
+        lidarr::RequestLidarr::add_artist(self.lidarr, artist, name, way_back)
+    }
+
+    fn request(&self, wanted: &Offer, way_back: &dyn lidarr::WayBack) -> Result<(), String> {
+        self.request_placement(wanted, way_back).map(drop)
+    }
+
+    fn request_placement(&self, wanted: &Offer, way_back: &dyn lidarr::WayBack) -> Result<bool, String> {
+        self.lidarr.request_placement(wanted, &self.recovery(wanted, way_back))
+    }
+
+    fn pending(&self) -> Result<Vec<lidarr::Pending>, String> {
+        self.lidarr.pending()
+    }
+
+    fn cancel(&self, id: i64) -> Result<(), String> {
+        self.lidarr.cancel(id)
+    }
+}
+
+impl lidarr::BulkLidarr for BatchUpstream<'_> {
+    fn pause(&self, wait: Duration) -> Result<(), String> {
+        self.lidarr.pause(wait)
+    }
+
+    fn address(&self) -> &str {
+        self.lidarr.address()
+    }
+
+    fn way_back_address(&self) -> String {
+        self.lidarr.way_back_address()
+    }
+
+    fn artist_numbers(&self) -> Result<HashMap<String, i64>, String> {
+        self.lidarr.artist_numbers()
+    }
+
+    fn listed(&self, artist: i64) -> Result<Vec<lidarr::Listed>, String> {
+        self.lidarr.listed(artist)
+    }
+
+    fn busy(&self, artists: &HashSet<i64>) -> Result<(HashSet<i64>, u64), String> {
+        self.lidarr.busy(artists)
+    }
+
+    fn busy_with(&self, artists: &HashSet<i64>) -> Result<HashSet<i64>, String> {
+        self.lidarr.busy_with(artists)
+    }
+
+    fn start_listing_singles_kept(
+        &self, artist: i64, wanted: &Offer, way_back: &dyn lidarr::WayBack,
+    ) -> Result<Option<(String, bool)>, String> {
+        self.lidarr.start_listing_singles_kept(artist, wanted, &self.recovery(wanted, way_back))
+    }
+
+    fn want(&self, artist: i64, albums: &[i64]) -> Result<(), String> {
+        self.lidarr.want(artist, albums)
+    }
+
+    fn want_before(&self, artist: i64, albums: &[i64], before: &dyn Fn() -> Result<(), String>) -> Result<(), String> {
+        self.lidarr.want_before(artist, albums, before)
+    }
+
+    fn setup(&self) -> Result<lidarr::Setup, String> {
+        self.lidarr.setup()
+    }
+
+    fn add_wanting(&self, setup: &mut lidarr::Setup, wanted: &[Offer]) -> Result<i64, String> {
+        self.lidarr.add_wanting(setup, wanted)
+    }
+
+    fn add_wanting_before(
+        &self, setup: &mut lidarr::Setup, wanted: &[Offer], before: &dyn Fn() -> Result<(), String>,
+    ) -> Result<i64, String> {
+        self.lidarr.add_wanting_before(setup, wanted, before)
+    }
+
+    fn unwant(&self, albums: &[i64]) -> Result<(), String> {
+        self.lidarr.unwant(albums)
+    }
+
+    fn set_new_releases(&self, artist: i64, setting: &str) -> Result<(), String> {
+        self.journal.restore_saved_artist(self.lidarr, artist, setting)
+            .map_err(|reason| reason.sentence(None).to_string())
+    }
 }
 
 struct BatchDesk {

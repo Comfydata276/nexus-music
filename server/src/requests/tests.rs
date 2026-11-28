@@ -239,6 +239,7 @@ struct LidarrState {
     arrived: bool,
     ambiguous_pending_number: bool,
     new_releases: Option<String>,
+    single_mode: bool,
     calls: Vec<String>,
 }
 
@@ -317,16 +318,35 @@ fn mock(request: &Question, state: &mut LidarrState) -> Value {
     let target = request.target.strip_prefix("/api/v1/").unwrap();
     state.calls.push(format!("{} {target}", request.method));
     let artist = json!({"id":5,"monitored":true,"artistName":"Quillon Vane","foreignArtistId":ARTIST,
-        "monitorNewItems":state.new_releases.as_deref().unwrap_or("all")});
+        "monitorNewItems":state.new_releases.as_deref().unwrap_or("all"),"metadataProfileId":1});
+    let mut offer = album(state.monitored);
+    if state.single_mode {
+        offer["albumType"] = json!("Single");
+    }
     match (request.method.as_str(), target) {
         ("GET", "system/status") => json!({"version":"2.0.0"}),
         ("GET", "album/lookup?term=Glass%20Orchard" | "album/lookup?term=Glass%20Orchard%20Quillon%20Vane") =>
-            json!([album(state.monitored)]),
+            json!([offer]),
         ("GET", lookup) if lookup == format!("album/lookup?term=lidarr%3A{ALBUM}") =>
             json!([album(state.monitored)]),
         ("GET", "artist") => json!([artist]),
         ("GET", "artist/5") => artist,
         ("GET", "command") => json!([]),
+        ("GET", "metadataprofile") if state.single_mode => {
+            let profile = |id, name, list: &[&str]| {
+                let list: Vec<_> = list.iter().map(|kind| json!({"allowed":true,"albumType":{"name":kind}})).collect();
+                json!({"id":id,"name":name,"primaryAlbumTypes":list})
+            };
+            json!([profile(1, "Standard", &["Album"]), profile(2, "Albums, EPs and singles", &["Album", "Single"])])
+        }
+        ("GET", "album?artistId=5") if state.single_mode => {
+            if state.new_releases.as_deref() != Some("none") {
+                offer["id"] = json!(99);
+                offer["foreignAlbumId"] = json!("10000000-0000-0000-0000-000000000999");
+                offer["albumType"] = json!("Album");
+            }
+            json!([offer])
+        }
         ("GET", "album?artistId=5") => json!([album(state.monitored)]),
         ("GET", "album/9") => album(state.monitored),
         ("GET", "wanted/missing?includeArtist=true&page=1&pageSize=500") => {
@@ -1232,6 +1252,49 @@ fn switching_off_a_running_batch_blocks_its_next_lidarr_write() {
     let calls = lidarr.take_calls();
     assert_eq!(calls.iter().filter(|&call| call == "PUT album/monitor").count(), 1);
     assert!(!calls.iter().any(|call| call == "POST command"));
+}
+
+#[test]
+fn a_cut_singles_batch_leaves_recovery_even_when_its_account_is_switched_off() {
+    let lidarr = MockLidarr::start();
+    lock(&lidarr.state).single_mode = true;
+    let (mut server, [admin, member, _]) = TestServer::start_child("singles-batch-cut", lidarr.address);
+    let page = server.redeem(admin, 1, TEST_PAGE);
+    server.configure(&page);
+    let member = server.redeem(member, 2, "");
+    lidarr.hold_response(Some(("PUT", "/api/v1/artist/5")));
+    let line = BatchLine { artist: "Quillon Vane".into(), album: "Glass Orchard".into(), song: "First Light".into() };
+    let job = begun(server.call(&member, begin(1, Change::Batch { singles: true, lines: vec![line] })));
+    lidarr.wait_for_call("PUT artist/5");
+    assert_eq!(lock(&lidarr.state).new_releases.as_deref(), Some("none"));
+    let db = Connection::open(server.root.join("data/nexus.db")).unwrap();
+    let saved: (i64, String, String) = db.query_row(
+        "SELECT artist, artist_key, setting FROM requests_way_back", [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).unwrap();
+    assert_eq!(saved, (5, ARTIST.to_owned(), "all".to_owned()));
+
+    server.set_switch(&page, &member, false);
+    server.kill_child();
+    lidarr.hold_response(None);
+    lidarr.take_calls();
+    server.launch(lidarr.address);
+    let until = Instant::now() + Duration::from_secs(8);
+    loop {
+        let status: (i64, Option<String>) = db.query_row(
+            "SELECT stage, result FROM requests_jobs WHERE id = ?1", [row_id(job).unwrap()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        let recovered = lock(&lidarr.state).new_releases.as_deref() == Some("all");
+        if status.0 == FINISHED && recovered {
+            assert!(matches!(read_job_result(&status.1.unwrap()).unwrap(), JobResult::Failed(Refusal::SwitchedOff)));
+            break;
+        }
+        assert!(Instant::now() < until, "startup did not restore the setting and refuse the cut job");
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(db.query_row("SELECT COUNT(*) FROM requests_way_back", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+    assert_eq!(lidarr.take_calls(), ["GET artist", "GET artist/5", "PUT artist/5"]);
 }
 
 #[test]
