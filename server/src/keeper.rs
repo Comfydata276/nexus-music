@@ -251,12 +251,23 @@ impl Keeper {
                 self.bring_up(&view).map_err(|failed| Refused(failed.0))?;
                 Ok(Started::Finished(plan))
             }
+            Startup::RestoreData if self.put_back_cut() => Err(Refused(format!(
+                "A put-back was cut off before it was done, and the copy may or may not be in place. Nothing is served. Run `nexus-music-server put-back` with the copy again. (Any data it was replacing is kept in {}.)",
+                copies::folder(&self.folder).display()
+            ))),
             Startup::RestoreData => self.restore_data(now, false),
             Startup::Stop | Startup::HoldAll => Err(Refused(format!(
                 "The store kept apart does not belong with this data: {}. Nothing is served, and nothing was changed. If NEXUS_DATA or NEXUS_STATE names the wrong folder, set it right; otherwise {TAKE_AS_IS}.",
                 found.contradiction.map_or("they disagree", contradiction)
             ))),
         }
+    }
+
+    /// Whether the store notes a put-back begun and not yet past its first step in the store
+    /// (11.2 step 1): the copy may or may not have been put in place, so only the command,
+    /// run again, can finish it.
+    fn put_back_cut(&self) -> bool {
+        matches!(self.store.pending, Some(Pending::Restore { restore }) if self.store.restore.checked_add(1) == Some(restore))
     }
 
     /// A device's half of C3's `Apart`, with the name the data gives its account.
@@ -278,6 +289,9 @@ impl Keeper {
     /// heard of is dropped; then the note is cleared.
     fn bring_up(&mut self, view: &compare::DataView) -> Result<(), Failed> {
         let mut changes_rows: Vec<Rows> = Vec::new();
+        // What survives in the store too: a permit whose session the data no longer loads is
+        // dead (C3's load), and is dropped, so that the two agree. Nothing that works is taken.
+        let mut permits: Vec<(u64, Rows)> = Vec::new();
         let mut erase = Vec::new();
         let mut remove = Vec::new();
         for (&number, &life) in &view.accounts {
@@ -298,6 +312,7 @@ impl Keeper {
             let apart = self.apart_of(id, kept, &name);
             let rows = self.data.rows(&self.backend, id).map_err(|error| Failed(data_failed(&error)))?.ok_or_else(|| Failed("A device went from the data while it was read.".into()))?;
             let up = compare::brought_up(&apart, &rows);
+            permits.push((id, up.clone()));
             if up != rows {
                 changes_rows.push(up);
             }
@@ -309,6 +324,13 @@ impl Keeper {
             self.data.apply(&changes, self.store.high_water).map_err(|error| Failed(data_failed(&error)))?;
         }
         let mut next = self.store.clone();
+        for (id, up) in &permits {
+            if let Some(entry) = next.devices.get_mut(id) {
+                let permit = |session: &nexus_core::nexus::kept::Session| nexus_core::nexus::kept::Permit { id: session.id, delete_proven: session.delete_proven };
+                entry.working = up.working.as_ref().map(permit);
+                entry.waiting = up.waiting.as_ref().map(permit);
+            }
+        }
         match next.pending {
             Some(Pending::MakeAccount { account }) if !view.accounts.contains_key(&account) => {
                 if let Some(entry) = next.accounts.get_mut(&account) {
@@ -382,9 +404,8 @@ impl Keeper {
                 }
             }
             for (number, account) in next.accounts.iter_mut() {
-                if account.kept.present && !view.accounts.contains_key(number) {
-                    account.kept.present = false;
-                }
+                // The copy's rows are what the data now has.
+                account.kept.present = view.accounts.contains_key(number);
             }
             for &(number, through) in &holds {
                 if let Some(account) = next.accounts.get_mut(&number) {
@@ -559,6 +580,17 @@ impl Keeper {
 
     /// A device as C3 decides with it: loaded from both stores (`Device::load`, under which a
     /// session known on one side only is dead), and the scope to decide under.
+    /// The scope a device's next decision is made under: the store's, which is the
+    /// authority (7.7). A device kept in memory between two decisions (a try begun and
+    /// finished) is decided under this each time.
+    pub fn authority(&self, id: u64) -> Result<Scope, Failed> {
+        let Some(kept) = self.store.devices.get(&id).copied().filter(|device| !device.gone) else {
+            return Err(Failed("There is no such device.".into()));
+        };
+        let name = self.name_of(kept.account)?;
+        Ok(self.apart_of(id, &kept, &name).scope)
+    }
+
     pub fn load(&mut self, id: u64) -> Result<(Device, Scope), Failed> {
         self.heal()?;
         let Some(kept) = self.store.devices.get(&id).copied().filter(|device| !device.gone) else {
@@ -776,7 +808,11 @@ pub fn put_back(state: &Path, folder: &Path, copy: &Path, now: u64) -> Result<Sa
             store.backend.to_hex()
         )));
     }
-    let new = store.restore.checked_add(1).ok_or_else(|| Refused("The restore number can go no higher. Nothing was changed.".into()))?;
+    // A put-back cut off before is taken up again under the number it had.
+    let new = match store.pending {
+        Some(Pending::Restore { restore }) if store.restore.checked_add(1) == Some(restore) => restore,
+        _ => store.restore.checked_add(1).ok_or_else(|| Refused("The restore number can go no higher. Nothing was changed.".into()))?,
+    };
     // 1. The store first: a restore is under way (and done again from the start if cut off).
     store.pending = Some(Pending::Restore { restore: new });
     apart::write(state, &store).map_err(|error| Refused(store_failed(state, &error)))?;
@@ -803,9 +839,13 @@ pub fn put_back(state: &Path, folder: &Path, copy: &Path, now: u64) -> Result<Sa
     // 3. The copy in its place, whole and lasting.
     copies::put(&source, &place).map_err(|why| Refused(format!("The copy couldn't be put in place: {why}. Run the put-back again.")))?;
     drop(source);
-    drop(held);
-    // 4. Opened and brought to the store as at every start: the restore under way is done.
-    let (keeper, started) = Keeper::open(state, folder, now)?;
+    // 4. Then, as at a start that finds the data older: 11.2's steps 1 to 3.
+    let data = match Data::open(folder, now).map_err(Refused)? {
+        Opened::Open(data) => data,
+        Opened::Absent => return Err(Refused("The copy was not in place once put there. Run the put-back again.".into())),
+    };
+    let mut keeper = Keeper { state: state.to_path_buf(), folder: folder.to_path_buf(), _lock: held, backend: store.backend, store, data, broken: false };
+    let started = keeper.restore_data(now, false)?;
     keeper.close();
     said.insert(0, format!("Put back {} (its data's last step was at {written_at} ms).", copy.display()));
     said.push(started.said());
@@ -845,8 +885,13 @@ pub fn take_as_is(state: &Path, folder: &Path, now: u64) -> Result<Said, Refused
             let restore = store.restore.checked_add(1).ok_or_else(|| Refused("The restore number can go no higher.".into()))?;
             store.pending = Some(Pending::Restore { restore });
             apart::write(state, &store).map_err(|error| Refused(store_failed(state, &error)))?;
-            drop(held);
-            let (keeper, started) = Keeper::open(state, folder, now)?;
+            let data = match Data::open(folder, now).map_err(Refused)? {
+                Opened::Open(data) => data,
+                Opened::Absent => return Err(Refused("The new data was not there once made. Run take-as-is again.".into())),
+            };
+            let mut keeper = Keeper { state: state.to_path_buf(), folder: folder.to_path_buf(), _lock: held, backend: store.backend, store, data, broken: false };
+            let started = keeper.restore_data(now, false)?;
+            let restore = keeper.restore();
             keeper.close();
             said.push(format!("There was no data: the backend starts again with none, under restore number {restore}. Accounts and devices sign in again; each account goes on from the life it had."));
             said.push(started.said());
