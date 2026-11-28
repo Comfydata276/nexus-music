@@ -56,7 +56,9 @@ button:disabled { opacity: .6; cursor: default; }
   gap: .75rem;
   margin-block: 1rem;
 }
-article p, aside p { color: var(--muted); }
+article p, aside p, dt { color: var(--muted); }
+dd { margin: 0 0 .65rem; }
+dd, li { overflow-wrap: anywhere; }
 </style>
 </head>
 <body>
@@ -77,11 +79,35 @@ article p, aside p { color: var(--muted); }
     <p id="identity"></p>
     <button id="signout" type="button">Sign out</button>
     <div id="sections">
-      <article><h2>Accounts</h2><p>Not built yet.</p></article>
-      <article><h2>Music server</h2><p>Not built yet.</p></article>
-      <article><h2>Devices</h2><p>Not built yet.</p></article>
-      <article><h2>Diagnostics</h2><p>Not built yet.</p></article>
-      <article><h2>Requests</h2><p>Not built yet.</p></article>
+      <article>
+        <h2>Accounts</h2>
+        <p id="accounts-status" role="status"></p>
+        <ul id="accounts-list"></ul>
+        <button id="accounts-more" type="button" hidden>Load more accounts</button>
+      </article>
+      <article>
+        <h2>Music server</h2>
+        <p id="music-status" role="status"></p>
+        <dl>
+          <dt>Backend address</dt><dd id="music-internal"></dd>
+          <dt>Public address</dt><dd id="music-public"></dd>
+        </dl>
+      </article>
+      <article>
+        <h2>Devices</h2>
+        <p id="devices-status" role="status"></p>
+        <ul id="devices-list"></ul>
+        <button id="devices-more" type="button" hidden>Load more devices</button>
+      </article>
+      <article>
+        <h2>Diagnostics</h2>
+        <p id="diagnostics-status" role="status"></p>
+      </article>
+      <article>
+        <h2>Requests</h2>
+        <p id="requests-status" role="status"></p>
+        <ul id="requests-list"></ul>
+      </article>
     </div>
     <aside id="grant">
       <h2>Authorize a change</h2>
@@ -105,6 +131,14 @@ article p, aside p { color: var(--muted); }
   let session = null;
   let pending = null;
   let idleTimer;
+  const accountPage = page("accounts");
+  const devicePage = page("devices");
+  const requests = byId("requests-list");
+  const requestsStatus = byId("requests-status");
+  const musicStatus = byId("music-status");
+  const internalAddress = byId("music-internal");
+  const publicAddress = byId("music-public");
+  const diagnostics = byId("diagnostics-status");
 
   function writeText(element, value) {
     element.textContent = value;
@@ -187,8 +221,186 @@ article p, aside p { color: var(--muted); }
     return typeof number === "bigint" && number >= 0n && number <= 18446744073709551615n;
   }
 
+  function json(value) {
+    if (typeof value === "bigint") return value.toString();
+    if (value === null || typeof value !== "object") return JSON.stringify(value);
+    if (Array.isArray(value)) return "[" + value.map(json).join(",") + "]";
+    return "{" + Object.entries(value).map(([key, item]) =>
+      JSON.stringify(key) + ":" + json(item)).join(",") + "}";
+  }
+
+  function armIdleTimer() {
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => endSession("Your session has ended. Sign in again."), 30 * 60 * 1000);
+  }
+
+  function endSession(message) {
+    forgetSession();
+    writeText(status, message);
+    email.focus();
+  }
+
+  async function readAdmin(current, path, fields, max) {
+    const response = await post(path, json({
+      head: { speaks: [1, 1], restore: current.restore }, ...fields,
+    }), current.controller.signal, current.bearer);
+    if (session !== current) throw new Error();
+    if (response.status === 401) {
+      const reply = await readReply(response, 4096);
+      if (session === current) {
+        const ended = reply.refused?.not_signed_in;
+        if (ended === "data_put_back" || ended === "session_ended") {
+          endSession(ended === "data_put_back" ?
+            "The server’s data was put back. Sign in again." : "Your session has ended. Sign in again.");
+        }
+      }
+      throw new Error();
+    }
+    if (response.status !== 200) throw new Error();
+    const reply = await readReply(response, max);
+    if (session !== current || !reply.done || reply.refused !== undefined) throw new Error();
+    armIdleTimer();
+    return reply.done;
+  }
+
+  function page(section) {
+    return {
+      list: byId(section + "-list"), status: byId(section + "-status"),
+      more: byId(section + "-more"), after: null,
+    };
+  }
+
+  function appendRow(list, value) {
+    const row = document.createElement("li");
+    writeText(row, value);
+    list.append(row);
+  }
+
+  function id(value) {
+    if (!isU64(value) || value === 0n) throw new Error();
+    return value;
+  }
+
+  function accountRow(row) {
+    if (typeof row.name !== "string" || typeof row.email !== "string" ||
+        typeof row.enabled !== "boolean" || typeof row.admin !== "boolean" ||
+        typeof row.requests_enabled !== "boolean") throw new Error();
+    return {
+      after: id(row.id),
+      label: row.name + " · " + row.email + (row.admin ? " · Administrator" : "") +
+        (row.enabled ? "" : " · Switched off"),
+      requests: row.name + " · " + (row.requests_enabled ? "On" : "Off"),
+    };
+  }
+
+  function deviceRow(row) {
+    if (typeof row.name !== "string" || typeof row.app_version !== "string" ||
+        !["pc", "phone"].includes(row.kind)) throw new Error();
+    if (row.session !== null) id(row.session);
+    if (!isU64(row.last_seen_ms)) throw new Error();
+    const heard = row.last_seen_ms === 0n ? "Never heard from" :
+      row.last_seen_ms <= 8640000000000000n ? "Last heard " + new Date(Number(row.last_seen_ms)).toLocaleString() :
+      "Last-heard time unavailable";
+    return {
+      after: { account: id(row.account), device: id(row.device) },
+      label: row.name + " · " + (row.kind === "pc" ? "PC" : "Phone") + " · " + row.app_version +
+        " · Account " + row.account + " · " + heard + (row.session === null ? " · Signed out" : ""),
+    };
+  }
+
+  async function loadPage(pager, path, decode, section) {
+    const current = session;
+    if (!current || pager.more.disabled) return;
+    pager.more.disabled = true;
+    writeText(pager.status, "Loading…");
+    try {
+      const result = await readAdmin(current, path, { after: pager.after }, 1024 * 1024);
+      if (session !== current) return;
+      if (!Array.isArray(result.rows) || result.rows.length > 500 ||
+          typeof result.more !== "boolean" || (result.more && result.rows.length === 0)) throw new Error();
+      const rows = result.rows.map(decode);
+      let after = pager.after;
+      for (const row of rows) {
+        const next = row.after;
+        if (after !== null) {
+          const advances = typeof next === "bigint" ? next > after :
+            next.account > after.account || (next.account === after.account && next.device > after.device);
+          if (!advances) throw new Error();
+        }
+        after = next;
+      }
+      for (const row of rows) {
+        appendRow(pager.list, row.label);
+        if (row.requests !== undefined) appendRow(requests, row.requests);
+      }
+      pager.after = after;
+      pager.more.hidden = !result.more;
+      writeText(pager.more, "Load more " + section);
+      writeText(pager.status, after === null ? "No " + section + "." : "");
+      if (pager === accountPage) writeText(requestsStatus, after === null ? "No accounts." : "");
+    } catch {
+      if (session !== current) return;
+      writeText(pager.status, "Could not load " + section + ".");
+      if (pager === accountPage && pager.after === null) writeText(requestsStatus, "Could not load accounts.");
+      pager.more.hidden = false;
+      writeText(pager.more, "Retry");
+    } finally {
+      if (session === current) pager.more.disabled = false;
+    }
+  }
+
+  function loadAccounts() {
+    return loadPage(accountPage, "/nexus/api/admin/accounts", accountRow, "accounts");
+  }
+
+  function loadDevices() {
+    return loadPage(devicePage, "/nexus/api/admin/devices", deviceRow, "devices");
+  }
+
+  async function loadMusic(current) {
+    writeText(musicStatus, "Loading…");
+    try {
+      const result = await readAdmin(current, "/nexus/api/admin/music-server", {}, 4096);
+      if (session !== current) return;
+      if (typeof result.internal !== "string" ||
+          (result.public !== null && typeof result.public !== "string")) throw new Error();
+      writeText(internalAddress, result.internal);
+      writeText(publicAddress, result.public ?? "Unset");
+      writeText(musicStatus, "");
+    } catch {
+      if (session === current) writeText(musicStatus, "Could not load music server addresses.");
+    }
+  }
+
+  async function loadDiagnostics(current) {
+    writeText(diagnostics, "Loading…");
+    try {
+      const result = await readAdmin(current, "/nexus/api/admin/diagnostics-default", {}, 4096);
+      if (session !== current) return;
+      if (typeof result.enabled !== "boolean") throw new Error();
+      writeText(diagnostics, result.enabled ? "Default is on." : "Default is off.");
+    } catch {
+      if (session === current) writeText(diagnostics, "Could not load the Diagnostics default.");
+    }
+  }
+
+  accountPage.more.addEventListener("click", loadAccounts);
+  devicePage.more.addEventListener("click", loadDevices);
+
   function forgetSession() {
+    session?.controller.abort();
     session = null;
+    for (const pager of [accountPage, devicePage]) {
+      pager.list.replaceChildren();
+      pager.after = null;
+      pager.more.hidden = true;
+      pager.more.disabled = false;
+      writeText(pager.status, "");
+    }
+    requests.replaceChildren();
+    for (const element of [requestsStatus, internalAddress, publicAddress, musicStatus, diagnostics]) {
+      writeText(element, "");
+    }
     clearTimeout(idleTimer);
     form.hidden = false;
     admin.hidden = true;
@@ -244,12 +456,12 @@ article p, aside p { color: var(--muted); }
         writeText(status, "An administrator sign-in is required.");
         return;
       }
-      session = { bearer: signedIn.session, restore };
-      idleTimer = setTimeout(() => {
-        forgetSession();
-        writeText(status, "Your session has ended. Sign in again.");
-        email.focus();
-      }, 30 * 60 * 1000);
+      session = { bearer: signedIn.session, restore, controller: new AbortController() };
+      armIdleTimer();
+      void loadAccounts();
+      void loadDevices();
+      void loadMusic(session);
+      void loadDiagnostics(session);
       form.reset();
       form.hidden = true;
       admin.hidden = false;
