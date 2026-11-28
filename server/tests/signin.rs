@@ -296,6 +296,22 @@ fn a_wrong_password_an_unknown_email_and_a_note_all_answer_as_the_design_says() 
     // A sign-in body over 4 KiB is refused from its head, before a byte of it is read.
     let (status, _) = backend.post(account::SIGN_IN, None, &vec![b' '; account::PASSWORD_REQUEST_MAX_BYTES + 1]);
     assert_eq!(status, 413);
+    // C5 (the review of S8): on both calls that carry a password, a head saying one byte over
+    // 4 KiB is answered 413 at once, with not a byte of the body sent: nothing waits for it.
+    for path in [account::SIGN_IN, account::CHANGE_PASSWORD] {
+        let mut stream = TcpStream::connect(backend.at).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let head = format!(
+            "POST {path} HTTP/1.1\r\nHost: nexus\r\nX-Nexus-Scheme: https\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            account::PASSWORD_REQUEST_MAX_BYTES + 1
+        );
+        let asked = Instant::now();
+        stream.write_all(head.as_bytes()).unwrap();
+        let mut from = BufReader::new(stream);
+        let answer = nexus_music_server::probe::read_head(&mut from).expect("answered before the read's two seconds").expect("an answer");
+        assert_eq!(answer.status, 413, "{path}");
+        assert!(asked.elapsed() < Duration::from_secs(1), "{path} waited {:?}", asked.elapsed());
+    }
 }
 
 /// A1 (8.3), as far as S8 can take it: a wrong password for an account and an email with no

@@ -193,3 +193,15 @@ fn a_redemption_is_fenced_by_a_change_made_during_its_slow_work_and_a_code_is_re
     });
     assert_eq!([a, b].iter().filter(|status| **status == 200).count(), 1, "{a} {b}");
 }
+
+/// C5 (the review of S8): an account that is not an admin's, with its right password, is
+/// refused at the admin's page (the page's own origin and marker are the door's, `routes`).
+#[test]
+fn a_correct_password_of_an_account_not_an_admin_s_does_not_sign_in_at_the_page() {
+    let (bench, made) = Bench::new("page-not-admin", &[("member@example.test", false)]);
+    bench::signed_in(&bench.sign_in(bench::with_code(&made[0].code, PASSWORD), 1));
+    bench.advance(2_000);
+    let page = bench.runtime.block_on(bench.accounts.sign_in(bench::sign_in(bench::with_password(made[0].email, PASSWORD), 2), true));
+    assert_ne!(page.status, 200);
+    assert!(account::read_reply::<account::SignedIn>(page.status, page.body.bytes()).is_ok_and(|reply| matches!(reply, account::Reply::Refused(_))));
+}
