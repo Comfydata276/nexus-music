@@ -1,68 +1,43 @@
-//! The music-server login (§9). The server supplies fresh random bytes and performs
-//! the fixed POSTs. Music-server answers confer no Nexus account permissions.
+//! The music-server login (§9). S9 supplies configured addresses, fresh random
+//! bytes and the transport. A music-server answer confers no Nexus permissions.
 
-use super::proto;
-use serde_json::Value;
-use std::fmt::{self, Write};
+use super::account::{AccountId, MusicAddress, MusicSalt, MusicToken, Name, SALT_LENGTH};
+use super::kept::MusicAuthorization;
+use super::proto::{self, BackendId};
+use super::wire::{self, BadMessage, Fields, Message, Value};
+use serde::Serialize;
+use serde_json::value::RawValue;
+use std::fmt;
 use zeroize::Zeroizing;
 
 mod md5;
+mod seal;
+pub use seal::{CredentialBinding, NONCE_BYTES, SealedCredential, SealingKey};
 
-pub const SALT_BYTES: usize = 32;
-const SALT_DIGITS: usize = 2 * SALT_BYTES;
-pub const TOKEN_DIGITS: usize = 32;
 /// The design does not say how large an upstream answer may be. Use the bounded
-/// hello reader for these two small responses, including their unknown fields.
+/// hello size for these small responses, including their unknown fields.
 pub const ANSWER_MAX_BYTES: usize = proto::HELLO_MAX_BYTES;
 
-fn append_hex(bytes: &[u8], text: &mut String) {
-    for byte in bytes {
-        let _ = write!(text, "{byte:02x}");
-    }
-}
-
-/// §9.4. The design does not say how to encode new salts. Keep the measured
-/// 32 random bytes rendered as 64 lowercase hex digits, including leading zeroes.
-pub struct Salt(Zeroizing<String>);
-
-impl Salt {
-    pub fn from_random(bytes: [u8; SALT_BYTES]) -> Self {
-        let mut text = Zeroizing::new(String::with_capacity(SALT_DIGITS));
-        append_hex(&bytes, &mut text);
-        Self(text)
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Debug for Salt {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("Salt(..)")
-    }
-}
-
-/// §9.1 and §9.4. The only constructor needs a non-empty, typed salt. There is no
-/// way to create a bare token. S9 passes both strings to C7's device login.
+/// §9.4. The only constructor requires C7's nonempty salt and the password bytes.
 pub struct SaltedToken {
-    salt: Salt,
-    token: Zeroizing<String>,
+    salt: MusicSalt,
+    token: MusicToken,
 }
 
 impl SaltedToken {
-    pub fn from_password(password: &[u8], salt: Salt) -> Self {
+    pub fn from_password(password: &[u8], salt: MusicSalt) -> Self {
         let digest = md5::with_salt(password, &salt);
-        let mut token = Zeroizing::new(String::with_capacity(TOKEN_DIGITS));
-        append_hex(digest.as_slice(), &mut token);
-        Self { salt, token }
+        Self {
+            salt,
+            token: MusicToken::from_bytes(*digest),
+        }
     }
 
-    pub fn salt(&self) -> &str {
-        self.salt.as_str()
+    pub fn salt(&self) -> &MusicSalt {
+        &self.salt
     }
 
-    pub fn token(&self) -> &str {
+    pub fn token(&self) -> &MusicToken {
         &self.token
     }
 }
@@ -75,28 +50,23 @@ impl fmt::Debug for SaltedToken {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum Outcome {
-    Verified,
     Refused,
-    UntrustedCheck,
     CouldNotAsk,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum Trust {
-    RequiresCredentials,
-    AcceptsHeader,
-    Unknown,
-}
-
-/// A POST to the configured music server, with application/x-www-form-urlencoded.
-/// Use the configured server and disable redirects. Never copy caller headers or
-/// query parameters into this request.
-pub struct Post {
+/// A POST to the shown configured endpoint. The transport must disable redirects,
+/// cookies and caller-supplied headers and use application/x-www-form-urlencoded.
+pub struct Post<'a> {
+    address: &'a str,
     path: &'static str,
     form: Zeroizing<String>,
 }
 
-impl Post {
+impl Post<'_> {
+    pub fn address(&self) -> &str {
+        self.address
+    }
+
     pub fn path(&self) -> &'static str {
         self.path
     }
@@ -106,7 +76,7 @@ impl Post {
     }
 }
 
-impl fmt::Debug for Post {
+impl fmt::Debug for Post<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Post")
             .field("path", &self.path)
@@ -114,189 +84,303 @@ impl fmt::Debug for Post {
     }
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct MusicInstallation {
+    pub binding: CredentialBinding,
+    pub sealed: SealedCredential,
+}
+
+/// The only input kept accepts to install a typed-in login. Only both configured
+/// endpoints answering correctly for the identical credentials can make one.
+pub struct VerifiedLogin {
+    authorization: MusicAuthorization,
+    install: MusicInstallation,
+    internal: String,
+}
+
+pub struct CurrentEndpoints<'a> {
+    pub internal: &'a str,
+    pub public: &'a MusicAddress,
+}
+
+impl VerifiedLogin {
+    pub(in crate::nexus) fn into_parts(
+        self,
+        endpoints: CurrentEndpoints<'_>,
+    ) -> Option<(MusicAuthorization, MusicInstallation)> {
+        (self.internal == endpoints.internal && self.install.binding.address == *endpoints.public)
+            .then_some((self.authorization, self.install))
+    }
+}
+
+pub struct Provisioning<'a> {
+    /// The trusted address from backend configuration. Private HTTP is allowed.
+    pub internal: &'a str,
+    pub public: MusicAddress,
+    pub name: Name,
+    pub password: &'a [u8],
+    pub salt: MusicSalt,
+    pub nonce: [u8; NONCE_BYTES],
+}
+
+struct Check {
+    authorization: MusicAuthorization,
+    internal: String,
+    install: MusicInstallation,
+    pair: SaltedToken,
+    public: bool,
+}
+
+impl Check {
+    fn address(&self) -> &str {
+        if self.public {
+            self.install.binding.address.as_str()
+        } else {
+            &self.internal
+        }
+    }
+}
+
+/// The check starts only after a grant has been consumed for this account.
+pub struct Ping(Check);
+
+impl Ping {
+    pub fn provision(
+        authorization: MusicAuthorization,
+        input: Provisioning<'_>,
+        key: &SealingKey,
+    ) -> Result<Self, Outcome> {
+        let internal = internal_address(input.internal).ok_or(Outcome::CouldNotAsk)?;
+        let binding = CredentialBinding {
+            backend: authorization.backend(),
+            account: authorization.account(),
+            address: input.public,
+            name: input.name,
+            count: authorization.next_count(),
+        };
+        let sealed = key
+            .seal(&binding, input.password, input.nonce)
+            .ok_or(Outcome::CouldNotAsk)?;
+        let pair = SaltedToken::from_password(input.password, input.salt);
+        Ok(Self(Check {
+            authorization,
+            internal,
+            install: MusicInstallation { binding, sealed },
+            pair,
+            public: false,
+        }))
+    }
+
+    pub fn post(&self) -> Post<'_> {
+        login_post(
+            self.0.address(),
+            self.0.install.binding.name.as_str(),
+            &self.0.pair,
+            false,
+        )
+    }
+
+    pub fn answer(self, reply: Option<(u16, &[u8])>) -> Result<GetUser, Outcome> {
+        ping_answer(reply)?;
+        Ok(GetUser(self.0))
+    }
+}
+
+pub struct GetUser(Check);
+
+pub enum Checked {
+    Public(Ping),
+    Verified(VerifiedLogin),
+}
+
+impl GetUser {
+    pub fn post(&self) -> Post<'_> {
+        login_post(
+            self.0.address(),
+            self.0.install.binding.name.as_str(),
+            &self.0.pair,
+            true,
+        )
+    }
+
+    pub fn answer(self, reply: Option<(u16, &[u8])>) -> Result<Checked, Outcome> {
+        let mut check = self.0;
+        user_answer(reply, check.install.binding.name.as_str())?;
+        // The design does not say whether to ask one configured address twice.
+        // Always check both unless the exact endpoint text is already the same.
+        if !check.public && check.internal != check.install.binding.address.as_str() {
+            check.public = true;
+            return Ok(Checked::Public(Ping(check)));
+        }
+        Ok(Checked::Verified(VerifiedLogin {
+            authorization: check.authorization,
+            install: check.install,
+            internal: check.internal,
+        }))
+    }
+}
+
+fn internal_address(address: &str) -> Option<String> {
+    // The design does not say what is allowed in the backend-only address.
+    // Accept only an absolute HTTP(S) base without credentials, query or fragment.
+    if address.len() > ANSWER_MAX_BYTES
+        || address.contains(['\\', '@'])
+        || address.chars().any(char::is_whitespace)
+    {
+        return None;
+    }
+    let url = url::Url::parse(address).ok()?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !address.starts_with(&format!("{}://", url.scheme()))
+        || url.host().is_none()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return None;
+    }
+    Some(address.to_owned())
+}
+
 // The design does not say which client label or protocol version to put in forms.
 // Use E3's measured protocol version and a fixed backend label.
 const FORM: &str = "v=1.16.1&c=nexus-music&f=json";
+const BAD_SIGN_IN: u64 = 40;
+const NOT_ALLOWED: u64 = 50;
 
-/// §20. At startup and daily, send the configured identity header with this fresh
-/// random value, no credentials, and no app-supplied headers. Cache the verdict
-/// for the configured server only. Changing its configuration requires a new probe.
-pub struct TrustProbe(Salt);
-
-impl TrustProbe {
-    pub fn from_random(bytes: [u8; SALT_BYTES]) -> Self {
-        Self(Salt::from_random(bytes))
-    }
-
-    pub fn post(&self) -> Post {
-        Post {
-            path: "/rest/ping",
-            form: Zeroizing::new(FORM.to_owned()),
-        }
-    }
-
-    pub fn header_value(&self) -> &str {
-        self.0.as_str()
-    }
-
-    pub fn answer(self, reply: Option<(u16, &[u8])>) -> Trust {
-        match read_reply(reply) {
-            Some(Envelope::Error(MISSING_PARAMETER, message)) if message == MISSING_USER => {
-                Trust::RequiresCredentials
-            }
-            Some(Envelope::Error(BAD_SIGN_IN, _) | Envelope::Ok(_)) => Trust::AcceptsHeader,
-            _ => Trust::Unknown,
-        }
-    }
-}
-
-impl fmt::Debug for TrustProbe {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("TrustProbe(..)")
-    }
-}
-
-/// A login check always starts with ping. §20 keeps this check for a newly entered
-/// or changed music login. Callers supply a complete HTTP response or None.
-pub struct Ping<'a> {
-    name: &'a str,
-    pair: &'a SaltedToken,
-}
-
-impl<'a> Ping<'a> {
-    pub fn new(name: &'a str, pair: &'a SaltedToken, trust: Trust) -> Result<Self, Outcome> {
-        match trust {
-            Trust::RequiresCredentials => {}
-            Trust::AcceptsHeader => return Err(Outcome::UntrustedCheck),
-            Trust::Unknown => return Err(Outcome::CouldNotAsk),
-        }
-        // The design does not say how large / unrestricted a music name may be.
-        // Require it to fit a possible getUser answer and reject control characters.
-        if name.is_empty() || name.len() > ANSWER_MAX_BYTES || name.chars().any(char::is_control) {
-            return Err(Outcome::CouldNotAsk);
-        }
-        Ok(Self { name, pair })
-    }
-
-    pub fn post(&self) -> Post {
-        login_post(self.name, self.pair, "/rest/ping", false)
-    }
-
-    pub fn answer(self, reply: Option<(u16, &[u8])>) -> Result<GetUser<'a>, Outcome> {
-        match read_reply(reply) {
-            Some(Envelope::Ok(None)) => Ok(GetUser {
-                name: self.name,
-                pair: self.pair,
-            }),
-            Some(Envelope::Error(BAD_SIGN_IN, _)) => Err(Outcome::Refused),
-            _ => Err(Outcome::CouldNotAsk),
-        }
-    }
-}
-
-/// Only a well-formed ping success allows S9 to ask getUser with the same login.
-pub struct GetUser<'a> {
-    name: &'a str,
-    pair: &'a SaltedToken,
-}
-
-impl GetUser<'_> {
-    pub fn post(&self) -> Post {
-        login_post(self.name, self.pair, "/rest/getUser", true)
-    }
-
-    pub fn answer(self, reply: Option<(u16, &[u8])>) -> Outcome {
-        match read_reply(reply) {
-            Some(Envelope::Ok(Some(name))) if name == self.name => Outcome::Verified,
-            // E3.4. A wrong name/password and the upstream limiter have the same answer.
-            Some(Envelope::Error(BAD_SIGN_IN, _)) => Outcome::Refused,
-            _ => Outcome::CouldNotAsk,
-        }
-    }
-}
-
-fn login_post(name: &str, pair: &SaltedToken, path: &'static str, get_user: bool) -> Post {
+fn login_post<'a>(address: &'a str, name: &str, pair: &SaltedToken, user: bool) -> Post<'a> {
     let name = crate::text::encode(name);
-    let mut form = Zeroizing::new(FORM.to_owned());
-    if get_user {
+    let salt = pair.salt().as_str();
+    let token = pair.token().expose_hex();
+    let mut form = Zeroizing::new(String::with_capacity(
+        FORM.len() + name.len() * 2 + salt.len() + token.len() + 21,
+    ));
+    form.push_str(FORM);
+    if user {
         form.push_str("&username=");
         form.push_str(&name);
     }
     form.push_str("&u=");
     form.push_str(&name);
     form.push_str("&s=");
-    form.push_str(pair.salt());
+    form.push_str(salt);
     form.push_str("&t=");
-    form.push_str(pair.token());
-    Post { path, form }
+    form.push_str(&token);
+    Post {
+        address,
+        path: if user { "/rest/getUser" } else { "/rest/ping" },
+        form,
+    }
+}
+
+fn ping_answer(reply: Option<(u16, &[u8])>) -> Result<(), Outcome> {
+    match read_reply(reply) {
+        Some(Envelope::Ok(None)) => Ok(()),
+        Some(Envelope::Error(BAD_SIGN_IN)) => Err(Outcome::Refused),
+        _ => Err(Outcome::CouldNotAsk),
+    }
+}
+
+fn user_answer(reply: Option<(u16, &[u8])>, name: &str) -> Result<(), Outcome> {
+    match read_reply(reply) {
+        Some(Envelope::Ok(Some(found))) if found == name => Ok(()),
+        // E3.4. Wrong credentials and the upstream limiter have the same envelope.
+        Some(Envelope::Error(BAD_SIGN_IN)) => Err(Outcome::Refused),
+        _ => Err(Outcome::CouldNotAsk),
+    }
+}
+
+/// §6.3. Only a complete, bounded Navidrome envelope can mark a login refused.
+/// A caller can inspect the prefix of a stream without buffering its media.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ReplyStart {
+    Refused,
+    NotAllowed,
+    Busy,
+    RangeUnavailable,
+    Other,
+}
+
+pub fn classify_start(status: u16, prefix: &[u8], complete: bool) -> ReplyStart {
+    // The design does not say which HTTP statuses separate these failures.
+    // Use only the explicit HTTP meanings and measured Subsonic codes.
+    match status {
+        403 => ReplyStart::NotAllowed,
+        416 => ReplyStart::RangeUnavailable,
+        429 | 503 => ReplyStart::Busy,
+        200 if complete => match read_reply(Some((status, prefix))) {
+            Some(Envelope::Error(BAD_SIGN_IN)) => ReplyStart::Refused,
+            Some(Envelope::Error(NOT_ALLOWED)) => ReplyStart::NotAllowed,
+            _ => ReplyStart::Other,
+        },
+        _ => ReplyStart::Other,
+    }
+}
+
+#[derive(Serialize)]
+enum Envelope {
+    Ok(Option<String>),
+    Error(u64),
+}
+
+impl Message for Envelope {}
+
+impl Value for Envelope {
+    fn read(raw: &RawValue) -> Result<Self, BadMessage> {
+        let root = Fields::read(raw)?;
+        if root.0.len() != 1 {
+            return Err(BadMessage::Form);
+        }
+        let response = root.0.get("subsonic-response").ok_or(BadMessage::Form)?;
+        let body = Fields::read(response)?;
+        // The design does not say which extra envelope payloads are safe.
+        // Permit observed metadata and only the expected success/error members.
+        for (key, raw) in &body.0 {
+            match key.as_str() {
+                "version" | "type" | "serverVersion" => {
+                    wire::json_string(raw)?;
+                }
+                "openSubsonic" => {
+                    bool::read(raw)?;
+                }
+                "status" | "user" | "error" => {}
+                _ => return Err(BadMessage::Form),
+            }
+        }
+        let status = wire::json_string(body.0.get("status").ok_or(BadMessage::Form)?)?;
+        match status.as_str() {
+            "ok" if !body.0.contains_key("error") => {
+                let name = if let Some(raw) = body.0.get("user") {
+                    let user = Fields::read(raw)?;
+                    let name = wire::json_string(user.0.get("username").ok_or(BadMessage::Form)?)?;
+                    if name.is_empty() {
+                        return Err(BadMessage::Form);
+                    }
+                    Some(name.to_string())
+                } else {
+                    None
+                };
+                Ok(Self::Ok(name))
+            }
+            "failed" if !body.0.contains_key("user") => {
+                let error = Fields::read(body.0.get("error").ok_or(BadMessage::Form)?)?;
+                wire::json_string(error.0.get("message").ok_or(BadMessage::Form)?)?;
+                Ok(Self::Error(error.get("code")?))
+            }
+            _ => Err(BadMessage::Form),
+        }
+    }
 }
 
 fn read_reply(reply: Option<(u16, &[u8])>) -> Option<Envelope> {
     let (status, bytes) = reply?;
-    read(status, bytes)
-}
-
-// §7.2–7.3 / E3.2 and E3.6. Code 10 alone also means missing v or c.
-const MISSING_PARAMETER: u64 = 10;
-const MISSING_USER: &str = "missing parameter: 'u'";
-const BAD_SIGN_IN: u64 = 40;
-
-enum Envelope {
-    Ok(Option<String>),
-    Error(u64, String),
-}
-
-fn read(status: u16, bytes: &[u8]) -> Option<Envelope> {
-    // the design does not say how to treat a valid body at an unmeasured status.
-    // A transport failure is never authentication; only a measured 200 is eligible.
-    if status != 200 || bytes.len() > ANSWER_MAX_BYTES || !proto::complete_json(bytes) {
+    // The design does not say what a convincing body at an unmeasured status
+    // means. Treat only a complete measured HTTP 200 envelope as authoritative.
+    if status != 200 || bytes.len() > ANSWER_MAX_BYTES {
         return None;
     }
-    let root: Value = serde_json::from_slice(bytes).ok()?;
-    let root = root.as_object()?;
-    if root.len() != 1 {
-        return None;
-    }
-    let body = root.get("subsonic-response")?.as_object()?;
-    // the design does not say which extra envelope payloads are safe. A successful
-    // getSong or extension listing is not a successful ping. Accept Navidrome's measured
-    // metadata and the two expected payloads; fields inside a real user may vary.
-    if !body.keys().all(|k| {
-        matches!(
-            k.as_str(),
-            "status" | "version" | "type" | "serverVersion" | "openSubsonic" | "user" | "error"
-        )
-    }) {
-        return None;
-    }
-    for key in ["version", "type", "serverVersion"] {
-        if body.get(key).is_some_and(|v| !v.is_string()) {
-            return None;
-        }
-    }
-    if body.get("openSubsonic").is_some_and(|v| !v.is_boolean()) {
-        return None;
-    }
-    match body.get("status")?.as_str()? {
-        "ok" if !body.contains_key("error") => {
-            let name = match body.get("user") {
-                None => None,
-                Some(user) => Some(user.as_object()?.get("username")?.as_str()?.to_owned()),
-            };
-            if name.as_deref() == Some("") {
-                return None;
-            }
-            Some(Envelope::Ok(name))
-        }
-        "failed" if !body.contains_key("user") => {
-            let error = body.get("error")?.as_object()?;
-            Some(Envelope::Error(
-                error.get("code")?.as_u64()?,
-                error.get("message")?.as_str()?.to_owned(),
-            ))
-        }
-        _ => None,
-    }
+    wire::read(bytes).ok()
 }
 
 #[cfg(test)]

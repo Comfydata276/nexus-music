@@ -3,6 +3,7 @@
 
 use super::receipt::Purpose;
 use super::*;
+use crate::nexus::music::{CurrentEndpoints, MusicInstallation, VerifiedLogin};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy)]
@@ -67,7 +68,7 @@ pub enum DataChange {
         action: AdminAction,
         target: AdminTarget,
     },
-    InstallMusicLogin,
+    InstallMusicLogin(MusicInstallation),
 }
 
 /// When credentials must be renewed, S3/S9 apply this alongside the data changes.
@@ -532,6 +533,31 @@ pub struct FreshSession {
     pub hash: Fingerprint,
 }
 
+/// One consumed admin grant for provisioning a named account's login. Only
+/// kept issues it, and the checked result is fenced again before installation.
+pub struct MusicAuthorization {
+    actor: Scope,
+    session: SessionId,
+    granted: u64,
+    target: AccountId,
+    target_revision: u64,
+    next_count: u64,
+}
+
+impl MusicAuthorization {
+    pub(in crate::nexus) fn backend(&self) -> BackendId {
+        self.actor.backend
+    }
+
+    pub(in crate::nexus) fn account(&self) -> AccountId {
+        self.target
+    }
+
+    pub(in crate::nexus) fn next_count(&self) -> u64 {
+        self.next_count
+    }
+}
+
 impl Turn<'_> {
     pub fn check_sign_in(
         self,
@@ -852,7 +878,7 @@ impl Turn<'_> {
         force_out(self.account, other, self.music)
     }
 
-    fn consume_leave(&mut self, bearer: Bearer<'_>, purpose: LeaveFor) -> Result<(), Denied> {
+    fn consume_leave(&mut self, bearer: Bearer<'_>, purpose: LeaveFor) -> Result<Leave, Denied> {
         let life = self.account.state.life;
         let revision = self.account.state.revision;
         let admin = self.account.state.admin;
@@ -866,8 +892,7 @@ impl Turn<'_> {
         }) {
             return Err(Denied::LeaveRequired);
         }
-        session.leave = None;
-        Ok(())
+        session.leave.take().ok_or(Denied::LeaveRequired)
     }
 
     pub fn change_password(mut self, bearer: Bearer<'_>) -> Result<(), Denied> {
@@ -901,21 +926,84 @@ impl Turn<'_> {
         Ok(())
     }
 
-    /// S9 applies a successfully replaced pending login, using the count under
-    /// which the replacement started. The storage step installs the checked pair's
-    /// source credentials alongside the count.
-    pub fn music_replaced(self, previous_count: u64) -> Result<u64, Denied> {
-        let state = &mut self.account.state;
-        if state.status == Status::Deleted
-            || state.music_recovery.is_none()
-            || state.music_login != previous_count
+    /// Consume a single grant before S9 sends either credential-bearing POST.
+    /// None selects the admin's own account.
+    pub fn authorize_music(
+        mut self,
+        bearer: Bearer<'_>,
+        target: Option<&Account>,
+    ) -> Result<MusicAuthorization, Denied> {
+        if !self.account.state.admin {
+            return Err(Denied::AdminRequired);
+        }
+        let target_state = &target.unwrap_or(self.account).state;
+        if target_state.backend != self.account.state.backend
+            || target_state.restore != self.account.state.restore
+            || target_state.status == Status::Deleted
         {
             return Err(Denied::WrongPurpose);
         }
-        state.music_login = next(state.music_login)?;
-        state.music_recovery = None;
-        *self.change = DataChange::InstallMusicLogin;
-        Ok(state.music_login)
+        let target = target_state.id;
+        let target_revision = target_state.revision;
+        let next_count = next(target_state.music_login)?;
+        let device = bearer.device;
+        let hash = bearer.hash;
+        let grant = self.consume_leave(
+            bearer,
+            LeaveFor::Admin {
+                action: AdminAction::MusicLoginChanged,
+                target: AdminTarget::Account(target),
+            },
+        )?;
+        let session = self.account.session(device, hash, self.now)?.id;
+        Ok(MusicAuthorization {
+            actor: self.account.scope(device)?,
+            session,
+            granted: grant.granted,
+            target,
+            target_revision,
+            next_count,
+        })
+    }
+
+    /// Install the verified login only while the same authorization and endpoints
+    /// are current. S3 commits the count and sealed bytes under the same lock.
+    pub fn install_music(
+        self,
+        bearer: Bearer<'_>,
+        verified: VerifiedLogin,
+        endpoints: CurrentEndpoints<'_>,
+        target: Option<&mut Account>,
+    ) -> Result<u64, Denied> {
+        let (auth, login) = verified.into_parts(endpoints).ok_or(Denied::WrongPurpose)?;
+        let session = self
+            .account
+            .session(bearer.device, bearer.hash, self.now)?
+            .id;
+        if !self.account.state.admin
+            || self.account.scope(bearer.device)? != auth.actor
+            || session != auth.session
+            || !within(auth.granted, self.now, PASSWORD_LEAVE_MS)
+        {
+            return Err(Denied::LeaveRequired);
+        }
+        if let Some(target) = target {
+            if target.state.same_account(&self.account.state) {
+                return Err(Denied::WrongPurpose);
+            }
+            let before = target.rows();
+            let apart = target.apart();
+            install_music(target, &auth)?;
+            if let Some(update) =
+                target.update(&before, &apart, DataChange::InstallMusicLogin(login), None)
+            {
+                self.others.push(update);
+            }
+        } else {
+            install_music(self.account, &auth)?;
+            *self.change = DataChange::InstallMusicLogin(login);
+        }
+        Ok(auth.next_count)
     }
 
     pub fn admin_read(self, bearer: Bearer<'_>) -> Result<(), Denied> {
@@ -939,6 +1027,9 @@ impl Turn<'_> {
     ) -> Result<(), Denied> {
         if !self.account.state.admin {
             return Err(Denied::AdminRequired);
+        }
+        if action == AdminAction::MusicLoginChanged {
+            return Err(Denied::WrongPurpose);
         }
         self.consume_leave(
             bearer,
@@ -971,6 +1062,23 @@ impl Turn<'_> {
             admin_change(self.account, action, named, self.change, self.music)
         }
     }
+}
+
+fn install_music(account: &mut Account, auth: &MusicAuthorization) -> Result<(), Denied> {
+    let state = &mut account.state;
+    if state.backend != auth.actor.backend
+        || state.restore != auth.actor.restore
+        || state.id != auth.target
+        || state.revision != auth.target_revision
+        || state.status == Status::Deleted
+        || next(state.music_login)? != auth.next_count
+    {
+        return Err(Denied::WrongPurpose);
+    }
+    state.music_login = auth.next_count;
+    state.music_managed = false;
+    state.music_recovery = None;
+    Ok(())
 }
 
 fn force_out(
@@ -1089,12 +1197,7 @@ fn admin_change(
             }
         }
         AdminAction::ForceOut(device) => force_out(account, device, music)?,
-        AdminAction::MusicLoginChanged => {
-            // S9 supplies this action when the replacement is ready for its data write.
-            account.state.music_login = next(account.state.music_login)?;
-            account.state.music_recovery = None;
-            *change = DataChange::InstallMusicLogin;
-        }
+        AdminAction::MusicLoginChanged => return Err(Denied::WrongPurpose),
         AdminAction::CreateAccount
         | AdminAction::SetMusicAddress
         | AdminAction::SetDiagnosticsDefault

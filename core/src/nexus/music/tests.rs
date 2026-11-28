@@ -1,26 +1,18 @@
 use super::e3::*;
 use super::*;
 
+use super::super::account::SALT_BYTES;
+
 fn pair() -> SaltedToken {
-    SaltedToken::from_password(b"Example password", Salt::from_random([0x2b; SALT_BYTES]))
+    SaltedToken::from_password(
+        b"Example password",
+        MusicSalt::from_random([0x2b; SALT_BYTES]),
+    )
 }
 
-fn probe(answer: Option<(u16, &[u8])>) -> Trust {
-    TrustProbe::from_random([42; SALT_BYTES]).answer(answer)
-}
-
-fn ping<'a>(name: &'a str, pair: &'a SaltedToken) -> Ping<'a> {
-    Ping::new(name, pair, Trust::RequiresCredentials)
-        .ok()
-        .unwrap()
-}
-
-fn outcome(ping_answer: &[u8], user_answer: &[u8], name: &str) -> Outcome {
-    let pair = pair();
-    match ping(name, &pair).answer(Some((200, ping_answer))) {
-        Ok(call) => call.answer(Some((200, user_answer))),
-        Err(outcome) => outcome,
-    }
+fn outcome(ping: &[u8], user: &[u8], name: &str) -> Result<(), Outcome> {
+    ping_answer(Some((200, ping)))?;
+    user_answer(Some((200, user)), name)
 }
 
 #[test]
@@ -44,34 +36,36 @@ fn a_token_requires_a_salt_and_covers_both_byte_sequences_in_order() {
         ),
     ];
     for (password, expected) in cases {
-        let salt = Salt::from_random([0x2b; SALT_BYTES]);
+        let salt = MusicSalt::from_random([0x2b; SALT_BYTES]);
         let pair = SaltedToken::from_password(&password, salt);
-        assert_eq!(pair.salt(), &"2b".repeat(SALT_BYTES));
-        assert_eq!(pair.token(), expected);
-        assert_eq!(pair.token().len(), TOKEN_DIGITS);
+        assert_eq!(pair.salt().as_str(), &"2b".repeat(SALT_BYTES));
+        assert_eq!(&*pair.token().expose_hex(), expected);
+        assert_eq!(pair.token().expose_hex().len(), 32);
     }
-    let empty_bytes = Salt::from_random([0; SALT_BYTES]);
+    let empty_bytes = MusicSalt::from_random([0; SALT_BYTES]);
     let pair = SaltedToken::from_password(b"Example password", empty_bytes);
-    assert_eq!(pair.salt(), &"00".repeat(SALT_BYTES));
-    assert_ne!(pair.token(), "f6b97dc773771138cd1eabbef027b6fc");
+    assert_eq!(pair.salt().as_str(), &"00".repeat(SALT_BYTES));
+    assert_ne!(
+        &*pair.token().expose_hex(),
+        "f6b97dc773771138cd1eabbef027b6fc"
+    );
 }
 
 #[test]
 fn approved_login_posts_have_fixed_paths_and_escape_the_bound_name() {
     let pair = pair();
     let name = "alice & + 山";
-    let ping = ping(name, &pair);
-    let post = ping.post();
+    let address = "https://music.example.test";
+    let post = login_post(address, name, &pair, false);
     let credentials = format!(
         "u=alice%20%26%20%2B%20%E5%B1%B1&s={}&t={}",
-        pair.salt(),
-        pair.token()
+        pair.salt().as_str(),
+        *pair.token().expose_hex()
     );
     assert_eq!(post.path(), "/rest/ping");
     assert_eq!(post.form(), format!("{FORM}&{credentials}"));
 
-    let user = ping.answer(Some((200, OK))).ok().unwrap();
-    let post = user.post();
+    let post = login_post(address, name, &pair, true);
     assert_eq!(post.path(), "/rest/getUser");
     assert_eq!(
         post.form(),
@@ -79,57 +73,44 @@ fn approved_login_posts_have_fixed_paths_and_escape_the_bound_name() {
     );
     let account =
         br#"{"subsonic-response":{"status":"ok","user":{"username":"alice & + \u5c71"}}}"#;
-    assert_eq!(user.answer(Some((200, account))), Outcome::Verified);
+    assert_eq!(user_answer(Some((200, account)), name), Ok(()));
 }
 
 #[test]
-fn only_the_exact_missing_u_response_allows_credential_posts_after_the_probe() {
-    let check = TrustProbe::from_random([42; SALT_BYTES]);
-    let post = check.post();
-    assert_eq!(post.path(), "/rest/ping");
-    assert_eq!(post.form(), FORM);
-    assert_eq!(check.header_value(), &"2a".repeat(SALT_BYTES));
-    assert_eq!(
-        check.answer(Some((200, MISSING_U))),
-        Trust::RequiresCredentials
-    );
-    for response in [OK, OK_WITH_VERSION, ALICE, REFUSED, REFUSED_WITH_VERSION] {
-        assert_eq!(probe(Some((200, response))), Trust::AcceptsHeader);
+fn a_stream_classifies_a_complete_refusal_apart_from_other_failures() {
+    assert_eq!(classify_start(200, REFUSED, true), ReplyStart::Refused);
+    assert_eq!(classify_start(200, REFUSED, false), ReplyStart::Other);
+    assert_eq!(classify_start(401, REFUSED, true), ReplyStart::Other);
+    assert_eq!(classify_start(200, FORBIDDEN, true), ReplyStart::NotAllowed);
+    assert_eq!(classify_start(403, b"", false), ReplyStart::NotAllowed);
+    for status in [429, 503] {
+        assert_eq!(classify_start(status, b"<html>", false), ReplyStart::Busy);
     }
-    for response in [
-        MISSING_C,
-        MISSING_V,
-        FORBIDDEN,
-        SONG,
-        SONG_MISSING,
-        XML_MISSING_U,
+    assert_eq!(
+        classify_start(416, b"", false),
+        ReplyStart::RangeUnavailable
+    );
+    for (status, prefix) in [
+        (200, XML_REFUSED),
+        (200, b"ID3"),
+        (206, b"ID3"),
+        (502, b"<html>"),
     ] {
-        assert_eq!(probe(Some((200, response))), Trust::Unknown);
+        assert_eq!(classify_start(status, prefix, true), ReplyStart::Other);
     }
-    assert_eq!(probe(None), Trust::Unknown);
-    assert_eq!(probe(Some((302, MISSING_U))), Trust::Unknown);
-    let pair = pair();
-    assert_eq!(
-        Ping::new("Alice", &pair, Trust::Unknown).err(),
-        Some(Outcome::CouldNotAsk)
-    );
-    assert_eq!(
-        Ping::new("Alice", &pair, Trust::AcceptsHeader).err(),
-        Some(Outcome::UntrustedCheck)
-    );
 }
 
 #[test]
 fn all_measured_e3_replies_are_classified_in_their_request_context() {
     for (reply, name) in [(ALICE, "Alice"), (BOB, "bob smith"), (ADMIN, "Exp-Admin")] {
-        assert_eq!(outcome(OK_WITH_VERSION, reply, name), Outcome::Verified);
-        assert_eq!(outcome(OK, reply, name), Outcome::Verified);
-        assert_eq!(outcome(reply, ALICE, "Alice"), Outcome::CouldNotAsk);
+        assert_eq!(outcome(OK_WITH_VERSION, reply, name), Ok(()));
+        assert_eq!(outcome(OK, reply, name), Ok(()));
+        assert_eq!(outcome(reply, ALICE, "Alice"), Err(Outcome::CouldNotAsk));
     }
     for response in [REFUSED, REFUSED_WITH_VERSION] {
         // E3.2 and E3.4 measured the same code for bad credentials and lockout.
-        assert_eq!(outcome(response, ALICE, "Alice"), Outcome::Refused);
-        assert_eq!(outcome(OK, response, "Alice"), Outcome::Refused);
+        assert_eq!(outcome(response, ALICE, "Alice"), Err(Outcome::Refused));
+        assert_eq!(outcome(OK, response, "Alice"), Err(Outcome::Refused));
     }
     for response in [
         MISSING_C,
@@ -145,13 +126,16 @@ fn all_measured_e3_replies_are_classified_in_their_request_context() {
         XML_OK,
         XML_REFUSED,
     ] {
-        assert_eq!(outcome(response, ALICE, "Alice"), Outcome::CouldNotAsk);
-        assert_eq!(outcome(OK, response, "Alice"), Outcome::CouldNotAsk);
+        assert_eq!(outcome(response, ALICE, "Alice"), Err(Outcome::CouldNotAsk));
+        assert_eq!(outcome(OK, response, "Alice"), Err(Outcome::CouldNotAsk));
     }
-    assert_eq!(outcome(OK, OK_WITH_VERSION, "Alice"), Outcome::CouldNotAsk);
+    assert_eq!(
+        outcome(OK, OK_WITH_VERSION, "Alice"),
+        Err(Outcome::CouldNotAsk)
+    );
     for name in ["alice", "ALICE", "Alice ", "Bob Smith", "bob  smith"] {
-        assert_eq!(outcome(OK, ALICE, name), Outcome::CouldNotAsk);
-        assert_eq!(outcome(OK, BOB, name), Outcome::CouldNotAsk);
+        assert_eq!(outcome(OK, ALICE, name), Err(Outcome::CouldNotAsk));
+        assert_eq!(outcome(OK, BOB, name), Err(Outcome::CouldNotAsk));
     }
 }
 
@@ -184,36 +168,83 @@ fn malformed_ambiguous_oversized_or_incomplete_envelopes_never_authenticate() {
         &oversized,
         deep.as_bytes(),
     ] {
-        assert_eq!(outcome(body, ALICE, "Alice"), Outcome::CouldNotAsk);
-        assert_eq!(outcome(OK, body, "Alice"), Outcome::CouldNotAsk);
+        assert_eq!(outcome(body, ALICE, "Alice"), Err(Outcome::CouldNotAsk));
+        assert_eq!(outcome(OK, body, "Alice"), Err(Outcome::CouldNotAsk));
     }
-    let pair = pair();
     for status in [201, 302, 400, 401, 429, 500] {
+        assert_eq!(ping_answer(Some((status, OK))), Err(Outcome::CouldNotAsk));
         assert_eq!(
-            ping("Alice", &pair).answer(Some((status, OK))).err(),
-            Some(Outcome::CouldNotAsk)
+            user_answer(Some((status, ALICE)), "Alice"),
+            Err(Outcome::CouldNotAsk)
         );
-        let get = ping("Alice", &pair).answer(Some((200, OK))).ok().unwrap();
-        assert_eq!(get.answer(Some((status, ALICE))), Outcome::CouldNotAsk);
     }
-    assert_eq!(
-        ping("Alice", &pair).answer(None).err(),
-        Some(Outcome::CouldNotAsk)
-    );
-    let get = ping("Alice", &pair).answer(Some((200, OK))).ok().unwrap();
-    assert_eq!(get.answer(None), Outcome::CouldNotAsk);
+    assert_eq!(ping_answer(None), Err(Outcome::CouldNotAsk));
+    assert_eq!(user_answer(None, "Alice"), Err(Outcome::CouldNotAsk));
 }
 
 #[test]
 fn secrets_and_secret_bearing_forms_have_redacted_debug() {
     let pair = pair();
-    let proof = TrustProbe::from_random([42; SALT_BYTES]);
-    let post = ping("Alice", &pair).post();
-    let text = format!(
-        "{:?} {pair:?} {proof:?} {post:?}",
-        Salt::from_random([43; SALT_BYTES])
-    );
-    for secret in [pair.salt(), pair.token(), proof.header_value(), post.form()] {
+    let post = login_post("https://music.example.test", "Alice", &pair, false);
+    let text = format!("{:?} {pair:?} {post:?}", pair.salt());
+    for secret in [
+        pair.salt().as_str(),
+        &*pair.token().expose_hex(),
+        post.form(),
+    ] {
         assert!(!text.contains(secret));
     }
+}
+
+#[test]
+fn a_sealed_password_opens_only_under_every_part_of_its_current_binding() {
+    let key = SealingKey::new([7; 32]);
+    let bind = CredentialBinding {
+        backend: BackendId::from_bytes([1; 16]),
+        account: AccountId::new(2).unwrap(),
+        address: MusicAddress::new("https://music.example.test").unwrap(),
+        name: Name::new("Alice").unwrap(),
+        count: 4,
+    };
+    let password = b"Example password";
+    let sealed = key.seal(&bind, password, [5; NONCE_BYTES]).unwrap();
+    assert_eq!(&*key.open(&bind, &sealed).unwrap(), password);
+    let decoded = SealedCredential::from_bytes(sealed.as_bytes()).unwrap();
+    assert_eq!(decoded, sealed);
+    for moved in [
+        CredentialBinding {
+            backend: BackendId::from_bytes([2; 16]),
+            ..bind.clone()
+        },
+        CredentialBinding {
+            account: AccountId::new(3).unwrap(),
+            ..bind.clone()
+        },
+        CredentialBinding {
+            address: MusicAddress::new("https://other.example.test").unwrap(),
+            ..bind.clone()
+        },
+        CredentialBinding {
+            name: Name::new("Bob").unwrap(),
+            ..bind.clone()
+        },
+        CredentialBinding {
+            count: 5,
+            ..bind.clone()
+        },
+    ] {
+        assert!(key.open(&moved, &sealed).is_none());
+    }
+    let mut tampered = sealed.as_bytes().to_vec();
+    *tampered.last_mut().unwrap() ^= 1;
+    assert!(
+        key.open(&bind, &SealedCredential::from_bytes(&tampered).unwrap())
+            .is_none()
+    );
+    assert!(SealedCredential::from_bytes(&[0; NONCE_BYTES]).is_none());
+    assert!(key.seal(&bind, b"", [6; NONCE_BYTES]).is_none());
+    assert_eq!(
+        format!("{key:?} {sealed:?}"),
+        "SealingKey(..) SealedCredential(..)"
+    );
 }

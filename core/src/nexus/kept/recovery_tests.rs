@@ -439,8 +439,7 @@ fn password_fence_lands_first_and_blocks_an_interrupted_password_write() -> Resu
 }
 
 #[test]
-fn managed_rotation_is_persisted_with_force_out_and_advances_the_count_on_replacement()
--> Result<(), Denied> {
+fn managed_force_out_records_rotation_without_advancing_the_count() -> Result<(), Denied> {
     let mut person = state("alice@example.test");
     person.music_managed = true;
     let mut s = Stored::new(person);
@@ -456,13 +455,8 @@ fn managed_rotation_is_persisted_with_force_out_and_advances_the_count_on_replac
         s.apart.account.music_recovery,
         Some(MusicRecovery::RotateManaged)
     );
-    assert_eq!(s.step(2, |turn| turn.music_replaced(1)), Ok(2));
-    assert_eq!(
-        s.step(2, |turn| turn.music_replaced(1)),
-        Err(Denied::WrongPurpose)
-    );
-    s.reload();
-    assert_eq!(s.sign_in(9, 2, 3, 2)?.music_login, 2);
+    assert_eq!(s.apart.account.music_login, 1);
+    assert_eq!(s.sign_in(9, 2, 3, 2)?.music_login, 1);
     Ok(())
 }
 
@@ -707,5 +701,179 @@ fn adoption_requires_reset_and_a_newer_stamp_cannot_change_the_account_life() ->
         assert!(!user.apart.account.history_held);
         assert_eq!(user.apart.account.life, current.life);
     }
+    Ok(())
+}
+
+#[test]
+fn provisioning_requires_the_grant_both_exact_logins_and_current_authority() -> Result<(), Denied> {
+    use crate::nexus::{
+        account::{MusicAddress, MusicSalt, Name, SALT_BYTES},
+        music::{
+            Checked, CurrentEndpoints, Outcome, Ping, Provisioning, SealingKey, VerifiedLogin,
+        },
+    };
+    const PRIVATE: &str = "http://navidrome.example.test:4533";
+    let public = MusicAddress::new("https://music.example.test").unwrap();
+    let key = SealingKey::new([8; 32]);
+    let mut admin = Stored::admin()?;
+    let mut alice = Stored::new(state("alice@example.test"));
+    let mut bob = Stored::new(state("bob@example.test"));
+    let actor = hash(7);
+    let target = AdminTarget::Account(alice.apart.account.id);
+    let action = AdminAction::MusicLoginChanged;
+    assert_eq!(
+        admin
+            .step(1, |t| t
+                .authorize_music(bearer(1, &actor), Some(&alice.account)))
+            .err(),
+        Some(Denied::LeaveRequired)
+    );
+    admin.leave(1, 7, LeaveFor::Admin { action, target }, 2)?;
+    assert_eq!(
+        admin
+            .step(2, |t| t
+                .authorize_music(bearer(1, &actor), Some(&bob.account)))
+            .err(),
+        Some(Denied::LeaveRequired)
+    );
+
+    let checked = |admin: &mut Stored,
+                   alice: &Stored,
+                   n: u8,
+                   public_name: &[u8]|
+     -> Result<VerifiedLogin, Outcome> {
+        admin
+            .leave(1, 7, LeaveFor::Admin { action, target }, u64::from(n))
+            .unwrap();
+        let auth = admin
+            .step(u64::from(n), |t| {
+                t.authorize_music(bearer(1, &actor), Some(&alice.account))
+            })
+            .unwrap();
+        let input = Provisioning {
+            internal: PRIVATE,
+            public: public.clone(),
+            name: Name::new("Alice").unwrap(),
+            password: b"Example password",
+            salt: MusicSalt::from_random([n; SALT_BYTES]),
+            nonce: [n; 24],
+        };
+        let ping = Ping::provision(auth, input, &key)?;
+        assert_eq!(ping.post().address(), PRIVATE);
+        let first_form = ping.post().form().to_owned();
+        let ok = br#"{"subsonic-response":{"status":"ok"}}"#;
+        let person = br#"{"subsonic-response":{"status":"ok","user":{"username":"Alice"}}}"#;
+        let user = ping.answer(Some((200, ok)))?;
+        assert_eq!(user.post().path(), "/rest/getUser");
+        let Checked::Public(ping) = user.answer(Some((200, person)))? else {
+            panic!("public login wasn't checked")
+        };
+        assert_eq!(ping.post().address(), public.as_str());
+        assert_eq!(ping.post().form(), first_form);
+        let Checked::Verified(result) = ping
+            .answer(Some((200, ok)))?
+            .answer(Some((200, public_name)))?
+        else {
+            panic!("public login wasn't verified")
+        };
+        Ok(result)
+    };
+
+    let other = br#"{"subsonic-response":{"status":"ok","user":{"username":"Bob"}}}"#;
+    let exact = br#"{"subsonic-response":{"status":"ok","user":{"username":"Alice"}}}"#;
+    assert_eq!(
+        checked(&mut admin, &alice, 3, other).err(),
+        Some(Outcome::CouldNotAsk)
+    );
+    assert_eq!(alice.apart.account.music_login, 1);
+
+    let replaced = checked(&mut admin, &alice, 4, exact).ok().unwrap();
+    assert_eq!(
+        admin.step(4, |t| t.install_music(
+            bearer(1, &actor),
+            replaced,
+            CurrentEndpoints {
+                internal: PRIVATE,
+                public: &public
+            },
+            Some(&mut bob.account)
+        )),
+        Err(Denied::WrongPurpose)
+    );
+
+    let wrong_address = MusicAddress::new("https://changed.example.test").unwrap();
+    let replaced = checked(&mut admin, &alice, 5, exact).ok().unwrap();
+    assert_eq!(
+        admin.step(5, |t| t.install_music(
+            bearer(1, &actor),
+            replaced,
+            CurrentEndpoints {
+                internal: PRIVATE,
+                public: &wrong_address
+            },
+            Some(&mut alice.account)
+        )),
+        Err(Denied::WrongPurpose)
+    );
+
+    let replaced = checked(&mut admin, &alice, 6, exact).ok().unwrap();
+    let stale_count = checked(&mut admin, &alice, 7, exact).ok().unwrap();
+    admin
+        .account
+        .request(1, clock(7, 7), |t| {
+            t.install_music(
+                bearer(1, &actor),
+                replaced,
+                CurrentEndpoints {
+                    internal: PRIVATE,
+                    public: &public,
+                },
+                Some(&mut alice.account),
+            )
+        })
+        .apply(|effects| {
+            let update = effects
+                .updates
+                .iter()
+                .find(|u| u.data.account.id == alice.apart.account.id)
+                .unwrap();
+            let DataChange::InstallMusicLogin(login) = &update.change else {
+                panic!("no sealed login effect")
+            };
+            assert_eq!(login.binding.count, update.data.account.music_login);
+            assert_eq!(
+                &*key.open(&login.binding, &login.sealed).unwrap(),
+                b"Example password"
+            );
+            assert_eq!(update.data.account.music_login, 2);
+            Ok::<_, Denied>(())
+        })??;
+    assert_eq!(
+        admin.step(7, |t| t.install_music(
+            bearer(1, &actor),
+            stale_count,
+            CurrentEndpoints {
+                internal: PRIVATE,
+                public: &public
+            },
+            Some(&mut alice.account)
+        )),
+        Err(Denied::WrongPurpose)
+    );
+
+    let replaced = checked(&mut admin, &alice, 8, exact).ok().unwrap();
+    admin.step(8, |t| t.sign_out(bearer(1, &actor)))?;
+    assert_eq!(
+        admin.step(8, |t| t.install_music(
+            bearer(1, &actor),
+            replaced,
+            CurrentEndpoints {
+                internal: PRIVATE,
+                public: &public
+            },
+            Some(&mut alice.account)
+        )),
+        Err(Denied::NotSignedIn)
+    );
     Ok(())
 }
