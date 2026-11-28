@@ -1,7 +1,8 @@
-//! The store kept apart (design 8, 9.2): one small file, `NEXUS_STATE/kept`, beside the
+//! The store kept apart (design 11, 12.3): one small file, `NEXUS_STATE/kept`, beside the
 //! backend's id. **What must not go backwards when the data does**: the restore number, the
-//! key answers are stamped with, the latest time the backend has acted at, each account's
-//! life and whether it is held, and each device's numbers and the sessions it may use.
+//! key that seals, the key answers are stamped with, the latest time the backend has acted
+//! at; for each account its life, whether it is held, deleted or switched off, and how many
+//! times its password has changed; and each device's numbers and the sessions it may use.
 //!
 //! - **Written whole, every time**: to a file of its own, made lasting, then renamed over
 //!   the last, and the folder made lasting. A cut leaves the old store or the new, never a
@@ -31,7 +32,7 @@ pub const FILE: &str = "kept";
 /// Where a write is made before it is renamed into place.
 const STAGING: &str = "kept.new-";
 /// The first line: what this file is, and the form it is written in.
-const HEAD: &str = "nexus-music-server store kept apart 1";
+const HEAD: &str = "nexus-music-server store kept apart 2";
 /// The most the file may be. A device takes about 100 bytes, an account 120.
 const FILE_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -51,6 +52,9 @@ pub struct Store {
     /// (C3's `Clock::high_water`).
     pub high_water: u64,
     key: [u8; SECRET_BYTES],
+    /// The key that seals what the data keeps sealed (a music-server password, 9.3). Never
+    /// in the data, so that a copy of the data alone opens nothing.
+    seal: [u8; SECRET_BYTES],
     /// Whether the data has been made for this store. Until then a store with no data is a
     /// first start cut short, not data lost.
     pub data_made: bool,
@@ -88,12 +92,13 @@ pub fn name_fingerprint(name: &str) -> [u8; 32] {
 
 impl Store {
     /// A new store, for a backend with no data yet.
-    pub fn new(backend: BackendId, key: [u8; SECRET_BYTES], high_water: u64) -> Self {
+    pub fn new(backend: BackendId, key: [u8; SECRET_BYTES], seal: [u8; SECRET_BYTES], high_water: u64) -> Self {
         Store {
             backend,
             restore: 0,
             high_water,
             key,
+            seal,
             data_made: false,
             next_account: 1,
             next_device: 1,
@@ -108,6 +113,11 @@ impl Store {
         StampKey::new(self.key)
     }
 
+    /// The key that seals (9.3). Its bytes are the caller's to wipe once used.
+    pub fn seal_key(&self) -> [u8; SECRET_BYTES] {
+        self.seal
+    }
+
     /// What `compare` reads.
     pub fn view(&self) -> StoreView {
         StoreView {
@@ -118,10 +128,10 @@ impl Store {
         }
     }
 
-    /// The account with this name's fingerprint, if the store has ever had it.
+    /// The account with this name's fingerprint that is not deleted, if the store has one.
     pub fn account_named(&self, name: &str) -> Option<u64> {
         let print = name_fingerprint(name);
-        self.accounts.iter().find(|(_, account)| account.name == print).map(|(&number, _)| number)
+        self.accounts.iter().find(|(_, account)| account.name == print && !account.kept.deleted).map(|(&number, _)| number)
     }
 
     fn to_text(&self) -> String {
@@ -135,16 +145,20 @@ impl Store {
         line(format!("restore {}", self.restore));
         line(format!("high-water {}", self.high_water));
         line(format!("key {}", hex(&self.key)));
+        line(format!("seal {}", hex(&self.seal)));
         line(format!("data-made {}", u8::from(self.data_made)));
         line(format!("next-account {}", self.next_account));
         line(format!("next-device {}", self.next_device));
         for (number, account) in &self.accounts {
             line(format!(
-                "account {number} name {} life {} held {} present {}",
+                "account {number} name {} life {} held {} present {} deleted {} off {} passwords {}",
                 hex(&account.name),
                 account.kept.life,
                 optional(account.kept.held),
-                u8::from(account.kept.present)
+                u8::from(account.kept.present),
+                u8::from(account.kept.deleted),
+                u8::from(account.kept.off),
+                account.kept.passwords
             ));
         }
         for (id, device) in &self.devices {
@@ -163,6 +177,7 @@ impl Store {
         line(match self.pending {
             None => "pending none".to_string(),
             Some(Pending::MakeAccount { account }) => format!("pending make-account {account}"),
+            Some(Pending::Account { account }) => format!("pending account {account}"),
             Some(Pending::MakeDevice { device }) => format!("pending make-device {device}"),
             Some(Pending::Update { device, account, family }) => format!("pending update {device} {account} {}", family_word(family)),
             Some(Pending::Remove { device }) => format!("pending remove {device}"),
@@ -190,16 +205,29 @@ impl Store {
         let restore = number(field(next()?, "restore")?)?;
         let high_water = number(field(next()?, "high-water")?)?;
         let key = unhex(field(next()?, "key")?)?;
+        let seal = unhex(field(next()?, "seal")?)?;
         let data_made = flag(field(next()?, "data-made")?)?;
         let next_account = number(field(next()?, "next-account")?)?;
         let next_device = number(field(next()?, "next-device")?)?;
-        let mut store = Store { backend, restore, high_water, key, data_made, next_account, next_device, ..Store::new(backend, key, 0) };
+        let mut store = Store { backend, restore, high_water, key, data_made, next_account, next_device, seal, ..Store::new(backend, key, seal, 0) };
         let mut line = next()?;
         while let Some(rest) = line.strip_prefix("account ") {
             let words: Vec<&str> = rest.split(' ').collect();
-            let [n, "name", name, "life", life, "held", held, "present", present] = words.as_slice() else { return None };
+            let [n, "name", name, "life", life, "held", held, "present", present, "deleted", deleted, "off", off, "passwords", passwords] = words.as_slice() else {
+                return None;
+            };
             let n = number(n)?;
-            let account = Account { name: unhex(name)?, kept: StoreAccount { life: number(life)?, held: unoptional(held)?, present: flag(present)? } };
+            let account = Account {
+                name: unhex(name)?,
+                kept: StoreAccount {
+                    life: number(life)?,
+                    held: unoptional(held)?,
+                    present: flag(present)?,
+                    deleted: flag(deleted)?,
+                    off: flag(off)?,
+                    passwords: number(passwords)?,
+                },
+            };
             if n == 0 || n >= store.next_account || store.accounts.insert(n, account).is_some() {
                 return None;
             }
@@ -232,6 +260,7 @@ impl Store {
         store.pending = match words.as_slice() {
             ["pending", "none"] => None,
             ["pending", "make-account", account] => Some(Pending::MakeAccount { account: number(account)? }),
+            ["pending", "account", account] => Some(Pending::Account { account: number(account)? }),
             ["pending", "make-device", device] => Some(Pending::MakeDevice { device: number(device)? }),
             ["pending", "update", device, account, family] => {
                 Some(Pending::Update { device: number(device)?, account: number(account)?, family: unfamily(family)? })
@@ -425,13 +454,13 @@ mod tests {
     }
 
     fn full() -> Store {
-        let mut store = Store::new(BackendId::from_bytes([5; 16]), [9; 32], 1234);
+        let mut store = Store::new(BackendId::from_bytes([5; 16]), [9; 32], [8; 32], 1234);
         store.restore = 3;
         store.data_made = true;
         store.next_account = 3;
         store.next_device = 8;
-        store.accounts.insert(1, Account { name: name_fingerprint("alice"), kept: StoreAccount { life: 2, held: Some(2), present: true } });
-        store.accounts.insert(2, Account { name: name_fingerprint("bob"), kept: StoreAccount { life: 0, held: None, present: false } });
+        store.accounts.insert(1, Account { name: name_fingerprint("alice"), kept: StoreAccount { life: 2, held: Some(2), present: true, deleted: false, off: true, passwords: 3 } });
+        store.accounts.insert(2, Account { name: name_fingerprint("bob"), kept: StoreAccount { life: 0, held: None, present: false, deleted: true, off: false, passwords: 0 } });
         store.devices.insert(
             7,
             StoreDevice {
@@ -458,6 +487,7 @@ mod tests {
             None,
             Some(Pending::MakeAccount { account: 1 }),
             Some(Pending::MakeDevice { device: 7 }),
+            Some(Pending::Account { account: 2 }),
             Some(Pending::Update { device: 7, account: 1, family: None }),
             Some(Pending::Update { device: 7, account: 1, family: Some(Family::Device) }),
             Some(Pending::Update { device: 7, account: 1, family: Some(Family::Backend) }),
@@ -527,7 +557,7 @@ mod tests {
     #[test]
     fn its_debug_says_nothing_of_the_key_or_a_name() {
         let shown = format!("{:?}", full());
-        assert!(!shown.contains("0909") && !shown.contains(&hex(&name_fingerprint("alice"))), "{shown}");
+        assert!(!shown.contains("0909") && !shown.contains("0808") && !shown.contains(&hex(&name_fingerprint("alice"))), "{shown}");
     }
 
     #[test]

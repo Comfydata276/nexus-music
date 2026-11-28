@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use nexus_core::nexus::kept::{Access, Denied, Device, Fingerprint, Purpose, SECRET_BYTES, Turn};
 use nexus_music_server::identity;
 use nexus_music_server::store::data::{self, Data, Migration, Opened};
-use nexus_music_server::store::keeper::{self, Failed, Keeper, Started};
+use nexus_music_server::store::keeper::{self, AccountChange, Failed, Keeper, Started};
 use nexus_music_server::store::{apart, copies, crash};
 
 /// A made-up time, in milliseconds.
@@ -116,7 +116,7 @@ fn decide<T>(keeper: &mut Keeper, device: &mut Device, id: u64, now: u64, action
 }
 
 fn name(account: u64) -> &'static str {
-    if account == ALICE { "alice" } else { "bob" }
+    if account == ALICE { "alice@example.org" } else { "bob@example.org" }
 }
 
 fn connect(keeper: &mut Keeper, id: u64, account: u64, session: u8, now: u64) -> Result<Device, Failed> {
@@ -154,13 +154,13 @@ fn account_of(keeper: &Keeper, name: &str) -> u64 {
 /// Alice, with her PC (1 working, 2 waiting) and her phone (3); Bob, with his PC (5).
 fn world(root: &Root) {
     let mut keeper = opened(root, T0);
-    assert_eq!(keeper.account("alice", T0).unwrap().number, ALICE);
+    assert_eq!(keeper.account("alice@example.org", "Alice", false, T0).unwrap().number, ALICE);
     assert_eq!(keeper.device(ALICE, &hash(11), "a made-up PC", "pc", "0.41.0", T0).unwrap(), (A1, true));
     connect(&mut keeper, A1, ALICE, 1, T0).unwrap();
     again(&mut keeper, A1, ALICE, 1, 2, T0 + 1).unwrap();
     assert_eq!(keeper.device(ALICE, &hash(12), "a made-up phone", "phone", "0.41.0", T0).unwrap(), (A2, true));
     connect(&mut keeper, A2, ALICE, 3, T0 + 2).unwrap();
-    assert_eq!(keeper.account("bob", T0).unwrap().number, BOB);
+    assert_eq!(keeper.account("bob@example.org", "Bob", false, T0).unwrap().number, BOB);
     assert_eq!(keeper.device(BOB, &hash(21), "another made-up PC", "pc", "0.41.0", T0).unwrap(), (B1, true));
     connect(&mut keeper, B1, BOB, 5, T0 + 3).unwrap();
     for (id, session) in [(A1, 1), (A1, 2), (A2, 3), (B1, 5)] {
@@ -215,7 +215,7 @@ fn run(scenario: &str, root: &Root) -> Result<(), String> {
     let now = T0 + 10 * MINUTE;
     match scenario {
         "first start" => Keeper::open(&root.state(), &root.data(), now).map(|(keeper, _)| keeper.close()).map_err(|why| why.0),
-        "an account made" => opened(root, now).account("carol", now).map(|_| ()).map_err(failed),
+        "an account made" => opened(root, now).account("carol@example.org", "Carol", false, now).map(|_| ()).map_err(failed),
         "a device made" => opened(root, now).device(ALICE, &hash(13), "a made-up tablet", "phone", "0.41.0", now).map(|_| ()).map_err(failed),
         "a device connecting" => connect(&mut opened(root, now), A2, ALICE, 7, now).map(|_| ()).map_err(failed),
         "proving again" => again(&mut opened(root, now), A2, ALICE, 3, 4, now).map_err(failed),
@@ -235,6 +235,11 @@ fn run(scenario: &str, root: &Root) -> Result<(), String> {
             decide(&mut keeper, &mut device, A1, now, |turn| turn.delete(&hash(1))).map_err(failed)?.map_err(|why| format!("{why:?}"))
         }
         "a device removed" => opened(root, now).remove_device(A2).map_err(failed),
+        "an account switched off" => opened(root, now).change_account(ALICE, AccountChange::SwitchOff, None, now).map_err(failed),
+        "an account switched on" => opened(root, now).change_account(ALICE, AccountChange::SwitchOn, None, now).map_err(failed),
+        "an account deleted" => opened(root, now).change_account(ALICE, AccountChange::Delete, None, now).map_err(failed),
+        "a password changed" => opened(root, now).change_account(ALICE, AccountChange::Password(Some(&password(7))), Some(A1), now).map_err(failed),
+        "a password reset" => opened(root, now).change_account(ALICE, AccountChange::Password(None), None, now).map_err(failed),
         "a held history kept" => opened(root, now).keep_held(ALICE).map_err(failed),
         "an older copy found at a start" => Keeper::open(&root.state(), &root.data(), now).map(|(keeper, _)| keeper.close()).map_err(|why| why.0),
         "put-back" => keeper::put_back(&root.state(), &root.data(), &the_copy(root), now).map(|_| ()).map_err(|why| why.0),
@@ -243,6 +248,21 @@ fn run(scenario: &str, root: &Root) -> Result<(), String> {
         "a change of form" => Data::open_with(&root.data(), now, &[data::MIGRATIONS[0], FORM_2]).map(|_| ()),
         other => Err(format!("no scenario {other}")),
     }
+}
+
+/// A made-up password, as kept.
+fn password(n: u8) -> data::Password {
+    data::Password { hash: [n; 32], salt: [n; 16], memory: 19 * 1024, passes: 2, lanes: 1 }
+}
+
+/// What the data says of an account: switched on, its password's first byte, its count.
+fn account_row(keeper: &Keeper, number: u64) -> Option<(bool, Option<u8>, u64)> {
+    let connection = keeper.data().connection();
+    let row = connection
+        .query_row("SELECT switched_on, passwords FROM accounts WHERE number = ?1", [number as i64], |row| Ok((row.get::<_, i64>(0)? == 1, row.get::<_, i64>(1)? as u64)))
+        .ok()?;
+    let first = keeper.data().password(number).unwrap().map(|password| password.hash[0]);
+    Some((row.0, first, row.1))
 }
 
 /// The first nightly copy there is: the one a put-back scenario puts back.
@@ -345,12 +365,12 @@ fn making_an_account_or_a_device_cut_at_any_point_leaves_it_made_or_not_and_neve
     world(&setup);
     at_every_point("an account made", &setup, |root, cut| {
         let (mut keeper, _) = settled(root, T0 + 20 * MINUTE);
-        let carol = keeper.data().account_named("carol").unwrap();
+        let carol = keeper.data().account_named("carol@example.org").unwrap();
         if cut.whole() {
             assert!(carol.is_some());
         }
         // Made again (or found), it is one account, with the number the store gave first.
-        let again = keeper.account("carol", T0 + 21 * MINUTE).unwrap();
+        let again = keeper.account("carol@example.org", "Carol", false, T0 + 21 * MINUTE).unwrap();
         assert_eq!(again.number, 3);
         assert_eq!(readers(&mut keeper, T0 + 21 * MINUTE), [1, 2, 3, 5]);
     });
@@ -445,16 +465,14 @@ fn a_deletion_cut_at_any_point_is_whole_once_the_store_has_it() {
     at_every_point("an account's history deleted", &setup, |root, cut| {
         let (mut keeper, _) = settled(root, T0 + 15 * MINUTE);
         let read = readers(&mut keeper, T0 + 16 * MINUTE);
-        let alice = keeper.data().account_named("alice").unwrap();
+        let alice = keeper.data().account_named("alice@example.org").unwrap();
         if cut.took() || cut.whole() {
-            // 11.1: the life moved first; then everything of the account went, in one step,
-            // or (cut before) it went at this start.
-            assert_eq!(alice, None, "at {}", cut.at);
+            // 12.5: the life moved first, in the store; then, in one step in the data, what
+            // was hers under the earlier life went (or, cut before, at this start). The
+            // account stays, and (C3 at 325c83a) every device of it is ended.
+            assert_eq!(alice, Some((ALICE, 1)), "at {}", cut.at);
             assert_eq!(read, [5], "at {}", cut.at);
-            // She connects again: the same number, the next life, nothing of before.
-            let again = keeper.account("alice", T0 + 16 * MINUTE).unwrap();
-            assert_eq!((again.number, again.life, again.held), (ALICE, 1, false));
-            assert_eq!(keeper.data().device_with_secret(ALICE, &hash(11)).unwrap(), None);
+            assert!(!keeper.held(ALICE));
         } else {
             assert_eq!(alice, Some((ALICE, 0)), "at {}", cut.at);
             assert_eq!(read, [1, 2, 3, 5], "at {}", cut.at);
@@ -497,7 +515,7 @@ fn keeping_a_held_history_cut_at_any_point_leaves_it_held_or_kept() {
     opened(&setup, T0 + 10 * MINUTE).close();
     at_every_point("a held history kept", &setup, |root, cut| {
         let (keeper, _) = settled(root, T0 + 20 * MINUTE);
-        let life = keeper.data().account_named("alice").unwrap().map(|(_, life)| life);
+        let life = keeper.data().account_named("alice@example.org").unwrap().map(|(_, life)| life);
         if cut.whole() {
             assert_eq!((keeper.held(ALICE), life), (false, Some(1)));
         } else {
@@ -604,6 +622,106 @@ fn a_change_of_form_cut_at_any_point_leaves_the_old_form_or_the_new_with_a_copy_
     });
 }
 
+#[test]
+fn a_change_to_a_whole_account_cut_at_any_point_holds_once_the_store_has_it() {
+    let setup = Root::new("account-changes");
+    world(&setup);
+    {
+        // Alice has a password, and a one-time code waiting.
+        let mut keeper = opened(&setup, T0 + 5 * MINUTE);
+        keeper.change_account(ALICE, AccountChange::Password(Some(&password(3))), Some(A1), T0 + 5 * MINUTE).unwrap();
+        keeper.data().connection().execute("INSERT INTO codes (account, code, made_at, until) VALUES (1, ?1, 0, 1)", [[9u8; 32].as_slice()]).unwrap();
+        keeper.close();
+    }
+    let codes = |keeper: &Keeper| -> i64 { keeper.data().connection().query_row("SELECT count(*) FROM codes", [], |row| row.get(0)).unwrap() };
+    for scenario in ["an account switched off", "an account deleted", "a password changed", "a password reset"] {
+        at_every_point(scenario, &setup, |root, cut| {
+            let (mut keeper, _) = settled(root, T0 + 20 * MINUTE);
+            let read = readers(&mut keeper, T0 + 21 * MINUTE);
+            let row = account_row(&keeper, ALICE);
+            let done = cut.took() || cut.whole();
+            match scenario {
+                "an account switched off" if done => assert_eq!((row.map(|r| r.0), read.clone()), (Some(false), vec![5]), "{scenario} at {}", cut.at),
+                "an account deleted" if done => {
+                    assert_eq!((row, read.clone()), (None, vec![5]), "{scenario} at {}", cut.at);
+                    assert!(keeper.load(A1).is_err());
+                }
+                // Changed on her PC: her other devices are signed out; the new password, or
+                // (cut before the data had it) none, waiting for the admin to reset it.
+                "a password changed" if done => {
+                    let (_, first, count) = row.unwrap();
+                    assert_eq!(count, 2, "{scenario} at {}", cut.at);
+                    assert!(first == Some(7) || first.is_none(), "{scenario} at {}: {first:?}", cut.at);
+                    assert!(!read.contains(&3) && read.contains(&5), "{scenario} at {}: {read:?}", cut.at);
+                    assert_eq!(codes(&keeper), 0);
+                }
+                "a password reset" if done => {
+                    assert_eq!(row.map(|r| (r.1, r.2)), Some((None, 2)), "{scenario} at {}", cut.at);
+                    assert_eq!(read, [5], "{scenario} at {}", cut.at);
+                    assert_eq!(codes(&keeper), 0);
+                }
+                _ => {
+                    assert_eq!(row, Some((true, Some(3), 1)), "{scenario} at {}", cut.at);
+                    assert_eq!(read, [1, 2, 5], "{scenario} at {}", cut.at);
+                }
+            }
+        });
+    }
+    // Switched on again: it gives leave, so it is on only once the store has heard.
+    let off = setup.copied("account-off");
+    {
+        let mut keeper = opened(&off, T0 + 6 * MINUTE);
+        keeper.change_account(ALICE, AccountChange::SwitchOff, None, T0 + 6 * MINUTE).unwrap();
+        keeper.close();
+    }
+    at_every_point("an account switched on", &off, |root, cut| {
+        let (keeper, _) = settled(root, T0 + 20 * MINUTE);
+        let on = account_row(&keeper, ALICE).unwrap().0;
+        assert_eq!(on, cut.gave() || cut.whole(), "at {}", cut.at);
+    });
+}
+
+#[test]
+fn an_account_deleted_switched_off_or_its_password_changed_then_the_data_put_back_is_taken_away_again() {
+    for change in ["deleted", "switched off", "password changed", "password reset", "code spent"] {
+        let root = Root::new(&format!("put-back-{}", change.replace(' ', "-")));
+        world(&root);
+        let mut keeper = opened(&root, T0 + 5 * MINUTE);
+        keeper.change_account(ALICE, AccountChange::Password(Some(&password(3))), Some(A1), T0 + 5 * MINUTE).unwrap();
+        keeper.data().connection().execute("INSERT INTO codes (account, code, made_at, until) VALUES (1, ?1, 0, 1)", [[9u8; 32].as_slice()]).unwrap();
+        // Copied by hand while open, with its -wal.
+        let copy = snapshot(&root, &["nexus.db", "nexus.db-wal", "nexus.db-shm"]);
+        let at = T0 + 6 * MINUTE;
+        match change {
+            "deleted" => keeper.change_account(ALICE, AccountChange::Delete, None, at),
+            "switched off" => keeper.change_account(ALICE, AccountChange::SwitchOff, None, at),
+            "password changed" => keeper.change_account(ALICE, AccountChange::Password(Some(&password(4))), Some(A1), at),
+            "password reset" => keeper.change_account(ALICE, AccountChange::Password(None), None, at),
+            // The code used to choose a password: that is a password chosen.
+            _ => keeper.change_account(ALICE, AccountChange::Password(Some(&password(5))), Some(A1), at),
+        }
+        .unwrap();
+        keeper.close();
+        put_by_hand(&root, &copy);
+        let (mut keeper, started) = settled(&root, T0 + 7 * MINUTE);
+        assert!(matches!(started, Started::Restored { .. }), "{change}: {started:?}");
+        assert_eq!(readers(&mut keeper, T0 + 8 * MINUTE), Vec::<u8>::new(), "{change}");
+        let row = account_row(&keeper, ALICE);
+        let codes: i64 = keeper.data().connection().query_row("SELECT count(*) FROM codes WHERE account = 1", [], |row| row.get(0)).unwrap();
+        match change {
+            "deleted" => assert_eq!(row, None, "{change}"),
+            "switched off" => assert_eq!(row, Some((false, Some(3), 1)), "{change}"),
+            // The copy's password, and its code, no longer work: it waits for the admin.
+            _ => {
+                assert_eq!(row, Some((true, None, 2)), "{change}");
+                assert_eq!(codes, 0, "{change}: a spent or old code came back");
+            }
+        }
+        // Bob is untouched but signed out, as everyone is (12.4 step 2).
+        assert_eq!(account_row(&keeper, BOB), Some((true, None, 0)));
+    }
+}
+
 // ---- The data put back by hand, and from a copy ----
 
 /// The data folder's files as they are now, by hand, while the program may be running.
@@ -674,14 +792,11 @@ fn a_copy_from_before_a_deletion_holds_that_history_until_its_person_answers() {
     let (mut keeper, started) = settled(&root, T0 + 7 * MINUTE);
     assert!(matches!(started, Started::Restored { held: 1, .. }), "{started:?}");
     assert!(keeper.held(ALICE) && !keeper.held(BOB));
-    // The copy holds her history again, held; nothing of it is given. Her devices were
-    // erased with it, and are not brought back: each connects again as a new device.
-    assert!(keeper.data().account_named("alice").unwrap().is_some());
-    assert!(keeper.load(A1).is_err() && keeper.load(A2).is_err());
-    assert_eq!(keeper.data().device_with_secret(ALICE, &hash(11)).unwrap(), None);
+    // The copy holds what she deleted again: held, and nothing of it is given.
+    assert_eq!(keeper.data().account_named("alice@example.org").unwrap(), Some((ALICE, 0)));
     assert_eq!(readers(&mut keeper, T0 + 8 * MINUTE), Vec::<u8>::new());
     let (pc, made) = keeper.device(ALICE, &hash(11), "a made-up PC", "pc", "0.41.0", T0 + 8 * MINUTE).unwrap();
-    assert!(made && pc > B1);
+    assert!(!made && pc == A1);
     // While held, a session it is given does not work: its scope has the store's life, the
     // held rows the copy's (S6 decides how the person is asked).
     let _ = connect(&mut keeper, pc, ALICE, 8, T0 + 8 * MINUTE);
@@ -773,7 +888,7 @@ fn the_data_lost_while_the_store_is_kept_stops_until_put_back_or_taken_as_none()
     assert_eq!(keeper.restore(), 1);
     assert_eq!(readers(&mut keeper, T0 + 8 * MINUTE), Vec::<u8>::new());
     // Alice goes on from the life the store kept; her old devices' ids are not given again.
-    let alice = keeper.account("alice", T0 + 9 * MINUTE).unwrap();
+    let alice = keeper.account("alice@example.org", "Alice", false, T0 + 9 * MINUTE).unwrap();
     assert!(alice.life >= 1, "{alice:?}");
     let (id, made) = keeper.device(alice.number, &hash(11), "a made-up PC", "pc", "0.41.0", T0 + 9 * MINUTE).unwrap();
     assert!(made && id > B1);
@@ -853,7 +968,7 @@ fn the_nightly_copy_taken_while_writes_go_on_is_whole_when_put_back() {
             let mut made = 0u64;
             while !stop.load(Ordering::SeqCst) && made < 400 {
                 let name = format!("listener-{made}");
-                let account = keeper.account(&name, T0 + 5 * MINUTE + made).unwrap().number;
+                let account = keeper.account(&format!("{name}@example.org"), &name, false, T0 + 5 * MINUTE + made).unwrap().number;
                 keeper.device(account, &Fingerprint::of(&[(made % 250) as u8 + 1; SECRET_BYTES]), "a made-up phone", "phone", "0.41.0", T0 + 5 * MINUTE + made).unwrap();
                 made += 1;
             }

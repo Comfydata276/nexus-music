@@ -91,6 +91,22 @@ pub struct Keeper {
     broken: bool,
 }
 
+/// A change to a whole account (design 8.7, 8.10, 12.5).
+#[derive(Debug, Clone, Copy)]
+pub enum AccountChange<'a> {
+    /// Switched off by the admin: every session ended, and none made until it is on again.
+    SwitchOff,
+    /// Switched on again: gives leave, so in the data first.
+    SwitchOn,
+    /// Deleted by the admin: everything of it goes, and no copy brings it back.
+    Delete,
+    /// Its password changed by its person (`Some`, and the device it was changed on kept), or
+    /// reset by the admin (`None`: it waits for one to be chosen with a code). Either way the
+    /// count moves, every one-time code it had is gone, and a copy from before holds a
+    /// password that no longer works.
+    Password(Option<&'a data::Password>),
+}
+
 /// One account, as a later slice is given it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AccountFound {
@@ -166,7 +182,7 @@ impl Keeper {
                     Some(id) => id,
                     None => identity::read_or_make(state, random_bytes::<16>).map_err(Refused)?.0,
                 };
-                let store = Store::new(id, random_bytes::<SECRET_BYTES>().map_err(Refused)?, now);
+                let store = Store::new(id, random_bytes::<SECRET_BYTES>().map_err(Refused)?, random_bytes::<SECRET_BYTES>().map_err(Refused)?, now);
                 apart::write(state, &store).map_err(|error| Refused(store_failed(state, &error)))?;
                 Self::first_data(state, folder, held, store, now)
             }
@@ -292,13 +308,21 @@ impl Keeper {
         // What survives in the store too: a permit whose session the data no longer loads is
         // dead (C3's load), and is dropped, so that the two agree. Nothing that works is taken.
         let mut permits: Vec<(u64, Rows)> = Vec::new();
-        let mut erase = Vec::new();
         let mut remove = Vec::new();
-        for (&number, &life) in &view.accounts {
-            if self.store.accounts.get(&number).is_some_and(|account| !account.kept.present && account.kept.life > life) {
-                erase.push(number);
-            }
-        }
+        // What the store says was taken from an account and the data has not yet (a cut
+        // change of a whole account: 12.4 step 3's rules, as for a copy).
+        let again = compare::taken_again(&self.store.view(), view);
+        let erase: Vec<u64> = again.iter().filter(|again| again.erase).map(|again| again.account).collect();
+        // A deletion of listening data cut off: the data's life brought to the store's.
+        let lives: Vec<(u64, u64)> = view
+            .accounts
+            .iter()
+            .filter_map(|(&number, row)| {
+                let kept = self.store.accounts.get(&number)?;
+                let cut = matches!(self.store.pending, Some(Pending::Update { account, family: Some(Family::Account), .. }) if account == number);
+                (cut && !kept.kept.deleted && row.life < kept.kept.life).then_some((number, kept.kept.life))
+            })
+            .collect();
         for (&id, row) in &view.devices {
             if erase.contains(&row.account) {
                 continue;
@@ -318,6 +342,17 @@ impl Keeper {
             }
         }
         let mut changes: Vec<Change<'_>> = erase.iter().map(|&account| Change::Erase { account }).collect();
+        for again in again.iter().filter(|again| !again.erase) {
+            if again.off {
+                changes.push(Change::SwitchedOn { account: again.account, on: false });
+            }
+            if again.reset_password {
+                let passwords = self.store.accounts.get(&again.account).map_or(0, |account| account.kept.passwords);
+                changes.push(Change::Password { account: again.account, password: None, passwords });
+                changes.push(Change::Codes { account: again.account });
+            }
+        }
+        changes.extend(lives.iter().map(|&(account, life)| Change::Life { account, life }));
         changes.extend(remove.iter().map(|&device| Change::Remove { device }));
         changes.extend(changes_rows.iter().map(Change::Install));
         if !changes.is_empty() {
@@ -404,8 +439,9 @@ impl Keeper {
                 }
             }
             for (number, account) in next.accounts.iter_mut() {
-                // The copy's rows are what the data now has.
-                account.kept.present = view.accounts.contains_key(number);
+                // The copy's rows are what the data now has (an account deleted since is
+                // erased again, below).
+                account.kept.present = !account.kept.deleted && view.accounts.contains_key(number);
             }
             for &(number, through) in &holds {
                 if let Some(account) = next.accounts.get_mut(&number) {
@@ -417,10 +453,29 @@ impl Keeper {
             next.pending = Some(if taken { Pending::TakeAsIs { restore: new } } else { Pending::Restore { restore: new } });
             self.write_store(next).map_err(refused)?;
         }
-        // Then the data, in one step.
+        // Then the data, in one step: 11.2 / 12.4 steps 1 to 3.
+        let again = compare::taken_again(&self.store.view(), &view);
+        let passwords: Vec<(u64, u64)> = again.iter().map(|again| (again.account, self.store.accounts.get(&again.account).map_or(0, |account| account.kept.passwords))).collect();
         let mut changes = vec![Change::Restore { restore: new, at: now, from: (meta.restore != new).then_some(meta.written_at) }];
+        for (again, &(_, count)) in again.iter().zip(&passwords) {
+            if again.erase {
+                changes.push(Change::Erase { account: again.account });
+                continue;
+            }
+            if again.off {
+                changes.push(Change::SwitchedOn { account: again.account, on: false });
+            }
+            if again.reset_password {
+                changes.push(Change::Password { account: again.account, password: None, passwords: count });
+                changes.push(Change::Codes { account: again.account });
+            }
+        }
+        let erased: Vec<u64> = again.iter().filter(|again| again.erase).map(|again| again.account).collect();
         let mut devices = 0;
-        for &id in view.devices.keys() {
+        for (&id, row) in &view.devices {
+            if erased.contains(&row.account) {
+                continue;
+            }
             match self.store.devices.get(&id) {
                 Some(kept) if !kept.gone => {
                     devices += 1;
@@ -512,32 +567,39 @@ impl Keeper {
         self.store.accounts.get(&account).is_some_and(|account| account.kept.held.is_some_and(|through| through >= account.kept.life))
     }
 
-    /// The account known by `name`, made if there is none: in the store first (its number,
-    /// never used again, and its life, which outlives its rows), then in the data. An account
-    /// deleted and come again goes on from its life (11.1).
-    pub fn account(&mut self, name: &str, now: u64) -> Result<AccountFound, Failed> {
+    /// The account with this email (as tidied: C7's), if the data has it.
+    pub fn find_account(&self, email: &str) -> Result<Option<AccountFound>, Failed> {
+        Ok(self.data.account_named(email).map_err(|error| Failed(data_failed(&error)))?.map(|(number, life)| AccountFound { number, life, held: self.held(number) }))
+    }
+
+    /// An account made with this email (as tidied: C7's), or the one there is: in the store
+    /// first (its number, never used again, and its life, which outlives its rows), then in
+    /// the data, switched on and with no password yet.
+    pub fn account(&mut self, email: &str, shown: &str, admin: bool, now: u64) -> Result<AccountFound, Failed> {
         self.heal()?;
-        if let Some((number, life)) = self.data.account_named(name).map_err(|error| Failed(data_failed(&error)))? {
-            return Ok(AccountFound { number, life, held: self.held(number) });
+        if let Some(found) = self.find_account(email)? {
+            return Ok(found);
         }
         let mut next = self.store.clone();
-        let number = match next.account_named(name) {
+        let number = match next.account_named(email) {
             Some(number) => number,
             None => {
                 let number = next.next_account;
                 next.next_account = number.checked_add(1).ok_or_else(|| Failed("No more accounts can be made.".into()))?;
-                next.accounts.insert(number, Account { name: apart::name_fingerprint(name), kept: StoreAccount { life: 0, held: None, present: false } });
+                let kept = StoreAccount { life: 0, held: None, present: false, deleted: false, off: false, passwords: 0 };
+                next.accounts.insert(number, Account { name: apart::name_fingerprint(email), kept });
                 number
             }
         };
-        let life = next.accounts.get(&number).map_or(0, |account| account.kept.life);
+        let (life, passwords) = next.accounts.get(&number).map_or((0, 0), |account| (account.kept.life, account.kept.passwords));
         if let Some(account) = next.accounts.get_mut(&number) {
             account.kept.present = true;
+            account.kept.off = false;
         }
         next.high_water = next.high_water.max(now);
         next.pending = Some(Pending::MakeAccount { account: number });
         self.write_store(next)?;
-        if let Err(error) = self.data.apply(&[Change::Account { number, name, life }], self.store.high_water) {
+        if let Err(error) = self.data.apply(&[Change::Account { number, email, shown, life, passwords, admin }], self.store.high_water) {
             return self.broke(Failed(data_failed(&error)));
         }
         let mut next = self.store.clone();
@@ -546,6 +608,87 @@ impl Keeper {
             return self.broke(failed);
         }
         Ok(AccountFound { number, life, held: self.held(number) })
+    }
+
+    /// A change to a whole account (design 8.7, 12.3, 12.5), each all or nothing: what it
+    /// takes away in the store first, under a note; then the data in one step; then the note
+    /// cleared. Every device of the account but `keep` has its session ended (C3's ending).
+    pub fn change_account(&mut self, account: u64, change: AccountChange<'_>, keep: Option<u64>, now: u64) -> Result<(), Failed> {
+        self.heal()?;
+        let Some(kept) = self.store.accounts.get(&account).map(|account| account.kept).filter(|kept| kept.present && !kept.deleted) else {
+            return Err(Failed("There is no such account.".into()));
+        };
+        let mut next = self.store.clone();
+        next.high_water = next.high_water.max(now);
+        let clock = Clock { now, high_water: next.high_water };
+        let ending = !matches!(change, AccountChange::SwitchOn);
+        let mut numbers = Vec::new();
+        if ending {
+            let ids: Vec<u64> = next.devices.iter().filter(|(id, device)| device.account == account && !device.gone && Some(**id) != keep).map(|(&id, _)| id).collect();
+            for id in ids {
+                let Some(device) = next.devices.get(&id).copied() else { continue };
+                let apart = self.apart_of(id, &device, "");
+                let mut loaded = Device::load(&apart, &Rows { scope: apart.scope.clone(), working: None, waiting: None });
+                let mut ended = None;
+                let answer = loaded
+                    .decide(&apart.scope, clock, |turn| turn.end())
+                    .apply(|effects| {
+                        ended = effects.update.as_ref().map(|update| update.apart_first.clone());
+                        Ok::<_, Denied>(())
+                    })
+                    .and_then(|answer| answer);
+                let (Ok(()), Some(ended)) = (answer, ended) else {
+                    return Err(Failed("A device's number can go no higher.".into()));
+                };
+                if let Some(entry) = next.devices.get_mut(&id) {
+                    entry.number = ended.scope.number;
+                    entry.working = ended.working;
+                    entry.waiting = ended.waiting;
+                    entry.gone = matches!(change, AccountChange::Delete);
+                }
+                numbers.push((id, ended.scope.number));
+            }
+        }
+        let passwords = kept.passwords.checked_add(1).ok_or_else(|| Failed("The account's password can be changed no more.".into()))?;
+        if let Some(entry) = next.accounts.get_mut(&account) {
+            match change {
+                AccountChange::SwitchOff => entry.kept.off = true,
+                AccountChange::SwitchOn => {}
+                AccountChange::Delete => {
+                    entry.kept.deleted = true;
+                    entry.kept.present = false;
+                    entry.kept.held = None;
+                }
+                AccountChange::Password(_) => entry.kept.passwords = passwords,
+            }
+        }
+        next.pending = Some(Pending::Account { account });
+        self.write_store(next)?;
+        let mut changes = match change {
+            AccountChange::Delete => vec![Change::Erase { account }],
+            AccountChange::SwitchOff => vec![Change::SwitchedOn { account, on: false }],
+            AccountChange::SwitchOn => vec![Change::SwitchedOn { account, on: true }],
+            AccountChange::Password(password) => vec![Change::Password { account, password, passwords }, Change::Codes { account }],
+        };
+        if ending && !matches!(change, AccountChange::Delete) {
+            changes.push(Change::EndedAll { account, numbers: &numbers });
+        }
+        if let Err(error) = self.data.apply(&changes, self.store.high_water) {
+            return self.broke(Failed(data_failed(&error)));
+        }
+        let mut next = self.store.clone();
+        if let (AccountChange::SwitchOn, Some(entry)) = (change, next.accounts.get_mut(&account)) {
+            // Gives leave: the store hears of it last.
+            entry.kept.off = false;
+        }
+        next.pending = None;
+        if let Err(failed) = self.write_store(next) {
+            return self.broke(failed);
+        }
+        if matches!(change, AccountChange::Delete) {
+            let _ = self.data.fold();
+        }
+        Ok(())
     }
 
     /// The device of `account` with this secret's fingerprint, made if there is none (7.5: a
@@ -645,7 +788,6 @@ impl Keeper {
                     entry.number = ended.number;
                     entry.working = None;
                     entry.waiting = None;
-                    entry.gone = family == Family::Account;
                 }
             }
         }
@@ -657,14 +799,13 @@ impl Keeper {
             entry.last_session = first.last_session;
             entry.working = first.working;
             entry.waiting = first.waiting;
-            entry.gone = family == Some(Family::Account);
         }
         match family {
             Some(Family::Account) => {
+                // Listening data deleted (12.5): the life moves; the account stays.
                 if let Some(entry) = next.accounts.get_mut(&account) {
                     entry.kept.life = first.scope.life;
                     entry.kept.held = None;
-                    entry.kept.present = false;
                 }
             }
             Some(Family::Backend) => next.restore = first.scope.restore,
@@ -673,8 +814,15 @@ impl Keeper {
         next.pending = Some(Pending::Update { device: id, account, family });
         self.write_store(next)?;
         let at = self.store.high_water;
+        let numbers: Vec<(u64, u64)> =
+            self.store.devices.iter().filter(|(device, kept)| kept.account == account && **device != id && !kept.gone).map(|(&device, kept)| (device, kept.number)).collect();
         let result = match family {
-            Some(Family::Account) => self.data.apply(&[Change::Erase { account }], at),
+            // The account's events go in this step, once they are kept (S12): their table
+            // is the account's, and goes with its life.
+            Some(Family::Account) => self.data.apply(
+                &[Change::Life { account, life: first.scope.life }, Change::EndedAll { account, numbers: &numbers }, Change::Install(&update.data)],
+                at,
+            ),
             Some(Family::Backend) => {
                 let mut changes = vec![Change::Restore { restore: first.scope.restore, at, from: None }];
                 let numbers: Vec<(u64, u64)> = self.store.devices.iter().filter(|(_, device)| !device.gone).map(|(&device, kept)| (device, kept.number)).collect();
@@ -688,13 +836,11 @@ impl Keeper {
             return self.broke(Failed(data_failed(&error)));
         }
         let mut next = self.store.clone();
-        if family != Some(Family::Account) {
-            let last = &update.apart_last;
-            if let Some(entry) = next.devices.get_mut(&id) {
-                entry.last_session = last.last_session;
-                entry.working = last.working;
-                entry.waiting = last.waiting;
-            }
+        let last = &update.apart_last;
+        if let Some(entry) = next.devices.get_mut(&id) {
+            entry.last_session = last.last_session;
+            entry.working = last.working;
+            entry.waiting = last.waiting;
         }
         next.pending = None;
         if let Err(failed) = self.write_store(next) {
@@ -931,7 +1077,13 @@ pub fn take_as_is(state: &Path, folder: &Path, now: u64) -> Result<Said, Refused
             // up is kept (its restore number, lives, and the ids it gave).
             let old_restore = old.as_ref().map_or(0, |old| old.restore);
             let new = meta.restore.max(old_restore).checked_add(1).ok_or_else(|| Refused("The restore number can go no higher.".into()))?;
-            let mut store = Store::new(meta.backend, random_bytes::<SECRET_BYTES>().map_err(Refused)?, now.max(meta.written_at).max(old.as_ref().map_or(0, |old| old.high_water)));
+            // The key that seals is lost with the store, if it was not readable: what it sealed
+            // is made anew or typed in again (12.4).
+            let seal = match &old {
+                Some(old) => old.seal_key(),
+                None => random_bytes::<SECRET_BYTES>().map_err(Refused)?,
+            };
+            let mut store = Store::new(meta.backend, random_bytes::<SECRET_BYTES>().map_err(Refused)?, seal, now.max(meta.written_at).max(old.as_ref().map_or(0, |old| old.high_water)));
             store.data_made = true;
             store.restore = new.saturating_sub(1);
             store.next_account = view.accounts.keys().max().map_or(1, |n| n.saturating_add(1)).max(old.as_ref().map_or(1, |old| old.next_account));
@@ -948,12 +1100,14 @@ pub fn take_as_is(state: &Path, folder: &Path, now: u64) -> Result<Said, Refused
                     }
                 }
             }
-            for (&number, &life) in &view.accounts {
+            for (&number, row) in &view.accounts {
                 let name = data.account_name(number).map_err(|error| Refused(format!("The data can't be read: {}.", why(&error))))?.unwrap_or_default();
-                let life = life.max(old.as_ref().and_then(|old| old.accounts.get(&number)).map_or(0, |account| account.kept.life));
+                let life = row.life.max(old.as_ref().and_then(|old| old.accounts.get(&number)).map_or(0, |account| account.kept.life));
                 // 11.2: without the store nothing says which were deleted (C3's `HoldAll`).
                 let held = (at_start(StoreComparison::StoreLost, true) == Startup::HoldAll).then_some(life);
-                store.accounts.insert(number, Account { name: apart::name_fingerprint(&name), kept: StoreAccount { life, held, present: true } });
+                // 12.4: it resets nothing it cannot know of: on or off, and the count, as the data has them.
+                let kept = StoreAccount { life, held, present: true, deleted: false, off: !row.on, passwords: row.passwords };
+                store.accounts.insert(number, Account { name: apart::name_fingerprint(&name), kept });
             }
             for (&id, row) in &view.devices {
                 let life = store.accounts.get(&row.account).map_or(0, |account| account.kept.life);
