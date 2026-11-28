@@ -1,15 +1,11 @@
 use super::*;
-use crate::diagnostics::{ReportStore, Session, export_report, preview_text, record_path, tests::TestFolder};
+use crate::diagnostics::{ReportStore, Session, WORKER_FIXTURE, export_report, preview_text, record_path, tests::TestFolder};
 use nexus_core::nexus::{
     account::{AccountId, DeviceKind, Name, Session as NexusSession},
     client::{AnswerBody, App, Ask, Client, Do, Given, JournalDo, Keep, Random, Saved},
     proto::{self, SPEAKS, Version},
 };
-use std::{fs, sync::{Mutex, mpsc}, time::Duration};
-
-// The production worker owns one profile. Keep tests that exercise its whole queue
-// from interleaving their different temporary profiles.
-static WORKER_FIXTURE: Mutex<()> = Mutex::new(());
+use std::{fs, sync::mpsc, time::Duration};
 
 fn queued_read(paths: &config::Paths, number: u64) -> Happened {
     let (send, receive) = mpsc::channel();

@@ -3,7 +3,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -244,24 +244,17 @@ fn save_schedule(path: &Path, schedule: Option<&DiagSchedule>) -> io::Result<()>
     config::write_surely(path, &serde_json::to_vec(&schedule)?)
 }
 
-/// Queue this in the order core issued it. The subsequent read cannot start ahead of it.
-#[allow(dead_code)] // W7 owns the live client.
-/// Says when it is done, and whether it was written (W7c item 11: the sign-in's driver waits
-/// for it).
-pub(crate) fn keep_schedule_for_window(schedule: Option<DiagSchedule>) -> Option<std::sync::mpsc::Receiver<bool>> {
-    let paths = with(|ctl| ctl.paths.clone())?;
-    Some(keep_schedule(&paths, schedule))
-}
-
-fn keep_schedule(paths: &config::Paths, schedule: Option<DiagSchedule>) -> std::sync::mpsc::Receiver<bool> {
+/// Queue on the Diagnostics worker without holding up the sign-in list. The worker runs
+/// the subsequent read after this write and uses its actual result to decide what it can send.
+pub(crate) fn keep_schedule(paths: &config::Paths, schedule: Option<DiagSchedule>) {
     let path = schedule_path(paths);
-    let (done, receipt) = std::sync::mpsc::channel();
     on_worker(move || {
-        let written = save_schedule(&path, schedule.as_ref()).is_ok();
-        SCHEDULE_KEPT.set(written && schedule.is_some());
-        let _ = done.send(written);
+        let result = save_schedule(&path, schedule.as_ref());
+        SCHEDULE_KEPT.set(result.is_ok() && schedule.is_some());
+        if let Err(error) = result {
+            let _ = writeln!(io::stderr(), "Could not write the Diagnostics schedule ({error})");
+        }
     });
-    receipt
 }
 
 /// Queue the matching reply for W7 to feed back into the same live client.

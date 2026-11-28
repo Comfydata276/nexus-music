@@ -19,7 +19,7 @@ use crate::{config, pool::Pool, ui};
 
 mod sending;
 #[allow(unused_imports)] // The live client is installed by W7.
-pub(crate) use sending::{attach, detach, forget_choice, keep_schedule_for_window as keep_schedule, load_kept, on_worker, publish_hello, read_for_window as read};
+pub(crate) use sending::{attach, detach, forget_choice, keep_schedule, load_kept, on_worker, publish_hello, read_for_window as read};
 
 thread_local! {
     static STORE: RefCell<ReportStore> = RefCell::default();
@@ -32,6 +32,10 @@ const RECORD_FILE: &str = "diagnostics-record.txt";
 // Keep report building and file I/O off the window thread. One worker keeps repeated
 // exports and previews in the order they were requested.
 static WORKER: OnceLock<Pool> = OnceLock::new();
+
+// The production worker owns one profile. Serialize tests of its schedule across profiles.
+#[cfg(test)]
+pub(crate) static WORKER_FIXTURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn worker() -> &'static Pool {
     WORKER.get_or_init(|| Pool::new("diagnostics", 1, false))

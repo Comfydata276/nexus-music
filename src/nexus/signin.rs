@@ -14,7 +14,8 @@
 //!   as given, one list after another. What is kept and forgotten (Credential Manager, the
 //!   folder decision) is done there, off the window's thread. What needs the window (the
 //!   player, the screens, the journal and Diagnostics, which live on the window's thread)
-//!   is run there and **waited for** before the next thing in the list.
+//!   is run there and **waited for** before the next thing in the list. Schedule writes are
+//!   queued directly on the Diagnostics worker.
 //! - **A keep or a forget that is not durable stops what follows it, and this run is not
 //!   signed in** (W7c item 2, the lead's simple rule). Nothing later in that list is done;
 //!   the machine is stopped, and stays stopped until the app ends: nothing authenticated is
@@ -798,14 +799,14 @@ fn perform(paths: &config::Paths, batch: Batch) -> Done {
                     false
                 }
             }
-            Do::Keep(Keep::DiagSchedule(schedule)) => match on_window_settled(epoch, move || crate::diagnostics::keep_schedule(Some(schedule))) {
-                Done::All => true,
-                stopped => return stopped,
-            },
-            Do::Forget(Forget::DiagSchedule) => match on_window_settled(epoch, || crate::diagnostics::keep_schedule(None)) {
-                Done::All => true,
-                stopped => return stopped,
-            },
+            Do::Keep(Keep::DiagSchedule(schedule)) => {
+                crate::diagnostics::keep_schedule(paths, Some(schedule));
+                true
+            }
+            Do::Forget(Forget::DiagSchedule) => {
+                crate::diagnostics::keep_schedule(paths, None);
+                true
+            }
             Do::Forget(Forget::Diagnostics) => match on_window_settled(epoch, crate::diagnostics::forget_choice) {
                 Done::All => true,
                 stopped => return stopped,
@@ -1617,6 +1618,42 @@ mod tests {
         assert_eq!(held, Done::NotKept);
         // What followed the keep was not done.
         assert!(vault::read(&paths, DEVICE).unwrap().is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_blocked_diagnostics_schedule_does_not_hold_up_the_sign_in_list() {
+        let (_one, dir, paths) = profile("schedule-blocked");
+        let _worker = crate::diagnostics::WORKER_FIXTURE.lock().unwrap();
+        std::fs::create_dir_all(paths.settings.with_file_name("diagnostics-schedule.json")).unwrap();
+        let (release, hold) = mpsc::channel::<()>();
+        crate::diagnostics::on_worker(move || {
+            let _ = hold.recv();
+        });
+        let schedule = core::DiagSchedule { started_ms: 1, fault_ms: None, attempts: Vec::new() };
+        let device = DeviceKey { secret: DeviceSecret::from_bytes([42; 32]), backend_id: None };
+        let batch = Batch::of(epoch_now(), vec![
+            Do::Keep(Keep::DiagSchedule(schedule)),
+            Do::Forget(Forget::DiagSchedule),
+            Do::Keep(Keep::DeviceSecret(device)),
+        ], Cause::Other);
+        let (done, result) = mpsc::channel();
+        let outcome = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let _ = done.send(perform(&paths, batch));
+            });
+            let outcome = result.recv_timeout(Duration::from_secs(5));
+            drop(release);
+            outcome
+        });
+        assert_eq!(outcome, Ok(Done::All));
+        assert!(vault::read(&paths, DEVICE).unwrap().is_some());
+        // Let the queued writes fail before releasing the shared worker or removing the fixture.
+        let (done, drained) = mpsc::channel();
+        crate::diagnostics::on_worker(move || {
+            let _ = done.send(());
+        });
+        drained.recv_timeout(SETTLE_WAIT).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
