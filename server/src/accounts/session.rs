@@ -432,6 +432,14 @@ impl Accounts {
 
     async fn changing_password(&self, bearer: account::Session, request: ChangePassword) -> Result<Answer, Refusal> {
         let ChangePassword { head, request_id, current_password, new_password } = request;
+        // CARRIED (asked of core: `ChangePassword`'s own check): a "change" to the password
+        // already set is refused as a malformed request, before anything is looked at, so that
+        // a retry of it can never prove a still-current password again and end sessions made
+        // since (the review of S8, B2; the lead's ruling). The comparison takes the same time
+        // whatever the two are (`Password`'s equality).
+        if current_password == new_password {
+            return Err(Refusal::Malformed);
+        }
         let clock = self.clock.clone();
         let hash = Fingerprint::of(bearer.expose_bytes());
         let (number, device, email, check, stored) = {
