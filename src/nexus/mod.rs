@@ -587,8 +587,10 @@ fn note(what: std::fmt::Arguments<'_>) {
     if let Some(path) = test_var("NEXUS_TEST_NEXUS_LOG") {
         use std::io::Write;
         let now = SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64();
+        // One write for the whole line, so that lines from two threads never run together.
+        let line = format!("{now:.3} {what}\n");
         if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-            let _ = writeln!(file, "{now:.3} {what}");
+            let _ = file.write_all(line.as_bytes());
         }
     }
 }

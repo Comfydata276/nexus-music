@@ -575,8 +575,11 @@ class Run:
         out = []
         for line in lines:
             parts = line.split(" ", 2)
-            if len(parts) >= 2:
-                out.append((float(parts[0]), parts[1], parts[2] if len(parts) > 2 else ""))
+            try:
+                if len(parts) >= 2:
+                    out.append((float(parts[0]), parts[1], parts[2] if len(parts) > 2 else ""))
+            except ValueError:
+                pass
         return out
 
     def looks(self):
@@ -1237,8 +1240,11 @@ def component_log(path):
     if os.path.exists(path):
         for line in open(path).read().splitlines():
             parts = line.split(" ", 2)
-            if len(parts) >= 2:
-                out.append((float(parts[0]), parts[1], parts[2] if len(parts) > 2 else ""))
+            try:
+                if len(parts) >= 2:
+                    out.append((float(parts[0]), parts[1], parts[2] if len(parts) > 2 else ""))
+            except ValueError:
+                pass
     return out
 
 
