@@ -125,6 +125,83 @@ pub fn read_stats_reply(status: u16, whole_body: &[u8]) -> Result<StatsReply, Ba
     account::read_reply(status, whole_body)
 }
 
+/// The two self-delete POSTs share one scope, revision and action ID. The
+/// app sends each once through its session driver and hands the whole answer back.
+pub struct HistoryDeletion {
+    head: RequestHead,
+    account: AccountId,
+    backend: BackendId,
+    life: u64,
+    revision: u64,
+    request: account::RequestId,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum HistoryDeleteError {
+    MissingRevision,
+    Invalid,
+    Refused(account::Refusal),
+}
+
+impl From<BadMessage> for HistoryDeleteError {
+    fn from(_: BadMessage) -> Self {
+        Self::Invalid
+    }
+}
+
+impl HistoryDeletion {
+    /// The stamp and current revision come from the same checked stats page.
+    pub fn new(
+        head: RequestHead, stamp: &account::Stamp, page: &StatsPage, request: account::RequestId,
+    ) -> Result<Self, HistoryDeleteError> {
+        if head.restore != stamp.restore {
+            return Err(HistoryDeleteError::Invalid);
+        }
+        let revision = page.account_revision.ok_or(HistoryDeleteError::MissingRevision)?;
+        Ok(Self { head, account: stamp.account, backend: stamp.backend, life: stamp.life, revision, request })
+    }
+
+    pub fn grant(&self, password: account::Password) -> Result<WireBody, HistoryDeleteError> {
+        Ok(account::encode(&account::GrantRequest {
+            head: self.head(),
+            change: account::GrantChange::DeleteListeningData {
+                account: self.account, target_revision: self.revision, request_id: self.request,
+            },
+            password,
+        })?)
+    }
+
+    pub fn spend(&self, status: u16, body: &[u8]) -> Result<WireBody, HistoryDeleteError> {
+        let grant = match account::read_reply::<account::GrantIssued>(status, body)? {
+            Reply::Done { result, receipt } if self.owns(&receipt.stamp) && receipt.stamp.life == self.life => result.grant,
+            Reply::Refused(reason) => return Err(HistoryDeleteError::Refused(reason)),
+            _ => return Err(HistoryDeleteError::Invalid),
+        };
+        Ok(account::encode(&account::DeleteListeningData {
+            head: self.head(),
+            request_id: self.request,
+            change: account::DeleteListeningDataTarget { account: self.account, target_revision: self.revision },
+            grant,
+        })?)
+    }
+
+    pub fn confirmed_life(&self, status: u16, body: &[u8]) -> Result<u64, HistoryDeleteError> {
+        match account::read_reply::<account::SignedOut>(status, body)? {
+            Reply::Done { receipt, .. } if self.owns(&receipt.stamp) && receipt.stamp.life > self.life => Ok(receipt.stamp.life),
+            Reply::Refused(reason) => Err(HistoryDeleteError::Refused(reason)),
+            _ => Err(HistoryDeleteError::Invalid),
+        }
+    }
+
+    fn head(&self) -> RequestHead {
+        RequestHead { speaks: self.head.speaks, restore: self.head.restore }
+    }
+
+    fn owns(&self, stamp: &account::Stamp) -> bool {
+        stamp.account == self.account && stamp.backend == self.backend && stamp.restore == self.head.restore
+    }
+}
+
 /// The design does not say the id's text spelling. Use the backend id's 32 lower-case
 /// hex digits, in its own type. Make the id once, before writing, and send it unchanged.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

@@ -810,3 +810,40 @@ fn stats_reads_only_bounded_pages_of_starts() {
     bytes.resize(account::SMALL_REPLY_MAX_BYTES + 1, b' ');
     assert_eq!(read_stats_reply(503, &bytes), Err(BadMessage::TooLarge));
 }
+
+#[test]
+fn self_deletion_pins_the_current_revision_scope_and_action_through_both_posts() {
+    let page = StatsPage { starts: 0, recent: Vec::new(), next: None, account_revision: Some(17) };
+    let stamp = receipt(5).stamp;
+    let action = account::RequestId::new(29).unwrap();
+    let delete = HistoryDeletion::new(head(), &stamp, &page, action).unwrap();
+    let password = account::Password::presented("fixture password").unwrap();
+    let grant = delete.grant(password).unwrap();
+    let request = account::read::<account::GrantRequest>(grant.bytes()).unwrap();
+    let account::GrantChange::DeleteListeningData { account, target_revision, request_id } = request.change;
+    assert_eq!((account, target_revision, request_id), (stamp.account, 17, action));
+
+    let wrong: Reply<account::GrantIssued> = Reply::Refused(Refusal::NotAllowed(account::NotAllowed::WrongLogin));
+    assert_eq!(delete.spend(wrong.status(), account::encode(&wrong).unwrap().bytes()).unwrap_err(),
+        HistoryDeleteError::Refused(Refusal::NotAllowed(account::NotAllowed::WrongLogin)));
+    let grant_reply = |life| {
+        account::encode(&Reply::Done {
+            result: account::GrantIssued { grant: account::GrantSecret::from_bytes([1; 32]) },
+            receipt: receipt(life),
+        }).unwrap()
+    };
+    assert_eq!(delete.spend(200, grant_reply(6).bytes()).unwrap_err(), HistoryDeleteError::Invalid);
+    let spend = delete.spend(200, grant_reply(5).bytes()).unwrap();
+    let command = account::read::<account::DeleteListeningData>(spend.bytes()).unwrap();
+    assert_eq!((command.change.account, command.change.target_revision, command.request_id), (stamp.account, 17, action));
+
+    let confirmation = |receipt| account::encode(&Reply::Done { result: account::SignedOut {}, receipt }).unwrap();
+    assert_eq!(delete.confirmed_life(200, confirmation(receipt(5)).bytes()), Err(HistoryDeleteError::Invalid));
+    let mut wrong_account = receipt(6);
+    wrong_account.stamp.account = AccountId::new(121).unwrap();
+    assert_eq!(delete.confirmed_life(200, confirmation(wrong_account).bytes()), Err(HistoryDeleteError::Invalid));
+    assert_eq!(delete.confirmed_life(200, confirmation(receipt(6)).bytes()), Ok(6));
+
+    let old_server = StatsPage { account_revision: None, ..page };
+    assert!(matches!(HistoryDeletion::new(head(), &stamp, &old_server, action), Err(HistoryDeleteError::MissingRevision)));
+}
