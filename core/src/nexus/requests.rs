@@ -16,7 +16,7 @@ use super::admin;
 use super::wire::{self, BadMessage, Fields, Value, WireBody};
 pub use super::account::{RequestHead, RequestId};
 use crate::bulk;
-use crate::lidarr::{self, ArtistOffer, Listed, Pending, RequestLidarr, Single, WayBack};
+use crate::lidarr::{self, AlbumPlacement, ArtistOffer, Listed, Pending, PlacementRecovery, RequestLidarr, Single, WayBack};
 use crate::musicbrainz::MusicBrainz;
 use crate::offer::Offer;
 
@@ -409,6 +409,30 @@ pub fn check_list_singles(
     artist.check_current(current)
 }
 
+/// Validate the exact targets while holding the mutation turn, then select only
+/// albums that need placing. Pass the returned numbers and a durable save of
+/// these placements to `Lidarr::want_before`. The other targets can still be
+/// recorded in asked history, without placing them again.
+pub fn placements_for_want(
+    artist: &ArtistTarget,
+    selected: &[AlbumTarget],
+    current_number: Option<i64>,
+    rows: &[Listed],
+) -> Result<Vec<AlbumPlacement>, Refusal> {
+    artist.check_current(current_number)?;
+    let mut placements = Vec::new();
+    for target in selected {
+        target.check_current(rows)?;
+        if let Some(row) = rows.iter().find(|row| row.id == target.id.get()) {
+            let placement = AlbumPlacement::from_listed(artist.artist.as_str(), artist.id.get(), row);
+            if placement.newly_placed() {
+                placements.push(placement);
+            }
+        }
+    }
+    Ok(placements)
+}
+
 /// A playlist line is deliberately just three names. It goes through bulk's lookup
 /// rules on the server. It cannot carry a playlist ID, a Lidarr setting or an album body.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -507,21 +531,30 @@ pub fn batch_fallback_offer<'a>(release: &MusicBrainzId, singles: bool, found: &
     found.iter().find(|offer| offer.album == release.as_str() && (singles || offer.kind() == "Album"))
 }
 
-/// Reconcile an ambiguous prepared-batch write using the verified artist's
-/// list from the original Lidarr binding. The current artist number must be
-/// the one observed when looking up `artist.artist` by MusicBrainz ID.
+/// Reconcile an interrupted request or batch from the verified artist's list
+/// on the original endpoint. The durable album-level observation must predate
+/// the placement write. Presence alone records history without removal rights.
 pub fn batch_effect_confirmed(
     offer: &Offer,
     artist: &ArtistTarget,
     current_number: Option<i64>,
     listed: &[Listed],
-) -> bool {
+    placement: Option<&AlbumPlacement>,
+) -> PlacementRecovery {
     if offer.artist_id != artist.artist.as_str() || artist.check_current(current_number).is_err() {
-        return false;
+        return PlacementRecovery::Unconfirmed;
     }
     let mut matching = listed.iter().filter(|row| row.album == offer.album);
-    matching.next().is_some_and(|row| row.id > 0 && (row.wanted || row.have))
-        && matching.next().is_none()
+    let Some(row) = matching.next() else { return PlacementRecovery::Unconfirmed };
+    if row.id <= 0 || (!row.wanted && !row.have) || matching.next().is_some() {
+        return PlacementRecovery::Unconfirmed;
+    }
+    let placed = placement.is_some_and(|before| {
+        before.newly_placed() && before.artist == offer.artist_id && before.release == offer.album
+            && before.artist_number.is_none_or(|number| number == artist.id.get())
+            && before.album_number.is_none_or(|number| number == row.id)
+    });
+    PlacementRecovery::Listed { placed }
 }
 
 fn within(count: usize, max: usize) -> Result<(), WireError> {
@@ -693,7 +726,7 @@ pub fn refusal_for(error: &str, wanted: Option<&Offer>) -> Refusal {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "done", rename_all = "snake_case")]
 pub enum Completed {
-    Requested,
+    Requested { placed: bool },
     ArtistAdded { count: u32 },
     AddedWanting { artist: LidarrNumber },
     Wanted,
@@ -705,7 +738,7 @@ pub enum Completed {
 impl Completed {
     pub fn sentence(&self) -> &'static str {
         match self {
-            Self::Requested => "The album is on Lidarr's list.",
+            Self::Requested { .. } => "The album is on Lidarr's list.",
             Self::ArtistAdded { .. } => "Lidarr is keeping track of the artist.",
             Self::AddedWanting { .. } | Self::Wanted => "The releases are on Lidarr's list.",
             Self::ListedSingles => "Lidarr has been asked to list the artist's singles.",
@@ -984,6 +1017,8 @@ pub fn write_attribution_reply(reply: &AttributionReply) -> Result<WireBody, Wir
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BatchLineView {
     pub index: u16,
+    /// This batch supplied the effect that placed the album.
+    pub placed: bool,
     #[serde(deserialize_with = "object")]
     pub progress: BatchLineProgress,
 }
@@ -1051,15 +1086,18 @@ impl BatchLineView {
             }
             _ => BatchLineProgress::Failed { reason: Refusal::LidarrUnrecognized, album: None },
         };
-        let row = Self { index, progress };
+        let placed = line.placed && matches!(progress, BatchLineProgress::Asked { .. } | BatchLineProgress::Done { .. });
+        let row = Self { index, placed, progress };
         if check_item(&row).is_err() {
-            return Ok(Self { index, progress: BatchLineProgress::Failed { reason: Refusal::TooLarge, album: None } });
+            return Ok(Self { index, placed: false, progress: BatchLineProgress::Failed { reason: Refusal::TooLarge, album: None } });
         }
         Ok(row)
     }
 
     fn valid(&self) -> bool {
-        usize::from(self.index) < BATCH_MAX_LINES && match &self.progress {
+        usize::from(self.index) < BATCH_MAX_LINES
+            && (!self.placed || matches!(self.progress, BatchLineProgress::Asked { .. } | BatchLineProgress::Done { .. }))
+            && match &self.progress {
             BatchLineProgress::Found { album } | BatchLineProgress::Asked { album }
             | BatchLineProgress::Done { album } => album.valid(),
             BatchLineProgress::Failed { album, .. } => album.as_ref().is_none_or(BatchAlbum::valid),
@@ -1382,20 +1420,18 @@ impl RequestsAccess {
     }
 }
 
-/// The caller supplies the authenticated account and role and the ownership recorded
-/// for this album. Apply the switch first for every call. the design does not say
-/// what happens if several accounts asked for it. A member may cancel only when
-/// every recorded requester is that member, so the removal cannot affect another
-/// account's request. An admin can cancel any album.
-pub fn may_cancel(access: RequestsAccess, account: AccountId, admin: bool, requesters: &[AccountId]) -> Result<(), Refusal> {
+/// Supply every account that asked for this release at this binding and whether
+/// that account placed it. Preserve a previously true bit on a later ask by the
+/// same account. Members need exclusive ownership and evidence of placement.
+pub fn may_cancel(access: RequestsAccess, account: AccountId, admin: bool, requesters: &[(AccountId, bool)]) -> Result<(), Refusal> {
     access.check()?;
     if admin {
         return Ok(());
     }
-    if requesters.iter().any(|&requester| requester != account) {
+    if requesters.iter().any(|&(requester, _)| requester != account) {
         return Err(Refusal::AskedByOthers);
     }
-    if requesters.is_empty() { Err(Refusal::NotAllowed) } else { Ok(()) }
+    if requesters.iter().any(|&(_, placed)| placed) { Ok(()) } else { Err(Refusal::NotAllowed) }
 }
 
 /// One book per authenticated session, discarded when that session ends. S13 must
@@ -1887,7 +1923,7 @@ impl<'a> BackendLidarr<'a> {
 impl Completed {
     fn answers(&self, change: &Change) -> bool {
         matches!((self, change),
-            (Self::Requested, Change::Request { .. })
+            (Self::Requested { .. }, Change::Request { .. })
             | (Self::ArtistAdded { .. }, Change::AddArtist { .. })
             | (Self::AddedWanting { .. }, Change::AddWanting { .. })
             | (Self::Wanted, Change::Want { .. })
@@ -1988,15 +2024,23 @@ impl RequestLidarr for BackendLidarr<'_> {
         }
     }
 
-    fn request(&self, wanted: &Offer, _: &dyn WayBack) -> Result<(), String> {
+    fn request(&self, wanted: &Offer, way_back: &dyn WayBack) -> Result<(), String> {
+        self.request_placement(wanted, way_back).map(drop)
+    }
+
+    fn request_placement(&self, wanted: &Offer, _: &dyn WayBack) -> Result<bool, String> {
         let offer = MusicBrainzId::new(&wanted.album).map(OfferName).ok_or_else(|| Refusal::SearchAgain.sentence(None).into_owned())?;
         let request_id = (self.new_id)().map_err(|error| RequestError::from(error).to_string())?;
         // The backend resolves the name and owns the write-ahead recovery. None of
         // the local offer description or WayBack leaves this device.
-        self.change(request_id, Change::Request { offer }).map(drop).map_err(|error| match error {
+        let result = self.change(request_id, Change::Request { offer }).map_err(|error| match error {
             RequestError::Refused(reason) => reason.sentence(Some(wanted)).into_owned(),
             _ => error.to_string(),
-        })
+        })?;
+        match result {
+            Completed::Requested { placed } => Ok(placed),
+            _ => Err(RequestError::UnexpectedAnswer.to_string()),
+        }
     }
 
     fn pending(&self) -> Result<Vec<Pending>, String> {
@@ -2114,6 +2158,16 @@ mod tests {
         let stale = Listed { album: id(7).into(), ..current.clone() };
         assert_eq!(album_target().check_current(std::slice::from_ref(&stale)), Err(Refusal::NoLongerListed));
         assert_eq!(album_target().check_current(&[current, stale]), Err(Refusal::NoLongerListed));
+        let wanted = Listed { id: 1, album: id(2).into(), wanted: true, have: false };
+        let held = Listed { id: 2, album: id(3).into(), wanted: false, have: true };
+        let new = Listed { id: 3, album: id(4).into(), ..Listed::default() };
+        let targets = [
+            album_target(),
+            AlbumTarget { id: LidarrNumber::new(2).unwrap(), release: id(3) },
+            AlbumTarget { id: LidarrNumber::new(3).unwrap(), release: id(4) },
+        ];
+        assert_eq!(placements_for_want(&artist_target(), &targets, Some(1), &[wanted, held, new.clone()]),
+            Ok(vec![AlbumPlacement::from_listed(id(1).as_str(), 1, &new)]));
     }
 
     #[test]
@@ -2153,7 +2207,7 @@ mod tests {
         let single = SingleView { title: "At Dawn".into(), artist_id: id(1), votes: i64::MAX };
         let pending = PendingView { id: one(), album: id(2), title: album.title.clone(), artist: album.artist.clone(), removable: true, progress: Some(100) };
         let done = [
-            Completed::Requested, Completed::ArtistAdded { count: u32::MAX }, Completed::AddedWanting { artist: one() },
+            Completed::Requested { placed: true }, Completed::ArtistAdded { count: u32::MAX }, Completed::AddedWanting { artist: one() },
             Completed::Wanted, Completed::ListedSingles, Completed::Cancelled, Completed::Batch,
         ];
         let answers = [
@@ -2177,7 +2231,7 @@ mod tests {
                     BatchLineProgress::Done { album: batch_album() },
                     BatchLineProgress::NotFound,
                     BatchLineProgress::Failed { reason: Refusal::WouldNotKeep, album: None },
-                ].into_iter().enumerate().map(|(index, progress)| BatchLineView { index: index as u16, progress }).collect(),
+                ].into_iter().enumerate().map(|(index, progress)| BatchLineView { placed: false, index: index as u16, progress }).collect(),
                 next: None,
             },
             Answer::BatchResolutionAccepted, Answer::Begun { job: job() }, Answer::Working,
@@ -2345,13 +2399,80 @@ mod tests {
         assert_eq!(on, RequestsAccess::On);
         let me = AccountId::new(1).unwrap();
         let other = AccountId::new(2).unwrap();
-        assert_eq!(may_cancel(on, me, false, &[me]), Ok(()));
-        assert_eq!(may_cancel(on, me, false, &[other]), Err(Refusal::AskedByOthers));
+        assert_eq!(may_cancel(on, me, false, &[(me, true)]), Ok(()));
+        assert_eq!(may_cancel(on, me, false, &[(other, true)]), Err(Refusal::AskedByOthers));
         assert_eq!(may_cancel(on, me, false, &[]), Err(Refusal::NotAllowed));
-        assert_eq!(may_cancel(on, me, false, &[me, other]), Err(Refusal::AskedByOthers));
-        assert_eq!(may_cancel(on, me, true, &[other]), Ok(()));
+        assert_eq!(may_cancel(on, me, false, &[(me, true), (other, false)]), Err(Refusal::AskedByOthers));
+        assert_eq!(may_cancel(on, me, true, &[(other, false)]), Ok(()));
         assert_eq!(may_cancel(on, me, true, &[]), Ok(()));
-        assert_eq!(may_cancel(RequestsAccess::Off, me, true, &[me]), Err(Refusal::SwitchedOff));
+        assert_eq!(may_cancel(RequestsAccess::Off, me, true, &[(me, true)]), Err(Refusal::SwitchedOff));
+    }
+
+    #[test]
+    fn asking_for_an_album_grants_removal_only_when_this_request_placed_it() {
+        use crate::http::{Failure, Http, Method, Request, Response};
+        use lidarr::{AlbumPlacement, Turn};
+
+        #[derive(Default)]
+        struct Journal(Mutex<Option<AlbumPlacement>>);
+        impl WayBack for Journal {
+            fn turn(&self) -> Box<dyn Turn + '_> { Box::new(()) }
+            fn keep(&self, _: &str, _: i64, _: &str) -> Result<bool, String> { Ok(true) }
+            fn put_back(&self, _: &str, _: i64, _: &str) {}
+            fn before_request_album(&self, placement: &AlbumPlacement) -> Result<(), String> {
+                *self.0.lock().unwrap() = Some(placement.clone());
+                Ok(())
+            }
+        }
+
+        struct Direct {
+            already_wanted: bool,
+            held: bool,
+            journal: Arc<Journal>,
+        }
+        impl Http for Direct {
+            fn send(&self, request: &Request) -> Result<Response, Failure> {
+                let path = request.url.strip_prefix("http://lidarr.test/api/v1/").unwrap();
+                let answer = match (path, request.method) {
+                    ("artist", Method::Get) => serde_json::json!([{ "id": 1, "foreignArtistId": id(1) }]),
+                    ("album?artistId=1", Method::Get) => serde_json::json!([{
+                        "id": 7, "foreignAlbumId": id(2), "monitored": self.already_wanted,
+                        "statistics": { "trackFileCount": u64::from(self.held) },
+                    }]),
+                    ("command", Method::Get) => serde_json::json!([]),
+                    ("artist/1", Method::Get) | ("album/7", Method::Get) => serde_json::json!({ "monitored": true }),
+                    ("album/monitor", Method::Put(_)) => {
+                        let saved = self.journal.0.lock().unwrap();
+                        let placement = saved.as_ref().expect("album placement must be durable before the monitor write");
+                        assert_eq!(placement.release, id(2).as_str());
+                        assert_eq!(placement.album_number, Some(7));
+                        assert_eq!(placement.previously_wanted, self.already_wanted);
+                        assert_eq!(placement.previously_held, self.held);
+                        serde_json::json!({})
+                    }
+                    ("command", Method::Post(_)) => serde_json::json!({}),
+                    _ => panic!("unexpected Lidarr call"),
+                };
+                Ok(Response::new(200, Vec::new(), move || Ok(answer.to_string())))
+            }
+
+            fn pause(&self, _: Duration) -> Result<(), Failure> { Ok(()) }
+        }
+
+        let account = AccountId::new(17).unwrap();
+        let asked = album(2).into();
+        for (already_wanted, held) in [(false, false), (true, false), (false, true)] {
+            let journal = Arc::new(Journal::default());
+            let lidarr = lidarr::Lidarr::new("http://lidarr.test", "key", None, Arc::new(Direct {
+                already_wanted, held, journal: journal.clone(),
+            }));
+            let placed = lidarr.request_placement(&asked, journal.as_ref()).unwrap();
+            assert_eq!(placed, !already_wanted && !held);
+            let history = [(account, placed)];
+            let member = if placed { Ok(()) } else { Err(Refusal::NotAllowed) };
+            assert_eq!(may_cancel(RequestsAccess::On, account, false, &history), member);
+            assert_eq!(may_cancel(RequestsAccess::On, account, true, &history), Ok(()));
+        }
     }
 
     #[test]
@@ -2378,7 +2499,7 @@ mod tests {
                         assert_eq!(got, job());
                         let mut polls = polls.lock().unwrap();
                         *polls += 1;
-                        if *polls == 1 { Answer::Working } else { Answer::Done { result: Completed::Requested } }
+                        if *polls == 1 { Answer::Working } else { Answer::Done { result: Completed::Requested { placed: true } } }
                     }
                     call => panic!("unexpected {call:?}"),
                 };
@@ -2453,7 +2574,7 @@ mod tests {
                         if *waits.lock().unwrap() == 0 {
                             Answer::Working
                         } else {
-                            Answer::Done { result: Completed::Requested }
+                            Answer::Done { result: Completed::Requested { placed: true } }
                         }
                     }
                     _ => panic!("unexpected call"),
@@ -2499,7 +2620,7 @@ mod tests {
                             else { Answer::Begun { job: job() } }
                         }
                         (3, Call::After { job: got }) if got == job() && !second_begin_fails => {
-                            Answer::Done { result: Completed::Requested }
+                            Answer::Done { result: Completed::Requested { placed: true } }
                         }
                         _ => panic!("unexpected call"),
                     };
@@ -2537,7 +2658,7 @@ mod tests {
                 *polls += 1;
                 match *polls {
                     1 => Err(TransportError::Unreachable),
-                    2 => transport(Answer::Done { result: Completed::Requested }),
+                    2 => transport(Answer::Done { result: Completed::Requested { placed: true } }),
                     3 => transport(Answer::Done { result: Completed::Cancelled }),
                     _ => transport(Answer::Working),
                 }
@@ -2545,7 +2666,7 @@ mod tests {
             |_| Ok(()), |_, _| Ok(()), || panic!("polling must not issue a new request ID"),
         );
         let change = Change::Request { offer: OfferName(id(2)) };
-        assert_eq!(client.finish_change(job(), &change, 3), Ok(Completed::Requested));
+        assert_eq!(client.finish_change(job(), &change, 3), Ok(Completed::Requested { placed: true }));
         assert_eq!(client.finish_change(job(), &change, 3), Err(RequestError::UnexpectedAnswer));
         assert_eq!(client.finish_change(job(), &change, 3), Err(RequestError::StillWorking(job())));
         assert_eq!(*polls.lock().unwrap(), 6);
@@ -2704,11 +2825,11 @@ mod tests {
                         Answer::Begun { job: job() }
                     }
                     Call::BatchLines { job: got, after: None } if got == job() => Answer::BatchLines {
-                        lines: vec![BatchLineView { index: 0, progress: BatchLineProgress::Asked { album: batch_album() } }],
+                        lines: vec![BatchLineView { placed: false, index: 0, progress: BatchLineProgress::Asked { album: batch_album() } }],
                         next: cursor(1),
                     },
                     Call::BatchLines { job: got, after } if got == job() && after == cursor(1) => Answer::BatchLines {
-                        lines: vec![BatchLineView { index: 1, progress: BatchLineProgress::Failed { reason: Refusal::NoLongerListed, album: None } }],
+                        lines: vec![BatchLineView { placed: false, index: 1, progress: BatchLineProgress::Failed { reason: Refusal::NoLongerListed, album: None } }],
                         next: None,
                     },
                     call => panic!("unexpected call {call:?}"),
@@ -2722,12 +2843,12 @@ mod tests {
         }).collect();
         let got = client.begin(request_id(), Change::Batch { singles: false, lines }).unwrap();
         assert_eq!(client.batch_lines(got).unwrap(), [
-            BatchLineView { index: 0, progress: BatchLineProgress::Asked { album: batch_album() } },
-            BatchLineView { index: 1, progress: BatchLineProgress::Failed { reason: Refusal::NoLongerListed, album: None } },
+            BatchLineView { placed: false, index: 0, progress: BatchLineProgress::Asked { album: batch_album() } },
+            BatchLineView { placed: false, index: 1, progress: BatchLineProgress::Failed { reason: Refusal::NoLongerListed, album: None } },
         ]);
         assert_eq!(write_call(&message(Call::BatchLines { job: got, after: cursor(2_000) })).map(drop), Err(WireError::Bounds));
         let bad = reply(Answer::BatchLines {
-            lines: vec![BatchLineView { index: 2_000, progress: BatchLineProgress::Waiting }],
+            lines: vec![BatchLineView { placed: false, index: 2_000, progress: BatchLineProgress::Waiting }],
             next: None,
         });
         assert_eq!(write_reply(&bad).map(drop), Err(WireError::Bounds));
@@ -2786,8 +2907,8 @@ mod tests {
         assert_eq!(batch_resolution_progress(since_ms, expires_ms - 1, true), BatchLineProgress::NeedsResolution);
         for (now_ms, live) in [(expires_ms, true), (since_ms, false)] {
             let mut rows = [
-                BatchLineView { index: 0, progress: BatchLineProgress::NeedsResolution },
-                BatchLineView { index: 1, progress: BatchLineProgress::Found { album: batch_album() } },
+                BatchLineView { placed: false, index: 0, progress: BatchLineProgress::NeedsResolution },
+                BatchLineView { placed: false, index: 1, progress: BatchLineProgress::Found { album: batch_album() } },
             ];
             assert!(batch_parked_on_app(&rows));
             rows[0].progress = batch_resolution_progress(since_ms, now_ms, live);
@@ -2804,6 +2925,55 @@ mod tests {
                 BatchResolutionState::Awaiting { since_ms }, Some(&id(2)), now_ms, live,
             ), Err(Refusal::NotAllowed));
         }
+    }
+
+    #[test]
+    fn an_indexed_batch_notes_existing_albums_without_claiming_their_placement() {
+        use crate::http::{Failure, Http, Method, Request, Response};
+
+        struct Disk;
+        impl bulk::Desk for Disk {
+            fn keep(&self, _: Option<Vec<u8>>, _: bool) {}
+            fn keep_checked(&self, _: Vec<u8>) -> bool { true }
+            fn now(&self) -> i64 { 0 }
+            fn singles(&self) -> bool { false }
+        }
+        struct Direct;
+        impl Http for Direct {
+            fn send(&self, request: &Request) -> Result<Response, Failure> {
+                let path = request.url.strip_prefix("http://lidarr.test/api/v1/").unwrap();
+                let answer = match (path, request.method) {
+                    ("artist", Method::Get) => serde_json::json!([{ "id": 1, "foreignArtistId": id(1) }]),
+                    ("album?artistId=1", Method::Get) => serde_json::json!([
+                        { "id": 7, "foreignAlbumId": id(2), "monitored": true },
+                        { "id": 8, "foreignAlbumId": id(3) },
+                    ]),
+                    ("artist/1", Method::Get) => serde_json::json!({ "monitored": true }),
+                    ("album/monitor", Method::Put(body)) => {
+                        let actual: serde_json::Value = serde_json::from_str(body).unwrap();
+                        assert_eq!(actual, serde_json::json!({ "albumIds": [8], "monitored": true }));
+                        serde_json::json!({})
+                    }
+                    ("command", Method::Post(_)) => serde_json::json!({}),
+                    _ => panic!("unexpected Lidarr call"),
+                };
+                Ok(Response::new(200, Vec::new(), move || Ok(answer.to_string())))
+            }
+        }
+
+        let job = bulk::Job::new(Disk);
+        job.start_indexed([2, 3].into_iter().map(|number| bulk::Want {
+            state: bulk::State::Found, offer: Some(album(number).into()), ..bulk::Want::default()
+        }).collect()).unwrap();
+        let lidarr = lidarr::Lidarr::new("http://lidarr.test", "key", None, Arc::new(Direct));
+        job.work_prepared(&lidarr, &|_| {}).unwrap();
+        let rows = job.indexed_lines().unwrap();
+        let projected = rows.iter().map(BatchLineView::from_indexed).collect::<Result<Vec<_>, _>>().unwrap();
+        let [first, second] = projected.as_slice() else { panic!("one row per original line") };
+        assert!(matches!(first.progress, BatchLineProgress::Done { .. }));
+        assert!(matches!(second.progress, BatchLineProgress::Done { .. }));
+        assert!(!first.placed);
+        assert!(second.placed);
     }
 
     #[test]
@@ -2857,25 +3027,34 @@ mod tests {
         assert!(recovered.load(&bytes));
         assert!(recovered.work_prepared(&lidarr, &|_| {}).is_err());
         let current = Listed { id: 7, album: id(2).into(), wanted: true, have: false };
-        assert!(batch_effect_confirmed(&offer, &artist_target(), Some(1), std::slice::from_ref(&current)));
-        assert!(!batch_effect_confirmed(&offer, &artist_target(), Some(3), std::slice::from_ref(&current)));
-        assert!(!batch_effect_confirmed(&offer, &artist_target(), Some(1), &[current.clone(), current]));
-        recovered.reconcile_indexed(0, false).unwrap();
+        let rows = recovered.indexed_lines().unwrap();
+        let placement = rows[0].placement.as_ref();
+        assert_eq!(batch_effect_confirmed(&offer, &artist_target(), Some(1), std::slice::from_ref(&current), placement),
+            PlacementRecovery::Listed { placed: true });
+        assert_eq!(batch_effect_confirmed(&offer, &artist_target(), Some(1), std::slice::from_ref(&current), None),
+            PlacementRecovery::Listed { placed: false });
+        assert_eq!(batch_effect_confirmed(&offer, &artist_target(), Some(3), std::slice::from_ref(&current), placement),
+            PlacementRecovery::Unconfirmed);
+        assert_eq!(batch_effect_confirmed(&offer, &artist_target(), Some(1), &[current.clone(), current], placement),
+            PlacementRecovery::Unconfirmed);
+        recovered.reconcile_indexed(0, PlacementRecovery::Unconfirmed).unwrap();
         let readback = bulk::Job::new(disk.clone());
         assert!(readback.load(&disk.0.lock().unwrap()));
         let projected = readback.indexed_lines().unwrap().iter().map(BatchLineView::from_indexed).collect::<Result<Vec<_>, _>>().unwrap();
         assert_eq!(projected, [0, 1].map(|index| BatchLineView {
             index,
+            placed: false,
             progress: BatchLineProgress::Failed { reason: Refusal::NotDealtWith, album: Some(batch_album()) },
         }));
         assert_eq!(readback.work_prepared(&lidarr, &|_| {}), Ok(()));
 
         let confirmed = bulk::Job::new(Disk::default());
         assert!(confirmed.load(&bytes));
-        confirmed.reconcile_indexed(0, true).unwrap();
+        confirmed.reconcile_indexed(0, PlacementRecovery::Listed { placed: true }).unwrap();
         let projected = confirmed.indexed_lines().unwrap().iter().map(BatchLineView::from_indexed).collect::<Result<Vec<_>, _>>().unwrap();
         assert_eq!(projected, [0, 1].map(|index| BatchLineView {
             index,
+            placed: true,
             progress: BatchLineProgress::Done { album: batch_album() },
         }));
         assert_eq!(confirmed.work_prepared(&lidarr, &|_| {}), Ok(()));

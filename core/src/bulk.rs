@@ -23,7 +23,7 @@
 //! waits and when it gives up, and how the batch stands. Where it's written down, the thread
 //! it runs on and the threads it looks albums up on are the app's (see `Desk`).
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::asked::{Asked, Fill};
-use crate::lidarr::{BulkLidarr, Setup};
+use crate::lidarr::{AlbumPlacement, BulkLidarr, PlacementRecovery, Setup};
 use crate::musicbrainz::MusicBrainz;
 use crate::offer::{Offer, VARIOUS};
 use crate::text::{same_artist, undecorated, words};
@@ -100,9 +100,14 @@ pub struct Want {
     pub lidarr_artist: i64,
     /// It's been noted as asked for (see `asked`).
     pub noted: bool,
+    /// A confirmed placement by this batch, separate from its note.
+    #[serde(skip_serializing_if = "is_false")]
+    pub placed: bool,
     /// It couldn't be asked for, for a reason that may have passed: worth another go.
     pub again: bool,
 }
+
+fn is_false(value: &bool) -> bool { !value }
 
 /// A projected row for each original server batch line, including aliases of
 /// the same canonical want. Slot numbers are stable within its saved batch.
@@ -115,6 +120,8 @@ pub struct IndexedLine {
     pub reason: String,
     /// This group's intent was flushed before an upstream write could start.
     pub before_effect: bool,
+    pub placement: Option<AlbumPlacement>,
+    pub placed: bool,
 }
 
 pub const INTERRUPTED_EFFECT: &str = "Lidarr's change could not be confirmed after the server restarted.";
@@ -123,6 +130,8 @@ pub const INTERRUPTED_EFFECT: &str = "Lidarr's change could not be confirmed aft
 struct Indexed {
     slots: Vec<usize>,
     before_effect: BTreeSet<usize>,
+    #[serde(default)]
+    placements: BTreeMap<usize, AlbumPlacement>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -279,6 +288,10 @@ impl crate::lidarr::WayBack for Job {
         Err("What Lidarr's settings would have to be put back to couldn't be written down on this PC first, so they weren't changed".into())
     }
 
+    fn before_request_album(&self, placement: &AlbumPlacement) -> Result<(), String> {
+        self.keep_placements(std::slice::from_ref(placement))
+    }
+
     /// Crossed off: only the way back this request wrote, not one the batch had before it.
     fn put_back(&self, lidarr: &str, artist: i64, before: &str) {
         let back = Back { artist, before: before.to_string(), lidarr: Some(lidarr.to_string()) };
@@ -358,6 +371,10 @@ impl Job {
             let slots = index.slots.iter().copied().collect::<BTreeSet<_>>();
             slots.is_empty() || slots.iter().any(|&slot| slot >= batch.wants.len())
                 || slots.len() != batch.wants.len() || !index.before_effect.is_subset(&slots)
+                || index.placements.iter().any(|(slot, placement)| {
+                    !index.before_effect.contains(slot) || batch.wants.get(*slot).and_then(|want| want.offer.as_ref())
+                        .is_none_or(|offer| offer.artist_id != placement.artist || offer.album != placement.release)
+                })
         }) {
             return false;
         }
@@ -434,7 +451,9 @@ impl Job {
         let mut saved = Batch::default();
         let mut index = Indexed::default();
         let mut by_release = HashMap::<(String, String), usize>::new();
-        for want in wants {
+        for mut want in wants {
+            // Placement evidence belongs to the effect this job is about to perform.
+            want.placed = false;
             let slot = match (want.state, &want.offer) {
                 (State::Found, Some(offer)) if !offer.artist_id.is_empty() && !offer.album.is_empty() => {
                     *by_release.entry((offer.artist_id.clone(), offer.album.clone())).or_insert(saved.wants.len())
@@ -474,21 +493,23 @@ impl Job {
                     offer: want.offer.clone(),
                     reason: want.reason.clone(),
                     before_effect: indexed.before_effect.contains(&slot),
+                    placement: indexed.placements.get(&slot).cloned(),
+                    placed: want.placed,
                 })
             }).collect()
         })
     }
 
-    /// On restart, resolve each uncertain slot before running more work. Supply
-    /// true only after checking the same Lidarr binding and exact artist/release
-    /// and observing that the release is wanted or has arrived. A false result
-    /// cannot authorize replay of an uncertain write.
-    pub fn reconcile_indexed(&self, slot: usize, placed: bool) -> Result<(), String> {
+    /// On restart reconcile only observations from the original endpoint and
+    /// exact artist/release. A listed release can be recorded in history even
+    /// when this batch has no evidence of having placed it.
+    pub fn reconcile_indexed(&self, slot: usize, outcome: PlacementRecovery) -> Result<(), String> {
         if self.running() {
             return Err("The indexed batch is running.".into());
         }
         let previous = self.with(|batch| {
-            if !batch.indexed.as_ref()?.before_effect.contains(&slot) {
+            let indexed = batch.indexed.as_ref()?;
+            if !indexed.before_effect.contains(&slot) {
                 return None;
             }
             let want = batch.wants.get_mut(slot)?;
@@ -496,8 +517,18 @@ impl Job {
                 return None;
             }
             let previous = want.clone();
-            want.state = if placed { State::Done } else { State::Failed };
-            want.reason = if placed { String::new() } else { INTERRUPTED_EFFECT.into() };
+            match outcome {
+                PlacementRecovery::Unconfirmed => {
+                    want.state = State::Failed;
+                    want.reason = INTERRUPTED_EFFECT.into();
+                    want.placed = false;
+                }
+                PlacementRecovery::Listed { placed } => {
+                    want.state = State::Done;
+                    want.reason.clear();
+                    want.placed = placed && indexed.placements.get(&slot).is_some_and(AlbumPlacement::newly_placed);
+                }
+            }
             want.again = false;
             Some(previous)
         }).ok_or("This batch slot has no uncertain effect.")?;
@@ -532,6 +563,39 @@ impl Job {
             }
         });
         Err("The changes to Lidarr could not be saved before they were sent.".into())
+    }
+
+    /// Commit the first album-level observation at the actual placement write.
+    /// The earlier group marker alone never proves that this request placed it.
+    fn keep_placements(&self, placements: &[AlbumPlacement]) -> Result<(), String> {
+        if placements.is_empty() {
+            return Ok(());
+        }
+        let added = self.with(|batch| {
+            let Some(index) = &mut batch.indexed else { return Vec::new() };
+            let mut added = Vec::new();
+            for placement in placements {
+                let Some(slot) = batch.wants.iter().position(|want| want.offer.as_ref().is_some_and(|offer| {
+                    offer.album == placement.release && offer.artist_id == placement.artist
+                })) else { continue };
+                if index.before_effect.contains(&slot) && let std::collections::btree_map::Entry::Vacant(entry) = index.placements.entry(slot) {
+                    entry.insert(placement.clone());
+                    added.push(slot);
+                }
+            }
+            added
+        });
+        if added.is_empty() || self.save_checked() {
+            return Ok(());
+        }
+        self.with(|batch| {
+            if let Some(index) = &mut batch.indexed {
+                for slot in added {
+                    index.placements.remove(&slot);
+                }
+            }
+        });
+        Err("The exact albums could not be journaled before they were sent to Lidarr.".into())
     }
 
     /// Whether there's a batch with something still to do with the Lidarr at `lidarr` (its
@@ -979,7 +1043,7 @@ impl Job {
 /// How asking for one album went.
 enum Went {
     /// It's on Lidarr's list.
-    Listed,
+    Listed { placed: bool },
     /// Lidarr has been asked and is reading the artist in; to be checked when it's done.
     /// With whether it can be counted as asked for already.
     Sent(bool),
@@ -1029,8 +1093,8 @@ impl Job {
                     0,
                     offers
                         .iter()
-                        .map(|offer| match lidarr.request(offer, self) {
-                            Ok(()) => Went::Listed,
+                        .map(|offer| match lidarr.request_placement(offer, self) {
+                            Ok(placed) => Went::Listed { placed },
                             Err(reason) => Went::Failed(reason.trim_end_matches('.').to_string()),
                         })
                         .collect(),
@@ -1061,8 +1125,9 @@ impl Job {
                             want.lidarr_artist = number;
                             want.reason.clear();
                             let counts = match went {
-                                Went::Listed => {
+                                Went::Listed { placed } => {
                                     want.state = State::Done;
+                                    want.placed = placed;
                                     true
                                 }
                                 Went::Sent(counts) => {
@@ -1129,14 +1194,18 @@ impl Job {
             reading = listed.is_empty() || twice(lidarr, || lidarr.busy_with(&HashSet::from([artist])))?.contains(&artist);
         }
         let mut wanted = Vec::new();
+        let mut placements = Vec::new();
         let mut went = Vec::new();
         for offer in offers {
             went.push(match listed.iter().find(|known| known.album == offer.album) {
                 Some(known) => {
-                    if !known.wanted && !known.have {
+                    let placement = AlbumPlacement::from_listed(&offer.artist_id, artist, known);
+                    let placed = placement.newly_placed();
+                    if placed {
                         wanted.push(known.id);
+                        placements.push(placement);
                     }
-                    Went::Listed
+                    Went::Listed { placed }
                 }
                 None if reading => Went::Sent(false),
                 // Lidarr only lists the kinds of release an artist's profile names. A single, an
@@ -1163,7 +1232,7 @@ impl Job {
         // changing the same record meanwhile would be written over (`WayBack::turn`).
         {
             let _turn = crate::lidarr::WayBack::turn(self);
-            lidarr.want(artist, &wanted)?;
+            lidarr.want_before(artist, &wanted, &|| self.keep_placements(&placements))?;
         }
         Ok(went)
     }
@@ -1176,8 +1245,8 @@ impl Job {
             // The long way: one release at a time, each seen onto the list before the next.
             let went: Vec<Went> = offers
                 .iter()
-                .map(|offer| match lidarr.request(offer, self) {
-                    Ok(()) => Went::Listed,
+                .map(|offer| match lidarr.request_placement(offer, self) {
+                    Ok(placed) => Went::Listed { placed },
                     Err(reason) => Went::Failed(reason.trim_end_matches('.').to_string()),
                 })
                 .collect();
@@ -1188,7 +1257,8 @@ impl Job {
             Some(setup) => setup,
             None => setup.insert(twice(lidarr, || lidarr.setup())?),
         };
-        let number = lidarr.add_wanting(setup, offers)?;
+        let placements: Vec<_> = offers.iter().map(|offer| AlbumPlacement::unlisted(offer, None)).collect();
+        let number = lidarr.add_wanting_before(setup, offers, &|| self.keep_placements(&placements))?;
         Ok((number, offers.iter().map(|_| Went::Sent(true)).collect(), proof.is_none()))
     }
 
@@ -1323,9 +1393,13 @@ impl Job {
         if listed.is_empty() && !places.is_empty() && !given_up {
             return Ok(Finished::Empty);
         }
-        let wanted: Vec<i64> =
-            places.iter().filter_map(|(_, offer)| listed.iter().find(|known| known.album == offer.album)).filter(|known| !known.wanted && !known.have).map(|known| known.id).collect();
-        lidarr.want(artist, &wanted)?;
+        let placements: Vec<_> = places.iter().filter_map(|(_, offer)| {
+            let row = listed.iter().find(|known| known.album == offer.album)?;
+            let placement = AlbumPlacement::from_listed(&offer.artist_id, artist, row);
+            placement.newly_placed().then_some(placement)
+        }).collect();
+        let wanted: Vec<_> = placements.iter().filter_map(|placement| placement.album_number).collect();
+        lidarr.want_before(artist, &wanted, &|| self.keep_placements(&placements))?;
         if let Some(before) = self.with(|batch| batch.restore.iter().find(|known| known.of(&lidarr.way_back_address(), artist)).map(|known| known.before.clone())) {
             lidarr.set_new_releases(artist, &before)?;
             self.with(|batch| batch.restore.retain(|known| !known.of(&lidarr.way_back_address(), artist)));
@@ -1336,7 +1410,13 @@ impl Job {
             let (mut notes, mut gone) = (Vec::new(), Vec::new());
             for (at, offer) in &places {
                 let want = &mut batch.wants[*at];
-                if listed.iter().any(|known| known.album == offer.album) {
+                if let Some(row) = listed.iter().find(|known| known.album == offer.album) {
+                    want.placed = placements.iter().any(|placement| placement.release == offer.album)
+                        || batch.indexed.as_ref().and_then(|index| index.placements.get(at)).is_some_and(|placement| {
+                            (row.wanted || row.have) && placement.newly_placed()
+                                && placement.artist_number.is_none_or(|number| number == artist)
+                                && placement.album_number.is_none_or(|number| number == row.id)
+                        });
                     want.state = State::Done;
                     if !want.noted {
                         want.noted = true;
