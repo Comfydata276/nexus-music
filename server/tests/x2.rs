@@ -2192,8 +2192,8 @@ fn the_requests_tables_take_s13s_rows_through_the_one_writer() {
         .write_data(T0 + 2 * MINUTE, |tx| {
             tx.execute("INSERT INTO requests_jobs (id, restore, account, session, request, change, work) VALUES (1, 0, ?1, 5, x'01', x'02', x'03')", [BOB as i64])?;
             tx.execute("INSERT INTO requests_lines (job, line, progress) VALUES (1, 0, 'asked')", [])?;
-            tx.execute("INSERT INTO requests_owners (binding, account, release, asked_ms) VALUES (x'aa', ?1, 'release-1', 1)", [BOB as i64])?;
-            tx.execute("INSERT INTO requests_owners (binding, account, release, asked_ms) VALUES (x'bb', ?1, 'release-1', 1)", [BOB as i64])?;
+            tx.execute("INSERT INTO requests_owners (binding, account, release, asked_ms, metadata, placed) VALUES (x'aa', ?1, 'release-1', 1, x'01', 1)", [BOB as i64])?;
+            tx.execute("INSERT INTO requests_owners (binding, account, release, asked_ms, metadata) VALUES (x'bb', ?1, 'release-1', 1, x'01')", [BOB as i64])?;
             tx.execute("INSERT INTO requests_way_back (binding, artist, artist_key, setting) VALUES (x'aa', 7, 'a-musicbrainz-id', 'monitored')", [])?;
             Ok(((), true))
         })
@@ -2208,5 +2208,28 @@ fn the_requests_tables_take_s13s_rows_through_the_one_writer() {
     });
     assert!(twice.is_err());
     assert_eq!(count_all(&keeper, "requests_lines"), 1);
+    // A placement once recorded is ORed, never cleared: a later ask that only joined the
+    // history cannot take the right to remove away, and an attempt to clear it fails whole.
+    let placed = |keeper: &Keeper, binding: &str| -> i64 {
+        keeper.data().connection().query_row(&format!("SELECT placed FROM requests_owners WHERE binding = x'{binding}' AND account = ?1"), [BOB as i64], |row| row.get(0)).unwrap()
+    };
+    keeper
+        .write_data(T0 + 3 * MINUTE, |tx| {
+            tx.execute(
+                "INSERT INTO requests_owners (binding, account, release, asked_ms, metadata, placed) VALUES (x'aa', ?1, 'release-1', 2, x'02', 0)
+                 ON CONFLICT (binding, account, release) DO UPDATE SET placed = max(placed, excluded.placed), metadata = excluded.metadata, asked_ms = excluded.asked_ms",
+                [BOB as i64],
+            )?;
+            Ok(((), true))
+        })
+        .unwrap();
+    assert_eq!((placed(&keeper, "aa"), placed(&keeper, "bb")), (1, 0));
+    let cleared = keeper.write_data(T0 + 3 * MINUTE, |tx| {
+        tx.execute("UPDATE requests_owners SET placed = 0 WHERE binding = x'aa'", [])?;
+        Ok(((), true))
+    });
+    assert!(cleared.is_err(), "a recorded placement was cleared");
+    assert_eq!(placed(&keeper, "aa"), 1);
+
     keeper.close();
 }
