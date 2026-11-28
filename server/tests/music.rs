@@ -546,9 +546,11 @@ fn an_admin_sets_a_music_login_and_the_person_plays_and_no_failure_touches_it() 
     let asked_before = between.taken.load(Ordering::SeqCst);
     let (status, _) = backend.post(admin::SET_MUSIC_LOGIN, None, admin::encode(&request).unwrap().bytes());
     assert_eq!(status, 401);
-    // Nor can a call that is not one.
-    let (status, _) = backend.post(admin::REQUEST_GRANT, Some(&phone.session), b"{}");
+    // Nor can a call that is not one, nor an app's session at an admin call.
+    let (status, _) = backend.post_page(admin::REQUEST_GRANT, Some(&admin.signed.session), b"{}");
     assert_eq!(status, 400);
+    let (status, _) = backend.post(admin::REQUEST_GRANT, Some(&phone.session), b"{}");
+    assert_eq!(status, 403);
     assert_eq!(between.taken.load(Ordering::SeqCst), asked_before);
 
     // Forcing the phone out does not change its login (9.5): the person's other device is
