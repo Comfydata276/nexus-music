@@ -25,9 +25,9 @@ use std::sync::{Mutex, MutexGuard};
 
 use axum::{Extension, Router};
 use axum::body::Body;
-use axum::extract::{OriginalUri, State};
+use axum::extract::State;
 use axum::http::header::AUTHORIZATION;
-use axum::http::{HeaderMap, Response};
+use axum::http::{HeaderMap, Response, Uri};
 use axum::routing::post;
 use nexus_core::nexus::account::{
     self, AccountId, DeviceId, NotSignedIn, Receipt, RequestHead, SessionId,
@@ -1319,7 +1319,7 @@ enum Dispatch {
 
 async fn call(
     State(service): State<Arc<Requests>>,
-    OriginalUri(uri): OriginalUri,
+    uri: Uri,
     caller: Option<Extension<Caller>>,
     headers: HeaderMap,
     body: Bytes,
