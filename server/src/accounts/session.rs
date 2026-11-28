@@ -22,7 +22,7 @@ use nexus_core::nexus::account::{
     Name, NotAllowed, NotSignedIn, Notice, Password, PasswordChanged, PasswordDoor, Person, Receipt, Refusal, Reply, RequestHead, SignIn, SignOut, SignOutNote, SignOutSecret,
     SignedIn, SignedOut, Stamp,
 };
-use nexus_core::nexus::kept::{Access, Account, AccountState, Bearer, Denied, Effects, Fingerprint, FreshSession, LeaveFor, PasswordCheck, SessionTarget};
+use nexus_core::nexus::kept::{Access, Account, AccountState, Bearer, Denied, Effects, Fingerprint, FreshSession, GrantIntent, GrantUse, LeaveFor, PasswordCheck, SessionTarget};
 use nexus_core::nexus::proto::{BackendId, SPEAKS, Speaks};
 
 use super::check::{Checked, PasswordWorkers};
@@ -146,9 +146,11 @@ struct Prepared {
     email: Email,
     check: PasswordCheck,
     stored: Option<data::Password>,
-    /// The device this sign-in is for: the one the secret is known by, or the id it would get.
+    /// The device this sign-in is for: the one the secret is found on, or the id it would get.
     device: DeviceId,
-    known: bool,
+    /// The device, if kept says the account knows it (a forced-out one is not, until it signs
+    /// in again): the door and its wait are this device's.
+    known: Option<DeviceId>,
 }
 
 /// What a sign-in leaves to be made and kept, once the password (or code) has been checked.
@@ -172,6 +174,8 @@ struct Described {
     name: Name,
     kind: &'static str,
     version: String,
+    /// Signing in from the admin's page.
+    page: bool,
 }
 
 impl Described {
@@ -181,25 +185,26 @@ impl Described {
             account::DeviceKind::Phone => "phone",
         };
         let version = format!("{}.{}.{}", sign_in.app_version.major, sign_in.app_version.minor, sign_in.app_version.patch);
-        Described { name: sign_in.device_name.clone(), kind, version }
+        Described { name: sign_in.device_name.clone(), kind, version, page: false }
     }
 }
 
 impl Accounts {
     /// 8.6: one call, from the app's form. With a password, or with a one-time code and the new
     /// password chosen with it (8.5).
-    pub async fn sign_in(&self, request: SignIn) -> Answer {
-        match self.signing_in(request).await {
+    /// `page`: the sign-in is the admin's page's (it came from the page's own origin, 7.3).
+    pub async fn sign_in(&self, request: SignIn, page: bool) -> Answer {
+        match self.signing_in(request, page).await {
             Ok(answer) => answer,
             Err(refusal) => refused(refusal),
         }
     }
 
-    async fn signing_in(&self, request: SignIn) -> Result<Answer, Refusal> {
+    async fn signing_in(&self, request: SignIn, page: bool) -> Result<Answer, Refusal> {
         if !speaks_with(&request.speaks) {
             return Err(incompatible());
         }
-        let described = Described::of(&request);
+        let described = Described { page, ..Described::of(&request) };
         let secret = request.device_secret.clone();
         match request.credential {
             Credential::Password { email, password } => self.with_password(email, password, secret, described).await,
@@ -231,14 +236,14 @@ impl Accounts {
                 let expected = stored.as_ref().map_or_else(|| Fingerprint::from_bytes(fresh_bytes().unwrap_or([0; 32])), |kept| Fingerprint::from_bytes(kept.hash));
                 let vacant = DeviceId::new(keeper.vacant_device()).ok_or(Refusal::NotDealtWith)?;
                 let print = Fingerprint::of(secret_for_check.expose_bytes());
-                let known = account.rows().devices.iter().find(|(_, row)| row.secret == print).map(|(id, _)| *id);
+                let found = account.rows().devices.iter().find(|(_, row)| row.secret == print).map(|(id, _)| *id);
                 let check = account
                     .sign_in_turn(keeper.clock(now), |turn| turn.check_sign_in(&secret_for_check, vacant, expected))
                     .apply(|effects| keeper.persist(effects, &[], now))
                     .map_err(not_dealt_with)?
                     .map_err(said)?;
-                let device = known.unwrap_or(vacant);
-                Ok(Some(Prepared { number, email: asked, known: check.known_device(), check, stored, device }))
+                let device = found.unwrap_or(vacant);
+                Ok(Some(Prepared { number, email: asked, known: check.known_device_id(), check, stored, device }))
             })
             .await??;
         // (2) On a worker: the slow check, through the door kept's check says (8.3). An email
@@ -247,8 +252,8 @@ impl Accounts {
             let _ = self.workers.check(&email, PasswordDoor::Other, None, password, None).await?;
             return Err(wrong());
         };
-        let door = PasswordDoor::for_device(prepared.known);
-        let device = (door == PasswordDoor::KnownDevice).then_some(prepared.device);
+        let door = PasswordDoor::for_device(prepared.known.is_some());
+        let device = prepared.known;
         let checked = self.workers.check(&prepared.email, door, device, password, prepared.stored).await?;
         let Checked::Match { derived, replacement } = checked else { return Err(wrong()) };
         // (3) On the thread that writes: the sign-in, made in the one step that looks again.
@@ -426,7 +431,7 @@ impl Accounts {
     }
 
     async fn changing_password(&self, bearer: account::Session, request: ChangePassword) -> Result<Answer, Refusal> {
-        let ChangePassword { head, current_password, new_password, .. } = request;
+        let ChangePassword { head, request_id, current_password, new_password } = request;
         let clock = self.clock.clone();
         let hash = Fingerprint::of(bearer.expose_bytes());
         let (number, device, email, check, stored) = {
@@ -440,7 +445,7 @@ impl Accounts {
                     let expected = stored.as_ref().map_or_else(|| Fingerprint::from_bytes([0; 32]), |kept| Fingerprint::from_bytes(kept.hash));
                     let email = account.state().email.clone();
                     let check = account
-                        .request(head.restore, keeper.clock(now), |turn| turn.check_leave(Bearer { device, hash: &hash, grant: None }, LeaveFor::ChangePassword, expected))
+                        .request(head.restore, keeper.clock(now), |turn| turn.check_leave(Bearer { device, hash: &hash, grant: None }, GrantIntent { request_id, change: LeaveFor::ChangePassword }, expected))
                         .apply(|effects| keeper.persist(effects, &[], now))
                         .map_err(not_dealt_with)?
                         .map_err(said)?;
@@ -463,14 +468,13 @@ impl Accounts {
                 let receipt_of_check = check.check(derived, keeper.clock(now)).map_err(said)?;
                 let mut account = keeper.load(number).map_err(not_dealt_with)?;
                 let grant = account::GrantSecret::from_bytes(fresh_bytes()?);
-                let bearer = |grant| Bearer { device, hash: &hash, grant };
                 account
                     .request(head.restore, keeper.clock(now), |turn| turn.grant_leave(receipt_of_check, &grant))
                     .apply(|effects| keeper.persist(effects, &[], now))
                     .map_err(not_dealt_with)?
                     .map_err(said)?;
                 account
-                    .request(head.restore, keeper.clock(now), |turn| turn.change_password(bearer(Some(&grant))))
+                    .request(head.restore, keeper.clock(now), |turn| turn.change_password(Bearer { device, hash: &hash, grant: Some(GrantUse { request_id, secret: &grant }) }))
                     .apply(|effects| keeper.persist(effects, &[Change::Password { account: number, password: Some(&chosen) }], now))
                     .map_err(not_dealt_with)?
                     .map_err(said)?;
@@ -522,11 +526,9 @@ fn arrived(keeper: &mut Keeper, head: &RequestHead, hash: &Fingerprint, access: 
     Ok((number, device, account))
 }
 
-/// Section 11: the note ends its one session and nothing else. A note for a session that has
-/// gone is already done.
-/// CARRIED (C3r's `Turn::sign_out_by_note` is on `t3/nexus-c3rb` `066116b`, not yet in the
-/// base): the note's secret is checked against the fingerprint kept beside its session, and
-/// then that session is ended as kept ends one signed out on.
+/// Section 11: the note ends its one session and nothing else, and needs no session (kept's
+/// `sign_out_by_note`). A note for a session that has gone is already done; one whose secret
+/// is not that session's is refused as a session that has ended.
 fn by_note(keeper: &mut Keeper, head: &RequestHead, note: SignOutNote, now: u64) -> Result<Answer, Refusal> {
     if !speaks_with(&head.speaks) {
         return Err(incompatible());
@@ -535,17 +537,13 @@ fn by_note(keeper: &mut Keeper, head: &RequestHead, note: SignOutNote, now: u64)
         // Every session was ended when the data was put back: so was this one.
         return Err(Refusal::NotSignedIn(NotSignedIn::DataPutBack));
     }
-    let Some((number, device, hash, revoke)) = rows::session_by_id(keeper.data().connection(), note.session).map_err(not_dealt_with)? else {
+    let Some((number, device, _, _)) = rows::session_by_id(keeper.data().connection(), note.session).map_err(not_dealt_with)? else {
         return Err(ended());
     };
     let given = Fingerprint::of(note.secret.expose_bytes());
-    if revoke.map(Fingerprint::from_bytes) != Some(given) {
-        return Err(ended());
-    }
-    let hash = Fingerprint::from_bytes(hash);
     let mut account = keeper.load(number).map_err(not_dealt_with)?;
     account
-        .request(head.restore, keeper.clock(now), |turn| turn.sign_out(Bearer { device, hash: &hash, grant: None }))
+        .request(head.restore, keeper.clock(now), |turn| turn.sign_out_by_note(SessionTarget { device, session: note.session }, &given))
         .apply(|effects| keeper.persist(effects, &[], now))
         .map_err(not_dealt_with)?
         .map_err(said)?;
@@ -568,9 +566,14 @@ fn finish_sign_in(
     step: impl FnOnce(nexus_core::nexus::kept::Turn<'_>, FreshSession, Option<&mut Account>) -> Result<nexus_core::nexus::kept::SessionGrant, Denied>,
 ) -> Result<Answer, Refusal> {
     let mut account = keeper.load(number).map_err(not_dealt_with)?;
+    // CARRIED (asked of C3r): the admin's page signs in an admin's account only (S10a's ask,
+    // 7.3). Said only after the right password, as "switched off" is.
+    if described.page && !account.state().admin {
+        return Err(Refusal::NotAllowed(NotAllowed::Denied));
+    }
     let made = made()?;
     let id = keeper.fresh_session().ok_or(Refusal::NotDealtWith)?;
-    let fresh = FreshSession { id, hash: made.hash.clone() };
+    let fresh = FreshSession { id, hash: made.hash.clone(), sign_out: Fingerprint::from_bytes(made.revoke) };
     // A device signed in to another account now is signed out of it by this sign-in (8.6).
     let print = Fingerprint::of(secret.expose_bytes());
     let other = rows::other_accounts_signed_in(keeper.data().connection(), print.as_bytes(), number).map_err(not_dealt_with)?.into_iter().next();
@@ -580,7 +583,6 @@ fn finish_sign_in(
     };
     let mut extra = vec![
         Change::Describe { device: device.get(), name: described.name.as_str(), kind: described.kind, version: &described.version },
-        Change::Revoke { device: device.get(), session: id.get(), revoke: &made.revoke },
     ];
     extra.extend(passwords.iter().map(|password| Change::Password { account: number, password: Some(password) }));
     let granted = account
@@ -603,7 +605,8 @@ fn finish_sign_in(
         person: Person { id: AccountId::new(number).ok_or(Refusal::NotDealtWith)?, revision: state.revision, email: state.email.clone(), name, admin: state.admin },
         device,
         restore: keeper.restore(),
-        // Until S9 there is never a music login to hand out (the slice notes, S8).
+        // Until S9 there is never a music login to hand out (the slice notes, S8); and the
+        // admin's page is never handed one (S10a's ask; 7.3, no secret in the page).
         music: MusicLoginResult::NoneSetYet,
         notice: Notice::new(RECORDED).ok_or(Refusal::NotDealtWith)?,
     };

@@ -18,8 +18,22 @@ use zeroize::Zeroize;
 
 use super::session::{Accounts, Answer, refused};
 
-/// The routes of S8 added to `base` (`hello`'s).
-pub fn router(base: Router, accounts: Arc<Accounts>) -> Router {
+/// What every call is handed: the accounts, and the admin's page's own origin.
+#[derive(Clone)]
+struct Calls {
+    accounts: Arc<Accounts>,
+    public_origin: Option<Arc<str>>,
+}
+
+/// 7.3: a call from a browser (it says it is the page's, or a browser sent an `Origin`) is
+/// taken only as the page's own: JSON, marked `X-Nexus-Admin: 1`, from exactly
+/// `NEXUS_PUBLIC_ORIGIN` (S10a's check). An app's call carries neither.
+fn from_a_browser_not_the_page(calls: &Calls, headers: &HeaderMap) -> bool {
+    crate::admin::is_browser(headers) && !crate::admin::browser_origin_allowed(headers, calls.public_origin.as_deref())
+}
+
+/// The routes of S8 added to `base` (`hello`'s and the admin's document).
+pub fn router(base: Router, accounts: Arc<Accounts>, public_origin: Option<Arc<str>>) -> Router {
     let calls: Router = Router::new()
         .route(account::SIGN_IN, post(sign_in))
         .route(account::SIGN_OUT, post(sign_out))
@@ -27,7 +41,7 @@ pub fn router(base: Router, accounts: Arc<Accounts>) -> Router {
         .route(account::FORCE_OUT, post(force_out))
         .route(account::CHANGE_PASSWORD, post(change_password))
         .route(account::MUSIC_LOGIN, post(music_login))
-        .with_state(accounts);
+        .with_state(Calls { accounts, public_origin });
     base.merge(calls)
 }
 
@@ -62,21 +76,36 @@ fn ended() -> Response<Body> {
     respond(refused(Refusal::NotSignedIn(NotSignedIn::SessionEnded)))
 }
 
-async fn sign_in(State(accounts): State<Arc<Accounts>>, body: Bytes) -> Response<Body> {
+async fn sign_in(State(calls): State<Calls>, headers: HeaderMap, body: Bytes) -> Response<Body> {
+    if from_a_browser_not_the_page(&calls, &headers) {
+        let _ = read(body, |_| Ok(()));
+        return respond(refused(Refusal::Malformed));
+    }
+    let page = crate::admin::is_browser(&headers);
     match read(body, account::read::<SignIn>) {
-        Ok(request) => respond(accounts.sign_in(request).await),
+        Ok(request) => respond(calls.accounts.sign_in(request, page).await),
         Err(answer) => respond(answer),
     }
 }
 
-async fn sign_out(State(accounts): State<Arc<Accounts>>, headers: HeaderMap, body: Bytes) -> Response<Body> {
+async fn sign_out(State(calls): State<Calls>, headers: HeaderMap, body: Bytes) -> Response<Body> {
+    if from_a_browser_not_the_page(&calls, &headers) {
+        let _ = read(body, |_| Ok(()));
+        return respond(refused(Refusal::Malformed));
+    }
+    let accounts = &calls.accounts;
     match read(body, account::read::<SignOut>) {
         Ok(request) => respond(accounts.sign_out(bearer(&headers), request).await),
         Err(answer) => respond(answer),
     }
 }
 
-async fn devices(State(accounts): State<Arc<Accounts>>, headers: HeaderMap, body: Bytes) -> Response<Body> {
+async fn devices(State(calls): State<Calls>, headers: HeaderMap, body: Bytes) -> Response<Body> {
+    if from_a_browser_not_the_page(&calls, &headers) {
+        let _ = read(body, |_| Ok(()));
+        return respond(refused(Refusal::Malformed));
+    }
+    let accounts = &calls.accounts;
     let Some(session) = bearer(&headers) else { return ended() };
     match read(body, account::read::<ListDevices>) {
         Ok(request) => respond(accounts.devices(session, request).await),
@@ -84,7 +113,12 @@ async fn devices(State(accounts): State<Arc<Accounts>>, headers: HeaderMap, body
     }
 }
 
-async fn force_out(State(accounts): State<Arc<Accounts>>, headers: HeaderMap, body: Bytes) -> Response<Body> {
+async fn force_out(State(calls): State<Calls>, headers: HeaderMap, body: Bytes) -> Response<Body> {
+    if from_a_browser_not_the_page(&calls, &headers) {
+        let _ = read(body, |_| Ok(()));
+        return respond(refused(Refusal::Malformed));
+    }
+    let accounts = &calls.accounts;
     let Some(session) = bearer(&headers) else { return ended() };
     match read(body, account::read::<ForceOut>) {
         Ok(request) => respond(accounts.force_out(session, request).await),
@@ -92,7 +126,12 @@ async fn force_out(State(accounts): State<Arc<Accounts>>, headers: HeaderMap, bo
     }
 }
 
-async fn change_password(State(accounts): State<Arc<Accounts>>, headers: HeaderMap, body: Bytes) -> Response<Body> {
+async fn change_password(State(calls): State<Calls>, headers: HeaderMap, body: Bytes) -> Response<Body> {
+    if from_a_browser_not_the_page(&calls, &headers) {
+        let _ = read(body, |_| Ok(()));
+        return respond(refused(Refusal::Malformed));
+    }
+    let accounts = &calls.accounts;
     let Some(session) = bearer(&headers) else { return ended() };
     match read(body, account::read::<ChangePassword>) {
         Ok(request) => respond(accounts.change_password(session, request).await),
@@ -100,7 +139,12 @@ async fn change_password(State(accounts): State<Arc<Accounts>>, headers: HeaderM
     }
 }
 
-async fn music_login(State(accounts): State<Arc<Accounts>>, headers: HeaderMap, body: Bytes) -> Response<Body> {
+async fn music_login(State(calls): State<Calls>, headers: HeaderMap, body: Bytes) -> Response<Body> {
+    if from_a_browser_not_the_page(&calls, &headers) {
+        let _ = read(body, |_| Ok(()));
+        return respond(refused(Refusal::Malformed));
+    }
+    let accounts = &calls.accounts;
     let Some(session) = bearer(&headers) else { return ended() };
     match read(body, account::read::<GetMusicLogin>) {
         Ok(request) => respond(accounts.music_login(session, request.head).await),

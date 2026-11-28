@@ -36,7 +36,7 @@ pub type ById = (u64, DeviceId, [u8; 32], Option<[u8; 32]>);
 
 pub fn session_by_id(data: &Connection, id: SessionId) -> rusqlite::Result<Option<ById>> {
     data.query_row(
-        "SELECT devices.account, devices.id, sessions.hash, sessions.revoke FROM sessions JOIN devices ON devices.id = sessions.device WHERE sessions.id = ?1",
+        "SELECT devices.account, devices.id, sessions.hash, sessions.sign_out FROM sessions JOIN devices ON devices.id = sessions.device WHERE sessions.id = ?1",
         [signed(id.get())?],
         |row| {
             let revoke: Option<Vec<u8>> = row.get(3)?;

@@ -206,7 +206,7 @@ fn run(settings: Settings) -> ExitCode {
             settings.data,
             settings.state,
         );
-        let shell = serve::Shell::backend(settings.proxy, &nexus_music_server::hello(id), accounts.clone());
+        let shell = serve::Shell::backend(settings.proxy, &nexus_music_server::hello(id), accounts.clone(), settings.public_origin.as_deref());
         serve::serve(listener, shell, true).await;
         ExitCode::SUCCESS
     });
