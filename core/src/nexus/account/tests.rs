@@ -731,22 +731,39 @@ fn load(worker_busy: bool, account_busy: bool, waiting: usize) -> PasswordLoad {
 }
 
 #[test]
-fn the_known_device_worker_is_isolated_and_has_no_startup_closure() {
+fn a_stolen_known_device_slows_only_itself() {
     let email = email();
     let mut waits = PasswordWaits::default();
-    assert_eq!(PasswordDoor::for_device(true), PasswordDoor::KnownDevice);
-    assert_eq!(PasswordDoor::for_device(false), PasswordDoor::Other);
-    assert_eq!(admit_password_check(PasswordDoor::KnownDevice, load(false, false, 0), &waits, &email, 0), PasswordAdmission::Check);
-    waits.record_wrong(PasswordDoor::KnownDevice, &email, 0);
-    assert_eq!(waits.retry_after(&email, 0), None);
+    let known = PasswordDoor::KnownDevice;
+    let other = PasswordDoor::Other;
+    let stolen = Some(id(1));
+    let owner = Some(id(2));
+    let available = load(false, false, 0);
+    assert_eq!(PasswordDoor::for_device(true), known);
+    assert_eq!(PasswordDoor::for_device(false), other);
+    assert_eq!(admit_password_check(known, available, &waits, &email, stolen, 0), PasswordAdmission::Check);
+    assert_eq!(admit_password_check(known, available, &waits, &email, None, 0), PasswordAdmission::Busy);
 
-    waits.record_wrong(PasswordDoor::Other, &email, 0);
-    assert_eq!(admit_password_check(PasswordDoor::Other, load(true, true, usize::MAX), &waits, &email, 0),
-        PasswordAdmission::ComeBack(Wait::new(1).unwrap()));
-    assert_eq!(admit_password_check(PasswordDoor::KnownDevice, load(false, false, usize::MAX), &waits, &email, 0),
-        PasswordAdmission::Check);
+    let mut now = 0;
+    for seconds in [1, 2, 4, 8, 16, 32, 60, 60] {
+        waits.record_wrong(known, &email, stolen, now);
+        let decision = admit_password_check(known, available, &waits, &email, stolen, now);
+        assert_eq!(decision.refusal(), Some(Refusal::Busy { retry_after_seconds: Wait::new(seconds) }));
+        assert_eq!(admit_password_check(known, load(false, false, usize::MAX), &waits, &email, owner, now), PasswordAdmission::Check);
+        assert_eq!(admit_password_check(other, available, &waits, &email, stolen, now), PasswordAdmission::Check);
+        let another_account = Email::new("other@example.org").unwrap();
+        assert_eq!(admit_password_check(known, available, &waits, &another_account, stolen, now), PasswordAdmission::Check);
+
+        now += seconds * 1000;
+        assert_eq!(waits.retry_after(known, &email, stolen, now - 1), Wait::new(1));
+        assert_eq!(admit_password_check(known, available, &waits, &email, stolen, now), PasswordAdmission::Check);
+    }
+
+    waits.record_wrong(other, &email, None, now);
+    assert_eq!(admit_password_check(other, available, &waits, &email, stolen, now), PasswordAdmission::ComeBack(Wait::new(1).unwrap()));
+    assert_eq!(admit_password_check(known, available, &waits, &email, owner, now), PasswordAdmission::Check);
     for busy in [load(true, false, 0), load(false, true, 0)] {
-        assert_eq!(admit_password_check(PasswordDoor::KnownDevice, busy, &waits, &email, 0), PasswordAdmission::Busy);
+        assert_eq!(admit_password_check(known, busy, &waits, &email, owner, now), PasswordAdmission::Busy);
     }
 }
 
@@ -755,13 +772,13 @@ fn the_other_door_waits_for_its_worker_for_ten_seconds_and_holds_eight() {
     let email = email();
     let waits = PasswordWaits::default();
     let door = PasswordDoor::Other;
-    assert_eq!(admit_password_check(door, load(false, false, 0), &waits, &email, 0), PasswordAdmission::Check);
+    assert_eq!(admit_password_check(door, load(false, false, 0), &waits, &email, None, 0), PasswordAdmission::Check);
     for waiting in 0..OTHER_PASSWORDS_WAITING {
-        assert_eq!(admit_password_check(door, load(true, false, waiting), &waits, &email, 0), PasswordAdmission::WaitForWorker);
-        assert_eq!(admit_password_check(door, load(false, true, waiting), &waits, &email, 0), PasswordAdmission::WaitForWorker);
+        assert_eq!(admit_password_check(door, load(true, false, waiting), &waits, &email, None, 0), PasswordAdmission::WaitForWorker);
+        assert_eq!(admit_password_check(door, load(false, true, waiting), &waits, &email, None, 0), PasswordAdmission::WaitForWorker);
     }
-    assert_eq!(admit_password_check(door, load(true, false, OTHER_PASSWORDS_WAITING), &waits, &email, 0), PasswordAdmission::Busy);
-    assert_eq!(admit_password_check(door, load(false, false, 1), &waits, &email, 0), PasswordAdmission::WaitForWorker);
+    assert_eq!(admit_password_check(door, load(true, false, OTHER_PASSWORDS_WAITING), &waits, &email, None, 0), PasswordAdmission::Busy);
+    assert_eq!(admit_password_check(door, load(false, false, 1), &waits, &email, None, 0), PasswordAdmission::WaitForWorker);
     assert_eq!(resume_password_check(0, true, false, &waits, &email, 9_999), PasswordAdmission::WaitForWorker);
     assert_eq!(resume_password_check(0, false, false, &waits, &email, 9_999), PasswordAdmission::Check);
     assert_eq!(resume_password_check(0, false, false, &waits, &email, 10_000), PasswordAdmission::Busy);
@@ -775,41 +792,55 @@ fn wrong_password_waits_double_to_a_minute_without_preventing_the_next_check() {
     let available = load(false, false, 0);
     let mut now = 100;
     for seconds in [1, 2, 4, 8, 16, 32, 60, 60, 60] {
-        assert_eq!(admit_password_check(door, available, &waits, &email, now), PasswordAdmission::Check);
-        waits.record_wrong(door, &email, now);
-        let outcome = admit_password_check(door, load(true, false, 8), &waits, &email, now);
+        assert_eq!(admit_password_check(door, available, &waits, &email, None, now), PasswordAdmission::Check);
+        waits.record_wrong(door, &email, None, now);
+        let outcome = admit_password_check(door, load(true, false, 8), &waits, &email, None, now);
         assert_eq!(outcome.refusal(), Some(Refusal::Busy { retry_after_seconds: Wait::new(seconds) }));
         assert_eq!(resume_password_check(now, false, false, &waits, &email, now), outcome);
         let until = now + seconds * 1000;
-        assert_eq!(waits.retry_after(&email, until - 1).map(Wait::seconds), Some(1));
-        assert_eq!(waits.retry_after(&email, until), None);
+        assert_eq!(waits.retry_after(door, &email, None, until - 1).map(Wait::seconds), Some(1));
+        assert_eq!(waits.retry_after(door, &email, None, until), None);
         now = until;
     }
-    assert_eq!(admit_password_check(door, available, &waits, &email, now), PasswordAdmission::Check);
+    assert_eq!(admit_password_check(door, available, &waits, &email, None, now), PasswordAdmission::Check);
 }
 
 #[test]
-fn wait_records_forget_at_an_hour_and_evict_the_oldest_name_at_the_cap() {
-    let first = email();
+fn wait_records_forget_at_an_hour_and_evict_the_oldest_device_key_at_the_cap() {
+    let email = email();
     let mut waits = PasswordWaits::default();
-    let door = PasswordDoor::Other;
-    waits.record_wrong(door, &first, 0);
-    for i in 1..=PASSWORD_WAIT_NAMES {
-        let other = Email::new(&format!("ada-{i}@example.org")).unwrap();
-        waits.record_wrong(door, &other, i as u64);
+    let known = PasswordDoor::KnownDevice;
+    let other = PasswordDoor::Other;
+    waits.record_wrong(other, &email, None, 0);
+    for i in 1..=PASSWORD_WAIT_NAMES as u64 {
+        waits.record_wrong(known, &email, Some(id(i)), i);
     }
-    assert!(!waits.by_email.contains_key(&first));
-    assert_eq!(waits.by_email.len(), PASSWORD_WAIT_NAMES);
+    assert_eq!(waits.by_key.len(), PASSWORD_WAIT_NAMES);
     assert_eq!(waits.oldest.len(), PASSWORD_WAIT_NAMES);
+    assert!(!waits.by_key.contains_key(&PasswordWaitKey::new(other, &email, None).unwrap()));
 
-    let last = Email::new(&format!("ada-{PASSWORD_WAIT_NAMES}@example.org")).unwrap();
+    let last = Some(id(PASSWORD_WAIT_NAMES as u64));
+    assert!(waits.by_key.contains_key(&PasswordWaitKey::new(known, &email, last).unwrap()));
     let end = PASSWORD_WAIT_NAMES as u64 + PASSWORD_WAIT_MEMORY_MS;
     waits.expire(end - 1);
-    assert!(waits.by_email.contains_key(&last));
+    assert_eq!(waits.by_key.len(), 1);
     waits.expire(end);
-    assert!(waits.by_email.is_empty());
-    waits.record_wrong(door, &last, end);
-    assert_eq!(waits.retry_after(&last, end).map(Wait::seconds), Some(1));
+    assert!(waits.by_key.is_empty());
+    waits.record_wrong(known, &email, last, end);
+    assert_eq!(waits.retry_after(known, &email, last, end), Wait::new(1));
+}
+
+#[test]
+fn a_clock_going_back_does_not_shorten_either_doors_wait() {
+    let email = email();
+    let mut waits = PasswordWaits::default();
+    for (door, device) in [(PasswordDoor::Other, None), (PasswordDoor::KnownDevice, Some(id(1)))] {
+        waits.record_wrong(door, &email, device, 10_000);
+        waits.record_wrong(door, &email, device, 9_000);
+        assert_eq!(waits.retry_after(door, &email, device, 9_000), Wait::new(2));
+        assert_eq!(waits.retry_after(door, &email, device, 11_999), Wait::new(1));
+        assert_eq!(waits.retry_after(door, &email, device, 12_000), None);
+    }
 }
 
 #[test]
