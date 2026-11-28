@@ -76,11 +76,7 @@ fn preview_save_and_c6_upload_have_the_same_clean_text() -> std::io::Result<()> 
     ] {
         observations.note(at as u64 * 1_000, line);
     }
-    for (at, _) in messages {
-        if let Some(at) = (at as u64).checked_mul(1_000) {
-            observations.note(at, Line::Note(Note::AppMessage));
-        }
-    }
+    count_notices(&mut observations, messages);
     let session = Session { about: Session::about(&settings, true), observations };
     let dir = TestFolder::new()?;
     let paths = dir.paths();

@@ -200,7 +200,9 @@ impl Session {
         pc.library_songs = crate::search::current().map_or(0, |index| index.library.songs.len() as u64);
         pc.downloads = ctl.downloads.borrow().downloaded_count() as u64;
         pc.pending = (ctl.pending.borrow().len() as u64).saturating_add(ctl.sending.borrow().len() as u64);
-        Self { about, observations: OBSERVED.take() }
+        let mut observations = OBSERVED.take();
+        count_notices(&mut observations, ctl.said.borrow_mut().drain(..));
+        Self { about, observations }
     }
 
     fn about(settings: &config::Settings, signed_in: bool) -> diag::About {
@@ -243,6 +245,14 @@ impl Session {
                 requests: settings.requests,
                 ..diag::PcDetails::default()
             }),
+        }
+    }
+}
+
+fn count_notices(record: &mut diag::Record, notices: impl IntoIterator<Item = (i64, String)>) {
+    for (at, _) in notices {
+        if let Some(at) = u64::try_from(at).ok().and_then(|at| at.checked_mul(1_000)) {
+            record.note(at, Line::Note(Note::AppMessage));
         }
     }
 }

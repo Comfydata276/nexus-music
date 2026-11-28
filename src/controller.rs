@@ -349,6 +349,8 @@ pub struct Controller {
     pub moving_downloads: Cell<bool>,
     /// The mix made to rules whose menu is open.
     pub menu_rule: Cell<Option<u64>>,
+    /// Legacy device-sync notices. Diagnostics drains these as typed counts on the window.
+    pub said: RefCell<std::collections::VecDeque<(i64, String)>>,
     /// Something to say once the window is up (the settings file was damaged, say).
     startup_note: RefCell<Option<String>>,
     /// What another device was playing more recently than anything was done here.
@@ -581,6 +583,7 @@ impl Controller {
             track_places: RefCell::default(),
             moving_downloads: Cell::new(false),
             menu_rule: Cell::new(None),
+            said: RefCell::default(),
             startup_note: RefCell::new(startup_note),
             elsewhere: RefCell::default(),
             play_log: RefCell::new(play_log),
