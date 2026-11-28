@@ -240,6 +240,7 @@ struct LidarrState {
     ambiguous_pending_number: bool,
     new_releases: Option<String>,
     single_mode: bool,
+    fail_batch_settle: bool,
     second_artist: bool,
     other_monitored: bool,
     calls: Vec<String>,
@@ -267,21 +268,33 @@ impl MockLidarr {
         let hold: Arc<HeldResponse> = Arc::default();
         let blocked = hold.clone();
         let thread = thread::spawn(move || {
+            let mut held = Vec::new();
             while !stopped.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((mut socket, _)) => {
                         let Some(incoming) = question(&mut socket) else { continue };
                         assert!(incoming.headers.get("x-api-key").is_some_and(|key| key == TEST_KEY));
                         let body = mock(&incoming, &mut lock(&available));
-                        let stop = lock(&blocked.0);
-                        drop(blocked.1.wait_while(stop, |held| {
-                            *held == Some((incoming.method.as_str(), incoming.target.as_str()))
-                        }).unwrap());
-                        let _ = response(&mut socket, "200 OK", "Content-Type: application/json\r\n", body.to_string().as_bytes());
+                        let matches = |held| held == Some((incoming.method.as_str(), incoming.target.as_str()));
+                        if matches(*lock(&blocked.0)) {
+                            let blocked = blocked.clone();
+                            held.push(thread::spawn(move || {
+                                let gate = lock(&blocked.0);
+                                drop(blocked.1.wait_while(gate, |held| {
+                                    *held == Some((incoming.method.as_str(), incoming.target.as_str()))
+                                }).unwrap());
+                                let _ = response(&mut socket, "200 OK", "Content-Type: application/json\r\n", body.to_string().as_bytes());
+                            }));
+                        } else {
+                            let _ = response(&mut socket, "200 OK", "Content-Type: application/json\r\n", body.to_string().as_bytes());
+                        }
                     }
                     Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => thread::sleep(Duration::from_millis(2)),
                     Err(err) => panic!("stand-in accept failed: {err}"),
                 }
+            }
+            for answer in held {
+                answer.join().unwrap();
             }
         });
         Self { address, state, stop, hold, thread: Some(thread) }
@@ -293,8 +306,12 @@ impl MockLidarr {
     }
 
     fn wait_for_call(&self, expected: &str) {
+        self.wait_for_calls(expected, 1);
+    }
+
+    fn wait_for_calls(&self, expected: &str, count: usize) {
         let until = Instant::now() + Duration::from_secs(8);
-        while !lock(&self.state).calls.iter().any(|call| call == expected) {
+        while lock(&self.state).calls.iter().filter(|&call| call == expected).count() < count {
             assert!(Instant::now() < until, "Lidarr did not receive {expected}");
             thread::sleep(Duration::from_millis(15));
         }
@@ -340,6 +357,8 @@ fn mock(request: &Question, state: &mut LidarrState) -> Value {
         ("GET", lookup) if lookup == format!("album/lookup?term=lidarr%3A{ALBUM}") =>
             json!([album(state.monitored)]),
         ("GET", "album/lookup?term=Quiet%20Coast%20Paper%20Tides") if state.second_artist => json!([other_album]),
+        ("GET", "artist") if state.fail_batch_settle && state.new_releases.as_deref() == Some("none") =>
+            json!({"fixture":"artist lookup failed during settling"}),
         ("GET", "artist") if state.second_artist => json!([artist, other_artist]),
         ("GET", "album?artistId=6") if state.second_artist => json!([other_album]),
         ("GET", "artist") => json!([artist]),
@@ -407,6 +426,7 @@ struct TestServer {
     root: PathBuf,
     address: SocketAddr,
     accounts: Option<Arc<Accounts>>,
+    shell: Option<std::sync::Weak<Shell>>,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<thread::JoinHandle<()>>,
     child: Option<Child>,
@@ -421,9 +441,9 @@ impl TestServer {
         Self::start_with_clock(name, endpoint, Arc::new(now))
     }
 
-    fn start_with_clock(
+    fn start_with_clock<const N: usize>(
         name: &str, endpoint: Option<Endpoint>, clock: crate::accounts::session::Clock,
-    ) -> (Self, [OneTimeCode; 3]) {
+    ) -> (Self, [OneTimeCode; N]) {
         let (root, keeper, codes) = fixture(name);
         let accounts = fixture_accounts(keeper, clock, endpoint.map(|endpoint| endpoint.address));
         let id = accounts.backend;
@@ -435,14 +455,14 @@ impl TestServer {
             let address = listener.local_addr().unwrap();
             let shell = Shell::backend(address.ip(), &crate::hello(id), server,
                 Some(TEST_ORIGIN), crate::settings::DATA_BUDGET_DEFAULT);
-            ready.send(address).unwrap();
+            ready.send((address, Arc::downgrade(&shell))).unwrap();
             let serving = tokio::spawn(serve::serve(listener, shell, false));
             let _ = stopped.await;
             serving.abort();
             let _ = serving.await;
         }));
-        let address = address.recv_timeout(Duration::from_secs(3)).unwrap();
-        (Self { root, address, accounts: Some(accounts), stop: Some(stop), thread: Some(thread), child: None }, codes)
+        let (address, shell) = address.recv_timeout(Duration::from_secs(3)).unwrap();
+        (Self { root, address, accounts: Some(accounts), shell: Some(shell), stop: Some(stop), thread: Some(thread), child: None }, codes)
     }
 
     fn start_child(name: &str, endpoint: SocketAddr) -> (Self, [OneTimeCode; 3]) {
@@ -453,7 +473,7 @@ impl TestServer {
 
     fn launch_saved(root: PathBuf, endpoint: SocketAddr) -> Self {
         let address = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
-        let mut server = Self { root, address, accounts: None, stop: None, thread: None, child: None };
+        let mut server = Self { root, address, accounts: None, shell: None, stop: None, thread: None, child: None };
         server.launch(endpoint);
         server
     }
@@ -771,7 +791,7 @@ fn authenticated_loopback_requests_keep_order_and_ownership_and_survive_the_clie
 
 #[test]
 fn a_finished_job_releases_its_worker_before_reporting_completion() {
-    let (root, mut keeper, _) = fixture("completed-worker");
+    let (root, mut keeper, _) = fixture::<3>("completed-worker");
     let rooms = Arc::new(Mutex::new(Rooms::default()));
     let actor = Actor {
         account: AccountId::new(1).unwrap(),
@@ -833,7 +853,7 @@ fn a_member_can_complete_the_full_walk_using_the_page_configured_key() {
 #[test]
 fn a_request_works_after_upgrading_the_deployed_form() {
     let lidarr = MockLidarr::start();
-    let (root, mut keeper, [admin, member, _]) = fixture("deployed-form");
+    let (root, mut keeper, [admin, member, _]) = fixture::<3>("deployed-form");
     let binding = binding(&endpoint(lidarr.address));
     keeper.write_data(now(), |tx| {
         tx.execute(
@@ -1010,7 +1030,7 @@ fn only_the_admin_page_can_configure_a_key_for_the_read_only_address() {
     assert!(lidarr.take_calls().is_empty());
 }
 
-fn fixture(name: &str) -> (PathBuf, Keeper, [OneTimeCode; 3]) {
+fn fixture<const N: usize>(name: &str) -> (PathBuf, Keeper, [OneTimeCode; N]) {
         let root = std::env::temp_dir().join(format!("nexus-requests-{name}-{}", std::process::id()));
         std::fs::create_dir_all(root.join("state")).unwrap();
         std::fs::create_dir_all(root.join("data")).unwrap();
@@ -1173,6 +1193,38 @@ fn startup_puts_back_a_recorded_artist_setting_for_the_same_lidarr() {
     assert_eq!(lidarr.take_calls(), ["GET artist", "GET artist", "GET artist/5", "PUT artist/5"]);
 }
 
+#[test]
+fn startup_discards_a_gone_artist_and_a_later_request_can_place_an_album() {
+    let lidarr = MockLidarr::start();
+    let (mut server, [admin, member, _]) = TestServer::start_child("gone-artist", lidarr.address);
+    server.configure(&server.redeem(admin, 1, TEST_PAGE));
+    server.kill_child();
+    let binding = binding(&endpoint(lidarr.address));
+    let mut keeper = reopen(&server.root);
+    keeper.write_data(now(), |tx| {
+        tx.execute(
+            "INSERT INTO requests_way_back (binding, artist, artist_key, setting)
+             VALUES (?1, 5, '20000000-0000-0000-0000-000000000222', 'new')",
+            [binding.as_slice()],
+        ).map(|count| ((), count != 0))
+    }).unwrap();
+    keeper.close();
+    server.launch(lidarr.address);
+
+    let db = Connection::open(server.root.join("data/nexus.db")).unwrap();
+    let until = Instant::now() + Duration::from_secs(5);
+    while db.query_row("SELECT COUNT(*) FROM requests_way_back", [], |row| row.get::<_, i64>(0)).unwrap() != 0 {
+        assert!(Instant::now() < until, "the gone artist's recovery row was still kept");
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(lidarr.take_calls(), ["GET artist"]);
+    assert_eq!(lock(&lidarr.state).new_releases, None);
+    let member = server.redeem(member, 2, "");
+    let offer = server.offer(&member);
+    let job = begun(server.call(&member, begin(1, Change::Request { offer })));
+    assert_eq!(server.done(&member, job), Completed::Requested { placed: true });
+}
+
 fn find_artist_call() -> Call {
     Call::FindArtists { search: Search::new("Quillon Vane").unwrap(), after: None }
 }
@@ -1239,6 +1291,55 @@ fn a_slow_lidarr_read_leaves_sign_in_and_the_writer_available() {
         assert!(matches!(search.join().unwrap(), Answer::FoundArtists { artists, .. } if artists.is_empty()));
     });
     reply.join().unwrap();
+}
+
+#[test]
+fn the_listener_accepts_only_eight_requests_answers_at_once() {
+    let lidarr = MockLidarr::start();
+    let (server, [admin, members @ ..]) = TestServer::start_with_clock::<10>(
+        "answer-cap", Some(endpoint(lidarr.address)), Arc::new(now),
+    );
+    server.configure(&server.redeem(admin, 1, TEST_PAGE));
+    let members: Vec<_> = members.into_iter().enumerate()
+        .map(|(index, code)| server.redeem(code, index as u8 + 2, "")).collect();
+    let shell = server.shell.as_ref().unwrap().upgrade().unwrap();
+    let accounts = server.accounts.as_ref().unwrap().clone();
+    let (entered, wait_for_writer) = std::sync::mpsc::channel();
+    let (release, hold) = std::sync::mpsc::channel();
+    let writer = thread::spawn(move || runtime().block_on(accounts.desk.ask(move |_| {
+        entered.send(()).unwrap();
+        let _ = hold.recv_timeout(Duration::from_secs(15));
+    })));
+    wait_for_writer.recv_timeout(Duration::from_secs(4)).unwrap();
+
+    let history = || Call::AskedHistory { after: None };
+    let mut held = Vec::new();
+    for member in &members[..8] {
+        let sent = body(member.restore, history());
+        let mut socket = server.socket(wire::REQUESTS, Some(&member.signed_in), "", sent.len());
+        socket.write_all(&sent).unwrap();
+        held.push(socket);
+    }
+    let until = Instant::now() + Duration::from_secs(4);
+    while shell.available_request_answers() != 0 {
+        assert!(Instant::now() < until, "eight signed-in calls did not reserve all the answer places");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let ninth = &members[8];
+    let (status, answer) = server.post(wire::REQUESTS, Some(&ninth.signed_in), "", &body(ninth.restore, history()));
+    assert_eq!(status, 429);
+    assert!(matches!(wire::read_reply(status, &answer).unwrap(),
+        account::Reply::Refused(account::Refusal::Busy { retry_after_seconds: None })));
+
+    release.send(()).unwrap();
+    writer.join().unwrap().unwrap();
+    for socket in held {
+        let (status, answer) = read_http(socket);
+        assert!(matches!(wire::read_reply(status, &answer).unwrap(),
+            account::Reply::Done { result: Answer::AskedHistory { rows, .. }, .. } if rows.is_empty()));
+    }
+    assert!(matches!(server.call(ninth, history()), Answer::AskedHistory { rows, .. } if rows.is_empty()));
+    assert!(lidarr.take_calls().is_empty());
 }
 
 #[test]
@@ -1355,6 +1456,89 @@ fn a_second_account_completes_its_request_between_two_batch_artist_groups() {
                 && matches!(line.progress, BatchLineProgress::Done { .. }))));
     assert_eq!(lidarr.take_calls().iter().filter(|call| call.as_str() == "POST command").count(), 2);
     assert!(matches!(server.call(&first, begin(2, cancelled())), Answer::Refused { reason: Refusal::AskedByOthers }));
+}
+
+#[test]
+fn three_batches_leave_a_worker_for_a_fifth_accounts_single_request() {
+    let lidarr = MockLidarr::start();
+    let (server, [admin, members @ ..]) = TestServer::start_with_clock::<6>(
+        "batch-worker-reserve", Some(endpoint(lidarr.address)), Arc::new(now),
+    );
+    server.configure(&server.redeem(admin, 1, TEST_PAGE));
+    let members: Vec<_> = members.into_iter().enumerate()
+        .map(|(index, code)| server.redeem(code, index as u8 + 2, "")).collect();
+    let batch = || Change::Batch { singles: false, lines: vec![BatchLine {
+        artist: "Quillon Vane".into(), album: "Glass Orchard".into(), song: "First Light".into(),
+    }] };
+    let lookup = "/api/v1/album/lookup?term=Glass%20Orchard%20Quillon%20Vane";
+    lidarr.hold_response(Some(("GET", lookup)));
+    let active: Vec<_> = members[..3].iter().map(|member| begun(server.call(member, begin(1, batch())))).collect();
+    lidarr.wait_for_calls("GET album/lookup?term=Glass%20Orchard%20Quillon%20Vane", 3);
+    let refused = begun(server.call(&members[3], begin(1, batch())));
+    assert_eq!(server.outcome(&members[3], refused), Err(Refusal::Busy));
+
+    let single = &members[4];
+    let offer = server.offer(single);
+    let job = begun(server.call(single, begin(1, Change::Request { offer })));
+    assert_eq!(server.done(single, job), Completed::Requested { placed: true });
+    for (member, job) in members.iter().zip(&active) {
+        assert!(matches!(server.call(member, Call::After { job: *job }), Answer::Working));
+    }
+
+    lidarr.hold_response(None);
+    for (member, job) in members.iter().zip(active) {
+        assert_eq!(server.done(member, job), Completed::Batch);
+    }
+    let retry = begun(server.call(&members[3], begin(2, batch())));
+    assert_eq!(server.done(&members[3], retry), Completed::Batch);
+    assert_eq!(lidarr.take_calls().iter().filter(|&call| call == "POST command").count(), 1);
+}
+
+#[test]
+fn a_batch_that_fails_while_settling_leaves_an_exact_way_back_for_recovery() {
+    let lidarr = MockLidarr::start();
+    {
+        let mut state = lock(&lidarr.state);
+        state.single_mode = true;
+        state.fail_batch_settle = true;
+    }
+    let (server, [admin, member, _]) = TestServer::start("singles-batch-settle-failure", Some(endpoint(lidarr.address)));
+    server.configure(&server.redeem(admin, 1, TEST_PAGE));
+    let member = server.redeem(member, 2, "");
+    let line = BatchLine { artist: "Quillon Vane".into(), album: "Glass Orchard".into(), song: "First Light".into() };
+    let job = begun(server.call(&member, begin(1, Change::Batch { singles: true, lines: vec![line] })));
+    lidarr.wait_for_call("PUT artist/5");
+    let until = Instant::now() + Duration::from_secs(19);
+    loop {
+        match server.call(&member, Call::After { job }) {
+            Answer::Working => {}
+            Answer::Failed { reason: Refusal::LidarrUnrecognized } => break,
+            answer => panic!("unexpected settlement result: {answer:?}"),
+        }
+        assert!(Instant::now() < until, "the settlement did not fail");
+        thread::sleep(Duration::from_millis(40));
+    }
+    let db = Connection::open(server.root.join("data/nexus.db")).unwrap();
+    let remaining: (i64, String, String) = db.query_row(
+        "SELECT artist, artist_key, setting FROM requests_way_back", [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).unwrap();
+    assert_eq!(remaining, (5, ARTIST.to_owned(), "all".to_owned()));
+    let before = lidarr.take_calls();
+    assert!(before.iter().skip_while(|&call| call != "PUT artist/5").any(|call| call == "GET command"));
+    assert_eq!(before.iter().filter(|&call| call == "PUT artist/5").count(), 1);
+    {
+        let mut state = lock(&lidarr.state);
+        assert_eq!(state.new_releases.as_deref(), Some("none"));
+        state.fail_batch_settle = false;
+    }
+    let until = Instant::now() + Duration::from_secs(5);
+    while db.query_row("SELECT COUNT(*) FROM requests_way_back", [], |row| row.get::<_, i64>(0)).unwrap() != 0 {
+        assert!(Instant::now() < until, "the way back was not recovered");
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(lock(&lidarr.state).new_releases.as_deref(), Some("all"));
+    assert_eq!(lidarr.take_calls().iter().filter(|&call| call == "PUT artist/5").count(), 1);
 }
 
 #[test]

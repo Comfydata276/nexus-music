@@ -199,6 +199,11 @@ impl Shell {
         Arc::new(Shell { proxy: proxy.into(), router, routes, admit: None, requests: None, request_answers: Semaphore::new(8), open: AtomicUsize::new(0), serving: AtomicUsize::new(0), refused: Default::default() })
     }
 
+    #[cfg(test)]
+    pub(crate) fn available_request_answers(&self) -> usize {
+        self.request_answers.available_permits()
+    }
+
     /// How many connections are open now, turned-away ones included.
     pub fn open(&self) -> usize {
         self.open.load(Ordering::SeqCst)
