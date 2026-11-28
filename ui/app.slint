@@ -11,7 +11,7 @@ import { Icons } from "icons.slint";
 import { Drag, App, View, Player, Menu, Prompt, Toast, Lyrics, Settings, Covers, Page, Track, Card, CardKind, Shelf, Offer, CardRow, PlaylistRef, MenuEntry, LyricLine, QualityOption, ThemeOption, Search, Suggestion, DeviceRow } from "types.slint";
 import { PageStatus, IconButton } from "widgets.slint";
 import { Sidebar, TopBar, QueuePanel, PlayerBar, SearchOverlay } from "chrome.slint";
-import { StackPage, TrackListPage, GridPage, LyricsPage, NowPlayingPage, SettingsPage, LoginPage } from "pages.slint";
+import { StackPage, TrackListPage, GridPage, LyricsPage, NowPlayingPage, SettingsPage, LoginPage, NoMusicPage } from "pages.slint";
 import { MenuOverlay, PromptOverlay, ToastOverlay } from "overlays.slint";
 
 export { Theme, App, View, Player, Menu, Prompt, Toast, Lyrics, Settings, Covers, Icons, Page, Track, Card, CardKind, Shelf, Offer, CardRow, PlaylistRef, MenuEntry, LyricLine, QualityOption, ThemeOption, Search, Suggestion, DeviceRow }
@@ -568,7 +568,10 @@ export component MainWindow inherits Window {
             }
         }
 
-        if !App.signed-in || App.show-sign-in: LoginPage { }
+        // Signed in with no music login yet: a screen of its own, with the account's own
+        // actions; never the sign-in form (src/nexus/signin.rs).
+        if !App.signed-in && App.nexus-signed-in && !App.show-sign-in: NoMusicPage { }
+        if (!App.signed-in && !App.nexus-signed-in && !App.nexus-starting) || App.show-sign-in: LoginPage { }
 
         // Above everything else, including the sign-in screen: it's how the window is moved
         // and closed.

@@ -1770,6 +1770,141 @@ component SettingNest inherits Rectangle {
     }
 }
 
+// The account at the Nexus server (src/nexus/signin.rs): who is signed in and how it stands,
+// signing out, the devices signed in to it, and changing the password. On the Account tab,
+// and on the screen of an account whose music sign-in is not set yet.
+component NexusAccount inherits VerticalLayout {
+    // The Nexus server: who is signed in, and how it stands (src/nexus/).
+    SettingRow {
+        title: "Nexus server";
+        detail: (Settings.nexus-who != "" ? "Signed in as " + Settings.nexus-who + (App.nexus-address != "" ? " at " + App.nexus-address : "") : App.nexus-address)
+            + (Settings.nexus-row != "" ? ". " + Settings.nexus-row : "")
+            + (Settings.nexus-music != "" ? "\n" + Settings.nexus-music : "");
+        if !App.nexus-sign-in-wanted: TextButton {
+            text: "Sign out";
+            clicked => { App.sign-out(); }
+        }
+        if App.nexus-sign-in-wanted: TextButton {
+            primary: true;
+            text: "Sign in";
+            clicked => { App.show-sign-in = true; }
+        }
+    }
+
+    SettingRow {
+        title: "Your devices";
+        detail: Settings.devices-note != "" ? Settings.devices-note : "The PCs and phones signed in to your account. Signing one out ends its sign-in at once.";
+        TextButton {
+            text: Settings.devices-busy ? "Looking…" : (Settings.devices.length > 0 ? "Refresh" : "Show");
+            enabled: !Settings.devices-busy;
+            clicked => { Settings.load-devices(); }
+        }
+    }
+
+    for device in Settings.devices: SettingRow {
+        nested: true;
+        title: device.name + (device.here ? " (this PC)" : "");
+        detail: device.detail;
+        if device.can-force-out: TextButton {
+            text: "Sign out";
+            enabled: !Settings.devices-busy;
+            clicked => { Settings.force-out(device.id); }
+        }
+    }
+
+    password-row := SettingRow {
+        in-out property <bool> open;
+        // Opened again after a change was made: the "changed" said before is not this
+        // form's (SHOULD 17), until the next try is sent.
+        in-out property <bool> again;
+        property <bool> busy: Settings.password-busy;
+        changed busy => {
+            if self.busy {
+                self.again = false;
+            }
+        }
+        property <bool> showing: self.open && (!Settings.password-changed || self.again);
+        title: "Change password";
+        detail: Settings.password-note != "" && !(password-row.again && Settings.password-changed) ? Settings.password-note : "Your other devices are signed out when you change it.";
+        TextButton {
+            text: password-row.showing ? "Cancel" : "Change";
+            clicked => {
+                // (The form is made afresh, empty, each time it opens.)
+                if password-row.showing {
+                    password-row.open = false;
+                } else {
+                    password-row.again = Settings.password-changed;
+                    password-row.open = true;
+                }
+            }
+        }
+    }
+
+    if password-row.showing: SettingNest {
+        password-form := VerticalLayout {
+            in-out property <string> current;
+            in-out property <string> new;
+            in-out property <string> again;
+            function save() {
+                if Settings.password-busy { return; }
+                Settings.change-password(self.current, self.new, self.again);
+                self.current = "";
+                self.new = "";
+                self.again = "";
+            }
+            spacing: 6px;
+            max-width: 420px;
+
+            Text {
+                text: "Present password";
+                color: Theme.text;
+                font-size: 13px;
+                font-weight: 600;
+            }
+            Field {
+                text <=> password-form.current;
+                input-type: InputType.password;
+                label: "Present password";
+            }
+            Text {
+                text: "New password";
+                color: Theme.text;
+                font-size: 13px;
+                font-weight: 600;
+            }
+            Field {
+                text <=> password-form.new;
+                input-type: InputType.password;
+                label: "New password";
+            }
+            Text {
+                text: "The new one again";
+                color: Theme.text;
+                font-size: 13px;
+                font-weight: 600;
+            }
+            Field {
+                text <=> password-form.again;
+                input-type: InputType.password;
+                label: "The new one again";
+                accepted => { password-form.save(); }
+            }
+            HorizontalLayout {
+                alignment: start;
+                padding-top: 6px;
+                TextButton {
+                    primary: true;
+                    height: 36px;
+                    text: Settings.password-busy ? "Saving…" : "Save password";
+                    enabled: !Settings.password-busy;
+                    clicked => { password-form.save(); }
+                }
+            }
+        }
+    }
+}
+
+
 // Names a run of related settings within a section.
 component SettingHeading inherits Rectangle {
     in property <string> text;
@@ -2633,22 +2768,7 @@ export component SettingsPage inherits Rectangle {
 
                     // ---- Account ----
                     if Settings.tab == 5: VerticalLayout {
-                        // The Nexus server: who is signed in, and how it stands (src/nexus/).
-                        SettingRow {
-                            title: "Nexus server";
-                            detail: (Settings.nexus-who != "" ? "Signed in as " + Settings.nexus-who + (App.nexus-address != "" ? " at " + App.nexus-address : "") : App.nexus-address)
-                                + (Settings.nexus-row != "" ? ". " + Settings.nexus-row : "")
-                                + (Settings.nexus-music != "" ? "\n" + Settings.nexus-music : "");
-                            if !App.nexus-sign-in-wanted: TextButton {
-                                text: "Sign out";
-                                clicked => { App.sign-out(); }
-                            }
-                            if App.nexus-sign-in-wanted: TextButton {
-                                primary: true;
-                                text: "Sign in";
-                                clicked => { App.show-sign-in = true; }
-                            }
-                        }
+                        NexusAccount { }
 
                         if Settings.nexus-server != "" && Settings.nexus-for == (App.signed-in ? App.server + "\n" + App.username : ""): SettingRow {
                             nested: true;
@@ -2656,106 +2776,10 @@ export component SettingsPage inherits Rectangle {
                             detail: Settings.nexus-server;
                         }
 
-                        SettingRow {
+                        if App.signed-in: SettingRow {
                             title: "Music server";
                             detail: "Your Nexus server gave this PC its sign-in at " + App.server + ", as " + App.username + (App.server-version != "" ? ", Navidrome " + App.server-version : "")
                                 + ". No music password is kept on this PC." + (Settings.connection != "" ? " " + Settings.connection : "");
-                        }
-
-                        SettingRow {
-                            title: "Your devices";
-                            detail: Settings.devices-note != "" ? Settings.devices-note : "The PCs and phones signed in to your account. Signing one out ends its sign-in at once.";
-                            TextButton {
-                                text: Settings.devices-busy ? "Looking…" : (Settings.devices.length > 0 ? "Refresh" : "Show");
-                                enabled: !Settings.devices-busy;
-                                clicked => { Settings.load-devices(); }
-                            }
-                        }
-
-                        for device in Settings.devices: SettingRow {
-                            nested: true;
-                            title: device.name + (device.here ? " (this PC)" : "");
-                            detail: device.detail;
-                            if device.can-force-out: TextButton {
-                                text: "Sign out";
-                                enabled: !Settings.devices-busy;
-                                clicked => { Settings.force-out(device.id); }
-                            }
-                        }
-
-                        password-row := SettingRow {
-                            in-out property <bool> open;
-                            title: "Change password";
-                            detail: Settings.password-note != "" ? Settings.password-note : "Your other devices are signed out when you change it.";
-                            TextButton {
-                                text: password-row.open && !Settings.password-changed ? "Cancel" : "Change";
-                                clicked => {
-                                    // (The form is made afresh, empty, each time it opens.)
-                                    password-row.open = !password-row.open || Settings.password-changed;
-                                }
-                            }
-                        }
-
-                        if password-row.open && !Settings.password-changed: SettingNest {
-                            password-form := VerticalLayout {
-                                in-out property <string> current;
-                                in-out property <string> new;
-                                in-out property <string> again;
-                                function save() {
-                                    Settings.change-password(self.current, self.new, self.again);
-                                    self.current = "";
-                                    self.new = "";
-                                    self.again = "";
-                                }
-                                spacing: 6px;
-                                max-width: 420px;
-
-                                Text {
-                                    text: "Present password";
-                                    color: Theme.text;
-                                    font-size: 13px;
-                                    font-weight: 600;
-                                }
-                                Field {
-                                    text <=> password-form.current;
-                                    input-type: InputType.password;
-                                    label: "Present password";
-                                }
-                                Text {
-                                    text: "New password";
-                                    color: Theme.text;
-                                    font-size: 13px;
-                                    font-weight: 600;
-                                }
-                                Field {
-                                    text <=> password-form.new;
-                                    input-type: InputType.password;
-                                    label: "New password";
-                                }
-                                Text {
-                                    text: "The new one again";
-                                    color: Theme.text;
-                                    font-size: 13px;
-                                    font-weight: 600;
-                                }
-                                Field {
-                                    text <=> password-form.again;
-                                    input-type: InputType.password;
-                                    label: "The new one again";
-                                    accepted => { password-form.save(); }
-                                }
-                                HorizontalLayout {
-                                    alignment: start;
-                                    padding-top: 6px;
-                                    TextButton {
-                                        primary: true;
-                                        height: 36px;
-                                        text: Settings.password-busy ? "Saving…" : "Save password";
-                                        enabled: !Settings.password-busy;
-                                        clicked => { password-form.save(); }
-                                    }
-                                }
-                            }
                         }
 
                         SettingRow {
@@ -2969,7 +2993,8 @@ export component LoginPage inherits Rectangle {
     form-scroll := ScrollView {
         y: 32px;
         height: parent.height - 32px;
-        vertical-scrollbar-policy: always-off;
+        // In a window too short for the form, it scrolls, and says so (SHOULD 18).
+        vertical-scrollbar-policy: as-needed;
         horizontal-scrollbar-policy: always-off;
 
         VerticalLayout {
@@ -3097,6 +3122,24 @@ export component LoginPage inherits Rectangle {
                         wrap: word-wrap;
                     }
 
+                    // Offline mode is on: nothing is sent, so signing in can't work until it
+                    // is off. The switch is here as well as under Storage (MUST 13).
+                    if Settings.offline: HorizontalLayout {
+                        spacing: 10px;
+                        alignment: space-between;
+                        Text {
+                            text: "Offline mode is on.";
+                            color: Theme.text;
+                            font-size: 13px;
+                            vertical-alignment: center;
+                            wrap: word-wrap;
+                        }
+                        TextButton {
+                            text: "Turn off Offline mode";
+                            clicked => { Settings.set-offline(false); }
+                        }
+                    }
+
                     if !root.short: Rectangle {
                         height: 2px;
                     }
@@ -3146,13 +3189,89 @@ export component LoginPage inherits Rectangle {
         }
     }
 
-    // What the button does.
+    // What the button does. What was typed as a password or a code is let go of here, as
+    // soon as it is handed over, whatever comes of it (SHOULD 17).
     function go() {
         if App.login-busy || App.login-wait > 0 { return; }
         if root.code {
             App.sign-in-code(root.address-in, root.code-in, root.password-in, root.again-in);
         } else {
             App.sign-in(root.address-in, root.email-in, root.password-in);
+        }
+        root.password-in = "";
+        root.code-in = "";
+        root.again-in = "";
+    }
+}
+
+// Signed in to the Nexus server, with no music sign-in set for the account yet (MUST 12): a
+// plain screen that stays until the admin has set it, with the account's own actions.
+export component NoMusicPage inherits Rectangle {
+    background: Theme.base;
+    property <bool> short: self.height < 640px;
+
+    Rectangle {
+        background: @radial-gradient(circle, Theme.accent.with-alpha(0.18) 0%, Theme.accent.with-alpha(0) 70%);
+        width: 900px;
+        height: 900px;
+        y: -420px;
+    }
+
+    TouchArea { }
+
+    page-scroll := ScrollView {
+        y: 32px;
+        height: parent.height - 32px;
+        vertical-scrollbar-policy: as-needed;
+        horizontal-scrollbar-policy: always-off;
+
+        VerticalLayout {
+            alignment: start;
+            padding-top: root.short ? 16px : 48px;
+            padding-bottom: 24px;
+
+            HorizontalLayout {
+                alignment: center;
+
+                VerticalLayout {
+                    width: min(560px, page-scroll.visible-width - 32px);
+                    spacing: 12px;
+
+                    Text {
+                        text: "You're signed in";
+                        color: Theme.text;
+                        font-family: Theme.display;
+                        font-size: root.short ? 26px : 34px;
+                        font-weight: 800;
+                        wrap: word-wrap;
+                    }
+
+                    Text {
+                        text: "Your admin hasn't set your music sign-in yet. Ask whoever runs your Nexus server to set it for you: your music appears here by itself as soon as they have. You don't need to sign in again.";
+                        color: Theme.muted;
+                        font-size: 14px;
+                        wrap: word-wrap;
+                    }
+
+                    if Settings.offline: HorizontalLayout {
+                        spacing: 10px;
+                        alignment: space-between;
+                        Text {
+                            text: "Offline mode is on: your Nexus server isn't being asked.";
+                            color: Theme.text;
+                            font-size: 13px;
+                            vertical-alignment: center;
+                            wrap: word-wrap;
+                        }
+                        TextButton {
+                            text: "Turn off Offline mode";
+                            clicked => { Settings.set-offline(false); }
+                        }
+                    }
+
+                    NexusAccount { }
+                }
+            }
         }
     }
 }
