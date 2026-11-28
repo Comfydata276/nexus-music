@@ -329,6 +329,27 @@ impl wire::Value for LidarrKeyChange {
 
 object! { Applied {} }
 
+/// A saved key was either accepted by Lidarr or could not be checked. A refused
+/// key is a denial, with no successful save.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LidarrKeyCheck {
+    Works,
+    Unreachable,
+}
+
+impl wire::Value for LidarrKeyCheck {
+    fn read(raw: &RawValue) -> Result<Self, BadMessage> {
+        read_text(raw, |tag| match tag {
+            "works" => Some(Self::Works),
+            "unreachable" => Some(Self::Unreachable),
+            _ => None,
+        })
+    }
+}
+
+object! { LidarrKeySaved { check: LidarrKeyCheck } }
+
 /// the design does not say how a code-bearing reply is retried without showing
 /// the code twice. Persist only the result with the code set to AlreadyShown.
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -559,6 +580,7 @@ pub enum Denial {
     NoSuchAccount,
     NoSuchSession,
     MusicLoginRefused,
+    LidarrLoginRefused,
     Conflict,
 }
 
@@ -571,6 +593,7 @@ impl wire::Value for Denial {
             "no_such_account" => Some(Self::NoSuchAccount),
             "no_such_session" => Some(Self::NoSuchSession),
             "music_login_refused" => Some(Self::MusicLoginRefused),
+            "lidarr_login_refused" => Some(Self::LidarrLoginRefused),
             "conflict" => Some(Self::Conflict),
             _ => None,
         })
@@ -669,6 +692,7 @@ impl ResultBody for Devices {
 }
 impl ResultBody for MusicServer {}
 impl ResultBody for LidarrSetting {}
+impl ResultBody for LidarrKeySaved {}
 impl ResultBody for DiagnosticsDefault {}
 impl ResultBody for GrantIssued {}
 
@@ -761,6 +785,27 @@ mod tests {
     }
 
     #[test]
+    fn lidarr_key_save_distinguishes_checked_and_unchecked_success() {
+        for (check, body) in [
+            (LidarrKeyCheck::Works, br#"{"done":{"check":"works"}}"#.as_slice()),
+            (LidarrKeyCheck::Unreachable, br#"{"done":{"check":"unreachable"}}"#.as_slice()),
+        ] {
+            let reply = Reply::Done(LidarrKeySaved { check });
+            assert_eq!(encode(&reply).unwrap().bytes(), body);
+            assert_eq!(read_reply(200, body), Ok(reply));
+        }
+        let refused = br#"{"refused":{"not_allowed":"lidarr_login_refused"}}"#;
+        assert_eq!(
+            read_reply::<LidarrKeySaved>(403, refused),
+            Ok(Reply::Refused(Refusal::NotAllowed(Denial::LidarrLoginRefused))),
+        );
+        assert_eq!(
+            read_reply::<LidarrKeySaved>(200, br#"{"done":{"check":"refused"}}"#),
+            Err(BadMessage::Form),
+        );
+    }
+
+    #[test]
     fn routes_are_unique_and_plain() {
         assert_eq!(proto::plain(PAGE), Ok(()));
         let mut seen = std::collections::BTreeSet::new();
@@ -834,6 +879,7 @@ mod tests {
             Refusal::NotAllowed(Denial::NoSuchAccount),
             Refusal::NotAllowed(Denial::NoSuchSession),
             Refusal::NotAllowed(Denial::MusicLoginRefused),
+            Refusal::NotAllowed(Denial::LidarrLoginRefused),
             Refusal::NotAllowed(Denial::Conflict),
             Refusal::Busy { retry_after_seconds: Wait::new(1) },
             Refusal::Busy { retry_after_seconds: None },
