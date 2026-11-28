@@ -349,6 +349,47 @@ fn older_clients_events_are_cleaned_without_losing_the_plays() {
 }
 
 #[test]
+fn live_stats_refresh_the_revision_for_a_kept_sessions_delete_grant() {
+    let mut fixture = Fixture::new("stats-revision");
+    let code = fixture.set_up();
+    fixture.start();
+    let (who, stamp) = fixture.sign_in(with_code(code), 1);
+    let revision = || {
+        let body = fixture.stats(&who, &stamp, None);
+        match events::read_stats_reply(200, &body).unwrap() {
+            Reply::Done { result, .. } => result.account_revision.unwrap(),
+            _ => panic!("stats refused"),
+        }
+    };
+    let before = revision();
+    let password = "winter-harbour-fixture-thirty";
+    let change = account::encode(&account::ChangePassword {
+        head: head(&stamp),
+        request_id: RequestId::new(11).unwrap(),
+        current_password: Password::presented(PASSWORD).unwrap(),
+        new_password: Password::presented(password).unwrap(),
+    }).unwrap();
+    assert_eq!(fixture.post(account::CHANGE_PASSWORD, Some(&who), change.bytes()).0, 200);
+    let current = revision();
+    assert!(current > before);
+
+    let grant = |target_revision| {
+        let request = account::encode(&GrantRequest {
+            head: head(&stamp),
+            password: Password::presented(password).unwrap(),
+            change: GrantChange::DeleteListeningData {
+                account: who.person.id,
+                target_revision,
+                request_id: RequestId::new(12).unwrap(),
+            },
+        }).unwrap();
+        fixture.post(account::GRANT, Some(&who), request.bytes()).0
+    };
+    assert_eq!(grant(before), 403);
+    assert_eq!(grant(current), 200);
+}
+
+#[test]
 fn a_password_grant_erases_only_its_owners_history_and_fences_old_life() {
     let mut fixture = Fixture::new("life");
     let code = fixture.set_up();
