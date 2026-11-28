@@ -1357,3 +1357,66 @@ fn lost_store_recovery_preserves_partial_authority_and_takes_the_higher_counters
     );
     Ok(())
 }
+
+#[test]
+fn the_clock_recovers_one_mark_interval_and_marks_row_writes_immediately() -> Result<(), Denied> {
+    let persisted = 100_000;
+    let interval = CLOCK_MARK_INTERVAL_MS;
+    assert_eq!(
+        Clock::after_load(1, persisted).effective(),
+        persisted + interval
+    );
+    assert_eq!(Clock::after_load(200_000, persisted).effective(), 200_000);
+    assert_eq!(Clock::after_load(1, u64::MAX - 1).effective(), u64::MAX);
+    let mut s = Stored::new(state("alice@example.test"));
+    for (now, due) in [
+        (persisted + interval - 1, false),
+        (persisted + interval, true),
+    ] {
+        let denial = s.account
+            .sign_in_turn(clock(now, persisted), |_| {
+                Err::<(), _>(Denied::WrongPassword)
+            })
+            .apply(|effects| {
+                assert!(effects.updates.is_empty());
+                assert_eq!(effects.high_water, now);
+                assert_eq!(effects.clock_mark_due(persisted), due);
+                Ok::<_, Denied>(())
+            })?;
+        assert_eq!(denial, Err(Denied::WrongPassword));
+    }
+    s.account
+        .owner_recover(clock(persisted + 1, persisted), hash(41))
+        .apply(|effects| {
+            assert!(effects.clock_mark_due(persisted));
+            Ok::<_, Denied>(())
+        })??;
+    Ok(())
+}
+
+#[test]
+fn reload_does_not_reopen_a_grant_that_expired_between_clock_writes() -> Result<(), Denied> {
+    let mut s = Stored::new(state("alice@example.test"));
+    s.sign_in(8, 1, 1, 0)?;
+    s.leave(1, 1, LeaveFor::DeleteHistory, 1)?;
+    let expired = 1 + PASSWORD_LEAVE_MS;
+    let persisted = expired - 1;
+    let decision = |account: &mut Account, clock| {
+        account
+            .request(1, clock, |t| t.delete_history(bearer(1, &hash(1))))
+            .apply(|effects| {
+                assert!(effects.updates.is_empty());
+                Ok::<_, Denied>(())
+            })
+    };
+    assert_eq!(
+        decision(&mut s.account, clock(expired, persisted))?,
+        Err(Denied::LeaveRequired)
+    );
+    s.reload();
+    assert_eq!(
+        decision(&mut s.account, Clock::after_load(expired - 10, persisted))?,
+        Err(Denied::LeaveRequired)
+    );
+    Ok(())
+}

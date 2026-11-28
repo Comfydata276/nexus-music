@@ -6,6 +6,8 @@ use super::*;
 use crate::nexus::music::{CurrentEndpoints, MusicInstallation, VerifiedLogin};
 use std::collections::BTreeMap;
 
+pub const CLOCK_MARK_INTERVAL_MS: u64 = 60_000;
+
 #[derive(Debug, Clone, Copy)]
 pub struct Clock {
     pub now: u64,
@@ -13,6 +15,15 @@ pub struct Clock {
 }
 
 impl Clock {
+    /// Take the full interval that could have elapsed without a durable mark.
+    /// Use at process load only. Subsequent turns carry the in-memory high water.
+    pub fn after_load(now: u64, persisted: u64) -> Self {
+        Self {
+            now,
+            high_water: persisted.saturating_add(CLOCK_MARK_INTERVAL_MS),
+        }
+    }
+
     pub fn effective(self) -> u64 {
         self.now.max(self.high_water)
     }
@@ -118,11 +129,18 @@ pub struct Update {
 
 #[derive(Debug)]
 pub struct Effects {
-    /// Persist even when there are no row updates. A denied operation can
-    /// observe grant or code expiry, and a restarted clock must not undo that.
-    /// The hourly write limit is for last_used; the clock is a separate fence.
+    /// Retain on every turn even when no rows changed. Persist with every row
+    /// change and otherwise when the mark interval is due.
     pub high_water: u64,
     pub updates: Vec<Update>,
+}
+
+impl Effects {
+    /// The server also marks a write for changes it adds to this step's rows.
+    pub fn clock_mark_due(&self, last_persisted: u64) -> bool {
+        !self.updates.is_empty()
+            || self.high_water.saturating_sub(last_persisted) >= CLOCK_MARK_INTERVAL_MS
+    }
 }
 
 #[must_use = "apply the durable effects even when the request was refused"]
