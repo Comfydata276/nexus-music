@@ -1,0 +1,515 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nexus Music administration</title>
+<style>
+:root {
+  color-scheme: dark;
+  font: 100%/1.5 system-ui, sans-serif;
+  color: #f3effa;
+  background: #0b0811;
+  --panel: #14101d;
+  --line: #392d4d;
+  --muted: #a89fbb;
+  --accent: #a98bfb;
+}
+* { box-sizing: border-box; }
+body { margin: 0; }
+main { width: min(100% - 2rem, 46rem); margin: clamp(2rem, 8vw, 5rem) auto; }
+h1 { margin: 0 0 1.25rem; font-size: clamp(1.65rem, 5vw, 2.3rem); }
+h2 { margin: 0 0 .35rem; font-size: 1.15rem; }
+p { margin: 0; overflow-wrap: anywhere; }
+form, article, aside {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: .75rem;
+  padding: 1.25rem;
+}
+form { max-width: 26rem; }
+label { display: block; margin-top: .8rem; }
+input, button { font: inherit; min-height: 2.75rem; border-radius: .4rem; }
+input {
+  width: 100%;
+  margin-top: .25rem;
+  padding: .55rem .7rem;
+  color: inherit;
+  background: #0b0811;
+  border: 1px solid var(--line);
+}
+button {
+  margin-top: 1rem;
+  padding: .5rem 1rem;
+  border: 1px solid transparent;
+  background: var(--accent);
+  color: #150c2b;
+  font-weight: 650;
+  cursor: pointer;
+}
+button:disabled { opacity: .6; cursor: default; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+#status { color: var(--accent); margin-top: 1rem; }
+#sections {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 17rem), 1fr));
+  gap: .75rem;
+  margin-block: 1rem;
+}
+article p, aside p, dt { color: var(--muted); }
+dd { margin: 0 0 .65rem; }
+dd, li { overflow-wrap: anywhere; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Nexus Music administration</h1>
+  <form id="signin" method="post" autocomplete="off">
+    <h2>Sign in</h2>
+    <label>Email
+      <input id="email" type="text" inputmode="email" autocapitalize="none" spellcheck="false" maxlength="254" required>
+    </label>
+    <label>Password
+      <input id="password" type="password" maxlength="256" required>
+    </label>
+    <button id="submit" type="submit" disabled>Sign in</button>
+    <noscript><p>Enable JavaScript to sign in.</p></noscript>
+  </form>
+  <section id="admin" hidden>
+    <p id="identity"></p>
+    <button id="signout" type="button">Sign out</button>
+    <div id="sections">
+      <article>
+        <h2>Accounts</h2>
+        <p id="accounts-status" role="status"></p>
+        <ul id="accounts-list"></ul>
+        <button id="accounts-more" type="button" hidden>Load more accounts</button>
+      </article>
+      <article>
+        <h2>Music server</h2>
+        <p id="music-status" role="status"></p>
+        <dl>
+          <dt>Backend address</dt><dd id="music-internal"></dd>
+          <dt>Public address</dt><dd id="music-public"></dd>
+        </dl>
+      </article>
+      <article>
+        <h2>Devices</h2>
+        <p id="devices-status" role="status"></p>
+        <ul id="devices-list"></ul>
+        <button id="devices-more" type="button" hidden>Load more devices</button>
+      </article>
+      <article>
+        <h2>Diagnostics</h2>
+        <p id="diagnostics-status" role="status"></p>
+      </article>
+      <article>
+        <h2>Requests</h2>
+        <p id="requests-status" role="status"></p>
+        <ul id="requests-list"></ul>
+      </article>
+    </div>
+    <aside id="grant">
+      <h2>Authorize a change</h2>
+      <p>When changes are available, this is where you’ll enter your password again.</p>
+    </aside>
+  </section>
+  <p id="status" role="status"></p>
+</main>
+<script>
+(() => {
+  "use strict";
+  const byId = id => document.getElementById(id);
+  const form = byId("signin");
+  const email = byId("email");
+  const password = byId("password");
+  const submit = byId("submit");
+  const admin = byId("admin");
+  const identity = byId("identity");
+  const signout = byId("signout");
+  const status = byId("status");
+  let session = null;
+  let pending = null;
+  let idleTimer;
+  const accountPage = page("accounts");
+  const devicePage = page("devices");
+  const requests = byId("requests-list");
+  const requestsStatus = byId("requests-status");
+  const musicStatus = byId("music-status");
+  const internalAddress = byId("music-internal");
+  const publicAddress = byId("music-public");
+  const diagnostics = byId("diagnostics-status");
+
+  function writeText(element, value) {
+    element.textContent = value;
+  }
+
+  function newSecret() {
+    const bytes = crypto.getRandomValues(new Uint8Array(32));
+    return Array.from(bytes, byte => byte.toString(16).padStart(2, "0")).join("");
+  }
+
+  function post(path, body, signal, bearer) {
+    const headers = { "Content-Type": "application/json", "X-Nexus-Admin": "1" };
+    if (bearer) headers.Authorization = "Bearer " + bearer;
+    return fetch(path, {
+      method: "POST", headers, body, signal,
+      mode: "cors", credentials: "omit", redirect: "error",
+      cache: "no-store", referrerPolicy: "no-referrer",
+    });
+  }
+
+  async function readReply(response, max) {
+    const buffer = new Uint8Array(max);
+    const reader = response.body.getReader();
+    let size = 0;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value.length > max - size) throw new Error();
+        buffer.set(value, size);
+        size += value.length;
+      }
+      return parseReply(new TextDecoder("utf-8", { fatal: true, ignoreBOM: true })
+        .decode(buffer.subarray(0, size)));
+    } finally {
+      reader.cancel().catch(() => {});
+      buffer.fill(0);
+    }
+  }
+
+  function parseReply(text) {
+    JSON.parse(text);
+    const tokens = text.matchAll(/"(?:[^"\\]|\\.)*"|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null|[{}[\],:]/g);
+    let next = tokens.next().value?.[0];
+    function take() {
+      const value = next;
+      next = tokens.next().value?.[0];
+      return value;
+    }
+    function value(depth) {
+      const token = take();
+      if (token === "{" || token === "[") {
+        if (depth >= 16) throw new Error();
+        const object = token === "{";
+        const result = object ? Object.create(null) : [];
+        const end = object ? "}" : "]";
+        while (next !== end) {
+          if (object) {
+            const key = value(depth + 1);
+            if (Object.hasOwn(result, key)) throw new Error();
+            take();
+            result[key] = value(depth + 1);
+          } else {
+            result.push(value(depth + 1));
+          }
+          if (next === ",") take();
+        }
+        take();
+        return result;
+      }
+      if (/^-?\d+$/.test(token)) return BigInt(token);
+      const scalar = JSON.parse(token);
+      if (typeof scalar === "string" && /[\uD800-\uDFFF]/u.test(scalar)) throw new Error();
+      return scalar;
+    }
+    return value(0);
+  }
+
+  function isU64(number) {
+    return typeof number === "bigint" && number >= 0n && number <= 18446744073709551615n;
+  }
+
+  function json(value) {
+    if (typeof value === "bigint") return value.toString();
+    if (value === null || typeof value !== "object") return JSON.stringify(value);
+    if (Array.isArray(value)) return "[" + value.map(json).join(",") + "]";
+    return "{" + Object.entries(value).map(([key, item]) =>
+      JSON.stringify(key) + ":" + json(item)).join(",") + "}";
+  }
+
+  function armIdleTimer() {
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => endSession("Your session has ended. Sign in again."), 30 * 60 * 1000);
+  }
+
+  function endSession(message) {
+    forgetSession();
+    writeText(status, message);
+    email.focus();
+  }
+
+  async function readAdmin(current, path, fields, max) {
+    const response = await post(path, json({
+      head: { speaks: [1, 1], restore: current.restore }, ...fields,
+    }), current.controller.signal, current.bearer);
+    if (session !== current) throw new Error();
+    if (response.status === 401) {
+      const reply = await readReply(response, 4096);
+      if (session === current) {
+        const ended = reply.refused?.not_signed_in;
+        if (ended === "data_put_back" || ended === "session_ended") {
+          endSession(ended === "data_put_back" ?
+            "The server’s data was put back. Sign in again." : "Your session has ended. Sign in again.");
+        }
+      }
+      throw new Error();
+    }
+    if (response.status !== 200) throw new Error();
+    const reply = await readReply(response, max);
+    if (session !== current || !reply.done || reply.refused !== undefined) throw new Error();
+    armIdleTimer();
+    return reply.done;
+  }
+
+  function page(section) {
+    return {
+      list: byId(section + "-list"), status: byId(section + "-status"),
+      more: byId(section + "-more"), after: null,
+    };
+  }
+
+  function appendRow(list, value) {
+    const row = document.createElement("li");
+    writeText(row, value);
+    list.append(row);
+  }
+
+  function id(value) {
+    if (!isU64(value) || value === 0n) throw new Error();
+    return value;
+  }
+
+  function accountRow(row) {
+    if (typeof row.name !== "string" || typeof row.email !== "string" ||
+        typeof row.enabled !== "boolean" || typeof row.admin !== "boolean" ||
+        typeof row.requests_enabled !== "boolean") throw new Error();
+    return {
+      after: id(row.id),
+      label: row.name + " · " + row.email + (row.admin ? " · Administrator" : "") +
+        (row.enabled ? "" : " · Switched off"),
+      requests: row.name + " · " + (row.requests_enabled ? "On" : "Off"),
+    };
+  }
+
+  function deviceRow(row) {
+    if (typeof row.name !== "string" || typeof row.app_version !== "string" ||
+        !["pc", "phone"].includes(row.kind)) throw new Error();
+    if (row.session !== null) id(row.session);
+    if (!isU64(row.last_seen_ms)) throw new Error();
+    const heard = row.last_seen_ms === 0n ? "Never heard from" :
+      row.last_seen_ms <= 8640000000000000n ? "Last heard " + new Date(Number(row.last_seen_ms)).toLocaleString() :
+      "Last-heard time unavailable";
+    return {
+      after: { account: id(row.account), device: id(row.device) },
+      label: row.name + " · " + (row.kind === "pc" ? "PC" : "Phone") + " · " + row.app_version +
+        " · Account " + row.account + " · " + heard + (row.session === null ? " · Signed out" : ""),
+    };
+  }
+
+  async function loadPage(pager, path, decode, section) {
+    const current = session;
+    if (!current || pager.more.disabled) return;
+    pager.more.disabled = true;
+    writeText(pager.status, "Loading…");
+    try {
+      const result = await readAdmin(current, path, { after: pager.after }, 1024 * 1024);
+      if (session !== current) return;
+      if (!Array.isArray(result.rows) || result.rows.length > 500 ||
+          typeof result.more !== "boolean" || (result.more && result.rows.length === 0)) throw new Error();
+      const rows = result.rows.map(decode);
+      let after = pager.after;
+      for (const row of rows) {
+        const next = row.after;
+        if (after !== null) {
+          const advances = typeof next === "bigint" ? next > after :
+            next.account > after.account || (next.account === after.account && next.device > after.device);
+          if (!advances) throw new Error();
+        }
+        after = next;
+      }
+      for (const row of rows) {
+        appendRow(pager.list, row.label);
+        if (row.requests !== undefined) appendRow(requests, row.requests);
+      }
+      pager.after = after;
+      pager.more.hidden = !result.more;
+      writeText(pager.more, "Load more " + section);
+      writeText(pager.status, after === null ? "No " + section + "." : "");
+      if (pager === accountPage) writeText(requestsStatus, after === null ? "No accounts." : "");
+    } catch {
+      if (session !== current) return;
+      writeText(pager.status, "Could not load " + section + ".");
+      if (pager === accountPage && pager.after === null) writeText(requestsStatus, "Could not load accounts.");
+      pager.more.hidden = false;
+      writeText(pager.more, "Retry");
+    } finally {
+      if (session === current) pager.more.disabled = false;
+    }
+  }
+
+  function loadAccounts() {
+    return loadPage(accountPage, "/nexus/api/admin/accounts", accountRow, "accounts");
+  }
+
+  function loadDevices() {
+    return loadPage(devicePage, "/nexus/api/admin/devices", deviceRow, "devices");
+  }
+
+  async function loadMusic(current) {
+    writeText(musicStatus, "Loading…");
+    try {
+      const result = await readAdmin(current, "/nexus/api/admin/music-server", {}, 4096);
+      if (session !== current) return;
+      if (typeof result.internal !== "string" ||
+          (result.public !== null && typeof result.public !== "string")) throw new Error();
+      writeText(internalAddress, result.internal);
+      writeText(publicAddress, result.public ?? "Unset");
+      writeText(musicStatus, "");
+    } catch {
+      if (session === current) writeText(musicStatus, "Could not load music server addresses.");
+    }
+  }
+
+  async function loadDiagnostics(current) {
+    writeText(diagnostics, "Loading…");
+    try {
+      const result = await readAdmin(current, "/nexus/api/admin/diagnostics-default", {}, 4096);
+      if (session !== current) return;
+      if (typeof result.enabled !== "boolean") throw new Error();
+      writeText(diagnostics, result.enabled ? "Default is on." : "Default is off.");
+    } catch {
+      if (session === current) writeText(diagnostics, "Could not load the Diagnostics default.");
+    }
+  }
+
+  accountPage.more.addEventListener("click", loadAccounts);
+  devicePage.more.addEventListener("click", loadDevices);
+
+  function forgetSession() {
+    session?.controller.abort();
+    session = null;
+    for (const pager of [accountPage, devicePage]) {
+      pager.list.replaceChildren();
+      pager.after = null;
+      pager.more.hidden = true;
+      pager.more.disabled = false;
+      writeText(pager.status, "");
+    }
+    requests.replaceChildren();
+    for (const element of [requestsStatus, internalAddress, publicAddress, musicStatus, diagnostics]) {
+      writeText(element, "");
+    }
+    clearTimeout(idleTimer);
+    form.hidden = false;
+    admin.hidden = true;
+    writeText(identity, "");
+    password.value = "";
+  }
+
+  form.addEventListener("submit", async event => {
+    event.preventDefault();
+    if (pending || session) return;
+    submit.disabled = true;
+    const request = new AbortController();
+    pending = request;
+    writeText(status, "Signing in…");
+    try {
+      const body = JSON.stringify({
+        credential: { password: { email: email.value, password: password.value } },
+        device_secret: newSecret(), device_name: "Nexus admin browser", device_kind: "pc",
+        app_version: "0.1.0", speaks: [1, 1], restore: null,
+      });
+      password.value = "";
+      const response = await post("/nexus/api/signin", body, request.signal);
+      if (response.status === 501) {
+        writeText(status, "Sign-in has not been built yet.");
+        return;
+      }
+      if (response.status === 403) {
+        const reply = await readReply(response, 4096);
+        if (request.signal.aborted) return;
+        const reason = reply.refused?.not_allowed;
+        writeText(status, reason === "wrong_login" ? "Wrong email or password." :
+          reason === "account_off" ? "This account is switched off." :
+          "An administrator sign-in is required.");
+        return;
+      }
+      if (response.status !== 200) {
+        writeText(status, response.status === 429 ? "The server is busy. Try again." :
+          "The Nexus server could not sign you in.");
+        return;
+      }
+      const reply = await readReply(response, 8192);
+      if (request.signal.aborted) return;
+      const signedIn = reply.done?.result;
+      const stamp = reply.done?.receipt?.stamp;
+      const restore = signedIn?.restore;
+      if (reply.refused !== undefined || reply.refused_with_receipt !== undefined ||
+          signedIn?.person?.admin !== true ||
+          typeof signedIn.person.email !== "string" ||
+          (!isU64(signedIn.person.id) || signedIn.person.id === 0n || signedIn.person.id !== stamp?.account) ||
+          typeof signedIn.session !== "string" || !/^[0-9a-f]{64}$/.test(signedIn.session) ||
+          signedIn.music !== "none_set_yet" ||
+          !isU64(restore) || restore !== stamp?.restore) {
+        writeText(status, "An administrator sign-in is required.");
+        return;
+      }
+      session = { bearer: signedIn.session, restore, controller: new AbortController() };
+      armIdleTimer();
+      void loadAccounts();
+      void loadDevices();
+      void loadMusic(session);
+      void loadDiagnostics(session);
+      form.reset();
+      form.hidden = true;
+      admin.hidden = false;
+      writeText(identity, signedIn.person.email);
+      writeText(status, "");
+      signout.focus();
+    } catch {
+      if (!request.signal.aborted) writeText(status, "The Nexus server could not sign you in.");
+    } finally {
+      form.reset();
+      pending = null;
+      submit.disabled = false;
+    }
+  });
+
+  signout.addEventListener("click", async () => {
+    if (!session || pending) return;
+    const current = session;
+    const request = new AbortController();
+    pending = request;
+    forgetSession();
+    submit.disabled = true;
+    writeText(status, "Signing out…");
+    try {
+      const requestId = crypto.getRandomValues(new BigUint64Array(1))[0] || 1n;
+      const body = '{"head":{"speaks":[1,1],"restore":' + current.restore +
+        '},"request_id":' + requestId + ',"revoke":null}';
+      const response = await post("/nexus/api/signout", body, request.signal, current.bearer);
+      const reply = response.status === 200 ? await readReply(response, 4096) : null;
+      if (!request.signal.aborted) {
+        writeText(status, reply?.done ? "Signed out." : "The server could not confirm sign-out.");
+      }
+    } catch {
+      if (!request.signal.aborted) writeText(status, "The server could not confirm sign-out.");
+    } finally {
+      pending = null;
+      submit.disabled = false;
+    }
+  });
+
+  window.addEventListener("pagehide", () => {
+    pending?.abort();
+    form.reset();
+    forgetSession();
+    writeText(status, "");
+  });
+  submit.disabled = false;
+})();
+</script>
+</body>
+</html>
