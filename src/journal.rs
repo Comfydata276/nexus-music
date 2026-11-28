@@ -531,6 +531,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn overlapping_searches_keep_their_own_result_counts_and_owner() {
+        let root = std::env::temp_dir().join(crate::config::temp_for(std::path::Path::new("nexus-search-w8")));
+        install(root.clone());
+        let scope = Scope { account: Account { backend: [4; 16], number: 3 }, life: 7 };
+        publish(Some(scope));
+        begin_search("fictional first", false);
+        let first = search_ticket("fictional first");
+        begin_search("fictional second", true);
+        let second = search_ticket("fictional second");
+        search_results(second, 9, Some(2));
+        search_results(first, 3, None);
+        finish();
+
+        let directory = writer::JournalDirectory::new(&root, scope.account);
+        let mut found = Vec::new();
+        for number in directory.numbers().unwrap() {
+            let file = directory.read(number).unwrap().1.unwrap();
+            assert_eq!(file.life, scope.life);
+            for row in file.events {
+                if let Kind::Search { words, found: count, where_ } = row.record().kind() {
+                    found.push((words.clone(), *count, *where_));
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(root);
+        assert_eq!(found, [
+            ("fictional second".into(), 9, events::SearchedIn::Library),
+            ("fictional second".into(), 2, events::SearchedIn::Requests),
+            ("fictional first".into(), 3, events::SearchedIn::Library),
+        ]);
+    }
+
+    #[test]
     fn a_read_for_an_inactive_account_is_answered_empty() {
         let (send, receive) = mpsc::channel();
         let account = JournalAccount {
